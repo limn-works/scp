@@ -21,7 +21,10 @@
 //!
 //! A relay that refused a request with a `4xxx` code is not sent the same
 //! request again (ADR-004): the registrar records the refusal and skips the
-//! relay until its routing-ID set or the token changes.
+//! relay until its routing-ID set or the token changes. `4062` is the one
+//! `4xxx` code it retries, after the backoff: the relay refused the
+//! `timestamp`, and the retry is a new request, signed with the clock's
+//! second at that time, which is above every `timestamp` sent before.
 //!
 //! [`PushRegistrar::spawn_trigger`] moves the registrar into one task, which
 //! serializes every reconcile and command. The task reconciles at start and
@@ -210,15 +213,19 @@ impl PushError {
     /// Whether a later attempt of the same operation can succeed without any
     /// change on this device: `5003`, `5004`, every other `5xxx` code, an
     /// unreachable relay, a clock behind the last timestamp, a failed
-    /// routing-ID query, and a failed ledger read or write. ADR-004 has a
-    /// client never retry a `4xxx` code as-is, so `4060`-`4064` are not
-    /// retryable.
+    /// routing-ID query, a failed ledger read or write, and `4062`. ADR-004
+    /// has a client never resend a `4xxx` request as-is, so `4060`, `4061`,
+    /// `4063` and `4064` are not retryable. A `4062` refused the message's
+    /// `timestamp` only, and every attempt signs a new message whose
+    /// `timestamp` is the clock's second at that time and above every one
+    /// sent before (§10.7.1 **Freshness**), so the retry is a new request.
     #[must_use]
     pub const fn retryable(&self) -> bool {
         matches!(
             self,
             Self::VerifierUnavailable { .. }
                 | Self::KeyStateUnavailable { .. }
+                | Self::Stale { .. }
                 | Self::RelayFailed { .. }
                 | Self::Unreachable { .. }
                 | Self::ClockBehind { .. }
@@ -228,15 +235,17 @@ impl PushError {
     }
 
     /// Whether the relay, or the publisher, refused the request for good: a
-    /// `4xxx` code, or a publisher with no push path. The registrar does not
-    /// send that relay the same request again (ADR-004).
+    /// `4xxx` code other than `4062`, or a publisher with no push path. The
+    /// registrar does not send that relay the same request again (ADR-004).
+    /// A `4062` is not terminal: it refused the `timestamp`, and
+    /// [`Self::retryable`] has the registrar send a new message with a newer
+    /// one after the backoff.
     #[must_use]
     pub const fn is_terminal_refusal(&self) -> bool {
         matches!(
             self,
             Self::RegistrationRejected { .. }
                 | Self::PlatformUnavailable { .. }
-                | Self::Stale { .. }
                 | Self::NotSupported { .. }
                 | Self::RegistrationLimit { .. }
                 | Self::RelayRefused { .. }
@@ -528,7 +537,11 @@ pub struct PushRegistrar<C: KeyCustody, S: Storage> {
     token: PushToken,
     storage: Arc<ProtocolRepository<S>>,
     /// Per canonical relay URL, the registration the relay accepted last for
-    /// `token`.
+    /// `token`, while no deregistration of `token` has been sent to the relay
+    /// since. [`Self::deregister_token`] removes the entry before it publishes
+    /// a deregistration of `token`, because a relay can apply a
+    /// deregistration whose OK is lost; an entry here therefore never claims
+    /// a registration that a deregistration may have removed.
     accepted: BTreeMap<String, PushTarget>,
     /// The durable relay ledger as loaded and written, per (canonical relay
     /// URL, token hash): every relay that may hold a registration.
@@ -889,7 +902,8 @@ impl<C: KeyCustody, S: Storage> PushRegistrar<C, S> {
     /// Applies one deregistration outcome of `token`: an accepted
     /// deregistration removes the relay from the ledger, and the ledger
     /// delete's failure becomes the relay's outcome, so the deregistration is
-    /// retried.
+    /// retried. `accepted` is not touched here: [`Self::deregister_token`]
+    /// cleared the relay's entry before the publish.
     async fn settle_deregistration(
         &mut self,
         relay_url: &str,
@@ -897,13 +911,9 @@ impl<C: KeyCustody, S: Storage> PushRegistrar<C, S> {
         outcome: Result<(), PushError>,
     ) -> Result<(), PushError> {
         let key = (relay_url.to_owned(), token_hash(token));
-        let current = *token == self.token;
         match outcome {
             Ok(()) => {
                 self.refused.remove(&key);
-                if current {
-                    self.accepted.remove(relay_url);
-                }
                 self.forget_relay(relay_url, token).await
             }
             Err(err) => {
@@ -911,9 +921,6 @@ impl<C: KeyCustody, S: Storage> PushRegistrar<C, S> {
                     self.refused.insert(key, Refused::Deregistration);
                 }
                 if err.relay_holds_nothing() {
-                    if current {
-                        self.accepted.remove(relay_url);
-                    }
                     self.forget_after_refusal(relay_url, token, &err).await;
                 }
                 Err(err)
@@ -989,6 +996,14 @@ impl<C: KeyCustody, S: Storage> PushRegistrar<C, S> {
         })
     }
 
+    /// Publishes a signed `PushDeregistration` of `token` to each relay,
+    /// concurrently, and settles each outcome.
+    ///
+    /// When `token` is the current token, each relay's `accepted` entry is
+    /// removed before its message is published, whatever the outcome: a
+    /// relay can remove the registration and lose the OK, and a kept entry
+    /// would make the next reconcile skip the relay as unchanged while it
+    /// holds nothing.
     async fn deregister_token(
         &mut self,
         relays: &[PushRelay],
@@ -998,7 +1013,11 @@ impl<C: KeyCustody, S: Storage> PushRegistrar<C, S> {
         refuse_duplicates(relays.iter())?;
         let mut results = RelayResults::new();
         let mut prepared = Vec::with_capacity(relays.len());
+        let current = *token == self.token;
         for relay in relays {
+            if current {
+                self.accepted.remove(relay.canonical_url());
+            }
             match self.prepare_deregistration(relay, platform, token).await {
                 Ok(message) => prepared.push(message),
                 Err(err) => {

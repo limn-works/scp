@@ -258,9 +258,11 @@ mod relays {
         }
     }
 
-    /// Criterion 1 (PUSH-014): each relay hosting a context stores exactly one
-    /// registration for the device's token, holding that relay's own routing
-    /// IDs.
+    /// PUSH-036 criterion 2: against relays wired with the signature-checking
+    /// test verifier of PUSH-005, `register` stores one registration per
+    /// relay for the device's token, holding that relay's own routing IDs.
+    /// The test signs with a P-256 key it registers in the verifier; the
+    /// device's `#active` key waits on PUSH-036's production constructor.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn register_stores_one_registration_per_relay() -> TestResult {
         let key = signing_key().await?;

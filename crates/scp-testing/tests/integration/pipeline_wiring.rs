@@ -9092,7 +9092,7 @@ fn bootstrap_lock_scan_flags_a_waiting_handle_method() {
     );
 }
 
-/// PUSH-014 criterion 6 (§10.7.1, ADR-004 **Push registration interception**):
+/// PUSH-014 criterion 4 (§10.7.1, ADR-004 **Push registration interception**):
 /// `PushRegistrar::register` reaches a relay PUBLISH at the relay's own push
 /// routing ID. `register` → `prepare_registration`, which refuses a tier 3
 /// relay, signs the preimage from `push_registration_signing_bytes` and

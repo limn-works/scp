@@ -642,6 +642,10 @@ async fn token_refresh_deregisters_old_then_registers_new() -> TestResult {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Input validation: one relay named twice
+// ---------------------------------------------------------------------------
+
 /// Two targets naming one relay, in any spelling, are refused before any
 /// publish.
 #[tokio::test]
@@ -666,8 +670,9 @@ async fn duplicate_relay_is_refused_before_publish() -> TestResult {
 // Criterion 8: wire codes
 // ---------------------------------------------------------------------------
 
-/// Each relay code maps to its own variant; 5003, 5004, other 5xxx codes and
-/// an unreachable relay are retryable, and 4060-4064 are not.
+/// Each relay code maps to its own variant; 4062, 5003, 5004, other 5xxx
+/// codes and an unreachable relay are retryable, and 4060, 4061, 4063 and
+/// 4064 are not.
 #[tokio::test]
 async fn wire_codes_map_to_typed_errors() -> TestResult {
     let codes: [u16; 10] = [4060, 4061, 4062, 4063, 4064, 5003, 5004, 5000, 4001, 0];
@@ -736,11 +741,16 @@ async fn wire_codes_map_to_typed_errors() -> TestResult {
         PushError::RelayRefused { code: 4001, .. }
     ));
     assert!(matches!(outcome(0)?, PushError::Unreachable { .. }));
-    for code in [4060, 4061, 4062, 4063, 4064, 4001] {
+    for code in [4060, 4061, 4063, 4064, 4001] {
         assert!(!outcome(code)?.retryable(), "{code} is not retryable");
+        assert!(outcome(code)?.is_terminal_refusal(), "{code} is terminal");
     }
-    for code in [5003, 5004, 5000, 0] {
+    for code in [4062, 5003, 5004, 5000, 0] {
         assert!(outcome(code)?.retryable(), "{code} is retryable");
+        assert!(
+            !outcome(code)?.is_terminal_refusal(),
+            "{code} is not terminal"
+        );
     }
     assert!(
         !outcome(4060)?.to_string().contains('\n'),
@@ -1132,6 +1142,51 @@ async fn refused_relay_is_not_retried_with_a_retryable_one() -> TestResult {
     Ok(())
 }
 
+/// A relay that answers 4062 once gets a new registration after the 1 s
+/// backoff, signed with a larger `timestamp`, and accepts it. The retry is a
+/// new request, so ADR-004's rule against resending a `4xxx` request as-is
+/// does not stop it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_registration_is_retried_with_a_newer_timestamp() -> TestResult {
+    let sup = supervisor();
+    create_context(&sup, CTX_A, PSEUDONYM_A, &[RELAY_A]).await?;
+    let answer: Answer = Box::new(|_, attempt| {
+        if attempt == 0 {
+            Err(PushPublishError::Rejected {
+                code: code::PUSH_REGISTRATION_STALE,
+                msg: String::new(),
+            })
+        } else {
+            Ok(())
+        }
+    });
+    let (sink, mut rx) = publisher(system_clock(), answer);
+    let registrar = registrar(sink, system_clock()).await?;
+    let public_key = *registrar.signing_key.public_key();
+    let shutdown = CancellationToken::new();
+    let task = registrar.spawn_trigger(Arc::clone(&sup), shutdown.clone());
+
+    let sent = expect_publishes(&mut rx, 2).await?;
+    let refused = verified_registration(&sent[0], &public_key)?;
+    let retry = verified_registration(&sent[1], &public_key)?;
+    assert_eq!(sent[1].relay_url, RELAY_A);
+    assert_eq!(retry.routing_ids, refused.routing_ids, "the same set");
+    assert!(
+        retry.timestamp > refused.timestamp,
+        "the retry carries a newer timestamp: {} then {}",
+        refused.timestamp,
+        retry.timestamp
+    );
+    assert!(
+        sent[1].at.duration_since(sent[0].at) >= Duration::from_secs(1),
+        "the retry waits for the backoff"
+    );
+
+    shutdown.cancel();
+    tokio::time::timeout(ARRIVAL, task.into_join_handle()).await??;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // The relay ledger
 // ---------------------------------------------------------------------------
@@ -1178,6 +1233,113 @@ async fn lost_ok_then_leaving_last_context_still_deregisters() -> TestResult {
         registrar.storage.load_push_relays().await?.is_empty(),
         "the accepted deregistration clears the ledger"
     );
+    Ok(())
+}
+
+/// Relay A removes the registration on `deregister_all` but its OK is lost.
+/// `register` then registers relay A again rather than skipping it as
+/// unchanged, and relay A accepts the registration.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lost_deregistration_ok_then_register_reregisters() -> TestResult {
+    let sup = supervisor();
+    create_context(&sup, CTX_A, PSEUDONYM_A, &[RELAY_A]).await?;
+    // Attempt 0 is the start registration and attempt 1 the deregistration,
+    // which the relay applies but whose OK never arrives.
+    let answer: Answer = Box::new(|_, attempt| {
+        if attempt == 1 {
+            Err(PushPublishError::Unreachable {
+                reason: "connection lost before the OK".to_owned(),
+            })
+        } else {
+            Ok(())
+        }
+    });
+    let (sink, mut rx) = publisher(system_clock(), answer);
+    let registrar = registrar(sink, system_clock()).await?;
+    let public_key = *registrar.signing_key.public_key();
+    let shutdown = CancellationToken::new();
+    let task = registrar.spawn_trigger(Arc::clone(&sup), shutdown.clone());
+    let start = expect_publishes(&mut rx, 1).await?;
+    let registered = verified_registration(&start[0], &public_key)?;
+
+    let outcome = task.deregister_all().await?;
+    assert!(
+        matches!(
+            outcome.deregistered.get(RELAY_A),
+            Some(Err(PushError::Unreachable { .. }))
+        ),
+        "{outcome:?}"
+    );
+    let sent = tokio::time::timeout(ARRIVAL, rx.recv())
+        .await?
+        .ok_or("publisher dropped")?;
+    verified_deregistration(&sent, &public_key)?;
+
+    let outcome = task.register().await?;
+    assert!(
+        outcome.registered.get(RELAY_A).is_some_and(Result::is_ok),
+        "relay A is registered again: {outcome:?}"
+    );
+    let sent = tokio::time::timeout(ARRIVAL, rx.recv())
+        .await?
+        .ok_or("publisher dropped")?;
+    assert_eq!(sent.relay_url, RELAY_A);
+    let again = verified_registration(&sent, &public_key)?;
+    assert_eq!(again.routing_ids, registered.routing_ids);
+
+    shutdown.cancel();
+    tokio::time::timeout(ARRIVAL, task.into_join_handle()).await??;
+    Ok(())
+}
+
+/// Relay A leaves the wanted set, its deregistration's OK is lost, and the
+/// same routing-ID set comes back. `reconcile` registers relay A again
+/// rather than skipping it as unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lost_deregistration_ok_then_same_set_returns_reregisters() -> TestResult {
+    let sup = supervisor();
+    create_context(&sup, CTX_A, PSEUDONYM_A, &[RELAY_A]).await?;
+    let answer: Answer = Box::new(|_, attempt| {
+        if attempt == 1 {
+            Err(PushPublishError::Unreachable {
+                reason: "connection lost before the OK".to_owned(),
+            })
+        } else {
+            Ok(())
+        }
+    });
+    let (sink, mut rx) = publisher(system_clock(), answer);
+    let mut registrar = registrar(sink, system_clock()).await?;
+    let public_key = *registrar.signing_key.public_key();
+    let first = registrar.reconcile(&sup).await?;
+    assert!(
+        first.registered.get(RELAY_A).is_some_and(Result::is_ok),
+        "{first:?}"
+    );
+    let start = expect_publishes(&mut rx, 1).await?;
+    let registered = verified_registration(&start[0], &public_key)?;
+
+    assert!(sup.despawn_actor(&hex::encode(CTX_A)).await);
+    let left = registrar.reconcile(&sup).await?;
+    assert!(
+        matches!(
+            left.deregistered.get(RELAY_A),
+            Some(Err(PushError::Unreachable { .. }))
+        ),
+        "{left:?}"
+    );
+    expect_publishes(&mut rx, 1).await?;
+
+    create_context(&sup, CTX_A, PSEUDONYM_A, &[RELAY_A]).await?;
+    let back = registrar.reconcile(&sup).await?;
+    assert!(
+        back.registered.get(RELAY_A).is_some_and(Result::is_ok),
+        "relay A is registered again: {back:?}"
+    );
+    let sent = expect_publishes(&mut rx, 1).await?;
+    assert_eq!(sent[0].relay_url, RELAY_A);
+    let again = verified_registration(&sent[0], &public_key)?;
+    assert_eq!(again.routing_ids, registered.routing_ids, "the same set");
     Ok(())
 }
 
