@@ -44,9 +44,7 @@ use scp_protocol::context::pseudonym::{
     classify_pseudonym_announcement, is_pseudonym_announcement_payload,
 };
 use scp_protocol::crypto::sender_keys::generate_wrapping_keypair;
-use scp_protocol::envelope::outer::{
-    DEFAULT_APP_DATA_BLOB_TTL_SECS, OuterEnvelope, create_outer_envelope,
-};
+use scp_protocol::envelope::outer::{DEFAULT_APP_DATA_BLOB_TTL_SECS, OuterEnvelope};
 use scp_relay_client::{ClientMessage, RelayMessage};
 use serde::{Deserialize, Serialize};
 use tls_codec::Serialize as TlsSerialize;
@@ -1096,15 +1094,21 @@ impl ScpClient {
             });
         }
 
-        // `state` borrow ends (ciphertext + routing_ids are owned). Wrap in an
-        // OuterEnvelope with a ZEROED cleartext routing_id (§9.10.4 privacy: the
-        // relay-visible routing id is the per-peer PUBLISH address below, not the
-        // envelope; a curious relay reads nothing linkable off the envelope).
-        let blob =
-            create_outer_envelope(&[0u8; 32], None, DEFAULT_APP_DATA_BLOB_TTL_SECS, ciphertext)
-                .map_err(|e| ClientError::Codec(format!("building outer envelope: {e}")))?
-                .to_bytes()
-                .map_err(|e| ClientError::Codec(format!("serializing outer envelope: {e}")))?;
+        // `state` borrow ends (ciphertext + routing_ids are owned). Frame the MLS
+        // message in the one relay-visible OuterEnvelope (ADR-002, spec 23
+        // §23.4.1), the codec every native publish uses, with a ZEROED cleartext
+        // routing_id (§9.10.4 privacy: the relay-visible routing id is the
+        // per-peer PUBLISH address below, not the envelope; a curious relay
+        // reads nothing linkable off the envelope).
+        let blob = OuterEnvelope::frame_mls_message(
+            &[0u8; 32],
+            None,
+            DEFAULT_APP_DATA_BLOB_TTL_SECS,
+            ciphertext,
+        )
+        .map_err(|e| ClientError::Codec(format!("framing the MLS message: {e}")))?
+        .to_bytes()
+        .map_err(|e| ClientError::Codec(format!("serializing outer envelope: {e}")))?;
 
         // Persist the advanced ratchet (+ buffered MessageSent) BEFORE publishing.
         self.persist_context(context_id)?;
@@ -1196,9 +1200,11 @@ impl ScpClient {
                 } else {
                     RecvChannel::App
                 };
-                let envelope = OuterEnvelope::from_bytes(&blob).map_err(|e| {
-                    ClientError::Codec(format!("deserializing outer envelope: {e}"))
-                })?;
+                // The one ADR-002 envelope; its `encrypted_blob` is the MLS
+                // message (spec 23 §23.4.1). A malformed frame is refused here,
+                // before any MLS work.
+                let envelope = OuterEnvelope::unframe_mls_message(&blob)
+                    .map_err(|e| ClientError::Codec(format!("unframing relay blob: {e}")))?;
                 // The relay is an untrusted pipe: it may deliver a frame this client
                 // cannot process (a self-echo of its own publish; an out-of-order or
                 // too-early announcement before its sender key / at the wrong epoch;

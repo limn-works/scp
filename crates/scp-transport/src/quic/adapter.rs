@@ -579,17 +579,7 @@ impl TransportAdapter for QuicAdapter {
                                 "query response exceeded maximum result count ({MAX_QUERY_RESULTS})"
                             )));
                         }
-                        match OuterEnvelope::from_bytes(&blob) {
-                            Ok(envelope) => envelopes.push(envelope),
-                            Err(_) => {
-                                // The blob is attacker-controlled. Some serde
-                                // codecs include byte excerpts in their
-                                // `Display`; do not include the inner error.
-                                return Err(TransportError::ProtocolError(
-                                    "failed to deserialize envelope from blob".to_string(),
-                                ));
-                            }
-                        }
+                        envelopes.push(OuterEnvelope::unframe_mls_message(&blob)?);
                     }
                     RelayMessage::Event { event_type, .. } if event_type == "query_complete" => {
                         break;
@@ -920,14 +910,12 @@ fn map_subscribe_relay_message(
         return None;
     }
     match relay_msg {
-        RelayMessage::Blob { blob, .. } => Some(OuterEnvelope::from_bytes(&blob).map_or_else(
-            |_| {
-                TransportEvent::Error(TransportError::ProtocolError(
-                    "failed to deserialize envelope from blob".to_string(),
-                ))
-            },
-            TransportEvent::Envelope,
-        )),
+        RelayMessage::Blob { blob, .. } => {
+            Some(OuterEnvelope::unframe_mls_message(&blob).map_or_else(
+                |e| TransportEvent::Error(TransportError::from(e)),
+                TransportEvent::Envelope,
+            ))
+        }
         RelayMessage::Event { event_type, .. } => match event_type.as_str() {
             "backfill_complete" => Some(TransportEvent::BackfillComplete),
             _ => None,

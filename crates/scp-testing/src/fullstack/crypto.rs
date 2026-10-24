@@ -122,19 +122,19 @@ impl E2eCryptoProvider {
 
     // -- Epoch-advance Commits for existing members ------------------------
 
-    /// Deposits a raw epoch-advance Commit for an existing member to process.
+    /// Deposits an epoch-advance Commit, framed as a relay delivers it (spec
+    /// 23 §23.4.1), for an existing member to process.
     pub fn deposit_commit(&self, context_id: &[u8; 32], member_did: &str, commit_bytes: Vec<u8>) {
         self.exchange()
             .deposit_commit(*context_id, member_did, commit_bytes);
     }
 
-    /// Takes (drains) every raw epoch-advance Commit deposited for this node,
-    /// in deposit order.
+    /// Takes (drains) every framed epoch-advance Commit deposited for this
+    /// node, in deposit order.
     ///
     /// ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the provider `open` twin is deleted —
     /// Commits are now merged through the REAL actor receive path. The caller
-    /// ([`super::node::FullStackNode`]) wraps each raw Commit in a throwaway
-    /// `OuterEnvelope` and feeds it to
+    /// ([`super::node::FullStackNode`]) feeds each framed Commit to
     /// [`Supervisor::deliver_commit_blob`](scp_core::context::supervisor::Supervisor::deliver_commit_blob),
     /// which routes it through the actor's `decrypt_and_dispatch` MLS control
     /// path and merges the staged commit (advancing the group epoch).
@@ -162,8 +162,8 @@ impl E2eCryptoProvider {
     /// deposited for this node, in deposit order.
     ///
     /// ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the provider `open` /
-    /// `mls_encrypt_management` twins are deleted. Each drained blob is a full
-    /// `OuterEnvelope` (harvested from the inviter's transport, where the
+    /// `mls_encrypt_management` twins are deleted. Each drained blob is the
+    /// serialized MLS message (harvested from the inviter's transport, where the
     /// inviter's actor pushed it during `invite_member`). The caller
     /// ([`super::node::FullStackNode`]) feeds each straight to
     /// [`Supervisor::deliver_commit_blob`](scp_core::context::supervisor::Supervisor::deliver_commit_blob),

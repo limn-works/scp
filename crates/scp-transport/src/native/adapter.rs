@@ -731,15 +731,15 @@ fn subscription_message_to_event(msg: SubscriptionMessage) -> Option<TransportEv
 /// PONG, OK responses).
 fn relay_message_to_event(msg: RelayMessage) -> Option<TransportEvent> {
     match msg {
-        RelayMessage::Blob { blob, .. } => Some(OuterEnvelope::from_bytes(&blob).map_or_else(
-            |_| {
-                tracing::warn!("envelope deserialization failed");
-                TransportEvent::Error(TransportError::ProtocolError(
-                    "failed to deserialize envelope from blob".to_owned(),
-                ))
-            },
-            TransportEvent::Envelope,
-        )),
+        RelayMessage::Blob { blob, .. } => Some(
+            scp_core::envelope::OuterEnvelope::unframe_mls_message(&blob).map_or_else(
+                |e| {
+                    tracing::warn!(error = %e, "relay blob refused");
+                    TransportEvent::Error(TransportError::from(e))
+                },
+                TransportEvent::Envelope,
+            ),
+        ),
         RelayMessage::Event { event_type, .. } => match event_type.as_str() {
             "backfill_complete" => Some(TransportEvent::BackfillComplete),
             _ => None,

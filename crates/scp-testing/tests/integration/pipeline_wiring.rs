@@ -2027,19 +2027,6 @@ fn state_seal_open_first_binding_is_production_core() {
     );
 }
 
-// Actor-state level: `ContextCryptoState::seal` calls create_outer_envelope
-// (envelope construction). Repointed from the deleted provider `seal` to its
-// actor home in `state.rs` (STATE_SRC) — the moved pipeline, not a weakening.
-// First-occurrence binding to the production core is pinned by
-// `state_seal_open_first_binding_is_production_core` above.
-#[test]
-fn seal_calls_create_outer_envelope() {
-    assert!(
-        fn_body_contains(STATE_SRC, "seal", "create_outer_envelope"),
-        "seal (actor ContextCryptoState) must call create_outer_envelope"
-    );
-}
-
 // Actor-state level: `ContextCryptoState::seal` calls encrypt_sender_layer
 // (sender key encryption). Repointed from the deleted provider `seal`.
 #[test]
@@ -2142,12 +2129,48 @@ fn provider_steady_state_crypto_methods_are_deleted() {
 
 // --- Envelope layer (§13) — NOW WIRED ---
 
+/// ADR-002 and spec 23 §23.4.1: a member publish carries one relay-visible
+/// `OuterEnvelope` over the serialized MLS message. `seal` serializes the
+/// ciphertext and frames nothing; `RelayTransportProvider::send_message`
+/// frames it once through the scp-protocol codec; the browser client frames
+/// and unframes through the same codec; and the native relay adapter unframes
+/// through it.
 #[test]
-fn encrypt_path_calls_create_outer_envelope_or_seal() {
+fn every_member_publish_is_framed_once_and_every_receive_unframed_once() {
+    const TRANSPORT_PROVIDER_SRC: &str =
+        include_str!("../../../../crates/scp-transport/src/provider.rs");
+    const CLIENT_SRC: &str = include_str!("../../../../crates/scp-client/src/client.rs");
+    const NATIVE_ADAPTER_SRC: &str =
+        include_str!("../../../../crates/scp-transport/src/native/adapter.rs");
+    let seal = extract_fn_body(STATE_SRC, "seal").expect("actor state.rs must define seal");
     assert!(
-        fn_body_contains(STATE_SRC, "seal", "create_outer_envelope")
-            || fn_body_contains(MANAGER_SRC, "send_message", "create_outer_envelope"),
-        "send/encrypt path must call create_outer_envelope"
+        seal.contains("serialize_ciphertext("),
+        "seal must return the serialized MLS ciphertext"
+    );
+    assert!(
+        !seal.contains("frame_mls_message") && !seal.contains("create_outer_envelope"),
+        "seal must build no envelope; the transport adds the only one"
+    );
+    let send = extract_fn_body(TRANSPORT_PROVIDER_SRC, "send_message")
+        .expect("provider.rs must define send_message");
+    assert!(
+        send.contains("frame_mls_message("),
+        "RelayTransportProvider::send_message must frame through OuterEnvelope::frame_mls_message"
+    );
+    assert!(
+        !send.contains("build_envelope("),
+        "RelayTransportProvider::send_message must not build its own envelope"
+    );
+    let client = strip_non_code(CLIENT_SRC);
+    for call in ["frame_mls_message(", "unframe_mls_message("] {
+        assert!(
+            client.contains(call),
+            "the browser client must call OuterEnvelope::{call})"
+        );
+    }
+    assert!(
+        strip_non_code(NATIVE_ADAPTER_SRC).contains("unframe_mls_message("),
+        "the native relay adapter must unframe through OuterEnvelope::unframe_mls_message"
     );
 }
 
@@ -3430,7 +3453,7 @@ fn b3_heartbeat_send_receive_loop_wired() {
 /// it clears `needs_reconnect`, a wake writes it after Phases 2 and 4 fed the
 /// context's buffer to the actor, and live delivery writes it after the actor
 /// accepts an envelope. napi's live subscription delivers through the shared
-/// `deliver_live_envelope`, which applies the contact rule.
+/// `deliver_live_envelope`. Every writer goes through `record_relay_contact`.
 #[test]
 fn last_relay_contact_writers_wired() {
     for (src, caller, callee) in [
@@ -3442,12 +3465,12 @@ fn last_relay_contact_writers_wired() {
         (
             RECONNECT_DRIVER_SRC,
             "clear_and_record_contact",
-            "store_last_relay_contact(",
+            "record_relay_contact(",
         ),
         (
             RECONNECT_DRIVER_SRC,
             "wake_pull_context",
-            "store_last_relay_contact(",
+            "record_relay_contact(",
         ),
         (
             RECONNECT_DRIVER_SRC,
@@ -3462,11 +3485,6 @@ fn last_relay_contact_writers_wired() {
         (
             RECONNECT_DRIVER_SRC,
             "deliver_live_envelope",
-            "record_contact_after_live_delivery(",
-        ),
-        (
-            RECONNECT_DRIVER_SRC,
-            "record_contact_after_live_delivery",
             "record_relay_contact(",
         ),
     ] {
@@ -3479,9 +3497,7 @@ fn last_relay_contact_writers_wired() {
     let body = extract_fn_body(RECONNECT_DRIVER_SRC, "clear_and_record_contact")
         .expect("clear_and_record_contact not found in reconnect.rs");
     let clear = body.find("clear_needs_reconnect(").expect("no clear call");
-    let write = body
-        .find("store_last_relay_contact(")
-        .expect("no write call");
+    let write = body.find("record_relay_contact(").expect("no write call");
     assert!(
         clear < write,
         "clear_and_record_contact must clear needs_reconnect before it writes the contact"
@@ -3490,9 +3506,7 @@ fn last_relay_contact_writers_wired() {
     // stops mid-delivery keeps its stored contact.
     let body = extract_fn_body(RECONNECT_DRIVER_SRC, "wake_pull_context")
         .expect("wake_pull_context not found in reconnect.rs");
-    let write = body
-        .find("store_last_relay_contact(")
-        .expect("no write call");
+    let write = body.find("record_relay_contact(").expect("no write call");
     for delivery in ["deliver_commit_blobs_until_steady(", "refeed_buffer("] {
         let at = body
             .find(delivery)
@@ -3886,7 +3900,7 @@ fn push_wake_pulls_without_signing() {
         (
             RECONNECT_DRIVER_SRC,
             "wake_pull_context",
-            "store_last_relay_contact(",
+            "record_relay_contact(",
         ),
         (
             RECONNECT_DRIVER_SRC,
@@ -7690,5 +7704,148 @@ fn spawn_actor_from_welcome_agrees_through_the_wrapping_key_before_the_bootstrap
             panic!("spawn_actor_from_welcome must run `{step}` after the steps before it");
         };
         from += at + step.len();
+    }
+}
+
+// --- One relay-visible envelope per member publish (ADR-002, spec 23 §23.4.1) ---
+
+/// `seal` returns the serialized MLS message: it builds no envelope, because
+/// the transport adds the only one.
+#[test]
+fn seal_builds_no_outer_envelope() {
+    let body = extract_fn_body(STATE_SRC, "seal").expect("state.rs must define seal");
+    assert!(
+        !body.contains("create_outer_envelope") && !body.contains("frame_mls_message"),
+        "seal must return the MLS message without framing it"
+    );
+}
+
+/// Every Commit publish goes through `publish_commit`: the first broadcast
+/// (`try_broadcast_commit`) and the retry of a queued Commit
+/// (`compute_commit_retry_outcomes`).
+#[test]
+fn commit_publishes_go_through_publish_commit() {
+    const GOVERNANCE_HELPERS_SRC: &str =
+        include_str!("../../../../crates/scp-runtime/src/context/governance_helpers.rs");
+    const HANDLERS_GOVERNANCE_SRC: &str =
+        include_str!("../../../../crates/scp-runtime/src/context/actor/handlers/governance.rs");
+    assert!(
+        fn_body_contains(
+            GOVERNANCE_HELPERS_SRC,
+            "try_broadcast_commit",
+            "publish_commit("
+        ),
+        "try_broadcast_commit must publish through publish_commit"
+    );
+    assert!(
+        fn_body_contains(
+            HANDLERS_GOVERNANCE_SRC,
+            "compute_commit_retry_outcomes",
+            "publish_commit("
+        ),
+        "compute_commit_retry_outcomes must publish through publish_commit"
+    );
+}
+
+/// The Phase 5 Update (spec 23 §23.3) publishes through the Commit retry
+/// queue's entry point, so a failed publish is queued, not lost.
+#[test]
+fn the_phase_5_update_publishes_through_try_broadcast_commit() {
+    const HANDLERS_LIFECYCLE_SRC: &str =
+        include_str!("../../../../crates/scp-runtime/src/context/actor/handlers/lifecycle.rs");
+    let body = extract_fn_body(HANDLERS_LIFECYCLE_SRC, "handle_issue_mls_update_actor")
+        .expect("handlers/lifecycle.rs must define handle_issue_mls_update_actor");
+    let broadcast = body
+        .find("try_broadcast_commit(")
+        .expect("the IssueMlsUpdate handler must call try_broadcast_commit");
+    assert!(
+        body[broadcast..].contains("keep_broadcast_failure("),
+        "the IssueMlsUpdate handler must queue a failed publish with keep_broadcast_failure"
+    );
+}
+
+/// No Commit producer publishes Commit bytes with a direct
+/// `send_message(` call; `publish_commit` is the only one.
+#[test]
+fn no_commit_producer_sends_commit_bytes_directly() {
+    const GOVERNANCE_HELPERS_SRC: &str =
+        include_str!("../../../../crates/scp-runtime/src/context/governance_helpers.rs");
+    const LIFECYCLE_HELPERS_SRC_FULL: &str =
+        include_str!("../../../../crates/scp-runtime/src/context/lifecycle_helpers.rs");
+    const TRUST_RECOVERY_HELPERS_SRC: &str =
+        include_str!("../../../../crates/scp-runtime/src/context/trust_recovery_helpers.rs");
+    const HANDLERS_LIFECYCLE_SRC: &str =
+        include_str!("../../../../crates/scp-runtime/src/context/actor/handlers/lifecycle.rs");
+    let publish_commit = extract_fn_body(GOVERNANCE_HELPERS_SRC, "publish_commit")
+        .expect("governance_helpers.rs must define publish_commit");
+    let governance = strip_non_code(GOVERNANCE_HELPERS_SRC);
+    assert!(
+        governance.contains(&publish_commit),
+        "the publish_commit body must be found in the stripped source"
+    );
+    let governance = governance.replacen(&publish_commit, "", 1);
+    for (file, code) in [
+        ("governance_helpers.rs", governance),
+        (
+            "lifecycle_helpers.rs",
+            strip_non_code(LIFECYCLE_HELPERS_SRC_FULL),
+        ),
+        (
+            "trust_recovery_helpers.rs",
+            strip_non_code(TRUST_RECOVERY_HELPERS_SRC),
+        ),
+        (
+            "handlers/lifecycle.rs",
+            strip_non_code(HANDLERS_LIFECYCLE_SRC),
+        ),
+    ] {
+        for (at, _) in code.match_indices("send_message(") {
+            let args = &code[at..];
+            let args = &args[..args.find(')').unwrap_or(args.len())];
+            assert!(
+                !args.contains("commit"),
+                "{file} sends Commit bytes directly ({args}); publish them through publish_commit"
+            );
+        }
+    }
+}
+
+/// ADR-029 §2 sync-state keys: `record_relay_contact` is the one writer of
+/// `last_relay_contact`, and the live delivery, the push-wake pull and the
+/// full reconnection all record their contact through it.
+#[test]
+fn record_relay_contact_is_the_one_relay_contact_writer() {
+    let body = extract_fn_body(RECONNECT_DRIVER_SRC, "record_relay_contact")
+        .expect("reconnect.rs must define record_relay_contact");
+    assert!(
+        body.contains("store_last_relay_contact("),
+        "record_relay_contact must write last_relay_contact"
+    );
+    let code = strip_non_code(RECONNECT_DRIVER_SRC);
+    let production = &code[..code.rfind("mod tests").unwrap_or(code.len())];
+    assert_eq!(
+        production.matches("store_last_relay_contact(").count(),
+        1,
+        "record_relay_contact must be the only writer of last_relay_contact in reconnect.rs"
+    );
+    for writer in [
+        "deliver_live_envelope",
+        "wake_pull_context",
+        "clear_and_record_contact",
+    ] {
+        assert!(
+            fn_body_contains(RECONNECT_DRIVER_SRC, writer, "record_relay_contact("),
+            "{writer} must record its relay contact through record_relay_contact"
+        );
+    }
+    for (bridge, src) in [
+        ("napi", NAPI_CONTEXT_SRC),
+        ("pyo3", PYO3_CONTEXT_SRC),
+        ("uniffi", UNIFFI_BRIDGE_SRC),
+    ] {
+        assert!(
+            !strip_non_code(src).contains("store_last_relay_contact("),
+            "the {bridge} bridge must not write last_relay_contact itself"
+        );
     }
 }

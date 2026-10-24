@@ -943,9 +943,15 @@ async fn compute_commit_retry_outcomes(
             });
             continue;
         }
-        match transport
-            .send_message(&pending.routing_id, &pending.commit_bytes)
-            .await
+        // Every Commit publish, first attempt and retry, goes through
+        // `publish_commit`, which hands the transport the serialized MLS
+        // Commit to frame once (ADR-002, spec 23 §23.4.1).
+        match crate::context::governance_helpers::publish_commit(
+            transport,
+            pending.routing_id,
+            &pending.commit_bytes,
+        )
+        .await
         {
             Ok(()) => {
                 outcomes.push(CommitRetryOutcome {
@@ -1625,6 +1631,87 @@ mod consequence_fail_closed_tests {
             assert!(
                 matches!(&sketch, ContextError::SupervisorShutDown(m) if m == "gone"),
                 "got {sketch:?}"
+            );
+        }
+    }
+
+    mod commit_retry_framing_tests {
+        //! ADR-002, spec 23 §23.4.1: a queued Commit holds the serialized MLS
+        //! Commit, and every retry hands the transport exactly those bytes to
+        //! frame, as an application message's are.
+
+        use std::sync::mpsc;
+
+        use scp_protocol::context::ContextParams;
+        use scp_protocol::context::builder::ContextCreationError;
+
+        use super::super::{CommitRetryOutcomeKind, compute_commit_retry_outcomes};
+        use crate::context::ContextError;
+        use crate::context::builder::ContextTransportProvider;
+        use crate::context::state::{CommitOperation, PendingCommit};
+
+        /// Records every `send_message` call (routing ID and payload) on a
+        /// channel and accepts it.
+        struct PayloadTransport {
+            payloads: mpsc::Sender<([u8; 32], Vec<u8>)>,
+        }
+
+        #[async_trait::async_trait]
+        impl ContextTransportProvider for PayloadTransport {
+            fn is_connected(&self) -> bool {
+                true
+            }
+            async fn publish_context(
+                &self,
+                _: &[u8; 32],
+                _: &ContextParams,
+            ) -> Result<(), ContextCreationError> {
+                Ok(())
+            }
+            async fn delete_published(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
+                Ok(())
+            }
+            async fn send_message(
+                &self,
+                routing_id: &[u8; 32],
+                payload: &[u8],
+            ) -> Result<(), ContextError> {
+                self.payloads
+                    .send((*routing_id, payload.to_vec()))
+                    .map_err(|e| ContextError::TransportFailed(e.to_string()))
+            }
+        }
+
+        #[tokio::test]
+        async fn a_retried_commit_hands_the_transport_the_mls_commit() {
+            let routing_id = [0x3e; 32];
+            let commit = b"queued-mls-commit".to_vec();
+            let pending = PendingCommit {
+                commit_bytes: commit.clone(),
+                routing_id,
+                operation: CommitOperation::RecoveryAdvanceEpoch,
+                first_attempt_at: 1_000,
+                retry_count: 1,
+                last_error: Some("relay unreachable".into()),
+                next_attempt_at: 1_010,
+            };
+            let (payloads, sent) = mpsc::channel();
+            let transport = PayloadTransport { payloads };
+
+            let outcomes = compute_commit_retry_outcomes(&[pending], 1_010, &transport).await;
+
+            assert!(
+                matches!(
+                    outcomes.as_slice(),
+                    [o] if o.index == 0
+                        && matches!(o.kind, CommitRetryOutcomeKind::Success { attempts: 1, .. })
+                ),
+                "the retry succeeds"
+            );
+            assert_eq!(
+                sent.try_iter().collect::<Vec<_>>(),
+                vec![(routing_id, commit)],
+                "the retry hands the transport the MLS Commit with no envelope of its own"
             );
         }
     }

@@ -848,14 +848,23 @@ impl NativeRelayClient {
         }
 
         // Temp-subscription path: collect raw blobs — terminated by the
-        // ref_id-correlated `query_complete` (not a deadline) — then decode each
-        // as an `OuterEnvelope`, discarding any that fail to deserialize.
+        // ref_id-correlated `query_complete` (not a deadline) — then unframe each
+        // through the shared codec. A malformed frame is dropped here, once,
+        // with a warning, so no catch-up pass ever offers it to the actor.
         let blobs = self
             .send_query_collect_blobs(routing_id, since, None, false)
             .await?;
         Ok(blobs
             .iter()
-            .filter_map(|blob| OuterEnvelope::from_bytes(blob).ok())
+            .filter_map(
+                |blob| match scp_core::envelope::OuterEnvelope::unframe_mls_message(blob) {
+                    Ok(envelope) => Some(envelope),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "QUERY: dropping a malformed relay blob");
+                        None
+                    }
+                },
+            )
             .collect())
     }
 
@@ -2124,6 +2133,47 @@ mod tests {
             elapsed < Duration::from_secs(2),
             "query_raw must complete on query_complete, not the deadline; took {elapsed:?}"
         );
+    }
+
+    /// A catch-up QUERY drops a blob that is not one framed MLS message, so
+    /// no catch-up pass offers it to the actor (ADR-002, spec 23 §23.4.1),
+    /// and returns every well-framed blob beside it.
+    #[tokio::test]
+    async fn query_drops_a_malformed_blob_and_returns_the_framed_one() {
+        use crate::native::server::{DidRecordValidation, Relay, RelayConfig};
+        use crate::native::storage::BlobStorageBackend;
+        use std::net::SocketAddr;
+
+        let config = RelayConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            delivery_jitter_ms: 0,
+            did_record_validation: DidRecordValidation::Disabled,
+            ..RelayConfig::defaults(crate::relay::push_gate::test_relay_url())
+        };
+        let (_shutdown, addr) = Relay::start(config, BlobStorageBackend::in_memory())
+            .await
+            .unwrap();
+        let url = format!("ws://{addr}/scp/v1");
+        let client = NativeRelayClient::connect(&url).await.unwrap();
+
+        let routing_id = [0x12; 32];
+        let framed = OuterEnvelope::frame_mls_message(&routing_id, None, 3600, vec![7; 48])
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+        for blob in [vec![0xFF; 40], framed] {
+            client
+                .publish_raw(&routing_id, 3600, blob)
+                .await
+                .expect("publish_raw succeeds");
+        }
+
+        let got = client
+            .query(&routing_id, None)
+            .await
+            .expect("query succeeds");
+        assert_eq!(got.len(), 1, "the malformed blob is dropped: {got:?}");
+        assert_eq!(got[0].encrypted_blob, vec![7; 48]);
     }
 
     /// Dedup-bypass end-to-end (and observability of `bypass_dedup: true` at the

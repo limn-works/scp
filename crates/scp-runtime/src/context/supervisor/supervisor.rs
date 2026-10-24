@@ -4689,16 +4689,8 @@ impl Supervisor {
             // shape of the access-key variants, so it folds into this
             // unknown-context fallthrough group (surfaces a typed
             // `ContextNotRegistered` / poison error on the oneshot).
-            | LifecycleCommand::ClearNeedsReconnect { context_id, reply } => {
-                let err = self.lookup_miss_error(&context_id, context_id.clone());
-                let sketch = standing_outcome_error_sketch(&err);
-                let _ = reply.send(Err(err));
-                Outcome::err(sketch)
-            }
-            // `IssueMlsUpdate` carries a `Result<Vec<u8>, _>` reply
-            // (serialized Commit bytes), so it cannot fold into the
-            // `Result<(), _>` group above and keeps its own arm.
-            LifecycleCommand::IssueMlsUpdate { context_id, reply } => {
+            | LifecycleCommand::ClearNeedsReconnect { context_id, reply }
+            | LifecycleCommand::IssueMlsUpdate { context_id, reply } => {
                 let err = self.lookup_miss_error(&context_id, context_id.clone());
                 let sketch = standing_outcome_error_sketch(&err);
                 let _ = reply.send(Err(err));
@@ -13103,8 +13095,8 @@ impl Supervisor {
     }
 
     /// Issues an MLS Update proposal + self-Commit for `context_id`
-    /// (§9.12 step 2). Returns the TLS-serialized Commit bytes for the
-    /// caller to distribute to all members. Routes through the actor
+    /// (§9.12 step 2), and publishes the Commit through the actor's Commit
+    /// broadcast and retry queue (spec 23 §23.3 Phase 5). Routes through the actor
     /// mailbox via [`Self::dispatch_lifecycle_command`].
     ///
     /// Used by the reconnection driver's Phase 5 (`mls_update`).
@@ -13112,12 +13104,10 @@ impl Supervisor {
     /// # Errors
     ///
     /// Propagates [`ContextError`] from the handler (e.g. `CryptoFailed`
-    /// for a broadcast context or MLS failure);
+    /// for a broadcast context or MLS failure, `TransportFailed` when the
+    /// Commit's publish failed and the Commit sits queued for retry);
     /// [`ContextError::TransportFailed`] if the reply channel is dropped.
-    pub async fn issue_mls_update(
-        self: &Arc<Self>,
-        context_id: &str,
-    ) -> Result<Vec<u8>, ContextError> {
+    pub async fn issue_mls_update(self: &Arc<Self>, context_id: &str) -> Result<(), ContextError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let cmd = LifecycleCommand::IssueMlsUpdate {
             context_id: context_id.to_owned(),
@@ -28634,9 +28624,8 @@ mod tests {
             &crate::crypto::mls::two_party_test_support::alice_signing_key(),
         )
         .expect("the sender signs its inner envelope");
-        let routing_id = scp_protocol::context::context_routing_id(ctx_str);
         state
-            .seal(sender, &inner, &routing_id, 3600)
+            .seal(sender, &inner)
             .expect("the sender seals the application message")
     }
 
@@ -28837,11 +28826,6 @@ mod tests {
             .add_member(carol, Some(&carol_kp), &SystemClock)
             .expect("Alice adds Carol")
             .commit_bytes;
-        let routing_id = scp_protocol::context::context_routing_id(ctx_str);
-        let outer =
-            scp_protocol::envelope::outer::create_outer_envelope(&routing_id, None, 3600, commit)
-                .expect("wrap the add Commit in an outer envelope");
-        let blob = rmp_serde::to_vec_named(&outer).expect("serialize the outer envelope");
 
         let bob_now = bob_clock_secs(not_before, not_after);
         bob_deps.clock = Arc::new(TestClock::new(bob_now));
@@ -28873,7 +28857,7 @@ mod tests {
                 Some(&mut *bob_cs),
                 ctx_str,
                 &ctx_bytes,
-                &blob,
+                &commit,
             ))
             .expect("Bob merges the add-Carol Commit");
         assert!(
@@ -29079,12 +29063,11 @@ mod tests {
         let rotated_epoch = alice_actor.local_sender_key_epoch();
         let msgs = alice_actor.drain_pending_sender_key_messages().unwrap();
         assert_eq!(msgs.len(), 1, "one KeyResponse for Bob");
-        let routing_id = scp_protocol::context::context_routing_id(ctx_str);
         let sealed = alice_actor
             .mode
             .crypto_mut()
             .expect("encrypted context")
-            .mls_encrypt_management(&msgs[0].1, &routing_id, 3600)
+            .mls_encrypt_management(&msgs[0].1)
             .expect("alice MLS-wraps the KeyResponse");
 
         let bob_cs = bob_actor.mode.crypto_mut().expect("encrypted context");
@@ -29188,13 +29171,12 @@ mod tests {
         else {
             panic!("alice queued a KeyResponse");
         };
-        let routing_id = scp_protocol::context::context_routing_id(ctx_str);
         let mut wrap = |payload: &[u8]| {
             alice_actor
                 .mode
                 .crypto_mut()
                 .expect("encrypted context")
-                .mls_encrypt_management(payload, &routing_id, 3600)
+                .mls_encrypt_management(payload)
                 .expect("alice MLS-wraps the KeyResponse")
         };
 
@@ -29339,18 +29321,16 @@ mod tests {
     /// key to Bob; returns it with the rotated epoch.
     fn alice_rotates_for_bob(
         alice_actor: &mut crate::context::actor::PerContextState,
-        ctx_str: &str,
     ) -> (Vec<u8>, u64) {
         alice_actor.rotate_sender_key(KR_ALICE).unwrap();
         let epoch = alice_actor.local_sender_key_epoch();
         let msgs = alice_actor.drain_pending_sender_key_messages().unwrap();
         assert_eq!(msgs.len(), 1, "one KeyResponse for Bob");
-        let routing_id = scp_protocol::context::context_routing_id(ctx_str);
         let sealed = alice_actor
             .mode
             .crypto_mut()
             .expect("encrypted context")
-            .mls_encrypt_management(&msgs[0].1, &routing_id, 3600)
+            .mls_encrypt_management(&msgs[0].1)
             .expect("alice MLS-wraps the KeyResponse");
         (sealed, epoch)
     }
@@ -29377,7 +29357,7 @@ mod tests {
         } = key_response_to_bob(ctx_str, &storage, &custody).await;
         let floors_before = bob_sup.export_sender_key_epochs(&ctx_bytes);
 
-        let (sealed, rotated_epoch) = alice_rotates_for_bob(&mut alice_actor, ctx_str);
+        let (sealed, rotated_epoch) = alice_rotates_for_bob(&mut alice_actor);
         let bob_cs = bob_actor.mode.crypto_mut().expect("encrypted context");
         let err = crate::context::messaging_helpers::decrypt_and_dispatch(
             &bob_deps,
@@ -29444,7 +29424,7 @@ mod tests {
             ctx_bytes,
         } = key_response_to_bob(ctx_str, &storage, &custody).await;
 
-        let (sealed, rotated_epoch) = alice_rotates_for_bob(&mut alice_actor, ctx_str);
+        let (sealed, rotated_epoch) = alice_rotates_for_bob(&mut alice_actor);
         let bob_cs = bob_actor.mode.crypto_mut().expect("encrypted context");
         crate::context::messaging_helpers::decrypt_and_dispatch(
             &bob_deps,
@@ -29476,7 +29456,7 @@ mod tests {
         };
         assert_eq!(opened.receive_floor.epoch, rotated_epoch);
 
-        let (second, _) = alice_rotates_for_bob(&mut alice_actor, ctx_str);
+        let (second, _) = alice_rotates_for_bob(&mut alice_actor);
         let err = crate::context::messaging_helpers::decrypt_and_dispatch(
             &bob_deps,
             Some(&mut *bob_cs),
@@ -29529,8 +29509,8 @@ mod tests {
             ctx_bytes,
             ..
         } = key_response_to_bob(ctx_str, &storage, &custody).await;
-        let (blank_leaf, _) = alice_rotates_for_bob(&mut alice_actor, ctx_str);
-        let (reused_leaf, _) = alice_rotates_for_bob(&mut alice_actor, ctx_str);
+        let (blank_leaf, _) = alice_rotates_for_bob(&mut alice_actor);
+        let (reused_leaf, _) = alice_rotates_for_bob(&mut alice_actor);
 
         let sender_key_ctx = hex::encode(ctx_bytes);
         let key_of = |actor: &crate::context::actor::PerContextState, did: &str| {
@@ -31202,14 +31182,7 @@ mod tests {
                 .mode
                 .crypto_mut()
                 .expect("encrypted context")
-                .seal(
-                    context_id_bytes,
-                    Self::ALICE,
-                    inner,
-                    &[0u8; 32],
-                    3600,
-                    aad_sequence,
-                )
+                .seal(context_id_bytes, Self::ALICE, inner, aad_sequence)
                 .expect("alice seals the application message")
         }
 
@@ -31493,10 +31466,7 @@ mod tests {
             &crate::crypto::mls::two_party_test_support::alice_signing_key(),
         )
         .expect("alice signs");
-        let routing_id = scp_protocol::context::context_routing_id(ctx_str);
-        let sealed = alice_actor
-            .seal(ALICE, &inner, &routing_id, 3600)
-            .expect("alice seals");
+        let sealed = alice_actor.seal(ALICE, &inner).expect("alice seals");
 
         let bob_cs = bob_actor.mode.crypto_mut().expect("encrypted context");
         let result = rt.block_on(crate::context::messaging_helpers::decrypt_and_dispatch(
@@ -31736,7 +31706,6 @@ mod tests {
             ..
         } = crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx_str, ALICE, BOB);
         let ctx_hex = hex::encode(ctx_bytes);
-        let routing_id = scp_protocol::context::context_routing_id(ctx_str).to_vec();
 
         // Alice's production receive deps, with a resolver that maps BOB → his
         // #active key so the request signature check can run.
@@ -31797,12 +31766,12 @@ mod tests {
         // Mismatch: Bob (authenticated) claims requester_did = CHARLIE.
         let (mismatch_dist, _) = build_request(CHARLIE, [1u8; 16]);
         let mismatch_sealed = bob_cs
-            .mls_encrypt_management(&mismatch_dist, &routing_id, 3600)
+            .mls_encrypt_management(&mismatch_dist)
             .expect("bob seals the mismatched request");
         // Well-formed: requester_did == BOB (the authenticated sender).
         let (ok_dist, bob_ephemeral_secret) = build_request(BOB, [2u8; 16]);
         let ok_sealed = bob_cs
-            .mls_encrypt_management(&ok_dist, &routing_id, 3600)
+            .mls_encrypt_management(&ok_dist)
             .expect("bob seals the well-formed request");
 
         // Alice opens on the production receive seam using her owned actor state.

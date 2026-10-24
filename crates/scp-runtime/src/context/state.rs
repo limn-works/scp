@@ -175,6 +175,15 @@ pub enum CommitOperation {
     /// it rides the persistent retry queue, so a dropped broadcast fail-closes
     /// the context rather than silently completing recovery.
     RecoveryAdvanceEpoch,
+    /// Commit produced by the reconnection Phase 5 MLS Update (spec 23 §23.3
+    /// Phase 5, spec 09 §9.7.3): an Update + self-Commit issued after the
+    /// member re-establishes connectivity.
+    ///
+    /// No peer can follow the member into the new epoch until this Commit
+    /// reaches a relay, so it rides the persistent retry queue like every
+    /// other epoch-advancing Commit, and a failed first publish fails the
+    /// reconnection of the context.
+    ReconnectMlsUpdate,
 }
 
 impl CommitOperation {
@@ -188,6 +197,7 @@ impl CommitOperation {
             Self::ResetMember { .. } => "ResetMember".to_owned(),
             Self::LeaveContext { .. } => "LeaveContext".to_owned(),
             Self::RecoveryAdvanceEpoch => "RecoveryAdvanceEpoch".to_owned(),
+            Self::ReconnectMlsUpdate => "ReconnectMlsUpdate".to_owned(),
         }
     }
 }

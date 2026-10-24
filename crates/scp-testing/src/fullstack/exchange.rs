@@ -117,7 +117,8 @@ impl KeyExchange {
             .unwrap_or_default()
     }
 
-    /// Deposits a raw epoch-advance Commit for an existing member to process.
+    /// Deposits an epoch-advance Commit, framed as a relay delivers it (spec
+    /// 23 §23.4.1), for an existing member to process.
     pub fn deposit_commit(
         &mut self,
         context_id: [u8; 32],

@@ -2721,12 +2721,6 @@ mod tests {
         crate::envelope::inner::sign::create_inner_envelope_raw(&params, &sk).unwrap()
     }
 
-    fn ctx_routing_id(context_id: &[u8; 32]) -> Vec<u8> {
-        // Any 32-byte routing id satisfies `create_outer_envelope`'s
-        // length check; the open() path does not validate routing_id.
-        context_id.to_vec()
-    }
-
     #[test]
     fn seal_open_binds_raw_context_id_string_not_hex() {
         // §9.16.1: the sender-layer AEAD AAD MUST bind the RAW context_id
@@ -2736,7 +2730,6 @@ mod tests {
         // FAILS to open when the hex-of-bytes string is supplied as the AAD
         // source — the exact value native used to (incorrectly) bind.
         let (mut alice_actor, mut bob_actor, ctx_id, alice_did) = setup_alice_bob_two_party();
-        let routing_id = ctx_routing_id(&ctx_id);
 
         // Two independently-sealed messages. MLS forward secrecy deletes the
         // per-message decryption secret on the FIRST `open` of a given
@@ -2745,12 +2738,8 @@ mod tests {
         // at the MLS layer for an unrelated (forward-secrecy) reason.
         let inner1 = build_test_inner(TEST_CTX_STR, &alice_did, 0, 0);
         let inner2 = build_test_inner(TEST_CTX_STR, &alice_did, 0, 1);
-        let sealed_neg = alice_actor
-            .seal(&alice_did, &inner1, &routing_id, 300)
-            .unwrap();
-        let sealed_pos = alice_actor
-            .seal(&alice_did, &inner2, &routing_id, 300)
-            .unwrap();
+        let sealed_neg = alice_actor.seal(&alice_did, &inner1).unwrap();
+        let sealed_pos = alice_actor.seal(&alice_did, &inner2).unwrap();
 
         // Negative: opening with the hex-of-bytes string supplies a
         // `context_id_str` of `hex(ctx_id)` instead of the raw `TEST_CTX_STR`
@@ -2844,7 +2833,6 @@ mod tests {
         // encrypt work — so the rejection is the fast-path resolve-consistency
         // error, not a downstream crypto failure.
         let (mut alice_actor, _bob_actor, ctx_id, alice_did) = setup_alice_bob_two_party();
-        let routing_id = ctx_routing_id(&ctx_id);
 
         // The keying context is the REAL `ctx_id`, but the inner envelope binds
         // a DIFFERENT context-id string. The string is non-64-hex, so it
@@ -2860,7 +2848,7 @@ mod tests {
 
         let inner = build_test_inner(mismatched_ctx_str, &alice_did, 0, 0);
         let err = alice_actor
-            .seal(&alice_did, &inner, &routing_id, 300)
+            .seal(&alice_did, &inner)
             .expect_err("seal must reject an inner context_id that does not resolve to context_id");
 
         match err {
@@ -2940,63 +2928,18 @@ mod tests {
         (alice_state, bob_state, context_id, alice_did.to_string())
     }
 
-    /// The cleartext outer-envelope `routing_id` produced by
-    /// `build_encrypted_envelope` for application data is the 32-byte zero
-    /// sentinel — NOT the relay-derivable `context_routing_id`. A relay
-    /// deserializing the single envelope layer therefore reads no shared
-    /// correlator off a pseudonym-addressed app-data blob.
-    #[tokio::test]
-    async fn app_data_envelope_routing_id_is_zeroed_not_context_rid() {
-        let ctx_str = "ctx-app-data-zeroed-rid";
-        let (mut alice_actor, _bob_actor, _ctx_id, alice_did) =
-            setup_two_party_for_ctx_string(ctx_str);
-        let clock: std::sync::Arc<dyn scp_clock::Clock> =
-            std::sync::Arc::new(scp_clock::SystemClock);
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
-        let sender = scp_did::DID(alice_did.clone());
-        let recipients = app_data_recipients(ctx_str, &alice_did);
-
-        // `build_encrypted_envelope_actor` is the production app-data seal that
-        // zeroes the outer routing_id (§9.10.4), driven on Alice's owned actor
-        // state.
-        let wire = crate::context::messaging_helpers::build_encrypted_envelope_actor(
-            &clock,
-            actor_crypto_mut(&mut alice_actor),
-            &alice_did,
-            ctx_str,
-            &sender,
-            b"hello app data",
-            crate::context::supervisor::MessageSigner::Active(
-                &crate::context::actor::signer::CommandSigner::local_ed25519(signing_key),
-            ),
-            &recipients,
-            0,
-            None,
-            scp_protocol::envelope::inner::MessageType::Content,
-        )
-        .await
-        .unwrap();
-
-        let decoded = scp_protocol::envelope::outer::OuterEnvelope::from_bytes(&wire).unwrap();
-        let context_rid = scp_protocol::context::context_routing_id(ctx_str).to_vec();
-
-        assert_eq!(
-            decoded.routing_id,
-            vec![0u8; 32],
-            "app-data outer envelope routing_id must be the 32-byte zero sentinel"
-        );
-        assert_ne!(
-            decoded.routing_id, context_rid,
-            "app-data outer envelope routing_id must NOT be the relay-derivable context_routing_id"
-        );
+    /// Whether `haystack` contains `needle` as a contiguous byte run.
+    fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
     }
 
-    /// Receive is unaffected by zeroing the field: a full app-data
-    /// send -> `open()` roundtrip still decrypts correctly, because the
-    /// receiver routes on the transport key and MLS-decrypts the blob; it
-    /// never reads the outer `routing_id` for app-data.
+    /// The app-data seal returns the serialized MLS message itself, with no
+    /// second envelope inside it (ADR-002, spec 23 §23.4.1): the bytes parse
+    /// as an MLS message, carry no relay-derivable `context_routing_id` a
+    /// relay could read as a shared correlator, and Bob opens them as they
+    /// are, recovering the sender from the MLS credential.
     #[tokio::test]
-    async fn app_data_roundtrip_decrypts_with_zeroed_routing_id() {
+    async fn app_data_seal_returns_the_mls_message_and_it_opens() {
         let ctx_str = "ctx-app-data-roundtrip";
         let (mut alice_actor, mut bob_actor, _ctx_id, alice_did) =
             setup_two_party_for_ctx_string(ctx_str);
@@ -3006,7 +2949,6 @@ mod tests {
         let sender = scp_did::DID(alice_did.clone());
         let recipients = app_data_recipients(ctx_str, &alice_did);
 
-        // Both seal (Alice) and open (Bob) drive their owned actor states.
         let wire = crate::context::messaging_helpers::build_encrypted_envelope_actor(
             &clock,
             actor_crypto_mut(&mut alice_actor),
@@ -3025,35 +2967,33 @@ mod tests {
         .await
         .unwrap();
 
-        // Sanity: the field really is zeroed on the wire.
-        let decoded = scp_protocol::envelope::outer::OuterEnvelope::from_bytes(&wire).unwrap();
-        assert_eq!(decoded.routing_id, vec![0u8; 32]);
+        assert!(
+            scp_mls::wire::parse_mls_message_in(&wire).is_ok(),
+            "the app-data seal output is a serialized MLS message"
+        );
+        let context_rid = scp_protocol::context::context_routing_id(ctx_str);
+        assert!(
+            !contains_bytes(&wire, &context_rid),
+            "the app-data seal output carries no context_routing_id"
+        );
 
-        // Bob opens the same blob and recovers the application plaintext,
-        // proving the zeroed routing_id does not break delivery.
         let opened = bob_actor.open(ctx_str, &wire).unwrap();
         match opened {
             scp_protocol::context::builder::OpenResult::Application(env) => {
                 assert_eq!(
                     env.sender_did, alice_did,
-                    "sender DID recovered from MLS credential despite zeroed routing_id"
+                    "sender DID recovered from the MLS credential"
                 );
             }
             other => panic!("expected an Application message, got {other:?}"),
         }
     }
 
-    /// Control-path guard: a control message (Recovery type) sealed with
-    /// `context_routing_id` — exactly as the recovery / sender-key dist sites
-    /// do — STILL embeds `context_routing_id` in its inner envelope. This is
-    /// correct: for control traffic the inner field equals the transport
-    /// address (the shared bootstrap channel every member subscribes to), so
-    /// there is no relay correlator leak. The guard proves `seal` faithfully
-    /// preserves whatever `routing_id` it is given, so the app-data fix is scoped
-    /// purely to the argument passed in `build_encrypted_envelope` and did NOT
-    /// over-broadly zero the control seal sites.
+    /// A control message (Recovery type) seals to the serialized MLS message
+    /// as well: `seal` adds no envelope for any message type, and the
+    /// transport frames every payload once for the address it publishes to.
     #[test]
-    fn control_message_seal_still_embeds_context_routing_id() {
+    fn control_message_seal_returns_the_mls_message() {
         // The context id must be derived from a real string: `seal` binds the
         // raw `inner.context_id` into the AEAD AAD (§9.16.1) and asserts the
         // supplied 32-byte id is its SHA-256, so a hex-of-bytes inner id (which
@@ -3063,7 +3003,6 @@ mod tests {
             setup_two_party_for_ctx_string(ctx_str);
         let sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
 
-        // Mirror the control-path inner envelope (Recovery message type).
         let params = crate::envelope::inner::InnerEnvelopeParams {
             version: scp_protocol::envelope::SCP_PROTOCOL_VERSION,
             context_id: ctx_str,
@@ -3079,24 +3018,15 @@ mod tests {
         };
         let inner = crate::envelope::inner::sign::create_inner_envelope_raw(&params, &sk).unwrap();
 
-        // Control path passes `context_routing_id` to `seal` (as in
-        // trust_recovery_helpers / supervisor / lifecycle_helpers). The actor
-        // seal preserves whatever `routing_id` it is given.
-        let control_rid = scp_protocol::context::context_routing_id(ctx_str);
-        let wire = alice_actor
-            .seal(&alice_did, &inner, &control_rid, 300)
-            .unwrap();
+        let wire = alice_actor.seal(&alice_did, &inner).unwrap();
 
-        let decoded = scp_protocol::envelope::outer::OuterEnvelope::from_bytes(&wire).unwrap();
-        assert_eq!(
-            decoded.routing_id,
-            control_rid.to_vec(),
-            "control messages must still embed context_routing_id (shared bootstrap channel)"
+        assert!(
+            scp_mls::wire::parse_mls_message_in(&wire).is_ok(),
+            "the control seal output is a serialized MLS message"
         );
-        assert_ne!(
-            decoded.routing_id,
-            vec![0u8; 32],
-            "control routing_id must NOT be zeroed — that would break the shared channel"
+        assert!(
+            scp_protocol::envelope::outer::OuterEnvelope::from_bytes(&wire).is_err(),
+            "the control seal output is not an outer envelope"
         );
     }
 

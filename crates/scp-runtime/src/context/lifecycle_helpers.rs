@@ -540,11 +540,7 @@ pub async fn drain_and_deliver_sender_keys(
                 message_len = message.len(),
                 "MLS-encrypting and sending rotated sender key distribution"
             );
-            let sealed = crypto_state.mls_encrypt_management(
-                &message,
-                &routing_id,
-                crate::context::messaging_helpers::DEFAULT_BLOB_TTL_SECS,
-            );
+            let sealed = crypto_state.mls_encrypt_management(&message);
             match sealed {
                 Ok(sealed) => {
                     if let Err(e) = deps.transport.send_message(&routing_id, &sealed).await {

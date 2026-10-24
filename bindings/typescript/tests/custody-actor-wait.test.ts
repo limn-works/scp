@@ -224,10 +224,10 @@ suite.describe("callback custody under a concurrent actor wait", (addon) => {
           DeliveryResult,
           DeliveryResult,
         ];
-        // The add's Commit goes out as bare MLS bytes, not an outer envelope, so
-        // the envelope receive path refuses it; Alice joined at its epoch
-        // through her Welcome and needs it from no path.
-        expect(commit.error).toContain("outer envelope");
+        // The add's Commit moves the group into the epoch Alice joined at
+        // through her Welcome, so her group, already in that epoch, refuses
+        // the Commit framed under the epoch before it; she needs it from no path.
+        expect(commit.error).toContain("Message epoch differs from the group's epoch");
         expect(keyResponse).toMatchObject({ outcome: "handled" });
         // Bob's message opens only under his sender key, so it opening without
         // an error shows the KeyResponse installed that key. Alice never saw

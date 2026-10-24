@@ -16,7 +16,7 @@ pub use did_record::{
     DidRecordV1, MAX_DID_RECORD_VALUE_LEN,
 };
 pub use inner::{InnerEnvelope, InnerEnvelopeParams, MessageType, Provenance};
-pub use outer::{OuterEnvelope, create_outer_envelope};
+pub use outer::{MalformedFrame, OuterEnvelope, create_outer_envelope};
 pub use padding::{BUCKET_SIZES, pad_to_bucket, strip_padding};
 pub use validation::{ReorderBuffer, SequenceCheck, SequenceTracker};
 

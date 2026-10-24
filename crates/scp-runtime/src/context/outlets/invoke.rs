@@ -9927,7 +9927,6 @@ mod tests {
                 ctx_bytes: a_ctx_bytes,
                 ..
             } = stand_up_two_party(a_ctx_str, alice_did, bob_did);
-            let routing_id = a_ctx_bytes.to_vec();
 
             let chunk = operator_signed_chunk();
             let operator_pk = SigningKey::from_bytes(&[0x5c; 32]).verifying_key();
@@ -9959,12 +9958,8 @@ mod tests {
             // per-message secret on first open of a given ciphertext). Each actor
             // `seal` advances the send tracker exactly as the provider's
             // `send_sequence` did (AAD sequence 0 then 1).
-            let sealed_for_outsider = alice_a
-                .seal(alice_did, &build_inner(0), &routing_id, 300)
-                .unwrap();
-            let sealed_for_member = alice_a
-                .seal(alice_did, &build_inner(1), &routing_id, 300)
-                .unwrap();
+            let sealed_for_outsider = alice_a.seal(alice_did, &build_inner(0)).unwrap();
+            let sealed_for_member = alice_a.seal(alice_did, &build_inner(1)).unwrap();
 
             // (a) A non-A-member (fresh actor, no A group key) CANNOT decrypt:
             // an empty encrypted-mode `PerContextState` holds no MLS group, so

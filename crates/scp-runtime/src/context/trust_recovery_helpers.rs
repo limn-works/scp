@@ -439,8 +439,6 @@ pub async fn recovery_send_notification(
             &context_id_bytes,
             deps.crypto.local_did(),
             &inner,
-            &routing_id,
-            300, // 5 minute blob TTL
             aad_sequence,
         )?;
         crate::context::actor::sequence::SequenceReservation::reserve(view.send_tracker_mut())

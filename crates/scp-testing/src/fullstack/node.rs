@@ -126,11 +126,14 @@ async fn dispatch_get_all_access_keys(
 struct CapturingTransport {
     /// `(routing_id, payload)` pairs, in send order.
     sent: SentBuffer,
+    /// While set, every send fails with `TransportFailed` and captures
+    /// nothing.
+    failing: Arc<AtomicBool>,
 }
 
 impl CapturingTransport {
-    const fn new(sent: SentBuffer) -> Self {
-        Self { sent }
+    const fn new(sent: SentBuffer, failing: Arc<AtomicBool>) -> Self {
+        Self { sent, failing }
     }
 }
 
@@ -157,6 +160,11 @@ impl ContextTransportProvider for CapturingTransport {
         context_id: &[u8; 32],
         encrypted_payload: &[u8],
     ) -> Result<(), ContextError> {
+        if self.failing.load(Ordering::SeqCst) {
+            return Err(ContextError::TransportFailed(
+                "fixture: transport sends fail".to_owned(),
+            ));
+        }
         self.sent
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -332,6 +340,9 @@ pub struct FullStackNode {
     key_resolver: KeyResolver,
     /// Ciphertexts captured by the transport, shared with the supervisor.
     sent: SentBuffer,
+    /// Makes every transport send fail while set; see
+    /// [`Self::set_sends_failing`].
+    sends_failing: Arc<AtomicBool>,
     /// Registry of all nodes' crypto helpers in the network (creator side
     /// reaches the joiner's provider to mint its real key package).
     registry: NodeRegistry,
@@ -361,10 +372,13 @@ impl FullStackNode {
     ) -> Self {
         let event_log = Arc::new(MerkleEventLogProvider::new());
         let sent: SentBuffer = Arc::new(Mutex::new(Vec::new()));
+        let sends_failing = Arc::new(AtomicBool::new(false));
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&did_to_seed(&did));
 
-        let transport_box: Box<dyn ContextTransportProvider> =
-            Box::new(CapturingTransport::new(Arc::clone(&sent)));
+        let transport_box: Box<dyn ContextTransportProvider> = Box::new(CapturingTransport::new(
+            Arc::clone(&sent),
+            Arc::clone(&sends_failing),
+        ));
         let event_log_box: Box<dyn ContextEventLogProvider> =
             Box::new(ArcEventLogProvider(Arc::clone(&event_log)));
 
@@ -415,6 +429,7 @@ impl FullStackNode {
             signing_key,
             key_resolver,
             sent,
+            sends_failing,
             registry,
             pending_events: Mutex::new(Vec::new()),
             observation,
@@ -490,7 +505,10 @@ impl FullStackNode {
         let observation = self.observation.as_ref()?;
         Some(Supervisor::with_providers_and_wrapping_custody(
             Arc::clone(&self.crypto.provider),
-            Box::new(CapturingTransport::new(Arc::clone(&self.sent))),
+            Box::new(CapturingTransport::new(
+                Arc::clone(&self.sent),
+                Arc::clone(&self.sends_failing),
+            )),
             Box::new(ArcEventLogProvider(Arc::clone(&self.event_log))),
             Arc::clone(&self.key_resolver),
             Some(Box::new(StorePersistence(Arc::clone(&observation.store)))),
@@ -510,6 +528,12 @@ impl FullStackNode {
             o.store.fail_writes.store(failing, Ordering::SeqCst);
             true
         })
+    }
+
+    /// Makes every later transport send of this node fail with
+    /// `TransportFailed` (`true`) or succeed (`false`).
+    pub fn set_sends_failing(&self, failing: bool) {
+        self.sends_failing.store(failing, Ordering::SeqCst);
     }
 
     /// Rotates this node's pseudonym in `context_id` to `new_routing_id` at
@@ -682,15 +706,17 @@ impl FullStackNode {
             },
         );
 
-        // 6. Extract the epoch-advance Commit from the actor's WelcomeGenerated
-        //    event and deposit it for every existing member so their MLS group
-        //    advances to the new epoch. The Welcome itself travels INSIDE the
-        //    sealed bundle, so `welcome_bytes` is discarded here. Every OTHER
-        //    event is buffered so the tests' later `drain_events` still sees it.
-        //    Capture the (broadcast) Commit ciphertext so the sender-key harvest
-        //    in step 7 can distinguish it from the inviter's sender-key push.
+        // 6. The epoch-advance Commit is the inviter actor's first send: the
+        //    in-actor add broadcasts it to the context's routing id before the
+        //    drain-and-deliver pushes the inviter's sender key. The actor hands
+        //    the transport the serialized MLS Commit, which the transport
+        //    frames (ADR-002, spec 23 §23.4.1), so the captured payload must
+        //    equal the `commit_bytes` of the actor's WelcomeGenerated event.
+        //    The Welcome itself travels INSIDE the sealed bundle, so
+        //    `welcome_bytes` is discarded here. Every OTHER event is buffered
+        //    so the tests' later `drain_events` still sees it.
         let drained = self.manager.drain_events(context_id).await;
-        let mut commit_ct: Option<Vec<u8>> = None;
+        let mut event_commit: Option<Vec<u8>> = None;
         {
             let mut pending = self
                 .pending_events
@@ -698,49 +724,54 @@ impl FullStackNode {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             for event in drained {
                 if let ContextEvent::WelcomeGenerated { commit_bytes, .. } = event {
-                    commit_ct = Some(commit_bytes.0.clone());
-                    for existing in &existing_members {
-                        // Deposit the epoch-advance Commit only for OTHER existing
-                        // members on separate nodes. Exclude the newly-added member
-                        // (it joins via the Welcome, not a Commit) AND this node —
-                        // the inviter ran the add in-actor on its OWN actor, so its
-                        // MLS group already advanced to the new epoch. Re-depositing
-                        // the Commit for `self.did` would make its later
-                        // `feed_pending_incoming` replay it, double-advancing the
-                        // epoch and breaking the B→A roundtrip with an epoch mismatch.
-                        if existing != member_did && existing.as_str() != self.did.as_ref() {
-                            self.crypto.deposit_commit(
-                                &ctx_bytes,
-                                existing,
-                                commit_bytes.0.clone(),
-                            );
-                        }
-                    }
+                    event_commit = Some(commit_bytes.0);
                 } else {
                     pending.push(event);
                 }
+            }
+        }
+        let event_commit = event_commit.ok_or_else(|| {
+            ContextError::TransportFailed(
+                "add_member: the inviter emitted no WelcomeGenerated event".to_owned(),
+            )
+        })?;
+        let mut captured = std::mem::take(&mut *self.lock_sent()).into_iter();
+        let (commit_routing_id, commit) = captured.next().ok_or_else(|| {
+            ContextError::TransportFailed("add_member: the inviter sent nothing".to_owned())
+        })?;
+        if commit_routing_id != context_routing_id(context_id) || commit != event_commit {
+            return Err(ContextError::TransportFailed(
+                "add_member: the inviter's first send is not its epoch-advance Commit to the \
+                 context routing id"
+                    .to_owned(),
+            ));
+        }
+        for existing in &existing_members {
+            // Deposit the epoch-advance Commit only for OTHER existing members
+            // on separate nodes. Exclude the newly-added member (it joins via
+            // the Welcome, not a Commit) AND this node — the inviter ran the
+            // add in-actor on its OWN actor, so its MLS group already advanced
+            // to the new epoch. Re-depositing the Commit for `self.did` would
+            // make its later `feed_pending_incoming` replay it, double-advancing
+            // the epoch and breaking the B→A roundtrip with an epoch mismatch.
+            if existing != member_did && existing.as_str() != self.did.as_ref() {
+                self.crypto
+                    .deposit_commit(&ctx_bytes, existing, commit.clone());
             }
         }
 
         // 7. Harvest THIS node's sender-key distribution for the new member.
         //    ADR-049 PR-7 (SCP-CRYPTOMOVE-001): `invite_member` runs the add in
         //    the inviter's actor, whose drain-and-deliver pushes the inviter's
-        //    MLS-wrapped sender key onto the transport (captured in `self.sent`).
-        //    The provider `distribute_sender_key` → `drain` →
-        //    `mls_encrypt_management` manual path is deleted, so harvest the
-        //    pushed blob(s) here — every captured envelope that is NOT the
-        //    (broadcast) epoch Commit — and deposit them for the joiner to feed
-        //    through its actor receive path (`feed_pending_incoming`). Taking the
-        //    buffer also clears it, keeping `take_sent_ciphertexts` clean for
-        //    later application-ciphertext assertions.
-        {
-            let captured = std::mem::take(&mut *self.lock_sent());
-            for (_routing_id, ct) in captured {
-                if commit_ct.as_deref() != Some(ct.as_slice()) {
-                    self.crypto
-                        .deposit_sender_key_message(&ctx_bytes, member_did, ct);
-                }
-            }
+        //    MLS-wrapped sender key onto the transport (captured in `self.sent`)
+        //    after the Commit. Every captured send after the Commit is deposited
+        //    for the joiner to feed through its actor receive path
+        //    (`feed_pending_incoming`). Taking the buffer also cleared it,
+        //    keeping `take_sent_ciphertexts` clean for later
+        //    application-ciphertext assertions.
+        for (_routing_id, ct) in captured {
+            self.crypto
+                .deposit_sender_key_message(&ctx_bytes, member_did, ct);
         }
 
         // NOTE: the new member's access keys are NOT pushed here. The creator
@@ -758,7 +789,7 @@ impl FullStackNode {
     /// removal Commit for every remaining member on another node to merge
     /// with [`Self::feed_pending_incoming`].
     ///
-    /// `execute_remove_member` broadcasts the raw epoch-advance Commit first
+    /// `execute_remove_member` broadcasts the framed epoch-advance Commit first
     /// and then pushes this node's rotated sender key, sealed to each
     /// recipient separately, so the first captured send is the Commit. The
     /// sender-key pushes carry no recipient the harness can read, so they are
@@ -1421,7 +1452,7 @@ impl FullStackNode {
         // Open through the real actor receive path (ADR-049 PR-7,
         // SCP-CRYPTOMOVE-001): `Supervisor::deliver_commit_blob` dispatches
         // `MessagingCommand::DeliverIncoming` to this node's context actor,
-        // which runs `decrypt_and_dispatch` (outer envelope → MLS decrypt →
+        // which runs `decrypt_and_dispatch` (MLS decrypt →
         // sender-key decrypt → inner envelope → anti-replay) followed by the
         // §9.17 access-key unwrap, returning the recovered plaintext. The
         // provider `open` twin is deleted; the actor is the sole crypto
@@ -1448,11 +1479,12 @@ impl FullStackNode {
     /// whose `decrypt_and_dispatch` merges Commits (advancing the MLS epoch) and
     /// installs authenticated sender keys through the same gate-before-install
     /// path production uses. Commits are applied BEFORE sender-key blobs so a
-    /// sender key wrapped at a post-Commit epoch is decryptable. Sender-key
-    /// blobs are full `OuterEnvelope`s (harvested from the inviter's transport
-    /// in [`Self::add_member`]); raw Commits are wrapped in a throwaway
-    /// `OuterEnvelope` first. `deliver_commit_blob` returns `None` for both
-    /// (Control / Management), so the `Option` is intentionally discarded.
+    /// sender key wrapped at a post-Commit epoch is decryptable. Both kinds of
+    /// blob are the serialized MLS message the actor handed its transport,
+    /// which is the `encrypted_blob` a relay delivers in the one
+    /// `OuterEnvelope` (ADR-002, spec 23 §23.4.1). `deliver_commit_blob`
+    /// returns `None` for both (Control /
+    /// Management), so the `Option` is intentionally discarded.
     ///
     /// # Errors
     ///
@@ -1462,14 +1494,9 @@ impl FullStackNode {
         context_id_str: &str,
         context_id: &[u8; 32],
     ) -> Result<(), ContextError> {
-        for commit_bytes in self.crypto.take_pending_commits(context_id) {
-            let wrapped = wrap_raw_mls_message(context_id_str, commit_bytes)?;
-            let _ = self
-                .manager
-                .deliver_commit_blob(context_id_str, wrapped, DeliveryMode::Live)
-                .await?;
-        }
-        for wrapped in self.crypto.take_pending_sender_key_messages(context_id) {
+        let commits = self.crypto.take_pending_commits(context_id);
+        let sender_keys = self.crypto.take_pending_sender_key_messages(context_id);
+        for wrapped in commits.into_iter().chain(sender_keys) {
             let _ = self
                 .manager
                 .deliver_commit_blob(context_id_str, wrapped, DeliveryMode::Live)
@@ -1525,18 +1552,4 @@ fn harness_pseudonym(did: &DID, ctx: &str) -> [u8; 32] {
     // Guarantee non-zero (spawn refuses the all-zero pseudonym).
     pseudonym[31] = 0xA5;
     pseudonym
-}
-
-/// Builds a throwaway `OuterEnvelope` wrapping a raw MLS message and returns
-/// its serialized bytes, for feeding a bare Commit through the provider's
-/// `open` path (which expects an `OuterEnvelope`).
-pub(super) fn wrap_raw_mls_message(
-    context_id: &str,
-    mls_bytes: Vec<u8>,
-) -> Result<Vec<u8>, ContextError> {
-    let routing_id = context_routing_id(context_id);
-    let outer = scp_core::envelope::outer::create_outer_envelope(&routing_id, None, 0, mls_bytes)
-        .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
-    rmp_serde::to_vec_named(&outer)
-        .map_err(|e| ContextError::CryptoFailed(format!("outer envelope serialization: {e}")))
 }

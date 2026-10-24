@@ -18,12 +18,13 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 
+use scp_core::context::actor::commands::{DeliverOutcome, DeliveryMode};
 use scp_core::context::builder::ContextEventLogProvider;
 use scp_core::context::membership::ContextEvent;
 use scp_core::context::{
-    Capability, ContextMode, ContextParams, ContextState, context_id_bytes, context_routing_id,
+    Capability, ContextError, ContextMode, ContextParams, ContextState, context_id_bytes,
+    context_routing_id,
 };
-use scp_core::envelope::outer::create_outer_envelope;
 use scp_did::DID;
 use scp_testing::fullstack::FullStackNetwork;
 use scp_transport::native::adapter::NativeRelayAdapter;
@@ -462,18 +463,48 @@ async fn fullstack_governance_with_real_crypto() {
         );
     }
 
-    // Bob must NOT be able to open the removal Commit: he was just removed, so he
-    // cannot derive the post-removal epoch's keys (MLS forward secrecy). The
-    // first captured management blob is the epoch-advance Commit.
+    // The removal Commit is framed under the epoch Bob still holds, so Bob
+    // processes it like any member. The first captured management blob is that
+    // Commit.
     let commit_bytes = &removal_traffic[0].1;
-    let commit_decrypt = bob
-        .decrypt_message(ctx_id, &ctx_bytes, commit_bytes, ALICE_DID)
+    let processed = bob
+        .manager
+        .deliver_commit_blob(ctx_id, commit_bytes.clone(), DeliveryMode::Live)
         .await;
     assert!(
-        commit_decrypt.is_err(),
-        "Bob must NOT decrypt post-removal traffic (MLS forward secrecy)"
+        matches!(processed, Ok(None)),
+        "Bob merges the Commit that removes him (a control message): {processed:?}"
     );
-    println!("  [4] Removal management traffic on shared RID; Bob cannot open it");
+
+    // Bob never holds the post-removal epoch's secrets. Alice applies the
+    // Remove proposal, blanking Bob's leaf, before she encrypts the Commit's
+    // UpdatePath (RFC 9420 §12.4.2), so no path secret is encrypted to Bob and
+    // he cannot derive the new epoch's keys. openmls records that state as
+    // eviction and refuses every later use of Bob's group (`UseAfterEviction`
+    // is its state guard, not the cryptographic cause). Alice's next Commit is
+    // later-epoch traffic; her actor hands it to its transport first.
+    drop(alice.take_sent_ciphertexts());
+    alice.manager.issue_mls_update(ctx_id).await.unwrap();
+    let (_routing_id, next_epoch_commit) = alice
+        .take_sent_ciphertexts()
+        .into_iter()
+        .next()
+        .expect("the Update sends its Commit");
+    let refused = bob
+        .manager
+        .deliver_commit_blob(ctx_id, next_epoch_commit, DeliveryMode::Live)
+        .await;
+    assert!(
+        matches!(
+            &refused,
+            Err(ContextError::CryptoFailed(m))
+                if m.contains("Tried to use a group after being evicted from it.")
+        ),
+        "Bob's evicted group must refuse post-removal traffic: {refused:?}"
+    );
+    println!(
+        "  [4] Removal management traffic on shared RID; Bob holds no post-removal epoch secret"
+    );
 
     // Alice sends an application message after removing Bob. Bob's pseudonym was
     // purged from the peer registry, leaving Alice the lone member. Under §9.10.4
@@ -832,23 +863,13 @@ async fn full_stack_relay_encrypted_roundtrip() {
         ciphertext.len()
     );
 
-    // 5. The captured bytes are a serialized OuterEnvelope. Deserialize to
-    //    extract the inner envelope for relay transport, then re-wrap with the
-    //    same per-member pseudonym routing ID the send addressed (§9.10.4): Bob
+    // 5. The captured bytes are the serialized MLS message the actor handed
+    //    its transport, addressed to Bob's per-member pseudonym (§9.10.4): Bob
     //    subscribes to his own pseudonym, the routing ID the relay delivers on.
-    let captured_outer: scp_core::envelope::OuterEnvelope =
-        rmp_serde::from_slice(ciphertext).unwrap();
-    let routing_id = bob_pseudonym; // Bob's per-member pseudonym routing ID
-    let outer_envelope = create_outer_envelope(
-        &routing_id,
-        None,
-        3600,
-        captured_outer.encrypted_blob.clone(),
-    )
-    .unwrap();
-    println!(
-        "  [5] Wrapped in OuterEnvelope (routing_id: {}...)",
-        &hex::encode(routing_id)[..16]
+    let routing_id = bob_pseudonym;
+    assert!(
+        scp_core::envelope::OuterEnvelope::from_bytes(ciphertext).is_err(),
+        "the actor hands its transport the MLS message, not an envelope (ADR-002)"
     );
 
     // 6. Connect to relay: Bob subscribes first, then Alice sends.
@@ -873,26 +894,28 @@ async fn full_stack_relay_encrypted_roundtrip() {
     )
     .await
     .unwrap();
-    let blob_id = alice_adapter.send(&outer_envelope).await.unwrap();
-    assert_eq!(blob_id.as_bytes().len(), 32, "blob_id must be 32 bytes");
-    println!(
-        "  [6] Published to relay (blob_id: {}...)",
-        hex::encode(&blob_id.as_bytes()[..8])
-    );
+    // The production `RelayTransportProvider` frames the MLS message in the
+    // one relay-visible envelope (ADR-002, spec 23 §23.4.1).
+    let alice_provider = scp_transport::RelayTransportProvider::new(alice_adapter);
+    scp_core::context::builder::ContextTransportProvider::send_message(
+        &alice_provider,
+        &routing_id,
+        ciphertext,
+    )
+    .await
+    .unwrap();
+    println!("  [6] Published to relay through RelayTransportProvider");
 
     // 7. Bob receives envelope from the relay.
     let received_outer = receive_envelope(&mut stream).await;
     assert_eq!(
-        received_outer.routing_id, outer_envelope.routing_id,
+        received_outer.routing_id,
+        routing_id.to_vec(),
         "routing_id must match"
     );
     assert_eq!(
-        received_outer.blob_ttl, outer_envelope.blob_ttl,
-        "blob_ttl must match"
-    );
-    assert_eq!(
-        received_outer.encrypted_blob, outer_envelope.encrypted_blob,
-        "encrypted_blob must survive relay transit intact"
+        &received_outer.encrypted_blob, ciphertext,
+        "the relayed envelope's encrypted_blob is the MLS message itself"
     );
     println!(
         "  [7] Bob received envelope from relay ({} bytes encrypted_blob)",
@@ -921,11 +944,14 @@ async fn full_stack_relay_encrypted_roundtrip() {
         "the relayed blob must not decode as an inner envelope"
     );
 
-    // 8. Bob decrypts using the original captured envelope (which is the
-    //    full serialized OuterEnvelope from the send pipeline).
-    //    The relay roundtrip above verified the encrypted_blob survived intact.
+    // 8. Bob decrypts the MLS message the relay delivered.
     let decrypted = bob
-        .decrypt_message(ctx_id, &ctx_bytes, ciphertext, ALICE_DID)
+        .decrypt_message(
+            ctx_id,
+            &ctx_bytes,
+            &received_outer.encrypted_blob,
+            ALICE_DID,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -1023,6 +1049,7 @@ async fn full_stack_relay_multiple_messages() {
     let routing_id = bob_pseudonym;
     let bob_routing = RoutingId::new(routing_id);
     let mut stream = bob_adapter.subscribe(&bob_routing, None).await.unwrap();
+    let alice_provider = scp_transport::RelayTransportProvider::new(alice_adapter);
 
     // Send 3 messages and verify each roundtrips through the relay.
     for i in 0..3u32 {
@@ -1044,28 +1071,24 @@ async fn full_stack_relay_multiple_messages() {
             "message {i} must NEVER address the shared context_routing_id (§9.10.4)"
         );
 
-        // The captured bytes are a serialized OuterEnvelope. Extract the
-        // encrypted_blob for relay transport.
-        let captured_outer: scp_core::envelope::OuterEnvelope =
-            rmp_serde::from_slice(ciphertext).unwrap();
-        let outer = create_outer_envelope(
+        // The captured bytes are the serialized MLS message; the production
+        // transport provider frames it once (ADR-002).
+        scp_core::context::builder::ContextTransportProvider::send_message(
+            &alice_provider,
             &routing_id,
-            None,
-            3600,
-            captured_outer.encrypted_blob.clone(),
+            ciphertext,
         )
+        .await
         .unwrap();
-        alice_adapter.send(&outer).await.unwrap();
 
-        // Bob receives from relay and verifies blob transit, then decrypts
-        // using the original captured envelope.
+        // Bob receives from relay and decrypts what it delivered.
         let received = receive_envelope(&mut stream).await;
         assert_eq!(
-            received.encrypted_blob, captured_outer.encrypted_blob,
-            "encrypted_blob must survive relay transit"
+            &received.encrypted_blob, ciphertext,
+            "the relayed encrypted_blob is the MLS message"
         );
         let decrypted = bob
-            .decrypt_message(ctx_id, &ctx_bytes, ciphertext, ALICE_DID)
+            .decrypt_message(ctx_id, &ctx_bytes, &received.encrypted_blob, ALICE_DID)
             .await
             .unwrap();
         assert_eq!(
@@ -1168,28 +1191,6 @@ async fn full_stack_relay_three_party() {
         .map(|(_, ct)| ct.clone())
         .expect("a send addressed to Carol's pseudonym must exist");
 
-    // Extract each peer's encrypted_blob from its captured OuterEnvelope and
-    // re-wrap addressed to that peer's own pseudonym (the routing ID the relay
-    // delivers on for that recipient).
-    let bob_captured_outer: scp_core::envelope::OuterEnvelope =
-        rmp_serde::from_slice(&bob_ciphertext).unwrap();
-    let carol_captured_outer: scp_core::envelope::OuterEnvelope =
-        rmp_serde::from_slice(&carol_ciphertext).unwrap();
-    let bob_outer = create_outer_envelope(
-        &bob_pseudonym,
-        None,
-        3600,
-        bob_captured_outer.encrypted_blob.clone(),
-    )
-    .unwrap();
-    let carol_outer = create_outer_envelope(
-        &carol_pseudonym,
-        None,
-        3600,
-        carol_captured_outer.encrypted_blob.clone(),
-    )
-    .unwrap();
-
     let sourced = SourcedRelayUrl {
         url: relay_url,
         source: RelayUrlSource::DhtResolved,
@@ -1223,18 +1224,31 @@ async fn full_stack_relay_three_party() {
     )
     .await
     .unwrap();
-    alice_adapter.send(&bob_outer).await.unwrap();
-    alice_adapter.send(&carol_outer).await.unwrap();
+    // The production transport provider frames each peer's MLS message once,
+    // addressed to that peer's own pseudonym (ADR-002, §9.10.4).
+    let alice_provider = scp_transport::RelayTransportProvider::new(alice_adapter);
+    for (pseudonym, ct) in [
+        (&bob_pseudonym, &bob_ciphertext),
+        (&carol_pseudonym, &carol_ciphertext),
+    ] {
+        scp_core::context::builder::ContextTransportProvider::send_message(
+            &alice_provider,
+            pseudonym,
+            ct,
+        )
+        .await
+        .unwrap();
+    }
     println!("  [2] Published per-peer envelopes to relay");
 
     // Bob receives on his pseudonym and verifies relay transit, then decrypts.
     let bob_received = receive_envelope(&mut bob_stream).await;
     assert_eq!(
-        bob_received.encrypted_blob, bob_captured_outer.encrypted_blob,
-        "encrypted_blob must survive relay transit"
+        bob_received.encrypted_blob, bob_ciphertext,
+        "the relayed encrypted_blob is Bob's MLS message"
     );
     let bob_decrypted = bob
-        .decrypt_message(ctx_id, &ctx_bytes, &bob_ciphertext, ALICE_DID)
+        .decrypt_message(ctx_id, &ctx_bytes, &bob_received.encrypted_blob, ALICE_DID)
         .await
         .unwrap();
     assert_eq!(bob_decrypted.as_slice(), msg.as_slice());
@@ -1243,11 +1257,16 @@ async fn full_stack_relay_three_party() {
     // Carol receives on her pseudonym and verifies relay transit, then decrypts.
     let carol_received = receive_envelope(&mut carol_stream).await;
     assert_eq!(
-        carol_received.encrypted_blob, carol_captured_outer.encrypted_blob,
-        "encrypted_blob must survive relay transit"
+        carol_received.encrypted_blob, carol_ciphertext,
+        "the relayed encrypted_blob is Carol's MLS message"
     );
     let carol_decrypted = carol
-        .decrypt_message(ctx_id, &ctx_bytes, &carol_ciphertext, ALICE_DID)
+        .decrypt_message(
+            ctx_id,
+            &ctx_bytes,
+            &carol_received.encrypted_blob,
+            ALICE_DID,
+        )
         .await
         .unwrap();
     assert_eq!(carol_decrypted.as_slice(), msg.as_slice());
@@ -1386,4 +1405,301 @@ async fn fullstack_direct_execute_genuine_runs_once_then_replay_rejected() {
         format!("{err}").contains("already been executed"),
         "replay rejection should name the executed proposal: {err}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// C7. A relayed governance Commit reaches a live member
+// ---------------------------------------------------------------------------
+
+const DAVE_DID: &str = "did:dht:z6MkDaveFullStack";
+
+/// Connects a relay client to the relay at `url`.
+async fn connect_relay(url: &str) -> NativeRelayAdapter {
+    NativeRelayAdapter::connect_sourced(
+        &SourcedRelayUrl {
+            url: url.to_owned(),
+            source: RelayUrlSource::DhtResolved,
+        },
+        None,
+        scp_transport::native::adapter::CoverTraffic::Off,
+    )
+    .await
+    .unwrap()
+}
+
+/// Alice removes `member_did` and the removal Commit stays unrelayed. Returns
+/// the routing ID and the bytes her actor handed its transport.
+async fn take_removal_commit(
+    alice: &scp_testing::fullstack::FullStackNode,
+    handle: &scp_core::context::ContextHandle,
+    member_did: &str,
+) -> ([u8; 32], Vec<u8>) {
+    drop(alice.take_sent_ciphertexts());
+    alice
+        .manager
+        .leave_context(handle, &DID::from(ALICE_DID), &DID::from(member_did))
+        .await
+        .unwrap();
+    // `execute_remove_member` broadcasts the Commit before it pushes the
+    // rotated sender keys, so the first send is the Commit.
+    let (routing_id, commit) = alice
+        .take_sent_ciphertexts()
+        .into_iter()
+        .next()
+        .expect("removing a member sends its Commit");
+    assert_eq!(routing_id, context_routing_id(handle.context_id()));
+    (routing_id, commit)
+}
+
+/// Alice removes `member_did`, and the bytes her actor handed its transport
+/// for the removal Commit go to the relay through `provider`, the production
+/// `RelayTransportProvider`. Returns the envelope the relay delivers to a
+/// subscriber of the shared context routing ID.
+async fn relay_removal_commit(
+    alice: &scp_testing::fullstack::FullStackNode,
+    handle: &scp_core::context::ContextHandle,
+    member_did: &str,
+    provider: &scp_transport::RelayTransportProvider<NativeRelayAdapter>,
+    stream: &mut scp_transport::traits::SubscriptionStream,
+) -> scp_core::envelope::OuterEnvelope {
+    use scp_core::context::builder::ContextTransportProvider;
+    let (routing_id, commit) = take_removal_commit(alice, handle, member_did).await;
+    provider.send_message(&routing_id, &commit).await.unwrap();
+    receive_envelope(stream).await
+}
+
+/// Alice's encrypted context `ctx_id` with Bob, Carol and Dave as members,
+/// and Bob's group at Alice's epoch e.
+async fn removal_scene(
+    network: &FullStackNetwork,
+    ctx_id: &str,
+) -> (
+    scp_testing::fullstack::FullStackNode,
+    scp_testing::fullstack::FullStackNode,
+    scp_core::context::ContextHandle,
+) {
+    let alice = network.create_node(ALICE_DID);
+    let bob = network.create_node(BOB_DID);
+    let carol = network.create_node(CAROL_DID);
+    let dave = network.create_node(DAVE_DID);
+    let ctx_bytes = context_id_bytes(ctx_id);
+    let handle = alice
+        .create_context(ctx_id, encrypted_params())
+        .await
+        .unwrap();
+    for (did, node) in [(BOB_DID, &bob), (CAROL_DID, &carol), (DAVE_DID, &dave)] {
+        alice.add_member(&handle, did).await.unwrap();
+        node.join_from_welcome(ctx_id, &ctx_bytes).await.unwrap();
+    }
+    // Bob merges the Commits that added Carol and Dave.
+    bob.feed_pending_incoming(ctx_id, &ctx_bytes).await.unwrap();
+    (alice, bob, handle)
+}
+
+/// The production catch-up QUERY of the shared routing ID of `ctx_id`, of
+/// everything the relay stores for it (`since` 0).
+async fn catch_up_pull(
+    url: &str,
+    ctx_id: &str,
+) -> Vec<scp_core::sync::hours_offline::BufferedMessage> {
+    let transport =
+        scp_transport::TransportManager::new(url.to_owned(), Box::new(connect_relay(url).await));
+    let now = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
+    scp_ffi_common::reconnect::pull_buffered(
+        &transport,
+        scp_ffi_common::reconnect::RelayScope::Installed,
+        ctx_id,
+        &[RoutingId::new(context_routing_id(ctx_id))],
+        0,
+        now,
+    )
+    .await
+    .unwrap()
+}
+
+/// A removal Commit Alice publishes through `RelayTransportProvider` reaches
+/// Bob's live subscription, and Bob's actor merges it (ADR-002, spec 23
+/// §23.4.1: the transport frames every MLS message once).
+///
+/// Alice removes Carol (Commit C1, epoch e to e+1) and then Dave (Commit C2,
+/// epoch e+1 to e+2). The relay hands Bob C2 first, which his group at epoch
+/// e refuses, and then C1, which he merges and which records his relay
+/// contact (ADR-029 §2 sync-state keys). C2 is not delivered live again, so
+/// his group stays at e+1 until a catch-up QUERY of the relay's whole history
+/// returns C2 and Bob reaches e+2.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_relayed_commit_refused_before_its_predecessor_merges_from_a_full_catch_up() {
+    use scp_core::store::sync::RelayContactStore;
+    let (relay_handle, relay_addr) = start_relay().await;
+    let url = format!("ws://{relay_addr}/scp/v1");
+
+    let network = FullStackNetwork::new();
+    let ctx_id = "relayed-commit-ctx";
+    let (alice, bob, handle) = removal_scene(&network, ctx_id).await;
+
+    let bob_adapter = connect_relay(&url).await;
+    let mut stream = bob_adapter
+        .subscribe(&RoutingId::new(context_routing_id(ctx_id)), None)
+        .await
+        .unwrap();
+    let provider = scp_transport::RelayTransportProvider::new(connect_relay(&url).await);
+
+    let c1 = relay_removal_commit(&alice, &handle, CAROL_DID, &provider, &mut stream).await;
+    let c2 = relay_removal_commit(&alice, &handle, DAVE_DID, &provider, &mut stream).await;
+
+    // A live subscription hands the actor the envelope's `encrypted_blob`.
+    let supervisor = Arc::downgrade(&bob.manager);
+    let contacts = scp_core::store::sync::StorageRelayContactStore::new(Arc::new(
+        scp_platform::in_memory::InMemoryStorage::new(),
+    ));
+    let deliver = |envelope: &scp_core::envelope::OuterEnvelope| {
+        scp_ffi_common::reconnect::deliver_live_envelope(
+            &supervisor,
+            &contacts,
+            ctx_id,
+            envelope.encrypted_blob.clone(),
+        )
+    };
+
+    let early = deliver(&c2).await.expect("Bob's supervisor is alive");
+    assert!(
+        early.delivered.is_err(),
+        "Bob's group at epoch e must refuse C2, an epoch e+1 Commit: {early:?}"
+    );
+    let first = deliver(&c1).await.expect("Bob's supervisor is alive");
+    assert!(
+        matches!(first.delivered, Ok(DeliverOutcome::Handled)),
+        "Bob must merge the relayed removal Commit C1: {first:?}"
+    );
+    assert!(first.contact_error.is_none(), "{first:?}");
+    assert!(
+        contacts
+            .load_last_relay_contact(ctx_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "the accepted live delivery of C1 records the relay contact"
+    );
+
+    // A catch-up QUERY of the relay's whole history feeds what it returns.
+    let pulled = catch_up_pull(&url, ctx_id).await;
+    assert!(
+        pulled.iter().any(|m| m.payload == c2.encrypted_blob),
+        "the catch-up QUERY returns the refused C2"
+    );
+    let tally = scp_ffi_common::reconnect::DeliveryTally::default();
+    let fed = scp_ffi_common::reconnect::deliver_commit_blobs_until_steady(
+        &bob.manager,
+        ctx_id,
+        &pulled,
+        pulled.len(),
+        DeliveryMode::Live,
+        &tally,
+    )
+    .await;
+    assert_eq!(
+        fed.accepted, 1,
+        "the catch-up merges C2 and refuses the replayed C1"
+    );
+    let replay = deliver(&c2).await.expect("Bob's supervisor is alive");
+    assert!(
+        replay.delivered.is_err(),
+        "the catch-up merged C2, so a replay of C2 must be refused: {replay:?}"
+    );
+
+    let replay = deliver(&c1).await.expect("Bob's supervisor is alive");
+    assert!(
+        replay.delivered.is_err(),
+        "Bob's group left epoch e, so a replay of C1 must be refused: {replay:?}"
+    );
+
+    relay_handle.shutdown();
+}
+
+/// Spec 23 §23.3 Phase 5: a Phase 5 Update whose publish fails keeps its
+/// Commit in the retry queue and reports the failure, and a peer opens that
+/// Commit once it is relayed through `RelayTransportProvider`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_phase_5_update_stays_queued_and_a_peer_opens_it_over_the_relay() {
+    use scp_core::context::builder::ContextTransportProvider;
+    let (relay_handle, relay_addr) = start_relay().await;
+    let url = format!("ws://{relay_addr}/scp/v1");
+
+    let network = FullStackNetwork::new();
+    let alice = network.create_node(ALICE_DID);
+    let bob = network.create_node(BOB_DID);
+    let ctx_id = "phase-5-update-ctx";
+    let ctx_bytes = context_id_bytes(ctx_id);
+    let handle = alice
+        .create_context(ctx_id, encrypted_params())
+        .await
+        .unwrap();
+    alice.add_member(&handle, BOB_DID).await.unwrap();
+    bob.join_from_welcome(ctx_id, &ctx_bytes).await.unwrap();
+    let alice_epoch = alice.manager.local_mls_epoch(ctx_id).await;
+    assert!(alice.manager.pending_commits(ctx_id).await.is_empty());
+
+    drop(alice.take_sent_ciphertexts());
+    alice.set_sends_failing(true);
+    let update = alice.manager.issue_mls_update(ctx_id).await;
+    assert!(
+        matches!(&update, Err(ContextError::TransportFailed(_))),
+        "a failed Phase 5 publish is reported: {update:?}"
+    );
+    assert_eq!(
+        alice.manager.local_mls_epoch(ctx_id).await,
+        alice_epoch.map(|e| e + 1),
+        "the Update's epoch advance is durable"
+    );
+    let queued = alice.manager.pending_commits(ctx_id).await;
+    assert_eq!(queued.len(), 1, "the Update's Commit is queued for retry");
+    assert_eq!(
+        queued[0].operation,
+        scp_core::context::state::CommitOperation::ReconnectMlsUpdate
+    );
+    assert_eq!(queued[0].routing_id, context_routing_id(ctx_id));
+    alice.set_sends_failing(false);
+
+    let bob_adapter = connect_relay(&url).await;
+    let mut stream = bob_adapter
+        .subscribe(&RoutingId::new(context_routing_id(ctx_id)), None)
+        .await
+        .unwrap();
+    let provider = scp_transport::RelayTransportProvider::new(connect_relay(&url).await);
+    provider
+        .send_message(&queued[0].routing_id, &queued[0].commit_bytes)
+        .await
+        .unwrap();
+    let envelope = receive_envelope(&mut stream).await;
+    assert_eq!(envelope.encrypted_blob, queued[0].commit_bytes);
+
+    let contacts = scp_core::store::sync::StorageRelayContactStore::new(Arc::new(
+        scp_platform::in_memory::InMemoryStorage::new(),
+    ));
+    let delivered = scp_ffi_common::reconnect::deliver_live_envelope(
+        &Arc::downgrade(&bob.manager),
+        &contacts,
+        ctx_id,
+        envelope.encrypted_blob,
+    )
+    .await
+    .expect("Bob's supervisor is alive");
+    assert!(
+        matches!(delivered.delivered, Ok(DeliverOutcome::Handled)),
+        "Bob opens the relayed Phase 5 Commit: {delivered:?}"
+    );
+    let replay = scp_ffi_common::reconnect::deliver_live_envelope(
+        &Arc::downgrade(&bob.manager),
+        &contacts,
+        ctx_id,
+        queued[0].commit_bytes.clone(),
+    )
+    .await
+    .expect("Bob's supervisor is alive");
+    assert!(
+        replay.delivered.is_err(),
+        "Bob's group left the Update's epoch, so a replay is refused: {replay:?}"
+    );
+
+    relay_handle.shutdown();
 }

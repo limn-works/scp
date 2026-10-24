@@ -257,8 +257,9 @@ pub enum MessagingCommand {
     DeliverIncoming {
         /// Context identifier.
         context_id: String,
-        /// Encrypted envelope bytes (outer blob as received from the
-        /// relay).
+        /// The serialized MLS message: the `encrypted_blob` of the one
+        /// `OuterEnvelope` the transport unframed (ADR-002, spec 23
+        /// §23.4.1).
         envelope_bytes: Vec<u8>,
         /// Whether handling this envelope may send queued sender-key
         /// answers.
@@ -1204,15 +1205,17 @@ pub enum LifecycleCommand {
     /// (which calls `ratchet::propose_update_with_wrapping_key`,
     /// preserving the `scp_wrapping_key` leaf extension per §9.16.1).
     ///
-    /// The reply carries the TLS-serialized MLS Commit bytes that the
-    /// caller MUST distribute to all group members. Used by the
-    /// reconnection driver's Phase 5 (`mls_update`).
+    /// The actor publishes the Update Commit through its Commit broadcast
+    /// and retry queue (spec 23 §23.3 Phase 5). The reply is `Ok(())` once
+    /// the Commit reached the transport, and an error when the Update
+    /// failed or its publish failed and the Commit sits queued for retry.
+    /// Used by the reconnection driver's Phase 5 (`mls_update`).
     IssueMlsUpdate {
         /// Context identifier.
         context_id: String,
-        /// Oneshot reply channel carrying the serialized MLS Commit
-        /// bytes for distribution.
-        reply: oneshot::Sender<Result<Vec<u8>, ContextError>>,
+        /// Oneshot reply channel: `Ok(())` when the Update Commit was
+        /// published, otherwise the failure.
+        reply: oneshot::Sender<Result<(), ContextError>>,
     },
 }
 

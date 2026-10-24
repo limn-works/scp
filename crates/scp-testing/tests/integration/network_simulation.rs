@@ -360,14 +360,14 @@ async fn end_to_end_network_demo() {
     assert_eq!(sent.len(), 1, "exactly one ciphertext for the one peer");
     let (sent_routing, sealed) = sent.remove(0);
     assert_eq!(sent_routing, routing_arr, "addressed to Bob's pseudonym");
-    // The harness captures the sealed envelope and its routing id separately;
-    // the transport layer addresses the blob to Bob's pseudonym.
-    let captured = scp_core::envelope::OuterEnvelope::from_bytes(&sealed).unwrap();
-    let outer_env = scp_core::envelope::outer::create_outer_envelope(
+    // The harness captures the serialized MLS message and its routing id
+    // separately; the transport frames the message once, addressed to Bob's
+    // pseudonym (ADR-002, spec 23 §23.4.1).
+    let outer_env = scp_core::envelope::OuterEnvelope::frame_mls_message(
         &routing_arr,
         None,
-        captured.blob_ttl,
-        captured.encrypted_blob.clone(),
+        3600,
+        sealed.clone(),
     )
     .unwrap();
 
@@ -430,12 +430,17 @@ async fn end_to_end_network_demo() {
     );
 
     assert_eq!(
-        received_outer.encrypted_blob, captured.encrypted_blob,
-        "the relay delivers the sealed blob unchanged"
+        received_outer.encrypted_blob, sealed,
+        "the relay delivers the MLS message unchanged"
     );
     let outer_bytes = received_outer.to_bytes().unwrap();
     let decrypted_msg = bob_node
-        .decrypt_message(ctx_id, &ctx_bytes, &sealed, alice_did_str)
+        .decrypt_message(
+            ctx_id,
+            &ctx_bytes,
+            &received_outer.encrypted_blob,
+            alice_did_str,
+        )
         .await
         .unwrap();
     let msg_str = String::from_utf8_lossy(&decrypted_msg);

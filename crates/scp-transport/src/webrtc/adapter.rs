@@ -277,13 +277,11 @@ impl TransportAdapter for WebRtcAdapter {
 
                     match provider.recv_data(&label).await {
                         Ok(Some(raw_bytes)) => {
-                            let event = match OuterEnvelope::from_bytes(&raw_bytes) {
+                            let event = match OuterEnvelope::unframe_mls_message(&raw_bytes) {
                                 Ok(envelope) => TransportEvent::Envelope(envelope),
                                 Err(e) => {
                                     warn!(error = %e, "failed to deserialize envelope from WebRTC data channel");
-                                    TransportEvent::Error(TransportError::ProtocolError(format!(
-                                        "invalid envelope in data channel message: {e}"
-                                    )))
+                                    TransportEvent::Error(TransportError::from(e))
                                 }
                             };
                             Some((event, (provider, label, false)))
@@ -671,15 +669,10 @@ mod tests {
         let mut stream = adapter.subscribe(&routing_id, None).await.unwrap();
         let event = stream.next().await.expect("stream should yield an event");
 
-        // Must be a ProtocolError, not a panic or a successful parse.
+        // Must be the typed frame error, not a panic or a successful parse.
         match event {
-            TransportEvent::Error(TransportError::ProtocolError(msg)) => {
-                assert!(
-                    msg.contains("invalid envelope"),
-                    "expected size-guard error, got: {msg}"
-                );
-            }
-            other => panic!("expected ProtocolError for oversized payload, got {other:?}"),
+            TransportEvent::Error(TransportError::MalformedFrame(_)) => {}
+            other => panic!("expected MalformedFrame for oversized payload, got {other:?}"),
         }
     }
 
