@@ -2144,6 +2144,7 @@ mod tests {
             &proposal_id,
             Some(&DID(CREATOR_DID.to_owned())),
             None,
+            None,
         )
         .await;
 
@@ -2214,6 +2215,7 @@ mod tests {
             &proposal_id,
             Some(&DID(CREATOR_DID.to_owned())),
             None,
+            None,
         )
         .await;
 
@@ -2253,6 +2255,7 @@ mod tests {
             &ctx_hex,
             &proposal_id,
             Some(&DID(CREATOR_DID.to_owned())),
+            None,
             None,
         )
         .await;
@@ -2312,6 +2315,7 @@ mod tests {
             &ctx_hex,
             &proposal_id,
             Some(&DID(CREATOR_DID.to_owned())),
+            None,
             None,
         )
         .await;
@@ -2402,6 +2406,7 @@ mod tests {
             &proposal_id,
             Some(&DID(CREATOR_DID.to_owned())),
             None,
+            None,
         )
         .await;
 
@@ -2460,6 +2465,7 @@ mod tests {
                 &ctx_hex,
                 &proposal_id,
                 Some(&DID(CREATOR_DID.to_owned())),
+                None,
                 None,
             )
             .await;
@@ -2755,6 +2761,7 @@ mod tests {
                 actor_did: CREATOR_DID,
                 timestamp_secs: 1_700_000_000,
             },
+            None,
         )
         .await;
 
@@ -2832,6 +2839,7 @@ mod tests {
                 actor_did: CREATOR_DID,
                 timestamp_secs: 1_700_000_000,
             },
+            None,
         )
         .await;
 
@@ -2852,6 +2860,136 @@ mod tests {
                 .unwrap(),
             Some(42),
             "the destination's contact is kept"
+        );
+    }
+
+    /// A migration proposal executed while another bootstrap holds
+    /// `bootstrap_spawn_lock` fails at once with a retryable `ActorBusy` and
+    /// changes nothing: the turn runs on the source context's actor, and the
+    /// lock's holders wait on actor mailboxes, so it must not wait for the
+    /// lock.
+    #[tokio::test]
+    async fn migration_while_the_bootstrap_lock_is_held_is_busy_and_changes_nothing() {
+        let (supervisor, deps, appends, _recorded) = build_supervisor_and_deps().await;
+        let (state, ctx_hex) =
+            build_broadcast_state_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
+        let mut cell = ClassSCell::new(state);
+        appends.store(0, Ordering::SeqCst);
+        let epoch_before = cell.mutation_epoch();
+        let held = supervisor.bootstrap_spawn_lock.lock().await;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            crate::context::governance_helpers::execute_propose_context_migration(
+                &mut cell,
+                &deps,
+                &ctx_hex,
+                &undeliverable_destination_params(),
+                "fixture",
+                60,
+                false,
+                crate::context::governance_helpers::CommitMeta {
+                    pid: [0x79; 32],
+                    actor_did: CREATOR_DID,
+                    timestamp_secs: 1_700_000_000,
+                },
+                None,
+            ),
+        )
+        .await
+        .expect("the migration turn must not wait for the bootstrap lock");
+
+        assert!(
+            matches!(&result, Err(ContextError::ActorBusy(msg)) if msg.contains("retry")),
+            "{result:?}"
+        );
+        assert_eq!(cell.mutation_epoch(), epoch_before);
+        assert_eq!(cell.handle.state(), ContextState::Active);
+        assert!(cell.migration_state.is_none());
+        assert_eq!(appends.load(Ordering::SeqCst), 0, "no event was appended");
+        drop(held);
+    }
+
+    /// A single-admin migration proposal made while another bootstrap holds
+    /// `bootstrap_spawn_lock` fails with a retryable `ActorBusy` before the
+    /// proposal is recorded, so the same proposal made again once the lock is
+    /// free reaches the migration instead of a duplicate-proposal refusal.
+    #[tokio::test]
+    async fn a_busy_migration_proposal_records_nothing_and_its_retry_runs() {
+        use scp_protocol::context::governance::GovernanceAction;
+
+        let (supervisor, deps, appends, _recorded) = build_supervisor_and_deps().await;
+        let (mut state, ctx_hex) =
+            build_broadcast_state_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
+        let creator_vk = creator_key().verifying_key();
+        state.governance.engine =
+            Box::new(scp_protocol::context::governance::SingleAdminEngine::new(
+                DID(CREATOR_DID.to_owned()),
+                Arc::new(move |did: &DID, kid: SigningKeyId| {
+                    (did.as_ref() == CREATOR_DID && kid == SigningKeyId::Active)
+                        .then_some(creator_vk)
+                }),
+            ));
+        let mut cell = ClassSCell::new(state);
+        appends.store(0, Ordering::SeqCst);
+        let creator = DID(CREATOR_DID.to_owned());
+        let signer = crate::context::actor::CommandSigner::local_ed25519(creator_key());
+        let migrate = || GovernanceAction::ProposeContextMigration {
+            new_context_params: Box::new(undeliverable_destination_params()),
+            reason: "fixture".to_owned(),
+            grace_period_secs: 60,
+            auto_invite: false,
+        };
+
+        let held = supervisor.bootstrap_spawn_lock.lock().await;
+        let busy = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            crate::context::governance_helpers::propose_governance_action_inner(
+                &mut cell,
+                &deps,
+                &ctx_hex,
+                &creator,
+                migrate(),
+                &signer,
+                false,
+                None,
+            ),
+        )
+        .await
+        .expect("the propose turn must not wait for the bootstrap lock");
+        assert!(
+            matches!(&busy, Err(ContextError::ActorBusy(msg)) if msg.contains("retry")),
+            "{busy:?}"
+        );
+        assert!(
+            crate::context::governance_helpers::list_proposals(&cell).is_empty(),
+            "a busy migration proposal must record no proposal"
+        );
+        assert!(
+            cell.governance.proposal_timestamps.is_empty(),
+            "a busy migration proposal must spend no rate-limit slot"
+        );
+        assert_eq!(appends.load(Ordering::SeqCst), 0, "no event was appended");
+        drop(held);
+
+        let retried = crate::context::governance_helpers::propose_governance_action_inner(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &creator,
+            migrate(),
+            &signer,
+            false,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(
+                &retried,
+                Err(ContextError::PermissionDenied(msg))
+                    if msg.starts_with("failed to create destination context")
+            ),
+            "the retry must reach the migration's destination create; got {retried:?}"
         );
     }
 
@@ -2887,6 +3025,7 @@ mod tests {
                 &ctx_hex,
                 &proposal_id,
                 Some(&DID(CREATOR_DID.to_owned())),
+                None,
                 None,
             )
             .await;
@@ -2964,6 +3103,7 @@ mod tests {
             &proposal_id,
             Some(&DID(CREATOR_DID.to_owned())),
             None,
+            None,
         )
         .await;
 
@@ -3006,6 +3146,7 @@ mod tests {
             &ctx_hex,
             &proposal_id,
             Some(&DID(CREATOR_DID.to_owned())),
+            None,
             None,
         )
         .await;

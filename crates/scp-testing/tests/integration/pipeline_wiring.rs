@@ -3774,6 +3774,11 @@ fn first_relay_contact_written_before_the_actor_spawns() {
         (
             LIFECYCLE_HELPERS_SRC,
             "persist_first_state",
+            "first_state_writes(",
+        ),
+        (
+            LIFECYCLE_HELPERS_SRC,
+            "first_state_writes",
             "write_first_state(",
         ),
         (
@@ -3850,19 +3855,6 @@ fn first_state_is_ordered_guarded_and_refused_over_a_running_context() {
             "{entry} must commit its first-state guard only after the spawn"
         );
     }
-    for (entry, owner) in [
-        ("dispatch_lifecycle_direct", SUPERVISOR_SRC),
-        ("standing_context", SUPERVISOR_SRC),
-        ("execute_propose_context_migration", MANAGER_SRC),
-    ] {
-        let body = extract_fn_body(owner, entry).unwrap_or_else(|| panic!("{entry} not found"));
-        for callee in ["FirstStateRollback::new(", ".rollback()"] {
-            assert!(
-                body.contains(callee),
-                "{entry} must own a first-state guard and roll it back ({callee})"
-            );
-        }
-    }
     let body = extract_fn_body(SUPERVISOR_SRC, "dispatch_lifecycle_direct")
         .expect("dispatch_lifecycle_direct not found");
     let refusal = body
@@ -3878,8 +3870,16 @@ fn first_state_is_ordered_guarded_and_refused_over_a_running_context() {
     let body = extract_fn_body(MANAGER_SRC, "execute_propose_context_migration")
         .expect("execute_propose_context_migration not found");
     let lock = body
-        .find("lock_bootstrap_spawn()")
-        .expect("the migration must take bootstrap_spawn_lock");
+        .find("try_lock_bootstrap_spawn()")
+        .expect("the migration must try-lock bootstrap_spawn_lock");
+    let transition = body
+        .find("transition_to(&ContextState::MigratingOut)")
+        .expect("the migration must move its source to MigratingOut");
+    assert!(
+        lock < transition,
+        "the migration must try-lock before it changes the source, so a busy lock leaves it \
+         unchanged"
+    );
     let lookup = body
         .find("lookup(&destination_context_id)")
         .expect("the migration must look up its destination");
@@ -3890,6 +3890,108 @@ fn first_state_is_ordered_guarded_and_refused_over_a_running_context() {
         lock < lookup && lookup < create,
         "the migration must check its destination under the lock before it creates"
     );
+}
+
+/// ADR-049 Decision 9: a migration's busy `bootstrap_spawn_lock` is decided
+/// before the propose or vote that executes it records anything. Each path
+/// takes the guard after its last await before the engine records the
+/// proposal or the vote, and hands that guard to the execution, so a
+/// retryable `ActorBusy` leaves no proposal, vote, or rate-limit slot behind.
+#[test]
+fn a_migration_takes_the_bootstrap_lock_before_its_proposal_or_vote_is_recorded() {
+    for (entry, record) in [
+        ("propose_governance_action_inner", ".propose_signed("),
+        ("vote_on_proposal_inner", "engine.approve_signed("),
+    ] {
+        let body =
+            extract_fn_body(MANAGER_SRC, entry).unwrap_or_else(|| panic!("{entry} not found"));
+        let guard = body
+            .find("migration_bootstrap_guard(")
+            .unwrap_or_else(|| panic!("{entry} must take the migration's bootstrap guard"));
+        let recorded = body
+            .find(record)
+            .unwrap_or_else(|| panic!("{entry} must record through {record}"));
+        assert!(
+            guard < recorded,
+            "{entry} must take the bootstrap guard before {record}"
+        );
+        assert!(
+            !body[guard..recorded].contains(".await"),
+            "{entry} must not await between taking the guard and {record}"
+        );
+        let executed = body[recorded..]
+            .find("execute_governance_action(")
+            .map_or_else(
+                || panic!("{entry} must execute the approved action"),
+                |at| recorded + at,
+            );
+        let call = &body[executed..];
+        let call = &call[..call.find(".await").expect("the execute call is awaited")];
+        assert!(
+            call.contains("bootstrap_guard"),
+            "{entry} must hand its bootstrap guard to the execution"
+        );
+    }
+    let helper = extract_fn_body(MANAGER_SRC, "migration_bootstrap_guard")
+        .expect("migration_bootstrap_guard not found");
+    assert!(
+        helper.contains("try_lock_bootstrap_spawn()") && !helper.contains(".await"),
+        "the migration's bootstrap guard is try-locked, never awaited"
+    );
+}
+
+/// ADR-049 Decision 9 lock order: each bootstrap owns a first-state guard
+/// and rolls it back only after it released `bootstrap_spawn_lock`, since the
+/// rollback waits for abandoned writes before it retakes the lock; the
+/// migration, in an actor turn, rolls back without waiting for the lock.
+#[test]
+fn every_first_state_owner_rolls_back_after_releasing_the_bootstrap_lock() {
+    for (entry, owner, rollback) in [
+        (
+            "dispatch_lifecycle_direct",
+            SUPERVISOR_SRC,
+            ".rollback(self.bootstrap_spawn_lock.lock())",
+        ),
+        (
+            "standing_context",
+            SUPERVISOR_SRC,
+            ".rollback(self.bootstrap_spawn_lock.lock())",
+        ),
+        (
+            "spawn_actor_from_welcome",
+            SUPERVISOR_SRC,
+            ".rollback(self.bootstrap_spawn_lock.lock())",
+        ),
+        (
+            "execute_propose_context_migration",
+            MANAGER_SRC,
+            ".rollback_in_turn()",
+        ),
+    ] {
+        let body = extract_fn_body(owner, entry).unwrap_or_else(|| panic!("{entry} not found"));
+        for callee in ["FirstStateRollback::new(", rollback] {
+            assert!(
+                body.contains(callee),
+                "{entry} must own a first-state guard and roll it back ({callee})"
+            );
+        }
+        // Every rollback runs after the owner released `bootstrap_spawn_lock`:
+        // the rollback waits for abandoned writes, which can take its whole
+        // drain budget, and retakes the lock only for the restores.
+        let mut searched = 0;
+        while let Some(found) = body[searched..].find(rollback) {
+            let at = searched + found;
+            let taken = body[..at]
+                .rfind("let bootstrap_guard =")
+                .unwrap_or_else(|| panic!("{entry} must take bootstrap_spawn_lock"));
+            let released = body[..at].rfind("drop(bootstrap_guard)");
+            assert!(
+                released.is_some_and(|released| released > taken),
+                "{entry} must release bootstrap_spawn_lock before it rolls back"
+            );
+            searched = at + rollback.len();
+        }
+    }
 }
 
 /// ADR-049 Decision 9 and ADR-029 Implementation: the first-state writes run
@@ -3904,41 +4006,37 @@ fn first_state_writes_are_drained_and_finalize_runs_after_the_bootstrap_lock() {
     let busy = body
         .find("writes_idle.send_replace(false)")
         .expect("persist_first_state must mark its writes running");
+    let writes = body
+        .find("first_state_writes(")
+        .expect("persist_first_state must build its writes with first_state_writes");
     let spawn = body
         .find("spawn_tracked(")
         .expect("persist_first_state must run its writes on a tracked task");
     assert!(
-        busy < spawn,
+        busy < writes && writes < spawn,
         "persist_first_state must mark its writes running before the task can start"
     );
+    // The idle guard is built before the future, so a task dropped before its
+    // first poll still marks the writes idle, and the writes select on the
+    // shutdown token, so a hung write cannot hold shutdown's task drain.
+    let body = extract_fn_body(LIFECYCLE_HELPERS_SRC, "first_state_writes")
+        .expect("first_state_writes not found");
+    let idle_guard = body
+        .find("WritesIdleOnDrop(")
+        .expect("the writes must mark themselves idle however they end");
+    let future = body
+        .find("async move")
+        .expect("first_state_writes builds a future");
     assert!(
-        body.contains("WritesIdleOnDrop("),
-        "the writes task must mark itself idle however it ends"
+        idle_guard < future,
+        "first_state_writes must build its idle guard before the future"
     );
-    let body = extract_fn_body(LIFECYCLE_HELPERS_SRC, "undo").expect("undo not found");
-    let drain = body
-        .find("drain_writes()")
-        .expect("undo must wait for the writes task");
-    let touched = body
-        .find("touched()")
-        .expect("undo must read what was touched");
-    assert!(
-        drain < touched,
-        "undo must wait for the writes task before it reads what was touched"
-    );
-    let guard_drop = LIFECYCLE_HELPERS_SRC
-        .find("impl Drop for FirstStateRollback ")
-        .expect("FirstStateRollback must implement Drop");
-    let body = extract_fn_body(&LIFECYCLE_HELPERS_SRC[guard_drop..], "drop")
-        .expect("FirstStateRollback::drop not found");
-    let lock = body
-        .find("lock_bootstrap_spawn()")
-        .expect("the dropped guard's undo must take bootstrap_spawn_lock");
-    let undo = body.find(".undo()").expect("the dropped guard must undo");
-    assert!(
-        lock < undo,
-        "the dropped guard must take bootstrap_spawn_lock before it undoes"
-    );
+    for step in ["select!", "shutdown.cancelled()", "abandoned"] {
+        assert!(
+            body[future..].contains(step),
+            "the writes must end a bounded time after shutdown begins ({step})"
+        );
+    }
     for (owner, entry) in [
         (SUPERVISOR_SRC, "dispatch_lifecycle_direct"),
         (SUPERVISOR_SRC, "standing_context"),
@@ -3970,6 +4068,87 @@ fn first_state_writes_are_drained_and_finalize_runs_after_the_bootstrap_lock() {
             "{entry} must leave the gauge refresh and TTL timer to SpawnedContext::finalize"
         );
     }
+}
+
+/// ADR-049 Decision 9: every first-state rollback waits for the writes task
+/// before it reads what was touched, with `bootstrap_spawn_lock` released,
+/// and undoes under the lock; an in-turn rollback try-locks, and a dropped
+/// guard's undo runs on a tracked task that takes the lock.
+#[test]
+fn first_state_rollbacks_drain_before_they_take_the_bootstrap_lock() {
+    for entry in ["rollback", "rollback_in_turn"] {
+        let body = extract_fn_body(LIFECYCLE_HELPERS_SRC, entry)
+            .unwrap_or_else(|| panic!("{entry} not found"));
+        let drain = body
+            .find("drain_writes()")
+            .unwrap_or_else(|| panic!("{entry} must wait for the writes task"));
+        let touched = body
+            .find("touched()")
+            .unwrap_or_else(|| panic!("{entry} must read what was touched"));
+        let undo = body
+            .find("undo_locked()")
+            .unwrap_or_else(|| panic!("{entry} must undo"));
+        assert!(
+            drain < touched && touched < undo,
+            "{entry} must wait for the writes task before it reads what was touched"
+        );
+    }
+    let body = extract_fn_body(LIFECYCLE_HELPERS_SRC, "rollback").expect("rollback not found");
+    let drain = body.find("drain_writes()").expect("rollback drains");
+    let relock = body
+        .find("relock.await")
+        .expect("rollback must retake bootstrap_spawn_lock");
+    let undo = body.find("undo_locked()").expect("rollback undoes");
+    assert!(
+        drain < relock && relock < undo,
+        "rollback must drain with the lock released and undo under it"
+    );
+    let body = extract_fn_body(LIFECYCLE_HELPERS_SRC, "rollback_in_turn")
+        .expect("rollback_in_turn not found");
+    assert!(
+        body.contains("try_lock_bootstrap_spawn()")
+            && body.contains("spawn_under_bootstrap_spawn_lock("),
+        "the in-turn rollback must try-lock and hand a busy undo to a task"
+    );
+    let guard_drop = LIFECYCLE_HELPERS_SRC
+        .find("impl Drop for FirstStateRollback ")
+        .expect("FirstStateRollback must implement Drop");
+    let body = extract_fn_body(&LIFECYCLE_HELPERS_SRC[guard_drop..], "drop")
+        .expect("FirstStateRollback::drop not found");
+    let drain = body
+        .find("drain_writes()")
+        .expect("the dropped guard must wait for its writes");
+    let lock = body
+        .find("spawn_under_bootstrap_spawn_lock(")
+        .expect("the dropped guard's undo must run under bootstrap_spawn_lock");
+    let undo = body
+        .find("finish_deferred_undo()")
+        .expect("the dropped guard must undo");
+    assert!(
+        drain < lock && lock < undo,
+        "the dropped guard must drain before the lock and undo under it"
+    );
+    let handle_src =
+        include_str!("../../../../crates/scp-runtime/src/context/supervisor/handle.rs");
+    let body = extract_fn_body(handle_src, "spawn_under_bootstrap_spawn_lock")
+        .expect("spawn_under_bootstrap_spawn_lock not found");
+    let tracked = body
+        .find("spawn_tracked(")
+        .expect("the work runs on a tracked task");
+    let before = body
+        .find("before_lock.await")
+        .expect("the pre-lock work runs");
+    let lock = body
+        .find("lock_owned().await")
+        .expect("the task takes the lock");
+    let under = body
+        .find("under_lock().await")
+        .expect("the locked work runs");
+    assert!(
+        tracked < before && before < lock && lock < under,
+        "spawn_under_bootstrap_spawn_lock must run the pre-lock work, then the locked work \
+         under the lock, on a tracked task"
+    );
 }
 
 /// ADR-029 §2 push-wake pull mode step 5: a full reconnection sends the
@@ -8093,4 +8272,588 @@ fn record_relay_contact_is_the_one_relay_contact_writer() {
             "the {bridge} bridge must not write last_relay_contact itself"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Syntax-tree scans over every production file of a crate directory
+// ---------------------------------------------------------------------------
+
+/// Parses the production source of the crates under a directory and records,
+/// per function, the names it calls and the names it mentions.
+///
+/// "Production" follows the module tree from each crate root (`src/lib.rs`,
+/// `src/main.rs`, `src/bin/*.rs`, `build.rs`) and skips every item and module
+/// gated on `cfg(test)`, so a test module in its own file is skipped as well.
+/// Code inside an argument of a task spawn (`spawn`, `spawn_tracked`,
+/// `spawn_tracked_on`, `spawn_local`, `spawn_under_bootstrap_spawn_lock`)
+/// runs on its own task, so it is attributed to no function.
+mod syn_scan {
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+
+    use proc_macro2::{TokenStream, TokenTree};
+    use syn::visit::{self, Visit};
+
+    /// The calls whose arguments run on a task of their own.
+    const SPAWNS: [&str; 5] = [
+        "spawn",
+        "spawn_tracked",
+        "spawn_tracked_on",
+        "spawn_local",
+        "spawn_under_bootstrap_spawn_lock",
+    ];
+
+    /// One function's calls and mentions, outside spawned-task arguments.
+    #[derive(Debug, Default)]
+    pub struct FnFacts {
+        /// The self type of the enclosing `impl`, or empty for a free function.
+        pub owner: String,
+        pub name: String,
+        pub file: PathBuf,
+        /// Method and function names called, and `name(` inside macros.
+        pub calls: BTreeSet<String>,
+        /// The subset of `calls` made through a bare or module path
+        /// (`name(..)`, `crate::module::name(..)`): each names a free
+        /// function, never a method.
+        pub free_calls: BTreeSet<String>,
+        /// Field, path and macro-token identifiers.
+        pub mentions: BTreeSet<String>,
+    }
+
+    /// `true` when a `#[cfg(..)]` in `attrs` holds only under `test`: it names
+    /// `test` outside every `not(..)`.
+    pub fn gated_on_test(attrs: &[syn::Attribute]) -> bool {
+        fn names_test(tokens: TokenStream, under_not: bool) -> bool {
+            let mut after_not = false;
+            for tree in tokens {
+                match tree {
+                    TokenTree::Ident(ident) => {
+                        if ident == "test" && !under_not {
+                            return true;
+                        }
+                        after_not = ident == "not";
+                    }
+                    TokenTree::Group(group) => {
+                        if names_test(group.stream(), under_not || after_not) {
+                            return true;
+                        }
+                        after_not = false;
+                    }
+                    TokenTree::Punct(_) | TokenTree::Literal(_) => after_not = false,
+                }
+            }
+            false
+        }
+        attrs.iter().any(|attr| {
+            attr.path().is_ident("cfg")
+                && matches!(&attr.meta, syn::Meta::List(list) if names_test(list.tokens.clone(), false))
+        })
+    }
+
+    /// Every production source file of the crates whose `Cargo.toml` sits in
+    /// `dir` or one level below it, parsed.
+    ///
+    /// # Panics
+    ///
+    /// When a file cannot be read or parsed, or a declared module has no file:
+    /// a scan that skips a file proves nothing about it.
+    pub fn production_files(dir: &Path) -> Vec<(PathBuf, syn::File)> {
+        let mut crate_dirs = vec![dir.to_path_buf()];
+        for entry in std::fs::read_dir(dir).expect("read crate directory") {
+            let path = entry.expect("directory entry").path();
+            if path.join("Cargo.toml").is_file() {
+                crate_dirs.push(path);
+            }
+        }
+        let mut roots = Vec::new();
+        for crate_dir in crate_dirs.iter().filter(|d| d.join("Cargo.toml").is_file()) {
+            for root in ["src/lib.rs", "src/main.rs", "build.rs"] {
+                let path = crate_dir.join(root);
+                if path.is_file() {
+                    roots.push(path);
+                }
+            }
+            if let Ok(bins) = std::fs::read_dir(crate_dir.join("src/bin")) {
+                for bin in bins {
+                    let path = bin.expect("bin entry").path();
+                    if path.extension().is_some_and(|ext| ext == "rs") {
+                        roots.push(path);
+                    }
+                }
+            }
+        }
+        assert!(!roots.is_empty(), "no crate root under {}", dir.display());
+        let mut files = Vec::new();
+        let mut pending = roots;
+        while let Some(path) = pending.pop() {
+            let src = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            let file =
+                syn::parse_file(&src).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
+            let parent = path.parent().expect("file has a directory").to_path_buf();
+            let is_mod_root = path.file_name().is_some_and(|n| {
+                n == "mod.rs" || n == "lib.rs" || n == "main.rs" || n == "build.rs"
+            }) || parent.ends_with("src/bin");
+            let base = if is_mod_root {
+                parent.clone()
+            } else {
+                parent.join(path.file_stem().expect("file stem"))
+            };
+            declared_modules(&file.items, &parent, &base, &mut pending);
+            files.push((path, file));
+        }
+        files
+    }
+
+    /// Pushes the file of every non-test `mod name;` in `items`, descending
+    /// into inline non-test modules.
+    fn declared_modules(items: &[syn::Item], dir: &Path, base: &Path, out: &mut Vec<PathBuf>) {
+        for item in items {
+            let syn::Item::Mod(module) = item else {
+                continue;
+            };
+            if gated_on_test(&module.attrs) {
+                continue;
+            }
+            let name = module.ident.to_string();
+            let explicit = module.attrs.iter().find_map(|attr| match &attr.meta {
+                syn::Meta::NameValue(nv) if nv.path.is_ident("path") => match &nv.value {
+                    syn::Expr::Lit(syn::ExprLit {
+                        lit: syn::Lit::Str(s),
+                        ..
+                    }) => Some(s.value()),
+                    _ => None,
+                },
+                _ => None,
+            });
+            if let Some((_, inner)) = &module.content {
+                let inner_base = base.join(&name);
+                declared_modules(inner, dir, &inner_base, out);
+                continue;
+            }
+            let candidates = explicit.map_or_else(
+                || {
+                    vec![
+                        base.join(format!("{name}.rs")),
+                        base.join(&name).join("mod.rs"),
+                    ]
+                },
+                |rel| vec![dir.join(rel)],
+            );
+            let found = candidates
+                .iter()
+                .find(|p| p.is_file())
+                .unwrap_or_else(|| panic!("module file for {candidates:?}"));
+            out.push(found.clone());
+        }
+    }
+
+    /// Records [`FnFacts`] for every non-test function in a file.
+    #[derive(Default)]
+    pub struct Collector {
+        pub fns: Vec<FnFacts>,
+        file: PathBuf,
+        stack: Vec<usize>,
+        owners: Vec<String>,
+        spawn_depth: usize,
+    }
+
+    impl Collector {
+        pub fn scan(files: &[(PathBuf, syn::File)]) -> Vec<FnFacts> {
+            let mut collector = Self::default();
+            for (path, file) in files {
+                collector.file.clone_from(path);
+                collector.visit_file(file);
+            }
+            collector.fns
+        }
+
+        fn enter(&mut self, name: String) -> usize {
+            self.fns.push(FnFacts {
+                owner: self.owners.last().cloned().unwrap_or_default(),
+                name,
+                file: self.file.clone(),
+                ..FnFacts::default()
+            });
+            self.stack.push(self.fns.len() - 1);
+            std::mem::replace(&mut self.spawn_depth, 0)
+        }
+
+        fn leave(&mut self, saved_depth: usize) {
+            self.stack.pop();
+            self.spawn_depth = saved_depth;
+        }
+
+        fn record_free_call(&mut self, name: String) {
+            if self.spawn_depth > 0 {
+                return;
+            }
+            if let Some(&at) = self.stack.last() {
+                self.fns[at].free_calls.insert(name);
+            }
+        }
+
+        fn record(&mut self, call: bool, name: String) {
+            if self.spawn_depth > 0 {
+                return;
+            }
+            if let Some(&at) = self.stack.last() {
+                let facts = &mut self.fns[at];
+                if call {
+                    facts.calls.insert(name);
+                } else {
+                    facts.mentions.insert(name);
+                }
+            }
+        }
+
+        fn scan_tokens(&mut self, tokens: TokenStream) {
+            let trees: Vec<TokenTree> = tokens.into_iter().collect();
+            for (at, tree) in trees.iter().enumerate() {
+                match tree {
+                    TokenTree::Ident(ident) => {
+                        let called = matches!(
+                            trees.get(at + 1),
+                            Some(TokenTree::Group(g))
+                                if g.delimiter() == proc_macro2::Delimiter::Parenthesis
+                        );
+                        if called {
+                            self.record(true, ident.to_string());
+                        }
+                        self.record(false, ident.to_string());
+                    }
+                    TokenTree::Group(group) => self.scan_tokens(group.stream()),
+                    TokenTree::Punct(_) | TokenTree::Literal(_) => {}
+                }
+            }
+        }
+
+        fn visit_spawned_args<'a>(&mut self, args: impl Iterator<Item = &'a syn::Expr>) {
+            self.spawn_depth += 1;
+            for arg in args {
+                self.visit_expr(arg);
+            }
+            self.spawn_depth -= 1;
+        }
+    }
+
+    fn type_name(ty: &syn::Type) -> String {
+        match ty {
+            syn::Type::Path(path) => path
+                .path
+                .segments
+                .last()
+                .map(|s| s.ident.to_string())
+                .unwrap_or_default(),
+            _ => String::new(),
+        }
+    }
+
+    impl<'ast> Visit<'ast> for Collector {
+        fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+            if !gated_on_test(&node.attrs) {
+                visit::visit_item_mod(self, node);
+            }
+        }
+
+        fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+            if gated_on_test(&node.attrs) {
+                return;
+            }
+            self.owners.push(type_name(&node.self_ty));
+            visit::visit_item_impl(self, node);
+            self.owners.pop();
+        }
+
+        fn visit_item_trait(&mut self, node: &'ast syn::ItemTrait) {
+            if gated_on_test(&node.attrs) {
+                return;
+            }
+            self.owners.push(node.ident.to_string());
+            visit::visit_item_trait(self, node);
+            self.owners.pop();
+        }
+
+        fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+            if gated_on_test(&node.attrs) {
+                return;
+            }
+            self.owners.push(String::new());
+            let saved = self.enter(node.sig.ident.to_string());
+            visit::visit_item_fn(self, node);
+            self.leave(saved);
+            self.owners.pop();
+        }
+
+        fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+            if gated_on_test(&node.attrs) {
+                return;
+            }
+            let saved = self.enter(node.sig.ident.to_string());
+            visit::visit_impl_item_fn(self, node);
+            self.leave(saved);
+        }
+
+        fn visit_trait_item_fn(&mut self, node: &'ast syn::TraitItemFn) {
+            if gated_on_test(&node.attrs) {
+                return;
+            }
+            let saved = self.enter(node.sig.ident.to_string());
+            visit::visit_trait_item_fn(self, node);
+            self.leave(saved);
+        }
+
+        fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+            let method = node.method.to_string();
+            self.record(true, method.clone());
+            self.visit_expr(&node.receiver);
+            if SPAWNS.contains(&method.as_str()) {
+                self.visit_spawned_args(node.args.iter());
+            } else {
+                for arg in &node.args {
+                    self.visit_expr(arg);
+                }
+            }
+        }
+
+        fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+            let syn::Expr::Path(path) = &*node.func else {
+                visit::visit_expr_call(self, node);
+                return;
+            };
+            let name = path
+                .path
+                .segments
+                .last()
+                .map(|s| s.ident.to_string())
+                .unwrap_or_default();
+            self.record(true, name.clone());
+            // A bare or module path names a free function; `Type::name` and
+            // `Self::name` may name a method.
+            let segments = &path.path.segments;
+            let module_path = path.qself.is_none()
+                && (segments.len() == 1
+                    || segments.iter().nth(segments.len() - 2).is_some_and(|s| {
+                        s.ident
+                            .to_string()
+                            .chars()
+                            .next()
+                            .is_some_and(|c| c.is_ascii_lowercase())
+                    }));
+            if module_path {
+                self.record_free_call(name.clone());
+            }
+            self.visit_expr_path(path);
+            if SPAWNS.contains(&name.as_str()) {
+                self.visit_spawned_args(node.args.iter());
+            } else {
+                for arg in &node.args {
+                    self.visit_expr(arg);
+                }
+            }
+        }
+
+        fn visit_ident(&mut self, node: &'ast proc_macro2::Ident) {
+            self.record(false, node.to_string());
+        }
+
+        fn visit_macro(&mut self, node: &'ast syn::Macro) {
+            self.scan_tokens(node.tokens.clone());
+        }
+    }
+}
+
+/// The directory that holds the workspace's crates.
+fn crates_dir() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..")
+}
+
+/// ADR-029 §2 sync-state keys: across every production file of the FFI and
+/// node crates, `store_last_relay_contact` is called only inside
+/// `record_relay_contact`, so no bridge, node path or helper writes the
+/// contact around the one writer the reconnection driver owns.
+#[test]
+fn record_relay_contact_is_the_only_relay_contact_writer_in_ffi_and_node() {
+    let mut writers = Vec::new();
+    let mut scanned = 0_usize;
+    for crate_dir in ["scp-ffi", "scp-node"] {
+        let files = syn_scan::production_files(&crates_dir().join(crate_dir));
+        scanned += files.len();
+        for facts in syn_scan::Collector::scan(&files) {
+            if facts.calls.contains("store_last_relay_contact") {
+                writers.push(format!("{}::{}", facts.file.display(), facts.name));
+            }
+        }
+    }
+    assert!(scanned > 50, "the scan read only {scanned} files");
+    assert_eq!(
+        writers.len(),
+        1,
+        "store_last_relay_contact callers: {writers:?}"
+    );
+    assert!(
+        writers[0].ends_with("reconnect.rs::record_relay_contact"),
+        "the one caller must be record_relay_contact in reconnect.rs, got {writers:?}"
+    );
+}
+
+/// The writer scan sees a call inside a macro, skips a call inside a spawned
+/// task, a `cfg(test)` module and a test-gated function, and keeps a
+/// `cfg(not(test))` function.
+#[test]
+fn syn_scan_records_macro_calls_and_skips_test_code() {
+    let file: syn::File = syn::parse_str(
+        "fn in_macro() { tokio::select! { _ = s.store_last_relay_contact(id, 1) => {} } }\n\
+         fn in_task() { tokio::spawn(async move { s.store_last_relay_contact(id, 1).await }); }\n\
+         #[cfg(test)] mod tests { fn t() { s.store_last_relay_contact(id, 1); } }\n\
+         #[cfg(any(test, feature = \"testing\"))] fn gated() { s.store_last_relay_contact(id, 1); }\n\
+         #[cfg(not(test))] fn kept() { s.store_last_relay_contact(id, 1); }\n",
+    )
+    .expect("parse");
+    let facts = syn_scan::Collector::scan(&[(std::path::PathBuf::from("x.rs"), file)]);
+    let callers: Vec<&str> = facts
+        .iter()
+        .filter(|f| f.calls.contains("store_last_relay_contact"))
+        .map(|f| f.name.as_str())
+        .collect();
+    assert_eq!(callers, ["in_macro", "kept"]);
+}
+
+/// `true` when `f` awaits `bootstrap_spawn_lock` on its own turn: it mentions
+/// the lock and calls `lock` or `lock_owned` outside any spawned-task
+/// argument. `try_lock` and `try_lock_owned` never wait.
+fn awaits_bootstrap_lock(f: &syn_scan::FnFacts) -> bool {
+    f.mentions.contains("bootstrap_spawn_lock")
+        && (f.calls.contains("lock") || f.calls.contains("lock_owned"))
+}
+
+/// Every `SupervisorHandle` method in `facts` that awaits
+/// `bootstrap_spawn_lock` on its own turn, directly or through the functions
+/// it calls, each with the call path that reaches the lock.
+///
+/// A call through a bare or module path resolves to the free functions of
+/// its name; every other call resolves to every function of its name, so a
+/// method name shared with a lock taker counts as a call of it: the check
+/// over-approximates and never misses a path.
+fn handle_paths_to_the_bootstrap_lock(facts: &[syn_scan::FnFacts]) -> Vec<String> {
+    // Keyed by (is a free function, name).
+    let mut reach: std::collections::BTreeMap<(bool, String), String> = facts
+        .iter()
+        .filter(|f| f.owner != "SupervisorHandle" && awaits_bootstrap_lock(f))
+        .map(|f| ((f.owner.is_empty(), f.name.clone()), f.name.clone()))
+        .collect();
+    let reached = |reach: &std::collections::BTreeMap<(bool, String), String>,
+                   f: &syn_scan::FnFacts| {
+        f.calls.iter().find_map(|c| {
+            let free = reach.get(&(true, c.clone()));
+            if f.free_calls.contains(c) {
+                free.cloned()
+            } else {
+                free.or_else(|| reach.get(&(false, c.clone()))).cloned()
+            }
+        })
+    };
+    loop {
+        let mut grew = false;
+        for f in facts.iter().filter(|f| f.owner != "SupervisorHandle") {
+            let key = (f.owner.is_empty(), f.name.clone());
+            if reach.contains_key(&key) {
+                continue;
+            }
+            if let Some(path) = reached(&reach, f) {
+                reach.insert(key, format!("{} -> {path}", f.name));
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    facts
+        .iter()
+        .filter(|f| f.owner == "SupervisorHandle")
+        .filter_map(|f| {
+            if awaits_bootstrap_lock(f) {
+                return Some(format!("SupervisorHandle::{} awaits the lock", f.name));
+            }
+            reached(&reach, f).map(|path| format!("SupervisorHandle::{} -> {path}", f.name))
+        })
+        .collect()
+}
+
+/// ADR-049 lock order: a holder of `bootstrap_spawn_lock` waits on actor
+/// mailboxes, so no actor turn may wait on that lock. An actor turn reaches
+/// the Supervisor only through `SupervisorHandle`, so no `SupervisorHandle`
+/// method may await the lock on its own turn, directly or through any
+/// function it calls. A method that needs the lock try-locks it and returns a
+/// retryable `ActorBusy`, or hands the work to a task that takes the lock.
+#[test]
+fn no_actor_turn_waits_on_the_bootstrap_spawn_lock() {
+    let files = syn_scan::production_files(&crates_dir().join("scp-runtime"));
+    let facts = syn_scan::Collector::scan(&files);
+    let handle_fns = facts
+        .iter()
+        .filter(|f| f.owner == "SupervisorHandle")
+        .count();
+    assert!(
+        handle_fns > 20,
+        "the scan found only {handle_fns} SupervisorHandle methods"
+    );
+    let takers: Vec<&str> = facts
+        .iter()
+        .filter(|f| awaits_bootstrap_lock(f))
+        .map(|f| f.name.as_str())
+        .collect();
+    assert!(
+        takers.contains(&"dispatch_lifecycle_direct"),
+        "the scan must see the Supervisor's lifecycle arms await the lock, found {takers:?}"
+    );
+    for nonblocking in [
+        "try_lock_bootstrap_spawn",
+        "spawn_under_bootstrap_spawn_lock",
+    ] {
+        assert!(
+            !takers.contains(&nonblocking),
+            "{nonblocking} must not wait on bootstrap_spawn_lock on its caller's turn"
+        );
+    }
+    let paths = handle_paths_to_the_bootstrap_lock(&facts);
+    assert!(
+        paths.is_empty(),
+        "actor turns that wait on bootstrap_spawn_lock: {paths:#?}"
+    );
+}
+
+/// The lock scan flags a handle method that awaits the lock directly or
+/// through a Supervisor function, and passes a try-lock, a lock taken inside
+/// a spawned task, and a module-path call of a free function that shares a
+/// lock taker's method name.
+#[test]
+fn bootstrap_lock_scan_flags_a_waiting_handle_method() {
+    let file: syn::File = syn::parse_str(
+        "impl SupervisorHandle {\n\
+             async fn lock_bootstrap_spawn(&self) { self.upgrade()?.bootstrap_spawn_lock.lock().await; }\n\
+             async fn via_supervisor(&self) { self.upgrade()?.respawn_x().await; }\n\
+             fn try_it(&self) { self.upgrade()?.bootstrap_spawn_lock.try_lock_owned(); }\n\
+             fn spawned(&self) { spawn_tracked(async move { l.bootstrap_spawn_lock.lock().await; }); }\n\
+             async fn via_free(&self) { crate::helpers::restore_y().await; }\n\
+             async fn via_method(&self) { self.upgrade()?.restore_y().await; }\n\
+         }\n\
+         impl Supervisor {\n\
+             async fn respawn_x(&self) { self.respawn_locked().await; }\n\
+             async fn respawn_locked(&self) { let _g = self.bootstrap_spawn_lock.lock().await; }\n\
+             async fn restore_y(&self) { let _g = self.bootstrap_spawn_lock.lock().await; }\n\
+         }\n\
+         async fn restore_y() {}\n",
+    )
+    .expect("parse");
+    let facts = syn_scan::Collector::scan(&[(std::path::PathBuf::from("x.rs"), file)]);
+    assert_eq!(
+        handle_paths_to_the_bootstrap_lock(&facts),
+        [
+            "SupervisorHandle::lock_bootstrap_spawn awaits the lock",
+            "SupervisorHandle::via_supervisor -> respawn_x -> respawn_locked",
+            "SupervisorHandle::via_method -> restore_y",
+        ]
+    );
 }

@@ -1908,10 +1908,17 @@ pub struct Supervisor {
     /// from `write_lock` to avoid re-entrancy with
     /// `spawn_actor_with_state`/`despawn_actor` (which take `write_lock`).
     /// Lock order is always `bootstrap_spawn_lock` → `write_lock`, never the
-    /// reverse. Held behind an `Arc` so the migration create, which runs in
-    /// the source context's actor turn, takes it through
-    /// [`SupervisorHandle::lock_bootstrap_spawn`](crate::context::supervisor::handle::SupervisorHandle::lock_bootstrap_spawn)
-    /// without holding the Supervisor across the wait.
+    /// reverse.
+    ///
+    /// No actor turn waits for this lock, because its holders wait on actor
+    /// mailboxes: the migration create, which runs in the source context's
+    /// actor turn, try-locks it through
+    /// [`SupervisorHandle::try_lock_bootstrap_spawn`](crate::context::supervisor::handle::SupervisorHandle::try_lock_bootstrap_spawn)
+    /// and fails with a retryable `ActorBusy` while another bootstrap holds
+    /// it, and work that must wait for it runs on a tracked task through
+    /// [`SupervisorHandle::spawn_under_bootstrap_spawn_lock`](crate::context::supervisor::handle::SupervisorHandle::spawn_under_bootstrap_spawn_lock).
+    /// It is held behind an `Arc` so that task holds the lock without
+    /// holding the Supervisor.
     #[allow(
         clippy::disallowed_types,
         reason = "ADR-049 §Decision 12 allow-list: serializes the same-id bootstrap-spawn sequence. Cold bootstrap path (not a per-command read), so the Mutex acquire cost the ban targets does not apply."
@@ -2061,6 +2068,17 @@ pub struct Supervisor {
     /// (`refuse_pending_discard`), so it cannot restore the context from the
     /// snapshot the discard is about to delete.
     pending_discards: dashmap::DashSet<String>,
+    /// Context ids whose first-state writes a create, import, Welcome join,
+    /// standing-context create or migration create has started and not yet
+    /// committed or rolled back
+    /// ([`crate::context::lifecycle_helpers::FirstStateRollback`]). A
+    /// rollback drains those writes with `bootstrap_spawn_lock` released, so
+    /// this set, not the lock, keeps another bootstrap of the id from
+    /// writing or spawning between the failure and the rollback: a second
+    /// first-state write of a claimed id is refused, and so is a restore or
+    /// respawn (`refuse_pending_first_state`), which would otherwise start an
+    /// actor from the failed operation's snapshot.
+    pub(in crate::context::supervisor) pending_first_state: dashmap::DashSet<String>,
     /// Wall-clock source. Populated by [`Self::with_providers_and_journal`] (or
     /// defaulted to [`scp_clock::SystemClock`] when the caller
     /// passes `None`).
@@ -2548,6 +2566,7 @@ impl Supervisor {
             write_lock,
             bootstrap_spawn_lock,
             pending_discards: dashmap::DashSet::new(),
+            pending_first_state: dashmap::DashSet::new(),
             saga_journal,
             key_package_stores: DashMap::new(),
             challenger_ledgers: DashMap::new(),
@@ -4349,8 +4368,13 @@ impl Supervisor {
                         (Outcome::err_mutated(sketch), Err(err))
                     }
                 };
+                drop(crash_window);
+                // No mailbox wait runs under the lock: the TTL install waits on
+                // the new actor. The rollback waits for abandoned writes with
+                // the lock released and retakes it for the restores.
+                drop(bootstrap_guard);
                 let (outcome, reply_result) = match reply_result {
-                    Err(e) => match first_state.rollback().await {
+                    Err(e) => match first_state.rollback(self.bootstrap_spawn_lock.lock()).await {
                         Ok(()) => (outcome, Err(e)),
                         Err(rollback) => {
                             let folded =
@@ -4366,10 +4390,6 @@ impl Supervisor {
                     },
                     ok => (outcome, ok),
                 };
-                drop(crash_window);
-                // No mailbox wait runs under the lock: the TTL install waits on
-                // the new actor, whose turn may wait for this lock.
-                drop(bootstrap_guard);
                 let (outcome, reply_result) = match reply_result {
                     Ok(spawned) => match spawned.finalize(&deps).await {
                         Ok(handle) => (outcome, Ok(handle)),
@@ -4542,8 +4562,13 @@ impl Supervisor {
                         (Outcome::err_mutated(sketch), Err(err))
                     }
                 };
+                drop(crash_window);
+                // No mailbox wait runs under the lock: the TTL install waits on
+                // the imported actor. The rollback waits for abandoned writes
+                // with the lock released and retakes it for the restores.
+                drop(bootstrap_guard);
                 let (outcome, reply_result) = match reply_result {
-                    Err(e) => match first_state.rollback().await {
+                    Err(e) => match first_state.rollback(self.bootstrap_spawn_lock.lock()).await {
                         Ok(()) => (outcome, Err(e)),
                         Err(rollback) => {
                             let folded =
@@ -4556,10 +4581,6 @@ impl Supervisor {
                     },
                     ok => (outcome, ok),
                 };
-                drop(crash_window);
-                // No mailbox wait runs under the lock: the TTL install waits on
-                // the imported actor, whose turn may wait for this lock.
-                drop(bootstrap_guard);
                 let (outcome, reply_result) = match reply_result {
                     Ok(spawned) => match spawned.finalize(&deps).await {
                         Ok(handle) => (outcome, Ok(handle)),
@@ -4595,7 +4616,14 @@ impl Supervisor {
                 };
                 // Serialize this bootstrap-spawn against every other same-id
                 // bootstrap (see `bootstrap_spawn_lock`).
-                let _bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
+                let bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
+                // A restore must not start an actor from a snapshot a failed
+                // create, import or join wrote and has not yet put back.
+                if let Err(e) = self.refuse_pending_first_state(&p.context_id, &bootstrap_guard) {
+                    let sketch = standing_outcome_error_sketch(&e);
+                    let _ = reply.send(Err(e));
+                    return Outcome::err(sketch);
+                }
                 let handle = crate::context::ContextHandle::new(p.context_id.clone(), p.params);
                 if let Err(e) = handle
                     .transition_to(&scp_protocol::context::ContextState::Active)
@@ -5345,19 +5373,13 @@ impl Supervisor {
     /// - [`ContextError::TransportFailed`] if the mailbox reply channel closes.
     /// - Any [`ContextError`] surfaced by the actor-shape handler's seal /
     ///   transport send.
-    // Manual `Box::pin(async move { … })` (NOT `async fn`) is REQUIRED, not a
-    // stack optimization: this method is transitively reachable from a spawned
-    // `ContextActor::run()` future (via the actor-shape cross-context
-    // `recovery_notify_contact` → `dispatch_recovery_send_notification`), and it
-    // calls `respawn_from_snapshot`, which constructs a fresh `run()` future to
-    // spawn. As an `async fn` its opaque return type would make
-    // `run()`'s type/`Send` inference cyclic (`run` ⊇ … ⊇
-    // `recovery_send_notification_direct` ⊇ `respawn` ⊇ `run`) and fail to
-    // resolve (E0391). Returning an explicit `Pin<Box<dyn Future + Send>>`
-    // erases this method's opaque type: `run()`'s inference sees a trait object
-    // that is `Send` by declaration and stops descending into the recursive
-    // concrete type, breaking the cycle. Owned copies of the borrowed arguments
-    // are captured so the returned future borrows only `self` (`&Arc<Self>`).
+    // Manual `Box::pin(async move { … })` (NOT `async fn`) is REQUIRED: the
+    // respawn constructs a fresh `ContextActor::run()` future, and an actor
+    // turn reaches the in-turn twin of this method, so an opaque `async fn`
+    // type would make `run()`'s type/`Send` inference cyclic (E0391). The
+    // explicit `Pin<Box<dyn Future + Send>>` breaks the cycle. This method
+    // waits for `bootstrap_spawn_lock`, so only Supervisor callers reach it;
+    // an actor turn goes through `recovery_send_notification_in_turn`.
     fn recovery_send_notification_direct<'a>(
         self: &'a Arc<Self>,
         context_id: &str,
@@ -5367,91 +5389,144 @@ impl Supervisor {
         signer: &crate::context::actor::signer::CommandSigner,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ContextError>> + Send + 'a>>
     {
-        use crate::context::actor::commands::{
-            ContextCommand, RecoverySendNotificationPayload, TrustRecoveryCommand,
-        };
-
-        let context_id = context_id.to_owned();
-        let sender_did = sender_did.to_owned();
-        let payload = payload.to_vec();
-        let signer = signer.clone();
-
+        let notification =
+            RecoveryNotification::new(context_id, sender_did, payload, sequence, signer);
         Box::pin(async move {
-            // ADR-049 PR-7 (SCP-CRYPTOMOVE-001) lazy-spawn seal: the per-context
-            // MLS crypto state is now OWNED by the context's actor (one-way take),
-            // so a recovery notification can no longer seal through the retired
-            // supervisor-scoped provider. Instead, respawn the target context's
-            // actor from its persisted snapshot and dispatch the notification to
-            // its mailbox, where the actor-shape `recovery_send_notification`
-            // handler seals through the authoritative owned `ContextCryptoState`
-            // (nonce-safe: the actor drives the persist-before-ack send sequence).
-            //
-            // Only a REAL (64-hex) context id — decodable by the ADR-056 chokepoint
-            // `context_id_to_bytes` — can be respawned. The synthetic
-            // `identity-private-state` pseudo-context (PSK rotation §9.12 step 6) is
-            // never a registered actor and has NO persisted snapshot, and in
-            // production has no MLS group at all (`seed_identity_private_state_group`
-            // is test-only), so the retired provider seal ALSO failed with "no MLS
-            // group" and was swallowed (`rotate_psk` returned false — a best-effort
-            // no-op). Preserve that exact contract: return the same "no MLS group"
-            // error for any non-real context id rather than respawning a snapshot
-            // that cannot exist (which would emit a spurious "state is lost" error
-            // and pollute the crash-window budget on every PSK rotation). The
-            // 64-hex-lowercase predicate mirrors `context_id_to_bytes`'s canonical
-            // branch (ADR-056).
-            let is_real_context_id = context_id.len() == 64
-                && context_id
-                    .bytes()
-                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
-            if !is_real_context_id {
-                return Err(ContextError::CryptoFailed(
-                    "no MLS group for this context".to_string(),
-                ));
-            }
-
+            recovery_notification_target_is_real(&notification.context_id)?;
             // The recovery respawn rehydrates the persisted snapshot, so the
             // context acts as this node's identity.
             let owning_did = self.node_identity()?;
-
-            // Respawn holds `bootstrap_spawn_lock` internally and is re-entrancy-
-            // safe (the caller holds no bootstrap lock). A failed respawn (genuinely
-            // lost snapshot for a real context) fails closed — the direct path is
-            // defensively reached only in the transient crash-respawn gap, since
-            // `restore_on_startup` eagerly spawns an actor for every persisted
-            // Active context, so live compromise-recovery flows normally reach the
-            // mailbox directly, not here. (The whole method is boxed as a
-            // `dyn Future + Send` — see the note on its signature — so this plain
-            // `.await` on the actor-spawning respawn does not reopen the cycle.)
-            self.respawn_from_snapshot(&context_id, &owning_did).await?;
-
-            // The actor is registered now — dispatch the notification straight to
-            // its mailbox (NOT back through `dispatch_trust_recovery_command`, so a
-            // transient lookup miss cannot re-enter this respawn path and loop).
-            let Some(actor) = self.lookup(&context_id) else {
-                return Err(ContextError::ActorCrashed(format!(
-                    "{context_id} (respawned actor vanished before recovery-notification dispatch)"
-                )));
-            };
-            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-            let send_payload = RecoverySendNotificationPayload {
-                context_id: context_id.clone(),
-                sender_did,
-                payload,
-                sequence,
-                signer,
-            };
-            let cmd =
-                ContextCommand::TrustRecovery(TrustRecoveryCommand::RecoverySendNotification {
-                    payload: Box::new(send_payload),
-                    reply: reply_tx,
-                });
-            Self::dispatch_via_mailbox(&actor, cmd).await?;
-            bounded_reply_await(reply_rx).await.map_err(|_| {
-                ContextError::TransportFailed(
-                    "recovery_send_notification_direct: mailbox reply channel closed".to_owned(),
-                )
-            })?
+            // A Supervisor caller holds no actor turn, so the respawn waits
+            // for `bootstrap_spawn_lock`. A failed respawn (genuinely lost
+            // snapshot for a real context) fails closed.
+            self.respawn_from_snapshot(&notification.context_id, &owning_did)
+                .await?;
+            self.send_recovery_notification_to_respawned(notification)
+                .await
         })
+    }
+
+    /// [`Self::recovery_send_notification_direct`] for a caller in an actor
+    /// turn, which reaches it through
+    /// [`SupervisorHandle::dispatch_recovery_send_notification`](crate::context::supervisor::handle::SupervisorHandle::dispatch_recovery_send_notification).
+    /// A holder of `bootstrap_spawn_lock` waits on actor mailboxes, so this
+    /// path try-locks it instead of waiting.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::ActorBusy`] while another bootstrap holds the lock; it
+    /// is retryable and nothing was sent. Otherwise the errors of
+    /// [`Self::recovery_send_notification_direct`].
+    fn recovery_send_notification_in_turn(
+        self: &Arc<Self>,
+        notification: RecoveryNotification,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ContextError>> + Send + '_>>
+    {
+        Box::pin(async move {
+            recovery_notification_target_is_real(&notification.context_id)?;
+            let owning_did = self.node_identity()?;
+            let bootstrap_guard = self.bootstrap_spawn_lock.try_lock().map_err(|_| {
+                ContextError::ActorBusy(format!(
+                    "the recovery notification to '{}' needs its actor respawned while another \
+                     bootstrap holds the bootstrap lock; retry",
+                    notification.context_id
+                ))
+            })?;
+            self.respawn_from_snapshot_locked(
+                &notification.context_id,
+                &owning_did,
+                &bootstrap_guard,
+            )
+            .await?;
+            drop(bootstrap_guard);
+            self.send_recovery_notification_to_respawned(notification)
+                .await
+        })
+    }
+
+    /// The actor-turn twin of [`Self::dispatch_trust_recovery_command`] for
+    /// one `RecoverySendNotification`: it sends to the target context's
+    /// mailbox when an actor is registered, and otherwise respawns the actor
+    /// through [`Self::recovery_send_notification_in_turn`], which never
+    /// waits for `bootstrap_spawn_lock`. The send's result goes to `reply`.
+    ///
+    /// # Errors
+    ///
+    /// The mailbox dispatch errors of [`Self::dispatch_trust_recovery_command`].
+    pub(in crate::context) async fn dispatch_recovery_send_notification_in_turn(
+        self: &Arc<Self>,
+        payload: Box<crate::context::actor::commands::RecoverySendNotificationPayload>,
+        reply: tokio::sync::oneshot::Sender<Result<(), ContextError>>,
+    ) -> Result<Outcome<()>, ContextError> {
+        use crate::context::actor::commands::TrustRecoveryCommand;
+        if let Some(actor) = self.lookup(&payload.context_id) {
+            let cmd = TrustRecoveryCommand::RecoverySendNotification { payload, reply };
+            return Self::dispatch_via_mailbox(&actor, ContextCommand::TrustRecovery(cmd)).await;
+        }
+        let notification = RecoveryNotification::new(
+            &payload.context_id,
+            &payload.sender_did,
+            &payload.payload,
+            payload.sequence,
+            &payload.signer,
+        );
+        Ok(
+            match self.recovery_send_notification_in_turn(notification).await {
+                Ok(()) => {
+                    let _ = reply.send(Ok(()));
+                    Outcome::ok(())
+                }
+                Err(e) => {
+                    let sketch = standing_outcome_error_sketch(&e);
+                    let _ = reply.send(Err(e));
+                    Outcome::err(sketch)
+                }
+            },
+        )
+    }
+
+    /// Sends the notification to the mailbox of the actor a respawn just
+    /// registered for its context. It goes straight to the mailbox, not back
+    /// through `dispatch_trust_recovery_command`, so a transient lookup miss
+    /// cannot re-enter the respawn and loop.
+    async fn send_recovery_notification_to_respawned(
+        self: &Arc<Self>,
+        notification: RecoveryNotification,
+    ) -> Result<(), ContextError> {
+        use crate::context::actor::commands::{
+            RecoverySendNotificationPayload, TrustRecoveryCommand,
+        };
+
+        let RecoveryNotification {
+            context_id,
+            sender_did,
+            payload,
+            sequence,
+            signer,
+        } = notification;
+        let Some(actor) = self.lookup(&context_id) else {
+            return Err(ContextError::ActorCrashed(format!(
+                "{context_id} (respawned actor vanished before recovery-notification dispatch)"
+            )));
+        };
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let send_payload = RecoverySendNotificationPayload {
+            context_id: context_id.clone(),
+            sender_did,
+            payload,
+            sequence,
+            signer,
+        };
+        let cmd = ContextCommand::TrustRecovery(TrustRecoveryCommand::RecoverySendNotification {
+            payload: Box::new(send_payload),
+            reply: reply_tx,
+        });
+        Self::dispatch_via_mailbox(&actor, cmd).await?;
+        bounded_reply_await(reply_rx).await.map_err(|_| {
+            ContextError::TransportFailed(
+                "recovery_send_notification_direct: mailbox reply channel closed".to_owned(),
+            )
+        })?
     }
 
     /// Direct supervisor-scoped dispatch for [`QueriesCommand`] variants
@@ -6178,6 +6253,32 @@ impl Supervisor {
         Ok(())
     }
 
+    /// Refuses a restore or respawn of `context_id` while a bootstrap's
+    /// first-state writes of it are unsettled (`pending_first_state`): the
+    /// stored snapshot may be the one a failed operation wrote and its
+    /// rollback is about to put back.
+    ///
+    /// The guard parameter proves the caller holds `bootstrap_spawn_lock`,
+    /// so no bootstrap of the id can claim it and write until the caller's
+    /// spawn finishes.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::ActorBusy`] while the claim stands; it is retryable.
+    fn refuse_pending_first_state(
+        &self,
+        context_id: &str,
+        _bootstrap_guard: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> Result<(), ContextError> {
+        if self.pending_first_state.contains(context_id) {
+            return Err(ContextError::ActorBusy(format!(
+                "{context_id}: a create, import or join of this context has not committed or \
+                 rolled back its first state; retry"
+            )));
+        }
+        Ok(())
+    }
+
     /// Body of [`Self::respawn_from_snapshot`], run by a caller that already
     /// holds `bootstrap_spawn_lock`; the guard parameter proves it.
     /// [`Self::clear_poison`] takes the lock itself so that it clears the
@@ -6192,6 +6293,7 @@ impl Supervisor {
         // snapshot is about to be deleted, and an actor restored from it would
         // keep running for a context the bridge released.
         self.refuse_pending_discard(ctx_id, bootstrap_guard)?;
+        self.refuse_pending_first_state(ctx_id, bootstrap_guard)?;
         // Mark the transient respawn window BEFORE despawning the stale actor.
         // Between the despawn below and re-registration, a concurrent
         // per-context dispatch would `lookup`-miss a context that genuinely
@@ -6623,26 +6725,29 @@ impl Supervisor {
     /// Operator action (ADR-049 §10): clear a context's poison record and
     /// attempt ONE respawn from the persisted snapshot.
     ///
-    /// This is the explicit recovery path for a poisoned context — it is
-    /// surfaced only on [`SupervisorHandle::clear_poison`](crate::context::supervisor::handle::SupervisorHandle::clear_poison) for operator use,
-    /// NOT reachable by ordinary per-context callers. The alternative
-    /// recovery path is a process restart, which re-runs
-    /// [`crate::context::lifecycle_helpers::restore_all_contexts`] and
-    /// rebuilds every actor from persistence (the poison record lives only
-    /// in memory, so it does not survive a restart).
+    /// This is the explicit recovery path for a poisoned context, for the
+    /// operator, which holds the Supervisor. It is not on
+    /// `SupervisorHandle`, the surface actors hold, so no actor turn reaches it: it waits for
+    /// `bootstrap_spawn_lock`, whose holders wait on actor mailboxes. The
+    /// alternative recovery path is a process restart, which re-runs
+    /// `restore_all_contexts` and rebuilds every actor from persistence (the
+    /// poison record lives only in memory, so it does not survive a
+    /// restart).
     ///
     /// # Errors
     ///
-    /// Surfaces any error from [`Self::respawn_from_snapshot`] (e.g.
+    /// Surfaces any error from the respawn (e.g.
     /// [`ContextError::ActorCrashed`] when no snapshot exists). On a failed
     /// respawn the freshly-cleared window records the failure as a crash —
     /// a context that cannot be respawned does not silently re-poison from
     /// stale history, but also does not loop. While a
     /// [`Self::discard_joined_context`] of the id is in progress it returns
-    /// [`ContextError::ContextNotRegistered`] and leaves the poison record
-    /// untouched. The errors of [`Self::load_wrapping_key`] for `owning_did`
+    /// [`ContextError::ContextNotRegistered`], and while a create, import or
+    /// join of the id has not committed or rolled back its first state it
+    /// returns [`ContextError::ActorBusy`]; both leave the poison record
+    /// untouched. The errors of loading the wrapping key of `owning_did`
     /// return before the poison record is touched.
-    pub(in crate::context) async fn clear_poison(
+    pub async fn clear_poison(
         self: &Arc<Self>,
         ctx_id: &str,
         owning_did: &DID,
@@ -6663,6 +6768,7 @@ impl Supervisor {
         // Refuse before touching the window, so a refused call leaves the
         // poison record as it found it.
         self.refuse_pending_discard(ctx_id, &bootstrap_guard)?;
+        self.refuse_pending_first_state(ctx_id, &bootstrap_guard)?;
         // Clear the window so the single retry starts from a clean budget.
         // `entry().or_default()` then `clear()` resets both the deque and the
         // sticky flag, and the same guard sets the respawn marker, so no read
@@ -12180,6 +12286,13 @@ impl Supervisor {
         self.shutdown_token.cancel();
     }
 
+    /// The token [`Self::close_spawn_gate`] cancels when shutdown begins.
+    /// A tracked task that can wait without bound selects on it, so
+    /// `shutdown_all_contexts`, which awaits every tracked task, ends.
+    pub(in crate::context) fn shutdown_signal(&self) -> tokio_util::sync::CancellationToken {
+        self.shutdown_token.clone()
+    }
+
     /// Stops every challenger-ledger actor and clears `challenger_ledgers`
     /// (ADR-049 Decision 16, step 3), as [`Self::stop_key_package_actors`]
     /// does for the key-package actors. The ledger is durable, so a stopped
@@ -12591,10 +12704,10 @@ impl Supervisor {
         let params = scp_protocol::context::templates::template_params(
             &scp_protocol::context::TemplateId::BilateralPersistent,
         );
-        let create_result = match self.build_actor_deps(local_did).await {
+        let (create_result, first_state) = match self.build_actor_deps(local_did).await {
             Ok(deps) => {
                 // A recreate that fails puts back what it wrote (ADR-029
-                // Implementation).
+                // Implementation), after the lock is released below.
                 let first_state =
                     crate::context::lifecycle_helpers::FirstStateRollback::new(&deps, &context_id)?;
                 let created = Box::pin(crate::context::lifecycle_helpers::create_context(
@@ -12616,20 +12729,12 @@ impl Supervisor {
                     ) => inner,
                     other => ContextError::TransportFailed(other.to_string()),
                 });
-                match created {
-                    Err(e) => match first_state.rollback().await {
-                        Ok(()) => Err(e),
-                        Err(rollback) => Err(
-                            crate::context::lifecycle_helpers::fold_rollback_failure(&e, &rollback),
-                        ),
-                    },
-                    ok => ok,
-                }
+                (created, Some(first_state))
             }
             // A shutdown refusal keeps its typed `SCP-CTX-2138` (ADR-049
             // Decision 16 item 2), as the create, import and restore arms do.
-            Err(e @ ContextError::SupervisorShutDown(_)) => Err(e),
-            Err(e) => Err(ContextError::TransportFailed(e.to_string())),
+            Err(e @ ContextError::SupervisorShutDown(_)) => (Err(e), None),
+            Err(e) => (Err(ContextError::TransportFailed(e.to_string())), None),
         };
         if let Some(dormant) = dormant
             && create_result.is_ok()
@@ -12652,22 +12757,34 @@ impl Supervisor {
         // window reads `ActorCrashed` until the guard drops, and that answer
         // describes this bootstrap rather than why the create failed.
         let spawned = match create_result {
-            Ok(spawned) => Some(spawned),
+            Ok(spawned) => Ok(Some(spawned)),
             Err(create_err)
                 if !matches!(
                     self.read_context_state_checked(&context_id).await,
                     Ok(Some(ContextState::Active | ContextState::Creating))
                 ) =>
             {
-                return Err(create_err);
+                Err(create_err)
             }
-            Err(_) => None,
+            Err(_) => Ok(None),
         };
         drop(crash_window);
-        // The post-spawn wiring waits on the new actor's mailbox, so it runs
-        // after the lock is released.
+        // The post-spawn wiring waits on the new actor's mailbox, and the
+        // rollback waits for abandoned writes, so both run after the lock is
+        // released; the rollback retakes it for the restores. After a
+        // committed create the rollback is a no-op.
         drop(bootstrap_guard);
-        if let Some((deps, spawned)) = spawned {
+        if let Some(first_state) = first_state
+            && let Err(rollback) = first_state.rollback(self.bootstrap_spawn_lock.lock()).await
+        {
+            return Err(match spawned {
+                Err(create_err) => {
+                    crate::context::lifecycle_helpers::fold_rollback_failure(&create_err, &rollback)
+                }
+                Ok(_) => rollback,
+            });
+        }
+        if let Some((deps, spawned)) = spawned? {
             spawned.finalize(&deps).await?;
         }
 
@@ -16804,10 +16921,14 @@ impl Supervisor {
                     )))
                 }
             };
+        // The post-spawn wiring waits on the new actor's mailbox, and the
+        // rollback waits for abandoned writes, so both run with the lock
+        // released; the rollback retakes it for the restores.
+        drop(bootstrap_guard);
         // A failed or timed-out join puts back what step 4 wrote; a no-op after
         // the spawn committed or when step 4 never ran.
         let spawn_outcome = match spawn_outcome {
-            Err(e) => match first_state.rollback().await {
+            Err(e) => match first_state.rollback(self.bootstrap_spawn_lock.lock()).await {
                 Ok(()) => Err(e),
                 Err(rollback) => Err(crate::context::lifecycle_helpers::fold_rollback_failure(
                     &e, &rollback,
@@ -16828,7 +16949,6 @@ impl Supervisor {
         // with no explicit deadline: the actor derives the convergent expiry
         // deadline on the same creator-assigned `creation_timestamp_secs +
         // params.ttl` basis the creator used.
-        drop(bootstrap_guard);
         crate::context::lifecycle_helpers::SpawnedContext::at_create_base(handle)
             .finalize(&deps)
             .await
@@ -19016,6 +19136,60 @@ struct WelcomeBundleFacts<'a> {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// The owned arguments of a recovery notification sent to a context with
+/// no registered actor.
+struct RecoveryNotification {
+    context_id: String,
+    sender_did: String,
+    payload: Vec<u8>,
+    sequence: u64,
+    signer: crate::context::actor::signer::CommandSigner,
+}
+
+impl RecoveryNotification {
+    fn new(
+        context_id: &str,
+        sender_did: &str,
+        payload: &[u8],
+        sequence: u64,
+        signer: &crate::context::actor::signer::CommandSigner,
+    ) -> Self {
+        Self {
+            context_id: context_id.to_owned(),
+            sender_did: sender_did.to_owned(),
+            payload: payload.to_vec(),
+            sequence,
+            signer: signer.clone(),
+        }
+    }
+}
+
+/// Only a real (64-hex) context id, decodable by the ADR-056 chokepoint
+/// `context_id_to_bytes`, can be respawned. The synthetic
+/// `identity-private-state` pseudo-context (PSK rotation, spec §9.12 step 6)
+/// is never a registered actor, has no persisted snapshot, and in production
+/// has no MLS group, so it gets the "no MLS group" error the retired
+/// provider seal produced, a best-effort no-op, before any lock is taken. The
+/// 64-hex-lowercase predicate mirrors `context_id_to_bytes`'s canonical
+/// branch.
+///
+/// # Errors
+///
+/// [`ContextError::CryptoFailed`] for any other id.
+fn recovery_notification_target_is_real(context_id: &str) -> Result<(), ContextError> {
+    let is_real_context_id = context_id.len() == 64
+        && context_id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if is_real_context_id {
+        Ok(())
+    } else {
+        Err(ContextError::CryptoFailed(
+            "no MLS group for this context".to_string(),
+        ))
+    }
+}
 
 #[cfg(test)]
 #[allow(
@@ -21599,11 +21773,16 @@ mod tests {
             .transition_to(&crate::context::ContextState::Active)
             .unwrap();
 
-        supervisor_arc
+        let actor_handle = supervisor_arc
             .spawn_actor_with_state(state, deps, None)
             .await
             .expect("spawn_actor_with_state: fresh context id registers");
         assert!(supervisor_arc.lookup(&ctx_key).is_some());
+        assert_eq!(
+            actor_handle.exited_deliberately(),
+            None,
+            "a running actor has recorded no exit"
+        );
 
         // Let the actor reach its `select!` and arm the sleep, then confirm
         // it has NOT fired before the deadline.
@@ -21646,6 +21825,22 @@ mod tests {
             despawned,
             "on terminal TTL expiry the actor must despawn its own registry handle \
              (no dead-but-registered zombie)"
+        );
+        // The actor records the expiry as a deliberate exit once its run loop
+        // breaks, so a flush sweep holding this handle skips it instead of
+        // reporting a lost context.
+        let mut recorded = None;
+        for _ in 0..64 {
+            recorded = actor_handle.exited_deliberately();
+            if recorded.is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            recorded,
+            Some(crate::context::actor::handle::DeliberateExit::Expired),
+            "a TTL expiry must record DeliberateExit::Expired"
         );
 
         // Post-expiry contract (ADR-049 finding A3): the actor is fully gone,
@@ -30270,7 +30465,10 @@ mod tests {
             Some(FIRST_CONTACT_NOW),
             "the create wrote its contact before the spawn"
         );
-        guard.rollback().await.unwrap();
+        guard
+            .rollback(sup.bootstrap_spawn_lock.lock())
+            .await
+            .unwrap();
         assert!(sup.lookup(&created).is_none(), "no actor started");
         assert_eq!(persistence.created_at(&created), Some(PRIOR_CREATED_AT));
         assert_eq!(
@@ -30310,7 +30508,10 @@ mod tests {
             Some(FIRST_CONTACT_NOW),
             "the import wrote its contact before the spawn"
         );
-        guard.rollback().await.unwrap();
+        guard
+            .rollback(sup.bootstrap_spawn_lock.lock())
+            .await
+            .unwrap();
         assert!(sup.lookup(&imported).is_none(), "no actor started");
         assert!(!persistence.contexts.contains_key(&imported));
         assert_eq!(
@@ -30346,7 +30547,10 @@ mod tests {
         ))
         .await
         .unwrap_err();
-        let err = guard.rollback().await.unwrap_err();
+        let err = guard
+            .rollback(sup.bootstrap_spawn_lock.lock())
+            .await
+            .unwrap_err();
         assert!(matches!(err, ContextError::PersistenceFailed(_)), "{err:?}");
         assert!(persistence.contexts.contains_key(&ctx), "the delete failed");
         assert_eq!(
@@ -30512,6 +30716,207 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+    }
+
+    /// A create that times out with its snapshot write still running waits
+    /// for that write with `bootstrap_spawn_lock` released, so every other
+    /// bootstrap can run during the wait; once the write lands the rollback
+    /// retakes the lock and puts back both records.
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_create_drains_its_writes_with_the_bootstrap_lock_released() {
+        let persistence = FaultyPersistence::default();
+        persistence
+            .delay_writes
+            .set(Supervisor::LIFECYCLE_TIMEOUT + std::time::Duration::from_secs(10))
+            .unwrap();
+        let sup = first_contact_supervisor(Box::new(persistence.clone()), durable_over_one_store());
+        let contacts = sup.relay_contact_store();
+        let ctx = hex::encode([0xF0u8; 32]);
+        contacts
+            .store_last_relay_contact(&ctx, PRIOR_CONTACT)
+            .await
+            .unwrap();
+        let identity = sup.node_identity().unwrap();
+        let create = tokio::spawn({
+            let sup = Arc::clone(&sup);
+            let ctx = ctx.clone();
+            async move {
+                sup.create_context(ctx, first_contact_params(), identity, None, Vec::new())
+                    .await
+            }
+        });
+        // Past the create's timeout, inside its rollback's wait for the write.
+        tokio::time::sleep(Supervisor::LIFECYCLE_TIMEOUT + std::time::Duration::from_secs(1)).await;
+        assert!(FaultyPersistence::is_set(&persistence.write_started));
+        assert!(
+            !create.is_finished(),
+            "the rollback is waiting for the snapshot write"
+        );
+        assert!(
+            sup.bootstrap_spawn_lock.try_lock().is_ok(),
+            "the rollback waits for the write with the bootstrap lock released"
+        );
+        let err = create.await.unwrap().unwrap_err();
+        assert!(err.to_string().contains("exceeded"), "{err:?}");
+        assert!(sup.lookup(&ctx).is_none(), "no actor is registered");
+        assert!(
+            !persistence.contexts.contains_key(&ctx),
+            "the late snapshot is deleted"
+        );
+        assert_eq!(
+            contacts.load_last_relay_contact(&ctx).await.unwrap(),
+            Some(PRIOR_CONTACT),
+            "the prior contact is put back"
+        );
+    }
+
+    /// While a bootstrap's first state of an id is written and not yet
+    /// committed or rolled back, a restore and an operator `clear_poison` of
+    /// that id are refused with a retryable `ActorBusy`, so neither starts an
+    /// actor from the snapshot the rollback is about to delete. After the
+    /// rollback the restore finds no snapshot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_restore_or_respawn_of_an_unsettled_first_state_is_busy() {
+        let persistence = FaultyPersistence::default();
+        let sup = first_contact_supervisor(Box::new(persistence.clone()), durable_over_one_store());
+        let identity = sup.node_identity().unwrap();
+        let ctx_bytes = [0xF1u8; 32];
+        let ctx = hex::encode(ctx_bytes);
+        let deps = sup.build_actor_deps_loaded(&identity).await.unwrap();
+        let guard =
+            crate::context::lifecycle_helpers::FirstStateRollback::new(&deps, &ctx).unwrap();
+        let state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_bytes,
+            FIRST_CONTACT_NOW,
+            identity.clone(),
+        );
+        crate::context::lifecycle_helpers::persist_first_state(&state, &deps, &ctx, &guard)
+            .await
+            .unwrap();
+        assert!(
+            persistence.contexts.contains_key(&ctx),
+            "the snapshot is written"
+        );
+
+        let handle = crate::context::ContextHandle::new(ctx.clone(), first_contact_params());
+        let err = sup.restore_context(&ctx, &handle).await.unwrap_err();
+        assert!(
+            matches!(&err, ContextError::ActorBusy(msg) if msg.contains("retry")),
+            "{err:?}"
+        );
+        let err = Box::pin(sup.clear_poison(&ctx, &identity))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, ContextError::ActorBusy(msg) if msg.contains("retry")),
+            "{err:?}"
+        );
+        assert!(sup.lookup(&ctx).is_none(), "no actor started");
+
+        guard
+            .rollback(sup.bootstrap_spawn_lock.lock())
+            .await
+            .unwrap();
+        assert!(
+            !persistence.contexts.contains_key(&ctx),
+            "the snapshot is deleted"
+        );
+        let handle = crate::context::ContextHandle::new(ctx.clone(), first_contact_params());
+        let err = sup.restore_context(&ctx, &handle).await.unwrap_err();
+        assert!(
+            !matches!(err, ContextError::ActorBusy(_)),
+            "the claim is released after the rollback: {err:?}"
+        );
+    }
+
+    /// A recovery notification an actor turn sends to a context with no
+    /// registered actor needs that actor respawned. While another bootstrap
+    /// holds `bootstrap_spawn_lock` the send returns a retryable `ActorBusy`
+    /// on its reply instead of waiting for the lock, whose holder may be
+    /// waiting on the sending actor's mailbox.
+    #[tokio::test(start_paused = true)]
+    async fn an_in_turn_recovery_send_needing_a_respawn_is_busy_while_the_lock_is_held() {
+        let persistence = FaultyPersistence::default();
+        let sup = first_contact_supervisor(Box::new(persistence), durable_over_one_store());
+        let ctx = hex::encode([0xF3u8; 32]);
+        let _held = sup.bootstrap_spawn_lock.lock().await;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let payload = crate::context::actor::commands::RecoverySendNotificationPayload {
+            context_id: ctx.clone(),
+            sender_did: "did:example:recovery-sender".to_owned(),
+            payload: b"recovery-notification-payload".to_vec(),
+            sequence: 1,
+            signer: CommandSigner::local_ed25519(ed25519_dalek::SigningKey::from_bytes(
+                &[0x11u8; 32],
+            )),
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            sup.dispatch_recovery_send_notification_in_turn(Box::new(payload), reply_tx),
+        )
+        .await
+        .expect("the in-turn send does not wait for the bootstrap lock")
+        .unwrap();
+        let err = reply_rx.await.unwrap().unwrap_err();
+        assert!(
+            matches!(&err, ContextError::ActorBusy(msg) if msg.contains("retry")),
+            "{err:?}"
+        );
+        assert!(sup.lookup(&ctx).is_none(), "no actor was respawned");
+    }
+
+    /// Shutdown ends while a first-state snapshot write hangs: after shutdown
+    /// begins the writes task gives the write a bounded time, then abandons
+    /// it, so `shutdown_all_contexts`, which awaits every tracked task, does
+    /// not hang. A rollback after that keeps the records, since the write may
+    /// still land.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_ends_while_a_first_state_write_hangs() {
+        let persistence = FaultyPersistence::default();
+        FaultyPersistence::set(&persistence.hang_writes);
+        let sup = first_contact_supervisor(Box::new(persistence.clone()), durable_over_one_store());
+        let contacts = sup.relay_contact_store();
+        let identity = sup.node_identity().unwrap();
+        let ctx_bytes = [0xF2u8; 32];
+        let ctx = hex::encode(ctx_bytes);
+        let deps = sup.build_actor_deps_loaded(&identity).await.unwrap();
+        let guard =
+            crate::context::lifecycle_helpers::FirstStateRollback::new(&deps, &ctx).unwrap();
+        let state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_bytes,
+            FIRST_CONTACT_NOW,
+            identity.clone(),
+        );
+        // The operation's future is dropped mid-write; the tracked writes
+        // task keeps waiting on the hung snapshot write.
+        let abandoned = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            crate::context::lifecycle_helpers::persist_first_state(&state, &deps, &ctx, &guard),
+        )
+        .await;
+        assert!(abandoned.is_err(), "the snapshot write hangs");
+        assert!(FaultyPersistence::is_set(&persistence.write_started));
+
+        let shutdown = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            sup.shutdown_all_contexts(),
+        )
+        .await;
+        assert!(shutdown.is_ok(), "shutdown ends while the write hangs");
+
+        let err = guard
+            .rollback(sup.bootstrap_spawn_lock.lock())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, ContextError::PersistenceFailed(msg) if msg.contains("abandoned")),
+            "{err:?}"
+        );
+        assert_eq!(
+            contacts.load_last_relay_contact(&ctx).await.unwrap(),
+            Some(FIRST_CONTACT_NOW),
+            "the contact written before the hung snapshot write is kept"
+        );
     }
 
     /// A second create of a running context's id fails with `CreationFailed`

@@ -4429,9 +4429,11 @@ async fn export_fails_when_the_event_log_cannot_export() {
     );
 }
 
-/// A migration that succeeds creates its destination inside the source
-/// actor's turn, under `bootstrap_spawn_lock`, while a create of another
-/// context runs alongside it. No bootstrap waits on a mailbox under that
+/// A migration creates its destination inside the source actor's turn,
+/// under `bootstrap_spawn_lock`, while a create of another context runs
+/// alongside it. The actor turn never waits for that lock: while the create
+/// holds it the migration returns a retryable `ActorBusy` and changes
+/// nothing, so the caller retries. No bootstrap waits on a mailbox under the
 /// lock, and the destination's gauge refresh runs as a task nobody awaits,
 /// so neither the source's turn nor the create waits on the source's
 /// mailbox; both finish well before the 30 s handler and lifecycle timeouts
@@ -4462,7 +4464,20 @@ async fn a_migration_alongside_a_create_finishes_without_waiting_on_its_own_turn
     let started = std::time::Instant::now();
     let (migrated, created) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         tokio::join!(
-            manager.propose_governance_action(source, &admin, migrate, &signer),
+            async {
+                loop {
+                    match manager
+                        .propose_governance_action(source, &admin, migrate.clone(), &signer)
+                        .await
+                    {
+                        Err(ContextError::ActorBusy(reason)) => {
+                            assert!(reason.contains("retry"), "{reason}");
+                            tokio::task::yield_now().await;
+                        }
+                        other => break other,
+                    }
+                }
+            },
             manager.create_context(
                 "ctx-created-alongside".into(),
                 params(),

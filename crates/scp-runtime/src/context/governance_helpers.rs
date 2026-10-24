@@ -3950,6 +3950,11 @@ pub fn execute_propose_context_migration<'a>(
     grace_period_secs: u64,
     auto_invite: bool,
     meta: CommitMeta<'a>,
+    // `bootstrap_spawn_lock`, taken by the propose or vote path before it
+    // recorded anything, for a migration this call executes; the migration's
+    // destination create runs under it. `None` everywhere else: the
+    // migration then try-locks itself.
+    bootstrap_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
 ) -> std::pin::Pin<
     Box<
         dyn std::future::Future<Output = Result<MigrationProposedResult, ContextError>> + Send + 'a,
@@ -4005,11 +4010,16 @@ pub fn execute_propose_context_migration<'a>(
         // runs under `bootstrap_spawn_lock`, and it fails before any write
         // when the destination id names a running context (ADR-029
         // Implementation), so it cannot replace that context's snapshot or
-        // contact. This turn waits for the lock, so no wait on another actor
-        // runs while it holds it: the destination's post-spawn wiring, which
-        // waits on the destination's mailbox, runs after the guard drops, and
-        // every other bootstrap runs its own wiring after releasing the lock.
-        let bootstrap_guard = deps.supervisor.lock_bootstrap_spawn().await?;
+        // contact. This is an actor turn, and the lock's holders wait on
+        // actor mailboxes, so the turn never waits for the lock: it
+        // try-locks before any mutation and fails with a retryable
+        // `ActorBusy` while another bootstrap holds it. The propose and vote
+        // paths take the guard before they record the proposal or the vote
+        // and hand it here, so their busy failure records nothing either.
+        // The destination's post-spawn wiring, which waits on the
+        // destination's mailbox, runs after the guard drops.
+        let bootstrap_guard =
+            bootstrap_guard.map_or_else(|| deps.supervisor.try_lock_bootstrap_spawn(), Ok)?;
         if deps.supervisor.lookup(&destination_context_id)?.is_some() {
             return Err(ContextError::CreationFailed(format!(
                 "migration destination '{destination_context_id}' is running"
@@ -4096,14 +4106,23 @@ pub fn execute_propose_context_migration<'a>(
                          destination's create failed"
                     );
                 }
-                // Put back the destination's first-state records; a failure to
-                // do so is the caller's to see.
-                first_state.rollback().await.map_err(|rollback| {
-                    crate::context::lifecycle_helpers::fold_rollback_failure(
-                        &format!("failed to create destination context: {e}"),
-                        &rollback,
-                    )
-                })?;
+                // Put back the destination's first-state records with the lock
+                // released; a failure to do so is the caller's to see. A
+                // rollback handed to a background task stays a retryable
+                // `ActorBusy`.
+                drop(bootstrap_guard);
+                first_state
+                    .rollback_in_turn()
+                    .await
+                    .map_err(|rollback| match rollback {
+                        ContextError::ActorBusy(waiting) => ContextError::ActorBusy(format!(
+                            "failed to create destination context: {e}; {waiting}"
+                        )),
+                        other => crate::context::lifecycle_helpers::fold_rollback_failure(
+                            &format!("failed to create destination context: {e}"),
+                            &other,
+                        ),
+                    })?;
                 return Err(ContextError::PermissionDenied(format!(
                     "failed to create destination context: {e}"
                 )));
@@ -4412,6 +4431,10 @@ pub async fn propose_governance_action_inner(
         }
         ProposeIntent::NoSignature { .. } => None,
     };
+    // Decided before the proposal is recorded, with no await in between: a
+    // busy `bootstrap_spawn_lock` fails the propose with a retryable
+    // `ActorBusy` that left no proposal and no rate-limit timestamp behind.
+    let bootstrap_guard = migration_bootstrap_guard(deps, Some(&action))?;
     let (proposal, events) = cell
         .class_c_view()
         .governance_class_c_mut()
@@ -4496,10 +4519,12 @@ pub async fn propose_governance_action_inner(
                 &proposal.proposal_id,
                 Some(proposer_did),
                 key_package,
+                bootstrap_guard,
             ))
             .await?,
         )
     } else {
+        drop(bootstrap_guard);
         None
     };
 
@@ -4694,6 +4719,33 @@ pub async fn propose_governance_action_checked(
     })
 }
 
+/// `bootstrap_spawn_lock` for a governance action that is a context
+/// migration, taken without waiting; `None` for every other action.
+///
+/// A migration creates its destination under that lock inside the source
+/// actor's turn, and the lock's holders wait on actor mailboxes, so an actor
+/// turn never waits for it. The propose and vote paths call this before they
+/// record anything, so that a busy lock leaves nothing behind and a retry of
+/// the same call can succeed.
+///
+/// # Errors
+///
+/// [`ContextError::ActorBusy`] (retryable) while another bootstrap holds the
+/// lock, or the Supervisor's own error when it has shut down.
+fn migration_bootstrap_guard(
+    deps: &ActorDeps,
+    action: Option<&GovernanceAction>,
+) -> Result<Option<tokio::sync::OwnedMutexGuard<()>>, ContextError> {
+    if matches!(
+        action,
+        Some(GovernanceAction::ProposeContextMigration { .. })
+    ) {
+        deps.supervisor.try_lock_bootstrap_spawn().map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // vote_on_proposal_inner (entry point — internal)
 // ---------------------------------------------------------------------------
@@ -4760,22 +4812,40 @@ pub async fn vote_on_proposal_inner(
         .engine_mut()
         .precheck_vote(proposal_id, voter_did, &vote_type, &gov_ctx)
         .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?;
-    let (status, events) = match intent {
+    let (status, events, bootstrap_guard) = match intent {
         VoteIntent::Sign { timestamp, digest } => {
             debug_assert_eq!(timestamp, gov_ctx.now);
             let signature = signer.sign_bounded_ed25519(&digest).await?;
             let vote = signed_vote(&vote_type, voter_did, timestamp, signature);
+            // Decided before the vote is recorded, with no await in between:
+            // an approval of a migration may cross quorum and execute it, so
+            // a busy `bootstrap_spawn_lock` fails the vote with a retryable
+            // `ActorBusy` that recorded no vote.
+            let bootstrap_guard = if approve {
+                migration_bootstrap_guard(
+                    deps,
+                    cell.governance
+                        .engine
+                        .get_proposal(proposal_id)
+                        .map(|p| &p.action),
+                )?
+            } else {
+                None
+            };
             let mut view = cell.class_c_view();
             let engine = view.governance_class_c_mut().engine_mut();
-            if approve {
+            let (status, events) = if approve {
                 engine.approve_signed(proposal_id, voter_did, &gov_ctx, vote)
             } else {
                 engine.reject_signed(proposal_id, voter_did, &gov_ctx, vote)
             }
-            .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?
+            .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?;
+            (status, events, bootstrap_guard)
         }
-        VoteIntent::Resolved(status, events) => (status, events),
-        VoteIntent::NoOp(status) => (status, Vec::new()),
+        // Neither arm records a vote, so a migration it approves try-locks
+        // in the migration itself, and a retry repeats the same resolution.
+        VoteIntent::Resolved(status, events) => (status, events, None),
+        VoteIntent::NoOp(status) => (status, Vec::new(), None),
     };
 
     let proposal_for_execution = if status == ProposalStatus::Approved {
@@ -4855,6 +4925,7 @@ pub async fn vote_on_proposal_inner(
                 // The quorum-approval path never carries an invitee KeyPackage
                 // (deferred governed invite is issue #2027).
                 None,
+                bootstrap_guard,
             ))
             .await?;
         }
@@ -5164,6 +5235,11 @@ pub async fn dispatch_context_governance_action(
     // never carried a real add (issue #2029).
     key_package: Option<&[u8]>,
     meta: CommitMeta<'_>,
+    // `bootstrap_spawn_lock`, taken by the propose or vote path before it
+    // recorded anything, for a migration this call executes; the migration's
+    // destination create runs under it. `None` everywhere else: the
+    // migration then try-locks itself.
+    bootstrap_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
 ) -> Result<GovernanceActionResult, ContextError> {
     let CommitMeta {
         pid,
@@ -5355,6 +5431,7 @@ pub async fn dispatch_context_governance_action(
                     actor_did,
                     timestamp_secs,
                 },
+                bootstrap_guard,
             )
             .await?;
             Ok(GovernanceActionResult::MigrationProposed(result))
@@ -5442,6 +5519,11 @@ pub async fn dispatch_governance_action(
     // on the actor command envelope by `Supervisor::invite_member` and threaded
     // to `execute_add_member`. `None` on every non-invite execute path.
     key_package: Option<&[u8]>,
+    // `bootstrap_spawn_lock`, taken by the propose or vote path before it
+    // recorded anything, for a migration this call executes; the migration's
+    // destination create runs under it. `None` everywhere else: the
+    // migration then try-locks itself.
+    bootstrap_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
 ) -> Result<GovernanceActionResult, ContextError> {
     let pid = proposal.proposal_id;
     let actor = executor_did.as_ref();
@@ -5723,6 +5805,7 @@ pub async fn dispatch_governance_action(
                     actor_did: actor,
                     timestamp_secs: ts,
                 },
+                bootstrap_guard,
             )
             .await
         }
@@ -6047,6 +6130,11 @@ pub async fn execute_governance_action(
     // paths — those never carry a real KeyPackage (governed-context invite is
     // issue #2027).
     key_package: Option<&[u8]>,
+    // `bootstrap_spawn_lock`, taken by the propose or vote path before it
+    // recorded anything, for a migration this call executes; the migration's
+    // destination create runs under it. `None` everywhere else: the
+    // migration then try-locks itself.
+    bootstrap_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
 ) -> Result<GovernanceActionResult, ContextError> {
     // ADR-049 §9 Class-S cell seam: this entry holds the cell. The pre-dispatch
     // gate is READ-ONLY (commit-fault gate, authoritative-proposal resolution,
@@ -6176,6 +6264,7 @@ pub async fn execute_governance_action(
         proposal,
         executor_did,
         key_package,
+        bootstrap_guard,
     )
     .await
     {
@@ -8093,6 +8182,89 @@ mod commit_broadcast_retry_tests {
             assert!(
                 persists.load(Ordering::SeqCst) > persists_before,
                 "the vote path persists"
+            );
+        }
+
+        /// An approval of a migration proposal, which may carry it past
+        /// quorum and execute it, cast while another bootstrap holds
+        /// `bootstrap_spawn_lock`, fails with a retryable `ActorBusy` before
+        /// the vote is recorded, so the same vote cast again once the lock is
+        /// free is counted instead of refused as a duplicate.
+        #[tokio::test]
+        async fn a_busy_migration_vote_records_nothing_and_its_retry_counts() {
+            let (deps, clock, _) = deps_and_clock().await;
+            let mut cell = majority_cell(&clock);
+            let migrate = GovernanceAction::ProposeContextMigration {
+                new_context_params: Box::new(scp_protocol::context::params::ContextParams {
+                    ceiling: ceiling(),
+                    governance: GovernanceModel::SingleAdmin,
+                    ..scp_protocol::context::params::ContextParams::default()
+                }),
+                reason: "fixture".to_owned(),
+                grace_period_secs: 60,
+                auto_invite: false,
+            };
+            let (proposal, _, _) =
+                crate::context::governance_helpers::propose_governance_action_inner(
+                    &mut cell,
+                    &deps,
+                    &ctx_hex(),
+                    &did(A),
+                    migrate,
+                    &local(A),
+                    false,
+                    None,
+                )
+                .await
+                .expect("propose the migration");
+            let pid = proposal.proposal_id;
+            let (status, _) = vote(&mut cell, &deps, &pid, B, &local(B))
+                .await
+                .expect("B approves");
+            assert_eq!(status, ProposalStatus::Pending);
+
+            let held = deps
+                .supervisor
+                .try_lock_bootstrap_spawn()
+                .expect("the bootstrap lock is free");
+            let busy = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                vote(&mut cell, &deps, &pid, C, &local(C)),
+            )
+            .await
+            .expect("the vote turn must not wait for the bootstrap lock");
+            assert!(
+                matches!(
+                    &busy,
+                    Err(scp_protocol::context::ContextError::ActorBusy(msg)) if msg.contains("retry")
+                ),
+                "{busy:?}"
+            );
+            let tracked = cell.governance.engine.get_proposal(&pid).expect("proposal");
+            assert_eq!(
+                tracked.status,
+                ProposalStatus::Pending,
+                "nothing was approved"
+            );
+            assert!(
+                tracked.approvals.iter().all(|v| v.voter_did != did(C)),
+                "a busy vote must not be recorded"
+            );
+            drop(held);
+
+            let retried = vote(&mut cell, &deps, &pid, C, &local(C)).await;
+            assert!(
+                !matches!(
+                    &retried,
+                    Err(scp_protocol::context::ContextError::ActorBusy(_)
+                        | scp_protocol::context::ContextError::GovernanceFailed(_))
+                ),
+                "the retried vote must be counted, not refused; got {retried:?}"
+            );
+            let tracked = cell.governance.engine.get_proposal(&pid).expect("proposal");
+            assert!(
+                tracked.approvals.iter().any(|v| v.voter_did == did(C)),
+                "the retried vote is recorded"
             );
         }
 
