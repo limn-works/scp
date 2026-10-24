@@ -337,20 +337,22 @@ The enclosing record's signature therefore proves that the identity's designated
 | 4 | `init_key` | 65 bytes (DHKEM(P-256) public key, RFC 9180 §7.1 — the KeyPackage `init_key`). §9.5.2 fixes the value on a leaf that has no KeyPackage: "a bare LeafNode created without a KeyPackage — the group creator's leaf and every PCS-Update leaf (§9.7.1) — has exactly one HPKE key, its `encryption_key`, and no separate `init_key`; on such a leaf this field therefore carries `leaf_encryption_key`" |
 | 5 | `wrapping_key` | 65 bytes (DHKEM(P-256) public key, RFC 9180 §7.1 — the `scp_wrapping_key` (`0xFF01`) LeafNode extension value) |
 | 6 | `signing_key_id` | 4-byte BE length + UTF-8 bytes. `#active` is the one operational role a key state names (`09-security-model.md` §9.1 invariant 1) |
-| 7 | `issued_at` | 8-byte BE u64 (equals the leaf's `Lifetime.not_before`) |
-| 8 | `expires_at` | 8-byte BE u64 (equals the leaf's `Lifetime.not_after`) |
+| 7 | `active_key` | 33 bytes (compressed SEC1 P-256 public key: the attesting identity's `#active` key, the key that signs the attestation) |
+| 8 | `active_key_algorithm` | 1 byte (`0x01`, `KEY_ALGORITHM_ECDSA_P256_SHA256`; any other value is rejected) |
+| 9 | `issued_at` | 8-byte BE u64 (equals the leaf's `Lifetime.not_before`) |
+| 10 | `expires_at` | 8-byte BE u64 (equals the leaf's `Lifetime.not_after`) |
 
-`canonical_fields` builds exactly that eight-element array, `signing_preimage` prepends the domain separator through `canonical_hash_bytes`, and `signing_hash` returns `SHA-256(signing_preimage())`. The module states the signer's obligation without ambiguity, in a comment written before SCP superseded Ed25519 on 2026-09-10 (§9.5 of the security spec), so it names the superseded curve where the rule now names ECDSA on P-256:
+`canonical_fields` builds exactly that ten-element array, `signing_preimage` prepends the domain separator through `canonical_hash_bytes`, and `signing_hash` returns `SHA-256(signing_preimage())`. The module states the signer's obligation without ambiguity, in a comment written before SCP superseded Ed25519 on 2026-09-10 (§9.5 of the security spec), so it names the superseded curve where the rule now names ECDSA on P-256:
 
 > The **only** signable output is [`signing_hash`]: the 32-byte `SHA-256(signing_preimage())` prehash. A later CRYPTO-22 slice's signer MUST compute the Ed25519 signature over that 32-byte hash — and over **nothing else**. It MUST NOT sign the raw `signing_preimage()` bytes, and it MUST NOT sign the [`to_extension_body`] output.
 
-**Inside the signed scope:** all eight fields.
+**Inside the signed scope:** all ten fields.
 
 **Outside the signed scope:** the 64-byte `signature` itself, and — deliberately — any context identifier. §9.5.2 of the security spec states the reason: "The attestation is deliberately **context-agnostic**: it carries no `context_id`. A KeyPackage is a per-identity, pre-published pre-key bundle that must be mintable offline — before any group it will be added to is known — so a context scope is unknowable at mint time; group-scope binding is provided separately and redundantly by the `scp_context_params` GroupContext extension (`0xFF02`, §5.13.3)."
 
-**The wire body is not the signed preimage.** *Consolidated* from §9.5.2 of the security spec: the `scp_keypackage_attestation` (`0xFF03`) LeafNode extension body is "the eight attestation fields, **in the same order as the signed preimage above**, followed by the raw 64-byte P-256 signature," and "the domain separator appears only in the signed preimage, never in the extension body." `to_extension_body` implements that by passing an empty domain to `canonical_hash_bytes` and appending the signature.
+**The wire body is not the signed preimage.** *Consolidated* from §9.5.2 of the security spec: the `scp_keypackage_attestation` (`0xFF03`) LeafNode extension body is "the ten attestation fields, **in the same order as the signed preimage above**, followed by the raw 64-byte P-256 signature," and "the domain separator appears only in the signed preimage, never in the extension body." `to_extension_body` implements that by passing an empty domain to `canonical_hash_bytes` and appending the signature.
 
-**F5 is the only family with a byte-exact known-answer vector for both the preimage and the wire body.** §25.23 Vector 37 of the test-vector spec pins a 211-byte preimage, the hash `50cf61db5a97e0ddbd762de07e107684dfd0f00cfe53bad2750a70103ac38957`, a 64-byte signature, and a 245-byte extension body. The module reproduces the vector in its own tests.
+**F5 is the only family with a byte-exact known-answer vector for both the preimage and the wire body.** §25.23 Vector 37 of the test-vector spec pins a 411-byte preimage, the hash `905f5919a0949568521c739c2c1eb0db86667fbcabf07b0e154fb60c7d6611fd`, a 64-byte signature, and a 445-byte extension body. The module reproduces the vector in its own tests.
 
 **Three mint sites.** *Consolidated* from §9.7.1 of the security spec (`.docs/specs/09-security-model.md` §9.7.1 MLS-to-SCP Concept Mapping): "An attestation is minted at **every leaf-creation site — all three of them**: (1) group creation (`create_group`, where the creator's leaf is built directly with **no** published KeyPackage — the creator leaf still has a LeafNode `Lifetime`, just no `KeyPackage` wrapper), (2) add-time KeyPackage generation (the published pre-key bundle), and (3) every PCS Update, which generates a fresh ephemeral leaf key and therefore requires a fresh attestation over it (§9.7.3)."
 

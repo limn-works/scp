@@ -1439,6 +1439,9 @@ INIT_KEY_SEED = bytes.fromhex("11" * 32)
 WRAPPING_KEY_SEED = bytes.fromhex("22" * 32)
 
 
+KEY_ALGORITHM_ECDSA_P256_SHA256_ATTESTATION = 0x01  # §9.5.2 field 8, §9.18.17
+
+
 def emit_keypackage_attestation() -> None:
     section("§25.23 KeyPackage attestation")
     leaf_signature_key = REF_KEY_2.uncompressed
@@ -1457,14 +1460,20 @@ def emit_keypackage_attestation() -> None:
     ]
     assert len(set(keys)) == 4, "the four bound leaf keys must be distinct"
 
+    # §9.5.2's ten fields: `active_key` (field 7) is the key that signs the
+    # attestation, §25.2's reference key, compressed; field 8 is
+    # KEY_ALGORITHM_ECDSA_P256_SHA256 (ADR-066 decision 40).
     body_fields = (
         var_field(ID_LEAF_ATTESTER)
         + b"".join(fixed_field(key) for key in keys)
         + var_field("#active")
+        + fixed_field(REF_KEY_1.compressed)
+        + u8(KEY_ALGORITHM_ECDSA_P256_SHA256_ATTESTATION)
         + u64(1_700_000_000)
         + u64(1_700_086_400)
     )
     preimage = b"SCP-KEYPACKAGE-ATTESTATION-V1:" + body_fields
+    assert len(preimage) == 411, len(preimage)
     emit_hex("vector_37.leaf_signature_key", leaf_signature_key)
     emit_hex("vector_37.leaf_encryption_key", leaf_encryption.uncompressed)
     emit_hex("vector_37.init_key", init.uncompressed)
@@ -1472,8 +1481,29 @@ def emit_keypackage_attestation() -> None:
     digest = sign_and_emit("vector_37", preimage)
     signature = ecdsa_sign(REF_KEY_1.d, digest)
     extension_body = body_fields + signature
+    assert len(extension_body) == 445, len(extension_body)
+    emit_hex("vector_37.active_key", REF_KEY_1.compressed)
     emit("vector_37.extension_body_len", len(extension_body))
     emit_hex("vector_37.extension_body", extension_body)
+
+    # The eight-field bytes the shipped code asserts until SCP-315 lands the
+    # ten-field attestation of ADR-066 decision 40. This section carries no §25
+    # heading, so spec 25 does not print it; it keeps those Rust literals
+    # traceable to this generator meanwhile.
+    section("Pre-decision-40 Vector 37 bytes that current code asserts until SCP-315")
+    legacy_fields = (
+        var_field(ID_LEAF_ATTESTER)
+        + b"".join(fixed_field(key) for key in keys)
+        + var_field("#active")
+        + u64(1_700_000_000)
+        + u64(1_700_086_400)
+    )
+    legacy_digest = sign_and_emit(
+        "legacy_vector_37", b"SCP-KEYPACKAGE-ATTESTATION-V1:" + legacy_fields
+    )
+    legacy_body = legacy_fields + ecdsa_sign(REF_KEY_1.d, legacy_digest)
+    emit("legacy_vector_37.extension_body_len", len(legacy_body))
+    emit_hex("legacy_vector_37.extension_body", legacy_body)
 
 
 # ---------------------------------------------------------------------------
@@ -2869,8 +2899,10 @@ def _gf128_mul(x: int, y: int) -> int:
     return z
 
 
-def aes128_gcm_encrypt(key: bytes, nonce: bytes, plaintext: bytes) -> bytes:
-    """AES-128-GCM, 96-bit nonce, no associated data; returns C || tag."""
+def aes128_gcm_encrypt(
+    key: bytes, nonce: bytes, plaintext: bytes, aad: bytes = b""
+) -> bytes:
+    """AES-128-GCM, 96-bit nonce, optional associated data; returns C || tag."""
     assert len(nonce) == 12
     rk = _aes128_expand(key)
     h = int.from_bytes(aes128_encrypt_block(rk, bytes(16)), "big")
@@ -2881,10 +2913,12 @@ def aes128_gcm_encrypt(key: bytes, nonce: bytes, plaintext: bytes) -> bytes:
         stream = aes128_encrypt_block(rk, counter)
         out += bytes(a ^ b for a, b in zip(plaintext[i : i + 16], stream))
     ghash = 0
-    padded = bytes(out) + bytes(-len(out) % 16)
+    padded = (
+        aad + bytes(-len(aad) % 16) + bytes(out) + bytes(-len(out) % 16)
+    )
     for i in range(0, len(padded), 16):
         ghash = _gf128_mul(ghash ^ int.from_bytes(padded[i : i + 16], "big"), h)
-    lengths = (0).to_bytes(8, "big") + (8 * len(out)).to_bytes(8, "big")
+    lengths = (8 * len(aad)).to_bytes(8, "big") + (8 * len(out)).to_bytes(8, "big")
     ghash = _gf128_mul(ghash ^ int.from_bytes(lengths, "big"), h)
     tag = bytes(
         a ^ b for a, b in zip(aes128_encrypt_block(rk, j0), ghash.to_bytes(16, "big"))
@@ -2892,7 +2926,7 @@ def aes128_gcm_encrypt(key: bytes, nonce: bytes, plaintext: bytes) -> bytes:
     if _HAVE_CRYPTOGRAPHY:
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-        assert AESGCM(key).encrypt(nonce, plaintext, None) == bytes(out) + tag, (
+        assert AESGCM(key).encrypt(nonce, plaintext, aad or None) == bytes(out) + tag, (
             "the cryptography package computed a different AES-128-GCM output"
         )
     return bytes(out) + tag
@@ -3744,6 +3778,506 @@ def emit_fork_merge() -> None:
     emit_hex("vector_79.cth2", cth2)
 
 
+# ---------------------------------------------------------------------------
+# §25.23 Vectors 80-82: key positions, the re-seat request and answer, and the
+# three re-seat seals (`09-security-model.md` §9.7.1, §9.10.12, §9.18;
+# `05-contexts.md` §5.13.3 "Key positions", §5.12.3.4, §5.12.3.5;
+# `07-trust-validation-and-capabilities.md` §7.3.1.1 step 1.6 and
+# "Carried re-seat").
+#
+# The two branch events of the Contested position are §25.29's Vector 53
+# (`CommitmentRollover`) and Vector 54 (`RootRecovery{CoSigns}`), both at
+# sequence 1 after Vector 41's inception, which is the shared fork point.
+# ---------------------------------------------------------------------------
+
+KEY_EVENT_FRAME_VERSION = 0x02
+RESEAT_CONTEXT_ID = "context-alpha"
+RESEAT_REQUEST_DOMAIN = "SCP-RESEAT-REQUEST-V1:"
+RESEAT_GROUPINFO_DOMAIN = "SCP-RESEAT-GROUPINFO-V1:"
+KEY_POSITION_NAMES = ("contested", "linear", "unheld", "displaced")
+
+
+def key_event_frame(identifier: bytes, events: list[tuple[int, bytes, bytes]]) -> bytes:
+    """§9.10.12: version 2, the 32-byte identifier, then `value`: first and last
+    sequence, the event count, and each event as BE32(len(preimage)) || preimage
+    || its indexed signature field."""
+    assert len(identifier) == 32 and events
+    value = (
+        u64(events[0][0])
+        + u64(events[-1][0])
+        + u32(len(events))
+        + b"".join(var_field(pre) + sigs for _, pre, sigs in events)
+    )
+    return u8(KEY_EVENT_FRAME_VERSION) + identifier + value
+
+
+def key_history_advance(frame: bytes, confirmation: bytes) -> bytes:
+    """§9.7.1: two length-prefixed fields (§9.5.1), at least one non-empty."""
+    assert frame or confirmation
+    return var_field(frame) + var_field(confirmation)
+
+
+def repeated_field(items: list[bytes]) -> bytes:
+    """§9.5.1's repeated-field rule: BE32(count), then each element length-prefixed."""
+    return u32(len(items)) + b"".join(var_field(item) for item in items)
+
+
+def position_element(
+    identifier: str,
+    heads: list[tuple[int, bytes]],
+    contested_since: int | None = None,
+    presented: tuple[tuple[int, bytes], ...] = (),
+    pending_since: int | None = None,
+    staged_by: str | None = None,
+    displaced: tuple[int, int] | None = None,
+    recovered_at: tuple[int, int, bytes] | None = None,
+) -> list:
+    """`05-contexts.md` §5.13.3 "Key positions": one element of `positions`.
+    No fixture position records a `confirmed` pair, so it is null throughout."""
+    assert (len(heads) > 1) == (contested_since is not None)
+    assert (pending_since is None) == (staged_by is None)
+
+    def pairs(items) -> list:
+        ordered = sorted(items, key=lambda pair: pair[1])
+        return [[seq, digest.hex()] for seq, digest in ordered]
+
+    return [
+        identifier,
+        pairs(heads),
+        contested_since,
+        pairs(presented),
+        pending_since,
+        None,
+        staged_by,
+        None if displaced is None else displaced[0],
+        None if displaced is None else displaced[1],
+        None
+        if recovered_at is None
+        else [recovered_at[0], recovered_at[1], recovered_at[2].hex()],
+    ]
+
+
+def key_positions_hash(relay_list_sequence: int, positions: list[list]) -> bytes:
+    ordered = sorted(positions, key=lambda element: element[0].encode())
+    return sha256(jcs([relay_list_sequence, ordered]))
+
+
+def mp_opt_uint(value: int | None) -> bytes:
+    return mp_none() if value is None else mp_uint(value)
+
+
+def key_position_recorded_payload(element: list) -> bytes:
+    """The leaf payload: the positional `rmp_serde` array of
+    `07-trust-validation-and-capabilities.md` §7.3.1.1 step 1.6, nine items,
+    every identifier in text form, each `[seq, event_digest]` pair a two-item
+    array whose digest is a 32-byte bin."""
+
+    def pairs(items: list) -> bytes:
+        return mp_array(
+            [mp_array([mp_uint(seq), mp_bin(bytes.fromhex(d))]) for seq, d in items]
+        )
+
+    identifier, heads, contested, presented, pending, confirmed, staged, at, top, _ = (
+        element
+    )
+    assert confirmed is None
+    return mp_array(
+        [
+            mp_str(identifier),
+            pairs(heads),
+            mp_opt_uint(contested),
+            pairs(presented),
+            mp_opt_uint(pending),
+            mp_none(),
+            mp_none() if staged is None else mp_str(staged),
+            mp_opt_uint(at),
+            mp_opt_uint(top),
+        ]
+    )
+
+
+def fixture_digest(label: str) -> bytes:
+    return sha256(f"SCP test vector {label}".encode())
+
+
+def fixture_bytes(label: str, length: int) -> bytes:
+    out = b""
+    counter = 0
+    while len(out) < length:
+        out += sha256(f"SCP test vector {label} {counter}".encode())
+        counter += 1
+    return out[:length]
+
+
+def mp_header(item: bytes) -> bytes:
+    """The MessagePack header of one encoded item: a fixint or nil is its own
+    header; a fixstr has one byte; str8 and bin8 two; bin16 three; a uint8 one."""
+    first = item[0]
+    if first < 0x80 or first == 0xC0:
+        return item[:1]
+    if 0xA0 <= first <= 0xBF or first == 0xCC:
+        return item[:1]
+    if first in (0xD9, 0xC4):
+        return item[:2]
+    if first in (0xDA, 0xC5):
+        return item[:3]
+    raise AssertionError(f"no header rule for 0x{first:02x}")
+
+
+def hpke_seal_base(
+    recipient: KeyPair, ephemeral: KeyPair, info: bytes, aad: bytes, plaintext: bytes
+) -> dict[str, bytes]:
+    """RFC 9180 single-shot Seal in mode base under DHKEM(P-256, HKDF-SHA256),
+    HKDF-SHA256 and AES-128-GCM, the suite §5.12.3.1 seals an `InvitationBundle`
+    under (§9.5). The ephemeral key is a fixture, so the bytes are reproducible."""
+    enc = ephemeral.uncompressed
+    dh = ecdh_p256(ephemeral.d, recipient.point)
+    assert dh == ecdh_p256(recipient.d, ephemeral.point)
+    eae_prk = hpke_labeled_extract(HPKE_SUITE_KEM, b"", b"eae_prk", dh)
+    shared_secret = hpke_labeled_expand(
+        HPKE_SUITE_KEM, eae_prk, b"shared_secret", enc + recipient.uncompressed, 32
+    )
+    psk_id_hash = hpke_labeled_extract(HPKE_SUITE, b"", b"psk_id_hash", b"")
+    info_hash = hpke_labeled_extract(HPKE_SUITE, b"", b"info_hash", info)
+    context = b"\x00" + psk_id_hash + info_hash
+    secret = hpke_labeled_extract(HPKE_SUITE, shared_secret, b"secret", b"")
+    key = hpke_labeled_expand(HPKE_SUITE, secret, b"key", context, 16)
+    base_nonce = hpke_labeled_expand(HPKE_SUITE, secret, b"base_nonce", context, 12)
+    return {
+        "enc": enc,
+        "shared_secret": shared_secret,
+        "key": key,
+        "base_nonce": base_nonce,
+        "ciphertext": aes128_gcm_encrypt(key, base_nonce, plaintext, aad),
+    }
+
+
+def reseat_seal_label(label: str, context_id: str, request_digest: bytes) -> bytes:
+    """`09-security-model.md` §9.18's HPKE rows for the re-seat seals:
+    label || BE32(len(context_id)) || context_id || request_digest."""
+    assert len(request_digest) == 32
+    return label.encode() + var_field(context_id) + request_digest
+
+
+def emit_key_positions_and_reseat() -> None:
+    section("§25.23 Vectors 80-82 key positions, re-seat request and answer, seals")
+    identifier = INCEPTION_IDENTIFIER
+    identifier_text = scp_text_form(identifier)
+    fork_point = INCEPTION_DIGEST
+
+    # --- Vector 80: the two branch events and their frames. ---
+    pre53 = rollover_preimage(identifier, fork_point)
+    d53 = sha256(pre53)
+    sigs53 = [
+        sign_group(REF_KEY_3, d53, "vector_80.rollover.reveal"),
+        sign_group(REF_KEY_1, d53, "vector_80.rollover.standing_root"),
+    ]
+    pre54 = recovery_preimage(
+        identifier,
+        fork_point,
+        STANDING_ROOT_COSIGNS,
+        COSIGNS_ROOT_KEY,
+        COSIGNS_ACTIVE_KEY,
+        COSIGNS_NEXT_KEY,
+    )
+    d54 = sha256(pre54)
+    sigs54 = [
+        sign_group(REF_KEY_3, d54, "vector_80.recovery.reveal"),
+        sign_group(COSIGNS_ROOT_KEY, d54, "vector_80.recovery.installed_root"),
+        sign_group(REF_KEY_1, d54, "vector_80.recovery.standing_root"),
+    ]
+    # R6 ties the two branches: each first event after the fork point carries a
+    # root signature under the root standing there, so both rank 1 and the
+    # position holds both heads.
+    assert rank_first_reveal(d53, sigs53, 1) == 1
+    assert rank_first_reveal(d54, sigs54, 2) == 1
+    frame53 = key_event_frame(identifier, [(1, pre53, b"".join(sigs53))])
+    frame54 = key_event_frame(identifier, [(1, pre54, b"".join(sigs54))])
+    emit("vector_80.identifier_text", identifier_text)
+    emit_hex("vector_80.fork_point_digest", fork_point)
+    emit_hex("vector_80.branch_rollover_digest", d53)
+    emit_hex("vector_80.branch_recovery_digest", d54)
+    emit("vector_80.frame_rollover_len", len(frame53))
+    emit_hex("vector_80.frame_rollover", frame53)
+    emit("vector_80.frame_recovery_len", len(frame54))
+    emit_hex("vector_80.frame_recovery", frame54)
+
+    # A KeyHistoryAdvance with a frame and an empty confirmation.
+    body_frame = key_history_advance(frame53, b"")
+    assert body_frame == u32(len(frame53)) + frame53 + u32(0)
+    emit("vector_80.advance_frame_only_len", len(body_frame))
+    emit_hex("vector_80.advance_frame_only_sha256", sha256(body_frame))
+
+    # A KeyHistoryAdvance with an empty frame and a FallbackConfirmation. The
+    # record reuses Vector 49's context, governor and entries at sequence 3; the
+    # operator is Vector 49's entry 0, whose key is §25.2's reference key.
+    entries = community_relay_list_bytes()
+    record_sequence = 3
+    record_fields = (
+        fixed_field(RELAY_LIST_CONTEXT_ID)
+        + u64(record_sequence)
+        + fixed_field(identifier)
+        + fixed_field(sha256(entries))
+    )
+    record_digest = sha256(canonical_preimage(RELAY_LIST_SEPARATOR, record_fields))
+    record_signature = sign_group(REF_KEY_2, record_digest, "vector_80.list_record")
+    list_record = jcs(
+        {
+            "context_id": RELAY_LIST_CONTEXT_ID.hex(),
+            "entries": entries.decode(),
+            "governor": identifier.hex(),
+            "sequence": record_sequence,
+            "signature": record_signature.hex(),
+        }
+    )
+    operator, operator_key, _, _ = RELAY_LIST_ENTRIES[0]
+    assert operator_key == REF_KEY_1.compressed
+    response = repeated_field([frame54])
+    proof_nonce = fixture_digest("confirmation proof nonce")
+    routing_id = sha256(b"scp:did:" + identifier)
+    proof_fields = (
+        fixed_field(operator)
+        + fixed_field(proof_nonce)
+        + fixed_field(routing_id)
+        + fixed_field(sha256(response))
+        + u64(COSIGN_OBSERVED_AT)
+    )
+    proof_digest = sha256(canonical_preimage("SCP-RELAY-PROOF-V1:", proof_fields))
+    relay_proof = proof_fields + sign_group(REF_KEY_1, proof_digest, "vector_80.proof")
+    assert len(relay_proof) == 200
+    confirmation = (
+        var_field(list_record)
+        + fixed_field(operator)
+        + var_field(b"")
+        + response
+        + fixed_field(relay_proof)
+    )
+    body_confirmation = key_history_advance(b"", confirmation)
+    emit("vector_80.list_record_sequence", record_sequence)
+    emit_hex("vector_80.list_record_canonical_hash", record_digest)
+    emit_hex("vector_80.list_record_signature", record_signature)
+    emit("vector_80.list_record_len", len(list_record))
+    emit_hex("vector_80.list_record_sha256", sha256(list_record))
+    emit_hex("vector_80.proof_nonce", proof_nonce)
+    emit_hex("vector_80.response_value_digest", sha256(response))
+    emit_hex("vector_80.relay_proof", relay_proof)
+    emit("vector_80.confirmation_len", len(confirmation))
+    emit_hex("vector_80.confirmation_sha256", sha256(confirmation))
+    emit("vector_80.advance_confirmation_only_len", len(body_confirmation))
+    emit_hex("vector_80.advance_confirmation_only_sha256", sha256(body_confirmation))
+
+    # key_positions_hash over four positions and relay_list_sequence 3. The
+    # Contested position held the recovery's triple from epoch 5, when it was
+    # Linear; the contest recorded at epoch 12 left it unchanged.
+    contested = position_element(
+        identifier_text,
+        [(1, d53), (1, d54)],
+        contested_since=12,
+        recovered_at=(5, 1, d54),
+    )
+    linear = position_element(
+        fixture_identifier("key position linear"),
+        [(2, fixture_digest("key position linear head"))],
+        recovered_at=(9, 1, fixture_digest("key position linear recovery")),
+    )
+    unheld = position_element(
+        fixture_identifier("key position unheld"),
+        [(4, fixture_digest("key position unheld head"))],
+        presented=(
+            (7, fixture_digest("key position unheld tip b")),
+            (6, fixture_digest("key position unheld tip a")),
+        ),
+        pending_since=10,
+        staged_by=ID_CAROL,
+    )
+    displaced = position_element(
+        fixture_identifier("key position displaced"),
+        [(8, fixture_digest("key position displaced head"))],
+        displaced=(3, 7),
+    )
+    positions = [contested, linear, unheld, displaced]
+    for name, element in zip(KEY_POSITION_NAMES, positions):
+        emit(f"vector_80.position_{name}", jcs(element).decode())
+    emit(
+        "vector_80.position_order",
+        ",".join(
+            name
+            for name, element in sorted(
+                zip(KEY_POSITION_NAMES, positions), key=lambda p: p[1][0].encode()
+            )
+        ),
+    )
+    emit_hex("vector_80.key_positions_hash", key_positions_hash(3, positions))
+
+    leaf = key_position_recorded_payload(unheld)
+    assert len(leaf) <= 903
+    emit("vector_80.leaf_unheld_len", len(leaf))
+    emit_hex("vector_80.leaf_unheld", leaf)
+
+    # The contest resolves to the rollover branch, whose chain holds no
+    # RootRecovery. The advance leaves the position Linear, so `recovered_at`
+    # becomes null and `contested_since` clears.
+    resolved = position_element(identifier_text, [(1, d53)])
+    emit("vector_80.position_contested_resolved", jcs(resolved).decode())
+    emit_hex(
+        "vector_80.key_positions_hash_resolved",
+        key_positions_hash(3, [resolved, linear, unheld, displaced]),
+    )
+
+    # --- Vector 82: the re-seat request, signed by Vector 41's #active key. ---
+    request_nonce = fixture_digest("re-seat request nonce")[:16]
+    anchor_digest = fixture_digest("re-seat anchor")
+    head_digest = fixture_digest("re-seat head")
+    key_package = fixture_bytes("re-seat key package", 96)
+    key_package_hash = sha256(key_package)
+    assert len(RESEAT_REQUEST_DOMAIN) == 22
+    request_preimage = canonical_preimage(
+        RESEAT_REQUEST_DOMAIN,
+        var_field(RESEAT_CONTEXT_ID),
+        var_field(identifier_text),
+        fixed_field(request_nonce),
+        u64(11),
+        fixed_field(anchor_digest),
+        u64(12),
+        fixed_field(head_digest),
+        fixed_field(key_package_hash),
+    )
+    request_digest = sha256(request_preimage)
+    request_signature = sign_group(REF_KEY_2, request_digest, "vector_82")
+    request_items = [
+        mp_str(RESEAT_CONTEXT_ID),
+        mp_str(identifier_text),
+        mp_bin(request_nonce),
+        mp_uint(11),
+        mp_bin(anchor_digest),
+        mp_uint(12),
+        mp_bin(head_digest),
+        mp_bin(key_package),
+        mp_bin(request_signature),
+    ]
+    request = mp_array(request_items)
+    assert request[0] == 0x99
+    emit("vector_82.context_id", RESEAT_CONTEXT_ID)
+    emit("vector_82.identifier", identifier_text)
+    emit_hex("vector_82.request_nonce", request_nonce)
+    emit_hex("vector_82.anchor_digest", anchor_digest)
+    emit_hex("vector_82.head_digest", head_digest)
+    emit_hex("vector_82.key_package", key_package)
+    emit_hex("vector_82.key_package_hash", key_package_hash)
+    emit("vector_82.preimage_len", len(request_preimage))
+    emit_hex("vector_82.preimage", request_preimage)
+    emit_hex("vector_82.request_digest", request_digest)
+    emit_hex("vector_82.signature", request_signature)
+    emit(
+        "vector_82.item_headers",
+        " ".join(hexs(mp_header(item)) for item in request_items),
+    )
+    emit("vector_82.request_len", len(request))
+    emit_hex("vector_82.request", request)
+    ten_items = b"\x9a" + request[1:] + mp_uint(41)
+    emit("vector_82.rejected_ten_items_len", len(ten_items))
+    emit_hex("vector_82.rejected_ten_items_tail", ten_items[-(2 + 64 + 1) :])
+    long_signature = mp_bin(request_signature + b"\x00")
+    emit_hex("vector_82.rejected_65_byte_signature_item", long_signature)
+    emit_hex("vector_82.info", b"scp-reseat-request-v1" + var_field(RESEAT_CONTEXT_ID))
+    emit_hex(
+        "vector_82.aad", b"scp-reseat-request-aad-v1" + var_field(RESEAT_CONTEXT_ID)
+    )
+    end_leaf_hash = fixture_digest("re-seat end leaf")
+    carried = mp_array([mp_uint(12), mp_bin(end_leaf_hash), mp_bin(request)])
+    emit_hex("vector_82.end_leaf_hash", end_leaf_hash)
+    emit("vector_82.carried_item_len", len(carried))
+    emit_hex("vector_82.carried_item_prefix", carried[: 1 + 1 + 2 + 32 + 3])
+
+    # --- Vector 81: the re-seat answer, published by carol for epoch 7. ---
+    group_info = fixture_bytes("re-seat group info", 300)
+    wrap_key = fixture_digest("re-seat wrap key")[:16]
+    key_material = jcs(
+        {
+            "context_metadata_key": fixture_digest("re-seat metadata key").hex(),
+            "sender_key_seed": None,
+        }
+    )
+    context_params = jcs(
+        {"governance": "SingleAdmin", "mode": "Encrypted", "ttl": None}
+    )
+    reordered_params = b'{"mode":"Encrypted","governance":"SingleAdmin","ttl":null}'
+    assert json.loads(reordered_params) == json.loads(context_params)
+    assert reordered_params != context_params
+    publisher = ID_CAROL
+    assert len(RESEAT_GROUPINFO_DOMAIN) == 24
+    answer_preimage = canonical_preimage(
+        RESEAT_GROUPINFO_DOMAIN,
+        var_field(RESEAT_CONTEXT_ID),
+        u64(7),
+        fixed_field(request_digest),
+        var_field(identifier_text),
+        fixed_field(sha256(group_info)),
+        fixed_field(sha256(wrap_key)),
+        fixed_field(sha256(key_material)),
+        fixed_field(sha256(context_params)),
+        var_field(publisher),
+    )
+    answer_digest = sha256(answer_preimage)
+    answer_signature = sign_group(REF_KEY_1, answer_digest, "vector_81")
+    answer_items = [
+        mp_str(RESEAT_CONTEXT_ID),
+        mp_uint(7),
+        mp_bin(request_digest),
+        mp_bin(group_info),
+        mp_bin(wrap_key),
+        mp_bin(key_material),
+        mp_bin(context_params),
+        mp_str(publisher),
+        mp_bin(answer_signature),
+    ]
+    answer = mp_array(answer_items)
+    emit_hex("vector_81.group_info", group_info)
+    emit_hex("vector_81.wrap_key", wrap_key)
+    emit("vector_81.key_material", key_material.decode())
+    emit("vector_81.context_params", context_params.decode())
+    emit("vector_81.context_params_rejected", reordered_params.decode())
+    emit("vector_81.publisher_did", publisher)
+    emit("vector_81.preimage_len", len(answer_preimage))
+    emit_hex("vector_81.preimage", answer_preimage)
+    emit_hex("vector_81.canonical_hash", answer_digest)
+    emit_hex("vector_81.signature", answer_signature)
+    emit(
+        "vector_81.item_headers",
+        " ".join(hexs(mp_header(item)) for item in answer_items),
+    )
+    emit("vector_81.answer_len", len(answer))
+    emit_hex("vector_81.answer_sha256", sha256(answer))
+
+    # --- The three re-seat seals, each binding request_digest in info and aad.
+    # The recipient key is Vector 37's wrapping key; the ephemeral key is
+    # §25.2's tertiary key.
+    recipient = keypair_from_seed(
+        WRAPPING_KEY_SEED, TEST_VECTOR_KEY_LABEL, "wrapping key"
+    )
+    welcome = fixture_bytes("re-seat welcome", 64)
+    notice = mp_array([mp_str(RESEAT_CONTEXT_ID), mp_bin(key_package_hash)])
+    emit_hex("vector_81.carried_welcome", welcome)
+    emit_hex("vector_81.expired_notice", notice)
+    for name, label, plaintext in (
+        ("groupinfo", "scp-reseat-groupinfo", answer),
+        ("welcome", "scp-reseat-welcome", welcome),
+        ("expired", "scp-reseat-expired", notice),
+    ):
+        info = reseat_seal_label(label + "-v1", RESEAT_CONTEXT_ID, request_digest)
+        aad = reseat_seal_label(label + "-aad-v1", RESEAT_CONTEXT_ID, request_digest)
+        sealed = hpke_seal_base(recipient, REF_KEY_3, info, aad, plaintext)
+        emit_hex(f"vector_81.seal_{name}.info", info)
+        emit_hex(f"vector_81.seal_{name}.aad", aad)
+        emit_hex(f"vector_81.seal_{name}.shared_secret", sealed["shared_secret"])
+        emit_hex(f"vector_81.seal_{name}.key", sealed["key"])
+        emit_hex(f"vector_81.seal_{name}.base_nonce", sealed["base_nonce"])
+        emit(f"vector_81.seal_{name}.ciphertext_len", len(sealed["ciphertext"]))
+        emit_hex(
+            f"vector_81.seal_{name}.ciphertext_sha256", sha256(sealed["ciphertext"])
+        )
+
+
 def main() -> int:
     self_test()
     _LINES.append("SCP §25 test vectors — ECDSA on NIST P-256, RFC 6979, SHA-256")
@@ -3779,6 +4313,7 @@ def main() -> int:
     emit_participation_seed()
     emit_push_signing_bytes()
     emit_fork_merge()
+    emit_key_positions_and_reseat()
     print("\n".join(_LINES))
     return 0
 
