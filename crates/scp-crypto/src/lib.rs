@@ -10,11 +10,14 @@
 //! - [`custody`]: the typed [`CustodyFailure`] a failed custody call carries.
 //! - [`signer`]: the curve-neutral [`ScpSigner`] trait and its object-safe
 //!   form [`DynScpSigner`].
+//! - [`webpush`]: the RFC 8291 `WebPush` message encryption the relay's `WebPush`
+//!   sender seals every wake body with.
 
 pub mod custody;
 pub mod p256;
 pub mod pseudonym;
 pub mod signer;
+pub mod webpush;
 
 pub use custody::{CustodyFailure, CustodyFailureKind};
 #[cfg(any(test, feature = "testing"))]

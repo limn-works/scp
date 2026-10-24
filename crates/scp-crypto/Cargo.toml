@@ -37,6 +37,14 @@ p256 = { workspace = true }
 # supplies the source.
 rand_core = { version = "0.6", default-features = false }
 thiserror = { workspace = true }
+# WebPush message encryption (RFC 8291, `webpush`): AES-128-GCM over one RFC 8188
+# record. The workspace already pins aes-gcm 0.10 and aes 0.8 for scp-protocol, so
+# neither adds a crate to the graph. `zeroize` on both wipes the GHASH key (aes-gcm)
+# and the AES round keys (aes) when the cipher drops; aes-gcm alone wipes only the
+# GHASH key. The cipher lives here because the record key derives from a P-256 ECDH
+# that deny.toml confines to this crate.
+aes-gcm = { workspace = true, features = ["zeroize"] }
+aes = { workspace = true, features = ["zeroize"] }
 
 # getrandom 0.2 fails to compile on wasm32-unknown-unknown without a backend.
 # In a wasm32 build it arrives through rand_core 0.6's `getrandom` feature, which
@@ -51,6 +59,7 @@ rand = { workspace = true }
 hex = { workspace = true }
 proptest = "1"
 serde_json = { workspace = true }
+base64 = { workspace = true }
 
 [lints]
 workspace = true
