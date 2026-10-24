@@ -4267,7 +4267,7 @@ The decisions below apply those rulings. The normative protocol is in `07-trust-
 | `FORK_RETAIN_SECS` (W) | 600 s of connected time | Non-tip deletion |
 | `FORK_RETAIN_WALL_SECS` | 604,800 s (7 days) of local time | Non-tip deletion |
 | `K(e)` | 2·n_e + 8 canonical Commits | Admission depth and import deadline |
-| `MERGE_CARRY_ITEMS` | Set by `00-open-questions.md` "Fork-merge carry cap" | Pending items one Commit carries before its own action |
+| `MERGE_CARRY_ITEMS` | 8 (`00-open-questions.md` "Fork-merge carry cap", resolved 2026-10-24) | Pending items one Commit carries before its own action |
 
 | Change | Change identity |
 |---|---|
@@ -4286,7 +4286,7 @@ The decisions below apply those rulings. The normative protocol is in `07-trust-
 3. **M2r, rank rotation.** rank(C) rotates with the epoch, so each identity has rank 0 once in every n_e consecutive epochs while ids is unchanged.
 4. **M3, obligations.** The pending set holds the changes a losing branch executed that canonical has neither executed, settled, nor placed in X; the unrecorded losing children; and the import leaves still needed. Every honest device follows five obligations:
    1. **Re-issue.** A change that a losing branch executed returns only as a re-application through an admitted record, and any member, its author included, may carry it. A change that no branch executed is re-issued natively with its original identity and records, after the spec 07 "Competing Commits" re-check and the "Conflicts" gate; an Add uses a fresh KeyPackage, and a change whose identity canonical already executed or settled is not re-issued. The author re-commits an Update from its canonical leaf. `AddMember` for X, a device Add for X, `RemoveMember` for X, and X's departure hold the conflict key `member:X`, which the state keeps after X leaves, so an Add of X loses to a Remove of X executed at or after the Add's `anchor_seq`, and a fresh re-invite anchored after the Remove still passes.
-   2. **Carry.** Every honest Commit carries at most `MERGE_CARRY_ITEMS` pending items and then the member's own action, so the action always fits. It carries them in this order: unrecorded records it holds, up to four; the oldest needed import leaves; re-applications whose evidence is complete. A carrier skips an item that is not admissible or whose evidence checks fail, so no item blocks a carrier.
+   2. **Carry.** Every honest Commit carries at most `MERGE_CARRY_ITEMS` (8) pending items that fit in the block body beside the member's own action, and then that action, so the action always fits. It carries them in this order: unrecorded records it holds, up to four; the oldest needed import leaves; re-applications whose evidence is complete. A carrier skips an item that is not admissible, whose evidence checks fail, or that does not fit beside the action, so no item blocks a carrier.
    3. **Record.** The author device of each losing child C' sends a record of C' in its next Commit, and sends a record-only Commit at once when it has nothing else to send. Every other holder carries the record under obligation 2 and sends no record-only Commit.
    4. **Send barrier (M11).** A holder of a pending restrictive-only change commits it before its next application message.
    5. **Causal order.** A re-application is not carried until every change in its `seen` that is in U has been executed or settled on canonical.

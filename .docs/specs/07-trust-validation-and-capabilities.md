@@ -347,7 +347,7 @@ Two members can each build a Commit on the same epoch. This subsection defines w
 |---|---|---|
 | `D_MAX` | 10 seconds | The delivery bound ADR-067 assumes (A1), and the length of the rank-0 window |
 | `K(e)` | 2·n_e + 8 canonical Commits | Admission depth and import deadline |
-| `MERGE_CARRY_ITEMS` | Set by `00-open-questions.md` "Fork-merge carry cap" | Pending items one Commit carries, each record, import leaf, or re-application counting as one item |
+| `MERGE_CARRY_ITEMS` | 8 | Pending items one Commit carries, each record, import leaf, or re-application counting as one item |
 
 - **Change identity.** G, the pending set, and obligation 1 name each change by its identity:
 
@@ -389,7 +389,7 @@ Two members can each build a Commit on the same epoch. This subsection defines w
    2. A change that no branch executed, which is the change of a Commit that no relay stored, is re-issued natively at once on the new tip, with its original identity and records. Before it re-issues, the device runs the "Competing Commits" re-check and the "Conflicts" gate above. A re-issued Add uses a fresh KeyPackage. A change whose identity canonical has already executed or settled is not re-issued.
    3. The author re-commits an Update from its canonical leaf.
    4. **The `member:X` row.** `AddMember` for X, a device Add for X, `RemoveMember` for X, and X's departure each hold the conflict key `member:X` ("Conflicts" above), which the governance state keeps after X leaves. An Add of X therefore loses to a Remove of X executed at or after the Add's `anchor_seq`, and a new invitation anchored after the Remove passes.
-2. **Carry and order.** Every honest Commit carries pending items before its own new action, in this order: the records it holds that no admitted record covers, at most four; then the oldest import leaves still needed; then the re-applications whose evidence is complete. It carries an item only when the item is admissible and its evidence checks pass, and it skips an item it cannot carry, so no item blocks a carrier. One Commit carries at most `MERGE_CARRY_ITEMS` pending items and then the member's own action, so the action always fits.
+2. **Carry and order.** Every honest Commit carries pending items before its own new action, in this order: the records it holds that no admitted record covers, at most four; then the oldest import leaves still needed; then the re-applications whose evidence is complete. It carries an item only when the item is admissible, its evidence checks pass, and it fits in the block body beside the member's own action, and it skips an item it cannot carry, so no item blocks a carrier. One Commit carries at most `MERGE_CARRY_ITEMS` (8) pending items and then the member's own action, so the action always fits.
 3. **Record.** The author device of each losing child sends a record of it in its next Commit, or, with nothing else to send, at once in a Commit that carries only the record, under the fresh-tip rule or the rank-0 window. Every other device that holds the losing child carries the record under obligation 2 and sends no record-only Commit.
 4. **Send barrier (M11).** A holder of a pending restrictive-only change commits it before its next application message. One Commit may carry a record, the import leaves it needs, and the re-application together.
 5. **Causal order.** A device carries a re-application only after every change in its `seen` that is in U is executed or settled on canonical.
@@ -410,7 +410,7 @@ A receiver cannot check obligations 2 and 3, because it may hold no copy of the 
 1. F ≥ 1, and canonical holds the leaf at F − 1. The creator writes leaf 0 alone, so no fork has F = 0, and the first `prev_hash` of every import names a leaf of this context.
 2. F is the log count of a row of the epoch table, which gives e_F exactly; the receiver refuses a record whose F is the log count of no row.
 3. c − e_F ≤ K(e_F), with n_{e_F} read from the epoch table.
-4. `end_count` − F ≤ K(e_F) · `MERGE_CARRY_ITEMS`, the import leaves that K(e_F) Commits can carry under obligation 2.
+4. `end_count` − F ≤ K(e_F) · 8 (`MERGE_CARRY_ITEMS`), the import leaves that K(e_F) Commits can carry under obligation 2.
 
 Admission does not read who the recorder is: any member may record, a committer of L included. An exact repeat of an admitted (F, `end_count`, `end_leaf_hash`) changes nothing. Records with one F and different ends are each admitted, their coverage is the union, and re-applications de-duplicate by change identity. A record that fails admission is rejected at every device, and its branch's changes go to X.
 

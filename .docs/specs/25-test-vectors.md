@@ -2870,7 +2870,7 @@ Admission at depth, for a record with F = 5 that a child of S_c carries, where t
 | 24 | 14 | Admitted |
 | 25 | 15 | Rejected at every device; L's changes go to X |
 
-A record whose F is the log count of no epoch table row is refused. The bound on `end_count` − F is K(e_F) · `MERGE_CARRY_ITEMS`, so it takes the value `00-open-questions.md` "Fork-merge carry cap" sets: with that value written m, the record (F = 5, `end_count` = 9) is admitted when 4 ≤ 14·m.
+A record whose F is the log count of no epoch table row is refused. The bound on `end_count` − F is K(e_F) · `MERGE_CARRY_ITEMS` = 14 · 8 = 112, so the record (F = 5, `end_count` = 9) is admitted (4 ≤ 112) and the record (F = 5, `end_count` = 118) is refused (113 > 112).
 
 ### Vector 74: the `merge_state_hash` derivation
 
