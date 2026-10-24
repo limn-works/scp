@@ -300,8 +300,11 @@ impl ContextEventLogProvider for ArcEventLogProvider {
     fn event_log_summary(&self, id: &[u8; 32]) -> Result<(usize, [u8; 32]), ContextError> {
         self.0.event_log_summary(id)
     }
-    async fn restore_event_log(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        self.0.restore_event_log(id).await
+    async fn restore_event_log(
+        &self,
+        id: &[u8; 32],
+    ) -> Result<scp_core::context::builder::EventLogRestore, ContextCreationError> {
+        ContextEventLogProvider::restore_event_log(&*self.0, id).await
     }
     async fn prune_before_checkpoint(
         &self,

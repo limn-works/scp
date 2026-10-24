@@ -309,14 +309,20 @@ impl<S: Storage> ProtocolRepository<S> {
     /// params, memberships, roles, events, outlets, etc. Returns the
     /// number of keys deleted.
     ///
-    /// See spec section 17.3 on context cleanup via `delete_prefix`.
+    /// Deletes the event log's `head` key first, so the event log is gone
+    /// even when the prefix sweep that follows stops partway, as
+    /// `delete_prefix` can on `FilesystemStorage` (spec section 17.3,
+    /// "Context cleanup").
     ///
     /// # Errors
     ///
     /// Returns [`StoreError::Storage`] if the underlying storage operation fails.
     pub async fn delete_context(&self, context_id: &str) -> Result<u64, StoreError> {
         let prefix = context_prefix(context_id)?;
-        let mut deleted = self.storage.delete_prefix(&prefix).await?;
+        let head_key = super::event_log::merkle_event_log_head_key(context_id)?;
+        let mut deleted = u64::from(self.storage.exists(&head_key).await?);
+        self.storage.delete(&head_key).await?;
+        deleted += self.storage.delete_prefix(&prefix).await?;
         // Also delete MLS state which lives under a separate namespace.
         let ctx = super::sanitize_key_component(context_id)?;
         let mls_prefix = format!("mls/{ctx}/");
@@ -878,25 +884,25 @@ impl<S: Storage> ProtocolRepositoryEventLogBridge<S> {
 impl<S: Storage + 'static> crate::context::providers::event_log::EventLogPersistence
     for ProtocolRepositoryEventLogBridge<S>
 {
-    async fn persist_entry(
+    async fn persist_unit(
         &self,
         context_id: &str,
-        seq: usize,
-        entry: &scp_event_log::Event,
+        base_seq: u64,
+        entries: &[scp_event_log::Event],
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.store
-            .store_merkle_event_log_entry(context_id, seq, entry)
+            .store_merkle_event_log_unit(context_id, base_seq, entries)
             .await?;
         Ok(())
     }
 
-    async fn persist_entries(
+    async fn replace(
         &self,
         context_id: &str,
         entries: &[scp_event_log::Event],
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.store
-            .store_merkle_event_log_entries(context_id, entries)
+            .replace_merkle_event_log_entries(context_id, entries)
             .await?;
         Ok(())
     }
@@ -1017,6 +1023,42 @@ mod tests {
                 .is_none()
         );
         assert!(store.load_role("ctx-1", "admin").await.unwrap().is_none());
+    }
+
+    /// A context delete whose prefix sweep fails still removes the event
+    /// log, because it deletes the log's `head` before the sweep.
+    #[tokio::test]
+    async fn delete_context_with_failed_sweep_still_removes_the_event_log() {
+        let faulty = std::sync::Arc::new(
+            crate::context::supervisor::faulty_storage::FaultyStorage::new(std::sync::Arc::new(
+                InMemoryStorage::new(),
+            )),
+        );
+        let store = ProtocolRepository::new_for_testing(std::sync::Arc::clone(&faulty));
+        let entry = scp_event_log::Event {
+            event_type: scp_event_log::EventType::ContextCreated,
+            actor_did: scp_did::DID(String::new()),
+            timestamp: 1_700_000_000,
+            sequence: 0,
+            payload: scp_event_log::EventPayload::default(),
+            prev_hash: [0u8; 32],
+            signature: Vec::new(),
+        };
+        store
+            .replace_merkle_event_log_entries("ctx-1", std::slice::from_ref(&entry))
+            .await
+            .unwrap();
+        faulty.fail_delete_prefix_calls("context/ctx-1/");
+        assert!(store.delete_context("ctx-1").await.is_err());
+        faulty.clear_fail();
+        assert!(
+            store
+                .load_merkle_event_log_entries("ctx-1")
+                .await
+                .unwrap()
+                .is_none(),
+            "the event log is gone although the sweep failed"
+        );
     }
 
     // -------------------------------------------------------------------
@@ -1542,13 +1584,13 @@ mod tests {
             signature: Vec::new(),
         };
 
-        // O(1) per-entry persist.
+        // O(1) per-unit persist.
         bridge
-            .persist_entry("ctx-bridge-el", 0, &entry0)
+            .persist_unit("ctx-bridge-el", 0, std::slice::from_ref(&entry0))
             .await
             .unwrap();
         bridge
-            .persist_entry("ctx-bridge-el", 1, &entry1)
+            .persist_unit("ctx-bridge-el", 1, std::slice::from_ref(&entry1))
             .await
             .unwrap();
 
@@ -1598,10 +1640,7 @@ mod tests {
             },
         ];
 
-        bridge
-            .persist_entries("ctx-bridge-bulk", &entries)
-            .await
-            .unwrap();
+        bridge.replace("ctx-bridge-bulk", &entries).await.unwrap();
 
         let loaded = bridge
             .load_entries("ctx-bridge-bulk")

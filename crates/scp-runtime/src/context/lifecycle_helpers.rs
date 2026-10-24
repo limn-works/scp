@@ -3572,28 +3572,38 @@ pub async fn load_persisted_context_state(
     Ok((ctx_snapshot, broadcast_ctx))
 }
 
-/// Best-effort event log restore from persistence.
+/// Restores the context's event log from persistence, failing closed.
 ///
-/// Takes the restore's floor-guarded crypto, which exists only after the
-/// group's `0xFF02` binding was verified and its floors merged, so a refused
-/// restore never hydrates the log.
+/// Spec 17 §17.3 "Merkle event log entries": an empty log starts only when
+/// storage holds no log ([`EventLogRestore::Absent`]); a failed load or a
+/// corrupt stored log fails the restore with [`ContextError::EventLogFailed`]
+/// and never puts an empty log in memory over the stored one.
+///
+/// Takes the restore's binding-verified crypto, which exists only after the
+/// group's `0xFF02` binding was verified, so a restore refused by that check
+/// never hydrates the log. The restore merges the snapshot's replay floors
+/// only after this returns `Ok`, so a restore refused here leaves the
+/// registry's floors as they were.
+///
+/// [`EventLogRestore::Absent`]: crate::context::builder::EventLogRestore::Absent
 #[allow(dead_code)] // Transitive of `restore_context` — see bootstrap rationale.
-async fn restore_event_log_best_effort(
+async fn restore_event_log_fail_closed(
     deps: &ActorDeps,
-    _floor_guarded: &crate::context::restored_crypto::FloorGuardedCrypto,
+    _binding_verified: &crate::context::restored_crypto::VerifiedRestoredCrypto,
     context_id: &str,
-) {
+) -> Result<(), ContextError> {
     use crate::context::state::context_id_to_bytes;
-    let ctx_id_bytes = context_id_to_bytes(context_id);
-    if let Err(e) = deps.event_log.restore_event_log(&ctx_id_bytes).await {
-        tracing::warn!(
-            context_id = %context_id,
-            error = %e,
-            "failed to restore event log from persistence; \
-             context will start with an empty event log"
-        );
-        let _ = deps.event_log.init_event_log(&ctx_id_bytes).await;
-    }
+    let restored = deps
+        .event_log
+        .restore_event_log(&context_id_to_bytes(context_id))
+        .await
+        .map_err(|e| {
+            ContextError::EventLogFailed(format!(
+                "restoring the event log of context {context_id} failed: {e}"
+            ))
+        })?;
+    tracing::debug!(context_id = %context_id, ?restored, "event log restored");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -3644,10 +3654,13 @@ pub async fn restore_context(
     let (mut ctx_snapshot, broadcast_ctx) =
         load_persisted_context_state(deps, context_id, preloaded_snapshot).await?;
     // Every refusal below (consequence rules, ceiling grammar, the §5.13.3
-    // binding check, the replay-floor merge) runs before the first side effect:
-    // the floor merge follows the binding check, and the event log is hydrated
-    // only after both, so a refused restore leaves the registry's floors and the
-    // event log as they were.
+    // binding check, the event-log load, the replay-floor merge) runs in that
+    // order. The event log is hydrated only after the binding check, and the
+    // floors are merged only after the event log loaded, so a restore refused
+    // at any of those steps leaves the registry's floors as they were. A
+    // refusal by the floor merge leaves the hydrated in-memory log, which holds
+    // exactly the stored log and which the next restore of the context
+    // replaces.
 
     validate_consequence_rules_for_import(
         &ctx_snapshot.consequence_rules,
@@ -3747,11 +3760,12 @@ pub async fn restore_context(
     // that lag and rejects only a corrupt overshoot beyond `MAX_EPOCH_ADVANCE`.
     // This routes the cold-restart (empty-registry) floors through the SAME
     // sink, closing the D2 replay window on first boot.
+    //
+    // The event log is restored first: a stored log that does not load refuses
+    // the restore before the floors reach the registry. The TTL deadline below
+    // reads the log for the fail-safe `TtlExtended` term.
+    restore_event_log_fail_closed(deps, &restored_crypto, context_id).await?;
     let restored_crypto = restored_crypto.merge_floors(deps, &ctx_id_bytes, true)?;
-
-    // Hydrate the event log only now that every refusal has passed. The TTL
-    // deadline below reads it for the fail-safe `TtlExtended` term.
-    restore_event_log_best_effort(deps, &restored_crypto, context_id).await;
 
     // Resolve the ABSOLUTE convergent TTL re-arm deadline through the partitioned
     // single-source deadline (§5.10 / §5.10.1, ADR-049 §9), AFTER the binding
@@ -3763,7 +3777,7 @@ pub async fn restore_context(
     // finite `params.ttl` ⇒ base `T0 + ttl`; a promoted context has
     // `params.ttl == None` ⇒ `None` (no re-arm), and that promotion signal
     // survives even a fully-pruned log. The prunable event log (hydrated by
-    // `restore_event_log_best_effort` above) is read ONLY for the fail-safe
+    // `restore_event_log_fail_closed` above) is read ONLY for the fail-safe
     // `TtlExtended` extension term (losing one only shortens). The persisted
     // `ttl_deadline_secs` scalar is a runtime cache, re-derived here, not
     // trusted, and no `memory_scope != Full` gate applies at the dispatch site

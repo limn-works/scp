@@ -134,7 +134,7 @@ pub mod transport_slot;
 mod spawn_from_welcome_tests;
 
 #[cfg(test)]
-mod faulty_storage;
+pub(crate) mod faulty_storage;
 
 #[cfg(any(test, feature = "testing"))]
 mod two_instance_seams;

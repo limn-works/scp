@@ -59,9 +59,11 @@ pub trait Storage: Send + Sync {
     async fn list_keys(&self, prefix: &str) -> Result<Vec<String>, PlatformError>;
 
     /// Delete all keys matching a prefix. Returns the count of keys deleted.
-    /// Atomic: either all matching keys are deleted or none are (on error).
+    /// Atomic on the SQLite-family backends; FilesystemStorage deletes file
+    /// by file, so an error can leave some matching keys deleted and others
+    /// in place. No correctness property relies on its atomicity.
     /// Used for context cleanup — delete_prefix("context/{id}/") removes
-    /// all state for a context in one operation.
+    /// all state for a context in one call.
     async fn delete_prefix(&self, prefix: &str) -> Result<u64, PlatformError>;
 
     /// Check if a key exists without reading the value.
@@ -75,7 +77,7 @@ pub trait Storage: Send + Sync {
 
 ## 17.3 Key Convention
 
-All keys follow `{namespace}/{entity_id}/{sub_key}` with `/` as the hierarchy separator. Keys are UTF-8 strings. Entity IDs are deterministic (DIDs, context IDs, hashes). Sub-keys are type-specific.
+All keys follow `{namespace}/{entity_id}/{sub_key}` with `/` as the hierarchy separator. Keys are UTF-8 strings. Entity IDs are deterministic (DIDs, context IDs, hashes). Sub-keys are type-specific. Every component interpolated into a key passes `sanitize_key_component`, which refuses a component that contains `/`, `\`, `..`, or a null byte, or that starts with `.tmp.`. `FilesystemStorage` names its temp files with the `.tmp.` prefix (section 17.6), so refusing that prefix on every backend means no backend stores a key that `FilesystemStorage` would hide.
 
 ```
 _meta/schema_version
@@ -101,7 +103,8 @@ context/{context_id}/event_data/{seq:020d}
 context/{context_id}/event_meta/count
 context/{context_id}/event_meta/root
 context/{context_id}/event_tree/{level}/{index}
-context/{context_id}/merkle_event_log/{seq:020d}
+context/{context_id}/merkle_event_log/head
+context/{context_id}/merkle_event_log/g{gen:020d}/{base_seq:020d}
 context/{context_id}/outlet/{outlet_id}
 context/{context_id}/outlet_session/{session_id}
 context/{context_id}/ucan_token/{token_id}
@@ -143,7 +146,25 @@ mls/{context_id}/...
 
 **Event data payloads.** The `event/{seq:020d}` key stores only the 32-byte SHA-256 leaf hash for Merkle tree verification. The `event_data/{seq:020d}` key stores the full MessagePack-serialized `Event` struct (event type, actor DID, timestamp, sequence, payload, prev_hash, signature). This dual-key design preserves the compact Merkle tree structure while enabling event replay and query without transport-layer round-trips. Events persisted before the `event_data/` key convention was introduced will have hash-only entries; `load_event_data` returns `None` for these (backward compatible).
 
-**Merkle event log entries.** Each `EventLogEntry` is stored individually under `merkle_event_log/{seq:020d}` (MessagePack-serialized), matching the per-event key pattern used by `event/{seq:020d}`. This enables O(1) append persistence — only the new entry is written, rather than re-serializing the entire list. Restore loads all entries by `list_keys("context/{id}/merkle_event_log/")` prefix scan, which returns keys in lexicographic (= sequence) order. Prune deletes removed entries by prefix and rewrites the retained entries with renumbered sequence keys starting from 0. After pruning, the first entry's `prev_hash` references a discarded predecessor — chain verification must accept any `prev_hash` for the first entry. See §9.9, #636, #710.
+**Merkle event log entries.** The `MerkleEventLogProvider` stores each context's event log under `merkle_event_log/` in two kinds of key, and each value is a MessagePack `StoredValue`:
+
+- `merkle_event_log/head` holds the current generation number `gen` and the log's length `len`, the total number of entries in the log.
+- `merkle_event_log/g{gen:020d}/{base_seq:020d}` holds one unit: a `Vec<EventLogEntry>` of one or more entries, whose first entry has sequence `base_seq`.
+
+Every write relies on one property that every `Storage` backend has: a put of a single key is atomic. No write relies on a multi-key batch. `FilesystemStorage` is atomic per key only, so a batch there would need an intent journal. `SyncableStorage::apply_changeset` replays a peer's keys one at a time, so a batch that was atomic on its source is not atomic on a replica.
+
+- **Append** puts one unit under the generation that `head` names, and then puts `head` with `len` raised by the unit's entry count. The unit's `base_seq` must equal `head`'s `len`; any other `base_seq` returns `StoreError::EventLogUnitMisaligned`. A crash between the two puts leaves a unit that starts at `len`, which load ignores, so a crash leaves either every entry of the unit or none of them. The next append puts its unit at the same `len`, so it overwrites that unit. When no `head` exists, an append is a replace with that one unit, and the unit's `base_seq` must be 0.
+- **Replace** (prune, import, and init over an existing log) deletes any keys left under generation `gen + 1` (generation 0 when no `head` exists), writes every unit of the new log under that generation, and then puts `head` naming that generation and the new log's length. The `head` put is the commit point: a failure before it leaves the old log in place, and a failure after it leaves the new log in place. Replace then deletes the old generation best-effort, because the next load deletes every generation below `head`'s.
+- **Destroy** deletes `head` first, which removes the log, and then deletes the generations best-effort.
+- **Load** reads `head`. When no `head` exists, the context has no log, and load returns none and deletes nothing. Otherwise load reads the units under generation `gen` in key order. A unit that starts at or beyond `len` is not part of the log: an append that crashed before its `head` put left it, or another writer's append is still in flight. Load ignores it and never deletes it. The next append at `len` overwrites it, and a replace's generation cleanup removes it. Each other unit's `base_seq` must equal the number of entries in the units before it, and a gap or an overlap returns the typed error `StoreError::EventLogUnitMisaligned`. The units' entries must total `len`, and any other total, such as a missing tail unit, returns the typed error `StoreError::EventLogLengthMismatch`. Load never returns a truncated log. An empty unit, or a unit key whose `base_seq` does not parse, returns a deserialization error. Load deletes, best-effort, every generation below `gen`. It leaves a generation above `gen` in place, because that generation can be a replace still in flight, from another process or on a replica that has not yet received its `head`.
+
+The `MerkleEventLogProvider` serializes the writes to one context with a per-context write gate, so an append never lands in a generation that a concurrent replace is retiring. Every path that removes a context's log from the provider releases that context's gate.
+
+When a unit persist or a replace fails, the provider marks the context's stored log as diverged from the in-memory log. While the mark is set, the next write to the context replaces the whole stored log with the in-memory log instead of persisting one unit, and only a replace that succeeds clears the mark. A divergence therefore lasts until the next successful write, never for the rest of the process.
+
+Restore loads the stored log and fails closed. It starts an empty log only when load returns none. A load error fails the restore with that error and leaves the stored log unchanged; restore never puts an empty log in memory over a stored `head`, because the next append would then overwrite stored units.
+
+Prune re-chains the retained tail as a new log. The first retained entry gets sequence 0 and the `prev_hash` `GENESIS_PREV_HASH`, each later entry chains to the one before it, and every other field of each entry is kept. The pruned log therefore verifies from genesis like any other log, and its Merkle root differs from the root before the prune. See §9.9, #636, #710.
 
 **Nonce keys.** UCAN nonce replay prevention uses `context/{context_id}/nonce/{SHA256(nonce_string)}` — the nonce string is hashed to a fixed-length key. The value stores `(first_seen_timestamp, token_expiry_timestamp)` for pruning. The `exists()` method enables O(1) replay checks without deserializing.
 
@@ -154,7 +175,7 @@ mls/{context_id}/...
 
 The in-memory `NonceTracker` remains the primary, synchronised replay defense on the hot path. `ProtocolRepository` nonce tracking is defense-in-depth for crash recovery. The time-gated prune ensures the persistent nonce store does not grow without bound even in long-running processes that never restart.
 
-**Context cleanup.** When a context is closed or expired, `delete_prefix("context/{context_id}/")` removes all context state atomically. No enumeration required.
+**Context cleanup.** When a context is closed or expired, `ProtocolRepository::delete_context` first deletes the context's `merkle_event_log/head`, which removes its event log, and then calls `delete_prefix("context/{context_id}/")` to remove the rest of the context's state. No enumeration is required. `delete_prefix` deletes file by file on `FilesystemStorage`, so a failed cleanup can leave some keys in place; the event log is already gone at that point, because a log without `head` loads as none.
 
 ## 17.4 ProtocolRepository
 
@@ -224,8 +245,8 @@ impl<S: Storage> ProtocolRepository<S> {
     pub async fn load_event_tree_node(&self, context_id: &ContextId, level: u32, index: u64) -> Result<Option<[u8; 32]>, StoreError>;
 
     // --- Merkle event log entries (§9.9, #636, #710) ---
-    pub async fn store_merkle_event_log_entry(&self, context_id: &str, seq: usize, entry: &EventLogEntry) -> Result<(), StoreError>;
-    pub async fn store_merkle_event_log_entries(&self, context_id: &str, entries: &[EventLogEntry]) -> Result<(), StoreError>;
+    pub(crate) async fn store_merkle_event_log_unit(&self, context_id: &str, base_seq: u64, entries: &[EventLogEntry]) -> Result<(), StoreError>;
+    pub(crate) async fn replace_merkle_event_log_entries(&self, context_id: &str, entries: &[EventLogEntry]) -> Result<(), StoreError>;
     pub async fn load_merkle_event_log_entries(&self, context_id: &str) -> Result<Option<Vec<EventLogEntry>>, StoreError>;
     pub async fn delete_merkle_event_log_entries(&self, context_id: &str) -> Result<(), StoreError>;
 
@@ -292,7 +313,7 @@ impl<S: Storage> ProtocolRepository<S> {
 }
 ```
 
-Every `ProtocolRepository` method translates to one or two `Storage` trait calls using the key convention from section 17.3. There is no query optimizer, no batch API, no transaction boundary beyond what `delete_prefix` provides. If performance profiling reveals hot paths, batch writes can be added to `Storage` as an optional method with a default implementation that loops (Phase 6).
+Most `ProtocolRepository` methods translate to one or two `Storage` trait calls using the key convention from section 17.3. Some make more: an event log replace makes one put per unit plus the `head` put, and a load lists and reads every unit. There is no query optimizer, no batch API, and no transaction boundary; no method relies on `delete_prefix` being atomic. If performance profiling reveals hot paths, batch writes can be added to `Storage` as an optional method with a default implementation that loops (Phase 6).
 
 **Exception to `ProtocolRepository` as the single interface.** One subsystem accesses `Storage` directly rather than through `ProtocolRepository` domain methods:
 
@@ -618,7 +639,7 @@ The client SDK does not need Postgres — SQLite covers all native platforms inc
 
 ### FilesystemStorage
 
-Maps keys to file paths: `{base_dir}/{key}` where `/` in keys maps to directory separators. Values are written atomically (write to temp file, rename). Useful for server-side deployments where inspectability matters (debugging, backup, migration). Not recommended for mobile or performance-sensitive use.
+Maps keys to file paths: `{base_dir}/{key}` where `/` in keys maps to directory separators. Values are written atomically: create any missing parent directories, write a temp file whose name starts with `.tmp.`, fsync it, rename it over the key's file, and fsync the key's directory. Each directory the put had to create is also made durable: the put fsyncs the parent of every new directory, from the deepest one up to the first directory that already existed. A put that returned therefore survives a power loss, and a later put cannot survive one while an earlier put does not. The directory fsyncs run on Unix only; on other platforms a put's file contents are durable, but its rename and new directories are not guaranteed to be. A temp file is never a key: `list_keys` and `delete_prefix` skip every file whose name starts with `.tmp.`, and a key component may not start with `.tmp.` (section 17.3), so no key is skipped. Useful for server-side deployments where inspectability matters (debugging, backup, migration). Not recommended for mobile or performance-sensitive use.
 
 ```
 base_dir/
