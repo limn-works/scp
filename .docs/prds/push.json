@@ -646,20 +646,21 @@
       "gate": "gate-push-relay",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "in-progress",
       "files": [
         "crates/scp-transport/src/relay/rate_limit.rs",
         "crates/scp-transport/src/relay/push_dispatch.rs"
       ],
-      "description": "\u00a710.7.1 step 6 requires at most one push per 30 seconds per device token. The limiter keys entries by SHA-256 of the token, so no second map holds plaintext tokens. A push suppressed inside the window is dropped, not deferred, because the device pulls every pending envelope on its next wake (\u00a710.7). The relay prunes expired entries.",
+      "description": "\u00a710.7.1 step 6 requires at most one push per 30 seconds per device token. A per-token limiter keyed by SHA-256 of the token, so plaintext tokens do not sit in another map. A wake suppressed inside the window is deferred, not dropped (Alec 2026-10-24: \"Yes defer for sure\"): the relay holds one pending wake per token and sends it when the window closes, so every wake inside one window becomes one push; the held token is zeroized when dropped. A dropped wake loses a message when nothing else wakes the device within the 300 s blob lifetime. The limiter lives in memory and a restart clears it (Alec's ruling, \"In memory\"); the spec states that (\u00a710.7.1 step 6). The relay prunes expired entries.",
       "acceptanceCriteria": [
-        "Two publishes 1 s apart to one token's routing ID produce exactly one sender call.",
+        "Two publishes 1 s apart to one token's routing ID produce exactly one sender call inside the window and a second sender call when the window closes.",
+        "Five publishes inside one window produce exactly one deferred call.",
         "A publish 30 s after the first produces a second call.",
         "Two different tokens are limited independently.",
         "The limiter's memory is bounded by the number of active tokens; a test checks the entry count after pruning."
       ],
       "actionItems": [
-        "Write the per-token limiter and call it from the dispatcher."
+        "Write the per-token limiter with one deferred wake per token, drive it from the dispatcher's drain, and send each deferred wake when its window closes."
       ],
       "blockedBy": [
         "PUSH-008"
