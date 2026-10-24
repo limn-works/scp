@@ -2101,9 +2101,10 @@ impl FirstStateRollbackInner {
 
     /// Waits for a first-state writes task the operation abandoned, so no
     /// write lands after the rollback reads the records' progress.
-    /// [`Self::rollback`] runs it with `bootstrap_spawn_lock` released, because
-    /// the wait can last [`FIRST_STATE_WRITES_DRAIN`] and every other
-    /// bootstrap waits on that lock. [`Self::rollback_with_guard`] runs it
+    /// [`FirstStateRollback::rollback`] runs it with `bootstrap_spawn_lock`
+    /// released, because the wait can last [`FIRST_STATE_WRITES_DRAIN`] and
+    /// every other bootstrap waits on that lock.
+    /// [`FirstStateRollback::rollback_with_guard`] runs it
     /// under the guard its actor turn already holds, because releasing that
     /// guard in a turn could not be undone without waiting on the lock.
     ///

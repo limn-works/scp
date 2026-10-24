@@ -609,7 +609,7 @@ pub struct CoreFields {
     /// transport write lock, so a test can begin shutdown while the restore
     /// is past every check made before that lock.
     #[cfg(test)]
-    restore_transport_lock_hook: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
+    restore_transport_lock_hook: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 
     /// Whether a shutdown closed the durable store, will never close it, or
     /// has not settled it yet, so a later shutdown call can report whether
@@ -8103,7 +8103,7 @@ pub(crate) mod tests {
         let installed = Arc::new(manager_on("ws://127.0.0.1:1/scp/v1"));
         instance.install_transport(Arc::clone(&installed)).unwrap();
 
-        let (at_lock, reached_lock) = std::sync::mpsc::sync_channel(1);
+        let (at_lock, reached_lock) = tokio::sync::oneshot::channel();
         *instance
             .restore_transport_lock_hook
             .lock()
@@ -8117,7 +8117,7 @@ pub(crate) mod tests {
                 instance.restore_transport(&installed, Some(Arc::clone(&previous)));
             });
             reached_lock
-                .recv()
+                .blocking_recv()
                 .expect("the restore signals before it takes the lock");
             instance.shutdown.store(true, Ordering::SeqCst);
             drop(held);
