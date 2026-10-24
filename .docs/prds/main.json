@@ -333,6 +333,26 @@
         "SCP-348",
         "SCP-349"
       ]
+    },
+    {
+      "id": "gate-fork-merge",
+      "name": "Concurrent Commits and fork merge (ADR-067)",
+      "priority": "P0",
+      "status": "pending",
+      "stories": [
+        "SCP-357",
+        "SCP-350",
+        "SCP-351",
+        "SCP-360",
+        "SCP-352",
+        "SCP-353",
+        "SCP-359",
+        "SCP-354",
+        "SCP-355",
+        "SCP-361",
+        "SCP-356",
+        "SCP-358"
+      ]
     }
   ],
   "stories": [
@@ -12292,7 +12312,7 @@
         "crates/scp-mls/src/group.rs",
         "crates/scp-mls/src/error.rs"
       ],
-      "description": "ADR-066 and §7.3.1.1 of the trust spec put one fixed-size governance leaf block in every Commit's authenticated data. This story builds the `scp-mls` half, treating the body as bytes (the record codec is SCP-331): the 32,805-byte `GovernanceLeafBlock` (magic `SCPG`, version 1, 12-byte nonce, `ciphertext_len` 32,784); the 32,768-byte padded plaintext (a 4-byte big-endian `body_len`, at most 32,764 bytes of body, zero padding); the empty block (`body_len` 0); AES-128-GCM under `MLS-Exporter(\"SCP-GOVERNANCE-LEAF-V1\", UTF-8 context_id, 16)` taken from `MlsGroup::export_secret` before merge (never `StagedCommit::export_secret`, which gives the new epoch), held in `Zeroizing` and dropped before the merge returns; additional data `magic ‖ version ‖ BE32(len(group_id)) ‖ group_id ‖ epoch ‖ sender_leaf_index`; the header-level canonical-encoding checks; committer entry points that set the block on add and remove Commits, on UpdatePath Commits with no Add or Remove proposal, and on every key-update and periodic Update Commit; and a two-phase receive that returns the staged Commit, its sending epoch, its pre-Commit ratchet tree view, and the decrypted body before merge. Every Commit the committer entry points emit is zero-padded so that its `PrivateMessage` `ciphertext`, the padded `PrivateMessageContent` plus the 16-byte AEAD tag, is a multiple of `COMMIT_PADDING_MULTIPLE`, 4,096 bytes, and no application message gets MLS padding (`09-security-model.md` §9.10.3 \"Commits\", ADR-066 decision 32). Every governance action travels in the one Commit that executes it, so the block has no part header. The runtime committer side is SCP-329 and the receiver side is SCP-330.",
+      "description": "ADR-066 and §7.3.1.1 of the trust spec put one fixed-size governance leaf block in every Commit's authenticated data. This story builds the `scp-mls` half, treating the body as bytes (the record codec is SCP-331): the 32,805-byte `GovernanceLeafBlock` (magic `SCPG`, version 1, 12-byte nonce, `ciphertext_len` 32,784); the 32,768-byte padded plaintext (a 4-byte big-endian `body_len`, at most 32,764 bytes of body, zero padding); the empty block (`body_len` 0); AES-128-GCM under `MLS-Exporter(\"SCP-GOVERNANCE-LEAF-V1\", UTF-8 context_id, 16)` taken from `MlsGroup::export_secret` before merge (never `StagedCommit::export_secret`, which gives the new epoch), held in `Zeroizing` and dropped before the merge returns; additional data `magic ‖ version ‖ BE32(len(group_id)) ‖ group_id ‖ epoch ‖ sender_leaf_index`; the header-level canonical-encoding checks; committer entry points that set the block on add and remove Commits, on UpdatePath Commits with no Add or Remove proposal, and on every key-update and periodic Update Commit; and a two-phase receive that returns the staged Commit, its sending epoch, its pre-Commit ratchet tree view, and the decrypted body before merge. Every Commit the committer entry points emit is zero-padded so that its `PrivateMessage` `ciphertext`, the padded `PrivateMessageContent` plus the 16-byte AEAD tag, is a multiple of `COMMIT_PADDING_MULTIPLE`, 4,096 bytes, and no application message gets MLS padding (`09-security-model.md` §9.10.3 \"Commits\", ADR-066 decision 32). Every governance action travels in the one Commit that executes it, so the block has no part header. The runtime committer side is SCP-329 and the receiver side is SCP-330. ADR-067 adds body item 5, `merge`: a nil when the Commit carries no pending item, otherwise up to four fork records (`fork_count`, `end_count`, `end_leaf_hash`) and one run of import leaves (`07-trust-validation-and-capabilities.md` §7.3.1.1 'Wire placement' and 'Fork record and import (M5)').",
       "acceptanceCriteria": [
         "Every block the encoder emits is 32,805 bytes with `ciphertext_len` 32,784, for an empty block, a body of 1 byte, and a body of 32,764 bytes; a body of 32,765 bytes returns a typed error and builds no Commit",
         "Commit padding (`09-security-model.md` §9.10.3 \"Commits\", ADR-066 decision 32): the `PrivateMessage` `ciphertext` of every Commit the committer entry points emit, its padded `PrivateMessageContent` plus the 16-byte AEAD tag, is a multiple of 4,096 bytes, for an empty-block key-update Commit, a leaf-bearing Commit, and an `AddMember` Commit, one test each; an application message the same group sends before and after each of those Commits carries no MLS padding, so its `ciphertext` is exactly 16 bytes longer than its unpadded `PrivateMessageContent`; and after the group is loaded from storage with a `padding_size` of 4,096 persisted, its application messages carry no MLS padding (`09-security-model.md` §9.10.3 \"Commits\"). Indicator, not the criterion: openmls 0.9.0 reads `padding_size` from the group's `MlsGroupJoinConfig` in `MlsGroup::encrypt` for every message the group encrypts, and `MlsGroup::set_configuration` replaces the whole configuration, so the committer passes it a copy of the current configuration with only `padding_size` changed, 4,096 immediately before it creates a Commit and 0 immediately after, inside the context actor, so that no application message is encrypted between the two, and passes the same copy with 0 when it loads a group; openmls 0.9.0 exposes no getter for every field, so the committer builds the copy from the values it set when it created or joined the group",
@@ -12303,7 +12323,9 @@
         "The exported key is held in a `Zeroizing` value whose scope ends before the merge function returns",
         "The committer entry points set the block on an add Commit, a remove Commit, an UpdatePath Commit with no Add or Remove proposal, and a self-Update Commit, and a receiving member's two-phase receive returns the same body bytes, the sending epoch, and a tree view in which the committer's leaf is its leaf before the Commit, all before merge",
         "A test flips one byte of the block inside a sent Commit, and the two-phase receive rejects the frame and returns no body bytes; after a discard, the group stays at the old epoch and processes the next valid Commit of that epoch",
-        "`cargo clippy -p scp-mls --all-targets -- -D warnings` and `cargo test -p scp-mls` pass"
+        "`cargo clippy -p scp-mls --all-targets -- -D warnings` and `cargo test -p scp-mls` pass",
+        "ADR-067 body item 5: a body's canonical encoding has five items, `merge` last; a nil `merge` encodes as one byte, and a body with a nil proposal, no votes, no leaves, no reset requests, and a nil `merge` is not sent",
+        "A fork record encodes as the MessagePack array (`fork_count`, `end_count`, `end_leaf_hash`) of the `25-test-vectors.md` fork-record vector, and a `merge` with more than four records is rejected"
       ],
       "actionItems": [
         "Add the `governance_leaf_block` module with the fixed-size layout, header, padding, additional data, exporter key, and constants",
@@ -12328,6 +12350,14 @@
         {
           "file": ".docs/specs/09-security-model.md",
           "section": "#### 9.18.3 Key Derivation and HPKE Labels"
+        },
+        {
+          "file": ".docs/adrs/phase-6.md",
+          "section": "## ADR-067: Concurrent Commits and fork merge"
+        },
+        {
+          "file": ".docs/specs/07-trust-validation-and-capabilities.md",
+          "section": "###### Fork record and import (M5)"
         }
       ],
       "details": {
@@ -12390,7 +12420,7 @@
         "crates/scp-protocol/src/economy/pricing.rs",
         "crates/scp-protocol/src/economy/mod.rs"
       ],
-      "description": "Per §7.3.1.1 of the trust spec, §5.9 invariants 3 and 4 of the contexts spec, and ADR-066 (which amends ADR-031 §7 and §8), the member that executes a governance action in an encrypted context sends the proposal as a block proposal record (without `action_bytes`), the approvals SCP-332 selects, and exactly the leaves §7.3.1.1 step 1.6 derives from the action and the Commit in the one Commit that executes it, and is the only path that extends or promotes a TTL: it deletes the bilateral extension path that ADR-066 retires (ADR-018 criterion 3 and ADR-049 §9 as ADR-066 amends them), the `ExtensionConsentMode` member-count split, `reset_ttl_timer`, which moves the deadline and appends a `TtlExtended` leaf outside any Commit, and the `TtlExtensionRejected` append in `execute_extend_ttl`, and the 72-hour ceiling timer that held a `ModifyCeiling` pending after approval (`PendingCeilingModification` and the `apply_pending_ceiling_modification` operation), which ADR-066 decision 18 retires because the new ceiling is in effect from the executing Commit, and the 24-hour economic policy timer (`PendingEconomicPolicyChange` and `apply_pending_economic_policy_change`) with the §19.4 formula grace period (`FormulaChange` and `FormulaChangeStatus` in `scp-protocol`'s `economy/pricing.rs`), which decision 19 retires for the same reason, each leaf signed under the committer's identity key through SCP-336 with a `signing_key_id` equal to the one in the committer's own `0xFF03` attestation. Today `execute_add_member` appends `MemberJoined` after `try_broadcast_commit` and sends no leaf, `execute_change_role` sends no Commit at all, and leaves carry empty signatures. This story encodes the body with SCP-331 and sends it through the SCP-328 entry points, building the executor's own vote and the leaves, including one `GovernanceActionExecuted` leaf whose payload carries the proposal's exact `action_bytes`, the action's only copy in the Commit, (with sequence and `prev_hash` from the executor's log) against the epoch it sends in. An action that changes no MLS membership, such as `ChangeRole`, executes in an UpdatePath Commit with no Add or Remove proposal. The committer builds the leaves by the same derivation every receiver runs: `MemberJoined` for `AddMember`, `MemberLeft` for `RemoveMember`, `MemberReset` for `ResetMember`, `TtlExtended` for `ExtendTtl`, then the `GovernanceActionExecuted` leaf with payload `[target_did, action_type, proposal_id, action_bytes]`, and no other leaf: no `RoleAssigned` for `ChangeRole` and no other per-action leaf of ADR-011. Every action the SCP-332 intake accepts fits one block (§7.3.1.1, 'The leaf bound'), so no accepted action is impossible to execute; the encoder still returns `GovernanceError::LimitExceeded` and sends nothing for a body over 32,764 bytes, which only a defect reaches. A reset at a member's request (ADR-029 Tier 3, or the Tier 2 Welcome-based fast-forward) is a Commit with no proposal that removes the member's leaf, re-adds a KeyPackage whose `0xFF03` attestation is newer than the old leaf's, carries one `MemberReset` leaf that repeats the request's `last_known_epoch`, `reset_counter`, and `reason` and the member's own `ResetRequest` record, and is sent only by a committer holding both `member:invite` and `member:remove`; checking the KeyPackage's attestation needs the verification SCP-CRYPTO22-004 wires. Every other Commit the runtime or `scp-client` sends carries the empty block, and the ADR-057 T3 `SCPT` blob is removed. When the executor's Commit loses its epoch, it re-runs the SCP-335 check against the new state and sends again or marks the proposal `Invalidated`. The receiver side is SCP-330. A `ModifyCeiling` and a `SetEconomicPolicy` each take two Commits (`05-contexts.md` §5.3.2 and §5.9 invariant 5, `19-economic-governance.md` §19.3, ADR-066 decisions 20 and 21): when it creates the proposal, the proposer's SDK sends a recording Commit, with the proposer as committer, carrying the block proposal record and one `GovernanceProposalRecorded` leaf, and the committer executes the proposal only in a later Commit, refusing an unrecorded one with `GovernanceError::ProposalNotRecorded`. The committer builds the GroupContextExtensions proposal that sets `governance_state_hash` in every Commit whose derived leaves change the membership, a role, the voters, or the outlet registration policy (`05-contexts.md` §5.13.3 rule 11, ADR-066 decisions 25 and 31). Every Commit carries exactly one GroupContextExtensions proposal, which sets `log_head_hash` to the hash of the log after the Commit's leaves and carries the extensions unchanged when the block is empty, and therefore an UpdatePath (RFC 9420 §12.4; ADR-066 decisions 27 and 32). In a context with an MLS group, `revoke_ucan` sends one revocation Commit carrying a `TokenRevoked` leaf, and no application message carries a revocation (`07-trust-validation-and-capabilities.md` §7.3.1.1 \"With a revocation\", ADR-066 decision 28). The outlet Commit and the SDK registration path are SCP-342.",
+      "description": "Per §7.3.1.1 of the trust spec, §5.9 invariants 3 and 4 of the contexts spec, and ADR-066 (which amends ADR-031 §7 and §8), the member that executes a governance action in an encrypted context sends the proposal as a block proposal record (without `action_bytes`), the approvals SCP-332 selects, and exactly the leaves §7.3.1.1 step 1.6 derives from the action and the Commit in the one Commit that executes it, and is the only path that extends or promotes a TTL: it deletes the bilateral extension path that ADR-066 retires (ADR-018 criterion 3 and ADR-049 §9 as ADR-066 amends them), the `ExtensionConsentMode` member-count split, `reset_ttl_timer`, which moves the deadline and appends a `TtlExtended` leaf outside any Commit, and the `TtlExtensionRejected` append in `execute_extend_ttl`, and the 72-hour ceiling timer that held a `ModifyCeiling` pending after approval (`PendingCeilingModification` and the `apply_pending_ceiling_modification` operation), which ADR-066 decision 18 retires because the new ceiling is in effect from the executing Commit, and the 24-hour economic policy timer (`PendingEconomicPolicyChange` and `apply_pending_economic_policy_change`) with the §19.4 formula grace period (`FormulaChange` and `FormulaChangeStatus` in `scp-protocol`'s `economy/pricing.rs`), which decision 19 retires for the same reason, each leaf signed under the committer's identity key through SCP-336 with a `signing_key_id` equal to the one in the committer's own `0xFF03` attestation. Today `execute_add_member` appends `MemberJoined` after `try_broadcast_commit` and sends no leaf, `execute_change_role` sends no Commit at all, and leaves carry empty signatures. This story encodes the body with SCP-331 and sends it through the SCP-328 entry points, building the executor's own vote and the leaves, including one `GovernanceActionExecuted` leaf whose payload carries the proposal's exact `action_bytes`, the action's only copy in the Commit, (with sequence and `prev_hash` from the executor's log) against the epoch it sends in. An action that changes no MLS membership, such as `ChangeRole`, executes in an UpdatePath Commit with no Add or Remove proposal. The committer builds the leaves by the same derivation every receiver runs: `MemberJoined` for `AddMember`, `MemberLeft` for `RemoveMember`, `MemberReset` for `ResetMember`, `TtlExtended` for `ExtendTtl`, then the `GovernanceActionExecuted` leaf with payload `[target_did, action_type, proposal_id, action_bytes]`, and no other leaf: no `RoleAssigned` for `ChangeRole` and no other per-action leaf of ADR-011. Every action the SCP-332 intake accepts fits one block (§7.3.1.1, 'The leaf bound'), so no accepted action is impossible to execute; the encoder still returns `GovernanceError::LimitExceeded` and sends nothing for a body over 32,764 bytes, which only a defect reaches. A reset at a member's request (ADR-029 Tier 3, or the Tier 2 Welcome-based fast-forward) is a Commit with no proposal that removes the member's leaf, re-adds a KeyPackage whose `0xFF03` attestation is newer than the old leaf's, carries one `MemberReset` leaf that repeats the request's `last_known_epoch`, `reset_counter`, and `reason` and the member's own `ResetRequest` record, and is sent only by a committer holding both `member:invite` and `member:remove`; checking the KeyPackage's attestation needs the verification SCP-CRYPTO22-004 wires. Every other Commit the runtime or `scp-client` sends carries the empty block, and the ADR-057 T3 `SCPT` blob is removed. When the executor's Commit loses its epoch, it re-runs the SCP-335 check against the new state and sends again or marks the proposal `Invalidated`. The receiver side is SCP-330. A `ModifyCeiling` and a `SetEconomicPolicy` each take two Commits (`05-contexts.md` §5.3.2 and §5.9 invariant 5, `19-economic-governance.md` §19.3, ADR-066 decisions 20 and 21): when it creates the proposal, the proposer's SDK sends a recording Commit, with the proposer as committer, carrying the block proposal record and one `GovernanceProposalRecorded` leaf, and the committer executes the proposal only in a later Commit, refusing an unrecorded one with `GovernanceError::ProposalNotRecorded`. The committer builds the GroupContextExtensions proposal that sets `governance_state_hash` in every Commit whose derived leaves change the membership, a role, the voters, or the outlet registration policy (`05-contexts.md` §5.13.3 rule 11, ADR-066 decisions 25 and 31). Every Commit carries exactly one GroupContextExtensions proposal, which sets `log_head_hash` to the hash of the log after the Commit's leaves and carries the extensions unchanged when the block is empty, and therefore an UpdatePath (RFC 9420 §12.4; ADR-066 decisions 27 and 32). In a context with an MLS group, `revoke_ucan` sends one revocation Commit carrying a `TokenRevoked` leaf, and no application message carries a revocation (`07-trust-validation-and-capabilities.md` §7.3.1.1 \"With a revocation\", ADR-066 decision 28). The outlet Commit and the SDK registration path are SCP-342. Under ADR-067 M14 the committer builds on a scratch copy, persists the staged Commit encrypted in `BranchStore` (SCP-350) before the first publish, merges it only when a listed relay accepts it or a fetch returns its bytes, republishes to every relay that lacks it, keeps a staged Commit no relay returned as a candidate child, and emits `WelcomeGenerated` after accept.",
       "acceptanceCriteria": [
         "For `AddMember`, `RemoveMember`, `RevokeAccess`, `ResetMember`, `ChangeRole`, `TransferAdmin`, `SuspendCapability`, `SuspendAccess`, `RestoreAccess`, and `ModifyCeiling`, a test executes the action in an encrypted context and decodes the sent Commit's block; the decoded leaves are byte-identical to the leaves the committer appended and to the leaves §7.3.1.1 step 1.6 derives from the action, in the same order, the `ChangeRole` Commit carries only the `GovernanceActionExecuted` leaf and no `RoleAssigned` leaf, and each leaf's signature verifies under the committer's identity key with the `signing_key_id` of its `0xFF03` attestation",
         "In a `Threshold` context with threshold 2 of 3, the executing Commit carries the block proposal record and exactly 2 approvals although the executor holds 3",
@@ -12413,7 +12443,11 @@
         "Log head on every leaf-bearing Commit (`05-contexts.md` §5.13.3 \"Log head\" and rule 11, ADR-066 decision 27): every Commit the committer builds whose block carries a leaf, an `AddMember`, recording, checkpoint, revocation, outlet, and `MemberReset`-only Commit included, carries exactly one GroupContextExtensions proposal whose `log_head_hash` is SHA-256(BE64(count) ‖ merkle_root ‖ head) of the commit-ordered log after the Commit's leaves, and an UpdatePath; a test vector fixes the hash for a fixed three-leaf log; a Commit with an empty block, a key-update and a periodic Update Commit included, carries exactly one GroupContextExtensions proposal whose extensions equal the pre-Commit ones, and an UpdatePath (ADR-066 decision 32); and the Welcome's `0xFF04` body for an `AddMember` Commit is exactly the preimage of the `log_head_hash` that Commit's proposal sets",
         "Rotated committer (`07-trust-validation-and-capabilities.md` §7.3.1.1 step 1.6, `09-security-model.md` §9.12 step 2, `05-contexts.md` §5.13.3 rule 11): after the committer's `#active` key rotates, the first Commit it sends in each context replaces its own leaf through an UpdatePath, carries an empty block and the rule-11 GroupContextExtensions proposal with unchanged extensions, and a governance action, revocation, or checkpoint requested before it goes in the next Commit, whose leaves verify under the new key at every member; a test that puts leaves signed under the new key into the leaf-replacing Commit shows every receiver rejects it, and the committer never signs a leaf under the rotated-away key after the rotation",
         "Revocation Commit (`07-trust-validation-and-capabilities.md` §7.3.1.1 \"With a revocation\", `09-security-model.md` §9.5.2, ADR-066 decision 28): in a context with an MLS group, `revoke_ucan` builds one Commit whose block carries one `TokenRevoked` leaf `[token_cid, token_payload]`, the 36-byte raw CIDv1 and the token's canonical DAG-CBOR payload, and nothing else beside the log-head proposal; the revoker denies the token from the moment it builds the Commit and resends it until a Commit carrying the leaf merges; a revoker that is neither the token's `iss` nor the committed `creator_did` gets a typed error and sends nothing, and so does one whose token payload exceeds `MAX_REVOKED_TOKEN_BYTES` (8,192) or whose CID the context's `ucan_revocations` already holds; no MLS application message carries a revocation, and no code path merges another member's revocation list",
-        "CI-feature `cargo clippy` over the touched crates and their tests pass"
+        "CI-feature `cargo clippy` over the touched crates and their tests pass",
+        "ADR-067 M14: a test whose relays all drop the acknowledgement but store the Commit ends with the committer merged on a fetch that returns its bytes",
+        "ADR-067 M14: the committer does not merge its own Commit before a listed relay accepts it or a fetch returns its bytes, and the staged Commit survives a restart",
+        "ADR-067 M14: when a fetch shows another child of S_x and no relay returned the committer's bytes, the staged Commit is kept as a candidate child and its changes are re-issued at once on the new tip",
+        "`WelcomeGenerated` is emitted after accept, never before"
       ],
       "actionItems": [
         "Encode the block proposal record, the selected approvals, the executor's own vote, and the leaves in one body, with the action's `action_bytes` only in the `GovernanceActionExecuted` leaf, and build them at the epoch the Commit is sent in",
@@ -12469,6 +12503,10 @@
         {
           "file": ".docs/specs/09-security-model.md",
           "section": "### 9.5.2 Signed Structure Definitions"
+        },
+        {
+          "file": ".docs/adrs/phase-6.md",
+          "section": "## ADR-067: Concurrent Commits and fork merge"
         }
       ],
       "details": {}
@@ -12487,7 +12525,7 @@
         "crates/scp-runtime/src/context/providers/event_log.rs",
         "crates/scp-mls/src/context_extension.rs"
       ],
-      "description": "Per §7.3.1.1 of the trust spec and ADR-066, a member that processes a Commit it did not send runs the three receiver steps against its own pre-Commit state, and no step reads its clock or a leaf timestamp. Verify: the block decrypts and is canonical (SCP-328); the committer's identifier is the one the verified §9.7.1 `0xFF03` attestation binds on the committer's leaf before the Commit, the leaf whose key signed `FramedContentTBS` (never the MLS credential identity; this needs the attestation verification SCP-CRYPTO22-004 builds), and a Commit whose UpdatePath leaf's attestation binds a different identifier is rejected; the SCP-335 check passes on the body with the receiver's governance state; each leaf's own signature verifies per §23.13 ¶1 under the key the receiver resolved for that attestation (SCP-336), with sequence and `prev_hash` continuing the receiver's log; and for each `MemberReset` leaf the receiver hands SCP-335 the verified `0xFF03` attestations of the replaced and the re-added leaf, and the identity key it resolved for `#active` when it verified the re-added one, which also needs SCP-CRYPTO22-004. Authorize: the SCP-335 leaf derivation (the Commit's leaves must equal the leaves derived from the decoded action, the MLS proposals, the carried reset requests, and the receiver's state, in count, order, type, and every field but the signature and timestamp), and the count, reset, voter-limit, and conflict checks, or the `SingleAdmin` capability check. Append: merge, append the leaves, and update the governance state, the TTL deadline included, in one durable step. A Commit whose `GovernanceActionExecuted` leaf records `CloseContext` closes the context at B, which detects a close it missed while offline from that Commit, never from a `ContextClosing` leaf (ADR-029 §5e as ADR-066 amends it). A Commit that fails is rejected before merge. Until a receiver has verified the leaf that grants a member a role, it grants that member nothing and never assumes a default role. A leaf that arrives later by replication or reconciliation and hashes the same as the held leaf is discarded; one that hashes differently is handled as §9.9.3 equivocation. Its two-node criteria need SCP-329's committer side merged before the story is done; SCP-329 is not in blockedBy because this story can start without it. The rejoin criteria of PUSH-030 and PUSH-026 depend on this story. The receiver also validates a checkpoint Commit: it recomputes the `Checkpoint` leaf's Merkle root, head leaf hash, and snapshot digest from its own state and checks the full quorum (ADR-066 decision 24). The receiver recomputes `governance_state_hash` from the members, roles, voters, and outlet registration policy its derived leaves produce before it merges (`05-contexts.md` §5.13.3 rule 11, ADR-066 decisions 25 and 31), and recomputes `log_head_hash` from its log after the Commit's leaves (ADR-066 decision 27). It verifies every leaf signature and checkpoint signature under the key it resolved from the signer's epoch-`E` `0xFF03` attestation, and reads no key-event log (§7.3.1.1 step 1.6, ADR-066 decision 27). Members can disagree on a leaf at the Commit where it enters their trees, and a joiner, an importer, or a restorer holds no resolved key for a leaf already in the tree, so two receivers can still diverge on one Commit; `09-security-model.md` §9.7.1, \"Known gap: members can resolve different keys for one attestation\" states that gap, and SCP-315 owns its fix. It applies a merged revocation Commit's `TokenRevoked` leaf to `ucan_revocations`, which step 10 of `validate_ucan` reads from that epoch (ADR-066 decision 28).",
+      "description": "Per §7.3.1.1 of the trust spec and ADR-066, a member that processes a Commit it did not send runs the three receiver steps against its own pre-Commit state, and no step reads its clock or a leaf timestamp. Verify: the block decrypts and is canonical (SCP-328); the committer's identifier is the one the verified §9.7.1 `0xFF03` attestation binds on the committer's leaf before the Commit, the leaf whose key signed `FramedContentTBS` (never the MLS credential identity; this needs the attestation verification SCP-CRYPTO22-004 builds), and a Commit whose UpdatePath leaf's attestation binds a different identifier is rejected; the SCP-335 check passes on the body with the receiver's governance state; each leaf's own signature verifies per §23.13 ¶1 under the key the receiver resolved for that attestation (SCP-336), with sequence and `prev_hash` continuing the receiver's log; and for each `MemberReset` leaf the receiver hands SCP-335 the verified `0xFF03` attestations of the replaced and the re-added leaf, and the identity key it resolved for `#active` when it verified the re-added one, which also needs SCP-CRYPTO22-004. Authorize: the SCP-335 leaf derivation (the Commit's leaves must equal the leaves derived from the decoded action, the MLS proposals, the carried reset requests, and the receiver's state, in count, order, type, and every field but the signature and timestamp), and the count, reset, voter-limit, and conflict checks, or the `SingleAdmin` capability check. Append: merge, append the leaves, and update the governance state, the TTL deadline included, in one durable step. A Commit whose `GovernanceActionExecuted` leaf records `CloseContext` closes the context at B, which detects a close it missed while offline from that Commit, never from a `ContextClosing` leaf (ADR-029 §5e as ADR-066 amends it). A Commit that fails is rejected before merge. Until a receiver has verified the leaf that grants a member a role, it grants that member nothing and never assumes a default role. A leaf that arrives later by replication or reconciliation and hashes the same as the held leaf is discarded; one that hashes differently is handled as §9.9.3 equivocation. Its two-node criteria need SCP-329's committer side merged before the story is done; SCP-329 is not in blockedBy because this story can start without it. The rejoin criteria of PUSH-030 and PUSH-026 depend on this story. The receiver also validates a checkpoint Commit: it recomputes the `Checkpoint` leaf's Merkle root, head leaf hash, and snapshot digest from its own state and checks the full quorum (ADR-066 decision 24). The receiver recomputes `governance_state_hash` from the members, roles, voters, and outlet registration policy its derived leaves produce before it merges (`05-contexts.md` §5.13.3 rule 11, ADR-066 decisions 25 and 31), and recomputes `log_head_hash` from its log after the Commit's leaves (ADR-066 decision 27). It verifies every leaf signature and checkpoint signature under the key it resolved from the signer's epoch-`E` `0xFF03` attestation, and reads no key-event log (§7.3.1.1 step 1.6, ADR-066 decision 27). Members can disagree on a leaf at the Commit where it enters their trees, and a joiner, an importer, or a restorer holds no resolved key for a leaf already in the tree, so two receivers can still diverge on one Commit; `09-security-model.md` §9.7.1, \"Known gap: members can resolve different keys for one attestation\" states that gap, and SCP-315 owns its fix. It applies a merged revocation Commit's `TokenRevoked` leaf to `ucan_revocations`, which step 10 of `validate_ucan` reads from that epoch (ADR-066 decision 28). Under ADR-067 the receiver processes every valid child of a held parent against the retained parent state, refuses a Commit at an epoch at or below its horizon that no held state takes, and follows receipt rules 1 to 4 of `23-sync-and-offline-strategy.md` §23.4.1.",
       "acceptanceCriteria": [
         "Two-node test: A adds C as `observer`; B processes A's Commit and then holds C with role `observer`, C's `messages:read` is authorized at B and C's `messages:write` is not, and B's log head equals A's",
         "Two-node test: A changes C's role from `observer` to `member` by `ChangeRole`; after B processes the Commit, C's `messages:write` is authorized at B",
@@ -12510,7 +12548,9 @@
         "B rejects before merge a checkpoint Commit whose leaf at sequence N − 1 is already a `Checkpoint` leaf, and one that also carries an Add proposal, a Remove proposal, a GroupContextExtensions proposal, a vote record, a reset-request record, or a second leaf; in a `SingleAdmin` context it rejects one sent by a member other than the admin and one whose `cosignatures` is not empty, and in a `Majority` context of five voters one carrying one cosignature (`07-trust-validation-and-capabilities.md` §7.3.1.1 step 1.6, ADR-066 decision 24)",
         "Log head at the receiver (`05-contexts.md` §5.13.3 \"Log head\" and rule 11, ADR-066 decision 27): before merge the receiver recomputes `log_head_hash` from its own log after the Commit's derived leaves and rejects, leaving the epoch, event log, and governance state unchanged, a leaf-bearing Commit with no GroupContextExtensions proposal, an empty-block Commit with none, one whose `log_head_hash` differs from the recomputed value in one bit, one with no UpdatePath, and an empty-block Commit whose proposal changes `log_head_hash`, one test each; after a matching Commit, two members' group contexts hold the same `log_head_hash`",
         "Revocation at the receiver (`07-trust-validation-and-capabilities.md` §7.3.1.1 \"With a revocation\" and step 2, ADR-066 decision 28): after B merges A's revocation Commit, B's `ucan_revocations` holds the CID and step 10 of `validate_ucan` at B denies the token in the Commit's epoch, though B received no application message about it; a joiner added after that Commit holds the CID from its rebuilt state and denies the token; the rejections of the SCP-335 check leave B's epoch, event log, and governance state unchanged",
-        "CI-feature `cargo clippy` over the touched crates and their tests pass"
+        "CI-feature `cargo clippy` over the touched crates and their tests pass",
+        "ADR-067 M1: a receiver that holds S_e validates a second child of S_e against the retained S_e and keeps both children",
+        "ADR-067 M9: a Commit for an epoch at or below the receiver's horizon that no held state takes is refused and its H indexed; one above the tip triggers an ancestor fetch with exponential backoff"
       ],
       "actionItems": [
         "Route incoming Commits through the SCP-328 two-phase receive",
@@ -12548,6 +12588,14 @@
         {
           "file": ".docs/specs/05-contexts.md",
           "section": "### 5.13.3 Creation"
+        },
+        {
+          "file": ".docs/adrs/phase-6.md",
+          "section": "## ADR-067: Concurrent Commits and fork merge"
+        },
+        {
+          "file": ".docs/specs/23-sync-and-offline-strategy.md",
+          "section": "### 23.4.1 Commit Recovery Sources"
         }
       ],
       "details": {}
@@ -12698,7 +12746,7 @@
         "crates/scp-runtime/src/context/governance_helpers.rs",
         ".docs/specs/25-test-vectors.md"
       ],
-      "description": "Per the governance-state, conflict, approval-cap, and receiver-step rules of §7.3.1.1 of the trust spec, this story builds in `scp-protocol` the pure check every receiver runs on one decoded block body before it merges a Commit, and the governance state the check reads. The governance state holds the membership and roles, `member_since` (each member's join point: the `sequence` of the `MemberJoined` leaf that added it as a non-member; a `MemberReset` leaf leaves it unchanged), `change_seq` per `GovernanceConflictKey` (`role:X`, `read:X`, `write:X`, `ceiling`), the executed-proposal set, `reset_counter_floor` per member (0 when a `MemberJoined` leaf adds it, set to the `reset_counter` of a `MemberReset` leaf that executes its request, unchanged by a `MemberReset` a `ResetMember` action derives, dropped when it leaves), and `ttl_deadline` (derived from the latest TTL leaf, the latest `TtlExtended` leaf or `PromoteContext` `GovernanceActionExecuted` leaf: none after a promotion, the leaf's `new_deadline_unix` after an extension, `creation_timestamp_secs` plus `ttl` when there is neither, both read from the committed `0xFF02` extension, SCP-338), the genesis role definitions, `outlet_policy`, `outlets`, and `ucan_revocations` (`07-trust-validation-and-capabilities.md` §7.3.1.1 governance state, ADR-066 decisions 28, 29, and 31), with a function that applies a leaf to it and reads only values the check verified. The check takes the body, the sender's identifier, the sending epoch E, a pre-Commit tree view, the receiver's commit-ordered leaf count N, the governance state, and, for each `MemberReset` leaf, the verified `0xFF03` attestations of the replaced and re-added leaves and the `#active` key the caller resolved, and reads nothing else: no clock and no leaf timestamp. When a proposal is present it requires exactly one `GovernanceActionExecuted` leaf, takes that leaf's `action_bytes` as received, checks their length and their RFC 8785 and I-JSON form on those exact bytes, recomputes the `\"SCP-PROPOSAL-V2:\"` `proposal_id` from them and the block proposal record, checks it against the leaf's `proposal_id`, and checks the executed set, `anchor_seq ≤ N`, `GovernancePropose`, and the signature in the tree view; checks each vote is `Approve`, from a voter with no other approval in the Commit, who holds `GovernanceVote` (and is a `Threshold` signer), or for an `ExtendTtl` or `PromoteContext` action is any current member, with `E ≤ expires_epoch` and a signature under that voter's leaf in the tree view whose `0xFF03` binds the voter, rejecting the Commit on any failure; counts the approvals against the requirement computed from the current state, every current member for `ExtendTtl` and `PromoteContext` under every model; checks every identifier field of the action is a valid 56-byte text form; derives the exact leaves the Commit must carry from the decoded action, the Commit's Add and Remove proposals, the carried reset requests, and the state (§7.3.1.1 step 1.6: `MemberJoined`, `MemberLeft`, `MemberReset`, or `TtlExtended` as the action requires, then the `GovernanceActionExecuted` leaf `[target_did, action_type, proposal_id, action_bytes]`; with no proposal, `MemberReset` for each paired Remove and Add and `MemberLeft` for each other Remove) and rejects a Commit whose leaves differ in count, order, type, or any field but `signature` and `timestamp`, or whose received leaf bytes are not the encoding of the decoded `Event`; rejects an action that raises the eligible voters past the context's voter limit or adds a 97th member to a context with a TTL, and a `ReconfigureGovernance` whose resulting configuration breaks the §5.9 invariant 4 limits; and applies the conflict rule (a key with `change_seq ≥ anchor_seq`, or a subject X with `member_since[X] ≥ anchor_seq`). A `MemberReset` leaf in a Commit with no proposal needs no approvals and is authorized only when the committer holds both `member:invite` and `member:remove`, the paired reset-request record verifies over the §9.5.2 `ResetRequest` preimage under X's `#active` key with `member_since` equal to `member_since[X]`, `reset_counter > reset_counter_floor[X]`, `last_known_epoch ≤ E`, and a `reason` that is one of the two §9.5.2 text forms; rejects a `PromoteContext` whose `ttl_deadline` is none or whose context's promotion policy, read from the committed `0xFF02` `promotion_policy` field and never from the bundle, is `no_promotion`; and the re-added leaf's `0xFF03` `issued_at` is later than the replaced leaf's; one in a Commit with a proposal is authorized only as the executed `ResetMember` action. Under epoch order the governance freeze for mutual removal and simultaneous commit cannot arise (ADR-031 §7 amendment), so this story deletes `ResolveConflict`, `ConflictResolution`, and the `GovernanceConflictDetected` and `GovernanceConflictResolved` event types with every caller. Leaf signature checks are SCP-330's. A recording Commit, which carries a `ModifyCeiling`'s or `SetEconomicPolicy`'s block proposal record and one `GovernanceProposalRecorded` leaf and whose committer must be the proposer, is checked and authorized under §7.3.1.1 steps 1.3 and 2, and an executing `ModifyCeiling` or `SetEconomicPolicy` is rejected unless an earlier Commit recorded it (`05-contexts.md` §5.3.2 and §5.9 invariant 5, ADR-066 decisions 20 and 21). The story renames the `CeilingModificationPending` event type `GovernanceProposalRecorded`, keeping tag 38, in the code and in the `25-test-vectors.md` Vector 32 tag table together (ADR-066 decision 21). The governance state also holds `economic_policy`, the economic policy in effect, initialized from the bundle-verified genesis `ContextParams` and set by each executed `SetEconomicPolicy`, and the check rejects the recording or execution of a `SetEconomicPolicy` when that policy is locked or when the action's policy sets `locked` (§7.3.1.1 step 1.3, ADR-066 decision 22).",
+      "description": "Per the governance-state, conflict, approval-cap, and receiver-step rules of §7.3.1.1 of the trust spec, this story builds in `scp-protocol` the pure check every receiver runs on one decoded block body before it merges a Commit, and the governance state the check reads. The governance state holds the membership and roles, `member_since` (each member's join point: the `sequence` of the `MemberJoined` leaf that added it as a non-member; a `MemberReset` leaf leaves it unchanged), `change_seq` per `GovernanceConflictKey` (`role:X`, `read:X`, `write:X`, `ceiling`), the executed-proposal set, `reset_counter_floor` per member (0 when a `MemberJoined` leaf adds it, set to the `reset_counter` of a `MemberReset` leaf that executes its request, unchanged by a `MemberReset` a `ResetMember` action derives, dropped when it leaves), and `ttl_deadline` (derived from the latest TTL leaf, the latest `TtlExtended` leaf or `PromoteContext` `GovernanceActionExecuted` leaf: none after a promotion, the leaf's `new_deadline_unix` after an extension, `creation_timestamp_secs` plus `ttl` when there is neither, both read from the committed `0xFF02` extension, SCP-338), the genesis role definitions, `outlet_policy`, `outlets`, and `ucan_revocations` (`07-trust-validation-and-capabilities.md` §7.3.1.1 governance state, ADR-066 decisions 28, 29, and 31), with a function that applies a leaf to it and reads only values the check verified. The check takes the body, the sender's identifier, the sending epoch E, a pre-Commit tree view, the receiver's commit-ordered leaf count N, the governance state, and, for each `MemberReset` leaf, the verified `0xFF03` attestations of the replaced and re-added leaves and the `#active` key the caller resolved, and reads nothing else: no clock and no leaf timestamp. When a proposal is present it requires exactly one `GovernanceActionExecuted` leaf, takes that leaf's `action_bytes` as received, checks their length and their RFC 8785 and I-JSON form on those exact bytes, recomputes the `\"SCP-PROPOSAL-V2:\"` `proposal_id` from them and the block proposal record, checks it against the leaf's `proposal_id`, and checks the executed set, `anchor_seq ≤ N`, `GovernancePropose`, and the signature in the tree view; checks each vote is `Approve`, from a voter with no other approval in the Commit, who holds `GovernanceVote` (and is a `Threshold` signer), or for an `ExtendTtl` or `PromoteContext` action is any current member, with `E ≤ expires_epoch` and a signature under that voter's leaf in the tree view whose `0xFF03` binds the voter, rejecting the Commit on any failure; counts the approvals against the requirement computed from the current state, every current member for `ExtendTtl` and `PromoteContext` under every model; checks every identifier field of the action is a valid 56-byte text form; derives the exact leaves the Commit must carry from the decoded action, the Commit's Add and Remove proposals, the carried reset requests, and the state (§7.3.1.1 step 1.6: `MemberJoined`, `MemberLeft`, `MemberReset`, or `TtlExtended` as the action requires, then the `GovernanceActionExecuted` leaf `[target_did, action_type, proposal_id, action_bytes]`; with no proposal, `MemberReset` for each paired Remove and Add and `MemberLeft` for each other Remove) and rejects a Commit whose leaves differ in count, order, type, or any field but `signature` and `timestamp`, or whose received leaf bytes are not the encoding of the decoded `Event`; rejects an action that raises the eligible voters past the context's voter limit or adds a 97th member to a context with a TTL, and a `ReconfigureGovernance` whose resulting configuration breaks the §5.9 invariant 4 limits; and applies the conflict rule (a key with `change_seq ≥ anchor_seq`, or a subject X with `member_since[X] ≥ anchor_seq`). A `MemberReset` leaf in a Commit with no proposal needs no approvals and is authorized only when the committer holds both `member:invite` and `member:remove`, the paired reset-request record verifies over the §9.5.2 `ResetRequest` preimage under X's `#active` key with `member_since` equal to `member_since[X]`, `reset_counter > reset_counter_floor[X]`, `last_known_epoch ≤ E`, and a `reason` that is one of the two §9.5.2 text forms; rejects a `PromoteContext` whose `ttl_deadline` is none or whose context's promotion policy, read from the committed `0xFF02` `promotion_policy` field and never from the bundle, is `no_promotion`; and the re-added leaf's `0xFF03` `issued_at` is later than the replaced leaf's; one in a Commit with a proposal is authorized only as the executed `ResetMember` action. Under epoch order the governance freeze for mutual removal and simultaneous commit cannot arise (ADR-031 §7 amendment), so this story deletes `ResolveConflict`, `ConflictResolution`, and the `GovernanceConflictDetected` and `GovernanceConflictResolved` event types with every caller. Leaf signature checks are SCP-330's. A recording Commit, which carries a `ModifyCeiling`'s or `SetEconomicPolicy`'s block proposal record and one `GovernanceProposalRecorded` leaf and whose committer must be the proposer, is checked and authorized under §7.3.1.1 steps 1.3 and 2, and an executing `ModifyCeiling` or `SetEconomicPolicy` is rejected unless an earlier Commit recorded it (`05-contexts.md` §5.3.2 and §5.9 invariant 5, ADR-066 decisions 20 and 21). The story renames the `CeilingModificationPending` event type `GovernanceProposalRecorded`, keeping tag 38, in the code and in the `25-test-vectors.md` Vector 32 tag table together (ADR-066 decision 21). The governance state also holds `economic_policy`, the economic policy in effect, initialized from the bundle-verified genesis `ContextParams` and set by each executed `SetEconomicPolicy`, and the check rejects the recording or execution of a `SetEconomicPolicy` when that policy is locked or when the action's policy sets `locked` (§7.3.1.1 step 1.3, ADR-066 decision 22). Under ADR-067 the check also runs G over a fork's changes (the dropped set D, values V over the `seen` frontier, the classes, the orders, the zero-holder rule, and the 47-row pair table), verifies a signed-leaf import, and re-checks each re-applied change in the losing branch's state at F, rebuilt by undoing journal entries with their `prior` values (`07-trust-validation-and-capabilities.md` §7.3.1.1 'The merge function G (M6, M8)' and 'Fork record and import (M5)'). When one change identity executes natively on two branches, the canonical execution holds and a `ConcurrentDrop` leaf records the skip.",
       "acceptanceCriteria": [
         "Given a valid body for each model, the check returns `Authorized`; one test per rejection returns a typed reason: a `proposal_id` in the executed set; `anchor_seq` above N; a `Reject` record; a voter with two approvals in one Commit; a voter without `GovernanceVote`; `expires_epoch` below E; a vote whose `leaf_key_hash` matches no leaf of the voter in the tree view; a leaf key whose `0xFF03` binds another identifier; one approval too few",
         "In a `Unanimity` context of 96 eligible voters, a body carrying 96 approvals is authorized; an `AddMember` action in that context, and a `ChangeRole` that grants `GovernanceVote` to a 97th member, are each rejected for exceeding the voter limit, as is an `AddMember` that takes a `Majority` context from 191 to 192 eligible voters, and an `AddMember` that takes a `Threshold` context with a TTL from 96 to 97 members",
@@ -12721,7 +12769,12 @@
         "Revocation check (`07-trust-validation-and-capabilities.md` §7.3.1.1 \"With a revocation\" and step 2, ADR-066 decision 28): the check accepts a revocation Commit whose committer is the payload's `iss`, and one whose committer is the committed `creator_did`, and applying its leaf adds the CID to `ucan_revocations`; it rejects, one test each, a `token_cid` other than the CID it computes from `token_payload` (`0x01 0x71 0x12 0x20` then SHA-256), a payload longer than `MAX_REVOKED_TOKEN_BYTES`, a payload that is not canonical DAG-CBOR, an `iss` that is not an identifier in text form, a CID `ucan_revocations` already holds, a committer that is neither, and a revocation Commit carrying a second leaf, a vote, or a reset request",
         "Outlet check (`05-contexts.md` §5.4 \"Registration and its policy\", `07-trust-validation-and-capabilities.md` §7.3.1.1 \"With an outlet change\" and step 2, ADR-066 decision 31): the check accepts an outlet Commit from a holder of `outlet:register` whose change `outlet_policy` does not route, and applying an `OutletRegistered`, `OutletUpdated`, or `OutletRemoved` leaf adds, replaces, or removes its header in `outlets`; it rejects, one test each, a committer without `outlet:register`, an `OutletRegistered` for an `outlet_id` `outlets` holds, an `OutletUpdated` or `OutletRemoved` for one it does not hold, a header field outside the §5.4.1 bounds, a `cost` longer than `MAX_OUTLET_COST_BYTES`, a Query header with a positive `amount` or a `cost_formula`, and, for each rule condition of `05-contexts.md` §5.4 (`changes`, `updated_fields`, `kinds`, `reads_any`, `capabilities_any`, `price_above` in the floor's currency and in another, `payee_differs`, `dynamic_price`, `operator_not_in`) in a rule that requires `Vote`, a change whose added, replaced, replacing, or removed header meets it, and a change that a `Role` rule matches from a committer whose role it does not list (ADR-066 decision 35); it verifies no operator signature; a `RegisterOutlet` or `RemoveOutlet` executing Commit derives the same leaf under the model's approvals; and a `SetOutletRegistrationPolicy` executing Commit sets `outlet_policy`, which a later Commit, not the same one, applies",
         "Governance state value (`05-contexts.md` §5.13.3 \"Governance state\", ADR-066 decisions 29, 31, and 35): the function that computes `governance_state_hash` takes the members, the genesis role definitions as names with sorted capabilities, the voters, and `outlet_policy`, and a test vector fixes the hash for a context with two members, one custom role holding two capabilities, one voter, and a policy of two rules, one that requires `Vote` for an Action header and one that requires `Role` `[\"admin\"]` for a header that reads `MESSAGES`; a value that repeats a role name or a capability, or lists one out of order, is rejected",
-        "CI-feature `cargo clippy` over the touched crates and their tests pass"
+        "CI-feature `cargo clippy` over the touched crates and their tests pass",
+        "ADR-067 G: every row of the `25-test-vectors.md` 47-row pair table gives its stated outcome on either choice of canonical child",
+        "ADR-067 M5c: a re-applied change whose author lacked the capability in the losing branch's state at F is dropped with a `ConcurrentDrop` leaf, and the Commit is not rejected",
+        "ADR-067 M5c: the state at F is rebuilt by undoing journal entries after F with their `prior` values, which cover membership, the UCAN revocation set, and `member_since`",
+        "ADR-067 collision rule: an import never re-executes an identity canonical executed, and a `ConcurrentDrop` leaf records the skip",
+        "A history with no fork gives D = ∅ and the same state as before ADR-067, except for the `member:X` row (SCP-361)"
       ],
       "actionItems": [
         "Add the governance state with `member_since`, `change_seq`, the executed set, `reset_counter_floor`, `recorded_proposals`, and `economic_policy`, and the leaf-apply function",
@@ -12765,6 +12818,18 @@
         {
           "file": ".docs/specs/05-contexts.md",
           "section": "## 5.4 Outlets"
+        },
+        {
+          "file": ".docs/adrs/phase-6.md",
+          "section": "## ADR-067: Concurrent Commits and fork merge"
+        },
+        {
+          "file": ".docs/specs/07-trust-validation-and-capabilities.md",
+          "section": "###### The merge function G (M6, M8)"
+        },
+        {
+          "file": ".docs/specs/07-trust-validation-and-capabilities.md",
+          "section": "###### Fork record and import (M5)"
         }
       ],
       "details": {}
@@ -12893,7 +12958,7 @@
         "scripts/gen-test-vectors-p256.py",
         ".docs/specs/25-test-vectors.md"
       ],
-      "description": "A member a Commit adds receives the Welcome, not the Commit (§7.3.1.1 of the trust spec, 'The members a Commit adds'). It rebuilds the event log and the governance state from a checkpoint and the leaves after it, as ADR-030 §5 'State Reconstruction from Checkpoints' specifies, fetching them through the §23.7 reconciliation of the sync spec and verifying each leaf per §23.13. ADR-066 amends ADR-030's `ContextStateSnapshot` with `member_since`, `governance_change_seqs`, `executed_proposals`, `reset_counter_floors`, and `ttl_deadline_unix`, which replaces `ttl_remaining_secs`, because a receiver's authorization reads them and their source leaves may lie before the checkpoint. No code builds this reconstruction today. This story adds the five snapshot fields, makes `convergent_ttl_deadline` (ADR-049 §9, as ADR-066 amends it) read only the context's latest TTL leaf, the latest `TtlExtended` leaf or `PromoteContext` `GovernanceActionExecuted` leaf, adopts a snapshot only when its `ttl_deadline_unix` equals the deadline the latest TTL leaf at or before the checkpoint gives, or the create base when there is none, fills them when a checkpoint is created, and builds the reconstruction, which loads the snapshot's state and applies each later leaf with the SCP-335 leaf-apply function. The fields use the canonical MessagePack encoding of the ADR-030 amendment: sorted by identifier, encoded key, or proposal ID as unsigned bytes, without duplicates, `GovernanceConflictKey` as `[tag, identifier]` with a 32-byte identifier for tags 0 to 2 and nil for tag 3, and `member_since` and `reset_counter_floors` (`[identifier, counter]`) keyed by exactly the current members. The rebuild adopts the whole snapshot, membership, roles, governance configuration, and ceiling included, from the latest `Checkpoint` leaf included under the `log_head_hash` the group context commits, counting no signature quorum and verifying no checkpoint signature, once the members, roles, voters, and outlet registration policy it computes from the snapshot and the leaves after it hash to the committed `governance_state_hash`, and never walks or rebuilds from an earlier checkpoint (`05-contexts.md` §5.13.3 'Governance state' and rules 11, 13, and 14, ADR-030 §1 adoption and §5 as ADR-066 decision 27 amends them). An importer and a restorer check the log they hold against the committed `log_head_hash` the same way (rule 14). Pruning keeps every leaf after the latest checkpoint, every checkpoint leaf (ADR-030 pruning invariant 3), and the latest TTL leaf (ADR-030 pruning invariant 6); pruning invariant 7 is withdrawn (ADR-066 decision 27). The creator's checkpoint signature and each cosignature are made and verified over the `09-security-model.md` §9.5.1 canonical hash under `\"SCP-STATE-CHECKPOINT-V1:\"`, with `context_id` length-prefixed and the signer's own `key_state_head` last, a member that processes the checkpoint Commit verifies them under the keys its signers' epoch-`E` `0xFF03` attestations name, and only a verifier outside the group verifies them in the log-anchored evidence class (ADR-030 §1 checkpoint signature preimage and log-anchored amendments, `09-security-model.md` §9.7.1, ADR-066 decision 27). The snapshot holds no `blocks`, and its `outlets` and `ucan_revocations` derive from commit-ordered leaves (ADR-030 §1 outlets amendment, ADR-066 decisions 28, 30, and 31). The snapshot also carries `economic_policy`, and a rebuilt, imported, or restored member grants no right until the policy it ends with hashes to the committed `economic_policy_hash` (`05-contexts.md` §5.13.3 rule 12, ADR-030 §1 economic policy amendment, ADR-066 decision 22). The rebuild accepts every leaf by its inclusion under the committed `log_head_hash` and verifies no leaf signature (ADR-066 decision 27). It returns the rebuilt log's count, Merkle root, and last leaf hash, so SCP-334 can compare them with the Welcome's `scp_event_log_head` extension. In an encrypted context the creator sends each checkpoint in a checkpoint Commit as a `Checkpoint` leaf (`EventType` tag 79) carrying the snapshot's digest and every signature, once it holds the full quorum; a checkpoint short of its quorum stays a local `PartiallyAttested` flag and is never committed, and a joiner checks the snapshot it fetches against the leaf's digest (ADR-030 §1 and §5 amendments, ADR-031 §9 amendment, ADR-066 decision 24).",
+      "description": "A member a Commit adds receives the Welcome, not the Commit (§7.3.1.1 of the trust spec, 'The members a Commit adds'). It rebuilds the event log and the governance state from a checkpoint and the leaves after it, as ADR-030 §5 'State Reconstruction from Checkpoints' specifies, fetching them through the §23.7 reconciliation of the sync spec and verifying each leaf per §23.13. ADR-066 amends ADR-030's `ContextStateSnapshot` with `member_since`, `governance_change_seqs`, `executed_proposals`, `reset_counter_floors`, and `ttl_deadline_unix`, which replaces `ttl_remaining_secs`, because a receiver's authorization reads them and their source leaves may lie before the checkpoint. No code builds this reconstruction today. This story adds the five snapshot fields, makes `convergent_ttl_deadline` (ADR-049 §9, as ADR-066 amends it) read only the context's latest TTL leaf, the latest `TtlExtended` leaf or `PromoteContext` `GovernanceActionExecuted` leaf, adopts a snapshot only when its `ttl_deadline_unix` equals the deadline the latest TTL leaf at or before the checkpoint gives, or the create base when there is none, fills them when a checkpoint is created, and builds the reconstruction, which loads the snapshot's state and applies each later leaf with the SCP-335 leaf-apply function. The fields use the canonical MessagePack encoding of the ADR-030 amendment: sorted by identifier, encoded key, or proposal ID as unsigned bytes, without duplicates, `GovernanceConflictKey` as `[tag, identifier]` with a 32-byte identifier for tags 0 to 2 and nil for tag 3, and `member_since` and `reset_counter_floors` (`[identifier, counter]`) keyed by exactly the current members. The rebuild adopts the whole snapshot, membership, roles, governance configuration, and ceiling included, from the latest `Checkpoint` leaf included under the `log_head_hash` the group context commits, counting no signature quorum and verifying no checkpoint signature, once the members, roles, voters, and outlet registration policy it computes from the snapshot and the leaves after it hash to the committed `governance_state_hash`, and never walks or rebuilds from an earlier checkpoint (`05-contexts.md` §5.13.3 'Governance state' and rules 11, 13, and 14, ADR-030 §1 adoption and §5 as ADR-066 decision 27 amends them). An importer and a restorer check the log they hold against the committed `log_head_hash` the same way (rule 14). Pruning keeps every leaf after the latest checkpoint, every checkpoint leaf (ADR-030 pruning invariant 3), and the latest TTL leaf (ADR-030 pruning invariant 6); pruning invariant 7 is withdrawn (ADR-066 decision 27). The creator's checkpoint signature and each cosignature are made and verified over the `09-security-model.md` §9.5.1 canonical hash under `\"SCP-STATE-CHECKPOINT-V1:\"`, with `context_id` length-prefixed and the signer's own `key_state_head` last, a member that processes the checkpoint Commit verifies them under the keys its signers' epoch-`E` `0xFF03` attestations name, and only a verifier outside the group verifies them in the log-anchored evidence class (ADR-030 §1 checkpoint signature preimage and log-anchored amendments, `09-security-model.md` §9.7.1, ADR-066 decision 27). The snapshot holds no `blocks`, and its `outlets` and `ucan_revocations` derive from commit-ordered leaves (ADR-030 §1 outlets amendment, ADR-066 decisions 28, 30, and 31). The snapshot also carries `economic_policy`, and a rebuilt, imported, or restored member grants no right until the policy it ends with hashes to the committed `economic_policy_hash` (`05-contexts.md` §5.13.3 rule 12, ADR-030 §1 economic policy amendment, ADR-066 decision 22). The rebuild accepts every leaf by its inclusion under the committed `log_head_hash` and verifies no leaf signature (ADR-066 decision 27). It returns the rebuilt log's count, Merkle root, and last leaf hash, so SCP-334 can compare them with the Welcome's `scp_event_log_head` extension. In an encrypted context the creator sends each checkpoint in a checkpoint Commit as a `Checkpoint` leaf (`EventType` tag 79) carrying the snapshot's digest and every signature, once it holds the full quorum; a checkpoint short of its quorum stays a local `PartiallyAttested` flag and is never committed, and a joiner checks the snapshot it fetches against the leaf's digest (ADR-030 §1 and §5 amendments, ADR-031 §9 amendment, ADR-066 decision 24). Under ADR-067 M13 the rebuild also restores the journal, key ledger, epoch table, fork records, imports, and pending joiners, and checks them against the committed `merge_state_hash` (`05-contexts.md` §5.13.3 rule 16).",
       "acceptanceCriteria": [
         "`ContextStateSnapshot` carries `member_since`, `governance_change_seqs`, `executed_proposals`, `reset_counter_floors`, `ttl_deadline_unix`, `recorded_proposals`, and `economic_policy`, and no `ttl_remaining_secs` field, every identifier it holds and `Checkpoint.creator_did` and `CosignedCheckpoint.signer_did` are `DID`s (ADR-030 §1 snapshot-types amendment), a checkpoint fills them from the live governance state, and its deterministic serialization covers them; the snapshot carries no `sender_key_epochs` field, and a checkpoint taken while a member's `SenderKeyEpochAdvance` has reached the creator but not a cosigner still reaches its quorum (ADR-030 §1 sender-key amendment, ADR-066 decision 26); the snapshot carries no `blocks` field, `outlets` is a `Vec<OutletRegistrationHeader>` sorted by `outlet_id` and `ucan_revocations` a list of `base32lower` CIDs sorted as bytes, both filled from the governance state that commit-ordered leaves set, and a snapshot with either list unsorted or holding a duplicate is rejected (ADR-030 §1 outlets amendment, ADR-066 decisions 28, 30, and 31)",
         "A test vector fixes the serialized bytes of the seven governance fields for a fixed state, each identifier a 56-byte `str 8`, and deserialization rejects as malformed, one test each: an unsorted `member_since`; a duplicate conflict key; a duplicate executed proposal ID; a conflict-key tag of 4; a tag of 0 with a nil identifier; a tag of 3 with an identifier; a tag of 0 with a 32-byte `bin 8` identifier; an unsorted `recorded_proposals`; a `recorded_proposals` that names one identifier and kind twice; a `recorded_proposals` kind other than `ModifyCeiling` or `SetEconomicPolicy`; a `recorded_proposals` entry that names a non-member; an `economic_policy` whose bytes are not RFC 8785; a `member_since` or `reset_counter_floors` that omits a current member or names a non-member",
@@ -12922,7 +12987,8 @@
         "A creator whose cosignature window closes short of the quorum marks the checkpoint `PartiallyAttested` locally and sends no Commit for it, and no member's log holds it or prunes against it (ADR-031 §9 as ADR-066 decision 24 amends it); in a `SingleAdmin` context the admin sends a checkpoint Commit with an empty `cosignatures` array",
         "A Welcome joiner adopts a fetched snapshot only when SHA-256(serialize(snapshot)) equals the `Checkpoint` leaf's `state_snapshot_hash`, the leaf is included in the log whose head the Welcome's `0xFF04` extension carries, that extension's body hashes to the committed `log_head_hash`, and a consistency proof shows the leaf's `merkle_root` is the root of that log's first `event_count` leaves; it rejects, one test each, a snapshot with one changed field, a leaf absent from that log, and a `merkle_root` of a different prefix (ADR-030 §5 step 2 amendment, ADR-066 decision 24)",
         "Rule 14 at import and restore (`05-contexts.md` §5.13.3 rule 14, ADR-066 decision 27): an import and a restore each reject, before installing any governance engine, admin set, or TTL timer, a group whose committed `log_head_hash` differs from SHA-256 of the held log's BE64 count, Merkle root, and last leaf hash, and a group whose `0xFF02` extension omits `log_head_hash`, one test each, and accept the matching group verifying no leaf signature",
-        "CI-feature `cargo clippy` over the touched crates and their tests pass"
+        "CI-feature `cargo clippy` over the touched crates and their tests pass",
+        "ADR-067 M13: a joiner whose rebuilt merge stores do not hash to the committed `merge_state_hash` rejects the group and grants no right"
       ],
       "actionItems": [
         "Add the seven governance fields to `ContextStateSnapshot`, retype its identifiers and the checkpoint signer fields to `DID`, with their sorted canonical encoding and decoder rules, fill them at checkpoint creation, add `creator_key_state_head` and `CosignedCheckpoint.key_state_head`, and sign and verify checkpoints under `\"SCP-STATE-CHECKPOINT-V1:\"` in the log-anchored class",
@@ -12965,6 +13031,10 @@
         {
           "file": ".docs/specs/05-contexts.md",
           "section": "### 5.13.3 Creation"
+        },
+        {
+          "file": ".docs/adrs/phase-6.md",
+          "section": "## ADR-067: Concurrent Commits and fork merge"
         }
       ],
       "details": {}
@@ -13048,7 +13118,7 @@
         "crates/scp-runtime/src/context/governance_helpers.rs",
         "crates/scp-runtime/src/context/invitation_helpers.rs"
       ],
-      "description": "Per §7.3.1.1 of the trust spec ('The members a Commit adds') and the `0xFF04` row of §9.18.7 of the security spec, the committer of a Commit with an Add proposal places the `scp_event_log_head` extension, 72 bytes holding the log's count (u64 BE), Merkle root, and last leaf hash after the Commit's own leaves, in the Welcome's GroupInfo. The joiner grants no member any rights, its own role included, and sends no message a role authorizes, until the SCP-337 rebuild returns a count, root, and last leaf hash equal to the extension's; a mismatch is handled as §9.9.3 equivocation. The joiner trusts the extension only from the GroupInfo whose signature its Welcome processing verified, and only when SHA-256 of its 72-byte body equals the `log_head_hash` the group context commits (`05-contexts.md` §5.13.3 rule 14, ADR-066 decision 27), and the GroupInfo that carries it never leaves the Welcome in the clear. The Commit's own leaves and receiver steps are SCP-329 and SCP-330.",
+      "description": "Per §7.3.1.1 of the trust spec ('The members a Commit adds') and the `0xFF04` row of §9.18.7 of the security spec, the committer of a Commit with an Add proposal places the `scp_event_log_head` extension, 72 bytes holding the log's count (u64 BE), Merkle root, and last leaf hash after the Commit's own leaves, in the Welcome's GroupInfo. The joiner grants no member any rights, its own role included, and sends no message a role authorizes, until the SCP-337 rebuild returns a count, root, and last leaf hash equal to the extension's; a mismatch is handled as §9.9.3 equivocation. The joiner trusts the extension only from the GroupInfo whose signature its Welcome processing verified, and only when SHA-256 of its 72-byte body equals the `log_head_hash` the group context commits (`05-contexts.md` §5.13.3 rule 14, ADR-066 decision 27), and the GroupInfo that carries it never leaves the Welcome in the clear. The Commit's own leaves and receiver steps are SCP-329 and SCP-330. Under ADR-067 a joiner that holds two groups for one context reads each group's epoch table at the first epoch after the shared log prefix and keeps the group whose child there has the lower (rank, cth); a group whose journal shows the joiner's Add as a re-application, with an import equal to the other group's log after the prefix, wins; while neither rule decides, the joiner sends on neither group's governance.",
       "acceptanceCriteria": [
         "The extension encodes and decodes as 72 bytes, and decoding rejects any other length",
         "Two-node test: A adds C; C's Welcome GroupInfo carries the extension whose count and root equal A's log after the add; after the rebuild C holds A's role state and its own role",
@@ -13058,7 +13128,8 @@
         "openmls 0.9.0 discards the verified GroupInfo extensions when it builds the group (`creation.rs`), and `ProcessedWelcome::unverified_group_info()` is the only path that reads them. The joiner reads `0xFF04` from that unverified GroupInfo and trusts it only after the `StagedWelcome` built from the same `ProcessedWelcome` has verified the GroupInfo signature, and a test asserts that a GroupInfo whose extension bytes were altered after signing fails `StagedWelcome` construction and grants no rights",
         "The plaintext GroupInfo that `create_group_info_with_extensions` places in the commit bundle is never published or sent outside the Welcome: a test captures every blob the committer publishes for an add and finds no GroupInfo and no `0xFF04` bytes outside the Welcome ciphertext",
         "Committed head (`05-contexts.md` §5.13.3 rule 14, ADR-066 decision 27): a Welcome whose `0xFF04` body has a count, root, or head other than the one whose SHA-256 the group context's `log_head_hash` commits, though the GroupInfo signature verifies, leaves C with no rights and C rejects the group; a Welcome whose body matches is accepted; a test vector fixes SHA-256 of a fixed 72-byte body",
-        "CI-feature `cargo clippy` over the touched crates and their tests pass"
+        "CI-feature `cargo clippy` over the touched crates and their tests pass",
+        "ADR-067 joiners: a joiner holding two groups keeps the one whose child at the first epoch after the shared prefix has the lower (rank, cth), and sends no governance on either until a rule decides"
       ],
       "actionItems": [
         "Add the `0xFF04` extension codec",
@@ -13086,6 +13157,10 @@
         {
           "file": ".docs/specs/05-contexts.md",
           "section": "### 5.13.3 Creation"
+        },
+        {
+          "file": ".docs/adrs/phase-6.md",
+          "section": "## ADR-067: Concurrent Commits and fork merge"
         }
       ],
       "details": {}
@@ -13312,6 +13387,571 @@
         {
           "file": ".docs/adrs/phase-6.md",
           "section": "## ADR-066: Governance Leaves Ride the MLS Commit"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-357",
+      "title": "Patch openmls to stage a Commit without merging it, skip leaf lifetimes, and derive child init secrets from a punctured PPRF",
+      "gate": "gate-fork-merge",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "Cargo.toml",
+        "crates/scp-mls/src/group.rs",
+        "crates/scp-mls/src/provider.rs"
+      ],
+      "description": "ADR-067 M12 and the 'No clock' consequence, and `09-security-model.md` §9.7.2. openmls merges a Commit as one step and reads `SystemTime::now()` through `Lifetime::validate()`, so a device can neither hold two children of one parent nor reach a clock-free verdict. This story adds an openmls patch through `[patch.crates-io]` that (1) splits Commit validation from merge, so a device validates a sibling Commit against a retained parent without merging it; (2) threads `LeafNodeLifetimePolicy::Skip` so no verdict reads a clock; and (3) derives each child `init_secret` by the draft-kohbrok-mls-dmls-03 §4 schedule from a puncturable PRF over a tree of depth 8·Nh = 256, read MSB first. Retention of the states is SCP-350; the choice of child is SCP-351.",
+      "acceptanceCriteria": [
+        "The workspace `Cargo.toml` names the patched openmls under `[patch.crates-io]`, and `cargo tree -i openmls` shows exactly one openmls",
+        "A test validates two children of one parent state in either order, merges neither, and then merges each into its own copy of the parent; both copies reach their child's epoch",
+        "A test processes a KeyPackage and a LeafNode whose lifetime ended before the test's clock and accepts both under `LeafNodeLifetimePolicy::Skip`; a grep of the patched validation path finds no `SystemTime::now()` call on the Commit verdict path",
+        "`parent_init_secret = DeriveSecret(epoch_secret, \"parent_init\")`, `commit_confirmation = DeriveSecret(path_secret[n], \"conf\")`, and `init_secret_[n] = DeriveChildSecret(PPRF, \"child_init\", commit_confirmation, GroupContext_[n])` each reproduce the `25-test-vectors.md` PPRF vector",
+        "Each PPRF node expands by `ExpandWithLabel(node, \"tree\", \"left\" | \"right\", Nh)`; after a child is derived and punctured, deriving it again returns a typed error, and a sibling not yet derived still derives",
+        "An External Commit's child stays derivable from the retained parent until the parent is deleted, and a test asserts it"
+      ],
+      "actionItems": [
+        "Add the openmls patch and `[patch.crates-io]` entry",
+        "Split Commit validation from merge",
+        "Thread `LeafNodeLifetimePolicy::Skip`",
+        "Implement the PPRF schedule and puncture",
+        "Add the tests the criteria name"
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/adrs/phase-6.md",
+          "section": "## ADR-067: Concurrent Commits and fork merge"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.7.2 Forward Secrecy"
+        },
+        {
+          "file": ".docs/specs/25-test-vectors.md",
+          "section": "## 25.33 Concurrent-Commit Fork-Merge Vectors (`09-security-model.md` §9.5.2, §9.7.2, `07-trust-validation-and-capabilities.md` §7.3.1.1 \"Concurrent Commits and fork merge\")"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-350",
+      "title": "Retain every parent state in an encrypted BranchStore and delete non-tip states by two clocks",
+      "gate": "gate-fork-merge",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-mls/src/branch_store.rs",
+        "crates/scp-mls/src/lib.rs",
+        "crates/scp-mls/src/snapshot.rs",
+        "crates/scp-platform/src/apple/storage.rs",
+        "crates/scp-platform/src/android/storage.rs"
+      ],
+      "description": "ADR-067 M1 and `09-security-model.md` §9.7.2, with ADR-001 criterion 6 as ADR-067 amends it. A device keeps every parent state and its children, persisted in `BranchStore` (an openmls `StorageProvider` keyed by `state_id = SHA-256(group_id ‖ BE64 epoch ‖ cth)`) in the SQLCipher store with `PRAGMA secure_delete = ON`. It deletes a non-tip state at the earlier of W = 600 s of connected time of non-tip age and 7 days of local time after it first held a child of the state, runs `PRAGMA wal_checkpoint(TRUNCATE)` after each deletion, and keeps the path index for 7 days of local time. A retained state holds only the secrets ADR-067 M1 lists and none of its excluded list. The openmls patch is SCP-357.",
+      "acceptanceCriteria": [
+        "`BranchStore` persists a retained state under `state_id = SHA-256(group_id ‖ BE64 epoch ‖ cth)` and reloads it after a process restart",
+        "The store opens with `PRAGMA secure_delete = ON`, and every deletion is followed by `PRAGMA wal_checkpoint(TRUNCATE)`",
+        "A test advances connected time past 600 s of a state's non-tip age and asserts the state is gone; a second test leaves the device disconnected and advances local time past 7 days after it first held a child, and asserts the state is gone",
+        "A raw-bytes test reads the database file and its `-wal` file after a deletion and finds no byte string of any deleted key",
+        "The same raw-bytes test finds none of `epoch_secret`, `init_secret`, the unpunctured PPRF seed, the resumption PSK, `exporter_secret`, `epoch_authenticator`, `external_secret`, the expanded `encryption_secret`, the application ratchets, or the parent `confirmation_key` in any retained state",
+        "A retained state holds `membership_key` only when the context uses PublicMessage, and a test covers both cases",
+        "The path index (H and cth of every valid child, H of every refused Commit) is kept 7 days of local time and then deleted",
+        "A device offline for more than 7 days runs the `23-sync-and-offline-strategy.md` §23.5.1 reset on reconnect"
+      ],
+      "actionItems": [
+        "Implement `BranchStore` over the SQLCipher store",
+        "Implement the two-clock deletion and the path index",
+        "List the retained and excluded secrets in code",
+        "Add the raw-bytes test and the deletion tests"
+      ],
+      "blockedBy": [
+        "SCP-357"
+      ],
+      "sources": [
+        {
+          "file": ".docs/adrs/phase-6.md",
+          "section": "## ADR-067: Concurrent Commits and fork merge"
+        },
+        {
+          "file": ".docs/adrs/phase-1.md",
+          "section": "## ADR-001: MLS Wrapper (OpenMLS Integration)"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.7.2 Forward Secrecy"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-351",
+      "title": "Choose the canonical child by least (rank, cth) and send only under the fresh-tip rule or the rank-0 window",
+      "gate": "gate-fork-merge",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-mls/src/fork.rs",
+        "crates/scp-mls/src/lib.rs",
+        "crates/scp-runtime/src/context/governance_helpers.rs",
+        "crates/scp-runtime/src/context/actor/state.rs"
+      ],
+      "description": "ADR-067 M2, M2r, and M4, and `07-trust-validation-and-capabilities.md` §7.3.1.1 'Choosing and sending (M2, M4)'. At a state with more than one valid child, every device places the child with the least (rank, cth) on its canonical path, where rank(C) = (pos(I) − e) mod n_e and an External Commit by a non-member has rank n_e. A device publishes a child of its tip only when it holds no child of the tip and is current, or inside the rank-0 window: its identity has rank 0 at S_t, it obtained S_t from the first copy of S_t's Commit received by live push while current, it publishes within `D_MAX` (10 s) of that copy's arrival, it holds no child of S_t by its own identity, and the Commit carries a pending item or rebuilds its own losing Commit. A losing Commit is rebuilt at once on the new tip. Trial decryption of a frame against retained states at its epoch runs through `decrypt_with_sender_did`. Retention is SCP-350; the obligations are SCP-352.",
+      "acceptanceCriteria": [
+        "A test builds two children of one parent with known ranks and cths and asserts every device chooses the child with the least (rank, cth), whichever child it processed first",
+        "An External Commit by a non-member gets rank n_e and loses to every member child",
+        "Over n_e consecutive epochs with ids unchanged, each identity has rank 0 exactly once",
+        "A device that is not current, or that holds a child of its tip, does not publish under the fresh-tip rule",
+        "A rank-0 device that received S_t's Commit by live push while current publishes a window Commit within `D_MAX`; the same device given S_t from a backlog or a fetch sends no window Commit",
+        "A device sends at most one window Commit per pending item or rebuild, at the oldest eligible state",
+        "A device whose Commit loses rebuilds it on its new tip without waiting and sends it under whichever rule allows a send first",
+        "A frame that fails under the canonical state decrypts under a retained state at its epoch"
+      ],
+      "actionItems": [
+        "Implement rank and the choice",
+        "Implement the fresh-tip rule and the rank-0 window",
+        "Implement rebuild-and-send",
+        "Route trial decryption through retained states",
+        "Add the tests the criteria name"
+      ],
+      "blockedBy": [
+        "SCP-350"
+      ],
+      "sources": [
+        {
+          "file": ".docs/adrs/phase-6.md",
+          "section": "## ADR-067: Concurrent Commits and fork merge"
+        },
+        {
+          "file": ".docs/specs/07-trust-validation-and-capabilities.md",
+          "section": "###### Choosing and sending (M2, M4)"
+        },
+        {
+          "file": ".docs/specs/07-trust-validation-and-capabilities.md",
+          "section": "###### Terms"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-360",
+      "title": "Keep the journal, key ledger, epoch table, fork records, imports, and deadlines, and commit them in merge_state_hash",
+      "gate": "gate-fork-merge",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-protocol/src/context/governance/mod.rs",
+        "crates/scp-runtime/src/context/governance_helpers.rs",
+        "crates/scp-mls/src/context_extension.rs",
+        "crates/scp-event-log/src/lib.rs"
+      ],
+      "description": "ADR-067 M5a, M5b, M5d, M6, and M13, `07-trust-validation-and-capabilities.md` §7.3.1.1 'Fork record and import (M5)' and 'Journal, key ledger, and epoch table (M6)', and `05-contexts.md` §5.13.3 rules 11 and 16. The governance state gains the journal (with each entry's `prior` values), the key ledger, the epoch table (each row with its log count), the admitted fork records, the imports with their received leaves and deadlines, and the pending joiners. A receiver admits a fork record when F ≥ 1 and canonical holds leaf F−1, F is a log count in the epoch table, c − e_F ≤ K(e_F), and `end_count` − F ≤ K(e_F) · `MERGE_CARRY_ITEMS`. An import's leaves verify by chain, signature, and end checks; an import expires after K(e_F) canonical Commits without progress. Retention keeps every epoch e ≥ min{e′ : tip − e′ ≤ K(e′)} plus open-import pins. The `0xFF02` field `merge_state_hash` hashes the stores, with the epoch table through the parent epoch of the carrying Commit, so every Commit changes it. G and the re-check are SCP-335; the `merge` body item is SCP-328.",
+      "acceptanceCriteria": [
+        "A record with F = 0, an F that is no log count in the epoch table, depth c − e_F above K(e_F), or `end_count` − F above K(e_F) · `MERGE_CARRY_ITEMS` is rejected at every device; a record that meets all four is admitted, and an exact repeat changes nothing",
+        "Two records with one F and different ends are both admitted, and their coverage is the union",
+        "An import run whose first `prev_hash` differs from the hash of canonical leaf F−1, whose chain breaks, or whose leaf signature fails under the key ledger or a carried `LeafNode` is rejected; a run that passes is stored",
+        "An import completes only when its last leaf has count `end_count` and hash `end_leaf_hash` and every nested source a `ConcurrentReapplied` leaf names is present",
+        "An import expires exactly when K(e_F) canonical Commits pass after its last progress, and `end_count` changes neither the deadline nor the pin",
+        "After eviction, the journal and epoch table hold every epoch e ≥ min{e′ : tip − e′ ≤ K(e′)} and every entry after the F of an open import, at two devices with equal canonical paths and equal stores",
+        "`merge_state_hash` equals the `25-test-vectors.md` merge-state vector; the hashed epoch table stops at the parent epoch of the carrying Commit; a Commit with an empty block changes only `merge_state_hash` in its `0xFF02` extension",
+        "A Welcome joiner, an importer, and a restorer reject a group whose rebuilt stores do not hash to the committed `merge_state_hash`, and a merge state holding an integer above 2^53 − 1 rejects the Commit"
+      ],
+      "actionItems": [
+        "Add the stores to the governance state",
+        "Implement record admission and import verification",
+        "Implement deadlines and retention",
+        "Add `merge_state_hash` to the `0xFF02` extension and rule 11's recompute",
+        "Add the tests the criteria name"
+      ],
+      "blockedBy": [
+        "SCP-351",
+        "SCP-335"
+      ],
+      "sources": [
+        {
+          "file": ".docs/adrs/phase-6.md",
+          "section": "## ADR-067: Concurrent Commits and fork merge"
+        },
+        {
+          "file": ".docs/specs/07-trust-validation-and-capabilities.md",
+          "section": "###### Fork record and import (M5)"
+        },
+        {
+          "file": ".docs/specs/07-trust-validation-and-capabilities.md",
+          "section": "###### Journal, key ledger, and epoch table (M6)"
+        },
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.13.3 Creation"
+        },
+        {
+          "file": ".docs/specs/25-test-vectors.md",
+          "section": "## 25.33 Concurrent-Commit Fork-Merge Vectors (`09-security-model.md` §9.5.2, §9.7.2, `07-trust-validation-and-capabilities.md` §7.3.1.1 \"Concurrent Commits and fork merge\")"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-352",
+      "title": "Carry the pending set in every honest Commit under the five fork-merge obligations",
+      "gate": "gate-fork-merge",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-runtime/src/context/governance_helpers.rs",
+        "crates/scp-runtime/src/context/actor/handlers/governance.rs",
+        "crates/scp-runtime/src/context/actor/commands.rs"
+      ],
+      "description": "ADR-067 M3 and M11, and `07-trust-validation-and-capabilities.md` §7.3.1.1 'Pending set and obligations (M3, M11)'. A new `reapply_pending` builds the pending items each Commit carries: unrecorded records (up to four), the oldest needed import leaves, then re-applications with complete evidence, at most `MERGE_CARRY_ITEMS` items before the member's own action. A change no branch executed is re-issued natively at once after the re-check and the 'Conflicts' gate; the author device of a losing child sends its record at once; a holder of a pending restrictive-only change commits it before its next application message; a re-application waits for every change in its `seen` that is in U. A new `GovernanceCommand::ReapplyPending` and `GovernanceCommand::RecordFork` reach it through the actor. Record admission and imports are SCP-360; G is SCP-335.",
+      "acceptanceCriteria": [
+        "A Commit built while items are pending carries them in the stated order and never more than `MERGE_CARRY_ITEMS` of them, and the member's own action is always present",
+        "A carrier skips an item that is not admissible or whose evidence fails, and still builds its Commit",
+        "A change of a Commit that no relay stored is re-issued natively with its original identity after the re-check; a re-issued Add uses a fresh KeyPackage; a change canonical already executed or settled is not re-issued",
+        "The rebuild of a losing child that a relay stored carries the child's record and its re-application, not a native re-issue",
+        "The author device of a losing child sends the record in its next Commit, or at once in a record-only Commit; a non-author holder sends no record-only Commit",
+        "A device holding a pending restrictive-only change cannot send an application message until it has committed that change",
+        "A re-application whose `seen` holds an unexecuted change of U is not carried until that change executes or is settled",
+        "`Supervisor` dispatch reaches `reapply_pending` through the actor mailbox, and `pipeline_wiring.rs` asserts the path"
+      ],
+      "actionItems": [
+        "Implement `reapply_pending`",
+        "Implement obligations 1 to 5 and the send barrier",
+        "Add `GovernanceCommand::ReapplyPending` and `RecordFork`",
+        "Wire dispatch and `pipeline_wiring.rs`",
+        "Add the tests the criteria name"
+      ],
+      "blockedBy": [
+        "SCP-360"
+      ],
+      "sources": [
+        {
+          "file": ".docs/adrs/phase-6.md",
+          "section": "## ADR-067: Concurrent Commits and fork merge"
+        },
+        {
+          "file": ".docs/specs/07-trust-validation-and-capabilities.md",
+          "section": "###### Pending set and obligations (M3, M11)"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-353",
+      "title": "Fetch every child of an obtained parent, republish the canonical child, send ForkNotice, and excuse only authenticated fork positions",
+      "gate": "gate-fork-merge",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-runtime/src/context/actor/handlers/messaging.rs",
+        "crates/scp-runtime/src/context/supervisor/supervisor.rs",
+        "crates/scp-runtime/src/context/governance_helpers.rs",
+        "crates/scp-event-log/src/lib.rs"
+      ],
+      "description": "ADR-067 M9, M14, M15, and M16, `23-sync-and-offline-strategy.md` §23.4.1 receipt rules 1 to 4 and §23.7, `09-security-model.md` §9.5.2, §9.9.3, and §9.9.4, and `07-trust-validation-and-capabilities.md` §7.3.1.1 'Fork evidence (M16)'. After a device obtains any parent it fetches every child from every listed relay, republishes its canonical child once per switch, and serves every kept child in a `CommitRangeResponse`. It publishes a `ForkNotice` (separator `SCP-FORK-NOTICE-V1:`, eight fields) on a refusal or a split, and drops notices by the §9.9.3 rules; a notice only starts a fetch and adds to `GroupSplit`. The M16 predicate excuses a log disagreement only at a fork point F the device authenticated by (i) or (ii), at six entry points. New `GovernanceCommand::FetchChildren`, `PublishForkNotice`, and a `ForkNotice` intake reach `Supervisor::deliver_commit_blob` → `handle_deliver_incoming`. Log truncation is SCP-359.",
+      "acceptanceCriteria": [
+        "After a device obtains a parent, it requests that parent's children from every listed relay, and a test with a relay serving a child to one device only ends with both devices holding it",
+        "At a parent with more than one valid child, the device republishes its canonical child once per switch, including a child it authored",
+        "A Commit no held state takes, at an epoch at or below the device's horizon, is refused and indexed, and a `refused` notice is published at most once per 24 h per H",
+        "`ForkNotice` encodes to the `25-test-vectors.md` notice vector; a notice with a bad signature, a differing `member_since`, a `reset_counter` below the floor, a sender that joined after S_e, or a repeated (sender, e, `own_child`, `other_child`) is dropped",
+        "A notice that passes starts one fetch, and adds the sender to `GroupSplit` only under rule (b); it changes no state and excuses no disagreement",
+        "A log disagreement at F is excused only with evidence (i), two valid children with differing MLS sender leaf indices, or (ii), a truncation at F, plus a matching leaf F−1; an excused disagreement raises no `EquivocationDetected`, sends no `EquivocationAlert`, applies no `equivocation_policy`, and flags no relay in ADR-012 scoring",
+        "The excuse lapses, and the full §9.9.3 response runs, when an all-relay fetch completes without (i) or (ii), or when the device deletes S_e; a relay-injected refused blob leaves §9.9.3 active",
+        "Each of the six entry points (spec 07 'Deduplication with replication' and 'The members a Commit adds', spec 23 §23.7 steps 3 and 4, spec 09 §9.9.3 and §9.9.4) calls the one predicate, and a test drives each",
+        "The committer merges its own Commit only when a listed relay accepts it or a fetch returns its bytes, republishes to every relay that lacks it, and keeps a staged Commit no relay returned as a candidate child"
+      ],
+      "actionItems": [
+        "Implement receipt rules 1 to 4 and republish",
+        "Implement `ForkNotice` send, intake, and drop rules",
+        "Implement the M16 predicate and call it at the six entry points",
+        "Wire the governance commands, dispatch, and `pipeline_wiring.rs`",
+        "Add the tests the criteria name"
+      ],
+      "blockedBy": [
+        "SCP-351",
+        "SCP-359"
+      ],
+      "sources": [
+        {
+          "file": ".docs/adrs/phase-6.md",
+          "section": "## ADR-067: Concurrent Commits and fork merge"
+        },
+        {
+          "file": ".docs/specs/23-sync-and-offline-strategy.md",
+          "section": "### 23.4.1 Commit Recovery Sources"
+        },
+        {
+          "file": ".docs/specs/23-sync-and-offline-strategy.md",
+          "section": "## 23.7 Event Log Reconciliation"
+        },
+        {
+          "file": ".docs/specs/23-sync-and-offline-strategy.md",
+          "section": "### 23.16.3 CommitRangeResponse"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.5.2 Signed Structure Definitions"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.9.3 Equivocation Detection — Relay Consistency Protocol"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.9.4 Selective Suppression of MLS Commits"
+        },
+        {
+          "file": ".docs/specs/07-trust-validation-and-capabilities.md",
+          "section": "###### Fork evidence (M16)"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-359",
+      "title": "Truncate the event log at a fork point on a switch and keep the truncated leaves as BranchLeaf records",
+      "gate": "gate-fork-merge",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-event-log/src/lib.rs",
+        "crates/scp-runtime/src/context/governance_helpers.rs"
+      ],
+      "description": "ADR-067 'Retention of governance state, joiners, and the event log' and `07-trust-validation-and-capabilities.md` §7.3.1.1 'Fork evidence (M16)', paragraph 'The canonical log'. A device that switches its canonical path adopts the retained governance state, truncates its log at F with a new truncate in `scp-event-log`, writes a truncation record that M16 evidence (ii) reads, and keeps the truncated leaves as `BranchLeaf` records it serves. A re-application takes new sequence numbers and begins with a `ConcurrentReapplied` leaf; `ConcurrentDrop` leaves record what fell in D or failed the re-check.",
+      "acceptanceCriteria": [
+        "A truncate at F leaves the log's count at F and its Merkle root equal to the root at count F before the truncate",
+        "A truncation record is written on every switch and names F, and the M16 predicate reads it as evidence (ii)",
+        "The truncated leaves are kept as `BranchLeaf` records and returned to a peer that requests them",
+        "A re-application's first derived leaf is a `ConcurrentReapplied` leaf naming the change identity and its source (F, `end_leaf_hash`, `sequence`), and each dropped change gets one `ConcurrentDrop` leaf naming its `change_id` and rule"
+      ],
+      "actionItems": [
+        "Add the truncate operation and truncation record",
+        "Add `BranchLeaf` storage and serving",
+        "Add the `ConcurrentReapplied` and `ConcurrentDrop` leaf types",
+        "Add the tests the criteria name"
+      ],
+      "blockedBy": [
+        "SCP-351"
+      ],
+      "sources": [
+        {
+          "file": ".docs/adrs/phase-6.md",
+          "section": "## ADR-067: Concurrent Commits and fork merge"
+        },
+        {
+          "file": ".docs/specs/07-trust-validation-and-capabilities.md",
+          "section": "###### Fork evidence (M16)"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-354",
+      "title": "Reconcile the MLS tree with G's membership after each Commit",
+      "gate": "gate-fork-merge",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-runtime/src/context/governance_helpers.rs",
+        "crates/scp-mls/src/group.rs",
+        "crates/scp-mls/src/key_package.rs"
+      ],
+      "description": "ADR-067 M8 and `07-trust-validation-and-capabilities.md` §7.3.1.1 'The merge function G (M6, M8)', paragraph 'Tree reconciliation (M8)'. After each Commit the tree's leaves match G's membership: a Commit carries a Remove proposal for every leaf whose identity or device G holds absent, or it is invalid, and a member or device that G holds present with no leaf is a pending joiner that any member adds with a fresh KeyPackage from the joiner's buffer. `10-infrastructure-and-self-hosting.md` §10.8.1 gives the device Add identity.",
+      "acceptanceCriteria": [
+        "A receiver rejects a Commit that omits a Remove proposal for a leaf G holds absent",
+        "A test where Bob adds Dan on a losing branch ends with Dan added on canonical from a fresh KeyPackage, and no KeyPackage is used twice",
+        "A pending joiner with no published KeyPackage stays pending and is added once one is published",
+        "The `ConcurrentAdminActionUndone` notice fires when reconciliation removes a leaf an admin added"
+      ],
+      "actionItems": [
+        "Compute reconciliation proposals from G's membership",
+        "Add pending joiners from the KeyPackage buffer",
+        "Add the tests the criteria name"
+      ],
+      "blockedBy": [
+        "SCP-335"
+      ],
+      "sources": [
+        {
+          "file": ".docs/adrs/phase-6.md",
+          "section": "## ADR-067: Concurrent Commits and fork merge"
+        },
+        {
+          "file": ".docs/specs/07-trust-validation-and-capabilities.md",
+          "section": "###### The merge function G (M6, M8)"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.8.1 Multi-Device MLS Participation Model"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-355",
+      "title": "Sign a DepartureRequest when a member leaves so any member can re-execute the departure",
+      "gate": "gate-fork-merge",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-runtime/src/context/lifecycle_helpers.rs",
+        "crates/scp-protocol/src/context/governance/mod.rs"
+      ],
+      "description": "ADR-067 M10 and `09-security-model.md` §9.5.2. `leave_context` emits a `DepartureRequest` (separator `SCP-DEPARTURE-V1:`, `context_id`, `member_did`, `member_since`, `leaf_key_hash`) signed under the member's leaf `signature_key`, so any member can re-execute a departure from a losing branch after the member has uninstalled. The departure's change identity is the request's hash (`07-trust-validation-and-capabilities.md` §7.3.1.1 'Terms').",
+      "acceptanceCriteria": [
+        "`DepartureRequest` encodes to the `25-test-vectors.md` departure vector",
+        "`leave_context` publishes a signed `DepartureRequest` before it destroys the member's keys",
+        "A receiver verifies the request under a leaf key whose hash is in its tree or key ledger, and rejects one whose key is in neither",
+        "A test where Carol leaves on a losing branch and uninstalls ends with her departure re-executed on canonical by another member"
+      ],
+      "actionItems": [
+        "Define and sign `DepartureRequest`",
+        "Emit it from `leave_context`",
+        "Verify it on re-execution",
+        "Add the tests the criteria name"
+      ],
+      "blockedBy": [
+        "SCP-360"
+      ],
+      "sources": [
+        {
+          "file": ".docs/adrs/phase-6.md",
+          "section": "## ADR-067: Concurrent Commits and fork merge"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.5.2 Signed Structure Definitions"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-361",
+      "title": "Add the member:X conflict key to AddMember, device Add, RemoveMember, and departure",
+      "gate": "gate-fork-merge",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-protocol/src/context/governance/mod.rs",
+        "crates/scp-runtime/src/context/governance_helpers.rs"
+      ],
+      "description": "ADR-067 M3 obligation 1 and `07-trust-validation-and-capabilities.md` §7.3.1.1 'Conflicts' and 'Pending set and obligations (M3, M11)'. `AddMember` for X, a device Add for X, `RemoveMember` for X, and X's departure hold the conflict key `member:X`, which the governance state keeps after X leaves, so an Add of X loses to a Remove of X executed at or after the Add's `anchor_seq`, and a new invitation anchored after the Remove passes. ADR-031 §7 lists the pair. This is the one change to a history with no fork.",
+      "acceptanceCriteria": [
+        "`change_seq[member:X]` is set by each of the four actions and kept after X leaves",
+        "An `AddMember` for X whose `anchor_seq` is at or below the sequence of an executed Remove of X is rejected by the 'Conflicts' gate",
+        "An `AddMember` for X anchored after that Remove executes",
+        "The `25-test-vectors.md` pair-table rows 3, 4, and 19 pass"
+      ],
+      "actionItems": [
+        "Add `member:X` to the conflict keys",
+        "Keep it in the governance state after X leaves",
+        "Add the tests the criteria name"
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/adrs/phase-6.md",
+          "section": "## ADR-067: Concurrent Commits and fork merge"
+        },
+        {
+          "file": ".docs/specs/07-trust-validation-and-capabilities.md",
+          "section": "###### Pending set and obligations (M3, M11)"
+        },
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "## 5.9 Governance"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-356",
+      "title": "Surface the fork-merge notices to the app through every FFI bridge and SDK",
+      "gate": "gate-fork-merge",
+      "priority": "P1",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-ffi/common/src/context_event.rs",
+        "crates/scp-ffi/src/lib.rs",
+        "bindings/swift/Sources/SCP/Governance.swift",
+        "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/SCP.kt",
+        "bindings/typescript/src/scp.ts",
+        "bindings/python/scp_sdk/scp.py",
+        ".docs/standards/sdk-capability-matrix.json"
+      ],
+      "description": "ADR-067 'What people see'. The SDK raises `ConcurrentChangeDropped`, `ConcurrentChangeExpired`, `ConcurrentChangePending`, `ConcurrentAdminActionUndone`, `ConcurrentRemovalStands`, `GovernanceUnavailable`, `JoinCancelled`, `GroupSplit { members, can_rejoin }`, and the joiner's gap marker, with the texts ADR-067 gives, through every FFI bridge and SDK, and the capability matrix lists `context.concurrent_commit_merge` and the nine events.",
+      "acceptanceCriteria": [
+        "Each of the nine events is a variant of the FFI context event and reaches the Swift, Kotlin, TypeScript, and Python SDKs, and a test per SDK receives it",
+        "`GroupSplit` carries `members` and `can_rejoin`, and the app text uses the second sentence ADR-067 gives when `can_rejoin` is false",
+        "`.docs/standards/sdk-capability-matrix.json` lists `context.concurrent_commit_merge` and the nine events, and `scripts/check-sdk-coverage.py` passes"
+      ],
+      "actionItems": [
+        "Add the events to the FFI context event",
+        "Export them through every bridge and SDK",
+        "Add the capability matrix entries",
+        "Add the tests the criteria name"
+      ],
+      "blockedBy": [
+        "SCP-352",
+        "SCP-353",
+        "SCP-354"
+      ],
+      "sources": [
+        {
+          "file": ".docs/adrs/phase-6.md",
+          "section": "## ADR-067: Concurrent Commits and fork merge"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-358",
+      "title": "Simulate concurrent Commits across 2 to 7 members with 1 to 3 devices and assert Theorem S and the residual bounds",
+      "gate": "gate-fork-merge",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-testing/tests/integration/fork_merge_simulation.rs",
+        "crates/scp-testing/tests/integration/pipeline_wiring.rs"
+      ],
+      "description": "ADR-067 'X and Theorem S', 'Convergence', and 'Residuals (accepted)'. A simulation over 2 to 7 members with 1 to 3 devices each drives random histories, nested forks included, through the production paths and asserts the outcomes the record states.",
+      "acceptanceCriteria": [
+        "Theorem S holds over random histories with nested forks: every device ends with state G((P ∪ L) \\ X)",
+        "A record released at depth 200 is rejected at every device",
+        "A fabricated leaf whose author lacked the right at F is dropped with a `ConcurrentDrop` leaf",
+        "A 2-member, 2-device fork in which both members committed on the losing branch is recorded and re-applied",
+        "A lost acknowledgement and a partial publish converge with no change identity executed twice",
+        "Lemma 4 holds against an automation committing 10 times per second while the loser stays connected",
+        "A device's own Commit wins within n_t canonical epochs while ids is unchanged",
+        "A relay-injected refused blob leaves §9.9.3 active, and a forged or replayed `ForkNotice` changes nothing a person sees",
+        "A late sibling past retention gives `GroupSplit` on both sides and no equivocation event"
+      ],
+      "actionItems": [
+        "Build the simulation harness over the production paths",
+        "Add one test per criterion"
+      ],
+      "blockedBy": [
+        "SCP-352",
+        "SCP-353",
+        "SCP-354",
+        "SCP-355",
+        "SCP-361"
+      ],
+      "sources": [
+        {
+          "file": ".docs/adrs/phase-6.md",
+          "section": "## ADR-067: Concurrent Commits and fork merge"
         }
       ],
       "details": {}
