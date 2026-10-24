@@ -690,13 +690,13 @@ fn handle_relay_frame_drops_unknown_routing_and_surfaces_relay_err() {
         routing_id: [0x99u8; 32],
         blob_id: [0u8; 32],
         recipient_hint: None,
-        blob_ttl: 300,
+        blob_ttl: DEFAULT_APP_DATA_BLOB_TTL_SECS,
         stored_at: 0,
         blob: OuterEnvelope::from_bytes(
             &scp_protocol::envelope::outer::create_outer_envelope(
                 &[0u8; 32],
                 None,
-                300,
+                DEFAULT_APP_DATA_BLOB_TTL_SECS,
                 vec![1, 2, 3],
             )
             .unwrap()
