@@ -1,6 +1,6 @@
 {
   "project": "Push notifications (\u00a710.7)",
-  "description": "Builds the \u00a710.7 push path: relays store signed push registrations and send a wake signal through APNs, FCM and WebPush when a message arrives for a registered routing ID, and devices accept the wake, connect, and pull pending envelopes. The keri workstream owns the one function that checks a registration's signature against the identity's key state (\u00a710.7.1 step 3); this PRD owns that function's interface, the relay code that calls it, and the error mapping (PUSH-005). Until keri replaces the stub body, every relay with push enabled answers 5003 and accepts no registration. PUSH-001 to PUSH-003 amend the specs and ADRs first, so each code story cites a section that already states its requirement. Alec ruled on 2026-10-12 that a registration lists routing IDs in place of plaintext context IDs (D5), that the registration key includes the device token so that each device registers separately (D6), and that WebPush is specified fully in a later gate (D3), which gate-push-webpush holds (PUSH-021 to PUSH-024).",
+  "description": "Builds the \u00a710.7 push path: relays store signed push registrations and send a wake signal through APNs, FCM and WebPush when a message arrives for a registered routing ID, and devices accept the wake, connect, and pull pending envelopes. The keri workstream owns the one function that checks a registration's signature against the identity's key state (\u00a710.7.1 step 3); this PRD owns that function's interface, the relay code that calls it, and the error mapping (PUSH-005). Until keri replaces the stub body, every relay with push enabled answers 5003 and accepts no registration. PUSH-001 to PUSH-003 amend the specs and ADRs first, so each code story cites a section that already states its requirement. Alec ruled on 2026-10-12 that a registration lists routing IDs in place of plaintext context IDs (D5), that the registration key includes the device token so that each device registers separately (D6), and that WebPush is specified fully in a later gate (D3), which gate-push-webpush holds (PUSH-021 to PUSH-024). Alec ruled on 2026-10-24 that the protocol drops the per-device-token push rate limit (\"I feel like we should remove the limit\", then \"So remove it and b done yes?\"), so this PRD dropped PUSH-009, the story titled \"Rate limit of one push per 30 s per token\". The reasoning Alec accepted: push credentials belong to each app developer, so a flood of wakes uses up only that developer's own provider quota, and any limit is that developer's relay policy, which \u00a710.7.1 step 5 **Relay limits** permits and the protocol does not set.",
   "gates": [
     {
       "id": "gate-push-spec",
@@ -21,7 +21,6 @@
         "PUSH-006",
         "PUSH-007",
         "PUSH-008",
-        "PUSH-009",
         "PUSH-010",
         "PUSH-011",
         "PUSH-012",
@@ -628,50 +627,6 @@
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
           "section": "### 17.17.2 Security Classification of Development Arms"
-        }
-      ],
-      "details": {
-        "checklist": {
-          "dispatch": "n/a",
-          "ffi": "n/a",
-          "sdk": "n/a",
-          "pw": "n/a",
-          "matrix": "n/a"
-        }
-      }
-    },
-    {
-      "id": "PUSH-009",
-      "title": "Rate limit of one push per 30 s per token",
-      "gate": "gate-push-relay",
-      "priority": "P0",
-      "severity": "major",
-      "status": "pending",
-      "files": [
-        "crates/scp-transport/src/relay/rate_limit.rs",
-        "crates/scp-transport/src/relay/push_dispatch.rs"
-      ],
-      "description": "\u00a710.7.1 step 6 requires at most one push per 30 seconds per device token. The limiter keys entries by SHA-256 of the token, so no second map holds plaintext tokens. A push suppressed inside the window is dropped, not deferred, because the device pulls every pending envelope on its next wake (\u00a710.7). The relay prunes expired entries.",
-      "acceptanceCriteria": [
-        "Two publishes 1 s apart to one token's routing ID produce exactly one sender call.",
-        "A publish 30 s after the first produces a second call.",
-        "Two different tokens are limited independently.",
-        "The limiter's memory is bounded by the number of active tokens; a test checks the entry count after pruning."
-      ],
-      "actionItems": [
-        "Write the per-token limiter and call it from the dispatcher."
-      ],
-      "blockedBy": [
-        "PUSH-008"
-      ],
-      "sources": [
-        {
-          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
-          "section": "### 10.7.1 Push Registration Protocol"
-        },
-        {
-          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
-          "section": "## 10.7 Notifications and Push"
         }
       ],
       "details": {
