@@ -27,10 +27,12 @@
 //! second at that time, which is above every `timestamp` sent before. The
 //! retries end once one relay has answered `4062` to every message of one
 //! request for more than [`STALE_RUN_BOUND_SECS`] (twice
-//! [`PUSH_TIMESTAMP_SKEW_SECS`]) of the device clock: a timestamp floor the
-//! relay holds clears within twice the skew window, so a relay still
-//! refusing after it is refusing the device clock itself, and the registrar
-//! records the refusal as it records any other (§10.7.1 **Freshness**).
+//! [`PUSH_TIMESTAMP_SKEW_SECS`]) of elapsed time on the device's monotonic
+//! clock: a timestamp floor the relay holds clears within twice the skew
+//! window, so a relay still refusing after it is refusing the device clock
+//! itself, and the registrar records the refusal as it records any other
+//! (§10.7.1 **Freshness**). A step of the device's wall clock does not count
+//! toward the run.
 //!
 //! [`PushRegistrar::spawn_trigger`] moves the registrar into one task, which
 //! serializes every reconcile and command. The task reconciles at start and
@@ -44,7 +46,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::future::BoxFuture;
-use scp_clock::Clock;
+use scp_clock::{Clock, MonotonicClock};
 use scp_crypto::p256::{COMPRESSED_POINT_LEN, P256PublicKey, SIGNATURE_LEN, verify_prehash_strict};
 use scp_did::DID;
 use scp_platform::traits::Storage;
@@ -80,17 +82,24 @@ const MAX_SECOND_WAITS: u32 = 3;
 /// for its reply, so a caller holds at most one slot.
 const COMMAND_CAPACITY: usize = 4;
 
-/// How many seconds of the device clock a run of `4062` answers to one
-/// request may span before the registrar stops retrying it.
+/// How many seconds of elapsed time, on the device's monotonic clock, a run
+/// of `4062` answers to one request may span before the registrar stops
+/// retrying it.
 ///
-/// Let `t1` be the device second of the first `4062`, `d` the relay's clock
-/// minus the device's, and `F` the floor the relay holds (the last
-/// `timestamp` it accepted). The relay accepted `F` at a relay second at or
-/// below `t1 + d`, and only if `F` was at most [`PUSH_TIMESTAMP_SKEW_SECS`]
-/// ahead of it, so `F <= t1 + d + PUSH_TIMESTAMP_SKEW_SECS`. While the relay
-/// accepts the device clock at all, `|d| <= PUSH_TIMESTAMP_SKEW_SECS`, so
-/// `F <= t1 + 2 * PUSH_TIMESTAMP_SKEW_SECS`, and every `timestamp` sent more
-/// than this many seconds after `t1` is above `F` (§10.7.1 **Freshness**).
+/// Let `R1` be the relay's clock at the first `4062` and `F` the floor the
+/// relay holds (the last `timestamp` it accepted). The relay accepted `F` at
+/// a relay second at or below `R1`, and only if `F` was at most
+/// [`PUSH_TIMESTAMP_SKEW_SECS`] ahead of it, so `F <= R1 + 300`. After `e`
+/// seconds of elapsed time the relay's clock reads `R1 + e` and the device's
+/// wall clock reads `R1 + e - d`, where `d` is the relay's clock minus the
+/// device's at that moment; `d` absorbs every step of the device's wall
+/// clock in between. The next `timestamp` is that wall-clock second, which
+/// is above `F` once `e > d + 300`. While the relay accepts the device clock
+/// at all, `d <= 300`, so `e > 600` suffices (§10.7.1 **Freshness**).
+///
+/// The bound assumes the relay's clock does not step during the run and the
+/// device's monotonic clock runs no faster than real time. A monotonic clock
+/// that stops while the device sleeps only lengthens the run.
 const STALE_RUN_BOUND_SECS: u64 = 2 * PUSH_TIMESTAMP_SKEW_SECS;
 
 // ---------------------------------------------------------------------------
@@ -178,8 +187,8 @@ pub enum PushError {
         msg: String,
     },
     /// The relay answered `4062` to every message of one request for more
-    /// than [`STALE_RUN_BOUND_SECS`] of the device clock, measured from the
-    /// first of those answers. A floor the relay holds (the last `timestamp`
+    /// than [`STALE_RUN_BOUND_SECS`] of elapsed time on the device's
+    /// monotonic clock, measured from the first of those answers. A floor the relay holds (the last `timestamp`
     /// it accepted) clears within that span, so this relay is refusing the
     /// device clock, which is outside the relay's skew window (§10.7.1
     /// **Freshness**). The registrar does not send a refused registration
@@ -187,13 +196,12 @@ pub enum PushError {
     /// deregistration until the relay is wanted again under the current
     /// token; a [`PushRegistrarTask::register`] or
     /// [`PushRegistrarTask::deregister_all`] command clears either.
-    #[error(
-        "relay refused every push timestamp as stale (4062) for {span_secs} s of the device clock: {msg}"
-    )]
+    #[error("relay refused every push timestamp as stale (4062) for {span_secs} s: {msg}")]
     StaleBeyondSkew {
         /// The relay's sanitized text of the last `4062`.
         msg: String,
-        /// Device-clock seconds from the first `4062` of the run to the last.
+        /// Elapsed seconds on the device's monotonic clock from the first
+        /// `4062` of the run to the last.
         span_secs: u64,
     },
     /// `4063` `PUSH_NOT_SUPPORTED`.
@@ -531,6 +539,9 @@ pub struct PushRegistrarConfig<C: KeyCustody, S: Storage> {
     pub publisher: Arc<dyn PushRelayPublisher>,
     /// The clock every `timestamp` is read from.
     pub clock: Arc<dyn Clock>,
+    /// The elapsed-time clock a run of `4062` answers is measured on, so a
+    /// step of `clock` does not end the run's retries.
+    pub monotonic_clock: Arc<dyn MonotonicClock>,
     /// The push platform the token belongs to. `WebPush` is refused.
     pub platform: PushPlatform,
     /// The platform's device token. Never empty.
@@ -584,8 +595,9 @@ struct Refusal {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StaleRun {
     request: Request,
-    /// The device clock's second at the first `4062` of the run.
-    first_secs: u64,
+    /// The monotonic clock's reading, in milliseconds, at the first `4062`
+    /// of the run.
+    first_millis: u64,
 }
 
 /// Whether [`PushRegistrar::forget_stale_refusals`] also drops the refusals
@@ -614,6 +626,7 @@ pub struct PushRegistrar<C: KeyCustody, S: Storage> {
     signing_key: PushSigningKey<C>,
     publisher: Arc<dyn PushRelayPublisher>,
     clock: Arc<dyn Clock>,
+    monotonic_clock: Arc<dyn MonotonicClock>,
     platform: PushPlatform,
     token: PushToken,
     storage: Arc<ProtocolRepository<S>>,
@@ -678,6 +691,7 @@ impl<C: KeyCustody, S: Storage> PushRegistrar<C, S> {
             signing_key: config.signing_key,
             publisher: config.publisher,
             clock: config.clock,
+            monotonic_clock: config.monotonic_clock,
             platform: config.platform,
             token: config.token,
             storage: config.storage,
@@ -750,17 +764,25 @@ impl<C: KeyCustody, S: Storage> PushRegistrar<C, S> {
     /// relay whose step failed keeps its ledger record, so the next reconcile
     /// sends it again.
     ///
+    /// Before it reads any refusal, it prunes the refusals against the
+    /// supervisor's current routes under the old token, so a deregistration
+    /// refusal that a relay wanted again has cleared does not stop the old
+    /// token's deregistration there.
+    ///
     /// # Errors
     ///
     /// [`PushError::Message`] with [`PushMessageError::EmptyToken`] when
-    /// `new_token` is empty; nothing is published and the token is kept.
+    /// `new_token` is empty, and [`PushError::Routes`] when the routing-ID
+    /// query fails; in both cases nothing is published and the token is kept.
     pub async fn refresh_token(
         &mut self,
+        supervisor: &Supervisor,
         new_token: PushToken,
     ) -> Result<RelayOutcomes, PushError> {
         if new_token.is_empty() {
             return Err(PushMessageError::EmptyToken.into());
         }
+        self.prune_refusals(supervisor, StaleBound::Keep).await?;
         let old_token = std::mem::replace(&mut self.token, new_token);
         let old_hash = token_hash(&old_token);
         let previous = std::mem::take(&mut self.accepted);
@@ -826,18 +848,7 @@ impl<C: KeyCustody, S: Storage> PushRegistrar<C, S> {
         supervisor: &Supervisor,
         stale_bound: StaleBound,
     ) -> Result<RelayOutcomes, PushError> {
-        let current = if self.enabled {
-            Box::pin(supervisor.push_routing_ids())
-                .await
-                .map_err(PushError::Routes)?
-        } else {
-            BTreeMap::new()
-        };
-        let wanted: BTreeMap<String, BTreeSet<[u8; 32]>> = current
-            .into_iter()
-            .filter(|(_, routing_ids)| !routing_ids.is_empty())
-            .collect();
-        self.forget_stale_refusals(&wanted, stale_bound);
+        let wanted = self.prune_refusals(supervisor, stale_bound).await?;
         let current_hash = token_hash(&self.token);
         let mut outcomes = RelayOutcomes::default();
 
@@ -928,6 +939,35 @@ impl<C: KeyCustody, S: Storage> PushRegistrar<C, S> {
         }
     }
 
+    /// Reads the routing IDs the registrar wants per relay (none while it is
+    /// disabled) and prunes `refused` and `stale_runs` against them under
+    /// the current token. Every operation that reads `refused` calls this
+    /// first, so none acts on a refusal a route change has already cleared.
+    ///
+    /// # Errors
+    ///
+    /// [`PushError::Routes`] when the routing-ID query fails; nothing is
+    /// pruned.
+    async fn prune_refusals(
+        &mut self,
+        supervisor: &Supervisor,
+        stale_bound: StaleBound,
+    ) -> Result<BTreeMap<String, BTreeSet<[u8; 32]>>, PushError> {
+        let current = if self.enabled {
+            Box::pin(supervisor.push_routing_ids())
+                .await
+                .map_err(PushError::Routes)?
+        } else {
+            BTreeMap::new()
+        };
+        let wanted: BTreeMap<String, BTreeSet<[u8; 32]>> = current
+            .into_iter()
+            .filter(|(_, routing_ids)| !routing_ids.is_empty())
+            .collect();
+        self.forget_stale_refusals(&wanted, stale_bound);
+        Ok(wanted)
+    }
+
     /// Drops every refusal and every `4062` run whose request the registrar
     /// would no longer send: a registration's once the relay's wanted set or
     /// the token changed, and a deregistration's once the ledger no longer
@@ -960,7 +1000,7 @@ impl<C: KeyCustody, S: Storage> PushRegistrar<C, S> {
 
     /// Settles a failed publish of `request` on `key`. A `4062` extends the
     /// key's run and becomes [`PushError::StaleBeyondSkew`] once the run spans
-    /// more than [`STALE_RUN_BOUND_SECS`] of the device clock; any other
+    /// more than [`STALE_RUN_BOUND_SECS`] of elapsed time; any other
     /// relay answer ends the run, and an unreachable relay leaves it. A
     /// terminal refusal is recorded so the request is not sent again.
     fn settle_failure(&mut self, key: RelayKey, request: Request, err: PushError) -> PushError {
@@ -986,10 +1026,10 @@ impl<C: KeyCustody, S: Storage> PushRegistrar<C, S> {
     /// Adds one `4062` to the run of `request` on `key`, starting a new run
     /// when none is open for that request.
     fn extend_stale_run(&mut self, key: &RelayKey, request: &Request, msg: String) -> PushError {
-        let now = self.clock.now_secs();
+        let now = self.monotonic_clock.monotonic_millis();
         match self.stale_runs.get(key) {
             Some(run) if run.request == *request => {
-                let span_secs = now.saturating_sub(run.first_secs);
+                let span_secs = now.saturating_sub(run.first_millis) / 1000;
                 if span_secs > STALE_RUN_BOUND_SECS {
                     self.stale_runs.remove(key);
                     return PushError::StaleBeyondSkew { msg, span_secs };
@@ -1000,7 +1040,7 @@ impl<C: KeyCustody, S: Storage> PushRegistrar<C, S> {
                     key.clone(),
                     StaleRun {
                         request: request.clone(),
-                        first_secs: now,
+                        first_millis: now,
                     },
                 );
             }
@@ -1321,7 +1361,7 @@ impl<C: KeyCustody, S: Storage> PushRegistrar<C, S> {
     async fn handle_command(&mut self, command: RegistrarCommand, supervisor: &Supervisor) -> bool {
         let (outcome, reply) = match command {
             RegistrarCommand::RefreshToken { token, reply } => {
-                (self.refresh_token(token).await, reply)
+                (self.refresh_token(supervisor, token).await, reply)
             }
             RegistrarCommand::DeregisterAll { reply } => {
                 self.enabled = false;
