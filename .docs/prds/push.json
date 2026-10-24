@@ -651,16 +651,20 @@
         "crates/scp-transport/src/relay/rate_limit.rs",
         "crates/scp-transport/src/relay/push_dispatch.rs"
       ],
-      "description": "\u00a710.7.1 step 6 requires at most one push per 30 seconds per device token. A per-token limiter keyed by SHA-256 of the token, so plaintext tokens do not sit in another map. A wake suppressed inside the window is deferred, not dropped (Alec 2026-10-24: \"Yes defer for sure\"): the relay holds one pending wake per token and sends it when the window closes, so every wake inside one window becomes one push; the held token is zeroized when dropped. A dropped wake loses a message when nothing else wakes the device within the 300 s blob lifetime. The limiter lives in memory and a restart clears it (Alec's ruling, \"In memory\"); the spec states that (\u00a710.7.1 step 6). The relay prunes expired entries.",
+      "description": "Rate-limits push wakes to at most one per 30 seconds per device token, as \u00a710.7.1 step 6 requires. A wake inside a token's window is deferred, not dropped (Alec 2026-10-24: \"Yes defer for sure\"): the relay holds one pending wake per token and sends it when the window closes, or when the platform's transient back-off ends if that is later, so every wake inside one window becomes one push. A transient send failure opens no window. Before every send the drain checks that a registration still holds the token, and discards the wake when none does. The pending wakes have no cap beyond one per token (Alec 2026-10-24), so the rate limit drops no wake while the relay runs. The limiter lives in memory, and a restart clears it: Alec picked the option \"In memory (Recommended)\". A graceful stop sends every pending wake before the drain exits, and a crash loses them (Alec 2026-10-24). Each drain keys its limiter by the SHA-256 of the platform tag byte followed by the token, the key its queue already uses, so no plaintext token sits in a map; a pending token is held in a zeroizing buffer. The limiter forgets a token whose window closed with nothing pending.",
       "acceptanceCriteria": [
         "Two publishes 1 s apart to one token's routing ID produce exactly one sender call inside the window and a second sender call when the window closes.",
         "Five publishes inside one window produce exactly one deferred call.",
         "A publish 30 s after the first produces a second call.",
         "Two different tokens are limited independently.",
-        "The limiter's memory is bounded by the number of active tokens; a test checks the entry count after pruning."
+        "The limiter's memory is bounded by the number of active tokens; a test checks the entry count after pruning.",
+        "A graceful stop of the push service sends every pending wake; a test stops the service with a wake held and the sender receives it.",
+        "A pending wake whose window closes during a transient back-off goes out when the back-off ends.",
+        "A transient failure opens no window: after a transient failure at t=0 and a new blob at t=2, the wake goes out when the back-off ends, not at t=30.",
+        "A wake held or queued for a token that is deregistered before its send is not sent."
       ],
       "actionItems": [
-        "Write the per-token limiter with one deferred wake per token, drive it from the dispatcher's drain, and send each deferred wake when its window closes."
+        "Write the per-token limiter with one deferred wake per token and no cap, drive it from the dispatcher's drain, send each deferred wake when its window closes or its platform's back-off ends, check the registration before every send, release the window after a transient failure, and send every pending wake on a graceful stop."
       ],
       "blockedBy": [
         "PUSH-008"
@@ -680,7 +684,7 @@
           "dispatch": "n/a",
           "ffi": "n/a",
           "sdk": "n/a",
-          "pw": "n/a",
+          "pw": "yes",
           "matrix": "n/a"
         }
       }
