@@ -37,15 +37,18 @@ use scp_core::context::builder::{ContextCreationError, ContextTransportProvider}
 use scp_core::context::{ContextError, ContextParams};
 use scp_core::crypto::envelope_seal::derive_key_package_routing_id;
 use scp_core::envelope::OuterEnvelope;
+use scp_protocol::envelope::outer::DEFAULT_APP_DATA_BLOB_TTL_SECS;
 
 use crate::traits::{BlobId, TransportAdapter};
 
-/// Default blob TTL in seconds (1 hour) for relay-published envelopes.
+/// Blob TTL in seconds (1 hour) for the two non-message publishes:
+/// the context-announcement placeholder (`publish_context`) and a published
+/// `KeyPackage` (`publish_key_package`).
 ///
-/// The relay enforces `MIN_BLOB_TTL..=MAX_BLOB_TTL` (1..=604800). A TTL of 0
-/// is rejected with relay error 4011. 3600 seconds (1 hour) matches the
-/// standard default used across the codebase (`scp-node`, adapter tests,
-/// protocol tests).
+/// MLS messages to a context do not use it: [`send_message`] requests
+/// [`DEFAULT_APP_DATA_BLOB_TTL_SECS`] (`09-security-model.md` §9.10.2).
+///
+/// [`send_message`]: ContextTransportProvider::send_message
 const DEFAULT_BLOB_TTL: u32 = 3600;
 
 /// Production [`ContextTransportProvider`] wrapping a [`TransportAdapter`].
@@ -182,11 +185,13 @@ impl<A: TransportAdapter + Send + Sync + 'static> ContextTransportProvider
     ) -> Result<(), ContextError> {
         // The one framing of a member publish (ADR-002, spec 23 §23.4.1): the
         // payload is the serialized MLS message, and this envelope is the only
-        // one around it.
+        // one around it. Every MLS message — application data, Commits, sealed
+        // management messages — requests the 7-day relay maximum
+        // (`09-security-model.md` §9.10.2 "Application-data blob TTL").
         let envelope = scp_core::envelope::OuterEnvelope::frame_mls_message(
             context_id,
             None,
-            DEFAULT_BLOB_TTL,
+            DEFAULT_APP_DATA_BLOB_TTL_SECS,
             encrypted_payload.to_vec(),
         )
         .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
@@ -220,7 +225,7 @@ impl<A: TransportAdapter + Send + Sync + 'static> ContextTransportProvider
 mod tests {
     use super::*;
 
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicU32, AtomicUsize};
 
     use futures::future::BoxFuture;
 
@@ -231,6 +236,8 @@ mod tests {
         send_count: AtomicUsize,
         delete_count: AtomicUsize,
         fail_send: AtomicBool,
+        /// `blob_ttl` of the last envelope passed to `send`.
+        last_blob_ttl: AtomicU32,
     }
 
     impl TestAdapter {
@@ -239,6 +246,7 @@ mod tests {
                 send_count: AtomicUsize::new(0),
                 delete_count: AtomicUsize::new(0),
                 fail_send: AtomicBool::new(false),
+                last_blob_ttl: AtomicU32::new(0),
             }
         }
     }
@@ -246,9 +254,11 @@ mod tests {
     impl TransportAdapter for TestAdapter {
         fn send(
             &self,
-            _envelope: &OuterEnvelope,
+            envelope: &OuterEnvelope,
         ) -> BoxFuture<'_, Result<BlobId, crate::TransportError>> {
             self.send_count.fetch_add(1, Ordering::Relaxed);
+            self.last_blob_ttl
+                .store(envelope.blob_ttl, Ordering::Relaxed);
             if self.fail_send.load(Ordering::Relaxed) {
                 Box::pin(async {
                     Err(crate::TransportError::SendFailed(
@@ -365,6 +375,43 @@ mod tests {
 
         let count = provider.adapter.send_count.load(Ordering::Relaxed);
         assert_eq!(count, 1);
+    }
+
+    /// Every MLS message the native runtime publishes (application data,
+    /// Commits, sealed management messages) goes through `send_message`, and
+    /// requests the 7-day relay maximum (`09-security-model.md` §9.10.2
+    /// "Application-data blob TTL").
+    #[tokio::test]
+    async fn send_message_requests_the_relay_maximum_blob_ttl() {
+        let provider = RelayTransportProvider::new(TestAdapter::new());
+
+        provider
+            .send_message(&[6u8; 32], b"mls-message")
+            .await
+            .unwrap();
+
+        let ttl = provider.adapter.last_blob_ttl.load(Ordering::Relaxed);
+        assert_eq!(ttl, scp_relay_client::MAX_BLOB_TTL);
+        assert_eq!(ttl, DEFAULT_APP_DATA_BLOB_TTL_SECS);
+        assert_eq!(ttl, 604_800);
+    }
+
+    /// The two non-message publishes keep their own one-hour TTL.
+    #[tokio::test]
+    async fn non_message_publishes_keep_the_one_hour_blob_ttl() {
+        let provider = RelayTransportProvider::new(TestAdapter::new());
+
+        provider
+            .publish_context(&[7u8; 32], &ContextParams::default())
+            .await
+            .unwrap();
+        assert_eq!(provider.adapter.last_blob_ttl.load(Ordering::Relaxed), 3600);
+
+        provider
+            .publish_key_package("did:dht:example", b"kp")
+            .await
+            .unwrap();
+        assert_eq!(provider.adapter.last_blob_ttl.load(Ordering::Relaxed), 3600);
     }
 
     #[tokio::test]

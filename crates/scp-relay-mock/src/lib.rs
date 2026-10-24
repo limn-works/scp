@@ -42,7 +42,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use scp_client::RelaySink;
-use scp_protocol::envelope::outer::OuterEnvelope;
+use scp_protocol::envelope::outer::{DEFAULT_APP_DATA_BLOB_TTL_SECS, OuterEnvelope};
 use scp_relay_client::{ClientMessage, RelayMessage};
 
 /// A relay connection id (one per client).
@@ -260,7 +260,7 @@ impl Relay {
                 ref_id: None,
                 routing_id,
                 recipient_hint: None,
-                blob_ttl: 300,
+                blob_ttl: DEFAULT_APP_DATA_BLOB_TTL_SECS,
                 blob,
             },
         );
@@ -274,7 +274,7 @@ impl Relay {
             routing_id,
             blob_id: [0u8; 32],
             recipient_hint: None,
-            blob_ttl: 300,
+            blob_ttl: DEFAULT_APP_DATA_BLOB_TTL_SECS,
             stored_at: 0,
             blob,
         }

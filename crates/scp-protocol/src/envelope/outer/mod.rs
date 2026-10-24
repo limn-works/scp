@@ -32,16 +32,23 @@ const fn default_outer_version() -> u16 {
     super::SCP_PROTOCOL_VERSION
 }
 
-/// Default TTL (seconds) a member requests when publishing an app-data blob
-/// through a relay. 300s = 5 minutes — short enough to limit replay surface,
-/// long enough to absorb transient relay outages.
+/// TTL (seconds) a member requests for every MLS message it publishes to a
+/// context: 7 days, the relay maximum `MAX_BLOB_TTL`.
 ///
-/// This is the single wasm-safe home for the value: the native runtime
-/// (`scp-runtime` `messaging_helpers::DEFAULT_BLOB_TTL_SECS`) and the in-browser
-/// participant driver (`scp-client`, over the injected `Socket`) both consume it,
-/// so a native and a browser member request the same relay-storage window for the
-/// same message (ADR-057 "share, don't fork").
-pub const DEFAULT_APP_DATA_BLOB_TTL_SECS: u32 = 300;
+/// It covers application data, Commits, and sealed management messages
+/// (`09-security-model.md` §9.10.2 "Application-data blob TTL", §9.18.11). A
+/// device offline for up to 7 days finds every such message still stored on
+/// reconnect. No replay or dedup window is sized from this value: replay
+/// protection is the per-sender `(epoch, sequence)` floor plus MLS.
+///
+/// This is the single wasm-safe home for the value: the native transport
+/// provider (`scp-transport` `RelayTransportProvider::send_message`) and the
+/// in-browser participant driver (`scp-client`, over the injected `Socket`) both
+/// consume it, so a native and a browser member request the same relay-storage
+/// window for the same message (ADR-057 "share, don't fork"). `scp-protocol`
+/// cannot name `scp_relay_client::MAX_BLOB_TTL` (the dependency runs the other
+/// way), so `scp-relay-client` const-asserts the two equal.
+pub const DEFAULT_APP_DATA_BLOB_TTL_SECS: u32 = 604_800;
 
 /// The unauthenticated outer envelope used for relay routing.
 ///
