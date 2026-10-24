@@ -86,7 +86,11 @@ async fn main() {
     if let Some(h) = metrics_handle {
         h.abort();
     }
-    handle.shutdown();
+    // Sends every pending push wake before the process exits (§10.7.1
+    // step 6, Stop and crash).
+    if let Err(e) = handle.shutdown_gracefully().await {
+        tracing::error!(error = %e, "relay stopped with push wakes lost");
+    }
     tracing::info!("relay stopped");
 }
 

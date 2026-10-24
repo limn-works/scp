@@ -175,6 +175,13 @@ const PUSH_DISPATCH_SRC: &str =
     include_str!("../../../../crates/scp-transport/src/relay/push_dispatch.rs");
 const RELAY_RATE_LIMIT_SRC: &str =
     include_str!("../../../../crates/scp-transport/src/relay/rate_limit.rs");
+// The relay server's shutdown handle and the two binaries that stop a
+// push-enabled relay (§10.7.1 step 6, Stop and crash). The
+// push_graceful_stop_sends_pending_wakes assertion below pins the chain.
+const NATIVE_SERVER_SRC: &str =
+    include_str!("../../../../crates/scp-transport/src/native/server.rs");
+const SCP_RELAY_MAIN_SRC: &str = include_str!("../../../../crates/scp-relay/src/main.rs");
+const SCP_NODE_MAIN_SRC: &str = include_str!("../../../../crates/scp-node/src/main.rs");
 
 // Actor messaging-handler source — owns `handle_build_local_checkpoint`,
 // the actor-turn body that builds AND broadcasts the Phase-3 checkpoint so
@@ -3989,6 +3996,56 @@ fn push_dispatch_sends_through_the_rate_limit() {
     assert!(
         !drain.contains("rx.recv("),
         "Drain::drain must read jobs only through next_job, so no job skips the rate limit"
+    );
+}
+
+/// §10.7.1 step 6, **Stop and crash** (PUSH-009): a graceful stop sends every
+/// pending push wake. Each binary that runs a push-enabled relay (`scp-relay`
+/// and `scp-node` in relay-only mode) stops it with
+/// `ShutdownHandle::shutdown_gracefully`, which stops the push service and
+/// awaits it; `PushService::stop` cancels the tasks and awaits each one; and
+/// the drain, once its loop ends, sends every job the limiter's
+/// `take_pending` returns, each after the registration check.
+#[test]
+fn push_graceful_stop_sends_pending_wakes() {
+    for (binary, src, caller) in [
+        ("scp-relay", SCP_RELAY_MAIN_SRC, "main"),
+        ("scp-node", SCP_NODE_MAIN_SRC, "run_relay_only"),
+    ] {
+        assert!(
+            fn_body_contains(src, caller, ".shutdown_gracefully().await"),
+            "{binary} {caller} must stop the relay with shutdown_gracefully (§10.7.1 step 6)"
+        );
+        let body =
+            extract_fn_body(src, caller).unwrap_or_else(|| panic!("{binary} {caller} not found"));
+        assert!(
+            !body.contains("handle.shutdown();"),
+            "{binary} {caller} must not stop the relay without the push stop (§10.7.1 step 6)"
+        );
+    }
+    assert!(
+        fn_body_contains(
+            NATIVE_SERVER_SRC,
+            "shutdown_gracefully",
+            "service.stop().await"
+        ),
+        "ShutdownHandle::shutdown_gracefully must await PushService::stop (§10.7.1 step 6)"
+    );
+    for callee in [".cancel()", "task.await"] {
+        assert!(
+            fn_body_contains(PUSH_DISPATCH_SRC, "stop", callee),
+            "PushService::stop must call {callee} (§10.7.1 step 6)"
+        );
+    }
+    for callee in [".take_pending()", "self.registered(", ".send_registered("] {
+        assert!(
+            fn_body_contains(PUSH_DISPATCH_SRC, "drain", callee),
+            "Drain::drain must call {callee} (§10.7.1 step 6, PUSH-009)"
+        );
+    }
+    assert!(
+        fn_body_contains(PUSH_DISPATCH_SRC, "registered", ".holds_token("),
+        "the drain's registration check must ask the store (§10.7.1 step 6)"
     );
 }
 

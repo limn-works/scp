@@ -292,8 +292,11 @@ pub(crate) use push_wake::{PUSH_WAKE_WINDOW, PushWakeLimiter, WakeAdmission};
 /// passes `now` and drives it from one task (the push dispatcher's drain for
 /// one platform), sending each wake [`PushWakeLimiter::admit`] or
 /// [`PushWakeLimiter::take_due`] hands back and sleeping until
-/// [`PushWakeLimiter::next_due`] in between. Its state lives in memory only,
-/// so a relay restart clears it (§10.7.1 step 6, **State**).
+/// [`PushWakeLimiter::next_due`] in between. It holds at most one pending
+/// wake per token and refuses none, so it never drops a wake; a graceful stop
+/// sends what [`PushWakeLimiter::take_pending`] returns (§10.7.1 step 6,
+/// **Stop and crash**). Its state lives in memory only, so a relay restart
+/// clears it (§10.7.1 step 6, **State**).
 #[cfg(feature = "push-store")]
 mod push_wake {
     use std::collections::{HashMap, VecDeque};
@@ -322,10 +325,6 @@ mod push_wake {
         /// The token already had a pending wake, which stands for this one
         /// too, so the limiter zeroized and dropped this one.
         Joined,
-        /// The limiter already held its most pending wakes, so it zeroized
-        /// and dropped this one (§10.7.1 step 6, **Held wakes and the
-        /// bounds**).
-        Full,
     }
 
     /// One token's window: when its last push went out, and the wake held
@@ -337,11 +336,10 @@ mod push_wake {
 
     /// The per-token limiter. `W` is the wake the caller sends, which holds
     /// the token; the limiter holds a pending `W` in [`Zeroizing`], so every
-    /// pending wake it drops (joined, refused, or with the limiter itself at
-    /// shutdown) is zeroized first.
+    /// pending wake it drops (joined, or with the limiter itself when its task
+    /// ends without a graceful stop) is zeroized first.
     pub struct PushWakeLimiter<W: Zeroize> {
         window: Duration,
-        max_pending: usize,
         entries: HashMap<WakeKey, Entry<W>>,
         /// One record per window started, oldest first: the token's key and
         /// the window's `sent_at`. A record whose `sent_at` differs from its
@@ -364,11 +362,10 @@ mod push_wake {
 
     impl<W: Zeroize> PushWakeLimiter<W> {
         /// A limiter with no entries, allowing one push per `window` per
-        /// token and holding at most `max_pending` pending wakes.
-        pub fn new(window: Duration, max_pending: usize) -> Self {
+        /// token.
+        pub fn new(window: Duration) -> Self {
             Self {
                 window,
-                max_pending,
                 entries: HashMap::new(),
                 windows: VecDeque::new(),
                 pending: 0,
@@ -428,9 +425,6 @@ mod push_wake {
                 self.windows.push_back((key, start));
                 return WakeAdmission::SendNow(wake);
             }
-            if self.pending >= self.max_pending {
-                return WakeAdmission::Full;
-            }
             if let Some(entry) = self.entries.get_mut(&key) {
                 entry.pending = Some(wake);
                 self.pending = self.pending.saturating_add(1);
@@ -474,6 +468,30 @@ mod push_wake {
                 self.entries.remove(&key);
             }
             None
+        }
+
+        /// Forgets `key`'s window unless the token holds a pending wake, for a
+        /// push that did not reach the push service's answer: a transient
+        /// failure, or a wake discarded before its send. Such a push opens no
+        /// window (§10.7.1 step 6, **Window**), so the token's next wake goes
+        /// out at once. The window's record goes stale, and `take_due`
+        /// discards it.
+        pub fn release(&mut self, key: &WakeKey) {
+            if self.entries.get(key).is_some_and(|e| e.pending.is_none()) {
+                self.entries.remove(key);
+            }
+        }
+
+        /// Takes every pending wake, whether or not its window closed, and
+        /// forgets every token: what a graceful stop sends (§10.7.1 step 6,
+        /// **Stop and crash**).
+        pub fn take_pending(&mut self) -> Vec<Zeroizing<W>> {
+            self.windows.clear();
+            self.pending = 0;
+            self.entries
+                .drain()
+                .filter_map(|(_, entry)| entry.pending)
+                .collect()
         }
 
         /// Tokens the limiter holds an entry for.
@@ -524,7 +542,7 @@ mod push_wake {
         }
 
         fn limiter() -> PushWakeLimiter<Probe> {
-            PushWakeLimiter::new(WINDOW, 16)
+            PushWakeLimiter::new(WINDOW)
         }
 
         const fn key(n: u8) -> WakeKey {
@@ -564,10 +582,6 @@ mod push_wake {
             let mut sent = 0;
             for i in 0..5 {
                 let admission = limiter.admit(key(1), probe(b"t1").0, t0 + secs(i));
-                assert!(
-                    !matches!(admission, WakeAdmission::Full),
-                    "wake {i} refused"
-                );
                 if matches!(admission, WakeAdmission::SendNow(_)) {
                     sent += 1;
                 }
@@ -639,25 +653,84 @@ mod push_wake {
             assert_eq!(limiter.next_due(), None);
         }
 
-        /// A limiter holding its most pending wakes refuses another, and the
-        /// refused wake is zeroized.
+        /// The limiter holds a pending wake for every token whose window is
+        /// open, however many there are: none is refused.
         #[test]
-        fn full_limiter_refuses_and_zeroizes_a_wake() {
+        fn every_token_holds_a_pending_wake() {
             let t0 = Instant::now();
-            let mut limiter = PushWakeLimiter::new(WINDOW, 1);
-            for n in 1..=2 {
+            let mut limiter = limiter();
+            for n in 0..=255 {
                 let _ = limiter.admit(key(n), probe(b"t").0, t0);
             }
+            for n in 0..=255 {
+                assert!(
+                    matches!(
+                        limiter.admit(key(n), probe(b"t").0, t0 + secs(1)),
+                        WakeAdmission::Deferred
+                    ),
+                    "token {n} refused"
+                );
+            }
+            assert_eq!(limiter.pending(), 256);
+        }
+
+        /// A released window lets the token's next wake out at once, and
+        /// its record is discarded when it would have closed.
+        #[test]
+        fn released_window_sends_the_next_wake_at_once() {
+            let t0 = Instant::now();
+            let mut limiter = limiter();
+            let _ = limiter.admit(key(1), probe(b"t1").0, t0);
+            limiter.release(&key(1));
+            assert_eq!(limiter.entries(), 0);
             assert!(matches!(
-                limiter.admit(key(1), probe(b"t").0, t0 + secs(1)),
+                limiter.admit(key(1), probe(b"t1").0, t0 + secs(2)),
+                WakeAdmission::SendNow(_)
+            ));
+            assert!(matches!(
+                limiter.admit(key(1), probe(b"t1").0, t0 + secs(3)),
                 WakeAdmission::Deferred
             ));
-            let (refused, buffer) = probe(b"refused");
-            assert!(matches!(
-                limiter.admit(key(2), refused, t0 + secs(1)),
-                WakeAdmission::Full
-            ));
-            assert_eq!(bytes(&buffer), vec![0; 7]);
+            // The released record closes first and is stale.
+            assert!(limiter.take_due(t0 + WINDOW).is_none());
+            assert!(limiter.take_due(t0 + secs(32)).is_some());
+        }
+
+        /// Releasing a token that holds a pending wake keeps its window, so
+        /// the pending wake still waits for the window's close.
+        #[test]
+        fn release_keeps_a_window_with_a_pending_wake() {
+            let t0 = Instant::now();
+            let mut limiter = limiter();
+            let _ = limiter.admit(key(1), probe(b"t1").0, t0);
+            let _ = limiter.admit(key(1), probe(b"t1").0, t0 + secs(1));
+            limiter.release(&key(1));
+            assert_eq!(limiter.pending(), 1);
+            assert!(limiter.take_due(t0 + secs(29)).is_none());
+            assert!(limiter.take_due(t0 + WINDOW).is_some());
+        }
+
+        /// `take_pending` returns every pending wake before its window
+        /// closes, holding its token intact for the send, and leaves the
+        /// limiter empty.
+        #[test]
+        fn take_pending_returns_every_pending_wake() {
+            let t0 = Instant::now();
+            let mut limiter = limiter();
+            for n in 1..=3 {
+                let _ = limiter.admit(key(n), probe(b"t").0, t0);
+            }
+            let (held, buffer) = probe(b"held");
+            let _ = limiter.admit(key(1), held, t0 + secs(1));
+            let _ = limiter.admit(key(2), probe(b"t").0, t0 + secs(1));
+            let taken = limiter.take_pending();
+            assert_eq!(taken.len(), 2);
+            assert_eq!(bytes(&buffer), b"held".to_vec());
+            assert_eq!(limiter.entries(), 0);
+            assert_eq!(limiter.pending(), 0);
+            assert_eq!(limiter.next_due(), None);
+            drop(taken);
+            assert_eq!(bytes(&buffer), vec![0; 4]);
         }
 
         /// A wake that joins a pending one is zeroized.
@@ -675,8 +748,9 @@ mod push_wake {
             assert_eq!(bytes(&buffer), vec![0; 6]);
         }
 
-        /// Dropping the limiter, as the drain does at shutdown, drops its
-        /// pending wake unsent and zeroizes the token it held.
+        /// Dropping the limiter, as a drain whose task ends without a
+        /// graceful stop does, drops its pending wake unsent and zeroizes
+        /// the token it held.
         #[test]
         fn dropping_the_limiter_zeroizes_its_pending_wake() {
             let t0 = Instant::now();

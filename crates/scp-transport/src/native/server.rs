@@ -258,20 +258,45 @@ impl RelayConfig {
 /// Handle for gracefully shutting down a running relay server.
 ///
 /// Dropping the handle does **not** shut down the server. Call
+/// [`shutdown_gracefully`](Self::shutdown_gracefully) or
 /// [`shutdown`](Self::shutdown) explicitly. In-flight connection handlers
 /// drain naturally after shutdown is signaled — they are not cancelled.
 #[derive(Debug, Clone)]
 pub struct ShutdownHandle {
     token: CancellationToken,
+    /// The relay's push role, so a graceful shutdown can send every pending
+    /// push wake before the process exits (§10.7.1 step 6, **Stop and
+    /// crash**).
+    push: PushRole,
 }
 
 impl ShutdownHandle {
     /// Signals the relay server to stop accepting new connections.
     ///
     /// Existing connection handlers continue until their clients disconnect
-    /// or their work completes.
+    /// or their work completes. The push service keeps running, so a
+    /// process that exits after this call loses every pending push wake;
+    /// [`shutdown_gracefully`](Self::shutdown_gracefully) sends them first.
     pub fn shutdown(&self) {
         self.token.cancel();
+    }
+
+    /// Signals the relay server to stop, as [`shutdown`](Self::shutdown)
+    /// does, then stops its push service and waits until every pending push
+    /// wake is sent (§10.7.1 step 6, **Stop and crash**). With push disabled
+    /// it returns once the signal is sent.
+    ///
+    /// # Errors
+    ///
+    /// [`RelayError::PushStop`] when a push service task panicked, so the
+    /// pending wakes it held were lost. The relay is stopped either way.
+    pub async fn shutdown_gracefully(&self) -> Result<(), RelayError> {
+        self.token.cancel();
+        match &self.push {
+            PushRole::Disabled => Ok(()),
+            #[cfg(feature = "push-store")]
+            PushRole::Enabled(service) => service.stop().await.map_err(RelayError::PushStop),
+        }
     }
 
     /// Returns `true` if shutdown has been signaled.
@@ -703,7 +728,13 @@ impl RelayServer {
             }
         });
 
-        Ok((ShutdownHandle { token }, local_addr))
+        Ok((
+            ShutdownHandle {
+                token,
+                push: self.config.push.clone(),
+            },
+            local_addr,
+        ))
     }
 }
 
@@ -756,6 +787,12 @@ pub enum RelayError {
     /// step 2).
     #[error("invalid relay URL: {0}")]
     InvalidRelayUrl(#[from] scp_protocol::discovery::push::PushMessageError),
+
+    /// The relay's push service did not stop gracefully, so pending push
+    /// wakes were lost (§10.7.1 step 6, **Stop and crash**).
+    #[cfg(feature = "push-store")]
+    #[error("push service did not stop gracefully: {0}")]
+    PushStop(#[source] push_dispatch::PushServiceError),
 }
 
 /// Background task that periodically purges expired blobs and reclaims stale
@@ -5059,6 +5096,34 @@ mod tests {
                     "{reply:?}"
                 );
                 harness.wait_for_wakes(1).await.unwrap();
+            }
+
+            /// A graceful shutdown of a relay sends the push wake its rate
+            /// limit holds, before the window closes, and returns only after
+            /// the wake went out (§10.7.1 step 6, **Stop and crash**).
+            #[tokio::test]
+            async fn graceful_shutdown_sends_the_held_wake() {
+                let rid = [0x45; 32];
+                let harness = WakeHarness::start(&[rid]).await.unwrap();
+                let config = RelayConfig {
+                    bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+                    delivery_jitter_ms: 0,
+                    push: harness.push.clone(),
+                    ..RelayConfig::defaults(LiveRelayUrl::new(
+                        RelayUrl::new(PUSH_RELAY_URL).unwrap(),
+                    ))
+                };
+                let server = RelayServer::new(config, Arc::new(BlobStorageBackend::in_memory()));
+                let (handle, addr) = server.start().await.unwrap();
+                publish_to(addr, rid, vec![1; 16]).await;
+                harness.wait_for_wakes(1).await.unwrap();
+                // Inside the token's 30 s window, so the rate limit holds it.
+                publish_to(addr, rid, vec![2; 16]).await;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                assert_eq!(harness.wakes().await, 1, "sent inside the window");
+                handle.shutdown_gracefully().await.unwrap();
+                assert_eq!(harness.wakes().await, 2, "the held wake was not sent");
+                assert!(handle.is_shutdown());
             }
         }
     }

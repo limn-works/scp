@@ -7,8 +7,9 @@
 //! publish waits on a lookup or a send.
 //!
 //! With push enabled, the relay's `PushService` runs two kinds of task, all
-//! started by `PushService::start` and all stopped when the last clone of the
-//! service is dropped:
+//! started by `PushService::start`. `PushService::stop` stops them gracefully
+//! and waits for them; dropping the last clone of the service stops them
+//! without waiting:
 //!
 //! - **One lookup task** reads the intake, reads the (platform, token) pairs
 //!   registered for each routing ID in one query on the blocking pool, and
@@ -16,7 +17,10 @@
 //! - **One drain per configured sender**, each reading its own platform's
 //!   queue, so a push service that stops answering stalls only its own
 //!   platform. Each drain passes every job through its platform's per-token
-//!   rate limit (section Rate limit below) before it sends. After a
+//!   rate limit (section Rate limit below) and checks that a registration
+//!   still holds the job's token before it sends (§10.7.1 step 6,
+//!   **Registration check**): a job carries the token the lookup read, and a
+//!   token deregistered or removed since then is not sent to. After a
 //!   `Transient` outcome a drain backs off before its next send to that
 //!   service. Each drain applies the outcome to the registration store:
 //!   - `Delivered` resets the token's consecutive invalid-token count.
@@ -42,28 +46,34 @@
 //! defers a wake inside that window instead of dropping it (PUSH-009). Each
 //! drain owns one `PushWakeLimiter` (in `rate_limit`) for its platform and
 //! consults it for every job it reads:
-//! - A token with no push in the last 30 s is sent at once, which opens its
-//!   window.
+//! - A token with no window open is sent at once, which opens its window.
 //! - A token inside its window holds the job as its one pending wake, and
-//!   any later job for that token inside the window joins it. The drain
-//!   sends the pending wake when the window closes, because it sleeps until
-//!   the oldest window's close whenever no job is waiting.
-//! - The limiter keys a token by the same SHA-256 the queues use, and holds
-//!   the token's bytes only inside a pending job, which zeroizes them when
-//!   it is sent, refused or dropped.
+//!   any later job for that token joins it. The drain sends the pending wake
+//!   when the window closes, because it sleeps until the oldest window's
+//!   close whenever no job is waiting. A drain backing off after a
+//!   `Transient` outcome reads no due wake until the back-off ends, so a
+//!   pending wake goes out at its window's close or the back-off's end,
+//!   whichever is later.
+//! - A push that ends `Transient`, or a job discarded before its send,
+//!   opens no window: the drain releases the token's window unless the token
+//!   holds a pending wake (§10.7.1 step 6, **Window**).
+//! - The limiter keys a token by the same SHA-256 of the platform tag and
+//!   token the queues use, and holds the token's bytes only inside a pending
+//!   job, which zeroizes them when it is sent, joined or dropped.
 //!
-//! The limiter lives in the drain's memory, so stopping the service (the
-//! relay shutting down or restarting) drops every pending wake unsent and
-//! zeroizes its token, and a restarted relay starts with no windows open
-//! (§10.7.1 step 6, **State**). The limiter forgets a token once its window
-//! closes with nothing pending, so it holds an entry only for each token
-//! pushed to within the last 30 s.
+//! The limiter holds at most one pending wake per token and refuses none, so
+//! the rate limit drops no wake while the relay runs (§10.7.1 step 6, **Held
+//! wakes and the bounds**). A pending job keeps its routing ID's ticket, so
+//! it counts toward `MAX_WAKES_PER_PUBLISH` as a job in flight.
 //!
-//! A pending wake counts against the bounds below (§10.7.1 step 6, **Held
-//! wakes and the bounds**): its job keeps its routing ID's ticket, so it
-//! counts toward `MAX_WAKES_PER_PUBLISH`, and one drain holds at most
-//! `PUSH_QUEUE_CAPACITY` pending wakes besides its queue. When a drain holds
-//! that many, it drops a further job it would defer, and logs the drop.
+//! The limiter lives in the drain's memory. `PushService::stop` makes each
+//! drain finish the send in flight and send every pending wake before it
+//! exits, whether or not its window closed, and waits until they are out. A
+//! crash, or a process that exits without awaiting `stop`, loses them
+//! (§10.7.1 step 6, **Stop and crash**). A
+//! restarted relay starts with no windows open (§10.7.1 step 6, **State**).
+//! The limiter forgets a token once its window closes with nothing pending,
+//! so it holds an entry only for each token whose window is open.
 //!
 //! # Bounds
 //!
@@ -90,7 +100,8 @@
 //! clone of the relay's [`PushRole`](super::push_gate::PushRole), so a publish
 //! on any transport reaches the one service. The only way to hold a service
 //! is `PushService::start`, which starts its tasks, so no relay can hold a
-//! push service whose drains are not running.
+//! push service whose drains are not running. A relay's
+//! `ShutdownHandle::shutdown_gracefully` calls `PushService::stop`.
 //!
 //! A build without the `push-store` feature has no push service, and its
 //! [`notify`] does nothing.
@@ -121,6 +132,7 @@ mod enabled {
     use scp_protocol::discovery::push::PushPlatform;
     use sha2::{Digest, Sha256};
     use tokio::sync::mpsc;
+    use tokio::task::JoinHandle;
     use tokio_util::sync::{CancellationToken, DropGuard};
     use zeroize::{Zeroize, Zeroizing};
 
@@ -151,7 +163,7 @@ mod enabled {
     /// The longest back-off after `Transient` outcomes (indicator: 60 s).
     const TRANSIENT_BACKOFF_MAX: Duration = Duration::from_secs(60);
 
-    /// A push service that could not start.
+    /// A push service that could not start, or could not stop gracefully.
     #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
     #[non_exhaustive]
     pub enum PushServiceError {
@@ -165,6 +177,13 @@ mod enabled {
         DuplicateSender {
             /// The platform named twice.
             platform: PushPlatform,
+        },
+        /// [`PushService::stop`] found tasks that ended in a panic, so the
+        /// pending wakes a panicked drain held were lost unsent.
+        #[error("{tasks} push service task(s) panicked before the graceful stop")]
+        TaskPanicked {
+            /// The tasks that panicked.
+            tasks: usize,
         },
     }
 
@@ -193,9 +212,14 @@ mod enabled {
     /// that leaks (through a log, a panic message, or memory) ties no token
     /// to a context or an identity. The token sits in a zeroizing buffer and
     /// `Debug` prints only its length.
-    struct PushJob {
+    ///
+    /// `T` is the token's buffer. Every production job holds a `Vec<u8>`; a
+    /// test holds a buffer it can read after the wipe, and being generic
+    /// lets `zeroize` reach the token only through `Zeroize`, never through
+    /// a `Vec` method such as `clear` that frees no bytes.
+    struct PushJob<T: Zeroize = Vec<u8>> {
         platform: PushPlatform,
-        token: Zeroizing<Vec<u8>>,
+        token: Zeroizing<T>,
         /// Held, never read, until the job drops; the lookup counts a routing ID's
         /// live jobs by the clones of its ticket.
         _ticket: Arc<()>,
@@ -203,7 +227,7 @@ mod enabled {
 
     /// Zeroizes the token, so the rate limiter can hold a pending job in
     /// [`Zeroizing`] and wipe its token whenever it drops the job.
-    impl Zeroize for PushJob {
+    impl<T: Zeroize> Zeroize for PushJob<T> {
         fn zeroize(&mut self) {
             self.token.zeroize();
         }
@@ -283,7 +307,8 @@ mod enabled {
         clear_failed: RateLimitedLog,
         store_failed: RateLimitedLog,
         config_error: RateLimitedLog,
-        deferred_full: RateLimitedLog,
+        registration_check_failed: RateLimitedLog,
+        task_panicked: RateLimitedLog,
     }
 
     /// The sizes the service runs with. Production uses
@@ -308,7 +333,11 @@ mod enabled {
 
     /// The relay's running push service: the configuration it was started
     /// with, the intake [`notify`] writes to, and the tasks that read it.
-    /// Clones share one service; dropping the last clone stops its tasks.
+    ///
+    /// Clones share one service. [`PushService::stop`] stops its tasks
+    /// gracefully and waits for them. Dropping the last clone stops them the
+    /// same way but waits for nothing, so a process that exits next loses
+    /// the pending wakes its drains had not yet sent.
     #[derive(Clone)]
     pub struct PushService {
         inner: Arc<Inner>,
@@ -321,6 +350,10 @@ mod enabled {
         /// intake slot however often it is published to.
         pending: Arc<Mutex<HashSet<RoutingId>>>,
         logs: Arc<Logs>,
+        /// Stops the lookup and every drain.
+        stop: CancellationToken,
+        /// The lookup and every drain, which [`PushService::stop`] waits for.
+        tasks: tokio::sync::Mutex<Vec<JoinHandle<()>>>,
         /// Cancels the lookup and every drain when the last clone drops.
         _stop: DropGuard,
     }
@@ -381,21 +414,24 @@ mod enabled {
             let stop = CancellationToken::new();
             let logs = Arc::new(Logs::default());
             let mut lanes = Vec::with_capacity(config.senders.len());
+            let mut tasks = Vec::with_capacity(config.senders.len().saturating_add(1));
             for (index, sender) in config.senders.iter().enumerate() {
                 let (tx, rx) = mpsc::channel(limits.queue_capacity);
                 let queued = Arc::new(Mutex::new(HashSet::new()));
-                runtime.spawn(
-                    Drain {
-                        senders: Arc::clone(&config.senders),
-                        index,
-                        store: config.store.clone(),
-                        queued: Arc::clone(&queued),
-                        logs: Arc::clone(&logs),
-                        stop: stop.clone(),
-                        pending_resets: HashSet::new(),
-                        limiter: PushWakeLimiter::new(limits.wake_window, limits.queue_capacity),
-                    }
-                    .drain(rx),
+                tasks.push(
+                    runtime.spawn(
+                        Drain {
+                            senders: Arc::clone(&config.senders),
+                            index,
+                            store: config.store.clone(),
+                            queued: Arc::clone(&queued),
+                            logs: Arc::clone(&logs),
+                            stop: stop.clone(),
+                            pending_resets: HashSet::new(),
+                            limiter: PushWakeLimiter::new(limits.wake_window),
+                        }
+                        .drain(rx),
+                    ),
                 );
                 lanes.push(Lane {
                     platform: sender.platform(),
@@ -405,16 +441,18 @@ mod enabled {
             }
             let (intake, intake_rx) = mpsc::channel(limits.queue_capacity);
             let pending = Arc::new(Mutex::new(HashSet::new()));
-            runtime.spawn(
-                Lookup {
-                    store: config.store.clone(),
-                    lanes,
-                    pending: Arc::clone(&pending),
-                    logs: Arc::clone(&logs),
-                    limits,
-                    tickets: HashMap::new(),
-                }
-                .run(intake_rx, stop.clone()),
+            tasks.push(
+                runtime.spawn(
+                    Lookup {
+                        store: config.store.clone(),
+                        lanes,
+                        pending: Arc::clone(&pending),
+                        logs: Arc::clone(&logs),
+                        limits,
+                        tickets: HashMap::new(),
+                    }
+                    .run(intake_rx, stop.clone()),
+                ),
             );
             Ok(Self {
                 inner: Arc::new(Inner {
@@ -422,9 +460,49 @@ mod enabled {
                     intake,
                     pending,
                     logs,
+                    stop: stop.clone(),
+                    tasks: tokio::sync::Mutex::new(tasks),
                     _stop: stop.drop_guard(),
                 }),
             })
+        }
+
+        /// Stops the service gracefully and waits until its tasks exit: the
+        /// lookup queues nothing more, and each drain finishes the send in
+        /// flight, sends every pending wake whether or not its window closed,
+        /// and exits (§10.7.1 step 6, **Stop and crash**). A wake still on a
+        /// queue is not sent. Each send is bounded by its sender's request
+        /// timeout, so the wait is too.
+        ///
+        /// A later or concurrent call waits for the first to finish and then
+        /// returns `Ok`. A wake notified after the stop is dropped.
+        ///
+        /// # Errors
+        ///
+        /// [`PushServiceError::TaskPanicked`] when a task ended in a panic,
+        /// so the pending wakes a panicked drain held were lost.
+        pub async fn stop(&self) -> Result<(), PushServiceError> {
+            self.inner.stop.cancel();
+            let mut tasks = self.inner.tasks.lock().await;
+            let mut panicked = 0_usize;
+            for task in tasks.drain(..) {
+                if task.await.is_err() {
+                    panicked = panicked.saturating_add(1);
+                }
+            }
+            drop(tasks);
+            if panicked == 0 {
+                Ok(())
+            } else {
+                if let Some(line) = self.inner.logs.task_panicked.hit() {
+                    tracing::error!(
+                        tasks = panicked,
+                        total = line.total,
+                        "push service tasks panicked before the graceful stop; their pending wakes were lost"
+                    );
+                }
+                Err(PushServiceError::TaskPanicked { tasks: panicked })
+            }
         }
 
         /// The configuration the service was started with.
@@ -658,8 +736,9 @@ mod enabled {
         /// the store failed to write. At most [`PUSH_QUEUE_CAPACITY`].
         pending_resets: HashSet<TokenKey>,
         /// The platform's per-token rate limit (§10.7.1 step 6), holding each
-        /// deferred job until its token's window closes. Dropped with the
-        /// drain, which zeroizes every pending job's token unsent.
+        /// deferred job until its token's window closes. A graceful stop
+        /// sends every job it holds; a drain dropped without one zeroizes
+        /// every pending job's token unsent.
         limiter: PushWakeLimiter<PushJob>,
     }
 
@@ -678,28 +757,75 @@ mod enabled {
                 return;
             };
             let mut backoff = ReconnectBackoff::new(TRANSIENT_BACKOFF_MIN, TRANSIENT_BACKOFF_MAX);
-            // `None` means the service stopped; returning drops the limiter,
-            // which zeroizes every pending job unsent.
+            // `None` means the service stopped. A send in flight finishes
+            // first, so a stop never cuts one off; each send is bounded by
+            // the sender's request timeout.
             while let Some(job) = self.next_job(&mut rx).await {
-                let key = token_key(job.platform, &job.token);
-                let outcome = tokio::select! {
-                    biased;
-                    () = self.stop.cancelled() => return,
-                    outcome = sender.send_registered(&job.token) => outcome,
+                let Some(job) = self.registered(job).await else {
+                    continue;
                 };
-                if !self.apply(job.platform, key, &job.token, outcome).await {
-                    return;
-                }
-                // Releases the routing ID's ticket and zeroizes the token.
-                drop(job);
+                let outcome = sender.send_registered(&job.token).await;
+                self.settle(job, outcome).await;
                 if outcome == PushSendOutcome::Transient {
                     if !self.pause(backoff.next_delay()).await {
-                        return;
+                        break;
                     }
                 } else {
                     backoff.reset();
                 }
             }
+            // A graceful stop sends every pending wake (§10.7.1 step 6,
+            // **Stop and crash**), with no back-off between sends.
+            for job in self.limiter.take_pending() {
+                let Some(job) = self.registered(job).await else {
+                    continue;
+                };
+                let outcome = sender.send_registered(&job.token).await;
+                self.settle(job, outcome).await;
+            }
+        }
+
+        /// `job` when a registration still holds its token (§10.7.1 step 6,
+        /// **Registration check**). Otherwise the job drops, which zeroizes
+        /// its token and releases its routing ID's ticket, and the token's
+        /// window is released, because no push went out (§10.7.1 step 6,
+        /// **Window**). A store failure drops the job too: a token the store
+        /// cannot vouch for may have been deregistered.
+        async fn registered(&mut self, job: Zeroizing<PushJob>) -> Option<Zeroizing<PushJob>> {
+            let platform = job.platform;
+            match self.store.holds_token(platform, &job.token).await {
+                Ok(true) => return Some(job),
+                Ok(false) => tracing::debug!(
+                    platform = ?platform,
+                    "push token lost its registration before its send; wake discarded"
+                ),
+                Err(e) => {
+                    if let Some(line) = self.logs.registration_check_failed.hit() {
+                        tracing::warn!(
+                            platform = ?platform,
+                            total = line.total,
+                            suppressed = line.suppressed,
+                            error = %e,
+                            "could not check a push token's registration; wake dropped"
+                        );
+                    }
+                }
+            }
+            self.limiter.release(&token_key(platform, &job.token));
+            None
+        }
+
+        /// Records a sent `job`'s `outcome`: a `Transient` push opens no
+        /// window (§10.7.1 step 6, **Window**), so the token's window is
+        /// released, and the outcome goes to the store. The job drops on
+        /// return, which zeroizes its token and releases its routing ID's
+        /// ticket.
+        async fn settle(&mut self, job: Zeroizing<PushJob>, outcome: PushSendOutcome) {
+            let key = token_key(job.platform, &job.token);
+            if outcome == PushSendOutcome::Transient {
+                self.limiter.release(&key);
+            }
+            self.apply(job.platform, key, &job.token, outcome).await;
         }
 
         /// The next job to send under the rate limit (§10.7.1 step 6): a
@@ -731,23 +857,12 @@ mod enabled {
                 };
                 let key = token_key(job.platform, &job.token);
                 lock(&self.queued).remove(&key);
-                let platform = job.platform;
                 let admitted =
                     self.limiter
                         .admit(key, Zeroizing::new(job), tokio::time::Instant::now());
                 match admitted {
                     WakeAdmission::SendNow(job) => return Some(job),
                     WakeAdmission::Deferred | WakeAdmission::Joined => {}
-                    WakeAdmission::Full => {
-                        if let Some(line) = self.logs.deferred_full.hit() {
-                            tracing::warn!(
-                                platform = ?platform,
-                                total = line.total,
-                                suppressed = line.suppressed,
-                                "push rate limit holds its most pending wakes; wake dropped"
-                            );
-                        }
-                    }
                 }
             }
         }
@@ -773,15 +888,14 @@ mod enabled {
             }
         }
 
-        /// Applies `outcome` for `token` to the store. `false` when the
-        /// service stopped meanwhile.
+        /// Applies `outcome` for `token` to the store.
         async fn apply(
             &mut self,
             platform: PushPlatform,
             key: TokenKey,
             token: &[u8],
             outcome: PushSendOutcome,
-        ) -> bool {
+        ) {
             match outcome {
                 PushSendOutcome::Delivered => {
                     match self.store.clear_invalid_tokens(platform, token).await {
@@ -795,7 +909,7 @@ mod enabled {
                             {
                                 self.pending_resets.insert(key);
                             } else {
-                                return self.retry_reset(platform, token).await;
+                                self.retry_reset(platform, token).await;
                             }
                         }
                     }
@@ -831,19 +945,19 @@ mod enabled {
                     }
                 }
             }
-            true
         }
 
         /// Writes a reset the drain has no room to carry, retrying with
-        /// back-off until it lands. `false` when the service stopped first.
-        async fn retry_reset(&self, platform: PushPlatform, token: &[u8]) -> bool {
+        /// back-off until it lands or the service stops. A reset lost to the
+        /// stop costs nothing: the next start clears every count.
+        async fn retry_reset(&self, platform: PushPlatform, token: &[u8]) {
             let mut backoff = ReconnectBackoff::new(TRANSIENT_BACKOFF_MIN, TRANSIENT_BACKOFF_MAX);
             loop {
                 if !self.pause(backoff.next_delay()).await {
-                    return false;
+                    return;
                 }
                 match self.store.clear_invalid_tokens(platform, token).await {
-                    Ok(_) => return true,
+                    Ok(_) => return,
                     Err(e) => self.store_failed(platform, &e),
                 }
             }
@@ -1146,17 +1260,29 @@ mod enabled {
             assert_eq!(log.total(), 5);
         }
 
-        /// Zeroizing a job wipes its token, so the rate limiter's
-        /// `Zeroizing<PushJob>` wipes the token of every job it drops.
+        /// A token buffer whose bytes the test reads after the job wipes it.
+        struct SharedToken(Arc<Mutex<Vec<u8>>>);
+
+        impl Zeroize for SharedToken {
+            fn zeroize(&mut self) {
+                lock(&self.0).as_mut_slice().zeroize();
+            }
+        }
+
+        /// Zeroizing a job overwrites every byte of its token, so the rate
+        /// limiter's `Zeroizing<PushJob>` wipes the token of every job it
+        /// drops. The test reads the token's bytes after the wipe, so a
+        /// `zeroize` that only shortens or forgets the token fails it.
         #[test]
         fn zeroizing_a_job_wipes_its_token() {
+            let bytes = Arc::new(Mutex::new(b"secret-token".to_vec()));
             let mut job = PushJob {
                 platform: PushPlatform::Apns,
-                token: Zeroizing::new(b"secret-token".to_vec()),
+                token: Zeroizing::new(SharedToken(Arc::clone(&bytes))),
                 _ticket: Arc::new(()),
             };
             job.zeroize();
-            assert!(job.token.is_empty(), "token left: {:?}", job.token.len());
+            assert_eq!(*lock(&bytes), vec![0; 12], "token bytes left");
         }
 
         /// With push disabled, `notify` does nothing.
@@ -1637,13 +1763,39 @@ mod enabled {
                 async fn limited()
                 -> Result<(PushRole, RecordingSender, TempDir), Box<dyn std::error::Error>>
                 {
-                    let sender =
-                        RecordingSender::new(PushPlatform::Apns, [PushSendOutcome::Delivered; 16]);
+                    let (_, push, sender, dir) =
+                        limited_with([PushSendOutcome::Delivered; 16]).await?;
+                    Ok((push, sender, dir))
+                }
+
+                /// As [`limited`], with the sender answering `outcomes` in
+                /// order, and the service itself returned too.
+                async fn limited_with(
+                    outcomes: impl IntoIterator<Item = PushSendOutcome>,
+                ) -> Result<
+                    (PushService, PushRole, RecordingSender, TempDir),
+                    Box<dyn std::error::Error>,
+                > {
+                    let sender = RecordingSender::new(PushPlatform::Apns, outcomes);
                     let (config, dir) = config(vec![recording(&sender)])?;
-                    let push = PushRole::Enabled(PushService::start(config)?);
+                    let service = PushService::start(config)?;
+                    let push = PushRole::Enabled(service.clone());
                     register(&push, REGISTRANT_A, PushPlatform::Apns, b"t1", &[RID]).await?;
                     register(&push, REGISTRANT_A, PushPlatform::Apns, b"t2", &[RID2]).await?;
-                    Ok((push, sender, dir))
+                    Ok((service, push, sender, dir))
+                }
+
+                /// Deregisters `token` from registrant A, as a signed
+                /// `PushDeregistration` does.
+                async fn deregister(service: &PushService, token: &[u8]) -> TestResult {
+                    let key = crate::relay::push_store::PushRegistrationKey {
+                        registrant: REGISTRANT_A.to_owned(),
+                        platform: PushPlatform::Apns,
+                        token: token.to_vec(),
+                    };
+                    let later = scp_clock::Clock::now_secs(&scp_clock::SystemClock) + 60;
+                    assert!(service.config().store.deregister(&key, later).await?);
+                    Ok(())
                 }
 
                 /// Publishes to `routing_id` and returns once its first wake
@@ -1730,25 +1882,171 @@ mod enabled {
                     Ok(())
                 }
 
-                /// Stopping the service drops a pending wake unsent: no wake
-                /// goes out after the window closes. The limiter test
-                /// `dropping_the_limiter_zeroizes_its_pending_wake` shows that
-                /// the drop zeroizes the token.
+                /// A graceful stop sends the pending wake before the window
+                /// closes, and `stop` returns only after it went out
+                /// (§10.7.1 step 6, **Stop and crash**).
                 #[tokio::test(start_paused = true)]
-                async fn stopping_the_service_drops_the_pending_wake() -> TestResult {
-                    let (push, sender, _dir) = limited().await?;
-                    first_wake(&push, &sender, &RID).await?;
+                async fn graceful_stop_sends_the_pending_wake() -> TestResult {
+                    let (service, push, sender, _dir) =
+                        limited_with([PushSendOutcome::Delivered; 16]).await?;
+                    let t0 = first_wake(&push, &sender, &RID).await?;
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     notify(&push, &RID);
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     assert_eq!(sender.sent().await.len(), 1, "sent inside the window");
-                    drop(push);
-                    tokio::time::sleep(Duration::from_secs(120)).await;
+                    service.stop().await?;
                     assert_eq!(
-                        sender.sent().await.len(),
-                        1,
-                        "sent after the service stopped"
+                        sender.sent().await,
+                        vec![b"t1".to_vec(); 2],
+                        "the pending wake was not sent on the stop"
                     );
+                    assert!(
+                        Instant::now() < t0 + PUSH_WAKE_WINDOW,
+                        "the stop waited out the window"
+                    );
+                    // A second stop waits for nothing.
+                    service.stop().await?;
+                    Ok(())
+                }
+
+                /// A `Transient` push opens no window: after one at t0, a
+                /// publish at t0 + 2 s is sent once the back-off (at most
+                /// 1.25 s) has ended, not when a window would close at
+                /// t0 + 30 s (§10.7.1 step 6, **Window**).
+                #[tokio::test(start_paused = true)]
+                async fn transient_push_opens_no_window() -> TestResult {
+                    let (_service, push, sender, _dir) =
+                        limited_with([PushSendOutcome::Transient, PushSendOutcome::Delivered])
+                            .await?;
+                    let t0 = first_wake(&push, &sender, &RID).await?;
+                    tokio::time::sleep_until(t0 + Duration::from_secs(2)).await;
+                    notify(&push, &RID);
+                    wait_for_sends(&sender, 2).await?;
+                    assert!(
+                        Instant::now() <= t0 + Duration::from_millis(2_100),
+                        "the wake after a transient failure went out {:?} after it",
+                        Instant::now() - t0
+                    );
+                    Ok(())
+                }
+
+                /// A pending wake whose window closes while the drain backs
+                /// off after a `Transient` push goes out when the back-off
+                /// ends: `t1`'s window closes at t0 + 30 s, `t2` fails
+                /// transiently at t0 + 29.5 s, and its 1 s to 1.25 s back-off
+                /// ends after the close (§10.7.1 step 6, **Deferral**).
+                #[tokio::test(start_paused = true)]
+                async fn pending_wake_waits_out_the_back_off() -> TestResult {
+                    let (_service, push, sender, _dir) = limited_with([
+                        PushSendOutcome::Delivered,
+                        PushSendOutcome::Transient,
+                        PushSendOutcome::Delivered,
+                    ])
+                    .await?;
+                    let t0 = first_wake(&push, &sender, &RID).await?;
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    notify(&push, &RID);
+                    tokio::time::sleep_until(t0 + Duration::from_millis(29_500)).await;
+                    notify(&push, &RID2);
+                    wait_for_sends(&sender, 2).await?;
+                    tokio::time::sleep_until(t0 + Duration::from_millis(30_300)).await;
+                    assert_eq!(sender.sent().await.len(), 2, "sent during the back-off");
+                    wait_for_sends(&sender, 3).await?;
+                    let at = Instant::now() - t0;
+                    assert!(
+                        at >= Duration::from_millis(30_500) && at <= Duration::from_millis(30_900),
+                        "the pending wake went out {at:?} after the first"
+                    );
+                    assert_eq!(
+                        sender.sent().await,
+                        vec![b"t1".to_vec(), b"t2".to_vec(), b"t1".to_vec()]
+                    );
+                    Ok(())
+                }
+
+                /// A wake held for a token that is deregistered before its
+                /// window closes is not sent (§10.7.1 step 6, **Registration
+                /// check**).
+                #[tokio::test(start_paused = true)]
+                async fn held_wake_for_a_deregistered_token_is_not_sent() -> TestResult {
+                    let (service, push, sender, _dir) =
+                        limited_with([PushSendOutcome::Delivered; 16]).await?;
+                    first_wake(&push, &sender, &RID).await?;
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    notify(&push, &RID);
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    deregister(&service, b"t1").await?;
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    assert_eq!(
+                        sender.sent().await,
+                        vec![b"t1".to_vec()],
+                        "sent to a deregistered token"
+                    );
+                    // The stop has nothing left to send either.
+                    service.stop().await?;
+                    assert_eq!(sender.sent().await.len(), 1);
+                    Ok(())
+                }
+
+                /// A held wake whose registration check fails in the store
+                /// is not sent, even by a graceful stop: a token the store
+                /// cannot vouch for may have been deregistered (§10.7.1
+                /// step 6, **Registration check**).
+                #[tokio::test]
+                async fn held_wake_is_not_sent_when_the_store_check_fails() -> TestResult {
+                    let (service, push, sender, dir) =
+                        limited_with([PushSendOutcome::Delivered; 16]).await?;
+                    first_wake(&push, &sender, &RID).await?;
+                    notify(&push, &RID);
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    assert_eq!(sender.sent().await.len(), 1, "sent inside the window");
+                    // Break the store under the drain: every check now fails.
+                    rusqlite::Connection::open(dir.path().join("push.db"))?
+                        .execute_batch("DROP TABLE push_registrations;")?;
+                    service.stop().await?;
+                    assert_eq!(
+                        sender.sent().await,
+                        vec![b"t1".to_vec()],
+                        "sent a wake the store could not vouch for"
+                    );
+                    Ok(())
+                }
+
+                /// A job on the queue whose token is deregistered before the
+                /// drain reads it is not sent; the job queued beside it for
+                /// a token still registered is (§10.7.1 step 6,
+                /// **Registration check**).
+                #[tokio::test]
+                async fn queued_job_for_a_deregistered_token_is_not_sent() -> TestResult {
+                    let (service, push, sender, _dir) =
+                        limited_with([PushSendOutcome::Delivered; 16]).await?;
+                    let config = service.config().clone();
+                    drop(push);
+                    service.stop().await?;
+                    let (tx, rx) = mpsc::channel(4);
+                    for token in [b"t1", b"t2"] {
+                        tx.send(PushJob {
+                            platform: PushPlatform::Apns,
+                            token: Zeroizing::new(token.to_vec()),
+                            _ticket: Arc::new(()),
+                        })
+                        .await?;
+                    }
+                    deregister(&service, b"t1").await?;
+                    drop(tx);
+                    Drain {
+                        senders: Arc::from(vec![recording(&sender)]),
+                        index: 0,
+                        store: config.store,
+                        queued: Arc::default(),
+                        logs: Arc::default(),
+                        stop: CancellationToken::new(),
+                        pending_resets: HashSet::new(),
+                        limiter: PushWakeLimiter::new(PUSH_WAKE_WINDOW),
+                    }
+                    .drain(rx)
+                    .await;
+                    assert_eq!(sender.sent().await, vec![b"t2".to_vec()]);
                     Ok(())
                 }
             }

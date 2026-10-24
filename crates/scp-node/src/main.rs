@@ -405,7 +405,11 @@ async fn run_relay_only() {
     shutdown.await;
 
     tracing::info!("shutdown signal received, stopping relay");
-    handle.shutdown();
+    // Sends every pending push wake before the process exits (§10.7.1
+    // step 6, Stop and crash).
+    if let Err(e) = handle.shutdown_gracefully().await {
+        tracing::error!(error = %e, "relay stopped with push wakes lost");
+    }
     tracing::info!("relay stopped");
 }
 

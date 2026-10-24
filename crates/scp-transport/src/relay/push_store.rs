@@ -559,6 +559,26 @@ impl PushRegistrationStore {
         }
     }
 
+    /// Whether any registration holds (`platform`, `token`). The push
+    /// dispatcher asks before every send, so a wake queued or held before
+    /// its token was deregistered or removed is not sent (§10.7.1 step 6,
+    /// **Registration check**).
+    ///
+    /// # Errors
+    ///
+    /// [`PushStoreError::Storage`] when the database fails.
+    pub async fn holds_token(
+        &self,
+        platform: PushPlatform,
+        token: &[u8],
+    ) -> Result<bool, PushStoreError> {
+        match self {
+            Self::Sqlite(s) => s.holds_token(platform, token).await,
+            #[cfg(feature = "testing")]
+            Self::InMemory(s) => Ok(s.holds_token(platform, token).await),
+        }
+    }
+
     /// Returns the (`platform`, `token`) pair's consecutive invalid-token
     /// count, or `None` when no registration holds the token.
     ///
@@ -1143,6 +1163,24 @@ impl SqlitePushStore {
         .await
     }
 
+    async fn holds_token(
+        &self,
+        platform: PushPlatform,
+        token: &[u8],
+    ) -> Result<bool, PushStoreError> {
+        let token = Zeroizing::new(token.to_vec());
+        self.with_conn(move |conn| {
+            conn.query_row(
+                "SELECT EXISTS (SELECT 1 FROM push_registrations
+                 WHERE platform = ?1 AND token = ?2)",
+                params![platform.tag_byte(), token.as_slice()],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|e| storage("check token held", &e))
+        })
+        .await
+    }
+
     async fn invalid_token_failures(
         &self,
         platform: PushPlatform,
@@ -1544,6 +1582,13 @@ mod in_memory {
 
         pub(super) async fn clear_all_invalid_tokens(&self) {
             self.state.lock().await.token_failures.clear();
+        }
+
+        pub(super) async fn holds_token(&self, platform: PushPlatform, token: &[u8]) -> bool {
+            let state = self.state.lock().await;
+            let held = state.holders(&(platform, token.to_vec()));
+            drop(state);
+            held
         }
 
         pub(super) async fn invalid_token_failures(

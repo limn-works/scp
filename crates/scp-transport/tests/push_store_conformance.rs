@@ -617,6 +617,29 @@ async fn deregister_removes_only_its_own_key(store: PushRegistrationStore) -> Ou
     Ok(())
 }
 
+/// `holds_token` answers per (platform, token): true while any registration
+/// holds the pair, false once the last holder is deregistered, and never for
+/// the same token on another platform.
+async fn holds_token_tracks_the_last_holder(store: PushRegistrationStore) -> Outcome {
+    let alice = record("did:dht:alice", b"tok-1", &[A], 1);
+    let bob = record("did:dht:bob", b"tok-1", &[B], 1);
+    assert!(!store.holds_token(APNS, b"tok-1").await?);
+    store.upsert(alice.clone()).await?;
+    store.upsert(bob.clone()).await?;
+    assert!(store.holds_token(APNS, b"tok-1").await?);
+    assert!(!store.holds_token(PushPlatform::Fcm, b"tok-1").await?);
+    assert!(!store.holds_token(APNS, b"tok-2").await?);
+
+    assert!(store.deregister(&alice.key(), 2).await?);
+    assert!(
+        store.holds_token(APNS, b"tok-1").await?,
+        "bob still holds it"
+    );
+    assert!(store.deregister(&bob.key(), 2).await?);
+    assert!(!store.holds_token(APNS, b"tok-1").await?);
+    Ok(())
+}
+
 async fn registration_replayed_after_deregistration_is_stale(
     store: PushRegistrationStore,
 ) -> Outcome {
@@ -777,6 +800,7 @@ both_arms!(
     malformed_records_are_refused,
     each_device_on_one_platform_holds_its_own_registration,
     deregister_removes_only_its_own_key,
+    holds_token_tracks_the_last_holder,
     registration_replayed_after_deregistration_is_stale,
     prune_drops_only_floors_below_the_bound,
     deregistration_timestamp_out_of_range_is_refused,
