@@ -684,7 +684,7 @@ fn log_format_is_json(raw: Option<OsString>) -> Result<bool, StartupError> {
 }
 
 /// The relay's subscriber: `filter`, then the relay's fixed cap
-/// (`push_webpush::admits_log_event`, which holds hyper-util and reqwest at
+/// (`push_webpush::admits_log_event`, which holds every crate outside SCP at
 /// INFO so no line names a `WebPush` endpoint's host), formatted as JSON when
 /// `json`, written to `writer`.
 fn relay_subscriber<W>(
@@ -722,9 +722,10 @@ where
 /// Log level is determined by `RUST_LOG` (takes precedence) or
 /// `SCP_RELAY_LOG_LEVEL` (default: `info`). Output format is controlled
 /// by `SCP_RELAY_LOG_FORMAT`: `json` for structured JSON, `pretty` (the
-/// default) for human-readable output. hyper-util and reqwest log at INFO at
-/// most, whatever those variables ask for. The subscriber also forwards `log`
-/// records, so reqwest's lines reach that cap.
+/// default) for human-readable output. Every crate outside SCP logs at INFO
+/// at most, whatever those variables ask for. The subscriber also forwards
+/// `log` records, so the lines of crates that log through `log` (reqwest,
+/// rustls) reach that cap.
 ///
 /// # Errors
 ///
@@ -1697,11 +1698,12 @@ mod tests {
         }
     }
 
-    /// G2: the relay's subscriber drops hyper-util's DEBUG lines, which name
-    /// the host a connection goes to, even under `RUST_LOG=trace`, in both
-    /// formats, and keeps everything else the filter admits.
+    /// G2: the relay's subscriber drops every non-SCP crate's DEBUG lines,
+    /// which can name the host a connection goes to, even under
+    /// `RUST_LOG=trace`, in both formats, and keeps everything else the
+    /// filter admits.
     #[test]
-    fn the_relay_log_holds_host_logging_crates_at_info() -> Result<(), Box<dyn std::error::Error>> {
+    fn the_relay_log_holds_other_crates_at_info() -> Result<(), Box<dyn std::error::Error>> {
         #[derive(Clone, Default)]
         struct Buffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
         impl std::io::Write for Buffer {
@@ -1734,6 +1736,11 @@ mod tests {
                     "starting new connection: https://push.example.net/"
                 );
                 tracing::info!(target: "reqwest::connect", "reqwest marker");
+                tracing::debug!(
+                    target: "rustls::client::hs",
+                    "No cached session for DnsName(\"push.example.net\")"
+                );
+                tracing::debug!(target: "some_new_crate::x", "push.example.net");
                 tracing::debug!(target: "scp_transport::relay::push_webpush", "own marker");
             });
             let logs = String::from_utf8_lossy(

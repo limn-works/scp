@@ -365,34 +365,27 @@ impl Backoffs {
     }
 }
 
-/// The most verbose level the relay logs from a crate in
-/// [`HOST_LOGGING_CRATES`].
+/// The most verbose level the relay logs from a crate outside SCP.
 #[cfg(any(test, feature = "startup"))]
-const HOST_LOGGING_CRATE_CAP: tracing::Level = tracing::Level::INFO;
+const OTHER_CRATE_CAP: tracing::Level = tracing::Level::INFO;
 
-/// The crates on the `WebPush` send path whose DEBUG or TRACE lines name the
-/// host each connection goes to: hyper-util's connector and pool through
-/// `tracing`, and reqwest's connector (`starting new connection: <uri>`)
-/// through the `log` crate, which `tracing-log` forwards under the target
-/// `reqwest::connect`. h2, hyper-rustls and rustls log no host on this path.
+/// The target prefix of every SCP crate: each is named `scp-*`, so its
+/// module path, the default `tracing` and `log` target, starts with `scp_`.
 #[cfg(any(test, feature = "startup"))]
-const HOST_LOGGING_CRATES: [&str; 2] = ["hyper_util", "reqwest"];
+const SCP_CRATE_PREFIX: &str = "scp_";
 
 /// Whether the relay's log keeps an event with `metadata`. A `WebPush`
 /// endpoint's host is a registrant's choice that PUSH-022 keeps out of the
-/// log, so every crate in [`HOST_LOGGING_CRATES`] is held at
-/// [`HOST_LOGGING_CRATE_CAP`] whatever `RUST_LOG` asks for. The relay's
-/// tracing subscriber (`startup`) and the push sender tests' log capture
-/// apply this one predicate.
+/// log. A dependency's DEBUG or TRACE lines can name the host a connection
+/// goes to: hyper-util's connector and pool, reqwest's connector, and rustls's
+/// client handshake (`No cached session for DnsName(..)`) all do. So only an
+/// SCP crate's event is kept below [`OTHER_CRATE_CAP`]; every other target,
+/// including a crate added later, is held at that cap whatever `RUST_LOG`
+/// asks for. The relay's tracing subscriber (`startup`) and the push sender
+/// tests' log capture apply this one predicate.
 #[cfg(any(test, feature = "startup"))]
 pub(crate) fn admits_log_event(metadata: &tracing::Metadata<'_>) -> bool {
-    let target = metadata.target();
-    let capped = HOST_LOGGING_CRATES.iter().any(|name| {
-        target
-            .strip_prefix(name)
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
-    });
-    !capped || *metadata.level() <= HOST_LOGGING_CRATE_CAP
+    metadata.target().starts_with(SCP_CRATE_PREFIX) || *metadata.level() <= OTHER_CRATE_CAP
 }
 
 /// The endpoint origin of a registered `WebPush` token, the key of the
@@ -585,10 +578,11 @@ impl WebPushSender {
     }
 
     /// Completes once a lookup frees a permit of this sender's endpoint
-    /// lookup pool, at once when one freed since the last completed wait.
+    /// lookup pool, at once when one freed since the last completed wait,
+    /// with the number of permits a send's lookup can take then.
     #[cfg(any(test, feature = "push-store"))]
-    pub(crate) async fn lookup_permit_freed(&self) {
-        self.resolver.lookup_permit_freed().await;
+    pub(crate) async fn lookup_permit_freed(&self) -> usize {
+        self.resolver.lookup_permit_freed().await
     }
 
     /// Takes every endpoint lookup permit until the returned permits drop.
@@ -1469,6 +1463,45 @@ pub(crate) mod tests {
         );
         assert!(!logs.contains("starting new connection"), "{logs}");
         assert!(logs.contains("reqwest info marker"), "{logs}");
+    }
+
+    /// G2: rustls's client handshake names the server at DEBUG through
+    /// `log`; the relay's cap holds it at INFO.
+    #[test]
+    fn a_rustls_handshake_debug_line_is_not_logged() {
+        let capture = LogCapture::install(admits_log_event);
+        log::debug!(
+            target: "rustls::client::hs",
+            "No cached session for DnsName(\"push.example.net\")"
+        );
+        log::info!(target: "rustls::client::hs", "rustls info marker");
+        let logs = capture.contents();
+        assert!(!logs.contains("push.example.net"), "{logs}");
+        assert!(logs.contains("rustls info marker"), "{logs}");
+    }
+
+    /// G2: a crate the cap names nowhere, such as one a later change adds,
+    /// is held at INFO too.
+    #[test]
+    fn an_unlisted_crates_debug_line_is_not_logged() {
+        let capture = LogCapture::install(admits_log_event);
+        tracing::debug!(target: "some_new_crate::x", "connecting to push.example.net");
+        tracing::trace!(target: "some_new_crate", "trace push.example.net");
+        tracing::info!(target: "some_new_crate::x", "new crate info marker");
+        let logs = capture.contents();
+        assert!(!logs.contains("push.example.net"), "{logs}");
+        assert!(logs.contains("new crate info marker"), "{logs}");
+    }
+
+    /// G2: an SCP crate's DEBUG and TRACE lines are kept.
+    #[test]
+    fn an_scp_crates_debug_line_is_logged() {
+        let capture = LogCapture::install(admits_log_event);
+        tracing::debug!(target: "scp_node::relay", "scp debug marker");
+        tracing::trace!(target: "scp_transport", "scp trace marker");
+        let logs = capture.contents();
+        assert!(logs.contains("scp debug marker"), "{logs}");
+        assert!(logs.contains("scp trace marker"), "{logs}");
     }
 
     /// B1: sends already in flight when their origin starts backing off,

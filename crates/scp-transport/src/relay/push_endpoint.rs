@@ -831,12 +831,15 @@ impl CheckedResolver {
     }
 
     /// Completes once a lookup of this resolver or a clone returns its
-    /// permits, at once when one did since the last completed wait. The
-    /// `WebPush` dispatcher waits on it to retry a wake whose send found the
-    /// pool full.
+    /// permits, at once when one did since the last completed wait, with the
+    /// number of permits a wake's lookup can take then. Several permits that
+    /// free before the wait completes complete it once, so the count, not the
+    /// completion, says how many held wakes may retry. The `WebPush`
+    /// dispatcher waits on it to retry a wake whose send found the pool full.
     #[cfg(any(test, feature = "push-store"))]
-    pub(crate) async fn lookup_permit_freed(&self) {
+    pub(crate) async fn lookup_permit_freed(&self) -> usize {
         self.permits.freed.notified().await;
+        self.permits.all.available_permits()
     }
 
     fn check(&self, ip: IpAddr) -> Result<(), EndpointError> {
@@ -1302,12 +1305,12 @@ mod tests {
 
     /// With every lookup permit taken, a lookup fails fast as a full pool,
     /// never as a timeout or a failure of the endpoint, and starts no lookup;
-    /// a freed permit signals the waiter.
+    /// a freed permit signals the waiter with the number of permits free.
     #[tokio::test]
     async fn a_full_lookup_pool_refuses_without_starting_a_lookup() -> TestResult {
         let table = HashMap::from([("public.example".to_owned(), vec![ip("8.8.8.8")?])]);
         let resolver = CheckedResolver::for_tests(OwnAddresses::new([]), table, false);
-        let held = resolver.exhaust_permits()?;
+        let mut held = resolver.exhaust_permits()?;
         assert_eq!(
             resolver.resolve_checked("public.example").await,
             Err(EndpointError::LookupPoolFull)
@@ -1326,8 +1329,12 @@ mod tests {
         assert_eq!(resolver.lookups_started(), 0);
         assert!(!EndpointError::LookupPoolFull.is_refusal());
         let freed = resolver.lookup_permit_freed();
+        drop(held.pop());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), freed).await?,
+            1
+        );
         drop(held);
-        tokio::time::timeout(Duration::from_secs(1), freed).await?;
         assert_eq!(resolver.resolve_checked("public.example").await?.len(), 1);
         assert_eq!(resolver.lookups_started(), 1);
         Ok(())

@@ -670,6 +670,11 @@ mod enabled {
             Arc::as_ptr(&self.job.ticket).addr()
         }
 
+        /// The group this job waits in: its routing ID's jobs to its origin.
+        fn group(&self) -> Group {
+            (self.ticket(), self.origin.clone())
+        }
+
         /// The keys whose caps this job counts against while in flight.
         fn gates(&self) -> impl Iterator<Item = Gate> + use<> {
             [
@@ -683,9 +688,9 @@ mod enabled {
     }
 
     /// A key whose cap, or whose origin's back-off, can keep a held `WebPush`
-    /// job from starting. Each blocked job waits in the queue of the key that
-    /// blocks it, so a finished send re-examines only the queues of the keys
-    /// it frees.
+    /// job from starting. Each blocked group of jobs waits in the list of the
+    /// key that blocks its oldest job, so a finished send re-examines only the
+    /// lists of the keys it frees.
     #[derive(Debug, Clone, PartialEq, Eq, Hash)]
     enum Gate {
         /// The token's own send is in flight.
@@ -775,33 +780,47 @@ mod enabled {
         }
     }
 
-    /// The `WebPush` jobs the drain holds, each in the queue of what blocks
-    /// it.
+    /// A routing ID's held jobs to one endpoint origin: its ticket's address
+    /// and the origin. The jobs of one group share every key but their
+    /// tokens, so they wait together, oldest first.
+    type Group = (usize, Option<String>);
+
+    /// What a waiting group waits on.
+    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+    enum List {
+        /// A key whose cap or back-off blocks the group's oldest job.
+        Key(Gate),
+        /// Only a drain-wide slot.
+        Sends,
+    }
+
+    /// The `WebPush` jobs the drain holds.
     ///
-    /// A job blocked by a key's cap or its origin's back-off waits in that
-    /// key's queue in `gates`; a job blocked only by the drain-wide cap waits
-    /// in `sends`; a job whose send found the endpoint lookup pool full waits
-    /// in `lookup`. A queue keeps the order its jobs began waiting on it, and
-    /// a new job sharing a key with a non-empty queue joins the back of that
-    /// queue, so the jobs waiting on one key start in the order they began
-    /// waiting on it.
+    /// A blocked job waits in its group, behind the group's older jobs, and
+    /// each non-empty group waits in exactly one list: that of the key whose
+    /// cap or back-off blocks the group's oldest job, or `Sends` when only
+    /// the drain-wide cap does. A job whose send found the endpoint lookup
+    /// pool full waits in `lookup` instead. A list keeps the order its groups
+    /// began waiting on it, and a new group sharing a key with a non-empty
+    /// list joins the back of that list.
     ///
-    /// Every non-empty queue in `gates` has a head that its own key blocks
-    /// (re-examined when a send holding that key ends, or, for a back-off,
-    /// when `timers` fires), or that waits only on a drain-wide slot (listed
-    /// in `stalled`). A finished send re-examines its keys' queues and, while
-    /// a drain-wide slot is free, the `stalled` queues in the order they
-    /// stalled, then `sends`. Each examination starts the job at a queue's
-    /// head, moves it to the queue of what now blocks it, or ends the pass
-    /// over that queue, so the cost of one event does not grow with the
-    /// number of jobs held.
+    /// A list is examined again only when its key frees: a send holding the
+    /// key ends, the origin's back-off ends (`timers`), or, for a list whose
+    /// head group waits only on a drain-wide slot (listed in `stalled`), a
+    /// drain-wide slot frees. Each examination starts the head group's oldest
+    /// job, moves the whole group to the list of what now blocks it, or ends
+    /// the pass over that list. Moving a group costs the same whatever its
+    /// length, so the cost of one event grows with the jobs it starts and the
+    /// groups it moves, never with the jobs held.
     #[derive(Default)]
     struct Waiting {
-        gates: HashMap<Gate, VecDeque<Held>>,
-        sends: VecDeque<Held>,
+        /// The non-empty groups, each oldest job first.
+        groups: HashMap<Group, VecDeque<Held>>,
+        /// The non-empty lists; each group in `groups` is in exactly one.
+        lists: HashMap<List, VecDeque<Group>>,
         lookup: VecDeque<Held>,
-        /// The queues whose head waits only on a drain-wide slot, in the
-        /// order they stalled; `stalled_set` holds the same keys.
+        /// The keys whose list's head group waits only on a drain-wide slot,
+        /// in the order they stalled; `stalled_set` holds the same keys.
         stalled: VecDeque<Gate>,
         stalled_set: HashSet<Gate>,
         /// Origin back-off ends to re-examine at, earliest first. `timer_at`
@@ -815,9 +834,10 @@ mod enabled {
     }
 
     impl Waiting {
-        /// Takes in a job that is not waiting: starts it into `ready` when
-        /// nothing blocks it, and otherwise queues it behind the jobs already
-        /// waiting on one of its keys, or on what blocks it.
+        /// Takes in a job that is not waiting: queues it behind its group's
+        /// jobs when the group waits, starts it into `ready` when nothing
+        /// blocks it, and otherwise opens its group in the list of a key it
+        /// shares with a waiting group, or of what blocks it.
         fn arrive(
             &mut self,
             held: Held,
@@ -829,14 +849,29 @@ mod enabled {
             {
                 self.examined += 1;
             }
-            // `gates` holds no empty queue.
-            if let Some(gate) = held.gates().find(|gate| self.gates.contains_key(gate)) {
-                self.gates.entry(gate).or_default().push_back(held);
+            let group = held.group();
+            if let Some(jobs) = self.groups.get_mut(&group) {
+                jobs.push_back(held);
+                return;
+            }
+            // `lists` holds no empty list.
+            if let Some(gate) = held
+                .gates()
+                .find(|gate| self.lists.contains_key(&List::Key(gate.clone())))
+            {
+                self.groups.insert(group.clone(), VecDeque::from([held]));
+                self.lists
+                    .entry(List::Key(gate))
+                    .or_default()
+                    .push_back(group);
                 return;
             }
             match in_flight.block(&held, retry_at) {
                 None => Self::start(held, in_flight, ready),
-                Some(block) => self.wait(held, block),
+                Some(block) => {
+                    self.groups.insert(group.clone(), VecDeque::from([held]));
+                    self.park(group, block);
+                }
             }
         }
 
@@ -862,22 +897,21 @@ mod enabled {
             ready.push(held);
         }
 
-        /// Queues `held` on what blocks it.
-        fn wait(&mut self, held: Held, block: Block) {
-            match block {
-                Block::Sends => self.sends.push_back(held),
-                Block::Cap(gate) => self.gates.entry(gate).or_default().push_back(held),
+        /// Puts `group`, which is in no list, at the back of the list of what
+        /// blocks its oldest job.
+        fn park(&mut self, group: Group, block: Block) {
+            let list = match block {
+                Block::Sends => List::Sends,
+                Block::Cap(gate) => List::Key(gate),
                 Block::Backoff(origin, until) => {
                     self.schedule(&origin, until);
-                    self.gates
-                        .entry(Gate::Origin(origin))
-                        .or_default()
-                        .push_back(held);
+                    List::Key(Gate::Origin(origin))
                 }
-            }
+            };
+            self.lists.entry(list).or_default().push_back(group);
         }
 
-        /// Re-examines `origin`'s queue at `until`, unless an earlier
+        /// Re-examines `origin`'s list at `until`, unless an earlier
         /// re-examination is pending, which schedules the next one itself.
         fn schedule(&mut self, origin: &str, until: tokio::time::Instant) {
             if self.timer_at.get(origin).is_some_and(|at| *at <= until) {
@@ -893,56 +927,86 @@ mod enabled {
             }
         }
 
-        /// Starts or moves on the jobs at the head of `gate`'s queue until
-        /// one waits on `gate` itself or on a drain-wide slot.
+        /// Takes the head group off `list`, dropping the list once empty.
+        fn pop_group(&mut self, list: &List) -> Option<Group> {
+            let groups = self.lists.get_mut(list)?;
+            let group = groups.pop_front();
+            if groups.is_empty() {
+                self.lists.remove(list);
+            }
+            group
+        }
+
+        /// Starts the oldest jobs of the head groups of `list`, or moves a
+        /// head group on to the list of what now blocks it, until the head
+        /// group waits on `list`'s own key or on a drain-wide slot.
         fn pass(
             &mut self,
-            gate: &Gate,
+            list: &List,
             in_flight: &mut InFlight,
             retry_at: RetryAt<'_>,
             ready: &mut Vec<Held>,
         ) {
             loop {
-                let Some(head) = self.gates.get(gate).and_then(VecDeque::front) else {
+                let Some(group) = self.lists.get(list).and_then(VecDeque::front) else {
                     return;
+                };
+                let Some(head) = self.groups.get(group).and_then(VecDeque::front) else {
+                    // `groups` holds no empty group, so this does not happen;
+                    // if it ever does, the list moves on rather than stop.
+                    self.pop_group(list);
+                    continue;
                 };
                 let block = in_flight.block(head, retry_at);
                 #[cfg(test)]
                 {
                     self.examined += 1;
                 }
-                match &block {
-                    Some(Block::Sends) => {
-                        self.stall(gate.clone());
+                match (list, &block) {
+                    (List::Sends, Some(Block::Sends)) => return,
+                    (List::Key(own), Some(Block::Sends)) => {
+                        self.stall(own.clone());
                         return;
                     }
-                    Some(Block::Cap(blocking)) if blocking == gate => return,
-                    Some(Block::Backoff(origin, until)) if matches!(gate, Gate::Origin(own) if own == origin) =>
+                    (List::Key(own), Some(Block::Cap(blocking))) if blocking == own => return,
+                    (List::Key(Gate::Origin(own)), Some(Block::Backoff(origin, until)))
+                        if own == origin =>
                     {
                         self.schedule(origin, *until);
                         return;
                     }
                     _ => {}
                 }
-                let Some(queue) = self.gates.get_mut(gate) else {
+                let Some(group) = self.pop_group(list) else {
                     return;
                 };
-                let Some(next) = queue.pop_front() else {
-                    return;
-                };
-                if queue.is_empty() {
-                    self.gates.remove(gate);
-                }
                 match block {
-                    None => Self::start(next, in_flight, ready),
-                    Some(block) => self.wait(next, block),
+                    None => {
+                        let Some(jobs) = self.groups.get_mut(&group) else {
+                            continue;
+                        };
+                        if let Some(next) = jobs.pop_front() {
+                            Self::start(next, in_flight, ready);
+                        }
+                        if jobs.is_empty() {
+                            self.groups.remove(&group);
+                        } else {
+                            // The group's next job is examined at once, still
+                            // at the head of this list.
+                            self.lists
+                                .entry(list.clone())
+                                .or_default()
+                                .push_front(group);
+                        }
+                    }
+                    Some(block) => self.park(group, block),
                 }
             }
         }
 
         /// Re-examines what a send that is no longer in flight frees: the
-        /// queues of its `gates`, then, while a drain-wide slot is free, the
-        /// stalled queues and `sends`.
+        /// lists of its `gates`, then, while a drain-wide slot is free, the
+        /// stalled lists and `Sends`.
         fn freed(
             &mut self,
             gates: impl IntoIterator<Item = Gate>,
@@ -951,29 +1015,16 @@ mod enabled {
             ready: &mut Vec<Held>,
         ) {
             for gate in gates {
-                self.pass(&gate, in_flight, retry_at, ready);
+                self.pass(&List::Key(gate), in_flight, retry_at, ready);
             }
             while !in_flight.full()
                 && let Some(gate) = self.stalled.pop_front()
             {
                 self.stalled_set.remove(&gate);
-                self.pass(&gate, in_flight, retry_at, ready);
+                self.pass(&List::Key(gate), in_flight, retry_at, ready);
             }
-            while !in_flight.full()
-                && let Some(held) = self.sends.pop_front()
-            {
-                #[cfg(test)]
-                {
-                    self.examined += 1;
-                }
-                match in_flight.block(&held, retry_at) {
-                    None => Self::start(held, in_flight, ready),
-                    Some(Block::Sends) => {
-                        self.sends.push_front(held);
-                        return;
-                    }
-                    Some(block) => self.wait(held, block),
-                }
+            if !in_flight.full() {
+                self.pass(&List::Sends, in_flight, retry_at, ready);
             }
         }
 
@@ -982,7 +1033,7 @@ mod enabled {
             self.timers.peek().map(|Reverse((at, _))| *at)
         }
 
-        /// Re-examines the queue of every origin whose back-off ended by
+        /// Re-examines the list of every origin whose back-off ended by
         /// `now`.
         fn timers_due(
             &mut self,
@@ -996,17 +1047,15 @@ mod enabled {
             {
                 if self.timer_at.get(&origin) == Some(&at) {
                     self.timer_at.remove(&origin);
-                    self.pass(&Gate::Origin(origin), in_flight, retry_at, ready);
+                    self.pass(&List::Key(Gate::Origin(origin)), in_flight, retry_at, ready);
                 }
             }
         }
 
-        /// How many jobs wait, in every queue.
+        /// How many jobs wait, in every group and in `lookup`.
         #[cfg(test)]
         fn held(&self) -> usize {
-            self.gates.values().map(VecDeque::len).sum::<usize>()
-                + self.sends.len()
-                + self.lookup.len()
+            self.groups.values().map(VecDeque::len).sum::<usize>() + self.lookup.len()
         }
 
         /// Whether a job waits on a lookup permit.
@@ -1014,17 +1063,22 @@ mod enabled {
             !self.lookup.is_empty()
         }
 
-        /// Takes in again every job that waits on a lookup permit, once one
-        /// freed. A job whose send finds the pool full again comes back here
-        /// without any request made, so this costs no network I/O, and each
-        /// round follows a lookup that ended.
+        /// Takes in again the `permits` oldest jobs that wait on a lookup
+        /// permit, one per permit free in the pool, so a freed permit restarts
+        /// one held send rather than every one. A restarted job whose send
+        /// finds the pool full again comes back here without any request
+        /// made.
         fn lookup_freed(
             &mut self,
+            permits: usize,
             in_flight: &mut InFlight,
             retry_at: RetryAt<'_>,
             ready: &mut Vec<Held>,
         ) {
-            for held in std::mem::take(&mut self.lookup) {
+            for _ in 0..permits {
+                let Some(held) = self.lookup.pop_front() else {
+                    return;
+                };
                 self.arrive(held, in_flight, retry_at, ready);
             }
         }
@@ -1041,7 +1095,8 @@ mod enabled {
         Job(Option<PushJob>),
         Sent(Held, SendAttempt),
         BackoffEnded,
-        LookupFreed,
+        /// A lookup permit freed; this many are free now.
+        LookupFreed(usize),
     }
 
     impl Drain {
@@ -1100,7 +1155,7 @@ mod enabled {
                             tokio::select! {
                                 biased;
                                 () = self.stop.cancelled() => return,
-                                () = sender.lookup_permit_freed() => {}
+                                _ = sender.lookup_permit_freed() => {}
                             }
                         }
                     }
@@ -1153,8 +1208,8 @@ mod enabled {
                     () = tokio::time::sleep_until(
                         next_timer.unwrap_or_else(tokio::time::Instant::now)
                     ), if next_timer.is_some() => Step::BackoffEnded,
-                    () = sender.lookup_permit_freed(), if waiting.awaits_lookup() => {
-                        Step::LookupFreed
+                    permits = sender.lookup_permit_freed(), if waiting.awaits_lookup() => {
+                        Step::LookupFreed(permits)
                     }
                 };
                 let mut ready = Vec::new();
@@ -1200,8 +1255,8 @@ mod enabled {
                         &retry_at,
                         &mut ready,
                     ),
-                    Step::LookupFreed => {
-                        waiting.lookup_freed(&mut in_flight, &retry_at, &mut ready);
+                    Step::LookupFreed(permits) => {
+                        waiting.lookup_freed(permits, &mut in_flight, &retry_at, &mut ready);
                     }
                 }
                 if !ready.is_empty() {
@@ -2086,6 +2141,126 @@ mod enabled {
                 "{} examinations for {total} jobs",
                 waiting.examined
             );
+        }
+
+        /// One routing ID holds two sends to one origin, its cap, and 200
+        /// jobs to a second origin that other routing IDs saturate. When one
+        /// of its sends ends, the drain examines a bounded number of jobs, not
+        /// the 200, and when the second origin frees, its jobs start in
+        /// arrival order. A drain that moves each job from the routing ID's
+        /// queue to the origin's on that event examines every one of them.
+        #[test]
+        fn a_routing_id_blocked_on_two_keys_moves_at_bounded_cost() -> TestResult {
+            const HELD: usize = 200;
+            let busy = "https://busy.example.net";
+            let other = "https://other.example.net";
+            let no_backoff = |_: &str| None;
+            let mut waiting = Waiting::default();
+            let mut in_flight = InFlight::default();
+            let mut ready = Vec::new();
+            let saturating: Vec<Arc<()>> = (0..WEBPUSH_SENDS_PER_ORIGIN)
+                .map(|_| Arc::new(()))
+                .collect();
+            for (n, ticket) in saturating.iter().enumerate() {
+                let job = held_job(10_000 + n, ticket, busy);
+                waiting.arrive(job, &mut in_flight, &no_backoff, &mut ready);
+            }
+            let ticket = Arc::new(());
+            for n in 0..WEBPUSH_SENDS_PER_TICKET {
+                let job = held_job(20_000 + n, &ticket, other);
+                waiting.arrive(job, &mut in_flight, &no_backoff, &mut ready);
+            }
+            let mut running: Vec<Held> = std::mem::take(&mut ready);
+            assert_eq!(
+                running.len(),
+                WEBPUSH_SENDS_PER_ORIGIN + WEBPUSH_SENDS_PER_TICKET
+            );
+            for n in 0..HELD {
+                waiting.arrive(
+                    held_job(n, &ticket, busy),
+                    &mut in_flight,
+                    &no_backoff,
+                    &mut ready,
+                );
+            }
+            assert!(ready.is_empty());
+            assert_eq!(waiting.held(), HELD);
+
+            // One of the routing ID's sends to the other origin ends.
+            let Some(at) = running
+                .iter()
+                .position(|held| Arc::ptr_eq(&held.job.ticket, &ticket))
+            else {
+                return Err("the routing ID has no send in flight".into());
+            };
+            let done = running.swap_remove(at);
+            in_flight.remove(&done);
+            let before = waiting.examined;
+            waiting.freed(done.gates(), &mut in_flight, &no_backoff, &mut ready);
+            assert!(ready.is_empty(), "a job started past the saturated origin");
+            assert!(
+                waiting.examined - before <= 3,
+                "{} examinations for one finished send",
+                waiting.examined - before
+            );
+
+            // The saturated origin's sends end one by one; the routing ID's
+            // jobs start in arrival order.
+            let mut order = Vec::new();
+            let mut events = 0_usize;
+            let before = waiting.examined;
+            while let Some(done) = running.pop() {
+                events += 1;
+                in_flight.remove(&done);
+                waiting.freed(done.gates(), &mut in_flight, &no_backoff, &mut ready);
+                for started in std::mem::take(&mut ready) {
+                    order.push(token_of(&started));
+                    running.push(started);
+                }
+            }
+            let expected: Vec<String> = (0..HELD).map(|n| format!("token-{n:04}")).collect();
+            assert_eq!(order, expected);
+            assert_eq!(waiting.held(), 0);
+            assert!(
+                waiting.examined - before <= 4 * events,
+                "{} examinations for {events} finished sends",
+                waiting.examined - before
+            );
+            Ok(())
+        }
+
+        /// Thirty-two jobs wait on a full endpoint lookup pool. One freed
+        /// permit restarts the oldest of them, so one send signs and seals,
+        /// not thirty-two; the next freed permit restarts the next.
+        #[test]
+        fn one_freed_lookup_permit_restarts_one_held_send() {
+            const HELD: usize = 32;
+            let no_backoff = |_: &str| None;
+            let mut waiting = Waiting::default();
+            let mut in_flight = InFlight::default();
+            let mut ready = Vec::new();
+            let tickets: Vec<Arc<()>> = (0..HELD).map(|_| Arc::new(())).collect();
+            for (n, ticket) in tickets.iter().enumerate() {
+                let origin = format!("https://push-{n}.example.net");
+                waiting.hold(
+                    held_job(n, ticket, &origin),
+                    SendDeferral::LookupPoolFull,
+                    &mut in_flight,
+                    &no_backoff,
+                    &mut ready,
+                );
+            }
+            assert!(ready.is_empty());
+            assert_eq!(waiting.held(), HELD);
+            waiting.lookup_freed(1, &mut in_flight, &no_backoff, &mut ready);
+            let started: Vec<String> = ready.iter().map(token_of).collect();
+            assert_eq!(started, ["token-0000"]);
+            assert_eq!(waiting.held(), HELD - 1);
+            ready.clear();
+            waiting.lookup_freed(1, &mut in_flight, &no_backoff, &mut ready);
+            let started: Vec<String> = ready.iter().map(token_of).collect();
+            assert_eq!(started, ["token-0001"]);
+            assert!(waiting.awaits_lookup());
         }
 
         /// Four sends to one origin are in flight when the origin begins

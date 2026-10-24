@@ -197,10 +197,11 @@ impl PushSender {
     }
 
     /// Completes once the `WebPush` sender's endpoint lookup pool frees a
-    /// permit, at once when one freed since the last completed wait. Never
-    /// completes for another sender, whose sends never defer on the pool.
+    /// permit, at once when one freed since the last completed wait, with the
+    /// number of permits a send's lookup can take then. Never completes for
+    /// another sender, whose sends never defer on the pool.
     #[cfg(feature = "push-store")]
-    pub(crate) async fn lookup_permit_freed(&self) {
+    pub(crate) async fn lookup_permit_freed(&self) -> usize {
         match self {
             Self::WebPush(sender) => sender.lookup_permit_freed().await,
             _ => std::future::pending().await,
