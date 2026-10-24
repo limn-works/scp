@@ -5,6 +5,7 @@ use std::error::Error;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
+use scp_clock::TestClock;
 use scp_platform::KeyType;
 use scp_platform::in_memory::InMemoryStorage;
 use scp_platform::testing::InMemoryKeyCustody;
@@ -293,6 +294,30 @@ fn target(url: &str, ids: &[[u8; 32]]) -> Result<PushTarget, Box<dyn Error>> {
         relay: PushRelay::direct(url)?,
         routing_ids: ids.iter().copied().collect(),
     })
+}
+
+/// Runs one task command through the registrar's command handler, without
+/// the task, and returns the command's reply. No backoff retry or route
+/// change can run between two such calls.
+async fn run_command<S: Storage>(
+    registrar: &mut PushRegistrar<InMemoryKeyCustody, S>,
+    sup: &Supervisor,
+    command: impl FnOnce(oneshot::Sender<Result<RelayOutcomes, PushError>>) -> RegistrarCommand,
+) -> Result<RelayOutcomes, Box<dyn Error>> {
+    let (reply, answer) = oneshot::channel();
+    registrar.handle_command(command(reply), sup).await;
+    Ok(answer.await??)
+}
+
+/// Every publish already in the channel. A publish is recorded before the
+/// registrar awaits it, so after an operation returns its publishes are all
+/// here.
+fn drain(rx: &mut mpsc::UnboundedReceiver<Published>) -> Vec<Published> {
+    let mut got = Vec::new();
+    while let Ok(next) = rx.try_recv() {
+        got.push(next);
+    }
+    got
 }
 
 // ---------------------------------------------------------------------------
@@ -1187,6 +1212,227 @@ async fn stale_registration_is_retried_with_a_newer_timestamp() -> TestResult {
     Ok(())
 }
 
+/// The device clock's second at the start of each `4062` bound test.
+const T0: u64 = 1_700_000_000;
+/// The device-clock step between two attempts in the `4062` bound tests: the
+/// ADR-004 backoff's 30 s cap, at which a relay that keeps answering `4062`
+/// is retried.
+const RETRY_STEP: u64 = 30;
+/// More attempts than the bound allows at [`RETRY_STEP`], so a registrar that
+/// never stops fails the test instead of looping.
+const MAX_ATTEMPTS: u64 = 3 * PUSH_TIMESTAMP_SKEW_SECS / RETRY_STEP;
+
+fn stale_answer() -> Result<(), PushPublishError> {
+    Err(PushPublishError::Rejected {
+        code: code::PUSH_REGISTRATION_STALE,
+        msg: "timestamp outside the skew window".to_owned(),
+    })
+}
+
+/// Which `4062` outcome one attempt produced.
+enum StaleStep {
+    /// A retryable `Stale`, which arms the task's backoff.
+    Retry,
+    /// The terminal `StaleBeyondSkew`, with its span.
+    Bound(u64),
+}
+
+/// Classifies the outcome of one attempt on relay A. Each attempt must be one
+/// publish; a retryable `Stale` must arm the task's backoff and the terminal
+/// refusal must not.
+fn stale_step(
+    outcome: RelayOutcomes,
+    deregistration: bool,
+    rx: &mut mpsc::UnboundedReceiver<Published>,
+) -> Result<StaleStep, Box<dyn Error>> {
+    let sent = drain(rx);
+    if sent.len() != 1 || sent[0].relay_url != RELAY_A {
+        return Err(format!("one publish to relay A per attempt, got {}", sent.len()).into());
+    }
+    let results = if deregistration {
+        &outcome.deregistered
+    } else {
+        &outcome.registered
+    };
+    let step = match results.get(RELAY_A) {
+        Some(Err(err @ PushError::Stale { .. })) if err.retryable() => StaleStep::Retry,
+        Some(Err(err @ PushError::StaleBeyondSkew { span_secs, .. }))
+            if !err.retryable() && err.is_terminal_refusal() =>
+        {
+            StaleStep::Bound(*span_secs)
+        }
+        other => return Err(format!("unexpected outcome at relay A: {other:?}").into()),
+    };
+    let retry = log_outcome("test", &Ok(outcome));
+    assert_eq!(
+        retry,
+        matches!(step, StaleStep::Retry),
+        "a 4062 inside the bound arms the backoff, the bound's refusal does not"
+    );
+    Ok(step)
+}
+
+/// Reconciles every [`RETRY_STEP`] seconds of `clock` until relay A's
+/// outcome is the terminal `StaleBeyondSkew`, and returns how many retryable
+/// `Stale` outcomes came first.
+async fn reconcile_until_bound<S: Storage>(
+    registrar: &mut PushRegistrar<InMemoryKeyCustody, S>,
+    sup: &Supervisor,
+    clock: &TestClock,
+    rx: &mut mpsc::UnboundedReceiver<Published>,
+    deregistration: bool,
+) -> Result<u64, Box<dyn Error>> {
+    let first = clock.now_secs();
+    let mut retries = 0;
+    for _ in 0..MAX_ATTEMPTS {
+        match stale_step(registrar.reconcile(sup).await?, deregistration, rx)? {
+            StaleStep::Retry => {
+                assert!(
+                    clock.now_secs() - first <= PUSH_TIMESTAMP_SKEW_SECS,
+                    "a 4062 {} s after the first is still retried",
+                    clock.now_secs() - first
+                );
+                retries += 1;
+            }
+            StaleStep::Bound(span_secs) => {
+                assert_eq!(span_secs, clock.now_secs() - first);
+                assert!(span_secs > PUSH_TIMESTAMP_SKEW_SECS, "{span_secs}");
+                return Ok(retries);
+            }
+        }
+        clock.advance(RETRY_STEP);
+    }
+    Err(format!("the relay was still sent a message after {MAX_ATTEMPTS} attempts of 4062").into())
+}
+
+/// The device clock runs 400 s behind relay A's, so relay A answers `4062`
+/// to every registration. Each attempt, 30 s apart on the device clock, is
+/// one registration and a retryable `Stale` while the run spans at most
+/// `PUSH_TIMESTAMP_SKEW_SECS`; the first `4062` past that becomes the
+/// terminal `StaleBeyondSkew`, and later reconciles send relay A nothing. A
+/// `register` command clears the refusal and relay A is sent the
+/// registration again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn always_stale_relay_stops_getting_registrations_after_skew_bound() -> TestResult {
+    let sup = supervisor();
+    create_context(&sup, CTX_A, PSEUDONYM_A, &[RELAY_A]).await?;
+    let clock = Arc::new(TestClock::new(T0));
+    let dyn_clock: Arc<dyn Clock> = Arc::clone(&clock) as Arc<dyn Clock>;
+    let (sink, mut rx) = publisher(Arc::clone(&dyn_clock), Box::new(|_, _| stale_answer()));
+    let mut registrar = registrar(sink, dyn_clock).await?;
+
+    let retries = reconcile_until_bound(&mut registrar, &sup, &clock, &mut rx, false).await?;
+    assert_eq!(
+        retries,
+        PUSH_TIMESTAMP_SKEW_SECS / RETRY_STEP + 1,
+        "every 4062 from T0 to T0 + the skew window is retried"
+    );
+    for _ in 0..3 {
+        clock.advance(RETRY_STEP);
+        let outcome = registrar.reconcile(&sup).await?;
+        assert!(outcome.registered.is_empty(), "{outcome:?}");
+        assert!(outcome.deregistered.is_empty(), "{outcome:?}");
+        assert!(drain(&mut rx).is_empty(), "relay A is sent nothing more");
+    }
+
+    clock.advance(RETRY_STEP);
+    let outcome = run_command(&mut registrar, &sup, |reply| RegistrarCommand::Register {
+        reply,
+    })
+    .await?;
+    assert!(
+        matches!(stale_step(outcome, false, &mut rx)?, StaleStep::Retry),
+        "a register command sends relay A the registration again, in a new run"
+    );
+    Ok(())
+}
+
+/// Relay A accepted the registration, the device then leaves its context
+/// there, and relay A answers `4062` to every deregistration. The
+/// deregistrations stop at the same bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn always_stale_relay_stops_getting_deregistrations_after_skew_bound() -> TestResult {
+    let sup = supervisor();
+    create_context(&sup, CTX_A, PSEUDONYM_A, &[RELAY_A]).await?;
+    let clock = Arc::new(TestClock::new(T0));
+    let dyn_clock: Arc<dyn Clock> = Arc::clone(&clock) as Arc<dyn Clock>;
+    let answer: Answer = Box::new(|_, attempt| if attempt == 0 { Ok(()) } else { stale_answer() });
+    let (sink, mut rx) = publisher(Arc::clone(&dyn_clock), answer);
+    let mut registrar = registrar(sink, dyn_clock).await?;
+    let first = registrar.reconcile(&sup).await?;
+    assert!(
+        first.registered.get(RELAY_A).is_some_and(Result::is_ok),
+        "{first:?}"
+    );
+    assert_eq!(drain(&mut rx).len(), 1);
+
+    assert!(sup.despawn_actor(&hex::encode(CTX_A)).await);
+    clock.advance(RETRY_STEP);
+    let retries = reconcile_until_bound(&mut registrar, &sup, &clock, &mut rx, true).await?;
+    assert_eq!(retries, PUSH_TIMESTAMP_SKEW_SECS / RETRY_STEP + 1);
+    for _ in 0..3 {
+        clock.advance(RETRY_STEP);
+        let outcome = registrar.reconcile(&sup).await?;
+        assert!(outcome.deregistered.is_empty(), "{outcome:?}");
+        assert!(drain(&mut rx).is_empty(), "relay A is sent nothing more");
+    }
+    Ok(())
+}
+
+/// Relay A holds a `timestamp` floor 100 s ahead of the device clock, for
+/// example from before a restart, and answers `4062` until the device clock
+/// passes it. The registration retried after that is accepted, inside the
+/// bound, and leaves no refusal and no open run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_floor_that_clears_inside_the_bound_registers() -> TestResult {
+    const FLOOR: u64 = T0 + 100;
+    let sup = supervisor();
+    create_context(&sup, CTX_A, PSEUDONYM_A, &[RELAY_A]).await?;
+    let clock = Arc::new(TestClock::new(T0));
+    let dyn_clock: Arc<dyn Clock> = Arc::clone(&clock) as Arc<dyn Clock>;
+    let relay_clock = Arc::clone(&clock);
+    let answer: Answer = Box::new(move |_, _| {
+        if relay_clock.now_secs() <= FLOOR {
+            stale_answer()
+        } else {
+            Ok(())
+        }
+    });
+    let (sink, mut rx) = publisher(Arc::clone(&dyn_clock), answer);
+    let mut registrar = registrar(sink, dyn_clock).await?;
+    let public_key = *registrar.signing_key.public_key();
+
+    let mut retries = 0;
+    let accepted = loop {
+        let outcome = registrar.reconcile(&sup).await?;
+        if outcome.registered.get(RELAY_A).is_some_and(Result::is_ok) {
+            break drain(&mut rx);
+        }
+        assert!(
+            matches!(stale_step(outcome, false, &mut rx)?, StaleStep::Retry),
+            "a 4062 below the floor is retried"
+        );
+        retries += 1;
+        assert!(retries < MAX_ATTEMPTS, "the floor never cleared");
+        clock.advance(RETRY_STEP);
+    };
+    assert_eq!(retries, 4, "4062 at T0, +30, +60 and +90");
+    assert_eq!(accepted.len(), 1);
+    let registration = verified_registration(&accepted[0], &public_key)?;
+    assert!(registration.timestamp > FLOOR);
+    assert!(registrar.refused.is_empty() && registrar.stale_runs.is_empty());
+    assert!(registrar.accepted.contains_key(RELAY_A));
+
+    clock.advance(RETRY_STEP);
+    let outcome = registrar.reconcile(&sup).await?;
+    assert!(outcome.registered.is_empty(), "{outcome:?}");
+    assert!(
+        drain(&mut rx).is_empty(),
+        "the accepted set is not sent again"
+    );
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // The relay ledger
 // ---------------------------------------------------------------------------
@@ -1238,7 +1484,9 @@ async fn lost_ok_then_leaving_last_context_still_deregisters() -> TestResult {
 
 /// Relay A removes the registration on `deregister_all` but its OK is lost.
 /// `register` then registers relay A again rather than skipping it as
-/// unchanged, and relay A accepts the registration.
+/// unchanged, and relay A accepts the registration. Both commands run
+/// through the registrar's command handler without the task, so no backoff
+/// retry of the failed deregistration can come between them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lost_deregistration_ok_then_register_reregisters() -> TestResult {
     let sup = supervisor();
@@ -1255,14 +1503,20 @@ async fn lost_deregistration_ok_then_register_reregisters() -> TestResult {
         }
     });
     let (sink, mut rx) = publisher(system_clock(), answer);
-    let registrar = registrar(sink, system_clock()).await?;
+    let mut registrar = registrar(sink, system_clock()).await?;
     let public_key = *registrar.signing_key.public_key();
-    let shutdown = CancellationToken::new();
-    let task = registrar.spawn_trigger(Arc::clone(&sup), shutdown.clone());
+    let first = registrar.reconcile(&sup).await?;
+    assert!(
+        first.registered.get(RELAY_A).is_some_and(Result::is_ok),
+        "{first:?}"
+    );
     let start = expect_publishes(&mut rx, 1).await?;
     let registered = verified_registration(&start[0], &public_key)?;
 
-    let outcome = task.deregister_all().await?;
+    let outcome = run_command(&mut registrar, &sup, |reply| {
+        RegistrarCommand::DeregisterAll { reply }
+    })
+    .await?;
     assert!(
         matches!(
             outcome.deregistered.get(RELAY_A),
@@ -1270,25 +1524,22 @@ async fn lost_deregistration_ok_then_register_reregisters() -> TestResult {
         ),
         "{outcome:?}"
     );
-    let sent = tokio::time::timeout(ARRIVAL, rx.recv())
-        .await?
-        .ok_or("publisher dropped")?;
-    verified_deregistration(&sent, &public_key)?;
+    let sent = expect_publishes(&mut rx, 1).await?;
+    assert_eq!(sent[0].relay_url, RELAY_A);
+    verified_deregistration(&sent[0], &public_key)?;
 
-    let outcome = task.register().await?;
+    let outcome = run_command(&mut registrar, &sup, |reply| RegistrarCommand::Register {
+        reply,
+    })
+    .await?;
     assert!(
         outcome.registered.get(RELAY_A).is_some_and(Result::is_ok),
         "relay A is registered again: {outcome:?}"
     );
-    let sent = tokio::time::timeout(ARRIVAL, rx.recv())
-        .await?
-        .ok_or("publisher dropped")?;
-    assert_eq!(sent.relay_url, RELAY_A);
-    let again = verified_registration(&sent, &public_key)?;
+    let sent = expect_publishes(&mut rx, 1).await?;
+    assert_eq!(sent[0].relay_url, RELAY_A);
+    let again = verified_registration(&sent[0], &public_key)?;
     assert_eq!(again.routing_ids, registered.routing_ids);
-
-    shutdown.cancel();
-    tokio::time::timeout(ARRIVAL, task.into_join_handle()).await??;
     Ok(())
 }
 
