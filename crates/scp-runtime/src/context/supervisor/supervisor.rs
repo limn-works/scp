@@ -2102,6 +2102,12 @@ pub struct Supervisor {
     /// external consumers. Empty `OnceLock` means "no channel
     /// configured".
     event_tx: OnceLock<tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
+    /// Bumped each time a context actor is added to or removed from
+    /// `actors`, the two changes that add or drop a context's push routes
+    /// without a [`ContextEvent`]. [`Self::push_routes_changed`] hands out
+    /// receivers; the push registrar re-reads the routes on each bump
+    /// (`10-infrastructure-and-self-hosting.md` §10.7.1 **Re-registration**).
+    push_routes_tx: tokio::sync::watch::Sender<u64>,
     /// OpenMLS storage adapter — the bridge's chosen Storage, erased once via
     /// `SpawnBlockingStorageAdapter`. Runtime NEVER defaults this. Lock-free
     /// read per ADR-049 §Decision 12.
@@ -2602,6 +2608,7 @@ impl Supervisor {
             key_resolver: OnceLock::new(),
             payment_adapter: OnceLock::new(),
             event_tx: OnceLock::new(),
+            push_routes_tx: tokio::sync::watch::channel(0u64).0,
             mls_storage: OnceLock::new(),
             relay_contacts,
             reserved_saga_contexts,
@@ -3258,6 +3265,24 @@ impl Supervisor {
         self.event_tx
             .get()
             .map(tokio::sync::broadcast::Sender::subscribe)
+    }
+
+    /// A receiver that changes each time a context actor is added or
+    /// removed, so a holder re-reads [`Self::push_routing_ids`]
+    /// (`10-infrastructure-and-self-hosting.md` §10.7.1 **Re-registration**).
+    /// The value is a wrapping count and carries no other meaning. Closing,
+    /// expiring or tombstoning a context keeps its actor, so those changes
+    /// arrive as a [`ContextEvent`] from [`Self::subscribe_events`] instead.
+    #[must_use]
+    pub fn push_routes_changed(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.push_routes_tx.subscribe()
+    }
+
+    /// Wakes every [`Self::push_routes_changed`] receiver. Called after each
+    /// insert into and removal from `actors`.
+    fn note_push_routes_changed(&self) {
+        self.push_routes_tx
+            .send_modify(|count| *count = count.wrapping_add(1));
     }
 
     /// Cheap reference to the supervisor's OpenMLS storage adapter
@@ -5849,6 +5874,7 @@ impl Supervisor {
             }
             self.actors.insert(ctx_id_str.clone(), handle.clone());
         }
+        self.note_push_routes_changed();
 
         // Hand the owned state + deps into the actor task. The spawned
         // future captures both by move; neither escapes the actor's scope.
@@ -6912,7 +6938,11 @@ impl Supervisor {
     /// spurious `MemberLeft` event.
     pub async fn despawn_actor(&self, context_id: &str) -> bool {
         let _guard = self.write_lock.lock().await;
-        self.actors.remove(context_id).is_some()
+        let removed = self.actors.remove(context_id).is_some();
+        if removed {
+            self.note_push_routes_changed();
+        }
+        removed
     }
 
     /// Despawn the actor that `import_context` is replacing, and mark the
@@ -7052,7 +7082,11 @@ impl Supervisor {
                      waiting for the actor to exit, and deletes the snapshot once it has"
                 )));
             }
-            let Some((_, handle)) = self.actors.remove(context_id) else {
+            let removed = self.actors.remove(context_id);
+            if removed.is_some() {
+                self.note_push_routes_changed();
+            }
+            let Some((_, handle)) = removed else {
                 // No actor to wait for: tear down under the locks already
                 // held, so no respawn of the id runs between the registry
                 // check and the snapshot delete.

@@ -15,6 +15,7 @@ pub use scp_protocol::uri;
 
 // --- Modules that exist ONLY in scp-runtime (no conflict) ---
 pub use scp_runtime::metrics;
+pub use scp_runtime::push;
 pub use scp_runtime::store;
 pub use scp_runtime::well_known;
 
