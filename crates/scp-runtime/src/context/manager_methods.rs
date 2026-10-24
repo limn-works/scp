@@ -68,7 +68,6 @@ use scp_protocol::context::broadcast::{BroadcastAdmission, BroadcastContext};
 use scp_protocol::context::builder::ContextCreationError;
 use scp_protocol::context::params::{ContextMode, TemplateId};
 
-use crate::context::ContextError;
 use crate::context::state::{ContextSnapshot, PerContextState, VelocityTrackerSnapshot};
 use crate::context::supervisor::Supervisor;
 

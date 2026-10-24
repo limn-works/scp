@@ -4927,11 +4927,11 @@ mod restore_reconcile_tests {
         (snapshot, broadcast)
     }
 
-    /// `persist_context_and_broadcast` returns the flush's own error when the
-    /// snapshot write fails, so the caller sees the failure instead of a
-    /// silent skip, and returns `Ok` for a context with no actor.
+    /// `flush_all_contexts` returns the flush's own error when a snapshot
+    /// write fails, so the caller sees the failure instead of a silent skip,
+    /// and flushes again once the store recovers.
     #[tokio::test]
-    async fn persist_context_and_broadcast_returns_the_flush_failure() {
+    async fn flush_all_contexts_returns_the_flush_failure() {
         let capture = Arc::new(CapturingPersistence::default());
         let supervisor = build_supervisor(Box::new(SharedCapture(Arc::clone(&capture))));
         let ctx_id = "persist-returns-failure";
@@ -4950,25 +4950,32 @@ mod restore_reconcile_tests {
             .await
             .expect("create_context should succeed");
 
-        crate::context::manager_methods::persist_context_and_broadcast(&supervisor, ctx_id)
+        capture.contexts.lock().unwrap().remove(ctx_id);
+        crate::context::lifecycle_helpers::flush_all_contexts(&supervisor)
             .await
             .expect("a working store persists");
+        assert!(
+            capture.contexts.lock().unwrap().contains_key(ctx_id),
+            "the sweep wrote the context's snapshot"
+        );
 
         capture
             .fail
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        let err =
-            crate::context::manager_methods::persist_context_and_broadcast(&supervisor, ctx_id)
-                .await
-                .expect_err("a failed snapshot write must reach the caller");
+        let err = crate::context::lifecycle_helpers::flush_all_contexts(&supervisor)
+            .await
+            .expect_err("a failed snapshot write must reach the caller");
         assert!(
             matches!(err, ContextError::PersistenceFailed(_)),
             "the flush's own error must pass through: {err:?}"
         );
 
-        crate::context::manager_methods::persist_context_and_broadcast(&supervisor, "no-such-ctx")
+        capture
+            .fail
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        crate::context::lifecycle_helpers::flush_all_contexts(&supervisor)
             .await
-            .expect("a context with no actor holds nothing to flush");
+            .expect("the retry after the store recovers flushes");
     }
 
     /// Drives `restore_context` against a snapshot whose `routing` variant and
