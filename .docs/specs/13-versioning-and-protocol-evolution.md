@@ -7,7 +7,7 @@ The protocol will evolve. New capabilities, new attestation types, new transport
 SCP uses a two-component version: `major.minor`. The initial release is **SCP/1.0**.
 
 - **Major version** increments on breaking wire format changes — changes that make messages from the new version unreadable by the old version even when following the forward compatibility rules (§13.5). Examples: redefining the signed structure field order, changing the encryption scheme, removing a required field.
-- **Minor version** increments on backward-compatible additions — new optional fields, new message types, new extension point registrations. An SCP/1.0 implementation encountering an SCP/1.1 message can still process it (with degraded feature set per §13.6).
+- **Minor version** increments on backward-compatible additions — new optional fields, new message types, new extension point registrations. An SCP/1.0 implementation encountering an SCP/1.1 message can still process it (with degraded feature set per §13.6). A minor version never changes which MLS Commit, proposal or leaf a member accepts, or the state a member derives from merging one (§13.7.4).
 
 Version numbers are monotonically increasing integers. There is no patch component — the protocol specification is not software. Editorial corrections to the spec that do not change wire behavior do not change the version number.
 
@@ -185,18 +185,18 @@ If a context's metadata declares a `ContextMode` value that the SDK does not rec
 
 ## 13.6 Degraded Mode
 
-When an implementation encounters a context or peer using a higher minor version, it operates in degraded mode: full participation in understood features, silent non-participation in unrecognized features.
+When an implementation encounters a context or peer using a higher minor version, it operates in degraded mode: full participation in understood features, silent non-participation in unrecognized features. Degraded mode never reaches a Commit verdict, because no minor version changes one (§13.7.4).
 
 ### 13.6.1 Degraded Mode Behaviors
 
 | Situation | Behavior |
 |-----------|----------|
 | Unknown fields in InnerEnvelope | Preserve for roundtrip forwarding. Process known fields normally. |
-| Unknown fields in ContextParams | Ignore. Join and participate using known parameters. |
+| Unknown fields in ContextParams | Ignore. Join and participate using known parameters. A field that a Commit verdict reads is never unknown to a member, because adding one is a new rule set (§13.7.4). |
 | Unknown relay EVENT type | Ignore. Continue normal operation. |
 | Context `min_protocol_version` exceeds SDK version | Refuse to join. Report to application layer. |
 | Unknown `ContextMode` | Refuse to join. Report to application layer. |
-| Unknown governance action variant | Do not vote on or execute. Abstain. Log warning. |
+| Governance action variant outside the context's rule set | In an MLS context, every member rejects a Commit that carries one, because a new variant is a new rule set (§13.7.4). Do not propose or vote on it. Log warning. |
 | Peer sends message with higher minor version | Process known fields. Ignore unknown. |
 | Relay `hello` shows higher minor version | Proceed normally. |
 | Relay `hello` shows higher major version | Disconnect. Try lower major version path. |
@@ -248,15 +248,18 @@ Extensions follow the same highest-common model as version negotiation. There is
 
 | Change type | Mechanism |
 |-------------|-----------|
-| New optional field in existing structure | Minor version bump |
-| New message type | Minor version bump |
+| New optional field in existing structure that no Commit, proposal or leaf verdict reads | Minor version bump |
+| New message type that no MLS Commit carries | Minor version bump |
 | New attestation type | Extension (self-versioned via `attestation_type` tag) |
 | New capability URI | Extension (self-versioned via `/v{N}` suffix per ADR-041) |
 | New transport binding | Extension (independent of protocol version) |
-| New `ContextMode` | Minor version bump (security implications require version gate) |
+| New `ContextMode` | Minor version bump (security implications require version gate); a mode is a genesis field of the context extension, and an SDK that lacks it refuses to join (§13.5.5), so every member of a context runs that mode's rules |
 | Changed field encoding in signed structure | Major version bump + domain separator increment |
 | Removed required field | Major version bump |
 | New encryption algorithm | Major version bump (security-critical) |
+| New MLS proposal type, governance action variant, derived event-log leaf type or Commit class; a new field of the context extension that a verdict reads; or a changed rule that decides whether a member accepts an MLS Commit, a proposal or a leaf, or the state it derives from one (`05-contexts.md` §5.13.3; `07-trust-validation-and-capabilities.md` §7.3.1.1; `09-security-model.md` §9.7.1, §9.7.4.2, and the §9.18 constants they read and the relay-list governor identifier the SDK pins (`18-addressability-and-deployment.md` §18.5.1), which a `FallbackConfirmation` verdict reads) | Major version bump with a new context extension type ID |
+
+**The context extension type names the rule set.** Each major version has its own context extension type ID (SCP/1: `0xFF02`, `05-contexts.md` §5.13.3). A group's GroupContext carries that type, and exactly one such type, and its `RequiredCapabilities` lists it. MLS admits no leaf that does not support every GroupContext extension and every required capability (RFC 9420 §7.3 and §11.1), so no implementation of another rule set joins the group. An implementation of several runs the rules of the type the group carries. A Commit's verdict therefore reads group state for its rules, never a version field a sender or a relay declares. `min_protocol_version` (§13.4) stays a floor on features outside Commits.
 
 ### 13.7.5 Registered Extensions
 
@@ -291,5 +294,6 @@ An implementation claiming SCP/1.x conformance MUST:
 6. Refuse to join contexts with unrecognized `ContextMode` (§13.5.5).
 7. Refuse to join contexts with `min_protocol_version` higher than supported (§13.4).
 8. Report degraded-mode status to the application layer (§13.6.2).
+9. In an MLS context, run the verdict rules of the one context extension type the group's GroupContext carries, and refuse a group that carries none the implementation implements, or more than one (§13.7.4).
 
 Conformance testing for version handling is part of the SDK conformance suite (§16).

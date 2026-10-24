@@ -1337,7 +1337,7 @@ Domain: `"SCP-KEYPACKAGE-ATTESTATION-V1:"`
 
 ### Vector 37: KeyPackage Attestation Signature + `0xFF03` Extension Body
 
-The `KeyPackageAttestation` (§9.5.2) binds **all four** of the leaf's public keys — the ephemeral MLS leaf `signature_key`, and three **distinct** DHKEM(P-256) HPKE keys: the LeafNode ratchet-tree `encryption_key`, the KeyPackage `init_key` (the Welcome-seal key), and the `scp_wrapping_key` (`0xFF01`) extension `wrapping_key` — to a DID. It is **context-agnostic** — eight fields, no `context_id`. All four are 65-byte uncompressed SEC1 P-256 points, in the encodings RFC 9420 §5.1.2 and RFC 9180 §7.1 fix and §9.5.2 states in place. The canonical hash uses the §9.5.1 construction; the P-256 signature is computed over the 32-byte hash with the reference key (§25.2). The `scp_keypackage_attestation` (`0xFF03`) LeafNode extension body is the eight fields in preimage order (deterministic length-prefixed binary — NOT MessagePack/JCS) followed by the raw 64-byte signature.
+The `KeyPackageAttestation` (§9.5.2) binds **all four** of the leaf's public keys — the ephemeral MLS leaf `signature_key`, and three **distinct** DHKEM(P-256) HPKE keys: the LeafNode ratchet-tree `encryption_key`, the KeyPackage `init_key` (the Welcome-seal key), and the `scp_wrapping_key` (`0xFF01`) extension `wrapping_key` — to a DID. It is **context-agnostic** — ten fields, no `context_id`. All four are 65-byte uncompressed SEC1 P-256 points, in the encodings RFC 9420 §5.1.2 and RFC 9180 §7.1 fix and §9.5.2 states in place. The canonical hash uses the §9.5.1 construction; the P-256 signature is computed over the 32-byte hash with the reference key (§25.2). The attestation also names the key that signs it, `active_key`, with its algorithm byte `active_key_algorithm` (§9.5.2 fields 7 and 8; ADR-066 decision 40); here that is the reference key, compressed. The `scp_keypackage_attestation` (`0xFF03`) LeafNode extension body is the ten fields in preimage order (deterministic length-prefixed binary — NOT MessagePack/JCS) followed by the raw 64-byte signature.
 
 This vector is fully regenerable from the inputs below. `leaf_signature_key` is the §25.2 secondary key in its uncompressed form, standing in for the ephemeral leaf `signature_key` being bound. The three HPKE keys each derive from a **fixed, documented 32-byte seed** under the §25.2 seed-to-scalar rule: `leaf_encryption_key` from `0x33×32`, `init_key` from `0x11×32`, `wrapping_key` from `0x22×32`. These are distinct keys by construction — `init_key != encryption_key` (RFC 9420: the Welcome's `EncryptedGroupSecrets` is HPKE-sealed to the KeyPackage `init_key`, NOT the LeafNode `encryption_key`), and `wrapping_key` is the separate §9.16.1 stable wrapping key.
 
@@ -1353,6 +1353,8 @@ Input:
   init_key:            0x041f75a6a31cc4516a2eb0b28511c45160b976b44e8c31ec377b0c2cb67b05f0ad3195794c4fc38b105bd5f5e1239a3c73feb58bd815cbfd2fe049c084f7f88a8a   (65 bytes, from fixed seed 0x11×32 — KeyPackage Welcome-seal HPKE key)
   wrapping_key:        0x04ff08966117691da4f3f0a3bbc4a63cab7193008d316127821b1e09b9e2aef925eaa5de2932cc294a2cc58f36e31a9a245f67404ad14d142d0e423901aa44cac3   (65 bytes, from fixed seed 0x22×32 — scp_wrapping_key 0xFF01 §9.16.1 stable wrapping key)
   signing_key_id:      "#active"                               (7 bytes)
+  active_key:          0x033b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f3027   (33 bytes, the reference public key, compressed)
+  active_key_algorithm: 0x01                                   (KEY_ALGORITHM_ECDSA_P256_SHA256, §9.18.17)
   issued_at:           1700000000                              (== leaf Lifetime.not_before)
   expires_at:          1700086400                              (== leaf Lifetime.not_after; issued_at + 86400)
 
@@ -1364,23 +1366,25 @@ Canonical hash input (per §9.5.1 / §9.5.2 KeyPackageAttestation):
   || init_key                                      (65 bytes, fixed-length, no length prefix)
   || wrapping_key                                  (65 bytes, fixed-length, no length prefix)
   || BE32(7)  || "#active"                         (4 + 7 = 11 bytes — signing_key_id)
+  || active_key                                    (33 bytes, fixed-length, no length prefix)
+  || 0x01                                          (1 byte — active_key_algorithm)
   || BE64(1700000000)                              (8 bytes — issued_at)
   || BE64(1700086400)                              (8 bytes — expires_at)
 
-Total preimage: 30 + 60 + 65 + 65 + 65 + 65 + 11 + 8 + 8 = 377 bytes
+Total preimage: 30 + 60 + 65 + 65 + 65 + 65 + 11 + 33 + 1 + 8 + 8 = 411 bytes
 
-Preimage (hex, 377 bytes):
-  0x5343502d4b45595041434b4147452d4154544553544154494f4e2d56313a000000387363703a676f6d6a786c786a74346b6573623566676862367470796b727668737864647577776c6f337577676d7668326a686f71766a79710423702a648232f2d00713de9289753c2fbd4c4efa7e1e33905e3723a412b20aead0992a08064d996d9268dc511c7430f3a4e614871d4a888b52a8dbecb56d6da604bb9fe4749210aad657fb3937fa97a0d79c976c442c54176ccce88477e1b32f304661cb77defd365843a4d43584afc760fed0d9a889d9cb3dd155986b446f4550041f75a6a31cc4516a2eb0b28511c45160b976b44e8c31ec377b0c2cb67b05f0ad3195794c4fc38b105bd5f5e1239a3c73feb58bd815cbfd2fe049c084f7f88a8a04ff08966117691da4f3f0a3bbc4a63cab7193008d316127821b1e09b9e2aef925eaa5de2932cc294a2cc58f36e31a9a245f67404ad14d142d0e423901aa44cac30000000723616374697665000000006553f1000000000065554280
+Preimage (hex, 411 bytes):
+  0x5343502d4b45595041434b4147452d4154544553544154494f4e2d56313a000000387363703a676f6d6a786c786a74346b6573623566676862367470796b727668737864647577776c6f337577676d7668326a686f71766a79710423702a648232f2d00713de9289753c2fbd4c4efa7e1e33905e3723a412b20aead0992a08064d996d9268dc511c7430f3a4e614871d4a888b52a8dbecb56d6da604bb9fe4749210aad657fb3937fa97a0d79c976c442c54176ccce88477e1b32f304661cb77defd365843a4d43584afc760fed0d9a889d9cb3dd155986b446f4550041f75a6a31cc4516a2eb0b28511c45160b976b44e8c31ec377b0c2cb67b05f0ad3195794c4fc38b105bd5f5e1239a3c73feb58bd815cbfd2fe049c084f7f88a8a04ff08966117691da4f3f0a3bbc4a63cab7193008d316127821b1e09b9e2aef925eaa5de2932cc294a2cc58f36e31a9a245f67404ad14d142d0e423901aa44cac30000000723616374697665033b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f302701000000006553f1000000000065554280
 
 Canonical hash SHA-256(preimage) (32 bytes):
-  0xf3e2825b6d0534827fec7a6b196b729578ef47be0c0847f6e8879cf5242aa4ad
+  0x905f5919a0949568521c739c2c1eb0db86667fbcabf07b0e154fb60c7d6611fd
 
 RFC 6979 signature over the canonical hash, reference key, 64-byte raw r || s:
-  0xe84f59744b0fba5ebc162f26a59d027694c1fae7c73dcdeb8d776e357bbf12632abea2a97205d75ca50e3914eec8af68f7315e27dd6f9296136e75ecb044ff24
+  0x07b4dd953e21ef014867b39e032cb3b6580239475da6f98692a8cb2445c8b4ed79639b807851d279256498ea4653122d38c2c4caa3bd6553cc9c4ad7c9b48418
 
-scp_keypackage_attestation (0xFF03) extension body = 8 fields in preimage order
-(NO domain separator) || 64-byte signature (347 + 64 = 411 bytes):
-  0x000000387363703a676f6d6a786c786a74346b6573623566676862367470796b727668737864647577776c6f337577676d7668326a686f71766a79710423702a648232f2d00713de9289753c2fbd4c4efa7e1e33905e3723a412b20aead0992a08064d996d9268dc511c7430f3a4e614871d4a888b52a8dbecb56d6da604bb9fe4749210aad657fb3937fa97a0d79c976c442c54176ccce88477e1b32f304661cb77defd365843a4d43584afc760fed0d9a889d9cb3dd155986b446f4550041f75a6a31cc4516a2eb0b28511c45160b976b44e8c31ec377b0c2cb67b05f0ad3195794c4fc38b105bd5f5e1239a3c73feb58bd815cbfd2fe049c084f7f88a8a04ff08966117691da4f3f0a3bbc4a63cab7193008d316127821b1e09b9e2aef925eaa5de2932cc294a2cc58f36e31a9a245f67404ad14d142d0e423901aa44cac30000000723616374697665000000006553f1000000000065554280e84f59744b0fba5ebc162f26a59d027694c1fae7c73dcdeb8d776e357bbf12632abea2a97205d75ca50e3914eec8af68f7315e27dd6f9296136e75ecb044ff24
+scp_keypackage_attestation (0xFF03) extension body = 10 fields in preimage order
+(NO domain separator) || 64-byte signature (381 + 64 = 445 bytes):
+  0x000000387363703a676f6d6a786c786a74346b6573623566676862367470796b727668737864647577776c6f337577676d7668326a686f71766a79710423702a648232f2d00713de9289753c2fbd4c4efa7e1e33905e3723a412b20aead0992a08064d996d9268dc511c7430f3a4e614871d4a888b52a8dbecb56d6da604bb9fe4749210aad657fb3937fa97a0d79c976c442c54176ccce88477e1b32f304661cb77defd365843a4d43584afc760fed0d9a889d9cb3dd155986b446f4550041f75a6a31cc4516a2eb0b28511c45160b976b44e8c31ec377b0c2cb67b05f0ad3195794c4fc38b105bd5f5e1239a3c73feb58bd815cbfd2fe049c084f7f88a8a04ff08966117691da4f3f0a3bbc4a63cab7193008d316127821b1e09b9e2aef925eaa5de2932cc294a2cc58f36e31a9a245f67404ad14d142d0e423901aa44cac30000000723616374697665033b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f302701000000006553f100000000006555428007b4dd953e21ef014867b39e032cb3b6580239475da6f98692a8cb2445c8b4ed79639b807851d279256498ea4653122d38c2c4caa3bd6553cc9c4ad7c9b48418
 
 Verification vector:
   public key: 0x033b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f3027
@@ -1389,7 +1393,141 @@ Verification vector:
   verdict:    accept
 ```
 
-A software signer under RFC 6979 reproduces these exact signature bytes on every run; a hardware signer or a platform signer (§9.5) produces different bytes and is checked against the verification vector instead (§25.4). Note the extension body omits the domain separator (present only in the signed preimage) and shares the eight fields byte-for-byte with the preimage's post-domain portion.
+A software signer under RFC 6979 reproduces these exact signature bytes on every run; a hardware signer or a platform signer (§9.5) produces different bytes and is checked against the verification vector instead (§25.4). Note the extension body omits the domain separator (present only in the signed preimage) and shares the ten fields byte-for-byte with the preimage's post-domain portion.
+
+### Vector 80: key positions, `KeyHistoryAdvance` bodies and `KeyPositionRecorded` (§9.7.1, §9.10.12; §5.13.3 "Key positions")
+
+Every value comes from `scripts/gen-test-vectors-p256.py`, which builds it from the §9.7.1, §9.10.12 and §5.13.3 tables. The fixture identity is Vector 41's inception, `scp:fqhx6rdyx2knwadygeppkg5dzsmtinrlb4ku3s7zywlvolsgz4za`. Its two branch events are Vector 53's `CommitmentRollover` and Vector 54's `RootRecovery{CoSigns}`, both at `seq` 1 after the inception, signed as Vectors 53 and 54 sign them. Under R6 each carries a root signature under the root standing at the fork point, so both rank 1 and a position that holds both is Contested.
+
+```
+fork point (Vector 41 inception) digest: 0xd8ba4ebad52657208736f4cac675352f5f9cc0aa837620f8d742dbf42aeedbd7
+rollover branch digest d1:  0x670fffd52753cd541d6b2dc9fa0a47a6acd54ca70e00d4779213e5f4fa87207c
+recovery branch digest d2:  0xf7e86d11b213d51e79c61e040268f5cb83deb0e995a888a65afce9a6e6108c38
+
+Key-event frame (§9.10.12) of the rollover, 388 bytes:
+  version 0x02 || identifier (32) || BE64(1) || BE64(1) || BE32(1) || BE32(len(preimage)) || preimage || 2 × 64-byte signatures
+  0x022c0f7f4478be94db0078311ef51ba3cc9934362b0f154dcbf9c597572e46cf320000000000000001000000000000000100000001000000cb5343502d4b454c2d4556454e542d56313a032c0f7f4478be94db0078311ef51ba3cc9934362b0f154dcbf9c597572e46cf320000000000000001d8ba4ebad52657208736f4cac675352f5f9cc0aa837620f8d742dbf42aeedbd700000000010000000001000000000101000000010100000001026fc6523b7b1e22ff3fbce8740cfbb7cbc816501864bf40f683db69c860d1a6700000000000000000000000000100000001bf945a74e57e4b861cdba9a78df32004adc443e983e957b9aa9749ade24be4bd010100000001ca0ac8b06c44b3721decf7ba5035e7a5232c865476ec4967da08da3e8a44b4d809d1a3403c5d5b55d7e9e7b53a4e9f7e8f678532d7beefc327e2a90afce24916bd3714633522f09068db59c29cb9656ce8eb9f86cce7edbcdb7df496c73b250921b9e75382aa400899ff1b35866f67a1c7a6bdcc71c1773cc63ead696700cd58
+
+Key-event frame of the recovery, 756 bytes (3 × 64-byte signatures):
+  0x022c0f7f4478be94db0078311ef51ba3cc9934362b0f154dcbf9c597572e46cf320000000000000001000000000000000100000001000001fb5343502d4b454c2d4556454e542d56313a042c0f7f4478be94db0078311ef51ba3cc9934362b0f154dcbf9c597572e46cf320000000000000001d8ba4ebad52657208736f4cac675352f5f9cc0aa837620f8d742dbf42aeedbd70100000001000000000100000000010000000001010000000101000000010100000001026fc6523b7b1e22ff3fbce8740cfbb7cbc816501864bf40f683db69c860d1a67000000001034c3e84e8da62f05b0a280d5a0426e24bde13c6fa023c567333bece3bc1497c53000000010000000100000004034c3e84e8da62f05b0a280d5a0426e24bde13c6fa023c567333bece3bc1497c53010100000000000000000101026188be77992cb98024f995da162f844f534e4a7f8fca8dc7b1d0cb4b54ce4c64020100000000000000000101033b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f30270102000000000000000001010223702a648232f2d00713de9289753c2fbd4c4efa7e1e33905e3723a412b20aea020200000000000000000101000000019d94df95bc0a13f1963f484414c320354c73c75bb86e96559e97765f5bc2d31300000e1002000000000000000000000000000000000000000000000000000000000000000000000000010000000141def207e7438655edf2766aa2fe0c96ef5f898233fb5ba16c56a3f7765aa8bd010100000001204c74ab4383ec683537666c4ce57caebf914ac76a9d380a21d2d961bd3efe211e0e595901be6599c1f92da4c6a364c81daef87e55b297eef68b9a571de12e5d78021d7367db675090416cb6d3536562230f10ae4eaf044eb08bdde1f3a1126e4f22c6960e73a527b9c74bb7e27d4a6ab54d2f14a99419cea6e20d1b6bd1c3e6c229bc09518a2d95af6a51939d0ff57e16ba4cfa317fe8fa24e37d3dc91bc68843bb5b6b587f38ead74215bdcb3f7d0982d32a1ef2948df40914a6695eb833d9
+```
+
+**A `KeyHistoryAdvance` with a frame and an empty confirmation.** The body is BE32(388) || the rollover frame || BE32(0), 396 bytes, with SHA-256 `38ae68a426d2b13dcbf17bceec7cf86c9da2b3673b564ab66b5ccdedc9b3c61a`.
+
+**A `KeyHistoryAdvance` with an empty frame and a `FallbackConfirmation`.** The confirmation confirms the recovery tip d2. Its fixtures:
+- `list_record` is a relay-list record (`18-addressability-and-deployment.md` §18.5.1) at `sequence` 3, with Vector 49's `context_id` and entries document, and this vector's identity as `governor`. Its canonical hash is `afd998183f3a9392e6aeb277f2f6e737ed99a4a2bd7e75261fd505fd27d541c2`, and its signature under the §25.2 secondary key is `00145341685ce373b0871500edf2c94844cbee0261a671f10f7fbec57ac7513b50d4fb7c9d7f0d79fa3d4a224c375ed9e9ae27e9b540d7479e20d8d95d5c7636`. Its bytes are the RFC 8785 form of the outlet output object, 771 bytes, with SHA-256 `7575fffb69393356ca5228081cdceb2aa8f06efd180d3c390579a6ea739795c1`.
+- `operator` is Vector 49's entry 0, whose `key` is the §25.2 reference key, and `service_record` is empty.
+- `response` holds one blob, the recovery frame above. Under §9.5.1's repeated-field rule its `value_digest` is `23604fbe0d2514bfc1c07f2253e663d2748dc9a4b60e8c2b9c5a7d3a2a9af3c3`.
+- `relay_proof` has the proof `nonce` `5a5054e04186dcdb137484414cc26f7a0b4100126689b5fee53f290d72b6eb9b`, the routing ID SHA-256("scp:did:" || identifier), and `observed_at` from Vector 44, and is signed under the reference key: `c45b32c65d25b3d070929aa68fa4532f69fd5ab56fa15173be77d6c5c6d03c185a5054e04186dcdb137484414cc26f7a0b4100126689b5fee53f290d72b6eb9bf8affd47ab024cae9489a63fa1c632914c16f7329441b8fca65b32c78d86a4eb23604fbe0d2514bfc1c07f2253e663d2748dc9a4b60e8c2b9c5a7d3a2a9af3c3000000006553f1009a2fea47263cf961dfbec93425947ab5a15fb5e388a8dfa6fbdc276a992c6f7d5598234b14ec44351af629fc4e2132145195b22858bb04f447730efa46a3601f` (200 bytes).
+
+The confirmation is 1775 bytes, with SHA-256 `8899ec1281dd387696cd6d0764c07530fe92730495d88cb7f7d2e942e23cb241`. The body is BE32(0) || BE32(1775) || the confirmation, 1783 bytes, with SHA-256 `a7c143f72aa7b9af6302d3fd17aeea08c87ca340401cd46acf6db477ddbff07a`.
+
+**`key_positions_hash` over four positions at `relay_list_sequence` 3.** The fixture positions:
+- The Contested position of this vector's identity, with heads d1 and d2 in ascending digest order and `contested_since` 12. It recorded the recovery at epoch 5, while it was Linear, and the contest recorded at epoch 12 left `recovered_at` unchanged at [5, 1, d2].
+- A Linear held position whose chain holds a fixture `RootRecovery`, with `recovered_at` [9, 1, d].
+- An unheld position with two `presented` tips, `pending_since` 10, and `staged_by` carol.
+- A Linear position with `displaced_at` 3 and `displaced_top` 7.
+
+The four other identifiers are fixture identifiers (§25.1) of the labels "key position linear", "key position unheld" and "key position displaced". Each digest other than d1 and d2 is SHA-256("SCP test vector " || label).
+
+```
+contested: ["scp:fqhx6rdyx2knwadygeppkg5dzsmtinrlb4ku3s7zywlvolsgz4za",[[1,"670fffd52753cd541d6b2dc9fa0a47a6acd54ca70e00d4779213e5f4fa87207c"],[1,"f7e86d11b213d51e79c61e040268f5cb83deb0e995a888a65afce9a6e6108c38"]],12,[],null,null,null,null,null,[5,1,"f7e86d11b213d51e79c61e040268f5cb83deb0e995a888a65afce9a6e6108c38"]]
+linear:    ["scp:enj27ejbilkxpwnnr33gqabqefwajgjsoltnfgl464kdwnt67tha",[[2,"dfe2fcbda22289e6a431b91dc065ff2842235cefa3b69b6436ac18ff51246539"]],null,[],null,null,null,null,null,[9,1,"e917a900d4403397bc6eaa58d6e6f5e060dc8efb2936029c48cb07c1208ea423"]]
+unheld:    ["scp:xncveguwtk6mo346wk5u6zt7qa6q2cs7b2ckym2kfm3qdydl4oaa",[[4,"11c8d8b1f08012b935f36393ff0682eee6fecc096213d672ddb8c3323e6dcea0"]],null,[[6,"dc2505b691c7b68758895d6593ae40a535c8112aef683cb5cadc9b430a9ea492"],[7,"e6ce988be7bc8910621c96d1ebc01a4d418e65d9f6a7135dca00beec2fdd9f22"]],10,null,"scp:mu3leerpopwlqi4da5g65wgpv5cp4lmvxfpebotmnyugveds37qa",null,null,null]
+displaced: ["scp:srqv6kid3drptyipn3xmqbqhgzahlsjmregupzyhghxzrwbh5ydq",[[8,"7e7af8b38b56e420bf3ed0c8c907d24aac40971c5f67bb24c311a31330635963"]],null,[],null,null,null,3,7,null]
+
+order by the UTF-8 bytes of the identifier: linear,contested,displaced,unheld
+key_positions_hash = SHA-256(JCS([3, positions])):
+  0x2331185e92fe5c155ce4996ad9c7b9ba74fecc490d4abb3662fe5bc384f96dc2
+```
+
+**The `KeyPositionRecorded` payload of the unheld position.** The positional `rmp_serde` array of nine items, without `recovered_at`, with `presented` in ascending digest order and `staged_by` present, 232 bytes:
+
+```
+0x99d9387363703a786e637665677577746b366d6f333436776b3575367a743771613671326373376232636b796d326b666d33716479646c346f6161919204c42011c8d8b1f08012b935f36393ff0682eee6fecc096213d672ddb8c3323e6dcea0c0929206c420dc2505b691c7b68758895d6593ae40a535c8112aef683cb5cadc9b430a9ea4929207c420e6ce988be7bc8910621c96d1ebc01a4d418e65d9f6a7135dca00beec2fdd9f220ac0d9387363703a6d75336c656572706f70776c71693464613567363577677076356370346c6d7678667065626f746d6e7975677665647333377161c0c0
+```
+
+**A contest that resolves to a chain with no recovery.** A later advance extends the rollover branch and the position becomes Linear on it. That chain holds no `RootRecovery`, so `recovered_at` becomes `null`, and `contested_since` clears. An implementation that keeps the [5, 1, d2] the contest left gives a different hash.
+
+```
+resolved:  ["scp:fqhx6rdyx2knwadygeppkg5dzsmtinrlb4ku3s7zywlvolsgz4za",[[1,"670fffd52753cd541d6b2dc9fa0a47a6acd54ca70e00d4779213e5f4fa87207c"]],null,[],null,null,null,null,null,null]
+key_positions_hash with the resolved position in place of the contested one:
+  0x0e756e5e5ad83ba52d69b3327147735104364950cc1b55481ab11143d2a2c518
+```
+
+### Vector 81: the `ReseatGroupInfo` answer and the three re-seat seals (§5.12.3.4, §9.7.1, §9.18)
+
+Fixture: carol (`publisher_did`, §25.1) answers Vector 82's request for epoch 7 of `context-alpha`, with recipient Vector 80's identity. `group_info` is 300 fixed bytes and `wrap_key` 16 fixed bytes, each the leading bytes of SHA-256("SCP test vector " || label || " " || counter) blocks. `key_material` and `context_params` are bins holding these RFC 8785 forms:
+
+```
+key_material:   {"context_metadata_key":"b4b7bf6e0f36c5639bb30720427c522a9f5f26db0eef479a7d868223f070cc60","sender_key_seed":null}
+context_params: {"governance":"SingleAdmin","mode":"Encrypted","ttl":null}
+group_info:     0xd383e910f15bf87e232c2489e07705faf4489ebbdd127aaf5d35ae7e9872dd32f9669081e74663937c45146b08280fb60f4ba3b5fbc899c0f8f43ab1a1779fe426e176ac2774d89a3aeca507bd2720c29b4a9b5262a9f4093ebc2e6af3370fd2482dac42c141679e34289c5a3489895eff76e4a2c685482d513e0351242ba880109c1934a20f0fb3cc92cbaa96c66c4cdb47b234a0bd0178fcf1b657c6d3c26f92d519d252862a3d253aad3b9a507a1c67df5683f16171ea87c1959b580bc4d99bf695da08d4ed17f29410f7676438a5e2146b0c0ffb906b14ff9ec5be32290e60b582773ac4d892696431673ae04a2b647e1df586fcca257eba7bf8468426af70030a30ab676c133b9a7552bb3492caa93b06e7b32f48190a3ab5d3fdc91afbf9e50968f51b9eb4855cf129
+wrap_key:       0x67d8345a7b14a7621dfe1f4f47b462cc
+
+Signature preimage, 329 bytes:
+  "SCP-RESEAT-GROUPINFO-V1:" || BE32(13) || "context-alpha" || BE64(7) || request_digest
+  || BE32(56) || recipient || SHA-256(group_info) || SHA-256(wrap_key)
+  || SHA-256(key_material) || SHA-256(context_params) || BE32(56) || publisher_did
+  0x5343502d5245534541542d47524f5550494e464f2d56313a0000000d636f6e746578742d616c7068610000000000000007472692512134d1d9fed79094dfd818cb39ea2b38cd547c5a338dc67ed32af210000000387363703a667168783672647978326b6e77616479676570706b6735647a736d74696e726c62346b753373377a79776c766f6c73677a347a6180e13f471e14b27be01ec88f74e5420ac33f23980d22e2538cf2480a001c46ca7dde0f76af497a1c01df97c005ef887fe9e15c6074f021c1156fe1576fb65f51c9646c5ac83f54e73c0925fc633f039a614e960780e015ed684b2f0f4e0b44c2300c02ffdc6d8a419d258aa9bbb6d991e1b5e52b4f97fa8dd571323d2dbf6c47000000387363703a6d75336c656572706f70776c71693464613567363577677076356370346c6d7678667065626f746d6e7975677665647333377161
+canonical hash: 0x63dfee047bbd919ec80c9f9e743cc2a3dd9a90648193166f4df6063a3dc5ba54
+signature (reference key, RFC 6979): 0x89d082983eac3a5a4dd26b84cf9908d5d29c52f9c84edfcdf9a66e694a279c6b299eafdd67ec90e8f16d246a708ee11f310edce50a00dcf11f0126816d3e4f61
+
+Answer: a nine-item MessagePack array (0x99), 671 bytes, with SHA-256
+  0x9179e40f56b35b3918a4f9065a5cc67f527d3d659eacb477075e7abe68356f3c
+item headers in order: ad 07 c420 c5012c c410 c472 c43a d938 c440
+```
+
+A `context_params` bin whose JSON reorders a member, `{"mode":"Encrypted","governance":"SingleAdmin","ttl":null}`, is not the RFC 8785 form, and a receiver rejects the answer that carries it.
+
+**The three seals.** Each seal is RFC 9180 base mode under the suite of §5.12.3.1, to Vector 37's `wrapping_key`, with the §25.2 tertiary key as the fixed ephemeral key. `info` and `aad` are the label, BE32(13) || "context-alpha", and Vector 82's `request_digest`. The plaintexts are the answer above, a 64-byte fixture Welcome `d44e5b6909bb868065f0b6d30535c178ecdd5c0a59611936ed4557ce55b730578cacc757c203d05dbe84add6cb1f860817cd9075d7273080a292b3150a5d085b`, and the expired notice, the MessagePack array [`context-alpha`, Vector 82's `key_package_hash`] `92ad636f6e746578742d616c706861c4204a22a09bcd4b1e3921f1117eeaf93ef9c1ad1d5e68001db83ad2e225a6cca584`. All three seals share the shared secret `e3aca73e38b32533c7038dc86fedc10238bd9adbe67be8f21606d4427043bd3c`.
+
+| Seal | `info` label / `aad` label | key | base_nonce | ciphertext length, SHA-256 |
+|---|---|---|---|---|
+| `ReseatGroupInfo` | `scp-reseat-groupinfo-v1` / `scp-reseat-groupinfo-aad-v1` | `98551fade4644d2a06fcc890b9a92eec` | `fde59307e1cf0c9936513a29` | 687, `76515af8a0c4d8033326ebbbc6d31eb87b85a1fa0efba082196873e207cec899` |
+| Carried Welcome | `scp-reseat-welcome-v1` / `scp-reseat-welcome-aad-v1` | `6f54206324189c53bd3d047fbf31bcd5` | `4e27bcd285e98febaa805e1c` | 80, `af2a7fb916e5cd12dae3abad6c5e7e458ac18a9735dcb9c79a8b5050944a5656` |
+| `ConcurrentChangeExpired` | `scp-reseat-expired-v1` / `scp-reseat-expired-aad-v1` | `a84e7a7e82719b85d6fadd9a61dc7b74` | `abdab0c6e2e3d3a3ca4dd7d6` | 65, `72417d80f878ef3be3866513d4ae72ab2ff984dc6e73b89e565a6a0c73c54b97` |
+
+```
+groupinfo info: 0x7363702d7265736561742d67726f7570696e666f2d76310000000d636f6e746578742d616c706861472692512134d1d9fed79094dfd818cb39ea2b38cd547c5a338dc67ed32af210
+groupinfo aad:  0x7363702d7265736561742d67726f7570696e666f2d6161642d76310000000d636f6e746578742d616c706861472692512134d1d9fed79094dfd818cb39ea2b38cd547c5a338dc67ed32af210
+welcome info:   0x7363702d7265736561742d77656c636f6d652d76310000000d636f6e746578742d616c706861472692512134d1d9fed79094dfd818cb39ea2b38cd547c5a338dc67ed32af210
+welcome aad:    0x7363702d7265736561742d77656c636f6d652d6161642d76310000000d636f6e746578742d616c706861472692512134d1d9fed79094dfd818cb39ea2b38cd547c5a338dc67ed32af210
+expired info:   0x7363702d7265736561742d657870697265642d76310000000d636f6e746578742d616c706861472692512134d1d9fed79094dfd818cb39ea2b38cd547c5a338dc67ed32af210
+expired aad:    0x7363702d7265736561742d657870697265642d6161642d76310000000d636f6e746578742d616c706861472692512134d1d9fed79094dfd818cb39ea2b38cd547c5a338dc67ed32af210
+```
+
+An opener that builds `info` or `aad` from an epoch in place of `request_digest` fails to open each seal.
+
+### Vector 82: the `ReseatRequest` (§5.12.3.5) and a carried re-seat item
+
+Fixture: Vector 80's identity asks to re-seat in `context-alpha`, anchored at `anchor_seq` 11 and `head_seq` 12, and signs with its `#active` key, here the §25.2 secondary key. `request_nonce` is the first 16 bytes of SHA-256("SCP test vector re-seat request nonce"), `anchor_digest` and `head_digest` are fixture digests, and `key_package` is 96 fixed bytes.
+
+```
+request_nonce:    0x460274c83c92609d6b356df85b83dbb3
+anchor_digest:    0x74ff9f54b7b99ddbc29745c40c6eaca6cc75659a325d37b55ba523ba66725979
+head_digest:      0x1382871cfc050623d2916fba718d10135746317081cf0b906a6732621c282046
+key_package:      0xdaa699473283557a492a3d1049475e3fcc6b5bec87ad51778f4de5ad26e30beb79132cc94a6d740149f02b3a692d29701365fe0b66073a1e3eec2d00447a2d32a73712b299a1ef2897545a92e5fb9d2ebe60507c3fb087fc6ab971847e9efe1c
+key_package_hash: 0x4a22a09bcd4b1e3921f1117eeaf93ef9c1ad1d5e68001db83ad2e225a6cca584
+
+Signature preimage, 227 bytes:
+  "SCP-RESEAT-REQUEST-V1:" || BE32(13) || "context-alpha" || BE32(56) || identifier
+  || request_nonce || BE64(11) || anchor_digest || BE64(12) || head_digest || key_package_hash
+  0x5343502d5245534541542d524551554553542d56313a0000000d636f6e746578742d616c706861000000387363703a667168783672647978326b6e77616479676570706b6735647a736d74696e726c62346b753373377a79776c766f6c73677a347a61460274c83c92609d6b356df85b83dbb3000000000000000b74ff9f54b7b99ddbc29745c40c6eaca6cc75659a325d37b55ba523ba66725979000000000000000c1382871cfc050623d2916fba718d10135746317081cf0b906a6732621c2820464a22a09bcd4b1e3921f1117eeaf93ef9c1ad1d5e68001db83ad2e225a6cca584
+request_digest = SHA-256(preimage): 0x472692512134d1d9fed79094dfd818cb39ea2b38cd547c5a338dc67ed32af210
+signature (secondary key, RFC 6979): 0x6323956de8812dcbe782ccfdd09bb479af1d60425f80b2cf2376bcb018a8a34d7bd9f62d0d9abf1f3589d7af9a5fb24b6124d439dde54c5a30e8322ca1ef9924
+
+Request: a nine-item MessagePack array (0x99), 325 bytes
+item headers in order: ad d938 c410 0b c420 0c c420 c460 c440
+  0x99ad636f6e746578742d616c706861d9387363703a667168783672647978326b6e77616479676570706b6735647a736d74696e726c62346b753373377a79776c766f6c73677a347a61c410460274c83c92609d6b356df85b83dbb30bc42074ff9f54b7b99ddbc29745c40c6eaca6cc75659a325d37b55ba523ba667259790cc4201382871cfc050623d2916fba718d10135746317081cf0b906a6732621c282046c460daa699473283557a492a3d1049475e3fcc6b5bec87ad51778f4de5ad26e30beb79132cc94a6d740149f02b3a692d29701365fe0b66073a1e3eec2d00447a2d32a73712b299a1ef2897545a92e5fb9d2ebe60507c3fb087fc6ab971847e9efe1cc4406323956de8812dcbe782ccfdd09bb479af1d60425f80b2cf2376bcb018a8a34d7bd9f62d0d9abf1f3589d7af9a5fb24b6124d439dde54c5a30e8322ca1ef9924
+
+HPKE info: 0x7363702d7265736561742d726571756573742d76310000000d636f6e746578742d616c706861
+HPKE aad:  0x7363702d7265736561742d726571756573742d6161642d76310000000d636f6e746578742d616c706861
+```
+
+Two encodings are rejected. A ten-item array (0x9a) with `epoch` 41 appended, 326 bytes, fails to decode; its last 67 bytes are `c4406323956de8812dcbe782ccfdd09bb479af1d60425f80b2cf2376bcb018a8a34d7bd9f62d0d9abf1f3589d7af9a5fb24b6124d439dde54c5a30e8322ca1ef992429`. A request whose `signature` item is the 65-byte bin `c4416323956de8812dcbe782ccfdd09bb479af1d60425f80b2cf2376bcb018a8a34d7bd9f62d0d9abf1f3589d7af9a5fb24b6124d439dde54c5a30e8322ca1ef992400` is rejected.
+
+**A carried re-seat item.** The three-item array [`F` 12, `end_leaf_hash`, the request bin] with `end_leaf_hash` `4ff58277b197040497d95d476f34918189bc359a567c78b2873e71898df88694` is 364 bytes. Its first 39 bytes, up to the request bin's bin16 header, are `930cc4204ff58277b197040497d95d476f34918189bc359a567c78b2873e71898df88694c50145`.
 
 ## 25.24 Outlet Registration V2 Vectors (§5.4.1)
 
@@ -2874,7 +3012,7 @@ A record whose F is the log count of no epoch table row is refused. The bound on
 
 ### Vector 74: the `merge_state_hash` derivation
 
-`merge_state_hash` is the SHA-256 of the RFC 8785 form of one object with five members, which RFC 8785 orders by their UTF-16 code units: `epoch_table`, `imports`, `journal`, `pending_joiners`, `records`. `journal` holds the journal entries in canonical order with the key-ledger fields; `imports` holds each import with its received leaves and its deadline. `05-contexts.md` §5.13.3 rule 16 fixes each entry's member names, so this vector fixes the rules every implementation applies to them and prints no hash:
+`merge_state_hash` is the SHA-256 of the RFC 8785 form of one object with six members, which RFC 8785 orders by their UTF-16 code units: `epoch_table`, `imports`, `journal`, `pending_joiners`, `records`, `reseat_window`. `journal` holds the journal entries in canonical order with the key-ledger fields; `imports` holds each import with its received leaves and its deadline. `05-contexts.md` §5.13.3 rule 16 fixes each entry's member names, so this vector fixes the rules every implementation applies to them and prints no hash:
 
 1. A set-valued fact is an array in ascending byte order with no duplicates. An `approvers` set {carol, alice, bob} encodes as `[bob, carol, alice]`, the order of their `scp:` text forms' bytes (`scp:gnv…`, `scp:mu3…`, `scp:nog…`). An array that repeats an element, or holds two elements out of that order, does not reproduce the hash.
 2. A hash is lowercase hexadecimal. `own` above encodes as the 64-character string `"81f41c0ba7a8a59f192449ecb70102989b5d08f5c9cdd19b0c365cff813431a9"`.
@@ -2985,8 +3123,10 @@ Each case is one row of the pair table of `07-trust-validation-and-capabilities.
 | 41 | Recording by bob of kind k | Recording by bob of kind k | The state at F; both dropped |
 | 42 | Checkpoint | Any change | The checkpoint is not re-applied |
 | 43 | Update | Any change | Not re-applied; its author re-commits it |
-| 44 | External join by X | `RemoveMember` X | X absent |
-| 45 | `0xFF03` re-seat with `key_package_hash` k | The same re-seat | Executes once |
+| 44 | External join by X, or X's re-seat with `key_package_hash` k | `RemoveMember` X | X absent; k settles with no Add |
+| 45 | X's re-seat k1 | X's carried re-seat k2 for the same recovery | Executes once; the other settles |
+| 45a | X's re-seat k on L | Any canonical change on P | Re-applied as an Add of a fresh KeyPackage of X from X's relay buffer, first among the record's items; X holds a current leaf placed at or above the recovery |
+| 45b | X's re-seat k on L, fork deeper than K(e_F) | — | Not re-applied; X gets `ConcurrentChangeExpired` |
 | 46 | `ResolveConflict` | — | Rejected |
 | 47 | A change in X (expired import) | — | Not re-applied; its author gets `ConcurrentChangeExpired` |
 
@@ -3002,4 +3142,4 @@ ids(S_e) sorts the three fixture identifiers by the bytes of their `scp:` text f
 | 8 | 1 | 2 | 0 |
 | 9 | 0 | 1 | 2 |
 
-An External Commit by a non-member at any of these epochs has rank 3. At S_7, children by carol and alice: carol's has rank 0 and is canonical whatever the cths. At S_7, two children by bob from two of his devices, with cth1 = SHA-256("SCP test vector cth one") = `15a9feb7bc8b0fb5d4f16c5607d5e71bd7477ff69d5af42de352bdbd31054416` and cth2 = SHA-256("SCP test vector cth two") = `6ca435b3e2f29c3dad106999a0ff78f31c1c1aedadf673d9fcdc9a772f74b4af`: both have rank 2, and the child with cth1 is canonical, because cth1 is less than cth2 as unsigned bytes. Two children of one parent from one MLS sender leaf are equivocation (`09-security-model.md` §9.9.3), and the choice still picks the cth1 child. At S_7, children by alice and bob: alice's has rank 1 and bob's rank 2, so alice's is canonical. An implementation that computes (e − pos(I)) mod n_e gives alice rank 2 and bob rank 1, and picks bob's.
+An External Commit by a non-member at any of these epochs has rank 3. At S_7, a re-seat child by alice and a child by carol, when S_7 holds no `reseat_window` entry for alice: alice's re-seat has rank −1 and carol's child has rank 0, so alice's re-seat is canonical whatever the cths. An implementation that gives the re-seat alice's member rank 1 picks carol's child. At S_7, two children of rank −1, by alice with a `recovered_at` epoch of 3 and cth2, and by bob with a `recovered_at` epoch of 5 and cth1: alice's is canonical, because 3 is less than 5, although cth1 is less than cth2 as unsigned bytes. An implementation that compares cth before `recovered_at` picks bob's. At S_7, a re-seat child by alice when S_7 holds `reseat_window[alice]` = [2, 14, 3], because alice's re-seat child created epoch 2 and rows 3 to 7 have committers carol, alice, bob, alice and carol: 3 ≤ K(2) = 14, so the child has alice's member rank 1 and carol's child of rank 0 is canonical. An implementation that ignores `reseat_window` picks alice's. At S_19, a re-seat child by alice when alice committed every Commit from epoch 3 to 19 after her re-seat child created epoch 2: `reseat_window[alice]` = [2, 14, 0], so the child has alice's member rank 1 and carol's child of rank 0 is canonical. An implementation that counts every Commit, 17 > 14, deletes the window and picks alice's. At S_7, children by carol and alice: carol's has rank 0 and is canonical whatever the cths. At S_7, two children by bob from two of his devices, with cth1 = SHA-256("SCP test vector cth one") = `15a9feb7bc8b0fb5d4f16c5607d5e71bd7477ff69d5af42de352bdbd31054416` and cth2 = SHA-256("SCP test vector cth two") = `6ca435b3e2f29c3dad106999a0ff78f31c1c1aedadf673d9fcdc9a772f74b4af`: both have rank 2, and the child with cth1 is canonical, because cth1 is less than cth2 as unsigned bytes. Two children of one parent from one MLS sender leaf are equivocation (`09-security-model.md` §9.9.3), and the choice still picks the cth1 child. At S_7, children by alice and bob: alice's has rank 1 and bob's rank 2, so alice's is canonical. An implementation that computes (e − pos(I)) mod n_e gives alice rank 2 and bob rank 1, and picks bob's.
