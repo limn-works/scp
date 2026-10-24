@@ -14038,7 +14038,7 @@
         "250 blobs that share one `stored_at` are all delivered at a page limit of 100",
         "Catch-up stops when a page returns fewer blobs than its limit, and a relay error mid-way returns a typed error that names the routing ID",
         "The in-browser client, after a reconnect with a persisted last `stored_at`, receives every blob stored on its routing IDs since then, 2,500 blobs included",
-        "Every routing ID the catch-up covers (shared, current, in-grace and query-only, spec 09 §9.10.4.1) is paged"
+        "Every routing ID the catch-up covers (shared, current and query-only, spec 09 §9.10.4.1) is paged"
       ],
       "actionItems": [
         "Page `relay_catch_up` in `reconnect.rs` by the cursor",
