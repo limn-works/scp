@@ -59,12 +59,12 @@ fn scp_suspend_resume_roundtrip() {
 
         // Case 1: suspend/resume on a freshly-initialised instance must
         // succeed.
-        scp.suspend().expect("scp.suspend must succeed");
+        scp.suspend(py, 10_000).expect("scp.suspend must succeed");
         scp.resume(py).expect("scp.resume must succeed");
 
         // Case 2: a second suspend/resume cycle still succeeds — the
         // operations are idempotent by design.
-        scp.suspend()
+        scp.suspend(py, 10_000)
             .expect("scp.suspend after prior resume must succeed");
         scp.resume(py)
             .expect("scp.resume after second suspend must succeed");
@@ -72,8 +72,10 @@ fn scp_suspend_resume_roundtrip() {
         // Case 3: double-suspend / double-resume are idempotent (no error on
         // repeated calls — matches the semantics documented on the `SCP`
         // methods).
-        scp.suspend().expect("double suspend must succeed");
-        scp.suspend().expect("double suspend must succeed");
+        scp.suspend(py, 10_000)
+            .expect("double suspend must succeed");
+        scp.suspend(py, 10_000)
+            .expect("double suspend must succeed");
         scp.resume(py).expect("double resume must succeed");
         scp.resume(py).expect("double resume must succeed");
     });

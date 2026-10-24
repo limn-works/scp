@@ -111,7 +111,7 @@ def test_fresh_instances_have_distinct_ids() -> None:
 def test_suspend_resume_shutdown_lifecycle() -> None:
     """suspend/resume/shutdown must all succeed on a fresh instance."""
     scp = SCP({"type": "in_memory"})
-    scp.suspend()
+    scp.suspend(1000)
     scp.resume()
     # Native `SCP.shutdown` takes unsigned milliseconds after the
     # #1549 Phase 4 unit unification. 1 s = 1000 ms.
@@ -444,6 +444,66 @@ def test_wrapper_with_storage_sqlite_passes_config_through() -> None:
     assert wrapper.instance_id == 42
 
 
+_FLUSH_FAILED_MSG = "[SCP-STORAGE-8014] suspend failed: context flush failed: disk full"
+
+
+@pytest.mark.asyncio
+async def test_wrapper_suspend_is_async_and_delegates_to_native() -> None:
+    """`WrapperSCP.suspend()` is a coroutine that runs `_native.suspend` once."""
+    import inspect
+
+    wrapper, mock_native = _make_wrapper_with_mock()
+    coro = wrapper.suspend()
+    assert inspect.iscoroutine(coro), "WrapperSCP.suspend() must return a coroutine"
+    await coro
+    mock_native.suspend.assert_called_once_with(5000)
+
+
+@pytest.mark.asyncio
+async def test_wrapper_suspend_passes_its_timeout_in_millis() -> None:
+    """`suspend(timeout=...)` reaches the native call as clamped milliseconds."""
+    wrapper, mock_native = _make_wrapper_with_mock()
+    await wrapper.suspend(timeout=0.25)
+    mock_native.suspend.assert_called_once_with(250)
+    mock_native.suspend.reset_mock()
+    await wrapper.suspend(timeout=-1.0)
+    mock_native.suspend.assert_called_once_with(0)
+
+
+def test_flush_failure_codes_are_exported() -> None:
+    """The suspend and shutdown flush codes are importable from the package."""
+    import scp_sdk
+
+    assert scp_sdk.SUSPEND_FLUSH_FAILED_CODE == "SCP-STORAGE-8014"
+    assert scp_sdk.SHUTDOWN_FLUSH_FAILED_CODE == "SCP-STORAGE-8015"
+
+
+@pytest.mark.asyncio
+async def test_suspend_translates_flush_failure_to_storage_error() -> None:
+    """A native SCP-STORAGE-8014 from `suspend` surfaces as `scp_sdk.StorageError`."""
+    from scp_sdk.errors import StorageError
+
+    wrapper, mock_native = _make_wrapper_with_mock()
+    mock_native.suspend.side_effect = RuntimeError(_FLUSH_FAILED_MSG)
+    with pytest.raises(StorageError) as info:
+        await wrapper.suspend()
+    assert info.value.code == "SCP-STORAGE-8014"
+
+
+@pytest.mark.asyncio
+async def test_suspend_translates_transport_failure_to_transport_error() -> None:
+    """A native SCP-TRANS-5001 from `suspend` surfaces as `scp_sdk.TransportError`."""
+    from scp_sdk.errors import TransportError
+
+    wrapper, mock_native = _make_wrapper_with_mock()
+    mock_native.suspend.side_effect = RuntimeError(
+        "[SCP-TRANS-5001] suspend failed: transport lock poisoned"
+    )
+    with pytest.raises(TransportError) as info:
+        await wrapper.suspend()
+    assert info.value.code == "SCP-TRANS-5001"
+
+
 _STORE_HELD_MSG = "[SCP-STORAGE-8005] Storage error: shutdown left the durable store open"
 
 
@@ -457,6 +517,20 @@ async def test_shutdown_translates_store_held_error_to_storage_error() -> None:
     with pytest.raises(StorageError) as info:
         await wrapper.shutdown(timeout=0.05)
     assert info.value.code == "SCP-STORAGE-8005"
+
+
+@pytest.mark.asyncio
+async def test_shutdown_translates_flush_failure_to_storage_error() -> None:
+    """A native SCP-STORAGE-8015 from `shutdown` surfaces as `scp_sdk.StorageError`."""
+    from scp_sdk.errors import StorageError
+
+    wrapper, mock_native = _make_wrapper_with_mock()
+    mock_native.shutdown.side_effect = RuntimeError(
+        "[SCP-STORAGE-8015] Storage error: shutdown completed but a context flush failed"
+    )
+    with pytest.raises(StorageError) as info:
+        await wrapper.shutdown(timeout=0.05)
+    assert info.value.code == "SCP-STORAGE-8015"
 
 
 @pytest.mark.asyncio

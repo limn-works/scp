@@ -62,8 +62,23 @@ final class ScpClassTests: XCTestCase {
     /// `suspend()` followed by `resume()` must succeed on a fresh
     /// instance.
     func testSuspendResumeRoundtrip() async throws {
-        try scp.suspend()
+        try await scp.suspend()
         try await scp.resume()
+    }
+
+    /// `suspend(timeout:)` takes an explicit deadline.
+    func testSuspendTakesADeadline() async throws {
+        try await scp.suspend(timeout: 1.0)
+        try await scp.resume()
+    }
+
+    /// The seconds-to-milliseconds clamp `suspend(timeout:)` and
+    /// `shutdown(timeout:)` share.
+    func testTimeoutClampsToMilliseconds() {
+        XCTAssertEqual(SCP.clampedMillis(0.25), 250)
+        XCTAssertEqual(SCP.clampedMillis(-1), 0)
+        XCTAssertEqual(SCP.clampedMillis(.nan), 0)
+        XCTAssertEqual(SCP.clampedMillis(.infinity), UInt64.max)
     }
 
     /// `configureLocalTransport(localDid:)` with a valid DID must succeed,

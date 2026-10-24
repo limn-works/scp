@@ -2007,8 +2007,8 @@ fn document_vm_key_resolver(
 /// connection), we box a thin wrapper that delegates every trait method to
 /// the shared `Arc`. The `Arc` mirror retained on `CoreFields::persistence`
 /// and the `Arc` reconstructed inside `ContextManager` end up pointing at
-/// the same provider, so suspend/resume flush + `flush_all_contexts_sync`
-/// operate on the same underlying storage.
+/// the same provider, so the suspend and shutdown flushes operate on the
+/// same underlying storage.
 struct ArcContextPersistence {
     inner: Arc<dyn scp_core::context::persistence::ContextPersistence + Send + Sync>,
 }
@@ -2629,6 +2629,7 @@ mod tests {
             },
         })
         .expect("first open");
+        let bi = std::sync::Arc::new(bi);
         let second = UniffiBridgeInstance::with_storage_uniffi(StorageConfig::Sqlite {
             path: tmp.path().to_string_lossy().into_owned(),
             key: SqliteKeyMaterial::Raw {
@@ -2639,7 +2640,8 @@ mod tests {
             matches!(second, Err(StorageInitError::LockHeld { .. })),
             "a second open of a live store's directory must fail with LockHeld"
         );
-        let outcome = crate::runtime().block_on(bi.shutdown(std::time::Duration::from_secs(10)));
+        let outcome = crate::runtime()
+            .block_on(std::sync::Arc::clone(&bi).shutdown(std::time::Duration::from_secs(10)));
         assert!(
             matches!(outcome, Ok(ShutdownOutcome::GracefulWithin { .. })),
             "{outcome:?}"
@@ -2850,8 +2852,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn shutdown_hook_runs_with_external_state() {
+    #[tokio::test]
+    async fn shutdown_hook_runs_with_external_state() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -2870,10 +2872,13 @@ mod tests {
             !ran.load(Ordering::SeqCst),
             "hook must not fire before shutdown"
         );
-        bi.core.shutdown();
+        bi.core
+            .shutdown_core_async(std::time::Duration::from_secs(5), None)
+            .await
+            .expect("shutdown");
         assert!(
             ran.load(Ordering::SeqCst),
-            "shutdown hook must execute during CoreFields::shutdown()"
+            "shutdown hook must execute during CoreFields::shutdown_core_async()"
         );
     }
 }

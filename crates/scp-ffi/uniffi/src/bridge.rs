@@ -1256,7 +1256,7 @@ mod storage_code_tests {
     ];
 
     /// Every registered `SCP-STORAGE-` code in `error_codes.rs`.
-    const STORAGE_CODES: [&str; 7] = [
+    const STORAGE_CODES: [&str; 8] = [
         codes::STORAGE_8000,
         codes::STORAGE_8004,
         codes::STORAGE_8005,
@@ -1264,6 +1264,7 @@ mod storage_code_tests {
         codes::STORAGE_8007,
         codes::STORAGE_8008,
         codes::STORAGE_8009,
+        codes::STORAGE_8014,
     ];
 
     /// Every custody failure kind; the match fails to compile when a kind is
@@ -21302,7 +21303,9 @@ mod tests {
     fn a_failed_close_re_read_settles_its_mark() {
         let scp = scp_test();
         let ctx_id = scp_ffi_common::generate_context_id();
-        scp.inner.core.suspend().expect("suspend");
+        runtime()
+            .block_on(scp.inner.core.suspend(std::time::Duration::from_secs(10)))
+            .expect("suspend");
         let result = runtime().block_on(
             scp.inner
                 .release_ucan_state_unless_readmitted(&ctx_id, || {}),
@@ -21884,6 +21887,68 @@ mod tests {
         );
     }
 
+    /// `Scp::suspend` writes every context's snapshot when the calling thread
+    /// runs no tokio runtime. The test drives the async export on the bridge
+    /// runtime from a plain test thread, as the generated Swift and Kotlin
+    /// bindings do, after deleting the context's stored snapshot, so only the
+    /// suspend's flush can put it back.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn suspend_from_a_thread_with_no_runtime_flushes_every_context() {
+        use scp_ffi_common::bridge_instance::{BridgeInstanceCore as _, ShutdownOutcome};
+        assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "precondition: the test thread runs no tokio runtime"
+        );
+        let rt = runtime();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let scp = crate::scp::Scp::with_storage(crate::StorageConfig::Sqlite {
+            path: tmp.path().to_string_lossy().into_owned(),
+            key: crate::runtime::SqliteKeyMaterial::Raw {
+                key: vec![0x12u8; 32],
+            },
+        })
+        .expect("sqlite storage must construct");
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let ctx_id = rt
+            .block_on(scp.context_create(Arc::clone(&identity), encrypted_join_test_params()))
+            .expect("context_create should succeed")
+            .context_id();
+        let persistence = scp
+            .inner
+            .core
+            .persistence_arc_clone()
+            .expect("a SQLCipher instance carries persistence");
+        rt.block_on(persistence.delete_context(&ctx_id))
+            .expect("delete_context must succeed");
+        assert!(
+            rt.block_on(persistence.load_context(&ctx_id))
+                .expect("load_context must succeed")
+                .is_none(),
+            "precondition: the store holds no snapshot of the context"
+        );
+
+        rt.block_on(scp.suspend(10_000))
+            .expect("suspend must flush and succeed");
+
+        assert!(
+            rt.block_on(persistence.load_context(&ctx_id))
+                .expect("load_context must succeed")
+                .is_some(),
+            "suspend must write the context's snapshot"
+        );
+        assert!(scp.inner.core.is_suspended(), "suspend must take effect");
+        drop(persistence);
+        let outcome =
+            rt.block_on(Arc::clone(&scp.inner).shutdown(std::time::Duration::from_secs(10)));
+        assert!(
+            matches!(outcome, Ok(ShutdownOutcome::GracefulWithin { .. })),
+            "the shutdown must drain every actor and close the store: {outcome:?}"
+        );
+    }
+
     /// `restore_context` and `restore_all_contexts` clear the release mark on
     /// each id they restore.
     #[test]
@@ -21953,7 +22018,8 @@ mod tests {
         // `OPENSSL_cleanup` frees the state SQLCipher is still using, and the
         // process dies of SIGSEGV after the test reports `ok`.
         drop(sup);
-        let outcome = rt.block_on(scp.inner.shutdown(std::time::Duration::from_secs(10)));
+        let outcome =
+            rt.block_on(Arc::clone(&scp.inner).shutdown(std::time::Duration::from_secs(10)));
         assert!(
             matches!(outcome, Ok(ShutdownOutcome::GracefulWithin { .. })),
             "the shutdown must drain every actor and close the store: {outcome:?}"
@@ -22044,7 +22110,8 @@ mod tests {
             .dht_client()
             .map(Arc::clone)
             .expect("identity_create attaches A's DHT client");
-        let outcome = rt.block_on(scp.inner.shutdown(std::time::Duration::from_secs(10)));
+        let outcome =
+            rt.block_on(Arc::clone(&scp.inner).shutdown(std::time::Duration::from_secs(10)));
         assert!(
             matches!(outcome, Ok(ShutdownOutcome::GracefulWithin { .. })),
             "A's shutdown must drain every actor and close the store: {outcome:?}"
@@ -22130,7 +22197,8 @@ mod tests {
         .expect("a token nobody revoked or presented still validates after the restart");
 
         drop(handle_b);
-        let outcome = rt.block_on(reopened.inner.shutdown(std::time::Duration::from_secs(10)));
+        let outcome =
+            rt.block_on(Arc::clone(&reopened.inner).shutdown(std::time::Duration::from_secs(10)));
         assert!(
             matches!(outcome, Ok(ShutdownOutcome::GracefulWithin { .. })),
             "B's shutdown must drain every actor and close the store: {outcome:?}"
@@ -26798,7 +26866,8 @@ mod tests {
         listener
             .set_nonblocking(true)
             .expect("nonblocking listener");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline =
+            scp_ffi_common::deadline::deadline_after(std::time::Duration::from_secs(5)).into_std();
         loop {
             match listener.accept() {
                 Ok((conn, _)) => {
@@ -28864,7 +28933,10 @@ mod tests {
             agent_proof_tokens: None,
         };
 
-        bi.core.suspend().expect("suspend");
+        bi.core
+            .suspend(std::time::Duration::from_secs(10))
+            .await
+            .expect("suspend");
         assert!(
             bi.core.try_supervisor().is_some(),
             "precondition: suspension keeps the supervisor attached"
@@ -28874,7 +28946,7 @@ mod tests {
             "McpServerForTransport::Unwired"
         );
 
-        bi.resume().await.expect("resume");
+        Arc::clone(&bi).resume().await.expect("resume");
         assert_eq!(
             format!("{:?}", mcp_server_bundle(&bi, provider())),
             "McpServerForTransport::Wired"
@@ -28915,7 +28987,10 @@ mod tests {
         bi.init_context_manager_with_did("did:dht:z6MkSubscriber");
         gates(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD);
 
-        bi.core.suspend().expect("suspend");
+        bi.core
+            .suspend(std::time::Duration::from_secs(10))
+            .await
+            .expect("suspend");
         let resource = provider.validate_resource_access("ctx-absent", ResourceKind::Events);
         assert!(
             matches!(&resource, Err(AccessRefusal::Unreadable(m)) if m.contains("suspended")),
@@ -32279,7 +32354,11 @@ mod tests {
         );
 
         register_supervisor_context(&scp, &context_id, creator, CALLBACK_SUPERVISOR_CEILING).await;
-        scp.inner.core.suspend().expect("suspend");
+        scp.inner
+            .core
+            .suspend(std::time::Duration::from_secs(10))
+            .await
+            .expect("suspend");
         let suspended = scp
             .inner
             .require_active_context_before_authz(

@@ -339,6 +339,38 @@ SDK wrappers match:
 
 Lifecycle tests across all four SDKs converted to `#[tokio::test]` / the idiomatic async test form in each language.
 
+### `suspend()` flushes on a runtime and fails closed (amended 2026-10-23)
+
+`CoreFields::suspend(&self, deadline)` and the `BridgeInstanceCore::suspend(self: Arc<Self>, deadline)` default are `async fn` returning `Result<(), SuspendError>`. `suspend` takes the instance's lifecycle lock, sets the suspended flag, cancels the reconnect generation, awaits `Supervisor::flush_all_contexts` within what is left of `deadline`, and then clears transport. `SuspendError` has four variants:
+
+- `FlushFailed(ContextError)`: a context snapshot did not persist.
+- `DeadlineElapsed { deadline }`: the flush, or the wait for the lifecycle lock, did not finish within `deadline`.
+- `Interrupted`: the runtime cancelled the suspend task, as when the runtime shuts down.
+- `TransportLock(TransportLockError)`: the transport lock is poisoned.
+
+On every variant `suspend` clears the suspended flag and leaves the transport connected, so the instance stays running. Each bridge reports the first three with `SCP-STORAGE-8014` and `TransportLock` with `SCP-TRANS-5001` (`classify_suspend_failure`, one total match the three bridges share). The unflushed actors stay dirty (ADR-049, actor per context, Decision 9 "Persistence: coalesced by default, sync for safety-critical"), so a retried `suspend` flushes them again. `flush_all_contexts` skips a context whose actor left its run loop on purpose between the id lookup and its reply: the actor records a Shutdown, a claimed PrepareForReplace or a TTL expiry on the handle the Supervisor's registry holds before its inbox drops. An actor that dropped the reply without that record, as a panic does, fails the sweep, and so does a full mailbox.
+
+Before this amendment, `suspend` was synchronous and called `flush_all_contexts_sync`, which returns an error outside a tokio runtime. A Swift, Kotlin, TypeScript or Python caller has no tokio runtime on its thread, so every SDK `suspend` skipped the flush, and `suspend` discarded the error and reported success.
+
+**Transitions serialize and run to completion; shutdown supersedes them.** `suspend`, `resume` (including its reconnect and restore) and `shutdown_core_async` each hold the lifecycle lock for their whole body, so a resume that starts during a suspend's flush waits for it, and two suspends cannot interleave. `shutdown_core_async` sets its shutdown flag, cancels the reconnect dial and cancels the instance's transition token before it takes the lock, so a losing concurrent shutdown waits only on the winner's store close. A suspend or resume selects on that token at every await: a suspend that a shutdown supersedes, while it waits for the lock or mid-flush, returns `Ok(())` and leaves the flush to the shutdown, and a resume returns `AlreadyShutDown`. The shutdown's wait for the lock is bounded by its own deadline; when the wait expires, the cleanup still runs without the lock and with no budget left, and the outcome is `ShutdownOutcome::TimedOut` with `ShutdownFlush::TimedOut`. A shutdown therefore never runs past its caller's deadline because a suspend or resume holds the lock, which also bounds Kotlin's `NonCancellable` wait on it. The trait defaults run each transition on a spawned task and await its handle, so a caller that drops the future, such as a cancelled Swift task, Kotlin coroutine or Python task, does not stop a transition half done: the suspend finishes or reverts. Kotlin `CoroutineBridge.ffiCallSuspend` fails fast for a coroutine cancelled before the call, then awaits the transition under `NonCancellable` and returns its real result, so a cancellation that arrives mid-call does not replace a suspend that succeeded.
+
+The bridges call `suspend` the way they call `resume`, with the deadline in milliseconds as `shutdown` takes it:
+
+- `PyScp::suspend(&self, py, timeout_millis)` — waits through `actor_wait::block_on_released`, which releases the GIL.
+- `Scp::suspend(timeout_millis: BigInt)` on napi — native `async fn`.
+- `Scp::suspend(timeout_millis: u64)` on UniFFI — `pub async fn` on the tokio async runtime, surfacing as Kotlin `suspend fun` and Swift `async throws`.
+
+SDK wrappers take the deadline in seconds, default 5, clamped as each SDK's `shutdown` clamps its own: Python `async def suspend(self, timeout: float = 5.0)` through `asyncio.to_thread`, TypeScript `suspend(timeoutSecs = 5): Promise<void>`, Swift `func suspend(timeout: TimeInterval = 5.0) async throws`, and Kotlin `suspend fun suspendInstance(bridge, timeout: Duration = 5.seconds)` through `CoroutineBridge.ffiCallSuspend`. Each SDK raises its storage error for `SCP-STORAGE-8014`; Python and TypeScript export it as `SUSPEND_FLUSH_FAILED_CODE`.
+
+**Background recipe.** A mobile host suspends while the OS still lets the process run, and gives `suspend` a deadline shorter than that window:
+
+- iOS: take an identifier from `UIApplication.shared.beginBackgroundTask(expirationHandler:)` when the scene enters the background, await `suspend(timeout:)` with a `timeout` below `backgroundTimeRemaining`, then call `endBackgroundTask(_:)`.
+- Android: call `suspendInstance` from `ProcessLifecycleOwner.get().lifecycleScope` in `onStop`, a scope that outlives the activity, with a `timeout` below the time before the process is frozen.
+
+When `suspend` raises `SCP-STORAGE-8014`, the instance is still running and connected; the host retries, or lets the OS suspend the process and accepts that the unflushed contexts restore from their last persisted snapshot.
+
+**Shutdown reports its flush.** The synchronous `CoreFields::shutdown` is deleted, because it also flushed through `flush_all_contexts_sync` and skipped the flush outside a runtime. Every shutdown goes through `CoreFields::shutdown_core_async`, which awaits `flush_all_contexts` inside the caller's deadline and records how it ended in `ShutdownOutcome`'s `flush` field: `ShutdownFlush::Flushed`, `Failed { message }`, `TimedOut`, or `Skipped` when no Supervisor was attached. `sdk_shutdown_result` raises `SCP-STORAGE-8015` for `Failed` or `TimedOut` when the store was released; the instance is shut down either way, and the unflushed contexts restore from their last persisted snapshot. A shutdown that also left the store holding its lock raises `SCP-STORAGE-8005`, whose message names the flush failure; `ShutdownError::DurableStoreClose { error, flush }` and `ShutdownError::Interrupted { flush }` carry the flush result (`Interrupted`'s is `None` when the runtime stopped the shutdown before its flush ended), and their messages name a flush that failed, timed out or had not finished. Each SDK `shutdown` documents both codes; Python and TypeScript export 8015 as `SHUTDOWN_FLUSH_FAILED_CODE`.
+
 ### Multi-URL reconnect via `HashSet`
 
 `CoreFields::relay_url: Mutex<Option<String>>` is replaced with `relay_urls: Mutex<HashSet<String>>`. `TransportManager` already supports multi-adapter routing; the single-URL state was artificially narrow.

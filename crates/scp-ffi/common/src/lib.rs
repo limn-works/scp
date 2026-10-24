@@ -22,8 +22,11 @@
 // (ADR-049 Decision 7a; `scripts/check-bridge-block-on.py`).
 #[cfg(feature = "resolvers")]
 pub mod bridge_wait;
+// Overflow-safe deadlines from host-supplied budgets.
 pub mod context_error_class;
 pub mod custody_request;
+#[cfg(feature = "resolvers")]
+pub mod deadline;
 pub mod error_codes;
 pub mod outlet_id;
 pub mod p256_host;

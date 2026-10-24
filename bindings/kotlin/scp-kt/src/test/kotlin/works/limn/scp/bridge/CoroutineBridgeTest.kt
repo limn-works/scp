@@ -517,6 +517,40 @@ class CoroutineBridgeTest {
             }
 
         @Test
+        fun `ffiCallSuspend returns the transition result to a caller cancelled mid-call`() =
+            runTest(ioDispatcher) {
+                val gate = kotlinx.coroutines.CompletableDeferred<Unit>()
+                var result: String? = null
+                val job =
+                    launch {
+                        result =
+                            bridge.ffiCallSuspend {
+                                gate.await()
+                                "suspended"
+                            }
+                    }
+                advanceUntilIdle()
+                job.cancel()
+                gate.complete(Unit)
+                job.join()
+                assertEquals("suspended", result, "a cancellation mid-call must not replace the result")
+            }
+
+        @Test
+        fun `ffiCallSuspend fails fast for a caller cancelled before the call`() =
+            runTest(ioDispatcher) {
+                val job = Job()
+                job.cancel()
+                var ran = false
+                assertFailsWith<CancellationException> {
+                    kotlinx.coroutines.withContext(job) {
+                        bridge.ffiCallSuspend { ran = true }
+                    }
+                }
+                assertFalse(ran, "a cancelled caller must not start a transition")
+            }
+
+        @Test
         fun `transportConnect propagates cancellation to handle`() =
             runTest(ioDispatcher) {
                 stubBindings.transportConnectBlocking = true

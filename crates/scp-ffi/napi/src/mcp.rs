@@ -1457,7 +1457,12 @@ mod tests {
             sleep 600; true",
             pid_file.display()
         );
-        bi.core.shutdown();
+        crate::runtime()
+            .block_on(
+                bi.core
+                    .shutdown_core_async(std::time::Duration::from_secs(5), None),
+            )
+            .expect("shutdown");
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1518,7 +1523,12 @@ mod tests {
     #[test]
     fn a_serve_after_shutdown_registers_nothing_napi() {
         let bi = Arc::new(NapiBridgeInstance::new_napi());
-        bi.core.shutdown();
+        crate::runtime()
+            .block_on(
+                bi.core
+                    .shutdown_core_async(std::time::Duration::from_secs(5), None),
+            )
+            .expect("shutdown");
         let Err(error) = crate::runtime().block_on(mcp_server_create_on(
             &bi,
             NapiMcpServerConfig {
@@ -2132,7 +2142,8 @@ mod tests {
         listener
             .set_nonblocking(true)
             .expect("nonblocking listener");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline =
+            scp_ffi_common::deadline::deadline_after(std::time::Duration::from_secs(5)).into_std();
         loop {
             match listener.accept() {
                 Ok((conn, _)) => {
@@ -3125,7 +3136,9 @@ mod tests {
             context_ids: vec![SUB_CTX.to_owned()],
         };
 
-        bi.core.suspend().expect("suspend");
+        crate::runtime()
+            .block_on(Arc::clone(&bi).suspend(std::time::Duration::from_secs(10)))
+            .expect("suspend");
         assert!(
             bi.core.try_supervisor().is_some(),
             "precondition: suspension keeps the supervisor attached"
@@ -3135,7 +3148,9 @@ mod tests {
             "McpServerForTransport::Unwired"
         );
 
-        crate::runtime().block_on(bi.resume()).expect("resume");
+        crate::runtime()
+            .block_on(Arc::clone(&bi).resume())
+            .expect("resume");
         assert_eq!(
             format!("{:?}", mcp_server_bundle(&bi, provider())),
             "McpServerForTransport::Wired"

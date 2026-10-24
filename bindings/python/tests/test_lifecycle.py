@@ -30,9 +30,10 @@ except Exception as _exc:
 from scp_sdk import SCP
 
 
-def test_suspend_before_init_is_noop(scp: SCP) -> None:
+@pytest.mark.asyncio
+async def test_suspend_before_init_is_noop(scp: SCP) -> None:
     """suspend() on a fresh instance must succeed (no context state)."""
-    scp.suspend()
+    await scp.suspend()
 
 
 @pytest.mark.asyncio
@@ -50,7 +51,7 @@ async def test_suspend_and_resume_roundtrip_after_init(scp: SCP) -> None:
     entirely-inert instance.
     """
     _identity = await create_in_memory_identity(scp)
-    scp.suspend()
+    await scp.suspend()
     await scp.resume()
 
 
@@ -58,7 +59,7 @@ async def test_suspend_and_resume_roundtrip_after_init(scp: SCP) -> None:
 async def test_multiple_suspend_resume_cycles_are_idempotent(scp: SCP) -> None:
     """Multiple suspend/resume cycles are safe; neither raises."""
     _identity = await create_in_memory_identity(scp)
-    scp.suspend()
-    scp.suspend()
+    await scp.suspend()
+    await scp.suspend()
     await scp.resume()
     await scp.resume()

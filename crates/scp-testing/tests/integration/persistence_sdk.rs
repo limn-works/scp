@@ -238,7 +238,7 @@ async fn context_create_persists_membership_to_sqlite() {
         assert_eq!(handle.state(), ContextState::Active);
         // Flush snapshots, then drain the supervisor so no task still holds
         // the store when this block drops it (ADR-049 Decision 16).
-        manager.flush_all_contexts_sync().unwrap();
+        manager.flush_all_contexts().await.unwrap();
         manager.shutdown_all_contexts().await;
     }
 
@@ -281,7 +281,7 @@ async fn context_create_persists_membership_to_sqlite() {
 /// Steps:
 /// 1. Open SqliteStorage#1 at tmpdir, build supervisor with persistence.
 /// 2. Register Alice's local DID, create context, send one message.
-/// 3. `flush_all_contexts_sync` — persists the snapshot.
+/// 3. `flush_all_contexts` — persists the snapshot.
 /// 4. Drop the supervisor (simulates process exit / `Scp::shutdown`).
 /// 5. Open SqliteStorage#2 at the SAME path with the SAME key.
 /// 6. Build a fresh supervisor with persistence pointing at the new
@@ -355,7 +355,7 @@ async fn full_lifecycle_suspend_restore_roundtrip() {
         // mirrors `CoreFields::shutdown_core_async`, which flushes and then
         // waits for every supervisor task before the store closes
         // (ADR-049 Decision 16).
-        manager.flush_all_contexts_sync().unwrap();
+        manager.flush_all_contexts().await.unwrap();
         manager.shutdown_all_contexts().await;
     }
 
@@ -369,7 +369,7 @@ async fn full_lifecycle_suspend_restore_roundtrip() {
         let persisted = repo.load_full_snapshot(ctx_id).await.unwrap();
         assert!(
             persisted.is_some(),
-            "ContextSnapshot must persist to SQLite after flush_all_contexts_sync"
+            "ContextSnapshot must persist to SQLite after flush_all_contexts"
         );
         let snap = persisted.unwrap();
         assert!(
@@ -503,7 +503,7 @@ async fn close_then_reopen_same_path_is_deterministic() {
             )
             .await
             .unwrap();
-        manager.flush_all_contexts_sync().unwrap();
+        manager.flush_all_contexts().await.unwrap();
         manager.shutdown_all_contexts().await;
     }
     assert_eq!(
@@ -530,7 +530,7 @@ async fn close_then_reopen_same_path_is_deterministic() {
         )
         .await
         .unwrap();
-    manager.flush_all_contexts_sync().unwrap();
+    manager.flush_all_contexts().await.unwrap();
     manager.shutdown_all_contexts().await;
     storage
         .close()

@@ -5778,8 +5778,10 @@ impl Supervisor {
         // (ADR-049 finding A3), reconciled inside the actor's own `run()`
         // loop — no separate supervisor timer JoinSet exists.
         let inbox = rx;
+        let exit = handle.exit_record();
         let join = permit.spawn(async move {
-            Box::pin(crate::context::actor::ContextActor::new(state, deps, inbox).run()).await;
+            Box::pin(crate::context::actor::ContextActor::new(state, deps, inbox, exit).run())
+                .await;
         });
 
         // Spawn the watchdog: it awaits the actor's completion and, on a
@@ -11904,22 +11906,6 @@ impl Supervisor {
         crate::context::lifecycle_helpers::flush_all_contexts(self).await
     }
 
-    /// Sync wrapper for [`Self::flush_all_contexts`].
-    ///
-    /// Required by `Drop` and other terminal sync callers that cannot
-    /// `.await`. Uses `tokio::runtime::Handle::current` to bridge
-    /// sync → async; **callers MUST be inside a tokio runtime**.
-    /// No-op if no persistence provider is configured.
-    ///
-    /// # Errors
-    ///
-    /// The first context's flush failure, or a failure when called outside
-    /// a tokio runtime; see
-    /// [`crate::context::lifecycle_helpers::flush_all_contexts_sync`].
-    pub fn flush_all_contexts_sync(&self) -> Result<(), ContextError> {
-        crate::context::lifecycle_helpers::flush_all_contexts_sync(self)
-    }
-
     /// Shut down every context the supervisor owns and wait for every task
     /// the supervisor spawned to exit (ADR-049 Decision 16, supervisor task
     /// drain; local cleanup only).
@@ -12267,24 +12253,6 @@ impl Supervisor {
         self.task_tracker.close();
         self.task_tracker.wait().await;
         self.crash_windows.retain(|_, window| window.is_poisoned());
-    }
-
-    /// Sync wrapper for [`Self::shutdown_all_contexts`].
-    ///
-    /// Required by destructor / atexit-style sync callers (the FFI
-    /// bridge instance's blocking-shutdown path) that cannot `.await`.
-    /// Uses [`tokio::runtime::Handle::try_current`] to bridge sync →
-    /// async; **callers MUST be inside a tokio runtime**.
-    ///
-    /// # Errors
-    ///
-    /// [`ContextError::InvalidState`] when called outside a tokio runtime:
-    /// nothing was shut down or drained, so the caller must not close the
-    /// storage backend. [`ContextError::InvalidState`] when the drain does
-    /// not finish within the deadline: tracked tasks still run, so the caller
-    /// must not close the storage backend.
-    pub fn shutdown_all_contexts_sync(&self) -> Result<(), ContextError> {
-        crate::context::lifecycle_helpers::shutdown_all_contexts_sync(self)
     }
 
     // -------------------------------------------------------------------
@@ -14183,8 +14151,7 @@ impl Supervisor {
     /// The method signature is `fn`, not `async fn` — FFI callers
     /// (the MCP `invoke_outlet` sync trait method in particular) invoke
     /// it from outside a tokio task and cannot `.await`. The body
-    /// bridges sync → async exactly like
-    /// [`Self::shutdown_all_contexts_sync`]: it inspects the ambient
+    /// bridges sync → async: it inspects the ambient
     /// runtime and either `blocking`-bridges into the async
     /// `Self::try_consume_hard_rate_limit` actor-mailbox path, or
     /// spawns a dedicated current-thread runtime when neither

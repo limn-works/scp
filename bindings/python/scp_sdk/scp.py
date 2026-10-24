@@ -33,8 +33,8 @@ Example usage::
         "key": b"\\x00" * 32,
     })
 
-    # `resume` and `shutdown` are async — they await the tokio runtime.
-    scp.suspend()
+    # `suspend`, `resume` and `shutdown` are async — they await the tokio runtime.
+    await scp.suspend()
     await scp.resume()
 """
 
@@ -105,6 +105,8 @@ logger = logging.getLogger("scp_sdk")
 
 __all__ = [
     "SCP",
+    "SHUTDOWN_FLUSH_FAILED_CODE",
+    "SUSPEND_FLUSH_FAILED_CODE",
     "CustodyKeyRole",
     "CustodyKeyType",
     "CustodyPublicKey",
@@ -583,6 +585,18 @@ CustodyArg: TypeAlias = "CustodyType | Literal['encrypted_file', 'os_keystore']"
 #: Code raised when an identity-creating method receives no custody argument.
 CUSTODY_REQUIRED_CODE = "SCP-IDENT-1116"
 
+#: Code :meth:`SCP.suspend` raises (as :class:`~scp_sdk.errors.StorageError`)
+#: when a context snapshot did not persist or the flush missed the deadline;
+#: the instance stays running with its transport connected
+#: (``STORAGE_8014`` in ``crates/scp-ffi/common/src/error_codes.rs``).
+SUSPEND_FLUSH_FAILED_CODE = "SCP-STORAGE-8014"
+
+#: Code :meth:`SCP.shutdown` raises (as :class:`~scp_sdk.errors.StorageError`)
+#: when the instance shut down and released its store but a context snapshot
+#: did not persist within the deadline
+#: (``STORAGE_8015`` in ``crates/scp-ffi/common/src/error_codes.rs``).
+SHUTDOWN_FLUSH_FAILED_CODE = "SCP-STORAGE-8015"
+
 
 #: Remedy for a method whose custody argument is a :data:`CustodyArg`.
 _CUSTODY_VALUE_REMEDY = (
@@ -744,27 +758,39 @@ class SCP:
         """
         return int(self._native.instance_id)
 
-    def suspend(self) -> None:
+    async def suspend(self, timeout: float = 5.0) -> None:
         """Suspend the bridge for mobile/desktop backgrounding.
 
-        Disconnects the transport (clears the relay connection) and marks
-        the instance as suspended. Context state is preserved;
-        transport-dependent operations will fail until :meth:`resume` is
-        called.
+        Flushes every context snapshot to storage, then disconnects the
+        transport (clears the relay connection) and marks the instance as
+        suspended. Context state is preserved; transport-dependent
+        operations will fail until :meth:`resume` is called.
 
-        :raises TransportError: If transport cleanup fails
-            (code ``SCP-TRANS-5001``).
+        ``timeout`` bounds the whole call in seconds, clamped as
+        :meth:`shutdown` clamps its ``timeout``. A flush that misses it
+        fails the suspend with ``SCP-STORAGE-8014`` and leaves the
+        instance running. The suspend runs to completion, or reverts,
+        even if the awaiting task is cancelled.
+
+        This is an ``async`` coroutine because the flush runs on the tokio
+        runtime behind a blocking wait at the FFI boundary; the blocking
+        call runs on a worker thread via :func:`asyncio.to_thread`, as
+        :meth:`resume` and :meth:`shutdown` do.
+
+        :param timeout: Maximum seconds the suspend may take.
+        :raises StorageError: With ``SCP-STORAGE-8014``
+            (:data:`SUSPEND_FLUSH_FAILED_CODE`) when a context snapshot did
+            not persist or the flush missed ``timeout``. The instance stays
+            running with its transport connected, and a retried ``suspend``
+            flushes the unflushed contexts again.
+        :raises TransportError: With ``SCP-TRANS-5001`` when transport
+            cleanup fails. The instance stays running.
         """
-        # Lazy import avoids circular dep (errors -> scp -> errors).
-        from scp_sdk.errors import TransportError
-
+        millis = self._shutdown_millis(timeout)
         try:
-            self._native.suspend()
-        except Exception as exc:  # PyO3 raises ScpTransportError
-            raise TransportError(
-                f"suspend failed: {exc}",
-                code="SCP-TRANS-5001",
-            ) from exc
+            await asyncio.to_thread(self._native.suspend, millis)
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
 
     async def resume(self) -> None:
         """Resume a suspended bridge instance.
@@ -850,7 +876,11 @@ class SCP:
             (float — fractional seconds are preserved to millisecond
             resolution before crossing the FFI boundary).
         :raises StorageError: With ``SCP-STORAGE-8005`` when the durable
-            store still holds its advisory lock after the call.
+            store still holds its advisory lock after the call, or with
+            ``SCP-STORAGE-8015`` (:data:`SHUTDOWN_FLUSH_FAILED_CODE`) when the
+            store was released but a context snapshot did not persist
+            within ``timeout``. The instance is shut down either way; an
+            unflushed context restores from its last persisted snapshot.
         """
         millis = self._shutdown_millis(timeout)
         try:
@@ -875,8 +905,9 @@ class SCP:
         Async callers should use :meth:`__aexit__` / ``async with``.
 
         :raises StorageError: With ``SCP-STORAGE-8005`` when the durable
-            store still holds its advisory lock after the call and the
-            ``with`` body raised nothing. When the body raised, the
+            store still holds its advisory lock after the call, or
+            ``SCP-STORAGE-8015`` when a context snapshot did not persist,
+            and the ``with`` body raised nothing. When the body raised, the
             shutdown error is logged and the body's exception propagates.
         """
         del exc_type, tb
@@ -904,8 +935,9 @@ class SCP:
         the tokio runtime drains in-flight tasks.
 
         :raises StorageError: With ``SCP-STORAGE-8005`` when the durable
-            store still holds its advisory lock after the call and the
-            ``async with`` body raised nothing. When the body raised, the
+            store still holds its advisory lock after the call, or
+            ``SCP-STORAGE-8015`` when a context snapshot did not persist,
+            and the ``async with`` body raised nothing. When the body raised, the
             shutdown error is logged and the body's exception propagates.
         """
         del exc_type, tb

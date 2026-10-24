@@ -89,7 +89,7 @@ suite.describe("SCP with SQLite storage", () => {
         storage: { type: "sqlite", path: dir, key: SQLITE_KEY },
       });
       try {
-        scp.suspend();
+        await scp.suspend();
         await scp.resume();
       } finally {
         await scp.shutdown(1);

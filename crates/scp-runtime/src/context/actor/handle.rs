@@ -125,6 +125,46 @@ pub(crate) async fn bounded_reply_await<T>(
 }
 
 // ---------------------------------------------------------------------------
+// Deliberate exit
+// ---------------------------------------------------------------------------
+
+/// Why an actor's `run()` loop ended on purpose. The actor records it before
+/// its inbox drops, so a caller whose command went unanswered can tell an
+/// actor that stopped on purpose from one that crashed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::context) enum DeliberateExit {
+    /// The actor dispatched `LifecycleControlCommand::Shutdown`.
+    Shutdown,
+    /// The actor dispatched a `LifecycleControlCommand::PrepareForReplace`
+    /// that claimed its slot for an imported context.
+    Replaced,
+    /// The actor's TTL expiry landed the context in a terminal state, which
+    /// the expiry persisted before the actor despawned itself.
+    Expired,
+}
+
+/// The cell an actor records its [`DeliberateExit`] in, shared with every
+/// [`ContextActorHandle`] clone for that actor. Empty while the actor runs,
+/// and empty forever after an exit that was not deliberate: a panic
+/// unwinds past every recording site.
+#[derive(Debug, Clone, Default)]
+pub(in crate::context) struct ExitRecord(std::sync::Arc<std::sync::OnceLock<DeliberateExit>>);
+
+impl ExitRecord {
+    /// Records `exit`. The first record wins; an actor exits once.
+    pub(in crate::context) fn record(&self, exit: DeliberateExit) {
+        if self.0.set(exit).is_err() {
+            tracing::error!(?exit, "an actor recorded a second deliberate exit");
+        }
+    }
+
+    /// The deliberate exit the actor recorded, if any.
+    pub(in crate::context) fn get(&self) -> Option<DeliberateExit> {
+        self.0.get().copied()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ContextActorHandle
 // ---------------------------------------------------------------------------
 
@@ -142,6 +182,9 @@ pub struct ContextActorHandle {
     /// Command inbox sender. `Sender::send` applies the bounded mailbox
     /// backpressure; `tokio::time::timeout` bounds the wait.
     inbox: mpsc::Sender<ContextCommand>,
+    /// Where the actor records a deliberate exit; see
+    /// [`Self::exited_deliberately`].
+    exit: ExitRecord,
 }
 
 impl ContextActorHandle {
@@ -156,8 +199,24 @@ impl ContextActorHandle {
     /// `#[cfg(test)]` until the lifecycle handler migrates in commit 9.
     #[must_use]
     #[allow(dead_code)]
-    pub(in crate::context) const fn from_sender(inbox: mpsc::Sender<ContextCommand>) -> Self {
-        Self { inbox }
+    pub(in crate::context) fn from_sender(inbox: mpsc::Sender<ContextCommand>) -> Self {
+        Self {
+            inbox,
+            exit: ExitRecord::default(),
+        }
+    }
+
+    /// The cell the actor behind this handle records its deliberate exit
+    /// in. The spawn hands it to [`super::ContextActor::new`], so the
+    /// handle reads what that actor records.
+    pub(in crate::context) fn exit_record(&self) -> ExitRecord {
+        self.exit.clone()
+    }
+
+    /// The exit the actor recorded when its `run()` loop ended on purpose,
+    /// or `None` while it runs and after any other exit, a panic included.
+    pub(in crate::context) fn exited_deliberately(&self) -> Option<DeliberateExit> {
+        self.exit.get()
     }
 
     /// Submits a command to the actor's mailbox, waits for the actor's

@@ -30,7 +30,7 @@ suite.describe("bridge lifecycle (SCP.suspend / SCP.resume)", () => {
     try {
       // BridgeInstance::suspend() short-circuits on is_shutdown() and
       // on uninitialized state, so suspend on a fresh instance resolves.
-      expect(() => scp.suspend()).not.toThrow();
+      await expect(scp.suspend()).resolves.toBeUndefined();
     } finally {
       await scp.shutdown(1);
     }

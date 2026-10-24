@@ -10458,6 +10458,78 @@ mod tests {
         );
     }
 
+    /// `Scp::suspend` writes every context's snapshot when the calling thread
+    /// runs no tokio runtime. The test drives the async method on the bridge
+    /// runtime from a plain test thread, as napi-rs does for a JavaScript
+    /// caller, after deleting the context's stored snapshot, so only the
+    /// suspend's flush can put it back.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn suspend_from_a_thread_with_no_runtime_flushes_every_context() {
+        use crate::runtime::{NapiBridgeInstance, SqliteKeyMaterial, StorageConfig};
+        use scp_ffi_common::bridge_instance::{BridgeInstanceCore as _, ShutdownOutcome};
+        assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "precondition: the test thread runs no tokio runtime"
+        );
+        let rt = crate::runtime();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let scp = crate::scp::Scp {
+            inner: Arc::new(
+                NapiBridgeInstance::with_storage_napi(StorageConfig::Sqlite {
+                    path: tmp.path().to_path_buf(),
+                    key: SqliteKeyMaterial::Raw(zeroize::Zeroizing::new(vec![0x5Bu8; 32])),
+                })
+                .expect("SQLCipher open must succeed"),
+            ),
+        };
+        let bi = Arc::clone(&scp.inner);
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create should succeed");
+        let params_json = serde_json::json!({
+            "ceiling": ["messages:read", "messages:write"],
+            "memoryScope": "full",
+            "governance": "single_admin",
+        })
+        .to_string();
+        let handle = rt
+            .block_on(super::context_create_on(&bi, &identity, params_json))
+            .expect("context_create should succeed");
+        let ctx_id = handle.context_id.clone();
+        drop(handle);
+        let persistence = bi
+            .core
+            .persistence_arc_clone()
+            .expect("a SQLCipher instance carries persistence");
+        rt.block_on(persistence.delete_context(&ctx_id))
+            .expect("delete_context must succeed");
+        assert!(
+            rt.block_on(persistence.load_context(&ctx_id))
+                .expect("load_context must succeed")
+                .is_none(),
+            "precondition: the store holds no snapshot of the context"
+        );
+
+        rt.block_on(scp.suspend(napi::bindgen_prelude::BigInt::from(10_000_u64)))
+            .expect("suspend must flush and succeed");
+
+        assert!(
+            rt.block_on(persistence.load_context(&ctx_id))
+                .expect("load_context must succeed")
+                .is_some(),
+            "suspend must write the context's snapshot"
+        );
+        assert!(bi.core.is_suspended(), "suspend must take effect");
+        drop(persistence);
+        drop(identity);
+        let outcome = rt.block_on(bi.shutdown(std::time::Duration::from_secs(10)));
+        assert!(
+            matches!(outcome, Ok(ShutdownOutcome::GracefulWithin { .. })),
+            "the shutdown must drain every actor and close the store: {outcome:?}"
+        );
+    }
+
     /// A context created on a SQLCipher-backed instance survives a reopen of
     /// the store: its snapshot lands in the caller's chosen backend (spec
     /// §17.6, one chosen backend with derived consumers), so a fresh instance
@@ -10504,7 +10576,8 @@ mod tests {
             .identity_registry
             .remove(&did)
             .expect("the creator is registered");
-        bi.shutdown(std::time::Duration::from_secs(10))
+        std::sync::Arc::clone(&bi)
+            .shutdown(std::time::Duration::from_secs(10))
             .await
             .expect("shutdown must release the store");
         drop(bi);
@@ -10619,7 +10692,8 @@ mod tests {
             .identity_registry
             .remove(&did)
             .expect("the creator is registered");
-        bi.shutdown(std::time::Duration::from_secs(10))
+        std::sync::Arc::clone(&bi)
+            .shutdown(std::time::Duration::from_secs(10))
             .await
             .expect("shutdown must release the store");
         drop(bi);

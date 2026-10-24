@@ -14,13 +14,14 @@
 //! See #1549 Phase 4 remainder plan and ADR-048.
 
 use scp_ffi_common::bridge_instance::{
-    BridgeInstanceCore as _, ShutdownError, ShutdownOutcome, sdk_shutdown_result,
+    BridgeInstanceCore as _, ShutdownError, ShutdownOutcome, SuspendError, SuspendFailureClass,
+    classify_suspend_failure, sdk_shutdown_result,
 };
 use scp_ffi_common::error_codes as codes;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::bridge::ScpError;
+use crate::bridge::{ErrorClass, ScpError};
 use crate::runtime::{StorageConfig, UniffiBridgeInstance};
 use crate::{decrement_handle_count, increment_handle_count};
 
@@ -100,17 +101,25 @@ impl Scp {
 
     /// Suspends this bridge instance (mobile backgrounding).
     ///
-    /// Disconnects transport and flushes context snapshots. Transport-
-    /// dependent operations fail until [`Self::resume`] is called.
+    /// Flushes every context snapshot, then disconnects transport.
+    /// Transport-dependent operations fail until [`Self::resume`] is called.
+    ///
+    /// `UniFFI` generates a `suspend`/`async` method on Swift and Kotlin; the
+    /// flush runs on the tokio runtime this export names.
+    ///
+    /// `timeout_millis` bounds the call, in milliseconds. The suspend runs
+    /// to completion, or reverts, even when the calling Swift task or Kotlin
+    /// coroutine is cancelled.
     ///
     /// # Errors
     ///
-    /// Returns `ScpError::Transport` if the transport lock is poisoned.
-    pub fn suspend(&self) -> Result<(), ScpError> {
-        self.inner.core.suspend().map_err(|e| ScpError::Transport {
-            msg: format!("suspend failed: {e}"),
-            code: codes::TRANS_5001.to_owned(),
-        })
+    /// Returns `ScpError::Storage` with `SCP-STORAGE-8014` when a context
+    /// snapshot did not persist or the flush missed the deadline, and
+    /// `ScpError::Transport` with `SCP-TRANS-5001` when the transport lock is
+    /// poisoned. The instance stays running on either error.
+    pub async fn suspend(&self, timeout_millis: u64) -> Result<(), ScpError> {
+        let deadline = Duration::from_millis(timeout_millis);
+        sdk_suspend(Arc::clone(&self.inner).suspend(deadline).await)
     }
 
     /// Resumes a suspended bridge instance.
@@ -126,10 +135,13 @@ impl Scp {
     /// Returns `ScpError::Context` if the instance has been permanently
     /// shut down.
     pub async fn resume(&self) -> Result<(), ScpError> {
-        self.inner.resume().await.map_err(|e| ScpError::Context {
-            msg: format!("resume failed: {e}"),
-            code: codes::CTX_2000.to_owned(),
-        })
+        Arc::clone(&self.inner)
+            .resume()
+            .await
+            .map_err(|e| ScpError::Context {
+                msg: format!("resume failed: {e}"),
+                code: codes::CTX_2000.to_owned(),
+            })
     }
 
     /// Shuts down this bridge instance with a graceful deadline.
@@ -144,10 +156,13 @@ impl Scp {
     /// # Errors
     ///
     /// Returns [`ScpError::Storage`] with `SCP-STORAGE-8005` when the
-    /// durable store still holds its advisory lock after the call.
+    /// durable store still holds its advisory lock after the call, and with
+    /// `SCP-STORAGE-8015` when the store was released but a context snapshot
+    /// did not persist (the flush failed or missed the deadline). The
+    /// instance is shut down either way.
     pub async fn shutdown(&self, timeout_millis: u64) -> Result<(), ScpError> {
         let timeout = Duration::from_millis(timeout_millis);
-        sdk_shutdown(self.inner.shutdown(timeout).await)
+        sdk_shutdown(Arc::clone(&self.inner).shutdown(timeout).await)
     }
 }
 
@@ -180,16 +195,59 @@ impl Drop for Scp {
     }
 }
 
+/// Maps a bridge suspend result to the SDK result: the class
+/// [`classify_suspend_failure`] names picks the [`ScpError`] variant.
+fn sdk_suspend(result: Result<(), SuspendError>) -> Result<(), ScpError> {
+    result.map_err(|e| {
+        let (class, code) = classify_suspend_failure(&e);
+        let msg = format!("suspend failed: {e}");
+        match class {
+            SuspendFailureClass::Storage => ScpError::storage(code, msg),
+            SuspendFailureClass::Transport => ScpError::coded(ErrorClass::Transport, code, msg),
+        }
+    })
+}
+
 /// Maps a bridge shutdown result to the SDK result (spec §17.6 "One Opener
-/// per Durable Directory"): a durable store the shutdown left holding its
-/// advisory lock raises `SCP-STORAGE-8005`.
+/// per Durable Directory"): [`ScpError::Storage`] with the code
+/// [`sdk_shutdown_result`] names (`SCP-STORAGE-8005` for a store left holding
+/// its advisory lock, `SCP-STORAGE-8015` for a flush that failed).
 fn sdk_shutdown(result: Result<ShutdownOutcome, ShutdownError>) -> Result<(), ScpError> {
-    sdk_shutdown_result(result).map_err(|msg| ScpError::storage(codes::STORAGE_8005, msg))
+    sdk_shutdown_result(result).map_err(|failure| ScpError::storage(failure.code, failure.message))
 }
 
 #[cfg(test)]
 mod sdk_shutdown_tests {
     use super::*;
+    use scp_ffi_common::bridge_instance::ShutdownFlush;
+
+    #[test]
+    fn suspend_failures_map_to_their_variants() {
+        let storage_failures = [
+            SuspendError::FlushFailed(scp_core::context::ContextError::PersistenceFailed(
+                "disk full".to_owned(),
+            )),
+            SuspendError::DeadlineElapsed {
+                deadline: Duration::from_millis(5),
+            },
+            SuspendError::Interrupted,
+        ];
+        for failure in storage_failures {
+            let mapped = sdk_suspend(Err(failure));
+            assert!(
+                matches!(&mapped, Err(ScpError::Storage { code, .. }) if code == codes::STORAGE_8014),
+                "{mapped:?}"
+            );
+        }
+        let lock = sdk_suspend(Err(SuspendError::TransportLock(
+            scp_ffi_common::bridge_instance::TransportLockError::Poisoned,
+        )));
+        assert!(
+            matches!(&lock, Err(ScpError::Transport { code, .. }) if code == codes::TRANS_5001),
+            "{lock:?}"
+        );
+        assert!(sdk_suspend(Ok(())).is_ok());
+    }
 
     #[test]
     fn store_left_locked_raises_storage_8005() {
@@ -198,14 +256,16 @@ mod sdk_shutdown_tests {
             panicked_tasks: 0,
             drain: scp_ffi_common::bridge_instance::DrainState::Panicked,
             durable_store_open: true,
+            flush: ShutdownFlush::Flushed,
         }));
         assert!(
             matches!(&timed_out, Err(ScpError::Storage { code, .. }) if code == codes::STORAGE_8005),
             "{timed_out:?}"
         );
-        let refused = sdk_shutdown(Err(ShutdownError::DurableStoreClose(
-            scp_platform::PlatformError::StorageError("close refused".to_owned()),
-        )));
+        let refused = sdk_shutdown(Err(ShutdownError::DurableStoreClose {
+            error: scp_platform::PlatformError::StorageError("close refused".to_owned()),
+            flush: scp_ffi_common::bridge_instance::ShutdownFlush::Flushed,
+        }));
         assert!(
             matches!(&refused, Err(ScpError::Storage { code, .. }) if code == codes::STORAGE_8005),
             "{refused:?}"
@@ -219,12 +279,68 @@ mod sdk_shutdown_tests {
         );
     }
 
+    /// A shutdown that released the store but whose flush failed or timed
+    /// out raises `SCP-STORAGE-8015`; one that also left the store locked
+    /// raises `SCP-STORAGE-8005`, which wins, as does a cancelled shutdown.
+    #[test]
+    fn failed_flush_raises_storage_8015() {
+        let failed = sdk_shutdown(Ok(ShutdownOutcome::GracefulWithin {
+            elapsed: Duration::ZERO,
+            panicked_tasks: 0,
+            flush: ShutdownFlush::Failed {
+                message: "disk full".to_owned(),
+            },
+        }));
+        assert!(
+            matches!(&failed, Err(ScpError::Storage { code, .. }) if code == codes::STORAGE_8015),
+            "{failed:?}"
+        );
+        let late = sdk_shutdown(Ok(ShutdownOutcome::TimedOut {
+            aborted_tasks: 0,
+            panicked_tasks: 0,
+            drain: scp_ffi_common::bridge_instance::DrainState::Finished,
+            durable_store_open: false,
+            flush: ShutdownFlush::TimedOut,
+        }));
+        assert!(
+            matches!(&late, Err(ScpError::Storage { code, .. }) if code == codes::STORAGE_8015),
+            "{late:?}"
+        );
+        let locked = sdk_shutdown(Ok(ShutdownOutcome::TimedOut {
+            aborted_tasks: 0,
+            panicked_tasks: 0,
+            drain: scp_ffi_common::bridge_instance::DrainState::Panicked,
+            durable_store_open: true,
+            flush: ShutdownFlush::Failed {
+                message: "disk full".to_owned(),
+            },
+        }));
+        assert!(
+            matches!(&locked, Err(ScpError::Storage { code, .. }) if code == codes::STORAGE_8005),
+            "{locked:?}"
+        );
+        let cut = sdk_shutdown(Err(ShutdownError::Interrupted { flush: None }));
+        assert!(
+            matches!(&cut, Err(ScpError::Storage { code, .. }) if code == codes::STORAGE_8005),
+            "{cut:?}"
+        );
+    }
+
     #[test]
     fn released_store_reports_success() {
         assert!(
             sdk_shutdown(Ok(ShutdownOutcome::GracefulWithin {
                 elapsed: Duration::ZERO,
                 panicked_tasks: 0,
+                flush: ShutdownFlush::Flushed,
+            }))
+            .is_ok()
+        );
+        assert!(
+            sdk_shutdown(Ok(ShutdownOutcome::GracefulWithin {
+                elapsed: Duration::ZERO,
+                panicked_tasks: 0,
+                flush: ShutdownFlush::Skipped,
             }))
             .is_ok()
         );

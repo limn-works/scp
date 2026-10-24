@@ -9835,7 +9835,9 @@ class SlowAgreeCustody(P256Custody):
                 .expect("wait on agree_started")
         });
         assert!(started, "alice's actor calls the Python dh_agree");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let deadline =
+            scp_ffi_common::deadline::deadline_after(std::time::Duration::from_secs(120))
+                .into_std();
         while alice_sup.test_queued_commands(&ctx_id).unwrap_or(0) == 0 {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -9878,6 +9880,85 @@ class SlowAgreeCustody(P256Custody):
             }
             other => panic!("bob's message opens under his installed sender key: {other:?}"),
         }
+    }
+
+    /// `PyScp::suspend` writes every context's snapshot when the calling
+    /// thread runs no tokio runtime, as a Python caller's thread does. The
+    /// test deletes the context's stored snapshot first, so only the
+    /// suspend's flush can put it back.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn suspend_from_a_thread_with_no_runtime_flushes_every_context() {
+        use crate::runtime::{PyBridgeInstance, SqliteKeyMaterial, StorageConfig};
+        use scp_ffi_common::bridge_instance::{BridgeInstanceCore as _, ShutdownOutcome};
+        assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "precondition: the test thread runs no tokio runtime"
+        );
+        pyo3::prepare_freethreaded_python();
+        crate::init_runtime().expect("init_runtime");
+        let rt = crate::runtime().expect("runtime");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let scp = crate::scp::PyScp {
+            inner: Arc::new(
+                PyBridgeInstance::with_storage_py(StorageConfig::Sqlite {
+                    path: tmp.path().to_path_buf(),
+                    key: SqliteKeyMaterial::Raw(zeroize::Zeroizing::new(vec![0x6Cu8; 32])),
+                })
+                .expect("SQLCipher open must succeed"),
+            ),
+        };
+        let did = Python::with_gil(|py| {
+            scp.identity_create(py, "in_memory", None)
+                .expect("identity_create")
+                .did()
+                .to_owned()
+        });
+        let ctx_id = format!("suspend-flush-{}", uuid::Uuid::new_v4());
+        crate::runtime::init_context_manager(&scp.inner, &did);
+        let sup = Arc::clone(crate::runtime::supervisor(&scp.inner).expect("supervisor"));
+        rt.block_on(sup.create_context(
+            ctx_id.clone(),
+            scp_core::context::ContextParams {
+                ceiling: vec![scp_core::context::roles::Capability::MessagesRead],
+                ..scp_core::context::ContextParams::default()
+            },
+            scp_did::DID(did),
+            None,
+            Vec::new(),
+        ))
+        .expect("create_context");
+        drop(sup);
+        let persistence = scp
+            .inner
+            .core
+            .persistence_arc_clone()
+            .expect("a SQLCipher instance carries persistence");
+        rt.block_on(persistence.delete_context(&ctx_id))
+            .expect("delete_context must succeed");
+        assert!(
+            rt.block_on(persistence.load_context(&ctx_id))
+                .expect("load_context must succeed")
+                .is_none(),
+            "precondition: the store holds no snapshot of the context"
+        );
+
+        Python::with_gil(|py| scp.suspend(py, 10_000)).expect("suspend must flush and succeed");
+
+        assert!(
+            rt.block_on(persistence.load_context(&ctx_id))
+                .expect("load_context must succeed")
+                .is_some(),
+            "suspend must write the context's snapshot"
+        );
+        assert!(scp.inner.core.is_suspended(), "suspend must take effect");
+        drop(persistence);
+        let outcome =
+            rt.block_on(Arc::clone(&scp.inner).shutdown(std::time::Duration::from_secs(10)));
+        assert!(
+            matches!(outcome, Ok(ShutdownOutcome::GracefulWithin { .. })),
+            "the shutdown must drain every actor and close the store: {outcome:?}"
+        );
     }
 
     /// Spec 09 §9.16.1, fail-closed restore order: after a restart, a context
@@ -9935,7 +10016,7 @@ class SlowAgreeCustody(P256Custody):
             .identity_registry
             .remove(&did)
             .expect("the creator is registered");
-        rt.block_on(first.inner.shutdown(std::time::Duration::from_secs(10)))
+        rt.block_on(Arc::clone(&first.inner).shutdown(std::time::Duration::from_secs(10)))
             .expect("shutdown must release the store");
         drop(first);
 

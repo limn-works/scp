@@ -1600,7 +1600,7 @@ async fn grading_permits_bound_leaked_threads() {
             })
         })
         .collect();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = crate::deadline::deadline_after(Duration::from_secs(10));
     while entered.load(Ordering::SeqCst) < MAX_CONCURRENT_GRADINGS_PER_CHALLENGER {
         assert!(
             tokio::time::Instant::now() < deadline,
@@ -1636,7 +1636,7 @@ async fn grading_permits_bound_leaked_threads() {
     for task in tasks {
         assert!(task.await.unwrap().unwrap().record.passed);
     }
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = crate::deadline::deadline_after(Duration::from_secs(10));
     while h
         .sup
         .challenge_grading_permit(did(1).as_ref())
@@ -1944,7 +1944,7 @@ async fn evaluator_output_at_the_backtrack_limit_fails_the_case() {
 
 /// Waits up to 10 s for `done`, failing the test with `what` after that.
 async fn wait_until(what: &str, done: impl Fn() -> bool) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = crate::deadline::deadline_after(Duration::from_secs(10));
     while !done() {
         assert!(tokio::time::Instant::now() < deadline, "{what}");
         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -2437,7 +2437,7 @@ async fn cut_off_evaluator_holds_one_permit_until_it_returns() {
     assert_eq!(held.len(), MAX_CONCURRENT_GRADINGS_PER_CHALLENGER - 1);
     drop(held);
     release.store(true, Ordering::SeqCst);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = crate::deadline::deadline_after(Duration::from_secs(10));
     loop {
         let held = take_free_permits(&h).await;
         if held.len() == MAX_CONCURRENT_GRADINGS_PER_CHALLENGER {

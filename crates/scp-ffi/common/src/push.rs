@@ -501,7 +501,7 @@ mod tests {
     #[tokio::test]
     async fn the_payload_check_precedes_every_other_step() {
         let core = CoreFields::new();
-        core.shutdown();
+        crate::bridge_instance::tests::shut_down(&core).await;
         let err = handle_wake(&core, PushPlatform::WebPush, b"{}")
             .await
             .unwrap_err();

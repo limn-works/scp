@@ -4154,10 +4154,14 @@ mod tests {
             !ran.load(Ordering::SeqCst),
             "hook must not fire before shutdown"
         );
-        bi.shutdown();
+        crate::init_runtime().expect("init_runtime");
+        crate::runtime()
+            .expect("runtime")
+            .block_on(bi.shutdown_core_async(std::time::Duration::from_secs(5), None))
+            .expect("shutdown");
         assert!(
             ran.load(Ordering::SeqCst),
-            "shutdown hook must execute during CoreFields::shutdown()"
+            "shutdown hook must execute during CoreFields::shutdown_core_async()"
         );
     }
 
@@ -4286,6 +4290,7 @@ mod tests {
             key: SqliteKeyMaterial::Raw(Zeroizing::new(vec![0x33u8; 32])),
         })
         .expect("first open");
+        let bi = std::sync::Arc::new(bi);
         let second = PyBridgeInstance::with_storage_py(StorageConfig::Sqlite {
             path: tmp.path().to_path_buf(),
             key: SqliteKeyMaterial::Raw(Zeroizing::new(vec![0x33u8; 32])),
@@ -4294,7 +4299,8 @@ mod tests {
             matches!(second, Err(StorageInitError::LockHeld { .. })),
             "a second open of a live store's directory must fail with LockHeld"
         );
-        let outcome = test_rt().block_on(bi.shutdown(std::time::Duration::from_secs(10)));
+        let outcome = test_rt()
+            .block_on(std::sync::Arc::clone(&bi).shutdown(std::time::Duration::from_secs(10)));
         assert!(
             matches!(outcome, Ok(ShutdownOutcome::GracefulWithin { .. })),
             "{outcome:?}"
@@ -4943,7 +4949,13 @@ mod tests {
             let (bi, ctx_id) =
                 live_state_fixture("role-read-resolved", creator, &["messages:read"]);
             let sup = Arc::clone(supervisor(&bi).expect("supervisor"));
-            bi.core.suspend().expect("suspend");
+            crate::init_runtime().expect("init_runtime");
+            crate::actor_wait::block_on_released(
+                py,
+                bi.core.suspend(std::time::Duration::from_secs(10)),
+            )
+            .expect("suspend wait")
+            .expect("suspend");
 
             let suspended = live_role_state(py, &bi, &ctx_id)
                 .expect_err("a fresh resolution on a suspended bridge must refuse");

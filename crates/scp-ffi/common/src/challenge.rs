@@ -1134,7 +1134,7 @@ where
             );
         }
     };
-    let deadline = tokio::time::Instant::now() + budget;
+    let deadline = crate::deadline::deadline_after(budget);
     let mut evaluated = CaseVerdicts::new(deadline);
     let run = async {
         let case_run = CaseRun {

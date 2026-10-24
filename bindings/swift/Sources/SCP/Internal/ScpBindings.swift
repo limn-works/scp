@@ -3659,21 +3659,34 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * # Errors
      *
      * Returns [`ScpError::Storage`] with `SCP-STORAGE-8005` when the
-     * durable store still holds its advisory lock after the call.
+     * durable store still holds its advisory lock after the call, and with
+     * `SCP-STORAGE-8015` when the store was released but a context snapshot
+     * did not persist (the flush failed or missed the deadline). The
+     * instance is shut down either way.
      */
     func shutdown(timeoutMillis: UInt64) async throws 
     
     /**
      * Suspends this bridge instance (mobile backgrounding).
      *
-     * Disconnects transport and flushes context snapshots. Transport-
-     * dependent operations fail until [`Self::resume`] is called.
+     * Flushes every context snapshot, then disconnects transport.
+     * Transport-dependent operations fail until [`Self::resume`] is called.
+     *
+     * `UniFFI` generates a `suspend`/`async` method on Swift and Kotlin; the
+     * flush runs on the tokio runtime this export names.
+     *
+     * `timeout_millis` bounds the call, in milliseconds. The suspend runs
+     * to completion, or reverts, even when the calling Swift task or Kotlin
+     * coroutine is cancelled.
      *
      * # Errors
      *
-     * Returns `ScpError::Transport` if the transport lock is poisoned.
+     * Returns `ScpError::Storage` with `SCP-STORAGE-8014` when a context
+     * snapshot did not persist or the flush missed the deadline, and
+     * `ScpError::Transport` with `SCP-TRANS-5001` when the transport lock is
+     * poisoned. The instance stays running on either error.
      */
-    func suspend() throws 
+    func suspend(timeoutMillis: UInt64) async throws 
     
     /**
      * Per-instance equivalent of the free-function
@@ -7566,7 +7579,10 @@ open func setEconomicPolicy(handle: ContextHandle, policyJson: String)throws   {
      * # Errors
      *
      * Returns [`ScpError::Storage`] with `SCP-STORAGE-8005` when the
-     * durable store still holds its advisory lock after the call.
+     * durable store still holds its advisory lock after the call, and with
+     * `SCP-STORAGE-8015` when the store was released but a context snapshot
+     * did not persist (the flush failed or missed the deadline). The
+     * instance is shut down either way.
      */
 open func shutdown(timeoutMillis: UInt64)async throws   {
     return
@@ -7588,17 +7604,38 @@ open func shutdown(timeoutMillis: UInt64)async throws   {
     /**
      * Suspends this bridge instance (mobile backgrounding).
      *
-     * Disconnects transport and flushes context snapshots. Transport-
-     * dependent operations fail until [`Self::resume`] is called.
+     * Flushes every context snapshot, then disconnects transport.
+     * Transport-dependent operations fail until [`Self::resume`] is called.
+     *
+     * `UniFFI` generates a `suspend`/`async` method on Swift and Kotlin; the
+     * flush runs on the tokio runtime this export names.
+     *
+     * `timeout_millis` bounds the call, in milliseconds. The suspend runs
+     * to completion, or reverts, even when the calling Swift task or Kotlin
+     * coroutine is cancelled.
      *
      * # Errors
      *
-     * Returns `ScpError::Transport` if the transport lock is poisoned.
+     * Returns `ScpError::Storage` with `SCP-STORAGE-8014` when a context
+     * snapshot did not persist or the flush missed the deadline, and
+     * `ScpError::Transport` with `SCP-TRANS-5001` when the transport lock is
+     * poisoned. The instance stays running on either error.
      */
-open func suspend()throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_method_scp_suspend(self.uniffiClonePointer(),$0
-    )
-}
+open func suspend(timeoutMillis: UInt64)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_suspend(
+                    self.uniffiClonePointer(),
+                    FfiConverterUInt64.lower(timeoutMillis)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeScpError_lift
+        )
 }
     
     /**
@@ -20059,10 +20096,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_set_economic_policy() != 12223) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_shutdown() != 41184) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_shutdown() != 5192) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_suspend() != 57088) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_suspend() != 5706) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_tombstone_migrated_context() != 15228) {

@@ -365,7 +365,7 @@ mod tests {
     // Construction pattern:
     //
     //   let scp = Scp::new_in_memory_for_test();
-    //   scp.suspend().expect("suspend");
+    //   scp.suspend(napi::bindgen_prelude::BigInt::from(10_000_u64)).await.expect("suspend");
     //   scp.resume().expect("resume");
     //
     // Each `Scp` owns an isolated `Arc<NapiBridgeInstance>`. Two tests
@@ -391,7 +391,9 @@ mod tests {
         );
 
         // Case 1: suspend / resume must round-trip.
-        scp.suspend().expect("Scp::suspend must succeed");
+        scp.suspend(napi::bindgen_prelude::BigInt::from(10_000_u64))
+            .await
+            .expect("Scp::suspend must succeed");
         assert!(
             scp.inner.core.is_suspended(),
             "instance must report suspended after suspend()"
@@ -403,8 +405,12 @@ mod tests {
         );
 
         // Case 2: double-suspend / double-resume are idempotent.
-        scp.suspend().expect("double suspend must succeed");
-        scp.suspend().expect("double suspend must succeed");
+        scp.suspend(napi::bindgen_prelude::BigInt::from(10_000_u64))
+            .await
+            .expect("double suspend must succeed");
+        scp.suspend(napi::bindgen_prelude::BigInt::from(10_000_u64))
+            .await
+            .expect("double suspend must succeed");
         assert!(scp.inner.core.is_suspended());
         scp.resume().await.expect("double resume must succeed");
         scp.resume().await.expect("double resume must succeed");

@@ -169,6 +169,8 @@ from scp_sdk.outlets import (
 )
 from scp_sdk.scp import (
     SCP,
+    SHUTDOWN_FLUSH_FAILED_CODE,
+    SUSPEND_FLUSH_FAILED_CODE,
     CustodyKeyRole,
     CustodyKeyType,
     CustodyPublicKey,
@@ -340,7 +342,9 @@ __all__ = [
     "SCHEMA_REJECTED_CODE",
     "SCP",
     "SELF_CHALLENGE_CODE",
+    "SHUTDOWN_FLUSH_FAILED_CODE",
     "STANDARD_NOT_GRADABLE_CODE",
+    "SUSPEND_FLUSH_FAILED_CODE",
     "TOO_MANY_CAPABILITY_REQUIREMENTS_CODE",
     "UNKNOWN_CHALLENGE_CODE",
     "UNTRUSTED_VERIFIER_CODE",
