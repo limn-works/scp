@@ -79,6 +79,8 @@ scp-protocol = { path = "../scp-protocol", features = ["testing"] }
 openmls_basic_credential = { workspace = true, features = ["test-utils"] }
 rand = { workspace = true }
 bs58 = { workspace = true }
+# Hex encoding of the golden `KeyPackage` fixture (`attested_key_package.rs` tests).
+hex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 rmp-serde = { workspace = true }

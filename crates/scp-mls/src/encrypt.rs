@@ -37,7 +37,7 @@ use crate::lifetime::validate_received_key_package_lifetime_range;
 /// a self-authored echo.
 ///
 /// Every `process_message` error maps to [`MlsError::DecryptionFailed`]. A
-/// tampered ciphertext is one such error: openmls 0.9.0 returns
+/// tampered ciphertext is one such error: openmls returns
 /// `MessageDecryptionError::AeadError` for it in debug and release builds
 /// alike (ADR-057 §Prereq-4). The `catch_unwind` guard converts any other
 /// upstream panic into [`MlsError::DecryptionFailed`], so a malicious relay
@@ -49,7 +49,7 @@ use crate::lifetime::validate_received_key_package_lifetime_range;
 /// before any caller reads the sender or the content (ADR-057). The relay
 /// delivers a PUBLISH to every subscriber of a routing id, the publisher
 /// included, so every member receives the echo of its own
-/// `PseudonymAnnouncement` on the shared `context_routing_id`. openmls 0.9.0
+/// `PseudonymAnnouncement` on the shared `context_routing_id`. openmls
 /// returns `Ok` for that echo, with content
 /// `ProcessedMessageContent::OwnPrivateMessage`, an undecrypted body, and an
 /// unverified signature; the typed error lets the receive loop drop it benignly
@@ -59,24 +59,24 @@ use crate::lifetime::validate_received_key_package_lifetime_range;
 /// SCP merges each Commit it creates before publishing it (`add_member` and
 /// `remove_member` in `group.rs`, the two self-updates in `ratchet.rs`), so the
 /// relay's echo of a member's own Commit reaches that member one epoch behind
-/// the member's group. openmls 0.9.0's `decrypt_message` runs
+/// the member's group. openmls's `decrypt_message` runs
 /// `validate_framing` first, and `validate_framing` refuses a non-application
 /// message from any epoch but the current one, so that echo returns
 /// [`MlsError::DecryptionFailed`] and leaves the epoch unchanged.
 /// [`MlsError::CannotDecryptOwnMessage`] covers a member's own application
 /// message and a member's own Commit that the member has not merged. For a
-/// `PrivateMessage` from the local member, openmls 0.9.0's
+/// `PrivateMessage` from the local member, openmls's
 /// `from_inbound_ciphertext` (`framing/validation.rs`) returns
 /// `OwnPrivateMessage` before decryption; openmls returns `OwnPendingCommit`
 /// only for an unmerged own Commit sent as a `PublicMessage`.
 ///
 /// # openmls's receive-side `Lifetime` clock check
 ///
-/// This is SCP's one `process_message` call. openmls 0.9.0 checks a received
-/// Add's `KeyPackage` `Lifetime` against the receiver's wall clock inside it,
-/// in `KeyPackageIn::validate` (reached through `AddProposalIn::validate`) and
-/// in `validate_leaf_node` (reached through `stage_commit`), and offers no
-/// switch for either check. Security-model spec §9.7.1 forbids a receiver to
+/// This is SCP's one `process_message` call. `process_message` runs openmls's
+/// `LeafNodeLifetimePolicy::Verify`, which checks a received Add's `KeyPackage`
+/// `Lifetime` against the receiver's wall clock, in `KeyPackageIn::validate`
+/// (reached through `AddProposalIn::validate`) and in `validate_leaf_node`
+/// (reached through `stage_commit`). Security-model spec §9.7.1 forbids a receiver to
 /// reject an Add by its own clock; SCP's own receive-side check is range-only
 /// (`validate_received_key_package_lifetime_range`). SCP carries no openmls
 /// patch: the adder's `KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS` and
@@ -87,12 +87,12 @@ use crate::lifetime::validate_received_key_package_lifetime_range;
 /// `not_before` side, a receiver clock more than 3,300 s behind the adder's),
 /// each refusal surfacing here as [`MlsError::DecryptionFailed`].
 ///
-/// Future path (ADR-057 Prerequisite 1, the future-path bullet under the
-/// residual bullet): once openmls takes a receive-side lifetime policy or a
-/// caller-supplied time, pass one here, on this call, that covers both of
-/// openmls's reads, `KeyPackageIn::validate` and `validate_leaf_node`. A
-/// policy that covers only `validate_leaf_node` leaves openmls's clock in the
-/// receive decision through `KeyPackageIn::validate`.
+/// openmls at the commit pinned in the root `Cargo.toml` offers
+/// `MlsGroup::process_message_with_lifetime_policy`, whose policy covers both
+/// of those reads, and SCP does not call it yet (ADR-057 Prerequisite 1, the
+/// future-path bullet under the residual bullet). Moving this call to it, with
+/// `LeafNodeLifetimePolicy::Skip`, together with the §9.7.1 and ADR-057
+/// corrections that change requires, is tracked as an open defect.
 fn process_inbound(
     g: &mut MlsGroup,
     provider: &crate::InMemoryMlsProvider,
@@ -256,7 +256,7 @@ pub fn decrypt(group: &mut ScpMlsGroup, ciphertext: &[u8]) -> Result<Vec<u8>, Ml
 /// The leaves openmls kept for each retained past epoch, read back from the
 /// group's stored `MessageSecretsStore`.
 ///
-/// openmls 0.9.0 verifies a past-epoch message against the sender's leaf in
+/// openmls verifies a past-epoch message against the sender's leaf in
 /// `MessageSecretsStore::past_epoch_trees`, a list of `{ epoch, leaves }`
 /// records stored under the group ID, and exposes no accessor for those
 /// leaves. This type deserializes only those two fields and skips the stored
@@ -1179,7 +1179,7 @@ mod tests {
             *byte ^= 0xFF;
         }
 
-        // openmls 0.9.0 returns a typed AEAD error for a tampered tag; the
+        // openmls returns a typed AEAD error for a tampered tag; the
         // message must not be the panic guard's.
         let result = decrypt(&mut bob_group, &ciphertext_bytes);
         match result {
@@ -1220,7 +1220,7 @@ mod tests {
     }
 
     /// A one-member group whose wire-format policy sends every handshake
-    /// message as a `PublicMessage`. openmls 0.9.0 reports the echo of the
+    /// message as a `PublicMessage`. openmls reports the echo of the
     /// member's own pending Commit as `OwnPendingCommit` only when that Commit
     /// is a `PublicMessage`; a `PrivateMessage` from the member's own leaf
     /// arrives as `OwnPrivateMessage` before openmls looks at the content.
@@ -1341,7 +1341,7 @@ mod tests {
 
         // The production shape: the member merged its own Commit before the
         // relay echoed it back, so the echo is one epoch behind the member.
-        // openmls 0.9.0 enforces this refusal: `validate_framing`'s epoch check
+        // openmls enforces this refusal: `validate_framing`'s epoch check
         // runs inside `process_message`, before any SCP code reads the message,
         // and no SCP-side change can make openmls accept a previous-epoch
         // Commit. This loop pins openmls's refusal and SCP's mapping of it to

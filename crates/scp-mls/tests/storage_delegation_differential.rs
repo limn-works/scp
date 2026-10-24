@@ -279,7 +279,7 @@ fn record<P: ListKeys>(trace: &mut Trace, step: &'static str, members: [&Member<
 /// creates a group and adds both; Bob and Carol join from the Welcome; Alice
 /// commits a self-update that Bob and Carol merge; Bob proposes an update of
 /// his own leaf, Alice and Carol queue it, and Alice commits it, which makes
-/// Bob delete the leaf's encryption key pair (the only path in openmls 0.9.0
+/// Bob delete the leaf's encryption key pair (the only path in openmls
 /// that calls `delete_encryption_key_pair`); Alice removes Carol, and Bob and
 /// Carol merge the removal; each member deletes its group (the only path that
 /// calls `delete_message_secrets`).

@@ -14,8 +14,9 @@
 # THE CHANNEL is a dated nightly, so a local run and CI compile on the same compiler; an
 # undated `nightly` resolves to whatever each machine installed last. The date is
 # 2026-09-28 (rustc 1.101.0-nightly d080e7dff 2026-09-27), the nightly on which
-# `cd fuzz && cargo check` was last run and passed. openmls 0.9.0's prelude still
-# glob-re-exports its `pub(crate) use signature::*`, as 0.8.1's did. Some nightlies after
+# `cd fuzz && cargo check` was last run and passed. The openmls commit pinned in
+# `fuzz/Cargo.toml` [patch.crates-io] still glob-re-exports its prelude's
+# `pub(crate) use signature::*`, as 0.9.0 and 0.8.1 did. Some nightlies after
 # 2026-05-03 rejected that re-export (E0365); this one accepts it again, and a later
 # nightly that tightens E0365 again would break this build. Move the date only to a
 # nightly on which `cd fuzz && cargo check` passes.

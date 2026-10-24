@@ -61,6 +61,7 @@ use sha2::{Digest, Sha256};
 
 use crate::credential::ScpCredential;
 use crate::error::MlsError;
+use crate::wrapping_extension::{SCP_LEAF_CIPHERSUITES, SCP_LEAF_CREDENTIALS};
 
 /// Extension type ID for `scp_keypackage_attestation` in the RFC 9420 §17.3
 /// private-use range (§9.18.7).
@@ -716,14 +717,14 @@ pub fn verify_attestation(
 pub fn scp_capabilities_with_context_params_and_attestation() -> Capabilities {
     Capabilities::new(
         None, // default versions
-        None, // default ciphersuites
+        Some(&SCP_LEAF_CIPHERSUITES),
         Some(&[
             ExtensionType::Unknown(crate::wrapping_extension::SCP_WRAPPING_KEY_EXTENSION_TYPE),
             ExtensionType::Unknown(scp_protocol::context::SCP_CONTEXT_EXTENSION_TYPE_ID),
             ExtensionType::Unknown(SCP_KEYPACKAGE_ATTESTATION_EXTENSION_TYPE),
         ]),
-        None, // default proposals
-        None, // default credentials
+        None, // no proposal types beyond the RFC 9420 defaults
+        Some(&SCP_LEAF_CREDENTIALS),
     )
 }
 
@@ -799,7 +800,7 @@ pub(crate) fn leaf_public_key(bytes: &[u8]) -> Result<[u8; 65], MlsError> {
 
 /// Reads the bytes of a leaf `encryption_key`.
 ///
-/// `openmls` 0.9.0 exposes no byte accessor for an `EncryptionKey`, so this
+/// `openmls` exposes no public byte accessor for an `EncryptionKey`, so this
 /// re-encodes it: its TLS encoding is the key as one variable-length vector.
 fn leaf_encryption_key(key: &openmls::treesync::EncryptionKey) -> Result<[u8; 65], MlsError> {
     use tls_codec::{DeserializeBytes as _, Serialize as _};
@@ -1256,6 +1257,14 @@ mod tests {
     #[test]
     fn capabilities_declare_attestation_and_wrapping_types() {
         let caps = scp_capabilities_with_context_params_and_attestation();
+        crate::capability_lists::assert_exact(
+            &caps,
+            &[
+                crate::wrapping_extension::SCP_WRAPPING_KEY_EXTENSION_TYPE,
+                scp_protocol::context::SCP_CONTEXT_EXTENSION_TYPE_ID,
+                SCP_KEYPACKAGE_ATTESTATION_EXTENSION_TYPE,
+            ],
+        );
         assert!(
             caps.extensions().contains(&ExtensionType::Unknown(
                 SCP_KEYPACKAGE_ATTESTATION_EXTENSION_TYPE

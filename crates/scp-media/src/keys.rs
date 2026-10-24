@@ -239,8 +239,10 @@ pub fn export_media_keys(
         )
         .map_err(|e| MediaError::ExportFailed(e.to_string()))?;
 
+    // `ExportedSecret` wipes its own buffer on drop; the copy taken here is
+    // wiped by `Zeroizing`.
     Ok(MediaKeyMaterial {
-        dtls_srtp_keys: Zeroizing::new(dtls_srtp_keys),
+        dtls_srtp_keys: Zeroizing::new(dtls_srtp_keys.as_slice().to_vec()),
         epoch,
         context_id,
     })

@@ -76,8 +76,29 @@ pub fn extract_wrapping_key(
         .transpose()
 }
 
+/// The ciphersuites every SCP leaf lists in its capabilities, in this order:
+/// `0x0001` (X25519, AES-128-GCM, Ed25519), `0x0002` (P-256, AES-128-GCM,
+/// P-256) and `0x0003` (X25519, ChaCha20-Poly1305, Ed25519).
+///
+/// openmls 0.9.0 filled these in when the caller passed `None`. Later openmls
+/// fills in nothing (an unset list is empty, and building a leaf whose
+/// capabilities omit its own ciphersuite fails), so every SCP builder passes
+/// this list. A leaf's capabilities are signed into its `LeafNode`, so
+/// changing it changes every published `KeyPackage`.
+pub(crate) const SCP_LEAF_CIPHERSUITES: [Ciphersuite; 3] = [
+    Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519,
+    Ciphersuite::MLS_128_DHKEMP256_AES128GCM_SHA256_P256,
+    Ciphersuite::MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519,
+];
+
+/// The credential types every SCP leaf lists: Basic alone, the type
+/// `ScpCredential` encodes to. openmls 0.9.0 filled this in for `None`, as it
+/// did [`SCP_LEAF_CIPHERSUITES`].
+pub(crate) const SCP_LEAF_CREDENTIALS: [CredentialType; 1] = [CredentialType::Basic];
+
 /// Builds `Capabilities` that include support for the `scp_wrapping_key`
-/// extension type, in addition to the SCP ciphersuite defaults.
+/// extension type, in addition to [`SCP_LEAF_CIPHERSUITES`] and
+/// [`SCP_LEAF_CREDENTIALS`].
 ///
 /// `OpenMLS` validates that any extension present on a `LeafNode` has its
 /// type listed in the node's capabilities (`valn0107`). This function
@@ -86,10 +107,10 @@ pub fn extract_wrapping_key(
 pub fn scp_capabilities_with_wrapping_key() -> Capabilities {
     Capabilities::new(
         None, // default versions
-        None, // default ciphersuites
+        Some(&SCP_LEAF_CIPHERSUITES),
         Some(&[ExtensionType::Unknown(SCP_WRAPPING_KEY_EXTENSION_TYPE)]),
-        None, // default proposals
-        None, // default credentials
+        None, // no proposal types beyond the RFC 9420 defaults
+        Some(&SCP_LEAF_CREDENTIALS),
     )
 }
 
@@ -143,7 +164,7 @@ pub fn extract_own_wrapping_key(
 ///
 /// For the local member's DID, reads `own_leaf_node()` and returns the key the
 /// local leaf publishes. For any other DID it returns
-/// [`MlsError::MemberNotFound`]. openmls 0.9.0 exposes every remote leaf
+/// [`MlsError::MemberNotFound`]. openmls exposes every remote leaf
 /// (`MlsGroup::public_group().leaf(index)`), so the tree could be read; SCP
 /// deliberately offers no remote lookup yet, because a remote lookup must first
 /// bind the identifier to leaves:
@@ -331,6 +352,7 @@ mod tests {
     #[test]
     fn scp_capabilities_contains_wrapping_key_type() {
         let caps = scp_capabilities_with_wrapping_key();
+        crate::capability_lists::assert_exact(&caps, &[SCP_WRAPPING_KEY_EXTENSION_TYPE]);
         assert!(
             caps.extensions()
                 .contains(&ExtensionType::Unknown(SCP_WRAPPING_KEY_EXTENSION_TYPE)),

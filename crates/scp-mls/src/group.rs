@@ -1211,7 +1211,7 @@ pub fn destroy_group(group: &mut ScpMlsGroup) -> Result<(), MlsError> {
     // leaving `None`, and the taken value is dropped at the end of the
     // statement. This releases:
     //   - MlsGroup: tree secrets, epoch key schedules, ratchet state, zeroized on
-    //     drop: openmls 0.9.0's `Secret` and `AeadKey`, and `openmls_traits`
+    //     drop: openmls's `Secret` and `AeadKey`, and `openmls_traits`
     //     0.6.0's `HpkePrivateKey`, hold a `tls_codec::SecretVLBytes`
     //   - SignatureKeyPair: P-256 private scalar, zeroized on drop by `SecretVLBytes`
     drop(group.group.take());
@@ -1551,7 +1551,7 @@ pub fn join_group_from_bytes(
     // the rest of its leaf validation.
     //
     // openmls decodes the peer's group secrets and GroupInfo inside these
-    // calls. openmls 0.9.0 and tls_codec 0.5.0 return an error for every
+    // calls. openmls and tls_codec 0.5.0 return an error for every
     // malformed input SCP knows of, including the 8-byte length header that
     // tls_codec 0.4 asserted on. The calls still run under `catch_unwind`, so
     // a panic on peer bytes in any build becomes a typed error rather than

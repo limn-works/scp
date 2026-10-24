@@ -136,7 +136,7 @@ impl NostrAdapter {
     /// Returns [`TransportError::ProtocolError`] if the signing key bytes
     /// are not a valid secp256k1 secret key.
     pub fn new(config: NostrConfig) -> Result<Self, TransportError> {
-        let signing_key = SigningKey::from_bytes(&config.signing_key).map_err(|e| {
+        let signing_key = SigningKey::from_bytes(&config.signing_key.into()).map_err(|e| {
             TransportError::ProtocolError(format!("invalid Nostr signing key: {e}"))
         })?;
         let verifying_key: &VerifyingKey = signing_key.verifying_key();
@@ -835,6 +835,42 @@ mod tests {
         let id_bytes = event.id_bytes().unwrap();
         let verifying_key = adapter.signing_key.verifying_key();
         verifying_key.verify(&id_bytes, &signature).unwrap();
+    }
+
+    /// A fixed key signing a fixed event id yields fixed signature bytes.
+    ///
+    /// The golden pins SCP's current output across the k256 0.13 to 0.14 port:
+    /// `sign_event` signs through `k256`'s `Signer`, which hashes the id with
+    /// SHA-256 and runs BIP-340 over that digest with an all-zero auxiliary
+    /// random input. It is therefore not a plain BIP-340 signature over the id,
+    /// which NIP-01 specifies; that divergence is an open defect, and fixing it
+    /// replaces this golden. The golden was captured on k256 0.13; a k256
+    /// upgrade that changes the signature, the x-only public key or the
+    /// signing-key parsing fails here.
+    #[test]
+    fn schnorr_signature_matches_the_golden() {
+        const GOLDEN_PUBKEY: &str =
+            "84bf7562262bbd6940085748f3be6afa52ae317155181ece31b66351ccffa4b0";
+        const GOLDEN_SIG: &str = "3854c68d550a6b9301c5f7e75e1258224a7bdbe399ee57b28437081c38d45e48\
+                                  28dd438d46355e05ff21d3272168647bd68f21975a122170a636f9d89f736350";
+
+        let mut key = [0u8; 32];
+        for (byte, value) in key.iter_mut().zip(1u8..) {
+            *byte = value;
+        }
+        let config = NostrConfig::new("wss://relay.example.com".to_owned(), key);
+        let adapter = NostrAdapter::new(config).unwrap();
+        let event = NostrEvent {
+            id: "5c".repeat(32),
+            pubkey: adapter.pubkey_hex.clone(),
+            created_at: 1_790_000_000,
+            kind: SCP_EVENT_KIND,
+            tags: vec![],
+            content: String::new(),
+            sig: String::new(),
+        };
+        assert_eq!(adapter.pubkey_hex(), GOLDEN_PUBKEY);
+        assert_eq!(adapter.sign_event(&event).unwrap(), GOLDEN_SIG);
     }
 
     #[test]
