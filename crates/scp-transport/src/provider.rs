@@ -180,7 +180,16 @@ impl<A: TransportAdapter + Send + Sync + 'static> ContextTransportProvider
         context_id: &[u8; 32],
         encrypted_payload: &[u8],
     ) -> Result<(), ContextError> {
-        let envelope = Self::build_envelope(context_id.to_vec(), encrypted_payload.to_vec());
+        // The one framing of a member publish (ADR-002, spec 23 §23.4.1): the
+        // payload is the serialized MLS message, and this envelope is the only
+        // one around it.
+        let envelope = scp_core::envelope::OuterEnvelope::frame_mls_message(
+            context_id,
+            None,
+            DEFAULT_BLOB_TTL,
+            encrypted_payload.to_vec(),
+        )
+        .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
         self.send_via_adapter(&envelope).await.map(|_blob_id| ())
     }
 

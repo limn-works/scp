@@ -222,8 +222,13 @@ impl Members {
         let adapter = connect(url).await;
         let mut routing_ids = Vec::new();
         for (routing_id, sealed) in sent {
-            let envelope =
-                scp_core::envelope::create_outer_envelope(&routing_id, None, 3600, sealed).unwrap();
+            let envelope = scp_core::envelope::OuterEnvelope::frame_mls_message(
+                &routing_id,
+                None,
+                3600,
+                sealed,
+            )
+            .unwrap();
             adapter.send(&envelope).await.unwrap();
             routing_ids.push(routing_id);
         }
@@ -1029,9 +1034,10 @@ async fn publish_alice_key_request(m: &Members, url: &str) {
         .test_seal_management(&m.ctx_id, request)
         .await
         .unwrap();
-    // The relay carries the sealed management envelope as the encrypted
-    // blob of a transport envelope, as it carries every sealed message.
-    let envelope = scp_core::envelope::create_outer_envelope(
+    // The relay carries the sealed management message as the encrypted blob
+    // of the one transport envelope, as it carries every sealed message
+    // (ADR-002, spec 23 §23.4.1).
+    let envelope = scp_core::envelope::OuterEnvelope::frame_mls_message(
         &scp_core::context::context_routing_id(&m.ctx_id),
         None,
         3600,

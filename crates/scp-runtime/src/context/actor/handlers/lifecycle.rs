@@ -780,14 +780,16 @@ fn handle_clear_needs_reconnect_actor(
 /// security (§9.12 step 2) via
 /// [`PerContextState::advance_epoch`](crate::context::actor::state::PerContextState::advance_epoch),
 /// which preserves the `scp_wrapping_key` leaf extension (§9.16.1) and
-/// advances the group epoch locally. Replies with the TLS-serialized MLS
-/// Commit bytes for the caller to distribute to all members. Used by the
-/// reconnection driver's Phase 5.
+/// advances the group epoch locally, then publishes the Commit through the
+/// Commit broadcast and retry queue (spec 23 §23.3 Phase 5, ADR-049). Replies
+/// `Ok(())` once the Commit reached the transport. A failed publish keeps the
+/// Commit queued fail-closed and replies `TransportFailed`, so the
+/// reconnection driver's Phase 5 fails the context.
 async fn handle_issue_mls_update_actor(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
-    reply: oneshot::Sender<Result<Vec<u8>, ContextError>>,
+    reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
     // Broadcast contexts have no MLS group — an Update is meaningless.
     // Pure read via `Deref` on the cell.
@@ -818,28 +820,58 @@ async fn handle_issue_mls_update_actor(
             return Outcome::ok(());
         }
     };
-    let result = cell
+    let commit = match cell
         .commit_class_s_keep(deps, context_id, |mut v| {
             let s = v.rest_mut();
             let out = s.advance_epoch(wrapping_public_key, deps.clock.as_ref())?;
             s.epoch.mls_epoch = s.epoch.mls_epoch.saturating_add(1);
             Ok(out.commit_bytes)
         })
-        .await;
+        .await
+    {
+        Ok(commit) => commit,
+        Err(e) => {
+            let _ = reply.send(Err(e));
+            // advance_epoch (or its fail-closed persist) failed — report an
+            // unmutated error so the post-dispatch persistence does not treat
+            // this turn as dirtying state (the fail-closed persist inside the
+            // combinator is authoritative).
+            return Outcome::err(ContextError::CryptoFailed(format!(
+                "IssueMlsUpdate failed for context {context_id}"
+            )));
+        }
+    };
 
-    let mutated = result.is_ok();
+    // The epoch advance is durable; publish the Commit through the broadcast
+    // and retry queue (spec 23 §23.3 Phase 5). On a failed publish the retry
+    // entry and the `commit_fault` marker persist fail-closed before the
+    // reply, so the Commit is never lost, and the reply names the failure.
+    let result = match crate::context::governance_helpers::try_broadcast_commit(
+        deps,
+        context_id,
+        commit,
+        &crate::context::state::CommitOperation::ReconnectMlsUpdate,
+    )
+    .await
+    {
+        None => Ok(()),
+        Some(failure) => {
+            let error = ContextError::TransportFailed(format!(
+                "Phase 5 Update Commit for context {context_id} queued for retry: {}",
+                failure.error()
+            ));
+            match crate::context::governance_helpers::keep_broadcast_failure(
+                cell, deps, context_id, failure,
+            )
+            .await
+            {
+                Ok(()) => Err(error),
+                Err(e) => Err(e),
+            }
+        }
+    };
     let _ = reply.send(result);
-    if mutated {
-        Outcome::ok_mutated(())
-    } else {
-        // advance_epoch (or its fail-closed persist) failed — preserve the
-        // handler's existing disposition: report an unmutated error so the
-        // post-dispatch persistence does not treat this turn as dirtying state
-        // (the fail-closed persist inside the combinator is authoritative).
-        Outcome::err(ContextError::CryptoFailed(format!(
-            "IssueMlsUpdate failed for context {context_id}"
-        )))
-    }
+    Outcome::ok_mutated(())
 }
 
 #[cfg(test)]

@@ -602,7 +602,7 @@ impl TransportAdapter for CoapAdapter {
             // MessagePack array of envelopes for multi-result queries.
             //
             // Reject oversized payloads before invoking any deserializer to prevent
-            // allocation bombs. `OuterEnvelope::from_bytes` has its own size guard
+            // allocation bombs. `OuterEnvelope::unframe_mls_message` has its own size guard
             // for the single-envelope case; the array path applies `max_reassembly_bytes`.
             if full_payload.len() > self.max_reassembly_bytes {
                 return Err(TransportError::PayloadTooLarge(format!(
@@ -611,7 +611,7 @@ impl TransportAdapter for CoapAdapter {
                     self.max_reassembly_bytes,
                 )));
             }
-            if let Ok(envelope) = OuterEnvelope::from_bytes(&full_payload) {
+            if let Ok(envelope) = OuterEnvelope::unframe_mls_message(&full_payload) {
                 // Verify blob integrity
                 let computed = BlobId::from_sha256(&full_payload);
                 debug!(
@@ -728,11 +728,9 @@ fn process_observe_notification(
         )));
     }
 
-    match OuterEnvelope::from_bytes(&packet.payload) {
+    match scp_core::envelope::OuterEnvelope::unframe_mls_message(&packet.payload) {
         Ok(envelope) => Ok(TransportEvent::Envelope(envelope)),
-        Err(e) => Ok(TransportEvent::Error(TransportError::ProtocolError(
-            format!("CoAP Observe: envelope deserialization failed: {e}"),
-        ))),
+        Err(e) => Ok(TransportEvent::Error(TransportError::from(e))),
     }
 }
 

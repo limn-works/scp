@@ -100,10 +100,18 @@ pub trait SyncPhaseDriver: Send + Sync {
         messages: &[BufferedMessage],
     ) -> Result<u64, SyncError>;
 
-    /// Phase 5 — MLS Update: issue an MLS Update proposal for post-compromise
-    /// security (§9.12).
+    /// Phase 5 — MLS Update: commit an MLS Update for post-compromise
+    /// security (spec 23 §23.3 Phase 5, §9.12).
     ///
-    /// Returns `true` if the Update was successfully issued.
+    /// Returns `true` if the Update Commit merged and the transport took it,
+    /// `false` if the context has no Update to issue.
+    ///
+    /// # Errors
+    ///
+    /// A [`SyncError`] when the Update did not reach the relay: the Commit
+    /// merged locally but its publish failed and waits in the retry queue, or
+    /// the Commit could not be built. Phase 5 then fails the context, because
+    /// its peers stay an epoch behind until the queue delivers the Commit.
     async fn mls_update(&self, context_id: &str) -> Result<bool, SyncError>;
 
     /// Phase 6 — Queue drain: MLS-encrypt and send queued outbound messages.
@@ -1164,17 +1172,17 @@ impl ReconnectionCoordinator {
             }
         };
 
-        // Phase 5: MLS Update.
-        let mls_update_issued = match driver.mls_update(context_id).await {
-            Ok(issued) => issued,
-            Err(e) => {
-                tracing::warn!(
-                    context_id,
-                    error = %e,
-                    "Phase 5: mls_update failed, continuing without MLS update"
-                );
-                false
-            }
+        // Phase 5: MLS Update (spec 23 §23.3 Phase 5). A Commit that merged
+        // locally but did not reach the relay leaves the peers an epoch
+        // behind until the retry queue delivers it, so it fails the context.
+        let (mls_update_issued, catch_up_outcome) = match driver.mls_update(context_id).await {
+            Ok(issued) => (issued, catch_up_outcome),
+            Err(e) => (
+                false,
+                SyncOutcome::Failed {
+                    reason: format!("MLS update failed: {e}"),
+                },
+            ),
         };
 
         // Phase 6 is handled at the aggregate level in execute().
@@ -2551,8 +2559,9 @@ mod tests {
         relay_messages: Vec<BufferedMessage>,
         /// Local epoch to return.
         local_epoch_val: Option<u64>,
-        /// Whether MLS update should succeed.
-        mls_update_success: bool,
+        /// When `true`, `mls_update` returns an error, as a Phase 5 Update
+        /// whose publish waits in the retry queue does.
+        fail_mls_update: bool,
         /// Events recovered from event log sync.
         events_recovered_val: u64,
         /// Whether to simulate a relay catch-up failure.
@@ -2573,7 +2582,7 @@ mod tests {
             Self {
                 relay_messages: Vec::new(),
                 local_epoch_val: Some(1),
-                mls_update_success: true,
+                fail_mls_update: false,
                 events_recovered_val: 5,
                 fail_relay: false,
                 ordered_merge: false,
@@ -2699,8 +2708,14 @@ mod tests {
             Ok(0)
         }
 
-        async fn mls_update(&self, _context_id: &str) -> Result<bool, SyncError> {
-            Ok(self.mls_update_success)
+        async fn mls_update(&self, context_id: &str) -> Result<bool, SyncError> {
+            if self.fail_mls_update {
+                return Err(SyncError::MlsUpdateFailed {
+                    context_id: context_id.to_owned(),
+                    reason: "Phase 5 Update Commit queued for retry".to_owned(),
+                });
+            }
+            Ok(true)
         }
 
         async fn queue_drain(
@@ -2760,6 +2775,40 @@ mod tests {
         assert_eq!(result.outcome, SyncOutcome::FullyCaughtUp);
         assert!(result.mls_update_issued);
         assert_eq!(result.events_recovered, 5);
+    }
+
+    /// Spec 23 §23.3 Phase 5: a failed MLS Update fails the context; the
+    /// driver's Commit stays queued for retry, so the reconnect must not
+    /// report the context as caught up.
+    #[tokio::test]
+    async fn execute_tier1_mls_update_failure_fails_the_context() {
+        let now = 1_010_000u64;
+        let mut contacts = std::collections::HashMap::new();
+        contacts.insert("ctx-1".to_owned(), now - 3600);
+        let coord = ReconnectionCoordinator::new(
+            DID::from("did:dht:z6MkAlice"),
+            vec!["ctx-1".to_owned()],
+            contacts,
+        );
+
+        let mut driver = MockSyncDriver::new();
+        driver.local_epoch_val = Some(5);
+        driver.relay_messages = vec![BufferedMessage {
+            blob_id: "b0".to_owned(),
+            context_id: "ctx-1".to_owned(),
+            payload: vec![1],
+            stored_at: now - 500,
+            epoch: Some(5),
+        }];
+        driver.fail_mls_update = true;
+
+        let report = coord.execute(now, &driver).await;
+        let result = &report.contexts_synced[0];
+        let SyncOutcome::Failed { reason } = &result.outcome else {
+            unreachable!("expected Failed, got {:?}", result.outcome);
+        };
+        assert!(reason.contains("MLS update failed"), "{reason}");
+        assert!(!result.mls_update_issued);
     }
 
     /// Helper: a Commit `BufferedMessage` advancing the group to `epoch`.

@@ -87,19 +87,6 @@ use crate::context::supervisor::MessageSigner;
 /// external subscribers (webhook dispatcher, SDK event streams).
 pub type ContextEventSender = tokio::sync::broadcast::Sender<(String, ContextEvent)>;
 
-/// Default TTL (in seconds) for sealed message blobs sent through the
-/// transport. 300s = 5 minutes — short enough to limit replay surface,
-/// long enough to absorb transient relay outages.
-///
-/// Public so the lifecycle path can re-use the same value when sealing
-/// welcome envelopes. Sourced from the wasm-safe
-/// [`scp_protocol::envelope::outer::DEFAULT_APP_DATA_BLOB_TTL_SECS`] so the
-/// native runtime and the in-browser `scp-client` driver request the identical
-/// relay-storage window for the same message (ADR-057 "share, don't fork") — the
-/// value is unchanged (300s); only its single source of truth moved.
-pub const DEFAULT_BLOB_TTL_SECS: u32 =
-    scp_protocol::envelope::outer::DEFAULT_APP_DATA_BLOB_TTL_SECS;
-
 // ---------------------------------------------------------------------------
 // 1. build_inner_wire (shared inner-envelope construction)
 // ---------------------------------------------------------------------------
@@ -207,8 +194,7 @@ pub(in crate::context) async fn build_inner_wire(
 /// crypto state (Class-C `&mut ContextCryptoState`), the field-granular crypto
 /// sub-state reached via `ClassCMut::mode_mut()`. Byte-identical to the deleted
 /// pre-PR-7 provider seal path: it shares [`build_inner_wire`] and
-/// passes the same all-zero app-data `routing_id`, `DEFAULT_BLOB_TTL_SECS`, and
-/// the caller-supplied `aad_sequence` (the authoritative sender-layer AAD
+/// passes the caller-supplied `aad_sequence` (the authoritative sender-layer AAD
 /// sequence — today `MembershipState::next_sequence_number`, matching what the
 /// provider's `seal` derived from the inner envelope). `local_did` is sourced
 /// from `deps.crypto.local_did()` so the sealed sender-layer AAD binds the same
@@ -216,9 +202,8 @@ pub(in crate::context) async fn build_inner_wire(
 #[allow(clippy::too_many_arguments)]
 // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): widened from module-private so the relocated
 // app-data send-path callers (crypto/mls/provider.rs `encrypt_and_send`, plus the
-// agent_binding_pipeline_tests) can drive the PRODUCTION actor app-data seal — the
-// one that zeroes the outer `routing_id` (§9.10.4) — after the deleted provider
-// twin `build_encrypted_envelope` is removed. `pub(crate)` is the minimal correct
+// agent_binding_pipeline_tests) can drive the PRODUCTION actor app-data seal
+// after the deleted provider twin `build_encrypted_envelope` is removed. `pub(crate)` is the minimal correct
 // visibility: callers span `crypto/mls/provider.rs` and `context/`, so a
 // `pub(super)` / `pub(in crate::context)` cap would wrongly forbid the crypto/mls
 // caller (E0624). It is a purely internal crate seam with no FFI/SDK surface, so it
@@ -251,22 +236,9 @@ pub(crate) async fn build_encrypted_envelope_actor(
         message_type,
     )
     .await?;
-    // §9.10.4 privacy: app-data outer `routing_id` is the 32-byte zero sentinel
-    // — one sealed blob fans out to N per-member pseudonym transport addresses,
-    // so no single per-recipient value belongs here, and embedding the
-    // relay-derivable `context_routing_id` would leak a correlator to the relay.
-    // The all-zero value is a RESERVED/forbidden pseudonym that cannot collide
-    // with a real routing ID; the receiver routes on the transport key and never
-    // reads this field for app-data.
-    let routing_id = [0u8; 32];
-    crypto_state.seal(
-        &context_id_bytes,
-        local_did,
-        &inner,
-        &routing_id,
-        DEFAULT_BLOB_TTL_SECS,
-        aad_sequence,
-    )
+    // The serialized MLS message; the transport frames it once for each
+    // per-member pseudonym address it fans out to (ADR-002, spec 23 §23.4.1).
+    crypto_state.seal(&context_id_bytes, local_did, &inner, aad_sequence)
 }
 
 // ---------------------------------------------------------------------------

@@ -6385,8 +6385,15 @@ pub struct BroadcastFailure {
     error: String,
 }
 
+impl BroadcastFailure {
+    /// The transport error the failed first publish returned.
+    pub(super) fn error(&self) -> &str {
+        &self.error
+    }
+}
+
 /// Attempts to broadcast an MLS Commit. Returns `None` on success (or an empty
-/// commit — the `cfg(test)` no-crypto pipeline); on transport failure returns
+/// commit — the `cfg(test)` no-crypto pipeline); on a transport failure returns
 /// `Some(BroadcastFailure)` describing the retry-queue bookkeeping the caller
 /// must persist via [`apply_broadcast_failure`].
 ///
@@ -6419,11 +6426,7 @@ pub async fn try_broadcast_commit(
         return None;
     }
     let routing_id = scp_protocol::context::context_routing_id(context_id);
-    match deps
-        .transport
-        .send_message(&routing_id, &commit_bytes)
-        .await
-    {
+    match publish_commit(deps.transport.as_ref(), routing_id, &commit_bytes).await {
         Ok(()) => None,
         Err(e) => {
             let now = deps.clock.now_secs();
@@ -6445,6 +6448,25 @@ pub async fn try_broadcast_commit(
             })
         }
     }
+}
+
+/// Publishes the serialized MLS Commit `commit` to `routing_id`. The
+/// transport frames it in the one relay-visible `OuterEnvelope` (ADR-002,
+/// spec 23 §23.4.1), as it frames every application and management message.
+/// The first broadcast ([`try_broadcast_commit`]) and the retry of a queued
+/// Commit both publish through here.
+///
+/// # Errors
+///
+/// The transport's error when the frame is refused or the send fails. The
+/// callers treat it as a failed attempt, so the Commit stays queued and the
+/// context fails closed once the retry budget runs out.
+pub(super) async fn publish_commit(
+    transport: &dyn crate::context::builder::ContextTransportProvider,
+    routing_id: [u8; 32],
+    commit: &[u8],
+) -> Result<(), ContextError> {
+    transport.send_message(&routing_id, commit).await
 }
 
 /// Applies the retry-queue bookkeeping from a failed [`try_broadcast_commit`] to
@@ -7385,6 +7407,86 @@ mod commit_broadcast_retry_tests {
             0,
             "no send is attempted for empty commit bytes"
         );
+    }
+
+    /// Every `send_message` call: the routing ID and the payload.
+    type Payloads = Arc<Mutex<Vec<([u8; 32], Vec<u8>)>>>;
+
+    /// A transport that records every `send_message` payload, then fails or
+    /// succeeds it.
+    struct PayloadTransport {
+        payloads: Payloads,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ContextTransportProvider for PayloadTransport {
+        fn is_connected(&self) -> bool {
+            !self.fail
+        }
+        async fn publish_context(
+            &self,
+            _: &[u8; 32],
+            _: &ContextParams,
+        ) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+        async fn delete_published(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+        async fn send_message(
+            &self,
+            routing_id: &[u8; 32],
+            payload: &[u8],
+        ) -> Result<(), ContextError> {
+            self.payloads
+                .lock()
+                .unwrap()
+                .push((*routing_id, payload.to_vec()));
+            if self.fail {
+                Err(ContextError::TransportFailed("induced send failure".into()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// ADR-002, spec 23 §23.4.1: the first broadcast hands the transport the
+    /// serialized MLS Commit with no envelope of its own, so the transport's
+    /// frame is the only one. On a failed send the retry queue keeps the same
+    /// bytes for the retry.
+    #[tokio::test]
+    async fn try_broadcast_commit_hands_the_transport_the_mls_commit() {
+        let commit = b"mls-commit".to_vec();
+        let routing_id = scp_protocol::context::context_routing_id(&ctx_hex());
+        for fail in [false, true] {
+            let payloads = Arc::new(Mutex::new(Vec::new()));
+            let deps = build_deps(
+                Box::new(PayloadTransport {
+                    payloads: Arc::clone(&payloads),
+                    fail,
+                }),
+                Box::new(FailPersistence),
+            )
+            .await;
+
+            let out = try_broadcast_commit(&deps, &ctx_hex(), commit.clone(), &remove_op()).await;
+
+            let sent = payloads.lock().unwrap().clone();
+            assert_eq!(
+                sent,
+                vec![(routing_id, commit.clone())],
+                "fail={fail}: one send of the MLS Commit to the context routing ID"
+            );
+            match out {
+                None => assert!(!fail, "a failed send must yield a BroadcastFailure"),
+                Some(failure) => {
+                    assert!(fail, "a successful send must yield None");
+                    assert_eq!(failure.pending.commit_bytes, commit);
+                    assert_eq!(failure.pending.routing_id, routing_id);
+                }
+            }
+        }
     }
 
     // -- Test 4: keep_broadcast_failure fail-closed durability ------------

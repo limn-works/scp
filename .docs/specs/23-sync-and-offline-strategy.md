@@ -55,7 +55,7 @@ On reconnection (at least one relay WebSocket connection re-established), the SD
 
 **Phase 4 -- Sender key re-acquisition.** For each context, check for `SenderKeyEpochAdvance` events received during catch-up. For any sender whose key epoch has advanced beyond the locally cached version, issue `SenderKeyRequest` (ADR-007) to obtain the current key. Messages encrypted with missed sender key epochs are buffered until the key is obtained or the sender key timeout expires (RECOMMENDED default: **60 seconds**, configurable via `SyncPolicy`). After timeout, those messages are marked as `UnrecoverableSenderKey` and the application layer is notified.
 
-**Phase 5 -- MLS Update.** After catch-up is complete, the SDK issues an MLS Update proposal in each active context (section 9.7.3: "SDK SHOULD issue an Update after re-establishing connectivity following an offline period"). This provides post-compromise security for the reconnecting member.
+**Phase 5 -- MLS Update.** After catch-up is complete, the SDK issues an MLS Update proposal in each active context (section 9.7.3: "SDK SHOULD issue an Update after re-establishing connectivity following an offline period"). This provides post-compromise security for the reconnecting member. The member merges the Update Commit and publishes it through the same broadcast and retry queue as every other Commit it issues (ADR-049): a publish that fails keeps the Commit queued for retry, and Phase 5 then fails the context, because no peer can follow the member into the new epoch until the Commit reaches a relay.
 
 **Phase 6 -- Queue drain.** Drain the outbound queue for each context. Each queued inner envelope is MLS-encrypted with the current epoch's key schedule and sent. If a queued message references a context that no longer exists (closed or expired while offline), the message is discarded with a `ContextGone` notification to the application layer.
 
@@ -71,7 +71,7 @@ MLS requires sequential epoch processing -- each Commit depends on the previous 
 
 Tried in order:
 
-1. **Relay backfill.** MLS Commits are sent as MLS `PrivateMessage` under the `PURE_CIPHERTEXT` wire policy (ADR-057 T3; protocol messages delivered via the transport layer). Relays store them like any other blob. If the relay's retention covers the offline period, all Commits are recoverable.
+1. **Relay backfill.** MLS Commits are sent as MLS `PrivateMessage` under the `PURE_CIPHERTEXT` wire policy (ADR-057 T3; protocol messages delivered via the transport layer). Every payload a member publishes to a context, whether a Commit, an application message, or a management message, is one `OuterEnvelope` (ADR-002, two-layer envelope format) whose `encrypted_blob` is the serialized MLS message; no second `OuterEnvelope` sits inside that blob. Relays store Commits like any other blob. If the relay's retention covers the offline period, all Commits are recoverable.
 
 2. **Peer request.** If relays have expired some Commits (blob_ttl elapsed), the reconnecting member broadcasts a `CommitRangeRequest` as an MLS application message (using their current epoch keys -- they can still encrypt at their stale epoch). Online members who have persisted the Commit messages respond with the missing Commits. This is best-effort -- members are not required to retain raw Commit messages beyond the MLS grace window.
 

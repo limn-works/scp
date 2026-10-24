@@ -343,14 +343,9 @@ impl TransportAdapter for UdpDtlsAdapter {
                         });
                     }
 
-                    let envelope = OuterEnvelope::from_bytes(&blob).map_err(|_| {
-                        // The blob is relay-supplied; do not propagate the
-                        // serde error into the TransportError -- some codecs
-                        // include byte excerpts in `Display`.
+                    let envelope = OuterEnvelope::unframe_mls_message(&blob).map_err(|e| {
                         tracing::warn!("envelope deserialization failed");
-                        TransportError::ProtocolError(
-                            "failed to deserialize envelope from blob".to_owned(),
-                        )
+                        TransportError::from(e)
                     })?;
 
                     Ok(vec![envelope])

@@ -243,18 +243,6 @@ fn key_package(did: &str) -> Vec<u8> {
         .expect("serialize key package")
 }
 
-/// A raw MLS message wrapped in the outer envelope a relay delivers.
-fn wrap(ctx: &str, mls_message: Vec<u8>) -> Vec<u8> {
-    let outer = scp_protocol::envelope::outer::create_outer_envelope(
-        &scp_protocol::context::context_routing_id(ctx),
-        None,
-        3600,
-        mls_message,
-    )
-    .expect("outer envelope");
-    rmp_serde::to_vec_named(&outer).expect("serialize outer envelope")
-}
-
 fn epoch(state: &PerContextState) -> u64 {
     state
         .mode
@@ -342,7 +330,7 @@ async fn trio(ctx: &str) -> (Member, Member) {
         bob_state.mode.crypto_mut(),
         ctx,
         &ctx_bytes,
-        &wrap(ctx, add),
+        &add,
     )
     .await
     .expect("Bob merges the add");
@@ -473,7 +461,7 @@ async fn a_received_remove_commit_changes_only_the_trigger_and_the_registry_reco
         .expect("Alice removes Carol's leaf")
         .commit_bytes;
     let epoch_before = epoch(&bob.cell);
-    deliver(&mut bob, ctx, wrap(ctx, remove))
+    deliver(&mut bob, ctx, remove)
         .await
         .expect("Bob processes the Remove Commit");
     assert_eq!(epoch(&bob.cell), epoch_before + 1, "Bob merged the Commit");
@@ -625,7 +613,7 @@ async fn a_non_committer_records_no_rotation_for_a_reset() {
         .await
         .expect("the reset commits");
     let epoch_before = epoch(&bob.cell);
-    deliver(&mut bob, ctx, wrap(ctx, output.commit_bytes))
+    deliver(&mut bob, ctx, output.commit_bytes)
         .await
         .expect("Bob processes the reset Commit");
 
@@ -677,7 +665,7 @@ async fn the_removed_member_discards_its_grace_and_records_no_rotation() {
         .await
         .expect("Alice removes Bob's leaf")
         .commit_bytes;
-    deliver(&mut bob, ctx, wrap(ctx, remove))
+    deliver(&mut bob, ctx, remove)
         .await
         .expect("Bob processes his own removal");
 

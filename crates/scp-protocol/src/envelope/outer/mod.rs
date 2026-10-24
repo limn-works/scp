@@ -250,10 +250,126 @@ impl OuterEnvelope {
     }
 }
 
+/// A relay blob that is not one ADR-002 outer envelope over a non-empty MLS
+/// message.
+///
+/// [`OuterEnvelope::unframe_mls_message`] returns it before any MLS work, so a receiver
+/// refuses relay junk without spending a decryption on it.
+#[derive(Debug, thiserror::Error)]
+pub enum MalformedFrame {
+    /// The blob does not decode as an [`OuterEnvelope`], or the envelope to
+    /// build has an invalid field. Covers the `MAX_ENVELOPE_SIZE` pre-check
+    /// of [`OuterEnvelope::from_bytes`] and an unsupported major version.
+    #[error("malformed frame: {0}")]
+    Envelope(#[from] EnvelopeError),
+    /// The envelope carries no MLS message.
+    #[error("malformed frame: the envelope carries an empty MLS message")]
+    EmptyMessage,
+}
+
+impl OuterEnvelope {
+    /// Frames the serialized MLS message `mls_message` for a relay publish: one
+    /// [`OuterEnvelope`] whose `encrypted_blob` is the MLS message (ADR-002,
+    /// spec 23 §23.4.1). Every member publish of a Commit, an application
+    /// message, or a management message frames through here, natively in the
+    /// transport provider and in the browser client, and nothing frames the MLS
+    /// message a second time.
+    ///
+    /// # Errors
+    ///
+    /// [`MalformedFrame::EmptyMessage`] when `mls_message` is empty;
+    /// [`MalformedFrame::Envelope`] when `routing_id` or `recipient_hint` is not
+    /// 32 bytes.
+    pub fn frame_mls_message(
+        routing_id: &[u8],
+        recipient_hint: Option<&[u8]>,
+        blob_ttl: u32,
+        mls_message: Vec<u8>,
+    ) -> Result<Self, MalformedFrame> {
+        if mls_message.is_empty() {
+            return Err(MalformedFrame::EmptyMessage);
+        }
+        Ok(create_outer_envelope(
+            routing_id,
+            recipient_hint,
+            blob_ttl,
+            mls_message,
+        )?)
+    }
+
+    /// Reverses [`Self::frame_mls_message`] on a blob a relay delivered:
+    /// decodes the one [`OuterEnvelope`] (with the `MAX_ENVELOPE_SIZE`
+    /// pre-check of [`Self::from_bytes`]), whose `encrypted_blob` is the
+    /// serialized MLS message a receiver decrypts.
+    ///
+    /// # Errors
+    ///
+    /// [`MalformedFrame::Envelope`] when the blob is oversized, does not
+    /// decode, or names an unsupported major version;
+    /// [`MalformedFrame::EmptyMessage`] when the envelope carries no MLS
+    /// message.
+    pub fn unframe_mls_message(blob: &[u8]) -> Result<Self, MalformedFrame> {
+        let envelope = Self::from_bytes(blob)?;
+        if envelope.encrypted_blob.is_empty() {
+            return Err(MalformedFrame::EmptyMessage);
+        }
+        Ok(envelope)
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// The codec round-trips: the blob a receiver unframes carries the MLS
+    /// message itself, under the routing id it was framed for.
+    #[test]
+    fn a_framed_mls_message_unframes_to_itself() {
+        let mls = vec![0x00, 0x01, 0x00, 0x02, 0xaa];
+        let blob = OuterEnvelope::frame_mls_message(&[0x11; 32], None, 300, mls.clone())
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+        let envelope = OuterEnvelope::unframe_mls_message(&blob).unwrap();
+        assert_eq!(envelope.encrypted_blob, mls);
+        assert_eq!(envelope.routing_id, vec![0x11; 32]);
+    }
+
+    /// Junk, an oversized blob, and an envelope with no MLS message are each a
+    /// typed `MalformedFrame`.
+    #[test]
+    fn a_malformed_frame_is_refused_with_a_typed_error() {
+        assert!(matches!(
+            OuterEnvelope::unframe_mls_message(&[0x00, 0x01, 0x02]),
+            Err(MalformedFrame::Envelope(
+                EnvelopeError::DeserializationFailed(_)
+            ))
+        ));
+        let oversized = vec![0u8; crate::serde_util::MAX_ENVELOPE_SIZE + 1];
+        assert!(matches!(
+            OuterEnvelope::unframe_mls_message(&oversized),
+            Err(MalformedFrame::Envelope(
+                EnvelopeError::EnvelopeTooLarge { .. }
+            ))
+        ));
+        let empty = create_outer_envelope(&[0x11; 32], None, 300, Vec::new())
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+        assert!(matches!(
+            OuterEnvelope::unframe_mls_message(&empty),
+            Err(MalformedFrame::EmptyMessage)
+        ));
+        assert!(matches!(
+            OuterEnvelope::frame_mls_message(&[0x11; 32], None, 300, Vec::new()),
+            Err(MalformedFrame::EmptyMessage)
+        ));
+        assert!(matches!(
+            OuterEnvelope::frame_mls_message(&[0x11; 16], None, 300, vec![1]),
+            Err(MalformedFrame::Envelope(EnvelopeError::InvalidRoutingId(_)))
+        ));
+    }
 
     #[test]
     fn create_outer_envelope_broadcast() {

@@ -122,11 +122,10 @@ pub(crate) async fn dispatch(
         }
         #[cfg(feature = "testing")]
         MessagingCommand::TestSealManagement {
-            context_id,
+            context_id: _,
             message,
             reply,
         } => {
-            let routing_id = scp_protocol::context::context_routing_id(&context_id);
             let sealed = cell
                 .class_c_view()
                 .mode_mut()
@@ -136,13 +135,7 @@ pub(crate) async fn dispatch(
                         "no MLS crypto state to seal a management message".to_owned(),
                     )
                 })
-                .and_then(|cs| {
-                    cs.mls_encrypt_management(
-                        &message,
-                        &routing_id,
-                        crate::context::messaging_helpers::DEFAULT_BLOB_TTL_SECS,
-                    )
-                });
+                .and_then(|cs| cs.mls_encrypt_management(&message));
             let outcome = match &sealed {
                 Ok(_) => Outcome::ok_mutated(()),
                 Err(e) => Outcome::err(outcome_error_sketch(e)),

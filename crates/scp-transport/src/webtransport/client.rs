@@ -1225,7 +1225,7 @@ impl TransportAdapter for WebTransportAdapter {
                                 if let Ok(relay_frame) = decode_relay_frame(&payload) {
                                     match relay_frame {
                                         QuicRelayFrame::Blob { blob, .. } => {
-                                            match OuterEnvelope::from_bytes(&blob) {
+                                            match OuterEnvelope::unframe_mls_message(&blob) {
                                                 Ok(env) => envelopes.push(env),
                                                 Err(_) => {
                                                     // Sanitized: do not log the
@@ -1437,16 +1437,11 @@ fn dispatch_relay_message(
         if !subscriptions.contains(&rid) {
             return;
         }
-        let event = match OuterEnvelope::from_bytes(blob) {
+        let event = match OuterEnvelope::unframe_mls_message(blob) {
             Ok(env) => TransportEvent::Envelope(env),
-            Err(_) => {
-                // The blob is attacker-controlled. Some serde codecs include
-                // raw byte excerpts in their `Display`; do not include `e` in
-                // the surfaced error message.
+            Err(e) => {
                 tracing::warn!("envelope deserialization failed");
-                TransportEvent::Error(TransportError::ProtocolError(
-                    "failed to deserialize envelope from blob".to_owned(),
-                ))
+                TransportEvent::Error(TransportError::from(e))
             }
         };
         let _ = subscriptions.with(&rid, |tx| tx.unbounded_send(event));
@@ -1490,17 +1485,11 @@ fn dispatch_relay_message(
 /// Converts a `QuicRelayFrame` to a `TransportEvent`.
 fn relay_frame_to_event(frame: QuicRelayFrame) -> Option<TransportEvent> {
     match frame {
-        QuicRelayFrame::Blob { blob, .. } => match OuterEnvelope::from_bytes(&blob) {
+        QuicRelayFrame::Blob { blob, .. } => match OuterEnvelope::unframe_mls_message(&blob) {
             Ok(env) => Some(TransportEvent::Envelope(env)),
-            Err(_) => {
-                // Sanitized: do not propagate the serde error message into the
-                // TransportEvent. The byte payload is relay-supplied and some
-                // codecs include byte excerpts in `Display`, which would leak
-                // attacker-controlled bytes into SDK error surfaces.
+            Err(e) => {
                 tracing::warn!("envelope deserialization failed");
-                Some(TransportEvent::Error(TransportError::ProtocolError(
-                    "failed to deserialize envelope from blob".to_owned(),
-                )))
+                Some(TransportEvent::Error(TransportError::from(e)))
             }
         },
         QuicRelayFrame::Event { event_type } => match event_type.as_str() {

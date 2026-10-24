@@ -187,7 +187,16 @@ fn envelope_to_buffered(
     envelope: &OuterEnvelope,
     now: u64,
 ) -> Option<BufferedMessage> {
-    let bytes = envelope.to_bytes().ok()?;
+    // The transport unframed this envelope from relay bytes, so re-encoding
+    // it cannot fail short of an encoder defect; such a blob has no dedup key
+    // and is dropped with a warning rather than fed twice.
+    let bytes = match envelope.to_bytes() {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::warn!(context_id, error = %e, "catch-up blob dropped: re-encoding failed");
+            return None;
+        }
+    };
     let blob_id = *scp_transport::BlobId::from_sha256(&bytes).as_bytes();
     Some(BufferedMessage {
         blob_id: hex::encode(blob_id),
@@ -650,41 +659,20 @@ impl SyncPhaseDriver for RelayActorSyncDriver<'_> {
     }
 
     /// Phase 5 — MLS Update for post-compromise security (§9.12 step 2).
-    /// Issues the Update through the actor and publishes the resulting
-    /// Commit to the context routing key so peers advance with us.
+    /// The actor issues the Update and publishes its Commit through the
+    /// Commit broadcast and retry queue (spec 23 §23.3 Phase 5, ADR-029
+    /// Addendum); the driver publishes nothing. A publish that failed leaves
+    /// the Commit queued and reaches here as an error, which fails the
+    /// context.
     async fn mls_update(&self, context_id: &str) -> Result<bool, SyncError> {
-        let commit_bytes = match self.supervisor.issue_mls_update(context_id).await {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                return Err(SyncError::MlsUpdateFailed {
-                    context_id: context_id.to_owned(),
-                    reason: e.to_string(),
-                });
-            }
-        };
-
-        // Publish the Commit to the shared routing key so online peers
-        // process the epoch advance. Best-effort: a transport failure does
-        // not undo the local epoch advance (the Commit can be re-broadcast).
-        let routing_id = self.shared_routing_id(context_id).await;
-        let envelope = create_outer_envelope(
-            routing_id.as_bytes(),
-            None,
-            RESET_BLOB_TTL_SECS,
-            commit_bytes,
-        )
-        .map_err(|e| SyncError::MlsUpdateFailed {
-            context_id: context_id.to_owned(),
-            reason: format!("outer envelope for MLS update commit: {e}"),
-        })?;
-        if let Err(e) = self.transport.send(&envelope).await {
-            tracing::warn!(
-                context_id,
-                error = %e,
-                "mls_update: failed to publish Update Commit to peers (best-effort)"
-            );
-        }
-        Ok(true)
+        self.supervisor
+            .issue_mls_update(context_id)
+            .await
+            .map(|()| true)
+            .map_err(|e| SyncError::MlsUpdateFailed {
+                context_id: context_id.to_owned(),
+                reason: e.to_string(),
+            })
     }
 
     /// Phase 6 — queue drain. The outbound offline queue is owned by
@@ -1238,11 +1226,11 @@ async fn drive_tier_engine(
 /// of `context_id` whose outcome is a terminal success.
 ///
 /// The clear keeps a later restore from re-driving the synced context
-/// (§23.11). The contact write records `now` as `last_relay_contact`, because
-/// a full reconnection that cleared the flag is a successful relay interaction
-/// (ADR-029 §2). Returns whether the flag was cleared and the contact-write
-/// error, if any. Nothing happens when `terminal_success` is false, and no
-/// write happens when the clear fails.
+/// (§23.11). The contact goes through [`record_relay_contact`], because a full
+/// reconnection that cleared the flag is a successful relay interaction
+/// (ADR-029 §2). Returns whether the flag was cleared and the contact error,
+/// if any. Nothing happens when
+/// `terminal_success` is false, and no write happens when the clear fails.
 async fn clear_and_record_contact(
     supervisor: &Arc<Supervisor>,
     relay_contacts: &dyn RelayContactStore,
@@ -1261,15 +1249,14 @@ async fn clear_and_record_contact(
         );
         return (false, None);
     }
-    let error = relay_contacts
-        .store_last_relay_contact(context_id, now)
+    let error = record_relay_contact(relay_contacts, context_id, now)
         .await
         .err()
         .map(|e| {
             tracing::error!(
                 context_id = %context_id,
                 error = %e,
-                "reconnect_contexts: last_relay_contact write failed"
+                "reconnect_contexts: recording last_relay_contact failed"
             );
             e.to_string()
         });
@@ -1397,11 +1384,11 @@ pub enum WakePullError {
         #[source]
         source: SyncError,
     },
-    /// Writing `sync/{context_id}/last_relay_contact` after Phases 2 and 4
-    /// failed.
-    #[error("writing the last relay contact of {context_id} failed: {source}")]
+    /// Recording `sync/{context_id}/last_relay_contact` after Phases 2 and 4
+    /// failed ([`record_relay_contact`]).
+    #[error("recording the last relay contact of {context_id} failed: {source}")]
     ContactWrite {
-        /// The context whose key could not be written.
+        /// The context whose key could not be recorded.
         context_id: String,
         /// The store failure.
         #[source]
@@ -1653,8 +1640,7 @@ async fn wake_pull_context(
             source,
         });
     }
-    relay_contacts
-        .store_last_relay_contact(context_id, now)
+    record_relay_contact(relay_contacts, context_id, now)
         .await
         .map_err(|source| WakePullError::ContactWrite {
             context_id: context_id.to_owned(),
@@ -1662,22 +1648,22 @@ async fn wake_pull_context(
         })
 }
 
-/// Writes the current local Unix time to `sync/{context_id}/last_relay_contact`
-/// (ADR-029 §2 sync-state keys). A live subscription calls it after the actor
-/// accepts a delivered envelope.
+/// Writes `now` as the context's `last_relay_contact`.
+///
+/// The one writer that advances `sync/{context_id}/last_relay_contact`
+/// (ADR-029 §2 sync-state keys): a live delivery, a push-wake pull and a full
+/// reconnection all record their relay contact through it.
 ///
 /// # Errors
 ///
-/// The store's [`StoreError`] when the write fails.
-async fn record_relay_contact(
+/// The store's [`StoreError`] when the write fails; the caller reports it.
+pub async fn record_relay_contact(
     relay_contacts: &dyn RelayContactStore,
     context_id: &str,
+    now: u64,
 ) -> Result<(), StoreError> {
     relay_contacts
-        .store_last_relay_contact(
-            context_id,
-            scp_clock::Clock::now_secs(&scp_clock::SystemClock),
-        )
+        .store_last_relay_contact(context_id, now)
         .await
 }
 
@@ -1686,9 +1672,8 @@ async fn record_relay_contact(
 pub struct LiveDelivery {
     /// The actor's reply to the delivery.
     pub delivered: Result<DeliverOutcome, ContextError>,
-    /// The failure of the `last_relay_contact` write after an accepted
-    /// delivery; `None` when the write landed or the actor refused the
-    /// envelope.
+    /// The failure of [`record_relay_contact`] after an accepted delivery;
+    /// `None` when the write landed or the actor refused the envelope.
     pub contact_error: Option<StoreError>,
 }
 
@@ -1697,9 +1682,13 @@ pub struct LiveDelivery {
 /// Dispatches `MessagingCommand::DeliverIncoming` in [`DeliveryMode::Live`]
 /// to `context_id` through the Supervisor `supervisor` still points at,
 /// awaits the actor's reply, and applies the live-subscription contact rule
-/// (ADR-029 §2 sync-state keys): an accepted envelope writes the current
-/// local time to the context's `last_relay_contact`, and a refused one writes
-/// nothing.
+/// (ADR-029 §2 sync-state keys): an accepted envelope records the current
+/// local time through [`record_relay_contact`], and a refused one records
+/// nothing, because a refused envelope proves no successful relay
+/// interaction.
+///
+/// `encrypted_blob` is the serialized MLS message the transport unframed from
+/// the one relay-visible `OuterEnvelope` (ADR-002, spec 23 §23.4.1).
 ///
 /// Every bridge's live subscription delivers through this function, so none
 /// can deliver without the contact rule. The upgraded `Arc` is held only for
@@ -1731,35 +1720,21 @@ pub async fn deliver_live_envelope(
         }),
         Err(e) => Err(e),
     };
-    let contact_error = record_contact_after_live_delivery(relay_contacts, context_id, &delivered)
+    let contact_error = if delivered.is_ok() {
+        record_relay_contact(
+            relay_contacts,
+            context_id,
+            scp_clock::Clock::now_secs(&scp_clock::SystemClock),
+        )
         .await
-        .err();
+        .err()
+    } else {
+        None
+    };
     Some(LiveDelivery {
         delivered,
         contact_error,
     })
-}
-
-/// The contact rule of a live subscription (ADR-029 §2 sync-state keys).
-///
-/// An envelope the actor accepted writes the current local time to the
-/// context's `last_relay_contact` through [`record_relay_contact`]; a delivery
-/// the actor refused writes nothing, because a refused envelope proves no
-/// successful relay interaction.
-///
-/// # Errors
-///
-/// The store's [`StoreError`] when the write after an accepted delivery
-/// fails. The caller reports it and keeps delivering.
-async fn record_contact_after_live_delivery<T: Sync, E: Sync>(
-    relay_contacts: &dyn RelayContactStore,
-    context_id: &str,
-    delivered: &Result<T, E>,
-) -> Result<(), StoreError> {
-    if delivered.is_err() {
-        return Ok(());
-    }
-    record_relay_contact(relay_contacts, context_id).await
 }
 
 #[cfg(test)]
@@ -1773,6 +1748,36 @@ mod tests {
         scp_core::store::sync::StorageRelayContactStore::new(std::sync::Arc::new(
             scp_platform::in_memory::InMemoryStorage::new(),
         ))
+    }
+
+    /// A dropped Supervisor yields `None`, which ends the subscription, and
+    /// writes no contact.
+    #[tokio::test]
+    async fn a_live_delivery_to_a_dropped_supervisor_ends_the_subscription() {
+        let store = contacts();
+        let outcome =
+            deliver_live_envelope(&std::sync::Weak::new(), &store, "ctx", vec![1, 2, 3]).await;
+        assert!(outcome.is_none(), "a dropped Supervisor must end the loop");
+        assert_eq!(store.load_last_relay_contact("ctx").await.unwrap(), None);
+    }
+
+    /// A delivery the actor refuses records no contact: here the context is
+    /// not registered, so the dispatch fails.
+    #[tokio::test]
+    async fn a_refused_live_delivery_records_no_contact() {
+        let store = contacts();
+        let supervisor = crate::bridge_instance::tests::test_supervisor();
+        let outcome = deliver_live_envelope(
+            &Arc::downgrade(&supervisor),
+            &store,
+            "absent",
+            vec![1, 2, 3],
+        )
+        .await
+        .expect("the Supervisor is alive");
+        assert!(outcome.delivered.is_err(), "{outcome:?}");
+        assert!(outcome.contact_error.is_none(), "{outcome:?}");
+        assert_eq!(store.load_last_relay_contact("absent").await.unwrap(), None);
     }
 
     /// A store whose writes fail, for the write-failure arm.
@@ -1794,43 +1799,20 @@ mod tests {
         }
     }
 
-    /// A dropped Supervisor yields `None`, which ends the subscription, and
-    /// writes no contact.
+    /// The single writer stores `now` as the contact, and a store write that
+    /// fails is returned as the store's typed error, not swallowed.
     #[tokio::test]
-    async fn a_live_delivery_to_a_dropped_supervisor_ends_the_subscription() {
+    async fn record_relay_contact_writes_now_and_returns_a_failed_store_write() {
         let store = contacts();
-        let outcome =
-            deliver_live_envelope(&std::sync::Weak::new(), &store, "ctx", vec![1, 2, 3]).await;
-        assert!(outcome.is_none(), "a dropped Supervisor must end the loop");
-        assert_eq!(store.load_last_relay_contact("ctx").await.unwrap(), None);
-    }
-
-    /// An accepted live delivery writes the current local time; a refused one
-    /// writes nothing; a failed write after an accepted delivery is returned.
-    #[tokio::test]
-    async fn a_live_delivery_writes_the_contact_only_when_the_actor_accepts() {
-        let store = contacts();
-        let refused: Result<(), &str> = Err("replay");
-        record_contact_after_live_delivery(&store, "ctx", &refused)
-            .await
-            .unwrap();
-        assert_eq!(store.load_last_relay_contact("ctx").await.unwrap(), None);
-
-        let before = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
-        let accepted: Result<(), &str> = Ok(());
-        record_contact_after_live_delivery(&store, "ctx", &accepted)
-            .await
-            .unwrap();
-        let after = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
-        let stored = store.load_last_relay_contact("ctx").await.unwrap();
-        assert!(
-            stored.is_some_and(|t| (before..=after).contains(&t)),
-            "{stored:?} not in {before}..={after}"
+        record_relay_contact(&store, "ctx", 42).await.unwrap();
+        assert_eq!(
+            store.load_last_relay_contact("ctx").await.unwrap(),
+            Some(42)
         );
 
-        let err = record_contact_after_live_delivery(&FailingStore, "ctx", &accepted).await;
+        let err = record_relay_contact(&FailingStore, "ctx", 43).await;
         assert!(
-            matches!(err, Err(StoreError::SerializationFailed(_))),
+            matches!(&err, Err(StoreError::SerializationFailed(m)) if m == "injected write failure"),
             "{err:?}"
         );
     }

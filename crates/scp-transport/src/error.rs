@@ -71,4 +71,19 @@ pub enum TransportError {
     /// payloads.
     #[error("payload too large: {0}")]
     PayloadTooLarge(String),
+
+    /// A blob the relay delivered is not one ADR-002 outer envelope over a
+    /// non-empty payload (`scp_protocol::envelope::MalformedFrame`), refused
+    /// before any MLS work. Held in an `Arc` because `TransportError` is
+    /// `Clone` and the frame error is not. The message names no detail of the
+    /// blob, which is relay-supplied and which some decoders echo in their
+    /// `Display`; the detail stays on the typed `source()`.
+    #[error("the relay delivered a malformed frame")]
+    MalformedFrame(#[source] std::sync::Arc<scp_core::envelope::MalformedFrame>),
+}
+
+impl From<scp_core::envelope::MalformedFrame> for TransportError {
+    fn from(e: scp_core::envelope::MalformedFrame) -> Self {
+        Self::MalformedFrame(std::sync::Arc::new(e))
+    }
 }
