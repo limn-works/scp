@@ -63,6 +63,11 @@ pub const PUSH_ROUTING_PREFIX: &str = "scp-push-registration";
 /// equals any `"scp-push-registration"` ID whatever URL and target follow.
 pub const PUSH_BRIDGE_ROUTING_PREFIX: &str = "scp-push-bridge:";
 
+/// The push timestamp skew window, in seconds (§9.18.13, §10.7.1
+/// **Freshness**): a relay rejects a push message whose `timestamp` differs
+/// from its clock by more than this.
+pub const PUSH_TIMESTAMP_SKEW_SECS: u64 = 300;
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------

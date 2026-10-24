@@ -12,12 +12,22 @@
 //! with that relay's canonical URL, and the registrar signs the SHA-256 of the
 //! preimage through [`KeyCustody::sign`] with a [`PushSigningKey`].
 //!
+//! Before its first publish to a relay, the registrar records the relay in a
+//! durable ledger ([`crate::store::push`]), and it deletes the record only
+//! when the relay accepts a deregistration of that token or refuses in a way
+//! that shows it holds nothing (`4061`, `4063`). A reconcile deregisters every
+//! recorded relay that no longer hosts a context of this device, so a lost OK
+//! or a restart never leaves a registration behind.
+//!
+//! A relay that refused a request with a `4xxx` code is not sent the same
+//! request again (ADR-004): the registrar records the refusal and skips the
+//! relay until its routing-ID set or the token changes.
+//!
 //! [`PushRegistrar::spawn_trigger`] moves the registrar into one task, which
-//! serializes every reconcile and token refresh. The task reconciles at start,
-//! whenever [`Supervisor::push_routes_changed`] reports an added or removed
-//! context actor, and on member, close, expiry and tombstone events. It retries
-//! a retryable failure with the ADR-004 backoff and stops on its shutdown
-//! token.
+//! serializes every reconcile and command. The task reconciles at start and
+//! whenever [`Supervisor::push_routes_changed`] reports that the routing IDs
+//! may have changed, retries a retryable failure with the ADR-004 backoff, and
+//! stops on its shutdown token.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::pin::Pin;
@@ -28,20 +38,22 @@ use futures::future::BoxFuture;
 use scp_clock::Clock;
 use scp_crypto::p256::{COMPRESSED_POINT_LEN, P256PublicKey, SIGNATURE_LEN, verify_prehash_strict};
 use scp_did::DID;
-use scp_platform::{KeyCustody, KeyHandle, PlatformError};
+use scp_platform::traits::Storage;
+use scp_platform::{KeyCustody, KeyHandle, PlatformError, PushToken};
 use scp_protocol::context::ContextError;
-use scp_protocol::context::membership::ContextEvent;
 use scp_protocol::discovery::push::{
-    PushDeregistration, PushMessageError, PushPlatform, PushRegistration, PushRelay,
-    push_deregistration_signing_bytes, push_registration_signing_bytes,
+    PUSH_TIMESTAMP_SKEW_SECS, PushDeregistration, PushMessageError, PushPlatform, PushRegistration,
+    PushRelay, push_deregistration_signing_bytes, push_registration_signing_bytes,
 };
 use scp_relay_client::{code, sanitize_relay_text};
 use sha2::{Digest, Sha256};
-use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::context::supervisor::Supervisor;
+use crate::store::push::PushRelayRecord;
+use crate::store::{ProtocolRepository, StoreError};
 
 #[cfg(test)]
 mod tests;
@@ -94,10 +106,21 @@ pub enum PushError {
     /// The routing-ID query failed, so nothing was published.
     #[error("push routing-ID query failed: {0}")]
     Routes(#[source] ContextError),
-    /// The supervisor has no context-event channel, so the trigger task would
-    /// miss close, expiry and tombstone changes.
-    #[error("the supervisor has no context-event channel")]
-    EventsUnavailable,
+    /// The platform is `WebPush`, whose subscription is per relay (§10.7.1,
+    /// the `WebPush` paragraph), so one token cannot go to every relay. PUSH-024 owns
+    /// `WebPush` registration.
+    #[error("WebPush registration is per relay; this registrar sends one token to every relay")]
+    WebPushUnsupported,
+    /// The relay ledger could not be read or written. A registration whose
+    /// ledger write failed is not published.
+    #[error("push relay ledger: {0}")]
+    Ledger(#[source] StoreError),
+    /// The publisher has no path that carries a push message to the relay.
+    #[error("the publisher cannot send push messages: {reason}")]
+    PublisherUnsupported {
+        /// Why the publisher cannot send.
+        reason: String,
+    },
     /// One call named the same relay twice.
     #[error("relay {relay_url} is named more than once")]
     DuplicateRelay {
@@ -186,9 +209,10 @@ pub enum PushError {
 impl PushError {
     /// Whether a later attempt of the same operation can succeed without any
     /// change on this device: `5003`, `5004`, every other `5xxx` code, an
-    /// unreachable relay, a clock behind the last timestamp, and a failed
-    /// routing-ID query. ADR-004 has a client never retry a `4xxx` code as-is,
-    /// so `4060`-`4064` are not retryable.
+    /// unreachable relay, a clock behind the last timestamp, a failed
+    /// routing-ID query, and a failed ledger read or write. ADR-004 has a
+    /// client never retry a `4xxx` code as-is, so `4060`-`4064` are not
+    /// retryable.
     #[must_use]
     pub const fn retryable(&self) -> bool {
         matches!(
@@ -199,6 +223,35 @@ impl PushError {
                 | Self::Unreachable { .. }
                 | Self::ClockBehind { .. }
                 | Self::Routes(_)
+                | Self::Ledger(_)
+        )
+    }
+
+    /// Whether the relay, or the publisher, refused the request for good: a
+    /// `4xxx` code, or a publisher with no push path. The registrar does not
+    /// send that relay the same request again (ADR-004).
+    #[must_use]
+    pub const fn is_terminal_refusal(&self) -> bool {
+        matches!(
+            self,
+            Self::RegistrationRejected { .. }
+                | Self::PlatformUnavailable { .. }
+                | Self::Stale { .. }
+                | Self::NotSupported { .. }
+                | Self::RegistrationLimit { .. }
+                | Self::RelayRefused { .. }
+                | Self::PublisherUnsupported { .. }
+        )
+    }
+
+    /// Whether the refusal shows that the relay holds no registration of this
+    /// token: `4061`, the relay cannot send to the platform, and `4063`, the
+    /// relay offers no push.
+    #[must_use]
+    pub const fn relay_holds_nothing(&self) -> bool {
+        matches!(
+            self,
+            Self::PlatformUnavailable { .. } | Self::NotSupported { .. }
         )
     }
 
@@ -226,6 +279,9 @@ impl From<PushPublishError> for PushError {
             PushPublishError::Unreachable { reason } => Self::Unreachable {
                 reason: sanitize_relay_text(&reason),
             },
+            PushPublishError::Unsupported { reason } => Self::PublisherUnsupported {
+                reason: sanitize_relay_text(&reason),
+            },
         }
     }
 }
@@ -251,6 +307,13 @@ pub enum PushPublishError {
         /// Why the publish did not reach the relay.
         reason: String,
     },
+    /// The publisher has no path that carries a push message, so no later
+    /// attempt can succeed.
+    #[error("publisher cannot send push messages: {reason}")]
+    Unsupported {
+        /// Why the publisher cannot send.
+        reason: String,
+    },
 }
 
 /// Publishes one push message to one relay: a PUBLISH of `blob` at
@@ -263,7 +326,9 @@ pub trait PushRelayPublisher: Send + Sync {
     ///
     /// [`PushPublishError::Rejected`] with the relay's code when the relay
     /// answers `ERR`; [`PushPublishError::Unreachable`] when no connection to
-    /// the relay exists or the publish gets no answer.
+    /// the relay exists or the publish gets no answer;
+    /// [`PushPublishError::Unsupported`] when the connection has no path for
+    /// a push message.
     fn publish<'a>(
         &'a self,
         relay_url: &'a str,
@@ -386,34 +451,62 @@ pub struct PushTarget {
 /// relay's failure does not stop the others.
 pub type RelayResults = BTreeMap<String, Result<(), PushError>>;
 
-/// The per-relay outcomes of [`PushRegistrar::refresh_token`]. Both maps hold
-/// the same relays: every relay that held a registration of the old token.
-#[derive(Debug)]
-pub struct TokenRefresh {
-    /// The `PushDeregistration` of the old token, per relay.
+/// The per-relay outcomes of an operation that can deregister and register.
+///
+/// [`PushRegistrar::refresh_token`], the registrar's crate-internal
+/// `reconcile` and the task commands return it. One relay can appear in both maps, for example an
+/// old token's deregistration and the new token's registration.
+#[derive(Debug, Default)]
+pub struct RelayOutcomes {
+    /// Each `PushDeregistration`, per relay.
     pub deregistered: RelayResults,
-    /// The `PushRegistration` of the new token, per relay.
+    /// Each `PushRegistration`, per relay.
     pub registered: RelayResults,
 }
 
+impl RelayOutcomes {
+    /// Every failed relay with its error, deregistrations first.
+    fn failures(&self) -> impl Iterator<Item = (&String, &PushError)> {
+        self.deregistered
+            .iter()
+            .chain(&self.registered)
+            .filter_map(|(url, outcome)| outcome.as_ref().err().map(|err| (url, err)))
+    }
+}
+
 /// Construction parameters for [`PushRegistrar`].
-pub struct PushRegistrarConfig<C: KeyCustody> {
+pub struct PushRegistrarConfig<C: KeyCustody, S: Storage> {
     /// The key every message is signed with.
     pub signing_key: PushSigningKey<C>,
     /// Delivers each message to its relay.
     pub publisher: Arc<dyn PushRelayPublisher>,
     /// The clock every `timestamp` is read from.
     pub clock: Arc<dyn Clock>,
-    /// The push platform the token belongs to.
+    /// The push platform the token belongs to. `WebPush` is refused.
     pub platform: PushPlatform,
     /// The platform's device token. Never empty.
-    pub token: Vec<u8>,
+    pub token: PushToken,
+    /// The store that holds the relay ledger, so a relay that may hold a
+    /// registration is deregistered after a lost OK or a restart.
+    pub storage: Arc<ProtocolRepository<S>>,
 }
 
-/// What a relay holds for this device's current token.
-struct Registered {
-    relay: PushRelay,
-    routing_ids: BTreeSet<[u8; 32]>,
+/// SHA-256 of a token: the token's identity in in-memory keys, so no map key
+/// holds the token bytes.
+type TokenHash = [u8; 32];
+
+fn token_hash(token: &PushToken) -> TokenHash {
+    Sha256::digest(token.as_bytes()).into()
+}
+
+/// A request a relay refused for good (ADR-004), which the registrar does not
+/// send again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Refused {
+    /// A registration of this routing-ID set.
+    Registration(BTreeSet<[u8; 32]>),
+    /// A deregistration.
+    Deregistration,
 }
 
 /// A signed message ready to publish.
@@ -426,49 +519,84 @@ struct Prepared {
 /// Registers this device's push token with relays (§10.7.1).
 ///
 /// Every method takes `&mut self`, so one owner serializes the operations;
-/// [`Self::spawn_trigger`] makes that owner a task. The registrar persists
-/// nothing: after a restart it registers every relay again.
-pub struct PushRegistrar<C: KeyCustody> {
+/// [`Self::spawn_trigger`] makes that owner a task.
+pub struct PushRegistrar<C: KeyCustody, S: Storage> {
     signing_key: PushSigningKey<C>,
     publisher: Arc<dyn PushRelayPublisher>,
     clock: Arc<dyn Clock>,
     platform: PushPlatform,
-    token: Vec<u8>,
+    token: PushToken,
+    storage: Arc<ProtocolRepository<S>>,
     /// Per canonical relay URL, the registration the relay accepted last for
     /// `token`.
-    registered: BTreeMap<String, Registered>,
-    /// Per (canonical relay URL, token), the last `timestamp` sent. An entry
-    /// below the clock constrains nothing and is pruned.
-    last_timestamp: HashMap<(String, Vec<u8>), u64>,
+    accepted: BTreeMap<String, PushTarget>,
+    /// The durable relay ledger as loaded and written, per (canonical relay
+    /// URL, token hash): every relay that may hold a registration.
+    ledger: BTreeMap<(String, TokenHash), PushRelayRecord>,
+    /// Per (canonical relay URL, token hash), the request the relay refused
+    /// for good.
+    refused: BTreeMap<(String, TokenHash), Refused>,
+    /// Per (canonical relay URL, token hash), the last `timestamp` sent.
+    last_timestamp: HashMap<(String, TokenHash), u64>,
+    /// Whether a reconcile registers the current routes. A
+    /// [`PushRegistrarTask::deregister_all`] clears it and a
+    /// [`PushRegistrarTask::register`] sets it.
+    enabled: bool,
 }
 
-impl<C: KeyCustody> PushRegistrar<C> {
-    /// Builds a registrar that has registered nothing.
+impl<C: KeyCustody, S: Storage> PushRegistrar<C, S> {
+    /// Builds a registrar over the relay ledger in `config.storage`. It has
+    /// registered nothing in this process; the first reconcile deregisters
+    /// every recorded relay that hosts no context of this device.
     ///
     /// # Errors
     ///
     /// [`PushError::Message`] with [`PushMessageError::EmptyToken`] when
-    /// `config.token` is empty.
-    pub fn new(config: PushRegistrarConfig<C>) -> Result<Self, PushError> {
+    /// `config.token` is empty; [`PushError::WebPushUnsupported`] when
+    /// `config.platform` is `WebPush`; [`PushError::Ledger`] when the ledger
+    /// cannot be read.
+    pub async fn new(config: PushRegistrarConfig<C, S>) -> Result<Self, PushError> {
         if config.token.is_empty() {
             return Err(PushMessageError::EmptyToken.into());
         }
+        if config.platform == PushPlatform::WebPush {
+            return Err(PushError::WebPushUnsupported);
+        }
+        let ledger = config
+            .storage
+            .load_push_relays()
+            .await
+            .map_err(PushError::Ledger)?
+            .into_iter()
+            .map(|record| {
+                (
+                    (record.relay_url.clone(), token_hash(&record.token)),
+                    record,
+                )
+            })
+            .collect();
         Ok(Self {
             signing_key: config.signing_key,
             publisher: config.publisher,
             clock: config.clock,
             platform: config.platform,
             token: config.token,
-            registered: BTreeMap::new(),
+            storage: config.storage,
+            accepted: BTreeMap::new(),
+            ledger,
+            refused: BTreeMap::new(),
             last_timestamp: HashMap::new(),
+            enabled: true,
         })
     }
 
     /// Publishes a signed `PushRegistration` of each target's routing IDs to
-    /// its relay, concurrently, and records each one the relay accepts.
+    /// its relay, concurrently, and records each one the relay accepts. Each
+    /// relay is written to the ledger before its message is published.
     ///
     /// A tier 3 relay gets [`PushError::Tier3Unsupported`] and nothing is
-    /// published to it.
+    /// published to it; a relay whose ledger write fails gets
+    /// [`PushError::Ledger`] and nothing is published to it.
     ///
     /// # Errors
     ///
@@ -487,26 +615,21 @@ impl<C: KeyCustody> PushRegistrar<C> {
             }
         }
         for (relay_url, outcome) in self.publish_all(prepared).await {
-            if outcome.is_ok()
-                && let Some(target) = targets
-                    .iter()
-                    .find(|target| target.relay.canonical_url() == relay_url)
+            let outcome = match targets
+                .iter()
+                .find(|target| target.relay.canonical_url() == relay_url)
             {
-                self.registered.insert(
-                    relay_url.clone(),
-                    Registered {
-                        relay: target.relay.clone(),
-                        routing_ids: target.routing_ids.clone(),
-                    },
-                );
-            }
+                Some(target) => self.settle_registration(target, outcome).await,
+                None => outcome,
+            };
             results.insert(relay_url, outcome);
         }
         Ok(results)
     }
 
     /// Publishes a signed `PushDeregistration` of the current token to each
-    /// relay, concurrently, and forgets each registration the relay removes.
+    /// relay, concurrently. Each relay that accepts it is removed from the
+    /// ledger.
     ///
     /// # Errors
     ///
@@ -514,140 +637,320 @@ impl<C: KeyCustody> PushRegistrar<C> {
     /// is published. Every other failure is that relay's entry in the result.
     pub async fn deregister(&mut self, relays: &[PushRelay]) -> Result<RelayResults, PushError> {
         let token = self.token.clone();
-        let results = self.deregister_token(relays, &token).await?;
-        for (relay_url, outcome) in &results {
-            if outcome.is_ok() {
-                self.registered.remove(relay_url);
-            }
-        }
-        Ok(results)
+        self.deregister_token(relays, self.platform, &token).await
     }
 
-    /// Replaces the device token (§10.7.1 **Token refresh**): each relay that
-    /// holds a registration gets a `PushDeregistration` for the old token and
-    /// then a `PushRegistration` of the same routing IDs for `new_token`. The
+    /// Replaces the device token (§10.7.1 **Token refresh**): each relay the
+    /// ledger lists for the old token gets a `PushDeregistration` of it, and
+    /// then each relay that had accepted a registration gets a
+    /// `PushRegistration` of the same routing IDs for `new_token`. The
     /// registration is sent whatever the deregistration's outcome, because
-    /// the relay's 3-failure rule removes an old token never deregistered.
+    /// the relay's 3-failure rule removes an old token never deregistered. A
+    /// relay whose step failed keeps its ledger record, so the next reconcile
+    /// sends it again.
     ///
     /// # Errors
     ///
     /// [`PushError::Message`] with [`PushMessageError::EmptyToken`] when
     /// `new_token` is empty; nothing is published and the token is kept.
-    pub async fn refresh_token(&mut self, new_token: Vec<u8>) -> Result<TokenRefresh, PushError> {
+    pub async fn refresh_token(
+        &mut self,
+        new_token: PushToken,
+    ) -> Result<RelayOutcomes, PushError> {
         if new_token.is_empty() {
             return Err(PushMessageError::EmptyToken.into());
         }
         let old_token = std::mem::replace(&mut self.token, new_token);
-        // Forget every registration first: if a step below fails, the next
-        // reconcile registers each relay again under the new token.
-        let previous = std::mem::take(&mut self.registered);
-        let relays: Vec<PushRelay> = previous.values().map(|r| r.relay.clone()).collect();
-        let deregistered = self.deregister_token(&relays, &old_token).await?;
-        let targets: Vec<PushTarget> = previous
-            .into_values()
-            .map(|r| PushTarget {
-                relay: r.relay,
-                routing_ids: r.routing_ids,
-            })
-            .collect();
-        let registered = self.register(&targets).await?;
-        Ok(TokenRefresh {
-            deregistered,
-            registered,
-        })
+        let old_hash = token_hash(&old_token);
+        let previous = std::mem::take(&mut self.accepted);
+        let mut outcomes = RelayOutcomes::default();
+        let mut relays = Vec::new();
+        for ((relay_url, _), record) in self
+            .ledger
+            .iter()
+            .filter(|((_, hash), _)| *hash == old_hash)
+        {
+            match PushRelay::direct(relay_url) {
+                Ok(relay) => relays.push((relay, record.platform)),
+                Err(err) => {
+                    outcomes
+                        .deregistered
+                        .insert(relay_url.clone(), Err(err.into()));
+                }
+            }
+        }
+        for (platform, group) in by_platform(relays) {
+            for (relay_url, outcome) in self.deregister_token(&group, platform, &old_token).await? {
+                merge_outcome(&mut outcomes.deregistered, relay_url, outcome);
+            }
+        }
+        let targets: Vec<PushTarget> = previous.into_values().collect();
+        outcomes.registered = self.register(&targets).await?;
+        Ok(outcomes)
     }
 
-    /// Brings every relay's registration in line with the supervisor's
-    /// current routing IDs: a `PushRegistration` to each relay whose set
-    /// differs from the one it accepted last, and a `PushDeregistration` to
-    /// each relay that holds a registration and no longer hosts a context of
-    /// this device (§10.7.1 **Re-registration**). A relay whose set did not
-    /// change gets nothing.
+    /// Brings every relay in line with the supervisor's current routing IDs
+    /// (§10.7.1 **Re-registration**):
+    ///
+    /// 1. a `PushDeregistration` to each relay the ledger lists for an old
+    ///    token, or that hosts no context of this device;
+    /// 2. a `PushRegistration` to each relay whose routing-ID set differs from
+    ///    the one it accepted last.
+    ///
+    /// A relay whose set did not change gets nothing, and neither does a
+    /// relay that refused the same request for good. While the registrar is
+    /// disabled ([`PushRegistrarTask::deregister_all`]) no routing ID is
+    /// wanted, so every recorded relay is deregistered.
     ///
     /// # Errors
     ///
     /// [`PushError::Routes`] when the routing-ID query fails; nothing is
     /// published, because a registration built from a partial set would drop
-    /// the wakes of the missing contexts.
+    /// the wakes of the missing contexts, and a deregistration built from it
+    /// would drop every wake on the relay.
     pub(crate) async fn reconcile(
         &mut self,
         supervisor: &Supervisor,
-    ) -> Result<RelayResults, PushError> {
-        let current = Box::pin(supervisor.push_routing_ids())
-            .await
-            .map_err(PushError::Routes)?;
-        let mut results = RelayResults::new();
-        let gone: Vec<PushRelay> = self
-            .registered
-            .iter()
-            .filter(|(url, _)| current.get(*url).is_none_or(BTreeSet::is_empty))
-            .map(|(_, registered)| registered.relay.clone())
+    ) -> Result<RelayOutcomes, PushError> {
+        let current = if self.enabled {
+            Box::pin(supervisor.push_routing_ids())
+                .await
+                .map_err(PushError::Routes)?
+        } else {
+            BTreeMap::new()
+        };
+        let wanted: BTreeMap<String, BTreeSet<[u8; 32]>> = current
+            .into_iter()
+            .filter(|(_, routing_ids)| !routing_ids.is_empty())
             .collect();
+        self.forget_stale_refusals(&wanted);
+        let current_hash = token_hash(&self.token);
+        let mut outcomes = RelayOutcomes::default();
+
+        // Deregistrations first, so on one relay an old token's
+        // deregistration precedes the new token's registration (§10.7.1
+        // **Token refresh**).
+        let mut stale = BTreeMap::<TokenHash, (PushToken, Vec<(PushRelay, PushPlatform)>)>::new();
+        for ((relay_url, hash), record) in &self.ledger {
+            let still_wanted = *hash == current_hash && wanted.contains_key(relay_url);
+            let refused =
+                self.refused.get(&(relay_url.clone(), *hash)) == Some(&Refused::Deregistration);
+            if still_wanted || refused {
+                continue;
+            }
+            match PushRelay::direct(relay_url) {
+                Ok(relay) => stale
+                    .entry(*hash)
+                    .or_insert_with(|| (record.token.clone(), Vec::new()))
+                    .1
+                    .push((relay, record.platform)),
+                Err(err) => {
+                    outcomes
+                        .deregistered
+                        .insert(relay_url.clone(), Err(err.into()));
+                }
+            }
+        }
+        for (token, relays) in stale.into_values() {
+            for (platform, group) in by_platform(relays) {
+                for (relay_url, outcome) in self.deregister_token(&group, platform, &token).await? {
+                    merge_outcome(&mut outcomes.deregistered, relay_url, outcome);
+                }
+            }
+        }
+
         let mut changed = Vec::new();
-        for (relay_url, routing_ids) in current {
-            if routing_ids.is_empty()
-                || self
-                    .registered
-                    .get(&relay_url)
-                    .is_some_and(|registered| registered.routing_ids == routing_ids)
-            {
+        for (relay_url, routing_ids) in wanted {
+            let unchanged = self
+                .accepted
+                .get(&relay_url)
+                .is_some_and(|accepted| accepted.routing_ids == routing_ids);
+            let refused = self.refused.get(&(relay_url.clone(), current_hash))
+                == Some(&Refused::Registration(routing_ids.clone()));
+            if unchanged || refused {
                 continue;
             }
             match PushRelay::direct(&relay_url) {
                 Ok(relay) => changed.push(PushTarget { relay, routing_ids }),
                 Err(err) => {
-                    results.insert(relay_url, Err(err.into()));
+                    outcomes.registered.insert(relay_url, Err(err.into()));
                 }
             }
         }
-        results.extend(self.register(&changed).await?);
-        results.extend(self.deregister(&gone).await?);
-        Ok(results)
+        outcomes.registered.extend(self.register(&changed).await?);
+        Ok(outcomes)
     }
 
-    /// Moves the registrar into a task that reconciles at start and on every
-    /// trigger, retries a retryable failure with the ADR-004 backoff, and
-    /// stops when `shutdown` is cancelled.
-    ///
-    /// # Errors
-    ///
-    /// [`PushError::EventsUnavailable`] when the supervisor has no
-    /// context-event channel; no task is spawned.
+    /// Moves the registrar into a task that reconciles at start, on every
+    /// [`Supervisor::push_routes_changed`] change and after every command,
+    /// retries a retryable failure with the ADR-004 backoff, and stops when
+    /// `shutdown` is cancelled, also in the middle of a command.
     pub fn spawn_trigger(
         self,
         supervisor: Arc<Supervisor>,
         shutdown: CancellationToken,
-    ) -> Result<PushRegistrarTask, PushError>
+    ) -> PushRegistrarTask
     where
         C: 'static,
+        S: 'static,
     {
-        let events = supervisor
-            .subscribe_events()
-            .ok_or(PushError::EventsUnavailable)?;
         let routes = supervisor.push_routes_changed();
         let (commands_tx, commands) = mpsc::channel(COMMAND_CAPACITY);
         let triggers = Triggers {
-            events,
             routes,
             commands,
             shutdown,
         };
         let join = tokio::spawn(self.run(supervisor, triggers));
-        Ok(PushRegistrarTask {
+        PushRegistrarTask {
             commands: commands_tx,
             join,
-        })
+        }
+    }
+
+    /// Drops every refusal whose request the registrar would no longer send:
+    /// a registration refusal once the relay's wanted set or the token
+    /// changed, and a deregistration refusal once the ledger no longer lists
+    /// the pair or the relay is wanted again under the current token.
+    fn forget_stale_refusals(&mut self, wanted: &BTreeMap<String, BTreeSet<[u8; 32]>>) {
+        let current_hash = token_hash(&self.token);
+        let ledger = &self.ledger;
+        self.refused.retain(|key, refusal| match refusal {
+            Refused::Registration(routing_ids) => {
+                key.1 == current_hash && wanted.get(&key.0) == Some(routing_ids)
+            }
+            Refused::Deregistration => {
+                ledger.contains_key(key) && (key.1 != current_hash || !wanted.contains_key(&key.0))
+            }
+        });
+    }
+
+    /// Writes (`relay_url`, current token) to the ledger unless it is there.
+    async fn record_relay(&mut self, relay_url: &str) -> Result<(), PushError> {
+        let key = (relay_url.to_owned(), token_hash(&self.token));
+        if self.ledger.contains_key(&key) {
+            return Ok(());
+        }
+        let record = PushRelayRecord {
+            relay_url: relay_url.to_owned(),
+            platform: self.platform,
+            token: self.token.clone(),
+        };
+        self.storage
+            .store_push_relay(&record)
+            .await
+            .map_err(PushError::Ledger)?;
+        self.ledger.insert(key, record);
+        Ok(())
+    }
+
+    /// Deletes (`relay_url`, `token`) from the ledger.
+    async fn forget_relay(&mut self, relay_url: &str, token: &PushToken) -> Result<(), PushError> {
+        self.storage
+            .delete_push_relay(relay_url, token)
+            .await
+            .map_err(PushError::Ledger)?;
+        self.ledger
+            .remove(&(relay_url.to_owned(), token_hash(token)));
+        Ok(())
+    }
+
+    /// Applies one registration outcome: an accepted set is recorded, a
+    /// refusal for good is remembered, and a refusal that shows the relay
+    /// holds nothing removes the relay from the ledger.
+    async fn settle_registration(
+        &mut self,
+        target: &PushTarget,
+        outcome: Result<(), PushError>,
+    ) -> Result<(), PushError> {
+        let relay_url = target.relay.canonical_url().to_owned();
+        let key = (relay_url.clone(), token_hash(&self.token));
+        match outcome {
+            Ok(()) => {
+                self.refused.remove(&key);
+                self.accepted.insert(relay_url, target.clone());
+                Ok(())
+            }
+            Err(err) => {
+                if err.is_terminal_refusal() {
+                    self.refused
+                        .insert(key, Refused::Registration(target.routing_ids.clone()));
+                }
+                if err.relay_holds_nothing() {
+                    self.accepted.remove(&relay_url);
+                    let token = self.token.clone();
+                    self.forget_after_refusal(&relay_url, &token, &err).await;
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// Applies one deregistration outcome of `token`: an accepted
+    /// deregistration removes the relay from the ledger, and the ledger
+    /// delete's failure becomes the relay's outcome, so the deregistration is
+    /// retried.
+    async fn settle_deregistration(
+        &mut self,
+        relay_url: &str,
+        token: &PushToken,
+        outcome: Result<(), PushError>,
+    ) -> Result<(), PushError> {
+        let key = (relay_url.to_owned(), token_hash(token));
+        let current = *token == self.token;
+        match outcome {
+            Ok(()) => {
+                self.refused.remove(&key);
+                if current {
+                    self.accepted.remove(relay_url);
+                }
+                self.forget_relay(relay_url, token).await
+            }
+            Err(err) => {
+                if err.is_terminal_refusal() {
+                    self.refused.insert(key, Refused::Deregistration);
+                }
+                if err.relay_holds_nothing() {
+                    if current {
+                        self.accepted.remove(relay_url);
+                    }
+                    self.forget_after_refusal(relay_url, token, &err).await;
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// Removes a relay that showed it holds nothing from the ledger. The
+    /// relay's refusal stays the outcome; a failed delete leaves the record,
+    /// which only costs a later deregistration the relay accepts, and is
+    /// logged.
+    async fn forget_after_refusal(
+        &mut self,
+        relay_url: &str,
+        token: &PushToken,
+        refusal: &PushError,
+    ) {
+        if let Err(err) = self.forget_relay(relay_url, token).await {
+            tracing::warn!(
+                relay_url = %relay_url,
+                refusal = %refusal,
+                error = %err,
+                "push registrar: the relay holds no registration, but its ledger record stays"
+            );
+        }
     }
 
     async fn prepare_registration(&mut self, target: &PushTarget) -> Result<Prepared, PushError> {
         refuse_tier3(&target.relay)?;
         let relay_url = target.relay.canonical_url().to_owned();
+        self.record_relay(&relay_url).await?;
         let token = self.token.clone();
         let timestamp = self.next_timestamp(&relay_url, &token).await?;
         let mut message = PushRegistration {
             registrant: self.signing_key.registrant().clone(),
             platform: self.platform,
-            token,
+            token: token.as_bytes().to_vec(),
             routing_ids: target.routing_ids.iter().copied().collect(),
             timestamp,
             signature: [0; SIGNATURE_LEN],
@@ -664,15 +967,16 @@ impl<C: KeyCustody> PushRegistrar<C> {
     async fn prepare_deregistration(
         &mut self,
         relay: &PushRelay,
-        token: &[u8],
+        platform: PushPlatform,
+        token: &PushToken,
     ) -> Result<Prepared, PushError> {
         refuse_tier3(relay)?;
         let relay_url = relay.canonical_url().to_owned();
         let timestamp = self.next_timestamp(&relay_url, token).await?;
         let mut message = PushDeregistration {
             registrant: self.signing_key.registrant().clone(),
-            platform: self.platform,
-            token: token.to_vec(),
+            platform,
+            token: token.as_bytes().to_vec(),
             timestamp,
             signature: [0; SIGNATURE_LEN],
         };
@@ -688,20 +992,24 @@ impl<C: KeyCustody> PushRegistrar<C> {
     async fn deregister_token(
         &mut self,
         relays: &[PushRelay],
-        token: &[u8],
+        platform: PushPlatform,
+        token: &PushToken,
     ) -> Result<RelayResults, PushError> {
         refuse_duplicates(relays.iter())?;
         let mut results = RelayResults::new();
         let mut prepared = Vec::with_capacity(relays.len());
         for relay in relays {
-            match self.prepare_deregistration(relay, token).await {
+            match self.prepare_deregistration(relay, platform, token).await {
                 Ok(message) => prepared.push(message),
                 Err(err) => {
                     results.insert(relay.canonical_url().to_owned(), Err(err));
                 }
             }
         }
-        results.extend(self.publish_all(prepared).await);
+        for (relay_url, outcome) in self.publish_all(prepared).await {
+            let outcome = self.settle_deregistration(&relay_url, token, outcome).await;
+            results.insert(relay_url, outcome);
+        }
         Ok(results)
     }
 
@@ -728,8 +1036,17 @@ impl<C: KeyCustody> PushRegistrar<C> {
     /// for the key (§10.7.1 **Freshness**). When the clock still reads the
     /// last second, the registrar waits for the next one; it never sends a
     /// second ahead of its clock, which the relay's skew check would refuse.
-    async fn next_timestamp(&mut self, relay_url: &str, token: &[u8]) -> Result<u64, PushError> {
-        let key = (relay_url.to_owned(), token.to_vec());
+    ///
+    /// An entry is pruned only once it is more than the skew window behind
+    /// the clock: the relay refuses a timestamp that old in any case, so the
+    /// entry no longer stops a clock that stepped back from sending a
+    /// timestamp at or below one the relay holds.
+    async fn next_timestamp(
+        &mut self,
+        relay_url: &str,
+        token: &PushToken,
+    ) -> Result<u64, PushError> {
+        let key = (relay_url.to_owned(), token_hash(token));
         let mut waits = 0;
         loop {
             let now = self.clock.now_secs();
@@ -743,7 +1060,8 @@ impl<C: KeyCustody> PushRegistrar<C> {
                     tokio::time::sleep(Duration::from_millis(1000 - into_second)).await;
                 }
                 _ => {
-                    self.last_timestamp.retain(|_, last| *last >= now);
+                    self.last_timestamp
+                        .retain(|_, last| last.saturating_add(PUSH_TIMESTAMP_SKEW_SECS) >= now);
                     self.last_timestamp.insert(key, now);
                     return Ok(now);
                 }
@@ -753,32 +1071,41 @@ impl<C: KeyCustody> PushRegistrar<C> {
 
     async fn run(mut self, supervisor: Arc<Supervisor>, mut triggers: Triggers) {
         let mut pending = true;
-        let mut failures = 0usize;
-        let mut retry: Option<Pin<Box<tokio::time::Sleep>>> = None;
+        let mut backoff = Backoff::default();
         let mut commands_open = true;
         loop {
             if pending {
                 pending = false;
-                retry = None;
                 triggers.drain();
                 let failed = tokio::select! {
                     biased;
                     () = triggers.shutdown.cancelled() => return,
                     failed = self.reconcile_and_log(&supervisor) => failed,
                 };
-                if failed {
-                    retry = Some(Box::pin(tokio::time::sleep(backoff_delay(failures))));
-                    failures = failures.saturating_add(1);
-                } else {
-                    failures = 0;
-                }
+                backoff.settle(failed);
             }
             tokio::select! {
                 biased;
                 () = triggers.shutdown.cancelled() => return,
-                () = wait_for_retry(&mut retry) => pending = true,
+                () = backoff.wait() => pending = true,
                 command = triggers.commands.recv(), if commands_open => match command {
-                    Some(command) => self.handle_command(command).await,
+                    Some(command) => {
+                        let failed = tokio::select! {
+                            biased;
+                            () = triggers.shutdown.cancelled() => return,
+                            failed = self.handle_command(command, &supervisor) => failed,
+                        };
+                        // A command can leave relays out of line (a refresh
+                        // re-registers only accepted relays, a step can
+                        // fail), and `reconcile` is diff-based: retry after
+                        // the backoff when a relay failed retryably, else
+                        // reconcile now.
+                        if failed {
+                            backoff.settle(true);
+                        } else {
+                            pending = true;
+                        }
+                    }
                     None => commands_open = false,
                 },
                 changed = triggers.routes.changed() => {
@@ -788,14 +1115,6 @@ impl<C: KeyCustody> PushRegistrar<C> {
                     }
                     pending = true;
                 }
-                event = triggers.events.recv() => match event {
-                    Ok((_, event)) => pending |= is_route_hint(&event),
-                    Err(broadcast::error::RecvError::Lagged(_)) => pending = true,
-                    Err(broadcast::error::RecvError::Closed) => {
-                        tracing::warn!("push registrar: the context-event channel closed; stopping");
-                        return;
-                    }
-                },
             }
         }
     }
@@ -803,64 +1122,143 @@ impl<C: KeyCustody> PushRegistrar<C> {
     /// Runs one reconcile and logs every failure. Returns whether a retryable
     /// failure calls for a retry.
     async fn reconcile_and_log(&mut self, supervisor: &Supervisor) -> bool {
-        match self.reconcile(supervisor).await {
-            Err(err) => {
-                tracing::warn!(error = %err, retryable = err.retryable(), "push registrar: reconcile failed");
-                err.retryable()
+        let outcome = self.reconcile(supervisor).await;
+        log_outcome("reconcile", &outcome)
+    }
+
+    /// Runs one command and answers it. Returns whether a relay failed
+    /// retryably.
+    async fn handle_command(&mut self, command: RegistrarCommand, supervisor: &Supervisor) -> bool {
+        let (outcome, reply) = match command {
+            RegistrarCommand::RefreshToken { token, reply } => {
+                (self.refresh_token(token).await, reply)
             }
-            Ok(results) => {
-                let mut retry = false;
-                for (relay_url, outcome) in &results {
-                    if let Err(err) = outcome {
-                        tracing::warn!(
-                            relay_url = %relay_url,
-                            error = %err,
-                            retryable = err.retryable(),
-                            "push registrar: relay did not take the push message"
-                        );
-                        retry |= err.retryable();
-                    }
-                }
-                retry
+            RegistrarCommand::DeregisterAll { reply } => {
+                self.enabled = false;
+                (self.reconcile(supervisor).await, reply)
             }
+            RegistrarCommand::Register { reply } => {
+                self.enabled = true;
+                (self.reconcile(supervisor).await, reply)
+            }
+        };
+        let failed = log_outcome("command", &outcome);
+        if reply.send(outcome).is_err() {
+            tracing::debug!("push registrar: the command's caller went away");
+        }
+        failed
+    }
+}
+
+/// Logs every failure in `outcome`. Returns whether one is retryable.
+fn log_outcome(operation: &str, outcome: &Result<RelayOutcomes, PushError>) -> bool {
+    match outcome {
+        Err(err) => {
+            tracing::warn!(operation, error = %err, retryable = err.retryable(), "push registrar: operation failed");
+            err.retryable()
+        }
+        Ok(outcomes) => {
+            let mut retry = false;
+            for (relay_url, err) in outcomes.failures() {
+                tracing::warn!(
+                    operation,
+                    relay_url = %relay_url,
+                    error = %err,
+                    retryable = err.retryable(),
+                    "push registrar: relay did not take the push message"
+                );
+                retry |= err.retryable();
+            }
+            retry
+        }
+    }
+}
+
+/// Inserts `outcome` for `relay_url`, keeping an earlier failure: one relay
+/// can get two deregistrations in one operation (one per recorded token), and
+/// its entry reports the failure when either failed.
+fn merge_outcome(results: &mut RelayResults, relay_url: String, outcome: Result<(), PushError>) {
+    match results.get(&relay_url) {
+        Some(Err(_)) => {}
+        _ => {
+            results.insert(relay_url, outcome);
+        }
+    }
+}
+
+/// Groups `relays` by platform, one group per platform, each naming a relay
+/// once.
+fn by_platform(relays: Vec<(PushRelay, PushPlatform)>) -> Vec<(PushPlatform, Vec<PushRelay>)> {
+    let mut groups: Vec<(PushPlatform, Vec<PushRelay>)> = Vec::new();
+    for (relay, platform) in relays {
+        match groups.iter_mut().find(|(p, _)| *p == platform) {
+            Some((_, group)) => group.push(relay),
+            None => groups.push((platform, vec![relay])),
+        }
+    }
+    groups
+}
+
+/// The ADR-004 retry timer of the registrar task.
+#[derive(Default)]
+struct Backoff {
+    failures: usize,
+    retry: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl Backoff {
+    /// Arms the next retry after a retryable failure; clears the timer and
+    /// the failure count after a clean pass.
+    fn settle(&mut self, failed: bool) {
+        if failed {
+            self.retry = Some(Box::pin(tokio::time::sleep(backoff_delay(self.failures))));
+            self.failures = self.failures.saturating_add(1);
+        } else {
+            self.retry = None;
+            self.failures = 0;
         }
     }
 
-    async fn handle_command(&mut self, command: RegistrarCommand) {
-        match command {
-            RegistrarCommand::RefreshToken { token, reply } => {
-                let outcome = self.refresh_token(token).await;
-                if reply.send(outcome).is_err() {
-                    tracing::debug!("push registrar: token refresh caller went away");
-                }
+    /// Completes when the armed retry is due; never when none is armed. The
+    /// timer is consumed, so the retry fires once.
+    async fn wait(&mut self) {
+        match self.retry.as_mut() {
+            Some(sleep) => {
+                sleep.as_mut().await;
+                self.retry = None;
             }
+            None => std::future::pending().await,
         }
     }
 }
 
 /// The trigger sources of the registrar task.
 struct Triggers {
-    events: broadcast::Receiver<(String, ContextEvent)>,
     routes: watch::Receiver<u64>,
     commands: mpsc::Receiver<RegistrarCommand>,
     shutdown: CancellationToken,
 }
 
 impl Triggers {
-    /// Marks every queued trigger seen. The reconcile that follows reads the
-    /// routes after this point, so it covers each of them; a trigger that
-    /// arrives during it starts another reconcile.
+    /// Marks the route watch seen. The reconcile that follows reads the
+    /// routes after this point, so it covers every earlier change; a change
+    /// during it starts another reconcile.
     fn drain(&mut self) {
         self.routes.borrow_and_update();
-        while let Ok(_) | Err(broadcast::error::TryRecvError::Lagged(_)) = self.events.try_recv() {}
     }
 }
 
 /// A command to the registrar task.
 enum RegistrarCommand {
     RefreshToken {
-        token: Vec<u8>,
-        reply: oneshot::Sender<Result<TokenRefresh, PushError>>,
+        token: PushToken,
+        reply: oneshot::Sender<Result<RelayOutcomes, PushError>>,
+    },
+    DeregisterAll {
+        reply: oneshot::Sender<Result<RelayOutcomes, PushError>>,
+    },
+    Register {
+        reply: oneshot::Sender<Result<RelayOutcomes, PushError>>,
     },
 }
 
@@ -877,10 +1275,46 @@ impl PushRegistrarTask {
     ///
     /// [`PushError::RegistrarStopped`] when the task has stopped, and every
     /// error of [`PushRegistrar::refresh_token`].
-    pub async fn refresh_token(&self, token: Vec<u8>) -> Result<TokenRefresh, PushError> {
+    pub async fn refresh_token(&self, token: PushToken) -> Result<RelayOutcomes, PushError> {
+        self.send(|reply| RegistrarCommand::RefreshToken { token, reply })
+            .await
+    }
+
+    /// Deregisters the token at every relay the ledger lists and stops
+    /// registering: until [`Self::register`], every reconcile wants no
+    /// routing ID, so a relay whose deregistration failed is sent it again
+    /// and a relay that accepts it leaves the ledger.
+    ///
+    /// # Errors
+    ///
+    /// [`PushError::RegistrarStopped`] when the task has stopped. Each
+    /// relay's failure is its entry in the result.
+    pub async fn deregister_all(&self) -> Result<RelayOutcomes, PushError> {
+        self.send(|reply| RegistrarCommand::DeregisterAll { reply })
+            .await
+    }
+
+    /// Resumes registering after [`Self::deregister_all`] and reconciles at
+    /// once. A registrar starts registering, so this is needed only after a
+    /// [`Self::deregister_all`].
+    ///
+    /// # Errors
+    ///
+    /// [`PushError::RegistrarStopped`] when the task has stopped, and
+    /// [`PushError::Routes`] when the routing-ID query fails. Each relay's
+    /// failure is its entry in the result.
+    pub async fn register(&self) -> Result<RelayOutcomes, PushError> {
+        self.send(|reply| RegistrarCommand::Register { reply })
+            .await
+    }
+
+    async fn send(
+        &self,
+        command: impl FnOnce(oneshot::Sender<Result<RelayOutcomes, PushError>>) -> RegistrarCommand,
+    ) -> Result<RelayOutcomes, PushError> {
         let (reply, answer) = oneshot::channel();
         self.commands
-            .send(RegistrarCommand::RefreshToken { token, reply })
+            .send(command(reply))
             .await
             .map_err(|_| PushError::RegistrarStopped)?;
         answer.await.map_err(|_| PushError::RegistrarStopped)?
@@ -893,33 +1327,10 @@ impl PushRegistrarTask {
     }
 }
 
-/// Whether `event` can change this device's routing IDs without adding or
-/// removing a context actor: a join or leave (a join can set this device's
-/// pseudonym), and a close, expiry or tombstone (the actor stays and adds no
-/// routes). A member event that changes nothing costs one routing-ID query
-/// and publishes nothing, because [`PushRegistrar::reconcile`] compares sets.
-const fn is_route_hint(event: &ContextEvent) -> bool {
-    matches!(
-        event,
-        ContextEvent::MemberJoined { .. }
-            | ContextEvent::MemberLeft { .. }
-            | ContextEvent::SystemClose { .. }
-            | ContextEvent::Expired
-            | ContextEvent::ContextTombstoned { .. }
-    )
-}
-
 /// The ADR-004 delay before retry number `failures + 1`.
 fn backoff_delay(failures: usize) -> Duration {
     let index = failures.min(BACKOFF_SECS.len() - 1);
     Duration::from_secs(BACKOFF_SECS[index])
-}
-
-async fn wait_for_retry(retry: &mut Option<Pin<Box<tokio::time::Sleep>>>) {
-    match retry {
-        Some(sleep) => sleep.as_mut().await,
-        None => std::future::pending().await,
-    }
 }
 
 fn refuse_tier3(relay: &PushRelay) -> Result<(), PushError> {

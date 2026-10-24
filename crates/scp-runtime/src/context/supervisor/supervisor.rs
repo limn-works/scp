@@ -3267,20 +3267,22 @@ impl Supervisor {
             .map(tokio::sync::broadcast::Sender::subscribe)
     }
 
-    /// A receiver that changes each time a context actor is added or
-    /// removed, so a holder re-reads [`Self::push_routing_ids`]
-    /// (`10-infrastructure-and-self-hosting.md` §10.7.1 **Re-registration**).
-    /// The value is a wrapping count and carries no other meaning. Closing,
-    /// expiring or tombstoning a context keeps its actor, so those changes
-    /// arrive as a [`ContextEvent`] from [`Self::subscribe_events`] instead.
+    /// A receiver that changes each time the output of
+    /// [`Self::push_routing_ids`] can have changed, so a holder re-reads it
+    /// (`10-infrastructure-and-self-hosting.md` §10.7.1 **Re-registration**):
+    /// when a context actor is added or removed, and when a running actor's
+    /// push routes change (a join or leave, a local pseudonym rotation, a
+    /// close, an expiry or a tombstone). The value is a wrapping count and
+    /// carries no other meaning.
     #[must_use]
     pub fn push_routes_changed(&self) -> tokio::sync::watch::Receiver<u64> {
         self.push_routes_tx.subscribe()
     }
 
     /// Wakes every [`Self::push_routes_changed`] receiver. Called after each
-    /// insert into and removal from `actors`.
-    fn note_push_routes_changed(&self) {
+    /// insert into and removal from `actors`, and by an actor whose push
+    /// routes changed.
+    pub(in crate::context) fn note_push_routes_changed(&self) {
         self.push_routes_tx
             .send_modify(|count| *count = count.wrapping_add(1));
     }

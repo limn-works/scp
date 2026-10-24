@@ -259,8 +259,10 @@ pub trait TransportAdapter: Send + Sync {
     /// # Errors
     ///
     /// Returns [`TransportError::NotConnected`] if the adapter has no active
-    /// connection, [`TransportError::SendFailed`] if the publish fails, or
-    /// [`TransportError::NotSupported`] for transports without a raw-blob path.
+    /// connection, [`TransportError::RelayRejected`] with the relay's code
+    /// and text if the relay answers `ERR`, [`TransportError::SendFailed`] if
+    /// the publish fails before an answer, or [`TransportError::NotSupported`]
+    /// for transports without a raw-blob path.
     fn publish_raw(
         &self,
         routing_id: &RoutingId,

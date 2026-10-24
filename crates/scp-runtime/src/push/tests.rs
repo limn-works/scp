@@ -6,11 +6,13 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use scp_platform::KeyType;
+use scp_platform::in_memory::InMemoryStorage;
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_protocol::context::membership::KeyPackage;
 
 use super::*;
 use crate::context::ContextHandle;
+use crate::context::supervisor::faulty_storage::FaultyStorage;
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -24,6 +26,8 @@ const CTX_B: [u8; 32] = [0xB0; 32];
 const PSEUDONYM_A: [u8; 32] = [0xA1; 32];
 const PSEUDONYM_A_NEW: [u8; 32] = [0xA2; 32];
 const PSEUDONYM_B: [u8; 32] = [0xB1; 32];
+const CTX_C: [u8; 32] = [0xC0; 32];
+const PSEUDONYM_C: [u8; 32] = [0xC1; 32];
 /// How long a test waits for a publish that must come.
 const ARRIVAL: Duration = Duration::from_secs(20);
 /// How long a test watches for a publish that must not come.
@@ -112,17 +116,34 @@ async fn signing_key() -> Result<PushSigningKey<InMemoryKeyCustody>, Box<dyn Err
     Ok(PushSigningKey::for_testing(DID(REGISTRANT.to_owned()), custody, handle).await?)
 }
 
+type Ledger = Arc<ProtocolRepository<InMemoryStorage>>;
+
+fn ledger() -> Ledger {
+    Arc::new(ProtocolRepository::new_for_testing(InMemoryStorage::new()))
+}
+
 async fn registrar(
     publisher: Arc<dyn PushRelayPublisher>,
     clock: Arc<dyn Clock>,
-) -> Result<PushRegistrar<InMemoryKeyCustody>, Box<dyn Error>> {
+) -> Result<PushRegistrar<InMemoryKeyCustody, InMemoryStorage>, Box<dyn Error>> {
+    registrar_on(publisher, clock, ledger()).await
+}
+
+async fn registrar_on<S: Storage>(
+    publisher: Arc<dyn PushRelayPublisher>,
+    clock: Arc<dyn Clock>,
+    storage: Arc<ProtocolRepository<S>>,
+) -> Result<PushRegistrar<InMemoryKeyCustody, S>, Box<dyn Error>> {
+    let signing_key = signing_key().await?;
     Ok(PushRegistrar::new(PushRegistrarConfig {
-        signing_key: signing_key().await?,
+        signing_key,
         publisher,
         clock,
         platform: PushPlatform::Apns,
-        token: TOKEN.to_vec(),
-    })?)
+        token: PushToken::new(TOKEN.to_vec()),
+        storage,
+    })
+    .await?)
 }
 
 fn system_clock() -> Arc<dyn Clock> {
@@ -158,9 +179,8 @@ impl crate::context::builder::ContextEventLogProvider for NoEventLog {
     }
 }
 
-/// A supervisor with real context actors and, when `events` holds, a
-/// context-event channel.
-fn supervisor(events: bool) -> Arc<Supervisor> {
+/// A supervisor with real context actors and a context-event channel.
+fn supervisor() -> Arc<Supervisor> {
     let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
         "did:dht:z6MkPushRegistrarNode".to_owned(),
         system_clock(),
@@ -177,7 +197,7 @@ fn supervisor(events: bool) -> Arc<Supervisor> {
         Arc::new(|_: &DID, _: scp_did::SigningKeyId| None),
         None,
         None,
-        events.then(|| broadcast::channel(256).0),
+        Some(tokio::sync::broadcast::channel(256).0),
         None,
         mls_storage,
     )
@@ -276,7 +296,7 @@ fn target(url: &str, ids: &[[u8; 32]]) -> Result<PushTarget, Box<dyn Error>> {
 }
 
 // ---------------------------------------------------------------------------
-// Criterion 4: re-registration on join, nothing on an unchanged set
+// Criterion 2: re-registration on join, nothing on an unchanged set
 // ---------------------------------------------------------------------------
 
 /// A join that sets this device's pseudonym in a context on relay A changes
@@ -284,14 +304,14 @@ fn target(url: &str, ids: &[[u8; 32]]) -> Result<PushTarget, Box<dyn Error>> {
 /// registration with the new pseudonym and sends relay B nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn join_triggers_exactly_one_reregistration_on_affected_relay() -> TestResult {
-    let sup = supervisor(true);
+    let sup = supervisor();
     let handle_a = create_context(&sup, CTX_A, PSEUDONYM_A, &[RELAY_A]).await?;
     create_context(&sup, CTX_B, PSEUDONYM_B, &[RELAY_B]).await?;
     let (sink, mut rx) = publisher(system_clock(), accept_all());
     let registrar = registrar(sink, system_clock()).await?;
     let public_key = *registrar.signing_key.public_key();
     let shutdown = CancellationToken::new();
-    let task = registrar.spawn_trigger(Arc::clone(&sup), shutdown.clone())?;
+    let task = registrar.spawn_trigger(Arc::clone(&sup), shutdown.clone());
 
     let initial = expect_publishes(&mut rx, 2).await?;
     assert_eq!(
@@ -322,13 +342,13 @@ async fn join_triggers_exactly_one_reregistration_on_affected_relay() -> TestRes
 /// trigger task publishes nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn foreign_member_join_triggers_no_publish() -> TestResult {
-    let sup = supervisor(true);
+    let sup = supervisor();
     let handle_a = create_context(&sup, CTX_A, PSEUDONYM_A, &[RELAY_A]).await?;
     create_context(&sup, CTX_B, PSEUDONYM_B, &[RELAY_B]).await?;
     let (sink, mut rx) = publisher(system_clock(), accept_all());
     let registrar = registrar(sink, system_clock()).await?;
     let shutdown = CancellationToken::new();
-    let task = registrar.spawn_trigger(Arc::clone(&sup), shutdown.clone())?;
+    let task = registrar.spawn_trigger(Arc::clone(&sup), shutdown.clone());
     expect_publishes(&mut rx, 2).await?;
 
     Box::pin(sup.join_context(
@@ -345,15 +365,65 @@ async fn foreign_member_join_triggers_no_publish() -> TestResult {
     Ok(())
 }
 
+/// A context created after the task started reaches the registrar through
+/// the route watch alone: its relay gets exactly one registration, holding
+/// the context's pseudonym, and the other relay nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn context_created_after_start_registers_once() -> TestResult {
+    let sup = supervisor();
+    create_context(&sup, CTX_A, PSEUDONYM_A, &[RELAY_A]).await?;
+    let (sink, mut rx) = publisher(system_clock(), accept_all());
+    let registrar = registrar(sink, system_clock()).await?;
+    let public_key = *registrar.signing_key.public_key();
+    let shutdown = CancellationToken::new();
+    let task = registrar.spawn_trigger(Arc::clone(&sup), shutdown.clone());
+    expect_publishes(&mut rx, 1).await?;
+
+    create_context(&sup, CTX_B, PSEUDONYM_B, &[RELAY_B]).await?;
+    let after = expect_publishes(&mut rx, 1).await?;
+    assert_eq!(after[0].relay_url, RELAY_B, "only the new context's relay");
+    let registration = verified_registration(&after[0], &public_key)?;
+    assert!(registration.routing_ids.contains(&PSEUDONYM_B));
+
+    shutdown.cancel();
+    tokio::time::timeout(ARRIVAL, task.into_join_handle()).await??;
+    Ok(())
+}
+
+/// `discard_joined_context` after the task started removes the device's
+/// last context on relay A, and relay A gets a deregistration.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn discard_joined_context_after_start_deregisters() -> TestResult {
+    let sup = supervisor();
+    create_context(&sup, CTX_A, PSEUDONYM_A, &[RELAY_A]).await?;
+    create_context(&sup, CTX_B, PSEUDONYM_B, &[RELAY_B]).await?;
+    let (sink, mut rx) = publisher(system_clock(), accept_all());
+    let registrar = registrar(sink, system_clock()).await?;
+    let public_key = *registrar.signing_key.public_key();
+    let shutdown = CancellationToken::new();
+    let task = registrar.spawn_trigger(Arc::clone(&sup), shutdown.clone());
+    expect_publishes(&mut rx, 2).await?;
+
+    assert!(sup.discard_joined_context(&hex::encode(CTX_A)).await?);
+    let after = expect_publishes(&mut rx, 1).await?;
+    assert_eq!(after[0].relay_url, RELAY_A);
+    let deregistration = verified_deregistration(&after[0], &public_key)?;
+    assert_eq!(deregistration.token, TOKEN);
+
+    shutdown.cancel();
+    tokio::time::timeout(ARRIVAL, task.into_join_handle()).await??;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
-// Criterion 5: no context ID on the wire or in the preimage
+// Criterion 3: no context ID on the wire or in the preimage
 // ---------------------------------------------------------------------------
 
 /// The registration and its preimage carry the context's routing ID and the
 /// device's pseudonym, never the context ID in raw or hex form.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn preimage_contains_no_context_id() -> TestResult {
-    let sup = supervisor(true);
+    let sup = supervisor();
     create_context(&sup, CTX_A, PSEUDONYM_A, &[RELAY_A]).await?;
     let (sink, mut rx) = publisher(system_clock(), accept_all());
     let mut registrar = registrar(sink, system_clock()).await?;
@@ -361,7 +431,7 @@ async fn preimage_contains_no_context_id() -> TestResult {
 
     let results = registrar.reconcile(&sup).await?;
     assert!(
-        results.get(RELAY_A).is_some_and(Result::is_ok),
+        results.registered.get(RELAY_A).is_some_and(Result::is_ok),
         "{results:?}"
     );
     let published = expect_publishes(&mut rx, 1).await?;
@@ -390,7 +460,7 @@ async fn preimage_contains_no_context_id() -> TestResult {
 }
 
 // ---------------------------------------------------------------------------
-// Criterion 7: bridge_target and tier 3
+// Criterion 5: bridge_target and tier 3
 // ---------------------------------------------------------------------------
 
 /// A relay that is not a tier 3 entry signs `bridge_target` = SHA-256(0x00),
@@ -461,7 +531,7 @@ async fn tier3_relay_is_refused_without_publish() -> TestResult {
 }
 
 // ---------------------------------------------------------------------------
-// Criteria 8 and 9: deregistration, last context, token refresh
+// Criteria 6 and 7: deregistration, last context, token refresh
 // ---------------------------------------------------------------------------
 
 /// `deregister` sends each relay a deregistration signed over that relay's
@@ -475,7 +545,7 @@ async fn deregister_mirrors_register() -> TestResult {
         .register(&[target(RELAY_A, &[[1; 32]])?, target(RELAY_B, &[[2; 32]])?])
         .await?;
     let registrations = expect_publishes(&mut rx, 2).await?;
-    assert_eq!(registrar.registered.len(), 2);
+    assert_eq!(registrar.accepted.len(), 2);
 
     let results = registrar
         .deregister(&[PushRelay::direct(RELAY_A)?, PushRelay::direct(RELAY_B)?])
@@ -495,7 +565,7 @@ async fn deregister_mirrors_register() -> TestResult {
         let registration = PushRegistration::from_msgpack(&registered.blob)?;
         assert!(deregistration.timestamp > registration.timestamp);
     }
-    assert!(registrar.registered.is_empty(), "both relays are forgotten");
+    assert!(registrar.accepted.is_empty(), "both relays are forgotten");
     Ok(())
 }
 
@@ -503,14 +573,14 @@ async fn deregister_mirrors_register() -> TestResult {
 /// sends relay A a deregistration and no registration, and relay B nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn leaving_last_context_on_relay_deregisters() -> TestResult {
-    let sup = supervisor(true);
+    let sup = supervisor();
     create_context(&sup, CTX_A, PSEUDONYM_A, &[RELAY_A]).await?;
     create_context(&sup, CTX_B, PSEUDONYM_B, &[RELAY_B]).await?;
     let (sink, mut rx) = publisher(system_clock(), accept_all());
     let registrar = registrar(sink, system_clock()).await?;
     let public_key = *registrar.signing_key.public_key();
     let shutdown = CancellationToken::new();
-    let task = registrar.spawn_trigger(Arc::clone(&sup), shutdown.clone())?;
+    let task = registrar.spawn_trigger(Arc::clone(&sup), shutdown.clone());
     expect_publishes(&mut rx, 2).await?;
 
     assert!(sup.despawn_actor(&hex::encode(CTX_A)).await);
@@ -536,7 +606,9 @@ async fn token_refresh_deregisters_old_then_registers_new() -> TestResult {
         .await?;
     expect_publishes(&mut rx, 2).await?;
 
-    let refresh = registrar.refresh_token(NEW_TOKEN.to_vec()).await?;
+    let refresh = registrar
+        .refresh_token(PushToken::new(NEW_TOKEN.to_vec()))
+        .await?;
     assert!(
         refresh.deregistered.values().all(Result::is_ok),
         "{refresh:?}"
@@ -559,11 +631,12 @@ async fn token_refresh_deregisters_old_then_registers_new() -> TestResult {
         assert_eq!(registration.routing_ids, vec![ids]);
     }
     assert!(matches!(
-        registrar.refresh_token(Vec::new()).await,
+        registrar.refresh_token(PushToken::new(Vec::new())).await,
         Err(PushError::Message(PushMessageError::EmptyToken))
     ));
     assert_eq!(
-        registrar.token, NEW_TOKEN,
+        registrar.token.as_bytes(),
+        NEW_TOKEN,
         "a refused refresh keeps the token"
     );
     Ok(())
@@ -590,7 +663,7 @@ async fn duplicate_relay_is_refused_before_publish() -> TestResult {
 }
 
 // ---------------------------------------------------------------------------
-// Criterion 10: wire codes
+// Criterion 8: wire codes
 // ---------------------------------------------------------------------------
 
 /// Each relay code maps to its own variant; 5003, 5004, other 5xxx codes and
@@ -674,14 +747,14 @@ async fn wire_codes_map_to_typed_errors() -> TestResult {
         "the relay's text is sanitized"
     );
     assert!(
-        registrar.registered.is_empty(),
+        registrar.accepted.is_empty(),
         "no refused relay is recorded"
     );
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// Criterion 11: clock-bounded timestamps
+// Criterion 9: clock-bounded timestamps
 // ---------------------------------------------------------------------------
 
 /// A clock that reads tokio's (pausable) time, starting mid-second.
@@ -776,15 +849,42 @@ async fn clock_behind_last_timestamp_is_refused() -> TestResult {
     Ok(())
 }
 
+/// An entry that is within the skew window stays when another relay's send
+/// prunes the map: after the clock steps back 5 s, a message to the first
+/// relay is refused with `ClockBehind` rather than sent with a timestamp at
+/// or below one the relay holds.
+#[tokio::test]
+async fn clock_step_back_within_skew_window_is_refused() -> TestResult {
+    const T: u64 = 1_700_000_100;
+    let seconds = Arc::new(AtomicU64::new(T));
+    let clock: Arc<dyn Clock> = Arc::new(StepClock(Arc::clone(&seconds)));
+    let (sink, mut rx) = publisher(Arc::clone(&clock), accept_all());
+    let mut registrar = registrar(sink, clock).await?;
+    registrar.register(&[target(RELAY_A, &[[1; 32]])?]).await?;
+    seconds.store(T + 1, Ordering::SeqCst);
+    registrar.register(&[target(RELAY_B, &[[1; 32]])?]).await?;
+    expect_publishes(&mut rx, 2).await?;
+
+    seconds.store(T - 4, Ordering::SeqCst);
+    let results = registrar.register(&[target(RELAY_A, &[[2; 32]])?]).await?;
+    let outcome = results.get(RELAY_A).ok_or("no result")?;
+    assert!(
+        matches!(outcome, Err(PushError::ClockBehind { now, last }) if *now == T - 4 && *last == T),
+        "{outcome:?}"
+    );
+    expect_quiet(&mut rx).await?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
-// Criterion 13: a failed routing-ID query publishes nothing
+// Criterion 11: a failed routing-ID query publishes nothing
 // ---------------------------------------------------------------------------
 
 /// A poisoned context fails the routing-ID query; `reconcile` returns the
 /// error and publishes nothing, not even for the healthy context's relay.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn routes_failure_publishes_nothing() -> TestResult {
-    let sup = supervisor(true);
+    let sup = supervisor();
     create_context(&sup, CTX_A, PSEUDONYM_A, &[RELAY_A]).await?;
     create_context(&sup, CTX_B, PSEUDONYM_B, &[RELAY_B]).await?;
     sup.test_poison_context(&hex::encode(CTX_B)).await;
@@ -797,12 +897,12 @@ async fn routes_failure_publishes_nothing() -> TestResult {
         "{result:?}"
     );
     expect_quiet(&mut rx).await?;
-    assert!(registrar.registered.is_empty());
+    assert!(registrar.accepted.is_empty());
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// Criterion 12: P-256 only
+// Criterion 10: P-256 only
 // ---------------------------------------------------------------------------
 
 /// An Ed25519 handle and a P-256 key-agreement handle are both refused.
@@ -837,7 +937,7 @@ fn backoff_follows_adr_004() {
 /// third attempt's success ends the retries.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn trigger_retries_retryable_failure_with_backoff() -> TestResult {
-    let sup = supervisor(true);
+    let sup = supervisor();
     create_context(&sup, CTX_A, PSEUDONYM_A, &[RELAY_A]).await?;
     let answer: Answer = Box::new(|_, attempt| {
         if attempt < 2 {
@@ -852,7 +952,7 @@ async fn trigger_retries_retryable_failure_with_backoff() -> TestResult {
     let (sink, mut rx) = publisher(system_clock(), answer);
     let registrar = registrar(sink, system_clock()).await?;
     let shutdown = CancellationToken::new();
-    let task = registrar.spawn_trigger(Arc::clone(&sup), shutdown.clone())?;
+    let task = registrar.spawn_trigger(Arc::clone(&sup), shutdown.clone());
 
     let attempts = expect_publishes(&mut rx, 3).await?;
     let first_gap = attempts[1].at.duration_since(attempts[0].at);
@@ -874,7 +974,7 @@ async fn trigger_retries_retryable_failure_with_backoff() -> TestResult {
 /// A 4060 is never retried, and a stopped task refuses commands.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn trigger_does_not_retry_4xxx_and_stops_on_shutdown() -> TestResult {
-    let sup = supervisor(true);
+    let sup = supervisor();
     create_context(&sup, CTX_A, PSEUDONYM_A, &[RELAY_A]).await?;
     let answer: Answer = Box::new(|_, _| {
         Err(PushPublishError::Rejected {
@@ -885,7 +985,7 @@ async fn trigger_does_not_retry_4xxx_and_stops_on_shutdown() -> TestResult {
     let (sink, mut rx) = publisher(system_clock(), answer);
     let registrar = registrar(sink, system_clock()).await?;
     let shutdown = CancellationToken::new();
-    let task = registrar.spawn_trigger(Arc::clone(&sup), shutdown.clone())?;
+    let task = registrar.spawn_trigger(Arc::clone(&sup), shutdown.clone());
 
     tokio::time::timeout(ARRIVAL, rx.recv())
         .await?
@@ -902,7 +1002,7 @@ async fn trigger_does_not_retry_4xxx_and_stops_on_shutdown() -> TestResult {
     let (reply, _answer) = oneshot::channel();
     let refused = commands
         .send(RegistrarCommand::RefreshToken {
-            token: NEW_TOKEN.to_vec(),
+            token: PushToken::new(NEW_TOKEN.to_vec()),
             reply,
         })
         .await;
@@ -913,15 +1013,17 @@ async fn trigger_does_not_retry_4xxx_and_stops_on_shutdown() -> TestResult {
 /// The task runs a token refresh between reconciles.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn trigger_task_runs_token_refresh() -> TestResult {
-    let sup = supervisor(true);
+    let sup = supervisor();
     create_context(&sup, CTX_A, PSEUDONYM_A, &[RELAY_A]).await?;
     let (sink, mut rx) = publisher(system_clock(), accept_all());
     let registrar = registrar(sink, system_clock()).await?;
     let shutdown = CancellationToken::new();
-    let task = registrar.spawn_trigger(Arc::clone(&sup), shutdown.clone())?;
+    let task = registrar.spawn_trigger(Arc::clone(&sup), shutdown.clone());
     expect_publishes(&mut rx, 1).await?;
 
-    let refresh = task.refresh_token(NEW_TOKEN.to_vec()).await?;
+    let refresh = task
+        .refresh_token(PushToken::new(NEW_TOKEN.to_vec()))
+        .await?;
     assert!(refresh.deregistered.get(RELAY_A).is_some_and(Result::is_ok));
     assert!(refresh.registered.get(RELAY_A).is_some_and(Result::is_ok));
     expect_publishes(&mut rx, 2).await?;
@@ -931,12 +1033,360 @@ async fn trigger_task_runs_token_refresh() -> TestResult {
     Ok(())
 }
 
-/// A supervisor with no context-event channel gets no trigger task.
-#[tokio::test]
-async fn spawn_trigger_without_events_fails_closed() -> TestResult {
-    let (sink, _rx) = publisher(system_clock(), accept_all());
+/// A token refresh whose new-token registration fails once with 5003 is
+/// retried by the task after the backoff, with no other trigger.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refresh_retries_a_retryable_registration_failure() -> TestResult {
+    let sup = supervisor();
+    create_context(&sup, CTX_A, PSEUDONYM_A, &[RELAY_A]).await?;
+    // Attempt 0 is the start registration, 1 the old token's
+    // deregistration, 2 the new token's registration.
+    let answer: Answer = Box::new(|_, attempt| {
+        if attempt == 2 {
+            Err(PushPublishError::Rejected {
+                code: code::PUSH_VERIFIER_UNAVAILABLE,
+                msg: String::new(),
+            })
+        } else {
+            Ok(())
+        }
+    });
+    let (sink, mut rx) = publisher(system_clock(), answer);
     let registrar = registrar(sink, system_clock()).await?;
-    let result = registrar.spawn_trigger(supervisor(false), CancellationToken::new());
-    assert!(matches!(result, Err(PushError::EventsUnavailable)));
+    let public_key = *registrar.signing_key.public_key();
+    let shutdown = CancellationToken::new();
+    let task = registrar.spawn_trigger(Arc::clone(&sup), shutdown.clone());
+    expect_publishes(&mut rx, 1).await?;
+
+    let refresh = task
+        .refresh_token(PushToken::new(NEW_TOKEN.to_vec()))
+        .await?;
+    assert!(
+        matches!(
+            refresh.registered.get(RELAY_A),
+            Some(Err(PushError::VerifierUnavailable { .. }))
+        ),
+        "{refresh:?}"
+    );
+    let sent = expect_publishes(&mut rx, 3).await?;
+    assert_eq!(verified_deregistration(&sent[0], &public_key)?.token, TOKEN);
+    assert_eq!(
+        verified_registration(&sent[1], &public_key)?.token,
+        NEW_TOKEN
+    );
+    let retry = verified_registration(&sent[2], &public_key)?;
+    assert_eq!(retry.token, NEW_TOKEN, "the retry registers the new token");
+    assert!(
+        sent[2].at.duration_since(sent[1].at) >= Duration::from_secs(1),
+        "the retry waits for the backoff"
+    );
+
+    shutdown.cancel();
+    tokio::time::timeout(ARRIVAL, task.into_join_handle()).await??;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// ADR-004: a 4xxx refusal is not sent again
+// ---------------------------------------------------------------------------
+
+/// Relay A answers 4063 and relay B 5003. The task's backoff retries reach
+/// relay B only; relay A receives exactly one message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refused_relay_is_not_retried_with_a_retryable_one() -> TestResult {
+    let sup = supervisor();
+    create_context(&sup, CTX_A, PSEUDONYM_A, &[RELAY_A]).await?;
+    create_context(&sup, CTX_B, PSEUDONYM_B, &[RELAY_B]).await?;
+    let answer: Answer = Box::new(|url, _| {
+        let code = if url == RELAY_A {
+            code::PUSH_NOT_SUPPORTED
+        } else {
+            code::PUSH_VERIFIER_UNAVAILABLE
+        };
+        Err(PushPublishError::Rejected {
+            code,
+            msg: String::new(),
+        })
+    });
+    let (sink, mut rx) = publisher(system_clock(), answer);
+    let registrar = registrar(sink, system_clock()).await?;
+    let shutdown = CancellationToken::new();
+    let task = registrar.spawn_trigger(Arc::clone(&sup), shutdown.clone());
+
+    // Retries come after 1 s and 3 s; watch past the second one.
+    let mut seen = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(3_800);
+    while let Ok(Some(next)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+        seen.push(next.relay_url);
+    }
+    let at = |url: &str| seen.iter().filter(|seen| *seen == url).count();
+    assert_eq!(
+        at(RELAY_A),
+        1,
+        "the 4063 relay is sent one message: {seen:?}"
+    );
+    assert!(at(RELAY_B) >= 3, "the 5003 relay is retried: {seen:?}");
+
+    shutdown.cancel();
+    tokio::time::timeout(ARRIVAL, task.into_join_handle()).await??;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// The relay ledger
+// ---------------------------------------------------------------------------
+
+/// A registration whose OK was lost leaves the relay in the ledger, so
+/// leaving the last context on it still sends the deregistration.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lost_ok_then_leaving_last_context_still_deregisters() -> TestResult {
+    let sup = supervisor();
+    create_context(&sup, CTX_A, PSEUDONYM_A, &[RELAY_A]).await?;
+    // The relay stores the registration, but its OK never arrives.
+    let answer: Answer = Box::new(|_, attempt| {
+        if attempt == 0 {
+            Err(PushPublishError::Unreachable {
+                reason: "connection lost before the OK".to_owned(),
+            })
+        } else {
+            Ok(())
+        }
+    });
+    let (sink, mut rx) = publisher(system_clock(), answer);
+    let mut registrar = registrar(sink, system_clock()).await?;
+    let public_key = *registrar.signing_key.public_key();
+    let first = registrar.reconcile(&sup).await?;
+    assert!(
+        matches!(
+            first.registered.get(RELAY_A),
+            Some(Err(PushError::Unreachable { .. }))
+        ),
+        "{first:?}"
+    );
+    expect_publishes(&mut rx, 1).await?;
+
+    assert!(sup.despawn_actor(&hex::encode(CTX_A)).await);
+    let second = registrar.reconcile(&sup).await?;
+    assert!(
+        second.deregistered.get(RELAY_A).is_some_and(Result::is_ok),
+        "{second:?}"
+    );
+    let sent = expect_publishes(&mut rx, 1).await?;
+    assert_eq!(sent[0].relay_url, RELAY_A);
+    assert_eq!(verified_deregistration(&sent[0], &public_key)?.token, TOKEN);
+    assert!(
+        registrar.storage.load_push_relays().await?.is_empty(),
+        "the accepted deregistration clears the ledger"
+    );
+    Ok(())
+}
+
+/// A new registrar over the same storage, whose supervisor has no context
+/// on relay A, deregisters at relay A.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restarted_registrar_deregisters_a_recorded_relay() -> TestResult {
+    let storage = ledger();
+    let (sink, mut rx) = publisher(system_clock(), accept_all());
+    let mut first = registrar_on(Arc::clone(&sink), system_clock(), Arc::clone(&storage)).await?;
+    first.register(&[target(RELAY_A, &[[1; 32]])?]).await?;
+    expect_publishes(&mut rx, 1).await?;
+    drop(first);
+
+    let sup = supervisor();
+    create_context(&sup, CTX_B, PSEUDONYM_B, &[RELAY_B]).await?;
+    let mut second = registrar_on(sink, system_clock(), Arc::clone(&storage)).await?;
+    let public_key = *second.signing_key.public_key();
+    let outcome = second.reconcile(&sup).await?;
+    assert!(
+        outcome.deregistered.get(RELAY_A).is_some_and(Result::is_ok),
+        "{outcome:?}"
+    );
+    assert!(
+        outcome.registered.get(RELAY_B).is_some_and(Result::is_ok),
+        "{outcome:?}"
+    );
+    let sent = expect_publishes(&mut rx, 2).await?;
+    let at_a = sent
+        .iter()
+        .find(|p| p.relay_url == RELAY_A)
+        .ok_or("nothing reached relay A")?;
+    assert_eq!(verified_deregistration(at_a, &public_key)?.token, TOKEN);
+    let recorded: Vec<String> = storage
+        .load_push_relays()
+        .await?
+        .into_iter()
+        .map(|record| record.relay_url)
+        .collect();
+    assert_eq!(recorded, vec![RELAY_B.to_owned()]);
+    Ok(())
+}
+
+/// A relay whose ledger write fails is not published to: the record comes
+/// before the first publish.
+#[tokio::test]
+async fn ledger_write_failure_publishes_nothing() -> TestResult {
+    let faulty = FaultyStorage::new(Arc::new(InMemoryStorage::new()));
+    faulty.fail_store_prefix("push_relay/");
+    let storage = Arc::new(ProtocolRepository::new_for_testing(faulty));
+    let (sink, mut rx) = publisher(system_clock(), accept_all());
+    let mut registrar = registrar_on(sink, system_clock(), storage).await?;
+    let results = registrar.register(&[target(RELAY_A, &[[1; 32]])?]).await?;
+    let outcome = results.get(RELAY_A).ok_or("no result")?;
+    assert!(
+        matches!(outcome, Err(err @ PushError::Ledger(_)) if err.retryable()),
+        "{outcome:?}"
+    );
+    expect_quiet(&mut rx).await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// deregister_all and register commands
+// ---------------------------------------------------------------------------
+
+/// `deregister_all` deregisters every relay and clears the ledger, a route
+/// change then publishes nothing, and `register` registers again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deregister_all_stops_registering_until_register() -> TestResult {
+    let sup = supervisor();
+    create_context(&sup, CTX_A, PSEUDONYM_A, &[RELAY_A]).await?;
+    create_context(&sup, CTX_B, PSEUDONYM_B, &[RELAY_B]).await?;
+    let storage = ledger();
+    let (sink, mut rx) = publisher(system_clock(), accept_all());
+    let registrar = registrar_on(sink, system_clock(), Arc::clone(&storage)).await?;
+    let public_key = *registrar.signing_key.public_key();
+    let shutdown = CancellationToken::new();
+    let task = registrar.spawn_trigger(Arc::clone(&sup), shutdown.clone());
+    expect_publishes(&mut rx, 2).await?;
+
+    let outcome = task.deregister_all().await?;
+    assert_eq!(outcome.deregistered.len(), 2, "{outcome:?}");
+    assert!(
+        outcome.deregistered.values().all(Result::is_ok),
+        "{outcome:?}"
+    );
+    assert!(outcome.registered.is_empty(), "{outcome:?}");
+    let sent = expect_publishes(&mut rx, 2).await?;
+    assert_eq!(
+        relay_urls(&sent),
+        BTreeSet::from([RELAY_A.to_owned(), RELAY_B.to_owned()])
+    );
+    for published in &sent {
+        verified_deregistration(published, &public_key)?;
+    }
+    assert!(
+        storage.load_push_relays().await?.is_empty(),
+        "the ledger is clear"
+    );
+
+    create_context(&sup, CTX_C, PSEUDONYM_C, &[RELAY_A]).await?;
+    expect_quiet(&mut rx).await?;
+
+    let outcome = task.register().await?;
+    assert_eq!(outcome.registered.len(), 2, "{outcome:?}");
+    let sent = expect_publishes(&mut rx, 2).await?;
+    let at_a = sent
+        .iter()
+        .find(|p| p.relay_url == RELAY_A)
+        .ok_or("relay A is not registered again")?;
+    let registration = verified_registration(at_a, &public_key)?;
+    assert!(registration.routing_ids.contains(&PSEUDONYM_A));
+    assert!(registration.routing_ids.contains(&PSEUDONYM_C));
+
+    shutdown.cancel();
+    tokio::time::timeout(ARRIVAL, task.into_join_handle()).await??;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Construction
+// ---------------------------------------------------------------------------
+
+/// `WebPush` is refused at construction with a typed error.
+#[tokio::test]
+async fn webpush_platform_is_refused() -> TestResult {
+    let (sink, _rx) = publisher(system_clock(), accept_all());
+    let refused = PushRegistrar::new(PushRegistrarConfig {
+        signing_key: signing_key().await?,
+        publisher: sink,
+        clock: system_clock(),
+        platform: PushPlatform::WebPush,
+        token: PushToken::new(TOKEN.to_vec()),
+        storage: ledger(),
+    })
+    .await;
+    assert!(matches!(refused, Err(PushError::WebPushUnsupported)));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Shutdown during a stalled publish
+// ---------------------------------------------------------------------------
+
+/// Accepts the first publish and leaves every later one pending forever.
+struct StallingPublisher {
+    tx: mpsc::UnboundedSender<String>,
+    attempts: AtomicUsize,
+}
+
+impl PushRelayPublisher for StallingPublisher {
+    fn publish<'a>(
+        &'a self,
+        relay_url: &'a str,
+        _routing_id: [u8; 32],
+        _blob: Vec<u8>,
+    ) -> BoxFuture<'a, Result<(), PushPublishError>> {
+        let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+        // A send error means the test stopped reading; nothing to record.
+        if self.tx.send(relay_url.to_owned()).is_err() {
+            tracing::debug!("stalling publisher: receiver closed");
+        }
+        Box::pin(async move {
+            if attempt == 0 {
+                Ok(())
+            } else {
+                std::future::pending().await
+            }
+        })
+    }
+}
+
+/// Cancelling the shutdown token while a command's publish never completes
+/// ends the task, and the command's caller gets `RegistrarStopped`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_during_stalled_command_ends_task() -> TestResult {
+    let sup = supervisor();
+    create_context(&sup, CTX_A, PSEUDONYM_A, &[RELAY_A]).await?;
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let sink = Arc::new(StallingPublisher {
+        tx,
+        attempts: AtomicUsize::new(0),
+    });
+    let registrar = registrar(sink, system_clock()).await?;
+    let shutdown = CancellationToken::new();
+    let task = Arc::new(registrar.spawn_trigger(Arc::clone(&sup), shutdown.clone()));
+    tokio::time::timeout(ARRIVAL, rx.recv())
+        .await?
+        .ok_or("publisher dropped")?;
+
+    let commander = Arc::clone(&task);
+    let refresh = tokio::spawn(async move {
+        commander
+            .refresh_token(PushToken::new(NEW_TOKEN.to_vec()))
+            .await
+    });
+    // The refresh's deregistration reached the publisher and stalls there.
+    tokio::time::timeout(ARRIVAL, rx.recv())
+        .await?
+        .ok_or("publisher dropped")?;
+
+    shutdown.cancel();
+    let refreshed = tokio::time::timeout(ARRIVAL, refresh).await??;
+    assert!(
+        matches!(refreshed, Err(PushError::RegistrarStopped)),
+        "{refreshed:?}"
+    );
+    let task = Arc::try_unwrap(task).map_err(|_| "the task handle is still shared")?;
+    tokio::time::timeout(ARRIVAL, task.into_join_handle()).await??;
     Ok(())
 }

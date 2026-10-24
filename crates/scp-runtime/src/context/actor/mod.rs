@@ -82,6 +82,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::time::{Interval, MissedTickBehavior, Sleep};
 
+use crate::context::push_helpers;
+
 /// Coalesced-persistence interval. ADR-049 §Decision 9 (50 ms): a
 /// burst of mutations that all complete within this window collapse to
 /// a single durable snapshot write. The actor's `run()` loop wakes on
@@ -325,6 +327,11 @@ pub struct ContextActor {
     /// Consecutive failed grace-end persists for the current
     /// [`Self::grace_armed_deadline`]; drives [`pseudonym_signal_backoff`].
     grace_retries: u32,
+    /// The push routes ([`push_helpers::push_routes`]) last observed at the
+    /// top of the run loop. A turn that changes them wakes the Supervisor's
+    /// push-route watch (`10-infrastructure-and-self-hosting.md` §10.7.1
+    /// **Re-registration**), whatever command or timer changed them.
+    push_routes_seen: Option<push_helpers::ContextPushRoutes>,
 }
 
 impl ContextActor {
@@ -368,6 +375,7 @@ impl ContextActor {
         exit: handle::ExitRecord,
     ) -> Self {
         let context_id = state.handle.context_id().to_owned();
+        let push_routes_seen = push_helpers::push_routes(&state);
         Self {
             context_id,
             inbox,
@@ -393,6 +401,7 @@ impl ContextActor {
             grace_timer: None,
             grace_armed_deadline: None,
             grace_retries: 0,
+            push_routes_seen,
         }
     }
 
@@ -421,12 +430,14 @@ impl ContextActor {
         // computes the deadline as `last_persist_attempt_at + COALESCE_INTERVAL`
         // — which is in the future relative to actor-spawn `now()`.
         loop {
-            // Reconcile the ACTOR-OWNED timer arms from owned state before
-            // every select (top of run() + after each dispatch, since a
-            // dispatch loops back to here). Cheap: re-arms only when the
-            // convergent TTL deadline changes or the `Active` state flips
-            // (ADR-049 Decision-1 / finding A3).
+            // Reconcile the ACTOR-OWNED timer arms and the push-route watch
+            // from owned state before every select (top of run() + after each
+            // dispatch, since a dispatch loops back to here). Cheap: re-arms
+            // only when the convergent TTL deadline changes or the `Active`
+            // state flips (ADR-049 Decision-1 / finding A3), and wakes the
+            // watch only when the push routes changed.
             self.reconcile_timers();
+            self.note_push_route_change();
 
             tokio::select! {
                 biased;
@@ -492,11 +503,10 @@ impl ContextActor {
                             if is_prepare_replace {
                                 // Claimed terminal iff the handler set
                                 // `lifecycle_state == Closed`.
-                                let claimed = matches!(
+                                if matches!(
                                     self.state.lifecycle_state,
                                     state::ContextLifecycleState::Closed
-                                );
-                                if claimed {
+                                ) {
                                     self.exit.record(handle::DeliberateExit::Replaced);
                                     break;
                                 }
@@ -806,6 +816,19 @@ impl ContextActor {
             ContextCommand::LifecycleControl(sub) => {
                 handlers::lifecycle_control::dispatch(cell, deps, sub).await
             }
+        }
+    }
+
+    /// Wakes the Supervisor's push-route watch when the context's push routes
+    /// differ from the ones the last turn saw. Every arm loops back to the
+    /// top of the run loop, so a join, leave, pseudonym rotation, close,
+    /// expiry or tombstone reaches the push registrar through this one check
+    /// (`10-infrastructure-and-self-hosting.md` §10.7.1 **Re-registration**).
+    fn note_push_route_change(&mut self) {
+        let current = push_helpers::push_routes(&self.state);
+        if current != self.push_routes_seen {
+            self.push_routes_seen = current;
+            self.deps.supervisor.note_push_routes_changed();
         }
     }
 

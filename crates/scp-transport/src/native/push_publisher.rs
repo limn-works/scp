@@ -17,7 +17,10 @@
 //! [`TransportError::RelayRejected`] and leaves as
 //! [`PushPublishError::Rejected`] with its code intact, which is what lets the
 //! registrar tell a `4060`-`4064` refusal (never retried) from a `5xxx`
-//! failure (retried). Node wiring is PUSH-015.
+//! failure (retried). A connection whose transport has no raw-blob path
+//! answers [`TransportError::NotSupported`] and leaves as
+//! [`PushPublishError::Unsupported`], which the registrar does not retry.
+//! Node wiring is PUSH-015.
 
 use std::sync::Arc;
 
@@ -112,11 +115,15 @@ impl PushRelayPublisher for TransportPushPublisher {
     }
 }
 
-/// A relay `ERR` keeps its code; every other transport failure means the
-/// message did not reach a relay that answered.
+/// A relay `ERR` keeps its code; a connection with no raw-blob path is
+/// [`PushPublishError::Unsupported`], which no retry heals; every other
+/// transport failure means the message did not reach a relay that answered.
 fn publish_error(err: TransportError) -> PushPublishError {
     match err {
         TransportError::RelayRejected { code, msg } => PushPublishError::Rejected { code, msg },
+        TransportError::NotSupported(reason) => PushPublishError::Unsupported {
+            reason: sanitize_relay_text(&reason),
+        },
         other => PushPublishError::Unreachable {
             reason: sanitize_relay_text(&other.to_string()),
         },

@@ -131,6 +131,7 @@ wrapping_key/{did}
 key_event_log_cache/{did}
 tofu/{did}
 key_package/{sha256_hex(relay_url)}/{index}
+push_relay/{sha256_hex(relay_url)}/{sha256_hex(token)}
 relay_score/{sha256_hex(relay_url)}
 cert_pin/{sha256_hex(relay_url)}
 
@@ -141,6 +142,8 @@ mls/{context_id}/...
 ```
 
 **Identity bootstrap key.** The `scp/identity` key stores a `StoredValue<PersistedIdentity>` for the node's own identity. This is a top-level singleton key (no entity ID) because it is read during identity bootstrap before any DID is known. Written via the `Storage` trait directly, not through `ProtocolRepository` domain methods (see §17.4 for the exception rationale).
+
+**Push relay ledger.** Each `push_relay/{sha256_hex(relay_url)}/{sha256_hex(token)}` key holds a `StoredValue<PushRelayRecord>` (canonical relay URL, push platform, device token): a relay that may hold a push registration of that token (§10.7.1). The push registrar writes the record before its first publish to the relay and deletes it only when the relay accepts a `PushDeregistration` of the token or answers `4061` or `4063`, so a registration whose OK was lost, or a restart, still leaves a record, and the registrar deregisters every recorded relay that hosts no context of this device. Both key components are SHA-256 hex, so neither the URL nor the token appears in a key. A record that does not decode fails the whole ledger load, because skipping it would leave its relay never deregistered. The token is a secret, so the serialized buffer is zeroized after the write.
 
 **Zero-padded sequences.** Event sequence numbers and private state sequence numbers use `:020d` formatting (20-digit zero-padded decimal). This ensures lexicographic ordering matches numeric ordering, enabling efficient range queries via `list_keys`. Example: event 42 is stored at `context/{id}/event/00000000000000000042`.
 

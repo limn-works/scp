@@ -4465,8 +4465,9 @@ mod tests {
         use super::*;
         use crate::relay::push::{ApnsConfig, ApnsEnvironment, ApnsSender, PushSender};
         use crate::relay::push_dispatch::PushService;
-        use crate::relay::push_gate::{PUSH_TIMESTAMP_SKEW_SECS, PushServiceConfig};
+        use crate::relay::push_gate::PushServiceConfig;
         use crate::relay::push_store::{PushRegistrationKey, PushRegistrationStore};
+        use scp_protocol::discovery::push::PUSH_TIMESTAMP_SKEW_SECS;
 
         const REGISTRANT: &str = "did:dht:push-registrant";
 
