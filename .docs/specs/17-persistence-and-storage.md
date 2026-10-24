@@ -101,7 +101,8 @@ context/{context_id}/event_data/{seq:020d}
 context/{context_id}/event_meta/count
 context/{context_id}/event_meta/root
 context/{context_id}/event_tree/{level}/{index}
-context/{context_id}/merkle_event_log/{seq:020d}
+context/{context_id}/merkle_event_log/head
+context/{context_id}/merkle_event_log/g{gen:020d}/{base_seq:020d}
 context/{context_id}/outlet/{outlet_id}
 context/{context_id}/outlet_session/{session_id}
 context/{context_id}/ucan_token/{token_id}
@@ -143,7 +144,19 @@ mls/{context_id}/...
 
 **Event data payloads.** The `event/{seq:020d}` key stores only the 32-byte SHA-256 leaf hash for Merkle tree verification. The `event_data/{seq:020d}` key stores the full MessagePack-serialized `Event` struct (event type, actor DID, timestamp, sequence, payload, prev_hash, signature). This dual-key design preserves the compact Merkle tree structure while enabling event replay and query without transport-layer round-trips. Events persisted before the `event_data/` key convention was introduced will have hash-only entries; `load_event_data` returns `None` for these (backward compatible).
 
-**Merkle event log entries.** Each `EventLogEntry` is stored individually under `merkle_event_log/{seq:020d}` (MessagePack-serialized), matching the per-event key pattern used by `event/{seq:020d}`. This enables O(1) append persistence — only the new entry is written, rather than re-serializing the entire list. Restore loads all entries by `list_keys("context/{id}/merkle_event_log/")` prefix scan, which returns keys in lexicographic (= sequence) order. Prune deletes removed entries by prefix and rewrites the retained entries with renumbered sequence keys starting from 0. After pruning, the first entry's `prev_hash` references a discarded predecessor — chain verification must accept any `prev_hash` for the first entry. See §9.9, #636, #710.
+**Merkle event log entries.** The `MerkleEventLogProvider` stores each context's event log under `merkle_event_log/` in two kinds of key, and each value is a MessagePack `StoredValue`:
+
+- `merkle_event_log/head` holds the current generation number, a `u64`.
+- `merkle_event_log/g{gen:020d}/{base_seq:020d}` holds one unit: a `Vec<EventLogEntry>` of one or more entries, whose first entry has sequence `base_seq`.
+
+Every write relies on one property that every `Storage` backend has: a put of a single key is atomic. No write relies on a multi-key batch. `FilesystemStorage` is atomic per key only, so a batch there would need an intent journal. `SyncableStorage::apply_changeset` replays a peer's keys one at a time, so a batch that was atomic on its source is not atomic on a replica.
+
+- **Append** puts one unit under the generation that `head` names, so a crash leaves either every entry of the unit or none of them. When no `head` exists, an append is a replace with that one unit, and the unit's `base_seq` must be 0.
+- **Replace** (prune, import, and init over an existing log) deletes any keys left under generation `head + 1` (generation 0 when no `head` exists), writes every unit of the new log under that generation, and then puts `head`. The `head` put is the commit point: a failure before it leaves the old log in place, and a failure after it leaves the new log in place. Replace then deletes the old generation best-effort, because the next load deletes every generation that `head` does not name.
+- **Destroy** deletes `head` first, which removes the log, and then deletes the generations best-effort.
+- **Load** reads `head`. When no `head` exists, the context has no log and load returns none. Otherwise load reads the units under generation `head` in key order. Each unit's `base_seq` must equal the number of entries in the units before it, and a gap or an overlap returns the typed error `StoreError::EventLogUnitMisaligned`, never a truncated log. An empty unit, or a unit key whose `base_seq` does not parse, returns a deserialization error. Load also deletes, best-effort, every generation that `head` does not name.
+
+The `MerkleEventLogProvider` serializes the writes to one context with a per-context write gate, so an append never lands in a generation that a concurrent replace is retiring. After pruning, the first entry's `prev_hash` references a discarded predecessor — chain verification must accept any `prev_hash` for the first entry. See §9.9, #636, #710.
 
 **Nonce keys.** UCAN nonce replay prevention uses `context/{context_id}/nonce/{SHA256(nonce_string)}` — the nonce string is hashed to a fixed-length key. The value stores `(first_seen_timestamp, token_expiry_timestamp)` for pruning. The `exists()` method enables O(1) replay checks without deserializing.
 
@@ -224,8 +237,8 @@ impl<S: Storage> ProtocolRepository<S> {
     pub async fn load_event_tree_node(&self, context_id: &ContextId, level: u32, index: u64) -> Result<Option<[u8; 32]>, StoreError>;
 
     // --- Merkle event log entries (§9.9, #636, #710) ---
-    pub async fn store_merkle_event_log_entry(&self, context_id: &str, seq: usize, entry: &EventLogEntry) -> Result<(), StoreError>;
-    pub async fn store_merkle_event_log_entries(&self, context_id: &str, entries: &[EventLogEntry]) -> Result<(), StoreError>;
+    pub async fn store_merkle_event_log_unit(&self, context_id: &str, base_seq: u64, entries: &[EventLogEntry]) -> Result<(), StoreError>;
+    pub async fn replace_merkle_event_log_entries(&self, context_id: &str, entries: &[EventLogEntry]) -> Result<(), StoreError>;
     pub async fn load_merkle_event_log_entries(&self, context_id: &str) -> Result<Option<Vec<EventLogEntry>>, StoreError>;
     pub async fn delete_merkle_event_log_entries(&self, context_id: &str) -> Result<(), StoreError>;
 
