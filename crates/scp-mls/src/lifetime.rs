@@ -8,7 +8,7 @@
 //! [`Lifetime::default`](openmls::prelude::Lifetime) read `SystemTime::now()`;
 //! [`Lifetime::validate`](openmls::prelude::Lifetime) re-reads the same clock at
 //! validation time. Under the `openmls` `js` feature (the wasm build) that
-//! `SystemTime` is `web_time::SystemTime` (openmls 0.9.0), which reads a *live,
+//! `SystemTime` is `web_time::SystemTime`, which reads a *live,
 //! un-captured* `Date.now()` — a **second, unhardened clock**, distinct from the
 //! SCP-layer hardened [`Clock`] injected through the rest of
 //! the client, and fully attacker-overridable in-tab. Left as-is, a hostile
@@ -17,18 +17,22 @@
 //! confidentiality — group secrets stay sound — but it defeats `KeyPackage`
 //! freshness/expiry as a defense.
 //!
-//! `openmls` 0.9.0 reads its own clock in `Lifetime::new`, `Lifetime::default`,
-//! and the `Lifetime::validate` its internal checks run, and offers no way to
-//! route those reads through a caller's clock. Of the checks SCP reaches, only
-//! the Welcome tree-leaf check can be switched off, and SCP switches it off
-//! (see below). There SCP checks only the maximum range on other members'
-//! leaves, and checks the joiner's own leaf against the injected clock.
+//! `openmls` reads its own clock in `Lifetime::new`, `Lifetime::default`, and
+//! the `Lifetime::validate` its internal checks run under
+//! `LeafNodeLifetimePolicy::Verify`. A caller can replace that read with
+//! `LeafNodeLifetimePolicy::Skip` or `VerifyAt` on the Welcome tree-leaf check
+//! and, at the commit pinned in the root `Cargo.toml`, on
+//! `MlsGroup::process_message_with_lifetime_policy`. SCP switches the Welcome
+//! tree-leaf check off (see below), and there checks only the maximum range on
+//! other members' leaves and checks the joiner's own leaf against the injected
+//! clock. SCP's receive path still calls `process_message`, which runs
+//! `Verify` (see `process_inbound` in `encrypt.rs`).
 //! openmls exposes two
 //! caller-side entry points that take the time from the caller, and this module
 //! uses both:
 //! [`Lifetime::init`](openmls::prelude::Lifetime), a pure constructor that takes
 //! caller-supplied `not_before`/`not_after` bounds, and
-//! `Lifetime::validate_with_time(now)`, new in 0.9.0. This module:
+//! `Lifetime::validate_with_time(now)`. This module:
 //!
 //! - **Mints** every `Lifetime` SCP generates via [`key_package_lifetime`],
 //!   which reads the injected [`Clock`] and calls
@@ -104,7 +108,7 @@
 //!   of its leaf validation. After `StagedWelcome::into_group` and before it
 //!   builds the `ScpMlsGroup`, it checks the joiner's own leaf and then calls
 //!   `validate_tree_leaf_lifetime_ranges` on every other leaf.
-//!   openmls 0.9.0 exposes `MlsGroup::treesync()`, and `TreeSync::full_leaves()`
+//!   openmls exposes `MlsGroup::treesync()`, and `TreeSync::full_leaves()`
 //!   yields every non-blank leaf of the joined tree with its
 //!   `LeafNodeSource::KeyPackage(Lifetime)`, the same leaf set openmls's
 //!   switched-off check covered. SCP accepts another member's expired tree
@@ -265,11 +269,11 @@ pub fn key_package_lifetime(clock: &dyn Clock) -> Lifetime {
 /// This is SCP's hardened counterpart to openmls's `Lifetime::validate`, which
 /// reads openmls's un-injectable internal clock. It performs two checks:
 ///
-/// 1. **Temporal validity** — openmls 0.9.0 `Lifetime::validate_with_time`,
+/// 1. **Temporal validity** — openmls's `Lifetime::validate_with_time`,
 ///    which accepts `not_before <= now && now < not_after`, called with `now`
 ///    read from the injected clock. SCP calls openmls's comparison instead of
 ///    keeping its own, so SCP's temporal rule cannot drift from openmls's (a
-///    hand-written copy went stale when openmls 0.9.0 moved the `not_before`
+///    hand-written copy went stale when openmls moved the `not_before`
 ///    bound from strict `<` to `<=`). No cfg branch is needed because `now` is
 ///    a `web_time::SystemTime`, the type `validate_with_time` takes on every
 ///    target: `web_time` re-exports `std::time::SystemTime` natively and
@@ -305,7 +309,7 @@ fn validate_key_package_lifetime_at(lifetime: &Lifetime, now: u64) -> Result<(),
     let not_before = lifetime.not_before();
     let not_after = lifetime.not_after();
 
-    // openmls 0.9.0 rejects `not_after <= now` (expired) and `not_before > now`
+    // openmls rejects `not_after <= now` (expired) and `not_before > now`
     // (not yet valid). A `now` too large for `SystemTime` fails closed.
     let temporally_valid = web_time::UNIX_EPOCH
         .checked_add(Duration::from_secs(now))
@@ -437,8 +441,8 @@ fn lifetime_range_acceptable(lifetime: &Lifetime) -> bool {
 /// decision, not part of the ruling: it keeps the result the former
 /// current-time check gave such a leaf (ADR-057 §Prereq-1).
 ///
-/// `MlsGroup::treesync().full_leaves()` (openmls 0.9.0
-/// `group/mls_group/mod.rs:417`, `treesync/mod.rs:685`) yields every non-blank
+/// `MlsGroup::treesync().full_leaves()` (openmls `group/mls_group/mod.rs`,
+/// `treesync/mod.rs`) yields every non-blank
 /// leaf, the joiner's own included, which this walk skips. A leaf whose source is
 /// `LeafNodeSource::Update` or `LeafNodeSource::Commit` carries no `Lifetime`
 /// (RFC 9420 §7.2) and is skipped.

@@ -839,9 +839,12 @@ mod tests {
 
     /// A fixed key signing a fixed event id yields fixed signature bytes.
     ///
-    /// `sign_event` signs through `k256`'s `Signer`, which runs BIP-340 with an
-    /// all-zero auxiliary random input, so the signature is a function of the
-    /// key and the message. The golden was captured on k256 0.13; a k256
+    /// The golden pins SCP's current output across the k256 0.13 to 0.14 port:
+    /// `sign_event` signs through `k256`'s `Signer`, which hashes the id with
+    /// SHA-256 and runs BIP-340 over that digest with an all-zero auxiliary
+    /// random input. It is therefore not a plain BIP-340 signature over the id,
+    /// which NIP-01 specifies; that divergence is an open defect, and fixing it
+    /// replaces this golden. The golden was captured on k256 0.13; a k256
     /// upgrade that changes the signature, the x-only public key or the
     /// signing-key parsing fails here.
     #[test]

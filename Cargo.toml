@@ -135,8 +135,9 @@ hkdf = "0.12"
 # `alloc` is the only std-adjacent feature. 0.14 is the RustCrypto generation
 # whose crypto-bigint (0.7.6 or later) clears RUSTSEC-2026-0387, and the one the
 # pinned openmls uses. Its own `getrandom` feature stays off: scp-crypto draws
-# from a caller-supplied rand_core 0.6 source, and the getrandom 0.2 that
-# ed25519-dalek 2 pulls still needs the `js` backend on wasm32.
+# from a caller-supplied rand_core 0.6 source. getrandom 0.2 still reaches the
+# wasm32 graph through rand_core 0.6's `getrandom` feature, which rand 0.8 and
+# aes-gcm 0.10 (via crypto-common 0.1) enable, so it needs the `js` backend there.
 p256 = { version = "0.14", default-features = false, features = ["ecdsa", "ecdh", "arithmetic", "alloc"] }
 uuid = { version = "1", features = ["v4", "v7"] }
 # No `libcrux-provider`. That feature does one thing — add the optional dependency

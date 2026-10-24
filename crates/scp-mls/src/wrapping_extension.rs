@@ -164,7 +164,7 @@ pub fn extract_own_wrapping_key(
 ///
 /// For the local member's DID, reads `own_leaf_node()` and returns the key the
 /// local leaf publishes. For any other DID it returns
-/// [`MlsError::MemberNotFound`]. openmls 0.9.0 exposes every remote leaf
+/// [`MlsError::MemberNotFound`]. openmls exposes every remote leaf
 /// (`MlsGroup::public_group().leaf(index)`), so the tree could be read; SCP
 /// deliberately offers no remote lookup yet, because a remote lookup must first
 /// bind the identifier to leaves:

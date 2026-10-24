@@ -800,7 +800,7 @@ pub(crate) fn leaf_public_key(bytes: &[u8]) -> Result<[u8; 65], MlsError> {
 
 /// Reads the bytes of a leaf `encryption_key`.
 ///
-/// `openmls` 0.9.0 exposes no byte accessor for an `EncryptionKey`, so this
+/// `openmls` exposes no public byte accessor for an `EncryptionKey`, so this
 /// re-encodes it: its TLS encoding is the key as one variable-length vector.
 fn leaf_encryption_key(key: &openmls::treesync::EncryptionKey) -> Result<[u8; 65], MlsError> {
     use tls_codec::{DeserializeBytes as _, Serialize as _};

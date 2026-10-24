@@ -4,7 +4,7 @@
 //! The attestation binds the leaf `signature_key`, the leaf `encryption_key`,
 //! the `KeyPackage` `init_key` and the `0xFF01` `wrapping_key` (§9.5.2), so it
 //! must be signed before the leaf exists, and the signature then rides inside
-//! the leaf. `openmls` 0.9.0 has no API that takes caller-supplied init or
+//! the leaf. `openmls` has no API that takes caller-supplied init or
 //! encryption keys, and spec 09 §9.7.1 requires the mint to need no `openmls`
 //! change. Minting is therefore two steps:
 //!

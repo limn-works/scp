@@ -270,7 +270,7 @@ pub enum MlsError {
     /// exclusion). Every member publishes its `PseudonymAnnouncement` to the shared
     /// `context_routing_id` AND subscribes to it, so each announcement is echoed to
     /// its author, whose MLS state cannot decrypt its own outbound message
-    /// (openmls 0.9.0 returns it as `ProcessedMessageContent::OwnPrivateMessage`,
+    /// (openmls returns it as `ProcessedMessageContent::OwnPrivateMessage`,
     /// which `scp-mls` maps to this variant). This is a **benign,
     /// expected** outcome under the untrusted-relay model — the receive loop MUST
     /// treat it as a DROP (symmetric with an unknown-routing_id drop), NOT a

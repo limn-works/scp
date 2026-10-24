@@ -38,9 +38,11 @@ p256 = { workspace = true }
 rand_core = { version = "0.6", default-features = false }
 thiserror = { workspace = true }
 
-# The workspace ed25519-dalek 2 pulls getrandom 0.2, which fails to compile on
-# wasm32-unknown-unknown without a backend. Select the JS backend there, as
-# scp-protocol and scp-client do.
+# getrandom 0.2 fails to compile on wasm32-unknown-unknown without a backend.
+# In a wasm32 build it arrives through rand_core 0.6's `getrandom` feature, which
+# rand 0.8 and aes-gcm 0.10 (via crypto-common 0.1) enable elsewhere in the graph;
+# ed25519-dalek 2 and this crate's rand_core leave that feature off. Select the JS
+# backend here, as scp-protocol and scp-client do.
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }
 
