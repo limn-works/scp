@@ -173,7 +173,7 @@ Two-layer envelope format:
 
 **Inner signature:** `P256_ECDSA_sign(SHA256(context_id || sender_did || epoch || generation || sequence || timestamp || payload_hash || provenance_hash || signing_key_id))`
 
-The `signing_key_id` field names the operational role that signed the envelope, `"#active"`. It is included in the signature preimage to bind the signature to the specific key, and stored as a field on `InnerEnvelope` so verifiers can resolve the public key from the sender's key state (`03-identity.md` §3.10.4).
+The `signing_key_id` field names the operational role that signed the envelope, `"#active"`. It is included in the signature preimage to bind the signature to the specific key, and stored as a field on `InnerEnvelope` so a verifier can take the key: inside a context's MLS, the leaf map entry of the MLS sender leaf (`09-security-model.md` §9.7.1 tree-key arm, 'The attested key is group state'; ADR-066 decision 27(d)); elsewhere, the key the sender's key state lists (`03-identity.md` §3.10.4).
 
 Where `provenance_hash = SHA256(serialize(provenance))` if provenance is present, or `SHA256(0x00)` (hash of a single zero byte) if provenance is absent. Using a sentinel value for absent provenance ensures the signature unambiguously commits to "no provenance" — stripping provenance from a message that had it, or adding provenance to one that did not, produces an invalid signature.
 
@@ -229,16 +229,16 @@ The inner signature is included inside the encrypted blob. Relays never see it. 
 
 5. **Receive path: `ContextCryptoState::open`, then `messaging_helpers::verify_and_unwrap`** (`scp-runtime`)
    - `ContextCryptoState::open` decrypts the outer envelope's blob via MLS, removes the sender-key layer, and deserializes the inner envelope. It returns the MLS-credential sender DID beside the inner envelope.
-   - Binding: the MLS-credential sender MUST equal `inner.sender_did`; a mismatch is rejected before any key is resolved. The verification key is resolved for `(inner.sender_did, inner.signing_key_id)` (§9.7.4.2), never for a DID the caller supplies.
+   - Binding: `inner.sender_did` MUST equal the identifier that the `0xFF03` attestation on the MLS sender leaf binds, and the identity the MLS credential asserts is never used (`05-contexts.md` §5.9.1, 'Receive path', check 1); a mismatch is rejected before any key is read. The verification key is the leaf map entry of the MLS sender leaf in the tree of the epoch that decrypted the envelope (`09-security-model.md` §9.7.1 tree-key arm, 'The attested key is group state'; ADR-066 decision 27(d)), never a key for a DID the caller supplies.
    - Order: inner-signature verification, then the payload-hash check (`payload_hash == SHA256(stripped_payload)`, rejected on mismatch as a content integrity failure), then the Recovery admin gate. The per-sender `(epoch, sequence)` receive floor advances only after all three succeed, so an envelope that fails verification never moves the floor.
    - Replay prevention for generations is delegated to the MLS and sender-key layers.
    - Returns the verified plaintext; no separate `open_envelope` exists.
 
-6. **`verify_inner_signature(inner_envelope, sender_did_document) -> bool`**
-   - Resolves the public key from the sender's key state using `inner_envelope.signing_key_id`: `"#active"` resolves to the key that state lists `Current` in the `#active` role (`09-security-model.md` §9.7.4.2 definitions).
+6. **`verify_inner_signature(inner_envelope, active_key) -> bool`**
+   - Takes the key from the tree: `inner_envelope.signing_key_id` MUST be `"#active"`, and the key is the leaf map entry of the MLS sender leaf in the decryption epoch's tree (`09-security-model.md` §9.7.1, tree-key arm). Content inside a snapshot or export reaches its verifier with no tree, so it takes the content arm of §9.7.1's classification table.
    - Computes `provenance_hash = SHA256(serialize(provenance))` if provenance is present, or `SHA256(0x00)` if absent.
    - Recomputes `SHA256(context_id || sender_did || epoch || generation || sequence || timestamp || payload_hash || provenance_hash || signing_key_id)`.
-   - Verifies the P-256 signature against the resolved public key.
+   - Verifies the P-256 signature against that key.
    - A mismatch indicates either payload tampering, provenance tampering, or signing key mismatch — all MUST be rejected.
 
 7. **`strip_padding(padded_payload) -> Payload`**
@@ -1240,7 +1240,7 @@ Implement per-sender AES-256 symmetric keys as `scp-core/crypto/sender_keys/`. M
    - The blocker signs the notification with their Active Signing Key to prevent forgery by other group members (MLS authenticates group membership, not individual identity within application messages).
    - Signature payload: `P256_ECDSA_sign(signing_key, SHA-256(context_id || "block" || blocker_did || blocked_did || signing_key_id || timestamp))`.
    - Message content: `{ "type": "block", "blocker": blocker_did, "blocked": blocked_did, "signing_key_id": signing_key_id, "timestamp": unix_ms, "signature": blocker_signature }`.
-   - **Verification on receipt:** The receiver MUST resolve the public key from the claimed blocker's key state using the `signing_key_id` field, then verify the P-256 signature. Only `#active` is accepted. Discard without action if verification fails. Log the discarded notification for anomaly detection.
+   - **Verification on receipt:** The receiver MUST check that `blocker` is the identifier the `0xFF03` attestation on the notification's MLS sender leaf binds, and verify under the tree-key arm (`09-security-model.md` §9.7.1). Only `#active` is accepted. Discard without action if verification fails. Log the discarded notification for anomaly detection.
    - On successful verification, the blocked party's client automatically calls `rotate_sender_key_for_block` excluding the blocker.
    - The block event is recorded in the context event log (ADR-011) with `EventType::MemberBlocked { blocker, blocked, signature }`.
 
