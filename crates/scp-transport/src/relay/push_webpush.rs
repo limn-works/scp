@@ -41,14 +41,21 @@
 //!
 //! **Back-off.** One registrant chooses each endpoint, so the back-off after
 //! a `Transient` or `Unreachable` outcome is per endpoint origin, not per
-//! platform. The dispatcher (`push_dispatch`) holds a wake for an origin in
-//! back-off until the back-off ends, and [`WebPushSender::send`] itself waits
-//! out a back-off that started after the dispatcher looked, so no wake is
-//! consumed by a back-off. Each send carries its origin's back-off epoch, and
-//! only an outcome from the current epoch moves the back-off: sends already
-//! in flight when a back-off starts cannot double it or clear it. The
-//! back-off map is bounded and never forgets an origin whose back-off has not
-//! ended.
+//! platform. A send to an origin that is backing off does not start and
+//! never sleeps: [`WebPushSender::send`] returns
+//! [`SendDeferral::BackingOff`] at once, and the dispatcher
+//! (`push_dispatch`) holds the wake, with no send slot taken, until the
+//! back-off ends, so no wake is consumed by a back-off. Each send carries its
+//! origin's back-off epoch, and only an outcome from the current epoch moves
+//! the back-off: sends already in flight when a back-off starts or ends
+//! cannot double it, clear it or restart it. Epochs come from one counter
+//! that never repeats a value. The back-off map is bounded and never forgets
+//! an origin whose back-off has not ended.
+//!
+//! **Lookup pool.** A send whose endpoint lookup finds the relay's bounded
+//! lookup pool full has learnt nothing about the endpoint: it returns
+//! [`SendDeferral::LookupPoolFull`], records no back-off and counts nothing,
+//! and the dispatcher retries the wake when a lookup frees a permit.
 //!
 //! No log line or `Debug` output carries the endpoint, its host or origin,
 //! `p256dh`, `auth`, the VAPID key or a JWT.
@@ -71,8 +78,8 @@ use tokio::time::Instant;
 use zeroize::Zeroizing;
 
 use super::push::{
-    CONNECT_TIMEOUT, PRODUCTION_KEEP_ALIVE, PushSendOutcome, PushSenderError, compact_jws_bytes,
-    read_bounded, transport_error_kind,
+    CONNECT_TIMEOUT, PRODUCTION_KEEP_ALIVE, PushSendOutcome, PushSenderError, SendAttempt,
+    SendDeferral, compact_jws_bytes, read_bounded, transport_error_kind,
 };
 use super::push_endpoint::{
     CheckedResolver, EndpointError, Nat64Prefixes, OwnAddresses, parse_endpoint,
@@ -241,22 +248,31 @@ struct CachedJwt {
     exp: u64,
 }
 
-/// One origin's back-off.
+/// One origin's back-off state.
 struct OriginBackoff {
     backoff: ReconnectBackoff,
-    /// No send to the origin starts before this.
+    /// No send to the origin starts before this. At or before `now` once the
+    /// back-off has ended or the origin has answered since.
     retry_at: Instant,
-    /// The epoch this back-off step started; never 0.
+    /// The epoch of the origin's last back-off step or answer.
     epoch: u64,
 }
 
-/// The back-off of every origin that failed and has not answered since.
+/// The back-off state of the origins that failed since the map last
+/// forgot them.
 ///
-/// An origin with no entry is in epoch 0. Each step of a back-off takes a
-/// fresh epoch from `next_epoch`, so a send stamped before the step cannot
-/// match it.
+/// Every epoch comes from `next_epoch`, which only grows, so no epoch is ever
+/// handed out twice: a send stamped before a step or an answer cannot match
+/// the epoch after it. An origin with no entry is in epoch `floor`. When an
+/// answer ends a back-off, the entry stays, with a fresh epoch, instead of
+/// returning the origin to `floor`, so a send stamped before the back-off
+/// cannot match again. When the map is full, a failure of a new origin
+/// forgets the entries that are not backing off; it then moves `floor` to a
+/// fresh epoch, so no stamp taken before the forgetting matches a forgotten
+/// origin. Such a stale stamp loses only its own outcome.
 struct Backoffs {
     origins: HashMap<String, OriginBackoff>,
+    floor: u64,
     next_epoch: u64,
 }
 
@@ -264,27 +280,41 @@ impl Backoffs {
     fn new() -> Self {
         Self {
             origins: HashMap::new(),
+            floor: 0,
             next_epoch: 1,
         }
+    }
+
+    /// A never-used epoch.
+    const fn fresh_epoch(&mut self) -> u64 {
+        let epoch = self.next_epoch;
+        // 2^64 steps never happen; saturating keeps the arithmetic total.
+        self.next_epoch = self.next_epoch.saturating_add(1);
+        epoch
     }
 
     /// `origin`'s current epoch and, while it is backing off at `now`, when
     /// the back-off ends.
     fn stamp(&self, origin: &str, now: Instant) -> (u64, Option<Instant>) {
-        self.origins.get(origin).map_or((0, None), |state| {
-            (
-                state.epoch,
-                (now < state.retry_at).then_some(state.retry_at),
-            )
-        })
+        self.origins
+            .get(origin)
+            .map_or((self.floor, None), |state| {
+                (
+                    state.epoch,
+                    (now < state.retry_at).then_some(state.retry_at),
+                )
+            })
     }
 
     /// Applies a send's `outcome` to `origin`'s back-off when the send was
     /// stamped with the current `epoch`, and ignores it otherwise. A
     /// `Transient` or `Unreachable` outcome takes the next back-off step under
-    /// a new epoch; any other outcome ends the back-off.
+    /// a fresh epoch; any other outcome ends the back-off under a fresh epoch.
     fn record(&mut self, origin: &str, epoch: u64, outcome: PushSendOutcome, now: Instant) {
-        let current = self.origins.get(origin).map_or(0, |state| state.epoch);
+        let current = self
+            .origins
+            .get(origin)
+            .map_or(self.floor, |state| state.epoch);
         if epoch != current {
             return;
         }
@@ -292,20 +322,28 @@ impl Backoffs {
             outcome,
             PushSendOutcome::Transient | PushSendOutcome::Unreachable
         );
-        if !failed {
-            self.origins.remove(origin);
+        let fresh = self.fresh_epoch();
+        if let Some(state) = self.origins.get_mut(origin) {
+            if failed {
+                state.retry_at = now + state.backoff.next_delay();
+            } else {
+                state.retry_at = now;
+                state.backoff.reset();
+            }
+            state.epoch = fresh;
             return;
         }
-        let epoch = self.next_epoch;
-        self.next_epoch = self.next_epoch.saturating_add(1);
-        if let Some(state) = self.origins.get_mut(origin) {
-            state.retry_at = now + state.backoff.next_delay();
-            state.epoch = epoch;
+        if !failed {
+            // An origin with no entry is not backing off.
             return;
         }
         if self.origins.len() >= ORIGIN_BACKOFF_CAPACITY {
-            // Forget only back-offs that have ended.
+            // Forget only origins that are not backing off.
+            let before = self.origins.len();
             self.origins.retain(|_, state| now < state.retry_at);
+            if self.origins.len() < before {
+                self.floor = self.fresh_epoch();
+            }
         }
         if self.origins.len() >= ORIGIN_BACKOFF_CAPACITY {
             tracing::debug!(
@@ -321,27 +359,40 @@ impl Backoffs {
             OriginBackoff {
                 backoff,
                 retry_at,
-                epoch,
+                epoch: fresh,
             },
         );
     }
 }
 
-/// The most verbose level the relay logs from hyper-util.
+/// The most verbose level the relay logs from a crate in
+/// [`HOST_LOGGING_CRATES`].
 #[cfg(any(test, feature = "startup"))]
-const HYPER_UTIL_LOG_CAP: tracing::Level = tracing::Level::INFO;
+const HOST_LOGGING_CRATE_CAP: tracing::Level = tracing::Level::INFO;
 
-/// Whether the relay's log keeps an event with `metadata`. hyper-util's
-/// DEBUG and TRACE lines name the host and port each connection goes to, and
-/// a `WebPush` endpoint's host is a registrant's choice that PUSH-022 keeps
-/// out of the log, so hyper-util is held at [`HYPER_UTIL_LOG_CAP`] whatever
-/// `RUST_LOG` asks for. The relay's tracing subscriber (`startup`) and the
-/// push sender tests' log capture apply this one predicate.
+/// The crates on the `WebPush` send path whose DEBUG or TRACE lines name the
+/// host each connection goes to: hyper-util's connector and pool through
+/// `tracing`, and reqwest's connector (`starting new connection: <uri>`)
+/// through the `log` crate, which `tracing-log` forwards under the target
+/// `reqwest::connect`. h2, hyper-rustls and rustls log no host on this path.
+#[cfg(any(test, feature = "startup"))]
+const HOST_LOGGING_CRATES: [&str; 2] = ["hyper_util", "reqwest"];
+
+/// Whether the relay's log keeps an event with `metadata`. A `WebPush`
+/// endpoint's host is a registrant's choice that PUSH-022 keeps out of the
+/// log, so every crate in [`HOST_LOGGING_CRATES`] is held at
+/// [`HOST_LOGGING_CRATE_CAP`] whatever `RUST_LOG` asks for. The relay's
+/// tracing subscriber (`startup`) and the push sender tests' log capture
+/// apply this one predicate.
 #[cfg(any(test, feature = "startup"))]
 pub(crate) fn admits_log_event(metadata: &tracing::Metadata<'_>) -> bool {
     let target = metadata.target();
-    let hyper_util = target == "hyper_util" || target.starts_with("hyper_util::");
-    !hyper_util || *metadata.level() <= HYPER_UTIL_LOG_CAP
+    let capped = HOST_LOGGING_CRATES.iter().any(|name| {
+        target
+            .strip_prefix(name)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
+    });
+    !capped || *metadata.level() <= HOST_LOGGING_CRATE_CAP
 }
 
 /// The endpoint origin of a registered `WebPush` token, the key of the
@@ -533,43 +584,51 @@ impl WebPushSender {
         self.backoffs().stamp(origin, Instant::now()).1
     }
 
-    /// Waits until `origin` is not backing off and returns the epoch the
-    /// send carries.
-    async fn wait_out_backoff(&self, origin: &str) -> u64 {
-        loop {
-            let (epoch, retry_at) = self.backoffs().stamp(origin, Instant::now());
-            match retry_at {
-                None => return epoch,
-                Some(retry_at) => {
-                    tracing::debug!(
-                        platform = "webpush",
-                        "endpoint origin backing off; wake waits"
-                    );
-                    tokio::time::sleep_until(retry_at).await;
-                }
-            }
-        }
+    /// Completes once a lookup frees a permit of this sender's endpoint
+    /// lookup pool, at once when one freed since the last completed wait.
+    #[cfg(any(test, feature = "push-store"))]
+    pub(crate) async fn lookup_permit_freed(&self) {
+        self.resolver.lookup_permit_freed().await;
     }
 
-    /// Sends one wake signal to `subscription`.
-    pub async fn send(&self, subscription: &WebPushSubscription) -> PushSendOutcome {
+    /// Takes every endpoint lookup permit until the returned permits drop.
+    #[cfg(test)]
+    pub(crate) fn exhaust_lookup_permits(
+        &self,
+    ) -> Result<Vec<super::push_endpoint::LookupPermit>, EndpointError> {
+        self.resolver.exhaust_permits()
+    }
+
+    /// Sends one wake signal to `subscription`, or defers it without
+    /// sending: [`SendDeferral::BackingOff`] at once while the endpoint's
+    /// origin is backing off, and [`SendDeferral::LookupPoolFull`] when the
+    /// relay's endpoint lookup pool is full. A deferred send records no
+    /// back-off step. It never waits out a back-off.
+    pub async fn send(&self, subscription: &WebPushSubscription) -> SendAttempt {
         let parsed = match parse_endpoint(subscription.endpoint()) {
             Ok(parsed) => parsed,
             Err(error) => {
                 tracing::debug!(platform = "webpush", %error, "endpoint refused before sending");
-                return PushSendOutcome::InvalidToken;
+                return SendAttempt::Sent(PushSendOutcome::InvalidToken);
             }
         };
         if let Err(error) = self.resolver.check_literal(&parsed) {
             tracing::debug!(platform = "webpush", %error, "endpoint refused before sending");
-            return PushSendOutcome::InvalidToken;
+            return SendAttempt::Sent(PushSendOutcome::InvalidToken);
         }
         let aud = parsed.aud();
-        // The dispatcher holds a wake for an origin in back-off; this wait
+        // The dispatcher holds a wake for an origin in back-off; this check
         // covers a back-off that began after it looked.
-        let epoch = self.wait_out_backoff(aud).await;
+        let (epoch, retry_at) = self.backoffs().stamp(aud, Instant::now());
+        if let Some(retry_at) = retry_at {
+            tracing::debug!(
+                platform = "webpush",
+                "endpoint origin backing off; wake held"
+            );
+            return SendAttempt::Deferred(SendDeferral::BackingOff(retry_at));
+        }
         let Some(authorization) = self.authorization(aud) else {
-            return PushSendOutcome::ConfigError;
+            return SendAttempt::Sent(PushSendOutcome::ConfigError);
         };
         let body = match scp_crypto::webpush::seal(
             subscription.p256dh(),
@@ -579,7 +638,7 @@ impl WebPushSender {
             Ok(body) => body,
             Err(error) => {
                 tracing::warn!(platform = "webpush", %error, "wake encryption failed");
-                return PushSendOutcome::ConfigError;
+                return SendAttempt::Sent(PushSendOutcome::ConfigError);
             }
         };
         let mut headers = HeaderMap::with_capacity(4);
@@ -615,6 +674,12 @@ impl WebPushSender {
                 outcome
             }
             Err(error) => match endpoint_error_in(&error) {
+                Some(EndpointError::LookupPoolFull) => {
+                    // The relay's own pool was full: nothing is known about
+                    // the endpoint, so no back-off step and no count.
+                    tracing::debug!(platform = "webpush", "endpoint lookup pool full; wake held");
+                    return SendAttempt::Deferred(SendDeferral::LookupPoolFull);
+                }
                 Some(refusal) if refusal.is_refusal() => {
                     tracing::debug!(platform = "webpush", error = %refusal, "endpoint refused at connect");
                     PushSendOutcome::InvalidToken
@@ -642,7 +707,7 @@ impl WebPushSender {
             },
         };
         self.backoffs().record(aud, epoch, outcome, Instant::now());
-        outcome
+        SendAttempt::Sent(outcome)
     }
 
     /// The `Authorization` header for `aud`, reusing the origin's cached JWT
@@ -999,11 +1064,47 @@ pub(crate) mod tests {
             first,
             "a stale failure moved it"
         );
-        // A send stamped in the current epoch moves it.
+        // A send stamped in the current epoch moves it, and the answer
+        // takes an epoch no earlier stamp holds.
         let (current, _) = backoffs.stamp(origin, now);
         backoffs.record(origin, current, PushSendOutcome::Delivered, now);
-        assert_eq!(backoffs.stamp(origin, now), (0, None));
+        let (after, retry_at) = backoffs.stamp(origin, now);
+        assert_eq!(retry_at, None);
+        for stale in [slow_201, fast_429, other_failure, current] {
+            assert_ne!(after, stale);
+        }
         Ok(())
+    }
+
+    /// B1, epoch reuse: A and B stamp; A's 429 starts a back-off; once it
+    /// ends, C stamps and its 201 ends the back-off; B's failure, stamped
+    /// before all of it, then starts no back-off. Epochs never repeat, so B's
+    /// stamp cannot match the origin's state after C's answer.
+    #[test]
+    fn a_failure_stamped_before_an_answer_starts_no_backoff() {
+        let origin = "https://push.example.net";
+        let now = Instant::now();
+        let mut backoffs = Backoffs::new();
+        let (a, _) = backoffs.stamp(origin, now);
+        let (b, _) = backoffs.stamp(origin, now);
+        backoffs.record(origin, a, PushSendOutcome::Transient, now);
+        assert!(backoffs.stamp(origin, now).1.is_some());
+        let ended = now + ORIGIN_BACKOFF_MIN * 2;
+        let (c, retry_at) = backoffs.stamp(origin, ended);
+        assert_eq!(retry_at, None);
+        backoffs.record(origin, c, PushSendOutcome::Delivered, ended);
+        backoffs.record(origin, b, PushSendOutcome::Transient, ended);
+        assert_eq!(
+            backoffs.stamp(origin, ended).1,
+            None,
+            "a failure stamped before the answer started a back-off"
+        );
+        // The answer reset the step: the next current failure backs off by
+        // the first step again.
+        let (d, _) = backoffs.stamp(origin, ended);
+        backoffs.record(origin, d, PushSendOutcome::Transient, ended);
+        let retry_at = backoffs.stamp(origin, ended).1;
+        assert!(retry_at.is_some_and(|at| at - ended <= ORIGIN_BACKOFF_MIN.mul_f64(1.25)));
     }
 
     /// B3: the back-off map is bounded and never forgets a back-off that has
@@ -1019,7 +1120,8 @@ pub(crate) mod tests {
             backoffs.record(&origin, epoch, PushSendOutcome::Transient, now);
         }
         let late = "https://late.example.net";
-        backoffs.record(late, 0, PushSendOutcome::Transient, now);
+        let (late_epoch, _) = backoffs.stamp(late, now);
+        backoffs.record(late, late_epoch, PushSendOutcome::Transient, now);
         assert_eq!(backoffs.origins.len(), ORIGIN_BACKOFF_CAPACITY);
         assert_eq!(backoffs.stamp(late, now).1, None);
         assert!(
@@ -1031,9 +1133,16 @@ pub(crate) mod tests {
         );
         // Every back-off has ended: the new origin's failure makes room.
         let later = now + ORIGIN_BACKOFF_MIN * 2;
-        backoffs.record(late, 0, PushSendOutcome::Transient, later);
+        let forgotten = "https://h0.example.net";
+        let (stale, _) = backoffs.stamp(forgotten, later);
+        backoffs.record(late, late_epoch, PushSendOutcome::Transient, later);
         assert!(backoffs.stamp(late, later).1.is_some());
         assert_eq!(backoffs.origins.len(), 1);
+        // A stamp taken before the map forgot an origin matches nothing
+        // after it.
+        assert_ne!(backoffs.stamp(forgotten, later).0, stale);
+        backoffs.record(forgotten, stale, PushSendOutcome::Transient, later);
+        assert_eq!(backoffs.stamp(forgotten, later).1, None);
     }
 
     /// B3: JWT cache churn never forgets an origin's back-off.
@@ -1041,9 +1150,10 @@ pub(crate) mod tests {
     async fn jwt_cache_churn_keeps_a_backoff() -> TestResult {
         let sender = production_sender(clock())?;
         let origin = "https://push.example.net";
+        let (epoch, _) = sender.backoffs().stamp(origin, Instant::now());
         sender
             .backoffs()
-            .record(origin, 0, PushSendOutcome::Transient, Instant::now());
+            .record(origin, epoch, PushSendOutcome::Transient, Instant::now());
         for n in 0..ORIGIN_CACHE_CAPACITY.get() + 50 {
             sender
                 .authorization(&format!("https://h{n}.example.net"))
@@ -1061,7 +1171,10 @@ pub(crate) mod tests {
         let sender = sender_for(&server, true, clock())?;
         let endpoint = server.endpoint("push.example.net", PATH);
         let (ua, subscription) = subscribe(endpoint.clone())?;
-        assert_eq!(sender.send(&subscription).await, PushSendOutcome::Delivered);
+        assert_eq!(
+            sender.send(&subscription).await,
+            SendAttempt::Sent(PushSendOutcome::Delivered)
+        );
 
         let requests = server.requests().await;
         let [request] = requests.as_slice() else {
@@ -1095,7 +1208,10 @@ pub(crate) mod tests {
         let sender = sender_for(&server, true, clock())?;
         let (ua, subscription) = subscribe(server.endpoint("push.example.net", PATH))?;
         for _ in 0..3 {
-            assert_eq!(sender.send(&subscription).await, PushSendOutcome::Delivered);
+            assert_eq!(
+                sender.send(&subscription).await,
+                SendAttempt::Sent(PushSendOutcome::Delivered)
+            );
         }
         let bodies: Vec<Vec<u8>> = server
             .requests()
@@ -1142,7 +1258,7 @@ pub(crate) mod tests {
             let (_, subscription) = subscribe(endpoint.clone())?;
             assert_eq!(
                 sender.send(&subscription).await,
-                PushSendOutcome::InvalidToken,
+                SendAttempt::Sent(PushSendOutcome::InvalidToken),
                 "{endpoint}"
             );
         }
@@ -1193,7 +1309,11 @@ pub(crate) mod tests {
             let server = TlsTestServer::start_routed(vec![("/", vec![Reply::empty(status)])]).await;
             let sender = sender_for(&server, true, clock())?;
             let (_, subscription) = subscribe(server.endpoint("push.example.net", PATH))?;
-            assert_eq!(sender.send(&subscription).await, expected, "{status}");
+            assert_eq!(
+                sender.send(&subscription).await,
+                SendAttempt::Sent(expected),
+                "{status}"
+            );
             assert_eq!(server.requests().await.len(), 1, "{status}");
         }
 
@@ -1203,13 +1323,19 @@ pub(crate) mod tests {
         let server = TlsTestServer::start_routed(vec![]).await;
         let sender = sender_for(&server, true, clock())?;
         let (_, subscription) = subscribe(format!("https://push.example.net:{port}{PATH}"))?;
-        assert_eq!(sender.send(&subscription).await, Unreachable);
+        assert_eq!(
+            sender.send(&subscription).await,
+            SendAttempt::Sent(Unreachable)
+        );
 
         // No answer before the deadline is Unreachable.
         let server = TlsTestServer::start_routed(vec![("/", vec![Reply::hang()])]).await;
         let sender = sender_with_deadline(&server, true, clock(), Duration::from_millis(300))?;
         let (_, subscription) = subscribe(server.endpoint("push.example.net", PATH))?;
-        assert_eq!(sender.send(&subscription).await, Unreachable);
+        assert_eq!(
+            sender.send(&subscription).await,
+            SendAttempt::Sent(Unreachable)
+        );
         assert_eq!(server.requests().await.len(), 1);
         Ok(())
     }
@@ -1224,7 +1350,7 @@ pub(crate) mod tests {
             let (_, subscription) = subscribe(format!("https://{host}{PATH}"))?;
             assert_eq!(
                 sender.send(&subscription).await,
-                PushSendOutcome::Transient,
+                SendAttempt::Sent(PushSendOutcome::Transient),
                 "{host}"
             );
         }
@@ -1232,9 +1358,10 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    /// Q6 and B2: a failure backs off its own origin only. A wake to that
-    /// origin during the back-off waits it out and is delivered, and another
-    /// origin is unaffected.
+    /// Q6 and B2: a failure backs off its own origin only. A send to that
+    /// origin during the back-off returns at once, deferred until the
+    /// back-off ends, with no request and no sleep; sent after the end it is
+    /// delivered. Another origin is unaffected.
     #[tokio::test]
     async fn transient_backs_off_only_its_own_origin() -> TestResult {
         let server = TlsTestServer::start_routed(vec![
@@ -1247,7 +1374,10 @@ pub(crate) mod tests {
         let (_, same_origin) = subscribe(server.endpoint("push.example.net", "/ok"))?;
         let (_, other_origin) = subscribe(server.endpoint("hung.example.net", "/ok"))?;
 
-        assert_eq!(sender.send(&busy).await, PushSendOutcome::Transient);
+        assert_eq!(
+            sender.send(&busy).await,
+            SendAttempt::Sent(PushSendOutcome::Transient)
+        );
         let aud = parse_endpoint(&server.endpoint("push.example.net", "/"))?
             .aud()
             .to_owned();
@@ -1255,12 +1385,26 @@ pub(crate) mod tests {
         assert!(retry_at - Instant::now() <= ORIGIN_BACKOFF_MIN.mul_f64(1.25));
         // Another origin is unaffected.
         let started = Instant::now();
-        assert_eq!(sender.send(&other_origin).await, PushSendOutcome::Delivered);
+        assert_eq!(
+            sender.send(&other_origin).await,
+            SendAttempt::Sent(PushSendOutcome::Delivered)
+        );
         assert!(started.elapsed() < ORIGIN_BACKOFF_MIN / 2);
-        // A wake to the backing-off origin is held, not consumed, and
-        // delivered once the back-off ends.
-        assert_eq!(sender.send(&same_origin).await, PushSendOutcome::Delivered);
-        assert!(Instant::now() >= retry_at);
+        // A send to the backing-off origin does not sleep out the back-off:
+        // it returns at once, deferred, and sends nothing.
+        let started = Instant::now();
+        assert_eq!(
+            sender.send(&same_origin).await,
+            SendAttempt::Deferred(SendDeferral::BackingOff(retry_at))
+        );
+        assert!(started.elapsed() < ORIGIN_BACKOFF_MIN / 2);
+        assert_eq!(server.requests().await.len(), 2);
+        // Sent once the back-off ends, it is delivered.
+        tokio::time::sleep_until(retry_at).await;
+        assert_eq!(
+            sender.send(&same_origin).await,
+            SendAttempt::Sent(PushSendOutcome::Delivered)
+        );
         let paths: Vec<String> = server
             .requests()
             .await
@@ -1269,6 +1413,62 @@ pub(crate) mod tests {
             .collect();
         assert_eq!(paths, ["/busy", "/ok", "/ok"]);
         Ok(())
+    }
+
+    /// A send that finds the relay's endpoint lookup pool full sends
+    /// nothing, records no back-off for the origin, and is deferred until a
+    /// permit frees; the same send then goes out. A full local pool says
+    /// nothing about the endpoint.
+    #[tokio::test]
+    async fn a_full_lookup_pool_defers_without_a_backoff() -> TestResult {
+        let server = TlsTestServer::start_routed(vec![("/", vec![Reply::empty(201)])]).await;
+        let sender = sender_for(&server, true, clock())?;
+        let (_, subscription) = subscribe(server.endpoint("push.example.net", PATH))?;
+        let aud = parse_endpoint(&server.endpoint("push.example.net", "/"))?
+            .aud()
+            .to_owned();
+        let held = sender.exhaust_lookup_permits()?;
+        assert_eq!(
+            sender.send(&subscription).await,
+            SendAttempt::Deferred(SendDeferral::LookupPoolFull)
+        );
+        assert_eq!(
+            sender.retry_at(&aud),
+            None,
+            "a full pool backed off the origin"
+        );
+        assert!(server.requests().await.is_empty());
+        let freed = sender.lookup_permit_freed();
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(1), freed).await?;
+        assert_eq!(
+            sender.send(&subscription).await,
+            SendAttempt::Sent(PushSendOutcome::Delivered)
+        );
+        assert_eq!(server.requests().await.len(), 1);
+        Ok(())
+    }
+
+    /// G2: the capture receives `log` records, as the relay's subscriber
+    /// does, so a raw `log::debug!` naming a host is caught; and the relay's
+    /// cap holds reqwest, which names each new connection's host through
+    /// `log` at DEBUG, at INFO.
+    #[test]
+    fn log_records_are_captured_and_reqwest_is_capped() {
+        let capture = LogCapture::install(admits_log_event);
+        log::debug!(target: "scp_transport::relay::push_webpush", "log marker push.example.net");
+        log::debug!(
+            target: "reqwest::connect",
+            "starting new connection: https://push.example.net/"
+        );
+        log::info!(target: "reqwest::connect", "reqwest info marker");
+        let logs = capture.contents();
+        assert!(
+            logs.contains("log marker push.example.net"),
+            "a `log` record did not reach the capture: {logs}"
+        );
+        assert!(!logs.contains("starting new connection"), "{logs}");
+        assert!(logs.contains("reqwest info marker"), "{logs}");
     }
 
     /// B1: sends already in flight when their origin starts backing off,
@@ -1281,7 +1481,10 @@ pub(crate) mod tests {
         let (_, subscription) = subscribe(server.endpoint("push.example.net", PATH))?;
         let outcomes =
             futures::future::join_all((0..IN_FLIGHT).map(|_| sender.send(&subscription))).await;
-        assert_eq!(outcomes, [PushSendOutcome::Unreachable; IN_FLIGHT]);
+        assert_eq!(
+            outcomes,
+            [SendAttempt::Sent(PushSendOutcome::Unreachable); IN_FLIGHT]
+        );
         assert_eq!(server.requests().await.len(), IN_FLIGHT);
         let aud = parse_endpoint(&server.endpoint("push.example.net", "/"))?
             .aud()
@@ -1308,13 +1511,13 @@ pub(crate) mod tests {
         ] {
             assert_eq!(
                 sender.send_registered(&malformed).await,
-                PushSendOutcome::InvalidToken
+                SendAttempt::Sent(PushSendOutcome::InvalidToken)
             );
         }
         assert!(server.requests().await.is_empty());
         assert_eq!(
             sender.send_registered(&token).await,
-            PushSendOutcome::Delivered
+            SendAttempt::Sent(PushSendOutcome::Delivered)
         );
         let requests = server.requests().await;
         let [request] = requests.as_slice() else {
@@ -1339,7 +1542,7 @@ pub(crate) mod tests {
         let (_, subscription) = subscribe(server.endpoint("push.example.net", "/moved"))?;
         assert_eq!(
             sender.send(&subscription).await,
-            PushSendOutcome::InvalidToken
+            SendAttempt::Sent(PushSendOutcome::InvalidToken)
         );
         assert_eq!(server.requests().await.len(), 1);
         Ok(())
@@ -1373,9 +1576,10 @@ pub(crate) mod tests {
         }
         assert_eq!(jwts.len(), 3);
         let logs = capture.contents();
-        // The capture applies the relay's own log cap, which holds
-        // hyper-util, whose DEBUG and TRACE lines name the host and port it
-        // connects to, at INFO. No captured line, from any target, names the
+        // The capture forwards `log` records, as the relay's subscriber does,
+        // and applies the relay's own log cap, which holds hyper-util and
+        // reqwest, whose DEBUG and TRACE lines name the host each connection
+        // goes to, at INFO. No captured line, from any target, names the
         // endpoint's host or address.
         let own = logs
             .lines()

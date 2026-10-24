@@ -184,7 +184,10 @@ base64 = { workspace = true }
 k256 = { version = "0.14", optional = true, features = ["schnorr"] }
 igd-next = { version = "0.16", optional = true, features = ["aio_tokio"] }
 natpmp = { version = "0.5", optional = true, features = ["tokio"] }
-tracing-subscriber = { version = "0.3", optional = true, features = ["env-filter", "json"] }
+# `tracing-log`: the relay's `try_init` forwards `log` records (reqwest's) into
+# the subscriber, where the relay's log cap holds them; named, not left to the
+# default features.
+tracing-subscriber = { version = "0.3", optional = true, features = ["env-filter", "json", "tracing-log"] }
 
 [dev-dependencies]
 # `testing` compiles `scp_core::push::PushSigningKey::for_testing` and
@@ -205,6 +208,12 @@ tokio-tungstenite = { version = "0.24", features = ["connect"] }
 futures = "0.3"
 rmpv = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# The push sender tests' log capture forwards `log` records into tracing, as
+# the relay's own subscriber does (tracing-subscriber's `tracing-log`
+# feature), so a crate that logs through `log` (reqwest) reaches the capture,
+# and its tests emit `log` records of their own. Both already in the graph.
+log = "0.4"
+tracing-log = "0.2"
 tempfile = "3"
 rcgen = "0.13"
 k256 = { version = "0.14", features = ["schnorr"] }

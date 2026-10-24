@@ -98,7 +98,7 @@ impl<S> Filter<S> for CaptureFilter {
 
 /// Installs, once per test process, a global subscriber that formats every
 /// event of every level and target, enabled only on a thread with an active
-/// capture.
+/// capture, and a `log` logger that forwards every `log` record to it.
 ///
 /// A thread-scoped `set_default` subscriber loses events: a callsite another
 /// test thread registers concurrently can cache `Interest::never`. A global
@@ -130,6 +130,10 @@ fn install_global() {
             });
         tracing::subscriber::set_global_default(tracing_subscriber::registry().with(layer))
             .expect("no other global subscriber in this test process");
+        // The relay's subscriber forwards `log` records into tracing
+        // (`try_init` with tracing-subscriber's `tracing-log` feature), and
+        // reqwest logs only through `log`, so the capture forwards them too.
+        tracing_log::LogTracer::init().expect("no other logger in this test process");
         armed.store(true, Ordering::SeqCst);
         tracing::callsite::rebuild_interest_cache();
     });

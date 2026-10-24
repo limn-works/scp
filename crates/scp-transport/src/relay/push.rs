@@ -4,10 +4,11 @@
 //! request for the registration's platform. [`PushSender`] is the one type the
 //! relay holds per configured platform; its arms are the production senders
 //! [`ApnsSender`] (PUSH-010), [`FcmSender`] (PUSH-011) and [`WebPushSender`]
-//! (PUSH-022). Every send returns a
-//! [`PushSendOutcome`], which the dispatcher of PUSH-008
-//! ([`push_dispatch`](super::push_dispatch)) reads to keep or remove a
-//! registration.
+//! (PUSH-022). Every send returns a [`SendAttempt`]: the
+//! [`PushSendOutcome`] of a send that went out, which the dispatcher of
+//! PUSH-008 ([`push_dispatch`](super::push_dispatch)) reads to keep or remove
+//! a registration, or the [`SendDeferral`] of a `WebPush` send that did not
+//! start, which the dispatcher holds and retries without counting it.
 //!
 //! No shipped arm of [`PushSender`] accepts a send without performing it. The
 //! `Recording` arm reports scripted outcomes for sends that never happened, so
@@ -35,6 +36,31 @@ pub use super::push_apns::{
 };
 pub use super::push_fcm::{FcmConfig, FcmCredentialError, FcmSender, FcmServiceAccount};
 pub use super::push_webpush::{VapidSubject, WebPushConfig, WebPushSender};
+
+/// Why a `WebPush` send did not start.
+///
+/// Neither reason says anything about the registration's endpoint, so the
+/// dispatcher counts neither toward removal or back-off: it holds the wake
+/// and sends it once the reason ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendDeferral {
+    /// The endpoint's origin is backing off until this instant.
+    BackingOff(tokio::time::Instant),
+    /// Every permit of the relay's own endpoint lookup pool was taken, so the
+    /// send could not resolve the endpoint's host
+    /// ([`EndpointError::LookupPoolFull`](super::push_endpoint::EndpointError::LookupPoolFull)).
+    LookupPoolFull,
+}
+
+/// What one call to [`PushSender::send_registered`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendAttempt {
+    /// The send ran, with this outcome.
+    Sent(PushSendOutcome),
+    /// The send did not start, for this reason; nothing was sent and the
+    /// outcome of the wake is still to come.
+    Deferred(SendDeferral),
+}
 
 /// The result of one wake-signal send.
 ///
@@ -129,7 +155,9 @@ impl PushSender {
     /// Sends one wake signal to a token as a registration carries it, the
     /// raw `token` bytes of `PushRegistration` (§22.11.4), and reports the
     /// outcome. Never fails: every network, credential, and response
-    /// condition maps to a [`PushSendOutcome`].
+    /// condition maps to a [`PushSendOutcome`], except the two conditions of
+    /// the relay's own state under which a `WebPush` send does not start,
+    /// which map to a [`SendDeferral`]. APNs and FCM never defer.
     ///
     /// - APNs: the bytes are the device token, which iOS hands the app as
     ///   raw bytes; the request path carries their lowercase hex (§10.7.1
@@ -140,31 +168,42 @@ impl PushSender {
     /// - `WebPush`: the bytes are the §22.11.4 `WebPush` token; bytes that
     ///   [`WebPushSubscription::decode`] rejects are `InvalidToken`, and no
     ///   request is sent for them.
-    pub async fn send_registered(&self, token: &[u8]) -> PushSendOutcome {
+    pub async fn send_registered(&self, token: &[u8]) -> SendAttempt {
         match self {
             Self::Apns(sender) => {
                 if token.is_empty() {
                     tracing::debug!(platform = "apns", "device token is empty");
-                    return PushSendOutcome::InvalidToken;
+                    return SendAttempt::Sent(PushSendOutcome::InvalidToken);
                 }
-                sender.send(&PushDeviceToken::new(hex::encode(token))).await
+                SendAttempt::Sent(sender.send(&PushDeviceToken::new(hex::encode(token))).await)
             }
             Self::Fcm(sender) => {
                 let Ok(text) = std::str::from_utf8(token) else {
                     tracing::debug!(platform = "fcm", "registration token is not UTF-8");
-                    return PushSendOutcome::InvalidToken;
+                    return SendAttempt::Sent(PushSendOutcome::InvalidToken);
                 };
-                sender.send(&PushDeviceToken::new(text)).await
+                SendAttempt::Sent(sender.send(&PushDeviceToken::new(text)).await)
             }
             Self::WebPush(sender) => match WebPushSubscription::decode(token) {
                 Ok(subscription) => sender.send(&subscription).await,
                 Err(error) => {
                     tracing::debug!(platform = "webpush", %error, "WebPush token is malformed");
-                    PushSendOutcome::InvalidToken
+                    SendAttempt::Sent(PushSendOutcome::InvalidToken)
                 }
             },
             #[cfg(feature = "testing")]
-            Self::Recording(sender) => sender.record(token).await,
+            Self::Recording(sender) => SendAttempt::Sent(sender.record(token).await),
+        }
+    }
+
+    /// Completes once the `WebPush` sender's endpoint lookup pool frees a
+    /// permit, at once when one freed since the last completed wait. Never
+    /// completes for another sender, whose sends never defer on the pool.
+    #[cfg(feature = "push-store")]
+    pub(crate) async fn lookup_permit_freed(&self) {
+        match self {
+            Self::WebPush(sender) => sender.lookup_permit_freed().await,
+            _ => std::future::pending().await,
         }
     }
 
@@ -519,11 +558,11 @@ mod tests {
         assert_eq!(sender.platform(), PushPlatform::Fcm);
         assert_eq!(
             sender.send_registered(b"tok-a").await,
-            PushSendOutcome::Delivered
+            SendAttempt::Sent(PushSendOutcome::Delivered)
         );
         assert_eq!(
             sender.send_registered(b"tok-b").await,
-            PushSendOutcome::ConfigError
+            SendAttempt::Sent(PushSendOutcome::ConfigError)
         );
         assert_eq!(
             recorder.sent().await,
@@ -559,7 +598,7 @@ mod tests {
         gate.admit(1);
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(5), send).await??,
-            PushSendOutcome::Delivered
+            SendAttempt::Sent(PushSendOutcome::Delivered)
         );
         Ok(())
     }
@@ -578,7 +617,7 @@ mod tests {
         )?);
         assert_eq!(
             sender.send_registered(b"").await,
-            PushSendOutcome::InvalidToken
+            SendAttempt::Sent(PushSendOutcome::InvalidToken)
         );
         assert!(server.requests().await.is_empty(), "a request was made");
         Ok(())
@@ -600,7 +639,7 @@ mod tests {
         )?);
         assert_eq!(
             sender.send_registered(&[0xff, 0xfe, 0x41]).await,
-            PushSendOutcome::InvalidToken
+            SendAttempt::Sent(PushSendOutcome::InvalidToken)
         );
         assert!(server.requests().await.is_empty(), "a request was made");
         Ok(())

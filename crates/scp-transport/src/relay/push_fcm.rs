@@ -722,7 +722,10 @@ pub(crate) mod tests {
         let outcome = PushSender::Fcm(sender)
             .send_registered(REG_TOKEN.as_bytes())
             .await;
-        assert_eq!(outcome, PushSendOutcome::Delivered);
+        assert_eq!(
+            outcome,
+            super::super::push::SendAttempt::Sent(PushSendOutcome::Delivered)
+        );
 
         let requests = server.requests().await;
         let sends = sends(&requests);

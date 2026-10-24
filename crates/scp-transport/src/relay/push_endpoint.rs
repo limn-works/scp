@@ -32,7 +32,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use url::{Host, Url};
 
 /// The longest a registration-time or send-time DNS lookup may take
@@ -108,10 +108,15 @@ pub enum EndpointError {
     /// The endpoint's host name resolves to no address.
     #[error("the WebPush endpoint host resolves to no address")]
     DoesNotResolve,
-    /// The lookup took longer than [`RESOLVE_TIMEOUT`], or found every
-    /// lookup permit taken and did not start.
+    /// The lookup took longer than [`RESOLVE_TIMEOUT`].
     #[error("the WebPush endpoint host lookup timed out")]
     ResolveTimeout,
+    /// Every permit of the relay's bounded lookup pool was taken, so no
+    /// lookup started. The relay's own pool was full and nothing is known
+    /// about the endpoint: a send neither goes out nor counts, and the
+    /// dispatcher holds the wake until a permit frees.
+    #[error("the relay's endpoint lookup pool is full; no lookup started")]
+    LookupPoolFull,
     /// The lookup failed.
     #[error("the WebPush endpoint host lookup failed: {0:?}")]
     Resolve(std::io::ErrorKind),
@@ -119,14 +124,15 @@ pub enum EndpointError {
 
 impl EndpointError {
     /// Whether the endpoint itself is refused, as opposed to a lookup that
-    /// found no address, failed or timed out, which a later attempt may pass.
-    /// A send counts only a refusal toward removal (spec 10 §10.7.1
-    /// **Unreachable `WebPush` push service** keeps DNS failure transient).
+    /// found no address, failed, timed out or never started, which a later
+    /// attempt may pass. A send counts only a refusal toward removal (spec 10
+    /// §10.7.1 **Unreachable `WebPush` push service** keeps DNS failure
+    /// transient).
     #[must_use]
     pub const fn is_refusal(self) -> bool {
         !matches!(
             self,
-            Self::ResolveTimeout | Self::Resolve(_) | Self::DoesNotResolve
+            Self::ResolveTimeout | Self::Resolve(_) | Self::DoesNotResolve | Self::LookupPoolFull
         )
     }
 }
@@ -632,10 +638,22 @@ enum LookupPurpose {
 }
 
 /// The permits one lookup holds until the lookup itself ends, even after its
-/// caller stopped waiting.
-struct LookupPermit {
-    _all: OwnedSemaphorePermit,
-    _registration: Option<OwnedSemaphorePermit>,
+/// caller stopped waiting. Dropping it returns the permits to the pool and
+/// then signals the pool's `freed`.
+pub(crate) struct LookupPermit {
+    all: Option<OwnedSemaphorePermit>,
+    registration: Option<OwnedSemaphorePermit>,
+    freed: Arc<Notify>,
+}
+
+impl Drop for LookupPermit {
+    fn drop(&mut self) {
+        // The permits go back before the signal, so a woken waiter finds
+        // them free.
+        drop(self.registration.take());
+        drop(self.all.take());
+        self.freed.notify_one();
+    }
 }
 
 /// The bounded lookup pool a [`CheckedResolver`] and its clones share.
@@ -643,6 +661,10 @@ struct LookupPermit {
 struct LookupPermits {
     all: Arc<Semaphore>,
     registration: Arc<Semaphore>,
+    /// Signalled each time a lookup returns its permits. `notify_one` keeps
+    /// one signal for a waiter that has not started waiting, so a permit
+    /// freed between a full-pool refusal and the wait is not missed.
+    freed: Arc<Notify>,
 }
 
 impl LookupPermits {
@@ -650,11 +672,12 @@ impl LookupPermits {
         Self {
             all: Arc::new(Semaphore::new(DNS_LOOKUP_PERMITS)),
             registration: Arc::new(Semaphore::new(REGISTRATION_LOOKUP_PERMITS)),
+            freed: Arc::new(Notify::new()),
         }
     }
 
     /// Takes the permits a lookup for `purpose` needs, or fails fast with
-    /// [`EndpointError::ResolveTimeout`] when the pool is full, before any
+    /// [`EndpointError::LookupPoolFull`] when the pool is full, before any
     /// lookup starts.
     fn try_acquire(&self, purpose: LookupPurpose) -> Result<LookupPermit, EndpointError> {
         let registration = match purpose {
@@ -662,15 +685,16 @@ impl LookupPermits {
             LookupPurpose::Registration => Some(
                 Arc::clone(&self.registration)
                     .try_acquire_owned()
-                    .map_err(|_| EndpointError::ResolveTimeout)?,
+                    .map_err(|_| EndpointError::LookupPoolFull)?,
             ),
         };
         let all = Arc::clone(&self.all)
             .try_acquire_owned()
-            .map_err(|_| EndpointError::ResolveTimeout)?;
+            .map_err(|_| EndpointError::LookupPoolFull)?;
         Ok(LookupPermit {
-            _all: all,
-            _registration: registration,
+            all: Some(all),
+            registration,
+            freed: Arc::clone(&self.freed),
         })
     }
 }
@@ -797,12 +821,22 @@ impl CheckedResolver {
         }
     }
 
-    /// Takes every lookup permit, as lookups stuck past their deadline would.
+    /// Takes every lookup permit, as lookups stuck past their deadline would,
+    /// until the returned permits are dropped.
     #[cfg(test)]
-    fn exhaust_permits(&self) -> Result<Vec<LookupPermit>, EndpointError> {
+    pub(crate) fn exhaust_permits(&self) -> Result<Vec<LookupPermit>, EndpointError> {
         (0..DNS_LOOKUP_PERMITS)
             .map(|_| self.permits.try_acquire(LookupPurpose::Send))
             .collect()
+    }
+
+    /// Completes once a lookup of this resolver or a clone returns its
+    /// permits, at once when one did since the last completed wait. The
+    /// `WebPush` dispatcher waits on it to retry a wake whose send found the
+    /// pool full.
+    #[cfg(any(test, feature = "push-store"))]
+    pub(crate) async fn lookup_permit_freed(&self) {
+        self.permits.freed.notified().await;
     }
 
     fn check(&self, ip: IpAddr) -> Result<(), EndpointError> {
@@ -830,9 +864,10 @@ impl CheckedResolver {
     /// # Errors
     ///
     /// [`EndpointError::Refused`] when any address is refused,
-    /// [`EndpointError::DoesNotResolve`] when there is none, and
+    /// [`EndpointError::DoesNotResolve`] when there is none,
     /// [`EndpointError::ResolveTimeout`] or [`EndpointError::Resolve`] when
-    /// the lookup fails, times out, or finds the lookup pool full.
+    /// the lookup times out or fails, and [`EndpointError::LookupPoolFull`]
+    /// when the lookup pool is full and no lookup started.
     pub async fn resolve_checked(&self, host: &str) -> Result<Vec<IpAddr>, EndpointError> {
         self.resolve_for(host, LookupPurpose::Send).await
     }
@@ -1265,8 +1300,9 @@ mod tests {
         Ok(())
     }
 
-    /// With every lookup permit taken, a lookup fails fast as a resolve
-    /// timeout and starts no lookup.
+    /// With every lookup permit taken, a lookup fails fast as a full pool,
+    /// never as a timeout or a failure of the endpoint, and starts no lookup;
+    /// a freed permit signals the waiter.
     #[tokio::test]
     async fn a_full_lookup_pool_refuses_without_starting_a_lookup() -> TestResult {
         let table = HashMap::from([("public.example".to_owned(), vec![ip("8.8.8.8")?])]);
@@ -1274,21 +1310,24 @@ mod tests {
         let held = resolver.exhaust_permits()?;
         assert_eq!(
             resolver.resolve_checked("public.example").await,
-            Err(EndpointError::ResolveTimeout)
+            Err(EndpointError::LookupPoolFull)
         );
         assert_eq!(
             resolver
                 .check_registration_endpoint("https://public.example/p")
                 .await,
-            Err(EndpointError::ResolveTimeout)
+            Err(EndpointError::LookupPoolFull)
         );
         // A clone shares the pool.
         assert_eq!(
             resolver.clone().resolve_checked("public.example").await,
-            Err(EndpointError::ResolveTimeout)
+            Err(EndpointError::LookupPoolFull)
         );
         assert_eq!(resolver.lookups_started(), 0);
+        assert!(!EndpointError::LookupPoolFull.is_refusal());
+        let freed = resolver.lookup_permit_freed();
         drop(held);
+        tokio::time::timeout(Duration::from_secs(1), freed).await?;
         assert_eq!(resolver.resolve_checked("public.example").await?.len(), 1);
         assert_eq!(resolver.lookups_started(), 1);
         Ok(())
@@ -1304,14 +1343,14 @@ mod tests {
             .collect::<Result<_, _>>()?;
         assert!(matches!(
             permits.try_acquire(LookupPurpose::Registration),
-            Err(EndpointError::ResolveTimeout)
+            Err(EndpointError::LookupPoolFull)
         ));
         let sends: Vec<LookupPermit> = (0..DNS_LOOKUP_PERMITS - REGISTRATION_LOOKUP_PERMITS)
             .map(|_| permits.try_acquire(LookupPurpose::Send))
             .collect::<Result<_, _>>()?;
         assert!(matches!(
             permits.try_acquire(LookupPurpose::Send),
-            Err(EndpointError::ResolveTimeout)
+            Err(EndpointError::LookupPoolFull)
         ));
         drop((held, sends));
         Ok(())
@@ -1325,7 +1364,7 @@ mod tests {
         let started = std::time::Instant::now();
         assert_eq!(
             resolver.resolve_checked("localhost").await,
-            Err(EndpointError::ResolveTimeout)
+            Err(EndpointError::LookupPoolFull)
         );
         assert!(started.elapsed() < Duration::from_millis(500));
         drop(held);

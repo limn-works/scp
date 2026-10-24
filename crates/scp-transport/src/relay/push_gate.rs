@@ -58,7 +58,7 @@ use super::push::PushSender;
 #[cfg(feature = "push-store")]
 use super::push_dispatch::PushService;
 #[cfg(feature = "push-store")]
-use super::push_endpoint::parse_endpoint;
+use super::push_endpoint::{EndpointError, parse_endpoint};
 #[cfg(feature = "push-store")]
 use super::push_store::{PushRegistrationKey, PushRegistrationRecord, PushRegistrationStore};
 
@@ -737,7 +737,9 @@ fn webpush_endpoint(token: &[u8]) -> Result<String, PushPublishGate> {
 
 /// The registration-time ADR-004 address check of `endpoint`, through the
 /// configured `WebPush` sender's resolver: `4060` when an address is refused
-/// or the lookup fails.
+/// or the lookup fails, and `5000` when the relay's own lookup pool is full,
+/// which says nothing about the endpoint and which the registrant retries
+/// (ADR-004, every `5xxx` code).
 #[cfg(feature = "push-store")]
 async fn check_webpush_addresses(
     service: &PushServiceConfig,
@@ -747,11 +749,14 @@ async fn check_webpush_addresses(
         Some(PushSender::WebPush(sender)) => sender
             .check_registration_endpoint(endpoint)
             .await
-            .map_err(|e| {
-                PushPublishGate::rejected(
+            .map_err(|e| match e {
+                EndpointError::LookupPoolFull => {
+                    PushPublishGate::rejected(code::INTERNAL_ERROR, e.to_string())
+                }
+                _ => PushPublishGate::rejected(
                     code::PUSH_REGISTRATION_REJECTED,
                     format!("WebPush endpoint refused: {e}"),
-                )
+                ),
             }),
         // The recording sender sends nothing, so it reaches no address.
         #[cfg(feature = "testing")]
@@ -1571,6 +1576,34 @@ mod tests {
                     assert_eq!(stored, None);
                 }
             }
+            Ok(())
+        }
+
+        /// A registration whose endpoint lookup finds the relay's own lookup
+        /// pool full is `5000`, which the registrant retries, not the `4060`
+        /// refusal of its endpoint, and nothing is stored; once a permit
+        /// frees, the same registration is accepted.
+        #[tokio::test]
+        async fn a_full_lookup_pool_is_5000_not_a_refusal() -> TestResult {
+            let dir = tempfile::tempdir()?;
+            let (service, server) = relay(dir.path(), true).await?;
+            let (_, good) = subscribe(server.endpoint("push.example.net", "/s/1"))?;
+            let token = good.encode();
+            let blob = signed(false, &token, GATE_NOW, false)?;
+            let Some(PushSender::WebPush(sender)) = service.config().senders.first() else {
+                return Err("the service has no WebPush sender".into());
+            };
+            let held = sender.exhaust_lookup_permits()?;
+            let (gate, stored) = present(&service, &blob, &token).await?;
+            assert!(
+                matches!(gate, PushPublishGate::Rejected { code: 5000, .. }),
+                "{gate:?}"
+            );
+            assert_eq!(stored, None);
+            drop(held);
+            let (gate, stored) = present(&service, &blob, &token).await?;
+            assert!(matches!(gate, PushPublishGate::Accepted), "{gate:?}");
+            assert_eq!(stored, Some(GATE_NOW));
             Ok(())
         }
 

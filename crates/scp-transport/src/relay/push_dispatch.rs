@@ -23,8 +23,14 @@
 //!   `WEBPUSH_SENDS_PER_ORIGIN` go to one endpoint origin and at most
 //!   `WEBPUSH_SENDS_PER_TICKET` wake one routing ID, and at most one sends to
 //!   one token. A job that a cap holds back, or whose origin the `WebPush`
-//!   sender is backing off, waits in the drain until it may start; it is
-//!   never dropped and never consumed by the back-off. So origins that stop
+//!   sender is backing off, waits in the drain until it may start, in a
+//!   queue keyed by what holds it back, so a finished send re-examines only
+//!   the jobs it may free. A send the sender defers, because its origin
+//!   began backing off or the relay's endpoint lookup pool was full, gives
+//!   back its slots at once and waits the same way until the back-off ends
+//!   or a lookup permit frees; no send sleeps holding a slot. A waiting job
+//!   is never dropped, and neither a back-off nor a full lookup pool
+//!   consumes it or counts against its origin or token. So origins that stop
 //!   answering, or one routing ID's many tokens, hold at most their caps'
 //!   share of the sends and delay no wake to another origin or routing ID,
 //!   and one token's outcomes reach the store in order. Each drain applies
@@ -94,7 +100,8 @@ pub const fn notify(push: &super::push_gate::PushRole, _routing_id: &[u8; 32]) {
 
 #[cfg(feature = "push-store")]
 mod enabled {
-    use std::collections::{HashMap, HashSet, VecDeque};
+    use std::cmp::Reverse;
+    use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
     use std::fmt;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -108,7 +115,7 @@ mod enabled {
     use tokio_util::sync::{CancellationToken, DropGuard};
     use zeroize::Zeroizing;
 
-    use super::super::push::{PushSendOutcome, PushSender};
+    use super::super::push::{PushSendOutcome, PushSender, SendAttempt, SendDeferral};
     use super::super::push_gate::{PushRole, PushServiceConfig};
     use super::super::push_store::{
         CountFrom, InvalidTokenOutcome, PushRegistrationStore, RoutingId, WakeToken,
@@ -662,17 +669,46 @@ mod enabled {
         fn ticket(&self) -> usize {
             Arc::as_ptr(&self.job.ticket).addr()
         }
+
+        /// The keys whose caps this job counts against while in flight.
+        fn gates(&self) -> impl Iterator<Item = Gate> + use<> {
+            [
+                Some(Gate::Token(self.key)),
+                Some(Gate::Ticket(self.ticket())),
+                self.origin.clone().map(Gate::Origin),
+            ]
+            .into_iter()
+            .flatten()
+        }
     }
 
-    /// Whether a held `WebPush` job may start now.
-    enum Admission {
-        Start,
-        /// A cap or the token's own send in flight holds it; a finished send
-        /// may free it.
-        Wait,
-        /// Its origin is backing off until then.
-        BackoffUntil(tokio::time::Instant),
+    /// A key whose cap, or whose origin's back-off, can keep a held `WebPush`
+    /// job from starting. Each blocked job waits in the queue of the key that
+    /// blocks it, so a finished send re-examines only the queues of the keys
+    /// it frees.
+    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+    enum Gate {
+        /// The token's own send is in flight.
+        Token(TokenKey),
+        /// The routing ID holds [`WEBPUSH_SENDS_PER_TICKET`] sends.
+        Ticket(usize),
+        /// The origin holds [`WEBPUSH_SENDS_PER_ORIGIN`] sends or is backing
+        /// off.
+        Origin(String),
     }
+
+    /// Why a held `WebPush` job may not start now.
+    enum Block {
+        /// The drain runs [`WEBPUSH_CONCURRENT_SENDS`] sends.
+        Sends,
+        /// A key's cap.
+        Cap(Gate),
+        /// The origin is backing off until then.
+        Backoff(String, tokio::time::Instant),
+    }
+
+    /// When an origin's back-off ends, while it is backing off.
+    type RetryAt<'a> = &'a dyn Fn(&str) -> Option<tokio::time::Instant>;
 
     /// The `WebPush` drain's sends in flight, counted by what caps them.
     #[derive(Default)]
@@ -684,22 +720,29 @@ mod enabled {
     }
 
     impl InFlight {
-        fn admission(&self, held: &Held, sender: &PushSender) -> Admission {
-            let origin_full = held.origin.as_ref().is_some_and(|origin| {
-                self.origins.get(origin).copied().unwrap_or(0) >= WEBPUSH_SENDS_PER_ORIGIN
-            });
-            if self.sends >= WEBPUSH_CONCURRENT_SENDS
-                || self.tokens.contains(&held.key)
-                || self.tickets.get(&held.ticket()).copied().unwrap_or(0)
-                    >= WEBPUSH_SENDS_PER_TICKET
-                || origin_full
-            {
-                return Admission::Wait;
+        /// What keeps `held` from starting now: its token's send, its routing
+        /// ID's cap, its origin's cap or back-off, then the drain-wide cap.
+        fn block(&self, held: &Held, retry_at: RetryAt<'_>) -> Option<Block> {
+            if self.tokens.contains(&held.key) {
+                return Some(Block::Cap(Gate::Token(held.key)));
             }
-            held.origin
-                .as_ref()
-                .and_then(|origin| sender.origin_retry_at(origin))
-                .map_or(Admission::Start, Admission::BackoffUntil)
+            let ticket = held.ticket();
+            if self.tickets.get(&ticket).copied().unwrap_or(0) >= WEBPUSH_SENDS_PER_TICKET {
+                return Some(Block::Cap(Gate::Ticket(ticket)));
+            }
+            if let Some(origin) = &held.origin {
+                if self.origins.get(origin).copied().unwrap_or(0) >= WEBPUSH_SENDS_PER_ORIGIN {
+                    return Some(Block::Cap(Gate::Origin(origin.clone())));
+                }
+                if let Some(until) = retry_at(origin) {
+                    return Some(Block::Backoff(origin.clone(), until));
+                }
+            }
+            self.full().then_some(Block::Sends)
+        }
+
+        const fn full(&self) -> bool {
+            self.sends >= WEBPUSH_CONCURRENT_SENDS
         }
 
         fn add(&mut self, held: &Held) {
@@ -732,17 +775,273 @@ mod enabled {
         }
     }
 
+    /// The `WebPush` jobs the drain holds, each in the queue of what blocks
+    /// it.
+    ///
+    /// A job blocked by a key's cap or its origin's back-off waits in that
+    /// key's queue in `gates`; a job blocked only by the drain-wide cap waits
+    /// in `sends`; a job whose send found the endpoint lookup pool full waits
+    /// in `lookup`. A queue keeps the order its jobs began waiting on it, and
+    /// a new job sharing a key with a non-empty queue joins the back of that
+    /// queue, so the jobs waiting on one key start in the order they began
+    /// waiting on it.
+    ///
+    /// Every non-empty queue in `gates` has a head that its own key blocks
+    /// (re-examined when a send holding that key ends, or, for a back-off,
+    /// when `timers` fires), or that waits only on a drain-wide slot (listed
+    /// in `stalled`). A finished send re-examines its keys' queues and, while
+    /// a drain-wide slot is free, the `stalled` queues in the order they
+    /// stalled, then `sends`. Each examination starts the job at a queue's
+    /// head, moves it to the queue of what now blocks it, or ends the pass
+    /// over that queue, so the cost of one event does not grow with the
+    /// number of jobs held.
+    #[derive(Default)]
+    struct Waiting {
+        gates: HashMap<Gate, VecDeque<Held>>,
+        sends: VecDeque<Held>,
+        lookup: VecDeque<Held>,
+        /// The queues whose head waits only on a drain-wide slot, in the
+        /// order they stalled; `stalled_set` holds the same keys.
+        stalled: VecDeque<Gate>,
+        stalled_set: HashSet<Gate>,
+        /// Origin back-off ends to re-examine at, earliest first. `timer_at`
+        /// holds each origin's earliest pending end; a heap entry that no
+        /// longer matches it is stale and skipped.
+        timers: BinaryHeap<Reverse<(tokio::time::Instant, String)>>,
+        timer_at: HashMap<String, tokio::time::Instant>,
+        /// Jobs examined so far, for the cost bound the tests check.
+        #[cfg(test)]
+        examined: usize,
+    }
+
+    impl Waiting {
+        /// Takes in a job that is not waiting: starts it into `ready` when
+        /// nothing blocks it, and otherwise queues it behind the jobs already
+        /// waiting on one of its keys, or on what blocks it.
+        fn arrive(
+            &mut self,
+            held: Held,
+            in_flight: &mut InFlight,
+            retry_at: RetryAt<'_>,
+            ready: &mut Vec<Held>,
+        ) {
+            #[cfg(test)]
+            {
+                self.examined += 1;
+            }
+            // `gates` holds no empty queue.
+            if let Some(gate) = held.gates().find(|gate| self.gates.contains_key(gate)) {
+                self.gates.entry(gate).or_default().push_back(held);
+                return;
+            }
+            match in_flight.block(&held, retry_at) {
+                None => Self::start(held, in_flight, ready),
+                Some(block) => self.wait(held, block),
+            }
+        }
+
+        /// Holds a job whose send was deferred and that is no longer in
+        /// flight: until a lookup permit frees, or as a new arrival, which
+        /// waits out its origin's back-off.
+        fn hold(
+            &mut self,
+            held: Held,
+            deferral: SendDeferral,
+            in_flight: &mut InFlight,
+            retry_at: RetryAt<'_>,
+            ready: &mut Vec<Held>,
+        ) {
+            match deferral {
+                SendDeferral::LookupPoolFull => self.lookup.push_back(held),
+                SendDeferral::BackingOff(_) => self.arrive(held, in_flight, retry_at, ready),
+            }
+        }
+
+        fn start(held: Held, in_flight: &mut InFlight, ready: &mut Vec<Held>) {
+            in_flight.add(&held);
+            ready.push(held);
+        }
+
+        /// Queues `held` on what blocks it.
+        fn wait(&mut self, held: Held, block: Block) {
+            match block {
+                Block::Sends => self.sends.push_back(held),
+                Block::Cap(gate) => self.gates.entry(gate).or_default().push_back(held),
+                Block::Backoff(origin, until) => {
+                    self.schedule(&origin, until);
+                    self.gates
+                        .entry(Gate::Origin(origin))
+                        .or_default()
+                        .push_back(held);
+                }
+            }
+        }
+
+        /// Re-examines `origin`'s queue at `until`, unless an earlier
+        /// re-examination is pending, which schedules the next one itself.
+        fn schedule(&mut self, origin: &str, until: tokio::time::Instant) {
+            if self.timer_at.get(origin).is_some_and(|at| *at <= until) {
+                return;
+            }
+            self.timer_at.insert(origin.to_owned(), until);
+            self.timers.push(Reverse((until, origin.to_owned())));
+        }
+
+        fn stall(&mut self, gate: Gate) {
+            if self.stalled_set.insert(gate.clone()) {
+                self.stalled.push_back(gate);
+            }
+        }
+
+        /// Starts or moves on the jobs at the head of `gate`'s queue until
+        /// one waits on `gate` itself or on a drain-wide slot.
+        fn pass(
+            &mut self,
+            gate: &Gate,
+            in_flight: &mut InFlight,
+            retry_at: RetryAt<'_>,
+            ready: &mut Vec<Held>,
+        ) {
+            loop {
+                let Some(head) = self.gates.get(gate).and_then(VecDeque::front) else {
+                    return;
+                };
+                let block = in_flight.block(head, retry_at);
+                #[cfg(test)]
+                {
+                    self.examined += 1;
+                }
+                match &block {
+                    Some(Block::Sends) => {
+                        self.stall(gate.clone());
+                        return;
+                    }
+                    Some(Block::Cap(blocking)) if blocking == gate => return,
+                    Some(Block::Backoff(origin, until)) if matches!(gate, Gate::Origin(own) if own == origin) =>
+                    {
+                        self.schedule(origin, *until);
+                        return;
+                    }
+                    _ => {}
+                }
+                let Some(queue) = self.gates.get_mut(gate) else {
+                    return;
+                };
+                let Some(next) = queue.pop_front() else {
+                    return;
+                };
+                if queue.is_empty() {
+                    self.gates.remove(gate);
+                }
+                match block {
+                    None => Self::start(next, in_flight, ready),
+                    Some(block) => self.wait(next, block),
+                }
+            }
+        }
+
+        /// Re-examines what a send that is no longer in flight frees: the
+        /// queues of its `gates`, then, while a drain-wide slot is free, the
+        /// stalled queues and `sends`.
+        fn freed(
+            &mut self,
+            gates: impl IntoIterator<Item = Gate>,
+            in_flight: &mut InFlight,
+            retry_at: RetryAt<'_>,
+            ready: &mut Vec<Held>,
+        ) {
+            for gate in gates {
+                self.pass(&gate, in_flight, retry_at, ready);
+            }
+            while !in_flight.full()
+                && let Some(gate) = self.stalled.pop_front()
+            {
+                self.stalled_set.remove(&gate);
+                self.pass(&gate, in_flight, retry_at, ready);
+            }
+            while !in_flight.full()
+                && let Some(held) = self.sends.pop_front()
+            {
+                #[cfg(test)]
+                {
+                    self.examined += 1;
+                }
+                match in_flight.block(&held, retry_at) {
+                    None => Self::start(held, in_flight, ready),
+                    Some(Block::Sends) => {
+                        self.sends.push_front(held);
+                        return;
+                    }
+                    Some(block) => self.wait(held, block),
+                }
+            }
+        }
+
+        /// When the earliest pending back-off re-examination is due.
+        fn next_timer(&self) -> Option<tokio::time::Instant> {
+            self.timers.peek().map(|Reverse((at, _))| *at)
+        }
+
+        /// Re-examines the queue of every origin whose back-off ended by
+        /// `now`.
+        fn timers_due(
+            &mut self,
+            now: tokio::time::Instant,
+            in_flight: &mut InFlight,
+            retry_at: RetryAt<'_>,
+            ready: &mut Vec<Held>,
+        ) {
+            while self.next_timer().is_some_and(|at| at <= now)
+                && let Some(Reverse((at, origin))) = self.timers.pop()
+            {
+                if self.timer_at.get(&origin) == Some(&at) {
+                    self.timer_at.remove(&origin);
+                    self.pass(&Gate::Origin(origin), in_flight, retry_at, ready);
+                }
+            }
+        }
+
+        /// How many jobs wait, in every queue.
+        #[cfg(test)]
+        fn held(&self) -> usize {
+            self.gates.values().map(VecDeque::len).sum::<usize>()
+                + self.sends.len()
+                + self.lookup.len()
+        }
+
+        /// Whether a job waits on a lookup permit.
+        fn awaits_lookup(&self) -> bool {
+            !self.lookup.is_empty()
+        }
+
+        /// Takes in again every job that waits on a lookup permit, once one
+        /// freed. A job whose send finds the pool full again comes back here
+        /// without any request made, so this costs no network I/O, and each
+        /// round follows a lookup that ended.
+        fn lookup_freed(
+            &mut self,
+            in_flight: &mut InFlight,
+            retry_at: RetryAt<'_>,
+            ready: &mut Vec<Held>,
+        ) {
+            for held in std::mem::take(&mut self.lookup) {
+                self.arrive(held, in_flight, retry_at, ready);
+            }
+        }
+    }
+
     /// Sends `held`'s job through `sender`.
-    async fn send_held(sender: &PushSender, held: Held) -> (Held, PushSendOutcome) {
-        let outcome = sender.send_registered(&held.job.token).await;
-        (held, outcome)
+    async fn send_held(sender: &PushSender, held: Held) -> (Held, SendAttempt) {
+        let attempt = sender.send_registered(&held.job.token).await;
+        (held, attempt)
     }
 
     /// What the `WebPush` drain does next.
     enum Step {
         Job(Option<PushJob>),
-        Sent(Held, PushSendOutcome),
+        Sent(Held, SendAttempt),
         BackoffEnded,
+        LookupFreed,
     }
 
     impl Drain {
@@ -767,7 +1066,8 @@ mod enabled {
         }
 
         /// The APNs and FCM drain: one send at a time, and a platform-wide
-        /// back-off after `Transient`.
+        /// back-off after `Transient`. APNs and FCM sends never defer; a
+        /// deferred send is held here and sent again once its reason ends.
         async fn run_serial(&mut self, sender: &PushSender, mut rx: mpsc::Receiver<PushJob>) {
             let mut backoff = ReconnectBackoff::new(TRANSIENT_BACKOFF_MIN, TRANSIENT_BACKOFF_MAX);
             loop {
@@ -781,10 +1081,29 @@ mod enabled {
                 let Some(job) = job else { return };
                 let key = token_key(job.platform, &job.token);
                 lock(&self.queued).remove(&key);
-                let outcome = tokio::select! {
-                    biased;
-                    () = self.stop.cancelled() => return,
-                    outcome = sender.send_registered(&job.token) => outcome,
+                let outcome = loop {
+                    let attempt = tokio::select! {
+                        biased;
+                        () = self.stop.cancelled() => return,
+                        attempt = sender.send_registered(&job.token) => attempt,
+                    };
+                    match attempt {
+                        SendAttempt::Sent(outcome) => break outcome,
+                        SendAttempt::Deferred(SendDeferral::BackingOff(until)) => {
+                            tokio::select! {
+                                biased;
+                                () = self.stop.cancelled() => return,
+                                () = tokio::time::sleep_until(until) => {}
+                            }
+                        }
+                        SendAttempt::Deferred(SendDeferral::LookupPoolFull) => {
+                            tokio::select! {
+                                biased;
+                                () = self.stop.cancelled() => return,
+                                () = sender.lookup_permit_freed() => {}
+                            }
+                        }
+                    }
                 };
                 if !self.apply(job.platform, key, &job.token, outcome).await {
                     return;
@@ -807,55 +1126,51 @@ mod enabled {
         /// per token, with no drain-wide back-off.
         ///
         /// The drain reads every job as it arrives. A job a cap holds back,
-        /// or whose origin the sender is backing off, waits in `held`, in
-        /// arrival order, and keeps its token in `queued`, so the lookup
-        /// still coalesces a further wake for that token into it and counts
-        /// it against the queue's capacity. Held jobs are tried again when a
-        /// send finishes and when the earliest back-off they wait on ends.
-        /// Outcomes are applied on this task, one at a time, and a token
-        /// never has two sends in flight, so one token's outcomes reach the
-        /// store in send order.
+        /// or whose origin the sender is backing off, waits in [`Waiting`]
+        /// and keeps its token in `queued`, so the lookup still coalesces a
+        /// further wake for that token into it and counts it against the
+        /// queue's capacity. A send the sender defers (its origin began
+        /// backing off, or the lookup pool was full) gives up its slots at
+        /// once and is held the same way, unless a newer job for its token
+        /// is already queued, which then wakes the device instead. Outcomes
+        /// are applied on this task, one at a time, and a token never has two
+        /// sends in flight, so one token's outcomes reach the store in send
+        /// order.
         async fn run_concurrent(&mut self, sender: &PushSender, mut rx: mpsc::Receiver<PushJob>) {
             let mut sends = FuturesUnordered::new();
             let mut in_flight = InFlight::default();
-            let mut held: VecDeque<Held> = VecDeque::new();
-            let mut wake_at: Option<tokio::time::Instant> = None;
+            let mut waiting = Waiting::default();
+            let retry_at = |origin: &str| sender.origin_retry_at(origin);
             loop {
+                let next_timer = waiting.next_timer();
                 let step = tokio::select! {
                     biased;
                     () = self.stop.cancelled() => return,
-                    Some((done, outcome)) = sends.next(), if !sends.is_empty() => {
-                        Step::Sent(done, outcome)
+                    Some((done, attempt)) = sends.next(), if !sends.is_empty() => {
+                        Step::Sent(done, attempt)
                     }
                     job = rx.recv() => Step::Job(job),
                     () = tokio::time::sleep_until(
-                        wake_at.unwrap_or_else(tokio::time::Instant::now)
-                    ), if wake_at.is_some() => Step::BackoffEnded,
+                        next_timer.unwrap_or_else(tokio::time::Instant::now)
+                    ), if next_timer.is_some() => Step::BackoffEnded,
+                    () = sender.lookup_permit_freed(), if waiting.awaits_lookup() => {
+                        Step::LookupFreed
+                    }
                 };
-                let rescan = !matches!(step, Step::Job(_));
+                let mut ready = Vec::new();
                 match step {
                     // The lookup holds the queue's sender until it stops, so
                     // `None` means the service is gone.
                     Step::Job(None) => return,
                     Step::Job(Some(job)) => {
-                        let job = Held {
+                        let held = Held {
                             key: token_key(job.platform, &job.token),
                             origin: sender.origin_of(&job.token),
                             job,
                         };
-                        match in_flight.admission(&job, sender) {
-                            Admission::Start => {
-                                self.begin(&job, &mut in_flight);
-                                sends.push(send_held(sender, job));
-                            }
-                            Admission::Wait => held.push_back(job),
-                            Admission::BackoffUntil(until) => {
-                                wake_at = Some(wake_at.map_or(until, |at| at.min(until)));
-                                held.push_back(job);
-                            }
-                        }
+                        waiting.arrive(held, &mut in_flight, &retry_at, &mut ready);
                     }
-                    Step::Sent(done, outcome) => {
+                    Step::Sent(done, SendAttempt::Sent(outcome)) => {
                         in_flight.remove(&done);
                         if !self
                             .apply(done.job.platform, done.key, &done.job.token, outcome)
@@ -863,62 +1178,62 @@ mod enabled {
                         {
                             return;
                         }
+                        waiting.freed(done.gates(), &mut in_flight, &retry_at, &mut ready);
                         drop(done);
                     }
-                    Step::BackoffEnded => {}
-                }
-                if rescan {
-                    let ready;
-                    (ready, wake_at) = self.take_ready(sender, &mut held, &mut in_flight);
-                    for job in ready {
-                        sends.push(send_held(sender, job));
+                    Step::Sent(done, SendAttempt::Deferred(deferral)) => {
+                        in_flight.remove(&done);
+                        let gates: Vec<Gate> = done.gates().collect();
+                        self.hold_deferred(
+                            done,
+                            deferral,
+                            &mut waiting,
+                            &mut in_flight,
+                            &retry_at,
+                            &mut ready,
+                        );
+                        waiting.freed(gates, &mut in_flight, &retry_at, &mut ready);
                     }
+                    Step::BackoffEnded => waiting.timers_due(
+                        tokio::time::Instant::now(),
+                        &mut in_flight,
+                        &retry_at,
+                        &mut ready,
+                    ),
+                    Step::LookupFreed => {
+                        waiting.lookup_freed(&mut in_flight, &retry_at, &mut ready);
+                    }
+                }
+                if !ready.is_empty() {
+                    let mut queued = lock(&self.queued);
+                    for held in &ready {
+                        // A wake for the token from now on queues another job.
+                        queued.remove(&held.key);
+                    }
+                }
+                for held in ready {
+                    sends.push(send_held(sender, held));
                 }
             }
         }
 
-        /// Counts `job` as in flight and takes its token out of `queued`, so
-        /// a wake for the token from now on queues another job. The caller
-        /// starts its send.
-        fn begin(&self, job: &Held, in_flight: &mut InFlight) {
-            lock(&self.queued).remove(&job.key);
-            in_flight.add(job);
-        }
-
-        /// Takes every held job that may start, in arrival order, counted as
-        /// in flight, and returns them with when the earliest back-off a
-        /// still-held job waits on ends.
-        fn take_ready(
+        /// Holds `done`, whose send was deferred and is no longer in flight,
+        /// unless a newer job for its token is queued or waiting, which then
+        /// wakes the device instead. Checked before anything freed starts, so
+        /// a newer job that starts now is still seen as queued.
+        fn hold_deferred(
             &self,
-            sender: &PushSender,
-            held: &mut VecDeque<Held>,
+            done: Held,
+            deferral: SendDeferral,
+            waiting: &mut Waiting,
             in_flight: &mut InFlight,
-        ) -> (Vec<Held>, Option<tokio::time::Instant>) {
-            let mut ready = Vec::new();
-            let mut wake_at: Option<tokio::time::Instant> = None;
-            let mut still = VecDeque::with_capacity(held.len());
-            while let Some(job) = held.pop_front() {
-                if in_flight.sends >= WEBPUSH_CONCURRENT_SENDS {
-                    // No job can start until a send finishes, which runs
-                    // this again.
-                    still.push_back(job);
-                    still.append(held);
-                    break;
-                }
-                match in_flight.admission(&job, sender) {
-                    Admission::Start => {
-                        self.begin(&job, in_flight);
-                        ready.push(job);
-                    }
-                    Admission::Wait => still.push_back(job),
-                    Admission::BackoffUntil(until) => {
-                        wake_at = Some(wake_at.map_or(until, |at| at.min(until)));
-                        still.push_back(job);
-                    }
-                }
+            retry_at: RetryAt<'_>,
+            ready: &mut Vec<Held>,
+        ) {
+            if !lock(&self.queued).insert(done.key) {
+                return;
             }
-            *held = still;
-            (ready, wake_at)
+            waiting.hold(done, deferral, in_flight, retry_at, ready);
         }
 
         /// Sleeps for `delay`; `false` when the service stopped meanwhile.
@@ -1717,6 +2032,178 @@ mod enabled {
             Ok(())
         }
 
+        /// A `WebPush` job for token `n` on `ticket` and `origin`.
+        fn held_job(n: usize, ticket: &Arc<()>, origin: &str) -> Held {
+            let token = format!("token-{n:04}").into_bytes();
+            Held {
+                key: token_key(PushPlatform::WebPush, &token),
+                job: PushJob {
+                    platform: PushPlatform::WebPush,
+                    token: Zeroizing::new(token),
+                    ticket: Arc::clone(ticket),
+                },
+                origin: Some(origin.to_owned()),
+            }
+        }
+
+        fn token_of(held: &Held) -> String {
+            String::from_utf8_lossy(&held.job.token).into_owned()
+        }
+
+        /// A thousand jobs held on one routing ID start in arrival order, and
+        /// each finished send examines a bounded number of held jobs, not
+        /// every one: the whole run examines at most three jobs per send. A
+        /// drain that rescans every held job on each finished send examines
+        /// about half a million.
+        #[test]
+        fn held_jobs_on_one_ticket_start_in_order_at_bounded_cost() {
+            const HELD: usize = 1_000;
+            let total = HELD + WEBPUSH_SENDS_PER_TICKET;
+            let ticket = Arc::new(());
+            let no_backoff = |_: &str| None;
+            let mut waiting = Waiting::default();
+            let mut in_flight = InFlight::default();
+            let mut ready = Vec::new();
+            for n in 0..total {
+                let job = held_job(n, &ticket, "https://push.example.net");
+                waiting.arrive(job, &mut in_flight, &no_backoff, &mut ready);
+            }
+            assert_eq!(ready.len(), WEBPUSH_SENDS_PER_TICKET);
+            assert_eq!(waiting.held(), HELD);
+            let mut running: VecDeque<Held> = std::mem::take(&mut ready).into();
+            let mut order = Vec::new();
+            while let Some(done) = running.pop_front() {
+                order.push(token_of(&done));
+                in_flight.remove(&done);
+                waiting.freed(done.gates(), &mut in_flight, &no_backoff, &mut ready);
+                running.extend(std::mem::take(&mut ready));
+            }
+            let expected: Vec<String> = (0..total).map(|n| format!("token-{n:04}")).collect();
+            assert_eq!(order, expected);
+            assert_eq!(waiting.held(), 0);
+            assert!(
+                waiting.examined <= 3 * total,
+                "{} examinations for {total} jobs",
+                waiting.examined
+            );
+        }
+
+        /// Four sends to one origin are in flight when the origin begins
+        /// backing off, and each comes back deferred. They hold no send slot
+        /// and no origin slot during the back-off, a job to another origin
+        /// starts at once, and all four start, in order, when it ends.
+        #[tokio::test]
+        async fn deferred_sends_hold_no_slot_during_a_backoff() {
+            let origin = "https://push.example.net";
+            let until = tokio::time::Instant::now() + Duration::from_secs(1);
+            let backing_off = std::cell::Cell::new(false);
+            let retry_at = |o: &str| (backing_off.get() && o == origin).then_some(until);
+            let mut waiting = Waiting::default();
+            let mut in_flight = InFlight::default();
+            let mut ready = Vec::new();
+            let tickets: Vec<Arc<()>> = (0..WEBPUSH_SENDS_PER_ORIGIN)
+                .map(|_| Arc::new(()))
+                .collect();
+            for (n, ticket) in tickets.iter().enumerate() {
+                waiting.arrive(
+                    held_job(n, ticket, origin),
+                    &mut in_flight,
+                    &retry_at,
+                    &mut ready,
+                );
+            }
+            assert_eq!(ready.len(), WEBPUSH_SENDS_PER_ORIGIN);
+            assert_eq!(
+                in_flight.origins.get(origin),
+                Some(&WEBPUSH_SENDS_PER_ORIGIN)
+            );
+
+            backing_off.set(true);
+            let mut started = Vec::new();
+            for done in std::mem::take(&mut ready) {
+                in_flight.remove(&done);
+                let gates: Vec<Gate> = done.gates().collect();
+                waiting.hold(
+                    done,
+                    SendDeferral::BackingOff(until),
+                    &mut in_flight,
+                    &retry_at,
+                    &mut ready,
+                );
+                waiting.freed(gates, &mut in_flight, &retry_at, &mut ready);
+                started.append(&mut ready);
+            }
+            assert!(
+                started.is_empty(),
+                "a deferred send restarted during the back-off"
+            );
+            assert_eq!(in_flight.sends, 0);
+            assert_eq!(
+                in_flight.origins.get(origin),
+                None,
+                "an origin slot is held"
+            );
+            assert_eq!(waiting.next_timer(), Some(until));
+
+            let other = Arc::new(());
+            let elsewhere = held_job(9, &other, "https://other.example.net");
+            waiting.arrive(elsewhere, &mut in_flight, &retry_at, &mut ready);
+            assert_eq!(ready.len(), 1, "another origin waited on the back-off");
+
+            backing_off.set(false);
+            let mut after = Vec::new();
+            waiting.timers_due(until, &mut in_flight, &retry_at, &mut after);
+            let order: Vec<String> = after.iter().map(token_of).collect();
+            let expected: Vec<String> = (0..WEBPUSH_SENDS_PER_ORIGIN)
+                .map(|n| format!("token-{n:04}"))
+                .collect();
+            assert_eq!(order, expected);
+            assert_eq!(waiting.next_timer(), None);
+        }
+
+        /// A full endpoint lookup pool holds a wake to a healthy origin
+        /// without consuming it or backing the origin off, and the wake is
+        /// sent once a lookup permit frees, with no further publish.
+        #[tokio::test]
+        async fn a_full_lookup_pool_holds_a_wake_without_a_backoff() -> TestResult {
+            let server = TlsTestServer::start_routed(vec![("/ok", vec![Reply::empty(201)])]).await;
+            let (push, service, _dir) = webpush_service(&server, Duration::from_secs(5))?;
+            let (_, good) = subscribe(server.endpoint("push.example.net", "/ok"))?;
+            let token = good.encode();
+            register(&push, REGISTRANT_A, PushPlatform::WebPush, &token, &[RID]).await?;
+            let Some(PushSender::WebPush(sender)) = service.config().senders.first() else {
+                return Err("the service has no WebPush sender".into());
+            };
+            let aud = crate::relay::push_endpoint::parse_endpoint(
+                &server.endpoint("push.example.net", "/"),
+            )?
+            .aud()
+            .to_owned();
+
+            let held = sender.exhaust_lookup_permits()?;
+            notify(&push, &RID);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(server.requests().await.is_empty());
+            assert_eq!(
+                sender.retry_at(&aud),
+                None,
+                "a full lookup pool backed off a healthy origin"
+            );
+            assert_eq!(
+                service
+                    .config()
+                    .store
+                    .invalid_token_failures(PushPlatform::WebPush, &token)
+                    .await?,
+                Some(0),
+                "a full lookup pool counted against the token"
+            );
+            drop(held);
+            wait_for_requests(&server, 1, Duration::from_secs(5)).await?;
+            assert_eq!(paths(&server).await, ["/ok"]);
+            Ok(())
+        }
+
         /// Drain tests: the recording sender compiles only under `testing`.
         #[cfg(feature = "testing")]
         mod drain {
@@ -1755,6 +2242,59 @@ mod enabled {
 
             fn recording(sender: &RecordingSender) -> PushSender {
                 PushSender::Recording(sender.clone())
+            }
+
+            /// A thousand `WebPush` jobs held on one routing ID behind its
+            /// two sends in flight are all sent, in arrival order.
+            #[tokio::test]
+            async fn a_thousand_held_jobs_on_one_ticket_are_sent_in_order() -> TestResult {
+                const HELD: usize = 1_000;
+                let total = HELD + WEBPUSH_SENDS_PER_TICKET;
+                let (sender, gate) = RecordingSender::gated(
+                    PushPlatform::WebPush,
+                    vec![PushSendOutcome::Delivered; total],
+                );
+                let dir = tempfile::tempdir()?;
+                let (tx, rx) = mpsc::channel(PUSH_QUEUE_CAPACITY);
+                let queued = Arc::new(Mutex::new(HashSet::new()));
+                let stop = CancellationToken::new();
+                let drain = Drain {
+                    senders: Arc::from(vec![recording(&sender)]),
+                    index: 0,
+                    store: PushRegistrationStore::open_sqlite(&dir.path().join("push.db"))?,
+                    queued: Arc::clone(&queued),
+                    logs: Arc::new(Logs::default()),
+                    stop: stop.clone(),
+                    pending_resets: HashSet::new(),
+                };
+                let task = tokio::spawn(drain.run(rx));
+                let ticket = Arc::new(());
+                let tokens: Vec<Vec<u8>> = (0..total)
+                    .map(|n| format!("token-{n:04}").into_bytes())
+                    .collect();
+                for token in &tokens {
+                    lock(&queued).insert(token_key(PushPlatform::WebPush, token));
+                    tx.send(PushJob {
+                        platform: PushPlatform::WebPush,
+                        token: Zeroizing::new(token.clone()),
+                        ticket: Arc::clone(&ticket),
+                    })
+                    .await?;
+                }
+                for _ in 0..1000 {
+                    if tx.capacity() == tx.max_capacity() && lock(&queued).len() == HELD {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                assert_eq!(lock(&queued).len(), HELD, "the drain did not hold the jobs");
+                assert_eq!(sender.sent().await.len(), WEBPUSH_SENDS_PER_TICKET);
+                gate.admit(total);
+                wait_for_sends(&sender, total).await?;
+                assert_eq!(sender.sent().await, tokens);
+                stop.cancel();
+                task.await?;
+                Ok(())
             }
 
             /// Runs `outcomes` through the APNs drain for one token two
