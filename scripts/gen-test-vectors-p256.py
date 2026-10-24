@@ -3522,6 +3522,228 @@ def emit_participation_seed() -> None:
     emit_hex("vector_67.ciphertext", ciphertext)
 
 
+# ---------------------------------------------------------------------------
+# §25.33 concurrent-commit fork-merge vectors 71-79
+# (`09-security-model.md` §9.5.2, §9.7.2, `07-trust-validation-and-capabilities.md`
+# §7.3.1.1 "Concurrent Commits and fork merge", ADR-067)
+#
+# None of these vectors carries a signature. Vectors 71 and 72 are canonical
+# preimages under the §9.5.1 construction; Vector 73 is a MessagePack fork
+# record; Vector 75 is the child-secret PPRF over RFC 9420 ExpandWithLabel.
+# Vectors 73 and 79 also compute the admission bound and the ranks spec 25
+# tabulates, so a changed rule fails here and not only in the spec text.
+# ---------------------------------------------------------------------------
+
+FORK_CONTEXT_ID = b"context-alpha"
+FORK_NOTICE_DOMAIN = "SCP-FORK-NOTICE-V1:"
+DEPARTURE_DOMAIN = "SCP-DEPARTURE-V1:"
+MERGE_CARRY_ITEMS = 8
+PPRF_DEPTH = 256
+
+
+def fork_commit_hash(label: str) -> bytes:
+    return sha256(f"SCP test vector commit {label}".encode())
+
+
+def fork_notice_preimage(
+    member: str,
+    member_since: int,
+    reset_counter: int,
+    epoch: int,
+    own_child: bytes,
+    other_child: bytes,
+    kind: int,
+) -> bytes:
+    return canonical_preimage(
+        FORK_NOTICE_DOMAIN,
+        var_field(FORK_CONTEXT_ID),
+        var_field(member),
+        u64(member_since),
+        u64(reset_counter),
+        u64(epoch),
+        fixed_field(own_child),
+        fixed_field(other_child),
+        u8(kind),
+    )
+
+
+def departure_preimage(member: str, member_since: int, leaf_key_hash: bytes) -> bytes:
+    return canonical_preimage(
+        DEPARTURE_DOMAIN,
+        var_field(FORK_CONTEXT_ID),
+        var_field(member),
+        u64(member_since),
+        fixed_field(leaf_key_hash),
+    )
+
+
+def msgpack_uint(value: int) -> bytes:
+    """The shortest MessagePack header for a non-negative integer."""
+    if value < 0x80:
+        return bytes([value])
+    if value <= 0xFF:
+        return b"\xcc" + u8(value)
+    if value <= 0xFFFF:
+        return b"\xcd" + u16(value)
+    if value <= 0xFFFFFFFF:
+        return b"\xce" + u32(value)
+    return b"\xcf" + u64(value)
+
+
+def fork_record(fork_count: int, end_count: int, end_leaf_hash: bytes) -> bytes:
+    assert fork_count >= 1 and len(end_leaf_hash) == 32
+    return (
+        b"\x93"
+        + msgpack_uint(fork_count)
+        + msgpack_uint(end_count)
+        + b"\xc4\x20"
+        + end_leaf_hash
+    )
+
+
+def merge_depth_bound(members: int) -> int:
+    """K(e) = 2·n_e + 8."""
+    return 2 * members + 8
+
+
+def fork_record_admitted(
+    depth: int, fork_count: int, end_count: int, members: int
+) -> bool:
+    k = merge_depth_bound(members)
+    return (
+        fork_count >= 1
+        and depth <= k
+        and end_count - fork_count <= k * MERGE_CARRY_ITEMS
+    )
+
+
+def mls_kdf_label(label: str, context: bytes, length: int) -> bytes:
+    """RFC 9420 §8 KDFLabel; every vector here is shorter than 64 bytes, so
+    each `<V>` length is one byte."""
+    full = b"MLS 1.0 " + label.encode()
+    assert len(full) < 64 and len(context) < 64
+    return u16(length) + u8(len(full)) + full + u8(len(context)) + context
+
+
+def pprf_child(node: bytes, right: bool) -> bytes:
+    info = mls_kdf_label("tree", b"right" if right else b"left", 32)
+    child = hkdf_expand(node, info, 32)
+    if _HAVE_CRYPTOGRAPHY:
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.kdf.hkdf import HKDFExpand
+
+        check = HKDFExpand(algorithm=hashes.SHA256(), length=32, info=info).derive(node)
+        assert check == child, "PPRF node expansion disagrees with cryptography"
+    return child
+
+
+def pprf_bits(x: bytes) -> list[bool]:
+    """x read most significant bit first; True is the right child."""
+    return [bool((byte >> (7 - i)) & 1) for byte in x for i in range(8)]
+
+
+def pprf_path(root: bytes, x: bytes) -> tuple[list[bytes], list[bytes]]:
+    """Returns the path nodes from the root to the leaf at x, and the copath
+    nodes a punctured tree keeps, root side first."""
+    path = [root]
+    copath = []
+    node = root
+    for bit in pprf_bits(x):
+        copath.append(pprf_child(node, not bit))
+        node = pprf_child(node, bit)
+        path.append(node)
+    return path, copath
+
+
+def merge_rank(position: int, epoch: int, members: int) -> int:
+    """rank(C) = (pos(I) − e) mod n_e."""
+    return (position - epoch) % members
+
+
+def emit_fork_merge() -> None:
+    section("§25.33 Concurrent-commit fork-merge vectors")
+    own = fork_commit_hash("own")
+    other = fork_commit_hash("other")
+    emit_hex("fork.context_id", FORK_CONTEXT_ID)
+    emit("fork.alice", ID_ALICE)
+    emit("fork.bob", ID_BOB)
+    emit("fork.carol", ID_CAROL)
+    emit_hex("fork.own", own)
+    emit_hex("fork.other", other)
+
+    notice = fork_notice_preimage(ID_ALICE, 3, 2, 7, own, other, 0)
+    assert len(notice) == 185
+    emit_hex("vector_71.preimage", notice)
+    emit_hex("vector_71.canonical_hash", sha256(notice))
+    diverged = fork_notice_preimage(ID_ALICE, 3, 2, 7, own, other, 1)
+    emit_hex("vector_71.canonical_hash_kind_1", sha256(diverged))
+
+    leaf_key_hash = sha256(REF_KEY_1.uncompressed)
+    departure = departure_preimage(ID_BOB, 4, leaf_key_hash)
+    assert len(departure) == 134
+    emit_hex("vector_72.leaf_key_hash", leaf_key_hash)
+    emit_hex("vector_72.preimage", departure)
+    emit_hex("vector_72.canonical_hash", sha256(departure))
+
+    end_leaf_hash = sha256(b"SCP test vector leaf L end")
+    small = fork_record(5, 9, end_leaf_hash)
+    large = fork_record(300, 305, end_leaf_hash)
+    assert len(small) == 37 and len(large) == 41
+    emit_hex("vector_73.end_leaf_hash", end_leaf_hash)
+    emit_hex("vector_73.record_5_9", small)
+    emit_hex("vector_73.record_300_305", large)
+    members = 3
+    k = merge_depth_bound(members)
+    assert k == 14
+    emit("vector_73.k_10", k)
+    emit("vector_73.end_count_bound", k * MERGE_CARRY_ITEMS)
+    for c in (24, 25):
+        emit(
+            f"vector_73.admitted_at_c_{c}", fork_record_admitted(c - 10, 5, 9, members)
+        )
+    assert fork_record_admitted(14, 5, 9, members)
+    assert not fork_record_admitted(15, 5, 9, members)
+    assert fork_record_admitted(14, 5, 117, members)
+    assert not fork_record_admitted(14, 5, 118, members)
+    assert not fork_record_admitted(14, 0, 9, members)
+
+    approvers = sorted([ID_CAROL, ID_ALICE, ID_BOB], key=str.encode)
+    assert approvers == [ID_BOB, ID_CAROL, ID_ALICE]
+    emit("vector_74.approvers", json.dumps(approvers))
+
+    root = bytes(range(32))
+    x = sha256(b"SCP test vector pprf input")
+    path, copath = pprf_path(root, x)
+    assert len(path) == PPRF_DEPTH + 1 and len(copath) == PPRF_DEPTH
+    assert format(x[0], "08b") == "00000111"
+    assert copath[0] == pprf_child(root, True)
+    emit_hex("vector_75.root", root)
+    emit_hex("vector_75.kdf_label_left", mls_kdf_label("tree", b"left", 32))
+    emit_hex("vector_75.left_child", pprf_child(root, False))
+    emit_hex("vector_75.right_child", pprf_child(root, True))
+    emit_hex("vector_75.x", x)
+    emit("vector_75.x_first_byte_bits", format(x[0], "08b"))
+    emit_hex("vector_75.node_after_two_steps", path[2])
+    emit_hex("vector_75.leaf", path[-1])
+    emit_hex("vector_75.first_copath_node", copath[0])
+    emit_hex("vector_75.last_copath_node", copath[-1])
+
+    order = sorted([ID_ALICE, ID_BOB, ID_CAROL], key=str.encode)
+    assert order == [ID_BOB, ID_CAROL, ID_ALICE]
+    names = {ID_BOB: "bob", ID_CAROL: "carol", ID_ALICE: "alice"}
+    for epoch in (7, 8, 9):
+        for position, identifier in enumerate(order):
+            emit(
+                f"vector_79.rank_{epoch}_{names[identifier]}",
+                merge_rank(position, epoch, len(order)),
+            )
+    cth1 = sha256(b"SCP test vector cth one")
+    cth2 = sha256(b"SCP test vector cth two")
+    assert cth1 < cth2
+    emit_hex("vector_79.cth1", cth1)
+    emit_hex("vector_79.cth2", cth2)
+
+
 def main() -> int:
     self_test()
     _LINES.append("SCP §25 test vectors — ECDSA on NIST P-256, RFC 6979, SHA-256")
@@ -3556,6 +3778,7 @@ def main() -> int:
     emit_challenge_vectors()
     emit_participation_seed()
     emit_push_signing_bytes()
+    emit_fork_merge()
     print("\n".join(_LINES))
     return 0
 

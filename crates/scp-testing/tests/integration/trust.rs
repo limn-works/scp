@@ -592,38 +592,108 @@ async fn challenge_request_response() {
     );
 }
 
-/// Every protocol capability row of spec 07 §7.3.4.3's standards table states
-/// the minimum the compiled-in constant enforces.
-#[test]
-fn protocol_capability_minimums_match_spec_07_table() {
-    const SPEC_07: &str =
-        include_str!("../../../../.docs/specs/07-trust-validation-and-capabilities.md");
-    let mut rows = 0;
-    for line in SPEC_07.lines() {
+/// The heading of spec 07's protocol capability registry, whose standards
+/// table pairs each protocol capability with its minimum case count.
+const STANDARDS_SECTION_HEADING: &str = "#### 7.3.4.3 ";
+
+/// Returns `(name, minimum column)` for each standards-table row of spec 07
+/// §7.3.4.3, reading only that section: from its heading to the next heading
+/// of equal or higher level. A row is ``| `name` | <minimum> |`` whose minimum
+/// starts with a digit. Fails when the heading is missing or the section holds
+/// no such row, so a table elsewhere in spec 07 never reaches the caller and a
+/// moved heading cannot pass as an empty table.
+fn standards_table_rows(spec: &str) -> Result<Vec<(&str, &str)>, String> {
+    let level = STANDARDS_SECTION_HEADING
+        .chars()
+        .take_while(|c| *c == '#')
+        .count();
+    let mut lines = spec.lines();
+    lines
+        .by_ref()
+        .find(|line| line.starts_with(STANDARDS_SECTION_HEADING))
+        .ok_or_else(|| format!("spec 07 has no heading {STANDARDS_SECTION_HEADING:?}"))?;
+    let mut rows = Vec::new();
+    for line in lines {
+        let hashes = line.chars().take_while(|c| *c == '#').count();
+        if hashes > 0 && hashes <= level && line[hashes..].starts_with(' ') {
+            break;
+        }
         let Some(rest) = line.strip_prefix("| `") else {
             continue;
         };
         let Some((name, rest)) = rest.split_once('`') else {
             continue;
         };
-        // Only the standards table pairs a capability name with a count column.
         let Some(min_column) = rest.trim_start_matches(" |").split('|').next() else {
             continue;
         };
         let min_column = min_column.trim();
+        if min_column.starts_with(|c: char| c.is_ascii_digit()) {
+            rows.push((name, min_column));
+        }
+    }
+    if rows.is_empty() {
+        return Err("spec 07 §7.3.4.3 holds no standards-table row".to_owned());
+    }
+    Ok(rows)
+}
+
+/// A table row outside §7.3.4.3, such as a constant table's, is ignored, and
+/// a row inside the section is read, including one below a lower-level
+/// subheading. Inside the section, a row whose minimum is not a number is
+/// skipped, and a `#` line that is not a heading does not end the section.
+#[test]
+fn standards_table_rows_reads_only_section_7_3_4_3() {
+    let spec = "\
+### 7.3.1 Earlier
+| `D_MAX` | 10 seconds | before |
+#### 7.3.4.3 Protocol Capability Registry
+| `code-review/v1` | 20 | in section |
+| `x` | none | not a minimum |
+#tag
+##### 7.3.4.3.1 Protocol Constant
+| `summarize/v1` | 5 per `category` | still in section |
+#### 7.3.4.4 Next
+| `MERGE_CARRY_ITEMS` | 8 | after |
+";
+    assert_eq!(
+        standards_table_rows(spec).unwrap(),
+        vec![
+            ("code-review/v1", "20"),
+            ("summarize/v1", "5 per `category`")
+        ]
+    );
+}
+
+/// The parser fails, rather than returning no rows, when the heading is
+/// missing or the section holds no row.
+#[test]
+fn standards_table_rows_fails_without_heading_or_rows() {
+    assert!(standards_table_rows("| `D_MAX` | 10 seconds |\n").is_err());
+    assert!(
+        standards_table_rows("#### 7.3.4.3 Registry\ntext\n#### 7.3.4.4 Next\n| `x` | 3 |\n")
+            .is_err()
+    );
+}
+
+/// Every protocol capability row of spec 07 §7.3.4.3's standards table states
+/// the minimum the compiled-in constant enforces.
+#[test]
+fn protocol_capability_minimums_match_spec_07_table() {
+    const SPEC_07: &str =
+        include_str!("../../../../.docs/specs/07-trust-validation-and-capabilities.md");
+    let rows = standards_table_rows(SPEC_07).unwrap();
+    for (name, min_column) in &rows {
         let digits: String = min_column
             .chars()
             .take_while(char::is_ascii_digit)
             .collect();
-        if digits.is_empty() {
-            continue;
-        }
         let n: u32 = digits.parse().unwrap();
         let expected = if min_column.contains("per `category`") {
             MinCases::PerCategory(n)
         } else {
             assert_eq!(
-                min_column, digits,
+                *min_column, digits,
                 "{name}: unrecognised minimum {min_column:?}"
             );
             MinCases::Total(n)
@@ -636,10 +706,10 @@ fn protocol_capability_minimums_match_spec_07_table() {
             Some(expected),
             "{uri}: code and spec 07 table disagree"
         );
-        rows += 1;
     }
     assert_eq!(
-        rows, 28,
+        rows.len(),
+        28,
         "the spec 07 standards table has one row per protocol capability"
     );
 }
