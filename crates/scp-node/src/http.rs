@@ -2068,7 +2068,6 @@ fn spawn_quic_listener(
     let config = QuicListenerConfig {
         bind_addr,
         max_blob_size: rc.max_blob_size,
-        max_blob_ttl: rc.max_blob_ttl,
         max_subscriptions_per_connection: rc.max_subscriptions_per_connection,
         max_query_limit: rc.max_query_limit,
         max_connections_per_ip: rc.max_connections_per_ip,

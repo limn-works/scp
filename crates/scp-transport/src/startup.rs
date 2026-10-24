@@ -198,7 +198,6 @@ fn is_blank(raw: &std::ffi::OsStr) -> bool {
 /// |---|---|
 /// | `SCP_RELAY_BIND_ADDR` | `0.0.0.0:9000` |
 /// | `SCP_RELAY_MAX_BLOB_SIZE` | 262,144 (256 KiB) |
-/// | `SCP_RELAY_MAX_BLOB_TTL` | 604,800 (7 days) |
 /// | `SCP_RELAY_MAX_CONNECTIONS` | 1,000 |
 /// | `SCP_RELAY_MAX_CONNECTIONS_PER_IP` | 10 |
 /// | `SCP_RELAY_RATE_LIMIT` | 100 |
@@ -221,7 +220,6 @@ pub fn relay_config_from_env() -> Result<RelayConfig, StartupError> {
             SocketAddr::from(([0, 0, 0, 0], 9000)),
         )?,
         max_blob_size: env_or("SCP_RELAY_MAX_BLOB_SIZE", 262_144)?,
-        max_blob_ttl: env_or("SCP_RELAY_MAX_BLOB_TTL", scp_relay_client::MAX_BLOB_TTL)?,
         max_total_connections: env_or("SCP_RELAY_MAX_CONNECTIONS", 1_000)?,
         max_connections_per_ip: env_or("SCP_RELAY_MAX_CONNECTIONS_PER_IP", 10)?,
         rate_limit_publishes_per_second: env_or("SCP_RELAY_RATE_LIMIT", 100)?,

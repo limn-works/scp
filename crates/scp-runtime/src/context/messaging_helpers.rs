@@ -3906,7 +3906,7 @@ pub async fn deliver_message_and_drain_buffered(
 
 /// Sends the local member's pseudonym announcement as an MLS application
 /// message, so other members map its DID to its current routing ID (spec 09
-/// §9.10.4; §9.10.4.1 "Transition protocol and grace").
+/// §9.10.4; §9.10.4.1 "Transition protocol: query-only until expiry").
 ///
 /// A member with a v2 rotation epoch sends the v2 form
 /// ([`PseudonymAnnouncementV2`](scp_protocol::context::pseudonym::PseudonymAnnouncementV2))

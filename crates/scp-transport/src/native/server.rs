@@ -153,8 +153,6 @@ pub struct RelayConfig {
     pub bind_addr: SocketAddr,
     /// Maximum blob size in bytes (default: 262144 / 256 KB).
     pub max_blob_size: usize,
-    /// Maximum blob TTL in seconds (default: 604800 / 7 days).
-    pub max_blob_ttl: u32,
     /// Maximum concurrent subscriptions per WebSocket connection (default: 100).
     pub max_subscriptions_per_connection: usize,
     /// Maximum QUERY limit (default: 1000).
@@ -229,7 +227,6 @@ impl RelayConfig {
         Self {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 9000)),
             max_blob_size: MAX_BLOB_SIZE,
-            max_blob_ttl: MAX_BLOB_TTL,
             max_subscriptions_per_connection: 100,
             max_query_limit: MAX_QUERY_LIMIT,
             ttl_check_interval: Duration::from_secs(10),
@@ -1313,15 +1310,13 @@ async fn handle_publish(
         return;
     }
 
-    // Validate TTL.
-    if blob_ttl < MIN_BLOB_TTL || blob_ttl > config.max_blob_ttl {
+    // Validate TTL against the protocol ceiling (spec 09 §9.18.11); no
+    // operator setting changes it (ADR-043, amended 2026-10-24).
+    if !(MIN_BLOB_TTL..=MAX_BLOB_TTL).contains(&blob_ttl) {
         let err = RelayMessage::Err {
             ref_id,
             code: code::TTL_TOO_LONG,
-            msg: format!(
-                "blob_ttl must be {}-{}, got {}",
-                MIN_BLOB_TTL, config.max_blob_ttl, blob_ttl
-            ),
+            msg: format!("blob_ttl must be {MIN_BLOB_TTL}-{MAX_BLOB_TTL}, got {blob_ttl}"),
         };
         let _ = tx.send(err).await;
         return;

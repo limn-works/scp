@@ -117,12 +117,13 @@ All relay configuration is via `SCP_RELAY_*` environment variables. These map to
 | `SCP_RELAY_URL` | `relay_url` | none (required) | The relay's public WebSocket URL, which determines its reserved push routing ID (spec §10.7.1, push registration protocol). Set it to the URL clients connect to. `scp-relay` and `scp-node --relay-only` exit 1 when it is unset or empty. A full node does not read it: the node derives the URL from its domain or from the address its NAT tier advertises. Every listener (WebSocket, QUIC, UDP/DTLS) reads the same URL |
 | `SCP_RELAY_BIND_ADDR` | `bind_addr` | `0.0.0.0:9000` | WebSocket listener bind address |
 | `SCP_RELAY_MAX_BLOB_SIZE` | `max_blob_size` | `262144` (256 KB) | Maximum blob size in bytes |
-| `SCP_RELAY_MAX_BLOB_TTL` | `max_blob_ttl` | `604800` (7 days) | Maximum blob TTL in seconds |
 | `SCP_RELAY_MAX_CONNECTIONS` | `max_total_connections` | `1000` | Maximum total WebSocket connections |
 | `SCP_RELAY_MAX_CONNECTIONS_PER_IP` | `max_connections_per_ip` | `10` | Maximum connections per IP address |
 | `SCP_RELAY_RATE_LIMIT` | `rate_limit_publishes_per_second` | `100` | PUBLISH operations per second per IP |
 | `SCP_RELAY_LOG_LEVEL` | N/A | `info` | Log level (trace, debug, info, warn, error) |
 | `SCP_RELAY_LOG_FORMAT` | N/A | `pretty` | Log format: `json` or `pretty` |
+
+No setting changes the longest blob TTL a relay accepts. Every relay refuses a `blob_ttl` above the protocol constant `MAX_BLOB_TTL`, 604,800 s (7 days) (spec 09 §9.18.11).
 
 Additional `RelayConfig` fields with fixed defaults (not configurable via env var):
 
