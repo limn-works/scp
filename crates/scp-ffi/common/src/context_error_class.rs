@@ -151,7 +151,8 @@ pub fn coded_creation_failure(
         | ContextCreationError::BilateralPeerNotSupported
         | ContextCreationError::InvalidCeilingCategory(_)
         | ContextCreationError::InvalidPseudonymRotationPolicy(_)
-        | ContextCreationError::CreationFailed(_) => Err(e),
+        | ContextCreationError::CreationFailed(_)
+        | ContextCreationError::RollbackFailed { .. } => Err(e),
     }
 }
 

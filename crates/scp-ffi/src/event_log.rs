@@ -229,9 +229,14 @@ fn query_manager_entries(
     // canonical chokepoint (NOT the raw SHA-256 routing primitive, which
     // double-hashes a real 64-hex id and queries the wrong event-log key).
     let ctx_id_bytes = scp_core::context::state::context_id_to_bytes(context_id);
-    let Some(entries) = crate::runtime::supervisor(bi)
-        .ok()
-        .and_then(|mgr| mgr.event_log_entries(&ctx_id_bytes).ok().flatten())
+    // A failed read of the supervisor's log is returned, never replaced by
+    // the bridge-local tree (spec 17 §"Event log write failures").
+    let Some(mgr) = crate::runtime::supervisor(bi).ok() else {
+        return Ok(None);
+    };
+    let Some(entries) = mgr
+        .event_log_entries(&ctx_id_bytes)
+        .map_err(|e| PyErr::from(crate::error::ScpPyError::from(e)))?
     else {
         return Ok(None);
     };

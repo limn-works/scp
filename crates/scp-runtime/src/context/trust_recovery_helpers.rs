@@ -118,14 +118,14 @@ pub async fn create_governance_checkpoint(
     };
 
     // Trigger event log pruning if a pruning policy is configured on the
-    // context (#1474). Best-effort: log but do not fail the checkpoint
-    // creation if pruning encounters an error.
+    // context (#1474). A failed prune fails the checkpoint creation (spec 17
+    // §"Event log write failures"); the in-memory log is unchanged.
     if let Some(ref policy) = pruning_policy {
         let context_id_bytes = context_id_to_bytes(context_id);
         if deps
             .event_log
             .prune_before_checkpoint(&context_id_bytes, event_count, policy)
-            .await
+            .await?
             .is_some_and(|pruned| pruned > 0)
         {
             tracing::info!(
@@ -299,8 +299,8 @@ pub async fn recovery_advance_epoch(
         (old_epoch, epoch.mls_epoch)
     };
 
-    // 5. Emit epoch advancement event to event log. Event log failures
-    //    are non-fatal — recovery must not be blocked by logging issues.
+    // 5. Emit epoch advancement event to event log. A failed encode or
+    //    append fails the call (spec 17 §"Event log write failures").
     let recovery_payload = scp_event_log::payload::encode_payload(
         &scp_event_log::payload::RecoveryEpochAdvancedPayload {
             old_epoch,
@@ -314,9 +314,7 @@ pub async fn recovery_advance_epoch(
     // The append is now async (ADR-049 Decision 7), so the former
     // `.map_err(..).and_then(|payload| ...)` combinator chain (whose closure
     // cannot `.await`) is unrolled imperatively: encode the payload first, then
-    // await the append. Both the encode failure and the append failure are
-    // non-fatal (recovery must not be blocked by logging issues), warned with
-    // the same message as before.
+    // await the append. Either failure is returned to the caller.
     let append_result =
         match recovery_payload.map_err(|e| ContextError::EventLogFailed(e.to_string())) {
             Ok(payload) => {
@@ -332,13 +330,7 @@ pub async fn recovery_advance_epoch(
             }
             Err(e) => Err(e),
         };
-    if let Err(e) = append_result {
-        tracing::warn!(
-            context_id = %context_id,
-            error = %e,
-            "failed to append recovery epoch advancement event to event log"
-        );
-    }
+    append_result?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
 
     // 6. Persist if configured (best-effort). The actor's coalesced

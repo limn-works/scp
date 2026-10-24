@@ -810,12 +810,19 @@ async fn handle_evaluate_periodic_consequences_actor(
     let member_dids: Vec<scp_did::DID> = cell.membership.members().map(|m| m.did.clone()).collect();
     // Periodic sweep: one convergent window anchor shared across all members
     // so every honest member's durable consequence leaf converges (§9.9.3).
-    let (events, convergent_now) = event_log_entries_for_consequences(
+    let (events, convergent_now) = match event_log_entries_for_consequences(
         &cell.receive_buffer,
         &context_id,
         now,
         deps.event_log.as_ref(),
-    );
+    ) {
+        Ok(read) => read,
+        Err(e) => {
+            let outcome = Outcome::err(outcome_error_sketch(&e));
+            let _ = reply.send(Err(e));
+            return outcome;
+        }
+    };
 
     let mut results: Vec<(scp_did::DID, Vec<TriggeredConsequence>)> = Vec::new();
     for member_did in member_dids {
@@ -844,6 +851,10 @@ async fn handle_evaluate_periodic_consequences_actor(
     // obligation a Drop-guard PANIC in debug/CI.
     let mut downward_auth_obligation: Option<crate::context::actor::class_s::ClassSCommitToken> =
         None;
+    // The first consequence-leaf append failure stops the sweep; it is replied
+    // after the obligation below is discharged (spec 17 §"Event log write
+    // failures").
+    let mut enforced: Result<(), ContextError> = Ok(());
     {
         let mut view = cell.class_c_view();
         let mut split = view.consequence_split();
@@ -851,7 +862,7 @@ async fn handle_evaluate_periodic_consequences_actor(
             // The GROW arms `downward_auth_obligation` directly (idempotent across
             // the sweep — one owed persist; no separate `note_downward_auth` call to
             // forget — GAP-A closed).
-            let _ = enforce_triggered_consequences(
+            if let Err(e) = enforce_triggered_consequences(
                 &mut split,
                 &EnforceConsequencesCtx {
                     context_id: &context_id,
@@ -865,7 +876,11 @@ async fn handle_evaluate_periodic_consequences_actor(
                 },
                 &mut downward_auth_obligation,
             )
-            .await;
+            .await
+            {
+                enforced = Err(e);
+                break;
+            }
         }
         // `split` / `view` drop here, releasing the `&mut cell` borrow.
     }
@@ -876,12 +891,17 @@ async fn handle_evaluate_periodic_consequences_actor(
     // discharges the Drop guard). On persist failure the mutation STAYS and the
     // error is surfaced to the caller; the handler still reports `mutated` so the
     // run loop also persists.
-    let reply_result = match downward_auth_obligation.take() {
+    let persisted = match downward_auth_obligation.take() {
         Some(token) => token.commit(cell, deps, &context_id).await,
         None => Ok(()),
     };
+    let reply_result = persisted.and(enforced);
+    let outcome = match &reply_result {
+        Ok(()) => Outcome::ok_mutated(()),
+        Err(e) => Outcome::err_mutated(outcome_error_sketch(e)),
+    };
     let _ = reply.send(reply_result);
-    Outcome::ok_mutated(())
+    outcome
 }
 
 /// Outcome of attempting to retry a single pending MLS commit

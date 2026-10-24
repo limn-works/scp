@@ -806,7 +806,14 @@ fn ingest_pseudonym_announcement(
 /// fail-closed after the borrowing view drops; evaluation otherwise stays
 /// best-effort / coalesced. The returned `bool` mirrors whether the sink was
 /// armed (retained as the RED-CS3b engine signal for callers that observe it).
-#[must_use]
+///
+/// # Errors
+///
+/// Returns [`ContextError::EventLogFailed`] when the received event's append,
+/// the consequence read, or a consequence leaf append fails (spec 17 §"Event
+/// log write failures"). The message itself is already delivered; the caller
+/// stops evaluating consequences for the rest of its batch and returns the
+/// error after delivering it.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_buffered_post_delivery(
     view: &mut ClassCMut<'_>,
@@ -830,7 +837,7 @@ pub async fn run_buffered_post_delivery(
     clock: &dyn Clock,
     event_log: &dyn crate::context::builder::ContextEventLogProvider,
     event_tx: Option<&ContextEventSender>,
-) -> bool {
+) -> Result<bool, ContextError> {
     let now = clock.now_secs();
 
     // Velocity tracking — always record for buffered messages.
@@ -840,8 +847,8 @@ pub async fn run_buffered_post_delivery(
 
     // Durable Merkle append ONLY for sender-authenticated events. Application
     // messages (`None`) skip the append but still run governance below.
-    if let Some(event_name) = event_name
-        && let Err(e) = event_log
+    if let Some(event_name) = event_name {
+        event_log
             .append_context_event(
                 context_id_bytes,
                 event_name,
@@ -849,13 +856,14 @@ pub async fn run_buffered_post_delivery(
                 event_timestamp_secs,
             )
             .await
-    {
-        tracing::warn!(
-            context_id,
-            sender_did,
-            event_name = ?event_name,
-            "failed to append buffered event to event log: {e}"
-        );
+            .inspect_err(|e| {
+                tracing::warn!(
+                    context_id,
+                    sender_did,
+                    event_name = ?event_name,
+                    "failed to append buffered event to event log: {e}"
+                );
+            })?;
     }
 
     let consequence_rules: Vec<ConsequenceRule> = view
@@ -875,7 +883,7 @@ pub async fn run_buffered_post_delivery(
                 context_id,
                 now,
                 event_log,
-            );
+            )?;
         let triggered = evaluate_consequence_rules(
             &consequence_rules,
             &events,
@@ -901,11 +909,11 @@ pub async fn run_buffered_post_delivery(
             },
             obligation,
         )
-        .await
+        .await?
     };
 
     *view.checkpoint_events_since_mut() += 1;
-    downward_auth_applied
+    Ok(downward_auth_applied)
 }
 
 // ---------------------------------------------------------------------------
@@ -1683,7 +1691,7 @@ pub async fn deliver_incoming(
                 now_ms,
                 downward_auth_sink,
             )
-            .await;
+            .await?;
             Ok(DeliverOutcome::Handled)
         }
     }
@@ -2236,10 +2244,20 @@ fn record_send_participation(
     send_events: &[scp_event_log::Event],
     now: u64,
 ) {
-    let send_merkle = deps
-        .event_log
-        .event_log_merkle_root(context_id_bytes)
-        .unwrap_or([0u8; 32]);
+    // A participation record is a cache the proposer-eligibility gate
+    // recomputes, failing closed, when it is cold. An unreadable log therefore
+    // leaves the cache cold here; it never caches a record over a zero root.
+    let send_merkle = match deps.event_log.event_log_merkle_root(context_id_bytes) {
+        Ok(root) => root,
+        Err(e) => {
+            tracing::warn!(
+                context_id,
+                error = %e,
+                "event log root unreadable; participation cache not refreshed"
+            );
+            return;
+        }
+    };
     if !send_events.is_empty()
         && let Ok(record) = scp_protocol::trust::participation::compute_participation_record(
             send_events,
@@ -2361,6 +2379,10 @@ pub async fn finalize_send(
     // is owned here at the cell boundary and reconciled with the send's nonce
     // `token` below.
     let mut downward_auth_sink: Option<crate::context::actor::class_s::ClassSCommitToken> = None;
+    // A failed event-log read or consequence-leaf append on this send. It is
+    // returned only after the send's persist obligations are discharged below
+    // (spec 17 §"Event log write failures").
+    let consequences: Result<(), ContextError>;
     // Class-C field mutations run through the non-persisting view (coalesced —
     // the run loop persists on `mutated`); the view borrow ends (NLL) before the
     // cell-taking checkpoint-broadcast + fail-closed persist below.
@@ -2379,58 +2401,60 @@ pub async fn finalize_send(
         );
 
         // Consequence enforcement.
-        let (send_events, convergent_now) =
-            crate::context::governance_logic::event_log_entries_for_consequences(
-                view.receive_buffer_mut(),
-                context_id,
-                now,
-                &*deps.event_log,
-            );
-        let consequence_rules: Vec<ConsequenceRule> = view
-            .governance_class_c_mut()
-            .consequence_rules_mut()
-            .clone();
-        let send_triggered = evaluate_consequence_rules(
-            &consequence_rules,
-            &send_events,
-            sender_did.as_ref(),
-            now,
-            convergent_now,
-        );
-        {
-            let mut split = view.consequence_split();
-            // ADR-049 §9 (RED-CS3): a downward-auth mutation (a
-            // `suspended_capabilities` GROW or an `AssignRole` `member_capabilities`
-            // replacement) ARMS `downward_auth_sink` via the GROW method itself.
-            // When armed, the final persist below is upgraded to fail-closed so the
-            // mutation is durable before this send acks.
-            let _ = crate::context::governance_logic::enforce_triggered_consequences(
-                &mut split,
-                &crate::context::governance_logic::EnforceConsequencesCtx {
-                    context_id,
-                    member_did: sender_did,
-                    now,
-                    triggered: &send_triggered,
-                    rules: &consequence_rules,
-                    clock: &*deps.clock,
-                    event_log: &*deps.event_log,
-                    event_tx: deps.event_tx.as_ref(),
-                },
-                &mut downward_auth_sink,
-            )
-            .await;
-        }
-
-        // Participation record (#1530).
-        record_send_participation(
-            &mut view,
-            deps,
+        match crate::context::governance_logic::event_log_entries_for_consequences(
+            view.receive_buffer_mut(),
             context_id,
-            context_id_bytes,
-            sender_did,
-            &send_events,
             now,
-        );
+            &*deps.event_log,
+        ) {
+            Err(e) => consequences = Err(e),
+            Ok((send_events, convergent_now)) => {
+                let consequence_rules: Vec<ConsequenceRule> = view
+                    .governance_class_c_mut()
+                    .consequence_rules_mut()
+                    .clone();
+                let send_triggered = evaluate_consequence_rules(
+                    &consequence_rules,
+                    &send_events,
+                    sender_did.as_ref(),
+                    now,
+                    convergent_now,
+                );
+                // ADR-049 §9 (RED-CS3): a downward-auth mutation (a
+                // `suspended_capabilities` GROW or an `AssignRole` `member_capabilities`
+                // replacement) ARMS `downward_auth_sink` via the GROW method itself.
+                // When armed, the final persist below is upgraded to fail-closed so the
+                // mutation is durable before this send acks. The split borrow is a
+                // temporary that ends with this statement.
+                consequences = crate::context::governance_logic::enforce_triggered_consequences(
+                    &mut view.consequence_split(),
+                    &crate::context::governance_logic::EnforceConsequencesCtx {
+                        context_id,
+                        member_did: sender_did,
+                        now,
+                        triggered: &send_triggered,
+                        rules: &consequence_rules,
+                        clock: &*deps.clock,
+                        event_log: &*deps.event_log,
+                        event_tx: deps.event_tx.as_ref(),
+                    },
+                    &mut downward_auth_sink,
+                )
+                .await
+                .map(drop);
+
+                // Participation record (#1530).
+                record_send_participation(
+                    &mut view,
+                    deps,
+                    context_id,
+                    context_id_bytes,
+                    sender_did,
+                    &send_events,
+                    now,
+                );
+            }
+        }
 
         // Checkpoint tracking (§9.9.3).
         *view.checkpoint_events_since_mut() += 1;
@@ -2465,7 +2489,8 @@ pub async fn finalize_send(
         is_broadcast,
         downward_auth_obligation,
     )
-    .await
+    .await?;
+    consequences
 }
 
 /// Creates a consistency checkpoint when due (§9.9.3 thresholds) and, when one
@@ -3465,6 +3490,7 @@ pub async fn validate_and_drain_timeouts(
     // ADR-056: canonical digest, not a re-hash of the hex id.
     let context_id_bytes = state::context_id_to_bytes(context_id);
     let timed_out = view.drain_timed_out_gaps(now_ms);
+    let mut post_delivery: Result<(), ContextError> = Ok(());
     for (gap_info, messages) in timed_out {
         let gap_event = ContextEvent::SequenceGapDetected {
             sender_did: DID(gap_info.sender_did.clone()),
@@ -3502,27 +3528,34 @@ pub async fn validate_and_drain_timeouts(
             );
             // The GROW arms `downward_auth_sink` directly (no separate
             // `note_downward_auth` call to forget — GAP-A closed).
-            let _ = run_buffered_post_delivery(
-                view,
-                downward_auth_sink,
-                context_id,
-                &context_id_bytes,
-                &msg.sender_did,
-                event_name,
-                // Dormant: `event_name` here is always `None`
-                // (`deliver_plaintext_or_announcement` never appends on
-                // receive), so this committer-copied timestamp is not yet
-                // consumed. Live only once cross-member leaf replication lands
-                // (ADR-051). See `run_buffered_post_delivery`'s param doc.
-                msg.inner.timestamp / 1000,
-                &*deps.clock,
-                &*deps.event_log,
-                deps.event_tx.as_ref(),
-            )
-            .await;
+            // A failed post-delivery stops consequence evaluation for the rest
+            // of the batch; every message is still delivered, and the error is
+            // returned after the batch (spec 17 §"Event log write failures").
+            if post_delivery.is_ok() {
+                post_delivery = run_buffered_post_delivery(
+                    view,
+                    downward_auth_sink,
+                    context_id,
+                    &context_id_bytes,
+                    &msg.sender_did,
+                    event_name,
+                    // Dormant: `event_name` here is always `None`
+                    // (`deliver_plaintext_or_announcement` never appends on
+                    // receive), so this committer-copied timestamp is not yet
+                    // consumed. Live only once cross-member leaf replication lands
+                    // (ADR-051). See `run_buffered_post_delivery`'s param doc.
+                    msg.inner.timestamp / 1000,
+                    &*deps.clock,
+                    &*deps.event_log,
+                    deps.event_tx.as_ref(),
+                )
+                .await
+                .map(drop);
+            }
         }
     }
 
+    post_delivery?;
     Ok(check)
 }
 
@@ -3548,7 +3581,8 @@ pub async fn buffer_ahead_message(
     plaintext: &[u8],
     now_ms: u64,
     downward_auth_sink: &mut Option<crate::context::actor::class_s::ClassSCommitToken>,
-) {
+) -> Result<(), ContextError> {
+    let mut post_delivery: Result<(), ContextError> = Ok(());
     let buffered_msg = scp_protocol::envelope::validation::BufferedMessage {
         inner: inner.clone(),
         sender_did: sender_did.to_owned(),
@@ -3601,26 +3635,33 @@ pub async fn buffer_ahead_message(
             );
             // The GROW arms `downward_auth_sink` directly (no separate
             // `note_downward_auth` call to forget — GAP-A closed).
-            let _ = run_buffered_post_delivery(
-                view,
-                downward_auth_sink,
-                context_id,
-                &context_id_bytes,
-                &msg.sender_did,
-                event_name,
-                // Dormant: `event_name` here is always `None`
-                // (`deliver_plaintext_or_announcement` never appends on
-                // receive), so this committer-copied timestamp is not yet
-                // consumed. Live only once cross-member leaf replication lands
-                // (ADR-051). See `run_buffered_post_delivery`'s param doc.
-                msg.inner.timestamp / 1000,
-                &*deps.clock,
-                &*deps.event_log,
-                deps.event_tx.as_ref(),
-            )
-            .await;
+            // A failed post-delivery stops consequence evaluation for the rest
+            // of the batch; every message is still delivered, and the error is
+            // returned after the batch (spec 17 §"Event log write failures").
+            if post_delivery.is_ok() {
+                post_delivery = run_buffered_post_delivery(
+                    view,
+                    downward_auth_sink,
+                    context_id,
+                    &context_id_bytes,
+                    &msg.sender_did,
+                    event_name,
+                    // Dormant: `event_name` here is always `None`
+                    // (`deliver_plaintext_or_announcement` never appends on
+                    // receive), so this committer-copied timestamp is not yet
+                    // consumed. Live only once cross-member leaf replication lands
+                    // (ADR-051). See `run_buffered_post_delivery`'s param doc.
+                    msg.inner.timestamp / 1000,
+                    &*deps.clock,
+                    &*deps.event_log,
+                    deps.event_tx.as_ref(),
+                )
+                .await
+                .map(drop);
+            }
         }
     }
+    post_delivery
 }
 
 // ---------------------------------------------------------------------------
@@ -3652,6 +3693,7 @@ pub async fn deliver_message_and_drain_buffered(
     downward_auth_sink: &mut Option<crate::context::actor::class_s::ClassSCommitToken>,
 ) -> Result<bool, ContextError> {
     let sender_did_obj = DID(sender_did.to_owned());
+    let mut post_delivery: Result<(), ContextError> = Ok(());
 
     state::require_active(view.handle_mut())?;
 
@@ -3737,25 +3779,31 @@ pub async fn deliver_message_and_drain_buffered(
                 );
                 // The GROW arms `downward_auth_sink` directly (no separate
                 // `note_downward_auth` call to forget — GAP-A closed).
-                let _ = run_buffered_post_delivery(
-                    view,
-                    downward_auth_sink,
-                    context_id,
-                    context_id_bytes,
-                    &msg.sender_did,
-                    event_name,
-                    // Dormant: `event_name` here is always `None`
-                    // (`deliver_plaintext_or_announcement` never appends on
-                    // receive), so this committer-copied timestamp is not yet
-                    // consumed. Live only once cross-member leaf replication
-                    // lands (ADR-051). See `run_buffered_post_delivery`'s param
-                    // doc.
-                    msg.inner.timestamp / 1000,
-                    &*deps.clock,
-                    &*deps.event_log,
-                    deps.event_tx.as_ref(),
-                )
-                .await;
+                // A failed post-delivery stops consequence evaluation for the rest
+                // of the batch; every message is still delivered, and the error is
+                // returned after the batch (spec 17 §"Event log write failures").
+                if post_delivery.is_ok() {
+                    post_delivery = run_buffered_post_delivery(
+                        view,
+                        downward_auth_sink,
+                        context_id,
+                        context_id_bytes,
+                        &msg.sender_did,
+                        event_name,
+                        // Dormant: `event_name` here is always `None`
+                        // (`deliver_plaintext_or_announcement` never appends on
+                        // receive), so this committer-copied timestamp is not yet
+                        // consumed. Live only once cross-member leaf replication
+                        // lands (ADR-051). See `run_buffered_post_delivery`'s param
+                        // doc.
+                        msg.inner.timestamp / 1000,
+                        &*deps.clock,
+                        &*deps.event_log,
+                        deps.event_tx.as_ref(),
+                    )
+                    .await
+                    .map(drop);
+                }
             }
 
             let now = deps.clock.now_secs();
@@ -3764,47 +3812,20 @@ pub async fn deliver_message_and_drain_buffered(
                     .velocity_tracker_mut()
                     .record_message(&DID(sender_did.to_owned()), now);
             }
-            let consequence_rules: Vec<ConsequenceRule> = view
-                .governance_class_c_mut()
-                .consequence_rules_mut()
-                .clone();
-            if !consequence_rules.is_empty() {
-                let (recv_events, convergent_now) =
-                    crate::context::governance_logic::event_log_entries_for_consequences(
-                        view.receive_buffer_mut(),
-                        context_id,
-                        now,
-                        &*deps.event_log,
-                    );
-                let recv_triggered = evaluate_consequence_rules(
-                    &consequence_rules,
-                    &recv_events,
+            if post_delivery.is_ok() {
+                post_delivery = evaluate_receive_consequences(
+                    view,
+                    deps,
+                    context_id,
                     sender_did,
                     now,
-                    convergent_now,
-                );
-                let recv_member_did = DID(sender_did.to_owned());
-                let mut split = view.consequence_split();
-                // The GROW arms `downward_auth_sink` directly (GAP-A closed).
-                let _ = crate::context::governance_logic::enforce_triggered_consequences(
-                    &mut split,
-                    &crate::context::governance_logic::EnforceConsequencesCtx {
-                        context_id,
-                        member_did: &recv_member_did,
-                        now,
-                        triggered: &recv_triggered,
-                        rules: &consequence_rules,
-                        clock: &*deps.clock,
-                        event_log: &*deps.event_log,
-                        event_tx: deps.event_tx.as_ref(),
-                    },
                     downward_auth_sink,
                 )
                 .await;
             }
             *view.checkpoint_events_since_mut() += 1;
 
-            return Ok(true);
+            return post_delivery.map(|()| true);
         }
     }
 
@@ -3849,24 +3870,30 @@ pub async fn deliver_message_and_drain_buffered(
             deps.event_tx.as_ref(),
         );
         // The GROW arms `downward_auth_sink` directly (GAP-A closed).
-        let _ = run_buffered_post_delivery(
-            view,
-            downward_auth_sink,
-            context_id,
-            context_id_bytes,
-            &msg.sender_did,
-            event_name,
-            // Dormant: `event_name` here is always `None`
-            // (`deliver_plaintext_or_announcement` never appends on receive),
-            // so this committer-copied timestamp is not yet consumed. Live only
-            // once cross-member leaf replication lands (ADR-051). See
-            // `run_buffered_post_delivery`'s param doc.
-            msg.inner.timestamp / 1000,
-            &*deps.clock,
-            &*deps.event_log,
-            deps.event_tx.as_ref(),
-        )
-        .await;
+        // A failed post-delivery stops consequence evaluation for the rest
+        // of the batch; every message is still delivered, and the error is
+        // returned after the batch (spec 17 §"Event log write failures").
+        if post_delivery.is_ok() {
+            post_delivery = run_buffered_post_delivery(
+                view,
+                downward_auth_sink,
+                context_id,
+                context_id_bytes,
+                &msg.sender_did,
+                event_name,
+                // Dormant: `event_name` here is always `None`
+                // (`deliver_plaintext_or_announcement` never appends on receive),
+                // so this committer-copied timestamp is not yet consumed. Live only
+                // once cross-member leaf replication lands (ADR-051). See
+                // `run_buffered_post_delivery`'s param doc.
+                msg.inner.timestamp / 1000,
+                &*deps.clock,
+                &*deps.event_log,
+                deps.event_tx.as_ref(),
+            )
+            .await
+            .map(drop);
+        }
     }
 
     // §9.9.3: received application messages are NOT appended to the durable
@@ -3883,49 +3910,78 @@ pub async fn deliver_message_and_drain_buffered(
             .velocity_tracker_mut()
             .record_message(&DID(sender_did.to_owned()), now);
     }
-    let consequence_rules: Vec<ConsequenceRule> = view
-        .governance_class_c_mut()
-        .consequence_rules_mut()
-        .clone();
-    if !consequence_rules.is_empty() {
-        let (recv_events, convergent_now) =
-            crate::context::governance_logic::event_log_entries_for_consequences(
-                view.receive_buffer_mut(),
-                context_id,
-                now,
-                &*deps.event_log,
-            );
-        let recv_triggered = evaluate_consequence_rules(
-            &consequence_rules,
-            &recv_events,
+    if post_delivery.is_ok() {
+        post_delivery = evaluate_receive_consequences(
+            view,
+            deps,
+            context_id,
             sender_did,
             now,
-            convergent_now,
-        );
-        let recv_member_did = DID(sender_did.to_owned());
-        let mut split = view.consequence_split();
-        // The GROW arms `downward_auth_sink` directly (GAP-A closed).
-        let _ = crate::context::governance_logic::enforce_triggered_consequences(
-            &mut split,
-            &crate::context::governance_logic::EnforceConsequencesCtx {
-                context_id,
-                member_did: &recv_member_did,
-                now,
-                triggered: &recv_triggered,
-                rules: &consequence_rules,
-                clock: &*deps.clock,
-                event_log: &*deps.event_log,
-                event_tx: deps.event_tx.as_ref(),
-            },
             downward_auth_sink,
         )
         .await;
     }
-
     *view.checkpoint_events_since_mut() += 1;
     crate::metrics::record_message_received();
 
-    Ok(false)
+    post_delivery.map(|()| false)
+}
+
+/// Runs the H16 defense-in-depth consequence evaluation for a message received
+/// in order from `sender_did`.
+///
+/// # Errors
+///
+/// Returns [`ContextError::EventLogFailed`] when the event log is unreadable or
+/// a consequence leaf fails to append (spec 17 §"Event log write failures").
+async fn evaluate_receive_consequences(
+    view: &mut ClassCMut<'_>,
+    deps: &ActorDeps,
+    context_id: &str,
+    sender_did: &str,
+    now: u64,
+    downward_auth_sink: &mut Option<crate::context::actor::class_s::ClassSCommitToken>,
+) -> Result<(), ContextError> {
+    let consequence_rules: Vec<ConsequenceRule> = view
+        .governance_class_c_mut()
+        .consequence_rules_mut()
+        .clone();
+    if consequence_rules.is_empty() {
+        return Ok(());
+    }
+    let (recv_events, convergent_now) =
+        crate::context::governance_logic::event_log_entries_for_consequences(
+            view.receive_buffer_mut(),
+            context_id,
+            now,
+            &*deps.event_log,
+        )?;
+    let recv_triggered = evaluate_consequence_rules(
+        &consequence_rules,
+        &recv_events,
+        sender_did,
+        now,
+        convergent_now,
+    );
+    let recv_member_did = DID(sender_did.to_owned());
+    let mut split = view.consequence_split();
+    // The GROW arms `downward_auth_sink` directly (GAP-A closed).
+    crate::context::governance_logic::enforce_triggered_consequences(
+        &mut split,
+        &crate::context::governance_logic::EnforceConsequencesCtx {
+            context_id,
+            member_did: &recv_member_did,
+            now,
+            triggered: &recv_triggered,
+            rules: &consequence_rules,
+            clock: &*deps.clock,
+            event_log: &*deps.event_log,
+            event_tx: deps.event_tx.as_ref(),
+        },
+        downward_auth_sink,
+    )
+    .await
+    .map(drop)
 }
 
 // ---------------------------------------------------------------------------
@@ -4790,6 +4846,21 @@ mod pseudonym_routing_tests {
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             Ok(())
         }
+        /// This fixture keeps no readable log: no entries for any context.
+        fn event_log_entries(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            Ok(None)
+        }
+        /// This fixture keeps no readable log: the zero root.
+        fn event_log_merkle_root(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok([0u8; 32])
+        }
     }
 
     #[tokio::test]
@@ -4857,7 +4928,8 @@ mod pseudonym_routing_tests {
             &event_log,
             None,
         )
-        .await;
+        .await
+        .expect("post-delivery succeeds");
         // No GROW occurs on this velocity-trigger path, so no obligation is armed.
         assert!(
             obligation.is_none(),
@@ -4999,6 +5071,21 @@ mod pseudonym_routing_tests {
             _id: &[u8; 32],
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             Ok(())
+        }
+        /// This fixture keeps no readable log: no entries for any context.
+        fn event_log_entries(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            Ok(None)
+        }
+        /// This fixture keeps no readable log: the zero root.
+        fn event_log_merkle_root(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok([0u8; 32])
         }
     }
 
@@ -5537,6 +5624,21 @@ pub mod dropped_supervisor_tests {
         }
         async fn destroy_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
+        }
+        /// This fixture keeps no readable log: no entries for any context.
+        fn event_log_entries(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            Ok(None)
+        }
+        /// This fixture keeps no readable log: the zero root.
+        fn event_log_merkle_root(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok([0u8; 32])
         }
     }
 

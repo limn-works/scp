@@ -146,9 +146,33 @@ pub trait ContextTransportProvider: Send + Sync {
     }
 }
 
+/// What [`ContextEventLogProvider::restore_event_log`] found in storage.
+///
+/// Spec 17 §"Event log write failures": restore starts an empty log only
+/// when storage holds no log for the context. A failed load is never this
+/// value; it is an `Err` that fails the restore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventLogRestore {
+    /// Storage held a log for the context, and its `entries` entries were
+    /// replayed into memory.
+    Loaded {
+        /// Number of entries replayed.
+        entries: usize,
+    },
+    /// Storage holds no log for the context, or the provider keeps no
+    /// storage; the context starts with an empty log.
+    Absent,
+}
+
 /// Provides event log operations needed during context creation.
 ///
 /// Implementors initialise the Merkle event log and append events.
+///
+/// # Failure rule (spec 17 §"Event log write failures")
+///
+/// Every method that writes or loads storage returns a typed error when the
+/// write or load fails, and changes the in-memory log only after the write
+/// succeeds (ADR-049 §9 Class S, invariant 4). A caller returns that error.
 ///
 /// # Async discipline (ADR-049 Decision 7)
 ///
@@ -211,13 +235,30 @@ pub trait ContextEventLogProvider: Send + Sync {
         timestamp_secs: u64,
     ) -> Result<(), ContextCreationError>;
 
-    /// Destroys the event log for the given context (rollback).
+    /// Destroys the event log for the given context: removes it from memory
+    /// and deletes its stored entries. Creation rollback calls it.
     ///
     /// # Errors
     ///
-    /// Returns [`ContextCreationError`] if destruction fails. Callers may
-    /// ignore this error during rollback (best-effort).
+    /// Returns [`ContextCreationError`] if deleting the stored entries fails.
+    /// A caller returns the error.
     async fn destroy_event_log(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError>;
+
+    /// Releases the context's in-memory log without touching its stored
+    /// entries. An actor calls it when it shuts down, so the next restore
+    /// loads the stored log (spec 17 §"Event log write failures").
+    ///
+    /// The default does nothing, which is correct for a provider that keeps
+    /// no per-context log in memory; a provider that keeps one overrides it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextCreationError`] if the provider cannot release the
+    /// log.
+    async fn release_event_log(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        let _ = context_id;
+        Ok(())
+    }
 
     // -- Membership/messaging event logging (SCP-020) ----------------------
 
@@ -513,36 +554,47 @@ pub trait ContextEventLogProvider: Send + Sync {
     /// Called during [`crate::context::supervisor::Supervisor::restore_context`] to reload event log
     /// entries that were persisted before the process restarted.
     ///
-    /// The default implementation initializes an empty event log (no-op for
-    /// providers without persistence support).
+    /// Returns [`EventLogRestore::Absent`] only when storage holds no log for
+    /// the context. The default, for a provider that keeps no storage,
+    /// initialises an empty log and returns `Absent`.
     ///
     /// # Errors
     ///
-    /// Returns [`ContextCreationError`] if the persisted data is corrupt
-    /// (e.g., broken Merkle chain).
-    async fn restore_event_log(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        // Default: initialize empty event log (no persistence).
-        self.init_event_log(context_id).await
+    /// Returns [`ContextCreationError`] if loading the stored log fails or the
+    /// stored data is corrupt (e.g., broken Merkle chain). The in-memory log
+    /// is unchanged on error.
+    async fn restore_event_log(
+        &self,
+        context_id: &[u8; 32],
+    ) -> Result<EventLogRestore, ContextCreationError> {
+        self.init_event_log(context_id).await?;
+        Ok(EventLogRestore::Absent)
     }
 
     /// Prunes event log entries before a checkpoint boundary based on a
     /// [`PruningPolicy`](scp_protocol::context::governance::PruningPolicy).
     ///
     /// Called after creating a governance checkpoint (#1474). The default
-    /// implementation is a no-op — providers that support pruning override
-    /// this method.
+    /// prunes nothing and returns `Ok(None)` — providers that support pruning
+    /// override this method.
     ///
     /// # Returns
     ///
     /// The number of entries removed, or `None` if no log exists for the
     /// context or the provider does not support pruning.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::EventLogFailed`] if truncating the log or
+    /// persisting the pruned log fails. The in-memory log is unchanged on
+    /// error.
     async fn prune_before_checkpoint(
         &self,
         _context_id: &[u8; 32],
         _checkpoint_event_count: u64,
         _policy: &scp_protocol::context::governance::PruningPolicy,
-    ) -> Option<usize> {
-        None
+    ) -> Result<Option<usize>, ContextError> {
+        Ok(None)
     }
 
     // -- Merkle proofs (ADR-011) ---------------------------------------------
@@ -790,11 +842,14 @@ pub struct CreationReceipt {
 }
 
 impl CreationReceipt {
-    /// Rolls back all completed steps in reverse order.
+    /// Rolls back all completed steps in reverse order and returns the error
+    /// the creation reports.
     ///
-    /// Rollback is best-effort: if a destruction step fails, it is ignored
-    /// so that subsequent rollback steps still execute. This ensures that a
-    /// failure during rollback does not leave additional orphaned state.
+    /// The relay DELETE is best-effort (spec 05 §5.2.1, step 6 rollback). The
+    /// event log destroy is not: when it fails, the stored log outlives the
+    /// failed creation, so the returned error is
+    /// [`ContextCreationError::RollbackFailed`] carrying both failures. When
+    /// every step succeeds, the returned error is `cause`.
     ///
     /// #2148 (ADR-049 birth-into-actor): the crypto (MLS group / sender key)
     /// rollback arms are GONE — crypto is never provider-resident during
@@ -809,16 +864,25 @@ impl CreationReceipt {
         context_id: &[u8; 32],
         transport: &dyn ContextTransportProvider,
         event_log: &dyn ContextEventLogProvider,
-    ) {
+        cause: ContextCreationError,
+    ) -> ContextCreationError {
         // Reverse order: published -> event_log
-        if self.published {
-            // Best-effort: relays are untrusted, orphaned blobs are encrypted
-            // with destroyed keys.
-            let _ = transport.delete_published(context_id).await;
+        if self.published
+            && let Err(e) = transport.delete_published(context_id).await
+        {
+            // Best-effort (spec 05 §5.2.1, step 6): relays are untrusted, and
+            // orphaned blobs are encrypted with destroyed keys.
+            tracing::warn!(error = %e, "rollback: relay DELETE failed (best-effort)");
         }
-        if self.event_log.is_some() {
-            let _ = event_log.destroy_event_log(context_id).await;
+        if self.event_log.is_some()
+            && let Err(rollback) = event_log.destroy_event_log(context_id).await
+        {
+            return ContextCreationError::RollbackFailed {
+                cause: Box::new(cause),
+                rollback: Box::new(rollback),
+            };
         }
+        cause
     }
 }
 
@@ -1087,10 +1151,9 @@ pub(crate) async fn create_context(
         if let Some(mut owned) = owned_crypto {
             owned.dispose_secrets();
         }
-        receipt
-            .rollback(&id_bytes, transport, event_log_provider)
-            .await;
-        return Err(e);
+        return Err(receipt
+            .rollback(&id_bytes, transport, event_log_provider, e)
+            .await);
     }
     receipt.event_log = Some(EventLogHandle::new());
 
@@ -1122,10 +1185,9 @@ pub(crate) async fn create_context(
         if let Some(mut owned) = owned_crypto {
             owned.dispose_secrets();
         }
-        receipt
-            .rollback(&id_bytes, transport, event_log_provider)
-            .await;
-        return Err(e.into());
+        return Err(receipt
+            .rollback(&id_bytes, transport, event_log_provider, e.into())
+            .await);
     }
 
     // Step 7: Append ContextCreated event.
@@ -1149,10 +1211,9 @@ pub(crate) async fn create_context(
             owned.dispose_secrets();
         }
         // Even though the handle is Active, we must roll back everything.
-        receipt
-            .rollback(&id_bytes, transport, event_log_provider)
-            .await;
-        return Err(e);
+        return Err(receipt
+            .rollback(&id_bytes, transport, event_log_provider, e)
+            .await);
     }
 
     // Step 8: Append the founder's `MemberJoined` leaf.
@@ -1186,10 +1247,9 @@ pub(crate) async fn create_context(
         if let Some(mut owned) = owned_crypto {
             owned.dispose_secrets();
         }
-        receipt
-            .rollback(&id_bytes, transport, event_log_provider)
-            .await;
-        return Err(e.into());
+        return Err(receipt
+            .rollback(&id_bytes, transport, event_log_provider, e.into())
+            .await);
     }
 
     // Step 8.5: Append one `OutletRegistered` leaf per genesis-declared outlet
@@ -1262,10 +1322,9 @@ pub(crate) async fn create_context(
         if let Some(mut owned) = owned_crypto {
             owned.dispose_secrets();
         }
-        receipt
-            .rollback(&id_bytes, transport, event_log_provider)
-            .await;
-        return Err(e);
+        return Err(receipt
+            .rollback(&id_bytes, transport, event_log_provider, e)
+            .await);
     }
 
     // Step 9: Return the handle plus the owned crypto material (Encrypted
@@ -1373,6 +1432,21 @@ mod tests {
         }
         async fn destroy_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
+        }
+        /// This fixture keeps no readable log: no entries for any context.
+        fn event_log_entries(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            Ok(None)
+        }
+        /// This fixture keeps no readable log: the zero root.
+        fn event_log_merkle_root(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok([0u8; 32])
         }
     }
 
@@ -1633,6 +1707,124 @@ mod tests {
         .await
         .map(|(_, owned)| owned);
         (result, provider, id_bytes)
+    }
+
+    /// An event log whose appends always fail and whose destroy fails when
+    /// `fail_destroy` is set, counting destroy calls.
+    struct AppendFailingEventLog {
+        fail_destroy: bool,
+        destroys: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl ContextEventLogProvider for AppendFailingEventLog {
+        async fn init_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+        async fn append_event(
+            &self,
+            _: &[u8; 32],
+            _event_type: scp_event_log::EventType,
+            _actor_did: &str,
+            _payload: scp_event_log::EventPayload,
+            _timestamp_secs: u64,
+        ) -> Result<(), ContextCreationError> {
+            Err(ContextCreationError::EventLogFailed(
+                "injected append failure".to_owned(),
+            ))
+        }
+        async fn destroy_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
+            self.destroys
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail_destroy {
+                return Err(ContextCreationError::EventLogFailed(
+                    "injected destroy failure".to_owned(),
+                ));
+            }
+            Ok(())
+        }
+        /// This fixture keeps no readable log: no entries for any context.
+        fn event_log_entries(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            Ok(None)
+        }
+        /// This fixture keeps no readable log: the zero root.
+        fn event_log_merkle_root(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok([0u8; 32])
+        }
+    }
+
+    async fn create_over(
+        seed: u8,
+        event_log: &AppendFailingEventLog,
+    ) -> Result<(), ContextCreationError> {
+        let crypto = NodeMlsFactory::new(
+            TEST_DID.to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
+        );
+        create_context(
+            hex::encode([seed; 32]),
+            ceilinged_params(),
+            &crypto,
+            &TestTransport,
+            event_log,
+            ContextCreator {
+                did: TEST_DID,
+                wrapping_public_key: scp_protocol::crypto::sender_keys::generate_wrapping_keypair()
+                    .0
+                    .as_bytes(),
+            },
+            1_700_000_000,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Spec 05 §5.2.1 step 4 rollback and spec 17 §"Event log write
+    /// failures": a creation whose rollback cannot destroy the initialised
+    /// event log reports both failures; one whose destroy succeeds reports
+    /// only the cause.
+    #[tokio::test]
+    async fn a_rollback_whose_event_log_destroy_fails_reports_both_failures() {
+        let failing = AppendFailingEventLog {
+            fail_destroy: true,
+            destroys: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let err = create_over(0x3e, &failing)
+            .await
+            .expect_err("a failed ContextCreated append fails the creation");
+        let ContextCreationError::RollbackFailed { cause, rollback } = &err else {
+            panic!("expected RollbackFailed, got {err:?}");
+        };
+        assert!(
+            matches!(cause.as_ref(), ContextCreationError::EventLogFailed(m) if m.contains("injected append failure")),
+            "{cause:?}"
+        );
+        assert!(
+            matches!(rollback.as_ref(), ContextCreationError::EventLogFailed(m) if m.contains("injected destroy failure")),
+            "{rollback:?}"
+        );
+        assert_eq!(
+            failing.destroys.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        // Control: a destroy that succeeds leaves the cause as the error.
+        let clean = AppendFailingEventLog {
+            fail_destroy: false,
+            destroys: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let err = create_over(0x3f, &clean).await.expect_err("creation fails");
+        assert!(
+            matches!(&err, ContextCreationError::EventLogFailed(m) if m.contains("injected append failure")),
+            "{err:?}"
+        );
+        assert_eq!(clean.destroys.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     /// Spec 05 §5.13.3 "Creation timestamp": the creator's `0xFF02` extension

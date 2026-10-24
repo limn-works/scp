@@ -3,6 +3,7 @@
 //! in ADR-049 §15.
 
 use scp_did::DID;
+use scp_protocol::context::ContextError;
 use scp_protocol::context::membership::{ContextEvent, ReceiveBuffer};
 use scp_protocol::context::params::Capability;
 use scp_protocol::trust::consequence::{ConsequenceRule, TriggeredConsequence};
@@ -45,11 +46,12 @@ use scp_protocol::trust::consequence::{
     consequence_action_type, convergent_consequence_timestamp, trigger_kind_str,
 };
 
-/// Best-effort durable append of one consequence event log entry. A failed
-/// append is logged via `tracing::warn!` but never blocks the matching
-/// `receive_buffer.push(...)` call — the receive buffer remains a useful
-/// in-session signal even when the durable log is unavailable. Returns
-/// nothing because the failure mode is observed via tracing, not callers.
+/// Durable append of one consequence event log entry. Every honest member
+/// appends the identical consequence record at the identical log position
+/// (spec 07 §"Convergent emission"), so a failed append is returned, never
+/// swallowed (spec 17 §"Event log write failures"): the caller stops the
+/// consequence before its matching receive-buffer push and before any later
+/// leaf, so this member's log does not skip a position its peers filled.
 ///
 /// `payload` is the shared [`consequence_event_payload`] output — JSON bytes
 /// wrapped in an [`scp_event_log::EventPayload`]. The consequence engine reads
@@ -66,8 +68,8 @@ async fn append_consequence_event(
     // event (see [`convergent_consequence_timestamp`]). Copied identically by
     // every member, never a per-member evaluation `now()` (§7.3.1, §9.9.3).
     trigger_timestamp_secs: u64,
-) {
-    if let Err(e) = event_log
+) -> Result<(), ContextError> {
+    event_log
         .append_context_event_with_payload(
             context_id_bytes,
             event_type,
@@ -76,15 +78,15 @@ async fn append_consequence_event(
             trigger_timestamp_secs,
         )
         .await
-    {
-        tracing::warn!(
-            context_id,
-            member = %member_did,
-            event = ?event_type,
-            error = %e,
-            "failed to append consequence event to durable event log"
-        );
-    }
+        .inspect_err(|e| {
+            tracing::warn!(
+                context_id,
+                member = %member_did,
+                event = ?event_type,
+                error = %e,
+                "failed to append consequence event to durable event log"
+            );
+        })
 }
 
 // `ConsequenceStateSplit` (the consequence-engine split) is DEFINED in
@@ -186,12 +188,21 @@ pub struct EnforceConsequencesCtx<'a> {
 /// engine-level downward-auth signal); it is retained for callers / tests that
 /// observe the signal directly, but the obligation arming itself is now carried by
 /// the sink, not by the caller reacting to the return value.
-#[must_use]
+///
+/// # Errors
+///
+/// Returns [`ContextError::EventLogFailed`] when a consequence leaf fails to
+/// append. Processing stops at that consequence, so no later leaf lands at a
+/// position this member's peers filled differently; a consequence whose
+/// `ConsequenceTriggered` leaf failed applies no enforcement and records no
+/// cooldown, so the next evaluation retries it. A downward-auth mutation
+/// applied before the failure has already armed `obligation`, and the caller
+/// discharges it before returning this error.
 pub async fn enforce_triggered_consequences(
     state: &mut ConsequenceStateSplit<'_>,
     args: &EnforceConsequencesCtx<'_>,
     obligation: &mut Option<ClassSCommitToken>,
-) -> bool {
+) -> Result<bool, ContextError> {
     let context_id_bytes = context_id_to_bytes(args.context_id);
     let mut downward_auth_applied = false;
     for consequence in args.triggered {
@@ -202,9 +213,9 @@ pub async fn enforce_triggered_consequences(
             consequence,
             obligation,
         )
-        .await;
+        .await?;
     }
-    downward_auth_applied
+    Ok(downward_auth_applied)
 }
 
 /// Single-consequence body of [`enforce_triggered_consequences`].
@@ -223,7 +234,7 @@ async fn process_one_triggered_consequence(
     context_id_bytes: &[u8; 32],
     consequence: &TriggeredConsequence,
     obligation: &mut Option<ClassSCommitToken>,
-) -> bool {
+) -> Result<bool, ContextError> {
     let member_did = args.member_did;
     let now = args.now;
 
@@ -237,7 +248,7 @@ async fn process_one_triggered_consequence(
         .get(&consequence.rule_index)
         && now < last_fired
     {
-        return false;
+        return Ok(false);
     }
 
     // TOCTOU/ghost guard: skip entirely if the member is absent AND
@@ -250,7 +261,7 @@ async fn process_one_triggered_consequence(
             member = %member_did,
             "skipping consequence: ghost DID with no evidence"
         );
-        return false;
+        return Ok(false);
     }
 
     let action_type = consequence_action_type(&consequence.action);
@@ -281,7 +292,7 @@ async fn process_one_triggered_consequence(
         action_type,
         durable,
     )
-    .await;
+    .await?;
 
     if !member_present {
         // Member left between evaluation and enforcement: emit a failed
@@ -299,8 +310,8 @@ async fn process_one_triggered_consequence(
             action_type,
             durable,
         )
-        .await;
-        return false;
+        .await?;
+        return Ok(false);
     }
 
     let enforcement = dispatch_enforcement_action(
@@ -322,11 +333,11 @@ async fn process_one_triggered_consequence(
             durable,
             obligation,
         )
-        .await;
+        .await?;
         // The H10 escalation unconditionally applies `suspend_all` (a Class-S
         // `suspended_capabilities` mutation), so this path always owes a
         // fail-closed persist regardless of which action originally failed.
-        return true; // skip cooldown recording — failed action doesn't count
+        return Ok(true); // skip cooldown recording — failed action doesn't count
     }
 
     // Record cooldown: prevent re-firing within the rule's window. Written
@@ -349,7 +360,7 @@ async fn process_one_triggered_consequence(
         action_type,
         durable,
     )
-    .await;
+    .await?;
 
     // `true` iff this successful action reduced the member's effective authority
     // and therefore owes a fail-closed persist (ADR-049 §9): a
@@ -358,7 +369,7 @@ async fn process_one_triggered_consequence(
     // authorization input — an `AssignRole` demotion is a downward-auth change, NOT
     // a coalesce-safe "structural role state" mutation, which is exactly the
     // misconception that left an earlier demotion-rollback window open.
-    enforcement.downward_auth
+    Ok(enforcement.downward_auth)
 }
 
 /// Emits a `ConsequenceTriggered` event. When `durable`, appends the durable
@@ -375,7 +386,7 @@ async fn emit_consequence_triggered(
     trigger_kind: &str,
     action_type: &str,
     durable: bool,
-) {
+) -> Result<(), ContextError> {
     if durable {
         let payload = consequence_event_payload(
             args.member_did.as_ref(),
@@ -392,7 +403,7 @@ async fn emit_consequence_triggered(
             payload,
             convergent_consequence_timestamp(consequence),
         )
-        .await;
+        .await?;
         *state.checkpoint_events_since += 1;
     }
     let event = ContextEvent::ConsequenceTriggered {
@@ -403,6 +414,7 @@ async fn emit_consequence_triggered(
         action_type: action_type.to_owned(),
     };
     emit_event_into(state.receive_buffer, event, args.context_id, args.event_tx);
+    Ok(())
 }
 
 /// Emits a `ConsequenceEnforcementFailed` durable entry plus the matching
@@ -418,7 +430,7 @@ async fn emit_absent_member_enforcement_failed(
     trigger_kind: &str,
     action_type: &str,
     durable: bool,
-) {
+) -> Result<(), ContextError> {
     if durable {
         let payload = consequence_event_payload(
             args.member_did.as_ref(),
@@ -435,7 +447,7 @@ async fn emit_absent_member_enforcement_failed(
             payload,
             convergent_consequence_timestamp(consequence),
         )
-        .await;
+        .await?;
         *state.checkpoint_events_since += 1;
     }
     let event = ContextEvent::ConsequenceEnforced {
@@ -445,6 +457,7 @@ async fn emit_absent_member_enforcement_failed(
         success: false,
     };
     emit_event_into(state.receive_buffer, event, args.context_id, args.event_tx);
+    Ok(())
 }
 
 /// Emits a `ConsequenceEnforced { success: true }` durable entry plus the
@@ -457,7 +470,7 @@ async fn emit_consequence_enforced_success(
     trigger_kind: &str,
     action_type: &str,
     durable: bool,
-) {
+) -> Result<(), ContextError> {
     if durable {
         let payload = consequence_event_payload(
             args.member_did.as_ref(),
@@ -474,7 +487,7 @@ async fn emit_consequence_enforced_success(
             payload,
             convergent_consequence_timestamp(consequence),
         )
-        .await;
+        .await?;
         *state.checkpoint_events_since += 1;
     }
     let event = ContextEvent::ConsequenceEnforced {
@@ -484,6 +497,7 @@ async fn emit_consequence_enforced_success(
         success: true,
     };
     emit_event_into(state.receive_buffer, event, args.context_id, args.event_tx);
+    Ok(())
 }
 
 /// Outcome of a single [`dispatch_enforcement_action`] call.
@@ -687,7 +701,7 @@ async fn emit_failure_escalation(
     action_type: &str,
     durable: bool,
     obligation: &mut Option<ClassSCommitToken>,
-) {
+) -> Result<(), ContextError> {
     let context_id = args.context_id;
     let member_did = args.member_did;
     // Recomputed from `args.context_id` (a pure SHA-256) on this RARE
@@ -730,7 +744,7 @@ async fn emit_failure_escalation(
             failed_payload,
             convergent_consequence_timestamp(consequence),
         )
-        .await;
+        .await?;
         *state.checkpoint_events_since += 1;
         let escalation_payload = consequence_event_payload(
             member_did.as_ref(),
@@ -747,7 +761,7 @@ async fn emit_failure_escalation(
             escalation_payload,
             convergent_consequence_timestamp(consequence),
         )
-        .await;
+        .await?;
         *state.checkpoint_events_since += 1;
     }
     let event = ContextEvent::ConsequenceEnforced {
@@ -757,6 +771,7 @@ async fn emit_failure_escalation(
         success: true,
     };
     emit_event_into(state.receive_buffer, event, context_id, args.event_tx);
+    Ok(())
 }
 
 /// Collects event history for consequence evaluation and participation
@@ -802,19 +817,20 @@ pub fn event_log_entries_for_consequences(
     context_id: &str,
     now: u64,
     event_log: &dyn crate::context::builder::ContextEventLogProvider,
-) -> (Vec<scp_event_log::Event>, u64) {
+) -> Result<(Vec<scp_event_log::Event>, u64), ContextError> {
     // Source 1: Full event log history (persisted, with real timestamps and
-    // actor_did). Acquired here from the provider; an unreadable/empty log
-    // yields an empty slice (the merge then reflects only Source 2).
+    // actor_did). Acquired here from the provider; an absent log yields an
+    // empty slice (the merge then reflects only Source 2). An unreadable log
+    // is returned as an error: evaluating over an empty Source 1 would select
+    // a different evidence set than every peer that read its log (§9.9.3).
     //
     // ADR-056: key by the canonical digest (matches the event log init in
     // `builder::create_context` and `state.context_id`), not a re-hash of the
     // hex id — `context_id_to_bytes` resolves a real 64-hex id to its digest.
     let context_id_bytes = context_id_to_bytes(context_id);
-    let log_entries = match event_log.event_log_entries(&context_id_bytes) {
-        Ok(Some(entries)) => entries,
-        Ok(None) | Err(_) => Vec::new(),
-    };
+    let log_entries = event_log
+        .event_log_entries(&context_id_bytes)?
+        .unwrap_or_default();
 
     // Convergent window anchor: max timestamp of the Source-1 durable log,
     // captured BEFORE the merge. Empty log -> `now` fallback (sound: no
@@ -850,7 +866,7 @@ pub fn event_log_entries_for_consequences(
         now,
     );
 
-    (merged, convergent_now)
+    Ok((merged, convergent_now))
 }
 
 #[cfg(test)]
@@ -957,7 +973,8 @@ mod convergence_tests {
                 },
                 &mut obligation,
             )
-            .await;
+            .await
+            .expect("consequence leaves append");
             assert!(
                 suspended,
                 "SuspendAccess against a present member applies a suspension"
@@ -1036,6 +1053,171 @@ mod convergence_tests {
         );
     }
 
+    /// A Merkle log whose appends fail while `fail_appends` is set and whose
+    /// reads fail while `fail_reads` is set, as a failing storage write or
+    /// load does.
+    struct FaultyLog {
+        inner: MerkleEventLogProvider,
+        fail_appends: std::sync::atomic::AtomicBool,
+        fail_reads: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl ContextEventLogProvider for FaultyLog {
+        async fn init_event_log(
+            &self,
+            id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            self.inner.init_event_log(id).await
+        }
+        async fn append_event(
+            &self,
+            id: &[u8; 32],
+            event_type: EventType,
+            actor: &str,
+            payload: scp_event_log::EventPayload,
+            timestamp_secs: u64,
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            if self.fail_appends.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(
+                    scp_protocol::context::builder::ContextCreationError::EventLogFailed(
+                        "injected append failure".to_owned(),
+                    ),
+                );
+            }
+            self.inner
+                .append_event(id, event_type, actor, payload, timestamp_secs)
+                .await
+        }
+        async fn destroy_event_log(
+            &self,
+            id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            self.inner.destroy_event_log(id).await
+        }
+        fn event_log_entries(
+            &self,
+            id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            if self.fail_reads.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(scp_protocol::context::ContextError::EventLogFailed(
+                    "injected read failure".to_owned(),
+                ));
+            }
+            self.inner.event_log_entries(id)
+        }
+        fn event_log_merkle_root(
+            &self,
+            id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            self.inner.event_log_merkle_root(id)
+        }
+    }
+
+    /// Spec 07 §"Convergent emission" and spec 17 §"Event log write
+    /// failures": a consequence whose `ConsequenceTriggered` leaf fails to
+    /// append returns the error, applies no enforcement, credits no
+    /// checkpoint counter, and is retried by the next evaluation.
+    #[tokio::test]
+    async fn a_failed_consequence_leaf_is_returned_and_applies_nothing() {
+        let mut state = PerContextState::new_for_test_encrypted(
+            CTX_BYTES,
+            1_700_000_000,
+            DID(ADMIN.to_owned()),
+        );
+        state
+            .membership
+            .add_member(DID(SUBJECT.to_owned()), "member".to_owned(), Vec::new());
+        let context_id_str = hex::encode(CTX_BYTES);
+        let storage_key = crate::context::state::context_id_to_bytes(&context_id_str);
+        let event_log = FaultyLog {
+            inner: MerkleEventLogProvider::new(),
+            fail_appends: std::sync::atomic::AtomicBool::new(true),
+            fail_reads: std::sync::atomic::AtomicBool::new(false),
+        };
+        event_log
+            .init_event_log(&storage_key)
+            .await
+            .expect("init log");
+        let root_before = event_log.event_log_merkle_root(&storage_key).expect("root");
+
+        let clock = SystemClock;
+        let rules = vec![rule(ConsequenceTrigger::WarningCount)];
+        let triggered = vec![TriggeredConsequence {
+            rule_index: 0,
+            action: rules[0].action.clone(),
+            evidence: Vec::new(),
+        }];
+        let args = EnforceConsequencesCtx {
+            context_id: &context_id_str,
+            member_did: &DID(SUBJECT.to_owned()),
+            now: 1_700_000_100,
+            triggered: &triggered,
+            rules: &rules,
+            clock: &clock,
+            event_log: &event_log,
+            event_tx: None,
+        };
+
+        let mut obligation = None;
+        let mut split = ConsequenceStateSplit::from_state(&mut state);
+        let result = enforce_triggered_consequences(&mut split, &args, &mut obligation).await;
+        assert!(
+            matches!(&result, Err(scp_protocol::context::ContextError::EventLogFailed(m)) if m.contains("injected append failure")),
+            "a failed consequence leaf must be returned, got {result:?}"
+        );
+        assert!(
+            obligation.is_none(),
+            "no suspension is applied when the Triggered leaf failed"
+        );
+        assert_eq!(*split.checkpoint_events_since, 0, "no leaf landed");
+        assert_eq!(
+            event_log.event_log_merkle_root(&storage_key).expect("root"),
+            root_before
+        );
+
+        // The next evaluation retries the consequence: no cooldown was set.
+        event_log
+            .fail_appends
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let suspended = enforce_triggered_consequences(&mut split, &args, &mut obligation)
+            .await
+            .expect("the retry appends");
+        assert!(suspended, "the retried consequence applies its suspension");
+        assert_eq!(
+            *split.checkpoint_events_since, 2,
+            "Triggered and Enforced leaves"
+        );
+        obligation
+            .expect("the suspension arms the obligation")
+            .defuse_for_test();
+    }
+
+    /// An unreadable event log fails consequence evaluation; it is never read
+    /// as an empty log (§9.9.3 evidence convergence).
+    #[tokio::test]
+    async fn consequence_evidence_read_returns_the_log_read_failure() {
+        let context_id_str = hex::encode(CTX_BYTES);
+        let storage_key = crate::context::state::context_id_to_bytes(&context_id_str);
+        let event_log = FaultyLog {
+            inner: MerkleEventLogProvider::new(),
+            fail_appends: std::sync::atomic::AtomicBool::new(false),
+            fail_reads: std::sync::atomic::AtomicBool::new(true),
+        };
+        event_log
+            .init_event_log(&storage_key)
+            .await
+            .expect("init log");
+        let buffer = ReceiveBuffer::new();
+        let result =
+            event_log_entries_for_consequences(&buffer, &context_id_str, 1_700_000_100, &event_log);
+        assert!(
+            matches!(&result, Err(scp_protocol::context::ContextError::EventLogFailed(m)) if m.contains("injected read failure")),
+            "an unreadable log must fail the evidence read, got {result:?}"
+        );
+    }
+
     // -- EL01: convergent-source soundness for consequence evaluation ----------
 
     use super::event_log_entries_for_consequences;
@@ -1099,7 +1281,8 @@ mod convergence_tests {
     async fn governance_bucket_count(buffer: &ReceiveBuffer) -> usize {
         let (log, ctx) = convergent_log().await;
         let (merged, _convergent_now) =
-            event_log_entries_for_consequences(buffer, &ctx, 1_700_000_100, &log);
+            event_log_entries_for_consequences(buffer, &ctx, 1_700_000_100, &log)
+                .expect("log read");
         merged
             .iter()
             .filter(|e| e.event_type == EventType::GovernanceAction)
@@ -1161,7 +1344,8 @@ mod convergence_tests {
             .expect("clock")
             .as_secs();
         let (merged, _convergent_now) =
-            event_log_entries_for_consequences(&buffer, &context_id_str, now, &log);
+            event_log_entries_for_consequences(&buffer, &context_id_str, now, &log)
+                .expect("log read");
         let message_count = merged
             .iter()
             .filter(|e| e.event_type == EventType::MessageSent)

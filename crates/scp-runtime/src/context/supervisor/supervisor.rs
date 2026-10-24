@@ -21065,6 +21065,21 @@ mod tests {
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             Ok(())
         }
+        /// This fixture keeps no readable log: no entries for any context.
+        fn event_log_entries(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            Ok(None)
+        }
+        /// This fixture keeps no readable log: the zero root.
+        fn event_log_merkle_root(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok([0u8; 32])
+        }
     }
 
     /// An event-log double PRE-SEEDED with a fixed entry history, returned
@@ -21077,11 +21092,18 @@ mod tests {
     struct SeededEventLog {
         #[allow(clippy::disallowed_types)]
         entries: Arc<std::sync::Mutex<Vec<scp_event_log::Event>>>,
+        /// While set, every write (`append_event`, `prune_before_checkpoint`)
+        /// fails as a failed storage write does.
+        fail_appends: Arc<std::sync::atomic::AtomicBool>,
+        /// While set, `event_log_entries` fails as a failed storage load does.
+        fail_reads: Arc<std::sync::atomic::AtomicBool>,
     }
     impl SeededEventLog {
         fn new(entries: Vec<scp_event_log::Event>) -> Self {
             Self {
                 entries: Arc::new(std::sync::Mutex::new(entries)),
+                fail_appends: Arc::default(),
+                fail_reads: Arc::default(),
             }
         }
     }
@@ -21101,6 +21123,13 @@ mod tests {
             payload: scp_event_log::EventPayload,
             timestamp_secs: u64,
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            if self.fail_appends.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(
+                    scp_protocol::context::builder::ContextCreationError::EventLogFailed(
+                        "injected append failure".to_owned(),
+                    ),
+                );
+            }
             {
                 let mut entries = self
                     .entries
@@ -21125,16 +21154,41 @@ mod tests {
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             Ok(())
         }
+        async fn prune_before_checkpoint(
+            &self,
+            _id: &[u8; 32],
+            _checkpoint_event_count: u64,
+            _policy: &scp_protocol::context::governance::PruningPolicy,
+        ) -> Result<Option<usize>, ContextError> {
+            if self.fail_appends.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(ContextError::EventLogFailed(
+                    "injected prune failure".to_owned(),
+                ));
+            }
+            Ok(Some(0))
+        }
         fn event_log_entries(
             &self,
             _id: &[u8; 32],
         ) -> Result<Option<Vec<scp_event_log::Event>>, ContextError> {
+            if self.fail_reads.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(ContextError::EventLogFailed(
+                    "injected read failure".to_owned(),
+                ));
+            }
             Ok(Some(
                 self.entries
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .clone(),
             ))
+        }
+        /// This fixture keeps no readable log: the zero root.
+        fn event_log_merkle_root(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok([0u8; 32])
         }
     }
 
@@ -22571,7 +22625,8 @@ mod tests {
             &ctx_key,
             std::time::Duration::from_secs(ADDITIONAL),
         )
-        .await;
+        .await
+        .expect("reset_ttl_timer");
 
         assert_eq!(
             cell.ttl.timer.deadline_unix_secs,
@@ -22583,6 +22638,222 @@ mod tests {
             Some(T0 + ADDITIONAL),
             "bilateral reset must NOT record now + additional (local-clock, divergent)"
         );
+    }
+
+    /// A finite-TTL `Active` context at `T0` whose deadline is
+    /// `T0 + create_ttl`, over `event_log`, with its actor deps.
+    async fn ttl_cell_over(
+        event_log: SeededEventLog,
+        seed: u8,
+        t0: u64,
+        create_ttl: u64,
+        pruning_policy: Option<scp_protocol::context::governance::PruningPolicy>,
+    ) -> (
+        Arc<Supervisor>,
+        crate::context::actor::ActorDeps,
+        crate::context::actor::class_s::ClassSCell,
+        String,
+    ) {
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(t0));
+        let sup = supervisor_with_clock_persistence_and_event_log(
+            clock_dyn,
+            Box::new(MapPersistence::default()),
+            Box::new(event_log),
+        );
+        let deps = test_actor_deps(&sup).await;
+        let ctx_key = hex::encode([seed; 32]);
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            [seed; 32],
+            t0,
+            DID("did:example:ttl-fail-closed-admin".to_owned()),
+        );
+        state.handle = crate::context::ContextHandle::new(
+            ctx_key.clone(),
+            scp_protocol::context::params::ContextParams {
+                ttl: Some(std::time::Duration::from_secs(create_ttl)),
+                memory_scope: scp_protocol::context::params::MemoryScope::Full,
+                ..Default::default()
+            },
+        );
+        state.ttl.timer.deadline_unix_secs = Some(t0 + create_ttl);
+        state.governance.pruning_policy = pruning_policy;
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .unwrap();
+        (
+            sup,
+            deps,
+            crate::context::actor::class_s::ClassSCell::new(state),
+            ctx_key,
+        )
+    }
+
+    /// Spec 17 §"Event log write failures": a TTL reset whose `TtlExtended`
+    /// leaf fails to append returns the error and leaves the deadline where it
+    /// was, so no member holds a deadline its log does not record.
+    #[tokio::test]
+    async fn a_ttl_reset_whose_leaf_fails_returns_err_and_keeps_the_deadline() {
+        const T0: u64 = 1_700_000_000;
+        const CREATE_TTL: u64 = 500;
+        let event_log = SeededEventLog::new(vec![seeded_context_created(0)]);
+        let fail = Arc::clone(&event_log.fail_appends);
+        let (_sup, deps, mut cell, ctx_key) =
+            ttl_cell_over(event_log.clone(), 0x61, T0, CREATE_TTL, None).await;
+        let counter_before = *cell.class_c_view().checkpoint_events_since_mut();
+
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        let result = crate::context::ttl_close_helpers::reset_ttl_timer(
+            &mut cell,
+            &deps,
+            &ctx_key,
+            std::time::Duration::from_secs(100),
+        )
+        .await;
+        assert!(
+            matches!(&result, Err(ContextError::EventLogFailed(m)) if m.contains("injected append failure")),
+            "a failed TtlExtended append must be returned, got {result:?}"
+        );
+        assert_eq!(cell.ttl.timer.deadline_unix_secs, Some(T0 + CREATE_TTL));
+        assert_eq!(
+            *cell.class_c_view().checkpoint_events_since_mut(),
+            counter_before
+        );
+        assert_eq!(
+            event_log
+                .entries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1,
+            "no TtlExtended leaf landed"
+        );
+    }
+
+    /// Spec 17 §"Event log write failures": a TTL expiry that cannot read the
+    /// log its convergent deadline comes from runs no step. Deriving the
+    /// deadline from an empty log would drop every recorded extension and
+    /// destroy keys at the un-extended base.
+    #[tokio::test]
+    async fn a_ttl_expiry_over_an_unreadable_log_runs_no_step() {
+        const T0: u64 = 1_700_000_000;
+        const CREATE_TTL: u64 = 500;
+        let event_log = SeededEventLog::new(vec![seeded_context_created(0)]);
+        let fail = Arc::clone(&event_log.fail_reads);
+        let (_sup, deps, mut cell, _ctx_key) =
+            ttl_cell_over(event_log, 0x62, T0, CREATE_TTL, None).await;
+        let handle = cell.handle.clone();
+
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        let outcome =
+            crate::context::ttl_close_helpers::handle_ttl_expiry(&mut cell, &deps, &handle, 0)
+                .await;
+        assert!(outcome.result.is_log_unreadable());
+        assert!(
+            matches!(&outcome.persist_result, Err(ContextError::EventLogFailed(m)) if m.contains("injected read failure")),
+            "the read failure is the outcome's error, got {:?}",
+            outcome.persist_result
+        );
+        assert_eq!(outcome.result.completed_steps(), 0, "no step ran");
+        assert_eq!(handle.state(), crate::context::ContextState::Active);
+        assert_eq!(cell.ttl.timer.deadline_unix_secs, Some(T0 + CREATE_TTL));
+    }
+
+    /// Spec 17 §"Event log write failures": a governance checkpoint whose
+    /// configured prune fails to persist returns the error.
+    #[tokio::test]
+    async fn a_checkpoint_whose_prune_fails_returns_err() {
+        const T0: u64 = 1_700_000_000;
+        let event_log = SeededEventLog::new(vec![seeded_context_created(0)]);
+        let fail = Arc::clone(&event_log.fail_appends);
+        let policy = scp_protocol::context::governance::PruningPolicy {
+            size_based: Some(scp_protocol::context::governance::SizeBasedPolicy {
+                max_event_count: 1,
+                max_storage_bytes: u64::MAX,
+            }),
+            ..Default::default()
+        };
+        let (_sup, deps, mut cell, ctx_key) =
+            ttl_cell_over(event_log, 0x63, T0, 500, Some(policy)).await;
+        let creator = DID("did:example:ttl-fail-closed-admin".to_owned());
+        macro_rules! checkpoint {
+            () => {
+                crate::context::trust_recovery_helpers::create_governance_checkpoint(
+                    &mut cell,
+                    &deps,
+                    &ctx_key,
+                    1,
+                    [0u8; 32],
+                    1,
+                    [0u8; 32],
+                    [0u8; 32],
+                    &creator,
+                    Vec::new(),
+                )
+                .await
+            };
+        }
+
+        checkpoint!().expect("control: the prune persists");
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        let result = checkpoint!();
+        assert!(
+            matches!(&result, Err(ContextError::EventLogFailed(m)) if m.contains("injected prune failure")),
+            "a failed prune must fail the checkpoint, got {result:?}"
+        );
+    }
+
+    /// Spec 17 §"Event log write failures": a recovery epoch advance whose
+    /// `RecoveryEpochAdvanced` leaf fails to append returns the error and
+    /// credits no checkpoint counter.
+    #[tokio::test]
+    async fn a_recovery_epoch_advance_whose_leaf_fails_returns_err() {
+        const T0: u64 = 1_700_000_000;
+        const CTX: &str = "recovery-epoch-leaf-fail-ctx";
+        let event_log = SeededEventLog::new(vec![seeded_context_created(0)]);
+        let fail = Arc::clone(&event_log.fail_appends);
+        let sup = supervisor_with_clock_persistence_and_event_log(
+            Arc::new(TestClock::new(T0)),
+            Box::new(MapPersistence::default()),
+            Box::new(event_log),
+        );
+        let deps = test_actor_deps(&sup).await;
+        // A real MLS group, so the epoch advance reaches the leaf append.
+        let crate::crypto::mls::two_party_test_support::TwoPartyPair {
+            alice_wrapping,
+            alice_state,
+            ..
+        } = crate::crypto::mls::two_party_test_support::stand_up_two_party(
+            CTX,
+            "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK",
+            "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo",
+        );
+        sup.wrapping_keys.insert(
+            DID("did:example:spawn-state-test".to_owned()),
+            alice_wrapping,
+        );
+        alice_state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .expect("the fixture context activates");
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(alice_state);
+        let ctx_key = CTX.to_owned();
+
+        crate::context::trust_recovery_helpers::recovery_advance_epoch(&mut cell, &deps, &ctx_key)
+            .await
+            .expect("control: the epoch advance and its leaf land");
+        let counter = *cell.class_c_view().checkpoint_events_since_mut();
+
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        let result = crate::context::trust_recovery_helpers::recovery_advance_epoch(
+            &mut cell, &deps, &ctx_key,
+        )
+        .await;
+        assert!(
+            matches!(&result, Err(ContextError::EventLogFailed(m)) if m.contains("injected append failure")),
+            "a failed RecoveryEpochAdvanced append must be returned, got {result:?}"
+        );
+        assert_eq!(*cell.class_c_view().checkpoint_events_since_mut(), counter);
     }
 
     /// H2 (reset on a no-TTL context, REGRESSION GATE): `reset_ttl_timer` on a
@@ -22630,7 +22901,8 @@ mod tests {
             &ctx_key,
             std::time::Duration::from_secs(ADDITIONAL),
         )
-        .await;
+        .await
+        .expect("reset_ttl_timer");
 
         assert_eq!(
             cell.ttl.timer.deadline_unix_secs, None,
@@ -22717,7 +22989,8 @@ mod tests {
             &ctx_key,
             std::time::Duration::from_secs(ADDITIONAL),
         )
-        .await;
+        .await
+        .expect("reset_ttl_timer");
 
         assert_eq!(
             cell.ttl.timer.deadline_unix_secs,
@@ -22825,7 +23098,8 @@ mod tests {
                 &ctx_key,
                 std::time::Duration::from_secs(ADDITIONAL),
             )
-            .await;
+            .await
+            .expect("reset_ttl_timer");
 
             entries_handle
                 .lock()
@@ -23133,6 +23407,13 @@ mod tests {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .clone(),
             ))
+        }
+        /// This fixture keeps no readable log: the zero root.
+        fn event_log_merkle_root(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok([0u8; 32])
         }
     }
 
@@ -26226,10 +26507,13 @@ mod tests {
         async fn restore_event_log(
             &self,
             _id: &[u8; 32],
-        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+        ) -> Result<
+            crate::context::builder::EventLogRestore,
+            scp_protocol::context::builder::ContextCreationError,
+        > {
             self.hydrations
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(())
+            Ok(crate::context::builder::EventLogRestore::Absent)
         }
         async fn append_event(
             &self,
@@ -26246,6 +26530,21 @@ mod tests {
             _id: &[u8; 32],
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             Ok(())
+        }
+        /// This fixture keeps no readable log: no entries for any context.
+        fn event_log_entries(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            Ok(None)
+        }
+        /// This fixture keeps no readable log: the zero root.
+        fn event_log_merkle_root(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok([0u8; 32])
         }
     }
 
@@ -26293,6 +26592,116 @@ mod tests {
             Vec::<(String, u64)>::new(),
             "the refused restore must leave the registry's replay floors unchanged"
         );
+    }
+
+    /// Event log whose `restore_event_log` fails as a failed storage load
+    /// does.
+    struct FailingRestoreEventLog;
+    #[async_trait::async_trait]
+    impl crate::context::builder::ContextEventLogProvider for FailingRestoreEventLog {
+        async fn init_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+        async fn restore_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<
+            crate::context::builder::EventLogRestore,
+            scp_protocol::context::builder::ContextCreationError,
+        > {
+            Err(
+                scp_protocol::context::builder::ContextCreationError::EventLogFailed(
+                    "injected load failure".to_owned(),
+                ),
+            )
+        }
+        async fn append_event(
+            &self,
+            _id: &[u8; 32],
+            _event_type: scp_event_log::EventType,
+            _actor: &str,
+            _payload: scp_event_log::EventPayload,
+            _timestamp_secs: u64,
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+        async fn destroy_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+        /// This fixture keeps no readable log: no entries for any context.
+        fn event_log_entries(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            Ok(None)
+        }
+        /// This fixture keeps no readable log: the zero root.
+        fn event_log_merkle_root(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok([0u8; 32])
+        }
+    }
+
+    /// Restores the keyless rule-9 snapshot for `seed` over `event_log`.
+    async fn restore_over_event_log(
+        seed: u8,
+        event_log: Box<dyn crate::context::builder::ContextEventLogProvider>,
+    ) -> (Result<(), ContextError>, Arc<Supervisor>, String) {
+        let persistence = MapPersistence::default();
+        let contexts = Arc::clone(&persistence.contexts);
+        let sup = supervisor_with_clock_persistence_and_event_log(
+            Arc::new(TestClock::new(RULE9_T0 + 9_000)),
+            Box::new(persistence),
+            event_log,
+        );
+        let context_id = hex::encode([seed; 32]);
+        let snapshot = rule9_snapshot(
+            &sup,
+            &context_id,
+            "did:key:restore-event-log-creator",
+            &rule9_params(),
+            None,
+        );
+        contexts.insert(context_id.clone(), snapshot);
+        let handle = crate::context::ContextHandle::new(context_id.clone(), rule9_params());
+        let result = sup.restore_context(&context_id, &handle).await;
+        (result, sup, context_id)
+    }
+
+    /// Spec 17 §"Event log write failures": a restore whose event-log load
+    /// fails returns the error and starts no actor; it never continues over an
+    /// empty log.
+    #[tokio::test]
+    async fn restore_context_returns_the_event_log_load_failure() {
+        let (result, sup, context_id) =
+            restore_over_event_log(0xB1, Box::new(FailingRestoreEventLog)).await;
+        let err = result.expect_err("a failed event-log load must fail the restore");
+        assert!(
+            matches!(&err, ContextError::EventLogFailed(m) if m.contains("injected load failure")),
+            "expected the event-log load failure, got {err:?}"
+        );
+        assert!(
+            sup.local_routing_ids(&context_id).await.is_err(),
+            "a failed restore must not leave a running context"
+        );
+
+        // Control: the same restore over a log that loads succeeds.
+        let (result, sup, context_id) = restore_over_event_log(
+            0xB2,
+            Box::new(crate::context::providers::event_log::MerkleEventLogProvider::new()),
+        )
+        .await;
+        result.expect("a restore whose log loads succeeds");
+        assert!(sup.local_routing_ids(&context_id).await.is_ok());
     }
 
     /// §5.13.3 rule 9: a keyed restore follows the interval schedule counted
@@ -27167,6 +27576,21 @@ mod tests {
             _id: &[u8; 32],
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             Ok(())
+        }
+        /// This fixture keeps no readable log: no entries for any context.
+        fn event_log_entries(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            Ok(None)
+        }
+        /// This fixture keeps no readable log: the zero root.
+        fn event_log_merkle_root(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok([0u8; 32])
         }
     }
 
@@ -35406,6 +35830,21 @@ mod tests {
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             Ok(())
         }
+        /// This fixture keeps no readable log: no entries for any context.
+        fn event_log_entries(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            Ok(None)
+        }
+        /// This fixture keeps no readable log: the zero root.
+        fn event_log_merkle_root(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok([0u8; 32])
+        }
     }
 
     /// Build a supervisor whose key_resolver resolves `creator_did` to
@@ -42690,6 +43129,21 @@ mod streaming_saga_tests {
             _id: &[u8; 32],
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             Ok(())
+        }
+        /// This fixture keeps no readable log: no entries for any context.
+        fn event_log_entries(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            Ok(None)
+        }
+        /// This fixture keeps no readable log: the zero root.
+        fn event_log_merkle_root(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok([0u8; 32])
         }
     }
 

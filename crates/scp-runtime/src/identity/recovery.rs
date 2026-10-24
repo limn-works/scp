@@ -2268,6 +2268,13 @@ mod tests {
             ) -> Result<Option<Vec<scp_event_log::Event>>, ContextError> {
                 Ok(None)
             }
+            /// This fixture keeps no readable log: the zero root.
+            fn event_log_merkle_root(
+                &self,
+                _context_id: &[u8; 32],
+            ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+                Ok([0u8; 32])
+            }
         }
 
         // ADR-049 §15: `ContextManager` is gone. Build the

@@ -4061,6 +4061,21 @@ pub(crate) mod tests {
         async fn destroy_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }
+        /// This fixture keeps no readable log: no entries for any context.
+        fn event_log_entries(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            Ok(None)
+        }
+        /// This fixture keeps no readable log: the zero root.
+        fn event_log_merkle_root(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok([0u8; 32])
+        }
     }
 
     /// Builds a per-instance Supervisor with test-friendly providers.
@@ -6330,15 +6345,15 @@ pub(crate) mod tests {
     // Drain before close (ADR-049 Decision 16; ADR-048 §5 as amended)
     // -----------------------------------------------------------------
 
-    /// Event log whose `destroy_event_log` waits for a permit on `gate`. A
+    /// Event log whose `release_event_log` waits for a permit on `gate`. A
     /// gate with no permits wedges the context actor's `ShutdownSelf`, so the
     /// Supervisor drain cannot finish until the test adds a permit.
-    struct GatedDestroyEventLog {
+    struct GatedReleaseEventLog {
         gate: Arc<tokio::sync::Semaphore>,
     }
 
     #[async_trait::async_trait]
-    impl ContextEventLogProvider for GatedDestroyEventLog {
+    impl ContextEventLogProvider for GatedReleaseEventLog {
         #[allow(
             clippy::unused_async,
             reason = "async fn required by the ContextEventLogProvider async_trait; body has no await"
@@ -6360,12 +6375,34 @@ pub(crate) mod tests {
         ) -> Result<(), ContextCreationError> {
             Ok(())
         }
+        #[allow(
+            clippy::unused_async,
+            reason = "async fn required by the ContextEventLogProvider async_trait; body has no await"
+        )]
         async fn destroy_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+        async fn release_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
             self.gate
                 .acquire()
                 .await
                 .map(drop)
                 .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))
+        }
+        /// This fixture keeps no readable log: no entries for any context.
+        fn event_log_entries(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            Ok(None)
+        }
+        /// This fixture keeps no readable log: the zero root.
+        fn event_log_merkle_root(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok([0u8; 32])
         }
     }
 
@@ -6400,7 +6437,7 @@ pub(crate) mod tests {
         dir
     }
 
-    /// Builds a bridge over a Supervisor whose event-log destroy waits on
+    /// Builds a bridge over a Supervisor whose event-log release waits on
     /// `gate`, with one created context so shutdown has an actor to stop.
     async fn sqlite_bridge_with_context(
         dir: &std::path::Path,
@@ -6414,7 +6451,7 @@ pub(crate) mod tests {
                 Arc::new(scp_clock::SystemClock),
             )),
             Box::new(LocalTransportProvider),
-            Box::new(GatedDestroyEventLog { gate }),
+            Box::new(GatedReleaseEventLog { gate }),
             key_resolver,
             None,
             None,

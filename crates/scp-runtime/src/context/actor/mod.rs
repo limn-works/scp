@@ -1156,7 +1156,10 @@ impl ContextActor {
             return true;
         }
 
-        if terminal {
+        // An attempt stopped by an unreadable event log ran nothing and left the
+        // context `Active`; it takes the same bounded retry, since re-arming the
+        // one-shot timer on its past deadline would re-fire at once.
+        if terminal || outcome.result.is_log_unreadable() {
             // Terminal but not fully durable/complete: KEEP the actor alive and
             // re-arm a bounded retry so a later tick re-runs the failed step
             // (SEC-1). Independent of the `is_active`-gated `ttl_timer`
@@ -1496,6 +1499,13 @@ mod tests {
         ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
         {
             Ok(Some(vec![ttl_seed_created_leaf()]))
+        }
+        /// This fixture keeps no readable log: the zero root.
+        fn event_log_merkle_root(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok([0u8; 32])
         }
     }
 
@@ -2646,6 +2656,13 @@ mod tests {
         {
             Ok(Some(vec![ttl_seed_created_leaf()]))
         }
+        /// This fixture keeps no readable log: the zero root.
+        fn event_log_merkle_root(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok([0u8; 32])
+        }
     }
 
     /// Event log whose `append_event` FAILS on the first attempt then succeeds —
@@ -2706,6 +2723,13 @@ mod tests {
         ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
         {
             Ok(Some(vec![ttl_seed_created_leaf()]))
+        }
+        /// This fixture keeps no readable log: the zero root.
+        fn event_log_merkle_root(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok([0u8; 32])
         }
     }
 
@@ -2813,6 +2837,135 @@ mod tests {
             "the still-alive actor reports the terminal Expired state"
         );
 
+        drop(handle);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), actor_task).await;
+    }
+
+    /// Event log whose reads fail for the first `failing_reads` calls, as a
+    /// failed storage load does, then return the seeded genesis leaf.
+    #[cfg(feature = "testing")]
+    #[derive(Clone, Default)]
+    struct UnreadableThenReadableLog {
+        reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        failing_reads: usize,
+    }
+    #[cfg(feature = "testing")]
+    #[async_trait::async_trait]
+    impl crate::context::builder::ContextEventLogProvider for UnreadableThenReadableLog {
+        async fn init_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+        async fn append_event(
+            &self,
+            _id: &[u8; 32],
+            _event: scp_event_log::EventType,
+            _actor: &str,
+            _payload: scp_event_log::EventPayload,
+            _timestamp_secs: u64,
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+        async fn destroy_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+        fn event_log_entries(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            let n = self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n < self.failing_reads {
+                return Err(scp_protocol::context::ContextError::EventLogFailed(
+                    "fixture: event log unreadable".to_owned(),
+                ));
+            }
+            Ok(Some(vec![ttl_seed_created_leaf()]))
+        }
+        /// This fixture keeps no readable log: the zero root.
+        fn event_log_merkle_root(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok([0u8; 32])
+        }
+    }
+
+    /// Spec 17 §"Event log write failures": a TTL expiry stopped by an
+    /// unreadable log keeps the context `Active` and retries on the bounded
+    /// backoff; it neither expires over an empty log nor re-fires the past
+    /// deadline in a loop. Once the log reads, the expiry completes.
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn ttl_expiry_over_an_unreadable_log_retries_with_backoff() {
+        let log = UnreadableThenReadableLog {
+            reads: std::sync::Arc::default(),
+            failing_reads: 1,
+        };
+        let reads = std::sync::Arc::clone(&log.reads);
+        let deps = new_test_deps_with_providers(
+            Box::new(RecordingPersistence::new()),
+            Box::new(crate::context::builder::NotConfiguredTransportProvider),
+            Box::new(log),
+        )
+        .await;
+        tokio::time::pause();
+
+        let now = deps.clock.now_secs();
+        let state = active_state_with_past_ttl(0x7A, now);
+        let ctx = hex_encode_context_id(&[0x7Au8; 32]);
+        let (tx, rx) = mpsc::channel::<ContextCommand>(4);
+        let actor_task = tokio::spawn(ContextActor::new(state, deps, rx).run());
+        let handle = ContextActorHandle::from_sender(tx);
+        let read_state = || {
+            handle.send(|reply| {
+                ContextCommand::Queries(QueriesCommand::ReadContextState {
+                    context_id: ctx.clone(),
+                    reply,
+                })
+            })
+        };
+
+        // Step virtual time in 10 ms ticks, so no tick can jump past the retry
+        // backoff, until the first expiry attempt has read the log.
+        let step = std::time::Duration::from_millis(10);
+        let mut waited = std::time::Duration::ZERO;
+        while reads.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            assert!(
+                waited < std::time::Duration::from_secs(1),
+                "the TTL expiry never fired"
+            );
+            tokio::time::sleep(step).await;
+            waited += step;
+        }
+        // Up to half the retry base later, the failed attempt is still the only
+        // read and the context is still Active.
+        while waited < TTL_EXPIRY_RETRY_BASE / 2 {
+            tokio::time::sleep(step).await;
+            waited += step;
+        }
+        assert_eq!(
+            reads.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the failed attempt waits for the retry backoff; it does not re-fire at once"
+        );
+        assert_eq!(
+            read_state().await.expect("actor alive"),
+            scp_protocol::context::ContextState::Active,
+            "an expiry over an unreadable log must not transition the context"
+        );
+
+        // The retry reads the log and completes the expiry.
+        while reads.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+            assert!(waited < TTL_EXPIRY_RETRY_BASE * 2, "the retry never fired");
+            tokio::time::sleep(step).await;
+            waited += step;
+        }
         drop(handle);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(1), actor_task).await;
     }
@@ -3117,6 +3270,13 @@ mod tests {
         ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
         {
             Ok(Some(vec![ttl_seed_created_leaf()]))
+        }
+        /// This fixture keeps no readable log: the zero root.
+        fn event_log_merkle_root(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok([0u8; 32])
         }
     }
 
