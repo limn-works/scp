@@ -5,7 +5,7 @@ use std::error::Error;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
-use scp_clock::TestClock;
+use scp_clock::{MonotonicClock, SystemMonotonicClock, TestClock};
 use scp_platform::KeyType;
 use scp_platform::in_memory::InMemoryStorage;
 use scp_platform::testing::InMemoryKeyCustody;
@@ -127,12 +127,27 @@ async fn registrar(
     publisher: Arc<dyn PushRelayPublisher>,
     clock: Arc<dyn Clock>,
 ) -> Result<PushRegistrar<InMemoryKeyCustody, InMemoryStorage>, Box<dyn Error>> {
-    registrar_on(publisher, clock, ledger()).await
+    registrar_on(publisher, clock, system_monotonic(), ledger()).await
+}
+
+/// A registrar whose wall clock and monotonic clock are both `clock`.
+async fn clocked(
+    publisher: Arc<dyn PushRelayPublisher>,
+    clock: &Arc<TestClock>,
+) -> Result<PushRegistrar<InMemoryKeyCustody, InMemoryStorage>, Box<dyn Error>> {
+    registrar_on(
+        publisher,
+        Arc::clone(clock) as Arc<dyn Clock>,
+        Arc::clone(clock) as Arc<dyn MonotonicClock>,
+        ledger(),
+    )
+    .await
 }
 
 async fn registrar_on<S: Storage>(
     publisher: Arc<dyn PushRelayPublisher>,
     clock: Arc<dyn Clock>,
+    monotonic_clock: Arc<dyn MonotonicClock>,
     storage: Arc<ProtocolRepository<S>>,
 ) -> Result<PushRegistrar<InMemoryKeyCustody, S>, Box<dyn Error>> {
     let signing_key = signing_key().await?;
@@ -140,6 +155,7 @@ async fn registrar_on<S: Storage>(
         signing_key,
         publisher,
         clock,
+        monotonic_clock,
         platform: PushPlatform::Apns,
         token: PushToken::new(TOKEN.to_vec()),
         storage,
@@ -149,6 +165,10 @@ async fn registrar_on<S: Storage>(
 
 fn system_clock() -> Arc<dyn Clock> {
     Arc::new(scp_clock::SystemClock)
+}
+
+fn system_monotonic() -> Arc<dyn MonotonicClock> {
+    Arc::new(SystemMonotonicClock::new())
 }
 
 /// An event log that stores nothing; these tests read push routes only.
@@ -621,8 +641,9 @@ async fn leaving_last_context_on_relay_deregisters() -> TestResult {
 
 /// A token refresh sends each registered relay a deregistration of the old
 /// token and then a registration of the same routing IDs for the new one.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn token_refresh_deregisters_old_then_registers_new() -> TestResult {
+    let sup = supervisor();
     let (sink, mut rx) = publisher(system_clock(), accept_all());
     let mut registrar = registrar(sink, system_clock()).await?;
     let public_key = *registrar.signing_key.public_key();
@@ -632,7 +653,7 @@ async fn token_refresh_deregisters_old_then_registers_new() -> TestResult {
     expect_publishes(&mut rx, 2).await?;
 
     let refresh = registrar
-        .refresh_token(PushToken::new(NEW_TOKEN.to_vec()))
+        .refresh_token(&sup, PushToken::new(NEW_TOKEN.to_vec()))
         .await?;
     assert!(
         refresh.deregistered.values().all(Result::is_ok),
@@ -656,7 +677,9 @@ async fn token_refresh_deregisters_old_then_registers_new() -> TestResult {
         assert_eq!(registration.routing_ids, vec![ids]);
     }
     assert!(matches!(
-        registrar.refresh_token(PushToken::new(Vec::new())).await,
+        registrar
+            .refresh_token(&sup, PushToken::new(Vec::new()))
+            .await,
         Err(PushError::Message(PushMessageError::EmptyToken))
     ));
     assert_eq!(
@@ -1272,7 +1295,7 @@ fn stale_step(
     Ok(step)
 }
 
-/// Reconciles every [`RETRY_STEP`] seconds of `clock` until relay A's
+/// Reconciles every [`RETRY_STEP`] seconds of elapsed time until relay A's
 /// outcome is the terminal `StaleBeyondSkew`, and returns how many retryable
 /// `Stale` outcomes came first.
 async fn reconcile_until_bound<S: Storage>(
@@ -1282,20 +1305,21 @@ async fn reconcile_until_bound<S: Storage>(
     rx: &mut mpsc::UnboundedReceiver<Published>,
     deregistration: bool,
 ) -> Result<u64, Box<dyn Error>> {
-    let first = clock.now_secs();
+    let first = clock.monotonic_millis();
+    let elapsed = || (clock.monotonic_millis() - first) / 1000;
     let mut retries = 0;
     for _ in 0..MAX_ATTEMPTS {
         match stale_step(registrar.reconcile(sup).await?, deregistration, rx)? {
             StaleStep::Retry => {
                 assert!(
-                    clock.now_secs() - first <= STALE_RUN_BOUND_SECS,
+                    elapsed() <= STALE_RUN_BOUND_SECS,
                     "a 4062 {} s after the first is still retried",
-                    clock.now_secs() - first
+                    elapsed()
                 );
                 retries += 1;
             }
             StaleStep::Bound(span_secs) => {
-                assert_eq!(span_secs, clock.now_secs() - first);
+                assert_eq!(span_secs, elapsed());
                 assert!(span_secs > STALE_RUN_BOUND_SECS, "{span_secs}");
                 return Ok(retries);
             }
@@ -1318,8 +1342,8 @@ async fn always_stale_relay_stops_getting_registrations_after_skew_bound() -> Te
     create_context(&sup, CTX_A, PSEUDONYM_A, &[RELAY_A]).await?;
     let clock = Arc::new(TestClock::new(T0));
     let dyn_clock: Arc<dyn Clock> = Arc::clone(&clock) as Arc<dyn Clock>;
-    let (sink, mut rx) = publisher(Arc::clone(&dyn_clock), Box::new(|_, _| stale_answer()));
-    let mut registrar = registrar(sink, dyn_clock).await?;
+    let (sink, mut rx) = publisher(dyn_clock, Box::new(|_, _| stale_answer()));
+    let mut registrar = clocked(sink, &clock).await?;
 
     let retries = reconcile_until_bound(&mut registrar, &sup, &clock, &mut rx, false).await?;
     assert_eq!(
@@ -1357,8 +1381,8 @@ async fn always_stale_relay_stops_getting_deregistrations_after_skew_bound() -> 
     let clock = Arc::new(TestClock::new(T0));
     let dyn_clock: Arc<dyn Clock> = Arc::clone(&clock) as Arc<dyn Clock>;
     let answer: Answer = Box::new(|_, attempt| if attempt == 0 { Ok(()) } else { stale_answer() });
-    let (sink, mut rx) = publisher(Arc::clone(&dyn_clock), answer);
-    let mut registrar = registrar(sink, dyn_clock).await?;
+    let (sink, mut rx) = publisher(dyn_clock, answer);
+    let mut registrar = clocked(sink, &clock).await?;
     let first = registrar.reconcile(&sup).await?;
     assert!(
         first.registered.get(RELAY_A).is_some_and(Result::is_ok),
@@ -1398,8 +1422,8 @@ async fn register_past_floor(ahead_secs: u64) -> Result<u64, Box<dyn Error>> {
             Ok(())
         }
     });
-    let (sink, mut rx) = publisher(Arc::clone(&dyn_clock), answer);
-    let mut registrar = registrar(sink, dyn_clock).await?;
+    let (sink, mut rx) = publisher(dyn_clock, answer);
+    let mut registrar = clocked(sink, &clock).await?;
     let public_key = *registrar.signing_key.public_key();
 
     let mut retries = 0;
@@ -1478,8 +1502,8 @@ async fn clocked_registrar(
     create_context(&sup, CTX_A, PSEUDONYM_A, &[RELAY_A]).await?;
     let clock = Arc::new(TestClock::new(T0));
     let dyn_clock: Arc<dyn Clock> = Arc::clone(&clock) as Arc<dyn Clock>;
-    let (sink, rx) = publisher(Arc::clone(&dyn_clock), answer);
-    let registrar = registrar(sink, dyn_clock).await?;
+    let (sink, rx) = publisher(dyn_clock, answer);
+    let registrar = clocked(sink, &clock).await?;
     Ok((sup, clock, registrar, rx))
 }
 
@@ -1504,7 +1528,7 @@ async fn unreachable_relay_neither_ends_nor_restarts_a_stale_run() -> TestResult
         StaleStep::Retry
     ));
 
-    clock.set(T0 + 200);
+    clock.advance(200);
     let outcome = registrar.reconcile(&sup).await?;
     assert!(
         matches!(
@@ -1515,7 +1539,7 @@ async fn unreachable_relay_neither_ends_nor_restarts_a_stale_run() -> TestResult
     );
     assert_eq!(drain(&mut rx).len(), 1);
 
-    clock.set(T0 + STALE_RUN_BOUND_SECS + RETRY_STEP);
+    clock.advance(STALE_RUN_BOUND_SECS + RETRY_STEP - 200);
     match stale_step(registrar.reconcile(&sup).await?, false, &mut rx)? {
         StaleStep::Bound(span_secs) => {
             assert_eq!(span_secs, STALE_RUN_BOUND_SECS + RETRY_STEP);
@@ -1546,7 +1570,7 @@ async fn other_relay_answer_ends_a_stale_run() -> TestResult {
         StaleStep::Retry
     ));
 
-    clock.set(T0 + 200);
+    clock.advance(200);
     let outcome = registrar.reconcile(&sup).await?;
     assert!(
         matches!(
@@ -1558,8 +1582,8 @@ async fn other_relay_answer_ends_a_stale_run() -> TestResult {
     assert_eq!(drain(&mut rx).len(), 1);
     assert!(registrar.stale_runs.is_empty(), "the 5003 ended the run");
 
-    let late = T0 + STALE_RUN_BOUND_SECS + RETRY_STEP;
-    clock.set(late);
+    clock.advance(STALE_RUN_BOUND_SECS + RETRY_STEP - 200);
+    let late = clock.monotonic_millis();
     assert!(
         matches!(
             stale_step(registrar.reconcile(&sup).await?, false, &mut rx)?,
@@ -1571,7 +1595,7 @@ async fn other_relay_answer_ends_a_stale_run() -> TestResult {
         registrar
             .stale_runs
             .get(&relay_a_key())
-            .map(|run| run.first_secs),
+            .map(|run| run.first_millis),
         Some(late)
     );
     Ok(())
@@ -1628,7 +1652,8 @@ async fn register_command_restarts_an_open_stale_run() -> TestResult {
         StaleStep::Retry
     ));
 
-    clock.set(T0 + 200);
+    clock.advance(200);
+    let restart = clock.monotonic_millis();
     let outcome = run_command(&mut registrar, &sup, |reply| RegistrarCommand::Register {
         reply,
     })
@@ -1638,7 +1663,7 @@ async fn register_command_restarts_an_open_stale_run() -> TestResult {
         StaleStep::Retry
     ));
 
-    clock.set(T0 + STALE_RUN_BOUND_SECS + RETRY_STEP);
+    clock.advance(STALE_RUN_BOUND_SECS + RETRY_STEP - 200);
     assert!(
         matches!(
             stale_step(registrar.reconcile(&sup).await?, false, &mut rx)?,
@@ -1650,8 +1675,8 @@ async fn register_command_restarts_an_open_stale_run() -> TestResult {
         registrar
             .stale_runs
             .get(&relay_a_key())
-            .map(|run| run.first_secs),
-        Some(T0 + 200)
+            .map(|run| run.first_millis),
+        Some(restart)
     );
     Ok(())
 }
@@ -1687,7 +1712,7 @@ async fn deregistration_skew_refusal_survives_refresh_until_deregister_all() -> 
 
     clock.advance(RETRY_STEP);
     let outcome = registrar
-        .refresh_token(PushToken::new(NEW_TOKEN.to_vec()))
+        .refresh_token(&sup, PushToken::new(NEW_TOKEN.to_vec()))
         .await?;
     assert!(outcome.deregistered.is_empty(), "{outcome:?}");
     assert!(outcome.registered.is_empty(), "{outcome:?}");
@@ -1719,6 +1744,100 @@ async fn deregistration_skew_refusal_survives_refresh_until_deregister_all() -> 
     );
     let sent = drain(&mut rx);
     assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].relay_url, RELAY_A);
+    assert_eq!(verified_deregistration(&sent[0], &public_key)?.token, TOKEN);
+    Ok(())
+}
+
+/// Relay A answers `4062` from T0. The device's wall clock then steps 700 s
+/// forward, as a first NTP sync after a cold boot does, and 30 s later relay
+/// A answers `4062` again. The step is not elapsed time, so the run goes on
+/// from its first answer and the `4062` is retried; the run still ends once
+/// it spans more than the bound of elapsed time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wall_clock_step_does_not_count_toward_a_stale_run() -> TestResult {
+    let (sup, clock, mut registrar, mut rx) =
+        clocked_registrar(Box::new(|_, _| stale_answer())).await?;
+    let first = clock.monotonic_millis();
+    assert!(matches!(
+        stale_step(registrar.reconcile(&sup).await?, false, &mut rx)?,
+        StaleStep::Retry
+    ));
+
+    clock.set(T0 + 700);
+    clock.advance(RETRY_STEP);
+    assert!(
+        matches!(
+            stale_step(registrar.reconcile(&sup).await?, false, &mut rx)?,
+            StaleStep::Retry
+        ),
+        "a 4062 after a 700 s wall-clock step is retried"
+    );
+    assert_eq!(
+        registrar
+            .stale_runs
+            .get(&relay_a_key())
+            .map(|run| run.first_millis),
+        Some(first),
+        "the step neither ends nor restarts the run"
+    );
+
+    let mut retries = 2;
+    loop {
+        clock.advance(RETRY_STEP);
+        match stale_step(registrar.reconcile(&sup).await?, false, &mut rx)? {
+            StaleStep::Retry => retries += 1,
+            StaleStep::Bound(span_secs) => {
+                assert_eq!(span_secs, (clock.monotonic_millis() - first) / 1000);
+                assert!(span_secs > STALE_RUN_BOUND_SECS);
+                break;
+            }
+        }
+        assert!(retries < MAX_ATTEMPTS, "the run never ended");
+    }
+    assert_eq!(retries, STALE_RUN_BOUND_SECS / RETRY_STEP + 1);
+    Ok(())
+}
+
+/// Relay A refuses the first token's deregistration past the skew bound,
+/// then the device joins a context on relay A again, which clears that
+/// refusal. A token refresh that runs before any reconcile prunes the
+/// refusals against the current routes first, so relay A is sent the first
+/// token's deregistration.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refresh_prunes_a_refusal_the_routes_cleared() -> TestResult {
+    let answer: Answer = Box::new(|_, attempt| if attempt == 0 { Ok(()) } else { stale_answer() });
+    let (sup, clock, mut registrar, mut rx) = clocked_registrar(answer).await?;
+    let public_key = *registrar.signing_key.public_key();
+    let first = registrar.reconcile(&sup).await?;
+    assert!(
+        first.registered.get(RELAY_A).is_some_and(Result::is_ok),
+        "{first:?}"
+    );
+    assert_eq!(drain(&mut rx).len(), 1);
+    assert!(sup.despawn_actor(&hex::encode(CTX_A)).await);
+    clock.advance(RETRY_STEP);
+    reconcile_until_bound(&mut registrar, &sup, &clock, &mut rx, true).await?;
+    assert!(registrar.refused.contains_key(&relay_a_key()));
+
+    create_context(&sup, CTX_B, PSEUDONYM_B, &[RELAY_A]).await?;
+    clock.advance(RETRY_STEP);
+    let outcome = run_command(&mut registrar, &sup, |reply| {
+        RegistrarCommand::RefreshToken {
+            token: PushToken::new(NEW_TOKEN.to_vec()),
+            reply,
+        }
+    })
+    .await?;
+    assert!(
+        matches!(
+            outcome.deregistered.get(RELAY_A),
+            Some(Err(PushError::Stale { .. }))
+        ),
+        "the refresh sends relay A the first token's deregistration: {outcome:?}"
+    );
+    let sent = drain(&mut rx);
+    assert_eq!(sent.len(), 1, "{:?}", relay_urls(&sent));
     assert_eq!(sent[0].relay_url, RELAY_A);
     assert_eq!(verified_deregistration(&sent[0], &public_key)?.token, TOKEN);
     Ok(())
@@ -1891,14 +2010,26 @@ async fn lost_deregistration_ok_then_same_set_returns_reregisters() -> TestResul
 async fn restarted_registrar_deregisters_a_recorded_relay() -> TestResult {
     let storage = ledger();
     let (sink, mut rx) = publisher(system_clock(), accept_all());
-    let mut first = registrar_on(Arc::clone(&sink), system_clock(), Arc::clone(&storage)).await?;
+    let mut first = registrar_on(
+        Arc::clone(&sink),
+        system_clock(),
+        system_monotonic(),
+        Arc::clone(&storage),
+    )
+    .await?;
     first.register(&[target(RELAY_A, &[[1; 32]])?]).await?;
     expect_publishes(&mut rx, 1).await?;
     drop(first);
 
     let sup = supervisor();
     create_context(&sup, CTX_B, PSEUDONYM_B, &[RELAY_B]).await?;
-    let mut second = registrar_on(sink, system_clock(), Arc::clone(&storage)).await?;
+    let mut second = registrar_on(
+        sink,
+        system_clock(),
+        system_monotonic(),
+        Arc::clone(&storage),
+    )
+    .await?;
     let public_key = *second.signing_key.public_key();
     let outcome = second.reconcile(&sup).await?;
     assert!(
@@ -1933,7 +2064,7 @@ async fn ledger_write_failure_publishes_nothing() -> TestResult {
     faulty.fail_store_prefix("push_relay/");
     let storage = Arc::new(ProtocolRepository::new_for_testing(faulty));
     let (sink, mut rx) = publisher(system_clock(), accept_all());
-    let mut registrar = registrar_on(sink, system_clock(), storage).await?;
+    let mut registrar = registrar_on(sink, system_clock(), system_monotonic(), storage).await?;
     let results = registrar.register(&[target(RELAY_A, &[[1; 32]])?]).await?;
     let outcome = results.get(RELAY_A).ok_or("no result")?;
     assert!(
@@ -1957,7 +2088,13 @@ async fn deregister_all_stops_registering_until_register() -> TestResult {
     create_context(&sup, CTX_B, PSEUDONYM_B, &[RELAY_B]).await?;
     let storage = ledger();
     let (sink, mut rx) = publisher(system_clock(), accept_all());
-    let registrar = registrar_on(sink, system_clock(), Arc::clone(&storage)).await?;
+    let registrar = registrar_on(
+        sink,
+        system_clock(),
+        system_monotonic(),
+        Arc::clone(&storage),
+    )
+    .await?;
     let public_key = *registrar.signing_key.public_key();
     let shutdown = CancellationToken::new();
     let task = registrar.spawn_trigger(Arc::clone(&sup), shutdown.clone());
@@ -2014,6 +2151,7 @@ async fn webpush_platform_is_refused() -> TestResult {
         signing_key: signing_key().await?,
         publisher: sink,
         clock: system_clock(),
+        monotonic_clock: system_monotonic(),
         platform: PushPlatform::WebPush,
         token: PushToken::new(TOKEN.to_vec()),
         storage: ledger(),

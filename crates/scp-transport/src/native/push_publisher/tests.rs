@@ -191,6 +191,7 @@ mod relays {
             signing_key,
             publisher,
             clock: Arc::new(scp_clock::SystemClock),
+            monotonic_clock: Arc::new(scp_clock::SystemMonotonicClock::new()),
             platform: PushPlatform::Apns,
             token: PushToken::new(TOKEN.to_vec()),
             storage: Arc::new(ProtocolRepository::new_for_testing(InMemoryStorage::new())),
