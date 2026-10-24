@@ -38,9 +38,9 @@
 //!   the original it drops after storing `value.to_vec()`, the buffers each
 //!   list append and removal outgrows when it re-encodes the stored list, and
 //!   the buffers every `serde_json` read decodes through;
-//! - hpke-rs 0.7.0's encapsulation intermediates (the input key material
-//!   `hpke.random()` returns, from which the ephemeral private key derives,
-//!   the Diffie-Hellman output, the `eae_prk`, and the KEM shared secret `zz`),
+//! - hpke-rs 0.8.0's encapsulation intermediates (the ephemeral private key
+//!   derived from the input key material `hpke.random()` returns, which
+//!   hpke-rs itself wipes; the Diffie-Hellman output, the `eae_prk`, and the KEM shared secret `zz`),
 //!   the `labeled_ikm` and `dkp_prk` that `derive_key_pair` builds for every
 //!   leaf and path-node encryption key openmls derives through
 //!   `derive_hpke_keypair`, and the Diffie-Hellman output, `eae_prk`, and `zz`

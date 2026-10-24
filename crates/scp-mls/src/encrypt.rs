@@ -92,7 +92,10 @@ use crate::lifetime::validate_received_key_package_lifetime_range;
 /// caller-supplied time, pass one here, on this call, that covers both of
 /// openmls's reads, `KeyPackageIn::validate` and `validate_leaf_node`. A
 /// policy that covers only `validate_leaf_node` leaves openmls's clock in the
-/// receive decision through `KeyPackageIn::validate`.
+/// receive decision through `KeyPackageIn::validate`. The openmls commit
+/// pinned in the root `Cargo.toml` adds
+/// `MlsGroup::process_message_with_lifetime_policy` and
+/// `LeafNodeLifetimePolicy::VerifyAt`, which this call does not use yet.
 fn process_inbound(
     g: &mut MlsGroup,
     provider: &crate::InMemoryMlsProvider,

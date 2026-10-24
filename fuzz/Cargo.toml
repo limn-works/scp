@@ -238,3 +238,19 @@ name = "fuzz_mls_decrypt"
 path = "fuzz_targets/fuzz_mls_decrypt.rs"
 test = false
 doc = false
+
+# ── openmls pin ─────────────────────────────────────────────────────────────
+# RUSTSEC-2026-0387: crypto-bigint below 0.7.6 branches on secret data, and the
+# released openmls 0.9.0 reaches it through p256 0.13 (RustCrypto 0.13). openmls
+# main moved to RustCrypto 0.14 (openmls #2249), which lets the graph take
+# crypto-bigint 0.7.6, but no release carries it yet. This pins every openmls crate
+# to one reviewed commit by its full hash; `deny.toml` [sources] allows exactly this
+# repository.
+# The identical block sits in the repository root `Cargo.toml`, which explains it.
+[patch.crates-io]
+openmls = { git = "https://github.com/openmls/openmls", rev = "be248d4b1306d87a641ce24ed0ffcab2b27967f6" }
+openmls_traits = { git = "https://github.com/openmls/openmls", rev = "be248d4b1306d87a641ce24ed0ffcab2b27967f6" }
+openmls_basic_credential = { git = "https://github.com/openmls/openmls", rev = "be248d4b1306d87a641ce24ed0ffcab2b27967f6" }
+openmls_rust_crypto = { git = "https://github.com/openmls/openmls", rev = "be248d4b1306d87a641ce24ed0ffcab2b27967f6" }
+openmls_memory_storage = { git = "https://github.com/openmls/openmls", rev = "be248d4b1306d87a641ce24ed0ffcab2b27967f6" }
+openmls_serialization_helpers = { git = "https://github.com/openmls/openmls", rev = "be248d4b1306d87a641ce24ed0ffcab2b27967f6" }

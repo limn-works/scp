@@ -63,7 +63,9 @@ use scp_protocol::context::{SCP_CONTEXT_EXTENSION_TYPE_ID, ScpContextExtension};
 
 use crate::error::MlsError;
 use crate::group::ScpMlsGroup;
-use crate::wrapping_extension::SCP_WRAPPING_KEY_EXTENSION_TYPE;
+use crate::wrapping_extension::{
+    SCP_LEAF_CIPHERSUITES, SCP_LEAF_CREDENTIALS, SCP_WRAPPING_KEY_EXTENSION_TYPE,
+};
 
 /// Builds an `Extension::Unknown` for the `scp_context_params` `group_context`
 /// extension from an [`ScpContextExtension`].
@@ -151,13 +153,13 @@ pub fn extract_context_params(
 pub fn scp_capabilities_with_context_params() -> Capabilities {
     Capabilities::new(
         None, // default versions
-        None, // default ciphersuites
+        Some(&SCP_LEAF_CIPHERSUITES),
         Some(&[
             ExtensionType::Unknown(SCP_WRAPPING_KEY_EXTENSION_TYPE),
             ExtensionType::Unknown(SCP_CONTEXT_EXTENSION_TYPE_ID),
         ]),
-        None, // default proposals
-        None, // default credentials
+        None, // no proposal types beyond the RFC 9420 defaults
+        Some(&SCP_LEAF_CREDENTIALS),
     )
 }
 

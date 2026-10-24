@@ -45,17 +45,17 @@
 //! (`ScpMlsGroup::serialize_state`); every decrypt call restores a FRESH gen-0
 //! receiver from that snapshot (`ScpMlsGroup::deserialize_state`) before running.
 //!
-//! Fresh-receiver-per-call is load-bearing, not incidental. openmls 0.9.0 advances
-//! Bob's secret-tree receive ratchet (consuming generation 0) DURING
-//! `process_message`, BEFORE the content-AEAD open, on `&mut self` state, and does
-//! NOT roll it back on AEAD failure (openmls 0.9.0 `group/mls_group/processing.rs`,
-//! `framing/validation.rs`, `framing/private_message_in.rs`,
-//! `tree/sender_ratchet.rs`). So a *shared* receiver would reach the content-AEAD
-//! open this target stresses at most ONCE per
-//! process: after the first genuinely-tampered ciphertext consumes gen-0, every
-//! later one is rejected at `secret_for_decryption` with a secret-reuse error
-//! BEFORE content-AEAD. Restoring a fresh gen-0 receiver per call makes the
-//! content-AEAD open reachable on EVERY input. (Snapshot-restore is cheap — an
+//! Fresh-receiver-per-call keeps every input on the same path. The released
+//! openmls 0.9.0 advanced Bob's secret-tree receive ratchet (consuming generation
+//! 0) DURING `process_message`, BEFORE the content-AEAD open, and did NOT roll it
+//! back on AEAD failure (`group/mls_group/processing.rs`, `framing/validation.rs`,
+//! `framing/private_message_in.rs`, `tree/sender_ratchet.rs`), so a *shared*
+//! receiver reached the content-AEAD open at most ONCE per process. The openmls
+//! commit pinned in `fuzz/Cargo.toml` (GHSA-p276-g3f3-wwgh) marks a generation
+//! used only once a PrivateMessage is processed successfully, so a failed input
+//! no longer consumes it; restoring a fresh gen-0 receiver per call still makes
+//! the content-AEAD open reachable on EVERY input whichever openmls this
+//! target builds against. (Snapshot-restore is cheap — an
 //! `rmp_serde` load of a small 2-member group dump — so this is viable for a real
 //! campaign; a per-input full group REBUILD would not be.)
 //!

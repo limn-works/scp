@@ -134,12 +134,17 @@ deny = [
     ], reason = "P-256 arithmetic stays in scp-crypto" },
     { crate = "elliptic-curve", wrappers = [
         "ecdsa",
+        # hpke-rs-rust-crypto 0.8 depends on elliptic-curve directly, for the
+        # curve traits (`ToSec1Point`, `Generate`) of its DHKEM backends.
+        "hpke-rs-rust-crypto",
         "k256",
         "p256",
         "p384",
         "primeorder",
     ], reason = "P-256 arithmetic stays in scp-crypto" },
     { crate = "primeorder", wrappers = [
+        # k256 0.14 depends on primeorder (0.13 did not).
+        "k256",
         "p256",
         "p384",
     ], reason = "P-256 arithmetic stays in scp-crypto" },
@@ -152,4 +157,9 @@ deny = [
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = []
+# openmls is pinned by full commit hash in [patch.crates-io] of every Cargo root
+# (see the root Cargo.toml) to fix RUSTSEC-2026-0387: the released openmls 0.9.0
+# reaches crypto-bigint < 0.7.6 through RustCrypto 0.13, and openmls #2249 on main
+# moves to RustCrypto 0.14. Pinned rev: be248d4b1306d87a641ce24ed0ffcab2b27967f6.
+# Remove this entry with the patch blocks once an openmls release carries #2249.
+allow-git = ["https://github.com/openmls/openmls"]

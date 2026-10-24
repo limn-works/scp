@@ -61,6 +61,7 @@ use sha2::{Digest, Sha256};
 
 use crate::credential::ScpCredential;
 use crate::error::MlsError;
+use crate::wrapping_extension::{SCP_LEAF_CIPHERSUITES, SCP_LEAF_CREDENTIALS};
 
 /// Extension type ID for `scp_keypackage_attestation` in the RFC 9420 §17.3
 /// private-use range (§9.18.7).
@@ -716,14 +717,14 @@ pub fn verify_attestation(
 pub fn scp_capabilities_with_context_params_and_attestation() -> Capabilities {
     Capabilities::new(
         None, // default versions
-        None, // default ciphersuites
+        Some(&SCP_LEAF_CIPHERSUITES),
         Some(&[
             ExtensionType::Unknown(crate::wrapping_extension::SCP_WRAPPING_KEY_EXTENSION_TYPE),
             ExtensionType::Unknown(scp_protocol::context::SCP_CONTEXT_EXTENSION_TYPE_ID),
             ExtensionType::Unknown(SCP_KEYPACKAGE_ATTESTATION_EXTENSION_TYPE),
         ]),
-        None, // default proposals
-        None, // default credentials
+        None, // no proposal types beyond the RFC 9420 defaults
+        Some(&SCP_LEAF_CREDENTIALS),
     )
 }
 

@@ -33,7 +33,8 @@
 use ::p256::ecdsa::signature::hazmat::{PrehashSigner, PrehashVerifier};
 use ::p256::ecdsa::{Signature, SigningKey, VerifyingKey};
 use ::p256::elliptic_curve::bigint::{NonZero, U256, U384};
-use ::p256::elliptic_curve::sec1::ToEncodedPoint;
+use ::p256::elliptic_curve::scalar::IsHigh;
+use ::p256::elliptic_curve::sec1::ToSec1Point;
 use ::p256::{NonZeroScalar, PublicKey};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -53,11 +54,10 @@ pub const SIGNATURE_LEN: usize = 64;
 ///
 /// `n = FFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551`
 /// (RFC 6979 A.2.5 prints the same `q`).
-const N_MINUS_ONE: NonZero<U384> = NonZero::<U384>::const_new(U384::from_be_hex(
+const N_MINUS_ONE: NonZero<U384> = NonZero::<U384>::from_be_hex(
     "00000000000000000000000000000000\
      FFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632550",
-))
-.0;
+);
 
 /// The 27 ASCII bytes whose SHA-256 is the HKDF-Extract salt of the
 /// participation signer derivation (§7.3.2.1, registered in §9.18.3 of the
@@ -213,7 +213,7 @@ impl P256PublicKey {
     /// encoding.
     #[must_use]
     pub fn to_compressed(&self) -> [u8; COMPRESSED_POINT_LEN] {
-        let encoded = self.0.to_encoded_point(true);
+        let encoded = self.0.to_sec1_point(true);
         let mut out = [0u8; COMPRESSED_POINT_LEN];
         out.copy_from_slice(encoded.as_bytes());
         out
@@ -223,7 +223,7 @@ impl P256PublicKey {
     /// (RFC 9420 §5.1.2) key encoding.
     #[must_use]
     pub fn to_uncompressed(&self) -> [u8; UNCOMPRESSED_POINT_LEN] {
-        let encoded = self.0.to_encoded_point(false);
+        let encoded = self.0.to_sec1_point(false);
         let mut out = [0u8; UNCOMPRESSED_POINT_LEN];
         out.copy_from_slice(encoded.as_bytes());
         out
@@ -269,13 +269,19 @@ impl P256SecretKey {
 
     /// Draws a fresh key from `rng`, uniform over `[1, n − 1]`.
     ///
-    /// Infallible: `NonZeroScalar::random` rejection-samples until the draw is
-    /// in range. Callers pass `rand::rngs::OsRng`, or the re-exported
-    /// `p256::elliptic_curve::rand_core::OsRng` when they have no `rand`
-    /// dependency.
+    /// Infallible: it draws 32 bytes at a time and keeps the first draw that
+    /// [`from_scalar_bytes`](Self::from_scalar_bytes) accepts (non-zero and
+    /// below `n`). A draw is rejected with probability about `2^-32`. Each
+    /// rejected draw is wiped. Callers pass `rand::rngs::OsRng`.
     #[must_use]
-    pub fn random(rng: &mut impl ::p256::elliptic_curve::rand_core::CryptoRngCore) -> Self {
-        Self::from_nonzero_scalar(NonZeroScalar::random(rng))
+    pub fn random(rng: &mut impl rand_core::CryptoRngCore) -> Self {
+        let mut draw = Zeroizing::new([0u8; 32]);
+        loop {
+            rng.fill_bytes(draw.as_mut());
+            if let Ok(key) = Self::from_scalar_bytes(&draw) {
+                return key;
+            }
+        }
     }
 
     /// Derives a key from a 32-byte seed by the FIPS 186-5 A.2.1
@@ -421,8 +427,7 @@ pub fn sign_prehash_rfc6979(
         .0
         .sign_prehash(digest)
         .map_err(|_| P256Error::SigningFailed)?;
-    let signature = signature.normalize_s().unwrap_or(signature);
-    Ok(signature_to_raw(&signature))
+    Ok(signature_to_raw(&signature.normalize_s()))
 }
 
 /// Signs a 32-byte digest with RFC 6979 deterministic nonces, as
@@ -461,7 +466,7 @@ pub fn verify_prehash_strict(
     signature: &[u8],
 ) -> Result<(), P256Error> {
     let signature = parse_raw_signature(signature)?;
-    if signature.normalize_s().is_some() {
+    if bool::from(signature.s().is_high()) {
         return Err(P256Error::HighS);
     }
     key.verifying_key()
@@ -501,7 +506,7 @@ pub fn verify_prehash_lenient(
 /// below `n`.
 pub fn normalize_low_s(signature: &[u8; SIGNATURE_LEN]) -> Result<[u8; SIGNATURE_LEN], P256Error> {
     let parsed = parse_raw_signature(signature)?;
-    Ok(signature_to_raw(&parsed.normalize_s().unwrap_or(parsed)))
+    Ok(signature_to_raw(&parsed.normalize_s()))
 }
 
 /// Converts a strict-DER `ECDSA-Sig-Value` (RFC 3279 §2.2.3) into the raw
@@ -924,12 +929,12 @@ mod tests {
         use p256::elliptic_curve::PrimeField;
         use p256::elliptic_curve::ops::Reduce;
         use p256::elliptic_curve::point::AffineCoordinates;
-        use p256::{AffinePoint, FieldBytes, Scalar, U256};
+        use p256::{AffinePoint, FieldBytes, Scalar};
 
         let s_bytes: [u8; 32] = h(s_hex);
         let s = Option::<Scalar>::from(Scalar::from_repr(FieldBytes::from(s_bytes))).unwrap();
-        let z = <Scalar as Reduce<U256>>::reduce_bytes(&FieldBytes::from(*digest));
-        let r = <Scalar as Reduce<U256>>::reduce_bytes(&AffinePoint::GENERATOR.x());
+        let z = <Scalar as Reduce<FieldBytes>>::reduce(&FieldBytes::from(*digest));
+        let r = <Scalar as Reduce<FieldBytes>>::reduce(&AffinePoint::GENERATOR.x());
         let d = (s - z) * Option::<Scalar>::from(r.invert()).unwrap();
         let key = P256SecretKey::from_scalar_bytes(&d.to_repr().into()).unwrap();
         let mut sig = [0u8; 64];

@@ -132,10 +132,12 @@ sha2 = "0.10"
 hkdf = "0.12"
 # P-256 (§9.5): ECDSA with RFC 6979 nonces, ECDH, and SEC1 point validation.
 # `default-features = false` drops `pem`/`std`, so pkcs8 and PEM stay out;
-# `alloc` is the only std-adjacent feature. The crate is not no_std-clean on
-# wasm32: ecdsa pulls getrandom 0.2, so every wasm32 consumer (scp-crypto
-# included) selects getrandom's `js` backend.
-p256 = { version = "0.13.2", default-features = false, features = ["ecdsa", "ecdh", "arithmetic", "alloc"] }
+# `alloc` is the only std-adjacent feature. 0.14 is the RustCrypto generation
+# whose crypto-bigint (0.7.6 or later) clears RUSTSEC-2026-0387, and the one the
+# pinned openmls uses. Its own `getrandom` feature stays off: scp-crypto draws
+# from a caller-supplied rand_core 0.6 source, and the getrandom 0.2 that
+# ed25519-dalek 2 pulls still needs the `js` backend on wasm32.
+p256 = { version = "0.14", default-features = false, features = ["ecdsa", "ecdh", "arithmetic", "alloc"] }
 uuid = { version = "1", features = ["v4", "v7"] }
 # No `libcrux-provider`. That feature does one thing — add the optional dependency
 # `openmls_libcrux_crypto` (openmls 0.9.0 Cargo.toml: `libcrux-provider =
@@ -341,9 +343,9 @@ debug = "line-tables-only"
 # ── Release profile ─────────────────────────────────────────────────────────
 # `debug-assertions = false` is the cargo release default; this line changes no
 # behavior and keeps the setting explicit. The shipped browser wasm is a
-# `--release` build (ADR-057 §Prereq-4). openmls 0.9.0 returns a typed error on a
-# tampered ciphertext in every build profile, so no decrypt-path guarantee
-# depends on this line.
+# `--release` build (ADR-057 §Prereq-4). openmls (the commit pinned in
+# [patch.crates-io] below) returns a typed error on a tampered ciphertext in
+# every build profile, so no decrypt-path guarantee depends on this line.
 [profile.release]
 debug-assertions = false
 
@@ -386,3 +388,23 @@ opt-level = 0
 
 [profile.ci-bridge.package.scp-ffi-uniffi]
 opt-level = 0
+
+# ── openmls pin ─────────────────────────────────────────────────────────────
+# RUSTSEC-2026-0387: crypto-bigint below 0.7.6 branches on secret data, and the
+# released openmls 0.9.0 reaches it through p256 0.13 (RustCrypto 0.13). openmls
+# main moved to RustCrypto 0.14 (openmls #2249), which lets the graph take
+# crypto-bigint 0.7.6, but no release carries it yet. This pins every openmls crate
+# to one reviewed commit by its full hash; `deny.toml` [sources] allows exactly this
+# repository.
+#
+# The identical block sits in every Cargo root that resolves openmls: this file,
+# `fuzz/Cargo.toml`, `scaffolds/relay`, `scaffolds/rust-client`,
+# `templates/cross-context-bridge` and `templates/personal-relay`. Each has its own
+# `[workspace]`, so a patch here does not reach them.
+[patch.crates-io]
+openmls = { git = "https://github.com/openmls/openmls", rev = "be248d4b1306d87a641ce24ed0ffcab2b27967f6" }
+openmls_traits = { git = "https://github.com/openmls/openmls", rev = "be248d4b1306d87a641ce24ed0ffcab2b27967f6" }
+openmls_basic_credential = { git = "https://github.com/openmls/openmls", rev = "be248d4b1306d87a641ce24ed0ffcab2b27967f6" }
+openmls_rust_crypto = { git = "https://github.com/openmls/openmls", rev = "be248d4b1306d87a641ce24ed0ffcab2b27967f6" }
+openmls_memory_storage = { git = "https://github.com/openmls/openmls", rev = "be248d4b1306d87a641ce24ed0ffcab2b27967f6" }
+openmls_serialization_helpers = { git = "https://github.com/openmls/openmls", rev = "be248d4b1306d87a641ce24ed0ffcab2b27967f6" }

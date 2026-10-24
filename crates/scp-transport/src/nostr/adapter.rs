@@ -136,7 +136,7 @@ impl NostrAdapter {
     /// Returns [`TransportError::ProtocolError`] if the signing key bytes
     /// are not a valid secp256k1 secret key.
     pub fn new(config: NostrConfig) -> Result<Self, TransportError> {
-        let signing_key = SigningKey::from_bytes(&config.signing_key).map_err(|e| {
+        let signing_key = SigningKey::from_bytes(&config.signing_key.into()).map_err(|e| {
             TransportError::ProtocolError(format!("invalid Nostr signing key: {e}"))
         })?;
         let verifying_key: &VerifyingKey = signing_key.verifying_key();
