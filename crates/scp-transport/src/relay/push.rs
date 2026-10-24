@@ -192,7 +192,7 @@ impl PushSender {
                 }
             },
             #[cfg(feature = "testing")]
-            Self::Recording(sender) => SendAttempt::Sent(sender.record(token).await),
+            Self::Recording(sender) => sender.attempt(token).await,
         }
     }
 
@@ -204,7 +204,22 @@ impl PushSender {
     pub(crate) async fn lookup_permit_freed(&self) -> usize {
         match self {
             Self::WebPush(sender) => sender.lookup_permit_freed().await,
-            _ => std::future::pending().await,
+            #[cfg(feature = "testing")]
+            Self::Recording(sender) => sender.lookup_permit_freed().await,
+            Self::Apns(_) | Self::Fcm(_) => std::future::pending().await,
+        }
+    }
+
+    /// The permits of the `WebPush` sender's endpoint lookup pool a send's
+    /// lookup can take now; `None` for a sender with no lookup pool, whose
+    /// sends never defer on one.
+    #[cfg(feature = "push-store")]
+    pub(crate) fn free_lookup_permits(&self) -> Option<usize> {
+        match self {
+            Self::WebPush(sender) => Some(sender.free_lookup_permits()),
+            #[cfg(feature = "testing")]
+            Self::Recording(sender) => sender.free_lookup_permits(),
+            Self::Apns(_) | Self::Fcm(_) => None,
         }
     }
 
@@ -250,6 +265,29 @@ pub struct RecordingSender {
     platform: PushPlatform,
     state: std::sync::Arc<tokio::sync::Mutex<RecordingState>>,
     gate: Option<std::sync::Arc<tokio::sync::Semaphore>>,
+    lookup: Option<RecordingLookupPool>,
+}
+
+/// The endpoint lookup pool of a [`RecordingSender`].
+///
+/// [`RecordingSender::with_lookup_pool`] makes it. A send defers with
+/// [`SendDeferral::LookupPoolFull`] while no permit is free, and otherwise
+/// takes none, as a `WebPush` send over a pooled connection resolves nothing.
+#[cfg(feature = "testing")]
+#[derive(Clone, Debug)]
+pub struct RecordingLookupPool {
+    free: std::sync::Arc<tokio::sync::Semaphore>,
+    freed: std::sync::Arc<tokio::sync::Notify>,
+}
+
+#[cfg(feature = "testing")]
+impl RecordingLookupPool {
+    /// Frees `permits` more permits and signals one freed-permit wait, as
+    /// one lookup returning its permit does.
+    pub fn free(&self, permits: usize) {
+        self.free.add_permits(permits);
+        self.freed.notify_one();
+    }
 }
 
 /// Admits the sends of a gated [`RecordingSender`], one permit per send.
@@ -286,7 +324,24 @@ impl RecordingSender {
                 sent: Vec::new(),
             })),
             gate: None,
+            lookup: None,
         }
+    }
+
+    /// As [`Self::new`], with an endpoint lookup pool that starts full.
+    pub fn with_lookup_pool(
+        platform: PushPlatform,
+        outcomes: impl IntoIterator<Item = PushSendOutcome>,
+    ) -> (Self, RecordingLookupPool) {
+        let pool = RecordingLookupPool {
+            free: std::sync::Arc::new(tokio::sync::Semaphore::new(0)),
+            freed: std::sync::Arc::new(tokio::sync::Notify::new()),
+        };
+        let sender = Self {
+            lookup: Some(pool.clone()),
+            ..Self::new(platform, outcomes)
+        };
+        (sender, pool)
     }
 
     /// As [`Self::new`], with every send held until the returned gate admits
@@ -312,6 +367,40 @@ impl RecordingSender {
             .iter()
             .map(|t| t.to_vec())
             .collect()
+    }
+
+    /// Defers while the lookup pool, if any, has no free permit, and
+    /// otherwise records `token` and returns the next scripted outcome.
+    async fn attempt(&self, token: &[u8]) -> SendAttempt {
+        if self
+            .lookup
+            .as_ref()
+            .is_some_and(|pool| pool.free.available_permits() == 0)
+        {
+            return SendAttempt::Deferred(SendDeferral::LookupPoolFull);
+        }
+        SendAttempt::Sent(self.record(token).await)
+    }
+
+    /// As [`PushSender::lookup_permit_freed`]; never completes without a
+    /// lookup pool.
+    #[cfg(feature = "push-store")]
+    async fn lookup_permit_freed(&self) -> usize {
+        match &self.lookup {
+            Some(pool) => {
+                pool.freed.notified().await;
+                pool.free.available_permits()
+            }
+            None => std::future::pending().await,
+        }
+    }
+
+    /// As [`PushSender::free_lookup_permits`].
+    #[cfg(feature = "push-store")]
+    fn free_lookup_permits(&self) -> Option<usize> {
+        self.lookup
+            .as_ref()
+            .map(|pool| pool.free.available_permits())
     }
 
     async fn record(&self, token: &[u8]) -> PushSendOutcome {

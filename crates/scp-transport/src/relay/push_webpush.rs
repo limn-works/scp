@@ -585,6 +585,13 @@ impl WebPushSender {
         self.resolver.lookup_permit_freed().await
     }
 
+    /// The permits of this sender's endpoint lookup pool a send's lookup can
+    /// take now.
+    #[cfg(feature = "push-store")]
+    pub(crate) fn free_lookup_permits(&self) -> usize {
+        self.resolver.free_lookup_permits()
+    }
+
     /// Takes every endpoint lookup permit until the returned permits drop.
     #[cfg(test)]
     pub(crate) fn exhaust_lookup_permits(

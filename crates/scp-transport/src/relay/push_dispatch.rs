@@ -661,6 +661,10 @@ mod enabled {
         /// The endpoint origin; `None` when the token does not decode, whose
         /// send sends nothing.
         origin: Option<String>,
+        /// Whether a freed lookup permit restarted this send from the lookup
+        /// wait, which the drain owes a restart of another held send when
+        /// this one ends, since the send may end without taking the permit.
+        granted: bool,
     }
 
     impl Held {
@@ -1063,11 +1067,15 @@ mod enabled {
             !self.lookup.is_empty()
         }
 
-        /// Takes in again the `permits` oldest jobs that wait on a lookup
-        /// permit, one per permit free in the pool, so a freed permit restarts
-        /// one held send rather than every one. A restarted job whose send
-        /// finds the pool full again comes back here without any request
-        /// made.
+        /// Starts the oldest jobs that wait on a lookup permit, one per
+        /// permit free in the pool, so a freed permit restarts one held send
+        /// rather than every one. A job a cap or a back-off holds leaves the
+        /// lookup wait for that wait and takes none of the permits, so the
+        /// next job is tried in its place. Each started job is marked
+        /// `granted`; when its send ends, taking a permit or not, the drain
+        /// calls this again with the permits free then (see
+        /// [`Drain::run_concurrent`]). A started job whose send finds the
+        /// pool full again comes back here without any request made.
         fn lookup_freed(
             &mut self,
             permits: usize,
@@ -1075,11 +1083,19 @@ mod enabled {
             retry_at: RetryAt<'_>,
             ready: &mut Vec<Held>,
         ) {
-            for _ in 0..permits {
+            let mut started = 0;
+            while started < permits {
                 let Some(held) = self.lookup.pop_front() else {
                     return;
                 };
+                let before = ready.len();
                 self.arrive(held, in_flight, retry_at, ready);
+                if ready.len() > before
+                    && let Some(granted) = ready.last_mut()
+                {
+                    granted.granted = true;
+                    started += 1;
+                }
             }
         }
     }
@@ -1213,6 +1229,8 @@ mod enabled {
                     }
                 };
                 let mut ready = Vec::new();
+                // Whether a send a freed lookup permit restarted has ended.
+                let mut granted = false;
                 match step {
                     // The lookup holds the queue's sender until it stops, so
                     // `None` means the service is gone.
@@ -1222,11 +1240,13 @@ mod enabled {
                             key: token_key(job.platform, &job.token),
                             origin: sender.origin_of(&job.token),
                             job,
+                            granted: false,
                         };
                         waiting.arrive(held, &mut in_flight, &retry_at, &mut ready);
                     }
-                    Step::Sent(done, SendAttempt::Sent(outcome)) => {
+                    Step::Sent(mut done, SendAttempt::Sent(outcome)) => {
                         in_flight.remove(&done);
+                        granted = std::mem::take(&mut done.granted);
                         if !self
                             .apply(done.job.platform, done.key, &done.job.token, outcome)
                             .await
@@ -1236,8 +1256,9 @@ mod enabled {
                         waiting.freed(done.gates(), &mut in_flight, &retry_at, &mut ready);
                         drop(done);
                     }
-                    Step::Sent(done, SendAttempt::Deferred(deferral)) => {
+                    Step::Sent(mut done, SendAttempt::Deferred(deferral)) => {
                         in_flight.remove(&done);
+                        granted = std::mem::take(&mut done.granted);
                         let gates: Vec<Gate> = done.gates().collect();
                         self.hold_deferred(
                             done,
@@ -1258,6 +1279,19 @@ mod enabled {
                     Step::LookupFreed(permits) => {
                         waiting.lookup_freed(permits, &mut in_flight, &retry_at, &mut ready);
                     }
+                }
+                // A restarted send that ended may never have taken a lookup
+                // permit: it reused a pooled connection, or was deferred
+                // first. No permit drop then signals `freed`, so the drain
+                // hands its grant on itself, to as many held sends as permits
+                // are free now. A send that did take one hands it on here
+                // and through `freed`; an extra restart that finds the pool
+                // full comes back without any request made.
+                if granted
+                    && waiting.awaits_lookup()
+                    && let Some(free) = sender.free_lookup_permits()
+                {
+                    waiting.lookup_freed(free, &mut in_flight, &retry_at, &mut ready);
                 }
                 if !ready.is_empty() {
                     let mut queued = lock(&self.queued);
@@ -2098,6 +2132,7 @@ mod enabled {
                     ticket: Arc::clone(ticket),
                 },
                 origin: Some(origin.to_owned()),
+                granted: false,
             }
         }
 
@@ -2261,6 +2296,49 @@ mod enabled {
             let started: Vec<String> = ready.iter().map(token_of).collect();
             assert_eq!(started, ["token-0001"]);
             assert!(waiting.awaits_lookup());
+        }
+
+        /// A freed lookup permit is not spent on a held job its origin's cap
+        /// holds: that job moves to its origin's wait, and the permit starts
+        /// the next held job, to another origin.
+        #[test]
+        fn a_freed_lookup_permit_passes_over_a_capped_job() {
+            let capped = "https://capped.example.net";
+            let other = "https://other.example.net";
+            let no_backoff = |_: &str| None;
+            let mut waiting = Waiting::default();
+            let mut in_flight = InFlight::default();
+            let mut ready = Vec::new();
+            let tickets: Vec<Arc<()>> = (0..WEBPUSH_SENDS_PER_ORIGIN + 3)
+                .map(|_| Arc::new(()))
+                .collect();
+            for (n, ticket) in tickets.iter().take(WEBPUSH_SENDS_PER_ORIGIN).enumerate() {
+                waiting.arrive(
+                    held_job(n, ticket, capped),
+                    &mut in_flight,
+                    &no_backoff,
+                    &mut ready,
+                );
+            }
+            assert_eq!(ready.len(), WEBPUSH_SENDS_PER_ORIGIN);
+            ready.clear();
+            let n = WEBPUSH_SENDS_PER_ORIGIN;
+            for (n, origin) in [(n, capped), (n + 1, capped), (n + 2, other)] {
+                let ticket = &tickets[n];
+                waiting.hold(
+                    held_job(n, ticket, origin),
+                    SendDeferral::LookupPoolFull,
+                    &mut in_flight,
+                    &no_backoff,
+                    &mut ready,
+                );
+            }
+            waiting.lookup_freed(1, &mut in_flight, &no_backoff, &mut ready);
+            let started: Vec<String> = ready.iter().map(token_of).collect();
+            assert_eq!(started, [format!("token-{:04}", n + 2)]);
+            assert!(ready.iter().all(|held| held.granted));
+            assert!(!waiting.awaits_lookup());
+            assert_eq!(waiting.held(), 2);
         }
 
         /// Four sends to one origin are in flight when the origin begins
@@ -2467,6 +2545,63 @@ mod enabled {
                 gate.admit(total);
                 wait_for_sends(&sender, total).await?;
                 assert_eq!(sender.sent().await, tokens);
+                stop.cancel();
+                task.await?;
+                Ok(())
+            }
+
+            /// Twenty `WebPush` jobs wait on a full lookup pool, and one
+            /// permit frees, once. Each restarted send takes no permit, as a
+            /// send over a pooled connection resolves nothing, so no further
+            /// permit drop signals the drain; each send that ends hands its
+            /// restart on to the next held job, and all twenty are sent.
+            #[tokio::test]
+            async fn one_freed_lookup_permit_reaches_every_held_job() -> TestResult {
+                const HELD: usize = 20;
+                let (sender, pool) = RecordingSender::with_lookup_pool(
+                    PushPlatform::WebPush,
+                    vec![PushSendOutcome::Delivered; HELD],
+                );
+                let dir = tempfile::tempdir()?;
+                let (tx, rx) = mpsc::channel(PUSH_QUEUE_CAPACITY);
+                let queued = Arc::new(Mutex::new(HashSet::new()));
+                let stop = CancellationToken::new();
+                let drain = Drain {
+                    senders: Arc::from(vec![recording(&sender)]),
+                    index: 0,
+                    store: PushRegistrationStore::open_sqlite(&dir.path().join("push.db"))?,
+                    queued: Arc::clone(&queued),
+                    logs: Arc::new(Logs::default()),
+                    stop: stop.clone(),
+                    pending_resets: HashSet::new(),
+                };
+                let task = tokio::spawn(drain.run(rx));
+                let tokens: Vec<Vec<u8>> = (0..HELD)
+                    .map(|n| format!("token-{n:04}").into_bytes())
+                    .collect();
+                for token in &tokens {
+                    lock(&queued).insert(token_key(PushPlatform::WebPush, token));
+                    tx.send(PushJob {
+                        platform: PushPlatform::WebPush,
+                        token: Zeroizing::new(token.clone()),
+                        ticket: Arc::new(()),
+                    })
+                    .await?;
+                }
+                for _ in 0..1000 {
+                    if tx.capacity() == tx.max_capacity() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                assert_eq!(lock(&queued).len(), HELD, "the drain did not hold the jobs");
+                assert!(sender.sent().await.is_empty());
+                pool.free(1);
+                wait_for_sends(&sender, HELD).await?;
+                let mut sent = sender.sent().await;
+                sent.sort();
+                assert_eq!(sent, tokens);
                 stop.cancel();
                 task.await?;
                 Ok(())
