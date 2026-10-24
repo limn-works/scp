@@ -605,6 +605,12 @@ pub struct CoreFields {
     /// A shut-down instance cannot be resumed.
     shutdown: AtomicBool,
 
+    /// Signalled by [`Self::restore_transport`] just before it takes the
+    /// transport write lock, so a test can begin shutdown while the restore
+    /// is past every check made before that lock.
+    #[cfg(test)]
+    restore_transport_lock_hook: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
+
     /// Whether a shutdown closed the durable store, will never close it, or
     /// has not settled it yet, so a later shutdown call can report whether
     /// the store still holds its advisory lock without waiting on a close
@@ -965,6 +971,8 @@ impl CoreFields {
         Self {
             supervisor: OnceLock::new(),
             shutdown: AtomicBool::new(false),
+            #[cfg(test)]
+            restore_transport_lock_hook: Mutex::new(None),
             durable_store_state: Arc::new(tokio::sync::watch::Sender::new(
                 DurableStoreState::Unsettled,
             )),
@@ -1059,6 +1067,8 @@ impl CoreFields {
         Self {
             supervisor: OnceLock::new(),
             shutdown: AtomicBool::new(false),
+            #[cfg(test)]
+            restore_transport_lock_hook: Mutex::new(None),
             durable_store_state: Arc::new(tokio::sync::watch::Sender::new(
                 DurableStoreState::Unsettled,
             )),
@@ -1974,6 +1984,18 @@ impl CoreFields {
         installed: &Arc<scp_transport::TransportManager>,
         previous: Option<Arc<scp_transport::TransportManager>>,
     ) {
+        #[cfg(test)]
+        {
+            let hook = self
+                .restore_transport_lock_hook
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            // A test that installed the hook waits on it; none that did not.
+            if let Some(hook) = hook {
+                hook.send(()).ok();
+            }
+        }
         let mut slot = self
             .transport
             .write()
@@ -8071,7 +8093,9 @@ pub(crate) mod tests {
     /// A restore that waits for the transport write lock while shutdown
     /// begins installs nothing once it gets the lock: it reads the shutdown
     /// flag under the lock, as an install does, so shutdown's clear of the
-    /// transport is never undone by a restore that started before it.
+    /// transport is never undone by a restore that started before it. The
+    /// restore signals just before it takes the lock, so shutdown begins
+    /// only after every check made before the lock has run.
     #[test]
     fn restore_transport_waiting_on_the_lock_while_shutdown_begins_restores_nothing() {
         let instance = CoreFields::with_supervisor(test_supervisor());
@@ -8079,6 +8103,11 @@ pub(crate) mod tests {
         let installed = Arc::new(manager_on("ws://127.0.0.1:1/scp/v1"));
         instance.install_transport(Arc::clone(&installed)).unwrap();
 
+        let (at_lock, reached_lock) = std::sync::mpsc::sync_channel(1);
+        *instance
+            .restore_transport_lock_hook
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(at_lock);
         std::thread::scope(|scope| {
             let held = instance
                 .transport
@@ -8087,8 +8116,9 @@ pub(crate) mod tests {
             let restore = scope.spawn(|| {
                 instance.restore_transport(&installed, Some(Arc::clone(&previous)));
             });
-            // Let the restore reach the lock before shutdown begins.
-            std::thread::sleep(Duration::from_millis(200));
+            reached_lock
+                .recv()
+                .expect("the restore signals before it takes the lock");
             instance.shutdown.store(true, Ordering::SeqCst);
             drop(held);
             restore.join().unwrap();
