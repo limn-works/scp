@@ -641,19 +641,22 @@ fn ingest_pseudonym_announcement(
     // `peer_registry()` both read the routing state; capture the local pseudonym
     // first so the two borrows do not overlap.
     //
-    // §9.10.4.1 also names the previous routing ID while it is in its rotation
-    // grace. The grace arm discards the previous routing ID when the grace ends,
-    // so the one this member still holds is the one in its grace.
-    let previous_routing_id = view
+    // §9.10.4.1 "Receipt ordering" also names every routing ID on this member's
+    // query-only list, which its reconnect catch-up still reads. An entry whose
+    // expiry passed stays until the next rotation prunes it, and is compared
+    // too: no live blob can sit on it, so rejecting it costs nothing.
+    let query_only: Vec<[u8; 32]> = view
         .class_s()
         .pseudonym_rotation
-        .previous()
-        .map(|p| p.routing_id);
+        .query_only
+        .iter()
+        .map(|entry| entry.routing_id)
+        .collect();
     let own_routing_ids: Vec<[u8; 32]> = view
         .routing_mut()
         .local_pseudonym()
         .into_iter()
-        .chain(previous_routing_id)
+        .chain(query_only)
         .collect();
     match classify_pseudonym_announcement(
         plaintext,
@@ -1797,10 +1800,13 @@ pub async fn encrypt_and_send(
     if routing_ids.is_empty() {
         return Ok(());
     }
+    // The one place a context message's relay TTL is chosen: from its type
+    // (spec 09 §9.10.2 "Blob TTL by message type").
+    let ttl = scp_protocol::envelope::outer::BlobTtl::for_message_type(message_type);
     let mut last_err = None;
     let mut any_success = false;
     for rid in routing_ids {
-        match deps.transport.send_message(rid, &encrypted).await {
+        match deps.transport.send_message(rid, &encrypted, ttl).await {
             Ok(()) => {
                 any_success = true;
                 crate::metrics::record_message_sent();
@@ -2971,7 +2977,7 @@ pub fn build_snapshot_from_state(
         stream_reservations: stream_reservations_snapshot(state),
         // §9.10.4.1 Class S: persist the rotation state so a crash after the
         // rotation's persist restores the new epoch with `announce_pending`.
-        pseudonym_rotation: state.class_s.pseudonym_rotation,
+        pseudonym_rotation: state.class_s.pseudonym_rotation.clone(),
         // ADR-049 §9 Class S (§5.14.8 block-before-serve): fold the broadcast
         // security + roster state (per-author key epochs, block lists, subscriber
         // registry) into the fail-closed snapshot so a block / governance ban /
@@ -3906,7 +3912,7 @@ pub async fn deliver_message_and_drain_buffered(
 
 /// Sends the local member's pseudonym announcement as an MLS application
 /// message, so other members map its DID to its current routing ID (spec 09
-/// §9.10.4; §9.10.4.1 "Transition protocol and grace").
+/// §9.10.4; §9.10.4.1 "Transition protocol: query-only until expiry").
 ///
 /// A member with a v2 rotation epoch sends the v2 form
 /// ([`PseudonymAnnouncementV2`](scp_protocol::context::pseudonym::PseudonymAnnouncementV2))
@@ -3940,7 +3946,7 @@ pub async fn send_pseudonym_announcement(
     let Some(routing_id) = cell.routing.local_pseudonym() else {
         return Err(ContextError::NotPseudonymousContext { context_id });
     };
-    let rotation = cell.class_s.pseudonym_rotation;
+    let rotation = cell.class_s.pseudonym_rotation.clone();
     let payload = encode_local_announcement(sender_did.as_ref(), routing_id, rotation.epoch())?;
     send_message(
         cell,
@@ -4074,7 +4080,7 @@ pub(super) async fn rotate_pseudonym(
 
     let now_secs = deps.clock.now_secs();
     let policy = handle.params().pseudonym_rotation;
-    let mut rotation = cell.class_s.pseudonym_rotation;
+    let mut rotation = cell.class_s.pseudonym_rotation.clone();
     let Some(expected_epoch) = rotation.due_epoch(policy.as_ref(), now_secs) else {
         return Err(ContextError::InvalidState(
             "no pseudonym rotation is due: the context has no rotation policy, no trigger has \
@@ -4496,6 +4502,43 @@ mod pseudonym_routing_tests {
             })
         );
         assert_eq!(count_events(&state), 2);
+    }
+
+    /// Spec 09 §9.10.4.1 "Receipt ordering": an announcement claiming a
+    /// routing ID on the receiver's query-only list is a collision, with no
+    /// grace state involved. The previous routing ID is cleared here so the
+    /// query-only list alone must carry the rejection.
+    #[test]
+    fn ingest_rejects_an_announcement_of_a_query_only_routing_id() {
+        use scp_protocol::context::pseudonym::REJECT_COLLISION;
+
+        let mut state = encrypted_state();
+        let ctx = ctx_hex(0x11);
+        let old = [0x76u8; 32];
+        state.routing.set_local_pseudonym([0x77u8; 32]);
+        state
+            .class_s
+            .pseudonym_rotation
+            .record_rotation(1, old, None, 1_000)
+            .expect("the rotation records");
+        state.class_s.pseudonym_rotation.previous = None;
+
+        let outcome = ingest_pseudonym_announcement(
+            &mut ClassCMut::from_state(&mut state),
+            ALICE,
+            &announcement_v2_bytes(ALICE, 1, old),
+            &ctx,
+            None,
+        );
+        assert_eq!(outcome, AnnouncementOutcome::Rejected(REJECT_COLLISION));
+        assert!(
+            state
+                .routing
+                .peer_registry()
+                .expect("encrypted ⇒ registry")
+                .is_empty(),
+            "a rejected announcement leaves the registry unchanged"
+        );
     }
 
     #[test]

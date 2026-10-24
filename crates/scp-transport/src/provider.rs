@@ -37,15 +37,19 @@ use scp_core::context::builder::{ContextCreationError, ContextTransportProvider}
 use scp_core::context::{ContextError, ContextParams};
 use scp_core::crypto::envelope_seal::derive_key_package_routing_id;
 use scp_core::envelope::OuterEnvelope;
+use scp_protocol::envelope::outer::BlobTtl;
 
 use crate::traits::{BlobId, TransportAdapter};
 
-/// Default blob TTL in seconds (1 hour) for relay-published envelopes.
+/// Blob TTL in seconds (1 hour) for the two non-message publishes:
+/// the context-announcement placeholder (`publish_context`) and a published
+/// `KeyPackage` (`publish_key_package`).
 ///
-/// The relay enforces `MIN_BLOB_TTL..=MAX_BLOB_TTL` (1..=604800). A TTL of 0
-/// is rejected with relay error 4011. 3600 seconds (1 hour) matches the
-/// standard default used across the codebase (`scp-node`, adapter tests,
-/// protocol tests).
+/// MLS messages to a context do not use it: [`send_message`] requests the
+/// [`BlobTtl`] the runtime chose from the message's type
+/// (`09-security-model.md` §9.10.2 "Blob TTL by message type").
+///
+/// [`send_message`]: ContextTransportProvider::send_message
 const DEFAULT_BLOB_TTL: u32 = 3600;
 
 /// Production [`ContextTransportProvider`] wrapping a [`TransportAdapter`].
@@ -179,14 +183,17 @@ impl<A: TransportAdapter + Send + Sync + 'static> ContextTransportProvider
         &self,
         context_id: &[u8; 32],
         encrypted_payload: &[u8],
+        ttl: BlobTtl,
     ) -> Result<(), ContextError> {
         // The one framing of a member publish (ADR-002, spec 23 §23.4.1): the
         // payload is the serialized MLS message, and this envelope is the only
-        // one around it.
+        // one around it. The `blob_ttl` is the one the runtime chose from the
+        // message's type (`09-security-model.md` §9.10.2 "Blob TTL by message
+        // type"); the provider never picks its own.
         let envelope = scp_core::envelope::OuterEnvelope::frame_mls_message(
             context_id,
             None,
-            DEFAULT_BLOB_TTL,
+            ttl,
             encrypted_payload.to_vec(),
         )
         .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
@@ -220,7 +227,7 @@ impl<A: TransportAdapter + Send + Sync + 'static> ContextTransportProvider
 mod tests {
     use super::*;
 
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicU32, AtomicUsize};
 
     use futures::future::BoxFuture;
 
@@ -231,6 +238,8 @@ mod tests {
         send_count: AtomicUsize,
         delete_count: AtomicUsize,
         fail_send: AtomicBool,
+        /// `blob_ttl` of the last envelope passed to `send`.
+        last_blob_ttl: AtomicU32,
     }
 
     impl TestAdapter {
@@ -239,6 +248,7 @@ mod tests {
                 send_count: AtomicUsize::new(0),
                 delete_count: AtomicUsize::new(0),
                 fail_send: AtomicBool::new(false),
+                last_blob_ttl: AtomicU32::new(0),
             }
         }
     }
@@ -246,9 +256,11 @@ mod tests {
     impl TransportAdapter for TestAdapter {
         fn send(
             &self,
-            _envelope: &OuterEnvelope,
+            envelope: &OuterEnvelope,
         ) -> BoxFuture<'_, Result<BlobId, crate::TransportError>> {
             self.send_count.fetch_add(1, Ordering::Relaxed);
+            self.last_blob_ttl
+                .store(envelope.blob_ttl, Ordering::Relaxed);
             if self.fail_send.load(Ordering::Relaxed) {
                 Box::pin(async {
                     Err(crate::TransportError::SendFailed(
@@ -360,11 +372,70 @@ mod tests {
         let provider = RelayTransportProvider::new(adapter);
         let ctx_id = [4u8; 32];
 
-        let result = provider.send_message(&ctx_id, b"encrypted-payload").await;
+        let result = provider
+            .send_message(
+                &ctx_id,
+                b"encrypted-payload",
+                BlobTtl::for_message_type(scp_protocol::envelope::inner::MessageType::Content),
+            )
+            .await;
         assert!(result.is_ok());
 
         let count = provider.adapter.send_count.load(Ordering::Relaxed);
         assert_eq!(count, 1);
+    }
+
+    /// Every MLS message the native runtime publishes goes through
+    /// `send_message`, and the frame carries the `BlobTtl` the runtime chose
+    /// (`09-security-model.md` §9.10.2 "Blob TTL by message type").
+    #[tokio::test]
+    async fn send_message_frames_the_requested_blob_ttl() {
+        use scp_protocol::envelope::inner::MessageType;
+        let provider = RelayTransportProvider::new(TestAdapter::new());
+
+        for (kind, ttl, want) in [
+            ("commit", BlobTtl::commit(), scp_relay_client::MAX_BLOB_TTL),
+            (
+                "content",
+                BlobTtl::for_message_type(MessageType::Content),
+                scp_relay_client::MAX_BLOB_TTL,
+            ),
+            (
+                "heartbeat",
+                BlobTtl::for_message_type(MessageType::Heartbeat),
+                240,
+            ),
+            (
+                "checkpoint",
+                BlobTtl::for_message_type(MessageType::ConsistencyCheckpoint),
+                1_200,
+            ),
+        ] {
+            provider
+                .send_message(&[6u8; 32], b"mls-message", ttl)
+                .await
+                .unwrap();
+            let got = provider.adapter.last_blob_ttl.load(Ordering::Relaxed);
+            assert_eq!(got, want, "{kind}");
+        }
+    }
+
+    /// The two non-message publishes keep their own one-hour TTL.
+    #[tokio::test]
+    async fn non_message_publishes_keep_the_one_hour_blob_ttl() {
+        let provider = RelayTransportProvider::new(TestAdapter::new());
+
+        provider
+            .publish_context(&[7u8; 32], &ContextParams::default())
+            .await
+            .unwrap();
+        assert_eq!(provider.adapter.last_blob_ttl.load(Ordering::Relaxed), 3600);
+
+        provider
+            .publish_key_package("did:dht:example", b"kp")
+            .await
+            .unwrap();
+        assert_eq!(provider.adapter.last_blob_ttl.load(Ordering::Relaxed), 3600);
     }
 
     #[tokio::test]
@@ -374,7 +445,15 @@ mod tests {
         let provider = RelayTransportProvider::new(adapter);
         let ctx_id = [5u8; 32];
 
-        let result = provider.send_message(&ctx_id, b"data").await;
+        let result = provider
+            .send_message(
+                &ctx_id,
+                b"data",
+                scp_protocol::envelope::outer::BlobTtl::for_message_type(
+                    scp_protocol::envelope::inner::MessageType::Content,
+                ),
+            )
+            .await;
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),

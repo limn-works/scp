@@ -1167,7 +1167,7 @@ async fn handle_rotate_pseudonym(
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
     let before = (
-        cell.class_s.pseudonym_rotation,
+        cell.class_s.pseudonym_rotation.clone(),
         cell.routing.local_pseudonym(),
     );
     let rotate_fut = crate::context::messaging_helpers::rotate_pseudonym(
@@ -1185,7 +1185,7 @@ async fn handle_rotate_pseudonym(
         Ok(Err(err)) => {
             let sketch = outcome_error_sketch(&err);
             let after = (
-                cell.class_s.pseudonym_rotation,
+                cell.class_s.pseudonym_rotation.clone(),
                 cell.routing.local_pseudonym(),
             );
             if after == before {

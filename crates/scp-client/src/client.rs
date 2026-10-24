@@ -44,7 +44,7 @@ use scp_protocol::context::pseudonym::{
     classify_pseudonym_announcement, is_pseudonym_announcement_payload,
 };
 use scp_protocol::crypto::sender_keys::generate_wrapping_keypair;
-use scp_protocol::envelope::outer::{DEFAULT_APP_DATA_BLOB_TTL_SECS, OuterEnvelope};
+use scp_protocol::envelope::outer::{BlobTtl, OuterEnvelope};
 use scp_relay_client::{ClientMessage, RelayMessage};
 use serde::{Deserialize, Serialize};
 use tls_codec::Serialize as TlsSerialize;
@@ -1100,15 +1100,15 @@ impl ScpClient {
         // routing_id (§9.10.4 privacy: the relay-visible routing id is the
         // per-peer PUBLISH address below, not the envelope; a curious relay
         // reads nothing linkable off the envelope).
-        let blob = OuterEnvelope::frame_mls_message(
-            &[0u8; 32],
-            None,
-            DEFAULT_APP_DATA_BLOB_TTL_SECS,
-            ciphertext,
-        )
-        .map_err(|e| ClientError::Codec(format!("framing the MLS message: {e}")))?
-        .to_bytes()
-        .map_err(|e| ClientError::Codec(format!("serializing outer envelope: {e}")))?;
+        // Every frame this client publishes is a Content message: an
+        // application message, or a pseudonym announcement, which the native
+        // runtime also sends as Content. Its TTL comes from the same mapping the
+        // native runtime uses (spec 09 §9.10.2 "Blob TTL by message type").
+        let ttl = BlobTtl::for_message_type(scp_protocol::envelope::inner::MessageType::Content);
+        let blob = OuterEnvelope::frame_mls_message(&[0u8; 32], None, ttl, ciphertext)
+            .map_err(|e| ClientError::Codec(format!("framing the MLS message: {e}")))?
+            .to_bytes()
+            .map_err(|e| ClientError::Codec(format!("serializing outer envelope: {e}")))?;
 
         // Persist the advanced ratchet (+ buffered MessageSent) BEFORE publishing.
         self.persist_context(context_id)?;
@@ -1133,7 +1133,7 @@ impl ScpClient {
                 ref_id: None,
                 routing_id,
                 recipient_hint: None,
-                blob_ttl: DEFAULT_APP_DATA_BLOB_TTL_SECS,
+                blob_ttl: ttl.secs(),
                 blob: blob.clone(),
             }
             .to_bytes()

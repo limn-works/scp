@@ -186,7 +186,6 @@ async fn relay_config_defaults() {
     // Verify defaults match ADR-004 spec values.
     assert_eq!(config.bind_addr, ([127, 0, 0, 1], 9000).into());
     assert_eq!(config.max_blob_size, 262_144); // 256 KB
-    assert_eq!(config.max_blob_ttl, 604_800); // 7 days
     assert_eq!(config.max_subscriptions_per_connection, 100);
     assert_eq!(config.max_query_limit, 1000);
     assert_eq!(

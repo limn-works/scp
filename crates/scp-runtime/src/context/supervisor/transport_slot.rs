@@ -88,9 +88,10 @@ impl ContextTransportProvider for TransportSlot {
         &self,
         context_id: &[u8; 32],
         encrypted_payload: &[u8],
+        ttl: scp_protocol::envelope::outer::BlobTtl,
     ) -> Result<(), ContextError> {
         self.bound()
-            .send_message(context_id, encrypted_payload)
+            .send_message(context_id, encrypted_payload, ttl)
             .await
     }
 
@@ -158,6 +159,7 @@ mod tests {
             &self,
             _context_id: &[u8; 32],
             _encrypted_payload: &[u8],
+            _ttl: scp_protocol::envelope::outer::BlobTtl,
         ) -> Result<(), ContextError> {
             self.sends.fetch_add(1, Ordering::SeqCst);
             if let Some(gate) = &self.gate {
@@ -175,14 +177,30 @@ mod tests {
         let a_dyn: Arc<dyn ContextTransportProvider> = a.clone();
         let b_dyn: Arc<dyn ContextTransportProvider> = b.clone();
         let slot = TransportSlot::new(Arc::clone(&a_dyn));
-        slot.send_message(&[1; 32], b"x").await.unwrap();
+        slot.send_message(
+            &[1; 32],
+            b"x",
+            scp_protocol::envelope::outer::BlobTtl::for_message_type(
+                scp_protocol::envelope::inner::MessageType::Content,
+            ),
+        )
+        .await
+        .unwrap();
 
         let displaced = slot.replace(Arc::clone(&b_dyn));
         assert!(
             Arc::ptr_eq(&displaced, &a_dyn),
             "replace returns the displaced provider"
         );
-        slot.send_message(&[2; 32], b"x").await.unwrap();
+        slot.send_message(
+            &[2; 32],
+            b"x",
+            scp_protocol::envelope::outer::BlobTtl::for_message_type(
+                scp_protocol::envelope::inner::MessageType::Content,
+            ),
+        )
+        .await
+        .unwrap();
 
         assert_eq!((a.sends(), b.sends()), (1, 1));
     }
@@ -198,7 +216,16 @@ mod tests {
         let slot = Arc::new(TransportSlot::new(a.clone()));
         let in_flight = tokio::spawn({
             let slot = Arc::clone(&slot);
-            async move { slot.send_message(&[7; 32], b"x").await }
+            async move {
+                slot.send_message(
+                    &[7; 32],
+                    b"x",
+                    scp_protocol::envelope::outer::BlobTtl::for_message_type(
+                        scp_protocol::envelope::inner::MessageType::Content,
+                    ),
+                )
+                .await
+            }
         });
         a.entered.notified().await;
 

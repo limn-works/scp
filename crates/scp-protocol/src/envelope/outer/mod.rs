@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use super::EnvelopeError;
+use super::inner::MessageType;
 
 /// The outer envelope — the minimal wire format visible to relays.
 ///
@@ -32,16 +33,195 @@ const fn default_outer_version() -> u16 {
     super::SCP_PROTOCOL_VERSION
 }
 
-/// Default TTL (seconds) a member requests when publishing an app-data blob
-/// through a relay. 300s = 5 minutes — short enough to limit replay surface,
-/// long enough to absorb transient relay outages.
+/// TTL (seconds) a member requests for every MLS message it publishes to a
+/// context other than a heartbeat or a consistency checkpoint: 7 days, the
+/// relay maximum `MAX_BLOB_TTL`.
 ///
-/// This is the single wasm-safe home for the value: the native runtime
-/// (`scp-runtime` `messaging_helpers::DEFAULT_BLOB_TTL_SECS`) and the in-browser
-/// participant driver (`scp-client`, over the injected `Socket`) both consume it,
-/// so a native and a browser member request the same relay-storage window for the
-/// same message (ADR-057 "share, don't fork").
-pub const DEFAULT_APP_DATA_BLOB_TTL_SECS: u32 = 300;
+/// It covers application data, Commits, and sealed management messages
+/// (`09-security-model.md` §9.10.2 "Blob TTL by message type", §9.18.11). A
+/// device offline for up to 7 days finds every such message still stored on
+/// reconnect. No replay or dedup window is sized from this value: replay
+/// protection is the per-sender `(epoch, sequence)` floor plus MLS.
+///
+/// This is the single wasm-safe home for the value: the native transport
+/// provider (`scp-transport` `RelayTransportProvider::send_message`) and the
+/// in-browser participant driver (`scp-client`, over the injected `Socket`) both
+/// consume it, so a native and a browser member request the same relay-storage
+/// window for the same message (ADR-057 "share, don't fork"). `scp-protocol`
+/// cannot name `scp_relay_client::MAX_BLOB_TTL` (the dependency runs the other
+/// way), so `scp-relay-client` const-asserts the two equal.
+pub const DEFAULT_APP_DATA_BLOB_TTL_SECS: u32 = 604_800;
+
+/// TTL (seconds) of a suppression-detection heartbeat (§9.9.2).
+///
+/// 240 s is the suppression threshold (`09-security-model.md` §9.10.2 "Blob
+/// TTL by message type", §9.18.11). A heartbeat older than the threshold tells
+/// a peer nothing.
+pub const HEARTBEAT_BLOB_TTL_SECS: u32 = 240;
+
+/// TTL (seconds) of a consistency checkpoint (§9.9.3): 1,200 s, twice the
+/// 10-minute checkpoint cadence (`09-security-model.md` §9.10.2 "Blob TTL by
+/// message type", §9.18.11).
+pub const CHECKPOINT_BLOB_TTL_SECS: u32 = 1_200;
+
+/// The relay-storage class of a message a member publishes to a context.
+///
+/// Private to this module: only [`BlobTtl`]'s per-kind constructors pick a
+/// class, so no caller can pair a message with another kind's TTL
+/// (`09-security-model.md` §9.10.2 "Blob TTL by message type").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlobClass {
+    /// A suppression-detection heartbeat: [`HEARTBEAT_BLOB_TTL_SECS`].
+    Heartbeat,
+    /// A consistency checkpoint: [`CHECKPOINT_BLOB_TTL_SECS`].
+    ConsistencyCheckpoint,
+    /// Every other message to a context (application data, Commits,
+    /// sealed management messages, broadcast posts, Tier-2 snapshots):
+    /// [`DEFAULT_APP_DATA_BLOB_TTL_SECS`].
+    Message,
+}
+
+impl BlobClass {
+    /// The class of an inner envelope's [`MessageType`].
+    ///
+    /// The match is exhaustive, so a new message type does not compile until
+    /// it is given a class.
+    const fn of(message_type: MessageType) -> Self {
+        match message_type {
+            MessageType::Heartbeat => Self::Heartbeat,
+            MessageType::ConsistencyCheckpoint => Self::ConsistencyCheckpoint,
+            MessageType::Content
+            | MessageType::Signaling
+            | MessageType::KeyDistribution
+            | MessageType::Recovery => Self::Message,
+        }
+    }
+
+    /// The `blob_ttl` (seconds) a first publish of this class requests.
+    const fn ttl_secs(self) -> u32 {
+        match self {
+            Self::Heartbeat => HEARTBEAT_BLOB_TTL_SECS,
+            Self::ConsistencyCheckpoint => CHECKPOINT_BLOB_TTL_SECS,
+            Self::Message => DEFAULT_APP_DATA_BLOB_TTL_SECS,
+        }
+    }
+}
+
+/// The `blob_ttl` a member requests for one publish to a context.
+///
+/// The field is private, and each constructor names the kind of message it is
+/// for, so no caller passes a TTL value or picks a storage class of its own
+/// (`09-security-model.md` §9.10.2 "Blob TTL by message type" and "Republish
+/// rule"). The class itself is not nameable outside this module:
+///
+/// ```compile_fail,E0603
+/// use scp_protocol::envelope::outer::BlobClass;
+/// ```
+///
+/// The per-kind constructors are the public surface:
+///
+/// ```
+/// use scp_protocol::envelope::outer::BlobTtl;
+/// assert_eq!(BlobTtl::commit().secs(), 604_800);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlobTtl(u32);
+
+/// A republish refused because the first attempt's TTL has run out
+/// (`09-security-model.md` §9.10.2 "Republish rule"): every relay copy of the
+/// first attempt has expired, so a new copy would outlive it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "republish refused: the first attempt at {first_attempt_secs} s has outlived its \
+     {ttl_secs} s blob TTL (now {now_secs} s)"
+)]
+pub struct BlobTtlExpired {
+    /// Unix seconds of the first attempt.
+    pub first_attempt_secs: u64,
+    /// Unix seconds of the refused republish.
+    pub now_secs: u64,
+    /// The class TTL of the first attempt.
+    pub ttl_secs: u32,
+}
+
+impl BlobTtl {
+    /// The TTL of a first publish of an inner envelope of `message_type`: a
+    /// heartbeat 240 s, a consistency checkpoint 1,200 s, every other type the
+    /// relay maximum.
+    #[must_use]
+    pub const fn for_message_type(message_type: MessageType) -> Self {
+        Self(BlobClass::of(message_type).ttl_secs())
+    }
+
+    /// The TTL of a first publish of an MLS Commit: the relay maximum.
+    #[must_use]
+    pub const fn commit() -> Self {
+        Self(BlobClass::Message.ttl_secs())
+    }
+
+    /// The TTL of a management message a member seals into the group, such as
+    /// a rotated sender-key distribution: the relay maximum.
+    #[must_use]
+    pub const fn sealed_management() -> Self {
+        Self(BlobClass::Message.ttl_secs())
+    }
+
+    /// The TTL of a broadcast post (§9.8.2): the relay maximum, its delivery
+    /// lifetime.
+    #[must_use]
+    pub const fn broadcast_post() -> Self {
+        Self(BlobClass::Message.ttl_secs())
+    }
+
+    /// The TTL of a Tier-2 snapshot a member publishes at its context's shared
+    /// routing ID (spec 23 §23.5): the relay maximum.
+    #[must_use]
+    pub const fn tier2_snapshot() -> Self {
+        Self(BlobClass::Message.ttl_secs())
+    }
+
+    /// The TTL of a retry of a Commit first published at `first_attempt_secs`:
+    /// the Commit TTL minus the seconds elapsed since then. A clock that moved
+    /// backwards (`now_secs < first_attempt_secs`) counts as zero elapsed
+    /// seconds.
+    ///
+    /// # Errors
+    ///
+    /// [`BlobTtlExpired`] when no TTL remains, so the caller does not
+    /// republish.
+    pub fn republish_commit(
+        first_attempt_secs: u64,
+        now_secs: u64,
+    ) -> Result<Self, BlobTtlExpired> {
+        Self::remaining(BlobClass::Message, first_attempt_secs, now_secs)
+    }
+
+    /// The TTL that remains of a `class` publish first attempted at
+    /// `first_attempt_secs`.
+    fn remaining(
+        class: BlobClass,
+        first_attempt_secs: u64,
+        now_secs: u64,
+    ) -> Result<Self, BlobTtlExpired> {
+        let ttl_secs = class.ttl_secs();
+        let elapsed = now_secs.saturating_sub(first_attempt_secs);
+        let remaining = u64::from(ttl_secs).saturating_sub(elapsed);
+        match u32::try_from(remaining) {
+            Ok(secs) if secs > 0 => Ok(Self(secs)),
+            _ => Err(BlobTtlExpired {
+                first_attempt_secs,
+                now_secs,
+                ttl_secs,
+            }),
+        }
+    }
+
+    /// The TTL in seconds, as the relay `PUBLISH` carries it.
+    #[must_use]
+    pub const fn secs(self) -> u32 {
+        self.0
+    }
+}
 
 /// The unauthenticated outer envelope used for relay routing.
 ///
@@ -283,7 +463,7 @@ impl OuterEnvelope {
     pub fn frame_mls_message(
         routing_id: &[u8],
         recipient_hint: Option<&[u8]>,
-        blob_ttl: u32,
+        blob_ttl: BlobTtl,
         mls_message: Vec<u8>,
     ) -> Result<Self, MalformedFrame> {
         if mls_message.is_empty() {
@@ -292,7 +472,7 @@ impl OuterEnvelope {
         Ok(create_outer_envelope(
             routing_id,
             recipient_hint,
-            blob_ttl,
+            blob_ttl.secs(),
             mls_message,
         )?)
     }
@@ -327,10 +507,15 @@ mod tests {
     #[test]
     fn a_framed_mls_message_unframes_to_itself() {
         let mls = vec![0x00, 0x01, 0x00, 0x02, 0xaa];
-        let blob = OuterEnvelope::frame_mls_message(&[0x11; 32], None, 300, mls.clone())
-            .unwrap()
-            .to_bytes()
-            .unwrap();
+        let blob = OuterEnvelope::frame_mls_message(
+            &[0x11; 32],
+            None,
+            BlobTtl::for_message_type(MessageType::Heartbeat),
+            mls.clone(),
+        )
+        .unwrap()
+        .to_bytes()
+        .unwrap();
         let envelope = OuterEnvelope::unframe_mls_message(&blob).unwrap();
         assert_eq!(envelope.encrypted_blob, mls);
         assert_eq!(envelope.routing_id, vec![0x11; 32]);
@@ -362,11 +547,21 @@ mod tests {
             Err(MalformedFrame::EmptyMessage)
         ));
         assert!(matches!(
-            OuterEnvelope::frame_mls_message(&[0x11; 32], None, 300, Vec::new()),
+            OuterEnvelope::frame_mls_message(
+                &[0x11; 32],
+                None,
+                BlobTtl::for_message_type(MessageType::Heartbeat),
+                Vec::new()
+            ),
             Err(MalformedFrame::EmptyMessage)
         ));
         assert!(matches!(
-            OuterEnvelope::frame_mls_message(&[0x11; 16], None, 300, vec![1]),
+            OuterEnvelope::frame_mls_message(
+                &[0x11; 16],
+                None,
+                BlobTtl::for_message_type(MessageType::Heartbeat),
+                vec![1]
+            ),
             Err(MalformedFrame::Envelope(EnvelopeError::InvalidRoutingId(_)))
         ));
     }
@@ -871,5 +1066,70 @@ mod tests {
             err_msg.contains("DeserializationFailed"),
             "should be DeserializationFailed from serde_bounded_bytes, got: {err_msg}"
         );
+    }
+
+    /// Spec 09 §9.10.2 "Blob TTL by message type": a heartbeat requests 240 s,
+    /// a checkpoint 1,200 s, and every other message type the 7-day maximum.
+    #[test]
+    fn each_message_type_requests_its_class_ttl() {
+        let cases = [
+            (MessageType::Heartbeat, 240),
+            (MessageType::ConsistencyCheckpoint, 1_200),
+            (MessageType::Content, 604_800),
+            (MessageType::Signaling, 604_800),
+            (MessageType::KeyDistribution, 604_800),
+            (MessageType::Recovery, 604_800),
+        ];
+        for (message_type, want) in cases {
+            assert_eq!(
+                BlobTtl::for_message_type(message_type).secs(),
+                want,
+                "{message_type:?}"
+            );
+        }
+    }
+
+    /// Spec 09 §9.10.2 "Blob TTL by message type": each per-kind constructor
+    /// that is not keyed by a message type requests the relay maximum.
+    #[test]
+    fn each_kind_constructor_requests_the_relay_maximum() {
+        for (kind, ttl) in [
+            ("commit", BlobTtl::commit()),
+            ("sealed management", BlobTtl::sealed_management()),
+            ("broadcast post", BlobTtl::broadcast_post()),
+            ("tier-2 snapshot", BlobTtl::tier2_snapshot()),
+        ] {
+            assert_eq!(ttl.secs(), DEFAULT_APP_DATA_BLOB_TTL_SECS, "{kind}");
+        }
+    }
+
+    /// Spec 09 §9.10.2 "Republish rule": a republish requests the TTL that
+    /// remains of the first attempt, a clock that moved backwards counts as
+    /// zero elapsed seconds, and no TTL left is a typed refusal.
+    #[test]
+    fn a_republish_requests_the_remaining_ttl_of_the_first_attempt() {
+        let first = 1_000_000;
+        assert_eq!(
+            BlobTtl::republish_commit(first, first + 3_000).map(BlobTtl::secs),
+            Ok(604_800 - 3_000)
+        );
+        assert_eq!(
+            BlobTtl::republish_commit(first, first - 50).map(BlobTtl::secs),
+            Ok(604_800),
+            "a backwards clock counts as zero elapsed seconds"
+        );
+        assert_eq!(
+            BlobTtl::remaining(BlobClass::Heartbeat, first, first + 239).map(BlobTtl::secs),
+            Ok(1)
+        );
+        assert_eq!(
+            BlobTtl::remaining(BlobClass::Heartbeat, first, first + 240),
+            Err(BlobTtlExpired {
+                first_attempt_secs: first,
+                now_secs: first + 240,
+                ttl_secs: 240,
+            })
+        );
+        assert!(BlobTtl::republish_commit(first, u64::MAX).is_err());
     }
 }

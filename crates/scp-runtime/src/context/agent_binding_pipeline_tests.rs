@@ -501,6 +501,7 @@ mod live_supervisor_send {
             &self,
             context_id: &[u8; 32],
             encrypted_payload: &[u8],
+            _ttl: scp_protocol::envelope::outer::BlobTtl,
         ) -> Result<(), ContextError> {
             self.sent
                 .lock()

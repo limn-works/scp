@@ -353,6 +353,15 @@
         "SCP-356",
         "SCP-358"
       ]
+    },
+    {
+      "id": "gate-message-lifetime",
+      "name": "Message lifetime: catch-up paging (spec 09 §9.10.2)",
+      "priority": "P1",
+      "status": "pending",
+      "stories": [
+        "SCP-363"
+      ]
     }
   ],
   "stories": [
@@ -1371,7 +1380,7 @@
         }
       ],
       "details": {
-        "relayOperatorConfig": "Published out-of-band. Defaults: max_blob_size 262144, max_blob_ttl 604800, max_subscriptions_per_connection 100, max_query_limit 1000, rate_limit_publish 60/min, rate_limit_subscribe 20/min, idle_timeout 90s.",
+        "relayOperatorConfig": "Published out-of-band. Defaults: max_blob_size 262144, max_subscriptions_per_connection 100, max_query_limit 1000, rate_limit_publish 60/min, rate_limit_subscribe 20/min, idle_timeout 90s.",
         "contextMetadata": "Contexts publish parameters to a keyed routing ID: metadata_routing_id = HMAC-SHA256(context_metadata_key, context_id || \"scp-metadata-v2\") (§9.10.4.B). Holders of the context_metadata_key can SUBSCRIBE or QUERY to inspect context parameters before joining; non-discoverable contexts are not publicly enumerable. Metadata blob is signed, unencrypted envelope containing ContextParameters struct (spec §5.3). Enables legibility-before-opt-in tenet.",
         "connectionRecovery": "Client-side: reconnect with exponential backoff (1s, 2s, 4s, 8s, 16s, 30s cap). Re-issue SUBSCRIBE with since = last received stored_at minus 5-second overlap. Deduplicate via blob_id. Relay maintains no per-client state across connections."
       },
@@ -7865,10 +7874,10 @@
       "files": [
         "crates/scp-core/src/well_known.rs"
       ],
-      "description": "Implement the .well-known/scp document type as specified in §18.3. This is the data type for the HTTP-accessible JSON document at https://<domain>/.well-known/scp that enables web-based discovery of SCP infrastructure.\n\nWellKnownScp struct: version (integer, currently 1), did (String), relay (String), contexts (optional Vec<WellKnownContext>), relay_config (optional RelayConfig).\n\nRelayConfig struct: max_blob_size, max_blob_ttl, rate_limit_publish, rate_limit_subscribe (all optional integers, mirroring ADR-004 configuration table).\n\nWellKnownContext struct: id (hex String), name (optional String), mode (optional String), uri (optional String — full scp:// URI).\n\nContexts list MUST NOT include encrypted context IDs — validation rejects them. Only broadcast context IDs (public by design, §5.14.6) may appear.\n\n.well-known/scp is NOT self-certifying — integrity depends on HTTPS. The did field enables partial verification via DHT resolution (§18.3.2).",
+      "description": "Implement the .well-known/scp document type as specified in §18.3. This is the data type for the HTTP-accessible JSON document at https://<domain>/.well-known/scp that enables web-based discovery of SCP infrastructure.\n\nWellKnownScp struct: version (integer, currently 1), did (String), relay (String), contexts (optional Vec<WellKnownContext>), relay_config (optional RelayConfig).\n\nRelayConfig struct: max_blob_size, rate_limit_publish, rate_limit_subscribe (all optional integers, mirroring ADR-004 configuration table).\n\nWellKnownContext struct: id (hex String), name (optional String), mode (optional String), uri (optional String — full scp:// URI).\n\nContexts list MUST NOT include encrypted context IDs — validation rejects them. Only broadcast context IDs (public by design, §5.14.6) may appear.\n\n.well-known/scp is NOT self-certifying — integrity depends on HTTPS. The did field enables partial verification via DHT resolution (§18.3.2).",
       "acceptanceCriteria": [
         "WellKnownScp struct with fields: version (u32), did (String), relay (String), contexts (Option<Vec<WellKnownContext>>), relay_config (Option<RelayConfig>)",
-        "RelayConfig struct with fields: max_blob_size (Option<u64>), max_blob_ttl (Option<u64>), rate_limit_publish (Option<u32>), rate_limit_subscribe (Option<u32>)",
+        "RelayConfig struct with fields: max_blob_size (Option<u64>), rate_limit_publish (Option<u32>), rate_limit_subscribe (Option<u32>)",
         "WellKnownContext struct with fields: id (String), name (Option<String>), mode (Option<String>), uri (Option<String>)",
         "Serde JSON serialization produces the format specified in §18.3.1",
         "Serde JSON deserialization accepts the format specified in §18.3.1",
@@ -7895,7 +7904,7 @@
         }
       ],
       "details": {
-        "documentFormat": "```json\n{\n  \"version\": 1,\n  \"did\": \"<the operator's identifier, in the text form 03 §3.1 fixes>\",\n  \"relay\": \"wss://relay.example.com/scp/v1\",\n  \"contexts\": [\n    {\n      \"id\": \"a1b2c3d4e5f6...\",\n      \"name\": \"Example Community\",\n      \"mode\": \"broadcast\",\n      \"uri\": \"scp://context/a1b2c3d4e5f6...?relay=wss://relay.example.com/scp/v1&mode=broadcast&name=Example+Community\"\n    }\n  ],\n  \"relay_config\": {\n    \"max_blob_size\": 262144,\n    \"max_blob_ttl\": 86400,\n    \"rate_limit_publish\": 100,\n    \"rate_limit_subscribe\": 50\n  }\n}\n```",
+        "documentFormat": "```json\n{\n  \"version\": 1,\n  \"did\": \"<the operator's identifier, in the text form 03 §3.1 fixes>\",\n  \"relay\": \"wss://relay.example.com/scp/v1\",\n  \"contexts\": [\n    {\n      \"id\": \"a1b2c3d4e5f6...\",\n      \"name\": \"Example Community\",\n      \"mode\": \"broadcast\",\n      \"uri\": \"scp://context/a1b2c3d4e5f6...?relay=wss://relay.example.com/scp/v1&mode=broadcast&name=Example+Community\"\n    }\n  ],\n  \"relay_config\": {\n    \"max_blob_size\": 262144,\n    \"rate_limit_publish\": 100,\n    \"rate_limit_subscribe\": 50\n  }\n}\n```",
         "securityNote": ".well-known/scp is NOT self-certifying. Integrity depends on HTTPS (DNS + TLS + server integrity). The did field enables partial verification via DHT resolution (§18.3.2). Clients MUST verify against resolved service records before trusting for protocol operations.",
         "privacyConstraints": "MUST NOT expose: encrypted context IDs, membership rosters, routing pseudonyms, subscriber lists. MAY expose: relay URLs, operator identifier, protocol version, relay config, broadcast context IDs."
       }
@@ -8882,7 +8891,7 @@
         "crates/scp-transport/src/relay/wellknown.rs",
         "crates/scp-transport/src/manager.rs"
       ],
-      "description": "Implement relay economic config extension to .well-known/scp (§19.8, §18.3.3) and cost-aware relay selection in TransportManager.\n\n§19.8 Relay Economic Config extends .well-known/scp (§18.3.3):\n```json\n{\n  \"relay_config\": {\n    \"max_blob_size\": 262144,\n    \"max_blob_ttl\": 86400,\n    \"rate_limit_publish\": 100,\n    \"economic\": {\n      \"currency\": \"USD\",\n      \"per_publish\": 10,\n      \"per_byte_stored\": 1,\n      \"payment_adapters\": [\"x402\", \"lightning\"],\n      \"payee\": \"<the relay operator's identifier, in the text form 03 §3.1 fixes>\"\n    }\n  }\n}\n```\n\nRelay economics are SEPARATE from context economics — different trust model. Relays are transport (dumb pipes, §9.9). Context pricing is application-level (inside encrypted envelope, invisible to relays).\n\nNo protocol rule requires a free relay to exist: whether the community relay list carries one is Limn's list policy (`18-addressability-and-deployment.md` §18.5.1, `19-economic-governance.md` §19.14 invariant 8).\n\nRelay selection: TransportManager (ADR-012) already selects by reliability + latency. Economic governance adds cost as a third criterion. Market pressure: agents prefer cheaper relays, creating competition.\n\nPayment flow: Agent evaluates relay config (visible before connecting) -> selects compatible adapter -> authorizes per-action -> relay verifies + captures.\n\nAmount values in .well-known/scp are serialized as JSON integers in the smallest currency unit specified by currency. Decimal string representations are NOT valid — all amounts are integers. The currency field determines the interpretation scale.",
+      "description": "Implement relay economic config extension to .well-known/scp (§19.8, §18.3.3) and cost-aware relay selection in TransportManager.\n\n§19.8 Relay Economic Config extends .well-known/scp (§18.3.3):\n```json\n{\n  \"relay_config\": {\n    \"max_blob_size\": 262144,\n    \"rate_limit_publish\": 100,\n    \"economic\": {\n      \"currency\": \"USD\",\n      \"per_publish\": 10,\n      \"per_byte_stored\": 1,\n      \"payment_adapters\": [\"x402\", \"lightning\"],\n      \"payee\": \"<the relay operator's identifier, in the text form 03 §3.1 fixes>\"\n    }\n  }\n}\n```\n\nRelay economics are SEPARATE from context economics — different trust model. Relays are transport (dumb pipes, §9.9). Context pricing is application-level (inside encrypted envelope, invisible to relays).\n\nNo protocol rule requires a free relay to exist: whether the community relay list carries one is Limn's list policy (`18-addressability-and-deployment.md` §18.5.1, `19-economic-governance.md` §19.14 invariant 8).\n\nRelay selection: TransportManager (ADR-012) already selects by reliability + latency. Economic governance adds cost as a third criterion. Market pressure: agents prefer cheaper relays, creating competition.\n\nPayment flow: Agent evaluates relay config (visible before connecting) -> selects compatible adapter -> authorizes per-action -> relay verifies + captures.\n\nAmount values in .well-known/scp are serialized as JSON integers in the smallest currency unit specified by currency. Decimal string representations are NOT valid — all amounts are integers. The currency field determines the interpretation scale.",
       "acceptanceCriteria": [
         "RelayEconomicConfig struct defined with field: per_publish (Option<Amount>) — cost per publish action",
         "RelayEconomicConfig struct defined with field: per_byte_stored (Option<Amount>) — cost per byte stored",
@@ -14006,6 +14015,47 @@
         {
           "file": ".docs/adrs/phase-6.md",
           "section": "## ADR-067: Concurrent Commits and fork merge"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-363",
+      "title": "Page every reconnect catch-up path by the (stored_at, blob_id) cursor, the browser client included",
+      "gate": "gate-message-lifetime",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-ffi/common/src/reconnect.rs",
+        "crates/scp-transport/src/native/client.rs",
+        "crates/scp-transport/src/native/adapter.rs",
+        "crates/scp-client/src/client.rs"
+      ],
+      "description": "Spec 09 §9.10.2 'What a reconnecting device recovers' and spec 23 §23.3 state that a reconnecting device reads only one answer per routing ID and relay: a `QUERY` without a limit answers 100 blobs, a subscribe backfill answers 1,000, and nothing asks for the rest; the in-browser client subscribes without `since` and gets no backfill. With a 7-day blob TTL, a device offline for days can find more stored blobs than one answer holds. This story generalizes the (`stored_at`, `blob_id`) cursor of SCP-RELAYRES-009, which pages one routing ID's public records, to every catch-up path, so a reconnecting device reads every blob a relay still stores for its routing IDs.",
+      "acceptanceCriteria": [
+        "Native reconnect catch-up of a routing ID holding 2,500 stored blobs delivers all 2,500, each once, by repeated `QUERY` calls that advance the (`stored_at`, `blob_id`) cursor of SCP-RELAYRES-009",
+        "250 blobs that share one `stored_at` are all delivered at a page limit of 100",
+        "Catch-up stops when a page returns fewer blobs than its limit, and a relay error mid-way returns a typed error that names the routing ID",
+        "The in-browser client, after a reconnect with a persisted last `stored_at`, receives every blob stored on its routing IDs since then, 2,500 blobs included",
+        "Every routing ID the catch-up covers (shared, current and query-only, spec 09 §9.10.4.1) is paged"
+      ],
+      "actionItems": [
+        "Page `relay_catch_up` in `reconnect.rs` by the cursor",
+        "Give the in-browser client a persisted last `stored_at` and a paged catch-up",
+        "Add one test per criterion"
+      ],
+      "blockedBy": [
+        "SCP-RELAYRES-009"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.10.2 Minimal Outer Envelope"
+        },
+        {
+          "file": ".docs/specs/23-sync-and-offline-strategy.md",
+          "section": "## 23.3 Reconnection Protocol"
         }
       ],
       "details": {}

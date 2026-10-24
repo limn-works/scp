@@ -210,8 +210,9 @@ pub const KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS: u64 =
 /// still refuses a Commit: delays add up, and a refusal on the `not_after`
 /// side needs publication delay + relay hold + local processing latency +
 /// receiver clock lead to reach 7 days + 1 hour. Neither bound lives in this crate: `scp-runtime`
-/// const-asserts the first against its invitation TTL, and `scp-client`
-/// const-asserts the second against `scp_relay_client::MAX_BLOB_TTL`.
+/// const-asserts the first against its invitation TTL, and `scp-client` and
+/// `scp-runtime` const-assert the second against `scp_relay_client::MAX_BLOB_TTL`
+/// (`scp-runtime` also against the TTL a Commit requests).
 pub const KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS: u64 =
     7 * 24 * 60 * 60 + KEY_PACKAGE_LIFETIME_MARGIN_SECS;
 

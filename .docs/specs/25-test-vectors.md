@@ -1173,7 +1173,7 @@ Expected bytes (hex, 171 bytes, single continuous string):
 
 `scripts/` holds no generator for these bytes. The Python `msgpack` package produced both strings from the inputs above, and the same encoding run reproduces the Vector 36 bytes, which checks that it matches `rmp_serde::to_vec_named` on this field layout.
 
-**Classifier decisions.** The classifier takes the plaintext, the authenticated MLS sender, the context ID, the receiver's registry (`None` for a broadcast context), and the receiver's own routing IDs (its current routing ID, plus its previous routing ID while that routing ID is in its grace period). A registry record is written `(epoch, routing_id)`, with epoch `—` for a record a v1 announcement wrote. The decision is one of four: `NotAnnouncement`, `Accept` (carrying the member, the epoch or none, and the routing ID, which replace the member's record), `Unchanged` (an idempotent re-announcement; the registry stays as it is), or `Rejected` with a stable `reason`. The four §9.10.4 reasons of Vector 36 keep their strings, and the two ordering reasons below are new. Like Vector 36's strings, each `reason` string is part of this vector, so a change to one is wire-observable:
+**Classifier decisions.** The classifier takes the plaintext, the authenticated MLS sender, the context ID, the receiver's registry (`None` for a broadcast context), and the receiver's own routing IDs (its current routing ID, plus every routing ID on its query-only list, `09-security-model.md` §9.10.4.1). A registry record is written `(epoch, routing_id)`, with epoch `—` for a record a v1 announcement wrote. The decision is one of four: `NotAnnouncement`, `Accept` (carrying the member, the epoch or none, and the routing ID, which replace the member's record), `Unchanged` (an idempotent re-announcement; the registry stays as it is), or `Rejected` with a stable `reason`. The four §9.10.4 reasons of Vector 36 keep their strings, and the two ordering reasons below are new. Like Vector 36's strings, each `reason` string is part of this vector, so a change to one is wire-observable:
 
 | Case | `sender_did` | payload / registry / receiver's own routing IDs | Decision | `reason` |
 |------|--------------|--------------------------------------------------|----------|----------|
@@ -1190,7 +1190,7 @@ Expected bytes (hex, 171 bytes, single continuous string):
 | broadcast context | member | golden v2 / `None` / `{}` | `Rejected` | `pseudonym announcement received on broadcast context` |
 | cross-DID collision | member | golden v2 / `Some({other → (—, 0x43×32)})` / `{}` | `Rejected` | `pseudonym announcement collides with another member's routing ID` |
 | receiver's current routing ID | member | golden v2 / `Some({})` / `{current: 0x43×32}` | `Rejected` | `pseudonym announcement collides with another member's routing ID` |
-| receiver's in-grace previous routing ID | member | golden v2 / `Some({})` / `{current: 0x45×32, previous: 0x43×32}` | `Rejected` | `pseudonym announcement collides with another member's routing ID` |
+| receiver's query-only routing ID | member | golden v2 / `Some({})` / `{current: 0x45×32, query_only: [0x43×32]}` | `Rejected` | `pseudonym announcement collides with another member's routing ID` |
 | extra key | member | golden v2 map plus a fifth key / `Some({})` / `{}` | `NotAnnouncement` | — |
 | short `routing_id` | member | golden v2 with a 31-byte `routing_id` / `Some({})` / `{}` | `NotAnnouncement` | — |
 

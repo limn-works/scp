@@ -43,6 +43,26 @@ pub const MIN_BLOB_TTL: u32 = 1;
 /// Maximum blob TTL in seconds (7 days).
 pub const MAX_BLOB_TTL: u32 = 604_800;
 
+// A member requests the relay maximum for every MLS message it publishes other
+// than a heartbeat or a checkpoint, whose shorter TTLs a relay must also accept
+// (`09-security-model.md` §9.10.2 "Blob TTL by message type"). The values live
+// in `scp-protocol`, which cannot depend on this crate, so the relations are
+// pinned here: changing a constant alone fails the build.
+const _: () = assert!(
+    scp_protocol::envelope::outer::DEFAULT_APP_DATA_BLOB_TTL_SECS == MAX_BLOB_TTL,
+    "DEFAULT_APP_DATA_BLOB_TTL_SECS must equal MAX_BLOB_TTL (spec 09 §9.10.2)"
+);
+const _: () = assert!(
+    scp_protocol::envelope::outer::HEARTBEAT_BLOB_TTL_SECS >= MIN_BLOB_TTL
+        && scp_protocol::envelope::outer::HEARTBEAT_BLOB_TTL_SECS <= MAX_BLOB_TTL,
+    "HEARTBEAT_BLOB_TTL_SECS must lie in [MIN_BLOB_TTL, MAX_BLOB_TTL] (spec 09 §9.10.2)"
+);
+const _: () = assert!(
+    scp_protocol::envelope::outer::CHECKPOINT_BLOB_TTL_SECS >= MIN_BLOB_TTL
+        && scp_protocol::envelope::outer::CHECKPOINT_BLOB_TTL_SECS <= MAX_BLOB_TTL,
+    "CHECKPOINT_BLOB_TTL_SECS must lie in [MIN_BLOB_TTL, MAX_BLOB_TTL] (spec 09 §9.10.2)"
+);
+
 /// Maximum `ref_id` length in bytes.
 pub const MAX_REF_ID_LEN: usize = 64;
 
@@ -639,6 +659,24 @@ fn validate_blob(blob: &[u8]) -> Result<(), RelayProtocolError> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// A member's MLS-message TTL is the relay maximum
+    /// (`09-security-model.md` §9.10.2 "Blob TTL by message type"), and a
+    /// PUBLISH carrying it passes the decode-side TTL bound.
+    #[test]
+    fn app_data_blob_ttl_is_the_relay_maximum_and_decodes() {
+        let ttl = scp_protocol::envelope::outer::DEFAULT_APP_DATA_BLOB_TTL_SECS;
+        assert_eq!(ttl, MAX_BLOB_TTL);
+        let msg = ClientMessage::Publish {
+            ref_id: None,
+            routing_id: [0xAA; 32],
+            recipient_hint: None,
+            blob_ttl: ttl,
+            blob: vec![0x01],
+        };
+        let decoded = ClientMessage::from_bytes(&msg.to_bytes().unwrap()).unwrap();
+        assert_eq!(decoded, msg);
+    }
 
     // -----------------------------------------------------------------------
     // ClientMessage roundtrip tests

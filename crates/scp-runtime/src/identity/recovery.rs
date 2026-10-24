@@ -2238,7 +2238,12 @@ mod tests {
             async fn delete_published(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
                 Ok(())
             }
-            async fn send_message(&self, _: &[u8; 32], _: &[u8]) -> Result<(), ContextError> {
+            async fn send_message(
+                &self,
+                _: &[u8; 32],
+                _: &[u8],
+                _ttl: scp_protocol::envelope::outer::BlobTtl,
+            ) -> Result<(), ContextError> {
                 Ok(())
             }
         }
