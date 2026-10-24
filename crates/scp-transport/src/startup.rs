@@ -1750,10 +1750,19 @@ mod tests {
                     .unwrap_or_else(std::sync::PoisonError::into_inner),
             )
             .into_owned();
-            assert!(!logs.contains("push.example.net"), "{logs}");
-            assert!(logs.contains("pool marker"), "{logs}");
-            assert!(logs.contains("reqwest marker"), "{logs}");
-            assert!(logs.contains("own marker"), "{logs}");
+            assert!(
+                !logs.contains("push.example.net"),
+                "a capped DEBUG line naming the host was logged"
+            );
+            assert!(
+                logs.contains("pool marker"),
+                "the pool's INFO line was not logged"
+            );
+            assert!(
+                logs.contains("reqwest marker"),
+                "reqwest's INFO line was not logged"
+            );
+            assert!(logs.contains("own marker"), "the SCP line was not logged");
         }
         Ok(())
     }

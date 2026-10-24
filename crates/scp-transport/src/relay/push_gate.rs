@@ -1616,18 +1616,21 @@ mod tests {
             // The production rule: the test host names resolve to loopback,
             // which it refuses.
             let (service, server) = relay(dir.path(), false).await?;
-            for endpoint in [
+            for (i, endpoint) in [
                 server.endpoint("push.example.net", "/s/1"),
                 "https://10.0.0.1/s/1".to_owned(),
                 "https://[fd00::1]/s/1".to_owned(),
                 "https://unknown.example.net/s/1".to_owned(),
-            ] {
-                let (_, subscription) = subscribe(endpoint.clone())?;
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let (_, subscription) = subscribe(endpoint)?;
                 let token = subscription.encode();
                 let blob = signed(false, &token, GATE_NOW, false)?;
                 let (gate, stored) = present(&service, &blob, &token).await?;
-                assert!(is_4060(&gate), "{endpoint}: {gate:?}");
-                assert_eq!(stored, None, "{endpoint}");
+                assert!(is_4060(&gate), "endpoint #{i}: {gate:?}");
+                assert_eq!(stored, None, "endpoint #{i}");
             }
 
             let dir = tempfile::tempdir()?;
@@ -1655,7 +1658,10 @@ mod tests {
             let PushPublishGate::Rejected { msg, .. } = &gate else {
                 return Err(format!("forged message answered {gate:?}").into());
             };
-            assert!(!msg.contains("WebPush endpoint"), "{msg}");
+            assert!(
+                !msg.contains("WebPush endpoint"),
+                "the refusal names the endpoint check"
+            );
             assert_eq!(stored, None);
             Ok(())
         }

@@ -1043,8 +1043,12 @@ mod tests {
         ];
         let own = OwnAddresses::new([]);
         let nat64 = Nat64Prefixes::new([]);
-        for (text, want) in cases {
-            assert_eq!(check_address(ip(text)?, &own, &nat64), *want, "{text}");
+        for (i, (text, want)) in cases.iter().enumerate() {
+            assert_eq!(
+                check_address(ip(text)?, &own, &nat64),
+                *want,
+                "address #{i}"
+            );
         }
         Ok(())
     }
@@ -1101,28 +1105,28 @@ mod tests {
                 "2001:db8:122:344::cb00:7207",
             ),
         ];
-        for (prefix, len, loopback, public, own_v4) in cases {
+        for (i, (prefix, len, loopback, public, own_v4)) in cases.iter().enumerate() {
             let listed = Nat64Prefixes::new([Nat64Prefix::new(Ipv6Addr::from_str(prefix)?, *len)?]);
             assert_eq!(
                 check_address(ip(loopback)?, &own, &listed),
                 Err(AddressRefusal::NotGloballyReachable),
-                "/{len} {loopback}"
+                "prefix #{i}, loopback"
             );
             assert_eq!(
                 check_address(ip(own_v4)?, &own, &listed),
                 Err(AddressRefusal::OwnAddress),
-                "/{len} {own_v4}"
+                "prefix #{i}, own address"
             );
             assert_eq!(
                 check_address(ip(public)?, &own, &listed),
                 Ok(()),
-                "/{len} {public}"
+                "prefix #{i}, public"
             );
             // Unlisted, the documentation prefix is refused as such.
             assert_eq!(
                 check_address(ip(public)?, &own, &none),
                 Err(AddressRefusal::NotGloballyReachable),
-                "/{len} {public} unlisted"
+                "prefix #{i}, public, unlisted"
             );
         }
         // A listed prefix inside global unicast space makes a public-looking
@@ -1164,16 +1168,19 @@ mod tests {
     #[test]
     fn own_addresses_are_refused() -> TestResult {
         let own = OwnAddresses::new([ip("203.0.114.7")?, ip("2001:4860::7")?]);
-        for text in [
+        for (i, text) in [
             "203.0.114.7",
             "::ffff:203.0.114.7",
             "64:ff9b::cb00:7207",
             "2001:4860::7",
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             assert_eq!(
                 check_address(ip(text)?, &own, &Nat64Prefixes::new([])),
                 Err(AddressRefusal::OwnAddress),
-                "{text}"
+                "address #{i}"
             );
         }
         assert_eq!(
@@ -1232,11 +1239,11 @@ mod tests {
                 EndpointError::NotCanonical,
             ),
         ];
-        for (endpoint, want) in cases {
+        for (i, (endpoint, want)) in cases.iter().enumerate() {
             assert_eq!(
                 parse_endpoint(endpoint).map(|_| ()),
                 Err(*want),
-                "{endpoint}"
+                "endpoint #{i}"
             );
         }
     }
@@ -1402,7 +1409,7 @@ mod tests {
         let own = OwnAddresses::new([ip("203.0.114.7")?]);
         assert!(!format!("{own:?}").contains("203.0"));
         let shown = EndpointError::Refused(AddressRefusal::OwnAddress).to_string();
-        assert!(!shown.contains("203.0"), "{shown}");
+        assert!(!shown.contains("203.0"), "the error names the address");
         Ok(())
     }
 }

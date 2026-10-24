@@ -1245,7 +1245,7 @@ pub(crate) mod tests {
         // The production rule: loopback is refused.
         let sender = sender_for(&server, false, clock())?;
         let port = port_of(&server.endpoint("push.example.net", "/"))?;
-        for endpoint in [
+        for (i, endpoint) in [
             format!("https://127.0.0.1:{port}{PATH}"),
             format!("https://[::1]:{port}{PATH}"),
             format!("https://[::ffff:7f00:1]:{port}{PATH}"),
@@ -1255,12 +1255,15 @@ pub(crate) mod tests {
             "https://[fd12:3456::1]/x".to_owned(),
             // A name that resolves to loopback.
             server.endpoint("push.example.net", PATH),
-        ] {
-            let (_, subscription) = subscribe(endpoint.clone())?;
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (_, subscription) = subscribe(endpoint)?;
             assert_eq!(
                 sender.send(&subscription).await,
                 SendAttempt::Sent(PushSendOutcome::InvalidToken),
-                "{endpoint}"
+                "endpoint #{i}"
             );
         }
         assert!(server.requests().await.is_empty());
@@ -1347,12 +1350,15 @@ pub(crate) mod tests {
     async fn a_name_that_does_not_resolve_is_transient() -> TestResult {
         let server = TlsTestServer::start_routed(vec![("/", vec![Reply::empty(201); 2])]).await;
         let sender = sender_for(&server, false, clock())?;
-        for host in ["absent.example.net", "empty.example.net"] {
+        for (i, host) in ["absent.example.net", "empty.example.net"]
+            .into_iter()
+            .enumerate()
+        {
             let (_, subscription) = subscribe(format!("https://{host}{PATH}"))?;
             assert_eq!(
                 sender.send(&subscription).await,
                 SendAttempt::Sent(PushSendOutcome::Transient),
-                "{host}"
+                "host #{i}"
             );
         }
         assert!(server.requests().await.is_empty());
@@ -1466,10 +1472,16 @@ pub(crate) mod tests {
         let logs = capture.contents();
         assert!(
             logs.contains("log marker push.example.net"),
-            "a `log` record did not reach the capture: {logs}"
+            "a `log` record did not reach the capture"
         );
-        assert!(!logs.contains("starting new connection"), "{logs}");
-        assert!(logs.contains("reqwest info marker"), "{logs}");
+        assert!(
+            !logs.contains("starting new connection"),
+            "reqwest's DEBUG connection line was logged"
+        );
+        assert!(
+            logs.contains("reqwest info marker"),
+            "reqwest's INFO line was not logged"
+        );
     }
 
     /// G2: rustls's client handshake names the server at DEBUG through
@@ -1483,8 +1495,14 @@ pub(crate) mod tests {
         );
         log::info!(target: "rustls::client::hs", "rustls info marker");
         let logs = capture.contents();
-        assert!(!logs.contains("push.example.net"), "{logs}");
-        assert!(logs.contains("rustls info marker"), "{logs}");
+        assert!(
+            !logs.contains("push.example.net"),
+            "rustls's DEBUG line was logged"
+        );
+        assert!(
+            logs.contains("rustls info marker"),
+            "rustls's INFO line was not logged"
+        );
     }
 
     /// G2: a crate the cap names nowhere, such as one a later change adds,
@@ -1496,8 +1514,14 @@ pub(crate) mod tests {
         tracing::trace!(target: "some_new_crate", "trace push.example.net");
         tracing::info!(target: "some_new_crate::x", "new crate info marker");
         let logs = capture.contents();
-        assert!(!logs.contains("push.example.net"), "{logs}");
-        assert!(logs.contains("new crate info marker"), "{logs}");
+        assert!(
+            !logs.contains("push.example.net"),
+            "the unlisted crate's DEBUG or TRACE line was logged"
+        );
+        assert!(
+            logs.contains("new crate info marker"),
+            "the unlisted crate's INFO line was not logged"
+        );
     }
 
     /// G2: an SCP crate's DEBUG and TRACE lines are kept.
@@ -1507,8 +1531,14 @@ pub(crate) mod tests {
         tracing::debug!(target: "scp_node::relay", "scp debug marker");
         tracing::trace!(target: "scp_transport", "scp trace marker");
         let logs = capture.contents();
-        assert!(logs.contains("scp debug marker"), "{logs}");
-        assert!(logs.contains("scp trace marker"), "{logs}");
+        assert!(
+            logs.contains("scp debug marker"),
+            "the SCP DEBUG line was not logged"
+        );
+        assert!(
+            logs.contains("scp trace marker"),
+            "the SCP TRACE line was not logged"
+        );
     }
 
     /// B1: sends already in flight when their origin starts backing off,
@@ -1625,11 +1655,17 @@ pub(crate) mod tests {
             .lines()
             .filter(|line| line.contains("scp_transport::relay::push_webpush"))
             .count();
-        assert!(own >= 5, "log capture saw too little: {logs}");
-        assert!(logs.lines().any(|line| line.contains("400")), "{logs}");
-        for line in logs.lines() {
-            for host in ["push.example.net", "10.9.8.7", "127.0.0.1"] {
-                assert!(!line.contains(host), "{line}");
+        assert!(own >= 5, "log capture saw {own} push_webpush lines, not 5");
+        assert!(
+            logs.lines().any(|line| line.contains("400")),
+            "no log line names the 400 answer"
+        );
+        for (n, line) in logs.lines().enumerate() {
+            for (i, host) in ["push.example.net", "10.9.8.7", "127.0.0.1"]
+                .into_iter()
+                .enumerate()
+            {
+                assert!(!line.contains(host), "log line #{n} names host #{i}");
             }
         }
         let p256dh = subscription.p256dh().to_uncompressed();
@@ -1649,14 +1685,17 @@ pub(crate) mod tests {
             // segment is a constant.
             secrets.extend(jwt.split('.').skip(1).map(str::to_owned));
         }
-        for printed in [
-            format!("{:?}", config()?),
-            format!("{sender:?}"),
-            format!("{subscription:?}"),
-            logs,
+        for (kind, printed) in [
+            ("the config's Debug form", format!("{:?}", config()?)),
+            ("the sender's Debug form", format!("{sender:?}")),
+            ("the subscription's Debug form", format!("{subscription:?}")),
+            ("the captured logs", logs),
         ] {
-            for secret in &secrets {
-                assert!(!printed.contains(secret.as_str()), "{secret} in {printed}");
+            for (i, secret) in secrets.iter().enumerate() {
+                assert!(
+                    !printed.contains(secret.as_str()),
+                    "secret #{i} found in {kind}"
+                );
             }
         }
         Ok(())

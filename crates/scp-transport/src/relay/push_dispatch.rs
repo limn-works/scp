@@ -2116,7 +2116,7 @@ mod enabled {
             assert_eq!(
                 good_at,
                 Some(ORIGINS),
-                "a backing-off wake held a send: {seen:?}"
+                "a backing-off wake held a send: /ok was request #{good_at:?}"
             );
             Ok(())
         }

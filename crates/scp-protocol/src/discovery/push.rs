@@ -858,12 +858,11 @@ mod webpush_token_tests {
                 WebPushTokenError::EndpointHasFragment,
             ),
         ];
-        for (endpoint, want) in cases {
+        for (i, (endpoint, want)) in cases.into_iter().enumerate() {
             assert_eq!(
                 WebPushSubscription::decode(&token_with_endpoint(endpoint)?),
                 Err(want),
-                "{}",
-                String::from_utf8_lossy(endpoint)
+                "endpoint #{i}"
             );
         }
         // An `@` after the authority is a path byte, not userinfo.
@@ -926,11 +925,17 @@ mod webpush_token_tests {
     fn debug_prints_no_endpoint_and_no_auth() -> TestResult {
         let sub = vector_59()?;
         let shown = format!("{sub:?}");
-        assert!(!shown.contains("push.example.net"), "{shown}");
-        assert!(!shown.contains("LBhhw0"), "{shown}");
-        assert!(!shown.contains(VECTOR_59_AUTH), "{shown}");
-        assert!(!shown.contains("5, 48, 89"), "{shown}");
-        assert!(shown.contains("endpoint_len: 59"), "{shown}");
+        assert!(!shown.contains("push.example.net"), "Debug shows the host");
+        assert!(!shown.contains("LBhhw0"), "Debug shows the endpoint path");
+        assert!(
+            !shown.contains(VECTOR_59_AUTH),
+            "Debug shows the auth secret"
+        );
+        assert!(!shown.contains("5, 48, 89"), "Debug shows the auth bytes");
+        assert!(
+            shown.contains("endpoint_len: 59"),
+            "Debug omits the endpoint length"
+        );
         Ok(())
     }
 }
