@@ -26226,10 +26226,13 @@ mod tests {
         async fn restore_event_log(
             &self,
             _id: &[u8; 32],
-        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+        ) -> Result<
+            crate::context::builder::EventLogRestore,
+            scp_protocol::context::builder::ContextCreationError,
+        > {
             self.hydrations
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(())
+            Ok(crate::context::builder::EventLogRestore::Absent)
         }
         async fn append_event(
             &self,

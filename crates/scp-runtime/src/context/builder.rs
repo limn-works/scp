@@ -146,6 +146,24 @@ pub trait ContextTransportProvider: Send + Sync {
     }
 }
 
+/// What [`ContextEventLogProvider::restore_event_log`] found in storage.
+///
+/// Spec 17 §17.3 "Merkle event log entries": restore starts an empty log only
+/// when storage holds no log for the context. A failed load is never this
+/// value; it is an `Err` that fails the restore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventLogRestore {
+    /// Storage held a log for the context, and its `entries` entries were
+    /// replayed into memory.
+    Loaded {
+        /// Number of entries replayed.
+        entries: usize,
+    },
+    /// Storage holds no log for the context, or the provider keeps no
+    /// storage; the context starts with an empty log.
+    Absent,
+}
+
 /// Provides event log operations needed during context creation.
 ///
 /// Implementors initialise the Merkle event log and append events.
@@ -513,16 +531,21 @@ pub trait ContextEventLogProvider: Send + Sync {
     /// Called during [`crate::context::supervisor::Supervisor::restore_context`] to reload event log
     /// entries that were persisted before the process restarted.
     ///
-    /// The default implementation initializes an empty event log (no-op for
-    /// providers without persistence support).
+    /// Returns [`EventLogRestore::Absent`] only when storage holds no log for
+    /// the context. The default, for a provider that keeps no storage,
+    /// initialises an empty log and returns `Absent`.
     ///
     /// # Errors
     ///
-    /// Returns [`ContextCreationError`] if the persisted data is corrupt
-    /// (e.g., broken Merkle chain).
-    async fn restore_event_log(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        // Default: initialize empty event log (no persistence).
-        self.init_event_log(context_id).await
+    /// Returns [`ContextCreationError`] if loading the stored log fails or the
+    /// stored data is corrupt (e.g., broken Merkle chain). The in-memory log
+    /// and the stored log are unchanged on error.
+    async fn restore_event_log(
+        &self,
+        context_id: &[u8; 32],
+    ) -> Result<EventLogRestore, ContextCreationError> {
+        self.init_event_log(context_id).await?;
+        Ok(EventLogRestore::Absent)
     }
 
     /// Prunes event log entries before a checkpoint boundary based on a

@@ -9,7 +9,7 @@
 //! context/{context_id}/event_meta/root                -- 32-byte Merkle root
 //! context/{context_id}/event_tree/{level}/{index}     -- Merkle tree nodes
 //! context/{context_id}/event_data/{seq:020d}          -- MessagePack-serialized Event payload
-//! context/{context_id}/merkle_event_log/head          -- current generation (u64)
+//! context/{context_id}/merkle_event_log/head          -- current generation and log length
 //! context/{context_id}/merkle_event_log/g{gen:020d}/{base_seq:020d}
 //!                                                     -- one unit: Vec<Event>, MerkleEventLogProvider
 //! ```
@@ -24,8 +24,9 @@
 //! The `merkle_event_log/` key space stores the `MerkleEventLogProvider` log as
 //! units of `scp_event_log::Event` under the generation that
 //! `merkle_event_log/head` names (spec section 17.3, "Merkle event log
-//! entries"). An append puts one unit. A replace writes a new generation and
-//! then puts `head`, so every write needs only a single-key put to be atomic.
+//! entries"). An append puts one unit and then `head`. A replace writes a new
+//! generation and then puts `head`, so every write needs only a single-key put
+//! to be atomic.
 //!
 //! See spec sections 17.3, 17.4, and ADR-011.
 
@@ -110,12 +111,12 @@ fn merkle_event_log_prefix(context_id: &str) -> Result<String, StoreError> {
     Ok(format!("context/{ctx}/merkle_event_log/"))
 }
 
-/// Builds the key that names the current generation of a context's
-/// `MerkleEventLogProvider` log.
+/// Builds the key that names the current generation and length of a
+/// context's `MerkleEventLogProvider` log.
 ///
 /// Format: `context/{context_id}/merkle_event_log/head`
 /// See spec section 17.3, "Merkle event log entries".
-fn merkle_event_log_head_key(context_id: &str) -> Result<String, StoreError> {
+pub(super) fn merkle_event_log_head_key(context_id: &str) -> Result<String, StoreError> {
     let ctx = super::sanitize_key_component(context_id)?;
     Ok(format!("context/{ctx}/merkle_event_log/head"))
 }
@@ -152,6 +153,34 @@ fn merkle_event_log_unit_key(
 /// makes `ceil(n / 256)` unit puts plus the `head` put, and this bound caps
 /// the size of each stored value.
 const MERKLE_EVENT_LOG_REPLACE_UNIT_ENTRIES: usize = 256;
+
+/// The value of `merkle_event_log/head`: the generation that holds the live
+/// log and the log's total entry count (spec section 17.3, "Merkle event log
+/// entries"). Units at or beyond `len` are left from an append that crashed
+/// before its `head` put, and a load ignores them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct MerkleEventLogHead {
+    /// The generation whose units form the live log.
+    generation: u64,
+    /// The number of entries in the live log.
+    len: u64,
+}
+
+/// Converts an entry count to `u64`, the type of every stored sequence.
+fn entry_count(n: usize) -> Result<u64, StoreError> {
+    u64::try_from(n)
+        .map_err(|_| StoreError::SerializationFailed("event log length exceeds u64".to_owned()))
+}
+
+/// Parses a generation directory name `g{gen:020d}`, accepting only the
+/// canonical 20-digit form.
+fn parse_generation_dir(name: &str) -> Option<u64> {
+    let digits = name.strip_prefix('g')?;
+    digits
+        .parse()
+        .ok()
+        .filter(|generation: &u64| format!("{generation:020}") == digits)
+}
 
 // ---------------------------------------------------------------------------
 // EventQueryFilter — filter criteria for query_events (GitHub issue #303)
@@ -650,20 +679,22 @@ impl<S: Storage> ProtocolRepository<S> {
     /// Stores one unit of `MerkleEventLogProvider` entries: `entries[0]` has
     /// sequence `base_seq` and the rest follow it in order.
     ///
-    /// The unit goes under the generation that `merkle_event_log/head` names,
-    /// in one put, so storage holds either every entry of the unit or none of
-    /// them. When no `head` exists, the unit becomes a whole new log through
-    /// [`Self::replace_merkle_event_log_entries`], and `base_seq` must be 0
-    /// (spec section 17.3, "Merkle event log entries").
+    /// Puts the unit under the generation that `merkle_event_log/head` names,
+    /// then puts `head` with its length raised by the unit's entry count. A
+    /// failure between the two puts leaves a unit at the old length, which a
+    /// load ignores, so storage holds either every entry of the unit or none
+    /// of them. When no `head` exists, the unit becomes a whole new log
+    /// through [`Self::replace_merkle_event_log_entries`] (spec section 17.3,
+    /// "Merkle event log entries").
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::SerializationFailed`] if `entries` is empty or
-    /// serialization fails.
-    /// Returns [`StoreError::EventLogUnitMisaligned`] if no `head` exists and
-    /// `base_seq` is not 0.
+    /// Returns [`StoreError::SerializationFailed`] if `entries` is empty,
+    /// serialization fails, or the length would overflow.
+    /// Returns [`StoreError::EventLogUnitMisaligned`] if `base_seq` differs
+    /// from the stored log's length (0 when no `head` exists).
     /// Returns [`StoreError::Storage`] if a storage read or write fails.
-    pub async fn store_merkle_event_log_unit(
+    pub(crate) async fn store_merkle_event_log_unit(
         &self,
         context_id: &str,
         base_seq: u64,
@@ -675,7 +706,7 @@ impl<S: Storage> ProtocolRepository<S> {
             ));
         }
         let head_key = merkle_event_log_head_key(context_id)?;
-        let Some(generation) = self.load_value::<u64>(&head_key).await? else {
+        let Some(head) = self.load_value::<MerkleEventLogHead>(&head_key).await? else {
             if base_seq != 0 {
                 return Err(StoreError::EventLogUnitMisaligned {
                     base_seq,
@@ -686,19 +717,41 @@ impl<S: Storage> ProtocolRepository<S> {
                 .replace_merkle_event_log_entries(context_id, entries)
                 .await;
         };
-        let key = merkle_event_log_unit_key(context_id, generation, base_seq)?;
-        self.store_value(&key, &entries).await
+        if base_seq != head.len {
+            return Err(StoreError::EventLogUnitMisaligned {
+                base_seq,
+                expected: head.len,
+            });
+        }
+        let len = head
+            .len
+            .checked_add(entry_count(entries.len())?)
+            .ok_or_else(|| {
+                StoreError::SerializationFailed("event log length overflowed".to_owned())
+            })?;
+        let key = merkle_event_log_unit_key(context_id, head.generation, base_seq)?;
+        self.store_value(&key, &entries).await?;
+        // Commit point: from here on, a load includes the unit.
+        self.store_value(
+            &head_key,
+            &MerkleEventLogHead {
+                generation: head.generation,
+                len,
+            },
+        )
+        .await
     }
 
     /// Replaces a context's whole `MerkleEventLogProvider` log with `entries`.
     ///
-    /// Deletes any keys left under generation `head + 1` (generation 0 when no
+    /// Deletes any keys left under generation `gen + 1` (generation 0 when no
     /// `head` exists), writes `entries` as units under that generation, and
-    /// then puts `head`. The `head` put is the commit point: an error before
-    /// it leaves the old log loadable, and once it lands the new log is
-    /// loadable. Deleting the old generation afterwards is best-effort,
-    /// because [`Self::load_merkle_event_log_entries`] deletes every
-    /// generation that `head` does not name. Used by prune, import, and init.
+    /// then puts `head` naming that generation and `entries.len()`. The
+    /// `head` put is the commit point: an error before it leaves the old log
+    /// loadable, and once it lands the new log is loadable. Deleting the old
+    /// generation afterwards is best-effort, because
+    /// [`Self::load_merkle_event_log_entries`] deletes every generation below
+    /// `head`'s. Used by prune, import, and init.
     ///
     /// # Errors
     ///
@@ -706,13 +759,16 @@ impl<S: Storage> ProtocolRepository<S> {
     /// the generation number would overflow.
     /// Returns [`StoreError::Storage`] if a storage read or write before the
     /// commit point fails.
-    pub async fn replace_merkle_event_log_entries(
+    pub(crate) async fn replace_merkle_event_log_entries(
         &self,
         context_id: &str,
         entries: &[scp_event_log::Event],
     ) -> Result<(), StoreError> {
         let head_key = merkle_event_log_head_key(context_id)?;
-        let old_generation = self.load_value::<u64>(&head_key).await?;
+        let old_generation = self
+            .load_value::<MerkleEventLogHead>(&head_key)
+            .await?
+            .map(|head| head.generation);
         let generation = match old_generation {
             None => 0,
             Some(old) => old.checked_add(1).ok_or_else(|| {
@@ -729,16 +785,22 @@ impl<S: Storage> ProtocolRepository<S> {
         for unit in entries.chunks(MERKLE_EVENT_LOG_REPLACE_UNIT_ENTRIES) {
             let key = merkle_event_log_unit_key(context_id, generation, base_seq)?;
             self.store_value(&key, &unit).await?;
-            let unit_len = u64::try_from(unit.len()).map_err(|_| {
-                StoreError::SerializationFailed("event log unit length exceeds u64".to_owned())
-            })?;
-            base_seq = base_seq.checked_add(unit_len).ok_or_else(|| {
-                StoreError::SerializationFailed("event log sequence overflowed".to_owned())
-            })?;
+            base_seq = base_seq
+                .checked_add(entry_count(unit.len())?)
+                .ok_or_else(|| {
+                    StoreError::SerializationFailed("event log sequence overflowed".to_owned())
+                })?;
         }
 
         // Commit point: from here on, a load reads the new generation.
-        self.store_value(&head_key, &generation).await?;
+        self.store_value(
+            &head_key,
+            &MerkleEventLogHead {
+                generation,
+                len: base_seq,
+            },
+        )
+        .await?;
 
         if let Some(old) = old_generation {
             let old_prefix = merkle_event_log_generation_prefix(context_id, old)?;
@@ -757,15 +819,21 @@ impl<S: Storage> ProtocolRepository<S> {
     /// Loads a context's `MerkleEventLogProvider` log.
     ///
     /// Reads `merkle_event_log/head`, then the units under the generation it
-    /// names in key order. Returns `None` when no `head` exists. Deletes,
-    /// best-effort, every generation that `head` does not name, which a
-    /// replace or a destroy left behind.
+    /// names in key order, up to the length it records. Returns `None` when
+    /// no `head` exists, and then deletes nothing. Deletes, best-effort, every
+    /// generation below `head`'s, which a replace or a destroy left behind,
+    /// and every unit at or beyond the recorded length, which an append that
+    /// failed before its `head` put left behind. A generation above `head`'s
+    /// can be a replace still in flight, so load leaves it in place.
     ///
     /// # Errors
     ///
     /// Returns [`StoreError::EventLogUnitMisaligned`] if a unit's `base_seq`
     /// differs from the number of entries in the units before it (a gap or an
     /// overlap).
+    /// Returns [`StoreError::EventLogLengthMismatch`] if the units below the
+    /// recorded length do not hold exactly that many entries, for example
+    /// because a tail unit is missing.
     /// Returns [`StoreError::DeserializationFailed`] if a unit key does not
     /// parse, a unit is empty, or deserialization fails.
     /// Returns [`StoreError::Storage`] if a storage read fails.
@@ -773,46 +841,34 @@ impl<S: Storage> ProtocolRepository<S> {
         &self,
         context_id: &str,
     ) -> Result<Option<Vec<scp_event_log::Event>>, StoreError> {
-        let prefix = merkle_event_log_prefix(context_id)?;
         let head_key = merkle_event_log_head_key(context_id)?;
-        let head = self.load_value::<u64>(&head_key).await?;
-        let live_prefix = head
-            .map(|generation| merkle_event_log_generation_prefix(context_id, generation))
-            .transpose()?;
+        let Some(head) = self.load_value::<MerkleEventLogHead>(&head_key).await? else {
+            return Ok(None);
+        };
+        let prefix = merkle_event_log_prefix(context_id)?;
+        let live_prefix = merkle_event_log_generation_prefix(context_id, head.generation)?;
 
         let mut keys = self.storage.list_keys(&prefix).await?;
         keys.sort_unstable();
 
         let mut unit_keys = Vec::new();
-        let mut stale_prefixes = std::collections::BTreeSet::new();
-        let mut stale_keys = Vec::new();
+        let mut stale_generations = std::collections::BTreeSet::new();
         for key in keys {
-            if key == head_key {
-                continue;
-            }
-            if let Some(live) = live_prefix.as_deref()
-                && key.starts_with(live)
-            {
+            if key.starts_with(&live_prefix) {
                 unit_keys.push(key);
                 continue;
             }
             let rest = key.get(prefix.len()..).unwrap_or_default();
-            match rest.split_once('/') {
-                Some((generation_dir, _)) => {
-                    stale_prefixes.insert(format!("{prefix}{generation_dir}/"));
-                }
-                None => stale_keys.push(key),
+            if let Some((dir, _)) = rest.split_once('/')
+                && parse_generation_dir(dir).is_some_and(|generation| generation < head.generation)
+            {
+                stale_generations.insert(format!("{prefix}{dir}/"));
             }
         }
-        self.delete_stale_event_log_keys(context_id, &stale_prefixes, &stale_keys)
-            .await;
-
-        let Some(live_prefix) = live_prefix else {
-            return Ok(None);
-        };
 
         let mut entries: Vec<scp_event_log::Event> = Vec::new();
-        for key in &unit_keys {
+        let mut orphans = Vec::new();
+        for key in unit_keys {
             let suffix = key.get(live_prefix.len()..).unwrap_or_default();
             let base_seq: u64 = suffix
                 .parse()
@@ -823,17 +879,20 @@ impl<S: Storage> ProtocolRepository<S> {
                         "event log unit key does not end in a 20-digit sequence: {key}"
                     ))
                 })?;
-            let expected = u64::try_from(entries.len()).map_err(|_| {
-                StoreError::DeserializationFailed("event log length exceeds u64".to_owned())
-            })?;
+            if base_seq >= head.len {
+                orphans.push(key);
+                continue;
+            }
+            let expected = entry_count(entries.len())?;
             if base_seq != expected {
                 return Err(StoreError::EventLogUnitMisaligned { base_seq, expected });
             }
-            let unit: Vec<scp_event_log::Event> = self.load_value(key).await?.ok_or_else(|| {
-                StoreError::DeserializationFailed(format!(
-                    "event log unit missing after list_keys: {key}"
-                ))
-            })?;
+            let unit: Vec<scp_event_log::Event> =
+                self.load_value(&key).await?.ok_or_else(|| {
+                    StoreError::DeserializationFailed(format!(
+                        "event log unit missing after list_keys: {key}"
+                    ))
+                })?;
             if unit.is_empty() {
                 return Err(StoreError::DeserializationFailed(format!(
                     "event log unit holds no entries: {key}"
@@ -841,15 +900,25 @@ impl<S: Storage> ProtocolRepository<S> {
             }
             entries.extend(unit);
         }
+        let loaded = entry_count(entries.len())?;
+        if loaded != head.len {
+            return Err(StoreError::EventLogLengthMismatch {
+                head_len: head.len,
+                loaded,
+            });
+        }
+        self.delete_stale_event_log_keys(context_id, &stale_generations, &orphans)
+            .await;
         Ok(Some(entries))
     }
 
     /// Deletes a context's `MerkleEventLogProvider` log.
     ///
     /// Deletes `merkle_event_log/head` first, which removes the log, and then
-    /// deletes every generation best-effort. The next
-    /// [`Self::load_merkle_event_log_entries`] deletes a generation this call
-    /// left behind, and the next replace into that generation resets it.
+    /// deletes every generation best-effort. A generation this call left
+    /// behind never joins a later log: the next replace deletes the
+    /// generation it writes before writing it, and a load deletes the
+    /// generations below `head`'s.
     ///
     /// # Errors
     ///
@@ -865,20 +934,21 @@ impl<S: Storage> ProtocolRepository<S> {
             tracing::warn!(
                 context_id,
                 error = %e,
-                "deleting the destroyed event log's generations failed; the next load deletes them"
+                "deleting the destroyed event log's generations failed; a later replace or load deletes them"
             );
         }
         Ok(())
     }
 
-    /// Deletes, best-effort, the event log keys that `head` does not name.
+    /// Deletes, best-effort, the generations below `head`'s and the units
+    /// beyond `head`'s length.
     async fn delete_stale_event_log_keys(
         &self,
         context_id: &str,
-        stale_prefixes: &std::collections::BTreeSet<String>,
-        stale_keys: &[String],
+        stale_generations: &std::collections::BTreeSet<String>,
+        orphan_units: &[String],
     ) {
-        for stale in stale_prefixes {
+        for stale in stale_generations {
             if let Err(e) = self.storage.delete_prefix(stale).await {
                 tracing::warn!(
                     context_id,
@@ -888,13 +958,13 @@ impl<S: Storage> ProtocolRepository<S> {
                 );
             }
         }
-        for stale in stale_keys {
-            if let Err(e) = self.storage.delete(stale).await {
+        for orphan in orphan_units {
+            if let Err(e) = self.storage.delete(orphan).await {
                 tracing::warn!(
                     context_id,
-                    key = %stale,
+                    key = %orphan,
                     error = %e,
-                    "deleting a stale event log key failed; the next load retries"
+                    "deleting an event log unit beyond the head's length failed; the next load retries"
                 );
             }
         }
@@ -1466,10 +1536,13 @@ mod tests {
         assert_eq!(log_bytes(&loaded), log_bytes(&entries));
         assert_eq!(
             store
-                .load_value::<u64>("context/ctx-1/merkle_event_log/head")
+                .load_value::<MerkleEventLogHead>("context/ctx-1/merkle_event_log/head")
                 .await
                 .unwrap(),
-            Some(0)
+            Some(MerkleEventLogHead {
+                generation: 0,
+                len: 1
+            })
         );
     }
 
@@ -1619,7 +1692,8 @@ mod tests {
     }
 
     /// A destroy whose generation delete fails still removes the log, because
-    /// it deletes `head` first; the next load deletes the leftover units.
+    /// it deletes `head` first; the next replace into that generation does
+    /// not pick up the leftover units.
     #[tokio::test]
     async fn delete_with_failed_generation_delete_still_removes_the_log() {
         let (store, faulty) = make_faulty_store();
@@ -1632,13 +1706,6 @@ mod tests {
             .delete_merkle_event_log_entries("ctx-del")
             .await
             .unwrap();
-        assert!(
-            store
-                .load_merkle_event_log_entries("ctx-del")
-                .await
-                .unwrap()
-                .is_none()
-        );
         faulty.clear_fail();
         assert!(
             store
@@ -1647,15 +1714,17 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert!(
-            store
-                .storage
-                .list_keys("context/ctx-del/merkle_event_log/")
-                .await
-                .unwrap()
-                .is_empty(),
-            "the load after a failed generation delete removes the leftover units"
-        );
+        let new = merkle_events(0, 1);
+        store
+            .replace_merkle_event_log_entries("ctx-del", &new)
+            .await
+            .unwrap();
+        let loaded = store
+            .load_merkle_event_log_entries("ctx-del")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(log_bytes(&loaded), log_bytes(&new));
     }
 
     /// A replace whose put fails at any point leaves exactly the old log or
@@ -1793,17 +1862,37 @@ mod tests {
         );
     }
 
+    /// Writes `head` and the given `(generation, base_seq, n)` units
+    /// directly, bypassing the write methods, to model a stored log those
+    /// methods cannot produce.
+    async fn write_raw_log(
+        store: &ProtocolRepository<InMemoryStorage>,
+        head: MerkleEventLogHead,
+        units: &[(u64, u64, u64)],
+    ) {
+        store
+            .store_value("context/ctx-1/merkle_event_log/head", &head)
+            .await
+            .unwrap();
+        for &(generation, base_seq, n) in units {
+            store
+                .store_value(
+                    &merkle_event_log_unit_key("ctx-1", generation, base_seq).unwrap(),
+                    &merkle_events(base_seq, n),
+                )
+                .await
+                .unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn gap_between_units_is_a_typed_error() {
         let store = make_store();
-        store
-            .replace_merkle_event_log_entries("ctx-1", &merkle_events(0, 2))
-            .await
-            .unwrap();
-        store
-            .store_merkle_event_log_unit("ctx-1", 5, &merkle_events(5, 1))
-            .await
-            .unwrap();
+        let head = MerkleEventLogHead {
+            generation: 0,
+            len: 6,
+        };
+        write_raw_log(&store, head, &[(0, 0, 2), (0, 5, 1)]).await;
         let err = store
             .load_merkle_event_log_entries("ctx-1")
             .await
@@ -1823,14 +1912,11 @@ mod tests {
     #[tokio::test]
     async fn overlap_between_units_is_a_typed_error() {
         let store = make_store();
-        store
-            .replace_merkle_event_log_entries("ctx-1", &merkle_events(0, 3))
-            .await
-            .unwrap();
-        store
-            .store_merkle_event_log_unit("ctx-1", 1, &merkle_events(1, 1))
-            .await
-            .unwrap();
+        let head = MerkleEventLogHead {
+            generation: 0,
+            len: 4,
+        };
+        write_raw_log(&store, head, &[(0, 0, 3), (0, 1, 1)]).await;
         let err = store
             .load_merkle_event_log_entries("ctx-1")
             .await
@@ -1845,6 +1931,175 @@ mod tests {
             ),
             "got {err:?}"
         );
+    }
+
+    /// A unit whose `base_seq` is not the stored log's length is refused
+    /// before anything is written.
+    #[tokio::test]
+    async fn unit_must_start_at_the_head_length() {
+        let store = make_store();
+        let base = merkle_events(0, 3);
+        store
+            .replace_merkle_event_log_entries("ctx-1", &base)
+            .await
+            .unwrap();
+        for base_seq in [1, 5] {
+            let err = store
+                .store_merkle_event_log_unit("ctx-1", base_seq, &merkle_events(base_seq, 1))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    StoreError::EventLogUnitMisaligned { base_seq: b, expected: 3 } if b == base_seq
+                ),
+                "base_seq {base_seq}: got {err:?}"
+            );
+        }
+        let loaded = store
+            .load_merkle_event_log_entries("ctx-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(log_bytes(&loaded), log_bytes(&base));
+        assert!(
+            store
+                .storage
+                .list_keys("context/ctx-1/merkle_event_log/g00000000000000000000/")
+                .await
+                .unwrap()
+                .iter()
+                .all(|key| key.ends_with("/00000000000000000000")),
+            "a refused unit writes no key"
+        );
+    }
+
+    /// A log whose last unit is gone loads as a typed error, never as the
+    /// shorter log.
+    #[tokio::test]
+    async fn missing_tail_unit_is_a_length_mismatch() {
+        let store = make_store();
+        let entries = merkle_events(
+            0,
+            u64::try_from(MERKLE_EVENT_LOG_REPLACE_UNIT_ENTRIES + 4).unwrap(),
+        );
+        store
+            .replace_merkle_event_log_entries("ctx-1", &entries)
+            .await
+            .unwrap();
+        store
+            .storage
+            .delete(&merkle_event_log_unit_key("ctx-1", 0, 256).unwrap())
+            .await
+            .unwrap();
+        let err = store
+            .load_merkle_event_log_entries("ctx-1")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::EventLogLengthMismatch {
+                    head_len: 260,
+                    loaded: 256
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    /// A unit at or beyond the head's length, which an append that failed
+    /// before its `head` put leaves, is ignored and deleted.
+    #[tokio::test]
+    async fn unit_beyond_the_head_length_is_ignored_and_deleted() {
+        let store = make_store();
+        let base = merkle_events(0, 2);
+        store
+            .replace_merkle_event_log_entries("ctx-1", &base)
+            .await
+            .unwrap();
+        let orphan = merkle_event_log_unit_key("ctx-1", 0, 2).unwrap();
+        store
+            .store_value(&orphan, &merkle_events(2, 1))
+            .await
+            .unwrap();
+        let loaded = store
+            .load_merkle_event_log_entries("ctx-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(log_bytes(&loaded), log_bytes(&base));
+        assert!(
+            !store.storage.exists(&orphan).await.unwrap(),
+            "the load deletes the unit beyond the head's length"
+        );
+    }
+
+    /// Load deletes a generation below the head's and leaves one above it,
+    /// which can be a replace still in flight.
+    #[tokio::test]
+    async fn load_deletes_only_generations_below_the_head() {
+        let store = make_store();
+        let head = MerkleEventLogHead {
+            generation: 5,
+            len: 1,
+        };
+        write_raw_log(&store, head, &[(4, 0, 2), (5, 0, 1), (6, 0, 3)]).await;
+        let loaded = store
+            .load_merkle_event_log_entries("ctx-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(log_bytes(&loaded), log_bytes(&merkle_events(0, 1)));
+        assert!(
+            !store
+                .storage
+                .exists(&merkle_event_log_unit_key("ctx-1", 4, 0).unwrap())
+                .await
+                .unwrap(),
+            "a generation below the head's is deleted"
+        );
+        assert!(
+            store
+                .storage
+                .exists(&merkle_event_log_unit_key("ctx-1", 6, 0).unwrap())
+                .await
+                .unwrap(),
+            "a generation above the head's stays in place"
+        );
+    }
+
+    /// On `FilesystemStorage`, a temp file that a crashed put left under the
+    /// live generation is not a unit: the log loads, and the temp file is not
+    /// read as a misaligned or undecodable unit.
+    #[tokio::test]
+    async fn log_loads_with_a_leftover_temp_file_in_its_generation() {
+        let dir = std::env::temp_dir().join(format!(
+            "scp-event-log-tmp-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = ProtocolRepository::new_for_testing(
+            scp_platform::filesystem::FilesystemStorage::new(&dir).unwrap(),
+        );
+        let entries = merkle_events(0, 2);
+        store
+            .replace_merkle_event_log_entries("ctx-1", &entries)
+            .await
+            .unwrap();
+        let generation_dir = dir
+            .join("context")
+            .join("ctx-1")
+            .join("merkle_event_log")
+            .join("g00000000000000000000");
+        std::fs::write(generation_dir.join(".tmp.1.2.3"), b"half-written").unwrap();
+
+        let loaded = store.load_merkle_event_log_entries("ctx-1").await;
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(log_bytes(&loaded.unwrap().unwrap()), log_bytes(&entries));
     }
 
     /// A unit key that does not end in a canonical 20-digit sequence is a

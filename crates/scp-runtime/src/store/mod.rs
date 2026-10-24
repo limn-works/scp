@@ -94,6 +94,19 @@ pub enum StoreError {
         expected: u64,
     },
 
+    /// The units of a stored Merkle event log hold a different number of
+    /// entries than its `head` records, for example because a tail unit is
+    /// missing (spec section 17.3, "Merkle event log entries").
+    #[error(
+        "event log length mismatch: head records {head_len} entries, but its units hold {loaded}"
+    )]
+    EventLogLengthMismatch {
+        /// The length `head` records.
+        head_len: u64,
+        /// The number of entries the units below that length hold.
+        loaded: u64,
+    },
+
     /// The stored value was written by a newer SCP version and cannot be read.
     #[error("incompatible version: stored={stored}, current={current}")]
     IncompatibleVersion {

@@ -1603,6 +1603,36 @@ fn welcome_import_and_restore_run_the_committed_t0_binding_check() {
     );
 }
 
+// Spec 17 §17.3 "Merkle event log entries": `restore_context` returns the
+// event-log restore's error; a failed load never continues over an empty log.
+#[test]
+fn restore_context_propagates_the_event_log_restore() {
+    let restore = compact_body(LIFECYCLE_HELPERS_SRC, "restore_context");
+    assert!(
+        restore.contains("restore_event_log_fail_closed(deps,&restored_crypto,context_id).await?;"),
+        "restore_context must `?`-propagate restore_event_log_fail_closed"
+    );
+    let helper = compact_body(LIFECYCLE_HELPERS_SRC, "restore_event_log_fail_closed");
+    let call = helper
+        .find(".restore_event_log(")
+        .expect("restore_event_log_fail_closed must call the provider's restore_event_log");
+    let tail = &helper[call..];
+    let end = tail
+        .find(';')
+        .expect("the restore_event_log call ends in a statement");
+    let statement = &tail[..end];
+    assert!(
+        statement.ends_with(")?"),
+        "the provider's restore_event_log result must be `?`-propagated, got {statement}"
+    );
+    for swallow in [".ok()", "unwrap_or", "let_=", "ifletErr("] {
+        assert!(
+            !helper.contains(swallow),
+            "restore_event_log_fail_closed must not swallow the restore error ({swallow})"
+        );
+    }
+}
+
 // Supervisor level: import is actor-native. The replaceability gate (NEVER
 // overwrite a live context) + the §23.17 epoch-floor capture/teardown/merge
 // run INSIDE the existing actor via `dispatch_prepare_for_replace`
