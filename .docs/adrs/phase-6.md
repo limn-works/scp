@@ -1754,7 +1754,7 @@ The alternative approaches (vector clocks, CRDTs, consensus protocols) all add c
 ### Dependencies
 
 - **ADR-001 (MLS):** MLS epoch processing, Commit handling, Welcome message processing, Update proposal generation. The epoch catch-up and group reset protocols are built directly on MLS group operations.
-- **ADR-004 (Native Relay):** Relay `SUBSCRIBE` with `since` parameter for backfill. Relay blob TTL determines the maximum Tier 1 offline duration. Connection recovery with exponential backoff (1s to 30s cap).
+- **ADR-004 (Native Relay):** Relay `SUBSCRIBE` with `since` parameter for backfill. The blob TTL a publisher requests, at most `MAX_BLOB_TTL`, determines the maximum Tier 1 offline duration. Connection recovery with exponential backoff (1s to 30s cap).
 - **ADR-007 (Sender Keys):** Sender key re-acquisition via pull-based protocol after missed `SenderKeyEpochAdvance` events.
 - **ADR-008 (Context Lifecycle):** Context state machine determines valid operations during catch-up. Context closure/expiry events discovered during reconnection trigger local cleanup.
 - **ADR-011 (Event Log):** Merkle tree consistency checkpoints for state reconciliation. Inclusion proofs for verifying recovered events. Event log as authoritative ordering for conflict resolution.
@@ -3736,6 +3736,8 @@ The access key is destroyed on Full revocation and not archived. Re-wrapping his
 
 **Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, removed the record whose expiry fixed this republish interval, so the interval is no longer a protocol constant, and the identity layer republishes its key-event log and its service record to relays instead (`03-identity.md` §3.10.5).
 
+**Amended 2026-10-24.** The relay blob TTL is no longer operator configuration. Asked whether the relay operator setting `SCP_RELAY_MAX_BLOB_TTL` should go away, Alec ruled "Remove we will add and design quotas later". Every relay enforces the protocol constant `MAX_BLOB_TTL` (604,800 s, `09-security-model.md` §9.18.11) as its ceiling. Every MLS message a member publishes to a context requests `MAX_BLOB_TTL` except a heartbeat, a consistency checkpoint and a broadcast post that sets a lower value (`09-security-model.md` §9.10.2), so a relay whose operator set a lower ceiling refused nearly all of them. This amendment removes the Tier 2 row "Relay blob TTL". The Context sentence that calls the relay blob TTL the relay operator's business, the Migration bullet "Relay TTL" and the rejected alternative's "operator-tuned relay TTLs" no longer hold. The protocol defines no storage quota yet (`10-infrastructure-and-self-hosting.md` §10.4).
+
 ### Context
 
 The Protocol Constants Registry (§9.18) promoted many implementation defaults to protocol-level constants. Constants like `MAX_SEQUENTIAL_COMMITS`, `RECONNECTION_TIMEOUT`, `SENDER_KEY_TIMEOUT`, `RECONNECTION_DEDUP_WINDOW`, and the nesting depth ceiling have no security or correctness basis for their specific values. The session cap default of 5 was a placeholder. The relay blob TTL is the relay operator's business. Several timeouts are hardware-dependent.
@@ -3762,7 +3764,6 @@ Reclassify protocol constants into three tiers:
 | Nesting depth | Unbounded (no limit) | [1, u32 max] | Context-configurable via `ContextParams::max_nesting_depth`. `None` = unbounded. Costs are borne by participants, not the protocol. |
 | Chain depth | 8 | [1, 255] (u8) | Context-configurable via `ContextParams::max_chain_depth`. No protocol hard max — `PROTOCOL_HARD_MAX_CHAIN_DEPTH` removed. Provenance degrades with depth, but that is an information-quality signal (provenance tiers handle this), not a protocol integrity concern. Default raised from 3 to 8 (3 was unnecessarily conservative). |
 | Session cap per caller | 1000 | [1, u32 max] | Context-configurable via `ContextParams::session_cap`. Sessions are lightweight. `u32` (not `usize`) for cross-platform serialization (usize is 32-bit on WASM, UniFFI does not support it). Default raised from 5 to 1000. |
-| Relay blob TTL | 604800s (operator config) | [1, infinity] | Relay operator's business. No protocol floor on TTL itself. |
 | Relay republish interval | Derived: `max(ttl - 86400, ttl / 2, 60)` | Derived | At 7-day TTL: 518400s (current value). At 1-hour TTL: 1800s. Floor of 60s prevents spin loop at very small TTLs. |
 
 **Tier 3 — Implementation Recommendations** (removed from spec normative language, SDK defaults):

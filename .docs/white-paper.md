@@ -786,7 +786,6 @@ Constants are organized into three tiers per ADR-043.
 | Nesting depth | Unbounded | [1, u32 max] | Context hierarchy depth. No protocol ceiling. |
 | Chain depth limit | 8 | [1, 255] (u8) | Cross-context data flow hops. No protocol hard max. |
 | Session cap per caller | 1000 | [1, u32 max] | Outlet session resource bound per context. |
-| Relay blob TTL | 604800 seconds (7 days) | [1, ∞] | Relay operator configuration. |
 | Relay republish interval | Derived: max(TTL - 86400, TTL / 2, 60) | Derived | Key-event-log and service-record re-publication. |
 
 ### Tier 3: Implementation Recommendations (SDK defaults, not protocol constants)
