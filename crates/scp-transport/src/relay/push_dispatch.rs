@@ -40,8 +40,8 @@
 //! The intake and every platform queue hold at most `PUSH_QUEUE_CAPACITY`
 //! entries. A wake that does not fit is dropped, and the publish still
 //! succeeds (PUSH-008 AC2): a wake is advisory, and a device whose wake was
-//! dropped pulls on its next wake or connection (§10.7, as the PUSH-009 rate
-//! limit also relies on). The intake holds each routing ID at most once, and
+//! dropped pulls on its next wake or connection (§10.7).
+//! The intake holds each routing ID at most once, and
 //! a platform queue holds each token at most once. One routing ID holds at
 //! most `MAX_WAKES_PER_PUBLISH` jobs queued or in flight at a time, so the
 //! wakes for one routing ID, however many tokens are registered on it, leave
