@@ -512,7 +512,6 @@ Relay economics are SEPARATE from context economics — different trust model. R
 {
   "relay_config": {
     "max_blob_size": 262144,
-    "max_blob_ttl": 604800,
     "rate_limit_publish": 6000,
     "economic": {
       "currency": "USD",
