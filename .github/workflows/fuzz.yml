@@ -127,6 +127,10 @@ jobs:
             dict: msgpack_push_message.dict
             max_len: 524288
             time: 900
+          - target: fuzz_webpush_token
+            dict: webpush_token.dict
+            max_len: 4096
+            time: 900
           - target: fuzz_sender_key_dist
             dict: msgpack_sender_key.dict
             max_len: 65536

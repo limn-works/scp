@@ -3,10 +3,12 @@
 //! A relay wakes a registered device by sending the §10.7.1 step 5 wake-signal
 //! request for the registration's platform. [`PushSender`] is the one type the
 //! relay holds per configured platform; its arms are the production senders
-//! [`ApnsSender`] (PUSH-010) and [`FcmSender`] (PUSH-011). Every send returns a
-//! [`PushSendOutcome`], which the dispatcher of PUSH-008
-//! ([`push_dispatch`](super::push_dispatch)) reads to keep or remove a
-//! registration.
+//! [`ApnsSender`] (PUSH-010), [`FcmSender`] (PUSH-011) and [`WebPushSender`]
+//! (PUSH-022). Every send returns a [`SendAttempt`]: the
+//! [`PushSendOutcome`] of a send that went out, which the dispatcher of
+//! PUSH-008 ([`push_dispatch`](super::push_dispatch)) reads to keep or remove
+//! a registration, or the [`SendDeferral`] of a `WebPush` send that did not
+//! start, which the dispatcher holds and retries without counting it.
 //!
 //! No shipped arm of [`PushSender`] accepts a send without performing it. The
 //! `Recording` arm reports scripted outcomes for sends that never happened, so
@@ -14,30 +16,58 @@
 //! `testing`; `scripts/check-shipped-feature-graph.sh` keeps `testing` out of
 //! every shipped build.
 //!
-//! Secrets: the APNs signing key, the FCM service-account key, the provider JWT
-//! and the OAuth access token live in zeroizing buffers, and no `Debug`
-//! implementation in this module or its senders prints them or a device token.
-//! No log line carries any of them: a send logs only the platform, the HTTP
-//! status and the platform's reason code.
+//! Secrets: the APNs signing key, the FCM service-account key, the VAPID key,
+//! the provider and VAPID JWTs and the OAuth access token live in zeroizing
+//! buffers, and no `Debug` implementation in this module or its senders prints
+//! them, a device token, or a `WebPush` endpoint, `p256dh` or `auth`. No log
+//! line carries any of them: a send logs only the platform, the HTTP status,
+//! the platform's reason code, and a typed error that carries none of them.
 
 use std::fmt;
 use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
-use scp_protocol::discovery::push::PushPlatform;
+use scp_protocol::discovery::push::{PushPlatform, WebPushSubscription};
 use zeroize::Zeroizing;
 
 pub use super::push_apns::{
     ApnsConfig, ApnsEnvironment, ApnsKeyError, ApnsSender, apns_key_from_p8,
 };
 pub use super::push_fcm::{FcmConfig, FcmCredentialError, FcmSender, FcmServiceAccount};
+pub use super::push_webpush::{VapidSubject, WebPushConfig, WebPushSender};
+
+/// Why a `WebPush` send did not start.
+///
+/// Neither reason says anything about the registration's endpoint, so the
+/// dispatcher counts neither toward removal or back-off: it holds the wake
+/// and sends it once the reason ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendDeferral {
+    /// The endpoint's origin is backing off until this instant.
+    BackingOff(tokio::time::Instant),
+    /// Every permit of the relay's own endpoint lookup pool was taken, so the
+    /// send could not resolve the endpoint's host
+    /// ([`EndpointError::LookupPoolFull`](super::push_endpoint::EndpointError::LookupPoolFull)).
+    LookupPoolFull,
+}
+
+/// What one call to [`PushSender::send_registered`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendAttempt {
+    /// The send ran, with this outcome.
+    Sent(PushSendOutcome),
+    /// The send did not start, for this reason; nothing was sent and the
+    /// outcome of the wake is still to come.
+    Deferred(SendDeferral),
+}
 
 /// The result of one wake-signal send.
 ///
-/// The PUSH-008 dispatcher counts only [`InvalidToken`](Self::InvalidToken)
-/// toward the §10.7.1 three-failure removal rule, resets the count on
-/// [`Delivered`](Self::Delivered), and leaves it unchanged on the other two.
+/// The PUSH-008 dispatcher counts [`InvalidToken`](Self::InvalidToken) and
+/// [`Unreachable`](Self::Unreachable) toward the §10.7.1 three-failure removal
+/// rule, resets the count on [`Delivered`](Self::Delivered), and leaves it
+/// unchanged on the other two.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PushSendOutcome {
     /// The push service accepted the wake signal for delivery.
@@ -45,8 +75,15 @@ pub enum PushSendOutcome {
     /// The push service reports that the device token is not valid for this
     /// sender: unregistered, malformed, or issued for another app or project.
     InvalidToken,
-    /// The push service is unavailable, throttling, or unreachable; a later
-    /// send may succeed.
+    /// A `WebPush` push service gave no answer before the request deadline,
+    /// or refused or reset the connection before it answered. Spec 10
+    /// §10.7.1 **Unreachable `WebPush` push service** counts it as a delivery
+    /// failure, so the dispatcher counts it toward removal exactly as it
+    /// counts [`InvalidToken`](Self::InvalidToken). APNs and FCM never
+    /// return it.
+    Unreachable,
+    /// The push service is unavailable or throttling, or its name did not
+    /// resolve; a later send may succeed.
     Transient,
     /// The relay's own push credentials or configuration are rejected; no send
     /// succeeds until the operator fixes them. The registration is kept.
@@ -94,6 +131,8 @@ pub enum PushSender {
     Apns(ApnsSender),
     /// Sends the FCM row of the §10.7.1 step 5 table.
     Fcm(FcmSender),
+    /// Sends the `WebPush` row of the §10.7.1 step 5 table.
+    WebPush(WebPushSender),
     /// Records each token and returns scripted outcomes without sending
     /// anything. A nullifier, so it compiles only under `testing`.
     #[cfg(feature = "testing")]
@@ -107,6 +146,7 @@ impl PushSender {
         match self {
             Self::Apns(_) => PushPlatform::Apns,
             Self::Fcm(_) => PushPlatform::Fcm,
+            Self::WebPush(_) => PushPlatform::WebPush,
             #[cfg(feature = "testing")]
             Self::Recording(sender) => sender.platform,
         }
@@ -115,7 +155,9 @@ impl PushSender {
     /// Sends one wake signal to a token as a registration carries it, the
     /// raw `token` bytes of `PushRegistration` (§22.11.4), and reports the
     /// outcome. Never fails: every network, credential, and response
-    /// condition maps to a [`PushSendOutcome`].
+    /// condition maps to a [`PushSendOutcome`], except the two conditions of
+    /// the relay's own state under which a `WebPush` send does not start,
+    /// which map to a [`SendDeferral`]. APNs and FCM never defer.
     ///
     /// - APNs: the bytes are the device token, which iOS hands the app as
     ///   raw bytes; the request path carries their lowercase hex (§10.7.1
@@ -123,24 +165,84 @@ impl PushSender {
     ///   `InvalidToken`.
     /// - FCM: the bytes are the UTF-8 registration token; bytes that are not
     ///   UTF-8 are `InvalidToken`, because no FCM token can match them.
-    pub async fn send_registered(&self, token: &[u8]) -> PushSendOutcome {
+    /// - `WebPush`: the bytes are the §22.11.4 `WebPush` token; bytes that
+    ///   [`WebPushSubscription::decode`] rejects are `InvalidToken`, and no
+    ///   request is sent for them.
+    pub async fn send_registered(&self, token: &[u8]) -> SendAttempt {
         match self {
             Self::Apns(sender) => {
                 if token.is_empty() {
                     tracing::debug!(platform = "apns", "device token is empty");
-                    return PushSendOutcome::InvalidToken;
+                    return SendAttempt::Sent(PushSendOutcome::InvalidToken);
                 }
-                sender.send(&PushDeviceToken::new(hex::encode(token))).await
+                SendAttempt::Sent(sender.send(&PushDeviceToken::new(hex::encode(token))).await)
             }
             Self::Fcm(sender) => {
                 let Ok(text) = std::str::from_utf8(token) else {
                     tracing::debug!(platform = "fcm", "registration token is not UTF-8");
-                    return PushSendOutcome::InvalidToken;
+                    return SendAttempt::Sent(PushSendOutcome::InvalidToken);
                 };
-                sender.send(&PushDeviceToken::new(text)).await
+                SendAttempt::Sent(sender.send(&PushDeviceToken::new(text)).await)
             }
+            Self::WebPush(sender) => match WebPushSubscription::decode(token) {
+                Ok(subscription) => sender.send(&subscription).await,
+                Err(error) => {
+                    tracing::debug!(platform = "webpush", %error, "WebPush token is malformed");
+                    SendAttempt::Sent(PushSendOutcome::InvalidToken)
+                }
+            },
             #[cfg(feature = "testing")]
-            Self::Recording(sender) => sender.record(token).await,
+            Self::Recording(sender) => sender.attempt(token).await,
+        }
+    }
+
+    /// Completes once the `WebPush` sender's endpoint lookup pool frees a
+    /// permit, at once when one freed since the last completed wait, with the
+    /// number of permits a send's lookup can take then. Never completes for
+    /// another sender, whose sends never defer on the pool.
+    #[cfg(feature = "push-store")]
+    pub(crate) async fn lookup_permit_freed(&self) -> usize {
+        match self {
+            Self::WebPush(sender) => sender.lookup_permit_freed().await,
+            #[cfg(feature = "testing")]
+            Self::Recording(sender) => sender.lookup_permit_freed().await,
+            Self::Apns(_) | Self::Fcm(_) => std::future::pending().await,
+        }
+    }
+
+    /// The permits of the `WebPush` sender's endpoint lookup pool a send's
+    /// lookup can take now; `None` for a sender with no lookup pool, whose
+    /// sends never defer on one.
+    #[cfg(feature = "push-store")]
+    pub(crate) fn free_lookup_permits(&self) -> Option<usize> {
+        match self {
+            Self::WebPush(sender) => Some(sender.free_lookup_permits()),
+            #[cfg(feature = "testing")]
+            Self::Recording(sender) => sender.free_lookup_permits(),
+            Self::Apns(_) | Self::Fcm(_) => None,
+        }
+    }
+
+    /// The endpoint origin a `WebPush` token's wakes go to, which keys the
+    /// dispatcher's per-origin cap and back-off wait. `None` for another
+    /// platform, and for a token or endpoint that does not decode, whose send
+    /// sends nothing.
+    #[cfg(feature = "push-store")]
+    pub(crate) fn origin_of(&self, token: &[u8]) -> Option<String> {
+        if self.platform() == PushPlatform::WebPush {
+            super::push_webpush::token_origin(token)
+        } else {
+            None
+        }
+    }
+
+    /// When `origin`'s back-off ends, while the `WebPush` sender is backing
+    /// it off; `None` for every other sender.
+    #[cfg(feature = "push-store")]
+    pub(crate) fn origin_retry_at(&self, origin: &str) -> Option<tokio::time::Instant> {
+        match self {
+            Self::WebPush(sender) => sender.retry_at(origin),
+            _ => None,
         }
     }
 }
@@ -163,6 +265,29 @@ pub struct RecordingSender {
     platform: PushPlatform,
     state: std::sync::Arc<tokio::sync::Mutex<RecordingState>>,
     gate: Option<std::sync::Arc<tokio::sync::Semaphore>>,
+    lookup: Option<RecordingLookupPool>,
+}
+
+/// The endpoint lookup pool of a [`RecordingSender`].
+///
+/// [`RecordingSender::with_lookup_pool`] makes it. A send defers with
+/// [`SendDeferral::LookupPoolFull`] while no permit is free, and otherwise
+/// takes none, as a `WebPush` send over a pooled connection resolves nothing.
+#[cfg(feature = "testing")]
+#[derive(Clone, Debug)]
+pub struct RecordingLookupPool {
+    free: std::sync::Arc<tokio::sync::Semaphore>,
+    freed: std::sync::Arc<tokio::sync::Notify>,
+}
+
+#[cfg(feature = "testing")]
+impl RecordingLookupPool {
+    /// Frees `permits` more permits and signals one freed-permit wait, as
+    /// one lookup returning its permit does.
+    pub fn free(&self, permits: usize) {
+        self.free.add_permits(permits);
+        self.freed.notify_one();
+    }
 }
 
 /// Admits the sends of a gated [`RecordingSender`], one permit per send.
@@ -199,7 +324,24 @@ impl RecordingSender {
                 sent: Vec::new(),
             })),
             gate: None,
+            lookup: None,
         }
+    }
+
+    /// As [`Self::new`], with an endpoint lookup pool that starts full.
+    pub fn with_lookup_pool(
+        platform: PushPlatform,
+        outcomes: impl IntoIterator<Item = PushSendOutcome>,
+    ) -> (Self, RecordingLookupPool) {
+        let pool = RecordingLookupPool {
+            free: std::sync::Arc::new(tokio::sync::Semaphore::new(0)),
+            freed: std::sync::Arc::new(tokio::sync::Notify::new()),
+        };
+        let sender = Self {
+            lookup: Some(pool.clone()),
+            ..Self::new(platform, outcomes)
+        };
+        (sender, pool)
     }
 
     /// As [`Self::new`], with every send held until the returned gate admits
@@ -225,6 +367,40 @@ impl RecordingSender {
             .iter()
             .map(|t| t.to_vec())
             .collect()
+    }
+
+    /// Defers while the lookup pool, if any, has no free permit, and
+    /// otherwise records `token` and returns the next scripted outcome.
+    async fn attempt(&self, token: &[u8]) -> SendAttempt {
+        if self
+            .lookup
+            .as_ref()
+            .is_some_and(|pool| pool.free.available_permits() == 0)
+        {
+            return SendAttempt::Deferred(SendDeferral::LookupPoolFull);
+        }
+        SendAttempt::Sent(self.record(token).await)
+    }
+
+    /// As [`PushSender::lookup_permit_freed`]; never completes without a
+    /// lookup pool.
+    #[cfg(feature = "push-store")]
+    async fn lookup_permit_freed(&self) -> usize {
+        match &self.lookup {
+            Some(pool) => {
+                pool.freed.notified().await;
+                pool.free.available_permits()
+            }
+            None => std::future::pending().await,
+        }
+    }
+
+    /// As [`PushSender::free_lookup_permits`].
+    #[cfg(feature = "push-store")]
+    fn free_lookup_permits(&self) -> Option<usize> {
+        self.lookup
+            .as_ref()
+            .map(|pool| pool.free.available_permits())
     }
 
     async fn record(&self, token: &[u8]) -> PushSendOutcome {
@@ -276,10 +452,10 @@ pub enum PushSenderError {
 }
 
 /// The per-request deadline of a push send or token request (indicator: 10 s).
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+pub(super) const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The TCP and TLS connect deadline (indicator: 5 s).
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+pub(super) const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The most response-body bytes a sender reads; push-service error bodies are
 /// a few hundred bytes, and a longer body is truncated, never buffered whole.
@@ -390,10 +566,25 @@ pub(super) fn compact_jws<E>(
     claims: &serde_json::Value,
     sign: impl FnOnce(&[u8]) -> Result<Vec<u8>, E>,
 ) -> Result<Zeroizing<String>, E> {
+    compact_jws_bytes(
+        header.to_string().as_bytes(),
+        claims.to_string().as_bytes(),
+        sign,
+    )
+}
+
+/// [`compact_jws`] over the exact header and claims bytes, so a caller whose
+/// spec fixes the member order (the VAPID JWT of §10.7.1) keeps it;
+/// `serde_json::Value` sorts object members.
+pub(super) fn compact_jws_bytes<E>(
+    header: &[u8],
+    claims: &[u8],
+    sign: impl FnOnce(&[u8]) -> Result<Vec<u8>, E>,
+) -> Result<Zeroizing<String>, E> {
     let mut jws = Zeroizing::new(String::new());
-    jws.push_str(&URL_SAFE_NO_PAD.encode(header.to_string()));
+    jws.push_str(&URL_SAFE_NO_PAD.encode(header));
     jws.push('.');
-    jws.push_str(&URL_SAFE_NO_PAD.encode(claims.to_string()));
+    jws.push_str(&URL_SAFE_NO_PAD.encode(claims));
     let signature = sign(jws.as_bytes())?;
     jws.push('.');
     jws.push_str(&URL_SAFE_NO_PAD.encode(signature));
@@ -422,8 +613,8 @@ mod tests {
     use super::*;
 
     /// A build without `testing` holds only the production senders: this
-    /// match names `Apns` and `Fcm` with no wildcard, so it stops compiling
-    /// if any other arm, such as `Recording`, is present.
+    /// match names `Apns`, `Fcm` and `WebPush` with no wildcard, so it stops
+    /// compiling if any other arm, such as `Recording`, is present.
     #[cfg(not(feature = "testing"))]
     #[test]
     fn sender_without_testing_has_only_production_arms() -> Result<(), Box<dyn std::error::Error>> {
@@ -431,6 +622,7 @@ mod tests {
             match sender {
                 PushSender::Apns(_) => "apns",
                 PushSender::Fcm(_) => "fcm",
+                PushSender::WebPush(_) => "webpush",
             }
         }
         let key = scp_crypto::p256::P256SecretKey::from_scalar_bytes(&[7u8; 32])?;
@@ -456,11 +648,11 @@ mod tests {
         assert_eq!(sender.platform(), PushPlatform::Fcm);
         assert_eq!(
             sender.send_registered(b"tok-a").await,
-            PushSendOutcome::Delivered
+            SendAttempt::Sent(PushSendOutcome::Delivered)
         );
         assert_eq!(
             sender.send_registered(b"tok-b").await,
-            PushSendOutcome::ConfigError
+            SendAttempt::Sent(PushSendOutcome::ConfigError)
         );
         assert_eq!(
             recorder.sent().await,
@@ -496,7 +688,7 @@ mod tests {
         gate.admit(1);
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(5), send).await??,
-            PushSendOutcome::Delivered
+            SendAttempt::Sent(PushSendOutcome::Delivered)
         );
         Ok(())
     }
@@ -515,7 +707,7 @@ mod tests {
         )?);
         assert_eq!(
             sender.send_registered(b"").await,
-            PushSendOutcome::InvalidToken
+            SendAttempt::Sent(PushSendOutcome::InvalidToken)
         );
         assert!(server.requests().await.is_empty(), "a request was made");
         Ok(())
@@ -537,7 +729,7 @@ mod tests {
         )?);
         assert_eq!(
             sender.send_registered(&[0xff, 0xfe, 0x41]).await,
-            PushSendOutcome::InvalidToken
+            SendAttempt::Sent(PushSendOutcome::InvalidToken)
         );
         assert!(server.requests().await.is_empty(), "a request was made");
         Ok(())

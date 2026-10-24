@@ -83,6 +83,12 @@ test = false
 doc = false
 
 [[bin]]
+name = "fuzz_webpush_token"
+path = "fuzz_targets/fuzz_webpush_token.rs"
+test = false
+doc = false
+
+[[bin]]
 name = "fuzz_sender_key_dist"
 path = "fuzz_targets/fuzz_sender_key_dist.rs"
 test = false

@@ -15,12 +15,21 @@
 //!   opener until PUSH-033, so it rejects every message there unread. It
 //!   also answers `4060` at a retired ID. At a current direct ID it decodes
 //!   the blob as a `PushRegistration` or a `PushDeregistration` (§22.11.4),
-//!   refuses a platform with no configured sender (`4061`), applies the
-//!   §10.7.1 freshness checks (`4062`), verifies the signature through the
-//!   injected
+//!   refuses a platform with no configured sender (`4061`), refuses a
+//!   `WebPush` token that does not decode or whose endpoint breaks the URL
+//!   rules (`4060`, PUSH-022), applies the §10.7.1 freshness checks
+//!   (`4062`), verifies the signature through the injected
 //!   [`PushSignatureVerifier`](scp_identity::push_verify::PushSignatureVerifier)
-//!   with that entry's canonical URL (`4060`, `5003`, `5004`), and only then
-//!   changes the registration store. Any rejection leaves the store unchanged.
+//!   with that entry's canonical URL (`4060`, `5003`, `5004`), refuses a
+//!   `WebPush` registration whose endpoint address the ADR-004 rule refuses
+//!   (`4060`), and only then changes the registration store. Any rejection
+//!   leaves the store unchanged.
+//!
+//! The `WebPush` checks are ordered by cost: the token decode and the URL
+//! rules need no I/O and run before freshness, and the address check, which
+//! resolves the endpoint's host, runs only after the signature verifies, so
+//! an unsigned message never makes the relay look a name up. A
+//! deregistration removes a token, so it skips the address check.
 //!
 //! A PUBLISH to any other routing ID passes through as
 //! [`PushPublishGate::NotPush`]. No response message and no log line carries a
@@ -39,6 +48,7 @@ use scp_identity::push_verify::{PushMessage, PushSignatureVerifier};
 #[cfg(feature = "push-store")]
 use scp_protocol::discovery::push::{
     PUSH_TIMESTAMP_SKEW_SECS, PushDeregistration, PushPlatform, PushRegistration,
+    WebPushSubscription,
 };
 use scp_protocol::discovery::push::{PushMessageError, PushRelay};
 use scp_relay_client::{RelayMessage, code};
@@ -47,6 +57,8 @@ use scp_relay_client::{RelayMessage, code};
 use super::push::PushSender;
 #[cfg(feature = "push-store")]
 use super::push_dispatch::PushService;
+#[cfg(feature = "push-store")]
+use super::push_endpoint::{EndpointError, parse_endpoint};
 #[cfg(feature = "push-store")]
 use super::push_store::{PushRegistrationKey, PushRegistrationRecord, PushRegistrationStore};
 
@@ -577,6 +589,13 @@ impl Decoded {
         }
     }
 
+    fn token(&self) -> &[u8] {
+        match self {
+            Self::Registration(m) => &m.token,
+            Self::Deregistration(m) => &m.token,
+        }
+    }
+
     fn key(&self) -> PushRegistrationKey {
         let (registrant, platform, token) = match self {
             Self::Registration(m) => (&m.registrant, m.platform, &m.token),
@@ -618,6 +637,13 @@ async fn handle(
             format!("this relay has no {platform} sender"),
         ));
     }
+
+    // The WebPush byte and URL rules need no I/O, so they run first (PUSH-022).
+    let webpush = if platform == PushPlatform::WebPush {
+        Some(webpush_endpoint(decoded.token())?)
+    } else {
+        None
+    };
 
     // Freshness runs before verification (§10.7.1 "Freshness").
     let timestamp = decoded.timestamp();
@@ -663,6 +689,12 @@ async fn handle(
         ));
     }
 
+    // The ADR-004 address check resolves the endpoint's host, so it runs only
+    // for a verified registration; a deregistration only removes a token.
+    if let (Some(endpoint), Decoded::Registration(_)) = (&webpush, &decoded) {
+        check_webpush_addresses(service, endpoint).await?;
+    }
+
     let written = match decoded {
         Decoded::Registration(m) => service
             .store
@@ -682,6 +714,61 @@ async fn handle(
             .map(|_| ()),
     };
     written.map_err(|e| PushPublishGate::rejected(e.wire_code(), e.to_string()))
+}
+
+/// The endpoint of a `WebPush` token that decodes under §22.11.4 and whose
+/// endpoint passes the ADR-004 URL rules, or `4060`.
+#[cfg(feature = "push-store")]
+fn webpush_endpoint(token: &[u8]) -> Result<String, PushPublishGate> {
+    let subscription = WebPushSubscription::decode(token).map_err(|e| {
+        PushPublishGate::rejected(
+            code::PUSH_REGISTRATION_REJECTED,
+            format!("WebPush token is malformed: {e}"),
+        )
+    })?;
+    parse_endpoint(subscription.endpoint()).map_err(|e| {
+        PushPublishGate::rejected(
+            code::PUSH_REGISTRATION_REJECTED,
+            format!("WebPush endpoint refused: {e}"),
+        )
+    })?;
+    Ok(subscription.endpoint().to_owned())
+}
+
+/// The registration-time ADR-004 address check of `endpoint`, through the
+/// configured `WebPush` sender's resolver: `4060` when an address is refused
+/// or the lookup fails, and `5000` when the relay's own lookup pool is full,
+/// which says nothing about the endpoint and which the registrant retries
+/// (ADR-004, every `5xxx` code).
+#[cfg(feature = "push-store")]
+async fn check_webpush_addresses(
+    service: &PushServiceConfig,
+    endpoint: &str,
+) -> Result<(), PushPublishGate> {
+    match service.sender_for(PushPlatform::WebPush) {
+        Some(PushSender::WebPush(sender)) => sender
+            .check_registration_endpoint(endpoint)
+            .await
+            .map_err(|e| match e {
+                EndpointError::LookupPoolFull => {
+                    PushPublishGate::rejected(code::INTERNAL_ERROR, e.to_string())
+                }
+                _ => PushPublishGate::rejected(
+                    code::PUSH_REGISTRATION_REJECTED,
+                    format!("WebPush endpoint refused: {e}"),
+                ),
+            }),
+        // The recording sender sends nothing, so it reaches no address.
+        #[cfg(feature = "testing")]
+        Some(PushSender::Recording(_)) => Ok(()),
+        // `handle` refused a platform with no sender before this point, and
+        // `sender_for` matches by platform, so neither arm is reached; both
+        // fail closed.
+        Some(PushSender::Apns(_) | PushSender::Fcm(_)) | None => Err(PushPublishGate::rejected(
+            code::PUSH_PLATFORM_UNAVAILABLE,
+            "this relay has no WebPush sender",
+        )),
+    }
 }
 
 /// A running push service with a SQLite store under `dir`, the production
@@ -1342,5 +1429,257 @@ mod tests {
                 msg: "stale".to_owned(),
             })
         );
+    }
+
+    /// The PUSH-022 `WebPush` registration checks in the push handler.
+    #[cfg(feature = "push-store")]
+    mod webpush {
+        use std::sync::Arc;
+
+        use scp_protocol::discovery::push::{
+            PushDeregistration, PushPlatform, PushRegistration, push_deregistration_signing_bytes,
+            push_registration_signing_bytes,
+        };
+        use sha2::{Digest, Sha256};
+
+        use super::super::super::push::PushSender;
+        use super::super::super::push_dispatch::PushService;
+        use super::super::super::push_store::{PushRegistrationKey, PushRegistrationStore};
+        use super::super::super::push_test_server::TlsTestServer;
+        use super::super::super::push_webpush::tests::{TestResult, sender_for, subscribe};
+        use super::super::{LiveRelayUrl, PushPublishGate, PushServiceConfig, RelayUrl, handle};
+        use super::{GATE_NOW, GATE_REGISTRANT, gate_key};
+
+        const RELAY: &str = "wss://relay.example/scp/v1";
+
+        /// A push-enabled relay whose only sender is a `WebPush` sender,
+        /// resolving the test host names to loopback, which it lets through
+        /// only when `allow_loopback`.
+        async fn relay(
+            dir: &std::path::Path,
+            allow_loopback: bool,
+        ) -> TestResult<(PushService, TlsTestServer)> {
+            let server = TlsTestServer::start_routed(vec![]).await;
+            let sender = sender_for(&server, allow_loopback, Arc::new(scp_clock::SystemClock))?;
+            let config = PushServiceConfig {
+                store: PushRegistrationStore::open_sqlite(&dir.join("push.db"))?,
+                verifier: Arc::new(scp_identity::push_verify::TestPushVerifier::new([(
+                    scp_did::DID::from(GATE_REGISTRANT),
+                    gate_key().public_key(),
+                )])),
+                senders: Arc::from(vec![PushSender::WebPush(sender)]),
+            };
+            Ok((PushService::start(config)?, server))
+        }
+
+        /// A `WebPush` registration or deregistration of `token`, signed by
+        /// `gate_key()` (or by another key when `forged`) at `timestamp`.
+        fn signed(
+            deregister: bool,
+            token: &[u8],
+            timestamp: u64,
+            forged: bool,
+        ) -> TestResult<Vec<u8>> {
+            let relay = RelayUrl::new(RELAY)?;
+            let key = if forged {
+                scp_crypto::p256::P256SecretKey::from_scalar_bytes(&[9; 32])?
+            } else {
+                gate_key()
+            };
+            let sign = |preimage: Vec<u8>| -> TestResult<[u8; 64]> {
+                let digest: [u8; 32] = Sha256::digest(preimage).into();
+                Ok(scp_crypto::p256::sign_prehash_rfc6979(&key, &digest)?)
+            };
+            let registrant = scp_did::DID::from(GATE_REGISTRANT);
+            Ok(if deregister {
+                let mut msg = PushDeregistration {
+                    registrant,
+                    platform: PushPlatform::WebPush,
+                    token: token.to_vec(),
+                    timestamp,
+                    signature: [0; 64],
+                };
+                msg.signature = sign(push_deregistration_signing_bytes(&msg, relay.push_relay())?)?;
+                rmp_serde::to_vec_named(&msg)?
+            } else {
+                let mut msg = PushRegistration {
+                    registrant,
+                    platform: PushPlatform::WebPush,
+                    token: token.to_vec(),
+                    routing_ids: vec![[0x11; 32]],
+                    timestamp,
+                    signature: [0; 64],
+                };
+                msg.signature = sign(push_registration_signing_bytes(&msg, relay.push_relay())?)?;
+                rmp_serde::to_vec_named(&msg)?
+            })
+        }
+
+        /// Runs the push handler on `blob`; returns its answer and the
+        /// timestamp the store then holds for `token`.
+        async fn present(
+            service: &PushService,
+            blob: &[u8],
+            token: &[u8],
+        ) -> TestResult<(PushPublishGate, Option<u64>)> {
+            let held = RelayUrl::new(RELAY)?;
+            let live = LiveRelayUrl::new(held.clone());
+            let entry = live
+                .current()
+                .get(&held.push_routing_id())
+                .cloned()
+                .ok_or("no entry")?;
+            let gate = match handle(service.config(), &entry, blob, GATE_NOW).await {
+                Ok(()) => PushPublishGate::Accepted,
+                Err(rejection) => rejection,
+            };
+            let key = PushRegistrationKey {
+                registrant: GATE_REGISTRANT.to_owned(),
+                platform: PushPlatform::WebPush,
+                token: token.to_vec(),
+            };
+            Ok((gate, service.config().store.accepted_timestamp(&key).await?))
+        }
+
+        fn is_4060(gate: &PushPublishGate) -> bool {
+            matches!(gate, PushPublishGate::Rejected { code: 4060, .. })
+        }
+
+        /// A token that does not decode, or whose endpoint breaks a URL
+        /// rule, is `4060` before the freshness checks: a stale timestamp
+        /// would otherwise answer `4062`.
+        #[tokio::test]
+        async fn malformed_token_is_4060_before_freshness() -> TestResult {
+            let dir = tempfile::tempdir()?;
+            let (service, server) = relay(dir.path(), true).await?;
+            let (_, good) = subscribe(server.endpoint("push.example.net", "/s/1"))?;
+            let encoded = good.encode();
+            let p256dh = good.p256dh().to_uncompressed();
+            // A §22.11.4 token whose endpoint passes the byte rules but not
+            // the WHATWG canonical form.
+            let uncanonical = {
+                let endpoint = b"https://PUSH.example.net/s/1";
+                let len = u32::try_from(endpoint.len())?;
+                [&len.to_be_bytes()[..], endpoint, &p256dh, &[7; 16]].concat()
+            };
+            for token in [
+                vec![0],
+                b"not a webpush token".to_vec(),
+                encoded[..encoded.len() - 1].to_vec(),
+                uncanonical,
+            ] {
+                for stale in [false, true] {
+                    let timestamp = if stale { GATE_NOW - 3600 } else { GATE_NOW };
+                    let blob = signed(false, &token, timestamp, false)?;
+                    let (gate, stored) = present(&service, &blob, &token).await?;
+                    assert!(is_4060(&gate), "{gate:?}");
+                    assert_eq!(stored, None);
+                }
+            }
+            Ok(())
+        }
+
+        /// A registration whose endpoint lookup finds the relay's own lookup
+        /// pool full is `5000`, which the registrant retries, not the `4060`
+        /// refusal of its endpoint, and nothing is stored; once a permit
+        /// frees, the same registration is accepted.
+        #[tokio::test]
+        async fn a_full_lookup_pool_is_5000_not_a_refusal() -> TestResult {
+            let dir = tempfile::tempdir()?;
+            let (service, server) = relay(dir.path(), true).await?;
+            let (_, good) = subscribe(server.endpoint("push.example.net", "/s/1"))?;
+            let token = good.encode();
+            let blob = signed(false, &token, GATE_NOW, false)?;
+            let Some(PushSender::WebPush(sender)) = service.config().senders.first() else {
+                return Err("the service has no WebPush sender".into());
+            };
+            let held = sender.exhaust_lookup_permits()?;
+            let (gate, stored) = present(&service, &blob, &token).await?;
+            assert!(
+                matches!(gate, PushPublishGate::Rejected { code: 5000, .. }),
+                "{gate:?}"
+            );
+            assert_eq!(stored, None);
+            drop(held);
+            let (gate, stored) = present(&service, &blob, &token).await?;
+            assert!(matches!(gate, PushPublishGate::Accepted), "{gate:?}");
+            assert_eq!(stored, Some(GATE_NOW));
+            Ok(())
+        }
+
+        /// A verified registration whose endpoint address the ADR-004 rule
+        /// refuses is `4060`, and nothing is stored; one whose address passes
+        /// is accepted.
+        #[tokio::test]
+        async fn refused_endpoint_address_is_4060_and_stores_nothing() -> TestResult {
+            let dir = tempfile::tempdir()?;
+            // The production rule: the test host names resolve to loopback,
+            // which it refuses.
+            let (service, server) = relay(dir.path(), false).await?;
+            for (i, endpoint) in [
+                server.endpoint("push.example.net", "/s/1"),
+                "https://10.0.0.1/s/1".to_owned(),
+                "https://[fd00::1]/s/1".to_owned(),
+                "https://unknown.example.net/s/1".to_owned(),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let (_, subscription) = subscribe(endpoint)?;
+                let token = subscription.encode();
+                let blob = signed(false, &token, GATE_NOW, false)?;
+                let (gate, stored) = present(&service, &blob, &token).await?;
+                assert!(is_4060(&gate), "endpoint #{i}: {gate:?}");
+                assert_eq!(stored, None, "endpoint #{i}");
+            }
+
+            let dir = tempfile::tempdir()?;
+            let (service, server) = relay(dir.path(), true).await?;
+            let (_, subscription) = subscribe(server.endpoint("push.example.net", "/s/1"))?;
+            let token = subscription.encode();
+            let blob = signed(false, &token, GATE_NOW, false)?;
+            let (gate, stored) = present(&service, &blob, &token).await?;
+            assert_eq!(gate, PushPublishGate::Accepted);
+            assert_eq!(stored, Some(GATE_NOW));
+            Ok(())
+        }
+
+        /// The address check runs only after the signature verifies: a
+        /// forged registration for a name that does not resolve is refused
+        /// by verification, so the lookup's `4060` never decides it.
+        #[tokio::test]
+        async fn unsigned_input_never_reaches_the_address_check() -> TestResult {
+            let dir = tempfile::tempdir()?;
+            let (service, _server) = relay(dir.path(), true).await?;
+            let (_, subscription) = subscribe("https://unknown.example.net/s/1".to_owned())?;
+            let token = subscription.encode();
+            let forged = signed(false, &token, GATE_NOW, true)?;
+            let (gate, stored) = present(&service, &forged, &token).await?;
+            let PushPublishGate::Rejected { msg, .. } = &gate else {
+                return Err(format!("forged message answered {gate:?}").into());
+            };
+            assert!(
+                !msg.contains("WebPush endpoint"),
+                "the refusal names the endpoint check"
+            );
+            assert_eq!(stored, None);
+            Ok(())
+        }
+
+        /// A deregistration only removes a token, so it skips the address
+        /// check: a token whose endpoint the rule now refuses still
+        /// deregisters.
+        #[tokio::test]
+        async fn deregistration_skips_the_address_check() -> TestResult {
+            let dir = tempfile::tempdir()?;
+            let (service, server) = relay(dir.path(), false).await?;
+            let (_, subscription) = subscribe(server.endpoint("push.example.net", "/s/1"))?;
+            let token = subscription.encode();
+            let blob = signed(true, &token, GATE_NOW, false)?;
+            let (gate, stored) = present(&service, &blob, &token).await?;
+            assert_eq!(gate, PushPublishGate::Accepted);
+            assert_eq!(stored, Some(GATE_NOW));
+            Ok(())
+        }
     }
 }

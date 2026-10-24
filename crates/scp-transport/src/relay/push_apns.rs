@@ -644,7 +644,10 @@ pub(crate) mod tests {
         let (sender, server, _) = sender_with(vec![Reply::empty(200)]).await;
         let raw = hex::decode(DEVICE_TOKEN).unwrap();
         let outcome = PushSender::Apns(sender).send_registered(&raw).await;
-        assert_eq!(outcome, PushSendOutcome::Delivered);
+        assert_eq!(
+            outcome,
+            super::super::push::SendAttempt::Sent(PushSendOutcome::Delivered)
+        );
 
         let requests = server.requests().await;
         assert_eq!(requests.len(), 1);
@@ -843,7 +846,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn no_log_line_carries_the_key_jwt_or_device_token() {
-        let capture = LogCapture::install();
+        let capture = LogCapture::install(crate::relay::push_webpush::admits_log_event);
         let (sender, server, _) = sender_with(vec![
             Reply::empty(200),
             reason(400, "TopicDisallowed"),

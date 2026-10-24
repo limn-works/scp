@@ -45,7 +45,7 @@ macro_rules! spinners {
                         return capture.contents().contains(&marker);
                     }
                     if tracing::dispatcher::has_been_set() {
-                        capture = Some(LogCapture::install());
+                        capture = Some(LogCapture::install(|_| true));
                     }
                     std::hint::spin_loop();
                 }
@@ -79,7 +79,7 @@ fn install_race_child() {
             .map(|spinner| scope.spawn(|| spinner(&start)))
             .collect();
         start.wait();
-        let _capture = LogCapture::install();
+        let _capture = LogCapture::install(|_| true);
         handles
             .into_iter()
             .enumerate()
