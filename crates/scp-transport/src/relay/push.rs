@@ -3,7 +3,8 @@
 //! A relay wakes a registered device by sending the §10.7.1 step 5 wake-signal
 //! request for the registration's platform. [`PushSender`] is the one type the
 //! relay holds per configured platform; its arms are the production senders
-//! [`ApnsSender`] (PUSH-010) and [`FcmSender`] (PUSH-011). Every send returns a
+//! [`ApnsSender`] (PUSH-010), [`FcmSender`] (PUSH-011) and [`WebPushSender`]
+//! (PUSH-022). Every send returns a
 //! [`PushSendOutcome`], which the dispatcher of PUSH-008
 //! ([`push_dispatch`](super::push_dispatch)) reads to keep or remove a
 //! registration.
@@ -14,24 +15,26 @@
 //! `testing`; `scripts/check-shipped-feature-graph.sh` keeps `testing` out of
 //! every shipped build.
 //!
-//! Secrets: the APNs signing key, the FCM service-account key, the provider JWT
-//! and the OAuth access token live in zeroizing buffers, and no `Debug`
-//! implementation in this module or its senders prints them or a device token.
-//! No log line carries any of them: a send logs only the platform, the HTTP
-//! status and the platform's reason code.
+//! Secrets: the APNs signing key, the FCM service-account key, the VAPID key,
+//! the provider and VAPID JWTs and the OAuth access token live in zeroizing
+//! buffers, and no `Debug` implementation in this module or its senders prints
+//! them, a device token, or a `WebPush` endpoint, `p256dh` or `auth`. No log
+//! line carries any of them: a send logs only the platform, the HTTP status,
+//! the platform's reason code, and a typed error that carries none of them.
 
 use std::fmt;
 use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
-use scp_protocol::discovery::push::PushPlatform;
+use scp_protocol::discovery::push::{PushPlatform, WebPushSubscription};
 use zeroize::Zeroizing;
 
 pub use super::push_apns::{
     ApnsConfig, ApnsEnvironment, ApnsKeyError, ApnsSender, apns_key_from_p8,
 };
 pub use super::push_fcm::{FcmConfig, FcmCredentialError, FcmSender, FcmServiceAccount};
+pub use super::push_webpush::{VapidSubject, WebPushConfig, WebPushSender};
 
 /// The result of one wake-signal send.
 ///
@@ -94,6 +97,8 @@ pub enum PushSender {
     Apns(ApnsSender),
     /// Sends the FCM row of the §10.7.1 step 5 table.
     Fcm(FcmSender),
+    /// Sends the `WebPush` row of the §10.7.1 step 5 table.
+    WebPush(WebPushSender),
     /// Records each token and returns scripted outcomes without sending
     /// anything. A nullifier, so it compiles only under `testing`.
     #[cfg(feature = "testing")]
@@ -107,6 +112,7 @@ impl PushSender {
         match self {
             Self::Apns(_) => PushPlatform::Apns,
             Self::Fcm(_) => PushPlatform::Fcm,
+            Self::WebPush(_) => PushPlatform::WebPush,
             #[cfg(feature = "testing")]
             Self::Recording(sender) => sender.platform,
         }
@@ -123,6 +129,9 @@ impl PushSender {
     ///   `InvalidToken`.
     /// - FCM: the bytes are the UTF-8 registration token; bytes that are not
     ///   UTF-8 are `InvalidToken`, because no FCM token can match them.
+    /// - `WebPush`: the bytes are the §22.11.4 `WebPush` token; bytes that
+    ///   [`WebPushSubscription::decode`] rejects are `InvalidToken`, and no
+    ///   request is sent for them.
     pub async fn send_registered(&self, token: &[u8]) -> PushSendOutcome {
         match self {
             Self::Apns(sender) => {
@@ -139,6 +148,13 @@ impl PushSender {
                 };
                 sender.send(&PushDeviceToken::new(text)).await
             }
+            Self::WebPush(sender) => match WebPushSubscription::decode(token) {
+                Ok(subscription) => sender.send(&subscription).await,
+                Err(error) => {
+                    tracing::debug!(platform = "webpush", %error, "WebPush token is malformed");
+                    PushSendOutcome::InvalidToken
+                }
+            },
             #[cfg(feature = "testing")]
             Self::Recording(sender) => sender.record(token).await,
         }
@@ -276,10 +292,10 @@ pub enum PushSenderError {
 }
 
 /// The per-request deadline of a push send or token request (indicator: 10 s).
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+pub(super) const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The TCP and TLS connect deadline (indicator: 5 s).
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+pub(super) const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The most response-body bytes a sender reads; push-service error bodies are
 /// a few hundred bytes, and a longer body is truncated, never buffered whole.
@@ -390,10 +406,25 @@ pub(super) fn compact_jws<E>(
     claims: &serde_json::Value,
     sign: impl FnOnce(&[u8]) -> Result<Vec<u8>, E>,
 ) -> Result<Zeroizing<String>, E> {
+    compact_jws_bytes(
+        header.to_string().as_bytes(),
+        claims.to_string().as_bytes(),
+        sign,
+    )
+}
+
+/// [`compact_jws`] over the exact header and claims bytes, so a caller whose
+/// spec fixes the member order (the VAPID JWT of §10.7.1) keeps it;
+/// `serde_json::Value` sorts object members.
+pub(super) fn compact_jws_bytes<E>(
+    header: &[u8],
+    claims: &[u8],
+    sign: impl FnOnce(&[u8]) -> Result<Vec<u8>, E>,
+) -> Result<Zeroizing<String>, E> {
     let mut jws = Zeroizing::new(String::new());
-    jws.push_str(&URL_SAFE_NO_PAD.encode(header.to_string()));
+    jws.push_str(&URL_SAFE_NO_PAD.encode(header));
     jws.push('.');
-    jws.push_str(&URL_SAFE_NO_PAD.encode(claims.to_string()));
+    jws.push_str(&URL_SAFE_NO_PAD.encode(claims));
     let signature = sign(jws.as_bytes())?;
     jws.push('.');
     jws.push_str(&URL_SAFE_NO_PAD.encode(signature));
@@ -422,8 +453,8 @@ mod tests {
     use super::*;
 
     /// A build without `testing` holds only the production senders: this
-    /// match names `Apns` and `Fcm` with no wildcard, so it stops compiling
-    /// if any other arm, such as `Recording`, is present.
+    /// match names `Apns`, `Fcm` and `WebPush` with no wildcard, so it stops
+    /// compiling if any other arm, such as `Recording`, is present.
     #[cfg(not(feature = "testing"))]
     #[test]
     fn sender_without_testing_has_only_production_arms() -> Result<(), Box<dyn std::error::Error>> {
@@ -431,6 +462,7 @@ mod tests {
             match sender {
                 PushSender::Apns(_) => "apns",
                 PushSender::Fcm(_) => "fcm",
+                PushSender::WebPush(_) => "webpush",
             }
         }
         let key = scp_crypto::p256::P256SecretKey::from_scalar_bytes(&[7u8; 32])?;

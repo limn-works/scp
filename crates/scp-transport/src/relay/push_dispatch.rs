@@ -15,9 +15,16 @@
 //!   queues one job per token on that platform's queue.
 //! - **One drain per configured sender**, each reading its own platform's
 //!   queue, so a push service that stops answering stalls only its own
-//!   platform. After a `Transient` outcome a drain backs off before its next
-//!   send to that service. Each drain applies the outcome to the
-//!   registration store:
+//!   platform. The APNs and FCM drains send one job at a time, and after a
+//!   `Transient` outcome back off before their next send to that service.
+//!   The `WebPush` drain differs, because each registrant chooses its own
+//!   endpoint (PUSH-022 lane rule): it runs up to
+//!   `WEBPUSH_CONCURRENT_SENDS` sends at once, and the `WebPush` sender
+//!   backs off per endpoint origin, so one origin that stops answering
+//!   delays no wake to another. A token with a send in flight holds at most
+//!   one more job, which starts when that send's outcome is applied, so one
+//!   token's outcomes reach the store in order. Each drain applies the
+//!   outcome to the registration store:
 //!   - `Delivered` resets the token's consecutive invalid-token count.
 //!   - `InvalidToken` adds one to it; at `INVALID_TOKEN_REMOVAL_THRESHOLD`
 //!     (in `push_store`, a module the `push-store` feature compiles) the
@@ -88,6 +95,8 @@ mod enabled {
     use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
     use std::time::{Duration, Instant};
 
+    use futures::StreamExt as _;
+    use futures::stream::FuturesUnordered;
     use scp_protocol::discovery::push::PushPlatform;
     use sha2::{Digest, Sha256};
     use tokio::sync::mpsc;
@@ -119,6 +128,14 @@ mod enabled {
 
     /// The longest back-off after `Transient` outcomes (indicator: 60 s).
     const TRANSIENT_BACKOFF_MAX: Duration = Duration::from_secs(60);
+
+    /// The most `WebPush` sends the `WebPush` drain runs at once (indicator:
+    /// 32).
+    ///
+    /// PUSH-022 lane rule: an origin that stops answering holds one of them
+    /// per wake to it for at most the sender's request timeout, after which
+    /// the sender backs that origin off.
+    pub const WEBPUSH_CONCURRENT_SENDS: usize = 32;
 
     /// A push service that could not start.
     #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -609,8 +626,23 @@ mod enabled {
         pending_resets: HashSet<TokenKey>,
     }
 
+    /// A finished `WebPush` send: the token's key, its job, and the outcome.
+    type Sent = (TokenKey, PushJob, PushSendOutcome);
+
+    /// Sends `job` through `sender`.
+    async fn send_job(sender: &PushSender, key: TokenKey, job: PushJob) -> Sent {
+        let outcome = sender.send_registered(&job.token).await;
+        (key, job, outcome)
+    }
+
+    /// What the `WebPush` drain does next.
+    enum Step {
+        Job(Option<PushJob>),
+        Sent(Sent),
+    }
+
     impl Drain {
-        async fn run(mut self, mut rx: mpsc::Receiver<PushJob>) {
+        async fn run(mut self, rx: mpsc::Receiver<PushJob>) {
             let senders = Arc::clone(&self.senders);
             let Some(sender) = senders.get(self.index) else {
                 // `start_with` takes `index` from enumerating this same
@@ -623,6 +655,16 @@ mod enabled {
                 );
                 return;
             };
+            if sender.platform() == PushPlatform::WebPush {
+                self.run_concurrent(sender, rx).await;
+            } else {
+                self.run_serial(sender, rx).await;
+            }
+        }
+
+        /// The APNs and FCM drain: one send at a time, and a platform-wide
+        /// back-off after `Transient`.
+        async fn run_serial(&mut self, sender: &PushSender, mut rx: mpsc::Receiver<PushJob>) {
             let mut backoff = ReconnectBackoff::new(TRANSIENT_BACKOFF_MIN, TRANSIENT_BACKOFF_MAX);
             loop {
                 let job = tokio::select! {
@@ -651,6 +693,56 @@ mod enabled {
                     }
                 } else {
                     backoff.reset();
+                }
+            }
+        }
+
+        /// The `WebPush` drain: up to [`WEBPUSH_CONCURRENT_SENDS`] sends at
+        /// once, with no drain-wide back-off; the sender backs off per
+        /// endpoint origin.
+        ///
+        /// Outcomes are applied on this task, one at a time. A job for a
+        /// token whose send is in flight waits in that token's slot and
+        /// starts once the in-flight outcome is applied; a further job for
+        /// the same token while one waits is dropped, because the waiting
+        /// job wakes the same device. So one token's outcomes reach the store
+        /// in send order, and the waiting jobs number at most the sends.
+        async fn run_concurrent(&mut self, sender: &PushSender, mut rx: mpsc::Receiver<PushJob>) {
+            let mut sends = FuturesUnordered::new();
+            let mut in_flight: HashMap<TokenKey, Option<PushJob>> = HashMap::new();
+            loop {
+                let step = tokio::select! {
+                    biased;
+                    () = self.stop.cancelled() => return,
+                    Some(sent) = sends.next(), if !sends.is_empty() => Step::Sent(sent),
+                    job = rx.recv(), if sends.len() < WEBPUSH_CONCURRENT_SENDS => Step::Job(job),
+                };
+                match step {
+                    // The lookup holds the queue's sender until it stops, so
+                    // `None` means the service is gone.
+                    Step::Job(None) => return,
+                    Step::Job(Some(job)) => {
+                        let key = token_key(job.platform, &job.token);
+                        lock(&self.queued).remove(&key);
+                        match in_flight.get_mut(&key) {
+                            Some(waiting @ None) => *waiting = Some(job),
+                            Some(Some(_)) => drop(job),
+                            None => {
+                                in_flight.insert(key, None);
+                                sends.push(send_job(sender, key, job));
+                            }
+                        }
+                    }
+                    Step::Sent((key, job, outcome)) => {
+                        if !self.apply(job.platform, key, &job.token, outcome).await {
+                            return;
+                        }
+                        drop(job);
+                        if let Some(Some(next)) = in_flight.remove(&key) {
+                            in_flight.insert(key, None);
+                            sends.push(send_job(sender, key, next));
+                        }
+                    }
                 }
             }
         }
@@ -782,7 +874,10 @@ mod enabled {
 
         use super::super::super::push::ApnsSender;
         use super::super::super::push_gate::{PushPublishGate, gate_publish, test_relay_url};
-        use super::super::super::push_test_server::TestServer;
+        use super::super::super::push_test_server::{Reply, TestServer, TlsTestServer};
+        use super::super::super::push_webpush::tests::{
+            sender_for as webpush_sender_for, subscribe,
+        };
         use super::*;
 
         type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -1045,6 +1140,76 @@ mod enabled {
         #[test]
         fn disabled_role_does_nothing() {
             notify(&PushRole::Disabled, &RID);
+        }
+
+        /// Polls `server` up to `within` until it has recorded `n` requests.
+        async fn wait_for_requests(
+            server: &TlsTestServer,
+            n: usize,
+            within: Duration,
+        ) -> TestResult {
+            let deadline = Instant::now() + within;
+            while Instant::now() < deadline {
+                if server.requests().await.len() >= n {
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            Err(format!(
+                "expected {n} requests within {within:?}, saw {}",
+                server.requests().await.len()
+            )
+            .into())
+        }
+
+        /// PUSH-022 lane rule, end to end through the real `WebPush` sender:
+        /// an endpoint origin that never answers delays no wake to another
+        /// origin. The hung send is in flight before the second wake is
+        /// published, and the second is delivered well inside the sender's
+        /// 10 s request timeout, which a one-at-a-time drain would wait out.
+        #[tokio::test]
+        async fn a_hung_webpush_origin_does_not_delay_another() -> TestResult {
+            const HUNG: RoutingId = [0x48; 32];
+            const GOOD: RoutingId = [0x47; 32];
+            let server = TlsTestServer::start_routed(vec![
+                ("/hung", vec![Reply::hang()]),
+                ("/ok", vec![Reply::empty(201)]),
+            ])
+            .await;
+            let sender = webpush_sender_for(&server, true, Arc::new(scp_clock::SystemClock))?;
+            let (config, _dir) = config(vec![PushSender::WebPush(sender)])?;
+            let push = PushRole::Enabled(PushService::start(config)?);
+            let (_, hung) = subscribe(server.endpoint("hung.example.net", "/hung"))?;
+            let (_, good) = subscribe(server.endpoint("push.example.net", "/ok"))?;
+            register(
+                &push,
+                REGISTRANT_A,
+                PushPlatform::WebPush,
+                &hung.encode(),
+                &[HUNG],
+            )
+            .await?;
+            register(
+                &push,
+                REGISTRANT_A,
+                PushPlatform::WebPush,
+                &good.encode(),
+                &[GOOD],
+            )
+            .await?;
+
+            notify(&push, &HUNG);
+            wait_for_requests(&server, 1, Duration::from_secs(5)).await?;
+            notify(&push, &GOOD);
+            wait_for_requests(&server, 2, Duration::from_secs(3)).await?;
+            let paths: Vec<String> = server
+                .requests()
+                .await
+                .into_iter()
+                .map(|r| r.path)
+                .collect();
+            assert_eq!(paths, ["/hung", "/ok"]);
+            Ok(())
         }
 
         /// Drain tests: the recording sender compiles only under `testing`.
@@ -1425,6 +1590,61 @@ mod enabled {
                 Ok(())
             }
 
+            /// The `WebPush` drain sends concurrently, but never two sends of
+            /// one token at once: while a token's send is held, a second wake
+            /// for it waits and a third joins the second, and another token's
+            /// wake is sent at once. Once the held send finishes, the waiting
+            /// job is sent, so the token's two outcomes reach the store in
+            /// order.
+            #[tokio::test]
+            async fn webpush_sends_one_token_at_a_time() -> TestResult {
+                use PushSendOutcome::InvalidToken;
+                const T: RoutingId = [0x54; 32];
+                const U: RoutingId = [0x55; 32];
+                let (webpush, gate) =
+                    RecordingSender::gated(PushPlatform::WebPush, [InvalidToken; 8]);
+                let (config, _dir) = config(vec![recording(&webpush)])?;
+                let service = PushService::start(config)?;
+                let push = PushRole::Enabled(service.clone());
+                let (_, t) = subscribe("https://push.example.net/t".to_owned())?;
+                let (_, u) = subscribe("https://push.example.net/u".to_owned())?;
+                let (t, u) = (t.encode(), u.encode());
+                register(&push, REGISTRANT_A, PushPlatform::WebPush, &t, &[T]).await?;
+                register(&push, REGISTRANT_A, PushPlatform::WebPush, &u, &[U]).await?;
+
+                notify(&push, &T);
+                wait_for_sends(&webpush, 1).await?;
+                for _ in 0..2 {
+                    notify(&push, &T);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                notify(&push, &U);
+                wait_for_sends(&webpush, 2).await?;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                assert_eq!(
+                    webpush.sent().await,
+                    vec![t.clone(), u.clone()],
+                    "a second send of the held token started"
+                );
+
+                gate.admit(8);
+                wait_for_sends(&webpush, 3).await?;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                assert_eq!(webpush.sent().await, vec![t.clone(), u, t.clone()]);
+                let store = &service.config().store;
+                for _ in 0..1000 {
+                    if store
+                        .invalid_token_failures(PushPlatform::WebPush, &t)
+                        .await?
+                        == Some(2)
+                    {
+                        return Ok(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Err("the token's two outcomes were not both counted".into())
+            }
+
             /// Publishes to a routing ID with many tokens leave room for
             /// another routing ID's wake: with queues of four and a share of
             /// two, five tokens on A published three times hold two slots,
@@ -1495,8 +1715,8 @@ mod enabled {
     }
 }
 
-/// A push service with a recording APNs sender over a fresh SQLite store,
-/// for the transports' end-to-end wake tests.
+/// A push service over a fresh SQLite store, with a recording APNs sender
+/// or a real `WebPush` sender, for the transports' end-to-end wake tests.
 #[cfg(all(test, feature = "push-store", feature = "testing"))]
 pub(crate) mod wake_harness {
     use std::sync::Arc;
@@ -1512,7 +1732,7 @@ pub(crate) mod wake_harness {
     use tempfile::TempDir;
 
     use super::PushService;
-    use crate::relay::push::{PushSendOutcome, PushSender, RecordingSender};
+    use crate::relay::push::{PushSendOutcome, PushSender, RecordingSender, WebPushSender};
     use crate::relay::push_gate::{
         PushPublishGate, PushRole, PushServiceConfig, gate_publish, test_relay_url,
     };
@@ -1537,41 +1757,14 @@ pub(crate) mod wake_harness {
         /// Starts the service and registers [`TOKEN`] for `routing_ids`
         /// through the push gate, as a client's PUBLISH would.
         pub async fn start(routing_ids: &[[u8; 32]]) -> Result<Self, Error> {
-            let dir = tempfile::tempdir()?;
-            let signer = P256SecretKey::from_scalar_bytes(&[0x5A; 32])?;
             let sender = RecordingSender::new(PushPlatform::Apns, [PushSendOutcome::Delivered; 64]);
-            let service = PushService::start(PushServiceConfig {
-                store: PushRegistrationStore::open_sqlite(&dir.path().join("push.db"))?,
-                verifier: Arc::new(TestPushVerifier::new([(
-                    DID::from(REGISTRANT),
-                    signer.public_key(),
-                )])),
-                senders: Arc::from(vec![PushSender::Recording(sender.clone())]),
-            })?;
-            let push = PushRole::Enabled(service);
-            let now = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
-            let mut msg = PushRegistration {
-                registrant: DID::from(REGISTRANT),
-                platform: PushPlatform::Apns,
-                token: TOKEN.to_vec(),
-                routing_ids: routing_ids.to_vec(),
-                timestamp: now,
-                signature: [0; 64],
-            };
-            let relay_url = test_relay_url();
-            let reserved_urls = relay_url.current();
-            let [current] = reserved_urls.as_slice() else {
-                return Err("the test relay reserves one URL".into());
-            };
-            let digest: [u8; 32] =
-                Sha256::digest(push_registration_signing_bytes(&msg, current.push_relay())?).into();
-            msg.signature = sign_prehash_rfc6979(&signer, &digest)?;
-            let reserved = current.push_routing_id();
-            let blob = rmp_serde::to_vec_named(&msg)?;
-            let decision = gate_publish(&relay_url, &push, &reserved, &blob, now).await;
-            if decision != PushPublishGate::Accepted {
-                return Err(format!("registration not accepted: {decision:?}").into());
-            }
+            let (push, dir) = registered(
+                PushSender::Recording(sender.clone()),
+                PushPlatform::Apns,
+                TOKEN,
+                routing_ids,
+            )
+            .await?;
             Ok(Self {
                 push,
                 sender,
@@ -1598,5 +1791,68 @@ pub(crate) mod wake_harness {
             }
             Err(format!("expected {n} wakes, saw {}", self.wakes().await).into())
         }
+    }
+
+    /// A running push service whose one sender is `sender`, holding a
+    /// `WebPush` registration of `token` for `routing_ids` made through the
+    /// push gate. The returned directory holds the store.
+    pub async fn webpush(
+        sender: WebPushSender,
+        token: &[u8],
+        routing_ids: &[[u8; 32]],
+    ) -> Result<(PushRole, TempDir), Error> {
+        registered(
+            PushSender::WebPush(sender),
+            PushPlatform::WebPush,
+            token,
+            routing_ids,
+        )
+        .await
+    }
+
+    /// Starts a service whose one sender is `sender`, and registers `token`
+    /// on `platform` for `routing_ids` through the push gate, as a client's
+    /// PUBLISH would, signed by a key the `TestPushVerifier` holds.
+    async fn registered(
+        sender: PushSender,
+        platform: PushPlatform,
+        token: &[u8],
+        routing_ids: &[[u8; 32]],
+    ) -> Result<(PushRole, TempDir), Error> {
+        let dir = tempfile::tempdir()?;
+        let signer = P256SecretKey::from_scalar_bytes(&[0x5A; 32])?;
+        let service = PushService::start(PushServiceConfig {
+            store: PushRegistrationStore::open_sqlite(&dir.path().join("push.db"))?,
+            verifier: Arc::new(TestPushVerifier::new([(
+                DID::from(REGISTRANT),
+                signer.public_key(),
+            )])),
+            senders: Arc::from(vec![sender]),
+        })?;
+        let push = PushRole::Enabled(service);
+        let now = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
+        let mut msg = PushRegistration {
+            registrant: DID::from(REGISTRANT),
+            platform,
+            token: token.to_vec(),
+            routing_ids: routing_ids.to_vec(),
+            timestamp: now,
+            signature: [0; 64],
+        };
+        let relay_url = test_relay_url();
+        let reserved_urls = relay_url.current();
+        let [current] = reserved_urls.as_slice() else {
+            return Err("the test relay reserves one URL".into());
+        };
+        let digest: [u8; 32] =
+            Sha256::digest(push_registration_signing_bytes(&msg, current.push_relay())?).into();
+        msg.signature = sign_prehash_rfc6979(&signer, &digest)?;
+        let reserved = current.push_routing_id();
+        let blob = rmp_serde::to_vec_named(&msg)?;
+        let decision = gate_publish(&relay_url, &push, &reserved, &blob, now).await;
+        if decision != PushPublishGate::Accepted {
+            return Err(format!("registration not accepted: {decision:?}").into());
+        }
+        Ok((push, dir))
     }
 }

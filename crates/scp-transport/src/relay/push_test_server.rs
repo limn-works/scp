@@ -1,6 +1,8 @@
-//! A local HTTP/2 (h2c) server for the push sender tests and the relay's
-//! end-to-end wake tests (PUSH-008, PUSH-010, PUSH-011). Compiled only under
-//! `cfg(test)`; the tests never reach Apple or Google.
+//! A local HTTP/2 server for the push sender tests and the relay's
+//! end-to-end wake tests (PUSH-008, PUSH-010, PUSH-011, PUSH-022): h2c for the
+//! APNs and FCM senders, and h2 over TLS for the `WebPush` sender, which sends
+//! only to `https` endpoints. Compiled only under `cfg(test)`; the tests never
+//! reach Apple, Google or a browser push service.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -12,6 +14,9 @@ use bytes::Bytes;
 use tokio::net::{TcpListener, TcpSocket};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
+use tokio_rustls::TlsAcceptor;
+use tokio_rustls::rustls;
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 /// One request the server received.
 #[derive(Debug, Clone)]
@@ -39,6 +44,9 @@ pub struct Reply {
     status: u16,
     body: Vec<u8>,
     content_type: Option<&'static str>,
+    /// Never answer: hold the stream open, as a push service that stopped
+    /// answering does.
+    hang: bool,
 }
 
 impl Reply {
@@ -48,6 +56,16 @@ impl Reply {
             status,
             body: Vec::new(),
             content_type: None,
+            hang: false,
+        }
+    }
+
+    /// No response at all: the request is recorded and its stream held open
+    /// until the server is dropped.
+    pub fn hang() -> Self {
+        Self {
+            hang: true,
+            ..Self::empty(UNSCRIPTED_STATUS)
         }
     }
 }
@@ -58,6 +76,7 @@ pub fn json_reply(status: u16, body: &serde_json::Value) -> Reply {
         status,
         body: body.to_string().into_bytes(),
         content_type: Some("application/json"),
+        hang: false,
     }
 }
 
@@ -91,6 +110,16 @@ impl TestServer {
     pub async fn start_routed(routes: Vec<(&str, Vec<Reply>)>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
+        Self::serve_on(listener, origin, routes, None)
+    }
+
+    /// Serves `routes` on `listener`, over TLS when `tls` is given.
+    fn serve_on(
+        listener: TcpListener,
+        origin: String,
+        routes: Vec<(&str, Vec<Reply>)>,
+        tls: Option<TlsAcceptor>,
+    ) -> Self {
         let routes: Routes = Arc::new(Mutex::new(
             routes
                 .into_iter()
@@ -107,19 +136,16 @@ impl TestServer {
                     };
                     let routes = routes.clone();
                     let requests = requests.clone();
+                    let tls = tls.clone();
                     tokio::spawn(async move {
-                        let Ok(mut connection) = h2::server::handshake(socket).await else {
-                            return;
-                        };
-                        // Each stream is served on its own task: reading a
-                        // request body needs `accept` to keep driving the
-                        // connection.
-                        while let Some(Ok((request, respond))) = connection.accept().await {
-                            let routes = routes.clone();
-                            let requests = requests.clone();
-                            tokio::spawn(async move {
-                                serve(request, respond, &routes, &requests).await;
-                            });
+                        match tls {
+                            None => serve_connection(socket, routes, requests).await,
+                            Some(acceptor) => {
+                                let Ok(stream) = acceptor.accept(socket).await else {
+                                    return;
+                                };
+                                serve_connection(stream, routes, requests).await;
+                            }
                         }
                     });
                 }
@@ -230,6 +256,87 @@ impl FrozenServer {
     }
 }
 
+/// Serves every stream of one HTTP/2 connection.
+async fn serve_connection<S>(socket: S, routes: Routes, requests: Arc<Mutex<Vec<CapturedRequest>>>)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let Ok(mut connection) = h2::server::handshake(socket).await else {
+        return;
+    };
+    // Each stream is served on its own task: reading a request body needs
+    // `accept` to keep driving the connection.
+    while let Some(Ok((request, respond))) = connection.accept().await {
+        let routes = routes.clone();
+        let requests = requests.clone();
+        tokio::spawn(async move {
+            serve(request, respond, &routes, &requests).await;
+        });
+    }
+}
+
+/// The host names a [`TlsTestServer`] certificate covers. A `WebPush` test
+/// points each at `127.0.0.1` through its resolver; two names are two
+/// endpoint origins on one server.
+pub const TLS_TEST_HOSTS: [&str; 2] = ["push.example.net", "hung.example.net"];
+
+/// An HTTP/2-over-TLS server on `127.0.0.1` with a fresh self-signed
+/// certificate for [`TLS_TEST_HOSTS`], offering only `h2` in ALPN. Replies
+/// are chosen by path prefix as for [`TestServer`].
+pub struct TlsTestServer {
+    server: TestServer,
+    port: u16,
+    root: reqwest::Certificate,
+}
+
+impl TlsTestServer {
+    /// A server whose replies are chosen by path prefix.
+    pub async fn start_routed(routes: Vec<(&str, Vec<Reply>)>) -> Self {
+        let cert = rcgen::generate_simple_self_signed(
+            TLS_TEST_HOSTS
+                .iter()
+                .map(|h| (*h).to_owned())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let root = reqwest::Certificate::from_der(cert.cert.der()).unwrap();
+        let key = PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
+        let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![CertificateDer::from(cert.cert.der().to_vec())], key)
+        .unwrap();
+        config.alpn_protocols = vec![b"h2".to_vec()];
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = TestServer::serve_on(
+            listener,
+            format!("https://127.0.0.1:{port}"),
+            routes,
+            Some(TlsAcceptor::from(Arc::new(config))),
+        );
+        Self { server, port, root }
+    }
+
+    /// The certificate a client must trust to reach this server.
+    pub fn root(&self) -> reqwest::Certificate {
+        self.root.clone()
+    }
+
+    /// `https://<host>:<port><path>`, an endpoint on this server.
+    pub fn endpoint(&self, host: &str, path: &str) -> String {
+        format!("https://{host}:{}{path}", self.port)
+    }
+
+    /// Every request received so far, in arrival order.
+    pub async fn requests(&self) -> Vec<CapturedRequest> {
+        self.server.requests().await
+    }
+}
+
 async fn serve(
     request: http::Request<h2::RecvStream>,
     mut respond: h2::server::SendResponse<Bytes>,
@@ -266,6 +373,11 @@ async fn serve(
         .find(|(prefix, _)| path.starts_with(prefix.as_str()))
         .and_then(|(_, replies)| replies.pop_front())
         .unwrap_or_else(|| Reply::empty(UNSCRIPTED_STATUS));
+    if reply.hang {
+        // `respond` stays alive on this never-finishing task, so the stream
+        // stays open until the server's runtime drops it.
+        std::future::pending::<()>().await;
+    }
     let mut response = http::Response::builder().status(reply.status);
     if let Some(content_type) = reply.content_type {
         response = response.header("content-type", content_type);

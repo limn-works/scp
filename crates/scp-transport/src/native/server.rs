@@ -5043,6 +5043,63 @@ mod tests {
                 harness.wait_for_wakes(1).await.unwrap();
             }
 
+            /// PUSH-022 AC8: a blob the relay stores wakes a `WebPush` device
+            /// registered through the push gate: the endpoint receives one
+            /// wake that opens, under the device's keys, to the wake body.
+            #[tokio::test]
+            async fn websocket_publish_wakes_a_webpush_device() {
+                use crate::relay::push_test_server::{Reply, TlsTestServer};
+                use crate::relay::push_webpush::tests::{sender_for, subscribe};
+
+                let rid = [0x57; 32];
+                let server =
+                    TlsTestServer::start_routed(vec![("/wake", vec![Reply::empty(201)])]).await;
+                let sender =
+                    sender_for(&server, true, std::sync::Arc::new(scp_clock::SystemClock)).unwrap();
+                let (ua, subscription) =
+                    subscribe(server.endpoint("push.example.net", "/wake")).unwrap();
+                let (push, _dir) = crate::relay::push_dispatch::wake_harness::webpush(
+                    sender,
+                    &subscription.encode(),
+                    &[rid],
+                )
+                .await
+                .unwrap();
+                let addr = start_push_server(push).await;
+                let reply = publish_to(addr, rid, vec![7; 16]).await;
+                assert!(
+                    matches!(
+                        reply,
+                        RelayMessage::Ok {
+                            blob_id: Some(_),
+                            ..
+                        }
+                    ),
+                    "{reply:?}"
+                );
+                let mut requests = Vec::new();
+                for _ in 0..1000 {
+                    requests = server.requests().await;
+                    if !requests.is_empty() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                let [request] = requests.as_slice() else {
+                    panic!("expected one wake, saw {}", requests.len());
+                };
+                assert_eq!(request.path, "/wake");
+                assert_eq!(
+                    scp_crypto::webpush::open(
+                        &ua,
+                        &crate::relay::push_webpush::tests::AUTH,
+                        &request.body
+                    )
+                    .unwrap(),
+                    br#"{"scp":"1"}"#
+                );
+            }
+
             #[tokio::test]
             async fn websocket_plain_blob_publish_wakes() {
                 let rid = [0x44; 32];

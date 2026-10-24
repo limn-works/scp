@@ -223,6 +223,9 @@ http = "1"
 # Dev-only: production RS256 signing is ring's. `getrandom` enables
 # `rand_core::OsRng` for key generation.
 rsa = { version = "0.9.10", features = ["getrandom"] }
+# `scp_crypto::webpush::open`, which the WebPush sender tests decrypt a wake
+# body with (PUSH-022). Dev-only: no shipped build can decrypt a wake.
+scp-crypto = { path = "../scp-crypto", features = ["testing"] }
 
 [[test]]
 name = "blob_storage_fail_closed"

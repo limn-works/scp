@@ -25,7 +25,8 @@
 //! - [`push`] -- the relay push sender seam ([`push::PushSender`],
 //!   [`push::PushSendOutcome`]) that sends the §10.7.1 step 5 wake signal,
 //!   with the APNs sender in [`push_apns`] (PUSH-010) and the FCM HTTP v1
-//!   sender in [`push_fcm`] (PUSH-011).
+//!   sender in [`push_fcm`] (PUSH-011), and the `WebPush` sender in
+//!   [`push_webpush`] (PUSH-022).
 //! - [`push_endpoint`] -- the ADR-004 `WebPush` endpoint refusal rule
 //!   (PUSH-022): the endpoint URL rules, the special-purpose address rule,
 //!   and the resolver that applies it to every address a host resolves to.
@@ -61,6 +62,7 @@ pub mod push_gate;
 pub mod push_store;
 #[cfg(test)]
 pub(crate) mod push_test_server;
+pub mod push_webpush;
 pub mod rate_limit;
 pub mod stun_service;
 pub mod subscription;
