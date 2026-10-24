@@ -1190,7 +1190,8 @@ fn nat_tier_task_writes_the_relay_push_url_handle() {
         .expect("build_no_domain_inner must publish through seed_from_startup_publish");
     assert!(
         reserve < seed,
-        "build_no_domain_inner must reserve the startup entry's routing ID before it publishes"
+        "build_no_domain_inner must bind its publisher with NodePublisher::new before it calls \
+         seed_from_startup_publish, which reserves on that publisher"
     );
     let seed_body = extract_fn_body(NODE_PUBLISHED_STATE_SRC, "seed_from_startup_publish")
         .expect("seed_from_startup_publish body");

@@ -291,16 +291,30 @@ impl<D: DidMethod + 'static> DidPublisher for NodeDidPublisher<D> {
 ///
 /// - The production constructor [`NodePublisher::new`] takes a
 ///   [`RelayConfig`] and clones its `relay_url` itself, so a production
-///   caller cannot bind the publisher to a bare handle it minted with the
-///   public `LiveRelayUrl::new`; it can only name a relay configuration.
+///   caller must name a relay configuration, not a bare `LiveRelayUrl`.
 /// - The reservation takes no handle, so every reservation before a publish
 ///   moves the handle the publisher was built with.
 ///
-/// What the types do not guarantee: that the [`RelayConfig`] a builder names
-/// is the one its relay server runs. Each builder passes the `relay_config`
-/// it then stores as the node's relay configuration, and `pipeline_wiring.rs`
-/// and the builder tests check that (§10.7.1 "Tier 3 relays": "its relay
-/// reserves every one of those IDs before the node publishes the entries").
+/// What the types do not guarantee: that the [`RelayConfig`] a caller names
+/// is the one its relay server runs. A caller can still build a
+/// `RelayConfig` around a fresh handle, for example
+/// `RelayConfig::defaults(LiveRelayUrl::new(url))`, and bind the publisher
+/// to it. Each builder passes the `relay_config` it then stores and runs its
+/// relay with. Two kinds of check hold that (§10.7.1 "Tier 3 relays": "its
+/// relay reserves every one of those IDs before the node publishes the
+/// entries"):
+/// - the `&relay_config` argument pins in `pipeline_wiring.rs`
+///   (`every_node_document_publish_reserves_the_published_entries`,
+///   `nat_tier_task_writes_the_relay_push_url_handle` and
+///   `reserved_document_is_minted_only_by_the_publisher_on_its_own_handle`);
+/// - the unit tests that start a node and send a PUBLISH to its own relay
+///   listener at each reserved routing ID:
+///   `no_domain_relay_reserves_the_push_routing_id_of_its_advertised_url`,
+///   `no_domain_node_reserves_its_tier3_id_at_startup`,
+///   `domain_node_reserves_its_explicit_documents_tier3_entry_at_startup`,
+///   `explicit_node_reserves_its_documents_second_tier3_entry_at_startup_and_after_a_tier_change`,
+///   `tier_change_moves_the_relay_push_gate_to_the_new_url` and
+///   `tier_change_to_a_bridge_entry_intercepts_its_tier3_id_at_the_node_listener`.
 #[derive(Clone)]
 pub struct NodePublisher {
     inner: Arc<dyn DidPublisher>,
