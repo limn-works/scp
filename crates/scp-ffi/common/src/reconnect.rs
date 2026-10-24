@@ -80,6 +80,12 @@ use scp_core::context::actor::CommandSigner;
 /// the relay's accepted TTL band.
 const RESET_BLOB_TTL_SECS: u32 = 3600;
 
+/// Blob TTL (seconds) of a Tier-2 snapshot a member publishes at its context's
+/// shared routing key: the relay maximum, so a member offline for up to 7 days
+/// still finds it (spec 23 §23.5, spec 09 §9.10.2 "Blob TTL by message type").
+/// `scp-relay-client` pins the message-class TTL equal to `MAX_BLOB_TTL`.
+const SNAPSHOT_BLOB_TTL_SECS: u32 = scp_protocol::envelope::outer::BlobClass::Message.ttl_secs();
+
 /// Overlap, in seconds, subtracted from a stored relay-contact time before it
 /// becomes a QUERY `since` (ADR-004 Connection Recovery; ADR-029 §2 push-wake
 /// pull mode step 4).
@@ -754,7 +760,7 @@ impl SnapshotTransport for RelayActorSyncDriver<'_> {
         let envelope = create_outer_envelope(
             routing_id.as_bytes(),
             None,
-            RESET_BLOB_TTL_SECS,
+            SNAPSHOT_BLOB_TTL_SECS,
             data.to_vec(),
         )
         .map_err(|e| DaysOfflineError::SnapshotCodecFailed {
@@ -1741,6 +1747,92 @@ pub async fn deliver_live_envelope(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// An adapter that records every envelope it is asked to send.
+    #[derive(Clone, Default)]
+    struct RecordingAdapter(Arc<Mutex<Vec<scp_core::envelope::OuterEnvelope>>>);
+
+    type BoxFut<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
+    impl scp_transport::traits::TransportAdapter for RecordingAdapter {
+        fn send(
+            &self,
+            envelope: &scp_core::envelope::OuterEnvelope,
+        ) -> BoxFut<'_, Result<scp_transport::traits::BlobId, scp_transport::TransportError>>
+        {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(envelope.clone());
+            Box::pin(async { Ok(scp_transport::traits::BlobId::new([0; 32])) })
+        }
+        fn subscribe(
+            &self,
+            _: &RoutingId,
+            _: Option<u64>,
+        ) -> BoxFut<
+            '_,
+            Result<scp_transport::traits::SubscriptionStream, scp_transport::TransportError>,
+        > {
+            Box::pin(async { Err(scp_transport::TransportError::NotConnected) })
+        }
+        fn unsubscribe(
+            &self,
+            _: &RoutingId,
+        ) -> BoxFut<'_, Result<(), scp_transport::TransportError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn query(
+            &self,
+            _: &RoutingId,
+            _: Option<u64>,
+        ) -> BoxFut<'_, Result<Vec<scp_core::envelope::OuterEnvelope>, scp_transport::TransportError>>
+        {
+            Box::pin(async { Err(scp_transport::TransportError::NotConnected) })
+        }
+        fn delete(
+            &self,
+            _: &scp_transport::traits::BlobId,
+        ) -> BoxFut<'_, Result<(), scp_transport::TransportError>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// Spec 23 §23.5 and spec 09 §9.10.2: a Tier-2 snapshot is stored for the
+    /// relay maximum, so a member offline for up to 7 days finds it; a Tier-3
+    /// reset request keeps its one-hour TTL.
+    #[tokio::test]
+    async fn a_tier_2_snapshot_requests_the_relay_maximum_blob_ttl() {
+        let adapter = RecordingAdapter::default();
+        let transport = Arc::new(scp_transport::TransportManager::new(
+            "wss://test.example".to_owned(),
+            Box::new(adapter.clone()),
+        ));
+        let supervisor = crate::bridge_instance::tests::test_supervisor();
+        let tally = DeliveryTally::default();
+        let driver = RelayActorSyncDriver::new(
+            &transport,
+            &supervisor,
+            DID::from("did:dht:snapshot-ttl"),
+            CommandSigner::local_ed25519(ed25519_dalek::SigningKey::from_bytes(&[7; 32])),
+            &tally,
+        );
+        driver
+            .publish_snapshot_bytes("ctx", b"snapshot")
+            .await
+            .unwrap();
+        driver.publish_plaintext("ctx", b"reset").await.unwrap();
+        let sent = adapter
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert_eq!(sent[0].encrypted_blob, b"snapshot");
+        assert_eq!(sent[0].blob_ttl, scp_relay_client::MAX_BLOB_TTL);
+        assert_eq!(sent[1].encrypted_blob, b"reset");
+        assert_eq!(sent[1].blob_ttl, 3_600);
+    }
 
     fn contacts()
     -> scp_core::store::sync::StorageRelayContactStore<scp_platform::in_memory::InMemoryStorage>

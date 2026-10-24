@@ -527,6 +527,11 @@ pub struct ConsequenceConfig {
 /// shorter.
 pub const PSEUDONYM_ROTATION_GRACE_SECS: u64 = 600;
 
+/// Most previous routing IDs a member keeps on its query-only list in one
+/// context (spec §9.18.11, §9.10.4.1 "Query-only list"). A rotation past the
+/// bound drops the entry with the earliest expiry.
+pub const PSEUDONYM_QUERY_ONLY_MAX_ENTRIES: usize = 1_024;
+
 /// When each member of an encrypted context rotates its pseudonymous routing
 /// ID (spec §9.10.4.1 "Rotation policy, and where it lives").
 ///

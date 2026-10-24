@@ -143,9 +143,6 @@ pub async fn build_well_known_scp(state: &NodeState) -> WellKnownScp {
     let rc = &state.relay_config;
     let relay_config = RelayConfig {
         max_blob_size: Some(rc.max_blob_size as u64),
-        // Every conforming relay enforces the protocol ceiling (spec 18
-        // §18.3.3, spec 09 §9.18.11); no operator setting changes it.
-        max_blob_ttl: Some(u64::from(scp_relay_client::MAX_BLOB_TTL)),
         // Spec §18.3.3: unit is "per minute"; transport field is per-second.
         rate_limit_publish: Some(rc.rate_limit_publishes_per_second.saturating_mul(60)),
         // Spec §18.3.3: "Maximum concurrent subscriptions per connection."

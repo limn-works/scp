@@ -217,15 +217,15 @@ impl Members {
         url: &str,
     ) -> Vec<[u8; 32]> {
         self.alice.send_message(handle, PLAINTEXT).await.unwrap();
-        let sent = self.alice.take_sent_ciphertexts();
+        let sent = self.alice.take_sent_publishes();
         assert!(!sent.is_empty(), "Alice's actor sealed nothing");
         let adapter = connect(url).await;
         let mut routing_ids = Vec::new();
-        for (routing_id, sealed) in sent {
+        for (routing_id, sealed, ttl) in sent {
             let envelope = scp_core::envelope::OuterEnvelope::frame_mls_message(
                 &routing_id,
                 None,
-                3600,
+                ttl,
                 sealed,
             )
             .unwrap();
@@ -1040,7 +1040,9 @@ async fn publish_alice_key_request(m: &Members, url: &str) {
     let envelope = scp_core::envelope::OuterEnvelope::frame_mls_message(
         &scp_core::context::context_routing_id(&m.ctx_id),
         None,
-        3600,
+        scp_protocol::envelope::outer::BlobTtl::fresh(
+            scp_protocol::envelope::outer::BlobClass::Message,
+        ),
         sealed,
     )
     .unwrap();

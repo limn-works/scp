@@ -356,17 +356,17 @@ async fn end_to_end_network_demo() {
         .send_message(&handle, original_msg)
         .await
         .unwrap();
-    let mut sent = alice_node.take_sent_ciphertexts();
+    let mut sent = alice_node.take_sent_publishes();
     assert_eq!(sent.len(), 1, "exactly one ciphertext for the one peer");
-    let (sent_routing, sealed) = sent.remove(0);
+    let (sent_routing, sealed, ttl) = sent.remove(0);
     assert_eq!(sent_routing, routing_arr, "addressed to Bob's pseudonym");
-    // The harness captures the serialized MLS message and its routing id
-    // separately; the transport frames the message once, addressed to Bob's
-    // pseudonym (ADR-002, spec 23 §23.4.1).
+    // The harness captures the serialized MLS message, its routing id and the
+    // TTL the runtime chose; the transport frames the message once, addressed
+    // to Bob's pseudonym (ADR-002, spec 23 §23.4.1).
     let outer_env = scp_core::envelope::OuterEnvelope::frame_mls_message(
         &routing_arr,
         None,
-        3600,
+        ttl,
         sealed.clone(),
     )
     .unwrap();

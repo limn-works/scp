@@ -537,8 +537,14 @@ async fn apply_guarded(
 
     let envelope_bytes = rmp_serde::to_vec_named(&envelope)
         .map_err(|e| ContextError::CryptoFailed(format!("envelope serialization: {e}")))?;
+    // A broadcast post requests the relay maximum as its delivery lifetime,
+    // like every other message to a context (spec 09 §9.10.2 "Blob TTL by
+    // message type").
+    let ttl = scp_protocol::envelope::outer::BlobTtl::fresh(
+        scp_protocol::envelope::outer::BlobClass::Message,
+    );
     deps.transport
-        .send_message(routing_id, &envelope_bytes)
+        .send_message(routing_id, &envelope_bytes, ttl)
         .await?;
 
     // `MessageSent` is no longer a durable Merkle leaf — per ADR-051 §6 / the

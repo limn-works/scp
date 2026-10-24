@@ -1797,10 +1797,15 @@ pub async fn encrypt_and_send(
     if routing_ids.is_empty() {
         return Ok(());
     }
+    // The one place a context message's relay TTL is chosen: from its type
+    // (spec 09 §9.10.2 "Blob TTL by message type").
+    let ttl = scp_protocol::envelope::outer::BlobTtl::fresh(
+        scp_protocol::envelope::outer::BlobClass::of(message_type),
+    );
     let mut last_err = None;
     let mut any_success = false;
     for rid in routing_ids {
-        match deps.transport.send_message(rid, &encrypted).await {
+        match deps.transport.send_message(rid, &encrypted, ttl).await {
             Ok(()) => {
                 any_success = true;
                 crate::metrics::record_message_sent();
@@ -2971,7 +2976,7 @@ pub fn build_snapshot_from_state(
         stream_reservations: stream_reservations_snapshot(state),
         // §9.10.4.1 Class S: persist the rotation state so a crash after the
         // rotation's persist restores the new epoch with `announce_pending`.
-        pseudonym_rotation: state.class_s.pseudonym_rotation,
+        pseudonym_rotation: state.class_s.pseudonym_rotation.clone(),
         // ADR-049 §9 Class S (§5.14.8 block-before-serve): fold the broadcast
         // security + roster state (per-author key epochs, block lists, subscriber
         // registry) into the fail-closed snapshot so a block / governance ban /
@@ -3940,7 +3945,7 @@ pub async fn send_pseudonym_announcement(
     let Some(routing_id) = cell.routing.local_pseudonym() else {
         return Err(ContextError::NotPseudonymousContext { context_id });
     };
-    let rotation = cell.class_s.pseudonym_rotation;
+    let rotation = cell.class_s.pseudonym_rotation.clone();
     let payload = encode_local_announcement(sender_did.as_ref(), routing_id, rotation.epoch())?;
     send_message(
         cell,
@@ -4074,7 +4079,7 @@ pub(super) async fn rotate_pseudonym(
 
     let now_secs = deps.clock.now_secs();
     let policy = handle.params().pseudonym_rotation;
-    let mut rotation = cell.class_s.pseudonym_rotation;
+    let mut rotation = cell.class_s.pseudonym_rotation.clone();
     let Some(expected_epoch) = rotation.due_epoch(policy.as_ref(), now_secs) else {
         return Err(ContextError::InvalidState(
             "no pseudonym rotation is due: the context has no rotation policy, no trigger has \

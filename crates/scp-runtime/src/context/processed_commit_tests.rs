@@ -123,7 +123,12 @@ impl ContextTransportProvider for RecordingTransport {
     async fn delete_published(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    async fn send_message(&self, _id: &[u8; 32], payload: &[u8]) -> Result<(), ContextError> {
+    async fn send_message(
+        &self,
+        _id: &[u8; 32],
+        payload: &[u8],
+        _ttl: scp_protocol::envelope::outer::BlobTtl,
+    ) -> Result<(), ContextError> {
         self.0.push(payload.to_vec());
         Ok(())
     }
@@ -606,7 +611,7 @@ async fn a_reset_without_the_targets_key_package_changes_nothing() {
 async fn a_non_committer_records_no_rotation_for_a_reset() {
     let ctx = "reset-records-no-rotation";
     let (mut alice, mut bob) = trio(ctx).await;
-    let rotation_before: PseudonymRotationState = bob.cell.class_s.pseudonym_rotation;
+    let rotation_before: PseudonymRotationState = bob.cell.class_s.pseudonym_rotation.clone();
     assert!(!rotation_before.membership_change_pending);
 
     let output = reset_carol(&mut alice, ctx, Some(&key_package(CAROL)))

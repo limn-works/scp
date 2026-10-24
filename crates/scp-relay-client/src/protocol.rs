@@ -43,13 +43,24 @@ pub const MIN_BLOB_TTL: u32 = 1;
 /// Maximum blob TTL in seconds (7 days).
 pub const MAX_BLOB_TTL: u32 = 604_800;
 
-// A member requests the relay maximum for every MLS message it publishes
-// (`09-security-model.md` §9.10.2 "Application-data blob TTL"). The value lives
-// in `scp-protocol`, which cannot depend on this crate, so the equality is
-// pinned here: changing either constant alone fails the build.
+// A member requests the relay maximum for every MLS message it publishes other
+// than a heartbeat or a checkpoint, whose shorter TTLs a relay must also accept
+// (`09-security-model.md` §9.10.2 "Blob TTL by message type"). The values live
+// in `scp-protocol`, which cannot depend on this crate, so the relations are
+// pinned here: changing a constant alone fails the build.
 const _: () = assert!(
     scp_protocol::envelope::outer::DEFAULT_APP_DATA_BLOB_TTL_SECS == MAX_BLOB_TTL,
     "DEFAULT_APP_DATA_BLOB_TTL_SECS must equal MAX_BLOB_TTL (spec 09 §9.10.2)"
+);
+const _: () = assert!(
+    scp_protocol::envelope::outer::HEARTBEAT_BLOB_TTL_SECS >= MIN_BLOB_TTL
+        && scp_protocol::envelope::outer::HEARTBEAT_BLOB_TTL_SECS <= MAX_BLOB_TTL,
+    "HEARTBEAT_BLOB_TTL_SECS must lie in [MIN_BLOB_TTL, MAX_BLOB_TTL] (spec 09 §9.10.2)"
+);
+const _: () = assert!(
+    scp_protocol::envelope::outer::CHECKPOINT_BLOB_TTL_SECS >= MIN_BLOB_TTL
+        && scp_protocol::envelope::outer::CHECKPOINT_BLOB_TTL_SECS <= MAX_BLOB_TTL,
+    "CHECKPOINT_BLOB_TTL_SECS must lie in [MIN_BLOB_TTL, MAX_BLOB_TTL] (spec 09 §9.10.2)"
 );
 
 /// Maximum `ref_id` length in bytes.
@@ -650,7 +661,7 @@ mod tests {
     use super::*;
 
     /// A member's MLS-message TTL is the relay maximum
-    /// (`09-security-model.md` §9.10.2 "Application-data blob TTL"), and a
+    /// (`09-security-model.md` §9.10.2 "Blob TTL by message type"), and a
     /// PUBLISH carrying it passes the decode-side TTL bound.
     #[test]
     fn app_data_blob_ttl_is_the_relay_maximum_and_decodes() {

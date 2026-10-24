@@ -2576,8 +2576,31 @@ mod tests {
         match reply {
             RelayMessage::Err { code, .. } => {
                 assert_eq!(code, code::TTL_TOO_LONG);
+                assert_eq!(code, 4011);
             }
             other => panic!("expected ERR, got {other:?}"),
+        }
+    }
+
+    /// The ceiling is the protocol constant `MAX_BLOB_TTL` with no
+    /// configuration path (spec 09 §9.18.11): exactly `MAX_BLOB_TTL` is stored.
+    #[tokio::test]
+    async fn publish_at_the_protocol_ttl_ceiling_is_accepted() {
+        let addr = start_test_server().await;
+        let (mut sink, mut stream) = connect_client(addr).await;
+
+        let publish = ClientMessage::Publish {
+            ref_id: Some("ttl-max".to_string()),
+            routing_id: [0x00; 32],
+            recipient_hint: None,
+            blob_ttl: MAX_BLOB_TTL,
+            blob: vec![1],
+        };
+        send_msg(&mut sink, &publish).await;
+
+        match recv_msg(&mut stream).await {
+            RelayMessage::Ok { ref_id, .. } => assert_eq!(ref_id.as_deref(), Some("ttl-max")),
+            other => panic!("expected OK, got {other:?}"),
         }
     }
 

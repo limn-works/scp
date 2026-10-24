@@ -165,6 +165,14 @@ async fn well_known_advertises_quic_when_listener_running() {
         transport_names.contains(&"quic"),
         "quic must be advertised while the QUIC listener is running, got {transport_names:?}"
     );
+    // The blob TTL ceiling is the protocol constant `MAX_BLOB_TTL`, not relay
+    // configuration, so the document advertises none (spec 18 §18.3.3).
+    assert!(
+        doc.get("relay_config")
+            .and_then(|rc| rc.get("max_blob_ttl"))
+            .is_none(),
+        "relay_config must carry no max_blob_ttl, got {doc}"
+    );
 
     // Close the client's pooled keep-alive connection first: the TLS server's
     // shutdown waits for open connections to finish, up to 30 s.

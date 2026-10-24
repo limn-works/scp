@@ -3493,6 +3493,7 @@ impl ContextTransportProvider for RecordingTransport {
         &self,
         _context_id: &[u8; 32],
         _encrypted_payload: &[u8],
+        _ttl: scp_protocol::envelope::outer::BlobTtl,
     ) -> Result<(), ContextError> {
         Ok(())
     }

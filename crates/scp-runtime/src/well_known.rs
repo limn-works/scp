@@ -122,10 +122,6 @@ pub struct RelayConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_blob_size: Option<u64>,
 
-    /// Maximum blob TTL the relay enforces, in seconds.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_blob_ttl: Option<u64>,
-
     /// PUBLISH rate limit per connection, per minute.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit_publish: Option<u32>,
@@ -532,7 +528,6 @@ mod tests {
             }]),
             relay_config: Some(RelayConfig {
                 max_blob_size: Some(262_144),
-                max_blob_ttl: Some(86_400),
                 rate_limit_publish: Some(100),
                 rate_limit_subscribe: Some(50),
                 transports: Some(vec!["websocket".to_owned(), "quic".to_owned()]),
@@ -576,7 +571,7 @@ mod tests {
 
         let rc = &json["relay_config"];
         assert_eq!(rc["max_blob_size"], 262_144);
-        assert_eq!(rc["max_blob_ttl"], 86_400);
+        assert!(rc.get("max_blob_ttl").is_none());
         assert_eq!(rc["rate_limit_publish"], 100);
         assert_eq!(rc["rate_limit_subscribe"], 50);
 
@@ -742,7 +737,6 @@ mod tests {
     fn optional_relay_config_fields_omitted_when_none() {
         let config = RelayConfig {
             max_blob_size: Some(1024),
-            max_blob_ttl: None,
             rate_limit_publish: None,
             rate_limit_subscribe: None,
             transports: None,
@@ -761,7 +755,6 @@ mod tests {
     fn transports_field_serializes_when_present() {
         let config = RelayConfig {
             max_blob_size: None,
-            max_blob_ttl: None,
             rate_limit_publish: None,
             rate_limit_subscribe: None,
             transports: Some(vec![
