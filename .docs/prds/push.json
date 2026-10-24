@@ -1478,14 +1478,15 @@
         ".docs/adrs/phase-1.md",
         "crates/scp-node/src/lib.rs"
       ],
-      "description": "Extends the PUSH-012 startup rules to WebPush. The variable names are indicators; the rules are the contract. `SCP_RELAY_PUSH_PLATFORMS` accepts `webpush` in its list. With `webpush` listed, `SCP_RELAY_WEBPUSH_VAPID_KEY_PATH` (a P-256 private key file) and `SCP_RELAY_WEBPUSH_VAPID_SUBJECT` (a `mailto:` or `https:` URI) are required, with no defaults. The key loads only from a file with no group or world permissions, into a zeroizing buffer, and no `Debug` implementation prints it. The relay publishes the VAPID public key where PUSH-021 states. The ADR-004 operator table records the two variables. The `scp-node` embedded relay takes WebPush through the same explicit selection as PUSH-012, defaulting to `Disabled`; the `scp-node` file path is an indicator.",
+      "description": "Extends the PUSH-012 startup rules to WebPush. The variable names are indicators; the rules are the contract. `SCP_RELAY_PUSH_PLATFORMS` accepts `webpush` in its list. With `webpush` listed, `SCP_RELAY_WEBPUSH_VAPID_KEY_PATH` (a P-256 private key file) and `SCP_RELAY_WEBPUSH_VAPID_SUBJECT` (a `mailto:` or `https:` URI) are required, with no defaults. The key loads only from a file with no group or world permissions, into a zeroizing buffer, and no `Debug` implementation prints it. The relay publishes the VAPID public key where PUSH-021 states. The ADR-004 operator table records the two variables. The `scp-node` embedded relay takes WebPush through the same explicit selection as PUSH-012, defaulting to `Disabled`; the `scp-node` file path is an indicator. Startup also builds the two other `WebPushConfig` fields PUSH-022 defines: the parsed VAPID subject, and the relay's own addresses for the ADR-004 endpoint refusal rule, which are the addresses the host of the canonical relay URL resolves to plus each specific address a relay listener binds to.",
       "acceptanceCriteria": [
         "With `webpush` listed, each missing WebPush variable yields its own typed `StartupError` variant naming that variable.",
         "A key file that is unreadable, has group or world permissions, or holds no P-256 private key yields a typed error.",
         "A subject that is neither `mailto:` nor `https:` yields a typed error.",
         "A relay started with `webpush` publishes its VAPID public key where PUSH-021 states, and a test reads it back and checks it matches the key file.",
         "A relay started without `webpush` rejects a WebPush registration with 4061.",
-        "A test checks that the `Debug` output of the push config contains no VAPID key byte."
+        "A test checks that the `Debug` output of the push config contains no VAPID key byte.",
+        "Startup passes the parsed VAPID subject and the relay's own addresses, built from the canonical relay URL host and every specific listener bind address, to the WebPush sender; a test checks that a WebPush endpoint naming one of those addresses gets no request."
       ],
       "actionItems": [
         "Parse the WebPush variables with one typed error per failure.",
