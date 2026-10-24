@@ -1256,6 +1256,14 @@ mod tests {
     #[test]
     fn capabilities_declare_attestation_and_wrapping_types() {
         let caps = scp_capabilities_with_context_params_and_attestation();
+        crate::capability_lists::assert_exact(
+            &caps,
+            &[
+                crate::wrapping_extension::SCP_WRAPPING_KEY_EXTENSION_TYPE,
+                scp_protocol::context::SCP_CONTEXT_EXTENSION_TYPE_ID,
+                SCP_KEYPACKAGE_ATTESTATION_EXTENSION_TYPE,
+            ],
+        );
         assert!(
             caps.extensions().contains(&ExtensionType::Unknown(
                 SCP_KEYPACKAGE_ATTESTATION_EXTENSION_TYPE

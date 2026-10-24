@@ -380,6 +380,20 @@ mod tests {
             crate::group::generate_key_package_with_context_params(&cred, &wrapping, &SystemClock)
                 .unwrap();
         let caps = kp.key_package().leaf_node().capabilities();
+        crate::capability_lists::assert_exact(
+            caps,
+            &[
+                SCP_WRAPPING_KEY_EXTENSION_TYPE,
+                SCP_CONTEXT_EXTENSION_TYPE_ID,
+            ],
+        );
+        crate::capability_lists::assert_exact(
+            &scp_capabilities_with_context_params(),
+            &[
+                SCP_WRAPPING_KEY_EXTENSION_TYPE,
+                SCP_CONTEXT_EXTENSION_TYPE_ID,
+            ],
+        );
         for ext in [
             SCP_CONTEXT_EXTENSION_TYPE_ID,
             SCP_WRAPPING_KEY_EXTENSION_TYPE,

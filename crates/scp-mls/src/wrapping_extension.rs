@@ -331,6 +331,7 @@ mod tests {
     #[test]
     fn scp_capabilities_contains_wrapping_key_type() {
         let caps = scp_capabilities_with_wrapping_key();
+        crate::capability_lists::assert_exact(&caps, &[SCP_WRAPPING_KEY_EXTENSION_TYPE]);
         assert!(
             caps.extensions()
                 .contains(&ExtensionType::Unknown(SCP_WRAPPING_KEY_EXTENSION_TYPE)),

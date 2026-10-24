@@ -126,3 +126,33 @@ pub use wrapping_extension::{
 // (§17.9.1). It lives in `scp-mls` so the sync MLS machine is self-contained
 // (ADR-057).
 pub use provider::{InMemoryMlsProvider, InMemoryMlsStorage, InMemoryMlsStorageError};
+
+/// The exact capability lists every SCP leaf declares, asserted by the tests
+/// of each function that builds them.
+#[cfg(test)]
+mod capability_lists {
+    use openmls::prelude::{Capabilities, CredentialType, ExtensionType, ProtocolVersion};
+    use openmls_traits::types::VerifiableCiphersuite;
+
+    /// Asserts that `caps` lists exactly: version MLS 1.0; ciphersuites
+    /// `0x0001`, `0x0002` and `0x0003`, in that order; `extensions`, in that
+    /// order; no proposal types; and the Basic credential type alone.
+    ///
+    /// A leaf's capabilities are signed into its `LeafNode`, so a change to any
+    /// list changes every published `KeyPackage` and every leaf a member signs.
+    pub fn assert_exact(caps: &Capabilities, extensions: &[u16]) {
+        assert_eq!(caps.versions(), [ProtocolVersion::Mls10]);
+        assert_eq!(
+            caps.ciphersuites(),
+            [1, 2, 3].map(VerifiableCiphersuite::new),
+            "ciphersuites"
+        );
+        let expected: Vec<ExtensionType> = extensions
+            .iter()
+            .map(|t| ExtensionType::Unknown(*t))
+            .collect();
+        assert_eq!(caps.extensions(), expected.as_slice(), "extensions");
+        assert!(caps.proposals().is_empty(), "proposals");
+        assert_eq!(caps.credentials(), [CredentialType::Basic], "credentials");
+    }
+}

@@ -294,6 +294,20 @@ pub fn prepare_key_package(
         })?;
     }
 
+    plan_key_package(credential, wrapping_pubkey, lifetime, signer, ikm)
+}
+
+/// Derives the draft's public keys from `ikm` and `signer` and fills the
+/// unsigned attestation. [`prepare_key_package`] supplies every input from the
+/// operating system and the injected clock; the byte-exact `KeyPackage` test
+/// supplies fixed ones, so both run this one derivation.
+fn plan_key_package(
+    credential: ScpCredential,
+    wrapping_pubkey: &[u8; 65],
+    lifetime: Lifetime,
+    signer: SignatureKeyPair,
+    ikm: Zeroizing<[[u8; IKM_LEN]; IKM_DRAWS]>,
+) -> Result<KeyPackageDraft, MlsError> {
     let crypto = RustCrypto::default();
     let [init_ikm, encryption_ikm] = &*ikm;
     let init_key = derive_public_key(&crypto, init_ikm)?;
@@ -490,6 +504,52 @@ mod tests {
             ));
         }
         assert_eq!(leaf_public_key(&[4; 65])?, [4; 65]);
+        Ok(())
+    }
+
+    /// The `KeyPackage` bytes the attested mint builds from fixed inputs.
+    ///
+    /// Every input is fixed: the DID, the wrapping key, the leaf signer's
+    /// P-256 scalar, both IKM values, the lifetime and the attesting
+    /// Ed25519 key. P-256 leaf signing is RFC 6979 deterministic and Ed25519
+    /// is deterministic, so the TLS encoding is a function of those inputs and
+    /// of the encoders and signers `openmls` and its crypto provider run. The
+    /// fixture was captured on `openmls` 0.9.0 with `RustCrypto` 0.13, and a
+    /// dependency change that alters one byte of the published `KeyPackage`
+    /// (a capability list, an extension encoding, a signature) fails here.
+    #[test]
+    fn attested_key_package_bytes_match_the_golden() -> TestResult {
+        use scp_clock::TestClock;
+        use tls_codec::Serialize as _;
+
+        const GOLDEN_HEX: &str = include_str!("../tests/fixtures/attested_key_package_cs2.hex");
+
+        let did = DID("did:dht:z6MkGoldenAttestedKeyPackage".to_owned());
+        let wrapping = scp_crypto::p256::testing::uncompressed_point_for(&did.0);
+        let credential = ScpCredential::new(did.0, None, SigningKeyId::Active)?;
+        let lifetime = key_package_lifetime(&TestClock::new(1_790_000_000));
+        let scalar = [0x42; 32];
+        let leaf_public = scp_crypto::p256::P256SecretKey::from_scalar_bytes(&scalar)?
+            .public_key()
+            .to_uncompressed();
+        let signer = SignatureKeyPair::from_raw(
+            SCP_CIPHERSUITE.signature_algorithm(),
+            scalar.to_vec(),
+            leaf_public.to_vec(),
+        );
+        let ikm = Zeroizing::new([[0x11; IKM_LEN], [0x22; IKM_LEN]]);
+        let draft = plan_key_package(credential, &wrapping, lifetime, signer, ikm)?;
+
+        let identity = SigningKey::from_bytes(&[0x07; 32]);
+        let signature = identity.sign(&draft.signing_hash()).to_bytes();
+        let (bundle, _signer, _provider) = draft.finish(signature, &identity.verifying_key())?;
+
+        let encoded = hex::encode(bundle.key_package().tls_serialize_detached()?);
+        assert_eq!(
+            encoded,
+            GOLDEN_HEX.trim(),
+            "KeyPackage bytes differ from the golden"
+        );
         Ok(())
     }
 
