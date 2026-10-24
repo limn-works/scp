@@ -84,7 +84,7 @@ const RESET_BLOB_TTL_SECS: u32 = 3600;
 /// shared routing key: the relay maximum, so a member offline for up to 7 days
 /// still finds it (spec 23 §23.5, spec 09 §9.10.2 "Blob TTL by message type").
 /// `scp-relay-client` pins the message-class TTL equal to `MAX_BLOB_TTL`.
-const SNAPSHOT_BLOB_TTL_SECS: u32 = scp_protocol::envelope::outer::BlobClass::Message.ttl_secs();
+const SNAPSHOT_BLOB_TTL_SECS: u32 = scp_protocol::envelope::outer::BlobTtl::tier2_snapshot().secs();
 
 /// Overlap, in seconds, subtracted from a stored relay-contact time before it
 /// becomes a QUERY `since` (ADR-004 Connection Recovery; ADR-029 §2 push-wake

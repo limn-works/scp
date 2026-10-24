@@ -2166,8 +2166,8 @@ mod tests {
         let framed = OuterEnvelope::frame_mls_message(
             &routing_id,
             None,
-            scp_protocol::envelope::outer::BlobTtl::fresh(
-                scp_protocol::envelope::outer::BlobClass::Message,
+            scp_protocol::envelope::outer::BlobTtl::for_message_type(
+                scp_protocol::envelope::inner::MessageType::Content,
             ),
             vec![7; 48],
         )

@@ -520,11 +520,21 @@ pub struct ConsequenceConfig {
     pub allow_automatic_access_revocation: bool,
 }
 
-/// Pseudonym rotation grace, in seconds (spec §9.18.11, §9.10.4.1).
+/// Shortest [`PseudonymRotationPolicy::interval_secs`], in seconds (spec
+/// §9.18.11, §9.10.4.1 "Rotation policy, and where it lives").
 ///
-/// A member that rotated stays subscribed to its previous routing ID for
-/// this long, and a [`PseudonymRotationPolicy::interval_secs`] may not be
-/// shorter.
+/// At this interval a member's query-only list reaches about 1,008 entries
+/// within `MAX_BLOB_TTL`, under [`PSEUDONYM_QUERY_ONLY_MAX_ENTRIES`].
+pub const PSEUDONYM_MIN_ROTATION_INTERVAL_SECS: u64 = 600;
+
+/// How long the runtime's grace arm holds a previous routing ID after a
+/// rotation, in seconds.
+///
+/// Spec 09 §9.10.4.1 no longer has a grace: from the rotation on, the
+/// previous routing ID is only on the query-only list, and no subscriber or
+/// pull reads the grace. The value is kept only for the persisted
+/// `GraceRoutingId` and the actor's grace arm, whose removal needs a change to
+/// the `pipeline_wiring.rs` assertions that a human must approve.
 pub const PSEUDONYM_ROTATION_GRACE_SECS: u64 = 600;
 
 /// Most previous routing IDs a member keeps on its query-only list in one
@@ -543,7 +553,7 @@ pub const PSEUDONYM_QUERY_ONLY_MAX_ENTRIES: usize = 1_024;
 pub struct PseudonymRotationPolicy {
     /// Interval trigger: members rotate at each boundary
     /// `T0 + j × interval_secs` (`j ≥ 1`). When set, at least
-    /// [`PSEUDONYM_ROTATION_GRACE_SECS`].
+    /// [`PSEUDONYM_MIN_ROTATION_INTERVAL_SECS`].
     pub interval_secs: Option<u64>,
     /// Membership trigger: every member except the added or removed one
     /// rotates once after each committed `AddMember` or `RemoveMember`.
@@ -559,21 +569,21 @@ pub enum PseudonymRotationPolicyError {
         "pseudonym rotation policy sets no trigger: set interval_secs, or set on_membership_change to true"
     )]
     NoTrigger,
-    /// `interval_secs` is shorter than the rotation grace.
+    /// `interval_secs` is shorter than the minimum rotation interval.
     #[error(
-        "pseudonym rotation interval_secs {interval_secs} is shorter than the rotation grace of {minimum_secs} s"
+        "pseudonym rotation interval_secs {interval_secs} is shorter than the minimum rotation interval of {minimum_secs} s"
     )]
-    IntervalBelowGrace {
+    IntervalBelowMinimum {
         /// The interval the policy carried.
         interval_secs: u64,
-        /// [`PSEUDONYM_ROTATION_GRACE_SECS`].
+        /// [`PSEUDONYM_MIN_ROTATION_INTERVAL_SECS`].
         minimum_secs: u64,
     },
 }
 
 impl PseudonymRotationPolicy {
     /// Applies the §9.10.4.1 validity criterion: at least one trigger, and a
-    /// set `interval_secs` of at least [`PSEUDONYM_ROTATION_GRACE_SECS`].
+    /// set `interval_secs` of at least [`PSEUDONYM_MIN_ROTATION_INTERVAL_SECS`].
     ///
     /// # Errors
     ///
@@ -581,10 +591,10 @@ impl PseudonymRotationPolicy {
     /// fails.
     pub const fn validate(&self) -> Result<(), PseudonymRotationPolicyError> {
         match self.interval_secs {
-            Some(interval_secs) if interval_secs < PSEUDONYM_ROTATION_GRACE_SECS => {
-                Err(PseudonymRotationPolicyError::IntervalBelowGrace {
+            Some(interval_secs) if interval_secs < PSEUDONYM_MIN_ROTATION_INTERVAL_SECS => {
+                Err(PseudonymRotationPolicyError::IntervalBelowMinimum {
                     interval_secs,
-                    minimum_secs: PSEUDONYM_ROTATION_GRACE_SECS,
+                    minimum_secs: PSEUDONYM_MIN_ROTATION_INTERVAL_SECS,
                 })
             }
             None if !self.on_membership_change => Err(PseudonymRotationPolicyError::NoTrigger),
@@ -1207,14 +1217,14 @@ mod tests {
     }
 
     #[test]
-    fn pseudonym_rotation_policy_accepts_each_trigger_at_and_above_grace() {
+    fn pseudonym_rotation_policy_accepts_each_trigger_at_and_above_the_minimum() {
         for policy in [
             PseudonymRotationPolicy {
                 interval_secs: None,
                 on_membership_change: true,
             },
             PseudonymRotationPolicy {
-                interval_secs: Some(PSEUDONYM_ROTATION_GRACE_SECS),
+                interval_secs: Some(PSEUDONYM_MIN_ROTATION_INTERVAL_SECS),
                 on_membership_change: false,
             },
             PseudonymRotationPolicy {
@@ -1239,8 +1249,8 @@ mod tests {
     }
 
     #[test]
-    fn pseudonym_rotation_policy_rejects_interval_below_grace() {
-        for interval_secs in [0, 1, PSEUDONYM_ROTATION_GRACE_SECS - 1] {
+    fn pseudonym_rotation_policy_rejects_interval_below_the_minimum() {
+        for interval_secs in [0, 1, PSEUDONYM_MIN_ROTATION_INTERVAL_SECS - 1] {
             for on_membership_change in [false, true] {
                 let policy = PseudonymRotationPolicy {
                     interval_secs: Some(interval_secs),
@@ -1248,7 +1258,7 @@ mod tests {
                 };
                 assert_eq!(
                     policy.validate(),
-                    Err(PseudonymRotationPolicyError::IntervalBelowGrace {
+                    Err(PseudonymRotationPolicyError::IntervalBelowMinimum {
                         interval_secs,
                         minimum_secs: 600,
                     }),

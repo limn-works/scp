@@ -448,9 +448,7 @@ pub async fn recovery_send_notification(
 
     // Send via transport using the domain-separated routing ID, at the TTL of
     // the envelope's message type (spec 09 §9.10.2 "Blob TTL by message type").
-    let ttl = scp_protocol::envelope::outer::BlobTtl::fresh(
-        scp_protocol::envelope::outer::BlobClass::of(inner.message_type),
-    );
+    let ttl = scp_protocol::envelope::outer::BlobTtl::for_message_type(inner.message_type);
     deps.transport
         .send_message(&routing_id, &encrypted, ttl)
         .await?;

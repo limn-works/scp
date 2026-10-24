@@ -1040,9 +1040,7 @@ async fn publish_alice_key_request(m: &Members, url: &str) {
     let envelope = scp_core::envelope::OuterEnvelope::frame_mls_message(
         &scp_core::context::context_routing_id(&m.ctx_id),
         None,
-        scp_protocol::envelope::outer::BlobTtl::fresh(
-            scp_protocol::envelope::outer::BlobClass::Message,
-        ),
+        scp_protocol::envelope::outer::BlobTtl::sealed_management(),
         sealed,
     )
     .unwrap();

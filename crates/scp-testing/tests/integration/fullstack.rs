@@ -1426,8 +1426,8 @@ async fn full_stack_relay_three_party() {
             &alice_provider,
             pseudonym,
             ct,
-            scp_protocol::envelope::outer::BlobTtl::fresh(
-                scp_protocol::envelope::outer::BlobClass::Message,
+            scp_protocol::envelope::outer::BlobTtl::for_message_type(
+                scp_protocol::envelope::inner::MessageType::Content,
             ),
         )
         .await
@@ -1875,9 +1875,7 @@ async fn a_failed_phase_5_update_stays_queued_and_a_peer_opens_it_over_the_relay
         .send_message(
             &queued[0].routing_id,
             &queued[0].commit_bytes,
-            scp_protocol::envelope::outer::BlobTtl::fresh(
-                scp_protocol::envelope::outer::BlobClass::Message,
-            ),
+            scp_protocol::envelope::outer::BlobTtl::commit(),
         )
         .await
         .unwrap();

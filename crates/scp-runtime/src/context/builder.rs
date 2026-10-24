@@ -80,10 +80,10 @@ pub trait ContextTransportProvider: Send + Sync {
     /// Sends an encrypted message via transport, asking the relay to store it
     /// for `ttl`.
     ///
-    /// The caller builds `ttl` from the message's type
-    /// ([`BlobTtl::fresh`](scp_protocol::envelope::outer::BlobTtl::fresh)) or,
-    /// for a republish, from the first attempt
-    /// ([`BlobTtl::republish`](scp_protocol::envelope::outer::BlobTtl::republish))
+    /// The caller builds `ttl` with the
+    /// [`BlobTtl`](scp_protocol::envelope::outer::BlobTtl) constructor for the
+    /// kind of message it sends or, for a Commit retry, from the first attempt
+    /// ([`BlobTtl::republish_commit`](scp_protocol::envelope::outer::BlobTtl::republish_commit))
     /// (`09-security-model.md` §9.10.2 "Blob TTL by message type" and
     /// "Republish rule"). An implementation frames it unchanged.
     ///

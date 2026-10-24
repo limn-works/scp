@@ -176,8 +176,8 @@ mod tests {
             .send_message(
                 &[1; 32],
                 b"first",
-                scp_protocol::envelope::outer::BlobTtl::fresh(
-                    scp_protocol::envelope::outer::BlobClass::Message,
+                scp_protocol::envelope::outer::BlobTtl::for_message_type(
+                    scp_protocol::envelope::inner::MessageType::Content,
                 ),
             )
             .await?;
@@ -185,8 +185,8 @@ mod tests {
             .send_message(
                 &[2; 32],
                 b"second",
-                scp_protocol::envelope::outer::BlobTtl::fresh(
-                    scp_protocol::envelope::outer::BlobClass::Message,
+                scp_protocol::envelope::outer::BlobTtl::for_message_type(
+                    scp_protocol::envelope::inner::MessageType::Content,
                 ),
             )
             .await?;

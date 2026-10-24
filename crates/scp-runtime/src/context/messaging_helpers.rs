@@ -641,19 +641,22 @@ fn ingest_pseudonym_announcement(
     // `peer_registry()` both read the routing state; capture the local pseudonym
     // first so the two borrows do not overlap.
     //
-    // §9.10.4.1 also names the previous routing ID while it is in its rotation
-    // grace. The grace arm discards the previous routing ID when the grace ends,
-    // so the one this member still holds is the one in its grace.
-    let previous_routing_id = view
+    // §9.10.4.1 "Receipt ordering" also names every routing ID on this member's
+    // query-only list, which its reconnect catch-up still reads. An entry whose
+    // expiry passed stays until the next rotation prunes it, and is compared
+    // too: no live blob can sit on it, so rejecting it costs nothing.
+    let query_only: Vec<[u8; 32]> = view
         .class_s()
         .pseudonym_rotation
-        .previous()
-        .map(|p| p.routing_id);
+        .query_only
+        .iter()
+        .map(|entry| entry.routing_id)
+        .collect();
     let own_routing_ids: Vec<[u8; 32]> = view
         .routing_mut()
         .local_pseudonym()
         .into_iter()
-        .chain(previous_routing_id)
+        .chain(query_only)
         .collect();
     match classify_pseudonym_announcement(
         plaintext,
@@ -1799,9 +1802,7 @@ pub async fn encrypt_and_send(
     }
     // The one place a context message's relay TTL is chosen: from its type
     // (spec 09 §9.10.2 "Blob TTL by message type").
-    let ttl = scp_protocol::envelope::outer::BlobTtl::fresh(
-        scp_protocol::envelope::outer::BlobClass::of(message_type),
-    );
+    let ttl = scp_protocol::envelope::outer::BlobTtl::for_message_type(message_type);
     let mut last_err = None;
     let mut any_success = false;
     for rid in routing_ids {
@@ -4501,6 +4502,43 @@ mod pseudonym_routing_tests {
             })
         );
         assert_eq!(count_events(&state), 2);
+    }
+
+    /// Spec 09 §9.10.4.1 "Receipt ordering": an announcement claiming a
+    /// routing ID on the receiver's query-only list is a collision, with no
+    /// grace state involved. The previous routing ID is cleared here so the
+    /// query-only list alone must carry the rejection.
+    #[test]
+    fn ingest_rejects_an_announcement_of_a_query_only_routing_id() {
+        use scp_protocol::context::pseudonym::REJECT_COLLISION;
+
+        let mut state = encrypted_state();
+        let ctx = ctx_hex(0x11);
+        let old = [0x76u8; 32];
+        state.routing.set_local_pseudonym([0x77u8; 32]);
+        state
+            .class_s
+            .pseudonym_rotation
+            .record_rotation(1, old, None, 1_000)
+            .expect("the rotation records");
+        state.class_s.pseudonym_rotation.previous = None;
+
+        let outcome = ingest_pseudonym_announcement(
+            &mut ClassCMut::from_state(&mut state),
+            ALICE,
+            &announcement_v2_bytes(ALICE, 1, old),
+            &ctx,
+            None,
+        );
+        assert_eq!(outcome, AnnouncementOutcome::Rejected(REJECT_COLLISION));
+        assert!(
+            state
+                .routing
+                .peer_registry()
+                .expect("encrypted ⇒ registry")
+                .is_empty(),
+            "a rejected announcement leaves the registry unchanged"
+        );
     }
 
     #[test]

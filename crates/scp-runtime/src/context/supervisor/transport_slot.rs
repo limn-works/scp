@@ -180,8 +180,8 @@ mod tests {
         slot.send_message(
             &[1; 32],
             b"x",
-            scp_protocol::envelope::outer::BlobTtl::fresh(
-                scp_protocol::envelope::outer::BlobClass::Message,
+            scp_protocol::envelope::outer::BlobTtl::for_message_type(
+                scp_protocol::envelope::inner::MessageType::Content,
             ),
         )
         .await
@@ -195,8 +195,8 @@ mod tests {
         slot.send_message(
             &[2; 32],
             b"x",
-            scp_protocol::envelope::outer::BlobTtl::fresh(
-                scp_protocol::envelope::outer::BlobClass::Message,
+            scp_protocol::envelope::outer::BlobTtl::for_message_type(
+                scp_protocol::envelope::inner::MessageType::Content,
             ),
         )
         .await
@@ -220,8 +220,8 @@ mod tests {
                 slot.send_message(
                     &[7; 32],
                     b"x",
-                    scp_protocol::envelope::outer::BlobTtl::fresh(
-                        scp_protocol::envelope::outer::BlobClass::Message,
+                    scp_protocol::envelope::outer::BlobTtl::for_message_type(
+                        scp_protocol::envelope::inner::MessageType::Content,
                     ),
                 )
                 .await
