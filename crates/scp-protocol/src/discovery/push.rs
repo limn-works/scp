@@ -550,6 +550,392 @@ fn tier3_routing_id_of_canonical(canonical: &str, target: BridgeTarget) -> [u8; 
 }
 
 // ---------------------------------------------------------------------------
+// WebPush token (§22.11.4 **WebPush token encoding**)
+// ---------------------------------------------------------------------------
+
+/// The longest endpoint a `WebPush` token carries, 2,048 bytes
+/// (`09-security-model.md` §9.18.13).
+pub const WEBPUSH_ENDPOINT_MAX_LEN: usize = 2048;
+
+/// The length of a subscription's `auth` secret (RFC 8291 §3.2).
+pub const WEBPUSH_AUTH_LEN: usize = 16;
+
+/// The longest `WebPush` token: `4 + 2,048 + 65 + 16` = 2,133 bytes.
+pub const WEBPUSH_TOKEN_MAX_LEN: usize =
+    4 + WEBPUSH_ENDPOINT_MAX_LEN + scp_crypto::p256::UNCOMPRESSED_POINT_LEN + WEBPUSH_AUTH_LEN;
+
+/// The scheme and authority separator every `WebPush` endpoint starts with.
+const WEBPUSH_ENDPOINT_PREFIX: &str = "https://";
+
+/// A `WebPush` token that breaks a §22.11.4 encoding rule. A relay answers every
+/// variant with `4060` `PUSH_REGISTRATION_REJECTED`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum WebPushTokenError {
+    /// The token ends before the field its length or encoding needs.
+    #[error("WebPush token is shorter than its encoding")]
+    Truncated,
+    /// The endpoint is empty.
+    #[error("WebPush endpoint is empty")]
+    EmptyEndpoint,
+    /// The length prefix exceeds 2,048 bytes.
+    #[error("WebPush endpoint length {len} exceeds {WEBPUSH_ENDPOINT_MAX_LEN} bytes")]
+    EndpointTooLong {
+        /// The declared endpoint length.
+        len: usize,
+    },
+    /// An endpoint byte lies outside printable ASCII `0x21`–`0x7E`.
+    #[error("WebPush endpoint holds a byte outside 0x21-0x7E")]
+    EndpointNotPrintableAscii,
+    /// The endpoint does not start with `https://`.
+    #[error("WebPush endpoint scheme is not https")]
+    EndpointNotHttps,
+    /// The endpoint's authority carries userinfo (`user@host`).
+    #[error("WebPush endpoint carries userinfo")]
+    EndpointHasUserinfo,
+    /// The endpoint carries a fragment (`#…`).
+    #[error("WebPush endpoint carries a fragment")]
+    EndpointHasFragment,
+    /// `p256dh` is not a 65-byte uncompressed point on P-256 (RFC 8291 §7).
+    #[error("WebPush p256dh is not an uncompressed P-256 point: {0}")]
+    InvalidP256dh(scp_crypto::p256::P256Error),
+    /// Bytes follow `auth`.
+    #[error("WebPush token is followed by {count} trailing bytes")]
+    TrailingBytes {
+        /// Number of bytes after `auth`.
+        count: usize,
+    },
+}
+
+/// A browser `PushSubscription` in the one canonical `WebPush` token encoding,
+/// `BE32(len(endpoint)) || endpoint || p256dh || auth` (§22.11.4).
+///
+/// Only [`WebPushSubscription::decode`] and [`WebPushSubscription::new`] build
+/// one, and both apply every encoding rule, so a value always encodes to a
+/// token a relay accepts at the decode step. The relay's endpoint refusal rule
+/// (ADR-004) and the WHATWG canonical-serialization rule need a URL parser and
+/// the network, so the relay applies them after decoding.
+///
+/// `Debug` prints the endpoint's length only: the endpoint is a per-device
+/// capability URL, and `auth` is a secret.
+#[derive(Clone, PartialEq, Eq)]
+pub struct WebPushSubscription {
+    endpoint: String,
+    p256dh: scp_crypto::p256::P256PublicKey,
+    auth: zeroize::Zeroizing<[u8; WEBPUSH_AUTH_LEN]>,
+}
+
+impl std::fmt::Debug for WebPushSubscription {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebPushSubscription")
+            .field("endpoint_len", &self.endpoint.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl WebPushSubscription {
+    /// Builds a subscription from its three parts.
+    ///
+    /// # Errors
+    ///
+    /// The endpoint variants of [`WebPushTokenError`] for an endpoint that
+    /// breaks a §22.11.4 rule.
+    pub fn new(
+        endpoint: String,
+        p256dh: scp_crypto::p256::P256PublicKey,
+        auth: [u8; WEBPUSH_AUTH_LEN],
+    ) -> Result<Self, WebPushTokenError> {
+        check_webpush_endpoint(endpoint.as_bytes())?;
+        Ok(Self {
+            endpoint,
+            p256dh,
+            auth: zeroize::Zeroizing::new(auth),
+        })
+    }
+
+    /// Decodes a `WebPush` token, applying every §22.11.4 encoding rule.
+    ///
+    /// # Errors
+    ///
+    /// A [`WebPushTokenError`] naming the first rule the token breaks.
+    pub fn decode(token: &[u8]) -> Result<Self, WebPushTokenError> {
+        let (len, rest) = token
+            .split_first_chunk::<4>()
+            .ok_or(WebPushTokenError::Truncated)?;
+        let len = usize::try_from(u32::from_be_bytes(*len))
+            .map_err(|_| WebPushTokenError::EndpointTooLong { len: usize::MAX })?;
+        if len > WEBPUSH_ENDPOINT_MAX_LEN {
+            return Err(WebPushTokenError::EndpointTooLong { len });
+        }
+        if len > rest.len() {
+            return Err(WebPushTokenError::Truncated);
+        }
+        let (endpoint, rest) = rest.split_at(len);
+        check_webpush_endpoint(endpoint)?;
+        let (p256dh, rest) = rest
+            .split_first_chunk::<{ scp_crypto::p256::UNCOMPRESSED_POINT_LEN }>()
+            .ok_or(WebPushTokenError::Truncated)?;
+        let p256dh = scp_crypto::p256::P256PublicKey::from_uncompressed(p256dh)
+            .map_err(WebPushTokenError::InvalidP256dh)?;
+        let (auth, rest) = rest
+            .split_first_chunk::<WEBPUSH_AUTH_LEN>()
+            .ok_or(WebPushTokenError::Truncated)?;
+        if !rest.is_empty() {
+            return Err(WebPushTokenError::TrailingBytes { count: rest.len() });
+        }
+        // `check_webpush_endpoint` accepted only bytes 0x21-0x7E, which are
+        // UTF-8.
+        let endpoint = std::str::from_utf8(endpoint)
+            .map_err(|_| WebPushTokenError::EndpointNotPrintableAscii)?
+            .to_owned();
+        Ok(Self {
+            endpoint,
+            p256dh,
+            auth: zeroize::Zeroizing::new(*auth),
+        })
+    }
+
+    /// The canonical token bytes, `BE32(len(endpoint)) || endpoint || p256dh
+    /// || auth`.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + self.endpoint.len() + 65 + WEBPUSH_AUTH_LEN);
+        // `new` and `decode` admit at most 2,048 endpoint bytes, which a u32
+        // holds; the fallback is never taken.
+        let len = u32::try_from(self.endpoint.len()).unwrap_or(u32::MAX);
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(self.endpoint.as_bytes());
+        out.extend_from_slice(&self.p256dh.to_uncompressed());
+        out.extend_from_slice(self.auth.as_ref());
+        out
+    }
+
+    /// The push resource URL, used byte for byte as the request target
+    /// (§10.7.1 step 5).
+    #[must_use]
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    /// The subscription's P-256 ECDH public key.
+    #[must_use]
+    pub const fn p256dh(&self) -> &scp_crypto::p256::P256PublicKey {
+        &self.p256dh
+    }
+
+    /// The subscription's 16-byte authentication secret.
+    #[must_use]
+    pub fn auth(&self) -> &[u8; WEBPUSH_AUTH_LEN] {
+        &self.auth
+    }
+}
+
+/// The §22.11.4 endpoint rules a byte check decides: 1 to 2,048 bytes of
+/// printable ASCII, the `https://` prefix, no userinfo and no fragment.
+fn check_webpush_endpoint(endpoint: &[u8]) -> Result<(), WebPushTokenError> {
+    if endpoint.is_empty() {
+        return Err(WebPushTokenError::EmptyEndpoint);
+    }
+    if endpoint.len() > WEBPUSH_ENDPOINT_MAX_LEN {
+        return Err(WebPushTokenError::EndpointTooLong {
+            len: endpoint.len(),
+        });
+    }
+    if !endpoint.iter().all(|b| (0x21..=0x7E).contains(b)) {
+        return Err(WebPushTokenError::EndpointNotPrintableAscii);
+    }
+    let Some(after_scheme) = endpoint.strip_prefix(WEBPUSH_ENDPOINT_PREFIX.as_bytes()) else {
+        return Err(WebPushTokenError::EndpointNotHttps);
+    };
+    if endpoint.contains(&b'#') {
+        return Err(WebPushTokenError::EndpointHasFragment);
+    }
+    // The authority ends at the first `/`, `?` or `#` (RFC 3986 §3.2), and a
+    // `@` inside it separates userinfo from the host. A `\` ends it too under
+    // the WHATWG parser for special schemes.
+    let authority_end = after_scheme
+        .iter()
+        .position(|b| matches!(b, b'/' | b'?' | b'#' | b'\\'))
+        .unwrap_or(after_scheme.len());
+    if after_scheme[..authority_end].contains(&b'@') {
+        return Err(WebPushTokenError::EndpointHasUserinfo);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod webpush_token_tests {
+    use super::*;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    /// `25-test-vectors.md` §25.30 Vector 59.
+    const VECTOR_59_ENDPOINT: &str = "https://push.example.net/p/LBhhw0OohO-Wl4Oi971UGsB7sdQGUibx";
+    const VECTOR_59_P256DH: &str = "042571b2becdfde360551aaf1ed0f4cd366c11cebe555f89bcb7b186a5333917\
+         3168ece2ebe018597bd30479b86e3c8f8eced577ca59187e9246990db682008b0e";
+    const VECTOR_59_AUTH: &str = "05305932a1c7eabe13b6cec9fda48882";
+    const VECTOR_59_TOKEN: &str = "0000003b68747470733a2f2f707573682e6578616d706c652e6e65742f702f4c\
+         42686877304f6f684f2d576c344f693937315547734237736451475569627804\
+         2571b2becdfde360551aaf1ed0f4cd366c11cebe555f89bcb7b186a533391731\
+         68ece2ebe018597bd30479b86e3c8f8eced577ca59187e9246990db682008b0e\
+         05305932a1c7eabe13b6cec9fda48882";
+
+    fn vector_59() -> Result<WebPushSubscription, Box<dyn std::error::Error>> {
+        let p256dh =
+            scp_crypto::p256::P256PublicKey::from_uncompressed(&hex::decode(VECTOR_59_P256DH)?)?;
+        let auth = <[u8; 16]>::try_from(hex::decode(VECTOR_59_AUTH)?.as_slice())?;
+        Ok(WebPushSubscription::new(
+            VECTOR_59_ENDPOINT.to_owned(),
+            p256dh,
+            auth,
+        )?)
+    }
+
+    fn token_with_endpoint(endpoint: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let mut token = u32::try_from(endpoint.len())?.to_be_bytes().to_vec();
+        token.extend_from_slice(endpoint);
+        token.extend_from_slice(&hex::decode(VECTOR_59_P256DH)?);
+        token.extend_from_slice(&hex::decode(VECTOR_59_AUTH)?);
+        Ok(token)
+    }
+
+    #[test]
+    fn encode_reproduces_vector_59_and_decode_round_trips() -> TestResult {
+        let sub = vector_59()?;
+        let token = sub.encode();
+        assert_eq!(hex::encode(&token), VECTOR_59_TOKEN);
+        assert_eq!(token.len(), 144);
+        let decoded = WebPushSubscription::decode(&token)?;
+        assert_eq!(decoded, sub);
+        assert_eq!(decoded.endpoint(), VECTOR_59_ENDPOINT);
+        assert_eq!(hex::encode(decoded.auth()), VECTOR_59_AUTH);
+        Ok(())
+    }
+
+    #[test]
+    fn decode_accepts_the_longest_token_of_2133_bytes() -> TestResult {
+        let mut endpoint = b"https://push.example.net/".to_vec();
+        endpoint.resize(WEBPUSH_ENDPOINT_MAX_LEN, b'a');
+        let token = token_with_endpoint(&endpoint)?;
+        assert_eq!(token.len(), 2133);
+        assert_eq!(WEBPUSH_TOKEN_MAX_LEN, 2133);
+        assert_eq!(WebPushSubscription::decode(&token)?.encode(), token);
+
+        endpoint.push(b'a');
+        assert_eq!(
+            WebPushSubscription::decode(&token_with_endpoint(&endpoint)?),
+            Err(WebPushTokenError::EndpointTooLong { len: 2049 })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn decode_rejects_each_endpoint_rule() -> TestResult {
+        let cases: [(&[u8], WebPushTokenError); 7] = [
+            (b"", WebPushTokenError::EmptyEndpoint),
+            (
+                b"http://push.example.net/p",
+                WebPushTokenError::EndpointNotHttps,
+            ),
+            (
+                b"HTTPS://push.example.net/p",
+                WebPushTokenError::EndpointNotHttps,
+            ),
+            (
+                b"https://push.example.net/p q",
+                WebPushTokenError::EndpointNotPrintableAscii,
+            ),
+            (
+                b"https://push.example.net/p\x7f",
+                WebPushTokenError::EndpointNotPrintableAscii,
+            ),
+            (
+                b"https://user@push.example.net/p",
+                WebPushTokenError::EndpointHasUserinfo,
+            ),
+            (
+                b"https://push.example.net/p#frag",
+                WebPushTokenError::EndpointHasFragment,
+            ),
+        ];
+        for (endpoint, want) in cases {
+            assert_eq!(
+                WebPushSubscription::decode(&token_with_endpoint(endpoint)?),
+                Err(want),
+                "{}",
+                String::from_utf8_lossy(endpoint)
+            );
+        }
+        // An `@` after the authority is a path byte, not userinfo.
+        WebPushSubscription::decode(&token_with_endpoint(b"https://push.example.net/p@q")?)?;
+        // A `\` ends the authority for the WHATWG parser, so an `@` after it
+        // is not userinfo.
+        WebPushSubscription::decode(&token_with_endpoint(b"https://push.example.net\\@q")?)?;
+        Ok(())
+    }
+
+    #[test]
+    fn decode_rejects_bad_lengths_points_and_trailing_bytes() -> TestResult {
+        let good = hex::decode(VECTOR_59_TOKEN)?;
+        assert_eq!(
+            WebPushSubscription::decode(&good[..3]),
+            Err(WebPushTokenError::Truncated)
+        );
+        // The prefix claims more bytes than follow it.
+        let mut long_prefix = good.clone();
+        long_prefix[..4].copy_from_slice(&0x0000_0800u32.to_be_bytes());
+        assert_eq!(
+            WebPushSubscription::decode(&long_prefix),
+            Err(WebPushTokenError::Truncated)
+        );
+        let mut huge_prefix = good.clone();
+        huge_prefix[..4].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(matches!(
+            WebPushSubscription::decode(&huge_prefix),
+            Err(WebPushTokenError::EndpointTooLong { .. })
+        ));
+        // One byte short of `auth`.
+        assert_eq!(
+            WebPushSubscription::decode(&good[..good.len() - 1]),
+            Err(WebPushTokenError::Truncated)
+        );
+        let mut trailing = good.clone();
+        trailing.push(0);
+        assert_eq!(
+            WebPushSubscription::decode(&trailing),
+            Err(WebPushTokenError::TrailingBytes { count: 1 })
+        );
+        // A compressed-point prefix, and a point off the curve.
+        let p256dh_at = 4 + VECTOR_59_ENDPOINT.len();
+        let mut compressed = good.clone();
+        compressed[p256dh_at] = 0x02;
+        assert!(matches!(
+            WebPushSubscription::decode(&compressed),
+            Err(WebPushTokenError::InvalidP256dh(_))
+        ));
+        let mut off_curve = good;
+        off_curve[p256dh_at + 64] ^= 1;
+        assert!(matches!(
+            WebPushSubscription::decode(&off_curve),
+            Err(WebPushTokenError::InvalidP256dh(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn debug_prints_no_endpoint_and_no_auth() -> TestResult {
+        let sub = vector_59()?;
+        let shown = format!("{sub:?}");
+        assert!(!shown.contains("push.example.net"), "{shown}");
+        assert!(!shown.contains("LBhhw0"), "{shown}");
+        assert!(!shown.contains(VECTOR_59_AUTH), "{shown}");
+        assert!(!shown.contains("5, 48, 89"), "{shown}");
+        assert!(shown.contains("endpoint_len: 59"), "{shown}");
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 

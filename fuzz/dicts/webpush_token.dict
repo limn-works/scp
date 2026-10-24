@@ -1,0 +1,29 @@
+# Dictionary for the WebPush token decoder (§22.11.4 **WebPush token
+# encoding**): BE32(len(endpoint)) || endpoint || p256dh || auth.
+
+# Endpoint structure
+"https://"
+"http://"
+"HTTPS://"
+"@"
+"#"
+"?"
+"/"
+"\\"
+":443"
+":8443"
+"push.example.net"
+"[::1]"
+"127.0.0.1"
+
+# Length prefixes: 0, 59, 2048, 2049, u32::MAX
+"\x00\x00\x00\x00"
+"\x00\x00\x00\x3b"
+"\x00\x00\x08\x00"
+"\x00\x00\x08\x01"
+"\xff\xff\xff\xff"
+
+# Point prefixes: uncompressed, compressed even and odd
+"\x04"
+"\x02"
+"\x03"
