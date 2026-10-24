@@ -1116,10 +1116,11 @@ where
     let bridge_secret = generate_bridge_secret();
     // The listener binds first so the relay starts on the URL of the address it
     // actually serves, even for a port-0 bind. `build_no_domain_inner` then
-    // sets on this shared handle the entries the node publishes, its own
-    // `SCPRelay` entry and every tier 3 entry of its document with its
-    // `bridgeTarget`, before the node publishes any, and `apply_tier_change`
-    // sets them again on each tier change (§10.7.1 step 2, "Tier 3 relays").
+    // binds the node's publisher to this shared handle, and the publisher sets
+    // on it the entries the node publishes, its own `SCPRelay` entry and every
+    // tier 3 entry of its document with its `bridgeTarget`, before the node
+    // publishes any, and again on each tier change (§10.7.1 step 2, "Tier 3
+    // relays").
     let listener = tokio::net::TcpListener::bind(bind_addr)
         .await
         .map_err(|e| RelayError::BindFailed(e.to_string()))?;

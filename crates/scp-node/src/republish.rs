@@ -1129,10 +1129,17 @@ mod tests {
         (did_method, identity, document, relay_url)
     }
 
-    /// The node's publish seam over `did_method`, in a publishing `DhtMode`.
+    /// The node's publish seam over `did_method`, in a publishing `DhtMode`,
+    /// bound to the live URL handle of the node's relay, the one handle every
+    /// reservation of the node in a test moves. Its URL is the one
+    /// [`signing_identity`] advertises.
     #[cfg(feature = "testing")]
     fn publish_seam(did_method: &Arc<SigningDidDht>) -> NodePublisher {
-        NodePublisher::new(Arc::clone(did_method), DhtMode::Memory)
+        let relay = scp_transport::relay::push_gate::LiveRelayUrl::new(
+            scp_transport::relay::push_gate::RelayUrl::new("ws://198.51.100.7:32891/scp/v1")
+                .expect("canonical test URL"),
+        );
+        NodePublisher::new(Arc::clone(did_method), DhtMode::Memory, relay)
     }
 
     /// The node's live slot as the builders construct it: the startup publish's
@@ -1147,15 +1154,9 @@ mod tests {
         relay_url: String,
     ) -> LiveSlot<NodePublishedState> {
         let relay = crate::published_state::test_relay(&relay_url);
-        let handle = scp_transport::relay::push_gate::LiveRelayUrl::new(
-            scp_transport::relay::push_gate::RelayUrl::from(&relay),
-        );
         let target = scp_did::BridgeTarget::new([0x5a; 32]).expect("a non-zero target");
-        let reserved = crate::published_state::reserve_push_routing_id(
-            &handle,
-            &crate::published_state::PublishedEntries::new(&relay, &document, target),
-        );
-        seed_from_startup_publish(publisher, identity, reserved)
+        let entries = crate::published_state::PublishedEntries::new(&relay, &document, target);
+        seed_from_startup_publish(publisher, identity, &entries)
             .await
             .expect("startup publish succeeds")
     }
@@ -1172,10 +1173,6 @@ mod tests {
         let next_url = format!("ws://203.0.113.42:{}/scp/v1", 9000 + nth);
         apply_tier_change(
             live_state,
-            &scp_transport::relay::push_gate::LiveRelayUrl::new(
-                scp_transport::relay::push_gate::RelayUrl::new("ws://203.0.113.42:9000/scp/v1")
-                    .expect("canonical test URL"),
-            ),
             &crate::published_state::test_relay(&next_url),
             scp_did::BridgeTarget::new([0x5a; 32]).expect("not the absent value"),
             publisher,
@@ -1276,10 +1273,6 @@ mod tests {
         let new_relay_url = "ws://203.0.113.42:8443/scp/v1";
         apply_tier_change(
             &live_state,
-            &scp_transport::relay::push_gate::LiveRelayUrl::new(
-                scp_transport::relay::push_gate::RelayUrl::new("ws://203.0.113.42:9000/scp/v1")
-                    .expect("canonical test URL"),
-            ),
             &crate::published_state::test_relay(new_relay_url),
             scp_did::BridgeTarget::new([0x5a; 32]).expect("not the absent value"),
             &publisher,
