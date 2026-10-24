@@ -75,9 +75,6 @@ pub enum WakeFailure {
     /// The instance's crypto provider holds no local member DID.
     #[error("the instance holds no local member DID")]
     NoLocalIdentity,
-    /// The instance holds no `last_relay_contact` store.
-    #[error("the instance holds no relay contact store")]
-    NoContactStore,
     /// Restoring or reading the persisted contexts failed.
     #[error("restoring persisted contexts failed: {0}")]
     Restore(#[source] ContextError),
@@ -120,7 +117,6 @@ impl WakeFailure {
             Self::ShutDown => error_codes::TRANS_5085,
             Self::NoSupervisor => error_codes::TRANS_5086,
             Self::NoLocalIdentity => error_codes::TRANS_5087,
-            Self::NoContactStore => error_codes::TRANS_5088,
             Self::Restore(_) => error_codes::TRANS_5089,
             Self::Unrestored { .. } => error_codes::TRANS_5090,
             Self::Targets(_) => error_codes::TRANS_5091,
@@ -151,7 +147,6 @@ impl WakeFailure {
             Self::ShutDown
             | Self::NoSupervisor
             | Self::NoLocalIdentity
-            | Self::NoContactStore
             | Self::Restore(_)
             | Self::Targets(_)
             | Self::DialCancelled(_)
@@ -351,9 +346,7 @@ async fn pull_on_wake(
     if supervisor.node_identity().is_err() {
         return Err(WakeFailure::NoLocalIdentity);
     }
-    let relay_contacts = core
-        .relay_contact_store()
-        .ok_or(WakeFailure::NoContactStore)?;
+    let relay_contacts = supervisor.relay_contact_store();
 
     // A cold process runs the startup restore, context restore then saga
     // replay. A context still missing after it, or one whose restore failed in
@@ -424,6 +417,7 @@ async fn pull_on_wake(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use scp_core::store::sync::RelayContactStore;
 
     fn invalid(platform: PushPlatform, payload: &[u8]) {
         assert_eq!(
@@ -529,7 +523,6 @@ mod tests {
             WakeFailure::ShutDown,
             WakeFailure::NoSupervisor,
             WakeFailure::NoLocalIdentity,
-            WakeFailure::NoContactStore,
             WakeFailure::Restore(ContextError::PersistenceFailed("x".to_owned())),
             WakeFailure::Unrestored {
                 context_ids: vec!["b".to_owned(), "a".to_owned()],
@@ -553,12 +546,15 @@ mod tests {
         ];
         let codes: BTreeSet<String> = failures.iter().map(|f| f.code().to_owned()).collect();
         assert_eq!(codes.len(), failures.len(), "each variant has its own code");
-        let expected: BTreeSet<String> = (5085..=5094).map(|n| format!("SCP-TRANS-{n}")).collect();
+        let expected: BTreeSet<String> = (5085..=5094)
+            .filter(|n| *n != 5088)
+            .map(|n| format!("SCP-TRANS-{n}"))
+            .collect();
         assert_eq!(codes, expected);
-        let unrestored = failures[5].view();
+        let unrestored = failures[4].view();
         assert_eq!(unrestored.context_ids, vec!["a".to_owned(), "b".to_owned()]);
         assert!(unrestored.context_failures.is_empty());
-        let pull = failures[8].view();
+        let pull = failures[7].view();
         assert_eq!(pull.code, error_codes::TRANS_5093);
         assert_eq!(pull.context_ids, vec!["c1".to_owned(), "c2".to_owned()]);
         assert!(pull.message.contains("wss://r"), "{}", pull.message);
@@ -668,8 +664,8 @@ mod tests {
             WakeOutcome::Failed(WakeFailure::DeadlineExpired)
         ));
         assert!(matches!(
-            wake_outcome(0, Ok(Err(WakeFailure::NoContactStore))),
-            WakeOutcome::Failed(WakeFailure::NoContactStore)
+            wake_outcome(0, Ok(Err(WakeFailure::NoSupervisor))),
+            WakeOutcome::Failed(WakeFailure::NoSupervisor)
         ));
     }
 
@@ -689,27 +685,13 @@ mod tests {
         );
     }
 
-    /// An instance with an identity and no `last_relay_contact` store fails
-    /// the wake.
-    #[tokio::test]
-    async fn an_instance_without_a_contact_store_fails_the_wake() {
-        let core = CoreFields::with_supervisor(crate::bridge_instance::tests::test_supervisor());
-        let outcome = handle_wake(&core, PushPlatform::Fcm, br#"{"scp":"1"}"#)
-            .await
-            .unwrap();
-        assert!(
-            matches!(outcome, WakeOutcome::Failed(WakeFailure::NoContactStore)),
-            "{outcome:?}"
-        );
-    }
-
     type Contacts = std::sync::Arc<
-        scp_core::store::ProtocolRepository<scp_platform::in_memory::InMemoryStorage>,
+        scp_core::store::sync::StorageRelayContactStore<scp_platform::in_memory::InMemoryStorage>,
     >;
 
     fn contacts() -> Contacts {
-        std::sync::Arc::new(scp_core::store::ProtocolRepository::new_for_testing(
-            scp_platform::in_memory::InMemoryStorage::new(),
+        std::sync::Arc::new(scp_core::store::sync::StorageRelayContactStore::new(
+            std::sync::Arc::new(scp_platform::in_memory::InMemoryStorage::new()),
         ))
     }
 

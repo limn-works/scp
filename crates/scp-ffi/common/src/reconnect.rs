@@ -896,8 +896,10 @@ use scp_protocol::sync::OfflineTier;
 pub struct ContextReconnectResult {
     /// Context that was reconnected.
     pub context_id: String,
-    /// Offline tier classification: `"short"` / `"extended"` / `"long"`.
-    pub tier: String,
+    /// Offline tier classification: `"short"` / `"extended"` / `"long"`;
+    /// `None` when the context's `last_relay_contact` is absent or
+    /// unreadable, so no tier was classified ([`Self::failure_code`]).
+    pub tier: Option<String>,
     /// Outcome: `"fully_caught_up"` / `"fast_forwarded"` / `"reset"` /
     /// `"context_gone"` / `"failed"` / `"pending"`.
     pub outcome: String,
@@ -919,6 +921,12 @@ pub struct ContextReconnectResult {
     /// `needs_reconnect` was cleared, or `None` when the write succeeded or
     /// no write was due.
     pub relay_contact_error: Option<String>,
+    /// The code of a failure that ended this context's reconnection before
+    /// its tier was classified: `SCP-TRANS-5102` when no
+    /// `last_relay_contact` is stored, `SCP-TRANS-5103` when reading it
+    /// failed (ADR-029 Implementation). `None` for a classified context,
+    /// whose `outcome` carries the result.
+    pub failure_code: Option<String>,
 }
 
 /// Flat, FFI-friendly reconnection report. Aggregates per-context results
@@ -964,10 +972,15 @@ fn outcome_str(outcome: &scp_protocol::sync::SyncOutcome) -> (String, bool) {
 /// the bridge surface and returns a flat report.
 ///
 /// Each context's `sync/{context_id}/last_relay_contact` is read from
-/// `relay_contacts`, the one source of that value; a context with none stored
-/// is classified Long (ADR-029 §2 sync-state keys). For each context the
-/// [`ReconnectionCoordinator`] classifies the offline tier from that value
-/// and:
+/// `relay_contacts`, which every bridge takes from the supervisor's one store
+/// ([`Supervisor::relay_contact_store`]). A context whose value is absent or
+/// cannot be read is reported `failed` with no tier and its own
+/// [`ContextReconnectResult::failure_code`] (`SCP-TRANS-5102` absent,
+/// `SCP-TRANS-5103` unreadable), keeps `needs_reconnect` set, and is not
+/// drained; the other contexts reconnect (ADR-029 Implementation). Those
+/// results follow the classified contexts' results. For each other context
+/// the [`ReconnectionCoordinator`] classifies the offline tier from that
+/// value and:
 /// - **Tier 1 (Short)** — runs the six-phase protocol via
 ///   [`ReconnectionCoordinator::execute`] against a [`RelayActorSyncDriver`].
 /// - **Tier 2 (Extended)** — fetches the relay snapshot via a
@@ -994,16 +1007,10 @@ fn outcome_str(outcome: &scp_protocol::sync::SyncOutcome) -> (String, bool) {
 /// `sync/{context_id}/last_relay_contact` through `relay_contacts` (ADR-029
 /// §2 sync-state keys); a failed write is reported on
 /// [`ContextReconnectResult::relay_contact_error`].
-///
-/// # Errors
-///
-/// [`ReconnectError::ContactRead`] when reading a context's
-/// `last_relay_contact` fails; no context is reconnected, because a context
-/// classified without its contact could take the wrong tier.
 pub async fn reconnect_contexts<F, Fut>(
     request: ReconnectRequest<'_>,
     mut drain: Option<F>,
-) -> Result<ReconnectReport, ReconnectError>
+) -> ReconnectReport
 where
     F: FnMut(String) -> Fut,
     Fut: std::future::Future<Output = (u64, u64)>,
@@ -1018,7 +1025,8 @@ where
         now,
         policy,
     } = request;
-    let last_relay_contacts = load_relay_contacts(relay_contacts, &context_ids).await?;
+    let (last_relay_contacts, classifiable, unreadable) =
+        load_relay_contacts(relay_contacts, context_ids).await;
 
     let tally = DeliveryTally::default();
     let driver = RelayActorSyncDriver::new(
@@ -1029,19 +1037,17 @@ where
         &tally,
     );
 
-    let coordinator = ReconnectionCoordinator::with_policy(
-        member_did,
-        context_ids.clone(),
-        last_relay_contacts,
-        policy,
-    );
+    let coordinator =
+        ReconnectionCoordinator::with_policy(member_did, classifiable, last_relay_contacts, policy);
 
     // Tier 1 contexts are executed by the coordinator's six-phase loop;
     // Tier 2 / Tier 3 contexts are reported with their classification and
     // driven through the tier engines below.
     let report = coordinator.execute(now, &driver).await;
 
-    let mut results = Vec::with_capacity(report.contexts_synced.len());
+    let mut results = Vec::with_capacity(
+        report.contexts_synced.len() + report.unclassified.len() + unreadable.len(),
+    );
     let mut messages_drained = report.messages_drained;
     let mut messages_discarded = report.messages_discarded;
 
@@ -1103,7 +1109,7 @@ where
         let envelopes_delivered = tally.get(&context_id);
         results.push(ContextReconnectResult {
             context_id,
-            tier: tier_str(tier),
+            tier: Some(tier_str(tier)),
             outcome: outcome_string,
             epochs_caught_up: epochs,
             events_recovered: events,
@@ -1112,38 +1118,54 @@ where
             needs_reconnect_cleared,
             envelopes_delivered,
             relay_contact_error,
+            failure_code: None,
         });
     }
 
-    Ok(ReconnectReport {
+    results.extend(unclassified_results(report.unclassified, unreadable));
+
+    ReconnectReport {
         contexts: results,
         messages_drained,
         messages_discarded,
         total_duration_ms: report.total_duration_ms,
-    })
+    }
 }
 
-/// Why [`reconnect_contexts`] reconnected no context.
-#[derive(Debug, thiserror::Error)]
-pub enum ReconnectError {
-    /// Reading `sync/{context_id}/last_relay_contact` failed.
-    #[error("reading the last relay contact of {context_id} failed: {source}")]
-    ContactRead {
-        /// The context whose key could not be read.
-        context_id: String,
-        /// The store failure.
-        #[source]
-        source: StoreError,
-    },
+/// The results of the contexts whose reconnection ended before their tier
+/// was classified: `missing` have no stored `last_relay_contact`
+/// (SCP-TRANS-5102), and `unreadable` failed to read it (SCP-TRANS-5103).
+fn unclassified_results(
+    missing: Vec<String>,
+    unreadable: Vec<String>,
+) -> impl Iterator<Item = ContextReconnectResult> {
+    let missing = missing
+        .into_iter()
+        .map(|id| (id, crate::error_codes::TRANS_5102));
+    let unreadable = unreadable
+        .into_iter()
+        .map(|id| (id, crate::error_codes::TRANS_5103));
+    missing
+        .chain(unreadable)
+        .map(|(context_id, code)| unclassified_result(context_id, code))
 }
 
-impl ReconnectError {
-    /// The bridge error code: `SCP-TRANS-5095` (`sdk-common.md`).
-    #[must_use]
-    pub const fn code(&self) -> &'static str {
-        match self {
-            Self::ContactRead { .. } => crate::error_codes::TRANS_5095,
-        }
+/// The result of a context whose reconnection ended before its tier was
+/// classified, because its `last_relay_contact` is absent or unreadable:
+/// `failed`, no tier, nothing caught up, and `needs_reconnect` kept.
+fn unclassified_result(context_id: String, code: &'static str) -> ContextReconnectResult {
+    ContextReconnectResult {
+        context_id,
+        tier: None,
+        outcome: "failed".to_owned(),
+        epochs_caught_up: 0,
+        events_recovered: 0,
+        mls_update_issued: false,
+        equivocations_detected: 0,
+        needs_reconnect_cleared: false,
+        envelopes_delivered: 0,
+        relay_contact_error: None,
+        failure_code: Some(code.to_owned()),
     }
 }
 
@@ -1254,30 +1276,37 @@ async fn clear_and_record_contact(
     (true, error)
 }
 
-/// Reads the stored `last_relay_contact` of each of `context_ids`; a context
-/// with none stored is absent from the map.
+/// Reads the stored `last_relay_contact` of each of `context_ids`.
 ///
-/// # Errors
-///
-/// [`ReconnectError::ContactRead`] on the first read that fails.
+/// Returns the values read, the contexts to classify (a context with none
+/// stored is among them, absent from the values, and the coordinator lists
+/// it unclassified), and the contexts whose read failed, each failure
+/// logged here and none of them classified.
 async fn load_relay_contacts(
     relay_contacts: &dyn RelayContactStore,
-    context_ids: &[String],
-) -> Result<HashMap<String, u64>, ReconnectError> {
+    context_ids: Vec<String>,
+) -> (HashMap<String, u64>, Vec<String>, Vec<String>) {
     let mut contacts = HashMap::with_capacity(context_ids.len());
+    let mut classifiable = Vec::with_capacity(context_ids.len());
+    let mut unreadable = Vec::new();
     for context_id in context_ids {
-        let stored = relay_contacts
-            .load_last_relay_contact(context_id)
-            .await
-            .map_err(|source| ReconnectError::ContactRead {
-                context_id: context_id.clone(),
-                source,
-            })?;
-        if let Some(contact) = stored {
-            contacts.insert(context_id.clone(), contact);
+        match relay_contacts.load_last_relay_contact(&context_id).await {
+            Ok(Some(contact)) => {
+                contacts.insert(context_id.clone(), contact);
+                classifiable.push(context_id);
+            }
+            Ok(None) => classifiable.push(context_id),
+            Err(error) => {
+                tracing::error!(
+                    context_id = %context_id,
+                    %error,
+                    "reconnect_contexts: reading last_relay_contact failed; the context is not reconnected"
+                );
+                unreadable.push(context_id);
+            }
         }
     }
-    Ok(contacts)
+    (contacts, classifiable, unreadable)
 }
 
 /// Welcome-await timeout (seconds) for Tier 3 re-join. Matches the
@@ -1295,13 +1324,7 @@ type NoDrainFn = fn(String) -> std::future::Ready<(u64, u64)>;
 /// For bridges whose outbound queue has no persistent enqueued entries to
 /// drain (e.g. encrypted in-memory storage), passes a typed `None` drain
 /// callback so callers do not have to spell out the closure generics.
-///
-/// # Errors
-///
-/// The errors of [`reconnect_contexts`].
-pub async fn reconnect_contexts_no_drain(
-    request: ReconnectRequest<'_>,
-) -> Result<ReconnectReport, ReconnectError> {
+pub async fn reconnect_contexts_no_drain(request: ReconnectRequest<'_>) -> ReconnectReport {
     // Concrete closure type so the `None` variant's generics are inferred.
     let drain: Option<NoDrainFn> = None;
     reconnect_contexts(request, drain).await
@@ -1744,10 +1767,12 @@ async fn record_contact_after_live_delivery<T: Sync, E: Sync>(
 mod tests {
     use super::*;
 
-    fn contacts() -> scp_core::store::ProtocolRepository<scp_platform::in_memory::InMemoryStorage> {
-        scp_core::store::ProtocolRepository::new_for_testing(
+    fn contacts()
+    -> scp_core::store::sync::StorageRelayContactStore<scp_platform::in_memory::InMemoryStorage>
+    {
+        scp_core::store::sync::StorageRelayContactStore::new(std::sync::Arc::new(
             scp_platform::in_memory::InMemoryStorage::new(),
-        )
+        ))
     }
 
     /// A store whose writes fail, for the write-failure arm.
@@ -1761,6 +1786,11 @@ mod tests {
         }
         async fn load_last_relay_contact(&self, _: &str) -> Result<Option<u64>, StoreError> {
             Ok(None)
+        }
+        async fn delete_last_relay_contact(&self, _: &str) -> Result<(), StoreError> {
+            Err(StoreError::SerializationFailed(
+                "injected delete failure".to_owned(),
+            ))
         }
     }
 

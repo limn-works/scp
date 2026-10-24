@@ -50,8 +50,8 @@ use scp_core::context::params::{ContextMode, ContextParams};
 use scp_core::context::roles::Capability;
 use scp_core::context::supervisor::Supervisor;
 use scp_core::envelope::OuterEnvelope;
-use scp_core::store::ProtocolRepository;
 use scp_core::store::sync::RelayContactStore;
+use scp_core::store::sync::StorageRelayContactStore;
 use scp_core::sync::SyncPolicy;
 use scp_did::DID;
 use scp_ffi_common::bridge_instance::CoreFields;
@@ -76,7 +76,7 @@ const BOB_DID: &str = "did:dht:z6MkBobPushWake";
 const PLAINTEXT: &[u8] = b"wake me up";
 const APNS_WAKE: &[u8] = br#"{"aps":{"content-available":1}}"#;
 
-type Contacts = Arc<ProtocolRepository<InMemoryStorage>>;
+type Contacts = Arc<StorageRelayContactStore<InMemoryStorage>>;
 
 fn encrypted_params() -> ContextParams {
     ContextParams {
@@ -108,7 +108,9 @@ fn dead_url() -> String {
 }
 
 fn new_contacts() -> Contacts {
-    Arc::new(ProtocolRepository::new_for_testing(InMemoryStorage::new()))
+    Arc::new(StorageRelayContactStore::new(Arc::new(
+        InMemoryStorage::new(),
+    )))
 }
 
 /// Starts an ephemeral native relay; returns its handle and `ws://` URL.
@@ -259,14 +261,24 @@ impl Members {
     }
 }
 
-/// Bob's bridge core over `supervisor`, with an in-memory contact store the
-/// test reads back.
-fn bob_core(supervisor: &Arc<Supervisor>) -> (CoreFields, Contacts) {
-    let core = CoreFields::with_supervisor(Arc::clone(supervisor));
-    let contacts: Contacts = Arc::new(ProtocolRepository::new_for_testing(InMemoryStorage::new()));
-    let store: Arc<dyn RelayContactStore> = Arc::clone(&contacts) as _;
-    assert!(core.set_relay_contact_store(store).is_ok());
-    (core, contacts)
+/// Bob's bridge core over `supervisor`, and the supervisor's contact store:
+/// the one store the bridge reads and writes.
+fn bob_core(supervisor: &Arc<Supervisor>) -> (CoreFields, Arc<dyn RelayContactStore>) {
+    (
+        CoreFields::with_supervisor(Arc::clone(supervisor)),
+        supervisor.relay_contact_store(),
+    )
+}
+
+/// Stores a contact an hour old for `context_id` and returns it, so a contact
+/// a wake writes differs from it, as does the one the join stored.
+async fn backdate(contacts: &Arc<dyn RelayContactStore>, context_id: &str) -> u64 {
+    let old = now_secs() - 3600;
+    contacts
+        .store_last_relay_contact(context_id, old)
+        .await
+        .unwrap();
+    old
 }
 
 async fn wake(core: &CoreFields) -> WakeOutcome {
@@ -289,6 +301,7 @@ async fn one_envelope_at_the_pseudonym_routing_id_gives_new_data_and_a_message_e
     );
 
     let (core, contacts) = bob_core(&m.bob.manager);
+    backdate(&contacts, &m.ctx_id).await;
     let before = now_secs();
     let outcome = wake(&core).await;
     let after = now_secs();
@@ -314,6 +327,7 @@ async fn nothing_buffered_gives_no_data() {
     let (relay, url) = start_relay().await;
     let m = members("push-wake-no-data", vec![url]).await;
     let (core, contacts) = bob_core(&m.bob.manager);
+    let old = backdate(&contacts, &m.ctx_id).await;
     let outcome = wake(&core).await;
     assert!(matches!(outcome, WakeOutcome::NoData), "{outcome:?}");
     assert!(
@@ -321,7 +335,7 @@ async fn nothing_buffered_gives_no_data() {
             .load_last_relay_contact(&m.ctx_id)
             .await
             .unwrap()
-            .is_some(),
+            .is_some_and(|t| t > old),
         "every relay answered, so the contact is written"
     );
     relay.shutdown();
@@ -332,6 +346,7 @@ async fn an_unreachable_relay_fails_the_wake() {
     let url = dead_url();
     let m = members("push-wake-unreachable", vec![url.clone()]).await;
     let (core, contacts) = bob_core(&m.bob.manager);
+    let old = backdate(&contacts, &m.ctx_id).await;
     let started = Instant::now();
     let outcome = wake(&core).await;
     match &outcome {
@@ -347,7 +362,7 @@ async fn an_unreachable_relay_fails_the_wake() {
     assert!(started.elapsed() < Duration::from_secs(26));
     assert_eq!(
         contacts.load_last_relay_contact(&m.ctx_id).await.unwrap(),
-        None,
+        Some(old),
         "a failed wake writes no contact"
     );
 }
@@ -375,6 +390,7 @@ async fn a_relay_that_never_answers_query_fails_the_wake_within_the_deadline() {
     let url = start_silent_relay().await;
     let m = members("push-wake-silent", vec![url]).await;
     let (core, contacts) = bob_core(&m.bob.manager);
+    let old = backdate(&contacts, &m.ctx_id).await;
     let started = Instant::now();
     let outcome = wake(&core).await;
     let elapsed = started.elapsed();
@@ -388,7 +404,7 @@ async fn a_relay_that_never_answers_query_fails_the_wake_within_the_deadline() {
     );
     assert_eq!(
         contacts.load_last_relay_contact(&m.ctx_id).await.unwrap(),
-        None
+        Some(old)
     );
 }
 
@@ -473,6 +489,7 @@ async fn a_cold_start_whose_restore_fails_fails_the_wake() {
     let restarted = m.bob.restarted_supervisor_with_lost_keys().unwrap();
     restarted.register_local_did(DID::from(BOB_DID)).await;
     let (core, contacts) = bob_core(&restarted);
+    let old = backdate(&contacts, &m.ctx_id).await;
 
     let outcome = wake(&core).await;
     match outcome {
@@ -483,7 +500,7 @@ async fn a_cold_start_whose_restore_fails_fails_the_wake() {
     }
     assert_eq!(
         contacts.load_last_relay_contact(&m.ctx_id).await.unwrap(),
-        None
+        Some(old)
     );
     relay.shutdown();
 }
@@ -801,10 +818,9 @@ async fn a_full_reconnect_that_clears_needs_reconnect_writes_the_contact() {
         now,
         policy: SyncPolicy::default(),
     })
-    .await
-    .expect("the contact reads");
+    .await;
     let result = &report.contexts[0];
-    assert_eq!(result.tier, "short", "{result:?}");
+    assert_eq!(result.tier.as_deref(), Some("short"), "{result:?}");
     assert_eq!(result.outcome, "fully_caught_up", "{result:?}");
     assert!(result.needs_reconnect_cleared, "{result:?}");
     assert!(!bob.needs_reconnect(&m.ctx_id).await);
@@ -813,6 +829,51 @@ async fn a_full_reconnect_that_clears_needs_reconnect_writes_the_contact() {
         contacts.load_last_relay_contact(&m.ctx_id).await.unwrap(),
         Some(now)
     );
+    relay.shutdown();
+}
+
+/// A member who just joined by Welcome reconnects at Tier 1 with nothing
+/// seeded: the join stored the first `last_relay_contact` in the supervisor's
+/// store, the store every bridge reads (ADR-029 Implementation), so the
+/// reconnection classifies the context Short, not Long.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reconnect_after_a_welcome_join_classifies_short_from_the_joins_contact() {
+    let (relay, url) = start_relay().await;
+    let before = now_secs();
+    let m = members("push-wake-first-contact", vec![url.clone()]).await;
+    let after = now_secs();
+    let (core, contacts) = bob_core(&m.bob.manager);
+    let joined = contacts.load_last_relay_contact(&m.ctx_id).await.unwrap();
+    assert!(
+        joined.is_some_and(|t| (before..=after).contains(&t)),
+        "the Welcome join stores the local time: {joined:?} not in {before}..={after}"
+    );
+    let bridge_store = core.relay_contact_store().expect("supervisor installed");
+    assert_eq!(
+        bridge_store
+            .load_last_relay_contact(&m.ctx_id)
+            .await
+            .unwrap(),
+        joined,
+        "the bridge reads the supervisor's store"
+    );
+    let transport = Arc::new(TransportManager::new(
+        url.clone(),
+        Box::new(connect(&url).await),
+    ));
+    let report = reconnect_contexts_no_drain(ReconnectRequest {
+        transport: &transport,
+        supervisor: &m.bob.manager,
+        member_did: DID::from(BOB_DID),
+        signer: m.bob_signer(),
+        relay_contacts: bridge_store.as_ref(),
+        context_ids: vec![m.ctx_id.clone()],
+        now: now_secs(),
+        policy: SyncPolicy::default(),
+    })
+    .await;
+    let result = &report.contexts[0];
+    assert_eq!(result.tier.as_deref(), Some("short"), "{result:?}");
     relay.shutdown();
 }
 
@@ -847,15 +908,14 @@ async fn a_tier_3_reconnect_fails_at_once_and_keeps_needs_reconnect_set() {
         now,
         policy,
     })
-    .await
-    .expect("the contact reads");
+    .await;
     assert!(
         started.elapsed() < Duration::from_secs(5),
         "Tier 3 fails at once, without a Welcome wait: {:?}",
         started.elapsed()
     );
     let result = &report.contexts[0];
-    assert_eq!(result.tier, "long", "{result:?}");
+    assert_eq!(result.tier.as_deref(), Some("long"), "{result:?}");
     assert_eq!(result.outcome, "failed", "{result:?}");
     assert!(!result.needs_reconnect_cleared, "{result:?}");
     assert!(
@@ -901,6 +961,7 @@ async fn a_warm_wake_leaves_needs_reconnect_set_and_publishes_nothing() {
     let bob = m.restarted_bob_needing_reconnect().await;
     m.publish_from_alice(&url).await;
     let (core, contacts) = bob_core(&bob);
+    let old = backdate(&contacts, &m.ctx_id).await;
     let outcome = wake(&core).await;
     assert!(matches!(outcome, WakeOutcome::NewData), "{outcome:?}");
     assert!(Members::message_received(
@@ -919,7 +980,7 @@ async fn a_warm_wake_leaves_needs_reconnect_set_and_publishes_nothing() {
             .load_last_relay_contact(&m.ctx_id)
             .await
             .unwrap()
-            .is_some()
+            .is_some_and(|t| t > old)
     );
     relay.shutdown();
 }
@@ -1060,8 +1121,7 @@ async fn a_full_reconnect_sends_the_answer_a_wake_queued() {
         now,
         policy: SyncPolicy::default(),
     })
-    .await
-    .expect("the contact reads");
+    .await;
     assert_eq!(report.contexts[0].outcome, "fully_caught_up", "{report:?}");
     assert_eq!(
         m.bob
@@ -1097,6 +1157,12 @@ impl RelayContactStore for YieldingContacts {
         context_id: &str,
     ) -> Result<Option<u64>, scp_core::store::StoreError> {
         self.0.load_last_relay_contact(context_id).await
+    }
+    async fn delete_last_relay_contact(
+        &self,
+        context_id: &str,
+    ) -> Result<(), scp_core::store::StoreError> {
+        self.0.delete_last_relay_contact(context_id).await
     }
 }
 
@@ -1259,6 +1325,8 @@ async fn a_dead_relay_fails_only_the_context_it_serves() {
     m.add_context(ctx_b, vec![dead_url()]).await;
     m.publish_from_alice(&url).await;
     let (core, contacts) = bob_core(&m.bob.manager);
+    let old_a = backdate(&contacts, &m.ctx_id).await;
+    let old_b = backdate(&contacts, ctx_b).await;
     let outcome = wake(&core).await;
     assert!(matches!(outcome, WakeOutcome::NewData), "{outcome:?}");
     assert!(Members::message_received(
@@ -1269,12 +1337,12 @@ async fn a_dead_relay_fails_only_the_context_it_serves() {
             .load_last_relay_contact(&m.ctx_id)
             .await
             .unwrap()
-            .is_some(),
+            .is_some_and(|t| t > old_a),
         "context A delivered, so its contact is written"
     );
     assert_eq!(
         contacts.load_last_relay_contact(ctx_b).await.unwrap(),
-        None,
+        Some(old_b),
         "context B's relay was not dialed, so its contact is unchanged"
     );
     relay.shutdown();
@@ -1295,6 +1363,7 @@ async fn a_context_on_eleven_relays_keeps_every_relay_of_the_dial() {
     let m = members("push-wake-eleven-relays", urls.clone()).await;
     m.publish_from_alice(&urls[0]).await;
     let (core, contacts) = bob_core(&m.bob.manager);
+    let old = backdate(&contacts, &m.ctx_id).await;
     let outcome = wake(&core).await;
     assert!(matches!(outcome, WakeOutcome::NewData), "{outcome:?}");
     assert!(
@@ -1302,7 +1371,7 @@ async fn a_context_on_eleven_relays_keeps_every_relay_of_the_dial() {
             .load_last_relay_contact(&m.ctx_id)
             .await
             .unwrap()
-            .is_some()
+            .is_some_and(|t| t > old)
     );
     for relay in relays {
         relay.shutdown();

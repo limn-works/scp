@@ -788,8 +788,14 @@ pub struct ContextSyncResult {
 /// See ADR-029 acceptance criterion 2.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReconnectionReport {
-    /// Per-context sync results.
+    /// Per-context sync results, one for each context with a stored relay
+    /// contact.
     pub contexts_synced: Vec<ContextSyncResult>,
+    /// The contexts with no stored relay contact, in input order. Each was
+    /// neither classified nor synced: a missing contact is a store fault,
+    /// never a long absence (ADR-029 Implementation), and it ends only that
+    /// context's reconnection.
+    pub unclassified: Vec<ContextId>,
     /// Total number of queued messages drained across all contexts.
     pub messages_drained: u64,
     /// Total number of queued messages discarded (expired or context gone).
@@ -911,14 +917,30 @@ impl ReconnectionCoordinator {
     ///
     /// Uses the per-context last relay contact timestamp and the provided
     /// `now` timestamp. SCP does not require synchronized clocks (§9.8.3).
-    #[must_use]
-    pub fn classify_context(&self, context_id: &str, now: u64) -> OfflineTier {
-        let last_contact = self
-            .last_relay_contacts
+    ///
+    /// # Errors
+    ///
+    /// [`SyncError::NoRelayContact`] when no contact is held for
+    /// `context_id`: a missing contact is a store fault, never a long
+    /// absence (ADR-029 Implementation).
+    pub fn classify_context(&self, context_id: &str, now: u64) -> Result<OfflineTier, SyncError> {
+        Ok(self
+            .policy
+            .classify_offline_duration(self.last_contact(context_id)?, now))
+    }
+
+    /// The last relay contact held for `context_id`.
+    ///
+    /// # Errors
+    ///
+    /// [`SyncError::NoRelayContact`] when none is held.
+    fn last_contact(&self, context_id: &str) -> Result<u64, SyncError> {
+        self.last_relay_contacts
             .get(context_id)
             .copied()
-            .unwrap_or(0);
-        self.policy.classify_offline_duration(last_contact, now)
+            .ok_or_else(|| SyncError::NoRelayContact {
+                context_id: context_id.to_owned(),
+            })
     }
 
     /// Plans the reconnection by classifying each context and producing
@@ -927,13 +949,17 @@ impl ReconnectionCoordinator {
     /// This does not execute the protocol — it prepares the context-level
     /// metadata that the actual transport/MLS layer uses to drive catch-up.
     /// The transport layer is injected at the SDK level, not in `scp-core`.
+    ///
+    /// Each context's entry is classified on its own: a context with no
+    /// relay contact gets [`SyncError::NoRelayContact`], and the other
+    /// contexts are still planned (ADR-029 Implementation).
     #[must_use]
-    pub fn plan(&self, now: u64) -> Vec<ContextSyncResult> {
+    pub fn plan(&self, now: u64) -> Vec<Result<ContextSyncResult, SyncError>> {
         self.context_ids
             .iter()
             .map(|ctx_id| {
-                let tier = self.classify_context(ctx_id, now);
-                ContextSyncResult {
+                let tier = self.classify_context(ctx_id, now)?;
+                Ok(ContextSyncResult {
                     context_id: ctx_id.clone(),
                     tier,
                     epochs_caught_up: 0,
@@ -942,7 +968,7 @@ impl ReconnectionCoordinator {
                     mls_update_issued: false,
                     outcome: SyncOutcome::Pending,
                     sync_events: Vec::new(),
-                }
+                })
             })
             .collect()
     }
@@ -972,16 +998,29 @@ impl ReconnectionCoordinator {
     /// # Returns
     ///
     /// A [`ReconnectionReport`] with per-context results and aggregate stats.
+    /// A context with no relay contact is listed in
+    /// [`ReconnectionReport::unclassified`] and not synced, since a context
+    /// classified without its contact could take the wrong tier; every other
+    /// context is synced (ADR-029 Implementation).
     pub async fn execute<D: SyncPhaseDriver>(&self, now: u64, driver: &D) -> ReconnectionReport {
         let start = std::time::Instant::now();
         let mut results = Vec::with_capacity(self.context_ids.len());
+        let mut unclassified = Vec::new();
         let mut total_drained: u64 = 0;
         let mut total_discarded: u64 = 0;
 
         for ctx_id in &self.context_ids {
-            let tier = self.classify_context(ctx_id, now);
+            let Ok(last_contact) = self.last_contact(ctx_id) else {
+                tracing::warn!(
+                    context_id = %ctx_id,
+                    "reconnection skipped a context with no stored last_relay_contact"
+                );
+                unclassified.push(ctx_id.clone());
+                continue;
+            };
+            let tier = self.policy.classify_offline_duration(last_contact, now);
             let result = match tier {
-                OfflineTier::Short => self.execute_tier1(ctx_id, now, tier, driver).await,
+                OfflineTier::Short => self.execute_tier1(ctx_id, last_contact, tier, driver).await,
                 OfflineTier::Extended | OfflineTier::Long => {
                     // Tier 2 and Tier 3 contexts are reported with their
                     // classification but not executed here — the caller
@@ -1026,6 +1065,7 @@ impl ReconnectionCoordinator {
 
         ReconnectionReport {
             contexts_synced: results,
+            unclassified,
             messages_drained: total_drained,
             messages_discarded: total_discarded,
             total_duration_ms: elapsed_ms,
@@ -1033,20 +1073,14 @@ impl ReconnectionCoordinator {
     }
 
     /// Executes the Tier 1 (Short offline) six-phase protocol for a single
-    /// context.
+    /// context whose stored relay contact is `last_contact`.
     async fn execute_tier1<D: SyncPhaseDriver>(
         &self,
         context_id: &str,
-        _now: u64,
+        last_contact: u64,
         tier: OfflineTier,
         driver: &D,
     ) -> ContextSyncResult {
-        let last_contact = self
-            .last_relay_contacts
-            .get(context_id)
-            .copied()
-            .unwrap_or(0);
-
         // Phase 1: Relay catch-up.
         let messages = match driver.relay_catch_up(context_id, last_contact).await {
             Ok(msgs) => msgs,
@@ -1318,18 +1352,21 @@ impl ReconnectionCoordinator {
     /// # Arguments
     ///
     /// * `results` — Per-context sync results.
+    /// * `unclassified` — Contexts with no stored relay contact.
     /// * `messages_drained` — Total queued messages sent.
     /// * `messages_discarded` — Total queued messages discarded.
     /// * `total_duration_ms` — Total time spent in the reconnection protocol.
     #[must_use]
     pub const fn build_report(
         results: Vec<ContextSyncResult>,
+        unclassified: Vec<ContextId>,
         messages_drained: u64,
         messages_discarded: u64,
         total_duration_ms: u64,
     ) -> ReconnectionReport {
         ReconnectionReport {
             contexts_synced: results,
+            unclassified,
             messages_drained,
             messages_discarded,
             total_duration_ms,
@@ -1897,31 +1934,57 @@ mod tests {
 
         // ctx-1: 1_003_600 - 1_000_000 = 3_600 < 14_400 → Short
         assert_eq!(
-            coord.classify_context("ctx-1", 1_003_600),
+            coord.classify_context("ctx-1", 1_003_600).unwrap(),
             OfflineTier::Short,
         );
 
         // ctx-2: 1_003_600 - 900_000 = 103_600 → Extended
         assert_eq!(
-            coord.classify_context("ctx-2", 1_003_600),
+            coord.classify_context("ctx-2", 1_003_600).unwrap(),
             OfflineTier::Extended,
         );
     }
 
-    #[test]
-    fn reconnection_coordinator_unknown_context_defaults_to_long() {
+    /// A context with no stored contact is a typed failure for that context
+    /// on every coordinator entry point, never a Long classification, and
+    /// the other contexts are still planned and synced (ADR-029
+    /// Implementation).
+    #[tokio::test]
+    async fn reconnection_coordinator_missing_contact_fails_only_that_context() {
+        let mut contacts = std::collections::HashMap::new();
+        contacts.insert("ctx-known".to_owned(), 1_000_000u64);
         let coord = ReconnectionCoordinator::new(
             DID::from("did:dht:z6MkAlice"),
-            vec!["ctx-unknown".to_owned()],
-            std::collections::HashMap::new(),
+            vec!["ctx-known".to_owned(), "ctx-unknown".to_owned()],
+            contacts,
         );
+        let no_contact = |e: &SyncError| matches!(e, SyncError::NoRelayContact { context_id } if context_id == "ctx-unknown");
 
-        // Unknown context has last_contact = 0 → always Long for any
-        // reasonable `now`.
-        assert_eq!(
-            coord.classify_context("ctx-unknown", 1_000_000),
-            OfflineTier::Long,
+        assert!(no_contact(
+            &coord
+                .classify_context("ctx-unknown", 1_000_000)
+                .unwrap_err()
+        ));
+        let mut plan = coord.plan(1_000_000).into_iter();
+        assert!(
+            matches!(
+                plan.next(),
+                Some(Ok(ref known))
+                    if known.context_id == "ctx-known" && known.tier == OfflineTier::Short
+            ),
+            "ctx-known is planned Short from its contact"
         );
+        assert!(
+            matches!(plan.next(), Some(Err(ref e)) if no_contact(e)),
+            "ctx-unknown is planned as a missing contact"
+        );
+        assert!(plan.next().is_none());
+
+        let report = coord.execute(1_000_010, &MockSyncDriver::new()).await;
+        assert_eq!(report.unclassified, vec!["ctx-unknown".to_owned()]);
+        assert_eq!(report.contexts_synced.len(), 1);
+        assert_eq!(report.contexts_synced[0].context_id, "ctx-known");
+        assert_eq!(report.contexts_synced[0].tier, OfflineTier::Short);
     }
 
     #[test]
@@ -1937,7 +2000,11 @@ mod tests {
             contacts,
         );
 
-        let plan = coord.plan(1_010_000);
+        let plan = coord
+            .plan(1_010_000)
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         assert_eq!(plan.len(), 2);
         assert_eq!(plan[0].context_id, "ctx-a");
         assert_eq!(plan[0].tier, OfflineTier::Short);
@@ -1974,7 +2041,7 @@ mod tests {
             outcome: SyncOutcome::FullyCaughtUp,
             sync_events: vec![],
         }];
-        let report = ReconnectionCoordinator::build_report(results, 15, 3, 2500);
+        let report = ReconnectionCoordinator::build_report(results, Vec::new(), 15, 3, 2500);
         assert_eq!(report.contexts_synced.len(), 1);
         assert_eq!(report.messages_drained, 15);
         assert_eq!(report.messages_discarded, 3);
@@ -2248,7 +2315,8 @@ mod tests {
         assert!(sync_result.mls_update_issued);
 
         // Build report.
-        let report = ReconnectionCoordinator::build_report(vec![sync_result], 0, 0, 150);
+        let report =
+            ReconnectionCoordinator::build_report(vec![sync_result], Vec::new(), 0, 0, 150);
         assert_eq!(report.contexts_synced.len(), 1);
         assert_eq!(
             report.contexts_synced[0].outcome,
@@ -3073,7 +3141,7 @@ mod tests {
                 sync_events: vec![],
             },
         ];
-        let report = ReconnectionCoordinator::build_report(results, 5, 2, 1000);
+        let report = ReconnectionCoordinator::build_report(results, Vec::new(), 5, 2, 1000);
         assert_eq!(report.contexts_synced.len(), 2);
         assert_eq!(
             report.contexts_synced[0].outcome,
@@ -3098,7 +3166,7 @@ mod tests {
             },
             sync_events: vec![],
         }];
-        let report = ReconnectionCoordinator::build_report(results, 0, 0, 500);
+        let report = ReconnectionCoordinator::build_report(results, Vec::new(), 0, 0, 500);
         assert_eq!(report.contexts_synced.len(), 1);
         let SyncOutcome::Failed { reason } = &report.contexts_synced[0].outcome else {
             unreachable!(

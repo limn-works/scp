@@ -2002,8 +2002,11 @@ impl Scp {
     /// the `TransportManager` and reaches actor-owned reconnection state
     /// through the `Supervisor`. On success each context's `needs_reconnect`
     /// flag is cleared. Each context's offline tier is classified from its
-    /// `last_relay_contact` in the instance's store; a context with none
-    /// stored takes the most conservative tier.
+    /// `last_relay_contact` in the instance's store.
+    /// A context whose `last_relay_contact` is absent or cannot be read is
+    /// reported `failed` with no tier and its own `failure_code`
+    /// (`SCP-TRANS-5102` absent, `SCP-TRANS-5103` unreadable) and keeps
+    /// `needs_reconnect` set; the other contexts reconnect.
     #[napi(js_name = "contextReconnect")]
     pub async fn context_reconnect(
         &self,

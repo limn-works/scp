@@ -55,9 +55,6 @@
 //!
 //! Persistence shortcuts:
 //! - [`has_persistence`] — predicate for skipping snapshot work.
-//! - [`persist_context_and_broadcast`] — best-effort flush of the whole
-//!   [`ContextSnapshot`] (context state + crypto export + embedded broadcast)
-//!   via the target actor's `FlushSnapshot` command.
 //!
 //! Broadcast bootstrapping:
 //! - [`init_broadcast_context`] — create + persist initial broadcast state.
@@ -129,10 +126,16 @@ pub fn has_persistence(supervisor: &Supervisor) -> bool {
 /// to each actor (the handler reads `state.receive_buffer.len()` from
 /// owned state — no cross-actor lock).
 ///
-/// Called after mutations that change context count or buffer state.
-/// Best-effort: if no metrics recorder is installed, these are no-ops
-/// (#1467); actors that fail to reply within the send timeout are skipped
-/// (metrics are approximate, exactly as the legacy `try_lock` skip was).
+/// Called after mutations that change context count or buffer state, from a
+/// tracked task that no caller awaits
+/// ([`SupervisorHandle::update_context_gauges`](crate::context::supervisor::handle::SupervisorHandle::update_context_gauges)):
+/// the sweep waits on every actor's mailbox, so a caller inside an actor's
+/// turn or under `bootstrap_spawn_lock` that awaited it would wait on itself
+/// or on an actor waiting for that lock. Best-effort: if no metrics recorder
+/// is installed, these are no-ops (#1467); an actor that does not take the
+/// command within [`SEND_TIMEOUT`](crate::context::actor::SEND_TIMEOUT), or
+/// does not reply within the same bound, is skipped (metrics are
+/// approximate, exactly as the legacy `try_lock` skip was).
 pub async fn update_context_gauges(supervisor: &Supervisor) {
     use crate::context::actor::commands::{ContextCommand, LifecycleCommand};
 
@@ -156,7 +159,7 @@ pub async fn update_context_gauges(supervisor: &Supervisor) {
         {
             continue;
         }
-        if let Ok(len) = rx.await {
+        if let Ok(Ok(len)) = tokio::time::timeout(crate::context::actor::SEND_TIMEOUT, rx).await {
             total_buffered += len;
         }
     }
@@ -208,46 +211,6 @@ pub fn init_broadcast_context(
     // write. The `supervisor` handle is unused now that the eager persist is gone.
     let _ = supervisor;
     Ok(Some(bc))
-}
-
-// ---------------------------------------------------------------------------
-// 12. persist_context_and_broadcast
-// ---------------------------------------------------------------------------
-
-/// Persists context and broadcast state for a single context if a
-/// persistence provider is configured.
-///
-/// ADR-049 Phase 2A finalization (`DashMap` removal): the snapshot is no
-/// longer read from the legacy `contexts` `DashMap`. Instead this mailboxes
-/// [`LifecycleCommand::FlushSnapshot`](crate::context::actor::commands::LifecycleCommand::FlushSnapshot)
-/// to the single target context's actor — the actor builds the snapshot
-/// (context + crypto export + broadcast) from its owned
-/// [`PerContextState`] and persists it via `deps.persistence`. The
-/// per-context body is identical to the per-actor slice
-/// [`flush_all_contexts`](crate::context::lifecycle_helpers::flush_all_contexts)
-/// fans out to.
-///
-/// Best-effort: a missing actor, a closed mailbox, or a send timeout is a
-/// silent skip (the actor persists on its own lifecycle paths too).
-pub async fn persist_context_and_broadcast(supervisor: &Supervisor, context_id: &str) {
-    use crate::context::actor::commands::{ContextCommand, LifecycleCommand};
-
-    if !has_persistence(supervisor) {
-        return;
-    }
-    let Some(actor) = supervisor.lookup(context_id) else {
-        return;
-    };
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    let cmd = ContextCommand::Lifecycle(LifecycleCommand::FlushSnapshot { reply: tx });
-    if actor
-        .send_with_timeout(cmd, crate::context::actor::SEND_TIMEOUT)
-        .await
-        .is_err()
-    {
-        return;
-    }
-    let _ = rx.await;
 }
 
 // ---------------------------------------------------------------------------

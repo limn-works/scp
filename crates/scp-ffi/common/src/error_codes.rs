@@ -909,9 +909,6 @@ pub const TRANS_5086: &str = "SCP-TRANS-5086";
 /// Push wake failed: the instance holds no local member DID
 /// (`WakeFailure::NoLocalIdentity`).
 pub const TRANS_5087: &str = "SCP-TRANS-5087";
-/// Push wake failed: the instance holds no `last_relay_contact` store
-/// (`WakeFailure::NoContactStore`).
-pub const TRANS_5088: &str = "SCP-TRANS-5088";
 /// Push wake failed: restoring or reading the persisted contexts failed
 /// (`WakeFailure::Restore`).
 pub const TRANS_5089: &str = "SCP-TRANS-5089";
@@ -929,9 +926,6 @@ pub const TRANS_5093: &str = "SCP-TRANS-5093";
 /// Push wake failed: the 25-second wake deadline expired with nothing
 /// delivered (`WakeFailure::DeadlineExpired`).
 pub const TRANS_5094: &str = "SCP-TRANS-5094";
-/// Reconnect failed: reading a context's stored `last_relay_contact` failed,
-/// so no context was reconnected (`reconnect::ReconnectError::ContactRead`).
-pub const TRANS_5095: &str = "SCP-TRANS-5095";
 /// Push wake context failed: the context's persisted relay set is empty
 /// (`reconnect::WakePullError::NoRelays`).
 pub const TRANS_5096: &str = "SCP-TRANS-5096";
@@ -950,6 +944,16 @@ pub const TRANS_5100: &str = "SCP-TRANS-5100";
 /// Push wake context failed: the actor reached no verdict on a blob of the
 /// context's buffer (`reconnect::WakePullError::Undelivered`).
 pub const TRANS_5101: &str = "SCP-TRANS-5101";
+/// Reconnect context failed: no `last_relay_contact` is stored.
+///
+/// No tier was classified for the context and `needs_reconnect` stays set;
+/// the other contexts reconnect (`reconnect::ContextReconnectResult::failure_code`).
+pub const TRANS_5102: &str = "SCP-TRANS-5102";
+/// Reconnect context failed: reading the stored `last_relay_contact` failed.
+///
+/// No tier was classified for the context and `needs_reconnect` stays set;
+/// the other contexts reconnect (`reconnect::ContextReconnectResult::failure_code`).
+pub const TRANS_5103: &str = "SCP-TRANS-5103";
 
 // -------------------------------------------------------------------------
 // Outlet (SCP-OUTLET- 6000--6999)

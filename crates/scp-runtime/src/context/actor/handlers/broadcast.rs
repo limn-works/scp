@@ -776,6 +776,18 @@ mod tests {
     /// appended leaf, for a test that asserts the bytes a leaf carries and not
     /// only how many leaves landed.
     async fn build_deps_recording() -> (ActorDeps, Arc<AtomicUsize>, RecordedLeaves) {
+        let (_supervisor, deps, appended, recorded) = build_supervisor_and_deps().await;
+        (deps, appended, recorded)
+    }
+
+    /// [`build_deps_recording`] plus the supervisor the deps reach, for a test
+    /// that registers a second context on it.
+    async fn build_supervisor_and_deps() -> (
+        Arc<crate::context::supervisor::supervisor::Supervisor>,
+        ActorDeps,
+        Arc<AtomicUsize>,
+        RecordedLeaves,
+    ) {
         use crate::context::supervisor::supervisor::Supervisor;
         use scp_platform::in_memory::InMemoryStorage;
 
@@ -825,7 +837,7 @@ mod tests {
             .build_actor_deps_loaded(&DID("did:example:broadcast-actor".to_owned()))
             .await
             .expect("build_actor_deps");
-        (deps, appended, recorded)
+        (supervisor, deps, appended, recorded)
     }
 
     /// Build an ACTIVE broadcast `ClassSCell` with the given admission policy,
@@ -2768,6 +2780,78 @@ mod tests {
             appends.load(Ordering::SeqCst),
             0,
             "a rolled-back migration appends nothing"
+        );
+    }
+
+    /// A migration whose destination id names a running context fails with
+    /// `CreationFailed` before it leaves `Active` or writes anything for the
+    /// destination, so the running context keeps its contact and its actor.
+    #[tokio::test]
+    async fn migration_onto_a_running_destination_is_refused_before_any_write() {
+        let (supervisor, deps, appends, _recorded) = build_supervisor_and_deps().await;
+        let (state, ctx_hex) =
+            build_broadcast_state_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
+        let mut cell = ClassSCell::new(state);
+        appends.store(0, Ordering::SeqCst);
+        let pid = [0x78; 32];
+        let destination = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(b"SCP-MIGRATION-DEST:");
+            hasher.update(ctx_hex.as_bytes());
+            hasher.update(pid);
+            hex::encode(hasher.finalize())
+        };
+        let mut destination_bytes = [0u8; 32];
+        destination_bytes.copy_from_slice(&hex::decode(&destination).expect("hex id"));
+        let running = PerContextState::new_for_test_encrypted(
+            destination_bytes,
+            1_700_000_000,
+            DID("did:example:broadcast-actor".to_owned()),
+        );
+        let _running_handle = supervisor
+            .spawn_actor_with_state(running, deps.clone_for_spawn(), None)
+            .await
+            .expect("spawn the destination's actor");
+        let contacts = supervisor.relay_contact_store();
+        contacts
+            .store_last_relay_contact(&destination, 42)
+            .await
+            .expect("store a later contact");
+
+        let result = crate::context::governance_helpers::execute_propose_context_migration(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &undeliverable_destination_params(),
+            "fixture",
+            60,
+            false,
+            crate::context::governance_helpers::CommitMeta {
+                pid,
+                actor_did: CREATOR_DID,
+                timestamp_secs: 1_700_000_000,
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(&result, Err(ContextError::CreationFailed(msg)) if msg.contains("is running")),
+            "{result:?}"
+        );
+        assert_eq!(cell.handle.state(), ContextState::Active);
+        assert!(cell.migration_state.is_none());
+        assert!(
+            supervisor.lookup(&destination).is_some(),
+            "the destination still runs"
+        );
+        assert_eq!(
+            contacts
+                .load_last_relay_contact(&destination)
+                .await
+                .unwrap(),
+            Some(42),
+            "the destination's contact is kept"
         );
     }
 

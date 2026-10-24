@@ -682,45 +682,47 @@ impl SupervisorHandle {
         )
     }
 
-    /// Update operational gauges (active contexts, buffer occupancy).
+    /// Starts a refresh of the operational gauges (active contexts, buffer
+    /// occupancy) as a tracked task and returns without waiting for it.
     /// Best-effort: skipped if no metrics recorder is installed.
     ///
-    /// Async because the gauge sweep mailboxes each per-context actor for
-    /// its receive-buffer length (ADR-049 Phase 2A finalization — DashMap
-    /// removal).
+    /// The sweep mailboxes each per-context actor for its receive-buffer
+    /// length (ADR-049 Phase 2A finalization — DashMap removal), so no caller
+    /// waits on it: a caller inside an actor's turn, or one holding
+    /// `bootstrap_spawn_lock` while an actor's turn waits for that lock, would
+    /// wait on itself until a timeout fired. The task spawns on the
+    /// Supervisor's tracker (ADR-049 Decision 16), so shutdown waits for it.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped or
+    /// shutdown has begun.
+    pub(crate) fn update_context_gauges(&self) -> Result<(), ContextError> {
+        let handle = self.clone();
+        let sweep = async move {
+            match handle.upgrade() {
+                Ok(supervisor) => {
+                    crate::context::manager_methods::update_context_gauges(&supervisor).await;
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "context gauge refresh skipped: supervisor gone");
+                }
+            }
+        };
+        self.spawn_tracked("refresh context gauges", sweep)
+            .map(drop)
+    }
+
+    /// The supervisor's store of each context's last successful relay
+    /// contact. See [`Supervisor::relay_contact_store`].
     ///
     /// # Errors
     ///
     /// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped.
-    pub(crate) async fn update_context_gauges(&self) -> Result<(), ContextError> {
-        let supervisor = self.upgrade()?;
-        crate::context::manager_methods::update_context_gauges(&supervisor).await;
-        Ok(())
-    }
-
-    /// Persist the per-context state and broadcast snapshot for
-    /// `context_id` if persistence is configured. This method returns no
-    /// error. When the Supervisor has dropped, the persist fails: ADR-049
-    /// Decision 16 item 4 makes that a Class C persist failure, which this
-    /// method logs and counts through `record_persistence_failure`.
-    pub(crate) async fn persist_context_and_broadcast(&self, context_id: &str) {
-        match self.upgrade() {
-            Ok(supervisor) => {
-                crate::context::manager_methods::persist_context_and_broadcast(
-                    &supervisor,
-                    context_id,
-                )
-                .await;
-            }
-            Err(e) => {
-                crate::metrics::record_persistence_failure();
-                tracing::warn!(
-                    context_id,
-                    error = %e,
-                    "snapshot persist skipped: the supervisor has dropped"
-                );
-            }
-        }
+    pub(crate) fn relay_contact_store(
+        &self,
+    ) -> Result<Arc<dyn crate::store::sync::RelayContactStore>, ContextError> {
+        Ok(self.upgrade()?.relay_contact_store())
     }
 
     /// Spawn a per-context [`ContextActor`](crate::context::actor::ContextActor)
@@ -983,6 +985,20 @@ impl SupervisorHandle {
         Ok(self.upgrade()?.lookup(context_id))
     }
 
+    /// Takes the Supervisor's `bootstrap_spawn_lock` for a bootstrap that runs
+    /// outside the Supervisor, the migration create. The Supervisor is not
+    /// held across the wait.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped.
+    pub(in crate::context) async fn lock_bootstrap_spawn(
+        &self,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, ContextError> {
+        let lock = Arc::clone(&self.upgrade()?.bootstrap_spawn_lock);
+        Ok(lock.lock_owned().await)
+    }
+
     /// Install the per-context TTL timer for `context_id` by mailboxing
     /// [`TtlCloseCommand::StartTtlTimer`](crate::context::actor::commands::TtlCloseCommand::StartTtlTimer)
     /// to the owning actor. The actor handler runs the actor-shape
@@ -990,8 +1006,8 @@ impl SupervisorHandle {
     /// its `state.ttl.timer` bookkeeping are installed by the actor that
     /// owns the state — no `&Supervisor` / DashMap reach.
     ///
-    /// Used by the lifecycle bootstrap paths (`finalize_create`,
-    /// `restore_context`, `import_context`) which run AFTER actor spawn
+    /// Used by the lifecycle bootstrap paths (`SpawnedContext::finalize`
+    /// for create, import and the Welcome join, and `restore_context`) which run AFTER actor spawn
     /// and hold only `&ActorDeps` (no `&mut state`). They delegate timer
     /// installation to the actor through this mailbox dispatch.
     ///
@@ -1214,57 +1230,9 @@ mod tests {
         shut_down(handle.seed_context_floors(&[7u8; 32]));
         shut_down(handle.is_context_poisoned("ctx").map(drop));
         shut_down(handle.find_shared_context("a", "b").await.map(drop));
-        shut_down(handle.update_context_gauges().await);
+        shut_down(handle.update_context_gauges());
+        shut_down(handle.relay_contact_store().map(drop));
         shut_down(handle.spawn_tracked("probe", async {}).map(drop));
-    }
-
-    /// ADR-049 Decision 16 item 4: the Class C snapshot persist counts a failed
-    /// upgrade as one persistence failure, and counts none against a live
-    /// Supervisor.
-    #[test]
-    fn class_c_snapshot_persist_counts_a_dropped_supervisor_as_a_persist_failure() {
-        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
-
-        let failures = |snapshotter: &metrics_util::debugging::Snapshotter| {
-            snapshotter
-                .snapshot()
-                .into_vec()
-                .into_iter()
-                .find_map(|(ck, _, _, v)| match v {
-                    DebugValue::Counter(c)
-                        if ck.key().name() == "scp_persistence_failures_total" =>
-                    {
-                        Some(c)
-                    }
-                    _ => None,
-                })
-                .unwrap_or(0)
-        };
-        let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        metrics::with_local_recorder(&recorder, || {
-            rt.block_on(async {
-                let (sup, handle) = test_handle();
-                handle.persist_context_and_broadcast("ctx").await;
-                assert_eq!(
-                    failures(&snapshotter),
-                    0,
-                    "a live Supervisor counts no failure"
-                );
-                drop(sup);
-                assert!(handle.local_dids().is_err(), "the Supervisor has dropped");
-                handle.persist_context_and_broadcast("ctx").await;
-                assert_eq!(
-                    failures(&snapshotter),
-                    1,
-                    "a failed upgrade counts one failure"
-                );
-            });
-        });
     }
 
     #[tokio::test]

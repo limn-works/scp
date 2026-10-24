@@ -2361,9 +2361,11 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * the `TransportManager` and reaches actor-owned reconnection state
      * through the `Supervisor`. On success each context's `needs_reconnect`
      * flag is cleared. Each context's offline tier is classified from its
-     * `last_relay_contact` in the instance's store; a context with none
-     * stored takes the most conservative tier. A store read failure fails
-     * the call with `SCP-TRANS-5095`.
+     * `last_relay_contact` in the instance's store.
+     * A context whose `last_relay_contact` is absent or cannot be read is
+     * reported `failed` with no tier and its own `failure_code`
+     * (`SCP-TRANS-5102` absent, `SCP-TRANS-5103` unreadable) and keeps
+     * `needs_reconnect` set; the other contexts reconnect.
      */
     func contextReconnect(identity: Identity, contextIds: [String]) async throws  -> ReconnectReport
     
@@ -4929,9 +4931,11 @@ open func contextProposeTtlExtension(handle: ContextHandle, memberDid: String, p
      * the `TransportManager` and reaches actor-owned reconnection state
      * through the `Supervisor`. On success each context's `needs_reconnect`
      * flag is cleared. Each context's offline tier is classified from its
-     * `last_relay_contact` in the instance's store; a context with none
-     * stored takes the most conservative tier. A store read failure fails
-     * the call with `SCP-TRANS-5095`.
+     * `last_relay_contact` in the instance's store.
+     * A context whose `last_relay_contact` is absent or cannot be read is
+     * reported `failed` with no tier and its own `failure_code`
+     * (`SCP-TRANS-5102` absent, `SCP-TRANS-5103` unreadable) and keeps
+     * `needs_reconnect` set; the other contexts reconnect.
      */
 open func contextReconnect(identity: Identity, contextIds: [String])async throws  -> ReconnectReport  {
     return
@@ -9849,9 +9853,11 @@ public struct ContextReconnectResult {
      */
     public var contextId: String
     /**
-     * Offline tier: `"short"` / `"extended"` / `"long"`.
+     * Offline tier: `"short"` / `"extended"` / `"long"`; absent when the
+     * context's `last_relay_contact` is absent or unreadable, so no tier was
+     * classified (see `failure_code`).
      */
-    public var tier: String
+    public var tier: String?
     /**
      * Outcome string (`"fully_caught_up"`, `"reset"`, `"failed"`, …).
      */
@@ -9887,6 +9893,13 @@ public struct ContextReconnectResult {
      * write was due.
      */
     public var relayContactError: String?
+    /**
+     * The code of a failure that ended this context's reconnection before
+     * its tier was classified: `SCP-TRANS-5102` when no `last_relay_contact`
+     * is stored, `SCP-TRANS-5103` when reading it failed. Absent for a
+     * classified context, whose `outcome` carries the result.
+     */
+    public var failureCode: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -9895,8 +9908,10 @@ public struct ContextReconnectResult {
          * Context that was reconnected.
          */contextId: String, 
         /**
-         * Offline tier: `"short"` / `"extended"` / `"long"`.
-         */tier: String, 
+         * Offline tier: `"short"` / `"extended"` / `"long"`; absent when the
+         * context's `last_relay_contact` is absent or unreadable, so no tier was
+         * classified (see `failure_code`).
+         */tier: String?, 
         /**
          * Outcome string (`"fully_caught_up"`, `"reset"`, `"failed"`, …).
          */outcome: String, 
@@ -9923,7 +9938,13 @@ public struct ContextReconnectResult {
          * Why writing the context's `last_relay_contact` failed after
          * `needs_reconnect` was cleared; `None` when the write succeeded or no
          * write was due.
-         */relayContactError: String?) {
+         */relayContactError: String?, 
+        /**
+         * The code of a failure that ended this context's reconnection before
+         * its tier was classified: `SCP-TRANS-5102` when no `last_relay_contact`
+         * is stored, `SCP-TRANS-5103` when reading it failed. Absent for a
+         * classified context, whose `outcome` carries the result.
+         */failureCode: String?) {
         self.contextId = contextId
         self.tier = tier
         self.outcome = outcome
@@ -9934,6 +9955,7 @@ public struct ContextReconnectResult {
         self.needsReconnectCleared = needsReconnectCleared
         self.envelopesDelivered = envelopesDelivered
         self.relayContactError = relayContactError
+        self.failureCode = failureCode
     }
 }
 
@@ -9974,6 +9996,9 @@ extension ContextReconnectResult: Equatable, Hashable {
         if lhs.relayContactError != rhs.relayContactError {
             return false
         }
+        if lhs.failureCode != rhs.failureCode {
+            return false
+        }
         return true
     }
 
@@ -9988,6 +10013,7 @@ extension ContextReconnectResult: Equatable, Hashable {
         hasher.combine(needsReconnectCleared)
         hasher.combine(envelopesDelivered)
         hasher.combine(relayContactError)
+        hasher.combine(failureCode)
     }
 }
 
@@ -10001,7 +10027,7 @@ public struct FfiConverterTypeContextReconnectResult: FfiConverterRustBuffer {
         return
             try ContextReconnectResult(
                 contextId: FfiConverterString.read(from: &buf), 
-                tier: FfiConverterString.read(from: &buf), 
+                tier: FfiConverterOptionString.read(from: &buf), 
                 outcome: FfiConverterString.read(from: &buf), 
                 epochsCaughtUp: FfiConverterUInt64.read(from: &buf), 
                 eventsRecovered: FfiConverterUInt64.read(from: &buf), 
@@ -10009,13 +10035,14 @@ public struct FfiConverterTypeContextReconnectResult: FfiConverterRustBuffer {
                 equivocationsDetected: FfiConverterUInt64.read(from: &buf), 
                 needsReconnectCleared: FfiConverterBool.read(from: &buf), 
                 envelopesDelivered: FfiConverterUInt64.read(from: &buf), 
-                relayContactError: FfiConverterOptionString.read(from: &buf)
+                relayContactError: FfiConverterOptionString.read(from: &buf), 
+                failureCode: FfiConverterOptionString.read(from: &buf)
         )
     }
 
     public static func write(_ value: ContextReconnectResult, into buf: inout [UInt8]) {
         FfiConverterString.write(value.contextId, into: &buf)
-        FfiConverterString.write(value.tier, into: &buf)
+        FfiConverterOptionString.write(value.tier, into: &buf)
         FfiConverterString.write(value.outcome, into: &buf)
         FfiConverterUInt64.write(value.epochsCaughtUp, into: &buf)
         FfiConverterUInt64.write(value.eventsRecovered, into: &buf)
@@ -10024,6 +10051,7 @@ public struct FfiConverterTypeContextReconnectResult: FfiConverterRustBuffer {
         FfiConverterBool.write(value.needsReconnectCleared, into: &buf)
         FfiConverterUInt64.write(value.envelopesDelivered, into: &buf)
         FfiConverterOptionString.write(value.relayContactError, into: &buf)
+        FfiConverterOptionString.write(value.failureCode, into: &buf)
     }
 }
 
@@ -19698,7 +19726,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_propose_ttl_extension() != 10308) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_reconnect() != 4997) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_reconnect() != 16281) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_reset_ttl_timer() != 21393) {
