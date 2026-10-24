@@ -2796,7 +2796,7 @@ Opening `enc` and `ciphertext` with the reference private scalar under the same 
 
 ## 25.33 Concurrent-Commit Fork-Merge Vectors (`09-security-model.md` §9.5.2, §9.7.2, `07-trust-validation-and-capabilities.md` §7.3.1.1 "Concurrent Commits and fork merge")
 
-ADR-067 (Concurrent Commits and fork merge) lets two members commit at one epoch and merges the losing branch into the canonical one. These vectors fix its byte encodings and its deterministic rules. None of them carries a signature, so the generator of §25.1 emits none of their bytes. Python's standard-library `hashlib`, `hmac`, `struct` and `base64` computed every hexadecimal value below, and the `cryptography` package's `HKDFExpand` recomputed the Vector 75 node expansion. Where a vector depends on an encoding that its source defines only in part, it states the derivation and the verdicts and prints no bytes.
+ADR-067 (Concurrent Commits and fork merge) lets two members commit at one epoch and merges the losing branch into the canonical one. These vectors fix its byte encodings and its deterministic rules. None of them carries a signature. The generator emits every hexadecimal value below, and the Vector 73 bound and the Vector 79 ranks, under its `§25.33` section; when the `cryptography` package is present, it recomputes each Vector 75 node expansion with that package's `HKDFExpand`. Where a vector depends on an encoding that its source defines only in part, it states the derivation and the verdicts and prints no bytes.
 
 The vectors share these inputs:
 
