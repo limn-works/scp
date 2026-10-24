@@ -802,6 +802,7 @@ Context metadata follows a two-tier visibility model that balances legibility (i
 - Promotion policy (`no_promotion` or `promotable`), if context has a TTL (§5.10)
 - Memory scope (§5.11)
 - Context mode (`Encrypted` or `Broadcast`, §5.14)
+- Broadcast post TTL, for a broadcast context (§5.14.5)
 - Metadata visibility policy itself (so prospective members know what's hidden)
 
 Structural fields are always public regardless of `MetadataVisibilityPolicy`. These are the parameters a prospective member needs to evaluate whether to join — hiding them would undermine informed consent.
@@ -2191,7 +2192,9 @@ Where:
 
 The domain separator `"SCP-BROADCAST-ENVELOPE-V1:"` prevents cross-protocol payload confusion. The nonce MUST be included in the signature to bind it to the specific encryption operation — without it, any broadcast key holder could re-encrypt different content under a new nonce while reusing the original author's valid signature.
 
-**Send path:** validate UCAN (`messages:write`) → assign sequence number → generate random 12-byte nonce → hash provenance → sign (domain-separated hash of version, context_id, author_did, sequence, key_epoch, timestamp, nonce, provenance_hash) → AES-256-GCM encrypt plaintext with author broadcast key using nonce and AAD → serialize BroadcastEnvelope (cleartext metadata + encrypted payload) → wrap in OuterEnvelope → relay PUBLISH.
+**Send path:** validate UCAN (`messages:write`) → assign sequence number → generate random 12-byte nonce → hash provenance → sign (domain-separated hash of version, context_id, author_did, sequence, key_epoch, timestamp, nonce, provenance_hash) → AES-256-GCM encrypt plaintext with author broadcast key using nonce and AAD → serialize BroadcastEnvelope (cleartext metadata + encrypted payload) → wrap in OuterEnvelope with the post's TTL → relay PUBLISH.
+
+**Post lifetime.** `ContextParams.broadcast_post_ttl_secs` sets the `blob_ttl` an author requests for each post it publishes to a broadcast context. The context creator sets it at creation, and it is immutable after creation, like `ContextMode`. Its default is the relay maximum, `MAX_BLOB_TTL` (`09-security-model.md` §9.18.11). An author may set a TTL for one post when it sends the post, and that TTL replaces the context's value for that post. Both values are at least 1 second and at most `MAX_BLOB_TTL`: a context creation or a post that carries a value outside that range is refused with a typed error, and no SDK shortens or lengthens it. The field is a structural field (§5.7), so a prospective subscriber reads it before it registers. The relay lifetime decides how far back a new subscriber can read, because one broadcast key reads every post at its key epoch. Alec ruled on 2026-10-24: "Indefinite/max by default (set by context). Can be customized per post". A relay stores no blob longer than `MAX_BLOB_TTL`, so the default the current design supports is `MAX_BLOB_TTL` (`09-security-model.md` §9.10.2).
 
 **Receive path:** transport receive → dedup by blob hash → deserialize → verify signature against the key the author's key state lists `Current` in the `#active` role (pre-decryption rejection of forgeries) → decrypt with cached author broadcast key for this epoch using envelope nonce and reconstructed AAD → verify author UCAN → replay check (sequence number) → deliver to application layer.
 

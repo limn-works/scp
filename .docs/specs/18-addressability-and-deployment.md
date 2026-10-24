@@ -117,7 +117,7 @@ An HTTP-accessible JSON document at `https://<domain>/.well-known/scp` that enab
   ],
   "relay_config": {
     "max_blob_size": 262144,
-    "max_blob_ttl": 86400,
+    "max_blob_ttl": 604800,
     "rate_limit_publish": 6000,
     "rate_limit_subscribe": 100
   }
@@ -185,7 +185,7 @@ The `relay_config` object exposes operational parameters that agents need to eva
 | Field | Type | Unit | Description |
 |-------|------|------|-------------|
 | `max_blob_size` | integer | bytes | Maximum blob size the relay accepts. **The value is this relay's own** (`03-identity.md` §3.10.5, which states how a publisher segments against it). |
-| `max_blob_ttl` | integer | seconds | Maximum blob TTL the relay enforces. |
+| `max_blob_ttl` | integer | seconds | Maximum blob TTL the relay enforces. A conforming SCP relay enforces `MAX_BLOB_TTL` (`09-security-model.md` §9.18.11) and advertises that value; no operator setting changes it. |
 | `rate_limit_publish` | integer | per minute | PUBLISH rate limit per source prefix (ADR-004). |
 | `rate_limit_subscribe` | integer | per connection | Maximum concurrent subscriptions per connection (default: 100). |
 | `economic` | object | — | Relay economic configuration (§19.8). Optional. Absence = free relay. |
