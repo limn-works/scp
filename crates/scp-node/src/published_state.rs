@@ -17,11 +17,13 @@
 //!   modes) or [`apply_tier_change`] (tier change), each of which seeds or
 //!   advances the slot in the same step — so a publish that does not
 //!   (re-)seed the slot cannot be written (AC-6).
-//! - Both take the document as a [`ReservedDocument`], which only
-//!   [`reserve_push_routing_id`] builds, after it has moved the relay's live
-//!   URL handle to the node's own entry and every tier 3 entry of that same
-//!   document with the node's `bridgeTarget`. A publish of a document whose
-//!   tier 3 entries the relay does not reserve therefore cannot be written
+//! - Both publish the document as a [`ReservedDocument`], which only
+//!   [`NodePublisher::reserve_push_routing_id`] builds, after it has moved the
+//!   publisher's own relay handle, the relay's live URL handle the builder
+//!   bound the publisher to, to the node's own entry and every tier 3 entry of
+//!   that same document with the node's `bridgeTarget`. Neither takes a
+//!   reservation or a handle from its caller, so a publish of a document whose
+//!   tier 3 entries the node's own relay does not reserve cannot be written
 //!   either (§10.7.1 "Tier 3 relays").
 //!
 //! (The items below are `pub` *within* this private module, which is what
@@ -35,6 +37,7 @@ use scp_identity::DidMethod;
 use scp_identity::ScpIdentity;
 use scp_identity::republish::RepublishEntry;
 use scp_transport::nat::NatTierChange;
+use scp_transport::native::server::RelayConfig;
 use scp_transport::relay::push_gate::LiveRelayUrl;
 
 use crate::DhtMode;
@@ -214,6 +217,17 @@ pub trait DidPublisher: Send + Sync {
             dyn std::future::Future<Output = Result<Option<RepublishEntry>, NodeError>> + Send + 'a,
         >,
     >;
+
+    /// Bootstraps the node's publish-sequence counter from the record the DHT
+    /// holds for `identity` per the node's configured `DhtMode`, so the startup
+    /// publish supersedes a live record a prior run left within its TTL
+    /// (SCP-RELAYRES-004). Fail-closed: an error stops the startup publish.
+    /// [`seed_from_startup_publish`] calls it after the reservation and before
+    /// the publish.
+    fn initialize_sequence<'a>(
+        &'a self,
+        identity: &'a ScpIdentity,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), NodeError>> + Send + 'a>>;
 }
 
 /// The production [`DidPublisher`]: a [`DidMethod`] and the node's `DhtMode`
@@ -247,6 +261,18 @@ impl<D: DidMethod + 'static> DidPublisher for NodeDidPublisher<D> {
             document,
         ))
     }
+
+    fn initialize_sequence<'a>(
+        &'a self,
+        identity: &'a ScpIdentity,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), NodeError>> + Send + 'a>>
+    {
+        Box::pin(crate::initialize_sequence_for_mode(
+            self.dht_mode,
+            self.inner.as_ref(),
+            identity,
+        ))
+    }
 }
 
 /// The opaque handle to the node's publish seam.
@@ -257,24 +283,71 @@ impl<D: DidMethod + 'static> DidPublisher for NodeDidPublisher<D> {
 /// Publishing is reachable solely through [`seed_from_startup_publish`] and
 /// [`apply_tier_change`], which is what keeps the publish and the slot write one
 /// indivisible step (AC-6).
+///
+/// It also holds a clone of a relay configuration's live URL handle
+/// (`LiveRelayUrl` is a shared `Arc`, so the clone is that handle), and
+/// [`reserve_push_routing_id`](Self::reserve_push_routing_id) moves only that
+/// handle. What the types guarantee:
+///
+/// - The production constructor [`NodePublisher::new`] takes a
+///   [`RelayConfig`] and clones its `relay_url` itself, so a production
+///   caller must name a relay configuration, not a bare `LiveRelayUrl`.
+/// - The reservation takes no handle, so every reservation before a publish
+///   moves the handle the publisher was built with.
+///
+/// What the types do not guarantee: that the [`RelayConfig`] a caller names
+/// is the one its relay server runs. A caller can still build a
+/// `RelayConfig` around a fresh handle, for example
+/// `RelayConfig::defaults(LiveRelayUrl::new(url))`, and bind the publisher
+/// to it. Each builder passes the `relay_config` it then stores and runs its
+/// relay with. Two kinds of check hold that (§10.7.1 "Tier 3 relays": "its
+/// relay reserves every one of those IDs before the node publishes the
+/// entries"):
+/// - the `&relay_config` argument pins in `pipeline_wiring.rs`
+///   (`every_node_document_publish_reserves_the_published_entries`,
+///   `nat_tier_task_writes_the_relay_push_url_handle` and
+///   `reserved_document_is_minted_only_by_the_publisher_on_its_own_handle`);
+/// - the unit tests that start a node and send a PUBLISH to its own relay
+///   listener at each reserved routing ID:
+///   `no_domain_relay_reserves_the_push_routing_id_of_its_advertised_url`,
+///   `no_domain_node_reserves_its_tier3_id_at_startup`,
+///   `domain_node_reserves_its_explicit_documents_tier3_entry_at_startup`,
+///   `explicit_node_reserves_its_documents_second_tier3_entry_at_startup_and_after_a_tier_change`,
+///   `tier_change_moves_the_relay_push_gate_to_the_new_url` and
+///   `tier_change_to_a_bridge_entry_intercepts_its_tier3_id_at_the_node_listener`.
 #[derive(Clone)]
-pub struct NodePublisher(Arc<dyn DidPublisher>);
+pub struct NodePublisher {
+    inner: Arc<dyn DidPublisher>,
+    relay: LiveRelayUrl,
+}
 
 impl NodePublisher {
-    /// The production seam over a [`DidMethod`] in the configured [`DhtMode`].
-    pub fn new<D: DidMethod + 'static>(did_method: Arc<D>, dht_mode: DhtMode) -> Self {
-        Self(Arc::new(NodeDidPublisher {
-            inner: did_method,
-            dht_mode,
-        }))
+    /// The production seam over a [`DidMethod`] in the configured [`DhtMode`],
+    /// bound to the live URL handle of `relay_config`, the configuration of
+    /// the relay the node runs.
+    pub fn new<D: DidMethod + 'static>(
+        did_method: Arc<D>,
+        dht_mode: DhtMode,
+        relay_config: &RelayConfig,
+    ) -> Self {
+        Self {
+            inner: Arc::new(NodeDidPublisher {
+                inner: did_method,
+                dht_mode,
+            }),
+            relay: relay_config.relay_url.clone(),
+        }
     }
 
-    /// Test-only: wrap an arbitrary [`DidPublisher`] double so unit tests can
-    /// drive the seam without a full signing `DidMethod`. Never compiled into a
-    /// production build.
+    /// Test-only: wrap an arbitrary [`DidPublisher`] double, bound to `relay`,
+    /// so unit tests can drive the seam without a full signing `DidMethod`.
+    /// Never compiled into a production build.
     #[cfg(test)]
-    pub(crate) fn from_dyn(publisher: Arc<dyn DidPublisher>) -> Self {
-        Self(publisher)
+    pub(crate) fn from_dyn(publisher: Arc<dyn DidPublisher>, relay: LiveRelayUrl) -> Self {
+        Self {
+            inner: publisher,
+            relay,
+        }
     }
 }
 
@@ -288,17 +361,28 @@ impl NodePublisher {
 /// actually published — the indivisibility AC-6 requires, enforced by the type
 /// rather than by each builder remembering to re-seed.
 ///
-/// `reserved` carries the document and the node's own entry, and exists only
-/// once [`reserve_push_routing_id`] has made the relay reserve every entry of
-/// that document the node publishes, so the startup publish of either
-/// builder cannot skip the reservation (§10.7.1 "Tier 3 relays").
+/// `entries` carries the document and the node's own entry. The function
+/// first has `publisher` reserve every entry of that document the node
+/// publishes on the publisher's own relay handle
+/// ([`NodePublisher::reserve_push_routing_id`]), and publishes only the
+/// [`ReservedDocument`] that reservation returns, through that same publisher.
+/// The startup publish of either builder therefore cannot skip the
+/// reservation, reserve on a handle other than the publisher's, or publish a
+/// document another publisher reserved (§10.7.1 "Tier 3 relays").
+///
+/// Between the reservation and the publish it bootstraps the publish-sequence
+/// counter ([`DidPublisher::initialize_sequence`], SCP-RELAYRES-004), so the
+/// relay reserves the entries before the node's first DHT read for its own
+/// record, and a failed bootstrap stops the publish.
 pub async fn seed_from_startup_publish(
     publisher: &NodePublisher,
     identity: &ScpIdentity,
-    reserved: ReservedDocument,
+    entries: &PublishedEntries,
 ) -> Result<LiveSlot<NodePublishedState>, NodeError> {
+    let reserved: ReservedDocument = publisher.reserve_push_routing_id(entries);
+    publisher.inner.initialize_sequence(identity).await?;
     let (auth, document) = reserved.authorize();
-    let record = publisher.0.publish(auth, identity, document).await?;
+    let record = publisher.inner.publish(auth, identity, document).await?;
     let (relay, document) = reserved.into_parts();
     Ok(LiveSlot::new(NodePublishedState {
         document,
@@ -307,18 +391,22 @@ pub async fn seed_from_startup_publish(
     }))
 }
 
-pub use reservation::{PublishedEntries, ReservedDocument, reserve_push_routing_id};
+pub use reservation::PublishedEntries;
+use reservation::ReservedDocument;
 
 /// The reservation that every publish of this node's DID document carries.
 ///
 /// Private, so its fields and the [`PublishAuthorization`] constructor are
 /// out of reach even for the rest of `published_state`: the only way to mint
 /// an authorization is [`ReservedDocument::authorize`], and the only way to
-/// build a [`ReservedDocument`] is [`reserve_push_routing_id`], which moves
-/// the relay's live URL handle first.
+/// build a [`ReservedDocument`] is
+/// [`NodePublisher::reserve_push_routing_id`], which moves the publisher's
+/// own relay handle first. Both sit in the inner `mint` module, which owns the
+/// `ReservedDocument` fields, so the rest of `reservation` cannot build one
+/// either.
 mod reservation {
     use scp_did::{BridgeTarget, DidDocument, RelayService};
-    use scp_transport::relay::push_gate::{LiveRelayUrl, RelayUrl, ReservedRelayUrls};
+    use scp_transport::relay::push_gate::{RelayUrl, ReservedRelayUrls};
 
     /// Proof that a [`DidPublisher::publish`](super::DidPublisher::publish)
     /// call publishes a document whose entries the relay reserves. See the
@@ -373,56 +461,84 @@ mod reservation {
         }
     }
 
-    /// A DID document whose entries the relay reserves, and the node's own
-    /// entry, as [`reserve_push_routing_id`] left them. The publish seam takes
-    /// only this, so the document a node publishes is the document the
-    /// reserved set was computed from.
-    #[derive(Debug)]
-    pub struct ReservedDocument {
-        own: RelayService,
-        document: DidDocument,
-    }
+    pub use mint::ReservedDocument;
 
-    impl ReservedDocument {
-        /// The authorization to publish this document, and the document.
-        pub(in crate::published_state) const fn authorize(
-            &self,
-        ) -> (PublishAuthorization, &DidDocument) {
-            (PublishAuthorization(()), &self.document)
+    /// The one place a [`ReservedDocument`] is built. Its fields are private
+    /// to this module, so no code elsewhere in `reservation` or
+    /// `published_state` can write a `ReservedDocument` literal, and the only
+    /// literal here is the one in
+    /// [`NodePublisher::reserve_push_routing_id`](crate::published_state::NodePublisher::reserve_push_routing_id),
+    /// after it moves the publisher's relay handle.
+    mod mint {
+        use scp_did::{DidDocument, RelayService};
+
+        use super::super::NodePublisher;
+        use super::{PublishAuthorization, PublishedEntries};
+
+        /// A DID document whose entries the relay reserves, and the node's own
+        /// entry, as [`NodePublisher::reserve_push_routing_id`] left them. The
+        /// publish seam takes only this, so the document a node publishes is
+        /// the document the reserved set was computed from. It is never named
+        /// outside `published_state`.
+        #[derive(Debug)]
+        pub struct ReservedDocument {
+            own: RelayService,
+            document: DidDocument,
         }
 
-        /// The node's own entry and the document, for the live slot.
-        pub(in crate::published_state) fn into_parts(self) -> (RelayService, DidDocument) {
-            (self.own, self.document)
-        }
-    }
+        impl ReservedDocument {
+            /// The authorization to publish this document, and the document.
+            pub(in crate::published_state) const fn authorize(
+                &self,
+            ) -> (PublishAuthorization, &DidDocument) {
+                (PublishAuthorization(()), &self.document)
+            }
 
-    /// Moves the relay's live URL handle to the entries in `published`, the
-    /// entries the node is about to publish, so every relay listener reserves
-    /// each entry's push routing ID before any client reads the entry
-    /// (§10.7.1 step 2, "Tier 3 relays"), and returns the document those
-    /// entries came from, ready to publish.
-    ///
-    /// Each entry maps to its own relay URL, keeping the entry's
-    /// `bridgeTarget`: a direct entry reserves the `"scp-push-registration"`
-    /// ID of its URL, and a tier 3 entry reserves its tier 3 push routing ID,
-    /// `SHA-256("scp-push-bridge:" || bridge_url || bridge_target)`
-    /// (`09-security-model.md` §9.18.2). The node never reserves the
-    /// `"scp-push-registration"` ID of a bridge relay's URL, which belongs to
-    /// the bridge relay. Every ID of the previous set that the new set lacks
-    /// joins the handle's retired list, so the relay keeps refusing it
-    /// without storing.
-    #[must_use]
-    pub fn reserve_push_routing_id(
-        relay: &LiveRelayUrl,
-        published: &PublishedEntries,
-    ) -> ReservedDocument {
-        let url = published.relay_urls();
-        relay.set(url);
-        ReservedDocument {
-            own: published.own.clone(),
-            document: published.document.clone(),
+            /// The node's own entry and the document, for the live slot.
+            pub(in crate::published_state) fn into_parts(self) -> (RelayService, DidDocument) {
+                (self.own, self.document)
+            }
         }
+
+        impl NodePublisher {
+            /// Moves the publisher's own relay handle, the live URL handle of
+            /// the relay configuration [`NodePublisher::new`] was given, to the
+            /// entries in `published`, the entries the node is about to
+            /// publish, so every listener reading that handle reserves each
+            /// entry's push routing ID before any client reads the entry
+            /// (§10.7.1 step 2, "Tier 3 relays"), and returns the document
+            /// those entries came from, ready to publish. It takes no handle:
+            /// the only one it can move is the one the publisher holds.
+            ///
+            /// Each entry maps to its own relay URL, keeping the entry's
+            /// `bridgeTarget`: a direct entry reserves the
+            /// `"scp-push-registration"` ID of its URL, and a tier 3 entry
+            /// reserves its tier 3 push routing ID,
+            /// `SHA-256("scp-push-bridge:" || bridge_url || bridge_target)`
+            /// (`09-security-model.md` §9.18.2). The node never reserves the
+            /// `"scp-push-registration"` ID of a bridge relay's URL, which
+            /// belongs to the bridge relay. Every ID of the previous set that
+            /// the new set lacks joins the handle's retired list, so the relay
+            /// keeps refusing it without storing.
+            #[must_use]
+            pub(in crate::published_state) fn reserve_push_routing_id(
+                &self,
+                published: &PublishedEntries,
+            ) -> ReservedDocument {
+                let url = published.relay_urls();
+                self.relay.set(url);
+                ReservedDocument {
+                    own: published.own.clone(),
+                    document: published.document.clone(),
+                }
+            }
+        }
+
+        /// Compile-time pin of the reservation's signature: the method takes
+        /// the publisher and the entries and nothing else, so a handle
+        /// parameter added back to it stops the crate compiling.
+        const _: fn(&NodePublisher, &PublishedEntries) -> ReservedDocument =
+            NodePublisher::reserve_push_routing_id;
     }
 }
 
@@ -452,7 +568,6 @@ pub struct TierChangeReport<'a> {
 /// honest `None`.
 pub async fn apply_tier_change(
     live_state: &LiveSlot<NodePublishedState>,
-    relay: &LiveRelayUrl,
     new_relay_url: &RelayService,
     bridge_target: BridgeTarget,
     publisher: &NodePublisher,
@@ -464,21 +579,17 @@ pub async fn apply_tier_change(
     let previous_relay_url = current.relay.url().to_owned();
     let mut next_document = current.document;
     next_document.set_preferred_relay(new_relay_url);
-    // The relay moves before the publish: every listener reserves the push
-    // routing ID of each entry `next_document` will advertise for this node,
-    // the new entry's tier 3 ID for a bridge entry and every other tier 3
-    // entry with `bridge_target`, before any client can read them, so a
-    // registration signed for one is intercepted, never stored as a blob
-    // (§10.7.1 step 2, "Tier 3 relays"). The inner `new_relay_url` names the
-    // reserved entries; the name stays because `pipeline_wiring.rs` pins this
-    // call text.
-    let reserved = {
-        let new_relay_url = &PublishedEntries::new(new_relay_url, &next_document, bridge_target);
-        reserve_push_routing_id(relay, new_relay_url)
-    };
+    // The relay moves before the publish: every listener of the relay the
+    // publisher is bound to reserves the push routing ID of each entry
+    // `next_document` will advertise for this node, the new entry's tier 3 ID
+    // for a bridge entry and every other tier 3 entry with `bridge_target`,
+    // before any client can read them, so a registration signed for one is
+    // intercepted, never stored as a blob (§10.7.1 step 2, "Tier 3 relays").
+    let entries = PublishedEntries::new(new_relay_url, &next_document, bridge_target);
+    let reserved = publisher.reserve_push_routing_id(&entries);
 
     let (auth, document) = reserved.authorize();
-    match publisher.0.publish(auth, identity, document).await {
+    match publisher.inner.publish(auth, identity, document).await {
         Ok(signed) => {
             let sequence = signed.as_ref().map(|entry| entry.sequence);
             let (_, document) = reserved.into_parts();

@@ -1116,35 +1116,49 @@ fn relay_set_writes_store_canonical_relay_urls() {
 
 // PUSH-007 (§10.7.1 step 2): the NAT-tier task writes the relay's live URL
 // handle, so every relay listener reserves the push routing ID of the URL the
-// node advertises after a tier change. `build_no_domain_inner` hands the task a
-// clone of the relay config's handle, the task calls `apply_tier_change` with
-// it, and `apply_tier_change` sets the handle before it publishes the document.
+// node advertises after a tier change. `build_no_domain_inner` binds the node's
+// publisher to the live URL handle of the relay config it runs its relay with
+// (`NodePublisher::new` takes the `RelayConfig` and clones its handle), hands
+// that publisher to the tier task, the task calls `apply_tier_change` with it,
+// and `apply_tier_change` has the publisher set its handle before it publishes
+// the document.
 #[test]
 fn nat_tier_task_writes_the_relay_push_url_handle() {
-    assert!(
-        fn_body_contains(
-            NODE_BUILDER_SRC,
-            "build_no_domain_inner",
-            "relay_config.relay_url.clone()"
-        ),
-        "build_no_domain_inner must give the tier task the relay config's live URL handle"
+    // The tier task holds the relay config's handle through the publisher the
+    // builder hands it.
+    let compact = compact_body(NODE_BUILDER_SRC, "build_no_domain_inner");
+    let tier_task_args = call_args(&compact, "spawn_tier_reevaluation")
+        .expect("build_no_domain_inner must spawn the tier task");
+    assert_eq!(
+        top_level_args(tier_task_args).get(2).map(String::as_str),
+        Some("publisher"),
+        "build_no_domain_inner must give the tier task the publisher it bound to the relay \
+         config's live URL handle, got arguments {tier_task_args}"
     );
-    assert!(
-        fn_body_contains(
-            NODE_BUILDER_SRC,
-            "build_no_domain_inner",
-            "reserve_push_routing_id(&relay_config.relay_url, &relay_url)"
-        ),
-        "build_no_domain_inner must set the probed tier's URL on the relay handle"
+    // The publisher carries the relay handle, so binding it to the relay
+    // config is what sets the probed tier's URL on that config's handle.
+    assert_eq!(
+        call_args(&compact, "NodePublisher::new").map(|args| args.trim_end_matches(',')),
+        Some("Arc::clone(&did_method),dht_mode,&relay_config"),
+        "build_no_domain_inner must set the probed tier's URL on the relay handle by binding \
+         its publisher to the relay config it runs its relay with"
     );
-    assert!(
-        fn_body_contains(NODE_BUILDER_SRC, "spawn_tier_reevaluation", "&relay_url,"),
-        "the tier task must pass the relay handle to apply_tier_change"
-    );
+    for (source, name) in [
+        (NODE_BUILDER_SRC, "spawn_tier_reevaluation"),
+        (NODE_PUBLISHED_STATE_SRC, "apply_tier_change"),
+    ] {
+        let signature =
+            extract_fn_signature(source, name).unwrap_or_else(|| panic!("{name} signature"));
+        assert!(
+            !signature.contains("LiveRelayUrl"),
+            "the tier task must reach apply_tier_change with no relay handle but its \
+             publisher's; {name} takes one: {signature}"
+        );
+    }
     let body = extract_fn_body(NODE_PUBLISHED_STATE_SRC, "apply_tier_change")
         .expect("apply_tier_change body");
     let set = body
-        .find("reserve_push_routing_id(relay, new_relay_url)")
+        .find("publisher.reserve_push_routing_id(")
         .expect("apply_tier_change must set the relay's live URL handle");
     assert!(
         fn_body_contains(
@@ -1165,25 +1179,55 @@ fn nat_tier_task_writes_the_relay_push_url_handle() {
     // the entry it publishes at startup before it publishes.
     let startup = extract_fn_body(NODE_BUILDER_SRC, "build_no_domain_inner")
         .expect("build_no_domain_inner body");
+    // The builder binds the publisher before the startup publish, and
+    // `seed_from_startup_publish` reserves on that publisher, then bootstraps
+    // the publish-sequence counter, then publishes.
     let reserve = startup
-        .find("reserve_push_routing_id(&relay_config.relay_url, &relay_url)")
-        .expect("build_no_domain_inner must reserve the startup entry's routing ID");
+        .find("NodePublisher::new(")
+        .expect("build_no_domain_inner must bind the publisher its startup publish reserves on");
     let seed = startup
         .find("seed_from_startup_publish(")
         .expect("build_no_domain_inner must publish through seed_from_startup_publish");
     assert!(
         reserve < seed,
-        "build_no_domain_inner must reserve the startup entry's routing ID before it publishes"
+        "build_no_domain_inner must bind its publisher with NodePublisher::new before it calls \
+         seed_from_startup_publish, which reserves on that publisher"
     );
+    let seed_body = extract_fn_body(NODE_PUBLISHED_STATE_SRC, "seed_from_startup_publish")
+        .expect("seed_from_startup_publish body");
+    let seed_reserve = seed_body
+        .find("reserve_push_routing_id(")
+        .expect("seed_from_startup_publish must reserve the startup entry's routing ID");
+    let seed_initialize = seed_body
+        .find(".initialize_sequence(")
+        .expect("seed_from_startup_publish must bootstrap the publish-sequence counter");
+    let seed_publish = seed_body
+        .find(".publish(")
+        .expect("seed_from_startup_publish must publish the document");
+    assert!(
+        seed_reserve < seed_publish,
+        "seed_from_startup_publish must reserve the startup entry's routing ID before it publishes"
+    );
+    assert!(
+        seed_reserve < seed_initialize && seed_initialize < seed_publish,
+        "seed_from_startup_publish must reserve, then bootstrap the sequence counter, then publish"
+    );
+    for builder in ["build_domain_inner", "build_no_domain_inner"] {
+        assert!(
+            !fn_body_contains(NODE_BUILDER_SRC, builder, "initialize_sequence"),
+            "{builder} must leave the sequence bootstrap to seed_from_startup_publish, which runs \
+             it after the reservation"
+        );
+    }
     // PUSH-032 (§10.7.1 "Tier 3 relays"): both callers reserve the node's own
     // entry and every tier 3 entry of the document they publish that carries
     // the node's `bridgeTarget`, built from that document before the
-    // reservation.
+    // reservation, which `seed_from_startup_publish` makes.
     let startup_entries = startup
         .find("PublishedEntries::new(&relay_url, &document, bridge_target)")
         .expect("build_no_domain_inner must reserve every entry of the document it publishes");
     assert!(
-        startup_entries < reserve,
+        startup_entries < seed,
         "build_no_domain_inner must build the reserved entries before it reserves them"
     );
     let tier_entries = body
@@ -1199,24 +1243,36 @@ fn nat_tier_task_writes_the_relay_push_url_handle() {
 // through a reservation of every entry of that document the node publishes.
 // The domain builder reserves before its startup publish, like the no-domain
 // builder, and the one `PublishAuthorization` constructor is
-// `ReservedDocument::authorize`, whose value only `reserve_push_routing_id`
-// builds.
+// `ReservedDocument::authorize`, whose value only
+// `NodePublisher::reserve_push_routing_id` builds.
 #[test]
 fn every_node_document_publish_reserves_the_published_entries() {
     let domain =
         extract_fn_body(NODE_BUILDER_SRC, "build_domain_inner").expect("build_domain_inner body");
+    // The publisher carries the relay handle it reserves on, so the domain
+    // builder reserves on the relay config's handle by binding its publisher
+    // to that config, and `seed_from_startup_publish` reserves the entries it
+    // is given.
+    let compact = compact_body(NODE_BUILDER_SRC, "build_domain_inner");
+    assert_eq!(
+        call_args(&compact, "NodePublisher::new").map(|args| args.trim_end_matches(',')),
+        Some("Arc::clone(&did_method),dht_mode,&relay_config"),
+        "build_domain_inner must reserve the entries of the document it publishes on the live \
+         URL handle of the relay config it runs its relay with"
+    );
     let domain_reserve = domain
-        .find("reserve_push_routing_id(\n        &relay_config.relay_url,")
-        .expect("build_domain_inner must reserve the entries of the document it publishes");
+        .find("NodePublisher::new(")
+        .expect("build_domain_inner must bind the publisher its startup publish reserves on");
     let domain_entries = domain
         .find("PublishedEntries::new(&relay, &document, bridge_target)")
         .expect("build_domain_inner must reserve every entry of the document it publishes");
     let domain_seed = domain
-        .find("seed_from_startup_publish(&publisher, &identity, reserved)")
+        .find("seed_from_startup_publish(&publisher, &identity, &entries)")
         .expect("build_domain_inner must publish the reserved document");
     assert!(
-        domain_reserve < domain_entries && domain_entries < domain_seed,
-        "build_domain_inner must reserve the document's entries before it publishes"
+        domain_entries < domain_seed && domain_reserve < domain_seed,
+        "build_domain_inner must build the document's entries and bind its publisher before \
+         the startup publish reserves and publishes them"
     );
     // Every publish of the node's document needs a `PublishAuthorization`,
     // and the one constructor sits in `ReservedDocument::authorize`, whose
@@ -1243,6 +1299,143 @@ fn every_node_document_publish_reserves_the_published_entries() {
         ),
         "the one PublishAuthorization constructor must be ReservedDocument::authorize"
     );
+}
+
+// §10.7.1 "Tier 3 relays": "its relay reserves every one of those IDs before
+// the node publishes the entries". The node's `NodePublisher` holds the live
+// URL handle of the node's own relay, and only a method on the publisher that
+// moves that handle builds a `ReservedDocument`, so no caller can reserve on a
+// handle it minted with the public `LiveRelayUrl::new`. Each builder binds its
+// publisher to `relay_config.relay_url`, the handle its relay listeners read.
+#[test]
+fn reserved_document_is_minted_only_by_the_publisher_on_its_own_handle() {
+    // A1: the reservation is a method on the publisher and takes no handle.
+    let reserve_sig = extract_fn_signature(NODE_PUBLISHED_STATE_SRC, "reserve_push_routing_id")
+        .expect("reserve_push_routing_id signature");
+    assert!(
+        reserve_sig.contains("&self"),
+        "reserve_push_routing_id must be a method on NodePublisher, got: {reserve_sig}"
+    );
+    assert!(
+        !reserve_sig.contains("LiveRelayUrl"),
+        "reserve_push_routing_id must take no relay handle, got: {reserve_sig}"
+    );
+
+    // A2: no publish path takes a handle, and the startup publish takes no
+    // reservation made outside it.
+    for (src, name) in [
+        (NODE_PUBLISHED_STATE_SRC, "seed_from_startup_publish"),
+        (NODE_PUBLISHED_STATE_SRC, "apply_tier_change"),
+        (NODE_BUILDER_SRC, "spawn_tier_reevaluation"),
+    ] {
+        let sig = extract_fn_signature(src, name).unwrap_or_else(|| panic!("{name} signature"));
+        assert!(
+            !sig.contains("LiveRelayUrl"),
+            "{name} must take no relay handle; the publisher carries it, got: {sig}"
+        );
+    }
+    let seed_sig = extract_fn_signature(NODE_PUBLISHED_STATE_SRC, "seed_from_startup_publish")
+        .expect("seed_from_startup_publish signature");
+    assert!(
+        !seed_sig.contains("ReservedDocument"),
+        "seed_from_startup_publish must reserve inside itself, not take a reservation, \
+         got: {seed_sig}"
+    );
+
+    // A3: the reservation moves the publisher's own handle, and the module
+    // mints no handle of its own.
+    assert!(
+        fn_body_contains(
+            NODE_PUBLISHED_STATE_SRC,
+            "reserve_push_routing_id",
+            "self.relay.set("
+        ),
+        "reserve_push_routing_id must move the publisher's own relay handle"
+    );
+    let published_state_code = strip_non_code(NODE_PUBLISHED_STATE_SRC);
+    assert!(
+        !published_state_code.contains("LiveRelayUrl::new"),
+        "published_state must not mint a relay handle; the builder binds the relay's own"
+    );
+
+    // A4: `ReservedDocument` is defined in the `mint` module, whose private
+    // fields keep every other module from writing a literal, and the one
+    // literal in `mint`, spelled `ReservedDocument` or `Self`, is inside the
+    // method.
+    let compact_code: String = published_state_code.split_whitespace().collect();
+    let mint_at = compact_code
+        .find("modmint{")
+        .expect("published_state must keep ReservedDocument in a `mint` module");
+    let mint = clean_and_extract_braced(&compact_code[mint_at + "modmint".len()..])
+        .expect("the mint module's braces balance");
+    assert!(
+        mint.contains("pubstructReservedDocument{own:RelayService,document:DidDocument,}"),
+        "ReservedDocument and its private fields must be defined in the mint module"
+    );
+    // A type name directly before `{` is a literal unless it names the item a
+    // `struct` or `impl` defines or a function's return type.
+    let literals = ["ReservedDocument{", "Self{"]
+        .iter()
+        .flat_map(|needle| mint.match_indices(needle))
+        .filter(|(at, _)| {
+            let before = &mint[..*at];
+            !(before.ends_with("struct") || before.ends_with("impl") || before.ends_with("->"))
+        })
+        .count();
+    assert_eq!(
+        literals, 1,
+        "ReservedDocument must have exactly one struct literal, in the mint module"
+    );
+    assert!(
+        fn_body_contains(
+            NODE_PUBLISHED_STATE_SRC,
+            "reserve_push_routing_id",
+            "ReservedDocument {"
+        ),
+        "the one ReservedDocument literal must be in reserve_push_routing_id"
+    );
+
+    // A5: each builder binds its publisher to the relay's own handle.
+    for builder in ["build_domain_inner", "build_no_domain_inner"] {
+        let body =
+            extract_fn_body(NODE_BUILDER_SRC, builder).unwrap_or_else(|| panic!("{builder} body"));
+        assert_eq!(
+            body.matches("NodePublisher::new(").count(),
+            1,
+            "{builder} must build exactly one publisher"
+        );
+        let compact = compact_body(NODE_BUILDER_SRC, builder);
+        let args = call_args(&compact, "NodePublisher::new")
+            .unwrap_or_else(|| panic!("{builder} must build a NodePublisher"));
+        assert_eq!(
+            top_level_args(args).get(2).map(String::as_str),
+            Some("&relay_config"),
+            "{builder} must bind its publisher to the relay config it runs its relay with, \
+             got arguments {args}"
+        );
+    }
+}
+
+/// The top-level arguments of a call's compact argument text, in order: a
+/// comma inside parentheses, braces or brackets does not split.
+fn top_level_args(args: &str) -> Vec<String> {
+    let mut depth = 0i32;
+    let mut positional = vec![String::new()];
+    for ch in args.chars() {
+        match ch {
+            '(' | '{' | '[' => depth += 1,
+            ')' | '}' | ']' => depth -= 1,
+            ',' if depth == 0 => {
+                positional.push(String::new());
+                continue;
+            }
+            _ => {}
+        }
+        if let Some(last) = positional.last_mut() {
+            last.push(ch);
+        }
+    }
+    positional
 }
 
 // PUSH-013 (§10.7.1): the push routing-ID query runs
