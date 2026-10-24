@@ -1,0 +1,888 @@
+//! The ADR-004 `WebPush` endpoint refusal rule (PUSH-022).
+//!
+//! A `WebPush` registrant chooses the URL the relay sends its wakes to, so the
+//! relay refuses an endpoint that would aim a request anywhere but a public
+//! host (ADR-004 **Endpoint refusal**, spec 10 §10.7.1 **`WebPush` endpoint**):
+//!
+//! - [`parse_endpoint`] parses the endpoint, requires it to equal its WHATWG
+//!   URL serialization (spec 22 §22.11.4) with scheme `https`, no userinfo and
+//!   no fragment, and derives the VAPID `aud`, the RFC 6454 origin.
+//! - [`check_address`] judges one address: it refuses each address the IANA
+//!   IPv4 and IPv6 Special-Purpose Address Registries (both as last updated
+//!   2025-10-09) mark not globally reachable, N/A or blank, every IPv6
+//!   address outside `2000::/3`, multicast, unspecified, 6to4, and the
+//!   relay's [`OwnAddresses`]. It judges an IPv4-mapped and a NAT64
+//!   (`64:ff9b::/96`) address by the IPv4 address it embeds.
+//! - [`CheckedResolver`] resolves a host name and refuses the whole lookup
+//!   when any address it returns is refused. The `WebPush` sender's HTTP client
+//!   resolves through it, so a request connects only to addresses that
+//!   passed, at the moment of the send. The client never consults a resolver
+//!   for an IP-literal host, so [`CheckedResolver::check_literal`] judges a
+//!   literal before any request.
+//!
+//! No error or log line in this module carries the endpoint, its host or an
+//! address: the endpoint is a per-device capability URL.
+
+use std::fmt;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
+use std::time::Duration;
+
+use url::{Host, Url};
+
+/// The longest a registration-time or send-time DNS lookup may take
+/// (indicator: 5 s, the connect deadline of every push sender).
+pub(crate) const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Why [`check_address`] refused an address. No variant carries the address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum AddressRefusal {
+    /// The address is one of the relay's own.
+    #[error("the address is one of the relay's own addresses")]
+    OwnAddress,
+    /// The address is unspecified (`0.0.0.0` or `::`).
+    #[error("the address is unspecified")]
+    Unspecified,
+    /// The address is multicast (`224.0.0.0/4` or `ff00::/8`).
+    #[error("the address is multicast")]
+    Multicast,
+    /// The most specific special-purpose registry row that contains the
+    /// address marks it not globally reachable.
+    #[error("the special-purpose address registry marks the address not globally reachable")]
+    NotGloballyReachable,
+    /// The most specific special-purpose registry row that contains the
+    /// address marks global reachability N/A or leaves it blank.
+    #[error("the special-purpose address registry gives the address no global reachability")]
+    ReachabilityUndefined,
+    /// The IPv6 address lies outside `2000::/3`.
+    #[error("the IPv6 address lies outside the global unicast block 2000::/3")]
+    OutsideGlobalUnicast,
+    /// The address is a 6to4 address (`2002::/16`), which RFC 7526
+    /// deprecates.
+    #[error("the address is a deprecated 6to4 address")]
+    SixToFour,
+}
+
+/// Why an endpoint was refused. No variant carries the endpoint, its host or
+/// an address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum EndpointError {
+    /// The endpoint is not a URL.
+    #[error("the WebPush endpoint is not a URL: {0}")]
+    NotUrl(url::ParseError),
+    /// The endpoint differs from its WHATWG URL serialization.
+    #[error("the WebPush endpoint is not in its canonical URL serialization")]
+    NotCanonical,
+    /// The endpoint's scheme is not `https`.
+    #[error("the WebPush endpoint scheme is not https")]
+    NotHttps,
+    /// The endpoint carries a user name or password.
+    #[error("the WebPush endpoint carries userinfo")]
+    HasUserinfo,
+    /// The endpoint carries a fragment.
+    #[error("the WebPush endpoint carries a fragment")]
+    HasFragment,
+    /// The endpoint has no host.
+    #[error("the WebPush endpoint has no host")]
+    NoHost,
+    /// The endpoint's host is, or resolves to, a refused address.
+    #[error("the WebPush endpoint host is refused: {0}")]
+    Refused(#[source] AddressRefusal),
+    /// The endpoint's host name resolves to no address.
+    #[error("the WebPush endpoint host resolves to no address")]
+    DoesNotResolve,
+    /// The lookup took longer than [`RESOLVE_TIMEOUT`].
+    #[error("the WebPush endpoint host lookup timed out")]
+    ResolveTimeout,
+    /// The lookup failed.
+    #[error("the WebPush endpoint host lookup failed: {0:?}")]
+    Resolve(std::io::ErrorKind),
+}
+
+impl EndpointError {
+    /// Whether the endpoint itself is refused, as opposed to a lookup that
+    /// failed or timed out, which a later attempt may pass.
+    #[must_use]
+    pub const fn is_refusal(self) -> bool {
+        !matches!(self, Self::ResolveTimeout | Self::Resolve(_))
+    }
+}
+
+/// The relay's own addresses, which the ADR-004 rule refuses.
+///
+/// They are each address the host of the relay's canonical URL resolves to,
+/// and each specific address a relay listener binds to. Relay startup
+/// (PUSH-023) builds the set.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct OwnAddresses(Arc<[IpAddr]>);
+
+impl OwnAddresses {
+    /// The set of `addresses`, each held in its canonical form, so an
+    /// IPv4-mapped IPv6 address matches the IPv4 address it embeds.
+    pub fn new(addresses: impl IntoIterator<Item = IpAddr>) -> Self {
+        Self(addresses.into_iter().map(|ip| ip.to_canonical()).collect())
+    }
+
+    /// Whether `ip`, in canonical form, is one of the relay's own addresses.
+    #[must_use]
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        self.0.contains(&ip.to_canonical())
+    }
+}
+
+impl fmt::Debug for OwnAddresses {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OwnAddresses")
+            .field("count", &self.0.len())
+            .finish()
+    }
+}
+
+/// What a special-purpose registry row says about global reachability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    Global,
+    NotGlobal,
+    Undefined,
+}
+
+/// The IANA IPv4 Special-Purpose Address Registry, as IANA last updated it on
+/// 2025-10-09: `(network, prefix length, Globally Reachable)`.
+const IPV4_REGISTRY: &[(Ipv4Addr, u8, Reach)] = &[
+    (Ipv4Addr::UNSPECIFIED, 8, Reach::NotGlobal),
+    (Ipv4Addr::UNSPECIFIED, 32, Reach::NotGlobal),
+    (Ipv4Addr::new(10, 0, 0, 0), 8, Reach::NotGlobal),
+    (Ipv4Addr::new(100, 64, 0, 0), 10, Reach::NotGlobal),
+    (Ipv4Addr::new(127, 0, 0, 0), 8, Reach::NotGlobal),
+    (Ipv4Addr::new(169, 254, 0, 0), 16, Reach::NotGlobal),
+    (Ipv4Addr::new(172, 16, 0, 0), 12, Reach::NotGlobal),
+    (Ipv4Addr::new(192, 0, 0, 0), 24, Reach::NotGlobal),
+    (Ipv4Addr::new(192, 0, 0, 0), 29, Reach::NotGlobal),
+    (Ipv4Addr::new(192, 0, 0, 8), 32, Reach::NotGlobal),
+    (Ipv4Addr::new(192, 0, 0, 9), 32, Reach::Global),
+    (Ipv4Addr::new(192, 0, 0, 10), 32, Reach::Global),
+    (Ipv4Addr::new(192, 0, 0, 170), 32, Reach::NotGlobal),
+    (Ipv4Addr::new(192, 0, 0, 171), 32, Reach::NotGlobal),
+    (Ipv4Addr::new(192, 0, 2, 0), 24, Reach::NotGlobal),
+    (Ipv4Addr::new(192, 31, 196, 0), 24, Reach::Global),
+    (Ipv4Addr::new(192, 52, 193, 0), 24, Reach::Global),
+    (Ipv4Addr::new(192, 88, 99, 0), 24, Reach::Undefined),
+    (Ipv4Addr::new(192, 88, 99, 2), 32, Reach::NotGlobal),
+    (Ipv4Addr::new(192, 168, 0, 0), 16, Reach::NotGlobal),
+    (Ipv4Addr::new(192, 175, 48, 0), 24, Reach::Global),
+    (Ipv4Addr::new(198, 18, 0, 0), 15, Reach::NotGlobal),
+    (Ipv4Addr::new(198, 51, 100, 0), 24, Reach::NotGlobal),
+    (Ipv4Addr::new(203, 0, 113, 0), 24, Reach::NotGlobal),
+    (Ipv4Addr::new(240, 0, 0, 0), 4, Reach::NotGlobal),
+    (Ipv4Addr::BROADCAST, 32, Reach::NotGlobal),
+];
+
+/// The IANA IPv6 Special-Purpose Address Registry, as IANA last updated it on
+/// 2025-10-09: `(network, prefix length, Globally Reachable)`. The
+/// `::ffff:0:0/96` and `64:ff9b::/96` rows are absent, because
+/// [`check_address`] judges those addresses by the IPv4 address they embed,
+/// and `2002::/16` is absent because every 6to4 address is refused.
+const IPV6_REGISTRY: &[(Ipv6Addr, u8, Reach)] = &[
+    (Ipv6Addr::LOCALHOST, 128, Reach::NotGlobal),
+    (Ipv6Addr::UNSPECIFIED, 128, Reach::NotGlobal),
+    (
+        Ipv6Addr::new(0x64, 0xff9b, 1, 0, 0, 0, 0, 0),
+        48,
+        Reach::NotGlobal,
+    ),
+    (
+        Ipv6Addr::new(0x100, 0, 0, 0, 0, 0, 0, 0),
+        64,
+        Reach::NotGlobal,
+    ),
+    (
+        Ipv6Addr::new(0x100, 0, 0, 1, 0, 0, 0, 0),
+        64,
+        Reach::NotGlobal,
+    ),
+    (
+        Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 0),
+        23,
+        Reach::NotGlobal,
+    ),
+    (
+        Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 0),
+        32,
+        Reach::Undefined,
+    ),
+    (
+        Ipv6Addr::new(0x2001, 1, 0, 0, 0, 0, 0, 1),
+        128,
+        Reach::Global,
+    ),
+    (
+        Ipv6Addr::new(0x2001, 1, 0, 0, 0, 0, 0, 2),
+        128,
+        Reach::Global,
+    ),
+    (
+        Ipv6Addr::new(0x2001, 1, 0, 0, 0, 0, 0, 3),
+        128,
+        Reach::Global,
+    ),
+    (
+        Ipv6Addr::new(0x2001, 2, 0, 0, 0, 0, 0, 0),
+        48,
+        Reach::NotGlobal,
+    ),
+    (
+        Ipv6Addr::new(0x2001, 3, 0, 0, 0, 0, 0, 0),
+        32,
+        Reach::Global,
+    ),
+    (
+        Ipv6Addr::new(0x2001, 4, 0x112, 0, 0, 0, 0, 0),
+        48,
+        Reach::Global,
+    ),
+    (
+        Ipv6Addr::new(0x2001, 0x10, 0, 0, 0, 0, 0, 0),
+        28,
+        Reach::Undefined,
+    ),
+    (
+        Ipv6Addr::new(0x2001, 0x20, 0, 0, 0, 0, 0, 0),
+        28,
+        Reach::Global,
+    ),
+    (
+        Ipv6Addr::new(0x2001, 0x30, 0, 0, 0, 0, 0, 0),
+        28,
+        Reach::Global,
+    ),
+    (
+        Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0),
+        32,
+        Reach::NotGlobal,
+    ),
+    (
+        Ipv6Addr::new(0x2620, 0x4f, 0x8000, 0, 0, 0, 0, 0),
+        48,
+        Reach::Global,
+    ),
+    (
+        Ipv6Addr::new(0x3fff, 0, 0, 0, 0, 0, 0, 0),
+        20,
+        Reach::NotGlobal,
+    ),
+    (
+        Ipv6Addr::new(0x5f00, 0, 0, 0, 0, 0, 0, 0),
+        16,
+        Reach::NotGlobal,
+    ),
+    (
+        Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0),
+        7,
+        Reach::NotGlobal,
+    ),
+    (
+        Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0),
+        10,
+        Reach::NotGlobal,
+    ),
+];
+
+/// The NAT64 well-known prefix `64:ff9b::/96` (RFC 6052).
+const NAT64_PREFIX: u128 = 0x0064_ff9b_0000_0000_0000_0000_0000_0000;
+
+/// Whether the top `len` bits of `addr` equal those of `network`.
+const fn prefix_matches(addr: u128, network: u128, len: u8) -> bool {
+    if len == 0 {
+        return true;
+    }
+    let shift = 128 - len as u32;
+    (addr >> shift) == (network >> shift)
+}
+
+/// The reachability of the most specific row of `rows` that contains `addr`,
+/// widened to 128 bits with `width` the address length in bits; `None` when
+/// no row contains it.
+fn most_specific<A: Copy>(
+    rows: &[(A, u8, Reach)],
+    addr: u128,
+    width: u8,
+    bits: impl Fn(A) -> u128,
+) -> Option<Reach> {
+    let shift = 128 - u32::from(width);
+    rows.iter()
+        .filter(|(network, len, _)| prefix_matches(addr << shift, bits(*network) << shift, *len))
+        .max_by_key(|(_, len, _)| *len)
+        .map(|(_, _, reach)| *reach)
+}
+
+const fn reach_to_result(reach: Option<Reach>) -> Result<(), AddressRefusal> {
+    match reach {
+        None | Some(Reach::Global) => Ok(()),
+        Some(Reach::NotGlobal) => Err(AddressRefusal::NotGloballyReachable),
+        Some(Reach::Undefined) => Err(AddressRefusal::ReachabilityUndefined),
+    }
+}
+
+fn check_ipv4(ip: Ipv4Addr, own: &OwnAddresses) -> Result<(), AddressRefusal> {
+    if own.contains(IpAddr::V4(ip)) {
+        return Err(AddressRefusal::OwnAddress);
+    }
+    if ip.is_unspecified() {
+        return Err(AddressRefusal::Unspecified);
+    }
+    if ip.is_multicast() {
+        return Err(AddressRefusal::Multicast);
+    }
+    reach_to_result(most_specific(
+        IPV4_REGISTRY,
+        u128::from(ip.to_bits()),
+        32,
+        |a: Ipv4Addr| u128::from(a.to_bits()),
+    ))
+}
+
+fn check_ipv6(ip: Ipv6Addr, own: &OwnAddresses) -> Result<(), AddressRefusal> {
+    if let Some(v4) = ip.to_ipv4_mapped() {
+        return check_ipv4(v4, own);
+    }
+    let bits = ip.to_bits();
+    if prefix_matches(bits, NAT64_PREFIX, 96) {
+        // The low 32 bits are the embedded IPv4 address; the mask keeps the
+        // conversion lossless.
+        let embedded = u32::try_from(bits & u128::from(u32::MAX)).unwrap_or(u32::MAX);
+        return check_ipv4(Ipv4Addr::from_bits(embedded), own);
+    }
+    if own.contains(IpAddr::V6(ip)) {
+        return Err(AddressRefusal::OwnAddress);
+    }
+    if ip.is_unspecified() {
+        return Err(AddressRefusal::Unspecified);
+    }
+    if ip.is_multicast() {
+        return Err(AddressRefusal::Multicast);
+    }
+    if ip.segments()[0] == 0x2002 {
+        return Err(AddressRefusal::SixToFour);
+    }
+    reach_to_result(most_specific(IPV6_REGISTRY, bits, 128, Ipv6Addr::to_bits))?;
+    if !prefix_matches(bits, 0x2000 << 112, 3) {
+        return Err(AddressRefusal::OutsideGlobalUnicast);
+    }
+    Ok(())
+}
+
+/// Applies the ADR-004 address rule to `ip`.
+///
+/// # Errors
+///
+/// The [`AddressRefusal`] naming why `ip` is not a global unicast address the
+/// relay may send to.
+pub fn check_address(ip: IpAddr, own: &OwnAddresses) -> Result<(), AddressRefusal> {
+    match ip {
+        IpAddr::V4(v4) => check_ipv4(v4, own),
+        IpAddr::V6(v6) => check_ipv6(v6, own),
+    }
+}
+
+/// An endpoint that passed [`parse_endpoint`].
+///
+/// `Debug` prints nothing of the URL.
+#[derive(Clone)]
+pub struct ParsedEndpoint {
+    url: Url,
+    aud: String,
+}
+
+impl fmt::Debug for ParsedEndpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ParsedEndpoint").finish_non_exhaustive()
+    }
+}
+
+impl ParsedEndpoint {
+    /// The request target, equal byte for byte to the registered endpoint.
+    #[must_use]
+    pub const fn url(&self) -> &Url {
+        &self.url
+    }
+
+    /// The endpoint's origin in the RFC 6454 §6.1 serialization: the VAPID
+    /// `aud` claim and the key of the per-origin sender state.
+    #[must_use]
+    pub fn aud(&self) -> &str {
+        &self.aud
+    }
+
+    /// The host as an IP address, when the endpoint names an IP literal.
+    #[must_use]
+    pub fn ip_literal(&self) -> Option<IpAddr> {
+        match self.url.host()? {
+            Host::Ipv4(v4) => Some(IpAddr::V4(v4)),
+            Host::Ipv6(v6) => Some(IpAddr::V6(v6)),
+            Host::Domain(_) => None,
+        }
+    }
+
+    /// The host name, when the endpoint names a domain.
+    #[must_use]
+    pub fn domain(&self) -> Option<&str> {
+        self.url.domain()
+    }
+}
+
+/// Parses `endpoint` under the §22.11.4 URL rules: it must equal its WHATWG
+/// URL serialization, with scheme `https`, a host, no userinfo and no
+/// fragment.
+///
+/// # Errors
+///
+/// The [`EndpointError`] naming the first rule `endpoint` breaks.
+pub fn parse_endpoint(endpoint: &str) -> Result<ParsedEndpoint, EndpointError> {
+    let url = Url::parse(endpoint).map_err(EndpointError::NotUrl)?;
+    if url.scheme() != "https" {
+        return Err(EndpointError::NotHttps);
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(EndpointError::HasUserinfo);
+    }
+    if url.fragment().is_some() {
+        return Err(EndpointError::HasFragment);
+    }
+    if url.host().is_none() {
+        return Err(EndpointError::NoHost);
+    }
+    if url.as_str() != endpoint {
+        return Err(EndpointError::NotCanonical);
+    }
+    let aud = url.origin().ascii_serialization();
+    Ok(ParsedEndpoint { url, aud })
+}
+
+/// How a [`CheckedResolver`] looks a name up.
+#[derive(Clone)]
+enum Lookup {
+    /// The operating system's resolver.
+    System,
+    /// A fixed table, so a test can point a name at any address.
+    #[cfg(test)]
+    Fixed(Arc<std::collections::HashMap<String, Vec<IpAddr>>>),
+}
+
+impl Lookup {
+    async fn lookup(&self, host: &str) -> Result<Vec<IpAddr>, EndpointError> {
+        match self {
+            Self::System => Ok(tokio::net::lookup_host((host, 0))
+                .await
+                .map_err(|e| EndpointError::Resolve(e.kind()))?
+                .map(|addr| addr.ip())
+                .collect()),
+            #[cfg(test)]
+            Self::Fixed(table) => Ok(table.get(host).cloned().unwrap_or_default()),
+        }
+    }
+}
+
+/// A resolver that refuses a whole lookup when [`check_address`] refuses any
+/// address it returns.
+///
+/// ADR-004 refuses an endpoint whose name resolves to any refused address,
+/// even when its other addresses pass.
+///
+/// The `WebPush` sender's HTTP client resolves every host through it, so the
+/// rule holds at the moment of each connection, not only at registration.
+#[derive(Clone)]
+pub struct CheckedResolver {
+    own: OwnAddresses,
+    lookup: Lookup,
+    /// Lets a test reach its loopback server. Absent from every non-test
+    /// build.
+    #[cfg(test)]
+    allow_loopback: bool,
+}
+
+impl fmt::Debug for CheckedResolver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CheckedResolver")
+            .field("own", &self.own)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CheckedResolver {
+    /// A resolver that looks names up through the operating system and
+    /// refuses `own` along with every other refused address.
+    #[must_use]
+    pub const fn new(own: OwnAddresses) -> Self {
+        Self {
+            own,
+            lookup: Lookup::System,
+            #[cfg(test)]
+            allow_loopback: false,
+        }
+    }
+
+    /// A resolver that answers from `table` and, when `allow_loopback`, lets
+    /// loopback addresses through.
+    #[cfg(test)]
+    pub(crate) fn for_tests(
+        own: OwnAddresses,
+        table: std::collections::HashMap<String, Vec<IpAddr>>,
+        allow_loopback: bool,
+    ) -> Self {
+        Self {
+            own,
+            lookup: Lookup::Fixed(Arc::new(table)),
+            allow_loopback,
+        }
+    }
+
+    fn check(&self, ip: IpAddr) -> Result<(), EndpointError> {
+        #[cfg(test)]
+        if self.allow_loopback && ip.to_canonical().is_loopback() {
+            return Ok(());
+        }
+        check_address(ip, &self.own).map_err(EndpointError::Refused)
+    }
+
+    /// Judges an IP-literal host, which the HTTP client connects to without
+    /// consulting any resolver. A domain host passes here and is judged when
+    /// it is resolved.
+    ///
+    /// # Errors
+    ///
+    /// [`EndpointError::Refused`] when the literal is refused.
+    pub fn check_literal(&self, endpoint: &ParsedEndpoint) -> Result<(), EndpointError> {
+        endpoint.ip_literal().map_or(Ok(()), |ip| self.check(ip))
+    }
+
+    /// Resolves `host` within [`RESOLVE_TIMEOUT`] and returns its addresses
+    /// when every one of them passes.
+    ///
+    /// # Errors
+    ///
+    /// [`EndpointError::Refused`] when any address is refused,
+    /// [`EndpointError::DoesNotResolve`] when there is none, and
+    /// [`EndpointError::ResolveTimeout`] or [`EndpointError::Resolve`] when
+    /// the lookup fails.
+    pub async fn resolve_checked(&self, host: &str) -> Result<Vec<IpAddr>, EndpointError> {
+        let addresses = tokio::time::timeout(RESOLVE_TIMEOUT, self.lookup.lookup(host))
+            .await
+            .map_err(|_| EndpointError::ResolveTimeout)??;
+        if addresses.is_empty() {
+            return Err(EndpointError::DoesNotResolve);
+        }
+        for ip in &addresses {
+            self.check(*ip)?;
+        }
+        Ok(addresses)
+    }
+
+    /// The registration-time check (ADR-004): parses `endpoint`, then judges
+    /// its IP literal or every address its host name resolves to.
+    ///
+    /// # Errors
+    ///
+    /// The [`EndpointError`] that refuses the endpoint or reports the failed
+    /// lookup.
+    pub async fn check_registration_endpoint(&self, endpoint: &str) -> Result<(), EndpointError> {
+        let parsed = parse_endpoint(endpoint)?;
+        self.check_literal(&parsed)?;
+        if let Some(domain) = parsed.domain() {
+            self.resolve_checked(domain).await?;
+        }
+        Ok(())
+    }
+}
+
+impl reqwest::dns::Resolve for CheckedResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let resolver = self.clone();
+        let host = name.as_str().to_owned();
+        Box::pin(async move {
+            let addresses = resolver
+                .resolve_checked(&host)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+            let addrs: reqwest::dns::Addrs =
+                Box::new(addresses.into_iter().map(|ip| SocketAddr::new(ip, 0)));
+            Ok(addrs)
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::str::FromStr;
+
+    use super::*;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn ip(text: &str) -> Result<IpAddr, std::net::AddrParseError> {
+        IpAddr::from_str(text)
+    }
+
+    /// One address in each registry row, and the outcome the rule gives it.
+    #[test]
+    fn each_registry_row_and_rule_is_judged() -> TestResult {
+        use AddressRefusal::{
+            Multicast, NotGloballyReachable as Not, OutsideGlobalUnicast, ReachabilityUndefined,
+            SixToFour, Unspecified,
+        };
+        let cases: &[(&str, Result<(), AddressRefusal>)] = &[
+            // IPv4 rows.
+            ("0.1.2.3", Err(Not)),
+            ("0.0.0.0", Err(Unspecified)),
+            ("10.1.2.3", Err(Not)),
+            ("100.64.0.1", Err(Not)),
+            ("100.127.255.254", Err(Not)),
+            ("127.0.0.1", Err(Not)),
+            ("169.254.1.1", Err(Not)),
+            ("172.16.0.1", Err(Not)),
+            ("172.31.255.255", Err(Not)),
+            ("192.0.0.100", Err(Not)),
+            ("192.0.0.1", Err(Not)),
+            ("192.0.0.8", Err(Not)),
+            ("192.0.0.9", Ok(())),
+            ("192.0.0.10", Ok(())),
+            ("192.0.0.170", Err(Not)),
+            ("192.0.0.171", Err(Not)),
+            ("192.0.2.1", Err(Not)),
+            ("192.31.196.1", Ok(())),
+            ("192.52.193.1", Ok(())),
+            ("192.88.99.1", Err(ReachabilityUndefined)),
+            ("192.88.99.2", Err(Not)),
+            ("192.168.1.1", Err(Not)),
+            ("192.175.48.1", Ok(())),
+            ("198.18.0.1", Err(Not)),
+            ("198.19.255.255", Err(Not)),
+            ("198.51.100.1", Err(Not)),
+            ("203.0.113.1", Err(Not)),
+            ("240.0.0.1", Err(Not)),
+            ("255.255.255.255", Err(Not)),
+            ("224.0.0.1", Err(Multicast)),
+            ("239.255.255.255", Err(Multicast)),
+            // IPv4 neighbours of the rows, outside every one.
+            ("8.8.8.8", Ok(())),
+            ("100.63.255.255", Ok(())),
+            ("100.128.0.0", Ok(())),
+            ("172.32.0.0", Ok(())),
+            ("198.20.0.0", Ok(())),
+            ("223.255.255.255", Ok(())),
+            // IPv6 rows.
+            ("::1", Err(Not)),
+            ("::", Err(Unspecified)),
+            ("64:ff9b:1::1", Err(Not)),
+            ("100::1", Err(Not)),
+            ("100:0:0:1::1", Err(Not)),
+            (
+                "2001:0:4136:e378:8000:63bf:3fff:fdd2",
+                Err(ReachabilityUndefined),
+            ),
+            ("2001:1::1", Ok(())),
+            ("2001:1::2", Ok(())),
+            ("2001:1::3", Ok(())),
+            ("2001:1::4", Err(Not)),
+            ("2001:2::1", Err(Not)),
+            ("2001:3::1", Ok(())),
+            ("2001:4:112::1", Ok(())),
+            ("2001:10::1", Err(ReachabilityUndefined)),
+            ("2001:20::1", Ok(())),
+            ("2001:30::1", Ok(())),
+            ("2001:100::1", Err(Not)),
+            ("2001:db8::1", Err(Not)),
+            ("2002:c000:0201::1", Err(SixToFour)),
+            ("2002:808:808::1", Err(SixToFour)),
+            ("2620:4f:8000::1", Ok(())),
+            ("3fff::1", Err(Not)),
+            ("5f00::1", Err(Not)),
+            ("fc00::1", Err(Not)),
+            ("fd12:3456::1", Err(Not)),
+            ("fe80::1", Err(Not)),
+            ("ff02::1", Err(Multicast)),
+            // Outside 2000::/3 and in no row.
+            ("4000::1", Err(OutsideGlobalUnicast)),
+            ("1::1", Err(OutsideGlobalUnicast)),
+            ("::2", Err(OutsideGlobalUnicast)),
+            // Global unicast.
+            ("2001:4860:4860::8888", Ok(())),
+            ("2606:4700::1111", Ok(())),
+            // Embedded IPv4, judged by the IPv4 address.
+            ("::ffff:127.0.0.1", Err(Not)),
+            ("::ffff:10.0.0.1", Err(Not)),
+            ("::ffff:8.8.8.8", Ok(())),
+            ("64:ff9b::7f00:1", Err(Not)),
+            ("64:ff9b::a9fe:a9fe", Err(Not)),
+            ("64:ff9b::808:808", Ok(())),
+        ];
+        let own = OwnAddresses::default();
+        for (text, want) in cases {
+            assert_eq!(check_address(ip(text)?, &own), *want, "{text}");
+        }
+        Ok(())
+    }
+
+    /// The relay's own public addresses are refused in every form.
+    #[test]
+    fn own_addresses_are_refused() -> TestResult {
+        let own = OwnAddresses::new([ip("203.0.114.7")?, ip("2001:4860::7")?]);
+        for text in [
+            "203.0.114.7",
+            "::ffff:203.0.114.7",
+            "64:ff9b::cb00:7207",
+            "2001:4860::7",
+        ] {
+            assert_eq!(
+                check_address(ip(text)?, &own),
+                Err(AddressRefusal::OwnAddress),
+                "{text}"
+            );
+        }
+        assert_eq!(check_address(ip("203.0.114.8")?, &own), Ok(()));
+        // An own address given in mapped form matches its IPv4 address.
+        let mapped = OwnAddresses::new([ip("::ffff:203.0.114.9")?]);
+        assert_eq!(
+            check_address(ip("203.0.114.9")?, &mapped),
+            Err(AddressRefusal::OwnAddress)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parse_endpoint_gives_the_rfc_6454_origin() -> TestResult {
+        let default_port = parse_endpoint("https://push.example.net/p/abc")?;
+        assert_eq!(default_port.aud(), "https://push.example.net");
+        assert_eq!(default_port.domain(), Some("push.example.net"));
+        assert_eq!(default_port.ip_literal(), None);
+        let other_port = parse_endpoint("https://push.example.net:8443/p/abc")?;
+        assert_eq!(other_port.aud(), "https://push.example.net:8443");
+        let literal = parse_endpoint("https://[2001:db8::1]/p")?;
+        assert_eq!(literal.ip_literal(), Some(ip("2001:db8::1")?));
+        assert_eq!(literal.aud(), "https://[2001:db8::1]");
+        Ok(())
+    }
+
+    #[test]
+    fn parse_endpoint_refuses_each_url_rule() {
+        let cases: &[(&str, EndpointError)] = &[
+            (
+                "not a url",
+                EndpointError::NotUrl(url::ParseError::RelativeUrlWithoutBase),
+            ),
+            ("http://push.example.net/p", EndpointError::NotHttps),
+            ("https://u:p@push.example.net/p", EndpointError::HasUserinfo),
+            ("https://u@push.example.net/p", EndpointError::HasUserinfo),
+            ("https://push.example.net/p#f", EndpointError::HasFragment),
+            // Each differs from its WHATWG serialization.
+            ("https://PUSH.example.net/p", EndpointError::NotCanonical),
+            ("https://push.example.net", EndpointError::NotCanonical),
+            (
+                "https://push.example.net:443/p",
+                EndpointError::NotCanonical,
+            ),
+            (
+                "https://push.example.net/a/../p",
+                EndpointError::NotCanonical,
+            ),
+            ("https://0x7f.1/p", EndpointError::NotCanonical),
+            ("https://push.example.net\\p", EndpointError::NotCanonical),
+            (
+                "https://xn--bcher-kva.example/p\u{e9}",
+                EndpointError::NotCanonical,
+            ),
+        ];
+        for (endpoint, want) in cases {
+            assert_eq!(
+                parse_endpoint(endpoint).map(|_| ()),
+                Err(*want),
+                "{endpoint}"
+            );
+        }
+    }
+
+    #[test]
+    fn check_literal_judges_only_literals() -> TestResult {
+        let resolver = CheckedResolver::new(OwnAddresses::default());
+        assert_eq!(
+            resolver.check_literal(&parse_endpoint("https://127.0.0.1/p")?),
+            Err(EndpointError::Refused(AddressRefusal::NotGloballyReachable))
+        );
+        assert_eq!(
+            resolver.check_literal(&parse_endpoint("https://[::1]/p")?),
+            Err(EndpointError::Refused(AddressRefusal::NotGloballyReachable))
+        );
+        resolver.check_literal(&parse_endpoint("https://8.8.8.8/p")?)?;
+        resolver.check_literal(&parse_endpoint("https://push.example.net/p")?)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_name_with_any_refused_address_is_refused() -> TestResult {
+        let table = HashMap::from([
+            (
+                "public.example".to_owned(),
+                vec![ip("8.8.8.8")?, ip("2001:4860:4860::8888")?],
+            ),
+            (
+                "mixed.example".to_owned(),
+                vec![ip("8.8.8.8")?, ip("10.0.0.1")?],
+            ),
+            ("loop.example".to_owned(), vec![ip("::1")?]),
+        ]);
+        let resolver = CheckedResolver::for_tests(OwnAddresses::default(), table, false);
+        assert_eq!(resolver.resolve_checked("public.example").await?.len(), 2);
+        assert_eq!(
+            resolver.resolve_checked("mixed.example").await,
+            Err(EndpointError::Refused(AddressRefusal::NotGloballyReachable))
+        );
+        assert_eq!(
+            resolver.resolve_checked("loop.example").await,
+            Err(EndpointError::Refused(AddressRefusal::NotGloballyReachable))
+        );
+        assert_eq!(
+            resolver.resolve_checked("absent.example").await,
+            Err(EndpointError::DoesNotResolve)
+        );
+        resolver
+            .check_registration_endpoint("https://public.example/p")
+            .await?;
+        assert_eq!(
+            resolver
+                .check_registration_endpoint("https://mixed.example/p")
+                .await,
+            Err(EndpointError::Refused(AddressRefusal::NotGloballyReachable))
+        );
+        assert_eq!(
+            resolver
+                .check_registration_endpoint("https://10.0.0.1/p")
+                .await,
+            Err(EndpointError::Refused(AddressRefusal::NotGloballyReachable))
+        );
+        Ok(())
+    }
+
+    /// The production resolver refuses `localhost`, which every system
+    /// resolver maps to loopback.
+    #[tokio::test]
+    async fn the_system_resolver_refuses_localhost() {
+        let resolver = CheckedResolver::new(OwnAddresses::default());
+        assert_eq!(
+            resolver.resolve_checked("localhost").await,
+            Err(EndpointError::Refused(AddressRefusal::NotGloballyReachable))
+        );
+    }
+
+    #[test]
+    fn errors_and_debug_carry_no_endpoint() -> TestResult {
+        let parsed = parse_endpoint("https://push.example.net/p/secret")?;
+        assert!(!format!("{parsed:?}").contains("push.example"));
+        let own = OwnAddresses::new([ip("203.0.114.7")?]);
+        assert!(!format!("{own:?}").contains("203.0"));
+        let shown = EndpointError::Refused(AddressRefusal::OwnAddress).to_string();
+        assert!(!shown.contains("203.0"), "{shown}");
+        Ok(())
+    }
+}

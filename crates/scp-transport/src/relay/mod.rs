@@ -26,6 +26,9 @@
 //!   [`push::PushSendOutcome`]) that sends the §10.7.1 step 5 wake signal,
 //!   with the APNs sender in [`push_apns`] (PUSH-010) and the FCM HTTP v1
 //!   sender in [`push_fcm`] (PUSH-011).
+//! - [`push_endpoint`] -- the ADR-004 `WebPush` endpoint refusal rule
+//!   (PUSH-022): the endpoint URL rules, the special-purpose address rule,
+//!   and the resolver that applies it to every address a host resolves to.
 //! - `push_store` -- the relay's push registration store (spec section
 //!   10.7.1 step 4), indexed by registration key, by routing ID and by
 //!   token. Behind the `push-store` feature.
@@ -51,6 +54,7 @@ pub(crate) mod log_capture;
 pub mod push;
 pub mod push_apns;
 pub mod push_dispatch;
+pub mod push_endpoint;
 pub mod push_fcm;
 pub mod push_gate;
 #[cfg(feature = "push-store")]
