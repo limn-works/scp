@@ -640,7 +640,8 @@ fn standards_table_rows(spec: &str) -> Result<Vec<(&str, &str)>, String> {
 
 /// A table row outside §7.3.4.3, such as a constant table's, is ignored, and
 /// a row inside the section is read, including one below a lower-level
-/// subheading.
+/// subheading. Inside the section, a row whose minimum is not a number is
+/// skipped, and a `#` line that is not a heading does not end the section.
 #[test]
 fn standards_table_rows_reads_only_section_7_3_4_3() {
     let spec = "\
@@ -648,6 +649,8 @@ fn standards_table_rows_reads_only_section_7_3_4_3() {
 | `D_MAX` | 10 seconds | before |
 #### 7.3.4.3 Protocol Capability Registry
 | `code-review/v1` | 20 | in section |
+| `x` | none | not a minimum |
+#tag
 ##### 7.3.4.3.1 Protocol Constant
 | `summarize/v1` | 5 per `category` | still in section |
 #### 7.3.4.4 Next
