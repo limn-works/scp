@@ -168,6 +168,14 @@ const RECONNECT_DRIVER_SRC: &str =
 // signer-free pull in `reconnect.rs`.
 const PUSH_WAKE_SRC: &str = include_str!("../../../../crates/scp-ffi/common/src/push.rs");
 
+// Relay push dispatcher and rate-limit sources (§10.7.1 steps 5 and 6). The
+// push_dispatch_sends_through_the_rate_limit assertion below pins every
+// production send to the per-token limiter.
+const PUSH_DISPATCH_SRC: &str =
+    include_str!("../../../../crates/scp-transport/src/relay/push_dispatch.rs");
+const RELAY_RATE_LIMIT_SRC: &str =
+    include_str!("../../../../crates/scp-transport/src/relay/rate_limit.rs");
+
 // Actor messaging-handler source — owns `handle_build_local_checkpoint`,
 // the actor-turn body that builds AND broadcasts the Phase-3 checkpoint so
 // the FFI driver never needs the `pub(crate)` `send_checkpoint` across the
@@ -3938,6 +3946,50 @@ fn push_wake_pulls_without_signing() {
             "{fn_name} must take no CommandSigner (ADR-029 §2): {signature}"
         );
     }
+}
+
+/// §10.7.1 step 6 (PUSH-009): the relay sends every push wake through the
+/// per-token rate limit. `PushService::start` runs the production limits,
+/// whose window is the 30 s `PUSH_WAKE_WINDOW`; `start_with` gives each
+/// platform's drain a `PushWakeLimiter`; the drain's `drain` loop sends only
+/// the jobs `next_job` returns; and `next_job` returns only a job the
+/// limiter admits now (`admit`) or a deferred job whose window closed
+/// (`take_due`), sleeping until the next window closes in between.
+#[test]
+fn push_dispatch_sends_through_the_rate_limit() {
+    assert!(
+        fn_body_contains(PUSH_DISPATCH_SRC, "start", "Limits::PRODUCTION"),
+        "PushService::start must run the production limits (§10.7.1 step 6)"
+    );
+    assert!(
+        strip_non_code(PUSH_DISPATCH_SRC).contains("wake_window: PUSH_WAKE_WINDOW"),
+        "the production limits must use PUSH_WAKE_WINDOW (§10.7.1 step 6)"
+    );
+    assert!(
+        strip_non_code(RELAY_RATE_LIMIT_SRC)
+            .contains("const PUSH_WAKE_WINDOW: Duration = Duration::from_secs(30);"),
+        "PUSH_WAKE_WINDOW must be 30 s (§10.7.1 step 6)"
+    );
+    for (caller, callee) in [
+        ("start_with", "PushWakeLimiter::new("),
+        ("start_with", ".drain(rx)"),
+        ("drain", "self.next_job("),
+        ("drain", ".send_registered("),
+        ("next_job", ".take_due("),
+        ("next_job", ".admit("),
+        ("next_job", "sleep_until("),
+    ] {
+        assert!(
+            fn_body_contains(PUSH_DISPATCH_SRC, caller, callee),
+            "{caller} must call {callee} (§10.7.1 step 6, PUSH-009)"
+        );
+    }
+    let drain = extract_fn_body(PUSH_DISPATCH_SRC, "drain")
+        .unwrap_or_else(|| panic!("Drain::drain not found in push_dispatch.rs"));
+    assert!(
+        !drain.contains("rx.recv("),
+        "Drain::drain must read jobs only through next_job, so no job skips the rate limit"
+    );
 }
 
 /// The FFI/SDK reconnection driver must DRIVE the checkpoint exchange, not

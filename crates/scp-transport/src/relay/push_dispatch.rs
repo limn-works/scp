@@ -15,9 +15,10 @@
 //!   queues one job per token on that platform's queue.
 //! - **One drain per configured sender**, each reading its own platform's
 //!   queue, so a push service that stops answering stalls only its own
-//!   platform. After a `Transient` outcome a drain backs off before its next
-//!   send to that service. Each drain applies the outcome to the
-//!   registration store:
+//!   platform. Each drain passes every job through its platform's per-token
+//!   rate limit (section Rate limit below) before it sends. After a
+//!   `Transient` outcome a drain backs off before its next send to that
+//!   service. Each drain applies the outcome to the registration store:
 //!   - `Delivered` resets the token's consecutive invalid-token count.
 //!   - `InvalidToken` adds one to it; at `INVALID_TOKEN_REMOVAL_THRESHOLD`
 //!     (in `push_store`, a module the `push-store` feature compiles) the
@@ -35,13 +36,42 @@
 //! the store before the clear. A restart therefore costs a token at most the
 //! failures counted before it, and never turns a stale count into a removal.
 //!
+//! # Rate limit
+//!
+//! §10.7.1 step 6 allows at most one push per 30 s per device token, and
+//! defers a wake inside that window instead of dropping it (PUSH-009). Each
+//! drain owns one `PushWakeLimiter` (in `rate_limit`) for its platform and
+//! consults it for every job it reads:
+//! - A token with no push in the last 30 s is sent at once, which opens its
+//!   window.
+//! - A token inside its window holds the job as its one pending wake, and
+//!   any later job for that token inside the window joins it. The drain
+//!   sends the pending wake when the window closes, because it sleeps until
+//!   the oldest window's close whenever no job is waiting.
+//! - The limiter keys a token by the same SHA-256 the queues use, and holds
+//!   the token's bytes only inside a pending job, which zeroizes them when
+//!   it is sent, refused or dropped.
+//!
+//! The limiter lives in the drain's memory, so stopping the service (the
+//! relay shutting down or restarting) drops every pending wake unsent and
+//! zeroizes its token, and a restarted relay starts with no windows open
+//! (§10.7.1 step 6, **State**). The limiter forgets a token once its window
+//! closes with nothing pending, so it holds an entry only for each token
+//! pushed to within the last 30 s.
+//!
+//! A pending wake counts against the bounds below (§10.7.1 step 6, **Held
+//! wakes and the bounds**): its job keeps its routing ID's ticket, so it
+//! counts toward `MAX_WAKES_PER_PUBLISH`, and one drain holds at most
+//! `PUSH_QUEUE_CAPACITY` pending wakes besides its queue. When a drain holds
+//! that many, it drops a further job it would defer, and logs the drop.
+//!
 //! # Bounds
 //!
 //! The intake and every platform queue hold at most `PUSH_QUEUE_CAPACITY`
 //! entries. A wake that does not fit is dropped, and the publish still
 //! succeeds (PUSH-008 AC2): a wake is advisory, and a device whose wake was
-//! dropped pulls on its next wake or connection (§10.7, as the PUSH-009 rate
-//! limit also relies on). The intake holds each routing ID at most once, and
+//! dropped pulls on its next wake or connection (§10.7.1 step 5,
+//! **Best-effort delivery**). The intake holds each routing ID at most once, and
 //! a platform queue holds each token at most once. One routing ID holds at
 //! most `MAX_WAKES_PER_PUBLISH` jobs queued or in flight at a time, so the
 //! wakes for one routing ID, however many tokens are registered on it, leave
@@ -92,13 +122,14 @@ mod enabled {
     use sha2::{Digest, Sha256};
     use tokio::sync::mpsc;
     use tokio_util::sync::{CancellationToken, DropGuard};
-    use zeroize::Zeroizing;
+    use zeroize::{Zeroize, Zeroizing};
 
     use super::super::push::{PushSendOutcome, PushSender};
     use super::super::push_gate::{PushRole, PushServiceConfig};
     use super::super::push_store::{
         CountFrom, InvalidTokenOutcome, PushRegistrationStore, RoutingId, WakeToken,
     };
+    use super::super::rate_limit::{PUSH_WAKE_WINDOW, PushWakeLimiter, WakeAdmission};
     use crate::backoff::ReconnectBackoff;
 
     /// The most entries the intake and each platform queue hold before new
@@ -165,9 +196,17 @@ mod enabled {
     struct PushJob {
         platform: PushPlatform,
         token: Zeroizing<Vec<u8>>,
-        /// Held until the send finishes; the lookup counts a routing ID's
+        /// Held, never read, until the job drops; the lookup counts a routing ID's
         /// live jobs by the clones of its ticket.
-        ticket: Arc<()>,
+        _ticket: Arc<()>,
+    }
+
+    /// Zeroizes the token, so the rate limiter can hold a pending job in
+    /// [`Zeroizing`] and wipe its token whenever it drops the job.
+    impl Zeroize for PushJob {
+        fn zeroize(&mut self) {
+            self.token.zeroize();
+        }
     }
 
     impl fmt::Debug for PushJob {
@@ -244,20 +283,26 @@ mod enabled {
         clear_failed: RateLimitedLog,
         store_failed: RateLimitedLog,
         config_error: RateLimitedLog,
+        deferred_full: RateLimitedLog,
     }
 
     /// The sizes the service runs with. Production uses
-    /// [`Limits::PRODUCTION`]; the tests shrink them to fill a queue.
+    /// [`Limits::PRODUCTION`]; the tests shrink them to fill a queue, and
+    /// the tests of behaviour other than the rate limit shorten its window.
     #[derive(Debug, Clone, Copy)]
     struct Limits {
         queue_capacity: usize,
         wakes_per_publish: usize,
+        /// The shortest time between two pushes to one token (§10.7.1
+        /// step 6).
+        wake_window: Duration,
     }
 
     impl Limits {
         const PRODUCTION: Self = Self {
             queue_capacity: PUSH_QUEUE_CAPACITY,
             wakes_per_publish: MAX_WAKES_PER_PUBLISH,
+            wake_window: PUSH_WAKE_WINDOW,
         };
     }
 
@@ -301,20 +346,23 @@ mod enabled {
             Self::start_with(config, Limits::PRODUCTION)
         }
 
-        /// As [`Self::start`], with queues of `queue_capacity` entries and at
-        /// most `wakes_per_publish` jobs per routing ID, so a test can fill a
-        /// queue.
+        /// As [`Self::start`], with queues of `queue_capacity` entries, at
+        /// most `wakes_per_publish` jobs per routing ID, and one push per
+        /// `wake_window` per token, so a test can fill a queue or send one
+        /// token several wakes without waiting out the production window.
         #[cfg(test)]
         pub(crate) fn start_with_limits(
             config: PushServiceConfig,
             queue_capacity: usize,
             wakes_per_publish: usize,
+            wake_window: Duration,
         ) -> Result<Self, PushServiceError> {
             Self::start_with(
                 config,
                 Limits {
                     queue_capacity,
                     wakes_per_publish,
+                    wake_window,
                 },
             )
         }
@@ -345,8 +393,9 @@ mod enabled {
                         logs: Arc::clone(&logs),
                         stop: stop.clone(),
                         pending_resets: HashSet::new(),
+                        limiter: PushWakeLimiter::new(limits.wake_window, limits.queue_capacity),
                     }
-                    .run(rx),
+                    .drain(rx),
                 );
                 lanes.push(Lane {
                     platform: sender.platform(),
@@ -561,7 +610,7 @@ mod enabled {
             let job = PushJob {
                 platform,
                 token,
-                ticket: Arc::clone(ticket),
+                _ticket: Arc::clone(ticket),
             };
             let refused = match lane.tx.try_send(job) {
                 Ok(()) => return,
@@ -596,7 +645,8 @@ mod enabled {
         }
     }
 
-    /// One platform's drain: jobs in, sends out, outcomes into the store.
+    /// One platform's drain: jobs in, through the rate limit, sends out,
+    /// outcomes into the store.
     struct Drain {
         senders: Arc<[PushSender]>,
         index: usize,
@@ -607,10 +657,14 @@ mod enabled {
         /// Tokens whose last outcome was `Delivered` but whose count reset
         /// the store failed to write. At most [`PUSH_QUEUE_CAPACITY`].
         pending_resets: HashSet<TokenKey>,
+        /// The platform's per-token rate limit (§10.7.1 step 6), holding each
+        /// deferred job until its token's window closes. Dropped with the
+        /// drain, which zeroizes every pending job's token unsent.
+        limiter: PushWakeLimiter<PushJob>,
     }
 
     impl Drain {
-        async fn run(mut self, mut rx: mpsc::Receiver<PushJob>) {
+        async fn drain(mut self, mut rx: mpsc::Receiver<PushJob>) {
             let senders = Arc::clone(&self.senders);
             let Some(sender) = senders.get(self.index) else {
                 // `start_with` takes `index` from enumerating this same
@@ -624,17 +678,10 @@ mod enabled {
                 return;
             };
             let mut backoff = ReconnectBackoff::new(TRANSIENT_BACKOFF_MIN, TRANSIENT_BACKOFF_MAX);
-            loop {
-                let job = tokio::select! {
-                    biased;
-                    () = self.stop.cancelled() => return,
-                    job = rx.recv() => job,
-                };
-                // The lookup holds the queue's sender until it stops, so
-                // `None` means the service is gone.
-                let Some(job) = job else { return };
+            // `None` means the service stopped; returning drops the limiter,
+            // which zeroizes every pending job unsent.
+            while let Some(job) = self.next_job(&mut rx).await {
                 let key = token_key(job.platform, &job.token);
-                lock(&self.queued).remove(&key);
                 let outcome = tokio::select! {
                     biased;
                     () = self.stop.cancelled() => return,
@@ -643,14 +690,64 @@ mod enabled {
                 if !self.apply(job.platform, key, &job.token, outcome).await {
                     return;
                 }
-                let PushJob { ticket, .. } = job;
-                drop(ticket);
+                // Releases the routing ID's ticket and zeroizes the token.
+                drop(job);
                 if outcome == PushSendOutcome::Transient {
                     if !self.pause(backoff.next_delay()).await {
                         return;
                     }
                 } else {
                     backoff.reset();
+                }
+            }
+        }
+
+        /// The next job to send under the rate limit (§10.7.1 step 6): a
+        /// pending job whose token's window closed, or a job from the queue
+        /// whose token has no window open. A job from the queue whose token
+        /// has a window open becomes that token's pending job, or joins the
+        /// one it already has, and the drain reads on. `None` when the
+        /// service stopped.
+        ///
+        /// While no job is waiting, the drain sleeps until the oldest window
+        /// closes, so a pending job goes out when its window closes and a
+        /// token with nothing pending is forgotten then.
+        async fn next_job(
+            &mut self,
+            rx: &mut mpsc::Receiver<PushJob>,
+        ) -> Option<Zeroizing<PushJob>> {
+            loop {
+                if let Some(job) = self.limiter.take_due(tokio::time::Instant::now()) {
+                    return Some(job);
+                }
+                let due = self.limiter.next_due();
+                let job = tokio::select! {
+                    biased;
+                    () = self.stop.cancelled() => return None,
+                    () = sleep_until(due) => continue,
+                    // The lookup holds the queue's sender until it stops, so
+                    // `None` means the service is gone.
+                    job = rx.recv() => job?,
+                };
+                let key = token_key(job.platform, &job.token);
+                lock(&self.queued).remove(&key);
+                let platform = job.platform;
+                let admitted =
+                    self.limiter
+                        .admit(key, Zeroizing::new(job), tokio::time::Instant::now());
+                match admitted {
+                    WakeAdmission::SendNow(job) => return Some(job),
+                    WakeAdmission::Deferred | WakeAdmission::Joined => {}
+                    WakeAdmission::Full => {
+                        if let Some(line) = self.logs.deferred_full.hit() {
+                            tracing::warn!(
+                                platform = ?platform,
+                                total = line.total,
+                                suppressed = line.suppressed,
+                                "push rate limit holds its most pending wakes; wake dropped"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -750,6 +847,14 @@ mod enabled {
                     Err(e) => self.store_failed(platform, &e),
                 }
             }
+        }
+    }
+
+    /// Sleeps until `due`, or forever when `due` is `None`.
+    async fn sleep_until(due: Option<tokio::time::Instant>) {
+        match due {
+            Some(due) => tokio::time::sleep_until(due).await,
+            None => std::future::pending().await,
         }
     }
 
@@ -896,7 +1001,7 @@ mod enabled {
             let job = PushJob {
                 platform: PushPlatform::Fcm,
                 token: Zeroizing::new(b"secret-token".to_vec()),
-                ticket: Arc::new(()),
+                _ticket: Arc::new(()),
             };
             let shown = format!("{job:?}");
             assert!(!shown.contains("secret-token"), "{shown}");
@@ -904,7 +1009,7 @@ mod enabled {
             let PushJob {
                 platform,
                 token,
-                ticket,
+                _ticket: ticket,
             } = job;
             assert_eq!(platform, PushPlatform::Fcm);
             assert_eq!(token.as_slice(), b"secret-token");
@@ -975,7 +1080,7 @@ mod enabled {
         #[tokio::test]
         async fn notify_holds_a_routing_id_once_on_the_intake() -> TestResult {
             let (config, _dir) = config(Vec::new())?;
-            let service = PushService::start_with_limits(config, 4, 4)?;
+            let service = PushService::start_with_limits(config, 4, 4, PUSH_WAKE_WINDOW)?;
             let push = PushRole::Enabled(service.clone());
             notify(&push, &RID);
             notify(&push, &RID);
@@ -991,7 +1096,7 @@ mod enabled {
         #[tokio::test]
         async fn full_intake_drops_and_logs() -> TestResult {
             let (config, _dir) = config(Vec::new())?;
-            let service = PushService::start_with_limits(config, 1, 4)?;
+            let service = PushService::start_with_limits(config, 1, 4, PUSH_WAKE_WINDOW)?;
             let push = PushRole::Enabled(service.clone());
             notify(&push, &RID);
             notify(&push, &[0x22; 32]);
@@ -1041,6 +1146,19 @@ mod enabled {
             assert_eq!(log.total(), 5);
         }
 
+        /// Zeroizing a job wipes its token, so the rate limiter's
+        /// `Zeroizing<PushJob>` wipes the token of every job it drops.
+        #[test]
+        fn zeroizing_a_job_wipes_its_token() {
+            let mut job = PushJob {
+                platform: PushPlatform::Apns,
+                token: Zeroizing::new(b"secret-token".to_vec()),
+                _ticket: Arc::new(()),
+            };
+            job.zeroize();
+            assert!(job.token.is_empty(), "token left: {:?}", job.token.len());
+        }
+
         /// With push disabled, `notify` does nothing.
         #[test]
         fn disabled_role_does_nothing() {
@@ -1052,6 +1170,18 @@ mod enabled {
         mod drain {
             use super::super::super::super::push::{RecordingGate, RecordingSender};
             use super::*;
+
+            /// A service with the production queues and a zero rate-limit
+            /// window, for the PUSH-008 tests that send one token several
+            /// wakes in a row and test something other than the rate limit.
+            fn start_unlimited(config: PushServiceConfig) -> Result<PushService, PushServiceError> {
+                PushService::start_with_limits(
+                    config,
+                    PUSH_QUEUE_CAPACITY,
+                    MAX_WAKES_PER_PUBLISH,
+                    Duration::ZERO,
+                )
+            }
 
             async fn wait_for_sends(sender: &RecordingSender, n: usize) -> TestResult {
                 for _ in 0..1000 {
@@ -1095,7 +1225,7 @@ mod enabled {
             ) -> Result<(PushService, TempDir), Box<dyn std::error::Error>> {
                 let sender = RecordingSender::new(PushPlatform::Apns, outcomes.iter().copied());
                 let (config, dir) = config(vec![recording(&sender)])?;
-                let service = PushService::start(config)?;
+                let service = start_unlimited(config)?;
                 let push = PushRole::Enabled(service.clone());
                 register(&push, REGISTRANT_A, PushPlatform::Apns, b"t1", &[RID]).await?;
                 register(&push, REGISTRANT_B, PushPlatform::Apns, b"t1", &[RID]).await?;
@@ -1210,7 +1340,7 @@ mod enabled {
                     [InvalidToken, InvalidToken, Delivered, InvalidToken],
                 );
                 let (config, dir) = config(vec![recording(&sender)])?;
-                let service = PushService::start(config)?;
+                let service = start_unlimited(config)?;
                 let push = PushRole::Enabled(service.clone());
                 let store = service.config().store.clone();
                 register(&push, REGISTRANT_A, PushPlatform::Apns, b"t1", &[RID]).await?;
@@ -1257,7 +1387,7 @@ mod enabled {
                 );
                 let (config, dir) = config(vec![recording(&sender)])?;
                 let store = config.store.clone();
-                let service = PushService::start(config.clone())?;
+                let service = start_unlimited(config.clone())?;
                 let push = PushRole::Enabled(service.clone());
                 register(&push, REGISTRANT_A, PushPlatform::Apns, b"t1", &[RID]).await?;
                 for i in 1..=2 {
@@ -1286,7 +1416,7 @@ mod enabled {
                 drop(push);
                 drop(service);
                 let after = RecordingSender::new(PushPlatform::Apns, [InvalidToken]);
-                let restarted = PushService::start(PushServiceConfig {
+                let restarted = start_unlimited(PushServiceConfig {
                     senders: Arc::from(vec![recording(&after)]),
                     ..config
                 })?;
@@ -1371,7 +1501,7 @@ mod enabled {
                 let (apns, gate) = RecordingSender::gated(PushPlatform::Apns, [Delivered; 2]);
                 let fcm = RecordingSender::new(PushPlatform::Fcm, [Delivered; 2]);
                 let (config, _dir) = config(vec![recording(&apns), recording(&fcm)])?;
-                let push = PushRole::Enabled(PushService::start(config)?);
+                let push = PushRole::Enabled(start_unlimited(config)?);
                 register(&push, REGISTRANT_A, PushPlatform::Apns, b"apns", &[RID]).await?;
                 register(&push, REGISTRANT_A, PushPlatform::Fcm, b"fcm", &[RID]).await?;
 
@@ -1395,7 +1525,7 @@ mod enabled {
                 let apns = RecordingSender::new(PushPlatform::Apns, [Transient, Delivered]);
                 let fcm = RecordingSender::new(PushPlatform::Fcm, [Delivered; 2]);
                 let (config, _dir) = config(vec![recording(&apns), recording(&fcm)])?;
-                let push = PushRole::Enabled(PushService::start(config)?);
+                let push = PushRole::Enabled(start_unlimited(config)?);
                 register(&push, REGISTRANT_A, PushPlatform::Apns, b"apns", &[RID]).await?;
                 register(&push, REGISTRANT_A, PushPlatform::Fcm, b"fcm", &[RID]).await?;
 
@@ -1437,7 +1567,7 @@ mod enabled {
                 let (apns, gate): (RecordingSender, RecordingGate) =
                     RecordingSender::gated(PushPlatform::Apns, [PushSendOutcome::Delivered; 16]);
                 let (config, _dir) = config(vec![recording(&apns)])?;
-                let service = PushService::start_with_limits(config, 4, 2)?;
+                let service = PushService::start_with_limits(config, 4, 2, PUSH_WAKE_WINDOW)?;
                 let push = PushRole::Enabled(service.clone());
                 register(&push, REGISTRANT_A, PushPlatform::Apns, b"c0", &[C]).await?;
                 for token in [b"a1", b"a2", b"a3", b"a4", b"a5"] {
@@ -1479,7 +1609,7 @@ mod enabled {
                 let (apns, gate) =
                     RecordingSender::gated(PushPlatform::Apns, [PushSendOutcome::Delivered; 4]);
                 let (config, _dir) = config(vec![recording(&apns)])?;
-                let service = PushService::start_with_limits(config, 1, 8)?;
+                let service = PushService::start_with_limits(config, 1, 8, PUSH_WAKE_WINDOW)?;
                 let push = PushRole::Enabled(service.clone());
                 register(&push, REGISTRANT_A, PushPlatform::Apns, b"t0", &[RID]).await?;
                 register(&push, REGISTRANT_A, PushPlatform::Apns, b"t1", &[B]).await?;
@@ -1490,6 +1620,137 @@ mod enabled {
                 wait_for_log(&service.inner.logs.queue_full, 1).await?;
                 gate.admit(4);
                 wait_for_sends(&apns, 2).await
+            }
+
+            /// The per-token rate limit of §10.7.1 step 6 (PUSH-009), on the
+            /// production service and its 30 s window, under paused tokio
+            /// time.
+            mod rate_limit {
+                use tokio::time::Instant;
+
+                use super::*;
+
+                const RID2: RoutingId = [0x22; 32];
+
+                /// The production service with one recording APNs sender,
+                /// `t1` registered on `RID` and `t2` on `RID2`.
+                async fn limited()
+                -> Result<(PushRole, RecordingSender, TempDir), Box<dyn std::error::Error>>
+                {
+                    let sender =
+                        RecordingSender::new(PushPlatform::Apns, [PushSendOutcome::Delivered; 16]);
+                    let (config, dir) = config(vec![recording(&sender)])?;
+                    let push = PushRole::Enabled(PushService::start(config)?);
+                    register(&push, REGISTRANT_A, PushPlatform::Apns, b"t1", &[RID]).await?;
+                    register(&push, REGISTRANT_A, PushPlatform::Apns, b"t2", &[RID2]).await?;
+                    Ok((push, sender, dir))
+                }
+
+                /// Publishes to `routing_id` and returns once its first wake
+                /// went out, with the time it saw the wake: no earlier than
+                /// the send that opened the token's window.
+                async fn first_wake(
+                    push: &PushRole,
+                    sender: &RecordingSender,
+                    routing_id: &RoutingId,
+                ) -> Result<Instant, Box<dyn std::error::Error>> {
+                    notify(push, routing_id);
+                    wait_for_sends(sender, 1).await?;
+                    Ok(Instant::now())
+                }
+
+                /// Two publishes 1 s apart to one token's routing ID make one
+                /// send at once and a second when the window closes, not
+                /// before.
+                #[tokio::test(start_paused = true)]
+                async fn second_publish_in_the_window_is_sent_when_it_closes() -> TestResult {
+                    let (push, sender, _dir) = limited().await?;
+                    let t0 = first_wake(&push, &sender, &RID).await?;
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    notify(&push, &RID);
+                    tokio::time::sleep_until(t0 + Duration::from_millis(29_900)).await;
+                    assert_eq!(sender.sent().await.len(), 1, "sent inside the window");
+                    wait_for_sends(&sender, 2).await?;
+                    assert!(
+                        Instant::now() <= t0 + PUSH_WAKE_WINDOW + Duration::from_millis(100),
+                        "the deferred wake went out {:?} after the first",
+                        Instant::now() - t0
+                    );
+                    assert_eq!(sender.sent().await, vec![b"t1".to_vec(); 2]);
+                    Ok(())
+                }
+
+                /// Five publishes inside one window make one send at once and
+                /// exactly one deferred send.
+                #[tokio::test(start_paused = true)]
+                async fn five_publishes_in_one_window_make_one_deferred_send() -> TestResult {
+                    let (push, sender, _dir) = limited().await?;
+                    let t0 = first_wake(&push, &sender, &RID).await?;
+                    for _ in 0..4 {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        notify(&push, &RID);
+                    }
+                    tokio::time::sleep_until(t0 + Duration::from_millis(29_900)).await;
+                    assert_eq!(sender.sent().await.len(), 1, "sent inside the window");
+                    tokio::time::sleep_until(t0 + Duration::from_secs(120)).await;
+                    assert_eq!(sender.sent().await, vec![b"t1".to_vec(); 2]);
+                    Ok(())
+                }
+
+                /// A publish 30 s after the first is sent at once.
+                #[tokio::test(start_paused = true)]
+                async fn publish_after_the_window_is_sent_at_once() -> TestResult {
+                    let (push, sender, _dir) = limited().await?;
+                    let t0 = first_wake(&push, &sender, &RID).await?;
+                    tokio::time::sleep_until(t0 + PUSH_WAKE_WINDOW).await;
+                    notify(&push, &RID);
+                    wait_for_sends(&sender, 2).await?;
+                    assert!(
+                        Instant::now() <= t0 + PUSH_WAKE_WINDOW + Duration::from_millis(100),
+                        "the second wake went out {:?} after the first",
+                        Instant::now() - t0
+                    );
+                    Ok(())
+                }
+
+                /// One token's window does not hold another token's wake.
+                #[tokio::test(start_paused = true)]
+                async fn two_tokens_are_limited_independently() -> TestResult {
+                    let (push, sender, _dir) = limited().await?;
+                    let t0 = first_wake(&push, &sender, &RID).await?;
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    notify(&push, &RID2);
+                    wait_for_sends(&sender, 2).await?;
+                    assert!(
+                        Instant::now() <= t0 + Duration::from_secs(2),
+                        "t2 waited {:?} on t1's window",
+                        Instant::now() - t0
+                    );
+                    assert_eq!(sender.sent().await, vec![b"t1".to_vec(), b"t2".to_vec()]);
+                    Ok(())
+                }
+
+                /// Stopping the service drops a pending wake unsent: no wake
+                /// goes out after the window closes. The limiter test
+                /// `dropping_the_limiter_zeroizes_its_pending_wake` shows that
+                /// the drop zeroizes the token.
+                #[tokio::test(start_paused = true)]
+                async fn stopping_the_service_drops_the_pending_wake() -> TestResult {
+                    let (push, sender, _dir) = limited().await?;
+                    first_wake(&push, &sender, &RID).await?;
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    notify(&push, &RID);
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    assert_eq!(sender.sent().await.len(), 1, "sent inside the window");
+                    drop(push);
+                    tokio::time::sleep(Duration::from_secs(120)).await;
+                    assert_eq!(
+                        sender.sent().await.len(),
+                        1,
+                        "sent after the service stopped"
+                    );
+                    Ok(())
+                }
             }
         }
     }
