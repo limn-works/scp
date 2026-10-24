@@ -26252,6 +26252,101 @@ mod tests {
         }
     }
 
+    /// An event-log provider whose `restore_event_log` always fails, as a
+    /// stored log that does not load makes it fail.
+    struct FailingEventLogRestore;
+    #[async_trait::async_trait]
+    impl crate::context::builder::ContextEventLogProvider for FailingEventLogRestore {
+        async fn init_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+        async fn restore_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<
+            crate::context::builder::EventLogRestore,
+            scp_protocol::context::builder::ContextCreationError,
+        > {
+            Err(
+                scp_protocol::context::builder::ContextCreationError::EventLogFailed(
+                    "stored event log is misaligned".to_owned(),
+                ),
+            )
+        }
+        async fn append_event(
+            &self,
+            _id: &[u8; 32],
+            _event_type: scp_event_log::EventType,
+            _actor: &str,
+            _payload: scp_event_log::EventPayload,
+            _timestamp_secs: u64,
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+        async fn destroy_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+    }
+
+    /// Spec 17 §17.3 "Merkle event log entries": a restore refused because the
+    /// stored event log does not load leaves the registry's replay floors
+    /// unchanged. The control restore, whose event log loads, merges the
+    /// snapshot's floor, so the snapshot carries one to merge.
+    #[tokio::test]
+    async fn a_restore_refused_by_the_event_log_merges_no_replay_floor() {
+        let restore_with = |event_log: Box<
+            dyn crate::context::builder::ContextEventLogProvider,
+        >| async move {
+            let persistence = MapPersistence::default();
+            let contexts = Arc::clone(&persistence.contexts);
+            let sup = supervisor_with_clock_persistence_and_event_log(
+                Arc::new(TestClock::new(RULE9_T0)),
+                Box::new(persistence),
+                event_log,
+            );
+            let context_id = hex::encode([0xA8; 32]);
+            let snapshot = rule9_snapshot(
+                &sup,
+                &context_id,
+                "did:key:rule9-restore-creator",
+                &rule9_params(),
+                Some(CommittedT0::Value(RULE9_T0)),
+            );
+            contexts.insert(context_id.clone(), snapshot);
+            let handle = crate::context::ContextHandle::new(context_id.clone(), rule9_params());
+            let result = sup.restore_context(&context_id, &handle).await;
+            let floors = sup
+                .export_sender_key_epochs(&crate::context::state::context_id_to_bytes(&context_id));
+            (result, floors)
+        };
+
+        let (control, floors) = restore_with(Box::<EventLogHydrationCounter>::default()).await;
+        control.expect("the control restore succeeds");
+        assert_eq!(
+            floors,
+            vec![(RULE9_FLOOR_SENDER.to_owned(), RULE9_FLOOR_EPOCH)],
+            "the control restore merges the snapshot's floor"
+        );
+
+        let (refused, floors) = restore_with(Box::new(FailingEventLogRestore)).await;
+        let err = refused.expect_err("an event log that does not load refuses the restore");
+        assert!(
+            matches!(&err, ContextError::EventLogFailed(reason) if reason.contains("misaligned")),
+            "expected the event-log refusal, got {err:?}"
+        );
+        assert_eq!(
+            floors,
+            Vec::<(String, u64)>::new(),
+            "the refused restore must leave the registry's replay floors unchanged"
+        );
+    }
+
     /// §5.13.3 rule 9 checked before any side effect: a restore whose snapshot
     /// records a creation timestamp other than the committed `T0` is refused
     /// before the event log is hydrated and before the replay-floor merge.

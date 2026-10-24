@@ -18,11 +18,12 @@ use crate::traits::Storage;
 /// Monotonic counter for generating unique temp file names across threads.
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Every temp file name starts with this. No key component may start with
-/// it, and `list_keys` and `delete_prefix` skip every file whose name starts
-/// with it, so a temp file left by a crash is never a key (spec section 17.6,
-/// "`FilesystemStorage`").
-const TEMP_FILE_PREFIX: &str = ".tmp.";
+// Every temp file name starts with `TEMP_FILE_PREFIX`. No key component may
+// start with it (`sanitize_key_component` refuses it on every backend, and
+// `key_to_path` repeats the check), and `list_keys` and `delete_prefix` skip
+// every file whose name starts with it, so a temp file left by a crash is
+// never a key (spec section 17.6, "FilesystemStorage").
+use crate::store_value::TEMP_FILE_PREFIX;
 
 /// True when `path` names a temp file that [`FilesystemStorage`] wrote.
 fn is_temp_file(path: &Path) -> bool {
@@ -144,6 +145,49 @@ fn remove_empty_parents(path: &Path, base_dir: &Path) {
     }
 }
 
+/// The directories `create_dir_all(dir)` has to create: `dir` and each of its
+/// ancestors, deepest first, up to and excluding the first one that exists.
+///
+/// # Errors
+///
+/// Returns [`PlatformError::StorageError`] if whether a directory exists
+/// cannot be determined.
+#[cfg(unix)]
+fn missing_dirs(dir: &Path) -> Result<Vec<PathBuf>, PlatformError> {
+    let mut missing = Vec::new();
+    let mut current = Some(dir);
+    while let Some(candidate) = current {
+        let exists = candidate.try_exists().map_err(|e| {
+            PlatformError::StorageError(format!(
+                "failed to check whether {} exists: {e}",
+                candidate.display()
+            ))
+        })?;
+        if exists {
+            break;
+        }
+        missing.push(candidate.to_path_buf());
+        current = candidate.parent();
+    }
+    Ok(missing)
+}
+
+/// Fsyncs a directory, so the entries created or renamed in it survive a
+/// power loss.
+///
+/// # Errors
+///
+/// Returns [`PlatformError::StorageError`] if the directory cannot be opened
+/// or fsynced.
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> Result<(), PlatformError> {
+    std::fs::File::open(dir)
+        .and_then(|handle| handle.sync_all())
+        .map_err(|e| {
+            PlatformError::StorageError(format!("failed to fsync directory {}: {e}", dir.display()))
+        })
+}
+
 /// Writes `data` to a new file at `path` and fsyncs it.
 fn write_synced(path: &Path, data: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
@@ -177,11 +221,22 @@ impl Storage for FilesystemStorage {
             let path = path?;
             tokio::task::spawn_blocking(move || {
                 if let Some(parent) = path.parent() {
+                    // Directory durability runs on Unix only (spec section
+                    // 17.6): every directory this put creates gets its entry
+                    // fsynced into its parent, deepest first.
+                    #[cfg(unix)]
+                    let new_dirs = missing_dirs(parent)?;
                     std::fs::create_dir_all(parent).map_err(|e| {
                         PlatformError::StorageError(format!(
                             "failed to create parent directory: {e}"
                         ))
                     })?;
+                    #[cfg(unix)]
+                    for dir in &new_dirs {
+                        if let Some(dir_parent) = dir.parent() {
+                            sync_dir(dir_parent)?;
+                        }
+                    }
                 }
 
                 // Atomic, durable write: write a temp file and fsync it, rename
@@ -230,13 +285,8 @@ impl Storage for FilesystemStorage {
                     )));
                 }
 
-                std::fs::File::open(parent)
-                    .and_then(|dir| dir.sync_all())
-                    .map_err(|e| {
-                        PlatformError::StorageError(format!(
-                            "failed to fsync the directory after a rename: {e}"
-                        ))
-                    })?;
+                #[cfg(unix)]
+                sync_dir(parent)?;
 
                 Ok(())
             })
@@ -405,6 +455,34 @@ mod tests {
     fn key_to_path_simple() {
         let path = key_to_path(Path::new("/tmp/test-fs"), "context/abc/state").unwrap();
         assert_eq!(path, PathBuf::from("/tmp/test-fs/context/abc/state"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn missing_dirs_lists_each_new_directory_deepest_first() {
+        let base = std::env::temp_dir().join(format!(
+            "scp-missing-dirs-{}-{}",
+            std::process::id(),
+            TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let deep = base.join("a").join("b").join("c");
+        assert_eq!(
+            missing_dirs(&deep).unwrap(),
+            vec![
+                base.join("a").join("b").join("c"),
+                base.join("a").join("b"),
+                base.join("a"),
+            ]
+        );
+        std::fs::create_dir_all(base.join("a")).unwrap();
+        assert_eq!(
+            missing_dirs(&deep).unwrap(),
+            vec![base.join("a").join("b").join("c"), base.join("a").join("b")]
+        );
+        std::fs::create_dir_all(&deep).unwrap();
+        assert!(missing_dirs(&deep).unwrap().is_empty());
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]

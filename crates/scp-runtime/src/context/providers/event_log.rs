@@ -403,14 +403,46 @@ impl MerkleEventLogProvider {
     /// Returns [`ContextCreationError::EventLogFailed`] if loading the stored
     /// log fails or its events fail hash-chain verification. The in-memory
     /// log and the stored log are then unchanged, so a later append cannot
-    /// overwrite stored units.
+    /// overwrite stored units. When the context then has no log in memory, the
+    /// restore also releases the context's write gate, so a failed restore
+    /// leaves no gate behind.
     pub async fn restore_event_log(
         &self,
         context_id: &[u8; 32],
     ) -> Result<EventLogRestore, ContextCreationError> {
-        let context_id_hex = hex::encode(context_id);
-        let _write = self.lock_write_gate(context_id).await?;
+        let write = self.lock_write_gate(context_id).await?;
+        match self.load_log_for_restore(context_id).await {
+            Ok((log, restore)) => {
+                let mut logs = self
+                    .logs
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                logs.insert(*context_id, ContextLog::from_log(log));
+                Ok(restore)
+            }
+            Err(e) => {
+                drop(write);
+                let has_log = self
+                    .logs
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains_key(context_id);
+                if !has_log {
+                    self.release_write_gate(context_id);
+                }
+                Err(e)
+            }
+        }
+    }
 
+    /// Loads and verifies a context's stored log for [`Self::restore_event_log`],
+    /// or starts an empty log when storage holds none. The caller holds the
+    /// context's write gate.
+    async fn load_log_for_restore(
+        &self,
+        context_id: &[u8; 32],
+    ) -> Result<(EventLog, EventLogRestore), ContextCreationError> {
+        let context_id_hex = hex::encode(context_id);
         let stored = match self.persistence.as_ref() {
             None => None,
             Some(persistence) => persistence
@@ -422,7 +454,7 @@ impl MerkleEventLogProvider {
                     ))
                 })?,
         };
-        let (log, restore) = match stored {
+        Ok(match stored {
             Some(entries) => (
                 rebuild_log_from_events(context_id, &entries)?,
                 EventLogRestore::Loaded {
@@ -430,14 +462,7 @@ impl MerkleEventLogProvider {
                 },
             ),
             None => (EventLog::new(context_id_hex), EventLogRestore::Absent),
-        };
-
-        let mut logs = self
-            .logs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        logs.insert(*context_id, ContextLog::from_log(log));
-        Ok(restore)
+        })
     }
 
     /// Prunes event log entries before a checkpoint boundary based on a
@@ -642,7 +667,8 @@ impl MerkleEventLogProvider {
     /// Every path that removes a context's log from this provider must call
     /// this after its own permit drops; otherwise the gate stays in
     /// `write_gates` for the life of the provider. `destroy_event_log` is
-    /// that path today.
+    /// one such path; a restore that fails while the context has no log in
+    /// memory is another.
     ///
     /// Every writer clones the gate inside [`Self::write_gate`] under the
     /// map's shard lock, and `remove_if` reads the clone count under that same
@@ -2353,6 +2379,10 @@ mod tests {
         assert!(
             restored.entries(&ctx_id).is_none(),
             "a failed restore installs no log"
+        );
+        assert!(
+            !restored.write_gates.contains_key(&ctx_id),
+            "a failed restore leaves no write gate behind"
         );
         assert!(
             restored

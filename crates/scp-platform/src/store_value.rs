@@ -129,19 +129,32 @@ pub fn from_stored_value_bytes<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, S
     Ok(envelope.data)
 }
 
-/// Validates a storage key component, rejecting path-traversal characters.
+/// The prefix `FilesystemStorage` gives its temp files. No key component may
+/// start with it, on any backend, so no stored key is one that
+/// `FilesystemStorage` skips as a temp file (spec section 17.3).
+pub const TEMP_FILE_PREFIX: &str = ".tmp.";
+
+/// Validates a storage key component, rejecting path-traversal characters
+/// and the temp file prefix.
 ///
 /// Rejects strings containing `/`, `\`, `..`, or null bytes to prevent storage
-/// path-traversal attacks. Every component interpolated into a storage key
-/// (DIDs, context ids, outlet ids, …) must pass through this gate before being
-/// formatted into a key.
+/// path-traversal attacks, and strings starting with [`TEMP_FILE_PREFIX`],
+/// which `FilesystemStorage` reserves for its temp files. Every component
+/// interpolated into a storage key (DIDs, context ids, outlet ids, …) must
+/// pass through this gate before being formatted into a key.
 ///
 /// # Errors
 ///
 /// Returns [`StoreValueError::InvalidKeyComponent`] if the input contains
-/// forbidden characters (`/`, `\`, `..`, or null bytes).
+/// forbidden characters (`/`, `\`, `..`, or null bytes) or starts with
+/// [`TEMP_FILE_PREFIX`].
 pub fn sanitize_key_component(s: &str) -> Result<&str, StoreValueError> {
-    if s.contains('/') || s.contains('\\') || s.contains("..") || s.contains('\0') {
+    if s.contains('/')
+        || s.contains('\\')
+        || s.contains("..")
+        || s.contains('\0')
+        || s.starts_with(TEMP_FILE_PREFIX)
+    {
         return Err(StoreValueError::InvalidKeyComponent(s.to_owned()));
     }
     Ok(s)
@@ -168,6 +181,21 @@ pub fn identity_document_key(did: &str) -> Result<String, StoreValueError> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sanitize_key_component_refuses_the_temp_file_prefix() {
+        assert!(matches!(
+            sanitize_key_component(".tmp.123"),
+            Err(StoreValueError::InvalidKeyComponent(_))
+        ));
+        assert!(matches!(
+            sanitize_key_component(".tmp."),
+            Err(StoreValueError::InvalidKeyComponent(_))
+        ));
+        // Only a leading prefix is reserved.
+        assert_eq!(sanitize_key_component("a.tmp.b").unwrap(), "a.tmp.b");
+        assert_eq!(sanitize_key_component(".tmpx").unwrap(), ".tmpx");
+    }
 
     #[test]
     fn stored_value_roundtrip_via_named_msgpack() {

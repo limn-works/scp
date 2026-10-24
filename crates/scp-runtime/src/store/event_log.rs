@@ -156,8 +156,9 @@ const MERKLE_EVENT_LOG_REPLACE_UNIT_ENTRIES: usize = 256;
 
 /// The value of `merkle_event_log/head`: the generation that holds the live
 /// log and the log's total entry count (spec section 17.3, "Merkle event log
-/// entries"). Units at or beyond `len` are left from an append that crashed
-/// before its `head` put, and a load ignores them.
+/// entries"). A unit at or beyond `len` is left from an append that crashed
+/// before its `head` put, or is another writer's append in flight; a load
+/// ignores it and the next append at `len` overwrites it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct MerkleEventLogHead {
     /// The generation whose units form the live log.
@@ -821,10 +822,12 @@ impl<S: Storage> ProtocolRepository<S> {
     /// Reads `merkle_event_log/head`, then the units under the generation it
     /// names in key order, up to the length it records. Returns `None` when
     /// no `head` exists, and then deletes nothing. Deletes, best-effort, every
-    /// generation below `head`'s, which a replace or a destroy left behind,
-    /// and every unit at or beyond the recorded length, which an append that
-    /// failed before its `head` put left behind. A generation above `head`'s
-    /// can be a replace still in flight, so load leaves it in place.
+    /// generation below `head`'s, which a replace or a destroy left behind.
+    /// Ignores, and never deletes, a unit at or beyond the recorded length:
+    /// an append that failed before its `head` put left it, or another
+    /// writer's append is in flight, and the next append at that length
+    /// overwrites it. A generation above `head`'s can be a replace still in
+    /// flight, so load leaves it in place.
     ///
     /// # Errors
     ///
@@ -867,7 +870,6 @@ impl<S: Storage> ProtocolRepository<S> {
         }
 
         let mut entries: Vec<scp_event_log::Event> = Vec::new();
-        let mut orphans = Vec::new();
         for key in unit_keys {
             let suffix = key.get(live_prefix.len()..).unwrap_or_default();
             let base_seq: u64 = suffix
@@ -879,8 +881,11 @@ impl<S: Storage> ProtocolRepository<S> {
                         "event log unit key does not end in a 20-digit sequence: {key}"
                     ))
                 })?;
+            // A unit at or beyond `len` is not part of the log: an append
+            // whose `head` put failed, or one still in flight, left it. Load
+            // ignores it and never deletes it; the next append at `len`
+            // overwrites it, and a replace's generation cleanup removes it.
             if base_seq >= head.len {
-                orphans.push(key);
                 continue;
             }
             let expected = entry_count(entries.len())?;
@@ -907,7 +912,7 @@ impl<S: Storage> ProtocolRepository<S> {
                 loaded,
             });
         }
-        self.delete_stale_event_log_keys(context_id, &stale_generations, &orphans)
+        self.delete_stale_event_log_generations(context_id, &stale_generations)
             .await;
         Ok(Some(entries))
     }
@@ -940,13 +945,11 @@ impl<S: Storage> ProtocolRepository<S> {
         Ok(())
     }
 
-    /// Deletes, best-effort, the generations below `head`'s and the units
-    /// beyond `head`'s length.
-    async fn delete_stale_event_log_keys(
+    /// Deletes, best-effort, the generations below `head`'s.
+    async fn delete_stale_event_log_generations(
         &self,
         context_id: &str,
         stale_generations: &std::collections::BTreeSet<String>,
-        orphan_units: &[String],
     ) {
         for stale in stale_generations {
             if let Err(e) = self.storage.delete_prefix(stale).await {
@@ -955,16 +958,6 @@ impl<S: Storage> ProtocolRepository<S> {
                     prefix = %stale,
                     error = %e,
                     "deleting a stale event log generation failed; the next load retries"
-                );
-            }
-        }
-        for orphan in orphan_units {
-            if let Err(e) = self.storage.delete(orphan).await {
-                tracing::warn!(
-                    context_id,
-                    key = %orphan,
-                    error = %e,
-                    "deleting an event log unit beyond the head's length failed; the next load retries"
                 );
             }
         }
@@ -2009,9 +2002,11 @@ mod tests {
     }
 
     /// A unit at or beyond the head's length, which an append that failed
-    /// before its `head` put leaves, is ignored and deleted.
+    /// before its `head` put leaves, is ignored and left in place: another
+    /// writer may be mid-append. The next append at the head's length
+    /// overwrites it, and the log then loads with that append's entries.
     #[tokio::test]
-    async fn unit_beyond_the_head_length_is_ignored_and_deleted() {
+    async fn unit_beyond_the_head_length_is_ignored_and_kept() {
         let store = make_store();
         let base = merkle_events(0, 2);
         store
@@ -2030,9 +2025,25 @@ mod tests {
             .unwrap();
         assert_eq!(log_bytes(&loaded), log_bytes(&base));
         assert!(
-            !store.storage.exists(&orphan).await.unwrap(),
-            "the load deletes the unit beyond the head's length"
+            store.storage.exists(&orphan).await.unwrap(),
+            "the load leaves the unit beyond the head's length in place"
         );
+
+        // The next append at the head's length overwrites the orphan.
+        let mut next = merkle_events(2, 1);
+        next[0].timestamp += 1;
+        store
+            .store_merkle_event_log_unit("ctx-1", 2, &next)
+            .await
+            .unwrap();
+        let loaded = store
+            .load_merkle_event_log_entries("ctx-1")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut expected = base.clone();
+        expected.extend(next);
+        assert_eq!(log_bytes(&loaded), log_bytes(&expected));
     }
 
     /// Load deletes a generation below the head's and leaves one above it,
