@@ -397,7 +397,7 @@ impl PseudonymRotationState {
 
     /// Discards the grace state and the query-only list when the member leaves
     /// the context or the context closes or expires (spec 09 §9.10.4.1 "Leave,
-    /// close and expiry during a grace"). A terminal context announces nothing
+    /// close and expiry"). A terminal context announces nothing
     /// further, so the pending announcement and membership trigger go too.
     pub fn discard_grace(&mut self) {
         self.previous = None;
@@ -452,7 +452,7 @@ pub(crate) fn note_member_added(state: &mut PerContextState, local_did: &str, ad
 /// member's rotation state, inside the Class-S commit that applies it. Another
 /// member's departure triggers a rotation under `on_membership_change` (spec 09
 /// §9.10.4.1 "Membership trigger"); the local member's own departure discards
-/// its grace state ("Leave, close and expiry during a grace").
+/// its grace state ("Leave, close and expiry").
 pub(crate) fn note_member_removed(state: &mut PerContextState, local_did: &str, removed_did: &str) {
     if removed_did == local_did {
         state.class_s.pseudonym_rotation.discard_grace();
@@ -495,8 +495,8 @@ pub(crate) struct ProcessedCommit {
 /// - **Membership trigger:** when the Commit applies at least one `AddMember` or
 ///   `RemoveMember`, it records one pending rotation unless the local member is
 ///   the committer (it rotates after its own commit) or is removed. A removed
-///   local member discards its grace instead ("Leave, close and expiry during a
-///   grace"). [`PseudonymRotationState::note_membership_change`] records
+///   local member discards its rotation state instead ("Leave, close and
+///   expiry"). [`PseudonymRotationState::note_membership_change`] records
 ///   nothing unless the policy sets `on_membership_change`.
 ///
 /// It reads the membership change from the MLS leaf diff, which no
@@ -540,15 +540,16 @@ pub(crate) fn note_processed_commit(
 /// The local member's routing IDs in one context (spec 09 §9.10.4.1), the
 /// answer to [`Supervisor::local_routing_ids`](crate::context::supervisor::supervisor::Supervisor::local_routing_ids).
 ///
-/// A subscriber holds `current` and, while it is set, `previous`; a rotation
-/// driver derives at `next_pseudonym_epoch` and re-publishes the announcement
-/// while `announce_pending` is set.
+/// A subscriber holds `current` only: at a rotation it unsubscribes from the
+/// previous routing ID, which stays on `query_only` for reconnect catch-up
+/// (spec 09 §9.10.4.1 "Subscription"). A rotation driver derives at
+/// `next_pseudonym_epoch` and re-publishes the announcement while
+/// `announce_pending` is set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalRoutingIds {
-    /// The routing ID peers address now.
+    /// The routing ID peers address now, and the only pseudonym routing ID a
+    /// subscriber holds.
     pub current: [u8; 32],
-    /// The previous routing ID, only while its grace runs by the wall clock.
-    pub previous: Option<GraceRoutingId>,
     /// The query-only routing IDs whose expiry the wall clock has not reached,
     /// in rotation order. Reconnect catch-up queries each one; no subscribe
     /// loop subscribes to one (spec 09 §9.10.4.1 "Query-only list").
@@ -854,30 +855,8 @@ mod tests {
         assert!(!rotation.membership_change_pending);
     }
 
-    /// `local_routing_ids` reports the previous routing ID only while its
-    /// grace runs by the wall clock, even before the grace arm has dropped it.
-    #[test]
-    fn local_routing_ids_reports_the_previous_routing_id_only_during_its_grace() {
-        let policy = interval_policy();
-        let mut state = context_state(Some(policy));
-        state
-            .class_s
-            .pseudonym_rotation
-            .record_rotation(1, [9; 32], Some(&policy), T0 + I)
-            .unwrap();
-        let grace_end = T0 + I + PSEUDONYM_ROTATION_GRACE_SECS;
-        let during =
-            crate::context::queries_helpers::local_routing_ids(&state, grace_end - 1).unwrap();
-        assert_eq!(during.previous.map(|p| p.routing_id), Some([9; 32]));
-        let after = crate::context::queries_helpers::local_routing_ids(&state, grace_end).unwrap();
-        assert_eq!(after.previous, None);
-        assert!(state.class_s.pseudonym_rotation.previous().is_some());
-        assert_eq!(after.pseudonym_epoch, Some(1));
-        assert!(after.announce_pending);
-    }
-
-    /// Spec 09 §9.10.4.1 "Query-only list": after the grace, the previous
-    /// routing ID stays on the query-only list until rotation time +
+    /// Spec 09 §9.10.4.1 "Query-only list": from the moment of the rotation,
+    /// the previous routing ID is on the query-only list until rotation time +
     /// `MAX_BLOB_TTL`, and `local_routing_ids` reports it until then.
     #[test]
     fn local_routing_ids_reports_a_query_only_routing_id_until_its_expiry() {
@@ -889,13 +868,10 @@ mod tests {
             .record_rotation(1, [9; 32], Some(&policy), T0 + I)
             .unwrap();
         let expiry = T0 + I + u64::from(scp_relay_client::MAX_BLOB_TTL);
-        let after_grace = crate::context::queries_helpers::local_routing_ids(
-            &state,
-            T0 + I + PSEUDONYM_ROTATION_GRACE_SECS,
-        )
-        .unwrap();
+        let at_rotation =
+            crate::context::queries_helpers::local_routing_ids(&state, T0 + I).unwrap();
         assert_eq!(
-            after_grace.query_only,
+            at_rotation.query_only,
             vec![QueryOnlyRoutingId {
                 routing_id: [9; 32],
                 expires_at_secs: expiry,
@@ -946,8 +922,8 @@ mod tests {
         );
     }
 
-    /// Spec 09 §9.10.4.1 "Leave, close and expiry during a grace": leaving
-    /// discards the query-only list along with the grace.
+    /// Spec 09 §9.10.4.1 "Leave, close and expiry": leaving discards the
+    /// query-only list.
     #[test]
     fn leaving_discards_the_query_only_list() {
         let policy = membership_policy();

@@ -376,7 +376,7 @@ mod tests {
             .send_message(
                 &ctx_id,
                 b"encrypted-payload",
-                BlobTtl::fresh(scp_protocol::envelope::outer::BlobClass::Message),
+                BlobTtl::for_message_type(scp_protocol::envelope::inner::MessageType::Content),
             )
             .await;
         assert!(result.is_ok());
@@ -390,20 +390,33 @@ mod tests {
     /// (`09-security-model.md` §9.10.2 "Blob TTL by message type").
     #[tokio::test]
     async fn send_message_frames_the_requested_blob_ttl() {
-        use scp_protocol::envelope::outer::BlobClass;
+        use scp_protocol::envelope::inner::MessageType;
         let provider = RelayTransportProvider::new(TestAdapter::new());
 
-        for (class, want) in [
-            (BlobClass::Message, scp_relay_client::MAX_BLOB_TTL),
-            (BlobClass::Heartbeat, 240),
-            (BlobClass::ConsistencyCheckpoint, 1_200),
+        for (kind, ttl, want) in [
+            ("commit", BlobTtl::commit(), scp_relay_client::MAX_BLOB_TTL),
+            (
+                "content",
+                BlobTtl::for_message_type(MessageType::Content),
+                scp_relay_client::MAX_BLOB_TTL,
+            ),
+            (
+                "heartbeat",
+                BlobTtl::for_message_type(MessageType::Heartbeat),
+                240,
+            ),
+            (
+                "checkpoint",
+                BlobTtl::for_message_type(MessageType::ConsistencyCheckpoint),
+                1_200,
+            ),
         ] {
             provider
-                .send_message(&[6u8; 32], b"mls-message", BlobTtl::fresh(class))
+                .send_message(&[6u8; 32], b"mls-message", ttl)
                 .await
                 .unwrap();
-            let ttl = provider.adapter.last_blob_ttl.load(Ordering::Relaxed);
-            assert_eq!(ttl, want, "{class:?}");
+            let got = provider.adapter.last_blob_ttl.load(Ordering::Relaxed);
+            assert_eq!(got, want, "{kind}");
         }
     }
 
@@ -436,8 +449,8 @@ mod tests {
             .send_message(
                 &ctx_id,
                 b"data",
-                scp_protocol::envelope::outer::BlobTtl::fresh(
-                    scp_protocol::envelope::outer::BlobClass::Message,
+                scp_protocol::envelope::outer::BlobTtl::for_message_type(
+                    scp_protocol::envelope::inner::MessageType::Content,
                 ),
             )
             .await;

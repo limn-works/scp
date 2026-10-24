@@ -469,7 +469,7 @@ fn assert_vector_58() {
             rejected(V58_REJECT_COLLISION),
         ),
         (
-            "receiver's in-grace previous routing ID",
+            "receiver's query-only routing ID",
             golden,
             Some(empty.clone()),
             vec![[0x45u8; 32], V58_ROUTING_ID],

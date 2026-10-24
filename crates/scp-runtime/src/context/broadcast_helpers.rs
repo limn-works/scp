@@ -540,9 +540,7 @@ async fn apply_guarded(
     // A broadcast post requests the relay maximum as its delivery lifetime,
     // like every other message to a context (spec 09 §9.10.2 "Blob TTL by
     // message type").
-    let ttl = scp_protocol::envelope::outer::BlobTtl::fresh(
-        scp_protocol::envelope::outer::BlobClass::Message,
-    );
+    let ttl = scp_protocol::envelope::outer::BlobTtl::broadcast_post();
     deps.transport
         .send_message(routing_id, &envelope_bytes, ttl)
         .await?;

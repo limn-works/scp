@@ -18225,9 +18225,9 @@ impl Supervisor {
     }
 
     /// Returns the push-wake pull target of every `Active` context (ADR-029
-    /// §2, push-wake pull mode): its ID, persisted relay set, and every
-    /// routing ID at which a blob for this device arrives, including the
-    /// previous pseudonym while its grace runs.
+    /// §2, push-wake pull mode): its ID, persisted relay set, and the routing
+    /// IDs the pull queries, the shared and the current pseudonym routing ID.
+    /// A routing ID on the query-only list is left to reconnect catch-up.
     ///
     /// Asks every context in [`Self::known_context_ids`] concurrently through
     /// [`Self::dispatch_push_command`]. A context that is not `Active`, or
@@ -18374,8 +18374,8 @@ impl Supervisor {
     }
 
     /// Returns the local member's routing IDs and rotation state (spec 09
-    /// §9.10.4.1) for `context_id`: the current routing ID, the previous one
-    /// while its grace runs, the epoch, the epoch the next rotation must
+    /// §9.10.4.1) for `context_id`: the current routing ID, the live
+    /// query-only routing IDs, the epoch, the epoch the next rotation must
     /// carry, and whether an announcement is pending. Routes through the
     /// actor mailbox via [`Self::dispatch_query`].
     ///

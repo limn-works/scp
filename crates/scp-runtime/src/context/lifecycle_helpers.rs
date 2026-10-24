@@ -545,9 +545,7 @@ pub async fn drain_and_deliver_sender_keys(
                 Ok(sealed) => {
                     // A sealed management message requests the relay maximum
                     // (spec 09 §9.10.2 "Blob TTL by message type").
-                    let ttl = scp_protocol::envelope::outer::BlobTtl::fresh(
-                        scp_protocol::envelope::outer::BlobClass::Message,
-                    );
+                    let ttl = scp_protocol::envelope::outer::BlobTtl::sealed_management();
                     if let Err(e) = deps.transport.send_message(&routing_id, &sealed, ttl).await {
                         tracing::warn!(target_did = %target_did, context_id = %context_id, error = %e, "failed to send rotated sender key");
                     }
@@ -766,7 +764,7 @@ pub async fn close_context_with_key(
         // The context is terminal at this point, so the routing axis no longer
         // needs to agree with the (also torn-down) crypto axis.
         state.routing = ContextRouting::Broadcast;
-        // §9.10.4.1 "Leave, close and expiry during a grace": a terminal
+        // §9.10.4.1 "Leave, close and expiry": a terminal
         // context drops its previous routing ID and pending rotation work.
         state.class_s.pseudonym_rotation.discard_grace();
 

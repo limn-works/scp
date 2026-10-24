@@ -309,7 +309,7 @@ pub async fn tombstone_migrated_context(
             migration_proposal_id: migration_pid,
         };
         emit(state, tombstone_event, context_id, deps);
-        // §9.10.4.1 "Leave, close and expiry during a grace": a terminal
+        // §9.10.4.1 "Leave, close and expiry": a terminal
         // context drops its previous routing ID and pending rotation work.
         state.class_s.pseudonym_rotation.discard_grace();
 
@@ -2138,7 +2138,7 @@ pub async fn execute_close_context(
         state.ttl.timer.deadline_unix_secs = None;
         state.broadcast_context = None;
         state.governance.decay_participation();
-        // §9.10.4.1 "Leave, close and expiry during a grace": a terminal
+        // §9.10.4.1 "Leave, close and expiry": a terminal
         // context drops its previous routing ID and pending rotation work.
         state.class_s.pseudonym_rotation.discard_grace();
         Ok(())
@@ -6697,9 +6697,7 @@ pub async fn try_broadcast_commit(
     // retried copy outlives a copy this attempt may have stored (spec 09
     // §9.10.2 "Republish rule").
     let now = deps.clock.now_secs();
-    let ttl = scp_protocol::envelope::outer::BlobTtl::fresh(
-        scp_protocol::envelope::outer::BlobClass::Message,
-    );
+    let ttl = scp_protocol::envelope::outer::BlobTtl::commit();
     match publish_commit(deps.transport.as_ref(), routing_id, &commit_bytes, ttl).await {
         Ok(()) => None,
         Err(e) => {
@@ -6730,7 +6728,7 @@ pub async fn try_broadcast_commit(
 // most one hour ahead. `u64::from` is not const, so the widening is `as`.
 const _: () = assert!(
     scp_mls::KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS
-        >= scp_protocol::envelope::outer::BlobClass::Message.ttl_secs() as u64
+        >= scp_protocol::envelope::outer::BlobTtl::commit().secs() as u64
             + scp_mls::KEY_PACKAGE_LIFETIME_MARGIN_SECS
 );
 const _: () = assert!(

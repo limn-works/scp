@@ -948,8 +948,7 @@ async fn compute_commit_retry_outcomes(
         // Commit with none left is not republished (spec 09 §9.10.2
         // "Republish rule"), so no relay holds a copy past the first
         // attempt's expiry, which the KeyPackage minimum lifetime covers.
-        let ttl = match scp_protocol::envelope::outer::BlobTtl::republish(
-            scp_protocol::envelope::outer::BlobClass::Message,
+        let ttl = match scp_protocol::envelope::outer::BlobTtl::republish_commit(
             pending.first_attempt_at,
             now,
         ) {
