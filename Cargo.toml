@@ -401,6 +401,10 @@ opt-level = 0
 # `fuzz/Cargo.toml`, `scaffolds/relay`, `scaffolds/rust-client`,
 # `templates/cross-context-bridge` and `templates/personal-relay`. Each has its own
 # `[workspace]`, so a patch here does not reach them.
+# Release swap: once an openmls release carries the RustCrypto 0.14 move, delete
+# this block from all six Cargo roots and the openmls `allow-git` entry in
+# `deny.toml`, and raise the openmls requirements if that release changes their
+# versions (openmls 0.10, openmls_traits 0.7).
 [patch.crates-io]
 openmls = { git = "https://github.com/openmls/openmls", rev = "be248d4b1306d87a641ce24ed0ffcab2b27967f6" }
 openmls_traits = { git = "https://github.com/openmls/openmls", rev = "be248d4b1306d87a641ce24ed0ffcab2b27967f6" }
