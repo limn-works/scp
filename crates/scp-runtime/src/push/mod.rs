@@ -26,11 +26,11 @@
 //! `timestamp`, and the retry is a new request, signed with the clock's
 //! second at that time, which is above every `timestamp` sent before. The
 //! retries end once one relay has answered `4062` to every message of one
-//! request for more than [`PUSH_TIMESTAMP_SKEW_SECS`] of the device clock:
-//! a timestamp floor the relay holds clears inside that span, so a relay
-//! still refusing after it is refusing the device clock itself, and the
-//! registrar records the refusal as it records any other (§10.7.1
-//! **Freshness**).
+//! request for more than [`STALE_RUN_BOUND_SECS`] (twice
+//! [`PUSH_TIMESTAMP_SKEW_SECS`]) of the device clock: a timestamp floor the
+//! relay holds clears within twice the skew window, so a relay still
+//! refusing after it is refusing the device clock itself, and the registrar
+//! records the refusal as it records any other (§10.7.1 **Freshness**).
 //!
 //! [`PushRegistrar::spawn_trigger`] moves the registrar into one task, which
 //! serializes every reconcile and command. The task reconciles at start and
@@ -79,6 +79,19 @@ const MAX_SECOND_WAITS: u32 = 3;
 /// Capacity of the command channel into the trigger task. Each command waits
 /// for its reply, so a caller holds at most one slot.
 const COMMAND_CAPACITY: usize = 4;
+
+/// How many seconds of the device clock a run of `4062` answers to one
+/// request may span before the registrar stops retrying it.
+///
+/// Let `t1` be the device second of the first `4062`, `d` the relay's clock
+/// minus the device's, and `F` the floor the relay holds (the last
+/// `timestamp` it accepted). The relay accepted `F` at a relay second at or
+/// below `t1 + d`, and only if `F` was at most [`PUSH_TIMESTAMP_SKEW_SECS`]
+/// ahead of it, so `F <= t1 + d + PUSH_TIMESTAMP_SKEW_SECS`. While the relay
+/// accepts the device clock at all, `|d| <= PUSH_TIMESTAMP_SKEW_SECS`, so
+/// `F <= t1 + 2 * PUSH_TIMESTAMP_SKEW_SECS`, and every `timestamp` sent more
+/// than this many seconds after `t1` is above `F` (§10.7.1 **Freshness**).
+const STALE_RUN_BOUND_SECS: u64 = 2 * PUSH_TIMESTAMP_SKEW_SECS;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -165,13 +178,15 @@ pub enum PushError {
         msg: String,
     },
     /// The relay answered `4062` to every message of one request for more
-    /// than [`PUSH_TIMESTAMP_SKEW_SECS`] of the device clock, measured from
-    /// the first of those answers. A floor the relay holds (the last
-    /// `timestamp` it accepted) clears inside that span, so this relay is
-    /// refusing the device clock, which is outside the relay's skew window
-    /// (§10.7.1 **Freshness**). The registrar does not send the request
-    /// again until the routing-ID set or the token changes or a
-    /// [`PushRegistrarTask::register`] command arrives.
+    /// than [`STALE_RUN_BOUND_SECS`] of the device clock, measured from the
+    /// first of those answers. A floor the relay holds (the last `timestamp`
+    /// it accepted) clears within that span, so this relay is refusing the
+    /// device clock, which is outside the relay's skew window (§10.7.1
+    /// **Freshness**). The registrar does not send a refused registration
+    /// again until the routing-ID set or the token changes, nor a refused
+    /// deregistration until the relay is wanted again under the current
+    /// token; a [`PushRegistrarTask::register`] or
+    /// [`PushRegistrarTask::deregister_all`] command clears either.
     #[error(
         "relay refused every push timestamp as stale (4062) for {span_secs} s of the device clock: {msg}"
     )]
@@ -579,7 +594,8 @@ struct StaleRun {
 enum StaleBound {
     /// Keep them while their request is still the one the registrar sends.
     Keep,
-    /// Drop them: a [`PushRegistrarTask::register`] command.
+    /// Drop them: a [`PushRegistrarTask::register`] or
+    /// [`PushRegistrarTask::deregister_all`] command.
     Clear,
 }
 
@@ -725,8 +741,9 @@ impl<C: KeyCustody, S: Storage> PushRegistrar<C, S> {
     }
 
     /// Replaces the device token (§10.7.1 **Token refresh**): each relay the
-    /// ledger lists for the old token gets a `PushDeregistration` of it, and
-    /// then each relay that had accepted a registration gets a
+    /// ledger lists for the old token gets a `PushDeregistration` of it,
+    /// except a relay that refused that deregistration for good (ADR-004),
+    /// and then each relay that had accepted a registration gets a
     /// `PushRegistration` of the same routing IDs for `new_token`. The
     /// registration is sent whatever the deregistration's outcome, because
     /// the relay's 3-failure rule removes an old token never deregistered. A
@@ -749,11 +766,13 @@ impl<C: KeyCustody, S: Storage> PushRegistrar<C, S> {
         let previous = std::mem::take(&mut self.accepted);
         let mut outcomes = RelayOutcomes::default();
         let mut relays = Vec::new();
-        for ((relay_url, _), record) in self
-            .ledger
-            .iter()
-            .filter(|((_, hash), _)| *hash == old_hash)
-        {
+        let refused = &self.refused;
+        for ((relay_url, _), record) in self.ledger.iter().filter(|(key, _)| {
+            key.1 == old_hash
+                && !refused
+                    .get(*key)
+                    .is_some_and(|refusal| refusal.request == Request::Deregistration)
+        }) {
             match PushRelay::direct(relay_url) {
                 Ok(relay) => relays.push((relay, record.platform)),
                 Err(err) => {
@@ -941,7 +960,7 @@ impl<C: KeyCustody, S: Storage> PushRegistrar<C, S> {
 
     /// Settles a failed publish of `request` on `key`. A `4062` extends the
     /// key's run and becomes [`PushError::StaleBeyondSkew`] once the run spans
-    /// more than [`PUSH_TIMESTAMP_SKEW_SECS`] of the device clock; any other
+    /// more than [`STALE_RUN_BOUND_SECS`] of the device clock; any other
     /// relay answer ends the run, and an unreachable relay leaves it. A
     /// terminal refusal is recorded so the request is not sent again.
     fn settle_failure(&mut self, key: RelayKey, request: Request, err: PushError) -> PushError {
@@ -971,7 +990,7 @@ impl<C: KeyCustody, S: Storage> PushRegistrar<C, S> {
         match self.stale_runs.get(key) {
             Some(run) if run.request == *request => {
                 let span_secs = now.saturating_sub(run.first_secs);
-                if span_secs > PUSH_TIMESTAMP_SKEW_SECS {
+                if span_secs > STALE_RUN_BOUND_SECS {
                     self.stale_runs.remove(key);
                     return PushError::StaleBeyondSkew { msg, span_secs };
                 }
@@ -1306,7 +1325,10 @@ impl<C: KeyCustody, S: Storage> PushRegistrar<C, S> {
             }
             RegistrarCommand::DeregisterAll { reply } => {
                 self.enabled = false;
-                (self.reconcile(supervisor).await, reply)
+                (
+                    self.reconcile_with(supervisor, StaleBound::Clear).await,
+                    reply,
+                )
             }
             RegistrarCommand::Register { reply } => {
                 self.enabled = true;
@@ -1457,7 +1479,9 @@ impl PushRegistrarTask {
     /// Deregisters the token at every relay the ledger lists and stops
     /// registering: until [`Self::register`], every reconcile wants no
     /// routing ID, so a relay whose deregistration failed is sent it again
-    /// and a relay that accepts it leaves the ledger.
+    /// and a relay that accepts it leaves the ledger. It also drops every
+    /// refusal recorded as [`PushError::StaleBeyondSkew`], so a logout sends
+    /// those relays their deregistration again.
     ///
     /// # Errors
     ///
