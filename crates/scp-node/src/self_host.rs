@@ -1807,8 +1807,9 @@ where
 
     // The BEP44 sequence counter was bootstrapped inside the builder ahead of
     // the startup publish (SCP-RELAYRES-004): `build_host_site_node` →
-    // `build_no_domain_inner` calls `initialize_sequence_for_mode` before
-    // `seed_from_startup_publish`, so the node above already published at the
+    // `build_no_domain_inner` → `seed_from_startup_publish` reserves the
+    // startup entries, then calls `initialize_sequence_for_mode`, then
+    // publishes, so the node above already published at the
     // correct next sequence. No post-build seq step here.
     let node_did = node.identity().did().to_owned();
 

@@ -1139,7 +1139,11 @@ mod tests {
             scp_transport::relay::push_gate::RelayUrl::new("ws://198.51.100.7:32891/scp/v1")
                 .expect("canonical test URL"),
         );
-        NodePublisher::new(Arc::clone(did_method), DhtMode::Memory, relay)
+        NodePublisher::new(
+            Arc::clone(did_method),
+            DhtMode::Memory,
+            &scp_transport::native::server::RelayConfig::defaults(relay),
+        )
     }
 
     /// The node's live slot as the builders construct it: the startup publish's

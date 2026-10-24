@@ -3482,18 +3482,14 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
     // read the same live type and a future update site cannot leave a reader
     // behind. See `LiveSlot`.
     //
-    // FIRST bootstrap the publish-sequence counter (Production / Memory) so a
-    // restart's startup publish supersedes the live record instead of colliding
-    // at `seq = 1` (SCP-RELAYRES-004). This MUST precede `seed_from_startup_publish`.
-    //
-    // The publisher is bound to the relay's own live URL handle, so the
+    // The publisher is bound to the live URL handle of `relay_config`, the
+    // configuration this node stores and runs its relay with, so the
     // reservation `seed_from_startup_publish` makes moves this node's relay.
-    initialize_sequence_for_mode(dht_mode, did_method.as_ref(), &identity).await?;
-    let publisher = NodePublisher::new(
-        Arc::clone(&did_method),
-        dht_mode,
-        relay_config.relay_url.clone(),
-    );
+    // `seed_from_startup_publish` reserves, then bootstraps the publish-sequence
+    // counter (Production / Memory) so a restart's startup publish supersedes
+    // the live record instead of colliding at `seq = 1` (SCP-RELAYRES-004), then
+    // publishes.
+    let publisher = NodePublisher::new(Arc::clone(&did_method), dht_mode, &relay_config);
     let live_state = seed_from_startup_publish(&publisher, &identity, &entries).await?;
 
     // Build the rustls ServerConfig from the provisioned certificate.
@@ -3689,8 +3685,11 @@ pub(crate) async fn publish_did_document_for_mode<D: DidMethod + 'static>(
 /// Bootstraps the DID method's monotonic publish-sequence counter ahead of the
 /// node's STARTUP publish — for the modes that actually publish.
 ///
-/// Mirrors [`publish_did_document_for_mode`]'s gate exactly, and must run BEFORE
-/// [`seed_from_startup_publish`] in the builders:
+/// Mirrors [`publish_did_document_for_mode`]'s gate exactly.
+/// [`seed_from_startup_publish`] runs it through
+/// [`DidPublisher::initialize_sequence`](crate::published_state::DidPublisher::initialize_sequence)
+/// after it reserves the startup
+/// document's entries and before it publishes that document:
 ///
 /// - [`DhtMode::Disabled`] publishes nothing, so there is no sequence to
 ///   bootstrap — a no-op success (and it never touches the disabled DHT arm).
@@ -3813,20 +3812,15 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
     //    and the `IdentityHandle` can only receive clones of the slot. See
     //    `LiveSlot`.
     //
-    //    FIRST bootstrap the publish-sequence counter (Production / Memory) so the
-    //    startup publish supersedes any live record a prior run left within its
-    //    TTL, instead of colliding at `seq = 1` (SCP-RELAYRES-004). This MUST
-    //    precede `seed_from_startup_publish` — the publish is inside it.
-    //
-    //    The publisher is bound to the relay's own live URL handle, so the
+    //    The publisher is bound to the live URL handle of `relay_config`, the
+    //    configuration this node stores and runs its relay with, so the
     //    reservation `seed_from_startup_publish` makes, and every reservation
     //    the tier task's `apply_tier_change` makes, moves this node's relay.
-    initialize_sequence_for_mode(dht_mode, did_method.as_ref(), &identity).await?;
-    let publisher = NodePublisher::new(
-        Arc::clone(&did_method),
-        dht_mode,
-        relay_config.relay_url.clone(),
-    );
+    //    `seed_from_startup_publish` reserves, then bootstraps the
+    //    publish-sequence counter (Production / Memory) so the startup publish
+    //    supersedes any live record a prior run left within its TTL instead of
+    //    colliding at `seq = 1` (SCP-RELAYRES-004), then publishes.
+    let publisher = NodePublisher::new(Arc::clone(&did_method), dht_mode, &relay_config);
     let live_state = seed_from_startup_publish(&publisher, &identity, &entries).await?;
 
     tracing::info!(
@@ -5143,7 +5137,7 @@ mod tests {
     /// live `seq = N` record its prior run published, not collide beneath it at
     /// `seq = 1`.
     ///
-    /// The builder now bootstraps the publish-sequence counter
+    /// `seed_from_startup_publish` bootstraps the publish-sequence counter
     /// (`initialize_sequence_for_mode`) BEFORE the startup publish, so the
     /// restart's `seed_from_startup_publish` emits `seq = N + 1`. Against the
     /// pre-fix code — which bootstrapped the counter only AFTER `Node::start`
@@ -5225,7 +5219,7 @@ mod tests {
             .expect("the restarted node carries the record it signed");
 
         // The fix: the startup publish superseded the live record at seq = N + 1.
-        // Without `initialize_sequence` in the builder the fresh counter would
+        // Without `initialize_sequence` before the startup publish the fresh counter would
         // have published seq = 1, colliding beneath the live seq = N record.
         assert_eq!(
             record.sequence,
@@ -6675,6 +6669,14 @@ mod tests {
                 }))
             })
         }
+
+        fn initialize_sequence<'a>(
+            &'a self,
+            _identity: &'a ScpIdentity,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), NodeError>> + Send + 'a>>
+        {
+            Box::pin(async { Ok(()) })
+        }
     }
 
     /// Short interval used in tests instead of the production 30-minute interval.
@@ -7103,6 +7105,14 @@ mod tests {
             >,
         > {
             Box::pin(async { Ok(None) })
+        }
+
+        fn initialize_sequence<'a>(
+            &'a self,
+            _identity: &'a ScpIdentity,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), NodeError>> + Send + 'a>>
+        {
+            Box::pin(async { Ok(()) })
         }
     }
 
@@ -8430,9 +8440,18 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// A `DidPublisher` that records what it was handed and can be made to fail.
+    ///
+    /// Built with [`ScriptedPublisher::observing`], it also records the value
+    /// of a relay handle at each `initialize_sequence` call, so a test can see
+    /// whether the reservation moved the handle before the sequence bootstrap,
+    /// and can make that bootstrap fail.
     struct ScriptedPublisher {
         fail: bool,
         seen: std::sync::Mutex<Vec<DidDocument>>,
+        observed: Option<LiveRelayUrl>,
+        fail_initialize: bool,
+        relay_at_initialize:
+            std::sync::Mutex<Vec<scp_transport::relay::push_gate::ReservedRelayUrls>>,
     }
 
     impl ScriptedPublisher {
@@ -8440,6 +8459,17 @@ mod tests {
             Self {
                 fail,
                 seen: std::sync::Mutex::new(Vec::new()),
+                observed: None,
+                fail_initialize: false,
+                relay_at_initialize: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn observing(relay: LiveRelayUrl, fail_initialize: bool) -> Self {
+            Self {
+                observed: Some(relay),
+                fail_initialize,
+                ..Self::new(false)
             }
         }
     }
@@ -8470,6 +8500,29 @@ mod tests {
                     )))
                 } else {
                     Ok(None)
+                }
+            })
+        }
+
+        fn initialize_sequence<'a>(
+            &'a self,
+            _identity: &'a ScpIdentity,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), NodeError>> + Send + 'a>>
+        {
+            if let Some(relay) = &self.observed {
+                self.relay_at_initialize
+                    .lock()
+                    .expect("scripted publisher lock")
+                    .push(relay.current());
+            }
+            let fail = self.fail_initialize;
+            Box::pin(async move {
+                if fail {
+                    Err(NodeError::Identity(IdentityError::DhtPublishFailed(
+                        "scripted sequence bootstrap failure".to_owned(),
+                    )))
+                } else {
+                    Ok(())
                 }
             })
         }
@@ -8884,6 +8937,86 @@ mod tests {
             .await,
             PushPublishGate::Rejected { code: 4063, .. }
         ));
+    }
+
+    /// The startup publish reserves the entries on the publisher's handle
+    /// before it bootstraps the publish-sequence counter: the handle already
+    /// holds the published entry when `initialize_sequence` runs.
+    #[tokio::test]
+    async fn startup_publish_reserves_before_it_initializes_the_sequence() {
+        use crate::published_state::PublishedEntries;
+        use scp_transport::relay::push_gate::ReservedRelayUrls;
+        let unrelated = RelayUrl::new("ws://203.0.113.9:4000/scp/v1").unwrap();
+        let relay = LiveRelayUrl::new(unrelated.clone());
+        let scripted = Arc::new(ScriptedPublisher::observing(relay.clone(), false));
+        let publisher = NodePublisher::from_dyn(
+            Arc::clone(&scripted) as Arc<dyn DidPublisher>,
+            relay.clone(),
+        );
+        let old = crate::published_state::test_relay(TIER_CHANGE_OLD_URL);
+        let document = slot_test_document(&[TIER_CHANGE_OLD_URL]);
+
+        seed_from_startup_publish(
+            &publisher,
+            &slot_test_identity(),
+            &PublishedEntries::new(&old, &document, slot_test_target()),
+        )
+        .await
+        .expect("the scripted publish succeeds");
+
+        let at_initialize = scripted
+            .relay_at_initialize
+            .lock()
+            .expect("scripted publisher lock")
+            .clone();
+        assert_eq!(
+            at_initialize,
+            vec![ReservedRelayUrls::from(RelayUrl::from(&old))],
+            "the sequence bootstrap runs once, after the reservation moved the handle \
+             off {unrelated:?}"
+        );
+        assert_eq!(
+            scripted.seen.lock().expect("scripted publisher lock").len(),
+            1,
+            "the startup publish publishes once"
+        );
+    }
+
+    /// A failed sequence bootstrap stops the startup publish with the typed
+    /// error, and nothing is published.
+    #[tokio::test]
+    async fn failed_sequence_bootstrap_stops_the_startup_publish() {
+        use crate::published_state::PublishedEntries;
+        let relay = LiveRelayUrl::new(RelayUrl::new("ws://203.0.113.9:4000/scp/v1").unwrap());
+        let scripted = Arc::new(ScriptedPublisher::observing(relay.clone(), true));
+        let publisher =
+            NodePublisher::from_dyn(Arc::clone(&scripted) as Arc<dyn DidPublisher>, relay);
+        let old = crate::published_state::test_relay(TIER_CHANGE_OLD_URL);
+        let document = slot_test_document(&[TIER_CHANGE_OLD_URL]);
+
+        let result = seed_from_startup_publish(
+            &publisher,
+            &slot_test_identity(),
+            &PublishedEntries::new(&old, &document, slot_test_target()),
+        )
+        .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(NodeError::Identity(IdentityError::DhtPublishFailed(ref msg)))
+                    if msg == "scripted sequence bootstrap failure"
+            ),
+            "the bootstrap's typed error reaches the caller"
+        );
+        assert!(
+            scripted
+                .seen
+                .lock()
+                .expect("scripted publisher lock")
+                .is_empty(),
+            "nothing is published after a failed sequence bootstrap"
+        );
     }
 
     /// Moving from tier 3 back to a direct tier clears `bridgeTarget`: the
