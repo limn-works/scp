@@ -245,18 +245,33 @@ pub fn post_join_bookkeeping(
     event_log: &dyn crate::context::builder::ContextEventLogProvider,
 ) {
     let context_id_bytes = super::state::context_id_to_bytes(context_id);
-    let merkle_root = event_log
-        .event_log_merkle_root(&context_id_bytes)
-        .unwrap_or([0u8; 32]);
+    // A participation record is a cache the proposer-eligibility gate
+    // recomputes, failing closed, when it is cold. An unreadable log therefore
+    // leaves the cache cold here; it never caches a record over a zero root.
     // Participation-record path consumes only the merged event set;
     // the consequence window anchor is not used here.
-    let (join_events, _convergent_now) =
-        super::governance_logic::event_log_entries_for_consequences(
-            receive_buffer,
-            context_id,
-            now,
-            event_log,
-        );
+    let read = event_log
+        .event_log_merkle_root(&context_id_bytes)
+        .and_then(|root| {
+            super::governance_logic::event_log_entries_for_consequences(
+                receive_buffer,
+                context_id,
+                now,
+                event_log,
+            )
+            .map(|(events, _convergent_now)| (root, events))
+        });
+    let (merkle_root, join_events) = match read {
+        Ok(read) => read,
+        Err(e) => {
+            tracing::warn!(
+                context_id,
+                error = %e,
+                "event log unreadable; participation cache not initialized"
+            );
+            return;
+        }
+    };
     if !join_events.is_empty()
         && let Ok(record) = scp_protocol::trust::participation::compute_participation_record(
             &join_events,

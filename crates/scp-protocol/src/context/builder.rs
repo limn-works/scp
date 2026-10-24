@@ -353,6 +353,19 @@ pub enum ContextCreationError {
     /// Generic creation failure with a descriptive message.
     #[error("context creation failed: {0}")]
     CreationFailed(String),
+
+    /// Creation failed with `cause`, and its rollback could not destroy the
+    /// event log the creation had initialised, so the stored log outlives
+    /// the failed creation (spec 05 §5.2.1, step 4 rollback).
+    #[error(
+        "context creation failed ({cause}); rollback could not destroy the event log: {rollback}"
+    )]
+    RollbackFailed {
+        /// The failure that started the rollback.
+        cause: Box<Self>,
+        /// The event log destroy failure.
+        rollback: Box<Self>,
+    },
 }
 
 // ---------------------------------------------------------------------------

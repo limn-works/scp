@@ -274,6 +274,9 @@ impl ContextEventLogProvider for ArcEventLogProvider {
     async fn destroy_event_log(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
         self.0.destroy_event_log(id).await
     }
+    async fn release_event_log(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        ContextEventLogProvider::release_event_log(&*self.0, id).await
+    }
     fn event_log_entries(
         &self,
         id: &[u8; 32],
@@ -292,18 +295,25 @@ impl ContextEventLogProvider for ArcEventLogProvider {
     fn event_log_summary(&self, id: &[u8; 32]) -> Result<(usize, [u8; 32]), ContextError> {
         self.0.event_log_summary(id)
     }
-    async fn restore_event_log(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        self.0.restore_event_log(id).await
+    async fn restore_event_log(
+        &self,
+        id: &[u8; 32],
+    ) -> Result<scp_core::context::builder::EventLogRestore, ContextCreationError> {
+        ContextEventLogProvider::restore_event_log(&*self.0, id).await
     }
     async fn prune_before_checkpoint(
         &self,
         id: &[u8; 32],
         checkpoint_event_count: u64,
         policy: &scp_core::context::governance::PruningPolicy,
-    ) -> Option<usize> {
-        self.0
-            .prune_before_checkpoint(id, checkpoint_event_count, policy)
-            .await
+    ) -> Result<Option<usize>, ContextError> {
+        ContextEventLogProvider::prune_before_checkpoint(
+            &*self.0,
+            id,
+            checkpoint_event_count,
+            policy,
+        )
+        .await
     }
 }
 

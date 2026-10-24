@@ -149,6 +149,20 @@ impl ContextEventLogProvider for OkEventLog {
     async fn destroy_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
+    /// This fixture keeps no readable log: no entries for any context.
+    fn event_log_entries(
+        &self,
+        _context_id: &[u8; 32],
+    ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError> {
+        Ok(None)
+    }
+    /// This fixture keeps no readable log: the zero root.
+    fn event_log_merkle_root(
+        &self,
+        _context_id: &[u8; 32],
+    ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+        Ok([0u8; 32])
+    }
 }
 
 /// One member: its cell, production deps, snapshot store and sent payloads.

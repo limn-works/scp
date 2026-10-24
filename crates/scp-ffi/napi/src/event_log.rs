@@ -116,9 +116,14 @@ pub(crate) async fn event_log_query_on(
     // double-hashes a real 64-hex id and queries the wrong event-log key).
     let ctx_id_bytes = scp_core::context::state::context_id_to_bytes(&context_id_str);
 
-    let manager_entries = crate::runtime::supervisor(bi)
-        .ok()
-        .and_then(|supervisor| supervisor.event_log_entries(&ctx_id_bytes).ok().flatten());
+    // A failed read of the supervisor's log is returned, never replaced by
+    // the bridge-local tree (spec 17 §"Event log write failures").
+    let manager_entries = match crate::runtime::supervisor(bi).ok() {
+        Some(supervisor) => supervisor
+            .event_log_entries(&ctx_id_bytes)
+            .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?,
+        None => None,
+    };
 
     if let Some(entries) = manager_entries
         && !entries.is_empty()
@@ -255,10 +260,15 @@ pub(crate) async fn event_log_verify_on(
     // canonical chokepoint (NOT the raw SHA-256 routing primitive, which
     // double-hashes a real 64-hex id and queries the wrong event-log key).
     let ctx_id_bytes = scp_core::context::state::context_id_to_bytes(&context_id);
-    if let Some(entries) = crate::runtime::supervisor(bi)
-        .ok()
-        .and_then(|supervisor| supervisor.event_log_entries(&ctx_id_bytes).ok().flatten())
-    {
+    // A failed read of the supervisor's log is returned, never replaced by
+    // the bridge-local tree (spec 17 §"Event log write failures").
+    let manager_entries = match crate::runtime::supervisor(bi).ok() {
+        Some(supervisor) => supervisor
+            .event_log_entries(&ctx_id_bytes)
+            .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?,
+        None => None,
+    };
+    if let Some(entries) = manager_entries {
         // Precompute the canonical leaf hash for each source event
         // (`SHA-256(0x00 ‖ rmp_serde(Event))`) via the substrate helper so the
         // synced UCAN-state tree commits to byte-identical leaves.

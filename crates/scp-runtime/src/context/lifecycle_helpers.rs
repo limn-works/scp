@@ -3576,28 +3576,36 @@ pub async fn load_persisted_context_state(
     Ok((ctx_snapshot, broadcast_ctx))
 }
 
-/// Best-effort event log restore from persistence.
+/// Restores the context's event log from persistence, failing closed.
+///
+/// Spec 17 §"Event log write failures": an empty log starts only when storage
+/// holds no log ([`EventLogRestore::Absent`]); a failed load or a corrupt
+/// stored log fails the restore with [`ContextError::EventLogFailed`] and
+/// never replaces the stored log with an empty one.
 ///
 /// Takes the restore's floor-guarded crypto, which exists only after the
 /// group's `0xFF02` binding was verified and its floors merged, so a refused
 /// restore never hydrates the log.
+///
+/// [`EventLogRestore::Absent`]: crate::context::builder::EventLogRestore::Absent
 #[allow(dead_code)] // Transitive of `restore_context` — see bootstrap rationale.
-async fn restore_event_log_best_effort(
+async fn restore_event_log_fail_closed(
     deps: &ActorDeps,
     _floor_guarded: &crate::context::restored_crypto::FloorGuardedCrypto,
     context_id: &str,
-) {
+) -> Result<(), ContextError> {
     use crate::context::state::context_id_to_bytes;
-    let ctx_id_bytes = context_id_to_bytes(context_id);
-    if let Err(e) = deps.event_log.restore_event_log(&ctx_id_bytes).await {
-        tracing::warn!(
-            context_id = %context_id,
-            error = %e,
-            "failed to restore event log from persistence; \
-             context will start with an empty event log"
-        );
-        let _ = deps.event_log.init_event_log(&ctx_id_bytes).await;
-    }
+    let restored = deps
+        .event_log
+        .restore_event_log(&context_id_to_bytes(context_id))
+        .await
+        .map_err(|e| {
+            ContextError::EventLogFailed(format!(
+                "restoring the event log of context {context_id} failed: {e}"
+            ))
+        })?;
+    tracing::debug!(context_id = %context_id, ?restored, "event log restored");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -3755,7 +3763,7 @@ pub async fn restore_context(
 
     // Hydrate the event log only now that every refusal has passed. The TTL
     // deadline below reads it for the fail-safe `TtlExtended` term.
-    restore_event_log_best_effort(deps, &restored_crypto, context_id).await;
+    restore_event_log_fail_closed(deps, &restored_crypto, context_id).await?;
 
     // Resolve the ABSOLUTE convergent TTL re-arm deadline through the partitioned
     // single-source deadline (§5.10 / §5.10.1, ADR-049 §9), AFTER the binding
@@ -3767,18 +3775,18 @@ pub async fn restore_context(
     // finite `params.ttl` ⇒ base `T0 + ttl`; a promoted context has
     // `params.ttl == None` ⇒ `None` (no re-arm), and that promotion signal
     // survives even a fully-pruned log. The prunable event log (hydrated by
-    // `restore_event_log_best_effort` above) is read ONLY for the fail-safe
+    // `restore_event_log_fail_closed` above) is read ONLY for the fail-safe
     // `TtlExtended` extension term (losing one only shortens). The persisted
     // `ttl_deadline_secs` scalar is a runtime cache, re-derived here, not
     // trusted, and no `memory_scope != Full` gate applies at the dispatch site
     // (H1).
     let restore_ttl_base_secs =
         restore_committed_t0.unwrap_or(ctx_snapshot.creation_timestamp_secs);
+    // A failed read fails the restore: an empty stand-in would drop every
+    // `TtlExtended` term and close the context early.
     let restore_log_entries = deps
         .event_log
-        .event_log_entries(&context_id_to_bytes(context_id))
-        .ok()
-        .flatten()
+        .event_log_entries(&context_id_to_bytes(context_id))?
         .unwrap_or_default();
     let restore_ttl_deadline = crate::context::ttl_close_helpers::convergent_ttl_deadline(
         &restore_log_entries,
@@ -4899,6 +4907,21 @@ mod restore_reconcile_tests {
         async fn destroy_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }
+        /// This fixture keeps no readable log: no entries for any context.
+        fn event_log_entries(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            Ok(None)
+        }
+        /// This fixture keeps no readable log: the zero root.
+        fn event_log_merkle_root(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok([0u8; 32])
+        }
     }
 
     /// Event log whose `init`/`destroy` succeed but whose `append_event` ALWAYS
@@ -4926,6 +4949,21 @@ mod restore_reconcile_tests {
         }
         async fn destroy_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
+        }
+        /// This fixture keeps no readable log: no entries for any context.
+        fn event_log_entries(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            Ok(None)
+        }
+        /// This fixture keeps no readable log: the zero root.
+        fn event_log_merkle_root(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok([0u8; 32])
         }
     }
 

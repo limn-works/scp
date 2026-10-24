@@ -645,16 +645,15 @@ fn handle_flush_snapshot_actor<'d>(
 
 /// Handle [`LifecycleCommand::ShutdownSelf`] (actor-shape).
 ///
-/// Per-actor body of the relocated sweep. Destroys this actor's
-/// per-context sender keys + MLS group + event log (in that order so
-/// secrets are released before structure tears down; the `SenderKey`s,
-/// the MLS Ed25519 signer, and the MLS provider-storage values zeroize on drop).
-/// Mirrors the
-/// per-context body of `shutdown_all_contexts_legacy`.
+/// Per-actor body of the relocated sweep. Disposes this actor's
+/// per-context crypto, then releases its in-memory event log (in that
+/// order so secrets are released before structure tears down; the
+/// `SenderKey`s, the MLS Ed25519 signer, and the MLS provider-storage values
+/// zeroize on drop). The stored event log entries are kept for the next
+/// restore.
 ///
-/// Best-effort: each destroy failure logs via `tracing::debug!` (the
-/// resource may already be gone, e.g., the actor is being shutdown
-/// twice) and the reply oneshot always carries `Ok(())`.
+/// The reply carries the event-log release result: `Ok(())`, or
+/// [`ContextError::EventLogFailed`] when the release fails.
 ///
 /// Supervisor-level cleanup (standing contexts, local DIDs, wrapping
 /// keys, task set) is the iterating entry point's responsibility —
@@ -712,18 +711,24 @@ fn handle_shutdown_self_actor(
     // turn, and the one-shot TTL arm is a no-op on a non-Active context.
 
     // Clone the event-log provider `Arc` so the async tail owns it (no `&deps`
-    // borrow crosses the await). The event-log destroy still runs after the
-    // MLS-group destroy (crypto released before the event-log structure).
+    // borrow crosses the await). The event-log release runs after the
+    // MLS-group dispose (crypto released before the event-log structure).
+    //
+    // Shutdown RELEASES the in-memory log and never destroys it: destroy
+    // deletes the stored entries, and the next restore would then start an
+    // empty log over a context whose history was durable (spec 17 §"Event log
+    // write failures"). A release failure is the shutdown's reply.
     let event_log = std::sync::Arc::clone(&deps.event_log);
     async move {
-        if let Err(e) = event_log.destroy_event_log(&ctx_id_bytes).await {
-            tracing::debug!(
-                context_id = %context_id,
-                error = %e,
-                "failed to destroy event log during shutdown — may already be gone"
-            );
-        }
-        let _ = reply.send(Ok(()));
+        let released = event_log
+            .release_event_log(&ctx_id_bytes)
+            .await
+            .map_err(|e| {
+                ContextError::EventLogFailed(format!(
+                    "releasing the event log of context {context_id} at shutdown failed: {e}"
+                ))
+            });
+        let _ = reply.send(released);
         // Shutdown mutates external resources (crypto, event log, task
         // handles) but does NOT mutate `state` itself — `cancel()` takes
         // `&self`. Mark non-mutated for the actor's dirty tracking.

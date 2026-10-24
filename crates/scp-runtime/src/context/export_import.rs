@@ -2412,7 +2412,8 @@ mod tests {
         let removed = provider
             .prune_before_checkpoint(&ctx_id_bytes, 10, &policy)
             .await
-            .unwrap();
+            .expect("prune persists")
+            .expect("the log exists");
         assert_eq!(removed, 7);
 
         let entries = provider.entries(&ctx_id_bytes).unwrap();

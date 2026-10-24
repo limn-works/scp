@@ -728,6 +728,17 @@ pub async fn reserve_outlet_economy(
         // persisting.
         ensure_context_active(&handle)?;
 
+        // Read the consequence evidence before any bookkeeping, so an
+        // unreadable event log rejects the call touching no state (spec 17
+        // §"Event log write failures").
+        let (events_snapshot, convergent_now) =
+            crate::context::governance_logic::event_log_entries_for_consequences(
+                view.receive_buffer_mut(),
+                context_id,
+                now_secs,
+                event_log.as_ref(),
+            )?;
+
         role_state = view.role_state().clone();
         let member_count = u64::try_from(view.membership_class_c_mut().count()).unwrap_or(u64::MAX);
 
@@ -766,14 +777,6 @@ pub async fn reserve_outlet_economy(
         // `economic_policy` / `consequence_rules` / `message_pricing` come from
         // `economy_pre_check_borrows()` below, so no separate clones are needed.
         economic_policy = gov.economic_policy_mut().clone();
-
-        let (events_snapshot, convergent_now) =
-            crate::context::governance_logic::event_log_entries_for_consequences(
-                view.receive_buffer_mut(),
-                context_id,
-                now_secs,
-                event_log.as_ref(),
-            );
 
         let mut participation_cache: HashMap<
             String,
@@ -2342,20 +2345,30 @@ pub async fn settle_outlet_economy_capture(
     let event_log = &deps.event_log;
     let event_tx = deps.event_tx.clone();
     let clock = deps.clock.as_ref();
-    let payment_adapter = deps.payment_adapter.clone();
 
     let now = clock.now_secs();
-    let (events_for_consequences, convergent_now) =
-        crate::context::governance_logic::event_log_entries_for_consequences(
-            view.receive_buffer_mut(),
-            context_id,
-            now,
-            event_log.as_ref(),
-        );
     let consequence_rules = view
         .governance_class_c_mut()
         .consequence_rules_mut()
         .clone();
+
+    // The outlet has already executed, so a failed event-log read or
+    // consequence-leaf append does not stop the payment capture or the ticket
+    // commit below; it is returned after them (spec 17 §"Event log write
+    // failures"), as a persist failure after capture is.
+    let (events_for_consequences, convergent_now) =
+        match crate::context::governance_logic::event_log_entries_for_consequences(
+            view.receive_buffer_mut(),
+            context_id,
+            now,
+            event_log.as_ref(),
+        ) {
+            Ok(read) => read,
+            Err(e) => {
+                let _cost = settle_capture_payment(&mut view, deps, invoker_did, ticket).await?;
+                return Err(e);
+            }
+        };
 
     let consequences = post_outlet_invocation_bookkeeping(
         &events_for_consequences,
@@ -2382,7 +2395,7 @@ pub async fn settle_outlet_economy_capture(
     // so the mutation's fail-closed-persist obligation survives the payment-capture
     // error path below (a returned token would be stranded/dropped by the early
     // `return Err` — RED-CS3).
-    let _ = crate::context::governance_logic::enforce_triggered_consequences(
+    let enforced = crate::context::governance_logic::enforce_triggered_consequences(
         &mut split,
         &crate::context::governance_logic::EnforceConsequencesCtx {
             context_id,
@@ -2398,6 +2411,25 @@ pub async fn settle_outlet_economy_capture(
     )
     .await;
 
+    let payment_receipt = settle_capture_payment(&mut view, deps, invoker_did, ticket).await?;
+    enforced?;
+    Ok((consequences, payment_receipt))
+}
+
+/// Captures the escrowed payment for an executed outlet call and commits the
+/// economy ticket. On capture failure it reverses the ticket's budget,
+/// velocity, and hard-rate-limit bookkeeping and returns the capture error.
+///
+/// # Errors
+///
+/// Returns the capture failure mapped by `invocation_error_to_context`.
+async fn settle_capture_payment(
+    view: &mut crate::context::actor::class_s::ClassCMut<'_>,
+    deps: &ActorDeps,
+    invoker_did: &DID,
+    ticket: OutletEconomyTicket,
+) -> Result<Option<PaymentReceipt>, ContextError> {
+    let payment_adapter = deps.payment_adapter.clone();
     let payment_receipt = match (
         payment_adapter.as_ref(),
         ticket.escrow.as_ref(),
@@ -2437,7 +2469,7 @@ pub async fn settle_outlet_economy_capture(
     };
 
     let _cost = commit_outlet_economy_ticket(ticket);
-    Ok((consequences, payment_receipt))
+    Ok(payment_receipt)
 }
 
 // ---------------------------------------------------------------------------

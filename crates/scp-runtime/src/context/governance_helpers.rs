@@ -2253,8 +2253,8 @@ pub async fn execute_extend_ttl(
     // it (`old_deadline + additional_secs`, convergent across members), and
     // stamps the leaf with the committer-assigned `timestamp_secs`
     // (`proposal.created_at`). A context whose log yields no convergent deadline
-    // has no TTL to extend ⇒ no-op, no leaf. The append is best-effort/fail-safe
-    // (a lost leaf re-derives the shorter un-extended base on restore). The
+    // has no TTL to extend ⇒ no-op, no leaf. A failed append returns its error
+    // with the deadline unchanged (spec 17 §"Event log write failures"). The
     // combinator credits `checkpoint_events_since` itself, in the one arm where
     // the `TtlExtended` leaf landed, so this helper credits nothing: three of
     // the combinator's paths (no convergent deadline, payload encode failure,
@@ -2272,7 +2272,7 @@ pub async fn execute_extend_ttl(
             consenting_members: consenting,
         },
     )
-    .await;
+    .await?;
 
     crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, context_id).await;
     Ok(())
@@ -4548,13 +4548,14 @@ fn actor_check_proposer_eligibility(
         .contains_key(proposer_did.as_ref())
     {
         let context_id_bytes = context_id_to_bytes(&context_id);
-        let merkle_root = event_log
-            .event_log_merkle_root(&context_id_bytes)
-            .unwrap_or([0u8; 32]);
+        // An unreadable log denies the proposal (spec 17 §"Event log write
+        // failures"): eligibility is never computed over a zero root or an
+        // empty Source 1.
+        let merkle_root = event_log.event_log_merkle_root(&context_id_bytes)?;
         // Participation-record path consumes only the merged event set;
         // `convergent_now` (the consequence window anchor) is unused here.
         let (events, _convergent_now) =
-            event_log_entries_for_consequences(&cell.receive_buffer, &context_id, now, event_log);
+            event_log_entries_for_consequences(&cell.receive_buffer, &context_id, now, event_log)?;
         if !events.is_empty() {
             match compute_participation_record(
                 &events,
@@ -5874,7 +5875,7 @@ pub async fn finalize_governance_action(
                 context_id,
                 now,
                 &*deps.event_log,
-            );
+            )?;
             let triggered_proposer = scp_protocol::trust::consequence::evaluate_consequence_rules(
                 &rules,
                 &buf_events,
@@ -5912,7 +5913,7 @@ pub async fn finalize_governance_action(
             let mut downward_auth_sink: Option<crate::context::actor::class_s::ClassSCommitToken> =
                 None;
             let mut split = ConsequenceStateSplit::from_state(state);
-            let _ = enforce_triggered_consequences(
+            let mut enforced = enforce_triggered_consequences(
                 &mut split,
                 &EnforceConsequencesCtx {
                     context_id,
@@ -5926,10 +5927,16 @@ pub async fn finalize_governance_action(
                 },
                 &mut downward_auth_sink,
             )
-            .await;
-            if let Some((target, triggered)) = triggered_target {
+            .await
+            .map(drop);
+            // A failed proposer consequence stops here: the target's leaves
+            // would otherwise land at positions this member's peers filled
+            // differently.
+            if enforced.is_ok()
+                && let Some((target, triggered)) = triggered_target
+            {
                 let mut split = ConsequenceStateSplit::from_state(state);
-                let _ = enforce_triggered_consequences(
+                enforced = enforce_triggered_consequences(
                     &mut split,
                     &EnforceConsequencesCtx {
                         context_id,
@@ -5943,13 +5950,15 @@ pub async fn finalize_governance_action(
                     },
                     &mut downward_auth_sink,
                 )
-                .await;
+                .await
+                .map(drop);
             }
             // Covered fail-closed by the caller's `discharge_with` commit (above):
             // subsume any armed obligation so EXACTLY ONE persist is owed.
             if let Some(token) = downward_auth_sink.take() {
                 token.subsume(context_id);
             }
+            enforced?;
         }
     }
 
@@ -5957,17 +5966,28 @@ pub async fn finalize_governance_action(
     {
         let now = deps.clock.now_secs();
         // Participation-record path: only the merged event set is consumed.
-        let (gov_events, _convergent_now) = event_log_entries_for_consequences(
-            &state.receive_buffer,
-            context_id,
-            now,
-            &*deps.event_log,
-        );
-        let gov_merkle = deps
+        // A participation record is a cache the proposer-eligibility gate
+        // recomputes, failing closed, when it is cold. An unreadable log therefore
+        // leaves the cache cold here; it never caches a record over a zero root.
+        let read = deps
             .event_log
             .event_log_merkle_root(&context_id_bytes)
-            .unwrap_or([0u8; 32]);
-        if !gov_events.is_empty()
+            .and_then(|root| {
+                event_log_entries_for_consequences(
+                    &state.receive_buffer,
+                    context_id,
+                    now,
+                    &*deps.event_log,
+                )
+                .map(|(events, _convergent_now)| (root, events))
+            });
+        if let Ok((gov_merkle, gov_events)) = read.inspect_err(|e| {
+            tracing::warn!(
+                context_id,
+                error = %e,
+                "event log unreadable; participation cache not refreshed"
+            );
+        }) && !gov_events.is_empty()
             && let Ok(record) = scp_protocol::trust::participation::compute_participation_record(
                 &gov_events,
                 proposal.proposer_did.as_ref(),
@@ -6888,6 +6908,21 @@ mod commit_broadcast_retry_tests {
         }
         async fn destroy_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
+        }
+        /// This fixture keeps no readable log: no entries for any context.
+        fn event_log_entries(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            Ok(None)
+        }
+        /// This fixture keeps no readable log: the zero root.
+        fn event_log_merkle_root(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok([0u8; 32])
         }
     }
 

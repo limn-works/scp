@@ -144,12 +144,27 @@ pub async fn handle_ttl_expiry(
     // context's stray timer destroy keys. The stale cached deadline is cleared so
     // `reconcile_timers` disarms (no re-fire spin) and a later restore re-derives
     // `None` from `params.ttl` too.
-    let expiry_log_entries = deps
-        .event_log
-        .event_log_entries(&context_id_bytes)
-        .ok()
-        .flatten()
-        .unwrap_or_default();
+    //
+    // An unreadable log stops the attempt before any step: deriving the
+    // deadline from an empty log would drop every `TtlExtended` leaf and expire
+    // the context at its un-extended base (spec 17 §"Event log write failures").
+    let expiry_log_entries = match deps.event_log.event_log_entries(&context_id_bytes) {
+        Ok(entries) => entries.unwrap_or_default(),
+        Err(e) => {
+            tracing::warn!(
+                context_id = %context_id,
+                error = %e,
+                "TTL expiry deferred: the event log is unreadable"
+            );
+            return TtlExpiryOutcome {
+                result: crate::context::ttl::TtlExpiryResult::log_unreadable(
+                    prior_completed,
+                    format!("event log unreadable: {e}"),
+                ),
+                persist_result: Err(e),
+            };
+        }
+    };
     let Some(expiry_deadline) = convergent_ttl_deadline(
         &expiry_log_entries,
         cell.creation_timestamp_secs,
@@ -400,15 +415,19 @@ pub async fn propose_ttl_extension(
 /// re-derive the un-extended `creation + ttl` base). The leaf carries the
 /// pending consent tally's members and a convergent content-derived
 /// `proposal_id` (this bilateral activation has no governance proposal id).
-/// The append is best-effort: on failure the deadline still moves in memory,
-/// and a later restore re-derives the SHORTER un-extended base — the
-/// fail-SAFE direction (the context expires no later than its convergent TTL).
+/// The append fails closed (spec 17 §"Event log write failures"): on failure
+/// the deadline does not move and the error is returned.
+///
+/// # Errors
+///
+/// Returns [`ContextError::EventLogFailed`] if reading the log, encoding the
+/// leaf, or appending it fails.
 pub async fn reset_ttl_timer(
     cell: &mut ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     new_duration: std::time::Duration,
-) {
+) -> Result<(), ContextError> {
     // Snapshot the pending consent tally (recorded by `propose_ttl_extension`)
     // BEFORE it is cleared below, for the §5.10.1 step-5 leaf's
     // `consenting_members`. Convergent (sorted) across members.
@@ -444,10 +463,11 @@ pub async fn reset_ttl_timer(
         new_duration.as_secs(),
         ExtensionLeaf::Reset { consenting_members },
     )
-    .await;
+    .await?;
 
     // Persist context state after TTL reset (best-effort).
     persist_state_best_effort(cell, deps, context_id).await;
+    Ok(())
 }
 
 /// Distinguishes the two TTL-extension activation paths that share the
@@ -496,9 +516,15 @@ pub enum ExtensionLeaf {
 /// A no-op (no timer mutation, NO leaf) when the log yields no deadline to
 /// extend — a promoted / no-TTL / empty-log context.
 ///
-/// The leaf append is best-effort / fail-safe: on failure the deadline still
-/// moved in memory and a later restore re-derives the SHORTER un-extended base
-/// (the context expires no later than its convergent TTL).
+/// The leaf is appended BEFORE the recorded deadline moves, and a failed
+/// read, encode, or append returns the error with the deadline unchanged
+/// (spec 17 §"Event log write failures"), so the recorded deadline never
+/// runs ahead of the log it is derived from.
+///
+/// # Errors
+///
+/// Returns [`ContextError::EventLogFailed`] if reading the log, encoding the
+/// `TtlExtended` payload, or appending the leaf fails.
 pub async fn extend_ttl_deadline_and_record(
     cell: &mut ClassSCell,
     event_log: &dyn crate::context::builder::ContextEventLogProvider,
@@ -506,16 +532,14 @@ pub async fn extend_ttl_deadline_and_record(
     actor_did: &str,
     additional_secs: u64,
     leaf: ExtensionLeaf,
-) {
+) -> Result<(), ContextError> {
     // Derive the CURRENT convergent deadline from the log (single source): the
     // extension raises the log-derived deadline, never the untrusted cached
     // scalar. No derivable deadline ⇒ nothing to extend (no-op, no leaf).
     let params_ttl = cell.handle.params().ttl.map(|t| t.as_secs());
     let creation_timestamp_secs = cell.creation_timestamp_secs;
     let entries = event_log
-        .event_log_entries(context_id_bytes)
-        .ok()
-        .flatten()
+        .event_log_entries(context_id_bytes)?
         .unwrap_or_default();
     let Some(current) = convergent_ttl_deadline(&entries, creation_timestamp_secs, params_ttl)
     else {
@@ -523,18 +547,11 @@ pub async fn extend_ttl_deadline_and_record(
             "extend_ttl_deadline_and_record: no convergent deadline to extend \
              (promoted / no-TTL context ⇒ params.ttl == None) — no-op, no leaf (H2)"
         );
-        return;
+        return Ok(());
     };
     let extended = current.extend(additional_secs);
     let old_dl = current.as_secs();
     let new_dl = extended.as_secs();
-
-    // Mutate the recorded timer deadline (Class-C) from the resolved convergent
-    // value. Scoped so the Class-C view is dropped before the async append.
-    {
-        let mut view = cell.class_c_view();
-        start_ttl_timer(&mut view.ttl_mut().timer, extended);
-    }
 
     // Resolve the leaf's convergent `proposal_id` + `timestamp` from the SAME
     // `(old, new)` pair, per the activation path's convention.
@@ -551,49 +568,41 @@ pub async fn extend_ttl_deadline_and_record(
         ),
     };
 
-    // Append the `TtlExtended` leaf (best-effort / fail-safe). This combinator
-    // is the one place that knows whether the leaf landed, so it credits
-    // `checkpoint_events_since` itself, in the success arm only: neither caller
-    // (`execute_extend_ttl`, `reset_ttl_timer`) credits the leaf. The counter
-    // must equal the durable leaf count, because `create_checkpoint_if_due_view`
-    // gates both §9.9.3 consistency-checkpoint triggers on it; a credit for a
-    // leaf that did not land (no convergent deadline, encode failure, append
-    // failure) would mint this member's checkpoint one position early, and a
-    // landed leaf with no credit would leave a reset-only context never
-    // reaching `events_since > 0`.
-    match scp_event_log::payload::encode_payload(&scp_event_log::payload::TtlExtendedPayload {
-        old_deadline_unix: old_dl,
-        new_deadline_unix: new_dl,
-        proposal_id,
-        consenting_members,
-    }) {
-        Ok(payload) => {
-            match event_log
-                .append_context_event_with_payload(
-                    context_id_bytes,
-                    scp_event_log::EventType::TtlExtended,
-                    actor_did,
-                    payload,
-                    timestamp_secs,
-                )
-                .await
-            {
-                Ok(()) => {
-                    *cell.class_c_view().checkpoint_events_since_mut() += 1;
-                }
-                Err(e) => tracing::warn!(
-                    error = %e,
-                    "extend_ttl_deadline_and_record: failed to append TtlExtended leaf; the \
-                     extension lives only in the runtime scalar and a later restore re-derives \
-                     the shorter un-extended base (fail-safe)"
-                ),
-            }
-        }
-        Err(e) => tracing::warn!(
-            error = %e,
-            "extend_ttl_deadline_and_record: failed to encode TtlExtended payload; leaf not appended"
-        ),
-    }
+    // Append the `TtlExtended` leaf, then move the recorded deadline. This
+    // combinator is the one place that knows whether the leaf landed, so it
+    // credits `checkpoint_events_since` itself, after the append succeeds:
+    // neither caller (`execute_extend_ttl`, `reset_ttl_timer`) credits the
+    // leaf. The counter must equal the durable leaf count, because
+    // `create_checkpoint_if_due_view` gates both §9.9.3 consistency-checkpoint
+    // triggers on it; a credit for a leaf that did not land would mint this
+    // member's checkpoint one position early, and a landed leaf with no credit
+    // would leave a reset-only context never reaching `events_since > 0`.
+    let payload =
+        scp_event_log::payload::encode_payload(&scp_event_log::payload::TtlExtendedPayload {
+            old_deadline_unix: old_dl,
+            new_deadline_unix: new_dl,
+            proposal_id,
+            consenting_members,
+        })
+        .map_err(|e| {
+            ContextError::EventLogFailed(format!("encoding the TtlExtended payload failed: {e}"))
+        })?;
+    event_log
+        .append_context_event_with_payload(
+            context_id_bytes,
+            scp_event_log::EventType::TtlExtended,
+            actor_did,
+            payload,
+            timestamp_secs,
+        )
+        .await?;
+
+    // The leaf landed: mutate the recorded timer deadline (Class-C) from the
+    // same resolved convergent value and credit the leaf.
+    let mut view = cell.class_c_view();
+    start_ttl_timer(&mut view.ttl_mut().timer, extended);
+    *view.checkpoint_events_since_mut() += 1;
+    Ok(())
 }
 
 /// Derives the CONVERGENT `proposal_id` for a `reset_ttl_timer` activation's

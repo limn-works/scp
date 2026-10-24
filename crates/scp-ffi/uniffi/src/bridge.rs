@@ -15009,7 +15009,11 @@ impl Scp {
                     // and queries the wrong event-log key).
                     let ctx_id_bytes =
                         scp_core::context::state::context_id_to_bytes(&handle.context_id);
-                    if let Ok(Some(entries)) = manager.event_log_entries(&ctx_id_bytes)
+                    // A failed read is returned, never replaced by the
+                    // bridge-local tree (spec 17 §"Event log write failures").
+                    if let Some(entries) = manager
+                        .event_log_entries(&ctx_id_bytes)
+                        .map_err(ScpError::from)?
                         && !entries.is_empty()
                     {
                         // Canonical filter — pinned across PyO3/NAPI/UniFFI by

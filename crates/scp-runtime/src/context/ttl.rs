@@ -150,6 +150,11 @@ pub struct TtlExpiryResult {
     /// actor uses this to distinguish an intentional benign abort from a genuine
     /// incomplete cleanup, so it does not emit a misleading "retrying" error.
     aborted: bool,
+    /// `true` iff the attempt could not read the event log the convergent
+    /// deadline is derived from ([`Self::log_unreadable`]). Nothing ran, so the
+    /// context is still `Active`; the actor arms its bounded retry instead of
+    /// re-firing the one-shot timer at once.
+    log_unreadable: bool,
 }
 
 /// Bit positions for [`TtlExpiryResult::completed_steps`].
@@ -237,7 +242,30 @@ impl TtlExpiryResult {
                     .to_owned(),
             ],
             aborted: true,
+            log_unreadable: false,
         }
+    }
+
+    /// The result of an expiry attempt that could not read the event log its
+    /// convergent deadline is derived from (spec 17 §"Event log write
+    /// failures"). No step runs: expiring against the un-extended base would
+    /// destroy keys before a recorded extension's deadline. `prior_completed`
+    /// carries forward unchanged, and the actor retries with backoff.
+    #[must_use]
+    pub fn log_unreadable(prior_completed: u8, error: String) -> Self {
+        Self {
+            completed_steps: prior_completed,
+            errors: vec![error],
+            aborted: false,
+            log_unreadable: true,
+        }
+    }
+
+    /// Whether this attempt stopped because the event log was unreadable
+    /// ([`Self::log_unreadable`]).
+    #[must_use]
+    pub const fn is_log_unreadable(&self) -> bool {
+        self.log_unreadable
     }
 
     /// Whether this is the deliberate no-op ABORT result (A3): the single-source
@@ -701,6 +729,7 @@ pub(crate) fn apply_ttl_terminal_transition(
         completed_steps: prior_completed,
         errors: Vec::new(),
         aborted: false,
+        log_unreadable: false,
     };
 
     let needs_key_destruction =
@@ -1263,6 +1292,13 @@ mod tests {
         ) -> Result<Option<Vec<scp_event_log::Event>>, ContextError> {
             Ok(Some(self.entries.lock().unwrap().clone()))
         }
+        /// This fixture keeps no readable log: the zero root.
+        fn event_log_merkle_root(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok([0u8; 32])
+        }
     }
 
     /// (d) idempotent terminal leaf (ADR-049 §9 amendment): a SECOND TTL expiry
@@ -1458,6 +1494,21 @@ mod tests {
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             Ok(())
         }
+        /// This fixture keeps no readable log: no entries for any context.
+        fn event_log_entries(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            Ok(None)
+        }
+        /// This fixture keeps no readable log: the zero root.
+        fn event_log_merkle_root(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok([0u8; 32])
+        }
     }
 
     /// Records the `(EventType, actor_did)` of every append so a test can
@@ -1499,6 +1550,21 @@ mod tests {
             _cid: &[u8; 32],
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             Ok(())
+        }
+        /// This fixture keeps no readable log: no entries for any context.
+        fn event_log_entries(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            Ok(None)
+        }
+        /// This fixture keeps no readable log: the zero root.
+        fn event_log_merkle_root(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok([0u8; 32])
         }
     }
 
@@ -1730,6 +1796,7 @@ mod tests {
             completed_steps: 0,
             errors: Vec::new(),
             aborted: false,
+            log_unreadable: false,
         };
         r.set_step(STEP_STATE_TRANSITIONED);
         r.set_step(STEP_MLS_DESTROYED);
@@ -1745,6 +1812,7 @@ mod tests {
             completed_steps: 0,
             errors: Vec::new(),
             aborted: false,
+            log_unreadable: false,
         };
         r.set_step(STEP_STATE_TRANSITIONED);
         assert!(r.has_failures());
