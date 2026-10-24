@@ -353,6 +353,16 @@
         "SCP-356",
         "SCP-358"
       ]
+    },
+    {
+      "id": "gate-message-lifetime",
+      "name": "Message lifetime: broadcast post TTL and catch-up paging (spec 09 §9.10.2)",
+      "priority": "P1",
+      "status": "pending",
+      "stories": [
+        "SCP-362",
+        "SCP-363"
+      ]
     }
   ],
   "stories": [
@@ -14006,6 +14016,112 @@
         {
           "file": ".docs/adrs/phase-6.md",
           "section": "## ADR-067: Concurrent Commits and fork merge"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-362",
+      "title": "Broadcast post TTL: a structural context parameter with a per-post override, bounded by MAX_BLOB_TTL",
+      "gate": "gate-message-lifetime",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-protocol/src/context/params.rs",
+        "crates/scp-runtime/src/context/broadcast_helpers.rs",
+        "crates/scp-runtime/src/context/supervisor/supervisor.rs",
+        "crates/scp-ffi/src/context.rs",
+        "crates/scp-ffi/napi/src/context.rs",
+        "crates/scp-ffi/napi/src/scp.rs",
+        "crates/scp-ffi/uniffi/src/bridge.rs",
+        "bindings/typescript/src/types.ts",
+        "bindings/python/scp_sdk/context.py",
+        "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Types.kt",
+        "bindings/swift/Sources/SCP/Internal/ScpBindings.swift",
+        "crates/scp-testing/tests/integration/pipeline_wiring.rs",
+        ".docs/standards/sdk-capability-matrix.json"
+      ],
+      "description": "Alec ruled on 2026-10-24: \"Indefinite/max by default (set by context). Can be customized per post\". Spec 05 §5.14.5 'Post lifetime' and spec 09 §9.10.2 make the broadcast post TTL a structural `ContextParams` field, `broadcast_post_ttl_secs`, set at creation and immutable, defaulting to `MAX_BLOB_TTL`, with a per-post override on the publish call. Both values lie in [1, `MAX_BLOB_TTL`], and a value outside it is a typed error, never clamped. Today every broadcast post requests `MAX_BLOB_TTL` through the runtime's message-type TTL choice, which equals the ruled default; this story adds the parameter and the override. Field and type names are indicators.",
+      "acceptanceCriteria": [
+        "`ContextParams` carries `broadcast_post_ttl_secs`; a broadcast context created without it publishes every post with `blob_ttl` = `MAX_BLOB_TTL` (604,800), asserted at a relay",
+        "A broadcast context created with `broadcast_post_ttl_secs` = 3,600 publishes a post with `blob_ttl` = 3,600, asserted at a relay",
+        "A post published with a per-post TTL of 600 in that context reaches the relay with `blob_ttl` = 600",
+        "Context creation with `broadcast_post_ttl_secs` = 0 or `MAX_BLOB_TTL` + 1 returns a typed error and creates no context",
+        "A post with a per-post TTL of 0 or `MAX_BLOB_TTL` + 1 returns a typed error and publishes nothing",
+        "The field is a structural field (spec 05 §5.7): the context's published parameters carry it before a subscriber registers",
+        "`dispatch_broadcast_command` carries the per-post TTL to `publish_broadcast_in_turn`, and `pipeline_wiring.rs` asserts that step",
+        "napi, UniFFI and PyO3 export the per-post TTL on `broadcast_publish`, `broadcast_publish_asset` and `broadcast_publish_assets`, and the `ContextParams` field",
+        "The TypeScript, Python, Kotlin and Swift SDKs expose the per-post TTL and the `ContextParams` field, and the capability matrix lists them"
+      ],
+      "actionItems": [
+        "Add the `ContextParams` field with its range check at creation",
+        "Thread a per-post TTL from the Supervisor dispatch to the broadcast publish",
+        "Export it through the three bridges and the four SDKs, with the matrix rows and pipeline_wiring assertions",
+        "Add one test per criterion"
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.14.5 BroadcastEnvelope"
+        },
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "## 5.7 Metadata"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.10.2 Minimal Outer Envelope"
+        }
+      ],
+      "details": {
+        "checklist": {
+          "dispatch": "yes",
+          "pw": "yes",
+          "ffi": "napi, uniffi, pyo3",
+          "sdk": "yes",
+          "matrix": "yes"
+        }
+      }
+    },
+    {
+      "id": "SCP-363",
+      "title": "Page every reconnect catch-up path by the (stored_at, blob_id) cursor, the browser client included",
+      "gate": "gate-message-lifetime",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-ffi/common/src/reconnect.rs",
+        "crates/scp-transport/src/native/client.rs",
+        "crates/scp-transport/src/native/adapter.rs",
+        "crates/scp-client/src/client.rs"
+      ],
+      "description": "Spec 09 §9.10.2 'What a reconnecting device recovers' and spec 23 §23.3 state that a reconnecting device reads only one answer per routing ID and relay: a `QUERY` without a limit answers 100 blobs, a subscribe backfill answers 1,000, and nothing asks for the rest; the in-browser client subscribes without `since` and gets no backfill. With a 7-day blob TTL, a device offline for days can find more stored blobs than one answer holds. This story generalizes the (`stored_at`, `blob_id`) cursor of SCP-RELAYRES-009, which pages one routing ID's public records, to every catch-up path, so a reconnecting device reads every blob a relay still stores for its routing IDs.",
+      "acceptanceCriteria": [
+        "Native reconnect catch-up of a routing ID holding 2,500 stored blobs delivers all 2,500, each once, by repeated `QUERY` calls that advance the (`stored_at`, `blob_id`) cursor of SCP-RELAYRES-009",
+        "250 blobs that share one `stored_at` are all delivered at a page limit of 100",
+        "Catch-up stops when a page returns fewer blobs than its limit, and a relay error mid-way returns a typed error that names the routing ID",
+        "The in-browser client, after a reconnect with a persisted last `stored_at`, receives every blob stored on its routing IDs since then, 2,500 blobs included",
+        "Every routing ID the catch-up covers (shared, current, in-grace and query-only, spec 09 §9.10.4.1) is paged"
+      ],
+      "actionItems": [
+        "Page `relay_catch_up` in `reconnect.rs` by the cursor",
+        "Give the in-browser client a persisted last `stored_at` and a paged catch-up",
+        "Add one test per criterion"
+      ],
+      "blockedBy": [
+        "SCP-RELAYRES-009"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.10.2 Minimal Outer Envelope"
+        },
+        {
+          "file": ".docs/specs/23-sync-and-offline-strategy.md",
+          "section": "## 23.3 Reconnection Protocol"
         }
       ],
       "details": {}
