@@ -343,6 +343,7 @@ async fn trio(ctx: &str) -> (Member, Member) {
         ctx,
         &ctx_bytes,
         &add,
+        &std::collections::HashSet::new(),
     )
     .await
     .expect("Bob merges the add");

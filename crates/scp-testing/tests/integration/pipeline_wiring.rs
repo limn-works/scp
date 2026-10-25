@@ -3015,6 +3015,30 @@ fn leave_context_calls_rotate_sender_key() {
     );
 }
 
+/// The leave and the write revoke rotate through the one helper that rotates,
+/// publishes, and returns the rotation's error (spec 09 §9.16.4, §9.16.10).
+#[test]
+fn leave_and_write_revoke_rotate_through_the_reporting_helper() {
+    let helper = extract_fn_body(MANAGER_SRC, "rotate_sender_key_and_distribute")
+        .expect("rotate_sender_key_and_distribute exists");
+    for needle in [
+        ".rotate_sender_key(",
+        "mirror_forward_local_sender_epoch(",
+        "drain_and_deliver_sender_keys(",
+    ] {
+        assert!(
+            helper.contains(needle),
+            "rotate_sender_key_and_distribute must contain `{needle}`"
+        );
+    }
+    for caller in ["leave_context", "execute_revoke"] {
+        assert!(
+            fn_body_contains(MANAGER_SRC, caller, "rotate_sender_key_and_distribute("),
+            "{caller} must rotate through rotate_sender_key_and_distribute"
+        );
+    }
+}
+
 // --- Proposer eligibility / Participation (#1530) ---
 
 #[test]

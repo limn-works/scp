@@ -29458,6 +29458,7 @@ mod tests {
                 ctx_str,
                 &ctx_bytes,
                 msg,
+                &std::collections::HashSet::new(),
             ))
             .map(|dispatched| match dispatched {
                 crate::context::messaging_helpers::Dispatched::Envelope(env) => Some(*env),
@@ -29622,6 +29623,7 @@ mod tests {
                 ctx_str,
                 &ctx_bytes,
                 &commit,
+                &std::collections::HashSet::new(),
             ))
             .expect("Bob merges the add-Carol Commit");
         assert!(
@@ -29756,6 +29758,7 @@ mod tests {
                 ctx_str,
                 &ctx_bytes,
                 &sealed,
+                &std::collections::HashSet::new(),
             ))
             .expect("a recv at the just-advanced epoch must open");
         let crate::context::messaging_helpers::Dispatched::Envelope(opened) = opened else {
@@ -29841,6 +29844,7 @@ mod tests {
             ctx_str,
             &ctx_bytes,
             &sealed,
+            &std::collections::HashSet::new(),
         )
         .await
         .expect("bob opens the KeyResponse through custody");
@@ -29870,6 +29874,7 @@ mod tests {
             ctx_str,
             &ctx_bytes,
             &app,
+            &std::collections::HashSet::new(),
         )
         .await
         .expect("the installed sender key opens alice's message");
@@ -29963,6 +29968,7 @@ mod tests {
             ctx_str,
             &ctx_bytes,
             &forged_sealed,
+            &std::collections::HashSet::new(),
         )
         .await;
         assert!(
@@ -29980,6 +29986,7 @@ mod tests {
             ctx_str,
             &ctx_bytes,
             &genuine_sealed,
+            &std::collections::HashSet::new(),
         )
         .await;
         assert!(
@@ -30087,6 +30094,7 @@ mod tests {
                 ctx_str,
                 &ctx_bytes,
                 sealed,
+                &std::collections::HashSet::new(),
             )
             .await;
             assert!(
@@ -30109,6 +30117,7 @@ mod tests {
             ctx_str,
             &ctx_bytes,
             &app,
+            &std::collections::HashSet::new(),
         )
         .await
         .expect("the installed key opens alice's message");
@@ -30152,6 +30161,7 @@ mod tests {
             ctx_str,
             &ctx_bytes,
             &newer_sealed,
+            &std::collections::HashSet::new(),
         )
         .await
         .expect("the newer distribution installs");
@@ -30161,6 +30171,7 @@ mod tests {
             ctx_str,
             &ctx_bytes,
             &older_sealed,
+            &std::collections::HashSet::new(),
         )
         .await;
         assert!(
@@ -30175,6 +30186,7 @@ mod tests {
             ctx_str,
             &ctx_bytes,
             &app,
+            &std::collections::HashSet::new(),
         )
         .await
         .expect("the newer key stays installed");
@@ -30320,6 +30332,7 @@ mod tests {
             ctx_str,
             &ctx_bytes,
             &sealed,
+            &std::collections::HashSet::new(),
         )
         .await
         .expect_err("a KeyResponse custody cannot open fails closed");
@@ -30346,6 +30359,7 @@ mod tests {
             ctx_str,
             &ctx_bytes,
             &app,
+            &std::collections::HashSet::new(),
         )
         .await;
         assert!(
@@ -30387,6 +30401,7 @@ mod tests {
             ctx_str,
             &ctx_bytes,
             &sealed,
+            &std::collections::HashSet::new(),
         )
         .await
         .expect("the KeyResponse opens before the key is lost");
@@ -30403,6 +30418,7 @@ mod tests {
             ctx_str,
             &ctx_bytes,
             &app,
+            &std::collections::HashSet::new(),
         )
         .await
         .expect("the installed sender key opens alice's message");
@@ -30418,6 +30434,7 @@ mod tests {
             ctx_str,
             &ctx_bytes,
             &second,
+            &std::collections::HashSet::new(),
         )
         .await
         .expect_err("the lost key cannot open the next KeyResponse");
@@ -30491,6 +30508,7 @@ mod tests {
             ctx_str,
             &ctx_bytes,
             &blank_leaf,
+            &std::collections::HashSet::new(),
         )
         .await
         .expect_err("a KeyResponse from a blank leaf is refused");
@@ -30521,6 +30539,7 @@ mod tests {
             ctx_str,
             &ctx_bytes,
             &reused_leaf,
+            &std::collections::HashSet::new(),
         )
         .await
         .expect_err("a KeyResponse from a leaf another member now holds is refused");
@@ -32750,6 +32769,7 @@ mod tests {
             ctx_str,
             &ctx_bytes,
             &sealed,
+            &std::collections::HashSet::new(),
         ));
         assert!(
             matches!(&result, Err(ContextError::CryptoFailed(m)) if m == "application message from own DID"),
@@ -33062,6 +33082,7 @@ mod tests {
             ctx_str,
             &ctx_bytes,
             &mismatch_sealed,
+            &std::collections::HashSet::new(),
         ));
         assert!(
             matches!(
@@ -33084,6 +33105,7 @@ mod tests {
                 ctx_str,
                 &ctx_bytes,
                 &ok_sealed,
+                &std::collections::HashSet::new(),
             ))
             .expect("a well-formed request is accepted on the receive path");
         assert!(

@@ -950,6 +950,12 @@ pub async fn execute_revoke(
                         .access
                         .access_key_store
                         .remove(context_id, did.as_ref());
+                    // No sender key is pushed to a read-revoked member: its
+                    // queued distributions go in this persist, and the
+                    // exclusion list above keeps later ones from being built
+                    // (spec 09 §9.16.10). Its own sender key stays; a Read
+                    // revoke leaves it able to write.
+                    state.drop_queued_distributions_to(did.as_ref())?;
                 }
 
                 emit(
@@ -1067,49 +1073,12 @@ pub async fn execute_revoke(
         }
     }
 
-    // H7: Rotate sender key after write-side revocation.
+    // H7: rotate the sender key after a write-side revocation. Everything above
+    // is durable, so a rotation failure reaches the caller as its typed error
+    // with the revoke standing (the replay marker is kept, see above).
     if needs_sender_key_rotation {
-        // ADR-049 PR-7: Class-S — the epoch bump is sync-persisted fail-closed via
-        // `commit_class_s_keep`; anti-replay backstop is the never-regressing
-        // registry floor (`mirror_forward`, `?`-propagated). M23: sender-key
-        // rotation + distribution stays best-effort (rotate/persist failure logged,
-        // revocation continues — the write-side capability strip above is the hard
-        // boundary).
-        let local_did = deps.crypto.local_did().to_owned();
-        match cell
-            .commit_class_s_keep(deps, context_id, |mut v| {
-                let s = v.rest_mut();
-                s.rotate_sender_key(&local_did, deps.event_tx.as_ref())?;
-                Ok(s.local_sender_key_epoch())
-            })
-            .await
-        {
-            Ok(epoch) => {
-                // ADR-049 PR-6/PR-7: advance the durably-bumped local epoch in the
-                // authoritative floor registry (fail-closed backstop).
-                crate::context::messaging_helpers::mirror_forward_local_sender_epoch(
-                    deps,
-                    &context_id_bytes,
-                    epoch,
-                )?;
-            }
-            Err(e) => {
-                tracing::warn!(
-                    context_id = %context_id,
-                    error = %e,
-                    "rotate_sender_key failed after access revocation"
-                );
-            }
-        }
-        // Publish what the rotation queued; a failed publish stays queued and
-        // is reported by event (spec 09 §9.16.9).
-        crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
-            deps,
-            &mut cell.class_c_view(),
-            context_id,
-            crate::context::lifecycle_helpers::DistributionScope::NeverAttempted,
-        )
-        .await;
+        crate::context::lifecycle_helpers::rotate_sender_key_and_distribute(cell, deps, context_id)
+            .await?;
     }
 
     Ok(rotated_authors.len())

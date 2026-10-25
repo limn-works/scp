@@ -21,12 +21,17 @@
 //! - A distribution supersedes the one queued to the same target and key.
 //! - `seal` refuses the current epoch while a distribution of it is pending.
 //! - Removing a member purges its queued distributions in the same persist.
+//! - The receive path answers no `SenderKeyRequest` from a read-revoked
+//!   member (spec 09 §9.16.10).
 //!
 //! The operation tests drive each of the six operations that rotate or
 //! distribute (join, Add, leave, Remove, reset, write revoke) through the
 //! Supervisor with the relay down: the operation returns `Ok`, the persisted
 //! snapshot holds the distribution, and `SenderKeyDistributionPending` reaches
-//! the event channel.
+//! the event channel. A read revoke drops the member's queued distributions
+//! in its persist and no later rotation queues one to it. A leave or write
+//! revoke whose rotation step fails returns that typed error, and the
+//! operation stands.
 
 #![cfg(test)]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -63,9 +68,42 @@ type PersistErr = Box<dyn std::error::Error + Send + Sync>;
 type EventRx = tokio::sync::broadcast::Receiver<(String, ContextEvent)>;
 
 #[derive(Default)]
-struct Store(DashMap<String, ContextSnapshot>);
+struct Store(DashMap<String, ContextSnapshot>, AtomicBool);
+
+/// The local sender-key epoch a snapshot carries, if it carries crypto.
+fn snapshot_sender_epoch(ctx: &str, s: &ContextSnapshot) -> Option<u64> {
+    NodeMlsFactory::build_restored_owned(
+        &scp_protocol::context::context_id_bytes(ctx),
+        &s.mls_crypto_state.0,
+    )
+    .ok()
+    .map(|(owned, _floors)| owned.sender_key_epoch)
+}
 
 impl Store {
+    /// Arms a one-shot refusal of the next persist that raises the local
+    /// sender-key epoch: only a rotation's Class-S step raises it.
+    fn refuse_next_rotation(&self) {
+        self.1.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether the armed refusal takes this persist (and disarms).
+    fn refuses(&self, id: &str, s: &ContextSnapshot) -> bool {
+        if !self.1.load(Ordering::SeqCst) {
+            return false;
+        }
+        let old = self
+            .0
+            .get(id)
+            .and_then(|prev| snapshot_sender_epoch(id, prev.value()));
+        let new = snapshot_sender_epoch(id, s);
+        let bumps = matches!((old, new), (Some(o), Some(n)) if n > o);
+        if bumps {
+            self.1.store(false, Ordering::SeqCst);
+        }
+        bumps
+    }
+
     /// The distribution queue of the one persisted snapshot of `ctx`.
     fn queue(&self, ctx: &str) -> Vec<PendingDistribution> {
         let snapshot = self
@@ -87,6 +125,9 @@ struct SharedStore(Arc<Store>);
 #[async_trait::async_trait]
 impl ContextPersistence for SharedStore {
     async fn persist_context(&self, id: &str, s: &ContextSnapshot) -> Result<(), PersistErr> {
+        if self.0.refuses(id, s) {
+            return Err("the store refuses the rotation's persist".into());
+        }
         self.0.0.insert(id.to_owned(), s.clone());
         Ok(())
     }
@@ -710,6 +751,111 @@ async fn a_member_with_no_wrapping_key_is_reported_not_built() {
     );
 }
 
+/// Bob's signed `SenderKeyRequest` for Alice's key, in its distribution
+/// envelope.
+fn bob_key_request(nonce: [u8; 16]) -> Vec<u8> {
+    use ed25519_dalek::Signer as _;
+    use scp_protocol::crypto::sender_keys::key_protocol_verify::{
+        RequestHashInput, compute_request_hash,
+    };
+    use scp_protocol::crypto::sender_keys::{SenderKeyDistributionMessage, SenderKeyRequest};
+    let (wrapping_pubkey, _secret) = scp_protocol::crypto::sender_keys::generate_wrapping_keypair();
+    let hash = compute_request_hash(
+        BOB,
+        ALICE,
+        &wrapping_pubkey,
+        &nonce,
+        RequestHashInput {
+            epoch: 1,
+            requested_at: T0,
+        },
+    )
+    .expect("hash the request");
+    let signature = crate::crypto::mls::two_party_test_support::bob_signing_key()
+        .sign(&hash)
+        .to_bytes();
+    SenderKeyDistributionMessage::KeyRequest(SenderKeyRequest {
+        requester_did: BOB.to_owned(),
+        sender_did: ALICE.to_owned(),
+        epoch: 1,
+        wrapping_pubkey,
+        nonce,
+        timestamp: T0,
+        signature,
+    })
+    .to_bytes()
+    .expect("encode the request")
+}
+
+/// Fails if the production receive path answers a `SenderKeyRequest` from a
+/// read-revoked member, or does not answer one from a member that reads
+/// (spec 09 §9.16.10).
+#[tokio::test]
+async fn a_read_revoked_requester_gets_no_answer() {
+    let ctx = "sender-key-requeue-read-revoked-request";
+    let crate::crypto::mls::two_party_test_support::TwoPartyPair {
+        alice_provider,
+        mut alice_state,
+        mut bob_state,
+        ..
+    } = crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx, ALICE, BOB);
+    let relay = Arc::new(Relay::default());
+    let store = Arc::new(Store::default());
+    let clock = Arc::new(TestClock::new(T0));
+    let (deps, _sup, _events) = alice_deps(alice_provider, &relay, &store, &clock).await;
+    activate(&mut alice_state);
+    alice_state
+        .access
+        .read_exclusion_list
+        .insert(DID::from(BOB));
+    let mut cell = ClassSCell::new(alice_state);
+    let bob_cs = bob_state.mode.crypto_mut().expect("encrypted");
+    let denied = bob_cs
+        .mls_encrypt_management(&bob_key_request([1; 16]))
+        .expect("Bob seals the first request");
+    let answered = bob_cs
+        .mls_encrypt_management(&bob_key_request([2; 16]))
+        .expect("Bob seals the second request");
+    let answers_to_bob =
+        |cell: &ClassSCell| queue(cell).iter().filter(|p| p.target_did == BOB).count();
+
+    let outcome = crate::context::messaging_helpers::deliver_incoming(
+        &mut cell.class_c_view(),
+        &deps,
+        ctx,
+        &denied,
+        &mut None,
+        &mut None,
+    )
+    .await
+    .expect("the request is consumed");
+    assert!(matches!(
+        outcome,
+        crate::context::messaging_helpers::DeliverOutcome::Handled
+    ));
+    assert_eq!(
+        answers_to_bob(&cell),
+        0,
+        "a read-revoked requester gets none"
+    );
+
+    cell.class_c_view()
+        .access_mut()
+        .read_exclusion_list
+        .remove(&DID::from(BOB));
+    crate::context::messaging_helpers::deliver_incoming(
+        &mut cell.class_c_view(),
+        &deps,
+        ctx,
+        &answered,
+        &mut None,
+        &mut None,
+    )
+    .await
+    .expect("the request is consumed");
+    assert_eq!(answers_to_bob(&cell), 1, "a member that reads is answered");
+}
+
 // ---------------------------------------------------------------------------
 // The six operations, through the Supervisor, with the relay down.
 // ---------------------------------------------------------------------------
@@ -1009,5 +1155,126 @@ mod operations {
         let outcome = rx.await.expect("reply").expect("the reset executes");
         assert!(outcome.execution_result.is_some(), "auto-executed");
         assert_pending_to(&mut node, CAROL);
+    }
+
+    fn revoke(did: &str, access: AccessScope) -> GovernanceAction {
+        GovernanceAction::RevokeAccess {
+            did: DID::from(did),
+            access,
+        }
+    }
+
+    /// The highest epoch of a distribution to `target` in the persisted queue.
+    fn persisted_epoch_to(node: &Node, target: &str) -> Option<u64> {
+        node.store
+            .queue(&node.ctx)
+            .iter()
+            .filter(|p| p.target_did == target)
+            .map(|p| p.epoch)
+            .max()
+    }
+
+    /// Fails if a read revoke leaves the revoked member's queued distribution
+    /// in the persist that records the revoke, drops another member's, or a
+    /// later rotation queues the new key to the revoked member (spec 09
+    /// §9.16.10).
+    #[tokio::test]
+    async fn read_revoke_purges_and_excludes_the_member() {
+        let mut node = trio(0x37).await;
+        // A write revoke of Bob rotates with the relay down: a distribution
+        // to Carol and one to Bob stay queued.
+        govern(&node, revoke(BOB, AccessScope::Write)).await;
+        assert_pending_to(&mut node, CAROL);
+        let first = persisted_epoch_to(&node, BOB).expect("Bob's distribution queued");
+
+        govern(&node, revoke(CAROL, AccessScope::Read)).await;
+        assert_eq!(
+            persisted_epoch_to(&node, CAROL),
+            None,
+            "the persist that records the read revoke drops Carol's distribution"
+        );
+        assert_eq!(persisted_epoch_to(&node, BOB), Some(first), "Bob's stays");
+
+        // Carol can still write; revoking that rotates the key again.
+        govern(&node, revoke(CAROL, AccessScope::Write)).await;
+        assert!(
+            persisted_epoch_to(&node, BOB).expect("Bob's distribution") > first,
+            "the second rotation queued its key to Bob"
+        );
+        assert_eq!(
+            persisted_epoch_to(&node, CAROL),
+            None,
+            "no rotation after the read revoke queues a key to Carol"
+        );
+    }
+
+    /// Fails if a write revoke whose rotation step fails returns `Ok`, or if
+    /// the revoke does not stand.
+    #[tokio::test]
+    async fn write_revoke_reports_a_failed_rotation() {
+        let node = trio(0x38).await;
+        node.store.refuse_next_rotation();
+        let err = node
+            .sup
+            .propose_governance_action_checked(
+                &node.ctx,
+                &DID::from(ALICE),
+                revoke(BOB, AccessScope::Write),
+                &signer(ALICE),
+            )
+            .await
+            .expect_err("the failed rotation reaches the caller");
+        assert!(
+            matches!(
+                err,
+                scp_protocol::context::ContextError::PersistenceFailed(_)
+            ),
+            "the rotation's persist error, typed: {err:?}"
+        );
+        // The revoke stood: the persisted state suspends Bob's write.
+        let snapshot = node
+            .store
+            .0
+            .get(&node.ctx)
+            .map(|s| s.value().clone())
+            .expect("a persisted snapshot");
+        assert!(
+            snapshot
+                .role_state
+                .suspended_for(BOB)
+                .is_some_and(|s| s.contains(&Capability::MessagesWrite)),
+            "Bob's write is suspended durably"
+        );
+    }
+
+    /// Fails if a leave whose rotation step fails returns `Ok`, or if the
+    /// leave does not stand.
+    #[tokio::test]
+    async fn leave_reports_a_failed_rotation() {
+        let node = trio(0x39).await;
+        node.store.refuse_next_rotation();
+        let err = node
+            .sup
+            .leave_context(&node.handle, &DID::from(ALICE), &DID::from(BOB))
+            .await
+            .expect_err("the failed rotation reaches the caller");
+        assert!(
+            matches!(
+                err,
+                scp_protocol::context::ContextError::PersistenceFailed(_)
+            ),
+            "the rotation's persist error, typed: {err:?}"
+        );
+        let again = node
+            .sup
+            .leave_context(&node.handle, &DID::from(ALICE), &DID::from(BOB))
+            .await;
+        assert!(
+            matches!(
+                again,
+                Err(scp_protocol::context::ContextError::MemberNotFound(_))
+            ),
+            "the leave stood: {again:?}"
+        );
     }
 }

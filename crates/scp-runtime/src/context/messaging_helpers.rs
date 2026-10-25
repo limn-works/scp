@@ -1517,6 +1517,14 @@ pub async fn deliver_incoming(
         .access_key_store
         .get(context_id, &local_member_did)
         .cloned();
+    // A read-revoked identity's `SenderKeyRequest` is denied (spec 09
+    // §9.16.10), read from the governance state.
+    let read_excluded: std::collections::HashSet<String> = view
+        .access_mut()
+        .read_exclusion_list
+        .iter()
+        .map(|did| did.0.clone())
+        .collect();
     drop(local_dids);
 
     // Phase 2: open envelope (MLS + sender key + deserialize + integrity).
@@ -1531,6 +1539,7 @@ pub async fn deliver_incoming(
         context_id,
         &context_id_bytes,
         encrypted_blob,
+        &read_excluded,
     )
     .await?
     {
@@ -3172,12 +3181,15 @@ pub(super) enum Dispatched {
 ///
 /// It does not advance the anti-replay floor. The only caller,
 /// [`deliver_incoming`], advances it after the inner envelope verifies.
+/// A `SenderKeyRequest` from an identity in `denied` gets no answer (spec 09
+/// §9.16.10: the read-revoked identities).
 pub(super) async fn decrypt_and_dispatch(
     deps: &ActorDeps,
     crypto_state: Option<&mut crate::context::actor::state::ContextCryptoState>,
     context_id: &str,
     context_id_bytes: &[u8; 32],
     encrypted_blob: &[u8],
+    denied: &std::collections::HashSet<String>,
 ) -> Result<Dispatched, ContextError> {
     let decrypt_start = std::time::Instant::now();
     // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): open through the actor's OWNED
@@ -3249,12 +3261,9 @@ pub(super) async fn decrypt_and_dispatch(
                 ) => {
                     let (request_bytes, requester_pk) =
                         bind_sender_key_request(deps, &request, &sender_did)?;
-                    // No per-context sender-key block list is resident on the actor
-                    // (the blocking-flow wiring into the actor answer path is a
-                    // forward-only follow-up, tracked in #2146); the §9.16.6
-                    // Mitigation-1 membership gate on the MLS group tree is the live
-                    // Sybil defense.
-                    let blocked = std::collections::HashSet::new();
+                    // `denied` holds the read-revoked identities (§9.16.10); the
+                    // §9.16.6 Mitigation-1 membership gate on the MLS group tree
+                    // is the Sybil defense.
                     let now_secs = deps.clock.now_secs();
                     if let Some(sealed) = cs.handle_sender_key_request(
                         context_id_bytes,
@@ -3262,7 +3271,7 @@ pub(super) async fn decrypt_and_dispatch(
                         now_secs,
                         &request_bytes,
                         requester_pk.as_bytes(),
-                        &blocked,
+                        denied,
                     )? {
                         // Queue the answer, sealed to the request's ephemeral
                         // wrapping key, for MLS-wrap + transmit by

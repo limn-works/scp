@@ -382,11 +382,14 @@ pub async fn leave_context(
     // `ContextTransportProvider` is async and cannot be awaited inside the
     // synchronous `_keep` closure above). The membership removal is already
     // fail-closed-persisted; the MLS-Commit broadcast's failure bookkeeping is
-    // itself re-persisted FAIL-CLOSED (see below), while the sender-key rotation +
-    // delivery are best-effort crypto/transport side-effects. The captured
+    // itself re-persisted FAIL-CLOSED (see below). A failed sender-key rotation
+    // leaves the leave standing and is returned to the caller at the end; a
+    // failed delivery stays queued (spec 09 §9.16.9). The captured
     // `mls_commit_bytes` is the removal Commit already produced under the crypto
     // `Arc` (Class-M) inside the closure.
-    if !is_broadcast {
+    let rotation = if is_broadcast {
+        Ok(())
+    } else {
         // Broadcast the MLS Commit to remaining members so they can advance their
         // group epoch and ratchet key material. Broadcast async (ADR-049 Decision
         // 7); on transport FAILURE the retry-queue bookkeeping is persisted
@@ -406,51 +409,11 @@ pub async fn leave_context(
             governance_helpers::keep_broadcast_failure(cell, deps, &context_id, failure).await?;
         }
 
-        // Rotate the local sender key and distribute to remaining members
-        // (§9.16.4). ADR-049 PR-7: Class-S — the epoch bump is sync-persisted
-        // fail-closed via `commit_class_s_keep` (a bumped-then-crash-lost epoch
-        // would let the departed member's old key keep decrypting); anti-replay
-        // backstop is the never-regressing registry floor (`mirror_forward`,
-        // `?`-propagated). M23: sender-key rotation + distribution stays
-        // best-effort — a rotate/persist failure is logged and the leave continues
-        // (MLS removal above is the hard security boundary).
-        let local_did = deps.crypto.local_did().to_owned();
-        match cell
-            .commit_class_s_keep(deps, &context_id, |mut v| {
-                let s = v.rest_mut();
-                s.rotate_sender_key(&local_did, deps.event_tx.as_ref())?;
-                Ok(s.local_sender_key_epoch())
-            })
-            .await
-        {
-            Ok(epoch) => {
-                // ADR-049 PR-6/PR-7: advance the durably-bumped local epoch in the
-                // authoritative floor registry (fail-closed backstop).
-                crate::context::messaging_helpers::mirror_forward_local_sender_epoch(
-                    deps,
-                    &context_id_bytes,
-                    epoch,
-                )?;
-            }
-            Err(e) => {
-                tracing::warn!(
-                    context_id = %context_id,
-                    error = %e,
-                    "rotate_sender_key failed after leave — \
-                     remaining members retain old sender key"
-                );
-            }
-        }
-        // Publish what the rotation queued. A failed publish stays queued and
-        // is reported by event (spec 09 §9.16.9); the leave stands.
-        drain_and_deliver_sender_keys(
-            deps,
-            &mut cell.class_c_view(),
-            &context_id,
-            DistributionScope::NeverAttempted,
-        )
-        .await;
-    }
+        // Rotate the local sender key and publish to the remaining members
+        // (§9.16.4: removal implies blocking). The leave stands either way; a
+        // rotation failure is returned after the `MemberLeft` leaf below.
+        rotate_sender_key_and_distribute(cell, deps, &context_id).await
+    };
 
     // Append the `MemberLeft` Merkle leaf AFTER the Class-S removal persist.
     // Under ADR-049 Decision 7 `EventLogPersistence` is async, so this append
@@ -491,7 +454,7 @@ pub async fn leave_context(
         handle.transition_to(&ContextState::Closing)?;
     }
 
-    Ok(())
+    rotation
 }
 
 // ---------------------------------------------------------------------------
@@ -536,6 +499,58 @@ pub(super) fn add_member_and_queue_distribution(
         );
     }
     Ok(output)
+}
+
+/// Rotates the local sender key after a membership or access change and
+/// publishes what the rotation queued (spec 09 §9.16.4: removal implies
+/// blocking, and a block is a sender-side rotation; §9.16.10 for a revoke).
+///
+/// The epoch bump persists fail-closed through `commit_class_s_keep`, and a
+/// bumped epoch advances the floor registry. The publish pass runs whether or
+/// not the rotation landed: a failed publish stays queued and is reported by
+/// event (§9.16.9), and the operation that rotated stands.
+///
+/// # Errors
+///
+/// The rotation's error (the `rotate_sender_key` failure or the persist
+/// failure), or the floor registry's. The caller finishes the durable work of
+/// the operation that rotated, then returns this error, so a rotation failure
+/// reaches its caller typed and never only as a log line.
+pub(super) async fn rotate_sender_key_and_distribute(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    context_id: &str,
+) -> Result<(), ContextError> {
+    let local_did = deps.crypto.local_did().to_owned();
+    let rotated = cell
+        .commit_class_s_keep(deps, context_id, |mut v| {
+            let s = v.rest_mut();
+            s.rotate_sender_key(&local_did, deps.event_tx.as_ref())?;
+            Ok(s.local_sender_key_epoch())
+        })
+        .await
+        .and_then(|epoch| {
+            crate::context::messaging_helpers::mirror_forward_local_sender_epoch(
+                deps,
+                &state::context_id_to_bytes(context_id),
+                epoch,
+            )
+        });
+    if let Err(e) = &rotated {
+        tracing::error!(
+            context_id,
+            error = %e,
+            "sender-key rotation failed; members keep the old sender key"
+        );
+    }
+    drain_and_deliver_sender_keys(
+        deps,
+        &mut cell.class_c_view(),
+        context_id,
+        DistributionScope::NeverAttempted,
+    )
+    .await;
+    rotated
 }
 
 /// Which queued sender-key distributions one pass of

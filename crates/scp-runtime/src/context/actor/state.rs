@@ -2912,13 +2912,35 @@ impl PerContextState {
         member_did: &str,
     ) -> Result<(), ContextError> {
         let ctx_id_hex = hex::encode(self.context_id);
-        let crypto = self.encrypted_crypto_mut()?;
-        crypto.sender_key_store.remove(&ctx_id_hex, member_did);
+        self.encrypted_crypto_mut()?
+            .sender_key_store
+            .remove(&ctx_id_hex, member_did);
         // A departed member gets no queued distribution: dropped in the same
         // durable step as its sender key (spec 09 §9.16.9).
-        ContextCryptoState::drop_distributions_to(&mut crypto.pending_distributions, member_did);
+        self.drop_queued_distributions_to(member_did)
         // The wrapping-key cache follows the tree: the Remove Commit that
         // dropped the member's last leaf already dropped its key.
+    }
+
+    /// Drops every sender-key distribution queued to `member_did`, which left
+    /// the context or lost read access (spec 09 §9.16.9, §9.16.10). The caller
+    /// runs it inside the Class-S step that records the departure or the
+    /// revocation, so the purge persists with it. A member in
+    /// `read_exclusion_list` gets no key from a later rotation and no answer
+    /// to its `SenderKeyRequest`.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::CryptoFailed`] if this context has no encrypted crypto
+    /// sub-state (broadcast mode).
+    pub(crate) fn drop_queued_distributions_to(
+        &mut self,
+        member_did: &str,
+    ) -> Result<(), ContextError> {
+        ContextCryptoState::drop_distributions_to(
+            &mut self.encrypted_crypto_mut()?.pending_distributions,
+            member_did,
+        );
         Ok(())
     }
 
@@ -3022,6 +3044,13 @@ impl PerContextState {
         let ctx_id_hex = hex::encode(self.context_id);
         let context_id = self.handle.context_id().to_owned();
         let mut not_built = Vec::new();
+        // Read-revoked members get no pushed key (spec 09 §9.16.10).
+        let read_excluded: Vec<String> = self
+            .access
+            .read_exclusion_list
+            .iter()
+            .map(|d| d.0.clone())
+            .collect();
         let crypto = self.encrypted_crypto_mut()?;
 
         // One-shot fault-injection seam (#2148 F1 / ADR-049 §15(c)): induce a
@@ -3070,7 +3099,7 @@ impl PerContextState {
 
         for (member_did, wrapping_pub) in &member_keys {
             // Skip self-sealing: the local member already holds the new key.
-            if *member_did == local_did {
+            if *member_did == local_did || read_excluded.contains(member_did) {
                 continue;
             }
             let seal_result = crate::crypto::sender_keys::key_protocol::hpke_seal_sender_key(
