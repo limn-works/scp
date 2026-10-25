@@ -263,15 +263,12 @@ pub enum KeyEventSignError {
     #[error("unsupported: {0}")]
     Unsupported(&'static str),
     /// The substrate failed: closed or locked storage, a failed decrypt, or a
-    /// host error.
-    #[error("the custody substrate failed ({code}): {message}")]
-    Substrate {
-        /// The SCP error code of the substrate's failure, such as
-        /// `SCP-STORAGE-8000`.
-        code: &'static str,
-        /// The substrate's description of the failure.
-        message: String,
-    },
+    /// host error. The [`CustodyFailure`](scp_crypto::CustodyFailure) carries
+    /// the failure's kind and the substrate's description. A bridge reports
+    /// the code `scp_ffi_common::error_codes::custody_failure_code` assigns to
+    /// that kind, the one table every custody failure's code comes from.
+    #[error("the custody substrate failed ({kind:?}): {detail}", kind = .0.kind, detail = .0.detail)]
+    Substrate(scp_crypto::CustodyFailure),
 }
 
 #[cfg(test)]
@@ -421,14 +418,14 @@ mod tests {
     }
 
     #[test]
-    fn a_substrate_failure_names_its_error_code() {
-        let error = KeyEventSignError::Substrate {
-            code: "SCP-STORAGE-8000",
-            message: "storage is locked".to_owned(),
-        };
+    fn a_substrate_failure_names_its_failure_kind() {
+        let error = KeyEventSignError::Substrate(scp_crypto::CustodyFailure {
+            kind: scp_crypto::CustodyFailureKind::StorageLockHeld,
+            detail: "storage is locked".to_owned(),
+        });
         assert_eq!(
             error.to_string(),
-            "the custody substrate failed (SCP-STORAGE-8000): storage is locked"
+            "the custody substrate failed (StorageLockHeld): storage is locked"
         );
     }
 }

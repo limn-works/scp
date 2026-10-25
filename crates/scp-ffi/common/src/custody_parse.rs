@@ -136,9 +136,7 @@ mod tests {
     /// assigns (ADR-021 2026-09-29 amendment, spec §17.6). Attestation, push
     /// and unsupported failures carry their own codes, never the key custody
     /// code `SCP-CRYPTO-4060`, and each push kind has a distinct code (ADR-006
-    /// 2026-10-12 amendment). A key-event signer's
-    /// [`Substrate`](scp_platform::KeyEventSignError::Substrate) failure
-    /// carries that same code.
+    /// 2026-10-12 amendment).
     #[test]
     fn custody_failure_code_covers_every_platform_error() {
         use crate::error_codes as codes;
@@ -203,15 +201,6 @@ mod tests {
                 expected,
                 "{error:?}"
             );
-            // A key-event signer's substrate failure carries the same code
-            // (SCP-345); scp-platform writes its table out because this
-            // registry sits above it.
-            let described = format!("{error:?}");
-            if let scp_platform::KeyEventSignError::Substrate { code, .. } =
-                scp_platform::KeyEventSignError::from(error)
-            {
-                assert_eq!(code, expected, "{described}");
-            }
         }
     }
 

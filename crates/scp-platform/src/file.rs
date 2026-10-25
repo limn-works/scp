@@ -287,14 +287,14 @@ const KEY_TYPE_P256_HPKE: u8 = 0x04;
 
 /// The type of key stored in an entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StoredKeyType {
+enum StoredKeyType {
     Ed25519,
     P256Signing,
     HpkeP256,
 }
 
 impl StoredKeyType {
-    pub(crate) const fn to_byte(self) -> u8 {
+    const fn to_byte(self) -> u8 {
         match self {
             Self::Ed25519 => KEY_TYPE_ED25519,
             Self::P256Signing => KEY_TYPE_P256_SIGNING,
@@ -302,7 +302,7 @@ impl StoredKeyType {
         }
     }
 
-    pub(crate) const fn from_key_type(key_type: KeyType) -> Self {
+    const fn from_key_type(key_type: KeyType) -> Self {
         match key_type {
             KeyType::Ed25519 => Self::Ed25519,
             KeyType::P256Signing => Self::P256Signing,
@@ -312,7 +312,7 @@ impl StoredKeyType {
 
     /// Returns the public [`KeyType`] this stored type names, so an error a
     /// caller reads names the same values the trait's own signatures use.
-    pub(crate) const fn to_key_type(self) -> KeyType {
+    const fn to_key_type(self) -> KeyType {
         match self {
             Self::Ed25519 => KeyType::Ed25519,
             Self::P256Signing => KeyType::P256Signing,
@@ -320,7 +320,7 @@ impl StoredKeyType {
         }
     }
 
-    pub(crate) fn from_byte(b: u8) -> Result<Self, PlatformError> {
+    fn from_byte(b: u8) -> Result<Self, PlatformError> {
         match b {
             KEY_TYPE_ED25519 => Ok(Self::Ed25519),
             KEY_TYPE_P256_SIGNING => Ok(Self::P256Signing),
@@ -1982,6 +1982,21 @@ impl KeyCustody for FileKeyCustody {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// File's §17.8 key-type table maps the key types one-to-one and refuses
+    /// every byte it does not assign, including the retired `0x02`.
+    #[test]
+    fn stored_key_type_bytes_are_a_bijection() {
+        crate::traits::assert_key_type_bijection(
+            "file",
+            |t| StoredKeyType::from_key_type(t).to_byte(),
+            |b| {
+                StoredKeyType::from_byte(b)
+                    .ok()
+                    .map(StoredKeyType::to_key_type)
+            },
+        );
+    }
 
     /// Helper: create a `FileKeyCustody` in a temporary directory.
     fn make_custody(dir: &TempDir, passphrase: &str) -> FileKeyCustody {

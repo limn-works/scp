@@ -7,47 +7,57 @@
 //! an integration test as well as in the rustdoc twin because `cargo nextest`
 //! runs no doctests.
 
+use core::future::{Future, ready};
+
 use scp_platform::{
-    CustodyProbe, IndexedSignature, KeyEventSignError, KeyEventSigner, NextSetCustody,
+    CustodyProbe, IndexedSignature, KeyEventSignError, KeyEventSigner, MaybeSend, NextSetCustody,
     NextSetCustodyError, NextSetKeyHandle, PreRotationCustodyKind, ProbeSignature, SigningChange,
 };
 
 struct Complete;
 
+// The signatures are the doctest's, `fn -> impl Future + MaybeSend` for the
+// signer and `+ Send` for the custody. The bodies are ready futures where the
+// doctest has async blocks; the signatures are what the doctest checks.
 impl KeyEventSigner for Complete {
     type Member = NextSetKeyHandle;
 
-    async fn sign_change(
+    fn sign_change(
         &self,
         _member: &NextSetKeyHandle,
         _change: &SigningChange,
-    ) -> Result<IndexedSignature, KeyEventSignError> {
-        Err(KeyEventSignError::MemberNotFound)
+    ) -> impl Future<Output = Result<IndexedSignature, KeyEventSignError>> + MaybeSend {
+        ready(Err(KeyEventSignError::MemberNotFound))
     }
 
-    async fn sign_probe(
+    fn sign_probe(
         &self,
         _member: &NextSetKeyHandle,
         _probe: &CustodyProbe,
-    ) -> Result<ProbeSignature, KeyEventSignError> {
-        Err(KeyEventSignError::MemberNotFound)
+    ) -> impl Future<Output = Result<ProbeSignature, KeyEventSignError>> + MaybeSend {
+        ready(Err(KeyEventSignError::MemberNotFound))
     }
 }
 
 impl NextSetCustody for Complete {
-    async fn generate(&self) -> Result<NextSetKeyHandle, NextSetCustodyError> {
-        Err(NextSetCustodyError::HandleNotFound)
+    fn generate(
+        &self,
+    ) -> impl Future<Output = Result<NextSetKeyHandle, NextSetCustodyError>> + Send {
+        ready(Err(NextSetCustodyError::HandleNotFound))
     }
 
-    async fn reveal_public_key(
+    fn reveal_public_key(
         &self,
         _handle: &NextSetKeyHandle,
-    ) -> Result<[u8; 33], NextSetCustodyError> {
-        Err(NextSetCustodyError::HandleNotFound)
+    ) -> impl Future<Output = Result<[u8; 33], NextSetCustodyError>> + Send {
+        ready(Err(NextSetCustodyError::HandleNotFound))
     }
 
-    async fn destroy(&self, _handle: &NextSetKeyHandle) -> Result<(), NextSetCustodyError> {
-        Err(NextSetCustodyError::HandleNotFound)
+    fn destroy(
+        &self,
+        _handle: &NextSetKeyHandle,
+    ) -> impl Future<Output = Result<(), NextSetCustodyError>> + Send {
+        ready(Err(NextSetCustodyError::HandleNotFound))
     }
 
     fn custody_kind(&self) -> PreRotationCustodyKind {

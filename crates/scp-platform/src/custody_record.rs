@@ -35,7 +35,15 @@ const RECORD_LEN: usize = 3;
 /// The 16-byte namespace that scopes one callback adapter's records
 /// (spec §17.3). The adapter's builder draws it from a CSPRNG; this crate
 /// takes it as bytes and draws nothing.
-#[derive(Clone, Copy, PartialEq, Eq)]
+///
+/// It is neither `Copy` nor `Clone`, and [`StorageCustodyRecordStore::new`]
+/// takes it by move, so one namespace value builds one store. A store's
+/// `put` checks for a record and then writes under a lock only that store
+/// holds, and [`Storage`] has no insert-if-absent, so two stores over one
+/// namespace could each pass the check and write different records. SCP-345's
+/// callback-adapter loader takes the namespace from its registry entry by
+/// move for the same reason.
+#[derive(PartialEq, Eq)]
 pub struct CustodyNamespace([u8; 16]);
 
 impl CustodyNamespace {
@@ -52,7 +60,7 @@ impl CustodyNamespace {
     }
 
     /// The 32 lowercase hex characters a record key carries.
-    fn to_hex(self) -> String {
+    fn to_hex(&self) -> String {
         const DIGITS: &[u8; 16] = b"0123456789abcdef";
         let mut out = String::with_capacity(32);
         for b in self.0 {
@@ -143,7 +151,19 @@ impl<S: Storage> fmt::Debug for StorageCustodyRecordStore<S> {
 
 impl<S: Storage> StorageCustodyRecordStore<S> {
     /// A store over `storage` that reads and writes only `namespace`'s
-    /// records.
+    /// records. It takes `namespace` by move, so no second store shares it:
+    ///
+    /// ```compile_fail,E0382
+    /// use scp_platform::{CustodyNamespace, Storage, StorageCustodyRecordStore};
+    ///
+    /// fn two_stores<S: Storage + Clone>(storage: S, namespace: CustodyNamespace) {
+    ///     let _first = StorageCustodyRecordStore::new(storage.clone(), namespace);
+    ///     let _second = StorageCustodyRecordStore::new(storage, namespace);
+    /// }
+    /// ```
+    ///
+    /// `tests/custody_record_namespace.rs` compiles the same function with
+    /// two namespaces.
     #[must_use]
     pub const fn new(storage: S, namespace: CustodyNamespace) -> Self {
         Self {
@@ -418,6 +438,43 @@ mod tests {
             assert_eq!(storage.retrieve(&records.key(handle)).await?, Some(value));
         }
         assert_eq!(RECORD_LEN, 3);
+        Ok(())
+    }
+
+    /// One store's gate holds the check and the write together: of two
+    /// concurrent puts of different records under one id, one lands and the
+    /// other is refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_different_puts_on_one_store_admit_one() -> TestResult {
+        for id in 0..64 {
+            let storage = Arc::new(InMemoryStorage::new());
+            let records = Arc::new(store(&storage, NS_A));
+            let handle = KeyHandle::new(id);
+            let (first, second) = (Arc::clone(&records), Arc::clone(&records));
+            let a = tokio::spawn(async move {
+                first
+                    .put(handle, KeyType::P256Signing, KeyRole::Operational)
+                    .await
+            });
+            let b = tokio::spawn(async move {
+                second
+                    .put(handle, KeyType::HpkeP256, KeyRole::Identity)
+                    .await
+            });
+            let (a, b) = (a.await?, b.await?);
+            assert_eq!(
+                usize::from(a.is_ok()) + usize::from(b.is_ok()),
+                1,
+                "{a:?} {b:?}"
+            );
+            let stored = records.get(handle).await?;
+            let winner = if a.is_ok() {
+                record(KeyType::P256Signing, KeyRole::Operational)
+            } else {
+                record(KeyType::HpkeP256, KeyRole::Identity)
+            };
+            assert_eq!(stored, Some(winner));
+        }
         Ok(())
     }
 

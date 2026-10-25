@@ -289,7 +289,7 @@ scp/
 │   │   ├── document.rs        # Retired document types; the key state replaces them
 │   │   └── attestation.rs     # Key-custody / identity-link attestation types
 │   │
-│   ├── scp-kel/               # Key-event log codec (SCP-308, slice S1) and verifier (SCP-309, from slice S2) — wasm-safe Layer 1 crate (see "Layered Dependency Graph");
+│   ├── scp-kel/               # Key-event log codec (SCP-308, slice S1) and verifier (SCP-309, from slice S2) — wasm-safe Layer 0 crate (see "Layered Dependency Graph");
 │   │                          #   no async, no I/O; depends on scp-did, and on scp-crypto from S2 (09-security-model.md §9.7.4.2, ADR-063)
 │   │
 │   ├── scp-mls/               # Synchronous MLS state machine — wasm-safe, shared by node + browser (ADR-057)
@@ -669,7 +669,7 @@ This section documents the layered dependency graph, every replaceable subsystem
 
 #### 2.5.1 Layered Dependency Graph
 
-Dependencies flow strictly upward. No crate may depend on a crate at a *higher* layer; intra-layer edges are permitted but must be acyclic. The Layer 0 capability leaves (`scp-clock`, `scp-crypto`, `scp-did`) are mutually independent — each depends only on external crates (`scp-did` on `p256` directly), so there are no intra-layer edges among them. `scp-platform` is the one Layer 0 crate that is not a leaf: it depends on `scp-crypto`, because the `Pseudonym` type its `KeyCustody` trait returns validates its P-256 point and computes its routing id there, and that edge is Layer 0's only intra-layer edge. Violations are compile errors (separate crates) or PR review failures (internal modules).
+Dependencies flow strictly upward. No crate may depend on a crate at a *higher* layer; intra-layer edges are permitted but must be acyclic. The Layer 0 capability leaves (`scp-clock`, `scp-crypto`, `scp-did`, `scp-sqlite-pools`) are mutually independent — each depends only on external crates (`scp-did` on `p256` directly), so there are no intra-layer edges among them. Two Layer 0 crates are not leaves, and their edges are Layer 0's only intra-layer edges. `scp-kel` depends on `scp-did` and `scp-crypto`. `scp-platform` depends on `scp-crypto`, because the `Pseudonym` type its `KeyCustody` trait returns validates its P-256 point and computes its routing id there; on `scp-kel`, because `KeyEventSigner` is a supertrait of `KeyCustody` (ADR-006, amended 2026-10-20); and, under its `sqlite` feature, on `scp-sqlite-pools`. No Layer 0 crate depends on `scp-platform`, and `scp-kel` depends only on leaves, so the edges are acyclic. `scripts/check-protocol-deps.sh` refuses any other SCP dependency of `scp-platform` and any `scp-platform` dependency of `scp-kel`. Violations are compile errors (separate crates) or PR review failures (internal modules).
 
 ```
 Layer 0 ─ scp-alloc                 Wiping global allocator (09-security-model.md §9.15). Wasm-safe leaf;
@@ -682,9 +682,15 @@ Layer 0 ─ scp-alloc                 Wiping global allocator (09-security-model
            │  scp-did                Identity data model (identifier, SigningKeyId, key state,
            │                          attestation). Wasm-safe leaf; deps =
            │                          the `p256` crate directly (no SCP deps).
+           │  scp-sqlite-pools        Opens SQLCipher connections with SQLite's reusable pools
+           │                          off (§17.6, §9.15). Leaf; no SCP dependencies.
+           │  scp-kel                 Key-event log codec and verifier (09-security-model.md
+           │                          §9.7.4.2; ADR-063). Wasm-safe and synchronous; its SCP
+           │                          dependencies are scp-did and scp-crypto.
            │  scp-platform            Platform abstraction traits (KeyCustody, Storage,
-           │                          DeviceAttestation, Push). Depends on scp-crypto only;
-           │                          the other Layer 0 crates have no SCP dependencies.
+           │                          DeviceAttestation, Push). Depends on scp-crypto, scp-kel,
+           │                          and (feature `sqlite`) scp-sqlite-pools; the other
+           │                          Layer 0 crates depend on no SCP crate but the ones named.
            │
 Layer 1 ─ scp-protocol              Pure sync protocol types (no tokio, wasm32-compatible).
            │  scp-runtime             Async orchestration (Supervisor + per-context actors, MLS, providers; ADR-049).
@@ -694,10 +700,6 @@ Layer 1 ─ scp-protocol              Pure sync protocol types (no tokio, wasm32
            │                          imports the identity model from scp-did.
            │  scp-dht                  Retired DHT transport leaf; no resolution path reads it.
            │  scp-event-log           Merkle event log.
-           │  scp-kel                 Key-event log codec and verifier (09-security-model.md
-           │                          §9.7.4.2; ADR-063). Wasm-safe and synchronous; its SCP
-           │                          dependencies are scp-did and scp-crypto, so it sits
-           │                          above Layer 0.
            │  scp-mls                 Synchronous MLS state machine (wasm-safe; ADR-057).
            │  scp-client              In-browser participant driver over scp-mls (ADR-057).
            │  scp-client-wasm         wasm-bindgen browser surface over scp-client (ADR-057).

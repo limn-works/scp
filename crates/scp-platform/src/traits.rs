@@ -1646,9 +1646,49 @@ pub const fn require_derive_source(role: KeyRole, key_type: KeyType) -> Result<(
     Ok(())
 }
 
+/// Every key type, listed through an exhaustive match so a new variant
+/// fails to compile here until every key-type byte table covers it.
+#[cfg(test)]
+fn all_key_types() -> [KeyType; 3] {
+    let all = [KeyType::Ed25519, KeyType::P256Signing, KeyType::HpkeP256];
+    for t in all {
+        match t {
+            KeyType::Ed25519 | KeyType::P256Signing | KeyType::HpkeP256 => {}
+        }
+    }
+    all
+}
+
+/// Test-only: asserts that `encode` gives each key type a distinct byte that
+/// `decode` maps back, and that `decode` refuses every other byte.
+#[cfg(test)]
+pub(crate) fn assert_key_type_bijection(
+    table: &str,
+    encode: impl Fn(KeyType) -> u8,
+    decode: impl Fn(u8) -> Option<KeyType>,
+) {
+    let codes: Vec<u8> = all_key_types().into_iter().map(&encode).collect();
+    let mut distinct = codes.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(
+        distinct.len(),
+        codes.len(),
+        "{table}: codes collide {codes:?}"
+    );
+    for t in all_key_types() {
+        assert_eq!(decode(encode(t)), Some(t), "{table}: {t:?}");
+    }
+    for byte in 0..=u8::MAX {
+        if !codes.contains(&byte) {
+            assert_eq!(decode(byte), None, "{table}: byte {byte} decodes");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{KeyRole, KeyType, PushToken};
+    use super::{KeyRole, KeyType, PushToken, all_key_types, assert_key_type_bijection};
 
     /// `Debug` of a push token prints its length and none of its bytes, in
     /// text or in the decimal list a derived `Debug` would print.
@@ -1661,49 +1701,12 @@ mod tests {
         assert!(printed.contains("17 bytes redacted"), "{printed}");
     }
 
-    /// Every key type, listed through an exhaustive match so a new variant
-    /// fails to compile here until the tables below cover it.
-    fn all_key_types() -> [KeyType; 3] {
-        let all = [KeyType::Ed25519, KeyType::P256Signing, KeyType::HpkeP256];
-        for t in all {
-            match t {
-                KeyType::Ed25519 | KeyType::P256Signing | KeyType::HpkeP256 => {}
-            }
-        }
-        all
-    }
-
-    /// Asserts that `encode` gives each key type a distinct byte that
-    /// `decode` maps back, and that `decode` refuses every other byte.
-    fn assert_bijection(
-        table: &str,
-        encode: impl Fn(KeyType) -> u8,
-        decode: impl Fn(u8) -> Option<KeyType>,
-    ) {
-        let codes: Vec<u8> = all_key_types().into_iter().map(&encode).collect();
-        let mut distinct = codes.clone();
-        distinct.sort_unstable();
-        distinct.dedup();
-        assert_eq!(
-            distinct.len(),
-            codes.len(),
-            "{table}: codes collide {codes:?}"
-        );
-        for t in all_key_types() {
-            assert_eq!(decode(encode(t)), Some(t), "{table}: {t:?}");
-        }
-        for byte in 0..=u8::MAX {
-            if !codes.contains(&byte) {
-                assert_eq!(decode(byte), None, "{table}: byte {byte} decodes");
-            }
-        }
-    }
-
-    /// The SQLite and custody-record table and File's §17.8 table each map the
-    /// key types one-to-one, and refuse every byte they do not assign.
+    /// The SQLite and custody-record table maps the key types one-to-one and
+    /// refuses every byte it does not assign; `file.rs` checks File's §17.8
+    /// table with the same helper.
     #[test]
     fn key_type_byte_tables_are_bijections() {
-        assert_bijection(
+        assert_key_type_bijection(
             "storage_code",
             KeyType::storage_code,
             KeyType::from_storage_code,
@@ -1713,19 +1716,6 @@ mod tests {
             [0, 2, 3],
             "the SQLite rows already on disk fix these codes"
         );
-        #[cfg(feature = "file")]
-        {
-            use crate::file::StoredKeyType;
-            assert_bijection(
-                "file",
-                |t| StoredKeyType::from_key_type(t).to_byte(),
-                |b| {
-                    StoredKeyType::from_byte(b)
-                        .ok()
-                        .map(StoredKeyType::to_key_type)
-                },
-            );
-        }
     }
 
     /// Every key type and role names itself in the host contract and parses

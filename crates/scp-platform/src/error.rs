@@ -189,7 +189,9 @@ impl From<PlatformError> for scp_kel::KeyEventSignError {
     /// handle is [`MemberNotFound`](scp_kel::KeyEventSignError::MemberNotFound),
     /// an unsupported operation keeps its message, and every other failure is
     /// a [`Substrate`](scp_kel::KeyEventSignError::Substrate) failure carrying
-    /// the error's SCP code and text. The match names every variant, so a new one is
+    /// the [`CustodyFailure`](scp_crypto::CustodyFailure) the same error
+    /// classifies as, so a bridge reports the one code
+    /// `scp_ffi_common::error_codes::custody_failure_code` assigns. The match names every variant, so a new one is
     /// classified here before it compiles.
     fn from(e: PlatformError) -> Self {
         match e {
@@ -204,53 +206,26 @@ impl From<PlatformError> for scp_kel::KeyEventSignError {
             | PlatformError::AttestationError(_)
             | PlatformError::PushError { .. }
             | PlatformError::CustodyError(_)
-            | PlatformError::PseudonymRejected(_) => Self::Substrate {
-                code: custody_failure_code(scp_crypto::CustodyFailure::from(&e).kind),
-                message: e.to_string(),
-            },
+            | PlatformError::PseudonymRejected(_) => {
+                Self::Substrate(scp_crypto::CustodyFailure::from(&e))
+            }
         }
-    }
-}
-
-/// The SCP error code each bridge reports for a custody failure kind, so a
-/// [`Substrate`](scp_kel::KeyEventSignError::Substrate) failure carries the
-/// code the same `PlatformError` reaches a bridge with
-/// (`.docs/standards/sdk-common.md`). The codes are written out because the
-/// registry (`scp_ffi_common::error_codes`) sits above this crate.
-/// `scp_ffi_common`'s `custody_failure_code_covers_every_platform_error` test
-/// checks, for every `PlatformError` variant that becomes a substrate
-/// failure, that this code equals its `custody_failure_code`.
-const fn custody_failure_code(kind: scp_crypto::CustodyFailureKind) -> &'static str {
-    use scp_crypto::CustodyFailureKind as Kind;
-    match kind {
-        Kind::KeyNotFound => "SCP-CRYPTO-4006",
-        Kind::PseudonymRejected => "SCP-IDENT-1055",
-        Kind::StorageClosed => "SCP-STORAGE-8006",
-        Kind::StorageLockHeld => "SCP-STORAGE-8005",
-        Kind::TimedOut => "SCP-CRYPTO-4062",
-        Kind::AttestationFailed => "SCP-ATTEST-9001",
-        Kind::Unsupported => "SCP-CRYPTO-4061",
-        Kind::PushWakePayloadInvalid => "SCP-TRANS-5080",
-        Kind::PushRegistrationRejected => "SCP-TRANS-5081",
-        Kind::PushVerifierUnavailable => "SCP-TRANS-5082",
-        Kind::PushPlatformUnavailable => "SCP-TRANS-5083",
-        Kind::PushProviderFailed => "SCP-TRANS-5084",
-        Kind::Failed => "SCP-CRYPTO-4060",
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use scp_crypto::{CustodyFailure, CustodyFailureKind};
     use scp_kel::KeyEventSignError;
 
     use super::{PlatformError, PushFailureKind};
     use crate::traits::KeyType;
 
-    fn substrate(code: &'static str, message: &str) -> KeyEventSignError {
-        KeyEventSignError::Substrate {
-            code,
-            message: message.to_owned(),
-        }
+    fn substrate(kind: CustodyFailureKind, detail: &str) -> KeyEventSignError {
+        KeyEventSignError::Substrate(CustodyFailure {
+            kind,
+            detail: detail.to_owned(),
+        })
     }
 
     #[test]
@@ -281,24 +256,27 @@ mod tests {
             ),
             (
                 PlatformError::StorageError("disk".into()),
-                substrate("SCP-CRYPTO-4060", "storage error: disk"),
+                substrate(CustodyFailureKind::Failed, "storage error: disk"),
             ),
             (
                 PlatformError::StorageClosed,
                 substrate(
-                    "SCP-STORAGE-8006",
+                    CustodyFailureKind::StorageClosed,
                     &PlatformError::StorageClosed.to_string(),
                 ),
             ),
             (
                 PlatformError::CustodyError("host".into()),
-                substrate("SCP-CRYPTO-4060", "custody error: host"),
+                substrate(CustodyFailureKind::Failed, "custody error: host"),
             ),
-            (push(), substrate("SCP-TRANS-5084", &push().to_string())),
+            (
+                push(),
+                substrate(CustodyFailureKind::PushProviderFailed, &push().to_string()),
+            ),
             (
                 PlatformError::PseudonymRejected("p".into()),
                 substrate(
-                    "SCP-IDENT-1055",
+                    CustodyFailureKind::PseudonymRejected,
                     &PlatformError::PseudonymRejected("p".into()).to_string(),
                 ),
             ),
