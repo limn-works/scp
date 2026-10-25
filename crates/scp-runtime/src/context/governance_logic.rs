@@ -53,6 +53,11 @@ use scp_protocol::trust::consequence::{
 /// [`convergent_consequence_timestamp`]), never a per-member evaluation `now()`
 /// (§7.3.1, §9.9.3). The consequence engine reads `target_did` back out of
 /// the payload via `scp_protocol::trust::consequence::payload_target_is`.
+///
+/// The consequence event types carry no append payload rule
+/// (`check_append_payload` checks only `OutletInvoked`), so a leaf planned
+/// here can never be refused when it is queued after the step (spec 17 §17.3
+/// "Event log write failures"); a test in `log_unit_helpers` pins that.
 fn consequence_leaf(
     event_type: scp_event_log::EventType,
     member_did: &DID,
@@ -790,11 +795,22 @@ pub fn read_consequence_log(
     let mut entries = event_log
         .event_log_entries(&context_id_bytes)?
         .unwrap_or_default();
-    // A queued entry has no position in the log yet, so its sequence and
-    // chain link are placeholders; the merge reads its type, actor, payload,
-    // and timestamp.
+    push_unwritten_leaves(
+        &mut entries,
+        queued.iter().flat_map(|unit| unit.leaves.iter()),
+    );
+    Ok(entries)
+}
+
+/// Appends entries that have no position in the log yet (queued or staged
+/// leaves) to `entries`. Their sequence and chain link are placeholders; the
+/// merge reads their type, actor, payload, and timestamp.
+fn push_unwritten_leaves<'a>(
+    entries: &mut Vec<scp_event_log::Event>,
+    leaves: impl Iterator<Item = &'a crate::context::state::LeafSpec>,
+) {
     let mut sequence = u64::try_from(entries.len()).unwrap_or(u64::MAX);
-    for leaf in queued.iter().flat_map(|unit| unit.leaves.iter()) {
+    for leaf in leaves {
         entries.push(scp_event_log::Event {
             event_type: leaf.event_type,
             actor_did: DID::from(leaf.actor_did.clone()),
@@ -806,7 +822,83 @@ pub fn read_consequence_log(
         });
         sequence = sequence.saturating_add(1);
     }
-    Ok(entries)
+}
+
+/// The consequence rules and the log read before an operation's irreversible
+/// step, for the evaluation that runs after it (spec 17 §17.3 "Event log
+/// write failures"): the received and buffered deliveries and the outlet
+/// capture. The read is the step's precondition, so a failed read refuses the
+/// step and the evaluation after it never reads the log.
+#[derive(Debug, Default, Clone)]
+pub struct PreStepEvidence {
+    /// The context's consequence rules when the log was read.
+    rules: Vec<ConsequenceRule>,
+    /// The durable log followed by the queued units, from
+    /// [`read_consequence_log`]. Empty, and not read, when
+    /// [`Self::read_for_rules`] found no rule.
+    log: Vec<scp_event_log::Event>,
+}
+
+impl PreStepEvidence {
+    /// Reads the log and the queued units, with `rules`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the provider's read error ([`ContextError::EventLogFailed`] or
+    /// [`ContextError::ContextNotRegistered`]); the caller refuses its step.
+    pub fn read(
+        rules: &[ConsequenceRule],
+        queued: &PendingLogUnits,
+        context_id: &str,
+        event_log: &dyn crate::context::builder::ContextEventLogProvider,
+    ) -> Result<Self, ContextError> {
+        Ok(Self {
+            rules: rules.to_vec(),
+            log: read_consequence_log(queued, context_id, event_log)?,
+        })
+    }
+
+    /// [`Self::read`] for a step whose only use of the log is the
+    /// consequence evaluation (the received and buffered deliveries): with no
+    /// rule nothing is evaluated after the step, so nothing is read.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::read`].
+    pub fn read_for_rules(
+        rules: &[ConsequenceRule],
+        queued: &PendingLogUnits,
+        context_id: &str,
+        event_log: &dyn crate::context::builder::ContextEventLogProvider,
+    ) -> Result<Self, ContextError> {
+        if rules.is_empty() {
+            return Ok(Self::default());
+        }
+        Self::read(rules, queued, context_id, event_log)
+    }
+
+    /// The consequence rules read with the log.
+    pub fn rules(&self) -> &[ConsequenceRule] {
+        &self.rules
+    }
+
+    /// The evidence for an evaluation after the step: the log as read, then
+    /// the leaves the operation staged since (`staged`), merged with the
+    /// receive buffer; with the convergent window anchor. Reads nothing, so it
+    /// cannot fail after the step.
+    pub fn events(
+        &self,
+        staged: &[crate::context::state::LeafSpec],
+        receive_buffer: &ReceiveBuffer,
+        now: u64,
+    ) -> (Vec<scp_event_log::Event>, u64) {
+        if staged.is_empty() {
+            return merge_for_consequences(&self.log, receive_buffer, now);
+        }
+        let mut entries = self.log.clone();
+        push_unwritten_leaves(&mut entries, staged.iter());
+        merge_for_consequences(&entries, receive_buffer, now)
+    }
 }
 
 /// [`event_log_entries_for_consequences`] for a caller whose operation already
@@ -831,29 +923,6 @@ pub(in crate::context) fn event_log_entries_for_consequences_after_side_effect(
             );
             merge_for_consequences(&[], receive_buffer, now)
         })
-}
-
-/// [`event_log_entries_for_consequences`] for an operation that queues its
-/// leaves as a pending log unit after its irreversible step (the received and
-/// buffered deliveries and the outlet capture; spec 17 §17.3 "Event log write
-/// failures"). A failed read is recorded in `sink`, whose discharge sets the
-/// log fault, and returns `None`: the step completes and the consequence
-/// evaluation for it does not run.
-pub(in crate::context) fn consequence_events_after_step(
-    receive_buffer: &ReceiveBuffer,
-    queued: &PendingLogUnits,
-    context_id: &str,
-    now: u64,
-    event_log: &dyn crate::context::builder::ContextEventLogProvider,
-    sink: &mut ConsequenceSink,
-) -> Option<(Vec<scp_event_log::Event>, u64)> {
-    match event_log_entries_for_consequences(receive_buffer, queued, context_id, now, event_log) {
-        Ok(read) => Some(read),
-        Err(e) => {
-            sink.note_read_fault(e.to_string());
-            None
-        }
-    }
 }
 
 /// Merges Source 1 (`log_entries`) with Source 2 (the receive buffer) for

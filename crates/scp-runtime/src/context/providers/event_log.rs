@@ -315,9 +315,11 @@ pub struct MerkleEventLogProvider {
     persistence: Option<std::sync::Arc<dyn EventLogPersistence>>,
     /// Contexts whose actor holds queued log units (spec 17 §17.3 "Event log
     /// write failures"). While a context is in this set, a fail-closed
-    /// append, an import, and a prune for it are refused. The drain sets and
-    /// clears membership through
-    /// [`ContextEventLogProvider::set_units_pending`].
+    /// append, an import, a prune, and an init for it are refused, each
+    /// checked after the writer takes the context's write gate. The actor
+    /// sets and clears membership through
+    /// [`ContextEventLogProvider::set_units_pending`]; destroying or releasing
+    /// the context's log removes it.
     units_pending: dashmap::DashSet<[u8; 32]>,
 }
 
@@ -453,8 +455,7 @@ impl MerkleEventLogProvider {
 
         let log = rebuild_log_from_events(context_id, &entries)?;
 
-        self.check_no_units_pending(context_id)?;
-        let write = self.lock_write_gate(context_id).await?;
+        let write = self.lock_write_gate_fenced(context_id).await?;
         // Store the imported events (one replace) before memory takes them.
         if let Err(e) = self.replace_stored(context_id, &entries).await {
             self.settle_write(context_id, write, false);
@@ -596,8 +597,7 @@ impl MerkleEventLogProvider {
             .unwrap_or_default()
             .as_secs();
 
-        self.check_no_units_pending(context_id)?;
-        let write = self.lock_write_gate(context_id).await?;
+        let write = self.lock_write_gate_fenced(context_id).await?;
 
         // Compute the pruned log without changing memory: memory takes it
         // only after storage does.
@@ -697,6 +697,43 @@ impl MerkleEventLogProvider {
                     hex::encode(context_id)
                 ))
             })
+    }
+
+    /// Takes a context's write gate for a writer outside the pending-unit
+    /// drain, then refuses the write while the context has queued log units
+    /// (spec 17 §17.3 "Event log write failures"). The check runs under the
+    /// gate, so a writer that waited while the drain held the gate sees the
+    /// queue the drain left.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextCreationError::EventLogFailed`] when the gate is
+    /// closed or the context has queued log units. On refusal the permit
+    /// drops, and the gate is released when the context has no log.
+    async fn lock_write_gate_fenced(
+        &self,
+        context_id: &[u8; 32],
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, ContextCreationError> {
+        let write = self.lock_write_gate(context_id).await?;
+        if let Err(e) = self.check_no_units_pending(context_id) {
+            self.drop_write(context_id, write);
+            return Err(e);
+        }
+        Ok(write)
+    }
+
+    /// Drops a write permit that wrote nothing, and releases the gate when
+    /// the context has no log in memory, so the write leaves no gate behind.
+    fn drop_write(&self, context_id: &[u8; 32], write: tokio::sync::OwnedSemaphorePermit) {
+        drop(write);
+        let has_log = self
+            .logs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(context_id);
+        if !has_log {
+            self.release_write_gate(context_id);
+        }
     }
 
     /// Removes a context's write gate when no writer holds or waits on it.
@@ -932,13 +969,16 @@ pub(crate) enum UnitPlacement {
     Append(Vec<Event>),
     /// The log holds the unit at `base_seq`, leaf hash for leaf hash.
     AlreadyPresent,
-    /// Neither holds.
+    /// `base_seq` is greater than the log's length, so the unit is not in the
+    /// log and no entry sits ahead of it.
+    PastEnd {
+        /// The log's length.
+        log_len: u64,
+    },
+    /// The log holds other entries at `base_seq`.
     Misaligned {
         /// The log's length.
         log_len: u64,
-        /// True when the log is longer than `base_seq` and its entry at
-        /// `base_seq` is not the unit's first entry.
-        slot_taken: bool,
     },
 }
 
@@ -968,10 +1008,7 @@ pub(crate) fn place_unit(
     let log_len = u64::try_from(events.len())
         .map_err(|_| ContextCreationError::EventLogFailed("event log length exceeds u64".into()))?;
     if base_seq > log_len {
-        return Ok(UnitPlacement::Misaligned {
-            log_len,
-            slot_taken: false,
-        });
+        return Ok(UnitPlacement::PastEnd { log_len });
     }
     let base = usize::try_from(base_seq).map_err(|_| {
         ContextCreationError::EventLogFailed("event log base_seq exceeds usize".into())
@@ -1008,10 +1045,7 @@ pub(crate) fn place_unit(
     Ok(if matched == unit.len() {
         UnitPlacement::AlreadyPresent
     } else {
-        UnitPlacement::Misaligned {
-            log_len,
-            slot_taken: matched == 0,
-        }
+        UnitPlacement::Misaligned { log_len }
     })
 }
 
@@ -1160,7 +1194,7 @@ fn truncate_log_keeping_tail(
 #[allow(clippy::significant_drop_tightening)]
 impl ContextEventLogProvider for MerkleEventLogProvider {
     async fn init_event_log(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        let write = self.lock_write_gate(context_id).await?;
+        let write = self.lock_write_gate_fenced(context_id).await?;
         // Store the empty event set first to establish the context in storage
         // (replaces any stored log from a previous incarnation); memory takes
         // the new log only after storage does.
@@ -1185,9 +1219,8 @@ impl ContextEventLogProvider for MerkleEventLogProvider {
         timestamp_secs: u64,
     ) -> Result<(), ContextCreationError> {
         check_append_payload(event_type, &payload)?;
-        self.check_no_units_pending(context_id)?;
 
-        let write = self.lock_write_gate(context_id).await?;
+        let write = self.lock_write_gate_fenced(context_id).await?;
         // Build the event without changing memory: memory takes it only
         // after storage does (spec section 17.3, "Event log write failures").
         let prepared = {
@@ -1294,6 +1327,7 @@ impl ContextEventLogProvider for MerkleEventLogProvider {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 logs.destroy(context_id);
             }
+            self.units_pending.remove(context_id);
             self.delete_stored(context_id).await
         };
         // The permit above dropped, so this provider's own clone of the gate
@@ -1359,16 +1393,17 @@ impl ContextEventLogProvider for MerkleEventLogProvider {
         let (placement, stored_log) = placed?;
         let unit = match placement {
             UnitPlacement::Append(unit) => unit,
-            UnitPlacement::AlreadyPresent => return Ok(UnitAppended::AlreadyPresent),
-            UnitPlacement::Misaligned {
-                log_len,
-                slot_taken,
-            } => {
-                return Err(UnitAppendError::Misaligned {
-                    base_seq,
-                    log_len,
-                    slot_taken,
-                });
+            UnitPlacement::AlreadyPresent => {
+                self.drop_write(&context_id, write);
+                return Ok(UnitAppended::AlreadyPresent);
+            }
+            UnitPlacement::PastEnd { log_len } => {
+                self.drop_write(&context_id, write);
+                return Err(UnitAppendError::PastEnd { base_seq, log_len });
+            }
+            UnitPlacement::Misaligned { log_len } => {
+                self.drop_write(&context_id, write);
+                return Err(UnitAppendError::Misaligned { base_seq, log_len });
             }
         };
 
@@ -1422,6 +1457,9 @@ impl ContextEventLogProvider for MerkleEventLogProvider {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             logs.release(context_id);
         }
+        // The actor that held the queue is gone; the next actor for the
+        // context records its restored queue when it starts.
+        self.units_pending.remove(context_id);
         // A writer holding the gate keeps it; that writer finds no log when
         // it re-locks and releases the gate itself.
         self.release_write_gate(context_id);
@@ -3326,9 +3364,10 @@ mod tests {
         assert_reload_matches(&faulty, &provider, &ctx_id, "unit retry").await;
     }
 
-    /// A unit whose `base_seq` is past the log's end, or whose slot holds a
-    /// different entry, is refused with the typed misalignment, and the log
-    /// is unchanged.
+    /// A unit whose `base_seq` is past the log's end is refused as past the
+    /// end; a unit whose slot holds a different entry, wholly or in part, is
+    /// refused as misaligned (spec 17 §17.3 "Event log write failures"). The
+    /// log is unchanged either way.
     #[tokio::test]
     async fn append_unit_misaligned_returns_typed_error() {
         let ctx_id = [42u8; 32];
@@ -3342,10 +3381,9 @@ mod tests {
         assert!(
             matches!(
                 past_end,
-                Err(UnitAppendError::Misaligned {
+                Err(UnitAppendError::PastEnd {
                     base_seq: 5,
                     log_len: 3,
-                    slot_taken: false
                 })
             ),
             "{past_end:?}"
@@ -3359,14 +3397,12 @@ mod tests {
                 Err(UnitAppendError::Misaligned {
                     base_seq: 1,
                     log_len: 3,
-                    slot_taken: true
                 })
             ),
             "{taken:?}"
         );
 
-        // The first leaf matches and the second does not: misaligned, and the
-        // slot is not free for a re-reserve.
+        // The first leaf matches and the second does not: misaligned.
         let stored_first = &before[1];
         let partial = [
             crate::context::state::LeafSpec {
@@ -3383,8 +3419,8 @@ mod tests {
             matches!(
                 half,
                 Err(UnitAppendError::Misaligned {
-                    slot_taken: false,
-                    ..
+                    base_seq: 1,
+                    log_len: 3,
                 })
             ),
             "{half:?}"
@@ -3445,6 +3481,73 @@ mod tests {
                 .await
                 .unwrap()
                 .is_some_and(|removed| removed > 0)
+        );
+    }
+
+    /// The fence is checked after the write gate is taken (spec 17 §17.3
+    /// "Event log write failures"): a writer that waited on the gate while a
+    /// drain held it, and whose fence check would have passed before it
+    /// waited, is refused once the drain's actor has recorded queued units.
+    #[tokio::test]
+    async fn writer_parked_on_the_gate_is_refused_by_the_fence() {
+        use futures::FutureExt as _;
+
+        let ctx_id = [44u8; 32];
+        let provider = MerkleEventLogProvider::new();
+        provider.init_event_log(&ctx_id).await.unwrap();
+
+        let drain = provider.lock_for_unit(&ctx_id).await.unwrap();
+        let mut parked = Box::pin(provider.append_event(
+            &ctx_id,
+            EventType::MemberJoined,
+            "",
+            payload_bytes(&[1]),
+            1,
+        ));
+        assert!(
+            (&mut parked).now_or_never().is_none(),
+            "the writer waits on the gate the drain holds"
+        );
+        provider.set_units_pending(&ctx_id, true);
+        assert_eq!(
+            provider
+                .append_unit(drain, 0, &[unit_leaf(1)])
+                .await
+                .unwrap(),
+            UnitAppended::Appended
+        );
+
+        let refused = parked.await;
+        assert!(refused.is_err(), "{refused:?}");
+        assert_eq!(provider.entries(&ctx_id).unwrap().len(), 1, "only the unit");
+    }
+
+    /// Destroying a context's log clears its fence, so a context created again
+    /// under the same id starts unfenced; `init_event_log` is fenced like any
+    /// other replace.
+    #[tokio::test]
+    async fn destroy_clears_the_fence_and_init_is_fenced() {
+        let ctx_id = [45u8; 32];
+        let provider = MerkleEventLogProvider::new();
+        provider.init_event_log(&ctx_id).await.unwrap();
+        provider.set_units_pending(&ctx_id, true);
+        assert!(
+            provider.init_event_log(&ctx_id).await.is_err(),
+            "init replaces the log, so the fence refuses it"
+        );
+
+        provider.destroy_event_log(&ctx_id).await.unwrap();
+        provider.init_event_log(&ctx_id).await.unwrap();
+        provider
+            .append_event(&ctx_id, EventType::MemberJoined, "", payload_bytes(&[1]), 1)
+            .await
+            .expect("the re-created context is not fenced");
+
+        provider.set_units_pending(&ctx_id, true);
+        provider.release_event_log(&ctx_id);
+        assert!(
+            !provider.units_pending.contains(&ctx_id),
+            "release clears the fence"
         );
     }
 }

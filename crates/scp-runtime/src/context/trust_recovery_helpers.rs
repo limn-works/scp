@@ -239,9 +239,11 @@ pub async fn recovery_advance_epoch(
     //    before the Commit is broadcast (this is the highest-stakes safety-gated
     //    advance; see the broadcast note below). The Update keeps publishing
     //    the identity's wrapping key (spec 09 §9.16.1); with none loaded it
-    //    fails closed before anything ratchets. If this fails (or its
-    //    fail-closed persist fails) the error `?`-propagates and the bookkeeping
-    //    counter is NOT incremented — disposition preserved.
+    //    fails closed before anything ratchets. If the advance fails, the
+    //    error `?`-propagates and the bookkeeping counter is NOT incremented.
+    //    If only its fail-closed persist fails, the group has ratcheted, so the
+    //    Commit is still broadcast, the counter still advances, and the persist
+    //    error is returned at the end.
     let wrapping_public_key = *deps
         .supervisor
         .my_wrapping_key(&deps.owned_identity)?
@@ -252,15 +254,17 @@ pub async fn recovery_advance_epoch(
     // cannot lose it. The leaf describes the bookkeeping advance in step 4
     // below. A leaf that cannot be built refuses the recovery before the step.
     let recovery_leaf = plan_recovery_epoch_leaf(cell, deps)?;
-    let epoch_commit_bytes = cell
-        .commit_class_s_keep(deps, context_id, |mut v| {
+    // A failed persist keeps the advanced epoch and the queued leaf in memory
+    // and returns the Commit with the persist error, so the Commit still
+    // reaches the broadcast and the retry queue below before the error is
+    // returned (spec 17 §17.3 "Event log write failures").
+    let (epoch_commit_bytes, epoch_persisted) = cell
+        .commit_class_s_keep_settled(deps, context_id, |mut v| {
             let commit_bytes = v
                 .rest_mut()
                 .advance_epoch(wrapping_public_key, deps.clock.as_ref())
                 .map(|out| out.commit_bytes)?;
-            // The leaf passed the payload check above, so the enqueue cannot
-            // refuse it.
-            v.enqueue_log_unit(vec![recovery_leaf])?;
+            v.enqueue_log_unit(vec![recovery_leaf]);
             Ok(commit_bytes)
         })
         .await?;
@@ -322,6 +326,9 @@ pub async fn recovery_advance_epoch(
     //    persist of the just-mutated Class-C state via a shared read.
     persist_state_best_effort(cell, deps, context_id).await;
 
+    // The epoch advance's own persist failed: every step after it ran, and
+    // the error is returned now without undoing the advance.
+    epoch_persisted?;
     Ok(new_epoch)
 }
 
@@ -544,15 +551,12 @@ fn plan_recovery_epoch_leaf(
         },
     )
     .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
-    let event_type = scp_event_log::EventType::RecoveryEpochAdvanced;
-    crate::context::providers::event_log::check_append_payload(event_type, &payload)
-        .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
-    Ok(crate::context::state::LeafSpec {
-        event_type,
-        actor_did: "system:recovery".to_owned(),
+    crate::context::log_unit_helpers::plan_leaf(
+        scp_event_log::EventType::RecoveryEpochAdvanced,
+        "system:recovery".to_owned(),
         payload,
-        timestamp_secs: deps.clock.now_secs(),
-    })
+        deps.clock.now_secs(),
+    )
 }
 
 /// The recovery family of spec 17 §17.3 "Event log write failures".
@@ -569,6 +573,84 @@ mod log_unit_family_tests {
 
     const OWNER: &str = "did:dht:z6MkOwnerRecoveryLogUnit";
 
+    /// An Active encrypted context whose owner holds a real MLS group, over
+    /// a log that has been initialised and then rejects entry writes.
+    async fn recovering_context(
+        ctx_byte: u8,
+        persistence: Option<Box<dyn crate::context::persistence::ContextPersistence>>,
+    ) -> (
+        ClassSCell,
+        crate::context::actor::deps::ActorDeps,
+        String,
+        [u8; 32],
+    ) {
+        let ctx_id_bytes = [ctx_byte; 32];
+        let ctx = hex::encode(ctx_id_bytes);
+        let (log, faulty) = faulty_merkle_log();
+        let deps = deps_with(OWNER, persistence, Box::new(log)).await;
+        deps.event_log
+            .init_event_log(&ctx_id_bytes)
+            .await
+            .expect("init event log");
+        fail_log_entry_writes(&faulty, &ctx_id_bytes);
+
+        let wrapping_public = *deps
+            .supervisor
+            .my_wrapping_key(&deps.owned_identity)
+            .expect("the owner's wrapping key is loaded")
+            .public();
+        let owned = crate::crypto::mls::provider::NodeMlsFactory::new(
+            OWNER.to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
+        )
+        .create_bare_group_owned(&wrapping_public)
+        .expect("birth an MLS group");
+        let mut state = PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            1_700_000_000,
+            DID(OWNER.to_owned()),
+        );
+        state.seed_encrypted_crypto_from_owned(owned);
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .expect("transition to Active");
+        (ClassSCell::new(state), deps, ctx, ctx_id_bytes)
+    }
+
+    /// Persistence whose every persist fails.
+    struct FailPersistence;
+    #[async_trait::async_trait]
+    impl crate::context::persistence::ContextPersistence for FailPersistence {
+        async fn persist_context(
+            &self,
+            _: &str,
+            _: &crate::context::state::ContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Err("induced persist failure".into())
+        }
+        async fn load_context(
+            &self,
+            _: &str,
+        ) -> Result<
+            Option<crate::context::state::ContextSnapshot>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(None)
+        }
+        async fn delete_context(
+            &self,
+            _: &str,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        async fn list_persisted_contexts(
+            &self,
+        ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(Vec::new())
+        }
+    }
+
     mod recovery_leaf {
         use super::*;
 
@@ -578,38 +660,7 @@ mod log_unit_family_tests {
         /// succeeds.
         #[tokio::test]
         async fn append_failure_after_side_effect_keeps_step_and_queues_leaf() {
-            let ctx_id_bytes = [0x6Au8; 32];
-            let ctx = hex::encode(ctx_id_bytes);
-            let (log, faulty) = faulty_merkle_log();
-            let deps = deps_with(OWNER, None, Box::new(log)).await;
-            deps.event_log
-                .init_event_log(&ctx_id_bytes)
-                .await
-                .expect("init event log");
-            fail_log_entry_writes(&faulty, &ctx_id_bytes);
-
-            let wrapping_public = *deps
-                .supervisor
-                .my_wrapping_key(&deps.owned_identity)
-                .expect("the owner's wrapping key is loaded")
-                .public();
-            let owned = crate::crypto::mls::provider::NodeMlsFactory::new(
-                OWNER.to_owned(),
-                std::sync::Arc::new(scp_clock::SystemClock),
-            )
-            .create_bare_group_owned(&wrapping_public)
-            .expect("birth an MLS group");
-            let mut state = PerContextState::new_for_test_encrypted(
-                ctx_id_bytes,
-                1_700_000_000,
-                DID(OWNER.to_owned()),
-            );
-            state.seed_encrypted_crypto_from_owned(owned);
-            state
-                .handle
-                .transition_to(&crate::context::ContextState::Active)
-                .expect("transition to Active");
-            let mut cell = ClassSCell::new(state);
+            let (mut cell, deps, ctx, ctx_id_bytes) = recovering_context(0x6A, None).await;
 
             let advanced = crate::context::trust_recovery_helpers::recovery_advance_epoch(
                 &mut cell, &deps, &ctx,
@@ -631,6 +682,39 @@ mod log_unit_family_tests {
                 log_len(&deps, &ctx_id_bytes),
                 0,
                 "the log rejected the write"
+            );
+        }
+
+        /// When the epoch advance's own persist fails, the group has still
+        /// ratcheted, so the Commit it produced reaches the broadcast and, the
+        /// broadcast failing, the retry queue, before the persist error is
+        /// returned (spec 17 §17.3 "Event log write failures").
+        #[tokio::test]
+        async fn failed_persist_still_hands_the_commit_to_the_broadcast() {
+            let (mut cell, deps, ctx, _ctx_id_bytes) =
+                recovering_context(0x6B, Some(Box::new(FailPersistence))).await;
+
+            let advanced = crate::context::trust_recovery_helpers::recovery_advance_epoch(
+                &mut cell, &deps, &ctx,
+            )
+            .await;
+
+            assert!(
+                matches!(
+                    advanced,
+                    Err(scp_protocol::context::ContextError::PersistenceFailed(_))
+                ),
+                "the persist error is returned: {advanced:?}"
+            );
+            assert_eq!(
+                cell.pending_commits.len(),
+                1,
+                "the Commit the advance produced is queued for re-delivery"
+            );
+            assert_eq!(
+                queued_unit_types(&cell.class_s.pending_log_units),
+                vec![vec![scp_event_log::EventType::RecoveryEpochAdvanced]],
+                "the recovery leaf stays queued in memory"
             );
         }
     }

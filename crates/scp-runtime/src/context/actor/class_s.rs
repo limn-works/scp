@@ -471,14 +471,46 @@ impl Deref for ClassSMut<'_> {
 /// the [`ClassSMut`] methods below. A [`ClassSMut`] exists only inside a
 /// fail-closed combinator, so calling `enqueue_log_unit` anywhere else does
 /// not compile.
-#[derive(Debug, Default)]
+///
+/// A queue read back from storage enters only through [`Self::validated`],
+/// which refuses a unit with no entry and an entry that breaks the append's
+/// payload rules.
+#[derive(Debug, Default, Clone)]
 pub(crate) struct PendingLogUnits(VecDeque<crate::context::state::PendingLogUnit>);
 
 impl PendingLogUnits {
-    /// Rebuilds the queue from a persisted copy (same-node restore and
-    /// [`ClassSState::restore`]).
-    pub(crate) const fn restored(units: VecDeque<crate::context::state::PendingLogUnit>) -> Self {
-        Self(units)
+    /// Rebuilds the queue from a persisted context snapshot (same-node
+    /// restore), checking each unit as [`ClassSMut::enqueue_log_unit`] and the
+    /// planning of each entry would have (spec 17 §17.3 "Event log write
+    /// failures").
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::PersistenceFailed`] when a unit holds no entry
+    /// or an entry breaks the append's payload rules.
+    pub(crate) fn validated(
+        units: VecDeque<crate::context::state::PendingLogUnit>,
+    ) -> Result<Self, ContextError> {
+        for (index, unit) in units.iter().enumerate() {
+            if unit.leaves.is_empty() {
+                return Err(ContextError::PersistenceFailed(format!(
+                    "restore: queued event log unit {index} holds no entry (spec 17 §17.3)"
+                )));
+            }
+            for leaf in &unit.leaves {
+                crate::context::providers::event_log::check_append_payload(
+                    leaf.event_type,
+                    &leaf.payload,
+                )
+                .map_err(|e| {
+                    ContextError::PersistenceFailed(format!(
+                        "restore: queued event log unit {index} breaks the append's payload \
+                         rules (spec 17 §17.3): {e}"
+                    ))
+                })?;
+            }
+        }
+        Ok(Self(units))
     }
 
     /// True when no unit is queued.
@@ -514,23 +546,12 @@ impl ClassSMut<'_> {
     /// Queues `leaves` as one pending log unit, in the persist that records
     /// the operation's irreversible step. An empty `leaves` queues nothing.
     ///
-    /// # Errors
-    ///
-    /// Returns [`ContextError::EventLogFailed`] when a leaf breaks the payload
-    /// rules the append enforces; nothing is queued then.
-    pub(crate) fn enqueue_log_unit(
-        &mut self,
-        leaves: Vec<crate::context::state::LeafSpec>,
-    ) -> Result<(), ContextError> {
+    /// The payload rules were checked when each entry was planned, before
+    /// the step (spec 17 §17.3 "Event log write failures"), so the enqueue
+    /// cannot refuse a unit after the step.
+    pub(crate) fn enqueue_log_unit(&mut self, leaves: Vec<crate::context::state::LeafSpec>) {
         if leaves.is_empty() {
-            return Ok(());
-        }
-        for leaf in &leaves {
-            crate::context::providers::event_log::check_append_payload(
-                leaf.event_type,
-                &leaf.payload,
-            )
-            .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
+            return;
         }
         self.state
             .class_s
@@ -540,7 +561,6 @@ impl ClassSMut<'_> {
                 base_seq: None,
                 leaves,
             });
-        Ok(())
     }
 
     /// Sets the `base_seq` of the oldest queued unit. Returns `false` when the
@@ -2970,6 +2990,31 @@ impl ClassSCell {
         persist_state_fail_closed(&self.state, deps, context_id)
             .await
             .map(|()| value)
+    }
+
+    /// [`Self::commit_class_s_keep`] for a mutation that is an irreversible
+    /// step whose value the work after the step still needs when the persist
+    /// fails (spec 17 §17.3 "Event log write failures"; ADR-049 §9).
+    ///
+    /// Runs `f(view)`; when `f` errs, returns that error and persists nothing.
+    /// Otherwise keeps the mutation, persists fail-closed, and returns `f`'s
+    /// value together with the persist's result, so the caller can finish the
+    /// work after the step (for example, broadcasting the MLS Commit the step
+    /// produced) before it returns the persist error.
+    ///
+    /// # Errors
+    ///
+    /// Returns `f`'s error. The persist's error is returned inside `Ok`.
+    pub(crate) async fn commit_class_s_keep_settled<T>(
+        &mut self,
+        deps: &ActorDeps,
+        context_id: &str,
+        f: impl FnOnce(ClassSMut) -> Result<T, ContextError>,
+    ) -> Result<(T, Result<(), ContextError>), ContextError> {
+        let value = f(ClassSMut::new(&mut self.state))?;
+        self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
+        let persisted = persist_state_fail_closed(&self.state, deps, context_id).await;
+        Ok((value, persisted))
     }
 
     /// Pure-Class-S rollback on persist failure (snapshot covers ONLY the

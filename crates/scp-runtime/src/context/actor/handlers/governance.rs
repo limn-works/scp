@@ -1647,6 +1647,11 @@ mod consequence_fail_closed_tests {
         };
 
         let mut downward_auth_sink = crate::context::log_unit_helpers::ConsequenceSink::new();
+        let evidence = crate::context::log_unit_helpers::test_support::pre_step_evidence(
+            &cell,
+            &ctx_str,
+            deps.event_log.as_ref(),
+        );
         let mut view = cell.class_c_view();
         let _ = crate::context::messaging_helpers::deliver_message_and_drain_buffered(
             &mut view,
@@ -1656,6 +1661,7 @@ mod consequence_fail_closed_tests {
             &inner,
             b"hello",
             false,
+            &evidence,
             &mut downward_auth_sink,
         )
         .expect("delivery of an in-order application message succeeds");

@@ -283,7 +283,7 @@ pub struct LeafSpec {
 pub struct PendingLogUnit {
     /// The log sequence the unit's first entry takes. `None` until the
     /// drain reserves it under the provider's write gate; a drain that finds
-    /// the slot taken by an append outside the queue resets it.
+    /// it past the log's end reserves it again, once per drain.
     pub base_seq: Option<u64>,
     /// The unit's entries, in log order. Never empty.
     pub leaves: Vec<LeafSpec>,
@@ -291,18 +291,17 @@ pub struct PendingLogUnit {
 
 /// The context's event log fault (spec 17 §17.3 "Event log write failures").
 ///
-/// Set when a queued unit cannot be placed in the log, or when a log read
-/// after an irreversible step fails. While it is set, the context refuses the
+/// Set when a queued unit cannot be placed in the log: the log holds other
+/// entries at its `base_seq`, or its `base_seq` is still past the log's end
+/// after one re-reservation. While it is set, the context refuses the
 /// mutations the commit-fault marker refuses, with `EventLogFailed`. Only a
 /// drain that empties the queue over a loaded log clears it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogFaultMarker {
-    /// The `base_seq` of the unit that could not be placed, or `None` when a
-    /// failed read set the marker.
-    pub base_seq: Option<u64>,
-    /// The log's length when the marker was set, or `None` when it was
-    /// unreadable.
-    pub log_len: Option<u64>,
+    /// The `base_seq` of the unit that could not be placed.
+    pub base_seq: u64,
+    /// The log's length when the marker was set.
+    pub log_len: u64,
     /// What went wrong.
     pub detail: String,
 }

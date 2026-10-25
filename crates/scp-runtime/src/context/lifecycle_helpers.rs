@@ -1430,9 +1430,7 @@ pub fn join_context_membership(
     {
         // The queued log units count as evidence (spec 17 §17.3); the split
         // below holds the view mutably, so they are copied out first.
-        let queued = crate::context::actor::class_s::PendingLogUnits::restored(
-            view.class_s().pending_log_units.to_deque(),
-        );
+        let queued = view.class_s().pending_log_units.clone();
         let mut split = view.split_class_c();
         crate::context::lifecycle_logic::post_join_bookkeeping(
             split.governance.participation_cache_mut(),
@@ -3904,6 +3902,11 @@ pub async fn restore_context(
         &ctx_snapshot.consequence_rules,
         &ctx_snapshot.context_params.consequence_config,
     )?;
+    // The queued log units enter the actor's queue only after each unit is
+    // checked as an enqueue would have checked it (spec 17 §17.3).
+    let pending_log_units = crate::context::actor::class_s::PendingLogUnits::validated(
+        std::mem::take(&mut ctx_snapshot.pending_log_units),
+    )?;
 
     // Ceiling-entry grammar enforcement on the RESTORED ceiling (spec §5.3.1.1).
     // This is the self-respawn / process-restart path reading a LOCAL snapshot.
@@ -4298,9 +4301,7 @@ pub async fn restore_context(
             // Spec 17 §17.3, ADR-049 §9 Class S: same-node restore REHYDRATES the
             // queued log units and the log fault; the actor drains the queue when it
             // starts.
-            pending_log_units: crate::context::actor::class_s::PendingLogUnits::restored(
-                ctx_snapshot.pending_log_units,
-            ),
+            pending_log_units,
             log_fault: ctx_snapshot.log_fault,
             saga_pending: ctx_snapshot
                 .saga_pending

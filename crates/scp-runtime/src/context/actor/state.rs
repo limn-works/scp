@@ -1066,12 +1066,13 @@ pub struct ClassSState {
     /// Event-log units queued after an irreversible step and not yet written
     /// (spec 17 §17.3 "Event log write failures"; ADR-049 §9). Only
     /// [`ClassSMut::enqueue_log_unit`](super::class_s::ClassSMut::enqueue_log_unit)
-    /// adds a unit, so a unit is queued only inside a fail-closed combinator.
+    /// adds a unit, so a unit is queued only inside a fail-closed combinator;
+    /// a restored queue enters through
+    /// [`PendingLogUnits::validated`](super::class_s::PendingLogUnits::validated).
     pub(crate) pending_log_units: super::class_s::PendingLogUnits,
 
     /// The log-fault marker (spec 17 §17.3 "Event log write failures"):
-    /// `Some` while a queued unit could not be placed in the log or a log
-    /// read after an irreversible step failed.
+    /// `Some` while a queued unit could not be placed in the log.
     pub(crate) log_fault: Option<crate::context::state::LogFaultMarker>,
 }
 
@@ -1126,7 +1127,7 @@ pub struct ClassSStateSnapshot {
     /// Mirror of [`ClassSState::pseudonym_rotation`] (`Copy`).
     pub(crate) pseudonym_rotation: super::pseudonym_rotation::PseudonymRotationState,
     /// Mirror of [`ClassSState::pending_log_units`].
-    pub(crate) pending_log_units: VecDeque<crate::context::state::PendingLogUnit>,
+    pub(crate) pending_log_units: super::class_s::PendingLogUnits,
     /// Mirror of [`ClassSState::log_fault`].
     pub(crate) log_fault: Option<crate::context::state::LogFaultMarker>,
 }
@@ -1161,7 +1162,7 @@ impl ClassSState {
             caveat_counters: self.caveat_counters.clone(),
             stream_reservations: self.stream_reservations.clone(),
             pseudonym_rotation: self.pseudonym_rotation.clone(),
-            pending_log_units: self.pending_log_units.to_deque(),
+            pending_log_units: self.pending_log_units.clone(),
             log_fault: self.log_fault.clone(),
         }
     }
@@ -1186,7 +1187,7 @@ impl ClassSState {
         self.caveat_counters = snap.caveat_counters;
         self.stream_reservations = snap.stream_reservations;
         self.pseudonym_rotation = snap.pseudonym_rotation;
-        self.pending_log_units = super::class_s::PendingLogUnits::restored(snap.pending_log_units);
+        self.pending_log_units = snap.pending_log_units;
         self.log_fault = snap.log_fault;
     }
 }

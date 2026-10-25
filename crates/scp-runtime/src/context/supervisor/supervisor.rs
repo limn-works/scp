@@ -28110,6 +28110,52 @@ mod tests {
             .collect()
     }
 
+    /// The payload tags of the log `faulty` stores, loaded by a fresh
+    /// provider.
+    #[cfg(feature = "testing")]
+    async fn stored_log_tags(
+        faulty: &Arc<crate::context::supervisor::faulty_storage::FaultyStorage>,
+        ctx_id_bytes: &[u8; 32],
+    ) -> Vec<u8> {
+        let stored = crate::context::log_unit_helpers::test_support::merkle_log_over(faulty);
+        stored
+            .restore_event_log(ctx_id_bytes)
+            .await
+            .expect("the stored log loads");
+        respawn_log_tags(stored.entries(ctx_id_bytes))
+    }
+
+    /// The landed put is in storage and not in memory. Reloads the live
+    /// provider's log from storage, as a restarted node would, so the
+    /// respawned drain finds the unit already at its reservation
+    /// (`AlreadyPresent`).
+    #[cfg(feature = "testing")]
+    async fn reload_landed_put(
+        event_log: &Arc<dyn crate::context::builder::ContextEventLogProvider>,
+        faulty: &Arc<crate::context::supervisor::faulty_storage::FaultyStorage>,
+        ctx_id_bytes: &[u8; 32],
+    ) {
+        assert_eq!(
+            stored_log_tags(faulty, ctx_id_bytes).await,
+            vec![1, 2],
+            "the failed put landed in storage"
+        );
+        event_log.release_event_log(ctx_id_bytes);
+        event_log
+            .restore_event_log(ctx_id_bytes)
+            .await
+            .expect("the live provider reloads the stored log");
+        assert_eq!(
+            respawn_log_tags(
+                event_log
+                    .event_log_entries(ctx_id_bytes)
+                    .expect("the log reads")
+            ),
+            vec![1, 2],
+            "the drain will find the unit at its reservation"
+        );
+    }
+
     /// One case of [`respawn_drains_queued_unit_exactly_once`]: the actor's
     /// drain fails with the unit's put landed in storage (`put_landed`) or
     /// not, the actor crashes, and the watchdog respawns it from the stored
@@ -28117,7 +28163,7 @@ mod tests {
     #[cfg(feature = "testing")]
     async fn respawn_drains_queued_unit(ctx_id_bytes: [u8; 32], put_landed: bool) {
         use crate::context::log_unit_helpers::test_support::{
-            fail_log_entry_writes, faulty_merkle_log, merkle_log_over,
+            fail_log_entry_writes, faulty_merkle_log,
         };
 
         let ctx_key = hex::encode(ctx_id_bytes);
@@ -28146,7 +28192,8 @@ mod tests {
             .expect("transition to Active");
         let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
         cell.commit_class_s_keep(&deps, &ctx_key, |mut v| {
-            v.enqueue_log_unit(vec![respawn_unit_leaf(1), respawn_unit_leaf(2)])
+            v.enqueue_log_unit(vec![respawn_unit_leaf(1), respawn_unit_leaf(2)]);
+            Ok(())
         })
         .await
         .expect("the enqueue persists");
@@ -28189,6 +28236,9 @@ mod tests {
         );
 
         faulty.clear_fail();
+        if put_landed {
+            reload_landed_put(&event_log, &faulty, &ctx_id_bytes).await;
+        }
         induce_panic(&handle, "log-unit-respawn").await;
         let drained = wait_until(std::time::Duration::from_secs(5), || {
             persistence
@@ -28211,13 +28261,8 @@ mod tests {
             vec![1, 2],
             "the unit is in the log exactly once (put_landed {put_landed})"
         );
-        let reloaded = merkle_log_over(&faulty);
-        reloaded
-            .restore_event_log(&ctx_id_bytes)
-            .await
-            .expect("the stored log loads");
         assert_eq!(
-            respawn_log_tags(reloaded.entries(&ctx_id_bytes)),
+            stored_log_tags(&faulty, &ctx_id_bytes).await,
             vec![1, 2],
             "the stored log holds the unit exactly once (put_landed {put_landed})"
         );
