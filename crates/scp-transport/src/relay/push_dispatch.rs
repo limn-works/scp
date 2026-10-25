@@ -305,8 +305,9 @@ mod enabled {
         /// intake slot however often it is published to.
         pending: Arc<Mutex<HashSet<RoutingId>>>,
         logs: Arc<Logs>,
-        /// Cancels the lookup and every drain. [`PushService::stop`] cancels
-        /// it; so does the guard below when the last clone drops.
+        /// Cancels the lookup and every drain. A holder of the token from
+        /// [`PushService::stop_token`] cancels it; so does the guard below
+        /// when the last clone drops.
         stop: CancellationToken,
         /// Cancels `stop` when the last clone drops.
         _stop_on_drop: DropGuard,

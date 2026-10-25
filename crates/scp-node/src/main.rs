@@ -268,10 +268,12 @@ ENVIRONMENT VARIABLES:
                                 (scp-relay README). --self-host and --ephemeral do not
                                 read it and offer no push
     SCP_RELAY_PUSH_STORE        Push registration store: sqlite. Read only in --relay-only
-                                mode, when a platform is listed
+                                mode, when a platform is listed. A full node exits 1
+                                when this or SCP_RELAY_PUSH_STORE_PATH is set
     SCP_RELAY_PUSH_STORE_PATH   Absolute path of the sqlite push store. Read only in
-                                --relay-only mode. A full node keeps its push store at
-                                push.sqlite in its storage directory
+                                --relay-only mode. A full node exits 1 when this or
+                                SCP_RELAY_PUSH_STORE is set, and keeps its push store
+                                at push.sqlite in its storage directory
     SCP_RELAY_URL               The relay's public WebSocket URL, which determines its
                                 reserved push routing ID (spec section 10.7.1, push
                                 registration protocol). Required in --relay-only mode:

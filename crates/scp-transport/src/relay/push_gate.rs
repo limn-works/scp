@@ -240,12 +240,23 @@ impl PushRole {
     /// How many of the push service's lookup and drain tasks have not yet
     /// returned: zero for [`PushRole::Disabled`] and for a service that has
     /// stopped, which it does when its relay shuts down.
+    #[cfg(feature = "push-store")]
     #[must_use]
     pub fn tasks_running(&self) -> usize {
         match self {
             Self::Disabled => 0,
-            #[cfg(feature = "push-store")]
             Self::Enabled(service) => service.tasks_running(),
+        }
+    }
+
+    /// How many of the push service's lookup and drain tasks have not yet
+    /// returned. Without the `push-store` feature the only role is
+    /// [`PushRole::Disabled`], which runs none.
+    #[cfg(not(feature = "push-store"))]
+    #[must_use]
+    pub const fn tasks_running(&self) -> usize {
+        match self {
+            Self::Disabled => 0,
         }
     }
 }
