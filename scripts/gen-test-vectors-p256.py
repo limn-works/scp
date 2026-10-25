@@ -31,6 +31,7 @@ import binascii
 import hashlib
 import hmac
 import json
+import os
 import sys
 
 # ---------------------------------------------------------------------------
@@ -4306,6 +4307,153 @@ def emit_custody_probe() -> None:
     emit_hex("vector_83a.signature", sign_group(REF_KEY_1, digest, "vector_83a"))
 
 
+# --- §25.35 Vectors 84-88: device attestation (`09-security-model.md` §9.3.1) ---
+#
+# Vector 84 is the binding digest D and the tag T, Vector 85 the assertion
+# digest A, Vector 86 the policy digest P, Vector 87 the Play Integrity verdict
+# preimage, its digest, a low-s signature and the 176-byte verdict, and Vector
+# 88 the SHA-256 fingerprint of Apple's App Attestation Root CA certificate.
+# Each preimage is built here from §9.3.1's byte layout with this file's own
+# SHA-256 and ECDSA, and shares no code with the Rust reader.
+DEVICE_ATTESTATION_SEPARATOR = b"SCP-DEVICE-ATTESTATION-V1:"
+DEVICE_ATTESTATION_TAG_SEPARATOR = b"SCP-DEVICE-ATTESTATION-TAG-V1:"
+DEVICE_ASSERTION_SEPARATOR = b"SCP-DEVICE-ASSERTION-V1:"
+DEVICE_ATTESTATION_POLICY_SEPARATOR = b"SCP-DEVICE-ATTESTATION-POLICY-V1:"
+PLAY_INTEGRITY_VERDICT_SEPARATOR = b"SCP-PLAY-INTEGRITY-VERDICT-V1:"
+APPLE_APP_ATTESTATION_ROOT_PEM = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "apple-app-attestation-root-ca.pem"
+)
+# DER of the secp384r1 OID (1.3.132.0.34) and of ecdsa-with-SHA384
+# (1.2.840.10045.4.3.3), the curve of the root's key and the algorithm of its
+# self-signature.
+DER_OID_SECP384R1 = bytes.fromhex("06052b81040022")
+DER_OID_ECDSA_WITH_SHA384 = bytes.fromhex("06082a8648ce3d040303")
+
+
+def device_digest_preimage(
+    separator: bytes, identifier_text: str, context_id: str, challenge: bytes
+) -> bytes:
+    """§9.3.1 D and T: separator, BE32(56) || text form, BE32(n) || context id, challenge."""
+    assert len(identifier_text) == 56 and len(challenge) == 32
+    return separator + var_field(identifier_text) + var_field(context_id) + challenge
+
+
+def pem_certificate_der(path: str) -> bytes:
+    """Returns the DER between the BEGIN and END lines, ignoring the text before them."""
+    with open(path, encoding="ascii") as handle:
+        lines = handle.read().splitlines()
+    begin = lines.index("-----BEGIN CERTIFICATE-----")
+    end = lines.index("-----END CERTIFICATE-----")
+    return base64.b64decode("".join(lines[begin + 1 : end]), validate=True)
+
+
+def emit_device_attestation() -> None:
+    section("§25.35 Vectors 84-88 device attestation")
+    subject_text = ID_SUBJECT
+    subject_raw = sha256(b"SCP test vector identifier subject")
+    assert scp_text_form(subject_raw) == subject_text, "vector_84: subject"
+    verifier_raw = sha256(b"SCP test vector identifier verifier")
+    assert scp_text_form(verifier_raw) == ID_VERIFIER, "vector_87: verifier"
+    context_id = "ctx-1"
+    challenge = bytes(range(0x20, 0x40))
+
+    d_preimage = device_digest_preimage(
+        DEVICE_ATTESTATION_SEPARATOR, subject_text, context_id, challenge
+    )
+    assert len(DEVICE_ATTESTATION_SEPARATOR) == 26
+    assert len(d_preimage) == 122 + len(context_id.encode()), "vector_84: D length"
+    t_preimage = device_digest_preimage(
+        DEVICE_ATTESTATION_TAG_SEPARATOR, subject_text, context_id, challenge
+    )
+    assert len(DEVICE_ATTESTATION_TAG_SEPARATOR) == 30
+    assert len(t_preimage) == 126 + len(context_id.encode()), "vector_84: T length"
+    binding_digest = sha256(d_preimage)
+    tag = sha256(t_preimage)
+    emit_hex("vector_84.challenge", challenge)
+    emit_hex("vector_84.binding_preimage", d_preimage)
+    emit_hex("vector_84.binding_digest", binding_digest)
+    emit_hex("vector_84.tag_preimage", t_preimage)
+    emit_hex("vector_84.tag", tag)
+    emit("vector_84.tag_base64url", base64.urlsafe_b64encode(tag).decode().rstrip("="))
+
+    request = b"SCP test vector assertion request"
+    a_preimage = DEVICE_ASSERTION_SEPARATOR + var_field(request)
+    assert len(DEVICE_ASSERTION_SEPARATOR) == 24
+    emit_hex("vector_85.request", request)
+    emit_hex("vector_85.assertion_preimage", a_preimage)
+    emit_hex("vector_85.assertion_digest", sha256(a_preimage))
+
+    signing_cert = sha256(b"SCP test vector signing certificate")
+    package_name = "com.example.scp"
+    policy_preimage = (
+        DEVICE_ATTESTATION_POLICY_SEPARATOR
+        + challenge
+        + u64(2_592_000)
+        # accepted_app_ids: one AcceptedAppId, platform Ios (0x00), one version
+        + u32(1)
+        + var_field("ABCDE12345.com.example.scp")
+        + u8(0x00)
+        + u32(1)
+        + var_field("1.0")
+        # accepted_validation_categories: one category, 4
+        + u32(1)
+        + u32(4)
+        # require_validation_category: true
+        + u8(0x01)
+        # accepted_android_packages: one AcceptedAndroidPackage
+        + u32(1)
+        + var_field(package_name)
+        + signing_cert
+        + verifier_raw
+    )
+    assert len(DEVICE_ATTESTATION_POLICY_SEPARATOR) == 33
+    emit_hex("vector_86.signing_cert_sha256", signing_cert)
+    emit_hex("vector_86.policy_preimage", policy_preimage)
+    emit_hex("vector_86.policy_digest", sha256(policy_preimage))
+
+    token = b"SCP test vector integrity token"
+    package_hash = sha256(package_name.encode())
+    token_issued_at = 1_767_225_600
+    checked_at = token_issued_at + 60
+    verdict_preimage = (
+        PLAY_INTEGRITY_VERDICT_SEPARATOR
+        + verifier_raw
+        + subject_raw
+        + binding_digest
+        + sha256(token)
+        + package_hash
+        + signing_cert
+        + u64(token_issued_at)
+        + u64(checked_at)
+    )
+    assert len(PLAY_INTEGRITY_VERDICT_SEPARATOR) == 30
+    assert len(verdict_preimage) == 238, "vector_87: preimage length"
+    verdict_digest = sha256(verdict_preimage)
+    # sign_group asserts the signature verifies and that s <= n/2.
+    signature = sign_group(REF_KEY_1, verdict_digest, "vector_87")
+    verdict = (
+        verifier_raw
+        + package_hash
+        + signing_cert
+        + u64(token_issued_at)
+        + u64(checked_at)
+        + signature
+    )
+    assert len(verdict) == 176, "vector_87: verdict length"
+    emit_hex("vector_87.token_sha256", sha256(token))
+    emit_hex("vector_87.package_hash", package_hash)
+    emit_hex("vector_87.verdict_preimage", verdict_preimage)
+    emit_hex("vector_87.verdict_digest", verdict_digest)
+    emit_hex("vector_87.signature", signature)
+    emit_hex("vector_87.verdict", verdict)
+
+    root_der = pem_certificate_der(APPLE_APP_ATTESTATION_ROOT_PEM)
+    assert root_der.count(DER_OID_SECP384R1) == 1, "vector_88: root key not P-384"
+    assert DER_OID_ECDSA_WITH_SHA384 in root_der, "vector_88: root algorithm"
+    emit("vector_88.root_der_length", len(root_der))
+    emit_hex("vector_88.root_sha256", sha256(root_der))
+
+
 def main() -> int:
     self_test()
     _LINES.append("SCP §25 test vectors — ECDSA on NIST P-256, RFC 6979, SHA-256")
@@ -4343,6 +4491,7 @@ def main() -> int:
     emit_fork_merge()
     emit_key_positions_and_reseat()
     emit_custody_probe()
+    emit_device_attestation()
     print("\n".join(_LINES))
     return 0
 
