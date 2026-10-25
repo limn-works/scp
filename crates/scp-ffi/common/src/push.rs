@@ -30,7 +30,8 @@
 //!
 //! The FFI exports that call [`handle_wake`] are each bridge's
 //! `push_handle_wake` (story PUSH-015). Each bridge's push register and
-//! deregister exports return [`push_registration_unavailable`]
+//! deregister exports run [`check_push_registration_ready`], then return
+//! [`push_registration_unavailable`]
 //! (`SCP-TRANS-5104`) until story PUSH-037 gives them the device's P-256
 //! `#active` signing key. napi and Python name the platform with
 //! [`parse_push_platform`].
@@ -276,16 +277,51 @@ pub enum PushRegistrationError {
     /// no provider to hand the payload to.
     #[error("push is not enabled on this instance")]
     NotEnabled,
+    /// The instance was shut down; construct a new one to continue.
+    #[error("the instance is shut down")]
+    ShutDown,
+    /// The instance holds no local member DID to register a push token for.
+    #[error("the instance holds no local member DID")]
+    NoLocalIdentity,
 }
 
 impl PushRegistrationError {
-    /// The bridge error code: `SCP-TRANS-5104` or `SCP-TRANS-5105`.
+    /// The bridge error code: `SCP-TRANS-5104`, `SCP-TRANS-5105`,
+    /// `SCP-CTX-2138` for a shut-down instance, or `SCP-IDENT-1002` for an
+    /// instance with no local member DID.
     #[must_use]
     pub const fn code(&self) -> &'static str {
         match self {
             Self::SigningKeyUnavailable => error_codes::TRANS_5104,
             Self::NotEnabled => error_codes::TRANS_5105,
+            Self::ShutDown => error_codes::CTX_2138,
+            Self::NoLocalIdentity => error_codes::IDENT_1002,
         }
+    }
+}
+
+/// Checks that `core` can register or deregister a push token.
+///
+/// The instance must not be shut down, and its supervisor must hold a local
+/// member DID, the identity a `PushRegistration` is signed for. The push wake
+/// refuses the same two states (ADR-029 §2 push-wake pull mode step 7).
+///
+/// # Errors
+///
+/// [`PushRegistrationError::ShutDown`] for a shut-down instance and
+/// [`PushRegistrationError::NoLocalIdentity`] for one with no supervisor or
+/// no local member DID.
+pub fn check_push_registration_ready(core: &CoreFields) -> Result<(), PushRegistrationError> {
+    if core.is_shutdown() {
+        return Err(PushRegistrationError::ShutDown);
+    }
+    let has_identity = core
+        .supervisor()
+        .is_some_and(|supervisor| supervisor.node_identity().is_ok());
+    if has_identity {
+        Ok(())
+    } else {
+        Err(PushRegistrationError::NoLocalIdentity)
     }
 }
 
@@ -592,6 +628,42 @@ mod tests {
         assert_eq!(
             PushRegistrationError::NotEnabled.code(),
             error_codes::TRANS_5105
+        );
+        assert_eq!(
+            PushRegistrationError::ShutDown.code(),
+            error_codes::CTX_2138
+        );
+        assert_eq!(
+            PushRegistrationError::NoLocalIdentity.code(),
+            error_codes::IDENT_1002
+        );
+    }
+
+    /// Registration needs a live instance whose supervisor holds a local
+    /// member DID: no supervisor and a supervisor with no crypto provider
+    /// both refuse, a supervisor with a DID passes, and a shut-down instance
+    /// refuses even with one.
+    #[tokio::test]
+    async fn registration_needs_a_live_instance_with_a_local_identity() {
+        assert_eq!(
+            check_push_registration_ready(&CoreFields::new()),
+            Err(PushRegistrationError::NoLocalIdentity)
+        );
+        let shim = CoreFields::with_supervisor(std::sync::Arc::new(
+            scp_core::context::supervisor::Supervisor::for_query_shim(),
+        ));
+        assert_eq!(
+            check_push_registration_ready(&shim),
+            Err(PushRegistrationError::NoLocalIdentity)
+        );
+        let core = CoreFields::with_supervisor(crate::bridge_instance::tests::test_supervisor());
+        assert_eq!(check_push_registration_ready(&core), Ok(()));
+        core.shutdown_core_async(Duration::from_secs(1), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            check_push_registration_ready(&core),
+            Err(PushRegistrationError::ShutDown)
         );
     }
 

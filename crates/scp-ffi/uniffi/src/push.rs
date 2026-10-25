@@ -9,8 +9,10 @@
 //! to [`scp_ffi_common::push::handle_wake`], which checks them against the
 //! enabled platform's wake signal and runs the ADR-029 §2 push-wake pull.
 //!
-//! `push_enable` and `push_disable` return `SCP-TRANS-5104` before they touch
-//! the provider: the registrar signs with the device's P-256 `#active` key,
+//! `push_enable` and `push_disable` check the instance first
+//! (`SCP-CTX-2138` when it is shut down, `SCP-IDENT-1002` when it holds no
+//! local member DID), then return `SCP-TRANS-5104` before they touch the
+//! provider: the registrar signs with the device's P-256 `#active` key,
 //! and no production constructor builds it until story PUSH-036. Story
 //! PUSH-037 makes them register and deregister and fill the instance's
 //! provider slot, [`UniffiBridgeInstance::push`]. Until then the slot stays
@@ -20,9 +22,10 @@
 
 use std::sync::Arc;
 
+use scp_ffi_common::bridge_instance::CoreFields;
 use scp_ffi_common::push::{
     PushRegistrationError, WakeContextFailureView, WakeError, WakeFailureView,
-    push_registration_unavailable,
+    check_push_registration_ready, push_registration_unavailable,
 };
 
 use crate::PushProvider;
@@ -136,9 +139,13 @@ pub(crate) struct EnabledPush {
 }
 
 fn registration_error(e: PushRegistrationError) -> ScpError {
-    ScpError::Transport {
-        msg: e.to_string(),
-        code: e.code().to_owned(),
+    let (msg, code) = (e.to_string(), e.code().to_owned());
+    match e {
+        PushRegistrationError::ShutDown => ScpError::Context { msg, code },
+        PushRegistrationError::NoLocalIdentity => ScpError::Identity { msg, code },
+        PushRegistrationError::SigningKeyUnavailable | PushRegistrationError::NotEnabled => {
+            ScpError::Transport { msg, code }
+        }
     }
 }
 
@@ -149,11 +156,23 @@ fn wake_error(e: WakeError) -> ScpError {
     }
 }
 
+/// The register and deregister paths both start here: `core` must be live
+/// and hold a local member DID. Until story PUSH-037 they then refuse.
+fn registration_refusal(core: &CoreFields) -> ScpError {
+    check_push_registration_ready(core).map_or_else(registration_error, |()| {
+        registration_error(push_registration_unavailable())
+    })
+}
+
 /// The enable path: story PUSH-037 calls `provider.register_push()`, runs the
 /// registrar for `platform` and fills the instance's slot. Until then it
 /// refuses before it reads either argument.
-fn enable_push(_provider: &dyn PushProvider, _platform: PushPlatform) -> Result<(), ScpError> {
-    Err(registration_error(push_registration_unavailable()))
+fn enable_push(
+    core: &CoreFields,
+    _provider: &dyn PushProvider,
+    _platform: PushPlatform,
+) -> Result<(), ScpError> {
+    Err(registration_refusal(core))
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -163,14 +182,16 @@ impl Scp {
     ///
     /// # Errors
     ///
-    /// `SCP-TRANS-5104` always, before `provider` is called: the device has
-    /// no P-256 `#active` signing key to sign a `PushRegistration` with.
+    /// `SCP-CTX-2138` for a shut-down instance, `SCP-IDENT-1002` for one with
+    /// no local member DID, and otherwise `SCP-TRANS-5104`: the device has no
+    /// P-256 `#active` signing key to sign a `PushRegistration` with. Each is
+    /// returned before `provider` is called.
     pub fn push_enable(
         &self,
         provider: Box<dyn PushProvider>,
         platform: PushPlatform,
     ) -> Result<(), ScpError> {
-        enable_push(provider.as_ref(), platform)
+        enable_push(&self.inner.core, provider.as_ref(), platform)
     }
 
     /// Disables push: deregisters the device's push token from every relay
@@ -178,10 +199,11 @@ impl Scp {
     ///
     /// # Errors
     ///
-    /// `SCP-TRANS-5104` always: the device has no P-256 `#active` signing key
-    /// to sign a `PushDeregistration` with.
+    /// `SCP-CTX-2138` for a shut-down instance, `SCP-IDENT-1002` for one with
+    /// no local member DID, and otherwise `SCP-TRANS-5104`: the device has no
+    /// P-256 `#active` signing key to sign a `PushDeregistration` with.
     pub fn push_disable(&self) -> Result<(), ScpError> {
-        Err(registration_error(push_registration_unavailable()))
+        Err(registration_refusal(&self.inner.core))
     }
 
     /// Handles a silent push. `payload` is what the platform delivered:
@@ -283,32 +305,54 @@ mod tests {
         }
     }
 
+    /// The code of a register, deregister or wake refusal, each in the
+    /// variant its code family names.
     fn code(e: &ScpError) -> String {
         match e {
-            ScpError::Transport { code, .. } => code.clone(),
-            other => panic!("expected a transport error, got {other:?}"),
+            ScpError::Transport { code, .. } if code.starts_with("SCP-TRANS-") => code.clone(),
+            ScpError::Context { code, .. } if code.starts_with("SCP-CTX-") => code.clone(),
+            ScpError::Identity { code, .. } if code.starts_with("SCP-IDENT-") => code.clone(),
+            other => panic!("expected a refusal in its own variant, got {other:?}"),
         }
+    }
+
+    /// An instance whose supervisor holds a local member DID.
+    fn ready_scp() -> Arc<Scp> {
+        let scp = Scp::new_in_memory_for_test();
+        scp.inner
+            .init_context_manager_with_local_transport("did:test:push-uniffi");
+        scp
     }
 
     #[test]
     fn push_enable_fails_closed_without_calling_register_push() {
-        let scp = Scp::new_in_memory_for_test();
-        let fake = FakePushProvider::new(Ok(Vec::new()));
-        let err = scp
-            .push_enable(Box::new(Forward(Arc::clone(&fake))), PushPlatform::Apns)
-            .unwrap_err();
-        assert_eq!(code(&err), codes::TRANS_5104);
-        assert_eq!(fake.register_calls.load(Ordering::SeqCst), 0);
-        assert!(
-            scp.inner.enabled_push().is_none(),
-            "a failed enable leaves no provider"
-        );
+        for (scp, expected) in [
+            (Scp::new_in_memory_for_test(), codes::IDENT_1002),
+            (ready_scp(), codes::TRANS_5104),
+        ] {
+            let fake = FakePushProvider::new(Ok(Vec::new()));
+            let err = scp
+                .push_enable(Box::new(Forward(Arc::clone(&fake))), PushPlatform::Apns)
+                .unwrap_err();
+            assert_eq!(code(&err), expected);
+            assert_eq!(fake.register_calls.load(Ordering::SeqCst), 0);
+            assert!(
+                scp.inner.enabled_push().is_none(),
+                "a failed enable leaves no provider"
+            );
+        }
     }
 
     #[test]
     fn push_disable_fails_closed() {
-        let scp = Scp::new_in_memory_for_test();
-        assert_eq!(code(&scp.push_disable().unwrap_err()), codes::TRANS_5104);
+        assert_eq!(
+            code(&Scp::new_in_memory_for_test().push_disable().unwrap_err()),
+            codes::IDENT_1002
+        );
+        assert_eq!(
+            code(&ready_scp().push_disable().unwrap_err()),
+            codes::TRANS_5104
+        );
     }
 
     #[tokio::test]
