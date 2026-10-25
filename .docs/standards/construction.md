@@ -170,7 +170,7 @@ NodeConfig {
     bind_addr, local_api, cors_origins, dht_gateways, http3, dns_provider,
     // Capability slots (typed, never dyn):
     nat: NatSlot, network_detector, blob_storage,
-    push: PushSlot,            // Disabled | Enabled(Box<PushProviders{store, senders: PushSenders{apns, fcm}}>); defaults Disabled (M2)
+    push: PushSlot,            // Disabled | Enabled(Box<PushProviders{store, senders: PushSenders{apns, fcm, webpush}}>); defaults Disabled (M2)
 }
 ```
 
