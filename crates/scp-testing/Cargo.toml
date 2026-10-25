@@ -312,6 +312,10 @@ name = "test_double_gating"
 path = "tests/integration/test_double_gating.rs"
 
 [[test]]
+name = "key_state_params"
+path = "tests/integration/key_state_params.rs"
+
+[[test]]
 name = "sdk_wrapper"
 path = "tests/integration/sdk_wrapper.rs"
 
