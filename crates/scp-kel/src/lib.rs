@@ -53,8 +53,8 @@ pub use rank::{
     UnrelatedChains, pair_chains, resolve_set,
 };
 pub use relation::{
-    ChainRelation, EntryRelations, ExtendingAct, RelationError, ServedChainReading,
-    classify_relation,
+    ChainRelation, EntryAdoption, EntryRelations, ExtendingAct, RelationError, ServedChainReading,
+    WithheldEvent, classify_relation,
 };
 pub use routing::{RoutingKind, routing_id};
 pub use signature::{
