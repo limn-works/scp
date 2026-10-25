@@ -16,43 +16,39 @@ use scp_ffi_common::error_codes::{
     STORAGE_8006, TRANS_5080, TRANS_5081, TRANS_5082, TRANS_5083, TRANS_5084, custody_failure_code,
 };
 
-/// The registered code for `kind`. The match names every kind, so a new kind
-/// does not compile until it has a row here.
-const fn registered(kind: CustodyFailureKind) -> &'static str {
-    match kind {
-        CustodyFailureKind::KeyNotFound => CRYPTO_4006,
-        CustodyFailureKind::PseudonymRejected => IDENT_1055,
-        CustodyFailureKind::StorageClosed => STORAGE_8006,
-        CustodyFailureKind::StorageLockHeld => STORAGE_8005,
-        CustodyFailureKind::TimedOut => CRYPTO_4062,
-        CustodyFailureKind::AttestationFailed => ATTEST_9001,
-        CustodyFailureKind::Unsupported => CRYPTO_4061,
-        CustodyFailureKind::PushWakePayloadInvalid => TRANS_5080,
-        CustodyFailureKind::PushRegistrationRejected => TRANS_5081,
-        CustodyFailureKind::PushVerifierUnavailable => TRANS_5082,
-        CustodyFailureKind::PushPlatformUnavailable => TRANS_5083,
-        CustodyFailureKind::PushProviderFailed => TRANS_5084,
-        CustodyFailureKind::Failed => CRYPTO_4060,
-    }
+/// One list of `kind => registered code` rows generates both the exhaustive
+/// `registered` match and `ALL_KINDS`, the kinds the test compares. A kind
+/// left out of the list leaves the match non-exhaustive (E0004), so no kind
+/// can be in the match and missing from the comparison.
+macro_rules! kind_table {
+    ($($kind:ident => $code:ident,)+) => {
+        /// The registered code for `kind`.
+        const fn registered(kind: CustodyFailureKind) -> &'static str {
+            match kind {
+                $(CustodyFailureKind::$kind => $code,)+
+            }
+        }
+
+        /// Every kind, in the list's order.
+        const ALL_KINDS: &[CustodyFailureKind] = &[$(CustodyFailureKind::$kind,)+];
+    };
 }
 
-/// Every kind. A new kind first fails to compile in `registered`, and the
-/// author who adds its row there adds it here.
-const ALL_KINDS: [CustodyFailureKind; 13] = [
-    CustodyFailureKind::KeyNotFound,
-    CustodyFailureKind::PseudonymRejected,
-    CustodyFailureKind::StorageClosed,
-    CustodyFailureKind::StorageLockHeld,
-    CustodyFailureKind::TimedOut,
-    CustodyFailureKind::AttestationFailed,
-    CustodyFailureKind::Unsupported,
-    CustodyFailureKind::PushWakePayloadInvalid,
-    CustodyFailureKind::PushRegistrationRejected,
-    CustodyFailureKind::PushVerifierUnavailable,
-    CustodyFailureKind::PushPlatformUnavailable,
-    CustodyFailureKind::PushProviderFailed,
-    CustodyFailureKind::Failed,
-];
+kind_table! {
+    KeyNotFound => CRYPTO_4006,
+    PseudonymRejected => IDENT_1055,
+    StorageClosed => STORAGE_8006,
+    StorageLockHeld => STORAGE_8005,
+    TimedOut => CRYPTO_4062,
+    AttestationFailed => ATTEST_9001,
+    Unsupported => CRYPTO_4061,
+    PushWakePayloadInvalid => TRANS_5080,
+    PushRegistrationRejected => TRANS_5081,
+    PushVerifierUnavailable => TRANS_5082,
+    PushPlatformUnavailable => TRANS_5083,
+    PushProviderFailed => TRANS_5084,
+    Failed => CRYPTO_4060,
+}
 
 #[test]
 fn every_custody_failure_kind_reports_its_registered_code() {

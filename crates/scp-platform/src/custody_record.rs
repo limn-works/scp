@@ -36,13 +36,15 @@ const RECORD_LEN: usize = 3;
 /// (spec §17.3). The adapter's builder draws it from a CSPRNG; this crate
 /// takes it as bytes and draws nothing.
 ///
-/// It is neither `Copy` nor `Clone`, and [`StorageCustodyRecordStore::new`]
-/// takes it by move, so one namespace value builds one store. A store's
-/// `put` checks for a record and then writes under a lock only that store
-/// holds, and [`Storage`] has no insert-if-absent, so two stores over one
-/// namespace could each pass the check and write different records. SCP-345's
-/// callback-adapter loader takes the namespace from its registry entry by
-/// move for the same reason.
+/// A store's `put` checks for a record and then writes under a lock only
+/// that store holds, and [`Storage`] has no insert-if-absent, so two live
+/// stores over one namespace could each pass the check and write different
+/// records. The namespace is neither `Copy` nor `Clone`, and
+/// [`StorageCustodyRecordStore::new`] takes it by move, which stops one value
+/// from being reused by accident. It does not stop two equal namespaces built
+/// from the same bytes; the guard against two live stores for one namespace
+/// is SCP-345's callback-adapter loader, which refuses a second live adapter
+/// for a namespace.
 #[derive(PartialEq, Eq)]
 pub struct CustodyNamespace([u8; 16]);
 
@@ -151,7 +153,7 @@ impl<S: Storage> fmt::Debug for StorageCustodyRecordStore<S> {
 
 impl<S: Storage> StorageCustodyRecordStore<S> {
     /// A store over `storage` that reads and writes only `namespace`'s
-    /// records. It takes `namespace` by move, so no second store shares it:
+    /// records. It takes `namespace` by move, so one value cannot build two:
     ///
     /// ```compile_fail,E0382
     /// use scp_platform::{CustodyNamespace, Storage, StorageCustodyRecordStore};
