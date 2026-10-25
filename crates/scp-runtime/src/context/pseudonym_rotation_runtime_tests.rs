@@ -593,6 +593,7 @@ async fn a_rotation_after_start_reregisters_once_with_the_new_routing_id() {
         signing_key,
         publisher: Arc::new(PushRecorder(tx)),
         clock: Arc::clone(&n.clock) as Arc<dyn scp_clock::Clock>,
+        monotonic_clock: Arc::new(scp_clock::SystemMonotonicClock::new()),
         platform: PushPlatform::Apns,
         token: scp_platform::PushToken::new(b"rotation-device-token".to_vec()),
         storage: Arc::new(crate::store::ProtocolRepository::new_for_testing(

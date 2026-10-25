@@ -8,13 +8,17 @@
 //! - [`SystemClock`] — production clock backed by [`SystemTime`].
 //! - [`TestClock`] — deterministic clock with manual time control.
 //!
+//! The [`MonotonicClock`] trait measures elapsed time that a step of the
+//! wall clock does not move: [`SystemMonotonicClock`] in production, and
+//! [`TestClock`] in tests.
+//!
 //! The free functions `now_secs()` / `now_millis()` and `ClockError` are
 //! private implementation details of `SystemClock`. All production code
 //! should use `&dyn Clock` or `SystemClock` directly.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 // ---------------------------------------------------------------------------
 // ClockError
@@ -106,14 +110,60 @@ impl Clock for SystemClock {
     }
 }
 
+/// Elapsed time that never goes back and that a step of the wall clock
+/// (an NTP correction, a user setting the date) does not move.
+/// Implementations must be thread-safe.
+pub trait MonotonicClock: Send + Sync {
+    /// Milliseconds since a fixed origin of this clock. Only the difference
+    /// of two readings of one clock means anything.
+    fn monotonic_millis(&self) -> u64;
+}
+
+/// Production monotonic clock backed by [`Instant`].
+///
+/// Its origin is the moment of construction. [`Instant`] is unavailable on
+/// `wasm32-unknown-unknown`, as [`SystemTime`] is, so the browser client
+/// brings its own implementation.
+pub struct SystemMonotonicClock {
+    origin: Instant,
+}
+
+impl SystemMonotonicClock {
+    /// A clock whose origin is now.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+        }
+    }
+}
+
+impl Default for SystemMonotonicClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MonotonicClock for SystemMonotonicClock {
+    fn monotonic_millis(&self) -> u64 {
+        u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+}
+
 /// Test clock with manual time control.
 ///
 /// Time is stored internally in milliseconds. The [`advance`](TestClock::advance)
 /// and [`set`](TestClock::set) methods operate in seconds for convenience;
 /// use [`advance_millis`](TestClock::advance_millis) when sub-second precision
 /// is needed.
+///
+/// A `TestClock` is also a [`MonotonicClock`]: [`advance`](TestClock::advance)
+/// and [`advance_millis`](TestClock::advance_millis) are elapsed time and move
+/// both readings, while [`set`](TestClock::set) is a step of the wall clock
+/// and leaves the monotonic reading where it is.
 pub struct TestClock {
     current_millis: AtomicU64,
+    monotonic_millis: AtomicU64,
 }
 
 impl TestClock {
@@ -122,21 +172,25 @@ impl TestClock {
     pub const fn new(start_secs: u64) -> Self {
         Self {
             current_millis: AtomicU64::new(start_secs.saturating_mul(1000)),
+            monotonic_millis: AtomicU64::new(0),
         }
     }
 
-    /// Advance time by the given number of seconds.
+    /// Advance time by the given number of seconds: the wall clock and the
+    /// monotonic clock both move.
     pub fn advance(&self, secs: u64) {
-        self.current_millis
-            .fetch_add(secs.saturating_mul(1000), Ordering::Release);
+        self.advance_millis(secs.saturating_mul(1000));
     }
 
-    /// Advance time by the given number of milliseconds.
+    /// Advance time by the given number of milliseconds: the wall clock and
+    /// the monotonic clock both move.
     pub fn advance_millis(&self, ms: u64) {
         self.current_millis.fetch_add(ms, Ordering::Release);
+        self.monotonic_millis.fetch_add(ms, Ordering::Release);
     }
 
-    /// Set the clock to a specific timestamp in seconds.
+    /// Step the wall clock to a specific timestamp in seconds. The monotonic
+    /// reading does not move.
     pub fn set(&self, timestamp_secs: u64) {
         self.current_millis
             .store(timestamp_secs.saturating_mul(1000), Ordering::Release);
@@ -150,6 +204,12 @@ impl Clock for TestClock {
 
     fn now_millis(&self) -> u64 {
         self.current_millis.load(Ordering::Acquire)
+    }
+}
+
+impl MonotonicClock for TestClock {
+    fn monotonic_millis(&self) -> u64 {
+        self.monotonic_millis.load(Ordering::Acquire)
     }
 }
 
@@ -262,6 +322,30 @@ mod tests {
         clock.set(20);
         assert_eq!(clock.now_secs(), 20);
         assert_eq!(clock.now_millis(), 20_000);
+    }
+
+    #[test]
+    fn test_clock_monotonic_moves_on_advance_not_on_set() {
+        let clock = TestClock::new(10);
+        assert_eq!(clock.monotonic_millis(), 0);
+        clock.advance(2);
+        clock.advance_millis(500);
+        assert_eq!(clock.monotonic_millis(), 2_500);
+        clock.set(1_000);
+        assert_eq!(clock.now_secs(), 1_000);
+        assert_eq!(
+            clock.monotonic_millis(),
+            2_500,
+            "a wall step is not elapsed time"
+        );
+    }
+
+    #[test]
+    fn system_monotonic_clock_never_goes_back() {
+        let clock = SystemMonotonicClock::new();
+        let first = clock.monotonic_millis();
+        let second = clock.monotonic_millis();
+        assert!(second >= first);
     }
 
     #[test]
