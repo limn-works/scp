@@ -1210,7 +1210,7 @@ struct SenderKeyResend {
 /// distribution that stays queued or was dropped is a count, never an error;
 /// `error` holds only a send that did not complete (spec 09 §9.16.9).
 ///
-/// [`DistributionReport`]: scp_runtime::context::actor::state::DistributionReport
+/// [`DistributionReport`]: scp_core::context::actor::state::DistributionReport
 async fn send_queued_answers(
     supervisor: &Supervisor,
     context_id: &str,
