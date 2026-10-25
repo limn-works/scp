@@ -445,6 +445,14 @@ pub struct UniffiBridgeInstance {
     /// stream.
     pub(crate) outlet_streaming_saga_registry:
         Arc<StreamRegistry<String, scp_ffi_common::streaming_saga::StreamingSagaEntry>>,
+
+    /// The push provider and platform enabled on this instance, which
+    /// `push_handle_wake` hands each payload to (ADR-025 criterion 4).
+    /// Per instance, never a `static` (`check-no-bridge-globals.sh`). Story
+    /// PUSH-037's `push_enable` fills it; until then only the `testing`
+    /// installer does, so a shipped build's wake returns `SCP-TRANS-5105`.
+    /// Cleared on shutdown, which drops the host's provider.
+    push: std::sync::Mutex<Option<crate::push::EnabledPush>>,
 }
 
 impl std::fmt::Debug for UniffiBridgeInstance {
@@ -508,6 +516,7 @@ impl UniffiBridgeInstance {
             durable_providers: Some(durable_providers),
             outlet_stream_registry,
             outlet_streaming_saga_registry,
+            push: std::sync::Mutex::new(None),
         }
     }
 
@@ -655,6 +664,7 @@ impl UniffiBridgeInstance {
             durable_providers: Some(durable_providers),
             outlet_stream_registry,
             outlet_streaming_saga_registry,
+            push: std::sync::Mutex::new(None),
         }
     }
 
@@ -1391,6 +1401,28 @@ impl UniffiBridgeInstance {
             .expect("rebuilding the durable UCAN state must succeed in a test");
     }
 
+    /// Locks this instance's push slot. A panic while the lock was held
+    /// leaves the slot's value whole (a single `Option` store), so a
+    /// poisoned lock is read through.
+    fn lock_push(&self) -> std::sync::MutexGuard<'_, Option<crate::push::EnabledPush>> {
+        self.push
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// A clone of the enabled push provider and platform, taken out of the
+    /// lock so no caller holds it across an `.await`.
+    pub(crate) fn enabled_push(&self) -> Option<crate::push::EnabledPush> {
+        self.lock_push().clone()
+    }
+
+    /// Enables `push` on this instance, replacing any provider enabled
+    /// before.
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn set_enabled_push(&self, push: crate::push::EnabledPush) {
+        *self.lock_push() = Some(push);
+    }
+
     /// Locks this instance's release marks.
     fn lock_release_marks(
         &self,
@@ -1889,6 +1921,9 @@ impl BridgeInstanceCore for UniffiBridgeInstance {
         // shutdown (the caller normally holds its own `Arc`).
         self.identity_link_attestation_registry.clear();
         self.context_handle_registry.clear();
+        // Drop the host's push provider, so a shut-down instance holds no
+        // callback into Swift or Kotlin.
+        self.lock_push().take();
     }
 }
 
