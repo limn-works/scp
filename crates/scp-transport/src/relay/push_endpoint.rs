@@ -161,6 +161,33 @@ impl EndpointError {
                 | Self::OwnAddressesUnresolved
         )
     }
+
+    /// The deferral for an error that comes from the relay's own state, not
+    /// from the endpoint: a full lookup pool or an unresolved own-address
+    /// set. Such an error says nothing about the endpoint, so a send records
+    /// no back-off for its origin and counts nothing toward removal, and a
+    /// registration answers `5000` (ADR-004 **Endpoint refusal**). `None`
+    /// for every error about the endpoint itself.
+    ///
+    /// Every caller that sorts an [`EndpointError`] asks this first, so a
+    /// relay-state error has one classification.
+    #[must_use]
+    pub const fn says_nothing_about_endpoint(self) -> Option<super::push::SendDeferral> {
+        match self {
+            Self::LookupPoolFull => Some(super::push::SendDeferral::LookupPoolFull),
+            Self::OwnAddressesUnresolved => Some(super::push::SendDeferral::OwnAddressesUnresolved),
+            Self::NotUrl(_)
+            | Self::NotCanonical
+            | Self::NotHttps
+            | Self::HasUserinfo
+            | Self::HasFragment
+            | Self::NoHost
+            | Self::Refused(_)
+            | Self::DoesNotResolve
+            | Self::ResolveTimeout
+            | Self::Resolve(_) => None,
+        }
+    }
 }
 
 /// One resolved set of the relay's own addresses, which [`check_address`]
@@ -221,8 +248,10 @@ impl fmt::Debug for OwnAddressSet {
 pub struct OwnAddresses(Arc<RwLock<Option<OwnAddressSet>>>);
 
 impl OwnAddresses {
-    /// A handle that holds the known set of `addresses`.
-    pub fn new(addresses: impl IntoIterator<Item = IpAddr>) -> Self {
+    /// A handle that holds the known set of `addresses`. Outside this
+    /// crate's tests a known set comes only from [`track_own_addresses`].
+    #[cfg(test)]
+    pub(crate) fn new(addresses: impl IntoIterator<Item = IpAddr>) -> Self {
         Self(Arc::new(RwLock::new(Some(OwnAddressSet::new(addresses)))))
     }
 
@@ -797,26 +826,116 @@ impl LookupPermits {
     }
 }
 
-/// How a [`CheckedResolver`] looks a name up.
+/// How a [`CheckedResolver`] or [`track_own_addresses`] looks a name up.
 #[derive(Clone)]
 enum Lookup {
     /// The operating system's resolver.
     System,
-    /// A fixed table, so a test can point a name at any address. A name the
-    /// table lacks fails as the system resolver fails for NXDOMAIN; a name
-    /// mapped to no address resolves to none. `started` counts the lookups
-    /// that ran.
-    #[cfg(test)]
-    Fixed {
-        table: FixedTable,
-        started: Arc<std::sync::atomic::AtomicUsize>,
-    },
+    /// A fixed table, so a test can point a name at any address.
+    #[cfg(any(test, feature = "testing"))]
+    Fixed(FixedAnswers),
 }
 
-/// The answers of a [`Lookup::Fixed`], which a test may change while a
-/// resolver holds them.
-#[cfg(test)]
-pub(crate) type FixedTable = Arc<RwLock<std::collections::HashMap<String, Vec<IpAddr>>>>;
+/// How [`track_own_addresses`] resolves the relay's own hosts: the
+/// operating system's resolver, or, in a test build, a fixed table.
+#[derive(Clone)]
+pub struct OwnAddressLookup(Lookup);
+
+impl OwnAddressLookup {
+    /// The operating system's resolver, the only lookup a build without the
+    /// `testing` feature has.
+    #[must_use]
+    pub const fn system() -> Self {
+        Self(Lookup::System)
+    }
+
+    /// A lookup that answers from `answers`, which the test may change while
+    /// the tracker runs.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn fixed(answers: &FixedAnswers) -> Self {
+        Self(Lookup::Fixed(answers.clone()))
+    }
+}
+
+impl fmt::Debug for OwnAddressLookup {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Lookup::System => f.write_str("OwnAddressLookup::System"),
+            #[cfg(any(test, feature = "testing"))]
+            Lookup::Fixed(_) => f.write_str("OwnAddressLookup::Fixed"),
+        }
+    }
+}
+
+/// The answers of a fixed lookup, shared by every clone.
+///
+/// A test may change them while a resolver or tracker holds them. A name the
+/// table lacks fails as the system resolver fails for NXDOMAIN; a name mapped
+/// to no address resolves to none. Each lookup waits the current delay
+/// first, on the tokio clock.
+#[cfg(any(test, feature = "testing"))]
+#[derive(Clone, Default)]
+pub struct FixedAnswers {
+    table: Arc<RwLock<std::collections::HashMap<String, Vec<IpAddr>>>>,
+    started: Arc<std::sync::atomic::AtomicUsize>,
+    delay: Arc<RwLock<Duration>>,
+}
+
+#[cfg(any(test, feature = "testing"))]
+impl FixedAnswers {
+    /// Answers holding `entries`.
+    #[must_use]
+    pub fn new(entries: impl IntoIterator<Item = (String, Vec<IpAddr>)>) -> Self {
+        let answers = Self::default();
+        for (host, ips) in entries {
+            answers.insert(&host, ips);
+        }
+        answers
+    }
+
+    /// Points `host` at `ips`, replacing any earlier answer.
+    pub fn insert(&self, host: &str, ips: Vec<IpAddr>) {
+        self.table
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(host.to_owned(), ips);
+    }
+
+    /// Removes `host`, so its lookup fails.
+    pub fn remove(&self, host: &str) {
+        self.table
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(host);
+    }
+
+    /// Makes each later lookup wait `delay` before it answers.
+    pub fn set_delay(&self, delay: Duration) {
+        *self.delay.write().unwrap_or_else(PoisonError::into_inner) = delay;
+    }
+
+    /// How many lookups started.
+    #[must_use]
+    pub fn started(&self) -> usize {
+        self.started.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    async fn answer(&self, host: &str) -> Result<Vec<IpAddr>, EndpointError> {
+        self.started
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let delay = *self.delay.read().unwrap_or_else(PoisonError::into_inner);
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        self.table
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(host)
+            .cloned()
+            .ok_or(EndpointError::Resolve(std::io::ErrorKind::NotFound))
+    }
+}
 
 impl Lookup {
     /// Looks `host` up while holding `permit`. The system lookup runs on a
@@ -837,16 +956,11 @@ impl Lookup {
                 // The blocking task panicked or the runtime is shutting down.
                 .map_err(|_| EndpointError::Resolve(std::io::ErrorKind::Other))?
             }
-            #[cfg(test)]
-            Self::Fixed { table, started } => {
-                started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            #[cfg(any(test, feature = "testing"))]
+            Self::Fixed(answers) => {
+                let found = answers.answer(host).await;
                 drop(permit);
-                table
-                    .read()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .get(host)
-                    .cloned()
-                    .ok_or(EndpointError::Resolve(std::io::ErrorKind::NotFound))
+                found
             }
         }
     }
@@ -908,10 +1022,7 @@ impl CheckedResolver {
         Self {
             own,
             nat64: Nat64Prefixes::new([]),
-            lookup: Lookup::Fixed {
-                table: Arc::new(RwLock::new(table)),
-                started: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            },
+            lookup: Lookup::Fixed(FixedAnswers::new(table)),
             permits: LookupPermits::new(),
             allow_loopback,
         }
@@ -921,7 +1032,7 @@ impl CheckedResolver {
     #[cfg(test)]
     pub(crate) fn lookups_started(&self) -> usize {
         match &self.lookup {
-            Lookup::Fixed { started, .. } => started.load(std::sync::atomic::Ordering::SeqCst),
+            Lookup::Fixed(answers) => answers.started(),
             Lookup::System => 0,
         }
     }
@@ -1102,12 +1213,44 @@ pub enum OwnAddressError {
 #[derive(Debug)]
 pub struct OwnAddressTracker {
     task: tokio::task::AbortHandle,
+    own: OwnAddresses,
+    binds: Binds,
 }
+
+/// The specific listener addresses the own-address set holds besides the
+/// reserved hosts' addresses. An install of a resolved set and
+/// [`OwnAddressTracker::add_bind`] each hold this lock, so neither loses the
+/// other's change.
+type Binds = Arc<RwLock<Vec<IpAddr>>>;
 
 impl OwnAddressTracker {
     /// Stops the refresh task; the handle keeps its last set.
     pub fn stop(&self) {
         self.task.abort();
+    }
+
+    /// Adds the address of a listener bound after tracking started
+    /// (ADR-004 **Endpoint refusal**): from now on the set holds it, and a
+    /// known set holds it at once. A wildcard bind (`0.0.0.0` or `::`) names
+    /// no specific address and adds none.
+    pub fn add_bind(&self, bind: SocketAddr) {
+        let ip = bind.ip();
+        if ip.is_unspecified() {
+            return;
+        }
+        let mut binds = self.binds.write().unwrap_or_else(PoisonError::into_inner);
+        if binds.contains(&ip) {
+            return;
+        }
+        binds.push(ip);
+        // The lock is held until the set holds `ip`, so an install that
+        // read the binds before the push cannot land after it.
+        if let Some(known) = self.own.known() {
+            self.own.replace(Some(OwnAddressSet::new(
+                known.0.iter().copied().chain([ip]),
+            )));
+        }
+        drop(binds);
     }
 }
 
@@ -1121,15 +1264,18 @@ impl Drop for OwnAddressTracker {
 /// (ADR-004 **Endpoint refusal**).
 ///
 /// The set holds each address the host of every URL in `urls` resolves to,
-/// each IP-literal host, and the address of each bind in `binds` that is not
-/// a wildcard (`0.0.0.0` or `::`), because a wildcard bind names no specific
-/// address. The returned task resolves the hosts again whenever `urls`
-/// changes, after first marking `own` unresolved, and every
+/// each IP-literal host, and the address of each bind in `binds`, and of each
+/// bind later given to [`OwnAddressTracker::add_bind`], that is not a
+/// wildcard (`0.0.0.0` or `::`), because a wildcard bind names no specific
+/// address. `lookup` resolves the hosts; a production caller passes
+/// [`OwnAddressLookup::system`]. The returned task resolves the hosts again
+/// whenever `urls` changes, after first marking `own` unresolved, and every
 /// [`OWN_ADDRESS_REFRESH`] while `urls` stays the same. A resolution that
 /// fails marks `own` unresolved, logs a warning, and is tried again after
-/// [`OWN_ADDRESS_RETRY`]. The task ends when it is dropped, when every
-/// [`LiveRelayUrl`] clone is gone, or when every [`OwnAddresses`] clone is
-/// gone.
+/// [`OWN_ADDRESS_RETRY`]. A resolution that finishes after `urls` changed is
+/// never installed: `own` stays unresolved and the hosts of the new set are
+/// resolved. The task ends when it is dropped, when every [`LiveRelayUrl`]
+/// clone is gone, or when every [`OwnAddresses`] clone is gone.
 ///
 /// # Errors
 ///
@@ -1139,8 +1285,30 @@ pub async fn track_own_addresses(
     own: &OwnAddresses,
     urls: &LiveRelayUrl,
     binds: &[SocketAddr],
+    lookup: &OwnAddressLookup,
 ) -> Result<OwnAddressTracker, OwnAddressError> {
-    track_with(own, urls, binds, Lookup::System, OWN_ADDRESS_REFRESH).await
+    track_with(own, urls, binds, lookup.0.clone(), OWN_ADDRESS_REFRESH).await
+}
+
+/// Installs `found`, plus the binds, into `own` while the URL set it was
+/// resolved for is still current. `false`, with `own` unresolved, when the
+/// set changed while it resolved.
+fn install_if_current(
+    own: &OwnAddresses,
+    reserved: &crate::relay::push_gate::RelayUrlChanges,
+    found: Vec<IpAddr>,
+    binds: &Binds,
+) -> bool {
+    let installed = reserved.while_current(|| {
+        let binds = binds.read().unwrap_or_else(PoisonError::into_inner);
+        own.replace(Some(OwnAddressSet::new(
+            found.into_iter().chain(binds.iter().copied()),
+        )));
+    });
+    if installed.is_none() {
+        own.replace(None);
+    }
+    installed.is_some()
 }
 
 async fn track_with(
@@ -1151,27 +1319,40 @@ async fn track_with(
     refresh: Duration,
 ) -> Result<OwnAddressTracker, OwnAddressError> {
     let runtime = tokio::runtime::Handle::try_current().map_err(|_| OwnAddressError::NoRuntime)?;
-    let binds: Arc<[IpAddr]> = binds
-        .iter()
-        .map(SocketAddr::ip)
-        .filter(|ip| !ip.is_unspecified())
-        .collect();
+    let binds: Binds = Arc::new(RwLock::new(
+        binds
+            .iter()
+            .map(SocketAddr::ip)
+            .filter(|ip| !ip.is_unspecified())
+            .collect(),
+    ));
     let permits = LookupPermits::new();
     let mut reserved = urls.subscribe();
-    let set = resolve_own(&reserved.current(), &binds, &lookup, &permits).await?;
-    own.replace(Some(set));
+    // A URL change during this first resolution would leave its answer
+    // stale, so resolve again until an answer is current.
+    loop {
+        let found = resolve_own(&reserved.current(), &lookup, &permits).await?;
+        if install_if_current(own, &reserved, found, &binds) {
+            break;
+        }
+    }
     let weak = own.downgrade();
+    let task_binds = Arc::clone(&binds);
     let task = runtime.spawn(async move {
-        let mut wait = refresh;
+        let binds = task_binds;
+        let mut next = NextTurn::After(refresh);
         loop {
-            let url_changed = tokio::select! {
-                changed = reserved.changed() => {
-                    if !changed {
-                        return;
+            let url_changed = match next {
+                NextTurn::UrlChanged => true,
+                NextTurn::After(wait) => tokio::select! {
+                    changed = reserved.changed() => {
+                        if !changed {
+                            return;
+                        }
+                        true
                     }
-                    true
-                }
-                () = tokio::time::sleep(wait) => false,
+                    () = tokio::time::sleep(wait) => false,
+                },
             };
             let Some(cell) = weak.upgrade() else {
                 return;
@@ -1182,10 +1363,27 @@ async fn track_with(
                 // is checked against it while the new one resolves.
                 own.replace(None);
             }
-            match resolve_own(&reserved.current(), &binds, &lookup, &permits).await {
-                Ok(set) => {
-                    own.replace(Some(set));
-                    wait = refresh;
+            let current = reserved.current();
+            // A change during the resolution makes its answer stale: the
+            // resolution is dropped at once, so the old set never outlives
+            // the change, and the next turn resolves the new set.
+            let resolved = tokio::select! {
+                resolved = resolve_own(&current, &lookup, &permits) => resolved,
+                changed = reserved.changed() => {
+                    if !changed {
+                        return;
+                    }
+                    next = NextTurn::UrlChanged;
+                    continue;
+                }
+            };
+            match resolved {
+                Ok(found) => {
+                    // A change that lands between the answer and the install
+                    // leaves the set unresolved, and wakes the next turn at
+                    // once.
+                    install_if_current(&own, &reserved, found, &binds);
+                    next = NextTurn::After(refresh);
                 }
                 Err(error) => {
                     own.replace(None);
@@ -1193,25 +1391,34 @@ async fn track_with(
                         %error,
                         "relay own addresses unresolved; WebPush checks no endpoint until they resolve"
                     );
-                    wait = OWN_ADDRESS_RETRY;
+                    next = NextTurn::After(OWN_ADDRESS_RETRY);
                 }
             }
         }
     });
     Ok(OwnAddressTracker {
         task: task.abort_handle(),
+        own: own.clone(),
+        binds,
     })
 }
 
-/// One resolution of the own-address set: every reserved URL's host, then
-/// the specific binds.
+/// When the refresh task's next resolution runs.
+#[derive(Clone, Copy)]
+enum NextTurn {
+    /// At once: the reserved URL set changed during the last resolution.
+    UrlChanged,
+    /// After this wait, or at the next change of the reserved URL set.
+    After(Duration),
+}
+
+/// One resolution of every reserved URL's host.
 async fn resolve_own(
     urls: &ReservedRelayUrls,
-    binds: &[IpAddr],
     lookup: &Lookup,
     permits: &LookupPermits,
-) -> Result<OwnAddressSet, OwnAddressError> {
-    let mut addresses = binds.to_vec();
+) -> Result<Vec<IpAddr>, OwnAddressError> {
+    let mut addresses = Vec::new();
     for entry in urls.as_slice() {
         let canonical = entry.canonical();
         let no_host = || OwnAddressError::NoHost {
@@ -1243,7 +1450,7 @@ async fn resolve_own(
             }
         }
     }
-    Ok(OwnAddressSet::new(addresses))
+    Ok(addresses)
 }
 
 #[cfg(test)]
@@ -1261,18 +1468,13 @@ mod tests {
 
     /// A fixed lookup whose answers a test can change, and the table behind
     /// it.
-    fn fixed(entries: &[(&str, &[IpAddr])]) -> (Lookup, FixedTable) {
-        let table: FixedTable = Arc::new(RwLock::new(
+    fn fixed(entries: &[(&str, &[IpAddr])]) -> (Lookup, FixedAnswers) {
+        let answers = FixedAnswers::new(
             entries
                 .iter()
-                .map(|(host, ips)| ((*host).to_owned(), ips.to_vec()))
-                .collect(),
-        ));
-        let lookup = Lookup::Fixed {
-            table: Arc::clone(&table),
-            started: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        };
-        (lookup, table)
+                .map(|(host, ips)| ((*host).to_owned(), ips.to_vec())),
+        );
+        (Lookup::Fixed(answers.clone()), answers)
     }
 
     fn relay_url(
@@ -1402,10 +1604,10 @@ mod tests {
         let own = OwnAddresses::unresolved();
         let _tracker = track_with(&own, &urls, &[], lookup, OWN_ADDRESS_REFRESH).await?;
         let set_table = |ips: Vec<IpAddr>| {
-            let mut table = table.write().unwrap_or_else(PoisonError::into_inner);
-            table.clear();
-            if !ips.is_empty() {
-                table.insert("a.example".to_owned(), ips);
+            if ips.is_empty() {
+                table.remove("a.example");
+            } else {
+                table.insert("a.example", ips);
             }
         };
         set_table(vec![ip("9.9.9.9")?]);
@@ -1489,13 +1691,98 @@ mod tests {
         let own = OwnAddresses::unresolved();
         let tracker = track_with(&own, &urls, &[], lookup, OWN_ADDRESS_REFRESH).await?;
         drop(tracker);
-        table
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert("a.example".to_owned(), vec![ip("9.9.9.9")?]);
+        table.insert("a.example", vec![ip("9.9.9.9")?]);
         tokio::time::sleep(OWN_ADDRESS_REFRESH * 3).await;
         let want = ip("8.8.8.8")?;
         assert!(own.known().is_some_and(|s| s.contains(want)));
+        Ok(())
+    }
+
+    /// A resolution for a URL set that changed never installs its answer:
+    /// a slow timer refresh for the old URL, still running when the set
+    /// changes, is dropped and leaves the set unresolved at once, and the
+    /// next set holds only the new URL's addresses.
+    #[tokio::test(start_paused = true)]
+    async fn stale_resolution_is_never_installed() -> TestResult {
+        let (lookup, answers) = fixed(&[
+            ("a.example", &[ip("8.8.8.8")?]),
+            ("b.example", &[ip("1.1.1.1")?]),
+        ]);
+        let urls = LiveRelayUrl::new(relay_url("wss://a.example/scp/v1")?);
+        let own = OwnAddresses::unresolved();
+        let _tracker = track_with(&own, &urls, &[], lookup, OWN_ADDRESS_REFRESH).await?;
+        let a_ip = ip("8.8.8.8")?;
+        assert!(own.known().is_some_and(|s| s.contains(a_ip)));
+
+        // The timer refresh for a.example starts and stalls in its lookup.
+        let slow = Duration::from_secs(3);
+        answers.set_delay(slow);
+        let before = answers.started();
+        tokio::time::sleep(OWN_ADDRESS_REFRESH + Duration::from_millis(1)).await;
+        for _ in 0..100 {
+            if answers.started() > before {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(answers.started(), before + 1, "the timer refresh started");
+
+        // The set changes while it stalls. Neither the old set nor the
+        // stalled answer may be seen from then on, while the new URL's
+        // lookup runs.
+        answers.set_delay(Duration::from_secs(4));
+        urls.set(relay_url("wss://b.example/scp/v1")?);
+        let mut seen_a = false;
+        let step = Duration::from_millis(100);
+        let mut waited = Duration::ZERO;
+        while waited < Duration::from_secs(3) {
+            tokio::time::sleep(step).await;
+            waited += step;
+            seen_a |= own.known().is_some_and(|s| s.contains(a_ip));
+        }
+        assert!(!seen_a, "the stale answer for a.example was installed");
+        assert!(own.known().is_none(), "the new URL is still resolving");
+
+        let b_ip = ip("1.1.1.1")?;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        settle(&own, move |set| set.is_some_and(|s| s.contains(b_ip))).await?;
+        assert!(
+            own.known()
+                .is_some_and(|s| !s.contains(a_ip) && s.len() == 1)
+        );
+        Ok(())
+    }
+
+    /// A listener bound after tracking started joins the set at once and
+    /// stays in it across a refresh, so an endpoint at its address is
+    /// refused; a wildcard bind adds nothing.
+    #[tokio::test(start_paused = true)]
+    async fn later_specific_bind_is_refused() -> TestResult {
+        let (lookup, _answers) = fixed(&[("a.example", &[ip("8.8.8.8")?])]);
+        let urls = LiveRelayUrl::new(relay_url("wss://a.example/scp/v1")?);
+        let own = OwnAddresses::unresolved();
+        let resolver = CheckedResolver::new(own.clone(), Nat64Prefixes::new([]));
+        let tracker = track_with(&own, &urls, &[], lookup, OWN_ADDRESS_REFRESH).await?;
+        resolver.check_literal(&parse_endpoint("https://9.9.9.9/p")?)?;
+
+        tracker.add_bind("0.0.0.0:8443".parse()?);
+        tracker.add_bind("[::]:8443".parse()?);
+        assert_eq!(own.known().map(|s| s.len()), Some(1));
+
+        tracker.add_bind("9.9.9.9:8443".parse()?);
+        assert_eq!(
+            resolver.check_literal(&parse_endpoint("https://9.9.9.9/p")?),
+            Err(EndpointError::Refused(AddressRefusal::OwnAddress))
+        );
+
+        // The refresh keeps the later bind.
+        tokio::time::sleep(OWN_ADDRESS_REFRESH + Duration::from_secs(1)).await;
+        settle(&own, |set| set.is_some()).await?;
+        assert_eq!(
+            resolver.check_literal(&parse_endpoint("https://9.9.9.9/p")?),
+            Err(EndpointError::Refused(AddressRefusal::OwnAddress))
+        );
+        assert_eq!(own.known().map(|s| s.len()), Some(2));
         Ok(())
     }
 

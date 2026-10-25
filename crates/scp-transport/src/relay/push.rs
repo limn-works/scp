@@ -39,9 +39,11 @@ pub use super::push_webpush::{VapidSubject, WebPushConfig, WebPushSender};
 
 /// Why a `WebPush` send did not start.
 ///
-/// Neither reason says anything about the registration's endpoint, so the
-/// dispatcher counts neither toward removal or back-off: it holds the wake
-/// and sends it once the reason ends.
+/// No reason says anything about the registration's endpoint, so the
+/// dispatcher counts none toward removal or back-off. It holds a wake
+/// deferred for a back-off or a full lookup pool and sends it once the
+/// reason ends, and counts a wake deferred for unresolved own addresses as
+/// transient (ADR-004 **Endpoint refusal**).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendDeferral {
     /// The endpoint's origin is backing off until this instant.
@@ -50,6 +52,10 @@ pub enum SendDeferral {
     /// send could not resolve the endpoint's host
     /// ([`EndpointError::LookupPoolFull`](super::push_endpoint::EndpointError::LookupPoolFull)).
     LookupPoolFull,
+    /// The relay's own-address set is unresolved, so no endpoint is checked
+    /// and no wake is sent
+    /// ([`EndpointError::OwnAddressesUnresolved`](super::push_endpoint::EndpointError::OwnAddressesUnresolved)).
+    OwnAddressesUnresolved,
 }
 
 /// What one call to [`PushSender::send_registered`] did.
@@ -60,6 +66,23 @@ pub enum SendAttempt {
     /// The send did not start, for this reason; nothing was sent and the
     /// outcome of the wake is still to come.
     Deferred(SendDeferral),
+}
+
+impl SendAttempt {
+    /// The attempt the dispatcher acts on: a wake the relay's unresolved
+    /// own-address set stopped is sent to no address and counts as a
+    /// transient outcome, toward no removal (ADR-004 **Endpoint refusal**).
+    /// Every other attempt is unchanged.
+    #[cfg(feature = "push-store")]
+    #[must_use]
+    pub(crate) const fn for_dispatch(self) -> Self {
+        match self {
+            Self::Deferred(SendDeferral::OwnAddressesUnresolved) => {
+                Self::Sent(PushSendOutcome::Transient)
+            }
+            other => other,
+        }
+    }
 }
 
 /// The result of one wake-signal send.
@@ -809,5 +832,25 @@ mod tests {
         );
         assert_eq!(loggable_reason(Some("")), "unrecognized");
         assert_eq!(loggable_reason(None), "none");
+    }
+
+    /// The dispatcher settles a wake the unresolved own-address set stopped
+    /// as transient, and acts on every other attempt as the sender gave it.
+    #[cfg(feature = "push-store")]
+    #[test]
+    fn unresolved_own_addresses_count_as_transient_for_dispatch() {
+        let at = tokio::time::Instant::now();
+        assert_eq!(
+            SendAttempt::Deferred(SendDeferral::OwnAddressesUnresolved).for_dispatch(),
+            SendAttempt::Sent(PushSendOutcome::Transient)
+        );
+        for kept in [
+            SendAttempt::Deferred(SendDeferral::LookupPoolFull),
+            SendAttempt::Deferred(SendDeferral::BackingOff(at)),
+            SendAttempt::Sent(PushSendOutcome::Delivered),
+            SendAttempt::Sent(PushSendOutcome::InvalidToken),
+        ] {
+            assert_eq!(kept.for_dispatch(), kept);
+        }
     }
 }

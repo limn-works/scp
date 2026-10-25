@@ -42,7 +42,6 @@ use scp_platform::EncryptedStorage;
 use scp_platform::sqlite::{SqliteKeyCustody, SqliteStorage};
 use scp_transport::native::server::RelayServer;
 use scp_transport::native::storage::BlobStorageBackend;
-use scp_transport::relay::push_gate::PushProviders;
 use scp_transport::relay::push_store::{PushRegistrationStore, PushStoreAtRest};
 use scp_transport::{shutdown, startup};
 
@@ -739,7 +738,7 @@ fn push_slot_from(
     storage_dir: &std::path::Path,
     storage_key: &[u8; 32],
 ) -> Result<PushSlot, startup::StartupError> {
-    let senders = match senders {
+    let startup::NodePushSenders { senders, webpush } = match senders {
         startup::PushSenderSelection::Disabled => {
             tracing::info!("push: none (SCP_RELAY_PUSH_PLATFORMS=none)");
             return Ok(PushSlot::Disabled);
@@ -758,12 +757,14 @@ fn push_slot_from(
     tracing::info!(
         apns = senders.apns.is_some(),
         fcm = senders.fcm.is_some(),
+        webpush = webpush.is_some(),
         store = %path.display(),
         "push: enabled with the keyed sqlite push store in the storage directory"
     );
-    Ok(PushSlot::Enabled(Box::new(PushProviders {
+    Ok(PushSlot::Enabled(Box::new(scp_node::NodePushProviders {
         store,
         senders,
+        webpush,
     })))
 }
 
@@ -1499,13 +1500,13 @@ mod tests {
         assert!(!dir.path().join(PUSH_STORE_FILE).exists());
 
         let enabled = push_slot_from(
-            startup::PushSenderSelection::Enabled(Box::new(
-                scp_transport::relay::push_gate::PushSenders {
+            startup::PushSenderSelection::Enabled(Box::new(startup::NodePushSenders {
+                senders: scp_transport::relay::push_gate::PushSenders {
                     apns: Some(apns()?),
                     fcm: None,
-                    webpush: None,
                 },
-            )),
+                webpush: None,
+            })),
             dir.path(),
             &key,
         );
@@ -1531,13 +1532,13 @@ mod tests {
 
         let missing = dir.path().join("no-such-dir");
         let refused = push_slot_from(
-            startup::PushSenderSelection::Enabled(Box::new(
-                scp_transport::relay::push_gate::PushSenders {
+            startup::PushSenderSelection::Enabled(Box::new(startup::NodePushSenders {
+                senders: scp_transport::relay::push_gate::PushSenders {
                     apns: Some(apns()?),
                     fcm: None,
-                    webpush: None,
                 },
-            )),
+                webpush: None,
+            })),
             &missing,
             &key,
         );

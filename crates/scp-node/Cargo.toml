@@ -136,6 +136,9 @@ http-body-util = "0.1"
 hyper = "1"
 rcgen = "0.14"
 tempfile = "3"
+# `FixedAnswers` and `OwnAddressLookup::fixed`, which let the node's tests make a
+# relay host resolve only after TLS provisioning, without real DNS.
+scp-transport = { path = "../scp-transport", features = ["testing"] }
 
 [features]
 # `default` holds only `node-bin`, so a shipped `scp-node` binary enables

@@ -804,6 +804,15 @@ pub const NODE_WEBPUSH_HELP: &str = "\
                                 prefixes of the network's NAT64 translator (for example
                                 2001:db8:64::/96), or none";
 
+/// The `SCP_RELAY_PUSH_PLATFORMS` values `scp-relay` and
+/// `scp-node --relay-only` accept, as their refusals name them.
+const RELAY_PUSH_PLATFORM_VALUES: &str = "none, apns, fcm, apns,fcm";
+
+/// The `SCP_RELAY_PUSH_PLATFORMS` values an `scp-node` full node accepts, as
+/// its refusals name them.
+const NODE_PUSH_PLATFORM_VALUES: &str =
+    "none, or a comma-separated list of one or more of apns, fcm, webpush";
+
 /// The largest credential file the relay reads. An APNs .p8 key is about 250
 /// bytes and a service-account JSON about 2.4 KB; a larger file is not a
 /// credential, and the bound keeps a misnamed path from being read whole.
@@ -820,20 +829,21 @@ pub enum PushStartupError {
     /// default (persistence spec §17.17.1, SCP-CAPSEL-8000).
     #[error(
         "{PUSH_PLATFORMS_VAR} is unset or empty, and it has no default (SCP-CAPSEL-8000: a relay \
-         offers push only on platforms the operator names). Set it to one of: none, apns, fcm, \
-         apns,fcm; an scp-node full node also accepts webpush in the list"
+         offers push only on platforms the operator names). Set it to {accepts}"
     )]
-    SelectionMissing,
+    SelectionMissing {
+        /// The values the reading path accepts.
+        accepts: &'static str,
+    },
     /// `SCP_RELAY_PUSH_PLATFORMS` lists a value other than `none`, `apns`,
     /// `fcm` and `webpush`, lists one twice, or combines `none` with a
     /// platform.
-    #[error(
-        "{PUSH_PLATFORMS_VAR} is invalid: {reason}. Set it to one of: none, apns, fcm, apns,fcm \
-         (SCP-CAPSEL-8000)"
-    )]
+    #[error("{PUSH_PLATFORMS_VAR} is invalid: {reason}. Set it to {accepts} (SCP-CAPSEL-8000)")]
     SelectionInvalid {
         /// What is wrong with the list.
         reason: &'static str,
+        /// The values the reading path accepts.
+        accepts: &'static str,
     },
     /// The platform list names a platform and `SCP_RELAY_PUSH_STORE` is unset
     /// or blank. The store selection has no default (SCP-CAPSEL-8000).
@@ -1079,7 +1089,7 @@ impl PushStartupError {
     #[must_use]
     pub const fn rule(&self) -> &'static str {
         match self {
-            Self::SelectionMissing | Self::SelectionInvalid { .. } | Self::StoreMissing => {
+            Self::SelectionMissing { .. } | Self::SelectionInvalid { .. } | Self::StoreMissing => {
                 "SCP-CAPSEL-8000"
             }
             Self::StoreUnsupported { .. }
@@ -1198,7 +1208,7 @@ struct NodePushPlatforms {
 /// platforms. A list that names `webpush` is refused with
 /// [`PushStartupError::WebPushNotOfferedByRelay`].
 fn parse_push_platforms(value: &str) -> Result<Option<PushPlatforms>, PushStartupError> {
-    match parse_node_push_platforms(value)? {
+    match parse_platform_list(value, RELAY_PUSH_PLATFORM_VALUES)? {
         None => Ok(None),
         Some(NodePushPlatforms { webpush: true, .. }) => {
             Err(PushStartupError::WebPushNotOfferedByRelay)
@@ -1207,12 +1217,21 @@ fn parse_push_platforms(value: &str) -> Result<Option<PushPlatforms>, PushStartu
     }
 }
 
+/// Parses a `SCP_RELAY_PUSH_PLATFORMS` value for an `scp-node` full node:
+/// `None` for `none`, otherwise the listed platforms.
+fn parse_node_push_platforms(value: &str) -> Result<Option<NodePushPlatforms>, PushStartupError> {
+    parse_platform_list(value, NODE_PUSH_PLATFORM_VALUES)
+}
+
 /// Parses a `SCP_RELAY_PUSH_PLATFORMS` value: `None` for `none`, otherwise the
 /// listed platforms. Items are comma separated, trimmed and matched ignoring
-/// case.
-fn parse_node_push_platforms(value: &str) -> Result<Option<NodePushPlatforms>, PushStartupError> {
+/// case. A refusal names `accepts`, the values its path accepts.
+fn parse_platform_list(
+    value: &str,
+    accepts: &'static str,
+) -> Result<Option<NodePushPlatforms>, PushStartupError> {
     if value.trim().is_empty() {
-        return Err(PushStartupError::SelectionMissing);
+        return Err(PushStartupError::SelectionMissing { accepts });
     }
     let mut platforms = NodePushPlatforms {
         relay: PushPlatforms {
@@ -1231,17 +1250,20 @@ fn parse_node_push_platforms(value: &str) -> Result<Option<NodePushPlatforms>, P
             "" => {
                 return Err(PushStartupError::SelectionInvalid {
                     reason: "the list has an empty item",
+                    accepts,
                 });
             }
             _ => {
                 return Err(PushStartupError::SelectionInvalid {
                     reason: "the list names an unknown platform",
+                    accepts,
                 });
             }
         };
         if *slot {
             return Err(PushStartupError::SelectionInvalid {
                 reason: "the list names a value twice",
+                accepts,
             });
         }
         *slot = true;
@@ -1252,6 +1274,7 @@ fn parse_node_push_platforms(value: &str) -> Result<Option<NodePushPlatforms>, P
     ) {
         (true, true) => Err(PushStartupError::SelectionInvalid {
             reason: "none cannot be combined with a platform",
+            accepts,
         }),
         (true, false) => Ok(None),
         (false, _) => Ok(Some(platforms)),
@@ -1264,7 +1287,12 @@ fn push_selection_from(
     lookup: &dyn Fn(&'static str) -> Option<OsString>,
 ) -> Result<PushSelection, StartupError> {
     let platforms = match lookup(PUSH_PLATFORMS_VAR) {
-        None => return Err(PushStartupError::SelectionMissing.into()),
+        None => {
+            return Err(PushStartupError::SelectionMissing {
+                accepts: RELAY_PUSH_PLATFORM_VALUES,
+            }
+            .into());
+        }
         Some(raw) => parse_push_platforms(&utf8(PUSH_PLATFORMS_VAR, raw)?)?,
     };
     let Some(platforms) = platforms else {
@@ -1288,8 +1316,22 @@ fn push_selection_from(
 pub enum PushSenderSelection {
     /// `none`: the relay offers no push.
     Disabled,
-    /// One or both platforms, with their senders.
-    Enabled(Box<PushSenders>),
+    /// One or more platforms, with their senders.
+    Enabled(Box<NodePushSenders>),
+}
+
+/// The senders a full node's platform list selects.
+///
+/// They are the APNs and FCM senders any relay may run, and the `WebPush`
+/// sender only a relay that publishes its VAPID key may run (ADR-004 **VAPID
+/// key publication**), which the caller hands to
+/// [`PushRole::start_with_webpush`](crate::relay::push_gate::PushRole::start_with_webpush).
+#[derive(Debug)]
+pub struct NodePushSenders {
+    /// The APNs and FCM senders.
+    pub senders: PushSenders,
+    /// The `WebPush` sender, or `None` when the list omits `webpush`.
+    pub webpush: Option<crate::relay::push::WebPushSender>,
 }
 
 /// Reads the push platform list and each listed platform's credentials from
@@ -1333,14 +1375,19 @@ fn push_senders_from(
         }
     }
     let platforms = match lookup(PUSH_PLATFORMS_VAR) {
-        None => return Err(PushStartupError::SelectionMissing.into()),
+        None => {
+            return Err(PushStartupError::SelectionMissing {
+                accepts: NODE_PUSH_PLATFORM_VALUES,
+            }
+            .into());
+        }
         Some(raw) => parse_node_push_platforms(&utf8(PUSH_PLATFORMS_VAR, raw)?)?,
     };
     let Some(NodePushPlatforms { relay, webpush }) = platforms else {
         return Ok(PushSenderSelection::Disabled);
     };
-    let mut senders = senders_for(relay, lookup)?;
-    if webpush {
+    let senders = senders_for(relay, lookup)?;
+    let webpush = if webpush {
         let sender = webpush_sender_from(lookup)?;
         // ADR-004 VAPID key publication: a key pair used for nothing else.
         if senders
@@ -1350,9 +1397,14 @@ fn push_senders_from(
         {
             return Err(PushStartupError::VapidKeyIsApnsKey.into());
         }
-        senders.webpush = Some(sender);
-    }
-    Ok(PushSenderSelection::Enabled(Box::new(senders)))
+        Some(sender)
+    } else {
+        None
+    };
+    Ok(PushSenderSelection::Enabled(Box::new(NodePushSenders {
+        senders,
+        webpush,
+    })))
 }
 
 /// Builds one sender for each platform in `platforms`.
@@ -1370,13 +1422,9 @@ fn senders_for(
     } else {
         None
     };
-    // The relay path's platform list has no WebPush field, so it never
-    // builds a WebPush sender; only `push_senders_from` adds one.
-    Ok(PushSenders {
-        apns,
-        fcm,
-        webpush: None,
-    })
+    // `PushSenders` has no WebPush field, so the relay path never builds a
+    // WebPush sender; only `push_senders_from` builds one, beside it.
+    Ok(PushSenders { apns, fcm })
 }
 
 /// Reads variable `var` through `lookup` as a required, non-blank value,
@@ -2242,9 +2290,10 @@ mod push_tests {
     use super::{
         APNS_ENVIRONMENT_VAR, APNS_KEY_ID_VAR, APNS_KEY_PATH_VAR, APNS_TEAM_ID_VAR, APNS_TOPIC_VAR,
         FCM_PROJECT_ID_VAR, FCM_SERVICE_ACCOUNT_PATH_VAR, MAX_CREDENTIAL_FILE_BYTES,
-        PUSH_PLATFORMS_VAR, PUSH_STORE_PATH_VAR, PUSH_STORE_VAR, PushPlatforms, PushSelection,
-        PushSenderSelection, PushStartupError, PushStoreChoice, StartupError,
-        WEBPUSH_NAT64_PREFIXES_VAR, WEBPUSH_VAPID_KEY_PATH_VAR, WEBPUSH_VAPID_SUBJECT_VAR,
+        NODE_PUSH_PLATFORM_VALUES, PUSH_PLATFORMS_VAR, PUSH_STORE_PATH_VAR, PUSH_STORE_VAR,
+        PushPlatforms, PushSelection, PushSenderSelection, PushStartupError, PushStoreChoice,
+        RELAY_PUSH_PLATFORM_VALUES, StartupError, WEBPUSH_NAT64_PREFIXES_VAR,
+        WEBPUSH_VAPID_KEY_PATH_VAR, WEBPUSH_VAPID_SUBJECT_VAR, parse_node_push_platforms,
         parse_push_platforms, push_role_from, push_selection_from, push_senders_from,
     };
     use crate::relay::log_capture::LogCapture;
@@ -2448,11 +2497,12 @@ mod push_tests {
             let Err(StartupError::Push(error)) = result else {
                 panic!("expected a refusal, got {result:?}");
             };
-            assert!(matches!(error, PushStartupError::SelectionMissing));
+            assert!(matches!(error, PushStartupError::SelectionMissing { .. }));
             assert_eq!(error.rule(), "SCP-CAPSEL-8000");
             let message = StartupError::Push(error).to_string();
             assert!(message.contains(PUSH_PLATFORMS_VAR), "{message}");
-            assert!(message.contains("none, apns, fcm, apns,fcm"), "{message}");
+            assert!(message.contains(RELAY_PUSH_PLATFORM_VALUES), "{message}");
+            assert!(!message.contains("webpush"), "{message}");
         }
     }
 
@@ -2514,7 +2564,8 @@ mod push_tests {
         let PushSenderSelection::Enabled(senders) = selection else {
             panic!("expected both senders: {selection:?}");
         };
-        assert!(senders.apns.is_some() && senders.fcm.is_some());
+        assert!(senders.senders.apns.is_some() && senders.senders.fcm.is_some());
+        assert!(senders.webpush.is_none());
         let read = read.into_inner();
         assert!(read.contains(&APNS_KEY_PATH_VAR), "{read:?}");
         assert!(read.contains(&FCM_SERVICE_ACCOUNT_PATH_VAR), "{read:?}");
@@ -2542,8 +2593,12 @@ mod push_tests {
         env.unset(PUSH_PLATFORMS_VAR);
         match push_senders_from(&|var| env.vars.get(var).cloned()) {
             Err(StartupError::Push(error)) => {
-                assert!(matches!(error, PushStartupError::SelectionMissing));
+                assert!(matches!(error, PushStartupError::SelectionMissing { .. }));
                 assert_eq!(error.rule(), "SCP-CAPSEL-8000");
+                assert!(
+                    error.to_string().contains(NODE_PUSH_PLATFORM_VALUES),
+                    "{error}"
+                );
             }
             other => panic!("expected SelectionMissing, got {other:?}"),
         }
@@ -2600,6 +2655,36 @@ mod push_tests {
             assert_eq!(error.rule(), "SCP-CAPSEL-8000");
             assert!(error.to_string().contains(PUSH_PLATFORMS_VAR));
         }
+    }
+
+    /// Each path's refusal names the values that path accepts, from one
+    /// constant per path: the relay path's never names `webpush`, which it
+    /// refuses, and the full node's names it.
+    #[test]
+    fn each_path_names_the_values_it_accepts() {
+        for value in ["", "apns;fcm", "apns,apns", "none,fcm", ",apns"] {
+            let relay = parse_push_platforms(value).unwrap_err().to_string();
+            assert!(
+                relay.contains(RELAY_PUSH_PLATFORM_VALUES),
+                "{value}: {relay}"
+            );
+            assert!(!relay.contains("webpush"), "{value}: {relay}");
+            let node = parse_node_push_platforms(value).unwrap_err().to_string();
+            assert!(node.contains(NODE_PUSH_PLATFORM_VALUES), "{value}: {node}");
+            assert!(node.contains("webpush"), "{value}: {node}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut env = Env::full(dir.path());
+        env.node_webpush().unset(PUSH_PLATFORMS_VAR);
+        let missing = env.node_error();
+        assert!(
+            matches!(missing, PushStartupError::SelectionMissing { .. }),
+            "{missing}"
+        );
+        assert!(
+            missing.to_string().contains(NODE_PUSH_PLATFORM_VALUES),
+            "{missing}"
+        );
     }
 
     /// A non-UTF-8 platform list is an invalid value naming the variable.
@@ -3100,7 +3185,7 @@ mod push_tests {
         let Ok(PushSenderSelection::Enabled(senders)) = env.node() else {
             panic!("expected webpush alone to load: {:?}", env.node());
         };
-        assert!(senders.apns.is_none() && senders.fcm.is_none());
+        assert!(senders.senders.apns.is_none() && senders.senders.fcm.is_none());
         assert!(senders.webpush.is_some());
     }
 

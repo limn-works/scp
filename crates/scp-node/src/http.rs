@@ -132,6 +132,14 @@ pub struct NodeState {
     /// second, unrelated port. A serve on any other address and
     /// [`ApplicationNode::shutdown`](crate::ApplicationNode::shutdown) close it.
     pub(crate) prebound_public: std::sync::Mutex<Option<tokio::net::TcpListener>>,
+    /// The task that keeps the `WebPush` sender's own-address set current as
+    /// the relay URLs change and on the refresh timer (ADR-004 **Endpoint
+    /// refusal**). `Some` exactly when the relay runs a `WebPush` sender,
+    /// which only a domain node does. Each public listener the node binds
+    /// later adds its address through [`Self::note_listener_bound`].
+    /// [`ApplicationNode::shutdown`](crate::ApplicationNode::shutdown) stops
+    /// it, and so does dropping the state.
+    pub(crate) own_addresses: Option<scp_transport::relay::push_endpoint::OwnAddressTracker>,
     /// Shared cancellation token for graceful shutdown of both the public
     /// HTTPS listener and the dev API listener. Cancelled by
     /// [`ApplicationNode::shutdown`].
@@ -322,6 +330,27 @@ impl NodeState {
     /// [`NodeError::Serve`] when the bind fails or the bound address cannot be
     /// read.
     pub(crate) async fn take_or_bind_public(
+        &self,
+        requested: SocketAddr,
+    ) -> Result<(tokio::net::TcpListener, SocketAddr), NodeError> {
+        let bound = self.take_or_bind_unnoted(requested).await?;
+        self.note_listener_bound(bound.1);
+        Ok(bound)
+    }
+
+    /// Adds the bound address of a public listener to the `WebPush` sender's
+    /// own addresses (ADR-004 **Endpoint refusal**), so an endpoint at a
+    /// listener bound after the start is refused too. A wildcard bind adds
+    /// nothing, and a node whose relay runs no `WebPush` sender tracks
+    /// nothing.
+    pub(crate) fn note_listener_bound(&self, bound: SocketAddr) {
+        if let Some(tracker) = &self.own_addresses {
+            tracker.add_bind(bound);
+        }
+    }
+
+    /// [`Self::take_or_bind_public`] before the bound address is noted.
+    async fn take_or_bind_unnoted(
         &self,
         requested: SocketAddr,
     ) -> Result<(tokio::net::TcpListener, SocketAddr), NodeError> {
@@ -1458,6 +1487,7 @@ mod tests {
             start_time: Instant::now(),
             http_bind_addr: Some(SocketAddr::from(([0, 0, 0, 0], 8443))),
             prebound_public: std::sync::Mutex::new(None),
+            own_addresses: None,
             shutdown_token: CancellationToken::new(),
             cors_origins,
             projection_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter::new(
@@ -1640,18 +1670,20 @@ mod tests {
         })
         .unwrap();
         let k = sender.vapid_k().to_owned();
-        let role = PushRole::start(PushProviders {
-            store: PushRegistrationStore::open_sqlite(
-                &dir.join("push.sqlite"),
-                PushStoreAtRest::Unkeyed,
-            )
-            .unwrap(),
-            senders: PushSenders {
-                apns: None,
-                fcm: None,
-                webpush: Some(sender),
+        let role = PushRole::start_with_webpush(
+            PushProviders {
+                store: PushRegistrationStore::open_sqlite(
+                    &dir.join("push.sqlite"),
+                    PushStoreAtRest::Unkeyed,
+                )
+                .unwrap(),
+                senders: PushSenders {
+                    apns: None,
+                    fcm: None,
+                },
             },
-        })
+            sender,
+        )
         .unwrap();
         (role, k)
     }
@@ -1815,6 +1847,7 @@ mod vhost_tests {
             start_time: Instant::now(),
             http_bind_addr: Some(SocketAddr::from(([0, 0, 0, 0], 8443))),
             prebound_public: std::sync::Mutex::new(None),
+            own_addresses: None,
             shutdown_token: tokio_util::sync::CancellationToken::new(),
             cors_origins: None,
             projection_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter::new(
@@ -2163,11 +2196,13 @@ fn spawn_http3_listener(http3_config: scp_transport::http3::Http3Config, state: 
     // same per-IP connection limits as the WebSocket and QUIC relay listeners
     // (spec §10.14.3 item 2: uniform cross-transport tracking).
     let connection_tracker = state.connection_tracker.clone();
+    let noted = Arc::clone(state);
 
     tokio::spawn(async move {
         let mut server = Http3Server::new(http3_config, handler);
         match server.bind() {
             Ok(addr) => {
+                noted.note_listener_bound(addr);
                 tracing::info!(addr = %addr, "HTTP/3 server started");
                 if let Err(e) = server.serve(connection_tracker).await {
                     tracing::error!(error = %e, "HTTP/3 server exited with error");

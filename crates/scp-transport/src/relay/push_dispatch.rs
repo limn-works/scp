@@ -915,7 +915,12 @@ mod enabled {
         ) {
             match deferral {
                 SendDeferral::LookupPoolFull => self.lookup.push_back(held),
-                SendDeferral::BackingOff(_) => self.arrive(held, in_flight, retry_at, ready),
+                // `send_held` settles an unresolved own-address set as a
+                // transient outcome, so it never reaches here; were it to,
+                // the job arrives anew, and its next send settles it.
+                SendDeferral::BackingOff(_) | SendDeferral::OwnAddressesUnresolved => {
+                    self.arrive(held, in_flight, retry_at, ready);
+                }
             }
         }
 
@@ -1125,7 +1130,7 @@ mod enabled {
 
     /// Sends `held`'s job through `sender`.
     async fn send_held(sender: &PushSender, held: Held) -> (Held, SendAttempt) {
-        let attempt = sender.send_registered(&held.job.token).await;
+        let attempt = sender.send_registered(&held.job.token).await.for_dispatch();
         (held, attempt)
     }
 
@@ -1179,7 +1184,7 @@ mod enabled {
                     let attempt = tokio::select! {
                         biased;
                         () = self.stop.cancelled() => return,
-                        attempt = sender.send_registered(&job.token) => attempt,
+                        attempt = sender.send_registered(&job.token) => attempt.for_dispatch(),
                     };
                     match attempt {
                         SendAttempt::Sent(outcome) => break outcome,
@@ -1196,6 +1201,10 @@ mod enabled {
                                 () = self.stop.cancelled() => return,
                                 _ = sender.lookup_permit_freed() => {}
                             }
+                        }
+                        // `for_dispatch` settled it as a transient outcome.
+                        SendAttempt::Deferred(SendDeferral::OwnAddressesUnresolved) => {
+                            break PushSendOutcome::Transient;
                         }
                     }
                 };

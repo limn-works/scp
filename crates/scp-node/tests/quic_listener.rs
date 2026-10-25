@@ -123,7 +123,7 @@ async fn quic_publish_then_query_roundtrips() {
 /// sender. Building the sender makes no request.
 fn enabled_push(dir: &std::path::Path) -> scp_node::PushSlot {
     use scp_transport::relay::push::{ApnsConfig, ApnsEnvironment, ApnsSender};
-    use scp_transport::relay::push_gate::{PushProviders, PushSenders};
+    use scp_transport::relay::push_gate::PushSenders;
     use scp_transport::relay::push_store::{PushRegistrationStore, PushStoreAtRest};
 
     let apns = ApnsSender::new(ApnsConfig {
@@ -134,7 +134,7 @@ fn enabled_push(dir: &std::path::Path) -> scp_node::PushSlot {
         environment: ApnsEnvironment::Sandbox,
     })
     .unwrap();
-    scp_node::PushSlot::Enabled(Box::new(PushProviders {
+    scp_node::PushSlot::Enabled(Box::new(scp_node::NodePushProviders {
         store: PushRegistrationStore::open_sqlite(
             &dir.join("push.sqlite"),
             PushStoreAtRest::Unkeyed,
@@ -143,8 +143,8 @@ fn enabled_push(dir: &std::path::Path) -> scp_node::PushSlot {
         senders: PushSenders {
             apns: Some(apns),
             fcm: None,
-            webpush: None,
         },
+        webpush: None,
     }))
 }
 

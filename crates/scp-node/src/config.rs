@@ -31,7 +31,12 @@ use scp_platform::traits::{KeyCustody, Storage};
 use scp_transport::nat::NetworkChangeDetector;
 use scp_transport::native::server::{RelayConfig, RelayError, RelayServer};
 use scp_transport::native::storage::BlobStorageBackend;
-use scp_transport::relay::push_gate::{LiveRelayUrl, PushProviders, PushRole, RelayUrl};
+use scp_transport::relay::push::WebPushSender;
+use scp_transport::relay::push_endpoint::{OwnAddressLookup, OwnAddressTracker};
+use scp_transport::relay::push_gate::{
+    LiveRelayUrl, PushProviders, PushRole, PushSenders, RelayUrl,
+};
+use scp_transport::relay::push_store::PushRegistrationStore;
 
 use crate::{
     ApplicationNode, DEFAULT_PROJECTION_RATE_LIMIT, NatStrategy, NoOpCustody, NoOpDidMethod,
@@ -298,23 +303,102 @@ pub enum PushSlot {
     /// routing ID with `4063` `PUSH_NOT_SUPPORTED`. The fail-safe default.
     Disabled,
     /// The relay verifies and stores push registrations in
-    /// [`PushProviders::store`] and wakes devices through its senders.
+    /// [`NodePushProviders::store`] and wakes devices through its senders.
     /// [`Node::start`] fails with [`NodeError::InvalidConfig`] when the
-    /// providers hold no sender.
-    Enabled(Box<PushProviders>),
+    /// providers hold no sender, and with
+    /// [`NodeError::WebPushWithoutWellKnown`] when they hold a `WebPush`
+    /// sender and the reach is not [`Reach::Domain`].
+    Enabled(Box<NodePushProviders>),
 }
 
-/// Starts the relay push role `slot` selects.
+/// What a caller provides to enable push on a node's relay: the registration
+/// store it opened and the senders it built (PUSH-012, PUSH-023).
+///
+/// The `WebPush` sender is a field of its own, not of [`PushSenders`]: only
+/// the domain build, which publishes the sender's VAPID key in its
+/// `.well-known/scp` document, starts it, through
+/// [`PushRole::start_with_webpush`] (ADR-004 **VAPID key publication**).
+#[derive(Debug)]
+pub struct NodePushProviders {
+    /// The registration store (PUSH-006).
+    pub store: PushRegistrationStore,
+    /// The APNs and FCM senders.
+    pub senders: PushSenders,
+    /// The `WebPush` sender, or `None` when the relay wakes no browser.
+    pub webpush: Option<WebPushSender>,
+}
+
+/// The push role a build path runs: one [`split_config`] already started, or
+/// a `WebPush` role that only the domain build starts.
+#[derive(Debug)]
+enum PendingPush {
+    /// A started role, which runs no `WebPush` sender.
+    Started(PushRole),
+    /// Providers with a `WebPush` sender, for [`PushRole::start_with_webpush`].
+    WebPush(Box<WebPushStart>),
+}
+
+/// The arguments of [`PushRole::start_with_webpush`] the domain build passes.
+#[derive(Debug)]
+struct WebPushStart {
+    providers: PushProviders,
+    webpush: WebPushSender,
+}
+
+/// Starts the relay push role `slot` selects, or holds a `WebPush` role for
+/// the domain build.
 ///
 /// # Errors
 ///
-/// [`NodeError::InvalidConfig`] when [`PushRole::start`] refuses the providers:
-/// an enabled slot with no sender, or a call outside a tokio runtime.
-fn start_push_slot(slot: PushSlot) -> Result<PushRole, NodeError> {
-    match slot {
-        PushSlot::Disabled => Ok(PushRole::Disabled),
-        PushSlot::Enabled(providers) => {
-            PushRole::start(*providers).map_err(|e| NodeError::InvalidConfig(format!("push: {e}")))
+/// - [`NodeError::WebPushWithoutWellKnown`] when `slot` holds a `WebPush`
+///   sender and `reach` is not [`Reach::Domain`], before the role starts or
+///   any listener binds: such a node serves no `.well-known/scp` (spec 10
+///   §10.12).
+/// - [`NodeError::InvalidConfig`] when [`PushRole::start`] refuses the
+///   providers: an enabled slot with no sender, or a call outside a tokio
+///   runtime.
+fn start_push_slot(slot: PushSlot, reach: &Reach) -> Result<PendingPush, NodeError> {
+    let providers = match slot {
+        PushSlot::Disabled => return Ok(PendingPush::Started(PushRole::Disabled)),
+        PushSlot::Enabled(providers) => *providers,
+    };
+    let NodePushProviders {
+        store,
+        senders,
+        webpush,
+    } = providers;
+    let providers = PushProviders { store, senders };
+    match webpush {
+        Some(webpush) if matches!(reach, Reach::Domain { .. }) => {
+            Ok(PendingPush::WebPush(Box::new(WebPushStart {
+                providers,
+                webpush,
+            })))
+        }
+        Some(_) => Err(NodeError::WebPushWithoutWellKnown),
+        None => PushRole::start(providers)
+            .map(PendingPush::Started)
+            .map_err(|e| push_role_refused(&e)),
+    }
+}
+
+/// The start error for a push role [`PushRole`] refused.
+fn push_role_refused(error: &scp_transport::relay::push_gate::PushRoleError) -> NodeError {
+    NodeError::InvalidConfig(format!("push: {error}"))
+}
+
+/// Starts the role `pending` holds on the domain build, which publishes the
+/// `WebPush` sender's key.
+///
+/// # Errors
+///
+/// [`NodeError::InvalidConfig`] when the role does not start.
+fn start_pending_on_domain(pending: PendingPush) -> Result<PushRole, NodeError> {
+    match pending {
+        PendingPush::Started(role) => Ok(role),
+        PendingPush::WebPush(start) => {
+            let WebPushStart { providers, webpush } = *start;
+            PushRole::start_with_webpush(providers, webpush).map_err(|e| push_role_refused(&e))
         }
     }
 }
@@ -335,18 +419,26 @@ fn refuse_webpush_without_well_known(push: &PushRole) -> Result<(), NodeError> {
     Ok(())
 }
 
-/// Starts tracking the `WebPush` sender's own addresses when `push` runs one:
-/// the hosts of every URL in `relay_url` and each non-wildcard bind in `binds`
+/// Resolves the `WebPush` sender's own addresses for the start, when `push`
+/// runs one, and returns the tracker that keeps them current: the hosts of
+/// every URL `relay_url` reserves and each non-wildcard bind in `binds`
 /// (ADR-004 **Endpoint refusal**).
+///
+/// The domain build calls it once, after TLS provisioning and after the
+/// startup publish reserved every relay URL the node publishes, and before
+/// the node reports started: a DNS provider may create the node's record
+/// during provisioning, and a tier 3 bridge host is reserved only by the
+/// publish.
 ///
 /// # Errors
 ///
-/// [`NodeError::OwnAddresses`] when a relay host does not resolve now.
-async fn track_webpush_own_addresses(
+/// [`NodeError::OwnAddresses`] when a reserved host does not resolve now.
+pub(crate) async fn resolve_own_addresses_for_start(
     push: &PushRole,
     relay_url: &LiveRelayUrl,
     binds: &[SocketAddr],
-) -> Result<Option<scp_transport::relay::push_endpoint::OwnAddressTracker>, NodeError> {
+    lookup: &OwnAddressLookup,
+) -> Result<Option<OwnAddressTracker>, NodeError> {
     let Some(sender) = push.webpush_sender() else {
         return Ok(None);
     };
@@ -354,6 +446,7 @@ async fn track_webpush_own_addresses(
         &sender.own_addresses(),
         relay_url,
         binds,
+        lookup,
     )
     .await?;
     Ok(Some(tracker))
@@ -621,8 +714,10 @@ struct ConfigTail {
     /// The caller's explicit blob backend selection, threaded verbatim to the
     /// relay build (never defaulted/fallen-back — SCP-CAPINJECT-010).
     blob_storage: BlobStorageBackend,
-    /// The started push role, set on the relay at both build paths.
-    push: PushRole,
+    /// The push role, set on the relay at both build paths.
+    push: PendingPush,
+    /// How the domain build resolves the relay's own hosts.
+    own_lookup: OwnAddressLookup,
 }
 
 /// Validates the config, returning a loud error for contradictory combinations
@@ -716,12 +811,14 @@ pub fn validate_reach_and_tls(reach: &Reach, tls: &TlsMode) -> Result<(), NodeEr
 /// `validate_reach_and_tls` borrows `config.reach` / `config.tls` and so MUST run
 /// **before** this function moves `config` — callers keep that ordering.
 ///
-/// It also starts the push role, so an enabled push slot with no sender fails
-/// the start before identity resolution or any socket opens.
+/// It also starts the push role, so an enabled push slot with no sender, or a
+/// `WebPush` sender on a reach that serves no `.well-known/scp`, fails the
+/// start before identity resolution or any socket opens.
 ///
 /// # Errors
 ///
-/// [`NodeError::InvalidConfig`] from [`start_push_slot`].
+/// [`NodeError::InvalidConfig`] and [`NodeError::WebPushWithoutWellKnown`]
+/// from [`start_push_slot`].
 fn split_config<K: KeyCustody, D: DidMethod, S: Storage>(
     config: NodeConfig<K, D, S>,
 ) -> Result<(S, IdentitySource<K, D>, ConfigTail), NodeError> {
@@ -749,7 +846,7 @@ fn split_config<K: KeyCustody, D: DidMethod, S: Storage>(
         blob_storage,
         push,
     } = config;
-    let push = start_push_slot(push)?;
+    let push = start_push_slot(push, &reach)?;
 
     let tail = ConfigTail {
         reach,
@@ -767,6 +864,7 @@ fn split_config<K: KeyCustody, D: DidMethod, S: Storage>(
         network_detector,
         blob_storage,
         push,
+        own_lookup: OwnAddressLookup::system(),
     };
 
     Ok((storage, identity, tail))
@@ -925,6 +1023,7 @@ where
         network_detector,
         blob_storage,
         push,
+        own_lookup,
     } = tail;
 
     // The Reach selects the build path. `Domain` reproduces the former
@@ -952,6 +1051,7 @@ where
                 network_detector,
                 blob_storage,
                 push,
+                own_lookup,
             )
             .await
         }
@@ -1019,7 +1119,8 @@ async fn build_node_domain<D, S>(
     nat: NatSlot,
     network_detector: Option<Arc<dyn NetworkChangeDetector>>,
     blob_storage: BlobStorageBackend,
-    push: PushRole,
+    push: PendingPush,
+    own_lookup: OwnAddressLookup,
 ) -> Result<ApplicationNode<S>, NodeError>
 where
     D: DidMethod + 'static,
@@ -1061,6 +1162,9 @@ where
         tls_mode_override
     };
 
+    // The domain build is the one path that publishes a VAPID key, so it is
+    // the one that starts a WebPush sender.
+    let push = start_pending_on_domain(push)?;
     let bridge_secret = generate_bridge_secret();
     let bind_addr = bind_addr.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 0)));
     // The relay knows the URL the node publishes, so it reserves the matching
@@ -1073,12 +1177,6 @@ where
         push,
         ..RelayConfig::defaults(LiveRelayUrl::new(relay_url))
     };
-    // The WebPush sender's own addresses resolve before the relay listens, so
-    // a relay host that does not resolve fails the start with no listener
-    // open. Until then the set is unresolved and refuses every endpoint.
-    let binds: Vec<SocketAddr> = std::iter::once(bind_addr).chain(http_bind_addr).collect();
-    let own_addresses =
-        track_webpush_own_addresses(&relay_config.push, &relay_config.relay_url, &binds).await?;
 
     // The caller's explicit blob-backend selection, threaded verbatim — never
     // defaulted or fallen-back (SCP-CAPINJECT-010 / SCP-CAPSEL-8002).
@@ -1145,7 +1243,7 @@ where
                 acme_challenges,
                 #[cfg(feature = "http3")]
                 http3,
-                own_addresses,
+                own_lookup,
             )
             .await
         }
@@ -1215,7 +1313,7 @@ async fn build_node_no_domain<D, S>(
     nat: NatSlot,
     network_detector: Option<Arc<dyn NetworkChangeDetector>>,
     blob_storage: BlobStorageBackend,
-    push: PushRole,
+    push: PendingPush,
     skip_nat_probe: bool,
 ) -> Result<ApplicationNode<S>, NodeError>
 where
@@ -1223,8 +1321,12 @@ where
     S: Storage + 'static,
 {
     // A no-domain node serves no `.well-known/scp`, so it cannot publish a
-    // VAPID key; refuse before any listener binds.
-    refuse_webpush_without_well_known(&push)?;
+    // VAPID key. `split_config` refused a WebPush sender on this reach
+    // already; a pending WebPush role still fails closed, before any
+    // listener binds.
+    let PendingPush::Started(push) = push else {
+        return Err(NodeError::WebPushWithoutWellKnown);
+    };
     // 3. Start relay server.
     let bind_addr = bind_addr.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 0)));
     let bridge_secret = generate_bridge_secret();
@@ -1389,35 +1491,7 @@ impl Node {
         // from `start_for_testing`). Identity is resolved against the storage,
         // then the one shared engine orchestrates the build.
         let protocol_repository = Arc::new(ProtocolRepository::new(storage));
-        // `Persisted` is the load-or-create-and-persist source. It normalizes to
-        // a `Generate` source with `persist = true` (exactly as the legacy
-        // builder's `identity_with_storage` did): `resolve_identity_persistent`
-        // checks storage first and only generates+persists on a cache miss.
-        // `Generate` / `Explicit` resolve with `persist = false`.
-        let (resolved_source, persist) = match identity {
-            IdentitySource::Persisted {
-                custody,
-                did_method,
-            } => (
-                IdentitySource::Generate {
-                    custody,
-                    did_method,
-                },
-                true,
-            ),
-            other => (other, false),
-        };
-        let (scp_identity, document, did_method) =
-            resolve_identity_persistent(resolved_source, persist, protocol_repository.storage())
-                .await?;
-        build_node(
-            protocol_repository,
-            scp_identity,
-            document,
-            did_method,
-            tail,
-        )
-        .await
+        start_on_repository(protocol_repository, identity, tail).await
     }
 
     /// Constructs and starts an [`ApplicationNode`] from a [`NodeConfig`]
@@ -1474,36 +1548,72 @@ impl Node {
         // Testing constructor: `ProtocolRepository::new_for_testing` (the only
         // difference from `start`). The build then flows through the same engine.
         let protocol_repository = Arc::new(ProtocolRepository::new_for_testing(storage));
-        // `Persisted` is the load-or-create-and-persist source. It normalizes to
-        // a `Generate` source with `persist = true` (exactly as the legacy
-        // builder's `identity_with_storage` did): `resolve_identity_persistent`
-        // checks storage first and only generates+persists on a cache miss.
-        // `Generate` / `Explicit` resolve with `persist = false`.
-        let (resolved_source, persist) = match identity {
-            IdentitySource::Persisted {
+        start_on_repository(protocol_repository, identity, tail).await
+    }
+
+    /// [`Node::start_for_testing`] with `lookup` resolving the relay's own
+    /// hosts in place of the operating system's resolver, so a test can make
+    /// a host resolve only once TLS provisioning ran.
+    #[cfg(test)]
+    pub(crate) async fn start_for_testing_with_own_lookup<K, D, S>(
+        config: NodeConfig<K, D, S>,
+        lookup: OwnAddressLookup,
+    ) -> Result<ApplicationNode<S>, NodeError>
+    where
+        K: KeyCustody + 'static,
+        D: DidMethod + 'static,
+        S: Storage + 'static,
+    {
+        validate_reach_and_tls(&config.reach, &config.tls)?;
+        let (storage, identity, mut tail) = split_config(config)?;
+        tail.own_lookup = lookup;
+        let protocol_repository = Arc::new(ProtocolRepository::new_for_testing(storage));
+        start_on_repository(protocol_repository, identity, tail).await
+    }
+}
+
+/// Resolves the identity against `protocol_repository`'s storage and builds
+/// the node: the part both start constructors share after each builds its
+/// repository.
+async fn start_on_repository<K, D, S>(
+    protocol_repository: Arc<ProtocolRepository<S>>,
+    identity: IdentitySource<K, D>,
+    tail: ConfigTail,
+) -> Result<ApplicationNode<S>, NodeError>
+where
+    K: KeyCustody + 'static,
+    D: DidMethod + 'static,
+    S: Storage + 'static,
+{
+    // `Persisted` is the load-or-create-and-persist source. It normalizes to
+    // a `Generate` source with `persist = true` (exactly as the legacy
+    // builder's `identity_with_storage` did): `resolve_identity_persistent`
+    // checks storage first and only generates+persists on a cache miss.
+    // `Generate` / `Explicit` resolve with `persist = false`.
+    let (resolved_source, persist) = match identity {
+        IdentitySource::Persisted {
+            custody,
+            did_method,
+        } => (
+            IdentitySource::Generate {
                 custody,
                 did_method,
-            } => (
-                IdentitySource::Generate {
-                    custody,
-                    did_method,
-                },
-                true,
-            ),
-            other => (other, false),
-        };
-        let (scp_identity, document, did_method) =
-            resolve_identity_persistent(resolved_source, persist, protocol_repository.storage())
-                .await?;
-        build_node(
-            protocol_repository,
-            scp_identity,
-            document,
-            did_method,
-            tail,
-        )
-        .await
-    }
+            },
+            true,
+        ),
+        other => (other, false),
+    };
+    let (scp_identity, document, did_method) =
+        resolve_identity_persistent(resolved_source, persist, protocol_repository.storage())
+            .await?;
+    build_node(
+        protocol_repository,
+        scp_identity,
+        document,
+        did_method,
+        tail,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -1912,13 +2022,10 @@ mod tests {
             scp_transport::relay::push_store::PushStoreAtRest::Unkeyed,
         )
         .unwrap();
-        PushSlot::Enabled(Box::new(PushProviders {
+        PushSlot::Enabled(Box::new(NodePushProviders {
             store,
-            senders: scp_transport::relay::push_gate::PushSenders {
-                apns,
-                fcm: None,
-                webpush: None,
-            },
+            senders: scp_transport::relay::push_gate::PushSenders { apns, fcm: None },
+            webpush: None,
         }))
     }
 
