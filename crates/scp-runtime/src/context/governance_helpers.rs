@@ -8328,6 +8328,37 @@ mod commit_broadcast_retry_tests {
             .await
         }
 
+        /// Spec section 17.3 ("Event log write failures"): the proposer
+        /// eligibility gate reads the event log before the proposal is
+        /// recorded, so a log that cannot be read fails the gate with the read
+        /// error. The same proposer passes the gate while the log is loaded;
+        /// the log is then released and not loaded again.
+        #[tokio::test]
+        async fn proposer_eligibility_fails_closed_over_an_unreadable_log() {
+            use crate::context::builder::ContextEventLogProvider as _;
+
+            let clock = scp_clock::TestClock::new(1_700_000_000);
+            let mut cell = majority_cell(&clock);
+            let log = crate::context::providers::MerkleEventLogProvider::new();
+            let ctx_bytes = crate::context::state::context_id_to_bytes(&ctx_hex());
+            log.init_event_log(&ctx_bytes).await.expect("init log");
+            let now = 1_700_000_100;
+
+            super::super::actor_check_proposer_eligibility(&mut cell, &did(B), now, &log)
+                .expect("a loaded log admits B");
+
+            log.release_event_log(&ctx_bytes);
+            let err = super::super::actor_check_proposer_eligibility(&mut cell, &did(B), now, &log)
+                .expect_err("an unreadable log fails the gate");
+            assert!(
+                matches!(
+                    err,
+                    scp_protocol::context::ContextError::ContextNotRegistered(_)
+                ),
+                "the gate fails with the read error; got {err:?}"
+            );
+        }
+
         /// A vote signature is Ed25519 (spec 07), so a P-256 custody fails the
         /// vote with the key-type error and custody is never asked to sign.
         #[tokio::test]

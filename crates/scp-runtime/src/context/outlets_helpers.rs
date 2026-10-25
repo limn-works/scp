@@ -4218,6 +4218,60 @@ mod tests {
             );
         }
 
+        /// Spec section 17.3 ("Event log write failures"): a reserve whose
+        /// event log cannot be read fails with the read error before the
+        /// outlet runs, and hands back the velocity tick and the hard-rate
+        /// token it took. The log here is initialized, then released and not
+        /// loaded again.
+        #[tokio::test]
+        async fn reserve_over_an_unreadable_log_returns_velocity_and_rate_tokens() {
+            let deps = build_deps(Box::new(OkPersistence)).await;
+            let ctx_bytes = crate::context::state::context_id_to_bytes(&ctx_key());
+            deps.event_log
+                .init_event_log(&ctx_bytes)
+                .await
+                .expect("init log");
+            deps.event_log.release_event_log(&ctx_bytes);
+            let mut cell = ClassSCell::new(active_state());
+            let invoker = DID(INVOKER.to_owned());
+            let now = 1_700_000_100;
+
+            // Leave exactly one hard-rate token: drain the bucket, then
+            // return one.
+            let mut drained = 0_u32;
+            while super::super::try_consume_hard_rate_limit(cell.class_c_view(), &invoker, now) {
+                drained += 1;
+                assert!(drained < 10_000, "the hard-rate bucket never empties");
+            }
+            super::super::refund_hard_rate_limit(cell.class_c_view(), &invoker);
+            assert_eq!(
+                cell.governance.velocity_tracker.get_velocity(&invoker, now),
+                0
+            );
+
+            let err = reserve_step(&mut cell, &deps, None, None, &serde_json::json!({}), now)
+                .await
+                .expect_err("an unreadable log fails the reserve");
+            assert!(
+                matches!(err, ContextError::ContextNotRegistered(_)),
+                "the reserve fails with the read error; got {err:?}"
+            );
+
+            assert_eq!(
+                cell.governance.velocity_tracker.get_velocity(&invoker, now),
+                0,
+                "the velocity tick is rolled back"
+            );
+            assert!(
+                super::super::try_consume_hard_rate_limit(cell.class_c_view(), &invoker, now),
+                "the hard-rate token is refunded"
+            );
+            assert!(
+                !super::super::try_consume_hard_rate_limit(cell.class_c_view(), &invoker, now),
+                "exactly the one token the reserve took comes back"
+            );
+        }
+
         /// TOKEN-SOURCE at the reserve seam: the reserve enforces the
         /// `effective_caveats` param and consults NO other token's `nb`. With
         /// caveats present the cap is enforced; with `effective_caveats == None`
