@@ -7,7 +7,7 @@
 //! - **DHT layer**: 2-hour republish cycle (Mainline DHT records expire).
 //! - **Relay layer**: 6-day republish cycle (the relay blob TTL is the
 //!   protocol constant `MAX_BLOB_TTL`, 7 days, `09-security-model.md`
-//!   §9.18.11; 1-day safety margin per §3.10.2).
+//!   §9.18.11; the 1-day safety margin is the derivation §9.18.B states).
 //!
 //! # Lifecycle
 //!
@@ -47,7 +47,7 @@ pub const REPUBLISH_INTERVAL_SECS: u64 = 2 * 60 * 60;
 ///
 /// Derived from [`RELAY_BLOB_TTL_SECS`] by [`derive_republish_interval`], so
 /// republishing leaves a 1-day safety margin before the 7-day TTL expires
-/// (§3.10.2, `09-security-model.md` §9.18.11).
+/// (`09-security-model.md` §9.18.B, "Relay republish interval").
 pub const RELAY_REPUBLISH_INTERVAL_SECS: u64 = derive_republish_interval(RELAY_BLOB_TTL_SECS);
 
 /// The `blob_ttl` every relay PUBLISH of a DID record requests: the protocol
@@ -63,7 +63,7 @@ pub const RELAY_BLOB_TTL_SECS: u64 = scp_relay_client::MAX_BLOB_TTL as u64;
 /// Derives the relay republish interval from a given TTL.
 ///
 /// Formula: `max(ttl.saturating_sub(86400), ttl / 2, 60)`
-/// (`09-security-model.md` §9.18.11, "Relay republish interval").
+/// (`09-security-model.md` §9.18.B, "Relay republish interval").
 /// - At 7-day TTL: 518400s (current default).
 /// - At 1-hour TTL: 1800s (half the TTL).
 /// - At TTL <= 1: 60s (floor prevents spin loop).
@@ -553,7 +553,9 @@ pub type RelayWarningCallback = Arc<dyn Fn(RelayPublishDegraded) + Send + Sync>;
 /// Each registered identity gets background tokio tasks that republish its DID
 /// document on the configured layers:
 /// - **DHT**: every 2 hours (existing cycle, unchanged).
-/// - **Relay**: every 6 days (blob TTL is 7 days, 1-day margin per §3.10.2).
+/// - **Relay**: every [`RELAY_REPUBLISH_INTERVAL_SECS`] (6 days): the blob TTL
+///   is `MAX_BLOB_TTL` (7 days, `09-security-model.md` §9.18.11) and the
+///   1-day margin is the derivation §9.18.B states.
 ///
 /// Both layers are enabled by default per the anti-segmentation invariant
 /// (§3.10.6). Use [`RepublishConfig`] to disable either layer (with warnings).
@@ -912,12 +914,14 @@ async fn dht_republish_loop<D: DhtClient>(
 ///
 /// Publishes immediately using the PUBLISH operation with:
 /// - `routing_id` = `did_routing_id(did_string)` (§3.10.2)
-/// - `blob_ttl` = config-derived TTL (default 604800 = 7 days, §3.10.2)
+/// - `blob_ttl` = [`RELAY_BLOB_TTL_SECS`], the protocol constant `MAX_BLOB_TTL`
+///   (604,800 s, `09-security-model.md` §9.18.11)
 /// - `blob` = the DID-record frame (§9.10.12) carrying the BEP44
 ///   `(public_key, seq, signature, value=document_bytes)` — NOT the bare
 ///   document bytes (which would drop the signature and sequence)
 ///
-/// Then waits for the derived republish interval before the next publish.
+/// Then waits [`RELAY_REPUBLISH_INTERVAL_SECS`] (§9.18.B) before the next
+/// publish.
 /// On failure, retries with exponential backoff.
 ///
 /// The frame is built ONCE, up front, via [`RepublishEntry::to_did_record`]
@@ -1526,12 +1530,59 @@ mod tests {
     #[test]
     fn relay_republish_interval_is_strictly_below_max_blob_ttl() {
         // A republish at or after the TTL lets the record expire on every
-        // relay before the next copy lands (§3.10.2, §9.18.11).
+        // relay before the next copy lands (`09-security-model.md` §9.18.B,
+        // §9.18.11).
         let max_blob_ttl = u64::from(scp_relay_client::MAX_BLOB_TTL);
         assert!(
             RELAY_REPUBLISH_INTERVAL_SECS < max_blob_ttl,
             "republish interval {RELAY_REPUBLISH_INTERVAL_SECS} s must be below MAX_BLOB_TTL {max_blob_ttl} s"
         );
+    }
+
+    /// The relay loop sleeps [`RELAY_REPUBLISH_INTERVAL_SECS`] between
+    /// publishes: no second PUBLISH one second before the interval, and one
+    /// second after it (`09-security-model.md` §9.18.B).
+    #[tokio::test(start_paused = true)]
+    async fn relay_loop_republishes_after_the_derived_interval() {
+        let dht = Arc::new(InMemoryDhtClient::new());
+        let relay = Arc::new(InMemoryRelayPublisher::new());
+        let manager = RepublishManager::with_relay_publisher(
+            Arc::clone(&dht),
+            Arc::clone(&relay),
+            RepublishConfig::new(),
+        );
+
+        manager.start_republishing(make_entry([4u8; 32])).await;
+        settle().await;
+        assert_eq!(relay.recorded_publishes().await.len(), 1, "first publish");
+
+        tokio::time::advance(tokio::time::Duration::from_secs(
+            RELAY_REPUBLISH_INTERVAL_SECS - 1,
+        ))
+        .await;
+        settle().await;
+        assert_eq!(
+            relay.recorded_publishes().await.len(),
+            1,
+            "no republish before RELAY_REPUBLISH_INTERVAL_SECS elapses"
+        );
+
+        tokio::time::advance(tokio::time::Duration::from_secs(2)).await;
+        settle().await;
+        assert_eq!(
+            relay.recorded_publishes().await.len(),
+            2,
+            "a second PUBLISH once RELAY_REPUBLISH_INTERVAL_SECS elapses"
+        );
+
+        manager.stop_all().await;
+    }
+
+    /// Lets every spawned republish task run to its next await point.
+    async fn settle() {
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
     }
 
     #[test]
@@ -1588,7 +1639,7 @@ mod tests {
                 let mut w = warnings_clone.lock().unwrap();
                 w.push(msg.to_owned());
             }));
-        config.disable_dht();
+        disable_dht(&mut config);
 
         let manager =
             RepublishManager::with_relay_publisher(Arc::clone(&dht), Arc::clone(&relay), config);
@@ -1623,7 +1674,7 @@ mod tests {
         let relay = Arc::new(InMemoryRelayPublisher::new());
 
         let mut config = RepublishConfig::new();
-        config.disable_relay();
+        disable_relay(&mut config);
 
         let manager =
             RepublishManager::with_relay_publisher(Arc::clone(&dht), Arc::clone(&relay), config);
@@ -1659,7 +1710,7 @@ mod tests {
     #[test]
     fn config_disable_dht_sets_flag() {
         let mut config = RepublishConfig::new();
-        config.disable_dht();
+        disable_dht(&mut config);
         assert!(!config.is_dht_enabled());
         assert!(config.is_relay_enabled());
     }
@@ -1667,7 +1718,7 @@ mod tests {
     #[test]
     fn config_disable_relay_sets_flag() {
         let mut config = RepublishConfig::new();
-        config.disable_relay();
+        disable_relay(&mut config);
         assert!(config.is_dht_enabled());
         assert!(!config.is_relay_enabled());
     }
@@ -1684,9 +1735,9 @@ mod tests {
     fn disabling_either_layer_always_logs_the_mandated_warning() {
         let logs = capture_tracing(|| {
             let mut relay_off = RepublishConfig::new();
-            relay_off.disable_relay();
+            disable_relay(&mut relay_off);
             let mut dht_off = RepublishConfig::new();
-            dht_off.disable_dht();
+            disable_dht(&mut dht_off);
         });
 
         assert_eq!(
@@ -1714,52 +1765,80 @@ mod tests {
             RepublishConfig::new().with_layer_disabled_callback(Arc::new(move |m: &str| {
                 sink.lock().unwrap().push(m.to_owned());
             }));
-        config.disable_relay();
+        disable_relay(&mut config);
 
         assert_eq!(seen.lock().unwrap().as_slice(), [LAYER_DISABLED_WARNING]);
     }
 
-    /// Runs `body` with a scoped `tracing` subscriber and returns everything it
-    /// emitted, so a test can assert on a log line that no callback observes.
-    fn capture_tracing(body: impl FnOnce()) -> String {
-        #[derive(Clone)]
-        struct SharedBuf(Arc<std::sync::Mutex<Vec<u8>>>);
-
-        impl std::io::Write for SharedBuf {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuf {
-            type Writer = Self;
-            fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
-            }
-        }
-
-        let buf = SharedBuf(Arc::new(std::sync::Mutex::new(Vec::new())));
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(buf.clone())
-            .with_ansi(false)
-            .finish();
-        // While only one dispatcher is live, tracing-core registers a callsite
-        // against the registering thread's default alone, so a concurrent test
-        // thread with no subscriber caches the `warn!` callsite as `never`. A
-        // second live dispatcher makes registration consult every live
-        // dispatcher, and the rebuild repairs a `never` cached before this
-        // capture began, so the capture does not depend on test order.
-        let _second_dispatcher =
-            tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
-        tracing::subscriber::with_default(subscriber, || {
-            tracing::callsite::rebuild_interest_cache();
-            body();
+    /// The capture dispatcher and a second dispatcher, both live for the rest
+    /// of the test process once forced.
+    ///
+    /// While at most one dispatcher is live, tracing-core registers a callsite
+    /// against the registering thread's default alone, so a test thread with no
+    /// subscriber caches the §3.10.6 `warn!` callsite as `never` and mutes every
+    /// later capture. Every test reaches that callsite through
+    /// [`disable_dht`] or [`disable_relay`], which force this lock first, so
+    /// two dispatchers are live before the callsite's first registration:
+    /// registration then consults both, and each thread's own default decides
+    /// whether an event is recorded.
+    static TRACING_CAPTURE: std::sync::LazyLock<[tracing::Dispatch; 2]> =
+        std::sync::LazyLock::new(|| {
+            let capture = tracing_subscriber::fmt()
+                .with_writer(ThreadBuf)
+                .with_ansi(false)
+                .finish();
+            [
+                tracing::Dispatch::new(capture),
+                tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()),
+            ]
         });
-        let bytes = buf.0.lock().unwrap().clone();
+
+    thread_local! {
+        /// What the capture dispatcher wrote on this test thread.
+        static CAPTURED: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Writes the capture dispatcher's output to the emitting thread's buffer,
+    /// so concurrent tests never see each other's lines.
+    struct ThreadBuf;
+
+    impl std::io::Write for ThreadBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            CAPTURED.with_borrow_mut(|captured| captured.extend_from_slice(buf));
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ThreadBuf {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            Self
+        }
+    }
+
+    /// Disables DHT publishing after forcing [`TRACING_CAPTURE`].
+    fn disable_dht(config: &mut RepublishConfig) {
+        std::sync::LazyLock::force(&TRACING_CAPTURE);
+        config.disable_dht();
+    }
+
+    /// Disables relay publishing after forcing [`TRACING_CAPTURE`].
+    fn disable_relay(config: &mut RepublishConfig) {
+        std::sync::LazyLock::force(&TRACING_CAPTURE);
+        config.disable_relay();
+    }
+
+    /// Runs `body` under the capture dispatcher and returns everything it
+    /// emitted on this thread, so a test can assert on a log line that no
+    /// callback observes.
+    fn capture_tracing(body: impl FnOnce()) -> String {
+        let [capture, _] = &*TRACING_CAPTURE;
+        CAPTURED.with_borrow_mut(Vec::clear);
+        tracing::dispatcher::with_default(capture, body);
+        let bytes = CAPTURED.with_borrow_mut(std::mem::take);
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
