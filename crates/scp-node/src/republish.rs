@@ -871,8 +871,8 @@ mod tests {
         );
         assert_eq!(
             *ttl,
-            scp_identity::republish::RELAY_BLOB_TTL_SECS,
-            "blob_ttl is the 7-day DID-record TTL (§3.10.2)"
+            u64::from(scp_relay_client::MAX_BLOB_TTL),
+            "blob_ttl is MAX_BLOB_TTL, the 7-day relay ceiling (§9.18.11)"
         );
 
         // The blob is a valid DID-record frame (not bare bytes, not an envelope).

@@ -1085,18 +1085,12 @@ pub struct PendingSignatureRecord { pub identifier: Identifier, pub sequence: u6
 pub struct KeptComposition { pub identifier: Identifier, pub sequence: u64, pub event_digest: [u8; 32] }
 
 /// One relay entry's declared write policy, as that entry publishes it at
-/// `.well-known/scp`. **The type carries three fields and no others**, which
-/// are the three write-policy terms `18-addressability-and-deployment.md`
-/// §18.3.3 states: `max_blob_size`, `max_blob_ttl_seconds` and
-/// `rate_limit_publish`. A relay that serializes this type discloses those
-/// terms and nothing else. Every field's doc names what its absence means and
-/// states no figure of its own. **`max_blob_ttl_seconds` is a term an
-/// identity-half publisher reads and never exercises**, because the four
-/// retained kinds carry no TTL (§3.10.5).
-///
-/// **Where a field's spelling differs from its `relay_config` row's, this
-/// type states the mapping**: `max_blob_ttl_seconds` carries the row
-/// `max_blob_ttl`, spelled with the unit that row declares.
+/// `.well-known/scp`. **The type carries two fields and no others**, which
+/// are the two write-policy terms `18-addressability-and-deployment.md`
+/// §18.3.3 states: `max_blob_size` and `rate_limit_publish`. A relay that
+/// serializes this type discloses those terms and nothing else. Every field's
+/// doc names what its absence means and states no figure of its own. Each
+/// field carries the name of its `relay_config` row, and
 /// `18-addressability-and-deployment.md` §18.3.3 is the section a reader finds
 /// the wire form of a relay's declaration in.
 pub struct DeclaredWritePolicy {
@@ -1104,9 +1098,6 @@ pub struct DeclaredWritePolicy {
     /// relay declares no ceiling of its own. `publish` segments the chain per
     /// entry against this value (§3.10.5).
     pub max_blob_size: Option<u64>,
-    /// The longest TTL the relay accepts on an expiring blob, in seconds.
-    /// Absent means the relay declares no ceiling of its own.
-    pub max_blob_ttl_seconds: Option<u64>,
     /// Messages per minute per publishing address. Absent takes the default
     /// `18-addressability-and-deployment.md` §18.3.3 states, and zero turns
     /// the term off.
