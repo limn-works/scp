@@ -53,27 +53,29 @@ pub(super) struct ResolvedKeys {
 }
 
 /// One event of a [`ValidatedChain`], as fork ranking and retention read it
-/// (§9.7.4.2 R6, R9). Crate-private: no caller outside scp-kel reads a
-/// chain's events.
+/// (§9.7.4.2 R6, R9). `pub` only inside the private `validate` module: no
+/// caller outside scp-kel reads a chain's events.
 #[derive(Debug, Clone, Copy)]
-pub struct EventView<'c> {
+pub struct EventView {
     /// The event's preimage digest, which every comparison reads (R9).
-    pub(crate) digest: [u8; 32],
+    pub digest: [u8; 32],
     /// The event's sequence.
-    pub(crate) sequence: u64,
+    pub sequence: u64,
     /// The event's kind.
-    pub(crate) kind: EventKind,
+    pub kind: EventKind,
     /// Whether this event carries a `StandingRoot` signer group, which on a
     /// validated chain verified against the root standing at its
     /// predecessor (R6).
-    pub(crate) reveal_root_cosigned: bool,
+    pub reveal_root_cosigned: bool,
     /// The byte length of the unit that carried the event (R9).
-    pub(crate) unit_len: u64,
-    /// The commitment standing at the event's predecessor, which a
-    /// reveal-authorized event reveals. `None` at the inception.
-    pub(crate) commitment_before: Option<&'c StandingCommitment>,
-    /// The commitment standing after the event.
-    pub(crate) commitment_after: &'c StandingCommitment,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "read by AcceptedChainHolder, which stays unexported until R9's retention bounds land with it (SCP-310)"
+        )
+    )]
+    pub unit_len: u64,
 }
 
 /// What one position of a valid chain leaves standing, read by
@@ -255,22 +257,15 @@ impl ValidatedChain {
     }
 
     /// Every event of the chain, from the inception to the head.
-    pub(crate) fn events(&self) -> impl Iterator<Item = EventView<'_>> {
-        let mut before: Option<&StandingCommitment> = None;
+    pub(crate) fn events(&self) -> impl Iterator<Item = EventView> + '_ {
         std::iter::once(&self.state.inception)
             .chain(&self.state.later)
-            .map(move |event| {
-                let view = EventView {
-                    digest: event.digest,
-                    sequence: event.sequence,
-                    kind: event.kind,
-                    reveal_root_cosigned: event.reveal_root_cosigned,
-                    unit_len: event.unit_len,
-                    commitment_before: before,
-                    commitment_after: &event.commitment,
-                };
-                before = Some(&event.commitment);
-                view
+            .map(|event| EventView {
+                digest: event.digest,
+                sequence: event.sequence,
+                kind: event.kind,
+                reveal_root_cosigned: event.reveal_root_cosigned,
+                unit_len: event.unit_len,
             })
     }
 
@@ -284,6 +279,37 @@ impl ValidatedChain {
             .zip(other.events())
             .take_while(|(left, right)| left.digest == right.digest)
             .count()
+    }
+
+    /// `longer` with this chain's copy of every leading event the two share
+    /// by preimage digest, and `longer`'s own events past them: where this
+    /// chain is a prefix of `longer`, this chain extended by `longer`'s
+    /// further events.
+    ///
+    /// §9.7.4.2 R9: "a party holding a valid event that receives a
+    /// byte-different valid event with the same digest keeps the copy it
+    /// holds". Two events of one digest carry one preimage, so every state
+    /// `longer` derived from them is the state this chain derived; only the
+    /// copy, which [`EventView::unit_len`] reads, differs.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "called by AcceptedChainHolder, which stays unexported until R9's retention bounds land with it (SCP-310)"
+        )
+    )]
+    pub(crate) fn extended_by(&self, longer: Self) -> Self {
+        let mut state = longer.state;
+        if state.inception.digest == self.state.inception.digest {
+            state.inception = self.state.inception.clone();
+            for (theirs, mine) in state.later.iter_mut().zip(&self.state.later) {
+                if theirs.digest != mine.digest {
+                    break;
+                }
+                *theirs = mine.clone();
+            }
+        }
+        Self { state }
     }
 
     /// The count of events the chain holds, the inception included.
@@ -530,14 +556,9 @@ mod tests {
             "the inception has no predecessor"
         );
         assert_eq!(events[0].unit_len, v41_len as u64);
-        assert!(events[0].commitment_before.is_none());
         assert_eq!(events[1].kind, EventKind::RootRecovery);
         assert!(events[1].reveal_root_cosigned);
         assert_eq!(events[1].unit_len, v54.len() as u64);
-        assert_eq!(
-            events[1].commitment_before,
-            Some(events[0].commitment_after)
-        );
     }
 
     #[test]

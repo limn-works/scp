@@ -2,6 +2,11 @@
 #![warn(missing_docs)]
 #![doc = include_str!("../README.md")]
 
+// The rank tests compile the integration tests' spec 25 fixtures, which
+// name this crate `scp_kel`.
+#[cfg(test)]
+extern crate self as scp_kel;
+
 mod client_data;
 pub mod constants;
 mod error;
@@ -35,8 +40,8 @@ pub use preimage::{
     prerotation_commitment,
 };
 pub use rank::{
-    AcceptedChainHolder, ChainPairing, DisplacedSuffix, Divergence, ForkRank, HoldOutcome,
-    SetResolution, TieClass, UnrelatedChains, pair_chains, resolve_set,
+    ChainPairing, Divergence, ForkRank, NoResolution, ResolveError, SetResolution, TieClass,
+    UnrelatedChains, pair_chains, resolve_set,
 };
 pub use routing::{RoutingKind, routing_id};
 pub use signature::{
