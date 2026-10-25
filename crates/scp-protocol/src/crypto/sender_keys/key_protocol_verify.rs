@@ -104,6 +104,13 @@ pub const REQUEST_FRESHNESS_SECS: u64 = NONCE_EXPIRY_SECS;
 /// of the replay window so the TTL, not the capacity, is what bounds replay.
 pub const NONCE_DEDUP_CAPACITY: usize = 10_000;
 
+/// Responses a key holder keeps per requester identity (spec 09 §9.16.9).
+///
+/// It also bounds the
+/// sender-key distributions a holder keeps queued for one target identity
+/// while their publish fails (§9.16.9 "A distribution whose publish fails").
+pub const MAX_PUSH_CHAINS_PER_MEMBER: usize = 16;
+
 // ---------------------------------------------------------------------------
 // Wire types
 // ---------------------------------------------------------------------------

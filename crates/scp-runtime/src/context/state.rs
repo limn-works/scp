@@ -1953,6 +1953,8 @@ pub(crate) fn strip_event_payload(event: &ContextEvent) -> ContextEvent {
         | ContextEvent::CommitBroadcastSucceeded { .. }
         | ContextEvent::EquivocationDetected { .. }
         | ContextEvent::CommitBroadcastFailed { .. }
+        | ContextEvent::SenderKeyDistributionPending { .. }
+        | ContextEvent::SenderKeyDistributionFailed { .. }
         | ContextEvent::PseudonymAnnounced { .. }
         | ContextEvent::PseudonymRotationDue { .. }
         | ContextEvent::PseudonymAnnouncementPending { .. }

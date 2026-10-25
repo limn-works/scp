@@ -3264,11 +3264,17 @@ pub(super) async fn decrypt_and_dispatch(
                         requester_pk.as_bytes(),
                         &blocked,
                     )? {
-                        // Queue the ephemeral-sealed answer for MLS-wrap + transmit
+                        // Queue the ephemeral-sealed answer, bounded per target, for
+                        // MLS-wrap + transmit
                         // by `drain_and_deliver_sender_keys` after the Class-C view
                         // drops (in `handle_deliver_incoming`). A blocked requester
                         // returns `None` (§9.16.2 silent drop) — nothing queued.
-                        cs.pending_distributions.push((sender_did.clone(), sealed));
+                        crate::context::actor::state::ContextCryptoState::enqueue_distribution(
+                            &mut cs.pending_distributions,
+                            &mut cs.undelivered,
+                            sender_did.clone(),
+                            sealed,
+                        );
                     }
                     Ok(Dispatched::Handled)
                 }

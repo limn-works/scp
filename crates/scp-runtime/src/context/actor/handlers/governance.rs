@@ -1311,6 +1311,19 @@ pub(crate) async fn evaluate_governance_timeouts(
     ))
     .await;
 
+    // Phase 6: publish again each sender-key distribution whose earlier publish
+    // failed and whose backoff has elapsed, under the republish rule (spec 09
+    // §9.16.9 "A distribution whose publish fails"). The pass emits the
+    // Pending / Failed events itself; the attempt record it updates is
+    // coalesced, covered by the `mutated` outcome below.
+    crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
+        deps,
+        &mut cell.class_c_view(),
+        &context_id,
+        crate::context::lifecycle_helpers::DistributionScope::DueRetries,
+    )
+    .await;
+
     Outcome::ok_mutated(true)
 }
 

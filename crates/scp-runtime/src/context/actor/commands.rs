@@ -275,8 +275,9 @@ pub enum MessagingCommand {
     SendQueuedSenderKeys {
         /// Context identifier.
         context_id: String,
-        /// Oneshot reply channel. `Ok(())` once every queued answer was
-        /// handed to the transport or logged as failed.
+        /// Oneshot reply channel. `Ok(())` once a relay accepted every queued
+        /// distribution; an error when one stays queued or was dropped (spec 09
+        /// §9.16.9 "A distribution whose publish fails").
         reply: oneshot::Sender<Result<(), ContextError>>,
     },
 

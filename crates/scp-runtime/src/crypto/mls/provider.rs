@@ -170,6 +170,12 @@ pub(crate) struct MlsCryptoSnapshot {
     /// defense-in-depth at the sender-key layer.
     #[serde(default)]
     pub(crate) recv_sequence_tracker: Vec<(String, u64, u64)>,
+    /// Sender-key distributions queued for publish, with their attempt
+    /// records. Persisted in the durable step of the rotation or Add that
+    /// queued them (spec 05 §5.15.3), so a publish that fails, or a crash
+    /// before the publish, leaves them to be published again (spec 09
+    /// §9.16.9 "A distribution whose publish fails").
+    pub(crate) pending_distributions: Vec<PendingDistribution>,
 }
 
 impl Drop for MlsCryptoSnapshot {
@@ -219,6 +225,61 @@ impl std::fmt::Debug for MlsCryptoSnapshot {
             )
             .field("signer_bytes", &"[REDACTED]")
             .field("group_id", &format_args!("[{} bytes]", self.group_id.len()))
+            .field(
+                "pending_distributions",
+                &format_args!("[{} entries]", self.pending_distributions.len()),
+            )
+            .finish()
+    }
+}
+
+/// A sender-key distribution queued for publish, with its attempt record
+/// (spec 09 §9.16.9 "A distribution whose publish fails").
+///
+/// The holder keeps the entry until a relay accepts a publish of it, or until
+/// no TTL remains under the republish rule (§9.10.2): `MAX_BLOB_TTL` after
+/// [`Self::first_attempt_at`]. Each attempt MLS-seals [`Self::message`] into
+/// the group's epoch at the time of the attempt.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct PendingDistribution {
+    /// The member the distribution carries a sender key to.
+    pub target_did: String,
+    /// The serialized `SenderKeyDistributionMessage`. Its key is HPKE-sealed
+    /// to the target; the buffer still wipes on drop because it is key
+    /// transport material.
+    pub message: Zeroizing<Vec<u8>>,
+    /// Unix seconds of the first publish attempt; `None` until one is made.
+    pub first_attempt_at: Option<u64>,
+    /// Publish attempts that failed so far.
+    pub failed_attempts: u32,
+    /// Unix seconds before which a timer retry skips the entry.
+    pub next_attempt_at: u64,
+}
+
+impl PendingDistribution {
+    /// A distribution queued for `target_did` that no attempt has published.
+    #[must_use]
+    pub fn queued(target_did: String, message: Vec<u8>) -> Self {
+        Self {
+            target_did,
+            message: Zeroizing::new(message),
+            first_attempt_at: None,
+            failed_attempts: 0,
+            next_attempt_at: 0,
+        }
+    }
+}
+
+// SECURITY: the message carries an HPKE-sealed sender key; the log shows its
+// length only.
+impl std::fmt::Debug for PendingDistribution {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingDistribution")
+            .field("target_did", &self.target_did)
+            .field("message", &format_args!("[{} bytes]", self.message.len()))
+            .field("first_attempt_at", &self.first_attempt_at)
+            .field("failed_attempts", &self.failed_attempts)
+            .field("next_attempt_at", &self.next_attempt_at)
             .finish()
     }
 }
@@ -287,10 +348,10 @@ pub struct OwnedMlsCryptoState {
     /// `crates/scp-runtime/src/context/actor/sequence.rs`
     /// §"Sequence numbering convention").
     pub send_sequence: u64,
-    /// Pending sender-key distribution messages (target DID, serialized
-    /// message). Not yet drained to transport at take-time; actor
-    /// replays via its own transport provider.
-    pub pending_distributions: Vec<(String, Vec<u8>)>,
+    /// Sender-key distributions queued for publish. A fresh birth starts
+    /// empty; a restore carries the persisted queue (spec 09 §9.16.9 "A
+    /// distribution whose publish fails").
+    pub pending_distributions: Vec<PendingDistribution>,
     /// Nonce dedup cache for sender-key requests (replay protection).
     pub nonce_dedup: NonceDedup,
     /// Remote members' DHKEM(P-256) wrapping public keys (by DID).
@@ -1070,7 +1131,8 @@ impl NodeMlsFactory {
             sender_key_store,
             sender_key_epoch: snapshot.sender_key_epoch,
             send_sequence: snapshot.send_sequence,
-            pending_distributions: Vec::new(),
+            // The persisted queue survives the restart (spec 05 §5.15.3).
+            pending_distributions: std::mem::take(&mut snapshot.pending_distributions),
             nonce_dedup: NonceDedup::new(),
             member_wrapping_keys,
         };

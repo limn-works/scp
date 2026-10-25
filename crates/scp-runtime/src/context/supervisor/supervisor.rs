@@ -32897,7 +32897,11 @@ mod tests {
             1,
             "alice enqueues exactly one answer for the authenticated requester"
         );
-        let (dest_did, answer_bytes) = alice_cs.pending_distributions[0].clone();
+        let crate::crypto::mls::provider::PendingDistribution {
+            target_did: dest_did,
+            message: answer_bytes,
+            ..
+        } = alice_cs.pending_distributions[0].clone();
         assert_eq!(
             dest_did, BOB,
             "the answer is addressed to the authenticated requester"

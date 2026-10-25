@@ -2620,6 +2620,87 @@ fn drain_and_deliver_sender_keys_calls_mls_encrypt_management() {
     );
 }
 
+// --- A distribution whose publish fails (spec 09 §9.16.9) ---
+
+/// The drain reports every undelivered distribution by local event, so no
+/// caller can drop the report, and a failed publish requeues the entry with
+/// its backoff instead of discarding it.
+#[test]
+fn drain_and_deliver_sender_keys_reports_and_requeues() {
+    let body = extract_fn_body(MANAGER_SRC, "drain_and_deliver_sender_keys")
+        .expect("drain_and_deliver_sender_keys body");
+    for needle in [
+        "emit_event(",
+        ".to_event()",
+        "DistributionFault::Requeued",
+        "commit_retry_backoff(",
+        "republish_sealed_management(",
+    ] {
+        assert!(
+            body.contains(needle),
+            "drain_and_deliver_sender_keys must contain `{needle}` (spec 09 §9.16.9)"
+        );
+    }
+}
+
+/// A `SenderKeyRequest` answer enters the queue through its per-target bound
+/// (spec 09 §9.16.9).
+#[test]
+fn key_request_answer_is_queued_through_the_bound() {
+    assert!(
+        fn_body_contains(MANAGER_SRC, "decrypt_and_dispatch", "enqueue_distribution("),
+        "decrypt_and_dispatch must queue a SenderKeyRequest answer through \
+         enqueue_distribution (spec 09 §9.16.9)"
+    );
+}
+
+/// The governance timer retries the queue's due entries (spec 09 §9.16.9
+/// step 2).
+#[test]
+fn governance_timer_retries_sender_key_distributions() {
+    const HANDLERS_GOVERNANCE_SRC: &str =
+        include_str!("../../../../crates/scp-runtime/src/context/actor/handlers/governance.rs");
+    let body = extract_fn_body(HANDLERS_GOVERNANCE_SRC, "evaluate_governance_timeouts")
+        .expect("evaluate_governance_timeouts body");
+    assert!(
+        body.contains("drain_and_deliver_sender_keys(")
+            && body.contains("DistributionScope::DueRetries"),
+        "evaluate_governance_timeouts must retry due sender-key distributions \
+         (spec 09 §9.16.9)"
+    );
+}
+
+/// The explicit re-send request turns an undelivered distribution into an
+/// error (spec 09 §9.16.9 step 5).
+#[test]
+fn send_queued_sender_keys_returns_the_report_as_error() {
+    assert!(
+        fn_body_contains(
+            HANDLERS_MESSAGING_SRC,
+            "handle_send_queued_sender_keys",
+            ".into_result()"
+        ),
+        "handle_send_queued_sender_keys must reply with the drain report's \
+         result (spec 09 §9.16.9)"
+    );
+}
+
+/// The persisted crypto blob carries the queue (spec 05 §5.15.3).
+#[test]
+fn export_crypto_state_persists_pending_distributions() {
+    const ACTOR_STATE_SRC: &str =
+        include_str!("../../../../crates/scp-runtime/src/context/actor/state.rs");
+    assert!(
+        fn_body_contains(
+            ACTOR_STATE_SRC,
+            "export_crypto_state",
+            "pending_distributions: crypto.pending_distributions"
+        ),
+        "export_crypto_state must persist the sender-key distribution queue \
+         (spec 05 §5.15.3)"
+    );
+}
+
 // --- Negative assertion: send_message must NOT call old encrypt_message ---
 
 #[test]

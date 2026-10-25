@@ -196,6 +196,24 @@ impl BlobTtl {
         Self::remaining(BlobClass::Message, first_attempt_secs, now_secs)
     }
 
+    /// The TTL of an attempt to publish a sealed management message first
+    /// attempted at `first_attempt_secs`, such as a sender-key distribution
+    /// whose publish failed (§9.16.9 "A distribution whose publish fails"):
+    /// the relay maximum minus the seconds elapsed since then. A clock that
+    /// moved backwards counts as zero elapsed seconds, so a first attempt
+    /// (`now_secs == first_attempt_secs`) requests the full relay maximum.
+    ///
+    /// # Errors
+    ///
+    /// [`BlobTtlExpired`] when no TTL remains, so the caller drops the message
+    /// instead of publishing it again.
+    pub fn republish_sealed_management(
+        first_attempt_secs: u64,
+        now_secs: u64,
+    ) -> Result<Self, BlobTtlExpired> {
+        Self::remaining(BlobClass::Message, first_attempt_secs, now_secs)
+    }
+
     /// The TTL that remains of a `class` publish first attempted at
     /// `first_attempt_secs`.
     fn remaining(

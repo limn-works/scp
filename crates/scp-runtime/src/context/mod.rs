@@ -515,3 +515,8 @@ mod pseudonym_rotation_runtime_tests;
 // story PUSH-030), also `#![cfg(test)]`.
 #[cfg(test)]
 mod processed_commit_tests;
+
+// A sender-key distribution whose publish fails (spec 09 §9.16.9), also
+// `#![cfg(test)]`.
+#[cfg(test)]
+mod sender_key_requeue_tests;

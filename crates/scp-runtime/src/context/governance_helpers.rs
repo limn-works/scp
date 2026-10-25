@@ -1101,23 +1101,15 @@ pub async fn execute_revoke(
                 );
             }
         }
-        // Drain through the actor's crypto state (same one the rotation populated).
-        {
-            let mut view = cell.class_c_view();
-            if let Err(e) = crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
-                deps,
-                view.mode_mut().crypto_mut(),
-                context_id,
-            )
-            .await
-            {
-                tracing::warn!(
-                    context_id = %context_id,
-                    error = %e,
-                    "drain_and_deliver_sender_keys failed after access revocation"
-                );
-            }
-        }
+        // Publish what the rotation queued; a failed publish stays queued and
+        // is reported by event (spec 09 §9.16.9).
+        crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
+            deps,
+            &mut cell.class_c_view(),
+            context_id,
+            crate::context::lifecycle_helpers::DistributionScope::All,
+        )
+        .await;
     }
 
     Ok(rotated_authors.len())
@@ -1384,9 +1376,10 @@ pub async fn execute_add_member(
     // MLS-wraps + delivers it over the management channel. Class-S — the enqueue
     // touches the same actor crypto the add advanced, reached only through
     // `rest_mut()` inside `commit_class_s_keep` (parity with the join add path).
-    // Best-effort disposition (M23, parity with the remove/revoke governance
-    // paths): a failure is warned and the add proceeds — the new member recovers
-    // the key via `SenderKeyRequest`. Gated on a non-empty Welcome so the
+    // A failure to build the distribution does not undo the add: it is reported
+    // as `SenderKeyDistributionFailed` by the publish pass below, and the new
+    // member recovers the key by a `SenderKeyRequest` (spec 09 §9.16.2,
+    // §9.16.9). Gated on a non-empty Welcome so the
     // `cfg(test)`/`testing` no-crypto pipeline (empty `AddMemberOutput`, no MLS
     // group) skips it exactly as the broadcast + `WelcomeGenerated` emit below do.
     let local_did = deps.crypto.local_did().to_owned();
@@ -1396,14 +1389,14 @@ pub async fn execute_add_member(
                 v.rest_mut().distribute_sender_key(&local_did, did.as_ref())
             })
             .await
+        && let Some(crypto) = cell.class_c_view().mode_mut().crypto_mut()
     {
-        tracing::warn!(
-            context_id = %context_id,
-            member_did = %did,
-            error = %e,
-            "distribute_sender_key failed after member add — new member will \
-             recover via SenderKeyRequest"
-        );
+        crypto
+            .undelivered
+            .push(crate::context::actor::state::DistributionFault::NotBuilt {
+                target_did: did.to_string(),
+                reason: e.to_string(),
+            });
     }
 
     // The fallible role assignment + structural member insert run through the
@@ -1508,26 +1501,19 @@ pub async fn execute_add_member(
     // populated (same crypto state), MLS-wraps each entry, and sends it — the
     // MLS-wrap is mandatory (see `drain_and_deliver_sender_keys`). Runs AFTER the
     // best-effort persist (transport is async — ADR-049 Decision 7), matching the
-    // remove/revoke drain call sites. Best-effort: a per-target send failure is
-    // warned; the member recovers via `SenderKeyRequest`. `&mut` view scoped so
-    // `cell` is free afterward. No-op on the `cfg(test)` no-crypto pipeline (the
-    // queue is empty — `distribute_sender_key` was skipped above).
+    // remove/revoke drain call sites. The queued distribution was persisted with
+    // the Add, so a failed publish stays queued for the governance timer's
+    // retry and is reported by event (spec 09 §9.16.9). No-op on the
+    // `cfg(test)` no-crypto pipeline (the queue is empty —
+    // `distribute_sender_key` was skipped above).
     {
-        let mut view = cell.class_c_view();
-        if let Err(e) = crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
+        crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
             deps,
-            view.mode_mut().crypto_mut(),
+            &mut cell.class_c_view(),
             context_id,
+            crate::context::lifecycle_helpers::DistributionScope::All,
         )
-        .await
-        {
-            tracing::warn!(
-                context_id = %context_id,
-                member_did = %did,
-                error = %e,
-                "failed to deliver join-time sender key after member add"
-            );
-        }
+        .await;
     }
 
     // Subject-bearing leaf (ADR-011 amendment): carry the *affected member*
@@ -1704,24 +1690,15 @@ pub async fn execute_remove_member(
         }
 
         // ADR-049 PR-7: drain through the actor's crypto state (same one the
-        // in-closure `rotate_sender_key` above populated); `&mut` view scoped so
-        // `cell` is free afterward.
-        {
-            let mut view = cell.class_c_view();
-            if let Err(e) = crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
-                deps,
-                view.mode_mut().crypto_mut(),
-                context_id,
-            )
-            .await
-            {
-                tracing::warn!(
-                    context_id = %context_id,
-                    error = %e,
-                    "failed to deliver rotated sender keys after member removal"
-                );
-            }
-        }
+        // in-closure `rotate_sender_key` above populated). A failed publish
+        // stays queued and is reported by event (spec 09 §9.16.9).
+        crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
+            deps,
+            &mut cell.class_c_view(),
+            context_id,
+            crate::context::lifecycle_helpers::DistributionScope::All,
+        )
+        .await;
     }
 
     // Subject-bearing leaf (ADR-011 amendment): carry the *affected member*
@@ -2927,22 +2904,16 @@ pub async fn execute_reset_member(
 
     // ADR-049 PR-7: drain through the actor's crypto state (same one the rotation
     // populated — reset has no separate `distribute_sender_key`, so `rotate` is the
-    // sole producer of the pending queue). `&mut` view scoped so `cell` is free.
+    // sole producer of the pending queue). A failed publish stays queued and
+    // is reported by event (spec 09 §9.16.9).
     {
-        let mut view = cell.class_c_view();
-        if let Err(e) = crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
+        crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
             deps,
-            view.mode_mut().crypto_mut(),
+            &mut cell.class_c_view(),
             context_id,
+            crate::context::lifecycle_helpers::DistributionScope::All,
         )
-        .await
-        {
-            tracing::warn!(
-                context_id = %context_id,
-                error = %e,
-                "failed to deliver rotated sender keys after member reset"
-            );
-        }
+        .await;
     }
 
     deps.event_log

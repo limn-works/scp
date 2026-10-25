@@ -925,21 +925,20 @@ async fn handle_deliver_incoming(
     // `pending_distributions`. In `Live` mode the deliver view has dropped, so
     // re-acquire the Class-C crypto view and MLS-wrap + transport-send the
     // queued answer(s) through the existing drain path. A no-op when nothing was
-    // queued (the ordinary case). The drain is best-effort by construction
-    // (per-recipient send failures are logged, the requester recovers via a
-    // fresh request), and its `Result` cannot error for the in-memory
-    // `std::mem::take` drain, so it does not fail the delivery ack.
+    // queued (the ordinary case). An answer whose publish fails stays queued
+    // and is reported by a `SenderKeyDistributionPending` event (spec 09
+    // §9.16.9); the delivery it answered succeeded, so the ack stays `Ok`.
     //
     // In `PullOnly` mode (a push-wake pull, ADR-029 §2 step 4) the actor sends
     // nothing and does not advance its MLS send ratchet: the answer stays
     // queued until a full reconnection sends `SendQueuedSenderKeys`.
     match mode {
         crate::context::actor::commands::DeliveryMode::Live => {
-            let mut view = cell.class_c_view();
-            let _ = crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
+            crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
                 deps,
-                view.mode_mut().crypto_mut(),
+                &mut cell.class_c_view(),
                 context_id,
+                crate::context::lifecycle_helpers::DistributionScope::All,
             )
             .await;
         }
@@ -1001,10 +1000,14 @@ async fn handle_deliver_incoming(
 
 /// Handle [`MessagingCommand::SendQueuedSenderKeys`] (actor-shape).
 ///
-/// MLS-encrypts and sends every queued sender-key answer through
+/// MLS-encrypts and sends every queued sender-key distribution through
 /// `drain_and_deliver_sender_keys`, the path a `Live` delivery runs. The
-/// drain logs each per-recipient failure, so the reply is `Ok` unless the
-/// drain itself fails or exceeds its budget.
+/// caller asked for the send and no step of its own can be left half done,
+/// so any distribution the pass does not deliver turns the reply into an
+/// error (spec 09 §9.16.9): `TransportFailed` when one stays queued,
+/// `CryptoFailed` when one was dropped, `TransportTimeout` when the pass
+/// exceeds its budget. The pass removes an entry only after its publish
+/// succeeds, so a timeout loses no queued distribution.
 async fn handle_send_queued_sender_keys(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
@@ -1015,11 +1018,12 @@ async fn handle_send_queued_sender_keys(
         let mut view = cell.class_c_view();
         let drain = crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
             deps,
-            view.mode_mut().crypto_mut(),
+            &mut view,
             context_id,
+            crate::context::lifecycle_helpers::DistributionScope::All,
         );
         match tokio::time::timeout(HANDLER_TIMEOUT, drain).await {
-            Ok(result) => result,
+            Ok(report) => report.into_result().map(|_sent| ()),
             Err(_elapsed) => Err(ContextError::TransportTimeout(format!(
                 "send_queued_sender_keys exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
             ))),
