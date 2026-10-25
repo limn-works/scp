@@ -469,6 +469,8 @@ pub(crate) fn fullstack_seed_peer_pseudonym_on(
 #[napi]
 pub struct TestingCallbackCustody {
     inner: std::sync::Arc<crate::custody::NapiCallbackKeyCustody>,
+    /// The custody records `reopen` hands a second adapter.
+    records: std::sync::Arc<dyn scp_platform::CustodyRecordStore>,
 }
 
 /// The error production reports for a custody failure outside derivation:
@@ -476,6 +478,24 @@ pub struct TestingCallbackCustody {
 /// [`custody_failure_code`](scp_ffi_common::error_codes::custody_failure_code).
 fn custody_err(e: scp_platform::PlatformError) -> napi::Error {
     napi::Error::from(ScpNapiError::from(e))
+}
+
+impl TestingCallbackCustody {
+    fn over(
+        provider: crate::custody::NapiKeyCustodyProvider,
+        records: std::sync::Arc<dyn scp_platform::CustodyRecordStore>,
+    ) -> napi::Result<Self> {
+        use scp_ffi_common::callback_custody::{CallbackKeyRegistry, CustodyRecords};
+        Ok(Self {
+            inner: std::sync::Arc::new(crate::custody::NapiCallbackKeyCustody::from_provider(
+                provider,
+                CallbackKeyRegistry::recorded(CustodyRecords::unleased(std::sync::Arc::clone(
+                    &records,
+                ))),
+            )?),
+            records,
+        })
+    }
 }
 
 fn testing_handle(key_id: &str) -> napi::Result<scp_platform::KeyHandle> {
@@ -491,14 +511,30 @@ impl TestingCallbackCustody {
     /// A `napi::Error` if a callback cannot become a threadsafe function.
     #[napi(constructor)]
     pub fn new(provider: crate::custody::NapiKeyCustodyProvider) -> napi::Result<Self> {
-        Ok(Self {
-            inner: std::sync::Arc::new(crate::custody::NapiCallbackKeyCustody::from_provider(
-                provider,
-                // Records in a fresh in-memory store, as production keeps
-                // them in the instance storage (SCP-345).
-                scp_ffi_common::callback_custody::CallbackKeyRegistry::recorded_in_memory(),
-            )?),
-        })
+        // Records in a fresh in-memory store, as production keeps them in the
+        // instance storage (SCP-345).
+        Self::over(
+            provider,
+            std::sync::Arc::new(scp_platform::StorageCustodyRecordStore::new(
+                scp_platform::in_memory::InMemoryStorage::new(),
+                scp_platform::CustodyNamespace::from_bytes([0; 16]),
+            )),
+        )
+    }
+
+    /// A new adapter around `provider` over this adapter's custody records,
+    /// as production rebuilds an identity's adapter over its stored records
+    /// after a relaunch. The new adapter caches no key, so its first use of a
+    /// recorded key asks `provider.getPublicKey` and checks the answer
+    /// against the record. Only a recorded key resolves, so a test mints its
+    /// keys through an adapter first.
+    ///
+    /// # Errors
+    ///
+    /// A `napi::Error` if a callback cannot become a threadsafe function.
+    #[napi]
+    pub fn reopen(&self, provider: crate::custody::NapiKeyCustodyProvider) -> napi::Result<Self> {
+        Self::over(provider, std::sync::Arc::clone(&self.records))
     }
 
     /// Generates an Ed25519 identity key through the provider.

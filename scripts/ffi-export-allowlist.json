@@ -1172,6 +1172,12 @@
       "reason": "SCP-307 test hook; feature-gated (testing). Method of TestingCallbackCustody, which wraps a JS custody provider in the production napi callback custody adapter so TypeScript tests reach that adapter's checks and error codes. Builds the adapter around the provider. Not a protocol operation."
     },
     {
+      "name": "reopen",
+      "path": "crates/scp-ffi/napi/src/testing.rs",
+      "kind": "test-fixture",
+      "reason": "SCP-345 test hook; feature-gated (testing). Method of TestingCallbackCustody that builds a new adapter around another JS provider over this one's custody records, as production rebuilds an identity's adapter over its stored records after a relaunch, so a TypeScript test reaches the check of a host's getPublicKey answer against the record. Not a protocol operation."
+    },
+    {
       "name": "generate_keypair",
       "path": "crates/scp-ffi/napi/src/testing.rs",
       "kind": "test-fixture",

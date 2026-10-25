@@ -59,6 +59,11 @@ interface TestingCustody {
     epoch: bigint,
   ): Promise<Buffer>;
   sign(keyId: string, data: Buffer): Promise<Buffer>;
+  /**
+   * A new adapter around `provider` over this adapter's custody records; its
+   * first use of a recorded key asks `provider.getPublicKey`.
+   */
+  reopen(provider: unknown): TestingCustody;
   /** Returns the 32-byte shared secret the bridge read from the host. */
   dhAgree(keyId: string, peerPublic: Buffer): Promise<Buffer>;
   destroyKey(keyId: string): Promise<void>;
@@ -306,6 +311,25 @@ function adapterWith(overrides: Record<string, (...args: unknown[]) => unknown>)
   return new Ctor(toNativeCustodyProvider(provider));
 }
 
+/**
+ * `adapterWith(overrides)` reopened over the records of an adapter that
+ * minted `keyType` (`"identity"` for an identity key) through a well-behaved
+ * host, with the minted key id. The reopened adapter caches no key, so its
+ * first use of that id asks the overridden `getPublicKey`.
+ */
+async function reopenedWith(
+  keyType: CustodyKeyType | "identity",
+  overrides: Record<string, (...args: unknown[]) => unknown>,
+): Promise<{ custody: TestingCustody; keyId: string }> {
+  const minting = adapter(new StoreKeychain());
+  const keyId =
+    keyType === "identity"
+      ? await minting.generateKeypair()
+      : await minting.generateOperationalKeypair(keyType);
+  const provider = Object.assign(new StoreKeychain(), overrides) as KeyCustodyProvider;
+  return { custody: minting.reopen(toNativeCustodyProvider(provider)), keyId };
+}
+
 const MESSAGE = Buffer.from("custody-bridge-checks");
 
 /**
@@ -534,14 +558,14 @@ suite.describe("napi callback custody", () => {
   });
 
   test("a host that reports the retired x25519 key type is a custody error", async () => {
-    const custody = adapterWith({
+    const { custody, keyId } = await reopenedWith("identity", {
       getPublicKey: () => ({
         keyType: "x25519",
         publicKey: new Uint8Array(32),
         role: "operational",
       }),
     });
-    const mapped = await rejectionOf(() => custody.sign("9", MESSAGE));
+    const mapped = await rejectionOf(() => custody.sign(keyId, MESSAGE));
     expect(mapped).toBeInstanceOf(CryptoError);
     expect(mapped.code).toBe("SCP-CRYPTO-4060");
     expect(mapped.message).toContain(
@@ -576,8 +600,7 @@ suite.describe("napi callback custody", () => {
     // `getPublicKey`, since `dhAgree` refuses a signing key.
     const hostEcdh = crypto.createECDH("prime256v1");
     const hostPublic = hostEcdh.generateKeys();
-    const keyId = "9";
-    const custody = adapterWith({
+    const { custody, keyId } = await reopenedWith("hpke-p256", {
       getPublicKey: () => ({
         keyType: "hpke-p256",
         publicKey: new Uint8Array(hostPublic),
