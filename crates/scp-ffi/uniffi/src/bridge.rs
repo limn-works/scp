@@ -15003,14 +15003,30 @@ impl Scp {
                 // (NAPI). Aligned across PyO3/NAPI/UniFFI — pinned by the
                 // cross-bridge parity harness's `OP_EVENT_LOG_APPEND` and
                 // `OP_EVENT_LOG_FILTERED` (ADR-046).
-                if let Some(manager) = bi.try_context_manager_ready() {
+                //
+                // No supervisor attached means no supervisor log, and the
+                // query falls back to the bridge-local log. A suspended bridge
+                // or a log that cannot be read is an error, never an empty
+                // answer (spec section 17.3, "Event log write failures").
+                let manager = if bi.core.try_supervisor().is_some() {
+                    Some(bi.context_manager_or_error()?)
+                } else {
+                    None
+                };
+                if let Some(manager) = manager {
                     // ADR-056: resolve the context-id string to its 32-byte
                     // digest via the canonical chokepoint (NOT the raw SHA-256
                     // routing primitive, which double-hashes a real 64-hex id
                     // and queries the wrong event-log key).
                     let ctx_id_bytes =
                         scp_core::context::state::context_id_to_bytes(&handle.context_id);
-                    if let Ok(Some(entries)) = manager.event_log_entries(&ctx_id_bytes)
+                    let entries = manager.event_log_entries(&ctx_id_bytes).map_err(|e| {
+                        ScpError::from_context_error(
+                            format!("reading the event log failed: {e}"),
+                            &e,
+                        )
+                    })?;
+                    if let Some(entries) = entries
                         && !entries.is_empty()
                     {
                         // Canonical filter — pinned across PyO3/NAPI/UniFFI by
@@ -25153,6 +25169,46 @@ mod tests {
             payload_json["target_did"].as_str(),
             Some(target_did),
             "GovernanceActionExecuted leaf projects its target_did"
+        );
+    }
+
+    /// A bridge whose supervisor is attached but suspended fails an event-log
+    /// query instead of answering from the bridge-local fallback: a supervisor
+    /// log that cannot be read is never reported as no log (spec section 17.3,
+    /// "Event log write failures"). The same query on the running bridge is
+    /// the control: it answers with the context's log.
+    // Multi-thread flavor: see `event_log_query_projects_role_assigned_subject_did`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "testing")]
+    async fn a_suspended_bridge_fails_the_event_log_query() {
+        let scp = scp_test();
+        let identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create");
+        let handle = scp
+            .context_create(Arc::clone(&identity), encrypted_join_test_params())
+            .await
+            .expect("context_create attaches the supervisor");
+        assert!(
+            scp.inner.core.try_supervisor().is_some(),
+            "precondition: the context's supervisor is attached"
+        );
+        let running = scp.event_log_query(Arc::clone(&handle), None).await;
+        assert!(
+            running.as_ref().is_ok_and(|events| !events.is_empty()),
+            "control: the running bridge answers with the context's log, got {running:?}"
+        );
+
+        scp.inner
+            .core
+            .suspend(std::time::Duration::from_secs(10))
+            .await
+            .expect("suspend");
+        let suspended = scp.event_log_query(Arc::clone(&handle), None).await;
+        assert!(
+            suspended.is_err(),
+            "a suspended supervisor's log is not answered from the fallback, got {suspended:?}"
         );
     }
 

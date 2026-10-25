@@ -116,9 +116,22 @@ pub(crate) async fn event_log_query_on(
     // double-hashes a real 64-hex id and queries the wrong event-log key).
     let ctx_id_bytes = scp_core::context::state::context_id_to_bytes(&context_id_str);
 
-    let manager_entries = crate::runtime::supervisor(bi)
-        .ok()
-        .and_then(|supervisor| supervisor.event_log_entries(&ctx_id_bytes).ok().flatten());
+    // No supervisor attached means no supervisor log, and the query falls
+    // back to the bridge-local log. A suspended bridge or a log that cannot
+    // be read is an error, never an empty answer (spec section 17.3, "Event
+    // log write failures").
+    let manager_entries = if bi.core.try_supervisor().is_some() {
+        crate::runtime::supervisor(bi)?
+            .event_log_entries(&ctx_id_bytes)
+            .map_err(|e| {
+                napi::Error::from(ScpNapiError::from_context_error(
+                    format!("reading the event log failed: {e}"),
+                    &e,
+                ))
+            })?
+    } else {
+        None
+    };
 
     if let Some(entries) = manager_entries
         && !entries.is_empty()
@@ -255,10 +268,22 @@ pub(crate) async fn event_log_verify_on(
     // canonical chokepoint (NOT the raw SHA-256 routing primitive, which
     // double-hashes a real 64-hex id and queries the wrong event-log key).
     let ctx_id_bytes = scp_core::context::state::context_id_to_bytes(&context_id);
-    if let Some(entries) = crate::runtime::supervisor(bi)
-        .ok()
-        .and_then(|supervisor| supervisor.event_log_entries(&ctx_id_bytes).ok().flatten())
-    {
+    // No supervisor attached means nothing to sync. A suspended bridge or a
+    // log that cannot be read fails the proof instead of proving against an
+    // unsynced tree (spec section 17.3, "Event log write failures").
+    let manager_entries = if bi.core.try_supervisor().is_some() {
+        crate::runtime::supervisor(bi)?
+            .event_log_entries(&ctx_id_bytes)
+            .map_err(|e| {
+                napi::Error::from(ScpNapiError::from_context_error(
+                    format!("reading the event log failed: {e}"),
+                    &e,
+                ))
+            })?
+    } else {
+        None
+    };
+    if let Some(entries) = manager_entries {
         // Precompute the canonical leaf hash for each source event
         // (`SHA-256(0x00 ‖ rmp_serde(Event))`) via the substrate helper so the
         // synced UCAN-state tree commits to byte-identical leaves.

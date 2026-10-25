@@ -217,8 +217,15 @@ impl PyCheckpoint {
 ///
 /// Returns `Ok(Some(events))` when the manager is initialized AND has
 /// entries for the context, `Ok(None)` when the caller should fall back to
-/// the bridge-local per-context `EventLog` (e.g. UCAN revocation writes,
-/// tests that bypass the manager).
+/// the bridge-local per-context `EventLog`: no supervisor is attached, or
+/// the supervisor holds no log or an empty one for the context (e.g. UCAN
+/// revocation writes, tests that bypass the manager).
+///
+/// # Errors
+///
+/// A suspended bridge, or a supervisor log that cannot be read, raises
+/// `ContextError`: an unreadable log is never answered with the fallback
+/// (spec section 17.3, "Event log write failures").
 fn query_manager_entries(
     bi: &PyBridgeInstance,
     py: Python<'_>,
@@ -229,9 +236,14 @@ fn query_manager_entries(
     // canonical chokepoint (NOT the raw SHA-256 routing primitive, which
     // double-hashes a real 64-hex id and queries the wrong event-log key).
     let ctx_id_bytes = scp_core::context::state::context_id_to_bytes(context_id);
-    let Some(entries) = crate::runtime::supervisor(bi)
-        .ok()
-        .and_then(|mgr| mgr.event_log_entries(&ctx_id_bytes).ok().flatten())
+    if bi.core.try_supervisor().is_none() {
+        return Ok(None);
+    }
+    let Some(entries) = crate::runtime::supervisor(bi)?
+        .event_log_entries(&ctx_id_bytes)
+        .map_err(|e| {
+            ScpPyError::from_context_error(format!("reading the event log failed: {e}"), &e)
+        })?
     else {
         return Ok(None);
     };
