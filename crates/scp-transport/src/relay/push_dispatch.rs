@@ -1465,13 +1465,14 @@ mod enabled {
         use tempfile::TempDir;
 
         use super::super::super::push::ApnsSender;
+        use super::super::super::push_endpoint::parse_endpoint;
         use super::super::super::push_gate::{PushPublishGate, gate_publish, test_relay_url};
         use super::super::super::push_store::MAX_REGISTRATIONS_PER_REGISTRANT;
         use super::super::super::push_test_server::hung_host;
         use super::super::super::push_test_server::{Reply, TestServer, TlsTestServer};
         use super::super::super::push_webpush::tests::{
-            sender_for as webpush_sender_for, sender_with_deadline as webpush_sender_with_deadline,
-            subscribe,
+            held, requests_reach, sender_for as webpush_sender_for,
+            sender_with_deadline as webpush_sender_with_deadline, subscribe,
         };
         use super::*;
 
@@ -1894,11 +1895,60 @@ mod enabled {
             Ok(token)
         }
 
+        /// When the service's `WebPush` sender's back-off of `server`'s
+        /// `push.example.net` origin ends.
+        fn webpush_retry_at(
+            service: &PushService,
+            server: &TlsTestServer,
+        ) -> Result<Option<tokio::time::Instant>, Box<dyn std::error::Error>> {
+            let aud = parse_endpoint(&server.endpoint("push.example.net", "/"))?
+                .aud()
+                .to_owned();
+            let Some(PushSender::WebPush(sender)) = service.config().senders.first() else {
+                return Err("the service has no WebPush sender".into());
+            };
+            Ok(sender.retry_at(&aud))
+        }
+
+        /// Lets the wake that `notify` queued go out on the paused clock. It
+        /// sleeps until the origin's back-off ends, the instant the service's
+        /// own back-off timer fires, then holds the clock still until `sent`
+        /// finishes, so no deadline passes while the send crosses loopback.
+        async fn wake_until<T>(
+            service: &PushService,
+            server: &TlsTestServer,
+            sent: impl Future<Output = T>,
+        ) -> Result<T, Box<dyn std::error::Error>> {
+            let backoff_end = webpush_retry_at(service, server)?;
+            if let Some(until) = backoff_end {
+                tokio::time::sleep_until(until).await;
+            }
+            held(sent).await
+        }
+
+        /// Finishes once `token`'s stored failure count is `want`.
+        async fn count_is(
+            store: &PushRegistrationStore,
+            token: &[u8],
+            want: Option<u32>,
+        ) -> TestResult {
+            while store
+                .invalid_token_failures(PushPlatform::WebPush, token)
+                .await?
+                != want
+            {
+                tokio::task::yield_now().await;
+            }
+            Ok(())
+        }
+
         /// R2, spec 10 §10.7.1: three sends in a row that the push service
         /// leaves unanswered past the deadline remove every registration
         /// holding the token, through the real `WebPush` sender. Each wake
         /// after the first waits out the origin's back-off and is then sent.
-        #[tokio::test]
+        /// The clock is paused and held until each request has arrived, so
+        /// each deadline passes with its request at the server.
+        #[tokio::test(start_paused = true)]
         async fn three_webpush_timeouts_remove_the_registrations() -> TestResult {
             let server =
                 TlsTestServer::start_routed(vec![("/x", (0..3).map(|_| Reply::hang()).collect())])
@@ -1906,12 +1956,14 @@ mod enabled {
             let (push, service, _dir) = webpush_service(&server, Duration::from_millis(300))?;
             let token = shared_webpush_token(&push, &server).await?;
             let store = &service.config().store;
-            for count in [Some(1), Some(2)] {
+            for (sent, count) in [(1, Some(1)), (2, Some(2))] {
                 notify(&push, &RID);
+                wake_until(&service, &server, requests_reach(&server, sent)).await?;
                 webpush_count_reaches(store, &token, count).await?;
             }
             assert_eq!(store.tokens_for_routing_id(&RID).await?.len(), 2);
             notify(&push, &RID);
+            wake_until(&service, &server, requests_reach(&server, 3)).await?;
             webpush_count_reaches(store, &token, None).await?;
             assert!(store.tokens_for_routing_id(&RID).await?.is_empty());
             assert_eq!(server.requests().await.len(), 3);
@@ -1919,8 +1971,9 @@ mod enabled {
         }
 
         /// R2: a 201 between two timeouts resets the count, so the second
-        /// timeout leaves it at one, not two.
-        #[tokio::test]
+        /// timeout leaves it at one, not two. The clock is paused and held
+        /// until each request has arrived, and until the 201 is applied.
+        #[tokio::test(start_paused = true)]
         async fn a_webpush_delivery_resets_the_timeout_count() -> TestResult {
             let server = TlsTestServer::start_routed(vec![(
                 "/x",
@@ -1931,25 +1984,22 @@ mod enabled {
             let token = shared_webpush_token(&push, &server).await?;
             let store = &service.config().store;
             notify(&push, &RID);
+            wake_until(&service, &server, requests_reach(&server, 1)).await?;
             webpush_count_reaches(store, &token, Some(1)).await?;
             notify(&push, &RID);
-            wait_for_requests(&server, 2, Duration::from_secs(5)).await?;
+            wake_until(&service, &server, count_is(store, &token, Some(0))).await??;
             notify(&push, &RID);
-            wait_for_requests(&server, 3, Duration::from_secs(5)).await?;
-            tokio::time::sleep(Duration::from_millis(400)).await;
-            assert_eq!(
-                store
-                    .invalid_token_failures(PushPlatform::WebPush, &token)
-                    .await?,
-                Some(1)
-            );
+            wake_until(&service, &server, requests_reach(&server, 3)).await?;
+            webpush_count_reaches(store, &token, Some(1)).await?;
             assert_eq!(store.tokens_for_routing_id(&RID).await?.len(), 2);
             Ok(())
         }
 
         /// R2: a 429 and a 5xx neither add to the count nor reset it: after
         /// two timeouts they leave it at two, and the registrations stay.
-        #[tokio::test]
+        /// The clock is paused and held until each timed-out request has
+        /// arrived, and until each 429 or 5xx has stepped the back-off.
+        #[tokio::test(start_paused = true)]
         async fn webpush_throttling_and_server_errors_never_remove() -> TestResult {
             let server = TlsTestServer::start_routed(vec![(
                 "/x",
@@ -1964,15 +2014,25 @@ mod enabled {
             let (push, service, _dir) = webpush_service(&server, Duration::from_millis(300))?;
             let token = shared_webpush_token(&push, &server).await?;
             let store = &service.config().store;
-            for count in [Some(1), Some(2)] {
+            for (sent, count) in [(1, Some(1)), (2, Some(2))] {
                 notify(&push, &RID);
+                wake_until(&service, &server, requests_reach(&server, sent)).await?;
                 webpush_count_reaches(store, &token, count).await?;
             }
-            for sent in [3, 4] {
+            for _ in [429, 503] {
                 notify(&push, &RID);
-                wait_for_requests(&server, sent, Duration::from_secs(10)).await?;
+                // `wake_until` holds the clock from the back-off's end, when
+                // the origin has none, until the `Transient` answer takes the
+                // next back-off step.
+                wake_until(&service, &server, async {
+                    while webpush_retry_at(&service, &server)?.is_none() {
+                        tokio::task::yield_now().await;
+                    }
+                    TestResult::Ok(())
+                })
+                .await??;
             }
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert_eq!(server.requests().await.len(), 4);
             assert_eq!(
                 store
                     .invalid_token_failures(PushPlatform::WebPush, &token)
