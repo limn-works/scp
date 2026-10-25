@@ -1,221 +1,208 @@
-//! The chain a store that validates key-event frames holds as accepted
-//! (§9.7.4.2 R9).
+//! The chain a store that validates key-event frames holds as accepted, and
+//! the divergent suffixes it retains beside it (§9.7.4.2 R9).
 
-use super::{
-    ChainPairing, Decision, Divergence, ForkRank, NoResolution, ResolveError, Tournament,
-    pair_chains,
-};
+use super::retention::{Admission, Bounds, Rerank, RetentionBasis, RetentionError, RetentionSet};
+use super::{ChainPairing, ForkRank, ResolveError, pair_chains};
 use crate::validate::ValidatedChain;
 
-/// A displaced accepted chain's suffix past the shared prefix it shares with
-/// the chain that displaced it (R9).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct DisplacedSuffix {
-    /// The displaced chain's head digest.
-    pub head: [u8; 32],
-    /// The rank R6 gives the displaced suffix against the new accepted
-    /// chain: 2 or 3 where a winner displaced it, and the rank of the tie,
-    /// 1 or 2, where R9's held-first rule moved acceptance to an
-    /// earlier-held chain tied with it.
-    pub rank: ForkRank,
-    /// The preimage digest of the last event the two chains share.
-    pub shared_prefix_head: [u8; 32],
-    /// The position of the displaced suffix's first event.
-    pub fork_position: u64,
-    /// The summed lengths of the units that carried the displaced suffix's
-    /// events, which R9's byte bound counts against the identifier.
-    pub bytes: u64,
-}
-
-/// The summed unit lengths of `chain`'s events at and past `fork_position`
-/// (R9's byte bound).
-fn suffix_bytes(chain: &ValidatedChain, fork_position: u64) -> u64 {
-    chain
-        .events()
-        .filter(|event| event.sequence >= fork_position)
-        .fold(0_u64, |bytes, event| bytes.saturating_add(event.unit_len))
-}
-
-/// What holding one more chain did to the accepted chain.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// What holding one more chain did.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[must_use]
 pub enum HoldOutcome {
     /// The chain is, or is a prefix of, a chain already held, compared by
     /// digest: nothing changed.
     AlreadyHeld,
     /// The chain is the accepted chain: the first chain held, or an
     /// extension of the chain accepted before it.
-    AcceptedExtended,
-    /// Another chain is accepted now, and the chain accepted before it is a
-    /// divergent suffix.
-    AcceptedReplaced {
-        /// The suffix of the chain accepted before.
-        displaced: DisplacedSuffix,
+    AcceptedExtended {
+        /// What re-ranking the retained suffixes against the extension did.
+        rerank: Rerank,
     },
-    /// The accepted chain is unchanged, and the chain is held as a divergent
-    /// suffix of it.
+    /// Another chain is accepted now, and the chain accepted before it is
+    /// re-admitted as a divergent suffix.
+    AcceptedReplaced {
+        /// The head of the chain accepted before.
+        displaced: [u8; 32],
+        /// What admitting the arriving chain did, or `None` where it
+        /// extended the chain accepted before.
+        admission: Option<Admission>,
+        /// What re-ranking every retained chain against the new accepted
+        /// chain did, the displaced chain included.
+        rerank: Rerank,
+    },
+    /// The accepted chain is unchanged, and the chain is retained as a
+    /// divergent suffix of it.
     HeldDivergent {
-        /// The rank R6 gives the held suffix against the accepted chain.
+        /// [`Admission::Retained`] or [`Admission::Extended`].
+        admission: Admission,
+    },
+    /// The retention bounds refused the chain: nothing changed, it takes no
+    /// part in deciding the accepted chain, and the caller counts it in its
+    /// residue.
+    Refused {
+        /// The chain's eviction rank.
         rank: ForkRank,
     },
 }
 
+/// Why [`AcceptedChainHolder::hold`] held nothing. The holder is then
+/// unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum HoldError {
+    /// The chain is of another identifier, or the comparisons reached none
+    /// of R6's outcomes.
+    #[error(transparent)]
+    Resolve(#[from] ResolveError),
+    /// Admitting or re-ranking a chain reached a [`RetentionError`].
+    #[error(transparent)]
+    Retention(#[from] RetentionError),
+}
+
 /// The chains of one identifier a store that validates key-event frames
-/// holds, and the one among them it holds as accepted (§9.7.4.2 R9).
+/// holds: the accepted chain, and the divergent suffixes a [`RetentionSet`]
+/// retains against it under R9's bounds (§9.7.4.2 R9).
 ///
 /// R9: "At a validating relay the accepted chain follows R6's rank: after
 /// every frame it accepts, the relay holds as accepted the chain that wins
 /// every pairwise R6 comparison against every other chain it holds at that
 /// routing id, and the displaced chain's events past the shared prefix
 /// become a divergent suffix carrying the rank R6 gave it, which is 2 or 3.
-/// Where no chain wins every pairwise comparison, the relay keeps as
-/// accepted the chain it held first". The rule applies to any store that
-/// validates key-event frames.
+/// Where no chain wins every pairwise comparison, the relay holds as
+/// accepted the chain it held earliest among the chains that no other chain
+/// beats".
 ///
-/// A chain is held from the first event of its own past every chain held
-/// before it: a chain that extends a held chain replaces it in place, keeps
-/// its place in receipt order and keeps the held copy of every event the two
-/// share, so a chain delivered frame by frame is one chain. "Held first" is
-/// the earliest-held chain among the chains no other chain beats.
+/// Every chain other than the accepted one goes through
+/// [`RetentionSet::admit`], so the chains held are the accepted chain and
+/// the retained suffixes, and nothing else: a chain the bounds refuse or
+/// evict takes no part in deciding the accepted chain. One moment counter,
+/// the set's, orders every chain: a chain extending a held one keeps its
+/// moment, and "held first" is the earliest moment among the chains no
+/// other chain beats. R9: "a suffix a party evicted and a party presents
+/// again later is re-ranked as if the party saw it for the first time", so
+/// it takes a new moment.
 ///
-/// The holder bounds nothing it holds, so it stays crate-private until R9's
-/// count and byte bounds on the divergent suffixes land with it.
-#[derive(Debug, Clone, Default)]
+/// S5 (SCP-007 part) is the caller that wires this holder into a validating
+/// store.
+#[derive(Debug, Clone)]
 pub struct AcceptedChainHolder {
-    /// The held chains in receipt order, none a prefix of another.
-    held: Vec<ValidatedChain>,
-    /// Every pairwise comparison over `held`, by index.
-    tournament: Tournament,
-    /// The index in `held` of the accepted chain; `None` while empty.
-    accepted: Option<usize>,
+    /// The accepted chain as the set's basis, and the retained suffixes;
+    /// `None` before the first chain is held.
+    set: Option<RetentionSet>,
+    bounds: Bounds,
+}
+
+impl Default for AcceptedChainHolder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl AcceptedChainHolder {
-    /// A holder that holds no chain.
+    /// A holder that holds no chain, under the registered bounds.
     #[must_use]
     pub const fn new() -> Self {
-        Self {
-            held: Vec::new(),
-            tournament: Tournament {
-                divergences: Vec::new(),
-            },
-            accepted: None,
-        }
+        Self::with_bounds(Bounds::REGISTERED)
+    }
+
+    pub(super) const fn with_bounds(bounds: Bounds) -> Self {
+        Self { set: None, bounds }
     }
 
     /// The accepted chain, or `None` before the first chain is held.
     #[must_use]
     pub fn accepted(&self) -> Option<&ValidatedChain> {
-        self.accepted.and_then(|i| self.held.get(i))
+        self.set.as_ref().map(|set| set.basis().chain())
     }
 
-    /// Every held chain in receipt order, the accepted chain included.
+    /// The accepted chain and the retained suffixes, or `None` before the
+    /// first chain is held.
+    #[must_use]
+    pub const fn retention(&self) -> Option<&RetentionSet> {
+        self.set.as_ref()
+    }
+
+    /// Every held chain, the accepted chain included, in the order of the
+    /// moment the holder first held each.
     pub fn held(&self) -> impl Iterator<Item = &ValidatedChain> {
-        self.held.iter()
+        let mut held: Vec<(u64, &ValidatedChain)> = self
+            .set
+            .iter()
+            .flat_map(|set| {
+                std::iter::once((set.basis_observed(), set.basis().chain())).chain(
+                    set.suffixes()
+                        .iter()
+                        .map(|suffix| (suffix.observed(), suffix.chain())),
+                )
+            })
+            .collect();
+        held.sort_by_key(|(observed, _)| *observed);
+        held.into_iter().map(|(_, chain)| chain)
     }
 
     /// Holds `chain` and re-decides the accepted chain under R9.
     ///
-    /// Each call compares `chain` with every held chain once and updates
-    /// only the comparisons of the slot `chain` takes.
+    /// A chain extending the accepted chain becomes the accepted chain and
+    /// re-ranks the retained suffixes against it. Any other chain goes
+    /// through [`RetentionSet::admit`]; a refusal returns
+    /// [`HoldOutcome::Refused`] and changes nothing. The holder then runs R6
+    /// over the accepted chain and the retained suffixes, and where another
+    /// chain wins, or ties and was held first, moves acceptance to it
+    /// through [`RetentionSet::rerank`], which re-admits the chain accepted
+    /// before.
+    ///
+    /// S5 (SCP-007 part) is the caller that wires this into a validating
+    /// store, which calls it after every frame it accepts.
     ///
     /// # Errors
     ///
-    /// [`ResolveError::Unrelated`] where `chain` is of another identifier
-    /// than the chains held, and [`ResolveError::NoResolution`] where the
+    /// [`HoldError::Resolve`] where `chain` is of another identifier or the
     /// comparisons reach none of R6's outcomes, which valid chains of one
-    /// identifier never do. On either error the holder is unchanged.
-    pub fn hold(&mut self, chain: ValidatedChain) -> Result<HoldOutcome, ResolveError> {
-        let mut extends = None;
-        let mut row = Vec::with_capacity(self.held.len().saturating_add(1));
-        for (i, held) in self.held.iter().enumerate() {
-            match pair_chains(&chain, held)? {
+    /// identifier never do, and [`HoldError::Retention`] where admitting or
+    /// re-ranking does. On any error the holder is unchanged.
+    pub fn hold(&mut self, chain: ValidatedChain) -> Result<HoldOutcome, HoldError> {
+        let Some(set) = &self.set else {
+            self.set = Some(RetentionSet::with_bounds(
+                RetentionBasis::Accepted(chain),
+                self.bounds,
+            ));
+            return Ok(HoldOutcome::AcceptedExtended {
+                rerank: Rerank::default(),
+            });
+        };
+        let mut next = set.clone();
+        let accepted = next.basis().chain();
+        let (admission, mut rerank) =
+            match pair_chains(&chain, accepted).map_err(ResolveError::from)? {
                 ChainPairing::Identical | ChainPairing::LeftPrefixOfRight => {
                     return Ok(HoldOutcome::AlreadyHeld);
                 }
                 ChainPairing::RightPrefixOfLeft => {
-                    extends = Some(i);
-                    row.push(None);
+                    let extended = RetentionBasis::Accepted(accepted.extended_by(chain));
+                    (None, next.rerank(extended)?)
                 }
-                ChainPairing::Diverged(divergence) => row.push(Some(divergence)),
-            }
-        }
-        // No held chain is a prefix of another, so at most one is a prefix
-        // of `chain`, and `chain` takes that one's slot.
-        let (slot, chain) =
-            if let Some((i, held)) = extends.and_then(|i| Some((i, self.held.get(i)?))) {
-                (i, held.extended_by(chain))
-            } else {
-                row.push(None);
-                (self.held.len(), chain)
+                ChainPairing::Diverged(_) => match next.admit(chain)? {
+                    Admission::AlreadyHeld => return Ok(HoldOutcome::AlreadyHeld),
+                    Admission::Refused { rank } => return Ok(HoldOutcome::Refused { rank }),
+                    admission => (Some(admission), Rerank::default()),
+                },
             };
-        let mut tournament = self.tournament.clone();
-        tournament.set(slot, &row);
-        let after = match tournament.decide()? {
-            Decision::Winner(winner) => winner,
-            Decision::Tie { undefeated, .. } => *undefeated.first().ok_or(NoResolution)?,
-        };
-        let before = self.accepted;
-        let outcome = match before {
-            None => HoldOutcome::AcceptedExtended,
-            Some(before) if before == after && slot == after => HoldOutcome::AcceptedExtended,
-            Some(before) if before == after => HoldOutcome::HeldDivergent {
-                rank: tournament
-                    .divergence(slot, after)
-                    .ok_or(NoResolution)?
-                    .ranks[0],
-            },
-            Some(before) => {
-                let displaced = if before == slot {
-                    &chain
-                } else {
-                    self.held.get(before).ok_or(NoResolution)?
-                };
-                let divergence: Divergence =
-                    tournament.divergence(before, after).ok_or(NoResolution)?;
+        let displaced = next.basis().chain().head_digest();
+        let winner = next
+            .displacing_suffix()?
+            .map(|suffix| suffix.chain().clone());
+        let outcome = match (winner, admission) {
+            (None, None) => HoldOutcome::AcceptedExtended { rerank },
+            (None, Some(admission)) => HoldOutcome::HeldDivergent { admission },
+            (Some(chain), admission) => {
+                rerank.absorb(next.rerank(RetentionBasis::Accepted(chain))?);
                 HoldOutcome::AcceptedReplaced {
-                    displaced: DisplacedSuffix {
-                        head: displaced.head_digest(),
-                        rank: divergence.ranks[0],
-                        shared_prefix_head: divergence.shared_prefix_head,
-                        fork_position: divergence.fork_position,
-                        bytes: suffix_bytes(displaced, divergence.fork_position),
-                    },
+                    displaced,
+                    admission,
+                    rerank,
                 }
             }
         };
-        match self.held.get_mut(slot) {
-            Some(held) => *held = chain,
-            None => self.held.push(chain),
-        }
-        self.tournament = tournament;
-        self.accepted = Some(after);
+        self.set = Some(next);
         Ok(outcome)
-    }
-}
-
-impl Tournament {
-    /// Sets the comparisons of the chain at `slot`: `row[j]` is its
-    /// divergence against chain `j`, and chain `j`'s against it is the same
-    /// divergence with the ranks swapped. A `slot` one past the last chain
-    /// appends it.
-    fn set(&mut self, slot: usize, row: &[Option<Divergence>]) {
-        if slot == self.divergences.len() {
-            for existing in &mut self.divergences {
-                existing.push(None);
-            }
-            self.divergences.push(vec![None; row.len()]);
-        }
-        for (j, divergence) in row.iter().enumerate() {
-            let swapped = divergence.map(|divergence| Divergence {
-                ranks: [divergence.ranks[1], divergence.ranks[0]],
-                ..divergence
-            });
-            if let Some(cell) = self.divergences.get_mut(slot).and_then(|r| r.get_mut(j)) {
-                *cell = *divergence;
-            }
-            if let Some(cell) = self.divergences.get_mut(j).and_then(|r| r.get_mut(slot)) {
-                *cell = swapped;
-            }
-        }
     }
 }

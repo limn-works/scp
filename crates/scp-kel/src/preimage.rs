@@ -515,7 +515,7 @@ fn write_snapshot(snapshot: &KeyStateSnapshot, out: &mut Vec<u8>) -> Result<(), 
 /// checks on them (the form-list lengths, then the encoded length, the
 /// signed preimage plus each named index's form ceiling, against
 /// `MAX_EVENT_BYTES`), then fields 8 through 12 from where field 7 ended.
-/// Every count is checked against the bound [`count_cap`] gives it and
+/// Every count is checked against the bound `count_cap` gives it and
 /// against the bytes remaining before any element is read, and no allocation
 /// is sized from a wire count (§9.7.4.2, the count-bound rule). The decoder
 /// is otherwise structural: a preimage whose fields its kind does not carry,

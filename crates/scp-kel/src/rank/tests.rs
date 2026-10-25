@@ -2,9 +2,10 @@
 //! (`09-security-model.md` §9.7.4.2 R6, R7, R9) over chains that fork from
 //! Vector 41, each suffix signed here.
 //!
-//! These tests sit in the crate because `AcceptedChainHolder` is
-//! crate-private until R9's retention bounds land with it. They compile the
-//! integration tests' spec 25 fixtures by path.
+//! These tests sit in the crate because `AcceptedChainHolder` stays
+//! crate-private until S5 (SCP-007 part) wires it into a validating store,
+//! and because the retention tests drive `RetentionSet` and the holder with
+//! bounds small enough to reach. They compile the integration tests' spec 25 fixtures by path.
 //!
 //! Every expected rank and resolution is the test's own model of R6, read
 //! from the kinds of the events a test built: a suffix ranks by its first
@@ -20,10 +21,10 @@ use self::chain_support::{
     unit_of, v41, v41_changed, v41_next, v41_v54, v41_v55, v42,
 };
 use self::fixtures::{TestResult, V41_DIGEST, V42_AUTHENTICATOR_DATA, V54_DIGEST, V55_DIGEST};
-use super::holder::{AcceptedChainHolder, HoldOutcome};
+use super::holder::{AcceptedChainHolder, HoldError, HoldOutcome};
 use super::{
-    ChainPairing, Divergence, ForkRank, ResolveError, SetResolution, TieClass, UnrelatedChains,
-    pair_chains, resolve_set,
+    Admission, ChainPairing, Divergence, ForkRank, Rerank, ResolveError, SetResolution, TieClass,
+    UnrelatedChains, pair_chains, resolve_set,
 };
 use crate::{
     AssertionSignature, CommitmentRolloverFields, EntryVerdict, EventPreimage, IndexedSignature,
@@ -535,6 +536,21 @@ fn resolves_as_the_model(tree: &ForkTree) -> TestResult {
     Ok(())
 }
 
+/// What holding the first chain returns.
+fn first_held() -> HoldOutcome {
+    HoldOutcome::AcceptedExtended {
+        rerank: Rerank::default(),
+    }
+}
+
+/// A rerank report naming only `heads` as already held.
+fn already_held(heads: &[[u8; 32]]) -> Rerank {
+    Rerank {
+        already_held: heads.to_vec(),
+        ..Rerank::default()
+    }
+}
+
 /// AC3: after every frame, the holder's accepted chain is the model's: R6's
 /// winner among the chains held so far, otherwise the unbeaten chain
 /// received first. A chain is received with its first frame no held chain
@@ -544,10 +560,7 @@ fn accepted_follows_every_frame(tree: &ForkTree, choices: &[u8]) -> TestResult {
     let frames = tree.frames(&mut keys)?;
     let v41 = Branch::v41()?;
     let mut holder = AcceptedChainHolder::new();
-    assert_eq!(
-        holder.hold(v41.chain.clone())?,
-        HoldOutcome::AcceptedExtended
-    );
+    assert_eq!(holder.hold(v41.chain.clone())?, first_held());
     let mut held: Vec<Branch> = vec![v41];
     let mut delivered = vec![0_usize; frames.len()];
     let mut choices = choices.iter().cycle();
@@ -774,30 +787,56 @@ fn holder_accepts_vector_54_in_either_arrival_order() -> TestResult {
 
     let mut holder = AcceptedChainHolder::new();
     assert_eq!(holder.accepted(), None);
-    assert_eq!(holder.hold(v55.clone())?, HoldOutcome::AcceptedExtended);
+    assert_eq!(holder.hold(v55.clone())?, first_held());
     assert_eq!(holder.hold(v41.clone())?, HoldOutcome::AlreadyHeld);
     assert_eq!(holder.hold(v55.clone())?, HoldOutcome::AlreadyHeld);
-    let HoldOutcome::AcceptedReplaced { displaced } = holder.hold(v54.clone())? else {
-        return Err("Vector 54 displaces Vector 55".into());
+    assert_eq!(
+        holder.hold(v54.clone())?,
+        HoldOutcome::AcceptedReplaced {
+            displaced: v55_digest,
+            admission: Some(Admission::Retained {
+                rank: ForkRank::Rank1,
+                evicted: Vec::new(),
+            }),
+            rerank: already_held(&[v54_digest]),
+        }
+    );
+    let set = holder.retention().ok_or("a retention set")?;
+    let [suffix] = set.suffixes() else {
+        return Err("Vector 55 is the one retained suffix".into());
     };
-    assert_eq!(displaced.head, v55_digest);
-    assert_eq!(displaced.rank, ForkRank::Rank2);
-    assert_eq!(displaced.shared_prefix_head, v41_digest());
-    assert_eq!(displaced.fork_position, 1);
+    assert_eq!(
+        (
+            suffix.head(),
+            suffix.rank(),
+            suffix.fork_position(),
+            suffix.observed()
+        ),
+        (v55_digest, ForkRank::Rank2, 1, 0)
+    );
     let v55_unit_len = v55_base.units.last().map(Vec::len).ok_or("V55's unit")?;
-    assert_eq!(displaced.bytes, u64::try_from(v55_unit_len)?);
+    assert_eq!(set.retained_bytes(), u64::try_from(v55_unit_len)?);
+    assert_eq!(set.basis_observed(), 1);
     assert_eq!(
         holder.accepted().map(ValidatedChain::head_digest),
         Some(v54_digest)
     );
 
     let mut holder = AcceptedChainHolder::new();
-    assert_eq!(holder.hold(v41)?, HoldOutcome::AcceptedExtended);
-    assert_eq!(holder.hold(v54)?, HoldOutcome::AcceptedExtended);
+    assert_eq!(holder.hold(v41)?, first_held());
+    assert_eq!(
+        holder.hold(v54)?,
+        HoldOutcome::AcceptedExtended {
+            rerank: already_held(&[v41_digest()]),
+        }
+    );
     assert_eq!(
         holder.hold(v55)?,
         HoldOutcome::HeldDivergent {
-            rank: ForkRank::Rank2
+            admission: Admission::Retained {
+                rank: ForkRank::Rank2,
+                evicted: Vec::new(),
+            }
         }
     );
     assert_eq!(
@@ -820,25 +859,51 @@ fn held_first_tie_displaces_a_rank_1_chain() -> TestResult {
     b1.push(&mut keys, Kind::Reveal, 2)?;
 
     let mut holder = AcceptedChainHolder::new();
+    assert_eq!(holder.hold(b0.chain.clone())?, first_held());
     assert_eq!(
-        holder.hold(b0.chain.clone())?,
-        HoldOutcome::AcceptedExtended
+        holder.hold(a.chain.clone())?,
+        HoldOutcome::AcceptedReplaced {
+            displaced: b0.head(),
+            admission: Some(Admission::Retained {
+                rank: ForkRank::Rank1,
+                evicted: Vec::new(),
+            }),
+            rerank: already_held(&[a.head()]),
+        }
     );
-    let HoldOutcome::AcceptedReplaced { displaced } = holder.hold(a.chain.clone())? else {
-        return Err("A beats B0".into());
+    let set = holder.retention().ok_or("a retention set")?;
+    let [suffix] = set.suffixes() else {
+        return Err("B0 is the one retained suffix".into());
+    };
+    assert_eq!((suffix.head(), suffix.rank()), (b0.head(), ForkRank::Rank3));
+    assert_eq!(
+        holder.hold(b1.chain.clone())?,
+        HoldOutcome::AcceptedReplaced {
+            displaced: a.head(),
+            admission: Some(Admission::Extended {
+                rank: ForkRank::Rank1,
+                replaced: b0.head(),
+                evicted: Vec::new(),
+            }),
+            rerank: already_held(&[b1.head()]),
+        },
+        "B1 extends B0 and keeps its moment, so it ties A and was held first"
+    );
+    let set = holder.retention().ok_or("a retention set")?;
+    let [suffix] = set.suffixes() else {
+        return Err("A is the one retained suffix".into());
     };
     assert_eq!(
-        (displaced.head, displaced.rank),
-        (b0.head(), ForkRank::Rank3)
+        (
+            suffix.head(),
+            suffix.rank(),
+            suffix.fork_position(),
+            suffix.observed()
+        ),
+        (a.head(), ForkRank::Rank1, 1, 1)
     );
-    let HoldOutcome::AcceptedReplaced { displaced } = holder.hold(b1.chain.clone())? else {
-        return Err("B1 ties A and was held first".into());
-    };
-    assert_eq!(displaced.head, a.head());
-    assert_eq!(displaced.rank, ForkRank::Rank1);
-    assert_eq!(displaced.shared_prefix_head, v41_digest());
-    assert_eq!(displaced.fork_position, 1);
-    assert_eq!(Some(displaced.bytes), a.unit_lens.last().copied());
+    assert_eq!(Some(set.retained_bytes()), a.unit_lens.last().copied());
+    assert_eq!(set.basis_observed(), 0);
     assert_eq!(
         holder.accepted().map(ValidatedChain::head_digest),
         Some(b1.head())
@@ -919,25 +984,25 @@ fn extension_keeps_the_held_copy_of_a_shared_event() -> TestResult {
     let extension = copied.then(&Wire::of(&next).fields(), next_unit, v41.root);
 
     let mut holder = AcceptedChainHolder::new();
-    assert_eq!(
-        holder.hold(chain_of(&held)?)?,
-        HoldOutcome::AcceptedExtended
-    );
+    assert_eq!(holder.hold(chain_of(&held)?)?, first_held());
     assert_eq!(
         holder.hold(chain_of(&extension)?)?,
-        HoldOutcome::AcceptedExtended
+        HoldOutcome::AcceptedExtended {
+            rerank: already_held(&[held.head]),
+        }
     );
     let accepted = holder.accepted().ok_or("an accepted chain")?;
     assert_eq!(accepted.head_digest(), extension.head);
     let shared = accepted.events().nth(1).ok_or("the shared event")?;
-    assert_eq!(shared.unit_len, u64::try_from(first.len())?);
+    assert_eq!(shared.unit, first.as_slice());
 
     let rollover = Branch::of(&mut keys, &[Kind::Reveal], 1)?;
-    let HoldOutcome::AcceptedReplaced { displaced } = holder.hold(rollover.chain)? else {
+    let HoldOutcome::AcceptedReplaced { displaced, .. } = holder.hold(rollover.chain)? else {
         return Err("a rollover beats a key state".into());
     };
-    assert_eq!(displaced.head, extension.head);
-    assert_eq!(displaced.bytes, u64::try_from(first.len() + next_len)?);
+    assert_eq!(displaced, extension.head);
+    let set = holder.retention().ok_or("a retention set")?;
+    assert_eq!(set.retained_bytes(), u64::try_from(first.len() + next_len)?);
     Ok(())
 }
 
@@ -960,16 +1025,20 @@ fn chains_of_two_identifiers_are_refused() -> TestResult {
         }))
     );
     let mut holder = AcceptedChainHolder::new();
-    holder.hold(v41.clone())?;
+    assert_eq!(holder.hold(v41.clone())?, first_held());
     assert_eq!(
         holder.hold(v42.clone()),
-        Err(ResolveError::Unrelated(UnrelatedChains {
-            left: v42.identifier(),
-            right: v41.identifier(),
-        }))
+        Err(HoldError::Resolve(ResolveError::Unrelated(
+            UnrelatedChains {
+                left: v42.identifier(),
+                right: v41.identifier(),
+            }
+        )))
     );
     assert_eq!(holder.held().count(), 1);
     assert_eq!(holder.accepted(), Some(&v41));
     assert_eq!(resolve_set(&[])?, SetResolution::Empty);
     Ok(())
 }
+
+mod retention;

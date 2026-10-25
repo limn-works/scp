@@ -861,13 +861,15 @@ fn fixed_commitments(continuation: Option<&StandingCommitment>) -> Vec<[u8; 32]>
     }
 }
 
-/// The event this content adds, as a chain entry, carried by a unit of
-/// `unit_len` bytes.
+/// The event this content adds, as a chain entry, carried by `unit`: the
+/// exact bytes that passed the check order (on the unsigned-candidate path,
+/// the candidate's signed preimage, which no reader of a
+/// `ValidatedChange` sees).
 pub(super) fn chain_event(
     applied: &Applied,
     digest: [u8; 32],
     preimage: &EventPreimage,
-    unit_len: u64,
+    unit: Arc<[u8]>,
 ) -> ChainEvent {
     ChainEvent {
         digest,
@@ -881,7 +883,7 @@ pub(super) fn chain_event(
             .signers
             .iter()
             .any(|signer| signer.role == SignerGroupRole::StandingRoot),
-        unit_len,
+        unit,
         root: Arc::clone(&applied.root),
         commitment: Arc::clone(&applied.commitment),
         snapshot: Arc::clone(&applied.snapshot),

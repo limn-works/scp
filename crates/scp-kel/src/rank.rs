@@ -205,15 +205,21 @@ pub enum ResolveError {
 /// event after the shared prefix": the walk reads neither.
 fn rank_suffix(chain: &ValidatedChain, shared_prefix_len: usize) -> Option<ForkRank> {
     shared_prefix_len.checked_sub(1)?;
+    Some(rank_past(chain, shared_prefix_len))
+}
+
+/// The rank of `chain`'s events past its first `shared_prefix_len`, which
+/// the caller has established is a non-empty prefix: [`rank_suffix`]'s walk.
+fn rank_past(chain: &ValidatedChain, shared_prefix_len: usize) -> ForkRank {
     let revealing = chain
         .events()
         .skip(shared_prefix_len)
         .find(|event| event.kind.is_reveal_authorized());
-    Some(match revealing {
+    match revealing {
         Some(event) if event.reveal_root_cosigned => ForkRank::Rank1,
         Some(_) => ForkRank::Rank2,
         None => ForkRank::Rank3,
-    })
+    }
 }
 
 /// How `left` and `right` relate: identical, one a prefix of the other, or
@@ -438,16 +444,23 @@ impl Tournament {
     }
 }
 
-// `AcceptedChainHolder` is crate-private until R9's count and byte bounds
-// land with it, so no exported path holds divergent suffixes unbounded.
+// `AcceptedChainHolder` holds its divergent suffixes in a `RetentionSet`
+// under R9's bounds; S5 (SCP-007 part) is the caller that wires it into a
+// validating store, so it stays crate-private until then.
 #[cfg_attr(
     not(test),
     expect(
         dead_code,
-        reason = "AcceptedChainHolder stays unexported until R9's retention bounds land with it (SCP-310)"
+        reason = "AcceptedChainHolder's one caller is the validating store S5 (SCP-007 part) wires"
     )
 )]
 mod holder;
+mod retention;
+
+pub use retention::{
+    Admission, BasisKind, PersistedBasis, PersistedRetention, PersistedSuffix, Rerank,
+    RestoreError, RetainedSuffix, RetentionBasis, RetentionError, RetentionSet,
+};
 
 #[cfg(test)]
 mod tests;

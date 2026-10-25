@@ -45,8 +45,10 @@ pub use preimage::{
     prerotation_commitment,
 };
 pub use rank::{
-    ChainPairing, Divergence, ForkRank, NoResolution, ResolveError, SetResolution, TieClass,
-    UnrelatedChains, pair_chains, resolve_set,
+    Admission, BasisKind, ChainPairing, Divergence, ForkRank, NoResolution, PersistedBasis,
+    PersistedRetention, PersistedSuffix, Rerank, ResolveError, RestoreError, RetainedSuffix,
+    RetentionBasis, RetentionError, RetentionSet, SetResolution, TieClass, UnrelatedChains,
+    pair_chains, resolve_set,
 };
 pub use routing::{RoutingKind, routing_id};
 pub use signature::{

@@ -27,9 +27,9 @@ pub(super) struct ChainEvent {
     /// unsigned-candidate path no signature was verified, and no reader of a
     /// `ValidatedChange` sees this flag.
     pub(super) reveal_root_cosigned: bool,
-    /// The byte length of the event unit that carried the event, which R9's
-    /// byte bound counts.
-    pub(super) unit_len: u64,
+    /// The event unit that carried the event, byte for byte: the copy R9
+    /// keeps, persists, and counts toward its byte bound.
+    pub(super) unit: Arc<[u8]>,
     /// The root standing after the event.
     pub(super) root: Arc<InstalledRootSet>,
     /// The commitment standing after the event.
@@ -56,7 +56,7 @@ pub(super) struct ResolvedKeys {
 /// (§9.7.4.2 R6, R9). `pub` only inside the private `validate` module: no
 /// caller outside scp-kel reads a chain's events.
 #[derive(Debug, Clone, Copy)]
-pub struct EventView {
+pub struct EventView<'c> {
     /// The event's preimage digest, which every comparison reads (R9).
     pub digest: [u8; 32],
     /// The event's sequence.
@@ -67,15 +67,9 @@ pub struct EventView {
     /// validated chain verified against the root standing at its
     /// predecessor (R6).
     pub reveal_root_cosigned: bool,
-    /// The byte length of the unit that carried the event (R9).
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "read by AcceptedChainHolder, which stays unexported until R9's retention bounds land with it (SCP-310)"
-        )
-    )]
-    pub unit_len: u64,
+    /// The unit that carried the event, byte for byte: the copy R9 keeps,
+    /// persists, and counts toward its byte bound.
+    pub unit: &'c [u8],
 }
 
 /// What one position of a valid chain leaves standing, read by
@@ -257,7 +251,7 @@ impl ValidatedChain {
     }
 
     /// Every event of the chain, from the inception to the head.
-    pub(crate) fn events(&self) -> impl Iterator<Item = EventView> + '_ {
+    pub(crate) fn events(&self) -> impl Iterator<Item = EventView<'_>> + '_ {
         std::iter::once(&self.state.inception)
             .chain(&self.state.later)
             .map(|event| EventView {
@@ -265,8 +259,16 @@ impl ValidatedChain {
                 sequence: event.sequence,
                 kind: event.kind,
                 reveal_root_cosigned: event.reveal_root_cosigned,
-                unit_len: event.unit_len,
+                unit: &event.unit,
             })
+    }
+
+    /// Every event's preimage digest and the unit that carried it, from the
+    /// inception to the head: the copies R9 keeps and persists.
+    pub(crate) fn units(&self) -> impl Iterator<Item = ([u8; 32], Arc<[u8]>)> + '_ {
+        std::iter::once(&self.state.inception)
+            .chain(&self.state.later)
+            .map(|event| (event.digest, Arc::clone(&event.unit)))
     }
 
     /// The count of leading events this chain and `other` share, compared
@@ -290,14 +292,7 @@ impl ValidatedChain {
     /// byte-different valid event with the same digest keeps the copy it
     /// holds". Two events of one digest carry one preimage, so every state
     /// `longer` derived from them is the state this chain derived; only the
-    /// copy, which [`EventView::unit_len`] reads, differs.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "called by AcceptedChainHolder, which stays unexported until R9's retention bounds land with it (SCP-310)"
-        )
-    )]
+    /// copy, which [`EventView::unit`] reads, differs.
     pub(crate) fn extended_by(&self, longer: Self) -> Self {
         let mut state = longer.state;
         if state.inception.digest == self.state.inception.digest {
@@ -310,6 +305,24 @@ impl ValidatedChain {
             }
         }
         Self { state }
+    }
+
+    /// Each event at and past `position`, as its preimage digest and the
+    /// length of the unit that carried it: what R9's byte bound counts for a
+    /// divergent suffix whose first event sits at `position`, once per
+    /// digest across every suffix retained.
+    pub(crate) fn unit_lens_from(
+        &self,
+        position: u64,
+    ) -> impl Iterator<Item = ([u8; 32], u64)> + '_ {
+        self.events()
+            .filter(move |event| event.sequence >= position)
+            .map(|event| {
+                (
+                    event.digest,
+                    u64::try_from(event.unit.len()).unwrap_or(u64::MAX),
+                )
+            })
     }
 
     /// The count of events the chain holds, the inception included.
@@ -555,10 +568,10 @@ mod tests {
             !events[0].reveal_root_cosigned,
             "the inception has no predecessor"
         );
-        assert_eq!(events[0].unit_len, v41_len as u64);
+        assert_eq!(events[0].unit.len(), v41_len);
         assert_eq!(events[1].kind, EventKind::RootRecovery);
         assert!(events[1].reveal_root_cosigned);
-        assert_eq!(events[1].unit_len, v54.len() as u64);
+        assert_eq!(events[1].unit, v54.as_slice());
     }
 
     #[test]
@@ -568,7 +581,7 @@ mod tests {
         let events: Vec<_> = chain.events().collect();
         assert_eq!(events[1].kind, EventKind::RootRecovery);
         assert!(!events[1].reveal_root_cosigned);
-        assert_eq!(events[1].unit_len, v55.len() as u64);
+        assert_eq!(events[1].unit, v55.as_slice());
     }
 
     #[test]
