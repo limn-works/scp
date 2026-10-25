@@ -12,9 +12,10 @@
 //! signature, body, macro arguments) names a gated type. A raw identifier
 //! names what it spells, and a name a `type` alias or a `use .. as` rename
 //! binds to one, anywhere in the scanned tree, counts as a gated name. A
-//! module declaration that loads no scanned file, and an `include!` or
-//! `include_str!` whose target is not a scanned file, count as items too: the
-//! scan cannot see what they bring in.
+//! module declaration that loads no scanned file, and an `include!` whose
+//! target is not a scanned file, count as items too: the scan cannot see the
+//! code they bring in. `include_str!` and `include_bytes!` expand to a string
+//! or byte literal, never tokens, so they never count.
 //!
 //! Items compiled only under exactly `#[cfg(test)]` are out of scope: an item
 //! carrying it, a file with `#![cfg(test)]`, and a file every non-test-build
@@ -267,108 +268,6 @@ const ALLOWLIST: &[Allowed] = &[
         "fn compute_key_continuity_fingerprint",
         "1a30d320845207027b708b801b358682b41ceda93595ede93ec13e5feefaa06a",
         "§9.11 fingerprint, a display value that gates nothing; it reads `ReplayedState` because one party is the device's own adopted log",
-    ),
-    allow(
-        "crates/scp-alloc/src/lib.rs",
-        "#![..]: include_str!(../README.md) reads no scanned file",
-        "f25814d5d88ea602295dc6aef4ae45851273d48d4c003b677f4335e7512dbd12",
-        "the crate's rustdoc text from `README.md`; `include_str!` yields a string literal, never tokens",
-    ),
-    allow(
-        "crates/scp-clock/src/lib.rs",
-        "#![..]: include_str!(../README.md) reads no scanned file",
-        "1a6c0ac7edad41f6626f09fc35e98e73795a71fbcd1d0a2924fdea592f7bc067",
-        "the crate's rustdoc text from `README.md`; `include_str!` yields a string literal, never tokens",
-    ),
-    allow(
-        "crates/scp-crypto/src/lib.rs",
-        "#![..]: include_str!(../README.md) reads no scanned file",
-        "3da064777ddc1753ff33f186c449bfc9b8f3e9de9c5354c8e54fc5a59dc72656",
-        "the crate's rustdoc text from `README.md`; `include_str!` yields a string literal, never tokens",
-    ),
-    allow(
-        "crates/scp-did/src/lib.rs",
-        "#![..]: include_str!(../README.md) reads no scanned file",
-        "e3f76a97793df37d9a5adb468f75a9027910f3dc4cb2a83cf74d4e49d8fe8a94",
-        "the crate's rustdoc text from `README.md`; `include_str!` yields a string literal, never tokens",
-    ),
-    allow(
-        "crates/scp-event-log/src/lib.rs",
-        "#![..]: include_str!(../README.md) reads no scanned file",
-        "8f75520ef198545f3d235d10e286a624232248944951fb2f9f0616effdc52ce3",
-        "the crate's rustdoc text from `README.md`; `include_str!` yields a string literal, never tokens",
-    ),
-    allow(
-        "crates/scp-identity/src/lib.rs",
-        "#![..]: include_str!(../README.md) reads no scanned file",
-        "03ea0f5bba2c445c30af1a02a14fbcdd8bff561323b3cab38d8bcac77b6d35f8",
-        "the crate's rustdoc text from `README.md`; `include_str!` yields a string literal, never tokens",
-    ),
-    allow(
-        "crates/scp-kel/src/lib.rs",
-        "#![..]: include_str!(../README.md) reads no scanned file",
-        "637535730a2605112d62c05468bfbb16c7aa8977a19ca3d10727d678cf682841",
-        "the crate's rustdoc text from `README.md`; `include_str!` yields a string literal, never tokens",
-    ),
-    allow(
-        "crates/scp-mcp/src/lib.rs",
-        "#![..]: include_str!(../README.md) reads no scanned file",
-        "a151153288c495fea8e3410191f3793344503b16358cd927fe1fa85070883163",
-        "the crate's rustdoc text from `README.md`; `include_str!` yields a string literal, never tokens",
-    ),
-    allow(
-        "crates/scp-media/src/lib.rs",
-        "#![..]: include_str!(../README.md) reads no scanned file",
-        "6f152a16d2fbc3770865b9409ec11da56984d3f9b2c5f79d0394a16afd6e4ad2",
-        "the crate's rustdoc text from `README.md`; `include_str!` yields a string literal, never tokens",
-    ),
-    allow(
-        "crates/scp-node/src/lib.rs",
-        "#![..]: include_str!(../README.md) reads no scanned file",
-        "e6e68e8c9b4e559dd4ae0a606852363725b8124750dda3550baab0bfa3129d86",
-        "the crate's rustdoc text from `README.md`; `include_str!` yields a string literal, never tokens",
-    ),
-    allow(
-        "crates/scp-node/src/self_host.rs",
-        "const EMBEDDED_INDEX_HTML: include_str!(../assets/selfhost/index.html) reads no scanned file",
-        "6db4a070444a2f8927fa6467024a11a5a531f41bad9edcf238b1ac969516576f",
-        "a self-hosted page asset served as bytes; `include_str!` yields a string literal, never tokens",
-    ),
-    allow(
-        "crates/scp-node/src/self_host.rs",
-        "const EMBEDDED_STYLE_CSS: include_str!(../assets/selfhost/style.css) reads no scanned file",
-        "6fc3cc95695d78ec3d393181bde47728e2883d195fc9a8479706e6621e3c1bc1",
-        "a self-hosted page asset served as bytes; `include_str!` yields a string literal, never tokens",
-    ),
-    allow(
-        "crates/scp-node/src/self_host.rs",
-        "const EMBEDDED_APP_JS: include_str!(../assets/selfhost/app.js) reads no scanned file",
-        "0a0bc1914b1a87e4165512499d072ca1cbed040c60a529530e4cc861d17c552c",
-        "a self-hosted page asset served as bytes; `include_str!` yields a string literal, never tokens",
-    ),
-    allow(
-        "crates/scp-platform/src/lib.rs",
-        "#![..]: include_str!(../README.md) reads no scanned file",
-        "d26f1b45b033f8f8685aa1932f2b66c7443e4e49e0613a11705ad1e25f726d8a",
-        "the crate's rustdoc text from `README.md`; `include_str!` yields a string literal, never tokens",
-    ),
-    allow(
-        "crates/scp-relay/src/main.rs",
-        "#![..]: include_str!(../README.md) reads no scanned file",
-        "9bf53b799220d705b1a09e6343667ad8c530c9f2f8a90cb25a5229d1df4cac2b",
-        "the crate's rustdoc text from `README.md`; `include_str!` yields a string literal, never tokens",
-    ),
-    allow(
-        "crates/scp-runtime/src/lib.rs",
-        "#![..]: include_str!(../README.md) reads no scanned file",
-        "6f02601a3552a129290a14d9bb9068dc2d83bec9570210a75afed9aeafa2ced7",
-        "the crate's rustdoc text from `README.md`; `include_str!` yields a string literal, never tokens",
-    ),
-    allow(
-        "crates/scp-transport/src/lib.rs",
-        "#![..]: include_str!(../README.md) reads no scanned file",
-        "b5b271c213c6abd07fb29d6e2647f6e0e18028ee415aea3931e0de1699148e84",
-        "the crate's rustdoc text from `README.md`; `include_str!` yields a string literal, never tokens",
     ),
 ];
 
@@ -746,16 +645,14 @@ fn test_only_files(files: &[(String, syn::File)], loads: &[Load]) -> BTreeSet<St
     }
 }
 
-/// Every `include!` or `include_str!` in `tokens`, with its argument when that
+/// Every `include!` (code inclusion) in `tokens`, with its argument when that
 /// is one string literal.
 fn includes(tokens: TokenStream, out: &mut Vec<(String, Option<String>)>) {
     let tokens: Vec<TokenTree> = tokens.into_iter().collect();
     for (i, t) in tokens.iter().enumerate() {
         match t {
             TokenTree::Group(g) => includes(g.stream(), out),
-            TokenTree::Ident(id)
-                if matches!(ident_name(id).as_str(), "include" | "include_str") =>
-            {
+            TokenTree::Ident(id) if ident_name(id) == "include" => {
                 if let (Some(TokenTree::Punct(bang)), Some(TokenTree::Group(args))) =
                     (tokens.get(i + 1), tokens.get(i + 2))
                     && bang.as_char() == '!'
@@ -1036,7 +933,13 @@ const FIXTURES: &[(&str, usize)] = &[
     // `use .. as _` binds no name, so `_` elsewhere is no mention.
     ("use scp_did::KeyState as _; pub fn f() { let _ = 1; }", 1),
     // A file the scan cannot read is a hole, whatever it holds.
-    ("pub fn f() -> &'static str { include_str!(\"k.json\") }", 1),
+    // `include_str!` and `include_bytes!` yield a literal, never tokens.
+    ("pub fn f() -> &'static str { include_str!(\"x.rs\") }", 0),
+    (
+        "pub fn f() -> &'static [u8] { include_bytes!(\"x.rs\") }",
+        0,
+    ),
+    ("pub fn f() { include!(\"../x.rs\"); }", 1),
     ("include!(\"gen.rs\");", 1),
     (
         "pub fn f() { include!(concat!(env!(\"OUT_DIR\"), \"/k.rs\")); }",
