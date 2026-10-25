@@ -82,7 +82,7 @@ use super::push::{
     SendDeferral, compact_jws_bytes, read_bounded, transport_error_kind,
 };
 use super::push_endpoint::{
-    CheckedResolver, EndpointError, Nat64Prefixes, OwnAddresses, parse_endpoint,
+    CheckedResolver, EndpointError, Nat64Prefixes, OwnAddresses, ParsedEndpoint, parse_endpoint,
 };
 use crate::backoff::ReconnectBackoff;
 
@@ -553,6 +553,22 @@ impl WebPushSender {
         self.vapid_key.public_key()
     }
 
+    /// The VAPID public key as the relay publishes it in
+    /// `relay_config.webpush_vapid_key` (spec 10 §10.7.1): the base64url,
+    /// unpadded form of the 65-byte uncompressed point, 87 characters.
+    #[must_use]
+    pub fn vapid_k(&self) -> &str {
+        &self.vapid_k
+    }
+
+    /// The relay's own-address handle this sender's endpoint checks read.
+    /// Relay startup keeps it current with
+    /// [`track_own_addresses`](super::push_endpoint::track_own_addresses).
+    #[must_use]
+    pub fn own_addresses(&self) -> OwnAddresses {
+        self.resolver.own_addresses()
+    }
+
     /// The registration-time ADR-004 check of `endpoint` (PUSH-022): its URL
     /// rules, then its IP literal or every address its host resolves to.
     ///
@@ -603,23 +619,41 @@ impl WebPushSender {
         self.resolver.exhaust_permits()
     }
 
+    /// Parses `subscription`'s endpoint and checks an IP-literal host, or
+    /// returns the attempt that ends the send before any request.
+    ///
+    /// Only a refusal counts toward removal. An unresolved own-address set
+    /// says nothing about the endpoint, so that wake is not sent and counts
+    /// as transient.
+    fn checked_endpoint(
+        &self,
+        subscription: &WebPushSubscription,
+    ) -> Result<ParsedEndpoint, SendAttempt> {
+        let parsed = parse_endpoint(subscription.endpoint()).map_err(|error| {
+            tracing::debug!(platform = "webpush", %error, "endpoint refused before sending");
+            SendAttempt::Sent(PushSendOutcome::InvalidToken)
+        })?;
+        if let Err(error) = self.resolver.check_literal(&parsed) {
+            if error.is_refusal() {
+                tracing::debug!(platform = "webpush", %error, "endpoint refused before sending");
+                return Err(SendAttempt::Sent(PushSendOutcome::InvalidToken));
+            }
+            tracing::debug!(platform = "webpush", %error, "endpoint not checked; wake not sent");
+            return Err(SendAttempt::Sent(PushSendOutcome::Transient));
+        }
+        Ok(parsed)
+    }
+
     /// Sends one wake signal to `subscription`, or defers it without
     /// sending: [`SendDeferral::BackingOff`] at once while the endpoint's
     /// origin is backing off, and [`SendDeferral::LookupPoolFull`] when the
     /// relay's endpoint lookup pool is full. A deferred send records no
     /// back-off step. It never waits out a back-off.
     pub async fn send(&self, subscription: &WebPushSubscription) -> SendAttempt {
-        let parsed = match parse_endpoint(subscription.endpoint()) {
+        let parsed = match self.checked_endpoint(subscription) {
             Ok(parsed) => parsed,
-            Err(error) => {
-                tracing::debug!(platform = "webpush", %error, "endpoint refused before sending");
-                return SendAttempt::Sent(PushSendOutcome::InvalidToken);
-            }
+            Err(ended) => return ended,
         };
-        if let Err(error) = self.resolver.check_literal(&parsed) {
-            tracing::debug!(platform = "webpush", %error, "endpoint refused before sending");
-            return SendAttempt::Sent(PushSendOutcome::InvalidToken);
-        }
         let aud = parsed.aud();
         // The dispatcher holds a wake for an origin in back-off; this check
         // covers a back-off that began after it looked.
@@ -1329,6 +1363,63 @@ pub(crate) mod tests {
             Some(EndpointError::Refused(_))
         ));
         assert!(server.requests().await.is_empty());
+        Ok(())
+    }
+
+    /// PUSH-023 criterion 7: an endpoint naming one of the relay's own
+    /// addresses, as a literal or through its host name, gets no request,
+    /// and the sender reads the set its [`OwnAddresses`] handle holds at the
+    /// moment of the send. While the set is unresolved the sender sends
+    /// nothing and counts the wake as transient. A second sender with no own
+    /// address delivers to the same endpoints, so the refusal comes from the
+    /// own-address rule alone.
+    #[tokio::test]
+    async fn endpoint_at_an_own_address_gets_no_request() -> TestResult {
+        use super::super::push_endpoint::OwnAddressSet;
+
+        let server = TlsTestServer::start_routed(vec![("/", vec![Reply::empty(201); 2])]).await;
+        let port = port_of(&server.endpoint("push.example.net", "/"))?;
+        let endpoints = [
+            server.endpoint("push.example.net", PATH),
+            format!("https://127.0.0.1:{port}{PATH}"),
+        ];
+        let sender = sender_for(&server, true, clock())?;
+        let own = sender.own_addresses();
+        own.replace(Some(OwnAddressSet::new([IpAddr::V4(Ipv4Addr::LOCALHOST)])));
+        for (i, endpoint) in endpoints.iter().enumerate() {
+            let (_, subscription) = subscribe(endpoint.clone())?;
+            assert_eq!(
+                sender.send(&subscription).await,
+                SendAttempt::Sent(PushSendOutcome::InvalidToken),
+                "endpoint #{i}"
+            );
+        }
+        own.replace(None);
+        for (i, endpoint) in endpoints.iter().enumerate() {
+            let (_, subscription) = subscribe(endpoint.clone())?;
+            assert_eq!(
+                sender.send(&subscription).await,
+                SendAttempt::Sent(PushSendOutcome::Transient),
+                "endpoint #{i} while unresolved"
+            );
+        }
+        assert!(server.requests().await.is_empty());
+
+        // The control: with no own address the host name is delivered. The
+        // test certificate names host names only, so the literal fails TLS
+        // and is transient, but the address rule does not refuse it.
+        let control = sender_for(&server, true, clock())?;
+        let (_, subscription) = subscribe(endpoints[0].clone())?;
+        assert_eq!(
+            control.send(&subscription).await,
+            SendAttempt::Sent(PushSendOutcome::Delivered)
+        );
+        let (_, subscription) = subscribe(endpoints[1].clone())?;
+        assert_eq!(
+            control.send(&subscription).await,
+            SendAttempt::Sent(PushSendOutcome::Transient)
+        );
+        assert_eq!(server.requests().await.len(), 1);
         Ok(())
     }
 

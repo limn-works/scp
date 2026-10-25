@@ -152,6 +152,14 @@ pub struct RelayConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transports: Option<Vec<String>>,
 
+    /// The relay's VAPID public key (RFC 8292 §3.2): the base64url encoding,
+    /// without padding, of the 65-byte uncompressed P-256 point, 87
+    /// characters. A relay that sends `WebPush` wakes publishes it; an absent
+    /// field means the relay sends none and rejects a `WebPush` registration
+    /// with `4061` (§18.3.3, ADR-004 **VAPID key publication**).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webpush_vapid_key: Option<String>,
+
     /// Relay economic configuration (section 19.8). Optional. Absence = free
     /// relay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -531,6 +539,7 @@ mod tests {
                 rate_limit_publish: Some(100),
                 rate_limit_subscribe: Some(50),
                 transports: Some(vec!["websocket".to_owned(), "quic".to_owned()]),
+                webpush_vapid_key: None,
                 economic: None,
             }),
             handles: Some(handles),
@@ -740,6 +749,7 @@ mod tests {
             rate_limit_publish: None,
             rate_limit_subscribe: None,
             transports: None,
+            webpush_vapid_key: None,
             economic: None,
         };
         let json = serde_json::to_value(&config).expect("serialization failed");
@@ -749,6 +759,29 @@ mod tests {
         assert!(json.get("rate_limit_publish").is_none());
         assert!(json.get("rate_limit_subscribe").is_none());
         assert!(json.get("transports").is_none());
+        assert!(json.get("webpush_vapid_key").is_none());
+    }
+
+    /// §18.3.3: `webpush_vapid_key` serializes under that name when set and
+    /// reads back; a document without it reads as `None`.
+    #[test]
+    fn webpush_vapid_key_round_trips() {
+        let key = "B".repeat(87);
+        let config = RelayConfig {
+            max_blob_size: None,
+            rate_limit_publish: None,
+            rate_limit_subscribe: None,
+            transports: None,
+            webpush_vapid_key: Some(key.clone()),
+            economic: None,
+        };
+        let json = serde_json::to_value(&config).expect("serialization failed");
+        assert_eq!(json["webpush_vapid_key"], key.as_str());
+        let back: RelayConfig = serde_json::from_value(json).expect("deserialization failed");
+        assert_eq!(back, config);
+        let absent: RelayConfig =
+            serde_json::from_str(r#"{"max_blob_size":1}"#).expect("deserialization failed");
+        assert_eq!(absent.webpush_vapid_key, None);
     }
 
     #[test]
@@ -763,6 +796,7 @@ mod tests {
                 "webtransport".to_owned(),
                 "udp-dtls".to_owned(),
             ]),
+            webpush_vapid_key: None,
             economic: None,
         };
         let json = serde_json::to_value(&config).expect("serialization failed");

@@ -150,6 +150,12 @@ pub async fn build_well_known_scp(state: &NodeState) -> WellKnownScp {
             u32::try_from(rc.max_subscriptions_per_connection).unwrap_or(u32::MAX),
         ),
         transports: Some(advertised_transports(quic_listening(state))),
+        // ADR-004 VAPID key publication: the running sender's key, so the
+        // published key and the key that signs every wake are one value.
+        webpush_vapid_key: rc
+            .push
+            .webpush_sender()
+            .map(|sender| sender.vapid_k().to_owned()),
         economic: None,
     };
 

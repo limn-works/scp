@@ -296,7 +296,7 @@ impl PushServiceConfig {
 /// The push senders a relay wakes devices through, one field per platform,
 /// so two senders for one platform are unrepresentable.
 ///
-/// Both fields may be `None`; [`PushRole::start`] refuses that with
+/// Every field may be `None`; [`PushRole::start`] refuses that with
 /// [`PushRoleError::NoSender`]. `Debug` prints no credential: each sender's
 /// own `Debug` omits its key, its JWT or access token, and every device token.
 #[cfg(feature = "push-store")]
@@ -308,6 +308,11 @@ pub struct PushSenders {
     /// The FCM sender (PUSH-011), or `None` when the relay does not wake FCM
     /// devices.
     pub fcm: Option<super::push_fcm::FcmSender>,
+    /// The `WebPush` sender (PUSH-022), or `None` when the relay does not wake
+    /// browsers. Only a relay that publishes the sender's VAPID key in a
+    /// `.well-known/scp` document may set it (ADR-004 **VAPID key
+    /// publication**); relay-only startup has no route that builds one.
+    pub webpush: Option<super::push_webpush::WebPushSender>,
 }
 
 /// What a caller provides to enable push on a relay (PUSH-012): the
@@ -354,12 +359,13 @@ impl PushRole {
     pub fn start(providers: PushProviders) -> Result<Self, PushRoleError> {
         let PushProviders {
             store,
-            senders: PushSenders { apns, fcm },
+            senders: PushSenders { apns, fcm, webpush },
         } = providers;
         let senders: Vec<PushSender> = apns
             .map(PushSender::Apns)
             .into_iter()
             .chain(fcm.map(PushSender::Fcm))
+            .chain(webpush.map(PushSender::WebPush))
             .collect();
         if senders.is_empty() {
             return Err(PushRoleError::NoSender);
@@ -373,6 +379,20 @@ impl PushRole {
         })
         .map_err(|_| PushRoleError::NoRuntime)?;
         Ok(Self::Enabled(service))
+    }
+
+    /// The running `WebPush` sender, whose VAPID public key the relay
+    /// publishes (ADR-004 **VAPID key publication**), or `None` when the role
+    /// wakes no browser.
+    #[must_use]
+    pub fn webpush_sender(&self) -> Option<&super::push_webpush::WebPushSender> {
+        match self {
+            Self::Disabled => None,
+            Self::Enabled(service) => match service.config().sender_for(PushPlatform::WebPush)? {
+                PushSender::WebPush(sender) => Some(sender),
+                _ => None,
+            },
+        }
     }
 }
 
@@ -460,6 +480,24 @@ struct UrlState {
 #[derive(Debug, Clone)]
 pub struct LiveRelayUrl(Arc<watch::Sender<UrlState>>);
 
+/// A watcher of one [`LiveRelayUrl`]'s current set, from
+/// [`LiveRelayUrl::subscribe`].
+pub(crate) struct RelayUrlChanges(watch::Receiver<UrlState>);
+
+impl RelayUrlChanges {
+    /// The current set, which [`changed`](Self::changed) then counts as seen.
+    pub(crate) fn current(&mut self) -> ReservedRelayUrls {
+        self.0.borrow_and_update().current.clone()
+    }
+
+    /// Completes when the current set changes after the last
+    /// [`current`](Self::current) read, with `true`, or with `false` once
+    /// every [`LiveRelayUrl`] clone is gone.
+    pub(crate) async fn changed(&mut self) -> bool {
+        self.0.changed().await.is_ok()
+    }
+}
+
 /// Where a PUBLISH routing ID falls against the relay's URL history.
 enum Reservation {
     /// The reserved routing ID of a current entry with no `bridgeTarget`,
@@ -497,6 +535,13 @@ impl LiveRelayUrl {
     #[must_use]
     pub fn current(&self) -> ReservedRelayUrls {
         self.0.borrow().current.clone()
+    }
+
+    /// A watcher that sees each later [`set`](Self::set) that changed the
+    /// current set. It does not keep the handle's set alive: once every
+    /// handle clone is gone, [`RelayUrlChanges::changed`] returns `false`.
+    pub(crate) fn subscribe(&self) -> RelayUrlChanges {
+        RelayUrlChanges(self.0.subscribe())
     }
 
     /// Whether `routing_id` is the push routing ID of a current entry or of
@@ -854,9 +899,10 @@ fn webpush_endpoint(token: &[u8]) -> Result<String, PushPublishGate> {
 
 /// The registration-time ADR-004 address check of `endpoint`, through the
 /// configured `WebPush` sender's resolver: `4060` when an address is refused
-/// or the lookup fails, and `5000` when the relay's own lookup pool is full,
-/// which says nothing about the endpoint and which the registrant retries
-/// (ADR-004, every `5xxx` code).
+/// or the lookup fails, and `5000` when the relay's own lookup pool is full
+/// or its own addresses are unresolved, neither of which says anything about
+/// the endpoint and both of which the registrant retries (ADR-004, every
+/// `5xxx` code).
 #[cfg(feature = "push-store")]
 async fn check_webpush_addresses(
     service: &PushServiceConfig,
@@ -867,7 +913,7 @@ async fn check_webpush_addresses(
             .check_registration_endpoint(endpoint)
             .await
             .map_err(|e| match e {
-                EndpointError::LookupPoolFull => {
+                EndpointError::LookupPoolFull | EndpointError::OwnAddressesUnresolved => {
                     PushPublishGate::rejected(code::INTERNAL_ERROR, e.to_string())
                 }
                 _ => PushPublishGate::rejected(
@@ -1011,6 +1057,7 @@ mod tests {
             senders: PushSenders {
                 apns: None,
                 fcm: None,
+                webpush: None,
             },
         });
         assert!(
@@ -1023,6 +1070,7 @@ mod tests {
             senders: PushSenders {
                 apns: Some(apns_sender()),
                 fcm: None,
+                webpush: None,
             },
         })
         .unwrap();
@@ -1056,6 +1104,7 @@ mod tests {
             senders: PushSenders {
                 apns: Some(apns_sender()),
                 fcm: None,
+                webpush: None,
             },
         });
         assert!(
@@ -1815,6 +1864,71 @@ mod tests {
             );
             assert_eq!(stored, None);
             drop(held);
+            let (gate, stored) = present(&service, &blob, &token).await?;
+            assert!(matches!(gate, PushPublishGate::Accepted), "{gate:?}");
+            assert_eq!(stored, Some(GATE_NOW));
+            Ok(())
+        }
+
+        /// PUSH-023 criterion 5: a relay started without `webpush`, here one
+        /// whose only sender is APNs, answers a well-formed, correctly
+        /// signed `WebPush` registration with `4061` and stores nothing, and
+        /// its role names no `WebPush` sender whose key could be published.
+        #[tokio::test]
+        async fn relay_without_webpush_answers_4061() -> TestResult {
+            use super::super::{PushProviders, PushRole, PushSenders};
+
+            let dir = tempfile::tempdir()?;
+            let role = PushRole::start(PushProviders {
+                store: PushRegistrationStore::open_sqlite(
+                    &dir.path().join("push.db"),
+                    crate::relay::push_store::PushStoreAtRest::Unkeyed,
+                )?,
+                senders: PushSenders {
+                    apns: Some(super::apns_sender()),
+                    fcm: None,
+                    webpush: None,
+                },
+            })?;
+            assert!(role.webpush_sender().is_none());
+            let PushRole::Enabled(service) = &role else {
+                return Err("the role is disabled".into());
+            };
+            let (_, subscription) = subscribe("https://push.example.net/s/1".to_owned())?;
+            let token = subscription.encode();
+            let blob = signed(false, &token, GATE_NOW, false)?;
+            let (gate, stored) = present(service, &blob, &token).await?;
+            assert!(
+                matches!(gate, PushPublishGate::Rejected { code: 4061, .. }),
+                "{gate:?}"
+            );
+            assert_eq!(stored, None);
+            Ok(())
+        }
+
+        /// A registration that arrives while the relay's own addresses are
+        /// unresolved is `5000`, not the `4060` refusal of its endpoint, and
+        /// nothing is stored; once the set resolves, the same registration is
+        /// accepted.
+        #[tokio::test]
+        async fn unresolved_own_addresses_are_5000_not_a_refusal() -> TestResult {
+            let dir = tempfile::tempdir()?;
+            let (service, server) = relay(dir.path(), true).await?;
+            let (_, good) = subscribe(server.endpoint("push.example.net", "/s/1"))?;
+            let token = good.encode();
+            let blob = signed(false, &token, GATE_NOW, false)?;
+            let Some(PushSender::WebPush(sender)) = service.config().senders.first() else {
+                return Err("the service has no WebPush sender".into());
+            };
+            let own = sender.own_addresses();
+            own.replace(None);
+            let (gate, stored) = present(&service, &blob, &token).await?;
+            assert!(
+                matches!(gate, PushPublishGate::Rejected { code: 5000, .. }),
+                "{gate:?}"
+            );
+            assert_eq!(stored, None);
+            own.replace(Some(crate::relay::push_endpoint::OwnAddressSet::new([])));
             let (gate, stored) = present(&service, &blob, &token).await?;
             assert!(matches!(gate, PushPublishGate::Accepted), "{gate:?}");
             assert_eq!(stored, Some(GATE_NOW));

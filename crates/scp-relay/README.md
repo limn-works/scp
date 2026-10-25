@@ -6,7 +6,7 @@ Minimal, untrusted relay that routes encrypted messages between SCP participants
 
 ## Push wake signals
 
-The relay can wake a registered mobile device through APNs or FCM when a message arrives for it (spec §10.7.1). The operator names the platforms in `SCP_RELAY_PUSH_PLATFORMS`, which has no default: `none`, `apns`, `fcm` or `apns,fcm`. An unset or empty value exits 1 (SCP-CAPSEL-8000).
+The relay can wake a registered mobile device through APNs or FCM when a message arrives for it (spec §10.7.1). The operator names the platforms in `SCP_RELAY_PUSH_PLATFORMS`, which has no default: `none`, `apns`, `fcm` or `apns,fcm`. An unset or empty value exits 1 (SCP-CAPSEL-8000). A list that names `webpush` exits 1 (SCP-CAPSEL-8001): a browser reads a relay's VAPID key from its `/.well-known/scp` document, which `scp-relay` does not serve, so only an `scp-node` full node with a domain offers `WebPush`.
 
 The relay also requires `SCP_RELAY_URL`, its public WebSocket URL, which has no default. The relay derives its reserved push routing ID from that URL (spec §10.7.1), so set it to the URL clients connect to. An unset or empty value exits 1.
 

@@ -319,6 +319,46 @@ fn start_push_slot(slot: PushSlot) -> Result<PushRole, NodeError> {
     }
 }
 
+/// Refuses a `WebPush` sender on a build path that serves no
+/// `.well-known/scp` document: the no-domain reaches and a domain whose TLS
+/// provisioning failed (spec 10 §10.12). A browser reads the VAPID key only
+/// from that document, so such a node could never be sent a `WebPush`
+/// registration it can serve (ADR-004 **VAPID key publication**).
+///
+/// # Errors
+///
+/// [`NodeError::WebPushWithoutWellKnown`] when `push` runs a `WebPush` sender.
+fn refuse_webpush_without_well_known(push: &PushRole) -> Result<(), NodeError> {
+    if push.webpush_sender().is_some() {
+        return Err(NodeError::WebPushWithoutWellKnown);
+    }
+    Ok(())
+}
+
+/// Starts tracking the `WebPush` sender's own addresses when `push` runs one:
+/// the hosts of every URL in `relay_url` and each non-wildcard bind in `binds`
+/// (ADR-004 **Endpoint refusal**).
+///
+/// # Errors
+///
+/// [`NodeError::OwnAddresses`] when a relay host does not resolve now.
+async fn track_webpush_own_addresses(
+    push: &PushRole,
+    relay_url: &LiveRelayUrl,
+    binds: &[SocketAddr],
+) -> Result<Option<scp_transport::relay::push_endpoint::OwnAddressTracker>, NodeError> {
+    let Some(sender) = push.webpush_sender() else {
+        return Ok(None);
+    };
+    let tracker = scp_transport::relay::push_endpoint::track_own_addresses(
+        &sender.own_addresses(),
+        relay_url,
+        binds,
+    )
+    .await?;
+    Ok(Some(tracker))
+}
+
 // ---------------------------------------------------------------------------
 // NodeConfig — the one flat config object (ADR-052 §AC-3)
 // ---------------------------------------------------------------------------
@@ -1033,6 +1073,12 @@ where
         push,
         ..RelayConfig::defaults(LiveRelayUrl::new(relay_url))
     };
+    // The WebPush sender's own addresses resolve before the relay listens, so
+    // a relay host that does not resolve fails the start with no listener
+    // open. Until then the set is unresolved and refuses every endpoint.
+    let binds: Vec<SocketAddr> = std::iter::once(bind_addr).chain(http_bind_addr).collect();
+    let own_addresses =
+        track_webpush_own_addresses(&relay_config.push, &relay_config.relay_url, &binds).await?;
 
     // The caller's explicit blob-backend selection, threaded verbatim — never
     // defaulted or fallen-back (SCP-CAPINJECT-010 / SCP-CAPSEL-8002).
@@ -1099,6 +1145,7 @@ where
                 acme_challenges,
                 #[cfg(feature = "http3")]
                 http3,
+                own_addresses,
             )
             .await
         }
@@ -1107,6 +1154,9 @@ where
                 domain = %domain, error = %tls_err,
                 "TLS provisioning failed, falling through to NAT-traversed mode (§10.12.8)"
             );
+            // A NAT-traversed node serves no `.well-known/scp`, so it cannot
+            // publish the VAPID key; the relay guard shuts the relay down.
+            refuse_webpush_without_well_known(&relay_config.push)?;
             let strategy = resolve_nat_slot(nat);
             build_no_domain_inner(
                 identity,
@@ -1172,6 +1222,9 @@ where
     D: DidMethod + 'static,
     S: Storage + 'static,
 {
+    // A no-domain node serves no `.well-known/scp`, so it cannot publish a
+    // VAPID key; refuse before any listener binds.
+    refuse_webpush_without_well_known(&push)?;
     // 3. Start relay server.
     let bind_addr = bind_addr.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 0)));
     let bridge_secret = generate_bridge_secret();
@@ -1861,7 +1914,11 @@ mod tests {
         .unwrap();
         PushSlot::Enabled(Box::new(PushProviders {
             store,
-            senders: scp_transport::relay::push_gate::PushSenders { apns, fcm: None },
+            senders: scp_transport::relay::push_gate::PushSenders {
+                apns,
+                fcm: None,
+                webpush: None,
+            },
         }))
     }
 

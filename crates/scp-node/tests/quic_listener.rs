@@ -143,6 +143,7 @@ fn enabled_push(dir: &std::path::Path) -> scp_node::PushSlot {
         senders: PushSenders {
             apns: Some(apns),
             fcm: None,
+            webpush: None,
         },
     }))
 }

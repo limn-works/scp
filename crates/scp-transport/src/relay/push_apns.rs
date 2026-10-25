@@ -105,11 +105,12 @@ impl fmt::Debug for ApnsConfig {
     }
 }
 
-/// An APNs authentication key file (.p8) that could not be read as a P-256
-/// private key. No variant carries any byte of the file.
+/// A key file that could not be read as a P-256 private key in PKCS#8 PEM
+/// form: an APNs authentication key (.p8) or a `WebPush` VAPID key. No variant
+/// carries any byte of the file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
-pub enum ApnsKeyError {
+pub enum P256KeyError {
     /// The file is not UTF-8 text holding one `-----BEGIN PRIVATE KEY-----`
     /// block with a base64 body.
     #[error("the file holds no PEM `PRIVATE KEY` block")]
@@ -137,29 +138,33 @@ const P256_ALGORITHM_ID: &[u8] = &[
 /// The DER of the `prime256v1` OID, the optional `ECPrivateKey` parameters.
 const PRIME256V1_OID: &[u8] = &[0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
 
-/// Reads an APNs authentication key file's bytes (the .p8 file Apple issues:
-/// PEM around a PKCS#8 `PrivateKeyInfo`, RFC 5208, holding an RFC 5915
-/// `ECPrivateKey`) as a P-256 private key.
+/// Reads a P-256 private key from a PKCS#8 PEM file.
+///
+/// The file is PEM around a PKCS#8 `PrivateKeyInfo` (RFC 5208) holding an
+/// RFC 5915 `ECPrivateKey`. It is the one loader for every P-256 push key:
+/// the APNs authentication key (the .p8 file Apple issues) and the `WebPush`
+/// VAPID key (PUSH-023). A SEC1 `EC PRIVATE KEY` block is refused as
+/// [`P256KeyError::NotPem`].
 ///
 /// The DER and the scalar are held in zeroizing buffers. When the key embeds
 /// its public key, the public key must be the one the scalar derives.
 ///
 /// # Errors
 ///
-/// An [`ApnsKeyError`] naming what is wrong with the file.
-pub fn apns_key_from_p8(file: &[u8]) -> Result<P256SecretKey, ApnsKeyError> {
-    let pem = std::str::from_utf8(file).map_err(|_| ApnsKeyError::NotPem)?;
-    let der = super::push::pem_pkcs8_der(pem).ok_or(ApnsKeyError::NotPem)?;
+/// An [`P256KeyError`] naming what is wrong with the file.
+pub fn p256_key_from_pkcs8_pem(file: &[u8]) -> Result<P256SecretKey, P256KeyError> {
+    let pem = std::str::from_utf8(file).map_err(|_| P256KeyError::NotPem)?;
+    let der = super::push::pem_pkcs8_der(pem).ok_or(P256KeyError::NotPem)?;
     let (scalar, embedded_public) =
-        p256_scalar_from_pkcs8(&der).ok_or(ApnsKeyError::NotP256Pkcs8)?;
+        p256_scalar_from_pkcs8(&der).ok_or(P256KeyError::NotP256Pkcs8)?;
     let mut bytes = Zeroizing::new([0u8; 32]);
     bytes.copy_from_slice(scalar);
     let key =
-        P256SecretKey::from_scalar_bytes(&bytes).map_err(|_| ApnsKeyError::ScalarOutOfRange)?;
+        P256SecretKey::from_scalar_bytes(&bytes).map_err(|_| P256KeyError::ScalarOutOfRange)?;
     if let Some(public) = embedded_public
         && public != key.public_key().to_uncompressed().as_slice()
     {
-        return Err(ApnsKeyError::PublicKeyMismatch);
+        return Err(P256KeyError::PublicKeyMismatch);
     }
     Ok(key)
 }
@@ -281,6 +286,14 @@ impl ApnsSender {
     pub fn new(config: ApnsConfig) -> Result<Self, PushSenderError> {
         let origin = config.environment.origin().to_owned();
         Self::build(config, origin, Arc::new(SystemClock))
+    }
+
+    /// The public key of the sender's signing key, which relay startup
+    /// compares with the VAPID key so one key pair never serves both
+    /// (ADR-004 **VAPID key publication**).
+    #[must_use]
+    pub fn public_key(&self) -> scp_crypto::p256::P256PublicKey {
+        self.signing_key.public_key()
     }
 
     /// Builds the sender against `origin` with `clock`. [`Self::new`] passes
@@ -946,38 +959,38 @@ pub(crate) mod tests {
     #[test]
     fn p8_key_parses_to_the_key_ring_generated() {
         let (pem, ring_public) = generated_p8();
-        let key = apns_key_from_p8(pem.as_bytes()).unwrap();
+        let key = p256_key_from_pkcs8_pem(pem.as_bytes()).unwrap();
         assert_eq!(key.public_key().to_uncompressed().as_slice(), ring_public);
     }
 
     #[test]
     fn p8_key_without_embedded_public_key_parses() {
         let pem = pem_of(&minimal_pkcs8(&[7u8; 32]));
-        let key = apns_key_from_p8(pem.as_bytes()).unwrap();
+        let key = p256_key_from_pkcs8_pem(pem.as_bytes()).unwrap();
         assert_eq!(key.public_key(), test_key().public_key());
     }
 
     #[test]
     fn p8_key_errors_are_typed() {
         assert_eq!(
-            apns_key_from_p8(b"not a key").unwrap_err(),
-            ApnsKeyError::NotPem
+            p256_key_from_pkcs8_pem(b"not a key").unwrap_err(),
+            P256KeyError::NotPem
         );
         assert_eq!(
-            apns_key_from_p8(&[0xff, 0xfe]).unwrap_err(),
-            ApnsKeyError::NotPem
+            p256_key_from_pkcs8_pem(&[0xff, 0xfe]).unwrap_err(),
+            P256KeyError::NotPem
         );
         // A PEM block whose body is not a P-256 PKCS#8 key.
         assert_eq!(
-            apns_key_from_p8(pem_of(&[0x30, 0x00]).as_bytes()).unwrap_err(),
-            ApnsKeyError::NotP256Pkcs8
+            p256_key_from_pkcs8_pem(pem_of(&[0x30, 0x00]).as_bytes()).unwrap_err(),
+            P256KeyError::NotP256Pkcs8
         );
         // Trailing bytes after the PrivateKeyInfo.
         let mut trailing = minimal_pkcs8(&[7u8; 32]);
         trailing.push(0x00);
         assert_eq!(
-            apns_key_from_p8(pem_of(&trailing).as_bytes()).unwrap_err(),
-            ApnsKeyError::NotP256Pkcs8
+            p256_key_from_pkcs8_pem(pem_of(&trailing).as_bytes()).unwrap_err(),
+            P256KeyError::NotP256Pkcs8
         );
         // Another curve's OID in the AlgorithmIdentifier: the last byte of
         // prime256v1 changed.
@@ -985,12 +998,12 @@ pub(crate) mod tests {
         let at = 7 + P256_ALGORITHM_ID.len() - 1;
         other_curve[at] = 0x0a;
         assert_eq!(
-            apns_key_from_p8(pem_of(&other_curve).as_bytes()).unwrap_err(),
-            ApnsKeyError::NotP256Pkcs8
+            p256_key_from_pkcs8_pem(pem_of(&other_curve).as_bytes()).unwrap_err(),
+            P256KeyError::NotP256Pkcs8
         );
         assert_eq!(
-            apns_key_from_p8(pem_of(&minimal_pkcs8(&[0u8; 32])).as_bytes()).unwrap_err(),
-            ApnsKeyError::ScalarOutOfRange
+            p256_key_from_pkcs8_pem(pem_of(&minimal_pkcs8(&[0u8; 32])).as_bytes()).unwrap_err(),
+            P256KeyError::ScalarOutOfRange
         );
         // ring's key with its embedded public key swapped for another key's.
         let (pem, _) = generated_p8();
@@ -1000,8 +1013,8 @@ pub(crate) mod tests {
         let at = swapped.len() - 65;
         swapped[at..].copy_from_slice(&other_public);
         assert_eq!(
-            apns_key_from_p8(pem_of(&swapped).as_bytes()).unwrap_err(),
-            ApnsKeyError::PublicKeyMismatch
+            p256_key_from_pkcs8_pem(pem_of(&swapped).as_bytes()).unwrap_err(),
+            P256KeyError::PublicKeyMismatch
         );
     }
 }

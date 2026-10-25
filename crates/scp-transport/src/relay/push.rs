@@ -32,7 +32,7 @@ use scp_protocol::discovery::push::{PushPlatform, WebPushSubscription};
 use zeroize::Zeroizing;
 
 pub use super::push_apns::{
-    ApnsConfig, ApnsEnvironment, ApnsKeyError, ApnsSender, apns_key_from_p8,
+    ApnsConfig, ApnsEnvironment, ApnsSender, P256KeyError, p256_key_from_pkcs8_pem,
 };
 pub use super::push_fcm::{FcmConfig, FcmCredentialError, FcmSender, FcmServiceAccount};
 pub use super::push_webpush::{VapidSubject, WebPushConfig, WebPushSender};
