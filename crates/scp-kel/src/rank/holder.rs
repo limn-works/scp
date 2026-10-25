@@ -27,15 +27,6 @@ pub struct DisplacedSuffix {
     pub bytes: u64,
 }
 
-/// The summed unit lengths of `chain`'s events at and past `fork_position`
-/// (R9's byte bound).
-fn suffix_bytes(chain: &ValidatedChain, fork_position: u64) -> u64 {
-    chain
-        .events()
-        .filter(|event| event.sequence >= fork_position)
-        .fold(0_u64, |bytes, event| bytes.saturating_add(event.unit_len))
-}
-
 /// What holding one more chain did to the accepted chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HoldOutcome {
@@ -77,8 +68,10 @@ pub enum HoldOutcome {
 /// share, so a chain delivered frame by frame is one chain. "Held first" is
 /// the earliest-held chain among the chains no other chain beats.
 ///
-/// The holder bounds nothing it holds, so it stays crate-private until R9's
-/// count and byte bounds on the divergent suffixes land with it.
+/// The holder bounds nothing it holds: the divergent suffixes it displaces
+/// go to a [`RetentionSet`](super::RetentionSet), whose bounds R9 states.
+/// S5 (SCP-007 part) wires the validating store that composes the two, so
+/// the holder stays crate-private until then.
 #[derive(Debug, Clone, Default)]
 pub struct AcceptedChainHolder {
     /// The held chains in receipt order, none a prefix of another.
@@ -114,6 +107,10 @@ impl AcceptedChainHolder {
     }
 
     /// Holds `chain` and re-decides the accepted chain under R9.
+    ///
+    /// S5 (SCP-007 part) wires the validating store, which calls this after
+    /// every frame it accepts and admits each displaced suffix to its
+    /// [`RetentionSet`](super::RetentionSet).
     ///
     /// Each call compares `chain` with every held chain once and updates
     /// only the comparisons of the slot `chain` takes.
@@ -178,7 +175,7 @@ impl AcceptedChainHolder {
                         rank: divergence.ranks[0],
                         shared_prefix_head: divergence.shared_prefix_head,
                         fork_position: divergence.fork_position,
-                        bytes: suffix_bytes(displaced, divergence.fork_position),
+                        bytes: displaced.unit_bytes_from(divergence.fork_position),
                     },
                 }
             }

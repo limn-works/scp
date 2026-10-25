@@ -2,9 +2,10 @@
 //! (`09-security-model.md` §9.7.4.2 R6, R7, R9) over chains that fork from
 //! Vector 41, each suffix signed here.
 //!
-//! These tests sit in the crate because `AcceptedChainHolder` is
-//! crate-private until R9's retention bounds land with it. They compile the
-//! integration tests' spec 25 fixtures by path.
+//! These tests sit in the crate because `AcceptedChainHolder` stays
+//! crate-private until S5 (SCP-007 part) wires the validating store, and
+//! because the retention tests drive `RetentionSet` with bounds small enough
+//! to reach. They compile the integration tests' spec 25 fixtures by path.
 //!
 //! Every expected rank and resolution is the test's own model of R6, read
 //! from the kinds of the events a test built: a suffix ranks by its first
@@ -930,7 +931,7 @@ fn extension_keeps_the_held_copy_of_a_shared_event() -> TestResult {
     let accepted = holder.accepted().ok_or("an accepted chain")?;
     assert_eq!(accepted.head_digest(), extension.head);
     let shared = accepted.events().nth(1).ok_or("the shared event")?;
-    assert_eq!(shared.unit_len, u64::try_from(first.len())?);
+    assert_eq!(shared.unit, first.as_slice());
 
     let rollover = Branch::of(&mut keys, &[Kind::Reveal], 1)?;
     let HoldOutcome::AcceptedReplaced { displaced } = holder.hold(rollover.chain)? else {
@@ -973,3 +974,5 @@ fn chains_of_two_identifiers_are_refused() -> TestResult {
     assert_eq!(resolve_set(&[])?, SetResolution::Empty);
     Ok(())
 }
+
+mod retention;
