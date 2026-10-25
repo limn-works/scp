@@ -1289,6 +1289,11 @@ pub struct ResolutionOutcome {
     /// input.
     pub key_state: Option<ResolvedState>,
     pub sources: ResolutionSources,
+    /// The candidates this resolution could not retain under R9's bounds
+    /// (`09-security-model.md` §9.7.4.2 R9, the eviction rule). It equals
+    /// `Contested`'s `residue` where the verdict is `Contested`, and it
+    /// carries the count beside every other verdict.
+    pub residue: u32,
 }
 
 /// The key state a resolution accepted: the state replaying the validated
@@ -1307,7 +1312,9 @@ impl ResolvedState {
     pub fn key_state(&self) -> &KeyState;
     pub fn standing_commitment(&self) -> &StandingCommitment;
     /// False once `MAX_ATTESTATION_KEY_RESOLUTION_STALENESS`
-    /// (`09-security-model.md` §9.18.7) has passed since the resolution.
+    /// (`09-security-model.md` §9.18.7) has passed since the resolution, and
+    /// false where `now` precedes the resolution instant, because a clock
+    /// stepped backward would otherwise extend that bound.
     pub fn is_fresh(&self, now: SystemTime) -> bool;
 }
 
