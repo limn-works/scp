@@ -9206,9 +9206,12 @@ fn shutdown_releases_the_event_log_and_never_destroys_it() {
 /// artifact:
 /// - a `mod` block gated by such a `cfg`;
 /// - a file declared by such a gated `mod name;`;
-/// - a crate that every other workspace manifest reaches only through
-///   `[dev-dependencies]` or an optional dependency that only a `testing`
-///   feature enables.
+/// - a crate on [`TEST_ONLY_CRATES`], each of which every other workspace
+///   manifest reaches only through `[dev-dependencies]` or an optional
+///   dependency that only a `testing` feature enables.
+///
+/// Every other crate is shipped, including one that no manifest names: the
+/// bridges and the relay ship as libraries and binaries of their own.
 #[test]
 fn no_shipped_source_builds_an_event_log_without_a_store() {
     let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -9238,13 +9241,41 @@ fn no_shipped_source_builds_an_event_log_without_a_store() {
         .collect();
 
     let mut files = Vec::new();
+    let mut scanned = std::collections::BTreeSet::new();
+    let mut test_only = std::collections::BTreeSet::new();
     for (dir, manifest) in crate_dirs.iter().zip(&manifests) {
         let name = manifest_package_name(manifest).expect("a manifest names its package");
-        let others = manifests.iter().filter(|m| !std::ptr::eq(*m, manifest));
-        if reached_only_by_tests(&name, others) {
+        if TEST_ONLY_CRATES.contains(&name.as_str()) {
+            let others = manifests.iter().filter(|m| !std::ptr::eq(*m, manifest));
+            assert!(
+                reached_only_by_tests(&name, others),
+                "{name} is listed as test-only, but a manifest ships it"
+            );
+            test_only.insert(name);
             continue;
         }
         collect_rust_files(&dir.join("src"), &mut files);
+        scanned.insert(name);
+    }
+    assert_eq!(
+        test_only,
+        TEST_ONLY_CRATES
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect(),
+        "every test-only crate names a workspace crate"
+    );
+    for shipped in [
+        "scp-ffi",
+        "scp-ffi-napi",
+        "scp-ffi-uniffi",
+        "scp-relay",
+        "scp-client-wasm",
+    ] {
+        assert!(
+            scanned.contains(shipped),
+            "the scan must cover {shipped}: {scanned:?}"
+        );
     }
     assert!(
         files.len() > 100,
@@ -9281,6 +9312,10 @@ fn no_shipped_source_builds_an_event_log_without_a_store() {
         "shipped sources build an event log with no store: {offenders:#?}"
     );
 }
+
+/// The workspace crates the store-free scan skips: each is reached only by
+/// tests, which the scan asserts.
+const TEST_ONLY_CRATES: &[&str] = &["scp-testing", "scp-relay-mock", "scp-ffi-napi-test-stubs"];
 
 /// The scan's own rules: a call in shipped code is reported, and the same
 /// call inside a test-gated module is not.
