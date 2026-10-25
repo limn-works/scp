@@ -25,6 +25,7 @@ use scp_platform::{KeyCustody, KeyHandle, PlatformError, Storage};
 use crate::callback_custody::{CustodyLoadError, CustodyRecords};
 use crate::custody_namespace::{CustodyNamespace, CustodyNamespaces};
 use crate::error_codes;
+use crate::identity_update::IdentityUpdateGuard;
 
 /// Why a callback custody identity could not be created or loaded.
 #[derive(Debug)]
@@ -274,11 +275,14 @@ where
 /// The operations are rotation of the active or agent key, an agent key's
 /// addition or removal, a device attestation, and a migration. The entry keeps `namespace` and takes `identity`
 /// and `document`, under `identity`'s DID; when the operation moved the
-/// identity to a new DID, the entry under `previous_did` is removed after the
-/// new one is written, so a load of the retired DID finds no entry.
+/// identity to a new DID, the entry under the DID `update` holds is removed
+/// after the new one is written, so a load of the retired DID finds no entry.
 ///
 /// Every bridge runs this before it installs the change in its registry, so
-/// a restart loads the identity as it was after the change.
+/// a restart loads the identity as it was after the change. `update` is the
+/// operation's hold on its DID ([`crate::identity_update`]), so no other
+/// update of the identity reads, publishes or rewrites until this one
+/// installs.
 ///
 /// `storage` is `None` when the instance storage stopped persisting.
 ///
@@ -291,11 +295,12 @@ where
 pub async fn rewrite_entry<S: Storage + ?Sized>(
     storage: Option<&S>,
     namespace: [u8; 16],
-    previous_did: &str,
+    update: &IdentityUpdateGuard,
     identity: &ScpIdentity,
     document: &DidDocument,
 ) -> Result<(), CallbackIdentityError> {
     let storage = storage.ok_or(CallbackIdentityError::NotPersistent)?;
+    let previous_did = update.did();
     let retired = if previous_did == identity.did {
         None
     } else {
@@ -428,6 +433,7 @@ mod tests {
     use scp_platform::testing::{InMemoryKeyCustody, InMemoryPreRotationCustody};
 
     use super::*;
+    use crate::identity_update::IdentityUpdates;
 
     async fn minted(custody: &InMemoryKeyCustody) -> (ScpIdentity, DidDocument) {
         let (identity, document, _) =
@@ -556,10 +562,12 @@ mod tests {
         changed_document
             .also_known_as
             .push("did:dht:changed".to_owned());
+        let updates = IdentityUpdates::new();
+        let update = updates.lock(&identity.did).await.unwrap();
         rewrite_entry(
             Some(storage.as_ref()),
             [3; 16],
-            &identity.did,
+            &update,
             &changed,
             &changed_document,
         )
@@ -580,7 +588,7 @@ mod tests {
         rewrite_entry(
             Some(storage.as_ref()),
             [3; 16],
-            &identity.did,
+            &update,
             &moved,
             &moved_document,
         )
@@ -595,10 +603,13 @@ mod tests {
             .unwrap();
         assert_eq!(loaded.document, moved_document);
 
+        drop(update);
+        let update = updates.lock(&moved.did).await.unwrap();
         let absent =
-            rewrite_entry::<InMemoryStorage>(None, [3; 16], &moved.did, &moved, &moved_document)
+            rewrite_entry::<InMemoryStorage>(None, [3; 16], &update, &moved, &moved_document)
                 .await
                 .unwrap_err();
+        drop(update);
         assert!(absent.is_storage_selection());
     }
 

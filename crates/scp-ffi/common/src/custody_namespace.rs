@@ -8,16 +8,18 @@
 //! other's record. [`CustodyNamespaces::open`] is the only way to build a
 //! store, and it refuses a namespace a live store of the same storage holds.
 //!
-//! The table's constructor is private to this crate, and the bridge
-//! instance ([`crate::bridge_instance::CoreFields::custody_namespaces`]) holds
-//! the one table of its storage, so code outside the bridge crates cannot
-//! build a second table and through it a second live store:
+//! Each bridge instance holds one table for its storage
+//! ([`crate::bridge_instance::CoreFields::custody_namespaces`]), so the
+//! refusal covers the stores of one instance, the scope spec §17.3 gives it.
+//! A table never sees the namespaces of another table: another instance, or
+//! another `CoreFields` that code builds, admits a store this one holds.
+//! The table's own constructor is private to this crate:
 //!
 //! ```compile_fail,E0624
 //! let table = scp_ffi_common::custody_namespace::CustodyNamespaces::new();
 //! ```
 //!
-//! The bridge instance's table is the one way in:
+//! Code outside the crate reaches a table through its bridge instance:
 //!
 //! ```
 //! let core = scp_ffi_common::bridge_instance::CoreFields::new();

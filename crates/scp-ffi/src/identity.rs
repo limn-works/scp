@@ -54,6 +54,7 @@ use scp_did::DidDocument;
 // in-memory seam are both encapsulated in the single cfg-gated
 // `scp_ffi_common::dht::build_ffi_dht_client`; this bridge only maps its error.
 use scp_ffi_common::dht::FfiDhtClient;
+use scp_ffi_common::identity_update::IdentityUpdateGuard;
 use scp_identity::ScpIdentity;
 use scp_identity::{DidCache, DidDht, DidMethod, DualLayerResolver, NoOpRelayQuerier};
 #[cfg(feature = "testing")]
@@ -310,14 +311,14 @@ impl DocumentUpdate {
 /// The wait releases the GIL, because custody may call back into Python. No
 /// registry guard is held across it: a guard held there deadlocks against a
 /// Python thread that blocks on the same shard while holding the GIL. The
-/// entry is read, released, and written back only when no other update
-/// replaced its document meanwhile, so two concurrent updates of one
-/// identity cannot both install.
+/// update holds its DID's update slot ([`lock_identity_update`]) from the
+/// registry read through the install instead, so a second update of the
+/// identity reads the first one's result.
 ///
 /// # Errors
 ///
-/// Returns `IdentityError` when the identity is not registered, the update
-/// or its publish fails, or another update installed first.
+/// Returns `IdentityError` when the identity is not registered or was
+/// migrated, or when the update or its publish fails.
 fn republish_identity(
     py: Python<'_>,
     bi: &Arc<PyBridgeInstance>,
@@ -326,6 +327,7 @@ fn republish_identity(
     publish_client: &Arc<FfiDhtClient>,
     update: DocumentUpdate,
 ) -> Result<PyIdentity, ScpPyError> {
+    let mut slot = lock_identity_update(py, bi, did)?;
     let (identity, document, custody) = crate::runtime::with_identity(bi, did, |entry| {
         Ok((
             entry.identity.clone(),
@@ -374,14 +376,15 @@ fn republish_identity(
     // failed write leaves both on the state a restart would load.
     crate::actor_wait::block_on_released(
         py,
-        rewrite_callback_entry(bi, custody.as_ref(), did, &new_identity, &new_document),
+        rewrite_callback_entry(
+            bi,
+            &mut slot,
+            custody.as_ref(),
+            &new_identity,
+            &new_document,
+        ),
     )??;
     crate::runtime::with_identity_mut(bi, did, |entry| {
-        if entry.document != document {
-            return Err(ScpPyError::identity(format!(
-                "identity '{did}' was updated concurrently; its document changed during this update"
-            )));
-        }
         entry.identity = new_identity;
         entry.document = new_document;
         Ok(PyIdentity::from_document(
@@ -1060,39 +1063,171 @@ async fn write_callback_entry(
     .map_err(callback_identity_error)
 }
 
-/// Rewrites the callback custody entry of an identity whose key handles or
-/// document an operation changed, when `custody` is a host provider's
-/// adapter (spec §17.3); other custodies keep no entry. Every operation that
-/// changes a registered identity calls this before it installs the change,
-/// so a restart loads the changed identity and never the one before.
-/// `previous_did` is the DID the identity had before the change.
+/// The testing build of [`PyScp::identity_attest_device`]: attests with
+/// `InMemoryDeviceAttestation`, rewrites a callback custody entry and
+/// installs the attested document, all under the DID's update slot.
+#[cfg(feature = "testing")]
+fn attest_device_in_memory(
+    py: Python<'_>,
+    bi: &Arc<PyBridgeInstance>,
+    identity_did: &str,
+) -> PyResult<String> {
+    let bi_arc = Arc::clone(bi);
+    validate::validate_did(identity_did)?;
+    let did_owned = identity_did.to_owned();
+
+    // Hold the DID's update slot from the registry read through the
+    // install, and attest with the GIL released and no registry guard
+    // held (see `republish_identity`).
+    let mut slot = lock_identity_update(py, &bi_arc, &did_owned)?;
+    let (identity, document, custody) =
+        crate::runtime::with_identity(&bi_arc, &did_owned, |entry| {
+            Ok((
+                entry.identity.clone(),
+                entry.document.clone(),
+                Arc::clone(&entry.custody),
+            ))
+        })?;
+    let attestation = scp_platform::testing::InMemoryDeviceAttestation::new();
+    let dht = shared_did_method(&bi_arc)?;
+    let new_document = crate::actor_wait::block_on_released(
+        py,
+        dht.attach_device_attestation(&document, &attestation),
+    )?
+    .map_err(|e| ScpPyError::identity(format!("device attestation failed: {e}")))?;
+
+    // Extract the attestation token from the updated document's
+    // service entries. The service_endpoint is already base64-encoded
+    // by `set_device_attestation_token`, so return it directly —
+    // no double-encoding.
+    let token_b64 = new_document
+        .service
+        .iter()
+        .find(|s| s.service_type == "ScpDeviceAttestation")
+        .map(|s| s.service_endpoint.clone())
+        .ok_or_else(|| {
+            ScpPyError::identity(
+                "device attestation succeeded but no ScpDeviceAttestation \
+                 service entry found in updated document"
+                    .to_owned(),
+            )
+        })?;
+
+    crate::actor_wait::block_on_released(
+        py,
+        rewrite_callback_entry(
+            &bi_arc,
+            &mut slot,
+            custody.as_ref(),
+            &identity,
+            &new_document,
+        ),
+    )??;
+    crate::runtime::with_identity_mut(&bi_arc, &did_owned, |entry| {
+        entry.document = new_document;
+        Ok(token_b64)
+    })
+    .map_err(PyErr::from)
+}
+
+/// The shipped build of [`PyScp::identity_attest_device`]: fail-closed device
+/// attestation.
+///
+/// Spec §9:187 — device attestation (Apple App Attest / Google Play
+/// Integrity) is an optional SDK-level trust signal whose absence is
+/// expected and non-penalizing. No production device-attestation backend is
+/// wired yet: App Attest / Play Integrity are hardware/platform-backed and
+/// are intentionally deferred (with hardware keychain custody) until an
+/// e2e-driven integration lands (ADR-062 §Decision 3 severs the test-harness
+/// `InMemoryDeviceAttestation` nullifier from every production path). So a
+/// shipped build returns a typed
+/// [`IDENT_1015`](scp_ffi_common::error_codes::IDENT_1015) honest-absent
+/// error rather than a silently-valid attestation. See ADR-025 and #2171 for
+/// the real backend.
+#[cfg(not(feature = "testing"))]
+fn attest_device_unavailable(
+    py: Python<'_>,
+    bi: &Arc<PyBridgeInstance>,
+    identity_did: &str,
+) -> PyResult<String> {
+    let bi_arc = Arc::clone(bi);
+    validate::validate_did(identity_did)?;
+    let did_owned = identity_did.to_owned();
+
+    // Resolve the identity against THIS instance's registry first: an
+    // unregistered DID surfaces the bridge's standard not-found identity
+    // error, so a caller can distinguish "unknown identity" from "backend
+    // unavailable". A registered DID then fails closed with the typed
+    // honest-absent IDENT_1015 rather than a silently-valid attestation.
+    py.allow_threads(move || {
+        crate::runtime::with_identity(&bi_arc, &did_owned, |_entry| {
+            Err(ScpPyError::identity_with_code(
+                "device attestation unavailable: no production device-attestation \
+                 backend is wired yet — Apple App Attest / Google Play Integrity are \
+                 hardware/platform-backed and are intentionally deferred (with hardware \
+                 keychain custody) until an e2e-driven integration lands (spec §9:187). \
+                 See #2171."
+                    .to_owned(),
+                scp_ffi_common::error_codes::IDENT_1015,
+            ))
+        })
+    })
+    .map_err(PyErr::from)
+}
+
+/// Waits until no other update of `did` runs on `bi` and returns the hold on
+/// its update slot (spec §17.3). Every operation that changes a registered
+/// identity's key handles or document takes it before it reads the registry
+/// and keeps it until it installs the change.
+///
+/// # Errors
+///
+/// `SCP-IDENT-1002` when a migration retired `did`, and the wait's error when
+/// the shared runtime is absent.
+fn lock_identity_update(
+    py: Python<'_>,
+    bi: &PyBridgeInstance,
+    did: &str,
+) -> Result<IdentityUpdateGuard, ScpPyError> {
+    crate::actor_wait::block_on_released(py, bi.core.identity_updates().lock(did))?
+        .map_err(|e| ScpPyError::identity_with_code(e.to_string(), e.code()))
+}
+
+/// Records a change to the identity `slot` holds: rewrites its callback
+/// custody entry when `custody` is a host provider's adapter (spec §17.3;
+/// other custodies keep no entry), then records `identity` and `document` in
+/// the slot. Every operation that changes a registered identity calls this
+/// before it installs the change, so a restart loads the changed identity and
+/// never the one before.
 ///
 /// # Errors
 ///
 /// `SCP-STORAGE-8000` when `bi`'s storage stopped persisting, and the
-/// [`CallbackIdentityError`] code when the write fails.
+/// [`CallbackIdentityError`] code when the write fails; the slot then records
+/// nothing.
 ///
 /// [`CallbackIdentityError`]: scp_ffi_common::callback_identity::CallbackIdentityError
 async fn rewrite_callback_entry(
     bi: &PyBridgeInstance,
+    slot: &mut IdentityUpdateGuard,
     custody: &FfiKeyCustody,
-    previous_did: &str,
     identity: &ScpIdentity,
     document: &DidDocument,
 ) -> Result<(), ScpPyError> {
-    let FfiKeyCustody::Callback(adapter) = custody else {
-        return Ok(());
-    };
-    let storage = callback_custody_storage(bi);
-    scp_ffi_common::callback_identity::rewrite_entry(
-        storage.as_deref(),
-        adapter.namespace(),
-        previous_did,
-        identity,
-        document,
-    )
-    .await
-    .map_err(callback_identity_error)
+    if let FfiKeyCustody::Callback(adapter) = custody {
+        let storage = callback_custody_storage(bi);
+        scp_ffi_common::callback_identity::rewrite_entry(
+            storage.as_deref(),
+            adapter.namespace(),
+            slot,
+            identity,
+            document,
+        )
+        .await
+        .map_err(callback_identity_error)?;
+    }
+    slot.commit(identity.clone(), document.clone());
+    Ok(())
 }
 
 /// Maps a callback custody identity refusal to the code every bridge
@@ -2455,6 +2590,14 @@ impl crate::scp::PyScp {
                 }
                 #[cfg(feature = "testing")]
                 {
+                    // The migration holds the old DID's update slot from the
+                    // registry read through the install (spec §17.3).
+                    let mut slot = bi_arc
+                        .core
+                        .identity_updates()
+                        .lock(&old_did)
+                        .await
+                        .map_err(|e| ScpPyError::identity_with_code(e.to_string(), e.code()))?;
                     // Extract what we need from the registry entry. The
                     // pre-rotation handle points into the cold-storage
                     // `pre_rotation_custody`; revealing it must yield a public
@@ -2517,8 +2660,8 @@ impl crate::scp::PyScp {
                     // registry does (spec §17.3).
                     rewrite_callback_entry(
                         &bi_arc,
+                        &mut slot,
                         custody.as_ref(),
-                        &old_did,
                         &new_identity,
                         &new_document,
                     )
@@ -2607,108 +2750,19 @@ impl crate::scp::PyScp {
     /// attestation fails.
     ///
     /// See §9.3.
-    #[cfg(feature = "testing")]
+    /// A shipped build refuses before it reads or changes anything (see
+    /// [`attest_device_unavailable`]); a testing build attests through
+    /// [`attest_device_in_memory`], which rewrites a callback custody entry
+    /// before it installs the attested document.
     pub fn identity_attest_device(&self, py: Python<'_>, identity_did: &str) -> PyResult<String> {
-        let bi_arc = Arc::clone(&self.inner);
-        validate::validate_did(identity_did)?;
-        let did_owned = identity_did.to_owned();
-
-        // Read the document, attest with the GIL released and no registry
-        // guard held, then install the result only if no other update
-        // replaced the document meanwhile (see `republish_identity`).
-        let (identity, document, custody) =
-            crate::runtime::with_identity(&bi_arc, &did_owned, |entry| {
-                Ok((
-                    entry.identity.clone(),
-                    entry.document.clone(),
-                    Arc::clone(&entry.custody),
-                ))
-            })?;
-        let attestation = scp_platform::testing::InMemoryDeviceAttestation::new();
-        let dht = shared_did_method(&bi_arc)?;
-        let new_document = crate::actor_wait::block_on_released(
-            py,
-            dht.attach_device_attestation(&document, &attestation),
-        )?
-        .map_err(|e| ScpPyError::identity(format!("device attestation failed: {e}")))?;
-
-        // Extract the attestation token from the updated document's
-        // service entries. The service_endpoint is already base64-encoded
-        // by `set_device_attestation_token`, so return it directly —
-        // no double-encoding.
-        let token_b64 = new_document
-            .service
-            .iter()
-            .find(|s| s.service_type == "ScpDeviceAttestation")
-            .map(|s| s.service_endpoint.clone())
-            .ok_or_else(|| {
-                ScpPyError::identity(
-                    "device attestation succeeded but no ScpDeviceAttestation \
-                     service entry found in updated document"
-                        .to_owned(),
-                )
-            })?;
-
-        crate::actor_wait::block_on_released(
-            py,
-            rewrite_callback_entry(
-                &bi_arc,
-                custody.as_ref(),
-                &did_owned,
-                &identity,
-                &new_document,
-            ),
-        )??;
-        crate::runtime::with_identity_mut(&bi_arc, &did_owned, |entry| {
-            if entry.document != document {
-                return Err(ScpPyError::identity(format!(
-                    "identity '{did_owned}' was updated concurrently; its document changed during attestation"
-                )));
-            }
-            entry.document = new_document;
-            Ok(token_b64)
-        })
-        .map_err(PyErr::from)
-    }
-
-    /// Fail-closed device attestation on a shipped (no-`testing`) build.
-    ///
-    /// Spec §9:187 — device attestation (Apple App Attest / Google Play
-    /// Integrity) is an optional SDK-level trust signal whose absence is
-    /// expected and non-penalizing. No production device-attestation backend is
-    /// wired yet: App Attest / Play Integrity are hardware/platform-backed and
-    /// are intentionally deferred (with hardware keychain custody) until an
-    /// e2e-driven integration lands (ADR-062 §Decision 3 severs the test-harness
-    /// `InMemoryDeviceAttestation` nullifier from every production path). So a
-    /// shipped build returns a typed
-    /// [`IDENT_1015`](scp_ffi_common::error_codes::IDENT_1015) honest-absent
-    /// error rather than a silently-valid attestation. See ADR-025 and #2171 for
-    /// the real backend.
-    #[cfg(not(feature = "testing"))]
-    pub fn identity_attest_device(&self, py: Python<'_>, identity_did: &str) -> PyResult<String> {
-        let bi_arc = Arc::clone(&self.inner);
-        validate::validate_did(identity_did)?;
-        let did_owned = identity_did.to_owned();
-
-        // Resolve the identity against THIS instance's registry first: an
-        // unregistered DID surfaces the bridge's standard not-found identity
-        // error, so a caller can distinguish "unknown identity" from "backend
-        // unavailable". A registered DID then fails closed with the typed
-        // honest-absent IDENT_1015 rather than a silently-valid attestation.
-        py.allow_threads(move || {
-            crate::runtime::with_identity(&bi_arc, &did_owned, |_entry| {
-                Err(ScpPyError::identity_with_code(
-                    "device attestation unavailable: no production device-attestation \
-                     backend is wired yet — Apple App Attest / Google Play Integrity are \
-                     hardware/platform-backed and are intentionally deferred (with hardware \
-                     keychain custody) until an e2e-driven integration lands (spec §9:187). \
-                     See #2171."
-                        .to_owned(),
-                    scp_ffi_common::error_codes::IDENT_1015,
-                ))
-            })
-        })
-        .map_err(PyErr::from)
+        #[cfg(feature = "testing")]
+        {
+            attest_device_in_memory(py, &self.inner, identity_did)
+        }
+        #[cfg(not(feature = "testing"))]
+        {
+            attest_device_unavailable(py, &self.inner, identity_did)
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -3286,6 +3340,69 @@ mod tests {
     /// retained custody. This test calls the actual bridge method to
     /// confirm the signer is properly wired and migration produces a
     /// valid new identity.
+    /// Spec §17.3: a key change holds its DID's update slot from its
+    /// registry read through its install. While another update holds the
+    /// slot, a rotation and an agent key's addition started at once on two
+    /// threads both wait; released, they run one after the other, the
+    /// second from the first's result, so the registry ends with both
+    /// changes rather than refusing or dropping one.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn py_concurrent_key_changes_wait_for_the_update_slot_and_converge() {
+        setup();
+        let scp = Arc::new(default_scp());
+        let bi = Arc::clone(&scp.inner);
+        let identity =
+            Python::with_gil(|py| scp.identity_create(py, "in_memory", None)).expect("create");
+        let did = identity.did.clone();
+        let initial = crate::runtime::with_identity(&bi, &did, |e| Ok(e.identity.clone()))
+            .expect("registered");
+        let runtime = crate::runtime().expect("runtime");
+        let held = runtime
+            .block_on(bi.core.identity_updates().lock(&did))
+            .expect("the test holds the slot");
+        let rotation = {
+            let (scp, identity) = (Arc::clone(&scp), identity.clone());
+            std::thread::spawn(move || {
+                Python::with_gil(|py| scp.identity_rotate_key(py, &identity).map(|_| ()))
+            })
+        };
+        let addition = {
+            let (scp, identity) = (Arc::clone(&scp), identity);
+            std::thread::spawn(move || {
+                Python::with_gil(|py| scp.identity_add_agent_key(py, &identity).map(|_| ()))
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            !rotation.is_finished() && !addition.is_finished(),
+            "both updates wait while another holds the slot"
+        );
+        drop(held);
+        rotation.join().expect("join").expect("identity_rotate_key");
+        addition
+            .join()
+            .expect("join")
+            .expect("identity_add_agent_key");
+
+        let (registered, document) = crate::runtime::with_identity(&bi, &did, |e| {
+            Ok((e.identity.clone(), e.document.clone()))
+        })
+        .expect("registered");
+        assert!(
+            registered.agent_signing_key.is_some(),
+            "the addition installed"
+        );
+        assert_ne!(
+            registered.active_signing_key, initial.active_signing_key,
+            "the rotation installed"
+        );
+        assert!(
+            document.agent_verification_method().is_some(),
+            "the registered document lists the agent key"
+        );
+    }
+
     #[test]
     #[cfg(feature = "testing")]
     fn py_identity_migrate_succeeds_with_signer() {

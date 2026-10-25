@@ -1,8 +1,8 @@
 //! The positive control of the `compile_fail` doctest in
-//! `scp_ffi_common::custody_namespace`: code outside the crate cannot build a
-//! `CustodyNamespaces`, and reaches the one table of a bridge instance
-//! through `CoreFields::custody_namespaces`, over which a callback custody
-//! identity's records open (spec §17.3). `cargo nextest` runs no doctests,
+//! `scp_ffi_common::custody_namespace`: code outside the crate cannot call
+//! `CustodyNamespaces::new`, and reaches a bridge instance's table through
+//! `CoreFields::custody_namespaces`, over which a callback custody identity's
+//! records open once per instance (spec §17.3). `cargo nextest` runs no doctests,
 //! so this test keeps the reachable path checked there too.
 
 #![cfg(all(feature = "custody", feature = "resolvers", feature = "testing"))]

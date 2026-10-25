@@ -2675,7 +2675,7 @@
         "pyo3"
       ],
       "pattern": {
-        "caller_matches": "^identity_(rotate_key|add_agent_key|rotate_agent_key|remove_agent_key|migrate)$",
+        "caller_matches": "^identity_(rotate_key|add_agent_key|rotate_agent_key|remove_agent_key|migrate|attest_device)$",
         "required_callee": "rewrite_callback_entry",
         "scope": "same-function-or-direct-callee",
         "min_occurrences": 1
@@ -2683,7 +2683,8 @@
       "evidence": {
         "code_sites": [
           "crates/scp-ffi/src/identity.rs republish_identity → rewrite_callback_entry",
-          "crates/scp-ffi/src/identity.rs PyScp::identity_migrate → rewrite_callback_entry"
+          "crates/scp-ffi/src/identity.rs PyScp::identity_migrate → rewrite_callback_entry",
+          "crates/scp-ffi/src/identity.rs PyScp::identity_attest_device → rewrite_callback_entry"
         ]
       }
     },

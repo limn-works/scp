@@ -601,30 +601,41 @@ impl NapiIdentity {
         }
         #[cfg(feature = "testing")]
         {
-            let (scp_identity, custody, document) = self.extract_in_memory_state("rotateKey")?;
+            let (_, custody, _) = self.extract_in_memory_state("rotateKey")?;
 
             let bi = &self.inner.bi;
 
             // Read attestations + pre-rotation state BEFORE async operation
             // (entry guaranteed to exist). `rotate_active_key` does not touch
             // the pre-rotation key, so we reuse the existing handle/custody.
-            let (existing_attestations, pre_rotation_handle, pre_rotation_custody) =
-                crate::runtime::with_identity(bi, &self.inner.did, |e| {
-                    Ok((
-                        e.identity_link_attestations.clone(),
-                        e.pre_rotation_handle,
-                        Arc::clone(&e.pre_rotation_custody),
-                    ))
-                })
-                .map_err(|e| {
-                    // Fail-fast rather than fabricate a synthetic
-                    // `(handle = 0, fresh empty custody)` pair: a fresh
-                    // empty custody would silently overwrite the
-                    // registered pre-rotation state, leaving the
-                    // identity un-migratable. Surface the real error
-                    // so the caller can recover.
-                    NapiError::from(e)
-                })?;
+            // The update holds the DID's update slot from this registry read
+            // through the install (spec §17.3), so a concurrent update of the
+            // identity reads this one's result rather than the handle's.
+            let mut slot = crate::scp::lock_identity_update(bi, &self.inner.did).await?;
+            let (
+                scp_identity,
+                document,
+                existing_attestations,
+                pre_rotation_handle,
+                pre_rotation_custody,
+            ) = crate::runtime::with_identity(bi, &self.inner.did, |e| {
+                Ok((
+                    e.identity.clone(),
+                    e.document.clone(),
+                    e.identity_link_attestations.clone(),
+                    e.pre_rotation_handle,
+                    Arc::clone(&e.pre_rotation_custody),
+                ))
+            })
+            .map_err(|e| {
+                // Fail-fast rather than fabricate a synthetic
+                // `(handle = 0, fresh empty custody)` pair: a fresh
+                // empty custody would silently overwrite the
+                // registered pre-rotation state, leaving the
+                // identity un-migratable. Surface the real error
+                // so the caller can recover.
+                NapiError::from(e)
+            })?;
 
             let dht = make_dht_with_signer(&custody)?;
             // Bootstrap the BEP44 sequence past the shared DHT's current record so
@@ -642,8 +653,8 @@ impl NapiIdentity {
             // (spec §17.3), so a restart loads the changed identity.
             crate::scp::rewrite_callback_entry(
                 bi,
+                &mut slot,
                 &custody,
-                &scp_identity.did,
                 &new_identity,
                 &new_document,
             )
@@ -722,29 +733,40 @@ impl NapiIdentity {
         }
         #[cfg(feature = "testing")]
         {
-            let (scp_identity, custody, document) = self.extract_in_memory_state("addAgentKey")?;
+            let (_, custody, _) = self.extract_in_memory_state("addAgentKey")?;
 
             let bi = &self.inner.bi;
 
             // Read attestations + pre-rotation state BEFORE async operation.
             // `add_agent_key` does not touch the pre-rotation key.
-            let (existing_attestations, pre_rotation_handle, pre_rotation_custody) =
-                crate::runtime::with_identity(bi, &self.inner.did, |e| {
-                    Ok((
-                        e.identity_link_attestations.clone(),
-                        e.pre_rotation_handle,
-                        Arc::clone(&e.pre_rotation_custody),
-                    ))
-                })
-                .map_err(|e| {
-                    // Fail-fast rather than fabricate a synthetic
-                    // `(handle = 0, fresh empty custody)` pair: a fresh
-                    // empty custody would silently overwrite the
-                    // registered pre-rotation state, leaving the
-                    // identity un-migratable. Surface the real error
-                    // so the caller can recover.
-                    NapiError::from(e)
-                })?;
+            // The update holds the DID's update slot from this registry read
+            // through the install (spec §17.3), so a concurrent update of the
+            // identity reads this one's result rather than the handle's.
+            let mut slot = crate::scp::lock_identity_update(bi, &self.inner.did).await?;
+            let (
+                scp_identity,
+                document,
+                existing_attestations,
+                pre_rotation_handle,
+                pre_rotation_custody,
+            ) = crate::runtime::with_identity(bi, &self.inner.did, |e| {
+                Ok((
+                    e.identity.clone(),
+                    e.document.clone(),
+                    e.identity_link_attestations.clone(),
+                    e.pre_rotation_handle,
+                    Arc::clone(&e.pre_rotation_custody),
+                ))
+            })
+            .map_err(|e| {
+                // Fail-fast rather than fabricate a synthetic
+                // `(handle = 0, fresh empty custody)` pair: a fresh
+                // empty custody would silently overwrite the
+                // registered pre-rotation state, leaving the
+                // identity un-migratable. Surface the real error
+                // so the caller can recover.
+                NapiError::from(e)
+            })?;
 
             let dht = make_dht_with_signer(&custody)?;
             // Bootstrap the BEP44 sequence past the shared DHT's current record so
@@ -761,8 +783,8 @@ impl NapiIdentity {
             // (spec §17.3), so a restart loads the changed identity.
             crate::scp::rewrite_callback_entry(
                 bi,
+                &mut slot,
                 &custody,
-                &scp_identity.did,
                 &new_identity,
                 &new_document,
             )
@@ -841,30 +863,40 @@ impl NapiIdentity {
         }
         #[cfg(feature = "testing")]
         {
-            let (scp_identity, custody, document) =
-                self.extract_in_memory_state("rotateAgentKey")?;
+            let (_, custody, _) = self.extract_in_memory_state("rotateAgentKey")?;
 
             let bi = &self.inner.bi;
 
             // Read attestations + pre-rotation state BEFORE async operation.
             // `rotate_agent_key` does not touch the pre-rotation key.
-            let (existing_attestations, pre_rotation_handle, pre_rotation_custody) =
-                crate::runtime::with_identity(bi, &self.inner.did, |e| {
-                    Ok((
-                        e.identity_link_attestations.clone(),
-                        e.pre_rotation_handle,
-                        Arc::clone(&e.pre_rotation_custody),
-                    ))
-                })
-                .map_err(|e| {
-                    // Fail-fast rather than fabricate a synthetic
-                    // `(handle = 0, fresh empty custody)` pair: a fresh
-                    // empty custody would silently overwrite the
-                    // registered pre-rotation state, leaving the
-                    // identity un-migratable. Surface the real error
-                    // so the caller can recover.
-                    NapiError::from(e)
-                })?;
+            // The update holds the DID's update slot from this registry read
+            // through the install (spec §17.3), so a concurrent update of the
+            // identity reads this one's result rather than the handle's.
+            let mut slot = crate::scp::lock_identity_update(bi, &self.inner.did).await?;
+            let (
+                scp_identity,
+                document,
+                existing_attestations,
+                pre_rotation_handle,
+                pre_rotation_custody,
+            ) = crate::runtime::with_identity(bi, &self.inner.did, |e| {
+                Ok((
+                    e.identity.clone(),
+                    e.document.clone(),
+                    e.identity_link_attestations.clone(),
+                    e.pre_rotation_handle,
+                    Arc::clone(&e.pre_rotation_custody),
+                ))
+            })
+            .map_err(|e| {
+                // Fail-fast rather than fabricate a synthetic
+                // `(handle = 0, fresh empty custody)` pair: a fresh
+                // empty custody would silently overwrite the
+                // registered pre-rotation state, leaving the
+                // identity un-migratable. Surface the real error
+                // so the caller can recover.
+                NapiError::from(e)
+            })?;
 
             let dht = make_dht_with_signer(&custody)?;
             // Bootstrap the BEP44 sequence past the shared DHT's current record so
@@ -881,8 +913,8 @@ impl NapiIdentity {
             // (spec §17.3), so a restart loads the changed identity.
             crate::scp::rewrite_callback_entry(
                 bi,
+                &mut slot,
                 &custody,
-                &scp_identity.did,
                 &new_identity,
                 &new_document,
             )
@@ -960,30 +992,40 @@ impl NapiIdentity {
         }
         #[cfg(feature = "testing")]
         {
-            let (scp_identity, custody, document) =
-                self.extract_in_memory_state("removeAgentKey")?;
+            let (_, custody, _) = self.extract_in_memory_state("removeAgentKey")?;
 
             let bi = &self.inner.bi;
 
             // Read attestations + pre-rotation state BEFORE async operation.
             // `remove_agent_key` does not touch the pre-rotation key.
-            let (existing_attestations, pre_rotation_handle, pre_rotation_custody) =
-                crate::runtime::with_identity(bi, &self.inner.did, |e| {
-                    Ok((
-                        e.identity_link_attestations.clone(),
-                        e.pre_rotation_handle,
-                        Arc::clone(&e.pre_rotation_custody),
-                    ))
-                })
-                .map_err(|e| {
-                    // Fail-fast rather than fabricate a synthetic
-                    // `(handle = 0, fresh empty custody)` pair: a fresh
-                    // empty custody would silently overwrite the
-                    // registered pre-rotation state, leaving the
-                    // identity un-migratable. Surface the real error
-                    // so the caller can recover.
-                    NapiError::from(e)
-                })?;
+            // The update holds the DID's update slot from this registry read
+            // through the install (spec §17.3), so a concurrent update of the
+            // identity reads this one's result rather than the handle's.
+            let mut slot = crate::scp::lock_identity_update(bi, &self.inner.did).await?;
+            let (
+                scp_identity,
+                document,
+                existing_attestations,
+                pre_rotation_handle,
+                pre_rotation_custody,
+            ) = crate::runtime::with_identity(bi, &self.inner.did, |e| {
+                Ok((
+                    e.identity.clone(),
+                    e.document.clone(),
+                    e.identity_link_attestations.clone(),
+                    e.pre_rotation_handle,
+                    Arc::clone(&e.pre_rotation_custody),
+                ))
+            })
+            .map_err(|e| {
+                // Fail-fast rather than fabricate a synthetic
+                // `(handle = 0, fresh empty custody)` pair: a fresh
+                // empty custody would silently overwrite the
+                // registered pre-rotation state, leaving the
+                // identity un-migratable. Surface the real error
+                // so the caller can recover.
+                NapiError::from(e)
+            })?;
 
             let dht = make_dht_with_signer(&custody)?;
             // Bootstrap the BEP44 sequence past the shared DHT's current record so
@@ -1000,8 +1042,8 @@ impl NapiIdentity {
             // (spec §17.3), so a restart loads the changed identity.
             crate::scp::rewrite_callback_entry(
                 bi,
+                &mut slot,
                 &custody,
-                &scp_identity.did,
                 &new_identity,
                 &new_document,
             )
@@ -1091,21 +1133,32 @@ impl NapiIdentity {
         }
         #[cfg(feature = "testing")]
         {
-            let (scp_identity, custody, document) = self.extract_in_memory_state("migrate")?;
+            let (_, custody, _) = self.extract_in_memory_state("migrate")?;
 
             let bi = &self.inner.bi;
 
             // Read attestations + pre-rotation state BEFORE async operation
             // (entry guaranteed to exist now).
-            let (existing_attestations, pre_rotation_handle, pre_rotation_custody) =
-                crate::runtime::with_identity(bi, &self.inner.did, |e| {
-                    Ok((
-                        e.identity_link_attestations.clone(),
-                        e.pre_rotation_handle,
-                        Arc::clone(&e.pre_rotation_custody),
-                    ))
-                })
-                .map_err(NapiError::from)?;
+            // The update holds the DID's update slot from this registry read
+            // through the install (spec §17.3), so a concurrent update of the
+            // identity reads this one's result rather than the handle's.
+            let mut slot = crate::scp::lock_identity_update(bi, &self.inner.did).await?;
+            let (
+                scp_identity,
+                document,
+                existing_attestations,
+                pre_rotation_handle,
+                pre_rotation_custody,
+            ) = crate::runtime::with_identity(bi, &self.inner.did, |e| {
+                Ok((
+                    e.identity.clone(),
+                    e.document.clone(),
+                    e.identity_link_attestations.clone(),
+                    e.pre_rotation_handle,
+                    Arc::clone(&e.pre_rotation_custody),
+                ))
+            })
+            .map_err(NapiError::from)?;
 
             // Spec §3.7 / §9.12 (Compromise Recovery Protocol): the
             // pre-rotation key whose hash equals the published
@@ -1153,8 +1206,8 @@ impl NapiIdentity {
             // (spec §17.3), so a restart loads the changed identity.
             crate::scp::rewrite_callback_entry(
                 bi,
+                &mut slot,
                 &custody,
-                &scp_identity.did,
                 &new_identity,
                 &new_document,
             )
@@ -1556,6 +1609,66 @@ mod tests {
         };
         increment_handle_count();
         (handle, initial_active_key)
+    }
+
+    /// Spec §17.3: a key change holds its DID's update slot from its
+    /// registry read through its install. While another update holds the
+    /// slot, a rotation and an agent key's addition started at once both
+    /// wait; released, they run one after the other, the second from the
+    /// first's result, so the registry ends with both changes and the
+    /// document the last publish returned.
+    #[test]
+    fn concurrent_key_changes_wait_for_the_update_slot_and_converge() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let (identity, initial_active_key) = rt.block_on(create_test_identity());
+        let bi = Arc::clone(&identity.inner.bi);
+        let did = identity.did();
+        let identity = Arc::new(identity);
+        let held = rt
+            .block_on(bi.core.identity_updates().lock(&did))
+            .expect("the test holds the slot");
+        let rotation = {
+            let identity = Arc::clone(&identity);
+            rt.spawn(async move { identity.rotate_key().await })
+        };
+        let addition = {
+            let identity = Arc::clone(&identity);
+            rt.spawn(async move { identity.add_agent_key().await })
+        };
+        rt.block_on(async { tokio::time::sleep(std::time::Duration::from_millis(200)).await });
+        assert!(
+            !rotation.is_finished() && !addition.is_finished(),
+            "both updates wait while another holds the slot"
+        );
+        drop(held);
+        let rotated = rt.block_on(rotation).expect("join").expect("rotate_key");
+        let added = rt.block_on(addition).expect("join").expect("add_agent_key");
+
+        let (registered, document) = crate::runtime::with_identity(&bi, &did, |e| {
+            Ok((e.identity.clone(), e.document.clone()))
+        })
+        .expect("registered");
+        assert!(
+            registered.agent_signing_key.is_some(),
+            "the addition installed"
+        );
+        let listed = document
+            .verification_method
+            .iter()
+            .find(|vm| vm.id.ends_with("#active"))
+            .expect("#active")
+            .public_key_multibase
+            .clone();
+        assert_ne!(listed, initial_active_key, "the rotation installed");
+        let returned = [rotated.inner.document.clone(), added.inner.document.clone()];
+        assert!(
+            returned.contains(&Some(document)),
+            "the registry holds the document the last update published"
+        );
     }
 
     #[test]

@@ -5773,40 +5773,63 @@ async fn write_created_callback_entry(
     .map_err(callback_identity_error)
 }
 
-/// Rewrites the callback custody entry of an identity whose key handles or
-/// document an operation changed, when `custody` is a host provider's
-/// adapter (spec §17.3); other custodies keep no entry. Every operation that
-/// changes a registered identity calls this before it installs the change,
-/// so a restart loads the changed identity and never the one before.
-/// `previous_did` is the DID the identity had before the change.
+/// Waits until no other update of `did` runs on `bi` and returns the hold on
+/// its update slot (spec §17.3). Every operation that changes a registered
+/// identity's key handles or document takes it before it reads the registry
+/// and keeps it until it installs the change.
+///
+/// # Errors
+///
+/// `SCP-IDENT-1002` when a migration retired `did`.
+#[cfg(feature = "testing")]
+pub(crate) async fn lock_identity_update(
+    bi: &NapiBridgeInstance,
+    did: &str,
+) -> napi::Result<scp_ffi_common::identity_update::IdentityUpdateGuard> {
+    bi.core.identity_updates().lock(did).await.map_err(|e| {
+        NapiError::from(ScpNapiError::Identity {
+            message: e.to_string(),
+            code: e.code().to_owned(),
+        })
+    })
+}
+
+/// Records a change to the identity `slot` holds: rewrites its callback
+/// custody entry when `custody` is a host provider's adapter (spec §17.3;
+/// other custodies keep no entry), then records `identity` and `document` in
+/// the slot. Every operation that changes a registered identity calls this
+/// before it installs the change, so a restart loads the changed identity and
+/// never the one before.
 ///
 /// # Errors
 ///
 /// `SCP-STORAGE-8000` when `bi`'s storage stopped persisting, and the
-/// [`CallbackIdentityError`] code when the write fails.
+/// [`CallbackIdentityError`] code when the write fails; the slot then records
+/// nothing.
 ///
 /// [`CallbackIdentityError`]: scp_ffi_common::callback_identity::CallbackIdentityError
 #[cfg(feature = "testing")]
 pub(crate) async fn rewrite_callback_entry(
     bi: &NapiBridgeInstance,
+    slot: &mut scp_ffi_common::identity_update::IdentityUpdateGuard,
     custody: &crate::custody::NapiKeyCustody,
-    previous_did: &str,
     identity: &scp_identity::ScpIdentity,
     document: &scp_did::DidDocument,
 ) -> napi::Result<()> {
-    let crate::custody::NapiKeyCustody::Callback(adapter) = custody else {
-        return Ok(());
-    };
-    let storage = crate::runtime::protocol_repository(bi).callback_custody_storage();
-    scp_ffi_common::callback_identity::rewrite_entry(
-        storage.as_deref(),
-        adapter.namespace(),
-        previous_did,
-        identity,
-        document,
-    )
-    .await
-    .map_err(callback_identity_error)
+    if let crate::custody::NapiKeyCustody::Callback(adapter) = custody {
+        let storage = crate::runtime::protocol_repository(bi).callback_custody_storage();
+        scp_ffi_common::callback_identity::rewrite_entry(
+            storage.as_deref(),
+            adapter.namespace(),
+            slot,
+            identity,
+            document,
+        )
+        .await
+        .map_err(callback_identity_error)?;
+    }
+    slot.commit(identity.clone(), document.clone());
+    Ok(())
 }
 
 /// Maps a callback custody identity refusal to the code every bridge

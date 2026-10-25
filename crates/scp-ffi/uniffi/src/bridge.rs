@@ -3178,6 +3178,13 @@ impl Identity {
                     // requires a signing function bound to the identity custody.
                     // `DidDht::new()` (sign_fn: None) would surface
                     // "no signing function configured".
+                    // The rotation holds the DID's update slot from here through
+                    // the install (spec §17.3) and starts from the last installed
+                    // state, which a handle taken before it does not carry.
+                    let mut slot = lock_identity_update(&self.bi, &self.did).await?;
+                    let core_id = &slot
+                        .committed()
+                        .map_or_else(|| core_id.clone(), |c| c.identity.clone());
                     let publish_client = rotation_publish_client(&self.bi)?;
                     let dht = make_dht_with_signer(custody, publish_client);
                     // Bootstrap the BEP44 sequence past the shared DHT's current record
@@ -3195,8 +3202,8 @@ impl Identity {
                     // returns (spec §17.3), so a restart loads it.
                     rewrite_callback_entry(
                         &self.bi,
+                        &mut slot,
                         custody.as_ref(),
-                        &core_id.did,
                         &new_identity,
                         &new_document,
                     )
@@ -3362,6 +3369,14 @@ impl Identity {
                     // Bootstrap the BEP44 sequence past the shared DHT's current
                     // record so the agent-key-bearing document strictly overwrites
                     // it (see rotate_key). Mirrors PyO3/NAPI.
+                    // The update holds the DID's update slot from here through
+                    // the install (spec §17.3) and starts from the last installed
+                    // state, which a handle taken before it does not carry.
+                    let mut slot = lock_identity_update(&bi, &did).await?;
+                    let (identity_clone, doc_clone) =
+                        slot.committed().map_or((identity_clone, doc_clone), |c| {
+                            (c.identity.clone(), c.document.clone())
+                        });
                     dht.initialize_sequence(&did)
                         .await
                         .map_err(ScpError::from)?;
@@ -3374,8 +3389,8 @@ impl Identity {
                     // returns (spec §17.3), so a restart loads it.
                     rewrite_callback_entry(
                         &bi,
+                        &mut slot,
                         &custody,
-                        &identity_clone.did,
                         &updated_identity,
                         &updated_doc,
                     )
@@ -3487,6 +3502,14 @@ impl Identity {
                     // Bootstrap the BEP44 sequence past the shared DHT's current
                     // record so the agent-key-removed document strictly overwrites
                     // it (see rotate_key). Mirrors PyO3/NAPI.
+                    // The update holds the DID's update slot from here through
+                    // the install (spec §17.3) and starts from the last installed
+                    // state, which a handle taken before it does not carry.
+                    let mut slot = lock_identity_update(&bi, &did).await?;
+                    let (identity_clone, doc_clone) =
+                        slot.committed().map_or((identity_clone, doc_clone), |c| {
+                            (c.identity.clone(), c.document.clone())
+                        });
                     dht.initialize_sequence(&did)
                         .await
                         .map_err(ScpError::from)?;
@@ -3499,8 +3522,8 @@ impl Identity {
                     // returns (spec §17.3), so a restart loads it.
                     rewrite_callback_entry(
                         &bi,
+                        &mut slot,
                         &custody,
-                        &identity_clone.did,
                         &updated_identity,
                         &updated_doc,
                     )
@@ -3613,6 +3636,14 @@ impl Identity {
                     // Bootstrap the BEP44 sequence past the shared DHT's current
                     // record so the rotated-agent-key document strictly overwrites
                     // it (see rotate_key). Mirrors PyO3/NAPI.
+                    // The update holds the DID's update slot from here through
+                    // the install (spec §17.3) and starts from the last installed
+                    // state, which a handle taken before it does not carry.
+                    let mut slot = lock_identity_update(&bi, &did).await?;
+                    let (identity_clone, doc_clone) =
+                        slot.committed().map_or((identity_clone, doc_clone), |c| {
+                            (c.identity.clone(), c.document.clone())
+                        });
                     dht.initialize_sequence(&did)
                         .await
                         .map_err(ScpError::from)?;
@@ -3625,8 +3656,8 @@ impl Identity {
                     // returns (spec §17.3), so a restart loads it.
                     rewrite_callback_entry(
                         &bi,
+                        &mut slot,
                         &custody,
-                        &identity_clone.did,
                         &updated_identity,
                         &updated_doc,
                     )
@@ -7577,40 +7608,81 @@ async fn write_created_callback_entry(
     .map_err(callback_identity_error)
 }
 
-/// Rewrites the callback custody entry of an identity whose key handles or
-/// document an operation changed, when `custody` is a host provider's
-/// adapter (spec §17.3); other custodies keep no entry. Every operation that
-/// changes an identity calls this before it returns the changed handle, so
-/// a restart loads the changed identity and never the one before.
-/// `previous_did` is the DID the identity had before the change.
+/// Waits until no other update of `did` runs on `bi` and returns the hold on
+/// its update slot (spec §17.3). Every operation that changes an identity's
+/// key handles or document takes it before it reads the identity's state and
+/// keeps it until it installs the change.
+///
+/// # Errors
+///
+/// `SCP-IDENT-1002` when a migration retired `did`.
+#[cfg(feature = "testing")]
+async fn lock_identity_update(
+    bi: &crate::runtime::UniffiBridgeInstance,
+    did: &str,
+) -> Result<scp_ffi_common::identity_update::IdentityUpdateGuard, ScpError> {
+    bi.core
+        .identity_updates()
+        .lock(did)
+        .await
+        .map_err(|e| ScpError::Identity {
+            msg: e.to_string(),
+            code: e.code().to_owned(),
+        })
+}
+
+/// Installs a change to the identity `slot` holds (spec §17.3): rewrites its
+/// callback custody entry when `custody` is a host provider's adapter (other
+/// custodies keep no entry), points the custody registry entry of the
+/// identity at its new active key (moving it to the new DID after a
+/// migration), and records `identity` and `document` in the slot. Every
+/// operation that changes an identity calls this before it returns the
+/// changed handle, so a restart loads the changed identity and every UCAN,
+/// delegation and verifying-key lookup that reads the registry signs with the
+/// key the published document lists.
+///
+/// A DID with no registry entry (removed by the host) gains none.
 ///
 /// # Errors
 ///
 /// `SCP-STORAGE-8000` when `bi`'s storage stopped persisting, and the
-/// [`CallbackIdentityError`] code when the write fails.
+/// [`CallbackIdentityError`] code when the write fails; neither the registry
+/// nor the slot then changes.
 ///
 /// [`CallbackIdentityError`]: scp_ffi_common::callback_identity::CallbackIdentityError
 #[cfg(feature = "testing")]
 async fn rewrite_callback_entry(
-    bi: &crate::runtime::UniffiBridgeInstance,
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+    slot: &mut scp_ffi_common::identity_update::IdentityUpdateGuard,
     custody: &UniffiKeyCustody,
-    previous_did: &str,
     identity: &scp_identity::ScpIdentity,
     document: &scp_did::DidDocument,
 ) -> Result<(), ScpError> {
-    let UniffiKeyCustody::Callback(adapter) = custody else {
-        return Ok(());
-    };
-    let storage = bi.protocol_repository().callback_custody_storage();
-    scp_ffi_common::callback_identity::rewrite_entry(
-        storage.as_deref(),
-        adapter.namespace(),
-        previous_did,
-        identity,
-        document,
-    )
-    .await
-    .map_err(callback_identity_error)
+    if let UniffiKeyCustody::Callback(adapter) = custody {
+        let storage = bi.protocol_repository().callback_custody_storage();
+        scp_ffi_common::callback_identity::rewrite_entry(
+            storage.as_deref(),
+            adapter.namespace(),
+            slot,
+            identity,
+            document,
+        )
+        .await
+        .map_err(callback_identity_error)?;
+    }
+    let registry = identity_custody_registry(bi);
+    if slot.did() == identity.did {
+        if let Some(mut entry) = registry.get_mut(&identity.did) {
+            entry.1 = identity.active_signing_key;
+        }
+    } else if let Some((_, (registered, _retired))) = registry.remove(slot.did()) {
+        registry.insert(
+            identity.did.clone(),
+            (registered, identity.active_signing_key),
+        );
+    }
+    slot.commit(identity.clone(), document.clone());
+    Ok(())
 }
 
 /// Maps a callback custody identity refusal to the code every bridge
@@ -17948,6 +18020,14 @@ impl Scp {
                             // record so the migration republish (old-DID `alsoKnownAs`
                             // update + new-DID document) strictly overwrites it. Mirrors
                             // PyO3 `run_migrate_publish`.
+                            // The migration holds the old DID's update slot from here
+                            // through the install (spec §17.3) and starts from the
+                            // last installed state.
+                            let mut slot = lock_identity_update(&bi, &old_did).await?;
+                            let (old_identity, old_document) =
+                                slot.committed().map_or((old_identity, old_document), |c| {
+                                    (c.identity.clone(), c.document.clone())
+                                });
                             dht.initialize_sequence(&old_did)
                                 .await
                                 .map_err(ScpError::from)?;
@@ -17977,8 +18057,8 @@ impl Scp {
                             // handle returns (spec §17.3).
                             rewrite_callback_entry(
                                 &bi,
+                                &mut slot,
                                 custody.as_ref(),
-                                &old_did,
                                 &new_identity,
                                 &new_document,
                             )
@@ -17989,7 +18069,6 @@ impl Scp {
                                 &new_identity.identity_key,
                             )
                             .await;
-                            let new_active_key = new_identity.active_signing_key;
                             let handle = Arc::new(Identity {
                                 did: new_identity.did.clone(),
                                 custody_type,
@@ -18013,27 +18092,13 @@ impl Scp {
                             invalidate_resolver_cache(&bi, &old_did).await;
                             invalidate_resolver_cache(&bi, &new_did).await;
 
-                            // Migrate attestation and custody registries from old DID to
-                            // new DID. The custody-registry block (now un-gated — the
-                            // registry exists in bare production builds) always consumes
-                            // `new_did`, so the attestation block clones.
-                            let attestation_did = new_did.clone();
+                            // Move the link attestations from the old DID to the new
+                            // one; `rewrite_callback_entry` moved the custody registry
+                            // entry with the migrated active key.
                             {
                                 let registry = identity_link_attestation_registry(&bi);
                                 if let Some((_, attestations)) = registry.remove(&old_did) {
-                                    registry.insert(attestation_did, attestations);
-                                }
-                            }
-                            {
-                                // Re-register under the new DID with the migrated active
-                                // signing key. `migrate_identity` rotates the active key,
-                                // so the old entry's key handle is stale (and destroyed);
-                                // reuse the same custody enum but swap in the new handle.
-                                let registry = identity_custody_registry(&bi);
-                                if let Some((_, (custody_enum, _stale_handle))) =
-                                    registry.remove(&old_did)
-                                {
-                                    registry.insert(new_did, (custody_enum, new_active_key));
+                                    registry.insert(new_did, attestations);
                                 }
                             }
 
@@ -25729,6 +25794,154 @@ mod tests {
         );
         assert_eq!(reloaded_id.agent_signing_key, changed_id.agent_signing_key);
         assert_eq!(reloaded.core_document.as_ref(), Some(&changed_document));
+    }
+
+    /// The public key the `#active` method of `document` lists.
+    #[cfg(feature = "testing")]
+    fn listed_active_key(document: &scp_did::DidDocument) -> [u8; 32] {
+        let method = document
+            .verification_method
+            .iter()
+            .find(|vm| vm.id.ends_with("#active"))
+            .expect("a document lists #active");
+        scp_did::decode_multibase_key(&method.public_key_multibase).expect("an Ed25519 key")
+    }
+
+    /// Spec §17.3: a rotation and an agent key's addition started at once
+    /// from one handle of a callback custody identity run one after the
+    /// other, the second from the first's result. The custody registry, the
+    /// stored entry and a reload then all hold the last published document
+    /// and the active key it lists; without the per-DID update slot both
+    /// would start from the handle, and the entry would keep one change and
+    /// lose the other.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_updates_of_a_callback_identity_converge() {
+        let host = Arc::new(scp_ffi_common::callback_custody::fake_host::FakeHost::default());
+        let first = scp_persistent_test();
+        let created = first
+            .identity_create_with_custody(Box::new(FakeHostProvider::over(&host)))
+            .await
+            .expect("identity_create_with_custody");
+        let created_key = created
+            .core_id
+            .as_ref()
+            .expect("created state")
+            .active_signing_key;
+        let (rotated, added) = tokio::join!(
+            Arc::clone(&created).rotate_key(),
+            Arc::clone(&created).add_agent_key()
+        );
+        let (rotated, added) = (rotated.expect("rotate_key"), added.expect("add_agent_key"));
+        let last = [&rotated, &added]
+            .into_iter()
+            .find(|handle| {
+                let id = handle.core_id.as_ref().expect("updated state");
+                id.agent_signing_key.is_some() && id.active_signing_key != created_key
+            })
+            .expect("one update starts from the other's result");
+        let last_id = last.core_id.clone().expect("last state");
+        let last_document = last.core_document.clone().expect("last document");
+        let registered = identity_custody_registry(&first.inner)
+            .get(&last.did)
+            .map(|entry| entry.value().1);
+        assert_eq!(registered, Some(last_id.active_signing_key));
+        let did = last.did.clone();
+        drop((created, rotated, added));
+        let second = scp_persistent_over(first.closed());
+
+        let loaded = second
+            .identity_load_with_custody(did, Box::new(FakeHostProvider::over(&host)))
+            .await
+            .expect("identity_load_with_custody");
+        let loaded_id = loaded.core_id.clone().expect("loaded state");
+        assert_eq!(loaded.core_document.as_ref(), Some(&last_document));
+        assert_eq!(loaded_id.active_signing_key, last_id.active_signing_key);
+        assert_eq!(loaded_id.agent_signing_key, last_id.agent_signing_key);
+        let active = loaded
+            .custody
+            .as_ref()
+            .expect("loaded custody")
+            .public_key(&loaded_id.active_signing_key)
+            .await
+            .expect("active public key");
+        assert_eq!(active.as_bytes(), &listed_active_key(&last_document));
+    }
+
+    /// A rotation points the custody registry at the rotated key, so a UCAN
+    /// the identity mints afterwards is signed with the key its rotated
+    /// document lists and passes validation, which resolves that document.
+    /// A registry left on the retired key signs with it, and validation
+    /// refuses the token.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn a_ucan_minted_after_rotation_verifies_against_the_rotated_document() {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        let rt = runtime();
+        let scp = scp_test();
+        let creator = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create");
+        let holder = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create")
+            .did();
+        let handle = rt
+            .block_on(scp.context_create(Arc::clone(&creator), closable_test_params()))
+            .expect("context_create");
+        let rotated = rt
+            .block_on(Arc::clone(&creator).rotate_key())
+            .expect("rotate_key");
+        let rotated_key = rotated
+            .core_id
+            .as_ref()
+            .expect("rotated state")
+            .active_signing_key;
+        assert_ne!(
+            rotated_key,
+            creator
+                .core_id
+                .as_ref()
+                .expect("created state")
+                .active_signing_key
+        );
+        let registered = identity_custody_registry(&scp.inner)
+            .get(&rotated.did)
+            .map(|entry| entry.value().1);
+        assert_eq!(registered, Some(rotated_key));
+
+        let token = rt
+            .block_on(scp.ucan_mint(
+                Arc::clone(&handle),
+                holder.clone(),
+                vec!["messages:write".to_owned()],
+                None,
+            ))
+            .expect("ucan_mint");
+        let (signing_input, signature) = token
+            .encoded
+            .rsplit_once('.')
+            .expect("a JWT has a signature segment");
+        let signature = URL_SAFE_NO_PAD
+            .decode(signature)
+            .expect("base64url signature");
+        let listed = listed_active_key(rotated.core_document.as_ref().expect("rotated document"));
+        let verifying = ed25519_dalek::VerifyingKey::from_bytes(&listed).expect("listed key");
+        let signature =
+            ed25519_dalek::Signature::from_slice(&signature).expect("an Ed25519 signature");
+        verifying
+            .verify_strict(signing_input.as_bytes(), &signature)
+            .expect("the token verifies under the rotated #active key");
+        rt.block_on(scp.ucan_validate(
+            handle,
+            token.encoded.clone(),
+            token.data.capabilities[0].clone(),
+            holder,
+            None,
+        ))
+        .expect("ucan_validate resolves the rotated document");
     }
 
     /// The callback adapter `identity` holds.

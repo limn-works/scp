@@ -951,6 +951,10 @@ pub struct CoreFields {
     /// lives is refused.
     #[cfg(feature = "custody")]
     custody_namespaces: crate::custody_namespace::CustodyNamespaces,
+    /// One update at a time per identity on this instance (spec §17.3):
+    /// every operation that changes an identity's keys or document holds its
+    /// DID's slot from its read through its install.
+    identity_updates: crate::identity_update::IdentityUpdates,
 }
 
 impl Default for CoreFields {
@@ -966,6 +970,12 @@ impl CoreFields {
     #[must_use]
     pub const fn custody_namespaces(&self) -> &crate::custody_namespace::CustodyNamespaces {
         &self.custody_namespaces
+    }
+
+    /// The per-DID update slots of this instance's identities (spec §17.3).
+    #[must_use]
+    pub const fn identity_updates(&self) -> &crate::identity_update::IdentityUpdates {
+        &self.identity_updates
     }
 
     /// Creates a new `CoreFields` without a `Supervisor`.
@@ -1025,6 +1035,7 @@ impl CoreFields {
             wake_flight: crate::push::WakeFlight::default(),
             #[cfg(feature = "custody")]
             custody_namespaces: crate::custody_namespace::CustodyNamespaces::new(),
+            identity_updates: crate::identity_update::IdentityUpdates::new(),
         }
     }
 
@@ -1124,6 +1135,7 @@ impl CoreFields {
             wake_flight: crate::push::WakeFlight::default(),
             #[cfg(feature = "custody")]
             custody_namespaces: crate::custody_namespace::CustodyNamespaces::new(),
+            identity_updates: crate::identity_update::IdentityUpdates::new(),
         }
     }
 
