@@ -11,9 +11,14 @@
 //!    the reservation through `commit_class_s_restore` (a failed persist
 //!    leaves the unit unreserved);
 //! 3. write the unit under the same gate: `Appended` or `AlreadyPresent`
-//!    removes it through `commit_class_s_restore`; a slot taken by an append
-//!    outside the queue resets `base_seq` and reserves again, once per unit
-//!    per drain; any other misalignment sets the log fault.
+//!    removes it through `commit_class_s_restore`; a `base_seq` past the
+//!    log's end is reserved again at the log's length, once per unit per
+//!    drain; any other misalignment sets the log fault, so the queue is
+//!    written in FIFO order with no exception.
+//!
+//! The drain tells the provider whether units remain queued before it takes
+//! the write gate and on every exit, so the provider's fence follows the
+//! queue.
 //!
 //! Every reserve and removal persists through the restore combinator, so the
 //! stored queue never holds a unit the in-memory queue has removed, and a
@@ -28,22 +33,19 @@ use crate::context::state::{LeafSpec, LogFaultMarker, context_id_to_bytes};
 
 /// What consequence enforcement owes after an operation's irreversible step
 /// (spec 17 §17.3 "Event log write failures"; ADR-049 §9): the downward-auth
-/// persist obligation, the durable consequence leaves, and a failed log read.
+/// persist obligation and the durable consequence leaves.
 ///
-/// [`Self::discharge`] queues the leaves as one pending log unit, sets the log
-/// fault for a failed read, and discharges the obligation, all in one
-/// fail-closed keep persist, so the stored state that holds the step's
+/// [`Self::discharge`] queues the leaves as one pending log unit and
+/// discharges the obligation, all in one fail-closed keep persist, so the stored state that holds the step's
 /// mutations also holds its leaves. A caller that keeps the memory-first rule
 /// takes the parts with [`Self::into_parts`] instead.
-#[must_use = "a ConsequenceSink must be discharged; dropping it loses the consequence leaves and the log fault"]
+#[must_use = "a ConsequenceSink must be discharged; dropping it loses the consequence leaves"]
 #[derive(Default)]
 pub struct ConsequenceSink {
     /// The downward-auth fail-closed persist obligation the GROW methods arm.
     pub(crate) obligation: Option<ClassSCommitToken>,
     /// Durable consequence leaves, in the order the engine produced them.
     leaves: Vec<LeafSpec>,
-    /// The error of a log read after the step, which sets the log fault.
-    read_fault: Option<String>,
 }
 
 impl ConsequenceSink {
@@ -57,32 +59,26 @@ impl ConsequenceSink {
         self.leaves.push(leaf);
     }
 
-    /// Records a log read that failed after the step.
-    pub fn note_read_fault(&mut self, detail: String) {
-        self.read_fault = Some(detail);
+    /// The leaves staged so far, which a later evaluation in the same
+    /// operation counts as evidence (spec 17 §17.3 "Event log write
+    /// failures").
+    pub fn staged_leaves(&self) -> &[LeafSpec] {
+        &self.leaves
     }
 
-    /// True when the sink owes nothing: no obligation, no leaf, no read fault.
+    /// True when the sink owes nothing: no obligation and no leaf.
     pub const fn is_empty(&self) -> bool {
-        self.obligation.is_none() && self.leaves.is_empty() && self.read_fault.is_none()
+        self.obligation.is_none() && self.leaves.is_empty()
     }
 
     /// Takes the obligation and the leaves for a caller that keeps the
-    /// memory-first rule after its step. A recorded read fault is logged; such
-    /// a caller never records one.
+    /// memory-first rule after its step.
     pub(crate) fn into_parts(mut self) -> (Option<ClassSCommitToken>, Vec<LeafSpec>) {
-        if let Some(detail) = self.read_fault.take() {
-            tracing::warn!(
-                detail,
-                "event log read fault dropped by a memory-first caller"
-            );
-        }
         (self.obligation.take(), std::mem::take(&mut self.leaves))
     }
 
-    /// Queues the leaves as one pending log unit, sets the log fault for a
-    /// failed read, and discharges the obligation in one fail-closed keep
-    /// persist, then drains the queue. With nothing owed it does nothing.
+    /// Queues the leaves as one pending log unit and discharges the
+    /// obligation in one fail-closed keep persist, then drains the queue. With nothing owed it does nothing.
     ///
     /// The drain's own failure leaves the unit queued for the next drain and
     /// is logged by [`drain_pending_log_units`]; it does not fail the
@@ -91,9 +87,7 @@ impl ConsequenceSink {
     /// # Errors
     ///
     /// Returns [`ContextError::PersistenceFailed`] when the persist fails (the
-    /// queued unit, the fault, and the step's mutations stay in memory), or
-    /// [`ContextError::EventLogFailed`] when a leaf breaks the payload rules
-    /// (nothing is queued; the persist still runs).
+    /// queued unit and the step's mutations stay in memory).
     pub async fn discharge(
         mut self,
         cell: &mut ClassSCell,
@@ -102,26 +96,12 @@ impl ConsequenceSink {
     ) -> Result<(), ContextError> {
         let obligation = self.obligation.take();
         let leaves = std::mem::take(&mut self.leaves);
-        let read_fault = self.read_fault.take();
-        if obligation.is_none() && leaves.is_empty() && read_fault.is_none() {
+        if obligation.is_none() && leaves.is_empty() {
             return Ok(());
         }
-        if let Some(detail) = &read_fault {
-            tracing::error!(
-                context_id,
-                detail = %detail,
-                "event log unreadable after the step; the log fault is set"
-            );
-        }
         let mutate = move |mut view: ClassSMut| {
-            if let Some(detail) = read_fault {
-                view.set_log_fault(LogFaultMarker {
-                    base_seq: None,
-                    log_len: None,
-                    detail,
-                });
-            }
-            view.enqueue_log_unit(leaves)
+            view.enqueue_log_unit(leaves);
+            Ok(())
         };
         let result = match obligation {
             Some(token) => token.discharge_with(cell, deps, context_id, mutate).await,
@@ -134,14 +114,38 @@ impl ConsequenceSink {
 
 impl Drop for ConsequenceSink {
     fn drop(&mut self) {
-        if !self.leaves.is_empty() || self.read_fault.is_some() {
+        if !self.leaves.is_empty() {
             tracing::error!(
                 leaves = self.leaves.len(),
-                read_fault = self.read_fault.is_some(),
-                "ConsequenceSink dropped undischarged; consequence leaves or a log fault are lost"
+                "ConsequenceSink dropped undischarged; consequence leaves are lost"
             );
         }
     }
+}
+
+/// Plans one entry of a pending log unit before the operation's irreversible
+/// step, checking it against the append's payload rules (spec 17 §17.3 "Event
+/// log write failures"), so a payload that breaks them refuses the operation
+/// before the step and never after it.
+///
+/// # Errors
+///
+/// Returns [`ContextError::EventLogFailed`] when the payload breaks the
+/// append's payload rules for `event_type`.
+pub fn plan_leaf(
+    event_type: scp_event_log::EventType,
+    actor_did: String,
+    payload: scp_event_log::EventPayload,
+    timestamp_secs: u64,
+) -> Result<LeafSpec, ContextError> {
+    crate::context::providers::event_log::check_append_payload(event_type, &payload)
+        .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
+    Ok(LeafSpec {
+        event_type,
+        actor_did,
+        payload,
+        timestamp_secs,
+    })
 }
 
 /// True when the context has queued log units or a log fault, so a drain has
@@ -166,15 +170,13 @@ pub async fn drain_pending_log_units(
     deps: &ActorDeps,
     context_id: &str,
 ) -> Result<(), ContextError> {
+    let context_id_bytes = context_id_to_bytes(context_id);
+    sync_units_pending(cell, deps, &context_id_bytes);
     if !has_log_unit_work(cell) {
         return Ok(());
     }
-    let context_id_bytes = context_id_to_bytes(context_id);
     let drained = drain_queue(cell, deps, context_id, &context_id_bytes).await;
-    deps.event_log.set_units_pending(
-        &context_id_bytes,
-        !cell.class_s.pending_log_units.is_empty(),
-    );
+    sync_units_pending(cell, deps, &context_id_bytes);
     if let Err(e) = &drained {
         tracing::warn!(
             context_id,
@@ -186,13 +188,22 @@ pub async fn drain_pending_log_units(
     drained
 }
 
+/// Tells the provider whether the context's queue holds a unit, so the
+/// provider's fence equals "the queue is non-empty" (spec 17 §17.3 "Event log
+/// write failures").
+fn sync_units_pending(cell: &ClassSCell, deps: &ActorDeps, context_id_bytes: &[u8; 32]) {
+    deps.event_log
+        .set_units_pending(context_id_bytes, !cell.class_s.pending_log_units.is_empty());
+}
+
 async fn drain_queue(
     cell: &mut ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     context_id_bytes: &[u8; 32],
 ) -> Result<(), ContextError> {
-    // Whether the front unit was already reserved again in this drain.
+    // Whether the front unit was already reserved again past the log's end in
+    // this drain.
     let mut re_reserved = false;
     while let Some(front) = cell.class_s.pending_log_units.front() {
         let leaves: Vec<LeafSpec> = front.leaves.clone();
@@ -222,11 +233,9 @@ async fn drain_queue(
                 .await?;
                 re_reserved = false;
             }
-            Err(UnitAppendError::Misaligned {
-                slot_taken: true, ..
-            }) if !re_reserved => {
-                // An append outside the queue took the slot and the unit is
-                // absent: reserve it again at the log's length.
+            Err(UnitAppendError::PastEnd { .. }) if !re_reserved => {
+                // The unit is not in the log and nothing sits ahead of it:
+                // reserve it again at the log's length.
                 cell.commit_class_s_restore(deps, context_id, |mut view| {
                     view.set_front_log_unit_base(None);
                     Ok(())
@@ -234,9 +243,10 @@ async fn drain_queue(
                 .await?;
                 re_reserved = true;
             }
-            Err(UnitAppendError::Misaligned {
-                base_seq, log_len, ..
-            }) => {
+            Err(
+                UnitAppendError::PastEnd { base_seq, log_len }
+                | UnitAppendError::Misaligned { base_seq, log_len },
+            ) => {
                 let detail = format!(
                     "queued event log unit misaligned: base_seq {base_seq}, log length {log_len}"
                 );
@@ -245,8 +255,8 @@ async fn drain_queue(
                     deps,
                     context_id,
                     LogFaultMarker {
-                        base_seq: Some(base_seq),
-                        log_len: Some(log_len),
+                        base_seq,
+                        log_len,
                         detail: detail.clone(),
                     },
                 )
@@ -415,6 +425,22 @@ pub mod test_support {
             .map_or(0, |entries| entries.len())
     }
 
+    /// The consequence evidence an operation reads before its step: `state`'s
+    /// rules and queued units with `event_log` read in full.
+    pub fn pre_step_evidence(
+        state: &crate::context::actor::state::PerContextState,
+        ctx: &str,
+        event_log: &dyn ContextEventLogProvider,
+    ) -> crate::context::governance_logic::PreStepEvidence {
+        crate::context::governance_logic::PreStepEvidence::read(
+            &state.governance.consequence_rules,
+            &state.class_s.pending_log_units,
+            ctx,
+            event_log,
+        )
+        .expect("the log reads before the step")
+    }
+
     /// Supervisor-backed deps for `owner` with `event_log`, the given
     /// persistence (`None` persists nothing and succeeds), and a test clock.
     pub async fn deps_with(
@@ -462,11 +488,13 @@ pub mod test_support {
 mod tests {
     use scp_event_log::{EventPayload, EventType};
 
+    use scp_protocol::context::ContextError;
+
     use super::drain_pending_log_units;
     use super::test_support::{deps_with, fail_log_entry_writes, faulty_merkle_log, log_len};
-    use crate::context::actor::class_s::ClassSCell;
+    use crate::context::actor::class_s::{ClassSCell, PendingLogUnits};
     use crate::context::actor::state::PerContextState;
-    use crate::context::state::LeafSpec;
+    use crate::context::state::{LeafSpec, PendingLogUnit};
 
     const OWNER: &str = "did:dht:z6MkLogUnitFifo";
 
@@ -508,9 +536,12 @@ mod tests {
         // Two units are queued while the log rejects entry writes.
         fail_log_entry_writes(&faulty, &ctx_id_bytes);
         for unit in [vec![tagged_leaf(1), tagged_leaf(2)], vec![tagged_leaf(3)]] {
-            cell.commit_class_s_keep(&deps, &ctx, |mut v| v.enqueue_log_unit(unit))
-                .await
-                .expect("the enqueue persists");
+            cell.commit_class_s_keep(&deps, &ctx, |mut v| {
+                v.enqueue_log_unit(unit);
+                Ok(())
+            })
+            .await
+            .expect("the enqueue persists");
             assert!(
                 drain_pending_log_units(&mut cell, &deps, &ctx)
                     .await
@@ -568,5 +599,282 @@ mod tests {
             vec![1, 2, 3, 4],
             "the queued units land first, oldest first, then the append"
         );
+    }
+
+    /// A unit queued ahead of the log at `base_seq`, and the cell holding it.
+    fn cell_with_reserved_unit(
+        ctx_id_bytes: [u8; 32],
+        base_seq: u64,
+        leaves: Vec<LeafSpec>,
+    ) -> ClassSCell {
+        let mut state = PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            1_700_000_000,
+            scp_did::DID(OWNER.to_owned()),
+        );
+        state.class_s.pending_log_units = PendingLogUnits::validated(
+            std::iter::once(PendingLogUnit {
+                base_seq: Some(base_seq),
+                leaves,
+            })
+            .collect(),
+        )
+        .expect("a valid unit");
+        ClassSCell::new(state)
+    }
+
+    /// Spec 17 §17.3 "Event log write failures": the drain tells the provider
+    /// whether units are queued even when it has nothing to write, so a
+    /// respawned actor whose restored queue is empty clears a fence a failed
+    /// drain left set, and the next append is accepted.
+    #[tokio::test]
+    async fn drain_with_no_unit_clears_a_stale_fence() {
+        let ctx_id_bytes = [0x5Fu8; 32];
+        let ctx = hex::encode(ctx_id_bytes);
+        let (log, _faulty) = faulty_merkle_log();
+        let deps = deps_with(OWNER, None, Box::new(log)).await;
+        deps.event_log
+            .init_event_log(&ctx_id_bytes)
+            .await
+            .expect("init event log");
+        // A drain that failed before the respawn left the fence set.
+        deps.event_log.set_units_pending(&ctx_id_bytes, true);
+        let refused = deps
+            .event_log
+            .append_event(
+                &ctx_id_bytes,
+                EventType::MemberJoined,
+                "",
+                tagged_payload(1),
+                1_700_000_001,
+            )
+            .await;
+        assert!(
+            refused.is_err(),
+            "the fence refuses the append: {refused:?}"
+        );
+
+        let mut cell = ClassSCell::new(PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            1_700_000_000,
+            scp_did::DID(OWNER.to_owned()),
+        ));
+        drain_pending_log_units(&mut cell, &deps, &ctx)
+            .await
+            .expect("an empty queue drains");
+        deps.event_log
+            .append_event(
+                &ctx_id_bytes,
+                EventType::MemberJoined,
+                "",
+                tagged_payload(1),
+                1_700_000_001,
+            )
+            .await
+            .expect("the fence follows the empty queue");
+    }
+
+    /// A unit reserved past the log's end (the log lost its tail before a
+    /// restart) holds no slot another entry took: the drain reserves it again
+    /// at the log's length and writes it, with no log fault.
+    #[tokio::test]
+    async fn unit_past_the_log_end_is_reserved_again() {
+        let ctx_id_bytes = [0x60u8; 32];
+        let ctx = hex::encode(ctx_id_bytes);
+        let (log, _faulty) = faulty_merkle_log();
+        let deps = deps_with(OWNER, None, Box::new(log)).await;
+        deps.event_log
+            .init_event_log(&ctx_id_bytes)
+            .await
+            .expect("init event log");
+        let mut cell = cell_with_reserved_unit(ctx_id_bytes, 5, vec![tagged_leaf(7)]);
+
+        drain_pending_log_units(&mut cell, &deps, &ctx)
+            .await
+            .expect("the unit is reserved again and written");
+        assert!(cell.class_s.pending_log_units.is_empty());
+        assert!(cell.class_s.log_fault.is_none(), "no log fault is set");
+        let entries = deps
+            .event_log
+            .event_log_entries(&ctx_id_bytes)
+            .expect("the log reads")
+            .expect("the log exists");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].payload.data, tagged_payload(7).data);
+    }
+
+    /// A unit whose slot holds another entry sets the log fault and stays
+    /// queued, and the fault refuses a mutation with `EventLogFailed`.
+    #[tokio::test]
+    async fn misaligned_unit_sets_the_log_fault_and_refuses_mutations() {
+        let ctx_id_bytes = [0x61u8; 32];
+        let ctx = hex::encode(ctx_id_bytes);
+        let (log, _faulty) = faulty_merkle_log();
+        let deps = deps_with(OWNER, None, Box::new(log)).await;
+        deps.event_log
+            .init_event_log(&ctx_id_bytes)
+            .await
+            .expect("init event log");
+        for tag in 1..=3 {
+            deps.event_log
+                .append_event(
+                    &ctx_id_bytes,
+                    EventType::MemberJoined,
+                    "",
+                    tagged_payload(tag),
+                    1_700_000_000 + u64::from(tag),
+                )
+                .await
+                .expect("seed the log");
+        }
+        let mut cell = cell_with_reserved_unit(ctx_id_bytes, 1, vec![tagged_leaf(9)]);
+
+        let drained = drain_pending_log_units(&mut cell, &deps, &ctx).await;
+        assert!(
+            matches!(drained, Err(ContextError::EventLogFailed(_))),
+            "{drained:?}"
+        );
+        assert_eq!(
+            cell.class_s.pending_log_units.len(),
+            1,
+            "the unit stays queued"
+        );
+        let marker = cell
+            .class_s
+            .log_fault
+            .clone()
+            .expect("the misalignment sets the log fault");
+        assert_eq!((marker.base_seq, marker.log_len), (1, 3));
+        assert_eq!(log_len(&deps, &ctx_id_bytes), 3, "the log is unchanged");
+
+        let refused = crate::context::governance_helpers::execute_governance_action(
+            &mut cell,
+            &deps,
+            &ctx,
+            &[0u8; 32],
+            Some(&scp_did::DID(OWNER.to_owned())),
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(ContextError::EventLogFailed(_))),
+            "the log fault refuses the mutation: {refused:?}"
+        );
+    }
+
+    /// Spec 17 §17.3: a queue read back from storage is checked as an enqueue
+    /// would have checked it.
+    #[test]
+    fn restored_queue_refuses_an_invalid_unit() {
+        let empty = PendingLogUnits::validated(
+            std::iter::once(PendingLogUnit {
+                base_seq: None,
+                leaves: Vec::new(),
+            })
+            .collect(),
+        );
+        assert!(
+            matches!(empty, Err(ContextError::PersistenceFailed(_))),
+            "{empty:?}"
+        );
+
+        let breach = PendingLogUnits::validated(
+            std::iter::once(PendingLogUnit {
+                base_seq: None,
+                leaves: vec![LeafSpec {
+                    event_type: EventType::OutletInvoked,
+                    actor_did: String::new(),
+                    payload: outlet_invoked_payload(2, 3),
+                    timestamp_secs: 1_700_000_000,
+                }],
+            })
+            .collect(),
+        );
+        assert!(
+            matches!(breach, Err(ContextError::PersistenceFailed(_))),
+            "{breach:?}"
+        );
+
+        let valid = PendingLogUnits::validated(
+            std::iter::once(PendingLogUnit {
+                base_seq: Some(4),
+                leaves: vec![tagged_leaf(1)],
+            })
+            .collect(),
+        )
+        .expect("a valid unit is restored");
+        assert_eq!(valid.len(), 1);
+    }
+
+    /// Spec 17 §17.3: an entry is checked against the append's payload rules
+    /// when it is planned, before the step, so the enqueue after the step has
+    /// nothing left to refuse.
+    #[test]
+    fn plan_leaf_refuses_a_payload_rule_breach() {
+        let refused = super::plan_leaf(
+            EventType::OutletInvoked,
+            String::new(),
+            outlet_invoked_payload(2, 3),
+            1_700_000_000,
+        );
+        assert!(
+            matches!(refused, Err(ContextError::EventLogFailed(_))),
+            "{refused:?}"
+        );
+        super::plan_leaf(
+            EventType::OutletInvoked,
+            String::new(),
+            outlet_invoked_payload(3, 3),
+            1_700_000_000,
+        )
+        .expect("chunks_billed equal to the chunk count is admissible");
+    }
+
+    /// The consequence leaves carry no payload rule, so a consequence planned
+    /// by the engine can never be refused by the append.
+    #[test]
+    fn consequence_leaf_types_have_no_payload_rule() {
+        for event_type in [
+            EventType::ConsequenceTriggered,
+            EventType::ConsequenceEnforced,
+            EventType::ConsequenceEnforcementFailed,
+            EventType::ConsequenceEscalatedToSuspendAll,
+            EventType::RecoveryEpochAdvanced,
+        ] {
+            crate::context::providers::event_log::check_append_payload(
+                event_type,
+                &EventPayload {
+                    data: b"{\"any\":\"payload\"}".to_vec(),
+                },
+            )
+            .expect("no payload rule for this type");
+        }
+    }
+
+    /// An `OutletInvokedEvent` payload with the given chunk counts.
+    fn outlet_invoked_payload(stream_chunk_count: u32, chunks_billed: u32) -> EventPayload {
+        use scp_protocol::context::outlets::OutletStatus;
+        use scp_protocol::context::outlets::lifecycle::OutletInvokedEvent;
+        use scp_protocol::context::outlets::stream::StreamTerminalStatus;
+        let event = OutletInvokedEvent {
+            request_id: "00000000000000000000000000000001".to_owned(),
+            outlet_id: "outlet-x".to_owned(),
+            invoker_did: scp_did::DID("did:dht:z6MkInvoker".to_owned()),
+            status: OutletStatus::Success,
+            execution_time_ms: 5,
+            input_hash: "0".repeat(64),
+            output_hash: None,
+            cost: None,
+            stream_chunk_count,
+            chunks_billed,
+            stream_manifest_hash: [0x11; 32],
+            stream_terminal_status: StreamTerminalStatus::Ok,
+            cancel_ack_seq: None,
+            audit_anomaly: None,
+        };
+        EventPayload {
+            data: serde_json::to_vec(&event).expect("serialize the event"),
+        }
     }
 }

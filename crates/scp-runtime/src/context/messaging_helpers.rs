@@ -778,11 +778,12 @@ fn ingest_pseudonym_announcement(
 /// performed a downward-authorization mutation (a `suspended_capabilities` GROW
 /// or an `AssignRole` `member_capabilities` replacement); the durable leaves
 /// (the `Some(event_name)` leaf and every consequence leaf) go into it instead
-/// of being appended here; and a log read that fails after the delivery is
-/// recorded in it, which skips the evaluation for this message. The cell holder
+/// of being appended here. The evaluation runs over `evidence`, the log read
+/// before the delivery's step, plus the leaves already staged in `sink` and
+/// the receive buffer, so it reads nothing after the step. The cell holder
 /// discharges the sink after the borrowing view drops: one fail-closed keep
-/// persist queues the leaves as one pending log unit, sets the log fault, and
-/// persists the mutation. The returned `bool` mirrors whether the obligation
+/// persist queues the leaves as one pending log unit and persists the
+/// mutation. The returned `bool` mirrors whether the obligation
 /// was armed (retained as the RED-CS3b engine signal for callers that observe
 /// it).
 #[must_use]
@@ -790,6 +791,7 @@ fn ingest_pseudonym_announcement(
 pub fn run_buffered_post_delivery(
     view: &mut ClassCMut<'_>,
     sink: &mut crate::context::log_unit_helpers::ConsequenceSink,
+    evidence: &crate::context::governance_logic::PreStepEvidence,
     context_id: &str,
     sender_did: &str,
     event_name: Option<scp_event_log::EventType>,
@@ -806,7 +808,6 @@ pub fn run_buffered_post_delivery(
     // only and do NOT converge cross-member. Do not assume this value is live.
     event_timestamp_secs: u64,
     clock: &dyn Clock,
-    event_log: &dyn crate::context::builder::ContextEventLogProvider,
     event_tx: Option<&ContextEventSender>,
 ) -> bool {
     let now = clock.now_secs();
@@ -828,59 +829,67 @@ pub fn run_buffered_post_delivery(
         });
     }
 
-    let consequence_rules: Vec<ConsequenceRule> = view
-        .governance_class_c_mut()
-        .consequence_rules_mut()
-        .clone();
     // ADR-049 §9 (RED-CS3): `true` iff consequence enforcement performed a
     // downward-authorization mutation on this delivery (a capability suspension
-    // or an `AssignRole` demotion) — propagated to the cell-holding caller so the
-    // mutation persists fail-closed (keep-direction).
-    let read = if consequence_rules.is_empty() {
-        None
-    } else {
-        let (receive_buffer, queued) = view.consequence_read_inputs();
-        crate::context::governance_logic::consequence_events_after_step(
-            receive_buffer,
-            queued,
-            context_id,
-            now,
-            event_log,
-            sink,
-        )
-    };
-    // An unreadable log skips the evaluation (the sink carries the fault).
-    let downward_auth_applied = if let Some((events, convergent_now)) = read {
-        let triggered = evaluate_consequence_rules(
-            &consequence_rules,
-            &events,
-            sender_did,
-            now,
-            convergent_now,
-        );
-        let member_did = DID(sender_did.to_owned());
-        // The `receive_buffer` read above has ended (NLL) before `consequence_split`
-        // reborrows the disjoint consequence fields (incl. the GROW role view).
-        let mut split = view.consequence_split();
-        crate::context::governance_logic::enforce_triggered_consequences(
-            &mut split,
-            &crate::context::governance_logic::EnforceConsequencesCtx {
-                context_id,
-                member_did: &member_did,
-                now,
-                triggered: &triggered,
-                rules: &consequence_rules,
-                clock,
-                event_tx,
-            },
-            sink,
-        )
-    } else {
-        false
-    };
+    // or an `AssignRole` demotion).
+    let (events, convergent_now) = received_consequence_events(view, sink, evidence, now);
+    let triggered =
+        evaluate_consequence_rules(evidence.rules(), &events, sender_did, now, convergent_now);
+    let downward_auth_applied = enforce_after_receive(
+        view, sink, evidence, &triggered, context_id, sender_did, now, clock, event_tx,
+    );
 
     *view.checkpoint_events_since_mut() += 1;
     downward_auth_applied
+}
+
+/// The consequence evidence for a received or buffered delivery (spec 17
+/// §17.3 "Event log write failures"): the log read before the delivery's
+/// step (`evidence`), then the leaves already staged in `sink`, merged with
+/// the receive buffer, so the evaluation reads nothing after the step.
+fn received_consequence_events(
+    view: &ClassCMut<'_>,
+    sink: &crate::context::log_unit_helpers::ConsequenceSink,
+    evidence: &crate::context::governance_logic::PreStepEvidence,
+    now: u64,
+) -> (Vec<scp_event_log::Event>, u64) {
+    let (receive_buffer, _) = view.consequence_read_inputs();
+    evidence.events(sink.staged_leaves(), receive_buffer, now)
+}
+
+/// Enforces what the evaluation after a received or buffered delivery
+/// `triggered` for `sender_did`, staging the leaves in `sink`. Returns `true`
+/// when the enforcement performed a downward-authorization mutation.
+#[allow(clippy::too_many_arguments)]
+fn enforce_after_receive(
+    view: &mut ClassCMut<'_>,
+    sink: &mut crate::context::log_unit_helpers::ConsequenceSink,
+    evidence: &crate::context::governance_logic::PreStepEvidence,
+    triggered: &[scp_protocol::trust::consequence::TriggeredConsequence],
+    context_id: &str,
+    sender_did: &str,
+    now: u64,
+    clock: &dyn Clock,
+    event_tx: Option<&ContextEventSender>,
+) -> bool {
+    if triggered.is_empty() {
+        return false;
+    }
+    let member_did = DID(sender_did.to_owned());
+    let mut split = view.consequence_split();
+    crate::context::governance_logic::enforce_triggered_consequences(
+        &mut split,
+        &crate::context::governance_logic::EnforceConsequencesCtx {
+            context_id,
+            member_did: &member_did,
+            now,
+            triggered,
+            rules: evidence.rules(),
+            clock,
+            event_tx,
+        },
+        sink,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1444,6 +1453,25 @@ pub async fn deliver_incoming(
         .collect();
     drop(local_dids);
 
+    // The consequence evaluation after this delivery reads the log as it
+    // stands before the message is opened, plus the queued log units (spec 17
+    // §17.3 "Event log write failures"). Opening the envelope consumes MLS
+    // key material, so an unreadable log refuses the delivery here, before
+    // anything is consumed.
+    let evidence = {
+        let rules = view
+            .governance_class_c_mut()
+            .consequence_rules_mut()
+            .clone();
+        let (_, queued) = view.consequence_read_inputs();
+        crate::context::governance_logic::PreStepEvidence::read_for_rules(
+            &rules,
+            queued,
+            context_id,
+            &*deps.event_log,
+        )?
+    };
+
     // Phase 2: open envelope (MLS + sender key + deserialize + integrity).
     // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): open through the actor's field-granular
     // Class-C `&mut ContextCryptoState` (`mode_mut().crypto_mut()`). Broadcast
@@ -1548,8 +1576,15 @@ pub async fn deliver_incoming(
 
     // Anti-replay + reorder buffer (§9.8.2, §9.8.5).
     let now_ms = deps.clock.now_millis();
-    let sequence_check =
-        validate_and_drain_timeouts(view, deps, context_id, &inner, now_ms, downward_auth_sink)?;
+    let sequence_check = validate_and_drain_timeouts(
+        view,
+        deps,
+        context_id,
+        &inner,
+        now_ms,
+        &evidence,
+        downward_auth_sink,
+    )?;
 
     let is_local_sender = sender_did == local_member_did;
 
@@ -1563,6 +1598,7 @@ pub async fn deliver_incoming(
                 &inner,
                 &plaintext,
                 is_local_sender,
+                &evidence,
                 downward_auth_sink,
             )?;
             if consumed_as_announcement {
@@ -1580,6 +1616,7 @@ pub async fn deliver_incoming(
                 &sender_did,
                 &plaintext,
                 now_ms,
+                &evidence,
                 downward_auth_sink,
             );
             Ok(DeliverOutcome::Handled)
@@ -3300,6 +3337,7 @@ pub fn validate_and_drain_timeouts(
     context_id: &str,
     inner: &scp_protocol::envelope::inner::InnerEnvelope,
     now_ms: u64,
+    evidence: &crate::context::governance_logic::PreStepEvidence,
     downward_auth_sink: &mut crate::context::log_unit_helpers::ConsequenceSink,
 ) -> Result<SequenceCheck, ContextError> {
     // Timestamp validation first.
@@ -3356,6 +3394,7 @@ pub fn validate_and_drain_timeouts(
             let _ = run_buffered_post_delivery(
                 view,
                 downward_auth_sink,
+                evidence,
                 context_id,
                 &msg.sender_did,
                 event_name,
@@ -3366,7 +3405,6 @@ pub fn validate_and_drain_timeouts(
                 // (ADR-051). See `run_buffered_post_delivery`'s param doc.
                 msg.inner.timestamp / 1000,
                 &*deps.clock,
-                &*deps.event_log,
                 deps.event_tx.as_ref(),
             );
         }
@@ -3396,6 +3434,7 @@ pub fn buffer_ahead_message(
     sender_did: &str,
     plaintext: &[u8],
     now_ms: u64,
+    evidence: &crate::context::governance_logic::PreStepEvidence,
     downward_auth_sink: &mut crate::context::log_unit_helpers::ConsequenceSink,
 ) {
     let buffered_msg = scp_protocol::envelope::validation::BufferedMessage {
@@ -3451,6 +3490,7 @@ pub fn buffer_ahead_message(
             let _ = run_buffered_post_delivery(
                 view,
                 downward_auth_sink,
+                evidence,
                 context_id,
                 &msg.sender_did,
                 event_name,
@@ -3461,7 +3501,6 @@ pub fn buffer_ahead_message(
                 // (ADR-051). See `run_buffered_post_delivery`'s param doc.
                 msg.inner.timestamp / 1000,
                 &*deps.clock,
-                &*deps.event_log,
                 deps.event_tx.as_ref(),
             );
         }
@@ -3493,6 +3532,7 @@ pub fn deliver_message_and_drain_buffered(
     inner: &scp_protocol::envelope::inner::InnerEnvelope,
     plaintext: &[u8],
     skip_velocity: bool,
+    evidence: &crate::context::governance_logic::PreStepEvidence,
     downward_auth_sink: &mut crate::context::log_unit_helpers::ConsequenceSink,
 ) -> Result<bool, ContextError> {
     let sender_did_obj = DID(sender_did.to_owned());
@@ -3584,6 +3624,7 @@ pub fn deliver_message_and_drain_buffered(
                 let _ = run_buffered_post_delivery(
                     view,
                     downward_auth_sink,
+                    evidence,
                     context_id,
                     &msg.sender_did,
                     event_name,
@@ -3595,7 +3636,6 @@ pub fn deliver_message_and_drain_buffered(
                     // doc.
                     msg.inner.timestamp / 1000,
                     &*deps.clock,
-                    &*deps.event_log,
                     deps.event_tx.as_ref(),
                 );
             }
@@ -3606,49 +3646,26 @@ pub fn deliver_message_and_drain_buffered(
                     .velocity_tracker_mut()
                     .record_message(&DID(sender_did.to_owned()), now);
             }
-            let consequence_rules: Vec<ConsequenceRule> = view
-                .governance_class_c_mut()
-                .consequence_rules_mut()
-                .clone();
-            if !consequence_rules.is_empty()
-                && let Some((recv_events, convergent_now)) = {
-                    // An unreadable log skips the evaluation; the sink carries the
-                    // fault and the message is still delivered (spec 17 §17.3).
-                    let (receive_buffer, queued) = view.consequence_read_inputs();
-                    crate::context::governance_logic::consequence_events_after_step(
-                        receive_buffer,
-                        queued,
-                        context_id,
-                        now,
-                        &*deps.event_log,
-                        downward_auth_sink,
-                    )
-                }
-            {
-                let recv_triggered = evaluate_consequence_rules(
-                    &consequence_rules,
-                    &recv_events,
-                    sender_did,
-                    now,
-                    convergent_now,
-                );
-                let recv_member_did = DID(sender_did.to_owned());
-                let mut split = view.consequence_split();
-                // The GROW arms `downward_auth_sink` directly (GAP-A closed).
-                let _ = crate::context::governance_logic::enforce_triggered_consequences(
-                    &mut split,
-                    &crate::context::governance_logic::EnforceConsequencesCtx {
-                        context_id,
-                        member_did: &recv_member_did,
-                        now,
-                        triggered: &recv_triggered,
-                        rules: &consequence_rules,
-                        clock: &*deps.clock,
-                        event_tx: deps.event_tx.as_ref(),
-                    },
-                    downward_auth_sink,
-                );
-            }
+            let (events, convergent_now) =
+                received_consequence_events(view, downward_auth_sink, evidence, now);
+            let triggered = evaluate_consequence_rules(
+                evidence.rules(),
+                &events,
+                sender_did,
+                now,
+                convergent_now,
+            );
+            let _ = enforce_after_receive(
+                view,
+                downward_auth_sink,
+                evidence,
+                &triggered,
+                context_id,
+                sender_did,
+                now,
+                &*deps.clock,
+                deps.event_tx.as_ref(),
+            );
             *view.checkpoint_events_since_mut() += 1;
 
             return Ok(true);
@@ -3699,6 +3716,7 @@ pub fn deliver_message_and_drain_buffered(
         let _ = run_buffered_post_delivery(
             view,
             downward_auth_sink,
+            evidence,
             context_id,
             &msg.sender_did,
             event_name,
@@ -3709,7 +3727,6 @@ pub fn deliver_message_and_drain_buffered(
             // `run_buffered_post_delivery`'s param doc.
             msg.inner.timestamp / 1000,
             &*deps.clock,
-            &*deps.event_log,
             deps.event_tx.as_ref(),
         );
     }
@@ -3728,49 +3745,21 @@ pub fn deliver_message_and_drain_buffered(
             .velocity_tracker_mut()
             .record_message(&DID(sender_did.to_owned()), now);
     }
-    let consequence_rules: Vec<ConsequenceRule> = view
-        .governance_class_c_mut()
-        .consequence_rules_mut()
-        .clone();
-    if !consequence_rules.is_empty()
-        && let Some((recv_events, convergent_now)) = {
-            // An unreadable log skips the evaluation; the sink carries the
-            // fault and the message is still delivered (spec 17 §17.3).
-            let (receive_buffer, queued) = view.consequence_read_inputs();
-            crate::context::governance_logic::consequence_events_after_step(
-                receive_buffer,
-                queued,
-                context_id,
-                now,
-                &*deps.event_log,
-                downward_auth_sink,
-            )
-        }
-    {
-        let recv_triggered = evaluate_consequence_rules(
-            &consequence_rules,
-            &recv_events,
-            sender_did,
-            now,
-            convergent_now,
-        );
-        let recv_member_did = DID(sender_did.to_owned());
-        let mut split = view.consequence_split();
-        // The GROW arms `downward_auth_sink` directly (GAP-A closed).
-        let _ = crate::context::governance_logic::enforce_triggered_consequences(
-            &mut split,
-            &crate::context::governance_logic::EnforceConsequencesCtx {
-                context_id,
-                member_did: &recv_member_did,
-                now,
-                triggered: &recv_triggered,
-                rules: &consequence_rules,
-                clock: &*deps.clock,
-                event_tx: deps.event_tx.as_ref(),
-            },
-            downward_auth_sink,
-        );
-    }
+    let (events, convergent_now) =
+        received_consequence_events(view, downward_auth_sink, evidence, now);
+    let triggered =
+        evaluate_consequence_rules(evidence.rules(), &events, sender_did, now, convergent_now);
+    let _ = enforce_after_receive(
+        view,
+        downward_auth_sink,
+        evidence,
+        &triggered,
+        context_id,
+        sender_did,
+        now,
+        &*deps.clock,
+        deps.event_tx.as_ref(),
+    );
 
     *view.checkpoint_events_since_mut() += 1;
     crate::metrics::record_message_received();
@@ -4736,15 +4725,18 @@ mod pseudonym_routing_tests {
         // in-order path — this is exactly the call shape the four buffered-drain
         // sites now use.
         let mut obligation = crate::context::log_unit_helpers::ConsequenceSink::new();
+        let evidence = crate::context::log_unit_helpers::test_support::pre_step_evidence(
+            &state, &ctx, &event_log,
+        );
         let _suspended = run_buffered_post_delivery(
             &mut ClassCMut::from_state(&mut state),
             &mut obligation,
+            &evidence,
             &ctx,
             ALICE,
             event_name,
             1_700_000_000,
             &clock,
-            &event_log,
             None,
         );
         // No GROW occurs on this velocity-trigger path, so no obligation is armed.
@@ -4971,6 +4963,7 @@ mod pseudonym_routing_tests {
 
     #[tokio::test]
     async fn buffered_drain_call_site_runs_governance_for_application_message() {
+        use crate::context::log_unit_helpers::test_support::pre_step_evidence;
         use crate::context::messaging_helpers::validate_and_drain_timeouts;
         use scp_protocol::context::roles::Capability;
         use scp_protocol::envelope::validation::{BufferedMessage, DEFAULT_GAP_TIMEOUT_MS};
@@ -4990,12 +4983,10 @@ mod pseudonym_routing_tests {
             .add_member(DID(ALICE.to_owned()), "member".to_owned(), Vec::new());
         state.members.insert(DID(ALICE.to_owned()));
         state.role_state.members.insert(ALICE.to_owned());
-        let mut caps = std::collections::HashSet::new();
-        caps.insert(Capability::MessagesWrite);
-        state
-            .role_state
-            .member_capabilities
-            .insert(ALICE.to_owned(), caps);
+        state.role_state.member_capabilities.insert(
+            ALICE.to_owned(),
+            std::iter::once(Capability::MessagesWrite).collect(),
+        );
 
         // A MessageVelocity rule that trips on the first message. Received
         // application messages project to `EventType::MessageSent` for
@@ -5047,12 +5038,14 @@ mod pseudonym_routing_tests {
         let incoming = drain_test_inner(&ctx, 1);
         let now_ms = 1_700_000_000 + DEFAULT_GAP_TIMEOUT_MS + 10;
         let mut downward_auth_applied = crate::context::log_unit_helpers::ConsequenceSink::new();
+        let evidence = pre_step_evidence(&state, &ctx, deps.event_log.as_ref());
         validate_and_drain_timeouts(
             &mut ClassCMut::from_state(&mut state),
             &deps,
             &ctx,
             &incoming,
             now_ms,
+            &evidence,
             &mut downward_auth_applied,
         )
         .expect("validate_and_drain_timeouts");
@@ -5188,6 +5181,11 @@ mod pseudonym_routing_tests {
         let inner = drain_test_inner(&ctx, 1);
 
         let mut downward_auth_applied = crate::context::log_unit_helpers::ConsequenceSink::new();
+        let evidence = crate::context::log_unit_helpers::test_support::pre_step_evidence(
+            &state,
+            &ctx,
+            deps.event_log.as_ref(),
+        );
         let consumed = deliver_message_and_drain_buffered(
             &mut ClassCMut::from_state(&mut state),
             &deps,
@@ -5196,6 +5194,7 @@ mod pseudonym_routing_tests {
             &inner,
             &plaintext,
             false,
+            &evidence,
             &mut downward_auth_applied,
         )
         .expect("deliver_message_and_drain_buffered");
@@ -5375,6 +5374,7 @@ mod pseudonym_routing_tests {
 #[allow(clippy::expect_used)]
 mod log_unit_family_tests {
     use scp_did::DID;
+    use scp_protocol::context::ContextError;
     use scp_protocol::context::roles::Capability;
 
     use crate::context::actor::class_s::ClassSCell;
@@ -5507,7 +5507,10 @@ mod log_unit_family_tests {
         use super::*;
         use scp_protocol::envelope::validation::{BufferedMessage, DEFAULT_GAP_TIMEOUT_MS};
 
-        fn inner(ctx: &str, sequence: u64) -> scp_protocol::envelope::inner::InnerEnvelope {
+        pub(super) fn inner(
+            ctx: &str,
+            sequence: u64,
+        ) -> scp_protocol::envelope::inner::InnerEnvelope {
             scp_protocol::envelope::inner::InnerEnvelope {
                 version: scp_protocol::envelope::inner::SCP_INNER_ENVELOPE_VERSION,
                 context_id: ctx.to_owned(),
@@ -5545,6 +5548,11 @@ mod log_unit_family_tests {
                 });
             assert!(overflow.is_none(), "one buffered message does not overflow");
 
+            let evidence = crate::context::log_unit_helpers::test_support::pre_step_evidence(
+                &cell,
+                &ctx,
+                deps.event_log.as_ref(),
+            );
             let mut sink = crate::context::log_unit_helpers::ConsequenceSink::new();
             let delivered = crate::context::messaging_helpers::validate_and_drain_timeouts(
                 &mut cell.class_c_view(),
@@ -5552,6 +5560,7 @@ mod log_unit_family_tests {
                 &ctx,
                 &inner(&ctx, 1),
                 1_700_000_000 + DEFAULT_GAP_TIMEOUT_MS + 10,
+                &evidence,
                 &mut sink,
             );
             assert!(delivered.is_ok(), "the receive is delivered: {delivered:?}");
@@ -5567,6 +5576,202 @@ mod log_unit_family_tests {
                 "the buffered message was delivered"
             );
             assert_step_kept_and_leaves_queued(&cell, &deps, &ctx_id_bytes);
+        }
+
+        /// A message that overflows the reorder buffer force-delivers the
+        /// buffered run, and each delivery is evaluated. A log that rejects
+        /// the leaves keeps the deliveries and the suspension and queues the
+        /// leaves.
+        #[tokio::test]
+        async fn overflow_drain_append_failure_keeps_step_and_queues_leaf() {
+            let (mut cell, deps, ctx, ctx_id_bytes) = tripped_context(0x63).await;
+            // Fill the per-sender buffer to its bound with sequences 2..=101.
+            for sequence in 2..=101 {
+                let overflow = cell
+                    .class_c_view()
+                    .reorder_buffer_mut()
+                    .buffer(BufferedMessage {
+                        inner: inner(&ctx, sequence),
+                        sender_did: MEMBER.to_owned(),
+                        plaintext: b"buffered application payload".to_vec(),
+                        received_at: 1_700_000_000,
+                    });
+                assert!(overflow.is_none(), "the buffer is not yet full");
+            }
+
+            let evidence = crate::context::log_unit_helpers::test_support::pre_step_evidence(
+                &cell,
+                &ctx,
+                deps.event_log.as_ref(),
+            );
+            let mut sink = crate::context::log_unit_helpers::ConsequenceSink::new();
+            crate::context::messaging_helpers::buffer_ahead_message(
+                &mut cell.class_c_view(),
+                &deps,
+                &ctx,
+                &inner(&ctx, 102),
+                MEMBER,
+                b"overflowing payload",
+                1_700_000_000,
+                &evidence,
+                &mut sink,
+            );
+            let persisted = sink.discharge(&mut cell, &deps, &ctx).await;
+
+            assert!(
+                persisted.is_ok(),
+                "the leaves are queued, so the receive's persist succeeds: {persisted:?}"
+            );
+            assert_eq!(
+                cell.class_c_view().reorder_buffer_mut().total_buffered(),
+                0,
+                "the overflow delivered the buffered run"
+            );
+            assert_step_kept_and_leaves_queued(&cell, &deps, &ctx_id_bytes);
+        }
+    }
+
+    mod receive {
+        use super::*;
+
+        use super::buffered_loops::inner;
+
+        /// An in-order received message is delivered before its consequences
+        /// are evaluated. A log that rejects the leaves keeps the delivery and
+        /// the suspension and queues the leaves; the receive is not refused.
+        #[tokio::test]
+        async fn in_order_append_failure_keeps_step_and_queues_leaf() {
+            let (mut cell, deps, ctx, ctx_id_bytes) = tripped_context(0x64).await;
+            let evidence = crate::context::log_unit_helpers::test_support::pre_step_evidence(
+                &cell,
+                &ctx,
+                deps.event_log.as_ref(),
+            );
+            let mut sink = crate::context::log_unit_helpers::ConsequenceSink::new();
+            let delivered = crate::context::messaging_helpers::deliver_message_and_drain_buffered(
+                &mut cell.class_c_view(),
+                &deps,
+                &ctx,
+                MEMBER,
+                &inner(&ctx, 1),
+                b"in-order application payload",
+                false,
+                &evidence,
+                &mut sink,
+            );
+            assert!(
+                matches!(delivered, Ok(false)),
+                "the message is delivered: {delivered:?}"
+            );
+            let persisted = sink.discharge(&mut cell, &deps, &ctx).await;
+            assert!(
+                persisted.is_ok(),
+                "the leaves are queued, so the receive's persist succeeds: {persisted:?}"
+            );
+            assert_step_kept_and_leaves_queued(&cell, &deps, &ctx_id_bytes);
+        }
+
+        /// The evaluation after the delivery runs over the log read before
+        /// it, so a log that becomes unreadable after the read neither skips
+        /// the evaluation nor faults the context (spec 17 §17.3 "Event log
+        /// write failures").
+        #[tokio::test]
+        async fn evaluation_after_the_step_uses_the_read_before_it() {
+            let (mut cell, deps, ctx, ctx_id_bytes) = tripped_context(0x65).await;
+            let evidence = crate::context::log_unit_helpers::test_support::pre_step_evidence(
+                &cell,
+                &ctx,
+                deps.event_log.as_ref(),
+            );
+            deps.event_log.release_event_log(&ctx_id_bytes);
+            assert!(
+                deps.event_log.event_log_entries(&ctx_id_bytes).is_err(),
+                "the released log is unreadable"
+            );
+
+            let mut sink = crate::context::log_unit_helpers::ConsequenceSink::new();
+            let delivered = crate::context::messaging_helpers::deliver_message_and_drain_buffered(
+                &mut cell.class_c_view(),
+                &deps,
+                &ctx,
+                MEMBER,
+                &inner(&ctx, 1),
+                b"in-order application payload",
+                false,
+                &evidence,
+                &mut sink,
+            );
+            assert!(matches!(delivered, Ok(false)), "{delivered:?}");
+            assert_eq!(
+                sink.staged_leaves()
+                    .iter()
+                    .map(|leaf| leaf.event_type)
+                    .collect::<Vec<_>>(),
+                SUSPENSION_LEAVES.to_vec(),
+                "the evaluation ran and staged the consequence leaves"
+            );
+            let _ = sink.discharge(&mut cell, &deps, &ctx).await;
+            assert!(
+                cell.role_state
+                    .suspended_for(MEMBER)
+                    .is_some_and(|caps| caps.contains(&Capability::MessagesWrite)),
+                "the consequence's suspension is applied"
+            );
+            assert!(cell.class_s.log_fault.is_none(), "no log fault is set");
+        }
+
+        /// A receive whose log read fails is refused before the envelope is
+        /// opened, so no MLS key material is consumed and no delivery runs
+        /// without its evaluation. The control shows the same bytes reach
+        /// the envelope open when the log reads.
+        #[tokio::test]
+        async fn unreadable_log_refuses_the_receive_before_the_envelope_opens() {
+            let (mut cell, deps, ctx, ctx_id_bytes) = tripped_context(0x66).await;
+            // The node's own identity is a local member, so the receive gets
+            // past the local-member lookup to the log read.
+            deps.local_dids.store(std::sync::Arc::new(
+                std::iter::once(DID(OWNER.to_owned())).collect(),
+            ));
+            cell.class_c_view().membership_class_c_mut().add_member(
+                DID(OWNER.to_owned()),
+                "admin".to_owned(),
+                Vec::new(),
+            );
+            let blob = b"not an MLS message";
+
+            let mut sink = crate::context::log_unit_helpers::ConsequenceSink::new();
+            let mut commit_sink = None;
+            let control = crate::context::messaging_helpers::deliver_incoming(
+                &mut cell.class_c_view(),
+                &deps,
+                &ctx,
+                blob,
+                &mut sink,
+                &mut commit_sink,
+            )
+            .await;
+            assert!(
+                matches!(control, Err(ref e) if !matches!(e, ContextError::ContextNotRegistered(_))
+                    && !e.to_string().contains("no local member")),
+                "with a readable log the bytes reach the envelope open: {control:?}"
+            );
+
+            deps.event_log.release_event_log(&ctx_id_bytes);
+            let refused = crate::context::messaging_helpers::deliver_incoming(
+                &mut cell.class_c_view(),
+                &deps,
+                &ctx,
+                blob,
+                &mut sink,
+                &mut commit_sink,
+            )
+            .await;
+            assert!(
+                matches!(refused, Err(ContextError::ContextNotRegistered(_))),
+                "the failed read refuses the receive: {refused:?}"
+            );
+            assert!(sink.is_empty(), "nothing was evaluated or staged");
+            let _ = sink.discharge(&mut cell, &deps, &ctx).await;
         }
     }
 }

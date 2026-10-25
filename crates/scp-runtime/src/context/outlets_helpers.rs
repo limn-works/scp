@@ -152,6 +152,9 @@ pub struct OutletEconomyTicket {
     escrow: Option<PreparedAction>,
     policy_for_capture: Option<scp_protocol::economy::types::EconomicPolicy>,
     metrics_for_capture: ObservableMetrics,
+    /// The consequence rules and the log read before the outlet ran, for the
+    /// evaluation after it (spec 17 §17.3 "Event log write failures").
+    consequence_evidence: crate::context::governance_logic::PreStepEvidence,
     needs_hard_rate_limit_refund: bool,
     consumed: bool,
 }
@@ -209,6 +212,7 @@ impl OutletEconomyTicket {
             escrow: None,
             policy_for_capture: None,
             metrics_for_capture: ObservableMetrics::default(),
+            consequence_evidence: crate::context::governance_logic::PreStepEvidence::default(),
             needs_hard_rate_limit_refund: true,
             consumed: false,
         }
@@ -235,6 +239,7 @@ impl OutletEconomyTicket {
             escrow: Some(escrow),
             policy_for_capture: Some(policy),
             metrics_for_capture: ObservableMetrics::default(),
+            consequence_evidence: crate::context::governance_logic::PreStepEvidence::default(),
             needs_hard_rate_limit_refund: true,
             consumed: false,
         }
@@ -716,6 +721,7 @@ pub async fn reserve_outlet_economy(
     let metrics;
     let economic_policy;
     let action_cost;
+    let consequence_evidence;
     {
         let mut view = cell.class_c_view();
 
@@ -771,16 +777,28 @@ pub async fn reserve_outlet_economy(
         // fails the invocation, and the velocity tick and hard-rate token
         // taken above are returned (spec section 17.3, "Event log write
         // failures").
+        // The same read is the evidence for the evaluation after the outlet
+        // runs, which reads nothing itself.
+        let rules = view
+            .governance_class_c_mut()
+            .consequence_rules_mut()
+            .clone();
         let (receive_buffer, queued) = view.consequence_read_inputs();
-        let read = crate::context::governance_logic::event_log_entries_for_consequences(
-            receive_buffer,
+        let read = crate::context::governance_logic::PreStepEvidence::read(
+            &rules,
             queued,
             context_id,
-            now_secs,
             event_log.as_ref(),
-        );
+        )
+        .map(|evidence| {
+            let merged = evidence.events(&[], receive_buffer, now_secs);
+            (evidence, merged)
+        });
         let (events_snapshot, convergent_now) = match read {
-            Ok(read) => read,
+            Ok((evidence, merged)) => {
+                consequence_evidence = evidence;
+                merged
+            }
             Err(e) => {
                 let gov = view.governance_class_c_mut();
                 gov.velocity_tracker_mut()
@@ -1137,6 +1155,7 @@ pub async fn reserve_outlet_economy(
         escrow,
         policy_for_capture: economic_policy,
         metrics_for_capture: metrics,
+        consequence_evidence,
         needs_hard_rate_limit_refund: true,
         consumed: false,
     };
@@ -2347,7 +2366,7 @@ pub async fn settle_outlet_economy_capture(
     deps: &ActorDeps,
     context_id: &str,
     invoker_did: &DID,
-    ticket: OutletEconomyTicket,
+    mut ticket: OutletEconomyTicket,
     sink: &mut crate::context::log_unit_helpers::ConsequenceSink,
 ) -> Result<
     (
@@ -2361,34 +2380,29 @@ pub async fn settle_outlet_economy_capture(
     let payment_adapter = deps.payment_adapter.clone();
 
     let now = clock.now_secs();
-    let read = {
-        let (receive_buffer, queued) = view.consequence_read_inputs();
-        crate::context::governance_logic::consequence_events_after_step(
-            receive_buffer,
-            queued,
-            context_id,
-            now,
-            deps.event_log.as_ref(),
-            sink,
-        )
+    // The evaluation runs over the log read before the outlet ran (carried by
+    // the ticket), plus the leaves staged since and the receive buffer, so it
+    // reads nothing after the step (spec 17 §17.3 "Event log write failures").
+    let evidence = std::mem::take(&mut ticket.consequence_evidence);
+    let (events_for_consequences, convergent_now) = {
+        let (receive_buffer, _) = view.consequence_read_inputs();
+        evidence.events(sink.staged_leaves(), receive_buffer, now)
     };
+    // The rules are read now, as they stand at the capture: a rule change
+    // that landed while the outlet ran applies to this capture.
     let consequence_rules = view
         .governance_class_c_mut()
         .consequence_rules_mut()
         .clone();
-
-    // An unreadable log skips the evaluation (the sink carries the fault).
-    let consequences = read.map_or_else(Vec::new, |(events_for_consequences, convergent_now)| {
-        post_outlet_invocation_bookkeeping(
-            &events_for_consequences,
-            invoker_did,
-            context_id,
-            now,
-            convergent_now,
-            view.governance_class_c_mut().participation_cache_mut(),
-            &consequence_rules,
-        )
-    });
+    let consequences = post_outlet_invocation_bookkeeping(
+        &events_for_consequences,
+        invoker_did,
+        context_id,
+        now,
+        convergent_now,
+        view.governance_class_c_mut().participation_cache_mut(),
+        &consequence_rules,
+    );
 
     // Consequence path (ADR-049 §9 / RED-CS3). `consequence_split()` yields the
     // consequence-engine split — disjoint Class-C / structural borrows plus the
@@ -3623,9 +3637,19 @@ mod tests {
                 .push(suspend_messages_write_rule());
             let mut cell = ClassSCell::new(state);
 
+            // The reserve reads the log before the outlet runs and carries the
+            // read on the ticket.
+            let mut ticket =
+                super::super::OutletEconomyTicket::new_for_test_no_escrow(invoker.clone());
+            ticket.consequence_evidence =
+                crate::context::log_unit_helpers::test_support::pre_step_evidence(
+                    &cell,
+                    &ctx,
+                    deps.event_log.as_ref(),
+                );
             let request = super::super::OutletSettleRequest::Capture {
                 generation: cell.generation,
-                ticket: super::super::OutletEconomyTicket::new_for_test_no_escrow(invoker.clone()),
+                ticket,
             };
             let settled =
                 super::super::settle_outlet_economy(&mut cell, &deps, &ctx, &invoker, request)

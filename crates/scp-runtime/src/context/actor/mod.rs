@@ -417,7 +417,10 @@ impl ContextActor {
         //
         // Drain the queued log units first (spec 17 §17.3 "Event log write
         // failures"): an actor starts on spawn, respawn, and restore, and a
-        // restored queue is written before any command runs.
+        // restored queue is written before any command runs. The drain sets
+        // the provider fence from the restored queue unconditionally, so a
+        // fence a failed drain of an earlier actor left is cleared when the
+        // restored queue is empty.
         self.drain_log_units().await;
         loop {
             // Reconcile the ACTOR-OWNED timer arms and the push-route watch
@@ -645,19 +648,13 @@ impl ContextActor {
         }
     }
 
-    /// Dispatch a single command to its matching handler: threads the
-    /// actor-owned state/deps through `dispatch_state` into the
-    /// per-domain actor-shape `dispatch` entry points. Returns whether the
-    /// handler's [`Outcome`] carries `Ok`; the run loop reads it to tell
-    /// whether a flush's write landed.
-    /// Drains the context's queued log units when there are any (spec 17
-    /// §17.3 "Event log write failures"). A failed drain leaves the units
-    /// queued and the provider fence set, so the command that follows cannot
-    /// write ahead of them; the drain logs the failure.
+    /// Drains the context's queued log units (spec 17 §17.3 "Event log write
+    /// failures"). The drain first tells the provider whether the queue holds
+    /// a unit, every time, so the provider fence follows the queue even when
+    /// there is nothing to drain. A failed drain leaves the units queued and
+    /// the fence set, so the command that follows cannot write ahead of them;
+    /// the drain logs the failure.
     async fn drain_log_units(&mut self) {
-        if !crate::context::log_unit_helpers::has_log_unit_work(&self.state) {
-            return;
-        }
         if let Err(err) = crate::context::log_unit_helpers::drain_pending_log_units(
             &mut self.state,
             &self.deps,
@@ -673,6 +670,11 @@ impl ContextActor {
         }
     }
 
+    /// Dispatch a single command to its matching handler: threads the
+    /// actor-owned state/deps through `dispatch_state` into the
+    /// per-domain actor-shape `dispatch` entry points. Returns whether the
+    /// handler's [`Outcome`] carries `Ok`; the run loop reads it to tell
+    /// whether a flush's write landed.
     async fn dispatch(&mut self, cmd: ContextCommand) -> bool {
         // `dispatch_state` receives the `&mut ClassSCell` directly and threads
         // it into every domain handler. Every domain mutates through the cell's
@@ -1681,6 +1683,7 @@ mod tests {
             &inner,
             &announcement_bytes(DIRECT_ALICE, pseudonym),
             true,
+            &crate::context::governance_logic::PreStepEvidence::default(),
             &mut downward_auth_applied,
         )
         .expect("a legitimate announcement is consumed, not an error");
@@ -1710,6 +1713,7 @@ mod tests {
             &inner,
             &announcement_bytes(DIRECT_BOB, [0x42u8; 32]),
             true,
+            &crate::context::governance_logic::PreStepEvidence::default(),
             &mut downward_auth_applied,
         );
         assert!(
@@ -1742,6 +1746,7 @@ mod tests {
             &inner,
             &announcement_bytes(DIRECT_ALICE, [0u8; 32]), // zero sentinel = reserved
             true,
+            &crate::context::governance_logic::PreStepEvidence::default(),
             &mut downward_auth_applied,
         );
         assert!(
@@ -1768,6 +1773,7 @@ mod tests {
                 &inner,
                 &announcement_bytes(DIRECT_ALICE, rid),
                 true,
+                &crate::context::governance_logic::PreStepEvidence::default(),
                 &mut downward_auth_applied,
             )
             .expect("same-DID re-announce must succeed");
@@ -1814,6 +1820,7 @@ mod tests {
             &inner,
             &plaintext,
             true,
+            &crate::context::governance_logic::PreStepEvidence::default(),
             &mut downward_auth_applied,
         )
     }

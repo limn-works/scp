@@ -93,8 +93,7 @@ pub fn check_commit_fault(state: &PerContextState) -> Result<(), ContextError> {
 
 /// Returns [`ContextError::EventLogFailed`] when the log-fault marker is set
 /// (spec 17 §17.3 "Event log write failures"): a queued log unit could not be
-/// placed in the log, or a log read after an irreversible step failed. Called
-/// at every site that calls the commit-fault gate.
+/// placed in the log. Called at every site that calls the commit-fault gate.
 ///
 /// # Errors
 ///
@@ -104,7 +103,7 @@ pub fn check_log_fault_marker(
 ) -> Result<(), ContextError> {
     if let Some(marker) = marker {
         return Err(ContextError::EventLogFailed(format!(
-            "the context's event log is faulted (base_seq {:?}, log length {:?}): {}",
+            "the context's event log is faulted (base_seq {}, log length {}): {}",
             marker.base_seq, marker.log_len, marker.detail
         )));
     }

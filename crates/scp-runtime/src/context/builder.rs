@@ -257,21 +257,24 @@ pub enum UnitAppended {
 /// §17.3 "Event log write failures").
 #[derive(Debug, thiserror::Error)]
 pub enum UnitAppendError {
-    /// The log neither has length `base_seq` nor holds the unit at
-    /// `base_seq`.
-    #[error(
-        "event log unit misaligned: base_seq {base_seq}, log length {log_len}, slot taken {slot_taken}"
-    )]
+    /// `base_seq` is greater than the log's length: the unit is not in the
+    /// log and no entry sits ahead of it, so the drain reserves it again at
+    /// the log's length.
+    #[error("event log unit past the end: base_seq {base_seq}, log length {log_len}")]
+    PastEnd {
+        /// The `base_seq` the unit was reserved at.
+        base_seq: u64,
+        /// The log's length.
+        log_len: u64,
+    },
+    /// The log holds other entries at `base_seq`, so placing the unit would
+    /// put it after an entry from a later step. The drain sets the log fault.
+    #[error("event log unit misaligned: base_seq {base_seq}, log length {log_len}")]
     Misaligned {
         /// The `base_seq` the unit was reserved at.
         base_seq: u64,
         /// The log's length.
         log_len: u64,
-        /// True when the log is longer than `base_seq` and its entry at
-        /// `base_seq` is not the unit's first entry: an append outside the
-        /// queue took the slot and the unit is absent, so the drain reserves
-        /// the unit again.
-        slot_taken: bool,
     },
     /// The unit is malformed, the context has no log, or storing the unit
     /// failed. The in-memory log is then unchanged.
@@ -461,7 +464,9 @@ pub trait ContextEventLogProvider: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`UnitAppendError::Misaligned`] when neither holds, and
+    /// Returns [`UnitAppendError::PastEnd`] when `base_seq` is greater than
+    /// the log's length, [`UnitAppendError::Misaligned`] when the log holds
+    /// other entries at `base_seq`, and
     /// [`UnitAppendError::Failed`] when the unit is malformed, the context has
     /// no log, or storing the unit fails.
     async fn append_unit(
@@ -510,23 +515,22 @@ pub trait ContextEventLogProvider: Send + Sync {
             crate::context::providers::event_log::UnitPlacement::AlreadyPresent => {
                 Ok(UnitAppended::AlreadyPresent)
             }
-            crate::context::providers::event_log::UnitPlacement::Misaligned {
-                log_len,
-                slot_taken,
-            } => Err(UnitAppendError::Misaligned {
-                base_seq,
-                log_len,
-                slot_taken,
-            }),
+            crate::context::providers::event_log::UnitPlacement::PastEnd { log_len } => {
+                Err(UnitAppendError::PastEnd { base_seq, log_len })
+            }
+            crate::context::providers::event_log::UnitPlacement::Misaligned { log_len } => {
+                Err(UnitAppendError::Misaligned { base_seq, log_len })
+            }
         }
     }
 
     /// Records whether the context has queued log units (spec 17 §17.3
     /// "Event log write failures"). While it does, a provider that keeps a
-    /// write gate refuses a fail-closed append, an import, and a prune for
-    /// the context, so no entry lands ahead of a queued one and no replace
-    /// re-chains the sequences a reserved `base_seq` names. The drain calls
-    /// this after each run.
+    /// write gate refuses a fail-closed append, an import, a prune, and an
+    /// init for the context, checked under the gate, so no entry lands ahead
+    /// of a queued one and no replace re-chains the sequences a reserved
+    /// `base_seq` names. The actor calls this when it starts, and the drain
+    /// calls it before it takes the write gate and on every exit.
     ///
     /// The default does nothing: a provider without a write gate has no
     /// writer outside the context's actor, and the actor drains the queue

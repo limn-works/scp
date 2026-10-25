@@ -2888,8 +2888,8 @@ mod tests {
             leaves: vec![leaf(3, 1_700_000_003)],
         });
         snapshot.log_fault = Some(LogFaultMarker {
-            base_seq: Some(17),
-            log_len: Some(20),
+            base_seq: 17,
+            log_len: 20,
             detail: "misaligned".to_owned(),
         });
 
