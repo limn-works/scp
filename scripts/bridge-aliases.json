@@ -2828,29 +2828,29 @@
       ]
     },
     {
-      "canonical": "push_register",
+      "canonical": "push_enable",
       "category": "push",
       "pyo3": [
-        "push_register"
+        "push_enable"
       ],
       "uniffi": [
         "push_enable"
       ],
       "napi": [
-        "push_register"
+        "push_enable"
       ]
     },
     {
-      "canonical": "push_deregister",
+      "canonical": "push_disable",
       "category": "push",
       "pyo3": [
-        "push_deregister"
+        "push_disable"
       ],
       "uniffi": [
         "push_disable"
       ],
       "napi": [
-        "push_deregister"
+        "push_disable"
       ]
     },
     {

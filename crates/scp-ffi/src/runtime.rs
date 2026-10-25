@@ -555,6 +555,14 @@ pub struct PyBridgeInstance {
     /// which is only compiled with that feature.
     #[cfg(feature = "testing")]
     pub(crate) network: std::sync::Mutex<Option<scp_testing::fullstack::FullStackNetwork>>,
+
+    /// The push platform enabled on this instance, whose wake signal
+    /// `push_handle_wake` checks each payload against (ADR-025 criterion 4).
+    ///
+    /// Story PUSH-037's `push_enable` fills it; until then only the
+    /// `testing` installer does, so a shipped build's wake raises
+    /// `SCP-TRANS-5105`. Cleared on shutdown.
+    pub(crate) push: scp_ffi_common::push::PushSlot<scp_core::discovery::PushPlatform>,
 }
 
 impl PyBridgeInstance {
@@ -581,6 +589,7 @@ impl PyBridgeInstance {
             outlet_streaming_saga_registry,
             #[cfg(feature = "testing")]
             network: std::sync::Mutex::new(None),
+            push: scp_ffi_common::push::PushSlot::default(),
         }
     }
 
@@ -690,6 +699,7 @@ impl PyBridgeInstance {
                     outlet_streaming_saga_registry,
                     #[cfg(feature = "testing")]
                     network: std::sync::Mutex::new(None),
+                    push: scp_ffi_common::push::PushSlot::default(),
                 };
                 let _ = instance
                     .storage_provider
@@ -816,6 +826,7 @@ impl BridgeInstanceCore for PyBridgeInstance {
         // connections drop, allowing background tasks to terminate cleanly.
         self.mcp_server_registry.clear();
         self.mcp_client_registry.clear();
+        self.push.clear();
         // Reset lifecycle-owned typed slots so their held URLs / networks
         // do not survive past shutdown. Best-effort: on lock poisoning
         // we swallow the error and leave the slot alone — a poisoned

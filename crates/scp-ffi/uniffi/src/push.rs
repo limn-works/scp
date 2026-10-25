@@ -2,30 +2,33 @@
 //! `push_handle_wake` (story PUSH-015; ADR-025 criterion 4, ADR-027
 //! criterion 10).
 //!
-//! `push_handle_wake(payload)` hands the payload to the enabled provider's
-//! `handle_notification`, which applies the platform's receipt rule and
-//! returns the wake signal bytes or throws. A thrown [`ScpError`] returns to
-//! the caller unchanged and no relay connection opens. The returned bytes go
-//! to [`scp_ffi_common::push::handle_wake`], which checks them against the
-//! enabled platform's wake signal and runs the ADR-029 §2 push-wake pull.
+//! `push_handle_wake(payload)` starts with
+//! [`scp_ffi_common::push::begin_wake`]: a shut-down instance returns the
+//! `Failed` outcome `SCP-TRANS-5085`, and an instance with no enabled
+//! provider returns `SCP-TRANS-5105`. It then hands the payload to the
+//! enabled provider's `handle_notification`, which applies the platform's
+//! receipt rule and returns the wake signal bytes or throws. A thrown
+//! [`ScpError`] returns to the caller unchanged and no relay connection
+//! opens. The returned bytes go to [`scp_ffi_common::push::handle_wake`],
+//! which checks them against the enabled platform's wake signal and runs the
+//! ADR-029 §2 push-wake pull.
 //!
 //! `push_enable` and `push_disable` check the instance first
 //! (`SCP-CTX-2138` when it is shut down, `SCP-IDENT-1002` when it holds no
 //! local member DID), then return `SCP-TRANS-5104` before they touch the
 //! provider: the registrar signs with the device's P-256 `#active` key,
 //! and no production constructor builds it until story PUSH-036. Story
-//! PUSH-037 makes them register and deregister and fill the instance's
-//! provider slot, [`UniffiBridgeInstance::push`]. Until then the slot stays
-//! empty in a shipped build, so `push_handle_wake` returns `SCP-TRANS-5105`.
-//!
-//! [`UniffiBridgeInstance::push`]: crate::runtime::UniffiBridgeInstance
+//! PUSH-037 makes them register and deregister, return each relay's result
+//! as [`PushRelayOutcomes`], and fill the instance's provider slot. Until
+//! then the slot stays empty in a shipped build, so `push_handle_wake`
+//! returns `SCP-TRANS-5105`.
 
 use std::sync::Arc;
 
 use scp_ffi_common::bridge_instance::CoreFields;
 use scp_ffi_common::push::{
-    PushRegistrationError, WakeContextFailureView, WakeError, WakeFailureView,
-    check_push_registration_ready, push_registration_unavailable,
+    PushRegistrationError, WakeContextFailureView, WakeEntry, WakeError, WakeFailureView,
+    begin_wake, push_registration,
 };
 
 use crate::PushProvider;
@@ -117,8 +120,8 @@ impl From<WakeFailureView> for WakeFailureInfo {
     }
 }
 
-impl From<scp_ffi_common::push::WakeOutcome> for WakeOutcome {
-    fn from(outcome: scp_ffi_common::push::WakeOutcome) -> Self {
+impl From<&scp_ffi_common::push::WakeOutcome> for WakeOutcome {
+    fn from(outcome: &scp_ffi_common::push::WakeOutcome) -> Self {
         match outcome {
             scp_ffi_common::push::WakeOutcome::NewData => Self::NewData,
             scp_ffi_common::push::WakeOutcome::NoData => Self::NoData,
@@ -127,6 +130,35 @@ impl From<scp_ffi_common::push::WakeOutcome> for WakeOutcome {
             },
         }
     }
+}
+
+/// Each relay's result of a `push_enable` or `push_disable`, mirroring the
+/// registrar's `RelayOutcomes`: deregistrations first, then registrations
+/// (`10-infrastructure-and-self-hosting.md` §10.7.1).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct PushRelayOutcomes {
+    /// Each `PushDeregistration`, one entry per relay.
+    pub deregistered: Vec<PushRelayResult>,
+    /// Each `PushRegistration`, one entry per relay.
+    pub registered: Vec<PushRelayResult>,
+}
+
+/// One relay's result in a [`PushRelayOutcomes`].
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct PushRelayResult {
+    /// The relay's canonical URL (`09-security-model.md` §9.5.2).
+    pub relay_url: String,
+    /// Why the relay refused; `None` when it accepted.
+    pub failure: Option<PushRelayFailure>,
+}
+
+/// Why one relay refused a push registration or deregistration.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct PushRelayFailure {
+    /// The failure's stable code.
+    pub code: String,
+    /// The failure's description.
+    pub message: String,
 }
 
 /// The provider and platform `push_enable` enabled on one instance.
@@ -143,9 +175,7 @@ fn registration_error(e: PushRegistrationError) -> ScpError {
     match e {
         PushRegistrationError::ShutDown => ScpError::Context { msg, code },
         PushRegistrationError::NoLocalIdentity => ScpError::Identity { msg, code },
-        PushRegistrationError::SigningKeyUnavailable | PushRegistrationError::NotEnabled => {
-            ScpError::Transport { msg, code }
-        }
+        PushRegistrationError::SigningKeyUnavailable => ScpError::Transport { msg, code },
     }
 }
 
@@ -156,59 +186,57 @@ fn wake_error(e: WakeError) -> ScpError {
     }
 }
 
-/// The register and deregister paths both start here: `core` must be live
-/// and hold a local member DID. Until story PUSH-037 they then refuse.
-fn registration_refusal(core: &CoreFields) -> ScpError {
-    check_push_registration_ready(core).map_or_else(registration_error, |()| {
-        registration_error(push_registration_unavailable())
-    })
-}
-
 /// The enable path: story PUSH-037 calls `provider.register_push()`, runs the
-/// registrar for `platform` and fills the instance's slot. Until then it
-/// refuses before it reads either argument.
-fn enable_push(
+/// registrar for `platform` and fills the instance's slot. Until then the
+/// registrar refuses before either argument is read.
+async fn enable_push(
     core: &CoreFields,
     _provider: &dyn PushProvider,
     _platform: PushPlatform,
-) -> Result<(), ScpError> {
-    Err(registration_refusal(core))
+) -> Result<PushRelayOutcomes, ScpError> {
+    match push_registration(core).await.map_err(registration_error)? {}
 }
 
 #[uniffi::export(async_runtime = "tokio")]
 impl Scp {
     /// Enables push: registers the device's push token with every relay in
-    /// the relay set (ADR-025 criterion 4, ADR-027 criterion 10).
+    /// the relay set and returns each relay's result (ADR-025 criterion 4,
+    /// ADR-027 criterion 10).
     ///
     /// # Errors
     ///
     /// `SCP-CTX-2138` for a shut-down instance, `SCP-IDENT-1002` for one with
     /// no local member DID, and otherwise `SCP-TRANS-5104`: the device has no
     /// P-256 `#active` signing key to sign a `PushRegistration` with. Each is
-    /// returned before `provider` is called.
-    pub fn push_enable(
+    /// returned before `provider` is called or any relay is addressed.
+    pub async fn push_enable(
         &self,
         provider: Box<dyn PushProvider>,
         platform: PushPlatform,
-    ) -> Result<(), ScpError> {
-        enable_push(&self.inner.core, provider.as_ref(), platform)
+    ) -> Result<PushRelayOutcomes, ScpError> {
+        enable_push(&self.inner.core, provider.as_ref(), platform).await
     }
 
     /// Disables push: deregisters the device's push token from every relay
-    /// it registered with.
+    /// it registered with and returns each relay's result.
     ///
     /// # Errors
     ///
     /// `SCP-CTX-2138` for a shut-down instance, `SCP-IDENT-1002` for one with
     /// no local member DID, and otherwise `SCP-TRANS-5104`: the device has no
     /// P-256 `#active` signing key to sign a `PushDeregistration` with.
-    pub fn push_disable(&self) -> Result<(), ScpError> {
-        Err(registration_refusal(&self.inner.core))
+    pub async fn push_disable(&self) -> Result<PushRelayOutcomes, ScpError> {
+        match push_registration(&self.inner.core)
+            .await
+            .map_err(registration_error)? {}
     }
 
     /// Handles a silent push. `payload` is what the platform delivered:
     /// the JSON serialization of the APNs `userInfo` dictionary or of the
     /// FCM data map.
+    ///
+    /// A shut-down instance returns [`WakeOutcome::Failed`] with
+    /// `SCP-TRANS-5085` and calls no `handle_notification`.
     ///
     /// # Errors
     ///
@@ -221,16 +249,17 @@ impl Scp {
     ///
     /// Every failure after those checks is [`WakeOutcome::Failed`].
     pub async fn push_handle_wake(&self, payload: Vec<u8>) -> Result<WakeOutcome, ScpError> {
-        let EnabledPush { provider, platform } = self
-            .inner
-            .enabled_push()
-            .ok_or_else(|| registration_error(PushRegistrationError::NotEnabled))?;
+        let EnabledPush { provider, platform } =
+            match begin_wake(&self.inner.core, &self.inner.push).map_err(wake_error)? {
+                WakeEntry::Enabled(enabled) => enabled,
+                WakeEntry::Finished(outcome) => return Ok((&outcome).into()),
+            };
         let wake_bytes = provider.handle_notification(payload).await?;
         let outcome =
             scp_ffi_common::push::handle_wake(&self.inner.core, platform.into(), &wake_bytes)
                 .await
                 .map_err(wake_error)?;
-        Ok(outcome.into())
+        Ok(outcome.as_ref().into())
     }
 }
 
@@ -246,8 +275,7 @@ impl Scp {
         provider: Arc<dyn PushProvider>,
         platform: PushPlatform,
     ) {
-        self.inner
-            .set_enabled_push(EnabledPush { provider, platform });
+        self.inner.push.set(EnabledPush { provider, platform });
     }
 }
 
@@ -324,8 +352,8 @@ mod tests {
         scp
     }
 
-    #[test]
-    fn push_enable_fails_closed_without_calling_register_push() {
+    #[tokio::test]
+    async fn push_enable_fails_closed_without_calling_register_push() {
         for (scp, expected) in [
             (Scp::new_in_memory_for_test(), codes::IDENT_1002),
             (ready_scp(), codes::TRANS_5104),
@@ -333,26 +361,53 @@ mod tests {
             let fake = FakePushProvider::new(Ok(Vec::new()));
             let err = scp
                 .push_enable(Box::new(Forward(Arc::clone(&fake))), PushPlatform::Apns)
+                .await
                 .unwrap_err();
             assert_eq!(code(&err), expected);
             assert_eq!(fake.register_calls.load(Ordering::SeqCst), 0);
             assert!(
-                scp.inner.enabled_push().is_none(),
+                scp.inner.push.get().is_none(),
                 "a failed enable leaves no provider"
             );
         }
     }
 
-    #[test]
-    fn push_disable_fails_closed() {
+    #[tokio::test]
+    async fn push_disable_fails_closed() {
         assert_eq!(
-            code(&Scp::new_in_memory_for_test().push_disable().unwrap_err()),
+            code(
+                &Scp::new_in_memory_for_test()
+                    .push_disable()
+                    .await
+                    .unwrap_err()
+            ),
             codes::IDENT_1002
         );
         assert_eq!(
-            code(&ready_scp().push_disable().unwrap_err()),
+            code(&ready_scp().push_disable().await.unwrap_err()),
             codes::TRANS_5104
         );
+    }
+
+    /// Shutdown is read before the provider slot, so a shut-down instance
+    /// answers the shutdown outcome, not `SCP-TRANS-5105`, even though
+    /// shutdown emptied the slot, and calls no `handle_notification`.
+    #[tokio::test]
+    async fn a_wake_after_shutdown_returns_the_shutdown_outcome() {
+        let scp = Scp::new_in_memory_for_test();
+        let fake = FakePushProvider::new(Ok(br#"{"aps":{"content-available":1}}"#.to_vec()));
+        scp.install_push_provider_for_testing(Arc::clone(&fake) as _, PushPlatform::Apns);
+        scp.shutdown(1_000).await.unwrap();
+        assert!(
+            scp.inner.push.get().is_none(),
+            "shutdown drops the provider"
+        );
+        let outcome = scp.push_handle_wake(b"payload".to_vec()).await.unwrap();
+        let WakeOutcome::Failed { failure } = outcome else {
+            panic!("expected Failed, got {outcome:?}");
+        };
+        assert_eq!(failure.code, codes::TRANS_5085);
+        assert_eq!(fake.notification_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -374,10 +429,19 @@ mod tests {
         assert_eq!(code(&err), codes::TRANS_5080);
         assert_eq!(fake.notification_calls.load(Ordering::SeqCst), 1);
         assert_eq!(fake.register_calls.load(Ordering::SeqCst), 0);
-        assert!(
-            scp.inner.core.get_transport_arc().ok().flatten().is_none(),
-            "a rejected wake dials nothing"
-        );
+    }
+
+    /// The platform `push_enable` recorded is the one whose wake signal the
+    /// provider's bytes are checked against: an instance enabled for `Fcm`
+    /// refuses the APNs wake signal.
+    #[tokio::test]
+    async fn the_enabled_platform_decides_which_wake_signal_passes() {
+        let scp = Scp::new_in_memory_for_test();
+        let fake = FakePushProvider::new(Ok(br#"{"aps":{"content-available":1}}"#.to_vec()));
+        scp.install_push_provider_for_testing(Arc::clone(&fake) as _, PushPlatform::Fcm);
+        let err = scp.push_handle_wake(b"payload".to_vec()).await.unwrap_err();
+        assert_eq!(code(&err), codes::TRANS_5080);
+        assert_eq!(fake.notification_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

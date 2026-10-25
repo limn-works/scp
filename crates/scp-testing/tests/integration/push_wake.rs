@@ -23,6 +23,8 @@
 //!   give `NewData`; the woken device publishes nothing and `needs_reconnect`
 //!   stays set;
 //! - a cold start whose restore fails gives `Failed`, not `NoData`;
+//! - two overlapping wakes on a cold supervisor share one flight: one saga
+//!   replay, one dial of the relay, one outcome;
 //! - a sender-key request a wake delivers leaves its answer queued, and the
 //!   next full reconnection sends it;
 //! - a deadline that stops a pull mid-delivery leaves the stored contact
@@ -286,7 +288,7 @@ async fn backdate(contacts: &Arc<dyn RelayContactStore>, context_id: &str) -> u6
     old
 }
 
-async fn wake(core: &CoreFields) -> WakeOutcome {
+async fn wake(core: &CoreFields) -> Arc<WakeOutcome> {
     handle_wake(core, PushPlatform::Apns, APNS_WAKE)
         .await
         .expect("a valid APNs payload")
@@ -310,7 +312,7 @@ async fn one_envelope_at_the_pseudonym_routing_id_gives_new_data_and_a_message_e
     let before = now_secs();
     let outcome = wake(&core).await;
     let after = now_secs();
-    assert!(matches!(outcome, WakeOutcome::NewData), "{outcome:?}");
+    assert!(matches!(*outcome, WakeOutcome::NewData), "{outcome:?}");
     assert!(
         Members::message_received(&m.bob.drain_events(&m.ctx_id).await),
         "the actor must emit MessageReceived for Alice's message"
@@ -334,7 +336,7 @@ async fn nothing_buffered_gives_no_data() {
     let (core, contacts) = bob_core(&m.bob.manager);
     let old = backdate(&contacts, &m.ctx_id).await;
     let outcome = wake(&core).await;
-    assert!(matches!(outcome, WakeOutcome::NoData), "{outcome:?}");
+    assert!(matches!(*outcome, WakeOutcome::NoData), "{outcome:?}");
     assert!(
         contacts
             .load_last_relay_contact(&m.ctx_id)
@@ -354,7 +356,7 @@ async fn an_unreachable_relay_fails_the_wake() {
     let old = backdate(&contacts, &m.ctx_id).await;
     let started = Instant::now();
     let outcome = wake(&core).await;
-    match &outcome {
+    match &*outcome {
         WakeOutcome::Failed(WakeFailure::Pull(failures)) => {
             assert!(
                 matches!(failures.as_slice(), [WakePullError::RelayUnavailable { context_id, relay_url, .. }]
@@ -400,7 +402,7 @@ async fn a_relay_that_never_answers_query_fails_the_wake_within_the_deadline() {
     let outcome = wake(&core).await;
     let elapsed = started.elapsed();
     assert!(
-        matches!(outcome, WakeOutcome::Failed(WakeFailure::DeadlineExpired)),
+        matches!(*outcome, WakeOutcome::Failed(WakeFailure::DeadlineExpired)),
         "{outcome:?}"
     );
     assert!(
@@ -466,7 +468,7 @@ async fn a_cold_start_restores_and_pulls_without_connect_and_publishes_nothing()
     drop(m.bob.take_sent_ciphertexts());
 
     let outcome = wake(&core).await;
-    assert!(matches!(outcome, WakeOutcome::NewData), "{outcome:?}");
+    assert!(matches!(*outcome, WakeOutcome::NewData), "{outcome:?}");
     assert!(
         Members::message_received(&restarted.drain_events(&m.ctx_id).await),
         "the restored actor must emit MessageReceived"
@@ -497,9 +499,9 @@ async fn a_cold_start_whose_restore_fails_fails_the_wake() {
     let old = backdate(&contacts, &m.ctx_id).await;
 
     let outcome = wake(&core).await;
-    match outcome {
+    match &*outcome {
         WakeOutcome::Failed(WakeFailure::Unrestored { context_ids }) => {
-            assert_eq!(context_ids, vec![m.ctx_id.clone()]);
+            assert_eq!(*context_ids, vec![m.ctx_id.clone()]);
         }
         other => panic!("a wake that cannot reach a context must fail, got {other:?}"),
     }
@@ -507,6 +509,114 @@ async fn a_cold_start_whose_restore_fails_fails_the_wake() {
         contacts.load_last_relay_contact(&m.ctx_id).await.unwrap(),
         Some(old)
     );
+    relay.shutdown();
+}
+
+/// A TCP proxy in front of `relay_url` that counts the connections it
+/// accepts. Returns its `ws://` URL and the count.
+async fn start_counting_proxy(relay_url: &str) -> (String, Arc<AtomicUsize>) {
+    let relay_addr: SocketAddr = relay_url
+        .trim_start_matches("ws://")
+        .trim_end_matches("/scp/v1")
+        .parse()
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&accepted);
+    tokio::spawn(async move {
+        while let Ok((mut inbound, _)) = listener.accept().await {
+            counter.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                if let Ok(mut outbound) = tokio::net::TcpStream::connect(relay_addr).await {
+                    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                }
+            });
+        }
+    });
+    (format!("ws://{addr}/scp/v1"), accepted)
+}
+
+/// Counts the runtime's `saga recovery replay` event, which
+/// `Supervisor::replay_unresolved_sagas` emits once per run.
+struct ReplayCounter(Arc<AtomicUsize>);
+
+/// Reads an event's `message` field.
+struct MessageField(String);
+
+impl tracing::field::Visit for MessageField {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.0 = format!("{value:?}");
+        }
+    }
+}
+
+impl tracing::Subscriber for ReplayCounter {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut message = MessageField(String::new());
+        event.record(&mut message);
+        if message.0.starts_with("saga recovery replay") {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// Two wakes that overlap on a cold supervisor run as one flight: the
+/// supervisor is restored once (one saga replay), the relay is dialed once,
+/// and both callers get the same outcome.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overlapping_wakes_on_a_cold_supervisor_restore_and_dial_once() {
+    use tracing::instrument::WithSubscriber;
+
+    let (relay, url) = start_relay().await;
+    let (proxy_url, accepted) = start_counting_proxy(&url).await;
+    let m = members("push-wake-overlap", vec![proxy_url]).await;
+    m.bob.manager.flush_all_contexts().await.unwrap();
+    m.publish_from_alice(&url).await;
+
+    let restarted = m.bob.restarted_supervisor().unwrap();
+    restarted.register_local_did(DID::from(BOB_DID)).await;
+    assert!(!restarted.has_known_contexts());
+    let (core, _contacts) = bob_core(&restarted);
+    drop(m.bob.take_sent_ciphertexts());
+
+    let replays = Arc::new(AtomicUsize::new(0));
+    let dispatch = tracing::Dispatch::new(ReplayCounter(Arc::clone(&replays)));
+    let dials_before = accepted.load(Ordering::SeqCst);
+    let (first, second) = tokio::join!(
+        wake(&core).with_subscriber(dispatch.clone()),
+        wake(&core).with_subscriber(dispatch),
+    );
+
+    assert_eq!(
+        replays.load(Ordering::SeqCst),
+        1,
+        "one restore, so replay_unresolved_sagas runs once"
+    );
+    assert_eq!(
+        accepted.load(Ordering::SeqCst) - dials_before,
+        1,
+        "the relay is dialed once"
+    );
+    assert!(matches!(*first, WakeOutcome::NewData), "{first:?}");
+    assert!(
+        Arc::ptr_eq(&first, &second),
+        "the second wake joins the first and gets its outcome"
+    );
+    assert!(Members::message_received(
+        &restarted.drain_events(&m.ctx_id).await
+    ));
     relay.shutdown();
 }
 
@@ -642,12 +752,12 @@ async fn a_refused_refeed_is_not_counted() {
     m.publish_from_alice(&url).await;
     let (core, _contacts) = bob_core(&m.bob.manager);
     let outcome = wake(&core).await;
-    assert!(matches!(outcome, WakeOutcome::NewData), "{outcome:?}");
+    assert!(matches!(*outcome, WakeOutcome::NewData), "{outcome:?}");
 
     // The relay still holds the blob and the 5-second overlap returns it
     // again; the actor refuses it as a replay, so the wake counts nothing.
     let outcome = wake(&core).await;
-    assert!(matches!(outcome, WakeOutcome::NoData), "{outcome:?}");
+    assert!(matches!(*outcome, WakeOutcome::NoData), "{outcome:?}");
 
     // The Phase 4 re-feed alone over the same buffer counts nothing either.
     let transport = TransportManager::new(url.clone(), Box::new(connect(&url).await));
@@ -968,7 +1078,7 @@ async fn a_warm_wake_leaves_needs_reconnect_set_and_publishes_nothing() {
     let (core, contacts) = bob_core(&bob);
     let old = backdate(&contacts, &m.ctx_id).await;
     let outcome = wake(&core).await;
-    assert!(matches!(outcome, WakeOutcome::NewData), "{outcome:?}");
+    assert!(matches!(*outcome, WakeOutcome::NewData), "{outcome:?}");
     assert!(Members::message_received(
         &bob.drain_events(&m.ctx_id).await
     ));
@@ -1052,7 +1162,7 @@ async fn publish_alice_key_request(m: &Members, url: &str) {
 async fn wake_queues_the_answer(m: &Members) {
     let (core, _contacts) = bob_core(&m.bob.manager);
     let outcome = wake(&core).await;
-    assert!(matches!(outcome, WakeOutcome::NoData), "{outcome:?}");
+    assert!(matches!(*outcome, WakeOutcome::NoData), "{outcome:?}");
     assert!(
         m.bob.take_sent_ciphertexts().is_empty(),
         "the wake publishes no answer"
@@ -1334,7 +1444,7 @@ async fn a_dead_relay_fails_only_the_context_it_serves() {
     let old_a = backdate(&contacts, &m.ctx_id).await;
     let old_b = backdate(&contacts, ctx_b).await;
     let outcome = wake(&core).await;
-    assert!(matches!(outcome, WakeOutcome::NewData), "{outcome:?}");
+    assert!(matches!(*outcome, WakeOutcome::NewData), "{outcome:?}");
     assert!(Members::message_received(
         &m.bob.drain_events(&m.ctx_id).await
     ));
@@ -1371,7 +1481,7 @@ async fn a_context_on_eleven_relays_keeps_every_relay_of_the_dial() {
     let (core, contacts) = bob_core(&m.bob.manager);
     let old = backdate(&contacts, &m.ctx_id).await;
     let outcome = wake(&core).await;
-    assert!(matches!(outcome, WakeOutcome::NewData), "{outcome:?}");
+    assert!(matches!(*outcome, WakeOutcome::NewData), "{outcome:?}");
     assert!(
         contacts
             .load_last_relay_contact(&m.ctx_id)

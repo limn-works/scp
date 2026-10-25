@@ -956,13 +956,14 @@ pub const TRANS_5102: &str = "SCP-TRANS-5102";
 pub const TRANS_5103: &str = "SCP-TRANS-5103";
 /// Push registration unavailable: the device has no P-256 `#active` key.
 ///
-/// A push register or deregister export returned before it touched the
-/// provider or the token (`push::PushRegistrationError::SigningKeyUnavailable`).
+/// `push_enable` or `push_disable` returned before it touched the provider
+/// or the token (`push::PushRegistrationError::SigningKeyUnavailable`).
+/// Retired once story PUSH-037 builds the registrar; never reused.
 pub const TRANS_5104: &str = "SCP-TRANS-5104";
-/// Push not enabled: the instance holds no enabled `PushProvider`.
+/// Push not enabled: the instance has no enabled push platform.
 ///
-/// Returned by the `UniFFI` `push_handle_wake`
-/// (`push::PushRegistrationError::NotEnabled`).
+/// Returned by `push_handle_wake` on every bridge
+/// (`push::WakeError::NotEnabled`).
 pub const TRANS_5105: &str = "SCP-TRANS-5105";
 
 // -------------------------------------------------------------------------

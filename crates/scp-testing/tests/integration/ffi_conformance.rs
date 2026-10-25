@@ -1460,12 +1460,11 @@ fn discovery_and_provenance_coverage() {
 // or signs with, so no host may receive a pseudonym scalar. The two point
 // helpers above replace them, and nothing is added in their place.
 //
-// Subsequently RAISED 111 -> 114 by the three push operations (`push_register`
-// / `push_deregister` / `push_handle_wake`, story PUSH-015, ADR-025 criterion 4
-// and ADR-029 §2 push-wake pull), exported by all three native bridges.
-// UniFFI names the first two `push_enable` / `push_disable` because its host
-// passes a `PushProvider` callback in place of a token. Pure coverage
-// expansion, not a swap for the removed `economy_adjust_relay_price`.
+// Subsequently RAISED 111 -> 114 by the three push operations (`push_enable`
+// / `push_disable` / `push_handle_wake`, story PUSH-015, ADR-025 criterion 4
+// and ADR-029 §2 push-wake pull), exported under those names by all three
+// native bridges. Pure coverage expansion, not a swap for the removed
+// `economy_adjust_relay_price`.
 const MIN_PARITY_OPERATIONS: usize = 114;
 
 // ---------------------------------------------------------------------------

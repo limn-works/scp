@@ -139,6 +139,9 @@ zeroize = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-util = { workspace = true }
 futures = "0.3"
+# tracing: the push-wake integration test counts the runtime's saga-replay
+# event to prove two overlapping wakes restore once.
+tracing = { workspace = true }
 hex = { workspace = true }
 openmls = { workspace = true }
 openmls_traits = { workspace = true }

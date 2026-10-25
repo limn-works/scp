@@ -28,15 +28,25 @@
 //! otherwise [`WakeOutcome::NoData`]. Each [`WakeFailure`] has a stable code
 //! ([`WakeFailure::code`]) and a flat view for the FFI ([`WakeFailureView`]).
 //!
-//! The FFI exports that call [`handle_wake`] are each bridge's
-//! `push_handle_wake` (story PUSH-015). Each bridge's push register and
-//! deregister exports run [`check_push_registration_ready`], then return
-//! [`push_registration_unavailable`]
-//! (`SCP-TRANS-5104`) until story PUSH-037 gives them the device's P-256
-//! `#active` signing key. napi and Python name the platform with
-//! [`parse_push_platform`].
+//! One wake runs per instance at a time: a [`handle_wake`] call that arrives
+//! while another runs on the same [`CoreFields`] joins it through the
+//! instance's [`WakeFlight`] and returns the same outcome, so a host that
+//! delivers two pushes at once starts one restore and one dial.
+//!
+//! Each bridge exports `push_enable`, `push_disable` and
+//! `push_handle_wake(payload)` (story PUSH-015). `push_enable` records the
+//! platform in the bridge's [`PushSlot`], and `push_handle_wake` reads it
+//! through [`begin_wake`], which answers a shut-down instance before it reads
+//! the slot. `push_enable` and `push_disable` await [`push_registration`],
+//! which runs [`check_push_registration_ready`] and then resolves to
+//! [`push_registration_unavailable`] (`SCP-TRANS-5104`) until story PUSH-037
+//! gives it the device's P-256 `#active` signing key, so in this story no
+//! slot is filled and every wake returns [`WakeError::NotEnabled`].
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::convert::Infallible;
+use std::future::Ready;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use scp_core::context::ContextError;
@@ -44,6 +54,7 @@ use scp_protocol::discovery::push::PushPlatform;
 use scp_protocol::sync::SyncPolicy;
 use scp_transport::native::adapter::CoverTraffic;
 use serde_json::Value;
+use tokio::sync::watch;
 
 use crate::bridge_instance::{CoreFields, DialBudget, LifecycleError};
 use crate::error_codes;
@@ -74,35 +85,40 @@ impl WakeOutcome {
     pub fn view(&self) -> WakeOutcomeView {
         match self {
             Self::NewData => WakeOutcomeView {
-                outcome: WAKE_OUTCOME_NEW_DATA,
+                kind: WakeOutcomeKind::NewData,
                 failure: None,
             },
             Self::NoData => WakeOutcomeView {
-                outcome: WAKE_OUTCOME_NO_DATA,
+                kind: WakeOutcomeKind::NoData,
                 failure: None,
             },
             Self::Failed(failure) => WakeOutcomeView {
-                outcome: WAKE_OUTCOME_FAILED,
+                kind: WakeOutcomeKind::Failed,
                 failure: Some(failure.view()),
             },
         }
     }
 }
 
-/// [`WakeOutcomeView::outcome`] of [`WakeOutcome::NewData`].
-pub const WAKE_OUTCOME_NEW_DATA: &str = "new_data";
-/// [`WakeOutcomeView::outcome`] of [`WakeOutcome::NoData`].
-pub const WAKE_OUTCOME_NO_DATA: &str = "no_data";
-/// [`WakeOutcomeView::outcome`] of [`WakeOutcome::Failed`].
-pub const WAKE_OUTCOME_FAILED: &str = "failed";
+/// Which of the three [`WakeOutcome`]s a wake reported, without the failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WakeOutcomeKind {
+    /// [`WakeOutcome::NewData`].
+    NewData,
+    /// [`WakeOutcome::NoData`].
+    NoData,
+    /// [`WakeOutcome::Failed`].
+    Failed,
+}
 
 /// A [`WakeOutcome`] flattened for the napi and Python bridges, which carry
 /// no Rust enum with payloads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WakeOutcomeView {
-    /// `new_data`, `no_data` or `failed`.
-    pub outcome: &'static str,
-    /// The failure for `failed`; `None` for the other two outcomes.
+    /// Which outcome the wake reported.
+    pub kind: WakeOutcomeKind,
+    /// The failure when `kind` is [`WakeOutcomeKind::Failed`]; `None`
+    /// otherwise.
     pub failure: Option<WakeFailureView>,
 }
 
@@ -243,9 +259,13 @@ pub struct WakeContextFailureView {
     pub message: String,
 }
 
-/// A wake the device must not act on.
+/// A wake the device must not act on. Neither variant opens a connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum WakeError {
+    /// The instance holds no enabled push platform, so the wake has no
+    /// receipt rule to apply (and on `UniFFI` no provider to call).
+    #[error("push is not enabled on this instance")]
+    NotEnabled,
     /// The payload fails the §10.7.1 device receipt rule of `platform`.
     #[error("{platform:?} payload is not the platform's wake signal")]
     WakePayloadInvalid {
@@ -255,28 +275,25 @@ pub enum WakeError {
 }
 
 impl WakeError {
-    /// The bridge error code: `SCP-TRANS-5080` (ADR-006 2026-10-12
-    /// amendment).
+    /// The bridge error code: `SCP-TRANS-5105` for a wake with no enabled
+    /// platform, `SCP-TRANS-5080` for a payload that is not the platform's
+    /// wake signal (ADR-006 2026-10-12 amendment).
     #[must_use]
     pub const fn code(&self) -> &'static str {
         match self {
+            Self::NotEnabled => error_codes::TRANS_5105,
             Self::WakePayloadInvalid { .. } => error_codes::TRANS_5080,
         }
     }
 }
 
-/// Why a push register, deregister or provider-backed wake export refused
-/// to run.
+/// Why a `push_enable` or `push_disable` export refused to run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum PushRegistrationError {
     /// The device has no P-256 `#active` signing key to sign a
     /// `PushRegistration` or `PushDeregistration` with (§10.7.1 step 3).
     #[error("push registration is unavailable: the device has no P-256 #active signing key")]
     SigningKeyUnavailable,
-    /// The instance holds no enabled `PushProvider`, so a `UniFFI` wake has
-    /// no provider to hand the payload to.
-    #[error("push is not enabled on this instance")]
-    NotEnabled,
     /// The instance was shut down; construct a new one to continue.
     #[error("the instance is shut down")]
     ShutDown,
@@ -286,14 +303,13 @@ pub enum PushRegistrationError {
 }
 
 impl PushRegistrationError {
-    /// The bridge error code: `SCP-TRANS-5104`, `SCP-TRANS-5105`,
-    /// `SCP-CTX-2138` for a shut-down instance, or `SCP-IDENT-1002` for an
-    /// instance with no local member DID.
+    /// The bridge error code: `SCP-TRANS-5104`, `SCP-CTX-2138` for a
+    /// shut-down instance, or `SCP-IDENT-1002` for an instance with no local
+    /// member DID.
     #[must_use]
     pub const fn code(&self) -> &'static str {
         match self {
             Self::SigningKeyUnavailable => error_codes::TRANS_5104,
-            Self::NotEnabled => error_codes::TRANS_5105,
             Self::ShutDown => error_codes::CTX_2138,
             Self::NoLocalIdentity => error_codes::IDENT_1002,
         }
@@ -325,7 +341,7 @@ pub fn check_push_registration_ready(core: &CoreFields) -> Result<(), PushRegist
     }
 }
 
-/// The error every push register and deregister export returns until the
+/// The error every `push_enable` and `push_disable` export returns until the
 /// device has a P-256 `#active` signing key to sign with.
 #[must_use]
 pub const fn push_registration_unavailable() -> PushRegistrationError {
@@ -333,44 +349,111 @@ pub const fn push_registration_unavailable() -> PushRegistrationError {
     PushRegistrationError::SigningKeyUnavailable
 }
 
-/// A push argument a napi or Python caller passed that the export refuses
+/// The registrar run every bridge's `push_enable` and `push_disable` awaits.
+///
+/// Story PUSH-037 makes it register or deregister with every relay and
+/// resolve to each relay's result. Until then no run can succeed, so its
+/// success type is uninhabited: it checks `core`
+/// ([`check_push_registration_ready`]) and resolves at once to
+/// [`push_registration_unavailable`].
+pub fn push_registration(core: &CoreFields) -> Ready<Result<Infallible, PushRegistrationError>> {
+    // Stub — see PUSH-037
+    std::future::ready(
+        check_push_registration_ready(core).and(Err(push_registration_unavailable())),
+    )
+}
+
+/// A push argument a napi or Python caller passed that `push_enable` refuses
 /// before any other step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum PushInputError {
-    /// The platform name is not `apns`, `fcm` or `web_push`. The message
-    /// does not echo the caller's string.
-    #[error("unknown push platform: expected `apns`, `fcm` or `web_push`")]
-    UnknownPlatform,
     /// The push token is empty.
     #[error("the push token is empty")]
     EmptyToken,
 }
 
 impl PushInputError {
-    /// The bridge error code: `SCP-VALID-7005` for an unknown platform name,
-    /// `SCP-VALID-7004` for an empty token.
+    /// The bridge error code: `SCP-VALID-7004` for an empty token.
     #[must_use]
     pub const fn code(&self) -> &'static str {
         match self {
-            Self::UnknownPlatform => error_codes::VALID_7005,
             Self::EmptyToken => error_codes::VALID_7004,
         }
     }
 }
 
-/// The platform a napi or Python caller names: `apns`, `fcm` or `web_push`,
-/// matched exactly.
+/// One bridge instance's enabled push state.
+///
+/// It holds the platform on napi and Python, the provider and platform on
+/// `UniFFI`. `push_enable` fills it, `push_disable` and shutdown empty it.
+/// Per instance, never a `static` (`check-no-bridge-globals.sh`).
+#[derive(Debug)]
+pub struct PushSlot<T>(Mutex<Option<T>>);
+
+impl<T> Default for PushSlot<T> {
+    fn default() -> Self {
+        Self(Mutex::new(None))
+    }
+}
+
+impl<T: Clone> PushSlot<T> {
+    /// Every store into the slot replaces one `Option` whole, so a panic
+    /// while the lock was held leaves no half-written value, and a poisoned
+    /// lock is read through.
+    fn lock(&self) -> MutexGuard<'_, Option<T>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// A clone of the enabled state, taken out of the lock so no caller
+    /// holds the lock across an `.await`.
+    #[must_use]
+    pub fn get(&self) -> Option<T> {
+        self.lock().clone()
+    }
+
+    /// Enables `value`, replacing what was enabled before.
+    pub fn set(&self, value: T) {
+        *self.lock() = Some(value);
+    }
+
+    /// Empties the slot, dropping what was enabled.
+    pub fn clear(&self) {
+        self.lock().take();
+    }
+}
+
+/// What [`begin_wake`] found.
+#[derive(Debug)]
+pub enum WakeEntry<T> {
+    /// Push is enabled with this state; the wake proceeds.
+    Enabled(T),
+    /// The instance is shut down. The wake ends with this outcome.
+    Finished(WakeOutcome),
+}
+
+/// The first step of every bridge's `push_handle_wake`.
+///
+/// A shut-down instance answers [`WakeFailure::ShutDown`] before the bridge's
+/// slot is read. The enabled state is then cloned out of `slot` and the
+/// shutdown flag read again, so a shutdown that began during the clone ends
+/// the wake before a `UniFFI` provider is called.
 ///
 /// # Errors
 ///
-/// [`PushInputError::UnknownPlatform`] for any other string.
-pub fn parse_push_platform(name: &str) -> Result<PushPlatform, PushInputError> {
-    match name {
-        "apns" => Ok(PushPlatform::Apns),
-        "fcm" => Ok(PushPlatform::Fcm),
-        "web_push" => Ok(PushPlatform::WebPush),
-        _ => Err(PushInputError::UnknownPlatform),
+/// [`WakeError::NotEnabled`] when the instance is live and `slot` is empty.
+pub fn begin_wake<T: Clone>(
+    core: &CoreFields,
+    slot: &PushSlot<T>,
+) -> Result<WakeEntry<T>, WakeError> {
+    let shut_down = || WakeEntry::Finished(WakeOutcome::Failed(WakeFailure::ShutDown));
+    if core.is_shutdown() {
+        return Ok(shut_down());
     }
+    let enabled = slot.get();
+    if core.is_shutdown() {
+        return Ok(shut_down());
+    }
+    enabled.map(WakeEntry::Enabled).ok_or(WakeError::NotEnabled)
 }
 
 /// Refuses an empty push token.
@@ -445,7 +528,8 @@ fn is_webpush_wake(value: &Value) -> bool {
         .is_some_and(|map| map.len() == 1 && map.get("scp").and_then(Value::as_str) == Some("1"))
 }
 
-/// Handles a silent push (module doc).
+/// Handles a silent push (module doc). A call that arrives while another
+/// runs on `core` returns that call's outcome and starts no pull of its own.
 ///
 /// # Errors
 ///
@@ -456,13 +540,115 @@ pub async fn handle_wake(
     core: &CoreFields,
     platform: PushPlatform,
     payload: &[u8],
-) -> Result<WakeOutcome, WakeError> {
+) -> Result<Arc<WakeOutcome>, WakeError> {
     check_wake_payload(platform, payload)?;
-    // The tally lives outside the deadline, so the envelopes a context
-    // delivered before the deadline dropped the pull still count.
-    let tally = DeliveryTally::default();
-    let result = tokio::time::timeout(WAKE_DEADLINE, pull_on_wake(core, &tally)).await;
-    Ok(wake_outcome(tally.total(), result))
+    Ok(core
+        .wake_flight()
+        .run(|| async {
+            // The tally lives outside the deadline, so the envelopes a
+            // context delivered before the deadline dropped the pull still
+            // count.
+            let tally = DeliveryTally::default();
+            let result = tokio::time::timeout(WAKE_DEADLINE, pull_on_wake(core, &tally)).await;
+            wake_outcome(tally.total(), result)
+        })
+        .await)
+}
+
+/// The receiver of the running wake's outcome; `None` until it finishes.
+type FlightOutcome = watch::Receiver<Option<Arc<WakeOutcome>>>;
+
+/// One instance's running wake, if any (module doc).
+///
+/// The restore check, the startup restore, the dial and the pull all run
+/// inside one flight, so two overlapping wakes cannot both find a cold
+/// supervisor and restore it twice.
+#[derive(Debug, Default)]
+pub struct WakeFlight(Mutex<Option<FlightOutcome>>);
+
+impl WakeFlight {
+    /// The lock guards one store or one clone of a receiver, so a panic
+    /// while it was held leaves the value whole and a poisoned lock is read
+    /// through.
+    fn lock(&self) -> MutexGuard<'_, Option<FlightOutcome>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Joins the running wake, or records a new one and leads it.
+    fn join_or_lead(&self) -> FlightRole {
+        let mut slot = self.lock();
+        if let Some(running) = slot.as_ref() {
+            return FlightRole::Join(running.clone());
+        }
+        let (sender, receiver) = watch::channel(None);
+        *slot = Some(receiver.clone());
+        drop(slot);
+        FlightRole::Lead(sender, receiver)
+    }
+
+    /// Runs `pull` when no wake is running, or waits for the running one.
+    /// A wake whose caller dropped it before it finished sends no outcome,
+    /// so a waiter on it starts over and may run `pull` itself.
+    async fn run<F, Fut>(&self, pull: F) -> Arc<WakeOutcome>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = WakeOutcome>,
+    {
+        loop {
+            match self.join_or_lead() {
+                FlightRole::Join(mut running) => {
+                    // `wait_for` reads the current value before it reports
+                    // a dropped sender, so an outcome sent just before the
+                    // sender dropped is still returned.
+                    if let Ok(outcome) = running.wait_for(Option::is_some).await
+                        && let Some(outcome) = outcome.as_ref()
+                    {
+                        return Arc::clone(outcome);
+                    }
+                }
+                FlightRole::Lead(sender, receiver) => {
+                    let landing = FlightLanding {
+                        flight: self,
+                        receiver,
+                    };
+                    let outcome = Arc::new(pull().await);
+                    // Clear the slot first, so a wake that starts after this
+                    // one finished pulls afresh; every waiter already holds
+                    // a receiver.
+                    drop(landing);
+                    sender.send_replace(Some(Arc::clone(&outcome)));
+                    return outcome;
+                }
+            }
+        }
+    }
+}
+
+/// A wake's part in its instance's [`WakeFlight`].
+enum FlightRole {
+    /// Another wake is running; wait for its outcome on this receiver.
+    Join(FlightOutcome),
+    /// No wake was running; run the pull and send its outcome.
+    Lead(watch::Sender<Option<Arc<WakeOutcome>>>, FlightOutcome),
+}
+
+/// Clears its [`WakeFlight`] when the leading wake finishes or its caller
+/// drops it, unless a later wake already replaced the slot.
+struct FlightLanding<'a> {
+    flight: &'a WakeFlight,
+    receiver: FlightOutcome,
+}
+
+impl Drop for FlightLanding<'_> {
+    fn drop(&mut self) {
+        let mut slot = self.flight.lock();
+        if slot
+            .as_ref()
+            .is_some_and(|running| running.same_channel(&self.receiver))
+        {
+            *slot = None;
+        }
+    }
 }
 
 /// The ADR-029 §2 push-wake pull mode step 7 outcome rule over the count of
@@ -594,20 +780,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_push_platform_accepts_exactly_the_three_names() {
-        assert_eq!(parse_push_platform("apns"), Ok(PushPlatform::Apns));
-        assert_eq!(parse_push_platform("fcm"), Ok(PushPlatform::Fcm));
-        assert_eq!(parse_push_platform("web_push"), Ok(PushPlatform::WebPush));
-        for name in [
-            "", "APNS", "Apns", "webpush", "web-push", "WebPush", " fcm", "gcm",
-        ] {
-            let err = parse_push_platform(name).unwrap_err();
-            assert_eq!(err, PushInputError::UnknownPlatform, "{name:?}");
-            assert_eq!(err.code(), error_codes::VALID_7005);
-        }
-    }
-
-    #[test]
     fn check_push_token_refuses_only_an_empty_token() {
         assert_eq!(check_push_token(b"t"), Ok(()));
         let err = check_push_token(b"").unwrap_err();
@@ -624,10 +796,6 @@ mod tests {
         assert_eq!(
             PushRegistrationError::SigningKeyUnavailable.code(),
             error_codes::TRANS_5104
-        );
-        assert_eq!(
-            PushRegistrationError::NotEnabled.code(),
-            error_codes::TRANS_5105
         );
         assert_eq!(
             PushRegistrationError::ShutDown.code(),
@@ -667,24 +835,47 @@ mod tests {
         );
     }
 
+    /// The registrar every bridge awaits refuses each state with its own
+    /// error: no local identity, then the missing signing key on a ready
+    /// instance, then shutdown.
+    #[tokio::test]
+    async fn the_registration_future_refuses_every_state() {
+        assert_eq!(
+            push_registration(&CoreFields::new()).await,
+            Err(PushRegistrationError::NoLocalIdentity)
+        );
+        let core = CoreFields::with_supervisor(crate::bridge_instance::tests::test_supervisor());
+        assert_eq!(
+            push_registration(&core).await,
+            Err(PushRegistrationError::SigningKeyUnavailable)
+        );
+        core.shutdown_core_async(Duration::from_secs(1), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            push_registration(&core).await,
+            Err(PushRegistrationError::ShutDown)
+        );
+    }
+
     #[test]
     fn wake_outcome_view_names_each_outcome() {
         assert_eq!(
             WakeOutcome::NewData.view(),
             WakeOutcomeView {
-                outcome: "new_data",
+                kind: WakeOutcomeKind::NewData,
                 failure: None
             }
         );
         assert_eq!(
             WakeOutcome::NoData.view(),
             WakeOutcomeView {
-                outcome: "no_data",
+                kind: WakeOutcomeKind::NoData,
                 failure: None
             }
         );
         let failed = WakeOutcome::Failed(WakeFailure::NoSupervisor).view();
-        assert_eq!(failed.outcome, "failed");
+        assert_eq!(failed.kind, WakeOutcomeKind::Failed);
         let failure = failed.failure.unwrap();
         assert_eq!(failure.code, error_codes::TRANS_5086);
         assert_eq!(failure, WakeFailure::NoSupervisor.view());
@@ -772,7 +963,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            matches!(outcome, WakeOutcome::Failed(WakeFailure::ShutDown)),
+            matches!(*outcome, WakeOutcome::Failed(WakeFailure::ShutDown)),
             "{outcome:?}"
         );
     }
@@ -942,7 +1133,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            matches!(outcome, WakeOutcome::Failed(WakeFailure::NoLocalIdentity)),
+            matches!(*outcome, WakeOutcome::Failed(WakeFailure::NoLocalIdentity)),
             "{outcome:?}"
         );
     }
@@ -1022,8 +1213,123 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            matches!(outcome, WakeOutcome::Failed(WakeFailure::NoSupervisor)),
+            matches!(*outcome, WakeOutcome::Failed(WakeFailure::NoSupervisor)),
             "{outcome:?}"
         );
+    }
+
+    #[test]
+    fn a_wake_with_no_enabled_platform_carries_trans_5105() {
+        assert_eq!(WakeError::NotEnabled.code(), error_codes::TRANS_5105);
+    }
+
+    /// `begin_wake` reads shutdown before the slot: a shut-down instance
+    /// ends the wake with `ShutDown` whether or not the slot is filled, a
+    /// live instance with an empty slot returns `NotEnabled`, and a live
+    /// instance with a filled slot proceeds with a clone of it.
+    #[tokio::test]
+    async fn begin_wake_answers_shutdown_before_the_slot() {
+        let core = CoreFields::new();
+        let slot = PushSlot::<PushPlatform>::default();
+        assert_eq!(begin_wake(&core, &slot).unwrap_err(), WakeError::NotEnabled);
+        slot.set(PushPlatform::Fcm);
+        assert!(matches!(
+            begin_wake(&core, &slot),
+            Ok(WakeEntry::Enabled(PushPlatform::Fcm))
+        ));
+        assert_eq!(
+            slot.get(),
+            Some(PushPlatform::Fcm),
+            "the slot keeps its value"
+        );
+        crate::bridge_instance::tests::shut_down(&core).await;
+        for filled in [true, false] {
+            if !filled {
+                slot.clear();
+            }
+            let entry = begin_wake(&core, &slot).unwrap();
+            assert!(
+                matches!(
+                    entry,
+                    WakeEntry::Finished(WakeOutcome::Failed(WakeFailure::ShutDown))
+                ),
+                "filled {filled}: {entry:?}"
+            );
+        }
+    }
+
+    /// Wakes that overlap one running wake join it: the pull runs once and
+    /// every caller gets the same outcome. A wake after the flight landed
+    /// pulls again.
+    #[tokio::test]
+    async fn overlapping_wakes_share_one_pull() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let flight = WakeFlight::default();
+        let pulls = AtomicUsize::new(0);
+        let (release, released) = watch::channel(false);
+        let pull = || {
+            let mut released = released.clone();
+            let pulls = &pulls;
+            async move {
+                pulls.fetch_add(1, Ordering::SeqCst);
+                released.wait_for(|go| *go).await.unwrap();
+                WakeOutcome::NoData
+            }
+        };
+        let (a, b, c, ()) = tokio::join!(
+            flight.run(pull),
+            flight.run(pull),
+            flight.run(pull),
+            async {
+                // Every `run` above reaches its first await before this block
+                // is polled, so all three are in the flight before it lands.
+                tokio::task::yield_now().await;
+                release.send_replace(true);
+            }
+        );
+        assert_eq!(pulls.load(Ordering::SeqCst), 1);
+        assert!(Arc::ptr_eq(&a, &b) && Arc::ptr_eq(&b, &c));
+        assert!(matches!(*a, WakeOutcome::NoData));
+        let d = flight.run(pull).await;
+        assert_eq!(
+            pulls.load(Ordering::SeqCst),
+            2,
+            "a landed flight is not reused"
+        );
+        assert!(!Arc::ptr_eq(&a, &d));
+    }
+
+    /// A leading wake its caller dropped sends no outcome, so a waiter
+    /// starts over and runs the pull itself instead of waiting forever.
+    #[tokio::test]
+    async fn a_dropped_leader_hands_the_pull_to_a_waiter() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let flight = WakeFlight::default();
+        let pulls = AtomicUsize::new(0);
+        let pull = || {
+            let pulls = &pulls;
+            async move {
+                if pulls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    std::future::pending::<()>().await;
+                }
+                WakeOutcome::NewData
+            }
+        };
+        let mut leader = Box::pin(flight.run(pull));
+        assert!(
+            futures::poll!(leader.as_mut()).is_pending(),
+            "the leader parks in its pull"
+        );
+        let mut waiter = Box::pin(flight.run(pull));
+        assert!(
+            futures::poll!(waiter.as_mut()).is_pending(),
+            "the waiter joins"
+        );
+        drop(leader);
+        let outcome = waiter.await;
+        assert!(matches!(*outcome, WakeOutcome::NewData));
+        assert_eq!(pulls.load(Ordering::SeqCst), 2);
     }
 }

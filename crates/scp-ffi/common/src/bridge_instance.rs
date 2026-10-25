@@ -941,6 +941,10 @@ pub struct CoreFields {
     /// or by either shutdown transition, and never cleared. Every
     /// [`StreamRegistry`] built from this instance reads it on insert.
     stream_registration_closed: Arc<AtomicBool>,
+    /// The push wake running on this instance, if any. Every
+    /// [`handle_wake`](crate::push::handle_wake) on this instance runs
+    /// through it, so overlapping wakes share one pull.
+    wake_flight: crate::push::WakeFlight,
 }
 
 impl Default for CoreFields {
@@ -1004,6 +1008,7 @@ impl CoreFields {
             borrowers: Mutex::new(BorrowerRegistry::default()),
             node_binding: Mutex::new(None),
             stream_registration_closed: Arc::new(AtomicBool::new(false)),
+            wake_flight: crate::push::WakeFlight::default(),
         }
     }
 
@@ -1100,6 +1105,7 @@ impl CoreFields {
             borrowers: Mutex::new(BorrowerRegistry::default()),
             node_binding: Mutex::new(None),
             stream_registration_closed: Arc::new(AtomicBool::new(false)),
+            wake_flight: crate::push::WakeFlight::default(),
         }
     }
 
@@ -1406,6 +1412,11 @@ impl CoreFields {
     #[must_use]
     pub fn is_shutdown(&self) -> bool {
         self.shutdown.load(Ordering::SeqCst)
+    }
+
+    /// This instance's push wake flight (module doc of [`crate::push`]).
+    pub(crate) const fn wake_flight(&self) -> &crate::push::WakeFlight {
+        &self.wake_flight
     }
 
     /// Whether this instance is currently suspended (backgrounded).
