@@ -162,6 +162,10 @@ syn = { version = "2", features = ["full", "visit"] }
 # contents — without this dep the scanner would falsely flag `__repr__` and
 # friends as unbound because `self.field` lives inside `format!(...)`.
 proc-macro2 = "1"
+# quote supplies `ToTokens`, so the key_state_params gate reads each item's
+# full token stream (attributes, bodies, macro arguments) instead of walking
+# syntax positions it would have to enumerate.
+quote = "1"
 rmp-serde = { workspace = true }
 tempfile = "3"
 tokio-tungstenite = { version = "0.24", features = ["connect"] }

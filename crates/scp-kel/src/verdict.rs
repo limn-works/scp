@@ -8,7 +8,7 @@
 //! the verifier persists next. R14's order, persisting before acting on the
 //! verdict, is its caller's.
 
-#![deny(clippy::wildcard_enum_match_arm)]
+#![forbid(clippy::wildcard_enum_match_arm)]
 
 use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime};

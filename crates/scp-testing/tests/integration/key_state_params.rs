@@ -1,601 +1,325 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-//! Structural gates for SCP-310's acceptance criteria on key-state input
-//! positions and on the verdict classifier's match.
+//! Structural gates for SCP-310's acceptance criteria on key-state mentions and
+//! on the verdict classifier's match.
 //!
 //! `key_state_params`: `03-identity.md` §3.10.10 makes `ResolvedState` the
 //! only key state a verification decision reads, because only the verdict
-//! classifier constructs it. The criterion is that no external input position
-//! names `KeyState`, `KeyStateView` or `ReplayedState`: no position through
-//! which code outside the defining item can hand a gated type into a crate's
-//! API. The gate parses every Rust file under `crates/*/src` and
-//! `crates/scp-ffi/*/src` with `syn` and reports one hit per such position.
+//! classifier constructs it. SCP-310 AC11 forbids any external input position
+//! that names `KeyState`, `KeyStateView` or `ReplayedState`. The gate does not
+//! reason about positions: it parses every Rust file under `crates/*/src` and
+//! `crates/scp-ffi/*/src` with `syn` and counts every top-level item whose
+//! full token stream (attributes, signature, body, macro arguments) names a
+//! gated type. A name a `type` alias or a `use .. as` rename binds to one,
+//! anywhere in the scanned tree, counts as a gated name. Items compiled only
+//! under exactly `#[cfg(test)]` are out of scope: an item carrying it, a file
+//! with `#![cfg(test)]`, and every file a `#[cfg(test)] mod` declaration loads
+//! or whose module descends from one. Every other `cfg`, `cfg(any(test,
+//! feature = "testing"))` included, stays in, because that code can ship. Every item that may
+//! mention one is pinned in [`ALLOWLIST`] by file path and item, with the
+//! reason the mention cannot hand in key state no resolution accepted, and
+//! each entry must match a mention, so a moved or deleted item fails the gate
+//! instead of leaving a stale entry.
 //!
-//! Indicators, not the criterion: the positions the walk reads are
-//! - each parameter of a `pub fn`, a `pub` inherent method, a method of a
-//!   `pub trait`, a `pub` foreign fn, and every method of every trait impl;
-//! - in the return type of each of those fns, a `Fn(..)`-trait or `fn(..)`
-//!   argument and a `&mut` reference;
-//! - each field of a `pub struct`, `pub union`, and each variant of a
-//!   `pub enum`, and the type of a `pub static`;
-//! - each macro invocation, in any position, whose tokens name a gated type
-//!   outside an enum-variant path (no expansion).
+//! `verdict_match_has_no_wildcard`: SCP-310 AC8 requires `classify` to match
+//! `EntryVerdict` with no wildcard arm. `crates/scp-kel/src/verdict.rs`
+//! carries `#![forbid(clippy::wildcard_enum_match_arm)]`: clippy checks the
+//! lint over the file, macro expansions included, and `forbid` makes any lower
+//! `allow` or `expect` inside the file a compile error. The check asserts that
+//! inner attribute.
 //!
-//! A type names a gated type through references, `Option`, slices, `Arc`,
-//! tuples, `impl` and `dyn` bounds, qualified paths, generic bounds, defaults
-//! and where clauses, `Self` inside a gated type's own struct or impl, an
-//! associated type an impl binds to one, and `type` aliases or `use .. as`
-//! renames of one. Items in nested scopes (fn bodies, `const _: () = {..}`,
-//! inline modules) are walked like top-level items.
-//!
-//! The exemptions in [`EXEMPTIONS`] are each pinned to a file path, and each
-//! must match at least once, so a moved or deleted exempt item fails the gate
-//! instead of leaving a stale exemption.
-//!
-//! `verdict_match_has_no_wildcard`: SCP-310 requires `classify` to match
-//! `EntryVerdict` exhaustively under `#![deny(clippy::wildcard_enum_match_arm)]`
-//! in `crates/scp-kel/src/verdict.rs`. Clippy enforces the lint only while the
-//! attribute stands and nothing lowers it, so this check asserts the inner
-//! attribute, that no attribute in the file allows, warns or expects the lint
-//! or a group or tool that contains it, and that every `match` over
-//! `EntryVerdict` names every variant and has no arm that matches every value.
-//!
-//! Each check first runs on must-fail inputs and asserts their hit counts, so a
-//! pass on the real tree means the tree is clean, not that the checker is blind.
+//! Each check first runs on must-fail inputs, so a pass on the real tree means
+//! the tree is clean, not that the checker is blind.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use proc_macro2::{TokenStream, TokenTree};
+use quote::ToTokens;
 use syn::visit::Visit;
 
 /// The key-state types no external input position may take
 /// (`03-identity.md` §3.10.10).
 const GATED: [&str; 3] = ["KeyState", "KeyStateView", "ReplayedState"];
 
-/// One pinned exemption. Paths are relative to the workspace root.
+/// One approved mention: the top-level item `item` of the file at `path`
+/// (relative to the workspace root), with the reason it cannot hand in key
+/// state no resolution accepted. `item` is the label [`item_label`] gives.
 #[derive(Debug, Clone, Copy)]
-enum Exemption {
-    /// The defining struct of `name` at `path` and its inherent impls in the
-    /// same file. It matches when the file defines a struct of that name.
-    Type {
-        path: &'static str,
-        name: &'static str,
-    },
-    /// Every item of the file. It matches when it exempts at least one hit.
-    File { path: &'static str },
-    /// The fn of that name in the file. It matches when it exempts at least
-    /// one hit.
-    Fn {
-        path: &'static str,
-        name: &'static str,
-    },
+struct Allowed {
+    path: &'static str,
+    item: &'static str,
+    reason: &'static str,
 }
 
-/// SCP-310's exemption list. SCP-314 adds the `KeyStateView` pin in the change
-/// that creates that type in `crates/scp-ffi/common`.
-const EXEMPTIONS: &[Exemption] = &[
-    Exemption::Type {
-        path: "crates/scp-did/src/key_state.rs",
-        name: "KeyState",
-    },
-    Exemption::Type {
-        path: "crates/scp-kel/src/validate/replay.rs",
-        name: "ReplayedState",
-    },
-    Exemption::File {
-        path: "crates/scp-kel/src/validate/replay.rs",
-    },
-    Exemption::File {
-        path: "crates/scp-kel/src/verdict.rs",
-    },
-    Exemption::Fn {
-        path: "crates/scp-protocol/src/crypto/key_continuity.rs",
-        name: "compute_key_continuity_fingerprint",
-    },
+const fn allow(path: &'static str, item: &'static str, reason: &'static str) -> Allowed {
+    Allowed { path, item, reason }
+}
+
+/// Every approved mention of a gated name. SCP-314 adds the `KeyStateView`
+/// entries in the change that creates that type in `crates/scp-ffi/common`.
+const ALLOWLIST: &[Allowed] = &[
+    allow(
+        "crates/scp-did/src/key_state.rs",
+        "struct KeyState",
+        "the defining item",
+    ),
+    allow(
+        "crates/scp-did/src/lib.rs",
+        "use",
+        "re-exports the type from its defining crate; takes no input",
+    ),
+    allow(
+        "crates/scp-kel/src/error.rs",
+        "enum BodyField",
+        "enum variant `EventKind::KeyState` / `BodyField::KeyState`, not the type",
+    ),
+    allow(
+        "crates/scp-kel/src/error.rs",
+        "impl Display for BodyField",
+        "enum variant `EventKind::KeyState` / `BodyField::KeyState`, not the type",
+    ),
+    allow(
+        "crates/scp-kel/src/event.rs",
+        "use",
+        "imports the type for `KeyStateSnapshot::into_key_state`; takes no input",
+    ),
+    allow(
+        "crates/scp-kel/src/event.rs",
+        "enum EventKind",
+        "enum variant `EventKind::KeyState` / `BodyField::KeyState`, not the type",
+    ),
+    allow(
+        "crates/scp-kel/src/event.rs",
+        "impl EventKind",
+        "enum variant `EventKind::KeyState` / `BodyField::KeyState`, not the type",
+    ),
+    allow(
+        "crates/scp-kel/src/event.rs",
+        "fn signer_group_roles",
+        "enum variant `EventKind::KeyState` / `BodyField::KeyState`, not the type",
+    ),
+    allow(
+        "crates/scp-kel/src/event.rs",
+        "impl KeyStateSnapshot",
+        "`into_key_state` is `pub(crate)` and returns a `KeyState`; only `replay` and `key_state_at` call it, each on a `ValidatedChain`",
+    ),
+    allow(
+        "crates/scp-kel/src/event.rs",
+        "impl EventPreimage",
+        "enum variant `EventKind::KeyState` / `BodyField::KeyState`, not the type",
+    ),
+    allow(
+        "crates/scp-kel/src/lib.rs",
+        "use",
+        "re-exports `ReplayedState` from its defining crate; takes no input",
+    ),
+    allow(
+        "crates/scp-kel/src/preimage.rs",
+        "fn kind_byte",
+        "enum variant `EventKind::KeyState` / `BodyField::KeyState`, not the type",
+    ),
+    allow(
+        "crates/scp-kel/src/preimage.rs",
+        "fn kind_from_byte",
+        "enum variant `EventKind::KeyState` / `BodyField::KeyState`, not the type",
+    ),
+    allow(
+        "crates/scp-kel/src/preimage.rs",
+        "impl EncodedPreimage",
+        "enum variant `EventKind::KeyState` / `BodyField::KeyState`, not the type",
+    ),
+    allow(
+        "crates/scp-kel/src/preimage.rs",
+        "fn read_snapshot",
+        "enum variant `EventKind::KeyState` / `BodyField::KeyState`, not the type",
+    ),
+    allow(
+        "crates/scp-kel/src/preimage.rs",
+        "fn read_key_entry",
+        "enum variant `EventKind::KeyState` / `BodyField::KeyState`, not the type",
+    ),
+    allow(
+        "crates/scp-kel/src/validate/content.rs",
+        "fn check_sentinels",
+        "enum variant `EventKind::KeyState` / `BodyField::KeyState`, not the type",
+    ),
+    allow(
+        "crates/scp-kel/src/validate/content.rs",
+        "fn check_continuation_present",
+        "enum variant `EventKind::KeyState` / `BodyField::KeyState`, not the type",
+    ),
+    allow(
+        "crates/scp-kel/src/validate/replay.rs",
+        "use",
+        "imports the type `ReplayedState` holds; takes no input",
+    ),
+    allow(
+        "crates/scp-kel/src/validate/replay.rs",
+        "struct ReplayedState",
+        "the defining item; private fields, no public constructor",
+    ),
+    allow(
+        "crates/scp-kel/src/validate/replay.rs",
+        "impl ReplayedState",
+        "the defining impl; its accessors return state a `ValidatedChain` derived and take none in",
+    ),
+    allow(
+        "crates/scp-kel/src/validate/replay.rs",
+        "fn replay",
+        "returns a `ReplayedState` derived from the `ValidatedChain` it takes",
+    ),
+    allow(
+        "crates/scp-kel/src/validate/replay.rs",
+        "fn key_state_at",
+        "returns a `ReplayedState` derived from the `ValidatedChain` it takes",
+    ),
+    allow(
+        "crates/scp-kel/src/validate.rs",
+        "use",
+        "re-exports `ReplayedState` within its defining crate; takes no input",
+    ),
+    allow(
+        "crates/scp-kel/src/verdict.rs",
+        "use",
+        "imports the types `ResolvedState` wraps and returns; takes no input",
+    ),
+    allow(
+        "crates/scp-kel/src/verdict.rs",
+        "struct ResolvedState",
+        "holds the replayed state of the chain resolution accepted, in a private field",
+    ),
+    allow(
+        "crates/scp-kel/src/verdict.rs",
+        "impl ResolvedState",
+        "`key_state` returns the state of the chain resolution accepted; takes none in",
+    ),
+    allow(
+        "crates/scp-protocol/src/crypto/key_continuity.rs",
+        "use",
+        "imports `ReplayedState` for the fingerprint; takes no input",
+    ),
+    allow(
+        "crates/scp-protocol/src/crypto/key_continuity.rs",
+        "impl PartyBlock",
+        "private block builder over a `ReplayedState` for the §9.11 fingerprint, a display value that gates nothing",
+    ),
+    allow(
+        "crates/scp-protocol/src/crypto/key_continuity.rs",
+        "fn compute_key_continuity_fingerprint",
+        "§9.11 fingerprint, a display value that gates nothing; it reads `ReplayedState` because one party is the device's own adopted log",
+    ),
 ];
 
-/// The index in [`EXEMPTIONS`] of the exemption whose name (for `Type` and
-/// `Fn`) or path (for `File`) is `key`.
-fn exemption(key: &str) -> usize {
-    EXEMPTIONS
-        .iter()
-        .position(|e| match e {
-            Exemption::Type { name, .. } | Exemption::Fn { name, .. } => *name == key,
-            Exemption::File { path } => *path == key,
-        })
-        .unwrap_or_else(|| panic!("no exemption keyed {key}"))
-}
-
-/// An input position whose type names a gated type.
+/// A top-level item whose tokens name a gated type.
 #[derive(Debug)]
-struct Hit {
+struct Mention {
     path: String,
-    site: String,
-    /// Indices into the exemption list of every exemption that covers it.
-    exempted_by: Vec<usize>,
+    item: String,
+    /// Index into [`ALLOWLIST`] of the entry that approves it.
+    allowed_by: Option<usize>,
 }
 
 #[derive(Debug)]
 struct Scan {
-    hits: Vec<Hit>,
-    /// Per exemption: the defining struct was found (for `Type`) or at least
-    /// one hit was exempted (for `File` and `Fn`).
-    matched: Vec<bool>,
-    /// Per exemption: the number of hits it exempted.
-    exempted: Vec<usize>,
+    mentions: Vec<Mention>,
+    /// Per allowlist entry: the number of mentions it approved.
+    approved: Vec<usize>,
 }
 
 impl Scan {
-    fn unexempted(&self) -> Vec<&Hit> {
-        self.hits
+    fn unapproved(&self) -> Vec<&Mention> {
+        self.mentions
             .iter()
-            .filter(|h| h.exempted_by.is_empty())
-            .collect()
-    }
-}
-
-const fn is_pub(vis: &syn::Visibility) -> bool {
-    matches!(vis, syn::Visibility::Public(_))
-}
-
-/// True when any path inside the visited node ends in a name from `names`.
-struct Finder<'a> {
-    names: &'a BTreeSet<String>,
-    found: bool,
-}
-
-impl<'ast> Visit<'ast> for Finder<'_> {
-    fn visit_path(&mut self, p: &'ast syn::Path) {
-        if p.segments
-            .last()
-            .is_some_and(|s| self.names.contains(&s.ident.to_string()))
-        {
-            self.found = true;
-        }
-        syn::visit::visit_path(self, p);
-    }
-
-    fn visit_type_macro(&mut self, m: &'ast syn::TypeMacro) {
-        self.found |= tokens_name(&m.mac.tokens, self.names);
-    }
-}
-
-fn type_names(ty: &syn::Type, names: &BTreeSet<String>) -> bool {
-    let mut f = Finder {
-        names,
-        found: false,
-    };
-    f.visit_type(ty);
-    f.found
-}
-
-fn bounds_name(
-    bounds: &syn::punctuated::Punctuated<syn::TypeParamBound, syn::Token![+]>,
-    names: &BTreeSet<String>,
-) -> bool {
-    let mut f = Finder {
-        names,
-        found: false,
-    };
-    for b in bounds {
-        f.visit_type_param_bound(b);
-    }
-    f.found
-}
-
-/// True when a return type lets the caller hand a gated type back in: an
-/// argument of a `Fn(..)`-trait bound or a `fn(..)` pointer, or a `&mut`
-/// reference to a type that names one.
-struct ReturnInput<'a> {
-    names: &'a BTreeSet<String>,
-    found: bool,
-}
-
-impl<'ast> Visit<'ast> for ReturnInput<'_> {
-    fn visit_parenthesized_generic_arguments(
-        &mut self,
-        args: &'ast syn::ParenthesizedGenericArguments,
-    ) {
-        self.found |= args.inputs.iter().any(|t| type_names(t, self.names));
-        syn::visit::visit_return_type(self, &args.output);
-    }
-
-    fn visit_type_bare_fn(&mut self, f: &'ast syn::TypeBareFn) {
-        self.found |= f.inputs.iter().any(|a| type_names(&a.ty, self.names));
-        syn::visit::visit_return_type(self, &f.output);
-    }
-
-    fn visit_type_reference(&mut self, r: &'ast syn::TypeReference) {
-        if r.mutability.is_some() && type_names(&r.elem, self.names) {
-            self.found = true;
-        }
-        syn::visit::visit_type_reference(self, r);
-    }
-}
-
-fn return_takes_input(ret: &syn::ReturnType, names: &BTreeSet<String>) -> bool {
-    let mut f = ReturnInput {
-        names,
-        found: false,
-    };
-    f.visit_return_type(ret);
-    f.found
-}
-
-/// True when `tokens` name a gated type: an ident from `names` that is not the
-/// variant segment of an enum path such as `EventKind::KeyState`.
-fn tokens_name(tokens: &TokenStream, names: &BTreeSet<String>) -> bool {
-    let toks: Vec<TokenTree> = tokens.clone().into_iter().collect();
-    toks.iter().enumerate().any(|(i, t)| match t {
-        TokenTree::Group(g) => tokens_name(&g.stream(), names),
-        TokenTree::Ident(id) if names.contains(&id.to_string()) => {
-            let colon =
-                |k: usize| matches!(toks.get(k), Some(TokenTree::Punct(p)) if p.as_char() == ':');
-            let variant = i >= 3
-                && colon(i - 1)
-                && colon(i - 2)
-                && matches!(&toks[i - 3], TokenTree::Ident(p)
-                    if p.to_string().starts_with(char::is_uppercase)
-                        && !names.contains(&p.to_string()));
-            !variant
-        }
-        _ => false,
-    })
-}
-
-/// `names` plus every type parameter of `generics` whose bound, default, or
-/// where-clause predicate names a gated type, directly or through another
-/// such parameter.
-fn with_bounded_params(names: &BTreeSet<String>, generics: &[&syn::Generics]) -> BTreeSet<String> {
-    let mut out = names.clone();
-    let params: Vec<&syn::TypeParam> = generics.iter().flat_map(|g| g.type_params()).collect();
-    loop {
-        let before = out.len();
-        for tp in &params {
-            let id = tp.ident.to_string();
-            if !out.contains(&id)
-                && (bounds_name(&tp.bounds, &out)
-                    || tp.default.as_ref().is_some_and(|d| type_names(d, &out)))
-            {
-                out.insert(id);
-            }
-        }
-        for g in generics {
-            let Some(wc) = &g.where_clause else { continue };
-            for pred in &wc.predicates {
-                let syn::WherePredicate::Type(pt) = pred else {
-                    continue;
-                };
-                if !bounds_name(&pt.bounds, &out) {
-                    continue;
-                }
-                for tp in &params {
-                    let one: BTreeSet<String> = [tp.ident.to_string()].into();
-                    if type_names(&pt.bounded_ty, &one) {
-                        out.insert(tp.ident.to_string());
-                    }
-                }
-            }
-        }
-        if out.len() == before {
-            return out;
-        }
-    }
-}
-
-/// `names` plus every associated type `impl` binds to a type that names a
-/// gated type, so `Self::S` in its methods reads as gated.
-fn with_assoc_types(names: &BTreeSet<String>, i: &syn::ItemImpl) -> BTreeSet<String> {
-    let mut out = names.clone();
-    loop {
-        let before = out.len();
-        for ii in &i.items {
-            if let syn::ImplItem::Type(t) = ii
-                && type_names(&t.ty, &out)
-            {
-                out.insert(t.ident.to_string());
-            }
-        }
-        if out.len() == before {
-            return out;
-        }
-    }
-}
-
-fn last_ident(ty: &syn::Type) -> Option<String> {
-    let syn::Type::Path(tp) = ty else { return None };
-    tp.path.segments.last().map(|s| s.ident.to_string())
-}
-
-fn pat_label(pat: &syn::Pat) -> String {
-    match pat {
-        syn::Pat::Ident(i) => i.ident.to_string(),
-        _ => "_".to_owned(),
-    }
-}
-
-struct Walker<'a> {
-    rel: &'a str,
-    /// The gated names plus every alias of one.
-    gated: &'a BTreeSet<String>,
-    scan: &'a mut Scan,
-}
-
-impl Walker<'_> {
-    fn file_exemptions(&self) -> Vec<usize> {
-        EXEMPTIONS
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| matches!(e, Exemption::File { path } if *path == self.rel))
-            .map(|(i, _)| i)
+            .filter(|m| m.allowed_by.is_none())
             .collect()
     }
 
-    fn fn_exemptions(&self, ident: &syn::Ident) -> Vec<usize> {
-        EXEMPTIONS
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| {
-                matches!(e, Exemption::Fn { path, name } if *path == self.rel && ident == name)
-            })
-            .map(|(i, _)| i)
-            .collect()
+    fn unapproved_in(&self, path: &str) -> usize {
+        self.unapproved().iter().filter(|m| m.path == path).count()
     }
+}
 
-    fn type_pin(&self, name: &str) -> Option<usize> {
-        EXEMPTIONS.iter().position(
-            |e| matches!(e, Exemption::Type { path, name: n } if *path == self.rel && *n == name),
-        )
-    }
-
-    fn record(&mut self, site: String, exempted_by: Vec<usize>) {
-        for &i in &exempted_by {
-            self.scan.exempted[i] += 1;
-            if !matches!(EXEMPTIONS[i], Exemption::Type { .. }) {
-                self.scan.matched[i] = true;
-            }
-        }
-        self.scan.hits.push(Hit {
-            path: self.rel.to_owned(),
-            site,
-            exempted_by,
-        });
-    }
-
-    fn check_sig(
-        &mut self,
-        owner: &str,
-        sig: &syn::Signature,
-        outer: &[&syn::Generics],
-        names: &BTreeSet<String>,
-        mut exempt: Vec<usize>,
-    ) {
-        let mut generics: Vec<&syn::Generics> = outer.to_vec();
-        generics.push(&sig.generics);
-        let names = with_bounded_params(names, &generics);
-        exempt.extend(self.fn_exemptions(&sig.ident));
-        for (i, arg) in sig.inputs.iter().enumerate() {
-            let (ty, label) = match arg {
-                syn::FnArg::Receiver(r) => (&*r.ty, "self".to_owned()),
-                syn::FnArg::Typed(pt) => (&*pt.ty, format!("#{i} `{}`", pat_label(&pt.pat))),
-            };
-            if type_names(ty, &names) {
-                self.record(
-                    format!("{owner}fn {} param {label}", sig.ident),
-                    exempt.clone(),
-                );
-            }
-        }
-        if return_takes_input(&sig.output, &names) {
-            self.record(
-                format!("{owner}fn {} return input", sig.ident),
-                exempt.clone(),
-            );
-        }
-    }
-
-    fn check_fields<'f>(
-        &mut self,
-        owner: &str,
-        fields: impl Iterator<Item = &'f syn::Field>,
-        names: &BTreeSet<String>,
-        exempt: &[usize],
-    ) {
-        for (i, field) in fields.enumerate() {
-            if type_names(&field.ty, names) {
-                let label = field
-                    .ident
-                    .as_ref()
-                    .map_or_else(|| i.to_string(), ToString::to_string);
-                self.record(format!("{owner} field {label}"), exempt.to_vec());
-            }
-        }
-    }
-
-    /// `gated` plus the bounded generics, plus `Self` where the item itself
-    /// carries a gated name.
-    fn item_names(&self, ident: &syn::Ident, generics: &syn::Generics) -> BTreeSet<String> {
-        let mut names = with_bounded_params(self.gated, &[generics]);
-        if self.gated.contains(&ident.to_string()) {
-            names.insert("Self".to_owned());
-        }
-        names
-    }
-
-    fn check_macro(&mut self, mac: &syn::Macro) {
-        if tokens_name(&mac.tokens, self.gated) {
-            let name = mac
-                .path
-                .segments
-                .last()
-                .map(|s| s.ident.to_string())
-                .unwrap_or_default();
-            let ex = self.file_exemptions();
-            self.record(format!("macro {name}!"), ex);
+/// Every identifier in `tokens`, at any depth.
+fn idents(tokens: TokenStream, out: &mut Vec<String>) {
+    for t in tokens {
+        match t {
+            TokenTree::Ident(i) => out.push(i.to_string()),
+            TokenTree::Group(g) => idents(g.stream(), out),
+            TokenTree::Punct(_) | TokenTree::Literal(_) => {}
         }
     }
 }
 
-impl<'ast> Visit<'ast> for Walker<'_> {
-    fn visit_item_fn(&mut self, f: &'ast syn::ItemFn) {
-        if is_pub(&f.vis) {
-            let ex = self.file_exemptions();
-            let gated = self.gated;
-            self.check_sig("", &f.sig, &[], gated, ex);
-        }
-        syn::visit::visit_item_fn(self, f);
-    }
+fn names_any(tokens: TokenStream, names: &BTreeSet<String>) -> bool {
+    let mut ids = Vec::new();
+    idents(tokens, &mut ids);
+    ids.iter().any(|i| names.contains(i))
+}
 
-    fn visit_foreign_item_fn(&mut self, f: &'ast syn::ForeignItemFn) {
-        if is_pub(&f.vis) {
-            let ex = self.file_exemptions();
-            let gated = self.gated;
-            self.check_sig("extern ", &f.sig, &[], gated, ex);
-        }
-        syn::visit::visit_foreign_item_fn(self, f);
-    }
+fn last_ident(path: &syn::Path) -> String {
+    path.segments
+        .last()
+        .map(|s| s.ident.to_string())
+        .unwrap_or_default()
+}
 
-    fn visit_item_struct(&mut self, s: &'ast syn::ItemStruct) {
-        let name = s.ident.to_string();
-        let pin = self.type_pin(&name);
-        if let Some(i) = pin {
-            self.scan.matched[i] = true;
+fn type_label(ty: &syn::Type) -> String {
+    match ty {
+        syn::Type::Path(p) => last_ident(&p.path),
+        other => {
+            let mut ids = Vec::new();
+            idents(other.to_token_stream(), &mut ids);
+            ids.join(" ")
         }
-        if is_pub(&s.vis) {
-            let names = self.item_names(&s.ident, &s.generics);
-            let mut exempt = self.file_exemptions();
-            exempt.extend(pin);
-            self.check_fields(&format!("struct {name}"), s.fields.iter(), &names, &exempt);
-        }
-        syn::visit::visit_item_struct(self, s);
-    }
-
-    fn visit_item_enum(&mut self, e: &'ast syn::ItemEnum) {
-        if is_pub(&e.vis) {
-            let names = self.item_names(&e.ident, &e.generics);
-            let exempt = self.file_exemptions();
-            for v in &e.variants {
-                self.check_fields(
-                    &format!("enum {}::{}", e.ident, v.ident),
-                    v.fields.iter(),
-                    &names,
-                    &exempt,
-                );
-            }
-        }
-        syn::visit::visit_item_enum(self, e);
-    }
-
-    fn visit_item_union(&mut self, u: &'ast syn::ItemUnion) {
-        if is_pub(&u.vis) {
-            let names = self.item_names(&u.ident, &u.generics);
-            let exempt = self.file_exemptions();
-            self.check_fields(
-                &format!("union {}", u.ident),
-                u.fields.named.iter(),
-                &names,
-                &exempt,
-            );
-        }
-        syn::visit::visit_item_union(self, u);
-    }
-
-    fn visit_item_static(&mut self, s: &'ast syn::ItemStatic) {
-        if is_pub(&s.vis) && type_names(&s.ty, self.gated) {
-            let ex = self.file_exemptions();
-            self.record(format!("static {}", s.ident), ex);
-        }
-        syn::visit::visit_item_static(self, s);
-    }
-
-    fn visit_item_trait(&mut self, t: &'ast syn::ItemTrait) {
-        if is_pub(&t.vis) {
-            for ti in &t.items {
-                if let syn::TraitItem::Fn(m) = ti {
-                    let ex = self.file_exemptions();
-                    let gated = self.gated;
-                    self.check_sig(
-                        &format!("trait {}::", t.ident),
-                        &m.sig,
-                        &[&t.generics],
-                        gated,
-                        ex,
-                    );
-                }
-            }
-        }
-        syn::visit::visit_item_trait(self, t);
-    }
-
-    fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {
-        let self_name = last_ident(&i.self_ty).unwrap_or_default();
-        let mut names = with_assoc_types(self.gated, i);
-        if self.gated.contains(&self_name) {
-            names.insert("Self".to_owned());
-        }
-        // A trait impl's methods are reachable wherever the trait and the
-        // type are, so each counts; an inherent impl's count when `pub`, and
-        // only an inherent impl in the pinned file is covered by the pin.
-        let (pin, owner) = match &i.trait_ {
-            None => (self.type_pin(&self_name), format!("impl {self_name}::")),
-            Some((_, path, _)) => {
-                let tr = path
-                    .segments
-                    .last()
-                    .map(|s| s.ident.to_string())
-                    .unwrap_or_default();
-                (None, format!("impl {tr} for {self_name}::"))
-            }
-        };
-        for ii in &i.items {
-            let syn::ImplItem::Fn(m) = ii else { continue };
-            if i.trait_.is_none() && !is_pub(&m.vis) {
-                continue;
-            }
-            let mut ex = self.file_exemptions();
-            ex.extend(pin);
-            self.check_sig(&owner, &m.sig, &[&i.generics], &names, ex);
-        }
-        syn::visit::visit_item_impl(self, i);
-    }
-
-    /// Every macro invocation in any position: item, statement, expression,
-    /// pattern, type, impl, trait or extern. An expression macro can expand to
-    /// a block whose `impl` is visible crate-wide, so no position is exempt.
-    fn visit_macro(&mut self, m: &'ast syn::Macro) {
-        self.check_macro(m);
     }
 }
 
-enum AliasOf {
-    Type(syn::Type),
-    Ident(String),
+/// The allowlist label of a top-level item: its keyword and name, `impl T`,
+/// `impl Tr for T`, `use`, `name!` for a macro invocation, or `verbatim`.
+fn item_label(item: &syn::Item) -> String {
+    match item {
+        syn::Item::Const(i) => format!("const {}", i.ident),
+        syn::Item::Enum(i) => format!("enum {}", i.ident),
+        syn::Item::ExternCrate(i) => format!("extern crate {}", i.ident),
+        syn::Item::Fn(i) => format!("fn {}", i.sig.ident),
+        syn::Item::ForeignMod(_) => "extern".to_owned(),
+        syn::Item::Impl(i) => match &i.trait_ {
+            None => format!("impl {}", type_label(&i.self_ty)),
+            Some((_, tr, _)) => format!("impl {} for {}", last_ident(tr), type_label(&i.self_ty)),
+        },
+        syn::Item::Macro(i) => i.ident.as_ref().map_or_else(
+            || format!("{}!", last_ident(&i.mac.path)),
+            |id| format!("macro {id}"),
+        ),
+        syn::Item::Mod(i) => format!("mod {}", i.ident),
+        syn::Item::Static(i) => format!("static {}", i.ident),
+        syn::Item::Struct(i) => format!("struct {}", i.ident),
+        syn::Item::Trait(i) => format!("trait {}", i.ident),
+        syn::Item::TraitAlias(i) => format!("trait {}", i.ident),
+        syn::Item::Type(i) => format!("type {}", i.ident),
+        syn::Item::Union(i) => format!("union {}", i.ident),
+        syn::Item::Use(_) => "use".to_owned(),
+        _ => "verbatim".to_owned(),
+    }
 }
 
-/// Every `type A = ..` alias and `use .. as A` rename in a file, at any depth.
-struct Aliases(Vec<(String, AliasOf)>);
+/// Every `type A = ..` alias and `use .. as A` rename, at any depth.
+struct Aliases(Vec<(String, TokenStream)>);
 
 impl<'ast> Visit<'ast> for Aliases {
     fn visit_item_type(&mut self, t: &'ast syn::ItemType) {
-        self.0
-            .push((t.ident.to_string(), AliasOf::Type((*t.ty).clone())));
+        self.0.push((t.ident.to_string(), t.ty.to_token_stream()));
         syn::visit::visit_item_type(self, t);
     }
 
-    fn visit_use_tree(&mut self, tree: &'ast syn::UseTree) {
-        match tree {
-            syn::UseTree::Path(p) => self.visit_use_tree(&p.tree),
-            syn::UseTree::Rename(r) => {
-                self.0
-                    .push((r.rename.to_string(), AliasOf::Ident(r.ident.to_string())));
-            }
-            syn::UseTree::Group(g) => g.items.iter().for_each(|t| self.visit_use_tree(t)),
-            syn::UseTree::Name(_) | syn::UseTree::Glob(_) => {}
-        }
+    fn visit_use_rename(&mut self, r: &'ast syn::UseRename) {
+        self.0
+            .push((r.rename.to_string(), r.ident.to_token_stream()));
     }
 }
 
-/// The gated names plus every alias that reaches one, across all `files`.
+/// The gated names plus every alias or rename that reaches one, closed over
+/// every file scanned together.
 fn gated_names(files: &[(String, syn::File)]) -> BTreeSet<String> {
     let mut aliases = Aliases(Vec::new());
     for (_, f) in files {
@@ -605,11 +329,7 @@ fn gated_names(files: &[(String, syn::File)]) -> BTreeSet<String> {
     loop {
         let before = names.len();
         for (alias, of) in &aliases.0 {
-            let reaches = match of {
-                AliasOf::Type(ty) => type_names(ty, &names),
-                AliasOf::Ident(id) => names.contains(id),
-            };
-            if reaches {
+            if names_any(of.clone(), &names) {
                 names.insert(alias.clone());
             }
         }
@@ -619,27 +339,169 @@ fn gated_names(files: &[(String, syn::File)]) -> BTreeSet<String> {
     }
 }
 
-fn scan(files: &[(String, syn::File)]) -> Scan {
-    let gated = gated_names(files);
-    let mut out = Scan {
-        hits: Vec::new(),
-        matched: vec![false; EXEMPTIONS.len()],
-        exempted: vec![0; EXEMPTIONS.len()],
-    };
-    for (rel, file) in files {
-        Walker {
-            rel,
-            gated: &gated,
-            scan: &mut out,
+/// True for an attribute that is exactly `cfg(test)`. Any other predicate,
+/// `cfg(any(test, feature = "testing"))` included, can hold in a shipped build.
+fn is_cfg_test(attr: &syn::Attribute) -> bool {
+    matches!(&attr.meta, syn::Meta::List(l) if l.path.is_ident("cfg") && l.tokens.to_string() == "test")
+}
+
+fn item_attrs(item: &syn::Item) -> &[syn::Attribute] {
+    match item {
+        syn::Item::Const(i) => &i.attrs,
+        syn::Item::Enum(i) => &i.attrs,
+        syn::Item::ExternCrate(i) => &i.attrs,
+        syn::Item::Fn(i) => &i.attrs,
+        syn::Item::ForeignMod(i) => &i.attrs,
+        syn::Item::Impl(i) => &i.attrs,
+        syn::Item::Macro(i) => &i.attrs,
+        syn::Item::Mod(i) => &i.attrs,
+        syn::Item::Static(i) => &i.attrs,
+        syn::Item::Struct(i) => &i.attrs,
+        syn::Item::Trait(i) => &i.attrs,
+        syn::Item::TraitAlias(i) => &i.attrs,
+        syn::Item::Type(i) => &i.attrs,
+        syn::Item::Union(i) => &i.attrs,
+        syn::Item::Use(i) => &i.attrs,
+        _ => &[],
+    }
+}
+
+fn test_only_item(item: &syn::Item) -> bool {
+    item_attrs(item).iter().any(is_cfg_test)
+}
+
+/// `a/b/../c` → `a/c`.
+fn normalize(path: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            p => parts.push(p),
         }
-        .visit_file(file);
+    }
+    parts.join("/")
+}
+
+/// The file a `mod ident;` declared in `decl` loads, if it was scanned. A file
+/// loaded through `#[path]`, a crate root, or a `mod.rs` keeps its children in
+/// its own directory; any other file keeps them in the directory named by its
+/// stem.
+fn module_file(
+    decl: &str,
+    path_loaded: &BTreeSet<String>,
+    m: &syn::ItemMod,
+    scanned: &BTreeSet<&str>,
+) -> Option<String> {
+    let (dir, name) = decl.rsplit_once('/').unwrap_or(("", decl));
+    let path_attr = m.attrs.iter().find_map(|a| match &a.meta {
+        syn::Meta::NameValue(nv) if nv.path.is_ident("path") => match &nv.value {
+            syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(s),
+                ..
+            }) => Some(s.value()),
+            _ => None,
+        },
+        _ => None,
+    });
+    if let Some(p) = path_attr {
+        let file = normalize(&format!("{dir}/{p}"));
+        return scanned.contains(file.as_str()).then_some(file);
+    }
+    let mod_rs = matches!(name, "mod.rs" | "lib.rs" | "main.rs")
+        || dir.ends_with("src/bin")
+        || path_loaded.contains(decl);
+    let base = if mod_rs {
+        dir.to_owned()
+    } else {
+        format!("{dir}/{}", name.trim_end_matches(".rs"))
+    };
+    [
+        format!("{base}/{}.rs", m.ident),
+        format!("{base}/{}/mod.rs", m.ident),
+    ]
+    .into_iter()
+    .find(|f| scanned.contains(f.as_str()))
+}
+
+/// Every scanned file compiled only under exactly `#[cfg(test)]`: a file with
+/// an inner `#![cfg(test)]`, the file a `#[cfg(test)] mod x;` loads, and every
+/// file a module declared in one of those loads. A declaration the walk cannot
+/// resolve leaves its file in scope, so the gate over-counts and never hides.
+fn test_only_files(files: &[(String, syn::File)]) -> BTreeSet<String> {
+    let scanned: BTreeSet<&str> = files.iter().map(|(r, _)| r.as_str()).collect();
+    let mut path_loaded = BTreeSet::new();
+    for (rel, file) in files {
+        for item in &file.items {
+            if let syn::Item::Mod(m) = item
+                && m.content.is_none()
+                && m.attrs.iter().any(|a| a.path().is_ident("path"))
+            {
+                path_loaded.extend(module_file(rel, &BTreeSet::new(), m, &scanned));
+            }
+        }
+    }
+    let mut test_only: BTreeSet<String> = files
+        .iter()
+        .filter(|(_, f)| f.attrs.iter().any(is_cfg_test))
+        .map(|(r, _)| r.clone())
+        .collect();
+    loop {
+        let before = test_only.len();
+        for (rel, file) in files {
+            let whole = test_only.contains(rel);
+            for item in &file.items {
+                let syn::Item::Mod(m) = item else { continue };
+                if m.content.is_none() && (whole || test_only_item(item)) {
+                    test_only.extend(module_file(rel, &path_loaded, m, &scanned));
+                }
+            }
+        }
+        if test_only.len() == before {
+            return test_only;
+        }
+    }
+}
+
+fn scan(files: &[(String, syn::File)]) -> Scan {
+    let names = gated_names(files);
+    let test_only = test_only_files(files);
+    let mut out = Scan {
+        mentions: Vec::new(),
+        approved: vec![0; ALLOWLIST.len()],
+    };
+    for (rel, file) in files.iter().filter(|(r, _)| !test_only.contains(r)) {
+        let inner: TokenStream = file.attrs.iter().map(ToTokens::to_token_stream).collect();
+        let items = file
+            .items
+            .iter()
+            .filter(|i| !test_only_item(i))
+            .map(|i| (item_label(i), i.to_token_stream()));
+        for (item, tokens) in std::iter::once(("#![..]".to_owned(), inner)).chain(items) {
+            if !names_any(tokens, &names) {
+                continue;
+            }
+            let allowed_by = ALLOWLIST
+                .iter()
+                .position(|a| a.path == rel && a.item == item);
+            if let Some(i) = allowed_by {
+                out.approved[i] += 1;
+            }
+            out.mentions.push(Mention {
+                path: rel.clone(),
+                item,
+                allowed_by,
+            });
+        }
     }
     out
 }
 
-fn scan_fixture(rel: &str, src: &str) -> Scan {
+fn parse(rel: &str, src: &str) -> (String, syn::File) {
     let file = syn::parse_file(src).unwrap_or_else(|e| panic!("fixture parses: {e}: {src}"));
-    scan(&[(rel.to_owned(), file)])
+    (rel.to_owned(), file)
 }
 
 fn workspace_root() -> PathBuf {
@@ -706,303 +568,276 @@ fn workspace_files() -> Vec<(String, syn::File)> {
 
 const OTHER: &str = "crates/scp-other/src/lib.rs";
 
-/// Must-fail and must-pass inputs at non-exempt paths, each with the number of
-/// unexempted hits the gate must report.
-const FIXTURES: &[(&str, &str, usize)] = &[
+/// Must-fail and must-pass inputs at a path with no allowlist entry, each with
+/// the number of unapproved mentions the gate must report.
+const FIXTURES: &[(&str, usize)] = &[
     // The story's two must-fail inputs.
-    (OTHER, "pub fn f(k: Option<&scp_did::KeyState>) {}", 1),
-    (OTHER, "pub fn g(r: &[ReplayedState]) {}", 1),
-    // Wrappers, trait bounds, and generic bounds.
-    (OTHER, "pub struct S { k: Arc<KeyStateView> }", 1),
-    (OTHER, "pub trait T { fn m(&self, k: &KeyState); }", 1),
-    (OTHER, "pub fn b<T: Into<ReplayedState>>(t: T) {}", 1),
+    ("pub fn f(k: Option<&scp_did::KeyState>) {}", 1),
+    ("pub fn g(r: &[ReplayedState]) {}", 1),
+    ("pub struct S { k: Arc<KeyStateView> }", 1),
+    // One mention per item, however many tokens name a gated type.
     (
-        OTHER,
-        "pub fn w<T>(t: Vec<T>) where T: Into<KeyState> {}",
+        "pub fn p(a: Vec<(KeyState, ReplayedState)>, b: &KeyState) {}",
         1,
     ),
-    (OTHER, "pub fn c<U: Into<KeyState>, T: Into<U>>(t: T) {}", 1),
-    // A parameter bounded through one declared after it needs a second pass.
-    (OTHER, "pub fn c<T: Into<U>, U: Into<KeyState>>(t: T) {}", 1),
-    (OTHER, "pub fn i(a: impl Into<KeyState>) {}", 1),
-    (OTHER, "pub fn d(a: &dyn AsRef<ReplayedState>) {}", 1),
-    (OTHER, "pub fn q(a: <KeyState as X>::Y) {}", 1),
-    (OTHER, "pub fn n(a: (&[Option<Arc<KeyState>>], u8)) {}", 1),
-    // Struct generics: a bound and a default.
-    (OTHER, "pub struct S<T: Into<KeyState>> { t: T }", 1),
-    (OTHER, "pub struct S<T = KeyState> { t: T }", 1),
-    // One hit per position, not per path.
-    (OTHER, "pub fn p(a: Vec<(KeyState, ReplayedState)>) {}", 1),
     (
-        OTHER,
-        "pub fn two(a: &KeyState, b: &ReplayedState, c: u8) {}",
+        "pub fn a(k: &KeyState) {} pub fn b(r: &ReplayedState) {}",
         2,
     ),
-    // Private fields of a pub struct, tuple fields, inline modules, methods.
-    (OTHER, "pub struct P { k: KeyState, n: u8 }", 1),
-    (OTHER, "pub struct T(pub KeyState, u8);", 1),
-    (OTHER, "mod m { pub fn f(k: &KeyState) {} }", 1),
-    (OTHER, "impl Foo { pub fn f(&self, k: &KeyState) {} }", 1),
+    // Inputs the earlier position walk missed.
+    ("pub enum E { A(KeyState) }", 1),
+    ("pub union U { k: std::mem::ManuallyDrop<KeyState> }", 1),
+    ("impl X for Foo { fn f(k: &KeyState) {} }", 1),
     (
-        OTHER,
-        "impl<T: Into<KeyState>> Foo<T> { pub fn f(t: T) {} }",
-        1,
-    ),
-    (OTHER, "pub trait G<T: Into<KeyState>> { fn m(t: T); }", 1),
-    // Aliases and renames of a gated name, in any order and in a use group.
-    (OTHER, "type K = Arc<KeyState>; pub fn f(k: K) {}", 1),
-    (OTHER, "type B = A; type A = KeyState; pub fn f(b: B) {}", 1),
-    (OTHER, "use scp_did::KeyState as K; pub fn f(k: &K) {}", 1),
-    (OTHER, "use scp_did::{KeyState as K}; pub fn f(k: &K) {}", 1),
-    // A gated name declared at another path is walked like any other type.
-    (OTHER, "pub struct KeyState { k: ReplayedState }", 1),
-    (OTHER, "pub struct KeyState { next: Option<Box<Self>> }", 1),
-    (OTHER, "impl KeyState { pub fn f(&self, o: u8) {} }", 1),
-    (
-        "crates/scp-did/src/other.rs",
-        "pub struct KeyState { k: ReplayedState }",
-        1,
-    ),
-    (
-        "crates/scp-protocol/src/crypto/other.rs",
-        "pub fn compute_key_continuity_fingerprint(a: &ReplayedState, b: &ReplayedState) {}",
-        2,
-    ),
-    // Positions outside pub fn parameters and pub struct fields.
-    (OTHER, "pub enum E { A(KeyState) }", 1),
-    (OTHER, "pub enum E { A { k: Box<ReplayedState> }, B }", 1),
-    (
-        OTHER,
-        "pub union U { k: std::mem::ManuallyDrop<KeyState> }",
-        1,
-    ),
-    (OTHER, "pub static S: Mutex<Option<KeyState>> = todo!();", 1),
-    (OTHER, "extern \"C\" { pub fn f(k: *const KeyState); }", 1),
-    (OTHER, "impl X for Foo { fn f(k: &KeyState) {} }", 1),
-    (
-        OTHER,
         "impl From<KeyState> for F { fn from(k: KeyState) -> Self { todo!() } }",
         1,
     ),
     (
-        OTHER,
         "impl TryFrom<KeyState> for F { type Error = (); \
          fn try_from(k: KeyState) -> Result<Self, ()> { todo!() } }",
         1,
     ),
     (
-        OTHER,
         "pub trait T { type S; fn m(s: Self::S); } \
          impl T for X { type S = KeyState; fn m(s: Self::S) {} }",
         1,
     ),
-    (OTHER, "pub fn mk() -> impl FnOnce(KeyState) { |_| () }", 1),
+    ("pub fn mk() -> impl FnOnce(KeyState) { |_| () }", 1),
+    ("fn outer() { impl Foo { pub fn take(k: KeyState) {} } }", 1),
     (
-        OTHER,
-        "pub fn mk() -> Box<dyn Fn(u8, &ReplayedState)> { todo!() }",
-        1,
-    ),
-    (OTHER, "pub fn mk() -> fn(KeyState) { todo!() }", 1),
-    (
-        OTHER,
-        "impl Foo { pub fn m(&mut self) -> &mut KeyState { todo!() } }",
-        1,
-    ),
-    (
-        OTHER,
-        "fn outer() { impl Foo { pub fn take(k: KeyState) {} } }",
-        1,
-    ),
-    (
-        OTHER,
-        "impl A { fn f() { impl Foo { pub fn take(k: KeyState) {} } } }",
-        1,
-    ),
-    (
-        OTHER,
         "const _: () = { impl Foo { pub fn take(k: KeyState) {} } };",
         1,
     ),
-    (OTHER, "m! { pub fn f(k: KeyState) {} }", 1),
+    ("m! { pub fn f(k: KeyState) {} }", 1),
+    ("pub fn f<T>(t: T) where T: Into<KeyState> {}", 1),
+    ("pub struct S<T = KeyState> { t: T }", 1),
     (
-        OTHER,
-        "fn f() { m! { pub fn g(k: scp_did::KeyState) {} } }",
+        "pub fn f<I: Iterator>(i: I) where I::Item: Into<KeyState> {}",
         1,
     ),
-    // A type macro in a parameter is two findings: the parameter and the macro.
-    (OTHER, "pub fn f(k: m!(KeyState)) {}", 2),
+    ("type F = fn(KeyState); pub fn r() -> F { todo!() }", 2),
+    ("pub fn r() -> Sender<KeyState> { todo!() }", 1),
+    ("pub fn r() -> &'static Mutex<KeyState> { todo!() }", 1),
+    ("pub const F: fn(KeyState) = |_| ();", 1),
     (
-        OTHER,
-        "fn f() { let _ = m!({ impl Foo { pub fn t(k: KeyState) {} } }); }",
+        "pub trait T { type S: Into<KeyState>; fn m(s: Self::S); }",
         1,
     ),
-    (OTHER, "fn f(x: u8) { if let m!(KeyState) = x {} }", 1),
-    // Not hits: crate-visible or private items, non-pub inherent methods,
-    // outputs, enum variants that share a gated name.
-    (OTHER, "pub(crate) fn h(k: &KeyState) {}", 0),
-    (OTHER, "struct Q { k: KeyState }", 0),
-    (OTHER, "enum Q { A(KeyState) }", 0),
-    (OTHER, "impl Foo { fn f(k: &KeyState) {} }", 0),
-    (OTHER, "pub fn r() -> KeyState { todo!() }", 0),
-    (OTHER, "pub fn r(&self) -> &KeyState { todo!() }", 0),
-    (OTHER, "pub fn r() -> impl Fn() -> KeyState { todo!() }", 0),
+    ("impl T for X { fn m(s: Self::S) {} type S = KeyState; }", 1),
+    ("fn f() { m!(Did::KeyState); }", 1),
+    ("#[my_attr(KeyState)] pub fn f() {}", 1),
     (
-        OTHER,
-        "pub fn e(k: EventKind) { let _ = EventKind::KeyState; \
-         assert!(matches!(k, EventKind::KeyState)); }",
+        "fn f(v: Kind) { match v { m!(KeyState) => (), _ => () } }",
+        1,
+    ),
+    ("#![doc = \"x\"] #![my_attr(KeyState)] fn f() {}", 1),
+    // Private and crate-visible items count: the mention, not its visibility,
+    // is what an approval covers.
+    ("pub(crate) fn h(k: &KeyState) {}", 1),
+    ("fn r() -> KeyState { todo!() }", 1),
+    ("enum Kind { KeyState }", 1),
+    // Aliases and renames in the same file, in either order.
+    ("type K = Arc<KeyState>; pub fn f(k: K) {}", 2),
+    ("type B = A; type A = KeyState; pub fn f(b: B) {}", 3),
+    ("use scp_did::{KeyState as K}; pub fn f(k: &K) {}", 2),
+    // Exactly `#[cfg(test)]` never ships; every other predicate can.
+    ("#[cfg(test)] mod t { pub fn f(k: KeyState) {} }", 0),
+    ("#[cfg(test)] pub fn f(k: KeyState) {}", 0),
+    ("#![cfg(test)] pub fn f(k: KeyState) {}", 0),
+    (
+        "#[cfg(any(test, feature = \"testing\"))] mod t { pub fn f(k: KeyState) {} }",
+        1,
+    ),
+    ("#[cfg(all(test))] pub fn f(k: KeyState) {}", 1),
+    ("#[cfg(not(test))] pub fn f(k: KeyState) {}", 1),
+    (
+        "#[cfg_attr(test, allow(dead_code))] pub fn f(k: KeyState) {}",
+        1,
+    ),
+    // A string or a doc comment is not a mention.
+    (
+        "/// A `KeyState` doc.\npub fn f() { let _ = \"KeyState\"; }",
         0,
     ),
-    (OTHER, "m! { Kind::KeyState }", 0),
+    ("pub fn f(k: &KeyStates, s: KeyStateSnapshot) {}", 0),
 ];
 
-/// An input at an exempt path.
-struct ExemptFixture {
-    rel: &'static str,
-    src: &'static str,
-    /// Unexempted hits the gate must report.
-    unexempted: usize,
-    /// Per exemption key (see [`exemption`]): the hits it must cover.
-    exempted: &'static [(&'static str, usize)],
-}
-
-const fn ef(
-    rel: &'static str,
-    src: &'static str,
-    unexempted: usize,
-    exempted: &'static [(&'static str, usize)],
-) -> ExemptFixture {
-    ExemptFixture {
-        rel,
-        src,
-        unexempted,
-        exempted,
+/// A rename or alias declared in one file reaches a use in another.
+fn assert_cross_file_aliases() {
+    let cases: [(&str, &str); 3] = [
+        ("pub use scp_did::KeyState as Ks;", "pub fn f(k: Ks) {}"),
+        ("pub type A = Vec<KeyState>;", "pub fn f(a: &A) {}"),
+        (
+            "pub type A = KeyState; pub type B = Option<A>;",
+            "pub fn f(b: B) {}",
+        ),
+    ];
+    for (decl, user) in cases {
+        let s = scan(&[
+            parse("crates/scp-decl/src/lib.rs", decl),
+            parse(OTHER, user),
+        ]);
+        assert_eq!(
+            s.unapproved_in(OTHER),
+            1,
+            "{decl} / {user}: {:#?}",
+            s.mentions
+        );
     }
 }
 
-const EXEMPT_FIXTURES: &[ExemptFixture] = &[
-    ef(
-        "crates/scp-did/src/key_state.rs",
-        "pub struct KeyState { k: Box<Self> } impl KeyState { pub fn f(&self, o: &KeyState) {} }",
-        0,
-        &[("KeyState", 3)],
-    ),
-    ef(
-        "crates/scp-did/src/key_state.rs",
-        "pub struct KeyState { a: u8 } impl From<ReplayedState> for KeyState { \
-         fn from(r: ReplayedState) -> Self { todo!() } }",
-        1,
-        &[("KeyState", 0)],
-    ),
-    ef(
-        "crates/scp-kel/src/validate/replay.rs",
-        "pub struct ReplayedState { key_state: KeyState } pub fn x(r: &ReplayedState) {}",
-        0,
-        &[
-            ("ReplayedState", 1),
-            ("crates/scp-kel/src/validate/replay.rs", 2),
-        ],
-    ),
-    ef(
-        "crates/scp-kel/src/verdict.rs",
-        "pub struct ResolvedState { replayed: ReplayedState } m! { KeyState }",
-        0,
-        &[("crates/scp-kel/src/verdict.rs", 2)],
-    ),
-    ef(
-        "crates/scp-protocol/src/crypto/key_continuity.rs",
-        "pub fn compute_key_continuity_fingerprint(a: &ReplayedState, b: &ReplayedState) {} \
-         pub fn other(a: &ReplayedState) {}",
-        1,
-        &[("compute_key_continuity_fingerprint", 2)],
-    ),
-];
+/// The file a `#[cfg(test)] mod x;` loads, and every file below it, is out of
+/// scope; a file loaded by any other declaration is in.
+fn assert_test_only_files() {
+    let k = "pub fn f(k: KeyState) {}";
+    let cases: &[(&[(&str, &str)], usize)] = &[
+        (
+            &[
+                ("crates/x/src/lib.rs", "#[cfg(test)] mod tests;"),
+                ("crates/x/src/tests.rs", k),
+            ],
+            0,
+        ),
+        (
+            &[
+                ("crates/x/src/lib.rs", "#[cfg(test)] mod tests;"),
+                ("crates/x/src/tests/mod.rs", k),
+            ],
+            0,
+        ),
+        (
+            &[
+                ("crates/x/src/lib.rs", "#[cfg(test)] mod tests;"),
+                ("crates/x/src/tests.rs", "mod deep;"),
+                ("crates/x/src/tests/deep.rs", k),
+            ],
+            0,
+        ),
+        (
+            &[
+                ("crates/x/src/a.rs", "#[cfg(test)] mod t;"),
+                ("crates/x/src/a/t.rs", k),
+            ],
+            0,
+        ),
+        (
+            &[
+                (
+                    "crates/x/src/a.rs",
+                    "#[cfg(test)] #[path = \"a_tests.rs\"] mod t;",
+                ),
+                ("crates/x/src/a_tests.rs", k),
+            ],
+            0,
+        ),
+        (
+            &[
+                ("crates/x/src/lib.rs", "mod tests;"),
+                ("crates/x/src/tests.rs", k),
+            ],
+            1,
+        ),
+        // `a.rs` keeps its children in `a/`, so a sibling `t.rs` is another module.
+        (
+            &[
+                ("crates/x/src/a.rs", "#[cfg(test)] mod t;"),
+                ("crates/x/src/t.rs", k),
+            ],
+            1,
+        ),
+        (
+            &[
+                (
+                    "crates/x/src/lib.rs",
+                    "#[cfg(any(test, feature = \"testing\"))] mod tests;",
+                ),
+                ("crates/x/src/tests.rs", k),
+            ],
+            1,
+        ),
+    ];
+    for (srcs, want) in cases {
+        let files: Vec<_> = srcs.iter().map(|(r, s)| parse(r, s)).collect();
+        let s = scan(&files);
+        assert_eq!(s.unapproved().len(), *want, "{srcs:?}: {:#?}", s.mentions);
+    }
+}
 
 fn assert_fixtures() {
-    for (rel, src, want) in FIXTURES {
-        let s = scan_fixture(rel, src);
-        let got = s.unexempted();
-        assert_eq!(got.len(), *want, "{rel}: {src}: {got:#?}");
+    for (src, want) in FIXTURES {
+        let s = scan(&[parse(OTHER, src)]);
+        assert_eq!(s.unapproved().len(), *want, "{src}: {:#?}", s.mentions);
     }
-    for f in EXEMPT_FIXTURES {
-        let (rel, src) = (f.rel, f.src);
-        let s = scan_fixture(rel, src);
-        let got = s.unexempted();
-        assert_eq!(got.len(), f.unexempted, "{rel}: {src}: {got:#?}");
-        for (key, n) in f.exempted {
-            assert_eq!(
-                s.exempted[exemption(key)],
-                *n,
-                "{rel}: {src}: exemption {key}: {:#?}",
-                s.hits
-            );
-        }
-    }
+    assert_cross_file_aliases();
+    assert_test_only_files();
 }
 
-/// The stale-exemption assertion fails on a tree in which a pin's struct or a
-/// file's exempt hit is missing.
-fn assert_stale_exemption_detected() {
-    let pin = exemption("KeyState");
-    let verdict = exemption("crates/scp-kel/src/verdict.rs");
-    let s = scan_fixture("crates/scp-did/src/key_state.rs", "pub struct Other;");
-    assert!(
-        !s.matched[pin],
-        "a KeyState pin with no defining struct reads as matched"
+/// An approved item gives no unapproved mention, another item in the same
+/// file does, and an entry whose item is missing reads as stale.
+fn assert_allowlist_semantics() {
+    let entry = ALLOWLIST
+        .iter()
+        .position(|a| a.path == "crates/scp-kel/src/verdict.rs" && a.item == "impl ResolvedState")
+        .expect("verdict.rs `impl ResolvedState` is approved");
+    let path = ALLOWLIST[entry].path;
+    let s = scan(&[parse(
+        path,
+        "impl ResolvedState { pub const fn key_state(&self) -> &KeyState { todo!() } }",
+    )]);
+    assert_eq!(s.unapproved().len(), 0, "{:#?}", s.mentions);
+    assert_eq!(s.approved[entry], 1);
+    let s = scan(&[parse(
+        path,
+        "impl ResolvedState { pub const fn key_state(&self) -> &KeyState { todo!() } } \
+         pub fn leak(k: KeyState) {}",
+    )]);
+    assert_eq!(s.unapproved().len(), 1, "{:#?}", s.mentions);
+    assert_eq!(s.unapproved()[0].item, "fn leak");
+    let s = scan(&[parse(path, "pub struct ResolvedState { n: u8 }")]);
+    assert_eq!(
+        s.approved[entry], 0,
+        "a missing approved item reads as matched"
     );
-    let s = scan_fixture(
-        "crates/scp-kel/src/verdict.rs",
-        "pub struct ResolvedState { n: u8 }",
-    );
-    assert!(
-        !s.matched[verdict],
-        "a file exemption that exempts nothing reads as matched"
-    );
-    let s = scan_fixture(
-        "crates/scp-did/src/key_state.rs",
-        "pub struct KeyState { a: u8 }",
-    );
-    assert!(s.matched[pin], "the KeyState pin did not match its struct");
 }
 
 #[test]
 fn key_state_params() {
-    assert_fixtures();
-    assert_stale_exemption_detected();
-
     let files = workspace_files();
     let s = scan(&files);
-    println!("key_state_params: scanned {} files", files.len());
-    for (i, e) in EXEMPTIONS.iter().enumerate() {
-        println!(
-            "  exemption {e:?}: matched={} exempted_hits={}",
-            s.matched[i], s.exempted[i]
-        );
+    println!(
+        "key_state_params: scanned {} files, {} allowlist entries",
+        files.len(),
+        ALLOWLIST.len()
+    );
+    for (a, n) in ALLOWLIST.iter().zip(&s.approved) {
+        println!("  approved x{n}: {} `{}`: {}", a.path, a.item, a.reason);
     }
-    for h in s.hits.iter().filter(|h| !h.exempted_by.is_empty()) {
-        println!("  exempt: {}: {}", h.path, h.site);
-    }
-    let bad = s.unexempted();
-    println!("  unexempted hits: {}", bad.len());
-    for h in &bad {
-        println!("  HIT: {}: {}", h.path, h.site);
+    let bad = s.unapproved();
+    println!("  unapproved mentions: {}", bad.len());
+    for m in &bad {
+        println!("  MENTION: {} `{}`", m.path, m.item);
     }
 
-    let stale: Vec<_> = EXEMPTIONS
+    assert_fixtures();
+    assert_allowlist_semantics();
+
+    let stale: Vec<_> = ALLOWLIST
         .iter()
-        .zip(&s.matched)
-        .filter(|(_, m)| !**m)
-        .map(|(e, _)| e)
+        .zip(&s.approved)
+        .filter(|(_, n)| **n == 0)
+        .map(|(a, _)| a)
         .collect();
     assert!(
         stale.is_empty(),
-        "these exemptions match nothing, so each is stale: {stale:#?}"
+        "these allowlist entries match no mention, so each is stale: {stale:#?}"
     );
     assert!(
         bad.is_empty(),
-        "these input positions take key state that no resolution accepted; \
-         take a `ResolvedState` instead (`03-identity.md` §3.10.10):\n{}",
+        "these items name key state that no resolution accepted; take a \
+         `ResolvedState` instead (`03-identity.md` §3.10.10), or pin the item in \
+         ALLOWLIST with the reason its mention cannot hand such state in:\n{}",
         bad.iter()
-            .map(|h| format!("{}: {}", h.path, h.site))
+            .map(|m| format!("{} `{}`", m.path, m.item))
             .collect::<Vec<_>>()
             .join("\n")
     );
@@ -1012,331 +847,65 @@ fn key_state_params() {
 // verdict_match_has_no_wildcard
 // ---------------------------------------------------------------------------
 
-const LINT: &str = "wildcard_enum_match_arm";
-
-/// The variant names of `EntryVerdict`, read from its definition.
-fn entry_verdict_variants() -> BTreeSet<String> {
-    let path = workspace_root().join("crates/scp-kel/src/validate/entry.rs");
-    let src = std::fs::read_to_string(&path).expect("crates/scp-kel/src/validate/entry.rs reads");
-    let file = syn::parse_file(&src).expect("entry.rs parses");
-    let variants: BTreeSet<String> = file
-        .items
-        .iter()
-        .find_map(|i| match i {
-            syn::Item::Enum(e) if e.ident == "EntryVerdict" => {
-                Some(e.variants.iter().map(|v| v.ident.to_string()).collect())
-            }
-            _ => None,
-        })
-        .expect("entry.rs defines EntryVerdict");
-    assert!(variants.len() >= 2, "{variants:?}");
-    variants
-}
-
-/// The `EntryVerdict` variants a pattern names, by an `EntryVerdict::V` path
-/// or by a bare variant name a glob import brought in; `named_enum` is set
-/// when the pattern spells `EntryVerdict`.
-struct VariantsIn<'a> {
-    variants: &'a BTreeSet<String>,
-    named: BTreeSet<String>,
-    named_enum: bool,
-}
-
-impl<'ast> Visit<'ast> for VariantsIn<'_> {
-    fn visit_path(&mut self, p: &'ast syn::Path) {
-        self.named_enum |= p.segments.iter().any(|s| s.ident == "EntryVerdict");
-        if let Some(last) = p.segments.last() {
-            let id = last.ident.to_string();
-            if self.variants.contains(&id) {
-                self.named.insert(id);
-            }
-        }
-        syn::visit::visit_path(self, p);
-    }
-
-    fn visit_pat_ident(&mut self, i: &'ast syn::PatIdent) {
-        let id = i.ident.to_string();
-        if i.subpat.is_none() && self.variants.contains(&id) {
-            self.named.insert(id);
-        }
-        syn::visit::visit_pat_ident(self, i);
-    }
-}
-
-/// True when `pat` matches every value: `_`, a binding that is not a
-/// variant name, `x @ <catch-all>`, or an or-pattern, parenthesis or
-/// reference around one.
-fn is_catch_all(pat: &syn::Pat, variants: &BTreeSet<String>) -> bool {
-    match pat {
-        syn::Pat::Wild(_) => true,
-        syn::Pat::Or(o) => o.cases.iter().any(|c| is_catch_all(c, variants)),
-        syn::Pat::Paren(p) => is_catch_all(&p.pat, variants),
-        syn::Pat::Reference(r) => is_catch_all(&r.pat, variants),
-        syn::Pat::Ident(i) => match &i.subpat {
-            Some((_, sub)) => is_catch_all(sub, variants),
-            None => !variants.contains(&i.ident.to_string()),
-        },
-        _ => false,
-    }
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct VerdictCheck {
-    denies: bool,
-    relaxations: usize,
-    wildcard_arms: usize,
-    incomplete_matches: usize,
-}
-
-#[derive(Debug, Default)]
-struct MatchFindings {
-    /// Matches whose arms name `EntryVerdict` or one of its variants.
-    matches: usize,
-    /// Catch-all arms across those matches.
-    wildcard: usize,
-    /// Those matches that name fewer than every variant.
-    incomplete: usize,
-}
-
-/// Catch-all arms, and matches that name fewer than every variant, over every
-/// `match` whose arms name an `EntryVerdict` variant.
-fn match_findings(file: &syn::File, variants: &BTreeSet<String>) -> MatchFindings {
-    struct V<'a> {
-        variants: &'a BTreeSet<String>,
-        out: MatchFindings,
-    }
-    impl<'ast> Visit<'ast> for V<'_> {
-        fn visit_expr_match(&mut self, m: &'ast syn::ExprMatch) {
-            let mut seen = VariantsIn {
-                variants: self.variants,
-                named: BTreeSet::new(),
-                named_enum: false,
-            };
-            for a in &m.arms {
-                seen.visit_pat(&a.pat);
-            }
-            if seen.named_enum || !seen.named.is_empty() {
-                self.out.matches += 1;
-                self.out.wildcard += m
-                    .arms
-                    .iter()
-                    .filter(|a| is_catch_all(&a.pat, self.variants))
-                    .count();
-                if seen.named != *self.variants {
-                    self.out.incomplete += 1;
-                }
-            }
-            syn::visit::visit_expr_match(self, m);
-        }
-    }
-    let mut v = V {
-        variants,
-        out: MatchFindings::default(),
-    };
-    v.visit_file(file);
-    v.out
-}
-
-fn path_is(p: &syn::Path, segs: &[&str]) -> bool {
-    p.segments.len() == segs.len() && p.segments.iter().zip(segs).all(|(s, w)| s.ident == w)
-}
-
-/// True when `meta` is `deny(..)` or `forbid(..)` listing the lint.
-fn meta_denies_lint(meta: &syn::Meta) -> bool {
-    let syn::Meta::List(list) = meta else {
-        return false;
-    };
-    (list.path.is_ident("deny") || list.path.is_ident("forbid"))
-        && list
-            .parse_args_with(
-                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
-            )
-            .is_ok_and(|ms| ms.iter().any(|m| path_is(m.path(), &["clippy", LINT])))
-}
-
-/// `syn::File::attrs` holds only the file's inner attributes, so an outer
-/// `#[deny(..)]` on one item never counts.
-fn file_denies_lint(file: &syn::File) -> bool {
-    file.attrs.iter().any(|a| meta_denies_lint(&a.meta))
-}
-
-/// True when `meta` lowers the lint below deny: `allow`, `warn` or `expect`
-/// naming the lint, `clippy::restriction` (the group holding it), or the bare
-/// `clippy` tool; or a `cfg_attr` whose attributes do. A list that does not
-/// parse counts when its text names the lint or the group.
-fn meta_relaxes(meta: &syn::Meta) -> bool {
-    let syn::Meta::List(list) = meta else {
-        return false;
-    };
-    let text_names = |_| {
-        let text = list.tokens.to_string();
-        text.contains(LINT) || text.contains("restriction")
-    };
-    let parsed = list.parse_args_with(
-        syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
-    );
-    if list.path.is_ident("cfg_attr") {
-        return parsed.map_or_else(text_names, |ms| ms.iter().skip(1).any(meta_relaxes));
-    }
-    if !["allow", "warn", "expect"]
-        .iter()
-        .any(|n| list.path.is_ident(n))
-    {
-        return false;
-    }
-    parsed.map_or_else(text_names, |ms| {
-        ms.iter().any(|m| {
-            let p = m.path();
-            p.is_ident("clippy")
-                || path_is(p, &["clippy", LINT])
-                || path_is(p, &["clippy", "restriction"])
-        })
-    })
-}
-
-fn lint_relaxations(file: &syn::File) -> usize {
-    struct V(usize);
-    impl<'ast> Visit<'ast> for V {
-        fn visit_attribute(&mut self, a: &'ast syn::Attribute) {
-            self.0 += usize::from(meta_relaxes(&a.meta));
-        }
-    }
-    let mut v = V(0);
-    v.visit_file(file);
-    v.0
-}
-
-fn check_verdict_source(src: &str, variants: &BTreeSet<String>) -> VerdictCheck {
+/// True when the file's inner attributes forbid the lint. `syn::File::attrs`
+/// holds only inner attributes, so a `#[forbid(..)]` on one item never counts.
+fn file_forbids_wildcard(src: &str) -> bool {
     let file = syn::parse_file(src).unwrap_or_else(|e| panic!("source parses: {e}: {src}"));
-    let m = match_findings(&file, variants);
-    VerdictCheck {
-        denies: file_denies_lint(&file),
-        relaxations: lint_relaxations(&file),
-        wildcard_arms: m.wildcard,
-        incomplete_matches: m.incomplete,
-    }
-}
-
-const CLEAN: VerdictCheck = VerdictCheck {
-    denies: true,
-    relaxations: 0,
-    wildcard_arms: 0,
-    incomplete_matches: 0,
-};
-
-/// Must-fail and must-pass sources for the verdict check, each with the
-/// result it must produce.
-fn verdict_cases() -> Vec<(String, VerdictCheck)> {
-    const DENY: &str = "#![deny(clippy::wildcard_enum_match_arm)]\n";
-    const FULL: &str = "EntryVerdict::NoInception => (), \
-         EntryVerdict::InceptionInvalid { .. } => (), EntryVerdict::Valid { .. } => ()";
-    let clean = CLEAN;
-    let wild = |n| VerdictCheck {
-        wildcard_arms: n,
-        ..clean
-    };
-    let partial = VerdictCheck {
-        wildcard_arms: 1,
-        incomplete_matches: 1,
-        ..clean
-    };
-    let relaxed = |n| VerdictCheck {
-        relaxations: n,
-        ..clean
-    };
-    let m = |arms: &str| format!("{DENY}fn f(v: EntryVerdict) {{ match v {{ {arms} }} }}");
-    vec![
-        // Catch-all arms beside a complete set of variants.
-        (m(&format!("{FULL}, _ => ()")), wild(1)),
-        (m(&format!("{FULL}, other => ()")), wild(1)),
-        (m(&format!("{FULL}, x @ _ => ()")), wild(1)),
-        (m(&format!("{FULL}, (_) => ()")), wild(1)),
-        (m(&format!("{FULL}, &_ => ()")), wild(1)),
-        (m("EntryVerdict::NoInception | _ => ()"), partial),
-        (m("EntryVerdict::NoInception => (), _ => ()"), partial),
-        // Through a glob import, with no `EntryVerdict` path in any arm.
-        (
-            format!(
-                "{DENY}use EntryVerdict::*; fn f(v: EntryVerdict) {{ \
-                 match v {{ Valid {{ .. }} => (), _ => () }} }}"
-            ),
-            partial,
-        ),
-        (
-            format!(
-                "{DENY}use EntryVerdict::*; fn f(v: EntryVerdict) {{ match v {{ \
-                 Valid {{ .. }} => (), NoInception => (), InceptionInvalid {{ .. }} => () }} }}"
-            ),
-            clean,
-        ),
-        (m(FULL), clean),
-        // A wildcard over another enum is outside the check.
-        (
-            format!("{DENY}fn f(v: Other) {{ match v {{ Other::A => (), _ => () }} }}"),
-            clean,
-        ),
-        // The deny: missing, outer on one fn, forbid in its place.
-        ("fn f() {}".to_owned(), VerdictCheck::default()),
-        (
-            "#[deny(clippy::wildcard_enum_match_arm)] fn f() {}".to_owned(),
-            VerdictCheck::default(),
-        ),
-        (
-            "#![forbid(clippy::wildcard_enum_match_arm)] fn f() {}".to_owned(),
-            clean,
-        ),
-        // Every attribute that lowers the lint.
-        (
-            "#![warn(clippy::wildcard_enum_match_arm)]\nfn f() {}".to_owned(),
-            VerdictCheck {
-                relaxations: 1,
-                ..VerdictCheck::default()
-            },
-        ),
-        (
-            format!("{DENY}#[allow(clippy::wildcard_enum_match_arm)] fn f() {{}}"),
-            relaxed(1),
-        ),
-        (
-            format!("{DENY}#[expect(clippy::wildcard_enum_match_arm)] fn f() {{}}"),
-            relaxed(1),
-        ),
-        (
-            format!("{DENY}#[cfg_attr(test, allow(clippy::wildcard_enum_match_arm))] fn f() {{}}"),
-            relaxed(1),
-        ),
-        (
-            format!("{DENY}#[allow(clippy::restriction)] fn f() {{}}"),
-            relaxed(1),
-        ),
-        (
-            format!("{DENY}#![allow(clippy::restriction)]\nfn f() {{}}"),
-            relaxed(1),
-        ),
-        (format!("{DENY}#[allow(clippy)] fn f() {{}}"), relaxed(1)),
-        (
-            format!("{DENY}#[allow(dead_code, clippy::all)] fn f() {{}}"),
-            clean,
-        ),
-    ]
+    file.attrs.iter().any(|a| {
+        let syn::Meta::List(list) = &a.meta else {
+            return false;
+        };
+        list.path.is_ident("forbid")
+            && list
+                .parse_args_with(
+                    syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated,
+                )
+                .is_ok_and(|ps| {
+                    ps.iter().any(|p| {
+                        p.segments.len() == 2
+                            && p.segments[0].ident == "clippy"
+                            && p.segments[1].ident == "wildcard_enum_match_arm"
+                    })
+                })
+    })
 }
 
 #[test]
 fn verdict_match_has_no_wildcard() {
-    let variants = entry_verdict_variants();
-    for (src, want) in &verdict_cases() {
-        assert_eq!(&check_verdict_source(src, &variants), want, "{src}");
+    let cases = [
+        (
+            "#![forbid(clippy::wildcard_enum_match_arm)]\nfn f() {}",
+            true,
+        ),
+        (
+            "#![forbid(unsafe_code, clippy::wildcard_enum_match_arm)]\nfn f() {}",
+            true,
+        ),
+        (
+            "#![deny(clippy::wildcard_enum_match_arm)]\nfn f() {}",
+            false,
+        ),
+        (
+            "#![warn(clippy::wildcard_enum_match_arm)]\nfn f() {}",
+            false,
+        ),
+        (
+            "#[forbid(clippy::wildcard_enum_match_arm)] fn f() {}",
+            false,
+        ),
+        (
+            "#![forbid(clippy::match_wildcard_for_single_variants)]\nfn f() {}",
+            false,
+        ),
+        ("fn f() {}", false),
+    ];
+    for (src, want) in cases {
+        assert_eq!(file_forbids_wildcard(src), want, "{src}");
     }
-
     let path = workspace_root().join("crates/scp-kel/src/verdict.rs");
     let src = std::fs::read_to_string(&path).expect("crates/scp-kel/src/verdict.rs is readable");
-    let file = syn::parse_file(&src).expect("verdict.rs parses");
-    let seen = match_findings(&file, &variants).matches;
     assert!(
-        seen > 0,
-        "verdict.rs no longer matches EntryVerdict, so this check reads nothing"
+        file_forbids_wildcard(&src),
+        "crates/scp-kel/src/verdict.rs must carry #![forbid(clippy::wildcard_enum_match_arm)]"
     );
-    let got = check_verdict_source(&src, &variants);
-    println!("verdict_match_has_no_wildcard: {seen} EntryVerdict matches, {got:?}");
-    assert_eq!(got, CLEAN, "crates/scp-kel/src/verdict.rs");
 }
