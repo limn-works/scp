@@ -76,24 +76,71 @@ pub enum RelationError {
 /// What one entry's answer holds to the controller's own retained log: one
 /// reading per chain the entry served, every unit no chain holds, and the
 /// one adoption the entry makes.
+///
+/// [`classify_relation`] is the only way to hold one, so its adoption is
+/// always the one R6 picks from its own readings' candidates.
+///
+/// ```compile_fail,E0451
+/// # use scp_kel::{EntryAdoption, EntryRelations};
+/// let relations = EntryRelations {
+///     readings: Vec::new(),
+///     discarded: Vec::new(),
+///     served_any_unit: false,
+///     adoption: EntryAdoption::Keep,
+/// };
+/// ```
+///
+/// The positive control: [`classify_relation`] returns one, and its fields
+/// read through the accessors.
+///
+/// ```
+/// # use scp_kel::{EntryAdoption, EntryRelations, RelationError, ValidatedChain};
+/// fn adoption(own: &ValidatedChain, served: &[&[u8]]) -> Result<EntryAdoption, RelationError> {
+///     let relations: EntryRelations = scp_kel::classify_relation(own, served, &[])?;
+///     let _ = (relations.readings(), relations.discarded(), relations.served_any_unit());
+///     Ok(relations.adoption().clone())
+/// }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntryRelations {
+    readings: Vec<ServedChainReading>,
+    discarded: Vec<Discarded>,
+    served_any_unit: bool,
+    adoption: EntryAdoption,
+}
+
+impl EntryRelations {
     /// One reading per valid chain the entry served, in
     /// [`ValidChains::iter`](crate::ValidChains::iter) order, or one
     /// `Absent` reading where the entry's units hold no valid chain
     /// (`03-identity.md` §3.10.10: one observation per chain).
-    pub readings: Vec<ServedChainReading>,
+    #[must_use]
+    pub fn readings(&self) -> &[ServedChainReading] {
+        &self.readings
+    }
+
     /// [`EntryValidation::discarded`](crate::EntryValidation::discarded),
     /// passed through unchanged: every served unit no chain holds, which R10
     /// treats as unserved and which the caller reads for R10's alerts.
-    pub discarded: Vec<Discarded>,
+    #[must_use]
+    pub fn discarded(&self) -> &[Discarded] {
+        &self.discarded
+    }
+
     /// Whether the entry served any unit. An `Absent` reading with this
     /// false is an empty entry; with it true, the entry's frames chain to
     /// nothing (`03-identity.md` §3.10.10, `EntryReach::Answered`).
-    pub served_any_unit: bool,
+    #[must_use]
+    pub const fn served_any_unit(&self) -> bool {
+        self.served_any_unit
+    }
+
     /// The one chain the entry adopts, which R6 picks from the set of the
     /// own log and every reading's [`ServedChainReading::candidate`].
-    pub adoption: EntryAdoption,
+    #[must_use]
+    pub const fn adoption(&self) -> &EntryAdoption {
+        &self.adoption
+    }
 }
 
 /// The entry's one adoption decision.

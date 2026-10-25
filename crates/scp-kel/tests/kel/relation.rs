@@ -39,7 +39,7 @@ fn relate(
 
 /// The one reading of an entry that served one chain.
 fn single(relations: &EntryRelations) -> Result<&ServedChainReading, Error> {
-    match relations.readings.as_slice() {
+    match relations.readings() {
         [reading] => Ok(reading),
         other => Err(format!("expected one reading, got {other:?}").into()),
     }
@@ -55,7 +55,7 @@ fn own(base: &Base) -> Result<ValidatedChain, Error> {
 
 /// The head the entry adopts, or `None` under `Keep`.
 fn adopted_head(relations: &EntryRelations) -> Result<Option<[u8; 32]>, Error> {
-    match &relations.adoption {
+    match &relations.adoption() {
         EntryAdoption::Keep => Ok(None),
         EntryAdoption::Adopt(chain) => Ok(Some(chain.head_digest())),
         contested @ EntryAdoption::Contested { .. } => {
@@ -112,9 +112,9 @@ fn relation_absent() -> TestResult {
     assert_eq!(reading.served(), None);
     assert_eq!(reading.candidate(), None);
     assert!(!reading.served_outranks_own());
-    assert!(!empty.served_any_unit, "an empty entry served no unit");
-    assert!(empty.discarded.is_empty());
-    assert_eq!(empty.adoption, EntryAdoption::Keep);
+    assert!(!empty.served_any_unit(), "an empty entry served no unit");
+    assert!(empty.discarded().is_empty());
+    assert_eq!(*empty.adoption(), EntryAdoption::Keep);
 
     // Frames that chain to nothing: the relation reads the valid prefix,
     // which is empty, and never the bytes served.
@@ -122,8 +122,8 @@ fn relation_absent() -> TestResult {
     let reading = single(&junk)?;
     assert_eq!(reading.relation(), ChainRelation::Absent);
     assert_eq!(reading.head(), None);
-    assert!(junk.served_any_unit, "the entry served a unit");
-    assert_eq!(junk.discarded.len(), 1);
+    assert!(junk.served_any_unit(), "the entry served a unit");
+    assert_eq!(junk.discarded().len(), 1);
     Ok(())
 }
 
@@ -137,9 +137,9 @@ fn relation_identical() -> TestResult {
     assert_eq!(reading.head(), Some(array(V50_DIGEST)?));
     assert_eq!(reading.candidate(), None);
     assert!(!reading.served_outranks_own());
-    assert!(relations.served_any_unit);
-    assert!(relations.discarded.is_empty());
-    assert_eq!(relations.adoption, EntryAdoption::Keep);
+    assert!(relations.served_any_unit());
+    assert!(relations.discarded().is_empty());
+    assert_eq!(*relations.adoption(), EntryAdoption::Keep);
     Ok(())
 }
 
@@ -152,7 +152,7 @@ fn relation_superseded() -> TestResult {
     assert_eq!(reading.head(), Some(array(V41_DIGEST)?));
     assert_eq!(reading.candidate(), None);
     assert!(!reading.served_outranks_own());
-    assert_eq!(relations.adoption, EntryAdoption::Keep);
+    assert_eq!(*relations.adoption(), EntryAdoption::Keep);
     Ok(())
 }
 
@@ -171,8 +171,8 @@ fn relation_reads_prefix_before_damaged_unit() -> TestResult {
     let reading = single(&relations)?;
     assert_eq!(reading.relation(), ChainRelation::Superseded);
     assert_eq!(reading.head(), Some(array(V41_DIGEST)?));
-    let [discarded] = relations.discarded.as_slice() else {
-        return Err(format!("expected one discard, got {:?}", relations.discarded).into());
+    let [discarded] = relations.discarded() else {
+        return Err(format!("expected one discard, got {:?}", relations.discarded()).into());
     };
     assert_eq!(discarded.served_index(), 1);
     assert_eq!(discarded.read_for(), Some(1));
@@ -329,7 +329,7 @@ fn relation_diverged() -> TestResult {
         head_of(chain.prefix(0).as_ref()),
         Some(divergence.shared_prefix_head)
     );
-    assert_eq!(relations.adoption, EntryAdoption::Keep);
+    assert_eq!(*relations.adoption(), EntryAdoption::Keep);
     Ok(())
 }
 
@@ -346,8 +346,8 @@ fn relation_passes_discarded_through() -> TestResult {
     let reading = single(&relations)?;
     assert_eq!(reading.relation(), ChainRelation::Identical);
     assert_eq!(reading.head(), Some(array(V50_DIGEST)?));
-    let [discarded] = relations.discarded.as_slice() else {
-        return Err(format!("expected one discard, got {:?}", relations.discarded).into());
+    let [discarded] = relations.discarded() else {
+        return Err(format!("expected one discard, got {:?}", relations.discarded()).into());
     };
     assert_eq!(discarded.served_index(), 1);
     assert_eq!(discarded.read_for(), None);
@@ -363,7 +363,7 @@ fn relation_reads_every_served_chain() -> TestResult {
     let served = base.with(last_unit(&v54)?);
     let relations = relate(&own, &served, &[])?;
     let kinds: Vec<(ChainRelation, Option<[u8; 32]>)> = relations
-        .readings
+        .readings()
         .iter()
         .map(|reading| (reading.relation(), reading.head()))
         .collect();
@@ -374,7 +374,7 @@ fn relation_reads_every_served_chain() -> TestResult {
             (ChainRelation::Diverged, Some(array(V54_DIGEST)?)),
         ]
     );
-    assert!(relations.discarded.is_empty());
+    assert!(relations.discarded().is_empty());
     Ok(())
 }
 
@@ -394,8 +394,8 @@ fn relation_adoption_is_order_free() -> TestResult {
     ] {
         let served: Vec<&[u8]> = v41_base.refs().into_iter().chain(order).collect();
         let relations = relate(&own_v41, &served, &[])?;
-        assert_eq!(relations.readings.len(), 2);
-        assert!(relations.readings.iter().all(|reading| {
+        assert_eq!(relations.readings().len(), 2);
+        assert!(relations.readings().iter().all(|reading| {
             reading.relation() == ChainRelation::Extending(ExtendingAct::Adopted)
         }));
         assert_eq!(adopted_head(&relations)?, Some(array(V54_DIGEST)?));
@@ -412,7 +412,7 @@ fn relation_adoption_is_order_free() -> TestResult {
         let served: Vec<&[u8]> = v50.refs().into_iter().chain(order).collect();
         let relations = relate(&own_v50, &served, &[])?;
         let mut relations_seen: Vec<ChainRelation> = relations
-            .readings
+            .readings()
             .iter()
             .map(ServedChainReading::relation)
             .collect();
@@ -452,9 +452,9 @@ fn relation_adoption_contested_on_tie() -> TestResult {
             tied,
             shared_prefix_head,
             fork_position,
-        } = &relations.adoption
+        } = &relations.adoption()
         else {
-            return Err(format!("expected a contest, got {:?}", relations.adoption).into());
+            return Err(format!("expected a contest, got {:?}", relations.adoption()).into());
         };
         assert_eq!(*class, TieClass::Rank1Terminal);
         let heads: Vec<[u8; 32]> = tied.iter().map(ValidatedChain::head_digest).collect();
