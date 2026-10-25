@@ -418,7 +418,7 @@ pub async fn leave_context(
         match cell
             .commit_class_s_keep(deps, &context_id, |mut v| {
                 let s = v.rest_mut();
-                s.rotate_sender_key(&local_did)?;
+                s.rotate_sender_key(&local_did, deps.event_tx.as_ref())?;
                 Ok(s.local_sender_key_epoch())
             })
             .await
@@ -447,7 +447,7 @@ pub async fn leave_context(
             deps,
             &mut cell.class_c_view(),
             &context_id,
-            DistributionScope::All,
+            DistributionScope::NeverAttempted,
         )
         .await;
     }
@@ -498,31 +498,65 @@ pub async fn leave_context(
 // 3. drain_and_deliver_sender_keys (per-context, transitive of join / leave)
 // ---------------------------------------------------------------------------
 
+/// Adds `member_did` to the MLS group and queues its sender-key
+/// distribution, in the one Class-S step that records the Add (spec 09
+/// §9.16.9). The join and the governance `AddMember` both call it, so the two
+/// give one disposition.
+///
+/// The §9.10.4.1 membership trigger is recorded with the add. When the
+/// distribution cannot be built, the add stands and the distribution is
+/// reported as not built (`SenderKeyDistributionFailed`); the new member
+/// requests the key (§9.16.2). An add that produced no Welcome (the
+/// `testing` no-crypto pipeline, with no MLS group) queues nothing.
+///
+/// # Errors
+///
+/// The error of `PerContextState::add_member`; nothing is added then.
+pub(super) fn add_member_and_queue_distribution(
+    state: &mut crate::context::actor::state::PerContextState,
+    deps: &ActorDeps,
+    member_did: &str,
+    key_package: Option<&[u8]>,
+) -> Result<scp_protocol::context::builder::AddMemberOutput, ContextError> {
+    let local_did = deps.crypto.local_did();
+    let output = state.add_member(member_did, key_package, deps.clock.as_ref())?;
+    crate::context::actor::pseudonym_rotation::note_member_added(state, local_did, member_did);
+    if !output.welcome_bytes.is_empty()
+        && let Err(e) = state.distribute_sender_key(local_did, member_did, deps.event_tx.as_ref())
+    {
+        let context_id = state.handle.context_id().to_owned();
+        crate::context::actor::state::DistributionFault::NotBuilt {
+            target_did: member_did.to_owned(),
+            reason: e.to_string(),
+        }
+        .report(
+            &mut state.receive_buffer,
+            &context_id,
+            deps.event_tx.as_ref(),
+        );
+    }
+    Ok(output)
+}
+
 /// Which queued sender-key distributions one pass of
-/// [`drain_and_deliver_sender_keys`] publishes.
+/// [`drain_and_deliver_sender_keys`] publishes (spec 09 §9.16.9 step 2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DistributionScope {
-    /// Every queued distribution: the pass right after a rotation, an Add, or
-    /// a `Live` delivery, and the explicit re-send a full reconnection asks
-    /// for (ADR-029, offline and sync strategy).
+    /// Only distributions never attempted: the publish right after a
+    /// rotation or an Add, and the one after a `Live` delivery. A failed
+    /// distribution waits for the governance timer or a full reconnection.
+    NeverAttempted,
+    /// Every queued distribution: the governance timer's tick and the
+    /// re-send a full reconnection asks for (ADR-029, offline and sync
+    /// strategy). A distribution restored with no attempt record is due here.
     All,
-    /// Only distributions whose earlier publish failed and whose backoff has
-    /// elapsed: the governance timer's retry. A `SenderKeyRequest` answer
-    /// queued during a push-wake pull has no failed attempt, so it still
-    /// waits for the full reconnection (ADR-029 §2 push-wake pull mode
-    /// step 5).
-    DueRetries,
 }
 
 impl DistributionScope {
-    const fn selects(
-        self,
-        entry: &crate::crypto::mls::provider::PendingDistribution,
-        now: u64,
-    ) -> bool {
+    const fn selects(self, entry: &crate::crypto::mls::provider::PendingDistribution) -> bool {
         match self {
+            Self::NeverAttempted => entry.first_attempt_at.is_none(),
             Self::All => true,
-            Self::DueRetries => entry.first_attempt_at.is_some() && entry.next_attempt_at <= now,
         }
     }
 }
@@ -534,17 +568,18 @@ impl DistributionScope {
 /// published with the TTL that remains of its first attempt
 /// (`BlobTtl::republish_sealed_management`, §9.10.2). An entry leaves the
 /// queue only when a relay accepts it, MLS cannot seal it, or no TTL
-/// remains; a failed publish keeps it with its attempt record and backoff.
-/// Because removal follows the publish, a pass cancelled mid-publish (the
+/// remains; a failed publish keeps it with its attempt record. Because
+/// removal follows the publish, a pass cancelled mid-publish (the
 /// `SendQueuedSenderKeys` timeout) loses no entry. The pass never undoes the
 /// rotation or membership change that queued an entry.
 ///
-/// The pass emits one local event per fault onto the context's receive buffer
-/// (`SenderKeyDistributionPending` for a requeued entry,
-/// `SenderKeyDistributionFailed` for a dropped one), so no caller can drop the
-/// report, and returns the same faults as a typed [`DistributionReport`].
-/// The attempt record is coalesced state (spec 05 §5.15.3): the caller's
-/// handler reports the turn mutated and the run loop persists it.
+/// Each fault is reported when it is recorded, by one local event on the
+/// context's receive buffer and event channel (`SenderKeyDistributionPending`
+/// for a requeued entry, `SenderKeyDistributionFailed` for a dropped one),
+/// before the pass awaits again, so a cancelled pass loses no report. The
+/// pass also returns the faults as a typed [`DistributionReport`]. The
+/// attempt record is coalesced state (spec 05 §5.15.3): the caller's handler
+/// reports the turn mutated and the run loop persists it.
 pub(super) async fn drain_and_deliver_sender_keys(
     deps: &ActorDeps,
     view: &mut crate::context::actor::class_s::ClassCMut<'_>,
@@ -555,71 +590,72 @@ pub(super) async fn drain_and_deliver_sender_keys(
     use scp_protocol::envelope::outer::BlobTtl;
 
     let mut report = DistributionReport::default();
+    let routing_id = scp_protocol::context::context_routing_id(context_id);
+    let now = deps.clock.now_secs();
+    let mut index = 0;
     // A broadcast context has no MLS crypto state and never queues a
     // distribution (rotation is skipped for broadcast).
-    if let Some(crypto_state) = view.mode_mut().crypto_mut() {
-        report.faults.append(&mut crypto_state.undelivered);
-        let routing_id = scp_protocol::context::context_routing_id(context_id);
-        let now = deps.clock.now_secs();
-        let mut index = 0;
-        while let Some(entry) = crypto_state.pending_distributions.get(index) {
-            if !scope.selects(entry, now) {
-                index += 1;
-                continue;
-            }
-            let first_attempt_at = entry.first_attempt_at.unwrap_or(now);
-            let ttl = match BlobTtl::republish_sealed_management(first_attempt_at, now) {
-                Ok(ttl) => ttl,
-                Err(expired) => {
-                    let dropped = crypto_state.pending_distributions.remove(index);
-                    report.faults.push(DistributionFault::Expired {
-                        target_did: dropped.target_did,
-                        failed_attempts: dropped.failed_attempts,
-                        expired,
-                    });
-                    continue;
-                }
-            };
-            let message = entry.message.clone();
-            let sealed = match crypto_state.mls_encrypt_management(&message) {
-                Ok(sealed) => sealed,
-                Err(error) => {
-                    let dropped = crypto_state.pending_distributions.remove(index);
-                    report.faults.push(DistributionFault::Unsealable {
-                        target_did: dropped.target_did,
-                        failed_attempts: dropped.failed_attempts,
-                        error,
-                    });
-                    continue;
-                }
-            };
-            match deps.transport.send_message(&routing_id, &sealed, ttl).await {
-                Ok(()) => {
-                    crypto_state.pending_distributions.remove(index);
-                    report.sent += 1;
-                }
-                Err(error) => {
-                    let Some(entry) = crypto_state.pending_distributions.get_mut(index) else {
-                        break;
-                    };
-                    entry.first_attempt_at = Some(first_attempt_at);
-                    entry.failed_attempts = entry.failed_attempts.saturating_add(1);
-                    entry.next_attempt_at = now.saturating_add(
-                        crate::context::state::commit_retry_backoff(entry.failed_attempts),
-                    );
-                    report.faults.push(DistributionFault::Requeued {
-                        target_did: entry.target_did.clone(),
-                        attempt: entry.failed_attempts,
-                        error,
-                    });
-                    index += 1;
-                }
-            }
+    while let Some(crypto_state) = view.mode_mut().crypto_mut() {
+        let Some(entry) = crypto_state.pending_distributions.get(index) else {
+            break;
+        };
+        if !scope.selects(entry) {
+            index += 1;
+            continue;
         }
-    }
-    for fault in &report.faults {
-        tracing::warn!(context_id = %context_id, fault = ?fault, "sender-key distribution not delivered");
-        view.emit_event(fault.to_event(), context_id, deps.event_tx.as_ref());
+        let first_attempt_at = entry.first_attempt_at.unwrap_or(now);
+        let fault = match BlobTtl::republish_sealed_management(first_attempt_at, now) {
+            Err(expired) => {
+                let dropped = crypto_state.pending_distributions.remove(index);
+                DistributionFault::Expired {
+                    target_did: dropped.target_did,
+                    failed_attempts: dropped.failed_attempts,
+                    expired,
+                }
+            }
+            Ok(ttl) => {
+                let message = entry.message.clone();
+                match crypto_state.mls_encrypt_management(&message) {
+                    Err(error) => {
+                        let dropped = crypto_state.pending_distributions.remove(index);
+                        DistributionFault::Unsealable {
+                            target_did: dropped.target_did,
+                            failed_attempts: dropped.failed_attempts,
+                            error,
+                        }
+                    }
+                    Ok(sealed) => {
+                        match deps.transport.send_message(&routing_id, &sealed, ttl).await {
+                            Ok(()) => {
+                                crypto_state.pending_distributions.remove(index);
+                                report.sent += 1;
+                                continue;
+                            }
+                            Err(error) => {
+                                let Some(entry) = crypto_state.pending_distributions.get_mut(index)
+                                else {
+                                    break;
+                                };
+                                entry.first_attempt_at = Some(first_attempt_at);
+                                entry.failed_attempts = entry.failed_attempts.saturating_add(1);
+                                index += 1;
+                                DistributionFault::Requeued {
+                                    target_did: entry.target_did.clone(),
+                                    attempt: entry.failed_attempts,
+                                    error,
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        fault.report(
+            view.receive_buffer_mut(),
+            context_id,
+            deps.event_tx.as_ref(),
+        );
+        report.faults.push(fault);
     }
     report
 }
@@ -1137,8 +1173,11 @@ pub async fn join_context(
     // which retains it as a birth-seam).
     let local_did = deps.crypto.local_did().to_owned();
 
-    // add_member — Class-S. On failure NO MLS rollback is needed (the add itself
-    // failed, so no member was added), matching the prior provider disposition.
+    // add_member + the joiner's sender-key distribution — one Class-S step
+    // through the add-then-distribute helper the governance `AddMember` shares
+    // (spec 09 §9.16.9). On failure NO MLS rollback is needed (the add itself
+    // failed, so no member was added); a distribution that cannot be built
+    // keeps the add and is reported as not built.
     //
     // The same commit records the §9.10.4.1 membership trigger for the local
     // member; the rollbacks below restore `rotation_before_add` with the MLS
@@ -1146,14 +1185,7 @@ pub async fn join_context(
     let rotation_before_add = cell.class_s.pseudonym_rotation.clone();
     let add_output = match cell
         .commit_class_s_keep(deps, &context_id, |mut v| {
-            let state = v.rest_mut();
-            let output = state.add_member(&member_did, kp_bytes, deps.clock.as_ref())?;
-            crate::context::actor::pseudonym_rotation::note_member_added(
-                state,
-                &local_did,
-                member_did.as_ref(),
-            );
-            Ok(output)
+            add_member_and_queue_distribution(v.rest_mut(), deps, &member_did, kp_bytes)
         })
         .await
     {
@@ -1179,48 +1211,6 @@ pub async fn join_context(
         }
     };
 
-    // distribute_sender_key — Class-S. On failure roll back the just-added member
-    // on the ACTOR (best-effort MLS remove + sender-key prune) + the registry
-    // floor, then the nonce/escrow/ticket rollback.
-    if let Err(e) = cell
-        .commit_class_s_keep(deps, &context_id, |mut v| {
-            v.rest_mut().distribute_sender_key(&local_did, &member_did)
-        })
-        .await
-    {
-        // Sender-key distribution failed after MLS add — roll back the MLS state
-        // on the actor's owned crypto (§9 Class-S, fail-closed persist).
-        let _ = cell
-            .commit_class_s_keep(deps, &context_id, |mut v| {
-                let s = v.rest_mut();
-                let _ = s.remove_member(&local_did, &member_did, deps.clock.as_ref());
-                // §9.10.4.1: the add did not commit, so neither does its
-                // membership trigger.
-                s.class_s.pseudonym_rotation = rotation_before_add;
-                s.remove_member_sender_key(&member_did)
-            })
-            .await;
-        // ADR-049 PR-6: prune the departed member's Class-M registry floors
-        // (member-granular; siblings + the local scalar retained).
-        deps.supervisor
-            .remove_member_floors(&context_id_bytes, &member_did);
-        // Keep-direction (ADR-049 §9): persist the burned nonce fail-closed
-        // before the existing escrow-void + ticket rollback.
-        let err = crate::context::messaging_helpers::commit_send_nonce_token_on_abort(
-            spending_nonce_token.take(),
-            &*cell,
-            deps,
-            &context_id,
-            e,
-        )
-        .await;
-        if let Some(a) = auth {
-            crate::context::economy_helpers::void_paid_action(deps, a, &context_id).await;
-        }
-        rollback_join_economy_ticket(cell, ticket);
-        return Err(err);
-    }
-
     // Drain pending HPKE-sealed sender-key distribution messages and deliver them
     // via the MLS management channel (§9.16.2). MLS-wrap is mandatory — see
     // comment on `drain_and_deliver_sender_keys`. ADR-049 PR-7: the producer is
@@ -1233,7 +1223,7 @@ pub async fn join_context(
         deps,
         &mut cell.class_c_view(),
         &context_id,
-        DistributionScope::All,
+        DistributionScope::NeverAttempted,
     )
     .await;
 

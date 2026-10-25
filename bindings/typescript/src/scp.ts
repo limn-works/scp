@@ -779,6 +779,27 @@ export interface ContextReconnectResult {
    * context, whose `outcome` carries the result.
    */
   readonly failureCode?: string;
+  /**
+   * Sender-key distributions a relay accepted in the re-send that follows a
+   * terminal-success sync (spec 09 §9.16.9).
+   */
+  readonly senderKeysSent: number;
+  /**
+   * Sender-key distributions whose re-send failed and that stay queued for
+   * the governance timer or the next reconnection.
+   */
+  readonly senderKeysPending: number;
+  /**
+   * Sender-key distributions the re-send dropped undelivered: MLS could not
+   * seal one, or no TTL remained.
+   */
+  readonly senderKeysDropped: number;
+  /**
+   * Why the re-send did not complete (its budget elapsed, or the actor could
+   * not be reached); absent when it completed or did not run. The sync
+   * `outcome` does not depend on it.
+   */
+  readonly senderKeySendError?: string;
 }
 
 /**

@@ -13363,6 +13363,10 @@ impl Supervisor {
     /// push-wake pull mode, step 5). Routes through the actor mailbox via
     /// [`Self::dispatch_command`].
     ///
+    /// Returns the report of the publish: the distributions a relay accepted,
+    /// and a fault for each one that stays queued or was dropped (spec 09
+    /// §9.16.9). A distribution that stays queued is not an error.
+    ///
     /// # Errors
     ///
     /// - [`ContextError::ContextNotRegistered`] (or the poison error) for an
@@ -13370,7 +13374,10 @@ impl Supervisor {
     /// - [`ContextError::TransportTimeout`] when the drain exceeds the handler
     ///   budget.
     /// - [`ContextError::TransportFailed`] if the reply channel is dropped.
-    pub async fn send_queued_sender_keys(&self, context_id: &str) -> Result<(), ContextError> {
+    pub async fn send_queued_sender_keys(
+        &self,
+        context_id: &str,
+    ) -> Result<crate::context::actor::state::DistributionReport, ContextError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let cmd = MessagingCommand::SendQueuedSenderKeys {
             context_id: context_id.to_owned(),
@@ -29697,8 +29704,8 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        alice_actor.rotate_sender_key(ALICE).unwrap();
-        alice_actor.distribute_sender_key(ALICE, ALICE).ok();
+        alice_actor.rotate_sender_key(ALICE, None).unwrap();
+        alice_actor.distribute_sender_key(ALICE, ALICE, None).ok();
         for (_t, msg) in alice_actor.drain_pending_sender_key_messages().unwrap() {
             if let Ok((key, _epoch)) = rt.block_on(
                 crate::crypto::mls::provider::NodeMlsFactory::open_incoming_sender_key_bytes(
@@ -29816,7 +29823,7 @@ mod tests {
             BOB.to_owned(),
             scp_protocol::crypto::hpke::p256::P256Point::try_from(*bob_key.public()).unwrap(),
         );
-        alice_actor.rotate_sender_key(ALICE).unwrap();
+        alice_actor.rotate_sender_key(ALICE, None).unwrap();
         let rotated_epoch = alice_actor.local_sender_key_epoch();
         let msgs = alice_actor.drain_pending_sender_key_messages().unwrap();
         assert_eq!(msgs.len(), 1, "one KeyResponse for Bob");
@@ -29919,7 +29926,7 @@ mod tests {
             BOB.to_owned(),
             scp_protocol::crypto::hpke::p256::P256Point::try_from(*bob_key.public()).unwrap(),
         );
-        alice_actor.rotate_sender_key(ALICE).unwrap();
+        alice_actor.rotate_sender_key(ALICE, None).unwrap();
         let rotated_epoch = alice_actor.local_sender_key_epoch();
         let msgs = alice_actor.drain_pending_sender_key_messages().unwrap();
         assert_eq!(msgs.len(), 1, "one KeyResponse for Bob");
@@ -29976,14 +29983,205 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(&stale, Err(ContextError::CryptoFailed(_))),
-            "a response at the recorded floor fails closed: {stale:?}"
+            matches!(&stale, Err(ContextError::CryptoFailed(m)) if m.contains("equals the floor with another key")),
+            "a response at the recorded floor whose key is not the installed key fails closed: \
+             {stale:?}"
         );
         assert_eq!(
             custody.dh_calls(),
-            0,
-            "no dh_agree for an epoch at the floor"
+            1,
+            "a response at the floor is opened once, to compare its key with the installed key"
         );
+    }
+
+    /// Bob's side of a two-party context whose wrapping key lives in a
+    /// `DhCountingCustody` and is published to Alice: Alice's state, Bob's
+    /// state, deps and supervisor, and the context id bytes.
+    async fn alice_and_bob_with_counting_custody(
+        ctx_str: &str,
+        alice: &str,
+        bob: &str,
+    ) -> (
+        crate::context::actor::PerContextState,
+        crate::context::actor::PerContextState,
+        crate::context::actor::deps::ActorDeps,
+        Arc<Supervisor>,
+        [u8; 32],
+    ) {
+        let crate::crypto::mls::two_party_test_support::TwoPartyPair {
+            alice_state: mut alice_actor,
+            bob_provider: bob_crypto,
+            bob_state: bob_actor,
+            ctx_bytes,
+            ..
+        } = crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx_str, alice, bob);
+        let custody = Arc::new(crate::crypto::dh_counting_custody::DhCountingCustody::new());
+        let bob_key = crate::crypto::wrapping::test_wrapping_key(&custody)
+            .await
+            .expect("bob's wrapping key is created in custody");
+        let bob_sup = supervisor_with_crypto(Arc::clone(&bob_crypto));
+        bob_sup
+            .wrapping_keys
+            .insert(DID::from(bob), Arc::clone(&bob_key));
+        let bob_deps = bob_sup
+            .build_actor_deps(&DID::from(bob))
+            .await
+            .expect("build bob's actor deps over his loaded key");
+        alice_actor
+            .mode
+            .crypto_mut()
+            .expect("encrypted context")
+            .member_wrapping_keys
+            .insert(
+                bob.to_owned(),
+                scp_protocol::crypto::hpke::p256::P256Point::try_from(*bob_key.public()).unwrap(),
+            );
+        (alice_actor, bob_actor, bob_deps, bob_sup, ctx_bytes)
+    }
+
+    /// Alice rotates and returns the one distribution of her new key to Bob,
+    /// unwrapped, with the new epoch.
+    fn rotate_for(
+        alice_actor: &mut crate::context::actor::PerContextState,
+        alice: &str,
+    ) -> (Vec<u8>, u64) {
+        alice_actor.rotate_sender_key(alice, None).unwrap();
+        let epoch = alice_actor.local_sender_key_epoch();
+        let mut msgs = alice_actor.drain_pending_sender_key_messages().unwrap();
+        assert_eq!(msgs.len(), 1, "one distribution for Bob");
+        (msgs.remove(0).1, epoch)
+    }
+
+    /// Spec 09 §9.16.9: the sender removes a distribution only after a relay
+    /// accepts it, so a receiver can get the same distribution twice. The
+    /// second delivery is handled with no change: the floor stays at the
+    /// epoch, and Alice's message at that epoch still opens.
+    ///
+    /// Fails if a response at the floor is refused even when its key is the
+    /// installed key.
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn a_distribution_delivered_twice_is_handled_once() {
+        const ALICE: &str = "did:dht:z6MkAliceDuplicateDistAliceDuplicateDistA1";
+        const BOB: &str = "did:dht:z6MkBobDuplicateDistBobDuplicateDistBobDu1";
+        let ctx_str = "e2e-distribution-delivered-twice";
+        let (mut alice_actor, mut bob_actor, bob_deps, bob_sup, ctx_bytes) =
+            alice_and_bob_with_counting_custody(ctx_str, ALICE, BOB).await;
+        let (distribution, epoch) = rotate_for(&mut alice_actor, ALICE);
+        let mut wrap = |payload: &[u8]| {
+            alice_actor
+                .mode
+                .crypto_mut()
+                .expect("encrypted context")
+                .mls_encrypt_management(payload)
+                .expect("alice MLS-wraps the distribution")
+        };
+        let first = wrap(&distribution);
+        let second = wrap(&distribution);
+
+        let bob_cs = bob_actor.mode.crypto_mut().expect("encrypted context");
+        for (n, sealed) in [first, second].iter().enumerate() {
+            let got = crate::context::messaging_helpers::decrypt_and_dispatch(
+                &bob_deps,
+                Some(&mut *bob_cs),
+                ctx_str,
+                &ctx_bytes,
+                sealed,
+            )
+            .await;
+            assert!(
+                matches!(
+                    got,
+                    Ok(crate::context::messaging_helpers::Dispatched::Handled)
+                ),
+                "delivery {n} of the same distribution is handled: {got:?}"
+            );
+        }
+        assert_eq!(
+            bob_sup.sender_epoch_floor(&ctx_bytes, ALICE),
+            epoch,
+            "the duplicate leaves the floor at the epoch"
+        );
+        let app = alice_seals_content(&mut alice_actor, ctx_str, ALICE, epoch, b"after-duplicate");
+        let opened = crate::context::messaging_helpers::decrypt_and_dispatch(
+            &bob_deps,
+            Some(&mut *bob_cs),
+            ctx_str,
+            &ctx_bytes,
+            &app,
+        )
+        .await
+        .expect("the installed key opens alice's message");
+        assert!(matches!(
+            opened,
+            crate::context::messaging_helpers::Dispatched::Envelope(_)
+        ));
+    }
+
+    /// Spec 09 §9.16.9: distributions can arrive out of order. Epoch N
+    /// delivered after N+1 is below the floor and refused, and the key of N+1
+    /// stays installed.
+    ///
+    /// Fails if a response below the floor is admitted, or if the duplicate
+    /// rule widens to every epoch at or below the floor.
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn an_older_distribution_after_a_newer_one_is_refused() {
+        const ALICE: &str = "did:dht:z6MkAliceOutOfOrderDistAliceOutOfOrderDis1";
+        const BOB: &str = "did:dht:z6MkBobOutOfOrderDistBobOutOfOrderDistBo1";
+        let ctx_str = "e2e-distribution-out-of-order";
+        let (mut alice_actor, mut bob_actor, bob_deps, bob_sup, ctx_bytes) =
+            alice_and_bob_with_counting_custody(ctx_str, ALICE, BOB).await;
+        let (older, _) = rotate_for(&mut alice_actor, ALICE);
+        let (newer, newer_epoch) = rotate_for(&mut alice_actor, ALICE);
+        let mut wrap = |payload: &[u8]| {
+            alice_actor
+                .mode
+                .crypto_mut()
+                .expect("encrypted context")
+                .mls_encrypt_management(payload)
+                .expect("alice MLS-wraps the distribution")
+        };
+        let newer_sealed = wrap(&newer);
+        let older_sealed = wrap(&older);
+
+        let bob_cs = bob_actor.mode.crypto_mut().expect("encrypted context");
+        crate::context::messaging_helpers::decrypt_and_dispatch(
+            &bob_deps,
+            Some(&mut *bob_cs),
+            ctx_str,
+            &ctx_bytes,
+            &newer_sealed,
+        )
+        .await
+        .expect("the newer distribution installs");
+        let late = crate::context::messaging_helpers::decrypt_and_dispatch(
+            &bob_deps,
+            Some(&mut *bob_cs),
+            ctx_str,
+            &ctx_bytes,
+            &older_sealed,
+        )
+        .await;
+        assert!(
+            matches!(&late, Err(ContextError::CryptoFailed(_))),
+            "a distribution below the floor fails closed: {late:?}"
+        );
+        assert_eq!(bob_sup.sender_epoch_floor(&ctx_bytes, ALICE), newer_epoch);
+        let app = alice_seals_content(&mut alice_actor, ctx_str, ALICE, newer_epoch, b"after-late");
+        let opened = crate::context::messaging_helpers::decrypt_and_dispatch(
+            &bob_deps,
+            Some(&mut *bob_cs),
+            ctx_str,
+            &ctx_bytes,
+            &app,
+        )
+        .await
+        .expect("the newer key stays installed");
+        assert!(matches!(
+            opened,
+            crate::context::messaging_helpers::Dispatched::Envelope(_)
+        ));
     }
 
     /// A supervisor over `crypto` whose `mls_storage` view is over `storage`
@@ -30079,7 +30277,7 @@ mod tests {
     fn alice_rotates_for_bob(
         alice_actor: &mut crate::context::actor::PerContextState,
     ) -> (Vec<u8>, u64) {
-        alice_actor.rotate_sender_key(KR_ALICE).unwrap();
+        alice_actor.rotate_sender_key(KR_ALICE, None).unwrap();
         let epoch = alice_actor.local_sender_key_epoch();
         let msgs = alice_actor.drain_pending_sender_key_messages().unwrap();
         assert_eq!(msgs.len(), 1, "one KeyResponse for Bob");

@@ -403,12 +403,17 @@ impl DisposalOutcome {
     }
 }
 
+/// The channel a context's local events are broadcast on (`ActorDeps::event_tx`).
+pub(crate) type ContextEventTx =
+    tokio::sync::broadcast::Sender<(String, scp_protocol::context::membership::ContextEvent)>;
+
 /// Why a sender-key distribution was not delivered (spec 09 §9.16.9 "A
 /// distribution whose publish fails"). Every variant but
-/// [`Self::Requeued`] means the holder dropped the distribution, and the
-/// target recovers the key by a `SenderKeyRequest` (§9.16.2).
+/// [`Self::Requeued`] means the holder dropped the distribution, or never
+/// built it, and the target recovers the key by a `SenderKeyRequest`
+/// (§9.16.2).
 #[derive(Debug)]
-pub(crate) enum DistributionFault {
+pub enum DistributionFault {
     /// The publish failed; the distribution stays queued for another attempt.
     Requeued {
         /// The member the distribution carries a sender key to.
@@ -436,16 +441,8 @@ pub(crate) enum DistributionFault {
         /// The refused republish.
         expired: scp_protocol::envelope::outer::BlobTtlExpired,
     },
-    /// Newer distributions to the same target displaced queued ones from the
-    /// per-target bound (`MAX_PUSH_CHAINS_PER_MEMBER`).
-    Evicted {
-        /// The member the displaced distributions carried a sender key to.
-        target_did: String,
-        /// How many distributions were displaced since the last report.
-        displaced: u32,
-    },
-    /// The rotation built no distribution for the target: the target has no
-    /// wrapping key, or the HPKE seal or the serialization failed.
+    /// The rotation or Add built no distribution for the target: the target
+    /// has no wrapping key, or the HPKE seal or the serialization failed.
     NotBuilt {
         /// The member the distribution would have carried a sender key to.
         target_did: String,
@@ -457,7 +454,8 @@ pub(crate) enum DistributionFault {
 impl DistributionFault {
     /// The local event that reports this fault to the operation that queued
     /// the distribution.
-    pub(crate) fn to_event(&self) -> scp_protocol::context::membership::ContextEvent {
+    #[must_use]
+    pub fn to_event(&self) -> scp_protocol::context::membership::ContextEvent {
         use scp_protocol::context::membership::ContextEvent;
         match self {
             Self::Requeued {
@@ -487,14 +485,6 @@ impl DistributionFault {
                 reason: format!("expired: {expired}"),
                 attempts: *failed_attempts,
             },
-            Self::Evicted {
-                target_did,
-                displaced,
-            } => ContextEvent::SenderKeyDistributionFailed {
-                target_did: DID(target_did.clone()),
-                reason: format!("evicted: {displaced} displaced by newer distributions"),
-                attempts: 0,
-            },
             Self::NotBuilt { target_did, reason } => ContextEvent::SenderKeyDistributionFailed {
                 target_did: DID(target_did.clone()),
                 reason: format!("not built: {reason}"),
@@ -502,45 +492,46 @@ impl DistributionFault {
             },
         }
     }
+
+    /// Logs this fault and emits its event onto `receive_buffer` and the
+    /// event channel. Every fault is reported here, when it is recorded
+    /// (spec 09 §9.16.9 step 4), so no later await can lose the report.
+    pub(crate) fn report(
+        &self,
+        receive_buffer: &mut ReceiveBuffer,
+        context_id: &str,
+        events: Option<&ContextEventTx>,
+    ) {
+        tracing::warn!(context_id = %context_id, fault = ?self, "sender-key distribution not delivered");
+        crate::context::state::emit_event_into(receive_buffer, self.to_event(), context_id, events);
+    }
 }
 
-/// The outcome of one pass over the sender-key distribution queue.
+/// The outcome of one pass over the sender-key distribution queue (spec 09
+/// §9.16.9). Each fault was already reported by event when it was recorded;
+/// the report repeats them for the caller of the pass.
 #[derive(Debug, Default)]
-pub(crate) struct DistributionReport {
+pub struct DistributionReport {
     /// Distributions a relay accepted in this pass.
-    pub(crate) sent: usize,
-    /// Distributions this pass did not deliver, and the faults found while
-    /// the queue was filled since the last pass.
-    pub(crate) faults: Vec<DistributionFault>,
+    pub sent: usize,
+    /// Distributions this pass did not deliver.
+    pub faults: Vec<DistributionFault>,
 }
 
 impl DistributionReport {
-    /// `Ok(sent)` when the pass delivered every distribution it covered.
-    ///
-    /// # Errors
-    ///
-    /// [`ContextError::TransportFailed`] when a publish failed and its
-    /// distribution stays queued; otherwise [`ContextError::CryptoFailed`]
-    /// when a distribution was dropped undelivered.
-    pub(crate) fn into_result(self) -> Result<usize, ContextError> {
-        let Some(first) = self.faults.first() else {
-            return Ok(self.sent);
-        };
-        let summary = format!(
-            "{} sender-key distribution(s) not delivered, {} sent; first: {:?}",
-            self.faults.len(),
-            self.sent,
-            first.to_event()
-        );
-        if self
-            .faults
+    /// Distributions whose publish failed in this pass and that stay queued.
+    #[must_use]
+    pub fn requeued(&self) -> usize {
+        self.faults
             .iter()
-            .any(|f| matches!(f, DistributionFault::Requeued { .. }))
-        {
-            Err(ContextError::TransportFailed(summary))
-        } else {
-            Err(ContextError::CryptoFailed(summary))
-        }
+            .filter(|f| matches!(f, DistributionFault::Requeued { .. }))
+            .count()
+    }
+
+    /// Distributions this pass dropped undelivered.
+    #[must_use]
+    pub fn dropped(&self) -> usize {
+        self.faults.len() - self.requeued()
     }
 }
 
@@ -605,15 +596,9 @@ pub struct ContextCryptoState {
     /// records (spec 09 §9.16.9 "A distribution whose publish fails").
     /// Exported in the crypto snapshot, so the queue is durable with the
     /// rotation or Add that filled it (spec 05 §5.15.3). Fill it only through
-    /// [`Self::enqueue_distribution`], which keeps the per-target bound.
+    /// [`Self::enqueue_distribution`], which keeps one entry per target and
+    /// recipient key.
     pub pending_distributions: Vec<PendingDistribution>,
-
-    /// Faults found while the queue was filled (displaced or unbuilt
-    /// distributions), reported by the next pass of
-    /// `lifecycle_helpers::drain_and_deliver_sender_keys`. Not persisted. It
-    /// holds at most one `Evicted` entry per target, and every rotation that
-    /// adds a `NotBuilt` entry runs a pass right after.
-    pub(crate) undelivered: Vec<DistributionFault>,
 
     /// Nonce deduplication cache for sender-key requests (replay
     /// protection). Mirrors legacy
@@ -707,7 +692,6 @@ impl std::fmt::Debug for ContextCryptoState {
             "pending_distributions",
             &format_args!("[{} entries]", self.pending_distributions.len()),
         )
-        .field("undelivered", &self.undelivered)
         .field("nonce_dedup", &self.nonce_dedup)
         .field(
             "member_wrapping_keys",
@@ -733,7 +717,6 @@ impl Default for ContextCryptoState {
             sender_key_store: SenderKeyStore::new(),
             sender_key_epoch: 0,
             pending_distributions: Vec::new(),
-            undelivered: Vec::new(),
             nonce_dedup: NonceDedup::new(),
             member_wrapping_keys: HashMap::new(),
             recv_sequence_tracker: HashMap::new(),
@@ -1898,49 +1881,49 @@ fn hex_encode_context_id(id: &[u8; 32]) -> String {
 /// `#[cfg(test)]` [`PerContextState`] wrappers below preserve the original
 /// whole-state call shape for the golden byte-identity tests.
 impl ContextCryptoState {
-    /// Queues a sender-key distribution to `target_did` for publish. When the
-    /// queue already holds `MAX_PUSH_CHAINS_PER_MEMBER` distributions for that
-    /// target, the oldest one is dropped and recorded as
-    /// [`DistributionFault::Evicted`] for the next pass to report (spec 09
-    /// §9.16.9 "A distribution whose publish fails"). The bound keeps a
-    /// requester that floods `SenderKeyRequest`s, or a relay outage across
-    /// many rotations, from growing the durable queue without limit.
+    /// Queues a distribution of `epoch` to `target_did`, sealed to
+    /// `recipient_key`, for publish. It replaces any distribution queued for
+    /// the same target and recipient key, so the queue holds at most one per
+    /// pair (spec 09 §9.16.9 "A distribution whose publish fails"): the
+    /// receiver keeps one key per sender behind a monotonic epoch floor, so
+    /// the newer distribution supersedes the older one.
     ///
-    /// Takes the queue and the fault list as two fields of one
-    /// [`ContextCryptoState`], so each call site names the queue it fills.
+    /// Takes the queue as a field of one [`ContextCryptoState`], so each call
+    /// site names the queue it fills.
     pub(crate) fn enqueue_distribution(
         pending_distributions: &mut Vec<PendingDistribution>,
-        undelivered: &mut Vec<DistributionFault>,
         target_did: String,
+        recipient_key: Vec<u8>,
+        epoch: u64,
         message: Vec<u8>,
     ) {
-        use scp_protocol::crypto::sender_keys::MAX_PUSH_CHAINS_PER_MEMBER;
-        let queued = pending_distributions
+        pending_distributions
+            .retain(|p| p.target_did != target_did || p.recipient_key != recipient_key);
+        pending_distributions.push(PendingDistribution::queued(
+            target_did,
+            recipient_key,
+            epoch,
+            message,
+        ));
+    }
+
+    /// Drops every distribution queued for `target_did`: the target left the
+    /// context or lost read access (spec 09 §9.16.9). Runs in the durable
+    /// step that drops the target's sender key.
+    pub(crate) fn drop_distributions_to(
+        pending_distributions: &mut Vec<PendingDistribution>,
+        target_did: &str,
+    ) {
+        pending_distributions.retain(|p| p.target_did != target_did);
+    }
+
+    /// The first queued distribution of the current sender-key epoch, which
+    /// no relay has accepted yet. While one exists, `seal` refuses to encrypt
+    /// under that epoch (spec 09 §9.16.9 step 5).
+    fn pending_current_distribution(&self) -> Option<&PendingDistribution> {
+        self.pending_distributions
             .iter()
-            .filter(|p| p.target_did == target_did)
-            .count();
-        if queued >= MAX_PUSH_CHAINS_PER_MEMBER
-            && let Some(oldest) = pending_distributions
-                .iter()
-                .position(|p| p.target_did == target_did)
-        {
-            pending_distributions.remove(oldest);
-            let recorded = undelivered.iter_mut().find_map(|f| match f {
-                DistributionFault::Evicted {
-                    target_did: t,
-                    displaced,
-                } if *t == target_did => Some(displaced),
-                _ => None,
-            });
-            match recorded {
-                Some(displaced) => *displaced = displaced.saturating_add(1),
-                None => undelivered.push(DistributionFault::Evicted {
-                    target_did: target_did.clone(),
-                    displaced: 1,
-                }),
-            }
-        }
-        pending_distributions.push(PendingDistribution::queued(target_did, message));
+            .find(|p| p.epoch == self.sender_key_epoch)
     }
 
     /// Seals an [`InnerEnvelope`] into the serialized MLS message (sender-key
@@ -1952,6 +1935,9 @@ impl ContextCryptoState {
     ///
     /// # Errors
     ///
+    /// [`ContextError::SenderKeyDistributionPending`] while a distribution of
+    /// the current sender-key epoch has no accepted publish (spec 09 §9.16.9
+    /// step 5: H MUST NOT encrypt under epoch N before it publishes N).
     /// [`ContextError::CryptoFailed`] on an inner-envelope context-id resolution
     /// mismatch, or any serialization / MLS / sender-layer failure.
     pub(crate) fn seal(
@@ -1961,6 +1947,12 @@ impl ContextCryptoState {
         inner: &InnerEnvelope,
         aad_sequence: u64,
     ) -> Result<Vec<u8>, ContextError> {
+        if let Some(pending) = self.pending_current_distribution() {
+            return Err(ContextError::SenderKeyDistributionPending {
+                target_did: pending.target_did.clone(),
+                epoch: pending.epoch,
+            });
+        }
         // The sender-layer AEAD AAD MUST bind the RAW `context_id` string
         // (UTF-8, 4-byte BE length prefix) per spec §9.16.1 + §9.5.1 — not the
         // hex encoding of its 32-byte hash. The raw string is carried on the
@@ -2421,7 +2413,6 @@ impl ContextCryptoState {
         self.sender_key_store = SenderKeyStore::new();
         self.member_wrapping_keys.clear();
         self.pending_distributions.clear();
-        self.undelivered.clear();
         self.nonce_dedup = NonceDedup::new();
         self.recv_sequence_tracker.clear();
         self.sender_key_epoch = 0;
@@ -2514,7 +2505,6 @@ impl PerContextState {
             sender_key_store: owned.sender_key_store,
             sender_key_epoch: owned.sender_key_epoch,
             pending_distributions: owned.pending_distributions,
-            undelivered: Vec::new(),
             nonce_dedup: owned.nonce_dedup,
             member_wrapping_keys: owned.member_wrapping_keys,
             recv_sequence_tracker: HashMap::new(),
@@ -2924,6 +2914,9 @@ impl PerContextState {
         let ctx_id_hex = hex::encode(self.context_id);
         let crypto = self.encrypted_crypto_mut()?;
         crypto.sender_key_store.remove(&ctx_id_hex, member_did);
+        // A departed member gets no queued distribution: dropped in the same
+        // durable step as its sender key (spec 09 §9.16.9).
+        ContextCryptoState::drop_distributions_to(&mut crypto.pending_distributions, member_did);
         // The wrapping-key cache follows the tree: the Remove Commit that
         // dropped the member's last leaf already dropped its key.
         Ok(())
@@ -2936,13 +2929,17 @@ impl PerContextState {
     /// # Errors
     ///
     /// [`ContextError::CryptoFailed`] on a mode/group mismatch or HPKE /
-    /// serialization failure.
+    /// serialization failure. A member with no wrapping key gets no
+    /// distribution; that is reported on `events` as not built and is not an
+    /// error (spec 09 §9.16.9).
     pub(crate) fn distribute_sender_key(
         &mut self,
         local_did: &str,
         member_did: &str,
+        events: Option<&ContextEventTx>,
     ) -> Result<(), ContextError> {
         let ctx_id_hex = hex::encode(self.context_id);
+        let context_id = self.handle.context_id().to_owned();
         let crypto = self.encrypted_crypto_mut()?;
         let sender_key = crypto.sender_key.clone().ok_or_else(|| {
             ContextError::CryptoFailed("no MLS group for this context".to_string())
@@ -2991,17 +2988,19 @@ impl PerContextState {
 
             ContextCryptoState::enqueue_distribution(
                 &mut crypto.pending_distributions,
-                &mut crypto.undelivered,
                 member_did.to_owned(),
+                recipient_wrapping_pub.as_bytes().to_vec(),
+                sender_key_epoch,
                 serialized,
             );
         } else {
             // No push is possible; the member recovers the key by a
             // `SenderKeyRequest` (§9.16.2). Reported, never silent.
-            crypto.undelivered.push(DistributionFault::NotBuilt {
+            DistributionFault::NotBuilt {
                 target_did: member_did.to_owned(),
                 reason: "no wrapping key for the member".to_owned(),
-            });
+            }
+            .report(&mut self.receive_buffer, &context_id, events);
         }
         Ok(())
     }
@@ -3013,9 +3012,16 @@ impl PerContextState {
     /// # Errors
     ///
     /// [`ContextError::CryptoFailed`] on a mode/group mismatch or epoch
-    /// overflow.
-    pub(crate) fn rotate_sender_key(&mut self, local_did: &str) -> Result<(), ContextError> {
+    /// overflow. A member whose distribution cannot be built is reported on
+    /// `events` as not built and is not an error (spec 09 §9.16.9).
+    pub(crate) fn rotate_sender_key(
+        &mut self,
+        local_did: &str,
+        events: Option<&ContextEventTx>,
+    ) -> Result<(), ContextError> {
         let ctx_id_hex = hex::encode(self.context_id);
+        let context_id = self.handle.context_id().to_owned();
+        let mut not_built = Vec::new();
         let crypto = self.encrypted_crypto_mut()?;
 
         // One-shot fault-injection seam (#2148 F1 / ADR-049 §15(c)): induce a
@@ -3080,7 +3086,7 @@ impl PerContextState {
                     let sealed: [u8; 48] = match sealed_vec.try_into() {
                         Ok(s) => s,
                         Err(v) => {
-                            crypto.undelivered.push(DistributionFault::NotBuilt {
+                            not_built.push(DistributionFault::NotBuilt {
                                 target_did: member_did.clone(),
                                 reason: format!(
                                     "HPKE seal produced {} bytes, expected 48",
@@ -3104,13 +3110,14 @@ impl PerContextState {
                         Ok(serialized) => {
                             ContextCryptoState::enqueue_distribution(
                                 &mut crypto.pending_distributions,
-                                &mut crypto.undelivered,
                                 member_did.clone(),
+                                wrapping_pub.as_bytes().to_vec(),
+                                sender_key_epoch,
                                 serialized,
                             );
                         }
                         Err(e) => {
-                            crypto.undelivered.push(DistributionFault::NotBuilt {
+                            not_built.push(DistributionFault::NotBuilt {
                                 target_did: member_did.clone(),
                                 reason: format!("serialization failed: {e}"),
                             });
@@ -3118,7 +3125,7 @@ impl PerContextState {
                     }
                 }
                 Err(e) => {
-                    crypto.undelivered.push(DistributionFault::NotBuilt {
+                    not_built.push(DistributionFault::NotBuilt {
                         target_did: member_did.clone(),
                         reason: format!("HPKE seal failed: {e}"),
                     });
@@ -3126,6 +3133,9 @@ impl PerContextState {
             }
         }
 
+        for fault in &not_built {
+            fault.report(&mut self.receive_buffer, &context_id, events);
+        }
         Ok(())
     }
 
@@ -3714,8 +3724,9 @@ mod tests {
                 // Only queued distribution ciphertext is present.
                 ContextCryptoState::enqueue_distribution(
                     &mut cs.pending_distributions,
-                    &mut cs.undelivered,
                     "did:dht:recipient".to_owned(),
+                    vec![0x02; 33],
+                    1,
                     vec![0xDE, 0xAD, 0xBE, 0xEF],
                 );
             }
@@ -3967,13 +3978,11 @@ mod tests {
             sender_key_store,
             sender_key_epoch,
             pending_distributions,
-            undelivered,
             nonce_dedup,
             member_wrapping_keys,
             recv_sequence_tracker,
             force_rotation_failure,
         } = c;
-        assert!(undelivered.is_empty());
 
         assert!(mls_group.is_none());
         assert!(sender_key.is_none());
@@ -4815,7 +4824,7 @@ mod crypto_ops_golden {
         let inner = build_inner(ALICE, 0);
 
         // --- Actor path: actor rotate + actor seal + actor open. ---
-        alice_a.rotate_sender_key(ALICE).unwrap();
+        alice_a.rotate_sender_key(ALICE, None).unwrap();
         let epoch_a = alice_a.local_sender_key_epoch();
         assert!(
             epoch_a >= 1,
@@ -4875,7 +4884,7 @@ mod crypto_ops_golden {
 
         // Rotate ONCE on the actor so Alice holds a single rotated key at a
         // non-zero epoch.
-        alice_a.rotate_sender_key(ALICE).unwrap();
+        alice_a.rotate_sender_key(ALICE, None).unwrap();
         let epoch = alice_a.local_sender_key_epoch();
         assert!(epoch >= 1, "rotate advances the sender-key epoch past 0");
 
@@ -4937,7 +4946,7 @@ mod crypto_ops_golden {
         alice_a.arm_rotation_failure_once();
         assert!(
             matches!(
-                alice_a.rotate_sender_key(ALICE),
+                alice_a.rotate_sender_key(ALICE, None),
                 Err(ContextError::CryptoFailed(_))
             ),
             "armed rotation must return CryptoFailed"
@@ -4952,7 +4961,7 @@ mod crypto_ops_golden {
 
         // One-shot cleared: the next rotation persists normally and advances the
         // epoch by exactly one.
-        alice_a.rotate_sender_key(ALICE).unwrap();
+        alice_a.rotate_sender_key(ALICE, None).unwrap();
         assert_eq!(
             alice_a.local_sender_key_epoch(),
             epoch_before + 1,
@@ -5029,7 +5038,7 @@ mod crypto_ops_golden {
         let (_alice_p, mut alice_a, bob_p, mut bob_a, _) = setup();
 
         // Actor distributes Alice's CURRENT (unrotated) sender key.
-        alice_a.distribute_sender_key(ALICE, BOB).unwrap();
+        alice_a.distribute_sender_key(ALICE, BOB, None).unwrap();
         let actor_msgs = alice_a.drain_pending_sender_key_messages().unwrap();
         assert_eq!(actor_msgs.len(), 1, "one queued distribution");
         // Drain again — the queue is now empty (verbatim `std::mem::take`).
@@ -5086,7 +5095,7 @@ mod crypto_ops_golden {
         // Rotate on the actor. The fresh key + HPKE ephemeral are random; the
         // EPOCH advance and the distribution's processability are the
         // deterministic golden invariants.
-        alice_a.rotate_sender_key(ALICE).unwrap();
+        alice_a.rotate_sender_key(ALICE, None).unwrap();
 
         assert_eq!(
             alice_a.local_sender_key_epoch(),
@@ -5233,18 +5242,20 @@ mod crypto_ops_golden {
         #[derive(serde::Serialize, serde::Deserialize)]
         struct PlainDistribution {
             target_did: String,
+            recipient_key: Vec<u8>,
+            epoch: u64,
             message: Vec<u8>,
             first_attempt_at: Option<u64>,
             failed_attempts: u32,
-            next_attempt_at: u64,
         }
         let (_alice_p, mut alice_a, _bob_p, _bob_a, _ctx) = setup();
         // A queued distribution, so `pending_distributions` is not empty.
         if let ContextModeState::Encrypted(cs) = &mut alice_a.mode {
             ContextCryptoState::enqueue_distribution(
                 &mut cs.pending_distributions,
-                &mut cs.undelivered,
                 BOB.to_owned(),
+                vec![0x02; 33],
+                1,
                 vec![0xAB; 4],
             );
         }
@@ -5260,6 +5271,8 @@ mod crypto_ops_golden {
         assert!(!plain.sender_key_entries.is_empty());
         assert_eq!(plain.pending_distributions.len(), 1);
         assert_eq!(plain.pending_distributions[0].message, [0xAB; 4]);
+        assert_eq!(plain.pending_distributions[0].recipient_key, [0x02; 33]);
+        assert_eq!(plain.pending_distributions[0].epoch, 1);
         let plain_bytes = rmp_serde::to_vec_named(&plain).unwrap();
         assert_eq!(*blob, plain_bytes);
 

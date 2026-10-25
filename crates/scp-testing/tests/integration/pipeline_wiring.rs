@@ -2622,18 +2622,16 @@ fn drain_and_deliver_sender_keys_calls_mls_encrypt_management() {
 
 // --- A distribution whose publish fails (spec 09 §9.16.9) ---
 
-/// The drain reports every undelivered distribution by local event, so no
-/// caller can drop the report, and a failed publish requeues the entry with
-/// its backoff instead of discarding it.
+/// The drain reports every undelivered distribution by local event when it
+/// records the fault, so no caller can drop the report, and a failed publish
+/// requeues the entry instead of discarding it.
 #[test]
 fn drain_and_deliver_sender_keys_reports_and_requeues() {
     let body = extract_fn_body(MANAGER_SRC, "drain_and_deliver_sender_keys")
         .expect("drain_and_deliver_sender_keys body");
     for needle in [
-        "emit_event(",
-        ".to_event()",
+        "fault.report(",
         "DistributionFault::Requeued",
-        "commit_retry_backoff(",
         "republish_sealed_management(",
     ] {
         assert!(
@@ -2643,10 +2641,11 @@ fn drain_and_deliver_sender_keys_reports_and_requeues() {
     }
 }
 
-/// A `SenderKeyRequest` answer enters the queue through its per-target bound
-/// (spec 09 §9.16.9).
+/// A `SenderKeyRequest` answer enters the queue through the enqueue that
+/// supersedes an answer queued to the same requester and key (spec 09
+/// §9.16.9).
 #[test]
-fn key_request_answer_is_queued_through_the_bound() {
+fn key_request_answer_is_queued_through_the_superseding_enqueue() {
     assert!(
         fn_body_contains(MANAGER_SRC, "decrypt_and_dispatch", "enqueue_distribution("),
         "decrypt_and_dispatch must queue a SenderKeyRequest answer through \
@@ -2654,7 +2653,7 @@ fn key_request_answer_is_queued_through_the_bound() {
     );
 }
 
-/// The governance timer retries the queue's due entries (spec 09 §9.16.9
+/// The governance timer retries every queued distribution (spec 09 §9.16.9
 /// step 2).
 #[test]
 fn governance_timer_retries_sender_key_distributions() {
@@ -2663,26 +2662,44 @@ fn governance_timer_retries_sender_key_distributions() {
     let body = extract_fn_body(HANDLERS_GOVERNANCE_SRC, "evaluate_governance_timeouts")
         .expect("evaluate_governance_timeouts body");
     assert!(
-        body.contains("drain_and_deliver_sender_keys(")
-            && body.contains("DistributionScope::DueRetries"),
-        "evaluate_governance_timeouts must retry due sender-key distributions \
+        body.contains("drain_and_deliver_sender_keys(") && body.contains("DistributionScope::All"),
+        "evaluate_governance_timeouts must retry every queued sender-key distribution \
          (spec 09 §9.16.9)"
     );
 }
 
-/// The explicit re-send request turns an undelivered distribution into an
-/// error (spec 09 §9.16.9 step 5).
+/// The explicit re-send request replies with the drain's typed report, never
+/// an error for a delivery fault (spec 09 §9.16.9).
 #[test]
-fn send_queued_sender_keys_returns_the_report_as_error() {
+fn send_queued_sender_keys_replies_with_the_report() {
+    let body = extract_fn_body(HANDLERS_MESSAGING_SRC, "handle_send_queued_sender_keys")
+        .expect("handle_send_queued_sender_keys body");
     assert!(
-        fn_body_contains(
-            HANDLERS_MESSAGING_SRC,
-            "handle_send_queued_sender_keys",
-            ".into_result()"
-        ),
-        "handle_send_queued_sender_keys must reply with the drain report's \
-         result (spec 09 §9.16.9)"
+        body.contains("drain_and_deliver_sender_keys(")
+            && body.contains("DistributionScope::All")
+            && body.contains("Ok(report)"),
+        "handle_send_queued_sender_keys must reply Ok with the drain report \
+         (spec 09 §9.16.9)"
     );
+}
+
+/// The join and the governance Add share one add-then-distribute step, so
+/// both give a member with no distribution the same disposition (spec 09
+/// §9.16.9).
+#[test]
+fn join_and_add_share_the_add_then_distribute_step() {
+    const GOVERNANCE_HELPERS_SRC: &str =
+        include_str!("../../../../crates/scp-runtime/src/context/governance_helpers.rs");
+    for (src, caller) in [
+        (MANAGER_SRC, "join_context"),
+        (GOVERNANCE_HELPERS_SRC, "execute_add_member"),
+    ] {
+        assert!(
+            fn_body_contains(src, caller, "add_member_and_queue_distribution("),
+            "{caller} must add through add_member_and_queue_distribution \
+             (spec 09 §9.16.9)"
+        );
+    }
 }
 
 /// The persisted crypto blob carries the queue (spec 05 §5.15.3).

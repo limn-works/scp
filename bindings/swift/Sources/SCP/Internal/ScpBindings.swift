@@ -9950,6 +9950,27 @@ public struct ContextReconnectResult {
      * classified context, whose `outcome` carries the result.
      */
     public var failureCode: String?
+    /**
+     * Sender-key distributions a relay accepted in the re-send that follows a
+     * terminal-success sync (spec 09 §9.16.9).
+     */
+    public var senderKeysSent: UInt64
+    /**
+     * Sender-key distributions whose re-send failed and that stay queued for
+     * the governance timer or the next reconnection.
+     */
+    public var senderKeysPending: UInt64
+    /**
+     * Sender-key distributions the re-send dropped undelivered: MLS could not
+     * seal one, or no TTL remained.
+     */
+    public var senderKeysDropped: UInt64
+    /**
+     * Why the re-send did not complete (its budget elapsed, or the actor
+     * could not be reached); absent when it completed or did not run. The
+     * sync `outcome` does not depend on it.
+     */
+    public var senderKeySendError: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -9994,7 +10015,24 @@ public struct ContextReconnectResult {
          * its tier was classified: `SCP-TRANS-5102` when no `last_relay_contact`
          * is stored, `SCP-TRANS-5103` when reading it failed. Absent for a
          * classified context, whose `outcome` carries the result.
-         */failureCode: String?) {
+         */failureCode: String?, 
+        /**
+         * Sender-key distributions a relay accepted in the re-send that follows a
+         * terminal-success sync (spec 09 §9.16.9).
+         */senderKeysSent: UInt64, 
+        /**
+         * Sender-key distributions whose re-send failed and that stay queued for
+         * the governance timer or the next reconnection.
+         */senderKeysPending: UInt64, 
+        /**
+         * Sender-key distributions the re-send dropped undelivered: MLS could not
+         * seal one, or no TTL remained.
+         */senderKeysDropped: UInt64, 
+        /**
+         * Why the re-send did not complete (its budget elapsed, or the actor
+         * could not be reached); absent when it completed or did not run. The
+         * sync `outcome` does not depend on it.
+         */senderKeySendError: String?) {
         self.contextId = contextId
         self.tier = tier
         self.outcome = outcome
@@ -10006,6 +10044,10 @@ public struct ContextReconnectResult {
         self.envelopesDelivered = envelopesDelivered
         self.relayContactError = relayContactError
         self.failureCode = failureCode
+        self.senderKeysSent = senderKeysSent
+        self.senderKeysPending = senderKeysPending
+        self.senderKeysDropped = senderKeysDropped
+        self.senderKeySendError = senderKeySendError
     }
 }
 
@@ -10049,6 +10091,18 @@ extension ContextReconnectResult: Equatable, Hashable {
         if lhs.failureCode != rhs.failureCode {
             return false
         }
+        if lhs.senderKeysSent != rhs.senderKeysSent {
+            return false
+        }
+        if lhs.senderKeysPending != rhs.senderKeysPending {
+            return false
+        }
+        if lhs.senderKeysDropped != rhs.senderKeysDropped {
+            return false
+        }
+        if lhs.senderKeySendError != rhs.senderKeySendError {
+            return false
+        }
         return true
     }
 
@@ -10064,6 +10118,10 @@ extension ContextReconnectResult: Equatable, Hashable {
         hasher.combine(envelopesDelivered)
         hasher.combine(relayContactError)
         hasher.combine(failureCode)
+        hasher.combine(senderKeysSent)
+        hasher.combine(senderKeysPending)
+        hasher.combine(senderKeysDropped)
+        hasher.combine(senderKeySendError)
     }
 }
 
@@ -10086,7 +10144,11 @@ public struct FfiConverterTypeContextReconnectResult: FfiConverterRustBuffer {
                 needsReconnectCleared: FfiConverterBool.read(from: &buf), 
                 envelopesDelivered: FfiConverterUInt64.read(from: &buf), 
                 relayContactError: FfiConverterOptionString.read(from: &buf), 
-                failureCode: FfiConverterOptionString.read(from: &buf)
+                failureCode: FfiConverterOptionString.read(from: &buf), 
+                senderKeysSent: FfiConverterUInt64.read(from: &buf), 
+                senderKeysPending: FfiConverterUInt64.read(from: &buf), 
+                senderKeysDropped: FfiConverterUInt64.read(from: &buf), 
+                senderKeySendError: FfiConverterOptionString.read(from: &buf)
         )
     }
 
@@ -10102,6 +10164,10 @@ public struct FfiConverterTypeContextReconnectResult: FfiConverterRustBuffer {
         FfiConverterUInt64.write(value.envelopesDelivered, into: &buf)
         FfiConverterOptionString.write(value.relayContactError, into: &buf)
         FfiConverterOptionString.write(value.failureCode, into: &buf)
+        FfiConverterUInt64.write(value.senderKeysSent, into: &buf)
+        FfiConverterUInt64.write(value.senderKeysPending, into: &buf)
+        FfiConverterUInt64.write(value.senderKeysDropped, into: &buf)
+        FfiConverterOptionString.write(value.senderKeySendError, into: &buf)
     }
 }
 

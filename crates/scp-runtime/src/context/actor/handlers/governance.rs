@@ -1320,7 +1320,7 @@ pub(crate) async fn evaluate_governance_timeouts(
         deps,
         &mut cell.class_c_view(),
         &context_id,
-        crate::context::lifecycle_helpers::DistributionScope::DueRetries,
+        crate::context::lifecycle_helpers::DistributionScope::All,
     )
     .await;
 

@@ -938,7 +938,7 @@ async fn handle_deliver_incoming(
                 deps,
                 &mut cell.class_c_view(),
                 context_id,
-                crate::context::lifecycle_helpers::DistributionScope::All,
+                crate::context::lifecycle_helpers::DistributionScope::NeverAttempted,
             )
             .await;
         }
@@ -1000,19 +1000,19 @@ async fn handle_deliver_incoming(
 
 /// Handle [`MessagingCommand::SendQueuedSenderKeys`] (actor-shape).
 ///
-/// MLS-encrypts and sends every queued sender-key distribution through
-/// `drain_and_deliver_sender_keys`, the path a `Live` delivery runs. The
-/// caller asked for the send and no step of its own can be left half done,
-/// so any distribution the pass does not deliver turns the reply into an
-/// error (spec 09 §9.16.9): `TransportFailed` when one stays queued,
-/// `CryptoFailed` when one was dropped, `TransportTimeout` when the pass
-/// exceeds its budget. The pass removes an entry only after its publish
-/// succeeds, so a timeout loses no queued distribution.
+/// MLS-encrypts and sends every queued sender-key distribution, a failed one
+/// included, through `drain_and_deliver_sender_keys`. The reply carries the
+/// pass's [`DistributionReport`](crate::context::actor::state::DistributionReport):
+/// a distribution that stays queued or was dropped is a fault in the report,
+/// never an error (spec 09 §9.16.9). The reply is `TransportTimeout` only when
+/// the pass exceeds its budget; the pass removes an entry only after its
+/// publish succeeds and reports each fault when it records it, so a timeout
+/// loses neither a queued distribution nor a report.
 async fn handle_send_queued_sender_keys(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
-    reply: oneshot::Sender<Result<(), ContextError>>,
+    reply: oneshot::Sender<Result<crate::context::actor::state::DistributionReport, ContextError>>,
 ) -> Outcome<()> {
     let result = {
         let mut view = cell.class_c_view();
@@ -1023,14 +1023,14 @@ async fn handle_send_queued_sender_keys(
             crate::context::lifecycle_helpers::DistributionScope::All,
         );
         match tokio::time::timeout(HANDLER_TIMEOUT, drain).await {
-            Ok(report) => report.into_result().map(|_sent| ()),
+            Ok(report) => Ok(report),
             Err(_elapsed) => Err(ContextError::TransportTimeout(format!(
                 "send_queued_sender_keys exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
             ))),
         }
     };
     let outcome = match &result {
-        Ok(()) => Outcome::ok_mutated(()),
+        Ok(_) => Outcome::ok_mutated(()),
         Err(e) => Outcome::err_mutated(outcome_error_sketch(e)),
     };
     let _ = reply.send(result);

@@ -3264,15 +3264,19 @@ pub(super) async fn decrypt_and_dispatch(
                         requester_pk.as_bytes(),
                         &blocked,
                     )? {
-                        // Queue the ephemeral-sealed answer, bounded per target, for
-                        // MLS-wrap + transmit
-                        // by `drain_and_deliver_sender_keys` after the Class-C view
-                        // drops (in `handle_deliver_incoming`). A blocked requester
-                        // returns `None` (§9.16.2 silent drop) — nothing queued.
+                        // Queue the answer, sealed to the request's ephemeral
+                        // wrapping key, for MLS-wrap + transmit by
+                        // `drain_and_deliver_sender_keys` after the Class-C view
+                        // drops (in `handle_deliver_incoming`). It replaces an
+                        // answer queued to the same requester and key (spec 09
+                        // §9.16.9). A blocked requester returns `None` (§9.16.2
+                        // silent drop) — nothing queued.
+                        let epoch = cs.sender_key_epoch;
                         crate::context::actor::state::ContextCryptoState::enqueue_distribution(
                             &mut cs.pending_distributions,
-                            &mut cs.undelivered,
                             sender_did.clone(),
+                            request.wrapping_pubkey.as_bytes().to_vec(),
+                            epoch,
                             sealed,
                         );
                     }
@@ -3297,27 +3301,36 @@ pub(super) async fn decrypt_and_dispatch(
                     // `deps.crypto.set_sender_key_unchecked` was a silent no-op —
                     // the latent bug this fixes (D1 close, fail-safe ordering
                     // preserved).
-                    let floor = deps
-                        .supervisor
-                        .sender_epoch_floor(context_id_bytes, &sender_did)?;
-                    let wrapping = deps.supervisor.my_wrapping_key(&deps.owned_identity)?;
-                    let (sender_key, epoch) =
-                        crate::crypto::mls::provider::NodeMlsFactory::open_incoming_sender_key(
-                            &wrapping,
+                    //
+                    // A response at the floor itself can be a duplicate: the
+                    // sender removes a distribution from its queue only after a
+                    // relay accepts it, so a crash between the accept and the
+                    // removal publishes it again (spec 09 §9.16.9). It is opened
+                    // against the window one below the floor and handled with
+                    // no change when its key is the key installed at the floor;
+                    // with another key it stays refused.
+                    let (sender_key, epoch, at_floor) =
+                        open_key_response(deps, context_id_bytes, &sender_did, &response).await?;
+                    // An epoch at the floor does not advance it; every other
+                    // epoch passes the registry gate before the store is read
+                    // or written.
+                    if !at_floor {
+                        deps.supervisor.check_and_advance_sender_epoch(
                             context_id_bytes,
                             &sender_did,
-                            &response,
-                            floor,
-                        )
-                        .await?;
-                    drop(wrapping);
-                    deps.supervisor.check_and_advance_sender_epoch(
-                        context_id_bytes,
-                        &sender_did,
-                        epoch,
-                        scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE,
-                    )?;
+                            epoch,
+                            scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE,
+                        )?;
+                    }
                     let ctx_id_hex = hex::encode(context_id_bytes);
+                    if at_floor {
+                        return at_floor_disposition(
+                            cs.sender_key_store.get(&ctx_id_hex, &sender_did),
+                            &sender_key,
+                            epoch,
+                            &sender_did,
+                        );
+                    }
                     cs.sender_key_store
                         .set_unchecked(&ctx_id_hex, &sender_did, sender_key);
                     Ok(Dispatched::Handled)
@@ -3327,6 +3340,70 @@ pub(super) async fn decrypt_and_dispatch(
                 ))),
             }
         }
+    }
+}
+
+/// Opens a received `KeyResponse` against the sender's epoch floor and
+/// returns the key, its epoch, and whether that epoch equals the floor. A
+/// response at the floor is opened against the window one below it, so a
+/// re-delivered distribution opens (spec 09 §9.16.9); the caller decides its
+/// disposition. The wrapping key is dropped before return.
+///
+/// # Errors
+///
+/// [`ContextError`] from the floor read, the custody wrapping key, or
+/// `open_incoming_sender_key`.
+async fn open_key_response(
+    deps: &ActorDeps,
+    context_id_bytes: &[u8; 32],
+    sender_did: &str,
+    response: &scp_protocol::crypto::sender_keys::SenderKeyResponse,
+) -> Result<(scp_protocol::crypto::sender_keys::SenderKey, u64, bool), ContextError> {
+    let floor = deps
+        .supervisor
+        .sender_epoch_floor(context_id_bytes, sender_did)?;
+    let at_floor = floor > 0 && response.epoch == floor;
+    let wrapping = deps.supervisor.my_wrapping_key(&deps.owned_identity)?;
+    let (sender_key, epoch) =
+        crate::crypto::mls::provider::NodeMlsFactory::open_incoming_sender_key(
+            &wrapping,
+            context_id_bytes,
+            sender_did,
+            response,
+            if at_floor { floor - 1 } else { floor },
+        )
+        .await?;
+    drop(wrapping);
+    Ok((sender_key, epoch, at_floor))
+}
+
+/// The disposition of a `KeyResponse` whose epoch equals the floor: a
+/// re-delivered distribution of the installed key is handled with no change,
+/// and any other key at the floor is refused (spec 09 §9.16.9).
+///
+/// # Errors
+///
+/// [`ContextError::CryptoFailed`] when no key is installed for the sender or
+/// the installed key differs from `received`.
+fn at_floor_disposition(
+    installed: Option<&scp_protocol::crypto::sender_keys::SenderKey>,
+    received: &scp_protocol::crypto::sender_keys::SenderKey,
+    epoch: u64,
+    sender_did: &str,
+) -> Result<Dispatched, ContextError> {
+    let same_key = installed.is_some_and(|installed| {
+        bool::from(subtle::ConstantTimeEq::ct_eq(
+            installed.as_bytes().as_slice(),
+            received.as_bytes().as_slice(),
+        ))
+    });
+    if same_key {
+        Ok(Dispatched::Handled)
+    } else {
+        Err(ContextError::CryptoFailed(format!(
+            "sender key distribution: epoch {epoch} from {sender_did} \
+             equals the floor with another key"
+        )))
     }
 }
 

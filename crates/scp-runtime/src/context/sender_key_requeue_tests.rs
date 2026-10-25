@@ -1,25 +1,32 @@
 //! A sender-key distribution whose publish fails (spec 09 §9.16.9 "A
 //! distribution whose publish fails"; spec 05 §5.15.3).
 //!
-//! Alice is the creator of a real two-party MLS pair (`stand_up_two_party`),
-//! in a `ClassSCell` with production `ActorDeps` over a snapshot store, a
-//! `TestClock`, and a transport whose `send_message` fails while a switch is
-//! set. Her queued distribution to Bob is built by the production
-//! `distribute_sender_key`, and every pass runs through a production entry
-//! point: the `SendQueuedSenderKeys` handler, the governance timer
-//! (`evaluate_governance_timeouts`), or the drain itself.
+//! The queue tests stand Alice up as the creator of a real two-party MLS pair
+//! (`stand_up_two_party`), in a `ClassSCell` with production `ActorDeps` over
+//! a snapshot store, a `TestClock`, an event channel, and a transport whose
+//! `send_message` fails while a switch is set. Her queued distribution to Bob
+//! is built by the production `distribute_sender_key`, and every pass runs
+//! through a production entry point: the `SendQueuedSenderKeys` handler, the
+//! governance timer (`evaluate_governance_timeouts`), or the drain itself.
 //!
 //! - A failed publish keeps the distribution in the persisted snapshot, and a
 //!   restored actor's timer publishes it.
-//! - A failed publish reports `SenderKeyDistributionPending`, and the explicit
-//!   re-send request returns an error.
-//! - The timer publishes only a distribution whose earlier publish failed and
-//!   whose backoff has elapsed, with the TTL that remains of its first attempt.
-//! - A distribution whose TTL is spent is dropped and reported as
-//!   `SenderKeyDistributionFailed`, never published.
-//! - A distribution MLS cannot seal is dropped and reported.
-//! - The queue holds at most `MAX_PUSH_CHAINS_PER_MEMBER` distributions per
-//!   target; the displaced ones are reported.
+//! - A failed publish reports `SenderKeyDistributionPending` on the receive
+//!   buffer and the event channel; the re-send request returns the report.
+//! - A pass after an operation publishes only entries never attempted; the
+//!   timer retries the failed one with the TTL that remains of its first
+//!   attempt.
+//! - A distribution whose TTL is spent, or that MLS cannot seal, is dropped
+//!   and reported with its attempt count.
+//! - A distribution supersedes the one queued to the same target and key.
+//! - `seal` refuses the current epoch while a distribution of it is pending.
+//! - Removing a member purges its queued distributions in the same persist.
+//!
+//! The operation tests drive each of the six operations that rotate or
+//! distribute (join, Add, leave, Remove, reset, write revoke) through the
+//! Supervisor with the relay down: the operation returns `Ok`, the persisted
+//! snapshot holds the distribution, and `SenderKeyDistributionPending` reaches
+//! the event channel.
 
 #![cfg(test)]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -35,7 +42,6 @@ use scp_protocol::context::membership::ContextEvent;
 use scp_protocol::context::params::ContextParams;
 use scp_protocol::context::roles::Capability;
 use scp_protocol::context::{ContextError, ContextState};
-use scp_protocol::crypto::sender_keys::MAX_PUSH_CHAINS_PER_MEMBER;
 use scp_protocol::envelope::outer::BlobTtl;
 
 use crate::context::ContextHandle;
@@ -54,9 +60,27 @@ const BOB: &str = "did:dht:z6MkBobSenderKeyRequeueBobSenderKeyRequeu1";
 const T0: u64 = 1_800_000_000;
 
 type PersistErr = Box<dyn std::error::Error + Send + Sync>;
+type EventRx = tokio::sync::broadcast::Receiver<(String, ContextEvent)>;
 
 #[derive(Default)]
 struct Store(DashMap<String, ContextSnapshot>);
+
+impl Store {
+    /// The distribution queue of the one persisted snapshot of `ctx`.
+    fn queue(&self, ctx: &str) -> Vec<PendingDistribution> {
+        let snapshot = self
+            .0
+            .get(ctx)
+            .map(|s| s.value().clone())
+            .expect("a persisted snapshot of the context");
+        let (owned, _floors) = NodeMlsFactory::build_restored_owned(
+            &scp_protocol::context::context_id_bytes(ctx),
+            &snapshot.mls_crypto_state.0,
+        )
+        .expect("restore the crypto blob");
+        owned.pending_distributions
+    }
+}
 
 struct SharedStore(Arc<Store>);
 
@@ -158,35 +182,40 @@ impl ContextEventLogProvider for OkEventLog {
     }
 }
 
-/// Alice's cell and deps, the relay her transport reaches, and the clock.
+/// Alice's cell and deps, the relay her transport reaches, the store her
+/// snapshots land in, her event channel, and the clock.
 struct Alice {
     cell: ClassSCell,
     deps: ActorDeps,
     /// Held so the deps' weak handle to the supervisor stays live.
     _sup: Arc<Supervisor>,
     relay: Arc<Relay>,
+    store: Arc<Store>,
+    events: EventRx,
     clock: Arc<TestClock>,
 }
 
 async fn alice_deps(
     crypto: Arc<NodeMlsFactory>,
     relay: &Arc<Relay>,
+    store: &Arc<Store>,
     clock: &Arc<TestClock>,
-) -> (ActorDeps, Arc<Supervisor>) {
+) -> (ActorDeps, Arc<Supervisor>, EventRx) {
     let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> = Arc::new(
         crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
             scp_platform::in_memory::InMemoryStorage::new(),
         )),
     );
     let clock: Arc<dyn Clock> = Arc::clone(clock) as Arc<dyn Clock>;
+    let (event_tx, events) = tokio::sync::broadcast::channel(64);
     let supervisor = Supervisor::with_providers(
         crypto,
         Box::new(RelayTransport(Arc::clone(relay))),
         Box::new(OkEventLog),
         crate::crypto::mls::two_party_test_support::pair_resolver(ALICE, BOB),
-        Some(Box::new(SharedStore(Arc::new(Store::default())))),
+        Some(Box::new(SharedStore(Arc::clone(store)))),
         None,
-        None,
+        Some(event_tx),
         Some(clock),
         mls_storage,
     );
@@ -195,7 +224,8 @@ async fn alice_deps(
         .build_actor_deps_loaded(&DID::from(ALICE))
         .await
         .expect("build actor deps");
-    (deps, supervisor)
+    assert!(deps.event_tx.is_some(), "the deps carry the event channel");
+    (deps, supervisor, events)
 }
 
 /// Makes `state` an active context with Alice and Bob as writing members.
@@ -229,11 +259,12 @@ async fn alice_with_queued_distribution(ctx: &str) -> Alice {
     } = crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx, ALICE, BOB);
     let relay = Arc::new(Relay::default());
     relay.down.store(true, Ordering::SeqCst);
+    let store = Arc::new(Store::default());
     let clock = Arc::new(TestClock::new(T0));
-    let (deps, sup) = alice_deps(alice_provider, &relay, &clock).await;
+    let (deps, sup, events) = alice_deps(alice_provider, &relay, &store, &clock).await;
     activate(&mut alice_state);
     alice_state
-        .distribute_sender_key(ALICE, BOB)
+        .distribute_sender_key(ALICE, BOB, None)
         .expect("Alice builds a distribution for Bob");
     assert_eq!(queue(&alice_state).len(), 1, "one distribution queued");
     Alice {
@@ -241,6 +272,8 @@ async fn alice_with_queued_distribution(ctx: &str) -> Alice {
         deps,
         _sup: sup,
         relay,
+        store,
+        events,
         clock,
     }
 }
@@ -254,36 +287,61 @@ fn queue(state: &PerContextState) -> Vec<PendingDistribution> {
         .clone()
 }
 
-/// Queues `message` for Bob through the production bound.
-fn enqueue(cell: &mut ClassSCell, message: Vec<u8>) {
+/// Queues `message` of `epoch` for `target`, sealed to `recipient_key`,
+/// through the production enqueue.
+fn enqueue(
+    cell: &mut ClassSCell,
+    target: &str,
+    recipient_key: &[u8],
+    epoch: u64,
+    message: Vec<u8>,
+) {
     let mut view = cell.class_c_view();
     let crypto = view.mode_mut().crypto_mut().expect("encrypted");
     crate::context::actor::state::ContextCryptoState::enqueue_distribution(
         &mut crypto.pending_distributions,
-        &mut crypto.undelivered,
-        BOB.to_owned(),
+        target.to_owned(),
+        recipient_key.to_vec(),
+        epoch,
         message,
     );
 }
 
-/// Every `SenderKeyDistribution*` event the context recorded since the last
-/// call.
+/// Every `SenderKeyDistribution*` event the context recorded on its receive
+/// buffer since the last call.
 fn distribution_events(cell: &mut ClassSCell) -> Vec<ContextEvent> {
     cell.class_c_view()
         .receive_buffer_mut()
         .drain()
         .into_iter()
-        .filter(|e| {
-            matches!(
-                e,
-                ContextEvent::SenderKeyDistributionPending { .. }
-                    | ContextEvent::SenderKeyDistributionFailed { .. }
-            )
-        })
+        .filter(is_distribution_event)
         .collect()
 }
 
-async fn send_queued(alice: &mut Alice, ctx: &str) -> Result<(), ContextError> {
+/// Every `SenderKeyDistribution*` event on `rx` since the last call.
+fn channel_events(rx: &mut EventRx) -> Vec<ContextEvent> {
+    let mut out = Vec::new();
+    loop {
+        match rx.try_recv() {
+            Ok((_, e)) if is_distribution_event(&e) => out.push(e),
+            Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+            Err(_) => return out,
+        }
+    }
+}
+
+const fn is_distribution_event(e: &ContextEvent) -> bool {
+    matches!(
+        e,
+        ContextEvent::SenderKeyDistributionPending { .. }
+            | ContextEvent::SenderKeyDistributionFailed { .. }
+    )
+}
+
+async fn send_queued(
+    alice: &mut Alice,
+    ctx: &str,
+) -> Result<crate::context::actor::state::DistributionReport, ContextError> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let _outcome = crate::context::actor::handlers::messaging::dispatch(
         &mut alice.cell,
@@ -312,17 +370,20 @@ fn full_ttl() -> u32 {
 
 /// Fails if the export drops the queue (`pending_distributions` not carried
 /// into `MlsCryptoSnapshot`) or the restore drops it: the restored actor then
-/// has nothing to publish.
+/// has nothing to publish. Also fails if the re-send turns a requeued
+/// distribution into an `Err` instead of reporting it.
 #[tokio::test]
 async fn failed_publish_survives_persist_and_a_restored_timer_publishes_it() {
     let ctx = "sender-key-requeue-survives-restart";
     let mut alice = alice_with_queued_distribution(ctx).await;
     let queued = queue(&alice.cell)[0].clone();
 
-    let result = send_queued(&mut alice, ctx).await;
-    assert!(
-        matches!(result, Err(ContextError::TransportFailed(_))),
-        "a requeued distribution fails the explicit re-send: {result:?}"
+    let report = send_queued(&mut alice, ctx)
+        .await
+        .expect("a delivery fault is reported, not an error");
+    assert_eq!(
+        (report.sent, report.requeued(), report.dropped()),
+        (0, 1, 0)
     );
 
     // Persist exactly as the run loop does, then restore into a fresh actor.
@@ -344,6 +405,8 @@ async fn failed_publish_survives_persist_and_a_restored_timer_publishes_it() {
     );
     let restored = &restored_queue[0];
     assert_eq!(restored.target_did, BOB);
+    assert_eq!(restored.recipient_key, queued.recipient_key);
+    assert_eq!(restored.epoch, queued.epoch);
     assert_eq!(restored.message.as_slice(), queued.message.as_slice());
     assert_eq!(restored.first_attempt_at, Some(T0));
     assert_eq!(restored.failed_attempts, 1);
@@ -369,10 +432,11 @@ async fn failed_publish_survives_persist_and_a_restored_timer_publishes_it() {
     );
 }
 
-/// Fails if the drain stops emitting its faults: no event reports the
-/// requeued distribution.
+/// Fails if the drain stops reporting its faults at the mutation: no event
+/// on the receive buffer or the event channel reports the requeued
+/// distribution.
 #[tokio::test]
-async fn failed_publish_emits_pending_event() {
+async fn failed_publish_emits_pending_event_on_buffer_and_channel() {
     let ctx = "sender-key-requeue-pending-event";
     let mut alice = alice_with_queued_distribution(ctx).await;
     let report = drain_and_deliver_sender_keys(
@@ -387,50 +451,66 @@ async fn failed_publish_emits_pending_event() {
         report.faults.as_slice(),
         [DistributionFault::Requeued { attempt: 1, .. }]
     ));
-    let events = distribution_events(&mut alice.cell);
-    assert!(
-        matches!(
-            events.as_slice(),
-            [ContextEvent::SenderKeyDistributionPending { target_did, attempt: 1, .. }]
-                if target_did.0 == BOB
-        ),
-        "got {events:?}"
-    );
+    for (source, events) in [
+        ("buffer", distribution_events(&mut alice.cell)),
+        ("channel", channel_events(&mut alice.events)),
+    ] {
+        assert!(
+            matches!(
+                events.as_slice(),
+                [ContextEvent::SenderKeyDistributionPending { target_did, attempt: 1, .. }]
+                    if target_did.0 == BOB
+            ),
+            "{source}: got {events:?}"
+        );
+    }
     let entry = &queue(&alice.cell)[0];
-    assert_eq!(entry.next_attempt_at, T0 + 1, "first backoff step is 1 s");
+    assert_eq!(entry.first_attempt_at, Some(T0));
+    assert_eq!(entry.failed_attempts, 1);
 }
 
-/// Fails if the timer's scope selects every entry (it would publish the
-/// never-attempted answer, or publish before the backoff elapses) or if the
-/// timer does not run the drain at all.
+/// Fails if the pass after an operation selects a failed entry (it would
+/// retry on every operation instead of the timer's cadence) or skips a
+/// never-attempted one, or if the timer does not retry the failed entry.
 #[tokio::test]
-async fn timer_publishes_only_failed_entries_whose_backoff_elapsed() {
-    let ctx = "sender-key-requeue-timer-due-only";
+async fn post_operation_pass_skips_a_failed_entry_and_the_timer_retries_it() {
+    let ctx = "sender-key-requeue-never-attempted";
     let mut alice = alice_with_queued_distribution(ctx).await;
     let _ = send_queued(&mut alice, ctx).await;
-    // A second distribution, never attempted (a push-wake answer).
-    enqueue(&mut alice.cell, b"never attempted".to_vec());
+    // A second distribution, never attempted, to another key of Bob's (an
+    // answer sealed to a request's ephemeral key).
+    enqueue(
+        &mut alice.cell,
+        BOB,
+        &[0x03; 33],
+        1,
+        b"never attempted".to_vec(),
+    );
     alice.relay.down.store(false, Ordering::SeqCst);
 
-    timer_tick(&mut alice).await;
-    assert!(alice.relay.accepted().is_empty(), "backoff not yet elapsed");
-    assert_eq!(queue(&alice.cell).len(), 2);
-
-    alice.clock.advance(1);
-    timer_tick(&mut alice).await;
-    assert_eq!(
-        alice.relay.accepted().len(),
-        1,
-        "only the due retry is published"
-    );
+    let report = drain_and_deliver_sender_keys(
+        &alice.deps,
+        &mut alice.cell.class_c_view(),
+        ctx,
+        DistributionScope::NeverAttempted,
+    )
+    .await;
+    assert_eq!(report.sent, 1);
+    assert!(report.faults.is_empty());
     let left = queue(&alice.cell);
-    assert_eq!(left.len(), 1);
-    assert_eq!(left[0].message.as_slice(), b"never attempted");
-    assert_eq!(left[0].first_attempt_at, None);
+    assert_eq!(left.len(), 1, "the failed entry waits");
+    assert_eq!(left[0].failed_attempts, 1);
+    let accepted = alice.relay.accepted();
+    assert_eq!(accepted.len(), 1);
+
+    timer_tick(&mut alice).await;
+    assert_eq!(alice.relay.accepted().len(), 2, "the timer retries it");
+    assert!(queue(&alice.cell).is_empty());
 }
 
-/// Fails if the age cap counts from the current attempt instead of the first:
-/// the entry would then be published after `MAX_BLOB_TTL`.
+/// Fails if the age cap counts from the current attempt instead of the first
+/// (the entry would then be published after `MAX_BLOB_TTL`), or if the drop
+/// reports another attempt count than the failed attempts the entry carried.
 #[tokio::test]
 async fn spent_ttl_drops_the_entry_and_reports_failed() {
     let ctx = "sender-key-requeue-age-cap";
@@ -460,8 +540,9 @@ async fn spent_ttl_drops_the_entry_and_reports_failed() {
     );
 }
 
-/// Fails if an encrypt failure is skipped instead of reported, or keeps the
-/// entry: an oversized payload can never be sealed.
+/// Fails if an encrypt failure is skipped instead of reported, keeps the
+/// entry, or turns the re-send into an `Err`: an oversized payload can never
+/// be sealed.
 #[tokio::test]
 async fn unsealable_entry_is_dropped_and_reported() {
     let ctx = "sender-key-requeue-unsealable";
@@ -469,13 +550,18 @@ async fn unsealable_entry_is_dropped_and_reported() {
     alice.relay.down.store(false, Ordering::SeqCst);
     enqueue(
         &mut alice.cell,
+        BOB,
+        &[0x03; 33],
+        1,
         vec![0; scp_protocol::context::builder::MAX_MANAGEMENT_PAYLOAD_SIZE + 1],
     );
 
-    let result = send_queued(&mut alice, ctx).await;
-    assert!(
-        matches!(result, Err(ContextError::CryptoFailed(_))),
-        "a dropped distribution fails the explicit re-send: {result:?}"
+    let report = send_queued(&mut alice, ctx)
+        .await
+        .expect("a dropped distribution is reported, not an error");
+    assert_eq!(
+        (report.sent, report.requeued(), report.dropped()),
+        (1, 0, 1)
     );
     assert_eq!(
         alice.relay.accepted().len(),
@@ -487,50 +573,441 @@ async fn unsealable_entry_is_dropped_and_reported() {
     assert!(
         matches!(
             events.as_slice(),
-            [ContextEvent::SenderKeyDistributionFailed { reason, .. }]
+            [ContextEvent::SenderKeyDistributionFailed { reason, attempts: 0, .. }]
                 if reason.starts_with("unsealable:")
         ),
         "got {events:?}"
     );
 }
 
-/// Fails if the per-target bound is lifted (the queue grows to 18) or the
-/// displaced entries go unreported.
+/// Fails if a distribution to a target and key already queued is appended
+/// instead of replacing the queued one, or if the replacement reaches past
+/// that target and key.
 #[tokio::test]
-async fn per_target_bound_evicts_oldest_and_reports_count() {
-    let ctx = "sender-key-requeue-bound";
+async fn a_distribution_supersedes_the_one_queued_to_the_same_target_and_key() {
+    let ctx = "sender-key-requeue-supersede";
     let mut alice = alice_with_queued_distribution(ctx).await;
-    for n in 0..=MAX_PUSH_CHAINS_PER_MEMBER {
-        enqueue(&mut alice.cell, vec![u8::try_from(n).unwrap()]);
+    let pushed = queue(&alice.cell)[0].clone();
+    for n in 0..3_u8 {
+        enqueue(&mut alice.cell, BOB, &[0x03; 33], 1, vec![n]);
     }
+    enqueue(&mut alice.cell, BOB, &pushed.recipient_key, 2, vec![0xEE]);
     let left = queue(&alice.cell);
-    assert_eq!(left.len(), MAX_PUSH_CHAINS_PER_MEMBER);
-    assert_eq!(
-        left[0].message.as_slice(),
-        [1],
-        "the two oldest were displaced"
+    assert_eq!(left.len(), 2, "one entry per target and key: {left:?}");
+    let answer = left
+        .iter()
+        .find(|p| p.recipient_key == [0x03; 33])
+        .expect("the answer entry");
+    assert_eq!(answer.message.as_slice(), [2], "the latest answer stays");
+    let push = left
+        .iter()
+        .find(|p| p.recipient_key == pushed.recipient_key)
+        .expect("the push entry");
+    assert_eq!((push.epoch, push.message.as_slice()), (2, &[0xEE][..]));
+}
+
+/// Builds and signs an inner envelope from Alice in `ctx` at `epoch`.
+fn alice_inner(ctx: &str, epoch: u64) -> crate::envelope::inner::InnerEnvelope {
+    let params = crate::envelope::inner::InnerEnvelopeParams {
+        version: scp_protocol::envelope::SCP_PROTOCOL_VERSION,
+        context_id: ctx,
+        sender_did: ALICE,
+        epoch,
+        generation: 0,
+        sequence: 0,
+        timestamp: T0,
+        message_type: crate::envelope::inner::MessageType::Content,
+        payload: b"hello",
+        provenance: None,
+        signing_key_id: scp_did::SigningKeyId::Active,
+    };
+    crate::envelope::inner::sign::create_inner_envelope_raw(
+        &params,
+        &crate::crypto::mls::two_party_test_support::alice_signing_key(),
+    )
+    .expect("alice signs the inner envelope")
+}
+
+/// Spec 09 §9.16.9: H MUST NOT encrypt under epoch N while a distribution of
+/// N has no accepted publish. Fails if `seal` encrypts while the
+/// distribution is pending, or still refuses after a relay accepts it.
+#[tokio::test]
+async fn seal_refuses_the_epoch_of_a_pending_distribution() {
+    let ctx = "sender-key-requeue-seal-gate";
+    let mut alice = alice_with_queued_distribution(ctx).await;
+    let ctx_bytes = scp_protocol::context::context_id_bytes(ctx);
+    let epoch = queue(&alice.cell)[0].epoch;
+    let inner = alice_inner(ctx, epoch);
+    let seal = |cell: &mut ClassSCell| {
+        cell.class_c_view()
+            .mode_mut()
+            .crypto_mut()
+            .expect("encrypted")
+            .seal(&ctx_bytes, ALICE, &inner, 0)
+    };
+
+    let refused = seal(&mut alice.cell);
+    assert!(
+        matches!(
+            &refused,
+            Err(ContextError::SenderKeyDistributionPending { target_did, epoch: e })
+                if target_did == BOB && *e == epoch
+        ),
+        "got {refused:?}"
     );
 
-    let report = drain_and_deliver_sender_keys(
-        &alice.deps,
-        &mut alice.cell.class_c_view(),
-        ctx,
-        DistributionScope::DueRetries,
-    )
-    .await;
+    alice.relay.down.store(false, Ordering::SeqCst);
+    let report = send_queued(&mut alice, ctx).await.expect("re-send");
+    assert_eq!(report.sent, 1);
+    assert!(seal(&mut alice.cell).is_ok(), "the published epoch seals");
+}
+
+/// Fails if the removal primitive leaves a departed member's distributions
+/// queued, drops another member's, or persists the queue before the purge.
+#[tokio::test]
+async fn removing_a_member_purges_its_queue_in_the_same_persist() {
+    let ctx = "sender-key-requeue-departure";
+    let mut alice = alice_with_queued_distribution(ctx).await;
+    let other = "did:dht:z6MkOtherSenderKeyRequeueOtherSenderKeyRe1";
+    enqueue(&mut alice.cell, BOB, &[0x03; 33], 1, vec![1]);
+    enqueue(&mut alice.cell, other, &[0x04; 33], 1, vec![2]);
+    alice
+        .cell
+        .commit_class_s_keep(&alice.deps, ctx, |mut v| {
+            v.rest_mut().remove_member_sender_key(BOB)
+        })
+        .await
+        .expect("the removal persists");
+    let left = queue(&alice.cell);
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].target_did, other);
+    let persisted = alice.store.queue(ctx);
+    assert_eq!(persisted.len(), 1, "the persist carries the purge");
+    assert_eq!(persisted[0].target_did, other);
+}
+
+/// Fails if a member with no wrapping key is skipped in silence, or if the
+/// missing key fails the distribution and with it the operation.
+#[tokio::test]
+async fn a_member_with_no_wrapping_key_is_reported_not_built() {
+    let ctx = "sender-key-requeue-not-built";
+    let mut alice = alice_with_queued_distribution(ctx).await;
+    let carol = "did:dht:z6MkCarolSenderKeyRequeueCarolSenderKeyRe1";
+    let tx = alice.deps.event_tx.clone();
+    let mut state = alice.cell.into_inner();
+    state
+        .distribute_sender_key(ALICE, carol, tx.as_ref())
+        .expect("no wrapping key is not an error");
+    assert_eq!(queue(&state).len(), 1, "nothing queued for Carol");
+    let events = channel_events(&mut alice.events);
     assert!(
-        report
-            .faults
-            .iter()
-            .any(|f| matches!(f, DistributionFault::Evicted { displaced: 2, .. })),
-        "got {:?}",
-        report.faults
+        matches!(
+            events.as_slice(),
+            [ContextEvent::SenderKeyDistributionFailed { target_did, reason, attempts: 0 }]
+                if target_did.0 == carol && reason.starts_with("not built:")
+        ),
+        "got {events:?}"
     );
-    assert!(
-        distribution_events(&mut alice.cell).iter().any(|e| matches!(
-            e,
-            ContextEvent::SenderKeyDistributionFailed { reason, .. } if reason.starts_with("evicted:")
-        )),
-        "the eviction is reported by event"
-    );
+}
+
+// ---------------------------------------------------------------------------
+// The six operations, through the Supervisor, with the relay down.
+// ---------------------------------------------------------------------------
+
+mod operations {
+    use super::{EventRx, Relay, RelayTransport, SharedStore, Store, channel_events};
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    use ed25519_dalek::SigningKey;
+    use scp_did::DID;
+    use scp_protocol::context::governance::{AccessScope, GovernanceAction};
+    use scp_protocol::context::membership::{ContextEvent, KeyPackage};
+    use scp_protocol::context::roles::Capability;
+    use scp_protocol::context::{ContextMode, ContextParams};
+
+    use crate::context::ContextHandle;
+    use crate::context::actor::CommandSigner;
+    use crate::context::builder::NotConfiguredTransportProvider;
+    use crate::context::providers::event_log::MerkleEventLogProvider;
+    use crate::context::supervisor::supervisor::Supervisor;
+    use crate::crypto::mls::provider::NodeMlsFactory;
+
+    const ALICE: &str = "did:dht:z6MkAliceSenderKeyOpsAliceSenderKeyOpsAli1";
+    const BOB: &str = "did:dht:z6MkBobSenderKeyOpsBobSenderKeyOpsBobSend1";
+    const CAROL: &str = "did:dht:z6MkCarolSenderKeyOpsCarolSenderKeyOpsCa1";
+
+    fn key(did: &str) -> SigningKey {
+        let seed = match did {
+            ALICE => 0xA7,
+            BOB => 0xB7,
+            _ => 0xC7,
+        };
+        SigningKey::from_bytes(&[seed; 32])
+    }
+
+    fn signer(did: &str) -> CommandSigner {
+        CommandSigner::local_ed25519(key(did))
+    }
+
+    fn resolver() -> scp_protocol::context::governance::KeyResolver {
+        crate::crypto::mls::test_support::role_resolver(
+            &[ALICE, BOB, CAROL].map(|d| (DID::from(d), key(d))),
+        )
+    }
+
+    fn mls_storage() -> Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> {
+        Arc::new(
+            crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
+                scp_platform::in_memory::InMemoryStorage::new(),
+            )),
+        )
+    }
+
+    fn params() -> ContextParams {
+        ContextParams {
+            mode: ContextMode::Encrypted,
+            ceiling: vec![
+                Capability::MessagesRead,
+                Capability::MessagesWrite,
+                Capability::RoleAssign,
+                Capability::MemberInvite,
+                Capability::MemberRemove,
+                Capability::MemberBan,
+                Capability::GovernancePropose,
+                Capability::GovernanceVote,
+                Capability::ContextClose,
+            ],
+            ..ContextParams::default()
+        }
+    }
+
+    /// Alice's node with a relay, a snapshot store and an event channel, and
+    /// the context she created.
+    struct Node {
+        sup: Arc<Supervisor>,
+        relay: Arc<Relay>,
+        store: Arc<Store>,
+        events: EventRx,
+        handle: ContextHandle,
+        ctx: String,
+    }
+
+    async fn alice_node(seed: u8) -> Node {
+        let relay = Arc::new(Relay::default());
+        let store = Arc::new(Store::default());
+        let (event_tx, events) = tokio::sync::broadcast::channel(256);
+        let crypto = Arc::new(NodeMlsFactory::new(
+            ALICE.to_owned(),
+            Arc::new(scp_clock::SystemClock),
+        ));
+        let sup = Supervisor::with_providers(
+            crypto,
+            Box::new(RelayTransport(Arc::clone(&relay))),
+            Box::new(MerkleEventLogProvider::new()),
+            resolver(),
+            Some(Box::new(SharedStore(Arc::clone(&store)))),
+            None,
+            Some(event_tx),
+            None,
+            mls_storage(),
+        );
+        let ctx = format!("{seed:02x}").repeat(32);
+        let handle = sup
+            .create_context(
+                ctx.clone(),
+                params(),
+                DID::from(ALICE),
+                Some([0x5a; 32]),
+                Vec::new(),
+            )
+            .await
+            .expect("alice creates the context");
+        Node {
+            sup,
+            relay,
+            store,
+            events,
+            handle,
+            ctx,
+        }
+    }
+
+    /// A fresh `KeyPackage` of `did`, reserved from `did`'s own node.
+    async fn key_package(did: &str) -> Vec<u8> {
+        let sup = Supervisor::with_providers(
+            Arc::new(NodeMlsFactory::new(
+                did.to_owned(),
+                Arc::new(scp_clock::SystemClock),
+            )),
+            Box::new(NotConfiguredTransportProvider),
+            Box::new(MerkleEventLogProvider::new()),
+            resolver(),
+            None,
+            None,
+            None,
+            None,
+            mls_storage(),
+        );
+        let (_reservation, kp) = sup
+            .reserve_key_package(DID::from(did), &signer(did))
+            .await
+            .expect("reserve a key package");
+        kp
+    }
+
+    async fn invite(node: &Node, did: &str) {
+        node.sup
+            .invite_member(
+                node.ctx.clone(),
+                DID::from(ALICE),
+                DID::from(did),
+                key_package(did).await,
+                &signer(ALICE),
+            )
+            .await
+            .expect("alice adds the member");
+    }
+
+    /// Alice's node with Bob and Carol added while the relay was up, every
+    /// distribution delivered, the relay then down and the channel drained.
+    async fn trio(seed: u8) -> Node {
+        let mut node = alice_node(seed).await;
+        invite(&node, BOB).await;
+        invite(&node, CAROL).await;
+        assert!(
+            node.store.queue(&node.ctx).is_empty(),
+            "every distribution was delivered while the relay was up"
+        );
+        node.relay.down.store(true, Ordering::SeqCst);
+        let _ = channel_events(&mut node.events);
+        node
+    }
+
+    /// The operation queued a distribution to `target`, the persisted
+    /// snapshot holds it, and the event channel reports it pending.
+    fn assert_pending_to(node: &mut Node, target: &str) {
+        let persisted = node.store.queue(&node.ctx);
+        assert!(
+            persisted.iter().any(|p| p.target_did == target),
+            "the persisted queue holds the distribution to {target}: {persisted:?}"
+        );
+        let events = channel_events(&mut node.events);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                ContextEvent::SenderKeyDistributionPending { target_did, .. } if target_did.0 == target
+            )),
+            "the channel reports the distribution to {target} pending: {events:?}"
+        );
+    }
+
+    async fn govern(node: &Node, action: GovernanceAction) {
+        let outcome = node
+            .sup
+            .propose_governance_action_checked(&node.ctx, &DID::from(ALICE), action, &signer(ALICE))
+            .await
+            .expect("the proposal executes");
+        assert!(outcome.execution_result.is_some(), "auto-executed");
+    }
+
+    /// Fails if a failed publish after a governance Add fails the Add, or
+    /// the distribution is not persisted or not reported.
+    #[tokio::test]
+    async fn add_with_the_relay_down() {
+        let mut node = alice_node(0x31).await;
+        node.relay.down.store(true, Ordering::SeqCst);
+        invite(&node, BOB).await;
+        assert_pending_to(&mut node, BOB);
+    }
+
+    /// Fails if a failed publish after a join fails the join, or the
+    /// distribution is not persisted or not reported.
+    #[tokio::test]
+    async fn join_with_the_relay_down() {
+        let mut node = alice_node(0x32).await;
+        node.relay.down.store(true, Ordering::SeqCst);
+        let kp = KeyPackage::new(DID::from(CAROL), key_package(CAROL).await);
+        node.sup
+            .join_context(&node.handle, kp, None, None)
+            .await
+            .expect("the join returns Ok");
+        assert_pending_to(&mut node, CAROL);
+    }
+
+    /// Fails if a failed publish after the leave's rotation fails the leave,
+    /// or the rotation's distribution is not persisted or not reported.
+    #[tokio::test]
+    async fn leave_with_the_relay_down() {
+        let mut node = trio(0x33).await;
+        node.sup
+            .leave_context(&node.handle, &DID::from(ALICE), &DID::from(BOB))
+            .await
+            .expect("the leave returns Ok");
+        assert_pending_to(&mut node, CAROL);
+    }
+
+    /// Fails if a failed publish after the Remove's rotation fails the
+    /// Remove, or the distribution is not persisted or not reported.
+    #[tokio::test]
+    async fn remove_with_the_relay_down() {
+        let mut node = trio(0x34).await;
+        govern(
+            &node,
+            GovernanceAction::RemoveMember {
+                did: DID::from(BOB),
+                reason: None,
+            },
+        )
+        .await;
+        assert_pending_to(&mut node, CAROL);
+    }
+
+    /// Fails if a failed publish after the write revoke's rotation fails the
+    /// revoke, or the distribution is not persisted or not reported.
+    #[tokio::test]
+    async fn write_revoke_with_the_relay_down() {
+        let mut node = trio(0x35).await;
+        govern(
+            &node,
+            GovernanceAction::RevokeAccess {
+                did: DID::from(BOB),
+                access: AccessScope::Write,
+            },
+        )
+        .await;
+        assert_pending_to(&mut node, CAROL);
+    }
+
+    /// Fails if a failed publish after the reset's rotation fails the reset,
+    /// or the distribution is not persisted or not reported.
+    #[tokio::test]
+    async fn reset_with_the_relay_down() {
+        let mut node = trio(0x36).await;
+        let kp = key_package(BOB).await;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        node.sup
+            .dispatch_governance_command(
+                crate::context::actor::commands::GovernanceCommand::ProposeGovernanceActionChecked {
+                    payload: Box::new(
+                        crate::context::actor::commands::ProposeGovernanceActionPayload {
+                            context_id: node.ctx.clone(),
+                            proposer_did: DID::from(ALICE),
+                            action: GovernanceAction::ResetMember {
+                                did: DID::from(BOB),
+                                reason: "test".to_owned(),
+                            },
+                            signer: signer(ALICE),
+                            key_package: Some(kp),
+                        },
+                    ),
+                    reply: tx,
+                },
+            )
+            .await
+            .expect("dispatch the reset");
+        let outcome = rx.await.expect("reply").expect("the reset executes");
+        assert!(outcome.execution_result.is_some(), "auto-executed");
+        assert_pending_to(&mut node, CAROL);
+    }
 }

@@ -275,10 +275,12 @@ pub enum MessagingCommand {
     SendQueuedSenderKeys {
         /// Context identifier.
         context_id: String,
-        /// Oneshot reply channel. `Ok(())` once a relay accepted every queued
-        /// distribution; an error when one stays queued or was dropped (spec 09
-        /// §9.16.9 "A distribution whose publish fails").
-        reply: oneshot::Sender<Result<(), ContextError>>,
+        /// Oneshot reply channel: the report of the publish pass, whose
+        /// faults name each distribution that stays queued or was dropped
+        /// (spec 09 §9.16.9 "A distribution whose publish fails"). An error
+        /// only when the pass exceeds its budget.
+        reply:
+            oneshot::Sender<Result<crate::context::actor::state::DistributionReport, ContextError>>,
     },
 
     /// The number of sender-key answers queued on the actor (testing).

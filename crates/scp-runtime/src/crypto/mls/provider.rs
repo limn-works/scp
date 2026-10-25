@@ -236,14 +236,21 @@ impl std::fmt::Debug for MlsCryptoSnapshot {
 /// A sender-key distribution queued for publish, with its attempt record
 /// (spec 09 §9.16.9 "A distribution whose publish fails").
 ///
-/// The holder keeps the entry until a relay accepts a publish of it, or until
-/// no TTL remains under the republish rule (§9.10.2): `MAX_BLOB_TTL` after
-/// [`Self::first_attempt_at`]. Each attempt MLS-seals [`Self::message`] into
-/// the group's epoch at the time of the attempt.
+/// The holder keeps the entry until a relay accepts a publish of it, a newer
+/// distribution to the same [`Self::target_did`] and [`Self::recipient_key`]
+/// replaces it, its target leaves, or no TTL remains under the republish rule
+/// (§9.10.2): `MAX_BLOB_TTL` after [`Self::first_attempt_at`]. Each attempt
+/// MLS-seals [`Self::message`] into the group's epoch at the time of the
+/// attempt.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct PendingDistribution {
     /// The member the distribution carries a sender key to.
     pub target_did: String,
+    /// The public key the sender key is HPKE-sealed to: the target's
+    /// wrapping key for a push, the request's ephemeral key for an answer.
+    pub recipient_key: Vec<u8>,
+    /// The sender-key epoch the distribution carries.
+    pub epoch: u64,
     /// The serialized `SenderKeyDistributionMessage`. Its key is HPKE-sealed
     /// to the target; the buffer still wipes on drop because it is key
     /// transport material.
@@ -252,20 +259,25 @@ pub struct PendingDistribution {
     pub first_attempt_at: Option<u64>,
     /// Publish attempts that failed so far.
     pub failed_attempts: u32,
-    /// Unix seconds before which a timer retry skips the entry.
-    pub next_attempt_at: u64,
 }
 
 impl PendingDistribution {
-    /// A distribution queued for `target_did` that no attempt has published.
+    /// A distribution of `epoch` to `target_did`, sealed to `recipient_key`,
+    /// that no attempt has published.
     #[must_use]
-    pub fn queued(target_did: String, message: Vec<u8>) -> Self {
+    pub fn queued(
+        target_did: String,
+        recipient_key: Vec<u8>,
+        epoch: u64,
+        message: Vec<u8>,
+    ) -> Self {
         Self {
             target_did,
+            recipient_key,
+            epoch,
             message: Zeroizing::new(message),
             first_attempt_at: None,
             failed_attempts: 0,
-            next_attempt_at: 0,
         }
     }
 }
@@ -276,10 +288,11 @@ impl std::fmt::Debug for PendingDistribution {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PendingDistribution")
             .field("target_did", &self.target_did)
+            .field("recipient_key", &hex::encode(&self.recipient_key))
+            .field("epoch", &self.epoch)
             .field("message", &format_args!("[{} bytes]", self.message.len()))
             .field("first_attempt_at", &self.first_attempt_at)
             .field("failed_attempts", &self.failed_attempts)
-            .field("next_attempt_at", &self.next_attempt_at)
             .finish()
     }
 }
@@ -1356,7 +1369,7 @@ mod tests {
         let epoch_before = actor.local_sender_key_epoch();
 
         // A normal rotation persists a fresh key and advances the epoch by one.
-        actor.rotate_sender_key(TEST_DID).unwrap();
+        actor.rotate_sender_key(TEST_DID, None).unwrap();
         assert_eq!(
             actor.local_sender_key_epoch(),
             epoch_before + 1,

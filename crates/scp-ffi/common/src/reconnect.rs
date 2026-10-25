@@ -921,6 +921,19 @@ pub struct ContextReconnectResult {
     /// failed (ADR-029 Implementation). `None` for a classified context,
     /// whose `outcome` carries the result.
     pub failure_code: Option<String>,
+    /// Sender-key distributions a relay accepted in the re-send after a
+    /// successful sync ([`Supervisor::send_queued_sender_keys`]).
+    pub sender_keys_sent: u64,
+    /// Sender-key distributions whose re-send failed and that stay queued
+    /// for the governance timer or the next reconnection (spec 09 §9.16.9).
+    pub sender_keys_pending: u64,
+    /// Sender-key distributions the re-send dropped undelivered: MLS could
+    /// not seal one, or no TTL remained (spec 09 §9.16.9 step 3).
+    pub sender_keys_dropped: u64,
+    /// Why the re-send itself did not complete (its budget elapsed, or the
+    /// actor could not be reached), or `None` when it completed or was not
+    /// run. The sync `outcome` does not depend on it.
+    pub sender_key_send_error: Option<String>,
 }
 
 /// Flat, FFI-friendly reconnection report. Aggregates per-context results
@@ -984,10 +997,12 @@ fn outcome_str(outcome: &scp_protocol::sync::SyncOutcome) -> (String, bool) {
 ///   (admin-side re-add + Welcome processing through the actor).
 ///
 /// After a reconnection that reached `FullyCaughtUp`, `FastForwarded` or
-/// `Reset`, the actor sends every sender-key answer it holds queued
+/// `Reset`, the actor sends every sender-key distribution it holds queued
 /// ([`Supervisor::send_queued_sender_keys`]), including the answers a push-wake
-/// pull left queued (ADR-029 §2 push-wake pull mode step 5); a failed send
-/// makes the outcome `Failed`. On a terminal-success outcome the context's
+/// pull left queued (ADR-029 §2 push-wake pull mode step 5). The send's report
+/// fills the result's `sender_keys_*` fields and never changes the sync
+/// outcome or the contact record, which come from the sync alone (spec 09
+/// §9.16.9). On a terminal-success outcome the context's
 /// `needs_reconnect` flag is cleared via [`Supervisor::clear_needs_reconnect`]. After per-context
 /// execution, the optional `drain` callback is invoked once per context to
 /// drain the bridge-owned outbound queue (Phase 6) — the queue lives in
@@ -1053,16 +1068,13 @@ where
         // runs Tier 1); drive their engines here so all three tiers are
         // reachable from `context_reconnect`.
         let (outcome, epochs, events, mls_update, equivocations) = match tier {
-            OfflineTier::Short => {
-                let equivocations = ctx_result.sync_events.len() as u64;
-                (
-                    ctx_result.outcome,
-                    ctx_result.epochs_caught_up,
-                    ctx_result.events_recovered,
-                    ctx_result.mls_update_issued,
-                    equivocations,
-                )
-            }
+            OfflineTier::Short => (
+                ctx_result.outcome,
+                ctx_result.epochs_caught_up,
+                ctx_result.events_recovered,
+                ctx_result.mls_update_issued,
+                ctx_result.sync_events.len() as u64,
+            ),
             OfflineTier::Extended | OfflineTier::Long => {
                 let driver = RelayActorSyncDriver::new(
                     transport,
@@ -1081,8 +1093,8 @@ where
             }
         };
 
-        let outcome = send_queued_answers(supervisor, &context_id, outcome).await;
         let (outcome_string, terminal_success) = outcome_str(&outcome);
+        let sender_keys = send_queued_answers(supervisor, &context_id, &outcome).await;
 
         let (needs_reconnect_cleared, relay_contact_error) = clear_and_record_contact(
             supervisor,
@@ -1113,6 +1125,10 @@ where
             envelopes_delivered,
             relay_contact_error,
             failure_code: None,
+            sender_keys_sent: sender_keys.sent,
+            sender_keys_pending: sender_keys.pending,
+            sender_keys_dropped: sender_keys.dropped,
+            sender_key_send_error: sender_keys.error,
         });
     }
 
@@ -1160,29 +1176,60 @@ fn unclassified_result(context_id: String, code: &'static str) -> ContextReconne
         envelopes_delivered: 0,
         relay_contact_error: None,
         failure_code: Some(code.to_owned()),
+        sender_keys_sent: 0,
+        sender_keys_pending: 0,
+        sender_keys_dropped: 0,
+        sender_key_send_error: None,
     }
 }
 
-/// Sends the sender-key answers queued on the actor of `context_id` after a
-/// reconnection whose `outcome` is `FullyCaughtUp`, `FastForwarded` or `Reset`,
-/// and returns the outcome, made `Failed` when the send fails. Any other
-/// outcome is returned unchanged with nothing sent.
+/// Whether a sync `outcome` re-sends the queued sender-key distributions:
+/// `FullyCaughtUp`, `FastForwarded` and `Reset` do; `Pending`, `ContextGone`
+/// and `Failed` do not.
+const fn terminal_success_sync(outcome: &scp_protocol::sync::SyncOutcome) -> bool {
+    use scp_protocol::sync::SyncOutcome;
+    match outcome {
+        SyncOutcome::FullyCaughtUp | SyncOutcome::FastForwarded { .. } | SyncOutcome::Reset => true,
+        SyncOutcome::Pending | SyncOutcome::ContextGone | SyncOutcome::Failed { .. } => false,
+    }
+}
+
+/// The re-send of a context's queued sender-key distributions after its
+/// sync, as the reconnection result reports it.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SenderKeyResend {
+    sent: u64,
+    pending: u64,
+    dropped: u64,
+    error: Option<String>,
+}
+
+/// Sends every sender-key distribution queued on the actor of `context_id`
+/// when its sync `outcome` is a terminal success, and returns what the send's
+/// [`DistributionReport`] counted; any other outcome sends nothing. A
+/// distribution that stays queued or was dropped is a count, never an error;
+/// `error` holds only a send that did not complete (spec 09 §9.16.9).
+///
+/// [`DistributionReport`]: scp_runtime::context::actor::state::DistributionReport
 async fn send_queued_answers(
     supervisor: &Supervisor,
     context_id: &str,
-    outcome: scp_protocol::sync::SyncOutcome,
-) -> scp_protocol::sync::SyncOutcome {
-    use scp_protocol::sync::SyncOutcome;
-    match outcome {
-        SyncOutcome::FullyCaughtUp | SyncOutcome::FastForwarded { .. } | SyncOutcome::Reset => {
-            match supervisor.send_queued_sender_keys(context_id).await {
-                Ok(()) => outcome,
-                Err(e) => SyncOutcome::Failed {
-                    reason: format!("sending queued sender-key answers failed: {e}"),
-                },
-            }
-        }
-        SyncOutcome::Pending | SyncOutcome::ContextGone | SyncOutcome::Failed { .. } => outcome,
+    outcome: &scp_protocol::sync::SyncOutcome,
+) -> SenderKeyResend {
+    if !terminal_success_sync(outcome) {
+        return SenderKeyResend::default();
+    }
+    match supervisor.send_queued_sender_keys(context_id).await {
+        Ok(report) => SenderKeyResend {
+            sent: u64::try_from(report.sent).unwrap_or(u64::MAX),
+            pending: u64::try_from(report.requeued()).unwrap_or(u64::MAX),
+            dropped: u64::try_from(report.dropped()).unwrap_or(u64::MAX),
+            error: None,
+        },
+        Err(e) => SenderKeyResend {
+            error: Some(e.to_string()),
+            ..SenderKeyResend::default()
+        },
     }
 }
 
@@ -1467,6 +1514,7 @@ pub const fn delivery_reached_verdict(error: &ContextError) -> bool {
         | ContextError::ContextNotRegistered(_)
         | ContextError::RateLimited { .. }
         | ContextError::CommitBroadcastFault { .. }
+        | ContextError::SenderKeyDistributionPending { .. }
         | ContextError::ActorBusy(_)
         | ContextError::NotImplemented(_)
         | ContextError::NotInitialized(_)
@@ -1907,5 +1955,48 @@ mod tests {
             matches!(&err, Err(StoreError::SerializationFailed(m)) if m == "injected write failure"),
             "{err:?}"
         );
+    }
+
+    /// Spec 09 §9.16.9: only a sync that left a live, caught-up actor
+    /// re-sends the queued sender-key distributions. Fails if a pending,
+    /// gone or failed sync re-sends, or a caught-up one does not.
+    #[test]
+    fn only_a_terminal_success_with_a_live_actor_resends_sender_keys() {
+        use scp_protocol::sync::SyncOutcome;
+        for (outcome, resends) in [
+            (SyncOutcome::FullyCaughtUp, true),
+            (SyncOutcome::FastForwarded { skipped_epochs: 2 }, true),
+            (SyncOutcome::Reset, true),
+            (SyncOutcome::Pending, false),
+            (SyncOutcome::ContextGone, false),
+            (
+                SyncOutcome::Failed {
+                    reason: "x".to_owned(),
+                },
+                false,
+            ),
+        ] {
+            assert_eq!(terminal_success_sync(&outcome), resends, "{outcome:?}");
+        }
+    }
+
+    /// A re-send that cannot reach the context's actor is reported in the
+    /// result's own error field with zero counts; it is not dropped and does
+    /// not touch the sync outcome. Fails if the error is swallowed.
+    #[tokio::test]
+    async fn a_resend_that_cannot_run_reports_its_error() {
+        let supervisor = crate::bridge_instance::tests::test_supervisor();
+        let ctx = "ab".repeat(32);
+        let caught_up = scp_protocol::sync::SyncOutcome::FullyCaughtUp;
+        let resend = send_queued_answers(&supervisor, &ctx, &caught_up).await;
+        assert_eq!((resend.sent, resend.pending, resend.dropped), (0, 0, 0));
+        assert!(resend.error.is_some(), "{resend:?}");
+        // A sync that is not a terminal success sends nothing, so it reports
+        // no error even though the actor is absent.
+        let failed = scp_protocol::sync::SyncOutcome::Failed {
+            reason: "x".to_owned(),
+        };
+        let skipped = send_queued_answers(&supervisor, &ctx, &failed).await;
+        assert_eq!(skipped, SenderKeyResend::default());
     }
 }

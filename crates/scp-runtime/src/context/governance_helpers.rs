@@ -1079,7 +1079,7 @@ pub async fn execute_revoke(
         match cell
             .commit_class_s_keep(deps, context_id, |mut v| {
                 let s = v.rest_mut();
-                s.rotate_sender_key(&local_did)?;
+                s.rotate_sender_key(&local_did, deps.event_tx.as_ref())?;
                 Ok(s.local_sender_key_epoch())
             })
             .await
@@ -1107,7 +1107,7 @@ pub async fn execute_revoke(
             deps,
             &mut cell.class_c_view(),
             context_id,
-            crate::context::lifecycle_helpers::DistributionScope::All,
+            crate::context::lifecycle_helpers::DistributionScope::NeverAttempted,
         )
         .await;
     }
@@ -1343,61 +1343,26 @@ pub async fn execute_add_member(
     // matching the prior provider disposition; the error propagates unchanged.
     let add_output = cell
         .commit_class_s_keep(deps, context_id, |mut v| {
-            let state = v.rest_mut();
-            let output = state
-                .add_member(did.as_ref(), key_package, deps.clock.as_ref())
-                .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
-            // §9.10.4.1 membership trigger, persisted with the add.
-            crate::context::actor::pseudonym_rotation::note_member_added(
-                state,
-                deps.crypto.local_did(),
+            crate::context::lifecycle_helpers::add_member_and_queue_distribution(
+                v.rest_mut(),
+                deps,
                 did.as_ref(),
-            );
-            Ok(output)
+                key_package,
+            )
+            .map_err(|e| ContextError::MembershipFailed(e.to_string()))
         })
         .await?;
 
     // Clone the Welcome + Commit for the return value (the invitation-sealing
     // caller needs the Welcome to seal the bundle; the Commit is surfaced for
     // observability) and for the existing-member broadcast below, BEFORE the
-    // originals are moved into the `WelcomeGenerated` emit.
+    // originals are moved into the `WelcomeGenerated` emit. The add queued the
+    // inviter's CURRENT sender key for the new member in the same Class-S step
+    // (the helper the join shares, spec 09 §9.16.2, §9.16.9); the publish pass
+    // below delivers it.
     let welcome_bytes_out = add_output.welcome_bytes.clone();
     let commit_bytes_out = add_output.commit_bytes.clone();
     let commit_for_broadcast = add_output.commit_bytes.clone();
-
-    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001) — join-time sender-key PUSH. Enqueue the
-    // inviter's CURRENT sender key for the newly-added member, mirroring the
-    // `join_context` add path (`lifecycle_helpers`, §9.16.2). The deleted provider
-    // `distribute_sender_key` used to do this on the invitation path; here we run
-    // its actor replacement on the actor-OWNED crypto: `distribute_sender_key`
-    // HPKE-seals the local sender key to the member's wrapping pubkey (extracted
-    // from the just-added KeyPackage's 0xFF01 leaf) and queues it onto
-    // `pending_distributions`; the async `drain_and_deliver_sender_keys` below
-    // MLS-wraps + delivers it over the management channel. Class-S — the enqueue
-    // touches the same actor crypto the add advanced, reached only through
-    // `rest_mut()` inside `commit_class_s_keep` (parity with the join add path).
-    // A failure to build the distribution does not undo the add: it is reported
-    // as `SenderKeyDistributionFailed` by the publish pass below, and the new
-    // member recovers the key by a `SenderKeyRequest` (spec 09 §9.16.2,
-    // §9.16.9). Gated on a non-empty Welcome so the
-    // `cfg(test)`/`testing` no-crypto pipeline (empty `AddMemberOutput`, no MLS
-    // group) skips it exactly as the broadcast + `WelcomeGenerated` emit below do.
-    let local_did = deps.crypto.local_did().to_owned();
-    if !welcome_bytes_out.is_empty()
-        && let Err(e) = cell
-            .commit_class_s_keep(deps, context_id, |mut v| {
-                v.rest_mut().distribute_sender_key(&local_did, did.as_ref())
-            })
-            .await
-        && let Some(crypto) = cell.class_c_view().mode_mut().crypto_mut()
-    {
-        crypto
-            .undelivered
-            .push(crate::context::actor::state::DistributionFault::NotBuilt {
-                target_did: did.to_string(),
-                reason: e.to_string(),
-            });
-    }
 
     // The fallible role assignment + structural member insert run through the
     // field-granular Class-C role view (ADR-049 §9): `system_assign_role` mints +
@@ -1511,7 +1476,7 @@ pub async fn execute_add_member(
             deps,
             &mut cell.class_c_view(),
             context_id,
-            crate::context::lifecycle_helpers::DistributionScope::All,
+            crate::context::lifecycle_helpers::DistributionScope::NeverAttempted,
         )
         .await;
     }
@@ -1613,7 +1578,8 @@ pub async fn execute_remove_member(
             deps.supervisor
                 .remove_member_floors(&context_id_bytes, did.as_ref());
 
-            if let Err(e) = state.rotate_sender_key(deps.crypto.local_did()) {
+            if let Err(e) = state.rotate_sender_key(deps.crypto.local_did(), deps.event_tx.as_ref())
+            {
                 return fail_close_remove_member(
                     state,
                     deps,
@@ -1696,7 +1662,7 @@ pub async fn execute_remove_member(
             deps,
             &mut cell.class_c_view(),
             context_id,
-            crate::context::lifecycle_helpers::DistributionScope::All,
+            crate::context::lifecycle_helpers::DistributionScope::NeverAttempted,
         )
         .await;
     }
@@ -2878,7 +2844,7 @@ pub async fn execute_reset_member(
     match cell
         .commit_class_s_keep(deps, context_id, |mut v| {
             let s = v.rest_mut();
-            s.rotate_sender_key(&local_did)?;
+            s.rotate_sender_key(&local_did, deps.event_tx.as_ref())?;
             Ok(s.local_sender_key_epoch())
         })
         .await
@@ -2911,7 +2877,7 @@ pub async fn execute_reset_member(
             deps,
             &mut cell.class_c_view(),
             context_id,
-            crate::context::lifecycle_helpers::DistributionScope::All,
+            crate::context::lifecycle_helpers::DistributionScope::NeverAttempted,
         )
         .await;
     }
