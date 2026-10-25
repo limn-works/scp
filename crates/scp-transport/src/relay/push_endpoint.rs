@@ -201,6 +201,10 @@ impl OwnAddressSet {
     /// The set of `addresses`, each held in its canonical form, so an
     /// IPv4-mapped IPv6 address matches the IPv4 address it embeds.
     pub fn new(addresses: impl IntoIterator<Item = IpAddr>) -> Self {
+        // A test lands a concurrent clear here, the point between a read of
+        // the handle and the write of a set built from it.
+        #[cfg(test)]
+        tests::run_set_build_hook();
         let mut held: Vec<IpAddr> = addresses.into_iter().map(|ip| ip.to_canonical()).collect();
         held.sort_unstable();
         held.dedup();
@@ -276,6 +280,16 @@ impl OwnAddresses {
     /// Replaces the set every clone reads; `None` marks it unresolved.
     pub(crate) fn replace(&self, set: Option<OwnAddressSet>) {
         *self.0.write().unwrap_or_else(PoisonError::into_inner) = set;
+    }
+
+    /// Adds `ip` to a known set under one write lock, and leaves an
+    /// unresolved handle unresolved. A set the tracker marked unresolved
+    /// between a read and a write is therefore never restored.
+    fn add_if_known(&self, ip: IpAddr) {
+        let mut held = self.0.write().unwrap_or_else(PoisonError::into_inner);
+        if let Some(known) = held.as_ref() {
+            *held = Some(OwnAddressSet::new(known.0.iter().copied().chain([ip])));
+        }
     }
 
     fn downgrade(&self) -> Weak<RwLock<Option<OwnAddressSet>>> {
@@ -1244,12 +1258,10 @@ impl OwnAddressTracker {
         }
         binds.push(ip);
         // The lock is held until the set holds `ip`, so an install that
-        // read the binds before the push cannot land after it.
-        if let Some(known) = self.own.known() {
-            self.own.replace(Some(OwnAddressSet::new(
-                known.0.iter().copied().chain([ip]),
-            )));
-        }
+        // read the binds before the push cannot land after it. The set is
+        // read and written under its own single write lock, so a set the
+        // refresh task marked unresolved stays unresolved.
+        self.own.add_if_known(ip);
         drop(binds);
     }
 }
@@ -1455,6 +1467,7 @@ async fn resolve_own(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::collections::HashMap;
     use std::str::FromStr;
 
@@ -1783,6 +1796,100 @@ mod tests {
             Err(EndpointError::Refused(AddressRefusal::OwnAddress))
         );
         assert_eq!(own.known().map(|s| s.len()), Some(2));
+        Ok(())
+    }
+
+    thread_local! {
+        /// A one-shot hook `OwnAddressSet::new` runs on this thread.
+        static SET_BUILD_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
+    /// Runs and disarms this thread's set-build hook, if one is armed.
+    pub(super) fn run_set_build_hook() {
+        let hook = SET_BUILD_HOOK.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// What a clear attempted while `add_bind` built the new set found.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ClearAttempt {
+        /// The handle's lock was free, so the clear landed between
+        /// `add_bind`'s read and its write.
+        Landed,
+        /// `add_bind` held the handle's write lock, so no clear could land.
+        LockHeld,
+    }
+
+    /// The tracker's clear of the set (a URL change or a failed
+    /// resolution) cannot land between `add_bind`'s read of the set and its
+    /// write: the new set is built while the write lock is held. The hook
+    /// tries the clear at that exact point, so a read-then-write `add_bind`
+    /// lets it land and then restores the cleared set, and this test fails.
+    #[tokio::test(start_paused = true)]
+    async fn a_clear_cannot_land_inside_add_bind() -> TestResult {
+        let (eight, nine) = (ip("8.8.8.8")?, ip("9.9.9.9")?);
+        let (lookup, _answers) = fixed(&[("a.example", &[eight])]);
+        let urls = LiveRelayUrl::new(relay_url("wss://a.example/scp/v1")?);
+        let own = OwnAddresses::unresolved();
+        let tracker = track_with(&own, &urls, &[], lookup, OWN_ADDRESS_REFRESH).await?;
+        settle(&own, |set| set.is_some()).await?;
+
+        let attempt = std::rc::Rc::new(std::cell::Cell::new(None));
+        let (clearer, seen) = (own.clone(), attempt.clone());
+        SET_BUILD_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                let landed = clearer.0.try_write().map(|mut held| *held = None);
+                seen.set(Some(
+                    landed.map_or(ClearAttempt::LockHeld, |()| ClearAttempt::Landed),
+                ));
+            }));
+        });
+        tracker.add_bind("9.9.9.9:8443".parse()?);
+
+        assert_eq!(attempt.get(), Some(ClearAttempt::LockHeld));
+        assert!(
+            own.known()
+                .is_some_and(|s| s.contains(nine) && s.contains(eight)),
+            "{own:?}"
+        );
+        Ok(())
+    }
+
+    /// A bind noted while the set is unresolved leaves it unresolved, so
+    /// the bind never restores a set the refresh task cleared; the next
+    /// install holds the bind. `add_if_known` reads and writes under one
+    /// lock, so a clear between `add_bind`'s read and its write cannot be
+    /// undone either.
+    #[tokio::test(start_paused = true)]
+    async fn bind_while_unresolved_keeps_the_set_unresolved() -> TestResult {
+        let nine = ip("9.9.9.9")?;
+        let unresolved = OwnAddresses::unresolved();
+        unresolved.add_if_known(nine);
+        assert!(unresolved.known().is_none());
+
+        let known = OwnAddresses::new([ip("8.8.8.8")?]);
+        known.add_if_known(nine);
+        assert!(
+            known
+                .known()
+                .is_some_and(|s| s.len() == 2 && s.contains(nine))
+        );
+
+        let (lookup, _answers) = fixed(&[("a.example", &[ip("8.8.8.8")?])]);
+        let urls = LiveRelayUrl::new(relay_url("wss://a.example/scp/v1")?);
+        let own = OwnAddresses::unresolved();
+        let tracker = track_with(&own, &urls, &[], lookup, OWN_ADDRESS_REFRESH).await?;
+        // The refresh task marks the set unresolved, as on a URL change.
+        own.replace(None);
+        tracker.add_bind("9.9.9.9:8443".parse()?);
+        assert!(own.known().is_none(), "{own:?}");
+
+        // The next install holds the bind.
+        tokio::time::sleep(OWN_ADDRESS_REFRESH + Duration::from_secs(1)).await;
+        settle(&own, |set| set.is_some()).await?;
+        assert!(own.known().is_some_and(|s| s.contains(nine)));
         Ok(())
     }
 
