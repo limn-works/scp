@@ -1,7 +1,7 @@
 [package]
 name = "scp-kel"
 version = "0.1.0-beta.2"
-description = "The SCP key-event log: the event codec, the identifier and routing derivations, chain validation, and key-state replay — wasm-safe, no async, no I/O"
+description = "The SCP key-event log: the event codec, the identifier and routing derivations, chain validation, and key-state replay — wasm-safe, no async runtime, no I/O"
 edition.workspace = true
 repository.workspace = true
 license.workspace = true
@@ -18,7 +18,19 @@ scp-did = { path = "../scp-did", version = "=0.1.0-beta.2" }
 scp-crypto = { path = "../scp-crypto", version = "=0.1.0-beta.2" }
 # Every construction here is a SHA-256 over a domain-separated preimage.
 sha2 = { workspace = true }
+# The operating-system random source `CustodyProbe::fresh` draws its nonce from
+# (09-security-model.md §9.7.4.1 item 5, step d). scp-crypto already depends on
+# rand_core 0.6 with `getrandom` and selects getrandom's wasm32 JS backend, so
+# this edge adds no crate to the graph.
+rand_core = { version = "0.6", default-features = false, features = ["getrandom"] }
 thiserror = { workspace = true }
+
+[features]
+# `CustodyProbe::new`, which takes the probe nonce from its caller, for
+# known-answer tests against spec 25 §25.34. No shipped build enables it, so
+# production code reaches only `CustodyProbe::fresh`
+# (09-security-model.md §9.7.4.1 item 5, step d: "32 fresh random bytes").
+testing = []
 
 [dev-dependencies]
 hex = { workspace = true }

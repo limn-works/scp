@@ -3143,3 +3143,34 @@ ids(S_e) sorts the three fixture identifiers by the bytes of their `scp:` text f
 | 9 | 0 | 1 | 2 |
 
 An External Commit by a non-member at any of these epochs has rank 3. At S_7, a re-seat child by alice and a child by carol, when S_7 holds no `reseat_window` entry for alice: alice's re-seat has rank −1 and carol's child has rank 0, so alice's re-seat is canonical whatever the cths. An implementation that gives the re-seat alice's member rank 1 picks carol's child. At S_7, two children of rank −1, by alice with a `recovered_at` epoch of 3 and cth2, and by bob with a `recovered_at` epoch of 5 and cth1: alice's is canonical, because 3 is less than 5, although cth1 is less than cth2 as unsigned bytes. An implementation that compares cth before `recovered_at` picks bob's. At S_7, a re-seat child by alice when S_7 holds `reseat_window[alice]` = [2, 14, 3], because alice's re-seat child created epoch 2 and rows 3 to 7 have committers carol, alice, bob, alice and carol: 3 ≤ K(2) = 14, so the child has alice's member rank 1 and carol's child of rank 0 is canonical. An implementation that ignores `reseat_window` picks alice's. At S_19, a re-seat child by alice when alice committed every Commit from epoch 3 to 19 after her re-seat child created epoch 2: `reseat_window[alice]` = [2, 14, 0], so the child has alice's member rank 1 and carol's child of rank 0 is canonical. An implementation that counts every Commit, 17 > 14, deletes the window and picks alice's. At S_7, children by carol and alice: carol's has rank 0 and is canonical whatever the cths. At S_7, two children by bob from two of his devices, with cth1 = SHA-256("SCP test vector cth one") = `15a9feb7bc8b0fb5d4f16c5607d5e71bd7477ff69d5af42de352bdbd31054416` and cth2 = SHA-256("SCP test vector cth two") = `6ca435b3e2f29c3dad106999a0ff78f31c1c1aedadf673d9fcdc9a772f74b4af`: both have rank 2, and the child with cth1 is canonical, because cth1 is less than cth2 as unsigned bytes. Two children of one parent from one MLS sender leaf are equivocation (`09-security-model.md` §9.9.3), and the choice still picks the cth1 child. At S_7, children by alice and bob: alice's has rank 1 and bob's rank 2, so alice's is canonical. An implementation that computes (e − pos(I)) mod n_e gives alice rank 2 and bob rank 1, and picks bob's.
+
+## 25.34 Custody-Reachability Probe Vectors (`09-security-model.md` §9.7.4.1 item 5)
+
+Step (d) of §9.7.4.1 item 5 confirms a non-copyable substrate is reachable with one test signature over a fresh 32-byte nonce. The raw form signs `SHA-256("SCP-CUSTODY-PROBE-V1:" || nonce)`. The assertion form passes the 53 bytes `"SCP-CUSTODY-PROBE-V1:" || nonce`, unhashed, to the authenticator as its WebAuthn challenge, and a verifier compares the unpadded base64url form of those bytes against `clientDataJSON.challenge` as for a key-event assertion (§9.7.4.2, "Signature form"). The separator is the 21 ASCII bytes `SCP-CUSTODY-PROBE-V1:`; it is neither a prefix of `"SCP-KEL-EVENT-V1:"` or `"SCP-KEY-EVENT-V1:"` nor prefixed by either, so no probe digest equals a key-event digest and no probe challenge equals a key-event challenge. A ceremony draws every nonce fresh; the two below are fixtures.
+
+### Vector 83: the probe's raw digest, assertion challenge and a raw signature
+
+```
+83a — nonce: the 32 bytes 00 through 1f
+      nonce:
+      000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+      assertion challenge (53 bytes = 21-byte separator + 32-byte nonce):
+      5343502d435553544f44592d50524f42452d56313a000102030405060708090a
+      0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+      raw digest = SHA-256(assertion challenge):
+      c36069dcc0cd6126d3371115304869d93b17e91dbdbe59d5ca58b8d442f8ffd1
+      raw signature by §25.2's reference key over the raw digest:
+      6f4a8e41a55455a45ea941e003199263aeb225e799c5453d56870e2561c94ec6
+      082078272e8a524df06c647899a9fe4ad4cf7e809a501fe38fd9e6e6a90629ac
+
+83b — nonce: the 32 bytes 5a
+      nonce:
+      5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a
+      assertion challenge (53 bytes):
+      5343502d435553544f44592d50524f42452d56313a5a5a5a5a5a5a5a5a5a5a5a
+      5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a
+      raw digest:
+      b02faa3696917a54fb2fceff73015251ac8d039c93fd07d42621d6e70b3078a7
+```
+
+A verifier accepts 83a's signature as a probe signature over 83a's nonce under §25.2's reference key. It rejects the same key's raw signature over an event digest `D` as a probe signature, because it recomputes the raw digest from the nonce and never takes the signed value from the signer.

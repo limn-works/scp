@@ -12,6 +12,7 @@ mod construction;
 mod decode;
 mod event_codec;
 mod fixtures;
+mod key_event_signer;
 mod replay;
 mod round_trip;
 mod signature;

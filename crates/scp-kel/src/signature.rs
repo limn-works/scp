@@ -153,8 +153,11 @@ pub enum IndexedSignatureError {
     #[error("the clientDataJSON type is not webauthn.get")]
     ClientDataTypeMismatch,
     /// The decoded `challenge` member is not the unpadded base64url
-    /// encoding of `"SCP-KEY-EVENT-V1:" ‖ D`.
-    #[error("the clientDataJSON challenge is not the event's challenge")]
+    /// encoding of the challenge the verifier expects: `"SCP-KEY-EVENT-V1:"
+    /// ‖ D` for a key-event signature, and the probe's
+    /// [`assertion_challenge`](crate::CustodyProbe::assertion_challenge) for
+    /// a [`ProbeSignature`](crate::ProbeSignature).
+    #[error("the clientDataJSON challenge is not the expected challenge")]
     ChallengeMismatch,
     /// The 64-byte signature fails §9.5's checks: a scalar out of range,
     /// a high `s`, or an equation that does not hold.
@@ -328,15 +331,18 @@ pub fn verify_indexed(
         IndexedSignature::Raw { signature } => verify_prehash_strict(&key, event_digest, signature)
             .map_err(IndexedSignatureError::Signature),
         IndexedSignature::WebAuthnAssertion(assertion) => {
-            verify_assertion(&key, event_digest, assertion)
+            verify_assertion(&key, &key_event_challenge(event_digest), assertion)
         }
     }
 }
 
-/// The assertion-form checks of [`verify_indexed`], in order.
-fn verify_assertion(
+/// The assertion-form checks of [`verify_indexed`], in order, against the
+/// challenge bytes the verifier expects: [`key_event_challenge`] for a key
+/// event, a probe's assertion challenge for a
+/// [`ProbeSignature`](crate::ProbeSignature).
+pub fn verify_assertion(
     key: &P256PublicKey,
-    event_digest: &[u8; 32],
+    challenge: &[u8],
     assertion: &AssertionSignature,
 ) -> Result<(), IndexedSignatureError> {
     // `AssertionSignature` holds at least MIN_AUTHENTICATOR_DATA_BYTES, so
@@ -356,7 +362,7 @@ fn verify_assertion(
     if members.client_data_type != ASSERTION_TYPE {
         return Err(IndexedSignatureError::ClientDataTypeMismatch);
     }
-    if members.challenge != base64url_unpadded(&key_event_challenge(event_digest)) {
+    if members.challenge != base64url_unpadded(challenge) {
         return Err(IndexedSignatureError::ChallengeMismatch);
     }
     let client_data_hash = Sha256::digest(&assertion.client_data_json);
@@ -389,7 +395,7 @@ pub const fn key_event_challenge(event_digest: &[u8; 32]) -> [u8; KEY_EVENT_CHAL
 }
 
 /// RFC 4648 §5 base64url, without padding.
-fn base64url_unpadded(bytes: &[u8]) -> String {
+pub fn base64url_unpadded(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {

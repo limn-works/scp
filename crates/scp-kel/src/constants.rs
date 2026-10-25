@@ -57,6 +57,12 @@ pub const HELD_HEAD_MARKER_BYTES: u32 = 73;
 /// `WebAuthn` challenge. Its one public path is `key_event_challenge`.
 pub(crate) const KEY_EVENT_CHALLENGE_SEPARATOR: &[u8] = b"SCP-KEY-EVENT-V1:";
 
+/// Prefixes the nonce in a custody-reachability probe (§9.7.4.1 item 5,
+/// step d; §9.18.2). It is distinct from [`KEL_EVENT_SEPARATOR`] and from
+/// [`KEY_EVENT_CHALLENGE_SEPARATOR`], so no probe value equals an event
+/// digest or a key-event challenge. Its one public path is `CustodyProbe`.
+pub(crate) const CUSTODY_PROBE_SEPARATOR: &[u8] = b"SCP-CUSTODY-PROBE-V1:";
+
 /// Prefixes the twelve field bytes in the signed preimage every event
 /// digest, signature and identifier derivation reads (§9.7.4.2, R13).
 /// Crate-private: `EncodedPreimage` and `RawSignedPreimage` are the public

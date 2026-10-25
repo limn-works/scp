@@ -4278,6 +4278,34 @@ def emit_key_positions_and_reseat() -> None:
         )
 
 
+# --- §25.34 Vector 83: the custody-reachability probe ---
+#
+# 09-security-model.md §9.7.4.1 item 5, step d: the raw arm signs
+# SHA-256("SCP-CUSTODY-PROBE-V1:" || nonce), and the assertion arm's WebAuthn
+# challenge is the 53 bytes "SCP-CUSTODY-PROBE-V1:" || nonce, unhashed.
+CUSTODY_PROBE_SEPARATOR = b"SCP-CUSTODY-PROBE-V1:"
+
+
+def emit_custody_probe() -> None:
+    section("§25.34 Vector 83 custody-reachability probe")
+    assert len(CUSTODY_PROBE_SEPARATOR) == 21, "vector_83: separator length"
+    for separator in (KEL_EVENT_SEPARATOR, WEBAUTHN_CHALLENGE_PREFIX):
+        assert not CUSTODY_PROBE_SEPARATOR.startswith(separator), separator
+        assert not separator.startswith(CUSTODY_PROBE_SEPARATOR), separator
+    for label, nonce in (
+        ("vector_83a", bytes(range(32))),
+        ("vector_83b", bytes([0x5A]) * 32),
+    ):
+        challenge = CUSTODY_PROBE_SEPARATOR + nonce
+        assert len(challenge) == 53, f"{label}: challenge length"
+        emit_hex(f"{label}.nonce", nonce)
+        emit_hex(f"{label}.assertion_challenge", challenge)
+        emit_hex(f"{label}.raw_digest", sha256(challenge))
+    # §25.2's reference key signs Vector 83a's raw digest.
+    digest = sha256(CUSTODY_PROBE_SEPARATOR + bytes(range(32)))
+    emit_hex("vector_83a.signature", sign_group(REF_KEY_1, digest, "vector_83a"))
+
+
 def main() -> int:
     self_test()
     _LINES.append("SCP §25 test vectors — ECDSA on NIST P-256, RFC 6979, SHA-256")
@@ -4314,6 +4342,7 @@ def main() -> int:
     emit_push_signing_bytes()
     emit_fork_merge()
     emit_key_positions_and_reseat()
+    emit_custody_probe()
     print("\n".join(_LINES))
     return 0
 
