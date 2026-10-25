@@ -191,7 +191,9 @@ pub enum ResolveError {
 /// only a reveal-authorized event changes the standing commitment, and each
 /// one reveals the commitment standing at its predecessor (R1); C stands
 /// until the suffix's first reveal-authorized event. Where C is abandoned,
-/// R4 discards every later event, so no chain diverges past it.
+/// no chain diverges past it: the standing commitment's definition in
+/// §9.7.4.2 states that it "is `StandingCommitment::Abandoned` from that
+/// rollover's position on, and no later event is valid on that chain".
 ///
 /// "Rank is monotone. Once a suffix carries a C-revealing event its rank is
 /// fixed and extending that suffix does not change it. A reveal consuming a
