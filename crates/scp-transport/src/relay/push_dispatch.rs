@@ -76,15 +76,26 @@
 //!
 //! Every listener of one relay (WebSocket, QUIC, UDP, WebTransport) holds a
 //! clone of the relay's [`PushRole`](super::push_gate::PushRole), so a publish
-//! on any transport reaches the one service. The only way to hold a service
-//! is `PushService::start`, which starts its tasks, so no relay can hold a
-//! push service whose drains are not running.
+//! on any transport reaches the one service. The only public way to hold a
+//! service is [`PushRole::start`](super::push_gate::PushRole::start), which
+//! wires the shipped `KelPushVerifier` and starts the tasks, so no relay can
+//! hold a push service whose drains are not running or whose verifier the
+//! caller chose. `PushService` and its configuration are crate-internal.
+//!
+//! The service stops its lookup and drains when the relay that holds it shuts
+//! down (`RelayServer` cancels it with its own shutdown token) or when its
+//! last clone drops, whichever comes first.
 //!
 //! A build without the `push-store` feature has no push service, and its
 //! [`notify`] does nothing.
 
 #[cfg(feature = "push-store")]
-pub use enabled::*;
+pub(crate) use enabled::PushService;
+#[cfg(feature = "push-store")]
+pub use enabled::{
+    MAX_WAKES_PER_PUBLISH, PUSH_QUEUE_CAPACITY, WEBPUSH_CONCURRENT_SENDS, WEBPUSH_SENDS_PER_ORIGIN,
+    WEBPUSH_SENDS_PER_TICKET, notify,
+};
 
 /// Does nothing, because a build without `push-store` has no push service.
 ///
@@ -104,7 +115,7 @@ mod enabled {
     use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
     use std::fmt;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+    use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
     use std::time::{Duration, Instant};
 
     use futures::StreamExt as _;
@@ -154,23 +165,6 @@ mod enabled {
     /// lane rule; indicator: 2). The tokens registered on one routing ID,
     /// whatever origins they name, hold at most these.
     pub const WEBPUSH_SENDS_PER_TICKET: usize = 2;
-
-    /// A push service that could not start.
-    #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-    #[non_exhaustive]
-    pub enum PushServiceError {
-        /// [`PushService::start`] ran outside a tokio runtime, so it had
-        /// nowhere to run its lookup and drains.
-        #[error("the push service must start inside a tokio runtime")]
-        NoRuntime,
-        /// Two configured senders wake the same platform, so the service
-        /// could not tell which one a token's wakes go through.
-        #[error("two push senders are configured for {platform:?}")]
-        DuplicateSender {
-            /// The platform named twice.
-            platform: PushPlatform,
-        },
-    }
 
     /// A SHA-256 of a token's platform tag and bytes: how a queue and a
     /// drain recognise a token without holding a second copy of it.
@@ -311,8 +305,15 @@ mod enabled {
         /// intake slot however often it is published to.
         pending: Arc<Mutex<HashSet<RoutingId>>>,
         logs: Arc<Logs>,
-        /// Cancels the lookup and every drain when the last clone drops.
-        _stop: DropGuard,
+        /// Cancels the lookup and every drain. A holder of the token from
+        /// [`PushService::stop_token`] cancels it; so does the guard below
+        /// when the last clone drops.
+        stop: CancellationToken,
+        /// Cancels `stop` when the last clone drops.
+        _stop_on_drop: DropGuard,
+        /// Upgradable while any lookup or drain task runs: each task holds a
+        /// strong reference until it returns.
+        running: Weak<()>,
     }
 
     impl fmt::Debug for PushService {
@@ -327,12 +328,17 @@ mod enabled {
         /// Starts a push service on `config`: one lookup task and one drain
         /// per configured sender, on the current tokio runtime.
         ///
+        /// The senders wake distinct platforms: the only production caller,
+        /// [`PushRole::start`], builds them from `PushSenders`, which holds
+        /// one field per platform, so the service runs no duplicate check.
+        ///
         /// # Errors
         ///
-        /// - [`PushServiceError::NoRuntime`] outside a tokio runtime.
-        /// - [`PushServiceError::DuplicateSender`] when two senders wake the
-        ///   same platform.
-        pub fn start(config: PushServiceConfig) -> Result<Self, PushServiceError> {
+        /// [`tokio::runtime::TryCurrentError`] outside a tokio runtime: the
+        /// service would have nowhere to run its lookup and drains.
+        pub(crate) fn start(
+            config: PushServiceConfig,
+        ) -> Result<Self, tokio::runtime::TryCurrentError> {
             Self::start_with(config, Limits::PRODUCTION)
         }
 
@@ -344,7 +350,7 @@ mod enabled {
             config: PushServiceConfig,
             queue_capacity: usize,
             wakes_per_publish: usize,
-        ) -> Result<Self, PushServiceError> {
+        ) -> Result<Self, tokio::runtime::TryCurrentError> {
             Self::start_with(
                 config,
                 Limits {
@@ -354,35 +360,32 @@ mod enabled {
             )
         }
 
-        fn start_with(config: PushServiceConfig, limits: Limits) -> Result<Self, PushServiceError> {
-            let runtime =
-                tokio::runtime::Handle::try_current().map_err(|_| PushServiceError::NoRuntime)?;
-            let mut platforms = HashSet::new();
-            for sender in config.senders.iter() {
-                if !platforms.insert(sender.platform()) {
-                    return Err(PushServiceError::DuplicateSender {
-                        platform: sender.platform(),
-                    });
-                }
-            }
+        fn start_with(
+            config: PushServiceConfig,
+            limits: Limits,
+        ) -> Result<Self, tokio::runtime::TryCurrentError> {
+            let runtime = tokio::runtime::Handle::try_current()?;
             let stop = CancellationToken::new();
+            let running = Arc::new(());
             let logs = Arc::new(Logs::default());
             let mut lanes = Vec::with_capacity(config.senders.len());
             for (index, sender) in config.senders.iter().enumerate() {
                 let (tx, rx) = mpsc::channel(limits.queue_capacity);
                 let queued = Arc::new(Mutex::new(HashSet::new()));
-                runtime.spawn(
-                    Drain {
-                        senders: Arc::clone(&config.senders),
-                        index,
-                        store: config.store.clone(),
-                        queued: Arc::clone(&queued),
-                        logs: Arc::clone(&logs),
-                        stop: stop.clone(),
-                        pending_resets: HashSet::new(),
-                    }
-                    .run(rx),
-                );
+                let drain = Drain {
+                    senders: Arc::clone(&config.senders),
+                    index,
+                    store: config.store.clone(),
+                    queued: Arc::clone(&queued),
+                    logs: Arc::clone(&logs),
+                    stop: stop.clone(),
+                    pending_resets: HashSet::new(),
+                };
+                let alive = Arc::clone(&running);
+                runtime.spawn(async move {
+                    drain.run(rx).await;
+                    drop(alive);
+                });
                 lanes.push(Lane {
                     platform: sender.platform(),
                     tx,
@@ -391,32 +394,52 @@ mod enabled {
             }
             let (intake, intake_rx) = mpsc::channel(limits.queue_capacity);
             let pending = Arc::new(Mutex::new(HashSet::new()));
-            runtime.spawn(
-                Lookup {
-                    store: config.store.clone(),
-                    lanes,
-                    pending: Arc::clone(&pending),
-                    logs: Arc::clone(&logs),
-                    limits,
-                    tickets: HashMap::new(),
-                }
-                .run(intake_rx, stop.clone()),
-            );
+            let lookup = Lookup {
+                store: config.store.clone(),
+                lanes,
+                pending: Arc::clone(&pending),
+                logs: Arc::clone(&logs),
+                limits,
+                tickets: HashMap::new(),
+            };
+            let lookup_stop = stop.clone();
+            let alive = Arc::clone(&running);
+            runtime.spawn(async move {
+                lookup.run(intake_rx, lookup_stop).await;
+                drop(alive);
+            });
             Ok(Self {
                 inner: Arc::new(Inner {
                     config,
                     intake,
                     pending,
                     logs,
-                    _stop: stop.drop_guard(),
+                    stop: stop.clone(),
+                    _stop_on_drop: stop.drop_guard(),
+                    running: Arc::downgrade(&running),
                 }),
             })
         }
 
         /// The configuration the service was started with.
         #[must_use]
-        pub fn config(&self) -> &PushServiceConfig {
+        pub(crate) fn config(&self) -> &PushServiceConfig {
             &self.inner.config
+        }
+
+        /// The token that stops the lookup and every drain. Cancelling it
+        /// stops the service for every clone; a later [`notify`] finds the
+        /// intake closed and drops the wake.
+        #[must_use]
+        pub fn stop_token(&self) -> CancellationToken {
+            self.inner.stop.clone()
+        }
+
+        /// How many of the service's lookup and drain tasks have not yet
+        /// returned. Zero once the service has stopped.
+        #[must_use]
+        pub fn tasks_running(&self) -> usize {
+            self.inner.running.strong_count()
         }
 
         fn notify(&self, routing_id: &RoutingId) {
@@ -1464,7 +1487,7 @@ mod enabled {
         use scp_protocol::discovery::push::{PushRegistration, push_registration_signing_bytes};
         use tempfile::TempDir;
 
-        use super::super::super::push::ApnsSender;
+        use super::super::super::push::{ApnsSender, FcmSender};
         use super::super::super::push_endpoint::parse_endpoint;
         use super::super::super::push_gate::{PushPublishGate, gate_publish, test_relay_url};
         use super::super::super::push_store::MAX_REGISTRATIONS_PER_REGISTRANT;
@@ -1510,7 +1533,10 @@ mod enabled {
             senders: Vec<PushSender>,
         ) -> Result<(PushServiceConfig, TempDir), Box<dyn std::error::Error>> {
             let dir = tempfile::tempdir()?;
-            let store = PushRegistrationStore::open_sqlite(&dir.path().join("push.db"))?;
+            let store = PushRegistrationStore::open_sqlite(
+                &dir.path().join("push.db"),
+                crate::relay::push_store::PushStoreAtRest::Unkeyed,
+            )?;
             let config = PushServiceConfig {
                 store,
                 verifier: verifier()?,
@@ -1527,6 +1553,14 @@ mod enabled {
                 super::super::super::push_apns::tests::config(),
                 closed.origin().to_owned(),
                 Arc::new(scp_clock::SystemClock),
+            )?))
+        }
+
+        /// A shipped FCM sender aimed at Google's endpoints; it is never
+        /// asked to send.
+        fn closed_fcm() -> Result<PushSender, Box<dyn std::error::Error>> {
+            Ok(PushSender::Fcm(FcmSender::new(
+                super::super::super::push_fcm::tests::config(),
             )?))
         }
 
@@ -1616,22 +1650,12 @@ mod enabled {
         #[test]
         fn start_outside_a_runtime_fails() -> TestResult {
             let (config, _dir) = config(Vec::new())?;
-            assert_eq!(
-                PushService::start(config).err(),
-                Some(PushServiceError::NoRuntime)
-            );
-            Ok(())
-        }
-
-        /// Two senders for one platform are refused at start.
-        #[tokio::test]
-        async fn start_rejects_two_senders_for_one_platform() -> TestResult {
-            let (config, _dir) = config(vec![closed_apns()?, closed_apns()?])?;
-            assert_eq!(
-                PushService::start(config).err(),
-                Some(PushServiceError::DuplicateSender {
-                    platform: PushPlatform::Apns
-                })
+            let refused = PushService::start(config).err();
+            assert!(
+                refused
+                    .as_ref()
+                    .is_some_and(tokio::runtime::TryCurrentError::is_missing_context),
+                "{refused:?}"
             );
             Ok(())
         }
@@ -1655,6 +1679,26 @@ mod enabled {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
             Err("the lookup task outlived the service".into())
+        }
+
+        /// Cancelling the stop token stops the lookup and both drains while
+        /// clones of the service are still held, as a relay shutdown does.
+        #[tokio::test]
+        async fn stopping_the_service_stops_every_task_while_clones_live() -> TestResult {
+            let (config, _dir) = config(vec![closed_apns()?, closed_fcm()?])?;
+            let service = PushService::start(config)?;
+            let clone = service.clone();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert_eq!(service.tasks_running(), 3, "one lookup and two drains");
+            service.stop_token().cancel();
+            for _ in 0..1000 {
+                if clone.tasks_running() == 0 {
+                    assert!(service.inner.intake.is_closed());
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            Err(format!("{} push tasks outlived the stop", clone.tasks_running()).into())
         }
 
         /// The production queues hold 10,000 entries and one routing ID's
@@ -2661,7 +2705,10 @@ mod enabled {
                 let drain = Drain {
                     senders: Arc::from(vec![recording(&sender)]),
                     index: 0,
-                    store: PushRegistrationStore::open_sqlite(&dir.path().join("push.db"))?,
+                    store: PushRegistrationStore::open_sqlite(
+                        &dir.path().join("push.db"),
+                        crate::relay::push_store::PushStoreAtRest::Unkeyed,
+                    )?,
                     queued: Arc::clone(&queued),
                     logs: Arc::new(Logs::default()),
                     stop: stop.clone(),
@@ -2716,7 +2763,10 @@ mod enabled {
                 let drain = Drain {
                     senders: Arc::from(vec![recording(&sender)]),
                     index: 0,
-                    store: PushRegistrationStore::open_sqlite(&dir.path().join("push.db"))?,
+                    store: PushRegistrationStore::open_sqlite(
+                        &dir.path().join("push.db"),
+                        crate::relay::push_store::PushStoreAtRest::Unkeyed,
+                    )?,
                     queued: Arc::clone(&queued),
                     logs: Arc::new(Logs::default()),
                     stop: stop.clone(),
@@ -3324,7 +3374,10 @@ pub(crate) mod wake_harness {
         let dir = tempfile::tempdir()?;
         let signer = P256SecretKey::from_scalar_bytes(&[0x5A; 32])?;
         let service = PushService::start(PushServiceConfig {
-            store: PushRegistrationStore::open_sqlite(&dir.path().join("push.db"))?,
+            store: PushRegistrationStore::open_sqlite(
+                &dir.path().join("push.db"),
+                crate::relay::push_store::PushStoreAtRest::Unkeyed,
+            )?,
             verifier: Arc::new(TestPushVerifier::new([(
                 DID::from(REGISTRANT),
                 signer.public_key(),

@@ -2310,6 +2310,49 @@ mod tests {
         handle.shutdown();
     }
 
+    /// PUSH-012 criterion 10 at the UDP/DTLS listener: with push enabled
+    /// (the production `KelPushVerifier`) and the handle reserving two bridge
+    /// entries, a PUBLISH at either entry's tier 3 push routing ID is answered
+    /// with `4060` before signature verification, because no Tier 3 envelope
+    /// opener exists yet (§10.7.1 "Tier 3 relays", "Tier 3 envelope"), and the
+    /// blob store holds nothing at that ID.
+    #[cfg(feature = "push-store")]
+    #[tokio::test]
+    async fn enabled_udp_listener_rejects_a_tier3_publish_with_4060() {
+        let fixture = crate::relay::push_gate::tier3_fixture().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, addr, storage) = start_test_listener_with_relay_config(RelayConfig {
+            push: crate::relay::push_gate::PushRole::Enabled(
+                crate::relay::push_gate::kel_service_for_tests(dir.path()),
+            ),
+            ..RelayConfig::defaults(fixture.live.clone())
+        })
+        .await;
+        let client = create_dtls_client(addr).await;
+        for rid in [
+            fixture.entry_a.push_routing_id(),
+            fixture.entry_b.push_routing_id(),
+        ] {
+            let publish = ClientMessage::Publish {
+                ref_id: Some("push".to_string()),
+                routing_id: rid,
+                recipient_hint: None,
+                blob_ttl: 3600,
+                blob: vec![0x42; 64],
+            };
+            let response = send_and_recv(&client, &publish).await;
+            assert!(
+                matches!(
+                    &response,
+                    RelayMessage::Err { code: 4060, ref_id: Some(r), .. } if r == "push"
+                ),
+                "{response:?}"
+            );
+            assert!(storage.query(&rid, None, 100).await.unwrap().is_empty());
+        }
+        handle.shutdown();
+    }
+
     // -- Store-site wakes (§10.7.1 step 5, PUSH-008) --
     //
     // A DID record and an opaque blob reach storage through different gate

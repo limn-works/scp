@@ -744,13 +744,18 @@
       "gate": "gate-push-relay",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-transport/src/startup.rs",
         "crates/scp-relay/src/main.rs",
         "crates/scp-relay/README.md",
         ".docs/adrs/phase-1.md",
-        "crates/scp-node/src/lib.rs"
+        "crates/scp-node/src/lib.rs",
+        "crates/scp-node/src/config.rs",
+        "crates/scp-node/src/main.rs",
+        "crates/scp-transport/src/relay/push_gate.rs",
+        "docs/guides/relay-operations.md",
+        ".docs/standards/construction.md"
       ],
       "description": "Implements Part 5 of the plan: push selection is mandatory, has no default, and every failure is typed and fails closed (\u00a717.17). The variable names are indicators; the rules are the contract. `SCP_RELAY_PUSH_PLATFORMS` takes `none`, `apns`, `fcm` or `apns,fcm`; `none` sets `PushRole::Disabled`. `SCP_RELAY_PUSH_STORE` has no default and is required whenever the platform list is not `none`; a shipped build accepts only `sqlite`, because the in-memory store arm compiles only under `testing` (PUSH-006). APNs needs `SCP_RELAY_APNS_KEY_PATH`, `SCP_RELAY_APNS_KEY_ID`, `SCP_RELAY_APNS_TEAM_ID`, `SCP_RELAY_APNS_TOPIC` and `SCP_RELAY_APNS_ENVIRONMENT` (`production` or `sandbox`, no default). FCM needs `SCP_RELAY_FCM_SERVICE_ACCOUNT_PATH`, and `SCP_RELAY_FCM_PROJECT_ID` or the JSON's `project_id`. Credentials load only from file paths; key bytes, JWTs and access tokens live in zeroizing buffers; no `Debug` implementation prints them. The ADR-004 operator table records that APNs credentials bind a relay to one Apple team and topic, and FCM credentials to one Firebase project. The `scp-node` embedded relay takes the same selection through its builder, defaulting to `Disabled` and never reading credentials implicitly; the `scp-node` file path is an indicator.",
       "acceptanceCriteria": [

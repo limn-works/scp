@@ -1,5 +1,5 @@
-# Each service names its blob storage backend and an absolute database path,
-# and the relay names its push platforms (`none` here) and its public URL, from
+# Each service names its blob storage backend, an absolute database path and
+# its push platforms (`none` here), and the relay names its public URL, from
 # which it derives its reserved push routing ID (spec §10.7.1, push
 # registration protocol). None of these variables
 # has a default: a binary started with one unset exits 1 (persistence spec
@@ -28,6 +28,7 @@ services:
       - "9001:9000"
     environment:
       SCP_NODE_DOMAIN: "localhost"
+      SCP_RELAY_PUSH_PLATFORMS: "none"
       SCP_RELAY_STORAGE_BACKEND: "sqlite"
       SCP_RELAY_STORAGE_PATH: "/data/scp-relay.db"
       SCP_RELAY_LOG_FORMAT: "pretty"

@@ -1732,7 +1732,12 @@ jobs:
           # gates a `src/` module plus a `[[test]] required-features` target,
           # and no lint or test invocation activated either feature, so 41
           # tests and both adapter modules went unlinted and unrun.
-          cargo clippy -p scp-transport --features quic,http3,udp,coap,nostr,webrtc --all-targets -- -D warnings
+          # `push-store` joins for the listeners' push tests (spec §10.7.1):
+          # each QUIC, UDP and WebTransport listener test of an enabled push
+          # role compiles only under a transport feature and `push-store`, and
+          # the listeners' store-site wake tests also need `testing`.
+          cargo clippy -p scp-transport --features quic,http3,udp,coap,nostr,webrtc,push-store --all-targets -- -D warnings
+          cargo clippy -p scp-transport --features quic,http3,udp,push-store,testing --all-targets -- -D warnings
           # Job rust-test-optional-features also runs code behind four more
           # feature sets that no other command of this job activates: scp-node's quic test
           # files and its http3/udp well_known arms (linted here), scp-platform's
@@ -2039,15 +2044,27 @@ jobs:
           # target (nostr_roundtrip, webrtc_roundtrip) that this list must
           # activate; without them those 10 tests plus 31 in-module tests under
           # src/nostr/ and src/webrtc/ compiled into no test binary CI ran.
+          # `push-store` joins the list for the QUIC, UDP and WebTransport
+          # listener tests of an enabled push role (spec §10.7.1, PUSH-012),
+          # which compile only under a transport feature and `push-store`.
           # The first run takes every other transport test; each run after it
-          # selects one of those four groups with `--no-tests=fail`, so
-          # re-gating a group behind another feature, or deleting it, leaves
-          # its run with nothing to select and fails this lane.
-          cargo nextest run --no-tests=fail -p scp-transport --features quic,http3,udp,coap,nostr,webrtc -E 'not (binary(nostr_roundtrip) | binary(webrtc_roundtrip) | test(/^nostr::/) | test(/^webrtc::/))'
-          cargo nextest run --no-tests=fail -p scp-transport --features quic,http3,udp,coap,nostr,webrtc --test nostr_roundtrip
-          cargo nextest run --no-tests=fail -p scp-transport --features quic,http3,udp,coap,nostr,webrtc --test webrtc_roundtrip
-          cargo nextest run --no-tests=fail -p scp-transport --features quic,http3,udp,coap,nostr,webrtc --lib -E 'test(/^nostr::/)'
-          cargo nextest run --no-tests=fail -p scp-transport --features quic,http3,udp,coap,nostr,webrtc --lib -E 'test(/^webrtc::/)'
+          # selects one of the nostr and webrtc groups or one listener push
+          # test with `--no-tests=fail`, so re-gating a group or a test behind
+          # another feature, renaming it, or deleting it leaves its run with
+          # nothing to select and fails this lane.
+          cargo nextest run --no-tests=fail -p scp-transport --features quic,http3,udp,coap,nostr,webrtc,push-store -E 'not (binary(nostr_roundtrip) | binary(webrtc_roundtrip) | test(/^nostr::/) | test(/^webrtc::/) | test(=quic::listener::tests::enabled_quic_listener_rejects_a_tier3_publish_with_4060) | test(=udp::listener::tests::enabled_udp_listener_rejects_a_tier3_publish_with_4060) | test(=webtransport::server::tests::enabled_webtransport_listener_rejects_a_tier3_publish_with_4060))'
+          cargo nextest run --no-tests=fail -p scp-transport --features quic,http3,udp,coap,nostr,webrtc,push-store --test nostr_roundtrip
+          cargo nextest run --no-tests=fail -p scp-transport --features quic,http3,udp,coap,nostr,webrtc,push-store --test webrtc_roundtrip
+          cargo nextest run --no-tests=fail -p scp-transport --features quic,http3,udp,coap,nostr,webrtc,push-store --lib -E 'test(/^nostr::/)'
+          cargo nextest run --no-tests=fail -p scp-transport --features quic,http3,udp,coap,nostr,webrtc,push-store --lib -E 'test(/^webrtc::/)'
+          cargo nextest run --no-tests=fail -p scp-transport --features quic,http3,udp,coap,nostr,webrtc,push-store --lib -E 'test(=quic::listener::tests::enabled_quic_listener_rejects_a_tier3_publish_with_4060)'
+          cargo nextest run --no-tests=fail -p scp-transport --features quic,http3,udp,coap,nostr,webrtc,push-store --lib -E 'test(=udp::listener::tests::enabled_udp_listener_rejects_a_tier3_publish_with_4060)'
+          cargo nextest run --no-tests=fail -p scp-transport --features quic,http3,udp,coap,nostr,webrtc,push-store --lib -E 'test(=webtransport::server::tests::enabled_webtransport_listener_rejects_a_tier3_publish_with_4060)'
+          # The QUIC and UDP listeners' store-site wake tests (§10.7.1 step
+          # 5, PUSH-008) also need the `testing` wake harness, which the runs
+          # above leave off. Each run selects one listener's wake module.
+          cargo nextest run --no-tests=fail -p scp-transport --features quic,http3,udp,push-store,testing --lib -E 'test(/^quic::listener::tests::wake::/)'
+          cargo nextest run --no-tests=fail -p scp-transport --features quic,http3,udp,push-store,testing --lib -E 'test(/^udp::listener::tests::wake::/)'
           # scp-transport compiles the PostgreSQL and S3 arms of
           # `storage_from_env` only under its `postgres-blob` and `s3-blob`
           # features, which --workspace leaves off. This command runs the
@@ -2067,7 +2084,9 @@ jobs:
           # which --workspace leaves off. Each feature set runs the whole lib
           # and every integration target with no test filter, so a unit test
           # in any module, or a target whose required features a set meets,
-          # runs with no edit here.
+          # runs with no edit here. A push test that also needs a transport
+          # feature (`quic`, `udp` or `http3`) runs in the transport runs
+          # above, which name each such test.
           cargo nextest run --no-tests=fail -p scp-transport --features push-store,testing --lib --tests
           cargo nextest run --no-tests=fail -p scp-transport --features push-store --lib --tests
           # Selects only the assertion that compiles out under `testing`, so a

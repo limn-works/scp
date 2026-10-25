@@ -19,7 +19,8 @@ mod quic_support;
 use scp_relay_client::{ClientMessage, RelayMessage};
 
 use quic_support::{
-    CONNECT_DEADLINE, build_tls_node, connect_quic, install_crypto_provider, serve_in_background,
+    CONNECT_DEADLINE, build_tls_node, build_tls_node_with_push, connect_quic,
+    install_crypto_provider, serve_in_background,
 };
 
 /// Sends a single client message on a fresh bidi stream and reads all responses.
@@ -116,6 +117,84 @@ async fn quic_publish_then_query_roundtrips() {
 
     conn.close(0u32.into(), b"done");
     serving.stop().await;
+}
+
+/// An enabled push slot over an unkeyed SQLite store in `dir` with one APNs
+/// sender. Building the sender makes no request.
+fn enabled_push(dir: &std::path::Path) -> scp_node::PushSlot {
+    use scp_transport::relay::push::{ApnsConfig, ApnsEnvironment, ApnsSender};
+    use scp_transport::relay::push_gate::{PushProviders, PushSenders};
+    use scp_transport::relay::push_store::{PushRegistrationStore, PushStoreAtRest};
+
+    let apns = ApnsSender::new(ApnsConfig {
+        signing_key: scp_crypto::p256::P256SecretKey::random(&mut rand::rngs::OsRng),
+        key_id: "ABC123DEFG".to_owned(),
+        team_id: "DEF123GHIJ".to_owned(),
+        topic: "org.example.app".to_owned(),
+        environment: ApnsEnvironment::Sandbox,
+    })
+    .unwrap();
+    scp_node::PushSlot::Enabled(Box::new(PushProviders {
+        store: PushRegistrationStore::open_sqlite(
+            &dir.join("push.sqlite"),
+            PushStoreAtRest::Unkeyed,
+        )
+        .unwrap(),
+        senders: PushSenders {
+            apns: Some(apns),
+            fcm: None,
+        },
+    }))
+}
+
+/// Publishes a malformed blob over QUIC to `node`'s reserved push routing ID
+/// and returns the error code the relay answers.
+async fn quic_push_reply(
+    node: scp_node::ApplicationNode<scp_platform::in_memory::InMemoryStorage>,
+) -> u16 {
+    let routing_id = scp_transport::relay::push_gate::RelayUrl::new(&node.relay_url())
+        .unwrap()
+        .push_routing_id();
+    let mut serving = serve_in_background(node).await;
+    let conn = connect_quic(&mut serving).await;
+    let publish = ClientMessage::Publish {
+        ref_id: Some("push".to_owned()),
+        routing_id,
+        recipient_hint: None,
+        blob_ttl: 3600,
+        blob: vec![0xC1],
+    };
+    let replies = send_and_recv(&conn, &publish).await;
+    conn.close(0u32.into(), b"done");
+    serving.stop().await;
+    match replies.as_slice() {
+        [RelayMessage::Err { code, .. }] => *code,
+        other => panic!("expected one error reply to a malformed push message: {other:?}"),
+    }
+}
+
+/// The node hands its push role to its QUIC listener (spec §10.7.1: every
+/// transport of a relay intercepts its reserved push routing ID). A malformed
+/// PUBLISH at the routing ID over QUIC reaches the push gate of an enabled
+/// node, which refuses it with a push code other than `4063`; the same
+/// message to a node on the default slot is answered `4063`
+/// `PUSH_NOT_SUPPORTED`.
+#[tokio::test]
+async fn quic_listener_serves_the_push_gate_of_an_enabled_node() {
+    install_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let enabled = quic_push_reply(build_tls_node_with_push(enabled_push(dir.path())).await).await;
+    assert_ne!(
+        enabled,
+        scp_relay_client::code::PUSH_NOT_SUPPORTED,
+        "the QUIC listener did not receive the node's push role"
+    );
+    let disabled = quic_push_reply(build_tls_node().await).await;
+    assert_eq!(
+        disabled,
+        scp_relay_client::code::PUSH_NOT_SUPPORTED,
+        "a node on the default slot offers no push over QUIC"
+    );
 }
 
 /// Asserts `.well-known/scp` advertises `"quic"` when (and only when) a QUIC

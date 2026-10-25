@@ -18,7 +18,9 @@ use scp_clock::SystemClock;
 use scp_dht::InMemoryDhtClient;
 use scp_identity::DidCache;
 use scp_identity::dht::DidDht;
-use scp_node::{ApplicationNode, DhtMode, IdentitySource, Node, NodeConfig, NodeError, Reach};
+use scp_node::{
+    ApplicationNode, DhtMode, IdentitySource, Node, NodeConfig, NodeError, PushSlot, Reach,
+};
 use scp_platform::in_memory::InMemoryStorage;
 use scp_platform::testing::InMemoryKeyCustody;
 
@@ -111,6 +113,11 @@ fn insecure_quic_client_config() -> ClientConfig {
 /// port: [`ApplicationNode::bind`] reports the bound TCP and QUIC addresses, so
 /// no port is learned before the node binds it.
 pub async fn build_tls_node() -> ApplicationNode<InMemoryStorage> {
+    build_tls_node_with_push(PushSlot::Disabled).await
+}
+
+/// As [`build_tls_node`], with the relay's push role taken from `push`.
+pub async fn build_tls_node_with_push(push: PushSlot) -> ApplicationNode<InMemoryStorage> {
     let custody = Arc::new(InMemoryKeyCustody::new());
     let dht_client = Arc::new(InMemoryDhtClient::new());
     let cache = Arc::new(DidCache::new());
@@ -127,6 +134,7 @@ pub async fn build_tls_node() -> ApplicationNode<InMemoryStorage> {
     Node::start_for_testing(NodeConfig {
         http_bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
         dht: DhtMode::Production,
+        push,
         ..NodeConfig::defaults(
             Reach::Domain {
                 domain: "localhost".to_owned(),

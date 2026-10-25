@@ -585,6 +585,22 @@ impl RelayServer {
                 )
                 .await;
         });
+
+        // The push service's lookup and drains stop with the relay. Every
+        // listener holds a clone of the role, so dropping the relay's own
+        // clone would not stop them; the shutdown token does. The watcher
+        // also returns when the service stops on its own.
+        #[cfg(feature = "push-store")]
+        if let PushRole::Enabled(service) = &self.config.push {
+            let push_stop = service.stop_token();
+            let relay_token = token.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    () = relay_token.cancelled() => push_stop.cancel(),
+                    () = push_stop.cancelled() => {}
+                }
+            });
+        }
     }
 
     /// Binds `config.bind_addr` and starts the relay on it, as
@@ -4580,7 +4596,11 @@ mod tests {
             verifier: Arc<dyn PushSignatureVerifier>,
         ) -> (SocketAddr, PushRegistrationStore, tempfile::TempDir) {
             let dir = tempfile::tempdir().unwrap();
-            let store = PushRegistrationStore::open_sqlite(&dir.path().join("push.db")).unwrap();
+            let store = PushRegistrationStore::open_sqlite(
+                &dir.path().join("push.db"),
+                crate::relay::push_store::PushStoreAtRest::Unkeyed,
+            )
+            .unwrap();
             let push = PushRole::Enabled(
                 PushService::start(PushServiceConfig {
                     store: store.clone(),
@@ -4590,6 +4610,48 @@ mod tests {
                 .unwrap(),
             );
             (start_push_server(push).await, store, dir)
+        }
+
+        /// A relay shutdown stops the push service's lookup and drain while
+        /// the relay's configuration, and so a clone of the role, is still
+        /// held: the shutdown token, not the last clone, stops them.
+        #[tokio::test]
+        async fn relay_shutdown_stops_the_push_tasks() {
+            let dir = tempfile::tempdir().unwrap();
+            let store = PushRegistrationStore::open_sqlite(
+                &dir.path().join("push.db"),
+                crate::relay::push_store::PushStoreAtRest::Unkeyed,
+            )
+            .unwrap();
+            let push = PushRole::Enabled(
+                PushService::start(PushServiceConfig {
+                    store,
+                    verifier: test_verifier(),
+                    senders: Arc::from(vec![apns_sender()]),
+                })
+                .unwrap(),
+            );
+            let config = RelayConfig {
+                bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+                push: push.clone(),
+                ..RelayConfig::defaults(LiveRelayUrl::new(RelayUrl::new(PUSH_RELAY_URL).unwrap()))
+            };
+            let server = RelayServer::new(config, Arc::new(BlobStorageBackend::in_memory()));
+            let (handle, _addr) = server.start().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert_eq!(push.tasks_running(), 2, "one lookup and one drain");
+            handle.shutdown();
+            for _ in 0..1000 {
+                if push.tasks_running() == 0 {
+                    drop(server);
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            panic!(
+                "{} push tasks outlived the relay shutdown",
+                push.tasks_running()
+            );
         }
 
         /// A test verifier holding `key(7)` as the registrant's key.
@@ -4611,7 +4673,11 @@ mod tests {
         async fn enabled_relay_rejects_an_unsealed_registration_at_a_tier3_id_with_4060() {
             let fixture = crate::relay::push_gate::tier3_fixture().unwrap();
             let dir = tempfile::tempdir().unwrap();
-            let store = PushRegistrationStore::open_sqlite(&dir.path().join("push.db")).unwrap();
+            let store = PushRegistrationStore::open_sqlite(
+                &dir.path().join("push.db"),
+                crate::relay::push_store::PushStoreAtRest::Unkeyed,
+            )
+            .unwrap();
             let push = PushRole::Enabled(
                 PushService::start(PushServiceConfig {
                     store: store.clone(),
@@ -4885,7 +4951,11 @@ mod tests {
         /// A relay with `senders`, `test_verifier()`, and a fresh SQLite store.
         async fn start_waking(senders: Vec<PushSender>) -> (SocketAddr, tempfile::TempDir) {
             let dir = tempfile::tempdir().unwrap();
-            let store = PushRegistrationStore::open_sqlite(&dir.path().join("push.db")).unwrap();
+            let store = PushRegistrationStore::open_sqlite(
+                &dir.path().join("push.db"),
+                crate::relay::push_store::PushStoreAtRest::Unkeyed,
+            )
+            .unwrap();
             let service = PushService::start(PushServiceConfig {
                 store,
                 verifier: test_verifier(),

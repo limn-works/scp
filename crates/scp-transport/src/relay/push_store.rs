@@ -231,6 +231,38 @@ pub enum PushStoreError {
     /// The backing database failed or holds a malformed row.
     #[error("push store: {0}")]
     Storage(String),
+    /// The store's file, or one of its `-wal`, `-shm` and `-journal`
+    /// sidecars, grants access to its group or to others. The store holds
+    /// every registered device token, so it opens only when its owner alone
+    /// can read it.
+    #[error(
+        "push store file '{}' has mode {mode:o}, which grants access to its group or to others; \
+         it must grant access to its owner only (0600)",
+        path.display()
+    )]
+    FileExposed {
+        /// The file whose mode is too wide.
+        path: std::path::PathBuf,
+        /// Its permission bits.
+        mode: u32,
+    },
+    /// The store's path, or one of its sidecar paths, is not a regular file
+    /// (a directory, a symbolic link, or a device).
+    #[error("push store path '{}' is not a regular file", path.display())]
+    NotAFile {
+        /// The path that is not a regular file.
+        path: std::path::PathBuf,
+    },
+    /// This platform has no owner-only file mode to check, so the store
+    /// cannot confirm that only its owner can read it.
+    #[error(
+        "push store file '{}' cannot be checked for owner-only access on this platform",
+        path.display()
+    )]
+    OwnerOnlyUnsupported {
+        /// The store's path.
+        path: std::path::PathBuf,
+    },
 }
 
 impl PushStoreError {
@@ -241,7 +273,9 @@ impl PushStoreError {
     ///   the skew window, so it gets the same code.
     /// - [`Self::LimitReached`]: `4064` `PUSH_REGISTRATION_LIMIT`.
     /// - [`Self::EmptyRoutingIds`]: `4060` `PUSH_REGISTRATION_REJECTED`.
-    /// - [`Self::Storage`]: `5000` `INTERNAL_ERROR`.
+    /// - [`Self::Storage`] and the three file refusals: `5000`
+    ///   `INTERNAL_ERROR`. A store with an unsafe file never opens, so a
+    ///   running relay never answers with these.
     #[must_use]
     pub const fn wire_code(&self) -> u16 {
         use scp_relay_client::code;
@@ -249,7 +283,10 @@ impl PushStoreError {
             Self::Stale { .. } | Self::TimestampOutOfRange(_) => code::PUSH_REGISTRATION_STALE,
             Self::LimitReached { .. } => code::PUSH_REGISTRATION_LIMIT,
             Self::EmptyRoutingIds => code::PUSH_REGISTRATION_REJECTED,
-            Self::Storage(_) => code::INTERNAL_ERROR,
+            Self::Storage(_)
+            | Self::FileExposed { .. }
+            | Self::NotAFile { .. }
+            | Self::OwnerOnlyUnsupported { .. } => code::INTERNAL_ERROR,
         }
     }
 }
@@ -288,16 +325,50 @@ pub enum PushRegistrationStore {
     InMemory(InMemoryPushStore),
 }
 
+/// How the SQLite push store protects its file at rest.
+///
+/// Both arms create the file with mode 0600 and refuse a file or sidecar that
+/// grants access to its group or to others.
+#[derive(Clone, Copy)]
+pub enum PushStoreAtRest<'a> {
+    /// No `SQLCipher` key, as for the relay blob store: §10.7.1 accepts that
+    /// the relay operator sees registrations and their tokens. `scp-relay`
+    /// and `scp-node --relay-only` open their store this way.
+    Unkeyed,
+    /// Keyed with an `SQLCipher` key under the regime of the instance's other
+    /// databases (`PRAGMA key` with the raw 32-byte key, 4096-byte pages,
+    /// 256,000 PBKDF2-HMAC-SHA512 iterations, HMAC-SHA512). A full node passes
+    /// its instance storage key, so the push store is protected like the
+    /// instance's own storage.
+    Keyed(&'a [u8; 32]),
+}
+
+impl std::fmt::Debug for PushStoreAtRest<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never the key bytes.
+        f.write_str(match self {
+            Self::Unkeyed => "Unkeyed",
+            Self::Keyed(_) => "Keyed(..)",
+        })
+    }
+}
+
 impl PushRegistrationStore {
-    /// Opens (or creates) the SQLite arm at `path`.
+    /// Opens (or creates) the SQLite arm at `path`, protected at rest as
+    /// `at_rest` says.
     ///
     /// # Errors
     ///
-    /// Returns [`PushStoreError::Storage`] when the database cannot be opened
-    /// or its schema cannot be applied. The caller sees the failure; nothing
-    /// falls back to another arm (SCP-CAPSEL-8001).
-    pub fn open_sqlite(path: &Path) -> Result<Self, PushStoreError> {
-        Ok(Self::Sqlite(SqlitePushStore::open(path)?))
+    /// - [`PushStoreError::FileExposed`], [`PushStoreError::NotAFile`] or
+    ///   [`PushStoreError::OwnerOnlyUnsupported`] when the file or a sidecar
+    ///   is not an owner-only regular file.
+    /// - [`PushStoreError::Storage`] when the database cannot be opened, the
+    ///   key does not open it, or its schema cannot be applied.
+    ///
+    /// The caller sees the failure; nothing falls back to another arm
+    /// (SCP-CAPSEL-8001).
+    pub fn open_sqlite(path: &Path, at_rest: PushStoreAtRest<'_>) -> Result<Self, PushStoreError> {
+        Ok(Self::Sqlite(SqlitePushStore::open(path, at_rest)?))
     }
 
     /// Creates the in-memory arm. Compiled only under the `testing` feature.
@@ -598,9 +669,10 @@ fn normalize(mut record: PushRegistrationRecord) -> Result<PushRegistrationRecor
 /// The durable push registration store, an `SQLCipher` database opened through
 /// `scp-sqlite-pools`.
 ///
-/// No at-rest key is applied, as for the relay blob store: §10.7.1 accepts that
-/// the relay operator sees registrations and their tokens. Operators who want
-/// at-rest encryption use filesystem-level encryption.
+/// Its file and sidecars are owner-only (0600). A full node keys it with the
+/// instance storage key; a relay leaves it unkeyed, as for the relay blob
+/// store, because §10.7.1 accepts that the relay operator sees registrations
+/// and their tokens ([`PushStoreAtRest`]).
 #[derive(Clone)]
 pub struct SqlitePushStore {
     conn: Arc<Mutex<Connection>>,
@@ -826,14 +898,114 @@ fn keys_for_token(
     Ok(keys)
 }
 
+/// The sidecar files `SQLite` keeps beside the database at `path`.
+#[cfg(any(unix, test))]
+fn sidecars(path: &Path) -> [std::path::PathBuf; 3] {
+    ["-wal", "-shm", "-journal"].map(|suffix| {
+        let mut name = path.as_os_str().to_owned();
+        name.push(suffix);
+        std::path::PathBuf::from(name)
+    })
+}
+
+/// Creates the database file at `path` with mode 0600 when it is absent, then
+/// refuses unless it and every sidecar present is a regular file that grants
+/// nothing to its group or to others. `SQLite` creates the `-wal` and `-shm`
+/// files with the database file's mode, so an owner-only database file gets
+/// owner-only sidecars.
+#[cfg(unix)]
+fn prepare_owner_only(path: &Path) -> Result<(), PushStoreError> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    // Refuse a symbolic link or a wide mode before the create, which would
+    // follow a link.
+    check_owner_only(path, false)?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| PushStoreError::Storage(format!("create '{}': {e}", path.display())))?;
+    check_owner_only(path, true)?;
+    for sidecar in sidecars(path) {
+        check_owner_only(&sidecar, false)?;
+    }
+    Ok(())
+}
+
+/// Refuses `path` unless it is an owner-only regular file. An absent path
+/// passes unless `must_exist`.
+#[cfg(unix)]
+fn check_owner_only(path: &Path, must_exist: bool) -> Result<(), PushStoreError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !must_exist => return Ok(()),
+        Err(e) => {
+            return Err(PushStoreError::Storage(format!(
+                "inspect '{}': {e}",
+                path.display()
+            )));
+        }
+    };
+    if !meta.file_type().is_file() {
+        return Err(PushStoreError::NotAFile {
+            path: path.to_owned(),
+        });
+    }
+    let mode = meta.mode() & 0o7777;
+    if mode & 0o077 != 0 {
+        return Err(PushStoreError::FileExposed {
+            path: path.to_owned(),
+            mode,
+        });
+    }
+    Ok(())
+}
+
+/// Refuses: this platform has no owner-only mode to check.
+#[cfg(not(unix))]
+fn prepare_owner_only(path: &Path) -> Result<(), PushStoreError> {
+    Err(PushStoreError::OwnerOnlyUnsupported {
+        path: path.to_owned(),
+    })
+}
+
+/// Keys `conn` under the regime of the instance's other `SQLCipher`
+/// databases (`scp_platform`'s `SqliteStorage` and `native::combined`). Runs
+/// after memory security is confirmed, so `SQLCipher` wipes the blocks that
+/// held the key's hex text; the hex string and the statement are zeroized.
+fn apply_key(conn: &Connection, key: &[u8; 32]) -> Result<(), PushStoreError> {
+    let hex_key = Zeroizing::new(hex::encode(key));
+    let pragma_sql = Zeroizing::new(format!(
+        "PRAGMA key = \"x'{}'\";\n\
+         PRAGMA cipher_page_size = 4096;\n\
+         PRAGMA kdf_iter = 256000;\n\
+         PRAGMA cipher_hmac_algorithm = HMAC_SHA512;\n\
+         PRAGMA cipher_kdf_algorithm = PBKDF2_HMAC_SHA512;",
+        hex_key.as_str()
+    ));
+    conn.execute_batch(&pragma_sql)
+        .map_err(|e| storage("key", &e))?;
+    // `PRAGMA key` succeeds whatever the key; the first page read is what
+    // fails on a wrong key, so read one here and name the cause.
+    conn.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))
+        .map_err(|e| storage("the key does not open the push store", &e))
+}
+
 impl SqlitePushStore {
     /// Opens (or creates) the store at `path`.
     ///
     /// # Errors
     ///
-    /// [`PushStoreError::Storage`] when the database cannot be opened, memory
-    /// security cannot be confirmed, or the schema cannot be applied.
-    pub fn open(path: &Path) -> Result<Self, PushStoreError> {
+    /// - The file refusals of [`PushRegistrationStore::open_sqlite`].
+    /// - [`PushStoreError::Storage`] when the database cannot be opened,
+    ///   memory security cannot be confirmed, the key does not open it, or
+    ///   the schema cannot be applied.
+    pub fn open(path: &Path, at_rest: PushStoreAtRest<'_>) -> Result<Self, PushStoreError> {
+        prepare_owner_only(path)?;
         let conn =
             scp_sqlite_pools::open(path).map_err(|e| PushStoreError::Storage(e.to_string()))?;
         // The connection is a SQLCipher connection (`bundled-sqlcipher`).
@@ -845,6 +1017,9 @@ impl SqlitePushStore {
             .map_err(|e| storage("pragma", &e))?;
         scp_sqlite_pools::require_memory_security(&conn)
             .map_err(|e| PushStoreError::Storage(e.to_string()))?;
+        if let PushStoreAtRest::Keyed(key) = at_rest {
+            apply_key(&conn, key)?;
+        }
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
@@ -1578,7 +1753,10 @@ mod tests {
             }
         }
         let dir = tempfile::tempdir()?;
-        let store = PushRegistrationStore::open_sqlite(&dir.path().join("push.db"))?;
+        let store = PushRegistrationStore::open_sqlite(
+            &dir.path().join("push.db"),
+            PushStoreAtRest::Unkeyed,
+        )?;
         assert_eq!(arm_name(&store), "sqlite");
         Ok(())
     }
@@ -1605,6 +1783,144 @@ mod tests {
         );
         assert_eq!(PushStoreError::EmptyRoutingIds.wire_code(), 4060);
         assert_eq!(PushStoreError::Storage(String::new()).wire_code(), 5000);
+    }
+
+    /// A record carrying `token` on one routing ID.
+    fn record_with(token: &[u8]) -> PushRegistrationRecord {
+        PushRegistrationRecord {
+            registrant: "did:dht:alice".to_owned(),
+            platform: PushPlatform::Apns,
+            token: token.to_vec(),
+            routing_ids: vec![[1; 32]],
+            timestamp: 7,
+        }
+    }
+
+    /// Every file of the store at `path` that exists: the database and its
+    /// sidecars.
+    fn store_files(path: &Path) -> Vec<std::path::PathBuf> {
+        std::iter::once(path.to_owned())
+            .chain(sidecars(path))
+            .filter(|p| p.exists())
+            .collect()
+    }
+
+    /// The store creates its file with mode 0600, and the `-wal` and `-shm`
+    /// sidecars a write creates are 0600 too, whatever the process umask
+    /// would have given them.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn store_files_are_owner_only() -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("push.db");
+        let store = PushRegistrationStore::open_sqlite(&path, PushStoreAtRest::Unkeyed)?;
+        store.upsert(record_with(b"device-token")).await?;
+        let files = store_files(&path);
+        assert!(files.len() >= 2, "a WAL write leaves a sidecar: {files:?}");
+        for file in files {
+            let mode = std::fs::metadata(&file)?.mode() & 0o777;
+            assert_eq!(mode, 0o600, "{} has mode {mode:o}", file.display());
+        }
+        Ok(())
+    }
+
+    /// A store file, or a sidecar, that grants access to its group or to
+    /// others is refused with `FileExposed`, and a path that is not a regular
+    /// file with `NotAFile`. Nothing is opened in either case.
+    #[cfg(unix)]
+    #[test]
+    fn exposed_or_irregular_store_files_are_refused() -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("push.db");
+        std::fs::write(&path, b"")?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
+        assert_eq!(
+            PushRegistrationStore::open_sqlite(&path, PushStoreAtRest::Unkeyed).err(),
+            Some(PushStoreError::FileExposed {
+                path: path.clone(),
+                mode: 0o644
+            })
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        let wal = sidecars(&path)[0].clone();
+        std::fs::write(&wal, b"")?;
+        std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o640))?;
+        assert_eq!(
+            PushRegistrationStore::open_sqlite(&path, PushStoreAtRest::Unkeyed).err(),
+            Some(PushStoreError::FileExposed {
+                path: wal,
+                mode: 0o640
+            })
+        );
+
+        let link = dir.path().join("link.db");
+        std::os::unix::fs::symlink(&path, &link)?;
+        assert_eq!(
+            PushRegistrationStore::open_sqlite(&link, PushStoreAtRest::Unkeyed).err(),
+            Some(PushStoreError::NotAFile { path: link })
+        );
+        Ok(())
+    }
+
+    /// A keyed store opens again only with its key: not unkeyed and not with
+    /// another key. Its file holds no plaintext token, where an unkeyed
+    /// store's file does.
+    #[tokio::test]
+    async fn keyed_store_opens_only_with_its_key() -> Result<(), Box<dyn std::error::Error>> {
+        const TOKEN: &[u8] = b"plaintext-device-token-0123456789";
+        let key = [0x42; 32];
+        let dir = tempfile::tempdir()?;
+
+        let keyed = dir.path().join("keyed.db");
+        let store = PushRegistrationStore::open_sqlite(&keyed, PushStoreAtRest::Keyed(&key))?;
+        store.upsert(record_with(TOKEN)).await?;
+        drop(store);
+        let reopened = PushRegistrationStore::open_sqlite(&keyed, PushStoreAtRest::Keyed(&key))?;
+        assert_eq!(
+            reopened.get(&record_with(TOKEN).key()).await?,
+            Some(record_with(TOKEN))
+        );
+        drop(reopened);
+        for other in [
+            PushStoreAtRest::Unkeyed,
+            PushStoreAtRest::Keyed(&[0x43; 32]),
+        ] {
+            assert!(
+                matches!(
+                    PushRegistrationStore::open_sqlite(&keyed, other),
+                    Err(PushStoreError::Storage(_))
+                ),
+                "{other:?} opened the keyed store"
+            );
+        }
+        for file in store_files(&keyed) {
+            let bytes = std::fs::read(&file)?;
+            assert!(
+                !bytes.windows(TOKEN.len()).any(|w| w == TOKEN),
+                "{} holds the token in plaintext",
+                file.display()
+            );
+        }
+
+        // The control: the same write to an unkeyed store leaves the token
+        // readable in its files, so the search above can find it.
+        let plain = dir.path().join("plain.db");
+        let store = PushRegistrationStore::open_sqlite(&plain, PushStoreAtRest::Unkeyed)?;
+        store.upsert(record_with(TOKEN)).await?;
+        drop(store);
+        let mut found = false;
+        for file in store_files(&plain) {
+            found |= std::fs::read(&file)?
+                .windows(TOKEN.len())
+                .any(|w| w == TOKEN);
+        }
+        assert!(found, "the unkeyed control holds no plaintext token");
+        Ok(())
     }
 
     #[test]
