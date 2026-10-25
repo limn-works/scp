@@ -530,7 +530,7 @@ impl ExtensionLeaf {
     /// bilateral reset's leaf comes first: the reset moves the deadline and
     /// clears the consent tally only after the leaf is stored.
     #[must_use]
-    pub const fn append_mode(&self) -> AppendMode {
+    const fn append_mode(&self) -> AppendMode {
         match self {
             Self::Governance { .. } => AppendMode::AfterSideEffect,
             Self::Reset { .. } => AppendMode::FailClosed,

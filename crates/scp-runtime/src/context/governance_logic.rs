@@ -837,7 +837,7 @@ pub fn event_log_entries_for_consequences(
 /// evaluation runs over the receive buffer alone. Spec section 17.3 ("Event
 /// log write failures") names these sites; the pending-log-unit work gives
 /// them a read that cannot fail this way.
-pub fn event_log_entries_for_consequences_after_side_effect(
+pub(in crate::context) fn event_log_entries_for_consequences_after_side_effect(
     receive_buffer: &ReceiveBuffer,
     context_id: &str,
     now: u64,
