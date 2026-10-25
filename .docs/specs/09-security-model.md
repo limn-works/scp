@@ -3368,6 +3368,34 @@ The zero nonce is safe because each `k_i` seals exactly one plaintext. The advan
 
 **Ordering.** H publishes the advance before it encrypts any message under epoch N, so every member that holds a chain with H holds the key for H's first message under it. Under a block, H drops its chains with the blocked identity before it writes the advance (§9.16.3 step 2).
 
+**A distribution whose publish fails.** A sender-key distribution is an advance with its pushed entries, or a `SenderKeyResponse` (§9.16.2) that H sends to one member. H's publish of a distribution can fail after a step H cannot undo: H has persisted the rotation, and the membership change that caused the rotation (an Add, a removal, a leave, a reset, or a revocation of §9.16.10) has merged. When a relay refuses such a publish or the transport fails it, H does the following:
+
+1. H keeps the distribution in the durable state it wrote with the rotation or the Add. H records the time of the first attempt and the number of attempts.
+2. H publishes the distribution again under the republish rule of §9.10.2, at each tick of its governance timer and when a full reconnection asks H to send its queued distributions (ADR-029, offline and sync strategy). Each attempt requests the TTL that remains of the first attempt: `MAX_BLOB_TTL` (604,800 s) minus the seconds since the first attempt. The publish that follows the operation, and the publish that follows a live delivery, cover only the distributions H has never attempted, so only the timer and the reconnection retry a failed one. A distribution H restores with no record of an attempt is due at the next of these publishes.
+3. H drops the distribution when no TTL remains, `MAX_BLOB_TTL` after the first attempt, because the republish rule forbids a republish whose remaining TTL is zero. This section therefore defines no age cap of its own. A member left without the key requests it as §9.16.2 states.
+4. H reports each failed attempt, and each drop, to the operation that rotated or changed the membership, at the moment it records the attempt or the drop. The report is a typed outcome that names the target identity and the attempt count; a drop reports the attempts made before it.
+5. H never reverses the rotation, the epoch increment, or the membership change because a publish failed. The operation completes, and only the delivery of its distribution stays outstanding. The Ordering rule above still holds: H MUST NOT encrypt a message under epoch N while a distribution of epoch N to a current member has no accepted publish. An encrypt that this rule refuses fails with a typed error that names the pending distribution.
+
+Each attempt carries the payload H persisted, and H seals that payload into the group's MLS epoch at the time of the attempt, so a retry seals no second sender key. When H cannot seal the payload into the group, H reports the distribution as unsealable and does not retry it.
+
+When H queues a distribution, it replaces any distribution queued for the same target identity and the same recipient key, the key H sealed the sender key to. A receiver holds one key per sender behind a monotonic epoch floor (§9.16.1), so the newer distribution supersedes the older one. A `SenderKeyResponse` is sealed to the ephemeral key of the request it answers, so each request names a new recipient key; H therefore supersedes answers by target identity and epoch instead. An answer to a target identity at epoch N replaces every answer queued to that identity at epoch N or earlier, and a pushed distribution to that identity at epoch N + 1 replaces its answer at epoch N. A flood of `SenderKeyRequest`s from one identity thus leaves at most one answer to it per epoch in the queue. When the target identity leaves the context or loses read access, H drops its queued distributions to that identity in the durable step that drops the identity's sender key. When H rolls back an Add, it drops the distributions it queued for the joiner the same way.
+
+**A rotation that fails.** A leave of another member, a reset, or a write revocation of §9.16.10 obliges H to rotate (§9.16.4). H records the obligation in the durable step that records the membership or access change. When the rotation then fails, before or at its own durable step, H does the following:
+
+1. H keeps the change. The operation completes, and H reports it as complete.
+2. H restores the sender key, epoch, and queue it held before the rotation, so it publishes no distribution of a key that no durable step holds (Persist before publish).
+3. H reports the failure to the operation's caller as a typed event.
+4. H MUST NOT encrypt a message while the obligation stands. An encrypt that this rule refuses fails with a typed error.
+5. H retries the rotation at each tick of its governance timer. The durable step of a rotation that succeeds clears the obligation.
+
+A member that leaves sends nothing after its leave and does not rotate. The members that remain rotate.
+
+An Add that a join or a governance `AddMember` performs queues the new member's distribution in the durable step that records the Add. When H cannot build that distribution, H keeps the Add and reports the distribution as not built, and the new member requests the key as §9.16.2 states.
+
+When a full reconnection asks H to send its queued distributions, H answers with the report of that publish: the distributions a relay accepted, the distributions still queued, and the distributions H dropped. A distribution that stays queued does not fail the reconnection. The reconnection's outcome, and the relay contact it records, come from its sync alone.
+
+A receiver can get one distribution twice, because H removes a distribution from the queue only after a relay accepts it, and a crash between the accept and the removal makes H publish it again. A receiver that gets a `SenderKeyResponse` whose epoch equals the floor it holds for H, and whose key equals the key it installed for H at that epoch, treats it as a duplicate and handles it with no change. A response whose epoch is below the floor, or equals it with another key, stays refused.
+
 ### 9.16.10 Rotation Bound to a Governance Commit
 
 Alec ruled on 2026-10-21: "Yes to ban rotate commit" (ADR-066 decision 36). The design below is the architect agent's under that ruling.

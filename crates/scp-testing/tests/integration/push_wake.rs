@@ -1193,11 +1193,18 @@ async fn a_key_request_a_wake_delivers_stays_queued_until_the_answers_are_sent()
     publish_alice_key_request(&m, &url).await;
     wake_queues_the_answer(&m).await;
 
-    m.bob
+    let report = m
+        .bob
         .manager
         .send_queued_sender_keys(&m.ctx_id)
         .await
         .unwrap();
+    assert_eq!(
+        (report.sent, report.faults.len()),
+        (1, 0),
+        "the answer is sent: {:?}",
+        report.faults
+    );
     assert_eq!(
         m.bob
             .manager

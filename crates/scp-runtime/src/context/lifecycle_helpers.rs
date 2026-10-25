@@ -27,9 +27,10 @@
 //!    [`ContextExport`](crate::context::export_import::ContextExport).
 //! 2. [`leave_context`] — capability check + MLS remove + sender-key
 //!    cleanup + membership removal + close-on-empty.
-//! 3. [`drain_and_deliver_sender_keys`] — drain pending sender-key
-//!    distribution and MLS-wrap deliver via transport (used by both
-//!    [`join_context`] and [`leave_context`]).
+//! 3. [`drain_and_deliver_sender_keys`] — publish queued sender-key
+//!    distributions MLS-wrapped, keeping and reporting each one a publish
+//!    fails (spec 09 §9.16.9; used by the join, leave, governance, delivery,
+//!    and governance-timer paths).
 //! 4. [`close_context`] — single-arg forwarder into
 //!    [`close_context_with_key`].
 //! 5. [`close_context_with_key`] — full close body (governance gate +
@@ -86,6 +87,7 @@ use scp_protocol::context::{ContextError, ContextParams, ContextState};
 use crate::context::ContextHandle;
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::sequence::SendSequenceTracker;
+use crate::context::actor::state::DistributionReport;
 use crate::context::actor::state::{
     ContextCryptoState, ContextLifecycleState, ContextModeState, ContextRouting, PerContextState,
     RecvSequenceTracker,
@@ -312,6 +314,14 @@ pub async fn leave_context(
                 // floors (member-granular; siblings + local scalar retained).
                 deps.supervisor
                     .remove_member_floors(&context_id_bytes, member_did);
+                // §9.16.4: a remaining member rotates when another member
+                // departs, so the departed one holds no current key. The debt
+                // persists with the removal, so a rotation that fails stays
+                // owed (§9.16.9 "A rotation that fails"). A departing local
+                // member sends nothing more and owes none.
+                if member_did.as_ref() != local_did {
+                    state.mark_sender_key_rotation_pending()?;
+                }
                 Some(remove_output.commit_bytes)
             };
 
@@ -380,8 +390,9 @@ pub async fn leave_context(
     // `ContextTransportProvider` is async and cannot be awaited inside the
     // synchronous `_keep` closure above). The membership removal is already
     // fail-closed-persisted; the MLS-Commit broadcast's failure bookkeeping is
-    // itself re-persisted FAIL-CLOSED (see below), while the sender-key rotation +
-    // delivery are best-effort crypto/transport side-effects. The captured
+    // itself re-persisted FAIL-CLOSED (see below). A sender-key rotation that
+    // fails stays pending and is reported by event, and the leave stands; a
+    // failed delivery stays queued (spec 09 §9.16.9). The captured
     // `mls_commit_bytes` is the removal Commit already produced under the crypto
     // `Arc` (Class-M) inside the closure.
     if !is_broadcast {
@@ -404,54 +415,11 @@ pub async fn leave_context(
             governance_helpers::keep_broadcast_failure(cell, deps, &context_id, failure).await?;
         }
 
-        // Rotate the local sender key and distribute to remaining members
-        // (§9.16.4). ADR-049 PR-7: Class-S — the epoch bump is sync-persisted
-        // fail-closed via `commit_class_s_keep` (a bumped-then-crash-lost epoch
-        // would let the departed member's old key keep decrypting); anti-replay
-        // backstop is the never-regressing registry floor (`mirror_forward`,
-        // `?`-propagated). M23: sender-key rotation + distribution stays
-        // best-effort — a rotate/persist failure is logged and the leave continues
-        // (MLS removal above is the hard security boundary).
-        let local_did = deps.crypto.local_did().to_owned();
-        match cell
-            .commit_class_s_keep(deps, &context_id, |mut v| {
-                let s = v.rest_mut();
-                s.rotate_sender_key(&local_did)?;
-                Ok(s.local_sender_key_epoch())
-            })
-            .await
-        {
-            Ok(epoch) => {
-                // ADR-049 PR-6/PR-7: advance the durably-bumped local epoch in the
-                // authoritative floor registry (fail-closed backstop).
-                crate::context::messaging_helpers::mirror_forward_local_sender_epoch(
-                    deps,
-                    &context_id_bytes,
-                    epoch,
-                )?;
-            }
-            Err(e) => {
-                tracing::warn!(
-                    context_id = %context_id,
-                    error = %e,
-                    "rotate_sender_key failed after leave — \
-                     remaining members retain old sender key"
-                );
-            }
-        }
-        {
-            // Drain through the actor's crypto state (same one the rotation just
-            // populated); `&mut` view scoped so `cell` is free afterward.
-            let mut view = cell.class_c_view();
-            if let Err(e) =
-                drain_and_deliver_sender_keys(deps, view.mode_mut().crypto_mut(), &context_id).await
-            {
-                tracing::warn!(
-                    context_id = %context_id,
-                    error = %e,
-                    "failed to deliver rotated sender keys after leave"
-                );
-            }
+        // A remaining member rotates the local sender key and publishes it to
+        // the members left (§9.16.4: removal implies blocking). The departing
+        // local member does not: after its own leave it encrypts nothing.
+        if member_did.as_ref() != deps.crypto.local_did() {
+            rotate_sender_key_and_distribute(cell, deps, &context_id).await;
         }
     }
 
@@ -501,65 +469,259 @@ pub async fn leave_context(
 // 3. drain_and_deliver_sender_keys (per-context, transitive of join / leave)
 // ---------------------------------------------------------------------------
 
-/// Drains pending sender key distribution messages and delivers them via
-/// transport (§9.16.2).
+/// Adds `member_did` to the MLS group and queues its sender-key
+/// distribution, in the one Class-S step that records the Add (spec 09
+/// §9.16.9). The join and the governance `AddMember` both call it, so the two
+/// give one disposition.
 ///
-/// Helper semantics:
-///   - Drain failure (catastrophic, e.g. lock poisoned) → propagated
-///     and forces full rollback at the caller.
-///   - Per-target encrypt/send failure → warned and continued. The
-///     joiner falls back to `SenderKeyRequest` to recover the key.
+/// The §9.10.4.1 membership trigger is recorded with the add. When the
+/// distribution cannot be built, the add stands and the distribution is
+/// reported as not built (`SenderKeyDistributionFailed`); the new member
+/// requests the key (§9.16.2). An add that produced no Welcome (the
+/// `testing` no-crypto pipeline, with no MLS group) queues nothing.
 ///
 /// # Errors
 ///
-/// Returns a [`ContextError`] if the underlying drain call fails
-/// catastrophically. Per-recipient send failures are logged but not
-/// propagated (the receiver can recover via `SenderKeyRequest`).
-pub async fn drain_and_deliver_sender_keys(
+/// The error of `PerContextState::add_member`; nothing is added then.
+pub(super) fn add_member_and_queue_distribution(
+    state: &mut crate::context::actor::state::PerContextState,
     deps: &ActorDeps,
-    crypto_state: Option<&mut crate::context::actor::state::ContextCryptoState>,
+    member_did: &str,
+    key_package: Option<&[u8]>,
+) -> Result<scp_protocol::context::builder::AddMemberOutput, ContextError> {
+    let local_did = deps.crypto.local_did();
+    let output = state.add_member(member_did, key_package, deps.clock.as_ref())?;
+    crate::context::actor::pseudonym_rotation::note_member_added(state, local_did, member_did);
+    if !output.welcome_bytes.is_empty()
+        && let Err(e) = state.distribute_sender_key(local_did, member_did, deps.event_tx.as_ref())
+    {
+        let context_id = state.handle.context_id().to_owned();
+        crate::context::actor::state::DistributionFault::NotBuilt {
+            target_did: member_did.to_owned(),
+            reason: e.to_string(),
+        }
+        .report(
+            &mut state.receive_buffer,
+            &context_id,
+            deps.event_tx.as_ref(),
+        );
+    }
+    Ok(output)
+}
+
+/// Rotates the local sender key after a membership or access change and
+/// publishes what the rotation queued (spec 09 §9.16.4: removal implies
+/// blocking, and a block is a sender-side rotation; §9.16.10 for a revoke).
+///
+/// The change that owes the rotation marks it pending in its own durable
+/// step (`mark_sender_key_rotation_pending`); the rotation's durable step
+/// clears the mark. The epoch bump persists fail-closed through
+/// `commit_class_s_keep`, and a bumped epoch advances the floor registry.
+///
+/// A rotation that does not land never fails the change that owes it, which
+/// has already completed (spec 09 §9.16.9 "A rotation that fails"). The key,
+/// epoch and queue go back to what they were before the attempt, so nothing
+/// built from a key no durable step holds is published; the rotation stays
+/// pending, so `seal` refuses to encrypt; one `SenderKeyRotationPending`
+/// event reports the error; and the governance timer retries. A floor
+/// registry refusal after the rotation persisted leaves the rotation in
+/// place and keeps it pending, so the retry rotates past it.
+///
+/// The publish pass runs either way: a failed publish stays queued and is
+/// reported by event (§9.16.9).
+pub(in crate::context) async fn rotate_sender_key_and_distribute(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
     context_id: &str,
-) -> Result<(), ContextError> {
-    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): drain + MLS-wrap the rotated sender-key
-    // distributions through the actor's OWNED field-granular Class-C
-    // `&mut ContextCryptoState` — the SAME crypto state the producer
-    // (`rotate_sender_key` / `add_member`) populated, so producer and consumer
-    // stay coherent. The provider steady-state twins
-    // (`drain_pending_sender_key_messages` / `mls_encrypt_management`) are deleted;
-    // there is no provider queue to fall back to. A broadcast context has no MLS
-    // `ContextCryptoState` (`crypto_mut()` is `None`) and no sender-key
-    // distributions — draining nothing is correct (rotation is skipped for
-    // broadcast, so the queue is always empty here).
-    let Some(crypto_state) = crypto_state else {
-        return Ok(());
+) {
+    let local_did = deps.crypto.local_did().to_owned();
+    let preimage = cell
+        .class_c_view()
+        .mode_mut()
+        .crypto_mut()
+        .map(|crypto| crypto.rotation_preimage());
+    let persisted = cell
+        .commit_class_s_keep(deps, context_id, |mut v| {
+            let s = v.rest_mut();
+            s.rotate_sender_key(&local_did, deps.event_tx.as_ref())?;
+            Ok(s.local_sender_key_epoch())
+        })
+        .await;
+    let failure = match persisted {
+        Ok(epoch) => crate::context::messaging_helpers::mirror_forward_local_sender_epoch(
+            deps,
+            &state::context_id_to_bytes(context_id),
+            epoch,
+        )
+        .err()
+        .map(|e| (e, None)),
+        Err(e) => Some((e, preimage)),
     };
-    let pending = std::mem::take(&mut crypto_state.pending_distributions);
-    if !pending.is_empty() {
-        let routing_id = scp_protocol::context::context_routing_id(context_id);
-        for (target_did, message) in pending {
-            tracing::debug!(
-                target_did = %target_did,
-                context_id = %context_id,
-                message_len = message.len(),
-                "MLS-encrypting and sending rotated sender key distribution"
-            );
-            let sealed = crypto_state.mls_encrypt_management(&message);
-            match sealed {
-                Ok(sealed) => {
-                    // A sealed management message requests the relay maximum
-                    // (spec 09 §9.10.2 "Blob TTL by message type").
-                    let ttl = scp_protocol::envelope::outer::BlobTtl::sealed_management();
-                    if let Err(e) = deps.transport.send_message(&routing_id, &sealed, ttl).await {
-                        tracing::warn!(target_did = %target_did, context_id = %context_id, error = %e, "failed to send rotated sender key");
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(target_did = %target_did, context_id = %context_id, error = %e, "MLS encryption of sender key distribution failed");
-                }
+    if let Some((error, preimage)) = failure {
+        tracing::error!(
+            context_id,
+            error = %error,
+            "sender-key rotation did not land; it stays pending and encrypt is refused"
+        );
+        let ctx_id_hex = hex::encode(state::context_id_to_bytes(context_id));
+        let mut view = cell.class_c_view();
+        if let Some(crypto) = view.mode_mut().crypto_mut() {
+            match preimage {
+                Some(preimage) => crypto.undo_rotation(preimage, &ctx_id_hex, &local_did),
+                None => crypto.sender_key_rotation_pending = true,
             }
         }
+        view.emit_event(
+            ContextEvent::SenderKeyRotationPending {
+                error: error.to_string(),
+            },
+            context_id,
+            deps.event_tx.as_ref(),
+        );
     }
-    Ok(())
+    drain_and_deliver_sender_keys(
+        deps,
+        &mut cell.class_c_view(),
+        context_id,
+        DistributionScope::NeverAttempted,
+    )
+    .await;
+}
+
+/// Retries a sender-key rotation that a membership or access change owes and
+/// that has not landed (spec 09 §9.16.9 "A rotation that fails"). The
+/// governance timer calls it each tick; it does nothing when no rotation is
+/// owed or the context is a broadcast one.
+pub(in crate::context) async fn retry_pending_sender_key_rotation(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    context_id: &str,
+) {
+    if cell.sender_key_rotation_pending() {
+        rotate_sender_key_and_distribute(cell, deps, context_id).await;
+    }
+}
+
+/// Which queued sender-key distributions one pass of
+/// [`drain_and_deliver_sender_keys`] publishes (spec 09 §9.16.9 step 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DistributionScope {
+    /// Only distributions never attempted: the publish right after a
+    /// rotation or an Add, and the one after a `Live` delivery. A failed
+    /// distribution waits for the governance timer or a full reconnection.
+    NeverAttempted,
+    /// Every queued distribution: the governance timer's tick and the
+    /// re-send a full reconnection asks for (ADR-029, offline and sync
+    /// strategy). A distribution restored with no attempt record is due here.
+    All,
+}
+
+impl DistributionScope {
+    const fn selects(self, entry: &crate::crypto::mls::provider::PendingDistribution) -> bool {
+        match self {
+            Self::NeverAttempted => entry.first_attempt_at.is_none(),
+            Self::All => true,
+        }
+    }
+}
+
+/// Publishes queued sender-key distributions (spec 09 §9.16.2, §9.16.9) and
+/// reports each one it does not deliver.
+///
+/// Each selected entry is MLS-sealed into the group's current epoch and
+/// published with the TTL that remains of its first attempt
+/// (`BlobTtl::republish_sealed_management`, §9.10.2). An entry leaves the
+/// queue only when a relay accepts it, MLS cannot seal it, or no TTL
+/// remains; a failed publish keeps it with its attempt record. Because
+/// removal follows the publish, a pass cancelled mid-publish (the
+/// `SendQueuedSenderKeys` timeout) loses no entry. The pass never undoes the
+/// rotation or membership change that queued an entry.
+///
+/// Each fault is reported when it is recorded, by one local event on the
+/// context's receive buffer and event channel (`SenderKeyDistributionPending`
+/// for a requeued entry, `SenderKeyDistributionFailed` for a dropped one),
+/// before the pass awaits again, so a cancelled pass loses no report. The
+/// pass also returns the faults as a typed [`DistributionReport`]. The
+/// attempt record is coalesced state (spec 05 §5.15.3): the caller's handler
+/// reports the turn mutated and the run loop persists it.
+pub(super) async fn drain_and_deliver_sender_keys(
+    deps: &ActorDeps,
+    view: &mut crate::context::actor::class_s::ClassCMut<'_>,
+    context_id: &str,
+    scope: DistributionScope,
+) -> DistributionReport {
+    use crate::context::actor::state::DistributionFault;
+    use scp_protocol::envelope::outer::BlobTtl;
+
+    let mut report = DistributionReport::default();
+    let routing_id = scp_protocol::context::context_routing_id(context_id);
+    let now = deps.clock.now_secs();
+    let mut index = 0;
+    // A broadcast context has no MLS crypto state and never queues a
+    // distribution (rotation is skipped for broadcast).
+    while let Some(crypto_state) = view.mode_mut().crypto_mut() {
+        let Some(entry) = crypto_state.pending_distributions.get(index) else {
+            break;
+        };
+        if !scope.selects(entry) {
+            index += 1;
+            continue;
+        }
+        let first_attempt_at = entry.first_attempt_at.unwrap_or(now);
+        let fault = match BlobTtl::republish_sealed_management(first_attempt_at, now) {
+            Err(expired) => {
+                let dropped = crypto_state.pending_distributions.remove(index);
+                DistributionFault::Expired {
+                    target_did: dropped.target_did,
+                    failed_attempts: dropped.failed_attempts,
+                    expired,
+                }
+            }
+            Ok(ttl) => {
+                let message = entry.message.clone();
+                match crypto_state.mls_encrypt_management(&message) {
+                    Err(error) => {
+                        let dropped = crypto_state.pending_distributions.remove(index);
+                        DistributionFault::Unsealable {
+                            target_did: dropped.target_did,
+                            failed_attempts: dropped.failed_attempts,
+                            error,
+                        }
+                    }
+                    Ok(sealed) => {
+                        match deps.transport.send_message(&routing_id, &sealed, ttl).await {
+                            Ok(()) => {
+                                crypto_state.pending_distributions.remove(index);
+                                report.sent += 1;
+                                continue;
+                            }
+                            Err(error) => {
+                                let Some(entry) = crypto_state.pending_distributions.get_mut(index)
+                                else {
+                                    break;
+                                };
+                                entry.first_attempt_at = Some(first_attempt_at);
+                                entry.failed_attempts = entry.failed_attempts.saturating_add(1);
+                                index += 1;
+                                DistributionFault::Requeued {
+                                    target_did: entry.target_did.clone(),
+                                    attempt: entry.failed_attempts,
+                                    error,
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        fault.report(
+            view.receive_buffer_mut(),
+            context_id,
+            deps.event_tx.as_ref(),
+        );
+        report.faults.push(fault);
+    }
+    report
 }
 
 // ---------------------------------------------------------------------------
@@ -1075,8 +1237,11 @@ pub async fn join_context(
     // which retains it as a birth-seam).
     let local_did = deps.crypto.local_did().to_owned();
 
-    // add_member — Class-S. On failure NO MLS rollback is needed (the add itself
-    // failed, so no member was added), matching the prior provider disposition.
+    // add_member + the joiner's sender-key distribution — one Class-S step
+    // through the add-then-distribute helper the governance `AddMember` shares
+    // (spec 09 §9.16.9). On failure NO MLS rollback is needed (the add itself
+    // failed, so no member was added); a distribution that cannot be built
+    // keeps the add and is reported as not built.
     //
     // The same commit records the §9.10.4.1 membership trigger for the local
     // member; the rollbacks below restore `rotation_before_add` with the MLS
@@ -1084,14 +1249,7 @@ pub async fn join_context(
     let rotation_before_add = cell.class_s.pseudonym_rotation.clone();
     let add_output = match cell
         .commit_class_s_keep(deps, &context_id, |mut v| {
-            let state = v.rest_mut();
-            let output = state.add_member(&member_did, kp_bytes, deps.clock.as_ref())?;
-            crate::context::actor::pseudonym_rotation::note_member_added(
-                state,
-                &local_did,
-                member_did.as_ref(),
-            );
-            Ok(output)
+            add_member_and_queue_distribution(v.rest_mut(), deps, &member_did, kp_bytes)
         })
         .await
     {
@@ -1117,92 +1275,21 @@ pub async fn join_context(
         }
     };
 
-    // distribute_sender_key — Class-S. On failure roll back the just-added member
-    // on the ACTOR (best-effort MLS remove + sender-key prune) + the registry
-    // floor, then the nonce/escrow/ticket rollback.
-    if let Err(e) = cell
-        .commit_class_s_keep(deps, &context_id, |mut v| {
-            v.rest_mut().distribute_sender_key(&local_did, &member_did)
-        })
-        .await
-    {
-        // Sender-key distribution failed after MLS add — roll back the MLS state
-        // on the actor's owned crypto (§9 Class-S, fail-closed persist).
-        let _ = cell
-            .commit_class_s_keep(deps, &context_id, |mut v| {
-                let s = v.rest_mut();
-                let _ = s.remove_member(&local_did, &member_did, deps.clock.as_ref());
-                // §9.10.4.1: the add did not commit, so neither does its
-                // membership trigger.
-                s.class_s.pseudonym_rotation = rotation_before_add;
-                s.remove_member_sender_key(&member_did)
-            })
-            .await;
-        // ADR-049 PR-6: prune the departed member's Class-M registry floors
-        // (member-granular; siblings + the local scalar retained).
-        deps.supervisor
-            .remove_member_floors(&context_id_bytes, &member_did);
-        // Keep-direction (ADR-049 §9): persist the burned nonce fail-closed
-        // before the existing escrow-void + ticket rollback.
-        let err = crate::context::messaging_helpers::commit_send_nonce_token_on_abort(
-            spending_nonce_token.take(),
-            &*cell,
-            deps,
-            &context_id,
-            e,
-        )
-        .await;
-        if let Some(a) = auth {
-            crate::context::economy_helpers::void_paid_action(deps, a, &context_id).await;
-        }
-        rollback_join_economy_ticket(cell, ticket);
-        return Err(err);
-    }
-
     // Drain pending HPKE-sealed sender-key distribution messages and deliver them
     // via the MLS management channel (§9.16.2). MLS-wrap is mandatory — see
     // comment on `drain_and_deliver_sender_keys`. ADR-049 PR-7: the producer is
     // now the ACTOR `distribute_sender_key` above (actor-owned queue), so drain
-    // the ACTOR queue via the Class-C crypto view (`Some(..)`). The view is scoped
-    // so it drops before any rollback below re-borrows `cell`.
-    let drain_result = {
-        let mut view = cell.class_c_view();
-        drain_and_deliver_sender_keys(deps, view.mode_mut().crypto_mut(), &context_id).await
-    };
-    if let Err(e) = drain_result {
-        // Drain failed catastrophically — roll back the MLS add on the actor,
-        // the sender key, the registry floor, the escrow, and the economy ticket
-        // so the join is fully aborted.
-        let _ = cell
-            .commit_class_s_keep(deps, &context_id, |mut v| {
-                let s = v.rest_mut();
-                let _ = s.remove_member(&local_did, &member_did, deps.clock.as_ref());
-                // §9.10.4.1: the add did not commit, so neither does its
-                // membership trigger.
-                s.class_s.pseudonym_rotation = rotation_before_add;
-                s.remove_member_sender_key(&member_did)
-            })
-            .await;
-        // ADR-049 PR-6: prune the departed member's Class-M registry floors
-        // (member-granular; siblings + the local scalar retained).
-        deps.supervisor
-            .remove_member_floors(&context_id_bytes, &member_did);
-        // Keep-direction (ADR-049 §9): persist the burned nonce fail-closed
-        // before the existing escrow-void + ticket rollback.
-        let err = crate::context::messaging_helpers::commit_send_nonce_token_on_abort(
-            spending_nonce_token.take(),
-            &*cell,
-            deps,
-            &context_id,
-            e,
-        )
-        .await;
-        if let Some(a) = auth {
-            crate::context::economy_helpers::void_paid_action(deps, a, &context_id).await;
-        }
-        rollback_join_economy_ticket(cell, ticket);
-        return Err(err);
-    }
+    // the ACTOR queue via the Class-C view. The distribution was persisted with
+    // the Add above, so a failed publish stays queued, is reported by event,
+    // and never aborts the join (spec 09 §9.16.9 "A distribution whose publish
+    // fails").
+    drain_and_deliver_sender_keys(
+        deps,
+        &mut cell.class_c_view(),
+        &context_id,
+        DistributionScope::NeverAttempted,
+    )
+    .await;
 
     // Phase 4: Membership mutation. On failure: void escrow + rollback
     // ticket + rollback MLS state. Routed through `cell.class_c_view()` — the

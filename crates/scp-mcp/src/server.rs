@@ -2335,6 +2335,9 @@ pub(crate) const fn affected_resources(event: &ContextEvent) -> AffectedResource
         | ContextEvent::CommitBroadcastPending { .. }
         | ContextEvent::CommitBroadcastSucceeded { .. }
         | ContextEvent::CommitBroadcastFailed { .. }
+        | ContextEvent::SenderKeyDistributionPending { .. }
+        | ContextEvent::SenderKeyDistributionFailed { .. }
+        | ContextEvent::SenderKeyRotationPending { .. }
         | ContextEvent::EquivocationDetected { .. }
         | ContextEvent::PseudonymAnnounced { .. }
         | ContextEvent::PseudonymRotationDue { .. }

@@ -2628,6 +2628,23 @@ pub struct PyContextReconnectResult {
     /// classified context, whose `outcome` carries the result.
     #[pyo3(get)]
     pub failure_code: Option<String>,
+    /// Sender-key distributions a relay accepted in the re-send that follows a
+    /// terminal-success sync (spec 09 §9.16.9).
+    #[pyo3(get)]
+    pub sender_keys_sent: u64,
+    /// Sender-key distributions whose re-send failed and that stay queued for
+    /// the governance timer or the next reconnection.
+    #[pyo3(get)]
+    pub sender_keys_pending: u64,
+    /// Sender-key distributions the re-send dropped undelivered: MLS could not
+    /// seal one, or no TTL remained.
+    #[pyo3(get)]
+    pub sender_keys_dropped: u64,
+    /// Why the re-send did not complete (its budget elapsed, or the actor
+    /// could not be reached); absent when it completed or did not run. The
+    /// sync `outcome` does not depend on it.
+    #[pyo3(get)]
+    pub sender_key_send_error: Option<String>,
 }
 
 /// Aggregate reconnection report surfaced to Python.
@@ -2668,6 +2685,10 @@ impl From<scp_ffi_common::reconnect::ReconnectReport> for PyReconnectReport {
                     envelopes_delivered: c.envelopes_delivered,
                     relay_contact_error: c.relay_contact_error,
                     failure_code: c.failure_code,
+                    sender_keys_sent: c.sender_keys_sent,
+                    sender_keys_pending: c.sender_keys_pending,
+                    sender_keys_dropped: c.sender_keys_dropped,
+                    sender_key_send_error: c.sender_key_send_error,
                 })
                 .collect(),
             messages_drained: report.messages_drained,
@@ -9156,6 +9177,59 @@ mod tests {
     /// closing handle's own cached string. Those two
     /// vocabularies differing is what a live read surfaces and a cached read
     /// hides.
+    /// Fails if `context_leave` returns an error, skips the `MemberLeft`
+    /// delivery, or leaves the receive channel open when the sender-key
+    /// rotation the leave obliges fails: the leave has completed, and the
+    /// rotation stays pending in the runtime (spec 09 §9.16.9 "A rotation
+    /// that fails").
+    #[test]
+    fn leave_completes_when_its_rotation_fails() {
+        pyo3::Python::with_gil(|py| {
+            let creator = "did:dht:z6MkLeaveRotationCreator";
+            let member = "did:dht:z6MkLeaveRotationMember";
+            let (scp, handle) = lifecycle_fixture("a3", creator);
+            let sup = Arc::clone(crate::runtime::supervisor(&scp.inner).unwrap());
+            let rt = crate::runtime().unwrap();
+            rt.block_on(sup.test_insert_member(
+                &handle.context_id,
+                scp_did::DID(member.to_owned()),
+                "member",
+            ))
+            .expect("record the member");
+            let (tx, rx) = mpsc::channel::<PyMessage>(RECEIVE_BUFFER_CAPACITY);
+            let rx_arc = Arc::new(tokio::sync::Mutex::new(rx));
+            crate::runtime::with_context(&scp.inner, &handle.context_id, |ctx| {
+                ctx.message_tx = Some(tx);
+                ctx.message_rx = Some(Arc::clone(&rx_arc));
+                Ok(())
+            })
+            .unwrap();
+            rt.block_on(sup.test_arm_rotation_failure(&handle.context_id))
+                .expect("arm the rotation failure");
+
+            scp.context_leave(py, &handle, member)
+                .expect("the leave completes although its rotation fails");
+
+            let delivered: Vec<String> = rt.block_on(async {
+                let mut rx = rx_arc.lock().await;
+                let mut out = Vec::new();
+                while let Ok(msg) = rx.try_recv() {
+                    out.push(String::from_utf8_lossy(&msg.payload).into_owned());
+                }
+                out
+            });
+            assert!(
+                delivered.iter().any(|p| p.starts_with("member_left")),
+                "MemberLeft is delivered: {delivered:?}"
+            );
+            let closed = crate::runtime::with_context(&scp.inner, &handle.context_id, |ctx| {
+                Ok(ctx.message_tx.is_none())
+            })
+            .unwrap();
+            assert!(closed, "the receive channel is closed");
+        });
+    }
+
     #[test]
     fn lifecycle_gates_refuse_a_context_the_supervisor_closed() {
         pyo3::Python::with_gil(|py| {

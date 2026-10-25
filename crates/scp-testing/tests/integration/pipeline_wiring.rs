@@ -2627,6 +2627,104 @@ fn drain_and_deliver_sender_keys_calls_mls_encrypt_management() {
     );
 }
 
+// --- A distribution whose publish fails (spec 09 §9.16.9) ---
+
+/// The drain reports every undelivered distribution by local event when it
+/// records the fault, so no caller can drop the report, and a failed publish
+/// requeues the entry instead of discarding it.
+#[test]
+fn drain_and_deliver_sender_keys_reports_and_requeues() {
+    let body = extract_fn_body(MANAGER_SRC, "drain_and_deliver_sender_keys")
+        .expect("drain_and_deliver_sender_keys body");
+    for needle in [
+        "fault.report(",
+        "DistributionFault::Requeued",
+        "republish_sealed_management(",
+    ] {
+        assert!(
+            body.contains(needle),
+            "drain_and_deliver_sender_keys must contain `{needle}` (spec 09 §9.16.9)"
+        );
+    }
+}
+
+/// A `SenderKeyRequest` answer enters the queue through the enqueue that
+/// supersedes the requester's queued answers at its epoch or earlier, so a
+/// request flood keeps one answer per requester and epoch (spec 09 §9.16.9).
+#[test]
+fn key_request_answer_is_queued_through_the_superseding_enqueue() {
+    assert!(
+        fn_body_contains(MANAGER_SRC, "decrypt_and_dispatch", "enqueue_answer("),
+        "decrypt_and_dispatch must queue a SenderKeyRequest answer through \
+         enqueue_answer (spec 09 §9.16.9)"
+    );
+}
+
+/// The governance timer retries every queued distribution (spec 09 §9.16.9
+/// step 2).
+#[test]
+fn governance_timer_retries_sender_key_distributions() {
+    const HANDLERS_GOVERNANCE_SRC: &str =
+        include_str!("../../../../crates/scp-runtime/src/context/actor/handlers/governance.rs");
+    let body = extract_fn_body(HANDLERS_GOVERNANCE_SRC, "evaluate_governance_timeouts")
+        .expect("evaluate_governance_timeouts body");
+    assert!(
+        body.contains("drain_and_deliver_sender_keys(") && body.contains("DistributionScope::All"),
+        "evaluate_governance_timeouts must retry every queued sender-key distribution \
+         (spec 09 §9.16.9)"
+    );
+}
+
+/// The explicit re-send request replies with the drain's typed report, never
+/// an error for a delivery fault (spec 09 §9.16.9).
+#[test]
+fn send_queued_sender_keys_replies_with_the_report() {
+    let body = extract_fn_body(HANDLERS_MESSAGING_SRC, "handle_send_queued_sender_keys")
+        .expect("handle_send_queued_sender_keys body");
+    assert!(
+        body.contains("drain_and_deliver_sender_keys(")
+            && body.contains("DistributionScope::All")
+            && body.contains("Ok(report)"),
+        "handle_send_queued_sender_keys must reply Ok with the drain report \
+         (spec 09 §9.16.9)"
+    );
+}
+
+/// The join and the governance Add share one add-then-distribute step, so
+/// both give a member with no distribution the same disposition (spec 09
+/// §9.16.9).
+#[test]
+fn join_and_add_share_the_add_then_distribute_step() {
+    const GOVERNANCE_HELPERS_SRC: &str =
+        include_str!("../../../../crates/scp-runtime/src/context/governance_helpers.rs");
+    for (src, caller) in [
+        (MANAGER_SRC, "join_context"),
+        (GOVERNANCE_HELPERS_SRC, "execute_add_member"),
+    ] {
+        assert!(
+            fn_body_contains(src, caller, "add_member_and_queue_distribution("),
+            "{caller} must add through add_member_and_queue_distribution \
+             (spec 09 §9.16.9)"
+        );
+    }
+}
+
+/// The persisted crypto blob carries the queue (spec 05 §5.15.3).
+#[test]
+fn export_crypto_state_persists_pending_distributions() {
+    const ACTOR_STATE_SRC: &str =
+        include_str!("../../../../crates/scp-runtime/src/context/actor/state.rs");
+    assert!(
+        fn_body_contains(
+            ACTOR_STATE_SRC,
+            "export_crypto_state",
+            "pending_distributions: crypto.pending_distributions"
+        ),
+        "export_crypto_state must persist the sender-key distribution queue \
+         (spec 05 §5.15.3)"
+    );
+}
+
 // --- Negative assertion: send_message must NOT call old encrypt_message ---
 
 #[test]
@@ -2919,8 +3017,47 @@ fn execute_remove_member_calls_rotate_sender_key() {
 #[test]
 fn leave_context_calls_rotate_sender_key() {
     assert!(
-        fn_body_contains(MANAGER_SRC, "leave_context", "rotate_sender_key"),
-        "leave_context must call rotate_sender_key (§9.16.4)"
+        fn_body_contains(
+            MANAGER_SRC,
+            "leave_context",
+            "rotate_sender_key_and_distribute(cell, deps, &context_id)"
+        ),
+        "leave_context must call rotate_sender_key_and_distribute (§9.16.4)"
+    );
+}
+
+/// The leave, the write revoke and the reset rotate through the one helper
+/// that rotates, publishes, and keeps a failed rotation pending (spec 09
+/// §9.16.4, §9.16.9, §9.16.10); the governance timer retries it.
+#[test]
+fn leave_and_write_revoke_rotate_through_the_reporting_helper() {
+    const HANDLERS_GOVERNANCE_SRC: &str =
+        include_str!("../../../../crates/scp-runtime/src/context/actor/handlers/governance.rs");
+    let helper = extract_fn_body(MANAGER_SRC, "rotate_sender_key_and_distribute")
+        .expect("rotate_sender_key_and_distribute exists");
+    for needle in [
+        ".rotate_sender_key(",
+        "mirror_forward_local_sender_epoch(",
+        "drain_and_deliver_sender_keys(",
+    ] {
+        assert!(
+            helper.contains(needle),
+            "rotate_sender_key_and_distribute must contain `{needle}`"
+        );
+    }
+    for caller in ["leave_context", "execute_revoke", "execute_reset_member"] {
+        assert!(
+            fn_body_contains(MANAGER_SRC, caller, "rotate_sender_key_and_distribute("),
+            "{caller} must rotate through rotate_sender_key_and_distribute"
+        );
+    }
+    assert!(
+        fn_body_contains(
+            HANDLERS_GOVERNANCE_SRC,
+            "evaluate_governance_timeouts",
+            "retry_pending_sender_key_rotation(cell, deps, &context_id)"
+        ),
+        "the governance timer must retry a pending sender-key rotation (§9.16.9)"
     );
 }
 

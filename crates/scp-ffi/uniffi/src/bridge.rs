@@ -2745,6 +2745,19 @@ pub struct ContextReconnectResult {
     /// is stored, `SCP-TRANS-5103` when reading it failed. Absent for a
     /// classified context, whose `outcome` carries the result.
     pub failure_code: Option<String>,
+    /// Sender-key distributions a relay accepted in the re-send that follows a
+    /// terminal-success sync (spec 09 §9.16.9).
+    pub sender_keys_sent: u64,
+    /// Sender-key distributions whose re-send failed and that stay queued for
+    /// the governance timer or the next reconnection.
+    pub sender_keys_pending: u64,
+    /// Sender-key distributions the re-send dropped undelivered: MLS could not
+    /// seal one, or no TTL remained.
+    pub sender_keys_dropped: u64,
+    /// Why the re-send did not complete (its budget elapsed, or the actor
+    /// could not be reached); absent when it completed or did not run. The
+    /// sync `outcome` does not depend on it.
+    pub sender_key_send_error: Option<String>,
 }
 
 /// Aggregate reconnection report (ADR-029).
@@ -2780,6 +2793,10 @@ impl From<scp_ffi_common::reconnect::ReconnectReport> for ReconnectReport {
                     envelopes_delivered: c.envelopes_delivered,
                     relay_contact_error: c.relay_contact_error,
                     failure_code: c.failure_code,
+                    sender_keys_sent: c.sender_keys_sent,
+                    sender_keys_pending: c.sender_keys_pending,
+                    sender_keys_dropped: c.sender_keys_dropped,
+                    sender_key_send_error: c.sender_key_send_error,
                 })
                 .collect(),
             messages_drained: report.messages_drained,

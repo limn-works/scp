@@ -81,6 +81,8 @@ pub fn classify_context_error(e: &ContextError) -> ContextErrorClass<'_> {
         ContextError::KeyPackageReplay(_) => K::Context(codes::CTX_2136),
         ContextError::NothingToRestore(_) => K::Context(codes::CTX_2137),
         ContextError::SupervisorShutDown(_) => K::Context(codes::CTX_2138),
+        ContextError::SenderKeyDistributionPending { .. } => K::Context(codes::CTX_2140),
+        ContextError::SenderKeyRotationPending { .. } => K::Context(codes::CTX_2141),
         ContextError::PermissionDenied(msg) => K::PermissionDenied(msg),
         ContextError::Outlet(surface) => K::Outlet(&surface.code),
         // The reserve-gate carrier renders no lifecycle state (it runs before
@@ -165,10 +167,39 @@ pub fn coded_creation_failure(
 
 #[cfg(test)]
 mod tests {
-    use super::{ContextErrorClass, classify_context_error, coded_creation_failure};
+    use super::{
+        ContextErrorClass, classify_context_error, coded_creation_failure, has_dedicated_code,
+    };
     use crate::error_codes as codes;
     use scp_protocol::context::ContextError;
     use scp_protocol::context::builder::ContextCreationError;
+
+    /// A send refused while a sender-key distribution is pending carries its
+    /// own code (spec 09 §9.16.9 step 5), never a call's fallback.
+    #[test]
+    fn a_pending_distribution_refusal_carries_ctx_2140() {
+        let refused = ContextError::SenderKeyDistributionPending {
+            target_did: "did:dht:bob".to_owned(),
+            epoch: 2,
+        };
+        assert!(matches!(
+            classify_context_error(&refused),
+            ContextErrorClass::Context(code) if code == codes::CTX_2140
+        ));
+        assert!(has_dedicated_code(&refused));
+    }
+
+    /// A send refused while an owed sender-key rotation has not landed
+    /// carries its own code (spec 09 §9.16.9), never a call's fallback.
+    #[test]
+    fn a_pending_rotation_refusal_carries_ctx_2141() {
+        let refused = ContextError::SenderKeyRotationPending { epoch: 3 };
+        assert!(matches!(
+            classify_context_error(&refused),
+            ContextErrorClass::Context(code) if code == codes::CTX_2141
+        ));
+        assert!(has_dedicated_code(&refused));
+    }
 
     /// A create refused with a coded `ContextError` (a custody failure, a
     /// shutdown, a ceiling rejection) yields that error; a generic wrapped

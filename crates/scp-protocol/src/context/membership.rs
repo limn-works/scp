@@ -810,6 +810,47 @@ pub enum ContextEvent {
         /// Total attempt count.
         attempts: u32,
     },
+    /// The publish of a sender-key distribution to `target_did` failed, and
+    /// the local member keeps the distribution queued and publishes it again
+    /// (spec 09 §9.16.9 "A distribution whose publish fails").
+    ///
+    /// The operation that queued the distribution (a rotation, an Add, a
+    /// removal, a leave, a reset, a revocation, or an answer to a
+    /// `SenderKeyRequest`) has completed and is not reversed. Local to the
+    /// publishing member: no Merkle leaf records it.
+    SenderKeyDistributionPending {
+        /// The member the distribution carries a sender key to.
+        target_did: DID,
+        /// The transport error from the failed attempt.
+        error: String,
+        /// 1-based count of failed attempts, this one included.
+        attempt: u32,
+    },
+    /// A rotation of the local sender key that a membership or access change
+    /// owes did not land (spec 09 §9.16.9 "A rotation that fails").
+    ///
+    /// The change has completed and is not reversed. The rotation stays
+    /// pending: the local member encrypts nothing until it lands, and its
+    /// governance timer retries it. Local to the rotating member: no Merkle
+    /// leaf records it.
+    SenderKeyRotationPending {
+        /// Why the rotation did not land.
+        error: String,
+    },
+    /// The local member dropped a queued sender-key distribution to
+    /// `target_did` without delivering it (spec 09 §9.16.9 "A distribution
+    /// whose publish fails"): no TTL remained under the republish rule, MLS
+    /// could not seal it into the group, or a newer distribution to the same
+    /// target displaced it from the bounded queue. The target recovers the key
+    /// by a `SenderKeyRequest` (§9.16.2). Local to the publishing member.
+    SenderKeyDistributionFailed {
+        /// The member the distribution carried a sender key to.
+        target_did: DID,
+        /// Why the local member dropped the distribution.
+        reason: String,
+        /// Failed publish attempts made before the drop.
+        attempts: u32,
+    },
     /// A member announced their pseudonym routing ID for this context (§9.10.4).
     ///
     /// Emitted when an incoming MLS application message carries a pseudonym
@@ -906,6 +947,9 @@ impl ContextEvent {
             Self::CommitBroadcastSucceeded { .. } => "CommitBroadcastSucceeded",
             Self::EquivocationDetected { .. } => "EquivocationDetected",
             Self::CommitBroadcastFailed { .. } => "CommitBroadcastFailed",
+            Self::SenderKeyDistributionPending { .. } => "SenderKeyDistributionPending",
+            Self::SenderKeyDistributionFailed { .. } => "SenderKeyDistributionFailed",
+            Self::SenderKeyRotationPending { .. } => "SenderKeyRotationPending",
             Self::PseudonymAnnounced { .. } => "PseudonymAnnounced",
             Self::PseudonymRotationDue { .. } => "PseudonymRotationDue",
             Self::PseudonymAnnouncementPending { .. } => "PseudonymAnnouncementPending",

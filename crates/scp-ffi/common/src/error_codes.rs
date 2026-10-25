@@ -631,6 +631,31 @@ pub const CTX_2138: &str = "SCP-CTX-2138";
 /// Distinct from `CTX_2138`, whose refused operation has done nothing, so a
 /// caller does not treat a started operation as one that never ran.
 pub const CTX_2139: &str = "SCP-CTX-2139";
+/// Sender-key distribution pending.
+///
+/// An encrypt under the local sender-key epoch was refused because a
+/// distribution of that epoch to a current member has no accepted publish
+/// (spec 09 §9.16.9 "A distribution whose publish fails", step 5). The
+/// distribution stays queued, and the governance timer and a full
+/// reconnection retry it; the send succeeds once a relay accepts it.
+///
+/// Distinct from the generic `CTX_2001` catch-all so a caller can tell a
+/// send that waits on a key distribution apart from a failed send.
+///
+/// Maps from `ContextError::SenderKeyDistributionPending`.
+pub const CTX_2140: &str = "SCP-CTX-2140";
+/// Sender-key rotation pending.
+///
+/// An encrypt was refused because a rotation of the local sender key that a
+/// membership or access change owes has not landed (spec 09 §9.16.9 "A
+/// rotation that fails"). The governance timer retries the rotation; the
+/// send succeeds once it lands.
+///
+/// Distinct from `CTX_2140`, whose rotation landed and whose distribution
+/// waits on a relay.
+///
+/// Maps from `ContextError::SenderKeyRotationPending`.
+pub const CTX_2141: &str = "SCP-CTX-2141";
 /// Media context error.
 pub const CTX_2500: &str = "SCP-CTX-2500";
 /// Media context key export error.

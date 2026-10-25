@@ -275,9 +275,12 @@ pub enum MessagingCommand {
     SendQueuedSenderKeys {
         /// Context identifier.
         context_id: String,
-        /// Oneshot reply channel. `Ok(())` once every queued answer was
-        /// handed to the transport or logged as failed.
-        reply: oneshot::Sender<Result<(), ContextError>>,
+        /// Oneshot reply channel: the report of the publish pass, whose
+        /// faults name each distribution that stays queued or was dropped
+        /// (spec 09 §9.16.9 "A distribution whose publish fails"). An error
+        /// only when the pass exceeds its budget.
+        reply:
+            oneshot::Sender<Result<crate::context::actor::state::DistributionReport, ContextError>>,
     },
 
     /// The number of sender-key answers queued on the actor (testing).
@@ -424,6 +427,19 @@ pub enum MessagingCommand {
         pseudonym: [u8; 32],
         /// Oneshot reply channel. Replies `Ok(())` once the registry is
         /// updated, or `Err` if the context is broadcast-routed.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+
+    /// Arms the one-shot rotation fault seam: the next local sender-key
+    /// rotation in this context fails before it mutates anything.
+    ///
+    /// Gated behind the `testing` feature — never compiled into production
+    /// builds, never reachable from any FFI bridge.
+    #[cfg(feature = "testing")]
+    TestArmRotationFailure {
+        /// Context identifier.
+        context_id: String,
+        /// Oneshot reply channel, `Ok(())` once armed.
         reply: oneshot::Sender<Result<(), ContextError>>,
     },
 

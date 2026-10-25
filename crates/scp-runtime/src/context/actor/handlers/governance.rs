@@ -1311,6 +1311,25 @@ pub(crate) async fn evaluate_governance_timeouts(
     ))
     .await;
 
+    // Phase 6: land a sender-key rotation that a membership or access change
+    // owes and that failed (spec 09 §9.16.9 "A rotation that fails"); a
+    // rotation that fails again stays pending for the next tick. Then publish
+    // again every queued sender-key distribution, each tick, under the
+    // republish rule (§9.16.9 "A distribution whose publish fails"): no
+    // backoff applies, and an entry leaves the queue only when a relay accepts
+    // it, MLS cannot seal it, or no TTL remains. The pass emits the Pending /
+    // Failed events itself; the attempt record it updates is coalesced,
+    // covered by the `mutated` outcome below.
+    crate::context::lifecycle_helpers::retry_pending_sender_key_rotation(cell, deps, &context_id)
+        .await;
+    crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
+        deps,
+        &mut cell.class_c_view(),
+        &context_id,
+        crate::context::lifecycle_helpers::DistributionScope::All,
+    )
+    .await;
+
     Outcome::ok_mutated(true)
 }
 

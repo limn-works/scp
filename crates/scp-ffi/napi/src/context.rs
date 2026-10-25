@@ -3566,6 +3566,19 @@ pub struct NapiContextReconnectResult {
     /// is stored, `SCP-TRANS-5103` when reading it failed. Absent for a
     /// classified context, whose `outcome` carries the result.
     pub failure_code: Option<String>,
+    /// Sender-key distributions a relay accepted in the re-send that follows a
+    /// terminal-success sync (spec 09 §9.16.9).
+    pub sender_keys_sent: f64,
+    /// Sender-key distributions whose re-send failed and that stay queued for
+    /// the governance timer or the next reconnection.
+    pub sender_keys_pending: f64,
+    /// Sender-key distributions the re-send dropped undelivered: MLS could not
+    /// seal one, or no TTL remained.
+    pub sender_keys_dropped: f64,
+    /// Why the re-send did not complete (its budget elapsed, or the actor
+    /// could not be reached); absent when it completed or did not run. The
+    /// sync `outcome` does not depend on it.
+    pub sender_key_send_error: Option<String>,
 }
 
 /// Aggregate reconnection report surfaced to TypeScript.
@@ -3605,6 +3618,10 @@ impl From<scp_ffi_common::reconnect::ReconnectReport> for NapiReconnectReport {
                     envelopes_delivered: c.envelopes_delivered as f64,
                     relay_contact_error: c.relay_contact_error,
                     failure_code: c.failure_code,
+                    sender_keys_sent: c.sender_keys_sent as f64,
+                    sender_keys_pending: c.sender_keys_pending as f64,
+                    sender_keys_dropped: c.sender_keys_dropped as f64,
+                    sender_key_send_error: c.sender_key_send_error,
                 })
                 .collect(),
             messages_drained: report.messages_drained as f64,
