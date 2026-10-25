@@ -190,6 +190,95 @@ pub enum AppendMode {
     AfterSideEffect,
 }
 
+/// A context's event-log write gate, held from the moment the drain reads the
+/// log's length until [`ContextEventLogProvider::append_unit`] writes the unit
+/// (spec 17 §17.3 "Event log write failures").
+///
+/// The drain reserves a unit's `base_seq` at [`Self::log_len`] while it holds
+/// the guard, so no other gated write can take that slot before the unit is
+/// written.
+#[derive(Debug)]
+pub struct UnitWriteGuard {
+    context_id: [u8; 32],
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    log_len: u64,
+}
+
+impl UnitWriteGuard {
+    /// Builds a guard for `context_id` whose log held `log_len` entries when
+    /// `permit` was taken. `permit` is `None` for a provider that keeps no
+    /// write gate.
+    #[must_use]
+    pub const fn new(
+        context_id: [u8; 32],
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+        log_len: u64,
+    ) -> Self {
+        Self {
+            context_id,
+            permit,
+            log_len,
+        }
+    }
+
+    /// The context the guard gates.
+    #[must_use]
+    pub const fn context_id(&self) -> &[u8; 32] {
+        &self.context_id
+    }
+
+    /// The log's length when the guard was taken.
+    #[must_use]
+    pub const fn log_len(&self) -> u64 {
+        self.log_len
+    }
+
+    /// Gives up the write gate's permit, if the provider keeps one.
+    #[must_use]
+    pub fn into_permit(self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.permit
+    }
+}
+
+/// How [`ContextEventLogProvider::append_unit`] placed a unit (spec 17 §17.3
+/// "Event log write failures").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnitAppended {
+    /// The log held `base_seq` entries; the unit was stored, then applied in
+    /// memory.
+    Appended,
+    /// The log already holds the unit at `base_seq`, leaf hash for leaf hash:
+    /// an earlier put reached storage and reported failure. Nothing was
+    /// written.
+    AlreadyPresent,
+}
+
+/// Why [`ContextEventLogProvider::append_unit`] did not place a unit (spec 17
+/// §17.3 "Event log write failures").
+#[derive(Debug, thiserror::Error)]
+pub enum UnitAppendError {
+    /// The log neither has length `base_seq` nor holds the unit at
+    /// `base_seq`.
+    #[error(
+        "event log unit misaligned: base_seq {base_seq}, log length {log_len}, slot taken {slot_taken}"
+    )]
+    Misaligned {
+        /// The `base_seq` the unit was reserved at.
+        base_seq: u64,
+        /// The log's length.
+        log_len: u64,
+        /// True when the log is longer than `base_seq` and its entry at
+        /// `base_seq` is not the unit's first entry: an append outside the
+        /// queue took the slot and the unit is absent, so the drain reserves
+        /// the unit again.
+        slot_taken: bool,
+    },
+    /// The unit is malformed, the context has no log, or storing the unit
+    /// failed. The in-memory log is then unchanged.
+    #[error(transparent)]
+    Failed(#[from] ContextCreationError),
+}
+
 /// Provides event log operations needed during context creation.
 ///
 /// Implementors initialise the Merkle event log and append events.
@@ -328,6 +417,123 @@ pub trait ContextEventLogProvider: Send + Sync {
     /// Creation rollback reports it as `RollbackFailed` (spec section 17.3,
     /// "Event log write failures").
     async fn destroy_event_log(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError>;
+
+    /// Takes the context's write gate and reads the log's length, for the
+    /// drain of queued log units (spec 17 §17.3 "Event log write failures").
+    ///
+    /// The default, for a provider that keeps no write gate, reads the length
+    /// from [`Self::event_log_entries`] and holds no permit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextCreationError::EventLogFailed`] when the context has
+    /// no log or the log cannot be read.
+    async fn lock_for_unit(
+        &self,
+        context_id: &[u8; 32],
+    ) -> Result<UnitWriteGuard, ContextCreationError> {
+        let len = match self.event_log_entries(context_id) {
+            Ok(Some(entries)) => entries.len(),
+            Ok(None) => {
+                return Err(ContextCreationError::EventLogFailed(format!(
+                    "no event log for context {}",
+                    hex::encode(context_id)
+                )));
+            }
+            Err(e) => return Err(ContextCreationError::EventLogFailed(e.to_string())),
+        };
+        let log_len = u64::try_from(len).map_err(|_| {
+            ContextCreationError::EventLogFailed("event log length exceeds u64".into())
+        })?;
+        Ok(UnitWriteGuard::new(*context_id, None, log_len))
+    }
+
+    /// Writes one queued log unit at `base_seq` under `guard`, chaining its
+    /// first entry to the entry at `base_seq − 1` (spec 17 §17.3 "Event log
+    /// write failures").
+    ///
+    /// Returns [`UnitAppended::Appended`] when the log held `base_seq`
+    /// entries and the unit was stored, and [`UnitAppended::AlreadyPresent`]
+    /// when the log already holds the unit at `base_seq`, leaf hash for leaf
+    /// hash. The default, for a provider that keeps no write gate, places the
+    /// unit from [`Self::event_log_entries`] and writes it through
+    /// [`Self::append_event`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UnitAppendError::Misaligned`] when neither holds, and
+    /// [`UnitAppendError::Failed`] when the unit is malformed, the context has
+    /// no log, or storing the unit fails.
+    async fn append_unit(
+        &self,
+        guard: UnitWriteGuard,
+        base_seq: u64,
+        leaves: &[crate::context::state::LeafSpec],
+    ) -> Result<UnitAppended, UnitAppendError> {
+        let context_id = *guard.context_id();
+        for leaf in leaves {
+            crate::context::providers::event_log::check_append_payload(
+                leaf.event_type,
+                &leaf.payload,
+            )?;
+        }
+        let entries = match self.event_log_entries(&context_id) {
+            Ok(Some(entries)) => entries,
+            Ok(None) => {
+                return Err(UnitAppendError::Failed(
+                    ContextCreationError::EventLogFailed(format!(
+                        "no event log for context {}",
+                        hex::encode(context_id)
+                    )),
+                ));
+            }
+            Err(e) => {
+                return Err(UnitAppendError::Failed(
+                    ContextCreationError::EventLogFailed(e.to_string()),
+                ));
+            }
+        };
+        match crate::context::providers::event_log::place_unit(&entries, base_seq, leaves)? {
+            crate::context::providers::event_log::UnitPlacement::Append(_) => {
+                for leaf in leaves {
+                    self.append_event(
+                        &context_id,
+                        leaf.event_type,
+                        &leaf.actor_did,
+                        leaf.payload.clone(),
+                        leaf.timestamp_secs,
+                    )
+                    .await?;
+                }
+                Ok(UnitAppended::Appended)
+            }
+            crate::context::providers::event_log::UnitPlacement::AlreadyPresent => {
+                Ok(UnitAppended::AlreadyPresent)
+            }
+            crate::context::providers::event_log::UnitPlacement::Misaligned {
+                log_len,
+                slot_taken,
+            } => Err(UnitAppendError::Misaligned {
+                base_seq,
+                log_len,
+                slot_taken,
+            }),
+        }
+    }
+
+    /// Records whether the context has queued log units (spec 17 §17.3
+    /// "Event log write failures"). While it does, a provider that keeps a
+    /// write gate refuses a fail-closed append, an import, and a prune for
+    /// the context, so no entry lands ahead of a queued one and no replace
+    /// re-chains the sequences a reserved `base_seq` names. The drain calls
+    /// this after each run.
+    ///
+    /// The default does nothing: a provider without a write gate has no
+    /// writer outside the context's actor, and the actor drains the queue
+    /// before it handles each command.
+    fn set_units_pending(&self, context_id: &[u8; 32], pending: bool) {
+        let _ = (context_id, pending);
+    }
 
     /// Releases the context's in-memory log and write gate without touching
     /// storage, so the next restore loads the stored log (shutdown, and a

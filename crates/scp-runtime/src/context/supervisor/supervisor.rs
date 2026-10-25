@@ -17228,6 +17228,10 @@ impl Supervisor {
             recv_tracker: crate::context::actor::state::RecvSequenceTracker::new(),
             xctx_ucan_proofs: scp_protocol::crypto::ucan::validate::InMemoryProofResolver::new(),
             class_s: crate::context::actor::state::ClassSState {
+                // Spec 17 §17.3: a Welcome joiner starts with no queued log unit
+                // and no log fault.
+                pending_log_units: crate::context::actor::class_s::PendingLogUnits::default(),
+                log_fault: None,
                 saga_pending: HashMap::new(),
                 xctx_committed_outputs: HashMap::new(),
                 xctx_committed_stream_outputs: HashMap::new(),
@@ -25016,6 +25020,8 @@ mod tests {
             revoked_spending_ucan_cids: HashSet::new(),
             pending_commits: std::collections::VecDeque::new(),
             commit_fault: None,
+            pending_log_units: std::collections::VecDeque::new(),
+            log_fault: None,
             checkpoint_events_since: 0,
             checkpoint_last_time_secs: 0,
             generation: 0,

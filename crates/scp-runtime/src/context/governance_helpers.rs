@@ -91,6 +91,35 @@ pub fn check_commit_fault(state: &PerContextState) -> Result<(), ContextError> {
     check_commit_fault_marker(state.commit_fault.as_ref())
 }
 
+/// Returns [`ContextError::EventLogFailed`] when the log-fault marker is set
+/// (spec 17 §17.3 "Event log write failures"): a queued log unit could not be
+/// placed in the log, or a log read after an irreversible step failed. Called
+/// at every site that calls the commit-fault gate.
+///
+/// # Errors
+///
+/// Returns [`ContextError::EventLogFailed`] if the marker is `Some`.
+pub fn check_log_fault_marker(
+    marker: Option<&crate::context::state::LogFaultMarker>,
+) -> Result<(), ContextError> {
+    if let Some(marker) = marker {
+        return Err(ContextError::EventLogFailed(format!(
+            "the context's event log is faulted (base_seq {:?}, log length {:?}): {}",
+            marker.base_seq, marker.log_len, marker.detail
+        )));
+    }
+    Ok(())
+}
+
+/// [`check_log_fault_marker`] over the actor-shape state.
+///
+/// # Errors
+///
+/// Returns [`ContextError::EventLogFailed`] if the log-fault marker is set.
+pub fn check_log_fault(state: &PerContextState) -> Result<(), ContextError> {
+    check_log_fault_marker(state.class_s.log_fault.as_ref())
+}
+
 // ---------------------------------------------------------------------------
 // emit helpers — re-export for convenience
 // ---------------------------------------------------------------------------
@@ -6243,6 +6272,7 @@ pub async fn execute_governance_action(
     // PR #1606 C6 fail-close gate + atomically check replay AND mark as
     // executed before dispatch. Actor-owned state — single linear sequence.
     check_commit_fault(cell)?;
+    check_log_fault(cell)?;
 
     // Resolve the authoritative proposal from the engine. Clone so the engine
     // borrow (taken via the cell's `Deref`) is dropped before the Class-S

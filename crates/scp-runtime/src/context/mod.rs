@@ -47,6 +47,7 @@ pub(crate) mod governance_logic;
 pub mod invitation_helpers;
 pub(crate) mod lifecycle_helpers;
 pub(crate) mod lifecycle_logic;
+pub(crate) mod log_unit_helpers;
 pub(crate) mod manager_methods;
 pub(crate) mod messaging_helpers;
 pub(crate) mod outlets_helpers;

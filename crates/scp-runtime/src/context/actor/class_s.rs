@@ -463,6 +463,79 @@ impl Deref for ClassSMut<'_> {
     }
 }
 
+/// The context's queue of event-log units written after an irreversible step
+/// (spec 17 §17.3 "Event log write failures"; ADR-049 §9 Class S).
+///
+/// The field is private to this module, so a unit enters the queue only
+/// through [`ClassSMut::enqueue_log_unit`], and the queue changes only through
+/// the [`ClassSMut`] methods below. A [`ClassSMut`] exists only inside a
+/// fail-closed combinator, so calling `enqueue_log_unit` anywhere else does
+/// not compile.
+#[derive(Debug, Default)]
+pub(crate) struct PendingLogUnits(VecDeque<crate::context::state::PendingLogUnit>);
+
+impl PendingLogUnits {
+    /// Rebuilds the queue from a persisted copy (same-node restore and
+    /// [`ClassSState::restore`]).
+    pub(crate) const fn restored(units: VecDeque<crate::context::state::PendingLogUnit>) -> Self {
+        Self(units)
+    }
+
+    /// True when no unit is queued.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The number of queued units.
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// The oldest queued unit, which the drain writes next.
+    pub(crate) fn front(&self) -> Option<&crate::context::state::PendingLogUnit> {
+        self.0.front()
+    }
+
+    /// A copy of the queue for a snapshot.
+    pub(crate) fn to_deque(&self) -> VecDeque<crate::context::state::PendingLogUnit> {
+        self.0.clone()
+    }
+}
+
+/// The queue and log-fault mutators (spec 17 §17.3 "Event log write
+/// failures"). Each runs inside the combinator that handed out this view, so
+/// the combinator's fail-closed persist stores the change.
+impl ClassSMut<'_> {
+    /// Sets the `base_seq` of the oldest queued unit. Returns `false` when the
+    /// queue is empty.
+    pub(crate) fn set_front_log_unit_base(&mut self, base_seq: Option<u64>) -> bool {
+        self.state
+            .class_s
+            .pending_log_units
+            .0
+            .front_mut()
+            .is_some_and(|unit| {
+                unit.base_seq = base_seq;
+                true
+            })
+    }
+
+    /// Removes the oldest queued unit after the drain wrote it.
+    pub(crate) fn pop_front_log_unit(&mut self) -> Option<crate::context::state::PendingLogUnit> {
+        self.state.class_s.pending_log_units.0.pop_front()
+    }
+
+    /// Sets the log-fault marker.
+    pub(crate) fn set_log_fault(&mut self, marker: crate::context::state::LogFaultMarker) {
+        self.state.class_s.log_fault = Some(marker);
+    }
+
+    /// Clears the log-fault marker.
+    pub(crate) fn clear_log_fault(&mut self) {
+        self.state.class_s.log_fault = None;
+    }
+}
+
 /// SHARED, READ-ONLY wrapper around a `&ClassSState` (ADR-049 §9 / BLACK-CS-01).
 ///
 /// Holds the actor's Class-S sub-struct as a PRIVATE shared reference. It exposes
