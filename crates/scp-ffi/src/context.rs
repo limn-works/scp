@@ -2919,9 +2919,9 @@ impl crate::scp::PyScp {
         // uses OnceLock internally — first call wins). #1073
         // Passes the joiner DID to NodeMlsFactory for real MLS encryption (#1324).
         #[cfg(test)]
-        crate::runtime::init_context_manager_for_test(bi);
+        crate::runtime::init_context_manager_for_test(bi)?;
         #[cfg(not(test))]
-        crate::runtime::init_context_manager(bi, identity_did);
+        crate::runtime::init_context_manager(bi, identity_did)?;
 
         // Delegate join to the shared ContextManager for membership tracking.
         {
@@ -3099,9 +3099,9 @@ impl crate::scp::PyScp {
         // it ever creates), so ensure the supervisor is attached first — the
         // same idempotent init context_join performs.
         #[cfg(test)]
-        crate::runtime::init_context_manager_for_test(bi);
+        crate::runtime::init_context_manager_for_test(bi)?;
         #[cfg(not(test))]
-        crate::runtime::init_context_manager(bi, owning_did);
+        crate::runtime::init_context_manager(bi, owning_did)?;
 
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -3198,9 +3198,9 @@ impl crate::scp::PyScp {
         // node's supervisor is attached first (this may be the joiner's first
         // context op — the same idempotent init context_join performs).
         #[cfg(test)]
-        crate::runtime::init_context_manager_for_test(bi);
+        crate::runtime::init_context_manager_for_test(bi)?;
         #[cfg(not(test))]
-        crate::runtime::init_context_manager(bi, &owning_did);
+        crate::runtime::init_context_manager(bi, &owning_did)?;
 
         // §9.10.4 + local-custody enforcement: DERIVE the joiner's routing
         // pseudonym from its locally-custodied identity — never caller-supplied.
@@ -3859,9 +3859,9 @@ impl crate::scp::PyScp {
         // now-verified `creator_did` is safe per the verify-before-init step
         // above.
         #[cfg(test)]
-        crate::runtime::init_context_manager_for_test(bi);
+        crate::runtime::init_context_manager_for_test(bi)?;
         #[cfg(not(test))]
-        crate::runtime::init_context_manager(bi, &creator_did);
+        crate::runtime::init_context_manager(bi, &creator_did)?;
 
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -6680,7 +6680,7 @@ mod tests {
             PyContextParams::from_py_dict(&dict).unwrap()
         });
         let context_id = "0".repeat(64);
-        crate::runtime::init_context_manager_for_test(bi);
+        crate::runtime::init_context_manager_for_test(bi).expect("the test supervisor initializes");
         let core_params = super::build_core_context_params(&params).unwrap();
         crate::runtime::create_supervisor_context_with_params_for_test(
             bi,
@@ -7531,7 +7531,8 @@ mod tests {
             let bi = Arc::clone(&scp.inner);
             let joiner = scp.identity_create(py, "in_memory", None).unwrap();
             let did = joiner.did().to_owned();
-            crate::runtime::init_context_manager_for_test(&bi);
+            crate::runtime::init_context_manager_for_test(&bi)
+                .expect("the test supervisor initializes");
             let sup = Arc::clone(crate::runtime::supervisor(&bi).unwrap());
 
             let kp = super::mint_self_join_key_package(py, &bi, &sup, &did)
@@ -7581,7 +7582,8 @@ mod tests {
                 .unwrap()
                 .did()
                 .to_owned();
-            crate::runtime::init_context_manager_for_test(&bi);
+            crate::runtime::init_context_manager_for_test(&bi)
+                .expect("the test supervisor initializes");
             let sup = Arc::clone(crate::runtime::supervisor(&bi).unwrap());
             let custody =
                 crate::runtime::with_identity(&bi, &did, |e| Ok(Arc::clone(&e.custody))).unwrap();
@@ -7619,7 +7621,8 @@ mod tests {
                 .unwrap()
                 .did()
                 .to_owned();
-            crate::runtime::init_context_manager_for_test(&bi);
+            crate::runtime::init_context_manager_for_test(&bi)
+                .expect("the test supervisor initializes");
             let sup = Arc::clone(crate::runtime::supervisor(&bi).unwrap());
             let unpublished = "did:dht:z6MkSelfJoinOwnerNeverPublished";
             let (_, entry) = crate::runtime::identity_registry(&bi)
@@ -8858,7 +8861,8 @@ mod tests {
         crate::init_runtime().ok();
         let bi = __bi();
         let context_id = format!("{prefix}{}", "0".repeat(56));
-        crate::runtime::init_context_manager_for_test(&bi);
+        crate::runtime::init_context_manager_for_test(&bi)
+            .expect("the test supervisor initializes");
         // Both copies carry every capability in `default_ceiling()`; the close
         // fixture needs the creator's `context:close`.
         let ceiling = super::default_ceiling_strings();
@@ -9120,7 +9124,8 @@ mod tests {
                 let bi = __bi();
                 let creator = "did:dht:z6MkTerminalReleaseCreator";
                 let context_id = format!("{prefix}{}", "0".repeat(56));
-                crate::runtime::init_context_manager_for_test(&bi);
+                crate::runtime::init_context_manager_for_test(&bi)
+                    .expect("the test supervisor initializes");
                 crate::runtime::register_context(&bi, &context_id, creator, &[])
                     .expect("fixture registration");
                 let handle = active_handle_for(&bi, &context_id, creator);
@@ -9353,7 +9358,8 @@ mod tests {
             let bi = __bi();
             let creator = "did:dht:z6MkReleaseOnFailedReRead";
             let context_id = format!("c5{}", "0".repeat(56));
-            crate::runtime::init_context_manager_for_test(&bi);
+            crate::runtime::init_context_manager_for_test(&bi)
+                .expect("the test supervisor initializes");
             crate::runtime::register_context(&bi, &context_id, creator, &[])
                 .expect("fixture registration");
             crate::runtime::create_supervisor_context_for_test(
@@ -9453,7 +9459,8 @@ mod tests {
             let bi = __bi();
             let creator = "did:dht:z6MkDespawnedCloseCreator";
             let context_id = format!("a3{}", "0".repeat(56));
-            crate::runtime::init_context_manager_for_test(&bi);
+            crate::runtime::init_context_manager_for_test(&bi)
+                .expect("the test supervisor initializes");
             crate::runtime::register_context(&bi, &context_id, creator, &[])
                 .expect("fixture registration");
             // No `create_supervisor_context_for_test`: this context has no actor,
@@ -9489,7 +9496,8 @@ mod tests {
         crate::init_runtime().ok();
         let bi = __bi();
         let context_id = format!("{prefix}{}", "0".repeat(64 - prefix.len()));
-        crate::runtime::init_context_manager_for_test(&bi);
+        crate::runtime::init_context_manager_for_test(&bi)
+            .expect("the test supervisor initializes");
         // A restore acts as the node identity and loads its wrapping key from
         // its custody (spec 09 §9.16.1), so the node identity keeps a
         // registered custody, as a host's own identity does.
@@ -9625,7 +9633,8 @@ class SlowAgreeCustody(P256Custody):
             &bob.inner,
             &bob_did,
             sent.transport(),
-        );
+        )
+        .expect("the test supervisor initializes");
         let (ctx_id, alice_handle) = Python::with_gil(|py| {
             let params = PyDict::new(py);
             params.set_item("mode", "encrypted").unwrap();
@@ -9915,7 +9924,8 @@ class SlowAgreeCustody(P256Custody):
                 .to_owned()
         });
         let ctx_id = format!("suspend-flush-{}", uuid::Uuid::new_v4());
-        crate::runtime::init_context_manager(&scp.inner, &did);
+        crate::runtime::init_context_manager(&scp.inner, &did)
+            .expect("the test supervisor initializes");
         let sup = Arc::clone(crate::runtime::supervisor(&scp.inner).expect("supervisor"));
         rt.block_on(sup.create_context(
             ctx_id.clone(),
@@ -9995,7 +10005,8 @@ class SlowAgreeCustody(P256Custody):
                 .to_owned()
         });
         let ctx_id = format!("restore-order-{}", uuid::Uuid::new_v4());
-        crate::runtime::init_context_manager(&first.inner, &did);
+        crate::runtime::init_context_manager(&first.inner, &did)
+            .expect("the test supervisor initializes");
         let sup = Arc::clone(crate::runtime::supervisor(&first.inner).expect("supervisor"));
         rt.block_on(sup.create_context(
             ctx_id.clone(),
@@ -10021,7 +10032,8 @@ class SlowAgreeCustody(P256Custody):
         drop(first);
 
         let reopened = crate::scp::PyScp { inner: open() };
-        crate::runtime::init_context_manager(&reopened.inner, &did);
+        crate::runtime::init_context_manager(&reopened.inner, &did)
+            .expect("the test supervisor initializes");
         let unavailable =
             scp_core::context::ContextError::WrappingKeyCustodyUnavailable.to_string();
         Python::with_gil(|py| {
@@ -10125,7 +10137,8 @@ class SlowAgreeCustody(P256Custody):
             let bi = __bi();
             let creator = "did:dht:z6MkUnreachableActorCreator";
             let context_id = format!("a6{}", "0".repeat(56));
-            crate::runtime::init_context_manager_for_test(&bi);
+            crate::runtime::init_context_manager_for_test(&bi)
+                .expect("the test supervisor initializes");
             crate::runtime::register_context(&bi, &context_id, creator, &[])
                 .expect("fixture registration");
             crate::runtime::create_supervisor_context_for_test(
@@ -10180,7 +10193,8 @@ class SlowAgreeCustody(P256Custody):
             crate::init_runtime().ok();
             let bi = __bi();
             let creator = "did:dht:z6MkCrashedCloseCreator";
-            crate::runtime::init_context_manager_for_test(&bi);
+            crate::runtime::init_context_manager_for_test(&bi)
+                .expect("the test supervisor initializes");
             let sup = std::sync::Arc::clone(crate::runtime::supervisor(&bi).expect("supervisor"));
             let scp = crate::scp::PyScp {
                 inner: std::sync::Arc::clone(&bi),
@@ -10242,7 +10256,8 @@ class SlowAgreeCustody(P256Custody):
             let bi = __bi();
             let creator = "did:dht:z6MkPoisonedCloseCreator";
             let context_id = format!("a4{}", "0".repeat(56));
-            crate::runtime::init_context_manager_for_test(&bi);
+            crate::runtime::init_context_manager_for_test(&bi)
+                .expect("the test supervisor initializes");
             crate::runtime::register_context(&bi, &context_id, creator, &[])
                 .expect("fixture registration");
             crate::runtime::create_supervisor_context_for_test(
@@ -10303,7 +10318,8 @@ class SlowAgreeCustody(P256Custody):
             let bi = __bi();
             let creator = "did:dht:z6MkNoActorCreator";
             let context_id = format!("a2{}", "0".repeat(56));
-            crate::runtime::init_context_manager_for_test(&bi);
+            crate::runtime::init_context_manager_for_test(&bi)
+                .expect("the test supervisor initializes");
             crate::runtime::register_context(&bi, &context_id, creator, &[])
                 .expect("fixture registration");
             // No `create_supervisor_context_for_test`: this context has no actor.
@@ -10561,7 +10577,8 @@ class SlowAgreeCustody(P256Custody):
         let scp = crate::scp::PyScp {
             inner: std::sync::Arc::clone(&bi_arc),
         };
-        crate::runtime::init_context_manager_for_test(&bi_arc);
+        crate::runtime::init_context_manager_for_test(&bi_arc)
+            .expect("the test supervisor initializes");
         let sup = std::sync::Arc::clone(crate::runtime::supervisor(&bi_arc).unwrap());
         crate::runtime()
             .unwrap()

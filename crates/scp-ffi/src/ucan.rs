@@ -1435,7 +1435,8 @@ mod tests {
             let scp = crate::scp::PyScp::new_in_memory_for_test();
             let bi = &*scp.inner;
             let ctx_id = format!("ucan-no-bridge-state-{}", uuid::Uuid::new_v4());
-            crate::runtime::init_context_manager_for_test(bi);
+            crate::runtime::init_context_manager_for_test(bi)
+                .expect("the test supervisor initializes");
             crate::runtime::create_supervisor_context_for_test(
                 bi,
                 &ctx_id,
@@ -1703,7 +1704,7 @@ mod tests {
         crate::init_runtime().ok();
         let scp = crate::scp::PyScp::new_in_memory_for_test();
         let bi = &*scp.inner;
-        crate::runtime::init_context_manager_for_test(bi);
+        crate::runtime::init_context_manager_for_test(bi).expect("the test supervisor initializes");
         let sup = std::sync::Arc::clone(crate::runtime::supervisor(bi).expect("supervisor"));
         let rt = crate::runtime().expect("tokio runtime");
 
@@ -2102,7 +2103,7 @@ mod tests {
             drop(scp);
 
             let reopened = open();
-            crate::runtime::init_context_manager_for_test(&reopened.inner);
+            crate::runtime::init_context_manager_for_test(&reopened.inner).expect("supervisor");
             // A restarted process resolves the issuer's DID document through
             // the resolver an identity call attaches; B makes no identity call.
             crate::runtime::set_resolver_dht_client(&reopened.inner, dht);

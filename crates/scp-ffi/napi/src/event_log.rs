@@ -117,9 +117,9 @@ pub(crate) async fn event_log_query_on(
     let ctx_id_bytes = scp_core::context::state::context_id_to_bytes(&context_id_str);
 
     // No supervisor attached means no supervisor log, and the query falls
-    // back to the bridge-local log. A suspended bridge or a log that cannot
-    // be read is an error, never an empty answer (spec section 17.3, "Event
-    // log write failures").
+    // back to the bridge-local log. A suspended bridge, a log that cannot be
+    // read, or a log released and not loaded again is an error, never an
+    // empty answer (spec section 17.3, "Event log write failures").
     let manager_entries = if bi.core.try_supervisor().is_some() {
         crate::runtime::supervisor(bi)?
             .event_log_entries(&ctx_id_bytes)
@@ -268,9 +268,10 @@ pub(crate) async fn event_log_verify_on(
     // canonical chokepoint (NOT the raw SHA-256 routing primitive, which
     // double-hashes a real 64-hex id and queries the wrong event-log key).
     let ctx_id_bytes = scp_core::context::state::context_id_to_bytes(&context_id);
-    // No supervisor attached means nothing to sync. A suspended bridge or a
-    // log that cannot be read fails the proof instead of proving against an
-    // unsynced tree (spec section 17.3, "Event log write failures").
+    // No supervisor attached means nothing to sync. A suspended bridge, a log
+    // that cannot be read, or a log released and not loaded again fails the
+    // proof instead of proving against an unsynced tree (spec section 17.3,
+    // "Event log write failures").
     let manager_entries = if bi.core.try_supervisor().is_some() {
         crate::runtime::supervisor(bi)?
             .event_log_entries(&ctx_id_bytes)
@@ -284,44 +285,12 @@ pub(crate) async fn event_log_verify_on(
         None
     };
     if let Some(entries) = manager_entries {
-        // Precompute the canonical leaf hash for each source event
-        // (`SHA-256(0x00 ‖ rmp_serde(Event))`) via the substrate helper so the
-        // synced UCAN-state tree commits to byte-identical leaves.
-        let mut leaf_hashes: Vec<[u8; 32]> = Vec::with_capacity(entries.len());
-        for entry in &entries {
-            leaf_hashes.push(scp_event_log::tree::leaf_hash(entry).map_err(|e| {
-                napi::Error::from(ScpNapiError::Context {
+        crate::runtime::with_context(bi, &context_id, |rt| {
+            scp_ffi_common::event_log::sync_leaves_from_entries(&mut rt.core.event_log, &entries)
+                .map_err(|e| ScpNapiError::Context {
                     message: format!("event leaf hash failed: {e}"),
                     code: codes::CTX_2000.to_owned(),
                 })
-            })?);
-        }
-
-        crate::runtime::with_context(bi, &context_id, |rt| {
-            let existing_leaves = rt.core.event_log.leaves();
-            let existing_count = existing_leaves.len();
-
-            // Prefix consistency check: if existing leaves diverge from the
-            // source (e.g. after reimport), clear and re-sync the entire tree.
-            let prefix_matches = existing_leaves
-                .iter()
-                .zip(leaf_hashes.iter())
-                .all(|(leaf, hash)| leaf == hash);
-
-            if !prefix_matches && existing_count > 0 {
-                // Leaves diverge — rebuild from scratch.
-                let ctx_id = rt.core.event_log.context_id().to_owned();
-                rt.core.event_log = scp_event_log::EventLog::new(ctx_id);
-                for hash in &leaf_hashes {
-                    rt.core.event_log.push_leaf_raw(*hash);
-                }
-            } else {
-                // Append-only: push entries that haven't been synced yet.
-                for hash in leaf_hashes.iter().skip(existing_count) {
-                    rt.core.event_log.push_leaf_raw(*hash);
-                }
-            }
-            Ok(())
         })
         .map_err(napi::Error::from)?;
     }
@@ -776,6 +745,67 @@ mod tests {
             "expected SCP-CRYPTO-4006 for a destroyed signing key, got: {}",
             err.reason
         );
+    }
+
+    /// A supervisor log that is not loaded fails the query and the proof
+    /// with the provider's typed error; the bridge-local log never answers in
+    /// its place (spec section 17.3, "Event log write failures"). The log is
+    /// released while the context stays `Active`, so both reads pass their
+    /// registration gate and reach the provider read.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn a_released_supervisor_log_fails_the_query_and_the_proof() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = std::sync::Arc::clone(&scp.inner);
+        crate::runtime().block_on(async {
+            let creator = scp
+                .identity_create("in_memory".to_owned(), None)
+                .await
+                .expect("identity_create should succeed");
+            let params = serde_json::json!({
+                "mode": "broadcast",
+                "ceiling": ["messages:read"],
+                "memoryScope": "full",
+                "governance": "single_admin",
+            })
+            .to_string();
+            let handle = crate::context::context_create_on(&bi, &creator, params)
+                .await
+                .expect("context_create should succeed");
+            let claim = r#"{"type":"inclusion","leaf_index":0}"#.to_owned();
+            let running = event_log_query_on(&bi, &handle, None).await;
+            assert!(
+                running.as_ref().is_ok_and(|events| !events.is_empty()),
+                "control: the loaded log answers the query"
+            );
+            assert!(
+                event_log_verify_on(&bi, &handle, claim.clone())
+                    .await
+                    .is_ok(),
+                "control: the loaded log answers the proof"
+            );
+
+            crate::runtime::supervisor(&bi)
+                .expect("supervisor attached")
+                .test_release_event_log(&scp_core::context::state::context_id_to_bytes(
+                    &handle.context_id(),
+                ))
+                .expect("release");
+            for (read, result) in [
+                ("query", event_log_query_on(&bi, &handle, None).await.err()),
+                (
+                    "proof",
+                    event_log_verify_on(&bi, &handle, claim).await.err(),
+                ),
+            ] {
+                let err = result.unwrap_or_else(|| panic!("a released log must fail the {read}"));
+                assert!(
+                    err.reason.contains("not loaded"),
+                    "the {read} error names the not-loaded log, got {}",
+                    err.reason
+                );
+            }
+        });
     }
 
     #[test]

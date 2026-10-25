@@ -2938,7 +2938,7 @@ mod tests {
         // create the context in the supervisor, which is where `outlet_register`
         // reads the registrant's authority.
         crate::init_runtime().ok();
-        crate::runtime::init_context_manager_for_test(bi);
+        crate::runtime::init_context_manager_for_test(bi).expect("the test supervisor initializes");
         crate::runtime::register_ffi_state(bi, &ctx_id, &[]).unwrap();
         crate::runtime::create_supervisor_context_for_test(
             bi,

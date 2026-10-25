@@ -28,7 +28,45 @@
 //! (`PyEvent` / `NapiEvent` / `UniFFI` `Event`) is the caller's
 //! responsibility — the helper only encodes the filter contract.
 
-use scp_event_log::Event;
+use scp_event_log::{Event, EventLog, EventLogError};
+
+/// Brings a bridge-local proof tree in line with the supervisor's log so an
+/// inclusion or absence proof covers the context's log of record.
+///
+/// Every leaf hash is computed before `log` changes, so a failure leaves
+/// `log` as it was. When `log`'s leaves are a prefix of `entries`' leaves,
+/// the missing leaves are appended; when they diverge (a re-import), `log`
+/// is rebuilt from `entries`. Leaves `log` holds past the end of `entries`
+/// are kept.
+///
+/// # Errors
+///
+/// Returns the [`EventLogError`] of the first entry whose leaf hash cannot
+/// be computed.
+pub fn sync_leaves_from_entries(
+    log: &mut EventLog,
+    entries: &[Event],
+) -> Result<(), EventLogError> {
+    let hashes = entries
+        .iter()
+        .map(scp_event_log::tree::leaf_hash)
+        .collect::<Result<Vec<[u8; 32]>, EventLogError>>()?;
+    let prefix_matches = log
+        .leaves()
+        .iter()
+        .zip(&hashes)
+        .all(|(leaf, hash)| leaf == hash);
+    let keep = if prefix_matches {
+        log.leaves().len()
+    } else {
+        *log = EventLog::new(log.context_id().to_owned());
+        0
+    };
+    for hash in hashes.iter().skip(keep) {
+        log.push_leaf_raw(*hash);
+    }
+    Ok(())
+}
 
 /// Returns an event type's canonical wire label, such as `"MessageSent"`.
 ///
@@ -255,6 +293,42 @@ mod tests {
             entry(EventType::MessageSent, "did:example:bob"),
             entry(EventType::MemberLeft, "did:example:alice"),
         ]
+    }
+
+    fn leaf_hashes(entries: &[Event]) -> Vec<[u8; 32]> {
+        entries
+            .iter()
+            .map(|e| scp_event_log::tree::leaf_hash(e).expect("leaf hash"))
+            .collect()
+    }
+
+    /// A tree whose leaves are a prefix of the entries gains the missing
+    /// leaves; a tree that diverges is rebuilt from the entries.
+    #[test]
+    fn sync_appends_to_a_prefix_and_rebuilds_a_divergent_tree() {
+        let entries = corpus();
+        let expected = leaf_hashes(&entries);
+
+        let mut prefix = EventLog::new("ctx".to_owned());
+        prefix.push_leaf_raw(expected[0]);
+        sync_leaves_from_entries(&mut prefix, &entries).expect("sync");
+        assert_eq!(prefix.leaves(), expected.as_slice());
+
+        let mut divergent = EventLog::new("ctx".to_owned());
+        divergent.push_leaf_raw([0xEE; 32]);
+        divergent.push_leaf_raw([0xEF; 32]);
+        sync_leaves_from_entries(&mut divergent, &entries).expect("sync");
+        assert_eq!(divergent.leaves(), expected.as_slice());
+        assert_eq!(divergent.context_id(), "ctx");
+
+        let mut synced = EventLog::new("ctx".to_owned());
+        sync_leaves_from_entries(&mut synced, &entries).expect("sync");
+        sync_leaves_from_entries(&mut synced, &entries).expect("a second sync");
+        assert_eq!(
+            synced.leaves(),
+            expected.as_slice(),
+            "a second sync adds nothing"
+        );
     }
 
     /// Every `EventType` with the label bridges surface as `event_type` and

@@ -574,8 +574,8 @@ public extension SCP {
     }
 
     /// Forwards to ``Scp/contextResetTtlTimer`` on ``inner``.
-    func contextResetTtlTimer(handle: ContextHandle, newSeconds: UInt64) async {
-        await inner.contextResetTtlTimer(handle: handle, newSeconds: newSeconds)
+    func contextResetTtlTimer(handle: ContextHandle, newSeconds: UInt64) async throws {
+        try await inner.contextResetTtlTimer(handle: handle, newSeconds: newSeconds)
     }
 
     /// Forwards to ``Scp/contextSend`` on ``inner``.

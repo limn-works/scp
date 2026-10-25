@@ -90,13 +90,17 @@ fn auto_wire_context_manager(
     node: &Arc<RunningNode>,
     relay_url: &str,
 ) -> Result<(), ScpPyError> {
-    crate::actor_wait::block_on_released(
+    // The wiring reports only that no supervisor is attached; a failed init
+    // names its own cause, so it is returned first.
+    let mut init = Ok(());
+    let wired = crate::actor_wait::block_on_released(
         py,
         server::wire_supervisor_to_node(&bi.core, node, relay_url, |did| {
-            crate::runtime::init_context_manager(bi, did);
+            init = crate::runtime::init_context_manager(bi, did);
         }),
-    )?
-    .map_err(server_error)
+    )?;
+    init?;
+    wired.map_err(server_error)
 }
 
 // ---------------------------------------------------------------------------

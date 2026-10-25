@@ -51,7 +51,7 @@ fn setup() {
 /// Phase D (#1695): tests no longer share a process-global default.
 fn __bi() -> Arc<PyBridgeInstance> {
     let bi = Arc::new(PyBridgeInstance::new_py());
-    runtime::init_context_manager_for_test(&bi);
+    runtime::init_context_manager_for_test(&bi).expect("the test supervisor initializes");
     bi
 }
 
@@ -328,7 +328,8 @@ fn single_admin_owner_and_context(
         .unwrap()
         .extract::<String>()
         .unwrap();
-    runtime::init_context_manager_for_test(scp.bridge_instance());
+    runtime::init_context_manager_for_test(scp.bridge_instance())
+        .expect("the test supervisor initializes");
     let params = PyDict::new(py);
     let ceiling = PyList::new(
         py,
@@ -691,7 +692,8 @@ fn context_create_establishes_mls_group() {
 fn outlet_register_and_verify() {
     Python::with_gil(|py| {
         let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
-        runtime::init_context_manager_for_test(scp.bridge_instance());
+        runtime::init_context_manager_for_test(scp.bridge_instance())
+            .expect("the test supervisor initializes");
         let did = create_test_identity(scp.bridge_instance());
         let ctx_id = create_test_context(scp.bridge_instance(), &did);
 
@@ -768,7 +770,8 @@ fn outlet_register_rejects_invalid_context() {
 fn outlet_register_rejects_empty_name() {
     Python::with_gil(|py| {
         let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
-        runtime::init_context_manager_for_test(scp.bridge_instance());
+        runtime::init_context_manager_for_test(scp.bridge_instance())
+            .expect("the test supervisor initializes");
         let did = create_test_identity(scp.bridge_instance());
         let ctx_id = create_test_context(scp.bridge_instance(), &did);
 
@@ -818,7 +821,8 @@ fn ucan_mint_rejects_empty_context() {
 fn event_log_query_empty_returns_empty() {
     Python::with_gil(|py| {
         let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
-        runtime::init_context_manager_for_test(scp.bridge_instance());
+        runtime::init_context_manager_for_test(scp.bridge_instance())
+            .expect("the test supervisor initializes");
         let did = create_test_identity(scp.bridge_instance());
         let ctx_id = create_test_context(scp.bridge_instance(), &did);
 
@@ -846,7 +850,8 @@ fn event_log_query_empty_returns_empty() {
 fn event_log_query_with_appended_event() {
     Python::with_gil(|py| {
         let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
-        runtime::init_context_manager_for_test(scp.bridge_instance());
+        runtime::init_context_manager_for_test(scp.bridge_instance())
+            .expect("the test supervisor initializes");
         let did = create_test_identity(scp.bridge_instance());
         let ctx_id = create_test_context(scp.bridge_instance(), &did);
 
@@ -876,7 +881,8 @@ fn event_log_query_with_appended_event() {
 fn event_log_query_with_filter() {
     Python::with_gil(|py| {
         let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
-        runtime::init_context_manager_for_test(scp.bridge_instance());
+        runtime::init_context_manager_for_test(scp.bridge_instance())
+            .expect("the test supervisor initializes");
         let did = create_test_identity(scp.bridge_instance());
         let ctx_id = create_test_context(scp.bridge_instance(), &did);
 
@@ -1038,7 +1044,8 @@ fn event_log_query_projects_role_assigned_subject_did_from_storage() {
 fn event_log_verify_inclusion_proof_after_append() {
     Python::with_gil(|py| {
         let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
-        runtime::init_context_manager_for_test(scp.bridge_instance());
+        runtime::init_context_manager_for_test(scp.bridge_instance())
+            .expect("the test supervisor initializes");
         let did = create_test_identity(scp.bridge_instance());
         let ctx_id = create_test_context(scp.bridge_instance(), &did);
 
@@ -1088,7 +1095,8 @@ fn event_log_checkpoint_by_did_generates_signed_checkpoint() {
     pyo3::Python::with_gil(|py| {
         Python::with_gil(|_py| {
             let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
-            runtime::init_context_manager_for_test(scp.bridge_instance());
+            runtime::init_context_manager_for_test(scp.bridge_instance())
+                .expect("the test supervisor initializes");
             let did = create_test_identity(scp.bridge_instance());
             let ctx_id = create_test_context(scp.bridge_instance(), &did);
 
@@ -1127,7 +1135,8 @@ fn event_log_checkpoint_by_did_unregistered_did_errors() {
     pyo3::Python::with_gil(|py| {
         Python::with_gil(|_py| {
             let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
-            runtime::init_context_manager_for_test(scp.bridge_instance());
+            runtime::init_context_manager_for_test(scp.bridge_instance())
+                .expect("the test supervisor initializes");
             let did = create_test_identity(scp.bridge_instance());
             let ctx_id = create_test_context(scp.bridge_instance(), &did);
 
@@ -1147,7 +1156,8 @@ fn event_log_checkpoint_by_did_invalid_context_errors() {
     pyo3::Python::with_gil(|py| {
         Python::with_gil(|_py| {
             let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
-            runtime::init_context_manager_for_test(scp.bridge_instance());
+            runtime::init_context_manager_for_test(scp.bridge_instance())
+                .expect("the test supervisor initializes");
             let did = create_test_identity(scp.bridge_instance());
 
             // DID is registered, but the context does not exist.
@@ -1514,7 +1524,8 @@ fn cross_domain_identity_context_outlet_eventlog_provenance() {
     // (py_ucan_mint, py_event_log_checkpoint). Those are tested in unit tests.
     Python::with_gil(|py| {
         let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
-        runtime::init_context_manager_for_test(scp.bridge_instance());
+        runtime::init_context_manager_for_test(scp.bridge_instance())
+            .expect("the test supervisor initializes");
         let did_a = create_test_identity(scp.bridge_instance());
         let ctx_id = create_test_context(scp.bridge_instance(), &did_a);
 
@@ -1712,7 +1723,8 @@ fn nonce_hex() -> String {
 fn xctx_saga_unhosted_caller_rejected_before_saga() {
     Python::with_gil(|py| {
         let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
-        runtime::init_context_manager_for_test(scp.bridge_instance());
+        runtime::init_context_manager_for_test(scp.bridge_instance())
+            .expect("the test supervisor initializes");
         let bi = scp.bridge_instance();
 
         let owner = create_test_identity(bi);
@@ -1767,7 +1779,8 @@ fn xctx_saga_unhosted_caller_rejected_before_saga() {
 fn xctx_saga_hosted_non_member_caller_rejected() {
     Python::with_gil(|py| {
         let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
-        runtime::init_context_manager_for_test(scp.bridge_instance());
+        runtime::init_context_manager_for_test(scp.bridge_instance())
+            .expect("the test supervisor initializes");
         let bi = scp.bridge_instance();
 
         let owner = create_test_identity(bi);
@@ -1844,7 +1857,8 @@ fn xctx_saga_hosted_non_member_caller_rejected() {
 fn xctx_saga_member_but_unhosted_caller_rejected_by_hosted_axis() {
     Python::with_gil(|py| {
         let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
-        runtime::init_context_manager_for_test(scp.bridge_instance());
+        runtime::init_context_manager_for_test(scp.bridge_instance())
+            .expect("the test supervisor initializes");
         let bi = scp.bridge_instance();
 
         // `owner` is a hosted identity used only to create the TARGET context and
@@ -1936,7 +1950,8 @@ fn xctx_saga_member_but_unhosted_caller_rejected_by_hosted_axis() {
 fn xctx_saga_authenticated_caller_reaches_target_axis_gate() {
     Python::with_gil(|py| {
         let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
-        runtime::init_context_manager_for_test(scp.bridge_instance());
+        runtime::init_context_manager_for_test(scp.bridge_instance())
+            .expect("the test supervisor initializes");
         let bi = scp.bridge_instance();
 
         let owner = create_test_identity(bi);
@@ -2004,7 +2019,8 @@ fn xctx_saga_authenticated_caller_reaches_target_axis_gate() {
 fn xctx_saga_malformed_nonce_rejected_fail_closed() {
     Python::with_gil(|py| {
         let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
-        runtime::init_context_manager_for_test(scp.bridge_instance());
+        runtime::init_context_manager_for_test(scp.bridge_instance())
+            .expect("the test supervisor initializes");
         let bi = scp.bridge_instance();
 
         let owner = create_test_identity(bi);
@@ -2082,7 +2098,8 @@ fn placeholder_streaming_ucan() -> String {
 fn xctx_streaming_saga_unhosted_caller_rejected_before_saga() {
     Python::with_gil(|py| {
         let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
-        runtime::init_context_manager_for_test(scp.bridge_instance());
+        runtime::init_context_manager_for_test(scp.bridge_instance())
+            .expect("the test supervisor initializes");
         let bi = scp.bridge_instance();
 
         let owner = create_test_identity(bi);
@@ -2142,7 +2159,8 @@ fn xctx_streaming_saga_unhosted_caller_rejected_before_saga() {
 fn xctx_streaming_saga_hosted_non_member_caller_rejected() {
     Python::with_gil(|py| {
         let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
-        runtime::init_context_manager_for_test(scp.bridge_instance());
+        runtime::init_context_manager_for_test(scp.bridge_instance())
+            .expect("the test supervisor initializes");
         let bi = scp.bridge_instance();
 
         let owner = create_test_identity(bi);
@@ -2206,7 +2224,8 @@ fn xctx_streaming_saga_hosted_non_member_caller_rejected() {
 fn xctx_streaming_saga_recover_unhosted_caller_rejected() {
     Python::with_gil(|py| {
         let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
-        runtime::init_context_manager_for_test(scp.bridge_instance());
+        runtime::init_context_manager_for_test(scp.bridge_instance())
+            .expect("the test supervisor initializes");
 
         let unhosted_caller = "did:dht:z6MkUnhostedStreamingRecover1";
         let err = scp
@@ -2233,7 +2252,8 @@ fn xctx_streaming_saga_recover_unhosted_caller_rejected() {
 fn xctx_streaming_saga_recover_unknown_saga_rejected() {
     Python::with_gil(|py| {
         let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
-        runtime::init_context_manager_for_test(scp.bridge_instance());
+        runtime::init_context_manager_for_test(scp.bridge_instance())
+            .expect("the test supervisor initializes");
         let bi = scp.bridge_instance();
 
         // A genuinely hosted identity, so recover passes the channel-auth gate
@@ -2268,7 +2288,8 @@ fn xctx_streaming_saga_recover_unknown_saga_rejected() {
 fn xctx_streaming_saga_recover_hosted_non_invoker_rejected() {
     Python::with_gil(|py| {
         let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
-        runtime::init_context_manager_for_test(scp.bridge_instance());
+        runtime::init_context_manager_for_test(scp.bridge_instance())
+            .expect("the test supervisor initializes");
         let bi = scp.bridge_instance();
 
         // The invoker who "opened" the saga, and a DIFFERENT hosted identity.
@@ -2322,7 +2343,8 @@ fn xctx_streaming_saga_recover_hosted_non_invoker_rejected() {
 fn xctx_streaming_saga_open_rejects_non_active_context() {
     Python::with_gil(|py| {
         let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
-        runtime::init_context_manager_for_test(scp.bridge_instance());
+        runtime::init_context_manager_for_test(scp.bridge_instance())
+            .expect("the test supervisor initializes");
         let bi = scp.bridge_instance();
 
         let owner = create_test_identity(bi);
@@ -2491,7 +2513,7 @@ fn establish_xctx_saga_commit_preconditions(
         .extract::<String>()
         .unwrap();
 
-    runtime::init_context_manager_for_test(bi);
+    runtime::init_context_manager_for_test(bi).expect("the test supervisor initializes");
 
     // Context A (caller/source). Its ceiling carries the two load-bearing
     // capabilities: `governance:propose` (so `owner`, as admin, can propose)
@@ -2762,7 +2784,7 @@ fn establish_xctx_streaming_saga_preconditions(
     let owner = published_identity_did(py, &scp);
     let invoker = published_identity_did(py, &scp);
 
-    runtime::init_context_manager_for_test(bi);
+    runtime::init_context_manager_for_test(bi).expect("the test supervisor initializes");
 
     // Context A (caller/source). Its ceiling carries `governance:propose` (owner
     // proposes), `outlet:interface` (the interface-establish ceiling check), and
@@ -3049,7 +3071,7 @@ fn outlet_stream_open_path_wired_and_control_plane_not_found() {
         let invoker = published_identity_did(py, &scp);
         let stranger = published_identity_did(py, &scp);
 
-        runtime::init_context_manager_for_test(bi);
+        runtime::init_context_manager_for_test(bi).expect("the test supervisor initializes");
         // Create the context via the REAL bridge method so its actor is spawned
         // on the SAME process-global runtime the streaming ops query (a context
         // created on a different runtime is unreachable → transport.rate-limited).
@@ -3240,7 +3262,7 @@ fn outlet_stream_live_poll_next_drains_to_terminal_without_gil_deadlock() {
         // caller that is not the pinned invoker (CRITICAL #1).
         let stranger = published_identity_did(py, &scp);
 
-        runtime::init_context_manager_for_test(bi);
+        runtime::init_context_manager_for_test(bi).expect("the test supervisor initializes");
         let ctx = {
             let params = PyDict::new(py);
             // Every capability in `default_ceiling()`, so the fixture's mint, delegation and
@@ -3501,7 +3523,7 @@ fn ucan_validate_evaluate_and_delegate_compare_against_the_supervisor_ceiling() 
         let holder = published_identity_did(py, &scp);
         let delegatee = published_identity_did(py, &scp);
         let bi = scp.bridge_instance();
-        runtime::init_context_manager_for_test(bi);
+        runtime::init_context_manager_for_test(bi).expect("the test supervisor initializes");
 
         let wide = random_context_id();
         let narrow = random_context_id();
@@ -3597,7 +3619,7 @@ fn ucan_validate_and_evaluate_anchor_on_the_supervisor_creator() {
         let other = published_identity_did(py, &scp);
         let holder = published_identity_did(py, &scp);
         let bi = scp.bridge_instance();
-        runtime::init_context_manager_for_test(bi);
+        runtime::init_context_manager_for_test(bi).expect("the test supervisor initializes");
 
         let anchored = random_context_id();
         let crossed = random_context_id();
@@ -3723,7 +3745,8 @@ fn nb_fixture(py: Python<'_>) -> NbFixture {
     let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
     let creator = published_identity_did(py, &scp);
     let holder = published_identity_did(py, &scp);
-    runtime::init_context_manager_for_test(scp.bridge_instance());
+    runtime::init_context_manager_for_test(scp.bridge_instance())
+        .expect("the test supervisor initializes");
     let ctx = {
         let params = PyDict::new(py);
         let ceiling: Vec<String> = scp_core::context::roles::default_ceiling()
@@ -3885,7 +3908,7 @@ fn ucan_mint_enforces_the_supervisor_ceiling_not_the_registration_ceiling() {
         let owner = published_identity_did(py, &scp);
         let audience = published_identity_did(py, &scp);
         let bi = scp.bridge_instance();
-        runtime::init_context_manager_for_test(bi);
+        runtime::init_context_manager_for_test(bi).expect("the test supervisor initializes");
 
         let ctx_id = random_context_id();
         let wide = vec![
@@ -3953,7 +3976,8 @@ fn ucan_mint_enforces_the_supervisor_ceiling_not_the_registration_ceiling() {
 fn xctx_unary_saga_rejects_non_active_context() {
     Python::with_gil(|py| {
         let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
-        runtime::init_context_manager_for_test(scp.bridge_instance());
+        runtime::init_context_manager_for_test(scp.bridge_instance())
+            .expect("the test supervisor initializes");
         let bi = scp.bridge_instance();
 
         let owner = create_test_identity(bi);
@@ -4096,7 +4120,8 @@ fn session_invoke_admits_a_supervisor_only_capability_holder() {
         // the document-backed resolver the UCAN signature check needs.
         let owner = published_identity_did(py, &scp);
         let invoker = published_identity_did(py, &scp);
-        runtime::init_context_manager_for_test(scp.bridge_instance());
+        runtime::init_context_manager_for_test(scp.bridge_instance())
+            .expect("the test supervisor initializes");
         let (ctx_id, outlet_id, ucan) =
             supervisor_only_member_context(py, &scp, &owner, &invoker, true);
 
@@ -4130,7 +4155,8 @@ fn session_invoke_refuses_a_member_the_supervisor_did_not_grant() {
         let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
         let owner = published_identity_did(py, &scp);
         let invoker = published_identity_did(py, &scp);
-        runtime::init_context_manager_for_test(scp.bridge_instance());
+        runtime::init_context_manager_for_test(scp.bridge_instance())
+            .expect("the test supervisor initializes");
         let (ctx_id, outlet_id, ucan) =
             supervisor_only_member_context(py, &scp, &owner, &invoker, false);
 
@@ -4174,7 +4200,8 @@ fn cross_context_invoke_refuses_a_source_member_the_supervisor_did_not_grant() {
         let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
         let owner = published_identity_did(py, &scp);
         let invoker = published_identity_did(py, &scp);
-        runtime::init_context_manager_for_test(scp.bridge_instance());
+        runtime::init_context_manager_for_test(scp.bridge_instance())
+            .expect("the test supervisor initializes");
         let (source_ctx, _source_outlet, _source_ucan) =
             supervisor_only_member_context(py, &scp, &owner, &invoker, false);
         let (target_ctx, target_outlet, target_ucan) =
@@ -4223,7 +4250,8 @@ fn cross_context_invoke_admits_a_supervisor_only_capability_holder() {
         // the document-backed resolver the UCAN signature check needs.
         let owner = published_identity_did(py, &scp);
         let invoker = published_identity_did(py, &scp);
-        runtime::init_context_manager_for_test(scp.bridge_instance());
+        runtime::init_context_manager_for_test(scp.bridge_instance())
+            .expect("the test supervisor initializes");
         let (source_ctx, _source_outlet, _source_ucan) =
             supervisor_only_member_context(py, &scp, &owner, &invoker, true);
         let (target_ctx, target_outlet, target_ucan) =
@@ -4279,7 +4307,7 @@ fn session_invoke_validates_the_ucan_against_the_supervisor_ceiling() {
         let owner = published_identity_did(py, &scp);
         let invoker = published_identity_did(py, &scp);
         let bi = scp.bridge_instance();
-        runtime::init_context_manager_for_test(bi);
+        runtime::init_context_manager_for_test(bi).expect("the test supervisor initializes");
 
         let ctx_id = random_context_id();
         runtime::register_context(bi, &ctx_id, &owner, &["messages:read".to_owned()]).unwrap();
@@ -4362,7 +4390,8 @@ fn session_invoke_anchors_the_ucan_on_the_supervisor_creator() {
         let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
         let owner = published_identity_did(py, &scp);
         let invoker = published_identity_did(py, &scp);
-        runtime::init_context_manager_for_test(scp.bridge_instance());
+        runtime::init_context_manager_for_test(scp.bridge_instance())
+            .expect("the test supervisor initializes");
         let (ctx_id, outlet_id, ucan) =
             supervisor_only_member_context(py, &scp, &owner, &invoker, true);
 

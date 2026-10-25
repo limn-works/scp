@@ -351,11 +351,10 @@ impl crate::scp::PyScp {
         // leaf, so the supervisor log was empty and participation facts were
         // unreadable on the relay (production) path. This matches the
         // local-transport path, which already builds the real provider.
-        let event_log =
-            crate::runtime::build_event_log_provider(bi).map_err(ScpPyError::context)?;
+        let event_log = crate::runtime::build_event_log_provider(bi)?;
         crate::runtime::init_context_manager_with(
             bi, local_did, crypto, transport, event_log, None,
-        );
+        )?;
 
         Ok(())
     }
@@ -387,7 +386,7 @@ impl crate::scp::PyScp {
     pub fn configure_local_transport(&self, local_did: &str) -> PyResult<()> {
         let bi = &*self.inner;
         validate::validate_did(local_did)?;
-        crate::runtime::init_context_manager_with_local_transport(bi, local_did);
+        crate::runtime::init_context_manager_with_local_transport(bi, local_did)?;
         Ok(())
     }
 
@@ -708,7 +707,8 @@ mod tests {
     #[test]
     fn transport_disconnect_is_idempotent() {
         let scp = default_scp();
-        crate::runtime::init_context_manager_for_test(&scp.inner);
+        crate::runtime::init_context_manager_for_test(&scp.inner)
+            .expect("the test supervisor initializes");
         // Disconnecting when not connected should not error.
         let result = scp.transport_disconnect();
         assert!(result.is_ok());
