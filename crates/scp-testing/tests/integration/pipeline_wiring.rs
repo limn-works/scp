@@ -10078,14 +10078,61 @@ fn reached_only_by_tests<'a>(name: &str, others: impl Iterator<Item = &'a String
     true
 }
 
-/// The call shapes that write a leaf to a context's event log.
-const EVENT_LOG_APPEND_CALLS: &[&str] = &[
-    ".append_event(",
-    ".append_event_in(",
-    ".append_context_event",
-    ".append_outlet_invoked_verified(",
-    ".append_unit(",
+/// Methods named `append_*` that write no leaf to a context's event log, with
+/// the store each one writes. The scan counts every other `.append_*(` call.
+const NON_EVENT_LOG_APPENDS: &[(&str, &str)] = &[
+    ("append_journal", "the saga journal store"),
+    ("append_block_list_event", "the identity store's block list"),
+    (
+        "append_log_event",
+        "the in-browser client's in-memory context state (ADR-057), not the runtime provider",
+    ),
+    ("append_log", "the scp-platform syncable change log"),
+    ("append_entry", "the scp-platform key custody file"),
+    (
+        "append_entry_holding_the_write_locks",
+        "the scp-platform key custody file",
+    ),
+    ("append_entry_by_text", "an OpenSSL X.509 name"),
+    ("append_own_leaf_node", "the MLS provider's storage"),
+    ("append_mode", "a TTL leaf's append-mode accessor"),
 ];
+
+/// Free functions that write leaves to a context's event log.
+const EVENT_LOG_APPEND_FREE_FNS: &[&str] = &["append_consequence_leaves_after_side_effect"];
+
+/// The byte offset of each call in `code` that writes a leaf to a context's
+/// event log: every `.append_<name>(` method call whose name
+/// [`NON_EVENT_LOG_APPENDS`] does not list, and every call of a free function
+/// on [`EVENT_LOG_APPEND_FREE_FNS`]. A wrapper that forwards to the provider is
+/// a writer too, so its callers count.
+fn event_log_append_calls(code: &str) -> Vec<usize> {
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    let mut calls = Vec::new();
+    for (at, _) in code.match_indices(".append_") {
+        let rest = &code[at + 1..];
+        let len = rest.find(|c: char| !ident(c)).unwrap_or(rest.len());
+        let name = &rest[..len];
+        let called = rest[len..].starts_with('(') || rest[len..].starts_with("::<");
+        if called && !NON_EVENT_LOG_APPENDS.iter().any(|(n, _)| *n == name) {
+            calls.push(at);
+        }
+    }
+    for free in EVENT_LOG_APPEND_FREE_FNS {
+        for (at, _) in code.match_indices(free) {
+            let before = code[..at].chars().next_back();
+            let after = &code[at + free.len()..];
+            let definition = code[..at].trim_end().ends_with("fn");
+            if before.is_none_or(|c| !(ident(c) || c == '.'))
+                && after.starts_with('(')
+                && !definition
+            {
+                calls.push(at);
+            }
+        }
+    }
+    calls
+}
 
 /// Each shipped function that may write a leaf to a context's event log, once
 /// per call it makes, with the reason it may.
@@ -10116,7 +10163,12 @@ const EVENT_LOG_APPEND_ALLOWLIST: &[(&str, &str, &str)] = &[
     (
         "scp-runtime/src/context/builder.rs",
         "append_event_in",
-        "the builder trait",
+        "the builder trait, forwards to `append_event`",
+    ),
+    (
+        "scp-runtime/src/context/builder.rs",
+        "append_event_in",
+        "the builder trait, forwards to `append_event_after_side_effect`",
     ),
     (
         "scp-runtime/src/context/builder.rs",
@@ -10159,6 +10211,11 @@ const EVENT_LOG_APPEND_ALLOWLIST: &[(&str, &str, &str)] = &[
         "create_context",
         "a fail-closed append",
     ),
+    (
+        "scp-runtime/src/context/builder.rs",
+        "create_context",
+        "a fail-closed append, the founder's `MemberJoined`",
+    ),
     // A seam that only the `testing` feature compiles.
     (
         "scp-runtime/src/context/supervisor/supervisor.rs",
@@ -10186,267 +10243,323 @@ const EVENT_LOG_APPEND_ALLOWLIST: &[(&str, &str, &str)] = &[
         "execute_rotate_content_keys",
         "SCP-349",
     ),
-    // Leaves whose resolution PR-4 of the #3066 re-plan defines.
+    // The streaming saga's A-side record.
     (
         "scp-runtime/src/context/outlets/invoke.rs",
         "record_streaming_saga_a_event",
-        "PR-4 of the #3066 re-plan",
+        "spec 06 §6.2.4",
     ),
     (
         "scp-runtime/src/context/actor/handlers/saga.rs",
         "emit_divergence_marker",
-        "PR-4 of the #3066 re-plan",
+        "spec 17 §17.3",
     ),
-    // Sites that PR-3b of the #3066 re-plan converts to pending log units.
+    // Leaves after a step, written memory-first; spec 17 §17.3 moves each
+    // into a pending log unit.
     (
-        "scp-runtime/src/context/governance_logic.rs",
-        "append_consequence_leaves_after_side_effect",
-        "converted by PR-3b of the #3066 re-plan",
-    ),
-    (
-        "scp-runtime/src/context/actor/handlers/saga.rs",
-        "commit_b_settle_finalize",
-        "converted by PR-3b of the #3066 re-plan",
+        "scp-runtime/src/context/supervisor/supervisor.rs",
+        "append_streaming_outlet_invoked_event",
+        "spec 17 §17.3, memory-first after the step",
     ),
     (
-        "scp-runtime/src/context/actor/handlers/saga.rs",
-        "commit_b_stream_settle_finalize",
-        "converted by PR-3b of the #3066 re-plan",
+        "scp-runtime/src/context/outlets/stream_settlement_adapter.rs",
+        "record",
+        "forwards to `append_streaming_outlet_invoked_event`",
     ),
     (
-        "scp-runtime/src/context/actor/handlers/saga.rs",
-        "commit_a",
-        "converted by PR-3b of the #3066 re-plan",
-    ),
-    (
-        "scp-runtime/src/context/outlets/invoke.rs",
-        "record_cross_context_a_event",
-        "converted by PR-3b of the #3066 re-plan",
+        "scp-runtime/src/context/actor/handlers/governance.rs",
+        "handle_evaluate_periodic_consequences_actor",
+        "spec 17 §17.3, memory-first after the step, through `append_consequence_leaves_after_side_effect`",
     ),
     (
         "scp-runtime/src/context/broadcast_helpers.rs",
-        "block_broadcast_subscriber",
-        "converted by PR-3b of the #3066 re-plan",
+        "subscribe_broadcast",
+        "spec 17 §17.3, memory-first after the step",
     ),
     (
         "scp-runtime/src/context/broadcast_helpers.rs",
-        "unblock_broadcast_subscriber",
-        "converted by PR-3b of the #3066 re-plan",
+        "unsubscribe_broadcast",
+        "spec 17 §17.3, memory-first after the step",
     ),
     (
-        "scp-runtime/src/context/ttl.rs",
-        "close_context",
-        "converted by PR-3b of the #3066 re-plan",
+        "scp-runtime/src/context/lifecycle_helpers.rs",
+        "join_context",
+        "spec 17 §17.3, memory-first after the step",
     ),
     (
-        "scp-runtime/src/context/ttl.rs",
-        "finalize_close",
-        "converted by PR-3b of the #3066 re-plan",
-    ),
-    (
-        "scp-runtime/src/context/ttl.rs",
-        "finish_ttl_expiry_io",
-        "converted by PR-3b of the #3066 re-plan",
-    ),
-    (
-        "scp-runtime/src/context/ttl_close_helpers.rs",
-        "extend_ttl_deadline_and_record",
-        "converted by PR-3b of the #3066 re-plan",
+        "scp-runtime/src/context/lifecycle_helpers.rs",
+        "leave_context",
+        "spec 17 §17.3, memory-first after the step",
     ),
     (
         "scp-runtime/src/context/governance_helpers.rs",
-        "tombstone_migrated_context",
-        "converted by PR-3b of the #3066 re-plan",
+        "execute_add_member",
+        "spec 17 §17.3, memory-first after the step",
     ),
     (
         "scp-runtime/src/context/governance_helpers.rs",
-        "withdraw_governance_vote",
-        "converted by PR-3b of the #3066 re-plan",
+        "execute_remove_member",
+        "spec 17 §17.3, memory-first after the step",
     ),
     (
         "scp-runtime/src/context/governance_helpers.rs",
-        "apply_pending_ceiling_modification",
-        "converted by PR-3b of the #3066 re-plan",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "apply_pending_economic_policy_change",
-        "converted by PR-3b of the #3066 re-plan",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_suspend_member",
-        "converted by PR-3b of the #3066 re-plan",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_revoke",
-        "converted by PR-3b of the #3066 re-plan",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_restore_access",
-        "converted by PR-3b of the #3066 re-plan",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_register_outlet",
-        "converted by PR-3b of the #3066 re-plan",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_remove_outlet",
-        "converted by PR-3b of the #3066 re-plan",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_modify_ceiling",
-        "converted by PR-3b of the #3066 re-plan",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_close_context",
-        "converted by PR-3b of the #3066 re-plan",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_extend_ttl",
-        "converted by PR-3b of the #3066 re-plan",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_transfer_admin",
-        "converted by PR-3b of the #3066 re-plan",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_create_child_context",
-        "converted by PR-3b of the #3066 re-plan",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_modify_pruning_policy",
-        "converted by PR-3b of the #3066 re-plan",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_add_signer",
-        "converted by PR-3b of the #3066 re-plan",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_remove_signer",
-        "converted by PR-3b of the #3066 re-plan",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_modify_threshold",
-        "converted by PR-3b of the #3066 re-plan",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_establish_outlet_interface",
-        "converted by PR-3b of the #3066 re-plan",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_reset_member",
-        "converted by PR-3b of the #3066 re-plan",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_resolve_conflict",
-        "converted by PR-3b of the #3066 re-plan",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_promote_context",
-        "converted by PR-3b of the #3066 re-plan",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_rotate_content_keys",
-        "converted by PR-3b of the #3066 re-plan",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_reconfigure_governance",
-        "converted by PR-3b of the #3066 re-plan",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_reconfigure_governance",
-        "converted by PR-3b of the #3066 re-plan",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_set_economic_policy",
-        "converted by PR-3b of the #3066 re-plan",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_approve_spend",
-        "converted by PR-3b of the #3066 re-plan",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_lock_economic_policy",
-        "converted by PR-3b of the #3066 re-plan",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_modify_hard_rate_limit",
-        "converted by PR-3b of the #3066 re-plan",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_modify_pseudonym_rotation_policy",
-        "converted by PR-3b of the #3066 re-plan",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_propose_context_migration",
-        "converted by PR-3b of the #3066 re-plan",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_cancel_context_migration",
-        "converted by PR-3b of the #3066 re-plan",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "propose_governance_action_inner",
-        "converted by PR-3b of the #3066 re-plan",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "propose_governance_action_inner",
-        "converted by PR-3b of the #3066 re-plan",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "propose_governance_action_inner",
-        "converted by PR-3b of the #3066 re-plan",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "vote_on_proposal_inner",
-        "converted by PR-3b of the #3066 re-plan",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "vote_on_proposal_inner",
-        "converted by PR-3b of the #3066 re-plan",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "dispatch_governance_action",
-        "converted by PR-3b of the #3066 re-plan",
+        "execute_change_role",
+        "spec 17 §17.3, memory-first after the step",
     ),
     (
         "scp-runtime/src/context/governance_helpers.rs",
         "finalize_governance_action",
-        "converted by PR-3b of the #3066 re-plan",
+        "spec 17 §17.3, memory-first after the step, through `append_consequence_leaves_after_side_effect`",
+    ),
+    (
+        "scp-runtime/src/context/governance_logic.rs",
+        "append_consequence_leaves_after_side_effect",
+        "spec 17 §17.3, memory-first after the step",
+    ),
+    (
+        "scp-runtime/src/context/actor/handlers/saga.rs",
+        "commit_b_settle_finalize",
+        "spec 17 §17.3, memory-first after the step",
+    ),
+    (
+        "scp-runtime/src/context/actor/handlers/saga.rs",
+        "commit_b_stream_settle_finalize",
+        "spec 17 §17.3, memory-first after the step",
+    ),
+    (
+        "scp-runtime/src/context/actor/handlers/saga.rs",
+        "commit_a",
+        "spec 17 §17.3, memory-first after the step",
+    ),
+    (
+        "scp-runtime/src/context/outlets/invoke.rs",
+        "record_cross_context_a_event",
+        "spec 17 §17.3, memory-first after the step",
+    ),
+    (
+        "scp-runtime/src/context/broadcast_helpers.rs",
+        "block_broadcast_subscriber",
+        "spec 17 §17.3, memory-first after the step",
+    ),
+    (
+        "scp-runtime/src/context/broadcast_helpers.rs",
+        "unblock_broadcast_subscriber",
+        "spec 17 §17.3, memory-first after the step",
+    ),
+    (
+        "scp-runtime/src/context/ttl.rs",
+        "close_context",
+        "spec 17 §17.3, memory-first after the step",
+    ),
+    (
+        "scp-runtime/src/context/ttl.rs",
+        "finalize_close",
+        "spec 17 §17.3, memory-first after the step",
+    ),
+    (
+        "scp-runtime/src/context/ttl.rs",
+        "finish_ttl_expiry_io",
+        "spec 17 §17.3, memory-first after the step",
+    ),
+    (
+        "scp-runtime/src/context/ttl_close_helpers.rs",
+        "extend_ttl_deadline_and_record",
+        "spec 17 §17.3, memory-first after the step",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "tombstone_migrated_context",
+        "spec 17 §17.3, memory-first after the step",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "withdraw_governance_vote",
+        "spec 17 §17.3, memory-first after the step",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "apply_pending_ceiling_modification",
+        "spec 17 §17.3, memory-first after the step",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "apply_pending_economic_policy_change",
+        "spec 17 §17.3, memory-first after the step",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_suspend_member",
+        "spec 17 §17.3, memory-first after the step",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_revoke",
+        "spec 17 §17.3, memory-first after the step",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_restore_access",
+        "spec 17 §17.3, memory-first after the step",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_register_outlet",
+        "spec 17 §17.3, memory-first after the step",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_remove_outlet",
+        "spec 17 §17.3, memory-first after the step",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_modify_ceiling",
+        "spec 17 §17.3, memory-first after the step",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_close_context",
+        "spec 17 §17.3, memory-first after the step",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_extend_ttl",
+        "spec 17 §17.3, memory-first after the step",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_transfer_admin",
+        "spec 17 §17.3, memory-first after the step",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_create_child_context",
+        "spec 17 §17.3, memory-first after the step",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_modify_pruning_policy",
+        "spec 17 §17.3, memory-first after the step",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_add_signer",
+        "spec 17 §17.3, memory-first after the step",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_remove_signer",
+        "spec 17 §17.3, memory-first after the step",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_modify_threshold",
+        "spec 17 §17.3, memory-first after the step",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_establish_outlet_interface",
+        "spec 17 §17.3, memory-first after the step",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_reset_member",
+        "spec 17 §17.3, memory-first after the step",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_resolve_conflict",
+        "spec 17 §17.3, memory-first after the step",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_promote_context",
+        "spec 17 §17.3, memory-first after the step",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_rotate_content_keys",
+        "spec 17 §17.3, memory-first after the step",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_reconfigure_governance",
+        "spec 17 §17.3, memory-first after the step",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_reconfigure_governance",
+        "spec 17 §17.3, memory-first after the step",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_set_economic_policy",
+        "spec 17 §17.3, memory-first after the step",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_approve_spend",
+        "spec 17 §17.3, memory-first after the step",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_lock_economic_policy",
+        "spec 17 §17.3, memory-first after the step",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_modify_hard_rate_limit",
+        "spec 17 §17.3, memory-first after the step",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_modify_pseudonym_rotation_policy",
+        "spec 17 §17.3, memory-first after the step",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_propose_context_migration",
+        "spec 17 §17.3, memory-first after the step",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_cancel_context_migration",
+        "spec 17 §17.3, memory-first after the step",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "propose_governance_action_inner",
+        "spec 17 §17.3, memory-first after the step",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "propose_governance_action_inner",
+        "spec 17 §17.3, memory-first after the step",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "propose_governance_action_inner",
+        "spec 17 §17.3, memory-first after the step",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "vote_on_proposal_inner",
+        "spec 17 §17.3, memory-first after the step",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "vote_on_proposal_inner",
+        "spec 17 §17.3, memory-first after the step",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "dispatch_governance_action",
+        "spec 17 §17.3, memory-first after the step",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "finalize_governance_action",
+        "spec 17 §17.3, memory-first after the step",
     ),
 ];
 
@@ -10497,9 +10610,18 @@ fn the_event_log_append_scan_reports_a_planted_call() {
         entry.1.push_str(&strip_non_code_keeping_cfg(extra));
         copy
     };
-    for call in EVENT_LOG_APPEND_CALLS {
+    // A provider call, a builder wrapper, a supervisor wrapper, a method no
+    // list names yet, and the free consequence-leaf writer.
+    for call in [
+        "log.append_event(a, b)",
+        "log.append_unit(a, b)",
+        "log.append_membership_change_leaf(a, b)",
+        "sup.append_streaming_outlet_invoked_event(a, b)",
+        "log.append_some_new_leaf(a)",
+        "crate::context::governance_logic::append_consequence_leaves_after_side_effect(a, b)",
+    ] {
         let planted = plant(&format!(
-            "\nasync fn planted_after_send(log: &L) {{ let _ = log{call}a, b).await; }}\n"
+            "\nasync fn planted_after_send(log: &L) {{ let _ = {call}.await; }}\n"
         ));
         let found = event_log_append_mismatches(&planted, EVENT_LOG_APPEND_ALLOWLIST);
         assert_eq!(
@@ -10508,6 +10630,15 @@ fn the_event_log_append_scan_reports_a_planted_call() {
                 "{planted_in}::planted_after_send: 1 call(s), allowlisted 0"
             )],
             "a planted `{call}` call is reported"
+        );
+    }
+    for (name, _) in NON_EVENT_LOG_APPENDS {
+        let planted = plant(&format!(
+            "\nasync fn planted_other_store(s: &S) {{ let _ = s.{name}(a).await; }}\n"
+        ));
+        assert!(
+            event_log_append_mismatches(&planted, EVENT_LOG_APPEND_ALLOWLIST).is_empty(),
+            "`{name}` writes no event-log leaf"
         );
     }
     let gated = plant(
@@ -10611,7 +10742,7 @@ fn shipped_crate_sources() -> Vec<(String, String)> {
     out
 }
 
-/// Every (file, function) whose count of [`EVENT_LOG_APPEND_CALLS`] in
+/// Every (file, function) whose count of [`event_log_append_calls`] in
 /// shipped code differs from its count of `allowlist` entries, as
 /// `"file::fn: N call(s), allowlisted M"`, sorted. A call outside any
 /// function counts against the function name `<item>`.
@@ -10624,15 +10755,13 @@ fn event_log_append_mismatches(
     for (rel, code) in sources {
         let shipped = without_test_gated_mod_blocks(code);
         let bodies = fn_bodies(&shipped);
-        for call in EVENT_LOG_APPEND_CALLS {
-            for (at, _) in shipped.match_indices(call) {
-                let owner = bodies
-                    .iter()
-                    .filter(|(open, end, _)| *open < at && at < *end)
-                    .max_by_key(|(open, _, _)| *open)
-                    .map_or("<item>", |(_, _, name)| *name);
-                *found.entry((rel.clone(), owner.to_owned())).or_default() += 1;
-            }
+        for at in event_log_append_calls(&shipped) {
+            let owner = bodies
+                .iter()
+                .filter(|(open, end, _)| *open < at && at < *end)
+                .max_by_key(|(open, _, _)| *open)
+                .map_or("<item>", |(_, _, name)| *name);
+            *found.entry((rel.clone(), owner.to_owned())).or_default() += 1;
         }
     }
     let mut allowed: std::collections::BTreeMap<(String, String), usize> =
