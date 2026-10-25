@@ -1,8 +1,9 @@
 //! The registered constants and domain separators the key-event codec reads.
 //!
 //! The bounds are `09-security-model.md` §9.18.17's registered values; the
-//! separators are §9.7.4.2's and §9.18.2's. Each is a `u32` or a byte string,
-//! never a `usize`, so no value here depends on the target's pointer width.
+//! separators are §9.7.4.2's and §9.18.2's; the staleness bound is §9.18.7's.
+//! Each is a `u32`, a `u64` count of seconds, or a byte string, never a
+//! `usize`, so no value here depends on the target's pointer width.
 //!
 //! Every separator is crate-private: each construction has one public
 //! function that applies its separator (ADR-063, implementation
@@ -39,6 +40,12 @@ pub const MAX_RETAINED_BYTES: u32 = 536_870_912;
 const _: () = assert!(
     MAX_RETAINED_BYTES == MAX_RETAINED_SUFFIXES * MAX_EVENTS_PER_SUFFIX_RETAINED * MAX_EVENT_BYTES
 );
+
+/// The most seconds a resolved key state stays fresh (§9.18.7).
+///
+/// It is the maximum age of the key-event log a party relies on for a key
+/// position (§9.7.1 check 2). `ResolvedState::is_fresh` reads it, and scp-mls re-exports it.
+pub const MAX_ATTESTATION_KEY_RESOLUTION_STALENESS: u64 = 300;
 
 /// The most witnesses a key-state snapshot may name (§9.18.17).
 pub const MAX_WITNESS_SET_SIZE: u32 = 32;

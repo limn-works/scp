@@ -15,10 +15,10 @@ use proptest::prelude::*;
 use proptest::test_runner::{Config, TestCaseError, TestRng, TestRunner};
 
 use super::super::holder::{AcceptedChainHolder, HoldOutcome};
-use super::super::retention::{Bounds, RetainedSuffix, Slot, plan_evictions};
+use super::super::retention::{Bounds, Guard, RetainedSuffix, Slot, plan_evictions};
 use super::super::{
-    Admission, BasisKind, ForkRank, PersistedSuffix, Rerank, RestoreError, RetentionBasis,
-    RetentionError, RetentionSet,
+    Admission, AdoptedBasis, BasisKind, ForkRank, PersistedSuffix, Rerank, RestoreError,
+    RetentionBasis, RetentionError, RetentionSet,
 };
 use super::chain_support::{group, identifier_of, sign_inception, signed_of, vector};
 use super::fixtures::V41_PREIMAGE;
@@ -32,6 +32,14 @@ use crate::ValidatedChain;
 /// The accepted basis: Vector 41, then owner 0's `KeyState`.
 fn basis(keys: &mut Keys) -> Result<Branch, Error> {
     Branch::of(keys, &[Kind::KeyState], 0)
+}
+
+/// An accepted basis every rank-2 and rank-3 fork at Vector 41 loses to:
+/// Vector 41, then owner 0's root-signed rollover. No such fork is a tied
+/// head, so R9's tied-head rule leaves the rank rule and the tie-break
+/// alone to decide its eviction.
+fn beating_basis(keys: &mut Keys) -> Result<Branch, Error> {
+    Branch::of(keys, &[Kind::Reveal], 0)
 }
 
 fn accepted(branch: &Branch) -> RetentionBasis {
@@ -139,7 +147,7 @@ fn extending_a_rank_one_suffix_nine_times_keeps_one_slot() -> TestResult {
 /// evict the owner's own chain first". The owner's rank-2 suffix, extended
 /// after seven attacker suffixes arrived, keeps its first moment, so a
 /// rank-2 candidate at the full count bound evicts the latest attacker
-/// suffix.
+/// suffix. The basis beats every suffix, so none is a tied head.
 ///
 /// Mutants (each run, then restored): an extension takes the next moment
 /// instead of inheriting one, so the owner's suffix is the most recent and
@@ -148,7 +156,7 @@ fn extending_a_rank_one_suffix_nine_times_keeps_one_slot() -> TestResult {
 #[test]
 fn owner_extension_keeps_its_moment_so_the_latest_attacker_is_evicted() -> TestResult {
     let mut keys = Keys::new()?;
-    let basis = basis(&mut keys)?;
+    let basis = beating_basis(&mut keys)?;
     let mut set = registered(&basis);
     let mut owner = Branch::of(&mut keys, &[Kind::Lost], 1)?;
     retain(&mut set, &owner.chain)?;
@@ -268,7 +276,11 @@ fn persist_restore_after_adoption() -> TestResult {
     assert_eq!(saved.basis.head, w.head());
     assert_eq!(saved.basis.observed, 2);
     let identifier = w.chain.identifier();
-    let restored = RetentionSet::restore(&identifier, &saved, Some(w.head()))?;
+    let restored = RetentionSet::restore(
+        &identifier,
+        &saved,
+        AdoptedBasis::Accepted { head: w.head() },
+    )?;
     assert_eq!(restored, set);
     assert_eq!(restored.persisted(), saved);
     Ok(())
@@ -315,15 +327,51 @@ fn byte_different_copy_served_second_never_displaces_the_held_copy() -> TestResu
     Ok(())
 }
 
+/// R9's copy rule on a move: a new basis the set already holds events of
+/// carries the held copy, so a byte-different copy served under the
+/// adopted chain never reaches what the set persists.
+///
+/// Mutant (run, then restored): `move_to` takes the new basis as served.
+#[test]
+fn moved_basis_keeps_the_held_copy() -> TestResult {
+    let mut keys = Keys::new()?;
+    let basis = basis(&mut keys)?;
+    let (preimage, first, second) = assertion_copies(&keys)?;
+    let v41 = v41()?;
+    let fields = Wire::of(&preimage).fields();
+    let held = v41.then(&fields, first.clone(), v41.root.clone());
+    let copied = v41.then(&fields, second.clone(), v41.root.clone());
+    let mut later = v41_changed()?;
+    later.witnessing_interval = 7_400;
+    let next = key_state_on(&copied, later);
+    let next_unit = keys.sign(&copied, &next)?;
+    let extension = copied.then(&Wire::of(&next).fields(), next_unit, v41.root);
+
+    let mut set = registered(&basis);
+    retain(&mut set, &chain_of(&held)?)?;
+    let _ = set.rerank(RetentionBasis::Accepted(chain_of(&extension)?))?;
+    let shared = set
+        .basis()
+        .chain()
+        .events()
+        .nth(1)
+        .ok_or("the shared event")?;
+    assert_eq!(shared.unit, first.as_slice());
+    let units = set.persisted().units;
+    assert!(units.iter().all(|unit| **unit != *second));
+    Ok(())
+}
+
 /// R9: "A candidate the party can evict no suffix for is refused — a
-/// rank-3 candidate against rank-2 suffixes alone, for one".
+/// rank-3 candidate against rank-2 suffixes alone, for one". The basis
+/// beats every suffix, so the rank rule alone refuses.
 ///
 /// Mutant (run, then restored): the planner drops "whose rank number is at
 /// least the candidate's", so the rank-3 candidate evicts a rank-2 suffix.
 #[test]
 fn rank_three_candidate_against_eight_rank_two_suffixes_is_refused() -> TestResult {
     let mut keys = Keys::new()?;
-    let basis = basis(&mut keys)?;
+    let basis = beating_basis(&mut keys)?;
     let mut set = registered(&basis);
     for owner in 1..=8 {
         retain(
@@ -344,14 +392,14 @@ fn rank_three_candidate_against_eight_rank_two_suffixes_is_refused() -> TestResu
 }
 
 /// R9: "breaking a tie among equal ranks by evicting the suffix it observed
-/// most recently".
+/// most recently". The basis beats every suffix, so none is a tied head.
 ///
 /// Mutant (run, then restored): the tie-break evicts the earliest-observed
 /// suffix.
 #[test]
 fn equal_rank_eviction_takes_the_most_recently_observed() -> TestResult {
     let mut keys = Keys::new()?;
-    let basis = basis(&mut keys)?;
+    let basis = beating_basis(&mut keys)?;
     let mut set = registered(&basis);
     let mut latest = None;
     for owner in 1..=8 {
@@ -637,19 +685,27 @@ fn contested_prefix_retains_the_tied_heads_past_it() -> TestResult {
     assert_eq!(saved.basis.kind, BasisKind::ContestedPrefix);
     assert_eq!(saved.basis.head, prefix.head());
     let identifier = prefix.chain.identifier();
-    assert_eq!(RetentionSet::restore(&identifier, &saved, None)?, set);
+    assert_eq!(
+        RetentionSet::restore(
+            &identifier,
+            &saved,
+            AdoptedBasis::ContestedPrefix {
+                head: prefix.head()
+            }
+        )?,
+        set
+    );
     Ok(())
 }
 
-/// `restore` takes the accepted chain from the verifier's adopted state,
-/// never from the persisted bytes: a contested prefix persisted as an
-/// accepted basis is refused at a first contact, a persisted contested
-/// prefix is refused where the caller holds a baseline, and an accepted
-/// head other than the baseline head is refused.
+/// `restore` takes the basis from the verifier's persisted verdict, never
+/// from the persisted bytes: a basis of the other kind is refused either
+/// way, a contested prefix persisted as an accepted basis included, and a
+/// basis of the named kind at another head is refused.
 ///
-/// Mutant (run, then restored): `restore` skips the agreement check, so
-/// the flipped kind restores Vector 41 as accepted and reaches the
-/// tournament instead.
+/// Mutants (each run, then restored): `restore` compares only the kinds,
+/// so a contested prefix at another head restores; and `restore` accepts
+/// an accepted basis where the verdict names a contested prefix.
 #[test]
 fn restore_refuses_a_basis_the_verifier_did_not_adopt() -> TestResult {
     let mut keys = Keys::new()?;
@@ -659,30 +715,57 @@ fn restore_refuses_a_basis_the_verifier_did_not_adopt() -> TestResult {
     retain(&mut set, &Branch::of(&mut keys, &[Kind::Reveal], 2)?.chain)?;
     let identifier = prefix.chain.identifier();
     let saved = set.persisted();
+    let contested = AdoptedBasis::ContestedPrefix {
+        head: prefix.head(),
+    };
     let mut flipped = saved.clone();
     flipped.basis.kind = BasisKind::Accepted;
     assert_eq!(
-        RetentionSet::restore(&identifier, &flipped, None),
+        RetentionSet::restore(&identifier, &flipped, contested),
         Err(RestoreError::BasisDisagrees {
-            adopted: None,
+            adopted: contested,
             kind: BasisKind::Accepted,
             head: prefix.head(),
         })
     );
+    let accepted = AdoptedBasis::Accepted {
+        head: prefix.head(),
+    };
     assert_eq!(
-        RetentionSet::restore(&identifier, &saved, Some(prefix.head())),
+        RetentionSet::restore(&identifier, &saved, accepted),
         Err(RestoreError::BasisDisagrees {
-            adopted: Some(prefix.head()),
+            adopted: accepted,
+            kind: BasisKind::ContestedPrefix,
+            head: prefix.head(),
+        })
+    );
+    let elsewhere = AdoptedBasis::ContestedPrefix { head: [0x5a; 32] };
+    assert_eq!(
+        RetentionSet::restore(&identifier, &saved, elsewhere),
+        Err(RestoreError::BasisDisagrees {
+            adopted: elsewhere,
             kind: BasisKind::ContestedPrefix,
             head: prefix.head(),
         })
     );
     let basis = basis(&mut keys)?;
-    let accepted_set = registered(&basis);
+    let accepted_set = registered(&basis).persisted();
+    // An accepted basis restored where the verifier's verdict names a
+    // contested prefix, a first contact's among them.
+    let first_contact = AdoptedBasis::ContestedPrefix { head: basis.head() };
     assert_eq!(
-        RetentionSet::restore(&identifier, &accepted_set.persisted(), Some(v41_digest())),
+        RetentionSet::restore(&identifier, &accepted_set, first_contact),
         Err(RestoreError::BasisDisagrees {
-            adopted: Some(v41_digest()),
+            adopted: first_contact,
+            kind: BasisKind::Accepted,
+            head: basis.head(),
+        })
+    );
+    let stale = AdoptedBasis::Accepted { head: v41_digest() };
+    assert_eq!(
+        RetentionSet::restore(&identifier, &accepted_set, stale),
+        Err(RestoreError::BasisDisagrees {
+            adopted: stale,
             kind: BasisKind::Accepted,
             head: basis.head(),
         })
@@ -706,7 +789,11 @@ fn restore_refuses_an_accepted_basis_a_suffix_beats() -> TestResult {
     retain(&mut set, &x.chain)?;
     let identifier = a.chain.identifier();
     assert_eq!(
-        RetentionSet::restore(&identifier, &set.persisted(), Some(a.head())),
+        RetentionSet::restore(
+            &identifier,
+            &set.persisted(),
+            AdoptedBasis::Accepted { head: a.head() }
+        ),
         Err(RestoreError::AcceptedDisplaced {
             accepted: a.head(),
             by: x.head(),
@@ -854,7 +941,7 @@ fn restore_fails_closed() -> TestResult {
     retain(&mut set, &second.chain)?;
     let saved = set.persisted();
     let identifier = basis.chain.identifier();
-    let adopted = Some(basis.head());
+    let adopted = AdoptedBasis::Accepted { head: basis.head() };
     let restore = |saved: &_| RetentionSet::restore(&identifier, saved, adopted);
     assert_eq!(restore(&saved)?, set);
 
@@ -921,7 +1008,11 @@ fn restore_fails_closed() -> TestResult {
     let mut short = saved.clone();
     short.basis.head = v41_digest();
     assert_eq!(
-        RetentionSet::restore(&identifier, &short, Some(v41_digest())),
+        RetentionSet::restore(
+            &identifier,
+            &short,
+            AdoptedBasis::Accepted { head: v41_digest() }
+        ),
         Err(RestoreError::Retention(RetentionError::ExtendsAccepted {
             head: v41_digest()
         }))
@@ -943,13 +1034,15 @@ const fn digest(id: u8) -> [u8; 32] {
 
 /// The planner's contract over arbitrary held slots sharing events, with
 /// or without a replaced slot: it never evicts a rank-1 suffix, one whose
-/// rank number is below the candidate's, or the replaced one; its victims
+/// rank number is below the candidate's, a protected one (a tied head the
+/// candidate does not beat), or the replaced one; its victims
 /// are the first k of the eviction order (highest rank number, then latest
 /// moment); the result fits both bounds with each event counted once;
 /// putting back the last victim breaks a bound; and it refuses only where
 /// evicting every suffix it may evict would still not fit.
 ///
-/// Mutants (each run, then restored): the planner evicts every suffix it
+/// Mutants (each run, then restored): the planner ignores `protected`;
+/// the planner evicts every suffix it
 /// may evict once over a bound, which breaks minimality; and it evicts the
 /// most recent regardless of rank, which breaks the order and the rank
 /// floor.
@@ -969,11 +1062,12 @@ fn plan_evictions_holds_the_eviction_rule() {
         proptest::collection::vec(1_u64..40, 16),
         1_u32..10,
         1_u64..300,
+        proptest::collection::vec(proptest::bool::weighted(0.25), 0..12),
     );
     let mut runner = TestRunner::new(Config::with_cases(4_000));
     let outcome = runner.run(
         &strategy,
-        |(held, candidate, replacing, sizes, suffixes, bytes)| {
+        |(held, candidate, replacing, sizes, suffixes, bytes, protected)| {
             let size = |id: u8| sizes.get(usize::from(id)).copied().unwrap_or(0);
             let slot_of = |(rank, ids): (ForkRank, BTreeSet<u8>), observed| Slot {
                 rank,
@@ -1007,10 +1101,11 @@ fn plan_evictions_holds_the_eviction_rule() {
                 .iter()
                 .copied()
                 .filter(|index| {
-                    held.get(*index).is_some_and(|slot| {
-                        slot.rank != ForkRank::Rank1
-                            && slot.rank.number() >= candidate.rank.number()
-                    })
+                    !protected.get(*index).copied().unwrap_or(false)
+                        && held.get(*index).is_some_and(|slot| {
+                            slot.rank != ForkRank::Rank1
+                                && slot.rank.number() >= candidate.rank.number()
+                        })
                 })
                 .collect();
             order.sort_by_key(|index| {
@@ -1025,7 +1120,19 @@ fn plan_evictions_holds_the_eviction_rule() {
                     .collect()
             };
             let refs: Vec<&Slot> = held.iter().collect();
-            match plan_evictions(&refs, replacing, &candidate, bounds) {
+            let guards: Vec<Guard> = protected
+                .iter()
+                .map(|protected| {
+                    if *protected {
+                        Guard::Tied {
+                            beaten_by: Vec::new(),
+                        }
+                    } else {
+                        Guard::Open
+                    }
+                })
+                .collect();
+            match plan_evictions(&refs, &guards, replacing, &candidate, bounds) {
                 Some(evicted) => {
                     prop_assert_eq!(order.get(..evicted.len()), Some(evicted.as_slice()));
                     prop_assert!(fits(&without(&evicted)));
@@ -1102,7 +1209,8 @@ fn flood_pool(keys: &mut Keys) -> Result<(Branch, Vec<ValidatedChain>), Error> {
 /// forking at positions 1 to 3, siblings sharing a body, and more rank-1
 /// lineages than slots: after every admission the result is the test's own
 /// model of refusal, which keeps every suffix the candidate may not evict
-/// (rank 1, or a rank number below the candidate's) and refuses exactly
+/// (rank 1, a rank number below the candidate's, or a tied head no held
+/// chain and not the candidate beats under R6) and refuses exactly
 /// where that floor and the candidate exceed the count bound or, each event
 /// once, the byte bound. Both bounds hold, the byte tally is the model's,
 /// no rank-1 suffix leaves except by its own extension, a refusal changes
@@ -1111,9 +1219,10 @@ fn flood_pool(keys: &mut Keys) -> Result<(Branch, Vec<ValidatedChain>), Error> {
 /// bound, and a set holding two suffixes that share an event.
 ///
 /// Mutants (each run, then restored): the planner evicts the most recently
-/// observed suffix regardless of rank, which evicts rank-1 suffixes; and
-/// the tally sums each suffix's own bytes, which refuses where the model
-/// admits.
+/// observed suffix regardless of rank, which evicts rank-1 suffixes; the
+/// tally sums each suffix's own bytes, which refuses where the model
+/// admits; and `protected` protects no suffix, which admits where the model
+/// refuses.
 #[test]
 fn admit_matches_the_refusal_model() -> TestResult {
     let mut keys = Keys::new()?;
@@ -1187,6 +1296,139 @@ fn admit_matches_the_refusal_model() -> TestResult {
     Ok(())
 }
 
+/// Whether `left` beats `right` under R6: two diverged chains, `left`'s
+/// rank number the lower.
+fn beats(left: &ValidatedChain, right: &ValidatedChain) -> bool {
+    matches!(
+        super::pair_chains(left, right),
+        Ok(super::ChainPairing::Diverged(divergence))
+            if divergence.ranks[0].number() < divergence.ranks[1].number()
+    )
+}
+
+/// R9's tied-head rule read after each victim: the byte bound needs two
+/// evictions among three rank-3 suffixes, and Y is a tied head once X, the
+/// one suffix beating it, leaves. The plan evicts X, the most recently
+/// observed, then W, never Y.
+///
+/// Mutant (run, then restored): `guarded` protects a tied head only where
+/// nothing held beats it, read once before the plan, so the plan evicts X
+/// and then Y.
+#[test]
+fn plan_protects_a_tied_head_its_first_victim_beat() {
+    let slot = |id: u8, observed| Slot {
+        rank: ForkRank::Rank3,
+        observed,
+        events: vec![(digest(id), 10)],
+    };
+    let w = slot(1, 1);
+    let y = slot(2, 2);
+    let x = slot(3, 3);
+    let candidate = slot(4, 4);
+    let guards = [Guard::Open, Guard::Tied { beaten_by: vec![2] }, Guard::Open];
+    let bounds = Bounds {
+        suffixes: 8,
+        bytes: 20,
+    };
+    assert_eq!(
+        plan_evictions(&[&w, &y, &x], &guards, None, &candidate, bounds),
+        Some(vec![2, 0])
+    );
+}
+
+/// R9's tie prefix where the bounds refuse every chain carrying it while a
+/// chain extending the accepted chain A is retained: the byte bound holds
+/// L, one event past A, and refuses both tied chains, which carry the tie
+/// prefix P's event past A. The set records the longest prefix of P a held
+/// chain carries, A itself, so L keeps its rank, the set persists no event
+/// of P past A, and it restores with L and that prefix.
+///
+/// Mutant (run, then restored): `settled` records no prefix wherever no
+/// held chain carries the whole one, so `restore` refuses L as an
+/// extension of the accepted chain.
+#[test]
+fn tie_prefix_settles_to_the_longest_carried_prefix() -> TestResult {
+    let mut keys = Keys::new()?;
+    let a = Branch::of(&mut keys, &[Kind::Reveal], 0)?;
+    let mut p = a.clone();
+    p.push(&mut keys, Kind::KeyState, 0)?;
+    let mut t1 = p.clone();
+    t1.push(&mut keys, Kind::Reveal, 1)?;
+    let mut t2 = p.clone();
+    t2.push(&mut keys, Kind::CoSigns, 2)?;
+    let mut l = a.clone();
+    l.push(&mut keys, Kind::KeyState, 3)?;
+    let mut set = bounded(&a, 8, tail(&l));
+    let report = set.after_contest(
+        p.chain.clone(),
+        [t1.chain.clone(), t2.chain.clone(), l.chain.clone()],
+    )?;
+    assert_eq!(report.refused, vec![t1.head(), t2.head()]);
+    assert_eq!(heads(&set), BTreeSet::from([l.head()]));
+    assert_eq!(set.tie_prefix(), Some(&a.chain));
+    let retained = by_head(&set, l.head())?;
+    assert_eq!(
+        (retained.rank(), retained.fork_position()),
+        (ForkRank::Rank3, 2)
+    );
+    let saved = set.persisted();
+    let stored: u64 = saved.units.iter().map(|unit| unit.len() as u64).sum();
+    assert_eq!(
+        stored,
+        a.unit_lens.iter().sum::<u64>() + set.retained_bytes()
+    );
+    let restored = RetentionSet::restore(
+        &a.chain.identifier(),
+        &saved,
+        AdoptedBasis::Accepted { head: a.head() },
+    )?;
+    assert_eq!(restored.suffixes(), set.suffixes());
+    assert_eq!(restored.tie_prefix(), Some(&a.chain));
+    Ok(())
+}
+
+/// R9's tie prefix after an admission evicts its last carrier: two
+/// `{Lost}` recoveries off the accepted chain A beat both tied chains past
+/// the prefix P and, at a count bound of two, evict them one at a time. No
+/// held chain then carries P, both recoveries extend A, so the set records
+/// A and restores.
+///
+/// Mutant (run, then restored): `admit` skips settling the tie prefix, so
+/// the set keeps P, which no held chain carries, and `restore` refuses it.
+#[test]
+fn admission_evicting_the_last_carrier_settles_the_tie_prefix() -> TestResult {
+    let mut keys = Keys::new()?;
+    let a = Branch::of(&mut keys, &[Kind::Reveal], 0)?;
+    let mut p = a.clone();
+    p.push(&mut keys, Kind::KeyState, 0)?;
+    let mut t1 = p.clone();
+    t1.push(&mut keys, Kind::KeyState, 1)?;
+    let mut t2 = p.clone();
+    t2.push(&mut keys, Kind::KeyState, 2)?;
+    let mut set = bounded(&a, 2, u64::MAX);
+    let report = set.after_contest(p.chain.clone(), [t1.chain.clone(), t2.chain.clone()])?;
+    assert!(report.refused.is_empty());
+    assert_eq!(set.tie_prefix(), Some(&p.chain));
+    for owner in [3, 4] {
+        let mut recovery = a.clone();
+        recovery.push(&mut keys, Kind::Lost, owner)?;
+        assert!(matches!(
+            set.admit(recovery.chain)?,
+            Admission::Retained { ref evicted, .. } if evicted.len() == 1
+        ));
+    }
+    assert!(!heads(&set).contains(&t1.head()) && !heads(&set).contains(&t2.head()));
+    assert_eq!(set.tie_prefix(), Some(&a.chain));
+    let restored = RetentionSet::restore(
+        &a.chain.identifier(),
+        &set.persisted(),
+        AdoptedBasis::Accepted { head: a.head() },
+    )?;
+    assert_eq!(restored.suffixes(), set.suffixes());
+    assert_eq!(restored.tie_prefix(), set.tie_prefix());
+    Ok(())
+}
+
 /// The test's own model of R9's refusal, and what a run reached.
 struct RefusalModel<'b> {
     basis: &'b ValidatedChain,
@@ -1222,12 +1464,22 @@ impl RefusalModel<'_> {
             .iter()
             .find(|suffix| suffix.chain().shared_prefix_len(candidate) == suffix.chain().len())
             .map(RetainedSuffix::head);
+        let held: Vec<&ValidatedChain> = std::iter::once(self.basis)
+            .chain(before.suffixes().iter().map(RetainedSuffix::chain))
+            .collect();
+        let protected = |suffix: &RetainedSuffix| {
+            held.iter()
+                .chain([&candidate])
+                .all(|other| !beats(other, suffix.chain()))
+        };
         let floor: Vec<&ValidatedChain> = before
             .suffixes()
             .iter()
             .filter(|suffix| Some(suffix.head()) != replaced)
             .filter(|suffix| {
-                suffix.rank() == ForkRank::Rank1 || suffix.rank().number() < rank.number()
+                suffix.rank() == ForkRank::Rank1
+                    || suffix.rank().number() < rank.number()
+                    || protected(suffix)
             })
             .map(RetainedSuffix::chain)
             .collect();
@@ -1248,12 +1500,11 @@ impl RefusalModel<'_> {
         if let Admission::Retained { evicted, .. } | Admission::Extended { evicted, .. } = admission
         {
             let evictable = evicted.iter().all(|head| {
-                before
-                    .suffixes()
-                    .iter()
-                    .any(|suffix| suffix.head() == *head && suffix.rank() != ForkRank::Rank1)
+                before.suffixes().iter().any(|suffix| {
+                    suffix.head() == *head && suffix.rank() != ForkRank::Rank1 && !protected(suffix)
+                })
             });
-            prop_assert!(evictable, "evicted a rank-1 or unheld suffix");
+            prop_assert!(evictable, "evicted a rank-1, protected or unheld suffix");
         }
         let own_sum: u64 = set
             .suffixes()
@@ -1290,9 +1541,9 @@ impl RefusalModel<'_> {
 
 /// R9 at a store: every chain other than the accepted one is a divergent
 /// suffix under the count bound. Nine rank-3 forks tie the accepted chain,
-/// which was held first and stays accepted; the ninth evicts the most
-/// recently observed fork, the eighth, so the holder holds eight suffixes
-/// and the accepted chain.
+/// which was held first and stays accepted; each fork is a tied head the
+/// ninth does not beat, so R9's tied-head rule refuses the ninth, and the
+/// holder holds the first eight forks and the accepted chain.
 ///
 /// Mutant (run, then restored): the planner checks the byte bound alone, so
 /// the holder keeps all nine forks.
@@ -1305,18 +1556,21 @@ fn holder_keeps_at_most_eight_of_nine_rank_three_forks() -> TestResult {
     let forks: Vec<Branch> = (1..=9)
         .map(|owner| Branch::of(&mut keys, &[Kind::KeyState], owner))
         .collect::<Result<_, _>>()?;
-    let eighth = forks.get(7).ok_or("an eighth fork")?.head();
+    let ninth = forks.get(8).ok_or("a ninth fork")?.head();
     for (index, fork) in forks.iter().enumerate() {
-        let evicted = if index == 8 { vec![eighth] } else { Vec::new() };
-        assert_eq!(
-            holder.hold(fork.chain.clone())?,
+        let expected = if index == 8 {
+            HoldOutcome::Refused {
+                rank: ForkRank::Rank3,
+            }
+        } else {
             HoldOutcome::HeldDivergent {
                 admission: Admission::Retained {
                     rank: ForkRank::Rank3,
-                    evicted,
-                }
+                    evicted: Vec::new(),
+                },
             }
-        );
+        };
+        assert_eq!(holder.hold(fork.chain.clone())?, expected);
     }
     assert_eq!(holder.held().count(), 9);
     assert_eq!(
@@ -1326,7 +1580,7 @@ fn holder_keeps_at_most_eight_of_nine_rank_three_forks() -> TestResult {
     let expected: BTreeSet<[u8; 32]> = forks
         .iter()
         .map(Branch::head)
-        .filter(|head| *head != eighth)
+        .filter(|head| *head != ninth)
         .collect();
     assert_eq!(heads(holder.retention().ok_or("a set")?), expected);
     Ok(())

@@ -94,13 +94,10 @@ pub const MAX_KEYPACKAGE_ATTESTATION_LIFETIME: u64 =
 // cap without tripping the build.
 const _: () = assert!(MAX_KEYPACKAGE_ATTESTATION_LIFETIME == 7_261_200);
 
-/// Maximum staleness of the DID document used for the attestation current-key
-/// check: 300 seconds (5 minutes).
-///
-/// §9.18.7; §9.7.1 verifier checks 1–2. Tied to the §9.14 clock-skew tolerance.
-/// Consumed by the (later-slice) verifier; defined here so the constant lives
-/// alongside the type it governs.
-pub const MAX_ATTESTATION_KEY_RESOLUTION_STALENESS: u64 = 300;
+/// Maximum staleness of the key-event log used for the attestation
+/// current-key check: 300 seconds (§9.18.7; §9.7.1 checks 1–2). scp-kel
+/// defines it once, beside the `ResolvedState` freshness check that reads it.
+pub use scp_kel::constants::MAX_ATTESTATION_KEY_RESOLUTION_STALENESS;
 
 /// Size of each of the four bound leaf public keys: a 65-byte uncompressed SEC1
 /// P-256 point (§9.5.2).

@@ -2542,6 +2542,7 @@ dependencies = [
  "scp-clock",
  "scp-crypto",
  "scp-did",
+ "scp-kel",
  "scp-protocol",
  "serde",
  "sha2 0.10.9",

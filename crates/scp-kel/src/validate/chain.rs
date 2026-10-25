@@ -263,6 +263,19 @@ impl ValidatedChain {
             })
     }
 
+    /// Whether every reveal-authorized event at sequences 1 through
+    /// `position` carries a root signature verifying against the root
+    /// standing at its predecessor: R9's early-stop condition on a tied
+    /// pair's shared prefix past the inception (§9.7.4.2 R9, the fetch
+    /// bound).
+    pub(crate) fn reveals_root_cosigned_through(&self, position: u64) -> bool {
+        self.events()
+            .skip(1)
+            .take_while(|event| event.sequence <= position)
+            .filter(|event| event.kind.is_reveal_authorized())
+            .all(|event| event.reveal_root_cosigned)
+    }
+
     /// Every event's preimage digest and the unit that carried it, from the
     /// inception to the head: the copies R9 keeps and persists.
     pub(crate) fn units(&self) -> impl Iterator<Item = ([u8; 32], Arc<[u8]>)> + '_ {

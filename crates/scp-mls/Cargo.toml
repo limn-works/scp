@@ -22,6 +22,10 @@ testing = ["scp-protocol/testing", "scp-did/testing"]
 # scp-identity.
 scp-clock = { path = "../scp-clock", version = "=0.1.0-beta.2" }
 scp-did = { path = "../scp-did", version = "=0.1.0-beta.2" }
+# MAX_ATTESTATION_KEY_RESOLUTION_STALENESS, defined once beside the
+# ResolvedState freshness check (09-security-model.md §9.18.7). wasm-safe,
+# no async runtime.
+scp-kel = { path = "../scp-kel", version = "=0.1.0-beta.2" }
 scp-protocol = { path = "../scp-protocol", version = "=0.1.0-beta.2" }
 # Wasm-safe leaf: the single §9.10.4.A pseudonym-derivation source (ADR-057
 # Option A). `derive_pseudonym` derives this member's per-context pseudonym over

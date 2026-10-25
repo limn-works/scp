@@ -458,8 +458,8 @@ mod holder;
 mod retention;
 
 pub use retention::{
-    Admission, BasisKind, PersistedBasis, PersistedRetention, PersistedSuffix, Rerank,
-    RestoreError, RetainedSuffix, RetentionBasis, RetentionError, RetentionSet,
+    Admission, AdoptedBasis, BasisKind, PersistedBasis, PersistedRetention, PersistedSuffix,
+    Rerank, RestoreError, RetainedSuffix, RetentionBasis, RetentionError, RetentionSet,
 };
 
 #[cfg(test)]
