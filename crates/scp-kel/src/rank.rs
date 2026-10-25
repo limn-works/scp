@@ -45,7 +45,7 @@ impl ForkRank {
 
     /// Whether this rank beats `other` (R6: "A lower rank number beats a
     /// higher one").
-    const fn beats(self, other: Self) -> bool {
+    pub(crate) const fn beats(self, other: Self) -> bool {
         self.number() < other.number()
     }
 }

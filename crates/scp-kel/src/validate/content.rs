@@ -883,6 +883,7 @@ pub(super) fn chain_event(
             .signers
             .iter()
             .any(|signer| signer.role == SignerGroupRole::StandingRoot),
+        standing_root: preimage.standing_root,
         unit,
         root: Arc::clone(&applied.root),
         commitment: Arc::clone(&applied.commitment),

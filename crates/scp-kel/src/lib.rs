@@ -15,6 +15,7 @@ mod event_codec;
 mod key_event_signer;
 mod preimage;
 mod rank;
+mod relation;
 mod routing;
 mod signature;
 mod validate;
@@ -50,6 +51,10 @@ pub use rank::{
     PersistedBasis, PersistedRetention, PersistedSuffix, Rerank, ResolveError, RestoreError,
     RetainedSuffix, RetentionBasis, RetentionError, RetentionSet, SetResolution, TieClass,
     UnrelatedChains, pair_chains, resolve_set,
+};
+pub use relation::{
+    ChainRelation, EntryRelations, ExtendingAct, RelationError, ServedChainReading,
+    classify_relation,
 };
 pub use routing::{RoutingKind, routing_id};
 pub use signature::{

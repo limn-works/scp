@@ -10,7 +10,9 @@ use super::change::ValidatedChange;
 use super::check::{Accepted, Signing, check_successor};
 use super::defect::Discarded;
 use super::verdicts::Strict;
-use crate::{EventKind, InstalledRootSet, KeyStateSnapshot, prerotation_commitment};
+use crate::{
+    EventKind, InstalledRootSet, KeyStateSnapshot, StandingRootDeclaration, prerotation_commitment,
+};
 
 /// One event of a valid chain and the state standing after it. The three
 /// states are shared with every chain that holds the event, so a fork or a
@@ -27,6 +29,9 @@ pub(super) struct ChainEvent {
     /// unsigned-candidate path no signature was verified, and no reader of a
     /// `ValidatedChange` sees this flag.
     pub(super) reveal_root_cosigned: bool,
+    /// Field 5: what a `RootRecovery` declares about the standing root, and
+    /// `None` for every other kind (§9.7.4.2, field 5).
+    pub(super) standing_root: Option<StandingRootDeclaration>,
     /// The event unit that carried the event, byte for byte: the copy R9
     /// keeps, persists, and counts toward its byte bound.
     pub(super) unit: Arc<[u8]>,
@@ -67,6 +72,10 @@ pub struct EventView<'c> {
     /// validated chain verified against the root standing at its
     /// predecessor (R6).
     pub reveal_root_cosigned: bool,
+    /// Field 5: what a `RootRecovery` declares about the standing root, and
+    /// `None` for every other kind, which R10's extending arm reads to find
+    /// a `RootRecovery{Lost}`.
+    pub standing_root: Option<StandingRootDeclaration>,
     /// The unit that carried the event, byte for byte: the copy R9 keeps,
     /// persists, and counts toward its byte bound.
     pub unit: &'c [u8],
@@ -259,6 +268,7 @@ impl ValidatedChain {
                 sequence: event.sequence,
                 kind: event.kind,
                 reveal_root_cosigned: event.reveal_root_cosigned,
+                standing_root: event.standing_root,
                 unit: &event.unit,
             })
     }
