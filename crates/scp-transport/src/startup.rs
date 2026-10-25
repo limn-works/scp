@@ -26,9 +26,11 @@ use tracing_subscriber::EnvFilter;
 
 use crate::native::server::{RelayConfig, RelayError};
 use crate::native::storage::{BlobStorageBackend, StorageError};
-use crate::relay::push_dispatch::PushServiceError;
-use crate::relay::push_gate::{LiveRelayUrl, PushProviders, PushRole, RelayUrl};
-use crate::relay::push_store::{PushRegistrationStore, PushStoreError};
+
+use crate::relay::push_gate::{
+    LiveRelayUrl, PushProviders, PushRole, PushRoleError, PushSenders, RelayUrl,
+};
+use crate::relay::push_store::{PushRegistrationStore, PushStoreAtRest, PushStoreError};
 use crate::shutdown::ShutdownSignalError;
 
 /// The variable that names the relay's blob storage backend.
@@ -943,13 +945,38 @@ pub enum PushStartupError {
         /// The store's refusal.
         error: PushStoreError,
     },
-    /// The push service could not start on the selected backends: it ran
-    /// outside a tokio runtime, or two senders name one platform. Nothing
-    /// starts without it (SCP-CAPSEL-8001).
+    /// The push service could not start on the selected senders: it ran
+    /// outside a tokio runtime, or no sender was configured. Nothing starts
+    /// without it (SCP-CAPSEL-8001).
     #[error("the push service cannot start: {error} (SCP-CAPSEL-8001)")]
     ServiceStart {
-        /// The service's refusal.
-        error: PushServiceError,
+        /// The refusal of [`PushRole::start`].
+        error: PushRoleError,
+    },
+    /// A full node read `SCP_RELAY_PUSH_STORE` or `SCP_RELAY_PUSH_STORE_PATH`.
+    /// A full node keeps its push store in its instance storage directory
+    /// and reads neither, so a set value is an operator choice it cannot
+    /// honor (SCP-CAPSEL-8001).
+    #[error(
+        "{var} is set, but a full node keeps its push store at <storage directory>/push.sqlite \
+         and reads no push store variable; unset it (SCP-CAPSEL-8001)"
+    )]
+    StoreVariableInFullNode {
+        /// The variable that is set.
+        var: &'static str,
+    },
+    /// A full node's push store, `push.sqlite` in its instance storage
+    /// directory, cannot be opened. Nothing falls back to another store
+    /// (SCP-CAPSEL-8001).
+    #[error(
+        "the full node cannot open its push store at '{}': {error} (SCP-CAPSEL-8001)",
+        path.display()
+    )]
+    NodeStoreOpen {
+        /// `<storage directory>/push.sqlite`.
+        path: PathBuf,
+        /// The store's refusal.
+        error: PushStoreError,
     },
 }
 
@@ -980,7 +1007,9 @@ impl PushStartupError {
             | Self::CredentialFile { .. }
             | Self::Sender { .. }
             | Self::StoreOpen { .. }
-            | Self::ServiceStart { .. } => "SCP-CAPSEL-8001",
+            | Self::ServiceStart { .. }
+            | Self::StoreVariableInFullNode { .. }
+            | Self::NodeStoreOpen { .. } => "SCP-CAPSEL-8001",
         }
     }
 }
@@ -996,8 +1025,7 @@ pub enum PushStoreChoice {
 }
 
 /// Everything a relay that offers push needs from its environment: the store
-/// it keeps registrations in and one sender per platform it serves. At least
-/// one sender is present.
+/// it keeps registrations in and one sender per platform it serves.
 ///
 /// `Debug` prints no credential: each sender's own `Debug` omits its key, its
 /// JWT or access token, and every device token.
@@ -1005,10 +1033,8 @@ pub enum PushStoreChoice {
 pub struct PushBackends {
     /// The registration store.
     pub store: PushStoreChoice,
-    /// The APNs sender, when the platform list names `apns`.
-    pub apns: Option<crate::relay::push::ApnsSender>,
-    /// The FCM sender, when the platform list names `fcm`.
-    pub fcm: Option<crate::relay::push::FcmSender>,
+    /// The senders of the platforms the list names.
+    pub senders: PushSenders,
 }
 
 /// The push selection `SCP_RELAY_PUSH_PLATFORMS` makes.
@@ -1114,11 +1140,10 @@ fn push_selection_from(
         return Ok(PushSelection::Disabled);
     };
     let store = push_store_from(lookup)?;
-    let (apns, fcm) = senders_for(platforms, lookup)?;
+    let senders = senders_for(platforms, lookup)?;
     Ok(PushSelection::Enabled(Box::new(PushBackends {
         store,
-        apns,
-        fcm,
+        senders,
     })))
 }
 
@@ -1132,33 +1157,27 @@ fn push_selection_from(
 pub enum PushSenderSelection {
     /// `none`: the relay offers no push.
     Disabled,
-    /// One or both platforms. At least one sender is present.
+    /// One or both platforms, with their senders.
     Enabled(Box<PushSenders>),
-}
-
-/// The senders of an enabled [`PushSenderSelection`], one field per platform.
-#[derive(Debug)]
-pub struct PushSenders {
-    /// The APNs sender, when the platform list names `apns`.
-    pub apns: Option<crate::relay::push::ApnsSender>,
-    /// The FCM sender, when the platform list names `fcm`.
-    pub fcm: Option<crate::relay::push::FcmSender>,
 }
 
 /// Reads the push platform list and each listed platform's credentials from
 /// the environment, through the same loaders as [`push_selection_from_env`].
 ///
 /// It reads `SCP_RELAY_PUSH_PLATFORMS` and the `SCP_RELAY_APNS_*` and
-/// `SCP_RELAY_FCM_*` variables in that function's table, and never
-/// `SCP_RELAY_PUSH_STORE` or `SCP_RELAY_PUSH_STORE_PATH`: the caller provides
-/// the store. Like that function, it opens no store and makes no network
-/// request.
+/// `SCP_RELAY_FCM_*` variables in that function's table. The caller provides
+/// the store, so it refuses `SCP_RELAY_PUSH_STORE` and
+/// `SCP_RELAY_PUSH_STORE_PATH` when either is set, whatever the platform
+/// list says: an operator who set one expects it to take effect. Like that
+/// function, it opens no store and makes no network request.
 ///
 /// # Errors
 ///
-/// As [`push_selection_from_env`], less the store variants:
-/// [`StartupError::Push`] for the first missing or invalid value, and
-/// [`StartupError::InvalidValue`] for a value that is not UTF-8.
+/// - [`PushStartupError::StoreVariableInFullNode`] when either store
+///   variable is set.
+/// - As [`push_selection_from_env`], less the store variants:
+///   [`StartupError::Push`] for the first missing or invalid value, and
+///   [`StartupError::InvalidValue`] for a value that is not UTF-8.
 pub fn push_senders_from_env() -> Result<PushSenderSelection, StartupError> {
     push_senders_from(&|var| env::var_os(var))
 }
@@ -1167,6 +1186,11 @@ pub fn push_senders_from_env() -> Result<PushSenderSelection, StartupError> {
 fn push_senders_from(
     lookup: &dyn Fn(&'static str) -> Option<OsString>,
 ) -> Result<PushSenderSelection, StartupError> {
+    for var in [PUSH_STORE_VAR, PUSH_STORE_PATH_VAR] {
+        if lookup(var).is_some() {
+            return Err(PushStartupError::StoreVariableInFullNode { var }.into());
+        }
+    }
     let platforms = match lookup(PUSH_PLATFORMS_VAR) {
         None => return Err(PushStartupError::SelectionMissing.into()),
         Some(raw) => parse_push_platforms(&utf8(PUSH_PLATFORMS_VAR, raw)?)?,
@@ -1174,24 +1198,16 @@ fn push_senders_from(
     let Some(platforms) = platforms else {
         return Ok(PushSenderSelection::Disabled);
     };
-    let (apns, fcm) = senders_for(platforms, lookup)?;
-    Ok(PushSenderSelection::Enabled(Box::new(PushSenders {
-        apns,
-        fcm,
-    })))
+    Ok(PushSenderSelection::Enabled(Box::new(senders_for(
+        platforms, lookup,
+    )?)))
 }
 
 /// Builds one sender for each platform in `platforms`.
 fn senders_for(
     platforms: PushPlatforms,
     lookup: &dyn Fn(&'static str) -> Option<OsString>,
-) -> Result<
-    (
-        Option<crate::relay::push::ApnsSender>,
-        Option<crate::relay::push::FcmSender>,
-    ),
-    StartupError,
-> {
+) -> Result<PushSenders, StartupError> {
     let apns = if platforms.apns {
         Some(apns_sender_from(lookup)?)
     } else {
@@ -1202,7 +1218,7 @@ fn senders_for(
     } else {
         None
     };
-    Ok((apns, fcm))
+    Ok(PushSenders { apns, fcm })
 }
 
 /// Reads variable `var` through `lookup` as a required, non-blank value,
@@ -1428,8 +1444,9 @@ fn check_owner_only(
 /// Builds the relay's push role from `selection`.
 ///
 /// [`PushSelection::Disabled`] yields [`PushRole::Disabled`]. An enabled
-/// selection opens the SQLite push registration store at its path and hands
-/// it, with the senders the selection built, to [`PushRole::start`], which
+/// selection opens the SQLite push registration store at its path, unkeyed
+/// and owner-only (mode 0600, [`PushStoreAtRest::Unkeyed`]), and hands it,
+/// with the senders the selection built, to [`PushRole::start`], which
 /// wires the production `KelPushVerifier` (spec §10.7.1 step 3, PUSH-005) and
 /// yields [`PushRole::Enabled`]. No other
 /// store arm is reachable: the in-memory arm compiles only under the
@@ -1437,24 +1454,27 @@ fn check_owner_only(
 ///
 /// # Errors
 ///
-/// - [`PushStartupError::StoreOpen`] when the store cannot be opened or its
+/// - [`PushStartupError::StoreOpen`] when the store cannot be opened, its
+///   file or a sidecar grants access to its group or to others, or its
 ///   schema cannot be applied. Nothing falls back to another store
 ///   (SCP-CAPSEL-8001).
 /// - [`PushStartupError::ServiceStart`] when the push service cannot start,
 ///   which includes a call outside a tokio runtime: the service's lookup and
 ///   drains run on the caller's runtime.
 pub fn push_role_from(selection: PushSelection) -> Result<PushRole, StartupError> {
-    let PushBackends { store, apns, fcm } = match selection {
+    let PushBackends { store, senders } = match selection {
         PushSelection::Disabled => return Ok(PushRole::Disabled),
         PushSelection::Enabled(backends) => *backends,
     };
     let store = match store {
-        PushStoreChoice::Sqlite { path } => match PushRegistrationStore::open_sqlite(&path) {
-            Ok(store) => store,
-            Err(error) => return Err(PushStartupError::StoreOpen { path, error }.into()),
-        },
+        PushStoreChoice::Sqlite { path } => {
+            match PushRegistrationStore::open_sqlite(&path, PushStoreAtRest::Unkeyed) {
+                Ok(store) => store,
+                Err(error) => return Err(PushStartupError::StoreOpen { path, error }.into()),
+            }
+        }
     };
-    PushRole::start(PushProviders { store, apns, fcm })
+    PushRole::start(PushProviders { store, senders })
         .map_err(|error| PushStartupError::ServiceStart { error }.into())
 }
 
@@ -2165,14 +2185,32 @@ mod push_tests {
 
     /// PUSH-012 criterion 9: the sender loader an `scp-node` full node uses
     /// reads the platform list and each platform's credentials through the
-    /// same loaders as `push_selection_from`, and never the store variables,
-    /// because the node provides the store. `none` reads nothing else, an unset
-    /// list is refused under SCP-CAPSEL-8000, and a missing credential variable
-    /// is named.
+    /// same loaders as `push_selection_from`. The node provides the store, so
+    /// a set store variable, even a blank one, is refused before anything
+    /// else is read. `none` reads nothing past the store variables, an unset
+    /// list is refused under SCP-CAPSEL-8000, and a missing credential
+    /// variable is named.
     #[test]
-    fn push_senders_read_the_credentials_and_no_store_variable() {
+    fn push_senders_read_the_credentials_and_refuse_a_store_variable() {
         let dir = tempfile::tempdir().unwrap();
         let mut env = Env::full(dir.path());
+        for (var, value) in [(PUSH_STORE_VAR, "sqlite"), (PUSH_STORE_PATH_VAR, "")] {
+            env.unset(PUSH_STORE_VAR)
+                .unset(PUSH_STORE_PATH_VAR)
+                .set(var, value);
+            match push_senders_from(&|v| env.vars.get(v).cloned()) {
+                Err(StartupError::Push(error)) => {
+                    assert!(
+                        matches!(error, PushStartupError::StoreVariableInFullNode { var: named } if named == var),
+                        "{error:?}"
+                    );
+                    assert_eq!(error.rule(), "SCP-CAPSEL-8001");
+                    assert!(error.to_string().contains(var), "{error}");
+                }
+                other => panic!("{var} set: expected StoreVariableInFullNode, got {other:?}"),
+            }
+        }
+        env.unset(PUSH_STORE_VAR).unset(PUSH_STORE_PATH_VAR);
         let read = std::cell::RefCell::new(Vec::new());
         let selection = push_senders_from(&|var| {
             read.borrow_mut().push(var);
@@ -2186,15 +2224,7 @@ mod push_tests {
         let read = read.into_inner();
         assert!(read.contains(&APNS_KEY_PATH_VAR), "{read:?}");
         assert!(read.contains(&FCM_SERVICE_ACCOUNT_PATH_VAR), "{read:?}");
-        assert!(!read.contains(&PUSH_STORE_VAR), "{read:?}");
-        assert!(!read.contains(&PUSH_STORE_PATH_VAR), "{read:?}");
         assert!(!dir.path().join("push.sqlite").exists());
-
-        env.unset(PUSH_STORE_VAR).unset(PUSH_STORE_PATH_VAR);
-        assert!(matches!(
-            push_senders_from(&|var| env.vars.get(var).cloned()),
-            Ok(PushSenderSelection::Enabled(_))
-        ));
 
         env.unset(APNS_KEY_ID_VAR);
         assert!(matches!(
@@ -2210,7 +2240,10 @@ mod push_tests {
         })
         .unwrap();
         assert!(matches!(selection, PushSenderSelection::Disabled));
-        assert_eq!(*read.borrow(), vec![PUSH_PLATFORMS_VAR]);
+        assert_eq!(
+            *read.borrow(),
+            vec![PUSH_STORE_VAR, PUSH_STORE_PATH_VAR, PUSH_PLATFORMS_VAR]
+        );
 
         env.unset(PUSH_PLATFORMS_VAR);
         match push_senders_from(&|var| env.vars.get(var).cloned()) {
@@ -2419,8 +2452,8 @@ mod push_tests {
         let Ok(PushSelection::Enabled(backends)) = env.parse() else {
             panic!("expected fcm to load: {:?}", env.parse());
         };
-        assert!(backends.apns.is_none());
-        assert!(backends.fcm.is_some());
+        assert!(backends.senders.apns.is_none());
+        assert!(backends.senders.fcm.is_some());
 
         env.set(FCM_SERVICE_ACCOUNT_PATH_VAR, "service-account.json");
         assert!(matches!(
@@ -2560,8 +2593,8 @@ mod push_tests {
                 path: dir.path().join("push.sqlite")
             }
         );
-        assert!(backends.apns.is_some());
-        assert!(backends.fcm.is_some());
+        assert!(backends.senders.apns.is_some());
+        assert!(backends.senders.fcm.is_some());
         // The parse opens no store.
         assert!(!dir.path().join("push.sqlite").exists());
     }
@@ -2586,7 +2619,7 @@ mod push_tests {
         use crate::native::storage::BlobStorageBackend;
         use crate::relay::push_gate::{LiveRelayUrl, RelayUrl};
         use crate::relay::push_store::{
-            PushRegistrationKey, PushRegistrationRecord, PushRegistrationStore,
+            PushRegistrationKey, PushRegistrationRecord, PushRegistrationStore, PushStoreAtRest,
         };
 
         let dir = tempfile::tempdir().unwrap();
@@ -2672,7 +2705,7 @@ mod push_tests {
         drop(sink);
         drop(stream);
 
-        let reopened = PushRegistrationStore::open_sqlite(&path).unwrap();
+        let reopened = PushRegistrationStore::open_sqlite(&path, PushStoreAtRest::Unkeyed).unwrap();
         assert_eq!(reopened.get(&key).await.unwrap(), Some(record));
     }
 
@@ -2750,7 +2783,7 @@ mod push_tests {
             matches!(
                 error,
                 PushStartupError::ServiceStart {
-                    error: crate::relay::push_dispatch::PushServiceError::NoRuntime
+                    error: crate::relay::push_gate::PushRoleError::NoRuntime
                 }
             ),
             "{error:?}"

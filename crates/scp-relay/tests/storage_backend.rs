@@ -620,8 +620,11 @@ fn sqlite_push_store_starts_the_relay_with_push_enabled() {
         "the relay did not create its push store at {}; output: {output}",
         push_path.display()
     );
-    scp_transport::relay::push_store::PushRegistrationStore::open_sqlite(&push_path)
-        .expect("the file the relay created opens as a push store");
+    scp_transport::relay::push_store::PushRegistrationStore::open_sqlite(
+        &push_path,
+        scp_transport::relay::push_store::PushStoreAtRest::Unkeyed,
+    )
+    .expect("the file the relay created opens as a push store");
 }
 
 /// A push store path whose parent is a regular file makes the relay exit 1

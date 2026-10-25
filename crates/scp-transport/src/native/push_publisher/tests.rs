@@ -133,7 +133,10 @@ mod relays {
         verifier: Arc<dyn PushSignatureVerifier>,
     ) -> Result<Relay, Box<dyn Error>> {
         let dir = tempfile::tempdir()?;
-        let store = PushRegistrationStore::open_sqlite(&dir.path().join("push.db"))?;
+        let store = PushRegistrationStore::open_sqlite(
+            &dir.path().join("push.db"),
+            crate::relay::push_store::PushStoreAtRest::Unkeyed,
+        )?;
         let push = PushRole::Enabled(PushService::start(PushServiceConfig {
             store: store.clone(),
             verifier,

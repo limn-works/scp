@@ -5,8 +5,9 @@
 //! every build that has the mode. A persistent full node and a `--relay-only`
 //! node also reject an unset or empty backend, which has no default, and a
 //! `sqlite` backend whose path is unset or relative. Both modes require
-//! `SCP_RELAY_PUSH_PLATFORMS` (PUSH-012); a full node keeps its push store in
-//! its storage directory.
+//! `SCP_RELAY_PUSH_PLATFORMS` (PUSH-012); a full node keeps its push store,
+//! keyed and owner-only, in its storage directory, and refuses the relay-only
+//! push store variables.
 
 #![allow(clippy::expect_used, clippy::panic)]
 
@@ -347,10 +348,49 @@ fn full_node_requires_a_push_selection() {
     }
 }
 
+/// PUSH-012: a persistent full node refuses `SCP_RELAY_PUSH_STORE` and
+/// `SCP_RELAY_PUSH_STORE_PATH`, which only `--relay-only` reads, instead of
+/// ignoring them: either one makes it exit 1 naming the variable and
+/// SCP-CAPSEL-8001, before it opens its blob store.
+#[test]
+fn full_node_refuses_a_push_store_variable() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db_path = tmp.path().join("must-not-exist.db");
+    for (var, value) in [
+        ("SCP_RELAY_PUSH_STORE", "sqlite"),
+        (
+            "SCP_RELAY_PUSH_STORE_PATH",
+            "/var/lib/scp-relay/push.sqlite",
+        ),
+    ] {
+        let mut command = node_command();
+        command
+            .current_dir(tmp.path())
+            .env("SCP_NODE_DOMAIN", "example.com")
+            .env("SCP_NODE_BIND_ADDR", "127.0.0.1:0")
+            .env("SCP_STORAGE_PATH", tmp.path().join("node-storage"))
+            .env("SCP_RELAY_STORAGE_BACKEND", "sqlite")
+            .env("SCP_RELAY_STORAGE_PATH", &db_path)
+            .env_remove("SCP_RELAY_PUSH_STORE")
+            .env_remove("SCP_RELAY_PUSH_STORE_PATH")
+            .env(var, value)
+            .env_remove("SCP_NODE_DHT_MODE")
+            .env_remove("SCP_STORAGE_KEY")
+            .env_remove("RUST_LOG");
+        let output = output_within_deadline(&mut command);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{var}: {stderr}");
+        assert!(stderr.contains(var), "{var}: {stderr}");
+        assert!(stderr.contains("SCP-CAPSEL-8001"), "{var}: {stderr}");
+        assert!(!db_path.exists(), "{var} opened {}", db_path.display());
+    }
+}
+
 /// PUSH-012: a persistent full node with `SCP_RELAY_PUSH_PLATFORMS=apns` and
 /// valid APNs credentials keeps its push registration store at `push.sqlite`
-/// in its storage directory, and ignores `SCP_RELAY_PUSH_STORE` and
-/// `SCP_RELAY_PUSH_STORE_PATH`, which only `--relay-only` reads.
+/// in its storage directory, with mode 0600 and keyed with the instance's
+/// storage key, so the file does not start with the plaintext `SQLite`
+/// header.
 #[test]
 fn full_node_keeps_its_push_store_in_its_storage_directory() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -361,7 +401,6 @@ fn full_node_keeps_its_push_store_in_its_storage_directory() {
     std::fs::write(&p8, key.serialize_pem()).expect("write the .p8 key");
     std::fs::set_permissions(&p8, std::fs::Permissions::from_mode(0o600)).expect("chmod 600");
     let node_storage = tmp.path().join("node-storage");
-    let relay_store = tmp.path().join("relay-push.sqlite");
     let mut child = node_command()
         .current_dir(tmp.path())
         .env("SCP_NODE_DOMAIN", "example.com")
@@ -370,8 +409,8 @@ fn full_node_keeps_its_push_store_in_its_storage_directory() {
         .env("SCP_RELAY_STORAGE_BACKEND", "sqlite")
         .env("SCP_RELAY_STORAGE_PATH", tmp.path().join("blobs.db"))
         .env("SCP_RELAY_PUSH_PLATFORMS", "apns")
-        .env("SCP_RELAY_PUSH_STORE", "sqlite")
-        .env("SCP_RELAY_PUSH_STORE_PATH", &relay_store)
+        .env_remove("SCP_RELAY_PUSH_STORE")
+        .env_remove("SCP_RELAY_PUSH_STORE_PATH")
         .env("SCP_RELAY_APNS_KEY_PATH", &p8)
         .env("SCP_RELAY_APNS_KEY_ID", "ABC123DEFG")
         .env("SCP_RELAY_APNS_TEAM_ID", "DEF123GHIJ")
@@ -402,9 +441,15 @@ fn full_node_keeps_its_push_store_in_its_storage_directory() {
         "the full node did not open {}: {stderr}",
         push_store.display()
     );
+    let mode = std::fs::metadata(&push_store)
+        .expect("stat the push store")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "the push store has mode {mode:o}");
+    let header = std::fs::read(&push_store).expect("read the push store");
     assert!(
-        !relay_store.exists(),
-        "the full node opened SCP_RELAY_PUSH_STORE_PATH {}: {stderr}",
-        relay_store.display()
+        !header.starts_with(b"SQLite format 3\0"),
+        "the full node's push store is a plaintext SQLite file: {stderr}"
     );
 }

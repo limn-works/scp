@@ -1856,12 +1856,12 @@ mod tests {
     ) -> PushSlot {
         let store = scp_transport::relay::push_store::PushRegistrationStore::open_sqlite(
             &dir.join("push.sqlite"),
+            scp_transport::relay::push_store::PushStoreAtRest::Unkeyed,
         )
         .unwrap();
         PushSlot::Enabled(Box::new(PushProviders {
             store,
-            apns,
-            fcm: None,
+            senders: scp_transport::relay::push_gate::PushSenders { apns, fcm: None },
         }))
     }
 
@@ -1989,6 +1989,43 @@ mod tests {
             "the domain relay did not receive its push role"
         );
         node.shutdown();
+    }
+
+    /// `ApplicationNode::shutdown` stops the push service's lookup and drain,
+    /// although the node, and so its relay configuration and every listener's
+    /// clone of the push role, is still alive.
+    #[tokio::test]
+    async fn node_shutdown_stops_the_push_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::start_for_testing(NodeConfig {
+            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            push: enabled_push(dir.path(), Some(apns_sender())),
+            ..NodeConfig::defaults(
+                Reach::Local,
+                generate_identity(),
+                InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
+            )
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(
+            node.state.relay_config.push.tasks_running(),
+            2,
+            "one lookup and one drain run before shutdown"
+        );
+        node.shutdown();
+        for _ in 0..1000 {
+            if node.state.relay_config.push.tasks_running() == 0 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!(
+            "{} push tasks outlived the node shutdown",
+            node.state.relay_config.push.tasks_running()
+        );
     }
 
     /// An enabled push slot with no sender fails the start with

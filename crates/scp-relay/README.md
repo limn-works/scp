@@ -19,7 +19,7 @@ A missing or invalid variable exits 1 with an error naming it. Credentials load 
 
 With a platform listed, the relay opens its SQLite push store at `SCP_RELAY_PUSH_STORE_PATH` before it opens its blob store, and exits 1 when the store cannot open. It verifies each registration's signature through the key-event-log verifier, which refuses every registration with `5003` until that verifier's key-state resolution is built. The relay operations guide (`docs/guides/relay-operations.md`, section 3) has the full table.
 
-A persistent `scp-node` full node reads the same platform and credential variables and keeps its push store at `push.sqlite` in its storage directory; it does not read `SCP_RELAY_PUSH_STORE` or `SCP_RELAY_PUSH_STORE_PATH`.
+A persistent `scp-node` full node reads the same platform and credential variables and keeps its push store at `push.sqlite` in its storage directory, keyed with the instance's storage key; it exits 1 when `SCP_RELAY_PUSH_STORE` or `SCP_RELAY_PUSH_STORE_PATH` is set.
 
 ## License
 

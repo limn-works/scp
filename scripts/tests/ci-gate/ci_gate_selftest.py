@@ -6977,8 +6977,12 @@ LEG_COMMANDS: tuple[tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]], ..
             "bash scripts/check-examples-compile.sh",
             "bash scripts/tests/examples-compile/run-tests.sh",
             (
-                f"cargo clippy -p scp-transport --features {TRANSPORT_FEATURES} --all-targets "
-                "-- -D warnings"
+                f"cargo clippy -p scp-transport --features {TRANSPORT_FEATURES},push-store "
+                "--all-targets -- -D warnings"
+            ),
+            (
+                "cargo clippy -p scp-transport --features quic,http3,udp,push-store,testing "
+                "--all-targets -- -D warnings"
             ),
             (
                 "cargo clippy -p scp-node --features quic,http3,udp,coap,upnp,testing --all-targets "
