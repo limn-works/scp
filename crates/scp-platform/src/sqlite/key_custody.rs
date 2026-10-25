@@ -31,25 +31,10 @@ const KEY_PREFIX: &str = "custody/keys/";
 /// Storage key for the next handle counter.
 const COUNTER_KEY: &str = "custody/next_id";
 
-/// Key type discriminant for Ed25519 keys.
-const KEY_TYPE_ED25519: u8 = 0;
-
-/// Key type discriminant for P-256 signing keys ([`KeyType::P256Signing`]).
-const KEY_TYPE_P256_SIGNING: u8 = 2;
-
-/// Key type discriminant for P-256 HPKE keys ([`KeyType::HpkeP256`]).
-const KEY_TYPE_P256_HPKE: u8 = 3;
-
-/// Length of a persisted key row: `[key_type, role, private_key(32)]`.
+/// Length of a persisted key row: `[key_type, role, private_key(32)]`. The
+/// type byte is [`KeyType::storage_code`], the table the custody record
+/// store shares (spec §17.3).
 const ROW_LEN: usize = 34;
-
-const fn type_byte(key_type: KeyType) -> u8 {
-    match key_type {
-        KeyType::Ed25519 => KEY_TYPE_ED25519,
-        KeyType::P256Signing => KEY_TYPE_P256_SIGNING,
-        KeyType::HpkeP256 => KEY_TYPE_P256_HPKE,
-    }
-}
 
 /// The error for using a key of type `actual` where `expected` is required.
 const fn wrong_type(actual: KeyType, expected: KeyType) -> PlatformError {
@@ -194,43 +179,29 @@ impl SqliteKeyCustody {
                 )));
             }
 
-            let key_type_byte = data[0];
             let role = KeyRole::from_byte(data[1]).ok_or_else(|| {
                 PlatformError::StorageError(format!("key {id} has unknown role {}", data[1]))
+            })?;
+            // An unknown type byte fails the load; it never maps to a default
+            // type. key_bytes is Zeroizing, so it is wiped on that exit too.
+            let key_type = KeyType::from_storage_code(data[0]).ok_or_else(|| {
+                PlatformError::StorageError(format!("key {id} has unknown type {}", data[0]))
             })?;
             let mut key_bytes = Zeroizing::new([0u8; 32]);
             key_bytes.copy_from_slice(&data[2..ROW_LEN]);
 
-            match key_type_byte {
-                KEY_TYPE_ED25519 => {
+            match key_type {
+                KeyType::Ed25519 => {
                     let signing_key = SigningKey::from_bytes(&key_bytes);
                     ed25519_keys.insert(id, signing_key);
-                    records.insert(
-                        id,
-                        KeyRecord {
-                            key_type: KeyType::Ed25519,
-                            role,
-                        },
-                    );
                 }
-                KEY_TYPE_P256_SIGNING | KEY_TYPE_P256_HPKE => {
+                KeyType::P256Signing | KeyType::HpkeP256 => {
                     let key = crate::traits::p256_key_from_stored(&key_bytes)
                         .map_err(|e| PlatformError::StorageError(format!("key {id}: {e}")))?;
                     p256_keys.insert(id, key);
-                    let key_type = if key_type_byte == KEY_TYPE_P256_SIGNING {
-                        KeyType::P256Signing
-                    } else {
-                        KeyType::HpkeP256
-                    };
-                    records.insert(id, KeyRecord { key_type, role });
-                }
-                other => {
-                    // key_bytes is Zeroizing — automatically zeroed on drop
-                    return Err(PlatformError::StorageError(format!(
-                        "key {id} has unknown type {other}"
-                    )));
                 }
             }
+            records.insert(id, KeyRecord { key_type, role });
             // key_bytes automatically zeroed on drop via Zeroizing
         }
 
@@ -299,7 +270,7 @@ impl SqliteKeyCustody {
         let handle = self.next_handle().await?;
 
         // Persist to storage before adding to cache.
-        self.persist_key(handle.id(), &key_bytes, type_byte(key_type), role)
+        self.persist_key(handle.id(), &key_bytes, key_type.storage_code(), role)
             .await?;
 
         let mut store = self.store.lock().await;
@@ -541,8 +512,13 @@ impl KeyCustody for SqliteKeyCustody {
             let handle = self.next_handle().await?;
             let key_bytes = Zeroizing::new(**seed);
             // The imported key is the migrated identity's new `#0`.
-            self.persist_key(handle.id(), &key_bytes, KEY_TYPE_ED25519, KeyRole::Identity)
-                .await?;
+            self.persist_key(
+                handle.id(),
+                &key_bytes,
+                KeyType::Ed25519.storage_code(),
+                KeyRole::Identity,
+            )
+            .await?;
 
             let mut store = self.store.lock().await;
             let signing_key = SigningKey::from_bytes(&key_bytes);
@@ -565,6 +541,10 @@ impl KeyCustody for SqliteKeyCustody {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    const KEY_TYPE_ED25519: u8 = KeyType::Ed25519.storage_code();
+    const KEY_TYPE_P256_SIGNING: u8 = KeyType::P256Signing.storage_code();
+    const KEY_TYPE_P256_HPKE: u8 = KeyType::HpkeP256.storage_code();
 
     /// Creates a temporary `SqliteKeyCustody` for testing.
     async fn temp_custody(dir: &Path) -> SqliteKeyCustody {

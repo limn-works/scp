@@ -34,6 +34,9 @@ use std::path::{Path, PathBuf};
 /// `InMemoryRelayQuerier` answers DID queries from a local map in place of a
 /// relay. `InMemoryPush` registers with a UUID that no push service issued, so
 /// it delivers no wake (ADR-062 §0, amended 2026-10-12).
+/// `InMemoryNextSetCustody` holds next-set keys in process memory beside the
+/// operational keys, so the §9.7.4.1 substrate isolation does not hold
+/// (SCP-345).
 const GATED_DOUBLES: &[&str] = &[
     "InMemoryFfiTrustStore",
     "InMemoryViolationStore",
@@ -46,6 +49,7 @@ const GATED_DOUBLES: &[&str] = &[
     "InMemorySequenceStore",
     "InMemoryRelayQuerier",
     "InMemoryPush",
+    "InMemoryNextSetCustody",
 ];
 
 /// True when a cfg predicate holds only if `test` or `feature = "testing"` holds.

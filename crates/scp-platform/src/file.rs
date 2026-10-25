@@ -1983,6 +1983,21 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// File's §17.8 key-type table maps the key types one-to-one and refuses
+    /// every byte it does not assign, including the retired `0x02`.
+    #[test]
+    fn stored_key_type_bytes_are_a_bijection() {
+        crate::traits::assert_key_type_bijection(
+            "file",
+            |t| StoredKeyType::from_key_type(t).to_byte(),
+            |b| {
+                StoredKeyType::from_byte(b)
+                    .ok()
+                    .map(StoredKeyType::to_key_type)
+            },
+        );
+    }
+
     /// Helper: create a `FileKeyCustody` in a temporary directory.
     fn make_custody(dir: &TempDir, passphrase: &str) -> FileKeyCustody {
         let path = dir.path().join("keys.scp");

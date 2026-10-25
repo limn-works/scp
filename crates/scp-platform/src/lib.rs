@@ -39,6 +39,9 @@
 pub mod android;
 #[cfg(feature = "apple")]
 pub mod apple;
+// The Rust-side custody record that fixes a callback key's type and role
+// (spec §17.3 `custody/record/{namespace}/{key_id}`; SCP-345).
+pub mod custody_record;
 pub mod encrypted;
 #[cfg(feature = "encrypting")]
 pub mod encrypting_adapter;
@@ -86,8 +89,17 @@ pub mod syncable;
 pub mod traits;
 
 // Re-export all public types for ergonomic access.
+pub use custody_record::{
+    CustodyNamespace, CustodyRecord, CustodyRecordStore, StorageCustodyRecordStore,
+};
 pub use encrypted::EncryptedStorage;
+// The key-event signer contract (09-security-model.md §9.7.4.2 R10), so a
+// custody implementor and its callers need no direct scp-kel dependency.
 pub use error::{PlatformError, PushFailureKind};
+pub use scp_kel::{
+    CustodyProbe, IndexedSignature, KeyEventSignError, KeyEventSigner, MaybeSend, ProbeSignature,
+    SigningChange,
+};
 pub use signer::CustodySigner;
 pub use store_value::{
     CURRENT_STORE_VERSION, StoreValueError, StoredValue, from_stored_value_bytes,
@@ -95,7 +107,7 @@ pub use store_value::{
 };
 pub use traits::{
     CustodyType, DeviceAttestation, DeviceAttestationToken, KeyCustody, KeyHandle, KeyRole,
-    KeyType, PreRotationCustody, PreRotationCustodyError, PreRotationCustodyKind,
-    PreRotationKeyHandle, Pseudonym, PublicKey, Push, PushToken, SharedSecret, Signature, Storage,
-    WakeSignal, require_derive_source,
+    KeyType, NextSetCustody, NextSetCustodyError, NextSetKeyHandle, PreRotationCustody,
+    PreRotationCustodyError, PreRotationCustodyKind, PreRotationKeyHandle, Pseudonym, PublicKey,
+    Push, PushToken, SharedSecret, Signature, Storage, WakeSignal, require_derive_source,
 };

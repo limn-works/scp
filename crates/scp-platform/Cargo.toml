@@ -108,6 +108,12 @@ sync = []
 # `software_platform`) exposes; the software backends also derive pseudonyms
 # through it (ADR-057 Option A). `scp-crypto` is a pure, wasm-safe leaf.
 scp-crypto = { path = "../scp-crypto", version = "=0.1.0-beta.2" }
+# The key-event signer contract (`KeyEventSigner`, `CustodyProbe`,
+# `SigningChange`, `IndexedSignature`) that `NextSetCustody` takes as a
+# supertrait and that this crate re-exports, so a custody implementor needs no
+# direct scp-kel dependency (09-security-model.md §9.7.4.2 R10; SCP-345).
+# scp-kel is a wasm-safe leaf that depends on no platform crate.
+scp-kel = { path = "../scp-kel", version = "=0.1.0-beta.2" }
 serde = { workspace = true }
 tokio.workspace = true
 thiserror.workspace = true
@@ -158,6 +164,8 @@ libsqlite3-sys = { version = "0.30.1", optional = true }
 # stays in scp-crypto; `deny.toml` bans a direct `p256` dependency here.
 scp-crypto = { path = "../scp-crypto", version = "=0.1.0-beta.2", features = ["testing"] }
 scp-testing = { path = "../scp-testing" }
+# Decodes spec 25 Vector 41's preimage in the next-set custody tests.
+hex = { workspace = true }
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 

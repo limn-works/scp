@@ -11,6 +11,8 @@
 //!   memory (nullifies key confidentiality vs. hardware custody).
 //! - [`InMemoryDeviceAttestation`] — always attests (nullifies attestation).
 //! - [`InMemoryPreRotationCustody`] — in-memory pre-rotation commitment store.
+//! - [`InMemoryNextSetCustody`] — next-set keys in unprotected heap memory,
+//!   beside operational keys (nullifies the §9.7.4.1 substrate isolation).
 //!
 //! It also provides [`InMemoryPush`], a test double for the
 //! [`Push`](crate::traits::Push) trait: its token is a UUID that no push
@@ -41,11 +43,18 @@
 
 mod attestation;
 mod key_custody;
+// `lib.rs` already gates this module behind `testing`; the module and its
+// re-export repeat the gate because `test_double_gating` parses each file
+// alone.
+#[cfg(feature = "testing")]
+mod next_set_custody;
 mod pre_rotation_custody;
 mod push;
 
 pub use attestation::InMemoryDeviceAttestation;
 pub use key_custody::InMemoryKeyCustody;
+#[cfg(feature = "testing")]
+pub use next_set_custody::InMemoryNextSetCustody;
 pub use pre_rotation_custody::InMemoryPreRotationCustody;
 // `lib.rs` already gates this module behind `testing`. The re-export repeats
 // the gate because scp-testing's `test_double_gating` test parses each file

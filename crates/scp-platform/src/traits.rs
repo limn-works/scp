@@ -66,6 +66,30 @@ impl KeyType {
             _ => None,
         }
     }
+
+    /// The type's one-byte code in a `SqliteKeyCustody` key row and in a
+    /// custody record (spec §17.3 `custody/record/{namespace}/{key_id}`):
+    /// `0` Ed25519, `2` P-256 signing, `3` HPKE P-256. Code 1 named the
+    /// retired X25519 type and is never reused. `FileKeyCustody` keeps its own
+    /// §17.8 bytes.
+    pub(crate) const fn storage_code(self) -> u8 {
+        match self {
+            Self::Ed25519 => 0,
+            Self::P256Signing => 2,
+            Self::HpkeP256 => 3,
+        }
+    }
+
+    /// The type whose [`storage_code`](Self::storage_code) is `code`; any
+    /// other byte is `None`, never a default type.
+    pub(crate) const fn from_storage_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Ed25519),
+            2 => Some(Self::P256Signing),
+            3 => Some(Self::HpkeP256),
+            _ => None,
+        }
+    }
 }
 
 /// What a custody key is for, fixed when custody first holds the key
@@ -1046,6 +1070,208 @@ pub trait PreRotationCustody: Send + Sync {
     fn custody_kind(&self) -> PreRotationCustodyKind;
 }
 
+/// Names one next-set key a [`NextSetCustody`] holds (`09-security-model.md`
+/// §9.7.4.1, §9.7.4.2 R10).
+///
+/// A distinct type from [`KeyHandle`] and [`PreRotationKeyHandle`], so no
+/// operational or pre-rotation handle reaches a next-set custody. A handle is
+/// meaningful only to the custody that generated it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NextSetKeyHandle(u64);
+
+impl NextSetKeyHandle {
+    /// A handle over the raw identifier `id`, for a [`NextSetCustody`]
+    /// implementation allocating ids in its own store.
+    #[must_use]
+    pub const fn new(id: u64) -> Self {
+        Self(id)
+    }
+
+    /// The raw identifier.
+    #[must_use]
+    pub const fn id(&self) -> u64 {
+        self.0
+    }
+}
+
+/// Why a [`NextSetCustody`] lifecycle operation failed.
+///
+/// Signing failures are [`KeyEventSignError`](scp_kel::KeyEventSignError),
+/// which the [`KeyEventSigner`](scp_kel::KeyEventSigner) supertrait returns.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum NextSetCustodyError {
+    /// The custody holds no key under the handle: never generated here, or
+    /// destroyed.
+    #[error("next-set key handle not found")]
+    HandleNotFound,
+    /// The custody substrate is unavailable. The message names the failure and
+    /// carries no key material or handle bytes.
+    #[error("next-set custody unavailable: {0}")]
+    Unavailable(String),
+    /// The custody's persistence failed. The message carries no key material.
+    #[error("next-set custody storage failed: {0}")]
+    Storage(String),
+}
+
+/// Custody of next-set keys: the keys a key event commits to and a later
+/// event reveals (`09-security-model.md` §9.7.4.1, §9.7.4.2 R10).
+///
+/// A next-set member signs a key event through the
+/// [`KeyEventSigner`](scp_kel::KeyEventSigner) supertrait and nothing else. No
+/// method returns key material: [`reveal_public_key`](Self::reveal_public_key)
+/// returns the 33-byte compressed SEC1 point. Spec 16 §16.12.3a lists the
+/// behaviours every implementor passes.
+///
+/// [`KeyEventSigner`](scp_kel::KeyEventSigner)'s methods have no default
+/// body, so an implementor that omits one does not compile:
+///
+/// ```compile_fail,E0046
+/// use core::future::Future;
+/// use scp_platform::{
+///     CustodyProbe, KeyEventSignError, KeyEventSigner, MaybeSend, NextSetCustody,
+///     NextSetCustodyError, NextSetKeyHandle, PreRotationCustodyKind, ProbeSignature,
+/// };
+///
+/// struct Partial;
+///
+/// impl KeyEventSigner for Partial {
+///     type Member = NextSetKeyHandle;
+///
+///     fn sign_probe(
+///         &self,
+///         _member: &NextSetKeyHandle,
+///         _probe: &CustodyProbe,
+///     ) -> impl Future<Output = Result<ProbeSignature, KeyEventSignError>> + MaybeSend {
+///         async { Err(KeyEventSignError::MemberNotFound) }
+///     }
+/// }
+///
+/// impl NextSetCustody for Partial {
+///     fn generate(
+///         &self,
+///     ) -> impl Future<Output = Result<NextSetKeyHandle, NextSetCustodyError>> + Send {
+///         async { Err(NextSetCustodyError::HandleNotFound) }
+///     }
+///
+///     fn reveal_public_key(
+///         &self,
+///         _handle: &NextSetKeyHandle,
+///     ) -> impl Future<Output = Result<[u8; 33], NextSetCustodyError>> + Send {
+///         async { Err(NextSetCustodyError::HandleNotFound) }
+///     }
+///
+///     fn destroy(
+///         &self,
+///         _handle: &NextSetKeyHandle,
+///     ) -> impl Future<Output = Result<(), NextSetCustodyError>> + Send {
+///         async { Err(NextSetCustodyError::HandleNotFound) }
+///     }
+///
+///     fn custody_kind(&self) -> PreRotationCustodyKind {
+///         PreRotationCustodyKind::Callback
+///     }
+/// }
+/// ```
+///
+/// The positive control, identical but for `sign_change`:
+///
+/// ```
+/// use core::future::Future;
+/// use scp_platform::{
+///     CustodyProbe, IndexedSignature, KeyEventSignError, KeyEventSigner, MaybeSend,
+///     NextSetCustody, NextSetCustodyError, NextSetKeyHandle, PreRotationCustodyKind,
+///     ProbeSignature, SigningChange,
+/// };
+///
+/// struct Partial;
+///
+/// impl KeyEventSigner for Partial {
+///     type Member = NextSetKeyHandle;
+///
+///     fn sign_change(
+///         &self,
+///         _member: &NextSetKeyHandle,
+///         _change: &SigningChange,
+///     ) -> impl Future<Output = Result<IndexedSignature, KeyEventSignError>> + MaybeSend {
+///         async { Err(KeyEventSignError::MemberNotFound) }
+///     }
+///
+///     fn sign_probe(
+///         &self,
+///         _member: &NextSetKeyHandle,
+///         _probe: &CustodyProbe,
+///     ) -> impl Future<Output = Result<ProbeSignature, KeyEventSignError>> + MaybeSend {
+///         async { Err(KeyEventSignError::MemberNotFound) }
+///     }
+/// }
+///
+/// impl NextSetCustody for Partial {
+///     fn generate(
+///         &self,
+///     ) -> impl Future<Output = Result<NextSetKeyHandle, NextSetCustodyError>> + Send {
+///         async { Err(NextSetCustodyError::HandleNotFound) }
+///     }
+///
+///     fn reveal_public_key(
+///         &self,
+///         _handle: &NextSetKeyHandle,
+///     ) -> impl Future<Output = Result<[u8; 33], NextSetCustodyError>> + Send {
+///         async { Err(NextSetCustodyError::HandleNotFound) }
+///     }
+///
+///     fn destroy(
+///         &self,
+///         _handle: &NextSetKeyHandle,
+///     ) -> impl Future<Output = Result<(), NextSetCustodyError>> + Send {
+///         async { Err(NextSetCustodyError::HandleNotFound) }
+///     }
+///
+///     fn custody_kind(&self) -> PreRotationCustodyKind {
+///         PreRotationCustodyKind::Callback
+///     }
+/// }
+/// ```
+pub trait NextSetCustody: Send + Sync + scp_kel::KeyEventSigner<Member = NextSetKeyHandle> {
+    /// Generates a next-set key and returns its handle.
+    ///
+    /// # Errors
+    ///
+    /// [`NextSetCustodyError::Unavailable`] or
+    /// [`NextSetCustodyError::Storage`] when the substrate cannot generate or
+    /// keep the key.
+    fn generate(
+        &self,
+    ) -> impl std::future::Future<Output = Result<NextSetKeyHandle, NextSetCustodyError>> + Send;
+
+    /// The key's public key, a 33-byte compressed SEC1 P-256 point.
+    ///
+    /// # Errors
+    ///
+    /// [`NextSetCustodyError::HandleNotFound`] when the custody holds no key
+    /// under `handle`.
+    fn reveal_public_key(
+        &self,
+        handle: &NextSetKeyHandle,
+    ) -> impl std::future::Future<Output = Result<[u8; 33], NextSetCustodyError>> + Send;
+
+    /// Destroys the key, so every later call with `handle` fails.
+    ///
+    /// # Errors
+    ///
+    /// [`NextSetCustodyError::HandleNotFound`] when the custody holds no key
+    /// under `handle`.
+    fn destroy(
+        &self,
+        handle: &NextSetKeyHandle,
+    ) -> impl std::future::Future<Output = Result<(), NextSetCustodyError>> + Send;
+
+    /// The substrate this custody keeps its keys in (ADR-054). A fixed value
+    /// per implementation, for diagnostics; the custody object itself is the
+    /// security boundary.
+    fn custody_kind(&self) -> PreRotationCustodyKind;
+}
+
 /// Device attestation trait.
 ///
 /// Abstracts platform-specific device attestation (Apple App Attest, Android
@@ -1292,6 +1518,26 @@ pub(crate) fn sign_p256_digest(
         .map_err(|e| PlatformError::CustodyError(format!("P-256 signing: {e}")))
 }
 
+/// Signs a key-event digest (a [`SigningChange`](scp_kel::SigningChange)'s
+/// `D` or a [`CustodyProbe`](scp_kel::CustodyProbe)'s raw digest) with a
+/// software P-256 key, giving the 64-byte raw-form signature: RFC 6979
+/// deterministic ECDSA, low-`s` (`09-security-model.md` §9.7.4.2, "Signature
+/// form"). The caller wraps it as
+/// [`IndexedSignature::Raw`](scp_kel::IndexedSignature::Raw) or
+/// [`ProbeSignature::raw`](scp_kel::ProbeSignature::raw).
+///
+/// # Errors
+///
+/// [`PlatformError::CustodyError`] when the signature cannot be computed.
+#[cfg(feature = "testing")]
+pub(crate) fn sign_key_event_digest(
+    key: &scp_crypto::p256::P256SecretKey,
+    digest: &[u8; 32],
+) -> Result<[u8; 64], PlatformError> {
+    scp_crypto::p256::sign_prehash_rfc6979(key, digest)
+        .map_err(|e| PlatformError::CustodyError(format!("P-256 key-event signing: {e}")))
+}
+
 /// Parses the peer public key of a [`KeyType::HpkeP256`] key agreement.
 ///
 /// The peer must be exactly the 65-byte uncompressed SEC1 point
@@ -1350,7 +1596,7 @@ pub(crate) fn p256_key_from_stored(
 }
 
 /// Generates a fresh P-256 scalar from the OS RNG by rejection sampling, for
-/// the persistent software backends.
+/// the persistent software backends and `InMemoryNextSetCustody`.
 ///
 /// # Errors
 ///
@@ -1358,7 +1604,7 @@ pub(crate) fn p256_key_from_stored(
 /// scalars (probability below 2^-256; a broken RNG, never bad luck).
 #[cfg(all(
     feature = "software_platform",
-    any(feature = "file", feature = "sqlite")
+    any(feature = "file", feature = "sqlite", feature = "testing")
 ))]
 pub(crate) fn generate_p256_os_rng() -> Result<scp_crypto::p256::P256SecretKey, PlatformError> {
     use rand::RngCore as _;
@@ -1400,9 +1646,49 @@ pub const fn require_derive_source(role: KeyRole, key_type: KeyType) -> Result<(
     Ok(())
 }
 
+/// Every key type, listed through an exhaustive match so a new variant
+/// fails to compile here until every key-type byte table covers it.
+#[cfg(test)]
+fn all_key_types() -> [KeyType; 3] {
+    let all = [KeyType::Ed25519, KeyType::P256Signing, KeyType::HpkeP256];
+    for t in all {
+        match t {
+            KeyType::Ed25519 | KeyType::P256Signing | KeyType::HpkeP256 => {}
+        }
+    }
+    all
+}
+
+/// Test-only: asserts that `encode` gives each key type a distinct byte that
+/// `decode` maps back, and that `decode` refuses every other byte.
+#[cfg(test)]
+pub(crate) fn assert_key_type_bijection(
+    table: &str,
+    encode: impl Fn(KeyType) -> u8,
+    decode: impl Fn(u8) -> Option<KeyType>,
+) {
+    let codes: Vec<u8> = all_key_types().into_iter().map(&encode).collect();
+    let mut distinct = codes.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(
+        distinct.len(),
+        codes.len(),
+        "{table}: codes collide {codes:?}"
+    );
+    for t in all_key_types() {
+        assert_eq!(decode(encode(t)), Some(t), "{table}: {t:?}");
+    }
+    for byte in 0..=u8::MAX {
+        if !codes.contains(&byte) {
+            assert_eq!(decode(byte), None, "{table}: byte {byte} decodes");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{KeyRole, KeyType, PushToken};
+    use super::{KeyRole, KeyType, PushToken, all_key_types, assert_key_type_bijection};
 
     /// `Debug` of a push token prints its length and none of its bytes, in
     /// text or in the decimal list a derived `Debug` would print.
@@ -1413,6 +1699,23 @@ mod tests {
         assert!(!printed.contains("secret"), "{printed}");
         assert!(!printed.contains("115, 101, 99"), "{printed}");
         assert!(printed.contains("17 bytes redacted"), "{printed}");
+    }
+
+    /// The SQLite and custody-record table maps the key types one-to-one and
+    /// refuses every byte it does not assign; `file.rs` checks File's §17.8
+    /// table with the same helper.
+    #[test]
+    fn key_type_byte_tables_are_bijections() {
+        assert_key_type_bijection(
+            "storage_code",
+            KeyType::storage_code,
+            KeyType::from_storage_code,
+        );
+        assert_eq!(
+            all_key_types().map(KeyType::storage_code),
+            [0, 2, 3],
+            "the SQLite rows already on disk fix these codes"
+        );
     }
 
     /// Every key type and role names itself in the host contract and parses

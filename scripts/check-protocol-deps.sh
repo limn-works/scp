@@ -61,6 +61,30 @@ fi
 
 echo "scp-kel dependency check passed: no async runtime, MLS, storage, transport or runtime crate."
 
+# scp-platform sits in Layer 0 (.docs/architecture.md §2.5.1, Layered
+# Dependency Graph): its only SCP dependencies are the Layer 0 crates
+# scp-crypto, scp-did, scp-kel and scp-sqlite-pools. An edge to any other SCP
+# crate would lift it above the crates that depend on it. Every feature and
+# every target is resolved, so an optional or cfg-gated edge cannot hide.
+echo "Checking scp-platform SCP dependencies..."
+platform_allowed="scp-crypto scp-did scp-kel scp-sqlite-pools"
+platform_output=$(cargo tree -p scp-platform --edges normal,build --target all --all-features --depth 1 --prefix none --format '{p}' 2>&1) || { echo "ERROR: cargo tree failed: $platform_output"; exit 1; }
+platform_deps=$(echo "$platform_output" | awk '{print $1}' | grep -E '^scp-' | grep -vx 'scp-platform' | sort -u || true)
+platform_extra=""
+for dep in $platform_deps; do
+    case " $platform_allowed " in
+        *" $dep "*) ;;
+        *) platform_extra="$platform_extra $dep" ;;
+    esac
+done
+
+if [ -n "$platform_extra" ]; then
+    echo "ERROR: scp-platform depends on SCP crates outside Layer 0:$platform_extra"
+    exit 1
+fi
+
+echo "scp-platform dependency check passed: SCP deps are a subset of {$platform_allowed}."
+
 # jsonschema_has_no_resolve_features: a challenge schema compiles with a
 # retriever that fetches nothing (spec 07 §7.3.4 step 1), and jsonschema's
 # `resolve-http` and `resolve-file` features add retrievers that fetch over

@@ -181,3 +181,108 @@ impl From<PlatformError> for scp_crypto::CustodyFailure {
         Self::from(&e)
     }
 }
+
+impl From<PlatformError> for scp_kel::KeyEventSignError {
+    /// The key-event signing error a custody's [`PlatformError`] means
+    /// (SCP-345): a wrong-type or non-identity key is
+    /// [`WrongKeyType`](scp_kel::KeyEventSignError::WrongKeyType), an unknown
+    /// handle is [`MemberNotFound`](scp_kel::KeyEventSignError::MemberNotFound),
+    /// an unsupported operation keeps its message, and every other failure is
+    /// a [`Substrate`](scp_kel::KeyEventSignError::Substrate) failure carrying
+    /// the [`CustodyFailure`](scp_crypto::CustodyFailure) the same error
+    /// classifies as, so a bridge reports the one code
+    /// `scp_ffi_common::error_codes::custody_failure_code` assigns. The match names every variant, so a new one is
+    /// classified here before it compiles.
+    fn from(e: PlatformError) -> Self {
+        match e {
+            PlatformError::WrongKeyType { .. } | PlatformError::NotIdentityKey => {
+                Self::WrongKeyType
+            }
+            PlatformError::KeyNotFound => Self::MemberNotFound,
+            PlatformError::Unsupported(what) => Self::Unsupported(what),
+            PlatformError::StorageError(_)
+            | PlatformError::StorageClosed
+            | PlatformError::StorageLockHeld { .. }
+            | PlatformError::AttestationError(_)
+            | PlatformError::PushError { .. }
+            | PlatformError::CustodyError(_)
+            | PlatformError::PseudonymRejected(_) => {
+                Self::Substrate(scp_crypto::CustodyFailure::from(&e))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use scp_crypto::{CustodyFailure, CustodyFailureKind};
+    use scp_kel::KeyEventSignError;
+
+    use super::{PlatformError, PushFailureKind};
+    use crate::traits::KeyType;
+
+    fn substrate(kind: CustodyFailureKind, detail: &str) -> KeyEventSignError {
+        KeyEventSignError::Substrate(CustodyFailure {
+            kind,
+            detail: detail.to_owned(),
+        })
+    }
+
+    #[test]
+    fn platform_errors_map_to_key_event_sign_errors() {
+        let push = || PlatformError::PushError {
+            kind: PushFailureKind::ProviderFailed,
+            detail: "x".into(),
+        };
+        let cases = [
+            (
+                PlatformError::WrongKeyType {
+                    expected: KeyType::P256Signing,
+                    actual: KeyType::Ed25519,
+                },
+                KeyEventSignError::WrongKeyType,
+            ),
+            (
+                PlatformError::NotIdentityKey,
+                KeyEventSignError::WrongKeyType,
+            ),
+            (
+                PlatformError::KeyNotFound,
+                KeyEventSignError::MemberNotFound,
+            ),
+            (
+                PlatformError::Unsupported("key-event signing"),
+                KeyEventSignError::Unsupported("key-event signing"),
+            ),
+            (
+                PlatformError::StorageError("disk".into()),
+                substrate(CustodyFailureKind::Failed, "storage error: disk"),
+            ),
+            (
+                PlatformError::StorageClosed,
+                substrate(
+                    CustodyFailureKind::StorageClosed,
+                    &PlatformError::StorageClosed.to_string(),
+                ),
+            ),
+            (
+                PlatformError::CustodyError("host".into()),
+                substrate(CustodyFailureKind::Failed, "custody error: host"),
+            ),
+            (
+                push(),
+                substrate(CustodyFailureKind::PushProviderFailed, &push().to_string()),
+            ),
+            (
+                PlatformError::PseudonymRejected("p".into()),
+                substrate(
+                    CustodyFailureKind::PseudonymRejected,
+                    &PlatformError::PseudonymRejected("p".into()).to_string(),
+                ),
+            ),
+        ];
+        for (platform, expected) in cases {
+            assert_eq!(KeyEventSignError::from(platform), expected);
+        }
+    }
+}
