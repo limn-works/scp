@@ -3521,7 +3521,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     
     /**
      * Disables push: deregisters the device's push token from every relay
-     * it registered with.
+     * it registered with and returns each relay's result.
      *
      * # Errors
      *
@@ -3529,25 +3529,29 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * no local member DID, and otherwise `SCP-TRANS-5104`: the device has no
      * P-256 `#active` signing key to sign a `PushDeregistration` with.
      */
-    func pushDisable() throws 
+    func pushDisable() async throws  -> PushRelayOutcomes
     
     /**
      * Enables push: registers the device's push token with every relay in
-     * the relay set (ADR-025 criterion 4, ADR-027 criterion 10).
+     * the relay set and returns each relay's result (ADR-025 criterion 4,
+     * ADR-027 criterion 10).
      *
      * # Errors
      *
      * `SCP-CTX-2138` for a shut-down instance, `SCP-IDENT-1002` for one with
      * no local member DID, and otherwise `SCP-TRANS-5104`: the device has no
      * P-256 `#active` signing key to sign a `PushRegistration` with. Each is
-     * returned before `provider` is called.
+     * returned before `provider` is called or any relay is addressed.
      */
-    func pushEnable(provider: PushProvider, platform: PushPlatform) throws 
+    func pushEnable(provider: PushProvider, platform: PushPlatform) async throws  -> PushRelayOutcomes
     
     /**
      * Handles a silent push. `payload` is what the platform delivered:
      * the JSON serialization of the APNs `userInfo` dictionary or of the
      * FCM data map.
+     *
+     * A shut-down instance returns [`WakeOutcome::Failed`] with
+     * `SCP-TRANS-5085` and calls no `handle_notification`.
      *
      * # Errors
      *
@@ -7336,7 +7340,7 @@ open func provenanceAttach(sourceContextId: String, sourceType: String, memorySc
     
     /**
      * Disables push: deregisters the device's push token from every relay
-     * it registered with.
+     * it registered with and returns each relay's result.
      *
      * # Errors
      *
@@ -7344,35 +7348,59 @@ open func provenanceAttach(sourceContextId: String, sourceType: String, memorySc
      * no local member DID, and otherwise `SCP-TRANS-5104`: the device has no
      * P-256 `#active` signing key to sign a `PushDeregistration` with.
      */
-open func pushDisable()throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_method_scp_push_disable(self.uniffiClonePointer(),$0
-    )
-}
+open func pushDisable()async throws  -> PushRelayOutcomes  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_push_disable(
+                    self.uniffiClonePointer()
+                    
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypePushRelayOutcomes_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
 }
     
     /**
      * Enables push: registers the device's push token with every relay in
-     * the relay set (ADR-025 criterion 4, ADR-027 criterion 10).
+     * the relay set and returns each relay's result (ADR-025 criterion 4,
+     * ADR-027 criterion 10).
      *
      * # Errors
      *
      * `SCP-CTX-2138` for a shut-down instance, `SCP-IDENT-1002` for one with
      * no local member DID, and otherwise `SCP-TRANS-5104`: the device has no
      * P-256 `#active` signing key to sign a `PushRegistration` with. Each is
-     * returned before `provider` is called.
+     * returned before `provider` is called or any relay is addressed.
      */
-open func pushEnable(provider: PushProvider, platform: PushPlatform)throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_method_scp_push_enable(self.uniffiClonePointer(),
-        FfiConverterCallbackInterfacePushProvider_lower(provider),
-        FfiConverterTypePushPlatform_lower(platform),$0
-    )
-}
+open func pushEnable(provider: PushProvider, platform: PushPlatform)async throws  -> PushRelayOutcomes  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_push_enable(
+                    self.uniffiClonePointer(),
+                    FfiConverterCallbackInterfacePushProvider_lower(provider),FfiConverterTypePushPlatform_lower(platform)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypePushRelayOutcomes_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
 }
     
     /**
      * Handles a silent push. `payload` is what the platform delivered:
      * the JSON serialization of the APNs `userInfo` dictionary or of the
      * FCM data map.
+     *
+     * A shut-down instance returns [`WakeOutcome::Failed`] with
+     * `SCP-TRANS-5085` and calls no `handle_notification`.
      *
      * # Errors
      *
@@ -12622,6 +12650,263 @@ public func FfiConverterTypePublishResult_lift(_ buf: RustBuffer) throws -> Publ
 #endif
 public func FfiConverterTypePublishResult_lower(_ value: PublishResult) -> RustBuffer {
     return FfiConverterTypePublishResult.lower(value)
+}
+
+
+/**
+ * Why one relay refused a push registration or deregistration.
+ */
+public struct PushRelayFailure {
+    /**
+     * The failure's stable code.
+     */
+    public var code: String
+    /**
+     * The failure's description.
+     */
+    public var message: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The failure's stable code.
+         */code: String, 
+        /**
+         * The failure's description.
+         */message: String) {
+        self.code = code
+        self.message = message
+    }
+}
+
+#if compiler(>=6)
+extension PushRelayFailure: Sendable {}
+#endif
+
+
+extension PushRelayFailure: Equatable, Hashable {
+    public static func ==(lhs: PushRelayFailure, rhs: PushRelayFailure) -> Bool {
+        if lhs.code != rhs.code {
+            return false
+        }
+        if lhs.message != rhs.message {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(code)
+        hasher.combine(message)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePushRelayFailure: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PushRelayFailure {
+        return
+            try PushRelayFailure(
+                code: FfiConverterString.read(from: &buf), 
+                message: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PushRelayFailure, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.code, into: &buf)
+        FfiConverterString.write(value.message, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePushRelayFailure_lift(_ buf: RustBuffer) throws -> PushRelayFailure {
+    return try FfiConverterTypePushRelayFailure.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePushRelayFailure_lower(_ value: PushRelayFailure) -> RustBuffer {
+    return FfiConverterTypePushRelayFailure.lower(value)
+}
+
+
+/**
+ * Each relay's result of a `push_enable` or `push_disable`, mirroring the
+ * registrar's `RelayOutcomes`: deregistrations first, then registrations
+ * (`10-infrastructure-and-self-hosting.md` §10.7.1).
+ */
+public struct PushRelayOutcomes {
+    /**
+     * Each `PushDeregistration`, one entry per relay.
+     */
+    public var deregistered: [PushRelayResult]
+    /**
+     * Each `PushRegistration`, one entry per relay.
+     */
+    public var registered: [PushRelayResult]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Each `PushDeregistration`, one entry per relay.
+         */deregistered: [PushRelayResult], 
+        /**
+         * Each `PushRegistration`, one entry per relay.
+         */registered: [PushRelayResult]) {
+        self.deregistered = deregistered
+        self.registered = registered
+    }
+}
+
+#if compiler(>=6)
+extension PushRelayOutcomes: Sendable {}
+#endif
+
+
+extension PushRelayOutcomes: Equatable, Hashable {
+    public static func ==(lhs: PushRelayOutcomes, rhs: PushRelayOutcomes) -> Bool {
+        if lhs.deregistered != rhs.deregistered {
+            return false
+        }
+        if lhs.registered != rhs.registered {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(deregistered)
+        hasher.combine(registered)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePushRelayOutcomes: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PushRelayOutcomes {
+        return
+            try PushRelayOutcomes(
+                deregistered: FfiConverterSequenceTypePushRelayResult.read(from: &buf), 
+                registered: FfiConverterSequenceTypePushRelayResult.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PushRelayOutcomes, into buf: inout [UInt8]) {
+        FfiConverterSequenceTypePushRelayResult.write(value.deregistered, into: &buf)
+        FfiConverterSequenceTypePushRelayResult.write(value.registered, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePushRelayOutcomes_lift(_ buf: RustBuffer) throws -> PushRelayOutcomes {
+    return try FfiConverterTypePushRelayOutcomes.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePushRelayOutcomes_lower(_ value: PushRelayOutcomes) -> RustBuffer {
+    return FfiConverterTypePushRelayOutcomes.lower(value)
+}
+
+
+/**
+ * One relay's result in a [`PushRelayOutcomes`].
+ */
+public struct PushRelayResult {
+    /**
+     * The relay's canonical URL (`09-security-model.md` §9.5.2).
+     */
+    public var relayUrl: String
+    /**
+     * Why the relay refused; `None` when it accepted.
+     */
+    public var failure: PushRelayFailure?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The relay's canonical URL (`09-security-model.md` §9.5.2).
+         */relayUrl: String, 
+        /**
+         * Why the relay refused; `None` when it accepted.
+         */failure: PushRelayFailure?) {
+        self.relayUrl = relayUrl
+        self.failure = failure
+    }
+}
+
+#if compiler(>=6)
+extension PushRelayResult: Sendable {}
+#endif
+
+
+extension PushRelayResult: Equatable, Hashable {
+    public static func ==(lhs: PushRelayResult, rhs: PushRelayResult) -> Bool {
+        if lhs.relayUrl != rhs.relayUrl {
+            return false
+        }
+        if lhs.failure != rhs.failure {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(relayUrl)
+        hasher.combine(failure)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePushRelayResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PushRelayResult {
+        return
+            try PushRelayResult(
+                relayUrl: FfiConverterString.read(from: &buf), 
+                failure: FfiConverterOptionTypePushRelayFailure.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PushRelayResult, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.relayUrl, into: &buf)
+        FfiConverterOptionTypePushRelayFailure.write(value.failure, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePushRelayResult_lift(_ buf: RustBuffer) throws -> PushRelayResult {
+    return try FfiConverterTypePushRelayResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePushRelayResult_lower(_ value: PushRelayResult) -> RustBuffer {
+    return FfiConverterTypePushRelayResult.lower(value)
 }
 
 
@@ -18828,6 +19113,30 @@ fileprivate struct FfiConverterOptionTypePseudonymRotationPolicy: FfiConverterRu
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypePushRelayFailure: FfiConverterRustBuffer {
+    typealias SwiftType = PushRelayFailure?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypePushRelayFailure.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypePushRelayFailure.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeReliabilityScoreRecord: FfiConverterRustBuffer {
     typealias SwiftType = ReliabilityScoreRecord?
 
@@ -19091,6 +19400,31 @@ fileprivate struct FfiConverterSequenceTypePublishResult: FfiConverterRustBuffer
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypePublishResult.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypePushRelayResult: FfiConverterRustBuffer {
+    typealias SwiftType = [PushRelayResult]
+
+    public static func write(_ value: [PushRelayResult], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypePushRelayResult.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [PushRelayResult] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [PushRelayResult]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypePushRelayResult.read(from: &buf))
         }
         return seq
     }
@@ -20610,13 +20944,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_provenance_attach() != 3158) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_push_disable() != 5430) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_push_disable() != 11628) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_push_enable() != 6683) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_push_enable() != 54151) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_push_handle_wake() != 35062) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_push_handle_wake() != 39504) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_register_local_did() != 49984) {
