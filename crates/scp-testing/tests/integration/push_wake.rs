@@ -575,6 +575,11 @@ impl tracing::Subscriber for ReplayCounter {
 /// Two wakes that overlap on a cold supervisor run as one flight: the
 /// supervisor is restored once (one saga replay), the relay is dialed once,
 /// and both callers get the same outcome.
+///
+/// The restarted supervisor's store yields in `list_persisted_contexts`,
+/// before the first wake's restore makes any actor resident. Without the
+/// flight the second wake runs in that gap, still finds no known context,
+/// and runs its own startup restore, so the replay count reaches 2.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn overlapping_wakes_on_a_cold_supervisor_restore_and_dial_once() {
     use tracing::instrument::WithSubscriber;
