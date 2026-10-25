@@ -1695,7 +1695,8 @@ pub(in crate::context) async fn create_context(
     // min_protocol_version.
     params.check_version_compatibility(scp_protocol::envelope::SCP_PROTOCOL_VERSION)?;
     // §9.10.4.1 validity criterion: creation rejects a rotation policy with no
-    // trigger or an interval shorter than the rotation grace.
+    // trigger or an interval shorter than
+    // `PSEUDONYM_MIN_ROTATION_INTERVAL_SECS`.
     if let Some(policy) = &params.pseudonym_rotation {
         policy.validate()?;
     }
@@ -4254,9 +4255,10 @@ pub async fn restore_context(
             // §9.10.4.1 Class S: same-node restore REHYDRATES the rotation state.
             // A restore with `announce_pending` set re-publishes the announcement
             // for the persisted epoch (the actor's rotation arm signals the
-            // driver until the publish succeeds), and a previous routing ID whose
-            // grace ended while the node was down is discarded by the grace arm
-            // on the first actor turn. `T0` is the committed value (§5.13.3 rule
+            // driver until the publish succeeds). The query-only list is restored
+            // whole: an entry that expired while the node was down stays until the
+            // next rotation drops it, and `LocalRoutingIds` leaves it out. `T0` is the
+            // committed value (§5.13.3 rule
             // 9), never the snapshot's copy; a keyless restore holds none and
             // follows no interval schedule until reconnection.
             pseudonym_rotation: ctx_snapshot

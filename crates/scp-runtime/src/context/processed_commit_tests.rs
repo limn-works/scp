@@ -17,8 +17,8 @@
 //! - A non-committer that processes a reset records no rotation trigger (09
 //!   §9.10.4.1 "Membership-change criterion": one leaf of the DID before and
 //!   after is no change).
-//! - A member that processes its own removal discards its grace and records
-//!   no trigger.
+//! - A member that processes its own removal discards its query-only list and
+//!   records no trigger.
 
 #![cfg(test)]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

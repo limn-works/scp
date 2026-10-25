@@ -1,7 +1,7 @@
 //! Runtime tests for the local member's pseudonym rotation (spec 09
 //! §9.10.4.1): the epoch schedule and membership trigger the actor's rotation
 //! arm signals, the fail-closed `rotate_pseudonym` commit, the announcement,
-//! the grace end, the leave/close/expiry discard, and crash recovery through
+//! the leave/close/expiry discard of the query-only list, and crash recovery through
 //! the production `restore_all_contexts`.
 //!
 //! Every test drives the production Supervisor entry points

@@ -338,7 +338,8 @@ const UNIFFI_SERVER_SRC: &str = include_str!("../../../../crates/scp-ffi/uniffi/
 // bridge's governance propose path.
 // Raised 89 -> 90 when the local member's pseudonym rotation (spec 09
 // §9.10.4.1) was wired: one assertion pins the rotate command, the routing-ID
-// query, and the actor's rotation and grace arms to their helpers.
+// query, and the actor's rotation arm to their helpers. (The grace arm it also
+// pinned was deleted with Alec's approval when spec 09 dropped the grace.)
 // Raised 90 -> 91 when non-committing members began rotating on a processed
 // membership Commit (spec 09 §9.10.4.1): one assertion pins the incoming-Commit
 // handler to the DID classifier, the fail-closed commit, and the rotation signal.
