@@ -518,10 +518,13 @@ impl WebPushSender {
                 root,
                 request_timeout,
             } => (
+                // The connect deadline is the test's request deadline too, so
+                // a test's loopback handshake races no fixed 5 s bound.
                 client_builder(ClientLimits {
                     request_timeout: *request_timeout,
                     ..WEBPUSH_CLIENT_LIMITS
                 })
+                .connect_timeout(*request_timeout)
                 .add_root_certificate(root.clone()),
                 resolver.clone(),
             ),
@@ -831,18 +834,16 @@ pub(crate) mod tests {
     }
 
     /// A sender that reaches `server`; `allow_loopback` false applies the
-    /// production ADR-004 rule, which refuses `server`'s address.
+    /// production ADR-004 rule, which refuses `server`'s address. Its request
+    /// deadline is [`HOLD_GUARD`], not the production 5 s, so no loopback
+    /// send in a test that does not hold the clock races a short deadline;
+    /// a test of the deadline uses [`sender_with_deadline`] and [`held`].
     pub fn sender_for(
         server: &TlsTestServer,
         allow_loopback: bool,
         clock: Arc<dyn Clock>,
     ) -> TestResult<WebPushSender> {
-        sender_with_deadline(
-            server,
-            allow_loopback,
-            clock,
-            WEBPUSH_CLIENT_LIMITS.request_timeout,
-        )
+        sender_with_deadline(server, allow_loopback, clock, HOLD_GUARD)
     }
 
     /// [`sender_for`] with `request_timeout` as the request deadline, so a
@@ -874,8 +875,9 @@ pub(crate) mod tests {
     /// can always run, so no timer fires, a request deadline included, while
     /// `future` waits on loopback I/O, however slowly the runner moves. A
     /// timer `future` itself waits on never fires either, so a send that
-    /// sleeps fails the test at [`HOLD_GUARD`].
-    pub async fn held<F: Future>(future: F) -> TestResult<F::Output> {
+    /// sleeps fails the test at [`HOLD_GUARD`], naming `awaited`, the
+    /// condition `future` waits for.
+    pub async fn held<F: Future>(awaited: &str, future: F) -> TestResult<F::Output> {
         let mut future = std::pin::pin!(future);
         let guard = std::time::Instant::now();
         loop {
@@ -883,7 +885,7 @@ pub(crate) mod tests {
                 return Ok(output);
             }
             if guard.elapsed() > HOLD_GUARD {
-                return Err("the held future did not finish".into());
+                return Err(format!("held {HOLD_GUARD:?} without {awaited}").into());
             }
             tokio::task::yield_now().await;
         }
@@ -1382,7 +1384,9 @@ pub(crate) mod tests {
     /// never answers is `Unreachable` once the request deadline passes. The
     /// deadline covers connect, TLS and HTTP/2 setup too, so the clock is
     /// paused and held until the server has the request: the deadline can
-    /// then pass only after the request arrived, on any runner.
+    /// then pass only after the request arrived, on any runner. A send that
+    /// ignored its deadline would run into the paused-clock bound of ten
+    /// deadlines and fail, not hang.
     #[tokio::test(start_paused = true)]
     async fn an_accepted_request_with_no_answer_is_unreachable() -> TestResult {
         let deadline = Duration::from_millis(300);
@@ -1390,9 +1394,12 @@ pub(crate) mod tests {
         let sender = sender_with_deadline(&server, true, clock(), deadline)?;
         let (_, subscription) = subscribe(server.endpoint("push.example.net", PATH))?;
         let started = Instant::now();
-        let (outcome, arrived) =
-            tokio::join!(sender.send(&subscription), held(requests_reach(&server, 1)));
+        let (outcome, arrived) = tokio::join!(
+            tokio::time::timeout(deadline * 10, sender.send(&subscription)),
+            held("the hung request at the server", requests_reach(&server, 1))
+        );
         arrived?;
+        let outcome = outcome.map_err(|_| "the send outlived ten request deadlines")?;
         assert_eq!(outcome, SendAttempt::Sent(PushSendOutcome::Unreachable));
         assert_eq!(server.requests().await.len(), 1);
         // The deadline, not a reset or a refusal, ended the send.
@@ -1445,7 +1452,7 @@ pub(crate) mod tests {
 
         let before = Instant::now();
         assert_eq!(
-            held(sender.send(&busy)).await?,
+            held("the 503 send", sender.send(&busy)).await?,
             SendAttempt::Sent(PushSendOutcome::Transient)
         );
         let aud = parse_endpoint(&server.endpoint("push.example.net", "/"))?
@@ -1460,7 +1467,7 @@ pub(crate) mod tests {
         // Another origin is unaffected: `held` fails a send that waits on
         // the back-off.
         assert_eq!(
-            held(sender.send(&other_origin)).await?,
+            held("the other origin's send", sender.send(&other_origin)).await?,
             SendAttempt::Sent(PushSendOutcome::Delivered)
         );
         // A send to the backing-off origin does not sleep out the back-off:
@@ -1475,7 +1482,7 @@ pub(crate) mod tests {
         // Sent once the back-off ends, it is delivered.
         tokio::time::sleep_until(retry_at).await;
         assert_eq!(
-            held(sender.send(&same_origin)).await?,
+            held("the send after the back-off", sender.send(&same_origin)).await?,
             SendAttempt::Sent(PushSendOutcome::Delivered)
         );
         let paths: Vec<String> = server
@@ -1615,14 +1622,22 @@ pub(crate) mod tests {
     async fn concurrent_failures_take_one_backoff_step() -> TestResult {
         const IN_FLIGHT: usize = 8;
         let server = TlsTestServer::start_routed(vec![("/", vec![Reply::hang(); IN_FLIGHT])]).await;
-        let sender = sender_with_deadline(&server, true, clock(), Duration::from_millis(300))?;
+        let deadline = Duration::from_millis(300);
+        let sender = sender_with_deadline(&server, true, clock(), deadline)?;
         let (_, subscription) = subscribe(server.endpoint("push.example.net", PATH))?;
         let before = Instant::now();
         let (outcomes, arrived) = tokio::join!(
-            futures::future::join_all((0..IN_FLIGHT).map(|_| sender.send(&subscription))),
-            held(requests_reach(&server, IN_FLIGHT))
+            tokio::time::timeout(
+                deadline * 10,
+                futures::future::join_all((0..IN_FLIGHT).map(|_| sender.send(&subscription)))
+            ),
+            held(
+                "every hung request at the server",
+                requests_reach(&server, IN_FLIGHT)
+            )
         );
         arrived?;
+        let outcomes = outcomes.map_err(|_| "a send outlived ten request deadlines")?;
         assert_eq!(
             outcomes,
             [SendAttempt::Sent(PushSendOutcome::Unreachable); IN_FLIGHT]

@@ -1747,32 +1747,26 @@ mod enabled {
             notify(&PushRole::Disabled, &RID);
         }
 
-        /// Polls `server` up to `within` until it has recorded `n` requests.
-        async fn wait_for_requests(
-            server: &TlsTestServer,
-            n: usize,
-            within: Duration,
-        ) -> TestResult {
-            let deadline = Instant::now() + within;
-            while Instant::now() < deadline {
-                if server.requests().await.len() >= n {
-                    return Ok(());
+        /// Lets `wall` of real time pass with the paused clock held, so
+        /// no deadline or back-off ends while the drain gets the chance to
+        /// start a send it must not start.
+        async fn settle(wall: Duration) -> TestResult {
+            held("the settle", async {
+                let started = std::time::Instant::now();
+                while started.elapsed() < wall {
+                    tokio::task::yield_now().await;
                 }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-            Err(format!(
-                "expected {n} requests within {within:?}, saw {}",
-                server.requests().await.len()
-            )
-            .into())
+            })
+            .await
         }
 
         /// PUSH-022 lane rule, end to end through the real `WebPush` sender:
         /// an endpoint origin that never answers delays no wake to another
         /// origin. The hung send is in flight before the second wake is
-        /// published, and the second is delivered well inside the sender's
-        /// 10 s request timeout, which a one-at-a-time drain would wait out.
-        #[tokio::test]
+        /// published, and the clock is paused and held, so the hung send is
+        /// still in flight when the second is delivered; a one-at-a-time
+        /// drain would never send the second and fail at the hold's guard.
+        #[tokio::test(start_paused = true)]
         async fn a_hung_webpush_origin_does_not_delay_another() -> TestResult {
             const HUNG: RoutingId = [0x48; 32];
             const GOOD: RoutingId = [0x47; 32];
@@ -1804,9 +1798,9 @@ mod enabled {
             .await?;
 
             notify(&push, &HUNG);
-            wait_for_requests(&server, 1, Duration::from_secs(5)).await?;
+            held("the hung request", requests_reach(&server, 1)).await?;
             notify(&push, &GOOD);
-            wait_for_requests(&server, 2, Duration::from_secs(3)).await?;
+            held("the other origin's request", requests_reach(&server, 2)).await?;
             let paths: Vec<String> = server
                 .requests()
                 .await
@@ -1901,7 +1895,17 @@ mod enabled {
             service: &PushService,
             server: &TlsTestServer,
         ) -> Result<Option<tokio::time::Instant>, Box<dyn std::error::Error>> {
-            let aud = parse_endpoint(&server.endpoint("push.example.net", "/"))?
+            origin_retry_at(service, server, "push.example.net")
+        }
+
+        /// When the service's `WebPush` sender's back-off of `server`'s
+        /// `host` origin ends.
+        fn origin_retry_at(
+            service: &PushService,
+            server: &TlsTestServer,
+            host: &str,
+        ) -> Result<Option<tokio::time::Instant>, Box<dyn std::error::Error>> {
+            let aud = parse_endpoint(&server.endpoint(host, "/"))?
                 .aud()
                 .to_owned();
             let Some(PushSender::WebPush(sender)) = service.config().senders.first() else {
@@ -1914,16 +1918,18 @@ mod enabled {
         /// sleeps until the origin's back-off ends, the instant the service's
         /// own back-off timer fires, then holds the clock still until `sent`
         /// finishes, so no deadline passes while the send crosses loopback.
+        /// `awaited` names what `sent` waits for, for the hold's failure.
         async fn wake_until<T>(
             service: &PushService,
             server: &TlsTestServer,
+            awaited: &str,
             sent: impl Future<Output = T>,
         ) -> Result<T, Box<dyn std::error::Error>> {
             let backoff_end = webpush_retry_at(service, server)?;
             if let Some(until) = backoff_end {
                 tokio::time::sleep_until(until).await;
             }
-            held(sent).await
+            held(awaited, sent).await
         }
 
         /// Finishes once `token`'s stored failure count is `want`.
@@ -1958,12 +1964,24 @@ mod enabled {
             let store = &service.config().store;
             for (sent, count) in [(1, Some(1)), (2, Some(2))] {
                 notify(&push, &RID);
-                wake_until(&service, &server, requests_reach(&server, sent)).await?;
+                wake_until(
+                    &service,
+                    &server,
+                    "the timed-out request",
+                    requests_reach(&server, sent),
+                )
+                .await?;
                 webpush_count_reaches(store, &token, count).await?;
             }
             assert_eq!(store.tokens_for_routing_id(&RID).await?.len(), 2);
             notify(&push, &RID);
-            wake_until(&service, &server, requests_reach(&server, 3)).await?;
+            wake_until(
+                &service,
+                &server,
+                "the third request",
+                requests_reach(&server, 3),
+            )
+            .await?;
             webpush_count_reaches(store, &token, None).await?;
             assert!(store.tokens_for_routing_id(&RID).await?.is_empty());
             assert_eq!(server.requests().await.len(), 3);
@@ -1984,12 +2002,30 @@ mod enabled {
             let token = shared_webpush_token(&push, &server).await?;
             let store = &service.config().store;
             notify(&push, &RID);
-            wake_until(&service, &server, requests_reach(&server, 1)).await?;
+            wake_until(
+                &service,
+                &server,
+                "the first request",
+                requests_reach(&server, 1),
+            )
+            .await?;
             webpush_count_reaches(store, &token, Some(1)).await?;
             notify(&push, &RID);
-            wake_until(&service, &server, count_is(store, &token, Some(0))).await??;
+            wake_until(
+                &service,
+                &server,
+                "the 201 clearing the count",
+                count_is(store, &token, Some(0)),
+            )
+            .await??;
             notify(&push, &RID);
-            wake_until(&service, &server, requests_reach(&server, 3)).await?;
+            wake_until(
+                &service,
+                &server,
+                "the third request",
+                requests_reach(&server, 3),
+            )
+            .await?;
             webpush_count_reaches(store, &token, Some(1)).await?;
             assert_eq!(store.tokens_for_routing_id(&RID).await?.len(), 2);
             Ok(())
@@ -2016,7 +2052,13 @@ mod enabled {
             let store = &service.config().store;
             for (sent, count) in [(1, Some(1)), (2, Some(2))] {
                 notify(&push, &RID);
-                wake_until(&service, &server, requests_reach(&server, sent)).await?;
+                wake_until(
+                    &service,
+                    &server,
+                    "the timed-out request",
+                    requests_reach(&server, sent),
+                )
+                .await?;
                 webpush_count_reaches(store, &token, count).await?;
             }
             for _ in [429, 503] {
@@ -2024,7 +2066,7 @@ mod enabled {
                 // `wake_until` holds the clock from the back-off's end, when
                 // the origin has none, until the `Transient` answer takes the
                 // next back-off step.
-                wake_until(&service, &server, async {
+                wake_until(&service, &server, "the next back-off step", async {
                     while webpush_retry_at(&service, &server)?.is_none() {
                         tokio::task::yield_now().await;
                     }
@@ -2045,8 +2087,9 @@ mod enabled {
 
         /// L3: 36 tokens on one hung origin, each on its own routing ID, hold
         /// at most `WEBPUSH_SENDS_PER_ORIGIN` sends, and a wake to another
-        /// origin is delivered well inside the 5 s request deadline.
-        #[tokio::test]
+        /// origin is delivered while they are all still in flight: the clock
+        /// is paused and held, so no hung send reaches its deadline.
+        #[tokio::test(start_paused = true)]
         async fn hung_tokens_on_one_origin_leave_room_for_another() -> TestResult {
             const GOOD: RoutingId = [0x47; 32];
             let server = TlsTestServer::start_routed(vec![
@@ -2069,26 +2112,34 @@ mod enabled {
             for n in 0..36 {
                 notify(&push, &routing_id(n));
             }
-            wait_for_requests(&server, WEBPUSH_SENDS_PER_ORIGIN, Duration::from_secs(5)).await?;
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            held(
+                "the capped hung requests",
+                requests_reach(&server, WEBPUSH_SENDS_PER_ORIGIN),
+            )
+            .await?;
+            // A send past the cap would arrive in this window; the held
+            // clock frees no slot meanwhile.
+            settle(Duration::from_millis(200)).await?;
             assert_eq!(paths(&server).await, ["/hung"; WEBPUSH_SENDS_PER_ORIGIN]);
 
             notify(&push, &GOOD);
-            wait_for_requests(
-                &server,
-                WEBPUSH_SENDS_PER_ORIGIN + 1,
-                Duration::from_secs(2),
+            held(
+                "the other wake's request",
+                requests_reach(&server, WEBPUSH_SENDS_PER_ORIGIN + 1),
             )
             .await?;
-            assert_eq!(paths(&server).await.last().map(String::as_str), Some("/ok"));
+            let mut expected = vec!["/hung"; WEBPUSH_SENDS_PER_ORIGIN];
+            expected.push("/ok");
+            assert_eq!(paths(&server).await, expected);
             Ok(())
         }
 
         /// L3: 36 tokens on one routing ID, each on its own hung origin and
         /// held by three registrants, hold at most `WEBPUSH_SENDS_PER_TICKET`
-        /// sends, and another routing ID's wake is delivered well inside the
-        /// 5 s request deadline.
-        #[tokio::test]
+        /// sends, and another routing ID's wake is delivered while they are
+        /// all still in flight: the clock is paused and held, so no hung
+        /// send reaches its deadline.
+        #[tokio::test(start_paused = true)]
         async fn hung_tokens_on_one_routing_id_leave_room_for_another() -> TestResult {
             const HUNG: RoutingId = [0x48; 32];
             const GOOD: RoutingId = [0x47; 32];
@@ -2110,18 +2161,25 @@ mod enabled {
             register_webpush(&push, &tokens).await?;
 
             notify(&push, &HUNG);
-            wait_for_requests(&server, WEBPUSH_SENDS_PER_TICKET, Duration::from_secs(5)).await?;
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            held(
+                "the capped hung requests",
+                requests_reach(&server, WEBPUSH_SENDS_PER_TICKET),
+            )
+            .await?;
+            // A send past the cap would arrive in this window; the held
+            // clock frees no slot meanwhile.
+            settle(Duration::from_millis(200)).await?;
             assert_eq!(paths(&server).await, ["/hung"; WEBPUSH_SENDS_PER_TICKET]);
 
             notify(&push, &GOOD);
-            wait_for_requests(
-                &server,
-                WEBPUSH_SENDS_PER_TICKET + 1,
-                Duration::from_secs(2),
+            held(
+                "the other wake's request",
+                requests_reach(&server, WEBPUSH_SENDS_PER_TICKET + 1),
             )
             .await?;
-            assert_eq!(paths(&server).await.last().map(String::as_str), Some("/ok"));
+            let mut expected = vec!["/hung"; WEBPUSH_SENDS_PER_TICKET];
+            expected.push("/ok");
+            assert_eq!(paths(&server).await, expected);
             Ok(())
         }
 
@@ -2129,8 +2187,10 @@ mod enabled {
         /// hold no send. Eight origins answer 429 and back off; a wake to
         /// each of their 32 tokens then fills no send slot, so a wake to a
         /// ninth origin is sent before any of them, and all 32 are sent once
-        /// the back-offs end.
-        #[tokio::test]
+        /// the back-offs end. The clock is paused and held until each origin
+        /// has backed off and until the ninth origin's request arrives, so
+        /// no back-off ends while a 429 or a send crosses loopback.
+        #[tokio::test(start_paused = true)]
         async fn wakes_during_a_backoff_hold_no_send() -> TestResult {
             const ORIGINS: usize = 8;
             const PER_ORIGIN: usize = WEBPUSH_CONCURRENT_SENDS / ORIGINS;
@@ -2146,7 +2206,8 @@ mod enabled {
             .await;
             let sender = webpush_sender_for(&server, true, Arc::new(scp_clock::SystemClock))?;
             let (config, _dir) = config(vec![PushSender::WebPush(sender)])?;
-            let push = PushRole::Enabled(PushService::start(config)?);
+            let service = PushService::start(config)?;
+            let push = PushRole::Enabled(service.clone());
             let mut tokens = Vec::new();
             for n in 0..u8::try_from(WEBPUSH_CONCURRENT_SENDS)? {
                 let origin = hung_host(usize::from(n) / PER_ORIGIN);
@@ -2161,16 +2222,30 @@ mod enabled {
             for origin in 0..u8::try_from(ORIGINS)? {
                 notify(&push, &routing_id(origin * u8::try_from(PER_ORIGIN)?));
             }
-            wait_for_requests(&server, ORIGINS, Duration::from_secs(5)).await?;
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            let backoff_ends = held("every origin's 429 back-off", async {
+                loop {
+                    let ends = (0..ORIGINS)
+                        .map(|n| origin_retry_at(&service, &server, &hung_host(n)))
+                        .collect::<Result<Option<Vec<_>>, _>>()?;
+                    if let Some(ends) = ends {
+                        return Ok::<_, Box<dyn std::error::Error>>(ends);
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await??;
 
+            // The intake is first in, first out, so the drain meets every
+            // backing-off wake before the ninth origin's.
             for n in 0..u8::try_from(WEBPUSH_CONCURRENT_SENDS)? {
                 notify(&push, &routing_id(n));
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
             notify(&push, &GOOD);
-            let all = ORIGINS + 1 + WEBPUSH_CONCURRENT_SENDS;
-            wait_for_requests(&server, all, Duration::from_secs(10)).await?;
+            held(
+                "the ninth origin's request",
+                requests_reach(&server, ORIGINS + 1),
+            )
+            .await?;
             let seen = paths(&server).await;
             let good_at = seen.iter().position(|path| path == "/ok");
             assert_eq!(
@@ -2178,6 +2253,15 @@ mod enabled {
                 Some(ORIGINS),
                 "a backing-off wake held a send: /ok was request #{good_at:?}"
             );
+
+            let last_end = backoff_ends
+                .into_iter()
+                .max()
+                .ok_or("no origin backed off")?;
+            tokio::time::sleep_until(last_end).await;
+            let all = ORIGINS + 1 + WEBPUSH_CONCURRENT_SENDS;
+            held("every held wake's request", requests_reach(&server, all)).await?;
+            assert_eq!(server.requests().await.len(), all);
             Ok(())
         }
 
@@ -2476,8 +2560,11 @@ mod enabled {
 
         /// A full endpoint lookup pool holds a wake to a healthy origin
         /// without consuming it or backing the origin off, and the wake is
-        /// sent once a lookup permit frees, with no further publish.
-        #[tokio::test]
+        /// sent once a lookup permit frees, with no further publish. The
+        /// clock is paused: the 300 ms sleep ends only once the drain has
+        /// nothing left to run, and the clock is held until the freed wake's
+        /// request arrives.
+        #[tokio::test(start_paused = true)]
         async fn a_full_lookup_pool_holds_a_wake_without_a_backoff() -> TestResult {
             let server = TlsTestServer::start_routed(vec![("/ok", vec![Reply::empty(201)])]).await;
             let (push, service, _dir) = webpush_service(&server, Duration::from_secs(5))?;
@@ -2493,7 +2580,7 @@ mod enabled {
             .aud()
             .to_owned();
 
-            let held = sender.exhaust_lookup_permits()?;
+            let permits = sender.exhaust_lookup_permits()?;
             notify(&push, &RID);
             tokio::time::sleep(Duration::from_millis(300)).await;
             assert!(server.requests().await.is_empty());
@@ -2511,8 +2598,8 @@ mod enabled {
                 Some(0),
                 "a full lookup pool counted against the token"
             );
-            drop(held);
-            wait_for_requests(&server, 1, Duration::from_secs(5)).await?;
+            drop(permits);
+            held("the freed wake's request", requests_reach(&server, 1)).await?;
             assert_eq!(paths(&server).await, ["/ok"]);
             Ok(())
         }
