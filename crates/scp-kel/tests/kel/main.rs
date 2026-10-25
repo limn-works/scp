@@ -12,6 +12,7 @@ mod construction;
 mod decode;
 mod event_codec;
 mod fixtures;
+mod rank;
 mod replay;
 mod round_trip;
 mod signature;
