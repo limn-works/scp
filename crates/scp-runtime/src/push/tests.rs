@@ -959,6 +959,35 @@ async fn routes_failure_publishes_nothing() -> TestResult {
     Ok(())
 }
 
+/// A token refresh whose routing-ID query fails returns
+/// [`PushError::Routes`], publishes nothing to the relays that accepted the
+/// old token, and keeps the old token and the accepted sets.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refresh_token_routes_failure_publishes_nothing() -> TestResult {
+    let sup = supervisor();
+    create_context(&sup, CTX_A, PSEUDONYM_A, &[RELAY_A]).await?;
+    let (sink, mut rx) = publisher(system_clock(), accept_all());
+    let mut registrar = registrar(sink, system_clock()).await?;
+    registrar
+        .register(&[target(RELAY_A, &[[1; 32]])?, target(RELAY_B, &[[2; 32]])?])
+        .await?;
+    expect_publishes(&mut rx, 2).await?;
+    let accepted = registrar.accepted.clone();
+    sup.test_poison_context(&hex::encode(CTX_A)).await;
+
+    let result = registrar
+        .refresh_token(&sup, PushToken::new(NEW_TOKEN.to_vec()))
+        .await;
+    assert!(
+        matches!(&result, Err(err @ PushError::Routes(_)) if err.retryable()),
+        "{result:?}"
+    );
+    expect_quiet(&mut rx).await?;
+    assert_eq!(registrar.token.as_bytes(), TOKEN, "the old token is kept");
+    assert_eq!(registrar.accepted, accepted, "the accepted sets are kept");
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Criterion 10: P-256 only
 // ---------------------------------------------------------------------------
