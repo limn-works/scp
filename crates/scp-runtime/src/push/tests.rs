@@ -474,7 +474,7 @@ async fn preimage_contains_no_context_id() -> TestResult {
     let mut registrar = registrar(sink, system_clock()).await?;
     let public_key = *registrar.signing_key.public_key();
 
-    let results = registrar.reconcile(&sup).await?;
+    let results = registrar.reconcile(&sup, StaleBound::Keep).await?;
     assert!(
         results.registered.get(RELAY_A).is_some_and(Result::is_ok),
         "{results:?}"
@@ -949,7 +949,7 @@ async fn routes_failure_publishes_nothing() -> TestResult {
     let (sink, mut rx) = publisher(system_clock(), accept_all());
     let mut registrar = registrar(sink, system_clock()).await?;
 
-    let result = registrar.reconcile(&sup).await;
+    let result = registrar.reconcile(&sup, StaleBound::Keep).await;
     assert!(
         matches!(&result, Err(err @ PushError::Routes(_)) if err.retryable()),
         "{result:?}"
@@ -1309,7 +1309,11 @@ async fn reconcile_until_bound<S: Storage>(
     let elapsed = || (clock.monotonic_millis() - first) / 1000;
     let mut retries = 0;
     for _ in 0..MAX_ATTEMPTS {
-        match stale_step(registrar.reconcile(sup).await?, deregistration, rx)? {
+        match stale_step(
+            registrar.reconcile(sup, StaleBound::Keep).await?,
+            deregistration,
+            rx,
+        )? {
             StaleStep::Retry => {
                 assert!(
                     elapsed() <= STALE_RUN_BOUND_SECS,
@@ -1353,7 +1357,7 @@ async fn always_stale_relay_stops_getting_registrations_after_skew_bound() -> Te
     );
     for _ in 0..3 {
         clock.advance(RETRY_STEP);
-        let outcome = registrar.reconcile(&sup).await?;
+        let outcome = registrar.reconcile(&sup, StaleBound::Keep).await?;
         assert!(outcome.registered.is_empty(), "{outcome:?}");
         assert!(outcome.deregistered.is_empty(), "{outcome:?}");
         assert!(drain(&mut rx).is_empty(), "relay A is sent nothing more");
@@ -1383,7 +1387,7 @@ async fn always_stale_relay_stops_getting_deregistrations_after_skew_bound() -> 
     let answer: Answer = Box::new(|_, attempt| if attempt == 0 { Ok(()) } else { stale_answer() });
     let (sink, mut rx) = publisher(dyn_clock, answer);
     let mut registrar = clocked(sink, &clock).await?;
-    let first = registrar.reconcile(&sup).await?;
+    let first = registrar.reconcile(&sup, StaleBound::Keep).await?;
     assert!(
         first.registered.get(RELAY_A).is_some_and(Result::is_ok),
         "{first:?}"
@@ -1396,7 +1400,7 @@ async fn always_stale_relay_stops_getting_deregistrations_after_skew_bound() -> 
     assert_eq!(retries, STALE_RUN_BOUND_SECS / RETRY_STEP + 1);
     for _ in 0..3 {
         clock.advance(RETRY_STEP);
-        let outcome = registrar.reconcile(&sup).await?;
+        let outcome = registrar.reconcile(&sup, StaleBound::Keep).await?;
         assert!(outcome.deregistered.is_empty(), "{outcome:?}");
         assert!(drain(&mut rx).is_empty(), "relay A is sent nothing more");
     }
@@ -1428,7 +1432,7 @@ async fn register_past_floor(ahead_secs: u64) -> Result<u64, Box<dyn Error>> {
 
     let mut retries = 0;
     let accepted = loop {
-        let outcome = registrar.reconcile(&sup).await?;
+        let outcome = registrar.reconcile(&sup, StaleBound::Keep).await?;
         if outcome.registered.get(RELAY_A).is_some_and(Result::is_ok) {
             break drain(&mut rx);
         }
@@ -1447,7 +1451,7 @@ async fn register_past_floor(ahead_secs: u64) -> Result<u64, Box<dyn Error>> {
     assert!(registrar.accepted.contains_key(RELAY_A));
 
     clock.advance(RETRY_STEP);
-    let outcome = registrar.reconcile(&sup).await?;
+    let outcome = registrar.reconcile(&sup, StaleBound::Keep).await?;
     assert!(outcome.registered.is_empty(), "{outcome:?}");
     assert!(
         drain(&mut rx).is_empty(),
@@ -1524,12 +1528,16 @@ async fn unreachable_relay_neither_ends_nor_restarts_a_stale_run() -> TestResult
     });
     let (sup, clock, mut registrar, mut rx) = clocked_registrar(answer).await?;
     assert!(matches!(
-        stale_step(registrar.reconcile(&sup).await?, false, &mut rx)?,
+        stale_step(
+            registrar.reconcile(&sup, StaleBound::Keep).await?,
+            false,
+            &mut rx
+        )?,
         StaleStep::Retry
     ));
 
     clock.advance(200);
-    let outcome = registrar.reconcile(&sup).await?;
+    let outcome = registrar.reconcile(&sup, StaleBound::Keep).await?;
     assert!(
         matches!(
             outcome.registered.get(RELAY_A),
@@ -1540,7 +1548,11 @@ async fn unreachable_relay_neither_ends_nor_restarts_a_stale_run() -> TestResult
     assert_eq!(drain(&mut rx).len(), 1);
 
     clock.advance(STALE_RUN_BOUND_SECS + RETRY_STEP - 200);
-    match stale_step(registrar.reconcile(&sup).await?, false, &mut rx)? {
+    match stale_step(
+        registrar.reconcile(&sup, StaleBound::Keep).await?,
+        false,
+        &mut rx,
+    )? {
         StaleStep::Bound(span_secs) => {
             assert_eq!(span_secs, STALE_RUN_BOUND_SECS + RETRY_STEP);
         }
@@ -1566,12 +1578,16 @@ async fn other_relay_answer_ends_a_stale_run() -> TestResult {
     });
     let (sup, clock, mut registrar, mut rx) = clocked_registrar(answer).await?;
     assert!(matches!(
-        stale_step(registrar.reconcile(&sup).await?, false, &mut rx)?,
+        stale_step(
+            registrar.reconcile(&sup, StaleBound::Keep).await?,
+            false,
+            &mut rx
+        )?,
         StaleStep::Retry
     ));
 
     clock.advance(200);
-    let outcome = registrar.reconcile(&sup).await?;
+    let outcome = registrar.reconcile(&sup, StaleBound::Keep).await?;
     assert!(
         matches!(
             outcome.registered.get(RELAY_A),
@@ -1586,7 +1602,11 @@ async fn other_relay_answer_ends_a_stale_run() -> TestResult {
     let late = clock.monotonic_millis();
     assert!(
         matches!(
-            stale_step(registrar.reconcile(&sup).await?, false, &mut rx)?,
+            stale_step(
+                registrar.reconcile(&sup, StaleBound::Keep).await?,
+                false,
+                &mut rx
+            )?,
             StaleStep::Retry
         ),
         "a 4062 after the 5003 starts a new run"
@@ -1617,7 +1637,7 @@ async fn register_command_keeps_a_code_refusal() -> TestResult {
         }
     });
     let (sup, clock, mut registrar, mut rx) = clocked_registrar(answer).await?;
-    let outcome = registrar.reconcile(&sup).await?;
+    let outcome = registrar.reconcile(&sup, StaleBound::Keep).await?;
     assert!(
         outcome
             .registered
@@ -1648,7 +1668,11 @@ async fn register_command_restarts_an_open_stale_run() -> TestResult {
     let (sup, clock, mut registrar, mut rx) =
         clocked_registrar(Box::new(|_, _| stale_answer())).await?;
     assert!(matches!(
-        stale_step(registrar.reconcile(&sup).await?, false, &mut rx)?,
+        stale_step(
+            registrar.reconcile(&sup, StaleBound::Keep).await?,
+            false,
+            &mut rx
+        )?,
         StaleStep::Retry
     ));
 
@@ -1666,7 +1690,11 @@ async fn register_command_restarts_an_open_stale_run() -> TestResult {
     clock.advance(STALE_RUN_BOUND_SECS + RETRY_STEP - 200);
     assert!(
         matches!(
-            stale_step(registrar.reconcile(&sup).await?, false, &mut rx)?,
+            stale_step(
+                registrar.reconcile(&sup, StaleBound::Keep).await?,
+                false,
+                &mut rx
+            )?,
             StaleStep::Retry
         ),
         "the run restarted at the register command"
@@ -1690,7 +1718,7 @@ async fn deregistration_skew_refusal_survives_refresh_until_deregister_all() -> 
     let answer: Answer = Box::new(|_, attempt| if attempt == 0 { Ok(()) } else { stale_answer() });
     let (sup, clock, mut registrar, mut rx) = clocked_registrar(answer).await?;
     let public_key = *registrar.signing_key.public_key();
-    let first = registrar.reconcile(&sup).await?;
+    let first = registrar.reconcile(&sup, StaleBound::Keep).await?;
     assert!(
         first.registered.get(RELAY_A).is_some_and(Result::is_ok),
         "{first:?}"
@@ -1726,7 +1754,7 @@ async fn deregistration_skew_refusal_survives_refresh_until_deregister_all() -> 
     );
 
     clock.advance(RETRY_STEP);
-    let outcome = registrar.reconcile(&sup).await?;
+    let outcome = registrar.reconcile(&sup, StaleBound::Keep).await?;
     assert!(outcome.deregistered.is_empty(), "{outcome:?}");
     assert!(drain(&mut rx).is_empty());
 
@@ -1760,7 +1788,11 @@ async fn wall_clock_step_does_not_count_toward_a_stale_run() -> TestResult {
         clocked_registrar(Box::new(|_, _| stale_answer())).await?;
     let first = clock.monotonic_millis();
     assert!(matches!(
-        stale_step(registrar.reconcile(&sup).await?, false, &mut rx)?,
+        stale_step(
+            registrar.reconcile(&sup, StaleBound::Keep).await?,
+            false,
+            &mut rx
+        )?,
         StaleStep::Retry
     ));
 
@@ -1768,7 +1800,11 @@ async fn wall_clock_step_does_not_count_toward_a_stale_run() -> TestResult {
     clock.advance(RETRY_STEP);
     assert!(
         matches!(
-            stale_step(registrar.reconcile(&sup).await?, false, &mut rx)?,
+            stale_step(
+                registrar.reconcile(&sup, StaleBound::Keep).await?,
+                false,
+                &mut rx
+            )?,
             StaleStep::Retry
         ),
         "a 4062 after a 700 s wall-clock step is retried"
@@ -1785,7 +1821,11 @@ async fn wall_clock_step_does_not_count_toward_a_stale_run() -> TestResult {
     let mut retries = 2;
     loop {
         clock.advance(RETRY_STEP);
-        match stale_step(registrar.reconcile(&sup).await?, false, &mut rx)? {
+        match stale_step(
+            registrar.reconcile(&sup, StaleBound::Keep).await?,
+            false,
+            &mut rx,
+        )? {
             StaleStep::Retry => retries += 1,
             StaleStep::Bound(span_secs) => {
                 assert_eq!(span_secs, (clock.monotonic_millis() - first) / 1000);
@@ -1809,7 +1849,7 @@ async fn refresh_prunes_a_refusal_the_routes_cleared() -> TestResult {
     let answer: Answer = Box::new(|_, attempt| if attempt == 0 { Ok(()) } else { stale_answer() });
     let (sup, clock, mut registrar, mut rx) = clocked_registrar(answer).await?;
     let public_key = *registrar.signing_key.public_key();
-    let first = registrar.reconcile(&sup).await?;
+    let first = registrar.reconcile(&sup, StaleBound::Keep).await?;
     assert!(
         first.registered.get(RELAY_A).is_some_and(Result::is_ok),
         "{first:?}"
@@ -1866,7 +1906,7 @@ async fn lost_ok_then_leaving_last_context_still_deregisters() -> TestResult {
     let (sink, mut rx) = publisher(system_clock(), answer);
     let mut registrar = registrar(sink, system_clock()).await?;
     let public_key = *registrar.signing_key.public_key();
-    let first = registrar.reconcile(&sup).await?;
+    let first = registrar.reconcile(&sup, StaleBound::Keep).await?;
     assert!(
         matches!(
             first.registered.get(RELAY_A),
@@ -1877,7 +1917,7 @@ async fn lost_ok_then_leaving_last_context_still_deregisters() -> TestResult {
     expect_publishes(&mut rx, 1).await?;
 
     assert!(sup.despawn_actor(&hex::encode(CTX_A)).await);
-    let second = registrar.reconcile(&sup).await?;
+    let second = registrar.reconcile(&sup, StaleBound::Keep).await?;
     assert!(
         second.deregistered.get(RELAY_A).is_some_and(Result::is_ok),
         "{second:?}"
@@ -1915,7 +1955,7 @@ async fn lost_deregistration_ok_then_register_reregisters() -> TestResult {
     let (sink, mut rx) = publisher(system_clock(), answer);
     let mut registrar = registrar(sink, system_clock()).await?;
     let public_key = *registrar.signing_key.public_key();
-    let first = registrar.reconcile(&sup).await?;
+    let first = registrar.reconcile(&sup, StaleBound::Keep).await?;
     assert!(
         first.registered.get(RELAY_A).is_some_and(Result::is_ok),
         "{first:?}"
@@ -1972,7 +2012,7 @@ async fn lost_deregistration_ok_then_same_set_returns_reregisters() -> TestResul
     let (sink, mut rx) = publisher(system_clock(), answer);
     let mut registrar = registrar(sink, system_clock()).await?;
     let public_key = *registrar.signing_key.public_key();
-    let first = registrar.reconcile(&sup).await?;
+    let first = registrar.reconcile(&sup, StaleBound::Keep).await?;
     assert!(
         first.registered.get(RELAY_A).is_some_and(Result::is_ok),
         "{first:?}"
@@ -1981,7 +2021,7 @@ async fn lost_deregistration_ok_then_same_set_returns_reregisters() -> TestResul
     let registered = verified_registration(&start[0], &public_key)?;
 
     assert!(sup.despawn_actor(&hex::encode(CTX_A)).await);
-    let left = registrar.reconcile(&sup).await?;
+    let left = registrar.reconcile(&sup, StaleBound::Keep).await?;
     assert!(
         matches!(
             left.deregistered.get(RELAY_A),
@@ -1992,7 +2032,7 @@ async fn lost_deregistration_ok_then_same_set_returns_reregisters() -> TestResul
     expect_publishes(&mut rx, 1).await?;
 
     create_context(&sup, CTX_A, PSEUDONYM_A, &[RELAY_A]).await?;
-    let back = registrar.reconcile(&sup).await?;
+    let back = registrar.reconcile(&sup, StaleBound::Keep).await?;
     assert!(
         back.registered.get(RELAY_A).is_some_and(Result::is_ok),
         "relay A is registered again: {back:?}"
@@ -2031,7 +2071,7 @@ async fn restarted_registrar_deregisters_a_recorded_relay() -> TestResult {
     )
     .await?;
     let public_key = *second.signing_key.public_key();
-    let outcome = second.reconcile(&sup).await?;
+    let outcome = second.reconcile(&sup, StaleBound::Keep).await?;
     assert!(
         outcome.deregistered.get(RELAY_A).is_some_and(Result::is_ok),
         "{outcome:?}"

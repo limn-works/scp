@@ -603,7 +603,7 @@ struct StaleRun {
 /// Whether [`PushRegistrar::forget_stale_refusals`] also drops the refusals
 /// recorded as [`RefusalCause::StaleBeyondSkew`] and every `4062` run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StaleBound {
+pub(crate) enum StaleBound {
     /// Keep them while their request is still the one the registrar sends.
     Keep,
     /// Drop them: a [`PushRegistrarTask::register`] or
@@ -782,7 +782,14 @@ impl<C: KeyCustody, S: Storage> PushRegistrar<C, S> {
         if new_token.is_empty() {
             return Err(PushMessageError::EmptyToken.into());
         }
-        self.prune_refusals(supervisor, StaleBound::Keep).await?;
+        let current = if self.enabled {
+            Box::pin(supervisor.push_routing_ids())
+                .await
+                .map_err(PushError::Routes)?
+        } else {
+            BTreeMap::new()
+        };
+        self.prune_refusals(current, StaleBound::Keep);
         let old_token = std::mem::replace(&mut self.token, new_token);
         let old_hash = token_hash(&old_token);
         let previous = std::mem::take(&mut self.accepted);
@@ -833,22 +840,23 @@ impl<C: KeyCustody, S: Storage> PushRegistrar<C, S> {
     /// published, because a registration built from a partial set would drop
     /// the wakes of the missing contexts, and a deregistration built from it
     /// would drop every wake on the relay.
+    ///
+    /// With [`StaleBound::Clear`] it first drops every refusal recorded as
+    /// [`RefusalCause::StaleBeyondSkew`] and every `4062` run, so each such
+    /// relay is sent its request again with a full window.
     pub(crate) async fn reconcile(
-        &mut self,
-        supervisor: &Supervisor,
-    ) -> Result<RelayOutcomes, PushError> {
-        self.reconcile_with(supervisor, StaleBound::Keep).await
-    }
-
-    /// [`Self::reconcile`], which with [`StaleBound::Clear`] first drops every
-    /// refusal recorded as [`RefusalCause::StaleBeyondSkew`] and every `4062`
-    /// run, so each such relay is sent its request again with a full window.
-    async fn reconcile_with(
         &mut self,
         supervisor: &Supervisor,
         stale_bound: StaleBound,
     ) -> Result<RelayOutcomes, PushError> {
-        let wanted = self.prune_refusals(supervisor, stale_bound).await?;
+        let current = if self.enabled {
+            Box::pin(supervisor.push_routing_ids())
+                .await
+                .map_err(PushError::Routes)?
+        } else {
+            BTreeMap::new()
+        };
+        let wanted = self.prune_refusals(current, stale_bound);
         let current_hash = token_hash(&self.token);
         let mut outcomes = RelayOutcomes::default();
 
@@ -939,33 +947,23 @@ impl<C: KeyCustody, S: Storage> PushRegistrar<C, S> {
         }
     }
 
-    /// Reads the routing IDs the registrar wants per relay (none while it is
-    /// disabled) and prunes `refused` and `stale_runs` against them under
-    /// the current token. Every operation that reads `refused` calls this
-    /// first, so none acts on a refusal a route change has already cleared.
-    ///
-    /// # Errors
-    ///
-    /// [`PushError::Routes`] when the routing-ID query fails; nothing is
-    /// pruned.
-    async fn prune_refusals(
+    /// Keeps the relays of `current` (the supervisor's routing IDs per relay,
+    /// or none while the registrar is disabled) that have a routing ID, and
+    /// prunes `refused` and `stale_runs` against them under the current
+    /// token. Every operation that reads `refused` calls this first, right
+    /// after it reads the routes, so none acts on a refusal a route change
+    /// has already cleared. Returns the routing IDs wanted per relay.
+    fn prune_refusals(
         &mut self,
-        supervisor: &Supervisor,
+        current: BTreeMap<String, BTreeSet<[u8; 32]>>,
         stale_bound: StaleBound,
-    ) -> Result<BTreeMap<String, BTreeSet<[u8; 32]>>, PushError> {
-        let current = if self.enabled {
-            Box::pin(supervisor.push_routing_ids())
-                .await
-                .map_err(PushError::Routes)?
-        } else {
-            BTreeMap::new()
-        };
+    ) -> BTreeMap<String, BTreeSet<[u8; 32]>> {
         let wanted: BTreeMap<String, BTreeSet<[u8; 32]>> = current
             .into_iter()
             .filter(|(_, routing_ids)| !routing_ids.is_empty())
             .collect();
         self.forget_stale_refusals(&wanted, stale_bound);
-        Ok(wanted)
+        wanted
     }
 
     /// Drops every refusal and every `4062` run whose request the registrar
@@ -1352,7 +1350,7 @@ impl<C: KeyCustody, S: Storage> PushRegistrar<C, S> {
     /// Runs one reconcile and logs every failure. Returns whether a retryable
     /// failure calls for a retry.
     async fn reconcile_and_log(&mut self, supervisor: &Supervisor) -> bool {
-        let outcome = self.reconcile(supervisor).await;
+        let outcome = self.reconcile(supervisor, StaleBound::Keep).await;
         log_outcome("reconcile", &outcome)
     }
 
@@ -1365,17 +1363,11 @@ impl<C: KeyCustody, S: Storage> PushRegistrar<C, S> {
             }
             RegistrarCommand::DeregisterAll { reply } => {
                 self.enabled = false;
-                (
-                    self.reconcile_with(supervisor, StaleBound::Clear).await,
-                    reply,
-                )
+                (self.reconcile(supervisor, StaleBound::Clear).await, reply)
             }
             RegistrarCommand::Register { reply } => {
                 self.enabled = true;
-                (
-                    self.reconcile_with(supervisor, StaleBound::Clear).await,
-                    reply,
-                )
+                (self.reconcile(supervisor, StaleBound::Clear).await, reply)
             }
         };
         let failed = log_outcome("command", &outcome);
