@@ -66,7 +66,7 @@ pub use self_host::{
 // lowering in `config`; the `pub use` brings them into crate-root scope for
 // both that path and external consumers.
 pub use config::{
-    DhtMode, ExplicitIdentity, IdentitySource, NatSlot, Node, NodeConfig, Reach, TlsMode,
+    DhtMode, ExplicitIdentity, IdentitySource, NatSlot, Node, NodeConfig, PushSlot, Reach, TlsMode,
     validate_reach_and_tls,
 };
 

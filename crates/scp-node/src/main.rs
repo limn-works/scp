@@ -37,11 +37,13 @@ use zeroize::Zeroizing;
 
 use scp_identity::DidCache;
 use scp_identity::dht::SequenceStore;
-use scp_node::{DhtMode, IdentitySource, Node, NodeConfig, Reach, TlsMode};
+use scp_node::{DhtMode, IdentitySource, Node, NodeConfig, PushSlot, Reach, TlsMode};
 use scp_platform::EncryptedStorage;
 use scp_platform::sqlite::{SqliteKeyCustody, SqliteStorage};
 use scp_transport::native::server::RelayServer;
 use scp_transport::native::storage::BlobStorageBackend;
+use scp_transport::relay::push_gate::PushProviders;
+use scp_transport::relay::push_store::PushRegistrationStore;
 use scp_transport::{shutdown, startup};
 
 // ---------------------------------------------------------------------------
@@ -260,9 +262,16 @@ ENVIRONMENT VARIABLES:
     SCP_RELAY_S3_BUCKET         S3 bucket name (required when backend=s3)
     SCP_RELAY_S3_PREFIX         S3 key prefix (default: blobs/)
     SCP_RELAY_PUSH_PLATFORMS    Push platforms the relay serves: none, apns, fcm, apns,fcm.
-                                Required in --relay-only mode: no default, and an unset or
-                                empty value exits 1. This build serves only 'none'; any
-                                platform exits 1. Full node mode does not read it
+                                Required in --relay-only and full node mode: no default,
+                                and an unset or empty value exits 1. A listed platform
+                                needs its SCP_RELAY_APNS_* or SCP_RELAY_FCM_* variables
+                                (scp-relay README). --self-host and --ephemeral do not
+                                read it and offer no push
+    SCP_RELAY_PUSH_STORE        Push registration store: sqlite. Read only in --relay-only
+                                mode, when a platform is listed
+    SCP_RELAY_PUSH_STORE_PATH   Absolute path of the sqlite push store. Read only in
+                                --relay-only mode. A full node keeps its push store at
+                                push.sqlite in its storage directory
     SCP_RELAY_URL               The relay's public WebSocket URL, which determines its
                                 reserved push routing ID (spec section 10.7.1, push
                                 registration protocol). Required in --relay-only mode:
@@ -509,6 +518,9 @@ async fn run_full_node_ephemeral() {
         encrypted_storage,
         // Ephemeral contract: in-memory blob, no persistence, env ignored.
         ephemeral_blob_backend(),
+        // Ephemeral mode offers no push: an enabled relay needs a durable
+        // registration store.
+        PushSlot::Disabled,
     )
     .await;
 }
@@ -588,6 +600,12 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
     // directory, the storage key, or a store, so a backend this build cannot
     // serve exits with nothing left on disk.
     let backend = or_exit(startup::backend_choice_from_env(CLOUD_BLOBS_FEATURE));
+    // The push platforms and their credentials load here, through the loaders
+    // `scp-relay` uses, for the same reason: an unset platform list or a bad
+    // credential exits before the storage directory exists (PUSH-012, spec
+    // §17.17.1 SCP-CAPSEL-8000). The store is the node's own, so the store
+    // variables are not read.
+    let push_senders = or_exit(startup::push_senders_from_env());
     let domain = require_domain();
     let http_addr = node_http_addr();
 
@@ -609,6 +627,10 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
     // is alive would fail with an advisory-lock conflict.
     let (storage_dir, _storage_key, node_storage_arc, custody) =
         init_persistent_storage(storage_path).await;
+
+    // Push registrations are relay data, kept beside the node's other stores
+    // in its storage directory (PUSH-012).
+    let push = or_exit(push_slot_from(push_senders, &storage_dir));
 
     tracing::info!(
         domain = %domain,
@@ -658,6 +680,7 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
                 did_method,
                 Arc::clone(&node_storage_arc),
                 blob_storage,
+                push,
             )
             .await;
         }
@@ -686,10 +709,52 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
                 did_method,
                 Arc::clone(&node_storage_arc),
                 blob_storage,
+                push,
             )
             .await;
         }
     }
+}
+
+/// The push registration store's file name in a full node's storage directory.
+const PUSH_STORE_FILE: &str = "push.sqlite";
+
+/// Lowers the push senders `SCP_RELAY_PUSH_PLATFORMS` selected onto the node's
+/// push slot, opening the registration store at [`PUSH_STORE_FILE`] in
+/// `storage_dir` when a platform is listed and opening nothing for `none`.
+///
+/// # Errors
+///
+/// [`startup::PushStartupError::StoreOpen`] when the store cannot be opened.
+/// Nothing falls back to another store (SCP-CAPSEL-8001).
+fn push_slot_from(
+    senders: startup::PushSenderSelection,
+    storage_dir: &std::path::Path,
+) -> Result<PushSlot, startup::StartupError> {
+    let (apns, fcm) = match senders {
+        startup::PushSenderSelection::Disabled => {
+            tracing::info!("push: none (SCP_RELAY_PUSH_PLATFORMS=none)");
+            return Ok(PushSlot::Disabled);
+        }
+        startup::PushSenderSelection::Enabled(senders) => (senders.apns, senders.fcm),
+    };
+    let path = storage_dir.join(PUSH_STORE_FILE);
+    let store = match PushRegistrationStore::open_sqlite(&path) {
+        Ok(store) => store,
+        Err(error) => return Err(startup::PushStartupError::StoreOpen { path, error }.into()),
+    };
+    // No field carries a credential, only which platforms have a sender.
+    tracing::info!(
+        apns = apns.is_some(),
+        fcm = fcm.is_some(),
+        store = %path.display(),
+        "push: enabled with the sqlite push store in the storage directory"
+    );
+    Ok(PushSlot::Enabled(Box::new(PushProviders {
+        store,
+        apns,
+        fcm,
+    })))
 }
 
 // ---------------------------------------------------------------------------
@@ -1093,6 +1158,9 @@ async fn run_node_with<
     // env). `startup::backend_choice_from_env` chose `backend` from
     // `SCP_RELAY_STORAGE_BACKEND`, which has no default.
     blob_storage: BlobStorageBackend,
+    // Whether the relay offers push, selected by the caller like
+    // `blob_storage` (PUSH-012).
+    push: PushSlot,
 ) {
     let use_self_signed = env_flag_is_truthy(env::var("SCP_NODE_TLS_SELF_SIGNED").ok().as_deref());
 
@@ -1167,6 +1235,7 @@ async fn run_node_with<
         bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
         http_bind_addr: Some(http_addr),
         projection_rate_limit: Some(projection_rate),
+        push,
         ..NodeConfig::defaults(
             Reach::Domain {
                 domain: domain.clone(),
@@ -1369,6 +1438,62 @@ mod tests {
             "ephemeral mode must use the in-memory blob backend (no persistence, \
              env ignored) — see the all-in-memory contract on run_full_node_ephemeral"
         );
+    }
+
+    /// PUSH-012: `none` lowers to the disabled slot and opens nothing; a
+    /// platform opens the push store at `push.sqlite` in the storage
+    /// directory; an enabled selection whose store cannot open is refused with
+    /// `StoreOpen` instead of falling back.
+    #[tokio::test]
+    async fn push_slot_keeps_the_store_in_the_storage_directory()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use scp_transport::relay::push::{ApnsConfig, ApnsEnvironment, ApnsSender};
+
+        let apns = || {
+            ApnsSender::new(ApnsConfig {
+                signing_key: scp_crypto::p256::P256SecretKey::random(&mut rand::rngs::OsRng),
+                key_id: "ABC123DEFG".to_owned(),
+                team_id: "DEF123GHIJ".to_owned(),
+                topic: "org.example.app".to_owned(),
+                environment: ApnsEnvironment::Sandbox,
+            })
+        };
+        let dir = tempfile::tempdir()?;
+
+        let disabled = push_slot_from(startup::PushSenderSelection::Disabled, dir.path());
+        assert!(matches!(disabled, Ok(PushSlot::Disabled)), "{disabled:?}");
+        assert!(!dir.path().join(PUSH_STORE_FILE).exists());
+
+        let enabled = push_slot_from(
+            startup::PushSenderSelection::Enabled(Box::new(startup::PushSenders {
+                apns: Some(apns()?),
+                fcm: None,
+            })),
+            dir.path(),
+        );
+        assert!(
+            matches!(&enabled, Ok(PushSlot::Enabled(p)) if p.apns.is_some() && p.fcm.is_none()),
+            "{enabled:?}"
+        );
+        assert!(dir.path().join(PUSH_STORE_FILE).exists());
+
+        let missing = dir.path().join("no-such-dir");
+        let refused = push_slot_from(
+            startup::PushSenderSelection::Enabled(Box::new(startup::PushSenders {
+                apns: Some(apns()?),
+                fcm: None,
+            })),
+            &missing,
+        );
+        assert!(
+            matches!(
+                &refused,
+                Err(startup::StartupError::Push(startup::PushStartupError::StoreOpen { path, .. }))
+                    if *path == missing.join(PUSH_STORE_FILE)
+            ),
+            "{refused:?}"
+        );
+        Ok(())
     }
 
     /// `SCP_NODE_SELF_HOST_NO_NAT` (and every opt-in self-host flag) is truthy

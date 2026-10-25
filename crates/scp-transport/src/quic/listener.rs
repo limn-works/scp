@@ -2607,6 +2607,59 @@ mod tests {
         handle.shutdown();
     }
 
+    /// PUSH-012 criterion 10 at the QUIC listener: with push enabled
+    /// (the production `KelPushVerifier`) and the handle reserving two bridge
+    /// entries, a PUBLISH at either entry's tier 3 push routing ID is answered
+    /// with `4060` before signature verification, because no Tier 3 envelope
+    /// opener exists yet (§10.7.1 "Tier 3 relays", "Tier 3 envelope"), and the
+    /// blob store holds nothing at that ID.
+    #[cfg(feature = "push-store")]
+    #[tokio::test]
+    async fn enabled_quic_listener_rejects_a_tier3_publish_with_4060() {
+        let fixture = crate::relay::push_gate::tier3_fixture().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (server_config, certs) = test_server_config();
+        let storage = Arc::new(InMemoryBlobStorage::new());
+        let listener = QuicListener::new(
+            QuicListenerConfig {
+                bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+                delivery_jitter_ms: 0,
+                push: PushRole::Enabled(push_gate::kel_service_for_tests(dir.path())),
+                ..QuicListenerConfig::defaults(fixture.live.clone())
+            },
+            Arc::clone(&storage),
+            subscription::new_registry(),
+            PublishRateLimiter::new(100),
+            rate_limit::new_connection_tracker(),
+            DidSlotRegistry::new(),
+        );
+        let (handle, addr) = listener.start(server_config).unwrap();
+        let connection = connect_client(addr, &certs).await;
+        for rid in [
+            fixture.entry_a.push_routing_id(),
+            fixture.entry_b.push_routing_id(),
+        ] {
+            let publish = ClientMessage::Publish {
+                ref_id: Some("push".into()),
+                routing_id: rid,
+                recipient_hint: None,
+                blob_ttl: 3600,
+                blob: vec![0x42; 64],
+            };
+            let responses = send_and_recv(&connection, &publish).await;
+            assert!(
+                matches!(
+                    responses.as_slice(),
+                    [RelayMessage::Err { code: 4060, ref_id: Some(r), .. }] if r == "push"
+                ),
+                "{responses:?}"
+            );
+            assert!(storage.query(&rid, None, 100).await.unwrap().is_empty());
+        }
+        connection.close(0u32.into(), b"done");
+        handle.shutdown();
+    }
+
     // -- Store-site wakes (§10.7.1 step 5, PUSH-008) --
     //
     // A DID record and an opaque blob reach storage through different gate

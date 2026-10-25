@@ -45,8 +45,11 @@ scp-transport = { path = "../scp-transport", version = "=0.1.0-beta.2", features
     # Ungated: `build_host_site_node` opens `BlobStorageBackend::sqlite` on the
     # path every `host_site()` consumer takes, and §17.17 requires a durable
     # blob backend on every shipped relay. `redb-blob` and `startup` come
-    # from `node-bin`.
+    # from `node-bin`. `push-store` is ungated for the same reason: an enabled
+    # `NodeConfig::push` carries the SQLite push registration store, the only
+    # shipped arm (§17.17.5, PUSH-012).
     "sqlite-blob",
+    "push-store",
 ] }
 # Durability-only + real backends ONLY (ADR-062 §Decision 6). `testing` is NO
 # LONGER enabled here: the production `Node::start` / first-start create path

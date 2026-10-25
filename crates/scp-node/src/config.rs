@@ -31,7 +31,7 @@ use scp_platform::traits::{KeyCustody, Storage};
 use scp_transport::nat::NetworkChangeDetector;
 use scp_transport::native::server::{RelayConfig, RelayError, RelayServer};
 use scp_transport::native::storage::BlobStorageBackend;
-use scp_transport::relay::push_gate::{LiveRelayUrl, RelayUrl};
+use scp_transport::relay::push_gate::{LiveRelayUrl, PushProviders, PushRole, RelayUrl};
 
 use crate::{
     ApplicationNode, DEFAULT_PROJECTION_RATE_LIMIT, NatStrategy, NoOpCustody, NoOpDidMethod,
@@ -282,6 +282,44 @@ pub enum NatSlot {
 }
 
 // ---------------------------------------------------------------------------
+// PushSlot — whether the node's relay offers push (typed capability slot)
+// ---------------------------------------------------------------------------
+
+/// Whether the node's embedded relay offers push (spec §10.7.1, PUSH-012).
+///
+/// The fail-safe value is [`Disabled`](PushSlot::Disabled) (ADR-052 M2): a
+/// relay stores no push token until its operator enables push. An enabled
+/// slot carries the registration store and the senders the caller built, so
+/// the node reads no environment variable and no credential file; the
+/// `scp-node` binary loads them through `scp_transport::startup`.
+#[derive(Debug)]
+pub enum PushSlot {
+    /// The relay offers no push and answers every PUBLISH to its reserved push
+    /// routing ID with `4063` `PUSH_NOT_SUPPORTED`. The fail-safe default.
+    Disabled,
+    /// The relay verifies and stores push registrations in
+    /// [`PushProviders::store`] and wakes devices through its senders.
+    /// [`Node::start`] fails with [`NodeError::InvalidConfig`] when the
+    /// providers hold no sender.
+    Enabled(Box<PushProviders>),
+}
+
+/// Starts the relay push role `slot` selects.
+///
+/// # Errors
+///
+/// [`NodeError::InvalidConfig`] when [`PushRole::start`] refuses the providers:
+/// an enabled slot with no sender, or a call outside a tokio runtime.
+fn start_push_slot(slot: PushSlot) -> Result<PushRole, NodeError> {
+    match slot {
+        PushSlot::Disabled => Ok(PushRole::Disabled),
+        PushSlot::Enabled(providers) => {
+            PushRole::start(*providers).map_err(|e| NodeError::InvalidConfig(format!("push: {e}")))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // NodeConfig — the one flat config object (ADR-052 §AC-3)
 // ---------------------------------------------------------------------------
 
@@ -422,6 +460,10 @@ pub struct NodeConfig<
     /// only ever by explicit choice, never by omission. Production nodes select a
     /// durable backend (Sqlite/redb/Postgres/S3; see spec §17.7).
     pub blob_storage: BlobStorageBackend,
+    /// Whether the relay offers push (§10.7.1). Defaults to
+    /// [`PushSlot::Disabled`]. Push registrations are relay data, as blobs
+    /// are, so the caller provides their store beside [`Self::blob_storage`].
+    pub push: PushSlot,
 }
 
 impl<K: KeyCustody, D: DidMethod, S: Storage> NodeConfig<K, D, S> {
@@ -430,7 +472,7 @@ impl<K: KeyCustody, D: DidMethod, S: Storage> NodeConfig<K, D, S> {
     ///
     /// Fail-safe defaults: `tls = TlsMode::SelfSigned`, `dht = DhtMode::Disabled`
     /// (no publish), every `Option` = `None`, `dht_gateways = []`,
-    /// `nat = NatSlot::Auto`.
+    /// `nat = NatSlot::Auto`, `push = PushSlot::Disabled`.
     ///
     /// This enables the spread idiom. Because `reach`/`identity`/`storage`/
     /// `blob_storage` are moved into the returned struct, the caller passes
@@ -473,6 +515,7 @@ impl<K: KeyCustody, D: DidMethod, S: Storage> NodeConfig<K, D, S> {
             nat: NatSlot::Auto,
             network_detector: None,
             blob_storage,
+            push: PushSlot::Disabled,
         }
     }
 }
@@ -538,6 +581,8 @@ struct ConfigTail {
     /// The caller's explicit blob backend selection, threaded verbatim to the
     /// relay build (never defaulted/fallen-back — SCP-CAPINJECT-010).
     blob_storage: BlobStorageBackend,
+    /// The started push role, set on the relay at both build paths.
+    push: PushRole,
 }
 
 /// Validates the config, returning a loud error for contradictory combinations
@@ -630,9 +675,16 @@ pub fn validate_reach_and_tls(reach: &Reach, tls: &TlsMode) -> Result<(), NodeEr
 ///
 /// `validate_reach_and_tls` borrows `config.reach` / `config.tls` and so MUST run
 /// **before** this function moves `config` — callers keep that ordering.
+///
+/// It also starts the push role, so an enabled push slot with no sender fails
+/// the start before identity resolution or any socket opens.
+///
+/// # Errors
+///
+/// [`NodeError::InvalidConfig`] from [`start_push_slot`].
 fn split_config<K: KeyCustody, D: DidMethod, S: Storage>(
     config: NodeConfig<K, D, S>,
-) -> (S, IdentitySource<K, D>, ConfigTail) {
+) -> Result<(S, IdentitySource<K, D>, ConfigTail), NodeError> {
     let NodeConfig {
         reach,
         identity,
@@ -655,7 +707,9 @@ fn split_config<K: KeyCustody, D: DidMethod, S: Storage>(
         nat,
         network_detector,
         blob_storage,
+        push,
     } = config;
+    let push = start_push_slot(push)?;
 
     let tail = ConfigTail {
         reach,
@@ -672,9 +726,10 @@ fn split_config<K: KeyCustody, D: DidMethod, S: Storage>(
         nat,
         network_detector,
         blob_storage,
+        push,
     };
 
-    (storage, identity, tail)
+    Ok((storage, identity, tail))
 }
 
 /// Resolves a [`NatSlot`] into the concrete `Arc<dyn NatStrategy>` the engine
@@ -829,6 +884,7 @@ where
         nat,
         network_detector,
         blob_storage,
+        push,
     } = tail;
 
     // The Reach selects the build path. `Domain` reproduces the former
@@ -855,6 +911,7 @@ where
                 nat,
                 network_detector,
                 blob_storage,
+                push,
             )
             .await
         }
@@ -887,6 +944,7 @@ where
                 nat,
                 network_detector,
                 blob_storage,
+                push,
                 skip_nat_probe,
             )
             .await
@@ -921,6 +979,7 @@ async fn build_node_domain<D, S>(
     nat: NatSlot,
     network_detector: Option<Arc<dyn NetworkChangeDetector>>,
     blob_storage: BlobStorageBackend,
+    push: PushRole,
 ) -> Result<ApplicationNode<S>, NodeError>
 where
     D: DidMethod + 'static,
@@ -971,6 +1030,7 @@ where
     let relay_config = RelayConfig {
         bind_addr,
         bridge_secret: Some(*bridge_secret),
+        push,
         ..RelayConfig::defaults(LiveRelayUrl::new(relay_url))
     };
 
@@ -1105,6 +1165,7 @@ async fn build_node_no_domain<D, S>(
     nat: NatSlot,
     network_detector: Option<Arc<dyn NetworkChangeDetector>>,
     blob_storage: BlobStorageBackend,
+    push: PushRole,
     skip_nat_probe: bool,
 ) -> Result<ApplicationNode<S>, NodeError>
 where
@@ -1134,6 +1195,7 @@ where
     let relay_config = RelayConfig {
         bind_addr,
         bridge_secret: Some(*bridge_secret),
+        push,
         ..RelayConfig::defaults(LiveRelayUrl::new(relay_url))
     };
 
@@ -1268,7 +1330,7 @@ impl Node {
         // `validate_reach_and_tls` borrows `config.reach` / `config.tls`, so it MUST
         // run before `split_config` moves `config`.
         validate_reach_and_tls(&config.reach, &config.tls)?;
-        let (storage, identity, tail) = split_config(config);
+        let (storage, identity, tail) = split_config(config)?;
 
         // Production constructor: `ProtocolRepository::new` (the only difference
         // from `start_for_testing`). Identity is resolved against the storage,
@@ -1354,7 +1416,7 @@ impl Node {
         // `validate_reach_and_tls` borrows `config.reach` / `config.tls`, so it MUST
         // run before `split_config` moves `config`.
         validate_reach_and_tls(&config.reach, &config.tls)?;
-        let (storage, identity, tail) = split_config(config);
+        let (storage, identity, tail) = split_config(config)?;
 
         // Testing constructor: `ProtocolRepository::new_for_testing` (the only
         // difference from `start`). The build then flows through the same engine.
@@ -1766,6 +1828,197 @@ mod tests {
         assert!(c.dht_gateways.is_empty());
         #[cfg(feature = "http3")]
         assert!(c.http3.is_none());
+        assert!(
+            matches!(c.push, PushSlot::Disabled),
+            "push fail-safe (no push token stored)"
+        );
+    }
+
+    // --- Push slot (PUSH-012 criterion 9) -------------------------------------
+
+    /// An APNs sender over a fresh P-256 key. Building it makes no request.
+    fn apns_sender() -> scp_transport::relay::push::ApnsSender {
+        use scp_transport::relay::push::{ApnsConfig, ApnsEnvironment, ApnsSender};
+        ApnsSender::new(ApnsConfig {
+            signing_key: scp_crypto::p256::P256SecretKey::random(&mut rand::rngs::OsRng),
+            key_id: "ABC123DEFG".to_owned(),
+            team_id: "DEF123GHIJ".to_owned(),
+            topic: "org.example.app".to_owned(),
+            environment: ApnsEnvironment::Sandbox,
+        })
+        .unwrap()
+    }
+
+    /// An enabled push slot over a SQLite store at `dir/push.sqlite`.
+    fn enabled_push(
+        dir: &std::path::Path,
+        apns: Option<scp_transport::relay::push::ApnsSender>,
+    ) -> PushSlot {
+        let store = scp_transport::relay::push_store::PushRegistrationStore::open_sqlite(
+            &dir.join("push.sqlite"),
+        )
+        .unwrap();
+        PushSlot::Enabled(Box::new(PushProviders {
+            store,
+            apns,
+            fcm: None,
+        }))
+    }
+
+    /// Sends a malformed PUBLISH to `node`'s reserved push routing ID over the
+    /// relay's WebSocket listener and returns the error code it answers.
+    async fn push_publish_reply<S: Storage + 'static>(node: &crate::ApplicationNode<S>) -> u16 {
+        use futures::{SinkExt as _, StreamExt as _};
+        use scp_relay_client::{ClientMessage, RelayMessage};
+        use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest as _};
+
+        let routing_id = RelayUrl::new(&node.relay_url()).unwrap().push_routing_id();
+        let mut request = format!("ws://{}/scp/v1", node.relay().bound_addr())
+            .into_client_request()
+            .unwrap();
+        request.headers_mut().insert(
+            "Authorization",
+            format!("Bearer {}", node.bridge_token_hex().as_str())
+                .parse()
+                .unwrap(),
+        );
+        let (ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        let (mut sink, mut stream) = ws.split();
+        let publish = ClientMessage::Publish {
+            ref_id: Some("push".to_owned()),
+            routing_id,
+            recipient_hint: None,
+            blob_ttl: 3600,
+            blob: vec![0xC1],
+        };
+        sink.send(Message::Binary(publish.to_bytes().unwrap()))
+            .await
+            .unwrap();
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let Message::Binary(bytes) = frame else {
+            panic!("expected a binary frame, got {frame:?}");
+        };
+        match RelayMessage::from_bytes(&bytes).unwrap() {
+            RelayMessage::Err { code, .. } => code,
+            other => panic!("expected an error reply to a malformed push message: {other:?}"),
+        }
+    }
+
+    /// A no-domain node started with push enabled hands the push role to its
+    /// relay: a malformed PUBLISH at the reserved push routing ID reaches the
+    /// push gate, which refuses it with a push code other than `4063`. The
+    /// same node started with the default slot answers `4063`.
+    #[tokio::test]
+    async fn no_domain_node_with_push_enabled_serves_the_push_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::start_for_testing(NodeConfig {
+            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            push: enabled_push(dir.path(), Some(apns_sender())),
+            ..NodeConfig::defaults(
+                Reach::Local,
+                generate_identity(),
+                InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
+            )
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(node.state.relay_config.push, PushRole::Enabled(_)),
+            "the relay config must carry the enabled push role"
+        );
+        let reply = push_publish_reply(&node).await;
+        assert_ne!(
+            reply,
+            scp_relay_client::code::PUSH_NOT_SUPPORTED,
+            "the no-domain relay did not receive its push role"
+        );
+        node.shutdown();
+
+        let disabled = Node::start_for_testing(NodeConfig {
+            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            ..NodeConfig::defaults(
+                Reach::Local,
+                generate_identity(),
+                InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
+            )
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            push_publish_reply(&disabled).await,
+            scp_relay_client::code::PUSH_NOT_SUPPORTED,
+            "a node on the default slot offers no push"
+        );
+        disabled.shutdown();
+    }
+
+    /// A domain node started with push enabled hands the push role to its
+    /// relay, which serves the reserved push routing ID of its `wss://` URL
+    /// through the push gate.
+    #[tokio::test]
+    async fn domain_node_with_push_enabled_serves_the_push_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::start_for_testing(NodeConfig {
+            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            push: enabled_push(dir.path(), Some(apns_sender())),
+            ..NodeConfig::defaults(
+                Reach::Domain {
+                    domain: "config-push.example.com".to_owned(),
+                },
+                generate_identity(),
+                InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
+            )
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(node.state.relay_config.push, PushRole::Enabled(_)),
+            "the relay config must carry the enabled push role"
+        );
+        let reply = push_publish_reply(&node).await;
+        assert_ne!(
+            reply,
+            scp_relay_client::code::PUSH_NOT_SUPPORTED,
+            "the domain relay did not receive its push role"
+        );
+        node.shutdown();
+    }
+
+    /// An enabled push slot with no sender fails the start with
+    /// `InvalidConfig`: a relay that wakes no platform would accept
+    /// registrations it can never serve.
+    #[tokio::test]
+    async fn push_enabled_with_no_sender_is_invalid_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = Node::start_for_testing(NodeConfig {
+            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            push: enabled_push(dir.path(), None),
+            ..NodeConfig::defaults(
+                Reach::Local,
+                generate_identity(),
+                InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
+            )
+        })
+        .await;
+        match result {
+            Err(NodeError::InvalidConfig(message)) => assert!(
+                message.contains("no push sender"),
+                "the error must name the missing sender: {message}"
+            ),
+            Err(other) => panic!("expected InvalidConfig, got {other:?}"),
+            Ok(node) => {
+                node.shutdown();
+                panic!("a push slot with no sender must not start");
+            }
+        }
     }
 
     // --- Test 10: Domain + Plaintext is a loud config error ------------------

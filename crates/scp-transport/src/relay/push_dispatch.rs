@@ -163,6 +163,11 @@ mod enabled {
         /// nowhere to run its lookup and drains.
         #[error("the push service must start inside a tokio runtime")]
         NoRuntime,
+        /// A relay enabled push with no sender, so it would accept
+        /// registrations for platforms it can never wake. Returned by
+        /// [`PushRole::start`](crate::relay::push_gate::PushRole::start).
+        #[error("push is enabled with no push sender configured")]
+        NoSender,
         /// Two configured senders wake the same platform, so the service
         /// could not tell which one a token's wakes go through.
         #[error("two push senders are configured for {platform:?}")]

@@ -26,9 +26,8 @@ use tracing_subscriber::EnvFilter;
 
 use crate::native::server::{RelayConfig, RelayError};
 use crate::native::storage::{BlobStorageBackend, StorageError};
-use crate::relay::push::PushSender;
-use crate::relay::push_dispatch::{PushService, PushServiceError};
-use crate::relay::push_gate::{LiveRelayUrl, PushRole, PushServiceConfig, RelayUrl};
+use crate::relay::push_dispatch::PushServiceError;
+use crate::relay::push_gate::{LiveRelayUrl, PushProviders, PushRole, RelayUrl};
 use crate::relay::push_store::{PushRegistrationStore, PushStoreError};
 use crate::shutdown::ShutdownSignalError;
 
@@ -1115,6 +1114,84 @@ fn push_selection_from(
         return Ok(PushSelection::Disabled);
     };
     let store = push_store_from(lookup)?;
+    let (apns, fcm) = senders_for(platforms, lookup)?;
+    Ok(PushSelection::Enabled(Box::new(PushBackends {
+        store,
+        apns,
+        fcm,
+    })))
+}
+
+/// The push senders `SCP_RELAY_PUSH_PLATFORMS` selects, for a caller that
+/// provides the registration store itself (an `scp-node` full node keeps it in
+/// its instance's storage directory).
+///
+/// `Debug` prints no credential: each sender's own `Debug` omits its key, its
+/// JWT or access token, and every device token.
+#[derive(Debug)]
+pub enum PushSenderSelection {
+    /// `none`: the relay offers no push.
+    Disabled,
+    /// One or both platforms. At least one sender is present.
+    Enabled(Box<PushSenders>),
+}
+
+/// The senders of an enabled [`PushSenderSelection`], one field per platform.
+#[derive(Debug)]
+pub struct PushSenders {
+    /// The APNs sender, when the platform list names `apns`.
+    pub apns: Option<crate::relay::push::ApnsSender>,
+    /// The FCM sender, when the platform list names `fcm`.
+    pub fcm: Option<crate::relay::push::FcmSender>,
+}
+
+/// Reads the push platform list and each listed platform's credentials from
+/// the environment, through the same loaders as [`push_selection_from_env`].
+///
+/// It reads `SCP_RELAY_PUSH_PLATFORMS` and the `SCP_RELAY_APNS_*` and
+/// `SCP_RELAY_FCM_*` variables in that function's table, and never
+/// `SCP_RELAY_PUSH_STORE` or `SCP_RELAY_PUSH_STORE_PATH`: the caller provides
+/// the store. Like that function, it opens no store and makes no network
+/// request.
+///
+/// # Errors
+///
+/// As [`push_selection_from_env`], less the store variants:
+/// [`StartupError::Push`] for the first missing or invalid value, and
+/// [`StartupError::InvalidValue`] for a value that is not UTF-8.
+pub fn push_senders_from_env() -> Result<PushSenderSelection, StartupError> {
+    push_senders_from(&|var| env::var_os(var))
+}
+
+/// Reads the platform list and senders through `lookup`.
+fn push_senders_from(
+    lookup: &dyn Fn(&'static str) -> Option<OsString>,
+) -> Result<PushSenderSelection, StartupError> {
+    let platforms = match lookup(PUSH_PLATFORMS_VAR) {
+        None => return Err(PushStartupError::SelectionMissing.into()),
+        Some(raw) => parse_push_platforms(&utf8(PUSH_PLATFORMS_VAR, raw)?)?,
+    };
+    let Some(platforms) = platforms else {
+        return Ok(PushSenderSelection::Disabled);
+    };
+    let (apns, fcm) = senders_for(platforms, lookup)?;
+    Ok(PushSenderSelection::Enabled(Box::new(PushSenders {
+        apns,
+        fcm,
+    })))
+}
+
+/// Builds one sender for each platform in `platforms`.
+fn senders_for(
+    platforms: PushPlatforms,
+    lookup: &dyn Fn(&'static str) -> Option<OsString>,
+) -> Result<
+    (
+        Option<crate::relay::push::ApnsSender>,
+        Option<crate::relay::push::FcmSender>,
+    ),
+    StartupError,
+> {
     let apns = if platforms.apns {
         Some(apns_sender_from(lookup)?)
     } else {
@@ -1125,11 +1202,7 @@ fn push_selection_from(
     } else {
         None
     };
-    Ok(PushSelection::Enabled(Box::new(PushBackends {
-        store,
-        apns,
-        fcm,
-    })))
+    Ok((apns, fcm))
 }
 
 /// Reads variable `var` through `lookup` as a required, non-blank value,
@@ -1355,9 +1428,10 @@ fn check_owner_only(
 /// Builds the relay's push role from `selection`.
 ///
 /// [`PushSelection::Disabled`] yields [`PushRole::Disabled`]. An enabled
-/// selection opens the SQLite push registration store at its path, wires the
-/// production `KelPushVerifier` (spec §10.7.1 step 3, PUSH-005) and the
-/// senders the selection built, and yields [`PushRole::Enabled`]. No other
+/// selection opens the SQLite push registration store at its path and hands
+/// it, with the senders the selection built, to [`PushRole::start`], which
+/// wires the production `KelPushVerifier` (spec §10.7.1 step 3, PUSH-005) and
+/// yields [`PushRole::Enabled`]. No other
 /// store arm is reachable: the in-memory arm compiles only under the
 /// `testing` feature (persistence spec §17.17.2).
 ///
@@ -1380,18 +1454,8 @@ pub fn push_role_from(selection: PushSelection) -> Result<PushRole, StartupError
             Err(error) => return Err(PushStartupError::StoreOpen { path, error }.into()),
         },
     };
-    let senders: Vec<PushSender> = apns
-        .map(PushSender::Apns)
-        .into_iter()
-        .chain(fcm.map(PushSender::Fcm))
-        .collect();
-    let service = PushService::start(PushServiceConfig {
-        store,
-        verifier: Arc::new(scp_identity::push_verify::KelPushVerifier),
-        senders: Arc::from(senders),
-    })
-    .map_err(|error| PushStartupError::ServiceStart { error })?;
-    Ok(PushRole::Enabled(service))
+    PushRole::start(PushProviders { store, apns, fcm })
+        .map_err(|error| PushStartupError::ServiceStart { error }.into())
 }
 
 /// Logs the push role a relay starts with. No field carries a credential.
@@ -1908,8 +1972,8 @@ mod push_tests {
         APNS_ENVIRONMENT_VAR, APNS_KEY_ID_VAR, APNS_KEY_PATH_VAR, APNS_TEAM_ID_VAR, APNS_TOPIC_VAR,
         FCM_PROJECT_ID_VAR, FCM_SERVICE_ACCOUNT_PATH_VAR, MAX_CREDENTIAL_FILE_BYTES,
         PUSH_PLATFORMS_VAR, PUSH_STORE_PATH_VAR, PUSH_STORE_VAR, PushPlatforms, PushSelection,
-        PushStartupError, PushStoreChoice, StartupError, parse_push_platforms, push_role_from,
-        push_selection_from,
+        PushSenderSelection, PushStartupError, PushStoreChoice, StartupError, parse_push_platforms,
+        push_role_from, push_selection_from, push_senders_from,
     };
     use crate::relay::log_capture::LogCapture;
     use crate::relay::push_gate::PushRole;
@@ -2096,6 +2160,65 @@ mod push_tests {
                 push_role_from(selection).unwrap(),
                 PushRole::Disabled
             ));
+        }
+    }
+
+    /// PUSH-012 criterion 9: the sender loader an `scp-node` full node uses
+    /// reads the platform list and each platform's credentials through the
+    /// same loaders as `push_selection_from`, and never the store variables,
+    /// because the node provides the store. `none` reads nothing else, an unset
+    /// list is refused under SCP-CAPSEL-8000, and a missing credential variable
+    /// is named.
+    #[test]
+    fn push_senders_read_the_credentials_and_no_store_variable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut env = Env::full(dir.path());
+        let read = std::cell::RefCell::new(Vec::new());
+        let selection = push_senders_from(&|var| {
+            read.borrow_mut().push(var);
+            env.vars.get(var).cloned()
+        })
+        .unwrap();
+        let PushSenderSelection::Enabled(senders) = selection else {
+            panic!("expected both senders: {selection:?}");
+        };
+        assert!(senders.apns.is_some() && senders.fcm.is_some());
+        let read = read.into_inner();
+        assert!(read.contains(&APNS_KEY_PATH_VAR), "{read:?}");
+        assert!(read.contains(&FCM_SERVICE_ACCOUNT_PATH_VAR), "{read:?}");
+        assert!(!read.contains(&PUSH_STORE_VAR), "{read:?}");
+        assert!(!read.contains(&PUSH_STORE_PATH_VAR), "{read:?}");
+        assert!(!dir.path().join("push.sqlite").exists());
+
+        env.unset(PUSH_STORE_VAR).unset(PUSH_STORE_PATH_VAR);
+        assert!(matches!(
+            push_senders_from(&|var| env.vars.get(var).cloned()),
+            Ok(PushSenderSelection::Enabled(_))
+        ));
+
+        env.unset(APNS_KEY_ID_VAR);
+        assert!(matches!(
+            push_senders_from(&|var| env.vars.get(var).cloned()),
+            Err(StartupError::Push(PushStartupError::ApnsKeyIdMissing))
+        ));
+
+        env.set(PUSH_PLATFORMS_VAR, "none");
+        let read = std::cell::RefCell::new(Vec::new());
+        let selection = push_senders_from(&|var| {
+            read.borrow_mut().push(var);
+            env.vars.get(var).cloned()
+        })
+        .unwrap();
+        assert!(matches!(selection, PushSenderSelection::Disabled));
+        assert_eq!(*read.borrow(), vec![PUSH_PLATFORMS_VAR]);
+
+        env.unset(PUSH_PLATFORMS_VAR);
+        match push_senders_from(&|var| env.vars.get(var).cloned()) {
+            Err(StartupError::Push(error)) => {
+                assert!(matches!(error, PushStartupError::SelectionMissing));
+                assert_eq!(error.rule(), "SCP-CAPSEL-8000");
+            }
+            other => panic!("expected SelectionMissing, got {other:?}"),
         }
     }
 
@@ -2487,7 +2610,7 @@ mod push_tests {
         let platforms: Vec<PushPlatform> = service
             .senders
             .iter()
-            .map(super::PushSender::platform)
+            .map(crate::relay::push::PushSender::platform)
             .collect();
         assert_eq!(platforms, vec![PushPlatform::Apns, PushPlatform::Fcm]);
         let relays_store = service.store.clone();

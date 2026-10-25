@@ -514,4 +514,57 @@ mod tests {
             1
         );
     }
+
+    /// PUSH-012 criterion 10 at the WebTransport listener: with push enabled
+    /// (the production `KelPushVerifier`) and the handle reserving two bridge
+    /// entries, a PUBLISH at either entry's tier 3 push routing ID is answered
+    /// with `4060` before signature verification, because no Tier 3 envelope
+    /// opener exists yet (§10.7.1 "Tier 3 relays", "Tier 3 envelope"), and the
+    /// blob store holds nothing at that ID.
+    #[cfg(feature = "push-store")]
+    #[tokio::test]
+    async fn enabled_webtransport_listener_rejects_a_tier3_publish_with_4060() {
+        use super::super::session::DispatchResult;
+        use scp_relay_client::{ClientMessage, RelayMessage};
+        let fixture = crate::relay::push_gate::tier3_fixture().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(InMemoryBlobStorage::new());
+        let mut config = WebTransportListenerConfig::defaults(fixture.live.clone());
+        config.session_config.delivery_jitter_ms = 0;
+        config.session_config.push = crate::relay::push_gate::PushRole::Enabled(
+            crate::relay::push_gate::kel_service_for_tests(dir.path()),
+        );
+        let listener = WebTransportListener::new(
+            config,
+            Arc::clone(&storage),
+            crate::relay::subscription::new_registry(),
+            PublishRateLimiter::new(100),
+            crate::relay::rate_limit::new_connection_tracker(),
+            DidSlotRegistry::new(),
+        );
+        let mut session =
+            listener.create_session(IpAddr::V4(Ipv4Addr::LOCALHOST), CancellationToken::new());
+        session.mark_active();
+        for rid in [
+            fixture.entry_a.push_routing_id(),
+            fixture.entry_b.push_routing_id(),
+        ] {
+            let publish = ClientMessage::Publish {
+                ref_id: Some("push".to_owned()),
+                routing_id: rid,
+                recipient_hint: None,
+                blob_ttl: 60,
+                blob: vec![0x42; 64],
+            };
+            let reply = session.dispatch_message_multi(&publish).await.unwrap();
+            assert!(
+                matches!(
+                    &reply,
+                    DispatchResult::Single(RelayMessage::Err { code: 4060, .. })
+                ),
+                "{reply:?}"
+            );
+            assert!(storage.query(&rid, None, 100).await.unwrap().is_empty());
+        }
+    }
 }

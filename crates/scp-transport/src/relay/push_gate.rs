@@ -56,7 +56,7 @@ use scp_relay_client::{RelayMessage, code};
 #[cfg(feature = "push-store")]
 use super::push::PushSender;
 #[cfg(feature = "push-store")]
-use super::push_dispatch::PushService;
+use super::push_dispatch::{PushService, PushServiceError};
 #[cfg(feature = "push-store")]
 use super::push_endpoint::{EndpointError, parse_endpoint};
 #[cfg(feature = "push-store")]
@@ -256,6 +256,57 @@ impl PushServiceConfig {
     #[must_use]
     pub fn sender_for(&self, platform: PushPlatform) -> Option<&PushSender> {
         self.senders.iter().find(|s| s.platform() == platform)
+    }
+}
+
+/// What a caller provides to enable push on a relay (PUSH-012): the
+/// registration store it opened and the senders it built from the credentials
+/// it loaded.
+///
+/// The caller owns every choice here: the store's location and the credential
+/// sources. The verifier is not a field: [`PushRole::start`] always wires the
+/// shipped `KelPushVerifier` (spec §17.17.5), so no caller can hand a relay a
+/// verifier that accepts everything. One field per platform makes two senders
+/// for one platform unrepresentable.
+#[cfg(feature = "push-store")]
+#[derive(Debug)]
+pub struct PushProviders {
+    /// The registration store (PUSH-006).
+    pub store: PushRegistrationStore,
+    /// The APNs sender (PUSH-010), or `None` when the relay does not wake APNs
+    /// devices.
+    pub apns: Option<super::push_apns::ApnsSender>,
+    /// The FCM sender (PUSH-011), or `None` when the relay does not wake FCM
+    /// devices.
+    pub fcm: Option<super::push_fcm::FcmSender>,
+}
+
+#[cfg(feature = "push-store")]
+impl PushRole {
+    /// Starts the push service on `providers` and returns the enabled role.
+    ///
+    /// # Errors
+    ///
+    /// - [`PushServiceError::NoSender`] when `providers` holds no sender: a
+    ///   relay that enabled push and wakes no platform would accept
+    ///   registrations it can never serve.
+    /// - [`PushServiceError::NoRuntime`] outside a tokio runtime.
+    pub fn start(providers: PushProviders) -> Result<Self, PushServiceError> {
+        let PushProviders { store, apns, fcm } = providers;
+        let senders: Vec<PushSender> = apns
+            .map(PushSender::Apns)
+            .into_iter()
+            .chain(fcm.map(PushSender::Fcm))
+            .collect();
+        if senders.is_empty() {
+            return Err(PushServiceError::NoSender);
+        }
+        let service = PushService::start(PushServiceConfig {
+            store,
+            verifier: Arc::new(scp_identity::push_verify::KelPushVerifier),
+            senders: Arc::from(senders),
+        })?;
+        Ok(Self::Enabled(service))
     }
 }
 
@@ -856,6 +907,80 @@ mod tests {
     use scp_protocol::discovery::push::push_registration_routing_id;
 
     use super::*;
+
+    /// An APNs sender over a fresh P-256 key. Building it makes no request.
+    #[cfg(feature = "push-store")]
+    fn apns_sender() -> crate::relay::push::ApnsSender {
+        use crate::relay::push::{ApnsConfig, ApnsEnvironment, ApnsSender};
+        ApnsSender::new(ApnsConfig {
+            signing_key: scp_crypto::p256::P256SecretKey::random(&mut rand::rngs::OsRng),
+            key_id: "ABC123DEFG".to_owned(),
+            team_id: "DEF123GHIJ".to_owned(),
+            topic: "org.example.app".to_owned(),
+            environment: ApnsEnvironment::Sandbox,
+        })
+        .unwrap()
+    }
+
+    /// PUSH-012: `PushRole::start` refuses providers with no sender, and
+    /// otherwise starts an enabled role over the providers' store and senders
+    /// with the shipped `KelPushVerifier`.
+    #[cfg(feature = "push-store")]
+    #[tokio::test]
+    async fn push_role_start_needs_a_sender_and_wires_the_kel_verifier() {
+        use crate::relay::push_dispatch::PushServiceError;
+        use crate::relay::push_store::PushRegistrationStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = PushRegistrationStore::open_sqlite(&dir.path().join("push.sqlite")).unwrap();
+        let refused = PushRole::start(PushProviders {
+            store: store.clone(),
+            apns: None,
+            fcm: None,
+        });
+        assert!(
+            matches!(refused, Err(PushServiceError::NoSender)),
+            "{refused:?}"
+        );
+
+        let role = PushRole::start(PushProviders {
+            store,
+            apns: Some(apns_sender()),
+            fcm: None,
+        })
+        .unwrap();
+        let PushRole::Enabled(service) = &role else {
+            unreachable!("PushRole::start returned {role:?}");
+        };
+        let config = service.config();
+        assert!(
+            format!("{:?}", config.verifier).contains("KelPushVerifier"),
+            "{:?}",
+            config.verifier
+        );
+        let platforms: Vec<PushPlatform> =
+            config.senders.iter().map(PushSender::platform).collect();
+        assert_eq!(platforms, vec![PushPlatform::Apns]);
+    }
+
+    /// Outside a tokio runtime `PushRole::start` returns `NoRuntime`.
+    #[cfg(feature = "push-store")]
+    #[test]
+    fn push_role_start_outside_a_runtime_is_typed() {
+        use crate::relay::push_dispatch::PushServiceError;
+        use crate::relay::push_store::PushRegistrationStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let result = PushRole::start(PushProviders {
+            store: PushRegistrationStore::open_sqlite(&dir.path().join("push.sqlite")).unwrap(),
+            apns: Some(apns_sender()),
+            fcm: None,
+        });
+        assert!(
+            matches!(result, Err(PushServiceError::NoRuntime)),
+            "{result:?}"
+        );
+    }
 
     #[test]
     fn relay_url_from_relay_service_matches_relay_url_new() {
