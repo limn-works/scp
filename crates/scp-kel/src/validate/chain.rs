@@ -20,6 +20,16 @@ pub(super) struct ChainEvent {
     pub(super) digest: [u8; 32],
     pub(super) sequence: u64,
     pub(super) kind: EventKind,
+    /// Whether this event carries a `StandingRoot` signer group: on a
+    /// validated event, a threshold of signatures verifying against the root
+    /// standing at its predecessor (§9.7.4.2 R6's rank-1 test). Only a
+    /// `CommitmentRollover` and a `RootRecovery{CoSigns}` carry one. On the
+    /// unsigned-candidate path no signature was verified, and no reader of a
+    /// `ValidatedChange` sees this flag.
+    pub(super) reveal_root_cosigned: bool,
+    /// The byte length of the event unit that carried the event, which R9's
+    /// byte bound counts.
+    pub(super) unit_len: u64,
     /// The root standing after the event.
     pub(super) root: Arc<InstalledRootSet>,
     /// The commitment standing after the event.
@@ -40,6 +50,32 @@ pub(super) struct ResolvedKeys {
     pub(super) active: [u8; 33],
     /// The count of `Current` `RootMember` entries.
     pub(super) root_count: u32,
+}
+
+/// One event of a [`ValidatedChain`], as fork ranking and retention read it
+/// (§9.7.4.2 R6, R9). `pub` only inside the private `validate` module: no
+/// caller outside scp-kel reads a chain's events.
+#[derive(Debug, Clone, Copy)]
+pub struct EventView {
+    /// The event's preimage digest, which every comparison reads (R9).
+    pub digest: [u8; 32],
+    /// The event's sequence.
+    pub sequence: u64,
+    /// The event's kind.
+    pub kind: EventKind,
+    /// Whether this event carries a `StandingRoot` signer group, which on a
+    /// validated chain verified against the root standing at its
+    /// predecessor (R6).
+    pub reveal_root_cosigned: bool,
+    /// The byte length of the unit that carried the event (R9).
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "read by AcceptedChainHolder, which stays unexported until R9's retention bounds land with it (SCP-310)"
+        )
+    )]
+    pub unit_len: u64,
 }
 
 /// What one position of a valid chain leaves standing, read by
@@ -220,6 +256,67 @@ impl ValidatedChain {
             .map(StandingState::of)
     }
 
+    /// Every event of the chain, from the inception to the head.
+    pub(crate) fn events(&self) -> impl Iterator<Item = EventView> + '_ {
+        std::iter::once(&self.state.inception)
+            .chain(&self.state.later)
+            .map(|event| EventView {
+                digest: event.digest,
+                sequence: event.sequence,
+                kind: event.kind,
+                reveal_root_cosigned: event.reveal_root_cosigned,
+                unit_len: event.unit_len,
+            })
+    }
+
+    /// The count of leading events this chain and `other` share, compared
+    /// by preimage digest and never by bytes (§9.7.4.2 R9: "An event is
+    /// identified by its preimage digest, and every comparison reads that
+    /// digest and never the bytes"). Zero where the inceptions differ,
+    /// which only chains of two identifiers can show.
+    pub(crate) fn shared_prefix_len(&self, other: &Self) -> usize {
+        self.events()
+            .zip(other.events())
+            .take_while(|(left, right)| left.digest == right.digest)
+            .count()
+    }
+
+    /// `longer` with this chain's copy of every leading event the two share
+    /// by preimage digest, and `longer`'s own events past them: where this
+    /// chain is a prefix of `longer`, this chain extended by `longer`'s
+    /// further events.
+    ///
+    /// §9.7.4.2 R9: "a party holding a valid event that receives a
+    /// byte-different valid event with the same digest keeps the copy it
+    /// holds". Two events of one digest carry one preimage, so every state
+    /// `longer` derived from them is the state this chain derived; only the
+    /// copy, which [`EventView::unit_len`] reads, differs.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "called by AcceptedChainHolder, which stays unexported until R9's retention bounds land with it (SCP-310)"
+        )
+    )]
+    pub(crate) fn extended_by(&self, longer: Self) -> Self {
+        let mut state = longer.state;
+        if state.inception.digest == self.state.inception.digest {
+            state.inception = self.state.inception.clone();
+            for (theirs, mine) in state.later.iter_mut().zip(&self.state.later) {
+                if theirs.digest != mine.digest {
+                    break;
+                }
+                *theirs = mine.clone();
+            }
+        }
+        Self { state }
+    }
+
+    /// The count of events the chain holds, the inception included.
+    pub(crate) fn len(&self) -> usize {
+        self.state.later.len().saturating_add(1)
+    }
+
     /// The position the next event takes: the count of events held.
     pub(super) fn next_position(&self) -> u64 {
         self.head().sequence.saturating_add(1)
@@ -331,4 +428,159 @@ fn filter_positions<K: Ord + Copy>(map: &BTreeMap<K, u64>, position: u64) -> BTr
         .filter(|(_, at)| **at <= position)
         .map(|(key, at)| (*key, *at))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::ValidatedChain;
+    use crate::{EntryVerdict, EventKind, validate_entry};
+
+    /// Spec 25 Vector 41's preimage.
+    const V41_PREIMAGE: &str = concat!(
+        "5343502d4b454c2d4556454e542d56313a010000000000000000000000000000",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "0000000000000000000000000000000000000000000000000000000000000100",
+        "00000001010000000000000001033b1cac23f45cf1cdfdf0b32f8f777b99166c",
+        "1b69649c2295b1517883d47f3027000000010000000100000002033b1cac23f4",
+        "5cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f30270101000000",
+        "000000000001010223702a648232f2d00713de9289753c2fbd4c4efa7e1e3390",
+        "5e3723a412b20aea020100000000000000000101000000019d94df95bc0a13f1",
+        "963f484414c320354c73c75bb86e96559e97765f5bc2d31300000e1002000000",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "000100000001421be508c6ed135a9737895007e5ba16f9542e1b3440f6d00a51",
+        "5de80a3e43eb010100000001",
+    );
+    /// Spec 25 Vector 41's raw signature.
+    const V41_SIGNATURE: &str = concat!(
+        "274e7cf73b6807ec53619491a1cc094a5fa2a649b4a04a043965597c7faa5e96",
+        "7e7b499be2e9750521b4bfec6fa65bfdd14c8e5c940bb60884d040da9d1e70a0",
+    );
+    /// Spec 25 Vector 41's identifier.
+    const V41_IDENTIFIER: &str = "2c0f7f4478be94db0078311ef51ba3cc9934362b0f154dcbf9c597572e46cf32";
+    /// Spec 25 Vector 54's preimage: `RootRecovery{CoSigns}` on Vector 41.
+    const V54_PREIMAGE: &str = concat!(
+        "5343502d4b454c2d4556454e542d56313a042c0f7f4478be94db0078311ef51b",
+        "a3cc9934362b0f154dcbf9c597572e46cf320000000000000001d8ba4ebad526",
+        "57208736f4cac675352f5f9cc0aa837620f8d742dbf42aeedbd7010000000100",
+        "0000000100000000010000000001010000000101000000010100000001026fc6",
+        "523b7b1e22ff3fbce8740cfbb7cbc816501864bf40f683db69c860d1a6700000",
+        "0001034c3e84e8da62f05b0a280d5a0426e24bde13c6fa023c567333bece3bc1",
+        "497c53000000010000000100000004034c3e84e8da62f05b0a280d5a0426e24b",
+        "de13c6fa023c567333bece3bc1497c53010100000000000000000101026188be",
+        "77992cb98024f995da162f844f534e4a7f8fca8dc7b1d0cb4b54ce4c64020100",
+        "000000000000000101033b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c",
+        "2295b1517883d47f30270102000000000000000001010223702a648232f2d007",
+        "13de9289753c2fbd4c4efa7e1e33905e3723a412b20aea020200000000000000",
+        "000101000000019d94df95bc0a13f1963f484414c320354c73c75bb86e96559e",
+        "97765f5bc2d31300000e10020000000000000000000000000000000000000000",
+        "00000000000000000000000000000000010000000141def207e7438655edf276",
+        "6aa2fe0c96ef5f898233fb5ba16c56a3f7765aa8bd010100000001",
+    );
+    /// Spec 25 Vector 54's signature field.
+    const V54_SIGNATURE_FIELD: &str = concat!(
+        "204c74ab4383ec683537666c4ce57caebf914ac76a9d380a21d2d961bd3efe21",
+        "1e0e595901be6599c1f92da4c6a364c81daef87e55b297eef68b9a571de12e5d",
+        "78021d7367db675090416cb6d3536562230f10ae4eaf044eb08bdde1f3a1126e",
+        "4f22c6960e73a527b9c74bb7e27d4a6ab54d2f14a99419cea6e20d1b6bd1c3e6",
+        "c229bc09518a2d95af6a51939d0ff57e16ba4cfa317fe8fa24e37d3dc91bc688",
+        "43bb5b6b587f38ead74215bdcb3f7d0982d32a1ef2948df40914a6695eb833d9",
+    );
+    /// Spec 25 Vector 55's preimage: `RootRecovery{Lost}` on Vector 41.
+    const V55_PREIMAGE: &str = concat!(
+        "5343502d4b454c2d4556454e542d56313a042c0f7f4478be94db0078311ef51b",
+        "a3cc9934362b0f154dcbf9c597572e46cf320000000000000001d8ba4ebad526",
+        "57208736f4cac675352f5f9cc0aa837620f8d742dbf42aeedbd7020000000100",
+        "00000001000000000101000000010100000001026fc6523b7b1e22ff3fbce874",
+        "0cfbb7cbc816501864bf40f683db69c860d1a67000000001026bf1355bb40ab8",
+        "6b1f3d2e776e08da67e754a5dfeeb706b67d7483d09451c4ce00000001000000",
+        "0100000004026bf1355bb40ab86b1f3d2e776e08da67e754a5dfeeb706b67d74",
+        "83d09451c4ce01010000000000000000010103b7fe460356f0d94ff2bb085ed1",
+        "6157ae327b7769f2823ca829077110f05fb4a502010000000000000000010103",
+        "3b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f3027",
+        "0102000000000000000001010223702a648232f2d00713de9289753c2fbd4c4e",
+        "fa7e1e33905e3723a412b20aea020200000000000000000101000000019d94df",
+        "95bc0a13f1963f484414c320354c73c75bb86e96559e97765f5bc2d31300000e",
+        "1002000000000000000000000000000000000000000000000000000000000000",
+        "0000000000000100000001cb05862aec3a89bd73c5e2d10a61d6483d945c7203",
+        "6bdf62dd880a9ff7d4d6f0010100000001",
+    );
+    /// Spec 25 Vector 55's signature field.
+    const V55_SIGNATURE_FIELD: &str = concat!(
+        "ce66db7b17acff6ea1c3501cd0380b0e011af13ebef9da42d4a5ce934506edfe",
+        "12fafa63880841e9a3ec7c142944a1c6f1b805257c5ac92a46e74912fa035b6d",
+        "7e9cb3011690ef40c1a3502350f2e2f05a40c0be0fe388b9482aca92f04b9b17",
+        "0536c755a6468d57c12d68de76f970e7e16e615de6ce68f7825edf337ad13842",
+    );
+
+    fn unit(preimage_hex: &str, signature_hex: &str) -> Vec<u8> {
+        let preimage = hex::decode(preimage_hex).unwrap();
+        let mut unit = u32::try_from(preimage.len())
+            .unwrap()
+            .to_be_bytes()
+            .to_vec();
+        unit.extend_from_slice(&preimage);
+        unit.extend_from_slice(&hex::decode(signature_hex).unwrap());
+        unit
+    }
+
+    /// Vector 41 followed by the unit, validated as one chain.
+    fn on_v41(successor: &[u8]) -> (ValidatedChain, usize) {
+        let identifier = scp_did::Identifier::from_bytes(
+            hex::decode(V41_IDENTIFIER).unwrap().try_into().unwrap(),
+        );
+        let v41 = unit(V41_PREIMAGE, V41_SIGNATURE);
+        let units: [&[u8]; 2] = [&v41, successor];
+        let validation = validate_entry(&identifier, &units);
+        assert!(
+            validation.discarded.is_empty(),
+            "{:?}",
+            validation.discarded
+        );
+        let chain = match &validation.verdict {
+            EntryVerdict::Valid { chains } => chains.single().cloned(),
+            EntryVerdict::InceptionInvalid { .. } | EntryVerdict::NoInception => None,
+        };
+        (chain.expect("one valid chain"), v41.len())
+    }
+
+    #[test]
+    fn vector_54_revealing_event_is_root_cosigned() {
+        let v54 = unit(V54_PREIMAGE, V54_SIGNATURE_FIELD);
+        let (chain, v41_len) = on_v41(&v54);
+        let events: Vec<_> = chain.events().collect();
+        assert_eq!(events.len(), 2);
+        assert!(
+            !events[0].reveal_root_cosigned,
+            "the inception has no predecessor"
+        );
+        assert_eq!(events[0].unit_len, v41_len as u64);
+        assert_eq!(events[1].kind, EventKind::RootRecovery);
+        assert!(events[1].reveal_root_cosigned);
+        assert_eq!(events[1].unit_len, v54.len() as u64);
+    }
+
+    #[test]
+    fn vector_55_lost_recovery_is_not_root_cosigned() {
+        let v55 = unit(V55_PREIMAGE, V55_SIGNATURE_FIELD);
+        let (chain, _) = on_v41(&v55);
+        let events: Vec<_> = chain.events().collect();
+        assert_eq!(events[1].kind, EventKind::RootRecovery);
+        assert!(!events[1].reveal_root_cosigned);
+        assert_eq!(events[1].unit_len, v55.len() as u64);
+    }
+
+    #[test]
+    fn shared_prefix_len_reads_digests() {
+        let (v54, _) = on_v41(&unit(V54_PREIMAGE, V54_SIGNATURE_FIELD));
+        let (v55, _) = on_v41(&unit(V55_PREIMAGE, V55_SIGNATURE_FIELD));
+        assert_eq!(v54.shared_prefix_len(&v55), 1);
+        assert_eq!(v54.shared_prefix_len(&v54), 2);
+        let v41 = v54.prefix(0).unwrap();
+        assert_eq!(v41.shared_prefix_len(&v55), 1);
+        assert_eq!(v55.shared_prefix_len(&v41), 1);
+        assert_eq!(v41.len(), 1);
+        assert_eq!(v54.len(), 2);
+    }
 }

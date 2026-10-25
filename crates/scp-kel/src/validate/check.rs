@@ -49,9 +49,10 @@ impl Accepted {
         raw: &RawSignedPreimage,
         digest: [u8; 32],
         preimage: &EventPreimage,
+        unit_len: usize,
     ) -> Self {
         Self {
-            event: chain_event(&applied, digest, preimage),
+            event: chain_event(&applied, digest, preimage, unit_len as u64),
             installed: applied.installed,
             fixed: applied.fixed,
             revealed: applied.revealed,
@@ -144,7 +145,13 @@ pub(super) fn check_inception(
         |_| Ok((applied, preimage)),
     )
     .map_err(InceptionFailure::Discard)?;
-    Ok(Accepted::new(applied, read.raw(), digest, preimage))
+    Ok(Accepted::new(
+        applied,
+        read.raw(),
+        digest,
+        preimage,
+        bytes.len(),
+    ))
 }
 
 /// Runs the check order at the position after `chain`'s head: steps 1, 2
@@ -186,7 +193,13 @@ pub(super) fn check_successor(
             Ok((applied, preimage))
         },
     )?;
-    Ok(Accepted::new(applied, read.raw(), digest, preimage))
+    Ok(Accepted::new(
+        applied,
+        read.raw(),
+        digest,
+        preimage,
+        bytes.len(),
+    ))
 }
 
 /// The key set each group counts toward sub-check 7a and 7b against, past

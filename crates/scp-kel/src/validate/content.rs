@@ -861,16 +861,27 @@ fn fixed_commitments(continuation: Option<&StandingCommitment>) -> Vec<[u8; 32]>
     }
 }
 
-/// The event this content adds, as a chain entry.
+/// The event this content adds, as a chain entry, carried by a unit of
+/// `unit_len` bytes.
 pub(super) fn chain_event(
     applied: &Applied,
     digest: [u8; 32],
     preimage: &EventPreimage,
+    unit_len: u64,
 ) -> ChainEvent {
     ChainEvent {
         digest,
         sequence: preimage.sequence,
         kind: preimage.kind,
+        // A `StandingRoot` group is the one group whose key set is the root
+        // standing at the predecessor on a reveal-authorized event
+        // (`check_groups`, `signer_group_roles`); `RootRecovery{Lost}`
+        // carries none and K′ verifies against the set the event installs.
+        reveal_root_cosigned: applied
+            .signers
+            .iter()
+            .any(|signer| signer.role == SignerGroupRole::StandingRoot),
+        unit_len,
         root: Arc::clone(&applied.root),
         commitment: Arc::clone(&applied.commitment),
         snapshot: Arc::clone(&applied.snapshot),

@@ -17,6 +17,29 @@ pub const MAX_NEXT_SET_SIZE: u32 = 16;
 /// The ceiling on one key event's encoded length in bytes (§9.18.17).
 pub const MAX_EVENT_BYTES: u32 = 65_536;
 
+/// The most divergent suffixes a party retains per identifier, beside the
+/// accepted chain (§9.18.17; §9.7.4.2 R9's count bound).
+pub const MAX_RETAINED_SUFFIXES: u32 = 8;
+
+/// The events-per-suffix factor of [`MAX_RETAINED_BYTES`]'s derivation
+/// (§9.18.17). R9 compares a suffix's event count against nothing, so no
+/// check reads it but that derivation.
+pub const MAX_EVENTS_PER_SUFFIX_RETAINED: u32 = 1_024;
+
+/// The byte bound and the fetch bound of §9.7.4.2 R9 (§9.18.17).
+///
+/// It caps the divergent-suffix bytes a party retains per identifier and
+/// the bytes a verifier downloads for one identifier from one source in one
+/// resolution: [`MAX_RETAINED_SUFFIXES`] × [`MAX_EVENTS_PER_SUFFIX_RETAINED`]
+/// × [`MAX_EVENT_BYTES`] = 536,870,912.
+pub const MAX_RETAINED_BYTES: u32 = 536_870_912;
+
+// §9.18.17 derives the byte bound as the product of three registered
+// constants; the value cannot drift from them.
+const _: () = assert!(
+    MAX_RETAINED_BYTES == MAX_RETAINED_SUFFIXES * MAX_EVENTS_PER_SUFFIX_RETAINED * MAX_EVENT_BYTES
+);
+
 /// The most witnesses a key-state snapshot may name (§9.18.17).
 pub const MAX_WITNESS_SET_SIZE: u32 = 32;
 
