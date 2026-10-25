@@ -2025,6 +2025,51 @@ impl Scp {
         crate::context::context_reconnect_on(&self.inner, identity_did, context_ids).await
     }
 
+    /// Registers the device's push `token` for `platform` (`apns`, `fcm` or
+    /// `web_push`) with every relay in the relay set (story PUSH-015).
+    ///
+    /// # Errors
+    ///
+    /// `SCP-VALID-7005` for an unknown platform name, `SCP-VALID-7004` for an
+    /// empty token, `SCP-CTX-2138` for a shut-down instance, `SCP-IDENT-1002`
+    /// for one with no local member DID, and otherwise `SCP-TRANS-5104`: the
+    /// device has no P-256 `#active` signing key to sign a `PushRegistration`
+    /// with.
+    #[napi(js_name = "pushRegister")]
+    pub fn push_register(&self, platform: String, token: Vec<u8>) -> napi::Result<()> {
+        crate::push::push_register_on(&self.inner, &platform, &token)
+    }
+
+    /// Deregisters the device's push token from every relay it registered
+    /// with (story PUSH-015).
+    ///
+    /// # Errors
+    ///
+    /// `SCP-CTX-2138` for a shut-down instance, `SCP-IDENT-1002` for one with
+    /// no local member DID, and otherwise `SCP-TRANS-5104`: the device has no
+    /// P-256 `#active` signing key to sign a `PushDeregistration` with.
+    #[napi(js_name = "pushDeregister")]
+    pub fn push_deregister(&self) -> napi::Result<()> {
+        crate::push::push_deregister_on(&self.inner)
+    }
+
+    /// Handles a silent push: `payload` is what `platform` (`apns`, `fcm` or
+    /// `web_push`) delivered (story PUSH-015, ADR-029 §2 push-wake pull).
+    ///
+    /// # Errors
+    ///
+    /// `SCP-VALID-7005` for an unknown platform name, `SCP-TRANS-5080` for a
+    /// payload that is not the platform's wake signal (no connection opens).
+    /// Every later failure is a `failed` outcome.
+    #[napi(js_name = "pushHandleWake")]
+    pub async fn push_handle_wake(
+        &self,
+        platform: String,
+        payload: Vec<u8>,
+    ) -> napi::Result<crate::push::NapiWakeOutcome> {
+        crate::push::push_handle_wake_on(&self.inner, &platform, &payload).await
+    }
+
     /// Per-instance equivalent of the free-function `context_is_member`.
     #[napi(js_name = "contextIsMember")]
     pub async fn context_is_member(
