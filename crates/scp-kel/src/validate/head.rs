@@ -10,6 +10,7 @@ use super::change::ValidatedChange;
 use super::defect::{CheckStep, Discarded};
 use super::{InceptionRefusal, validate_inception};
 use crate::constants::HELD_HEAD_MARKER_BYTES;
+use crate::signature::KEY_EVENT_CHALLENGE_LEN;
 
 /// The bytes of an encoded [`HeldHeadMarker`].
 const MARKER_LEN: usize = HELD_HEAD_MARKER_BYTES as usize;
@@ -320,5 +321,20 @@ impl SigningChange {
     #[must_use]
     pub const fn change(&self) -> &ValidatedChange {
         &self.change
+    }
+
+    /// The event digest `D` a raw-arm signer signs:
+    /// [`ValidatedChange::digest`].
+    #[must_use]
+    pub const fn digest(&self) -> [u8; 32] {
+        self.change.digest()
+    }
+
+    /// The `WebAuthn` challenge an assertion-arm signer passes to its
+    /// authenticator, `"SCP-KEY-EVENT-V1:" ‖ D`:
+    /// [`ValidatedChange::key_event_challenge`].
+    #[must_use]
+    pub const fn key_event_challenge(&self) -> [u8; KEY_EVENT_CHALLENGE_LEN] {
+        self.change.key_event_challenge()
     }
 }

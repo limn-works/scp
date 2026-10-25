@@ -60,6 +60,18 @@ This crate owns:
   form").
 - `key_event_challenge` — the 49 challenge bytes `"SCP-KEY-EVENT-V1:" ‖ D` a
   signer passes to its authenticator.
+- `KeyEventSigner` — the one contract every key-event member signs through
+  (§9.7.4.2 R10). `sign_change` takes a `SigningChange`, whose `digest` and
+  `key_event_challenge` are the bytes the raw and assertion arms sign, and
+  `sign_probe` takes a `CustodyProbe`. Each returns an `IndexedSignature` or a
+  `KeyEventSignError`. Its futures are `MaybeSend`: `Send` on every target but
+  wasm32, where the browser client awaits a wasm-bindgen `JsFuture`.
+- `CustodyProbe` — §9.7.4.1 item 5 step d's reachability probe. `fresh` draws
+  its 32-byte nonce from the operating system's random source and fails with
+  `ProbeNonceError` when that source fails; `new` takes the nonce for
+  known-answer tests. `raw_digest` is
+  `SHA-256("SCP-CUSTODY-PROBE-V1:" ‖ nonce)`, and `assertion_challenge` is the
+  53 bytes `"SCP-CUSTODY-PROBE-V1:" ‖ nonce`.
 - `parse_client_data_json` (hidden; public for the fuzz target) and
   `ClientDataError` — the strict `clientDataJSON` acceptance set, a
   hand-written validator with an explicit stack over an
@@ -92,7 +104,8 @@ P-256 point validation and signature verification come from `scp-crypto`.
 
 The crate is a wasm-safe Layer 1 crate (`.docs/architecture.md`, "Layered
 Dependency Graph"): no async runtime, no I/O, no clock, and no pointer-width
-integer or float on the wire. It compiles to
+integer or float on the wire. `KeyEventSigner` declares future-returning
+methods, and this crate runs no future. It compiles to
 `wasm32-unknown-unknown`, and `crates/scp-client-wasm/tests/kel_cross_target_kat.rs`
 pins byte identity between native and wasm32 against `25-test-vectors.md`
 §25.26, §25.28 and §25.29, including the validation of every spec 25 chain

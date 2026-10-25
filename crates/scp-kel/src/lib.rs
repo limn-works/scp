@@ -7,6 +7,7 @@ pub mod constants;
 mod error;
 mod event;
 mod event_codec;
+mod key_event_signer;
 mod preimage;
 mod routing;
 mod signature;
@@ -28,6 +29,10 @@ pub use event::{
 pub use event_codec::{
     EventHeader, EventUnit, HeaderFailedUnit, HeaderGroup, NamedSignature, NamedSigner,
     RawSignedPreimage, ReadUnit, SignatureField, SignerGroupSignatures, decode_event,
+};
+pub use key_event_signer::{
+    CUSTODY_PROBE_CHALLENGE_LEN, CustodyProbe, KeyEventSignError, KeyEventSigner, MaybeSend,
+    ProbeNonceError,
 };
 pub use preimage::{
     EncodedPreimage, decode_preimage, derive_identifier, encode_preimage, key_event_seal,
