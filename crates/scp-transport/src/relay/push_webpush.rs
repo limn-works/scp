@@ -372,40 +372,6 @@ impl Backoffs {
     }
 }
 
-/// The most verbose level the relay logs from a crate outside SCP.
-#[cfg(any(test, feature = "startup"))]
-const OTHER_CRATE_CAP: tracing::Level = tracing::Level::INFO;
-
-/// The target prefix of every SCP crate: each is named `scp-*`, so its
-/// module path, the default `tracing` and `log` target, starts with `scp_`.
-#[cfg(any(test, feature = "startup"))]
-const SCP_CRATE_PREFIX: &str = "scp_";
-
-/// Whether the relay's log keeps an event with `metadata`. A `WebPush`
-/// endpoint's host is a registrant's choice that PUSH-022 keeps out of the
-/// log. A dependency's DEBUG or TRACE lines can name the host a connection
-/// goes to: hyper-util's connector and pool, reqwest's connector, and rustls's
-/// client handshake (`No cached session for DnsName(..)`) all do. So only an
-/// SCP crate's event is kept below [`OTHER_CRATE_CAP`]; every other target,
-/// including a crate added later, is held at that cap whatever `RUST_LOG`
-/// asks for. The relay's tracing subscriber (`startup`) and the push sender
-/// tests' log capture apply this one predicate.
-#[cfg(any(test, feature = "startup"))]
-pub(crate) fn admits_log_event(metadata: &tracing::Metadata<'_>) -> bool {
-    metadata.target().starts_with(SCP_CRATE_PREFIX) || *metadata.level() <= OTHER_CRATE_CAP
-}
-
-/// The endpoint origin of a registered `WebPush` token, the key of the
-/// per-origin back-off and in-flight cap. `None` when the token or its
-/// endpoint does not decode; the send of such a token sends nothing.
-#[cfg(feature = "push-store")]
-pub(crate) fn token_origin(token: &[u8]) -> Option<String> {
-    let subscription = WebPushSubscription::decode(token).ok()?;
-    parse_endpoint(subscription.endpoint())
-        .ok()
-        .map(|parsed| parsed.aud().to_owned())
-}
-
 /// Whether a request error is one spec 10 §10.7.1 **Unreachable `WebPush`
 /// push service** counts: the request deadline passed, or the connection was
 /// refused, reset or aborted before an answer arrived.
@@ -834,7 +800,7 @@ pub(crate) mod tests {
     use scp_crypto::p256::jose::es256_verify_lenient;
 
     use super::super::log_capture::LogCapture;
-    use super::super::push::PushSender;
+    use super::super::push::{PushSender, admits_log_event};
     use super::super::push_test_server::{
         CapturedRequest, HUNG_HOSTS, Reply, TLS_TEST_HOSTS, TestServer, TlsTestServer, hung_host,
     };

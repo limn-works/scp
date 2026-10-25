@@ -57,8 +57,10 @@ use scp_relay_client::{RelayMessage, code};
 use super::push::PushSender;
 #[cfg(feature = "push-store")]
 use super::push_dispatch::PushService;
+#[cfg(all(feature = "push-store", any(test, feature = "webpush")))]
+use super::push_endpoint::EndpointError;
 #[cfg(feature = "push-store")]
-use super::push_endpoint::{EndpointError, parse_endpoint};
+use super::push_endpoint::parse_endpoint;
 #[cfg(feature = "push-store")]
 use super::push_store::{PushRegistrationKey, PushRegistrationRecord, PushRegistrationStore};
 
@@ -303,8 +305,10 @@ impl PushServiceConfig {
 /// No field holds a `WebPush` sender: only a relay that publishes the
 /// sender's VAPID key in a `.well-known/scp` document may wake browsers
 /// (ADR-004 **VAPID key publication**), so a `WebPush` sender reaches a role
-/// only through [`PushRole::start_with_webpush`], which the full node's
-/// domain build calls.
+/// only through `PushRole::start_with_webpush`, which the full node's
+/// domain build calls. That function and the sender compile only under this
+/// crate's `webpush` feature, which `scp-node` enables and `scp-relay` does
+/// not.
 #[cfg(feature = "push-store")]
 #[derive(Debug)]
 pub struct PushSenders {
@@ -369,16 +373,20 @@ impl PushRole {
     /// # Errors
     ///
     /// [`PushRoleError::NoRuntime`] outside a tokio runtime.
+    #[cfg(any(test, feature = "webpush"))]
     pub fn start_with_webpush(
         providers: PushProviders,
         webpush: super::push_webpush::WebPushSender,
     ) -> Result<Self, PushRoleError> {
-        Self::start_senders(providers, Some(webpush))
+        Self::start_senders(providers, Some(PushSender::WebPush(webpush)))
     }
 
+    /// Starts the service on the APNs and FCM senders of `providers` and on
+    /// `webpush`, the `WebPush` sender when
+    /// `start_with_webpush` calls it and `None` otherwise.
     fn start_senders(
         providers: PushProviders,
-        webpush: Option<super::push_webpush::WebPushSender>,
+        webpush: Option<PushSender>,
     ) -> Result<Self, PushRoleError> {
         let PushProviders {
             store,
@@ -388,7 +396,7 @@ impl PushRole {
             .map(PushSender::Apns)
             .into_iter()
             .chain(fcm.map(PushSender::Fcm))
-            .chain(webpush.map(PushSender::WebPush))
+            .chain(webpush)
             .collect();
         if senders.is_empty() {
             return Err(PushRoleError::NoSender);
@@ -408,6 +416,7 @@ impl PushRole {
     /// publishes (ADR-004 **VAPID key publication**), or `None` when the role
     /// wakes no browser.
     #[must_use]
+    #[cfg(any(test, feature = "webpush"))]
     pub fn webpush_sender(&self) -> Option<&super::push_webpush::WebPushSender> {
         match self {
             Self::Disabled => None,
@@ -834,11 +843,18 @@ async fn handle(
     }
 
     // The WebPush byte and URL rules need no I/O, so they run first (PUSH-022).
+    // A build without `webpush` holds no WebPush sender whose address check
+    // would read the endpoint, so it only applies the rules.
+    #[cfg(any(test, feature = "webpush"))]
     let webpush = if platform == PushPlatform::WebPush {
         Some(webpush_endpoint(decoded.token())?)
     } else {
         None
     };
+    #[cfg(not(any(test, feature = "webpush")))]
+    if platform == PushPlatform::WebPush {
+        webpush_endpoint(decoded.token())?;
+    }
 
     // Freshness runs before verification (§10.7.1 "Freshness").
     let timestamp = decoded.timestamp();
@@ -886,6 +902,7 @@ async fn handle(
 
     // The ADR-004 address check resolves the endpoint's host, so it runs only
     // for a verified registration; a deregistration only removes a token.
+    #[cfg(any(test, feature = "webpush"))]
     if let (Some(endpoint), Decoded::Registration(_)) = (&webpush, &decoded) {
         check_webpush_addresses(service, endpoint).await?;
     }
@@ -936,7 +953,7 @@ fn webpush_endpoint(token: &[u8]) -> Result<String, PushPublishGate> {
 /// or its own addresses are unresolved, neither of which says anything about
 /// the endpoint and both of which the registrant retries (ADR-004, every
 /// `5xxx` code).
-#[cfg(feature = "push-store")]
+#[cfg(all(feature = "push-store", any(test, feature = "webpush")))]
 async fn check_webpush_addresses(
     service: &PushServiceConfig,
     endpoint: &str,

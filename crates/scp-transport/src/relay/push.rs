@@ -3,8 +3,8 @@
 //! A relay wakes a registered device by sending the §10.7.1 step 5 wake-signal
 //! request for the registration's platform. [`PushSender`] is the one type the
 //! relay holds per configured platform; its arms are the production senders
-//! [`ApnsSender`] (PUSH-010), [`FcmSender`] (PUSH-011) and [`WebPushSender`]
-//! (PUSH-022). Every send returns a [`SendAttempt`]: the
+//! [`ApnsSender`] (PUSH-010), [`FcmSender`] (PUSH-011) and `WebPushSender`
+//! (PUSH-022, compiled only under the `webpush` feature). Every send returns a [`SendAttempt`]: the
 //! [`PushSendOutcome`] of a send that went out, which the dispatcher of
 //! PUSH-008 ([`push_dispatch`](super::push_dispatch)) reads to keep or remove
 //! a registration, or the [`SendDeferral`] of a `WebPush` send that did not
@@ -35,7 +35,46 @@ pub use super::push_apns::{
     ApnsConfig, ApnsEnvironment, ApnsSender, P256KeyError, p256_key_from_pkcs8_pem,
 };
 pub use super::push_fcm::{FcmConfig, FcmCredentialError, FcmSender, FcmServiceAccount};
+// A crate that does not enable `webpush` cannot name or build a `WebPush`
+// sender: only a relay that publishes the VAPID key in a `.well-known/scp`
+// document may wake browsers (ADR-004 **VAPID key publication**), and only
+// `scp-node` enables the feature. This crate's own tests compile it always.
+#[cfg(any(test, feature = "webpush"))]
 pub use super::push_webpush::{VapidSubject, WebPushConfig, WebPushSender};
+
+/// The most verbose level the relay logs from a crate outside SCP.
+#[cfg(any(test, feature = "startup"))]
+const OTHER_CRATE_CAP: tracing::Level = tracing::Level::INFO;
+
+/// The target prefix of every SCP crate: each is named `scp-*`, so its
+/// module path, the default `tracing` and `log` target, starts with `scp_`.
+#[cfg(any(test, feature = "startup"))]
+const SCP_CRATE_PREFIX: &str = "scp_";
+
+/// Whether the relay's log keeps an event with `metadata`. A `WebPush`
+/// endpoint's host is a registrant's choice that PUSH-022 keeps out of the
+/// log. A dependency's DEBUG or TRACE lines can name the host a connection
+/// goes to: hyper-util's connector and pool, reqwest's connector, and rustls's
+/// client handshake (`No cached session for DnsName(..)`) all do. So only an
+/// SCP crate's event is kept below [`OTHER_CRATE_CAP`]; every other target,
+/// including a crate added later, is held at that cap whatever `RUST_LOG`
+/// asks for. The relay's tracing subscriber (`startup`) and the push sender
+/// tests' log capture apply this one predicate.
+#[cfg(any(test, feature = "startup"))]
+pub(crate) fn admits_log_event(metadata: &tracing::Metadata<'_>) -> bool {
+    metadata.target().starts_with(SCP_CRATE_PREFIX) || *metadata.level() <= OTHER_CRATE_CAP
+}
+
+/// The endpoint origin of a registered `WebPush` token, the key of the
+/// per-origin back-off and in-flight cap. `None` when the token or its
+/// endpoint does not decode; the send of such a token sends nothing.
+#[cfg(feature = "push-store")]
+pub(crate) fn token_origin(token: &[u8]) -> Option<String> {
+    let subscription = WebPushSubscription::decode(token).ok()?;
+    super::push_endpoint::parse_endpoint(subscription.endpoint())
+        .ok()
+        .map(|parsed| parsed.aud().to_owned())
+}
 
 /// Why a `WebPush` send did not start.
 ///
@@ -154,7 +193,9 @@ pub enum PushSender {
     Apns(ApnsSender),
     /// Sends the FCM row of the §10.7.1 step 5 table.
     Fcm(FcmSender),
-    /// Sends the `WebPush` row of the §10.7.1 step 5 table.
+    /// Sends the `WebPush` row of the §10.7.1 step 5 table. Compiles only
+    /// under `webpush`, which `scp-relay` does not enable.
+    #[cfg(any(test, feature = "webpush"))]
     WebPush(WebPushSender),
     /// Records each token and returns scripted outcomes without sending
     /// anything. A nullifier, so it compiles only under `testing`.
@@ -169,6 +210,7 @@ impl PushSender {
         match self {
             Self::Apns(_) => PushPlatform::Apns,
             Self::Fcm(_) => PushPlatform::Fcm,
+            #[cfg(any(test, feature = "webpush"))]
             Self::WebPush(_) => PushPlatform::WebPush,
             #[cfg(feature = "testing")]
             Self::Recording(sender) => sender.platform,
@@ -207,6 +249,7 @@ impl PushSender {
                 };
                 SendAttempt::Sent(sender.send(&PushDeviceToken::new(text)).await)
             }
+            #[cfg(any(test, feature = "webpush"))]
             Self::WebPush(sender) => match WebPushSubscription::decode(token) {
                 Ok(subscription) => sender.send(&subscription).await,
                 Err(error) => {
@@ -226,6 +269,7 @@ impl PushSender {
     #[cfg(feature = "push-store")]
     pub(crate) async fn lookup_permit_freed(&self) -> usize {
         match self {
+            #[cfg(any(test, feature = "webpush"))]
             Self::WebPush(sender) => sender.lookup_permit_freed().await,
             #[cfg(feature = "testing")]
             Self::Recording(sender) => sender.lookup_permit_freed().await,
@@ -236,12 +280,28 @@ impl PushSender {
     /// The permits of the `WebPush` sender's endpoint lookup pool a send's
     /// lookup can take now; `None` for a sender with no lookup pool, whose
     /// sends never defer on one.
-    #[cfg(feature = "push-store")]
+    #[cfg(all(
+        feature = "push-store",
+        any(test, feature = "webpush", feature = "testing")
+    ))]
     pub(crate) fn free_lookup_permits(&self) -> Option<usize> {
         match self {
+            #[cfg(any(test, feature = "webpush"))]
             Self::WebPush(sender) => Some(sender.free_lookup_permits()),
             #[cfg(feature = "testing")]
             Self::Recording(sender) => sender.free_lookup_permits(),
+            Self::Apns(_) | Self::Fcm(_) => None,
+        }
+    }
+
+    /// A build with neither `webpush` nor `testing` holds only APNs and FCM
+    /// senders, and neither has a lookup pool.
+    #[cfg(all(
+        feature = "push-store",
+        not(any(test, feature = "webpush", feature = "testing"))
+    ))]
+    pub(crate) const fn free_lookup_permits(&self) -> Option<usize> {
+        match *self {
             Self::Apns(_) | Self::Fcm(_) => None,
         }
     }
@@ -253,7 +313,7 @@ impl PushSender {
     #[cfg(feature = "push-store")]
     pub(crate) fn origin_of(&self, token: &[u8]) -> Option<String> {
         if self.platform() == PushPlatform::WebPush {
-            super::push_webpush::token_origin(token)
+            token_origin(token)
         } else {
             None
         }
@@ -261,11 +321,22 @@ impl PushSender {
 
     /// When `origin`'s back-off ends, while the `WebPush` sender is backing
     /// it off; `None` for every other sender.
-    #[cfg(feature = "push-store")]
+    #[cfg(all(feature = "push-store", any(test, feature = "webpush")))]
     pub(crate) fn origin_retry_at(&self, origin: &str) -> Option<tokio::time::Instant> {
         match self {
             Self::WebPush(sender) => sender.retry_at(origin),
             _ => None,
+        }
+    }
+
+    /// A build without `webpush` holds no `WebPush` sender, and no other
+    /// sender backs off an origin, so no origin is ever backing off.
+    #[cfg(all(feature = "push-store", not(any(test, feature = "webpush"))))]
+    pub(crate) const fn origin_retry_at(&self, _origin: &str) -> Option<tokio::time::Instant> {
+        match *self {
+            Self::Apns(_) | Self::Fcm(_) => None,
+            #[cfg(feature = "testing")]
+            Self::Recording(_) => None,
         }
     }
 }

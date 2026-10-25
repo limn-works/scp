@@ -1066,14 +1066,14 @@ impl CheckedResolver {
     /// free before the wait completes complete it once, so the count, not the
     /// completion, says how many held wakes may retry. The `WebPush`
     /// dispatcher waits on it to retry a wake whose send found the pool full.
-    #[cfg(any(test, feature = "push-store"))]
+    #[cfg(any(test, all(feature = "push-store", feature = "webpush")))]
     pub(crate) async fn lookup_permit_freed(&self) -> usize {
         self.permits.freed.notified().await;
         self.free_lookup_permits()
     }
 
     /// The permits a wake's lookup can take now.
-    #[cfg(any(test, feature = "push-store"))]
+    #[cfg(any(test, all(feature = "push-store", feature = "webpush")))]
     pub(crate) fn free_lookup_permits(&self) -> usize {
         self.permits.all.available_permits()
     }

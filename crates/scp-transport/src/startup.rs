@@ -683,7 +683,7 @@ fn log_format_is_json(raw: Option<OsString>) -> Result<bool, StartupError> {
 }
 
 /// The relay's subscriber: `filter`, then the relay's fixed cap
-/// (`push_webpush::admits_log_event`, which holds every crate outside SCP at
+/// (`push::admits_log_event`, which holds every crate outside SCP at
 /// INFO so no line names a `WebPush` endpoint's host), formatted as JSON when
 /// `json`, written to `writer`.
 fn relay_subscriber<W>(
@@ -695,7 +695,7 @@ where
     W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
 {
     use tracing_subscriber::layer::SubscriberExt as _;
-    let cap = tracing_subscriber::filter::filter_fn(crate::relay::push_webpush::admits_log_event);
+    let cap = tracing_subscriber::filter::filter_fn(crate::relay::push::admits_log_event);
     if json {
         Box::new(
             tracing_subscriber::fmt()
@@ -810,6 +810,7 @@ const RELAY_PUSH_PLATFORM_VALUES: &str = "none, apns, fcm, apns,fcm";
 
 /// The `SCP_RELAY_PUSH_PLATFORMS` values an `scp-node` full node accepts, as
 /// its refusals name them.
+#[cfg(any(test, feature = "webpush"))]
 const NODE_PUSH_PLATFORM_VALUES: &str =
     "none, or a comma-separated list of one or more of apns, fcm, webpush";
 
@@ -1219,6 +1220,7 @@ fn parse_push_platforms(value: &str) -> Result<Option<PushPlatforms>, PushStartu
 
 /// Parses a `SCP_RELAY_PUSH_PLATFORMS` value for an `scp-node` full node:
 /// `None` for `none`, otherwise the listed platforms.
+#[cfg(any(test, feature = "webpush"))]
 fn parse_node_push_platforms(value: &str) -> Result<Option<NodePushPlatforms>, PushStartupError> {
     parse_platform_list(value, NODE_PUSH_PLATFORM_VALUES)
 }
@@ -1313,6 +1315,7 @@ fn push_selection_from(
 /// `Debug` prints no credential: each sender's own `Debug` omits its key, its
 /// JWT or access token, and every device token.
 #[derive(Debug)]
+#[cfg(any(test, feature = "webpush"))]
 pub enum PushSenderSelection {
     /// `none`: the relay offers no push.
     Disabled,
@@ -1327,6 +1330,7 @@ pub enum PushSenderSelection {
 /// key publication**), which the caller hands to
 /// [`PushRole::start_with_webpush`](crate::relay::push_gate::PushRole::start_with_webpush).
 #[derive(Debug)]
+#[cfg(any(test, feature = "webpush"))]
 pub struct NodePushSenders {
     /// The APNs and FCM senders.
     pub senders: PushSenders,
@@ -1361,11 +1365,13 @@ pub struct NodePushSenders {
 /// - As [`push_selection_from_env`], less the store variants:
 ///   [`StartupError::Push`] for the first missing or invalid value, and
 ///   [`StartupError::InvalidValue`] for a value that is not UTF-8.
+#[cfg(any(test, feature = "webpush"))]
 pub fn push_senders_from_env() -> Result<PushSenderSelection, StartupError> {
     push_senders_from(&|var| env::var_os(var))
 }
 
 /// Reads the platform list and senders through `lookup`.
+#[cfg(any(test, feature = "webpush"))]
 fn push_senders_from(
     lookup: &dyn Fn(&'static str) -> Option<OsString>,
 ) -> Result<PushSenderSelection, StartupError> {
@@ -1567,6 +1573,7 @@ fn fcm_sender_from(
 /// The sender starts with an unresolved own-address set, so it checks no
 /// endpoint until the node resolves its own addresses with
 /// [`track_own_addresses`](crate::relay::push_endpoint::track_own_addresses).
+#[cfg(any(test, feature = "webpush"))]
 fn webpush_sender_from(
     lookup: &dyn Fn(&'static str) -> Option<OsString>,
 ) -> Result<crate::relay::push::WebPushSender, StartupError> {
@@ -1615,6 +1622,7 @@ fn webpush_sender_from(
 /// Parses a `SCP_RELAY_WEBPUSH_NAT64_PREFIXES` value: `none` for no prefix,
 /// otherwise comma-separated `address/length` items, each an RFC 6052 §2.2
 /// prefix.
+#[cfg(any(test, feature = "webpush"))]
 fn parse_nat64_prefixes(
     value: &str,
 ) -> Result<crate::relay::push_endpoint::Nat64Prefixes, PushStartupError> {
@@ -3439,7 +3447,7 @@ mod push_tests {
         let mut env = Env::full(dir.path());
         env.node_webpush();
         let fragments = secret_fragments(&env);
-        let capture = LogCapture::install(crate::relay::push_webpush::admits_log_event);
+        let capture = LogCapture::install(crate::relay::push::admits_log_event);
 
         let selection = env.node().unwrap();
         let mut printed = format!("{selection:?} {selection:#?}");
@@ -3542,7 +3550,7 @@ mod push_tests {
         let dir = tempfile::tempdir().unwrap();
         let mut env = Env::full(dir.path());
         let fragments = secret_fragments(&env);
-        let capture = LogCapture::install(crate::relay::push_webpush::admits_log_event);
+        let capture = LogCapture::install(crate::relay::push::admits_log_event);
 
         let selection = env.parse().unwrap();
         let printed = format!("{selection:?} {selection:#?}");
