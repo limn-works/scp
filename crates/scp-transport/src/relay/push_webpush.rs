@@ -1147,20 +1147,32 @@ pub(crate) mod tests {
     }
 
     /// B3: JWT cache churn never forgets an origin's back-off.
+    ///
+    /// The back-off is read at the instant it was recorded, not after the
+    /// churn: signing 1,074 JWTs can outlast the 1 s first step on a loaded
+    /// runner, and a back-off that ended on time is not one the churn
+    /// forgot.
     #[tokio::test]
     async fn jwt_cache_churn_keeps_a_backoff() -> TestResult {
         let sender = production_sender(clock())?;
         let origin = "https://push.example.net";
-        let (epoch, _) = sender.backoffs().stamp(origin, Instant::now());
+        let failed_at = Instant::now();
+        let (epoch, _) = sender.backoffs().stamp(origin, failed_at);
         sender
             .backoffs()
-            .record(origin, epoch, PushSendOutcome::Transient, Instant::now());
+            .record(origin, epoch, PushSendOutcome::Transient, failed_at);
+        let before = sender.backoffs().stamp(origin, failed_at);
+        assert!(before.1.is_some(), "the failure started no back-off");
         for n in 0..ORIGIN_CACHE_CAPACITY.get() + 50 {
             sender
                 .authorization(&format!("https://h{n}.example.net"))
                 .ok_or("signing failed")?;
         }
-        assert!(sender.retry_at(origin).is_some());
+        assert_eq!(
+            sender.backoffs().stamp(origin, failed_at),
+            before,
+            "JWT cache churn changed the origin's back-off"
+        );
         Ok(())
     }
 
@@ -1381,6 +1393,7 @@ pub(crate) mod tests {
         let (_, same_origin) = subscribe(server.endpoint("push.example.net", "/ok"))?;
         let (_, other_origin) = subscribe(server.endpoint("hung.example.net", "/ok"))?;
 
+        let before = Instant::now();
         assert_eq!(
             sender.send(&busy).await,
             SendAttempt::Sent(PushSendOutcome::Transient)
@@ -1388,7 +1401,11 @@ pub(crate) mod tests {
         let aud = parse_endpoint(&server.endpoint("push.example.net", "/"))?
             .aud()
             .to_owned();
-        let retry_at = sender.retry_at(&aud).ok_or("no back-off")?;
+        let retry_at = sender
+            .backoffs()
+            .stamp(&aud, before)
+            .1
+            .ok_or("no back-off")?;
         assert!(retry_at - Instant::now() <= ORIGIN_BACKOFF_MIN.mul_f64(1.25));
         // Another origin is unaffected.
         let started = Instant::now();
@@ -1549,6 +1566,7 @@ pub(crate) mod tests {
         let server = TlsTestServer::start_routed(vec![("/", vec![Reply::hang(); IN_FLIGHT])]).await;
         let sender = sender_with_deadline(&server, true, clock(), Duration::from_millis(300))?;
         let (_, subscription) = subscribe(server.endpoint("push.example.net", PATH))?;
+        let before = Instant::now();
         let outcomes =
             futures::future::join_all((0..IN_FLIGHT).map(|_| sender.send(&subscription))).await;
         assert_eq!(
@@ -1559,7 +1577,11 @@ pub(crate) mod tests {
         let aud = parse_endpoint(&server.endpoint("push.example.net", "/"))?
             .aud()
             .to_owned();
-        let retry_at = sender.retry_at(&aud).ok_or("no back-off")?;
+        let retry_at = sender
+            .backoffs()
+            .stamp(&aud, before)
+            .1
+            .ok_or("no back-off")?;
         let left = retry_at - Instant::now();
         assert!(left <= ORIGIN_BACKOFF_MIN.mul_f64(1.25), "{left:?}");
         Ok(())
