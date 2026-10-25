@@ -5576,6 +5576,7 @@ dependencies = [
  "scp-event-log",
  "scp-ffi-common",
  "scp-identity",
+ "scp-kel",
  "scp-node",
  "scp-platform",
  "scp-protocol",

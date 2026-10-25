@@ -10,8 +10,9 @@
 use core::future::{Future, ready};
 
 use scp_platform::{
-    CustodyProbe, IndexedSignature, KeyEventSignError, KeyEventSigner, MaybeSend, NextSetCustody,
-    NextSetCustodyError, NextSetKeyHandle, PreRotationCustodyKind, ProbeSignature, SigningChange,
+    BackupArtifact, BackupRequest, CustodyProbe, IndexedSignature, KeyEventSignError,
+    KeyEventSigner, MaybeSend, NextSetCustody, NextSetCustodyError, NextSetKeyHandle,
+    PreRotationCustodyKind, ProbeSignature, SigningChange,
 };
 
 struct Complete;
@@ -60,6 +61,22 @@ impl NextSetCustody for Complete {
         ready(Err(NextSetCustodyError::HandleNotFound))
     }
 
+    fn seal_backup(
+        &self,
+        _handle: &NextSetKeyHandle,
+        _request: BackupRequest,
+    ) -> impl Future<Output = Result<BackupArtifact, NextSetCustodyError>> + Send {
+        ready(Err(NextSetCustodyError::MethodNotOffered))
+    }
+
+    fn restore(
+        &self,
+        _artifact: BackupArtifact,
+        _expected_commitment: [u8; 32],
+    ) -> impl Future<Output = Result<NextSetKeyHandle, NextSetCustodyError>> + Send {
+        ready(Err(NextSetCustodyError::MethodNotOffered))
+    }
+
     fn custody_kind(&self) -> PreRotationCustodyKind {
         PreRotationCustodyKind::Callback
     }
@@ -83,4 +100,47 @@ async fn a_complete_implementor_compiles_and_dispatches() -> Result<(), Box<dyn 
     );
     assert_eq!(custody.custody_kind(), PreRotationCustodyKind::Callback);
     Ok(())
+}
+
+/// `BackupArtifact`, `BackupRequest` and `PassphraseSource` name the method
+/// in their `Debug` output and never the secret.
+#[test]
+fn backup_types_redact_their_secrets() {
+    use scp_platform::{ENCRYPTED_BACKUP_BYTES, PassphraseSource, SHAMIR_SHARE_BYTES};
+    use zeroize::Zeroizing;
+
+    let secret = "hunter2-secret";
+    let rendered = [
+        format!(
+            "{:?}",
+            BackupArtifact::Encrypted {
+                backup: [0xAB; ENCRYPTED_BACKUP_BYTES],
+                passphrase: Zeroizing::new(secret.to_owned()),
+            }
+        ),
+        format!(
+            "{:?}",
+            BackupArtifact::Shamir {
+                shares: vec![Zeroizing::new([0xAB; SHAMIR_SHARE_BYTES]); 3],
+            }
+        ),
+        format!(
+            "{:?}",
+            BackupArtifact::Paper {
+                words: Zeroizing::new(secret.to_owned()),
+            }
+        ),
+        format!(
+            "{:?}",
+            BackupRequest::Encrypted {
+                passphrase: PassphraseSource::Supplied(Zeroizing::new(secret.to_owned())),
+            }
+        ),
+    ];
+    for text in &rendered {
+        assert!(!text.contains(secret), "{text}");
+        assert!(!text.contains("171"), "{text}");
+        assert!(!text.to_lowercase().contains("ab, "), "{text}");
+    }
+    assert!(rendered[1].contains("share_count: 3"), "{}", rendered[1]);
 }

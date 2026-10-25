@@ -104,9 +104,10 @@ pub use store_value::{
     identity_document_key, sanitize_key_component, to_stored_value_bytes,
 };
 pub use traits::{
-    CustodyType, DeviceAttestation, DeviceAttestationToken, KeyCustody, KeyHandle, KeyRole,
-    KeyType, NextSetCustody, NextSetCustodyError, NextSetKeyHandle, PreRotationCustody,
+    BackupArtifact, BackupRequest, CustodyType, DeviceAttestation, DeviceAttestationToken,
+    ENCRYPTED_BACKUP_BYTES, KeyCustody, KeyHandle, KeyRole, KeyType, NextSetCustody,
+    NextSetCustodyError, NextSetKeyHandle, PassphraseSource, PreRotationCustody,
     PreRotationCustodyError, PreRotationCustodyKind, PreRotationKeyHandle, Pseudonym, PublicKey,
-    Push, PushToken, SharedSecret, Signature, Storage, WakeSignal, refuse_key_event_mint,
-    require_derive_source,
+    Push, PushToken, SHAMIR_SHARE_BYTES, SharedSecret, Signature, Storage, WakeSignal,
+    refuse_key_event_mint, require_derive_source,
 };

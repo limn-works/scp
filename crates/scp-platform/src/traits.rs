@@ -1447,6 +1447,93 @@ pub enum NextSetCustodyError {
     /// The custody's persistence failed. The message carries no key material.
     #[error("next-set custody storage failed: {0}")]
     Storage(String),
+    /// The custody offers neither [`seal_backup`](NextSetCustody::seal_backup)
+    /// nor [`restore`](NextSetCustody::restore): every next-set custody that
+    /// is not headless refuses both (`09-security-model.md` §9.7.4.1 item 4,
+    /// the sealing window).
+    #[error("this next-set custody offers no backup method")]
+    MethodNotOffered,
+}
+
+/// The encoded width of an encrypted offline backup of a next-set key
+/// (`09-security-model.md` §9.18.17): version, salt, nonce, ciphertext, tag.
+pub const ENCRYPTED_BACKUP_BYTES: usize = 77;
+
+/// The encoded width of one Shamir share of a next-set key
+/// (`09-security-model.md` §9.18.17): version, x, and 32-byte y.
+pub const SHAMIR_SHARE_BYTES: usize = 34;
+
+/// Where the passphrase of an encrypted offline backup comes from
+/// (`09-security-model.md` §9.7.4.1 item 4, the sealing window).
+pub enum PassphraseSource {
+    /// The custody generates the passphrase: the 12-word BIP39 English
+    /// mnemonic of 16 bytes from the operating system's CSPRNG.
+    Generate,
+    /// The caller supplies the passphrase. The custody refuses an empty one.
+    Supplied(zeroize::Zeroizing<String>),
+}
+
+impl std::fmt::Debug for PassphraseSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Generate => f.write_str("Generate"),
+            Self::Supplied(_) => f.write_str("Supplied(<redacted>)"),
+        }
+    }
+}
+
+/// The copyable method a [`NextSetCustody::seal_backup`] call names
+/// (`09-security-model.md` §9.7.4.1 item 4, the headless methods).
+#[derive(Debug)]
+pub enum BackupRequest {
+    /// The encrypted offline backup, under a passphrase from `passphrase`.
+    Encrypted {
+        /// The passphrase's source.
+        passphrase: PassphraseSource,
+    },
+    /// The 3-of-5 Shamir split.
+    Shamir,
+    /// The 24-word BIP39 paper backup.
+    Paper,
+}
+
+/// A copyable artifact of one next-set key: what
+/// [`NextSetCustody::seal_backup`] emits and [`NextSetCustody::restore`]
+/// takes (`09-security-model.md` §9.7.4.1 item 4).
+///
+/// Its `Debug` output names the method and redacts every secret.
+pub enum BackupArtifact {
+    /// The encrypted offline backup and the passphrase that opens it: the
+    /// generated one, or the one the caller supplied.
+    Encrypted {
+        /// The `ENCRYPTED_BACKUP_BYTES`-byte backup.
+        backup: [u8; ENCRYPTED_BACKUP_BYTES],
+        /// The passphrase.
+        passphrase: zeroize::Zeroizing<String>,
+    },
+    /// Shamir shares: the five a seal emits, or the three a restore combines.
+    Shamir {
+        /// The shares, each `SHAMIR_SHARE_BYTES` bytes.
+        shares: Vec<zeroize::Zeroizing<[u8; SHAMIR_SHARE_BYTES]>>,
+    },
+    /// The 24 BIP39 English words, joined by single ASCII spaces.
+    Paper {
+        /// The words.
+        words: zeroize::Zeroizing<String>,
+    },
+}
+
+impl std::fmt::Debug for BackupArtifact {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Encrypted { .. } => f.debug_struct("Encrypted").finish_non_exhaustive(),
+            Self::Shamir { shares } => f
+                .debug_struct("Shamir")
+                .field("share_count", &shares.len())
+                .finish_non_exhaustive(),
+            Self::Paper { .. } => f.debug_struct("Paper").finish_non_exhaustive(),
+        }
+    }
 }
 
 /// Custody of next-set keys: the keys a key event commits to and a later
@@ -1464,8 +1551,9 @@ pub enum NextSetCustodyError {
 /// ```compile_fail,E0046
 /// use core::future::Future;
 /// use scp_platform::{
-///     CustodyProbe, KeyEventSignError, KeyEventSigner, MaybeSend, NextSetCustody,
-///     NextSetCustodyError, NextSetKeyHandle, PreRotationCustodyKind, ProbeSignature,
+///     BackupArtifact, BackupRequest, CustodyProbe, KeyEventSignError, KeyEventSigner,
+///     MaybeSend, NextSetCustody, NextSetCustodyError, NextSetKeyHandle,
+///     PreRotationCustodyKind, ProbeSignature,
 /// };
 ///
 /// struct Partial;
@@ -1503,6 +1591,22 @@ pub enum NextSetCustodyError {
 ///         async { Err(NextSetCustodyError::HandleNotFound) }
 ///     }
 ///
+///     fn seal_backup(
+///         &self,
+///         _handle: &NextSetKeyHandle,
+///         _request: BackupRequest,
+///     ) -> impl Future<Output = Result<BackupArtifact, NextSetCustodyError>> + Send {
+///         async { Err(NextSetCustodyError::MethodNotOffered) }
+///     }
+///
+///     fn restore(
+///         &self,
+///         _artifact: BackupArtifact,
+///         _expected_commitment: [u8; 32],
+///     ) -> impl Future<Output = Result<NextSetKeyHandle, NextSetCustodyError>> + Send {
+///         async { Err(NextSetCustodyError::MethodNotOffered) }
+///     }
+///
 ///     fn custody_kind(&self) -> PreRotationCustodyKind {
 ///         PreRotationCustodyKind::Callback
 ///     }
@@ -1514,9 +1618,9 @@ pub enum NextSetCustodyError {
 /// ```
 /// use core::future::Future;
 /// use scp_platform::{
-///     CustodyProbe, IndexedSignature, KeyEventSignError, KeyEventSigner, MaybeSend,
-///     NextSetCustody, NextSetCustodyError, NextSetKeyHandle, PreRotationCustodyKind,
-///     ProbeSignature, SigningChange,
+///     BackupArtifact, BackupRequest, CustodyProbe, IndexedSignature, KeyEventSignError,
+///     KeyEventSigner, MaybeSend, NextSetCustody, NextSetCustodyError, NextSetKeyHandle,
+///     PreRotationCustodyKind, ProbeSignature, SigningChange,
 /// };
 ///
 /// struct Partial;
@@ -1562,6 +1666,22 @@ pub enum NextSetCustodyError {
 ///         async { Err(NextSetCustodyError::HandleNotFound) }
 ///     }
 ///
+///     fn seal_backup(
+///         &self,
+///         _handle: &NextSetKeyHandle,
+///         _request: BackupRequest,
+///     ) -> impl Future<Output = Result<BackupArtifact, NextSetCustodyError>> + Send {
+///         async { Err(NextSetCustodyError::MethodNotOffered) }
+///     }
+///
+///     fn restore(
+///         &self,
+///         _artifact: BackupArtifact,
+///         _expected_commitment: [u8; 32],
+///     ) -> impl Future<Output = Result<NextSetKeyHandle, NextSetCustodyError>> + Send {
+///         async { Err(NextSetCustodyError::MethodNotOffered) }
+///     }
+///
 ///     fn custody_kind(&self) -> PreRotationCustodyKind {
 ///         PreRotationCustodyKind::Callback
 ///     }
@@ -1600,6 +1720,36 @@ pub trait NextSetCustody: Send + Sync + scp_kel::KeyEventSigner<Member = NextSet
         &self,
         handle: &NextSetKeyHandle,
     ) -> impl std::future::Future<Output = Result<(), NextSetCustodyError>> + Send;
+
+    /// Emits the copyable artifact `request` names for the key under
+    /// `handle`, wipes the key's scalar from the custody, and keeps its
+    /// public key (`09-security-model.md` §9.7.4.1 item 4, the sealing
+    /// window).
+    ///
+    /// # Errors
+    ///
+    /// [`NextSetCustodyError::MethodNotOffered`] from every custody that is
+    /// not headless, whatever `request` names.
+    fn seal_backup(
+        &self,
+        handle: &NextSetKeyHandle,
+        request: BackupRequest,
+    ) -> impl std::future::Future<Output = Result<BackupArtifact, NextSetCustodyError>> + Send;
+
+    /// Reconstructs a key from `artifact` inside the custody and returns its
+    /// handle, never its scalar (`09-security-model.md` §9.7.4.1 item 4,
+    /// restore). `expected_commitment` is the pre-rotation commitment the
+    /// restored key must derive.
+    ///
+    /// # Errors
+    ///
+    /// [`NextSetCustodyError::MethodNotOffered`] from every custody that is
+    /// not headless, whatever `artifact` holds.
+    fn restore(
+        &self,
+        artifact: BackupArtifact,
+        expected_commitment: [u8; 32],
+    ) -> impl std::future::Future<Output = Result<NextSetKeyHandle, NextSetCustodyError>> + Send;
 
     /// The substrate this custody keeps its keys in (ADR-054). A fixed value
     /// per implementation, for diagnostics; the custody object itself is the
