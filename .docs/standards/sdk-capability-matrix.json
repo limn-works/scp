@@ -2493,6 +2493,50 @@
           }
         }
       ]
+    },
+    {
+      "domain": "Push",
+      "operations": [
+        {
+          "name": "enable",
+          "python": false,
+          "typescript": false,
+          "kotlin": false,
+          "swift": false,
+          "exemptions": {
+            "python": "Bridge exports push_enable on SCP (PUSH-015); the Python SDK wrapper is story PUSH-020",
+            "typescript": "napi bridge exports push_enable on Scp (PUSH-015); the TypeScript SDK wrapper is story PUSH-020",
+            "kotlin": "UniFFI bridge exports push_enable (PUSH-015); the Kotlin SDK wiring is story PUSH-018",
+            "swift": "UniFFI bridge exports push_enable (PUSH-015); the Swift SDK wiring is story PUSH-017"
+          }
+        },
+        {
+          "name": "disable",
+          "python": false,
+          "typescript": false,
+          "kotlin": false,
+          "swift": false,
+          "exemptions": {
+            "python": "Bridge exports push_disable on SCP (PUSH-015); the Python SDK wrapper is story PUSH-020",
+            "typescript": "napi bridge exports push_disable on Scp (PUSH-015); the TypeScript SDK wrapper is story PUSH-020",
+            "kotlin": "UniFFI bridge exports push_disable (PUSH-015); the Kotlin SDK wiring is story PUSH-018",
+            "swift": "UniFFI bridge exports push_disable (PUSH-015); the Swift SDK wiring is story PUSH-017"
+          }
+        },
+        {
+          "name": "handle_wake",
+          "python": false,
+          "typescript": false,
+          "kotlin": false,
+          "swift": false,
+          "exemptions": {
+            "python": "Bridge exports push_handle_wake on SCP (PUSH-015); the Python SDK wrapper is story PUSH-020",
+            "typescript": "napi bridge exports push_handle_wake on Scp (PUSH-015); the TypeScript SDK wrapper is story PUSH-020",
+            "kotlin": "UniFFI bridge exports push_handle_wake (PUSH-015); the Kotlin SDK wiring is story PUSH-018",
+            "swift": "UniFFI bridge exports push_handle_wake (PUSH-015); the Swift SDK wiring is story PUSH-017"
+          }
+        }
+      ]
     }
   ],
   "call_invariants": [

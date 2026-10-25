@@ -45,7 +45,8 @@
         "PUSH-030",
         "PUSH-031",
         "PUSH-035",
-        "PUSH-036"
+        "PUSH-036",
+        "PUSH-037"
       ]
     },
     {
@@ -97,7 +98,7 @@
         "ADR-027 contains no `\"to\":` key.",
         "ADR-006 and ADR-025 cite \u00a710.7.1 rather than restating the bytes.",
         "The SCP-096 action item in `.docs/prds/main.json` no longer mentions context_id.",
-        "ADR-025 and ADR-027 state the D10 call order: `push_enable(provider)` calls `registerPush()` and publishes a signed registration; `push_handle_wake(payload)` calls `handleNotification(payload)`, then runs relay catch-up under a deadline and returns `WakeOutcome`.",
+        "ADR-025 and ADR-027 state the D10 call order: `push_enable(provider, platform)` calls `registerPush()` and publishes a signed registration; `push_handle_wake(payload)` calls `handleNotification(payload)`, then runs relay catch-up under a deadline and returns `WakeOutcome`.",
         "\u00a710.7.1 step 5 states the APNs receipt rule (exactly the key `aps`, and `aps` exactly `content-available` = 1) and the FCM receipt rule (`scp` equals the string `\"1\"`).",
         "The FCM row of the \u00a710.7.1 table sets `android.priority` to `HIGH` and carries no `notification` key.",
         "`python3.12 scripts/check-doc-citations.py` passes."
@@ -826,7 +827,7 @@
         "crates/scp-runtime/src/context/mod.rs",
         "crates/scp-testing/tests/integration/pipeline_wiring.rs"
       ],
-      "description": "`Supervisor::push_routing_ids()` fans a query out to each standing context actor. Each actor returns its `context_routing_id` and this device's current `pseudonym_routing_id` (\u00a79.10.4). The Supervisor groups the results by canonical relay URL (\u00a79.18.2). FFI, SDK and matrix rows are covered by PUSH-015.",
+      "description": "`Supervisor::push_routing_ids()` fans a query out to each standing context actor. Each actor returns its `context_routing_id` and this device's current `pseudonym_routing_id` (\u00a79.10.4). The Supervisor groups the results by canonical relay URL (\u00a79.18.2). PUSH-037 exports the registration that reads these routing IDs, PUSH-015 adds the matrix rows, and PUSH-017, PUSH-018 and PUSH-020 add the SDK wrappers.",
       "acceptanceCriteria": [
         "With two contexts on two relays, the result maps each relay to exactly the routing IDs of the contexts on it.",
         "the result contains this device's current local pseudonym routing ID for each context; after the local pseudonym changes, the next query returns the new one and not the old one",
@@ -858,8 +859,8 @@
         "checklist": {
           "dispatch": "yes",
           "pw": "yes",
-          "ffi": "PUSH-015",
-          "sdk": "PUSH-015",
+          "ffi": "PUSH-037",
+          "sdk": "PUSH-017, PUSH-018, PUSH-020",
           "matrix": "PUSH-015"
         }
       }
@@ -938,8 +939,8 @@
         "checklist": {
           "dispatch": "PUSH-013",
           "pw": "yes",
-          "ffi": "PUSH-015",
-          "sdk": "PUSH-015",
+          "ffi": "PUSH-037",
+          "sdk": "PUSH-017, PUSH-018, PUSH-020",
           "matrix": "PUSH-015"
         }
       }
@@ -950,32 +951,51 @@
       "gate": "gate-push-client",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "in-progress",
       "files": [
         "crates/scp-ffi/common/src/push.rs",
+        "crates/scp-ffi/common/src/error_codes.rs",
         "crates/scp-ffi/uniffi/src/lib.rs",
+        "crates/scp-ffi/uniffi/src/push.rs",
+        "crates/scp-ffi/uniffi/src/runtime.rs",
         "crates/scp-ffi/napi/src/push.rs",
+        "crates/scp-ffi/napi/src/scp.rs",
         "crates/scp-ffi/src/push.rs",
         "crates/scp-testing/tests/integration/pipeline_wiring.rs",
         "crates/scp-testing/tests/integration/ffi_conformance.rs",
-        ".docs/standards/sdk-capability-matrix.json"
+        "scripts/bridge-aliases.json",
+        ".docs/standards/sdk-capability-matrix.json",
+        ".docs/standards/sdk-common.md",
+        "crates/scp-ffi/common/src/bridge_instance.rs",
+        "crates/scp-ffi/napi/src/lib.rs",
+        "crates/scp-ffi/napi/src/runtime.rs",
+        "crates/scp-ffi/src/lib.rs",
+        "crates/scp-ffi/src/runtime.rs",
+        "crates/scp-testing/Cargo.toml",
+        "crates/scp-testing/tests/integration/push_wake.rs",
+        "bindings/python/scp_sdk/_scp_core.pyi",
+        "bindings/swift/Sources/SCP/Internal/ScpBindings.swift"
       ],
-      "description": "Implements the call order ADR-025 criterion 4 and ADR-027 criterion 10 state. UniFFI: `push_enable(provider: PushProvider, platform)` calls `register_push()` and then the PUSH-014 registrar; `push_disable` deregisters; `push_handle_wake(payload)` calls `handle_notification`, checks the wake bytes, runs PUSH-016, and returns `WakeOutcome`. napi and Python hosts have no callback provider, so they export `push_register(platform, token)`, `push_deregister` and `push_handle_wake`, taking the token directly. Adding pipeline assertions and matrix rows only adds enforcement, which AGENTS.md allows. SDK wrappers are PUSH-017, PUSH-018 and PUSH-020. `push_enable` builds the registrar's `PushSigningKey` with the production constructor that PUSH-036 adds.",
+      "description": "Implements the call order ADR-025 criterion 4 and ADR-027 criterion 10 state, with one shape on every bridge (`.docs/standards/construction.md`, ADR-052). Each of the three bridges exports `push_enable`, `push_disable` and `push_handle_wake(payload)`. Only the token's source differs: UniFFI takes `push_enable(provider: PushProvider, platform)`, and napi and Python, whose hosts have no callback provider, take `push_enable(platform, token)` (construction.md \u00a7FFI asymmetry). `platform` is an enum on every bridge: `Apns`, `Fcm` and `WebPush`, which napi spells `apns`, `fcm` and `web_push`. `push_enable` and `push_disable` are async on every bridge and return `PushRelayOutcomes`, which mirrors the registrar's `RelayOutcomes`: a `deregistered` and a `registered` list, each entry naming one relay URL and carrying a failure (code and message) only when that relay refused. The device has no P-256 `#active` signing key until PUSH-036, so `push_enable` and `push_disable` check the instance (SCP-CTX-2138 when it is shut down, SCP-IDENT-1002 when it holds no local member DID) and then return SCP-TRANS-5104 through a stub that names PUSH-037, before they call the provider, address any relay or record anything; napi and Python first refuse an empty token with SCP-VALID-7004. `push_enable` records the platform, and on UniFFI the provider, in a per-instance slot that shutdown clears, so in this story the slot stays empty. `push_handle_wake(payload)` starts with one shared step on every bridge: a shut-down instance returns the `failed` outcome SCP-TRANS-5085, and an instance with an empty slot returns SCP-TRANS-5105 (`WakeError::NotEnabled`). UniFFI then calls `handle_notification` and checks the bytes it returns; napi and Python check `payload` itself. Each checks against the recorded platform's wake signal, runs PUSH-016 and returns the wake outcome, an enum of `new_data`, `no_data` and `failed` whose failure is present only for `failed`. A wake that arrives while another runs on the same instance joins it and starts no second pull. Adding pipeline assertions, conformance entries and matrix rows only adds enforcement, which AGENTS.md allows. SDK wrappers are PUSH-017, PUSH-018 and PUSH-020.",
       "acceptanceCriteria": [
-        "Each of the three bridges exports the operations.",
-        "`pipeline_wiring.rs` asserts that each export reaches the registrar.",
-        "The matrix has a `Push` domain with `register`, `deregister` and `handle_wake` rows.",
-        "A UniFFI test with a Rust-side fake provider under `testing` proves that `push_enable` calls `register_push` exactly once."
+        "Each of the three bridges exports `push_enable`, `push_disable` and `push_handle_wake`, and `scripts/bridge-aliases.json` maps no other name to them.",
+        "`push_enable` and `push_disable` are async on every bridge and return `PushRelayOutcomes`.",
+        "The platform and the wake outcome are enums on every bridge; no push export takes or returns either as a free-form string.",
+        "`pipeline_wiring.rs` asserts that each `push_handle_wake` export reaches `scp_ffi_common::push::handle_wake`, and that the UniFFI export calls `handle_notification` first.",
+        "The matrix has a `Push` domain with `enable`, `disable` and `handle_wake` rows.",
+        "A UniFFI test with a Rust-side fake provider proves that `push_enable` returns SCP-TRANS-5104 and calls `register_push` zero times, that `push_handle_wake` calls `handle_notification` once and returns SCP-TRANS-5080 for invalid wake bytes, and that an instance enabled for `Fcm` whose provider returns the APNs wake bytes returns SCP-TRANS-5080.",
+        "On all three bridges, a wake on a shut-down instance returns the `failed` outcome SCP-TRANS-5085, and a wake on an instance with no enabled platform returns SCP-TRANS-5105.",
+        "Two concurrent wakes on a cold supervisor run `replay_unresolved_sagas` once and dial each relay once.",
+        "`scripts/check-pyi-generated.sh` passes, with every push class and enum in `_scp_core.pyi`."
       ],
       "actionItems": [
-        "Write the shared push module in `scp-ffi/common` and the three bridge exports.",
-        "Add the pipeline assertions, the conformance entries and the matrix rows."
+        "Write the shared push module in `scp-ffi/common`, its single-flight wake and the three bridge exports.",
+        "Add the pipeline assertions, the conformance entries and the matrix rows, and regenerate the Python stub and the Swift bindings."
       ],
       "blockedBy": [
         "PUSH-014",
         "PUSH-016",
-        "PUSH-019",
-        "PUSH-036"
+        "PUSH-019"
       ],
       "sources": [
         {
@@ -1168,7 +1188,8 @@
         "Add `Scp.handleRemoteNotification` and `ApplePlatformAdapter.make()`."
       ],
       "blockedBy": [
-        "PUSH-015"
+        "PUSH-015",
+        "PUSH-037"
       ],
       "sources": [
         {
@@ -1222,7 +1243,8 @@
         "Wire `make(context)` and `Scp.onMessageReceived`."
       ],
       "blockedBy": [
-        "PUSH-015"
+        "PUSH-015",
+        "PUSH-037"
       ],
       "sources": [
         {
@@ -1315,7 +1337,8 @@
         "Write the two wrappers and flip the matrix cells."
       ],
       "blockedBy": [
-        "PUSH-015"
+        "PUSH-015",
+        "PUSH-037"
       ],
       "sources": [
         {
@@ -1573,7 +1596,8 @@
         "PUSH-021",
         "PUSH-004",
         "PUSH-007",
-        "PUSH-015"
+        "PUSH-015",
+        "PUSH-037"
       ],
       "sources": [
         {
@@ -1952,8 +1976,8 @@
         "checklist": {
           "dispatch": "PUSH-013",
           "pw": "yes",
-          "ffi": "PUSH-015",
-          "sdk": "PUSH-015",
+          "ffi": "PUSH-037",
+          "sdk": "PUSH-017, PUSH-018, PUSH-020",
           "matrix": "PUSH-015"
         }
       }
@@ -2361,8 +2385,8 @@
       "details": {
         "checklist": {
           "dispatch": "PUSH-013",
-          "ffi": "PUSH-015",
-          "sdk": "PUSH-015",
+          "ffi": "PUSH-037",
+          "sdk": "PUSH-017, PUSH-018, PUSH-020",
           "pw": "n/a",
           "matrix": "PUSH-015"
         }
@@ -2379,7 +2403,7 @@
         "crates/scp-runtime/src/push/mod.rs",
         "crates/scp-transport/src/native/push_publisher.rs"
       ],
-      "description": "\u00a710.7.1 step 3 and \u00a722.11.4 have the registrant sign a push message with the P-256 key its key state lists `Current` in the `#active` role. The device's `#active` key is Ed25519 until SCP-315 moves it to P-256, so PUSH-014 ships its registrar with a `PushSigningKey` that only `testing` can build. This story adds the production constructor, which takes the custody handle the device's key state lists `Current` in `#active` and no other handle, and proves the two criteria that need that key. PUSH-015's `push_enable` is the first production caller.",
+      "description": "\u00a710.7.1 step 3 and \u00a722.11.4 have the registrant sign a push message with the P-256 key its key state lists `Current` in the `#active` role. The device's `#active` key is Ed25519 until SCP-315 moves it to P-256, so PUSH-014 ships its registrar with a `PushSigningKey` that only `testing` can build. This story adds the production constructor, which takes the custody handle the device's key state lists `Current` in `#active` and no other handle, and proves the two criteria that need that key. PUSH-037's `push_enable` is the first production caller.",
       "acceptanceCriteria": [
         "`PushSigningKey` has a constructor outside `testing` that takes the custody handle the device's key state lists `Current` in the `#active` role, and it refuses any other handle.",
         "Against a relay wired with the signature-checking test verifier of PUSH-005, which checks a real P-256 signature against a key the test supplies and compiles only under `testing` and the device's `#active` public key, `register` stores one registration per relay.",
@@ -2419,9 +2443,64 @@
         "checklist": {
           "dispatch": "PUSH-013",
           "pw": "PUSH-014",
-          "ffi": "PUSH-015",
-          "sdk": "PUSH-015",
+          "ffi": "PUSH-037",
+          "sdk": "PUSH-017, PUSH-018, PUSH-020",
           "matrix": "PUSH-015"
+        }
+      }
+    },
+    {
+      "id": "PUSH-037",
+      "title": "push_enable and push_disable run the registrar with the device's `#active` key",
+      "gate": "gate-push-client",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-ffi/common/src/push.rs",
+        "crates/scp-ffi/uniffi/src/push.rs",
+        "crates/scp-ffi/napi/src/push.rs",
+        "crates/scp-ffi/src/push.rs",
+        "crates/scp-testing/tests/integration/pipeline_wiring.rs"
+      ],
+      "description": "PUSH-015 exports `push_enable` and `push_disable` on every bridge (UniFFI `push_enable(provider, platform)`, napi and Python `push_enable(platform, token)`), and each returns SCP-TRANS-5104 through the `push_registration_unavailable` stub, because the registrar signs with the device's P-256 `#active` key and no production constructor builds it until PUSH-036. This story replaces the stub. `push_enable` takes the token (UniFFI calls `register_push()` once; napi and Python use the `token` argument), runs the PUSH-014 registrar with the `PushSigningKey` PUSH-036 builds from the key state's `#active` handle and the instance's push publisher, keeps the registrar's task in a per-instance slot, and records the platform, and on UniFFI the provider, in the instance's push slot. `push_disable` runs `deregister` and clears both slots. Each returns `PushRelayOutcomes`, built from the registrar's `RelayOutcomes`: one entry per relay in `deregistered` and in `registered`, each naming the relay URL and, for a relay that refused, carrying the failure's PUSH-019 code and message. Each registrar `PushError` maps to its PUSH-019 code at the FFI boundary. SCP-TRANS-5104 is retired with the stub and never reused (`.docs/standards/sdk-common.md`).",
+      "acceptanceCriteria": [
+        "A UniFFI test with a Rust-side fake provider under `testing` proves that `push_enable` calls `register_push` exactly once.",
+        "`pipeline_wiring.rs` asserts that `push_enable` and `push_disable` on every bridge reach the registrar.",
+        "`push_enable` and `push_disable` return `PushRelayOutcomes` with one entry for each relay the registrar addressed.",
+        "A registration that every relay refused is reported as such, never as success.",
+        "Each registrar `PushError` returned through an export carries its own registered code, never SCP-TRANS-5104.",
+        "No production path reaches `push_registration_unavailable` after this story; the stub is deleted, and no export returns SCP-TRANS-5104."
+      ],
+      "actionItems": [
+        "Bind the registrar to the instance's push publisher and the PUSH-036 signing key in each bridge's `push_enable` and `push_disable`.",
+        "Map each `PushError` to its code, build `PushRelayOutcomes` from `RelayOutcomes`, and add the pipeline assertions."
+      ],
+      "blockedBy": [
+        "PUSH-015",
+        "PUSH-036"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.7.1 Push Registration Protocol"
+        },
+        {
+          "file": ".docs/adrs/phase-5.md",
+          "section": "## ADR-025: Apple Platform Adapter"
+        },
+        {
+          "file": ".docs/adrs/phase-6.md",
+          "section": "## ADR-027: Android Platform Adapter"
+        }
+      ],
+      "details": {
+        "checklist": {
+          "dispatch": "PUSH-013",
+          "ffi": "yes",
+          "pw": "yes",
+          "matrix": "PUSH-015",
+          "sdk": "PUSH-017, PUSH-018, PUSH-020"
         }
       }
     }

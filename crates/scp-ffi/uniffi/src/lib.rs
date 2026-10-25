@@ -74,6 +74,7 @@ use std::time::Duration;
 pub mod bridge;
 pub mod outlet_stream;
 pub mod p256_host;
+pub mod push;
 pub mod runtime;
 pub mod scp;
 // Test-only custody handle and P-256 oracles for host tests; never in a
@@ -671,7 +672,8 @@ pub trait PushProvider: Send + Sync {
     /// states: "Push payloads MUST contain a wake signal and nothing else. No
     /// context ID, no sender identifier, no message preview, no metadata of any
     /// kind." A wake signal built from the received bytes would hand the caller
-    /// whatever a relay put in them. No Rust code calls this method yet.
+    /// whatever a relay put in them. `Scp::push_handle_wake` calls it and
+    /// checks the returned bytes against the enabled platform's wake signal.
     async fn handle_notification(&self, payload: Vec<u8>) -> Result<Vec<u8>, ScpError>;
 }
 

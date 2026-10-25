@@ -375,6 +375,74 @@ class NodeHandle:
     def rollback_deploy(self, context_id: str, deploy_id: str) -> None: ...
     def disable_site_projection(self, context_id: str) -> None: ...
 
+class PushPlatform:
+    """The push service a device's token belongs to (``SCP.push_enable``)."""
+
+    APNS: PushPlatform
+    FCM: PushPlatform
+    WEB_PUSH: PushPlatform
+
+class WakeOutcomeKind:
+    """What a wake reports to the platform (``WakeOutcome.outcome``)."""
+
+    NEW_DATA: WakeOutcomeKind
+    NO_DATA: WakeOutcomeKind
+    FAILED: WakeOutcomeKind
+
+class WakeContextFailure:
+    """One context a failed wake could not pull."""
+
+    @property
+    def context_id(self) -> str: ...
+    @property
+    def code(self) -> str: ...
+    @property
+    def message(self) -> str: ...
+
+class WakeFailure:
+    """Why a wake failed; present only when the outcome is ``FAILED``."""
+
+    @property
+    def code(self) -> str: ...
+    @property
+    def message(self) -> str: ...
+    @property
+    def context_ids(self) -> list[str]: ...
+    @property
+    def context_failures(self) -> list[WakeContextFailure]: ...
+
+class WakeOutcome:
+    """The result of ``SCP.push_handle_wake``."""
+
+    @property
+    def outcome(self) -> WakeOutcomeKind: ...
+    @property
+    def failure(self) -> WakeFailure | None: ...
+
+class PushRelayFailure:
+    """Why one relay refused a push registration or deregistration."""
+
+    @property
+    def code(self) -> str: ...
+    @property
+    def message(self) -> str: ...
+
+class PushRelayResult:
+    """One relay's result; ``failure`` is ``None`` when the relay accepted."""
+
+    @property
+    def relay_url(self) -> str: ...
+    @property
+    def failure(self) -> PushRelayFailure | None: ...
+
+class PushRelayOutcomes:
+    """Each relay's result for ``SCP.push_enable`` or ``SCP.push_disable``."""
+
+    @property
+    def deregistered(self) -> list[PushRelayResult]: ...
+    @property
+    def registered(self) -> list[PushRelayResult]: ...
+
 # ---------------------------------------------------------------------------
 # SCP class (Phase 4 PR 4 — #1549 façade consolidation, ADR-048)
 # ---------------------------------------------------------------------------
@@ -684,6 +752,11 @@ class SCP:
     ) -> Any: ...
     def relay_start_in_memory(self) -> Any: ...
     def relay_start_local(self, data_dir: Any) -> Any: ...
+
+    # -- push --
+    def push_enable(self, platform: PushPlatform, token: bytes) -> PushRelayOutcomes: ...
+    def push_disable(self) -> PushRelayOutcomes: ...
+    def push_handle_wake(self, payload: bytes) -> WakeOutcome: ...
 
     # -- scpid --
     def scpid_sign(

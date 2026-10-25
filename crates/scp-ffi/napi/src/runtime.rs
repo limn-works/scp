@@ -392,6 +392,14 @@ pub struct NapiBridgeInstance {
     /// reference bridge's `PyBridgeInstance::outlet_streaming_saga_registry`.
     pub(crate) outlet_streaming_saga_registry:
         Arc<StreamRegistry<String, scp_ffi_common::streaming_saga::StreamingSagaEntry>>,
+
+    /// The push platform enabled on this instance, whose wake signal
+    /// `pushHandleWake` checks each payload against (ADR-025 criterion 4).
+    ///
+    /// Story PUSH-037's `pushEnable` fills it; until then only the `testing`
+    /// installer does, so a shipped build's wake returns `SCP-TRANS-5105`.
+    /// Cleared on shutdown.
+    pub(crate) push: scp_ffi_common::push::PushSlot<scp_core::discovery::PushPlatform>,
 }
 
 /// Permit cap for [`NapiBridgeInstance::recovery_semaphore`].
@@ -461,6 +469,7 @@ impl NapiBridgeInstance {
             recovery_semaphore: Arc::new(tokio::sync::Semaphore::new(RECOVERY_CONCURRENCY_CAP)),
             outlet_stream_registry,
             outlet_streaming_saga_registry,
+            push: scp_ffi_common::push::PushSlot::default(),
         }
     }
 
@@ -592,6 +601,7 @@ impl NapiBridgeInstance {
             recovery_semaphore: Arc::new(tokio::sync::Semaphore::new(RECOVERY_CONCURRENCY_CAP)),
             outlet_stream_registry,
             outlet_streaming_saga_registry,
+            push: scp_ffi_common::push::PushSlot::default(),
         }
     }
 
@@ -718,6 +728,7 @@ impl BridgeInstanceCore for NapiBridgeInstance {
         // shutdown-hook closure) in #1549 Phase 4 PR 2 commit 4.
         self.mcp_server_registry.clear();
         self.mcp_client_registry.clear();
+        self.push.clear();
         // Reset the full-stack test network slot. Best-effort: on lock
         // poisoning we leave the slot alone — a poisoned mutex means
         // another thread panicked while holding it, which is a larger

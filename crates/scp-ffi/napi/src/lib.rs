@@ -137,6 +137,7 @@ pub mod outlet_stream;
 pub mod outlets;
 pub mod p256_host;
 pub mod provenance;
+pub mod push;
 pub mod runtime;
 pub mod scp;
 pub mod scpid;

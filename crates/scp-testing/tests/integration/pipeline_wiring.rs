@@ -168,6 +168,13 @@ const RECONNECT_DRIVER_SRC: &str =
 // signer-free pull in `reconnect.rs`.
 const PUSH_WAKE_SRC: &str = include_str!("../../../../crates/scp-ffi/common/src/push.rs");
 
+// Push export sources (story PUSH-015). The
+// push_handle_wake_exports_reach_handle_wake assertion below pins each
+// bridge's `push_handle_wake` to the shared `handle_wake`.
+const UNIFFI_PUSH_SRC: &str = include_str!("../../../../crates/scp-ffi/uniffi/src/push.rs");
+const NAPI_PUSH_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/push.rs");
+const PYO3_PUSH_SRC: &str = include_str!("../../../../crates/scp-ffi/src/push.rs");
+
 // Actor messaging-handler source — owns `handle_build_local_checkpoint`,
 // the actor-turn body that builds AND broadcasts the Phase-3 checkpoint so
 // the FFI driver never needs the `pub(crate)` `send_checkpoint` across the
@@ -4467,6 +4474,57 @@ fn push_wake_targets_reach_push_helpers() {
         assert!(
             !wake.contains(forbidden),
             "push_helpers::wake_target must read no previous routing ID, found `{forbidden}`"
+        );
+    }
+}
+
+/// Story PUSH-015: each bridge's `push_handle_wake` export reaches
+/// `scp_ffi_common::push::handle_wake`. UniFFI first asks the host's
+/// `PushProvider` for the wake bytes (`handle_notification`) and passes those
+/// bytes on; napi and PyO3 pass the payload through `push_handle_wake_on`.
+/// Every bridge reads shutdown and the enabled platform through the shared
+/// `begin_wake` first, so a shut-down instance answers the same outcome on
+/// all three and the host's provider is never asked.
+#[test]
+fn push_handle_wake_exports_reach_handle_wake() {
+    let uniffi = extract_fn_body(UNIFFI_PUSH_SRC, "push_handle_wake")
+        .expect("UniFFI push_handle_wake must exist in uniffi/src/push.rs");
+    let begin = uniffi
+        .find("begin_wake(")
+        .expect("UniFFI push_handle_wake must call scp_ffi_common::push::begin_wake");
+    let notify = uniffi
+        .find(".handle_notification(")
+        .expect("UniFFI push_handle_wake must call provider.handle_notification");
+    let wake = uniffi
+        .find("push::handle_wake(")
+        .expect("UniFFI push_handle_wake must call scp_ffi_common::push::handle_wake");
+    assert!(
+        begin < notify,
+        "UniFFI push_handle_wake must call begin_wake before handle_notification"
+    );
+    assert!(
+        notify < wake,
+        "UniFFI push_handle_wake must call handle_notification before handle_wake"
+    );
+    for (bridge, export_src, helper_src) in [
+        ("napi", NAPI_SCP_SRC, NAPI_PUSH_SRC),
+        ("PyO3", PYO3_PUSH_SRC, PYO3_PUSH_SRC),
+    ] {
+        assert!(
+            fn_body_contains(export_src, "push_handle_wake", "push_handle_wake_on("),
+            "{bridge} push_handle_wake must call push_handle_wake_on"
+        );
+        let helper = extract_fn_body(helper_src, "push_handle_wake_on")
+            .unwrap_or_else(|| panic!("{bridge} push_handle_wake_on must exist"));
+        let begin = helper
+            .find("begin_wake(")
+            .unwrap_or_else(|| panic!("{bridge} push_handle_wake_on must call begin_wake"));
+        let wake = helper.find("push::handle_wake(").unwrap_or_else(|| {
+            panic!("{bridge} push_handle_wake_on must call scp_ffi_common::push::handle_wake")
+        });
+        assert!(
+            begin < wake,
+            "{bridge} push_handle_wake_on must call begin_wake before handle_wake"
         );
     }
 }

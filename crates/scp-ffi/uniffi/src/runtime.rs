@@ -445,6 +445,14 @@ pub struct UniffiBridgeInstance {
     /// stream.
     pub(crate) outlet_streaming_saga_registry:
         Arc<StreamRegistry<String, scp_ffi_common::streaming_saga::StreamingSagaEntry>>,
+
+    /// The push provider and platform enabled on this instance, which
+    /// `push_handle_wake` hands each payload to (ADR-025 criterion 4).
+    /// Per instance, never a `static` (`check-no-bridge-globals.sh`). Story
+    /// PUSH-037's `push_enable` fills it; until then only the `testing`
+    /// installer does, so a shipped build's wake returns `SCP-TRANS-5105`.
+    /// Cleared on shutdown, which drops the host's provider.
+    pub(crate) push: scp_ffi_common::push::PushSlot<crate::push::EnabledPush>,
 }
 
 impl std::fmt::Debug for UniffiBridgeInstance {
@@ -508,6 +516,7 @@ impl UniffiBridgeInstance {
             durable_providers: Some(durable_providers),
             outlet_stream_registry,
             outlet_streaming_saga_registry,
+            push: scp_ffi_common::push::PushSlot::default(),
         }
     }
 
@@ -655,6 +664,7 @@ impl UniffiBridgeInstance {
             durable_providers: Some(durable_providers),
             outlet_stream_registry,
             outlet_streaming_saga_registry,
+            push: scp_ffi_common::push::PushSlot::default(),
         }
     }
 
@@ -1889,6 +1899,9 @@ impl BridgeInstanceCore for UniffiBridgeInstance {
         // shutdown (the caller normally holds its own `Arc`).
         self.identity_link_attestation_registry.clear();
         self.context_handle_registry.clear();
+        // Drop the host's push provider, so a shut-down instance holds no
+        // callback into Swift or Kotlin.
+        self.push.clear();
     }
 }
 

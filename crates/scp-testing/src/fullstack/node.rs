@@ -236,7 +236,12 @@ impl ContextPersistence for StorePersistence {
         Ok(())
     }
 
+    /// Yields once before it reads, as a host store's list is I/O that
+    /// suspends the caller: a task running a restore gives way here, so a
+    /// test can drive a second caller into the restore window before the
+    /// first caller's restore makes any actor resident.
     async fn list_persisted_contexts(&self) -> Result<Vec<String>, PersistError> {
+        tokio::task::yield_now().await;
         Ok(self.0.lock().keys().cloned().collect())
     }
 }
