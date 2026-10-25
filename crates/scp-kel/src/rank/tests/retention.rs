@@ -15,7 +15,7 @@ use proptest::prelude::*;
 use proptest::test_runner::{Config, TestCaseError, TestRng, TestRunner};
 
 use super::super::holder::{AcceptedChainHolder, HoldOutcome};
-use super::super::retention::{Bounds, RetainedSuffix, Slot, plan_evictions};
+use super::super::retention::{Bounds, Guard, RetainedSuffix, Slot, plan_evictions};
 use super::super::{
     Admission, AdoptedBasis, BasisKind, ForkRank, PersistedSuffix, Rerank, RestoreError,
     RetentionBasis, RetentionError, RetentionSet,
@@ -1120,7 +1120,19 @@ fn plan_evictions_holds_the_eviction_rule() {
                     .collect()
             };
             let refs: Vec<&Slot> = held.iter().collect();
-            match plan_evictions(&refs, &protected, replacing, &candidate, bounds) {
+            let guards: Vec<Guard> = protected
+                .iter()
+                .map(|protected| {
+                    if *protected {
+                        Guard::Tied {
+                            beaten_by: Vec::new(),
+                        }
+                    } else {
+                        Guard::Open
+                    }
+                })
+                .collect();
+            match plan_evictions(&refs, &guards, replacing, &candidate, bounds) {
                 Some(evicted) => {
                     prop_assert_eq!(order.get(..evicted.len()), Some(evicted.as_slice()));
                     prop_assert!(fits(&without(&evicted)));
@@ -1292,6 +1304,129 @@ fn beats(left: &ValidatedChain, right: &ValidatedChain) -> bool {
         Ok(super::ChainPairing::Diverged(divergence))
             if divergence.ranks[0].number() < divergence.ranks[1].number()
     )
+}
+
+/// R9's tied-head rule read after each victim: the byte bound needs two
+/// evictions among three rank-3 suffixes, and Y is a tied head once X, the
+/// one suffix beating it, leaves. The plan evicts X, the most recently
+/// observed, then W, never Y.
+///
+/// Mutant (run, then restored): `guarded` protects a tied head only where
+/// nothing held beats it, read once before the plan, so the plan evicts X
+/// and then Y.
+#[test]
+fn plan_protects_a_tied_head_its_first_victim_beat() {
+    let slot = |id: u8, observed| Slot {
+        rank: ForkRank::Rank3,
+        observed,
+        events: vec![(digest(id), 10)],
+    };
+    let w = slot(1, 1);
+    let y = slot(2, 2);
+    let x = slot(3, 3);
+    let candidate = slot(4, 4);
+    let guards = [Guard::Open, Guard::Tied { beaten_by: vec![2] }, Guard::Open];
+    let bounds = Bounds {
+        suffixes: 8,
+        bytes: 20,
+    };
+    assert_eq!(
+        plan_evictions(&[&w, &y, &x], &guards, None, &candidate, bounds),
+        Some(vec![2, 0])
+    );
+}
+
+/// R9's tie prefix where the bounds refuse every chain carrying it while a
+/// chain extending the accepted chain A is retained: the byte bound holds
+/// L, one event past A, and refuses both tied chains, which carry the tie
+/// prefix P's event past A. The set records the longest prefix of P a held
+/// chain carries, A itself, so L keeps its rank, the set persists no event
+/// of P past A, and it restores with L and that prefix.
+///
+/// Mutant (run, then restored): `settled` records no prefix wherever no
+/// held chain carries the whole one, so `restore` refuses L as an
+/// extension of the accepted chain.
+#[test]
+fn tie_prefix_settles_to_the_longest_carried_prefix() -> TestResult {
+    let mut keys = Keys::new()?;
+    let a = Branch::of(&mut keys, &[Kind::Reveal], 0)?;
+    let mut p = a.clone();
+    p.push(&mut keys, Kind::KeyState, 0)?;
+    let mut t1 = p.clone();
+    t1.push(&mut keys, Kind::Reveal, 1)?;
+    let mut t2 = p.clone();
+    t2.push(&mut keys, Kind::CoSigns, 2)?;
+    let mut l = a.clone();
+    l.push(&mut keys, Kind::KeyState, 3)?;
+    let mut set = bounded(&a, 8, tail(&l));
+    let report = set.after_contest(
+        p.chain.clone(),
+        [t1.chain.clone(), t2.chain.clone(), l.chain.clone()],
+    )?;
+    assert_eq!(report.refused, vec![t1.head(), t2.head()]);
+    assert_eq!(heads(&set), BTreeSet::from([l.head()]));
+    assert_eq!(set.tie_prefix(), Some(&a.chain));
+    let retained = by_head(&set, l.head())?;
+    assert_eq!(
+        (retained.rank(), retained.fork_position()),
+        (ForkRank::Rank3, 2)
+    );
+    let saved = set.persisted();
+    let stored: u64 = saved.units.iter().map(|unit| unit.len() as u64).sum();
+    assert_eq!(
+        stored,
+        a.unit_lens.iter().sum::<u64>() + set.retained_bytes()
+    );
+    let restored = RetentionSet::restore(
+        &a.chain.identifier(),
+        &saved,
+        AdoptedBasis::Accepted { head: a.head() },
+    )?;
+    assert_eq!(restored.suffixes(), set.suffixes());
+    assert_eq!(restored.tie_prefix(), Some(&a.chain));
+    Ok(())
+}
+
+/// R9's tie prefix after an admission evicts its last carrier: two
+/// `{Lost}` recoveries off the accepted chain A beat both tied chains past
+/// the prefix P and, at a count bound of two, evict them one at a time. No
+/// held chain then carries P, both recoveries extend A, so the set records
+/// A and restores.
+///
+/// Mutant (run, then restored): `admit` skips settling the tie prefix, so
+/// the set keeps P, which no held chain carries, and `restore` refuses it.
+#[test]
+fn admission_evicting_the_last_carrier_settles_the_tie_prefix() -> TestResult {
+    let mut keys = Keys::new()?;
+    let a = Branch::of(&mut keys, &[Kind::Reveal], 0)?;
+    let mut p = a.clone();
+    p.push(&mut keys, Kind::KeyState, 0)?;
+    let mut t1 = p.clone();
+    t1.push(&mut keys, Kind::KeyState, 1)?;
+    let mut t2 = p.clone();
+    t2.push(&mut keys, Kind::KeyState, 2)?;
+    let mut set = bounded(&a, 2, u64::MAX);
+    let report = set.after_contest(p.chain.clone(), [t1.chain.clone(), t2.chain.clone()])?;
+    assert!(report.refused.is_empty());
+    assert_eq!(set.tie_prefix(), Some(&p.chain));
+    for owner in [3, 4] {
+        let mut recovery = a.clone();
+        recovery.push(&mut keys, Kind::Lost, owner)?;
+        assert!(matches!(
+            set.admit(recovery.chain)?,
+            Admission::Retained { ref evicted, .. } if evicted.len() == 1
+        ));
+    }
+    assert!(!heads(&set).contains(&t1.head()) && !heads(&set).contains(&t2.head()));
+    assert_eq!(set.tie_prefix(), Some(&a.chain));
+    let restored = RetentionSet::restore(
+        &a.chain.identifier(),
+        &set.persisted(),
+        AdoptedBasis::Accepted { head: a.head() },
+    )?;
+    assert_eq!(restored.suffixes(), set.suffixes());
+    assert_eq!(restored.tie_prefix(), set.tie_prefix());
+    Ok(())
 }
 
 /// The test's own model of R9's refusal, and what a run reached.

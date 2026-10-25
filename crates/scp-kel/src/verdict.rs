@@ -648,7 +648,9 @@ fn prefix_of(
 /// is the basis. Each tied chain of `ranked` and each chain of `read` the
 /// set did not hold is admitted: a tied chain at R9's early stop may sit
 /// only on a source stopped at the fetch bound, and R7 retains it as
-/// evidence.
+/// evidence. Over an accepted basis the admission runs inside
+/// [`RetentionSet::after_contest`], so the tie prefix settles once every
+/// candidate is placed.
 fn contested(
     held: Option<&RetentionSet>,
     contest: Contest,
@@ -657,18 +659,26 @@ fn contested(
 ) -> Result<Classification, ClassifyError> {
     let prefix = prefix_of(ranked, contest.shared_prefix_head, contest.fork_position)?;
     let mut refused = Refused::default();
-    let set = match held {
-        Some(held) => {
-            let mut set = held.clone();
-            refused.rerank(set.after_contest(prefix)?);
-            set
-        }
-        None => RetentionSet::new(RetentionBasis::ContestedPrefix(prefix)),
-    };
     let tied = ranked
         .iter()
         .filter(|chain| contest.heads.contains(&chain.head_digest()));
-    let set = admit_new(set, held, tied.chain(read), &mut refused)?;
+    let set = match held {
+        Some(held) => {
+            let mut set = held.clone();
+            let candidates = tied
+                .chain(read)
+                .filter(|chain| !holds(held, &chain.head_digest()))
+                .cloned();
+            refused.rerank(set.after_contest(prefix, candidates)?);
+            set
+        }
+        None => admit_new(
+            RetentionSet::new(RetentionBasis::ContestedPrefix(prefix)),
+            None,
+            tied.chain(read),
+            &mut refused,
+        )?,
+    };
     let residue = refused.residue(&set);
     Ok(Classification {
         verdict: ResolutionVerdict::Contested {

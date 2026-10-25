@@ -1586,3 +1586,57 @@ fn tied_suffixes_past_the_accepted_head_count_the_prefix_once() -> TestResult {
     assert_eq!(set.retained_bytes(), expected);
     Ok(())
 }
+
+/// R9's tie prefix where the bounds refuse every tied chain: eight `{Lost}`
+/// forks that the accepted chain A beats fill the count bound, and the
+/// tied chains past the prefix P, which extends A, rank 3 and evict no
+/// rank-2 fork. The set records no tie prefix, persists no event of P past
+/// A, and round-trips; the stored bytes are A's and the tally's.
+///
+/// Mutant (run, then restored): `after_contest` skips settling the tie
+/// prefix, so the set records P, which no held chain carries, and
+/// `restore` refuses it.
+#[test]
+fn refused_tie_records_no_prefix_and_round_trips() -> TestResult {
+    let mut keys = Keys::new()?;
+    let a = Branch::of(&mut keys, &[Kind::Reveal], 0)?;
+    let mut p = a.clone();
+    p.push(&mut keys, Kind::KeyState, 0)?;
+    let mut t1 = p.clone();
+    t1.push(&mut keys, Kind::KeyState, 1)?;
+    let mut t2 = p.clone();
+    t2.push(&mut keys, Kind::KeyState, 2)?;
+    let mut forks = Vec::new();
+    for owner in 3..=10 {
+        forks.push(Branch::of(&mut keys, &[Kind::Lost], owner)?);
+    }
+    let refs: Vec<&Branch> = forks.iter().collect();
+    let filled = run(Some(&accepted(&a)), &[exhausted("a", &refs, 1)])?;
+    assert_eq!(filled.verdict, ResolutionVerdict::Confirmed);
+    let result = run(Some(retention(&filled)?), &[exhausted("a", &[&t1, &t2], 1)])?;
+    assert_eq!(
+        result.verdict,
+        ResolutionVerdict::Contested {
+            tie: TieClass::Rank3Pending,
+            heads: sorted(vec![t1.head(), t2.head()]),
+            shared_prefix_head: p.head(),
+            fork_position: 3,
+            residue: 2,
+        }
+    );
+    let set = retention(&result)?;
+    assert_eq!(set.tie_prefix(), None);
+    assert_eq!(set.suffixes().len(), 8);
+    assert_eq!(round_trip(set)?, *set);
+    let stored: u64 = set
+        .persisted()
+        .units
+        .iter()
+        .map(|unit| unit.len() as u64)
+        .sum();
+    assert_eq!(
+        stored,
+        a.unit_lens.iter().sum::<u64>() + set.retained_bytes()
+    );
+    Ok(())
+}
