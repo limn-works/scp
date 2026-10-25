@@ -6,7 +6,15 @@
  */
 
 import { expect, test } from "bun:test";
-import { type JsKeyCustody, WebCryptoCustody } from "../src/index";
+import {
+  CryptoError,
+  type CustodyKeyType,
+  type JsKeyCustody,
+  KeyEventKeyRefusedError,
+  mapBridgeError,
+  ScpError,
+  WebCryptoCustody,
+} from "../src/index";
 
 const DID = "did:dht:z6MkExampleParticipantIdentityAAAAAAAAAAAA";
 
@@ -61,4 +69,37 @@ test("JsKeyCustody.generateKeypair accepts only the four custody key types", () 
   // the check on an unused directive.
   // @ts-expect-error "rsa" is not a CustodyKeyType.
   expect(() => custody.generateKeypair("rsa")).toThrow(/unwired custody SEAM/);
+});
+
+test("generateKeypair refuses a key-event key with the typed refusal, not the unwired SEAM", () => {
+  const custody = WebCryptoCustody.create({ did: DID });
+  let thrown: unknown;
+  try {
+    // @ts-expect-error "p256-key-event" is not a CustodyKeyType; the runtime check refuses it.
+    custody.generateKeypair("p256-key-event");
+  } catch (e) {
+    thrown = e;
+  }
+  expect(thrown).toBeInstanceOf(KeyEventKeyRefusedError);
+  expect(thrown).toBeInstanceOf(CryptoError);
+  expect(thrown).toBeInstanceOf(ScpError);
+  const refusal = thrown as KeyEventKeyRefusedError;
+  expect(refusal.code).toBe("SCP-CRYPTO-4060");
+  expect(refusal.keyType).toBe("p256-key-event");
+  expect(refusal.message).toMatch(/^\[SCP-CRYPTO-4060\] /);
+  expect(refusal.message).not.toMatch(/unwired custody SEAM/);
+  // mapBridgeError passes the typed refusal through, and classifies its message
+  // to a CryptoError with the same code when it arrives as a plain Error.
+  expect(mapBridgeError(refusal)).toBe(refusal);
+  const mapped = mapBridgeError(new Error(refusal.message));
+  expect(mapped).toBeInstanceOf(CryptoError);
+  expect(mapped.code).toBe("SCP-CRYPTO-4060");
+});
+
+test("CustodyKeyType does not admit the key-event key type", () => {
+  // `bun run check` type-checks this file: adding "p256-key-event" to
+  // CustodyKeyType leaves the directive unused and fails the check.
+  // @ts-expect-error "p256-key-event" is not a CustodyKeyType.
+  const t: CustodyKeyType = "p256-key-event";
+  expect(t as string).toBe("p256-key-event");
 });

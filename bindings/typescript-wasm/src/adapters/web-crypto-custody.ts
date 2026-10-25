@@ -46,7 +46,8 @@
  * a later slice can wire it."
  */
 
-import type { JsKeyCustody } from "./types";
+import { CryptoError } from "../errors";
+import type { CustodyKeyType, JsKeyCustody } from "./types";
 
 /** Options for {@link WebCryptoCustody.create}. */
 export interface WebCryptoCustodyOptions {
@@ -74,6 +75,37 @@ function unwiredSeam(method: string): Error {
       "than fabricate a value. On-device key custody + signing land with the " +
       "MLS-signing-key → WebCrypto move.",
   );
+}
+
+/** The key type the native SDKs mint only through `generate_key_event_keypair` (SCP-345). */
+const KEY_EVENT_KEY_TYPE = "p256-key-event";
+
+/**
+ * The code the native SDKs report for `PlatformError::WrongKeyType`
+ * (`crates/scp-ffi/common/src/error_codes.rs` `CRYPTO_4060`).
+ */
+const WRONG_KEY_TYPE_CODE = "SCP-CRYPTO-4060";
+
+/**
+ * Thrown by {@link WebCryptoCustody.generateKeypair} for `"p256-key-event"`: the
+ * browser client never mints a key-event key through `generateKeypair`, and that
+ * type is not a `CustodyKeyType`. SCP-311 and SCP-312 own the browser's
+ * key-event signer (SCP-345 AC19). It is a {@link CryptoError} with code
+ * `SCP-CRYPTO-4060`, the code the native SDKs report for a wrong key type.
+ */
+export class KeyEventKeyRefusedError extends CryptoError {
+  /** The refused key type, always `"p256-key-event"`. */
+  readonly keyType: typeof KEY_EVENT_KEY_TYPE = KEY_EVENT_KEY_TYPE;
+
+  constructor() {
+    super(
+      `[${WRONG_KEY_TYPE_CODE}] WebCryptoCustody.generateKeypair refuses "p256-key-event": ` +
+        "a key-event key is never minted through generateKeypair; the key-event signer " +
+        "owns it (fails closed).",
+      WRONG_KEY_TYPE_CODE,
+    );
+    this.name = "KeyEventKeyRefusedError";
+  }
 }
 
 export class WebCryptoCustody implements JsKeyCustody {
@@ -129,8 +161,16 @@ export class WebCryptoCustody implements JsKeyCustody {
     throw unwiredSeam("getPublicKey");
   }
 
-  /** Unwired custody SEAM — no driver call site this slice; fails closed. */
-  generateKeypair(_keyType: string): string {
+  /**
+   * Refuses `"p256-key-event"` with {@link KeyEventKeyRefusedError} before any other
+   * branch; every other type reaches the unwired custody SEAM and fails closed.
+   * The check runs at runtime because a JS caller or the wasm seam passes any
+   * string, whatever the declared {@link CustodyKeyType}.
+   */
+  generateKeypair(keyType: CustodyKeyType): string {
+    if ((keyType as string) === KEY_EVENT_KEY_TYPE) {
+      throw new KeyEventKeyRefusedError();
+    }
     throw unwiredSeam("generateKeypair");
   }
 

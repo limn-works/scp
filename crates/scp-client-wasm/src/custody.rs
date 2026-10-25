@@ -105,6 +105,10 @@ mod wasm_impl {
         /// Generates a keypair of type `key_type` (`"ed25519"`,
         /// `"p256"` or `"hpke-p256"`) and returns its opaque `key_id`.
         ///
+        /// This seam does not check the key type. For `"p256-key-event"`,
+        /// the TypeScript `WebCryptoCustody` refuses it; SCP-311 and SCP-312
+        /// own the key-event signer.
+        ///
         /// SEAM: see [`JsKeyCustody::sign`].
         #[wasm_bindgen(method, catch, js_name = "generateKeypair")]
         fn generate_keypair(this: &JsKeyCustody, key_type: &str) -> Result<String, JsValue>;
