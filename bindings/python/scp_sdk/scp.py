@@ -123,9 +123,10 @@ __all__ = [
 ]
 
 
-CustodyKeyType = Literal["ed25519", "p256", "hpke-p256"]
-"""The type of a custody key: Ed25519, ``"p256"`` (ECDSA P-256 signing) or
-``"hpke-p256"`` (P-256 ECDH for HPKE)."""
+CustodyKeyType = Literal["ed25519", "p256", "hpke-p256", "p256-key-event"]
+"""The type of a custody key: Ed25519, ``"p256"`` (ECDSA P-256 signing),
+``"hpke-p256"`` (P-256 ECDH for HPKE) or ``"p256-key-event"`` (ECDSA P-256
+that signs only key-event-log changes and custody probes, spec §9.7.4.1)."""
 
 CustodyKeyRole = Literal["identity", "operational"]
 """The role a custody key was minted in: ``"identity"`` (the only source a
@@ -213,8 +214,9 @@ class KeyCustodyProvider(Protocol):
     def sign(self, key_id: str, message: bytes) -> bytes:
         """Sign ``message`` under ``key_id``.
 
-        An Ed25519 key returns the 64-byte signature. A ``"p256"`` key
-        receives a 32-byte digest (§9.5.1, no second hash) and returns raw
+        An Ed25519 key returns the 64-byte signature. A ``"p256"`` or
+        ``"p256-key-event"`` key receives a 32-byte digest (§9.5.1, no second
+        hash) and returns raw
         ``r || s`` (64 bytes) or DER; the bridge normalises it to low-s and
         verifies it strictly against the key's public key, and any mismatch
         is an error. A software implementation MUST derive the ECDSA nonce by
@@ -227,21 +229,19 @@ class KeyCustodyProvider(Protocol):
 
         ``public_key`` is 32
         bytes for Ed25519, the 33-byte compressed SEC1 point for
-        ``"p256"``, and the 65-byte uncompressed SEC1 point for
-        ``"hpke-p256"``. The bridge registers the key under the stated type
-        and rejects a length that does not match it. A provider that holds no
+        ``"p256"`` and ``"p256-key-event"``, and the 65-byte uncompressed
+        SEC1 point for ``"hpke-p256"``. The bridge rejects a length that does
+        not match the stated type. A provider that holds no
         key for ``key_id`` raises :class:`~scp_sdk.errors.KeyNotFoundError`
         (or any exception whose ``code`` is ``"SCP-CRYPTO-4006"``), which
         callers receive as key-not-found; any other exception is a custody
         error.
 
         ``role`` is the role :meth:`generate_keypair` minted the key in,
-        reported in every session. A key id the bridge has not seen binds as
-        an identity only when ``role`` is ``"identity"``, so an identity from
-        an earlier session can still derive pseudonyms. The bridge cannot
-        check this answer: a provider that reports ``"identity"`` for a key
-        it minted as ``"operational"`` lets that key derive pseudonyms, and
-        that is outside the Rust core's control.
+        reported in every session. The bridge records each key's type and
+        role when it mints the key, in the instance storage, and refuses an
+        answer that disagrees with that record, in this session or a later
+        one. A key id with no record is key-not-found, with no callback.
         """
         ...
 

@@ -290,7 +290,12 @@ mod tests {
         let storage = Arc::new(InMemoryStorage::new());
         let records = store(&storage, NS_A);
         let mut id = 0;
-        for key_type in [KeyType::Ed25519, KeyType::P256Signing, KeyType::HpkeP256] {
+        for key_type in [
+            KeyType::Ed25519,
+            KeyType::P256Signing,
+            KeyType::HpkeP256,
+            KeyType::P256KeyEvent,
+        ] {
             for role in [KeyRole::Operational, KeyRole::Identity] {
                 id += 1;
                 records.put(KeyHandle::new(id), key_type, role).await?;
@@ -412,7 +417,7 @@ mod tests {
             ("unknown version 0", vec![0x00, 2, 0x00]),
             ("unknown version 2", vec![0x02, 2, 0x00]),
             ("retired type code 1", vec![0x01, 1, 0x00]),
-            ("unknown type code 4", vec![0x01, 4, 0x00]),
+            ("unknown type code 5", vec![0x01, 5, 0x00]),
             ("unknown role", vec![0x01, 2, 0x02]),
             ("short", vec![0x01, 2]),
             ("long", vec![0x01, 2, 0x00, 0x00]),

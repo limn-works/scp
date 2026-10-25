@@ -12,11 +12,13 @@ use crate::ScpError;
 /// A round trip runs through `CallbackKeyCustody` and the shared flows. A
 /// host not-found answers with the typed `SCP-CRYPTO-4006`; `sign_error`,
 /// when set, replaces every `sign` answer; `custody_type` is the string
-/// the provider reports for every key.
+/// the provider reports for every key; `signed` records the bytes each
+/// `sign` call hands the host.
 pub struct FakeHostProvider {
     pub host: Arc<scp_ffi_common::callback_custody::fake_host::FakeHost>,
     pub sign_error: Option<ScpError>,
     pub custody_type: &'static str,
+    pub signed: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
 }
 
 impl FakeHostProvider {
@@ -25,6 +27,7 @@ impl FakeHostProvider {
             host: Arc::clone(host),
             sign_error: None,
             custody_type: "software",
+            signed: Arc::default(),
         }
     }
 }
@@ -45,6 +48,13 @@ fn fake_host_err(e: &scp_platform::error::PlatformError) -> ScpError {
 #[async_trait::async_trait]
 impl crate::KeyCustodyProvider for FakeHostProvider {
     async fn sign(&self, key_id: String, message: Vec<u8>) -> Result<Vec<u8>, ScpError> {
+        self.signed
+            .lock()
+            .map_err(|_| ScpError::Context {
+                msg: "fake host sign log poisoned".to_owned(),
+                code: codes::CTX_2050.to_owned(),
+            })?
+            .push(message.clone());
         let answer = self
             .host
             .sign(&key_id, &message)

@@ -12,19 +12,24 @@
 //! key after `dh_agree` used it (an invitation open among them). [`KeyLoss`]
 //! names each of those steps.
 
-use scp_platform::PlatformError;
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{
     CustodyType, KeyCustody, KeyHandle, KeyType, Pseudonym, PublicKey, SharedSecret, Signature,
+};
+use scp_platform::{
+    CustodyProbe, IndexedSignature, KeyEventSignError, KeyEventSigner, PlatformError,
+    ProbeSignature, SigningChange,
 };
 
 /// The step at which [`KeyLossCustody`] loses a key.
 #[derive(Debug, Clone, Copy)]
 pub enum KeyLoss {
-    /// `generate_keypair` reports [`PlatformError::KeyNotFound`].
+    /// `generate_keypair` and `generate_key_event_keypair` report
+    /// [`PlatformError::KeyNotFound`].
     OnGenerate,
-    /// `generate_keypair` destroys the key it created before returning its
-    /// handle, so the next `public_key` on that handle is key-not-found.
+    /// `generate_keypair` and `generate_key_event_keypair` destroy the key
+    /// they created before returning its handle, so the next call on that
+    /// handle is key-not-found.
     AfterGenerate,
     /// `dh_agree` reports [`PlatformError::KeyNotFound`] without agreeing.
     OnDhAgree,
@@ -50,19 +55,55 @@ impl KeyLossCustody {
     }
 }
 
+impl KeyLossCustody {
+    /// Applies the generate-step loss to a key `minted` just created.
+    async fn after_mint(
+        &self,
+        minted: Result<KeyHandle, PlatformError>,
+    ) -> Result<KeyHandle, PlatformError> {
+        let handle = minted?;
+        if matches!(self.loss, KeyLoss::AfterGenerate) {
+            self.inner.destroy_key(&handle).await?;
+        }
+        Ok(handle)
+    }
+}
+
+impl KeyEventSigner for KeyLossCustody {
+    type Member = KeyHandle;
+
+    async fn sign_change(
+        &self,
+        member: &KeyHandle,
+        change: &SigningChange,
+    ) -> Result<IndexedSignature, KeyEventSignError> {
+        self.inner.sign_change(member, change).await
+    }
+
+    async fn sign_probe(
+        &self,
+        member: &KeyHandle,
+        probe: &CustodyProbe,
+    ) -> Result<ProbeSignature, KeyEventSignError> {
+        self.inner.sign_probe(member, probe).await
+    }
+}
+
 impl KeyCustody for KeyLossCustody {
     async fn generate_keypair(&self, key_type: KeyType) -> Result<KeyHandle, PlatformError> {
-        match self.loss {
-            KeyLoss::OnGenerate => Err(PlatformError::KeyNotFound),
-            KeyLoss::AfterGenerate => {
-                let handle = self.inner.generate_keypair(key_type).await?;
-                self.inner.destroy_key(&handle).await?;
-                Ok(handle)
-            }
-            KeyLoss::OnDhAgree | KeyLoss::AfterDhAgree => {
-                self.inner.generate_keypair(key_type).await
-            }
+        if matches!(self.loss, KeyLoss::OnGenerate) {
+            return Err(PlatformError::KeyNotFound);
         }
+        self.after_mint(self.inner.generate_keypair(key_type).await)
+            .await
+    }
+
+    async fn generate_key_event_keypair(&self) -> Result<KeyHandle, PlatformError> {
+        if matches!(self.loss, KeyLoss::OnGenerate) {
+            return Err(PlatformError::KeyNotFound);
+        }
+        self.after_mint(self.inner.generate_key_event_keypair().await)
+            .await
     }
 
     async fn generate_identity_keypair(&self) -> Result<KeyHandle, PlatformError> {

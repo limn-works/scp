@@ -37,6 +37,10 @@ use scp_platform::traits::{
     CustodyType, KeyCustody, KeyHandle, KeyRole, KeyType, Pseudonym, PublicKey, SharedSecret,
     Signature,
 };
+use scp_platform::{
+    CustodyProbe, IndexedSignature, KeyEventSignError, KeyEventSigner, ProbeSignature,
+    SigningChange,
+};
 
 use crate::error::ScpNapiError;
 #[cfg(feature = "testing")]
@@ -91,7 +95,7 @@ pub struct NapiKeyCustodyProvider {
     /// The host never reuses a key id: an id it returns here names no other
     /// key for the host's lifetime, even after that key is destroyed.
     #[napi(
-        ts_type = "(args: [\"ed25519\" | \"p256\" | \"hpke-p256\", \"identity\" | \"operational\"]) => { ok: boolean; value?: string; code?: string; message?: string }"
+        ts_type = "(args: [\"ed25519\" | \"p256\" | \"hpke-p256\" | \"p256-key-event\", \"identity\" | \"operational\"]) => { ok: boolean; value?: string; code?: string; message?: string }"
     )]
     pub generate_keypair:
         Function<'static, (NapiCustodyKeyType, NapiCustodyKeyRole), HostStringResult>,
@@ -106,20 +110,18 @@ pub struct NapiKeyCustodyProvider {
     )]
     pub sign: Function<'static, (String, Vec<u8>), HostBytesResult>,
     /// `(keyId: string) => { keyType, publicKey, role }` — the key's type
-    /// (`"ed25519"`, `"p256"` or `"hpke-p256"`) and its public
-    /// key: exactly 32 bytes (Ed25519), the 33-byte compressed SEC1
-    /// point (`"p256"`) or the 65-byte uncompressed SEC1 point
-    /// (`"hpke-p256"`). The bridge types the key from `keyType`, never from
-    /// the length, and refuses any other length. A key id the host does not
-    /// hold is a failure whose `code` is `"SCP-CRYPTO-4006"`. `role` is the
-    /// role `generateKeypair` minted the key in, reported across sessions. A
-    /// key id the bridge has not seen binds as an identity only when `role`
-    /// is `"identity"`. A `keyType` or `role` outside the two enums is a
-    /// custody error. The bridge cannot check the host's word: a host that
-    /// reports `"identity"` for a key it minted as `"operational"` lets that
-    /// key derive pseudonyms, which is outside Rust's control.
+    /// (`"ed25519"`, `"p256"`, `"hpke-p256"` or `"p256-key-event"`) and its
+    /// public key: exactly 32 bytes (Ed25519), the 33-byte compressed SEC1
+    /// point (`"p256"`, `"p256-key-event"`) or the 65-byte uncompressed SEC1
+    /// point (`"hpke-p256"`). The bridge refuses any other length. A key id
+    /// the host does not hold is a failure whose `code` is
+    /// `"SCP-CRYPTO-4006"`. `role` is the role `generateKeypair` minted the
+    /// key in, reported across sessions. A `keyType` or `role` outside the
+    /// two enums is a custody error, and so is an answer that disagrees with
+    /// the type and role the bridge recorded when it minted the key (ADR-021,
+    /// SCP-345).
     #[napi(
-        ts_type = "(keyId: string) => { ok: boolean; value?: { keyType: \"ed25519\" | \"p256\" | \"hpke-p256\"; publicKey: number[]; role: \"identity\" | \"operational\" }; code?: string; message?: string }"
+        ts_type = "(keyId: string) => { ok: boolean; value?: { keyType: \"ed25519\" | \"p256\" | \"hpke-p256\" | \"p256-key-event\"; publicKey: number[]; role: \"identity\" | \"operational\" }; code?: string; message?: string }"
     )]
     pub get_public_key: Function<'static, String, HostPublicKeyResult>,
     /// `(keyId: string) => void` — destroy key material.
@@ -185,6 +187,10 @@ pub enum NapiCustodyKeyType {
     /// A P-256 HPKE key-agreement key.
     #[napi(value = "hpke-p256")]
     HpkeP256,
+    /// A P-256 key-event key, which signs only key-event-log changes and
+    /// custody probes (spec 09 §9.7.4.1, SCP-345).
+    #[napi(value = "p256-key-event")]
+    P256KeyEvent,
 }
 
 impl From<KeyType> for NapiCustodyKeyType {
@@ -193,6 +199,7 @@ impl From<KeyType> for NapiCustodyKeyType {
             KeyType::Ed25519 => Self::Ed25519,
             KeyType::P256Signing => Self::P256,
             KeyType::HpkeP256 => Self::HpkeP256,
+            KeyType::P256KeyEvent => Self::P256KeyEvent,
         }
     }
 }
@@ -203,6 +210,7 @@ impl From<NapiCustodyKeyType> for KeyType {
             NapiCustodyKeyType::Ed25519 => Self::Ed25519,
             NapiCustodyKeyType::P256 => Self::P256Signing,
             NapiCustodyKeyType::HpkeP256 => Self::HpkeP256,
+            NapiCustodyKeyType::P256KeyEvent => Self::P256KeyEvent,
         }
     }
 }
@@ -630,11 +638,8 @@ impl<H> fmt::Debug for CallbackAdapter<H> {
 }
 
 impl<H> CallbackAdapter<H> {
-    fn over(host: H) -> Self {
-        Self {
-            host,
-            registry: CallbackKeyRegistry::new(),
-        }
+    const fn over(host: H, registry: CallbackKeyRegistry) -> Self {
+        Self { host, registry }
     }
 }
 
@@ -648,64 +653,86 @@ impl NapiCallbackKeyCustody {
     ///
     /// # Errors
     ///
+    /// `registry` holds the adapter's custody records: production passes
+    /// [`CallbackKeyRegistry::recorded`] over the instance storage, so every
+    /// handle resolves against its record and the host's word never types a
+    /// key (ADR-021, SCP-345).
+    ///
     /// Returns a `napi::Error` if any callback cannot be promoted to a
     /// threadsafe function.
-    pub fn from_provider(provider: NapiKeyCustodyProvider) -> napi::Result<Self> {
-        Ok(Self::over(CallbackTsfns {
-            generate_keypair: provider
-                .generate_keypair
-                .build_threadsafe_function()
-                .weak::<false>()
-                .build()?,
-            sign: provider
-                .sign
-                .build_threadsafe_function()
-                .weak::<false>()
-                .build()?,
-            get_public_key: provider
-                .get_public_key
-                .build_threadsafe_function()
-                .weak::<false>()
-                .build()?,
-            destroy_key: provider
-                .destroy_key
-                .build_threadsafe_function()
-                .weak::<false>()
-                .build()?,
-            dh_agree: provider
-                .dh_agree
-                .build_threadsafe_function()
-                .weak::<false>()
-                .build()?,
-            derive_pseudonym: provider
-                .derive_pseudonym
-                .build_threadsafe_function()
-                .weak::<false>()
-                .build()?,
-            derive_rotatable_pseudonym: provider
-                .derive_rotatable_pseudonym
-                .build_threadsafe_function()
-                .weak::<false>()
-                .build()?,
-            custody_type: provider
-                .custody_type
-                .build_threadsafe_function()
-                .weak::<false>()
-                .build()?,
-        }))
+    pub fn from_provider(
+        provider: NapiKeyCustodyProvider,
+        registry: CallbackKeyRegistry,
+    ) -> napi::Result<Self> {
+        Ok(Self::over(
+            CallbackTsfns {
+                generate_keypair: provider
+                    .generate_keypair
+                    .build_threadsafe_function()
+                    .weak::<false>()
+                    .build()?,
+                sign: provider
+                    .sign
+                    .build_threadsafe_function()
+                    .weak::<false>()
+                    .build()?,
+                get_public_key: provider
+                    .get_public_key
+                    .build_threadsafe_function()
+                    .weak::<false>()
+                    .build()?,
+                destroy_key: provider
+                    .destroy_key
+                    .build_threadsafe_function()
+                    .weak::<false>()
+                    .build()?,
+                dh_agree: provider
+                    .dh_agree
+                    .build_threadsafe_function()
+                    .weak::<false>()
+                    .build()?,
+                derive_pseudonym: provider
+                    .derive_pseudonym
+                    .build_threadsafe_function()
+                    .weak::<false>()
+                    .build()?,
+                derive_rotatable_pseudonym: provider
+                    .derive_rotatable_pseudonym
+                    .build_threadsafe_function()
+                    .weak::<false>()
+                    .build()?,
+                custody_type: provider
+                    .custody_type
+                    .build_threadsafe_function()
+                    .weak::<false>()
+                    .build()?,
+            },
+            registry,
+        ))
     }
 }
 
 impl<H: JsCustodyHost> KeyCustody for CallbackAdapter<H> {
     // The shared flows in `scp_ffi_common::callback_custody` hold every
     // key-type, length, role and signature rule; each closure is one host
-    // callback. Every entry point resolves a handle this adapter has not
-    // registered through `getPublicKey`.
+    // callback. Every entry point resolves a handle against its custody
+    // record, and checks the host's `getPublicKey` answer against it.
     async fn generate_keypair(&self, key_type: KeyType) -> Result<KeyHandle, PlatformError> {
         let h = &self.host;
         flow::generate_operational(
             &self.registry,
             key_type,
+            |key_type, role| h.generate_keypair(key_type, role),
+            |key_id| h.get_public_key(key_id),
+            |key_id| h.destroy_key(key_id),
+        )
+        .await
+    }
+
+    async fn generate_key_event_keypair(&self) -> Result<KeyHandle, PlatformError> {
+        let h = &self.host;
+        flow::generate_key_event(
+            &self.registry,
             |key_type, role| h.generate_keypair(key_type, role),
             |key_id| h.get_public_key(key_id),
             |key_id| h.destroy_key(key_id),
@@ -847,6 +874,42 @@ impl<H: JsCustodyHost> KeyCustody for CallbackAdapter<H> {
     }
 }
 
+impl<H: JsCustodyHost> KeyEventSigner for CallbackAdapter<H> {
+    type Member = KeyHandle;
+
+    async fn sign_change(
+        &self,
+        member: &KeyHandle,
+        change: &SigningChange,
+    ) -> Result<IndexedSignature, KeyEventSignError> {
+        let h = &self.host;
+        flow::sign_change(
+            &self.registry,
+            member,
+            change,
+            |key_id, data| h.sign(key_id, data),
+            |key_id| h.get_public_key(key_id),
+        )
+        .await
+    }
+
+    async fn sign_probe(
+        &self,
+        member: &KeyHandle,
+        probe: &CustodyProbe,
+    ) -> Result<ProbeSignature, KeyEventSignError> {
+        let h = &self.host;
+        flow::sign_probe(
+            &self.registry,
+            member,
+            probe,
+            |key_id, data| h.sign(key_id, data),
+            |key_id| h.get_public_key(key_id),
+        )
+        .await
+    }
+}
+
 // ---------------------------------------------------------------------------
 // NapiKeyCustody — enum dispatch wrapper
 // ---------------------------------------------------------------------------
@@ -909,6 +972,38 @@ impl NapiKeyCustody {
     }
 }
 
+impl KeyEventSigner for NapiKeyCustody {
+    type Member = KeyHandle;
+
+    async fn sign_change(
+        &self,
+        member: &KeyHandle,
+        change: &SigningChange,
+    ) -> Result<IndexedSignature, KeyEventSignError> {
+        match self {
+            #[cfg(feature = "testing")]
+            Self::InMemory(kc) => kc.0.sign_change(member, change).await,
+            Self::Callback(kc) => kc.sign_change(member, change).await,
+            #[cfg(feature = "testing")]
+            Self::File(kc) => kc.sign_change(member, change).await,
+        }
+    }
+
+    async fn sign_probe(
+        &self,
+        member: &KeyHandle,
+        probe: &CustodyProbe,
+    ) -> Result<ProbeSignature, KeyEventSignError> {
+        match self {
+            #[cfg(feature = "testing")]
+            Self::InMemory(kc) => kc.0.sign_probe(member, probe).await,
+            Self::Callback(kc) => kc.sign_probe(member, probe).await,
+            #[cfg(feature = "testing")]
+            Self::File(kc) => kc.sign_probe(member, probe).await,
+        }
+    }
+}
+
 impl KeyCustody for NapiKeyCustody {
     async fn generate_keypair(&self, key_type: KeyType) -> Result<KeyHandle, PlatformError> {
         match self {
@@ -917,6 +1012,16 @@ impl KeyCustody for NapiKeyCustody {
             Self::Callback(kc) => kc.generate_keypair(key_type).await,
             #[cfg(feature = "testing")]
             Self::File(kc) => kc.generate_keypair(key_type).await,
+        }
+    }
+
+    async fn generate_key_event_keypair(&self) -> Result<KeyHandle, PlatformError> {
+        match self {
+            #[cfg(feature = "testing")]
+            Self::InMemory(kc) => kc.0.generate_key_event_keypair().await,
+            Self::Callback(kc) => kc.generate_key_event_keypair().await,
+            #[cfg(feature = "testing")]
+            Self::File(kc) => kc.generate_key_event_keypair().await,
         }
     }
 
@@ -1335,10 +1440,12 @@ mod adapter_tests {
     use super::*;
 
     /// A [`JsCustodyHost`] over the shared fake host. `sign_error`, when set,
-    /// replaces every `sign` answer after the host call.
+    /// replaces every `sign` answer after the host call; `signed` records the
+    /// bytes each `sign` call hands the host.
     struct TestHost {
         host: Arc<FakeHost>,
         sign_error: Option<fn() -> PlatformError>,
+        signed: std::sync::Mutex<Vec<Vec<u8>>>,
     }
 
     impl JsCustodyHost for TestHost {
@@ -1351,6 +1458,7 @@ mod adapter_tests {
         }
 
         async fn sign(&self, key_id: String, data: Vec<u8>) -> Result<Vec<u8>, PlatformError> {
+            self.signed.lock().expect("lock").push(data.clone());
             let answer = self.host.sign(&key_id, &data)?;
             self.sign_error.map_or(Ok(answer), |e| Err(e()))
         }
@@ -1388,11 +1496,133 @@ mod adapter_tests {
         fn notify_custody_type(&self, _key_id: String) {}
     }
 
-    fn adapter(host: &Arc<FakeHost>) -> CallbackAdapter<TestHost> {
-        CallbackAdapter::over(TestHost {
+    fn test_host(host: &Arc<FakeHost>) -> TestHost {
+        TestHost {
             host: Arc::clone(host),
             sign_error: None,
-        })
+            signed: std::sync::Mutex::default(),
+        }
+    }
+
+    /// A registry over `storage`'s records in `slot`'s namespace, as
+    /// `identityCreateWithCustody` opens one over the instance storage.
+    fn recorded(
+        storage: &Arc<scp_platform::in_memory::InMemoryStorage>,
+        slot: &flow::CustodyNamespaceSlot,
+    ) -> CallbackKeyRegistry {
+        CallbackKeyRegistry::recorded(
+            flow::custody_record_store(Arc::clone(storage), slot)
+                .expect("no other adapter holds the namespace"),
+        )
+    }
+
+    fn adapter(host: &Arc<FakeHost>) -> CallbackAdapter<TestHost> {
+        CallbackAdapter::over(
+            test_host(host),
+            recorded(
+                &Arc::new(scp_platform::in_memory::InMemoryStorage::new()),
+                &flow::CustodyNamespaceSlot::fresh().expect("namespace"),
+            ),
+        )
+    }
+
+    /// A key-event key minted through `custody`, with its 33-byte public key.
+    async fn key_event_key(custody: &CallbackAdapter<TestHost>) -> (KeyHandle, [u8; 33]) {
+        let key = custody
+            .generate_key_event_keypair()
+            .await
+            .expect("key-event mint");
+        let public = custody
+            .public_key(&key)
+            .await
+            .expect("public key")
+            .as_bytes()
+            .try_into()
+            .expect("a key-event key is a 33-byte point");
+        (key, public)
+    }
+
+    /// AC7 (SCP-345): the custody record, not the host's word, types a key.
+    /// An adapter rebuilt over the same records refuses `sign` of a
+    /// key-event key the host now reports as `p256`, without a host call. A
+    /// registry that trusted the host's answer would sign.
+    #[tokio::test]
+    async fn rebuilt_adapter_refuses_sign_of_key_event_key_host_reports_p256() {
+        let host = Arc::new(FakeHost::default());
+        let storage = Arc::new(scp_platform::in_memory::InMemoryStorage::new());
+        let slot = flow::CustodyNamespaceSlot::fresh().expect("namespace");
+        let minted = CallbackAdapter::over(test_host(&host), recorded(&storage, &slot));
+        let (key, _) = key_event_key(&minted).await;
+        assert!(
+            flow::custody_record_store(Arc::clone(&storage), &slot).is_err(),
+            "a second adapter for a live namespace is refused"
+        );
+        drop(minted);
+
+        host.report_as(&key.id().to_string(), KeyType::P256Signing)
+            .expect("report");
+        let rebuilt = CallbackAdapter::over(test_host(&host), recorded(&storage, &slot));
+        let signs = host.calls("sign");
+        let refused = rebuilt.sign(&key, &[0x5a; 32]).await;
+        assert!(
+            matches!(
+                refused,
+                Err(PlatformError::WrongKeyType {
+                    expected: KeyType::P256Signing,
+                    actual: KeyType::P256KeyEvent,
+                })
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(host.calls("sign"), signs, "the refusal makes no host call");
+    }
+
+    /// AC8 (SCP-345): `sign_change` hands the host the change's 32-byte
+    /// digest `D`, never the preimage, and the raw low-`s` signature it
+    /// returns verifies strictly over `D` under the key.
+    #[tokio::test]
+    async fn sign_change_hands_host_the_change_digest() {
+        let host = Arc::new(FakeHost::default());
+        let custody = adapter(&host);
+        let (key, public) = key_event_key(&custody).await;
+        let change = scp_testing::conformance::key_custody::v41_signing_change();
+        let signed = custody
+            .sign_change(&key, &change)
+            .await
+            .expect("sign_change");
+        assert!(
+            matches!(signed, IndexedSignature::Raw { .. }),
+            "a callback custody signs the raw form, got {signed:?}"
+        );
+        let IndexedSignature::Raw { signature } = signed else {
+            return;
+        };
+        assert_eq!(
+            *custody.host.signed.lock().expect("lock"),
+            vec![change.digest().to_vec()]
+        );
+        let point = P256PublicKey::from_sec1(&public).expect("point");
+        verify_prehash_strict(&point, &change.digest(), &signature).expect("verifies over D");
+    }
+
+    /// AC8 (SCP-345): `sign_probe` hands the host the probe's raw digest,
+    /// never its nonce, and the signature verifies over the probe.
+    #[tokio::test]
+    async fn sign_probe_hands_host_the_probe_digest() {
+        let host = Arc::new(FakeHost::default());
+        let custody = adapter(&host);
+        let (key, public) = key_event_key(&custody).await;
+        let probe = CustodyProbe::fresh().expect("probe nonce");
+        custody
+            .sign_probe(&key, &probe)
+            .await
+            .expect("sign_probe")
+            .verify(&probe, &public)
+            .expect("verifies over the probe");
+        assert_eq!(
+            *custody.host.signed.lock().expect("lock"),
+            vec![probe.raw_digest().to_vec()]
+        );
     }
 
     /// P-256 sign and HPKE `dh_agree` through the adapter. The host
@@ -1589,16 +1819,22 @@ mod adapter_tests {
         ));
         assert_eq!(host.calls("sign"), 1);
 
-        let transport = CallbackAdapter::over(TestHost {
-            host: Arc::clone(&host),
-            sign_error: Some(|| {
-                scp_ffi_common::custody_parse::host_failure(
-                    "sign",
-                    Some("ECONNRESET"),
-                    "socket closed",
-                )
-            }),
-        });
+        let transport = CallbackAdapter::over(
+            TestHost {
+                sign_error: Some(|| {
+                    scp_ffi_common::custody_parse::host_failure(
+                        "sign",
+                        Some("ECONNRESET"),
+                        "socket closed",
+                    )
+                }),
+                ..test_host(&host)
+            },
+            recorded(
+                &Arc::new(scp_platform::in_memory::InMemoryStorage::new()),
+                &flow::CustodyNamespaceSlot::fresh().expect("namespace"),
+            ),
+        );
         let key = transport
             .generate_keypair(KeyType::Ed25519)
             .await

@@ -11334,10 +11334,10 @@ class SignOnlyCustody:
             .set_item("_scp_core_export_signer", &signer_module)
             .unwrap();
 
-        let active_handle_id = crate::runtime::with_identity(bi, did, |entry| {
-            Ok(entry.identity.active_signing_key.id())
-        })
-        .unwrap();
+        let active_handle =
+            crate::runtime::with_identity(bi, did, |entry| Ok(entry.identity.active_signing_key))
+                .unwrap();
+        let active_handle_id = active_handle.id();
 
         let provider_module = PyModule::from_code(
             py,
@@ -11352,11 +11352,23 @@ class SignOnlyCustody:
             .call1((active_handle_id,))
             .unwrap();
         let provider = crate::custody::PyKeyCustodyProvider::new(py, obj.unbind()).unwrap();
-        // The adapter resolves the identity's existing active handle through
-        // the provider's structured `get_public_key` on first use, as it does
-        // any handle it did not mint; no adoption step is needed.
+        // The adapter's records hold the identity's existing active handle
+        // as the Ed25519 identity key it is, so the adapter resolves it
+        // through the provider's structured `get_public_key` on first use.
+        let registry = crate::runtime()
+            .unwrap()
+            .block_on(
+                scp_ffi_common::callback_custody::CallbackKeyRegistry::recorded_in_memory_holding(
+                    &[(
+                        active_handle,
+                        scp_platform::KeyType::Ed25519,
+                        scp_platform::KeyRole::Identity,
+                    )],
+                ),
+            )
+            .unwrap();
         let sign_only_custody = Arc::new(crate::custody::FfiKeyCustody::Callback(
-            crate::custody::PyCallbackKeyCustody::new(provider),
+            crate::custody::PyCallbackKeyCustody::new(provider, registry),
         ));
 
         crate::runtime::with_identity_mut(bi, did, |entry| {

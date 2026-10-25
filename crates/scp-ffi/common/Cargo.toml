@@ -170,6 +170,10 @@ z-base-32 = { workspace = true }
 tokio-tungstenite = { version = "0.24", features = ["connect"] }
 futures = "0.3"
 scp-relay-client = { path = "../../scp-relay-client" }
+# `callback_custody` tests sign spec 25 Vector 41's change, and
+# `tests/conformance_callback_custody.rs` expands `key_custody_conformance!`
+# against the callback flows over the fake host.
+scp-testing = { path = "../../scp-testing" }
 
 [lints]
 workspace = true

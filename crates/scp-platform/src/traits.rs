@@ -41,17 +41,26 @@ pub enum KeyType {
     /// P-256 key-agreement key (HPKE `DHKEM(P-256, HKDF-SHA256)`). Its public
     /// key is the 65-byte uncompressed SEC1 point; it only performs ECDH.
     HpkeP256,
+    /// P-256 key-event key: a member of an identity's signing set that signs
+    /// only a key event's digest `D` or a custody probe's raw digest, through
+    /// [`KeyEventSigner`](scp_kel::KeyEventSigner) (`09-security-model.md`
+    /// §9.7.4.2 R10). [`KeyCustody::generate_key_event_keypair`] is its one
+    /// mint, in the [`KeyRole::Operational`] role; [`KeyCustody::sign`],
+    /// [`KeyCustody::dh_agree`] and both pseudonym derivations refuse it. Its
+    /// public key is the 33-byte compressed SEC1 point (SCP-345).
+    P256KeyEvent,
 }
 
 impl KeyType {
-    /// The type's name in a host custody contract: `"ed25519"`, `"p256"` or
-    /// `"hpke-p256"` (ADR-021, amended 2026-10-10).
+    /// The type's name in a host custody contract: `"ed25519"`, `"p256"`,
+    /// `"hpke-p256"` or `"p256-key-event"` (ADR-021, amended 2026-10-10).
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Ed25519 => "ed25519",
             Self::P256Signing => "p256",
             Self::HpkeP256 => "hpke-p256",
+            Self::P256KeyEvent => "p256-key-event",
         }
     }
 
@@ -63,13 +72,15 @@ impl KeyType {
             "ed25519" => Some(Self::Ed25519),
             "p256" => Some(Self::P256Signing),
             "hpke-p256" => Some(Self::HpkeP256),
+            "p256-key-event" => Some(Self::P256KeyEvent),
             _ => None,
         }
     }
 
     /// The type's one-byte code in a `SqliteKeyCustody` key row and in a
     /// custody record (spec §17.3 `custody/record/{namespace}/{key_id}`):
-    /// `0` Ed25519, `2` P-256 signing, `3` HPKE P-256. Code 1 named the
+    /// `0` Ed25519, `2` P-256 signing, `3` HPKE P-256, `4` P-256 key event.
+    /// Code 1 named the
     /// retired X25519 type and is never reused. `FileKeyCustody` keeps its own
     /// §17.8 bytes.
     pub(crate) const fn storage_code(self) -> u8 {
@@ -77,6 +88,7 @@ impl KeyType {
             Self::Ed25519 => 0,
             Self::P256Signing => 2,
             Self::HpkeP256 => 3,
+            Self::P256KeyEvent => 4,
         }
     }
 
@@ -87,6 +99,7 @@ impl KeyType {
             0 => Some(Self::Ed25519),
             2 => Some(Self::P256Signing),
             3 => Some(Self::HpkeP256),
+            4 => Some(Self::P256KeyEvent),
             _ => None,
         }
     }
@@ -548,15 +561,335 @@ impl WakeSignal {
 /// only inspects local state.
 ///
 /// See ADR-006 for the full design rationale.
-pub trait KeyCustody: Send + Sync {
+///
+/// [`KeyEventSigner`](scp_kel::KeyEventSigner)'s methods and
+/// [`generate_key_event_keypair`](Self::generate_key_event_keypair) have no
+/// default body (SCP-345), so an implementor that omits `sign_change` does
+/// not compile:
+///
+/// ```compile_fail,E0046
+/// use core::future::{Future, ready};
+/// use scp_platform::{
+///     CustodyProbe, CustodyType, IndexedSignature, KeyCustody, KeyEventSignError, KeyEventSigner,
+///     KeyHandle, KeyType, MaybeSend, PlatformError, ProbeSignature, Pseudonym, PublicKey,
+///     SharedSecret, Signature, SigningChange,
+/// };
+///
+/// struct Custody;
+///
+/// impl KeyEventSigner for Custody {
+///     type Member = KeyHandle;
+///
+///     fn sign_probe(
+///         &self,
+///         _member: &KeyHandle,
+///         _probe: &CustodyProbe,
+///     ) -> impl Future<Output = Result<ProbeSignature, KeyEventSignError>> + MaybeSend {
+///         ready(Err(KeyEventSignError::MemberNotFound))
+///     }
+/// }
+///
+/// impl KeyCustody for Custody {
+///     fn generate_keypair(
+///         &self,
+///         _key_type: KeyType,
+///     ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send {
+///         ready(Err(PlatformError::Unsupported("no key")))
+///     }
+///
+///     fn generate_key_event_keypair(
+///         &self,
+///     ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send {
+///         ready(Err(PlatformError::Unsupported("no key-event key")))
+///     }
+///
+///     fn generate_identity_keypair(
+///         &self,
+///     ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send {
+///         ready(Err(PlatformError::Unsupported("no identity key")))
+///     }
+///
+///     fn sign(
+///         &self,
+///         _key: &KeyHandle,
+///         _data: &[u8],
+///     ) -> impl Future<Output = Result<Signature, PlatformError>> + Send {
+///         ready(Err(PlatformError::Unsupported("no sign")))
+///     }
+///
+///     fn public_key(
+///         &self,
+///         _key: &KeyHandle,
+///     ) -> impl Future<Output = Result<PublicKey, PlatformError>> + Send {
+///         ready(Err(PlatformError::Unsupported("no public key")))
+///     }
+///
+///     fn destroy_key(&self, _key: &KeyHandle) -> impl Future<Output = Result<(), PlatformError>> + Send {
+///         ready(Err(PlatformError::Unsupported("no destroy")))
+///     }
+///
+///     fn dh_agree(
+///         &self,
+///         _key: &KeyHandle,
+///         _peer_public: &[u8],
+///     ) -> impl Future<Output = Result<SharedSecret, PlatformError>> + Send {
+///         ready(Err(PlatformError::Unsupported("no agreement")))
+///     }
+///
+///     fn derive_pseudonym(
+///         &self,
+///         _key: &KeyHandle,
+///         _context_id: &[u8],
+///     ) -> impl Future<Output = Result<Pseudonym, PlatformError>> + Send {
+///         ready(Err(PlatformError::Unsupported("no pseudonym")))
+///     }
+///
+///     fn derive_rotatable_pseudonym(
+///         &self,
+///         _key: &KeyHandle,
+///         _context_id: &[u8],
+///         _pseudonym_epoch: u64,
+///     ) -> impl Future<Output = Result<Pseudonym, PlatformError>> + Send {
+///         ready(Err(PlatformError::Unsupported("no pseudonym")))
+///     }
+///
+///     fn custody_type(&self, _key: &KeyHandle) -> CustodyType {
+///         CustodyType::Software
+///     }
+/// }
+/// ```
+///
+/// Nor does one that omits the key-event mint:
+///
+/// ```compile_fail,E0046
+/// use core::future::{Future, ready};
+/// use scp_platform::{
+///     CustodyProbe, CustodyType, IndexedSignature, KeyCustody, KeyEventSignError, KeyEventSigner,
+///     KeyHandle, KeyType, MaybeSend, PlatformError, ProbeSignature, Pseudonym, PublicKey,
+///     SharedSecret, Signature, SigningChange,
+/// };
+///
+/// struct Custody;
+///
+/// impl KeyEventSigner for Custody {
+///     type Member = KeyHandle;
+///
+///     fn sign_change(
+///         &self,
+///         _member: &KeyHandle,
+///         _change: &SigningChange,
+///     ) -> impl Future<Output = Result<IndexedSignature, KeyEventSignError>> + MaybeSend {
+///         ready(Err(KeyEventSignError::MemberNotFound))
+///     }
+///
+///     fn sign_probe(
+///         &self,
+///         _member: &KeyHandle,
+///         _probe: &CustodyProbe,
+///     ) -> impl Future<Output = Result<ProbeSignature, KeyEventSignError>> + MaybeSend {
+///         ready(Err(KeyEventSignError::MemberNotFound))
+///     }
+/// }
+///
+/// impl KeyCustody for Custody {
+///     fn generate_keypair(
+///         &self,
+///         _key_type: KeyType,
+///     ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send {
+///         ready(Err(PlatformError::Unsupported("no key")))
+///     }
+///
+///     fn generate_identity_keypair(
+///         &self,
+///     ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send {
+///         ready(Err(PlatformError::Unsupported("no identity key")))
+///     }
+///
+///     fn sign(
+///         &self,
+///         _key: &KeyHandle,
+///         _data: &[u8],
+///     ) -> impl Future<Output = Result<Signature, PlatformError>> + Send {
+///         ready(Err(PlatformError::Unsupported("no sign")))
+///     }
+///
+///     fn public_key(
+///         &self,
+///         _key: &KeyHandle,
+///     ) -> impl Future<Output = Result<PublicKey, PlatformError>> + Send {
+///         ready(Err(PlatformError::Unsupported("no public key")))
+///     }
+///
+///     fn destroy_key(&self, _key: &KeyHandle) -> impl Future<Output = Result<(), PlatformError>> + Send {
+///         ready(Err(PlatformError::Unsupported("no destroy")))
+///     }
+///
+///     fn dh_agree(
+///         &self,
+///         _key: &KeyHandle,
+///         _peer_public: &[u8],
+///     ) -> impl Future<Output = Result<SharedSecret, PlatformError>> + Send {
+///         ready(Err(PlatformError::Unsupported("no agreement")))
+///     }
+///
+///     fn derive_pseudonym(
+///         &self,
+///         _key: &KeyHandle,
+///         _context_id: &[u8],
+///     ) -> impl Future<Output = Result<Pseudonym, PlatformError>> + Send {
+///         ready(Err(PlatformError::Unsupported("no pseudonym")))
+///     }
+///
+///     fn derive_rotatable_pseudonym(
+///         &self,
+///         _key: &KeyHandle,
+///         _context_id: &[u8],
+///         _pseudonym_epoch: u64,
+///     ) -> impl Future<Output = Result<Pseudonym, PlatformError>> + Send {
+///         ready(Err(PlatformError::Unsupported("no pseudonym")))
+///     }
+///
+///     fn custody_type(&self, _key: &KeyHandle) -> CustodyType {
+///         CustodyType::Software
+///     }
+/// }
+/// ```
+///
+/// The positive control, identical but for the omitted method:
+///
+/// ```
+/// use core::future::{Future, ready};
+/// use scp_platform::{
+///     CustodyProbe, CustodyType, IndexedSignature, KeyCustody, KeyEventSignError, KeyEventSigner,
+///     KeyHandle, KeyType, MaybeSend, PlatformError, ProbeSignature, Pseudonym, PublicKey,
+///     SharedSecret, Signature, SigningChange,
+/// };
+///
+/// struct Custody;
+///
+/// impl KeyEventSigner for Custody {
+///     type Member = KeyHandle;
+///
+///     fn sign_change(
+///         &self,
+///         _member: &KeyHandle,
+///         _change: &SigningChange,
+///     ) -> impl Future<Output = Result<IndexedSignature, KeyEventSignError>> + MaybeSend {
+///         ready(Err(KeyEventSignError::MemberNotFound))
+///     }
+///
+///     fn sign_probe(
+///         &self,
+///         _member: &KeyHandle,
+///         _probe: &CustodyProbe,
+///     ) -> impl Future<Output = Result<ProbeSignature, KeyEventSignError>> + MaybeSend {
+///         ready(Err(KeyEventSignError::MemberNotFound))
+///     }
+/// }
+///
+/// impl KeyCustody for Custody {
+///     fn generate_keypair(
+///         &self,
+///         _key_type: KeyType,
+///     ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send {
+///         ready(Err(PlatformError::Unsupported("no key")))
+///     }
+///
+///     fn generate_key_event_keypair(
+///         &self,
+///     ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send {
+///         ready(Err(PlatformError::Unsupported("no key-event key")))
+///     }
+///
+///     fn generate_identity_keypair(
+///         &self,
+///     ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send {
+///         ready(Err(PlatformError::Unsupported("no identity key")))
+///     }
+///
+///     fn sign(
+///         &self,
+///         _key: &KeyHandle,
+///         _data: &[u8],
+///     ) -> impl Future<Output = Result<Signature, PlatformError>> + Send {
+///         ready(Err(PlatformError::Unsupported("no sign")))
+///     }
+///
+///     fn public_key(
+///         &self,
+///         _key: &KeyHandle,
+///     ) -> impl Future<Output = Result<PublicKey, PlatformError>> + Send {
+///         ready(Err(PlatformError::Unsupported("no public key")))
+///     }
+///
+///     fn destroy_key(&self, _key: &KeyHandle) -> impl Future<Output = Result<(), PlatformError>> + Send {
+///         ready(Err(PlatformError::Unsupported("no destroy")))
+///     }
+///
+///     fn dh_agree(
+///         &self,
+///         _key: &KeyHandle,
+///         _peer_public: &[u8],
+///     ) -> impl Future<Output = Result<SharedSecret, PlatformError>> + Send {
+///         ready(Err(PlatformError::Unsupported("no agreement")))
+///     }
+///
+///     fn derive_pseudonym(
+///         &self,
+///         _key: &KeyHandle,
+///         _context_id: &[u8],
+///     ) -> impl Future<Output = Result<Pseudonym, PlatformError>> + Send {
+///         ready(Err(PlatformError::Unsupported("no pseudonym")))
+///     }
+///
+///     fn derive_rotatable_pseudonym(
+///         &self,
+///         _key: &KeyHandle,
+///         _context_id: &[u8],
+///         _pseudonym_epoch: u64,
+///     ) -> impl Future<Output = Result<Pseudonym, PlatformError>> + Send {
+///         ready(Err(PlatformError::Unsupported("no pseudonym")))
+///     }
+///
+///     fn custody_type(&self, _key: &KeyHandle) -> CustodyType {
+///         CustodyType::Software
+///     }
+/// }
+/// ```
+pub trait KeyCustody: Send + Sync + scp_kel::KeyEventSigner<Member = KeyHandle> {
     /// Generate a new keypair of the specified type.
     ///
     /// Ed25519 keys may be hardware-backed (Secure Enclave, Keystore).
     ///
     /// Returns an opaque [`KeyHandle`] that references the generated key.
+    ///
+    /// # Errors
+    ///
+    /// [`PlatformError::WrongKeyType`] for [`KeyType::P256KeyEvent`], whose
+    /// one mint is [`generate_key_event_keypair`](Self::generate_key_event_keypair)
+    /// (see [`refuse_key_event_mint`]).
     fn generate_keypair(
         &self,
         key_type: KeyType,
+    ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send;
+
+    /// Generate a key-event key: a P-256 key in the [`KeyRole::Operational`]
+    /// role, recorded as [`KeyType::P256KeyEvent`] (`09-security-model.md`
+    /// §9.7.4.2 R10; SCP-345). This is the type's one mint.
+    ///
+    /// The key signs only through [`KeyEventSigner`](scp_kel::KeyEventSigner):
+    /// [`sign`](Self::sign) and [`dh_agree`](Self::dh_agree) refuse it with
+    /// [`PlatformError::WrongKeyType`], and both pseudonym derivations with
+    /// [`PlatformError::NotIdentityKey`]. Its public key is the 33-byte
+    /// compressed SEC1 point.
+    ///
+    /// # Errors
+    ///
+    /// Any error the substrate returns when it cannot generate or keep the
+    /// key. A custody that cannot hold a key-event key returns
+    /// [`PlatformError::Unsupported`] or the refusal its other mints give.
+    fn generate_key_event_keypair(
+        &self,
     ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send;
 
     /// Generate the identity key (`#0`) of a new identity: an Ed25519 key in
@@ -1529,7 +1862,10 @@ pub(crate) fn sign_p256_digest(
 /// # Errors
 ///
 /// [`PlatformError::CustodyError`] when the signature cannot be computed.
-#[cfg(feature = "testing")]
+#[cfg(all(
+    feature = "software_platform",
+    any(feature = "file", feature = "sqlite", feature = "testing")
+))]
 pub(crate) fn sign_key_event_digest(
     key: &scp_crypto::p256::P256SecretKey,
     digest: &[u8; 32],
@@ -1646,14 +1982,40 @@ pub const fn require_derive_source(role: KeyRole, key_type: KeyType) -> Result<(
     Ok(())
 }
 
+/// Refuses [`KeyType::P256KeyEvent`] as an argument to
+/// [`KeyCustody::generate_keypair`].
+///
+/// Every `generate_keypair` implementation calls this first: a key-event
+/// key's one mint is [`KeyCustody::generate_key_event_keypair`] (SCP-345).
+///
+/// # Errors
+///
+/// [`PlatformError::WrongKeyType`] with `expected`
+/// [`KeyType::P256Signing`] and `actual` [`KeyType::P256KeyEvent`].
+pub const fn refuse_key_event_mint(key_type: KeyType) -> Result<(), PlatformError> {
+    if matches!(key_type, KeyType::P256KeyEvent) {
+        return Err(PlatformError::WrongKeyType {
+            expected: KeyType::P256Signing,
+            actual: KeyType::P256KeyEvent,
+        });
+    }
+    Ok(())
+}
+
 /// Every key type, listed through an exhaustive match so a new variant
 /// fails to compile here until every key-type byte table covers it.
 #[cfg(test)]
-fn all_key_types() -> [KeyType; 3] {
-    let all = [KeyType::Ed25519, KeyType::P256Signing, KeyType::HpkeP256];
+pub(crate) fn all_key_types() -> [KeyType; 4] {
+    let all = [
+        KeyType::Ed25519,
+        KeyType::P256Signing,
+        KeyType::HpkeP256,
+        KeyType::P256KeyEvent,
+    ];
     for t in all {
         match t {
-            KeyType::Ed25519 | KeyType::P256Signing | KeyType::HpkeP256 => {}
+            KeyType::Ed25519 | KeyType::P256Signing | KeyType::HpkeP256 | KeyType::P256KeyEvent => {
+            }
         }
     }
     all
@@ -1713,25 +2075,54 @@ mod tests {
         );
         assert_eq!(
             all_key_types().map(KeyType::storage_code),
-            [0, 2, 3],
+            [0, 2, 3, 4],
             "the SQLite rows already on disk fix these codes"
         );
+    }
+
+    /// Only the key-event type is refused as a `generate_keypair` argument.
+    #[test]
+    fn refuse_key_event_mint_refuses_only_the_key_event_type() {
+        for t in all_key_types() {
+            let refused = super::refuse_key_event_mint(t);
+            if t == KeyType::P256KeyEvent {
+                assert!(matches!(
+                    refused,
+                    Err(crate::error::PlatformError::WrongKeyType {
+                        expected: KeyType::P256Signing,
+                        actual: KeyType::P256KeyEvent,
+                    })
+                ));
+            } else {
+                assert!(refused.is_ok(), "{t:?}");
+            }
+        }
     }
 
     /// Every key type and role names itself in the host contract and parses
     /// back; a near miss in case or spelling parses to nothing.
     #[test]
     fn host_contract_names_round_trip() {
-        for t in [KeyType::Ed25519, KeyType::P256Signing, KeyType::HpkeP256] {
+        for t in all_key_types() {
             assert_eq!(KeyType::parse(t.as_str()), Some(t));
         }
         assert_eq!(KeyType::P256Signing.as_str(), "p256");
         assert_eq!(KeyType::HpkeP256.as_str(), "hpke-p256");
+        assert_eq!(KeyType::P256KeyEvent.as_str(), "p256-key-event");
         for r in [KeyRole::Identity, KeyRole::Operational] {
             assert_eq!(KeyRole::parse(r.as_str()), Some(r));
         }
         // `"x25519"` named a key type the custody contract no longer has.
-        for bad in ["P256", "", "hpke_p256", "Identity", "admin", "x25519"] {
+        for bad in [
+            "P256",
+            "",
+            "hpke_p256",
+            "Identity",
+            "admin",
+            "x25519",
+            "p256_key_event",
+            "p256-keyevent",
+        ] {
             assert_eq!(KeyType::parse(bad), None, "{bad}");
             assert_eq!(KeyRole::parse(bad), None, "{bad}");
         }

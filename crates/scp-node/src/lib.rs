@@ -3930,7 +3930,47 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
 #[doc(hidden)]
 pub struct NoOpCustody;
 
+impl scp_platform::KeyEventSigner for NoOpCustody {
+    type Member = scp_platform::KeyHandle;
+
+    fn sign_change(
+        &self,
+        _member: &scp_platform::KeyHandle,
+        _change: &scp_platform::SigningChange,
+    ) -> impl std::future::Future<
+        Output = Result<scp_platform::IndexedSignature, scp_platform::KeyEventSignError>,
+    > + Send {
+        std::future::ready(Err(scp_platform::PlatformError::StorageError(
+            "NoOpCustody: not configured".to_owned(),
+        )
+        .into()))
+    }
+
+    fn sign_probe(
+        &self,
+        _member: &scp_platform::KeyHandle,
+        _probe: &scp_platform::CustodyProbe,
+    ) -> impl std::future::Future<
+        Output = Result<scp_platform::ProbeSignature, scp_platform::KeyEventSignError>,
+    > + Send {
+        std::future::ready(Err(scp_platform::PlatformError::StorageError(
+            "NoOpCustody: not configured".to_owned(),
+        )
+        .into()))
+    }
+}
+
 impl KeyCustody for NoOpCustody {
+    fn generate_key_event_keypair(
+        &self,
+    ) -> impl std::future::Future<
+        Output = Result<scp_platform::KeyHandle, scp_platform::PlatformError>,
+    > + Send {
+        std::future::ready(Err(scp_platform::PlatformError::StorageError(
+            "NoOpCustody: not configured".to_owned(),
+        )))
+    }
+
     fn generate_keypair(
         &self,
         _key_type: scp_platform::KeyType,

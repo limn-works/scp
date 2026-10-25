@@ -428,6 +428,43 @@ async def test_host_reporting_the_retired_x25519_key_type_fails_with_4060(scp) -
     assert 'unknown key type "x25519"' in message, message
 
 
+def test_custody_key_type_names_the_four_types_the_bridge_parses() -> None:
+    """``CustodyKeyType`` names exactly the host key types the bridge parses,
+    the key-event type of spec 09 §9.7.4.1 (SCP-345) among them."""
+    import typing
+
+    assert set(typing.get_args(CustodyKeyType)) == {
+        "ed25519",
+        "p256",
+        "hpke-p256",
+        "p256-key-event",
+    }
+
+
+@pytest.mark.asyncio
+async def test_host_reporting_its_identity_key_as_a_key_event_key_fails_with_4060(scp) -> None:
+    """A host whose ``get_public_key`` reports ``"p256-key-event"`` for the
+    Ed25519 identity key it was asked to mint fails the operation with
+    ``SCP-CRYPTO-4060``: the bridge parses the key-event type and refuses an
+    answer whose type disagrees with the key it requested and recorded."""
+    from scp_sdk import _scp_core
+
+    class _ReportsKeyEvent(_FakeKeychain):
+        def get_public_key(self, key_id: str) -> CustodyPublicKey:
+            real = super().get_public_key(key_id)
+            if real.key_type != "ed25519":
+                return real
+            return CustodyPublicKey(
+                key_type="p256-key-event", public_key=real.public_key, role=real.role
+            )
+
+    with pytest.raises(_scp_core.ScpError) as excinfo:
+        await scp.identity_create_with_custody(_ReportsKeyEvent())
+    message = str(excinfo.value)
+    assert message.startswith("[SCP-CRYPTO-4060]"), message
+    assert "unknown key type" not in message, message
+
+
 @pytest.mark.asyncio
 async def test_key_not_found_error_from_the_host_reaches_the_caller_as_4006(scp) -> None:
     """A host that raises :class:`KeyNotFoundError` for a key id it does not

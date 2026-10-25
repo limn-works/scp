@@ -55,6 +55,31 @@
             return sValue.lexicographicallyPrecedes(halfOrder) || sValue == halfOrder
         }
 
+        /// The P-256 group order `n`, big-endian.
+        static let order: [UInt8] = [
+            0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0xBC, 0xE6, 0xFA, 0xAD, 0xA7, 0x17, 0x9E, 0x84, 0xF3, 0xB9, 0xCA, 0xC2, 0xFC, 0x63, 0x25, 0x51
+        ]
+
+        /// The raw `r || s` signature `raw` with `s` replaced by `n - s`
+        /// when `s` is high, the normalisation the bridge applies to a host's
+        /// P-256 signature.
+        static func lowS(_ raw: Data) -> Data {
+            guard !isLowS(raw) else { return raw }
+            let scalar = [UInt8](raw.suffix(32))
+            var negated = [UInt8](repeating: 0, count: 32)
+            var borrow = 0
+            for index in stride(from: 31, through: 0, by: -1) {
+                var difference = Int(order[index]) - Int(scalar[index]) - borrow
+                borrow = difference < 0 ? 1 : 0
+                if difference < 0 {
+                    difference += 256
+                }
+                negated[index] = UInt8(difference)
+            }
+            return raw.prefix(32) + Data(negated)
+        }
+
         static func randomDigest() -> Data {
             Data((0 ..< 32).map { _ in UInt8.random(in: .min ... .max) })
         }
@@ -258,6 +283,34 @@
             try await provider.destroyKey(keyId: wrapping)
         }
 
+        /// Spec 09 §9.7.4.1 (SCP-345): a key-event key mints in the P-256
+        /// store, signs a 32-byte digest, and reports `"p256-key-event"` with
+        /// a 33-byte point, also from an adapter reopened over the same
+        /// Keychain and store. A key persisted as `.p256` would report
+        /// `"p256"` after the reopen, which the bridge's record refuses.
+        @Test("a p256-key-event key generates, signs a digest and reports its type, also after a reopen")
+        func p256KeyEventGeneratesSignsAndReports() async throws {
+            let store = SoftwareP256KeyStore()
+            let provider: any KeyCustodyProvider = keyIds.p256Adapter(store)
+            let keyId = try await provider.generateKeypair(keyType: .p256KeyEvent, role: .operational)
+            let minted = try await provider.getPublicKey(keyId: keyId)
+            #expect(minted.keyType == .p256KeyEvent)
+            #expect(minted.role == .operational)
+            #expect(minted.publicKey.count == 33)
+
+            let digest = P256Fixture.randomDigest()
+            let der = try await provider.sign(keyId: keyId, message: digest)
+            let raw = try P256Fixture.lowS(P256.Signing.ECDSASignature(derRepresentation: der).rawRepresentation)
+            #expect(try testingP256VerifyStrict(publicKey: minted.publicKey, digest: digest, signature: raw))
+            #expect(await store.signCalls == 1)
+
+            let reopened: any KeyCustodyProvider = keyIds.p256Adapter(store)
+            let reported = try await reopened.getPublicKey(keyId: keyId)
+            #expect(reported.keyType == .p256KeyEvent)
+            #expect(reported.publicKey == minted.publicKey)
+            try await reopened.destroyKey(keyId: keyId)
+        }
+
         @Test("getPublicKey reports P-256 as 33 bytes and HPKE P-256 as 65 bytes, each with its role")
         func getPublicKeyReportsTypeLengthAndRole() async throws {
             let store = SoftwareP256KeyStore()
@@ -347,12 +400,13 @@
             let enclaveStore = SoftwareP256KeyStore()
             let softwareStore = SoftwareP256KeyStore()
             let minting = keyIds.p256Adapter(enclaveStore, enclaveAvailable: true, other: softwareStore)
-            let signing = try await minting.generateKeypair(keyType: "p256")
-            let wrapping = try await minting.generateKeypair(keyType: "hpke-p256")
+            let mintingBridge = TestingCallbackCustody(provider: minting)
+            let signing = try await mintingBridge.generateKeypair(keyType: .p256)
+            let wrapping = try await mintingBridge.generateKeypair(keyType: .hpkeP256)
 
             let reopened = keyIds.p256Adapter(softwareStore, enclaveAvailable: false, other: enclaveStore)
             #expect(reopened.mintBacking == .software)
-            let bridge = TestingCallbackCustody(provider: reopened)
+            let bridge = mintingBridge.reopen(provider: reopened)
             let signingPublic = try await bridge.publicKey(keyId: signing)
             let digest = P256Fixture.randomDigest()
             let signature = try await bridge.sign(keyId: signing, data: digest)

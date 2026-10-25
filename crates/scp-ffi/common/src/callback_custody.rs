@@ -1,5 +1,5 @@
-//! Shared key cache, host-answer validation and adapter flows for the
-//! callback-custody bridges.
+//! Shared key cache, custody records, host-answer validation and adapter
+//! flows for the callback-custody bridges.
 //!
 //! The `PyO3`, napi-rs, and `UniFFI` bridges adapt a host `KeyCustodyProvider`
 //! to [`KeyCustody`](scp_platform::KeyCustody). The host returns raw bytes, so
@@ -9,58 +9,66 @@
 //! - The host's `get_public_key` answers with a typed [`HostPublicKey`]: the
 //!   key's [`KeyType`], its public key, and the [`KeyRole`] the host minted it
 //!   in. [`registered_key`] requires the exact length for the stated type
-//!   (Ed25519 32, P-256 signing 33, HPKE P-256 65) and a valid key.
-//!   The bridge never infers a type from a length.
-//! - [`CallbackKeyRegistry`] caches the type, public key and role of each
-//!   handle this adapter minted or resolved. The host owns whether a key
-//!   exists: a handle the cache lacks (a host key from an earlier session, or
-//!   one destroyed in this session) is resolved through `get_public_key` the
-//!   same way in every entry point, and a host that no longer holds the key
-//!   answers key-not-found. A destroy drops the cache entry when the host
-//!   confirms it or reports the key absent. A resolution that awaits the
-//!   host while a destroy of the same id completes caches the destroyed key;
-//!   no operation succeeds from that entry alone, because each one either
-//!   calls the host, which answers key-not-found, or fails a type or role
-//!   check first.
+//!   (Ed25519 32, P-256 signing and P-256 key event 33, HPKE P-256 65) and a
+//!   valid key. The bridge never infers a type from a length.
+//! - A [`CustodyRecordStore`] fixes the type and role each key was minted
+//!   with (ADR-021, spec §17.3 `custody/record/{namespace}/{key_id}`). Every
+//!   mint writes its record before it returns. An unrecorded handle is
+//!   [`PlatformError::KeyNotFound`] with no host call, in every entry point,
+//!   and a host answer that disagrees with the record is refused, so the host
+//!   never decides a key's type or role. A registry built
+//!   [`unrecorded`](CallbackKeyRegistry::unrecorded) has no store: the keys it
+//!   minted itself are its records, and it mints no key-event key.
+//! - [`CallbackKeyRegistry`] caches the public key of each recorded handle
+//!   this adapter minted or resolved. A destroy drops the cache entry and the
+//!   record when the host confirms the key is gone or reports it absent.
 //! - Every host signature is verified: an Ed25519 signature strictly over the
 //!   data under the cached verifying key, a P-256 signature through
 //!   [`p256_host_signature`].
+//! - A key-event key ([`KeyType::P256KeyEvent`]) signs only a key-event
+//!   change digest or a custody probe digest ([`sign_change`],
+//!   [`sign_probe`]). Its record refuses [`sign`] before any host call
+//!   (spec 09 §9.7.4.2 R10).
 //! - Pseudonym derivation requires an Ed25519 [`KeyRole::Identity`] source
 //!   ([`scp_platform::require_derive_source`]). A pseudonym has no private key
 //!   (§9.10.4): the host returns only the 33-byte compressed point, which
 //!   becomes a [`Pseudonym`], and the cache records nothing for it.
 //!
-//! See ADR-006 and the per-bridge `CallbackKeyCustody` adapters.
+//! See ADR-006, ADR-021 and the per-bridge `CallbackKeyCustody` adapters.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::fmt;
+use std::sync::{Arc, Mutex};
 
 use ed25519_dalek::VerifyingKey;
+use rand_core::RngCore;
 use scp_crypto::p256::{
     COMPRESSED_POINT_LEN, P256PublicKey, SIGNATURE_LEN, UNCOMPRESSED_POINT_LEN, der_to_raw,
     normalize_low_s, verify_prehash_strict,
 };
 use scp_platform::error::PlatformError;
 use scp_platform::traits::{
-    KeyHandle, KeyRole, KeyType, Pseudonym, PublicKey, SharedSecret, Signature,
+    KeyHandle, KeyRole, KeyType, Pseudonym, PublicKey, SharedSecret, Signature, Storage,
+};
+use scp_platform::{
+    CustodyNamespace, CustodyProbe, CustodyRecord, CustodyRecordStore, IndexedSignature,
+    KeyEventSignError, ProbeSignature, SigningChange, StorageCustodyRecordStore,
+    refuse_key_event_mint,
 };
 
 /// A host's `get_public_key` answer: the key's type, its public key, and the
 /// role the host recorded when it minted the key.
 ///
-/// The host records the role `generate_keypair` named and reports it for
-/// the key's lifetime, across adapter instances, so a new adapter resolves
-/// an identity key from an earlier session as an identity. Rust cannot check
-/// the host's word: a host that reports [`KeyRole::Identity`] for a key it
-/// minted as operational lets that key derive pseudonyms, and that is outside
-/// the bridge's control.
+/// A recorded handle's answer must state the type and role its custody
+/// record holds, so a host that reports another type or role for a key is
+/// refused rather than believed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostPublicKey {
     /// The key's type.
     pub key_type: KeyType,
-    /// The public key: 32 bytes (Ed25519), the 33-byte compressed
-    /// SEC1 point ([`KeyType::P256Signing`]), or the 65-byte uncompressed SEC1
-    /// point ([`KeyType::HpkeP256`]).
+    /// The public key: 32 bytes (Ed25519), the 33-byte compressed SEC1 point
+    /// ([`KeyType::P256Signing`], [`KeyType::P256KeyEvent`]), or the 65-byte
+    /// uncompressed SEC1 point ([`KeyType::HpkeP256`]).
     pub public_key: Vec<u8>,
     /// The role the key was minted in.
     pub role: KeyRole,
@@ -107,6 +115,8 @@ pub enum RegisteredKey {
     P256Signing(P256PublicKey),
     /// A P-256 HPKE key and its public key.
     HpkeP256(P256PublicKey),
+    /// A P-256 key-event key and its public key.
+    P256KeyEvent(P256PublicKey),
 }
 
 impl RegisteredKey {
@@ -117,6 +127,7 @@ impl RegisteredKey {
             Self::Ed25519(_) => KeyType::Ed25519,
             Self::P256Signing(_) => KeyType::P256Signing,
             Self::HpkeP256(_) => KeyType::HpkeP256,
+            Self::P256KeyEvent(_) => KeyType::P256KeyEvent,
         }
     }
 
@@ -127,7 +138,7 @@ impl RegisteredKey {
     pub fn public_bytes(&self) -> Vec<u8> {
         match self {
             Self::Ed25519(vk) => vk.to_bytes().to_vec(),
-            Self::P256Signing(pk) => pk.to_compressed().to_vec(),
+            Self::P256Signing(pk) | Self::P256KeyEvent(pk) => pk.to_compressed().to_vec(),
             Self::HpkeP256(pk) => pk.to_uncompressed().to_vec(),
         }
     }
@@ -151,28 +162,248 @@ pub struct RegisteredEntry {
     pub role: KeyRole,
 }
 
-/// Handle → cached entry for the handles one adapter instance minted or
-/// resolved.
+/// Why a callback adapter's custody records could not be opened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CustodyLoadError {
+    /// Another live callback adapter holds this identity's custody namespace.
+    /// Two adapters over one namespace would each check and write its records
+    /// under their own lock, so the second is refused until the first drops.
+    NamespaceLive,
+    /// The operating system's random source failed while drawing a new
+    /// namespace; no namespace is drawn from a fallback.
+    RandomSource(String),
+}
+
+impl fmt::Display for CustodyLoadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NamespaceLive => f.write_str(
+                "another live callback custody adapter holds this identity's custody namespace",
+            ),
+            Self::RandomSource(detail) => write!(
+                f,
+                "the operating system's random source failed drawing a custody namespace: {detail}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CustodyLoadError {}
+
+impl From<CustodyLoadError> for PlatformError {
+    fn from(e: CustodyLoadError) -> Self {
+        Self::CustodyError(e.to_string())
+    }
+}
+
+/// The custody namespace an identity's registry entry keeps for its callback
+/// adapter (spec §17.3; SCP-345 decision D1).
+///
+/// The slot holds the [`CustodyNamespace`] while no adapter is live. Loading
+/// an adapter ([`custody_record_store`]) takes the namespace out by move and
+/// builds the adapter's one record store from it; the slot is empty until
+/// that adapter's [`CustodyRecords`] drop and return it. A second load while
+/// the first adapter lives finds the slot empty and is refused with
+/// [`CustodyLoadError::NamespaceLive`], so one namespace never backs two
+/// stores whose `put`s could interleave. Clones share one slot.
+#[derive(Debug, Clone)]
+pub struct CustodyNamespaceSlot(Arc<Mutex<Option<CustodyNamespace>>>);
+
+impl CustodyNamespaceSlot {
+    /// A slot holding a namespace drawn from the operating system's random
+    /// source, for a newly created callback identity.
+    ///
+    /// # Errors
+    ///
+    /// [`CustodyLoadError::RandomSource`] when the random source fails.
+    pub fn fresh() -> Result<Self, CustodyLoadError> {
+        let mut bytes = [0u8; 16];
+        rand_core::OsRng
+            .try_fill_bytes(&mut bytes)
+            .map_err(|e| CustodyLoadError::RandomSource(e.to_string()))?;
+        Ok(Self::holding(CustodyNamespace::from_bytes(bytes)))
+    }
+
+    /// A slot holding `namespace`.
+    #[must_use]
+    pub fn holding(namespace: CustodyNamespace) -> Self {
+        Self(Arc::new(Mutex::new(Some(namespace))))
+    }
+
+    /// Takes the namespace out, leaving the slot empty until the returned
+    /// lease drops.
+    fn take(&self) -> Result<(CustodyNamespace, NamespaceLease), CustodyLoadError> {
+        let namespace = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .ok_or(CustodyLoadError::NamespaceLive)?;
+        let lease = NamespaceLease {
+            slot: self.clone(),
+            bytes: *namespace.as_bytes(),
+        };
+        Ok((namespace, lease))
+    }
+}
+
+/// Returns its namespace to the slot when the adapter holding it drops.
+struct NamespaceLease {
+    slot: CustodyNamespaceSlot,
+    bytes: [u8; 16],
+}
+
+impl Drop for NamespaceLease {
+    fn drop(&mut self) {
+        // A poisoned slot still takes the namespace back: the lock guards a
+        // plain `Option`, which no panic leaves half-written.
+        *self
+            .slot
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(CustodyNamespace::from_bytes(self.bytes));
+    }
+}
+
+/// One callback adapter's custody records: the store scoped to its
+/// namespace, and the lease that returns the namespace to its identity's
+/// slot when the adapter drops.
+pub struct CustodyRecords {
+    // Declared before `lease`, so the store drops before the namespace
+    // returns to the slot and a later load builds the only live store.
+    store: Arc<dyn CustodyRecordStore>,
+    lease: Option<NamespaceLease>,
+}
+
+impl fmt::Debug for CustodyRecords {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CustodyRecords")
+            .field("leased", &self.lease.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl CustodyRecords {
+    /// Records over a store a test built and keeps a handle to, with no
+    /// namespace slot. Production adapters open theirs through
+    /// [`custody_record_store`].
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn unleased(store: Arc<dyn CustodyRecordStore>) -> Self {
+        Self { store, lease: None }
+    }
+}
+
+/// Opens the custody records of the callback adapter whose identity keeps
+/// `slot`, over the instance storage the operator selected (spec §17.6).
+///
+/// The namespace leaves the slot by move and returns when the adapter's
+/// records drop.
+///
+/// # Errors
+///
+/// [`CustodyLoadError::NamespaceLive`] while another adapter holds the slot's
+/// namespace.
+pub fn custody_record_store<S>(
+    storage: S,
+    slot: &CustodyNamespaceSlot,
+) -> Result<CustodyRecords, CustodyLoadError>
+where
+    S: Storage + Send + Sync + 'static,
+{
+    let (namespace, lease) = slot.take()?;
+    Ok(CustodyRecords {
+        store: Arc::new(StorageCustodyRecordStore::new(storage, namespace)),
+        lease: Some(lease),
+    })
+}
+
+/// The custody records and public-key cache of one callback adapter.
+///
+/// A handle is usable only when it has a record: in the adapter's
+/// [`CustodyRecordStore`] when the registry is
+/// [`recorded`](Self::recorded), or, for an
+/// [`unrecorded`](Self::unrecorded) registry, a cache entry this registry
+/// minted. An unrecorded registry binds no handle it did not mint, because
+/// [`resolve`] refuses a handle with no record before any host call, so its
+/// cache holds exactly its own mints.
 ///
 /// The cache is not the authority on whether a key exists; the host is. A
-/// handle the cache lacks is resolved through the host, and a destroy removes
-/// the entry when the host confirms the key is gone. An entry can outlive
-/// its key: a [`resolve`] that awaits the host's `get_public_key` while a
-/// [`destroy_key`] of the same id completes binds the destroyed key
-/// afterwards. Every operation on that entry still calls the host (which
-/// answers key-not-found) or fails a type or role check, and a later
-/// [`destroy_key`] drops it. The map holds at most one entry per key the
-/// caller minted or used.
-#[derive(Debug, Default)]
+/// recorded handle the cache lacks is resolved through the host, and a
+/// destroy removes the entry and the record when the host confirms the key
+/// is gone. The map holds at most one entry per key the caller minted or
+/// used.
 pub struct CallbackKeyRegistry {
     entries: Mutex<HashMap<u64, RegisteredEntry>>,
+    records: Option<CustodyRecords>,
+}
+
+impl fmt::Debug for CallbackKeyRegistry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CallbackKeyRegistry")
+            .field("records", &self.records)
+            .finish_non_exhaustive()
+    }
 }
 
 impl CallbackKeyRegistry {
-    /// An empty registry.
+    /// A registry whose keys' types and roles live in `records`.
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub fn recorded(records: CustodyRecords) -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            records: Some(records),
+        }
+    }
+
+    /// A registry over a fresh in-memory record store, for a test adapter
+    /// that needs records but no instance storage. Infallible: the namespace
+    /// is fixed, since the store is the registry's own.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn recorded_in_memory() -> Self {
+        Self::recorded(CustodyRecords::unleased(Arc::new(
+            scp_platform::StorageCustodyRecordStore::new(
+                scp_platform::in_memory::InMemoryStorage::new(),
+                CustodyNamespace::from_bytes([0; 16]),
+            ),
+        )))
+    }
+
+    /// [`recorded_in_memory`](Self::recorded_in_memory) already holding a
+    /// record for each `(handle, key type, role)` in `records`, for a test
+    /// that installs an adapter over keys another custody minted.
+    ///
+    /// # Errors
+    ///
+    /// Any record-store error.
+    #[cfg(any(test, feature = "testing"))]
+    pub async fn recorded_in_memory_holding(
+        records: &[(KeyHandle, KeyType, KeyRole)],
+    ) -> Result<Self, PlatformError> {
+        let store: Arc<dyn CustodyRecordStore> =
+            Arc::new(scp_platform::StorageCustodyRecordStore::new(
+                scp_platform::in_memory::InMemoryStorage::new(),
+                CustodyNamespace::from_bytes([0; 16]),
+            ));
+        for &(handle, key_type, role) in records {
+            store.put(handle, key_type, role).await?;
+        }
+        Ok(Self::recorded(CustodyRecords::unleased(store)))
+    }
+
+    /// A registry with no record store. It mints no key-event key, and only
+    /// the keys it minted itself are usable; every other handle is
+    /// [`PlatformError::KeyNotFound`] with no host call. Test-only: every
+    /// production adapter is record-backed (SCP-345).
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn unrecorded() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            records: None,
+        }
     }
 
     fn lock(
@@ -203,10 +434,10 @@ impl CallbackKeyRegistry {
         Ok(())
     }
 
-    /// Caches a host key resolved through `get_public_key`, in the role the
-    /// host reported. Resolution is a lookup a host may answer twice (two
+    /// Caches a recorded host key resolved through `get_public_key`, in its
+    /// recorded role. Resolution is a lookup a host may answer twice (two
     /// concurrent resolutions), so an id already cached with the same key
-    /// returns the cached entry, role and all.
+    /// returns the cached entry.
     ///
     /// # Errors
     ///
@@ -244,7 +475,7 @@ impl CallbackKeyRegistry {
         Ok(self.lock()?.get(&handle.id()).cloned())
     }
 
-    /// Drops a handle's entry, once the host has confirmed the key is gone.
+    /// Drops a handle's entry.
     ///
     /// # Errors
     ///
@@ -264,13 +495,52 @@ impl CallbackKeyRegistry {
         };
         Ok(self.lock()?.contains_key(&handle.id()))
     }
+
+    /// The record store, when this registry has one.
+    fn store(&self) -> Option<&dyn CustodyRecordStore> {
+        self.records.as_ref().map(|records| records.store.as_ref())
+    }
+}
+
+/// The record of `key`: the type and role it was minted with.
+///
+/// A [`recorded`](CallbackKeyRegistry::recorded) registry reads its store,
+/// a local storage read and never a host call. An
+/// [`unrecorded`](CallbackKeyRegistry::unrecorded) registry's records are
+/// the entries it minted.
+///
+/// # Errors
+///
+/// Any store error, including an undecodable record; a poisoned registry.
+pub async fn record_of(
+    registry: &CallbackKeyRegistry,
+    key: &KeyHandle,
+) -> Result<Option<CustodyRecord>, PlatformError> {
+    match registry.store() {
+        Some(store) => store.get(*key).await,
+        None => Ok(registry.get(key)?.map(|entry| CustodyRecord {
+            key_type: entry.key.key_type(),
+            role: entry.role,
+        })),
+    }
+}
+
+/// The record of `key`, or [`PlatformError::KeyNotFound`] when it has none.
+async fn required_record(
+    registry: &CallbackKeyRegistry,
+    key: &KeyHandle,
+) -> Result<CustodyRecord, PlatformError> {
+    record_of(registry, key)
+        .await?
+        .ok_or(PlatformError::KeyNotFound)
 }
 
 /// Validates a host's `get_public_key` answer.
 ///
 /// The public key must have exactly the stated type's length (Ed25519 32,
-/// P-256 signing 33, HPKE P-256 65) and be a valid key: a non-weak
-/// Ed25519 point, or a P-256 point on the curve that is not the identity.
+/// P-256 signing and key event 33, HPKE P-256 65) and be a valid key: a
+/// non-weak Ed25519 point, or a P-256 point on the curve that is not the
+/// identity.
 ///
 /// # Errors
 ///
@@ -286,6 +556,9 @@ pub fn registered_key(
             method, key_type, bytes,
         )?)),
         KeyType::HpkeP256 => Ok(RegisteredKey::HpkeP256(p256_public_key(
+            method, key_type, bytes,
+        )?)),
+        KeyType::P256KeyEvent => Ok(RegisteredKey::P256KeyEvent(p256_public_key(
             method, key_type, bytes,
         )?)),
         KeyType::Ed25519 => {
@@ -308,9 +581,9 @@ pub fn registered_key(
 
 /// Validates a host-reported P-256 public key.
 ///
-/// It must be exactly 33 bytes (compressed) for [`KeyType::P256Signing`],
-/// exactly 65 bytes (uncompressed) for [`KeyType::HpkeP256`], and a point on
-/// the curve that is not the identity.
+/// It must be exactly 33 bytes (compressed) for [`KeyType::P256Signing`] and
+/// [`KeyType::P256KeyEvent`], exactly 65 bytes (uncompressed) for
+/// [`KeyType::HpkeP256`], and a point on the curve that is not the identity.
 ///
 /// # Errors
 ///
@@ -322,7 +595,7 @@ pub fn p256_public_key(
     bytes: &[u8],
 ) -> Result<P256PublicKey, PlatformError> {
     let expected_len = match key_type {
-        KeyType::P256Signing => COMPRESSED_POINT_LEN,
+        KeyType::P256Signing | KeyType::P256KeyEvent => COMPRESSED_POINT_LEN,
         KeyType::HpkeP256 => UNCOMPRESSED_POINT_LEN,
         KeyType::Ed25519 => {
             return Err(PlatformError::CustodyError(format!(
@@ -374,6 +647,15 @@ pub fn p256_host_signature(
     digest: &[u8; 32],
     host_signature: &[u8],
 ) -> Result<Signature, PlatformError> {
+    p256_host_raw(public_key, digest, host_signature).map(|raw| Signature::new(raw.to_vec()))
+}
+
+/// [`p256_host_signature`] as the fixed-size raw signature.
+fn p256_host_raw(
+    public_key: &P256PublicKey,
+    digest: &[u8; 32],
+    host_signature: &[u8],
+) -> Result<[u8; SIGNATURE_LEN], PlatformError> {
     let raw: Option<[u8; SIGNATURE_LEN]> = host_signature.try_into().ok();
     let der = der_to_raw(host_signature).ok();
     for candidate in raw.iter().chain(der.iter()) {
@@ -381,7 +663,7 @@ pub fn p256_host_signature(
             continue;
         };
         if verify_prehash_strict(public_key, digest, &low_s).is_ok() {
-            return Ok(Signature::new(low_s.to_vec()));
+            return Ok(low_s);
         }
     }
     Err(PlatformError::CustodyError(format!(
@@ -436,21 +718,41 @@ pub fn p256_peer_for_host(
     scp_platform::traits::hpke_p256_peer(peer_public).map(|pk| pk.to_uncompressed())
 }
 
+/// Refuses a key-event key's record where `expected` is required, before
+/// any host call (spec 09 §9.7.4.2 R10).
+const fn refuse_key_event_record(
+    record: CustodyRecord,
+    expected: KeyType,
+) -> Result<(), PlatformError> {
+    if matches!(record.key_type, KeyType::P256KeyEvent) {
+        return Err(PlatformError::WrongKeyType {
+            expected,
+            actual: KeyType::P256KeyEvent,
+        });
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Adapter flows
 //
 // Each bridge supplies its host calls as closures; these functions hold every
-// decision (key types, roles, cache, lengths, signature and seed checks) so
-// the bridges cannot drift. The closures take the key id as the host's
-// string.
+// decision (key types, roles, records, cache, lengths, signature and seed
+// checks) so the bridges cannot drift. The closures take the key id as the
+// host's string.
 // ---------------------------------------------------------------------------
 
 /// `KeyCustody::generate_keypair` over a host: mints a key of `key_type` in
-/// [`KeyRole::Operational`]. See [`generate_identity`] for the identity key.
+/// [`KeyRole::Operational`].
+///
+/// See [`generate_identity`] for the identity key and [`generate_key_event`]
+/// for the key-event key, which this refuses.
 ///
 /// # Errors
 ///
-/// As in [`generate_identity`].
+/// [`PlatformError::WrongKeyType`] for [`KeyType::P256KeyEvent`], with no
+/// host call ([`refuse_key_event_mint`]); otherwise as in
+/// [`generate_identity`].
 pub async fn generate_operational<G, GF, P, PF, D, DF>(
     registry: &CallbackKeyRegistry,
     key_type: KeyType,
@@ -466,9 +768,52 @@ where
     D: FnOnce(String) -> DF,
     DF: Future<Output = Result<(), PlatformError>>,
 {
+    refuse_key_event_mint(key_type)?;
     generate(
         registry,
         key_type,
+        KeyRole::Operational,
+        host_generate,
+        host_get_public_key,
+        host_destroy,
+    )
+    .await
+}
+
+/// `KeyCustody::generate_key_event_keypair` over a host: mints a
+/// [`KeyType::P256KeyEvent`] key in [`KeyRole::Operational`].
+///
+/// The flow records the key before it returns, so a later adapter over the
+/// same records refuses its raw signing whatever the host then reports
+/// (ADR-021).
+///
+/// # Errors
+///
+/// [`PlatformError::Unsupported`] for an
+/// [`unrecorded`](CallbackKeyRegistry::unrecorded) registry, with no host
+/// call; otherwise as in [`generate_identity`].
+pub async fn generate_key_event<G, GF, P, PF, D, DF>(
+    registry: &CallbackKeyRegistry,
+    host_generate: G,
+    host_get_public_key: P,
+    host_destroy: D,
+) -> Result<KeyHandle, PlatformError>
+where
+    G: FnOnce(KeyType, KeyRole) -> GF,
+    GF: Future<Output = Result<String, PlatformError>>,
+    P: FnOnce(String) -> PF,
+    PF: Future<Output = Result<HostPublicKey, PlatformError>>,
+    D: FnOnce(String) -> DF,
+    DF: Future<Output = Result<(), PlatformError>>,
+{
+    if registry.store().is_none() {
+        return Err(PlatformError::Unsupported(
+            "callback custody without a record store cannot mint a key-event key",
+        ));
+    }
+    generate(
+        registry,
+        KeyType::P256KeyEvent,
         KeyRole::Operational,
         host_generate,
         host_get_public_key,
@@ -481,9 +826,10 @@ where
 /// in [`KeyRole::Identity`], the only pseudonym-derivation source.
 ///
 /// Asks the host for the key and for its public key, which must state the
-/// requested type and role and pass [`registered_key`], and caches it. When
-/// the key id is not numeric, the host's `get_public_key` fails, or the
-/// host's answer is refused, the flow destroys the new host key before it
+/// requested type and role and pass [`registered_key`], caches it, and
+/// writes its custody record before it returns. When the key id is not
+/// numeric, the host's `get_public_key` fails, the host's answer is refused,
+/// or the record write fails, the flow destroys the new host key before it
 /// returns the error, and appends a destroy failure other than key-not-found
 /// to the error. The flow leaves the host key in place in three cases. When
 /// the cache already holds the id, the id names a key this adapter holds, so
@@ -492,13 +838,15 @@ where
 /// the key was not destroyed. When the host's `generate_keypair` fails, no key
 /// id exists and nothing is destroyed.
 ///
-/// A caller that drops this future between the host's mint and the cache
-/// write leaves the minted key on the host, unnamed by any handle.
+/// A caller that drops this future between the host's mint and the record
+/// write leaves the minted key on the host with no record. No SCP operation
+/// reads, signs with or destroys an unrecorded key (spec §17.3).
 ///
 /// # Errors
 ///
-/// Any host error; [`PlatformError::CustodyError`] for a non-numeric key id,
-/// a refused public key, another stated type or role, or a cached key id.
+/// Any host or record-store error; [`PlatformError::CustodyError`] for a
+/// non-numeric key id, a refused public key, another stated type or role, a
+/// cached key id, or a different record already stored under the id.
 pub async fn generate_identity<G, GF, P, PF, D, DF>(
     registry: &CallbackKeyRegistry,
     host_generate: G,
@@ -524,8 +872,8 @@ where
     .await
 }
 
-/// The one generation flow; [`generate_operational`] and
-/// [`generate_identity`] fix the role.
+/// The one generation flow; [`generate_operational`], [`generate_identity`]
+/// and [`generate_key_event`] fix the type and role.
 async fn generate<G, GF, P, PF, D, DF>(
     registry: &CallbackKeyRegistry,
     key_type: KeyType,
@@ -563,6 +911,14 @@ where
             )));
         }
         registry.register(handle, RegisteredEntry { key, role })?;
+        if let Some(store) = registry.store()
+            && let Err(refused) = store.put(handle, key_type, role).await
+        {
+            // The key is unrecorded, so this adapter does not hold it: drop
+            // the cache entry so the refusal below destroys the host key.
+            registry.remove(handle)?;
+            return Err(refused);
+        }
         Ok(handle)
     }
     .await;
@@ -584,25 +940,41 @@ where
     }
 }
 
-/// The cached entry for `key`, resolving a handle the cache lacks through
-/// the host's `get_public_key`. Every entry point calls this, so no result
-/// depends on which ran first.
+/// The cached entry for `key`, resolving a recorded handle the cache lacks
+/// through the host's `get_public_key`. Every entry point calls this, so no
+/// result depends on which ran first.
 ///
-/// A host keeps its keys, and the role it minted each with, across adapter
-/// instances, so a handle from an earlier session is still the host's key.
-/// Its answer passes [`registered_key`] and binds the handle in the role the
-/// host reports ([`CallbackKeyRegistry::bind_resolved`]): an identity minted
-/// in an earlier session resolves as an identity. Returns the entry and
-/// whether this call asked the host.
+/// A handle with no record ([`record_of`]) is
+/// [`PlatformError::KeyNotFound`] with no host call: the host never decides
+/// a key's type or role. A recorded handle's host answer must pass
+/// [`registered_key`] and state the recorded type and role, and binds the
+/// handle in that role ([`CallbackKeyRegistry::bind_resolved`]). Returns the
+/// entry and whether this call asked the host.
 ///
 /// # Errors
 ///
-/// The host's own error for a key it lacks (a conforming host reports
-/// [`PlatformError::KeyNotFound`]); as in [`registered_key`] and
+/// [`PlatformError::KeyNotFound`] for an unrecorded handle; the host's own
+/// error for a key it lacks; [`PlatformError::CustodyError`] for an answer
+/// that disagrees with the custody record; as in [`registered_key`] and
 /// [`CallbackKeyRegistry::bind_resolved`].
 pub async fn resolve<P, PF>(
     registry: &CallbackKeyRegistry,
     key: &KeyHandle,
+    host_get_public_key: &P,
+) -> Result<(RegisteredEntry, bool), PlatformError>
+where
+    P: Fn(String) -> PF + Sync,
+    PF: Future<Output = Result<HostPublicKey, PlatformError>>,
+{
+    let record = required_record(registry, key).await?;
+    resolve_recorded(registry, key, record, host_get_public_key).await
+}
+
+/// [`resolve`] for a handle whose `record` the caller already read.
+async fn resolve_recorded<P, PF>(
+    registry: &CallbackKeyRegistry,
+    key: &KeyHandle,
+    record: CustodyRecord,
     host_get_public_key: &P,
 ) -> Result<(RegisteredEntry, bool), PlatformError>
 where
@@ -614,21 +986,36 @@ where
     }
     let answer = host_get_public_key(key.id().to_string()).await?;
     let found = registered_key("get_public_key", &answer)?;
-    Ok((registry.bind_resolved(*key, found, answer.role)?, true))
+    if found.key_type() != record.key_type || answer.role != record.role {
+        return Err(PlatformError::CustodyError(format!(
+            "KeyCustodyProvider.get_public_key reports key_id {} as a {} {} key, which \
+             disagrees with the custody record ({} {})",
+            key.id(),
+            found.key_type().as_str(),
+            answer.role.as_str(),
+            record.key_type.as_str(),
+            record.role.as_str()
+        )));
+    }
+    Ok((registry.bind_resolved(*key, found, record.role)?, true))
 }
 
 /// `KeyCustody::sign` over a host provider.
 ///
-/// A P-256 signing key (generated or resolved) signs a 32-byte
-/// digest and its host result passes [`p256_host_signature`]. An Ed25519 key
-/// signs `data` and its host result passes [`ed25519_host_signature`]. A
+/// The record is read first: an unrecorded handle is
+/// [`PlatformError::KeyNotFound`] and a key-event key
+/// [`PlatformError::WrongKeyType`], each with no host call of any kind
+/// (spec 09 §9.7.4.2 R10). A P-256 signing key then signs a 32-byte digest
+/// and its host result passes [`p256_host_signature`]. An Ed25519 key signs
+/// `data` and its host result passes [`ed25519_host_signature`]. A
 /// key-agreement key is [`PlatformError::WrongKeyType`] without a host sign
 /// call.
 ///
 /// # Errors
 ///
-/// Any host error; [`PlatformError::WrongKeyType`] or
-/// [`PlatformError::CustodyError`] as above and in [`resolve`].
+/// Any host or record-store error; [`PlatformError::KeyNotFound`],
+/// [`PlatformError::WrongKeyType`] or [`PlatformError::CustodyError`] as
+/// above and in [`resolve`].
 pub async fn sign<S, SF, P, PF>(
     registry: &CallbackKeyRegistry,
     key: &KeyHandle,
@@ -642,8 +1029,14 @@ where
     P: Fn(String) -> PF + Sync,
     PF: Future<Output = Result<HostPublicKey, PlatformError>>,
 {
+    let record = required_record(registry, key).await?;
+    refuse_key_event_record(record, KeyType::P256Signing)?;
     let key_id = key.id().to_string();
-    match resolve(registry, key, &host_get_public_key).await?.0.key {
+    match resolve_recorded(registry, key, record, &host_get_public_key)
+        .await?
+        .0
+        .key
+    {
         RegisteredKey::P256Signing(pk) => {
             let digest = p256_digest(data)?;
             let host_sig = host_sign(key_id, digest.to_vec()).await?;
@@ -652,8 +1045,113 @@ where
         RegisteredKey::Ed25519(vk) => {
             ed25519_host_signature(&vk, data, host_sign(key_id, data.to_vec()).await?)
         }
-        k @ RegisteredKey::HpkeP256(_) => Err(k.wrong_type(KeyType::P256Signing)),
+        k @ (RegisteredKey::HpkeP256(_) | RegisteredKey::P256KeyEvent(_)) => {
+            Err(k.wrong_type(KeyType::P256Signing))
+        }
     }
+}
+
+/// `KeyEventSigner::sign_change` over a host provider: the key-event key
+/// `key` signs the 32-byte change digest `D` (spec 09 §9.7.4.2 R10).
+///
+/// The host's `sign` receives exactly `change.digest()`, and its signature
+/// passes [`p256_host_signature`] under the key's public key and becomes the
+/// raw low-`s` [`IndexedSignature::Raw`].
+///
+/// # Errors
+///
+/// [`KeyEventSignError::MemberNotFound`] for an unrecorded handle or a key
+/// the host lacks; [`KeyEventSignError::WrongKeyType`] for a handle whose
+/// record is not a key-event key; [`KeyEventSignError::Substrate`] for a host
+/// error, a store error, an answer that disagrees with the record, or a
+/// signature that does not verify.
+pub async fn sign_change<S, SF, P, PF>(
+    registry: &CallbackKeyRegistry,
+    key: &KeyHandle,
+    change: &SigningChange,
+    host_sign: S,
+    host_get_public_key: P,
+) -> Result<IndexedSignature, KeyEventSignError>
+where
+    S: FnOnce(String, Vec<u8>) -> SF,
+    SF: Future<Output = Result<Vec<u8>, PlatformError>>,
+    P: Fn(String) -> PF + Sync,
+    PF: Future<Output = Result<HostPublicKey, PlatformError>>,
+{
+    let signature = key_event_signature(
+        registry,
+        key,
+        change.digest(),
+        host_sign,
+        host_get_public_key,
+    )
+    .await?;
+    Ok(IndexedSignature::Raw { signature })
+}
+
+/// `KeyEventSigner::sign_probe` over a host provider: the key-event key
+/// `key` signs the custody probe's raw digest (§9.7.4.1 item 5, step d).
+///
+/// The host's `sign` receives exactly `probe.raw_digest()`.
+///
+/// # Errors
+///
+/// As in [`sign_change`].
+pub async fn sign_probe<S, SF, P, PF>(
+    registry: &CallbackKeyRegistry,
+    key: &KeyHandle,
+    probe: &CustodyProbe,
+    host_sign: S,
+    host_get_public_key: P,
+) -> Result<ProbeSignature, KeyEventSignError>
+where
+    S: FnOnce(String, Vec<u8>) -> SF,
+    SF: Future<Output = Result<Vec<u8>, PlatformError>>,
+    P: Fn(String) -> PF + Sync,
+    PF: Future<Output = Result<HostPublicKey, PlatformError>>,
+{
+    let signature = key_event_signature(
+        registry,
+        key,
+        probe.raw_digest(),
+        host_sign,
+        host_get_public_key,
+    )
+    .await?;
+    Ok(ProbeSignature::raw(signature))
+}
+
+/// The raw low-`s` signature of the key-event key `key` over `digest`.
+async fn key_event_signature<S, SF, P, PF>(
+    registry: &CallbackKeyRegistry,
+    key: &KeyHandle,
+    digest: [u8; 32],
+    host_sign: S,
+    host_get_public_key: P,
+) -> Result<[u8; SIGNATURE_LEN], PlatformError>
+where
+    S: FnOnce(String, Vec<u8>) -> SF,
+    SF: Future<Output = Result<Vec<u8>, PlatformError>>,
+    P: Fn(String) -> PF + Sync,
+    PF: Future<Output = Result<HostPublicKey, PlatformError>>,
+{
+    let record = required_record(registry, key).await?;
+    if record.key_type != KeyType::P256KeyEvent {
+        return Err(PlatformError::WrongKeyType {
+            expected: KeyType::P256KeyEvent,
+            actual: record.key_type,
+        });
+    }
+    let public_key = match resolve_recorded(registry, key, record, &host_get_public_key)
+        .await?
+        .0
+        .key
+    {
+        RegisteredKey::P256KeyEvent(pk) => pk,
+        other => return Err(other.wrong_type(KeyType::P256KeyEvent)),
+    };
+    let host_sig = host_sign(key.id().to_string(), digest.to_vec()).await?;
+    p256_host_raw(&public_key, &digest, &host_sig)
 }
 
 /// `KeyCustody::public_key` over a host provider.
@@ -699,10 +1197,11 @@ where
 
 /// `KeyCustody::dh_agree` over a host provider.
 ///
-/// An HPKE P-256 key requires a valid 65-byte uncompressed peer point,
-/// checked before the host call. A signing
-/// key is [`PlatformError::WrongKeyType`] without a host call. The host must
-/// return exactly 32 bytes, which are zeroized once copied.
+/// A key-event key's record is [`PlatformError::WrongKeyType`] with no host
+/// call. An HPKE P-256 key requires a valid 65-byte uncompressed peer point,
+/// checked before the host call. A signing key is
+/// [`PlatformError::WrongKeyType`] without a host agreement call. The host
+/// must return exactly 32 bytes, which are zeroized once copied.
 ///
 /// # Errors
 ///
@@ -721,9 +1220,17 @@ where
     P: Fn(String) -> PF + Sync,
     PF: Future<Output = Result<HostPublicKey, PlatformError>>,
 {
-    let peer = match resolve(registry, key, &host_get_public_key).await?.0.key {
+    let record = required_record(registry, key).await?;
+    refuse_key_event_record(record, KeyType::HpkeP256)?;
+    let peer = match resolve_recorded(registry, key, record, &host_get_public_key)
+        .await?
+        .0
+        .key
+    {
         RegisteredKey::HpkeP256(_) => p256_peer_for_host(peer_public)?.to_vec(),
-        k @ (RegisteredKey::Ed25519(_) | RegisteredKey::P256Signing(_)) => {
+        k @ (RegisteredKey::Ed25519(_)
+        | RegisteredKey::P256Signing(_)
+        | RegisteredKey::P256KeyEvent(_)) => {
             return Err(k.wrong_type(KeyType::HpkeP256));
         }
     };
@@ -735,18 +1242,18 @@ where
 
 /// `KeyCustody::destroy_key` over a host provider.
 ///
-/// The host destroys the key; the cache entry is dropped when the host
-/// confirms the key is gone, by success or by key-not-found. A host failure
-/// leaves the entry, so the handle still names the key the host still holds.
-/// A [`resolve`] of the same id that was awaiting the host when this call
-/// dropped the entry binds the destroyed key again; the host stays the
-/// authority, so every later operation on the handle reaches it and fails
-/// key-not-found (or fails a type or role check first).
+/// An unrecorded handle is [`PlatformError::KeyNotFound`] with no host call.
+/// Otherwise the host destroys the key, and the cache entry and the custody
+/// record are dropped when the host confirms the key is gone, by success or
+/// by key-not-found. A host failure leaves both, so the handle still names
+/// the key the host still holds.
 ///
 /// # Errors
 ///
-/// [`PlatformError::KeyNotFound`] when the host does not hold the key; any
-/// other host error; a poisoned registry.
+/// [`PlatformError::KeyNotFound`] for an unrecorded handle or a key the host
+/// does not hold; any other host error; [`PlatformError::CustodyError`] when
+/// the record could not be removed after the host's destroy; a poisoned
+/// registry.
 pub async fn destroy_key<D, DF>(
     registry: &CallbackKeyRegistry,
     key: &KeyHandle,
@@ -756,26 +1263,44 @@ where
     D: FnOnce(String) -> DF,
     DF: Future<Output = Result<(), PlatformError>>,
 {
+    required_record(registry, key).await?;
     match host_destroy(key.id().to_string()).await {
-        Ok(()) => registry.remove(*key),
+        Ok(()) => forget(registry, key).await,
         Err(PlatformError::KeyNotFound) => {
-            registry.remove(*key)?;
+            forget(registry, key).await?;
             Err(PlatformError::KeyNotFound)
         }
         Err(e) => Err(e),
     }
 }
 
+/// Drops `key`'s cache entry and custody record once the host no longer
+/// holds it.
+async fn forget(registry: &CallbackKeyRegistry, key: &KeyHandle) -> Result<(), PlatformError> {
+    registry.remove(*key)?;
+    if let Some(store) = registry.store() {
+        store.remove(*key).await.map_err(|e| {
+            PlatformError::CustodyError(format!(
+                "the host no longer holds key_id {}, and its custody record was not \
+                 removed: {e}",
+                key.id()
+            ))
+        })?;
+    }
+    Ok(())
+}
+
 /// `KeyCustody::derive_pseudonym` (`epoch` `None`) and
 /// `derive_rotatable_pseudonym` over a host provider.
 ///
-/// `key` must be an Ed25519 [`KeyRole::Identity`] key
-/// ([`scp_platform::require_derive_source`]): an operational key is
-/// [`PlatformError::NotIdentityKey`] and an identity of another type
-/// [`PlatformError::WrongKeyType`], each with no derive call. A key the host
-/// no longer holds is the host's key-not-found (§9.10.4.A). A pseudonym has
-/// no private key, so the host returns only the point; [`parse_pseudonym`]
-/// requires a 33-byte compressed P-256 point, and nothing is cached.
+/// `key`'s record must be an Ed25519 [`KeyRole::Identity`] key
+/// ([`scp_platform::require_derive_source`]): an operational key, the
+/// key-event key included, is [`PlatformError::NotIdentityKey`] and an
+/// identity of another type [`PlatformError::WrongKeyType`], each with no
+/// host call. A key the host no longer holds is the host's key-not-found
+/// (§9.10.4.A). A pseudonym has no private key, so the host returns only the
+/// point; [`parse_pseudonym`] requires a 33-byte compressed P-256 point, and
+/// nothing is cached.
 ///
 /// [`parse_pseudonym`]: crate::custody_parse::parse_pseudonym
 ///
@@ -802,14 +1327,64 @@ where
     } else {
         "derive_pseudonym"
     };
-    let source = resolve(registry, key, &host_get_public_key).await?.0;
-    scp_platform::require_derive_source(source.role, source.key.key_type())?;
+    let record = required_record(registry, key).await?;
+    scp_platform::require_derive_source(record.role, record.key_type)?;
+    resolve_recorded(registry, key, record, &host_get_public_key).await?;
     let point = host_derive(key.id().to_string()).await?;
     crate::custody_parse::parse_pseudonym(method, &point)
 }
 
-/// A software host for bridge tests: Ed25519, P-256 signing and HPKE P-256
-/// keys, answering the host callbacks the way a conforming platform keystore
+/// The host contract's key-id rule, run against a host (spec §17.3): a host
+/// never reuses a key id within one namespace, so a destroyed key's id is
+/// never handed out again.
+///
+/// Mints `rounds` keys of every [`KeyType`] the host serves, destroying each
+/// before the next mint, and requires every id to differ.
+///
+/// # Errors
+///
+/// A description of the first id the host handed out twice, or of a host
+/// call that failed.
+#[cfg(any(test, feature = "testing"))]
+pub async fn check_host_never_reuses_key_ids<G, GF, D, DF>(
+    rounds: usize,
+    host_generate: G,
+    host_destroy: D,
+) -> Result<(), String>
+where
+    G: Fn(KeyType, KeyRole) -> GF,
+    GF: Future<Output = Result<String, PlatformError>>,
+    D: Fn(String) -> DF,
+    DF: Future<Output = Result<(), PlatformError>>,
+{
+    let mints = [
+        (KeyType::Ed25519, KeyRole::Identity),
+        (KeyType::Ed25519, KeyRole::Operational),
+        (KeyType::P256Signing, KeyRole::Operational),
+        (KeyType::HpkeP256, KeyRole::Operational),
+        (KeyType::P256KeyEvent, KeyRole::Operational),
+    ];
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..rounds {
+        for (key_type, role) in mints {
+            let id = host_generate(key_type, role)
+                .await
+                .map_err(|e| format!("generate_keypair({}) failed: {e}", key_type.as_str()))?;
+            if !seen.insert(id.clone()) {
+                return Err(format!(
+                    "the host handed out key id {id} again after destroying the key it named"
+                ));
+            }
+            host_destroy(id.clone())
+                .await
+                .map_err(|e| format!("destroy_key({id}) failed: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// A software host for bridge tests: Ed25519, P-256 signing, HPKE P-256
+/// and P-256 key-event keys, answering the host callbacks the way a conforming platform keystore
 /// does.
 ///
 /// It signs P-256 digests with a high `s` in DER, so a test proves the
@@ -892,7 +1467,8 @@ pub mod fake_host {
         out
     }
 
-    /// A key the host holds, with the role it was minted in.
+    /// A key the host holds. A P-256 signing key and a P-256 key-event key
+    /// are both [`HostKey::P256`]; the reported-type map tells them apart.
     enum HostKey {
         Ed25519(ed25519_dalek::SigningKey),
         P256(P256SecretKey),
@@ -911,6 +1487,9 @@ pub mod fake_host {
         keys: Mutex<HashMap<String, HostKey>>,
         /// The role each key id was minted in.
         roles: Mutex<HashMap<String, KeyRole>>,
+        /// The type `get_public_key` reports for each key id: the minted
+        /// type, unless a test replaced it ([`FakeHost::report_as`]).
+        types: Mutex<HashMap<String, KeyType>>,
         next: AtomicUsize,
         calls: Mutex<HashMap<&'static str, usize>>,
         /// The peer bytes of the most recent `dh_agree` call.
@@ -929,6 +1508,17 @@ pub mod fake_host {
         /// Whether the host still holds `key_id`.
         pub fn holds(&self, key_id: &str) -> bool {
             locked(&self.keys).is_ok_and(|keys| keys.contains_key(key_id))
+        }
+
+        /// Makes `get_public_key` report `key_id` as `key_type`, as a host
+        /// that misreports a key would.
+        ///
+        /// # Errors
+        ///
+        /// A poisoned type map.
+        pub fn report_as(&self, key_id: &str, key_type: KeyType) -> Result<(), PlatformError> {
+            locked(&self.types)?.insert(key_id.to_owned(), key_type);
+            Ok(())
         }
 
         /// How many calls to `method` reached the host.
@@ -957,8 +1547,9 @@ pub mod fake_host {
                 .ok_or(PlatformError::KeyNotFound)?)
         }
 
-        /// `generate_keypair`: Ed25519, P-256 signing or HPKE P-256,
-        /// recording `role` for `get_public_key`; numeric ids from 1.
+        /// `generate_keypair`: Ed25519, P-256 signing, HPKE P-256 or P-256
+        /// key event, recording `role` and the type for `get_public_key`;
+        /// numeric ids from 1, never reused.
         ///
         /// # Errors
         ///
@@ -979,10 +1570,11 @@ pub mod fake_host {
                 KeyType::Ed25519 => {
                     HostKey::Ed25519(ed25519_dalek::SigningKey::from_bytes(&scalar))
                 }
-                KeyType::P256Signing => HostKey::P256(p256()?),
+                KeyType::P256Signing | KeyType::P256KeyEvent => HostKey::P256(p256()?),
                 KeyType::HpkeP256 => HostKey::HpkeP256(p256()?),
             };
             locked(&self.roles)?.insert(id.to_string(), role);
+            locked(&self.types)?.insert(id.to_string(), key_type);
             locked(&self.keys)?.insert(id.to_string(), key);
             Ok(id.to_string())
         }
@@ -995,6 +1587,7 @@ pub mod fake_host {
         pub fn get_public_key(&self, key_id: &str) -> Result<HostPublicKey, PlatformError> {
             self.count("get_public_key");
             let role = locked(&self.roles)?.get(key_id).copied();
+            let reported = locked(&self.types)?.get(key_id).copied();
             self.with_key(key_id, |key| {
                 // Every key this host holds has a recorded role; a held key
                 // without one is a fake-host defect, reported, never defaulted.
@@ -1003,18 +1596,15 @@ pub mod fake_host {
                         "fake host recorded no role for key {key_id}"
                     ))
                 })?;
-                let (key_type, public_key) = match key {
-                    HostKey::Ed25519(sk) => {
-                        (KeyType::Ed25519, sk.verifying_key().to_bytes().to_vec())
-                    }
-                    HostKey::P256(sk) => (
-                        KeyType::P256Signing,
-                        sk.public_key().to_compressed().to_vec(),
-                    ),
-                    HostKey::HpkeP256(sk) => (
-                        KeyType::HpkeP256,
-                        sk.public_key().to_uncompressed().to_vec(),
-                    ),
+                let key_type = reported.ok_or_else(|| {
+                    PlatformError::CustodyError(format!(
+                        "fake host recorded no type for key {key_id}"
+                    ))
+                })?;
+                let public_key = match key {
+                    HostKey::Ed25519(sk) => sk.verifying_key().to_bytes().to_vec(),
+                    HostKey::P256(sk) => sk.public_key().to_compressed().to_vec(),
+                    HostKey::HpkeP256(sk) => sk.public_key().to_uncompressed().to_vec(),
                 };
                 Ok(HostPublicKey {
                     key_type,
@@ -1111,6 +1701,7 @@ pub mod fake_host {
         pub fn destroy_key(&self, key_id: &str) -> Result<(), PlatformError> {
             self.count("destroy_key");
             locked(&self.roles)?.remove(key_id);
+            locked(&self.types)?.remove(key_id);
             locked(&self.keys)?
                 .remove(key_id)
                 .map(|_| ())
@@ -1196,6 +1787,40 @@ mod tests {
 
     fn cached(registry: &CallbackKeyRegistry) -> usize {
         registry.entries.lock().expect("registry lock").len()
+    }
+
+    /// A record store over fresh in-memory storage, in namespace `ns`.
+    fn store_in(ns: u8) -> Arc<dyn CustodyRecordStore> {
+        Arc::new(StorageCustodyRecordStore::new(
+            scp_platform::in_memory::InMemoryStorage::new(),
+            CustodyNamespace::from_bytes([ns; 16]),
+        ))
+    }
+
+    /// A recorded registry over `store`.
+    fn over(store: &Arc<dyn CustodyRecordStore>) -> CallbackKeyRegistry {
+        CallbackKeyRegistry::recorded(CustodyRecords::unleased(Arc::clone(store)))
+    }
+
+    /// A recorded registry whose store holds `records`, and the store.
+    async fn seeded(
+        records: &[(u64, KeyType, KeyRole)],
+    ) -> (CallbackKeyRegistry, Arc<dyn CustodyRecordStore>) {
+        let store = store_in(7);
+        for &(id, key_type, role) in records {
+            store.put(KeyHandle::new(id), key_type, role).await.unwrap();
+        }
+        (over(&store), store)
+    }
+
+    /// A host call a test expects never to happen.
+    fn no_host<A, T>(_: A) -> std::future::Ready<Result<T, PlatformError>> {
+        panic!("no host call expected")
+    }
+
+    /// A two-argument host call a test expects never to happen.
+    fn no_host2<A, B, T>(_: A, _: B) -> std::future::Ready<Result<T, PlatformError>> {
+        panic!("no host call expected")
     }
 
     /// A host that names a type or role outside the contract is refused;
@@ -1389,9 +2014,10 @@ mod tests {
     async fn ed25519_sign_rejects_junk_from_the_host() {
         let key = ed(0x51);
         let calls = AtomicUsize::new(0);
+        let (resolving, _store) = seeded(&[(5, KeyType::Ed25519, KeyRole::Operational)]).await;
         for registry in [
             {
-                let r = CallbackKeyRegistry::new();
+                let r = CallbackKeyRegistry::unrecorded();
                 live(
                     &r,
                     5,
@@ -1400,7 +2026,7 @@ mod tests {
                 );
                 r
             },
-            CallbackKeyRegistry::new(),
+            resolving,
         ] {
             let h = KeyHandle::new(5);
             assert!(matches!(
@@ -1433,7 +2059,7 @@ mod tests {
         assert_eq!(
             calls.load(Ordering::Relaxed),
             1,
-            "only the fresh registry resolves"
+            "only the recorded registry with an empty cache resolves"
         );
     }
 
@@ -1443,7 +2069,7 @@ mod tests {
         identity: &ed25519_dalek::SigningKey,
         key: &P256SecretKey,
     ) -> CallbackKeyRegistry {
-        let registry = CallbackKeyRegistry::new();
+        let registry = CallbackKeyRegistry::unrecorded();
         live(
             &registry,
             1,
@@ -1547,7 +2173,8 @@ mod tests {
             .generate_keypair(KeyType::HpkeP256, KeyRole::Operational)
             .unwrap();
         let handle = KeyHandle::new(key_id.parse().unwrap());
-        let registry = CallbackKeyRegistry::new();
+        let (registry, _store) =
+            seeded(&[(handle.id(), KeyType::HpkeP256, KeyRole::Operational)]).await;
         let host_dh = |id: String, peer: Vec<u8>| {
             let answer = host.dh_agree(&id, &peer);
             async move { answer }
@@ -1607,10 +2234,9 @@ mod tests {
         }
     }
 
-    /// Every entry point resolves an unregistered handle the same way,
-    /// with one host lookup, and binds the same operational entry, whichever
-    /// runs first. Before this, `dh_agree` returned `KeyNotFound` for a
-    /// handle `sign` would have resolved.
+    /// Every entry point resolves a recorded handle the cache lacks the same
+    /// way, with one host lookup, and binds the same operational entry,
+    /// whichever runs first.
     #[tokio::test]
     async fn every_entry_point_resolves_an_unregistered_handle() {
         let e = ed(0x71);
@@ -1631,7 +2257,8 @@ mod tests {
             (&hpke_a, "sign"),
         ];
         for (host_answer, first) in cases {
-            let registry = CallbackKeyRegistry::new();
+            let (registry, _store) =
+                seeded(&[(42, host_answer.key_type, KeyRole::Operational)]).await;
             let calls = AtomicUsize::new(0);
             let l = lookup(host_answer, &calls);
             let expected = registered_key("m", host_answer).unwrap();
@@ -1694,13 +2321,13 @@ mod tests {
         }
     }
 
-    /// A host without the key answers its not-found to every entry
+    /// A host without a recorded key answers its not-found to every entry
     /// point, with no other host call and nothing bound.
     #[tokio::test]
     async fn every_entry_point_reports_a_key_the_host_lacks() {
         let h = KeyHandle::new(42);
         let peer_x = [5u8; 32];
-        let registry = CallbackKeyRegistry::new();
+        let (registry, _store) = seeded(&[(42, KeyType::Ed25519, KeyRole::Operational)]).await;
         let missing = |_: String| async { Err::<HostPublicKey, _>(PlatformError::KeyNotFound) };
         assert!(matches!(
             sign(
@@ -1744,7 +2371,7 @@ mod tests {
             answer(KeyType::HpkeP256, &p.public_key().to_compressed()),
             answer(KeyType::HpkeP256, &[4u8; 64]),
         ] {
-            let registry = CallbackKeyRegistry::new();
+            let (registry, _store) = seeded(&[(8, a.key_type, KeyRole::Operational)]).await;
             let calls = AtomicUsize::new(0);
             let result = sign(
                 &registry,
@@ -1770,7 +2397,7 @@ mod tests {
     async fn concurrent_and_repeated_resolutions_agree() {
         let p = p256(0x91);
         let a = p256_answer(&p);
-        let registry = CallbackKeyRegistry::new();
+        let (registry, _store) = seeded(&[(9, KeyType::P256Signing, KeyRole::Operational)]).await;
         let h = KeyHandle::new(9);
         let inner_calls = AtomicUsize::new(0);
         let outer = |_: String| {
@@ -1812,7 +2439,7 @@ mod tests {
     /// another type for the same bytes, or another role for the same key.
     #[tokio::test]
     async fn public_key_refuses_a_changed_host_key() {
-        let registry = CallbackKeyRegistry::new();
+        let registry = CallbackKeyRegistry::unrecorded();
         let host = std::sync::Mutex::new(hpke_answer(&p256(0xB1)));
         let h = generate_operational(
             &registry,
@@ -1864,7 +2491,7 @@ mod tests {
     /// with no host call; a 65-byte uncompressed point reaches the host.
     #[tokio::test]
     async fn hpke_agree_checks_the_peer_before_the_host() {
-        let registry = CallbackKeyRegistry::new();
+        let registry = CallbackKeyRegistry::unrecorded();
         live(
             &registry,
             3,
@@ -1916,7 +2543,7 @@ mod tests {
     }
 
     /// A derive source must be an Ed25519 identity key. An operational
-    /// Ed25519 key (minted by `generate_operational`, or resolved as
+    /// Ed25519 key (minted by `generate_operational`, or recorded as
     /// operational) is `NotIdentityKey`: it is Ed25519, so the curve check
     /// alone would pass it. A P-256 identity key is `WrongKeyType` from the
     /// interim curve check. None reaches the host's derive, and a derive
@@ -1924,7 +2551,7 @@ mod tests {
     #[tokio::test]
     async fn derivation_needs_an_identity_source() {
         let point = p256(0xC1).public_key().to_compressed().to_vec();
-        let registry = CallbackKeyRegistry::new();
+        let registry = CallbackKeyRegistry::unrecorded();
         let e = ed(0xC2).verifying_key();
         live(&registry, 1, RegisteredKey::Ed25519(e), KeyRole::Identity);
         live(
@@ -1956,14 +2583,15 @@ mod tests {
             ),
             "{p256_identity:?}"
         );
-        // A host key resolved as operational never derives.
-        let calls = AtomicUsize::new(0);
+        // A key recorded as operational never derives, and its record
+        // refuses it before any host call.
+        let (recorded, _store) = seeded(&[(5, KeyType::Ed25519, KeyRole::Operational)]).await;
         let resolved = derive_pseudonym(
-            &registry,
+            &recorded,
             &KeyHandle::new(5),
             None,
             |_| async { panic!("no derivation from an operational key") },
-            lookup(&answer(KeyType::Ed25519, &e.to_bytes()), &calls),
+            no_lookup,
         )
         .await;
         assert!(
@@ -1989,7 +2617,7 @@ mod tests {
     /// prefix are each `PseudonymRejected`.
     #[tokio::test]
     async fn a_derive_answer_must_be_a_compressed_point() {
-        let registry = CallbackKeyRegistry::new();
+        let registry = CallbackKeyRegistry::unrecorded();
         live(
             &registry,
             1,
@@ -2010,14 +2638,13 @@ mod tests {
     }
 
     /// An identity the host has destroyed derives nothing: the cache entry
-    /// is gone once the host confirmed the destroy, the handle resolves
-    /// through the host, and the host's key-not-found is returned with no
-    /// derive call.
+    /// and the custody record are gone once the host confirmed the destroy,
+    /// so the handle is key-not-found with no host call of any kind.
     #[tokio::test]
-    async fn destroyed_identity_derive_is_key_not_found_through_the_host() {
+    async fn destroyed_identity_derive_is_key_not_found() {
         let host = fake_host::FakeHost::default();
         let host = &host;
-        let registry = CallbackKeyRegistry::new();
+        let (registry, store) = seeded(&[]).await;
         let identity = generate_identity(
             &registry,
             |t, r| async move { host.generate_keypair(t, r) },
@@ -2034,6 +2661,8 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(registry.get(&identity).unwrap(), None);
+        assert_eq!(store.get(identity).await.unwrap(), None);
+        let lookups = host.calls("get_public_key");
         let result = derive_pseudonym(
             &registry,
             &identity,
@@ -2047,6 +2676,7 @@ mod tests {
             "{result:?}"
         );
         assert_eq!(host.calls("derive_pseudonym"), 0);
+        assert_eq!(host.calls("get_public_key"), lookups);
     }
 
     type Log = std::sync::Mutex<Vec<String>>;
@@ -2128,7 +2758,7 @@ mod tests {
             ),
         ];
         for (key_type, key_id, public_key) in cases {
-            let registry = CallbackKeyRegistry::new();
+            let registry = CallbackKeyRegistry::unrecorded();
             let destroyed = Log::default();
             let result = generate_with(&registry, key_type, key_id, public_key, &destroyed).await;
             assert!(
@@ -2144,7 +2774,7 @@ mod tests {
     /// and a host that no longer holds the key counts as destroyed.
     #[tokio::test]
     async fn a_refused_generation_reports_a_failed_destroy() {
-        let registry = CallbackKeyRegistry::new();
+        let registry = CallbackKeyRegistry::unrecorded();
         let refused = generate_operational(
             &registry,
             KeyType::P256Signing,
@@ -2179,7 +2809,7 @@ mod tests {
     async fn a_refused_generation_spares_a_cached_id() {
         let valid = p256(5);
         let e = ed(6);
-        let registry = CallbackKeyRegistry::new();
+        let registry = CallbackKeyRegistry::unrecorded();
         let destroyed = Log::default();
         let handle = generate_with(
             &registry,
@@ -2226,7 +2856,7 @@ mod tests {
     /// `register` refuses an id the cache holds and keeps the cached entry.
     #[test]
     fn register_refuses_a_cached_id() {
-        let registry = CallbackKeyRegistry::new();
+        let registry = CallbackKeyRegistry::unrecorded();
         let held = RegisteredKey::P256Signing(p256(0x31).public_key());
         live(&registry, 9, held.clone(), KeyRole::Operational);
         let other = RegisteredEntry {
@@ -2251,7 +2881,7 @@ mod tests {
     /// reports key-not-found drops it.
     #[tokio::test]
     async fn a_failed_host_destroy_keeps_the_entry() {
-        let registry = CallbackKeyRegistry::new();
+        let registry = CallbackKeyRegistry::unrecorded();
         let h = KeyHandle::new(3);
         let entry = RegisteredEntry {
             key: RegisteredKey::Ed25519(ed(0x33).verifying_key()),
@@ -2284,7 +2914,7 @@ mod tests {
     async fn generate_operational_asks_the_host_for_operational() {
         let host = fake_host::FakeHost::default();
         let host = &host;
-        let registry = CallbackKeyRegistry::new();
+        let registry = CallbackKeyRegistry::unrecorded();
         let asked = std::sync::Mutex::new(Vec::new());
         let asked = &asked;
         let gpk = |id: String| async move { host.get_public_key(&id) };
@@ -2335,7 +2965,7 @@ mod tests {
     async fn fake_host_round_trip() {
         let host = fake_host::FakeHost::default();
         let host = &host;
-        let registry = CallbackKeyRegistry::new();
+        let registry = CallbackKeyRegistry::unrecorded();
         let gpk = |id: String| async move { host.get_public_key(&id) };
         let identity = generate_identity(
             &registry,
@@ -2405,9 +3035,14 @@ mod tests {
         ));
     }
 
-    /// Mints an Ed25519 key in `role` on `host` through a first registry.
-    async fn mint_on(host: &fake_host::FakeHost, role: KeyRole) -> KeyHandle {
-        let first = CallbackKeyRegistry::new();
+    /// Mints an Ed25519 key in `role` on `host` through a first registry
+    /// over `store`.
+    async fn mint_on(
+        host: &fake_host::FakeHost,
+        role: KeyRole,
+        store: &Arc<dyn CustodyRecordStore>,
+    ) -> KeyHandle {
+        let first = over(store);
         let gpk = |id: String| async move { host.get_public_key(&id) };
         let destroy = |id: String| async move { host.destroy_key(&id) };
         let mint = |t, r| async move { host.generate_keypair(t, r) };
@@ -2421,14 +3056,16 @@ mod tests {
     }
 
     /// An identity a host minted in an earlier session resolves as an
-    /// identity in a new registry, and derives a pseudonym there.
+    /// identity in a new registry over the same records, and derives a
+    /// pseudonym there.
     #[tokio::test]
     async fn an_earlier_sessions_identity_derives_in_a_new_registry() {
         let host = fake_host::FakeHost::default();
         let host = &host;
-        let identity = mint_on(host, KeyRole::Identity).await;
+        let store = store_in(9);
+        let identity = mint_on(host, KeyRole::Identity, &store).await;
 
-        let registry = CallbackKeyRegistry::new();
+        let registry = over(&store);
         let gpk = |id: String| async move { host.get_public_key(&id) };
         derive_pseudonym(
             &registry,
@@ -2446,16 +3083,18 @@ mod tests {
         assert_eq!(host.calls("derive_pseudonym"), 1);
     }
 
-    /// An operational key a host minted in an earlier session resolves as
-    /// operational in a new registry, and its derive is `NotIdentityKey`
-    /// before any host derive call.
+    /// An operational key a host minted in an earlier session is recorded
+    /// as operational, so its derive in a new registry over the same records
+    /// is `NotIdentityKey` before any host call.
     #[tokio::test]
     async fn an_earlier_sessions_operational_key_cannot_derive() {
         let host = fake_host::FakeHost::default();
         let host = &host;
-        let operational = mint_on(host, KeyRole::Operational).await;
+        let store = store_in(9);
+        let operational = mint_on(host, KeyRole::Operational, &store).await;
+        let lookups = host.calls("get_public_key");
 
-        let registry = CallbackKeyRegistry::new();
+        let registry = over(&store);
         let result = derive_pseudonym(
             &registry,
             &operational,
@@ -2468,10 +3107,568 @@ mod tests {
             matches!(result, Err(PlatformError::NotIdentityKey)),
             "{result:?}"
         );
-        assert_eq!(
-            registry.get(&operational).unwrap().unwrap().role,
-            KeyRole::Operational
-        );
+        assert_eq!(registry.get(&operational).unwrap(), None);
         assert_eq!(host.calls("derive_pseudonym"), 0);
+        assert_eq!(host.calls("get_public_key"), lookups);
+    }
+
+    /// A record store whose `get` answers `record` and whose writes fail on
+    /// request.
+    struct FaultyStore {
+        record: Option<CustodyRecord>,
+        fail_put: bool,
+        fail_remove: bool,
+    }
+
+    type StoreFuture<'a, T> =
+        std::pin::Pin<Box<dyn Future<Output = Result<T, PlatformError>> + Send + 'a>>;
+
+    impl CustodyRecordStore for FaultyStore {
+        fn put(&self, _: KeyHandle, _: KeyType, _: KeyRole) -> StoreFuture<'_, ()> {
+            let fail = self.fail_put;
+            Box::pin(async move {
+                if fail {
+                    Err(PlatformError::StorageError("record write failed".into()))
+                } else {
+                    Ok(())
+                }
+            })
+        }
+
+        fn get(&self, _: KeyHandle) -> StoreFuture<'_, Option<CustodyRecord>> {
+            let record = self.record;
+            Box::pin(async move { Ok(record) })
+        }
+
+        fn remove(&self, _: KeyHandle) -> StoreFuture<'_, ()> {
+            let fail = self.fail_remove;
+            Box::pin(async move {
+                if fail {
+                    Err(PlatformError::StorageError("record remove failed".into()))
+                } else {
+                    Ok(())
+                }
+            })
+        }
+    }
+
+    fn faulty(store: FaultyStore) -> CallbackKeyRegistry {
+        CallbackKeyRegistry::recorded(CustodyRecords::unleased(Arc::new(store)))
+    }
+
+    const KEY_EVENT: CustodyRecord = CustodyRecord {
+        key_type: KeyType::P256KeyEvent,
+        role: KeyRole::Operational,
+    };
+
+    /// A registry with no record store mints no key-event key, and asks
+    /// the host nothing.
+    #[tokio::test]
+    async fn unrecorded_registry_refuses_key_event_mint() {
+        let registry = CallbackKeyRegistry::unrecorded();
+        let result = generate_key_event(&registry, no_host2, no_host, no_host).await;
+        assert!(
+            matches!(result, Err(PlatformError::Unsupported(_))),
+            "{result:?}"
+        );
+        assert_eq!(cached(&registry), 0);
+    }
+
+    /// `generate_operational` refuses the key-event type with no host call,
+    /// in a recorded registry too: the key-event key's one mint is
+    /// `generate_key_event`.
+    #[tokio::test]
+    async fn generate_operational_refuses_the_key_event_type() {
+        let (registry, store) = seeded(&[]).await;
+        let result =
+            generate_operational(&registry, KeyType::P256KeyEvent, no_host2, no_host, no_host)
+                .await;
+        assert!(
+            matches!(
+                result,
+                Err(PlatformError::WrongKeyType {
+                    expected: KeyType::P256Signing,
+                    actual: KeyType::P256KeyEvent
+                })
+            ),
+            "{result:?}"
+        );
+        assert_eq!(cached(&registry), 0);
+        assert_eq!(store.get(KeyHandle::new(1)).await.unwrap(), None);
+    }
+
+    /// A handle with no record is key-not-found from every entry point with
+    /// no host call, in an unrecorded registry and in a recorded one whose
+    /// store lacks it: the host never decides that a key exists, or its type
+    /// or role.
+    #[tokio::test]
+    async fn unrecorded_registry_refuses_sign_of_unminted_handle() {
+        let (recorded, _store) = seeded(&[(41, KeyType::Ed25519, KeyRole::Identity)]).await;
+        let change = scp_testing::conformance::key_custody::v41_signing_change();
+        let probe = CustodyProbe::fresh().unwrap();
+        let h = KeyHandle::new(42);
+        for registry in [CallbackKeyRegistry::unrecorded(), recorded] {
+            let signed = sign(&registry, &h, &[0u8; 32], no_host2, no_host).await;
+            assert!(
+                matches!(signed, Err(PlatformError::KeyNotFound)),
+                "{signed:?}"
+            );
+            let public = public_key(&registry, &h, no_host).await;
+            assert!(
+                matches!(public, Err(PlatformError::KeyNotFound)),
+                "{public:?}"
+            );
+            let agreed = dh_agree(&registry, &h, &[4u8; 65], no_host2, no_host).await;
+            assert!(
+                matches!(agreed, Err(PlatformError::KeyNotFound)),
+                "{agreed:?}"
+            );
+            let derived = derive_pseudonym(&registry, &h, None, no_host, no_host).await;
+            assert!(
+                matches!(derived, Err(PlatformError::KeyNotFound)),
+                "{derived:?}"
+            );
+            let destroyed = destroy_key(&registry, &h, no_host).await;
+            assert!(
+                matches!(destroyed, Err(PlatformError::KeyNotFound)),
+                "{destroyed:?}"
+            );
+            let changed = sign_change(&registry, &h, &change, no_host2, no_host).await;
+            assert_eq!(changed, Err(KeyEventSignError::MemberNotFound));
+            let probed = sign_probe(&registry, &h, &probe, no_host2, no_host).await;
+            assert!(
+                matches!(probed, Err(KeyEventSignError::MemberNotFound)),
+                "{probed:?}"
+            );
+            assert_eq!(cached(&registry), 0);
+        }
+    }
+
+    /// A key-event mint writes its record before it returns, so a new
+    /// registry over the same records with an empty cache refuses the key's
+    /// raw signing with no host call, even after the host starts reporting
+    /// it as a P-256 signing key; the misreported answer disagrees with the
+    /// record, so the key-event path refuses it too.
+    #[tokio::test]
+    async fn key_event_mint_records_before_return() {
+        let host = fake_host::FakeHost::default();
+        let host = &host;
+        let store = store_in(3);
+        let minted = over(&store);
+        let gpk = |id: String| async move { host.get_public_key(&id) };
+        let handle = generate_key_event(
+            &minted,
+            |t, r| async move { host.generate_keypair(t, r) },
+            gpk,
+            |id| async move { host.destroy_key(&id) },
+        )
+        .await
+        .unwrap();
+        assert_eq!(store.get(handle).await.unwrap(), Some(KEY_EVENT));
+        assert_eq!(
+            public_key(&minted, &handle, gpk)
+                .await
+                .unwrap()
+                .as_bytes()
+                .len(),
+            33
+        );
+        drop(minted);
+
+        host.report_as(&handle.id().to_string(), KeyType::P256Signing)
+            .unwrap();
+        let rebuilt = over(&store);
+        let (signs, lookups) = (host.calls("sign"), host.calls("get_public_key"));
+        let refused = sign(
+            &rebuilt,
+            &handle,
+            &[0x5a; 32],
+            |id, data| async move { host.sign(&id, &data) },
+            gpk,
+        )
+        .await;
+        assert!(
+            matches!(
+                refused,
+                Err(PlatformError::WrongKeyType {
+                    expected: KeyType::P256Signing,
+                    actual: KeyType::P256KeyEvent
+                })
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(
+            (host.calls("sign"), host.calls("get_public_key")),
+            (signs, lookups)
+        );
+
+        let change = scp_testing::conformance::key_custody::v41_signing_change();
+        let disagreeing = sign_change(
+            &rebuilt,
+            &handle,
+            &change,
+            |id, data| async move { host.sign(&id, &data) },
+            gpk,
+        )
+        .await;
+        assert!(
+            matches!(disagreeing, Err(KeyEventSignError::Substrate(_))),
+            "{disagreeing:?}"
+        );
+        assert_eq!(host.calls("sign"), signs);
+        assert_eq!(cached(&rebuilt), 0);
+    }
+
+    /// A key whose record write fails is destroyed on the host and not
+    /// cached, so no unrecorded key stays usable or held.
+    #[tokio::test]
+    async fn a_failed_record_write_destroys_the_minted_key() {
+        let host = fake_host::FakeHost::default();
+        let host = &host;
+        let registry = faulty(FaultyStore {
+            record: None,
+            fail_put: true,
+            fail_remove: false,
+        });
+        let result = generate_key_event(
+            &registry,
+            |t, r| async move { host.generate_keypair(t, r) },
+            |id: String| async move { host.get_public_key(&id) },
+            |id| async move { host.destroy_key(&id) },
+        )
+        .await;
+        assert!(
+            matches!(result, Err(PlatformError::StorageError(_))),
+            "{result:?}"
+        );
+        assert_eq!(host.calls("destroy_key"), 1);
+        assert!(!host.holds("1"));
+        assert_eq!(cached(&registry), 0);
+    }
+
+    /// A host answer whose type or role differs from the custody record is
+    /// refused and binds nothing; an agreeing answer binds in the recorded
+    /// role.
+    #[tokio::test]
+    async fn resolve_refuses_host_answer_disagreeing_with_record() {
+        let k = p256(0x95);
+        let e = ed(0x96);
+        let (registry, _store) = seeded(&[
+            (5, KeyType::P256KeyEvent, KeyRole::Operational),
+            (6, KeyType::Ed25519, KeyRole::Identity),
+            (7, KeyType::HpkeP256, KeyRole::Operational),
+        ])
+        .await;
+        for (id, a) in [
+            (5, p256_answer(&k)),
+            (6, ed_answer(&e)),
+            (7, as_identity(hpke_answer(&k))),
+        ] {
+            let calls = AtomicUsize::new(0);
+            let h = KeyHandle::new(id);
+            let result = public_key(&registry, &h, lookup(&a, &calls)).await;
+            assert!(
+                matches!(&result, Err(PlatformError::CustodyError(m)) if m.contains("custody record")),
+                "{id}: {result:?}"
+            );
+            assert_eq!(calls.load(Ordering::Relaxed), 1, "{id}");
+            assert_eq!(registry.get(&h).unwrap(), None, "{id}");
+        }
+        let calls = AtomicUsize::new(0);
+        let h = KeyHandle::new(6);
+        public_key(&registry, &h, lookup(&as_identity(ed_answer(&e)), &calls))
+            .await
+            .unwrap();
+        assert_eq!(registry.get(&h).unwrap().unwrap().role, KeyRole::Identity);
+    }
+
+    /// A key-event record refuses `sign`, `dh_agree` and both derivations
+    /// before any host call (spec 09 §9.7.4.2 R10).
+    #[tokio::test]
+    async fn sign_refuses_key_event_record_without_host_call() {
+        let (registry, _store) = seeded(&[(5, KeyType::P256KeyEvent, KeyRole::Operational)]).await;
+        let h = KeyHandle::new(5);
+        let signed = sign(&registry, &h, &[0u8; 32], no_host2, no_host).await;
+        assert!(
+            matches!(
+                signed,
+                Err(PlatformError::WrongKeyType {
+                    expected: KeyType::P256Signing,
+                    actual: KeyType::P256KeyEvent
+                })
+            ),
+            "{signed:?}"
+        );
+        let agreed = dh_agree(&registry, &h, &[4u8; 65], no_host2, no_host).await;
+        assert!(
+            matches!(
+                agreed,
+                Err(PlatformError::WrongKeyType {
+                    expected: KeyType::HpkeP256,
+                    actual: KeyType::P256KeyEvent
+                })
+            ),
+            "{agreed:?}"
+        );
+        for epoch in [None, Some(3)] {
+            let derived = derive_pseudonym(&registry, &h, epoch, no_host, no_host).await;
+            assert!(
+                matches!(derived, Err(PlatformError::NotIdentityKey)),
+                "{derived:?}"
+            );
+        }
+        assert_eq!(cached(&registry), 0);
+    }
+
+    /// Only a key-event record signs a change or a probe; every other
+    /// record is refused with no host call.
+    #[tokio::test]
+    async fn key_event_signing_refuses_other_records_without_host_call() {
+        let (registry, _store) = seeded(&[
+            (5, KeyType::P256Signing, KeyRole::Operational),
+            (6, KeyType::Ed25519, KeyRole::Identity),
+            (7, KeyType::HpkeP256, KeyRole::Operational),
+        ])
+        .await;
+        let change = scp_testing::conformance::key_custody::v41_signing_change();
+        let probe = CustodyProbe::fresh().unwrap();
+        for id in [5, 6, 7] {
+            let h = KeyHandle::new(id);
+            let changed = sign_change(&registry, &h, &change, no_host2, no_host).await;
+            assert_eq!(changed, Err(KeyEventSignError::WrongKeyType), "{id}");
+            let probed = sign_probe(&registry, &h, &probe, no_host2, no_host).await;
+            assert!(
+                matches!(probed, Err(KeyEventSignError::WrongKeyType)),
+                "{id}: {probed:?}"
+            );
+        }
+        assert_eq!(cached(&registry), 0);
+    }
+
+    /// `sign_change` hands the host exactly the change digest and
+    /// `sign_probe` exactly the probe's raw digest; each host DER high-`s`
+    /// answer comes back as a raw low-`s` signature that verifies under the
+    /// key, and a host signature that does not verify is refused.
+    #[tokio::test]
+    async fn key_event_signing_hands_the_host_the_digest() {
+        let host = fake_host::FakeHost::default();
+        let host = &host;
+        let (registry, _store) = seeded(&[]).await;
+        let gpk = |id: String| async move { host.get_public_key(&id) };
+        let handle = generate_key_event(
+            &registry,
+            |t, r| async move { host.generate_keypair(t, r) },
+            gpk,
+            |id| async move { host.destroy_key(&id) },
+        )
+        .await
+        .unwrap();
+        let key: [u8; 33] = public_key(&registry, &handle, gpk)
+            .await
+            .unwrap()
+            .as_bytes()
+            .try_into()
+            .unwrap();
+        let point = scp_crypto::p256::P256PublicKey::from_sec1(&key).unwrap();
+        let seen = std::sync::Mutex::new(Vec::new());
+        let seen = &seen;
+        let recording = |id: String, data: Vec<u8>| {
+            seen.lock().unwrap().push(data.clone());
+            async move { host.sign(&id, &data) }
+        };
+
+        let change = scp_testing::conformance::key_custody::v41_signing_change();
+        let IndexedSignature::Raw { signature } =
+            sign_change(&registry, &handle, &change, recording, gpk)
+                .await
+                .unwrap()
+        else {
+            panic!("a callback custody signs the raw form");
+        };
+        scp_crypto::p256::verify_prehash_strict(&point, &change.digest(), &signature).unwrap();
+        let probe = CustodyProbe::fresh().unwrap();
+        sign_probe(&registry, &handle, &probe, recording, gpk)
+            .await
+            .unwrap()
+            .verify(&probe, &key)
+            .unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![change.digest().to_vec(), probe.raw_digest().to_vec()]
+        );
+        let host_sig = host
+            .sign(&handle.id().to_string(), &change.digest())
+            .unwrap();
+        assert_ne!(host_sig.as_slice(), signature.as_slice());
+
+        let junk = sign_change(
+            &registry,
+            &handle,
+            &change,
+            |_, _| async { Ok(vec![0x11u8; 64]) },
+            gpk,
+        )
+        .await;
+        assert!(
+            matches!(junk, Err(KeyEventSignError::Substrate(_))),
+            "{junk:?}"
+        );
+    }
+
+    /// Two providers that hand out the same key id keep separate records
+    /// in one storage: destroying one provider's key leaves the other's
+    /// record.
+    #[tokio::test]
+    async fn providers_with_one_key_id_keep_separate_records() {
+        let storage = Arc::new(scp_platform::in_memory::InMemoryStorage::new());
+        let a_slot = CustodyNamespaceSlot::fresh().unwrap();
+        let b_slot = CustodyNamespaceSlot::fresh().unwrap();
+        let a = CallbackKeyRegistry::recorded(
+            custody_record_store(Arc::clone(&storage), &a_slot).unwrap(),
+        );
+        let b = CallbackKeyRegistry::recorded(
+            custody_record_store(Arc::clone(&storage), &b_slot).unwrap(),
+        );
+        let h = KeyHandle::new(5);
+        a.store()
+            .unwrap()
+            .put(h, KeyType::P256KeyEvent, KeyRole::Operational)
+            .await
+            .unwrap();
+        b.store()
+            .unwrap()
+            .put(h, KeyType::Ed25519, KeyRole::Identity)
+            .await
+            .unwrap();
+        destroy_key(&b, &h, |_| async { Ok(()) }).await.unwrap();
+        assert_eq!(record_of(&b, &h).await.unwrap(), None);
+        assert_eq!(record_of(&a, &h).await.unwrap(), Some(KEY_EVENT));
+    }
+
+    /// A destroy the host reports as key-not-found drops the record, as a
+    /// confirmed destroy does; a failed host destroy keeps it; a recorded
+    /// key that is gone is key-not-found with no host call.
+    #[tokio::test]
+    async fn host_absent_destroy_drops_the_record() {
+        let (registry, store) = seeded(&[
+            (5, KeyType::Ed25519, KeyRole::Operational),
+            (6, KeyType::P256KeyEvent, KeyRole::Operational),
+            (7, KeyType::Ed25519, KeyRole::Operational),
+        ])
+        .await;
+        let failed = destroy_key(&registry, &KeyHandle::new(5), |_| async {
+            Err(PlatformError::CustodyError("host destroy failed".into()))
+        })
+        .await;
+        assert!(matches!(failed, Err(PlatformError::CustodyError(_))));
+        assert!(store.get(KeyHandle::new(5)).await.unwrap().is_some());
+
+        let absent = destroy_key(&registry, &KeyHandle::new(5), |_| async {
+            Err(PlatformError::KeyNotFound)
+        })
+        .await;
+        assert!(matches!(absent, Err(PlatformError::KeyNotFound)));
+        assert_eq!(store.get(KeyHandle::new(5)).await.unwrap(), None);
+
+        destroy_key(&registry, &KeyHandle::new(6), |_| async { Ok(()) })
+            .await
+            .unwrap();
+        assert_eq!(store.get(KeyHandle::new(6)).await.unwrap(), None);
+        let again = destroy_key(&registry, &KeyHandle::new(6), no_host).await;
+        assert!(matches!(again, Err(PlatformError::KeyNotFound)));
+        assert!(store.get(KeyHandle::new(7)).await.unwrap().is_some());
+    }
+
+    /// A record the store fails to remove after the host's destroy is
+    /// reported, whether the host confirmed the destroy or reported the key
+    /// absent.
+    #[tokio::test]
+    async fn a_failed_record_removal_is_reported() {
+        for host_answer in [Ok(()), Err(PlatformError::KeyNotFound)] {
+            let registry = faulty(FaultyStore {
+                record: Some(KEY_EVENT),
+                fail_put: false,
+                fail_remove: true,
+            });
+            let result = destroy_key(
+                &registry,
+                &KeyHandle::new(5),
+                |_| async move { host_answer },
+            )
+            .await;
+            assert!(
+                matches!(&result, Err(PlatformError::CustodyError(m)) if m.contains("not removed")),
+                "{result:?}"
+            );
+        }
+    }
+
+    /// The loader refuses a second live adapter for one namespace while the
+    /// first lives, and loads it again, over the same records, once the first
+    /// drops.
+    #[tokio::test]
+    async fn a_second_live_adapter_for_one_namespace_is_refused() {
+        let storage = Arc::new(scp_platform::in_memory::InMemoryStorage::new());
+        let slot = CustodyNamespaceSlot::fresh().unwrap();
+        let h = KeyHandle::new(3);
+        let first = CallbackKeyRegistry::recorded(
+            custody_record_store(Arc::clone(&storage), &slot).expect("the first load"),
+        );
+        first
+            .store()
+            .unwrap()
+            .put(h, KeyType::P256KeyEvent, KeyRole::Operational)
+            .await
+            .unwrap();
+
+        let second = custody_record_store(Arc::clone(&storage), &slot.clone());
+        assert!(
+            matches!(second, Err(CustodyLoadError::NamespaceLive)),
+            "{second:?}"
+        );
+        assert!(matches!(
+            PlatformError::from(CustodyLoadError::NamespaceLive),
+            PlatformError::CustodyError(_)
+        ));
+
+        drop(first);
+        let third = CallbackKeyRegistry::recorded(
+            custody_record_store(Arc::clone(&storage), &slot).expect("the namespace is back"),
+        );
+        assert_eq!(record_of(&third, &h).await.unwrap(), Some(KEY_EVENT));
+    }
+
+    /// The fake host meets the host contract's key-id rule, and the check
+    /// fails a host that hands out a destroyed key's id again.
+    #[tokio::test]
+    async fn fake_host_never_reuses_key_ids() {
+        let host = fake_host::FakeHost::default();
+        let host = &host;
+        check_host_never_reuses_key_ids(
+            3,
+            |t, r| async move { host.generate_keypair(t, r) },
+            |id: String| async move { host.destroy_key(&id) },
+        )
+        .await
+        .unwrap();
+
+        let next = std::sync::Mutex::new(0u64);
+        let recycling = check_host_never_reuses_key_ids(
+            2,
+            |_, _| {
+                let id = {
+                    let mut n = next.lock().unwrap();
+                    *n = (*n % 3) + 1;
+                    *n
+                };
+                async move { Ok(id.to_string()) }
+            },
+            |_: String| async { Ok(()) },
+        )
+        .await;
+        assert!(
+            recycling.as_ref().is_err_and(|e| e.contains("again")),
+            "{recycling:?}"
+        );
     }
 }

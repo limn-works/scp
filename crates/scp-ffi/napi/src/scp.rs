@@ -535,7 +535,23 @@ impl Scp {
         // Promote the JS callbacks to threadsafe functions on the JS
         // thread (consuming the non-Send `Function`s). A malformed
         // provider fails fast here, before any DID-creation work.
-        let callback = crate::custody::NapiCallbackKeyCustody::from_provider(provider)?;
+        //
+        // The adapter's custody records live in the instance storage under a
+        // fresh namespace (SCP-345, ADR-021 strict refusal); the identity's
+        // registry entry keeps the namespace slot (decision D1).
+        let slot =
+            scp_ffi_common::callback_custody::CustodyNamespaceSlot::fresh().map_err(|e| {
+                NapiError::from(ScpNapiError::from(scp_platform::PlatformError::from(e)))
+            })?;
+        let records = crate::runtime::protocol_repository(&bi_arc)
+            .custody_record_store(&slot)
+            .map_err(|e| {
+                NapiError::from(ScpNapiError::from(scp_platform::PlatformError::from(e)))
+            })?;
+        let callback = crate::custody::NapiCallbackKeyCustody::from_provider(
+            provider,
+            scp_ffi_common::callback_custody::CallbackKeyRegistry::recorded(records),
+        )?;
         // A provider serves exactly custody `os_keystore` (§3.2.2); the
         // decision still goes through the shared parser.
         let selection = crate::custody::select_key_custody(

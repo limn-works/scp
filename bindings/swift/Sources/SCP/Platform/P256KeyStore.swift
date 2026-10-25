@@ -22,8 +22,8 @@ nonisolated enum P256Backing: String, Sendable, Equatable, CaseIterable {
 // MARK: - P256KeyStore
 
 /// The store that holds the private half of every P-256 key
-/// ``AppleKeyCustody`` mints (`p256` signing keys and `hpke-p256` wrapping
-/// keys) and runs every operation on it.
+/// ``AppleKeyCustody`` mints (`p256` signing keys, `p256-key-event` keys and
+/// `hpke-p256` wrapping keys) and runs every operation on it.
 ///
 /// ``KeychainP256KeyStore`` is the only implementation the SDK ships; the
 /// public ``AppleKeyCustody`` initializer builds one per ``P256Backing``. The

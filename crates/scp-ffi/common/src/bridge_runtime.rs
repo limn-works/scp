@@ -277,6 +277,30 @@ impl ProtocolRepoVariant {
         }
     }
 
+    /// Opens the custody records of the callback adapter whose identity
+    /// keeps `slot`, over this instance's own storage (spec §17.3, §17.6):
+    /// the store this repository's event log already uses, never a second one.
+    ///
+    /// # Errors
+    ///
+    /// [`CustodyLoadError::NamespaceLive`](crate::callback_custody::CustodyLoadError::NamespaceLive)
+    /// while another adapter holds the slot's namespace.
+    #[cfg(feature = "custody")]
+    pub fn custody_record_store(
+        &self,
+        slot: &crate::callback_custody::CustodyNamespaceSlot,
+    ) -> Result<crate::callback_custody::CustodyRecords, crate::callback_custody::CustodyLoadError>
+    {
+        match self {
+            Self::InMemory(repo) => {
+                crate::callback_custody::custody_record_store(Arc::clone(repo.storage()), slot)
+            }
+            Self::Sqlite(repo) => {
+                crate::callback_custody::custody_record_store(Arc::clone(repo.storage()), slot)
+            }
+        }
+    }
+
     /// Constructs a [`ContextEventLogProvider`] backed by this repository.
     ///
     /// The bridge is retained by `Arc` inside

@@ -350,6 +350,9 @@ pub enum CustodyKeyType {
     P256,
     /// A P-256 ECDH key for HPKE.
     HpkeP256,
+    /// A P-256 key-event key, which signs only key-event-log changes and
+    /// custody probes (spec 09 §9.7.4.1, SCP-345).
+    P256KeyEvent,
 }
 
 impl From<scp_platform::KeyType> for CustodyKeyType {
@@ -358,6 +361,7 @@ impl From<scp_platform::KeyType> for CustodyKeyType {
             scp_platform::KeyType::Ed25519 => Self::Ed25519,
             scp_platform::KeyType::P256Signing => Self::P256,
             scp_platform::KeyType::HpkeP256 => Self::HpkeP256,
+            scp_platform::KeyType::P256KeyEvent => Self::P256KeyEvent,
         }
     }
 }
@@ -368,6 +372,7 @@ impl From<CustodyKeyType> for scp_platform::KeyType {
             CustodyKeyType::Ed25519 => Self::Ed25519,
             CustodyKeyType::P256 => Self::P256Signing,
             CustodyKeyType::HpkeP256 => Self::HpkeP256,
+            CustodyKeyType::P256KeyEvent => Self::P256KeyEvent,
         }
     }
 }
@@ -474,18 +479,15 @@ pub trait KeyCustodyProvider: Send + Sync {
     ///
     /// The bridge types the key by `key_type` alone and requires exactly that
     /// type's length: 32 bytes (`"ed25519"`), the 33-byte
-    /// compressed SEC1 point (P-256 signing), or the 65-byte uncompressed
-    /// SEC1 point (HPKE P-256). A length that does not match the stated type,
+    /// compressed SEC1 point (P-256 signing and key event), or the 65-byte
+    /// uncompressed SEC1 point (HPKE P-256). A length that does not match the stated type,
     /// or an invalid point, is an error, and the bridge binds nothing. The bridge asks this for every key id it has not yet
     /// registered, whichever operation names it first.
     ///
     /// `role` is the role `generate_keypair` minted the key in, recorded by
-    /// the host for the key's lifetime and reported across sessions. A key id
-    /// the bridge has not seen binds as an identity only when `role` is
-    /// [`CustodyKeyRole::Identity`], so an identity from an earlier session
-    /// can still derive pseudonyms. The bridge cannot check the host's word:
-    /// a host that reports an identity for a key it minted as operational
-    /// lets that key derive pseudonyms, which is outside Rust's control.
+    /// the host for the key's lifetime and reported across sessions. The
+    /// bridge refuses an answer whose type or role disagrees with the record
+    /// it wrote when it minted the key (ADR-021, SCP-345).
     async fn get_public_key(&self, key_id: String) -> Result<CustodyPublicKey, ScpError>;
 
     /// Destroy key material for `key_id`. Subsequent operations must fail,

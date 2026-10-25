@@ -494,6 +494,9 @@ impl TestingCallbackCustody {
         Ok(Self {
             inner: std::sync::Arc::new(crate::custody::NapiCallbackKeyCustody::from_provider(
                 provider,
+                // Records in a fresh in-memory store, as production keeps
+                // them in the instance storage (SCP-345).
+                scp_ffi_common::callback_custody::CallbackKeyRegistry::recorded_in_memory(),
             )?),
         })
     }

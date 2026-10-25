@@ -33,7 +33,11 @@ impl<C: KeyCustody> CustodySigner<C> {
     /// this constructor checks it against the length of the public key the
     /// custody reports: 32 bytes for [`SigAlg::Ed25519`], 33 for
     /// [`SigAlg::EcdsaP256Sha256`]. A 65-byte HPKE P-256 key fails both
-    /// checks.
+    /// checks. A key-event key reports the same 33-byte point as a P-256
+    /// signing key, so it passes the check for
+    /// [`SigAlg::EcdsaP256Sha256`]; every [`ScpSigner::sign`] through it then
+    /// fails, because the custody's `sign` refuses a key-event key with
+    /// [`PlatformError::WrongKeyType`] (spec 09 §9.7.4.2 R10).
     ///
     /// # Errors
     ///
@@ -92,13 +96,14 @@ const fn signing_key_type(alg: SigAlg) -> Result<KeyType, PlatformError> {
 const fn public_key_len(key_type: KeyType) -> usize {
     match key_type {
         KeyType::Ed25519 => 32,
-        KeyType::P256Signing => 33,
+        KeyType::P256Signing | KeyType::P256KeyEvent => 33,
         KeyType::HpkeP256 => 65,
     }
 }
 
-/// The key type a public key of `len` bytes belongs to; the lengths are
-/// distinct across [`KeyType`].
+/// The key type a public key of `len` bytes belongs to. A key-event key's
+/// 33 bytes read as [`KeyType::P256Signing`], the only type of that length
+/// [`signing_key_type`] names.
 const fn key_type_of_len(len: usize) -> Option<KeyType> {
     match len {
         32 => Some(KeyType::Ed25519),
@@ -272,6 +277,20 @@ mod tests {
                 "{key_type:?} with {alg:?}: {result:?}"
             );
         }
+        Ok(())
+    }
+
+    /// A key-event key passes construction for ECDSA P-256 (its public key is
+    /// the same 33-byte point), and every sign through it fails with
+    /// `SignError::Custody`: `CustodySigner` is no path around R10's refusal
+    /// of raw signing by a key-event key.
+    #[tokio::test]
+    async fn custody_signer_over_key_event_key_refuses_every_sign() -> TestResult {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let handle = custody.generate_key_event_keypair().await?;
+        let signer = CustodySigner::new(custody, handle, SigAlg::EcdsaP256Sha256).await?;
+        let err = ScpSigner::sign(&signer, &[1; 32]).await;
+        assert!(matches!(&err, Err(SignError::Custody(_))), "{err:?}");
         Ok(())
     }
 

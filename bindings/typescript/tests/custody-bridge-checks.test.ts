@@ -595,6 +595,28 @@ suite.describe("napi callback custody", () => {
     expect(secret.every((b, i) => b === 0xa0 + i)).toBe(true);
   });
 
+  test("getPublicKey: the adapter passes a p256-key-event answer to the bridge and refuses an unknown type", () => {
+    // Spec 09 §9.7.4.1 (SCP-345): a key-event key reports its own type, which
+    // the bridge checks against the record it wrote at mint.
+    const answer = (keyType: string) =>
+      toNativeCustodyProvider(
+        Object.assign(new StoreKeychain(), {
+          getPublicKey: () => ({
+            keyType,
+            publicKey: new Uint8Array(33).fill(2),
+            role: "operational",
+          }),
+        }) as KeyCustodyProvider,
+      ).getPublicKey("1");
+    const keyEvent = answer("p256-key-event");
+    if (!keyEvent.ok) throw new Error(`host call failed: ${keyEvent.message}`);
+    expect(keyEvent.value.keyType).toBe("p256-key-event");
+    expect(keyEvent.value.role).toBe("operational");
+    expect(keyEvent.value.publicKey).toHaveLength(33);
+    const unknown = answer("p256-keyevent");
+    expect(unknown.ok).toBe(false);
+  });
+
   test("dhAgree: the adapter's copy of the host secret is zero after the bridge's synchronous read", async () => {
     const secret = Uint8Array.from({ length: 32 }, (_, i) => 0x40 + i);
     const provider = Object.assign(new StoreKeychain(), {

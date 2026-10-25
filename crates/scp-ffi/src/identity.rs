@@ -920,11 +920,13 @@ fn custody_request_error(
 /// `SCP-IDENT-1059` (ADR-062 §Decision 6) before the selection creates
 /// `$HOME/.scp` or opens a key file. Opening first would leave a key file
 /// sealed under whatever passphrase was set, for a call that fails. An
-/// `os_keystore` selection opens nothing, so it builds here and the refusal
-/// runs where `identity_create_with_custody` states it.
+/// `os_keystore` selection opens only its custody records over `bi`'s
+/// storage, which writes nothing, so it builds here and the refusal runs
+/// where `identity_create_with_custody` states it.
 #[cfg(not(feature = "testing"))]
 fn build_key_custody(
     selection: CustodySelection,
+    bi: &PyBridgeInstance,
 ) -> Result<(Arc<FfiKeyCustody>, String), ScpPyError> {
     use scp_ffi_common::custody_request::CustodyRequest;
     match selection {
@@ -934,7 +936,7 @@ fn build_key_custody(
         }
         CustodySelection::OsKeystore(provider) => Ok((
             Arc::new(FfiKeyCustody::Callback(
-                crate::custody::PyCallbackKeyCustody::new(provider),
+                crate::custody::PyCallbackKeyCustody::new(provider, callback_registry(bi)?),
             )),
             CustodyRequest::OsKeystore.as_str().to_owned(),
         )),
@@ -943,10 +945,12 @@ fn build_key_custody(
 
 /// Builds the key custody a [`CustodySelection`] names for an
 /// identity-creation path. A `testing` build mints the in-memory pre-rotation
-/// custody later, so it opens here.
+/// custody later, so it opens here. An `os_keystore` selection opens its
+/// custody records over `bi`'s storage.
 #[cfg(feature = "testing")]
 fn build_key_custody(
     selection: CustodySelection,
+    bi: &PyBridgeInstance,
 ) -> Result<(Arc<FfiKeyCustody>, String), ScpPyError> {
     use scp_ffi_common::custody_request::CustodyRequest;
     match selection {
@@ -976,11 +980,51 @@ fn build_key_custody(
         }
         CustodySelection::OsKeystore(provider) => Ok((
             Arc::new(FfiKeyCustody::Callback(
-                crate::custody::PyCallbackKeyCustody::new(provider),
+                crate::custody::PyCallbackKeyCustody::new(provider, callback_registry(bi)?),
             )),
             CustodyRequest::OsKeystore.as_str().to_owned(),
         )),
     }
+}
+
+/// The record-backed registry of a new identity's callback custody (SCP-345
+/// decision D1): a fresh namespace over `bi`'s own storage. The custody holds
+/// the namespace for as long as the identity's registry entry keeps it, so a
+/// second adapter over the same records is refused while it lives.
+///
+/// # Errors
+///
+/// `SCP-STORAGE-8000` when `bi` has no storage, since records with no store
+/// would lose every key's type at restart (spec section 17.17, decision D2);
+/// the [`CustodyLoadError`] code when no namespace can be drawn.
+///
+/// [`CustodyLoadError`]: scp_ffi_common::callback_custody::CustodyLoadError
+fn callback_registry(
+    bi: &PyBridgeInstance,
+) -> Result<scp_ffi_common::callback_custody::CallbackKeyRegistry, ScpPyError> {
+    use crate::runtime::StorageProvider;
+    use scp_ffi_common::callback_custody::{
+        CallbackKeyRegistry, CustodyNamespaceSlot, custody_record_store,
+    };
+    let load = |e| ScpPyError::from(scp_platform::PlatformError::from(e));
+    let slot = CustodyNamespaceSlot::fresh().map_err(load)?;
+    let records = match bi.storage_provider() {
+        Some(StorageProvider::InMemoryEncrypted(storage)) => {
+            custody_record_store(Arc::clone(storage), &slot)
+        }
+        Some(StorageProvider::Sqlite(storage)) => custody_record_store(Arc::clone(storage), &slot),
+        None => {
+            return Err(ScpPyError::ContextError {
+                message: "no storage provider is attached, so a callback custody has no store \
+                          for its key records; construct the bridge with storage first \
+                          (spec section 17.17)"
+                    .to_owned(),
+                code: scp_ffi_common::error_codes::STORAGE_8000.to_owned(),
+            });
+        }
+    }
+    .map_err(load)?;
+    Ok(CallbackKeyRegistry::recorded(records))
 }
 
 /// Maps a shared [`FileCustodyError`] onto this bridge's error type.
@@ -1276,7 +1320,7 @@ impl crate::scp::PyScp {
         // Resolve the custody (no file touched), then open it; a shipped build
         // refuses with SCP-IDENT-1059 at the open, before any key file exists.
         let (key_custody, custody_str) =
-            build_key_custody(resolve_custody(custody, None, testing_seed_array)?)?;
+            build_key_custody(resolve_custody(custody, None, testing_seed_array)?, &bi_arc)?;
         let rt = crate::runtime()?;
 
         // Ensure the production DID resolver is initialized on this bridge
@@ -1411,7 +1455,8 @@ impl crate::scp::PyScp {
         custody: &str,
     ) -> PyResult<PyIdentity> {
         let bi_arc = Arc::clone(&self.inner);
-        let (key_custody, custody_str) = build_key_custody(resolve_custody(custody, None, None)?)?;
+        let (key_custody, custody_str) =
+            build_key_custody(resolve_custody(custody, None, None)?, &bi_arc)?;
         let rt = crate::runtime()?;
 
         // Ensure the production DID resolver is initialized on this bridge
@@ -1557,11 +1602,14 @@ impl crate::scp::PyScp {
                     code: scp_ffi_common::error_codes::VALID_7005.to_owned(),
                 }
             })?;
-        let (key_custody, custody_str) = build_key_custody(resolve_custody(
-            scp_ffi_common::custody_request::CustodyRequest::OsKeystore.as_str(),
-            Some(provider_shim),
-            None,
-        )?)?;
+        let (key_custody, custody_str) = build_key_custody(
+            resolve_custody(
+                scp_ffi_common::custody_request::CustodyRequest::OsKeystore.as_str(),
+                Some(provider_shim),
+                None,
+            )?,
+            &bi_arc,
+        )?;
         let rt = crate::runtime()?;
 
         // Ensure the production DID resolver is initialized on this bridge
@@ -3272,9 +3320,57 @@ mod custody_request_tests {
         seed: Option<zeroize::Zeroizing<[u8; 32]>>,
     ) -> Result<String, String> {
         let selection = resolve_custody(request, provider, seed).map_err(|e| format!("{e:?}"))?;
-        build_key_custody(selection)
+        build_key_custody(selection, &PyBridgeInstance::new_in_memory_for_test())
             .map(|(_, label)| label)
             .map_err(|e| format!("{e:?}"))
+    }
+
+    /// Decision D2 (SCP-345): `os_keystore` on a bridge with no storage is
+    /// `SCP-STORAGE-8000`, since its custody records would have no store. A
+    /// build that fell back to an unrecorded or in-memory registry would
+    /// succeed.
+    #[test]
+    fn build_key_custody_refuses_os_keystore_without_storage_with_storage_8000()
+    -> Result<(), String> {
+        let selection =
+            resolve_custody("os_keystore", Some(provider()), None).map_err(|e| format!("{e:?}"))?;
+        let built =
+            build_key_custody(selection, &PyBridgeInstance::new_py()).map(|(_, label)| label);
+        assert!(
+            matches!(&built, Err(ScpPyError::ContextError { code, .. }) if code == codes::STORAGE_8000),
+            "expected SCP-STORAGE-8000, got {built:?}"
+        );
+        Ok(())
+    }
+
+    /// Decision D1 (SCP-345): each `os_keystore` build draws its own
+    /// namespace over the bridge's one storage. Two hosts that both name
+    /// their first key `1` mint it in different roles, and each record lands
+    /// in its own identity's namespace. A shared namespace would refuse the
+    /// second record as a different record for handle 1.
+    #[test]
+    fn build_key_custody_gives_each_os_keystore_identity_its_own_namespace() -> Result<(), String> {
+        let bi = PyBridgeInstance::new_in_memory_for_test();
+        let custody = || {
+            let selection = resolve_custody("os_keystore", Some(provider()), None)
+                .map_err(|e| format!("{e:?}"))?;
+            build_key_custody(selection, &bi)
+                .map(|(custody, _)| custody)
+                .map_err(|e| format!("custody: {e:?}"))
+        };
+        let (first, second) = (custody()?, custody()?);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("runtime: {e}"))?;
+        let identity = rt
+            .block_on(first.generate_identity_keypair())
+            .map_err(|e| format!("first identity key: {e:?}"))?;
+        let operational = rt
+            .block_on(second.generate_keypair(scp_platform::KeyType::Ed25519))
+            .map_err(|e| format!("second host's key 1 records in its own namespace: {e:?}"))?;
+        assert_eq!(identity, operational, "both hosts named their first key 1");
+        Ok(())
     }
 
     /// `os_keystore` with a provider resolves, and `build_key_custody` labels

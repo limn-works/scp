@@ -2600,6 +2600,44 @@
           "crates/scp-ffi/uniffi/src/bridge.rs Scp::identity_create (in-memory arm) → ensure_did_resolver_initialized_on"
         ]
       }
+    },
+    {
+      "rule_id": "callback-custody-record-store-at-create",
+      "description": "The PyO3 and UniFFI production paths that builds a callback custody adapter for a host `KeyCustodyProvider` must load the adapter's custody record store from the instance storage through `custody_record_store`, which leases the identity's own record namespace (ADR-021, spec 17 section 17.3 custody records, SCP-345). An adapter built without that store would have no record of each host key's type and role, so it could neither mint a key-event key nor refuse a host that reports a key-event key as a raw signing key.",
+      "applies_to": [
+        "pyo3",
+        "uniffi"
+      ],
+      "pattern": {
+        "caller_matches": "^(build_key_custody|decide_custody_for_create)$",
+        "required_callee": "custody_record_store",
+        "scope": "same-function-or-direct-callee",
+        "min_occurrences": 1
+      },
+      "evidence": {
+        "code_sites": [
+          "crates/scp-ffi/src/identity.rs build_key_custody → callback_registry → custody_record_store",
+          "crates/scp-ffi/uniffi/src/bridge.rs decide_custody_for_create → custody_record_store"
+        ]
+      }
+    },
+    {
+      "rule_id": "callback-custody-record-store-at-create-napi",
+      "description": "The napi `identity_create_with_custody` must load the callback custody adapter's record store from the instance storage through `custody_record_store`, as the rule `callback-custody-record-store-at-create` requires of the PyO3 and UniFFI bridges, whose adapter construction lives in a helper with another name (ADR-021, spec 17 section 17.3 custody records, SCP-345).",
+      "applies_to": [
+        "napi"
+      ],
+      "pattern": {
+        "caller_matches": "^identity_create_with_custody$",
+        "required_callee": "custody_record_store",
+        "scope": "same-function",
+        "min_occurrences": 1
+      },
+      "evidence": {
+        "code_sites": [
+          "crates/scp-ffi/napi/src/scp.rs Scp::identity_create_with_custody → custody_record_store"
+        ]
+      }
     }
   ]
 }

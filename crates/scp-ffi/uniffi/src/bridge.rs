@@ -71,6 +71,10 @@ use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{
     CustodyType, KeyCustody, KeyHandle, KeyType, Pseudonym, PublicKey, SharedSecret, Signature,
 };
+use scp_platform::{
+    CustodyProbe, IndexedSignature, KeyEventSignError, KeyEventSigner, ProbeSignature,
+    SigningChange,
+};
 use uuid::Uuid;
 
 use scp_core::context::membership::KeyPackage;
@@ -120,9 +124,34 @@ impl fmt::Debug for OpaqueInMemoryKeyCustody {
 /// `migrate_identity`) are preserved rather than silently falling back to the
 /// `Unsupported` defaults.
 #[cfg(feature = "testing")]
+impl KeyEventSigner for OpaqueInMemoryKeyCustody {
+    type Member = KeyHandle;
+
+    async fn sign_change(
+        &self,
+        member: &KeyHandle,
+        change: &SigningChange,
+    ) -> Result<IndexedSignature, KeyEventSignError> {
+        self.0.sign_change(member, change).await
+    }
+
+    async fn sign_probe(
+        &self,
+        member: &KeyHandle,
+        probe: &CustodyProbe,
+    ) -> Result<ProbeSignature, KeyEventSignError> {
+        self.0.sign_probe(member, probe).await
+    }
+}
+
+#[cfg(feature = "testing")]
 impl KeyCustody for OpaqueInMemoryKeyCustody {
     async fn generate_keypair(&self, key_type: KeyType) -> Result<KeyHandle, PlatformError> {
         self.0.generate_keypair(key_type).await
+    }
+
+    async fn generate_key_event_keypair(&self) -> Result<KeyHandle, PlatformError> {
+        self.0.generate_key_event_keypair().await
     }
 
     async fn generate_identity_keypair(&self) -> Result<KeyHandle, PlatformError> {
@@ -610,12 +639,25 @@ pub(crate) struct CallbackKeyCustody {
 }
 
 impl CallbackKeyCustody {
-    /// Creates a new adapter wrapping the given callback provider.
-    pub(crate) fn new(provider: Box<dyn crate::KeyCustodyProvider>) -> Self {
-        Self {
+    /// Creates an adapter wrapping the given callback provider, whose custody
+    /// records `registry` holds. Production passes
+    /// [`CallbackKeyRegistry::recorded`](scp_ffi_common::callback_custody::CallbackKeyRegistry::recorded)
+    /// over the instance storage, so every handle resolves against its record
+    /// and the host's word never types a key (ADR-021, SCP-345).
+    pub(crate) fn new(
+        provider: Box<dyn crate::KeyCustodyProvider>,
+        registry: scp_ffi_common::callback_custody::CallbackKeyRegistry,
+    ) -> Self {
+        Self { provider, registry }
+    }
+
+    /// An adapter over `provider` with records in a fresh in-memory store.
+    #[cfg(test)]
+    pub(crate) fn new_for_test(provider: Box<dyn crate::KeyCustodyProvider>) -> Self {
+        Self::new(
             provider,
-            registry: scp_ffi_common::callback_custody::CallbackKeyRegistry::new(),
-        }
+            scp_ffi_common::callback_custody::CallbackKeyRegistry::recorded_in_memory(),
+        )
     }
 }
 
@@ -672,16 +714,64 @@ async fn host_public_key(
     })
 }
 
+impl KeyEventSigner for CallbackKeyCustody {
+    type Member = KeyHandle;
+
+    async fn sign_change(
+        &self,
+        member: &KeyHandle,
+        change: &SigningChange,
+    ) -> Result<IndexedSignature, KeyEventSignError> {
+        let p = &*self.provider;
+        scp_ffi_common::callback_custody::sign_change(
+            &self.registry,
+            member,
+            change,
+            |key_id, data| async move { p.sign(key_id, data).await.map_err(host_err("sign")) },
+            |key_id| host_public_key(p, key_id),
+        )
+        .await
+    }
+
+    async fn sign_probe(
+        &self,
+        member: &KeyHandle,
+        probe: &CustodyProbe,
+    ) -> Result<ProbeSignature, KeyEventSignError> {
+        let p = &*self.provider;
+        scp_ffi_common::callback_custody::sign_probe(
+            &self.registry,
+            member,
+            probe,
+            |key_id, data| async move { p.sign(key_id, data).await.map_err(host_err("sign")) },
+            |key_id| host_public_key(p, key_id),
+        )
+        .await
+    }
+}
+
 impl KeyCustody for CallbackKeyCustody {
     // The shared flows in `scp_ffi_common::callback_custody` hold every
     // key-type, length, role and signature rule, so the three bridges cannot
     // drift; each closure is one provider call. Every entry point resolves a
-    // handle this adapter has not registered through `get_public_key`.
+    // handle against its custody record, and checks the host's
+    // `get_public_key` answer against it.
     async fn generate_keypair(&self, key_type: KeyType) -> Result<KeyHandle, PlatformError> {
         let p = &*self.provider;
         scp_ffi_common::callback_custody::generate_operational(
             &self.registry,
             key_type,
+            |key_type, role| host_generate(p, key_type, role),
+            |key_id| host_public_key(p, key_id),
+            |key_id| host_destroy(p, key_id),
+        )
+        .await
+    }
+
+    async fn generate_key_event_keypair(&self) -> Result<KeyHandle, PlatformError> {
+        let p = &*self.provider;
+        scp_ffi_common::callback_custody::generate_key_event(
+            &self.registry,
             |key_type, role| host_generate(p, key_type, role),
             |key_id| host_public_key(p, key_id),
             |key_id| host_destroy(p, key_id),
@@ -942,6 +1032,36 @@ impl fmt::Debug for UniffiKeyCustody {
     }
 }
 
+impl KeyEventSigner for UniffiKeyCustody {
+    type Member = KeyHandle;
+
+    async fn sign_change(
+        &self,
+        member: &KeyHandle,
+        change: &SigningChange,
+    ) -> Result<IndexedSignature, KeyEventSignError> {
+        match self {
+            #[cfg(feature = "testing")]
+            Self::InMemory(kc) => kc.0.sign_change(member, change).await,
+            Self::Callback(kc) => kc.sign_change(member, change).await,
+            Self::File(kc) => kc.sign_change(member, change).await,
+        }
+    }
+
+    async fn sign_probe(
+        &self,
+        member: &KeyHandle,
+        probe: &CustodyProbe,
+    ) -> Result<ProbeSignature, KeyEventSignError> {
+        match self {
+            #[cfg(feature = "testing")]
+            Self::InMemory(kc) => kc.0.sign_probe(member, probe).await,
+            Self::Callback(kc) => kc.sign_probe(member, probe).await,
+            Self::File(kc) => kc.sign_probe(member, probe).await,
+        }
+    }
+}
+
 impl KeyCustody for UniffiKeyCustody {
     async fn generate_keypair(&self, key_type: KeyType) -> Result<KeyHandle, PlatformError> {
         match self {
@@ -949,6 +1069,15 @@ impl KeyCustody for UniffiKeyCustody {
             Self::InMemory(kc) => kc.0.generate_keypair(key_type).await,
             Self::Callback(kc) => kc.generate_keypair(key_type).await,
             Self::File(kc) => kc.generate_keypair(key_type).await,
+        }
+    }
+
+    async fn generate_key_event_keypair(&self) -> Result<KeyHandle, PlatformError> {
+        match self {
+            #[cfg(feature = "testing")]
+            Self::InMemory(kc) => kc.0.generate_key_event_keypair().await,
+            Self::Callback(kc) => kc.generate_key_event_keypair().await,
+            Self::File(kc) => kc.generate_key_event_keypair().await,
         }
     }
 
@@ -7378,10 +7507,16 @@ const fn decided_built(custody: UniffiKeyCustody) -> DecidedCustody {
 /// shipped build then refuses with `SCP-IDENT-1059` before the key file opens,
 /// so a failed call leaves no key file sealed under whatever passphrase was
 /// set.
+///
+/// An `os_keystore` adapter keeps its custody records in `repository`'s
+/// storage under a fresh namespace (SCP-345, ADR-021 strict refusal), and the
+/// identity's registry entry keeps the namespace by keeping the adapter
+/// (decision D1).
 fn decide_custody_for_create(
     custody: &str,
     provider: Option<Box<dyn crate::KeyCustodyProvider>>,
     testing_seed: Option<Zeroizing<[u8; 32]>>,
+    repository: &scp_ffi_common::bridge_runtime::ProtocolRepoVariant,
 ) -> Result<(CustodyRequest, DecidedCustody), ScpError> {
     let request = parse_custody_request(CustodyRequestInput {
         request: custody,
@@ -7390,9 +7525,18 @@ fn decide_custody_for_create(
         testing_build: cfg!(feature = "testing"),
     })?;
     let decided = match (request, provider) {
-        (CustodyRequest::OsKeystore, Some(provider)) => decided_built(UniffiKeyCustody::Callback(
-            Arc::new(CallbackKeyCustody::new(provider)),
-        )),
+        (CustodyRequest::OsKeystore, Some(provider)) => {
+            let slot = scp_ffi_common::callback_custody::CustodyNamespaceSlot::fresh()
+                .map_err(|e| ScpError::from(PlatformError::from(e)))?;
+            let registry = scp_ffi_common::callback_custody::CallbackKeyRegistry::recorded(
+                repository
+                    .custody_record_store(&slot)
+                    .map_err(|e| ScpError::from(PlatformError::from(e)))?,
+            );
+            decided_built(UniffiKeyCustody::Callback(Arc::new(
+                CallbackKeyCustody::new(provider, registry),
+            )))
+        }
         (CustodyRequest::EncryptedFile, None) => {
             let inputs = scp_ffi_common::custody_file::resolve_file_custody_inputs()
                 .map_err(|e| file_custody_error(&e))?;
@@ -7454,8 +7598,10 @@ async fn open_custody_for_create(
     custody: &str,
     provider: Option<Box<dyn crate::KeyCustodyProvider>>,
     testing_seed: Option<Zeroizing<[u8; 32]>>,
+    repository: &scp_ffi_common::bridge_runtime::ProtocolRepoVariant,
 ) -> Result<CreateCustody, ScpError> {
-    let (request, decided) = decide_custody_for_create(custody, provider, testing_seed)?;
+    let (request, decided) =
+        decide_custody_for_create(custody, provider, testing_seed, repository)?;
     let built = match decided {
         DecidedCustody::Built(built) => built,
         DecidedCustody::OpenFile(inputs) => {
@@ -7487,12 +7633,15 @@ fn open_custody_for_create(
     custody: &str,
     provider: Option<Box<dyn crate::KeyCustodyProvider>>,
     testing_seed: Option<Zeroizing<[u8; 32]>>,
+    repository: &scp_ffi_common::bridge_runtime::ProtocolRepoVariant,
 ) -> std::future::Ready<Result<CreateCustody, ScpError>> {
     std::future::ready(
-        decide_custody_for_create(custody, provider, testing_seed).and_then(|(_, decided)| {
-            drop(decided);
-            Err(no_pre_rotation_backend())
-        }),
+        decide_custody_for_create(custody, provider, testing_seed, repository).and_then(
+            |(_, decided)| {
+                drop(decided);
+                Err(no_pre_rotation_backend())
+            },
+        ),
     )
 }
 
@@ -9996,7 +10145,13 @@ impl Scp {
 
         runtime()
             .spawn(async move {
-                let created = open_custody_for_create(&custody, None, testing_seed_bytes).await?;
+                let created = open_custody_for_create(
+                    &custody,
+                    None,
+                    testing_seed_bytes,
+                    bi.protocol_repository(),
+                )
+                .await?;
                 #[cfg(not(feature = "testing"))]
                 {
                     let _ = &bi;
@@ -10050,6 +10205,7 @@ impl Scp {
                     CustodyRequest::OsKeystore.as_str(),
                     Some(provider),
                     None,
+                    bi.protocol_repository(),
                 )
                 .await?;
                 #[cfg(not(feature = "testing"))]
@@ -17645,7 +17801,8 @@ impl Scp {
 
         runtime()
             .spawn(async move {
-                let created = open_custody_for_create(&custody, None, None).await?;
+                let created =
+                    open_custody_for_create(&custody, None, None, bi.protocol_repository()).await?;
                 #[cfg(not(feature = "testing"))]
                 {
                     let _ = &bi;
@@ -24797,7 +24954,7 @@ mod tests {
         use scp_platform::traits::KeyType;
 
         let host = Arc::new(scp_ffi_common::callback_custody::fake_host::FakeHost::default());
-        let custody = CallbackKeyCustody::new(Box::new(FakeHostProvider::over(&host)));
+        let custody = CallbackKeyCustody::new_for_test(Box::new(FakeHostProvider::over(&host)));
 
         let signer = custody
             .generate_keypair(KeyType::P256Signing)
@@ -24884,26 +25041,43 @@ mod tests {
         );
     }
 
-    /// A fresh adapter that never minted or derived handle N (a host key
-    /// from an earlier session) still verifies `sign(N)` strictly: it binds N
-    /// through the host's structured `get_public_key` and returns the host's
-    /// high-s DER signature as raw low-s that verifies against that point. An
-    /// id the host does not hold fails with `KeyNotFound` before any host
-    /// sign call.
+    /// A fresh adapter over the records of an earlier session's adapter
+    /// verifies `sign(N)` of that session's key strictly: it binds N through
+    /// the host's structured `get_public_key`, checked against N's record,
+    /// and returns the host's high-s DER signature as raw low-s that
+    /// verifies against that point. An id with no record fails with
+    /// `KeyNotFound` before any host call.
     #[tokio::test]
-    async fn callback_custody_unregistered_handle_resolves_and_verifies() {
+    async fn callback_custody_recorded_handle_resolves_and_verifies() {
         use scp_crypto::p256::{P256PublicKey, normalize_low_s, verify_prehash_strict};
+        use scp_ffi_common::callback_custody::{
+            CallbackKeyRegistry, CustodyNamespaceSlot, custody_record_store,
+        };
         use scp_platform::KeyCustody;
 
         let host = Arc::new(scp_ffi_common::callback_custody::fake_host::FakeHost::default());
-        let id = host
-            .generate_keypair(KeyType::P256Signing, scp_platform::KeyRole::Operational)
-            .expect("host-side key");
-        let point =
-            P256PublicKey::from_sec1(&host.get_public_key(&id).expect("host point").public_key)
-                .expect("a valid point");
-        let custody = CallbackKeyCustody::new(Box::new(FakeHostProvider::over(&host)));
-        let handle = KeyHandle::new(id.parse().expect("numeric id"));
+        let storage = Arc::new(scp_platform::in_memory::InMemoryStorage::new());
+        let slot = CustodyNamespaceSlot::fresh().expect("namespace");
+        let recorded = || {
+            CallbackKeyRegistry::recorded(
+                custody_record_store(Arc::clone(&storage), &slot)
+                    .expect("no other adapter holds the namespace"),
+            )
+        };
+        let earlier = CallbackKeyCustody::new(Box::new(FakeHostProvider::over(&host)), recorded());
+        let handle = earlier
+            .generate_keypair(KeyType::P256Signing)
+            .await
+            .expect("earlier session's key");
+        drop(earlier);
+        let point = P256PublicKey::from_sec1(
+            &host
+                .get_public_key(&handle.id().to_string())
+                .expect("host point")
+                .public_key,
+        )
+        .expect("a valid point");
+        let custody = CallbackKeyCustody::new(Box::new(FakeHostProvider::over(&host)), recorded());
 
         let digest = [7u8; 32];
         let sig: [u8; 64] = custody
@@ -24921,14 +25095,15 @@ mod tests {
         ));
         assert_eq!(host.calls("sign"), 1);
 
+        let lookups = host.calls("get_public_key");
         assert!(matches!(
             custody.sign(&KeyHandle::new(4242), &digest).await,
             Err(scp_platform::error::PlatformError::KeyNotFound)
         ));
         assert_eq!(
-            host.calls("sign"),
-            1,
-            "no host sign call for an id the host lacks"
+            (host.calls("sign"), host.calls("get_public_key")),
+            (1, lookups),
+            "no host call for an id with no record"
         );
     }
 
@@ -24941,7 +25116,7 @@ mod tests {
         use scp_platform::error::PlatformError;
 
         let host = Arc::new(scp_ffi_common::callback_custody::fake_host::FakeHost::default());
-        let custody = CallbackKeyCustody::new(Box::new(FakeHostProvider::over(&host)));
+        let custody = CallbackKeyCustody::new_for_test(Box::new(FakeHostProvider::over(&host)));
         let key = custody
             .generate_keypair(KeyType::Ed25519)
             .await
@@ -24956,13 +25131,14 @@ mod tests {
         ));
         assert_eq!(host.calls("sign"), 1);
 
-        let transport = CallbackKeyCustody::new(Box::new(FakeHostProvider {
+        let transport = CallbackKeyCustody::new_for_test(Box::new(FakeHostProvider {
             host: Arc::clone(&host),
             sign_error: Some(ScpError::Transport {
                 msg: "connection reset".to_owned(),
                 code: "SCP-TRANSPORT-0000".to_owned(),
             }),
             custody_type: "software",
+            signed: Arc::default(),
         }));
         let key = transport
             .generate_keypair(KeyType::Ed25519)
@@ -24984,7 +25160,7 @@ mod tests {
         use scp_platform::error::PlatformError;
 
         let host = Arc::new(scp_ffi_common::callback_custody::fake_host::FakeHost::default());
-        let custody = CallbackKeyCustody::new(Box::new(FakeHostProvider::over(&host)));
+        let custody = CallbackKeyCustody::new_for_test(Box::new(FakeHostProvider::over(&host)));
         let operational = custody
             .generate_keypair(KeyType::Ed25519)
             .await
@@ -25010,6 +25186,116 @@ mod tests {
             .expect("an identity derives");
     }
 
+    /// A key-event key minted through `custody`, with its 33-byte public key.
+    async fn key_event_key(custody: &CallbackKeyCustody) -> (KeyHandle, [u8; 33]) {
+        let key = custody
+            .generate_key_event_keypair()
+            .await
+            .expect("key-event mint");
+        let public = custody
+            .public_key(&key)
+            .await
+            .expect("public key")
+            .as_bytes()
+            .try_into()
+            .expect("a key-event key is a 33-byte point");
+        (key, public)
+    }
+
+    /// AC7 (SCP-345): the custody record, not the host's word, types a key.
+    /// An adapter rebuilt over the same records refuses `sign` of a
+    /// key-event key the host now reports as `P256`, without a host call. A
+    /// registry that trusted the host's answer would sign.
+    #[tokio::test]
+    async fn rebuilt_adapter_refuses_sign_of_key_event_key_host_reports_p256() {
+        use scp_ffi_common::callback_custody::{
+            CallbackKeyRegistry, CustodyNamespaceSlot, custody_record_store,
+        };
+
+        let host = Arc::new(scp_ffi_common::callback_custody::fake_host::FakeHost::default());
+        let storage = Arc::new(scp_platform::in_memory::InMemoryStorage::new());
+        let slot = CustodyNamespaceSlot::fresh().expect("namespace");
+        let recorded = || {
+            CallbackKeyRegistry::recorded(
+                custody_record_store(Arc::clone(&storage), &slot)
+                    .expect("no other adapter holds the namespace"),
+            )
+        };
+        let minted = CallbackKeyCustody::new(Box::new(FakeHostProvider::over(&host)), recorded());
+        let (key, _) = key_event_key(&minted).await;
+        assert!(
+            custody_record_store(Arc::clone(&storage), &slot).is_err(),
+            "a second adapter for a live namespace is refused"
+        );
+        drop(minted);
+
+        host.report_as(&key.id().to_string(), KeyType::P256Signing)
+            .expect("report");
+        let rebuilt = CallbackKeyCustody::new(Box::new(FakeHostProvider::over(&host)), recorded());
+        let signs = host.calls("sign");
+        let refused = rebuilt.sign(&key, &[0x5a; 32]).await;
+        assert!(
+            matches!(
+                refused,
+                Err(PlatformError::WrongKeyType {
+                    expected: KeyType::P256Signing,
+                    actual: KeyType::P256KeyEvent,
+                })
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(host.calls("sign"), signs, "the refusal makes no host call");
+    }
+
+    /// AC8 (SCP-345): `sign_change` hands the host the change's 32-byte
+    /// digest `D`, never the preimage, and the raw low-`s` signature it
+    /// returns verifies strictly over `D` under the key.
+    #[tokio::test]
+    async fn sign_change_hands_host_the_change_digest() {
+        let host = Arc::new(scp_ffi_common::callback_custody::fake_host::FakeHost::default());
+        let provider = FakeHostProvider::over(&host);
+        let signed = Arc::clone(&provider.signed);
+        let custody = CallbackKeyCustody::new_for_test(Box::new(provider));
+        let (key, public) = key_event_key(&custody).await;
+        let change = scp_testing::conformance::key_custody::v41_signing_change();
+        let IndexedSignature::Raw { signature } = custody
+            .sign_change(&key, &change)
+            .await
+            .expect("sign_change")
+        else {
+            panic!("a callback custody signs the raw form");
+        };
+        assert_eq!(
+            *signed.lock().expect("lock"),
+            vec![change.digest().to_vec()]
+        );
+        let point = scp_crypto::p256::P256PublicKey::from_sec1(&public).expect("point");
+        scp_crypto::p256::verify_prehash_strict(&point, &change.digest(), &signature)
+            .expect("verifies over D");
+    }
+
+    /// AC8 (SCP-345): `sign_probe` hands the host the probe's raw digest,
+    /// never its nonce, and the signature verifies over the probe.
+    #[tokio::test]
+    async fn sign_probe_hands_host_the_probe_digest() {
+        let host = Arc::new(scp_ffi_common::callback_custody::fake_host::FakeHost::default());
+        let provider = FakeHostProvider::over(&host);
+        let signed = Arc::clone(&provider.signed);
+        let custody = CallbackKeyCustody::new_for_test(Box::new(provider));
+        let (key, public) = key_event_key(&custody).await;
+        let probe = CustodyProbe::fresh().expect("probe nonce");
+        custody
+            .sign_probe(&key, &probe)
+            .await
+            .expect("sign_probe")
+            .verify(&probe, &public)
+            .expect("verifies over the probe");
+        assert_eq!(
+            *signed.lock().expect("lock"),
+            vec![probe.raw_digest().to_vec()]
+        );
+    }
+
     /// For `UniFFI`: the rotatable derivation reaches the host's
     /// rotatable callback, and the plain one the plain callback.
     #[tokio::test]
@@ -25017,7 +25303,7 @@ mod tests {
         use scp_platform::KeyCustody;
 
         let host = Arc::new(scp_ffi_common::callback_custody::fake_host::FakeHost::default());
-        let custody = CallbackKeyCustody::new(Box::new(FakeHostProvider::over(&host)));
+        let custody = CallbackKeyCustody::new_for_test(Box::new(FakeHostProvider::over(&host)));
         let identity = custody
             .generate_identity_keypair()
             .await
@@ -25143,8 +25429,19 @@ mod tests {
         let provider = SignOnlyCustody::new();
         let verifying_key = provider.signing_key.verifying_key();
 
-        let callback = Arc::new(CallbackKeyCustody::new(Box::new(provider)));
         let key_handle = KeyHandle::new(1);
+        // The adapter's records hold the provider's key as the Ed25519
+        // identity key it is, so the adapter resolves it through the
+        // provider's `get_public_key` on first use.
+        let registry =
+            scp_ffi_common::callback_custody::CallbackKeyRegistry::recorded_in_memory_holding(&[(
+                key_handle,
+                KeyType::Ed25519,
+                scp_platform::KeyRole::Identity,
+            )])
+            .await
+            .expect("record the provider's key");
+        let callback = Arc::new(CallbackKeyCustody::new(Box::new(provider), registry));
 
         // Build a context handle carrying the sign-only callback custody and the
         // `#active` key handle, exactly as `context_create` would for a
@@ -31046,7 +31343,7 @@ mod tests {
     /// reports them as `SCP-CRYPTO-4006` and `SCP-CRYPTO-4060`.
     #[tokio::test]
     async fn callback_host_failure_codes_map_to_typed_errors() {
-        let custody = CallbackKeyCustody::new(Box::new(ProdLikeCustody::new()));
+        let custody = CallbackKeyCustody::new_for_test(Box::new(ProdLikeCustody::new()));
         let identity = custody
             .generate_identity_keypair()
             .await
@@ -31065,7 +31362,7 @@ mod tests {
             other => panic!("expected CRYPTO_4006, got {other:?}"),
         }
 
-        let custody = CallbackKeyCustody::new(Box::new(ProdLikeCustody::with_fault(
+        let custody = CallbackKeyCustody::new_for_test(Box::new(ProdLikeCustody::with_fault(
             HostFault::SignFails4001,
         )));
         let identity = custody
@@ -31098,7 +31395,7 @@ mod tests {
     async fn callback_custody_forwards_context_and_epoch_unchanged() {
         let provider = ProdLikeCustody::new();
         let received = Arc::clone(&provider.received);
-        let custody = CallbackKeyCustody::new(Box::new(provider));
+        let custody = CallbackKeyCustody::new_for_test(Box::new(provider));
         let identity = custody
             .generate_identity_keypair()
             .await
@@ -31134,7 +31431,7 @@ mod tests {
             *probe_seen.lock().expect("probe mutex") =
                 Some(custody.registry.get(&handle).expect("lock").is_some());
         }));
-        let custody = Arc::new(CallbackKeyCustody::new(Box::new(host)));
+        let custody = Arc::new(CallbackKeyCustody::new_for_test(Box::new(host)));
         adapter
             .set(Arc::downgrade(&custody))
             .expect("cell set once");
@@ -31474,7 +31771,9 @@ mod tests {
     async fn rotate_key_signer_is_wired_over_callback_custody() {
         use scp_identity::DidMethod;
 
-        let callback = Arc::new(CallbackKeyCustody::new(Box::new(ProdLikeCustody::new())));
+        let callback = Arc::new(CallbackKeyCustody::new_for_test(Box::new(
+            ProdLikeCustody::new(),
+        )));
         let pre_rotation_custody =
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
 
@@ -31745,7 +32044,9 @@ mod tests {
         if identity_custody_registry(bi).contains_key(did) {
             return false;
         }
-        let callback = Arc::new(CallbackKeyCustody::new(Box::new(ProdLikeCustody::new())));
+        let callback = Arc::new(CallbackKeyCustody::new_for_test(Box::new(
+            ProdLikeCustody::new(),
+        )));
         let active_key = callback
             .generate_keypair(KeyType::Ed25519)
             .await
@@ -31836,7 +32137,9 @@ mod tests {
         scp: &Arc<crate::scp::Scp>,
         supervisor_ceiling: &[&str],
     ) -> (Arc<ContextHandle>, ed25519_dalek::VerifyingKey) {
-        let callback = Arc::new(CallbackKeyCustody::new(Box::new(ProdLikeCustody::new())));
+        let callback = Arc::new(CallbackKeyCustody::new_for_test(Box::new(
+            ProdLikeCustody::new(),
+        )));
         // Generate the `#active` key inside the callback store and capture its
         // public key for signature verification.
         let signing_key = callback
@@ -31966,7 +32269,9 @@ mod tests {
         KeyHandle,
         ed25519_dalek::VerifyingKey,
     ) {
-        let custody = Arc::new(CallbackKeyCustody::new(Box::new(ProdLikeCustody::new())));
+        let custody = Arc::new(CallbackKeyCustody::new_for_test(Box::new(
+            ProdLikeCustody::new(),
+        )));
         let key = custody
             .generate_keypair(KeyType::Ed25519)
             .await
@@ -32121,7 +32426,9 @@ mod tests {
         scp: &Arc<crate::scp::Scp>,
         did: &str,
     ) -> ed25519_dalek::VerifyingKey {
-        let callback = Arc::new(CallbackKeyCustody::new(Box::new(ProdLikeCustody::new())));
+        let callback = Arc::new(CallbackKeyCustody::new_for_test(Box::new(
+            ProdLikeCustody::new(),
+        )));
         let signing_key = callback
             .generate_keypair(KeyType::Ed25519)
             .await

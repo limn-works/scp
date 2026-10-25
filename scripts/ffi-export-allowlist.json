@@ -810,6 +810,12 @@
       "reason": "SCP-307 test hook; feature-gated (testing). Method returning the adapter's mapping of the host's custody-type string (hardware, software or in_memory), so a test shows a Secure Enclave key reaches Rust as hardware; a method of TestingCallbackCustody, which wraps a Swift or Kotlin KeyCustodyProvider in the production UniFFI callback custody adapter so SDK tests reach that adapter's checks, its custody-type mapping and its error codes. Not a protocol operation."
     },
     {
+      "name": "reopen",
+      "path": "crates/scp-ffi/uniffi/src/testing_custody.rs",
+      "kind": "test-fixture",
+      "reason": "SCP-345 test hook; feature-gated (testing). Method that builds a new TestingCallbackCustody around another host provider over this one's custody records, as production rebuilds an identity's adapter over its stored records after a relaunch, so a Swift or Kotlin test reopens keys the first adapter minted and recorded. Not a protocol operation."
+    },
+    {
       "name": "testing_p256_verify_strict",
       "path": "crates/scp-ffi/uniffi/src/testing_custody.rs",
       "kind": "test-fixture",

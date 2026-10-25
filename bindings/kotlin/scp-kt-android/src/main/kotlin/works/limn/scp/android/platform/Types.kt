@@ -21,16 +21,29 @@ package works.limn.scp.android.platform
 
 /**
  * The type of cryptographic key managed by a [KeyHandle], one per UniFFI `CustodyKeyType`.
+ *
+ * @property wire The host key-type name the bridge parses (`KeyType::parse`).
  */
-enum class KeyType {
+enum class KeyType(val wire: String) {
     /** Ed25519 signing key (identity keys, active signing keys). */
-    ED25519,
+    ED25519("ed25519"),
 
     /** P-256 signing key: signs a 32-byte digest and returns DER (spec 09 §9.5). */
-    P256,
+    P256("p256"),
 
     /** P-256 agreement key for DHKEM(P-256) HPKE (spec 09 §9.5, RFC 9180 §7.1). */
-    HPKE_P256,
+    HPKE_P256("hpke-p256"),
+
+    /**
+     * P-256 key-event key: signs only the 32-byte digests of key-event-log changes and custody
+     * probes and returns DER (spec 09 §9.7.4.1, SCP-345). Recorded as its own type, so it never
+     * signs as a [P256] key after a restart.
+     */
+    P256_KEY_EVENT("p256-key-event"),
+    ;
+
+    /** Whether this type is an ECDSA P-256 key, signing or key event, held in Keystore. */
+    val isP256Ecdsa: Boolean get() = this == P256 || this == P256_KEY_EVENT
 }
 
 /**

@@ -113,7 +113,7 @@ internal class P256Keys(
      * Signs the 32-byte [digest] with the P-256 key [id] and returns Keystore's DER signature.
      */
     fun sign(id: String, record: KeyRecord, digest: ByteArray): ByteArray {
-        if (record.type != KeyType.P256) custodyFailure("sign requires a P-256 signing key; key $id is ${record.type}")
+        if (!record.type.isP256Ecdsa) custodyFailure("sign requires a P-256 ECDSA key; key $id is ${record.type.wire}")
         if (digest.size != DIGEST_SIZE) {
             custodyFailure("A P-256 key signs a $DIGEST_SIZE-byte digest, got ${digest.size} bytes")
         }
@@ -127,7 +127,7 @@ internal class P256Keys(
             Backing.KEYSTORE -> keystorePoint(id)
             Backing.SOFTWARE -> (softwarePair(id).public as ECPublicKeyParameters).q
         }
-        return point.getEncoded(record.type == KeyType.P256)
+        return point.getEncoded(record.type.isP256Ecdsa)
     }
 
     /**
@@ -218,7 +218,7 @@ internal class P256Keys(
 
     private fun createInKeystore(id: String, type: KeyType): CustodyType {
         val alias = keyAlias(id)
-        if (type == KeyType.P256) keystore.generateP256Signing(alias) else keystore.generateP256Agreement(alias)
+        if (type.isP256Ecdsa) keystore.generateP256Signing(alias) else keystore.generateP256Agreement(alias)
         val created = keystore.p256PublicKey(alias)
             ?: throw ScpException("Keystore created no public key for key $id", CUSTODY_ERROR)
         validPoint(id, created)

@@ -12278,7 +12278,7 @@
       "gate": "gate-kel",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-kel/src/key_event_signer.rs",
         "crates/scp-kel/src/lib.rs",

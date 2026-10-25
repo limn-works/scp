@@ -109,5 +109,6 @@ pub use traits::{
     CustodyType, DeviceAttestation, DeviceAttestationToken, KeyCustody, KeyHandle, KeyRole,
     KeyType, NextSetCustody, NextSetCustodyError, NextSetKeyHandle, PreRotationCustody,
     PreRotationCustodyError, PreRotationCustodyKind, PreRotationKeyHandle, Pseudonym, PublicKey,
-    Push, PushToken, SharedSecret, Signature, Storage, WakeSignal, require_derive_source,
+    Push, PushToken, SharedSecret, Signature, Storage, WakeSignal, refuse_key_event_mint,
+    require_derive_source,
 };

@@ -21,6 +21,10 @@ use scp_ffi_common::error_codes as codes;
 use scp_platform::{CustodyType, KeyCustody, KeyHandle};
 use zeroize::Zeroizing;
 
+use scp_ffi_common::callback_custody::{CallbackKeyRegistry, CustodyRecords};
+use scp_platform::in_memory::InMemoryStorage;
+use scp_platform::{CustodyNamespace, CustodyRecordStore, StorageCustodyRecordStore};
+
 use crate::CustodyKeyType;
 use crate::bridge::{CallbackKeyCustody, ScpError};
 
@@ -47,6 +51,22 @@ fn validation(msg: String) -> ScpError {
 #[derive(uniffi::Object)]
 pub struct TestingCallbackCustody {
     inner: CallbackKeyCustody,
+    records: Arc<dyn CustodyRecordStore>,
+}
+
+impl TestingCallbackCustody {
+    fn over(
+        provider: Box<dyn crate::KeyCustodyProvider>,
+        records: Arc<dyn CustodyRecordStore>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            inner: CallbackKeyCustody::new(
+                provider,
+                CallbackKeyRegistry::recorded(CustodyRecords::unleased(Arc::clone(&records))),
+            ),
+            records,
+        })
+    }
 }
 
 impl std::fmt::Debug for TestingCallbackCustody {
@@ -57,14 +77,27 @@ impl std::fmt::Debug for TestingCallbackCustody {
 
 #[uniffi::export(async_runtime = "tokio")]
 impl TestingCallbackCustody {
-    /// Wraps `provider` in a fresh callback custody adapter with an empty
-    /// key registry.
+    /// Wraps `provider` in a fresh callback custody adapter over an empty
+    /// in-memory custody record store.
     #[uniffi::constructor]
     #[must_use]
     pub fn new(provider: Box<dyn crate::KeyCustodyProvider>) -> Arc<Self> {
-        Arc::new(Self {
-            inner: CallbackKeyCustody::new(provider),
-        })
+        Self::over(
+            provider,
+            Arc::new(StorageCustodyRecordStore::new(
+                InMemoryStorage::new(),
+                CustodyNamespace::from_bytes([0; 16]),
+            )),
+        )
+    }
+
+    /// A new adapter around `provider` over this adapter's custody records,
+    /// as production rebuilds an identity's adapter over its stored records
+    /// after a relaunch. Only a recorded key resolves, so a test that
+    /// reopens a host's keys mints them through an adapter first.
+    #[must_use]
+    pub fn reopen(&self, provider: Box<dyn crate::KeyCustodyProvider>) -> Arc<Self> {
+        Self::over(provider, Arc::clone(&self.records))
     }
 
     /// Generates an operational key of `key_type` through the adapter, as

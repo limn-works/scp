@@ -245,6 +245,38 @@ class AndroidKeyCustodyP256Test {
             }
         }
 
+        /**
+         * Spec 09 §9.7.4.1 (SCP-345): a key-event key mints in Keystore, signs a 32-byte digest,
+         * and reports `P256_KEY_EVENT` with a 33-byte point, also from an adapter reopened over
+         * the same records. A key recorded as `P256` would report `P256` after the reopen, which
+         * the bridge's record refuses.
+         */
+        @Test
+        fun `p256 key-event key generates, signs a digest and reports its type, also after a reopen`() {
+            runTest {
+                val provider = UniffiKeyCustody(custody())
+                val id = provider.generateKeypair(CustodyKeyType.P256_KEY_EVENT, CustodyKeyRole.OPERATIONAL)
+                val minted = provider.getPublicKey(id)
+                assertEquals(CustodyKeyType.P256_KEY_EVENT, minted.keyType)
+                assertEquals(CustodyKeyRole.OPERATIONAL, minted.role)
+                assertEquals(33, minted.publicKey.size)
+                assertEquals(KeyType.P256_KEY_EVENT, KeyRecords(prefs).get(id)?.type)
+                assertEquals("p256-key-event", KeyType.P256_KEY_EVENT.wire)
+
+                val digest = digest()
+                val der = ASN1Sequence.getInstance(provider.sign(id, digest))
+                val r = (der.getObjectAt(0) as ASN1Integer).value
+                val s = (der.getObjectAt(1) as ASN1Integer).value
+                val lowS = if (s > CURVE.n.shiftRight(1)) CURVE.n - s else s
+                val raw = BigIntegers.asUnsignedByteArray(32, r) + BigIntegers.asUnsignedByteArray(32, lowS)
+                assertTrue(testingP256VerifyStrict(minted.publicKey, digest, raw))
+
+                val reopened = UniffiKeyCustody(custody()).getPublicKey(id)
+                assertEquals(CustodyKeyType.P256_KEY_EVENT, reopened.keyType)
+                assertArrayEquals(minted.publicKey, reopened.publicKey)
+            }
+        }
+
         @Test
         fun `sign refuses a digest that is not 32 bytes`() {
             val custody = custody()
@@ -925,7 +957,7 @@ class AndroidKeyCustodyP256Test {
         }
 
         @Test
-        fun `a pending id is unusable and the bridge destroys it`() {
+        fun `a pending id is unusable, the bridge refuses it unrecorded, and the host destroys it`() {
             runTest {
                 val custody = custody()
                 KeyRecords(prefs).reserve("31", KeyType.P256, Backing.KEYSTORE, KeyRole.OPERATIONAL, TAG)
@@ -936,10 +968,16 @@ class AndroidKeyCustodyP256Test {
                 assertEquals("SCP-CRYPTO-4006", codeOf { custody.derivePseudonym(pending, ByteArray(16)) })
                 assertEquals("SCP-CRYPTO-4006", codeOf { custody.deriveRotatablePseudonym(pending, ByteArray(16), 3) })
 
+                // The bridge holds no custody record for an id it never
+                // minted, so it refuses the destroy before any host call
+                // (spec 17 section 17.3); the key is still there afterwards.
                 val bridge = TestingCallbackCustody(UniffiKeyCustody(custody))
                 assertEquals("in_memory", bridge.custodyType("31"))
-                bridge.destroyKey("31")
+                val refused = runCatching { bridge.destroyKey("31") }.exceptionOrNull()
+                assertEquals("SCP-CRYPTO-4006", (refused as? BridgeException.Crypto)?.code, "refused: $refused")
+                assertTrue(keys.containsAlias(alias("31")))
 
+                custody.destroyKey(pending)
                 assertFalse(keys.containsAlias(alias("31")))
                 assertTrue(prefs.all.isEmpty(), "left behind: ${prefs.all.keys}")
             }

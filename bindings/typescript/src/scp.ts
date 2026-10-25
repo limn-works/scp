@@ -841,10 +841,11 @@ export interface KeyPackageReservation {
 }
 
 /**
- * The type of a custody key: Ed25519, `"p256"` (ECDSA P-256 signing) or
- * `"hpke-p256"` (P-256 ECDH for HPKE).
+ * The type of a custody key: Ed25519, `"p256"` (ECDSA P-256 signing),
+ * `"hpke-p256"` (P-256 ECDH for HPKE) or `"p256-key-event"` (ECDSA P-256
+ * that signs only key-event-log changes and custody probes, spec §9.7.4.1).
  */
-export type CustodyKeyType = "ed25519" | "p256" | "hpke-p256";
+export type CustodyKeyType = "ed25519" | "p256" | "hpke-p256" | "p256-key-event";
 
 /**
  * The role a custody key was minted in: `"identity"` (the only source a
@@ -924,8 +925,8 @@ export interface KeyCustodyProvider {
   generateKeypair(keyType: CustodyKeyType, role: CustodyKeyRole): string;
   /**
    * Sign `message` under `keyId`. An Ed25519 key returns the 64-byte
-   * signature. A `"p256"` key receives a 32-byte digest (§9.5.1, no second
-   * hash) and returns raw `r || s` (64 bytes) or DER; the bridge normalises
+   * signature. A `"p256"` or `"p256-key-event"` key receives a 32-byte digest
+   * (§9.5.1, no second hash) and returns raw `r || s` (64 bytes) or DER; the bridge normalises
    * it to low-s and verifies it strictly against the key's public key, and
    * any mismatch is an error. A software implementation MUST derive the
    * ECDSA nonce by RFC 6979 with SHA-256; a hardware keystore may use a
@@ -936,19 +937,17 @@ export interface KeyCustodyProvider {
    * Return the type, public key and role of `keyId`. `keyType` is the type
    * the key was generated with.
    * `publicKey` is 32 bytes for Ed25519, the 33-byte compressed
-   * SEC1 point for `"p256"`, and the 65-byte uncompressed SEC1 point for
-   * `"hpke-p256"`. The bridge registers the key under the stated type and
-   * rejects a length that does not match it. A provider that holds no key
+   * SEC1 point for `"p256"` and `"p256-key-event"`, and the 65-byte
+   * uncompressed SEC1 point for `"hpke-p256"`. The bridge rejects a length
+   * that does not match the stated type. A provider that holds no key
    * for `keyId` throws a `KeyNotFoundError` (or any error whose `code` is
    * `"SCP-CRYPTO-4006"`), which callers receive as key-not-found.
    *
    * `role` is the role {@link generateKeypair} minted the key in, reported in
-   * every session. A key id the bridge has not seen binds as an identity only
-   * when `role` is `"identity"`, so an identity from an earlier session can
-   * still derive pseudonyms. The bridge cannot check this answer: a provider
-   * that reports `"identity"` for a key it minted as `"operational"` lets
-   * that key derive pseudonyms, and that is outside the native core's
-   * control.
+   * every session. The bridge records each key's type and role when it mints
+   * the key, in the instance storage, and refuses an answer that disagrees
+   * with that record, in this session or a later one. A key id with no
+   * record is key-not-found, with no callback.
    */
   getPublicKey(keyId: string): CustodyPublicKey;
   /**
