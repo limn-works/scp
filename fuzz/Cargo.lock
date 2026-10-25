@@ -2519,6 +2519,7 @@ dependencies = [
 name = "scp-kel"
 version = "0.1.0-beta.2"
 dependencies = [
+ "rand_core 0.6.4",
  "scp-crypto",
  "scp-did",
  "sha2 0.10.9",

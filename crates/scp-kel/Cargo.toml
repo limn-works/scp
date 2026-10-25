@@ -25,6 +25,13 @@ sha2 = { workspace = true }
 rand_core = { version = "0.6", default-features = false, features = ["getrandom"] }
 thiserror = { workspace = true }
 
+[features]
+# `CustodyProbe::new`, which takes the probe nonce from its caller, for
+# known-answer tests against spec 25 §25.34. No shipped build enables it, so
+# production code reaches only `CustodyProbe::fresh`
+# (09-security-model.md §9.7.4.1 item 5, step d: "32 fresh random bytes").
+testing = []
+
 [dev-dependencies]
 hex = { workspace = true }
 # Round-trips encode and decode over generated preimages of all four kinds.

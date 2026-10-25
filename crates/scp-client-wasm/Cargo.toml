@@ -108,7 +108,9 @@ scp-relay-client = { path = "../scp-relay-client" }
 # scp-kel's preimage, digest, seal, commitment and routing ids against spec 25
 # §25.26 through §25.29 on native and wasm32 (09-security-model.md §9.7.4.2).
 # It includes scp-kel's test fixtures by path, and they decode their hex with
-# `hex`. scp-kel is a leaf with no I/O and no runtime, inside the ADR-057 fence.
+# `hex`. scp-kel has no async runtime: it declares future-returning methods and
+# runs none, and draws its custody-probe nonce from getrandom's wasm32 backend,
+# inside the ADR-057 fence.
 # `sha2` recomputes Vector 42's two assertion hashes on each target, so the
 # indexed-signature KAT checks the WebAuthn message as well as the verdict.
 scp-kel = { path = "../scp-kel" }

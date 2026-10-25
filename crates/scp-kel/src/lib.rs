@@ -32,7 +32,7 @@ pub use event_codec::{
 };
 pub use key_event_signer::{
     CUSTODY_PROBE_CHALLENGE_LEN, CustodyProbe, KeyEventSignError, KeyEventSigner, MaybeSend,
-    ProbeNonceError,
+    ProbeNonceError, ProbeSignature,
 };
 pub use preimage::{
     EncodedPreimage, decode_preimage, derive_identifier, encode_preimage, key_event_seal,

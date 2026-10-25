@@ -6,8 +6,8 @@ use std::pin::pin;
 use std::task::{Context, Poll, Waker};
 
 use scp_kel::{
-    CustodyProbe, IndexedSignature, KeyEventSignError, KeyEventSigner, MaybeSend, SigningChange,
-    key_event_challenge,
+    CustodyProbe, IndexedSignature, KeyEventSignError, KeyEventSigner, MaybeSend, ProbeSignature,
+    SigningChange, key_event_challenge,
 };
 
 use crate::fixtures::{TestResult, V41_DIGEST, V41_PREIMAGE, array, bytes};
@@ -15,11 +15,17 @@ use crate::fixtures::{TestResult, V41_DIGEST, V41_PREIMAGE, array, bytes};
 /// A raw-arm signer whose signature is the 32 bytes it was handed, twice.
 struct EchoSigner;
 
-fn echo(digest: [u8; 32]) -> IndexedSignature {
+fn echo_bytes(digest: [u8; 32]) -> [u8; 64] {
     let mut signature = [0u8; 64];
     signature[..32].copy_from_slice(&digest);
     signature[32..].copy_from_slice(&digest);
-    IndexedSignature::Raw { signature }
+    signature
+}
+
+fn echo(digest: [u8; 32]) -> IndexedSignature {
+    IndexedSignature::Raw {
+        signature: echo_bytes(digest),
+    }
 }
 
 impl KeyEventSigner for EchoSigner {
@@ -37,8 +43,8 @@ impl KeyEventSigner for EchoSigner {
         &self,
         (): &(),
         probe: &CustodyProbe,
-    ) -> impl Future<Output = Result<IndexedSignature, KeyEventSignError>> + MaybeSend {
-        ready(Ok(echo(probe.raw_digest())))
+    ) -> impl Future<Output = Result<ProbeSignature, KeyEventSignError>> + MaybeSend {
+        ready(Ok(ProbeSignature::raw(echo_bytes(probe.raw_digest()))))
     }
 }
 
@@ -74,12 +80,7 @@ fn ready_value<F: Future>(future: F) -> Option<F::Output> {
 
 #[test]
 fn futures_are_send_natively() -> TestResult {
-    futures_are_send(
-        &EchoSigner,
-        &(),
-        &v41_change()?,
-        &CustodyProbe::new([0; 32]),
-    );
+    futures_are_send(&EchoSigner, &(), &v41_change()?, &CustodyProbe::fresh()?);
     Ok(())
 }
 

@@ -63,15 +63,20 @@ This crate owns:
 - `KeyEventSigner` — the one contract every key-event member signs through
   (§9.7.4.2 R10). `sign_change` takes a `SigningChange`, whose `digest` and
   `key_event_challenge` are the bytes the raw and assertion arms sign, and
-  `sign_probe` takes a `CustodyProbe`. Each returns an `IndexedSignature` or a
-  `KeyEventSignError`. Its futures are `MaybeSend`: `Send` on every target but
+  `sign_probe` takes a `CustodyProbe`. `sign_change` returns an
+  `IndexedSignature` and `sign_probe` a `ProbeSignature`, which no conversion
+  turns into an `IndexedSignature`; each fails with a `KeyEventSignError`. Its futures are `MaybeSend`: `Send` on every target but
   wasm32, where the browser client awaits a wasm-bindgen `JsFuture`.
 - `CustodyProbe` — §9.7.4.1 item 5 step d's reachability probe. `fresh` draws
   its 32-byte nonce from the operating system's random source and fails with
-  `ProbeNonceError` when that source fails; `new` takes the nonce for
-  known-answer tests. `raw_digest` is
+  `ProbeNonceError` when that source fails; `new`, compiled only under
+  `cfg(test)` or the `testing` feature, takes the nonce for known-answer tests
+  (spec 25 §25.34). A probe is neither `Clone` nor `Copy`. `raw_digest` is
   `SHA-256("SCP-CUSTODY-PROBE-V1:" ‖ nonce)`, and `assertion_challenge` is the
   53 bytes `"SCP-CUSTODY-PROBE-V1:" ‖ nonce`.
+- `ProbeSignature` — a signature over a `CustodyProbe`. `verify(&probe, &key)`
+  checks the raw form over `raw_digest` and the assertion form, with every
+  key-event assertion check, against `assertion_challenge`.
 - `parse_client_data_json` (hidden; public for the fuzz target) and
   `ClientDataError` — the strict `clientDataJSON` acceptance set, a
   hand-written validator with an explicit stack over an
