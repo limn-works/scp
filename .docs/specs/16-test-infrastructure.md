@@ -1291,6 +1291,29 @@ macro_rules! next_set_custody_conformance {
             async fn invalid_handle_errors() {
                 // A handle this custody did not generate errors on every method.
             }
+
+            #[tokio::test]
+            async fn seal_backup_refused_off_headless_or_outside_window() {
+                // On a custody that is not headless, `seal_backup` returns
+                // `NextSetCustodyError::MethodNotOffered` for every method the
+                // request names. On a headless custody, `seal_backup` on a key
+                // already sealed, and on a restored key, returns
+                // `NextSetCustodyError::BackupWindowClosed`
+                // (`09-security-model.md` §9.7.4.1 item 4, the sealing window).
+            }
+
+            #[tokio::test]
+            async fn restore_refuses_commitment_mismatch() {
+                // On a headless custody, `restore` of a Shamir or paper
+                // artifact against an expected commitment other than the one
+                // its key derives returns `NextSetCustodyError::CommitmentMismatch`.
+                // An encrypted artifact restored against another commitment
+                // fails its AES-256-GCM tag, because the associated data binds
+                // the expected commitment, and `restore` refuses it as it
+                // refuses a wrong passphrase. On a custody that is not
+                // headless, `restore` returns `NextSetCustodyError::MethodNotOffered`
+                // (`09-security-model.md` §9.7.4.1 item 4, restore).
+            }
         }
     };
 }

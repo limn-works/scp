@@ -11286,7 +11286,10 @@
         "`next_set_custody_conformance!()` runs first against SCP-345's in-memory `NextSetCustody` at `crates/scp-platform/src/testing/next_set_custody.rs`, its first caller, and then against every `NextSetCustody` implementor this story ships (`16-test-infrastructure.md` §16.12.3a)",
         "`seal_backup` is offered only on the `Headless` profile and only at generation, and every implementor that is not `Headless` returns `NextSetCustodyError::MethodNotOffered`; the codecs in `crates/scp-platform/src/headless_backup.rs` are `pub(crate)` to scp-platform: a test per implementor (`09-security-model.md` §9.7.4.1)",
         "`restore` refuses an artifact whose key does not match the expected commitment, and no public function outside scp-platform returns a reconstructed scalar: a test per method (`09-security-model.md` §9.7.4.1 item 5d)",
-        "No unwrap() or expect() in library code"
+        "No unwrap() or expect() in library code",
+        "At custody selection, the SDK states the residual row of the four-cell table and the root/recovery co-residence: a test per SDK (`09-security-model.md` §9.7.4.1 item 4)",
+        "The SDK re-shows the copyable-custody disclosure whenever it opens an identity whose standing pre-rotation custody is copyable: a test per SDK (`09-security-model.md` §9.7.4.1 item 4)",
+        "The SDK offers the pre-rotation credential on a FIDO2 token or under a second platform account: a test per SDK (`09-security-model.md` §9.7.4.1 item 4)"
       ],
       "actionItems": [
         "Declare `RecoveryHandleStore` in `scp-platform`, and implement the passkey and FIDO2 `KeyEventSigner`s and every production `NextSetCustody`.",

@@ -9,5 +9,6 @@ scaffold/shared.md	name-binding-criterion	1
 scaffold/shared.md	recovery-entry-points	1
 scaffold/shared.md	recovery-handle-declaration	1
 specs/09-security-model.md	large-blob-arithmetic	1
+specs/17-persistence-and-storage.md	platform-account-member	1
 specs/17-persistence-and-storage.md	recovery-handle-declaration	1
 standards/conventions.md	name-binding-criterion	1
