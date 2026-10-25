@@ -28,7 +28,11 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
-use scp_protocol::discovery::push::{PushPlatform, WebPushSubscription};
+use scp_protocol::discovery::push::PushPlatform;
+// Read by `token_origin` (`push-store`) and by the `WebPush` arm of
+// `PushSender::send_registered` (`webpush`, or this crate's tests).
+#[cfg(any(test, feature = "push-store", feature = "webpush"))]
+use scp_protocol::discovery::push::WebPushSubscription;
 use zeroize::Zeroizing;
 
 pub use super::push_apns::{
