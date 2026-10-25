@@ -19817,6 +19817,7 @@ mod tests {
         dir: Option<tempfile::TempDir>,
     }
 
+    #[cfg(feature = "testing")]
     impl PersistentScp {
         /// Shuts the instance down and returns its directory, for a new
         /// instance over the same store.
@@ -19858,6 +19859,8 @@ mod tests {
                     "the shutdown must drain every actor and close the store: {outcome:?}"
                 );
             }
+            // The directory goes only after the store has closed.
+            drop(self.dir.take());
         }
     }
 
@@ -20173,8 +20176,12 @@ mod tests {
             }
             return;
         }
-        let result = runtime()
-            .block_on(scp.identity_create_with_custody(Box::new(NeverAnsweringCustodyProvider)));
+        // Callback custody refuses storage that does not persist before it
+        // reaches the pre-rotation backend, so this arm runs on SQLite.
+        let persistent = scp_persistent_test();
+        let result = runtime().block_on(
+            persistent.identity_create_with_custody(Box::new(NeverAnsweringCustodyProvider)),
+        );
         match result {
             Ok(_) => panic!(
                 "shipped identity_create_with_custody must FAIL CLOSED — no identity may \
@@ -25945,6 +25952,7 @@ mod tests {
     }
 
     /// The callback adapter `identity` holds.
+    #[cfg(feature = "testing")]
     fn callback_of(identity: &Identity) -> &CallbackKeyCustody {
         match identity.custody.as_deref() {
             Some(UniffiKeyCustody::Callback(adapter)) => adapter,

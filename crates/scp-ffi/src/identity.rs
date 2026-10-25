@@ -1063,7 +1063,7 @@ async fn write_callback_entry(
     .map_err(callback_identity_error)
 }
 
-/// The testing build of [`PyScp::identity_attest_device`]: attests with
+/// The testing build of [`crate::scp::PyScp::identity_attest_device`]: attests with
 /// `InMemoryDeviceAttestation`, rewrites a callback custody entry and
 /// installs the attested document, all under the DID's update slot.
 #[cfg(feature = "testing")]
@@ -1130,7 +1130,7 @@ fn attest_device_in_memory(
     .map_err(PyErr::from)
 }
 
-/// The shipped build of [`PyScp::identity_attest_device`]: fail-closed device
+/// The shipped build of [`crate::scp::PyScp::identity_attest_device`]: fail-closed device
 /// attestation.
 ///
 /// Spec §9:187 — device attestation (Apple App Attest / Google Play
@@ -2751,8 +2751,8 @@ impl crate::scp::PyScp {
     ///
     /// See §9.3.
     /// A shipped build refuses before it reads or changes anything (see
-    /// [`attest_device_unavailable`]); a testing build attests through
-    /// [`attest_device_in_memory`], which rewrites a callback custody entry
+    /// `attest_device_unavailable`); a testing build attests through
+    /// `attest_device_in_memory`, which rewrites a callback custody entry
     /// before it installs the attested document.
     pub fn identity_attest_device(&self, py: Python<'_>, identity_did: &str) -> PyResult<String> {
         #[cfg(feature = "testing")]

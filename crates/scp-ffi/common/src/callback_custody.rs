@@ -553,8 +553,8 @@ impl<R: RecordSource> CallbackKeyRegistry<R> {
 ///
 /// A [`recorded`](CallbackKeyRegistry::recorded) registry reads its store,
 /// a local storage read and never a host call. An
-/// [`unrecorded`](CallbackKeyRegistry::unrecorded) registry's records are
-/// the entries it minted.
+/// unrecorded registry (one with no record store) reads only the entries
+/// it minted.
 ///
 /// # Errors
 ///
@@ -837,7 +837,7 @@ where
 /// # Errors
 ///
 /// [`PlatformError::Unsupported`] for an
-/// [`unrecorded`](CallbackKeyRegistry::unrecorded) registry, with no host
+/// unrecorded registry (one with no record store), with no host
 /// call; otherwise as in [`generate_identity`].
 pub async fn generate_key_event<R: RecordSource, G, GF, P, PF, D, DF>(
     registry: &CallbackKeyRegistry<R>,
