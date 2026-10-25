@@ -94,6 +94,12 @@ public nonisolated enum KeyType: String, Sendable, Equatable {
     /// ADR-025 criterion 8). Signs 32-byte digests; the public key is the
     /// 33-byte SEC1 compressed point.
     case p256
+    /// P-256 ECDSA key-event key held by the Secure Enclave (spec 09
+    /// §9.7.4.1, SCP-345). Signs only the 32-byte digests of key-event-log
+    /// changes and custody probes; the public key is the 33-byte SEC1
+    /// compressed point. Stored and reported as its own type, so it never
+    /// signs as a `.p256` key after a relaunch.
+    case p256KeyEvent = "p256-key-event"
     /// P-256 key-agreement key held by the Secure Enclave, the HPKE
     /// DHKEM(P-256) wrapping key of spec 03 §3.7.2. Agrees only; the public
     /// key is the 65-byte SEC1 uncompressed point.
@@ -693,7 +699,7 @@ public final class AppleKeyCustody: Sendable {
         switch keyType {
         case .ed25519:
             break
-        case .p256, .hpkeP256:
+        case .p256, .p256KeyEvent, .hpkeP256:
             throw PlatformError.wrongKeyType(
                 "a \(keyType.rawValue) key lives in a P-256 key store and has no private bytes to store"
             )
@@ -772,7 +778,7 @@ extension AppleKeyCustody {
         switch keyType {
         case .ed25519:
             return try mintSoftwareKey(keyType: keyType, role: role)
-        case .p256, .hpkeP256:
+        case .p256, .p256KeyEvent, .hpkeP256:
             return try await mintP256Key(keyType: keyType, role: role)
         }
     }
@@ -795,7 +801,7 @@ extension AppleKeyCustody {
             let signingKey = Curve25519.Signing.PrivateKey()
             privateKeyBytes = signingKey.rawRepresentation
             publicKeyBytes = signingKey.publicKey.rawRepresentation
-        case .p256, .hpkeP256:
+        case .p256, .p256KeyEvent, .hpkeP256:
             throw PlatformError.wrongKeyType("a \(keyType.rawValue) key is not a Keychain software key")
         }
         defer { privateKeyBytes.resetBytes(in: 0 ..< privateKeyBytes.count) }
@@ -925,7 +931,7 @@ extension AppleKeyCustody {
 
     /// The public key `publicKey(_:)` returns for a `keyType` key whose
     /// uncompressed point is `uncompressed`: the 65 bytes for HPKE P-256,
-    /// the 33-byte compressed point for P-256.
+    /// the 33-byte compressed point for P-256 signing and key-event keys.
     nonisolated static func p256PublicKey(_ uncompressed: Data, as keyType: KeyType) throws -> Data {
         switch keyType {
         case .hpkeP256:
@@ -935,7 +941,7 @@ extension AppleKeyCustody {
                 )
             }
             return uncompressed
-        case .p256:
+        case .p256, .p256KeyEvent:
             do {
                 return try P256.Signing.PublicKey(x963Representation: uncompressed).compressedRepresentation
             } catch {
@@ -1120,7 +1126,7 @@ extension AppleKeyCustody {
                 metadata.publicKeyBase64 == nil,
                 let process = metadata.mintingProcess,
                 let backing = metadata.backing.flatMap(P256Backing.init(rawValue:)),
-                KeyType(rawValue: metadata.keyType).map({ $0 == .p256 || $0 == .hpkeP256 }) == true,
+                KeyType(rawValue: metadata.keyType).map({ $0 != .ed25519 }) == true,
                 isAbandoned(process)
             else { return nil }
             return AbandonedMint(handle: String(account.dropFirst(accountPrefix.count)), backing: backing)
@@ -1289,7 +1295,7 @@ extension AppleKeyCustody {
         switch storedType {
         case .ed25519:
             break
-        case .p256, .hpkeP256:
+        case .p256, .p256KeyEvent, .hpkeP256:
             throw PlatformError.wrongKeyType(
                 "\(method) requires an Ed25519 key; handle '\(identityHandle)' is \(storedType.rawValue)"
             )
@@ -1335,7 +1341,8 @@ public extension AppleKeyCustody {
     /// the bridge through `generateKeypair(keyType:role:)`, which records the
     /// role the bridge names.
     ///
-    /// - Parameter keyType: `"ed25519"`, `"p256"` or `"hpke-p256"`.
+    /// - Parameter keyType: `"ed25519"`, `"p256"`, `"p256-key-event"` or
+    ///   `"hpke-p256"`.
     /// - Returns: The key id, a canonical decimal `UInt64` string. Pass this
     ///   to other methods on this instance to perform operations with the key.
     /// - Throws: ``PlatformError/keychainError(_:)`` if the Keychain add fails,
@@ -1360,14 +1367,16 @@ public extension AppleKeyCustody {
     ///   signature. Its private key bytes are held in memory only for the
     ///   duration of this call; they are not cached, logged, or returned
     ///   across the FFI boundary.
-    /// - A P-256 key signs the 32-byte digest `data` in the store its record
+    /// - A P-256 signing or key-event key signs the 32-byte digest `data` in
+    ///   the store its record
     ///   names (`.ecdsaSignatureDigestX962SHA256`, no second hash) and
     ///   returns the store's DER `ECDSA-Sig-Value`. The Rust bridge converts
     ///   it to the 64-byte raw `r || s` with `s` in the low half of the group
     ///   order and verifies it (spec 09 §9.5, ADR-025 criterion 1).
     ///
     /// - Parameters:
-    ///   - keyHandle: The key id of an `"ed25519"` or `"p256"` key.
+    ///   - keyHandle: The key id of an `"ed25519"`, `"p256"` or
+    ///     `"p256-key-event"` key.
     ///   - data: The bytes to sign; a 32-byte digest for a P-256 key.
     /// - Returns: A 64-byte Ed25519 signature, or a P-256 DER signature.
     /// - Throws: ``PlatformError/wrongKeyType(_:)`` if `keyHandle` refers to
@@ -1386,7 +1395,7 @@ public extension AppleKeyCustody {
         switch storedType {
         case .ed25519:
             return try signEd25519(keyHandle, data: data)
-        case .p256:
+        case .p256, .p256KeyEvent:
             guard data.count == 32 else {
                 throw PlatformError.custodyError(
                     "P-256 sign takes a 32-byte digest; got \(data.count) bytes"
@@ -1435,7 +1444,7 @@ public extension AppleKeyCustody {
         // Read from metadata cache (attributes only -- no biometric prompt).
         let expectedLength = switch keyType {
         case .ed25519: 32
-        case .p256: 33
+        case .p256, .p256KeyEvent: 33
         case .hpkeP256: 65
         }
         if let pubKeyBase64 = metadata.publicKeyBase64,
@@ -1449,7 +1458,7 @@ public extension AppleKeyCustody {
             return try legacyPublicKey(keyHandle) { privateKeyBytes in
                 try Curve25519.Signing.PrivateKey(rawRepresentation: privateKeyBytes).publicKey.rawRepresentation
             }
-        case .p256, .hpkeP256:
+        case .p256, .p256KeyEvent, .hpkeP256:
             let uncompressed = try await p256Store(for: metadata, handle: keyHandle)
                 .publicKey(tag: applicationTag(for: keyHandle))
             return try Self.p256PublicKey(uncompressed, as: keyType)
@@ -1532,7 +1541,7 @@ public extension AppleKeyCustody {
         var removedKey = false
         if let metadata, let keyType = KeyType(rawValue: metadata.keyType) {
             switch keyType {
-            case .p256, .hpkeP256:
+            case .p256, .p256KeyEvent, .hpkeP256:
                 removedKey = try await deleteConfirmed(
                     keyHandle, tag: tag, from: p256Store(for: metadata, handle: keyHandle)
                 )
@@ -1611,7 +1620,7 @@ public extension AppleKeyCustody {
         switch storedType {
         case .hpkeP256:
             return try await agreeP256(keyHandle, metadata: metadata, peerPublic: peerPublic)
-        case .ed25519, .p256:
+        case .ed25519, .p256, .p256KeyEvent:
             throw PlatformError.wrongKeyType(
                 "dhAgree requires an HPKE P-256 key; '\(keyHandle)' is \(storedType.rawValue), and a signing key never agrees"
             )
@@ -1796,6 +1805,7 @@ extension AppleKeyCustody: KeyCustodyProvider {
             let keyType: CustodyKeyType = switch try fetchKeyType(for: keyId) {
             case .ed25519: .ed25519
             case .p256: .p256
+            case .p256KeyEvent: .p256KeyEvent
             case .hpkeP256: .hpkeP256
             }
             let role = try fetchRole(for: keyId).custodyKeyRole
@@ -1813,6 +1823,7 @@ extension AppleKeyCustody: KeyCustodyProvider {
             let adapterType: KeyType = switch keyType {
             case .ed25519: .ed25519
             case .p256: .p256
+            case .p256KeyEvent: .p256KeyEvent
             case .hpkeP256: .hpkeP256
             }
             return try await mintKey(keyType: adapterType, role: role)

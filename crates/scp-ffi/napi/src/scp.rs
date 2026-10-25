@@ -535,7 +535,21 @@ impl Scp {
         // Promote the JS callbacks to threadsafe functions on the JS
         // thread (consuming the non-Send `Function`s). A malformed
         // provider fails fast here, before any DID-creation work.
-        let callback = crate::custody::NapiCallbackKeyCustody::from_provider(provider)?;
+        //
+        // The adapter's custody records live in the instance storage under a
+        // namespace drawn here and opened through the instance's namespace
+        // table; `create_identity` stores it in the identity's callback
+        // custody entry (spec §17.3, SCP-345 decision D1). Storage that does
+        // not persist is refused with `SCP-STORAGE-8000`.
+        let records = scp_ffi_common::callback_identity::create_records(
+            bi_arc.core.custody_namespaces(),
+            crate::runtime::protocol_repository(&bi_arc).callback_custody_storage(),
+        )
+        .map_err(callback_identity_error)?;
+        let callback = crate::custody::NapiCallbackKeyCustody::from_provider(
+            provider,
+            scp_ffi_common::callback_custody::CallbackKeyRegistry::recorded(records),
+        )?;
         // A provider serves exactly custody `os_keystore` (§3.2.2); the
         // decision still goes through the shared parser.
         let selection = crate::custody::select_key_custody(
@@ -557,7 +571,9 @@ impl Scp {
     /// Per-instance equivalent of `identity_load`.
     ///
     /// Looks the DID up in this instance's identity registry first; falls
-    /// back to DHT resolution.
+    /// back to DHT resolution. An identity created with
+    /// `identityCreateWithCustody` is refused with `SCP-IDENT-1003`: it loads
+    /// only through `identityLoadWithCustody` (spec §17.3).
     #[napi(js_name = "identityLoad")]
     pub async fn identity_load(&self, did: String) -> napi::Result<crate::identity::NapiIdentity> {
         use crate::identity::NapiIdentityInner;
@@ -571,6 +587,12 @@ impl Scp {
         }
 
         let bi = &*self.inner;
+
+        if let Some(storage) = crate::runtime::protocol_repository(bi).callback_custody_storage() {
+            scp_ffi_common::callback_identity::refuse_plain_load(storage.as_ref(), &did)
+                .await
+                .map_err(callback_identity_error)?;
+        }
 
         // Look the DID up in this instance's identity registry first. Hits for
         // any locally created identity — in-memory or production callback
@@ -625,6 +647,120 @@ impl Scp {
         };
         crate::increment_handle_count();
         Ok(handle)
+    }
+
+    /// Loads an identity created with `identityCreateWithCustody` on this
+    /// instance's storage, with the same host custody provider (spec §17.3,
+    /// SCP-345 decision D1).
+    ///
+    /// Reads the identity's callback custody entry, reopens its custody
+    /// records over the stored namespace, and checks that `provider` holds
+    /// the identity key the DID derives from. The handle reports
+    /// `os_keystore` and signs through `provider`, including with keys minted
+    /// in an earlier process.
+    ///
+    /// Rejects with `SCP-IDENT-1004` for a DID that is not `did:dht`;
+    /// `SCP-STORAGE-8000` when this instance's storage does not persist;
+    /// `SCP-IDENT-1002` when the storage holds no entry for `did`;
+    /// `SCP-IDENT-1009` when the entry does not decode or names another DID;
+    /// `SCP-IDENT-1008` while another live adapter of this instance holds
+    /// the identity's namespace, or when `provider`'s identity key does not
+    /// derive `did`.
+    #[napi(
+        js_name = "identityLoadWithCustody",
+        ts_return_type = "Promise<NapiIdentity>"
+    )]
+    pub fn identity_load_with_custody<'env>(
+        &self,
+        env: &'env Env,
+        did: String,
+        provider: crate::custody::NapiKeyCustodyProvider,
+    ) -> napi::Result<napi::bindgen_prelude::PromiseRaw<'env, crate::identity::NapiIdentity>> {
+        use crate::identity::NapiIdentityInner;
+        use scp_ffi_common::callback_identity::{
+            LoadedCallbackIdentity, check_provider, open_entry,
+        };
+
+        if !did.starts_with("did:dht:") {
+            return Err(ScpNapiError::Identity {
+                message: format!("unsupported DID method: {did} — only did:dht is supported"),
+                code: codes::IDENT_1004.to_owned(),
+            }
+            .into());
+        }
+        // The JS `Function`s are not `Send`: promote them on the JS thread,
+        // as `identityCreateWithCustody` does, and build the adapter on the
+        // tokio worker once its records are open.
+        let host = crate::custody::CallbackTsfns::from_provider(provider)?;
+        let bi_arc = Arc::clone(&self.inner);
+
+        env.spawn_future(async move {
+            let bi = &*bi_arc;
+            let LoadedCallbackIdentity {
+                records,
+                identity,
+                document,
+            } = open_entry(
+                bi.core.custody_namespaces(),
+                crate::runtime::protocol_repository(bi).callback_custody_storage(),
+                &did,
+            )
+            .await
+            .map_err(callback_identity_error)?;
+            let custody = Arc::new(crate::custody::NapiKeyCustody::Callback(
+                crate::custody::CallbackAdapter::over(
+                    host,
+                    scp_ffi_common::callback_custody::CallbackKeyRegistry::recorded(records),
+                ),
+            ));
+            let verifying_key_hex = Some(
+                check_provider(custody.as_ref(), &identity)
+                    .await
+                    .map_err(callback_identity_error)?,
+            );
+            // The resolver a governance vote and a UCAN check read this
+            // identity's document from, as create initializes it before minting.
+            crate::identity::ensure_did_resolver_initialized_on(bi).map_err(NapiError::from)?;
+            crate::runtime::register_identity(
+                bi,
+                &identity.did,
+                crate::runtime::NapiIdentityEntry {
+                    identity: identity.clone(),
+                    custody: Arc::clone(&custody),
+                    document: document.clone(),
+                    identity_link_attestations: Vec::new(),
+                    // The pre-rotation key stays in the substrate that
+                    // created it, which no load reopens: the testing-only
+                    // fields name no key and hold an empty custody.
+                    #[cfg(feature = "testing")]
+                    pre_rotation_handle: scp_platform::PreRotationKeyHandle::new(0),
+                    #[cfg(feature = "testing")]
+                    pre_rotation_custody: Arc::new(
+                        scp_platform::testing::InMemoryPreRotationCustody::new(),
+                    ),
+                },
+            );
+            // As create does after it registers the identity, publish the
+            // stored document into the resolver's DHT client: this instance's
+            // resolver reads it there to verify the identity's signatures.
+            #[cfg(feature = "testing")]
+            crate::identity::publish_to_shared_dht_for(&identity, &document, &custody).await;
+            let handle = crate::identity::NapiIdentity {
+                inner: Arc::new(NapiIdentityInner {
+                    did: identity.did.clone(),
+                    custody_type: custody.custody_type_label().to_owned(),
+                    scp_identity: Some(identity),
+                    custody: Some(custody),
+                    document: Some(document),
+                    bi: Arc::clone(&bi_arc),
+                    verifying_key_hex,
+                    instance_id: bi.instance_id(),
+                    rotation_event_json: None,
+                }),
+            };
+            crate::increment_handle_count();
+            Ok(handle)
+        })
     }
 
     /// Per-instance equivalent of `identity_resolve`.
@@ -5563,6 +5699,12 @@ async fn create_identity(
     let (scp_identity, document, pre_rotation_handle) =
         created.map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
 
+    // A callback custody identity stores its namespace, handles and document
+    // before the create returns (spec §17.3, SCP-345 decision D1), so
+    // `identityLoadWithCustody` reopens the same records; a failed write
+    // fails the create and destroys the keys it minted.
+    write_created_callback_entry(bi, &key_custody, &scp_identity, &document).await?;
+
     let verifying_key_hex =
         crate::identity::identity_verifying_key_hex(&key_custody, &scp_identity.identity_key).await;
 
@@ -5596,6 +5738,114 @@ async fn create_identity(
     };
     crate::increment_handle_count();
     Ok(handle)
+}
+
+/// Writes the callback custody entry of an identity just minted over
+/// `custody` when `custody` is a host provider's adapter (spec §17.3); other
+/// custodies keep no entry. A failed write destroys the keys the create
+/// minted before the error returns.
+///
+/// # Errors
+///
+/// `SCP-STORAGE-8000` when `bi`'s storage stopped persisting, and the
+/// [`CallbackIdentityError`] code when the write fails.
+///
+/// [`CallbackIdentityError`]: scp_ffi_common::callback_identity::CallbackIdentityError
+#[cfg(feature = "testing")]
+async fn write_created_callback_entry(
+    bi: &NapiBridgeInstance,
+    custody: &crate::custody::NapiKeyCustody,
+    identity: &scp_identity::ScpIdentity,
+    document: &scp_did::DidDocument,
+) -> napi::Result<()> {
+    let crate::custody::NapiKeyCustody::Callback(adapter) = custody else {
+        return Ok(());
+    };
+    let storage = crate::runtime::protocol_repository(bi).callback_custody_storage();
+    scp_ffi_common::callback_identity::write_created_entry(
+        storage.as_deref(),
+        adapter,
+        adapter.namespace(),
+        identity,
+        document,
+    )
+    .await
+    .map_err(callback_identity_error)
+}
+
+/// Waits until no other update of `did` runs on `bi` and returns the hold on
+/// its update slot (spec §17.3). Every operation that changes a registered
+/// identity's key handles or document takes it before it reads the registry
+/// and keeps it until it installs the change.
+///
+/// # Errors
+///
+/// `SCP-IDENT-1002` when a migration retired `did`.
+#[cfg(feature = "testing")]
+pub(crate) async fn lock_identity_update(
+    bi: &NapiBridgeInstance,
+    did: &str,
+) -> napi::Result<scp_ffi_common::identity_update::IdentityUpdateGuard> {
+    bi.core.identity_updates().lock(did).await.map_err(|e| {
+        NapiError::from(ScpNapiError::Identity {
+            message: e.to_string(),
+            code: e.code().to_owned(),
+        })
+    })
+}
+
+/// Records a change to the identity `slot` holds: rewrites its callback
+/// custody entry when `custody` is a host provider's adapter (spec §17.3;
+/// other custodies keep no entry), then records `identity` and `document` in
+/// the slot. Every operation that changes a registered identity calls this
+/// before it installs the change, so a restart loads the changed identity and
+/// never the one before.
+///
+/// # Errors
+///
+/// `SCP-STORAGE-8000` when `bi`'s storage stopped persisting, and the
+/// [`CallbackIdentityError`] code when the write fails; the slot then records
+/// nothing.
+///
+/// [`CallbackIdentityError`]: scp_ffi_common::callback_identity::CallbackIdentityError
+#[cfg(feature = "testing")]
+pub(crate) async fn rewrite_callback_entry(
+    bi: &NapiBridgeInstance,
+    slot: &mut scp_ffi_common::identity_update::IdentityUpdateGuard,
+    custody: &crate::custody::NapiKeyCustody,
+    identity: &scp_identity::ScpIdentity,
+    document: &scp_did::DidDocument,
+) -> napi::Result<()> {
+    if let crate::custody::NapiKeyCustody::Callback(adapter) = custody {
+        let storage = crate::runtime::protocol_repository(bi).callback_custody_storage();
+        scp_ffi_common::callback_identity::rewrite_entry(
+            storage.as_deref(),
+            adapter.namespace(),
+            slot,
+            identity,
+            document,
+        )
+        .await
+        .map_err(callback_identity_error)?;
+    }
+    slot.commit(identity.clone(), document.clone());
+    Ok(())
+}
+
+/// Maps a callback custody identity refusal to the code every bridge
+/// reports for it (spec §17.3): a storage selection that does not persist in
+/// the context class this bridge reports `SCP-STORAGE-8000` in, every other
+/// refusal in the identity class.
+fn callback_identity_error(
+    error: scp_ffi_common::callback_identity::CallbackIdentityError,
+) -> NapiError {
+    let message = error.to_string();
+    let code = error.code().to_owned();
+    NapiError::from(if error.is_storage_selection() {
+        ScpNapiError::Context { message, code }
+    } else {
+        ScpNapiError::Identity { message, code }
+    })
 }
 
 /// A shipped build has no `PreRotationCustody` backend, so every identity

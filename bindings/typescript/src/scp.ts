@@ -192,6 +192,42 @@ function requireCustody(method: string, custody: unknown): void {
   }
 }
 
+/** The eight methods of {@link KeyCustodyProvider}. */
+const PROVIDER_METHODS = [
+  "generateKeypair",
+  "sign",
+  "getPublicKey",
+  "destroyKey",
+  "dhAgree",
+  "derivePseudonym",
+  "deriveRotatablePseudonym",
+  "custodyType",
+] as const;
+
+/**
+ * The native adapter for `provider`, after checking that it is present and
+ * complete. The adapter always supplies all eight closures, so a provider
+ * missing a method would otherwise surface only later as a native "oneshot
+ * canceled" failure; this rejects it first with a typed error.
+ */
+function nativeProviderFor(
+  method: string,
+  provider: KeyCustodyProvider,
+): ReturnType<typeof toNativeCustodyProvider> {
+  if (provider === undefined || provider === null) {
+    throw custodyRequiredError(method, CUSTODY_PROVIDER_REMEDY);
+  }
+  for (const name of PROVIDER_METHODS) {
+    if (typeof (provider as unknown as Record<string, unknown>)[name] !== "function") {
+      throw new ValidationError(
+        `KeyCustodyProvider is missing required method: ${name}`,
+        "SCP-VALID-7005",
+      );
+    }
+  }
+  return toNativeCustodyProvider(provider);
+}
+
 // ---------------------------------------------------------------------------
 // Handle arguments
 // ---------------------------------------------------------------------------
@@ -841,10 +877,11 @@ export interface KeyPackageReservation {
 }
 
 /**
- * The type of a custody key: Ed25519, `"p256"` (ECDSA P-256 signing) or
- * `"hpke-p256"` (P-256 ECDH for HPKE).
+ * The type of a custody key: Ed25519, `"p256"` (ECDSA P-256 signing),
+ * `"hpke-p256"` (P-256 ECDH for HPKE) or `"p256-key-event"` (ECDSA P-256
+ * that signs only key-event-log changes and custody probes, spec §9.7.4.1).
  */
-export type CustodyKeyType = "ed25519" | "p256" | "hpke-p256";
+export type CustodyKeyType = "ed25519" | "p256" | "hpke-p256" | "p256-key-event";
 
 /**
  * The role a custody key was minted in: `"identity"` (the only source a
@@ -924,8 +961,8 @@ export interface KeyCustodyProvider {
   generateKeypair(keyType: CustodyKeyType, role: CustodyKeyRole): string;
   /**
    * Sign `message` under `keyId`. An Ed25519 key returns the 64-byte
-   * signature. A `"p256"` key receives a 32-byte digest (§9.5.1, no second
-   * hash) and returns raw `r || s` (64 bytes) or DER; the bridge normalises
+   * signature. A `"p256"` or `"p256-key-event"` key receives a 32-byte digest
+   * (§9.5.1, no second hash) and returns raw `r || s` (64 bytes) or DER; the bridge normalises
    * it to low-s and verifies it strictly against the key's public key, and
    * any mismatch is an error. A software implementation MUST derive the
    * ECDSA nonce by RFC 6979 with SHA-256; a hardware keystore may use a
@@ -936,19 +973,18 @@ export interface KeyCustodyProvider {
    * Return the type, public key and role of `keyId`. `keyType` is the type
    * the key was generated with.
    * `publicKey` is 32 bytes for Ed25519, the 33-byte compressed
-   * SEC1 point for `"p256"`, and the 65-byte uncompressed SEC1 point for
-   * `"hpke-p256"`. The bridge registers the key under the stated type and
-   * rejects a length that does not match it. A provider that holds no key
+   * SEC1 point for `"p256"` and `"p256-key-event"`, and the 65-byte
+   * uncompressed SEC1 point for `"hpke-p256"`. The bridge rejects a length
+   * that does not match the stated type. A provider that holds no key
    * for `keyId` throws a `KeyNotFoundError` (or any error whose `code` is
    * `"SCP-CRYPTO-4006"`), which callers receive as key-not-found.
    *
    * `role` is the role {@link generateKeypair} minted the key in, reported in
-   * every session. A key id the bridge has not seen binds as an identity only
-   * when `role` is `"identity"`, so an identity from an earlier session can
-   * still derive pseudonyms. The bridge cannot check this answer: a provider
-   * that reports `"identity"` for a key it minted as `"operational"` lets
-   * that key derive pseudonyms, and that is outside the native core's
-   * control.
+   * every session. The bridge records each key's type and role when it mints
+   * the key, in the instance storage, and refuses an answer that disagrees
+   * with that record, in this session or in a later one that loads the
+   * identity with {@link SCP.identityLoadWithCustody}. A key id with no
+   * record is key-not-found, with no callback.
    */
   getPublicKey(keyId: string): CustodyPublicKey;
   /**
@@ -1324,33 +1360,7 @@ export class SCP {
    *   IdentityError if key/DID creation fails inside the provider.
    */
   async identityCreateWithCustody(provider: KeyCustodyProvider): Promise<Identity> {
-    if (provider === undefined || provider === null) {
-      throw custodyRequiredError("identityCreateWithCustody", CUSTODY_PROVIDER_REMEDY);
-    }
-    // Validate provider completeness up front. The byte-converting adapter
-    // below always supplies all eight closures, so a provider missing a method
-    // would otherwise surface only later as a cryptic native "oneshot canceled"
-    // failure. Checking here makes the returned promise reject early with a
-    // clear, actionable error. Mirrors the eight methods on KeyCustodyProvider.
-    const REQUIRED = [
-      "generateKeypair",
-      "sign",
-      "getPublicKey",
-      "destroyKey",
-      "dhAgree",
-      "derivePseudonym",
-      "deriveRotatablePseudonym",
-      "custodyType",
-    ] as const;
-    for (const method of REQUIRED) {
-      if (typeof (provider as unknown as Record<string, unknown>)[method] !== "function") {
-        throw new ValidationError(
-          `KeyCustodyProvider is missing required method: ${method}`,
-          "SCP-VALID-7005",
-        );
-      }
-    }
-    const adapter = toNativeCustodyProvider(provider);
+    const adapter = nativeProviderFor("identityCreateWithCustody", provider);
     try {
       const raw = await (
         this.#native.identityCreateWithCustody as (p: typeof adapter) => Promise<unknown>
@@ -1361,9 +1371,46 @@ export class SCP {
     }
   }
 
+  /**
+   * Load an identity this instance can reach. An identity created with
+   * {@link identityCreateWithCustody} loads only through
+   * {@link identityLoadWithCustody}, which takes its provider.
+   *
+   * @throws IdentityError `SCP-IDENT-1003` when `did` was created with a host
+   *   custody provider on this instance's storage (spec §17.3).
+   */
   async identityLoad(did: string): Promise<Identity> {
     try {
       const raw = await (this.#native.identityLoad as (d: string) => Promise<unknown>)(did);
+      return Identity._fromHandle(this, raw);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
+  }
+
+  /**
+   * Load an identity created with {@link identityCreateWithCustody} on this
+   * instance's storage, in this process or an earlier one, with the same host
+   * custody `provider` (spec §17.3). The identity's keys, including keys its
+   * custody minted earlier, sign through `provider`.
+   *
+   * @throws IdentityError `SCP-IDENT-1116` when `provider` is `undefined` or
+   *   `null`, before any bridge call.
+   * @throws ValidationError `SCP-VALID-7005` when `provider` is missing a
+   *   method.
+   * @throws ContextError `SCP-STORAGE-8000` when this instance's storage does
+   *   not persist (`{ type: "in_memory" }`).
+   * @throws IdentityError `SCP-IDENT-1002` when the storage holds no entry for
+   *   `did`; `SCP-IDENT-1009` when the entry does not decode or names another
+   *   DID; `SCP-IDENT-1008` while this instance already holds the identity
+   *   loaded, or when `provider`'s identity key does not derive `did`.
+   */
+  async identityLoadWithCustody(did: string, provider: KeyCustodyProvider): Promise<Identity> {
+    const adapter = nativeProviderFor("identityLoadWithCustody", provider);
+    try {
+      const raw = await (
+        this.#native.identityLoadWithCustody as (d: string, p: typeof adapter) => Promise<unknown>
+      )(did, adapter);
       return Identity._fromHandle(this, raw);
     } catch (err) {
       throw mapBridgeError(err);

@@ -459,10 +459,10 @@ _REPO_ROOT = Path(conftest.__file__).resolve().parents[3]
 #: differ from this table in either direction, so a new site fails and so does an
 #: entry whose site was removed.
 _NON_LOADER_SKIP_SITES: dict[tuple[str, str], int] = {
-    # The ``scp`` fixture skips only after ``extension_is_absent(exc)`` returned
-    # True, which is the SCP-VALID-7081 test itself; it re-raises every other
-    # construction failure.
-    ("bindings/python/tests/conftest.py", "scp"): 1,
+    # ``_open_or_skip``, which every instance fixture opens through, skips only
+    # after ``extension_is_absent(exc)`` returned True, which is the
+    # SCP-VALID-7081 test itself; it re-raises every other construction failure.
+    ("bindings/python/tests/conftest.py", "_open_or_skip"): 1,
     # The bridge-parity runner fixtures skip on an unbuilt Kotlin or Swift runner
     # binary, or for Swift on a host that is not macOS. Neither is the Python
     # extension: the runners load the UniFFI library, not ``_scp_core``.

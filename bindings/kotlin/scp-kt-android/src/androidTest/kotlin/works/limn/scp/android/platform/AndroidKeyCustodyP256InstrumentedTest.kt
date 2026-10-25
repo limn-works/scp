@@ -156,7 +156,7 @@ class AndroidKeyCustodyP256InstrumentedTest {
         val signingPublic = first.publicKey(signing)
         val agreementPublic = first.publicKey(agreement)
 
-        val reopened = TestingCallbackCustody(UniffiKeyCustody(AndroidKeyCustody(context)))
+        val reopened = first.reopen(UniffiKeyCustody(AndroidKeyCustody(context)))
         assertArrayEquals(signingPublic, reopened.publicKey(signing))
         assertArrayEquals(agreementPublic, reopened.publicKey(agreement))
         val digest = ByteArray(32).also(random::nextBytes)

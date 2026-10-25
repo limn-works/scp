@@ -61,6 +61,7 @@ class UniffiKeyCustody(private val inner: AndroidKeyCustody) : uniffi.scp.KeyCus
             KeyType.ED25519 -> CustodyKeyType.ED25519
             KeyType.P256 -> CustodyKeyType.P256
             KeyType.HPKE_P256 -> CustodyKeyType.HPKE_P256
+            KeyType.P256_KEY_EVENT -> CustodyKeyType.P256_KEY_EVENT
         }
         val role = when (inner.roleOf(keyId)) {
             KeyRole.IDENTITY -> CustodyKeyRole.IDENTITY
@@ -84,6 +85,7 @@ class UniffiKeyCustody(private val inner: AndroidKeyCustody) : uniffi.scp.KeyCus
             CustodyKeyType.ED25519 -> KeyType.ED25519
             CustodyKeyType.P256 -> KeyType.P256
             CustodyKeyType.HPKE_P256 -> KeyType.HPKE_P256
+            CustodyKeyType.P256_KEY_EVENT -> KeyType.P256_KEY_EVENT
         }
         val androidRole = when (role) {
             CustodyKeyRole.IDENTITY -> KeyRole.IDENTITY

@@ -11,10 +11,13 @@ use std::sync::{Arc, PoisonError, RwLock};
 
 use tokio::sync::Notify;
 
-use scp_platform::PlatformError;
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{
     CustodyType, KeyCustody, KeyHandle, KeyType, Pseudonym, PublicKey, SharedSecret, Signature,
+};
+use scp_platform::{
+    CustodyProbe, IndexedSignature, KeyEventSignError, KeyEventSigner, PlatformError,
+    ProbeSignature, SigningChange,
 };
 
 /// [`InMemoryKeyCustody`] that counts [`KeyCustody::dh_agree`] and
@@ -121,7 +124,34 @@ impl DhCountingCustody {
     }
 }
 
+impl KeyEventSigner for DhCountingCustody {
+    type Member = KeyHandle;
+
+    async fn sign_change(
+        &self,
+        member: &KeyHandle,
+        change: &SigningChange,
+    ) -> Result<IndexedSignature, KeyEventSignError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.sign_change(member, change).await
+    }
+
+    async fn sign_probe(
+        &self,
+        member: &KeyHandle,
+        probe: &CustodyProbe,
+    ) -> Result<ProbeSignature, KeyEventSignError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.sign_probe(member, probe).await
+    }
+}
+
 impl KeyCustody for DhCountingCustody {
+    async fn generate_key_event_keypair(&self) -> Result<KeyHandle, PlatformError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.generate_key_event_keypair().await
+    }
+
     async fn generate_keypair(&self, key_type: KeyType) -> Result<KeyHandle, PlatformError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.generate_calls.fetch_add(1, Ordering::SeqCst);

@@ -129,6 +129,23 @@ pub mod custody_parse;
 #[cfg(feature = "custody")]
 pub mod callback_custody;
 
+// The custody record store over the instance storage and the namespace
+// table that admits one live store per namespace within one bridge instance
+// (spec §17.3). Each bridge instance holds one table.
+#[cfg(feature = "custody")]
+pub mod custody_namespace;
+
+// The callback custody identity entry (spec §17.3, SCP-345 decision D1):
+// the namespace and identity a host custody provider's identity keeps, and
+// the create and load flows every bridge runs over it.
+#[cfg(all(feature = "custody", feature = "resolvers"))]
+pub mod callback_identity;
+
+// One update at a time per identity on a bridge instance (spec §17.3): the
+// per-DID slot every key or document change holds from read to install.
+#[cfg(feature = "resolvers")]
+pub mod identity_update;
+
 // Resolves `$HOME/.scp/keys.bin` and `SCP_KEY_PASSPHRASE` for
 // `"encrypted_file"` custody (spec 03 §3.2.2), rejecting an unset, empty or
 // relative HOME and an empty passphrase, then opens the key file. See ADR-006

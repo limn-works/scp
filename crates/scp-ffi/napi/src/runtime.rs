@@ -1568,6 +1568,11 @@ pub(crate) struct NapiIdentityEntry {
     /// caller-provided callback custody (`identityCreateWithCustody`). The
     /// `KeyCustody` trait is not object-safe (RPITIT), so this is a concrete
     /// enum rather than `Arc<dyn KeyCustody>`.
+    ///
+    /// A callback custody holds the namespace slot of its custody records
+    /// (SCP-345 decision D1), so the entry keeps the namespace for as long as
+    /// it keeps the identity, and the slot refuses a second adapter over the
+    /// same records while this one lives.
     pub(crate) custody: Arc<crate::custody::NapiKeyCustody>,
     /// The DID document at the time of creation (or last key rotation).
     pub(crate) document: scp_did::DidDocument,
@@ -1636,12 +1641,9 @@ pub(crate) fn identity_registry_contains(bi: &NapiBridgeInstance, did: &str) -> 
 /// Overwrites any existing entry for the same DID (idempotent — supports
 /// key rotation where the same DID gets new key material).
 ///
-/// Only reached from the `testing`-gated identity-create / rotation / migration
-/// paths: a `NapiIdentityEntry` carries the `testing`-only pre-rotation state,
-/// and on a shipped build every create path fails closed before an entry is
-/// built (ADR-062 §Decision 6), so the registry is never populated in
-/// production.
-#[cfg(feature = "testing")]
+/// On a shipped build every create path fails closed before an entry is
+/// built (ADR-062 §Decision 6); `identityLoadWithCustody` registers the
+/// identity it loads on both builds.
 pub(crate) fn register_identity(bi: &NapiBridgeInstance, did: &str, entry: NapiIdentityEntry) {
     identity_registry(bi).insert(did.to_owned(), entry);
 }

@@ -277,6 +277,20 @@ impl ProtocolRepoVariant {
         }
     }
 
+    /// The storage a callback custody identity's entry and records live in
+    /// (spec §17.3): this instance's own store, the one this repository's
+    /// event log already uses, when it persists; `None` for the in-memory
+    /// repository, whose entry and records would end with the instance while
+    /// the host keys remain.
+    #[cfg(feature = "custody")]
+    #[must_use]
+    pub fn callback_custody_storage(&self) -> Option<Arc<scp_platform::sqlite::SqliteStorage>> {
+        match self {
+            Self::InMemory(_) => None,
+            Self::Sqlite(repo) => Some(Arc::clone(repo.storage())),
+        }
+    }
+
     /// Constructs a [`ContextEventLogProvider`] backed by this repository.
     ///
     /// The bridge is retained by `Arc` inside

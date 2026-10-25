@@ -21,7 +21,11 @@ pub enum PlatformError {
     ///
     /// For example, calling `sign` with an HPKE P-256 key handle, or calling
     /// `dh_agree` with an Ed25519 key handle.
-    #[error("wrong key type: expected {expected:?}, got {actual:?}")]
+    ///
+    /// When `actual` is a key-event key ([`KeyType::P256KeyEvent`]), the
+    /// message names the one call that mints such a key, so a caller that
+    /// passed it to `generate_keypair` reads which call to use (SCP-345).
+    #[error("wrong key type: expected {expected:?}, got {actual:?}{}", key_event_hint(*actual))]
     WrongKeyType {
         /// The key type the operation requires.
         expected: KeyType,
@@ -107,6 +111,17 @@ pub enum PlatformError {
     /// a platform-specific alternative (`SecRandomCopyBytes`, etc.).
     #[error("unsupported operation: {0}")]
     Unsupported(&'static str),
+}
+
+/// The suffix [`PlatformError::WrongKeyType`] adds to its message when
+/// `actual` is a key-event key: the one call that mints such a key (SCP-345).
+const fn key_event_hint(actual: KeyType) -> &'static str {
+    if matches!(actual, KeyType::P256KeyEvent) {
+        "; mint a key-event key with KeyCustody::generate_key_event_keypair \
+         (generate_key_event_keypair in every binding), not generate_keypair"
+    } else {
+        ""
+    }
 }
 
 /// Which push failure occurred (ADR-006 2026-10-12 amendment in
@@ -226,6 +241,35 @@ mod tests {
             kind,
             detail: detail.to_owned(),
         })
+    }
+
+    #[test]
+    fn key_event_mint_refusal_names_the_key_event_mint() {
+        let refused = crate::traits::refuse_key_event_mint(KeyType::P256KeyEvent);
+        assert!(
+            matches!(
+                refused,
+                Err(PlatformError::WrongKeyType {
+                    actual: KeyType::P256KeyEvent,
+                    ..
+                })
+            ),
+            "{refused:?}"
+        );
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("generate_key_event_keypair")),
+            "{refused:?}"
+        );
+        let other = PlatformError::WrongKeyType {
+            expected: KeyType::Ed25519,
+            actual: KeyType::P256Signing,
+        };
+        assert!(
+            !other.to_string().contains("generate_key_event_keypair"),
+            "{other}"
+        );
     }
 
     #[test]

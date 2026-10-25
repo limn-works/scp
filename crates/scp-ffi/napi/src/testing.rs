@@ -468,7 +468,23 @@ pub(crate) fn fullstack_seed_peer_pseudonym_on(
 /// each host failure to a typed error.
 #[napi]
 pub struct TestingCallbackCustody {
-    inner: std::sync::Arc<crate::custody::NapiCallbackKeyCustody>,
+    /// The live adapter; `None` once [`reopen`](Self::reopen) closed it.
+    inner: std::sync::Mutex<Option<std::sync::Arc<crate::custody::NapiCallbackKeyCustody>>>,
+    /// The storage the adapter's records live in, and the namespace table
+    /// they open through, shared with every adapter `reopen` builds.
+    storage: std::sync::Arc<scp_platform::in_memory::InMemoryStorage>,
+    table: scp_ffi_common::custody_namespace::CustodyNamespaces,
+}
+
+/// The one namespace every adapter of a fixture opens.
+const FIXTURE_NAMESPACE: [u8; 16] = [0; 16];
+
+/// The error a closed fixture adapter answers.
+fn closed_adapter() -> napi::Error {
+    napi::Error::from(ScpNapiError::Identity {
+        message: "this testing adapter was closed by reopen".to_owned(),
+        code: scp_ffi_common::error_codes::IDENT_1008.to_owned(),
+    })
 }
 
 /// The error production reports for a custody failure outside derivation:
@@ -476,6 +492,41 @@ pub struct TestingCallbackCustody {
 /// [`custody_failure_code`](scp_ffi_common::error_codes::custody_failure_code).
 fn custody_err(e: scp_platform::PlatformError) -> napi::Error {
     napi::Error::from(ScpNapiError::from(e))
+}
+
+impl TestingCallbackCustody {
+    /// An adapter over `host` and `records`, which `table` holds live.
+    fn holding(
+        host: crate::custody::CallbackTsfns,
+        records: scp_ffi_common::callback_custody::CustodyRecords,
+        storage: std::sync::Arc<scp_platform::in_memory::InMemoryStorage>,
+        table: scp_ffi_common::custody_namespace::CustodyNamespaces,
+    ) -> Self {
+        Self {
+            inner: std::sync::Mutex::new(Some(std::sync::Arc::new(
+                crate::custody::CallbackAdapter::over(
+                    host,
+                    scp_ffi_common::callback_custody::CallbackKeyRegistry::recorded(records),
+                ),
+            ))),
+            storage,
+            table,
+        }
+    }
+
+    /// The live adapter.
+    ///
+    /// # Errors
+    ///
+    /// `SCP-IDENT-1008` once [`reopen`](Self::reopen) closed this adapter.
+    fn adapter(&self) -> napi::Result<std::sync::Arc<crate::custody::NapiCallbackKeyCustody>> {
+        self.inner
+            .lock()
+            .map_err(|_| closed_adapter())?
+            .as_ref()
+            .map(std::sync::Arc::clone)
+            .ok_or_else(closed_adapter)
+    }
 }
 
 fn testing_handle(key_id: &str) -> napi::Result<scp_platform::KeyHandle> {
@@ -491,11 +542,53 @@ impl TestingCallbackCustody {
     /// A `napi::Error` if a callback cannot become a threadsafe function.
     #[napi(constructor)]
     pub fn new(provider: crate::custody::NapiKeyCustodyProvider) -> napi::Result<Self> {
-        Ok(Self {
-            inner: std::sync::Arc::new(crate::custody::NapiCallbackKeyCustody::from_provider(
-                provider,
-            )?),
-        })
+        // Records in a fresh in-memory store under a table of their own, as
+        // production keeps them in the instance storage (spec §17.3).
+        let host = crate::custody::CallbackTsfns::from_provider(provider)?;
+        let storage = std::sync::Arc::new(scp_platform::in_memory::InMemoryStorage::new());
+        let (table, records) = scp_ffi_common::callback_custody::CustodyRecords::open_alone(
+            std::sync::Arc::clone(&storage),
+            FIXTURE_NAMESPACE,
+        );
+        Ok(Self::holding(host, records, storage, table))
+    }
+
+    /// Closes this adapter and opens a new one around `provider` over the
+    /// same custody records, through the same namespace table, as
+    /// `identityLoadWithCustody` rebuilds an identity's adapter over the
+    /// namespace its stored entry holds (spec §17.3). The new adapter caches no key, so its first use
+    /// of a recorded key asks `provider.getPublicKey` and checks the answer
+    /// against the record. Only a recorded key resolves, so a test mints its
+    /// keys through an adapter first. This adapter answers `SCP-IDENT-1008`
+    /// afterwards.
+    ///
+    /// # Errors
+    ///
+    /// A `napi::Error` if a callback cannot become a threadsafe function;
+    /// `SCP-IDENT-1008` when this adapter is already closed, or while a call
+    /// on it still holds its records; that refusal leaves this adapter open.
+    #[napi]
+    pub fn reopen(&self, provider: crate::custody::NapiKeyCustodyProvider) -> napi::Result<Self> {
+        let host = crate::custody::CallbackTsfns::from_provider(provider)?;
+        let mut slot = self.inner.lock().map_err(|_| closed_adapter())?;
+        scp_ffi_common::callback_custody::close_for_reopen(&mut slot).map_err(|refusal| {
+            napi::Error::from(ScpNapiError::Identity {
+                message: refusal.to_string(),
+                code: scp_ffi_common::error_codes::IDENT_1008.to_owned(),
+            })
+        })?;
+        let records = scp_ffi_common::callback_custody::CustodyRecords::reopen(
+            &self.table,
+            std::sync::Arc::clone(&self.storage),
+            FIXTURE_NAMESPACE,
+        )
+        .map_err(|e| custody_err(scp_platform::PlatformError::from(e)))?;
+        Ok(Self::holding(
+            host,
+            records,
+            std::sync::Arc::clone(&self.storage),
+            self.table.clone(),
+        ))
     }
 
     /// Generates an Ed25519 identity key through the provider.
@@ -507,7 +600,7 @@ impl TestingCallbackCustody {
     #[napi(js_name = "generateKeypair")]
     pub async fn generate_keypair(&self) -> napi::Result<String> {
         use scp_platform::KeyCustody;
-        self.inner
+        self.adapter()?
             .generate_identity_keypair()
             .await
             .map(|h| h.id().to_string())
@@ -527,7 +620,7 @@ impl TestingCallbackCustody {
         key_type: crate::custody::NapiCustodyKeyType,
     ) -> napi::Result<String> {
         use scp_platform::KeyCustody;
-        self.inner
+        self.adapter()?
             .generate_keypair(key_type.into())
             .await
             .map(|h| h.id().to_string())
@@ -551,7 +644,7 @@ impl TestingCallbackCustody {
         use scp_platform::KeyCustody;
         let identity = testing_handle(&identity_key_id)?;
         let pseudonym = self
-            .inner
+            .adapter()?
             .derive_pseudonym(&identity, context_id.as_bytes())
             .await
             .map_err(|e| napi::Error::from(crate::context::pseudonym_derivation_failed(&e)))?;
@@ -577,7 +670,7 @@ impl TestingCallbackCustody {
         let identity = testing_handle(&identity_key_id)?;
         let epoch = crate::economy::amount_u64_from_bigint(&epoch, "epoch")?;
         let pseudonym = self
-            .inner
+            .adapter()?
             .derive_rotatable_pseudonym(&identity, context_id.as_bytes(), epoch)
             .await
             .map_err(|e| napi::Error::from(crate::context::pseudonym_derivation_failed(&e)))?;
@@ -594,7 +687,7 @@ impl TestingCallbackCustody {
     pub async fn sign(&self, key_id: String, data: Buffer) -> napi::Result<Buffer> {
         use scp_platform::KeyCustody;
         let key = testing_handle(&key_id)?;
-        self.inner
+        self.adapter()?
             .sign(&key, &data)
             .await
             .map(|signature| Buffer::from(signature.as_bytes().to_vec()))
@@ -617,7 +710,7 @@ impl TestingCallbackCustody {
     pub async fn dh_agree(&self, key_id: String, peer_public: Buffer) -> napi::Result<Buffer> {
         use scp_platform::KeyCustody;
         let key = testing_handle(&key_id)?;
-        self.inner
+        self.adapter()?
             .dh_agree(&key, &peer_public)
             .await
             .map(|shared| Buffer::from(shared.as_bytes().to_vec()))
@@ -634,7 +727,7 @@ impl TestingCallbackCustody {
     pub async fn destroy_key(&self, key_id: String) -> napi::Result<()> {
         use scp_platform::KeyCustody;
         let key = testing_handle(&key_id)?;
-        self.inner.destroy_key(&key).await.map_err(custody_err)
+        self.adapter()?.destroy_key(&key).await.map_err(custody_err)
     }
 }
 

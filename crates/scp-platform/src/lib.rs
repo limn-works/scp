@@ -89,9 +89,7 @@ pub mod syncable;
 pub mod traits;
 
 // Re-export all public types for ergonomic access.
-pub use custody_record::{
-    CustodyNamespace, CustodyRecord, CustodyRecordStore, StorageCustodyRecordStore,
-};
+pub use custody_record::{CustodyRecord, CustodyRecordStore};
 pub use encrypted::EncryptedStorage;
 // The key-event signer contract (09-security-model.md §9.7.4.2 R10), so a
 // custody implementor and its callers need no direct scp-kel dependency.
@@ -109,5 +107,6 @@ pub use traits::{
     CustodyType, DeviceAttestation, DeviceAttestationToken, KeyCustody, KeyHandle, KeyRole,
     KeyType, NextSetCustody, NextSetCustodyError, NextSetKeyHandle, PreRotationCustody,
     PreRotationCustodyError, PreRotationCustodyKind, PreRotationKeyHandle, Pseudonym, PublicKey,
-    Push, PushToken, SharedSecret, Signature, Storage, WakeSignal, require_derive_source,
+    Push, PushToken, SharedSecret, Signature, Storage, WakeSignal, refuse_key_event_mint,
+    require_derive_source,
 };

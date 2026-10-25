@@ -32,6 +32,14 @@ except Exception as _exc:
 
 from tests.test_identity_create_with_custody import _FakeKeychain
 
+
+@pytest.fixture
+def scp(sqlite_scp):  # type: ignore[no-untyped-def]
+    """This module's instance persists: callback custody refuses storage that
+    does not persist (spec section 17.3)."""
+    return sqlite_scp
+
+
 _GOVERNANCE_PARAMS = {
     "ceiling": ["governance:propose", "member:ban", "messages:read", "messages:write"],
     "memory_scope": "ephemeral",

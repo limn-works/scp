@@ -1419,8 +1419,36 @@ class SCP internal constructor(
     /** Forwards to [NativeScp.identityLinkAttestations] on [inner]. */
     fun identityLinkAttestations(did: String): String = inner.identityLinkAttestations(did = did)
 
-    /** Forwards to [NativeScp.identityLoad] on [inner]. */
+    /**
+     * Forwards to [NativeScp.identityLoad] on [inner].
+     *
+     * An identity created with [identityCreateWithCustody] loads only
+     * through [identityLoadWithCustody], which takes its provider: this
+     * throws `SCP-IDENT-1003` for one (spec section 17.3).
+     */
     suspend fun identityLoad(did: String): Identity = inner.identityLoad(did = did)
+
+    /**
+     * Forwards to [NativeScp.identityLoadWithCustody] on [inner]: loads an
+     * identity created with [identityCreateWithCustody] on this instance's
+     * storage, in this process or an earlier one, with the same [provider]
+     * (spec section 17.3). The identity's keys, including keys its custody
+     * minted earlier, sign through [provider].
+     *
+     * Throws `SCP-STORAGE-8000` when this instance's storage does not
+     * persist; `SCP-IDENT-1002` when the storage holds no entry for [did];
+     * `SCP-IDENT-1009` when the entry does not decode or names another DID;
+     * `SCP-IDENT-1008` while this instance already holds the identity
+     * loaded, or when [provider]'s identity key does not derive [did].
+     */
+    suspend fun identityLoadWithCustody(
+        did: String,
+        provider: KeyCustodyProvider,
+    ): Identity =
+        inner.identityLoadWithCustody(
+            did = did,
+            provider = provider,
+        )
 
     /** Forwards to [NativeScp.identityMigrate] on [inner]. */
     suspend fun identityMigrate(identity: Identity): Identity = inner.identityMigrate(identity = identity)

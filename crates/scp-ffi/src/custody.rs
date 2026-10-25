@@ -28,6 +28,10 @@ use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{
     CustodyType, KeyCustody, KeyHandle, KeyType, Pseudonym, PublicKey, SharedSecret, Signature,
 };
+use scp_platform::{
+    CustodyProbe, IndexedSignature, KeyEventSignError, KeyEventSigner, ProbeSignature,
+    SigningChange,
+};
 
 /// Enum dispatch wrapper for [`KeyCustody`] implementations used by the
 /// `PyO3` FFI bridge.
@@ -53,6 +57,36 @@ pub enum FfiKeyCustody {
     Callback(PyCallbackKeyCustody),
 }
 
+impl KeyEventSigner for FfiKeyCustody {
+    type Member = KeyHandle;
+
+    async fn sign_change(
+        &self,
+        member: &KeyHandle,
+        change: &SigningChange,
+    ) -> Result<IndexedSignature, KeyEventSignError> {
+        match self {
+            #[cfg(feature = "testing")]
+            Self::InMemory(kc) => kc.sign_change(member, change).await,
+            Self::File(kc) => kc.sign_change(member, change).await,
+            Self::Callback(kc) => kc.sign_change(member, change).await,
+        }
+    }
+
+    async fn sign_probe(
+        &self,
+        member: &KeyHandle,
+        probe: &CustodyProbe,
+    ) -> Result<ProbeSignature, KeyEventSignError> {
+        match self {
+            #[cfg(feature = "testing")]
+            Self::InMemory(kc) => kc.sign_probe(member, probe).await,
+            Self::File(kc) => kc.sign_probe(member, probe).await,
+            Self::Callback(kc) => kc.sign_probe(member, probe).await,
+        }
+    }
+}
+
 impl KeyCustody for FfiKeyCustody {
     async fn generate_keypair(&self, key_type: KeyType) -> Result<KeyHandle, PlatformError> {
         match self {
@@ -60,6 +94,15 @@ impl KeyCustody for FfiKeyCustody {
             Self::InMemory(kc) => kc.generate_keypair(key_type).await,
             Self::File(kc) => kc.generate_keypair(key_type).await,
             Self::Callback(kc) => kc.generate_keypair(key_type).await,
+        }
+    }
+
+    async fn generate_key_event_keypair(&self) -> Result<KeyHandle, PlatformError> {
+        match self {
+            #[cfg(feature = "testing")]
+            Self::InMemory(kc) => kc.generate_key_event_keypair().await,
+            Self::File(kc) => kc.generate_key_event_keypair().await,
+            Self::Callback(kc) => kc.generate_key_event_keypair().await,
         }
     }
 
@@ -562,15 +605,12 @@ impl PyKeyCustodyProvider {
 /// - `get_public_key(key_id: str) -> scp_sdk.CustodyPublicKey` — an object
 ///   whose `key_type` attribute is the key's type (as above), whose
 ///   `public_key` attribute is its public key, exactly 32 bytes (Ed25519),
-///   33 (compressed SEC1, `"p256"`) or 65 (uncompressed SEC1,
-///   `"hpke-p256"`), and whose `role` attribute is the role
-///   `generate_keypair` minted it in. The bridge types the key from
-///   `key_type`, never from the length, and refuses any other length, and
-///   any type or role name outside the two `Literal`s. A key id the bridge
-///   has not seen binds as an identity only when `role` is `"identity"`. The
-///   bridge cannot check the host's word: a host that
-///   reports `"identity"` for a key it minted as `"operational"` lets that
-///   key derive pseudonyms, which is outside Rust's control.
+///   33 (compressed SEC1, `"p256"` and `"p256-key-event"`) or 65
+///   (uncompressed SEC1, `"hpke-p256"`), and whose `role` attribute is the
+///   role `generate_keypair` minted it in. The bridge refuses any other
+///   length, any type or role name outside the two `Literal`s, and an answer
+///   that disagrees with the type and role it recorded when it minted the
+///   key (ADR-021, SCP-345).
 /// - Any method raises `scp_sdk.KeyNotFoundError`, or any exception whose
 ///   `code` is `SCP-CRYPTO-4006`, for a key id the host does not hold; the
 ///   bridge reports it as `KeyNotFound`. Any other exception is a custody
@@ -637,6 +677,42 @@ impl PyKeyCustodyProvider {
     }
 }
 
+impl KeyEventSigner for PyCallbackKeyCustody {
+    type Member = KeyHandle;
+
+    async fn sign_change(
+        &self,
+        member: &KeyHandle,
+        change: &SigningChange,
+    ) -> Result<IndexedSignature, KeyEventSignError> {
+        let p = &self.provider;
+        scp_ffi_common::callback_custody::sign_change(
+            &self.registry,
+            member,
+            change,
+            |key_id, data| p.call_str_bytes("sign", key_id, data),
+            |key_id| p.host_public_key(key_id),
+        )
+        .await
+    }
+
+    async fn sign_probe(
+        &self,
+        member: &KeyHandle,
+        probe: &CustodyProbe,
+    ) -> Result<ProbeSignature, KeyEventSignError> {
+        let p = &self.provider;
+        scp_ffi_common::callback_custody::sign_probe(
+            &self.registry,
+            member,
+            probe,
+            |key_id, data| p.call_str_bytes("sign", key_id, data),
+            |key_id| p.host_public_key(key_id),
+        )
+        .await
+    }
+}
+
 impl std::fmt::Debug for PyCallbackKeyCustody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("PyCallbackKeyCustody([python])")
@@ -644,13 +720,26 @@ impl std::fmt::Debug for PyCallbackKeyCustody {
 }
 
 impl PyCallbackKeyCustody {
-    /// Wraps a validated [`PyKeyCustodyProvider`].
+    /// Wraps a validated [`PyKeyCustodyProvider`] over `registry`, which
+    /// holds the adapter's custody records. Production passes
+    /// [`CallbackKeyRegistry::recorded`] over the instance storage, so every
+    /// handle resolves against its record and the host's word never types a
+    /// key (ADR-021, SCP-345).
+    ///
+    /// [`CallbackKeyRegistry::recorded`]: scp_ffi_common::callback_custody::CallbackKeyRegistry::recorded
     #[must_use]
-    pub fn new(provider: PyKeyCustodyProvider) -> Self {
-        Self {
-            provider,
-            registry: scp_ffi_common::callback_custody::CallbackKeyRegistry::new(),
-        }
+    pub const fn new(
+        provider: PyKeyCustodyProvider,
+        registry: scp_ffi_common::callback_custody::CallbackKeyRegistry,
+    ) -> Self {
+        Self { provider, registry }
+    }
+
+    /// The custody namespace this adapter's records live under, which the
+    /// identity's callback custody entry stores (spec §17.3).
+    #[must_use]
+    pub const fn namespace(&self) -> [u8; 16] {
+        self.registry.namespace()
     }
 }
 
@@ -658,13 +747,24 @@ impl KeyCustody for PyCallbackKeyCustody {
     // The shared flows in `scp_ffi_common::callback_custody` hold every
     // key-type, length, role and signature rule; each closure is one
     // provider call on tokio's blocking pool (`PyKeyCustodyProvider::off_thread`). Every
-    // entry point resolves a handle this adapter has not registered through
-    // `get_public_key`.
+    // entry point resolves a handle against its custody record, and checks the
+    // host's `get_public_key` answer against it.
     async fn generate_keypair(&self, key_type: KeyType) -> Result<KeyHandle, PlatformError> {
         let p = &self.provider;
         scp_ffi_common::callback_custody::generate_operational(
             &self.registry,
             key_type,
+            |key_type, role| p.host_generate(key_type, role),
+            |key_id| p.host_public_key(key_id),
+            |key_id| p.call_str_void("destroy_key", key_id),
+        )
+        .await
+    }
+
+    async fn generate_key_event_keypair(&self) -> Result<KeyHandle, PlatformError> {
+        let p = &self.provider;
+        scp_ffi_common::callback_custody::generate_key_event(
+            &self.registry,
             |key_type, role| p.host_generate(key_type, role),
             |key_id| p.host_public_key(key_id),
             |key_id| p.call_str_void("destroy_key", key_id),
@@ -1076,6 +1176,11 @@ class P256Custody(FakeCustody):
         self._types = {}
         self._hpke_d = {}
         self.dh_peers = []
+        self.signed = []
+
+    def report_as(self, key_id, key_type):
+        '''Reports `key_id` as `key_type` from now on, whatever it was minted as.'''
+        self._types[key_id] = key_type
 
     def generate_keypair(self, key_type, role):
         kid = super().generate_keypair(key_type, role)
@@ -1086,17 +1191,18 @@ class P256Custody(FakeCustody):
 
     def _public(self, key_id):
         t = self._types.get(key_id)
-        if t == 'p256':
-            return ('p256', G_COMPRESSED)
+        if t in ('p256', 'p256-key-event'):
+            return (t, G_COMPRESSED)
         if t == 'hpke-p256':
             x, y = mul(self._hpke_d[key_id], G)
             return ('hpke-p256', bytes([4]) + x.to_bytes(32, 'big') + y.to_bytes(32, 'big'))
         return super()._public(key_id)
 
     def sign(self, key_id, message):
-        if self._types.get(key_id) != 'p256':
+        if self._types.get(key_id) not in ('p256', 'p256-key-event'):
             return super().sign(key_id, message)
         self._count('sign')
+        self.signed.append(bytes(message))
         s = (int.from_bytes(bytes(message), 'big') + GX) % N
         high_s = s if s > N // 2 else N - s
         body = der_int(GX) + der_int(high_s)
@@ -1211,7 +1317,13 @@ class WrongLengthCustody(P256Custody):
                 .unbind();
             let provider =
                 PyKeyCustodyProvider::new(py, obj.clone_ref(py)).expect("valid provider");
-            (PyCallbackKeyCustody::new(provider), obj)
+            (
+                PyCallbackKeyCustody::new(
+                    provider,
+                    scp_ffi_common::callback_custody::CallbackKeyRegistry::recorded_in_memory(),
+                ),
+                obj,
+            )
         })
     }
 
@@ -1280,6 +1392,151 @@ mod tests {
     /// Builds a `FfiKeyCustody::Callback` wrapping a fresh fault-free fake.
     fn fake_callback_custody() -> FfiKeyCustody {
         FfiKeyCustody::Callback(fake_py_custody(None))
+    }
+
+    /// A `P256Custody` host object and a `PyCallbackKeyCustody` over it and
+    /// `registry`.
+    fn p256_over(
+        registry: scp_ffi_common::callback_custody::CallbackKeyRegistry,
+    ) -> (PyCallbackKeyCustody, Py<PyAny>) {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let host = super::test_fakes::fake_custody_module(py)
+                .getattr("P256Custody")
+                .and_then(|cls| cls.call0())
+                .expect("P256Custody host")
+                .unbind();
+            let provider =
+                PyKeyCustodyProvider::new(py, host.clone_ref(py)).expect("valid provider");
+            (PyCallbackKeyCustody::new(provider, registry), host)
+        })
+    }
+
+    /// The messages the `P256Custody` host `host` was asked to sign.
+    fn host_signed(host: &Py<PyAny>) -> Vec<Vec<u8>> {
+        Python::with_gil(|py| host.bind(py).getattr("signed").and_then(|s| s.extract()))
+            .expect("signed log")
+    }
+
+    /// A key-event key minted through `custody`, with its 33-byte public key.
+    async fn key_event_key(custody: &PyCallbackKeyCustody) -> (KeyHandle, [u8; 33]) {
+        let key = custody
+            .generate_key_event_keypair()
+            .await
+            .expect("key-event mint");
+        let public = custody
+            .public_key(&key)
+            .await
+            .expect("public key")
+            .as_bytes()
+            .try_into()
+            .expect("a key-event key is a 33-byte point");
+        (key, public)
+    }
+
+    /// AC7 (SCP-345): the custody record, not the host's word, types a key.
+    /// An adapter rebuilt over the same records refuses `sign` of a
+    /// key-event key the host now reports as `p256`, without a host call. A
+    /// registry that trusted the host's answer would sign.
+    #[tokio::test]
+    async fn rebuilt_adapter_refuses_sign_of_key_event_key_host_reports_p256() {
+        use scp_ffi_common::callback_custody::CallbackKeyRegistry;
+
+        let storage = Arc::new(scp_platform::in_memory::InMemoryStorage::new());
+        let table = scp_ffi_common::callback_custody::CustodyRecords::open_alone(
+            Arc::clone(&storage),
+            [0x3a; 16],
+        )
+        .0;
+        let recorded = || {
+            CallbackKeyRegistry::recorded(
+                scp_ffi_common::callback_custody::CustodyRecords::reopen(
+                    &table,
+                    Arc::clone(&storage),
+                    [0x3a; 16],
+                )
+                .expect("no other adapter holds the namespace"),
+            )
+        };
+        let (minted, host) = p256_over(recorded());
+        let (key, _) = key_event_key(&minted).await;
+        assert!(
+            scp_ffi_common::callback_custody::CustodyRecords::reopen(
+                &table,
+                Arc::clone(&storage),
+                [0x3a; 16]
+            )
+            .is_err(),
+            "a second adapter for a live namespace is refused"
+        );
+        drop(minted);
+
+        Python::with_gil(|py| {
+            host.bind(py)
+                .call_method1("report_as", (key.id().to_string(), "p256"))
+                .map(drop)
+        })
+        .expect("report");
+        let provider = Python::with_gil(|py| PyKeyCustodyProvider::new(py, host.clone_ref(py)))
+            .expect("valid provider");
+        let rebuilt = PyCallbackKeyCustody::new(provider, recorded());
+        let signs = fake_calls(&rebuilt, "sign");
+        let refused = rebuilt.sign(&key, &[0x5a; 32]).await;
+        assert!(
+            matches!(
+                refused,
+                Err(PlatformError::WrongKeyType {
+                    expected: KeyType::P256Signing,
+                    actual: KeyType::P256KeyEvent,
+                })
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(
+            fake_calls(&rebuilt, "sign"),
+            signs,
+            "the refusal makes no host call"
+        );
+    }
+
+    /// AC8 (SCP-345): `sign_change` hands the host the change's 32-byte
+    /// digest `D`, never the preimage. The host answers DER with the high
+    /// `s`, and the raw low-`s` signature returned verifies strictly over `D`
+    /// under the key.
+    #[tokio::test]
+    async fn sign_change_hands_host_the_change_digest() {
+        let (custody, host) =
+            p256_over(scp_ffi_common::callback_custody::CallbackKeyRegistry::recorded_in_memory());
+        let (key, public) = key_event_key(&custody).await;
+        let change = scp_testing::conformance::key_custody::v41_signing_change();
+        let IndexedSignature::Raw { signature } = custody
+            .sign_change(&key, &change)
+            .await
+            .expect("sign_change")
+        else {
+            panic!("a callback custody signs the raw form");
+        };
+        assert_eq!(host_signed(&host), vec![change.digest().to_vec()]);
+        let point = scp_crypto::p256::P256PublicKey::from_sec1(&public).expect("point");
+        scp_crypto::p256::verify_prehash_strict(&point, &change.digest(), &signature)
+            .expect("verifies over D");
+    }
+
+    /// AC8 (SCP-345): `sign_probe` hands the host the probe's raw digest,
+    /// never its nonce, and the signature verifies over the probe.
+    #[tokio::test]
+    async fn sign_probe_hands_host_the_probe_digest() {
+        let (custody, host) =
+            p256_over(scp_ffi_common::callback_custody::CallbackKeyRegistry::recorded_in_memory());
+        let (key, public) = key_event_key(&custody).await;
+        let probe = CustodyProbe::fresh().expect("probe nonce");
+        custody
+            .sign_probe(&key, &probe)
+            .await
+            .expect("sign_probe")
+            .verify(&probe, &public)
+            .expect("verifies over the probe");
+        assert_eq!(host_signed(&host), vec![probe.raw_digest().to_vec()]);
     }
 
     #[tokio::test]
@@ -1351,7 +1608,13 @@ class SleepyAgreeCustody(P256Custody):
                     .unbind();
             let provider =
                 PyKeyCustodyProvider::new(py, host.clone_ref(py)).expect("valid provider");
-            (PyCallbackKeyCustody::new(provider), host)
+            (
+                PyCallbackKeyCustody::new(
+                    provider,
+                    scp_ffi_common::callback_custody::CallbackKeyRegistry::recorded_in_memory(),
+                ),
+                host,
+            )
         });
         let handle = custody
             .generate_keypair(KeyType::HpkeP256)

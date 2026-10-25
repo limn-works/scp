@@ -2739,6 +2739,31 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func identityLoad(did: String) async throws  -> Identity
     
     /**
+     * Loads an identity created with
+     * [`identity_create_with_custody`](Self::identity_create_with_custody)
+     * on this instance's storage, with the same host custody provider
+     * (spec §17.3, SCP-345 decision D1).
+     *
+     * Reads the identity's callback custody entry, reopens its custody
+     * records over the stored namespace, and checks that `provider` holds
+     * the identity key the DID derives from. The handle reports
+     * `os_keystore` and signs through `provider`, including with keys minted
+     * in an earlier process.
+     *
+     * # Errors
+     *
+     * - `SCP-IDENT-1004` for a DID that is not `did:dht`.
+     * - `SCP-STORAGE-8000` on in-memory storage, which keeps no entry.
+     * - `SCP-IDENT-1002` when the storage holds no entry for `did`.
+     * - `SCP-IDENT-1009` when the entry does not decode or names another
+     * DID.
+     * - `SCP-IDENT-1008` while another live adapter of this instance holds
+     * the identity's namespace (a second load, or the create's own
+     * adapter), or when `provider`'s identity key does not derive `did`.
+     */
+    func identityLoadWithCustody(did: String, provider: KeyCustodyProvider) async throws  -> Identity
+    
+    /**
      * Per-instance equivalent of the free-function `identity_migrate`.
      *
      * Rejects any `Identity` whose `instance_id` does not match this
@@ -5864,6 +5889,46 @@ open func identityLoad(did: String)async throws  -> Identity  {
 }
     
     /**
+     * Loads an identity created with
+     * [`identity_create_with_custody`](Self::identity_create_with_custody)
+     * on this instance's storage, with the same host custody provider
+     * (spec §17.3, SCP-345 decision D1).
+     *
+     * Reads the identity's callback custody entry, reopens its custody
+     * records over the stored namespace, and checks that `provider` holds
+     * the identity key the DID derives from. The handle reports
+     * `os_keystore` and signs through `provider`, including with keys minted
+     * in an earlier process.
+     *
+     * # Errors
+     *
+     * - `SCP-IDENT-1004` for a DID that is not `did:dht`.
+     * - `SCP-STORAGE-8000` on in-memory storage, which keeps no entry.
+     * - `SCP-IDENT-1002` when the storage holds no entry for `did`.
+     * - `SCP-IDENT-1009` when the entry does not decode or names another
+     * DID.
+     * - `SCP-IDENT-1008` while another live adapter of this instance holds
+     * the identity's namespace (a second load, or the create's own
+     * adapter), or when `provider`'s identity key does not derive `did`.
+     */
+open func identityLoadWithCustody(did: String, provider: KeyCustodyProvider)async throws  -> Identity  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_identity_load_with_custody(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(did),FfiConverterCallbackInterfaceKeyCustodyProvider_lower(provider)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_pointer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
+            liftFunc: FfiConverterTypeIdentity_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
      * Per-instance equivalent of the free-function `identity_migrate`.
      *
      * Rejects any `Identity` whose `instance_id` does not match this
@@ -8265,6 +8330,397 @@ public func FfiConverterTypeScp_lift(_ pointer: UnsafeMutableRawPointer) throws 
 #endif
 public func FfiConverterTypeScp_lower(_ value: Scp) -> UnsafeMutableRawPointer {
     return FfiConverterTypeScp.lower(value)
+}
+
+
+
+
+
+
+/**
+ * Test-only handle over one callback custody adapter built from a host
+ * provider.
+ *
+ * Each method runs the production adapter's `KeyCustody` operation, so the
+ * bridge's checks run as they do for `identity_create_with_custody`: key
+ * type and role binding, public key length and point validation, the P-256
+ * signature's low-`s` normalisation and strict verification, and the HPKE
+ * peer's validation before the host is called. Errors carry the codes
+ * production reports.
+ */
+public protocol TestingCallbackCustodyProtocol: AnyObject, Sendable {
+    
+    /**
+     * The custody class the bridge reads for `key_id` from the host's
+     * `custody_type` string: `"hardware"`, `"software"` or `"in_memory"`.
+     *
+     * # Errors
+     *
+     * The custody error production reports for a key id that is not a
+     * canonical decimal `u64`.
+     */
+    func custodyType(keyId: String) throws  -> String
+    
+    /**
+     * Destroys `key_id` through the adapter.
+     *
+     * # Errors
+     *
+     * The custody error production reports.
+     */
+    func destroyKey(keyId: String) async throws 
+    
+    /**
+     * Runs the adapter's `dh_agree` for `key_id` against `peer_public` and
+     * returns the 32-byte shared secret the bridge read from the host.
+     *
+     * # Errors
+     *
+     * The custody error production reports.
+     */
+    func dhAgree(keyId: String, peerPublic: Data) async throws  -> Data
+    
+    /**
+     * Generates an operational key of `key_type` through the adapter, as
+     * `KeyCustody::generate_keypair` does in production: the host is asked
+     * for `(key_type, Operational)` and must report that type and role.
+     *
+     * # Errors
+     *
+     * The custody error production reports.
+     */
+    func generateKeypair(keyType: CustodyKeyType) async throws  -> String
+    
+    /**
+     * The public key the adapter holds for `key_id`: 32 bytes (Ed25519),
+     * the 33-byte compressed point (P-256 signing) or the 65-byte
+     * uncompressed point (HPKE P-256).
+     *
+     * # Errors
+     *
+     * The custody error production reports.
+     */
+    func publicKey(keyId: String) async throws  -> Data
+    
+    /**
+     * Closes this adapter and opens a new one around `provider` over the
+     * same custody records, through the same namespace table, as
+     * `identity_load_with_custody` rebuilds an identity's adapter over the
+     * namespace its stored entry holds (spec §17.3). Only a recorded key resolves, so a test that
+     * reopens a host's keys mints them through an adapter first. This
+     * adapter answers `SCP-IDENT-1008` afterwards.
+     *
+     * # Errors
+     *
+     * `SCP-IDENT-1008` when this adapter is already closed, or while a call
+     * on it still holds its records (the namespace is live).
+     */
+    func reopen(provider: KeyCustodyProvider) throws  -> TestingCallbackCustody
+    
+    /**
+     * Signs `data` with `key_id` through the adapter and returns what the
+     * bridge returns: for a P-256 key, the 64-byte low-`s` signature that
+     * verified strictly over the 32-byte digest `data`.
+     *
+     * # Errors
+     *
+     * The custody error production reports.
+     */
+    func sign(keyId: String, data: Data) async throws  -> Data
+    
+}
+/**
+ * Test-only handle over one callback custody adapter built from a host
+ * provider.
+ *
+ * Each method runs the production adapter's `KeyCustody` operation, so the
+ * bridge's checks run as they do for `identity_create_with_custody`: key
+ * type and role binding, public key length and point validation, the P-256
+ * signature's low-`s` normalisation and strict verification, and the HPKE
+ * peer's validation before the host is called. Errors carry the codes
+ * production reports.
+ */
+open class TestingCallbackCustody: TestingCallbackCustodyProtocol, @unchecked Sendable {
+    fileprivate let pointer: UnsafeMutableRawPointer!
+
+    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoPointer {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        self.pointer = pointer
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noPointer: NoPointer) {
+        self.pointer = nil
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
+        return try! rustCall { uniffi_scp_ffi_uniffi_fn_clone_testingcallbackcustody(self.pointer, $0) }
+    }
+    /**
+     * Wraps `provider` in a fresh callback custody adapter over empty
+     * in-memory custody records, opened through a namespace table of its
+     * own.
+     */
+public convenience init(provider: KeyCustodyProvider) {
+    let pointer =
+        try! rustCall() {
+    uniffi_scp_ffi_uniffi_fn_constructor_testingcallbackcustody_new(
+        FfiConverterCallbackInterfaceKeyCustodyProvider_lower(provider),$0
+    )
+}
+    self.init(unsafeFromRawPointer: pointer)
+}
+
+    deinit {
+        guard let pointer = pointer else {
+            return
+        }
+
+        try! rustCall { uniffi_scp_ffi_uniffi_fn_free_testingcallbackcustody(pointer, $0) }
+    }
+
+    
+
+    
+    /**
+     * The custody class the bridge reads for `key_id` from the host's
+     * `custody_type` string: `"hardware"`, `"software"` or `"in_memory"`.
+     *
+     * # Errors
+     *
+     * The custody error production reports for a key id that is not a
+     * canonical decimal `u64`.
+     */
+open func custodyType(keyId: String)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_testingcallbackcustody_custody_type(self.uniffiClonePointer(),
+        FfiConverterString.lower(keyId),$0
+    )
+})
+}
+    
+    /**
+     * Destroys `key_id` through the adapter.
+     *
+     * # Errors
+     *
+     * The custody error production reports.
+     */
+open func destroyKey(keyId: String)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_testingcallbackcustody_destroy_key(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(keyId)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Runs the adapter's `dh_agree` for `key_id` against `peer_public` and
+     * returns the 32-byte shared secret the bridge read from the host.
+     *
+     * # Errors
+     *
+     * The custody error production reports.
+     */
+open func dhAgree(keyId: String, peerPublic: Data)async throws  -> Data  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_testingcallbackcustody_dh_agree(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(keyId),FfiConverterData.lower(peerPublic)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterData.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Generates an operational key of `key_type` through the adapter, as
+     * `KeyCustody::generate_keypair` does in production: the host is asked
+     * for `(key_type, Operational)` and must report that type and role.
+     *
+     * # Errors
+     *
+     * The custody error production reports.
+     */
+open func generateKeypair(keyType: CustodyKeyType)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_testingcallbackcustody_generate_keypair(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeCustodyKeyType_lower(keyType)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * The public key the adapter holds for `key_id`: 32 bytes (Ed25519),
+     * the 33-byte compressed point (P-256 signing) or the 65-byte
+     * uncompressed point (HPKE P-256).
+     *
+     * # Errors
+     *
+     * The custody error production reports.
+     */
+open func publicKey(keyId: String)async throws  -> Data  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_testingcallbackcustody_public_key(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(keyId)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterData.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Closes this adapter and opens a new one around `provider` over the
+     * same custody records, through the same namespace table, as
+     * `identity_load_with_custody` rebuilds an identity's adapter over the
+     * namespace its stored entry holds (spec §17.3). Only a recorded key resolves, so a test that
+     * reopens a host's keys mints them through an adapter first. This
+     * adapter answers `SCP-IDENT-1008` afterwards.
+     *
+     * # Errors
+     *
+     * `SCP-IDENT-1008` when this adapter is already closed, or while a call
+     * on it still holds its records (the namespace is live).
+     */
+open func reopen(provider: KeyCustodyProvider)throws  -> TestingCallbackCustody  {
+    return try  FfiConverterTypeTestingCallbackCustody_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_testingcallbackcustody_reopen(self.uniffiClonePointer(),
+        FfiConverterCallbackInterfaceKeyCustodyProvider_lower(provider),$0
+    )
+})
+}
+    
+    /**
+     * Signs `data` with `key_id` through the adapter and returns what the
+     * bridge returns: for a P-256 key, the 64-byte low-`s` signature that
+     * verified strictly over the 32-byte digest `data`.
+     *
+     * # Errors
+     *
+     * The custody error production reports.
+     */
+open func sign(keyId: String, data: Data)async throws  -> Data  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_testingcallbackcustody_sign(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(keyId),FfiConverterData.lower(data)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterData.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTestingCallbackCustody: FfiConverter {
+
+    typealias FfiType = UnsafeMutableRawPointer
+    typealias SwiftType = TestingCallbackCustody
+
+    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> TestingCallbackCustody {
+        return TestingCallbackCustody(unsafeFromRawPointer: pointer)
+    }
+
+    public static func lower(_ value: TestingCallbackCustody) -> UnsafeMutableRawPointer {
+        return value.uniffiClonePointer()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TestingCallbackCustody {
+        let v: UInt64 = try readInt(&buf)
+        // The Rust code won't compile if a pointer won't fit in a UInt64.
+        // We have to go via `UInt` because that's the thing that's the size of a pointer.
+        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
+        if (ptr == nil) {
+            throw UniffiInternalError.unexpectedNullPointer
+        }
+        return try lift(ptr!)
+    }
+
+    public static func write(_ value: TestingCallbackCustody, into buf: inout [UInt8]) {
+        // This fiddling is because `Int` is the thing that's the same size as a pointer.
+        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
+        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTestingCallbackCustody_lift(_ pointer: UnsafeMutableRawPointer) throws -> TestingCallbackCustody {
+    return try FfiConverterTypeTestingCallbackCustody.lift(pointer)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTestingCallbackCustody_lower(_ value: TestingCallbackCustody) -> UnsafeMutableRawPointer {
+    return FfiConverterTypeTestingCallbackCustody.lower(value)
 }
 
 
@@ -15267,6 +15723,11 @@ public enum CustodyKeyType {
      * A P-256 ECDH key for HPKE.
      */
     case hpkeP256
+    /**
+     * A P-256 key-event key, which signs only key-event-log changes and
+     * custody probes (spec 09 §9.7.4.1, SCP-345).
+     */
+    case p256KeyEvent
 }
 
 
@@ -15290,6 +15751,8 @@ public struct FfiConverterTypeCustodyKeyType: FfiConverterRustBuffer {
         
         case 3: return .hpkeP256
         
+        case 4: return .p256KeyEvent
+        
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
@@ -15308,6 +15771,10 @@ public struct FfiConverterTypeCustodyKeyType: FfiConverterRustBuffer {
         
         case .hpkeP256:
             writeInt(&buf, Int32(3))
+        
+        
+        case .p256KeyEvent:
+            writeInt(&buf, Int32(4))
         
         }
     }
@@ -17543,18 +18010,15 @@ public protocol KeyCustodyProvider: AnyObject, Sendable {
      *
      * The bridge types the key by `key_type` alone and requires exactly that
      * type's length: 32 bytes (`"ed25519"`), the 33-byte
-     * compressed SEC1 point (P-256 signing), or the 65-byte uncompressed
-     * SEC1 point (HPKE P-256). A length that does not match the stated type,
+     * compressed SEC1 point (P-256 signing and key event), or the 65-byte
+     * uncompressed SEC1 point (HPKE P-256). A length that does not match the stated type,
      * or an invalid point, is an error, and the bridge binds nothing. The bridge asks this for every key id it has not yet
      * registered, whichever operation names it first.
      *
      * `role` is the role `generate_keypair` minted the key in, recorded by
-     * the host for the key's lifetime and reported across sessions. A key id
-     * the bridge has not seen binds as an identity only when `role` is
-     * [`CustodyKeyRole::Identity`], so an identity from an earlier session
-     * can still derive pseudonyms. The bridge cannot check the host's word:
-     * a host that reports an identity for a key it minted as operational
-     * lets that key derive pseudonyms, which is outside Rust's control.
+     * the host for the key's lifetime and reported across sessions. The
+     * bridge refuses an answer whose type or role disagrees with the record
+     * it wrote when it minted the key (ADR-021, SCP-345).
      */
     func getPublicKey(keyId: String) async throws  -> CustodyPublicKey
     
@@ -20309,6 +20773,70 @@ public func templateGetParams(templateId: String)throws  -> String  {
 })
 }
 /**
+ * The P-256 ECDH shared secret of `peer_scalar` and `host_public`.
+ *
+ * It is the 32-byte x-coordinate of the private scalar `peer_scalar` times
+ * the 65-byte uncompressed point `host_public`: the value a host's
+ * `dh_agree` must return when handed `peer_scalar`'s public point
+ * (RFC 9180 §7.1.1 `DH`).
+ *
+ * # Errors
+ *
+ * `SCP-VALID-7005` when `peer_scalar` is not a 32-byte scalar in
+ * `[1, n − 1]` or `host_public` is not a valid 65-byte uncompressed point.
+ */
+public func testingP256Ecdh(peerScalar: Data, hostPublic: Data)throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_func_testing_p256_ecdh(
+        FfiConverterData.lower(peerScalar),
+        FfiConverterData.lower(hostPublic),$0
+    )
+})
+}
+/**
+ * Whether `signature` is a §9.5.1 signature over the 32-byte `digest` under
+ * `public_key` (33- or 65-byte SEC1): exactly 64 bytes, low `s`, and a valid
+ * ECDSA equation with no second hash.
+ *
+ * # Errors
+ *
+ * `SCP-VALID-7005` when `public_key` is not a valid P-256 point or `digest`
+ * is not 32 bytes.
+ */
+public func testingP256VerifyStrict(publicKey: Data, digest: Data, signature: Data)throws  -> Bool  {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_func_testing_p256_verify_strict(
+        FfiConverterData.lower(publicKey),
+        FfiConverterData.lower(digest),
+        FfiConverterData.lower(signature),$0
+    )
+})
+}
+/**
+ * Makes `target` resolve DIDs through `source`'s DHT client.
+ *
+ * Two processes sharing the Mainline DHT resolve each other's DIDs; this
+ * gives two instances in one test process the same reach, so a Swift or
+ * Kotlin test can invite an identity of one instance from another.
+ *
+ * Call it after `source`'s first identity call, which creates its client,
+ * and before `target`'s first identity call: a resolver keeps the client it
+ * was given first.
+ *
+ * # Errors
+ *
+ * `SCP-VALID-7000` when `source` has made no identity call, so it has no
+ * DHT client to share, or when `target` already holds a different client,
+ * which its resolver would keep in place of `source`'s.
+ */
+public func testingShareDidResolver(source: Scp, target: Scp)throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_func_testing_share_did_resolver(
+        FfiConverterTypeScp_lower(source),
+        FfiConverterTypeScp_lower(target),$0
+    )
+}
+}
+/**
  * Queries a trust score for the given DID in the given context.
  *
  * Trust event counts are queried from the module-level helper (a
@@ -20513,6 +21041,15 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_template_get_params() != 28014) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_testing_p256_ecdh() != 58120) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_testing_p256_verify_strict() != 11979) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_testing_share_did_resolver() != 47411) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_trust_query_score() != 58685) {
@@ -20833,6 +21370,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_load() != 9295) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_load_with_custody() != 15063) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_migrate() != 35072) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -21106,6 +21646,27 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_validate() != 28821) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_method_testingcallbackcustody_custody_type() != 42533) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_testingcallbackcustody_destroy_key() != 53206) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_testingcallbackcustody_dh_agree() != 50852) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_testingcallbackcustody_generate_keypair() != 1434) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_testingcallbackcustody_public_key() != 64484) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_testingcallbackcustody_reopen() != 40072) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_testingcallbackcustody_sign() != 17590) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scp_ffi_uniffi_checksum_method_transportmanager_adapter_count() != 31835) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -21148,6 +21709,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_constructor_scp_with_storage() != 28869) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_constructor_testingcallbackcustody_new() != 20187) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scp_ffi_uniffi_checksum_method_deviceattestationprovider_attest() != 18976) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -21157,7 +21721,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_sign() != 25409) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_get_public_key() != 19655) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_get_public_key() != 10579) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_destroy_key() != 48628) {

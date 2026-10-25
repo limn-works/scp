@@ -117,6 +117,9 @@ scp-core = { path = "../../scp-core", features = ["testing"] }
 # non-testing feature list.
 scp-dht = { path = "../../scp-dht", features = ["testing"] }
 tempfile = "3"
+# The per-bridge key-event tests (SCP-345) sign Vector 41's change, which
+# `scp_testing::conformance::key_custody::v41_signing_change` builds.
+scp-testing = { path = "../../scp-testing" }
 # Provides weak C stubs for napi runtime symbols so the test binary
 # can link without a Node.js runtime. Kept as a dev-dependency so
 # the cdylib build NEVER sees these stubs (if they leaked into the

@@ -281,6 +281,10 @@ const KEY_TYPE_P256_SIGNING: u8 = 0x03;
 /// Key type byte for a P-256 HPKE key ([`KeyType::HpkeP256`]).
 const KEY_TYPE_P256_HPKE: u8 = 0x04;
 
+/// Key type byte for a P-256 key-event key ([`KeyType::P256KeyEvent`];
+/// §17.8, SCP-345).
+const KEY_TYPE_P256_KEY_EVENT: u8 = 0x05;
+
 // ---------------------------------------------------------------------------
 // Internal types
 // ---------------------------------------------------------------------------
@@ -291,6 +295,7 @@ enum StoredKeyType {
     Ed25519,
     P256Signing,
     HpkeP256,
+    P256KeyEvent,
 }
 
 impl StoredKeyType {
@@ -299,6 +304,7 @@ impl StoredKeyType {
             Self::Ed25519 => KEY_TYPE_ED25519,
             Self::P256Signing => KEY_TYPE_P256_SIGNING,
             Self::HpkeP256 => KEY_TYPE_P256_HPKE,
+            Self::P256KeyEvent => KEY_TYPE_P256_KEY_EVENT,
         }
     }
 
@@ -307,6 +313,7 @@ impl StoredKeyType {
             KeyType::Ed25519 => Self::Ed25519,
             KeyType::P256Signing => Self::P256Signing,
             KeyType::HpkeP256 => Self::HpkeP256,
+            KeyType::P256KeyEvent => Self::P256KeyEvent,
         }
     }
 
@@ -317,6 +324,7 @@ impl StoredKeyType {
             Self::Ed25519 => KeyType::Ed25519,
             Self::P256Signing => KeyType::P256Signing,
             Self::HpkeP256 => KeyType::HpkeP256,
+            Self::P256KeyEvent => KeyType::P256KeyEvent,
         }
     }
 
@@ -325,6 +333,7 @@ impl StoredKeyType {
             KEY_TYPE_ED25519 => Ok(Self::Ed25519),
             KEY_TYPE_P256_SIGNING => Ok(Self::P256Signing),
             KEY_TYPE_P256_HPKE => Ok(Self::HpkeP256),
+            KEY_TYPE_P256_KEY_EVENT => Ok(Self::P256KeyEvent),
             _ => Err(PlatformError::CustodyError(format!(
                 "unknown key type byte: {b:#04x}"
             ))),
@@ -1509,6 +1518,10 @@ impl FileKeyCustody {
                 KeyType::HpkeP256,
                 crate::traits::p256_key_from_stored(&key_bytes)?,
             ),
+            StoredKeyType::P256KeyEvent => LoadedKey::P256(
+                KeyType::P256KeyEvent,
+                crate::traits::p256_key_from_stored(&key_bytes)?,
+            ),
         })
     }
 
@@ -1520,7 +1533,7 @@ impl FileKeyCustody {
                 rand::rngs::OsRng.fill_bytes(key_bytes.as_mut());
                 key_bytes
             }
-            KeyType::P256Signing | KeyType::HpkeP256 => {
+            KeyType::P256Signing | KeyType::HpkeP256 | KeyType::P256KeyEvent => {
                 crate::traits::generate_p256_os_rng()?.to_scalar_bytes()
             }
         };
@@ -1555,7 +1568,8 @@ use scp_crypto::pseudonym::{PseudonymVersion, derive_pseudonym};
 /// drop, and `P256SecretKey` zeroizes its scalar on drop.
 enum LoadedKey {
     Ed25519(Zeroizing<[u8; KEY_LEN]>),
-    /// A P-256 key and its public type (`P256Signing` or `HpkeP256`).
+    /// A P-256 key and its public type (`P256Signing`, `HpkeP256` or
+    /// `P256KeyEvent`).
     P256(KeyType, P256SecretKey),
 }
 
@@ -1573,6 +1587,49 @@ const fn wrong_type(actual: KeyType, expected: KeyType) -> PlatformError {
     PlatformError::WrongKeyType { expected, actual }
 }
 
+impl FileKeyCustody {
+    /// Signs `digest` with the stored scalar of the key-event key under
+    /// `key_id`, giving the raw form; any other key type is `WrongKeyType`.
+    async fn sign_key_event(
+        &self,
+        key_id: u64,
+        digest: &[u8; 32],
+    ) -> Result<[u8; 64], PlatformError> {
+        match self.load_key(key_id).await? {
+            LoadedKey::P256(KeyType::P256KeyEvent, key) => {
+                crate::traits::sign_key_event_digest(&key, digest)
+            }
+            other => Err(wrong_type(other.key_type(), KeyType::P256KeyEvent)),
+        }
+    }
+}
+
+impl scp_kel::KeyEventSigner for FileKeyCustody {
+    type Member = KeyHandle;
+
+    /// Signs the change's digest `D` with a key-event key (the raw arm).
+    async fn sign_change(
+        &self,
+        member: &KeyHandle,
+        change: &scp_kel::SigningChange,
+    ) -> Result<scp_kel::IndexedSignature, scp_kel::KeyEventSignError> {
+        let signature = self.sign_key_event(member.id(), &change.digest()).await?;
+        Ok(scp_kel::IndexedSignature::Raw { signature })
+    }
+
+    /// Signs the probe's raw digest with a key-event key.
+    async fn sign_probe(
+        &self,
+        member: &KeyHandle,
+        probe: &scp_kel::CustodyProbe,
+    ) -> Result<scp_kel::ProbeSignature, scp_kel::KeyEventSignError> {
+        let signature = self
+            .sign_key_event(member.id(), &probe.raw_digest())
+            .await?;
+        Ok(scp_kel::ProbeSignature::raw(signature))
+    }
+}
+
 // Trait uses RPITIT with explicit `+ Send` bound; async fn in trait
 // does not guarantee Send futures, so manual impl Future is required.
 #[allow(clippy::manual_async_fn)]
@@ -1581,7 +1638,16 @@ impl KeyCustody for FileKeyCustody {
         &self,
         key_type: KeyType,
     ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send {
-        self.generate(key_type, KeyRole::Operational)
+        async move {
+            crate::traits::refuse_key_event_mint(key_type)?;
+            self.generate(key_type, KeyRole::Operational).await
+        }
+    }
+
+    fn generate_key_event_keypair(
+        &self,
+    ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send {
+        self.generate(KeyType::P256KeyEvent, KeyRole::Operational)
     }
 
     fn generate_identity_keypair(
@@ -3765,6 +3831,41 @@ mod tests {
         }
     }
 
+    /// A key-event entry whose stored type byte is rewritten to P-256 signing
+    /// (`0x05` → `0x03`), with the file HMAC re-sealed, fails its AEAD check
+    /// after a reopen, so the key never becomes a raw signer (§17.8; SCP-345).
+    /// An `entry_aad` that omits the type byte lets `sign` here return a
+    /// signature under the key-event key.
+    #[tokio::test]
+    async fn key_event_type_byte_flip_fails_decryption() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("keys.scp");
+
+        let custody = FileKeyCustody::new(&path, "pw").unwrap();
+        let handle = custody.generate_key_event_keypair().await.unwrap();
+
+        let mut data = custody.read_file().unwrap();
+        assert_eq!(data[HEADER_SIZE], KEY_TYPE_P256_KEY_EVENT);
+        data[HEADER_SIZE] = KEY_TYPE_P256_SIGNING;
+        seal_file_mac(&custody.mac_key, &mut data).unwrap();
+        atomic_write(&path, &data).unwrap();
+        drop(custody);
+
+        let reopened = FileKeyCustody::new(&path, "pw")
+            .expect("a re-sealed file passes its HMAC check, so the reopen succeeds");
+        let error = reopened
+            .sign(&handle, &[0u8; 32])
+            .await
+            .expect_err("a key-event key relabelled P-256 signing must not sign");
+        match error {
+            PlatformError::CustodyError(msg) => assert!(
+                msg.contains("decryption failed"),
+                "the AEAD must reject the relabelled entry: {msg}"
+            ),
+            other => panic!("expected the AEAD's CustodyError, got {other:?}"),
+        }
+    }
+
     /// A writer who moves one entry's ciphertext behind another entry's
     /// identifier, and re-seals the file HMAC under the passphrase-derived MAC
     /// key, produces entries the AEAD rejects.
@@ -4110,6 +4211,7 @@ mod tests {
             StoredKeyType::Ed25519,
             StoredKeyType::P256Signing,
             StoredKeyType::HpkeP256,
+            StoredKeyType::P256KeyEvent,
         ] {
             for role in [KeyRole::Operational, KeyRole::Identity] {
                 for index in 0..64u8 {
@@ -4121,7 +4223,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(seen.len(), 3 * 2 * 64);
+        assert_eq!(seen.len(), 4 * 2 * 64);
     }
 
     /// `generate_unique_entry_id` never returns an identifier the file already

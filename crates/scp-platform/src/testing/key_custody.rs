@@ -12,10 +12,15 @@ use rand::{CryptoRng, RngCore, SeedableRng};
 use tokio::sync::Mutex;
 use zeroize::Zeroizing;
 
+use scp_kel::{
+    CustodyProbe, IndexedSignature, KeyEventSignError, KeyEventSigner, ProbeSignature,
+    SigningChange,
+};
+
 use crate::error::PlatformError;
 use crate::traits::{
     CustodyType, KeyCustody, KeyHandle, KeyRole, KeyType, Pseudonym, PublicKey, SharedSecret,
-    Signature,
+    Signature, refuse_key_event_mint, sign_key_event_digest,
 };
 
 /// The error for using a key of type `actual` where `expected` is required.
@@ -77,6 +82,17 @@ impl KeyStore {
             .get(&key_id)
             .ok_or(PlatformError::KeyNotFound)?;
         Ok(Zeroizing::new(signing_key.to_bytes()))
+    }
+
+    /// Signs `digest` with the key-event key under `key_id`, giving the raw
+    /// form. Any other key type is `WrongKeyType`; an unknown or destroyed
+    /// handle is `MemberNotFound`.
+    fn sign_key_event(&self, key_id: u64, digest: &[u8; 32]) -> Result<[u8; 64], PlatformError> {
+        let key_type = self.lookup_type(KeyHandle::new(key_id))?;
+        if key_type != KeyType::P256KeyEvent {
+            return Err(wrong_type(key_type, KeyType::P256KeyEvent));
+        }
+        sign_key_event_digest(self.p256_key(key_id)?, digest)
     }
 
     /// The generated P-256 key behind `key_id`.
@@ -229,7 +245,7 @@ impl InMemoryKeyCustody {
                 let signing_key = SigningKey::from_bytes(&key_bytes);
                 store.ed25519_keys.insert(handle.id(), signing_key);
             }
-            KeyType::P256Signing | KeyType::HpkeP256 => {
+            KeyType::P256Signing | KeyType::HpkeP256 | KeyType::P256KeyEvent => {
                 let key = P256SecretKey::from_scalar_bytes(&key_bytes).map_err(|e| {
                     PlatformError::CustodyError(format!(
                         "RNG draw is not a valid P-256 scalar: {e}"
@@ -262,7 +278,16 @@ impl KeyCustody for InMemoryKeyCustody {
         &self,
         key_type: KeyType,
     ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send {
-        self.generate(key_type, KeyRole::Operational)
+        async move {
+            refuse_key_event_mint(key_type)?;
+            self.generate(key_type, KeyRole::Operational).await
+        }
+    }
+
+    fn generate_key_event_keypair(
+        &self,
+    ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send {
+        self.generate(KeyType::P256KeyEvent, KeyRole::Operational)
     }
 
     fn generate_identity_keypair(
@@ -286,7 +311,9 @@ impl KeyCustody for InMemoryKeyCustody {
                 KeyType::P256Signing => {
                     return crate::traits::sign_p256_digest(store.p256_key(key_id)?, data);
                 }
-                KeyType::HpkeP256 => return Err(wrong_type(key_type, KeyType::P256Signing)),
+                KeyType::HpkeP256 | KeyType::P256KeyEvent => {
+                    return Err(wrong_type(key_type, KeyType::P256Signing));
+                }
             }
 
             let signing_key = store
@@ -318,7 +345,7 @@ impl KeyCustody for InMemoryKeyCustody {
                     let verifying_key: VerifyingKey = signing_key.verifying_key();
                     Ok(PublicKey::new(verifying_key.to_bytes().to_vec()))
                 }
-                KeyType::P256Signing => Ok(PublicKey::new(
+                KeyType::P256Signing | KeyType::P256KeyEvent => Ok(PublicKey::new(
                     store
                         .p256_key(key_id)?
                         .public_key()
@@ -350,7 +377,7 @@ impl KeyCustody for InMemoryKeyCustody {
                 KeyType::Ed25519 => {
                     store.ed25519_keys.remove(&key_id);
                 }
-                KeyType::P256Signing | KeyType::HpkeP256 => {
+                KeyType::P256Signing | KeyType::HpkeP256 | KeyType::P256KeyEvent => {
                     store.p256_keys.remove(&key_id);
                 }
             }
@@ -376,7 +403,7 @@ impl KeyCustody for InMemoryKeyCustody {
                 KeyType::HpkeP256 => {
                     crate::traits::p256_dh_agree(store.p256_key(key_id)?, &peer_public)
                 }
-                KeyType::Ed25519 | KeyType::P256Signing => {
+                KeyType::Ed25519 | KeyType::P256Signing | KeyType::P256KeyEvent => {
                     Err(wrong_type(key_type, KeyType::HpkeP256))
                 }
             }
@@ -461,6 +488,38 @@ impl KeyCustody for InMemoryKeyCustody {
             self.rng.lock().await.fill_bytes(seed.as_mut());
             Ok(seed)
         }
+    }
+}
+
+impl KeyEventSigner for InMemoryKeyCustody {
+    type Member = KeyHandle;
+
+    /// Signs the change's digest `D` with a key-event key (the raw arm).
+    async fn sign_change(
+        &self,
+        member: &KeyHandle,
+        change: &SigningChange,
+    ) -> Result<IndexedSignature, KeyEventSignError> {
+        let signature = self
+            .store
+            .lock()
+            .await
+            .sign_key_event(member.id(), &change.digest())?;
+        Ok(IndexedSignature::Raw { signature })
+    }
+
+    /// Signs the probe's raw digest with a key-event key.
+    async fn sign_probe(
+        &self,
+        member: &KeyHandle,
+        probe: &CustodyProbe,
+    ) -> Result<ProbeSignature, KeyEventSignError> {
+        let signature = self
+            .store
+            .lock()
+            .await
+            .sign_key_event(member.id(), &probe.raw_digest())?;
+        Ok(ProbeSignature::raw(signature))
     }
 }
 

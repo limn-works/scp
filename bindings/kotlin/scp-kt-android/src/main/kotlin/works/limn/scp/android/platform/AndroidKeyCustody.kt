@@ -223,6 +223,7 @@ class AndroidKeyCustody private constructor(
             ?: throw ScpException("No free key id after $MINT_ATTEMPTS draws", CUSTODY_ERROR)
         when (keyType) {
             KeyType.P256 -> p256.mint(keyId, KeyType.P256, Backing.KEYSTORE, role)
+            KeyType.P256_KEY_EVENT -> p256.mint(keyId, KeyType.P256_KEY_EVENT, Backing.KEYSTORE, role)
             KeyType.HPKE_P256 ->
                 p256.mint(keyId, KeyType.HPKE_P256, if (keystoreAgreement) Backing.KEYSTORE else Backing.SOFTWARE, role)
             KeyType.ED25519 -> keyRoles.mint(keyId, role, persist = true) {
@@ -630,7 +631,7 @@ private fun Map<String, KeyType>.requireEd25519Identity(keyHandle: KeyHandle, op
     if (keyHandle.custodyType != CustodyType.SOFTWARE) return
     when (val type = this[keyHandle.id]) {
         KeyType.ED25519, null -> Unit
-        KeyType.P256, KeyType.HPKE_P256 -> throw ScpException(
+        KeyType.P256, KeyType.HPKE_P256, KeyType.P256_KEY_EVENT -> throw ScpException(
             "$operation requires an Ed25519 key; handle '${keyHandle.id}' is $type",
             CUSTODY_ERROR,
         )
@@ -736,7 +737,7 @@ internal class SoftwareKeyOps(
             ?: throw ScpException("Key not found: ${keyHandle.id}", KEY_NOT_FOUND)
         when (val type = softwareKeyTypes[keyHandle.id]) {
             KeyType.ED25519 -> Unit
-            KeyType.P256, KeyType.HPKE_P256, null ->
+            KeyType.P256, KeyType.HPKE_P256, KeyType.P256_KEY_EVENT, null ->
                 throw ScpException("sign requires an Ed25519 key; handle '${keyHandle.id}' is $type", CUSTODY_ERROR)
         }
         val signer = Ed25519Signer()
@@ -769,7 +770,7 @@ internal class SoftwareKeyOps(
             ?: throw ScpException("Key not found: ${keyHandle.id}", KEY_NOT_FOUND)
         return when (val type = softwareKeyTypes[keyHandle.id]) {
             KeyType.ED25519 -> (keyPair.public as Ed25519PublicKeyParameters).encoded
-            KeyType.P256, KeyType.HPKE_P256, null ->
+            KeyType.P256, KeyType.HPKE_P256, KeyType.P256_KEY_EVENT, null ->
                 throw ScpException("Software key '${keyHandle.id}' has type $type", CUSTODY_ERROR)
         }
     }

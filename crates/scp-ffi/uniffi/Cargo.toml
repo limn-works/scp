@@ -115,6 +115,9 @@ rustix = { version = "1.1.4", default-features = false, features = ["std", "net"
 libc = "0.2"
 
 [dev-dependencies]
+# The per-bridge key-event tests (SCP-345) sign Vector 41's change, which
+# `scp_testing::conformance::key_custody::v41_signing_change` builds.
+scp-testing = { path = "../../scp-testing" }
 # The MCP subscription tests build a wired server with
 # `McpServer::with_event_source`, public only under `scp-mcp/testing`.
 scp-mcp = { path = "../../scp-mcp", features = ["testing"] }

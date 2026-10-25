@@ -123,9 +123,10 @@ __all__ = [
 ]
 
 
-CustodyKeyType = Literal["ed25519", "p256", "hpke-p256"]
-"""The type of a custody key: Ed25519, ``"p256"`` (ECDSA P-256 signing) or
-``"hpke-p256"`` (P-256 ECDH for HPKE)."""
+CustodyKeyType = Literal["ed25519", "p256", "hpke-p256", "p256-key-event"]
+"""The type of a custody key: Ed25519, ``"p256"`` (ECDSA P-256 signing),
+``"hpke-p256"`` (P-256 ECDH for HPKE) or ``"p256-key-event"`` (ECDSA P-256
+that signs only key-event-log changes and custody probes, spec §9.7.4.1)."""
 
 CustodyKeyRole = Literal["identity", "operational"]
 """The role a custody key was minted in: ``"identity"`` (the only source a
@@ -213,8 +214,9 @@ class KeyCustodyProvider(Protocol):
     def sign(self, key_id: str, message: bytes) -> bytes:
         """Sign ``message`` under ``key_id``.
 
-        An Ed25519 key returns the 64-byte signature. A ``"p256"`` key
-        receives a 32-byte digest (§9.5.1, no second hash) and returns raw
+        An Ed25519 key returns the 64-byte signature. A ``"p256"`` or
+        ``"p256-key-event"`` key receives a 32-byte digest (§9.5.1, no second
+        hash) and returns raw
         ``r || s`` (64 bytes) or DER; the bridge normalises it to low-s and
         verifies it strictly against the key's public key, and any mismatch
         is an error. A software implementation MUST derive the ECDSA nonce by
@@ -227,21 +229,20 @@ class KeyCustodyProvider(Protocol):
 
         ``public_key`` is 32
         bytes for Ed25519, the 33-byte compressed SEC1 point for
-        ``"p256"``, and the 65-byte uncompressed SEC1 point for
-        ``"hpke-p256"``. The bridge registers the key under the stated type
-        and rejects a length that does not match it. A provider that holds no
+        ``"p256"`` and ``"p256-key-event"``, and the 65-byte uncompressed
+        SEC1 point for ``"hpke-p256"``. The bridge rejects a length that does
+        not match the stated type. A provider that holds no
         key for ``key_id`` raises :class:`~scp_sdk.errors.KeyNotFoundError`
         (or any exception whose ``code`` is ``"SCP-CRYPTO-4006"``), which
         callers receive as key-not-found; any other exception is a custody
         error.
 
         ``role`` is the role :meth:`generate_keypair` minted the key in,
-        reported in every session. A key id the bridge has not seen binds as
-        an identity only when ``role`` is ``"identity"``, so an identity from
-        an earlier session can still derive pseudonyms. The bridge cannot
-        check this answer: a provider that reports ``"identity"`` for a key
-        it minted as ``"operational"`` lets that key derive pseudonyms, and
-        that is outside the Rust core's control.
+        reported in every session. The bridge records each key's type and
+        role when it mints the key, in the instance storage, and refuses an
+        answer that disagrees with that record, in this session or in a later
+        one that loads the identity with :meth:`SCP.identity_load_with_custody`.
+        A key id with no record is key-not-found, with no callback.
         """
         ...
 
@@ -643,11 +644,12 @@ _R = TypeVar("_R")
 
 def _requires_custody(
     remedy: str,
+    position: int = 1,
 ) -> Callable[[Callable[_P, Awaitable[_R]]], Callable[_P, Awaitable[_R]]]:
     """Raise ``SCP-IDENT-1116`` when the caller passes no custody, before ``fn`` runs.
 
-    ``fn`` is a method whose second parameter names the custody, and
-    ``remedy`` tells the caller what to pass there. The wrapper keeps
+    ``fn`` is a method whose parameter at ``position`` (``self`` is 0) names
+    the custody, and ``remedy`` tells the caller what to pass there. The wrapper keeps
     ``fn``'s signature for a type checker, which rejects the omission; an
     untyped caller that omits the custody or passes ``None`` reaches the
     wrapper and gets ``SCP-IDENT-1116`` instead of Python's ``TypeError``,
@@ -655,11 +657,11 @@ def _requires_custody(
     """
 
     def decorate(fn: Callable[_P, Awaitable[_R]]) -> Callable[_P, Awaitable[_R]]:
-        custody_param = fn.__code__.co_varnames[1]
+        custody_param = fn.__code__.co_varnames[position]
 
         @functools.wraps(fn)
         async def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
-            custody = args[1] if len(args) > 1 else kwargs.get(custody_param)
+            custody = args[position] if len(args) > position else kwargs.get(custody_param)
             if custody is None:
                 raise _custody_required_error(fn.__name__, remedy)
             return await fn(*args, **kwargs)
@@ -1201,9 +1203,46 @@ class SCP:
         return [IdentityAttestation._from_dict(item) for item in items]
 
     async def identity_load(self, did: str) -> Identity:
-        """Delegate to ``_scp_core.SCP.identity_load`` (returns :class:`Identity`)."""
+        """Delegate to ``_scp_core.SCP.identity_load`` (returns :class:`Identity`).
+
+        An identity created with :meth:`identity_create_with_custody` loads
+        only through :meth:`identity_load_with_custody`, which takes its
+        provider.
+
+        :raises IdentityError: ``SCP-IDENT-1003`` when ``did`` was created with
+            a :class:`KeyCustodyProvider` on this instance's storage (spec
+            section 17.3).
+        """
 
         raw = await asyncio.to_thread(self._native.identity_load, did)
+        return Identity(raw)
+
+    @_requires_custody(_CUSTODY_PROVIDER_REMEDY, position=2)
+    async def identity_load_with_custody(self, did: str, provider: KeyCustodyProvider) -> Identity:
+        """Load an identity created with :meth:`identity_create_with_custody`.
+
+        Delegate to ``_scp_core.SCP.identity_load_with_custody``. The identity
+        was created on this instance's storage, in this process or an earlier
+        one, and ``provider`` is the same host custody; the identity's keys,
+        including keys its custody minted earlier, sign through it (spec
+        section 17.3).
+
+        :param did: The identity's DID.
+        :param provider: The :class:`KeyCustodyProvider` that created it.
+        :returns: An :class:`Identity` wrapper.
+        :raises IdentityError: ``SCP-IDENT-1116`` when ``provider`` is absent
+            or ``None``, before any bridge call; ``SCP-IDENT-1002`` when the
+            storage holds no entry for ``did``; ``SCP-IDENT-1009`` when the
+            entry does not decode or names another DID; ``SCP-IDENT-1008``
+            while this instance already holds the identity loaded, or when
+            ``provider``'s identity key does not derive ``did``.
+        :raises ValidationError: ``SCP-VALID-7005`` when ``provider`` is
+            missing a method.
+        :raises ContextError: ``SCP-STORAGE-8000`` when this instance's
+            storage does not persist (``{"type": "in_memory"}``).
+        """
+
+        raw = await asyncio.to_thread(self._native.identity_load_with_custody, did, provider)
         return Identity(raw)
 
     async def identity_migrate(self, identity: Identity) -> Identity:

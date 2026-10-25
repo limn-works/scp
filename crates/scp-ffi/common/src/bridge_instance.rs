@@ -945,6 +945,16 @@ pub struct CoreFields {
     /// [`handle_wake`](crate::push::handle_wake) on this instance runs
     /// through it, so overlapping wakes share one pull.
     wake_flight: crate::push::WakeFlight,
+    /// The custody namespaces the live callback custody adapters of this
+    /// instance hold (spec §17.3). Every adapter's records open through it,
+    /// so a second load of one callback identity while the first adapter
+    /// lives is refused.
+    #[cfg(feature = "custody")]
+    custody_namespaces: crate::custody_namespace::CustodyNamespaces,
+    /// One update at a time per identity on this instance (spec §17.3):
+    /// every operation that changes an identity's keys or document holds its
+    /// DID's slot from its read through its install.
+    identity_updates: crate::identity_update::IdentityUpdates,
 }
 
 impl Default for CoreFields {
@@ -954,6 +964,20 @@ impl Default for CoreFields {
 }
 
 impl CoreFields {
+    /// The table of custody namespaces this instance's live callback custody
+    /// adapters hold (spec §17.3).
+    #[cfg(feature = "custody")]
+    #[must_use]
+    pub const fn custody_namespaces(&self) -> &crate::custody_namespace::CustodyNamespaces {
+        &self.custody_namespaces
+    }
+
+    /// The per-DID update slots of this instance's identities (spec §17.3).
+    #[must_use]
+    pub const fn identity_updates(&self) -> &crate::identity_update::IdentityUpdates {
+        &self.identity_updates
+    }
+
     /// Creates a new `CoreFields` without a `Supervisor`.
     ///
     /// Initializes all shared state registries (transport, known contexts,
@@ -1009,6 +1033,9 @@ impl CoreFields {
             node_binding: Mutex::new(None),
             stream_registration_closed: Arc::new(AtomicBool::new(false)),
             wake_flight: crate::push::WakeFlight::default(),
+            #[cfg(feature = "custody")]
+            custody_namespaces: crate::custody_namespace::CustodyNamespaces::new(),
+            identity_updates: crate::identity_update::IdentityUpdates::new(),
         }
     }
 
@@ -1106,6 +1133,9 @@ impl CoreFields {
             node_binding: Mutex::new(None),
             stream_registration_closed: Arc::new(AtomicBool::new(false)),
             wake_flight: crate::push::WakeFlight::default(),
+            #[cfg(feature = "custody")]
+            custody_namespaces: crate::custody_namespace::CustodyNamespaces::new(),
+            identity_updates: crate::identity_update::IdentityUpdates::new(),
         }
     }
 

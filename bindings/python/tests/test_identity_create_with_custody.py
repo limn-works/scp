@@ -21,6 +21,7 @@ Requires the native extension built with ``testing``::
 from __future__ import annotations
 
 import hashlib
+import json
 from typing import Literal
 
 import pytest
@@ -35,6 +36,15 @@ from scp_sdk import (
     p256_software_pseudonym_point,
 )
 from scp_sdk.errors import KeyNotFoundError
+from tests.conftest import open_sqlite_scp
+
+
+@pytest.fixture
+def scp(sqlite_scp):  # type: ignore[no-untyped-def]
+    """This module's instance persists: callback custody refuses storage that
+    does not persist (spec section 17.3)."""
+    return sqlite_scp
+
 
 # ---------------------------------------------------------------------------
 # Minimal pure-Python Ed25519 (RFC 8032) — stdlib only.
@@ -428,6 +438,43 @@ async def test_host_reporting_the_retired_x25519_key_type_fails_with_4060(scp) -
     assert 'unknown key type "x25519"' in message, message
 
 
+def test_custody_key_type_names_the_four_types_the_bridge_parses() -> None:
+    """``CustodyKeyType`` names exactly the host key types the bridge parses,
+    the key-event type of spec 09 §9.7.4.1 (SCP-345) among them."""
+    import typing
+
+    assert set(typing.get_args(CustodyKeyType)) == {
+        "ed25519",
+        "p256",
+        "hpke-p256",
+        "p256-key-event",
+    }
+
+
+@pytest.mark.asyncio
+async def test_host_reporting_its_identity_key_as_a_key_event_key_fails_with_4060(scp) -> None:
+    """A host whose ``get_public_key`` reports ``"p256-key-event"`` for the
+    Ed25519 identity key it was asked to mint fails the operation with
+    ``SCP-CRYPTO-4060``: the bridge parses the key-event type and refuses an
+    answer whose type disagrees with the key it requested and recorded."""
+    from scp_sdk import _scp_core
+
+    class _ReportsKeyEvent(_FakeKeychain):
+        def get_public_key(self, key_id: str) -> CustodyPublicKey:
+            real = super().get_public_key(key_id)
+            if real.key_type != "ed25519":
+                return real
+            return CustodyPublicKey(
+                key_type="p256-key-event", public_key=real.public_key, role=real.role
+            )
+
+    with pytest.raises(_scp_core.ScpError) as excinfo:
+        await scp.identity_create_with_custody(_ReportsKeyEvent())
+    message = str(excinfo.value)
+    assert message.startswith("[SCP-CRYPTO-4060]"), message
+    assert "unknown key type" not in message, message
+
+
 @pytest.mark.asyncio
 async def test_key_not_found_error_from_the_host_reaches_the_caller_as_4006(scp) -> None:
     """A host that raises :class:`KeyNotFoundError` for a key id it does not
@@ -442,3 +489,133 @@ async def test_key_not_found_error_from_the_host_reaches_the_caller_as_4006(scp)
     with pytest.raises(_scp_core.ScpError) as excinfo:
         await scp.identity_create_with_custody(_ForgetsEveryKey())
     assert str(excinfo.value).startswith("[SCP-CRYPTO-4006]"), excinfo.value
+
+
+# ---------------------------------------------------------------------------
+# identity_load_with_custody (spec section 17.3, SCP-345 decision D1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_new_instance_loads_the_identity_and_signs_with_its_earlier_key(
+    tmp_path,  # type: ignore[no-untyped-def]
+) -> None:
+    """The identity's custody entry carries its namespace, so a new instance
+    over the same directory reaches the keys the earlier one minted."""
+    from scp_sdk import _scp_core
+
+    class _CountingKeychain(_FakeKeychain):
+        def __init__(self) -> None:
+            super().__init__()
+            self.sign_calls = 0
+
+        def sign(self, key_id: str, message: bytes) -> bytes:
+            self.sign_calls += 1
+            return super().sign(key_id, message)
+
+    provider = _CountingKeychain()
+    first = open_sqlite_scp(tmp_path)
+    try:
+        did = (await first.identity_create_with_custody(provider)).did
+    finally:
+        first.__exit__(None, None, None)
+
+    second = open_sqlite_scp(tmp_path)
+    try:
+        with pytest.raises(_scp_core.ScpError) as plain:
+            await second.identity_load(did)
+        assert "SCP-IDENT-1003" in str(plain.value), plain.value
+
+        loaded = await second.identity_load_with_custody(did, provider)
+        assert loaded.did == did
+        assert loaded.custody_type is CustodyType.OS_KEYSTORE
+
+        # The identity key was minted by the first instance; its record lives
+        # under the stored namespace, so the loaded adapter resolves it, and
+        # the proposal signs through `provider`.
+        ctx = await second.context_create(
+            did,
+            {
+                "ceiling": ["governance:propose", "member:ban", "messages:read", "messages:write"],
+                "memory_scope": "ephemeral",
+                "governance": "single_admin",
+            },
+        )
+        signs_before = provider.sign_calls
+        response = await second.governance_propose(
+            ctx,
+            did,
+            json.dumps({"SuspendCapability": {"did": did, "capabilities": ["MessagesWrite"]}}),
+        )
+        status = json.loads(response) if isinstance(response, str) else dict(response)
+        assert status["status"] == "Approved", status
+        assert provider.sign_calls > signs_before
+
+        with pytest.raises(_scp_core.ScpError) as again:
+            await second.identity_load_with_custody(did, provider)
+        assert "SCP-IDENT-1008" in str(again.value), again.value
+    finally:
+        second.__exit__(None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_a_reload_after_rotation_and_an_agent_key_carries_the_changed_keys(
+    tmp_path,  # type: ignore[no-untyped-def]
+) -> None:
+    """Every operation that changes a callback custody identity rewrites its
+    stored entry (spec section 17.3). A new instance loads the identity with
+    the document a rotation alone published, and, after an agent key's
+    addition to the loaded identity, a third instance loads that agent key
+    and its document, never the ones an earlier write stored."""
+    provider = _FakeKeychain()
+    first = open_sqlite_scp(tmp_path)
+    try:
+        created = await first.identity_create_with_custody(provider)
+        created_document = await first.identity_resolve(created.did)
+        rotated = await first.identity_rotate_key(created)
+        rotated_document = await first.identity_resolve(rotated.did)
+        assert rotated_document != created_document
+        did = rotated.did
+        del created, rotated
+    finally:
+        first.__exit__(None, None, None)
+
+    second = open_sqlite_scp(tmp_path)
+    try:
+        loaded = await second.identity_load_with_custody(did, provider)
+        assert await second.identity_resolve(did) == rotated_document
+        changed = await second.identity_add_agent_key(loaded)
+        assert changed._raw_handle.has_agent_key
+        agent_key = changed._raw_handle.get_agent_public_key()
+        changed_document = await second.identity_resolve(did)
+        assert changed_document != rotated_document
+        del loaded, changed
+    finally:
+        second.__exit__(None, None, None)
+
+    third = open_sqlite_scp(tmp_path)
+    try:
+        reloaded = await third.identity_load_with_custody(did, provider)
+        assert reloaded._raw_handle.has_agent_key
+        assert reloaded._raw_handle.get_agent_public_key() == agent_key
+        assert await third.identity_resolve(did) == changed_document
+    finally:
+        third.__exit__(None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_in_memory_storage_refuses_a_callback_custody_create_and_load_with_storage_8000(
+    in_memory_scp,  # type: ignore[no-untyped-def]
+) -> None:
+    from scp_sdk import _scp_core
+
+    provider = _FakeKeychain()
+    with pytest.raises(_scp_core.ScpError) as created:
+        await in_memory_scp.identity_create_with_custody(provider)
+    assert "SCP-STORAGE-8000" in str(created.value), created.value
+
+    with pytest.raises(_scp_core.ScpError) as loaded:
+        await in_memory_scp.identity_load_with_custody(
+            "did:dht:ab3ii3ef4mbcu5rmhkbf5yctwnodzx6a65ghazmtu1ydzhfzezby", provider
+        )
+    assert "SCP-STORAGE-8000" in str(loaded.value), loaded.value

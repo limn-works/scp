@@ -36,3 +36,40 @@ func createInMemoryIdentity(_ scp: SCP, seed: Data? = nil) async throws -> Ident
 func createInMemoryIdentityWithAgentKey(_ scp: SCP) async throws -> Identity {
     try await scp.inner.identityCreateWithAgentKey(custody: harnessInMemoryCustody)
 }
+
+/// The `SQLCipher` key every ``persistentTestScp(at:)`` instance opens with.
+let persistentTestKey = Data(repeating: 0x5C, count: 32)
+
+/// A fresh directory for a SQLite-backed test instance. Callback custody
+/// refuses storage that does not persist (spec section 17.3), so a test that
+/// creates an identity with a `KeyCustodyProvider` runs on one. The caller
+/// removes it.
+func persistentTestDirectory() throws -> URL {
+    let dir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("scp-callback-custody-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    return dir
+}
+
+/// An instance over `SQLCipher` storage in `dir`.
+func persistentTestScp(at dir: URL) throws -> SCP {
+    try SCP.withStorage(sqliteDir: dir, key: persistentTestKey)
+}
+
+/// The code of the `ScpError` `body` threw, or a description of whatever
+/// else happened.
+func scpErrorCode(_ body: () async throws -> Void) async -> String {
+    do {
+        try await body()
+        return "no error"
+    } catch let error as ScpError {
+        switch error {
+        case let .Identity(_, code), let .Storage(_, code):
+            return code
+        default:
+            return "other ScpError: \(error)"
+        }
+    } catch {
+        return "non-ScpError: \(error)"
+    }
+}

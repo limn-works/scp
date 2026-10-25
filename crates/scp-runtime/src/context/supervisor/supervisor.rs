@@ -32012,7 +32012,36 @@ mod tests {
         }
     }
 
+    impl scp_platform::KeyEventSigner for LockCheckingCustody {
+        type Member = scp_platform::KeyHandle;
+
+        async fn sign_change(
+            &self,
+            member: &scp_platform::KeyHandle,
+            change: &scp_platform::SigningChange,
+        ) -> Result<scp_platform::IndexedSignature, scp_platform::KeyEventSignError> {
+            self.check("sign_change");
+            self.inner.sign_change(member, change).await
+        }
+
+        async fn sign_probe(
+            &self,
+            member: &scp_platform::KeyHandle,
+            probe: &scp_platform::CustodyProbe,
+        ) -> Result<scp_platform::ProbeSignature, scp_platform::KeyEventSignError> {
+            self.check("sign_probe");
+            self.inner.sign_probe(member, probe).await
+        }
+    }
+
     impl scp_platform::traits::KeyCustody for LockCheckingCustody {
+        async fn generate_key_event_keypair(
+            &self,
+        ) -> Result<scp_platform::KeyHandle, scp_platform::PlatformError> {
+            self.check("generate_key_event_keypair");
+            self.inner.generate_key_event_keypair().await
+        }
+
         async fn generate_keypair(
             &self,
             key_type: scp_platform::traits::KeyType,

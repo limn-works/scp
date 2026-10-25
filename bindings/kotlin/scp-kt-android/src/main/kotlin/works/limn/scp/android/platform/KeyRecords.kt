@@ -57,7 +57,7 @@ internal class KeyRecords(private val prefs: SharedPreferences) {
      * [processTag], and adds [id] to the index in the same commit.
      */
     fun reserve(id: String, type: KeyType, backing: Backing, role: KeyRole, processTag: String) {
-        require(type == KeyType.P256 || type == KeyType.HPKE_P256) { "only P-256 keys have records" }
+        require(type != KeyType.ED25519) { "only P-256 keys have records" }
         val committed = index.commit(id, present = true) {
             it.putString(key(id), encode(KeyRecord(type, backing, null, role, processTag)))
         }
@@ -131,8 +131,8 @@ internal class KeyRecords(private val prefs: SharedPreferences) {
                 else -> return null
             }
             if (type == null || backing == null || role == null) return null
-            // Only P-256 keys have records, and a P-256 signing key lives only in Keystore.
-            val valid = type == KeyType.HPKE_P256 || (type == KeyType.P256 && backing == Backing.KEYSTORE)
+            // Only P-256 keys have records, and a P-256 ECDSA key lives only in Keystore.
+            val valid = type == KeyType.HPKE_P256 || (type.isP256Ecdsa && backing == Backing.KEYSTORE)
             return if (valid) KeyRecord(type, backing, custody, role, parts[4]) else null
         }
     }

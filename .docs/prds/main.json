@@ -12278,7 +12278,7 @@
       "gate": "gate-kel",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-kel/src/key_event_signer.rs",
         "crates/scp-kel/src/lib.rs",
@@ -12301,7 +12301,16 @@
         "bindings/typescript/src/scp.ts",
         "bindings/python/scp_sdk/scp.py",
         "crates/scp-client-wasm/src/custody.rs",
-        "crates/scp-testing/src/conformance/key_custody.rs"
+        "crates/scp-testing/src/conformance/key_custody.rs",
+        "crates/scp-platform/src/custody_record.rs",
+        "crates/scp-ffi/common/src/bridge_instance.rs",
+        "crates/scp-ffi/common/src/bridge_runtime.rs",
+        "crates/scp-ffi/common/src/error_codes.rs",
+        "crates/scp-ffi/src/identity.rs",
+        "crates/scp-ffi/napi/src/scp.rs",
+        "bindings/swift/Sources/SCP/Scp.swift",
+        "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/SCP.kt",
+        ".docs/standards/sdk-capability-matrix.json"
       ],
       "description": "Every key-event member, a root member, a K′ member or a next-set member, signs through one contract, `KeyEventSigner`, declared with `CustodyProbe` and `KeyEventSignError` in scp-kel at `crates/scp-kel/src/key_event_signer.rs`, so the ADR-057 browser client, which depends on no scp-platform, implements it directly. The contract hands a substrate only a checked change's digest (the raw arm), its `key_event_challenge()` (the assertion arm), or a custody probe's fixed bytes, and its one change input is a `SigningChange`, which only SCP-309's `HeldHead::check_next` and `SigningChange::inception` construct (`09-security-model.md` §9.7.4.2 R10, *A device signs only a legal event at the head it holds* and *What the signing rule cannot reach*). A key-event key is `KeyType::P256KeyEvent`, minted only by `KeyCustody::generate_key_event_keypair`; raw `sign` refuses it. `KeyCustody` and `NextSetCustody` take `KeyEventSigner` as a supertrait, so a missing implementation does not compile. This story owns the contract, the mint, the `NextSetCustody` trait, the Rust-side custody record that fixes a callback key's type, and every raw-arm implementor. SCP-311 owns the assertion arm (passkey and FIDO2), every production `NextSetCustody` implementor, the headless backup methods and the ADR-054 callbacks. `generate_identity_keypair` and the pseudonym derivations are unchanged until SCP-315.",
       "acceptanceCriteria": [
@@ -12324,6 +12333,7 @@
         "`key_custody_conformance!()` case `signing_key_refuses_sign_change`: `sign_change` on a `P256Signing` handle returns `WrongKeyType` (`16-test-infrastructure.md` §16.12.3)",
         "`key_custody_conformance!()` case `no_import_as_key_event`: every import method `KeyCustody` has, `import_ed25519_signing_key` included, returns a handle whose `KeyType` is not `P256KeyEvent` (`16-test-infrastructure.md` §16.12.3)",
         "Every implementor: the callback custody and the napi, PyO3 and UniFFI adapters delegate to the shared flows and take the record store in their constructors; `NoOpCustody` in scp-node refuses `sign_change` as its `sign` refuses; file and SQLite custody sign with the stored P-256 scalar where the record's type is `P256KeyEvent`; the in-memory testing custody signs in memory; the counting, key-loss and lock-checking wrappers and the UniFFI `OpaqueInMemoryKeyCustody` testing wrapper (`crates/scp-ffi/uniffi/src/bridge.rs`) delegate; the Swift `p256KeyEvent = \"p256-key-event\"` and Kotlin `P256_KEY_EVENT(\"p256-key-event\")` cases generate, sign with and report a P-256 key as `p256-key-event`; TypeScript `KEY_TYPES` and `CustodyKeyType` and Python `CustodyKeyType` add `p256-key-event`; and the ADR-057 browser client's custody refuses `generateKeypair(\"p256-key-event\")` and its `CustodyKeyType` gains no value: a case in its custody tests asserts the refusal. `git grep -n \"impl.*KeyCustody for\"` lists no implementor this criterion leaves out",
+        "Callback custody identity entry (`17-persistence-and-storage.md` §17.3, decision D1): creating an identity with a host custody provider writes `identity/{did}/callback_custody`, holding the identity's custody namespace, key handles and DID document, before the create returns; `identity_load_with_custody` takes the DID and the provider, both required (PyO3, UniFFI and napi bridges; `identity_load_with_custody` in Python, `identityLoadWithCustody` in TypeScript, Swift and Kotlin), reads the entry, rebuilds the adapter over the stored namespace and checks that the provider's identity key derives the DID; a fresh namespace is drawn only on create; `identity_load` of an identity with that entry returns `SCP-IDENT-1003`; an absent entry returns `SCP-IDENT-1002`, an entry that does not decode or names another DID returns `SCP-IDENT-1009`, and a provider whose identity key does not derive the DID returns `SCP-IDENT-1008`; a second load while an adapter of the same instance holds the namespace returns `SCP-IDENT-1008`; and a callback custody create or load on storage that does not persist (the `in_memory` selection) returns `SCP-STORAGE-8000` on every bridge. Per bridge, tests create the identity on SQLite storage, drop the instance and load it with the provider on a new instance over the same directory; the UniFFI test then signs a change with a key-event key minted before the drop, and the PyO3 and napi tests, whose SDKs expose no key-event operation, pass a single-admin governance proposal signed through the provider with the identity key minted before the drop; load without the provider and assert `SCP-IDENT-1003`; load twice and assert the second refusal; and create and load on in-memory storage and assert `SCP-STORAGE-8000`",
         "No unwrap() or expect() in library code"
       ],
       "actionItems": [
@@ -12331,7 +12341,8 @@
         "Add `KeyType::P256KeyEvent`, `generate_key_event_keypair`, the `KeyEventSigner` supertrait on `KeyCustody`, and the `NextSetCustody` trait with its in-memory testing implementor in scp-platform.",
         "Back `CallbackKeyRegistry` with a `CustodyRecordStore` and move the `P256KeyEvent` refusal into `callback_custody::sign`.",
         "Implement the raw arm in every `KeyCustody` implementor and add `p256-key-event` to every host key-type set.",
-        "Add the key-event cases to `key_custody_conformance!()`."
+        "Add the key-event cases to `key_custody_conformance!()`.",
+        "Persist the callback custody identity entry on create and add `identity_load_with_custody` to every bridge and SDK wrapper."
       ],
       "blockedBy": [
         "SCP-309"
@@ -12360,6 +12371,10 @@
         {
           "file": ".docs/specs/09-security-model.md",
           "section": "### 9.7.4.2 Root-Authority Recovery and Fork Precedence"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.3 Key Convention"
         }
       ],
       "details": {}

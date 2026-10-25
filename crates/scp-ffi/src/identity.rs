@@ -54,11 +54,9 @@ use scp_did::DidDocument;
 // in-memory seam are both encapsulated in the single cfg-gated
 // `scp_ffi_common::dht::build_ffi_dht_client`; this bridge only maps its error.
 use scp_ffi_common::dht::FfiDhtClient;
-use scp_identity::{DidCache, DidDht, DidMethod, DualLayerResolver, NoOpRelayQuerier};
-// Only the testing-gated `identity_migrate` path constructs a `ScpIdentity`
-// value directly (production migration is unreachable — ADR-062 §Decision 6).
-#[cfg(feature = "testing")]
+use scp_ffi_common::identity_update::IdentityUpdateGuard;
 use scp_identity::ScpIdentity;
+use scp_identity::{DidCache, DidDht, DidMethod, DualLayerResolver, NoOpRelayQuerier};
 #[cfg(feature = "testing")]
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{KeyCustody, Storage};
@@ -313,14 +311,14 @@ impl DocumentUpdate {
 /// The wait releases the GIL, because custody may call back into Python. No
 /// registry guard is held across it: a guard held there deadlocks against a
 /// Python thread that blocks on the same shard while holding the GIL. The
-/// entry is read, released, and written back only when no other update
-/// replaced its document meanwhile, so two concurrent updates of one
-/// identity cannot both install.
+/// update holds its DID's update slot ([`lock_identity_update`]) from the
+/// registry read through the install instead, so a second update of the
+/// identity reads the first one's result.
 ///
 /// # Errors
 ///
-/// Returns `IdentityError` when the identity is not registered, the update
-/// or its publish fails, or another update installed first.
+/// Returns `IdentityError` when the identity is not registered or was
+/// migrated, or when the update or its publish fails.
 fn republish_identity(
     py: Python<'_>,
     bi: &Arc<PyBridgeInstance>,
@@ -329,6 +327,7 @@ fn republish_identity(
     publish_client: &Arc<FfiDhtClient>,
     update: DocumentUpdate,
 ) -> Result<PyIdentity, ScpPyError> {
+    let mut slot = lock_identity_update(py, bi, did)?;
     let (identity, document, custody) = crate::runtime::with_identity(bi, did, |entry| {
         Ok((
             entry.identity.clone(),
@@ -373,12 +372,19 @@ fn republish_identity(
         ScpPyError::from(e)
     })?;
     let (new_identity, new_document) = published;
+    // The stored entry takes the change before the registry does, so a
+    // failed write leaves both on the state a restart would load.
+    crate::actor_wait::block_on_released(
+        py,
+        rewrite_callback_entry(
+            bi,
+            &mut slot,
+            custody.as_ref(),
+            &new_identity,
+            &new_document,
+        ),
+    )??;
     crate::runtime::with_identity_mut(bi, did, |entry| {
-        if entry.document != document {
-            return Err(ScpPyError::identity(format!(
-                "identity '{did}' was updated concurrently; its document changed during this update"
-            )));
-        }
         entry.identity = new_identity;
         entry.document = new_document;
         Ok(PyIdentity::from_document(
@@ -920,11 +926,13 @@ fn custody_request_error(
 /// `SCP-IDENT-1059` (ADR-062 §Decision 6) before the selection creates
 /// `$HOME/.scp` or opens a key file. Opening first would leave a key file
 /// sealed under whatever passphrase was set, for a call that fails. An
-/// `os_keystore` selection opens nothing, so it builds here and the refusal
-/// runs where `identity_create_with_custody` states it.
+/// `os_keystore` selection opens only its custody records over `bi`'s
+/// storage, which writes nothing, so it builds here and the refusal runs
+/// where `identity_create_with_custody` states it.
 #[cfg(not(feature = "testing"))]
 fn build_key_custody(
     selection: CustodySelection,
+    bi: &PyBridgeInstance,
 ) -> Result<(Arc<FfiKeyCustody>, String), ScpPyError> {
     use scp_ffi_common::custody_request::CustodyRequest;
     match selection {
@@ -934,7 +942,7 @@ fn build_key_custody(
         }
         CustodySelection::OsKeystore(provider) => Ok((
             Arc::new(FfiKeyCustody::Callback(
-                crate::custody::PyCallbackKeyCustody::new(provider),
+                crate::custody::PyCallbackKeyCustody::new(provider, callback_registry(bi)?),
             )),
             CustodyRequest::OsKeystore.as_str().to_owned(),
         )),
@@ -943,10 +951,12 @@ fn build_key_custody(
 
 /// Builds the key custody a [`CustodySelection`] names for an
 /// identity-creation path. A `testing` build mints the in-memory pre-rotation
-/// custody later, so it opens here.
+/// custody later, so it opens here. An `os_keystore` selection opens its
+/// custody records over `bi`'s storage.
 #[cfg(feature = "testing")]
 fn build_key_custody(
     selection: CustodySelection,
+    bi: &PyBridgeInstance,
 ) -> Result<(Arc<FfiKeyCustody>, String), ScpPyError> {
     use scp_ffi_common::custody_request::CustodyRequest;
     match selection {
@@ -976,10 +986,263 @@ fn build_key_custody(
         }
         CustodySelection::OsKeystore(provider) => Ok((
             Arc::new(FfiKeyCustody::Callback(
-                crate::custody::PyCallbackKeyCustody::new(provider),
+                crate::custody::PyCallbackKeyCustody::new(provider, callback_registry(bi)?),
             )),
             CustodyRequest::OsKeystore.as_str().to_owned(),
         )),
+    }
+}
+
+/// The record-backed registry of a new identity's callback custody (spec
+/// §17.3, SCP-345 decision D1): a namespace drawn here over `bi`'s own
+/// storage, opened through `bi`'s namespace table. The create stores the
+/// namespace in the identity's callback custody entry, and
+/// `identity_load_with_custody` reopens the records over it.
+///
+/// # Errors
+///
+/// `SCP-STORAGE-8000` when `bi`'s storage does not persist (none, or
+/// `in_memory`), since the entry and records would end with the instance
+/// while the host keys remain; the [`CallbackIdentityError`] code when no
+/// namespace can be drawn.
+///
+/// [`CallbackIdentityError`]: scp_ffi_common::callback_identity::CallbackIdentityError
+fn callback_registry(
+    bi: &PyBridgeInstance,
+) -> Result<scp_ffi_common::callback_custody::CallbackKeyRegistry, ScpPyError> {
+    let records = scp_ffi_common::callback_identity::create_records(
+        bi.core.custody_namespaces(),
+        callback_custody_storage(bi),
+    )
+    .map_err(callback_identity_error)?;
+    Ok(scp_ffi_common::callback_custody::CallbackKeyRegistry::recorded(records))
+}
+
+/// The storage a callback custody identity's entry and records live in
+/// (spec §17.3): `bi`'s `SQLCipher` store, or `None` when `bi`'s storage
+/// does not persist.
+fn callback_custody_storage(
+    bi: &PyBridgeInstance,
+) -> Option<Arc<scp_platform::sqlite::SqliteStorage>> {
+    match bi.storage_provider() {
+        Some(crate::runtime::StorageProvider::Sqlite(storage)) => Some(Arc::clone(storage)),
+        Some(crate::runtime::StorageProvider::InMemoryEncrypted(_)) | None => None,
+    }
+}
+
+/// Writes the callback custody entry of an identity just minted over
+/// `custody` when `custody` is a host provider's adapter (spec §17.3,
+/// SCP-345 decision D1); other custodies keep no entry. A failed write
+/// destroys the keys the create minted before the error returns.
+///
+/// # Errors
+///
+/// `SCP-STORAGE-8000` when `bi`'s storage stopped persisting, and the
+/// [`CallbackIdentityError`] code when the write fails.
+///
+/// [`CallbackIdentityError`]: scp_ffi_common::callback_identity::CallbackIdentityError
+#[cfg(feature = "testing")]
+async fn write_callback_entry(
+    bi: &PyBridgeInstance,
+    custody: &FfiKeyCustody,
+    identity: &ScpIdentity,
+    document: &DidDocument,
+) -> Result<(), ScpPyError> {
+    let FfiKeyCustody::Callback(adapter) = custody else {
+        return Ok(());
+    };
+    let storage = callback_custody_storage(bi);
+    scp_ffi_common::callback_identity::write_created_entry(
+        storage.as_deref(),
+        adapter,
+        adapter.namespace(),
+        identity,
+        document,
+    )
+    .await
+    .map_err(callback_identity_error)
+}
+
+/// The testing build of [`crate::scp::PyScp::identity_attest_device`]: attests with
+/// `InMemoryDeviceAttestation`, rewrites a callback custody entry and
+/// installs the attested document, all under the DID's update slot.
+#[cfg(feature = "testing")]
+fn attest_device_in_memory(
+    py: Python<'_>,
+    bi: &Arc<PyBridgeInstance>,
+    identity_did: &str,
+) -> PyResult<String> {
+    let bi_arc = Arc::clone(bi);
+    validate::validate_did(identity_did)?;
+    let did_owned = identity_did.to_owned();
+
+    // Hold the DID's update slot from the registry read through the
+    // install, and attest with the GIL released and no registry guard
+    // held (see `republish_identity`).
+    let mut slot = lock_identity_update(py, &bi_arc, &did_owned)?;
+    let (identity, document, custody) =
+        crate::runtime::with_identity(&bi_arc, &did_owned, |entry| {
+            Ok((
+                entry.identity.clone(),
+                entry.document.clone(),
+                Arc::clone(&entry.custody),
+            ))
+        })?;
+    let attestation = scp_platform::testing::InMemoryDeviceAttestation::new();
+    let dht = shared_did_method(&bi_arc)?;
+    let new_document = crate::actor_wait::block_on_released(
+        py,
+        dht.attach_device_attestation(&document, &attestation),
+    )?
+    .map_err(|e| ScpPyError::identity(format!("device attestation failed: {e}")))?;
+
+    // Extract the attestation token from the updated document's
+    // service entries. The service_endpoint is already base64-encoded
+    // by `set_device_attestation_token`, so return it directly —
+    // no double-encoding.
+    let token_b64 = new_document
+        .service
+        .iter()
+        .find(|s| s.service_type == "ScpDeviceAttestation")
+        .map(|s| s.service_endpoint.clone())
+        .ok_or_else(|| {
+            ScpPyError::identity(
+                "device attestation succeeded but no ScpDeviceAttestation \
+                 service entry found in updated document"
+                    .to_owned(),
+            )
+        })?;
+
+    crate::actor_wait::block_on_released(
+        py,
+        rewrite_callback_entry(
+            &bi_arc,
+            &mut slot,
+            custody.as_ref(),
+            &identity,
+            &new_document,
+        ),
+    )??;
+    crate::runtime::with_identity_mut(&bi_arc, &did_owned, |entry| {
+        entry.document = new_document;
+        Ok(token_b64)
+    })
+    .map_err(PyErr::from)
+}
+
+/// The shipped build of [`crate::scp::PyScp::identity_attest_device`]: fail-closed device
+/// attestation.
+///
+/// Spec §9:187 — device attestation (Apple App Attest / Google Play
+/// Integrity) is an optional SDK-level trust signal whose absence is
+/// expected and non-penalizing. No production device-attestation backend is
+/// wired yet: App Attest / Play Integrity are hardware/platform-backed and
+/// are intentionally deferred (with hardware keychain custody) until an
+/// e2e-driven integration lands (ADR-062 §Decision 3 severs the test-harness
+/// `InMemoryDeviceAttestation` nullifier from every production path). So a
+/// shipped build returns a typed
+/// [`IDENT_1015`](scp_ffi_common::error_codes::IDENT_1015) honest-absent
+/// error rather than a silently-valid attestation. See ADR-025 and #2171 for
+/// the real backend.
+#[cfg(not(feature = "testing"))]
+fn attest_device_unavailable(
+    py: Python<'_>,
+    bi: &Arc<PyBridgeInstance>,
+    identity_did: &str,
+) -> PyResult<String> {
+    let bi_arc = Arc::clone(bi);
+    validate::validate_did(identity_did)?;
+    let did_owned = identity_did.to_owned();
+
+    // Resolve the identity against THIS instance's registry first: an
+    // unregistered DID surfaces the bridge's standard not-found identity
+    // error, so a caller can distinguish "unknown identity" from "backend
+    // unavailable". A registered DID then fails closed with the typed
+    // honest-absent IDENT_1015 rather than a silently-valid attestation.
+    py.allow_threads(move || {
+        crate::runtime::with_identity(&bi_arc, &did_owned, |_entry| {
+            Err(ScpPyError::identity_with_code(
+                "device attestation unavailable: no production device-attestation \
+                 backend is wired yet — Apple App Attest / Google Play Integrity are \
+                 hardware/platform-backed and are intentionally deferred (with hardware \
+                 keychain custody) until an e2e-driven integration lands (spec §9:187). \
+                 See #2171."
+                    .to_owned(),
+                scp_ffi_common::error_codes::IDENT_1015,
+            ))
+        })
+    })
+    .map_err(PyErr::from)
+}
+
+/// Waits until no other update of `did` runs on `bi` and returns the hold on
+/// its update slot (spec §17.3). Every operation that changes a registered
+/// identity's key handles or document takes it before it reads the registry
+/// and keeps it until it installs the change.
+///
+/// # Errors
+///
+/// `SCP-IDENT-1002` when a migration retired `did`, and the wait's error when
+/// the shared runtime is absent.
+fn lock_identity_update(
+    py: Python<'_>,
+    bi: &PyBridgeInstance,
+    did: &str,
+) -> Result<IdentityUpdateGuard, ScpPyError> {
+    crate::actor_wait::block_on_released(py, bi.core.identity_updates().lock(did))?
+        .map_err(|e| ScpPyError::identity_with_code(e.to_string(), e.code()))
+}
+
+/// Records a change to the identity `slot` holds: rewrites its callback
+/// custody entry when `custody` is a host provider's adapter (spec §17.3;
+/// other custodies keep no entry), then records `identity` and `document` in
+/// the slot. Every operation that changes a registered identity calls this
+/// before it installs the change, so a restart loads the changed identity and
+/// never the one before.
+///
+/// # Errors
+///
+/// `SCP-STORAGE-8000` when `bi`'s storage stopped persisting, and the
+/// [`CallbackIdentityError`] code when the write fails; the slot then records
+/// nothing.
+///
+/// [`CallbackIdentityError`]: scp_ffi_common::callback_identity::CallbackIdentityError
+async fn rewrite_callback_entry(
+    bi: &PyBridgeInstance,
+    slot: &mut IdentityUpdateGuard,
+    custody: &FfiKeyCustody,
+    identity: &ScpIdentity,
+    document: &DidDocument,
+) -> Result<(), ScpPyError> {
+    if let FfiKeyCustody::Callback(adapter) = custody {
+        let storage = callback_custody_storage(bi);
+        scp_ffi_common::callback_identity::rewrite_entry(
+            storage.as_deref(),
+            adapter.namespace(),
+            slot,
+            identity,
+            document,
+        )
+        .await
+        .map_err(callback_identity_error)?;
+    }
+    slot.commit(identity.clone(), document.clone());
+    Ok(())
+}
+
+/// Maps a callback custody identity refusal to the code every bridge
+/// reports for it (spec §17.3): a storage selection that does not persist in
+/// the storage class, every other refusal in the identity class.
+fn callback_identity_error(
+    error: scp_ffi_common::callback_identity::CallbackIdentityError,
+) -> ScpPyError {
+    if error.is_storage_selection() {
+        ScpPyError::ContextError {
+            message: error.to_string(),
+            code: error.code().to_owned(),
+        }
+    } else {
+        ScpPyError::identity_with_code(error.to_string(), error.code())
     }
 }
 
@@ -1276,7 +1539,7 @@ impl crate::scp::PyScp {
         // Resolve the custody (no file touched), then open it; a shipped build
         // refuses with SCP-IDENT-1059 at the open, before any key file exists.
         let (key_custody, custody_str) =
-            build_key_custody(resolve_custody(custody, None, testing_seed_array)?)?;
+            build_key_custody(resolve_custody(custody, None, testing_seed_array)?, &bi_arc)?;
         let rt = crate::runtime()?;
 
         // Ensure the production DID resolver is initialized on this bridge
@@ -1411,7 +1674,8 @@ impl crate::scp::PyScp {
         custody: &str,
     ) -> PyResult<PyIdentity> {
         let bi_arc = Arc::clone(&self.inner);
-        let (key_custody, custody_str) = build_key_custody(resolve_custody(custody, None, None)?)?;
+        let (key_custody, custody_str) =
+            build_key_custody(resolve_custody(custody, None, None)?, &bi_arc)?;
         let rt = crate::runtime()?;
 
         // Ensure the production DID resolver is initialized on this bridge
@@ -1557,11 +1821,14 @@ impl crate::scp::PyScp {
                     code: scp_ffi_common::error_codes::VALID_7005.to_owned(),
                 }
             })?;
-        let (key_custody, custody_str) = build_key_custody(resolve_custody(
-            scp_ffi_common::custody_request::CustodyRequest::OsKeystore.as_str(),
-            Some(provider_shim),
-            None,
-        )?)?;
+        let (key_custody, custody_str) = build_key_custody(
+            resolve_custody(
+                scp_ffi_common::custody_request::CustodyRequest::OsKeystore.as_str(),
+                Some(provider_shim),
+                None,
+            )?,
+            &bi_arc,
+        )?;
         let rt = crate::runtime()?;
 
         // Ensure the production DID resolver is initialized on this bridge
@@ -1601,6 +1868,11 @@ impl crate::scp::PyScp {
                         .create(key_custody.as_ref(), pre_rotation_custody.as_ref())
                         .await
                         .map_err(ScpPyError::from)?;
+
+                    // The identity's callback custody entry, before the create
+                    // returns (spec §17.3, SCP-345 decision D1): a failed write
+                    // fails the create.
+                    write_callback_entry(&bi_arc, &key_custody, &identity, &document).await?;
 
                     let did = identity.did.clone();
                     let document_for_handle = document.clone();
@@ -1718,6 +1990,12 @@ impl crate::scp::PyScp {
             let storage = crate::runtime::get_storage(&bi_arc).map_err(PyErr::from)?;
 
             async {
+                // An identity created with a host custody provider loads only
+                // with that provider (spec §17.3).
+                scp_ffi_common::callback_identity::refuse_plain_load(storage, &did_owned)
+                    .await
+                    .map_err(callback_identity_error)?;
+
                 let key = identity_state_key(&did_owned);
                 // `storage` is `&StorageProvider` which impls `Storage` directly
                 // via enum dispatch — no Arc blanket-impl ambiguity.
@@ -1793,6 +2071,118 @@ impl crate::scp::PyScp {
                 ))))
             }
             .await
+        })?
+    }
+
+    /// Loads an identity created with `identity_create_with_custody` on this
+    /// instance's storage, with the same host custody provider (spec §17.3,
+    /// SCP-345 decision D1).
+    ///
+    /// Reads the identity's callback custody entry, reopens its custody
+    /// records over the stored namespace, and checks that `provider` holds
+    /// the identity key the DID derives from. The handle reports
+    /// `"os_keystore"` and signs through `provider`, including with keys
+    /// minted in an earlier process.
+    ///
+    /// # Errors
+    ///
+    /// - `ValidationError` (`SCP-VALID-7005`) when `provider` lacks a
+    ///   custody method.
+    /// - `IdentityError` (`SCP-IDENT-1004`) for a DID that is not `did:dht`.
+    /// - `ContextError` (`SCP-STORAGE-8000`) when this instance's storage
+    ///   does not persist.
+    /// - `IdentityError` (`SCP-IDENT-1002`) when the storage holds no entry
+    ///   for `did`; `SCP-IDENT-1009` when the entry does not decode or names
+    ///   another DID; `SCP-IDENT-1008` while another live adapter of this
+    ///   instance holds the identity's namespace, or when `provider`'s
+    ///   identity key does not derive `did`.
+    pub fn identity_load_with_custody(
+        &self,
+        py: Python<'_>,
+        did: &str,
+        provider: Py<PyAny>,
+    ) -> PyResult<PyIdentity> {
+        use scp_ffi_common::callback_identity::{
+            LoadedCallbackIdentity, check_provider, open_entry,
+        };
+        let bi_arc = Arc::clone(&self.inner);
+        validate::validate_did(did)?;
+        if !did.starts_with("did:dht:") {
+            return Err(PyErr::from(ScpPyError::identity_with_code(
+                format!("unsupported DID method: {did} -- only did:dht is supported"),
+                scp_ffi_common::error_codes::IDENT_1004,
+            )));
+        }
+        let provider_shim =
+            crate::custody::PyKeyCustodyProvider::new(py, provider).map_err(|e| {
+                ScpPyError::ValidationError {
+                    message: format!("invalid KeyCustodyProvider: {e}"),
+                    code: scp_ffi_common::error_codes::VALID_7005.to_owned(),
+                }
+            })?;
+        let did_owned = did.to_owned();
+        let handle = crate::runtime()?.handle().clone();
+
+        crate::actor_wait::block_on_released(py, async {
+            let LoadedCallbackIdentity {
+                records,
+                identity,
+                document,
+            } = open_entry(
+                bi_arc.core.custody_namespaces(),
+                callback_custody_storage(&bi_arc),
+                &did_owned,
+            )
+            .await
+            .map_err(callback_identity_error)?;
+            let custody = Arc::new(FfiKeyCustody::Callback(
+                crate::custody::PyCallbackKeyCustody::new(
+                    provider_shim,
+                    scp_ffi_common::callback_custody::CallbackKeyRegistry::recorded(records),
+                ),
+            ));
+            let verifying_key_hex = Some(
+                check_provider(custody.as_ref(), &identity)
+                    .await
+                    .map_err(callback_identity_error)?,
+            );
+            // The resolver a governance vote and a UCAN check read this
+            // identity's document from, as create initializes it before minting.
+            ensure_did_resolver_initialized_on(&bi_arc, handle).map_err(PyErr::from)?;
+            // As create does after it registers the identity, publish the
+            // stored document into the resolver's DHT client: this instance's
+            // resolver reads it there to verify the identity's signatures.
+            #[cfg(feature = "testing")]
+            publish_to_resolver_dht_for(&bi_arc, &identity, &document, custody.as_ref()).await;
+            let loaded = PyIdentity::from_document(
+                &bi_arc,
+                identity.did.clone(),
+                scp_ffi_common::custody_request::CustodyRequest::OsKeystore
+                    .as_str()
+                    .to_owned(),
+                &document,
+                verifying_key_hex,
+            );
+            crate::runtime::register_identity(
+                &bi_arc,
+                &did_owned,
+                crate::runtime::IdentityEntry {
+                    identity,
+                    custody,
+                    document,
+                    identity_link_attestations: Vec::new(),
+                    // The pre-rotation key stays in the substrate that
+                    // created it, which no load reopens: the handle names no
+                    // key, and the testing-only custody field holds an empty
+                    // custody.
+                    pre_rotation_handle: scp_platform::PreRotationKeyHandle::new(0),
+                    #[cfg(feature = "testing")]
+                    pre_rotation_custody: Arc::new(
+                        scp_platform::testing::InMemoryPreRotationCustody::new(),
+                    ),
+                },
+            );
+            Ok::<_, PyErr>(loaded)
         })?
     }
 
@@ -2200,6 +2590,14 @@ impl crate::scp::PyScp {
                 }
                 #[cfg(feature = "testing")]
                 {
+                    // The migration holds the old DID's update slot from the
+                    // registry read through the install (spec §17.3).
+                    let mut slot = bi_arc
+                        .core
+                        .identity_updates()
+                        .lock(&old_did)
+                        .await
+                        .map_err(|e| ScpPyError::identity_with_code(e.to_string(), e.code()))?;
                     // Extract what we need from the registry entry. The
                     // pre-rotation handle points into the cold-storage
                     // `pre_rotation_custody`; revealing it must yield a public
@@ -2258,6 +2656,16 @@ impl crate::scp::PyScp {
                     } = outcome;
                     let new_did = new_identity.did.clone();
                     let document_for_handle = new_document.clone();
+                    // The stored entry moves to the new DID before the
+                    // registry does (spec §17.3).
+                    rewrite_callback_entry(
+                        &bi_arc,
+                        &mut slot,
+                        custody.as_ref(),
+                        &new_identity,
+                        &new_document,
+                    )
+                    .await?;
 
                     // Snapshot the migrated identity's verifying-key BEFORE the
                     // identity / custody move into the registry (ADR-046 parity).
@@ -2342,92 +2750,19 @@ impl crate::scp::PyScp {
     /// attestation fails.
     ///
     /// See §9.3.
-    #[cfg(feature = "testing")]
+    /// A shipped build refuses before it reads or changes anything (see
+    /// `attest_device_unavailable`); a testing build attests through
+    /// `attest_device_in_memory`, which rewrites a callback custody entry
+    /// before it installs the attested document.
     pub fn identity_attest_device(&self, py: Python<'_>, identity_did: &str) -> PyResult<String> {
-        let bi_arc = Arc::clone(&self.inner);
-        validate::validate_did(identity_did)?;
-        let did_owned = identity_did.to_owned();
-
-        // Read the document, attest with the GIL released and no registry
-        // guard held, then install the result only if no other update
-        // replaced the document meanwhile (see `republish_identity`).
-        let document =
-            crate::runtime::with_identity(&bi_arc, &did_owned, |entry| Ok(entry.document.clone()))?;
-        let attestation = scp_platform::testing::InMemoryDeviceAttestation::new();
-        let dht = shared_did_method(&bi_arc)?;
-        let new_document = crate::actor_wait::block_on_released(
-            py,
-            dht.attach_device_attestation(&document, &attestation),
-        )?
-        .map_err(|e| ScpPyError::identity(format!("device attestation failed: {e}")))?;
-
-        // Extract the attestation token from the updated document's
-        // service entries. The service_endpoint is already base64-encoded
-        // by `set_device_attestation_token`, so return it directly —
-        // no double-encoding.
-        let token_b64 = new_document
-            .service
-            .iter()
-            .find(|s| s.service_type == "ScpDeviceAttestation")
-            .map(|s| s.service_endpoint.clone())
-            .ok_or_else(|| {
-                ScpPyError::identity(
-                    "device attestation succeeded but no ScpDeviceAttestation \
-                     service entry found in updated document"
-                        .to_owned(),
-                )
-            })?;
-
-        crate::runtime::with_identity_mut(&bi_arc, &did_owned, |entry| {
-            if entry.document != document {
-                return Err(ScpPyError::identity(format!(
-                    "identity '{did_owned}' was updated concurrently; its document changed during attestation"
-                )));
-            }
-            entry.document = new_document;
-            Ok(token_b64)
-        })
-        .map_err(PyErr::from)
-    }
-
-    /// Fail-closed device attestation on a shipped (no-`testing`) build.
-    ///
-    /// Spec §9:187 — device attestation (Apple App Attest / Google Play
-    /// Integrity) is an optional SDK-level trust signal whose absence is
-    /// expected and non-penalizing. No production device-attestation backend is
-    /// wired yet: App Attest / Play Integrity are hardware/platform-backed and
-    /// are intentionally deferred (with hardware keychain custody) until an
-    /// e2e-driven integration lands (ADR-062 §Decision 3 severs the test-harness
-    /// `InMemoryDeviceAttestation` nullifier from every production path). So a
-    /// shipped build returns a typed
-    /// [`IDENT_1015`](scp_ffi_common::error_codes::IDENT_1015) honest-absent
-    /// error rather than a silently-valid attestation. See ADR-025 and #2171 for
-    /// the real backend.
-    #[cfg(not(feature = "testing"))]
-    pub fn identity_attest_device(&self, py: Python<'_>, identity_did: &str) -> PyResult<String> {
-        let bi_arc = Arc::clone(&self.inner);
-        validate::validate_did(identity_did)?;
-        let did_owned = identity_did.to_owned();
-
-        // Resolve the identity against THIS instance's registry first: an
-        // unregistered DID surfaces the bridge's standard not-found identity
-        // error, so a caller can distinguish "unknown identity" from "backend
-        // unavailable". A registered DID then fails closed with the typed
-        // honest-absent IDENT_1015 rather than a silently-valid attestation.
-        py.allow_threads(move || {
-            crate::runtime::with_identity(&bi_arc, &did_owned, |_entry| {
-                Err(ScpPyError::identity_with_code(
-                    "device attestation unavailable: no production device-attestation \
-                     backend is wired yet — Apple App Attest / Google Play Integrity are \
-                     hardware/platform-backed and are intentionally deferred (with hardware \
-                     keychain custody) until an e2e-driven integration lands (spec §9:187). \
-                     See #2171."
-                        .to_owned(),
-                    scp_ffi_common::error_codes::IDENT_1015,
-                ))
-            })
-        })
-        .map_err(PyErr::from)
+        #[cfg(feature = "testing")]
+        {
+            attest_device_in_memory(py, &self.inner, identity_did)
+        }
+        #[cfg(not(feature = "testing"))]
+        {
+            attest_device_unavailable(py, &self.inner, identity_did)
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -3005,6 +3340,69 @@ mod tests {
     /// retained custody. This test calls the actual bridge method to
     /// confirm the signer is properly wired and migration produces a
     /// valid new identity.
+    /// Spec §17.3: a key change holds its DID's update slot from its
+    /// registry read through its install. While another update holds the
+    /// slot, a rotation and an agent key's addition started at once on two
+    /// threads both wait; released, they run one after the other, the
+    /// second from the first's result, so the registry ends with both
+    /// changes rather than refusing or dropping one.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn py_concurrent_key_changes_wait_for_the_update_slot_and_converge() {
+        setup();
+        let scp = Arc::new(default_scp());
+        let bi = Arc::clone(&scp.inner);
+        let identity =
+            Python::with_gil(|py| scp.identity_create(py, "in_memory", None)).expect("create");
+        let did = identity.did.clone();
+        let initial = crate::runtime::with_identity(&bi, &did, |e| Ok(e.identity.clone()))
+            .expect("registered");
+        let runtime = crate::runtime().expect("runtime");
+        let held = runtime
+            .block_on(bi.core.identity_updates().lock(&did))
+            .expect("the test holds the slot");
+        let rotation = {
+            let (scp, identity) = (Arc::clone(&scp), identity.clone());
+            std::thread::spawn(move || {
+                Python::with_gil(|py| scp.identity_rotate_key(py, &identity).map(|_| ()))
+            })
+        };
+        let addition = {
+            let (scp, identity) = (Arc::clone(&scp), identity);
+            std::thread::spawn(move || {
+                Python::with_gil(|py| scp.identity_add_agent_key(py, &identity).map(|_| ()))
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            !rotation.is_finished() && !addition.is_finished(),
+            "both updates wait while another holds the slot"
+        );
+        drop(held);
+        rotation.join().expect("join").expect("identity_rotate_key");
+        addition
+            .join()
+            .expect("join")
+            .expect("identity_add_agent_key");
+
+        let (registered, document) = crate::runtime::with_identity(&bi, &did, |e| {
+            Ok((e.identity.clone(), e.document.clone()))
+        })
+        .expect("registered");
+        assert!(
+            registered.agent_signing_key.is_some(),
+            "the addition installed"
+        );
+        assert_ne!(
+            registered.active_signing_key, initial.active_signing_key,
+            "the rotation installed"
+        );
+        assert!(
+            document.agent_verification_method().is_some(),
+            "the registered document lists the agent key"
+        );
+    }
+
     #[test]
     #[cfg(feature = "testing")]
     fn py_identity_migrate_succeeds_with_signer() {
@@ -3272,9 +3670,61 @@ mod custody_request_tests {
         seed: Option<zeroize::Zeroizing<[u8; 32]>>,
     ) -> Result<String, String> {
         let selection = resolve_custody(request, provider, seed).map_err(|e| format!("{e:?}"))?;
-        build_key_custody(selection)
+        // `os_keystore` builds only over storage that persists (spec §17.3).
+        let dir = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
+        let bi = PyBridgeInstance::sqlite_for_test(dir.path()).map_err(|e| format!("{e:?}"))?;
+        build_key_custody(selection, &bi)
             .map(|(_, label)| label)
             .map_err(|e| format!("{e:?}"))
+    }
+
+    /// Decision D2 (SCP-345): `os_keystore` on a bridge with no storage is
+    /// `SCP-STORAGE-8000`, since its custody records would have no store. A
+    /// build that fell back to an unrecorded or in-memory registry would
+    /// succeed.
+    #[test]
+    fn build_key_custody_refuses_os_keystore_without_storage_with_storage_8000()
+    -> Result<(), String> {
+        let selection =
+            resolve_custody("os_keystore", Some(provider()), None).map_err(|e| format!("{e:?}"))?;
+        let built =
+            build_key_custody(selection, &PyBridgeInstance::new_py()).map(|(_, label)| label);
+        assert!(
+            matches!(&built, Err(ScpPyError::ContextError { code, .. }) if code == codes::STORAGE_8000),
+            "expected SCP-STORAGE-8000, got {built:?}"
+        );
+        Ok(())
+    }
+
+    /// Decision D1 (SCP-345): each `os_keystore` build draws its own
+    /// namespace over the bridge's one storage. Two hosts that both name
+    /// their first key `1` mint it in different roles, and each record lands
+    /// in its own identity's namespace. A shared namespace would refuse the
+    /// second record as a different record for handle 1.
+    #[test]
+    fn build_key_custody_gives_each_os_keystore_identity_its_own_namespace() -> Result<(), String> {
+        let dir = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
+        let bi = PyBridgeInstance::sqlite_for_test(dir.path()).map_err(|e| format!("{e:?}"))?;
+        let custody = || {
+            let selection = resolve_custody("os_keystore", Some(provider()), None)
+                .map_err(|e| format!("{e:?}"))?;
+            build_key_custody(selection, &bi)
+                .map(|(custody, _)| custody)
+                .map_err(|e| format!("custody: {e:?}"))
+        };
+        let (first, second) = (custody()?, custody()?);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("runtime: {e}"))?;
+        let identity = rt
+            .block_on(first.generate_identity_keypair())
+            .map_err(|e| format!("first identity key: {e:?}"))?;
+        let operational = rt
+            .block_on(second.generate_keypair(scp_platform::KeyType::Ed25519))
+            .map_err(|e| format!("second host's key 1 records in its own namespace: {e:?}"))?;
+        assert_eq!(identity, operational, "both hosts named their first key 1");
+        Ok(())
     }
 
     /// `os_keystore` with a provider resolves, and `build_key_custody` labels

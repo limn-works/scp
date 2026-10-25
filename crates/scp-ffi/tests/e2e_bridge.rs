@@ -483,8 +483,21 @@ fn install_sign_only_governance_custody(
         .unwrap();
     let host = obj.clone().unbind();
     let provider = _scp_core::custody::PyKeyCustodyProvider::new(py, obj.unbind()).unwrap();
+    // The adapter's records hold the identity's active key as the Ed25519
+    // identity key it is, so the adapter resolves it through the provider.
+    let registry = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("record runtime")
+        .block_on(
+            scp_ffi_common::callback_custody::CallbackKeyRegistry::recorded_in_memory_holding(&[(
+                key,
+                scp_platform::KeyType::Ed25519,
+                scp_platform::KeyRole::Identity,
+            )]),
+        )
+        .expect("record the active key");
     let custody = Arc::new(FfiKeyCustody::Callback(
-        _scp_core::custody::PyCallbackKeyCustody::new(provider),
+        _scp_core::custody::PyCallbackKeyCustody::new(provider, registry),
     ));
     runtime::with_identity_mut(bi, did, |entry: &mut IdentityEntry| {
         entry.custody = custody;

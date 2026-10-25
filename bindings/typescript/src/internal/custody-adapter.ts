@@ -12,7 +12,12 @@ export interface NativeCustodyPublicKey {
   role: CustodyKeyRole;
 }
 
-const KEY_TYPES: readonly unknown[] = ["ed25519", "p256", "hpke-p256"] satisfies CustodyKeyType[];
+const KEY_TYPES: readonly unknown[] = [
+  "ed25519",
+  "p256",
+  "hpke-p256",
+  "p256-key-event",
+] satisfies CustodyKeyType[];
 const KEY_ROLES: readonly unknown[] = ["identity", "operational"] satisfies CustodyKeyRole[];
 
 /**

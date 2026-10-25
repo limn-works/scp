@@ -42,7 +42,7 @@ testing = [
 # form makes Cargo mint an implicit feature named `scp-platform`, which the
 # shipped-feature-graph gate rejects as a feature its allowlist does not name.
 # `dep:scp-platform` on the same line already enables the dependency.
-custody = ["dep:scp-platform", "scp-platform?/file", "dep:ed25519-dalek"]
+custody = ["dep:scp-platform", "scp-platform?/file", "dep:ed25519-dalek", "dep:tokio"]
 # Shared relay/node startup code for FFI bridges that need to spawn servers.
 # Requires scp-transport (relay), scp-node (application node), scp-platform, and
 # tokio. `start_node_local` opens no protocol store: it receives a caller's
@@ -170,6 +170,10 @@ z-base-32 = { workspace = true }
 tokio-tungstenite = { version = "0.24", features = ["connect"] }
 futures = "0.3"
 scp-relay-client = { path = "../../scp-relay-client" }
+# `callback_custody` tests sign spec 25 Vector 41's change, and
+# `tests/conformance_callback_custody.rs` expands `key_custody_conformance!`
+# against the callback flows over the fake host.
+scp-testing = { path = "../../scp-testing" }
 
 [lints]
 workspace = true

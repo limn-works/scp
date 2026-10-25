@@ -810,6 +810,12 @@
       "reason": "SCP-307 test hook; feature-gated (testing). Method returning the adapter's mapping of the host's custody-type string (hardware, software or in_memory), so a test shows a Secure Enclave key reaches Rust as hardware; a method of TestingCallbackCustody, which wraps a Swift or Kotlin KeyCustodyProvider in the production UniFFI callback custody adapter so SDK tests reach that adapter's checks, its custody-type mapping and its error codes. Not a protocol operation."
     },
     {
+      "name": "reopen",
+      "path": "crates/scp-ffi/uniffi/src/testing_custody.rs",
+      "kind": "test-fixture",
+      "reason": "SCP-345 test hook; feature-gated (testing). Method that builds a new TestingCallbackCustody around another host provider over this one's custody records, as identity_load_with_custody rebuilds an identity's adapter over the namespace its stored entry holds, so a Swift or Kotlin test reopens keys the first adapter minted and recorded. Not a protocol operation."
+    },
+    {
       "name": "testing_p256_verify_strict",
       "path": "crates/scp-ffi/uniffi/src/testing_custody.rs",
       "kind": "test-fixture",
@@ -1164,6 +1170,12 @@
       "path": "crates/scp-ffi/napi/src/testing.rs",
       "kind": "test-fixture",
       "reason": "SCP-307 test hook; feature-gated (testing). Method of TestingCallbackCustody, which wraps a JS custody provider in the production napi callback custody adapter so TypeScript tests reach that adapter's checks and error codes. Builds the adapter around the provider. Not a protocol operation."
+    },
+    {
+      "name": "reopen",
+      "path": "crates/scp-ffi/napi/src/testing.rs",
+      "kind": "test-fixture",
+      "reason": "SCP-345 test hook; feature-gated (testing). Method of TestingCallbackCustody that builds a new adapter around another JS provider over this one's custody records, as identityLoadWithCustody rebuilds an identity's adapter over the namespace its stored entry holds, so a TypeScript test reaches the check of a host's getPublicKey answer against the record. Not a protocol operation."
     },
     {
       "name": "generate_keypair",
