@@ -3357,6 +3357,16 @@ The zero nonce is safe because each `k_i` seals exactly one plaintext. The advan
 
 **Ordering.** H publishes the advance before it encrypts any message under epoch N, so every member that holds a chain with H holds the key for H's first message under it. Under a block, H drops its chains with the blocked identity before it writes the advance (§9.16.3 step 2).
 
+**A distribution whose publish fails.** A sender-key distribution is an advance with its pushed entries, or a `SenderKeyResponse` (§9.16.2) that H sends to one member. H's publish of a distribution can fail after a step H cannot undo: H has persisted the rotation, and the membership change that caused the rotation (an Add, a removal, a leave, a reset, or a revocation of §9.16.10) has merged. When a relay refuses such a publish or the transport fails it, H does the following:
+
+1. H keeps the distribution in the durable state it wrote with the rotation or the Add. H records the time of the first attempt and the number of attempts.
+2. H publishes the distribution again under the republish rule of §9.10.2. Each attempt requests the TTL that remains of the first attempt: `MAX_BLOB_TTL` (604,800 s) minus the seconds since the first attempt.
+3. H drops the distribution when no TTL remains, `MAX_BLOB_TTL` after the first attempt, because the republish rule forbids a republish whose remaining TTL is zero. This section therefore defines no age cap of its own. A member left without the key requests it as §9.16.2 states.
+4. H reports each failed attempt, and each drop, to the operation that rotated or changed the membership. The report is a typed outcome that names the target identity and the attempt count.
+5. H never reverses the rotation, the epoch increment, or the membership change because a publish failed. The operation completes, and only the delivery of its distribution stays outstanding.
+
+Each attempt carries the payload H persisted, and H seals that payload into the group's MLS epoch at the time of the attempt, so a retry seals no second sender key. When H cannot seal the payload into the group, H reports the distribution as unsealable and does not retry it. When a caller asks H to send its queued distributions, as a full reconnection does (ADR-029, offline and sync strategy), that request follows no step that a failure could leave half done, so H returns the failure to that caller as an error. H keeps at most `MAX_PUSH_CHAINS_PER_MEMBER` (16) queued distributions for one target identity, the number of responses this section lets H keep for one requester identity. A further distribution for that identity makes H drop the oldest one queued for it, and H reports that drop.
+
 ### 9.16.10 Rotation Bound to a Governance Commit
 
 Alec ruled on 2026-10-21: "Yes to ban rotate commit" (ADR-066 decision 36). The design below is the architect agent's under that ruling.
