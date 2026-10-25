@@ -627,8 +627,8 @@ mod handle_affinity_tests {
             bi_b.core.instance_id(),
             "new_py() must mint distinct instance ids across instances"
         );
-        init_context_manager_for_test(bi_a);
-        init_context_manager_for_test(bi_b);
+        init_context_manager_for_test(bi_a).expect("the test supervisor initializes");
+        init_context_manager_for_test(bi_b).expect("the test supervisor initializes");
 
         // Mint a node on bi_a. Its instance_id is stamped from
         // bi_a.core.instance_id().
@@ -755,7 +755,7 @@ mod handle_affinity_tests {
         pyo3::Python::with_gil(|py| {
             let bi_arc = std::sync::Arc::new(crate::runtime::PyBridgeInstance::new_py());
             let bi = &*bi_arc;
-            init_context_manager_for_test(bi);
+            init_context_manager_for_test(bi).expect("the test supervisor initializes");
             let node = fullstack_create_node_impl(bi, "did:dht:z6MkSameTest".to_owned());
 
             // Direct check against the matching instance: must not error

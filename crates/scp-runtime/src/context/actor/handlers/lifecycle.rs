@@ -711,18 +711,12 @@ fn handle_shutdown_self_actor(
     // actor's `reconcile_timers` clears the governance interval on its next
     // turn, and the one-shot TTL arm is a no-op on a non-Active context.
 
-    // Clone the event-log provider `Arc` so the async tail owns it (no `&deps`
-    // borrow crosses the await). The event-log destroy still runs after the
-    // MLS-group destroy (crypto released before the event-log structure).
-    let event_log = std::sync::Arc::clone(&deps.event_log);
+    // Release the context's in-memory event log and write gate after the
+    // MLS-group release (crypto released before the event-log structure).
+    // Shutdown touches no storage, so the next restore loads the stored log
+    // (spec section 17.3, "Event log write failures").
+    deps.event_log.release_event_log(&ctx_id_bytes);
     async move {
-        if let Err(e) = event_log.destroy_event_log(&ctx_id_bytes).await {
-            tracing::debug!(
-                context_id = %context_id,
-                error = %e,
-                "failed to destroy event log during shutdown — may already be gone"
-            );
-        }
         let _ = reply.send(Ok(()));
         // Shutdown mutates external resources (crypto, event log, task
         // handles) but does NOT mutate `state` itself — `cancel()` takes

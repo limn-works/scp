@@ -9174,3 +9174,473 @@ fn push_registrar_register_reaches_relay_publish() {
         );
     }
 }
+
+/// Spec 17 §17.3 "Event log write failures": an actor's shutdown releases its
+/// context's in-memory event log and write gate, and never destroys the log.
+/// Shutdown is not a deletion; destroying the log there deleted the stored log
+/// of every context at every process stop.
+#[test]
+fn shutdown_releases_the_event_log_and_never_destroys_it() {
+    const HANDLERS_LIFECYCLE_SRC: &str =
+        include_str!("../../../../crates/scp-runtime/src/context/actor/handlers/lifecycle.rs");
+    let code = strip_non_code(HANDLERS_LIFECYCLE_SRC);
+    let body = extract_fn_body(&code, "handle_shutdown_self_actor")
+        .expect("handlers/lifecycle.rs must define handle_shutdown_self_actor");
+    assert!(
+        body.contains(".release_event_log("),
+        "handle_shutdown_self_actor must release the context's event log"
+    );
+    assert!(
+        !body.contains("destroy_event_log"),
+        "handle_shutdown_self_actor must not destroy the context's event log"
+    );
+}
+
+/// Spec 17 §17.17 (capability classification): an event log with no store is
+/// a test construct. `MerkleEventLogProvider::new()` and its `Default` build
+/// one, so no shipped source under `crates/` calls either; production builds
+/// the provider with `with_persistence`.
+///
+/// Test code is code the compiler builds only under `test` or a `testing`
+/// feature, which the shipped-feature-graph gate keeps out of every shipped
+/// artifact:
+/// - a `mod` block gated by such a `cfg`;
+/// - a file declared by such a gated `mod name;`;
+/// - a crate on [`TEST_ONLY_CRATES`], each of which every other workspace
+///   manifest reaches only through `[dev-dependencies]` or an optional
+///   dependency that only a `testing` feature enables.
+///
+/// Every other crate is shipped, including one that no manifest names: the
+/// bridges and the relay ship as libraries and binaries of their own.
+#[test]
+fn no_shipped_source_builds_an_event_log_without_a_store() {
+    let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("scp-testing sits under crates/");
+    let mut crate_dirs = Vec::new();
+    for krate in std::fs::read_dir(crates)
+        .expect("crates/ is readable")
+        .flatten()
+    {
+        let dir = krate.path();
+        if dir.join("Cargo.toml").is_file() {
+            crate_dirs.push(dir.clone());
+        }
+        // Nested crates such as `scp-ffi/napi` keep their own manifest.
+        if let Ok(nested) = std::fs::read_dir(&dir) {
+            for sub in nested.flatten() {
+                if sub.path().join("Cargo.toml").is_file() {
+                    crate_dirs.push(sub.path());
+                }
+            }
+        }
+    }
+    let manifests: Vec<String> = crate_dirs
+        .iter()
+        .map(|dir| std::fs::read_to_string(dir.join("Cargo.toml")).expect("a manifest is readable"))
+        .collect();
+
+    let mut files = Vec::new();
+    // A crate counts as scanned only when its `src` walk yields a file, so a
+    // moved or unreadable source tree fails the must-cover check below
+    // instead of passing it with nothing read.
+    let mut scanned = std::collections::BTreeMap::new();
+    let mut test_only = std::collections::BTreeSet::new();
+    for (dir, manifest) in crate_dirs.iter().zip(&manifests) {
+        let name = manifest_package_name(manifest).expect("a manifest names its package");
+        if TEST_ONLY_CRATES.contains(&name.as_str()) {
+            let others = manifests.iter().filter(|m| !std::ptr::eq(*m, manifest));
+            assert!(
+                reached_only_by_tests(&name, others),
+                "{name} is listed as test-only, but a manifest ships it"
+            );
+            test_only.insert(name);
+            continue;
+        }
+        let before = files.len();
+        collect_rust_files(&dir.join("src"), &mut files);
+        let found = files.len() - before;
+        if found > 0 {
+            scanned.insert(name, found);
+        }
+    }
+    assert_eq!(
+        test_only,
+        TEST_ONLY_CRATES
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect(),
+        "every test-only crate names a workspace crate"
+    );
+    for shipped in [
+        "scp-ffi",
+        "scp-ffi-napi",
+        "scp-ffi-uniffi",
+        "scp-relay",
+        "scp-client-wasm",
+    ] {
+        let found = scanned.get(shipped).copied().unwrap_or(0);
+        assert!(
+            found >= 1,
+            "the scan must read at least one source file of {shipped}, read {found}: {scanned:?}"
+        );
+    }
+    assert!(
+        files.len() > 100,
+        "the walk must reach the workspace sources, found {}",
+        files.len()
+    );
+
+    let sources: Vec<(std::path::PathBuf, String, String)> = files
+        .into_iter()
+        .map(|file| {
+            let src = std::fs::read_to_string(&file).expect("a source file is readable");
+            let code = strip_non_code_keeping_cfg(&src);
+            (file, src, code)
+        })
+        .collect();
+    let test_files: std::collections::HashSet<std::path::PathBuf> = sources
+        .iter()
+        .flat_map(|(file, src, code)| test_gated_mod_files(file, src, code))
+        .collect();
+
+    let mut offenders = Vec::new();
+    for (file, _, code) in &sources {
+        if test_files.contains(file) {
+            continue;
+        }
+        offenders.extend(
+            store_free_event_log_calls(code)
+                .into_iter()
+                .map(|call| format!("{}: {call}", file.display())),
+        );
+    }
+    assert!(
+        offenders.is_empty(),
+        "shipped sources build an event log with no store: {offenders:#?}"
+    );
+}
+
+/// The workspace crates the store-free scan skips: each is reached only by
+/// tests, which the scan asserts.
+const TEST_ONLY_CRATES: &[&str] = &["scp-testing", "scp-relay-mock", "scp-ffi-napi-test-stubs"];
+
+/// The scan's own rules: a call in shipped code is reported, and the same
+/// call inside a test-gated module is not.
+#[test]
+fn the_store_free_event_log_scan_reports_shipped_calls_only() {
+    let shipped = strip_non_code_keeping_cfg(
+        "fn build() -> Box<dyn P> { Box::new(MerkleEventLogProvider::new()) }\n\
+         fn other() { let _ = MerkleEventLogProvider::default(); }\n",
+    );
+    assert_eq!(store_free_event_log_calls(&shipped).len(), 2);
+    let gated = strip_non_code_keeping_cfg(
+        "fn build() -> Box<dyn P> { Box::new(MerkleEventLogProvider::with_persistence(s)) }\n\
+         #[cfg(test)]\nmod shutdown_sweep_tests { fn s() { MerkleEventLogProvider::new(); } }\n\
+         #[cfg(all(test, feature = \"testing\"))]\n#[allow(clippy::unwrap_used)]\n\
+         mod restore_tests { fn r() { MerkleEventLogProvider::new(); } }\n\
+         #[cfg(feature = \"testing\")]\npub mod fixtures { fn f() { MerkleEventLogProvider::new(); } }\n",
+    );
+    assert!(store_free_event_log_calls(&gated).is_empty());
+    let any_cfg = strip_non_code_keeping_cfg(
+        "#[cfg(any(test, feature = \"server\"))]\nmod shipped { fn s() { MerkleEventLogProvider::new(); } }\n",
+    );
+    assert_eq!(
+        store_free_event_log_calls(&any_cfg).len(),
+        1,
+        "a cfg that a shipped feature satisfies does not make a module test code"
+    );
+
+    let declaring = std::path::Path::new("/w/crates/c/src/context/mod.rs");
+    let raw = "#[cfg(test)]\nmod pipeline_tests;\n\
+               #[cfg(test)]\n#[path = \"welcome_tests.rs\"]\nmod welcome;\n\
+               mod shipped;\n";
+    let found = test_gated_mod_files(declaring, raw, &strip_non_code_keeping_cfg(raw));
+    assert!(found.contains(&std::path::PathBuf::from(
+        "/w/crates/c/src/context/pipeline_tests.rs"
+    )));
+    assert!(found.contains(&std::path::PathBuf::from(
+        "/w/crates/c/src/context/welcome_tests.rs"
+    )));
+    assert!(!found.iter().any(|p| p.ends_with("shipped.rs")));
+
+    let manifest_dev =
+        "[package]\nname = \"a\"\n[dev-dependencies]\nsupport = { path = \"../s\" }\n";
+    let manifest_opt = "[package]\nname = \"b\"\n[features]\ntesting = [\n    \"dep:support\",\n]\n\
+                        [dependencies]\nsupport = { path = \"../s\", optional = true }\n";
+    let manifest_shipped =
+        "[package]\nname = \"c\"\n[dependencies]\nsupport = { path = \"../s\" }\n";
+    let manifest_server = "[package]\nname = \"d\"\n[features]\nserver = [\"dep:support\"]\n\
+                           [dependencies]\nsupport = { path = \"../s\", optional = true }\n";
+    let as_vec = |ms: &[&str]| ms.iter().map(|m| (*m).to_owned()).collect::<Vec<_>>();
+    assert!(reached_only_by_tests(
+        "support",
+        as_vec(&[manifest_dev, manifest_opt]).iter()
+    ));
+    assert!(!reached_only_by_tests(
+        "support",
+        as_vec(&[manifest_dev, manifest_shipped]).iter()
+    ));
+    assert!(!reached_only_by_tests(
+        "support",
+        as_vec(&[manifest_server]).iter()
+    ));
+}
+
+/// [`strip_non_code`] with each `#[cfg(...)]` attribute restored from `src`,
+/// so a `feature = "testing"` predicate keeps its feature name. The cleaner
+/// blanks one char per char, so a char index in its output is the same char
+/// index in `src`.
+fn strip_non_code_keeping_cfg(src: &str) -> String {
+    let raw: Vec<char> = src.chars().collect();
+    let mut code: Vec<char> = strip_non_code(src).chars().collect();
+    assert_eq!(raw.len(), code.len(), "the cleaner keeps one char per char");
+    let opener: Vec<char> = "#[cfg(".chars().collect();
+    let mut i = 0;
+    while i + opener.len() <= code.len() {
+        if code[i..i + opener.len()] != opener[..] {
+            i += 1;
+            continue;
+        }
+        // Blanked strings hold no bracket, so depth counting in `code` finds
+        // the attribute's closing `]`.
+        let mut depth = 0usize;
+        let mut end = None;
+        for (j, ch) in code.iter().enumerate().skip(i + 1) {
+            match ch {
+                '[' => depth += 1,
+                ']' if depth <= 1 => {
+                    end = Some(j);
+                    break;
+                }
+                ']' => depth -= 1,
+                _ => {}
+            }
+        }
+        let Some(end) = end else { break };
+        code[i..=end].copy_from_slice(&raw[i..=end]);
+        i = end + 1;
+    }
+    code.into_iter().collect()
+}
+
+fn collect_rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rust_files(&path, out);
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            out.push(path);
+        }
+    }
+}
+
+/// Every store-free event-log construction in `code` (from
+/// [`strip_non_code`]) outside a test-gated `mod` block.
+fn store_free_event_log_calls(code: &str) -> Vec<&'static str> {
+    let shipped: String = without_test_gated_mod_blocks(code)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    [
+        "MerkleEventLogProvider::new()",
+        "MerkleEventLogProvider::default()",
+    ]
+    .into_iter()
+    .filter(|call| shipped.contains(call))
+    .collect()
+}
+
+/// Whether a normalized `#[cfg(...)]` attribute holds only when `test` or the
+/// `testing` feature is on.
+fn cfg_requires_test(attr: &str) -> bool {
+    let attr: String = attr.split_whitespace().collect();
+    attr == "#[cfg(test)]"
+        || attr == "#[cfg(feature=\"testing\")]"
+        || attr == "#[cfg(any(test,feature=\"testing\"))]"
+        || attr.starts_with("#[cfg(all(test,")
+        || attr.starts_with("#[cfg(all(feature=\"testing\",")
+}
+
+/// Where the run of outer attributes that ends `head` begins, when one of them
+/// requires `test` or the `testing` feature; `None` otherwise.
+fn test_gated_attrs_start(head: &str) -> Option<usize> {
+    let mut start = head.trim_end().len();
+    let mut gated = false;
+    while head[..start].ends_with(']') {
+        let attr = head[..start].rfind("#[")?;
+        gated |= cfg_requires_test(&head[attr..start]);
+        start = head[..attr].trim_end().len();
+    }
+    gated.then_some(start)
+}
+
+/// The `mod` items in `code`: (start of the `mod` keyword, its name, the byte
+/// just past the name).
+fn mod_items(code: &str) -> Vec<(usize, &str, usize)> {
+    let mut items = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = code[from..].find("mod ") {
+        let at = from + rel;
+        from = at + 4;
+        let boundary = code[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+        if !boundary {
+            continue;
+        }
+        let rest = &code[at + 4..];
+        let len = rest
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        if len > 0 {
+            items.push((at, &rest[..len], at + 4 + len));
+        }
+    }
+    items
+}
+
+/// The start of the item that owns the `mod` keyword at `at`: the keyword
+/// itself, or a visibility (`pub`, `pub(crate)`, ...) before it.
+fn item_head_end(code: &str, at: usize) -> usize {
+    let head = code[..at].trim_end();
+    if let Some(stripped) = head.strip_suffix(')')
+        && let Some(open) = stripped.rfind("pub(")
+    {
+        return open;
+    }
+    if head.ends_with("pub") {
+        return head.len() - 3;
+    }
+    at
+}
+
+/// `code` with every `mod name { ... }` block gated by a test `cfg` removed.
+fn without_test_gated_mod_blocks(code: &str) -> String {
+    let mut kept = String::with_capacity(code.len());
+    let mut cursor = 0;
+    for (at, _, name_end) in mod_items(code) {
+        if at < cursor {
+            continue;
+        }
+        let after = code[name_end..].trim_start();
+        if !after.starts_with('{') {
+            continue;
+        }
+        let open = code.len() - after.len();
+        let item = item_head_end(code, at);
+        let (Some(start), Some(len)) = (
+            test_gated_attrs_start(&code[cursor..item]),
+            matching_brace_end(&code[open..]),
+        ) else {
+            continue;
+        };
+        kept.push_str(&code[cursor..cursor + start]);
+        kept.push(' ');
+        cursor = open + len;
+    }
+    kept.push_str(&code[cursor..]);
+    kept
+}
+
+/// The files that `file` (raw source `src`, [`strip_non_code`] output `code`)
+/// declares through a test-gated `mod name;`, at each path rustc would load:
+/// the `#[path = "..."]` value beside the declaring file, or `name.rs` /
+/// `name/mod.rs` in the declaring module's directory.
+fn test_gated_mod_files(file: &std::path::Path, src: &str, code: &str) -> Vec<std::path::PathBuf> {
+    let dir = file.parent().expect("a source file has a directory");
+    let stem = file
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    let module_dir = if matches!(stem, "mod" | "lib" | "main") {
+        dir.to_path_buf()
+    } else {
+        dir.join(stem)
+    };
+    let mut out = Vec::new();
+    for (at, name, name_end) in mod_items(code) {
+        if !code[name_end..].trim_start().starts_with(';') {
+            continue;
+        }
+        let head = &code[..item_head_end(code, at)];
+        let Some(start) = test_gated_attrs_start(head) else {
+            continue;
+        };
+        // `strip_non_code` blanks string contents, so read a `#[path]` value
+        // from the raw attribute run before the same declaration.
+        if head[start..].contains("#[path") {
+            let decl = format!("mod {name};");
+            let path = src.find(&decl).and_then(|at| {
+                let attrs = &src[..at];
+                let value = &attrs[attrs.rfind("#[path")?..];
+                let open = value.find('"')? + 1;
+                let len = value[open..].find('"')?;
+                Some(value[open..open + len].to_owned())
+            });
+            out.push(dir.join(path.expect("a #[path] attribute names its file")));
+        }
+        out.push(module_dir.join(format!("{name}.rs")));
+        out.push(module_dir.join(name).join("mod.rs"));
+    }
+    out
+}
+
+/// The `name` under a manifest's `[package]`.
+fn manifest_package_name(manifest: &str) -> Option<String> {
+    let mut in_package = false;
+    for line in manifest.lines().map(str::trim) {
+        if line.starts_with('[') {
+            in_package = line == "[package]";
+        } else if in_package && let Some(value) = line.strip_prefix("name") {
+            return Some(
+                value
+                    .trim_start()
+                    .strip_prefix('=')?
+                    .trim()
+                    .trim_matches('"')
+                    .to_owned(),
+            );
+        }
+    }
+    None
+}
+
+/// Whether every manifest in `others` that names crate `name` reaches it only
+/// as a dev-dependency or as an optional dependency that only a feature named
+/// `testing` enables.
+fn reached_only_by_tests<'a>(name: &str, others: impl Iterator<Item = &'a String>) -> bool {
+    let dep_key = format!("{name} ");
+    let dep_eq = format!("{name}=");
+    let enabler = format!("\"dep:{name}\"");
+    for manifest in others {
+        let mut section = String::new();
+        let mut feature = String::new();
+        for line in manifest.lines().map(str::trim) {
+            if line.starts_with('[') && line.ends_with(']') && !line.contains('"') {
+                line.clone_into(&mut section);
+                continue;
+            }
+            if section == "[features]" {
+                if let Some(eq) = line.find('=') {
+                    line[..eq].trim().clone_into(&mut feature);
+                }
+                if line.contains(&enabler) && feature != "testing" {
+                    return false;
+                }
+                continue;
+            }
+            let names_dep = line.starts_with(&dep_key) || line.starts_with(&dep_eq);
+            let shipped_section =
+                section.ends_with("dependencies]") && !section.ends_with("dev-dependencies]");
+            if names_dep && shipped_section && !line.contains("optional = true") {
+                return false;
+            }
+        }
+    }
+    true
+}

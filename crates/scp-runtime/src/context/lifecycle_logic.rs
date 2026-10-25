@@ -251,7 +251,7 @@ pub fn post_join_bookkeeping(
     // Participation-record path consumes only the merged event set;
     // the consequence window anchor is not used here.
     let (join_events, _convergent_now) =
-        super::governance_logic::event_log_entries_for_consequences(
+        super::governance_logic::event_log_entries_for_consequences_after_side_effect(
             receive_buffer,
             context_id,
             now,

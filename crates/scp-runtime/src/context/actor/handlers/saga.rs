@@ -1976,6 +1976,7 @@ async fn commit_b_settle_finalize(
         Ok(outlet_invoked_payload_bytes) => {
             deps.event_log
                 .append_context_event_with_payload(
+                    crate::context::builder::AppendMode::AfterSideEffect,
                     &target_context_id,
                     scp_event_log::EventType::OutletInvoked,
                     &caller_did_str,
@@ -2843,6 +2844,7 @@ async fn commit_b_stream_settle_finalize(
         Ok(bytes) => {
             deps.event_log
                 .append_context_event_with_payload(
+                    crate::context::builder::AppendMode::AfterSideEffect,
                     &target_context_id,
                     scp_event_log::EventType::OutletInvoked,
                     &caller_did_str,
@@ -3175,6 +3177,7 @@ async fn commit_a(
         Ok((invoked_leaf_secs, invoked_payload_bytes)) => {
             deps.event_log
                 .append_context_event_with_payload(
+                    crate::context::builder::AppendMode::AfterSideEffect,
                     &req.caller_context_id,
                     scp_event_log::EventType::CrossContextOutletInvoked,
                     req.caller_did.as_ref(),
@@ -3599,6 +3602,7 @@ async fn emit_divergence_marker(
     if let Err(err) = deps
         .event_log
         .append_context_event_with_payload(
+            crate::context::builder::AppendMode::AfterSideEffect,
             &context_id,
             scp_event_log::EventType::CrossContextDivergenceMarker,
             scp_event_log::system_actors::SYSTEM_SAGA_ACTOR,
@@ -3837,6 +3841,14 @@ mod tests {
     struct TestEventLog;
     #[async_trait::async_trait]
     impl crate::context::builder::ContextEventLogProvider for TestEventLog {
+        fn event_log_entries(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            Ok(None)
+        }
+
         async fn init_event_log(
             &self,
             _id: &[u8; 32],
@@ -3910,6 +3922,14 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl crate::context::builder::ContextEventLogProvider for CountingEventLog {
+        fn event_log_entries(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            Ok(None)
+        }
+
         async fn init_event_log(
             &self,
             _id: &[u8; 32],
@@ -4033,6 +4053,14 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl crate::context::builder::ContextEventLogProvider for CrossContextCountingEventLog {
+        fn event_log_entries(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            Ok(None)
+        }
+
         async fn init_event_log(
             &self,
             _id: &[u8; 32],

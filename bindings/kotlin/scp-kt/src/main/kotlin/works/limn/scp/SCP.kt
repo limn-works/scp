@@ -742,14 +742,19 @@ class SCP internal constructor(
             proposedSeconds = proposedSeconds,
         )
 
-    /** Forwards to [NativeScp.contextResetTtlTimer] on [inner]. */
+    /**
+     * Forwards to [NativeScp.contextResetTtlTimer] on [inner].
+     *
+     * @throws ScpException the bridge's typed error when the reset fails.
+     */
     suspend fun contextResetTtlTimer(
         handle: ContextHandle,
         newSeconds: ULong,
-    ) = inner.contextResetTtlTimer(
-        handle = handle,
-        newSeconds = newSeconds,
-    )
+    ): Unit =
+        inner.contextResetTtlTimer(
+            handle = handle,
+            newSeconds = newSeconds,
+        )
 
     /**
      * Forwards to [NativeScp.contextSend] on [inner].

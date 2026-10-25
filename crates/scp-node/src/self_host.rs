@@ -273,6 +273,13 @@ pub struct DeploySiteParams<'a, C: KeyCustody> {
     /// on that handle, so snapshots, the saga journal, and the `OpenMLS` view
     /// share one backend (spec §17.6).
     pub persistence: Box<dyn scp_core::context::persistence::ContextPersistence>,
+    /// The loopback supervisor's event log. Build it over the SAME `Storage`
+    /// handle as `persistence`, e.g. a `MerkleEventLogProvider::with_persistence`
+    /// over a `ProtocolRepositoryEventLogBridge` on that handle, so every
+    /// event the supervisor logs survives a restart with its snapshots (spec
+    /// sections 17.3 and 17.17; an event log with no store is a test
+    /// construct).
+    pub event_log: Box<dyn scp_core::context::builder::ContextEventLogProvider>,
     /// The custody that holds the node identity's wrapping key (spec 09
     /// §9.16.1), normally `single_custody_source` over `custody`. The loopback
     /// supervisor fails closed with `WrappingKeyCustodyUnavailable` when it
@@ -420,6 +427,7 @@ where
         custody,
         durable,
         persistence,
+        event_log,
         wrapping_custody,
         assets,
     } = params;
@@ -433,6 +441,7 @@ where
         key_resolver,
         durable,
         persistence,
+        event_log,
         wrapping_custody,
     )
     .await?;
@@ -488,7 +497,8 @@ impl SelfHostDeployer {
     /// the caller must then leave the storage behind `durable` open.
     // Provider-bootstrap entry: each argument is a distinct, required provider
     // the loopback supervisor needs (node, identity, hostname, signing key,
-    // governance resolver, durable providers, context persistence). The durable
+    // governance resolver, durable providers, context persistence, event log).
+    // The durable
     // saga journal and the
     // `mls_storage` view arrive bound into one `DurableProviders` so they cannot
     // be wired to divergent backends — mirroring the FFI
@@ -503,6 +513,7 @@ impl SelfHostDeployer {
         key_resolver: scp_core::context::governance::KeyResolver,
         durable: scp_core::context::supervisor::DurableProviders,
         persistence: Box<dyn scp_core::context::persistence::ContextPersistence>,
+        event_log: Box<dyn scp_core::context::builder::ContextEventLogProvider>,
         wrapping_custody: scp_core::context::supervisor::WrappingCustodySource,
     ) -> Result<Self, SelfHostError>
     where
@@ -522,7 +533,10 @@ impl SelfHostDeployer {
             &author_did,
             key_resolver,
             durable,
-            persistence,
+            LoopbackStores {
+                persistence,
+                event_log,
+            },
             wrapping_custody,
         )
         .await?;
@@ -789,6 +803,13 @@ fn colocated_resolve_vm_on_dedicated_thread<R: scp_identity::resolver::DidResolv
     rx.recv().ok().flatten()
 }
 
+/// The loopback supervisor's per-context stores: context snapshots and the
+/// event log, both over the node's storage (spec sections 17.3 and 17.17).
+struct LoopbackStores {
+    persistence: Box<dyn scp_core::context::persistence::ContextPersistence>,
+    event_log: Box<dyn scp_core::context::builder::ContextEventLogProvider>,
+}
+
 /// Builds an in-process [`Supervisor`](scp_core::context::supervisor::Supervisor)
 /// connected to the node's own loopback relay and registers `author_did` as a
 /// local DID.
@@ -810,7 +831,7 @@ async fn connect_loopback_supervisor<S>(
     author_did: &scp_did::DID,
     key_resolver: scp_core::context::governance::KeyResolver,
     durable: scp_core::context::supervisor::DurableProviders,
-    persistence: Box<dyn scp_core::context::persistence::ContextPersistence>,
+    stores: LoopbackStores,
     wrapping_custody: scp_core::context::supervisor::WrappingCustodySource,
 ) -> Result<Arc<scp_core::context::supervisor::Supervisor>, SelfHostError>
 where
@@ -842,8 +863,6 @@ where
         node_did.to_owned(),
         std::sync::Arc::new(scp_clock::SystemClock),
     ));
-    let event_log: Box<dyn scp_core::context::builder::ContextEventLogProvider> =
-        Box::new(scp_core::context::providers::MerkleEventLogProvider::new());
     let (event_tx, _event_rx) = tokio::sync::broadcast::channel(1000);
 
     // Share the provider's exact hardened `Clock` Arc with the supervisor so the
@@ -858,9 +877,9 @@ where
     let supervisor = scp_core::context::supervisor::Supervisor::with_providers_and_journal(
         crypto,
         transport,
-        event_log,
+        stores.event_log,
         key_resolver,
-        persistence,
+        stores.persistence,
         None,
         Some(event_tx),
         Some(clock),
@@ -2799,6 +2818,15 @@ where
             scp_core::store::ProtocolRepository::new(Arc::clone(&mls_inner)),
         )),
     );
+    // The loopback supervisor's event log over the same store, so its events
+    // survive a restart with the snapshots (spec sections 17.3 and 17.17).
+    let event_log: Box<dyn scp_core::context::builder::ContextEventLogProvider> = Box::new(
+        scp_core::context::providers::MerkleEventLogProvider::with_persistence(Arc::new(
+            scp_core::store::context::ProtocolRepositoryEventLogBridge::new(Arc::new(
+                scp_core::store::ProtocolRepository::new(Arc::clone(&mls_inner)),
+            )),
+        )),
+    );
 
     let signing_key_handle = node.identity().identity().active_signing_key;
     let started = SelfHostDeployer::start(
@@ -2810,6 +2838,7 @@ where
         key_resolver,
         durable,
         persistence,
+        event_log,
         // The node identity's wrapping key lives in the node's own custody,
         // beside its signing keys (spec 09 §9.16.1).
         scp_core::context::supervisor::single_custody_source(Arc::clone(custody)),

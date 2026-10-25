@@ -4747,12 +4747,15 @@ pub(crate) async fn context_handle_ttl_expiry_on(
         }),
         reply: tx,
     };
-    sup.dispatch_ttl_close_command(cmd).await.map_err(|e| {
-        napi::Error::from_reason(format!("supervisor dispatch_ttl_close_command failed: {e}"))
-    })?;
+    sup.dispatch_ttl_close_command(cmd)
+        .await
+        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
     rx.await
         .map_err(|e| {
-            napi::Error::from_reason(format!("handle_ttl_expiry shim reply dropped: {e}"))
+            NapiError::from(ScpNapiError::Context {
+                message: format!("handle_ttl_expiry shim reply dropped: {e}"),
+                code: codes::CTX_2038.to_owned(),
+            })
         })?
         .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
     Ok(())
@@ -4783,13 +4786,16 @@ pub(crate) async fn context_propose_ttl_extension_on(
         proposed_duration: duration,
         reply: tx,
     };
-    sup.dispatch_ttl_close_command(cmd).await.map_err(|e| {
-        napi::Error::from_reason(format!("supervisor dispatch_ttl_close_command failed: {e}"))
-    })?;
+    sup.dispatch_ttl_close_command(cmd)
+        .await
+        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
     let unanimous = rx
         .await
         .map_err(|e| {
-            napi::Error::from_reason(format!("propose_ttl_extension shim reply dropped: {e}"))
+            NapiError::from(ScpNapiError::Context {
+                message: format!("propose_ttl_extension shim reply dropped: {e}"),
+                code: codes::CTX_2039.to_owned(),
+            })
         })?
         .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
     Ok(unanimous)
@@ -4833,11 +4839,16 @@ pub(crate) async fn context_reset_ttl_timer_on(
         }),
         reply: tx,
     };
-    sup.dispatch_ttl_close_command(cmd).await.map_err(|e| {
-        napi::Error::from_reason(format!("supervisor dispatch_ttl_close_command failed: {e}"))
-    })?;
+    sup.dispatch_ttl_close_command(cmd)
+        .await
+        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
     rx.await
-        .map_err(|e| napi::Error::from_reason(format!("reset_ttl_timer shim reply dropped: {e}")))?
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("reset_ttl_timer shim reply dropped: {e}"),
+                code: codes::CTX_2039.to_owned(),
+            })
+        })?
         .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
     Ok(())
 }
@@ -8051,6 +8062,56 @@ mod tests {
                     &ContextError::MembershipFailed("bad snapshot".to_owned()),
                 )),
                 fallback
+            );
+        }
+    }
+
+    /// The TTL operations keep the typed code of a dispatch error: after the
+    /// Supervisor's shutdown no actor holds the context, and expiry,
+    /// extension and reset each fail with the not-registered code
+    /// `SCP-CTX-2001`, where the bridge used to flatten the dispatch error
+    /// into an uncoded reason.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ttl_operations_keep_the_dispatch_error_code() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = std::sync::Arc::clone(&scp.inner);
+        let owner = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed");
+        let handle = super::context_create_on(
+            &bi,
+            &owner,
+            r#"{"memoryScope":"ephemeral","ceiling":["messages:read"]}"#.to_owned(),
+        )
+        .await
+        .expect("context_create should succeed");
+        crate::runtime::supervisor(&bi)
+            .expect("supervisor initialized")
+            .shutdown_all_contexts()
+            .await;
+
+        let expiry = super::context_handle_ttl_expiry_on(&bi, &handle)
+            .await
+            .err();
+        let extension =
+            super::context_propose_ttl_extension_on(&bi, &handle, owner.inner.did.clone(), 60)
+                .await
+                .err();
+        let reset = super::context_reset_ttl_timer_on(&bi, &handle, 60)
+            .await
+            .err();
+        for (name, err) in [
+            ("expiry", expiry),
+            ("extension", extension),
+            ("reset", reset),
+        ] {
+            let err = err.unwrap_or_else(|| panic!("{name} after shutdown must fail"));
+            assert!(
+                err.reason.starts_with(&format!("[{}] ", codes::CTX_2001)),
+                "{name} keeps the dispatch error's code, got: {}",
+                err.reason
             );
         }
     }

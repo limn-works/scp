@@ -895,13 +895,19 @@ impl Drop for PyBridgeInstance {
 ///
 /// Subsequent calls are no-ops (`OnceLock` guarantees single initialization).
 /// If the manager is already initialized with a different DID, a warning is logged.
-pub fn init_context_manager(bi: &PyBridgeInstance, local_did: &str) {
+///
+/// # Errors
+///
+/// Returns [`ScpPyError::ContextError`] (`STORAGE_8000`) when the instance has
+/// no storage, so neither the event log nor the supervisor has a store. No
+/// supervisor is attached.
+pub fn init_context_manager(bi: &PyBridgeInstance, local_did: &str) -> Result<(), ScpPyError> {
     if bi.core.has_supervisor() {
         tracing::debug!(
             requested_did = %local_did,
             "init_context_manager: ContextManager already attached — using existing instance"
         );
-        return;
+        return Ok(());
     }
 
     let did = local_did.to_owned();
@@ -909,21 +915,16 @@ pub fn init_context_manager(bi: &PyBridgeInstance, local_did: &str) {
         did,
         std::sync::Arc::new(scp_clock::SystemClock),
     ));
-    let supervisor_arc = match build_supervisor(
+    let event_log = build_event_log_provider(bi)?;
+    let supervisor_arc = build_supervisor(
         bi,
         crypto,
         Box::new(NotConfiguredTransportProvider),
-        build_event_log_provider(bi),
+        event_log,
         None,
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(error = %e, "init_context_manager: build_supervisor failed");
-            return;
-        }
-    };
-
+    )?;
     bi.core.set_supervisor(supervisor_arc);
+    Ok(())
 }
 
 /// Initializes the bridge instance's [`Supervisor`](scp_core::context::supervisor::Supervisor) with custom providers.
@@ -934,6 +935,11 @@ pub fn init_context_manager(bi: &PyBridgeInstance, local_did: &str) {
 /// When `persistence` is `None` but the global storage provider has been
 /// initialized, a [`ProtocolRepositoryContextBridge`] is automatically constructed
 /// from it. Pass `Some(...)` to override with a custom implementation.
+///
+/// # Errors
+///
+/// Returns the [`build_supervisor`] error (`STORAGE_8000` when the instance
+/// has no storage). No supervisor is attached.
 pub fn init_context_manager_with(
     bi: &PyBridgeInstance,
     _local_did: &str,
@@ -941,21 +947,16 @@ pub fn init_context_manager_with(
     transport: Box<dyn ContextTransportProvider>,
     event_log: Box<dyn ContextEventLogProvider>,
     persistence: Option<Box<dyn ContextPersistence>>,
-) {
+) -> Result<(), ScpPyError> {
     // `_local_did` is retained in the signature for API stability: callers
     // construct `crypto` with the DID before calling into this function
     // (it is the `NodeMlsFactory` that carries the DID).
     if bi.core.has_supervisor() {
-        return;
+        return Ok(());
     }
-    let supervisor_arc = match build_supervisor(bi, crypto, transport, event_log, persistence) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(error = %e, "init_context_manager_with: build_supervisor failed");
-            return;
-        }
-    };
+    let supervisor_arc = build_supervisor(bi, crypto, transport, event_log, persistence)?;
     bi.core.set_supervisor(supervisor_arc);
+    Ok(())
 }
 
 /// Initializes the given bridge instance's [`Supervisor`](scp_core::context::supervisor::Supervisor) with a
@@ -977,13 +978,21 @@ pub fn init_context_manager_with(
 /// server.
 ///
 /// No-op if the bridge already has a `ContextManager` attached.
-pub fn init_context_manager_with_local_transport(bi: &PyBridgeInstance, local_did: &str) {
+///
+/// # Errors
+///
+/// Returns the [`build_supervisor`] error when the supervisor cannot be
+/// built. No supervisor is attached.
+pub fn init_context_manager_with_local_transport(
+    bi: &PyBridgeInstance,
+    local_did: &str,
+) -> Result<(), ScpPyError> {
     if bi.core.has_supervisor() {
         tracing::warn!(
             requested_did = %local_did,
             "init_context_manager_with_local_transport: ContextManager already attached — ignoring"
         );
-        return;
+        return Ok(());
     }
     // The supervisor's `mls_storage` consumer requires a single Storage
     // handle (storage-before-supervisor precondition, spec §17.6). Test
@@ -1001,21 +1010,16 @@ pub fn init_context_manager_with_local_transport(bi: &PyBridgeInstance, local_di
         did,
         std::sync::Arc::new(scp_clock::SystemClock),
     ));
-    let supervisor_arc = match build_supervisor(
+    let event_log = build_event_log_provider(bi)?;
+    let supervisor_arc = build_supervisor(
         bi,
         crypto,
         Box::new(scp_core::context::LocalTransportProvider),
-        build_event_log_provider(bi),
+        event_log,
         None,
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(error = %e, "init_context_manager_with_local_transport: build_supervisor failed");
-            return;
-        }
-    };
-
+    )?;
     bi.core.set_supervisor(supervisor_arc);
+    Ok(())
 }
 
 /// Selects in-memory encrypted storage on a test instance that has none, with
@@ -1042,26 +1046,35 @@ pub(crate) fn select_in_memory_storage_for_test(bi: &PyBridgeInstance) {
 ///
 /// Not behind `#[cfg(test)]` because integration tests (`tests/e2e_bridge.rs`)
 /// compile as separate crates and need access to this function.
-pub fn init_context_manager_for_test(bi: &PyBridgeInstance) {
+///
+/// # Errors
+///
+/// As [`init_context_manager_for_test_with_transport`].
+pub fn init_context_manager_for_test(bi: &PyBridgeInstance) -> Result<(), ScpPyError> {
     init_context_manager_for_test_with_transport(
         bi,
         "did:test:pyo3-bridge-test",
         Box::new(scp_core::context::LocalTransportProvider),
-    );
+    )
 }
 
 /// [`init_context_manager_for_test`] whose MLS credential identity is
 /// `local_did` and whose supervisor sends through `transport`.
+///
+/// # Errors
+///
+/// Returns the [`build_supervisor`] error when the supervisor cannot be
+/// built. No supervisor is attached.
 pub fn init_context_manager_for_test_with_transport(
     bi: &PyBridgeInstance,
     local_did: &str,
     transport: Box<dyn ContextTransportProvider>,
-) {
+) -> Result<(), ScpPyError> {
     // Test fixtures create contexts for DIDs they never register.
     #[cfg(feature = "testing")]
     serve_unregistered_wrapping_keys_from_test_custody(bi);
     if bi.core.has_supervisor() {
-        return;
+        return Ok(());
     }
     // The supervisor's `mls_storage` consumer requires a single Storage
     // handle (storage-before-supervisor precondition, spec §17.6). Test
@@ -1078,21 +1091,10 @@ pub fn init_context_manager_for_test_with_transport(
         local_did.to_owned(),
         std::sync::Arc::new(scp_clock::SystemClock),
     ));
-    let supervisor_arc = match build_supervisor(
-        bi,
-        crypto,
-        transport,
-        build_event_log_provider(bi),
-        None,
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(error = %e, "init_context_manager_for_test: build_supervisor failed");
-            return;
-        }
-    };
-
+    let event_log = build_event_log_provider(bi)?;
+    let supervisor_arc = build_supervisor(bi, crypto, transport, event_log, None)?;
     bi.core.set_supervisor(supervisor_arc);
+    Ok(())
 }
 
 /// Constructs a [`ProtocolRepositoryContextBridge`] from the bridge's storage
@@ -1215,8 +1217,16 @@ impl ContextPersistence for ArcContextPersistence {
 /// This replaced `NoOpEventLogProvider` so that the `PyO3` bridge emits the
 /// same initial `ContextCreated` event as the NAPI and `UniFFI`
 /// bridges (cross-bridge parity, ADR-046 `OP_EVENT_LOG_APPEND`).
-pub(crate) fn build_event_log_provider(bi: &PyBridgeInstance) -> Box<dyn ContextEventLogProvider> {
-    match bi.storage_provider() {
+///
+/// # Errors
+///
+/// Returns an error when the instance has no storage provider: an event log
+/// with no store would lose every event at restart, so the bridge never
+/// builds one (spec section 17.17, capability classification).
+pub(crate) fn build_event_log_provider(
+    bi: &PyBridgeInstance,
+) -> Result<Box<dyn ContextEventLogProvider>, ScpPyError> {
+    Ok(match bi.storage_provider() {
         Some(StorageProvider::InMemoryEncrypted(storage)) => {
             let protocol_repository = Arc::new(ProtocolRepository::new(Arc::clone(storage)));
             let bridge = ProtocolRepositoryEventLogBridge::new(protocol_repository);
@@ -1227,8 +1237,15 @@ pub(crate) fn build_event_log_provider(bi: &PyBridgeInstance) -> Box<dyn Context
             let bridge = ProtocolRepositoryEventLogBridge::new(protocol_repository);
             Box::new(MerkleEventLogProvider::with_persistence(Arc::new(bridge)))
         }
-        None => Box::new(MerkleEventLogProvider::new()),
-    }
+        None => {
+            return Err(ScpPyError::ContextError {
+                message: "no storage provider is attached, so the event log has no store; \
+                          construct the bridge with storage first (spec section 17.17)"
+                    .to_owned(),
+                code: scp_ffi_common::error_codes::STORAGE_8000.to_owned(),
+            });
+        }
+    })
 }
 
 /// Constructs a fresh per-instance `Supervisor` with the given providers.
@@ -3077,10 +3094,10 @@ pub fn register_context(
         // The test supervisor is built with a fixed MLS credential identity, so
         // `creator_did` has no consumer on this branch.
         let _ = creator_did;
-        init_context_manager_for_test(bi);
+        init_context_manager_for_test(bi)?;
     }
     #[cfg(not(test))]
-    init_context_manager(bi, creator_did);
+    init_context_manager(bi, creator_did)?;
 
     // Register FFI-specific state. `creator_did` reaches the MLS factory above.
     register_ffi_state(bi, context_id, user_ceiling)
@@ -3292,7 +3309,7 @@ mod tests {
     fn registry_stats_reflects_context_registration() {
         let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
         let bi = &*bi_arc;
-        init_context_manager_for_test(bi);
+        init_context_manager_for_test(bi).expect("the test supervisor initializes");
         let ctx_id = unique_ctx_id("stats-ctx");
         let creator = "did:dht:z6MkStatsTest";
 
@@ -3325,7 +3342,7 @@ mod tests {
     fn registry_stats_reflects_identity_registration() {
         let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
         let bi = &*bi_arc;
-        init_context_manager_for_test(bi);
+        init_context_manager_for_test(bi).expect("the test supervisor initializes");
         let did = "did:dht:z6MkStatsIdentityUnique9988";
 
         let entry = IdentityEntry {
@@ -3369,7 +3386,7 @@ mod tests {
         // Ensure bridge is initialized so known_contexts DashMap exists.
         let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
         let bi = &*bi_arc;
-        init_context_manager_for_test(bi);
+        init_context_manager_for_test(bi).expect("the test supervisor initializes");
 
         let ctx_id = unique_ctx_id("stats-known");
         let known = KnownContext {
@@ -3407,7 +3424,7 @@ mod tests {
     fn remove_identity_if_present_returns_true_when_found() {
         let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
         let bi = &*bi_arc;
-        init_context_manager_for_test(bi);
+        init_context_manager_for_test(bi).expect("the test supervisor initializes");
         let did = "did:dht:z6MkRemoveIfPresent";
         let entry = IdentityEntry {
             identity: ScpIdentity {
@@ -3433,7 +3450,7 @@ mod tests {
     fn remove_identity_if_present_returns_false_when_not_found() {
         let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
         let bi = &*bi_arc;
-        init_context_manager_for_test(bi);
+        init_context_manager_for_test(bi).expect("the test supervisor initializes");
         assert!(!remove_identity_if_present(
             bi,
             "did:dht:z6MkNotPresent9999"
@@ -3444,7 +3461,7 @@ mod tests {
     fn registry_stats_returns_all_fields() {
         let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
         let bi = &*bi_arc;
-        init_context_manager_for_test(bi);
+        init_context_manager_for_test(bi).expect("the test supervisor initializes");
         // Verifies the struct shape and that registry_stats() doesn't panic.
         let stats = registry_stats(bi);
         // Destructure to catch struct changes at compile time. If a field is
@@ -3466,9 +3483,9 @@ mod tests {
     fn context_manager_initializes_once() {
         let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
         let bi = &*bi_arc;
-        init_context_manager_for_test(bi);
+        init_context_manager_for_test(bi).expect("the test supervisor initializes");
         let sup1 = supervisor(bi).unwrap();
-        init_context_manager_for_test(bi);
+        init_context_manager_for_test(bi).expect("the test supervisor initializes");
         let sup2 = supervisor(bi).unwrap();
         // Same Arc (same pointer).
         assert!(Arc::ptr_eq(sup1, sup2));
@@ -3478,7 +3495,7 @@ mod tests {
     fn with_ffi_state_finds_registered_context() {
         let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
         let bi = &*bi_arc;
-        init_context_manager_for_test(bi);
+        init_context_manager_for_test(bi).expect("the test supervisor initializes");
         let ctx_id = unique_ctx_id("ffi-find");
         let creator = "did:dht:z6MkFfiFind";
         register_context(bi, &ctx_id, creator, &[]).unwrap();
@@ -3496,7 +3513,7 @@ mod tests {
     fn with_ffi_state_errors_on_missing_context() {
         let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
         let bi = &*bi_arc;
-        init_context_manager_for_test(bi);
+        init_context_manager_for_test(bi).expect("the test supervisor initializes");
         let result = with_ffi_state(bi, "nonexistent-ctx-id", |_| Ok(()));
         assert!(result.is_err());
     }
@@ -3506,7 +3523,7 @@ mod tests {
     fn unserved_context(prefix: &str) -> (Arc<PyBridgeInstance>, String) {
         crate::init_runtime().ok();
         let bi = Arc::new(PyBridgeInstance::new_py());
-        init_context_manager_for_test(&bi);
+        init_context_manager_for_test(&bi).expect("the test supervisor initializes");
         let ctx_id = unique_ctx_id(prefix);
         register_context(&bi, &ctx_id, "did:dht:z6MkReleaseMark", &[])
             .expect("fixture registration");
@@ -3851,7 +3868,7 @@ mod tests {
     async fn close_channel_handles_survive_ffi_state_removal() {
         let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
         let bi = &*bi_arc;
-        init_context_manager_for_test(bi);
+        init_context_manager_for_test(bi).expect("the test supervisor initializes");
         let ctx_id = unique_ctx_id("close-fail-closed");
         register_context(bi, &ctx_id, "did:dht:z6MkCloseFailClosed", &[]).unwrap();
 
@@ -3912,7 +3929,7 @@ mod tests {
             crate::init_runtime().ok();
             let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
             let bi = &*bi_arc;
-            init_context_manager_for_test(bi);
+            init_context_manager_for_test(bi).expect("the test supervisor initializes");
             let ctx_id = unique_ctx_id("ceiling-conv");
             let creator = "did:dht:z6MkCeilingConv";
 
@@ -3971,7 +3988,7 @@ mod tests {
             crate::init_runtime().ok();
             let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
             let bi = &*bi_arc;
-            init_context_manager_for_test(bi);
+            init_context_manager_for_test(bi).expect("the test supervisor initializes");
             let ctx_id = unique_ctx_id("ceiling-default");
             let creator = "did:dht:z6MkCeilingDefault";
             let declared = crate::context::default_ceiling_strings();
@@ -4003,7 +4020,7 @@ mod tests {
     fn live_context_for_regime(prefix: &str) -> (std::sync::Arc<PyBridgeInstance>, String) {
         crate::init_runtime().ok();
         let bi = std::sync::Arc::new(PyBridgeInstance::new_py());
-        init_context_manager_for_test(&bi);
+        init_context_manager_for_test(&bi).expect("the test supervisor initializes");
         let ctx_id = format!("{prefix}{}", "0".repeat(56));
         create_supervisor_context_for_test(
             &bi,
@@ -4095,7 +4112,7 @@ mod tests {
         // ContextManager. Phase D (#1695) removed the global default.
         let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
         let bi = &*bi_arc;
-        init_context_manager_for_test(bi);
+        init_context_manager_for_test(bi).expect("the test supervisor initializes");
 
         let sup = supervisor(bi).expect("supervisor should be initialized");
 
@@ -4110,7 +4127,7 @@ mod tests {
     fn bridge_instance_not_shutdown_initially() {
         let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
         let bi = &*bi_arc;
-        init_context_manager_for_test(bi);
+        init_context_manager_for_test(bi).expect("the test supervisor initializes");
 
         assert!(
             !bi.core.is_shutdown(),
@@ -4137,7 +4154,8 @@ mod tests {
                 std::sync::Arc::new(scp_clock::SystemClock),
             )),
             Box::new(scp_core::context::LocalTransportProvider),
-            build_event_log_provider(&isolated),
+            build_event_log_provider(&isolated)
+                .expect("the isolated instance carries in-memory storage"),
             None,
         )
         .expect("build_supervisor must succeed with in-memory storage set");
@@ -4477,6 +4495,49 @@ mod tests {
     // would appear to "work" while secretly wiring its `ContextManager` onto
     // the default bridge — breaking multi-instance isolation entirely.
 
+    /// An init on an instance with no storage returns the storage error and
+    /// attaches no supervisor, so a caller learns why, not only that a later
+    /// supervisor lookup failed (spec section 17.17).
+    #[test]
+    fn an_init_with_no_storage_returns_the_storage_error() {
+        let storage_error = |r: Result<(), ScpPyError>| {
+            assert!(
+                matches!(
+                    &r,
+                    Err(ScpPyError::ContextError { code, .. })
+                        if code == scp_ffi_common::error_codes::STORAGE_8000
+                ),
+                "expected the STORAGE_8000 error, got {r:?}"
+            );
+        };
+        let bi = PyBridgeInstance::new_py();
+        storage_error(init_context_manager(&bi, "did:test:no-storage"));
+        assert!(!bi.core.has_supervisor(), "no supervisor is attached");
+
+        let event_log = build_event_log_provider(&bi);
+        assert!(
+            matches!(&event_log, Err(ScpPyError::ContextError { code, .. })
+                if code == scp_ffi_common::error_codes::STORAGE_8000),
+            "the event log has no store either"
+        );
+        storage_error(init_context_manager_with(
+            &bi,
+            "did:test:no-storage",
+            Arc::new(NodeMlsFactory::new(
+                "did:test:no-storage".to_owned(),
+                std::sync::Arc::new(scp_clock::SystemClock),
+            )),
+            Box::new(scp_core::context::LocalTransportProvider),
+            build_event_log_provider(
+                &PyBridgeInstance::with_storage_py(StorageConfig::InMemory)
+                    .expect("in-memory storage construction is infallible"),
+            )
+            .expect("a stored event log"),
+            None,
+        ));
+        assert!(!bi.core.has_supervisor(), "no supervisor is attached");
+    }
+
     /// `init_context_manager_for_test(bi)` must attach the `ContextManager`
     /// to `bi.core` (not the default bridge instance).
     #[test]
@@ -4487,7 +4548,7 @@ mod tests {
             !bi.core.has_supervisor(),
             "fresh PyBridgeInstance must not have a ContextManager attached"
         );
-        init_context_manager_for_test(bi);
+        init_context_manager_for_test(bi).expect("the test supervisor initializes");
         assert!(
             bi.core.has_supervisor(),
             "init_context_manager_for_test(bi) must attach a ContextManager to bi.core"
@@ -4507,8 +4568,8 @@ mod tests {
     fn non_default_bi_gets_its_own_context_manager() {
         let bi_a = PyBridgeInstance::new_py();
         let bi_b = PyBridgeInstance::new_py();
-        init_context_manager_for_test(&bi_a);
-        init_context_manager_for_test(&bi_b);
+        init_context_manager_for_test(&bi_a).expect("the test supervisor initializes");
+        init_context_manager_for_test(&bi_b).expect("the test supervisor initializes");
         assert!(bi_a.core.has_supervisor());
         assert!(bi_b.core.has_supervisor());
         // Each instance holds a distinct Arc<ContextManager>.
@@ -4527,7 +4588,7 @@ mod tests {
     #[test]
     fn register_context_on_non_default_bi_attaches_cm_to_bi() {
         let first = PyBridgeInstance::new_py();
-        init_context_manager_for_test(&first);
+        init_context_manager_for_test(&first).expect("the test supervisor initializes");
         let first_manager = Arc::clone(first.core.try_supervisor().unwrap());
 
         let second = PyBridgeInstance::new_py();
@@ -4747,7 +4808,7 @@ mod tests {
             crate::init_runtime().ok();
             let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
             let bi = &*bi_arc;
-            init_context_manager_for_test(bi);
+            init_context_manager_for_test(bi).expect("the test supervisor initializes");
             let creator = "did:dht:z6MkGateCrashed";
             let sup = Arc::clone(supervisor(bi).expect("supervisor"));
             let rt = crate::runtime().expect("tokio runtime");

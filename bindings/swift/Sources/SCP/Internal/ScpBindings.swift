@@ -2384,11 +2384,18 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * no recorded deadline there is no TTL to extend, so the disarmed timer
      * stays disarmed rather than arming a long-past deadline (H2).
      *
-     * Routes through `&*self.inner`. Silently returns when the handle's
-     * `instance_id` does not match this `SCP`'s (matches the free-function
-     * fire-and-forget signature).
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     *
+     * # Errors
+     *
+     * Returns the typed error of every step that can fail: a handle from
+     * another instance, a bridge with no supervisor, a dispatch the supervisor
+     * refuses (no actor for the context), a reply the actor dropped, and the
+     * reset itself, whose `TtlExtended` reset leaf fails closed when its
+     * event-log append fails (spec 17 §17.3).
      */
-    func contextResetTtlTimer(handle: ContextHandle, newSeconds: UInt64) async 
+    func contextResetTtlTimer(handle: ContextHandle, newSeconds: UInt64) async throws 
     
     /**
      * Per-instance equivalent of the free-function `context_send`.
@@ -4982,13 +4989,20 @@ open func contextReconnect(identity: Identity, contextIds: [String])async throws
      * no recorded deadline there is no TTL to extend, so the disarmed timer
      * stays disarmed rather than arming a long-past deadline (H2).
      *
-     * Routes through `&*self.inner`. Silently returns when the handle's
-     * `instance_id` does not match this `SCP`'s (matches the free-function
-     * fire-and-forget signature).
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     *
+     * # Errors
+     *
+     * Returns the typed error of every step that can fail: a handle from
+     * another instance, a bridge with no supervisor, a dispatch the supervisor
+     * refuses (no actor for the context), a reply the actor dropped, and the
+     * reset itself, whose `TtlExtended` reset leaf fails closed when its
+     * event-log append fails (spec 17 §17.3).
      */
-open func contextResetTtlTimer(handle: ContextHandle, newSeconds: UInt64)async   {
+open func contextResetTtlTimer(handle: ContextHandle, newSeconds: UInt64)async throws   {
     return
-        try!  await uniffiRustCallAsync(
+        try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_scp_ffi_uniffi_fn_method_scp_context_reset_ttl_timer(
                     self.uniffiClonePointer(),
@@ -4999,8 +5013,7 @@ open func contextResetTtlTimer(handle: ContextHandle, newSeconds: UInt64)async  
             completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
             freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
             liftFunc: { $0 },
-            errorHandler: nil
-            
+            errorHandler: FfiConverterTypeScpError_lift
         )
 }
     
@@ -19766,7 +19779,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_reconnect() != 16281) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_reset_ttl_timer() != 21393) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_reset_ttl_timer() != 12038) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_send() != 57249) {

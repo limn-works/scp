@@ -1058,7 +1058,9 @@ public extension Context {
     ///
     /// - Parameters:
     ///   - newSeconds: The additional TTL duration in seconds to extend by.
-    /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not active.
+    /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not active,
+    ///   and the bridge's typed error when the reset fails, including a
+    ///   `TtlExtended` reset leaf whose event-log append failed.
     func resetTtlTimer(
         newSeconds: UInt64
     ) async throws {
@@ -1066,7 +1068,7 @@ public extension Context {
             throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
 
-        await scp.contextResetTtlTimer(handle: handle, newSeconds: newSeconds)
+        try await scp.contextResetTtlTimer(handle: handle, newSeconds: newSeconds)
     }
 
     /// Exports this context's full state as serialized bytes.

@@ -701,6 +701,14 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl crate::context::builder::ContextEventLogProvider for TestEventLog {
+        fn event_log_entries(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            Ok(None)
+        }
+
         async fn init_event_log(
             &self,
             _id: &[u8; 32],
@@ -1766,6 +1774,14 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl crate::context::builder::ContextEventLogProvider for KeaFailingEventLog {
+        fn event_log_entries(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            Ok(None)
+        }
+
         async fn init_event_log(
             &self,
             _id: &[u8; 32],
@@ -3441,7 +3457,8 @@ mod tests {
             &ctx_hex,
             std::time::Duration::from_secs(600),
         )
-        .await;
+        .await
+        .expect("the reset appends its TtlExtended leaf");
 
         assert_eq!(
             appends.load(Ordering::SeqCst),

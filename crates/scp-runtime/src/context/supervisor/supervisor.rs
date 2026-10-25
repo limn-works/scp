@@ -3121,8 +3121,11 @@ impl Supervisor {
     }
 
     /// Durably appends the §5.4.5 streaming `OutletInvokedEvent` at stream close
-    /// through the plain [`ContextEventLogProvider::append_event`] boundary,
-    /// whose override re-runs the durable event-local
+    /// through the [`ContextEventLogProvider::append_event_after_side_effect`]
+    /// boundary: the stream has already closed and settled, so a failed store
+    /// keeps the entry in memory and marks the stored log diverged (spec
+    /// section 17.3, "Event log write failures"). The boundary re-runs the
+    /// durable event-local
     /// `chunks_billed <= stream_chunk_count` backstop
     /// ([`verify_outlet_invoked_event_local`](crate::context::outlets::stream::verify_outlet_invoked_event_local)).
     ///
@@ -3168,7 +3171,7 @@ impl Supervisor {
             ContextError::EventLogFailed(format!("failed to serialize OutletInvokedEvent: {e}"))
         })?;
         event_log
-            .append_event(
+            .append_event_after_side_effect(
                 &context_id_bytes,
                 scp_event_log::EventType::OutletInvoked,
                 &actor_did,
@@ -17867,6 +17870,34 @@ impl Supervisor {
             .map_err(|e| ContextError::EventLogFailed(e.to_string()))
     }
 
+    /// Releases `context_id`'s in-memory event log while its actor keeps
+    /// running — test-only.
+    ///
+    /// Shutdown releases the log the same way but also stops the actor, and
+    /// the FFI reads refuse a context that is not `Active` before they reach
+    /// the log. This leaves the context `Active`, so a bridge read reaches
+    /// the provider's "not loaded" answer (spec section 17.3, "Event log
+    /// write failures").
+    ///
+    /// Gated behind the `testing` feature — never compiled into production
+    /// builds, never reachable from any FFI bridge.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::NotInitialized`] if no event-log provider is wired.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn test_release_event_log(&self, context_id_bytes: &[u8; 32]) -> Result<(), ContextError> {
+        self.event_log_ref()
+            .ok_or_else(|| {
+                ContextError::NotInitialized(
+                    "Supervisor::test_release_event_log — event_log provider not configured"
+                        .to_owned(),
+                )
+            })?
+            .release_event_log(context_id_bytes);
+        Ok(())
+    }
+
     /// Lists every governance proposal currently tracked by the
     /// context's engine via the actor mailbox.
     ///
@@ -21253,6 +21284,14 @@ mod tests {
     struct TestEventLog;
     #[async_trait::async_trait]
     impl crate::context::builder::ContextEventLogProvider for TestEventLog {
+        fn event_log_entries(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            Ok(None)
+        }
+
         async fn init_event_log(
             &self,
             _context_id: &[u8; 32],
@@ -22802,7 +22841,8 @@ mod tests {
             &ctx_key,
             std::time::Duration::from_secs(ADDITIONAL),
         )
-        .await;
+        .await
+        .expect("the reset appends its TtlExtended leaf");
 
         assert_eq!(
             cell.ttl.timer.deadline_unix_secs,
@@ -22814,6 +22854,105 @@ mod tests {
             Some(T0 + ADDITIONAL),
             "bilateral reset must NOT record now + additional (local-clock, divergent)"
         );
+    }
+
+    /// An event log whose reads succeed and whose appends all fail.
+    struct AppendFailingEventLog(SeededEventLog);
+    #[async_trait::async_trait]
+    impl crate::context::builder::ContextEventLogProvider for AppendFailingEventLog {
+        async fn init_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+        async fn append_event(
+            &self,
+            _id: &[u8; 32],
+            _event_type: scp_event_log::EventType,
+            _actor: &str,
+            _payload: scp_event_log::EventPayload,
+            _timestamp_secs: u64,
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Err(
+                scp_protocol::context::builder::ContextCreationError::EventLogFailed(
+                    "append refused".to_owned(),
+                ),
+            )
+        }
+        async fn destroy_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+        fn event_log_entries(
+            &self,
+            id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, ContextError> {
+            self.0.event_log_entries(id)
+        }
+    }
+
+    /// A reset whose `TtlExtended` append fails returns the error, keeps the
+    /// consent tally, and leaves the deadline where it was: the tally clears
+    /// only after the leaf is in the log (spec section 17.3, "Event log write
+    /// failures").
+    #[tokio::test]
+    async fn a_reset_whose_append_fails_keeps_the_tally_and_the_deadline() {
+        const T0: u64 = 1_700_000_000;
+        const CREATE_TTL: u64 = 500;
+        const OLD_DEADLINE: u64 = T0 + CREATE_TTL;
+        const ADDITIONAL: u64 = 100;
+
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(T0));
+        let event_log = AppendFailingEventLog(SeededEventLog::new(vec![seeded_context_created(0)]));
+        let sup = supervisor_with_clock_persistence_and_event_log(
+            clock_dyn,
+            Box::new(MapPersistence::default()),
+            Box::new(event_log),
+        );
+        let deps = test_actor_deps(&sup).await;
+
+        let ctx_id_bytes = [0x5Au8; 32];
+        let ctx_key = hex::encode(ctx_id_bytes);
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            T0,
+            DID("did:example:failed-reset-admin".to_owned()),
+        );
+        state.handle = crate::context::ContextHandle::new(
+            ctx_key.clone(),
+            scp_protocol::context::params::ContextParams {
+                ttl: Some(std::time::Duration::from_secs(CREATE_TTL)),
+                ..Default::default()
+            },
+        );
+        state.ttl.timer.deadline_unix_secs = Some(OLD_DEADLINE);
+        let mut ext =
+            crate::context::ttl::TtlExtension::new(std::time::Duration::from_secs(ADDITIONAL), 2);
+        ext.add_consent(DID("did:example:m-alpha".to_owned()));
+        ext.add_consent(DID("did:example:m-bravo".to_owned()));
+        state.ttl.extension = Some(ext);
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
+
+        let reset = crate::context::ttl_close_helpers::reset_ttl_timer(
+            &mut cell,
+            &deps,
+            &ctx_key,
+            std::time::Duration::from_secs(ADDITIONAL),
+        )
+        .await;
+
+        assert!(
+            matches!(reset, Err(ContextError::EventLogFailed(_))),
+            "a failed TtlExtended append fails the reset, got {reset:?}"
+        );
+        assert!(
+            cell.ttl.extension.is_some(),
+            "the consent tally survives a reset whose leaf was not logged"
+        );
+        assert_eq!(cell.ttl.timer.deadline_unix_secs, Some(OLD_DEADLINE));
     }
 
     /// H2 (reset on a no-TTL context, REGRESSION GATE): `reset_ttl_timer` on a
@@ -22861,7 +23000,8 @@ mod tests {
             &ctx_key,
             std::time::Duration::from_secs(ADDITIONAL),
         )
-        .await;
+        .await
+        .expect("the reset appends its TtlExtended leaf");
 
         assert_eq!(
             cell.ttl.timer.deadline_unix_secs, None,
@@ -22948,7 +23088,8 @@ mod tests {
             &ctx_key,
             std::time::Duration::from_secs(ADDITIONAL),
         )
-        .await;
+        .await
+        .expect("the reset appends its TtlExtended leaf");
 
         assert_eq!(
             cell.ttl.timer.deadline_unix_secs,
@@ -23056,7 +23197,8 @@ mod tests {
                 &ctx_key,
                 std::time::Duration::from_secs(ADDITIONAL),
             )
-            .await;
+            .await
+            .expect("the reset appends its TtlExtended leaf");
 
             entries_handle
                 .lock()
@@ -23299,12 +23441,14 @@ mod tests {
     /// An event-log double that FAILS the first append (modelling a transient
     /// event-log failure that forces a TTL-expiry retry), then STORES and
     /// returns every subsequent append so a test can read the timestamp the
-    /// retry stamped on the `ContextExpired` leaf.
+    /// retry stamped on the `ContextExpired` leaf. `fail_next_read` fails the
+    /// next `event_log_entries` read the same way.
     #[derive(Clone, Default)]
     struct FailFirstThenRecordEventLog {
         #[allow(clippy::disallowed_types)]
         entries: Arc<std::sync::Mutex<Vec<scp_event_log::Event>>>,
         fail_next: Arc<std::sync::atomic::AtomicBool>,
+        fail_next_read: Arc<std::sync::atomic::AtomicBool>,
     }
     #[async_trait::async_trait]
     impl crate::context::builder::ContextEventLogProvider for FailFirstThenRecordEventLog {
@@ -23358,6 +23502,14 @@ mod tests {
             &self,
             _id: &[u8; 32],
         ) -> Result<Option<Vec<scp_event_log::Event>>, ContextError> {
+            if self
+                .fail_next_read
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(ContextError::EventLogFailed(
+                    "induced transient event-log read failure".to_owned(),
+                ));
+            }
             Ok(Some(
                 self.entries
                     .lock()
@@ -23365,6 +23517,95 @@ mod tests {
                     .clone(),
             ))
         }
+    }
+
+    /// A governance checkpoint whose event-log prune fails returns the
+    /// error, not a checkpoint over a log that kept the entries the policy
+    /// prunes (spec section 17.3, "Event log write failures").
+    #[tokio::test]
+    async fn a_checkpoint_whose_prune_fails_returns_the_error() {
+        use crate::context::builder::ContextEventLogProvider as _;
+        const T0: u64 = 1_700_000_000;
+        let faulty = Arc::new(
+            crate::context::supervisor::faulty_storage::FaultyStorage::new(Arc::new(
+                scp_platform::in_memory::InMemoryStorage::new(),
+            )),
+        );
+        let log = crate::context::providers::event_log::MerkleEventLogProvider::with_persistence(
+            Arc::new(
+                crate::store::context::ProtocolRepositoryEventLogBridge::new(Arc::new(
+                    crate::store::ProtocolRepository::new_for_testing(Arc::clone(&faulty)),
+                )),
+            ),
+        );
+        let ctx_id = hex::encode([0x6Cu8; 32]);
+        let ctx_bytes = crate::context::state::context_id_to_bytes(&ctx_id);
+        log.init_event_log(&ctx_bytes).await.expect("init log");
+        for i in 0..5u64 {
+            log.append_event(
+                &ctx_bytes,
+                scp_event_log::EventType::MemberJoined,
+                "did:example:checkpoint-admin",
+                scp_event_log::EventPayload::default(),
+                T0 + i,
+            )
+            .await
+            .expect("append");
+        }
+        let sup = supervisor_with_clock_persistence_and_event_log(
+            Arc::new(TestClock::new(T0)),
+            Box::new(MapPersistence::default()),
+            Box::new(log),
+        );
+        let deps = test_actor_deps(&sup).await;
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            [0x6Cu8; 32],
+            T0,
+            DID("did:example:checkpoint-admin".to_owned()),
+        );
+        state.handle = crate::context::ContextHandle::new(
+            ctx_id.clone(),
+            scp_protocol::context::params::ContextParams::default(),
+        );
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .unwrap();
+        state.governance.pruning_policy = Some(scp_protocol::context::governance::PruningPolicy {
+            size_based: Some(scp_protocol::context::governance::SizeBasedPolicy {
+                max_event_count: 2,
+                max_storage_bytes: u64::MAX,
+            }),
+            ..Default::default()
+        });
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
+
+        faulty.fail_nth_store(1);
+        let checkpoint = crate::context::trust_recovery_helpers::create_governance_checkpoint(
+            &mut cell,
+            &deps,
+            &ctx_id,
+            1,
+            [0u8; 32],
+            5,
+            [0u8; 32],
+            [0u8; 32],
+            &DID("did:example:checkpoint-admin".to_owned()),
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            matches!(checkpoint, Err(ContextError::EventLogFailed(_))),
+            "the failed prune fails the checkpoint: {checkpoint:?}"
+        );
+        assert_eq!(
+            deps.event_log
+                .event_log_entries(&ctx_bytes)
+                .expect("the log reads")
+                .map(|entries| entries.len()),
+            Some(5),
+            "the in-memory log is unchanged"
+        );
     }
 
     /// M1 (retry stamps the convergent deadline, REGRESSION GATE): when the
@@ -23399,6 +23640,7 @@ mod tests {
         let event_log = FailFirstThenRecordEventLog {
             entries: Arc::new(std::sync::Mutex::new(vec![seeded_context_created(0)])),
             fail_next: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            ..Default::default()
         };
         let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(NOW_SKEWED));
 
@@ -23546,6 +23788,7 @@ mod tests {
                 seeded_ttl_extended(1, BASE_DEADLINE, EXTENDED_DEADLINE),
             ])),
             fail_next: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            ..Default::default()
         };
         let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(NOW_SKEWED));
 
@@ -23639,6 +23882,100 @@ mod tests {
             "the retry must stamp the RESET-EXTENDED convergent deadline derived from \
              the TtlExtended leaf, not the create base ({BASE_DEADLINE}) or the skewed \
              clock ({NOW_SKEWED})"
+        );
+    }
+
+    /// An expiry whose event log cannot be read stamps no `ContextExpired`
+    /// leaf: the leaf's deadline raises the snapshot base to the log's
+    /// extensions, and a log read as empty would stamp the shorter base. The
+    /// leaf step stays undone with the read error recorded, and the retry,
+    /// whose read succeeds, stamps the extended deadline (spec section 17.3,
+    /// "Event log write failures").
+    #[tokio::test]
+    async fn an_unreadable_log_at_expiry_stamps_no_shortened_deadline() {
+        const T0: u64 = 1_700_000_000;
+        const TTL_SECS: u64 = 3_600;
+        const BASE_DEADLINE: u64 = T0 + TTL_SECS;
+        const EXTENDED_DEADLINE: u64 = BASE_DEADLINE + 1_000;
+
+        let event_log = FailFirstThenRecordEventLog {
+            entries: Arc::new(std::sync::Mutex::new(vec![
+                seeded_context_created(0),
+                seeded_ttl_extended(1, BASE_DEADLINE, EXTENDED_DEADLINE),
+            ])),
+            fail_next_read: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            ..Default::default()
+        };
+        let sup = supervisor_with_clock_persistence_and_event_log(
+            Arc::new(TestClock::new(T0)),
+            Box::new(MapPersistence::default()),
+            Box::new(event_log.clone()),
+        );
+        let deps = test_actor_deps(&sup).await;
+
+        let ctx_id_bytes = [0x5Eu8; 32];
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            T0,
+            DID("did:example:unreadable-expiry-admin".to_owned()),
+        );
+        state.handle = crate::context::ContextHandle::new(
+            hex::encode(ctx_id_bytes),
+            scp_protocol::context::params::ContextParams {
+                ttl: Some(std::time::Duration::from_secs(TTL_SECS)),
+                memory_scope: scp_protocol::context::params::MemoryScope::Full,
+                ..Default::default()
+            },
+        );
+        state.ttl.timer.deadline_unix_secs = Some(EXTENDED_DEADLINE);
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .unwrap();
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
+        let handle = cell.handle.clone();
+        let expired_leaves = || -> Vec<u64> {
+            event_log
+                .entries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .filter(|e| e.event_type == scp_event_log::EventType::ContextExpired)
+                .map(|e| e.timestamp)
+                .collect()
+        };
+
+        let out1 =
+            crate::context::ttl_close_helpers::handle_ttl_expiry(&mut cell, &deps, &handle, 0)
+                .await;
+        assert!(
+            !out1.result.event_logged()
+                && out1
+                    .result
+                    .errors()
+                    .iter()
+                    .any(|e| e.contains("induced transient event-log read failure")),
+            "an unreadable log leaves the leaf step undone with the read error: {}",
+            out1.result
+        );
+        assert_eq!(expired_leaves(), Vec::<u64>::new(), "no leaf is stamped");
+
+        let out2 = crate::context::ttl_close_helpers::handle_ttl_expiry(
+            &mut cell,
+            &deps,
+            &handle,
+            out1.result.completed_steps(),
+        )
+        .await;
+        assert!(
+            out2.result.is_complete(),
+            "the retry completes: {}",
+            out2.result
+        );
+        assert_eq!(
+            expired_leaves(),
+            vec![EXTENDED_DEADLINE],
+            "the retry stamps the extended deadline, not the base ({BASE_DEADLINE})"
         );
     }
 
@@ -26446,6 +26783,14 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl crate::context::builder::ContextEventLogProvider for EventLogHydrationCounter {
+        fn event_log_entries(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            Ok(None)
+        }
+
         async fn init_event_log(
             &self,
             _id: &[u8; 32],
@@ -26488,6 +26833,14 @@ mod tests {
     struct FailingEventLogRestore;
     #[async_trait::async_trait]
     impl crate::context::builder::ContextEventLogProvider for FailingEventLogRestore {
+        fn event_log_entries(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            Ok(None)
+        }
+
         async fn init_event_log(
             &self,
             _id: &[u8; 32],
@@ -27471,6 +27824,14 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl crate::context::builder::ContextEventLogProvider for ContextExpiredAppendCounter {
+        fn event_log_entries(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            Ok(None)
+        }
+
         async fn init_event_log(
             &self,
             _id: &[u8; 32],
@@ -36059,6 +36420,14 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl crate::context::builder::ContextEventLogProvider for RecordingEventLog {
+        fn event_log_entries(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            Ok(None)
+        }
+
         async fn init_event_log(
             &self,
             _id: &[u8; 32],
@@ -43344,6 +43713,14 @@ mod streaming_saga_tests {
     }
     #[async_trait::async_trait]
     impl ContextEventLogProvider for SsRecordingEventLog {
+        fn event_log_entries(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            Ok(None)
+        }
+
         async fn init_event_log(
             &self,
             _id: &[u8; 32],

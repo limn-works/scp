@@ -529,7 +529,7 @@ mod live {
             setup();
             let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
             let bi = scp.bridge_instance();
-            runtime::init_context_manager_for_test(bi);
+            runtime::init_context_manager_for_test(bi).expect("the test supervisor initializes");
 
             let (_ctx, _outlet, _invoker, handle_id) = open_live(
                 py,
@@ -565,7 +565,7 @@ mod live {
             setup();
             let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
             let bi = scp.bridge_instance();
-            runtime::init_context_manager_for_test(bi);
+            runtime::init_context_manager_for_test(bi).expect("the test supervisor initializes");
 
             let (_ctx, _outlet, _invoker, handle_id) = open_live(
                 py,
@@ -607,7 +607,7 @@ mod live {
             setup();
             let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
             let bi = scp.bridge_instance();
-            runtime::init_context_manager_for_test(bi);
+            runtime::init_context_manager_for_test(bi).expect("the test supervisor initializes");
 
             let (_ctx, _outlet, invoker, handle_id) = open_live(
                 py,

@@ -14894,37 +14894,61 @@ impl Scp {
     /// no recorded deadline there is no TTL to extend, so the disarmed timer
     /// stays disarmed rather than arming a long-past deadline (H2).
     ///
-    /// Routes through `&*self.inner`. Silently returns when the handle's
-    /// `instance_id` does not match this `SCP`'s (matches the free-function
-    /// fire-and-forget signature).
-    pub async fn context_reset_ttl_timer(&self, handle: Arc<ContextHandle>, new_seconds: u64) {
-        if self.inner.core.check_handle(handle.instance_id()).is_err() {
-            return;
-        }
-        let Ok(sup) = self.inner.context_manager_expect() else {
-            return;
-        };
-        let duration = std::time::Duration::from_secs(new_seconds);
-        use scp_core::context::actor::commands::{TtlCloseCommand, TtlTimerPayload};
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let cmd = TtlCloseCommand::ResetTtlTimer {
-            payload: Box::new(TtlTimerPayload {
-                context_id: handle.context_id.clone(),
-                params: scp_core::context::ContextParams::default(),
-                duration,
-                // Ignored by ResetTtlTimer (which extends the existing
-                // convergent deadline by `duration`, not an absolute override).
-                deadline_override: None,
-            }),
-            reply: tx,
-        };
-        if sup.dispatch_ttl_close_command(cmd).await.is_err() {
-            return;
-        }
-        // Fire-and-forget: drain the reply so the handler is not left with a
-        // dropped sender, but the public signature is `()` (matches the
-        // free-function's fire-and-forget contract).
-        let _ = rx.await;
+    /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+    /// `instance_id` does not match this `SCP`'s.
+    ///
+    /// # Errors
+    ///
+    /// Returns the typed error of every step that can fail: a handle from
+    /// another instance, a bridge with no supervisor, a dispatch the supervisor
+    /// refuses (no actor for the context), a reply the actor dropped, and the
+    /// reset itself, whose `TtlExtended` reset leaf fails closed when its
+    /// event-log append fails (spec 17 §17.3).
+    pub async fn context_reset_ttl_timer(
+        &self,
+        handle: Arc<ContextHandle>,
+        new_seconds: u64,
+    ) -> Result<(), ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
+        runtime()
+            .spawn(async move {
+                let sup = bi.context_manager_or_error()?;
+                let duration = std::time::Duration::from_secs(new_seconds);
+                use scp_core::context::actor::commands::{TtlCloseCommand, TtlTimerPayload};
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let cmd = TtlCloseCommand::ResetTtlTimer {
+                    payload: Box::new(TtlTimerPayload {
+                        context_id: handle.context_id.clone(),
+                        // Ignored by ResetTtlTimer, which reads the
+                        // actor's own state, as `context_handle_ttl_expiry`.
+                        params: scp_core::context::ContextParams::default(),
+                        duration,
+                        // Ignored by ResetTtlTimer (which extends the existing
+                        // convergent deadline by `duration`, not an absolute
+                        // override).
+                        deadline_override: None,
+                    }),
+                    reply: tx,
+                };
+                sup.dispatch_ttl_close_command(cmd)
+                    .await
+                    .map_err(ScpError::from)?;
+                rx.await
+                    .map_err(|e| ScpError::Context {
+                        msg: format!("reset_ttl_timer shim reply dropped: {e}"),
+                        code: codes::CTX_2039.to_owned(),
+                    })?
+                    .map_err(ScpError::from)
+            })
+            .await
+            .map_err(|e| ScpError::Context {
+                msg: format!("tokio task join error during TTL reset: {e}"),
+                code: codes::CTX_2039.to_owned(),
+            })?
     }
 
     /// Per-instance equivalent of the free-function `event_log_query`.
@@ -15003,14 +15027,31 @@ impl Scp {
                 // (NAPI). Aligned across PyO3/NAPI/UniFFI — pinned by the
                 // cross-bridge parity harness's `OP_EVENT_LOG_APPEND` and
                 // `OP_EVENT_LOG_FILTERED` (ADR-046).
-                if let Some(manager) = bi.try_context_manager_ready() {
+                //
+                // No supervisor attached means no supervisor log, and the
+                // query falls back to the bridge-local log. A suspended
+                // bridge, a log that cannot be read, or a log released and
+                // not loaded again is an error, never an empty answer (spec
+                // section 17.3, "Event log write failures").
+                let manager = if bi.core.try_supervisor().is_some() {
+                    Some(bi.context_manager_or_error()?)
+                } else {
+                    None
+                };
+                if let Some(manager) = manager {
                     // ADR-056: resolve the context-id string to its 32-byte
                     // digest via the canonical chokepoint (NOT the raw SHA-256
                     // routing primitive, which double-hashes a real 64-hex id
                     // and queries the wrong event-log key).
                     let ctx_id_bytes =
                         scp_core::context::state::context_id_to_bytes(&handle.context_id);
-                    if let Ok(Some(entries)) = manager.event_log_entries(&ctx_id_bytes)
+                    let entries = manager.event_log_entries(&ctx_id_bytes).map_err(|e| {
+                        ScpError::from_context_error(
+                            format!("reading the event log failed: {e}"),
+                            &e,
+                        )
+                    })?;
+                    if let Some(entries) = entries
                         && !entries.is_empty()
                     {
                         // Canonical filter — pinned across PyO3/NAPI/UniFFI by
@@ -15233,6 +15274,46 @@ impl Scp {
                 // `Active`.
                 bi.ensure_ucan_registered_while_active(&handle.context_id)
                     .await?;
+
+                // With a supervisor attached, its log is the context's log of
+                // record: the bridge-local proof tree is synced from it
+                // before proving, and a log that cannot be read or is not
+                // loaded fails the proof instead of proving against the
+                // bridge-local tree (spec section 17.3, "Event log write
+                // failures"). No supervisor attached leaves the bridge-local
+                // tree.
+                if bi.core.try_supervisor().is_some() {
+                    let ctx_id_bytes =
+                        scp_core::context::state::context_id_to_bytes(&handle.context_id);
+                    let entries = bi
+                        .context_manager_or_error()?
+                        .event_log_entries(&ctx_id_bytes)
+                        .map_err(|e| {
+                            ScpError::from_context_error(
+                                format!("reading the event log failed: {e}"),
+                                &e,
+                            )
+                        })?;
+                    if let Some(entries) = entries {
+                        bi.with_ucan_state(&handle.context_id, |ucan_state| {
+                            scp_ffi_common::event_log::sync_leaves_from_entries(
+                                &mut ucan_state.event_log,
+                                &entries,
+                            )
+                        })
+                        .ok_or_else(|| ScpError::Context {
+                            msg: format!(
+                                "context '{}' not found in UCAN registry",
+                                handle.context_id
+                            ),
+                            code: codes::CTX_2025.to_owned(),
+                        })?
+                        .map_err(|e| ScpError::Context {
+                            msg: format!("event leaf hash failed: {e}"),
+                            code: codes::CTX_2000.to_owned(),
+                        })?;
+                    }
+                }
 
                 match claim_type {
                     "inclusion" => {
@@ -25153,6 +25234,179 @@ mod tests {
             payload_json["target_did"].as_str(),
             Some(target_did),
             "GovernanceActionExecuted leaf projects its target_did"
+        );
+    }
+
+    /// A bridge whose supervisor is attached but suspended fails an event-log
+    /// query instead of answering from the bridge-local fallback: a supervisor
+    /// log that cannot be read is never reported as no log (spec section 17.3,
+    /// "Event log write failures"). The same query on the running bridge is
+    /// the control: it answers with the context's log.
+    // Multi-thread flavor: see `event_log_query_projects_role_assigned_subject_did`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "testing")]
+    async fn a_suspended_bridge_fails_the_event_log_query() {
+        let scp = scp_test();
+        let identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create");
+        let handle = scp
+            .context_create(Arc::clone(&identity), encrypted_join_test_params())
+            .await
+            .expect("context_create attaches the supervisor");
+        assert!(
+            scp.inner.core.try_supervisor().is_some(),
+            "precondition: the context's supervisor is attached"
+        );
+        let running = scp.event_log_query(Arc::clone(&handle), None).await;
+        assert!(
+            running.as_ref().is_ok_and(|events| !events.is_empty()),
+            "control: the running bridge answers with the context's log, got {running:?}"
+        );
+
+        scp.inner
+            .core
+            .suspend(std::time::Duration::from_secs(10))
+            .await
+            .expect("suspend");
+        let suspended = scp.event_log_query(Arc::clone(&handle), None).await;
+        assert!(
+            suspended.is_err(),
+            "a suspended supervisor's log is not answered from the fallback, got {suspended:?}"
+        );
+    }
+
+    /// A supervisor log that is not loaded fails the query with the
+    /// provider's typed error, and the bridge-local log never answers in its
+    /// place (spec section 17.3, "Event log write failures"). The log is
+    /// released while the context stays `Active`, so the query passes its
+    /// `Active` gate and reaches the provider read.
+    // Multi-thread flavor: see `event_log_query_projects_role_assigned_subject_did`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "testing")]
+    async fn a_released_supervisor_log_fails_the_event_log_query() {
+        let scp = scp_test();
+        let identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create");
+        let handle = scp
+            .context_create(Arc::clone(&identity), encrypted_join_test_params())
+            .await
+            .expect("context_create attaches the supervisor");
+        let running = scp.event_log_query(Arc::clone(&handle), None).await;
+        assert!(
+            running.as_ref().is_ok_and(|events| !events.is_empty()),
+            "control: the loaded log answers the query, got {running:?}"
+        );
+
+        scp.inner
+            .context_manager_or_error()
+            .expect("supervisor attached")
+            .test_release_event_log(&scp_core::context::state::context_id_to_bytes(
+                &handle.context_id,
+            ))
+            .expect("release");
+        let released = scp.event_log_query(Arc::clone(&handle), None).await;
+        match released {
+            Err(ScpError::Context { msg, .. }) => assert!(
+                msg.contains("not loaded"),
+                "the error names the not-loaded log, got {msg}"
+            ),
+            other => panic!("a released log must fail the query, got {other:?}"),
+        }
+    }
+
+    /// An inclusion proof covers the supervisor's log: the proof of leaf 0
+    /// succeeds while the log is loaded, and once it is released the proof
+    /// fails with the provider's typed error instead of proving against the
+    /// bridge-local tree (spec section 17.3, "Event log write failures").
+    // Multi-thread flavor: see `event_log_query_projects_role_assigned_subject_did`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "testing")]
+    async fn a_proof_covers_the_supervisor_log_and_fails_once_released() {
+        let scp = scp_test();
+        let identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create");
+        let handle = scp
+            .context_create(Arc::clone(&identity), encrypted_join_test_params())
+            .await
+            .expect("context_create attaches the supervisor");
+        let claim = r#"{"type":"inclusion","leaf_index":0}"#.to_owned();
+        let running = scp
+            .event_log_verify(Arc::clone(&handle), claim.clone())
+            .await;
+        assert!(
+            running.as_ref().is_ok_and(|proof| proof.verified),
+            "control: the loaded supervisor log proves leaf 0, got {running:?}"
+        );
+
+        scp.inner
+            .context_manager_or_error()
+            .expect("supervisor attached")
+            .test_release_event_log(&scp_core::context::state::context_id_to_bytes(
+                &handle.context_id,
+            ))
+            .expect("release");
+        match scp.event_log_verify(Arc::clone(&handle), claim).await {
+            Err(ScpError::Context { msg, .. }) => assert!(
+                msg.contains("not loaded"),
+                "the error names the not-loaded log, got {msg}"
+            ),
+            other => panic!("a released log must fail the proof, got {other:?}"),
+        }
+    }
+
+    /// A TTL reset returns the actor's error to the caller: with the
+    /// context's log not loaded, the reset cannot read the deadline it
+    /// extends and fails, where the bridge used to drop the reply and return
+    /// nothing (spec section 17.3, "Event log write failures").
+    // Multi-thread flavor: see `event_log_query_projects_role_assigned_subject_did`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "testing")]
+    async fn a_ttl_reset_returns_the_actors_error() {
+        let scp = scp_test();
+        let identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create");
+        let handle = scp
+            .context_create(Arc::clone(&identity), encrypted_join_test_params())
+            .await
+            .expect("context_create attaches the supervisor");
+        scp.context_reset_ttl_timer(Arc::clone(&handle), 60)
+            .await
+            .expect("control: a reset over a loaded log succeeds");
+
+        scp.inner
+            .context_manager_or_error()
+            .expect("supervisor attached")
+            .test_release_event_log(&scp_core::context::state::context_id_to_bytes(
+                &handle.context_id,
+            ))
+            .expect("release");
+        match scp.context_reset_ttl_timer(Arc::clone(&handle), 60).await {
+            Err(ScpError::Context { msg, .. }) => assert!(
+                msg.contains("not loaded"),
+                "the error names the not-loaded log, got {msg}"
+            ),
+            other => panic!("a reset over a released log must fail, got {other:?}"),
+        }
+    }
+
+    /// A TTL reset with a handle another instance minted fails, where the
+    /// bridge used to return nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ttl_reset_with_a_foreign_handle_fails() {
+        let owner = scp_test();
+        let handle = test_handle_for(&owner);
+        let other = scp_test();
+        assert!(
+            other.context_reset_ttl_timer(handle, 60).await.is_err(),
+            "a foreign handle fails the reset"
         );
     }
 

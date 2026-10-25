@@ -217,8 +217,16 @@ impl PyCheckpoint {
 ///
 /// Returns `Ok(Some(events))` when the manager is initialized AND has
 /// entries for the context, `Ok(None)` when the caller should fall back to
-/// the bridge-local per-context `EventLog` (e.g. UCAN revocation writes,
-/// tests that bypass the manager).
+/// the bridge-local per-context `EventLog`: no supervisor is attached, or
+/// the supervisor holds no log or an empty one for the context (e.g. UCAN
+/// revocation writes, tests that bypass the manager).
+///
+/// # Errors
+///
+/// A suspended bridge, or a supervisor log that cannot be read or that
+/// shutdown released and nothing loaded again, raises `ContextError`: such a
+/// log is never answered with the fallback (spec section 17.3, "Event log
+/// write failures").
 fn query_manager_entries(
     bi: &PyBridgeInstance,
     py: Python<'_>,
@@ -229,9 +237,14 @@ fn query_manager_entries(
     // canonical chokepoint (NOT the raw SHA-256 routing primitive, which
     // double-hashes a real 64-hex id and queries the wrong event-log key).
     let ctx_id_bytes = scp_core::context::state::context_id_to_bytes(context_id);
-    let Some(entries) = crate::runtime::supervisor(bi)
-        .ok()
-        .and_then(|mgr| mgr.event_log_entries(&ctx_id_bytes).ok().flatten())
+    if bi.core.try_supervisor().is_none() {
+        return Ok(None);
+    }
+    let Some(entries) = crate::runtime::supervisor(bi)?
+        .event_log_entries(&ctx_id_bytes)
+        .map_err(|e| {
+            ScpPyError::from_context_error(format!("reading the event log failed: {e}"), &e)
+        })?
     else {
         return Ok(None);
     };
@@ -571,6 +584,26 @@ fn event_log_verify_impl(
         .ok_or_else(|| {
             ScpPyError::validation("claim must include 'type' field ('inclusion' or 'absence')")
         })?;
+
+    // With a supervisor attached, its log is the context's log of record:
+    // the bridge-local proof tree is synced from it before proving, and a
+    // log that cannot be read or is not loaded fails the proof instead of
+    // proving against the bridge-local tree (spec section 17.3, "Event log
+    // write failures"). No supervisor attached leaves the bridge-local tree.
+    if bi.core.try_supervisor().is_some() {
+        let ctx_id_bytes = scp_core::context::state::context_id_to_bytes(context_id);
+        let entries = crate::runtime::supervisor(bi)?
+            .event_log_entries(&ctx_id_bytes)
+            .map_err(|e| {
+                ScpPyError::from_context_error(format!("reading the event log failed: {e}"), &e)
+            })?;
+        if let Some(entries) = entries {
+            crate::runtime::with_context(bi, context_id, |rt| {
+                scp_ffi_common::event_log::sync_leaves_from_entries(&mut rt.event_log, &entries)
+                    .map_err(|e| ScpPyError::context(format!("event leaf hash failed: {e}")))
+            })?;
+        }
+    }
 
     match claim_type {
         "inclusion" => {
@@ -976,6 +1009,115 @@ pub fn register_event_log(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyProof>()?;
     m.add_class::<PyCheckpoint>()?;
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod manager_read_tests {
+    use super::{event_log_query_impl, event_log_verify_impl};
+    use pyo3::Python;
+    use std::sync::Arc;
+
+    /// A supervisor log that is not loaded fails the query with the
+    /// provider's typed error; the bridge-local log never answers in its
+    /// place (spec section 17.3, "Event log write failures"). The log is
+    /// released while the context stays registered, so the query reaches the
+    /// provider read.
+    #[test]
+    fn a_released_supervisor_log_fails_the_query() {
+        crate::init_runtime().ok();
+        pyo3::prepare_freethreaded_python();
+        let bi = Arc::new(crate::runtime::PyBridgeInstance::new_py());
+        let ctx_id = crate::types::generate_random_id("test-released-log");
+        let creator = "did:dht:z6MkReleasedLogCreator";
+        crate::runtime::register_context(&bi, &ctx_id, creator, &[]).unwrap();
+        let _host = crate::runtime::register_host_custody_for_test(&bi, creator);
+        let supervisor = Arc::clone(crate::runtime::supervisor(&bi).unwrap());
+        let params = scp_core::context::ContextParams {
+            ceiling: vec![scp_core::context::params::Capability::new("messages:read").unwrap()],
+            ..scp_core::context::ContextParams::default()
+        };
+        crate::runtime()
+            .unwrap()
+            .block_on(supervisor.create_context(
+                ctx_id.clone(),
+                params,
+                scp_did::DID(creator.to_owned()),
+                None,
+                Vec::new(),
+            ))
+            .unwrap();
+
+        Python::with_gil(|py| {
+            let running = event_log_query_impl(&bi, py, &ctx_id, None);
+            assert!(
+                running.as_ref().is_ok_and(|events| !events.is_empty()),
+                "control: the loaded log answers the query"
+            );
+            supervisor
+                .test_release_event_log(&scp_core::context::state::context_id_to_bytes(&ctx_id))
+                .unwrap();
+            let message = event_log_query_impl(&bi, py, &ctx_id, None)
+                .err()
+                .map(|e| e.to_string());
+            assert!(
+                message.as_deref().is_some_and(|m| m.contains("not loaded")),
+                "a released log fails the query with the not-loaded error, got {message:?}"
+            );
+        });
+    }
+
+    /// An inclusion proof covers the supervisor's log: the proof of leaf 0
+    /// succeeds while the log is loaded, and once it is released the proof
+    /// fails with the provider's typed error instead of proving against the
+    /// bridge-local tree (spec section 17.3, "Event log write failures").
+    #[test]
+    fn a_proof_covers_the_supervisor_log_and_fails_once_released() {
+        crate::init_runtime().ok();
+        pyo3::prepare_freethreaded_python();
+        let bi = Arc::new(crate::runtime::PyBridgeInstance::new_py());
+        let ctx_id = crate::types::generate_random_id("test-released-proof");
+        let creator = "did:dht:z6MkReleasedProofCreator";
+        crate::runtime::register_context(&bi, &ctx_id, creator, &[]).unwrap();
+        let _host = crate::runtime::register_host_custody_for_test(&bi, creator);
+        let supervisor = Arc::clone(crate::runtime::supervisor(&bi).unwrap());
+        let params = scp_core::context::ContextParams {
+            ceiling: vec![scp_core::context::params::Capability::new("messages:read").unwrap()],
+            ..scp_core::context::ContextParams::default()
+        };
+        crate::runtime()
+            .unwrap()
+            .block_on(supervisor.create_context(
+                ctx_id.clone(),
+                params,
+                scp_did::DID(creator.to_owned()),
+                None,
+                Vec::new(),
+            ))
+            .unwrap();
+
+        Python::with_gil(|py| {
+            use pyo3::types::PyDictMethods as _;
+            let claim = pyo3::types::PyDict::new(py);
+            claim.set_item("type", "inclusion").unwrap();
+            claim.set_item("leaf_index", 0).unwrap();
+            let running = event_log_verify_impl(&bi, py, &ctx_id, &claim);
+            assert!(
+                running.as_ref().is_ok_and(|proof| proof.verified),
+                "control: the loaded supervisor log proves leaf 0"
+            );
+            supervisor
+                .test_release_event_log(&scp_core::context::state::context_id_to_bytes(&ctx_id))
+                .unwrap();
+            let message = event_log_verify_impl(&bi, py, &ctx_id, &claim)
+                .err()
+                .map(|e| e.to_string());
+            assert!(
+                message.as_deref().is_some_and(|m| m.contains("not loaded")),
+                "a released log fails the proof with the not-loaded error, got {message:?}"
+            );
+        });
+    }
 }
 
 #[cfg(test)]

@@ -2857,7 +2857,7 @@ mod tests {
         creator_did: &str,
         with_outlet: bool,
     ) -> String {
-        crate::runtime::init_context_manager_for_test(bi);
+        crate::runtime::init_context_manager_for_test(bi).expect("the test supervisor initializes");
         setup_unsupervised_context(bi, creator_did, with_outlet)
     }
 
@@ -4118,7 +4118,8 @@ mod tests {
     #[test]
     fn known_context_registration_and_lookup() {
         // BridgeInstance must exist for known-context registration.
-        crate::runtime::init_context_manager_for_test(&__bi());
+        crate::runtime::init_context_manager_for_test(&__bi())
+            .expect("the test supervisor initializes");
 
         let creator = "did:dht:z6MkCreatorKnownCtx";
         let ctx_id = crate::types::generate_random_id("known-ctx");
@@ -5434,7 +5435,8 @@ mod tests {
 
     #[test]
     fn mcp_registry_stats_returns_consistent_counts() {
-        crate::runtime::init_context_manager_for_test(&__bi());
+        crate::runtime::init_context_manager_for_test(&__bi())
+            .expect("the test supervisor initializes");
         let stats = mcp_registry_stats_for(&__bi());
         // Cannot assert exact values due to parallel tests, but structural
         // invariants must hold: stopped_servers can never exceed total servers.
@@ -5522,7 +5524,8 @@ mod tests {
 
     #[test]
     fn core_registry_stats_includes_all_fields() {
-        crate::runtime::init_context_manager_for_test(&__bi());
+        crate::runtime::init_context_manager_for_test(&__bi())
+            .expect("the test supervisor initializes");
         let stats = crate::runtime::registry_stats(&__bi());
         // Destructure without `..`, so adding a field to `RegistryStats`
         // stops this test compiling. Reading each field through `let _ =`,
@@ -5965,7 +5968,8 @@ mod tests {
         let bi = __bi();
         let ctx_id = setup_unsupervised_context(&bi, agent, false);
         let provider = pyo3_mcp_provider(&bi, &ctx_id, agent);
-        crate::runtime::init_context_manager_for_test(&bi);
+        crate::runtime::init_context_manager_for_test(&bi)
+            .expect("the test supervisor initializes");
         assert!(crate::runtime::supervisor(&bi).is_ok());
 
         assert!(
@@ -6332,7 +6336,8 @@ mod tests {
     fn supervisor_yields_context_event_receiver_for_mcp_pyo3() {
         crate::init_runtime().ok();
         let bi = __bi();
-        crate::runtime::init_context_manager_for_test(&bi);
+        crate::runtime::init_context_manager_for_test(&bi)
+            .expect("the test supervisor initializes");
 
         let supervisor =
             crate::runtime::supervisor(&bi).expect("supervisor must be attached after init");
@@ -6357,7 +6362,8 @@ mod tests {
         use scp_ffi_common::bridge_instance::BridgeInstanceCore as _;
         crate::init_runtime().ok();
         let bi = __bi();
-        crate::runtime::init_context_manager_for_test(&bi);
+        crate::runtime::init_context_manager_for_test(&bi)
+            .expect("the test supervisor initializes");
 
         crate::runtime()
             .expect("runtime")

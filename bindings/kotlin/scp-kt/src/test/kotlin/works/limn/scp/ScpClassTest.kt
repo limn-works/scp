@@ -25,11 +25,18 @@ import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
+import uniffi.scp.CeilingPolicy
+import uniffi.scp.ContextMode
+import uniffi.scp.ContextParams
+import uniffi.scp.GovernanceModel
+import uniffi.scp.MemoryScope
+import uniffi.scp.ScpException
 import uniffi.scp.StorageConfig
 import works.limn.scp.bridge.CoroutineBridge
 import works.limn.scp.conformance.ConformanceStubBindings
 import java.nio.file.Files
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.seconds
@@ -153,6 +160,49 @@ class ScpClassTest {
                 "SCP() must allocate fresh instances, not reuse a cached handle",
             )
             second.shutdown(bridge(), 1.seconds)
+        }
+
+    // ── TTL reset returns the bridge's error (real UniFFI bridge) ──
+
+    @Test
+    fun `contextResetTtlTimer throws the bridge error for a handle another instance minted`() =
+        runBlocking<Unit> {
+            scp.configureLocalTransport("did:key:z6MkKotlinResetTtlForeignHandle")
+            val identity = scp.identityCreateInMemory()
+            val handle =
+                scp.contextCreate(
+                    identity = identity,
+                    params =
+                        ContextParams(
+                            mode = ContextMode.ENCRYPTED,
+                            ceiling = listOf("messages:read"),
+                            ceilingPolicy = CeilingPolicy.IMMUTABLE,
+                            governance = GovernanceModel.SINGLE_ADMIN,
+                            memoryScope = MemoryScope.EPHEMERAL,
+                            ttlSeconds = 3600uL,
+                            promotable = false,
+                            minProtocolVersion = 0.toUShort(),
+                            maxChainDepth = null,
+                            maxNestingDepth = null,
+                            sessionCap = null,
+                            economicPolicy = null,
+                            consequenceRulesJson = null,
+                            consequenceConfigJson = null,
+                            capabilityRequirementsJson = null,
+                            pseudonymRotation = null,
+                        ),
+                )
+            // Control: the owning instance's reset succeeds.
+            scp.contextResetTtlTimer(handle = handle, newSeconds = 60uL)
+
+            val other = SCP(StorageConfig.InMemory)
+            try {
+                assertFailsWith<ScpException> {
+                    other.contextResetTtlTimer(handle = handle, newSeconds = 60uL)
+                }
+            } finally {
+                other.shutdown(bridge(), 1.seconds)
+            }
         }
 
     // ── economy verify-payment-receipts (suspend, real UniFFI bridge) ──

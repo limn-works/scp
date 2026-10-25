@@ -130,8 +130,11 @@ pub fn has_dedicated_code(e: &ContextError) -> bool {
 /// `Ok` holds the error a `StateTransition` wraps when it has a dedicated code
 /// ([`has_dedicated_code`]); `Err` returns `e` unchanged, which the bridge
 /// reports with its create fallback code. Only `StateTransition` wraps a
-/// `ContextError`; the match names every variant so a new wrapping variant
-/// needs a decision here.
+/// `ContextError` directly; a `RollbackFailed` reports what its `cause` would,
+/// so a coded creation failure keeps its code when the rollback after it also
+/// failed (the runtime logs the rollback error when it builds the variant).
+/// The match names every variant so a new wrapping variant needs a decision
+/// here.
 ///
 /// # Errors
 ///
@@ -141,6 +144,11 @@ pub fn coded_creation_failure(
 ) -> Result<ContextError, ContextCreationError> {
     match e {
         ContextCreationError::StateTransition(inner) if has_dedicated_code(&inner) => Ok(inner),
+        ContextCreationError::RollbackFailed { cause, rollback } => coded_creation_failure(*cause)
+            .map_err(|cause| ContextCreationError::RollbackFailed {
+                cause: Box::new(cause),
+                rollback,
+            }),
         ContextCreationError::StateTransition(_)
         | ContextCreationError::TransportNotConnected
         | ContextCreationError::IdentityValidationFailed(_)
@@ -188,6 +196,38 @@ mod tests {
         ] {
             assert!(coded_creation_failure(flattened).is_err());
         }
+    }
+
+    /// A create whose rollback also failed reports what its cause reports: a
+    /// coded cause keeps its code, and an uncoded one comes back as the same
+    /// `RollbackFailed`, both errors intact.
+    #[test]
+    fn a_failed_rollback_reports_the_code_of_its_cause() {
+        let rollback = || Box::new(ContextCreationError::EventLogFailed("delete".to_owned()));
+        let coded = ContextCreationError::RollbackFailed {
+            cause: Box::new(ContextCreationError::StateTransition(
+                ContextError::SupervisorShutDown("create".to_owned()),
+            )),
+            rollback: rollback(),
+        };
+        assert!(matches!(
+            coded_creation_failure(coded),
+            Ok(ContextError::SupervisorShutDown(_))
+        ));
+        let uncoded = ContextCreationError::RollbackFailed {
+            cause: Box::new(ContextCreationError::EventLogFailed("append".to_owned())),
+            rollback: rollback(),
+        };
+        let kept = coded_creation_failure(uncoded);
+        assert!(
+            matches!(
+                &kept,
+                Err(ContextCreationError::RollbackFailed { cause, rollback })
+                    if cause.to_string() == "event log operation failed: append"
+                        && rollback.to_string() == "event log operation failed: delete"
+            ),
+            "an uncoded cause keeps the RollbackFailed with both errors: {kept:?}"
+        );
     }
 
     #[test]

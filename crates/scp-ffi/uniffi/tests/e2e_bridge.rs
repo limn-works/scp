@@ -727,8 +727,9 @@ async fn context_ttl_operations() {
         .await
         .unwrap();
 
-    // Reset TTL timer (should not panic)
-    scp.context_reset_ttl_timer(handle.clone(), 7200).await;
+    scp.context_reset_ttl_timer(handle.clone(), 7200)
+        .await
+        .expect("the creator's TTL reset succeeds");
 
     // Alice is sole admin of this context, so her extension proposal carries
     // and applies. An earlier version bound both results to `_`, which passed

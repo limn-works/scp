@@ -3,7 +3,8 @@
 //! Maps keys to file paths under a base directory: `{base_dir}/{key}` where
 //! `/` in keys maps to directory separators. Values are written atomically
 //! and durably (write a temp file in the same directory, fsync it, rename it,
-//! then fsync the directory). A temp file is never a key. Useful for
+//! then fsync the directory), and on Unix every directory on the key's path
+//! is durable before a put returns. A temp file is never a key. Useful for
 //! server-side deployments where inspectability matters (debugging, backup,
 //! migration). Not recommended for mobile or performance-sensitive use.
 //!
@@ -45,19 +46,54 @@ pub struct FilesystemStorage {
 impl FilesystemStorage {
     /// Creates a new filesystem storage rooted at `base_dir`.
     ///
-    /// The directory is created if it does not exist.
+    /// The directory is created if it does not exist, and on Unix the parent
+    /// of each directory this call created is fsynced, so the first put's
+    /// directories are reachable after a power loss (spec section 17.6).
     ///
     /// # Errors
     ///
     /// Returns [`PlatformError::StorageError`] if the directory cannot be
-    /// created.
+    /// created or resolved, or a created directory's parent cannot be
+    /// fsynced.
     pub fn new(base_dir: &Path) -> Result<Self, PlatformError> {
+        // The deepest ancestor that exists before the create; every directory
+        // below it on the way to `base_dir` is new.
+        #[cfg(unix)]
+        let existing = base_dir
+            .ancestors()
+            .find(|dir| dir.as_os_str().is_empty() || dir.is_dir())
+            .map(Path::to_path_buf);
         std::fs::create_dir_all(base_dir).map_err(|e| {
             PlatformError::StorageError(format!("failed to create base directory: {e}"))
         })?;
-        Ok(Self {
-            base_dir: base_dir.to_path_buf(),
-        })
+        // One spelling of `base_dir`, so the fsync walks below and in a put
+        // stop at it.
+        #[cfg(unix)]
+        let base_dir = std::fs::canonicalize(base_dir).map_err(|e| {
+            PlatformError::StorageError(format!("failed to resolve base directory: {e}"))
+        })?;
+        #[cfg(unix)]
+        if let Some(existing) = existing {
+            let existing = if existing.as_os_str().is_empty() {
+                std::env::current_dir()
+            } else {
+                std::fs::canonicalize(&existing)
+            }
+            .map_err(|e| {
+                PlatformError::StorageError(format!("failed to resolve base directory: {e}"))
+            })?;
+            let mut created = base_dir.as_path();
+            while created != existing && created.starts_with(&existing) {
+                let Some(parent) = created.parent() else {
+                    break;
+                };
+                sync_dir(parent)?;
+                created = parent;
+            }
+        }
+        #[cfg(not(unix))]
+        let base_dir = base_dir.to_path_buf();
+        Ok(Self { base_dir })
     }
 }
 
@@ -145,31 +181,35 @@ fn remove_empty_parents(path: &Path, base_dir: &Path) {
     }
 }
 
-/// The directories `create_dir_all(dir)` has to create: `dir` and each of its
-/// ancestors, deepest first, up to and excluding the first one that exists.
+/// Creates `dir` and its missing ancestors, and on Unix fsyncs the parent of
+/// every directory from `dir` up to and including `base_dir`, deepest first.
+///
+/// No record of durable directories is kept (spec section 17.6): another
+/// store or process can remove a directory and recreate it at any time, so
+/// every put makes every directory on its path durable again.
 ///
 /// # Errors
 ///
-/// Returns [`PlatformError::StorageError`] if whether a directory exists
-/// cannot be determined.
-#[cfg(unix)]
-fn missing_dirs(dir: &Path) -> Result<Vec<PathBuf>, PlatformError> {
-    let mut missing = Vec::new();
-    let mut current = Some(dir);
-    while let Some(candidate) = current {
-        let exists = candidate.try_exists().map_err(|e| {
-            PlatformError::StorageError(format!(
-                "failed to check whether {} exists: {e}",
-                candidate.display()
-            ))
-        })?;
-        if exists {
-            break;
+/// Returns [`PlatformError::StorageError`] if a directory cannot be created
+/// or a parent cannot be fsynced.
+fn create_durable_dirs(dir: &Path, base_dir: &Path) -> Result<(), PlatformError> {
+    std::fs::create_dir_all(dir).map_err(|e| {
+        PlatformError::StorageError(format!("failed to create parent directory: {e}"))
+    })?;
+    #[cfg(unix)]
+    {
+        let mut current = dir;
+        while current.starts_with(base_dir) {
+            let Some(parent) = current.parent() else {
+                break;
+            };
+            sync_dir(parent)?;
+            current = parent;
         }
-        missing.push(candidate.to_path_buf());
-        current = candidate.parent();
     }
-    Ok(missing)
+    #[cfg(not(unix))]
+    let _ = base_dir;
+    Ok(())
 }
 
 /// Fsyncs a directory, so the entries created or renamed in it survive a
@@ -181,6 +221,8 @@ fn missing_dirs(dir: &Path) -> Result<Vec<PathBuf>, PlatformError> {
 /// or fsynced.
 #[cfg(unix)]
 fn sync_dir(dir: &Path) -> Result<(), PlatformError> {
+    #[cfg(test)]
+    tests::record_sync(dir);
     std::fs::File::open(dir)
         .and_then(|handle| handle.sync_all())
         .map_err(|e| {
@@ -216,29 +258,11 @@ impl Storage for FilesystemStorage {
         data: &[u8],
     ) -> impl Future<Output = Result<(), PlatformError>> + Send {
         let path = key_to_path(&self.base_dir, key);
+        let base_dir = self.base_dir.clone();
         let data = data.to_vec();
         async move {
             let path = path?;
             tokio::task::spawn_blocking(move || {
-                if let Some(parent) = path.parent() {
-                    // Directory durability runs on Unix only (spec section
-                    // 17.6): every directory this put creates gets its entry
-                    // fsynced into its parent, deepest first.
-                    #[cfg(unix)]
-                    let new_dirs = missing_dirs(parent)?;
-                    std::fs::create_dir_all(parent).map_err(|e| {
-                        PlatformError::StorageError(format!(
-                            "failed to create parent directory: {e}"
-                        ))
-                    })?;
-                    #[cfg(unix)]
-                    for dir in &new_dirs {
-                        if let Some(dir_parent) = dir.parent() {
-                            sync_dir(dir_parent)?;
-                        }
-                    }
-                }
-
                 // Atomic, durable write: write a temp file and fsync it, rename
                 // it over the key's file, then fsync the directory so the
                 // rename itself survives a power loss. A put that returned is
@@ -257,7 +281,23 @@ impl Storage for FilesystemStorage {
                         .map_or(0, |d| d.as_nanos())
                 ));
 
-                if let Err(e) = write_synced(&temp_path, &data) {
+                // Directory durability runs on Unix only (spec section 17.6):
+                // every directory on the key's path gets its entry fsynced
+                // into its parent. A concurrent delete can remove the key's
+                // empty directory before the temp file lands in it, so a
+                // write that finds no directory creates the directories again
+                // and retries once.
+                let mut written = Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+                for _ in 0..2 {
+                    create_durable_dirs(parent, &base_dir)?;
+                    #[cfg(test)]
+                    tests::after_dirs_created(parent);
+                    written = write_synced(&temp_path, &data);
+                    if !matches!(&written, Err(e) if e.kind() == std::io::ErrorKind::NotFound) {
+                        break;
+                    }
+                }
+                if let Err(e) = written {
                     if let Err(cleanup) = std::fs::remove_file(&temp_path)
                         && cleanup.kind() != std::io::ErrorKind::NotFound
                     {
@@ -457,31 +497,163 @@ mod tests {
         assert_eq!(path, PathBuf::from("/tmp/test-fs/context/abc/state"));
     }
 
-    #[test]
+    /// Every directory `sync_dir` fsynced in this test process. Tests use
+    /// distinct base directories, so each reads only its own entries.
     #[cfg(unix)]
-    fn missing_dirs_lists_each_new_directory_deepest_first() {
+    static SYNCED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+    #[cfg(unix)]
+    pub(super) fn record_sync(dir: &Path) {
+        SYNCED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(dir.to_path_buf());
+    }
+
+    #[cfg(unix)]
+    fn sync_count(dir: &Path) -> usize {
+        SYNCED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|synced| synced.as_path() == dir)
+            .count()
+    }
+
+    #[cfg(unix)]
+    fn fresh_base(tag: &str) -> PathBuf {
         let base = std::env::temp_dir().join(format!(
-            "scp-missing-dirs-{}-{}",
+            "scp-durable-dirs-{tag}-{}-{}",
             std::process::id(),
             TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&base).unwrap();
-        let deep = base.join("a").join("b").join("c");
+        std::fs::canonicalize(&base).unwrap()
+    }
+
+    /// Directories whose next creation by a put is undone right after it,
+    /// as a concurrent delete's empty-directory removal would. Each entry
+    /// fires once.
+    #[cfg(unix)]
+    static REMOVE_AFTER_CREATE: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+    /// The put's hook between creating the key's directories and writing
+    /// its temp file there.
+    pub(super) fn after_dirs_created(dir: &Path) {
+        #[cfg(unix)]
+        {
+            let fires = {
+                let mut pending = REMOVE_AFTER_CREATE
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                pending
+                    .iter()
+                    .position(|p| p == dir)
+                    .map(|i| pending.remove(i))
+                    .is_some()
+            };
+            if fires {
+                std::fs::remove_dir(dir).unwrap();
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = dir;
+    }
+
+    /// A put into directories that its own put did not create fsyncs the
+    /// parent of each one, `base_dir` included, before it returns.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn put_makes_a_directory_it_did_not_create_durable() {
+        let base = fresh_base("existing");
+        let storage = FilesystemStorage::new(&base).unwrap();
+        std::fs::create_dir_all(base.join("a").join("b")).unwrap();
+
+        storage.store("a/b/key", b"v").await.unwrap();
+
+        assert!(sync_count(&base) >= 1, "the entry of `a` in base_dir");
+        assert!(sync_count(&base.join("a")) >= 1, "the entry of `b` in `a`");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// Creating a store over a missing `base_dir` fsyncs the parent of each
+    /// directory it created, so the base directory survives a power loss
+    /// before any put.
+    #[cfg(unix)]
+    #[test]
+    fn new_over_a_missing_base_dir_syncs_its_parent() {
+        let root = fresh_base("new");
+        let base = root.join("x").join("y");
+
+        let storage = FilesystemStorage::new(&base).unwrap();
+
+        assert_eq!(storage.base_dir, base);
+        assert_eq!(sync_count(&root.join("x")), 1, "the entry of `y` in `x`");
         assert_eq!(
-            missing_dirs(&deep).unwrap(),
-            vec![
-                base.join("a").join("b").join("c"),
-                base.join("a").join("b"),
-                base.join("a"),
-            ]
+            sync_count(&root),
+            1,
+            "the entry of `x` in the existing root"
         );
-        std::fs::create_dir_all(base.join("a")).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A store over an existing `base_dir` creates nothing and fsyncs
+    /// nothing.
+    #[cfg(unix)]
+    #[test]
+    fn new_over_an_existing_base_dir_syncs_nothing() {
+        let root = fresh_base("new-existing");
+        let base = root.join("x");
+        std::fs::create_dir(&base).unwrap();
+
+        FilesystemStorage::new(&base).unwrap();
+
+        assert_eq!(sync_count(&root), 0);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A delete that removed the key's directory between a put's directory
+    /// creation and its temp-file write does not fail the put: the put
+    /// creates the directory again, fsyncs its entry again, and writes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_put_racing_a_directory_removal_recreates_it_and_writes() {
+        let base = fresh_base("race");
+        let storage = FilesystemStorage::new(&base).unwrap();
+        REMOVE_AFTER_CREATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(base.join("a"));
+
+        storage.store("a/k", b"v").await.unwrap();
+
+        assert_eq!(storage.retrieve("a/k").await.unwrap(), Some(b"v".to_vec()));
         assert_eq!(
-            missing_dirs(&deep).unwrap(),
-            vec![base.join("a").join("b").join("c"), base.join("a").join("b")]
+            sync_count(&base),
+            2,
+            "the entry of `a` is fsynced for the creation and the recreation"
         );
-        std::fs::create_dir_all(&deep).unwrap();
-        assert!(missing_dirs(&deep).unwrap().is_empty());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// Every put fsyncs every directory entry on its path, so a put after a
+    /// delete removed the directory makes the recreated directory durable,
+    /// whichever store or process removed it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_put_after_a_delete_removed_the_directory_syncs_again() {
+        let base = fresh_base("delete");
+        let storage = FilesystemStorage::new(&base).unwrap();
+        let other = FilesystemStorage::new(&base.join("alias").join("..")).unwrap();
+        assert_eq!(storage.base_dir, other.base_dir);
+
+        storage.store("a/k1", b"v").await.unwrap();
+        assert_eq!(sync_count(&base), 1);
+        other.delete("a/k1").await.unwrap();
+        assert!(!base.join("a").exists());
+
+        storage.store("a/k2", b"v").await.unwrap();
+        assert_eq!(sync_count(&base), 2, "the recreated `a` is fsynced again");
         std::fs::remove_dir_all(&base).unwrap();
     }
 

@@ -181,8 +181,10 @@ async fn handle_extend_ttl(
 
 /// Handle [`TtlCloseCommand::ResetTtlTimer`] against actor-owned state.
 ///
-/// Re-records the TTL deadline (a Class-C write) and persists best-effort via
-/// [`crate::context::ttl_close_helpers::reset_ttl_timer`]. The persist is the
+/// Re-records the TTL deadline (a Class-C write) after its `TtlExtended` leaf
+/// is stored, and persists best-effort, via
+/// [`crate::context::ttl_close_helpers::reset_ttl_timer`]; replies with the
+/// reset's error when the leaf could not be stored. The persist is the
 /// only I/O, so the `HANDLER_TIMEOUT` wrap bounds it (ADR-049 finding A3 — the
 /// deadline itself is re-derived into a one-shot sleep by the actor's
 /// `reconcile_timers`, no task is spawned).
@@ -197,7 +199,13 @@ async fn handle_reset_ttl_timer(
         crate::context::ttl_close_helpers::reset_ttl_timer(cell, deps, &context_id, new_duration);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, reset_fut).await {
-        Ok(()) => (Outcome::ok_mutated(()), Ok(())),
+        Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
+        // The reset failed before changing the deadline or the consent tally
+        // (spec section 17.3, "Event log write failures").
+        Ok(Err(err)) => {
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err(sketch), Err(err))
+        }
         Err(_elapsed) => {
             let err = ContextError::TransportTimeout(format!(
                 "reset_ttl_timer exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"

@@ -159,11 +159,14 @@ where
     // copied by every member (§7.3.1, §9.9.3).
     deps.event_log
         .append_membership_change_leaf(
+            crate::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::MemberJoined,
             subscriber_did.as_ref(),
-            subscriber_did.as_ref(),
-            "subscriber",
+            &scp_event_log::payload::MembershipChangePayload {
+                subject_did: subscriber_did.as_ref().to_owned(),
+                role_name: "subscriber".to_owned(),
+            },
             timestamp,
         )
         .await?;
@@ -242,11 +245,14 @@ pub async fn unsubscribe_broadcast(
     let unsub_ts = deps.clock.now_secs();
     deps.event_log
         .append_membership_change_leaf(
+            crate::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::MemberLeft,
             subscriber_did.as_ref(),
-            subscriber_did.as_ref(),
-            "subscriber",
+            &scp_event_log::payload::MembershipChangePayload {
+                subject_did: subscriber_did.as_ref().to_owned(),
+                role_name: "subscriber".to_owned(),
+            },
             unsub_ts,
         )
         .await?;
@@ -282,6 +288,7 @@ pub async fn unsubscribe_broadcast(
                 if let Err(e) = deps
                     .event_log
                     .append_context_event_with_payload(
+                        crate::context::builder::AppendMode::AfterSideEffect,
                         &context_id_bytes,
                         scp_event_log::EventType::KeyEpochAdvance,
                         rotation.author_did.as_str(),
@@ -701,6 +708,7 @@ pub async fn block_broadcast_subscriber(
     let block_ts = deps.clock.now_secs();
     deps.event_log
         .append_context_event(
+            crate::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::MemberBlocked,
             author_did.as_ref(),
@@ -737,6 +745,7 @@ pub async fn block_broadcast_subscriber(
             if let Err(e) = deps
                 .event_log
                 .append_context_event_with_payload(
+                    crate::context::builder::AppendMode::AfterSideEffect,
                     &context_id_bytes,
                     scp_event_log::EventType::KeyEpochAdvance,
                     author_did.as_ref(),
@@ -824,6 +833,7 @@ pub async fn unblock_broadcast_subscriber(
 
     deps.event_log
         .append_context_event(
+            crate::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::MemberUnblocked,
             author_did.as_ref(),

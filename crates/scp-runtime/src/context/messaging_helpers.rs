@@ -818,6 +818,7 @@ pub async fn run_buffered_post_delivery(
     if let Some(event_name) = event_name
         && let Err(e) = event_log
             .append_context_event(
+                crate::context::builder::AppendMode::AfterSideEffect,
                 context_id_bytes,
                 event_name,
                 sender_did,
@@ -845,7 +846,7 @@ pub async fn run_buffered_post_delivery(
         false
     } else {
         let (events, convergent_now) =
-            crate::context::governance_logic::event_log_entries_for_consequences(
+            crate::context::governance_logic::event_log_entries_for_consequences_after_side_effect(
                 view.receive_buffer_mut(),
                 context_id,
                 now,
@@ -2359,7 +2360,7 @@ pub async fn finalize_send(
 
         // Consequence enforcement.
         let (send_events, convergent_now) =
-            crate::context::governance_logic::event_log_entries_for_consequences(
+            crate::context::governance_logic::event_log_entries_for_consequences_after_side_effect(
                 view.receive_buffer_mut(),
                 context_id,
                 now,
@@ -3749,7 +3750,7 @@ pub async fn deliver_message_and_drain_buffered(
                 .clone();
             if !consequence_rules.is_empty() {
                 let (recv_events, convergent_now) =
-                    crate::context::governance_logic::event_log_entries_for_consequences(
+                    crate::context::governance_logic::event_log_entries_for_consequences_after_side_effect(
                         view.receive_buffer_mut(),
                         context_id,
                         now,
@@ -3868,7 +3869,7 @@ pub async fn deliver_message_and_drain_buffered(
         .clone();
     if !consequence_rules.is_empty() {
         let (recv_events, convergent_now) =
-            crate::context::governance_logic::event_log_entries_for_consequences(
+            crate::context::governance_logic::event_log_entries_for_consequences_after_side_effect(
                 view.receive_buffer_mut(),
                 context_id,
                 now,
@@ -4771,6 +4772,14 @@ mod pseudonym_routing_tests {
 
     #[async_trait::async_trait]
     impl crate::context::builder::ContextEventLogProvider for RecordingEventLog {
+        fn event_log_entries(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            Ok(None)
+        }
+
         async fn init_event_log(
             &self,
             _id: &[u8; 32],
@@ -4978,6 +4987,14 @@ mod pseudonym_routing_tests {
 
     #[async_trait::async_trait]
     impl crate::context::builder::ContextEventLogProvider for DrainRecordingEventLog {
+        fn event_log_entries(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            Ok(None)
+        }
+
         async fn init_event_log(
             &self,
             _id: &[u8; 32],
@@ -5536,6 +5553,14 @@ pub mod dropped_supervisor_tests {
     struct CountingEventLog(Arc<AtomicUsize>);
     #[async_trait::async_trait]
     impl crate::context::builder::ContextEventLogProvider for CountingEventLog {
+        fn event_log_entries(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            Ok(None)
+        }
+
         async fn init_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }

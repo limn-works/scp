@@ -236,6 +236,20 @@ fn persistence_over(
     )
 }
 
+/// The loopback supervisor's event log over `mls_inner`, the same handle as
+/// [`persistence_over`], mirroring the production `build_host_site_deployer`.
+fn event_log_over(
+    mls_inner: &Arc<SqliteStorage>,
+) -> Box<dyn scp_core::context::builder::ContextEventLogProvider> {
+    Box::new(
+        scp_core::context::providers::MerkleEventLogProvider::with_persistence(Arc::new(
+            scp_core::store::context::ProtocolRepositoryEventLogBridge::new(Arc::new(
+                scp_core::store::ProtocolRepository::new(Arc::clone(mls_inner)),
+            )),
+        )),
+    )
+}
+
 /// Full in-process self-host deploy + HTTP serve, end to end.
 ///
 /// Mirrors the production `--self-host` path: build a no-domain node on real
@@ -301,6 +315,7 @@ async fn self_host_deploys_embedded_site_and_serves_index_over_http() {
         custody: &custody,
         durable,
         persistence: persistence_over(&mls_inner),
+        event_log: event_log_over(&mls_inner),
         wrapping_custody: single_custody_source(Arc::clone(&custody)),
         assets: &assets,
     };
@@ -401,6 +416,7 @@ async fn build_deployer(built: &BuiltNode, context_id: &str) -> scp_node::SelfHo
         built.key_resolver(),
         durable,
         persistence_over(&mls_inner),
+        event_log_over(&mls_inner),
         single_custody_source(Arc::clone(&built.custody)),
     )
     .await
@@ -1016,6 +1032,7 @@ async fn deploy_embedded_and_assert_serves<S>(
             custody,
             durable,
             persistence,
+            event_log: event_log_over(&mls_inner),
             wrapping_custody: single_custody_source(Arc::clone(custody)),
             assets: &assets,
         },
@@ -1620,6 +1637,7 @@ async fn self_host_deployer_shutdown_drains_before_store_close() {
         built.key_resolver(),
         durable,
         persistence_over(&mls_inner),
+        event_log_over(&mls_inner),
         single_custody_source(Arc::clone(&built.custody)),
     )
     .await
