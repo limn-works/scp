@@ -3174,3 +3174,124 @@ Step (d) of §9.7.4.1 item 5 confirms a non-copyable substrate is reachable with
 ```
 
 A verifier accepts 83a's signature as a probe signature over 83a's nonce under §25.2's reference key. It rejects the same key's raw signature over an event digest `D` as a probe signature, because it recomputes the raw digest from the nonce and never takes the signed value from the signer.
+
+## 25.35 Device-Attestation Vectors (`09-security-model.md` §9.3.1)
+
+These vectors pin the four digests §9.3.1 of the security spec defines, the Play Integrity verdict a verifier signs, and the fingerprint of the root certificate an App Attest reader pins. The subject and the verifier are the fixture identifiers `SHA-256("SCP test vector identifier subject")` and `SHA-256("SCP test vector identifier verifier")` (§25.1). The context id is the 5 ASCII bytes `ctx-1`, and the context's `device_attestation_challenge` is the 32 bytes 20 through 3f. `scripts/gen-test-vectors-p256.py` builds every preimage from §9.3.1's byte layout with its own SHA-256 and ECDSA code and shares no code with the Rust reader.
+
+### Vector 84: the binding digest `D` and the tag `T`
+
+```
+84a — D = SHA-256("SCP-DEVICE-ATTESTATION-V1:" || BE32(56) || subject text form
+                  || BE32(5) || "ctx-1" || challenge)
+      challenge (32 bytes):
+      202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f
+      preimage (127 bytes = 122 + 5):
+      5343502d4445564943452d4154544553544154494f4e2d56313a000000387363
+      703a6b7461726736617174736a75366d6832777333686b3774356b6d73766d63
+      6b71376435657177736d617735646933653370347461000000056374782d3120
+      2122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f
+      D:
+      66318c86819e17ad71427eabe4cf46590f16adb2bed9e43c9c7dc18ea060bbd3
+
+84b — T = SHA-256("SCP-DEVICE-ATTESTATION-TAG-V1:" || BE32(56) || subject text form
+                  || BE32(5) || "ctx-1" || challenge)
+      preimage (131 bytes = 126 + 5):
+      5343502d4445564943452d4154544553544154494f4e2d5441472d56313a0000
+      00387363703a6b7461726736617174736a75366d6832777333686b3774356b6d
+      73766d636b71376435657177736d617735646933653370347461000000056374
+      782d31202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c
+      3d3e3f
+      T:
+      4d462ead28cfe33b7cee1d01fd9da538e984858260227fcfd3d53c2b4c27d550
+      T in an entry's serviceEndpoint, unpadded base64url (43 characters):
+      TUYurSjP4zt87h0B_Z2lOOmEhYJgIn_P09U8K0wn1VA
+```
+
+The two preimages differ only in the separator, so `T` equals no `D` short of a SHA-256 collision.
+
+### Vector 85: the assertion digest `A`
+
+```
+85 — A = SHA-256("SCP-DEVICE-ASSERTION-V1:" || BE32(len(m)) || m)
+     m, the 33 ASCII bytes "SCP test vector assertion request":
+     534350207465737420766563746f7220617373657274696f6e20726571756573
+     74
+     preimage (61 bytes = 24 + 4 + 33):
+     5343502d4445564943452d415353455254494f4e2d56313a0000002153435020
+     7465737420766563746f7220617373657274696f6e2072657175657374
+     A:
+     678ab334973418b55ed733637a81b24c6e9d37bc4ea89df227cecf9c3ebedc35
+```
+
+### Vector 86: the policy digest `P`
+
+The policy holds one element in every list:
+
+- `device_attestation_challenge`: Vector 84's challenge;
+- `device_attestation_max_age_secs`: 2,592,000;
+- `accepted_app_ids`: one `AcceptedAppId` with `app_id` `"ABCDE12345.com.example.scp"`, `platform` `Ios` (`0x00`), and `accepted_bundle_versions` `["1.0"]`;
+- `accepted_validation_categories`: `[4]`;
+- `require_validation_category`: true (`0x01`);
+- `accepted_android_packages`: one `AcceptedAndroidPackage` with `package_name` `"com.example.scp"`, `signing_cert_sha256` the SHA-256 of the ASCII bytes `SCP test vector signing certificate`, and `verifier_identifier` the verifier's 32 raw bytes.
+
+```
+86 — signing_cert_sha256:
+     83599d12bbbeff09725d9d6ea2222acadb684c092b9f534dbaf10f973f6f5bd0
+     preimage (215 bytes):
+     5343502d4445564943452d4154544553544154494f4e2d504f4c4943592d5631
+     3a202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e
+     3f0000000000278d00000000010000001a414243444531323334352e636f6d2e
+     6578616d706c652e736370000000000100000003312e30000000010000000401
+     000000010000000f636f6d2e6578616d706c652e73637083599d12bbbeff0972
+     5d9d6ea2222acadb684c092b9f534dbaf10f973f6f5bd0aca2c93825d53244c8
+     23000db9dec0a02498bdb3ed96aa2ce038425b4c65001e
+     P:
+     8bb83191f4f322501d2cd65070a4f61b438887934aaea29f1797f974d5fe19ef
+```
+
+### Vector 87: the Play Integrity verdict
+
+The token is the 31 ASCII bytes `SCP test vector integrity token`, the package is Vector 86's, `cert_digest` is Vector 86's `signing_cert_sha256`, `token_issued_at` is 1,767,225,600 (2026-01-01T00:00:00Z), and `checked_at` is 60 seconds later. The verifier signs with §25.2's reference key under RFC 6979, and the signature's `s` is at most n/2, the low-`s` form §9.5 requires.
+
+```
+87 — SHA-256(token):
+     f3eedcddd35d370d042a0eb4e19b4b57a918a421aee1d96845c08c1fbdb9fe03
+     package_hash = SHA-256("com.example.scp"):
+     ee760b2de75a5f5a5e7eaa046eca0df481765a163b7088338eb7c54dee70daae
+     preimage (238 bytes = 30-byte separator + verifier + subject + D (Vector 84a)
+       + SHA-256(token) + package_hash + cert_digest + BE64(token_issued_at)
+       + BE64(checked_at)):
+     5343502d504c41592d494e544547524954592d564552444943542d56313aaca2
+     c93825d53244c823000db9dec0a02498bdb3ed96aa2ce038425b4c65001e54c1
+     1378109c934f30fab4b6757e7d5325560950f8fa485a4c05ba346c9b7f266631
+     8c86819e17ad71427eabe4cf46590f16adb2bed9e43c9c7dc18ea060bbd3f3ee
+     dcddd35d370d042a0eb4e19b4b57a918a421aee1d96845c08c1fbdb9fe03ee76
+     0b2de75a5f5a5e7eaa046eca0df481765a163b7088338eb7c54dee70daae8359
+     9d12bbbeff09725d9d6ea2222acadb684c092b9f534dbaf10f973f6f5bd00000
+     00006955b900000000006955b93c
+     preimage digest:
+     4098e91f88231da38665691770a1b026e60a8d184efae9bb2f11a3107fbe6e79
+     signature, raw r || s:
+     feef9523a7bcd5ef7cadbd0886ad374057003f9964c6ded0716617b22841a230
+     456fb375ccf6b28573637ee2084719cf04b9a2502d37baf66a2dd475e6358eb1
+     verdict (176 bytes = verifier + package_hash + cert_digest
+       + BE64(token_issued_at) + BE64(checked_at) + signature):
+     aca2c93825d53244c823000db9dec0a02498bdb3ed96aa2ce038425b4c65001e
+     ee760b2de75a5f5a5e7eaa046eca0df481765a163b7088338eb7c54dee70daae
+     83599d12bbbeff09725d9d6ea2222acadb684c092b9f534dbaf10f973f6f5bd0
+     000000006955b900000000006955b93cfeef9523a7bcd5ef7cadbd0886ad3740
+     57003f9964c6ded0716617b22841a230456fb375ccf6b28573637ee2084719cf
+     04b9a2502d37baf66a2dd475e6358eb1
+```
+
+A reader that recomputes the preimage with `subject` set to its own identifier, or with the `D` of another context, gets a different digest, and Play Integrity check 6 returns `Rejected{VerdictSignatureInvalid}`.
+
+### Vector 88: the pinned Apple App Attestation Root CA
+
+`scripts/apple-app-attestation-root-ca.pem` holds the certificate Apple publishes at https://www.apple.com/certificateauthority/Apple_App_Attestation_Root_CA.pem. Its DER is 549 bytes, its key is a P-384 key, and it signs itself with ecdsa-with-SHA384. A reader that pins a root whose DER has another SHA-256 pins a different certificate.
+
+```
+88 — SHA-256(root certificate DER):
+     1cb9823ba28ba6ad2d33a006941de2ae4f513ef1d4e831b9f7e0fa7b6242c932
+```
