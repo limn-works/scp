@@ -542,17 +542,32 @@ pub async fn handle_wake(
     payload: &[u8],
 ) -> Result<Arc<WakeOutcome>, WakeError> {
     check_wake_payload(platform, payload)?;
-    Ok(core
-        .wake_flight()
+    Ok(run_wake(core.wake_flight(), |tally| async move {
+        pull_on_wake(core, &tally).await
+    })
+    .await)
+}
+
+/// Runs `pull` in `flight` under one [`WAKE_DEADLINE`] that starts when this
+/// call starts. A call that joins a leader its caller then drops runs `pull`
+/// itself under the same deadline, never a fresh one, so the host's wake
+/// window bounds every caller.
+async fn run_wake<P, Fut>(flight: &WakeFlight, pull: P) -> Arc<WakeOutcome>
+where
+    P: Fn(Arc<DeliveryTally>) -> Fut + Send + Sync,
+    Fut: Future<Output = Result<Vec<WakePullError>, WakeFailure>> + Send,
+{
+    let deadline = tokio::time::Instant::now() + WAKE_DEADLINE;
+    flight
         .run(|| async {
             // The tally lives outside the deadline, so the envelopes a
             // context delivered before the deadline dropped the pull still
             // count.
-            let tally = DeliveryTally::default();
-            let result = tokio::time::timeout(WAKE_DEADLINE, pull_on_wake(core, &tally)).await;
+            let tally = Arc::new(DeliveryTally::default());
+            let result = tokio::time::timeout_at(deadline, pull(Arc::clone(&tally))).await;
             wake_outcome(tally.total(), result)
         })
-        .await)
+        .await
 }
 
 /// The receiver of the running wake's outcome; `None` until it finishes.
@@ -1331,5 +1346,40 @@ mod tests {
         let outcome = waiter.await;
         assert!(matches!(*outcome, WakeOutcome::NewData));
         assert_eq!(pulls.load(Ordering::SeqCst), 2);
+    }
+
+    /// A waiter that takes over from a leader its caller dropped keeps the
+    /// deadline that started with its own call: the leader is dropped at 24
+    /// seconds and the waiter's pull, which never finishes, expires 25
+    /// seconds after the waiter started, not 25 seconds after the takeover.
+    #[tokio::test(start_paused = true)]
+    async fn a_waiter_that_takes_over_keeps_its_own_deadline() {
+        let flight = WakeFlight::default();
+        let pull = |_tally: Arc<DeliveryTally>| async {
+            std::future::pending::<Result<Vec<WakePullError>, WakeFailure>>().await
+        };
+        let started = tokio::time::Instant::now();
+        let mut leader = Box::pin(run_wake(&flight, pull));
+        assert!(
+            futures::poll!(leader.as_mut()).is_pending(),
+            "the leader parks in its pull"
+        );
+        let mut waiter = Box::pin(run_wake(&flight, pull));
+        assert!(
+            futures::poll!(waiter.as_mut()).is_pending(),
+            "the waiter joins"
+        );
+        tokio::time::advance(Duration::from_secs(24)).await;
+        drop(leader);
+        let outcome = waiter.await;
+        assert!(
+            matches!(*outcome, WakeOutcome::Failed(WakeFailure::DeadlineExpired)),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            started.elapsed(),
+            WAKE_DEADLINE,
+            "the waiter returns 25 seconds after its own start"
+        );
     }
 }
