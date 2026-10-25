@@ -1786,6 +1786,19 @@
       ]
     },
     {
+      "canonical": "identity_load_with_custody",
+      "category": "identity",
+      "pyo3": [
+        "identity_load_with_custody"
+      ],
+      "uniffi": [
+        "identity_load_with_custody"
+      ],
+      "napi": [
+        "identity_load_with_custody"
+      ]
+    },
+    {
       "canonical": "identity_execute_recovery",
       "category": "identity",
       "pyo3": [
