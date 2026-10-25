@@ -336,9 +336,13 @@ impl ResolvedState {
 ///    winner at the baseline head is `Confirmed`, or `Discarded` where every
 ///    chain an exhausted source served is a proper prefix of the baseline;
 ///    any other winner is `Adopted`, and the set moves to it.
-/// 7. Every verdict that changes the set admits through one routine: each
-///    ranked chain the set did not hold before this resolution, against the
-///    set's new basis, under R9's eviction rank and bounds.
+/// 7. Every verdict that changes the set admits through one routine, under
+///    R9's eviction rank and bounds against the set's new basis: each chain
+///    an exhausted source served that the set did not hold before this
+///    resolution, and at a `Contested` verdict each tied chain, which R7
+///    makes the verifier retain. A losing chain only an unexhausted source
+///    served is never retained, because a later resolution reads every held
+///    chain as read to its end.
 ///
 /// # Errors
 ///
@@ -386,7 +390,7 @@ pub fn classify(input: ResolutionInput<'_>) -> Result<Classification, ClassifyEr
     ranked.extend(served.all().cloned());
     let resolution = resolve_set(&ranked)?;
     if let Some(contest) = early_stop(&served, &ranked, &resolution)? {
-        return contested(held, contest, &ranked);
+        return contested(held, contest, &ranked, &exhausted);
     }
     if exhausted.is_empty() {
         return Ok(unchanged(held, served.missing_events(held)));
@@ -416,6 +420,7 @@ pub fn classify(input: ResolutionInput<'_>) -> Result<Classification, ClassifyEr
                     fork_position,
                 },
                 &ranked,
+                &exhausted,
             )
         }
         SetResolution::Winner { head } => {
@@ -429,10 +434,8 @@ pub fn classify(input: ResolutionInput<'_>) -> Result<Classification, ClassifyEr
                 .ok_or(NoResolution)
                 .map_err(ResolveError::from)?;
             match (held, baseline) {
-                (Some(set), Some(baseline)) => {
-                    on_baseline(set, baseline, winner, &exhausted, &ranked, now)
-                }
-                (held, _) => adopted(held, None, winner, &ranked, now),
+                (Some(set), Some(baseline)) => on_baseline(set, baseline, winner, &exhausted, now),
+                (held, _) => adopted(held, None, winner, &exhausted, now),
             }
         }
         SetResolution::Empty => Err(ResolveError::from(NoResolution).into()),
@@ -642,11 +645,15 @@ fn prefix_of(
 /// verification basis". R9: "A verifier never evicts the accepted chain":
 /// an accepted basis stays, with the shared prefix recorded beside it
 /// ([`RetentionSet::tie_prefix`]), and at a first contact the shared prefix
-/// is the basis. Every ranked chain the set did not hold is admitted.
+/// is the basis. Each tied chain of `ranked` and each chain of `read` the
+/// set did not hold is admitted: a tied chain at R9's early stop may sit
+/// only on a source stopped at the fetch bound, and R7 retains it as
+/// evidence.
 fn contested(
     held: Option<&RetentionSet>,
     contest: Contest,
     ranked: &[ValidatedChain],
+    read: &[ValidatedChain],
 ) -> Result<Classification, ClassifyError> {
     let prefix = prefix_of(ranked, contest.shared_prefix_head, contest.fork_position)?;
     let mut refused = Refused::default();
@@ -658,7 +665,10 @@ fn contested(
         }
         None => RetentionSet::new(RetentionBasis::ContestedPrefix(prefix)),
     };
-    let set = admit_new(set, held, ranked, &mut refused)?;
+    let tied = ranked
+        .iter()
+        .filter(|chain| contest.heads.contains(&chain.head_digest()));
+    let set = admit_new(set, held, tied.chain(read), &mut refused)?;
     let residue = refused.residue(&set);
     Ok(Classification {
         verdict: ResolutionVerdict::Contested {
@@ -701,19 +711,19 @@ fn holds(set: &RetentionSet, head: &[u8; 32]) -> bool {
 }
 
 /// The one admission routine every verdict that changes the set runs: each
-/// chain of `ranked` whose head the pre-resolution set `before` did not
-/// hold is admitted against `set`'s basis, under R9's eviction rank and
-/// bounds, and each refusal is recorded. A chain `before` held is already
+/// of `candidates` whose head the pre-resolution set `before` did not hold
+/// is admitted against `set`'s basis, under R9's eviction rank and bounds,
+/// and each refusal is recorded. A chain `before` held is already
 /// placed at its moment by the move that built `set`, so none is admitted
 /// again with a new moment. R12: "the verifier retains each losing chain as
 /// a divergent suffix under R9".
-fn admit_new(
+fn admit_new<'c>(
     mut set: RetentionSet,
     before: Option<&RetentionSet>,
-    ranked: &[ValidatedChain],
+    candidates: impl IntoIterator<Item = &'c ValidatedChain>,
     refused: &mut Refused,
 ) -> Result<RetentionSet, ClassifyError> {
-    for chain in ranked {
+    for chain in candidates {
         let head = chain.head_digest();
         if before.is_some_and(|before| holds(before, &head)) {
             continue;
@@ -738,11 +748,10 @@ fn on_baseline(
     baseline: &ValidatedChain,
     winner: ValidatedChain,
     exhausted: &[ValidatedChain],
-    ranked: &[ValidatedChain],
     now: SystemTime,
 ) -> Result<Classification, ClassifyError> {
     if winner.head_digest() != baseline.head_digest() {
-        return adopted(Some(set), Some(baseline), winner, ranked, now);
+        return adopted(Some(set), Some(baseline), winner, exhausted, now);
     }
     let mut stale = true;
     for chain in exhausted {
@@ -761,8 +770,8 @@ fn on_baseline(
     }
     let mut refused = Refused::default();
     let mut next = set.clone();
-    refused.rerank(next.clear_tie()?);
-    let next = admit_new(next, Some(set), ranked, &mut refused)?;
+    next.confirm_accepted();
+    let next = admit_new(next, Some(set), exhausted, &mut refused)?;
     let residue = refused.residue(&next);
     Ok(Classification {
         verdict: ResolutionVerdict::Confirmed,
@@ -773,14 +782,14 @@ fn on_baseline(
 }
 
 /// R12's adoption of `winner`: the set moves to it, which re-places the
-/// replaced basis and every retained suffix against it, and every ranked
-/// chain the set did not hold is admitted. Where `winner` extends
+/// replaced basis and every retained suffix against it, and every chain of
+/// `read` the set did not hold is admitted. Where `winner` extends
 /// `baseline`, the baseline's held copies stay (R9's copy rule).
 fn adopted(
     held: Option<&RetentionSet>,
     baseline: Option<&ValidatedChain>,
     winner: ValidatedChain,
-    ranked: &[ValidatedChain],
+    read: &[ValidatedChain],
     now: SystemTime,
 ) -> Result<Classification, ClassifyError> {
     let adopted_head = winner.head_digest();
@@ -804,7 +813,7 @@ fn adopted(
         }
         None => RetentionSet::new(RetentionBasis::Accepted(winner)),
     };
-    let next = admit_new(next, held, ranked, &mut refused)?;
+    let next = admit_new(next, held, read, &mut refused)?;
     let residue = refused.residue(&next);
     Ok(Classification {
         verdict: ResolutionVerdict::Adopted {

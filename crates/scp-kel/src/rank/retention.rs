@@ -351,6 +351,14 @@ pub enum RestoreError {
         /// The persisted tie prefix head.
         head: [u8; 32],
     },
+    /// The persisted tie prefix is on no chain the set holds: it is neither
+    /// a prefix of the accepted chain nor a prefix of a retained suffix, so
+    /// no tied chain extends it.
+    #[error("the tie prefix {head:02x?} is on no chain the set holds")]
+    TiePrefixOffHeldChains {
+        /// The persisted tie prefix head.
+        head: [u8; 32],
+    },
     /// R6's comparisons over the restored chains reached no outcome.
     #[error(transparent)]
     Resolve(#[from] ResolveError),
@@ -463,12 +471,24 @@ impl RetentionSet {
     /// shares with the basis or a retained suffix.
     ///
     /// Eviction rank, R9: "It is a scalar: the R6 rank the suffix carries
-    /// against the accepted chain, read against the commitment standing at
-    /// that suffix's own fork position."
+    /// against the accepted chain. A chain the verifier retains past the
+    /// accepted head while a `Contested` verdict stands, a tied chain
+    /// included, and a chain the held-first rule below displaces read that
+    /// rank against the commitment standing at the tie's fork; every other
+    /// suffix reads it against the commitment standing at its own fork
+    /// position." An extension of the accepted chain reads its rank against
+    /// [`tie_prefix`](Self::tie_prefix), whose head is the tie's fork.
     ///
     /// Bounds and eviction: R9's eviction rule, quoted on the planner this
-    /// calls. The set changes only where the candidate is placed; a refusal
-    /// evicts nothing.
+    /// calls. R9: "A tied head of a contested identity is evicted only for a
+    /// candidate that beats it under R6, and a candidate that would need to
+    /// evict a tied head it does not beat is refused and counted in the
+    /// residue n". A tied head is a retained suffix no chain the set holds
+    /// beats: R6 makes every other chain lose to the winner or to a tied
+    /// head, and a suffix beating every chain the set holds outright is
+    /// protected too, which R9's "never evicts the accepted chain" extends
+    /// to the chain R6 would adopt. The set changes only where the candidate
+    /// is placed; a refusal evicts nothing.
     ///
     /// # Errors
     ///
@@ -539,7 +559,18 @@ impl RetentionSet {
             self.next_observed
         };
         let held: Vec<&Slot> = self.suffixes.iter().map(|suffix| &suffix.slot).collect();
-        let Some(evict) = plan_evictions(&held, extends, &slot, self.bounds) else {
+        let kept = held
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| Some(*index) != extends)
+            .map(|(_, slot)| *slot);
+        // The tournament runs only where the candidate needs an eviction.
+        let protected = if fits(kept, &slot, self.bounds) {
+            Vec::new()
+        } else {
+            self.protected(&candidate)?
+        };
+        let Some(evict) = plan_evictions(&held, &protected, extends, &slot, self.bounds) else {
             return Ok(Admission::Refused { rank });
         };
         let retained = RetainedSuffix {
@@ -570,6 +601,23 @@ impl RetentionSet {
             },
             None => Admission::Retained { rank, evicted },
         })
+    }
+
+    /// For each retained suffix, in order, whether R9 forbids evicting it for
+    /// `candidate`: it is a tied head, which no chain the set holds beats,
+    /// and `candidate` does not beat it under R6.
+    fn protected(&self, candidate: &ValidatedChain) -> Result<Vec<bool>, UnrelatedChains> {
+        let chains: Vec<&ValidatedChain> = std::iter::once(self.basis.chain())
+            .chain(self.suffixes.iter().map(RetainedSuffix::chain))
+            .collect();
+        let tournament = Tournament::of(&chains)?;
+        (1..)
+            .zip(&self.suffixes)
+            .map(|(index, suffix)| {
+                let tied = (0..chains.len()).all(|other| !tournament.beats(other, index));
+                Ok(tied && !beats(candidate, suffix.chain())?)
+            })
+            .collect()
     }
 
     /// `candidate` with the held copy of every leading event it shares with
@@ -652,19 +700,15 @@ impl RetentionSet {
     }
 
     /// Drops the [`tie_prefix`](Self::tie_prefix) a `Contested` verdict
-    /// recorded, after a verdict that resolved the tie: every retained
-    /// suffix is re-placed against the basis alone.
-    ///
-    /// # Errors
-    ///
-    /// The first [`RetentionError`] a re-admission reaches, a retained
-    /// extension of the accepted chain's [`RetentionError::ExtendsAccepted`]
-    /// among them. The set is then unchanged.
-    pub(crate) fn clear_tie(&mut self) -> Result<Rerank, RetentionError> {
-        if self.tie_prefix.is_none() {
-            return Ok(Rerank::default());
-        }
-        self.move_to(self.basis.clone(), None)
+    /// recorded, after R6 confirmed the accepted chain over every chain the
+    /// set holds, which happens where every tied head but the accepted
+    /// chain was refused. Only an extension of the accepted chain reads its
+    /// rank against the tie prefix, and R6 drops a chain another chain
+    /// extends before ranking, so the accepted head wins only where the set
+    /// retains no extension of it: no rank and no byte tally changes, and
+    /// nothing is re-placed.
+    pub(crate) fn confirm_accepted(&mut self) {
+        self.tie_prefix = None;
     }
 
     /// [`rerank`](Self::rerank)'s move, past every check its caller runs.
@@ -783,8 +827,9 @@ impl RetentionSet {
     /// set that rule would not have built is refused, and no retained suffix
     /// off an accepted basis may win every R6 comparison. A tie prefix is
     /// restored before the suffixes, so an extension of the accepted chain
-    /// re-reads its rank against it. The moment counter restarts past the
-    /// largest persisted moment.
+    /// re-reads its rank against it, and it must lie on a chain the
+    /// restored set holds. The moment counter restarts past the largest
+    /// persisted moment.
     ///
     /// # Errors
     ///
@@ -860,6 +905,22 @@ impl RetentionSet {
                         admission,
                     });
                 }
+            }
+        }
+        if let Some(prefix) = &set.tie_prefix {
+            let mut on_held = false;
+            for chain in std::iter::once(set.basis.chain())
+                .chain(set.suffixes.iter().map(RetainedSuffix::chain))
+            {
+                on_held |= matches!(
+                    pair_chains(prefix, chain).map_err(RetentionError::from)?,
+                    ChainPairing::Identical | ChainPairing::LeftPrefixOfRight
+                );
+            }
+            if !on_held {
+                return Err(RestoreError::TiePrefixOffHeldChains {
+                    head: prefix.head_digest(),
+                });
             }
         }
         let referenced = set.persisted().units.len();
@@ -949,6 +1010,17 @@ fn rank_against(
     })
 }
 
+/// Whether `left` beats `right` under R6 ("A lower rank number beats a
+/// higher one"): only two diverged chains compare.
+fn beats(left: &ValidatedChain, right: &ValidatedChain) -> Result<bool, UnrelatedChains> {
+    Ok(match pair_chains(left, right)? {
+        ChainPairing::Diverged(divergence) => divergence.ranks[0].beats(divergence.ranks[1]),
+        ChainPairing::Identical
+        | ChainPairing::LeftPrefixOfRight
+        | ChainPairing::RightPrefixOfLeft => false,
+    })
+}
+
 /// Every valid chain `units` hold, failing closed on any discard.
 fn rebuild(
     identifier: &Identifier,
@@ -1012,6 +1084,18 @@ fn union_bytes<'s>(slots: impl IntoIterator<Item = &'s Slot>) -> u64 {
         .fold(0, |sum: u64, len| sum.saturating_add(*len))
 }
 
+/// Whether `kept` and `candidate` together fit both bounds, each event
+/// counted once.
+fn fits<'s>(
+    kept: impl Iterator<Item = &'s Slot> + Clone,
+    candidate: &'s Slot,
+    bounds: Bounds,
+) -> bool {
+    let count = kept.clone().count().saturating_add(1);
+    let bytes = union_bytes(kept.chain(std::iter::once(candidate)));
+    u64::try_from(count).unwrap_or(u64::MAX) <= u64::from(bounds.suffixes) && bytes <= bounds.bytes
+}
+
 /// The indices of `held` to evict so `candidate` fits both bounds, in
 /// eviction order, or `None` where the candidate is refused. `replacing` is
 /// the index of the held suffix the candidate extends, which leaves only
@@ -1042,8 +1126,15 @@ fn union_bytes<'s>(slots: impl IntoIterator<Item = &'s Slot>) -> u64 {
 /// tally is the union of the kept suffixes' events and the candidate's, and
 /// an eviction frees only the events no kept suffix or the candidate also
 /// holds.
+///
+/// R9, tied heads: "A tied head of a contested identity is evicted only for
+/// a candidate that beats it under R6, and a candidate that would need to
+/// evict a tied head it does not beat is refused and counted in the residue
+/// n". `protected[index]` is true for each held suffix that rule keeps; an
+/// index past its end is unprotected.
 pub(super) fn plan_evictions(
     held: &[&Slot],
+    protected: &[bool],
     replacing: Option<usize>,
     candidate: &Slot,
     bounds: Bounds,
@@ -1053,25 +1144,21 @@ pub(super) fn plan_evictions(
         .collect();
     let mut evicted = Vec::new();
     loop {
-        let kept_slots = || {
-            held.iter()
-                .zip(&kept)
-                .filter(|(_, kept)| **kept)
-                .map(|(slot, _)| *slot)
-        };
-        let count = kept_slots().count().saturating_add(1);
-        let bytes = union_bytes(kept_slots().chain(std::iter::once(candidate)));
-        if u64::try_from(count).unwrap_or(u64::MAX) <= u64::from(bounds.suffixes)
-            && bytes <= bounds.bytes
-        {
+        let kept_slots = held
+            .iter()
+            .zip(&kept)
+            .filter(|(_, kept)| **kept)
+            .map(|(slot, _)| *slot);
+        if fits(kept_slots, candidate, bounds) {
             return Some(evicted);
         }
         let (victim, _) = held
             .iter()
             .enumerate()
             .zip(&kept)
-            .filter(|((_, slot), kept)| {
+            .filter(|((index, slot), kept)| {
                 **kept
+                    && !protected.get(*index).copied().unwrap_or(false)
                     && slot.rank != ForkRank::Rank1
                     && slot.rank.number() >= candidate.rank.number()
             })

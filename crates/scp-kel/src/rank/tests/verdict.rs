@@ -1214,3 +1214,375 @@ fn worked_example_5_witnesses_go_silent() -> TestResult {
     assert_eq!(retention(&result)?.basis().chain(), &served);
     Ok(())
 }
+
+/// R9's fetch bound across resolutions: a losing chain U that only a source
+/// stopped at the fetch bound served is never retained. U beats the
+/// accepted chain A and loses to both tied chains, so once the tied chains
+/// leave the set, a held U would win and count as read; U is adopted only
+/// after an exhausted source serves it.
+///
+/// Mutant (run, then restored): `contested` admits every ranked chain, so U
+/// is retained and the second read adopts it.
+#[test]
+fn losing_chain_from_a_stopped_source_is_never_retained() -> TestResult {
+    let mut keys = Keys::new()?;
+    let a = Branch::of(&mut keys, &[Kind::KeyState], 0)?;
+    let shared = Branch::of(&mut keys, &[Kind::Reveal], 1)?;
+    let mut b = shared.clone();
+    b.push(&mut keys, Kind::KeyState, 2)?;
+    let mut c = shared.clone();
+    c.push(&mut keys, Kind::KeyState, 3)?;
+    let u = Branch::of(&mut keys, &[Kind::Lost], 4)?;
+    let stopped = source(
+        "s",
+        &[&u],
+        SourceExhaustion::StoppedAtFetchBound,
+        operator(2),
+    );
+    let first = run(
+        Some(&accepted(&a)),
+        &[exhausted("a", &[&b, &c], 1), stopped],
+    )?;
+    assert_eq!(
+        first.verdict,
+        ResolutionVerdict::Contested {
+            tie: TieClass::Rank3Pending,
+            heads: sorted(vec![b.head(), c.head()]),
+            shared_prefix_head: shared.head(),
+            fork_position: 2,
+            residue: 0,
+        }
+    );
+    let set = retention(&first)?;
+    assert_eq!(suffix_heads(set), sorted(vec![b.head(), c.head()]));
+    assert_eq!(set.tie_prefix(), Some(&shared.chain));
+    assert_eq!(round_trip(set)?, *set);
+    // The chains that beat U leave the set; every other suffix stays.
+    let mut later = accepted(&a);
+    for suffix in set.suffixes() {
+        if suffix.head() != b.head() && suffix.head() != c.head() {
+            let _ = later.admit(suffix.chain().clone())?;
+        }
+    }
+    let again = run(Some(&later), &[exhausted("a", &[&a], 1)])?;
+    assert_eq!(again.verdict, ResolutionVerdict::Confirmed);
+    let served = run(Some(&later), &[exhausted("a", &[&u], 1)])?;
+    assert_eq!(
+        served.verdict,
+        ResolutionVerdict::Adopted {
+            head: u.head(),
+            baseline_decreased: false,
+        }
+    );
+    Ok(())
+}
+
+/// R9's eviction rank at the tie's fork: the accepted chain A rotates
+/// between the tie prefix P and its head, so a tied chain T extending A
+/// reads its rank against the commitment standing at P, which A's rotation
+/// reveals under a root signature (rank 1). Against the commitment standing
+/// at its own fork past A's head, where T reveals nothing, it would be rank
+/// 3.
+///
+/// Mutant (run, then restored): `place` ranks an extension of the accepted
+/// chain past the accepted head, so T is retained at rank 3.
+#[test]
+fn extension_of_a_rotated_accepted_chain_ranks_at_the_tie_fork() -> TestResult {
+    let mut keys = Keys::new()?;
+    let p = Branch::of(&mut keys, &[Kind::KeyState], 0)?;
+    let mut a = p.clone();
+    a.push(&mut keys, Kind::Reveal, 0)?;
+    let mut t = a.clone();
+    t.push(&mut keys, Kind::KeyState, 0)?;
+    let mut s = p.clone();
+    s.push(&mut keys, Kind::Reveal, 1)?;
+    let result = run(Some(&accepted(&a)), &[exhausted("a", &[&t, &s], 1)])?;
+    assert_eq!(
+        result.verdict,
+        ResolutionVerdict::Contested {
+            tie: TieClass::Rank1Terminal,
+            heads: sorted(vec![t.head(), s.head()]),
+            shared_prefix_head: p.head(),
+            fork_position: 2,
+            residue: 0,
+        }
+    );
+    let set = retention(&result)?;
+    assert_eq!(set.tie_prefix(), Some(&p.chain));
+    let tied = set
+        .suffixes()
+        .iter()
+        .find(|suffix| suffix.head() == t.head())
+        .ok_or("T is retained")?;
+    assert_eq!((tied.rank(), tied.fork_position()), (ForkRank::Rank1, 3));
+    assert_eq!(round_trip(set)?, *set);
+    Ok(())
+}
+
+/// A set over the accepted chain A after a `Rank3Pending` tie between A and
+/// C past the prefix P, filled to the count bound by seven `{Lost}` forks
+/// at Vector 41 that A beats (rank 2): C is the one rank-3 suffix.
+struct RankThreeTie {
+    keys: Keys,
+    p: Branch,
+    a: Branch,
+    c: Branch,
+    set: RetentionSet,
+}
+
+fn rank_three_tie() -> Result<RankThreeTie, Error> {
+    let mut keys = Keys::new()?;
+    let p = Branch::of(&mut keys, &[Kind::Reveal], 0)?;
+    let mut a = p.clone();
+    a.push(&mut keys, Kind::KeyState, 0)?;
+    let mut c = p.clone();
+    c.push(&mut keys, Kind::KeyState, 1)?;
+    let mut forks = Vec::new();
+    for owner in 2..=8 {
+        forks.push(Branch::of(&mut keys, &[Kind::Lost], owner)?);
+    }
+    let first = run(Some(&accepted(&a)), &[exhausted("a", &[&c], 1)])?;
+    let refs: Vec<&Branch> = forks.iter().collect();
+    let filled = run(Some(retention(&first)?), &[exhausted("a", &refs, 1)])?;
+    let set = retention(&filled)?.clone();
+    assert_eq!(set.suffixes().len(), 8);
+    assert_eq!(set.tie_prefix(), Some(&p.chain));
+    assert!(set.suffixes().iter().all(|suffix| {
+        let rank = if suffix.head() == c.head() {
+            ForkRank::Rank3
+        } else {
+            ForkRank::Rank2
+        };
+        suffix.rank() == rank
+    }));
+    Ok(RankThreeTie { keys, p, a, c, set })
+}
+
+/// R7 and R9's tied-head rule: a `Rank3Pending` tied head C survives a
+/// flood of rank-3 chains that tie with it, because none beats it under R6
+/// and the rank-2 forks filling the set are not evictable for them; each
+/// refused chain counts in the residue.
+///
+/// Mutant (run, then restored): `protected` protects no suffix, so the
+/// first flood chain evicts C, the one rank-3 suffix.
+#[test]
+fn tied_head_survives_a_rank_3_flood() -> TestResult {
+    let RankThreeTie {
+        mut keys,
+        p,
+        a,
+        c,
+        set,
+    } = rank_three_tie()?;
+    let mut flood = Vec::new();
+    for owner in 10..13 {
+        let mut chain = p.clone();
+        chain.push(&mut keys, Kind::KeyState, owner)?;
+        flood.push(chain);
+    }
+    let refs: Vec<&Branch> = flood.iter().collect();
+    let result = run(Some(&set), &[exhausted("a", &refs, 1)])?;
+    let mut heads = vec![a.head(), c.head()];
+    heads.extend(flood.iter().map(Branch::head));
+    assert_eq!(
+        result.verdict,
+        ResolutionVerdict::Contested {
+            tie: TieClass::Rank3Pending,
+            heads: sorted(heads),
+            shared_prefix_head: p.head(),
+            fork_position: 2,
+            residue: 3,
+        }
+    );
+    assert_eq!(result.residue, 3);
+    assert_eq!(retention(&result)?.suffixes(), set.suffixes());
+    Ok(())
+}
+
+/// R9's tied-head rule admits a candidate that beats the tied head: a
+/// `{Lost}` recovery D at the tie's fork ranks 2 against C's 3, so it
+/// evicts C, the suffix with the highest rank number, and no rank-2 fork.
+///
+/// Mutant (run, then restored): `protected` ignores whether the candidate
+/// beats the tied head, so D evicts the latest rank-2 fork instead.
+#[test]
+fn candidate_beating_a_tied_head_may_evict_it() -> TestResult {
+    let RankThreeTie {
+        mut keys,
+        p,
+        c,
+        mut set,
+        ..
+    } = rank_three_tie()?;
+    let mut d = p;
+    d.push(&mut keys, Kind::Lost, 9)?;
+    assert_eq!(
+        set.admit(d.chain)?,
+        crate::Admission::Retained {
+            rank: ForkRank::Rank2,
+            evicted: vec![c.head()],
+        }
+    );
+    Ok(())
+}
+
+/// R9's tied-head rule never blocks the controller: with the count bound
+/// full of eight tied rank-3 heads at a first contact, the controller's
+/// root-signed rollover beats every one of them, so it is admitted and
+/// evicts the latest; the same read is adopted.
+///
+/// Mutant (run, then restored): `protected` ignores whether the candidate
+/// beats the tied head, so the rollover is refused.
+#[test]
+fn controller_reveal_is_admitted_over_tied_rank_3_heads() -> TestResult {
+    let mut keys = Keys::new()?;
+    let mut heads = Vec::new();
+    for owner in 1..=8 {
+        heads.push(Branch::of(&mut keys, &[Kind::KeyState], owner)?);
+    }
+    let refs: Vec<&Branch> = heads.iter().collect();
+    let contest = run(None, &two_sources(&refs))?;
+    assert!(matches!(
+        contest.verdict,
+        ResolutionVerdict::Contested {
+            tie: TieClass::Rank3Pending,
+            residue: 0,
+            ..
+        }
+    ));
+    let set = retention(&contest)?;
+    assert_eq!(set.suffixes().len(), 8);
+    let latest = set
+        .suffixes()
+        .iter()
+        .max_by_key(|suffix| suffix.observed())
+        .ok_or("a retained suffix")?
+        .head();
+    let reveal = Branch::of(&mut keys, &[Kind::Reveal], 9)?;
+    assert_eq!(
+        set.clone().admit(reveal.chain.clone())?,
+        crate::Admission::Retained {
+            rank: ForkRank::Rank1,
+            evicted: vec![latest],
+        }
+    );
+    let adopted = run(Some(set), &two_sources(&[&reveal]))?;
+    assert_eq!(
+        adopted.verdict,
+        ResolutionVerdict::Adopted {
+            head: reveal.head(),
+            baseline_decreased: false,
+        }
+    );
+    Ok(())
+}
+
+/// R12's `Confirmed` drops the tie prefix a `Contested` verdict recorded.
+/// Eight `{Lost}` forks that the accepted chain A beats fill the count
+/// bound, so the rank-3 chain tying A is refused (residue 1) and A then
+/// beats every chain the set holds.
+///
+/// Mutant (run, then restored): `on_baseline` keeps the tie prefix, so the
+/// confirmed set still records it.
+#[test]
+fn confirmed_after_a_refused_tie_drops_the_tie_prefix() -> TestResult {
+    let mut keys = Keys::new()?;
+    let p = Branch::of(&mut keys, &[Kind::Reveal], 0)?;
+    let mut a = p.clone();
+    a.push(&mut keys, Kind::KeyState, 0)?;
+    let mut forks = Vec::new();
+    for owner in 1..=8 {
+        forks.push(Branch::of(&mut keys, &[Kind::Lost], owner)?);
+    }
+    let refs: Vec<&Branch> = forks.iter().collect();
+    let filled = run(Some(&accepted(&a)), &[exhausted("a", &refs, 1)])?;
+    assert_eq!(filled.verdict, ResolutionVerdict::Confirmed);
+    let mut s = p.clone();
+    s.push(&mut keys, Kind::KeyState, 9)?;
+    let contest = run(Some(retention(&filled)?), &[exhausted("a", &[&s], 1)])?;
+    assert!(matches!(
+        contest.verdict,
+        ResolutionVerdict::Contested { residue: 1, .. }
+    ));
+    let contested = retention(&contest)?;
+    assert_eq!(contested.tie_prefix(), Some(&p.chain));
+    let confirmed = run(Some(contested), &[exhausted("a", &[&a], 1)])?;
+    assert_eq!(confirmed.verdict, ResolutionVerdict::Confirmed);
+    let set = retention(&confirmed)?;
+    assert_eq!(set.tie_prefix(), None);
+    assert_eq!(set.suffixes(), contested.suffixes());
+    Ok(())
+}
+
+/// `restore` refuses a tie prefix on no chain the set holds: a `{Lost}`
+/// fork's head, persisted with its unit beside a contest whose tied chains
+/// fork at Vector 41, is neither a prefix of the accepted chain nor of a
+/// retained suffix.
+///
+/// Mutant (run, then restored): `restore` skips the check, so the set
+/// restores with the stray prefix.
+#[test]
+fn restore_refuses_a_tie_prefix_off_the_held_chains() -> TestResult {
+    let mut keys = Keys::new()?;
+    let a = Branch::of(&mut keys, &[Kind::KeyState], 0)?;
+    let t1 = Branch::of(&mut keys, &[Kind::Reveal], 1)?;
+    let t2 = Branch::of(&mut keys, &[Kind::Reveal], 2)?;
+    let stray = Branch::of(&mut keys, &[Kind::Lost], 3)?;
+    let result = run(Some(&accepted(&a)), &[exhausted("a", &[&t1, &t2], 1)])?;
+    let set = retention(&result)?;
+    assert_eq!(set.tie_prefix(), Some(&Branch::v41()?.chain));
+    let mut saved = set.persisted();
+    let unit = stray.base.units.last().ok_or("the fork's unit")?;
+    saved.units.push(std::sync::Arc::from(unit.as_slice()));
+    saved.basis.tie_prefix = Some(stray.head());
+    assert_eq!(
+        RetentionSet::restore(
+            &a.chain.identifier(),
+            &saved,
+            AdoptedBasis::Accepted { head: a.head() },
+        ),
+        Err(super::super::RestoreError::TiePrefixOffHeldChains { head: stray.head() })
+    );
+    Ok(())
+}
+
+/// R9's byte bound where the tie prefix P extends the accepted chain A: both
+/// tied suffixes start past A's head, so each holds P's event past A, and
+/// the byte bound counts that event once.
+///
+/// Mutant (run, then restored): the tally sums each suffix's events, so
+/// P's event counts twice.
+#[test]
+fn tied_suffixes_past_the_accepted_head_count_the_prefix_once() -> TestResult {
+    let mut keys = Keys::new()?;
+    let a = Branch::of(&mut keys, &[Kind::KeyState], 0)?;
+    let mut p = a.clone();
+    p.push(&mut keys, Kind::KeyState, 0)?;
+    let mut t1 = p.clone();
+    t1.push(&mut keys, Kind::Reveal, 1)?;
+    let mut t2 = p.clone();
+    t2.push(&mut keys, Kind::CoSigns, 2)?;
+    let result = run(Some(&accepted(&a)), &[exhausted("a", &[&t1, &t2], 1)])?;
+    assert!(matches!(
+        result.verdict,
+        ResolutionVerdict::Contested {
+            tie: TieClass::Rank1Terminal,
+            fork_position: 3,
+            ..
+        }
+    ));
+    let set = retention(&result)?;
+    assert_eq!(set.tie_prefix(), Some(&p.chain));
+    assert!(
+        set.suffixes()
+            .iter()
+            .all(|suffix| suffix.fork_position() == 2)
+    );
+    let len = |branch: &Branch, index: usize| branch.unit_lens.get(index).copied();
+    let expected = [len(&p, 2), len(&t1, 3), len(&t2, 3)]
+        .into_iter()
+        .sum::<Option<u64>>()
+        .ok_or("three unit lengths")?;
+    assert_eq!(set.retained_bytes(), expected);
+    Ok(())
+}
