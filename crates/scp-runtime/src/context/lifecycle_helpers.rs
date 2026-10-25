@@ -1428,10 +1428,16 @@ pub fn join_context_membership(
     // once (the `ConsequenceStateSplit` shape); the split drops before the
     // role / membership / access mutations below re-borrow the view.
     {
+        // The queued log units count as evidence (spec 17 §17.3); the split
+        // below holds the view mutably, so they are copied out first.
+        let queued = crate::context::actor::class_s::PendingLogUnits::restored(
+            view.class_s().pending_log_units.to_deque(),
+        );
         let mut split = view.split_class_c();
         crate::context::lifecycle_logic::post_join_bookkeeping(
             split.governance.participation_cache_mut(),
             split.receive_buffer,
+            &queued,
             context_id,
             member_did,
             deps.clock.now_secs(),
@@ -6510,8 +6516,7 @@ mod restore_reconcile_tests {
                     ed25519_dalek::SigningKey::from_bytes(&[0x5au8; 32]),
                 ),
             ),
-            None,  // no spending-nonce token (free send) — keeps best-effort persist
-            false, // is_broadcast
+            &[],
         )
         .await;
         let mut state = cell.into_inner();

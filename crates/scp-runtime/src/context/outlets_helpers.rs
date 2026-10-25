@@ -771,8 +771,10 @@ pub async fn reserve_outlet_economy(
         // fails the invocation, and the velocity tick and hard-rate token
         // taken above are returned (spec section 17.3, "Event log write
         // failures").
+        let (receive_buffer, queued) = view.consequence_read_inputs();
         let read = crate::context::governance_logic::event_log_entries_for_consequences(
-            view.receive_buffer_mut(),
+            receive_buffer,
+            queued,
             context_id,
             now_secs,
             event_log.as_ref(),
@@ -2317,13 +2319,15 @@ pub async fn authorize_and_capture_stream_billed(
 ///
 /// Returns the triggered consequences and the optional payment receipt.
 ///
-/// `downward_auth_sink` (ADR-049 §9, RED-CS3): a CALLER-OWNED
-/// `&mut Option<ClassSCommitToken>` that this function POPULATES with a
-/// fail-closed-persist obligation if consequence enforcement performed a
+/// `sink` (ADR-049 §9, RED-CS3; spec 17 §17.3 "Event log write failures"): a
+/// CALLER-OWNED [`ConsequenceSink`](crate::context::log_unit_helpers::ConsequenceSink)
+/// that this function fills with the fail-closed-persist obligation of a
 /// downward-authorization mutation (a `suspended_capabilities` GROW or an
-/// `AssignRole` `member_capabilities` replacement). The token is a caller-owned
-/// sink rather than part of the return value SO IT SURVIVES THE PAYMENT-CAPTURE
-/// ERROR PATH: the mutation is applied in memory BEFORE the fallible payment
+/// `AssignRole` `member_capabilities` replacement), the durable consequence
+/// leaves, and a failed log read. The outlet already ran, so a failed read
+/// skips the consequence evaluation and the caller's discharge sets the log
+/// fault. The sink is caller-owned rather than part of the return value SO IT
+/// SURVIVES THE PAYMENT-CAPTURE ERROR PATH: the mutation is applied in memory BEFORE the fallible payment
 /// capture, and on capture failure this function returns `Err` early — a
 /// returned token would be STRANDED/DROPPED by that `?` (tripping the token's Drop
 /// guard on a path that legitimately must still persist, or losing the obligation
@@ -2344,7 +2348,7 @@ pub async fn settle_outlet_economy_capture(
     context_id: &str,
     invoker_did: &DID,
     ticket: OutletEconomyTicket,
-    downward_auth_sink: &mut Option<crate::context::actor::class_s::ClassSCommitToken>,
+    sink: &mut crate::context::log_unit_helpers::ConsequenceSink,
 ) -> Result<
     (
         Vec<scp_protocol::trust::consequence::TriggeredConsequence>,
@@ -2352,33 +2356,39 @@ pub async fn settle_outlet_economy_capture(
     ),
     ContextError,
 > {
-    let event_log = &deps.event_log;
     let event_tx = deps.event_tx.clone();
     let clock = deps.clock.as_ref();
     let payment_adapter = deps.payment_adapter.clone();
 
     let now = clock.now_secs();
-    let (events_for_consequences, convergent_now) =
-        crate::context::governance_logic::event_log_entries_for_consequences_after_side_effect(
-            view.receive_buffer_mut(),
+    let read = {
+        let (receive_buffer, queued) = view.consequence_read_inputs();
+        crate::context::governance_logic::consequence_events_after_step(
+            receive_buffer,
+            queued,
             context_id,
             now,
-            event_log.as_ref(),
-        );
+            deps.event_log.as_ref(),
+            sink,
+        )
+    };
     let consequence_rules = view
         .governance_class_c_mut()
         .consequence_rules_mut()
         .clone();
 
-    let consequences = post_outlet_invocation_bookkeeping(
-        &events_for_consequences,
-        invoker_did,
-        context_id,
-        now,
-        convergent_now,
-        view.governance_class_c_mut().participation_cache_mut(),
-        &consequence_rules,
-    );
+    // An unreadable log skips the evaluation (the sink carries the fault).
+    let consequences = read.map_or_else(Vec::new, |(events_for_consequences, convergent_now)| {
+        post_outlet_invocation_bookkeeping(
+            &events_for_consequences,
+            invoker_did,
+            context_id,
+            now,
+            convergent_now,
+            view.governance_class_c_mut().participation_cache_mut(),
+            &consequence_rules,
+        )
+    });
 
     // Consequence path (ADR-049 §9 / RED-CS3). `consequence_split()` yields the
     // consequence-engine split — disjoint Class-C / structural borrows plus the
@@ -2391,10 +2401,10 @@ pub async fn settle_outlet_economy_capture(
     // coalesce-persists); only a downward-auth OUTCOME owes a fail-closed persist,
     // which the cell-holding caller performs when `downward_auth_applied` is set.
     let mut split = view.consequence_split();
-    // The GROW arms the caller-owned `downward_auth_sink` directly (GAP-A closed),
-    // so the mutation's fail-closed-persist obligation survives the payment-capture
-    // error path below (a returned token would be stranded/dropped by the early
-    // `return Err` — RED-CS3).
+    // The GROW arms the caller-owned `sink` directly (GAP-A closed), so the
+    // mutation's fail-closed-persist obligation and the durable leaves survive
+    // the payment-capture error path below (a returned token would be
+    // stranded/dropped by the early `return Err` — RED-CS3).
     let _ = crate::context::governance_logic::enforce_triggered_consequences(
         &mut split,
         &crate::context::governance_logic::EnforceConsequencesCtx {
@@ -2404,12 +2414,10 @@ pub async fn settle_outlet_economy_capture(
             triggered: &consequences,
             rules: &consequence_rules,
             clock,
-            event_log: event_log.as_ref(),
             event_tx: event_tx.as_ref(),
         },
-        downward_auth_sink,
-    )
-    .await;
+        sink,
+    );
 
     let payment_receipt = match (
         payment_adapter.as_ref(),
@@ -2788,32 +2796,30 @@ pub async fn settle_outlet_economy(
             // a path that must still persist or losing the obligation. The token
             // carrier (vs. a `bool`) makes a populated-but-undischarged obligation a
             // Drop-guard PANIC in debug/CI.
-            let mut downward_auth_obligation: Option<
-                crate::context::actor::class_s::ClassSCommitToken,
-            > = None;
+            let mut sink = crate::context::log_unit_helpers::ConsequenceSink::new();
             let capture_result = settle_outlet_economy_capture(
                 cell.class_c_view(),
                 deps,
                 context_id,
                 invoker_did,
                 ticket,
-                &mut downward_auth_obligation,
+                &mut sink,
             )
             .await;
             // Fail-closed persist (token `commit`) of an applied downward-auth
             // mutation (keep-direction), run on BOTH the Ok and Err arms: the
             // mutation is already in memory; commit it before acking so a
             // coalesce-window crash cannot silently re-grant the removed authority.
-            // `take()` discharges the Drop guard. The view above has been consumed,
+            // The same keep persist queues the consequence leaves as one pending
+            // log unit and sets the log fault for a failed read (spec 17 §17.3).
+            // The view above has been consumed,
             // so the `&mut cell` borrow is released here. ERROR PRECEDENCE: when the
             // capture itself failed, the commit still runs; if the commit ALSO
             // fails, the §9 durability failure (`PersistenceFailed`) is surfaced over
             // the original capture error (durability is the security obligation), and
             // the original capture cause is preserved in its message. When the
             // commit succeeds, the original capture error is surfaced unchanged.
-            if let Some(token) = downward_auth_obligation.take()
-                && let Err(persist_err) = token.commit(cell, deps, context_id).await
-            {
+            if let Err(persist_err) = sink.discharge(cell, deps, context_id).await {
                 return Err(match capture_result {
                     Ok(_) => persist_err,
                     Err(capture_err) => ContextError::PersistenceFailed(format!(
@@ -3570,6 +3576,81 @@ mod tests {
                 suspended.contains(&Capability::MessagesWrite),
                 "the suspended capability is retained in memory (keep-direction) even \
                  though the payment capture failed"
+            );
+        }
+    }
+
+    /// The outlet capture family of spec 17 §17.3 "Event log write failures".
+    mod outlet_capture {
+        use scp_did::DID;
+        use scp_protocol::context::params::Capability;
+
+        use crate::context::actor::class_s::ClassSCell;
+        use crate::context::actor::state::PerContextState;
+        use crate::context::log_unit_helpers::test_support::{
+            SUSPENSION_LEAVES, deps_with, fail_log_entry_writes, faulty_merkle_log, log_len,
+            queued_unit_types, seed_warning_leaf, suspend_messages_write_rule,
+        };
+
+        const OWNER: &str = "did:dht:z6MkOwnerOutletCapture";
+        const INVOKER: &str = "did:dht:z6MkInvokerOutletCapture";
+
+        /// The outlet already ran when the capture evaluates its consequences.
+        /// A log that rejects the leaf writes keeps the capture's step (the
+        /// suspension and the committed ticket) and queues the leaves as one
+        /// unit; the capture succeeds.
+        #[tokio::test]
+        async fn append_failure_after_side_effect_keeps_step_and_queues_leaf() {
+            let ctx_id_bytes = [0x7bu8; 32];
+            let ctx = hex::encode(ctx_id_bytes);
+            let invoker = DID(INVOKER.to_owned());
+            let (log, faulty) = faulty_merkle_log();
+            seed_warning_leaf(&log, &ctx_id_bytes, &invoker).await;
+            fail_log_entry_writes(&faulty, &ctx_id_bytes);
+            let deps = deps_with(OWNER, None, Box::new(log)).await;
+
+            let mut state = PerContextState::new_for_test_encrypted(
+                ctx_id_bytes,
+                1_700_000_000,
+                DID(OWNER.to_owned()),
+            );
+            state
+                .membership
+                .add_member(invoker.clone(), "member".to_owned(), Vec::new());
+            state
+                .governance
+                .consequence_rules
+                .push(suspend_messages_write_rule());
+            let mut cell = ClassSCell::new(state);
+
+            let request = super::super::OutletSettleRequest::Capture {
+                generation: cell.generation,
+                ticket: super::super::OutletEconomyTicket::new_for_test_no_escrow(invoker.clone()),
+            };
+            let settled =
+                super::super::settle_outlet_economy(&mut cell, &deps, &ctx, &invoker, request)
+                    .await;
+
+            assert!(
+                settled.is_ok(),
+                "the leaves are queued, so a log write failure does not fail the capture: \
+                 {settled:?}"
+            );
+            assert!(
+                cell.role_state
+                    .suspended_for(INVOKER)
+                    .is_some_and(|caps| caps.contains(&Capability::MessagesWrite)),
+                "the capture's suspension is kept"
+            );
+            assert_eq!(
+                queued_unit_types(&cell.class_s.pending_log_units),
+                vec![SUSPENSION_LEAVES.to_vec()],
+                "the consequence leaves stay queued as one unit"
+            );
+            assert_eq!(
+                log_len(&deps, &ctx_id_bytes),
+                1,
+                "only the seeded warning is logged"
             );
         }
     }

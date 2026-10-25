@@ -28087,6 +28087,157 @@ mod tests {
         }
     }
 
+    /// A queued-unit leaf whose payload carries `tag`.
+    #[cfg(feature = "testing")]
+    fn respawn_unit_leaf(tag: u8) -> crate::context::state::LeafSpec {
+        crate::context::state::LeafSpec {
+            event_type: scp_event_log::EventType::MemberJoined,
+            actor_did: String::new(),
+            payload: scp_event_log::EventPayload {
+                data: vec![0xC0, tag],
+            },
+            timestamp_secs: 1_700_000_000 + u64::from(tag),
+        }
+    }
+
+    /// The payload tags of a log's entries, in log order.
+    #[cfg(feature = "testing")]
+    fn respawn_log_tags(entries: Option<Vec<scp_event_log::Event>>) -> Vec<u8> {
+        entries
+            .expect("the log exists")
+            .iter()
+            .map(|event| event.payload.data[1])
+            .collect()
+    }
+
+    /// One case of [`respawn_drains_queued_unit_exactly_once`]: the actor's
+    /// drain fails with the unit's put landed in storage (`put_landed`) or
+    /// not, the actor crashes, and the watchdog respawns it from the stored
+    /// snapshot with the log healthy again.
+    #[cfg(feature = "testing")]
+    async fn respawn_drains_queued_unit(ctx_id_bytes: [u8; 32], put_landed: bool) {
+        use crate::context::log_unit_helpers::test_support::{
+            fail_log_entry_writes, faulty_merkle_log, merkle_log_over,
+        };
+
+        let ctx_key = hex::encode(ctx_id_bytes);
+        let persistence = MapPersistence::default();
+        let (log, faulty) = faulty_merkle_log();
+        let sup = supervisor_with_clock_persistence_and_event_log(
+            Arc::new(TestClock::new(1_700_000_000)),
+            Box::new(persistence.clone()),
+            Box::new(log),
+        );
+        let deps = test_actor_deps(&sup).await;
+        let event_log = Arc::clone(&deps.event_log);
+        event_log
+            .init_event_log(&ctx_id_bytes)
+            .await
+            .expect("init event log");
+
+        let state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            1_700_000_000,
+            DID("did:example:admin".to_owned()),
+        );
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .expect("transition to Active");
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
+        cell.commit_class_s_keep(&deps, &ctx_key, |mut v| {
+            v.enqueue_log_unit(vec![respawn_unit_leaf(1), respawn_unit_leaf(2)])
+        })
+        .await
+        .expect("the enqueue persists");
+
+        if put_landed {
+            // The entries and the head reach storage; the head put reports
+            // failure, so the drain fails after its put landed.
+            faulty.fail_after_commit_prefix(&format!(
+                "context/{}/merkle_event_log/head",
+                hex::encode(ctx_id_bytes)
+            ));
+        } else {
+            fail_log_entry_writes(&faulty, &ctx_id_bytes);
+        }
+        let handle = Box::pin(sup.spawn_actor_with_state(cell.into_inner(), deps, None))
+            .await
+            .expect("spawn registers");
+        // The mailbox is ordered: when this query answers, the drain at the
+        // start of the run loop and the drain before the query have both run
+        // and failed.
+        handle
+            .send(|reply| {
+                ContextCommand::Queries(QueriesCommand::MemberCount {
+                    context_id: ctx_key.clone(),
+                    reply,
+                })
+            })
+            .await
+            .expect("the actor answers");
+        let stored = persistence
+            .contexts
+            .get(&ctx_key)
+            .map(|snap| snap.pending_log_units.clone())
+            .expect("the context is stored");
+        assert_eq!(stored.len(), 1, "the failed unit stays queued in the store");
+        assert_eq!(
+            stored[0].base_seq,
+            Some(0),
+            "the unit's reservation is stored before its put"
+        );
+
+        faulty.clear_fail();
+        induce_panic(&handle, "log-unit-respawn").await;
+        let drained = wait_until(std::time::Duration::from_secs(5), || {
+            persistence
+                .contexts
+                .get(&ctx_key)
+                .is_some_and(|snap| snap.pending_log_units.is_empty())
+        })
+        .await;
+        assert!(
+            drained,
+            "the respawned actor drains the stored unit (put_landed {put_landed})"
+        );
+
+        assert_eq!(
+            respawn_log_tags(
+                event_log
+                    .event_log_entries(&ctx_id_bytes)
+                    .expect("the log reads")
+            ),
+            vec![1, 2],
+            "the unit is in the log exactly once (put_landed {put_landed})"
+        );
+        let reloaded = merkle_log_over(&faulty);
+        reloaded
+            .restore_event_log(&ctx_id_bytes)
+            .await
+            .expect("the stored log loads");
+        assert_eq!(
+            respawn_log_tags(reloaded.entries(&ctx_id_bytes)),
+            vec![1, 2],
+            "the stored log holds the unit exactly once (put_landed {put_landed})"
+        );
+        if let Some(live) = sup.lookup(&ctx_key) {
+            let _ = live.send_shutdown().await;
+        }
+    }
+
+    /// Spec 17 §17.3 "Event log write failures": a unit whose drain failed is
+    /// in the stored snapshot with its reservation, and the actor the watchdog
+    /// respawns from that snapshot writes it to the log exactly once, both
+    /// when the failed put never reached storage and when it landed but
+    /// reported failure.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn respawn_drains_queued_unit_exactly_once() {
+        respawn_drains_queued_unit([0xD1u8; 32], false).await;
+        respawn_drains_queued_unit([0xD2u8; 32], true).await;
+    }
+
     /// 3 panics within 60s poison the context: `is_context_poisoned` becomes
     /// true, `lookup` returns None (the dead handle is despawned), a
     /// subsequent dispatch surfaces `ContextPoisoned`, and no respawn
@@ -35072,71 +35223,195 @@ mod tests {
         }
     }
 
-    /// ADR-049 §9 Class S (BLACK-001) — the MESSAGE-SEND path's spending-nonce
-    /// persist GATING is fail-closed, structurally identical to the outlet-invoke
-    /// path. Asserted against the PRODUCTION `finalize_send`: with a persistence
-    /// backend that always fails, `finalize_send` with a `Some(ClassSCommitToken)`
-    /// (a paid send) returns an error (the paid send is NOT acknowledged while
-    /// its nonce-consume is unpersisted), whereas a `None` token
-    /// (a free / non-spending send) swallows the same failure and returns `Ok`
-    /// (the common path stays best-effort, un-regressed).
+    /// A transport that counts `send_message` calls and accepts every call.
+    struct CountingSendTransport {
+        sends: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::context::builder::ContextTransportProvider for CountingSendTransport {
+        fn is_connected(&self) -> bool {
+            true
+        }
+        async fn publish_context(
+            &self,
+            _: &[u8; 32],
+            _: &scp_protocol::context::params::ContextParams,
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+        async fn delete_published(
+            &self,
+            _: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+        async fn send_message(
+            &self,
+            _: &[u8; 32],
+            _: &[u8],
+            _: scp_protocol::envelope::outer::BlobTtl,
+        ) -> Result<(), ContextError> {
+            self.sends.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// The Ed25519 key a paid-send test derives from `did`.
+    fn paid_send_key(did: &DID) -> ed25519_dalek::SigningKey {
+        let mut seed = [0u8; 32];
+        for (i, b) in did.as_ref().as_bytes().iter().enumerate() {
+            seed[i % 32] ^= *b;
+        }
+        ed25519_dalek::SigningKey::from_bytes(&seed)
+    }
+
+    /// A signed spending UCAN bound to `did` (iss == aud), valid now, with a
+    /// fresh single-use nonce.
+    fn paid_send_ucan(did: &DID) -> scp_protocol::crypto::ucan::UcanToken {
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use scp_protocol::crypto::ucan::nonce::generate_nonce;
+        use scp_protocol::crypto::ucan::spending::{
+            Amount as SpendAmount, CurrencyCode as SpendCurrency, SpendingCapability,
+        };
+        use scp_protocol::crypto::ucan::{Attenuation, UcanHeader, UcanPayload, UcanToken};
+
+        let cap = SpendingCapability {
+            max_per_action: SpendAmount(u64::MAX),
+            max_total: SpendAmount(u64::MAX),
+            currency: SpendCurrency::from_code("USD").expect("USD is a valid code"),
+            time_window: std::time::Duration::from_hours(1),
+            allowed_adapters: vec![],
+        };
+        let mut fct = serde_json::Map::new();
+        fct.insert(
+            "spending_capability".to_owned(),
+            cap.to_fact_value().expect("capability serializes"),
+        );
+        fct.insert(
+            "scp_key_scope".to_owned(),
+            serde_json::Value::String("#agent".to_owned()),
+        );
+        let now = scp_clock::SystemClock.now_secs();
+        let header = UcanHeader::with_kid("#agent".to_owned());
+        let payload = UcanPayload {
+            iss: did.as_ref().to_owned(),
+            aud: did.as_ref().to_owned(),
+            exp: now + 3600,
+            nbf: Some(now.saturating_sub(60)),
+            nnc: generate_nonce(&scp_clock::SystemClock),
+            att: vec![Attenuation {
+                with: "scp:spending:*".to_owned(),
+                can: "spend".to_owned(),
+            }],
+            prf: vec![],
+            fct: Some(serde_json::Value::Object(fct)),
+            nb: None,
+        };
+        let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).expect("header"));
+        let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).expect("payload"));
+        let signing_input = format!("{header_b64}.{payload_b64}");
+        let signature = ed25519_dalek::Signer::sign(&paid_send_key(did), signing_input.as_bytes());
+        let encoded = format!(
+            "{signing_input}.{}",
+            URL_SAFE_NO_PAD.encode(signature.to_bytes())
+        );
+        UcanToken {
+            header,
+            payload,
+            signature: signature.to_bytes().to_vec(),
+            encoded,
+        }
+    }
+
+    /// ADR-049 §9 Class S (BLACK-001); spec 17 §17.3 "Event log write
+    /// failures": a paid send commits its burned spending nonce fail-closed
+    /// BEFORE the send. With a persistence backend that always fails, the paid
+    /// `send_message` is refused with `PersistenceFailed`, the transport is
+    /// never reached, the nonce stays consumed in memory (keep-direction), and
+    /// the economy charge is reversed. A crash in the coalesce window therefore
+    /// can never roll the consume back after the message left.
     ///
-    /// Before this fix, the send path persisted via `persist_state_best_effort`
-    /// regardless of whether a spending nonce was committed: a crash in the
-    /// ≤50ms coalesce window rolled the consume back, freshening the nonce after
-    /// the caller already saw the send succeed (replay / double-spend).
+    /// A free send's finalize, which owes no fail-closed persist, keeps the
+    /// best-effort persist and returns `Ok` under the same backend.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn send_path_spending_nonce_persist_is_fail_closed() {
-        let sup = supervisor_with_providers();
+        use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
+
+        let sup = supervisor_with_resolver(Arc::new(|did: &DID, _: scp_did::SigningKeyId| {
+            Some(paid_send_key(did).verifying_key())
+        }));
         let mut deps = test_actor_deps(&sup).await;
-        // Swap in a persistence double that always fails.
         deps.persistence = Arc::new(FailingPersistence);
+        let sends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        deps.transport = Arc::new(CountingSendTransport {
+            sends: Arc::clone(&sends),
+        });
 
         let ctx_id_bytes = [0xDAu8; 32];
         let ctx_key = hex::encode(ctx_id_bytes);
         let sender = DID("did:example:send-fail-closed".to_owned());
-        let state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
-            ctx_id_bytes,
-            1_700_000_000,
-            sender.clone(),
-        );
+        let mut state = broadcast_state_with_author(ctx_id_bytes, &sender);
+        state.governance.economic_policy = Some(EconomicPolicy {
+            locked: false,
+            cost_schedule: CostSchedule {
+                currency: CurrencyCode::from("USD"),
+                per_message: Some(Amount::new(5)),
+                per_outlet_call: None,
+                per_join: None,
+                per_period: None,
+                per_byte_stored: None,
+            },
+            payment_adapters: vec![],
+            pricing_formula: None,
+            payee: DID::from("did:key:send-payee"),
+        });
         state
-            .handle
-            .transition_to(&crate::context::ContextState::Active)
-            .unwrap();
+            .governance
+            .budget_tracker
+            .grant(&sender, Amount::new(1_000));
+        let handle = state.handle.clone();
         let signing_key =
             CommandSigner::local_ed25519(ed25519_dalek::SigningKey::from_bytes(&[0x11u8; 32]));
-
-        // `finalize_send` is actor-shape (ADR-049 §9): it takes the owning
-        // `ClassSCell` so it can drive the Class-S fail-closed persist (via the
-        // shared `&*cell`) and the Class-C field mutations (via `class_c_view`).
         let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
 
-        // A paid send (spending nonce committed) MUST surface the persist
-        // failure — fail-closed.
-        let paid = crate::context::messaging_helpers::finalize_send(
+        let paid = crate::context::messaging_helpers::send_message(
             &mut cell,
             &deps,
-            &ctx_key,
-            &ctx_id_bytes,
+            &handle,
             &sender,
-            0,
             b"paid",
-            crate::context::supervisor::MessageSigner::Active(&signing_key),
-            // Paid send: a deferred spending-nonce token whose fail-closed
-            // commit drives the persist (previously the `true` bool).
-            Some(crate::context::actor::class_s::ClassSCommitToken::new_for_test(&ctx_key)),
-            /* is_broadcast = */ false,
+            &signing_key,
+            scp_did::SigningKeyId::Active,
+            None,
+            Some(&paid_send_ucan(&sender)),
         )
         .await;
         assert!(
             matches!(paid, Err(ContextError::PersistenceFailed(_))),
-            "a paid send whose spending-nonce consume cannot be persisted MUST \
-             fail-closed, not return Ok: got {paid:?}"
+            "a paid send whose spending-nonce consume cannot be persisted MUST be \
+             refused fail-closed: got {paid:?}"
+        );
+        assert_eq!(
+            sends.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the nonce commits before the send, so a refused paid send never \
+             reaches the transport"
+        );
+        assert_eq!(
+            cell.governance.class_s.spending_nonce_tracker.len(),
+            1,
+            "keep-direction: the burned nonce stays consumed in memory"
+        );
+        assert_eq!(
+            cell.governance.budget_tracker.remaining(&sender),
+            Amount::new(1_000),
+            "the refused send's charge is reversed"
         );
 
-        // A free send (no spending nonce) swallows the same failure — the
-        // common path stays best-effort, un-regressed.
+        // A free send's finalize swallows the same persist failure — the common
+        // path stays best-effort, un-regressed.
         let free = crate::context::messaging_helpers::finalize_send(
             &mut cell,
             &deps,
@@ -35146,10 +35421,7 @@ mod tests {
             1,
             b"free",
             crate::context::supervisor::MessageSigner::Active(&signing_key),
-            // Free send: no token (previously the `false` bool) — keeps the
-            // best-effort persist, un-regressed.
-            None,
-            /* is_broadcast = */ false,
+            &[],
         )
         .await;
         assert!(
@@ -35201,8 +35473,7 @@ mod tests {
             0,
             b"agent",
             MessageSigner::Agent(&agent),
-            None,
-            /* is_broadcast = */ false,
+            &[],
         )
         .await
         .unwrap();
@@ -35221,8 +35492,7 @@ mod tests {
             1,
             b"active",
             MessageSigner::Active(&active),
-            None,
-            /* is_broadcast = */ false,
+            &[],
         )
         .await
         .unwrap();
@@ -35846,9 +36116,10 @@ mod tests {
 
     /// ADR-049 §9 Class S (BLACK-001) — the MESSAGE-SEND path's spending-nonce
     /// consume survives a crash before coalesce. With a working backend, a
-    /// consumed nonce persisted via the PRODUCTION `finalize_send(.. = true)` is
-    /// still present in the snapshot the respawn rehydrates from — so a replayed
-    /// spending UCAN would be rejected post-crash.
+    /// consumed nonce persisted through the burned-nonce token commit that
+    /// `send_message` runs before the send is still present in the snapshot the
+    /// respawn rehydrates from — so a replayed spending UCAN would be rejected
+    /// post-crash.
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn send_path_spending_nonce_consume_survives_crash_before_coalesce() {
@@ -35871,9 +36142,9 @@ mod tests {
             .unwrap();
 
         // Seed the post-`commit_spending_ucan_nonce` tracker state (the same
-        // shape `snapshot_entries` persists), then run the PRODUCTION send-path
-        // finalize with a `Some(ClassSCommitToken)` — the exact gating the
-        // metered send path uses. This drives the real fail-closed persist.
+        // shape `snapshot_entries` persists), then commit the burned-nonce token
+        // as `send_message` does before the send. This drives the real
+        // fail-closed persist.
         let consumed_nonce = "1700000000000-aabbccddeeff00112233445566778899".to_owned();
         let mut seed_entries = std::collections::HashMap::new();
         seed_entries.insert(consumed_nonce.clone(), (1_700_000_000_u64, u64::MAX));
@@ -35885,28 +36156,11 @@ mod tests {
                 seed_entries,
             );
         let deps = test_actor_deps(&sup).await;
-        let signing_key =
-            CommandSigner::local_ed25519(ed25519_dalek::SigningKey::from_bytes(&[0x22u8; 32]));
-        // `finalize_send` is actor-shape (ADR-049 §9): wrap the state in the
-        // owning `ClassSCell` for the call, then reclaim it via `into_inner` to
-        // hand off to `spawn_actor_with_state`.
-        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
-        crate::context::messaging_helpers::finalize_send(
-            &mut cell,
-            &deps,
-            &ctx_key,
-            &ctx_id_bytes,
-            &sender,
-            0,
-            b"paid-send",
-            crate::context::supervisor::MessageSigner::Active(&signing_key),
-            // Paid send: deferred token whose fail-closed commit persists the
-            // consumed nonce (previously the `true` bool).
-            Some(crate::context::actor::class_s::ClassSCommitToken::new_for_test(&ctx_key)),
-            /* is_broadcast = */ false,
-        )
-        .await
-        .expect("fail-closed finalize of the send-path consumed nonce must succeed");
+        let cell = crate::context::actor::class_s::ClassSCell::new(state);
+        crate::context::actor::class_s::ClassSCommitToken::new_for_test(&ctx_key)
+            .commit(&cell, &deps, &ctx_key)
+            .await
+            .expect("the fail-closed commit of the send-path consumed nonce must succeed");
         let state = cell.into_inner();
 
         let handle = sup
@@ -36307,17 +36561,14 @@ mod tests {
         );
     }
 
-    /// ADR-049 §9 (round-5 regression): `finalize_send` owns the sequence-number
-    /// rollback on its error exits, and rolls it back EXACTLY ONCE per error
-    /// path. The prior code double-rolled (the TTL early-return rolled back AND
-    /// the `send_message` caller rolled back again on the same `Err`), leaving
-    /// the counter one BELOW correct via `saturating_sub`. Here we reserve a
-    /// sequence, drive a paid `finalize_send` against an always-failing
-    /// persistence backend (the bottom persist-failure path), and assert the
-    /// counter is rolled back to EXACTLY the pre-reservation baseline — neither
-    /// short (no rollback) nor over (double rollback).
+    /// Spec 17 §17.3 "Event log write failures": `finalize_send` runs after the
+    /// message left, so nothing it does undoes the send. The reserved sequence
+    /// stays consumed whatever finalize meets, here a backend whose every
+    /// persist fails: finalize's best-effort persist swallows the failure and
+    /// the counter keeps the reservation (a rollback would reissue a sequence
+    /// peers already saw).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn finalize_send_rolls_back_sequence_exactly_once_on_persist_failure() {
+    async fn finalize_send_keeps_the_sent_sequence_when_its_persist_fails() {
         let sup = supervisor_with_providers();
         let mut deps = test_actor_deps(&sup).await;
         deps.persistence = Arc::new(FailingPersistence);
@@ -36330,8 +36581,6 @@ mod tests {
             1_700_000_000,
             sender.clone(),
         );
-        // The sender must be a member to reserve a sequence (membership starts
-        // empty in the test constructor).
         state
             .membership
             .add_member(sender.clone(), "member".to_owned(), Vec::new());
@@ -36341,29 +36590,11 @@ mod tests {
             .unwrap();
         let signing_key =
             CommandSigner::local_ed25519(ed25519_dalek::SigningKey::from_bytes(&[0x33u8; 32]));
-
-        // Baseline: the sender's sequence counter before any reservation.
-        let baseline = state
-            .membership
-            .get(sender.as_ref())
-            .expect("sender is a member")
-            .sequence_number;
-
-        // Reserve a sequence (Phase 1 of a real send), then drive the paid
-        // finalize whose fail-closed persist will fail.
         let reserved = state
             .membership
             .next_sequence_number(sender.as_ref())
             .expect("sender is a member");
-        assert_eq!(
-            reserved,
-            baseline + 1,
-            "reservation must advance the counter by exactly 1"
-        );
 
-        // `finalize_send` is actor-shape (ADR-049 §9): wrap the state in the
-        // owning `ClassSCell` for the call, then reclaim it via `into_inner` for
-        // the post-send sequence-rollback assertion below.
         let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
         let result = crate::context::messaging_helpers::finalize_send(
             &mut cell,
@@ -36372,29 +36603,25 @@ mod tests {
             &ctx_id_bytes,
             &sender,
             reserved,
-            b"paid",
+            b"sent",
             crate::context::supervisor::MessageSigner::Active(&signing_key),
-            // Paid send: deferred token whose fail-closed commit fails here,
-            // driving the sequence-rollback path (previously the `true` bool).
-            Some(crate::context::actor::class_s::ClassSCommitToken::new_for_test(&ctx_key)),
-            /* is_broadcast = */ false,
+            &[],
         )
         .await;
         let state = cell.into_inner();
         assert!(
-            matches!(result, Err(ContextError::PersistenceFailed(_))),
-            "a paid send whose fail-closed persist fails must surface the error: got {result:?}"
+            result.is_ok(),
+            "a finalize that owes no fail-closed persist keeps the best-effort \
+             persist: got {result:?}"
         );
-
         let after = state
             .membership
             .get(sender.as_ref())
             .expect("sender is a member")
             .sequence_number;
         assert_eq!(
-            after, baseline,
-            "finalize_send must roll the reserved sequence back to the baseline \
-             EXACTLY ONCE (not double-rolled below it)"
+            after, reserved,
+            "the sent message's sequence stays consumed after finalize"
         );
     }
 

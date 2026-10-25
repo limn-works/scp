@@ -239,6 +239,7 @@ pub fn post_join_bookkeeping(
         scp_protocol::trust::participation::ParticipationRecord,
     >,
     receive_buffer: &scp_protocol::context::membership::ReceiveBuffer,
+    queued: &crate::context::actor::class_s::PendingLogUnits,
     context_id: &str,
     member_did: &DID,
     now: u64,
@@ -253,6 +254,7 @@ pub fn post_join_bookkeeping(
     let (join_events, _convergent_now) =
         super::governance_logic::event_log_entries_for_consequences_after_side_effect(
             receive_buffer,
+            queued,
             context_id,
             now,
             event_log,
