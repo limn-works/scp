@@ -28,6 +28,16 @@ Documentation adds one further requirement, from the `AGENTS.md` rule about cont
 - Private implementation details (unless complex)
 - Code that follows established patterns
 
+## ADR status
+
+Every ADR opens with a `**Status:**` line whose first word is one of three statuses, by Alec's ruling relayed on 2026-10-25. The date, ruling, `**Amended:**` and `**Supersedes:**` clauses follow that word.
+
+- **Proposed:** the design is not yet settled.
+- **Accepted:** the design is settled. Accepted says nothing about whether the design is implemented.
+- **Superseded:** a later ADR replaces this one. The status line names that ADR and the date, for example `**Status:** Superseded by ADR-063 (2026-08-30)`.
+
+No other status word is permitted. The ruling renamed every earlier `Decided` and `RESOLVED` status to `Accepted`.
+
 ## Inline Documentation
 
 Use the language's standard doc-comment syntax. Focus on **why** and **how to use**, not **what** (the code shows what).

@@ -3,7 +3,7 @@
 **Date:** June 1–2, 2026
 **Scope:** Restore the broken `quic` cargo feature in `crates/scp-transport`, close the integration gaps the compile-break masked, and reconcile the affected PRD stories.
 **Status:** Executing — PR-1 in merge queue; PR-2/3a/3b/4 pending. Decisions D1–D6 locked.
-**Provenance:** ADR-037 (`.docs/adrs/phase-2.md`, Status: Decided, QUIC = Tier 1); spec §10.14 / §10.14.2 / §10.14.3 / §10.5.1 (`.docs/specs/10-infrastructure-and-self-hosting.md`); PRD stories SCP-254..257 (`.docs/prds/transport-expansion.json`).
+**Provenance:** ADR-037 (`.docs/adrs/phase-2.md`, Status: Accepted, QUIC = Tier 1); spec §10.14 / §10.14.2 / §10.14.3 / §10.5.1 (`.docs/specs/10-infrastructure-and-self-hosting.md`); PRD stories SCP-254..257 (`.docs/prds/transport-expansion.json`).
 
 ## Progress Log
 
@@ -69,7 +69,7 @@ NAT/STUN/ICE selection (`crates/scp-transport/src/nat/`, `webrtc/`, `scp-media`)
 | D5 | PR-3 split | Split into PR-3a (client selection) and PR-3b (relay listener wiring) | different crates, independent acceptance |
 | D6 | Story status | Set SCP-256 and SCP-257 → `in-progress` (were falsely `done`); add new stories for native-selection and listener-wiring | artifact-flow: corrections flow down from spec |
 
-**Removal was rejected:** the one-way artifact-flow invariant forbids deleting spec-mandated behavior without first amending a Decided Tier-1 ADR.
+**Removal was rejected:** the one-way artifact-flow invariant forbids deleting spec-mandated behavior without first amending an Accepted Tier-1 ADR.
 
 ## 4. PR Decomposition (strictly ordered)
 

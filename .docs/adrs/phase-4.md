@@ -25,7 +25,7 @@ Build order: ADR-017 + ADR-019 (parallel, both depend on Phase 1-3) --> ADR-018 
 
 ## ADR-017: Trust Engine (Four-Layer Evaluation)
 
-**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling); 2026-10-12 (challenge request and record converge on spec 07 §7.3.4); 2026-10-13 (challenger grading).
+**Status:** Accepted. **Amended:** 2026-09-10 (the P-256 curve ruling); 2026-10-12 (challenge request and record converge on spec 07 §7.3.4); 2026-10-13 (challenger grading).
 
 **Amendment (2026-09-10 — trust-layer signature verification is ECDSA on P-256).** ADR-063, inception-derived self-certifying identity over a key-event log, carries the curve ruling in §The curve and the root's custody, which names §9.5 of `09-security-model.md` as the home of its reason, and carries the provenance of the curve it superseded in §Alternatives considered. The three signed structures this ADR defines carry `P256Signature` fields, its signature-verification step verifies an ECDSA signature on P-256 against the issuer's resolved public key, and its dependency list names the `p256` crate. The four evaluation layers, their ordering, and the fail-closed direction are untouched.
 
@@ -246,7 +246,7 @@ pub struct TrustInput {
 
 ## ADR-018: Context TTL and Memory Scope Enforcement
 
-**Status:** Decided
+**Status:** Accepted
 
 ### Context
 
@@ -388,7 +388,7 @@ No SCP implementation verifies a destruction platform proof today, and the signi
 
 ## ADR-019: Data Provenance
 
-**Status:** Decided
+**Status:** Accepted
 
 ### Context
 
@@ -510,7 +510,7 @@ pub enum ProvenanceQuality {
 
 ## ADR-020: Outlet-Interface Discovery
 
-**Status:** Decided
+**Status:** Accepted
 
 **Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, moved an agent's self-asserted capability URIs into `SCPCapabilities` entries of its service record, which its designated operational key signs (`03-identity.md` §3.10.13), and a resolver reaches that record by the identity resolution of §3.10.4 rather than by an identifier-method lookup.
 
@@ -653,7 +653,7 @@ agent_deregister(did) -> { removed }
 
 ## ADR-021: UniFFI Bridge Definitions
 
-**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling); 2026-09-29 (SCP-307, `derive_pseudonym` returns the pseudonym point); 2026-10-10 (SCP-307, the host records each key's type and role, and the adapter caches them); 2026-10-18 (SCP-307, the custody interface has no Ed25519-to-X25519 agreement); 2026-10-20 (SCP-307, the custody key-type set is `ed25519`, `p256` and `hpke-p256`); 2026-10-20 (SCP-345, the key-type set adds `p256-key-event`); 2026-10-25 (SCP-345, the bridge refuses a key it holds no custody record for).
+**Status:** Accepted. **Amended:** 2026-09-10 (the P-256 curve ruling); 2026-09-29 (SCP-307, `derive_pseudonym` returns the pseudonym point); 2026-10-10 (SCP-307, the host records each key's type and role, and the adapter caches them); 2026-10-18 (SCP-307, the custody interface has no Ed25519-to-X25519 agreement); 2026-10-20 (SCP-307, the custody key-type set is `ed25519`, `p256` and `hpke-p256`); 2026-10-20 (SCP-345, the key-type set adds `p256-key-event`); 2026-10-25 (SCP-345, the bridge refuses a key it holds no custody record for).
 
 **Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, gave an identity a root set, one operational key, and a pre-rotation commitment, and resolution returns a key state (`09-security-model.md` §9.1 invariant 1, `03-identity.md` §3.10.4).
 
@@ -1524,7 +1524,7 @@ The re-implementation is NOT a fork — it is a second implementation of the sam
 
 > **Note:** ADR-055 is numbered sequentially but lives in the Phase 4 document by *subject*, not by number: it supersedes ADR-034 (WASM bridge re-implementation), which lives here. Its scope is the protocol's browser story and the FFI bridge set.
 
-**Status:** Decided. **Supersedes:** ADR-034. **Amended by:** **ADR-057** (in-browser clients over a shared `scp-mls` crate, keys on-device) — the WASM *bridge* removal below stands; the conclusion that a browser must be a *remote thin client with no in-browser protocol execution* is revised by ADR-057's finding that the protocol compiles to wasm32 as *shared* code (no re-implementation, no parity tax). ADR-057 is a *constrained* form of this ADR's rejected alternative #3 (in-browser engine): it runs shared code rather than a re-implementation, and it *participates without coordinating* (scope-fenced), which is what defeats the maintenance-tax objection that drove this ADR.
+**Status:** Accepted. **Supersedes:** ADR-034. **Amended by:** **ADR-057** (in-browser clients over a shared `scp-mls` crate, keys on-device) — the WASM *bridge* removal below stands; the conclusion that a browser must be a *remote thin client with no in-browser protocol execution* is revised by ADR-057's finding that the protocol compiles to wasm32 as *shared* code (no re-implementation, no parity tax). ADR-057 is a *constrained* form of this ADR's rejected alternative #3 (in-browser engine): it runs shared code rather than a re-implementation, and it *participates without coordinating* (scope-fenced), which is what defeats the maintenance-tax objection that drove this ADR.
 
 ### Context
 
@@ -1584,7 +1584,7 @@ This is the only structural shape that respects the "one implementation" invaria
 
 ## ADR-041: Agent Capability Registry (URI Namespace and Protocol Registry)
 
-**Status:** Decided
+**Status:** Accepted
 
 **Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, made a self-asserted capability URI an `SCPCapabilities` entry of the declaring identity's service record (`03-identity.md` §3.10.13), and the identity-scoped custom namespace resolves through the identity resolution of §3.10.4.
 
@@ -1702,7 +1702,7 @@ Protocol-level feature flags for node roles. Not challenge-testable — these de
 
 ## ADR-043: Scope Registration as Handle Convention
 
-**Status:** Decided
+**Status:** Accepted
 
 > **Amended by ADR-055 (2026-06-29):** the WASM bridge was removed; the scope-registration FFI surface below now spans the three remaining bridges (PyO3, NAPI, UniFFI), and the WASM-local constraint-reimplementation clause no longer applies. The browser is a remote thin client.
 
