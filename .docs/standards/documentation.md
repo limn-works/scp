@@ -30,7 +30,7 @@ Documentation adds one further requirement, from the `AGENTS.md` rule about cont
 
 ## ADR status
 
-Every ADR opens with a `**Status:**` line whose first word is one of three statuses, by Alec's ruling relayed on 2026-10-25. The date, ruling, `**Amended:**` and `**Supersedes:**` clauses follow that word.
+Every ADR opens with a `**Status:**` line whose first word is one of three statuses, by Alec's ruling of 2026-10-25. The date, ruling, `**Amended:**` and `**Supersedes:**` clauses follow that word.
 
 - **Proposed:** the design is not yet settled.
 - **Accepted:** the design is settled. Accepted says nothing about whether the design is implemented.
