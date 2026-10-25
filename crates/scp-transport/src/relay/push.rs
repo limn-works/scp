@@ -749,22 +749,35 @@ mod tests {
     /// A push service that stops reading its connection (it answers nothing
     /// and acknowledges no PING) costs a send one keep-alive interval plus
     /// one timeout, not the request deadline: the client closes the dead
-    /// connection and the send fails.
-    #[tokio::test]
+    /// connection and the send fails. The clock is paused and held until
+    /// the request reaches the peer, so no timer fires during the loopback
+    /// handshake; from there the keep-alive and the request deadline race on
+    /// the test clock alone.
+    #[tokio::test(start_paused = true)]
     async fn keep_alive_closes_a_connection_whose_peer_stopped_reading()
     -> Result<(), Box<dyn std::error::Error>> {
         use super::super::push_test_server::FrozenServer;
+        use super::super::push_webpush::tests::held;
         let server = FrozenServer::start().await?;
         let client = http2_client_with(KeepAlive {
             interval: Duration::from_millis(100),
             timeout: Duration::from_millis(200),
         })?;
-        let started = std::time::Instant::now();
-        let result = client
+        let started = tokio::time::Instant::now();
+        let send = client
             .post(format!("{}/3/device/ab", server.origin()))
             .body("{}")
-            .send()
-            .await;
+            .send();
+        let reached = async {
+            held("the request at the frozen peer", async {
+                while !server.took_a_request() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+        };
+        let (result, reached) = tokio::join!(send, reached);
+        reached?;
         let elapsed = started.elapsed();
         assert!(result.is_err(), "a frozen peer answered: {result:?}");
         assert!(

@@ -4467,6 +4467,7 @@ mod tests {
         use crate::relay::push_dispatch::PushService;
         use crate::relay::push_gate::PushServiceConfig;
         use crate::relay::push_store::{PushRegistrationKey, PushRegistrationStore};
+        use crate::relay::push_webpush::tests::held;
         use scp_protocol::discovery::push::PUSH_TIMESTAMP_SKEW_SECS;
 
         const REGISTRANT: &str = "did:dht:push-registrant";
@@ -4902,29 +4903,45 @@ mod tests {
             );
         }
 
-        /// Waits up to 5 s for a request whose path is `path`.
+        /// The first request to `path` that `server` records, waited for
+        /// with the paused clock held, so no sender deadline passes while
+        /// the wake crosses loopback; the hold's guard fails a wake that
+        /// never comes.
         async fn wait_for_request(
             server: &crate::relay::push_test_server::TestServer,
             path: &str,
         ) -> crate::relay::push_test_server::CapturedRequest {
-            for _ in 0..500 {
-                if let Some(found) = server.requests().await.into_iter().find(|r| r.path == path) {
-                    return found;
+            held(&format!("a request to {path}"), async {
+                loop {
+                    if let Some(found) =
+                        server.requests().await.into_iter().find(|r| r.path == path)
+                    {
+                        return found;
+                    }
+                    tokio::task::yield_now().await;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            panic!(
-                "no request to {path}; received {:?}",
-                server
-                    .requests()
-                    .await
-                    .iter()
-                    .map(|r| r.path.clone())
-                    .collect::<Vec<_>>()
-            );
+            })
+            .await
+            .unwrap()
         }
 
-        #[tokio::test]
+        /// Registers through [`register`] with the paused clock held.
+        async fn held_register(addr: SocketAddr, platform: PushPlatform, token: &[u8]) {
+            held("the registration's reply", register(addr, platform, token))
+                .await
+                .unwrap();
+        }
+
+        /// Publishes through [`publish_blob`] with the paused clock held.
+        async fn held_publish(addr: SocketAddr, blob: Vec<u8>) {
+            held("the publish's reply", publish_blob(addr, blob))
+                .await
+                .unwrap();
+        }
+
+        /// The clock is paused and held through every loopback step, so the
+        /// sender's connect and request deadlines cannot pass mid-send.
+        #[tokio::test(start_paused = true)]
         async fn a_stored_blob_wakes_the_registered_apns_device() {
             use crate::relay::push_test_server::{Reply, TestServer};
             let server = TestServer::start(vec![Reply::empty(200)]).await;
@@ -4936,13 +4953,13 @@ mod tests {
             .unwrap();
             let (addr, _dir) = start_waking(vec![PushSender::Apns(sender)]).await;
             let token = [0xA1, 0xB2, 0xC3, 0xD4, 0x05];
-            register(addr, PushPlatform::Apns, &token).await;
+            held_register(addr, PushPlatform::Apns, &token).await;
             assert!(
                 server.requests().await.is_empty(),
                 "a registration woke a device"
             );
 
-            publish_blob(addr, vec![9; 16]).await;
+            held_publish(addr, vec![9; 16]).await;
 
             let request = wait_for_request(&server, "/3/device/a1b2c3d405").await;
             assert_eq!(request.method, "POST");
@@ -4950,7 +4967,9 @@ mod tests {
             assert_eq!(server.requests().await.len(), 1, "one job per stored blob");
         }
 
-        #[tokio::test]
+        /// The clock is paused and held through every loopback step, so the
+        /// sender's connect and request deadlines cannot pass mid-send.
+        #[tokio::test(start_paused = true)]
         async fn a_stored_blob_wakes_the_registered_fcm_device() {
             use crate::relay::push_fcm::tests::{SEND_PATH, config, token_reply};
             use crate::relay::push_test_server::{Reply, TestServer};
@@ -4969,9 +4988,9 @@ mod tests {
             .unwrap();
             let (addr, _dir) = start_waking(vec![PushSender::Fcm(sender)]).await;
             let token = b"fcm-reg-token:e2e";
-            register(addr, PushPlatform::Fcm, token).await;
+            held_register(addr, PushPlatform::Fcm, token).await;
 
-            publish_blob(addr, vec![9; 16]).await;
+            held_publish(addr, vec![9; 16]).await;
 
             let request = wait_for_request(&server, SEND_PATH).await;
             assert_eq!(request.method, "POST");
@@ -4981,20 +5000,25 @@ mod tests {
 
         /// A sender that admits no send leaves every publish answered: the
         /// publisher never waits on push work (§10.7.1 step 5). Once the
-        /// sender is let through, the queued wake goes out.
+        /// sender is let through, the queued wake goes out. The clock is
+        /// paused and held, so a publish that waited on the sender would
+        /// fail at the hold's guard, whatever the runner's speed.
         #[cfg(feature = "testing")]
-        #[tokio::test]
+        #[tokio::test(start_paused = true)]
         async fn a_hung_sender_never_holds_a_publish() {
             use crate::relay::push::{PushSendOutcome, RecordingSender};
             let (sender, gate) =
                 RecordingSender::gated(PushPlatform::Apns, [PushSendOutcome::Delivered; 8]);
             let (addr, _dir) = start_waking(vec![PushSender::Recording(sender.clone())]).await;
-            register(addr, PushPlatform::Apns, b"hung").await;
+            held_register(addr, PushPlatform::Apns, b"hung").await;
 
             for i in 0..3u8 {
-                tokio::time::timeout(Duration::from_secs(5), publish_blob(addr, vec![i; 16]))
-                    .await
-                    .expect("a publish waited on a hung push sender");
+                held(
+                    "a publish answered while the push sender hangs",
+                    publish_blob(addr, vec![i; 16]),
+                )
+                .await
+                .unwrap();
             }
             assert!(
                 sender.sent().await.len() <= 1,
@@ -5002,12 +5026,13 @@ mod tests {
             );
 
             gate.admit(8);
-            for _ in 0..500 {
-                if !sender.sent().await.is_empty() {
-                    break;
+            held("the admitted wake", async {
+                while sender.sent().await.is_empty() {
+                    tokio::task::yield_now().await;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+            })
+            .await
+            .unwrap();
             assert_eq!(
                 sender.sent().await.first().map(Vec::as_slice),
                 Some(b"hung".as_slice())
@@ -5046,10 +5071,12 @@ mod tests {
             /// PUSH-022 AC8: a blob the relay stores wakes a `WebPush` device
             /// registered through the push gate: the endpoint receives one
             /// wake that opens, under the device's keys, to the wake body.
-            #[tokio::test]
+            /// The clock is paused and held through every loopback step, so
+            /// no deadline passes while the publish or the wake is in flight.
+            #[tokio::test(start_paused = true)]
             async fn websocket_publish_wakes_a_webpush_device() {
                 use crate::relay::push_test_server::{Reply, TlsTestServer};
-                use crate::relay::push_webpush::tests::{sender_for, subscribe};
+                use crate::relay::push_webpush::tests::{requests_reach, sender_for, subscribe};
 
                 let rid = [0x57; 32];
                 let server =
@@ -5058,15 +5085,21 @@ mod tests {
                     sender_for(&server, true, std::sync::Arc::new(scp_clock::SystemClock)).unwrap();
                 let (ua, subscription) =
                     subscribe(server.endpoint("push.example.net", "/wake")).unwrap();
-                let (push, _dir) = crate::relay::push_dispatch::wake_harness::webpush(
-                    sender,
-                    &subscription.encode(),
-                    &[rid],
+                let (push, _dir) = held(
+                    "the WebPush registration",
+                    crate::relay::push_dispatch::wake_harness::webpush(
+                        sender,
+                        &subscription.encode(),
+                        &[rid],
+                    ),
                 )
                 .await
+                .unwrap()
                 .unwrap();
                 let addr = start_push_server(push).await;
-                let reply = publish_to(addr, rid, vec![7; 16]).await;
+                let reply = held("the publish's reply", publish_to(addr, rid, vec![7; 16]))
+                    .await
+                    .unwrap();
                 assert!(
                     matches!(
                         reply,
@@ -5077,14 +5110,10 @@ mod tests {
                     ),
                     "{reply:?}"
                 );
-                let mut requests = Vec::new();
-                for _ in 0..1000 {
-                    requests = server.requests().await;
-                    if !requests.is_empty() {
-                        break;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                }
+                held("the WebPush wake", requests_reach(&server, 1))
+                    .await
+                    .unwrap();
+                let requests = server.requests().await;
                 let [request] = requests.as_slice() else {
                     panic!("expected one wake, saw {}", requests.len());
                 };
