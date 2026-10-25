@@ -33,10 +33,22 @@ zeroize = { workspace = true }
 p256 = { workspace = true }
 # The RNG trait `P256SecretKey::random` takes. p256 0.14 re-exports rand_core 0.10,
 # which `rand` 0.8 (`rand::rngs::OsRng`, the workspace RNG) does not implement, so
-# the key draw names the 0.6 trait directly. No `getrandom` feature: the caller
-# supplies the source.
-rand_core = { version = "0.6", default-features = false }
+# the key draw names the 0.6 trait directly. The `getrandom` feature gives
+# `rand_core::OsRng`, from which `webpush::seal` draws its ephemeral key and salt
+# itself, so no caller supplies the source. rand 0.8 already enables the feature
+# elsewhere in the graph, so it adds no crate.
+rand_core = { version = "0.6", default-features = false, features = ["getrandom"] }
 thiserror = { workspace = true }
+# WebPush message encryption (RFC 8291, `webpush`): AES-128-GCM over one RFC 8188
+# record. The workspace already pins aes-gcm 0.10 and aes 0.8 for scp-protocol, so
+# neither adds a crate to the graph. `aes/zeroize` wipes the AES round keys when the
+# cipher drops. Nothing wipes the GHASH key: aes-gcm 0.10's `zeroize` feature wipes
+# only the temporary copy it makes while building the cipher, and it enables no
+# `zeroize` feature on `ghash` or `polyval`, so the key held in the `polyval` state
+# stays in memory after the cipher drops. The cipher lives here because the record
+# key derives from a P-256 ECDH that deny.toml confines to this crate.
+aes-gcm = { workspace = true, features = ["zeroize"] }
+aes = { workspace = true, features = ["zeroize"] }
 
 # getrandom 0.2 fails to compile on wasm32-unknown-unknown without a backend.
 # In a wasm32 build it arrives through rand_core 0.6's `getrandom` feature, which
@@ -51,6 +63,7 @@ rand = { workspace = true }
 hex = { workspace = true }
 proptest = "1"
 serde_json = { workspace = true }
+base64 = { workspace = true }
 
 [lints]
 workspace = true

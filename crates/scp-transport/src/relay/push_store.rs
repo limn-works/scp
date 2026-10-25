@@ -9,8 +9,9 @@
 //! - by routing ID, so a message arriving on a routing ID finds every token to
 //!   wake.
 //!
-//! It also keeps, per token, a count of consecutive invalid-token responses
-//! from the push service, and removes every registration holding a token
+//! It also keeps, per token, a count of consecutive delivery failures (an
+//! invalid-token response, or for `WebPush` an unreachable push service; the
+//! dispatcher decides which outcomes count), and removes every registration holding a token
 //! whose count reaches [`INVALID_TOKEN_REMOVAL_THRESHOLD`] (§10.7.1
 //! `PushDeregistration`: "3 consecutive delivery failures for the same
 //! token"). The count is keyed by (platform, token), not by registration key,
@@ -73,7 +74,7 @@ pub const MAX_REGISTRATIONS_PER_REGISTRANT: usize = 16;
 /// A relay routing ID (32 bytes).
 pub type RoutingId = [u8; 32];
 
-/// The consecutive invalid-token responses for one token after which the
+/// The consecutive delivery failures for one token after which the
 /// relay removes every registration holding it (§10.7.1 `PushDeregistration`).
 pub const INVALID_TOKEN_REMOVAL_THRESHOLD: u32 = 3;
 

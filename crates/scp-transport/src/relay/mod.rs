@@ -25,14 +25,19 @@
 //! - [`push`] -- the relay push sender seam ([`push::PushSender`],
 //!   [`push::PushSendOutcome`]) that sends the §10.7.1 step 5 wake signal,
 //!   with the APNs sender in [`push_apns`] (PUSH-010) and the FCM HTTP v1
-//!   sender in [`push_fcm`] (PUSH-011).
+//!   sender in [`push_fcm`] (PUSH-011), and the `WebPush` sender in
+//!   [`push_webpush`] (PUSH-022).
+//! - [`push_endpoint`] -- the ADR-004 `WebPush` endpoint refusal rule
+//!   (PUSH-022): the endpoint URL rules, the special-purpose address rule,
+//!   and the resolver that applies it to every address a host resolves to.
 //! - `push_store` -- the relay's push registration store (spec section
 //!   10.7.1 step 4), indexed by registration key, by routing ID and by
 //!   token. Behind the `push-store` feature.
 //! - [`push_dispatch`] -- the relay's push queue and drain task (spec
 //!   section 10.7.1 step 5 and `PushDeregistration`, PUSH-008): one job per
 //!   registered token after each stored blob, and removal after three
-//!   consecutive invalid-token responses.
+//!   consecutive delivery failures (an invalid token, or an unreachable
+//!   `WebPush` push service).
 //! - [`push_gate`] -- the relay's interception of every PUBLISH to its
 //!   reserved push routing ID (spec section 10.7.1, PUSH-007): the
 //!   [`push_gate::PushRole`] selection and the verify-then-store gate.
@@ -51,12 +56,14 @@ pub(crate) mod log_capture;
 pub mod push;
 pub mod push_apns;
 pub mod push_dispatch;
+pub mod push_endpoint;
 pub mod push_fcm;
 pub mod push_gate;
 #[cfg(feature = "push-store")]
 pub mod push_store;
 #[cfg(test)]
 pub(crate) mod push_test_server;
+pub mod push_webpush;
 pub mod rate_limit;
 pub mod stun_service;
 pub mod subscription;
