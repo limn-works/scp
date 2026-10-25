@@ -137,15 +137,15 @@ Additional `RelayConfig` fields with fixed defaults (not configurable via env va
 | `bridge_secret` | `None` | Shared secret for internal bridge auth |
 | `supports_bridge` | `false` | Whether BRIDGE operations are accepted |
 
-### Push configuration (`scp-relay` and `scp-node --relay-only`)
+### Push configuration (`scp-relay`, `scp-node --relay-only`, and an `scp-node` full node)
 
-A relay wakes a registered mobile device through APNs or FCM when a message arrives for it (spec §10.7.1). The operator names the platforms the relay serves in `SCP_RELAY_PUSH_PLATFORMS`, which has no default (persistence spec §17.17.1, SCP-CAPSEL-8000): a relay that reads it unset, empty or only whitespace prints `SCP_RELAY_PUSH_PLATFORMS is unset or empty, and it has no default (SCP-CAPSEL-8000 ...)` and exits 1 before it opens any store. A full node does not read these variables: its embedded relay offers no push.
+A relay wakes a registered mobile device through APNs or FCM when a message arrives for it (spec §10.7.1). The operator names the platforms the relay serves in `SCP_RELAY_PUSH_PLATFORMS`, which has no default (persistence spec §17.17.1, SCP-CAPSEL-8000): a relay that reads it unset, empty or only whitespace prints `SCP_RELAY_PUSH_PLATFORMS is unset or empty, and it has no default (SCP-CAPSEL-8000 ...)` and exits 1 before it opens any store. A persistent `scp-node` full node reads the same variables, except the two store variables, as the full-node paragraph below states. `scp-node --self-host` and `--ephemeral` read none of them, and their embedded relays offer no push.
 
 | Environment Variable | Required when | Values |
 |---------------------|---------------|--------|
 | `SCP_RELAY_PUSH_PLATFORMS` | always | `none`, `apns`, `fcm`, or `apns,fcm` (any order and case) |
-| `SCP_RELAY_PUSH_STORE` | a platform is listed | `sqlite` |
-| `SCP_RELAY_PUSH_STORE_PATH` | the store is `sqlite` | Absolute path of the push registration database |
+| `SCP_RELAY_PUSH_STORE` | a platform is listed (`scp-relay` and `--relay-only` only) | `sqlite` |
+| `SCP_RELAY_PUSH_STORE_PATH` | the store is `sqlite` (`scp-relay` and `--relay-only` only) | Absolute path of the push registration database |
 | `SCP_RELAY_APNS_KEY_PATH` | `apns` is listed | Absolute path of the APNs authentication key (`.p8`) |
 | `SCP_RELAY_APNS_KEY_ID` | `apns` is listed | The key's ID |
 | `SCP_RELAY_APNS_TEAM_ID` | `apns` is listed | The Apple developer team ID |
@@ -161,6 +161,8 @@ Credentials load only from files, never from an environment value. Each credenti
 One relay serves one Apple team, topic and APNs environment, and one Firebase project.
 
 With a platform listed, the relay opens the SQLite push store at `SCP_RELAY_PUSH_STORE_PATH` before it opens its blob store and serves its reserved push routing ID through the push gate. A store that cannot open exits 1 with `SCP_RELAY_PUSH_STORE=sqlite cannot open the push store at SCP_RELAY_PUSH_STORE_PATH='<path>' ... (SCP-CAPSEL-8001)`, and nothing falls back to another store. The relay verifies each registration's signature against the registrant's key-event log; until that verifier's key-state resolution is built, it refuses every registration with `5003` `PUSH_VERIFIER_UNAVAILABLE` and stores none.
+
+A persistent full node loads the platforms and credentials before it creates its storage directory, so an unset `SCP_RELAY_PUSH_PLATFORMS` or a bad credential exits 1 the same way and leaves no directory behind. Push registrations are relay data, so with a platform listed the node keeps its push store at `push.sqlite` in its storage directory (`SCP_STORAGE_PATH` or `--storage-path`), beside its other stores, and ignores `SCP_RELAY_PUSH_STORE` and `SCP_RELAY_PUSH_STORE_PATH`. The push store applies no at-rest key of its own, as the relay's SQLite blob store applies none, but it holds device tokens and registrant DIDs in plaintext where the blob store holds only ciphertext; an operator who wants them encrypted at rest uses filesystem encryption.
 
 ### Node-specific configuration
 
