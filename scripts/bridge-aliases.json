@@ -2826,6 +2826,45 @@
       "napi": [
         "p256_software_pseudonym_point"
       ]
+    },
+    {
+      "canonical": "push_register",
+      "category": "push",
+      "pyo3": [
+        "push_register"
+      ],
+      "uniffi": [
+        "push_enable"
+      ],
+      "napi": [
+        "push_register"
+      ]
+    },
+    {
+      "canonical": "push_deregister",
+      "category": "push",
+      "pyo3": [
+        "push_deregister"
+      ],
+      "uniffi": [
+        "push_disable"
+      ],
+      "napi": [
+        "push_deregister"
+      ]
+    },
+    {
+      "canonical": "push_handle_wake",
+      "category": "push",
+      "pyo3": [
+        "push_handle_wake"
+      ],
+      "uniffi": [
+        "push_handle_wake"
+      ],
+      "napi": [
+        "push_handle_wake"
+      ]
     }
   ],
   "exemptions": {
