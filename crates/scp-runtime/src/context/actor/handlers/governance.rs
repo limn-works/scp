@@ -811,12 +811,21 @@ async fn handle_evaluate_periodic_consequences_actor(
     let member_dids: Vec<scp_did::DID> = cell.membership.members().map(|m| m.did.clone()).collect();
     // Periodic sweep: one convergent window anchor shared across all members
     // so every honest member's durable consequence leaf converges (§9.9.3).
-    let (events, convergent_now) = event_log_entries_for_consequences(
+    // Nothing is enforced yet, so an unreadable log fails the sweep for this
+    // context (spec section 17.3, "Event log write failures").
+    let (events, convergent_now) = match event_log_entries_for_consequences(
         &cell.receive_buffer,
         &context_id,
         now,
         deps.event_log.as_ref(),
-    );
+    ) {
+        Ok(read) => read,
+        Err(e) => {
+            let sketch = outcome_error_sketch(&e);
+            let _ = reply.send(Err(e));
+            return Outcome::err(sketch);
+        }
+    };
 
     let mut results: Vec<(scp_did::DID, Vec<TriggeredConsequence>)> = Vec::new();
     for member_did in member_dids {
@@ -1451,6 +1460,36 @@ mod consequence_fail_closed_tests {
             window: Duration::from_hours(1),
         });
         state
+    }
+
+    /// A sweep whose event log cannot be read fails with the read error and
+    /// enforces nothing: a log read as empty would evaluate the rules over the
+    /// receive buffer alone and suspend SUBJECT on evidence the other members
+    /// do not share (spec section 17.3, "Event log write failures"). The log
+    /// here is released and not loaded again.
+    #[tokio::test]
+    async fn periodic_sweep_over_an_unreadable_log_enforces_nothing() {
+        let deps = build_fail_closed_deps().await;
+        deps.event_log
+            .init_event_log(&[CTX_BYTE; 32])
+            .await
+            .expect("init log");
+        deps.event_log.release_event_log(&[CTX_BYTE; 32]);
+        let mut cell = ClassSCell::new(seed_state());
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ =
+            super::handle_evaluate_periodic_consequences_actor(&mut cell, &deps, reply_tx).await;
+
+        let reply = reply_rx.await.expect("handler replies");
+        assert!(
+            matches!(reply, Err(ContextError::ContextNotRegistered(_))),
+            "the sweep fails with the read error; got {reply:?}"
+        );
+        assert!(
+            cell.role_state.suspended_for(SUBJECT).is_none(),
+            "no consequence is enforced over an unreadable log"
+        );
     }
 
     /// The consequence-engine auto-suspension persists FAIL-CLOSED: with a

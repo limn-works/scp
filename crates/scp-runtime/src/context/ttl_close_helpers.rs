@@ -444,9 +444,9 @@ pub async fn propose_ttl_extension(
 ///
 /// # Errors
 ///
-/// Returns [`ContextError::EventLogFailed`] when the log cannot be read, the
-/// leaf cannot be encoded, or the append fails. The deadline and the consent
-/// tally are then unchanged.
+/// Returns the log's read error when the log cannot be read or is not loaded,
+/// and [`ContextError::EventLogFailed`] when the leaf cannot be encoded or the
+/// append fails. The deadline and the consent tally are then unchanged.
 pub async fn reset_ttl_timer(
     cell: &mut ClassSCell,
     deps: &ActorDeps,
@@ -471,7 +471,7 @@ pub async fn reset_ttl_timer(
     // convergent leaf. A context with no derivable convergent deadline
     // (promoted / no-TTL / empty log) has no TTL to extend ⇒ no-op, no leaf (H2:
     // never arm a past `0 + new_duration ≈ 1970` deadline reachable via the FFI
-    // `context_reset_ttl_timer` op; the fire-and-forget op silently no-ops).
+    // `context_reset_ttl_timer` op, which returns `Ok` with nothing extended).
     let context_id_bytes = context_id_to_bytes(context_id);
     // Convergent actor for a member-consented activation: the creator DID is
     // signed into the context and identical on every member.
@@ -566,13 +566,16 @@ impl ExtensionLeaf {
 ///   timer moves first and the leaf is best-effort. On an encode or append
 ///   failure the deadline still moved in memory and a later restore re-derives
 ///   the SHORTER un-extended base (the context expires no later than its
-///   convergent TTL), so the failure is logged and `Ok` returned.
+///   convergent TTL), so the failure is logged and `Ok` returned. A log that
+///   cannot be read is logged too, and the extension raises the base derived
+///   from an empty log: the governance decision already committed, so failing
+///   it cannot undo it. Pending log units replace this fallback.
 ///
 /// # Errors
 ///
-/// Returns [`ContextError::EventLogFailed`] when the log cannot be read, in
-/// either mode: an unreadable log is never read as an empty one. In
-/// [`AppendMode::FailClosed`] also when the leaf cannot be encoded or
+/// In [`AppendMode::FailClosed`] only: the log's read error when the log
+/// cannot be read (an unreadable log is never read as an empty one), and
+/// [`ContextError::EventLogFailed`] when the leaf cannot be encoded or
 /// appended.
 pub async fn extend_ttl_deadline_and_record(
     cell: &mut ClassSCell,
@@ -588,9 +591,19 @@ pub async fn extend_ttl_deadline_and_record(
     // scalar. No derivable deadline ⇒ nothing to extend (no-op, no leaf).
     let params_ttl = cell.handle.params().ttl.map(|t| t.as_secs());
     let creation_timestamp_secs = cell.creation_timestamp_secs;
-    let entries = event_log
-        .event_log_entries(context_id_bytes)?
-        .unwrap_or_default();
+    let entries = match (event_log.event_log_entries(context_id_bytes), mode) {
+        (Ok(entries), _) => entries.unwrap_or_default(),
+        (Err(e), AppendMode::FailClosed) => return Err(e),
+        (Err(e), AppendMode::AfterSideEffect) => {
+            tracing::warn!(
+                error = %e,
+                "extend_ttl_deadline_and_record: the event log cannot be read after the \
+                 governance decision committed; the extension raises the base derived \
+                 from an empty log"
+            );
+            Vec::new()
+        }
+    };
     let Some(current) = convergent_ttl_deadline(&entries, creation_timestamp_secs, params_ttl)
     else {
         tracing::warn!(
@@ -1224,6 +1237,86 @@ mod tests {
 
     const CREATION: u64 = 1_700_000_000;
     const TTL: u64 = 3_600;
+
+    /// A cell for a finite-TTL context created at `CREATION`.
+    fn ttl_cell(ctx: [u8; 32]) -> crate::context::actor::class_s::ClassSCell {
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx,
+            CREATION,
+            scp_did::DID::from("did:example:extension-admin"),
+        );
+        state.handle = crate::context::ContextHandle::new(
+            hex::encode(ctx),
+            scp_protocol::context::params::ContextParams {
+                ttl: Some(std::time::Duration::from_secs(TTL)),
+                memory_scope: scp_protocol::context::params::MemoryScope::Full,
+                ..Default::default()
+            },
+        );
+        crate::context::actor::class_s::ClassSCell::new(state)
+    }
+
+    /// The committed governance extension still extends when the log cannot
+    /// be read, raising the base derived from an empty log, and returns `Ok`:
+    /// the decision already committed. The bilateral reset, which has taken
+    /// no step yet, fails with the read error and leaves the timer unchanged
+    /// (spec section 17.3, "Event log write failures").
+    #[tokio::test]
+    async fn an_unreadable_log_fails_only_the_extension_before_its_step() {
+        use crate::context::builder::ContextEventLogProvider;
+        const ADDITIONAL: u64 = 600;
+        let ctx = [0x7Au8; 32];
+        let log = crate::context::providers::event_log::MerkleEventLogProvider::new();
+        log.init_event_log(&ctx).await.expect("init log");
+        log.release_event_log(&ctx);
+
+        let mut governance = ttl_cell(ctx);
+        super::extend_ttl_deadline_and_record(
+            &mut governance,
+            &log,
+            &ctx,
+            "did:example:extension-admin",
+            ADDITIONAL,
+            super::ExtensionLeaf::Governance {
+                proposal_id: [1u8; 32],
+                committer_timestamp_secs: CREATION + 1,
+                consenting_members: vec!["did:example:extension-admin".to_owned()],
+            },
+        )
+        .await
+        .expect("a committed extension returns Ok over an unreadable log");
+        assert_eq!(
+            governance.ttl.timer.deadline_unix_secs,
+            Some(CREATION + TTL + ADDITIONAL),
+            "the committed extension moves the timer"
+        );
+
+        let mut reset = ttl_cell(ctx);
+        let before = reset.ttl.timer.deadline_unix_secs;
+        let err = super::extend_ttl_deadline_and_record(
+            &mut reset,
+            &log,
+            &ctx,
+            "did:example:extension-admin",
+            ADDITIONAL,
+            super::ExtensionLeaf::Reset {
+                consenting_members: vec!["did:example:extension-admin".to_owned()],
+            },
+        )
+        .await
+        .expect_err("a reset over an unreadable log fails");
+        assert!(
+            matches!(
+                err,
+                scp_protocol::context::ContextError::ContextNotRegistered(_)
+            ),
+            "the read error reaches the caller: {err:?}"
+        );
+        assert_eq!(
+            reset.ttl.timer.deadline_unix_secs, before,
+            "the timer is unchanged"
+        );
+    }
 
     /// No finite TTL (`params.ttl == None`) and no recorded extension ⇒ no
     /// deadline. The `None` is returned before any log read.

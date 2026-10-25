@@ -767,13 +767,26 @@ pub async fn reserve_outlet_economy(
         // `economy_pre_check_borrows()` below, so no separate clones are needed.
         economic_policy = gov.economic_policy_mut().clone();
 
-        let (events_snapshot, convergent_now) =
-            crate::context::governance_logic::event_log_entries_for_consequences(
-                view.receive_buffer_mut(),
-                context_id,
-                now_secs,
-                event_log.as_ref(),
-            );
+        // Before the outlet runs or any budget is debited: an unreadable log
+        // fails the invocation, and the velocity tick and hard-rate token
+        // taken above are returned (spec section 17.3, "Event log write
+        // failures").
+        let read = crate::context::governance_logic::event_log_entries_for_consequences(
+            view.receive_buffer_mut(),
+            context_id,
+            now_secs,
+            event_log.as_ref(),
+        );
+        let (events_snapshot, convergent_now) = match read {
+            Ok(read) => read,
+            Err(e) => {
+                let gov = view.governance_class_c_mut();
+                gov.velocity_tracker_mut()
+                    .rollback(invoker_did, velocity_token);
+                gov.hard_rate_limit_mut().refund(invoker_did);
+                return Err(e);
+            }
+        };
 
         let mut participation_cache: HashMap<
             String,
@@ -2346,7 +2359,7 @@ pub async fn settle_outlet_economy_capture(
 
     let now = clock.now_secs();
     let (events_for_consequences, convergent_now) =
-        crate::context::governance_logic::event_log_entries_for_consequences(
+        crate::context::governance_logic::event_log_entries_for_consequences_after_side_effect(
             view.receive_buffer_mut(),
             context_id,
             now,

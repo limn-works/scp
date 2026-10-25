@@ -846,7 +846,7 @@ pub async fn run_buffered_post_delivery(
         false
     } else {
         let (events, convergent_now) =
-            crate::context::governance_logic::event_log_entries_for_consequences(
+            crate::context::governance_logic::event_log_entries_for_consequences_after_side_effect(
                 view.receive_buffer_mut(),
                 context_id,
                 now,
@@ -2360,7 +2360,7 @@ pub async fn finalize_send(
 
         // Consequence enforcement.
         let (send_events, convergent_now) =
-            crate::context::governance_logic::event_log_entries_for_consequences(
+            crate::context::governance_logic::event_log_entries_for_consequences_after_side_effect(
                 view.receive_buffer_mut(),
                 context_id,
                 now,
@@ -3750,7 +3750,7 @@ pub async fn deliver_message_and_drain_buffered(
                 .clone();
             if !consequence_rules.is_empty() {
                 let (recv_events, convergent_now) =
-                    crate::context::governance_logic::event_log_entries_for_consequences(
+                    crate::context::governance_logic::event_log_entries_for_consequences_after_side_effect(
                         view.receive_buffer_mut(),
                         context_id,
                         now,
@@ -3869,7 +3869,7 @@ pub async fn deliver_message_and_drain_buffered(
         .clone();
     if !consequence_rules.is_empty() {
         let (recv_events, convergent_now) =
-            crate::context::governance_logic::event_log_entries_for_consequences(
+            crate::context::governance_logic::event_log_entries_for_consequences_after_side_effect(
                 view.receive_buffer_mut(),
                 context_id,
                 now,

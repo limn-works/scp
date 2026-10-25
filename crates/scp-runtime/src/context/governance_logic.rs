@@ -3,6 +3,7 @@
 //! in ADR-049 §15.
 
 use scp_did::DID;
+use scp_protocol::context::ContextError;
 use scp_protocol::context::membership::{ContextEvent, ReceiveBuffer};
 use scp_protocol::context::params::Capability;
 use scp_protocol::trust::consequence::{ConsequenceRule, TriggeredConsequence};
@@ -798,25 +799,71 @@ async fn emit_failure_escalation(
 /// timestamps and would therefore be skew-dependent and unsound). An empty log
 /// has no convergent-trigger evidence, so `convergent_now` falls back to `now`
 /// (the window is then irrelevant: no convergent events can match it).
+///
+/// A context with no log reads as an empty log. A log that cannot be read, or
+/// that is not loaded, is never read as an empty one (spec section 17.3,
+/// "Event log write failures"): a member whose read failed would otherwise
+/// decide a consequence differently from members whose reads succeeded.
+///
+/// # Errors
+///
+/// Returns the provider's read error ([`ContextError::EventLogFailed`] or
+/// [`ContextError::ContextNotRegistered`]). A caller whose operation has not
+/// yet taken its irreversible step fails with it; a caller whose operation
+/// already has uses [`event_log_entries_for_consequences_after_side_effect`].
 pub fn event_log_entries_for_consequences(
     receive_buffer: &ReceiveBuffer,
     context_id: &str,
     now: u64,
     event_log: &dyn crate::context::builder::ContextEventLogProvider,
-) -> (Vec<scp_event_log::Event>, u64) {
+) -> Result<(Vec<scp_event_log::Event>, u64), ContextError> {
     // Source 1: Full event log history (persisted, with real timestamps and
-    // actor_did). Acquired here from the provider; an unreadable/empty log
-    // yields an empty slice (the merge then reflects only Source 2).
+    // actor_did). Acquired here from the provider.
     //
     // ADR-056: key by the canonical digest (matches the event log init in
     // `builder::create_context` and `state.context_id`), not a re-hash of the
     // hex id — `context_id_to_bytes` resolves a real 64-hex id to its digest.
     let context_id_bytes = context_id_to_bytes(context_id);
-    let log_entries = match event_log.event_log_entries(&context_id_bytes) {
-        Ok(Some(entries)) => entries,
-        Ok(None) | Err(_) => Vec::new(),
-    };
+    let log_entries = event_log
+        .event_log_entries(&context_id_bytes)?
+        .unwrap_or_default();
+    Ok(merge_for_consequences(&log_entries, receive_buffer, now))
+}
 
+/// [`event_log_entries_for_consequences`] for a caller whose operation already
+/// took its irreversible step (an executed governance action, a delivered or
+/// sent message, a committed join, an executed outlet call): failing the
+/// operation cannot undo that step, so a failed read is logged and the
+/// evaluation runs over the receive buffer alone. Spec section 17.3 ("Event
+/// log write failures") names these sites; the pending-log-unit work gives
+/// them a read that cannot fail this way.
+pub fn event_log_entries_for_consequences_after_side_effect(
+    receive_buffer: &ReceiveBuffer,
+    context_id: &str,
+    now: u64,
+    event_log: &dyn crate::context::builder::ContextEventLogProvider,
+) -> (Vec<scp_event_log::Event>, u64) {
+    event_log_entries_for_consequences(receive_buffer, context_id, now, event_log).unwrap_or_else(
+        |e| {
+            tracing::warn!(
+                context_id,
+                error = %e,
+                "the event log could not be read after the operation's side effect; \
+                 consequences are evaluated over the receive buffer alone"
+            );
+            merge_for_consequences(&[], receive_buffer, now)
+        },
+    )
+}
+
+/// Merges Source 1 (`log_entries`) with Source 2 (the receive buffer) for
+/// [`event_log_entries_for_consequences`], returning the merged events and the
+/// convergent window anchor.
+fn merge_for_consequences(
+    log_entries: &[scp_event_log::Event],
+    receive_buffer: &ReceiveBuffer,
+    now: u64,
+) -> (Vec<scp_event_log::Event>, u64) {
     // Convergent window anchor: max timestamp of the Source-1 durable log,
     // captured BEFORE the merge. Empty log -> `now` fallback (sound: no
     // convergent-trigger evidence exists to anchor).
@@ -846,7 +893,7 @@ pub fn event_log_entries_for_consequences(
     // (projection + buffer gates) to the shared function so all honest members
     // stay byte-identical.
     let merged = scp_protocol::trust::consequence::merge_consequence_events(
-        &log_entries,
+        log_entries,
         receive_buffer.event_log_entries(),
         now,
     );
@@ -1101,7 +1148,8 @@ mod convergence_tests {
     async fn governance_bucket_count(buffer: &ReceiveBuffer) -> usize {
         let (log, ctx) = convergent_log().await;
         let (merged, _convergent_now) =
-            event_log_entries_for_consequences(buffer, &ctx, 1_700_000_100, &log);
+            event_log_entries_for_consequences(buffer, &ctx, 1_700_000_100, &log)
+                .expect("the log reads");
         merged
             .iter()
             .filter(|e| e.event_type == EventType::GovernanceAction)
@@ -1144,6 +1192,45 @@ mod convergence_tests {
         );
     }
 
+    /// An unreadable log is an error, never an empty log, and the
+    /// after-side-effect read logs it and evaluates over the receive buffer
+    /// alone (spec section 17.3, "Event log write failures").
+    #[tokio::test]
+    async fn an_unreadable_log_is_an_error_except_after_the_side_effect() {
+        let context_id_str = hex::encode(CTX_BYTES);
+        let storage_key = crate::context::state::context_id_to_bytes(&context_id_str);
+        let log = MerkleEventLogProvider::new();
+        log.init_event_log(&storage_key).await.expect("init log");
+        log.release_event_log(&storage_key);
+        let buffer = buffer_with_local_activity(3);
+
+        let read =
+            event_log_entries_for_consequences(&buffer, &context_id_str, 1_700_000_100, &log);
+        assert!(
+            matches!(
+                read,
+                Err(scp_protocol::context::ContextError::ContextNotRegistered(_))
+            ),
+            "an unreadable log is an error: {read:?}"
+        );
+        let (merged, convergent_now) = super::event_log_entries_for_consequences_after_side_effect(
+            &buffer,
+            &context_id_str,
+            1_700_000_100,
+            &log,
+        );
+        assert_eq!(
+            convergent_now, 1_700_000_100,
+            "no log evidence anchors the window"
+        );
+        assert!(
+            merged
+                .iter()
+                .any(|e| e.event_type == EventType::MessageSent),
+            "the receive buffer still feeds the evaluation"
+        );
+    }
+
     /// Pins that the per-author `MessageSent` events DO flow from the buffer
     /// (the velocity/rate path must keep working), so the EL01 fix narrowed the
     /// buffer projection without disabling it. Uses an EMPTY durable log so the
@@ -1163,7 +1250,8 @@ mod convergence_tests {
             .expect("clock")
             .as_secs();
         let (merged, _convergent_now) =
-            event_log_entries_for_consequences(&buffer, &context_id_str, now, &log);
+            event_log_entries_for_consequences(&buffer, &context_id_str, now, &log)
+                .expect("the log reads");
         let message_count = merged
             .iter()
             .filter(|e| e.event_type == EventType::MessageSent)

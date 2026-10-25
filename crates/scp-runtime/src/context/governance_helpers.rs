@@ -45,6 +45,7 @@ use crate::context::actor::state::PerContextState;
 use crate::context::governance_logic::ConsequenceStateSplit;
 use crate::context::governance_logic::{
     EnforceConsequencesCtx, enforce_triggered_consequences, event_log_entries_for_consequences,
+    event_log_entries_for_consequences_after_side_effect,
 };
 use crate::context::state::{
     CEILING_CHANGE_NOTIFICATION_PERIOD_SECS, CommitFaultMarker, CommitOperation,
@@ -2273,9 +2274,9 @@ pub async fn execute_extend_ttl(
     // stamps the leaf with the committer-assigned `timestamp_secs`
     // (`proposal.created_at`). A context whose log yields no convergent deadline
     // has no TTL to extend ⇒ no-op, no leaf. The governance decision is already
-    // committed, so the append is after its side effect and best-effort (a
-    // lost leaf re-derives the shorter un-extended base on restore); only an
-    // unreadable log returns an error. The
+    // committed, so the read and the append are after its side effect and
+    // best-effort (a lost leaf re-derives the shorter un-extended base on
+    // restore). The
     // combinator credits `checkpoint_events_since` itself, in the one arm where
     // the `TtlExtended` leaf landed, so this helper credits nothing: three of
     // the combinator's paths (no convergent deadline, payload encode failure,
@@ -4636,8 +4637,10 @@ fn actor_check_proposer_eligibility(
             .unwrap_or([0u8; 32]);
         // Participation-record path consumes only the merged event set;
         // `convergent_now` (the consequence window anchor) is unused here.
+        // A gate before the proposal is recorded: an unreadable log fails the
+        // proposal (spec section 17.3, "Event log write failures").
         let (events, _convergent_now) =
-            event_log_entries_for_consequences(&cell.receive_buffer, &context_id, now, event_log);
+            event_log_entries_for_consequences(&cell.receive_buffer, &context_id, now, event_log)?;
         if !events.is_empty() {
             match compute_participation_record(
                 &events,
@@ -6173,7 +6176,7 @@ pub async fn finalize_governance_action(
         if !rules.is_empty() {
             // Proposer and target share one merged event set and one convergent
             // window anchor so both evaluations are convergent across members.
-            let (buf_events, convergent_now) = event_log_entries_for_consequences(
+            let (buf_events, convergent_now) = event_log_entries_for_consequences_after_side_effect(
                 &state.receive_buffer,
                 context_id,
                 now,
@@ -6261,7 +6264,7 @@ pub async fn finalize_governance_action(
     {
         let now = deps.clock.now_secs();
         // Participation-record path: only the merged event set is consumed.
-        let (gov_events, _convergent_now) = event_log_entries_for_consequences(
+        let (gov_events, _convergent_now) = event_log_entries_for_consequences_after_side_effect(
             &state.receive_buffer,
             context_id,
             now,
