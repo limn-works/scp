@@ -1484,7 +1484,7 @@
       "gate": "gate-push-webpush",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-transport/src/startup.rs",
         "crates/scp-transport/src/relay/push_gate.rs",
