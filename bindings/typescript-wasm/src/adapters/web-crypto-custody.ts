@@ -76,6 +76,28 @@ function unwiredSeam(method: string): Error {
   );
 }
 
+/** The key type the native SDKs mint only through `generate_key_event_keypair` (SCP-345). */
+const KEY_EVENT_KEY_TYPE = "p256-key-event";
+
+/**
+ * Thrown by {@link WebCryptoCustody.generateKeypair} for `"p256-key-event"`: the
+ * browser client never mints a key-event key through `generateKeypair`, and that
+ * type is not a `CustodyKeyType`. SCP-311 and SCP-312 own the browser's
+ * key-event signer (SCP-345 AC19).
+ */
+export class KeyEventKeyRefusedError extends Error {
+  /** The refused key type, always `"p256-key-event"`. */
+  readonly keyType: typeof KEY_EVENT_KEY_TYPE = KEY_EVENT_KEY_TYPE;
+
+  constructor() {
+    super(
+      'WebCryptoCustody.generateKeypair refuses "p256-key-event": a key-event key is ' +
+        "never minted through generateKeypair; the key-event signer owns it (fails closed).",
+    );
+    this.name = "KeyEventKeyRefusedError";
+  }
+}
+
 export class WebCryptoCustody implements JsKeyCustody {
   readonly #did: string;
 
@@ -129,8 +151,14 @@ export class WebCryptoCustody implements JsKeyCustody {
     throw unwiredSeam("getPublicKey");
   }
 
-  /** Unwired custody SEAM — no driver call site this slice; fails closed. */
-  generateKeypair(_keyType: string): string {
+  /**
+   * Refuses `"p256-key-event"` with {@link KeyEventKeyRefusedError} before any other
+   * branch; every other type reaches the unwired custody SEAM and fails closed.
+   */
+  generateKeypair(keyType: string): string {
+    if (keyType === KEY_EVENT_KEY_TYPE) {
+      throw new KeyEventKeyRefusedError();
+    }
     throw unwiredSeam("generateKeypair");
   }
 

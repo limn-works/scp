@@ -6,7 +6,12 @@
  */
 
 import { expect, test } from "bun:test";
-import { type JsKeyCustody, WebCryptoCustody } from "../src/index";
+import {
+  type CustodyKeyType,
+  type JsKeyCustody,
+  KeyEventKeyRefusedError,
+  WebCryptoCustody,
+} from "../src/index";
 
 const DID = "did:dht:z6MkExampleParticipantIdentityAAAAAAAAAAAA";
 
@@ -61,4 +66,25 @@ test("JsKeyCustody.generateKeypair accepts only the four custody key types", () 
   // the check on an unused directive.
   // @ts-expect-error "rsa" is not a CustodyKeyType.
   expect(() => custody.generateKeypair("rsa")).toThrow(/unwired custody SEAM/);
+});
+
+test("generateKeypair refuses a key-event key with the typed refusal, not the unwired SEAM", () => {
+  const custody = WebCryptoCustody.create({ did: DID });
+  let thrown: unknown;
+  try {
+    custody.generateKeypair("p256-key-event");
+  } catch (e) {
+    thrown = e;
+  }
+  expect(thrown).toBeInstanceOf(KeyEventKeyRefusedError);
+  expect((thrown as KeyEventKeyRefusedError).keyType).toBe("p256-key-event");
+  expect((thrown as Error).message).not.toMatch(/unwired custody SEAM/);
+});
+
+test("CustodyKeyType does not admit the key-event key type", () => {
+  // `bun run check` type-checks this file: adding "p256-key-event" to
+  // CustodyKeyType leaves the directive unused and fails the check.
+  // @ts-expect-error "p256-key-event" is not a CustodyKeyType.
+  const t: CustodyKeyType = "p256-key-event";
+  expect(t as string).toBe("p256-key-event");
 });

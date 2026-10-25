@@ -33,7 +33,11 @@ export { IndexedDbStorage, type IndexedDbStorageOptions } from "./adapters/index
 // The three platform-port interfaces (embedders implement these to inject their
 // own custody / storage / socket on Deno / Workers / edge).
 export type { CustodyKeyType, JsKeyCustody, JsSocket, JsStorage } from "./adapters/types";
-export { WebCryptoCustody, type WebCryptoCustodyOptions } from "./adapters/web-crypto-custody";
+export {
+  KeyEventKeyRefusedError,
+  WebCryptoCustody,
+  type WebCryptoCustodyOptions,
+} from "./adapters/web-crypto-custody";
 export {
   type RelayPumpHandlers,
   type WebSocketLike,
