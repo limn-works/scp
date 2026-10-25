@@ -95,7 +95,7 @@ lists the URL and push values and section 4 the storage values, and what an unse
 
 ```bash
 # Full node (a shipped binary logs "no production pre-rotation custody backend available" and exits 1; see section 6)
-SCP_NODE_DOMAIN=relay.example.com SCP_RELAY_STORAGE_BACKEND=sqlite SCP_RELAY_STORAGE_PATH=/var/lib/scp/blobs.db scp-node
+SCP_NODE_DOMAIN=relay.example.com SCP_RELAY_PUSH_PLATFORMS=none SCP_RELAY_STORAGE_BACKEND=sqlite SCP_RELAY_STORAGE_PATH=/var/lib/scp/blobs.db scp-node
 
 # Relay-only mode (names its public URL, push selection, storage backend and path, none of which has a default; see sections 3 and 4)
 SCP_RELAY_URL=wss://relay.example.com/scp/v1 SCP_RELAY_PUSH_PLATFORMS=none SCP_RELAY_STORAGE_BACKEND=sqlite SCP_RELAY_STORAGE_PATH=/var/lib/scp/relay.db scp-node --relay-only
@@ -160,9 +160,9 @@ Credentials load only from files, never from an environment value. Each credenti
 
 One relay serves one Apple team, topic and APNs environment, and one Firebase project.
 
-With a platform listed, the relay opens the SQLite push store at `SCP_RELAY_PUSH_STORE_PATH` before it opens its blob store and serves its reserved push routing ID through the push gate. A store that cannot open exits 1 with `SCP_RELAY_PUSH_STORE=sqlite cannot open the push store at SCP_RELAY_PUSH_STORE_PATH='<path>' ... (SCP-CAPSEL-8001)`, and nothing falls back to another store. The relay verifies each registration's signature against the registrant's key-event log; until that verifier's key-state resolution is built, it refuses every registration with `5003` `PUSH_VERIFIER_UNAVAILABLE` and stores none.
+With a platform listed, the relay opens the SQLite push store at `SCP_RELAY_PUSH_STORE_PATH` before it opens its blob store and serves its reserved push routing ID through the push gate. The relay creates the store file with mode 0600, so `SQLite` gives its `-wal` and `-shm` files the same mode, and it refuses a store file or sidecar that is not a regular file or whose mode grants anything to its group or to others. A store that cannot open, or a refused file, exits 1 with `SCP_RELAY_PUSH_STORE=sqlite cannot open the push store at SCP_RELAY_PUSH_STORE_PATH='<path>' ... (SCP-CAPSEL-8001)`, and nothing falls back to another store. The relay verifies each registration's signature against the registrant's key-event log; until that verifier's key-state resolution is built, it refuses every registration with `5003` `PUSH_VERIFIER_UNAVAILABLE` and stores none.
 
-A persistent full node loads the platforms and credentials before it creates its storage directory, so an unset `SCP_RELAY_PUSH_PLATFORMS` or a bad credential exits 1 the same way and leaves no directory behind. Push registrations are relay data, so with a platform listed the node keeps its push store at `push.sqlite` in its storage directory (`SCP_STORAGE_PATH` or `--storage-path`), beside its other stores, and ignores `SCP_RELAY_PUSH_STORE` and `SCP_RELAY_PUSH_STORE_PATH`. The push store applies no at-rest key of its own, as the relay's SQLite blob store applies none, but it holds device tokens and registrant DIDs in plaintext where the blob store holds only ciphertext; an operator who wants them encrypted at rest uses filesystem encryption.
+A persistent full node loads the platforms and credentials before it creates its storage directory, so an unset `SCP_RELAY_PUSH_PLATFORMS` or a bad credential exits 1 the same way and leaves no directory behind. Push registrations are relay data, so with a platform listed the node keeps its push store at `push.sqlite` in its storage directory (`SCP_STORAGE_PATH` or `--storage-path`), beside its other stores. The node keys the store with the instance's storage key under the same SQLCipher settings as its other databases, and creates it owner-only as the relay does. A store that cannot open exits 1 with `the full node cannot open its push store at '<storage directory>/push.sqlite' ... (SCP-CAPSEL-8001)`. The node reads neither `SCP_RELAY_PUSH_STORE` nor `SCP_RELAY_PUSH_STORE_PATH`, and either one set exits 1 naming the variable (SCP-CAPSEL-8001). The relay-only push store has no instance key, so it holds device tokens and registrant DIDs in plaintext, where the blob store holds only ciphertext; an operator who wants them encrypted at rest uses filesystem encryption.
 
 ### Node-specific configuration
 
@@ -306,9 +306,10 @@ The full node (`scp-node` without `--relay-only`) starts an `ApplicationNode` (d
 ### Production deployment
 
 ```bash
-# Required: domain, storage path, and blob backend and path (section 4)
+# Required: domain, storage path, push selection (section 3), and blob backend and path (section 4)
 SCP_NODE_DOMAIN=relay.example.com \
 SCP_STORAGE_PATH=/var/lib/scp/node \
+SCP_RELAY_PUSH_PLATFORMS=none \
 SCP_RELAY_STORAGE_BACKEND=sqlite \
 SCP_RELAY_STORAGE_PATH=/var/lib/scp/blobs.db \
 scp-node

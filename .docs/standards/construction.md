@@ -170,7 +170,7 @@ NodeConfig {
     bind_addr, local_api, cors_origins, dht_gateways, http3, dns_provider,
     // Capability slots (typed, never dyn):
     nat: NatSlot, network_detector, blob_storage,
-    push: PushSlot,            // Disabled | Enabled(PushProviders{store, apns, fcm}); defaults Disabled (M2)
+    push: PushSlot,            // Disabled | Enabled(Box<PushProviders{store, senders: PushSenders{apns, fcm}}>); defaults Disabled (M2)
 }
 ```
 
@@ -211,7 +211,7 @@ Arms and fields that `NodeStartConfig` omits:
 | `TlsMode::Custom` | It carries an `Arc<dyn TlsProvider>` trait object, which cannot cross the FFI boundary. |
 | `DhtMode::Memory` | Its in-memory client is a nullifier compiled only under `feature = "testing"` (ADR-062, capability injection, Decision 1). |
 | `NatSlot::Custom`, `NatSlot::Tuned` | Both carry `NatStrategy` trait objects. |
-| `push` | Senders carry loaded operator credentials, and nodes are not participants. |
+| `push` | Push credentials load only from operator files into zeroizing buffers, so a field that crossed the FFI boundary would carry either key bytes or a second credential loader. An SDK-started node runs with push `Disabled`, and its relay answers a push registration with `4063` `PUSH_NOT_SUPPORTED`. |
 | `local_api`, `http3`, `dns_provider`, `network_detector`, `dht_gateways` | `local_api` is a development control plane whose token the node mints. The `http3` field compiles only under `feature = "http3"`, which no bridge enables. `dns_provider` overrides the selected `tls` and `domain` without saying so in the signature. `network_detector` is a core capability slot. `dht_gateways` has no DHT client to reach, because the operator identity owns its DID method and its DHT client. |
 
 keri's scope ruling of 2026-10-13: `dht` exposes `Disabled` only, because ADR-063 removes Mainline publication; under `Disabled` the node runs its relay and publishes nothing. `DnsSubdomain` stays out of the SDK mirror and `dns_provider` stays binary-only, because the DID-derived label collides across one operator's nodes and changes at the `Identifier` cut-over; the keri workstream owns defining that label and a future relay-advertisement variant.
