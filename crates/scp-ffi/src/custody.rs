@@ -1443,13 +1443,17 @@ mod tests {
         use scp_ffi_common::callback_custody::CallbackKeyRegistry;
 
         let storage = Arc::new(scp_platform::in_memory::InMemoryStorage::new());
-        let table = scp_platform::CustodyNamespaces::new();
+        let table = scp_ffi_common::callback_custody::CustodyRecords::open_alone(
+            Arc::clone(&storage),
+            [0x3a; 16],
+        )
+        .0;
         let recorded = || {
             CallbackKeyRegistry::recorded(
-                scp_ffi_common::callback_custody::CustodyRecords::open(
+                scp_ffi_common::callback_custody::CustodyRecords::reopen(
                     &table,
                     Arc::clone(&storage),
-                    scp_platform::CustodyNamespace::from_bytes([0x3a; 16]),
+                    [0x3a; 16],
                 )
                 .expect("no other adapter holds the namespace"),
             )
@@ -1457,10 +1461,10 @@ mod tests {
         let (minted, host) = p256_over(recorded());
         let (key, _) = key_event_key(&minted).await;
         assert!(
-            scp_ffi_common::callback_custody::CustodyRecords::open(
+            scp_ffi_common::callback_custody::CustodyRecords::reopen(
                 &table,
                 Arc::clone(&storage),
-                scp_platform::CustodyNamespace::from_bytes([0x3a; 16])
+                [0x3a; 16]
             )
             .is_err(),
             "a second adapter for a live namespace is refused"

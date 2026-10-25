@@ -5702,24 +5702,8 @@ async fn create_identity(
     // A callback custody identity stores its namespace, handles and document
     // before the create returns (spec §17.3, SCP-345 decision D1), so
     // `identityLoadWithCustody` reopens the same records; a failed write
-    // fails the create.
-    if let crate::custody::NapiKeyCustody::Callback(adapter) = key_custody.as_ref() {
-        let storage = crate::runtime::protocol_repository(bi)
-            .callback_custody_storage()
-            .ok_or_else(|| {
-                callback_identity_error(
-                    scp_ffi_common::callback_identity::CallbackIdentityError::NotPersistent,
-                )
-            })?;
-        scp_ffi_common::callback_identity::write_entry(
-            storage.as_ref(),
-            adapter.namespace(),
-            &scp_identity,
-            &document,
-        )
-        .await
-        .map_err(callback_identity_error)?;
-    }
+    // fails the create and destroys the keys it minted.
+    write_created_callback_entry(bi, &key_custody, &scp_identity, &document).await?;
 
     let verifying_key_hex =
         crate::identity::identity_verifying_key_hex(&key_custody, &scp_identity.identity_key).await;
@@ -5754,6 +5738,75 @@ async fn create_identity(
     };
     crate::increment_handle_count();
     Ok(handle)
+}
+
+/// Writes the callback custody entry of an identity just minted over
+/// `custody` when `custody` is a host provider's adapter (spec §17.3); other
+/// custodies keep no entry. A failed write destroys the keys the create
+/// minted before the error returns.
+///
+/// # Errors
+///
+/// `SCP-STORAGE-8000` when `bi`'s storage stopped persisting, and the
+/// [`CallbackIdentityError`] code when the write fails.
+///
+/// [`CallbackIdentityError`]: scp_ffi_common::callback_identity::CallbackIdentityError
+#[cfg(feature = "testing")]
+async fn write_created_callback_entry(
+    bi: &NapiBridgeInstance,
+    custody: &crate::custody::NapiKeyCustody,
+    identity: &scp_identity::ScpIdentity,
+    document: &scp_did::DidDocument,
+) -> napi::Result<()> {
+    let crate::custody::NapiKeyCustody::Callback(adapter) = custody else {
+        return Ok(());
+    };
+    let storage = crate::runtime::protocol_repository(bi).callback_custody_storage();
+    scp_ffi_common::callback_identity::write_created_entry(
+        storage.as_deref(),
+        adapter,
+        adapter.namespace(),
+        identity,
+        document,
+    )
+    .await
+    .map_err(callback_identity_error)
+}
+
+/// Rewrites the callback custody entry of an identity whose key handles or
+/// document an operation changed, when `custody` is a host provider's
+/// adapter (spec §17.3); other custodies keep no entry. Every operation that
+/// changes a registered identity calls this before it installs the change,
+/// so a restart loads the changed identity and never the one before.
+/// `previous_did` is the DID the identity had before the change.
+///
+/// # Errors
+///
+/// `SCP-STORAGE-8000` when `bi`'s storage stopped persisting, and the
+/// [`CallbackIdentityError`] code when the write fails.
+///
+/// [`CallbackIdentityError`]: scp_ffi_common::callback_identity::CallbackIdentityError
+#[cfg(feature = "testing")]
+pub(crate) async fn rewrite_callback_entry(
+    bi: &NapiBridgeInstance,
+    custody: &crate::custody::NapiKeyCustody,
+    previous_did: &str,
+    identity: &scp_identity::ScpIdentity,
+    document: &scp_did::DidDocument,
+) -> napi::Result<()> {
+    let crate::custody::NapiKeyCustody::Callback(adapter) = custody else {
+        return Ok(());
+    };
+    let storage = crate::runtime::protocol_repository(bi).callback_custody_storage();
+    scp_ffi_common::callback_identity::rewrite_entry(
+        storage.as_deref(),
+        adapter.namespace(),
+        previous_did,
+        identity,
+        document,
+    )
+    .await
+    .map_err(callback_identity_error)
 }
 
 /// Maps a callback custody identity refusal to the code every bridge

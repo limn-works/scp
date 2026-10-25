@@ -51,10 +51,11 @@ use scp_platform::traits::{
     KeyHandle, KeyRole, KeyType, Pseudonym, PublicKey, SharedSecret, Signature, Storage,
 };
 use scp_platform::{
-    CustodyNamespace, CustodyNamespaces, CustodyProbe, CustodyRecord, CustodyRecordStore,
-    IndexedSignature, KeyEventSignError, NamespaceLive, ProbeSignature, SigningChange,
-    refuse_key_event_mint,
+    CustodyProbe, CustodyRecord, CustodyRecordStore, IndexedSignature, KeyEventSignError,
+    ProbeSignature, SigningChange, refuse_key_event_mint,
 };
+
+use crate::custody_namespace::{CustodyNamespace, CustodyNamespaces, NamespaceLive};
 
 /// A host's `get_public_key` answer: the key's type, its public key, and the
 /// role the host recorded when it minted the key.
@@ -229,7 +230,7 @@ impl CustodyRecords {
     ///
     /// [`CustodyLoadError::NamespaceLive`] while another adapter opened from
     /// `table` holds `namespace`.
-    pub fn open<S>(
+    pub(crate) fn open<S>(
         table: &CustodyNamespaces,
         storage: S,
         namespace: CustodyNamespace,
@@ -276,12 +277,13 @@ impl CustodyRecords {
     /// [`CustodyNamespaces::open_alone`].
     #[cfg(any(test, feature = "testing"))]
     #[must_use]
-    pub fn open_alone<S>(storage: S, namespace: CustodyNamespace) -> (CustodyNamespaces, Self)
+    pub fn open_alone<S>(storage: S, namespace: [u8; 16]) -> (CustodyNamespaces, Self)
     where
         S: Storage + Send + Sync + 'static,
     {
-        let namespace_bytes = *namespace.as_bytes();
-        let (table, store) = CustodyNamespaces::open_alone(storage, namespace);
+        let namespace_bytes = namespace;
+        let (table, store) =
+            CustodyNamespaces::open_alone(storage, CustodyNamespace::from_bytes(namespace));
         (
             table,
             Self {
@@ -289,6 +291,27 @@ impl CustodyRecords {
                 namespace: namespace_bytes,
             },
         )
+    }
+
+    /// Reopens `namespace` over `storage` through `table`, for a test
+    /// fixture that drops an adapter and rebuilds it over the table
+    /// [`open_alone`](Self::open_alone) returned, as a restarted process
+    /// reopens its identity's records.
+    ///
+    /// # Errors
+    ///
+    /// [`CustodyLoadError::NamespaceLive`] while a live adapter from `table`
+    /// holds `namespace`.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn reopen<S>(
+        table: &CustodyNamespaces,
+        storage: S,
+        namespace: [u8; 16],
+    ) -> Result<Self, CustodyLoadError>
+    where
+        S: Storage + Send + Sync + 'static,
+    {
+        Self::open(table, storage, CustodyNamespace::from_bytes(namespace))
     }
 
     /// Records over a store a unit test built and keeps a handle to, with no
@@ -394,11 +417,7 @@ impl CallbackKeyRegistry {
     /// Records over fresh in-memory storage and a table of their own.
     #[cfg(any(test, feature = "testing"))]
     fn in_memory_records() -> CustodyRecords {
-        CustodyRecords::open_alone(
-            scp_platform::in_memory::InMemoryStorage::new(),
-            CustodyNamespace::from_bytes([0; 16]),
-        )
-        .1
+        CustodyRecords::open_alone(scp_platform::in_memory::InMemoryStorage::new(), [0; 16]).1
     }
 
     /// [`recorded_in_memory`](Self::recorded_in_memory) already holding a
@@ -1412,6 +1431,57 @@ where
         }
     }
     Ok(())
+}
+
+/// Why a test fixture's `reopen` left its adapter as it was.
+#[cfg(any(test, feature = "testing"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReopenRefusal {
+    /// An earlier `reopen` already closed the adapter.
+    Closed,
+    /// A call still holds the adapter, and with it the namespace, so a new
+    /// adapter could not open the records; the adapter stays open.
+    InFlight,
+}
+
+#[cfg(any(test, feature = "testing"))]
+impl fmt::Display for ReopenRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Closed => "this testing adapter was closed by reopen",
+            Self::InFlight => {
+                "a call on this testing adapter is still in flight and holds its custody \
+                 records; the adapter stays open, so reopen it after the call settles"
+            }
+        })
+    }
+}
+
+/// Closes the adapter in a test fixture's `slot` for a reopen over the same
+/// records, only when no call holds it.
+///
+/// The namespace is released when the adapter drops, so an adapter a call
+/// still holds would make the reopen's open refuse the namespace while the
+/// fixture had already given its adapter up. A refused close leaves `slot`
+/// as it was.
+///
+/// # Errors
+///
+/// [`ReopenRefusal::Closed`] for an empty slot, and
+/// [`ReopenRefusal::InFlight`] while another reference to the adapter lives.
+#[cfg(any(test, feature = "testing"))]
+pub fn close_for_reopen<T>(slot: &mut Option<Arc<T>>) -> Result<(), ReopenRefusal> {
+    let adapter = slot.take().ok_or(ReopenRefusal::Closed)?;
+    match Arc::try_unwrap(adapter) {
+        Ok(adapter) => {
+            drop(adapter);
+            Ok(())
+        }
+        Err(shared) => {
+            *slot = Some(shared);
+            Err(ReopenRefusal::InFlight)
+        }
+    }
 }
 
 /// A software host for bridge tests: Ed25519, P-256 signing, HPKE P-256
@@ -3696,6 +3766,33 @@ mod tests {
             .expect("the namespace is free again"),
         );
         assert_eq!(record_of(&third, &h).await.unwrap(), Some(KEY_EVENT));
+    }
+
+    /// A reopen closes the fixture's adapter only when no call holds it; a
+    /// held adapter stays in the slot, and the namespace it holds stays
+    /// live until the holder drops, after which the close succeeds and the
+    /// namespace opens again. An empty slot is `Closed`.
+    #[tokio::test]
+    async fn close_for_reopen_waits_for_the_last_holder() {
+        let storage = Arc::new(scp_platform::in_memory::InMemoryStorage::new());
+        let (table, records) = CustodyRecords::open_alone(Arc::clone(&storage), [0x7e; 16]);
+        let mut slot = Some(Arc::new(CallbackKeyRegistry::recorded(records)));
+        let in_flight = slot.as_ref().map(Arc::clone);
+
+        assert_eq!(close_for_reopen(&mut slot), Err(ReopenRefusal::InFlight));
+        assert!(slot.is_some(), "a refused close leaves the adapter open");
+        assert!(matches!(
+            CustodyRecords::reopen(&table, Arc::clone(&storage), [0x7e; 16]),
+            Err(CustodyLoadError::NamespaceLive)
+        ));
+
+        drop(in_flight);
+        assert_eq!(close_for_reopen(&mut slot), Ok(()));
+        assert!(slot.is_none());
+        CustodyRecords::reopen(&table, Arc::clone(&storage), [0x7e; 16])
+            .expect("the namespace is free once the adapter dropped");
+        assert_eq!(close_for_reopen(&mut slot), Err(ReopenRefusal::Closed));
+        assert!(ReopenRefusal::InFlight.to_string().contains("in flight"));
     }
 
     /// The fake host meets the host contract's key-id rule, and the check

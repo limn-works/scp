@@ -54,11 +54,8 @@ use scp_did::DidDocument;
 // in-memory seam are both encapsulated in the single cfg-gated
 // `scp_ffi_common::dht::build_ffi_dht_client`; this bridge only maps its error.
 use scp_ffi_common::dht::FfiDhtClient;
-use scp_identity::{DidCache, DidDht, DidMethod, DualLayerResolver, NoOpRelayQuerier};
-// Only the testing-gated `identity_migrate` path constructs a `ScpIdentity`
-// value directly (production migration is unreachable — ADR-062 §Decision 6).
-#[cfg(feature = "testing")]
 use scp_identity::ScpIdentity;
+use scp_identity::{DidCache, DidDht, DidMethod, DualLayerResolver, NoOpRelayQuerier};
 #[cfg(feature = "testing")]
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{KeyCustody, Storage};
@@ -373,6 +370,12 @@ fn republish_identity(
         ScpPyError::from(e)
     })?;
     let (new_identity, new_document) = published;
+    // The stored entry takes the change before the registry does, so a
+    // failed write leaves both on the state a restart would load.
+    crate::actor_wait::block_on_released(
+        py,
+        rewrite_callback_entry(bi, custody.as_ref(), did, &new_identity, &new_document),
+    )??;
     crate::runtime::with_identity_mut(bi, did, |entry| {
         if entry.document != document {
             return Err(ScpPyError::identity(format!(
@@ -1026,7 +1029,8 @@ fn callback_custody_storage(
 
 /// Writes the callback custody entry of an identity just minted over
 /// `custody` when `custody` is a host provider's adapter (spec §17.3,
-/// SCP-345 decision D1); other custodies keep no entry.
+/// SCP-345 decision D1); other custodies keep no entry. A failed write
+/// destroys the keys the create minted before the error returns.
 ///
 /// # Errors
 ///
@@ -1041,15 +1045,54 @@ async fn write_callback_entry(
     identity: &ScpIdentity,
     document: &DidDocument,
 ) -> Result<(), ScpPyError> {
-    use scp_ffi_common::callback_identity::{CallbackIdentityError, write_entry};
     let FfiKeyCustody::Callback(adapter) = custody else {
         return Ok(());
     };
-    let storage = callback_custody_storage(bi)
-        .ok_or_else(|| callback_identity_error(CallbackIdentityError::NotPersistent))?;
-    write_entry(storage.as_ref(), adapter.namespace(), identity, document)
-        .await
-        .map_err(callback_identity_error)
+    let storage = callback_custody_storage(bi);
+    scp_ffi_common::callback_identity::write_created_entry(
+        storage.as_deref(),
+        adapter,
+        adapter.namespace(),
+        identity,
+        document,
+    )
+    .await
+    .map_err(callback_identity_error)
+}
+
+/// Rewrites the callback custody entry of an identity whose key handles or
+/// document an operation changed, when `custody` is a host provider's
+/// adapter (spec §17.3); other custodies keep no entry. Every operation that
+/// changes a registered identity calls this before it installs the change,
+/// so a restart loads the changed identity and never the one before.
+/// `previous_did` is the DID the identity had before the change.
+///
+/// # Errors
+///
+/// `SCP-STORAGE-8000` when `bi`'s storage stopped persisting, and the
+/// [`CallbackIdentityError`] code when the write fails.
+///
+/// [`CallbackIdentityError`]: scp_ffi_common::callback_identity::CallbackIdentityError
+async fn rewrite_callback_entry(
+    bi: &PyBridgeInstance,
+    custody: &FfiKeyCustody,
+    previous_did: &str,
+    identity: &ScpIdentity,
+    document: &DidDocument,
+) -> Result<(), ScpPyError> {
+    let FfiKeyCustody::Callback(adapter) = custody else {
+        return Ok(());
+    };
+    let storage = callback_custody_storage(bi);
+    scp_ffi_common::callback_identity::rewrite_entry(
+        storage.as_deref(),
+        adapter.namespace(),
+        previous_did,
+        identity,
+        document,
+    )
+    .await
+    .map_err(callback_identity_error)
 }
 
 /// Maps a callback custody identity refusal to the code every bridge
@@ -2470,6 +2513,16 @@ impl crate::scp::PyScp {
                     } = outcome;
                     let new_did = new_identity.did.clone();
                     let document_for_handle = new_document.clone();
+                    // The stored entry moves to the new DID before the
+                    // registry does (spec §17.3).
+                    rewrite_callback_entry(
+                        &bi_arc,
+                        custody.as_ref(),
+                        &old_did,
+                        &new_identity,
+                        &new_document,
+                    )
+                    .await?;
 
                     // Snapshot the migrated identity's verifying-key BEFORE the
                     // identity / custody move into the registry (ADR-046 parity).
@@ -2563,8 +2616,14 @@ impl crate::scp::PyScp {
         // Read the document, attest with the GIL released and no registry
         // guard held, then install the result only if no other update
         // replaced the document meanwhile (see `republish_identity`).
-        let document =
-            crate::runtime::with_identity(&bi_arc, &did_owned, |entry| Ok(entry.document.clone()))?;
+        let (identity, document, custody) =
+            crate::runtime::with_identity(&bi_arc, &did_owned, |entry| {
+                Ok((
+                    entry.identity.clone(),
+                    entry.document.clone(),
+                    Arc::clone(&entry.custody),
+                ))
+            })?;
         let attestation = scp_platform::testing::InMemoryDeviceAttestation::new();
         let dht = shared_did_method(&bi_arc)?;
         let new_document = crate::actor_wait::block_on_released(
@@ -2590,6 +2649,16 @@ impl crate::scp::PyScp {
                 )
             })?;
 
+        crate::actor_wait::block_on_released(
+            py,
+            rewrite_callback_entry(
+                &bi_arc,
+                custody.as_ref(),
+                &did_owned,
+                &identity,
+                &new_document,
+            ),
+        )??;
         crate::runtime::with_identity_mut(&bi_arc, &did_owned, |entry| {
             if entry.document != document {
                 return Err(ScpPyError::identity(format!(

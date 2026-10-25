@@ -473,7 +473,7 @@ pub struct TestingCallbackCustody {
     /// The storage the adapter's records live in, and the namespace table
     /// they open through, shared with every adapter `reopen` builds.
     storage: std::sync::Arc<scp_platform::in_memory::InMemoryStorage>,
-    table: scp_platform::CustodyNamespaces,
+    table: scp_ffi_common::custody_namespace::CustodyNamespaces,
 }
 
 /// The one namespace every adapter of a fixture opens.
@@ -500,7 +500,7 @@ impl TestingCallbackCustody {
         host: crate::custody::CallbackTsfns,
         records: scp_ffi_common::callback_custody::CustodyRecords,
         storage: std::sync::Arc<scp_platform::in_memory::InMemoryStorage>,
-        table: scp_platform::CustodyNamespaces,
+        table: scp_ffi_common::custody_namespace::CustodyNamespaces,
     ) -> Self {
         Self {
             inner: std::sync::Mutex::new(Some(std::sync::Arc::new(
@@ -548,7 +548,7 @@ impl TestingCallbackCustody {
         let storage = std::sync::Arc::new(scp_platform::in_memory::InMemoryStorage::new());
         let (table, records) = scp_ffi_common::callback_custody::CustodyRecords::open_alone(
             std::sync::Arc::clone(&storage),
-            scp_platform::CustodyNamespace::from_bytes(FIXTURE_NAMESPACE),
+            FIXTURE_NAMESPACE,
         );
         Ok(Self::holding(host, records, storage, table))
     }
@@ -566,21 +566,21 @@ impl TestingCallbackCustody {
     ///
     /// A `napi::Error` if a callback cannot become a threadsafe function;
     /// `SCP-IDENT-1008` when this adapter is already closed, or while a call
-    /// on it still holds its records (the namespace is live).
+    /// on it still holds its records; that refusal leaves this adapter open.
     #[napi]
     pub fn reopen(&self, provider: crate::custody::NapiKeyCustodyProvider) -> napi::Result<Self> {
         let host = crate::custody::CallbackTsfns::from_provider(provider)?;
-        let closing = self
-            .inner
-            .lock()
-            .map_err(|_| closed_adapter())?
-            .take()
-            .ok_or_else(closed_adapter)?;
-        drop(closing);
-        let records = scp_ffi_common::callback_custody::CustodyRecords::open(
+        let mut slot = self.inner.lock().map_err(|_| closed_adapter())?;
+        scp_ffi_common::callback_custody::close_for_reopen(&mut slot).map_err(|refusal| {
+            napi::Error::from(ScpNapiError::Identity {
+                message: refusal.to_string(),
+                code: scp_ffi_common::error_codes::IDENT_1008.to_owned(),
+            })
+        })?;
+        let records = scp_ffi_common::callback_custody::CustodyRecords::reopen(
             &self.table,
             std::sync::Arc::clone(&self.storage),
-            scp_platform::CustodyNamespace::from_bytes(FIXTURE_NAMESPACE),
+            FIXTURE_NAMESPACE,
         )
         .map_err(|e| custody_err(scp_platform::PlatformError::from(e)))?;
         Ok(Self::holding(

@@ -21,9 +21,9 @@ use scp_ffi_common::error_codes as codes;
 use scp_platform::{CustodyType, KeyCustody, KeyHandle};
 use zeroize::Zeroizing;
 
-use scp_ffi_common::callback_custody::{CallbackKeyRegistry, CustodyRecords};
+use scp_ffi_common::callback_custody::{CallbackKeyRegistry, CustodyRecords, close_for_reopen};
+use scp_ffi_common::custody_namespace::CustodyNamespaces;
 use scp_platform::in_memory::InMemoryStorage;
-use scp_platform::{CustodyNamespace, CustodyNamespaces};
 
 use crate::CustodyKeyType;
 use crate::bridge::{CallbackKeyCustody, ScpError};
@@ -116,10 +116,7 @@ impl TestingCallbackCustody {
     #[must_use]
     pub fn new(provider: Box<dyn crate::KeyCustodyProvider>) -> Arc<Self> {
         let storage = Arc::new(InMemoryStorage::new());
-        let (table, records) = CustodyRecords::open_alone(
-            Arc::clone(&storage),
-            CustodyNamespace::from_bytes(NAMESPACE),
-        );
+        let (table, records) = CustodyRecords::open_alone(Arc::clone(&storage), NAMESPACE);
         Self::holding(provider, records, storage, table)
     }
 
@@ -133,24 +130,18 @@ impl TestingCallbackCustody {
     /// # Errors
     ///
     /// `SCP-IDENT-1008` when this adapter is already closed, or while a call
-    /// on it still holds its records (the namespace is live).
+    /// on it still holds its records; that refusal leaves this adapter open.
     pub fn reopen(
         &self,
         provider: Box<dyn crate::KeyCustodyProvider>,
     ) -> Result<Arc<Self>, ScpError> {
-        let closing = self
-            .inner
-            .lock()
-            .map_err(|_| closed())?
-            .take()
-            .ok_or_else(closed)?;
-        drop(closing);
-        let records = CustodyRecords::open(
-            &self.table,
-            Arc::clone(&self.storage),
-            CustodyNamespace::from_bytes(NAMESPACE),
-        )
-        .map_err(|e| ScpError::from(scp_platform::PlatformError::from(e)))?;
+        let mut slot = self.inner.lock().map_err(|_| closed())?;
+        close_for_reopen(&mut slot).map_err(|refusal| ScpError::Identity {
+            msg: refusal.to_string(),
+            code: codes::IDENT_1008.to_owned(),
+        })?;
+        let records = CustodyRecords::reopen(&self.table, Arc::clone(&self.storage), NAMESPACE)
+            .map_err(|e| ScpError::from(scp_platform::PlatformError::from(e)))?;
         Ok(Self::holding(
             provider,
             records,
@@ -370,6 +361,44 @@ mod tests {
         let mut provider = FakeHostProvider::over(host);
         provider.custody_type = custody_type;
         TestingCallbackCustody::new(Box::new(provider))
+    }
+
+    /// A reopen while a call holds the adapter is refused with
+    /// `SCP-IDENT-1008` and leaves the fixture open; once the call drops its
+    /// hold, the reopen succeeds and the new adapter signs with the key the
+    /// first one minted, over the same records.
+    #[tokio::test]
+    async fn reopen_waits_for_a_call_in_flight_and_keeps_the_fixture_open() {
+        let host = Arc::new(FakeHost::default());
+        let custody = custody_over(&host, "software");
+        let key = custody
+            .generate_keypair(CustodyKeyType::P256)
+            .await
+            .unwrap();
+        let in_flight = custody.adapter().unwrap();
+
+        let Err(ScpError::Identity { msg, code }) =
+            custody.reopen(Box::new(FakeHostProvider::over(&host)))
+        else {
+            panic!("a reopen while a call holds the adapter must be refused");
+        };
+        assert_eq!(code, codes::IDENT_1008);
+        assert!(msg.contains("in flight"), "{msg}");
+        assert_eq!(
+            custody
+                .sign(key.clone(), vec![9u8; 32])
+                .await
+                .unwrap()
+                .len(),
+            64,
+            "the refused reopen left the fixture open"
+        );
+
+        drop(in_flight);
+        let reopened = custody
+            .reopen(Box::new(FakeHostProvider::over(&host)))
+            .unwrap();
+        assert_eq!(reopened.sign(key, vec![9u8; 32]).await.unwrap().len(), 64);
     }
 
     /// A P-256 signature through the object is the 64-byte low-`s` form the

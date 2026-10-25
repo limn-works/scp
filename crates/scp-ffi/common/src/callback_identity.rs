@@ -20,9 +20,10 @@ use scp_identity::ScpIdentity;
 use scp_platform::store_value::{
     from_stored_value_bytes, sanitize_key_component, to_stored_value_bytes,
 };
-use scp_platform::{CustodyNamespace, CustodyNamespaces, KeyCustody, PlatformError, Storage};
+use scp_platform::{KeyCustody, KeyHandle, PlatformError, Storage};
 
 use crate::callback_custody::{CustodyLoadError, CustodyRecords};
+use crate::custody_namespace::{CustodyNamespace, CustodyNamespaces};
 use crate::error_codes;
 
 /// Why a callback custody identity could not be created or loaded.
@@ -55,6 +56,14 @@ pub enum CallbackIdentityError {
     Provider(PlatformError),
     /// The provider's identity key does not derive the stored DID.
     ProviderMismatch,
+    /// The create failed with `cause`, and destroying the keys it minted
+    /// failed too, so the host still holds the keys `orphaned` names.
+    KeysOrphaned {
+        /// Why the create failed.
+        cause: Box<Self>,
+        /// Each minted key the destroy left, with the destroy's error.
+        orphaned: Vec<(KeyHandle, PlatformError)>,
+    },
 }
 
 impl CallbackIdentityError {
@@ -72,14 +81,19 @@ impl CallbackIdentityError {
             Self::Records(_) | Self::Provider(_) | Self::ProviderMismatch => {
                 error_codes::IDENT_1008
             }
+            Self::KeysOrphaned { cause, .. } => cause.code(),
         }
     }
 
     /// Whether the refusal is about the instance storage selection, which
     /// each bridge reports in its storage error class, not its identity one.
     #[must_use]
-    pub const fn is_storage_selection(&self) -> bool {
-        matches!(self, Self::NotPersistent)
+    pub fn is_storage_selection(&self) -> bool {
+        match self {
+            Self::NotPersistent => true,
+            Self::KeysOrphaned { cause, .. } => cause.is_storage_selection(),
+            _ => false,
+        }
     }
 }
 
@@ -120,6 +134,17 @@ impl fmt::Display for CallbackIdentityError {
                 "the custody provider's identity key does not derive this DID; pass the \
                  provider that created the identity",
             ),
+            Self::KeysOrphaned { cause, orphaned } => {
+                write!(
+                    f,
+                    "{cause}; destroying the keys the create minted then failed, and the host \
+                     still holds"
+                )?;
+                for (key, e) in orphaned {
+                    write!(f, " key_id {} ({e})", key.id())?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -166,14 +191,14 @@ where
     Ok(CustodyRecords::create(table, storage)?)
 }
 
-/// Writes the callback custody identity entry of a created identity.
+/// Writes the callback custody identity entry of `identity` under its DID.
 ///
 /// # Errors
 ///
 /// [`CallbackIdentityError::InvalidDid`], [`CallbackIdentityError::Storage`],
 /// or [`CallbackIdentityError::EntryUndecodable`] when the entry does not
 /// encode.
-pub async fn write_entry<S: Storage + ?Sized>(
+async fn write_entry<S: Storage + ?Sized>(
     storage: &S,
     namespace: [u8; 16],
     identity: &ScpIdentity,
@@ -186,6 +211,104 @@ pub async fn write_entry<S: Storage + ?Sized>(
         .store(&key, &bytes)
         .await
         .map_err(CallbackIdentityError::Storage)
+}
+
+/// Writes the callback custody identity entry of an identity just created
+/// over `custody`, whose records live under `namespace` (spec §17.3).
+///
+/// A failed write fails the create, and no later load could reach the keys
+/// the create minted, so they are destroyed through `custody` (host key and
+/// custody record) before the error returns. A key the host already lacks
+/// counts as destroyed.
+///
+/// `storage` is `None` when the instance storage stopped persisting.
+///
+/// # Errors
+///
+/// The write's [`CallbackIdentityError`], or
+/// [`CallbackIdentityError::KeysOrphaned`] carrying it when a destroy failed
+/// too.
+pub async fn write_created_entry<S, C>(
+    storage: Option<&S>,
+    custody: &C,
+    namespace: [u8; 16],
+    identity: &ScpIdentity,
+    document: &DidDocument,
+) -> Result<(), CallbackIdentityError>
+where
+    S: Storage + ?Sized,
+    C: KeyCustody,
+{
+    let written = match storage {
+        Some(storage) => write_entry(storage, namespace, identity, document).await,
+        None => Err(CallbackIdentityError::NotPersistent),
+    };
+    let Err(cause) = written else {
+        return Ok(());
+    };
+    let minted = [
+        identity.agent_signing_key,
+        Some(identity.active_signing_key),
+        Some(identity.identity_key),
+    ];
+    let mut orphaned = Vec::new();
+    for key in minted.into_iter().flatten() {
+        match custody.destroy_key(&key).await {
+            Ok(()) | Err(PlatformError::KeyNotFound) => {}
+            Err(e) => orphaned.push((key, e)),
+        }
+    }
+    if orphaned.is_empty() {
+        Err(cause)
+    } else {
+        Err(CallbackIdentityError::KeysOrphaned {
+            cause: Box::new(cause),
+            orphaned,
+        })
+    }
+}
+
+/// Rewrites the callback custody identity entry after an operation changed
+/// the identity's key handles or document (spec §17.3).
+///
+/// The operations are rotation of the active or agent key, an agent key's
+/// addition or removal, a device attestation, and a migration. The entry keeps `namespace` and takes `identity`
+/// and `document`, under `identity`'s DID; when the operation moved the
+/// identity to a new DID, the entry under `previous_did` is removed after the
+/// new one is written, so a load of the retired DID finds no entry.
+///
+/// Every bridge runs this before it installs the change in its registry, so
+/// a restart loads the identity as it was after the change.
+///
+/// `storage` is `None` when the instance storage stopped persisting.
+///
+/// # Errors
+///
+/// [`CallbackIdentityError::NotPersistent`] for `None`;
+/// [`CallbackIdentityError::InvalidDid`], [`CallbackIdentityError::Storage`]
+/// or [`CallbackIdentityError::EntryUndecodable`] when the write or the
+/// removal fails.
+pub async fn rewrite_entry<S: Storage + ?Sized>(
+    storage: Option<&S>,
+    namespace: [u8; 16],
+    previous_did: &str,
+    identity: &ScpIdentity,
+    document: &DidDocument,
+) -> Result<(), CallbackIdentityError> {
+    let storage = storage.ok_or(CallbackIdentityError::NotPersistent)?;
+    let retired = if previous_did == identity.did {
+        None
+    } else {
+        Some(entry_key(previous_did)?)
+    };
+    write_entry(storage, namespace, identity, document).await?;
+    if let Some(key) = retired {
+        storage
+            .delete(&key)
+            .await
+            .map_err(CallbackIdentityError::Storage)?;
+    }
+    Ok(())
 }
 
 /// Refuses a provider-less `identity_load` of a DID that has a callback
@@ -409,6 +532,74 @@ mod tests {
             CallbackIdentityError::EntryDidMismatch { .. }
         ));
         assert_eq!(moved.code(), error_codes::IDENT_1009);
+    }
+
+    /// A rewrite replaces the entry under the same DID, so the load returns
+    /// the changed handles and document; a rewrite to a new DID moves the
+    /// entry, so the retired DID has none; no storage is `SCP-STORAGE-8000`.
+    #[tokio::test]
+    async fn a_rewrite_replaces_the_entry_and_a_migration_moves_it() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let table = CustodyNamespaces::new();
+        let custody = InMemoryKeyCustody::new();
+        let (identity, document) = minted(&custody).await;
+        write_entry(storage.as_ref(), [3; 16], &identity, &document)
+            .await
+            .unwrap();
+
+        let mut changed = identity.clone();
+        changed.active_signing_key = custody
+            .generate_keypair(scp_platform::KeyType::Ed25519)
+            .await
+            .unwrap();
+        let mut changed_document = document.clone();
+        changed_document
+            .also_known_as
+            .push("did:dht:changed".to_owned());
+        rewrite_entry(
+            Some(storage.as_ref()),
+            [3; 16],
+            &identity.did,
+            &changed,
+            &changed_document,
+        )
+        .await
+        .unwrap();
+        let loaded = open_entry(&table, Some(Arc::clone(&storage)), &identity.did)
+            .await
+            .unwrap();
+        assert_eq!(loaded.records.namespace(), [3; 16]);
+        assert_eq!(
+            loaded.identity.active_signing_key,
+            changed.active_signing_key
+        );
+        assert_eq!(loaded.document, changed_document);
+        drop(loaded);
+
+        let (moved, moved_document) = minted(&InMemoryKeyCustody::new()).await;
+        rewrite_entry(
+            Some(storage.as_ref()),
+            [3; 16],
+            &identity.did,
+            &moved,
+            &moved_document,
+        )
+        .await
+        .unwrap();
+        let retired = open_entry(&table, Some(Arc::clone(&storage)), &identity.did)
+            .await
+            .unwrap_err();
+        assert_eq!(retired.code(), error_codes::IDENT_1002);
+        let loaded = open_entry(&table, Some(Arc::clone(&storage)), &moved.did)
+            .await
+            .unwrap();
+        assert_eq!(loaded.document, moved_document);
+
+        let absent =
+            rewrite_entry::<InMemoryStorage>(None, [3; 16], &moved.did, &moved, &moved_document)
+                .await
+                .unwrap_err();
+        assert!(absent.is_storage_selection());
     }
 
     /// A provider-less load of a DID with an entry is `SCP-IDENT-1003`; a

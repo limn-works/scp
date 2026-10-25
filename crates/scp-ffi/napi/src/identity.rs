@@ -638,6 +638,17 @@ impl NapiIdentity {
                 .await
                 .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
 
+            // The stored entry takes the change before the registry does
+            // (spec §17.3), so a restart loads the changed identity.
+            crate::scp::rewrite_callback_entry(
+                bi,
+                &custody,
+                &scp_identity.did,
+                &new_identity,
+                &new_document,
+            )
+            .await?;
+
             let verifying_key_hex =
                 identity_verifying_key_hex(&custody, &new_identity.identity_key).await;
 
@@ -745,6 +756,17 @@ impl NapiIdentity {
                 .add_agent_key(&scp_identity, &document, &*custody)
                 .await
                 .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+
+            // The stored entry takes the change before the registry does
+            // (spec §17.3), so a restart loads the changed identity.
+            crate::scp::rewrite_callback_entry(
+                bi,
+                &custody,
+                &scp_identity.did,
+                &new_identity,
+                &new_document,
+            )
+            .await?;
 
             let verifying_key_hex =
                 identity_verifying_key_hex(&custody, &new_identity.identity_key).await;
@@ -855,6 +877,17 @@ impl NapiIdentity {
                 .await
                 .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
 
+            // The stored entry takes the change before the registry does
+            // (spec §17.3), so a restart loads the changed identity.
+            crate::scp::rewrite_callback_entry(
+                bi,
+                &custody,
+                &scp_identity.did,
+                &new_identity,
+                &new_document,
+            )
+            .await?;
+
             let verifying_key_hex =
                 identity_verifying_key_hex(&custody, &new_identity.identity_key).await;
 
@@ -962,6 +995,17 @@ impl NapiIdentity {
                 .remove_agent_key(&scp_identity, &document)
                 .await
                 .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+
+            // The stored entry takes the change before the registry does
+            // (spec §17.3), so a restart loads the changed identity.
+            crate::scp::rewrite_callback_entry(
+                bi,
+                &custody,
+                &scp_identity.did,
+                &new_identity,
+                &new_document,
+            )
+            .await?;
 
             let verifying_key_hex =
                 identity_verifying_key_hex(&custody, &new_identity.identity_key).await;
@@ -1104,6 +1148,17 @@ impl NapiIdentity {
             })?;
 
             let new_did = new_identity.did.clone();
+
+            // The stored entry takes the change before the registry does
+            // (spec §17.3), so a restart loads the changed identity.
+            crate::scp::rewrite_callback_entry(
+                bi,
+                &custody,
+                &scp_identity.did,
+                &new_identity,
+                &new_document,
+            )
+            .await?;
 
             let verifying_key_hex =
                 identity_verifying_key_hex(&custody, &new_identity.identity_key).await;

@@ -2667,6 +2667,62 @@
           "crates/scp-ffi/napi/src/scp.rs Scp::identity_load_with_custody → open_entry"
         ]
       }
+    },
+    {
+      "rule_id": "callback-custody-entry-rewritten-on-change-pyo3",
+      "description": "Every PyO3 operation that changes a registered identity's key handles or document must rewrite its callback custody entry through `rewrite_callback_entry` before it installs the change in the registry; the rotation and agent-key operations reach it through `republish_identity`. A restart loads the identity from that entry (spec 17 section 17.3 callback custody identity entry, SCP-345), so an operation that skipped the rewrite would reload the identity with its pre-change keys and republish its pre-change document.",
+      "applies_to": [
+        "pyo3"
+      ],
+      "pattern": {
+        "caller_matches": "^identity_(rotate_key|add_agent_key|rotate_agent_key|remove_agent_key|migrate)$",
+        "required_callee": "rewrite_callback_entry",
+        "scope": "same-function-or-direct-callee",
+        "min_occurrences": 1
+      },
+      "evidence": {
+        "code_sites": [
+          "crates/scp-ffi/src/identity.rs republish_identity → rewrite_callback_entry",
+          "crates/scp-ffi/src/identity.rs PyScp::identity_migrate → rewrite_callback_entry"
+        ]
+      }
+    },
+    {
+      "rule_id": "callback-custody-entry-rewritten-on-change-napi",
+      "description": "Every napi `NapiIdentity` operation that changes the identity's key handles or document must rewrite its callback custody entry through `rewrite_callback_entry` before it registers the change. A restart loads the identity from that entry (spec 17 section 17.3 callback custody identity entry, SCP-345), so an operation that skipped the rewrite would reload the identity with its pre-change keys and republish its pre-change document.",
+      "applies_to": [
+        "napi"
+      ],
+      "pattern": {
+        "caller_matches": "^(rotate_key|add_agent_key|rotate_agent_key|remove_agent_key|migrate)$",
+        "required_callee": "rewrite_callback_entry",
+        "scope": "same-function",
+        "min_occurrences": 1
+      },
+      "evidence": {
+        "code_sites": [
+          "crates/scp-ffi/napi/src/identity.rs NapiIdentity::{rotate_key, add_agent_key, rotate_agent_key, remove_agent_key, migrate} → rewrite_callback_entry"
+        ]
+      }
+    },
+    {
+      "rule_id": "callback-custody-entry-rewritten-on-change-uniffi",
+      "description": "Every UniFFI operation that changes an identity's key handles or document must rewrite its callback custody entry through `rewrite_callback_entry` before it returns the changed handle. A restart loads the identity from that entry (spec 17 section 17.3 callback custody identity entry, SCP-345), so an operation that skipped the rewrite would reload the identity with its pre-change keys and republish its pre-change document.",
+      "applies_to": [
+        "uniffi"
+      ],
+      "pattern": {
+        "caller_matches": "^(rotate_key|add_agent_key|rotate_agent_key|remove_agent_key|identity_migrate)$",
+        "required_callee": "rewrite_callback_entry",
+        "scope": "same-function",
+        "min_occurrences": 1
+      },
+      "evidence": {
+        "code_sites": [
+          "crates/scp-ffi/uniffi/src/bridge.rs Identity::{rotate_key, add_agent_key, rotate_agent_key, remove_agent_key} → rewrite_callback_entry",
+          "crates/scp-ffi/uniffi/src/bridge.rs Scp::identity_migrate → rewrite_callback_entry"
+        ]
+      }
     }
   ]
 }

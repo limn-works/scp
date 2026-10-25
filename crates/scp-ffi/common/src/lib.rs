@@ -129,6 +129,13 @@ pub mod custody_parse;
 #[cfg(feature = "custody")]
 pub mod callback_custody;
 
+// The custody record store over the instance storage and the namespace
+// table that admits one live store per namespace (spec §17.3). Its
+// constructors are private to this crate, so only a bridge instance builds a
+// table.
+#[cfg(feature = "custody")]
+pub mod custody_namespace;
+
 // The callback custody identity entry (spec §17.3, SCP-345 decision D1):
 // the namespace and identity a host custody provider's identity keeps, and
 // the create and load flows every bridge runs over it.

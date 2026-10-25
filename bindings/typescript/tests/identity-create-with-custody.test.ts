@@ -491,6 +491,53 @@ suite.describe("identityCreateWithCustody", () => {
       }
     });
 
+    // Spec §17.3: every operation that changes a callback custody identity
+    // rewrites its stored entry. A new instance resolves the document a
+    // rotation alone published, and after an agent key's addition to the
+    // loaded identity, a third instance resolves that document, never the
+    // one an earlier write stored.
+    test("a reload after a rotation and an agent key carries the changed keys", async () => {
+      const dir = await freshDir();
+      const provider = new CryptoKeychain();
+      try {
+        const first = sqliteScp(dir);
+        let did: string;
+        let rotatedDocument: unknown;
+        try {
+          const created = await first.identityCreateWithCustody(provider);
+          const createdDocument = await first.identityResolve(created.did);
+          const rotated = await first.identityRotateKey(created);
+          did = rotated.did;
+          rotatedDocument = await first.identityResolve(did);
+          expect(rotatedDocument).not.toEqual(createdDocument);
+        } finally {
+          await first.shutdown(1000);
+        }
+
+        const second = sqliteScp(dir);
+        let changedDocument: unknown;
+        try {
+          const loaded = await second.identityLoadWithCustody(did, provider);
+          expect(await second.identityResolve(did)).toEqual(rotatedDocument);
+          await second.identityAddAgentKey(loaded);
+          changedDocument = await second.identityResolve(did);
+          expect(changedDocument).not.toEqual(rotatedDocument);
+        } finally {
+          await second.shutdown(1000).catch(() => {});
+        }
+
+        const third = sqliteScp(dir);
+        try {
+          await third.identityLoadWithCustody(did, provider);
+          expect(await third.identityResolve(did)).toEqual(changedDocument);
+        } finally {
+          await third.shutdown(1000).catch(() => {});
+        }
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
     test("in-memory storage refuses a callback custody create and load with SCP-STORAGE-8000", async () => {
       const scp = new SCP({ storage: { type: "in_memory" } });
       try {

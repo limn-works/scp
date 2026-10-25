@@ -950,7 +950,7 @@ pub struct CoreFields {
     /// so a second load of one callback identity while the first adapter
     /// lives is refused.
     #[cfg(feature = "custody")]
-    custody_namespaces: scp_platform::CustodyNamespaces,
+    custody_namespaces: crate::custody_namespace::CustodyNamespaces,
 }
 
 impl Default for CoreFields {
@@ -964,7 +964,7 @@ impl CoreFields {
     /// adapters hold (spec §17.3).
     #[cfg(feature = "custody")]
     #[must_use]
-    pub const fn custody_namespaces(&self) -> &scp_platform::CustodyNamespaces {
+    pub const fn custody_namespaces(&self) -> &crate::custody_namespace::CustodyNamespaces {
         &self.custody_namespaces
     }
 
@@ -1024,7 +1024,7 @@ impl CoreFields {
             stream_registration_closed: Arc::new(AtomicBool::new(false)),
             wake_flight: crate::push::WakeFlight::default(),
             #[cfg(feature = "custody")]
-            custody_namespaces: scp_platform::CustodyNamespaces::new(),
+            custody_namespaces: crate::custody_namespace::CustodyNamespaces::new(),
         }
     }
 
@@ -1123,7 +1123,7 @@ impl CoreFields {
             stream_registration_closed: Arc::new(AtomicBool::new(false)),
             wake_flight: crate::push::WakeFlight::default(),
             #[cfg(feature = "custody")]
-            custody_namespaces: scp_platform::CustodyNamespaces::new(),
+            custody_namespaces: crate::custody_namespace::CustodyNamespaces::new(),
         }
     }
 

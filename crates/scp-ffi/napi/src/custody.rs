@@ -643,7 +643,9 @@ impl<H> CallbackAdapter<H> {
     }
 
     /// The custody namespace this adapter's records live under, which the
-    /// identity's callback custody entry stores (spec §17.3).
+    /// identity's callback custody entry stores (spec §17.3). Only the
+    /// `testing` build's create writes that entry.
+    #[cfg(feature = "testing")]
     pub(crate) const fn namespace(&self) -> [u8; 16] {
         self.registry.namespace()
     }
@@ -1529,24 +1531,30 @@ mod adapter_tests {
     /// `identityCreateWithCustody` opens one over the instance storage.
     fn recorded(
         storage: &Arc<scp_platform::in_memory::InMemoryStorage>,
-        table: &scp_platform::CustodyNamespaces,
+        table: &scp_ffi_common::custody_namespace::CustodyNamespaces,
     ) -> CallbackKeyRegistry {
         CallbackKeyRegistry::recorded(
-            flow::CustodyRecords::open(
-                table,
-                Arc::clone(storage),
-                scp_platform::CustodyNamespace::from_bytes([0x3a; 16]),
-            )
-            .expect("no other adapter holds the namespace"),
+            flow::CustodyRecords::reopen(table, Arc::clone(storage), [0x3a; 16])
+                .expect("no other adapter holds the namespace"),
         )
+    }
+
+    /// A namespace table of its own over `storage`, holding no namespace.
+    fn table_over(
+        storage: &Arc<scp_platform::in_memory::InMemoryStorage>,
+    ) -> scp_ffi_common::custody_namespace::CustodyNamespaces {
+        flow::CustodyRecords::open_alone(Arc::clone(storage), [0x3a; 16]).0
     }
 
     fn adapter(host: &Arc<FakeHost>) -> CallbackAdapter<TestHost> {
         CallbackAdapter::over(
             test_host(host),
-            recorded(
-                &Arc::new(scp_platform::in_memory::InMemoryStorage::new()),
-                &scp_platform::CustodyNamespaces::new(),
+            CallbackKeyRegistry::recorded(
+                flow::CustodyRecords::open_alone(
+                    scp_platform::in_memory::InMemoryStorage::new(),
+                    [0x3a; 16],
+                )
+                .1,
             ),
         )
     }
@@ -1575,16 +1583,11 @@ mod adapter_tests {
     async fn rebuilt_adapter_refuses_sign_of_key_event_key_host_reports_p256() {
         let host = Arc::new(FakeHost::default());
         let storage = Arc::new(scp_platform::in_memory::InMemoryStorage::new());
-        let table = scp_platform::CustodyNamespaces::new();
+        let table = table_over(&storage);
         let minted = CallbackAdapter::over(test_host(&host), recorded(&storage, &table));
         let (key, _) = key_event_key(&minted).await;
         assert!(
-            flow::CustodyRecords::open(
-                &table,
-                Arc::clone(&storage),
-                scp_platform::CustodyNamespace::from_bytes([0x3a; 16])
-            )
-            .is_err(),
+            flow::CustodyRecords::reopen(&table, Arc::clone(&storage), [0x3a; 16]).is_err(),
             "a second adapter for a live namespace is refused"
         );
         drop(minted);
@@ -1860,9 +1863,12 @@ mod adapter_tests {
                 }),
                 ..test_host(&host)
             },
-            recorded(
-                &Arc::new(scp_platform::in_memory::InMemoryStorage::new()),
-                &scp_platform::CustodyNamespaces::new(),
+            CallbackKeyRegistry::recorded(
+                flow::CustodyRecords::open_alone(
+                    scp_platform::in_memory::InMemoryStorage::new(),
+                    [0x3a; 16],
+                )
+                .1,
             ),
         );
         let key = transport

@@ -559,6 +559,51 @@ async def test_a_new_instance_loads_the_identity_and_signs_with_its_earlier_key(
 
 
 @pytest.mark.asyncio
+async def test_a_reload_after_rotation_and_an_agent_key_carries_the_changed_keys(
+    tmp_path,  # type: ignore[no-untyped-def]
+) -> None:
+    """Every operation that changes a callback custody identity rewrites its
+    stored entry (spec section 17.3). A new instance loads the identity with
+    the document a rotation alone published, and, after an agent key's
+    addition to the loaded identity, a third instance loads that agent key
+    and its document, never the ones an earlier write stored."""
+    provider = _FakeKeychain()
+    first = open_sqlite_scp(tmp_path)
+    try:
+        created = await first.identity_create_with_custody(provider)
+        created_document = await first.identity_resolve(created.did)
+        rotated = await first.identity_rotate_key(created)
+        rotated_document = await first.identity_resolve(rotated.did)
+        assert rotated_document != created_document
+        did = rotated.did
+        del created, rotated
+    finally:
+        first.__exit__(None, None, None)
+
+    second = open_sqlite_scp(tmp_path)
+    try:
+        loaded = await second.identity_load_with_custody(did, provider)
+        assert await second.identity_resolve(did) == rotated_document
+        changed = await second.identity_add_agent_key(loaded)
+        assert changed._raw_handle.has_agent_key
+        agent_key = changed._raw_handle.get_agent_public_key()
+        changed_document = await second.identity_resolve(did)
+        assert changed_document != rotated_document
+        del loaded, changed
+    finally:
+        second.__exit__(None, None, None)
+
+    third = open_sqlite_scp(tmp_path)
+    try:
+        reloaded = await third.identity_load_with_custody(did, provider)
+        assert reloaded._raw_handle.has_agent_key
+        assert reloaded._raw_handle.get_agent_public_key() == agent_key
+        assert await third.identity_resolve(did) == changed_document
+    finally:
+        third.__exit__(None, None, None)
+
+
+@pytest.mark.asyncio
 async def test_in_memory_storage_refuses_a_callback_custody_create_and_load_with_storage_8000(
     in_memory_scp,  # type: ignore[no-untyped-def]
 ) -> None:

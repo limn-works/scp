@@ -83,7 +83,8 @@ impl KeyType {
     /// Code 1 named the
     /// retired X25519 type and is never reused. `FileKeyCustody` keeps its own
     /// §17.8 bytes.
-    pub(crate) const fn storage_code(self) -> u8 {
+    #[must_use]
+    pub const fn storage_code(self) -> u8 {
         match self {
             Self::Ed25519 => 0,
             Self::P256Signing => 2,
@@ -94,7 +95,8 @@ impl KeyType {
 
     /// The type whose [`storage_code`](Self::storage_code) is `code`; any
     /// other byte is `None`, never a default type.
-    pub(crate) const fn from_storage_code(code: u8) -> Option<Self> {
+    #[must_use]
+    pub const fn from_storage_code(code: u8) -> Option<Self> {
         match code {
             0 => Some(Self::Ed25519),
             2 => Some(Self::P256Signing),
