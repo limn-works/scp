@@ -28,7 +28,12 @@
 //! otherwise [`WakeOutcome::NoData`]. Each [`WakeFailure`] has a stable code
 //! ([`WakeFailure::code`]) and a flat view for the FFI ([`WakeFailureView`]).
 //!
-//! The FFI exports that call [`handle_wake`] belong to story PUSH-015.
+//! The FFI exports that call [`handle_wake`] are each bridge's
+//! `push_handle_wake` (story PUSH-015). Each bridge's push register and
+//! deregister exports return [`push_registration_unavailable`]
+//! (`SCP-TRANS-5104`) until story PUSH-037 gives them the device's P-256
+//! `#active` signing key. napi and Python name the platform with
+//! [`parse_push_platform`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -60,6 +65,44 @@ pub enum WakeOutcome {
     /// The actor accepted no application envelope, and a step or a context's
     /// pull failed; the reason says which.
     Failed(WakeFailure),
+}
+
+impl WakeOutcome {
+    /// The flat view an FFI bridge returns for this outcome.
+    #[must_use]
+    pub fn view(&self) -> WakeOutcomeView {
+        match self {
+            Self::NewData => WakeOutcomeView {
+                outcome: WAKE_OUTCOME_NEW_DATA,
+                failure: None,
+            },
+            Self::NoData => WakeOutcomeView {
+                outcome: WAKE_OUTCOME_NO_DATA,
+                failure: None,
+            },
+            Self::Failed(failure) => WakeOutcomeView {
+                outcome: WAKE_OUTCOME_FAILED,
+                failure: Some(failure.view()),
+            },
+        }
+    }
+}
+
+/// [`WakeOutcomeView::outcome`] of [`WakeOutcome::NewData`].
+pub const WAKE_OUTCOME_NEW_DATA: &str = "new_data";
+/// [`WakeOutcomeView::outcome`] of [`WakeOutcome::NoData`].
+pub const WAKE_OUTCOME_NO_DATA: &str = "no_data";
+/// [`WakeOutcomeView::outcome`] of [`WakeOutcome::Failed`].
+pub const WAKE_OUTCOME_FAILED: &str = "failed";
+
+/// A [`WakeOutcome`] flattened for the napi and Python bridges, which carry
+/// no Rust enum with payloads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WakeOutcomeView {
+    /// `new_data`, `no_data` or `failed`.
+    pub outcome: &'static str,
+    /// The failure for `failed`; `None` for the other two outcomes.
+    pub failure: Option<WakeFailureView>,
 }
 
 /// Why a wake returned [`WakeOutcome::Failed`]. Each variant is one cause
@@ -218,6 +261,92 @@ impl WakeError {
         match self {
             Self::WakePayloadInvalid { .. } => error_codes::TRANS_5080,
         }
+    }
+}
+
+/// Why a push register, deregister or provider-backed wake export refused
+/// to run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum PushRegistrationError {
+    /// The device has no P-256 `#active` signing key to sign a
+    /// `PushRegistration` or `PushDeregistration` with (§10.7.1 step 3).
+    #[error("push registration is unavailable: the device has no P-256 #active signing key")]
+    SigningKeyUnavailable,
+    /// The instance holds no enabled `PushProvider`, so a `UniFFI` wake has
+    /// no provider to hand the payload to.
+    #[error("push is not enabled on this instance")]
+    NotEnabled,
+}
+
+impl PushRegistrationError {
+    /// The bridge error code: `SCP-TRANS-5104` or `SCP-TRANS-5105`.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::SigningKeyUnavailable => error_codes::TRANS_5104,
+            Self::NotEnabled => error_codes::TRANS_5105,
+        }
+    }
+}
+
+/// The error every push register and deregister export returns until the
+/// device has a P-256 `#active` signing key to sign with.
+#[must_use]
+pub const fn push_registration_unavailable() -> PushRegistrationError {
+    // Stub — see PUSH-037
+    PushRegistrationError::SigningKeyUnavailable
+}
+
+/// A push argument a napi or Python caller passed that the export refuses
+/// before any other step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum PushInputError {
+    /// The platform name is not `apns`, `fcm` or `web_push`. The message
+    /// does not echo the caller's string.
+    #[error("unknown push platform: expected `apns`, `fcm` or `web_push`")]
+    UnknownPlatform,
+    /// The push token is empty.
+    #[error("the push token is empty")]
+    EmptyToken,
+}
+
+impl PushInputError {
+    /// The bridge error code: `SCP-VALID-7005` for an unknown platform name,
+    /// `SCP-VALID-7004` for an empty token.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::UnknownPlatform => error_codes::VALID_7005,
+            Self::EmptyToken => error_codes::VALID_7004,
+        }
+    }
+}
+
+/// The platform a napi or Python caller names: `apns`, `fcm` or `web_push`,
+/// matched exactly.
+///
+/// # Errors
+///
+/// [`PushInputError::UnknownPlatform`] for any other string.
+pub fn parse_push_platform(name: &str) -> Result<PushPlatform, PushInputError> {
+    match name {
+        "apns" => Ok(PushPlatform::Apns),
+        "fcm" => Ok(PushPlatform::Fcm),
+        "web_push" => Ok(PushPlatform::WebPush),
+        _ => Err(PushInputError::UnknownPlatform),
+    }
+}
+
+/// Refuses an empty push token.
+///
+/// # Errors
+///
+/// [`PushInputError::EmptyToken`] when `token` is empty.
+pub const fn check_push_token(token: &[u8]) -> Result<(), PushInputError> {
+    if token.is_empty() {
+        Err(PushInputError::EmptyToken)
+    } else {
+        Ok(())
     }
 }
 
@@ -426,6 +555,67 @@ mod tests {
             "{platform:?} must reject {}",
             String::from_utf8_lossy(payload)
         );
+    }
+
+    #[test]
+    fn parse_push_platform_accepts_exactly_the_three_names() {
+        assert_eq!(parse_push_platform("apns"), Ok(PushPlatform::Apns));
+        assert_eq!(parse_push_platform("fcm"), Ok(PushPlatform::Fcm));
+        assert_eq!(parse_push_platform("web_push"), Ok(PushPlatform::WebPush));
+        for name in [
+            "", "APNS", "Apns", "webpush", "web-push", "WebPush", " fcm", "gcm",
+        ] {
+            let err = parse_push_platform(name).unwrap_err();
+            assert_eq!(err, PushInputError::UnknownPlatform, "{name:?}");
+            assert_eq!(err.code(), error_codes::VALID_7005);
+        }
+    }
+
+    #[test]
+    fn check_push_token_refuses_only_an_empty_token() {
+        assert_eq!(check_push_token(b"t"), Ok(()));
+        let err = check_push_token(b"").unwrap_err();
+        assert_eq!(err, PushInputError::EmptyToken);
+        assert_eq!(err.code(), error_codes::VALID_7004);
+    }
+
+    #[test]
+    fn push_registration_errors_carry_their_own_codes() {
+        assert_eq!(
+            push_registration_unavailable(),
+            PushRegistrationError::SigningKeyUnavailable
+        );
+        assert_eq!(
+            PushRegistrationError::SigningKeyUnavailable.code(),
+            error_codes::TRANS_5104
+        );
+        assert_eq!(
+            PushRegistrationError::NotEnabled.code(),
+            error_codes::TRANS_5105
+        );
+    }
+
+    #[test]
+    fn wake_outcome_view_names_each_outcome() {
+        assert_eq!(
+            WakeOutcome::NewData.view(),
+            WakeOutcomeView {
+                outcome: "new_data",
+                failure: None
+            }
+        );
+        assert_eq!(
+            WakeOutcome::NoData.view(),
+            WakeOutcomeView {
+                outcome: "no_data",
+                failure: None
+            }
+        );
+        let failed = WakeOutcome::Failed(WakeFailure::NoSupervisor).view();
+        assert_eq!(failed.outcome, "failed");
+        let failure = failed.failure.unwrap();
+        assert_eq!(failure.code, error_codes::TRANS_5086);
+        assert_eq!(failure, WakeFailure::NoSupervisor.view());
     }
 
     #[test]

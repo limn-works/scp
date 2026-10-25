@@ -954,6 +954,16 @@ pub const TRANS_5102: &str = "SCP-TRANS-5102";
 /// No tier was classified for the context and `needs_reconnect` stays set;
 /// the other contexts reconnect (`reconnect::ContextReconnectResult::failure_code`).
 pub const TRANS_5103: &str = "SCP-TRANS-5103";
+/// Push registration unavailable: the device has no P-256 `#active` key.
+///
+/// A push register or deregister export returned before it touched the
+/// provider or the token (`push::PushRegistrationError::SigningKeyUnavailable`).
+pub const TRANS_5104: &str = "SCP-TRANS-5104";
+/// Push not enabled: the instance holds no enabled `PushProvider`.
+///
+/// Returned by the `UniFFI` `push_handle_wake`
+/// (`push::PushRegistrationError::NotEnabled`).
+pub const TRANS_5105: &str = "SCP-TRANS-5105";
 
 // -------------------------------------------------------------------------
 // Outlet (SCP-OUTLET- 6000--6999)
