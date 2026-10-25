@@ -21,8 +21,9 @@ use super::fixtures::{
 };
 use super::{Branch, ChainPairing, Error, Keys, Kind, chain_of, pair_chains, v41_digest};
 use crate::{
-    Classification, InconclusiveCause, OperatorProof, ResolutionInput, ResolutionVerdict,
-    ResolvedState, SequenceRange, SourceExhaustion, SourceRead, classify, replay,
+    Classification, ClassifyError, InconclusiveCause, OperatorProof, ResolutionInput,
+    ResolutionVerdict, ResolvedState, SequenceRange, SourceExhaustion, SourceRead, classify,
+    replay,
 };
 
 /// The resolution instant every test reads.
@@ -464,24 +465,49 @@ fn unexhausted_complete_chain_is_inconclusive() -> TestResult {
     Ok(())
 }
 
-/// R9's early stop: two rank-1 suffixes from a source stopped at the fetch
-/// bound are `Contested{Rank1Terminal}`, retained against their shared
-/// prefix, with no exhausted source.
+/// R9's early stop at a first contact: R11's floor binds first, so a stopped
+/// source alone, or beside one exhausted source, reaches no verdict past the
+/// floor; with two proven exhausted sources serving the shared prefix, the
+/// two rank-1 suffixes the stopped source served are
+/// `Contested{Rank1Terminal}`, retained against that prefix.
 ///
-/// Mutant (run, then restored): `early_stop` returns `None`, so the read is
-/// `MissingEvents`.
+/// Mutants (each run, then restored): `early_stop` returns `None`, so the
+/// read is `MissingEvents`; the floor runs only past the early stop, so the
+/// one-exhausted-source read is `Contested`.
 #[test]
 fn unexhausted_two_rank_one_suffixes_contest() -> TestResult {
     let mut keys = Keys::new()?;
+    let v41 = Branch::v41()?;
     let a = Branch::of(&mut keys, &[Kind::Reveal], 1)?;
     let b = Branch::of(&mut keys, &[Kind::CoSigns], 2)?;
-    let read = source(
-        "a",
+    let stopped = source(
+        "s",
         &[&a, &b],
         SourceExhaustion::StoppedAtFetchBound,
-        operator(1),
+        operator(3),
     );
-    let result = run(None, &[read])?;
+    let alone = run(None, std::slice::from_ref(&stopped))?;
+    assert!(matches!(
+        alone.verdict,
+        ResolutionVerdict::Inconclusive {
+            cause: InconclusiveCause::MissingEvents { .. }
+        }
+    ));
+    let one = run(None, &[exhausted("a", &[&v41], 1), stopped.clone()])?;
+    assert_eq!(
+        one.verdict,
+        ResolutionVerdict::Inconclusive {
+            cause: InconclusiveCause::SingleSource {
+                reached_sources: 2,
+                proven_sources: 2,
+                clock_skew_rejected: 0,
+            }
+        }
+    );
+    assert!(one.retention.is_none());
+    let mut reads = two_sources(&[&v41]);
+    reads.push(stopped);
+    let result = run(None, &reads)?;
     assert_eq!(
         result.verdict,
         ResolutionVerdict::Contested {
@@ -493,10 +519,7 @@ fn unexhausted_two_rank_one_suffixes_contest() -> TestResult {
         }
     );
     let set = retention(&result)?;
-    assert_eq!(
-        set.basis(),
-        &RetentionBasis::ContestedPrefix(Branch::v41()?.chain)
-    );
+    assert_eq!(set.basis(), &RetentionBasis::ContestedPrefix(v41.chain));
     assert_eq!(suffix_heads(set), sorted(vec![a.head(), b.head()]));
     Ok(())
 }
@@ -546,23 +569,24 @@ fn early_stop_refused_past_lost_prefix() -> TestResult {
 /// R9's early stop ranks every chain the verifier holds: a stopped source
 /// serving one rank-1 suffix ties a rank-1 suffix the set already retains.
 ///
-/// Mutant (run, then restored): `early_stop` ranks only the served chains,
-/// so the served suffix wins alone and the read is `MissingEvents`.
+/// Mutant (run, then restored): the ranking input leaves out the held
+/// chains, so the served suffix wins alone and the read is `MissingEvents`.
 #[test]
 fn early_stop_reads_retained() -> TestResult {
     let mut keys = Keys::new()?;
     let v41 = Branch::v41()?;
     let a = Branch::of(&mut keys, &[Kind::Reveal], 1)?;
     let b = Branch::of(&mut keys, &[Kind::Reveal], 2)?;
-    let mut held = RetentionSet::new(RetentionBasis::ContestedPrefix(v41.chain));
+    let mut held = RetentionSet::new(RetentionBasis::ContestedPrefix(v41.chain.clone()));
     let _ = held.admit(a.chain.clone())?;
-    let read = source(
-        "a",
+    let mut reads = two_sources(&[&v41]);
+    reads.push(source(
+        "s",
         &[&b],
         SourceExhaustion::StoppedAtFetchBound,
-        operator(1),
-    );
-    let result = run(Some(&held), &[read])?;
+        operator(3),
+    ));
+    let result = run(Some(&held), &reads)?;
     assert_eq!(
         result.verdict,
         ResolutionVerdict::Contested {
@@ -586,8 +610,9 @@ fn early_stop_reads_retained() -> TestResult {
 /// that recovery fill the count bound, so a `{CoSigns}` recovery at Vector
 /// 41 has no room as a suffix; it beats every held chain and is adopted.
 ///
-/// Mutant (run, then restored): the winner is ranked over the held chains
-/// alone, where the eight rollovers beat the accepted chain and tie.
+/// Mutants (each run, then restored): the winner is ranked over the held
+/// chains alone, where the eight rollovers beat the accepted chain and tie;
+/// the residue counts the head the move evicted.
 #[test]
 fn refused_winner_still_adopted() -> TestResult {
     let mut keys = Keys::new()?;
@@ -620,11 +645,17 @@ fn refused_winner_still_adopted() -> TestResult {
         }
     );
     let set = retention(&result)?;
-    assert_eq!(set.basis(), &RetentionBasis::Accepted(o.chain));
+    assert_eq!(set.basis(), &RetentionBasis::Accepted(o.chain.clone()));
     // The replaced chain and the eight rollovers now fork at Vector 41 at
-    // rank 2: nine candidates for eight places.
+    // rank 2: nine held chains for eight places, so the move evicts one,
+    // which R9's residue does not count: it was retained before.
     assert_eq!(set.suffixes().len(), 8);
-    assert_eq!(result.residue, 1);
+    assert_eq!(result.residue, 0);
+    // The set is the move's alone: the evicted chain is not re-admitted at
+    // a new moment to evict another held chain in its place.
+    let mut moved = held.clone();
+    let _ = moved.rerank(RetentionBasis::Accepted(o.chain))?;
+    assert_eq!(*set, moved);
     Ok(())
 }
 
@@ -694,13 +725,15 @@ fn restored_contest_adopts_a_suffix_beating_all() -> TestResult {
     Ok(())
 }
 
-/// R7 where the verifier holds an accepted chain A and two rank-1 chains
-/// extending A tie: the verdict is `Contested`, the basis moves to the
-/// shared prefix, which extends A, and both tied chains are retained past
-/// it; the set survives a persist and restore.
+/// R9 where the verifier holds an accepted chain A and two rank-1 chains
+/// extending A tie: the verdict is `Contested`, A stays the accepted basis
+/// ("A verifier never evicts the accepted chain") with the shared prefix,
+/// A itself, recorded beside it, and both tied chains are retained as
+/// suffixes past A's head at the tie's rank; the set survives a persist and
+/// a restore against A.
 ///
-/// Mutant (run, then restored): `contested` moves the set through `rerank`,
-/// which refuses a contested prefix after an accepted chain.
+/// Mutant (run, then restored): `after_contest` moves an accepted basis to
+/// the shared prefix, so the basis is a contested prefix.
 #[test]
 fn baselined_contest_on_ties_extending_the_accepted_chain() -> TestResult {
     let mut keys = Keys::new()?;
@@ -720,8 +753,10 @@ fn baselined_contest_on_ties_extending_the_accepted_chain() -> TestResult {
             residue: 0,
         }
     );
+    assert!(result.key_state.is_none());
     let set = retention(&result)?;
-    assert_eq!(set.basis(), &RetentionBasis::ContestedPrefix(a.chain));
+    assert_eq!(set.basis(), &RetentionBasis::Accepted(a.chain.clone()));
+    assert_eq!(set.tie_prefix(), Some(&a.chain));
     assert_eq!(suffix_heads(set), sorted(vec![t1.head(), t2.head()]));
     assert!(
         set.suffixes()
@@ -732,13 +767,14 @@ fn baselined_contest_on_ties_extending_the_accepted_chain() -> TestResult {
     Ok(())
 }
 
-/// R7 where both tied rank-1 chains beat the accepted chain A at Vector 41:
-/// the verdict is `Contested`, the basis moves to Vector 41, A's tail
-/// becomes a retained rank-3 suffix beside both tied chains, and the set
-/// survives a persist and restore.
+/// R9 where both tied rank-1 chains beat the accepted chain A at Vector 41:
+/// the verdict is `Contested`, A stays the accepted basis with Vector 41
+/// recorded as the tie prefix, both tied chains are retained against A, and
+/// `restore` against A accepts the set: a tie displaces no accepted chain,
+/// only a suffix winning outright does.
 ///
-/// Mutant (run, then restored): `contested` builds a fresh set against the
-/// prefix instead of moving the held one, so A is not retained.
+/// Mutants (each run, then restored): `after_contest` records no tie
+/// prefix; `restore` refuses an accepted basis a held-first tie displaces.
 #[test]
 fn baselined_contest_on_ties_beating_the_accepted_chain() -> TestResult {
     let mut keys = Keys::new()?;
@@ -757,21 +793,270 @@ fn baselined_contest_on_ties_beating_the_accepted_chain() -> TestResult {
         }
     );
     let set = retention(&result)?;
-    assert_eq!(
-        set.basis(),
-        &RetentionBasis::ContestedPrefix(Branch::v41()?.chain)
+    assert_eq!(set.basis(), &RetentionBasis::Accepted(a.chain.clone()));
+    assert_eq!(set.tie_prefix(), Some(&Branch::v41()?.chain));
+    assert_eq!(suffix_heads(set), sorted(vec![t1.head(), t2.head()]));
+    assert!(
+        set.suffixes()
+            .iter()
+            .all(|suffix| (suffix.rank(), suffix.fork_position()) == (ForkRank::Rank1, 1))
     );
+    let identifier = a.chain.identifier();
     assert_eq!(
-        suffix_heads(set),
-        sorted(vec![a.head(), t1.head(), t2.head()])
+        RetentionSet::restore(
+            &identifier,
+            &set.persisted(),
+            AdoptedBasis::Accepted { head: a.head() }
+        )?,
+        *set
     );
-    let tail = set
-        .suffixes()
-        .iter()
-        .find(|suffix| suffix.head() == a.head())
-        .ok_or("A retained")?;
-    assert_eq!((tail.rank(), tail.fork_position()), (ForkRank::Rank3, 1));
-    assert_eq!(round_trip(set)?, *set);
+    Ok(())
+}
+
+/// R9's downgrade guard: after a contest over the verifier's accepted chain
+/// A, eight `RootRecovery{Lost}` forks below the tie prefix, served one per
+/// resolution, never evict A and never make the prefix's state a served key
+/// state; every read stays `Contested` over the same tie, the forks only
+/// filling the room the tied chains leave.
+///
+/// Mutant (run, then restored): `after_contest` moves an accepted basis to
+/// the shared prefix, so the basis is a contested prefix.
+#[test]
+fn baselined_contest_survives_lost_forks_below_the_prefix() -> TestResult {
+    let mut keys = Keys::new()?;
+    let p = Branch::of(&mut keys, &[Kind::Reveal], 0)?;
+    let mut a = p.clone();
+    a.push(&mut keys, Kind::KeyState, 0)?;
+    let mut t1 = p.clone();
+    t1.push(&mut keys, Kind::Reveal, 1)?;
+    let mut t2 = p.clone();
+    t2.push(&mut keys, Kind::Reveal, 2)?;
+    let tie = ResolutionVerdict::Contested {
+        tie: TieClass::Rank1Terminal,
+        heads: sorted(vec![t1.head(), t2.head()]),
+        shared_prefix_head: p.head(),
+        fork_position: 2,
+        residue: 0,
+    };
+    let first = run(Some(&accepted(&a)), &[exhausted("a", &[&t1, &t2], 1)])?;
+    assert_eq!(first.verdict, tie);
+    let mut set = retention(&first)?.clone();
+    for owner in 3..=10 {
+        let fork = Branch::of(&mut keys, &[Kind::Lost], owner)?;
+        let result = run(Some(&set), &[exhausted("a", &[&fork], 1)])?;
+        assert!(
+            matches!(&result.verdict, ResolutionVerdict::Contested { heads, shared_prefix_head, .. }
+                if *heads == sorted(vec![t1.head(), t2.head()]) && *shared_prefix_head == p.head())
+        );
+        assert!(result.key_state.is_none());
+        set = retention(&result)?.clone();
+        assert_eq!(set.basis(), &RetentionBasis::Accepted(a.chain.clone()));
+        assert_eq!(set.tie_prefix(), Some(&p.chain));
+        assert_eq!(round_trip(&set)?, set);
+    }
+    assert_eq!(set.suffixes().len(), 8);
+    Ok(())
+}
+
+/// R9's fetch bound and R12: a verdict rests on chains the verifier read to
+/// the end. A thief T served by two exhausted sources and a controller K
+/// that beats T served only by a source stopped at the fetch bound is
+/// `MissingEvents`, never `Adopted{T}`, and the same holds where a rank-2
+/// tie's other head sits only on the stopped source.
+///
+/// Mutants (each run, then restored): the ranking input reads the exhausted
+/// sources alone, so T is adopted; a winner on no read-through chain is
+/// adopted; a tied head on no read-through chain is contested.
+#[test]
+fn winner_only_on_a_stopped_source_is_missing_events() -> TestResult {
+    let mut keys = Keys::new()?;
+    let thief = Branch::of(&mut keys, &[Kind::Lost], 1)?;
+    let controller = Branch::of(&mut keys, &[Kind::CoSigns], 2)?;
+    let rival = Branch::of(&mut keys, &[Kind::Lost], 3)?;
+    let missing = ResolutionVerdict::Inconclusive {
+        cause: InconclusiveCause::MissingEvents {
+            range: SequenceRange {
+                from: None,
+                to: None,
+            },
+            failed_sources: Vec::new(),
+        },
+    };
+    for other in [&controller, &rival] {
+        let mut reads = two_sources(&[&thief]);
+        reads.push(source(
+            "padded",
+            &[other],
+            SourceExhaustion::StoppedAtFetchBound,
+            operator(3),
+        ));
+        let result = run(None, &reads)?;
+        assert_eq!(result.verdict, missing);
+        assert!(result.retention.is_none());
+    }
+    Ok(())
+}
+
+/// R11: a source that served no valid chain counts toward the floor at no
+/// degree, and neither does a source stopped at the fetch bound, however
+/// its proof verified.
+///
+/// Mutants (each run, then restored): the floor counts a chainless
+/// exhausted source; the floor counts a stopped source.
+#[test]
+fn floor_counts_only_exhausted_sources_serving_a_chain() -> TestResult {
+    let mut keys = Keys::new()?;
+    let o = Branch::of(&mut keys, &[Kind::KeyState], 0)?;
+    let single = |reached| ResolutionVerdict::Inconclusive {
+        cause: InconclusiveCause::SingleSource {
+            reached_sources: reached,
+            proven_sources: 2,
+            clock_skew_rejected: 0,
+        },
+    };
+    let chainless = run(None, &[exhausted("a", &[&o], 1), exhausted("b", &[], 2)])?;
+    assert_eq!(chainless.verdict, single(2));
+    let stopped = run(
+        None,
+        &[
+            exhausted("a", &[&o], 1),
+            source(
+                "b",
+                &[&o],
+                SourceExhaustion::StoppedAtFetchBound,
+                operator(2),
+            ),
+        ],
+    )?;
+    assert_eq!(stopped.verdict, single(2));
+    Ok(())
+}
+
+/// R9's early stop needs a source stopped at the fetch bound: a source that
+/// failed after serving two rank-1 suffixes leaves the baselined verifier
+/// with no read-through chain, which is `MissingEvents`.
+///
+/// Mutant (run, then restored): `early_stop` drops the stopped-source
+/// guard, so the failed read is `Contested`.
+#[test]
+fn early_stop_needs_a_stopped_source() -> TestResult {
+    let mut keys = Keys::new()?;
+    let a = Branch::of(&mut keys, &[Kind::Reveal], 1)?;
+    let b = Branch::of(&mut keys, &[Kind::Reveal], 2)?;
+    let held = accepted(&Branch::v41()?);
+    let read = source("f", &[&a, &b], SourceExhaustion::Failed, operator(1));
+    let result = run(Some(&held), &[read])?;
+    assert_eq!(
+        result.verdict,
+        ResolutionVerdict::Inconclusive {
+            cause: InconclusiveCause::MissingEvents {
+                range: SequenceRange {
+                    from: None,
+                    to: None,
+                },
+                failed_sources: vec!["f".to_owned()],
+            },
+        }
+    );
+    assert_eq!(result.retention.as_ref(), Some(&held));
+    Ok(())
+}
+
+/// R9: a contested prefix is no accepted baseline, so R11's floor binds a
+/// verifier holding one: a single proven source serving a chain that beats
+/// every held chain is `SingleSource`, not `Adopted`.
+///
+/// Mutant (run, then restored): a contested-prefix basis reads as the
+/// baseline, so the floor is skipped and the chain is adopted.
+#[test]
+fn contested_prefix_is_no_baseline() -> TestResult {
+    let mut keys = Keys::new()?;
+    let a = Branch::of(&mut keys, &[Kind::KeyState], 1)?;
+    let b = Branch::of(&mut keys, &[Kind::KeyState], 2)?;
+    let contest = run(None, &two_sources(&[&a, &b]))?;
+    let held = retention(&contest)?;
+    let c = Branch::of(&mut keys, &[Kind::Reveal], 3)?;
+    let result = run(Some(held), &[exhausted("a", &[&c], 1)])?;
+    assert_eq!(
+        result.verdict,
+        ResolutionVerdict::Inconclusive {
+            cause: InconclusiveCause::SingleSource {
+                reached_sources: 1,
+                proven_sources: 1,
+                clock_skew_rejected: 0,
+            }
+        }
+    );
+    assert_eq!(result.retention.as_ref(), Some(held));
+    Ok(())
+}
+
+/// A held set of another identifier than the one resolved is refused with
+/// a typed error before any source is read.
+///
+/// Mutant (run, then restored): the identifier check is skipped.
+#[test]
+fn held_set_of_another_identifier_is_refused() -> TestResult {
+    let mut keys = Keys::new()?;
+    let other = chain_of(&super::v42()?)?;
+    let held = RetentionSet::new(RetentionBasis::Accepted(other.clone()));
+    let o = Branch::of(&mut keys, &[Kind::KeyState], 0)?;
+    let reads = two_sources(&[&o]);
+    let resolved = fixtures::identifier(V41_IDENTIFIER)?;
+    let result = classify(ResolutionInput {
+        identifier: resolved,
+        held: Some(&held),
+        reads: &reads,
+        now: now()?,
+    });
+    assert_eq!(
+        result.err(),
+        Some(ClassifyError::HeldOfAnotherIdentifier {
+            resolved,
+            held: other.identifier(),
+        })
+    );
+    Ok(())
+}
+
+/// R9's residue on a `Contested` verdict: nine rank-1 heads tie at a first
+/// contact, eight fill the count bound, and the ninth is refused; the
+/// verdict's residue and the classification's both report it.
+///
+/// Mutants (each run, then restored): `Contested.residue` reports zero;
+/// `Classification.residue` reports zero.
+#[test]
+fn contested_residue_reports_refused_heads() -> TestResult {
+    let mut keys = Keys::new()?;
+    let mut branches = Vec::new();
+    for owner in 1..=9 {
+        branches.push(Branch::of(&mut keys, &[Kind::Reveal], owner)?);
+    }
+    let refs: Vec<&Branch> = branches.iter().collect();
+    let result = run(None, &two_sources(&refs))?;
+    let ResolutionVerdict::Contested { residue, heads, .. } = &result.verdict else {
+        return Err("a contested verdict".into());
+    };
+    assert_eq!(heads.len(), 9);
+    assert_eq!((*residue, result.residue), (1, 1));
+    assert_eq!(retention(&result)?.suffixes().len(), 8);
+    Ok(())
+}
+
+/// R12's `Discarded` needs every exhausted chain to be a proper prefix of
+/// the accepted chain: one source serving the accepted chain itself and a
+/// later one serving its prefix is `Confirmed`.
+///
+/// Mutant (run, then restored): the staleness fold keeps only the last
+/// chain's answer, so the read is `Discarded`.
+#[test]
+fn one_current_source_beside_a_stale_one_confirms() -> TestResult {
+    let mut keys = Keys::new()?;
+    let v41 = Branch::v41()?;
+    let o = Branch::of(&mut keys, &[Kind::KeyState, Kind::KeyState], 0)?;
+    let reads = vec![exhausted("a", &[&o], 1), exhausted("b", &[&v41], 2)];
+    let result = run(Some(&accepted(&o)), &reads)?;
+    assert_eq!(result.verdict, ResolutionVerdict::Confirmed);
     Ok(())
 }
 
@@ -889,10 +1174,10 @@ fn worked_example_4_spent_key_backup_reaches_root_thief() -> TestResult {
     let held = accepted(&controller);
     let baselined = run(Some(&held), &reads)?;
     assert_eq!(baselined.verdict, expected);
-    assert_eq!(
-        suffix_heads(retention(&baselined)?),
-        sorted(vec![controller.head(), thief.head()])
-    );
+    let set = retention(&baselined)?;
+    assert_eq!(set.basis(), &RetentionBasis::Accepted(controller.chain));
+    assert_eq!(set.tie_prefix(), Some(&Branch::v41()?.chain));
+    assert_eq!(suffix_heads(set), vec![thief.head()]);
     Ok(())
 }
 

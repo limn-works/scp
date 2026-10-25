@@ -18,8 +18,8 @@ use std::sync::Arc;
 use scp_did::Identifier;
 
 use super::{
-    ChainPairing, Decision, ForkRank, NoResolution, ResolveError, Tournament, UnrelatedChains,
-    pair_chains, rank_past,
+    ChainPairing, Decision, ForkRank, NoResolution, ResolveError, SetResolution, Tournament,
+    UnrelatedChains, pair_chains, rank_past, resolve_set,
 };
 use crate::constants::{MAX_RETAINED_BYTES, MAX_RETAINED_SUFFIXES};
 use crate::validate::ValidatedChain;
@@ -36,8 +36,10 @@ use crate::{Discarded, EntryVerdict, InceptionDefect, validate_entry};
 ///
 /// The two differ in one case: a chain that extends the basis. Extending the
 /// accepted chain makes it "that chain or suffix, extended", which the caller
-/// adopts and never retains; extending the shared prefix makes it a
-/// divergent suffix past that prefix, which is what each tied head is.
+/// adopts and never retains, unless a `Contested` verdict over the accepted
+/// chain recorded its shared prefix ([`RetentionSet::tie_prefix`]);
+/// extending the shared prefix makes it a divergent suffix past that prefix,
+/// which is what each tied head is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RetentionBasis {
     /// The accepted chain.
@@ -155,7 +157,8 @@ pub enum RetentionError {
     /// The candidate is of another identifier than the basis.
     #[error(transparent)]
     Unrelated(#[from] UnrelatedChains),
-    /// The candidate extends the accepted chain, so it is the accepted chain
+    /// The candidate extends the accepted chain and no `Contested` verdict
+    /// recorded a shared prefix beside it, so it is the accepted chain
     /// extended, which the caller adopts and never retains (R9).
     #[error("the chain extends the accepted chain at {head:02x?}, which is adopted, not retained")]
     ExtendsAccepted {
@@ -167,9 +170,10 @@ pub enum RetentionError {
     #[error("the retention set's moment counter is exhausted")]
     ObservedExhausted,
     /// A contested prefix was offered as the basis of a set whose basis is
-    /// the accepted chain. Only a `Contested` verdict moves an accepted
-    /// basis to the shared prefix it names (R7), and the verdict classifier
-    /// makes that move itself, so a move a caller chooses is refused.
+    /// the accepted chain. R9 makes a shared prefix the basis only "Where a
+    /// first-contact resolution returns `Contested`", and "A verifier never
+    /// evicts the accepted chain": a `Contested` verdict over an accepted
+    /// chain keeps it and records the prefix beside it.
     #[error("a contested prefix cannot replace the accepted chain at {accepted:02x?}")]
     ContestedAfterAccepted {
         /// The accepted chain's head digest.
@@ -222,6 +226,9 @@ pub struct PersistedBasis {
     pub head: [u8; 32],
     /// The moment the party first held the basis.
     pub observed: u64,
+    /// The head digest of the shared prefix a `Contested` verdict over an
+    /// accepted basis recorded ([`RetentionSet::tie_prefix`]).
+    pub tie_prefix: Option<[u8; 32]>,
 }
 
 /// One persisted retained suffix.
@@ -239,14 +246,16 @@ pub struct PersistedSuffix {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AdoptedBasis {
     /// The accepted chain, by the head digest the verifier's last
-    /// `Confirmed` or `Adopted` verdict accepted.
+    /// `Confirmed` or `Adopted` verdict accepted; a later `Contested` verdict
+    /// keeps it (R9: "A verifier never evicts the accepted chain").
     Accepted {
         /// The accepted head's digest.
         head: [u8; 32],
     },
     /// The shared prefix the verifier's last `Contested` verdict named, by
-    /// that verdict's `shared_prefix_head` (§9.7.4.2 R7, R9), at a first
-    /// contact or past an accepted baseline.
+    /// that verdict's `shared_prefix_head`, where the verifier held no
+    /// accepted chain (§9.7.4.2 R9: "Where a first-contact resolution
+    /// returns `Contested`").
     ContestedPrefix {
         /// The prefix's head digest.
         head: [u8; 32],
@@ -324,15 +333,23 @@ pub enum RestoreError {
         /// The persisted basis head.
         head: [u8; 32],
     },
-    /// A retained suffix beats the persisted accepted chain under R6, or
-    /// ties it and was held earlier, so R9 would not hold that chain as
-    /// accepted.
+    /// A retained suffix off the persisted accepted chain wins every R6
+    /// comparison over the chains the set holds, so the verdict that
+    /// persisted the set would have adopted it. A tie displaces nothing: R9
+    /// "never evicts the accepted chain".
     #[error("the retained suffix {by:02x?} displaces the persisted accepted chain {accepted:02x?}")]
     AcceptedDisplaced {
         /// The persisted accepted chain's head.
         accepted: [u8; 32],
         /// The head of the retained suffix R9 holds as accepted instead.
         by: [u8; 32],
+    },
+    /// A tie prefix was persisted beside a contested-prefix basis, which
+    /// records none: only an accepted basis carries one.
+    #[error("a tie prefix {head:02x?} was persisted beside a contested-prefix basis")]
+    TiePrefixWithoutAccepted {
+        /// The persisted tie prefix head.
+        head: [u8; 32],
     },
     /// R6's comparisons over the restored chains reached no outcome.
     #[error(transparent)]
@@ -353,6 +370,7 @@ pub enum RestoreError {
 pub struct RetentionSet {
     basis: RetentionBasis,
     basis_observed: u64,
+    tie_prefix: Option<ValidatedChain>,
     suffixes: Vec<RetainedSuffix>,
     next_observed: u64,
     bounds: Bounds,
@@ -371,6 +389,7 @@ impl RetentionSet {
         Self {
             basis,
             basis_observed: 0,
+            tie_prefix: None,
             suffixes: Vec::new(),
             next_observed: 1,
             bounds,
@@ -388,6 +407,23 @@ impl RetentionSet {
     #[must_use]
     pub const fn basis_observed(&self) -> u64 {
         self.basis_observed
+    }
+
+    /// The shared prefix a `Contested` verdict over the accepted basis
+    /// named, which R7 makes the verification basis while the accepted chain
+    /// stays the chain the eviction rank reads; `None` where the last verdict
+    /// over an accepted basis was no `Contested`, and always `None` beside a
+    /// contested-prefix basis.
+    ///
+    /// R9: "Where a resolution at a verifier holding an accepted chain
+    /// returns `Contested`, the accepted chain stays the chain the eviction
+    /// rank reads, and each chain the verifier retains that extends the
+    /// accepted chain, a tied chain included, is a divergent suffix past the
+    /// accepted head carrying the rank R6 gives it against the shared prefix
+    /// that `Contested` names".
+    #[must_use]
+    pub const fn tie_prefix(&self) -> Option<&ValidatedChain> {
+        self.tie_prefix.as_ref()
     }
 
     /// Every retained suffix.
@@ -457,11 +493,17 @@ impl RetentionSet {
             }
             ChainPairing::Diverged(divergence) => (divergence.ranks[0], divergence.fork_position),
             ChainPairing::RightPrefixOfLeft => match &self.basis {
-                RetentionBasis::Accepted(accepted) => {
-                    return Err(RetentionError::ExtendsAccepted {
-                        head: accepted.head_digest(),
-                    });
-                }
+                RetentionBasis::Accepted(accepted) => match &self.tie_prefix {
+                    Some(prefix) => (
+                        rank_against(&candidate, prefix)?,
+                        accepted.head_sequence().saturating_add(1),
+                    ),
+                    None => {
+                        return Err(RetentionError::ExtendsAccepted {
+                            head: accepted.head_digest(),
+                        });
+                    }
+                },
                 RetentionBasis::ContestedPrefix(prefix) => (
                     rank_past(&candidate, prefix.len()),
                     prefix.head_sequence().saturating_add(1),
@@ -558,7 +600,9 @@ impl RetentionSet {
     /// reads the basis, so moving the basis re-reads every rank and every
     /// fork-relative byte tally. A chain on the new basis leaves the set,
     /// and the new basis takes the earliest moment among them, or the next
-    /// moment where it is new.
+    /// moment where it is new. The move drops any
+    /// [`tie_prefix`](Self::tie_prefix), because a new basis follows a
+    /// verdict that resolved the tie.
     ///
     /// # Errors
     ///
@@ -574,31 +618,70 @@ impl RetentionSet {
                 accepted: accepted.head_digest(),
             });
         }
-        self.move_to(basis)
+        self.move_to(basis, None)
     }
 
-    /// Moves the set to `prefix`, the shared prefix a `Contested` verdict
-    /// names, whatever the basis was. R7: "For a contested identity a
-    /// verifier … uses the shared prefix's key state as the verification
-    /// basis"; R9: "The accepted chain … is the chain the verifier held
-    /// before it observed any divergence". An accepted chain inside `prefix`
-    /// leaves the set, and one diverging from it or running past it becomes
-    /// a retained suffix carrying its eviction rank against `prefix`.
+    /// The set after a `Contested` verdict naming `prefix` as the tie's
+    /// shared prefix. An accepted basis stays, and `prefix` is recorded
+    /// beside it as [`tie_prefix`](Self::tie_prefix); a contested-prefix
+    /// basis, which only a first contact holds, moves to `prefix`.
     ///
-    /// The verdict classifier is the one caller, so only a `Contested`
-    /// verdict moves an accepted basis to a contested prefix; any other move
-    /// goes through [`rerank`](Self::rerank), which refuses it.
+    /// R9: "A verifier never evicts the accepted chain", and the shared
+    /// prefix is the basis only "Where a first-contact resolution returns
+    /// `Contested`". Every retained suffix is re-placed at its moment, so a
+    /// suffix extending the accepted chain re-reads its rank against the new
+    /// prefix.
     ///
     /// # Errors
     ///
     /// The first [`RetentionError`] a re-admission reaches. The set is then
     /// unchanged.
-    pub(crate) fn contest(&mut self, prefix: ValidatedChain) -> Result<Rerank, RetentionError> {
-        self.move_to(RetentionBasis::ContestedPrefix(prefix))
+    pub(crate) fn after_contest(
+        &mut self,
+        prefix: ValidatedChain,
+    ) -> Result<Rerank, RetentionError> {
+        match &self.basis {
+            RetentionBasis::Accepted(accepted) => {
+                let basis = RetentionBasis::Accepted(accepted.clone());
+                self.move_to(basis, Some(prefix))
+            }
+            RetentionBasis::ContestedPrefix(_) => {
+                self.move_to(RetentionBasis::ContestedPrefix(prefix), None)
+            }
+        }
+    }
+
+    /// Drops the [`tie_prefix`](Self::tie_prefix) a `Contested` verdict
+    /// recorded, after a verdict that resolved the tie: every retained
+    /// suffix is re-placed against the basis alone.
+    ///
+    /// # Errors
+    ///
+    /// The first [`RetentionError`] a re-admission reaches, a retained
+    /// extension of the accepted chain's [`RetentionError::ExtendsAccepted`]
+    /// among them. The set is then unchanged.
+    pub(crate) fn clear_tie(&mut self) -> Result<Rerank, RetentionError> {
+        if self.tie_prefix.is_none() {
+            return Ok(Rerank::default());
+        }
+        self.move_to(self.basis.clone(), None)
     }
 
     /// [`rerank`](Self::rerank)'s move, past every check its caller runs.
-    fn move_to(&mut self, basis: RetentionBasis) -> Result<Rerank, RetentionError> {
+    /// The new basis and tie prefix take the held copy of every event the
+    /// set holds (R9's copy rule), as every placed suffix does.
+    fn move_to(
+        &mut self,
+        basis: RetentionBasis,
+        tie_prefix: Option<ValidatedChain>,
+    ) -> Result<Rerank, RetentionError> {
+        let basis = match basis {
+            RetentionBasis::Accepted(chain) => RetentionBasis::Accepted(self.held_copies(chain)),
+            RetentionBasis::ContestedPrefix(chain) => {
+                RetentionBasis::ContestedPrefix(self.held_copies(chain))
+            }
+        };
+        let tie_prefix = tie_prefix.map(|prefix| self.held_copies(prefix));
         let mut entries: Vec<(u64, ValidatedChain)> = self
             .suffixes
             .iter()
@@ -631,6 +714,7 @@ impl RetentionSet {
         let mut moved = Self {
             basis,
             basis_observed,
+            tie_prefix,
             suffixes: Vec::new(),
             next_observed,
             bounds: self.bounds,
@@ -662,8 +746,9 @@ impl RetentionSet {
         let mut units = Vec::new();
         let mut ordered: Vec<&RetainedSuffix> = self.suffixes.iter().collect();
         ordered.sort_by_key(|suffix| suffix.slot.observed);
-        for chain in
-            std::iter::once(self.basis.chain()).chain(ordered.iter().map(|suffix| &suffix.chain))
+        for chain in std::iter::once(self.basis.chain())
+            .chain(self.tie_prefix.as_ref())
+            .chain(ordered.iter().map(|suffix| &suffix.chain))
         {
             for (digest, unit) in chain.units() {
                 if seen.insert(digest) {
@@ -676,6 +761,7 @@ impl RetentionSet {
                 kind: self.basis.kind(),
                 head: self.basis.chain().head_digest(),
                 observed: self.basis_observed,
+                tie_prefix: self.tie_prefix.as_ref().map(ValidatedChain::head_digest),
             },
             units,
             suffixes: ordered
@@ -694,9 +780,11 @@ impl RetentionSet {
     /// units, and the basis and each suffix the prefix through its head of
     /// the chain holding that head. Every suffix is re-admitted in ascending
     /// moment order through [`admit`](Self::admit)'s one rule, so a persisted
-    /// set that rule would not have built is refused, and an accepted basis
-    /// must win R6 and R9's held-first rule over the retained suffixes. The
-    /// moment counter restarts past the largest persisted moment.
+    /// set that rule would not have built is refused, and no retained suffix
+    /// off an accepted basis may win every R6 comparison. A tie prefix is
+    /// restored before the suffixes, so an extension of the accepted chain
+    /// re-reads its rank against it. The moment counter restarts past the
+    /// largest persisted moment.
     ///
     /// # Errors
     ///
@@ -732,9 +820,14 @@ impl RetentionSet {
                 .ok_or(RestoreError::MissingHead { head })
         };
         let chain = find(saved.basis.head)?;
-        let basis = match saved.basis.kind {
-            BasisKind::Accepted => RetentionBasis::Accepted(chain),
-            BasisKind::ContestedPrefix => RetentionBasis::ContestedPrefix(chain),
+        let (basis, tie_prefix) = match (saved.basis.kind, saved.basis.tie_prefix) {
+            (BasisKind::Accepted, tie) => {
+                (RetentionBasis::Accepted(chain), tie.map(find).transpose()?)
+            }
+            (BasisKind::ContestedPrefix, None) => (RetentionBasis::ContestedPrefix(chain), None),
+            (BasisKind::ContestedPrefix, Some(head)) => {
+                return Err(RestoreError::TiePrefixWithoutAccepted { head });
+            }
         };
         let mut moments = BTreeSet::from([saved.basis.observed]);
         for suffix in &saved.suffixes {
@@ -751,6 +844,7 @@ impl RetentionSet {
         let mut set = Self {
             basis,
             basis_observed: saved.basis.observed,
+            tie_prefix,
             suffixes: Vec::new(),
             next_observed,
             bounds: Bounds::REGISTERED,
@@ -775,15 +869,35 @@ impl RetentionSet {
                 referenced,
             });
         }
-        if let (RetentionBasis::Accepted(accepted), Some(by)) =
-            (&set.basis, set.displacing_suffix()?)
+        if let (RetentionBasis::Accepted(accepted), Some(by)) = (&set.basis, set.winning_suffix()?)
         {
             return Err(RestoreError::AcceptedDisplaced {
                 accepted: accepted.head_digest(),
-                by: by.head(),
+                by,
             });
         }
         Ok(set)
+    }
+
+    /// The head of the R6 winner over the basis and the retained suffixes
+    /// where that winner is off the basis, or `None` where the basis is on
+    /// the winner or no chain wins: a suffix strictly beating every other
+    /// chain, which is the one chain that displaces an accepted basis (R9:
+    /// "A verifier never evicts the accepted chain").
+    fn winning_suffix(&self) -> Result<Option<[u8; 32]>, ResolveError> {
+        let chains: Vec<ValidatedChain> = std::iter::once(self.basis.chain())
+            .chain(self.suffixes.iter().map(RetainedSuffix::chain))
+            .cloned()
+            .collect();
+        let basis_head = self.basis.chain().head_digest();
+        Ok(match resolve_set(&chains)? {
+            SetResolution::Winner { head } => chains
+                .iter()
+                .find(|chain| chain.head_digest() == head)
+                .filter(|winner| !winner.events().any(|event| event.digest == basis_head))
+                .map(|_| head),
+            SetResolution::Tie { .. } | SetResolution::Empty => None,
+        })
     }
 
     /// R6 and R9's held-first rule over the basis and the retained
@@ -819,6 +933,20 @@ impl RetentionSet {
             .checked_sub(1)
             .and_then(|suffix| self.suffixes.get(suffix)))
     }
+}
+
+/// The R6 rank `candidate` carries against `prefix`, read against the
+/// commitment standing at their own fork: a candidate holding nothing past
+/// `prefix` reveals nothing past it, which is rank 3.
+fn rank_against(
+    candidate: &ValidatedChain,
+    prefix: &ValidatedChain,
+) -> Result<ForkRank, UnrelatedChains> {
+    Ok(match pair_chains(candidate, prefix)? {
+        ChainPairing::Diverged(divergence) => divergence.ranks[0],
+        ChainPairing::RightPrefixOfLeft => rank_past(candidate, prefix.len()),
+        ChainPairing::Identical | ChainPairing::LeftPrefixOfRight => ForkRank::Rank3,
+    })
 }
 
 /// Every valid chain `units` hold, failing closed on any discard.

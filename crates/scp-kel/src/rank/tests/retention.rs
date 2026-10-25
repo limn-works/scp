@@ -319,6 +319,41 @@ fn byte_different_copy_served_second_never_displaces_the_held_copy() -> TestResu
     Ok(())
 }
 
+/// R9's copy rule on a move: a new basis the set already holds events of
+/// carries the held copy, so a byte-different copy served under the
+/// adopted chain never reaches what the set persists.
+///
+/// Mutant (run, then restored): `move_to` takes the new basis as served.
+#[test]
+fn moved_basis_keeps_the_held_copy() -> TestResult {
+    let mut keys = Keys::new()?;
+    let basis = basis(&mut keys)?;
+    let (preimage, first, second) = assertion_copies(&keys)?;
+    let v41 = v41()?;
+    let fields = Wire::of(&preimage).fields();
+    let held = v41.then(&fields, first.clone(), v41.root.clone());
+    let copied = v41.then(&fields, second.clone(), v41.root.clone());
+    let mut later = v41_changed()?;
+    later.witnessing_interval = 7_400;
+    let next = key_state_on(&copied, later);
+    let next_unit = keys.sign(&copied, &next)?;
+    let extension = copied.then(&Wire::of(&next).fields(), next_unit, v41.root);
+
+    let mut set = registered(&basis);
+    retain(&mut set, &chain_of(&held)?)?;
+    let _ = set.rerank(RetentionBasis::Accepted(chain_of(&extension)?))?;
+    let shared = set
+        .basis()
+        .chain()
+        .events()
+        .nth(1)
+        .ok_or("the shared event")?;
+    assert_eq!(shared.unit, first.as_slice());
+    let units = set.persisted().units;
+    assert!(units.iter().all(|unit| **unit != *second));
+    Ok(())
+}
+
 /// R9: "A candidate the party can evict no suffix for is refused — a
 /// rank-3 candidate against rank-2 suffixes alone, for one".
 ///

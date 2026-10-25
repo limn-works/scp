@@ -190,8 +190,10 @@ pub struct Classification {
     /// every other verdict.
     pub key_state: Option<ResolvedState>,
     /// The set the verifier persists before it acts on the verdict, or
-    /// `None` where it holds none. Its basis is the basis the verdict names:
-    /// the accepted chain, or the shared prefix of a `Contested` verdict.
+    /// `None` where it holds none. Its basis is the verifier's baseline: the
+    /// accepted chain, which a `Contested` verdict keeps with the tie's
+    /// shared prefix recorded beside it, or, where the verifier holds no
+    /// accepted chain, the shared prefix of a first-contact `Contested`.
     pub retention: Option<RetentionSet>,
     /// The candidates this resolution could not retain under R9's bounds;
     /// `Contested.residue` equals it.
@@ -311,24 +313,32 @@ impl ResolvedState {
 /// 1. Each source's units go through [`validate_entry`]. An inception that
 ///    recomputes to the identifier and fails R2 or R3 is `Invalid` from any
 ///    source, because the identifier fixes that inception's preimage.
-/// 2. R9's early stop: where a source stopped at the fetch bound, R6 over
-///    every chain held (the basis, the retained suffixes and every chain any
-///    source served) ties at rank 1, and the strictest pair's shared prefix
-///    reveals only under root signatures, the verdict is
-///    `Contested{Rank1Terminal}` from the unexhausted read.
-/// 3. Otherwise a verdict rests on the exhausted sources alone; where none
-///    served a chain, `Inconclusive{MissingEvents}`.
-/// 4. With no accepted baseline, R11's floor: fewer than two distinct
-///    proven operator keys over the exhausted sources that served a chain
-///    is `Inconclusive{SingleSource}`.
-/// 5. R12's candidate head is the R6 winner over the basis, every retained
-///    suffix and every chain an exhausted source served, ranked before and
-///    independent of what R9 then retains: a chain R9 refuses still wins.
-///    A tie is `Contested`, and the set moves to the tie's shared prefix
-///    (R7) and retains every tied chain. A winner at the baseline head is
-///    `Confirmed`, or `Discarded` where every served chain is a proper
-///    prefix of the baseline; any other winner is `Adopted`, and the set
-///    moves to it. Every losing chain is retained.
+/// 2. With no accepted baseline, R11's floor binds first: where no exhausted
+///    source served a chain, `Inconclusive{MissingEvents}`, and where fewer
+///    than two distinct proven operator keys sit over the exhausted sources
+///    that served one, `Inconclusive{SingleSource}`. R11: "A source the
+///    verifier did not read to exhaustion counts toward the floor at no
+///    degree", and "Every degree below the floor is fail-closed".
+/// 3. One ranking input: every chain the set holds (the basis and each
+///    retained suffix) and every valid chain any source served, ranked
+///    under R6 before and independent of what R9 then retains.
+/// 4. R9's early stop: where a source stopped at the fetch bound, that
+///    ranking ties at rank 1, and the strictest pair's shared prefix reveals
+///    only under root signatures, the verdict is `Contested{Rank1Terminal}`.
+/// 5. Otherwise a verdict rests on what the verifier read to the end: where
+///    no exhausted source served a chain, or the winner or a tied head sits
+///    on no chain the set holds or an exhausted source served, the verdict
+///    is `Inconclusive{MissingEvents}`, because a source not read to its end
+///    may hold the events that answer it.
+/// 6. A tie is `Contested`. An accepted basis stays (R9: "A verifier never
+///    evicts the accepted chain") with the tie's shared prefix recorded
+///    beside it; at a first contact the shared prefix is the basis. A
+///    winner at the baseline head is `Confirmed`, or `Discarded` where every
+///    chain an exhausted source served is a proper prefix of the baseline;
+///    any other winner is `Adopted`, and the set moves to it.
+/// 7. Every verdict that changes the set admits through one routine: each
+///    ranked chain the set did not hold before this resolution, against the
+///    set's new basis, under R9's eviction rank and bounds.
 ///
 /// # Errors
 ///
@@ -359,41 +369,59 @@ pub fn classify(input: ResolutionInput<'_>) -> Result<Classification, ClassifyEr
             .chain(set.suffixes().iter().map(|suffix| suffix.chain().clone()))
             .collect()
     });
-    if let Some(contest) = early_stop(&served, &held_chains)? {
-        return contested(held, contest);
-    }
     let exhausted: Vec<ValidatedChain> = served.exhausted().cloned().collect();
-    if exhausted.is_empty() {
-        return Ok(unchanged(held, served.missing_events(held)));
-    }
     let baseline = held.and_then(|set| match set.basis() {
         RetentionBasis::Accepted(chain) => Some(chain),
         RetentionBasis::ContestedPrefix(_) => None,
     });
-    if baseline.is_none()
-        && let Some(cause) = served.below_floor()
-    {
-        return Ok(unchanged(held, ResolutionVerdict::Inconclusive { cause }));
+    if baseline.is_none() {
+        if exhausted.is_empty() {
+            return Ok(unchanged(held, served.missing_events(held)));
+        }
+        if let Some(cause) = served.below_floor() {
+            return Ok(unchanged(held, ResolutionVerdict::Inconclusive { cause }));
+        }
     }
-    let mut ranked = held_chains;
-    ranked.extend(exhausted.iter().cloned());
-    match resolve_set(&ranked)? {
+    let mut ranked = held_chains.clone();
+    ranked.extend(served.all().cloned());
+    let resolution = resolve_set(&ranked)?;
+    if let Some(contest) = early_stop(&served, &ranked, &resolution)? {
+        return contested(held, contest, &ranked);
+    }
+    if exhausted.is_empty() {
+        return Ok(unchanged(held, served.missing_events(held)));
+    }
+    let read_through = |head: &[u8; 32]| {
+        held_chains
+            .iter()
+            .chain(&exhausted)
+            .any(|chain| chain.events().any(|event| event.digest == *head))
+    };
+    match resolution {
         SetResolution::Tie {
             class,
             heads,
             shared_prefix_head,
             fork_position,
-        } => contested(
-            held,
-            Contest {
-                class,
-                heads,
-                shared_prefix_head,
-                fork_position,
-                chains: ranked,
-            },
-        ),
+        } => {
+            if !heads.iter().all(read_through) {
+                return Ok(unchanged(held, served.missing_events(held)));
+            }
+            contested(
+                held,
+                Contest {
+                    class,
+                    heads,
+                    shared_prefix_head,
+                    fork_position,
+                },
+                &ranked,
+            )
+        }
         SetResolution::Winner { head } => {
+            if !read_through(&head) {
+                return Ok(unchanged(held, served.missing_events(held)));
+            }
             let winner = ranked
                 .iter()
                 .find(|chain| chain.head_digest() == head)
@@ -437,6 +465,11 @@ impl<'r> Served<'r> {
         self.reads.iter().zip(self.chains.iter().map(Vec::as_slice))
     }
 
+    /// Every chain any source served, however far it was read.
+    fn all(&self) -> impl Iterator<Item = &ValidatedChain> + '_ {
+        self.chains.iter().flatten()
+    }
+
     /// Every chain an exhausted source served.
     fn exhausted(&self) -> impl Iterator<Item = &ValidatedChain> + '_ {
         self.sources()
@@ -444,11 +477,18 @@ impl<'r> Served<'r> {
             .flat_map(|(_, chains)| chains)
     }
 
-    /// R9's `MissingEvents` where no exhausted source served a chain: `from`
-    /// absent where an unexhausted source assembled a chain, which runs
-    /// from the inception without a gap, and otherwise the first sequence
-    /// past the basis the verifier holds (zero where it holds none); `to`
-    /// absent, because no source the verifier read to its end fixed a head.
+    /// Whether the verifier stopped itself at R9's fetch bound on a source.
+    fn stopped(&self) -> bool {
+        self.reads
+            .iter()
+            .any(|read| read.exhaustion == SourceExhaustion::StoppedAtFetchBound)
+    }
+
+    /// R9's `MissingEvents`: `from` absent where a source assembled a chain,
+    /// which runs from the inception without a gap, and otherwise the first
+    /// sequence past the basis the verifier holds (zero where it holds
+    /// none); `to` absent, because no source the verifier read to its end
+    /// fixed the head the verdict needs.
     fn missing_events(&self, held: Option<&RetentionSet>) -> ResolutionVerdict {
         let assembled = self.chains.iter().any(|chains| !chains.is_empty());
         let from = (!assembled).then(|| {
@@ -527,13 +567,12 @@ fn unchanged(held: Option<&RetentionSet>, verdict: ResolutionVerdict) -> Classif
     }
 }
 
-/// R6's tie over `chains` and R7's class of it.
+/// R6's tie and R7's class of it.
 struct Contest {
     class: TieClass,
     heads: Vec<[u8; 32]>,
     shared_prefix_head: [u8; 32],
     fork_position: u64,
-    chains: Vec<ValidatedChain>,
 }
 
 /// R9: "One verdict is allowed from an unexhausted source: a resolver
@@ -544,29 +583,25 @@ struct Contest {
 /// shared prefix past the inception carries a root signature verifying
 /// against the root standing at its predecessor."
 ///
-/// The pair read is R6's strictest tied pair, which `Contested` names: the
-/// tie's class must be `Rank1Terminal`, and its shared prefix must pass the
-/// root-signature condition.
+/// `resolution` is R6 over the one ranking input, `ranked`. The pair read is
+/// R6's strictest tied pair, which `Contested` names: the tie's class must
+/// be `Rank1Terminal`, and its shared prefix must pass the root-signature
+/// condition.
 fn early_stop(
     served: &Served<'_>,
-    held_chains: &[ValidatedChain],
+    ranked: &[ValidatedChain],
+    resolution: &SetResolution,
 ) -> Result<Option<Contest>, ClassifyError> {
-    let stopped = served
-        .reads
-        .iter()
-        .any(|read| read.exhaustion == SourceExhaustion::StoppedAtFetchBound);
-    if !stopped {
+    if !served.stopped() {
         return Ok(None);
     }
-    let mut chains = held_chains.to_vec();
-    chains.extend(served.chains.iter().flatten().cloned());
-    let (heads, shared_prefix_head, fork_position) = match resolve_set(&chains)? {
+    let (heads, shared_prefix_head, fork_position) = match resolution {
         SetResolution::Tie {
             class: TieClass::Rank1Terminal,
             heads,
             shared_prefix_head,
             fork_position,
-        } => (heads, shared_prefix_head, fork_position),
+        } => (heads, *shared_prefix_head, *fork_position),
         SetResolution::Tie {
             class: TieClass::Rank2Terminal | TieClass::Rank3Pending,
             ..
@@ -574,16 +609,15 @@ fn early_stop(
         | SetResolution::Winner { .. }
         | SetResolution::Empty => return Ok(None),
     };
-    let prefix = prefix_of(&chains, shared_prefix_head, fork_position)?;
+    let prefix = prefix_of(ranked, shared_prefix_head, fork_position)?;
     if !prefix.reveals_root_cosigned_through(prefix.head_sequence()) {
         return Ok(None);
     }
     Ok(Some(Contest {
         class: TieClass::Rank1Terminal,
-        heads,
+        heads: heads.clone(),
         shared_prefix_head,
         fork_position,
-        chains,
     }))
 }
 
@@ -605,36 +639,27 @@ fn prefix_of(
 /// R7: "For a contested identity a verifier MUST return `Contested`, MUST
 /// NOT adopt any tied suffix as its key state, and MUST retain every tied
 /// head and suffix as evidence. It uses the shared prefix's key state as the
-/// verification basis". The set moves to the tie's shared prefix, the
-/// verifier's accepted chain included (R9: "The accepted chain … is the
-/// chain the verifier held before it observed any divergence"), and every
-/// tied chain is admitted against it.
+/// verification basis". R9: "A verifier never evicts the accepted chain":
+/// an accepted basis stays, with the shared prefix recorded beside it
+/// ([`RetentionSet::tie_prefix`]), and at a first contact the shared prefix
+/// is the basis. Every ranked chain the set did not hold is admitted.
 fn contested(
     held: Option<&RetentionSet>,
     contest: Contest,
+    ranked: &[ValidatedChain],
 ) -> Result<Classification, ClassifyError> {
-    let prefix = prefix_of(
-        &contest.chains,
-        contest.shared_prefix_head,
-        contest.fork_position,
-    )?;
-    let mut dropped = Dropped::default();
-    let mut set = match held {
+    let prefix = prefix_of(ranked, contest.shared_prefix_head, contest.fork_position)?;
+    let mut refused = Refused::default();
+    let set = match held {
         Some(held) => {
             let mut set = held.clone();
-            dropped.rerank(set.contest(prefix)?);
+            refused.rerank(set.after_contest(prefix)?);
             set
         }
         None => RetentionSet::new(RetentionBasis::ContestedPrefix(prefix)),
     };
-    for chain in contest
-        .chains
-        .into_iter()
-        .filter(|chain| contest.heads.contains(&chain.head_digest()))
-    {
-        dropped.admit(&mut set, chain)?;
-    }
-    let residue = dropped.residue(&set);
+    let set = admit_new(set, held, ranked, &mut refused)?;
+    let residue = refused.residue(&set);
     Ok(Classification {
         verdict: ResolutionVerdict::Contested {
             tie: contest.class,
@@ -649,52 +674,65 @@ fn contested(
     })
 }
 
-/// The heads of the chains R9's bounds refused or evicted while one
-/// resolution placed its candidates. A head counts once however often it was
-/// dropped, and not at all where the final set holds it.
+/// The heads of the chains R9's bounds refused while one resolution placed
+/// its candidates: R9's residue counts "a candidate the verifier could not
+/// retain", and a suffix evicted to make room was retained before. A head
+/// counts once however often it was refused, and not at all where the final
+/// set holds it.
 #[derive(Default)]
-struct Dropped(BTreeSet<[u8; 32]>);
+struct Refused(BTreeSet<[u8; 32]>);
 
-impl Dropped {
+impl Refused {
     fn rerank(&mut self, rerank: Rerank) {
         self.0.extend(rerank.refused);
-        self.0.extend(rerank.evicted);
     }
 
-    /// Admits `chain` into `set`, recording what R9 dropped.
-    fn admit(
-        &mut self,
-        set: &mut RetentionSet,
-        chain: ValidatedChain,
-    ) -> Result<(), ClassifyError> {
-        let head = chain.head_digest();
-        match set.admit(chain)? {
-            Admission::Refused { .. } => {
-                self.0.insert(head);
-            }
-            Admission::Retained { evicted, .. } | Admission::Extended { evicted, .. } => {
-                self.0.extend(evicted);
-            }
-            Admission::AlreadyHeld => {}
-        }
-        Ok(())
-    }
-
-    /// R9's residue: the dropped heads `set` does not hold.
+    /// R9's residue: the refused heads `set` does not hold.
     fn residue(&self, set: &RetentionSet) -> u32 {
-        let holds = |head: &[u8; 32]| {
-            std::iter::once(set.basis().chain())
-                .chain(set.suffixes().iter().map(RetainedSuffix::chain))
-                .any(|chain| chain.events().any(|event| event.digest == *head))
-        };
-        count(self.0.iter().filter(|head| !holds(head)).count())
+        count(self.0.iter().filter(|head| !holds(set, head)).count())
     }
+}
+
+/// Whether a chain `set` holds carries an event with digest `head`.
+fn holds(set: &RetentionSet, head: &[u8; 32]) -> bool {
+    std::iter::once(set.basis().chain())
+        .chain(set.suffixes().iter().map(RetainedSuffix::chain))
+        .any(|chain| chain.events().any(|event| event.digest == *head))
+}
+
+/// The one admission routine every verdict that changes the set runs: each
+/// chain of `ranked` whose head the pre-resolution set `before` did not
+/// hold is admitted against `set`'s basis, under R9's eviction rank and
+/// bounds, and each refusal is recorded. A chain `before` held is already
+/// placed at its moment by the move that built `set`, so none is admitted
+/// again with a new moment. R12: "the verifier retains each losing chain as
+/// a divergent suffix under R9".
+fn admit_new(
+    mut set: RetentionSet,
+    before: Option<&RetentionSet>,
+    ranked: &[ValidatedChain],
+    refused: &mut Refused,
+) -> Result<RetentionSet, ClassifyError> {
+    for chain in ranked {
+        let head = chain.head_digest();
+        if before.is_some_and(|before| holds(before, &head)) {
+            continue;
+        }
+        match set.admit(chain.clone())? {
+            Admission::Refused { .. } => {
+                refused.0.insert(head);
+            }
+            Admission::Retained { .. } | Admission::Extended { .. } | Admission::AlreadyHeld => {}
+        }
+    }
+    Ok(set)
 }
 
 /// R12 where the verifier holds `baseline` as its accepted chain: the
 /// winner at its head is `Confirmed`, or `Discarded` where every chain an
 /// exhausted source served is a proper prefix of it; any other winner is
-/// adopted.
+/// adopted. `Confirmed` resolves any tie a `Contested` verdict recorded, so
+/// the set drops that tie prefix.
 fn on_baseline(
     set: &RetentionSet,
     baseline: &ValidatedChain,
@@ -721,10 +759,11 @@ fn on_baseline(
             },
         ));
     }
+    let mut refused = Refused::default();
     let mut next = set.clone();
-    let mut dropped = Dropped::default();
-    retain_losers(&mut next, ranked, &mut dropped)?;
-    let residue = dropped.residue(&next);
+    refused.rerank(next.clear_tie()?);
+    let next = admit_new(next, Some(set), ranked, &mut refused)?;
+    let residue = refused.residue(&next);
     Ok(Classification {
         verdict: ResolutionVerdict::Confirmed,
         key_state: Some(ResolvedState::of(next.basis().chain(), now)),
@@ -733,10 +772,10 @@ fn on_baseline(
     })
 }
 
-/// R12's adoption of `winner`: the set moves to it, the replaced basis and
-/// every losing chain are re-admitted against it, and refusals count in the
-/// residue. Where `winner` extends `baseline`, the baseline's held copies
-/// stay (R9's copy rule).
+/// R12's adoption of `winner`: the set moves to it, which re-places the
+/// replaced basis and every retained suffix against it, and every ranked
+/// chain the set did not hold is admitted. Where `winner` extends
+/// `baseline`, the baseline's held copies stay (R9's copy rule).
 fn adopted(
     held: Option<&RetentionSet>,
     baseline: Option<&ValidatedChain>,
@@ -756,17 +795,17 @@ fn adopted(
         }
         Some(_) | None => winner,
     };
-    let mut dropped = Dropped::default();
-    let mut next = match held {
+    let mut refused = Refused::default();
+    let next = match held {
         Some(held) => {
             let mut next = held.clone();
-            dropped.rerank(next.rerank(RetentionBasis::Accepted(winner))?);
+            refused.rerank(next.rerank(RetentionBasis::Accepted(winner))?);
             next
         }
         None => RetentionSet::new(RetentionBasis::Accepted(winner)),
     };
-    retain_losers(&mut next, ranked, &mut dropped)?;
-    let residue = dropped.residue(&next);
+    let next = admit_new(next, held, ranked, &mut refused)?;
+    let residue = refused.residue(&next);
     Ok(Classification {
         verdict: ResolutionVerdict::Adopted {
             head: adopted_head,
@@ -776,17 +815,4 @@ fn adopted(
         retention: Some(next),
         residue,
     })
-}
-
-/// R12: "the verifier retains each losing chain as a divergent suffix under
-/// R9". Chains on the basis are already held.
-fn retain_losers(
-    set: &mut RetentionSet,
-    ranked: &[ValidatedChain],
-    dropped: &mut Dropped,
-) -> Result<(), ClassifyError> {
-    for chain in ranked {
-        dropped.admit(set, chain.clone())?;
-    }
-    Ok(())
 }
