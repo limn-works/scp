@@ -1682,6 +1682,44 @@ Where the SDK auto-generates the passphrase for an encrypted offline backup, it 
 
 Each copyable method yields key bytes, which the SDK emits only as the method's artifact and reconstructs only inside its next-set custody (§9.7.4.2 R10, *What the signing rule cannot reach*), so a copy can outlive the reveal that spent it. Where a copy of a spent pre-rotation key later reaches any party, that party forks below the event that spent the key and reveals the same commitment there, and the root rule of §9.7.4.2 R6 alone decides the outcome.
 
+**The sealing window.** A headless next-set custody emits a copyable artifact only through `seal_backup`, whose request names one of the three methods and, for the encrypted backup, either a generated passphrase or one the caller supplies. `seal_backup` accepts only a key the custody generated and has not yet sealed. It emits the artifact, wipes the private scalar from the custody's memory, and keeps the 33-byte public key. Before the seal the custody refuses `reveal_public_key` with `NextSetCustodyError::BackupNotSealed`, and refuses `sign_change` and `sign_probe` with `KeyEventSignError::NotRestored`. After the seal, and on a restored key, it refuses `seal_backup` with `NextSetCustodyError::BackupWindowClosed`. No reveal or signature can therefore come before the seal, and no seal can come after one. Every next-set custody that is not headless refuses both `seal_backup` and `restore` with `NextSetCustodyError::MethodNotOffered`.
+
+**Restore.** `restore` takes an artifact and the commitment the caller expects, reconstructs the scalar inside the custody, derives the 33-byte public key from it, recomputes `SHA-256("SCP-PREROTATION-COMMITMENT-V1:" ‖ public key)` (§9.7.4.2 definitions), and refuses with `NextSetCustodyError::CommitmentMismatch` where that value differs from the expected commitment. Every method runs that check. For the encrypted backup the associated data already binds the expected commitment, so an artifact sealed under another commitment fails its tag before the check runs, and `restore` refuses it as it refuses a wrong passphrase. `restore` returns a key handle and never the scalar. The custody wipes a restored scalar when the caller destroys the handle, when the custody itself is dropped, and, for a successor restored only to answer item 5(d)'s reachability probe, as soon as that probe's signature returns, which discharges item 5(f) for that successor.
+
+**Randomness.** The custody draws the scalar, the salt, the nonce, the Shamir polynomial coefficients and the generated passphrase's entropy from the operating system's CSPRNG, under item 1.
+
+**The encrypted offline backup** is `ENCRYPTED_BACKUP_BYTES` (§9.18.17), 77 bytes:
+
+```
+version     u8         0x01
+salt        [u8; 16]
+nonce       [u8; 12]
+ciphertext  [u8; 32]   the 32-byte big-endian scalar under AES-256-GCM
+tag         [u8; 16]
+```
+
+- The AES-256-GCM key is the Argon2id output over the passphrase and `salt`, under the one parameterization `17-persistence-and-storage.md` §17.8 states, parallelism 1 included.
+- The passphrase enters Argon2id as its UTF-8 bytes after Unicode NFKD normalization, so a passphrase typed in precomposed form and the same passphrase typed in decomposed form derive one key.
+- The associated data is `"SCP-NEXT-SET-BACKUP-V1:" ‖ 0x01 ‖ commitment`, where `commitment` is the key's 32-byte pre-rotation commitment, so an artifact opens only under the commitment it was sealed for.
+- `restore` refuses an artifact whose tag does not verify under the derived key and that associated data, which covers a wrong passphrase, a modified artifact, and an artifact sealed under another commitment.
+- The custody refuses an empty passphrase, because Argon2id over an empty passphrase yields a key that anyone who reads the salt can derive (`17-persistence-and-storage.md` §17.8).
+- A generated passphrase is the 12-word BIP39 English mnemonic of 16 bytes of entropy, with the words joined by single ASCII spaces, which carries the 128 bits of entropy this item requires of a generated passphrase.
+
+**The Shamir split** yields five shares, each `SHAMIR_SHARE_BYTES` (§9.18.17), 34 bytes:
+
+```
+version  u8         0x01
+x        u8         1 to 5
+y        [u8; 32]
+```
+
+- The split runs once for each byte of the 32-byte big-endian scalar, over GF(2^8) with the reduction polynomial 0x11B. For byte i it takes a degree-2 polynomial whose constant term is that byte and whose other two coefficients come from the CSPRNG, and the polynomial's value at a share's x is that share's `y[i]`.
+- Field multiplication is constant-time shift-and-add. No implementation indexes a table by a secret byte, because a lookup's cache timing reveals the index it read.
+- The only values the implementation inverts are the public x values, for the Lagrange coefficients at 0.
+- `combine` takes exactly three shares, and refuses fewer than three, more than three, two shares with one x, an x of 0 or above 5, and a version byte other than 0x01. Any three of the five shares reconstruct the scalar.
+
+**The paper backup** is 24 BIP39 English words that encode the 32-byte big-endian scalar directly, as BIP39 entropy with its 8-bit checksum. A decoder refuses a word count other than 24 and a checksum that does not match, and it refuses a scalar of 0 or a scalar at or above the P-256 group order n.
+
 **The four-cell outcome table.** The controller's own revealing event either carried the standing root's signature or it did not, and the copy holder either holds that root or does not.
 
 | The controller's revealing event | The copy holder holds the root | The copy holder holds no root |
@@ -2174,10 +2212,29 @@ The SDK MUST refuse, with `IdentityError::NoFallbackSourceReachable`, to compose
 
 **The store set.** The store set is keyed on the identity's pre-rotation credential and never on the running profile, and an SDK on any profile writes to and reads from every member it can reach. It has two possible synced members:
 
-- **the platform account's synced credential store**, wherever that account syncs the credential;
+- **the platform account's synced credential store**, wherever that account syncs the credential and the host gives the SDK a data API that writes into the store that syncs it, which the host table below decides;
 - **the pre-rotation credential's WebAuthn `largeBlob` store, only after a write lands at the credential's designation.** The authenticator's advertisement of the extension establishes no membership. **A `largeBlob` write that does not land removes that member alone from the set, and never removes the platform-account member.**
 
-**The platform account's synced credential store and the SDK's own store each hold a signed event under its digest, and a `largeBlob` store holds only the handle and the marker.** Where the credential syncs through neither, the set is the SDK's own local store and spans one device. **The page's origin storage is never a member**, because the browser partitions it per origin and `17-persistence-and-storage.md` §17.8 calls it ephemeral in a private window. The `largeBlob` store is the pre-rotation credential's and never the root credential's, because a reveal is what this rule gates and §9.7.4.1 item 3a separates the reveal-time authorizer from daily operations. Every origin whose effective domain is the credential's relying-party identifier, or a registrable-domain suffix of it, reaches that store.
+**The platform account's synced credential store and the SDK's own store each hold a signed event under its digest, and a `largeBlob` store holds only the handle and the marker.** Where neither synced member exists, the set is the SDK's own local store and spans one device.
+
+<!-- scp:fragment id="platform-account-member" -->
+**The platform-account member, per host.** The platform-account member exists only where the host gives the SDK a data API that writes into the store through which the platform account syncs the pre-rotation credential. Where the member does not exist, the SDK records one of two absence reasons: `NoDataApiToCredentialSyncStore`, where the credential syncs through a store that no data API of the host reaches, and `NoPlatformCredential`, where the host holds no platform credential.
+
+| Host | Platform-account member | Basis |
+|---|---|---|
+| Apple: the Swift SDK on the `Mobile` and `Desktop` profiles | Present where the credential syncs through iCloud Keychain: a synchronizable generic-password Keychain item (`kSecClassGenericPassword` with `kSecAttrSynchronizable` set to true) in the application's access group | iCloud Keychain is the store that syncs the passkey, and it encrypts what it syncs end to end. Apple's `kSecAttrSynchronizable` page (https://developer.apple.com/documentation/security/ksecattrsynchronizable) lists the sync caveats |
+| Android: the Kotlin SDK | Absent: `NoDataApiToCredentialSyncStore` | Passkeys sync through Google Password Manager (https://developer.android.com/identity/passkeys). Credential Manager's data surface is passkeys, passwords and federated credentials, and no data API writes an application's bytes into Google Password Manager. Block Store (https://developer.android.com/identity/block-store) is Google's application backup store and not the store that syncs the credential |
+| Browser | Absent: `NoDataApiToCredentialSyncStore` | No page API reaches the credential's sync store, and the page's origin storage is never a member |
+| Headless | Absent: `NoPlatformCredential` | The headless profile holds no platform credential |
+
+**The Apple member's capacity is proved by test, not by vendor documentation.** Apple's `kSecValueData` page (https://developer.apple.com/documentation/security/ksecvaluedata) and its `kSecAttrSynchronizable` page state no size limit for a Keychain item, so the claim that the member holds a signed event rests on two checks. A Swift SDK test writes a synchronizable item of 65,675 bytes, one byte more than `MAX_EVENT_BYTES`, `RECOVERY_HANDLE_BYTES` and `LAST_REVEAL_MARKER_BYTES` together (`09-security-model.md` §9.18.17), reads the item back, compares it byte for byte, and runs on iOS and on macOS in CI. CI cannot sign into iCloud, so a release-checklist step writes an item of that size on one device, reads it on a second device signed into the same iCloud account, and compares the bytes there.
+<!-- scp:end id="platform-account-member" -->
+
+**The Android password route is not a member.** A `PasswordCredential` stored through Credential Manager's `CreatePasswordRequest` would reach Google Password Manager, and the SDK does not use one, for three reasons: Google documents no size limit for a stored password, every read shows the user an account picker, and the user would see the stored bytes as a saved password. Two Android devices that sync one passkey therefore share no platform-account member, so the one-reveal-at-a-time rule spans them only through a member both reach, as §9.7.4.1's failure-mode table states over SDK sets.
+
+**Membership is decided once per credential and recorded.** At credential creation the SDK writes a `StoreSetRecord` (`17-persistence-and-storage.md` §17.8) into its own local store and, where the platform-account member is present, into that member, keyed on the credential. The record's platform-account entry, `Present` or `Absent` with one of the two reasons above, never changes after creation, whatever profile a later SDK runs. Its `largeBlob` entry changes only when a `largeBlob` write lands, which adds that member, or does not land, which removes it. An SDK that does not reach a member the record names refuses under the refusal rule below with `IdentityError::StorePartiallyUnreadable`. A recorded absence lifts no refusal this section states, and the `Browser` refusal below still binds a `Browser` SDK under a platform account that syncs the credential.
+
+**A failed write to the platform-account member refuses the reveal and keeps the member.** That write returns `RecoveryStoreError::PlatformAccountWriteFailed`, carrying the cause the platform reported, and the SDK refuses the reveal. The failure never removes the platform-account member from the record. **Only the `largeBlob` member is removable**: a `largeBlob` write that does not land returns `LargeBlobWrite::NotLanded`, carrying the cause and the act that clears it, and removes that member alone. **The page's origin storage is never a member**, because the browser partitions it per origin and `17-persistence-and-storage.md` §17.8 calls it ephemeral in a private window. The `largeBlob` store is the pre-rotation credential's and never the root credential's, because a reveal is what this rule gates and §9.7.4.1 item 3a separates the reveal-time authorizer from daily operations. Every origin whose effective domain is the credential's relying-party identifier, or a registrable-domain suffix of it, reaches that store.
 
 **Refusals over the store set.** **An SDK that does not reach every member of a non-empty store set, whether it reaches some members or none, MUST refuse to compose with `IdentityError::StorePartiallyUnreadable`**, because a partial read is indistinguishable to it from an empty one. A member that answers with bytes the SDK cannot decode as a `RecoveryHandle` is a member the SDK did not reach. **A `Browser` SDK under a platform account that syncs the credential cannot read that account's store, so it composes no reveal** and refuses under that same error. The rule therefore observes across a controller's SDKs exactly where one store spans every SDK the controller runs, and §9.7.4.1's failure-mode table states that condition over SDK sets.
 
@@ -3604,6 +3661,7 @@ All domain separators are UTF-8 strings used as prefixes (or, where a row says s
 | `"SCP-PREROTATION-COMMITMENT-V1:"` | Pre-rotation commitment over the fixed-length pre-rotation public key — a commitment-hash domain, NOT a §9.5.1 signature-preimage separator | §9.7.4.2 definitions, R13 |
 | `"SCP-KEL-SEAL-V1:"` | Key-event seal — `SHA-256("SCP-KEL-SEAL-V1:" \|\| anchored_event_preimage_digest)`, carried by a `KeyState` to anchor another identity's key event (the delegation use); a commitment-hash domain, NOT a §9.5.1 signature-preimage separator, and never a content anchor | §9.7.4.2 definitions, R13 |
 | `"SCP-KEY-EVENT-V1:"` | WebAuthn challenge domain for a key-event assertion-form signature — the authenticator's challenge is `"SCP-KEY-EVENT-V1:" \|\| event_preimage_digest` and a verifier compares its unpadded base64url form against `clientDataJSON.challenge`; a challenge-construction prefix, NOT a §9.5.1 signature-preimage separator, and distinct from `"SCP-KEL-EVENT-V1:"` above so that no key-event preimage is ever a WebAuthn challenge and no WebAuthn challenge is ever a preimage | §9.7.4.2 definitions |
+| `"SCP-NEXT-SET-BACKUP-V1:"` | Associated-data prefix of an encrypted offline backup of a pre-rotation key — the AES-256-GCM associated data is `"SCP-NEXT-SET-BACKUP-V1:" \|\| 0x01 \|\| commitment`, so an artifact opens only under the commitment it was sealed for; an AEAD associated-data domain, NOT a §9.5.1 signature-preimage separator | §9.7.4.1 item 4 |
 | `"SCP-CUSTODY-PROBE-V1:"` | Custody-reachability probe domain for §9.7.4.1 item 5d — the SDK takes one test signature over `SHA-256("SCP-CUSTODY-PROBE-V1:" \|\| 32 fresh random bytes)`; for the assertion form the authenticator's WebAuthn challenge is the 53 bytes `"SCP-CUSTODY-PROBE-V1:" \|\| those same 32 random bytes`, unhashed. It is registered so that no probe value can equal a key-event preimage or a key-event WebAuthn challenge, which is what stops a compromised assembling device using the probe to obtain a signature over an event it composed | §9.7.4.1 item 5d |
 | `"SCP-KEL-ID-V1:"` | Inception-derived identifier — `SHA-256("SCP-KEL-ID-V1:" \|\| inception_signed_preimage)`, with the inception's identifier and predecessor-digest fields set to the all-zero placeholder; an identifier-construction prefix, NOT a §9.5.1 signature-preimage separator | §9.7.4.2 R13 |
 | `"SCP-RELAY-PROOF-V1:"` | Relay proof of control — one community-relay-list operator's signed statement that the relay serving a QUERY is the one its entry names, over the requester's nonce, the routing id served, and the digest of the bytes served; §9.7.4.2's definitions state the field set and the five checks a resolver applies, and §9.7.4.2 R11 states the floor it feeds | §9.7.4.2 definitions, R11 |
@@ -4004,6 +4062,8 @@ Both seeds go through the `"SCP-PSEUDONYM-P256-V1"` seed-to-scalar step above. T
 | `LAST_REVEAL_MARKER_BYTES` | 72 | The encoded width of a `LastRevealMarker`: the 32-byte identifier, the 8-byte big-endian sequence, and the 32-byte preimage digest of the last reveal-authorized event a completed ceremony published | §9.7.4.2 R10's last-reveal rule |
 | `HELD_HEAD_MARKER_BYTES` | 73 | The encoded width of a `HeldHeadMarker`: the 32-byte identifier, the 8-byte big-endian sequence, the 32-byte preimage digest of the head a device holding a key-event member last adopted, and the 1-byte mode, `0x00` for `Any` and `0x01` for `RevealOnly`; a decode refuses any other mode byte | §9.7.4.2 R10's signing rule |
 | `PENDING_SIGNATURE_RECORD_BYTES` | 72 | The encoded width of a `PendingSignatureRecord`: the 32-byte identifier, the 8-byte big-endian sequence, and the 32-byte preimage digest of an event a device signed and has not adopted; the same layout as `LAST_REVEAL_MARKER_BYTES` | §9.7.4.2 R10's signing rule |
+| `ENCRYPTED_BACKUP_BYTES` | 77 | The encoded width of an encrypted offline backup: the 1-byte version `0x01`, the 16-byte Argon2id salt, the 12-byte AES-256-GCM nonce, the 32-byte ciphertext of the scalar, and the 16-byte tag | §9.7.4.1 item 4, the encrypted offline backup |
+| `SHAMIR_SHARE_BYTES` | 34 | The encoded width of one Shamir share: the 1-byte version `0x01`, the 1-byte x from 1 to 5, and the 32-byte y, one field element for each byte of the scalar | §9.7.4.1 item 4, the Shamir split |
 | `KEPT_COMPOSITION_BYTES` | 72 | The encoded width of a `KeptComposition`: the 32-byte identifier, the 8-byte big-endian sequence, and the 32-byte preimage digest of an event the composing device returned as awaiting signatures; the same layout as `LAST_REVEAL_MARKER_BYTES` | §9.7.4.2 R10's abandonment rule |
 
 #### 9.18.18 Trust Challenges

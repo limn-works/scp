@@ -761,7 +761,40 @@ Key custody is the `KeyCustody` trait ADR-006 defines, named here for completene
 | Python, Node, and server hosts | software keys in `FileKeyCustody`'s encrypted key file at `$HOME/.scp/keys.bin`, or in SQLCipher-encrypted SQLite, or an HSM under a separate principal | P-256 signing, DHKEM(P-256) | A caller selects `FileKeyCustody` with the request value `encrypted_file`, which reads its passphrase from `SCP_KEY_PASSPHRASE`, and reaches a host key store as `os_keystore` through a `KeyCustodyProvider` (`03-identity.md` §3.2.2). The headless profile exposes no passkey API, so the headless table of `09-security-model.md` §9.7.4.1 item 4 governs its pre-rotation custody |
 | Testing | `InMemoryKeyCustody` | P-256 signing, DHKEM(P-256) | Defined in ADR-006, barred from a shipped artifact above |
 
-**Where a pending recovery handle lives.** `09-security-model.md` §9.7.4.2 R10 states the store set a pending `RecoveryHandle` lives in, which is keyed on the identity's pre-rotation credential, and states when the credential's `largeBlob` store joins that set. This section's own local store is the set where the credential syncs through neither synced member.
+**Where a pending recovery handle lives.** `09-security-model.md` §9.7.4.2 R10 states the store set a pending `RecoveryHandle` lives in, which is keyed on the identity's pre-rotation credential, and states when the credential's `largeBlob` store joins that set. This section's own local store is the set where neither synced member exists.
+
+**Which hosts carry the platform-account member**, as `09-security-model.md` §9.7.4.2 R10 states it:
+
+<!-- scp:include id="platform-account-member" from=".docs/specs/09-security-model.md" -->
+**The platform-account member, per host.** The platform-account member exists only where the host gives the SDK a data API that writes into the store through which the platform account syncs the pre-rotation credential. Where the member does not exist, the SDK records one of two absence reasons: `NoDataApiToCredentialSyncStore`, where the credential syncs through a store that no data API of the host reaches, and `NoPlatformCredential`, where the host holds no platform credential.
+
+| Host | Platform-account member | Basis |
+|---|---|---|
+| Apple: the Swift SDK on the `Mobile` and `Desktop` profiles | Present where the credential syncs through iCloud Keychain: a synchronizable generic-password Keychain item (`kSecClassGenericPassword` with `kSecAttrSynchronizable` set to true) in the application's access group | iCloud Keychain is the store that syncs the passkey, and it encrypts what it syncs end to end. Apple's `kSecAttrSynchronizable` page (https://developer.apple.com/documentation/security/ksecattrsynchronizable) lists the sync caveats |
+| Android: the Kotlin SDK | Absent: `NoDataApiToCredentialSyncStore` | Passkeys sync through Google Password Manager (https://developer.android.com/identity/passkeys). Credential Manager's data surface is passkeys, passwords and federated credentials, and no data API writes an application's bytes into Google Password Manager. Block Store (https://developer.android.com/identity/block-store) is Google's application backup store and not the store that syncs the credential |
+| Browser | Absent: `NoDataApiToCredentialSyncStore` | No page API reaches the credential's sync store, and the page's origin storage is never a member |
+| Headless | Absent: `NoPlatformCredential` | The headless profile holds no platform credential |
+
+**The Apple member's capacity is proved by test, not by vendor documentation.** Apple's `kSecValueData` page (https://developer.apple.com/documentation/security/ksecvaluedata) and its `kSecAttrSynchronizable` page state no size limit for a Keychain item, so the claim that the member holds a signed event rests on two checks. A Swift SDK test writes a synchronizable item of 65,675 bytes, one byte more than `MAX_EVENT_BYTES`, `RECOVERY_HANDLE_BYTES` and `LAST_REVEAL_MARKER_BYTES` together (`09-security-model.md` §9.18.17), reads the item back, compares it byte for byte, and runs on iOS and on macOS in CI. CI cannot sign into iCloud, so a release-checklist step writes an item of that size on one device, reads it on a second device signed into the same iCloud account, and compares the bytes there.
+<!-- scp:end id="platform-account-member" -->
+
+**The store-set record.** `StoreSetRecord` carries three fields:
+
+- `credential_id`: the pre-rotation credential's WebAuthn credential identifier, on which the record is keyed;
+- `platform_account`: a `PlatformAccountMember`, which is `Present`, or `Absent` carrying a `PlatformAccountAbsence` of `NoDataApiToCredentialSyncStore` or `NoPlatformCredential`;
+- `large_blob`: a `LargeBlobMembership`, which records whether a `largeBlob` write landed at the credential's designation, and so whether the credential's `largeBlob` store is a member.
+
+The SDK writes the record at credential creation into this section's local store and, where the platform-account member is present, into that member. `09-security-model.md` §9.7.4.2 R10 states when each field may change and what an SDK that does not reach a recorded member does.
+
+**The `largeBlob` record.** A `largeBlob` member holds one record of at most 139 bytes:
+
+```
+flags   u8         bit 0 set: a RecoveryHandle follows; bit 1 set: a LastRevealMarker follows; bits 2 to 7 zero
+handle  [u8; 66]   present only when bit 0 is set (RECOVERY_HANDLE_BYTES)
+marker  [u8; 72]   present only when bit 1 is set (LAST_REVEAL_MARKER_BYTES)
+```
+
+A decoder refuses a record with any of bits 2 to 7 set, and a record whose length differs from the length its flags name, which is 1, 67, 73 or 139 bytes. A record the decoder refuses is bytes the SDK cannot decode, which `09-security-model.md` §9.7.4.2 R10 counts as a member the SDK did not reach.
 
 **What each member holds.** **Every member holds the `RecoveryHandle` and the `LastRevealMarker`** `09-security-model.md` §9.7.4.2 R10 declares, and the handle is at the width `RECOVERY_HANDLE_BYTES` registers (`09-security-model.md` §9.18.17), which is why an authenticator's large-blob array and never the object's own size is what bounds what the set can hold. **The handle, as `09-security-model.md` §9.7.4.2 R10 declares it**: <!-- scp:include id="recovery-handle-declaration" from=".docs/specs/09-security-model.md" -->**`RecoveryHandle` is one enum whose variants are `FixesCommitment` and `Abandons`, each carrying the identity's 32-byte identifier, a `RecoveryPhase`, and the 32-byte preimage digest of the composed event, and `RecoveryPhase`'s six values are `Composed`, `Signed`, `PublishSent`, `Confirmed`, `Discarded` and `Lost`.**<!-- scp:end id="recovery-handle-declaration" --> It carries the composed preimage and the signed event never, because <!-- scp:fragment id="large-blob-arithmetic" -->CTAP 2.1 floors an authenticator's whole large-blob array at 1,024 bytes across every credential it holds, and `MAX_EVENT_BYTES` is 65,536, so a duty to write the event itself would ask for a write between one and two orders of magnitude larger than the store.<!-- scp:end id="large-blob-arithmetic" --> **The composed preimage, the next commitment list and the next threshold sit in this section's own local store, and the signed event also sits in the platform account's store where that member exists, each keyed on that digest**, and `09-security-model.md` §9.7.4.2 R10 states what an SDK whose local store holds no preimage under a handle's digest does.
 
