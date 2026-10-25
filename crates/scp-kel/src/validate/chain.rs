@@ -307,14 +307,21 @@ impl ValidatedChain {
         Self { state }
     }
 
-    /// The summed lengths of the units that carried the chain's events at
-    /// and past `position`: the bytes R9's byte bound counts for a divergent
-    /// suffix whose first event sits at `position`.
-    pub(crate) fn unit_bytes_from(&self, position: u64) -> u64 {
+    /// Each event at and past `position`, as its preimage digest and the
+    /// length of the unit that carried it: what R9's byte bound counts for a
+    /// divergent suffix whose first event sits at `position`, once per
+    /// digest across every suffix retained.
+    pub(crate) fn unit_lens_from(
+        &self,
+        position: u64,
+    ) -> impl Iterator<Item = ([u8; 32], u64)> + '_ {
         self.events()
-            .filter(|event| event.sequence >= position)
-            .fold(0_u64, |bytes, event| {
-                bytes.saturating_add(u64::try_from(event.unit.len()).unwrap_or(u64::MAX))
+            .filter(move |event| event.sequence >= position)
+            .map(|event| {
+                (
+                    event.digest,
+                    u64::try_from(event.unit.len()).unwrap_or(u64::MAX),
+                )
             })
     }
 

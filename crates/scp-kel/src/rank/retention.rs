@@ -12,7 +12,7 @@
 //! which counts the refusals of one resolution (R9: "the party counts that
 //! candidate in its residue n").
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use scp_did::Identifier;
@@ -65,10 +65,9 @@ impl RetentionBasis {
 /// Which chain a [`RetentionBasis`] is, as persisted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BasisKind {
-    /// The accepted chain, which the caller persists as its baseline.
+    /// The accepted chain.
     Accepted,
-    /// The shared prefix a first-contact `Contested` names, which the
-    /// retention set persists itself.
+    /// The shared prefix a first-contact `Contested` names.
     ContestedPrefix,
 }
 
@@ -78,9 +77,7 @@ pub enum BasisKind {
 pub struct RetainedSuffix {
     chain: ValidatedChain,
     fork_position: u64,
-    rank: ForkRank,
-    bytes: u64,
-    observed: u64,
+    slot: Slot,
 }
 
 impl RetainedSuffix {
@@ -106,29 +103,14 @@ impl RetainedSuffix {
     /// The suffix's eviction rank.
     #[must_use]
     pub const fn rank(&self) -> ForkRank {
-        self.rank
-    }
-
-    /// The summed lengths of the units that carried the suffix's events
-    /// from its fork position on, which the byte bound counts.
-    #[must_use]
-    pub const fn bytes(&self) -> u64 {
-        self.bytes
+        self.slot.rank
     }
 
     /// The moment the party first held or observed the suffix: a counter the
     /// set keeps, never wall-clock time.
     #[must_use]
     pub const fn observed(&self) -> u64 {
-        self.observed
-    }
-
-    const fn slot(&self) -> Slot {
-        Slot {
-            rank: self.rank,
-            bytes: self.bytes,
-            observed: self.observed,
-        }
+        self.slot.observed
     }
 }
 
@@ -140,7 +122,8 @@ pub enum Admission {
     Retained {
         /// The candidate's eviction rank.
         rank: ForkRank,
-        /// The head of every suffix evicted to fit it.
+        /// The head of every suffix evicted to fit it, in the order of the
+        /// moment the set first held each.
         evicted: Vec<[u8; 32]>,
     },
     /// The candidate extends a retained suffix and replaced it.
@@ -149,7 +132,8 @@ pub enum Admission {
         rank: ForkRank,
         /// The head of the suffix it replaced.
         replaced: [u8; 32],
-        /// The head of every other suffix evicted to fit it.
+        /// The head of every other suffix evicted to fit it, in the order of
+        /// the moment the set first held each.
         evicted: Vec<[u8; 32]>,
     },
     /// The party holds every event of the candidate: nothing changed.
@@ -179,6 +163,16 @@ pub enum RetentionError {
     /// moment with a held one and the eviction tie-break could not read it.
     #[error("the retention set's moment counter is exhausted")]
     ObservedExhausted,
+    /// A contested prefix was offered as the basis of a set whose basis is
+    /// the accepted chain. R9 makes a contested prefix the basis only
+    /// "Where a first-contact resolution returns `Contested`", where the
+    /// party holds no accepted chain, so the move would drop the accepted
+    /// baseline into the set as a ranked suffix.
+    #[error("a contested prefix cannot replace the accepted chain at {accepted:02x?}")]
+    ContestedAfterAccepted {
+        /// The accepted chain's head digest.
+        accepted: [u8; 32],
+    },
 }
 
 /// What [`RetentionSet::rerank`] did with each chain it re-admitted.
@@ -194,6 +188,15 @@ pub struct Rerank {
     pub refused: Vec<[u8; 32]>,
 }
 
+impl Rerank {
+    /// Appends `later`'s report to this one.
+    pub(super) fn absorb(&mut self, later: Self) {
+        self.already_held.extend(later.already_held);
+        self.evicted.extend(later.evicted);
+        self.refused.extend(later.refused);
+    }
+}
+
 /// A [`RetentionSet`] as its owner persists it: raw units it re-validates
 /// on [`RetentionSet::restore`], and the heads and moments that name what it
 /// retained.
@@ -201,9 +204,8 @@ pub struct Rerank {
 pub struct PersistedRetention {
     /// The basis.
     pub basis: PersistedBasis,
-    /// Every unit of every retained suffix's chain from its inception, and
-    /// of a contested-prefix basis, one per digest, the held copy, in
-    /// chain order.
+    /// Every unit of the basis and of every retained suffix's chain from
+    /// its inception, one per digest, the held copy, in chain order.
     pub units: Vec<Arc<[u8]>>,
     /// Every retained suffix.
     pub suffixes: Vec<PersistedSuffix>,
@@ -247,21 +249,6 @@ pub enum RestoreError {
     MissingHead {
         /// The head no chain holds.
         head: [u8; 32],
-    },
-    /// The baseline is of another identifier than the one restored.
-    #[error("the baseline is of {found}, not {expected}")]
-    IdentifierMismatch {
-        /// The identifier restored.
-        expected: Identifier,
-        /// The baseline's identifier.
-        found: Identifier,
-    },
-    /// The baseline given disagrees with the persisted basis: absent for an
-    /// accepted basis, present for a contested prefix, or another head.
-    #[error("the baseline does not match the persisted {kind:?} basis")]
-    BasisMismatch {
-        /// The persisted basis kind.
-        kind: BasisKind,
     },
     /// Two persisted entries carry one `observed` moment.
     #[error("two persisted entries carry the moment {observed}")]
@@ -338,6 +325,13 @@ impl RetentionSet {
         &self.basis
     }
 
+    /// The moment the party first held the basis, on the counter every
+    /// suffix's [`observed`](RetainedSuffix::observed) moment reads.
+    #[must_use]
+    pub const fn basis_observed(&self) -> u64 {
+        self.basis_observed
+    }
+
     /// Every retained suffix.
     #[must_use]
     pub fn suffixes(&self) -> &[RetainedSuffix] {
@@ -345,18 +339,18 @@ impl RetentionSet {
     }
 
     /// The divergent-suffix bytes the byte bound counts, rank-1 bytes
-    /// included.
+    /// included, each retained event once (R9: "The byte bound counts each
+    /// retained event once").
     #[must_use]
     pub fn retained_bytes(&self) -> u64 {
-        self.suffixes
-            .iter()
-            .fold(0, |sum, suffix| sum.saturating_add(suffix.bytes))
+        union_bytes(self.suffixes.iter().map(|suffix| &suffix.slot))
     }
 
     /// Admits `candidate`, a valid chain of the basis's identifier, under
-    /// R9's identity, retention bound and eviction rule. S5 (SCP-007 part)
-    /// wires the validating store, which admits each suffix its accepted
-    /// chain displaces; the resolver admits every losing and tied chain.
+    /// R9's identity, retention bound and eviction rule. The holder of the
+    /// accepted chain admits here every chain it holds other than the
+    /// accepted one; S5 (SCP-007 part) is the caller that wires that holder
+    /// into a validating store.
     ///
     /// Identity, R9: "An arrival every event of which the party already
     /// holds changes nothing." A candidate the basis or a retained suffix
@@ -430,12 +424,12 @@ impl RetentionSet {
         let fresh = extends.is_none() && observed.is_none();
         let slot = Slot {
             rank,
-            bytes: candidate.unit_bytes_from(fork_position),
             observed: extends
                 .and_then(|index| self.suffixes.get(index))
                 .map(RetainedSuffix::observed)
                 .or(observed)
                 .unwrap_or(self.next_observed),
+            events: candidate.unit_lens_from(fork_position).collect(),
         };
         let next_observed = if fresh {
             self.next_observed
@@ -444,16 +438,14 @@ impl RetentionSet {
         } else {
             self.next_observed
         };
-        let held: Vec<Slot> = self.suffixes.iter().map(RetainedSuffix::slot).collect();
-        let Some(evict) = plan_evictions(&held, extends, slot, self.bounds) else {
+        let held: Vec<&Slot> = self.suffixes.iter().map(|suffix| &suffix.slot).collect();
+        let Some(evict) = plan_evictions(&held, extends, &slot, self.bounds) else {
             return Ok(Admission::Refused { rank });
         };
         let retained = RetainedSuffix {
             chain: candidate,
             fork_position,
-            rank,
-            bytes: slot.bytes,
-            observed: slot.observed,
+            slot,
         };
         let mut evicted = Vec::with_capacity(evict.len());
         let mut replaced = None;
@@ -512,13 +504,22 @@ impl RetentionSet {
     ///
     /// # Errors
     ///
-    /// The first [`RetentionError`] a re-admission reaches. The set is then
-    /// unchanged.
+    /// [`RetentionError::ContestedAfterAccepted`] where `basis` is a
+    /// contested prefix and the set's basis is the accepted chain, and
+    /// otherwise the first [`RetentionError`] a re-admission reaches. The set
+    /// is then unchanged.
     pub fn rerank(&mut self, basis: RetentionBasis) -> Result<Rerank, RetentionError> {
+        if let (RetentionBasis::Accepted(accepted), RetentionBasis::ContestedPrefix(_)) =
+            (&self.basis, &basis)
+        {
+            return Err(RetentionError::ContestedAfterAccepted {
+                accepted: accepted.head_digest(),
+            });
+        }
         let mut entries: Vec<(u64, ValidatedChain)> = self
             .suffixes
             .iter()
-            .map(|suffix| (suffix.observed, suffix.chain.clone()))
+            .map(|suffix| (suffix.slot.observed, suffix.chain.clone()))
             .chain(std::iter::once((
                 self.basis_observed,
                 self.basis.chain().clone(),
@@ -570,21 +571,16 @@ impl RetentionSet {
     ///
     /// R9's eviction tie-break reads "the suffix it observed most recently",
     /// so every moment is persisted; R9 keeps "the copy it holds", so every
-    /// unit is the held copy. The accepted chain is the caller's baseline,
-    /// persisted by the caller; a contested-prefix basis is persisted here.
+    /// unit is the held copy. The basis is persisted with the suffixes, so
+    /// its kind alone says which chain it is.
     #[must_use]
     pub fn persisted(&self) -> PersistedRetention {
         let mut seen = BTreeSet::new();
         let mut units = Vec::new();
-        let basis = match &self.basis {
-            RetentionBasis::Accepted(_) => None,
-            RetentionBasis::ContestedPrefix(prefix) => Some(prefix),
-        };
         let mut ordered: Vec<&RetainedSuffix> = self.suffixes.iter().collect();
-        ordered.sort_by_key(|suffix| suffix.observed);
-        for chain in basis
-            .into_iter()
-            .chain(ordered.iter().map(|suffix| &suffix.chain))
+        ordered.sort_by_key(|suffix| suffix.slot.observed);
+        for chain in
+            std::iter::once(self.basis.chain()).chain(ordered.iter().map(|suffix| &suffix.chain))
         {
             for (digest, unit) in chain.units() {
                 if seen.insert(digest) {
@@ -603,16 +599,15 @@ impl RetentionSet {
                 .iter()
                 .map(|suffix| PersistedSuffix {
                     head: suffix.head(),
-                    observed: suffix.observed,
+                    observed: suffix.slot.observed,
                 })
                 .collect(),
         }
     }
 
-    /// Rebuilds a persisted set: one [`validate_entry`] over its units, each
-    /// suffix the prefix through its head of the chain holding that head,
-    /// and the basis the same way where it is a contested prefix, or
-    /// `baseline` where it is the accepted chain. Every suffix is then
+    /// Rebuilds a persisted set: one [`validate_entry`] over its units, and
+    /// the basis and each suffix the prefix through its head of the chain
+    /// holding that head. Every suffix is then
     /// re-admitted in ascending moment order through [`admit`](Self::admit)'s
     /// one rule, so a persisted set that rule would not have built is
     /// refused. The moment counter restarts past the largest persisted
@@ -623,7 +618,6 @@ impl RetentionSet {
     /// Each [`RestoreError`] arm; none returns a partial set.
     pub fn restore(
         identifier: &Identifier,
-        baseline: Option<&ValidatedChain>,
         saved: &PersistedRetention,
     ) -> Result<Self, RestoreError> {
         let chains = rebuild(identifier, &saved.units)?;
@@ -636,26 +630,10 @@ impl RetentionSet {
                 })
                 .ok_or(RestoreError::MissingHead { head })
         };
-        let kind = saved.basis.kind;
-        let basis = match (kind, baseline) {
-            (BasisKind::Accepted, Some(baseline)) => {
-                if baseline.identifier() != *identifier {
-                    return Err(RestoreError::IdentifierMismatch {
-                        expected: *identifier,
-                        found: baseline.identifier(),
-                    });
-                }
-                if baseline.head_digest() != saved.basis.head {
-                    return Err(RestoreError::BasisMismatch { kind });
-                }
-                RetentionBasis::Accepted(baseline.clone())
-            }
-            (BasisKind::ContestedPrefix, None) => {
-                RetentionBasis::ContestedPrefix(find(saved.basis.head)?)
-            }
-            (BasisKind::Accepted, None) | (BasisKind::ContestedPrefix, Some(_)) => {
-                return Err(RestoreError::BasisMismatch { kind });
-            }
+        let chain = find(saved.basis.head)?;
+        let basis = match saved.basis.kind {
+            BasisKind::Accepted => RetentionBasis::Accepted(chain),
+            BasisKind::ContestedPrefix => RetentionBasis::ContestedPrefix(chain),
         };
         let mut moments = BTreeSet::from([saved.basis.observed]);
         for suffix in &saved.suffixes {
@@ -710,14 +688,19 @@ fn rebuild(
     }
     let refs: Vec<&[u8]> = units.iter().map(|unit| &**unit).collect();
     let validation = validate_entry(identifier, &refs);
+    // The verdict first: without a valid inception every other unit is
+    // discarded too, and the inception's own failure is the cause.
+    let chains: Vec<ValidatedChain> = match validation.verdict {
+        EntryVerdict::Valid { chains } => chains.iter().cloned().collect(),
+        EntryVerdict::InceptionInvalid { defect } => {
+            return Err(RestoreError::InceptionInvalid(defect));
+        }
+        EntryVerdict::NoInception => return Err(RestoreError::NoInception),
+    };
     if !validation.discarded.is_empty() {
         return Err(RestoreError::Discarded(validation.discarded));
     }
-    match validation.verdict {
-        EntryVerdict::Valid { chains } => Ok(chains.iter().cloned().collect()),
-        EntryVerdict::InceptionInvalid { defect } => Err(RestoreError::InceptionInvalid(defect)),
-        EntryVerdict::NoInception => Err(RestoreError::NoInception),
-    }
+    Ok(chains)
 }
 
 /// R9's two bounds.
@@ -731,18 +714,31 @@ pub(super) struct Bounds {
 
 impl Bounds {
     /// The registered values (§9.18.17).
-    const REGISTERED: Self = Self {
+    pub(super) const REGISTERED: Self = Self {
         suffixes: MAX_RETAINED_SUFFIXES,
         bytes: MAX_RETAINED_BYTES as u64,
     };
 }
 
-/// What the eviction rule reads of one suffix.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What the eviction rule and the bounds read of one suffix.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Slot {
     pub(super) rank: ForkRank,
-    pub(super) bytes: u64,
     pub(super) observed: u64,
+    /// Each event past the suffix's fork from the basis: its preimage
+    /// digest and the length of the held unit that carried it.
+    pub(super) events: Vec<([u8; 32], u64)>,
+}
+
+/// The bytes of the union of `slots`' events, each digest once (R9: "The
+/// byte bound counts each retained event once").
+fn union_bytes<'s>(slots: impl IntoIterator<Item = &'s Slot>) -> u64 {
+    let mut lens = BTreeMap::new();
+    for slot in slots {
+        lens.extend(slot.events.iter().copied());
+    }
+    lens.values()
+        .fold(0, |sum: u64, len| sum.saturating_add(*len))
 }
 
 /// The indices of `held` to evict so `candidate` fits both bounds, in
@@ -770,10 +766,15 @@ pub(super) struct Slot {
 /// R9, the rank-1 flood: "Where the rank-1 suffixes a party retains fill
 /// either bound and another rank-1 candidate arrives, the verifier keeps
 /// the suffixes it holds".
+///
+/// R9, counting: "The byte bound counts each retained event once", so the
+/// tally is the union of the kept suffixes' events and the candidate's, and
+/// an eviction frees only the events no kept suffix or the candidate also
+/// holds.
 pub(super) fn plan_evictions(
-    held: &[Slot],
+    held: &[&Slot],
     replacing: Option<usize>,
-    candidate: Slot,
+    candidate: &Slot,
     bounds: Bounds,
 ) -> Option<Vec<usize>> {
     let mut kept: Vec<bool> = (0..held.len())
@@ -781,14 +782,17 @@ pub(super) fn plan_evictions(
         .collect();
     let mut evicted = Vec::new();
     loop {
-        let (count, bytes) = held
-            .iter()
-            .zip(&kept)
-            .filter(|(_, kept)| **kept)
-            .fold((1_u64, candidate.bytes), |(count, bytes), (slot, _)| {
-                (count.saturating_add(1), bytes.saturating_add(slot.bytes))
-            });
-        if count <= u64::from(bounds.suffixes) && bytes <= bounds.bytes {
+        let kept_slots = || {
+            held.iter()
+                .zip(&kept)
+                .filter(|(_, kept)| **kept)
+                .map(|(slot, _)| *slot)
+        };
+        let count = kept_slots().count().saturating_add(1);
+        let bytes = union_bytes(kept_slots().chain(std::iter::once(candidate)));
+        if u64::try_from(count).unwrap_or(u64::MAX) <= u64::from(bounds.suffixes)
+            && bytes <= bounds.bytes
+        {
             return Some(evicted);
         }
         let (victim, _) = held
