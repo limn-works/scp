@@ -90,7 +90,8 @@ pub mod traits;
 
 // Re-export all public types for ergonomic access.
 pub use custody_record::{
-    CustodyNamespace, CustodyRecord, CustodyRecordStore, StorageCustodyRecordStore,
+    CustodyNamespace, CustodyNamespaces, CustodyRecord, CustodyRecordStore, LiveCustodyRecordStore,
+    NamespaceLive,
 };
 pub use encrypted::EncryptedStorage;
 // The key-event signer contract (09-security-model.md §9.7.4.2 R10), so a

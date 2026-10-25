@@ -277,27 +277,17 @@ impl ProtocolRepoVariant {
         }
     }
 
-    /// Opens the custody records of the callback adapter whose identity
-    /// keeps `slot`, over this instance's own storage (spec §17.3, §17.6):
-    /// the store this repository's event log already uses, never a second one.
-    ///
-    /// # Errors
-    ///
-    /// [`CustodyLoadError::NamespaceLive`](crate::callback_custody::CustodyLoadError::NamespaceLive)
-    /// while another adapter holds the slot's namespace.
+    /// The storage a callback custody identity's entry and records live in
+    /// (spec §17.3): this instance's own store, the one this repository's
+    /// event log already uses, when it persists; `None` for the in-memory
+    /// repository, whose entry and records would end with the instance while
+    /// the host keys remain.
     #[cfg(feature = "custody")]
-    pub fn custody_record_store(
-        &self,
-        slot: &crate::callback_custody::CustodyNamespaceSlot,
-    ) -> Result<crate::callback_custody::CustodyRecords, crate::callback_custody::CustodyLoadError>
-    {
+    #[must_use]
+    pub fn callback_custody_storage(&self) -> Option<Arc<scp_platform::sqlite::SqliteStorage>> {
         match self {
-            Self::InMemory(repo) => {
-                crate::callback_custody::custody_record_store(Arc::clone(repo.storage()), slot)
-            }
-            Self::Sqlite(repo) => {
-                crate::callback_custody::custody_record_store(Arc::clone(repo.storage()), slot)
-            }
+            Self::InMemory(_) => None,
+            Self::Sqlite(repo) => Some(Arc::clone(repo.storage())),
         }
     }
 

@@ -858,8 +858,29 @@ public extension SCP {
     }
 
     /// Forwards to ``Scp/identityLoad`` on ``inner``.
+    ///
+    /// An identity created with ``identityCreateWithCustody(provider:)``
+    /// loads only through ``identityLoadWithCustody(did:provider:)``, which
+    /// takes its provider: this throws `SCP-IDENT-1003` for one (spec
+    /// section 17.3).
     func identityLoad(did: String) async throws -> Identity {
         try await inner.identityLoad(did: did)
+    }
+
+    /// Forwards to ``Scp/identityLoadWithCustody`` on ``inner``: loads an
+    /// identity created with ``identityCreateWithCustody(provider:)`` on this
+    /// instance's storage, in this process or an earlier one, with the same
+    /// `provider` (spec section 17.3). The identity's keys, including keys
+    /// its custody minted earlier, sign through `provider`.
+    ///
+    /// - Throws: ``ScpError`` `SCP-STORAGE-8000` when this instance's storage
+    ///   does not persist; `SCP-IDENT-1002` when the storage holds no entry
+    ///   for `did`; `SCP-IDENT-1009` when the entry does not decode or names
+    ///   another DID; `SCP-IDENT-1008` while this instance already holds the
+    ///   identity loaded, or when `provider`'s identity key does not derive
+    ///   `did`.
+    func identityLoadWithCustody(did: String, provider: KeyCustodyProvider) async throws -> Identity {
+        try await inner.identityLoadWithCustody(did: did, provider: provider)
     }
 
     /// Forwards to ``Scp/identityMigrate`` on ``inner``.

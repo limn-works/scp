@@ -2739,6 +2739,31 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func identityLoad(did: String) async throws  -> Identity
     
     /**
+     * Loads an identity created with
+     * [`identity_create_with_custody`](Self::identity_create_with_custody)
+     * on this instance's storage, with the same host custody provider
+     * (spec §17.3, SCP-345 decision D1).
+     *
+     * Reads the identity's callback custody entry, reopens its custody
+     * records over the stored namespace, and checks that `provider` holds
+     * the identity key the DID derives from. The handle reports
+     * `os_keystore` and signs through `provider`, including with keys minted
+     * in an earlier process.
+     *
+     * # Errors
+     *
+     * - `SCP-IDENT-1004` for a DID that is not `did:dht`.
+     * - `SCP-STORAGE-8000` on in-memory storage, which keeps no entry.
+     * - `SCP-IDENT-1002` when the storage holds no entry for `did`.
+     * - `SCP-IDENT-1009` when the entry does not decode or names another
+     * DID.
+     * - `SCP-IDENT-1008` while another live adapter of this instance holds
+     * the identity's namespace (a second load, or the create's own
+     * adapter), or when `provider`'s identity key does not derive `did`.
+     */
+    func identityLoadWithCustody(did: String, provider: KeyCustodyProvider) async throws  -> Identity
+    
+    /**
      * Per-instance equivalent of the free-function `identity_migrate`.
      *
      * Rejects any `Identity` whose `instance_id` does not match this
@@ -5864,6 +5889,46 @@ open func identityLoad(did: String)async throws  -> Identity  {
 }
     
     /**
+     * Loads an identity created with
+     * [`identity_create_with_custody`](Self::identity_create_with_custody)
+     * on this instance's storage, with the same host custody provider
+     * (spec §17.3, SCP-345 decision D1).
+     *
+     * Reads the identity's callback custody entry, reopens its custody
+     * records over the stored namespace, and checks that `provider` holds
+     * the identity key the DID derives from. The handle reports
+     * `os_keystore` and signs through `provider`, including with keys minted
+     * in an earlier process.
+     *
+     * # Errors
+     *
+     * - `SCP-IDENT-1004` for a DID that is not `did:dht`.
+     * - `SCP-STORAGE-8000` on in-memory storage, which keeps no entry.
+     * - `SCP-IDENT-1002` when the storage holds no entry for `did`.
+     * - `SCP-IDENT-1009` when the entry does not decode or names another
+     * DID.
+     * - `SCP-IDENT-1008` while another live adapter of this instance holds
+     * the identity's namespace (a second load, or the create's own
+     * adapter), or when `provider`'s identity key does not derive `did`.
+     */
+open func identityLoadWithCustody(did: String, provider: KeyCustodyProvider)async throws  -> Identity  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_identity_load_with_custody(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(did),FfiConverterCallbackInterfaceKeyCustodyProvider_lower(provider)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_pointer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
+            liftFunc: FfiConverterTypeIdentity_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
      * Per-instance equivalent of the free-function `identity_migrate`.
      *
      * Rejects any `Identity` whose `instance_id` does not match this
@@ -8338,12 +8403,19 @@ public protocol TestingCallbackCustodyProtocol: AnyObject, Sendable {
     func publicKey(keyId: String) async throws  -> Data
     
     /**
-     * A new adapter around `provider` over this adapter's custody records,
-     * as production rebuilds an identity's adapter over its stored records
-     * after a relaunch. Only a recorded key resolves, so a test that
-     * reopens a host's keys mints them through an adapter first.
+     * Closes this adapter and opens a new one around `provider` over the
+     * same custody records, through the same namespace table, as
+     * `identity_load_with_custody` rebuilds an identity's adapter over the
+     * namespace its stored entry holds (spec §17.3). Only a recorded key resolves, so a test that
+     * reopens a host's keys mints them through an adapter first. This
+     * adapter answers `SCP-IDENT-1008` afterwards.
+     *
+     * # Errors
+     *
+     * `SCP-IDENT-1008` when this adapter is already closed, or while a call
+     * on it still holds its records (the namespace is live).
      */
-    func reopen(provider: KeyCustodyProvider)  -> TestingCallbackCustody
+    func reopen(provider: KeyCustodyProvider) throws  -> TestingCallbackCustody
     
     /**
      * Signs `data` with `key_id` through the adapter and returns what the
@@ -8408,8 +8480,9 @@ open class TestingCallbackCustody: TestingCallbackCustodyProtocol, @unchecked Se
         return try! rustCall { uniffi_scp_ffi_uniffi_fn_clone_testingcallbackcustody(self.pointer, $0) }
     }
     /**
-     * Wraps `provider` in a fresh callback custody adapter over an empty
-     * in-memory custody record store.
+     * Wraps `provider` in a fresh callback custody adapter over empty
+     * in-memory custody records, opened through a namespace table of its
+     * own.
      */
 public convenience init(provider: KeyCustodyProvider) {
     let pointer =
@@ -8551,13 +8624,20 @@ open func publicKey(keyId: String)async throws  -> Data  {
 }
     
     /**
-     * A new adapter around `provider` over this adapter's custody records,
-     * as production rebuilds an identity's adapter over its stored records
-     * after a relaunch. Only a recorded key resolves, so a test that
-     * reopens a host's keys mints them through an adapter first.
+     * Closes this adapter and opens a new one around `provider` over the
+     * same custody records, through the same namespace table, as
+     * `identity_load_with_custody` rebuilds an identity's adapter over the
+     * namespace its stored entry holds (spec §17.3). Only a recorded key resolves, so a test that
+     * reopens a host's keys mints them through an adapter first. This
+     * adapter answers `SCP-IDENT-1008` afterwards.
+     *
+     * # Errors
+     *
+     * `SCP-IDENT-1008` when this adapter is already closed, or while a call
+     * on it still holds its records (the namespace is live).
      */
-open func reopen(provider: KeyCustodyProvider) -> TestingCallbackCustody  {
-    return try!  FfiConverterTypeTestingCallbackCustody_lift(try! rustCall() {
+open func reopen(provider: KeyCustodyProvider)throws  -> TestingCallbackCustody  {
+    return try  FfiConverterTypeTestingCallbackCustody_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
     uniffi_scp_ffi_uniffi_fn_method_testingcallbackcustody_reopen(self.uniffiClonePointer(),
         FfiConverterCallbackInterfaceKeyCustodyProvider_lower(provider),$0
     )
@@ -21290,6 +21370,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_load() != 9295) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_load_with_custody() != 15063) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_migrate() != 35072) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -21578,7 +21661,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_testingcallbackcustody_public_key() != 64484) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_testingcallbackcustody_reopen() != 28955) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_testingcallbackcustody_reopen() != 40072) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_testingcallbackcustody_sign() != 17590) {
@@ -21626,7 +21709,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_constructor_scp_with_storage() != 28869) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_constructor_testingcallbackcustody_new() != 13648) {
+    if (uniffi_scp_ffi_uniffi_checksum_constructor_testingcallbackcustody_new() != 20187) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_deviceattestationprovider_attest() != 18976) {

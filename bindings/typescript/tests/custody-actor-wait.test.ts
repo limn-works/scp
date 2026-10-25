@@ -21,6 +21,9 @@
 
 import { describe, expect, test } from "bun:test";
 import * as crypto from "node:crypto";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { KeyNotFoundError } from "../src/errors";
 import { toNativeCustodyProvider } from "../src/internal/custody-adapter";
@@ -171,7 +174,11 @@ const CEILING = [
 suite.describe("callback custody under a concurrent actor wait", (addon) => {
   describe("callback custody under a concurrent actor wait", () => {
     test("a KeyResponse turn awaiting the host's dhAgree completes while JS awaits contextMemberCount on the same actor", async () => {
-      const alice = new addon.SCP(JSON.stringify({ type: "in_memory" }));
+      // Callback custody refuses storage that does not persist (spec §17.3).
+      const aliceDir = await mkdtemp(join(tmpdir(), "scp-actor-wait-"));
+      const alice = new addon.SCP(
+        JSON.stringify({ type: "sqlite", path: aliceDir, key: "5c".repeat(32) }),
+      );
       const bob = new addon.SCP(JSON.stringify({ type: "in_memory" }));
       try {
         const host = new WrappingAgreeKeychain();
@@ -245,6 +252,7 @@ suite.describe("callback custody under a concurrent actor wait", (addon) => {
       } finally {
         await alice.shutdown(1000n).catch(() => {});
         await bob.shutdown(1000n).catch(() => {});
+        await rm(aliceDir, { recursive: true, force: true });
       }
     }, 30_000);
   });

@@ -23,7 +23,7 @@ use zeroize::Zeroizing;
 
 use scp_ffi_common::callback_custody::{CallbackKeyRegistry, CustodyRecords};
 use scp_platform::in_memory::InMemoryStorage;
-use scp_platform::{CustodyNamespace, CustodyRecordStore, StorageCustodyRecordStore};
+use scp_platform::{CustodyNamespace, CustodyNamespaces};
 
 use crate::CustodyKeyType;
 use crate::bridge::{CallbackKeyCustody, ScpError};
@@ -50,22 +50,54 @@ fn validation(msg: String) -> ScpError {
 /// production reports.
 #[derive(uniffi::Object)]
 pub struct TestingCallbackCustody {
-    inner: CallbackKeyCustody,
-    records: Arc<dyn CustodyRecordStore>,
+    /// The live adapter; `None` once [`reopen`](Self::reopen) closed it.
+    inner: std::sync::Mutex<Option<Arc<CallbackKeyCustody>>>,
+    /// The storage the adapter's records live in, and the namespace table
+    /// they open through, shared with every adapter `reopen` builds.
+    storage: Arc<InMemoryStorage>,
+    table: CustodyNamespaces,
 }
 
+/// The one namespace every adapter of a fixture opens.
+const NAMESPACE: [u8; 16] = [0; 16];
+
 impl TestingCallbackCustody {
-    fn over(
+    /// An adapter over `provider` and `records`, which `table` holds live.
+    fn holding(
         provider: Box<dyn crate::KeyCustodyProvider>,
-        records: Arc<dyn CustodyRecordStore>,
+        records: CustodyRecords,
+        storage: Arc<InMemoryStorage>,
+        table: CustodyNamespaces,
     ) -> Arc<Self> {
         Arc::new(Self {
-            inner: CallbackKeyCustody::new(
+            inner: std::sync::Mutex::new(Some(Arc::new(CallbackKeyCustody::new(
                 provider,
-                CallbackKeyRegistry::recorded(CustodyRecords::unleased(Arc::clone(&records))),
-            ),
-            records,
+                CallbackKeyRegistry::recorded(records),
+            )))),
+            storage,
+            table,
         })
+    }
+
+    /// The live adapter.
+    ///
+    /// # Errors
+    ///
+    /// `SCP-IDENT-1008` once [`reopen`](Self::reopen) closed this adapter.
+    fn adapter(&self) -> Result<Arc<CallbackKeyCustody>, ScpError> {
+        self.inner
+            .lock()
+            .map_err(|_| closed())?
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or_else(closed)
+    }
+}
+
+fn closed() -> ScpError {
+    ScpError::Identity {
+        msg: "this testing adapter was closed by reopen".to_owned(),
+        code: codes::IDENT_1008.to_owned(),
     }
 }
 
@@ -77,27 +109,54 @@ impl std::fmt::Debug for TestingCallbackCustody {
 
 #[uniffi::export(async_runtime = "tokio")]
 impl TestingCallbackCustody {
-    /// Wraps `provider` in a fresh callback custody adapter over an empty
-    /// in-memory custody record store.
+    /// Wraps `provider` in a fresh callback custody adapter over empty
+    /// in-memory custody records, opened through a namespace table of its
+    /// own.
     #[uniffi::constructor]
     #[must_use]
     pub fn new(provider: Box<dyn crate::KeyCustodyProvider>) -> Arc<Self> {
-        Self::over(
-            provider,
-            Arc::new(StorageCustodyRecordStore::new(
-                InMemoryStorage::new(),
-                CustodyNamespace::from_bytes([0; 16]),
-            )),
-        )
+        let storage = Arc::new(InMemoryStorage::new());
+        let (table, records) = CustodyRecords::open_alone(
+            Arc::clone(&storage),
+            CustodyNamespace::from_bytes(NAMESPACE),
+        );
+        Self::holding(provider, records, storage, table)
     }
 
-    /// A new adapter around `provider` over this adapter's custody records,
-    /// as production rebuilds an identity's adapter over its stored records
-    /// after a relaunch. Only a recorded key resolves, so a test that
-    /// reopens a host's keys mints them through an adapter first.
-    #[must_use]
-    pub fn reopen(&self, provider: Box<dyn crate::KeyCustodyProvider>) -> Arc<Self> {
-        Self::over(provider, Arc::clone(&self.records))
+    /// Closes this adapter and opens a new one around `provider` over the
+    /// same custody records, through the same namespace table, as
+    /// `identity_load_with_custody` rebuilds an identity's adapter over the
+    /// namespace its stored entry holds (spec §17.3). Only a recorded key resolves, so a test that
+    /// reopens a host's keys mints them through an adapter first. This
+    /// adapter answers `SCP-IDENT-1008` afterwards.
+    ///
+    /// # Errors
+    ///
+    /// `SCP-IDENT-1008` when this adapter is already closed, or while a call
+    /// on it still holds its records (the namespace is live).
+    pub fn reopen(
+        &self,
+        provider: Box<dyn crate::KeyCustodyProvider>,
+    ) -> Result<Arc<Self>, ScpError> {
+        let closing = self
+            .inner
+            .lock()
+            .map_err(|_| closed())?
+            .take()
+            .ok_or_else(closed)?;
+        drop(closing);
+        let records = CustodyRecords::open(
+            &self.table,
+            Arc::clone(&self.storage),
+            CustodyNamespace::from_bytes(NAMESPACE),
+        )
+        .map_err(|e| ScpError::from(scp_platform::PlatformError::from(e)))?;
+        Ok(Self::holding(
+            provider,
+            records,
+            Arc::clone(&self.storage),
+            self.table.clone(),
+        ))
     }
 
     /// Generates an operational key of `key_type` through the adapter, as
@@ -108,7 +167,7 @@ impl TestingCallbackCustody {
     ///
     /// The custody error production reports.
     pub async fn generate_keypair(&self, key_type: CustodyKeyType) -> Result<String, ScpError> {
-        self.inner
+        self.adapter()?
             .generate_keypair(key_type.into())
             .await
             .map(|handle| handle.id().to_string())
@@ -124,7 +183,7 @@ impl TestingCallbackCustody {
     /// The custody error production reports.
     pub async fn public_key(&self, key_id: String) -> Result<Vec<u8>, ScpError> {
         let key = testing_handle(&key_id)?;
-        self.inner
+        self.adapter()?
             .public_key(&key)
             .await
             .map(|pk| pk.as_bytes().to_vec())
@@ -140,7 +199,7 @@ impl TestingCallbackCustody {
     /// The custody error production reports.
     pub async fn sign(&self, key_id: String, data: Vec<u8>) -> Result<Vec<u8>, ScpError> {
         let key = testing_handle(&key_id)?;
-        self.inner
+        self.adapter()?
             .sign(&key, &data)
             .await
             .map(|signature| signature.as_bytes().to_vec())
@@ -159,7 +218,7 @@ impl TestingCallbackCustody {
         peer_public: Vec<u8>,
     ) -> Result<Vec<u8>, ScpError> {
         let key = testing_handle(&key_id)?;
-        self.inner
+        self.adapter()?
             .dh_agree(&key, &peer_public)
             .await
             .map(|shared| shared.as_bytes().to_vec())
@@ -173,7 +232,10 @@ impl TestingCallbackCustody {
     /// The custody error production reports.
     pub async fn destroy_key(&self, key_id: String) -> Result<(), ScpError> {
         let key = testing_handle(&key_id)?;
-        self.inner.destroy_key(&key).await.map_err(ScpError::from)
+        self.adapter()?
+            .destroy_key(&key)
+            .await
+            .map_err(ScpError::from)
     }
 
     /// The custody class the bridge reads for `key_id` from the host's
@@ -185,7 +247,7 @@ impl TestingCallbackCustody {
     /// canonical decimal `u64`.
     pub fn custody_type(&self, key_id: String) -> Result<String, ScpError> {
         let key = testing_handle(&key_id)?;
-        Ok(match self.inner.custody_type(&key) {
+        Ok(match self.adapter()?.custody_type(&key) {
             CustodyType::Hardware => "hardware",
             CustodyType::Software => "software",
             CustodyType::InMemory => "in_memory",
@@ -501,5 +563,34 @@ mod tests {
         );
         let refused = share_refused(&target, &theirs).expect_err("another client is refused");
         assert_eq!(refused.code(), codes::VALID_7000, "{refused:?}");
+    }
+
+    /// `reopen` closes the adapter and opens a new one over the same records
+    /// through the same table: the new one resolves the key the first
+    /// minted, and the first answers `SCP-IDENT-1008`, as does a second
+    /// `reopen` of it.
+    #[tokio::test]
+    async fn reopen_closes_the_adapter_and_keeps_its_records() {
+        let host = Arc::new(FakeHost::default());
+        let first = custody_over(&host, "software");
+        let key = first
+            .generate_keypair(CustodyKeyType::P256)
+            .await
+            .expect("mint");
+        let minted = first.public_key(key.clone()).await.expect("public key");
+        let reopened = first
+            .reopen(Box::new(FakeHostProvider::over(&host)))
+            .expect("the first adapter released its namespace");
+        assert_eq!(
+            reopened.public_key(key.clone()).await.expect("resolves"),
+            minted
+        );
+        let closed = first.public_key(key).await.expect_err("closed");
+        assert!(matches!(closed, ScpError::Identity { ref code, .. } if code == codes::IDENT_1008));
+        assert!(
+            first
+                .reopen(Box::new(FakeHostProvider::over(&host)))
+                .is_err()
+        );
     }
 }

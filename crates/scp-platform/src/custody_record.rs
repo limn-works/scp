@@ -6,13 +6,17 @@
 //! minted a key with, so a later host answer that disagrees is refused rather
 //! than trusted, and a handle with no record is refused before any host call.
 //!
-//! Each [`StorageCustodyRecordStore`] is scoped to one [`CustodyNamespace`],
-//! fixed when its callback adapter is built. Two adapters whose hosts reuse a
-//! key id therefore never read, overwrite or delete each other's record.
+//! Each record store is scoped to one [`CustodyNamespace`], drawn when its
+//! identity is created and stored with the identity. Two identities whose
+//! hosts reuse a key id therefore never read, overwrite or delete each
+//! other's record. [`CustodyNamespaces::open`] is the only way to build a
+//! store, and it refuses a namespace a live store of the same storage holds.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
@@ -39,12 +43,9 @@ const RECORD_LEN: usize = 3;
 /// A store's `put` checks for a record and then writes under a lock only
 /// that store holds, and [`Storage`] has no insert-if-absent, so two live
 /// stores over one namespace could each pass the check and write different
-/// records. The namespace is neither `Copy` nor `Clone`, and
-/// [`StorageCustodyRecordStore::new`] takes it by move, which stops one value
-/// from being reused by accident. It does not stop two equal namespaces built
-/// from the same bytes; the guard against two live stores for one namespace
-/// is SCP-345's callback-adapter loader, which refuses a second live adapter
-/// for a namespace.
+/// records. [`CustodyNamespaces::open`] therefore refuses a namespace that a
+/// live store of the same storage holds, whatever value carries its bytes.
+/// The namespace is neither `Copy` nor `Clone`, and `open` takes it by move.
 #[derive(PartialEq, Eq)]
 pub struct CustodyNamespace([u8; 16]);
 
@@ -135,9 +136,10 @@ pub trait CustodyRecordStore: Send + Sync {
 ///
 /// One store object serializes its own `put`s and `remove`s, so the check
 /// that refuses a different record and the write that follows it are not
-/// interleaved by another call on the same object. Each callback adapter
-/// holds one store per namespace.
-pub struct StorageCustodyRecordStore<S: Storage> {
+/// interleaved by another call on the same object. Only
+/// [`CustodyNamespaces::open`] builds one, so one namespace has at most one
+/// live store per storage.
+pub(crate) struct StorageCustodyRecordStore<S: Storage> {
     storage: S,
     namespace: CustodyNamespace,
     write_gate: Mutex<()>,
@@ -153,21 +155,9 @@ impl<S: Storage> fmt::Debug for StorageCustodyRecordStore<S> {
 
 impl<S: Storage> StorageCustodyRecordStore<S> {
     /// A store over `storage` that reads and writes only `namespace`'s
-    /// records. It takes `namespace` by move, so one value cannot build two:
-    ///
-    /// ```compile_fail,E0382
-    /// use scp_platform::{CustodyNamespace, Storage, StorageCustodyRecordStore};
-    ///
-    /// fn two_stores<S: Storage + Clone>(storage: S, namespace: CustodyNamespace) {
-    ///     let _first = StorageCustodyRecordStore::new(storage.clone(), namespace);
-    ///     let _second = StorageCustodyRecordStore::new(storage, namespace);
-    /// }
-    /// ```
-    ///
-    /// `tests/custody_record_namespace.rs` compiles the same function with
-    /// two namespaces.
+    /// records.
     #[must_use]
-    pub const fn new(storage: S, namespace: CustodyNamespace) -> Self {
+    pub(crate) const fn new(storage: S, namespace: CustodyNamespace) -> Self {
         Self {
             storage,
             namespace,
@@ -255,6 +245,159 @@ impl<S: Storage> CustodyRecordStore for StorageCustodyRecordStore<S> {
             let _gate = self.write_gate.lock().await;
             self.storage.delete(&self.key(handle)).await
         })
+    }
+}
+
+/// [`CustodyNamespaces::open`] refused a namespace because a live store of
+/// the same storage holds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NamespaceLive;
+
+impl fmt::Display for NamespaceLive {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a live custody record store already holds this custody namespace")
+    }
+}
+
+impl std::error::Error for NamespaceLive {}
+
+/// The custody namespaces the live record stores of one storage hold
+/// (spec §17.3).
+///
+/// The owner of a storage, a bridge instance, keeps one table for it, and
+/// every record store over that storage comes from [`open`](Self::open). A
+/// store's `put` checks for a record and then writes under a lock only that
+/// store holds, so two live stores over one namespace could each pass the
+/// check and write different records; the table refuses the second. Clones
+/// share one table.
+#[derive(Debug, Clone, Default)]
+pub struct CustodyNamespaces {
+    live: Arc<std::sync::Mutex<HashSet<[u8; 16]>>>,
+}
+
+impl CustodyNamespaces {
+    /// A table with no live namespace.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn live(&self) -> std::sync::MutexGuard<'_, HashSet<[u8; 16]>> {
+        // A poisoned table is still consistent: the lock guards a plain set
+        // that no panic leaves half-written.
+        self.live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Opens the record store of `namespace` over `storage`. The namespace is
+    /// live until the store drops.
+    ///
+    /// # Errors
+    ///
+    /// [`NamespaceLive`] while another store from this table holds
+    /// `namespace`.
+    pub fn open<S: Storage>(
+        &self,
+        storage: S,
+        namespace: CustodyNamespace,
+    ) -> Result<LiveCustodyRecordStore<S>, NamespaceLive> {
+        let bytes = *namespace.as_bytes();
+        if !self.live().insert(bytes) {
+            return Err(NamespaceLive);
+        }
+        Ok(LiveCustodyRecordStore {
+            store: StorageCustodyRecordStore::new(storage, namespace),
+            _lease: NamespaceLease {
+                table: self.clone(),
+                bytes,
+            },
+        })
+    }
+
+    /// A new table and the store of `namespace` over `storage` it holds,
+    /// for a test adapter that needs records but no instance: a new table
+    /// holds no namespace, so the open cannot be refused.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn open_alone<S: Storage>(
+        storage: S,
+        namespace: CustodyNamespace,
+    ) -> (Self, LiveCustodyRecordStore<S>) {
+        let table = Self::new();
+        let bytes = *namespace.as_bytes();
+        table.live().insert(bytes);
+        let store = LiveCustodyRecordStore {
+            store: StorageCustodyRecordStore::new(storage, namespace),
+            _lease: NamespaceLease {
+                table: table.clone(),
+                bytes,
+            },
+        };
+        (table, store)
+    }
+}
+
+/// Releases a namespace from its table when the store holding it drops.
+struct NamespaceLease {
+    table: CustodyNamespaces,
+    bytes: [u8; 16],
+}
+
+impl Drop for NamespaceLease {
+    fn drop(&mut self) {
+        self.table.live().remove(&self.bytes);
+    }
+}
+
+/// A [`CustodyRecordStore`] over the instance [`Storage`] (spec §17.6),
+/// scoped to one [`CustodyNamespace`].
+///
+/// It holds its namespace in its [`CustodyNamespaces`] table until it
+/// drops. The key is `custody/record/{namespace as 32 lowercase hex}/{decimal key
+/// id}`, and the value is `[0x01, type code, role byte]` (spec §17.3).
+pub struct LiveCustodyRecordStore<S: Storage> {
+    // Declared before `_lease`, so the store drops before its namespace is
+    // released and a later `open` builds the only live store.
+    store: StorageCustodyRecordStore<S>,
+    _lease: NamespaceLease,
+}
+
+impl<S: Storage> fmt::Debug for LiveCustodyRecordStore<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LiveCustodyRecordStore")
+            .field("namespace", &self.store.namespace)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<S: Storage> LiveCustodyRecordStore<S> {
+    /// The namespace this store reads and writes.
+    #[must_use]
+    pub const fn namespace(&self) -> &CustodyNamespace {
+        &self.store.namespace
+    }
+}
+
+impl<S: Storage> CustodyRecordStore for LiveCustodyRecordStore<S> {
+    fn put(
+        &self,
+        handle: KeyHandle,
+        key_type: KeyType,
+        role: KeyRole,
+    ) -> BoxFuture<'_, Result<(), PlatformError>> {
+        self.store.put(handle, key_type, role)
+    }
+
+    fn get(
+        &self,
+        handle: KeyHandle,
+    ) -> BoxFuture<'_, Result<Option<CustodyRecord>, PlatformError>> {
+        self.store.get(handle)
+    }
+
+    fn remove(&self, handle: KeyHandle) -> BoxFuture<'_, Result<(), PlatformError>> {
+        self.store.remove(handle)
     }
 }
 

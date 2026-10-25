@@ -51,6 +51,13 @@
           "swift": true
         },
         {
+          "name": "load_with_custody",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true
+        },
+        {
           "name": "add_agent_key",
           "python": true,
           "typescript": true,
@@ -2603,39 +2610,61 @@
     },
     {
       "rule_id": "callback-custody-record-store-at-create",
-      "description": "The PyO3 and UniFFI production paths that builds a callback custody adapter for a host `KeyCustodyProvider` must load the adapter's custody record store from the instance storage through `custody_record_store`, which leases the identity's own record namespace (ADR-021, spec 17 section 17.3 custody records, SCP-345). An adapter built without that store would have no record of each host key's type and role, so it could neither mint a key-event key nor refuse a host that reports a key-event key as a raw signing key.",
+      "description": "The PyO3 and UniFFI production paths that build a callback custody adapter for a host `KeyCustodyProvider` at create must open the adapter's custody records over the instance storage through `create_records`, which draws the identity's namespace and leases it in the instance's namespace table, and refuses storage that does not persist (ADR-021, spec 17 section 17.3 custody records and callback custody identity entry, SCP-345). An adapter built without those records would have no record of each host key's type and role, so it could neither mint a key-event key nor refuse a host that reports a key-event key as a raw signing key.",
       "applies_to": [
         "pyo3",
         "uniffi"
       ],
       "pattern": {
         "caller_matches": "^(build_key_custody|decide_custody_for_create)$",
-        "required_callee": "custody_record_store",
+        "required_callee": "create_records",
         "scope": "same-function-or-direct-callee",
         "min_occurrences": 1
       },
       "evidence": {
         "code_sites": [
-          "crates/scp-ffi/src/identity.rs build_key_custody → callback_registry → custody_record_store",
-          "crates/scp-ffi/uniffi/src/bridge.rs decide_custody_for_create → custody_record_store"
+          "crates/scp-ffi/src/identity.rs build_key_custody → callback_registry → create_records",
+          "crates/scp-ffi/uniffi/src/bridge.rs decide_custody_for_create → create_records"
         ]
       }
     },
     {
       "rule_id": "callback-custody-record-store-at-create-napi",
-      "description": "The napi `identity_create_with_custody` must load the callback custody adapter's record store from the instance storage through `custody_record_store`, as the rule `callback-custody-record-store-at-create` requires of the PyO3 and UniFFI bridges, whose adapter construction lives in a helper with another name (ADR-021, spec 17 section 17.3 custody records, SCP-345).",
+      "description": "The napi `identity_create_with_custody` must open the callback custody adapter's records over the instance storage through `create_records`, as the rule `callback-custody-record-store-at-create` requires of the PyO3 and UniFFI bridges, whose adapter construction lives in a helper with another name (ADR-021, spec 17 section 17.3 custody records, SCP-345).",
       "applies_to": [
         "napi"
       ],
       "pattern": {
         "caller_matches": "^identity_create_with_custody$",
-        "required_callee": "custody_record_store",
+        "required_callee": "create_records",
         "scope": "same-function",
         "min_occurrences": 1
       },
       "evidence": {
         "code_sites": [
-          "crates/scp-ffi/napi/src/scp.rs Scp::identity_create_with_custody → custody_record_store"
+          "crates/scp-ffi/napi/src/scp.rs Scp::identity_create_with_custody → create_records"
+        ]
+      }
+    },
+    {
+      "rule_id": "callback-custody-identity-load-opens-entry",
+      "description": "Every bridge's `identity_load_with_custody` must rebuild the callback custody adapter through `open_entry`, which reads the identity's callback custody entry and opens its records over the stored namespace through the instance's namespace table, refusing a namespace another adapter holds (spec 17 section 17.3 callback custody identity entry, decision D1, SCP-345). A load that drew a fresh namespace instead would lose every key the identity minted before the restart.",
+      "applies_to": [
+        "pyo3",
+        "uniffi",
+        "napi"
+      ],
+      "pattern": {
+        "caller_matches": "^identity_load_with_custody$",
+        "required_callee": "open_entry",
+        "scope": "same-function",
+        "min_occurrences": 1
+      },
+      "evidence": {
+        "code_sites": [
+          "crates/scp-ffi/src/identity.rs PyScp::identity_load_with_custody → open_entry",
+          "crates/scp-ffi/uniffi/src/bridge.rs Scp::identity_load_with_custody → open_entry",
+          "crates/scp-ffi/napi/src/scp.rs Scp::identity_load_with_custody → open_entry"
         ]
       }
     }

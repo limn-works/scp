@@ -406,7 +406,7 @@
 
             let reopened = keyIds.p256Adapter(softwareStore, enclaveAvailable: false, other: enclaveStore)
             #expect(reopened.mintBacking == .software)
-            let bridge = mintingBridge.reopen(provider: reopened)
+            let bridge = try mintingBridge.reopen(provider: reopened)
             let signingPublic = try await bridge.publicKey(keyId: signing)
             let digest = P256Fixture.randomDigest()
             let signature = try await bridge.sign(keyId: signing, data: digest)
@@ -816,7 +816,11 @@
             let store = SoftwareP256KeyStore()
             let custody = keyIds.p256Adapter(store)
             let creatorScp = try SCP(storage: .inMemory)
-            let joinerScp = try SCP(storage: .inMemory)
+            // The joiner creates with a provider, which needs persistent
+            // storage (spec section 17.3).
+            let joinerDir = try persistentTestDirectory()
+            defer { try? FileManager.default.removeItem(at: joinerDir) }
+            let joinerScp = try persistentTestScp(at: joinerDir)
 
             var failure: (any Error)?
             do {

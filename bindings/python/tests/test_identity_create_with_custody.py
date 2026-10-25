@@ -21,6 +21,7 @@ Requires the native extension built with ``testing``::
 from __future__ import annotations
 
 import hashlib
+import json
 from typing import Literal
 
 import pytest
@@ -35,6 +36,15 @@ from scp_sdk import (
     p256_software_pseudonym_point,
 )
 from scp_sdk.errors import KeyNotFoundError
+from tests.conftest import open_sqlite_scp
+
+
+@pytest.fixture
+def scp(sqlite_scp):  # type: ignore[no-untyped-def]
+    """This module's instance persists: callback custody refuses storage that
+    does not persist (spec section 17.3)."""
+    return sqlite_scp
+
 
 # ---------------------------------------------------------------------------
 # Minimal pure-Python Ed25519 (RFC 8032) — stdlib only.
@@ -479,3 +489,88 @@ async def test_key_not_found_error_from_the_host_reaches_the_caller_as_4006(scp)
     with pytest.raises(_scp_core.ScpError) as excinfo:
         await scp.identity_create_with_custody(_ForgetsEveryKey())
     assert str(excinfo.value).startswith("[SCP-CRYPTO-4006]"), excinfo.value
+
+
+# ---------------------------------------------------------------------------
+# identity_load_with_custody (spec section 17.3, SCP-345 decision D1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_new_instance_loads_the_identity_and_signs_with_its_earlier_key(
+    tmp_path,  # type: ignore[no-untyped-def]
+) -> None:
+    """The identity's custody entry carries its namespace, so a new instance
+    over the same directory reaches the keys the earlier one minted."""
+    from scp_sdk import _scp_core
+
+    class _CountingKeychain(_FakeKeychain):
+        def __init__(self) -> None:
+            super().__init__()
+            self.sign_calls = 0
+
+        def sign(self, key_id: str, message: bytes) -> bytes:
+            self.sign_calls += 1
+            return super().sign(key_id, message)
+
+    provider = _CountingKeychain()
+    first = open_sqlite_scp(tmp_path)
+    try:
+        did = (await first.identity_create_with_custody(provider)).did
+    finally:
+        first.__exit__(None, None, None)
+
+    second = open_sqlite_scp(tmp_path)
+    try:
+        with pytest.raises(_scp_core.ScpError) as plain:
+            await second.identity_load(did)
+        assert "SCP-IDENT-1003" in str(plain.value), plain.value
+
+        loaded = await second.identity_load_with_custody(did, provider)
+        assert loaded.did == did
+        assert loaded.custody_type is CustodyType.OS_KEYSTORE
+
+        # The identity key was minted by the first instance; its record lives
+        # under the stored namespace, so the loaded adapter resolves it, and
+        # the proposal signs through `provider`.
+        ctx = await second.context_create(
+            did,
+            {
+                "ceiling": ["governance:propose", "member:ban", "messages:read", "messages:write"],
+                "memory_scope": "ephemeral",
+                "governance": "single_admin",
+            },
+        )
+        signs_before = provider.sign_calls
+        response = await second.governance_propose(
+            ctx,
+            did,
+            json.dumps({"SuspendCapability": {"did": did, "capabilities": ["MessagesWrite"]}}),
+        )
+        status = json.loads(response) if isinstance(response, str) else dict(response)
+        assert status["status"] == "Approved", status
+        assert provider.sign_calls > signs_before
+
+        with pytest.raises(_scp_core.ScpError) as again:
+            await second.identity_load_with_custody(did, provider)
+        assert "SCP-IDENT-1008" in str(again.value), again.value
+    finally:
+        second.__exit__(None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_in_memory_storage_refuses_a_callback_custody_create_and_load_with_storage_8000(
+    in_memory_scp,  # type: ignore[no-untyped-def]
+) -> None:
+    from scp_sdk import _scp_core
+
+    provider = _FakeKeychain()
+    with pytest.raises(_scp_core.ScpError) as created:
+        await in_memory_scp.identity_create_with_custody(provider)
+    assert "SCP-STORAGE-8000" in str(created.value), created.value
+
+    with pytest.raises(_scp_core.ScpError) as loaded:
+        await in_memory_scp.identity_load_with_custody(
+            "did:dht:ab3ii3ef4mbcu5rmhkbf5yctwnodzx6a65ghazmtu1ydzhfzezby", provider
+        )
+    assert "SCP-STORAGE-8000" in str(loaded.value), loaded.value

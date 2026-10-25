@@ -240,8 +240,9 @@ class KeyCustodyProvider(Protocol):
         ``role`` is the role :meth:`generate_keypair` minted the key in,
         reported in every session. The bridge records each key's type and
         role when it mints the key, in the instance storage, and refuses an
-        answer that disagrees with that record, in this session or a later
-        one. A key id with no record is key-not-found, with no callback.
+        answer that disagrees with that record, in this session or in a later
+        one that loads the identity with :meth:`SCP.identity_load_with_custody`.
+        A key id with no record is key-not-found, with no callback.
         """
         ...
 
@@ -643,11 +644,12 @@ _R = TypeVar("_R")
 
 def _requires_custody(
     remedy: str,
+    position: int = 1,
 ) -> Callable[[Callable[_P, Awaitable[_R]]], Callable[_P, Awaitable[_R]]]:
     """Raise ``SCP-IDENT-1116`` when the caller passes no custody, before ``fn`` runs.
 
-    ``fn`` is a method whose second parameter names the custody, and
-    ``remedy`` tells the caller what to pass there. The wrapper keeps
+    ``fn`` is a method whose parameter at ``position`` (``self`` is 0) names
+    the custody, and ``remedy`` tells the caller what to pass there. The wrapper keeps
     ``fn``'s signature for a type checker, which rejects the omission; an
     untyped caller that omits the custody or passes ``None`` reaches the
     wrapper and gets ``SCP-IDENT-1116`` instead of Python's ``TypeError``,
@@ -655,11 +657,11 @@ def _requires_custody(
     """
 
     def decorate(fn: Callable[_P, Awaitable[_R]]) -> Callable[_P, Awaitable[_R]]:
-        custody_param = fn.__code__.co_varnames[1]
+        custody_param = fn.__code__.co_varnames[position]
 
         @functools.wraps(fn)
         async def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
-            custody = args[1] if len(args) > 1 else kwargs.get(custody_param)
+            custody = args[position] if len(args) > position else kwargs.get(custody_param)
             if custody is None:
                 raise _custody_required_error(fn.__name__, remedy)
             return await fn(*args, **kwargs)
@@ -1201,9 +1203,46 @@ class SCP:
         return [IdentityAttestation._from_dict(item) for item in items]
 
     async def identity_load(self, did: str) -> Identity:
-        """Delegate to ``_scp_core.SCP.identity_load`` (returns :class:`Identity`)."""
+        """Delegate to ``_scp_core.SCP.identity_load`` (returns :class:`Identity`).
+
+        An identity created with :meth:`identity_create_with_custody` loads
+        only through :meth:`identity_load_with_custody`, which takes its
+        provider.
+
+        :raises IdentityError: ``SCP-IDENT-1003`` when ``did`` was created with
+            a :class:`KeyCustodyProvider` on this instance's storage (spec
+            section 17.3).
+        """
 
         raw = await asyncio.to_thread(self._native.identity_load, did)
+        return Identity(raw)
+
+    @_requires_custody(_CUSTODY_PROVIDER_REMEDY, position=2)
+    async def identity_load_with_custody(self, did: str, provider: KeyCustodyProvider) -> Identity:
+        """Load an identity created with :meth:`identity_create_with_custody`.
+
+        Delegate to ``_scp_core.SCP.identity_load_with_custody``. The identity
+        was created on this instance's storage, in this process or an earlier
+        one, and ``provider`` is the same host custody; the identity's keys,
+        including keys its custody minted earlier, sign through it (spec
+        section 17.3).
+
+        :param did: The identity's DID.
+        :param provider: The :class:`KeyCustodyProvider` that created it.
+        :returns: An :class:`Identity` wrapper.
+        :raises IdentityError: ``SCP-IDENT-1116`` when ``provider`` is absent
+            or ``None``, before any bridge call; ``SCP-IDENT-1002`` when the
+            storage holds no entry for ``did``; ``SCP-IDENT-1009`` when the
+            entry does not decode or names another DID; ``SCP-IDENT-1008``
+            while this instance already holds the identity loaded, or when
+            ``provider``'s identity key does not derive ``did``.
+        :raises ValidationError: ``SCP-VALID-7005`` when ``provider`` is
+            missing a method.
+        :raises ContextError: ``SCP-STORAGE-8000`` when this instance's
+            storage does not persist (``{"type": "in_memory"}``).
+        """
+
+        raw = await asyncio.to_thread(self._native.identity_load_with_custody, did, provider)
         return Identity(raw)
 
     async def identity_migrate(self, identity: Identity) -> Identity:

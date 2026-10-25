@@ -987,44 +987,85 @@ fn build_key_custody(
     }
 }
 
-/// The record-backed registry of a new identity's callback custody (SCP-345
-/// decision D1): a fresh namespace over `bi`'s own storage. The custody holds
-/// the namespace for as long as the identity's registry entry keeps it, so a
-/// second adapter over the same records is refused while it lives.
+/// The record-backed registry of a new identity's callback custody (spec
+/// §17.3, SCP-345 decision D1): a namespace drawn here over `bi`'s own
+/// storage, opened through `bi`'s namespace table. The create stores the
+/// namespace in the identity's callback custody entry, and
+/// `identity_load_with_custody` reopens the records over it.
 ///
 /// # Errors
 ///
-/// `SCP-STORAGE-8000` when `bi` has no storage, since records with no store
-/// would lose every key's type at restart (spec section 17.17, decision D2);
-/// the [`CustodyLoadError`] code when no namespace can be drawn.
+/// `SCP-STORAGE-8000` when `bi`'s storage does not persist (none, or
+/// `in_memory`), since the entry and records would end with the instance
+/// while the host keys remain; the [`CallbackIdentityError`] code when no
+/// namespace can be drawn.
 ///
-/// [`CustodyLoadError`]: scp_ffi_common::callback_custody::CustodyLoadError
+/// [`CallbackIdentityError`]: scp_ffi_common::callback_identity::CallbackIdentityError
 fn callback_registry(
     bi: &PyBridgeInstance,
 ) -> Result<scp_ffi_common::callback_custody::CallbackKeyRegistry, ScpPyError> {
-    use crate::runtime::StorageProvider;
-    use scp_ffi_common::callback_custody::{
-        CallbackKeyRegistry, CustodyNamespaceSlot, custody_record_store,
-    };
-    let load = |e| ScpPyError::from(scp_platform::PlatformError::from(e));
-    let slot = CustodyNamespaceSlot::fresh().map_err(load)?;
-    let records = match bi.storage_provider() {
-        Some(StorageProvider::InMemoryEncrypted(storage)) => {
-            custody_record_store(Arc::clone(storage), &slot)
-        }
-        Some(StorageProvider::Sqlite(storage)) => custody_record_store(Arc::clone(storage), &slot),
-        None => {
-            return Err(ScpPyError::ContextError {
-                message: "no storage provider is attached, so a callback custody has no store \
-                          for its key records; construct the bridge with storage first \
-                          (spec section 17.17)"
-                    .to_owned(),
-                code: scp_ffi_common::error_codes::STORAGE_8000.to_owned(),
-            });
-        }
+    let records = scp_ffi_common::callback_identity::create_records(
+        bi.core.custody_namespaces(),
+        callback_custody_storage(bi),
+    )
+    .map_err(callback_identity_error)?;
+    Ok(scp_ffi_common::callback_custody::CallbackKeyRegistry::recorded(records))
+}
+
+/// The storage a callback custody identity's entry and records live in
+/// (spec §17.3): `bi`'s `SQLCipher` store, or `None` when `bi`'s storage
+/// does not persist.
+fn callback_custody_storage(
+    bi: &PyBridgeInstance,
+) -> Option<Arc<scp_platform::sqlite::SqliteStorage>> {
+    match bi.storage_provider() {
+        Some(crate::runtime::StorageProvider::Sqlite(storage)) => Some(Arc::clone(storage)),
+        Some(crate::runtime::StorageProvider::InMemoryEncrypted(_)) | None => None,
     }
-    .map_err(load)?;
-    Ok(CallbackKeyRegistry::recorded(records))
+}
+
+/// Writes the callback custody entry of an identity just minted over
+/// `custody` when `custody` is a host provider's adapter (spec §17.3,
+/// SCP-345 decision D1); other custodies keep no entry.
+///
+/// # Errors
+///
+/// `SCP-STORAGE-8000` when `bi`'s storage stopped persisting, and the
+/// [`CallbackIdentityError`] code when the write fails.
+///
+/// [`CallbackIdentityError`]: scp_ffi_common::callback_identity::CallbackIdentityError
+#[cfg(feature = "testing")]
+async fn write_callback_entry(
+    bi: &PyBridgeInstance,
+    custody: &FfiKeyCustody,
+    identity: &ScpIdentity,
+    document: &DidDocument,
+) -> Result<(), ScpPyError> {
+    use scp_ffi_common::callback_identity::{CallbackIdentityError, write_entry};
+    let FfiKeyCustody::Callback(adapter) = custody else {
+        return Ok(());
+    };
+    let storage = callback_custody_storage(bi)
+        .ok_or_else(|| callback_identity_error(CallbackIdentityError::NotPersistent))?;
+    write_entry(storage.as_ref(), adapter.namespace(), identity, document)
+        .await
+        .map_err(callback_identity_error)
+}
+
+/// Maps a callback custody identity refusal to the code every bridge
+/// reports for it (spec §17.3): a storage selection that does not persist in
+/// the storage class, every other refusal in the identity class.
+fn callback_identity_error(
+    error: scp_ffi_common::callback_identity::CallbackIdentityError,
+) -> ScpPyError {
+    if error.is_storage_selection() {
+        ScpPyError::ContextError {
+            message: error.to_string(),
+            code: error.code().to_owned(),
+        }
+    } else {
+        ScpPyError::identity_with_code(error.to_string(), error.code())
+    }
 }
 
 /// Maps a shared [`FileCustodyError`] onto this bridge's error type.
@@ -1650,6 +1691,11 @@ impl crate::scp::PyScp {
                         .await
                         .map_err(ScpPyError::from)?;
 
+                    // The identity's callback custody entry, before the create
+                    // returns (spec §17.3, SCP-345 decision D1): a failed write
+                    // fails the create.
+                    write_callback_entry(&bi_arc, &key_custody, &identity, &document).await?;
+
                     let did = identity.did.clone();
                     let document_for_handle = document.clone();
 
@@ -1766,6 +1812,12 @@ impl crate::scp::PyScp {
             let storage = crate::runtime::get_storage(&bi_arc).map_err(PyErr::from)?;
 
             async {
+                // An identity created with a host custody provider loads only
+                // with that provider (spec §17.3).
+                scp_ffi_common::callback_identity::refuse_plain_load(storage, &did_owned)
+                    .await
+                    .map_err(callback_identity_error)?;
+
                 let key = identity_state_key(&did_owned);
                 // `storage` is `&StorageProvider` which impls `Storage` directly
                 // via enum dispatch — no Arc blanket-impl ambiguity.
@@ -1841,6 +1893,118 @@ impl crate::scp::PyScp {
                 ))))
             }
             .await
+        })?
+    }
+
+    /// Loads an identity created with `identity_create_with_custody` on this
+    /// instance's storage, with the same host custody provider (spec §17.3,
+    /// SCP-345 decision D1).
+    ///
+    /// Reads the identity's callback custody entry, reopens its custody
+    /// records over the stored namespace, and checks that `provider` holds
+    /// the identity key the DID derives from. The handle reports
+    /// `"os_keystore"` and signs through `provider`, including with keys
+    /// minted in an earlier process.
+    ///
+    /// # Errors
+    ///
+    /// - `ValidationError` (`SCP-VALID-7005`) when `provider` lacks a
+    ///   custody method.
+    /// - `IdentityError` (`SCP-IDENT-1004`) for a DID that is not `did:dht`.
+    /// - `ContextError` (`SCP-STORAGE-8000`) when this instance's storage
+    ///   does not persist.
+    /// - `IdentityError` (`SCP-IDENT-1002`) when the storage holds no entry
+    ///   for `did`; `SCP-IDENT-1009` when the entry does not decode or names
+    ///   another DID; `SCP-IDENT-1008` while another live adapter of this
+    ///   instance holds the identity's namespace, or when `provider`'s
+    ///   identity key does not derive `did`.
+    pub fn identity_load_with_custody(
+        &self,
+        py: Python<'_>,
+        did: &str,
+        provider: Py<PyAny>,
+    ) -> PyResult<PyIdentity> {
+        use scp_ffi_common::callback_identity::{
+            LoadedCallbackIdentity, check_provider, open_entry,
+        };
+        let bi_arc = Arc::clone(&self.inner);
+        validate::validate_did(did)?;
+        if !did.starts_with("did:dht:") {
+            return Err(PyErr::from(ScpPyError::identity_with_code(
+                format!("unsupported DID method: {did} -- only did:dht is supported"),
+                scp_ffi_common::error_codes::IDENT_1004,
+            )));
+        }
+        let provider_shim =
+            crate::custody::PyKeyCustodyProvider::new(py, provider).map_err(|e| {
+                ScpPyError::ValidationError {
+                    message: format!("invalid KeyCustodyProvider: {e}"),
+                    code: scp_ffi_common::error_codes::VALID_7005.to_owned(),
+                }
+            })?;
+        let did_owned = did.to_owned();
+        let handle = crate::runtime()?.handle().clone();
+
+        crate::actor_wait::block_on_released(py, async {
+            let LoadedCallbackIdentity {
+                records,
+                identity,
+                document,
+            } = open_entry(
+                bi_arc.core.custody_namespaces(),
+                callback_custody_storage(&bi_arc),
+                &did_owned,
+            )
+            .await
+            .map_err(callback_identity_error)?;
+            let custody = Arc::new(FfiKeyCustody::Callback(
+                crate::custody::PyCallbackKeyCustody::new(
+                    provider_shim,
+                    scp_ffi_common::callback_custody::CallbackKeyRegistry::recorded(records),
+                ),
+            ));
+            let verifying_key_hex = Some(
+                check_provider(custody.as_ref(), &identity)
+                    .await
+                    .map_err(callback_identity_error)?,
+            );
+            // The resolver a governance vote and a UCAN check read this
+            // identity's document from, as create initializes it before minting.
+            ensure_did_resolver_initialized_on(&bi_arc, handle).map_err(PyErr::from)?;
+            // As create does after it registers the identity, publish the
+            // stored document into the resolver's DHT client: this instance's
+            // resolver reads it there to verify the identity's signatures.
+            #[cfg(feature = "testing")]
+            publish_to_resolver_dht_for(&bi_arc, &identity, &document, custody.as_ref()).await;
+            let loaded = PyIdentity::from_document(
+                &bi_arc,
+                identity.did.clone(),
+                scp_ffi_common::custody_request::CustodyRequest::OsKeystore
+                    .as_str()
+                    .to_owned(),
+                &document,
+                verifying_key_hex,
+            );
+            crate::runtime::register_identity(
+                &bi_arc,
+                &did_owned,
+                crate::runtime::IdentityEntry {
+                    identity,
+                    custody,
+                    document,
+                    identity_link_attestations: Vec::new(),
+                    // The pre-rotation key stays in the substrate that
+                    // created it, which no load reopens: the handle names no
+                    // key, and the testing-only custody field holds an empty
+                    // custody.
+                    pre_rotation_handle: scp_platform::PreRotationKeyHandle::new(0),
+                    #[cfg(feature = "testing")]
+                    pre_rotation_custody: Arc::new(
+                        scp_platform::testing::InMemoryPreRotationCustody::new(),
+                    ),
+                },
+            );
+            Ok::<_, PyErr>(loaded)
         })?
     }
 
@@ -3320,7 +3484,10 @@ mod custody_request_tests {
         seed: Option<zeroize::Zeroizing<[u8; 32]>>,
     ) -> Result<String, String> {
         let selection = resolve_custody(request, provider, seed).map_err(|e| format!("{e:?}"))?;
-        build_key_custody(selection, &PyBridgeInstance::new_in_memory_for_test())
+        // `os_keystore` builds only over storage that persists (spec §17.3).
+        let dir = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
+        let bi = PyBridgeInstance::sqlite_for_test(dir.path()).map_err(|e| format!("{e:?}"))?;
+        build_key_custody(selection, &bi)
             .map(|(_, label)| label)
             .map_err(|e| format!("{e:?}"))
     }
@@ -3350,7 +3517,8 @@ mod custody_request_tests {
     /// second record as a different record for handle 1.
     #[test]
     fn build_key_custody_gives_each_os_keystore_identity_its_own_namespace() -> Result<(), String> {
-        let bi = PyBridgeInstance::new_in_memory_for_test();
+        let dir = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
+        let bi = PyBridgeInstance::sqlite_for_test(dir.path()).map_err(|e| format!("{e:?}"))?;
         let custody = || {
             let selection = resolve_custody("os_keystore", Some(provider()), None)
                 .map_err(|e| format!("{e:?}"))?;

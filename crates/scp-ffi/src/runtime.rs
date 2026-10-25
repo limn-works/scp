@@ -608,6 +608,17 @@ impl PyBridgeInstance {
         Self::new_py().with_in_memory_storage()
     }
 
+    /// A `PyBridgeInstance` over `SQLCipher` storage in `dir`, for Rust-side
+    /// tests that create an identity with a host custody provider, which
+    /// storage that does not persist refuses (spec §17.3).
+    #[cfg(test)]
+    pub(crate) fn sqlite_for_test(dir: &std::path::Path) -> Result<Self, StorageInitError> {
+        Self::with_storage_py(StorageConfig::Sqlite {
+            path: dir.to_path_buf(),
+            key: SqliteKeyMaterial::Raw(zeroize::Zeroizing::new(vec![0x5Cu8; 32])),
+        })
+    }
+
     /// This instance with a fresh encrypted in-memory storage provider in its
     /// storage slot.
     fn with_in_memory_storage(mut self) -> Self {

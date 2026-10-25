@@ -10,8 +10,6 @@
 #![cfg(all(feature = "custody", feature = "testing"))]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::sync::Arc;
-
 use scp_ffi_common::callback_custody::{
     self as flow, CallbackKeyRegistry, CustodyRecords, fake_host::FakeHost,
 };
@@ -19,8 +17,8 @@ use scp_platform::traits::{
     CustodyType, KeyCustody, KeyHandle, KeyType, PublicKey, SharedSecret, Signature,
 };
 use scp_platform::{
-    CustodyNamespace, CustodyProbe, IndexedSignature, KeyEventSignError, KeyEventSigner,
-    PlatformError, ProbeSignature, Pseudonym, SigningChange, StorageCustodyRecordStore,
+    CustodyNamespace, CustodyNamespaces, CustodyProbe, IndexedSignature, KeyEventSignError,
+    KeyEventSigner, PlatformError, ProbeSignature, Pseudonym, SigningChange,
 };
 
 /// The callback flows over a fake host, as a bridge adapter wires them.
@@ -31,13 +29,16 @@ struct FakeHostCustody {
 
 impl FakeHostCustody {
     fn new() -> Self {
-        let store = StorageCustodyRecordStore::new(
+        // A table of its own: no other adapter holds the namespace.
+        let records = CustodyRecords::open(
+            &CustodyNamespaces::new(),
             scp_platform::in_memory::InMemoryStorage::new(),
             CustodyNamespace::from_bytes([0x5c; 16]),
-        );
+        )
+        .expect("a new namespace table holds no namespace");
         Self {
             host: FakeHost::default(),
-            registry: CallbackKeyRegistry::recorded(CustodyRecords::unleased(Arc::new(store))),
+            registry: CallbackKeyRegistry::recorded(records),
         }
     }
 }

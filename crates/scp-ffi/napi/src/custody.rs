@@ -638,8 +638,14 @@ impl<H> fmt::Debug for CallbackAdapter<H> {
 }
 
 impl<H> CallbackAdapter<H> {
-    const fn over(host: H, registry: CallbackKeyRegistry) -> Self {
+    pub(crate) const fn over(host: H, registry: CallbackKeyRegistry) -> Self {
         Self { host, registry }
+    }
+
+    /// The custody namespace this adapter's records live under, which the
+    /// identity's callback custody entry stores (spec §17.3).
+    pub(crate) const fn namespace(&self) -> [u8; 16] {
+        self.registry.namespace()
     }
 }
 
@@ -665,50 +671,64 @@ impl NapiCallbackKeyCustody {
         registry: CallbackKeyRegistry,
     ) -> napi::Result<Self> {
         Ok(Self::over(
-            CallbackTsfns {
-                generate_keypair: provider
-                    .generate_keypair
-                    .build_threadsafe_function()
-                    .weak::<false>()
-                    .build()?,
-                sign: provider
-                    .sign
-                    .build_threadsafe_function()
-                    .weak::<false>()
-                    .build()?,
-                get_public_key: provider
-                    .get_public_key
-                    .build_threadsafe_function()
-                    .weak::<false>()
-                    .build()?,
-                destroy_key: provider
-                    .destroy_key
-                    .build_threadsafe_function()
-                    .weak::<false>()
-                    .build()?,
-                dh_agree: provider
-                    .dh_agree
-                    .build_threadsafe_function()
-                    .weak::<false>()
-                    .build()?,
-                derive_pseudonym: provider
-                    .derive_pseudonym
-                    .build_threadsafe_function()
-                    .weak::<false>()
-                    .build()?,
-                derive_rotatable_pseudonym: provider
-                    .derive_rotatable_pseudonym
-                    .build_threadsafe_function()
-                    .weak::<false>()
-                    .build()?,
-                custody_type: provider
-                    .custody_type
-                    .build_threadsafe_function()
-                    .weak::<false>()
-                    .build()?,
-            },
+            CallbackTsfns::from_provider(provider)?,
             registry,
         ))
+    }
+}
+
+impl CallbackTsfns {
+    /// Promotes each JS `Function` of `provider` to a threadsafe function,
+    /// on the JS thread, so an adapter can be built over them on a tokio
+    /// worker once its custody records are open.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `napi::Error` if any callback cannot be promoted to a
+    /// threadsafe function.
+    pub(crate) fn from_provider(provider: NapiKeyCustodyProvider) -> napi::Result<Self> {
+        Ok(Self {
+            generate_keypair: provider
+                .generate_keypair
+                .build_threadsafe_function()
+                .weak::<false>()
+                .build()?,
+            sign: provider
+                .sign
+                .build_threadsafe_function()
+                .weak::<false>()
+                .build()?,
+            get_public_key: provider
+                .get_public_key
+                .build_threadsafe_function()
+                .weak::<false>()
+                .build()?,
+            destroy_key: provider
+                .destroy_key
+                .build_threadsafe_function()
+                .weak::<false>()
+                .build()?,
+            dh_agree: provider
+                .dh_agree
+                .build_threadsafe_function()
+                .weak::<false>()
+                .build()?,
+            derive_pseudonym: provider
+                .derive_pseudonym
+                .build_threadsafe_function()
+                .weak::<false>()
+                .build()?,
+            derive_rotatable_pseudonym: provider
+                .derive_rotatable_pseudonym
+                .build_threadsafe_function()
+                .weak::<false>()
+                .build()?,
+            custody_type: provider
+                .custody_type
+                .build_threadsafe_function()
+                .weak::<false>()
+                .build()?,
+        })
     }
 }
 
@@ -1504,15 +1524,20 @@ mod adapter_tests {
         }
     }
 
-    /// A registry over `storage`'s records in `slot`'s namespace, as
+    /// A registry over `storage`'s records under one namespace, opened through
+    /// `table`, as
     /// `identityCreateWithCustody` opens one over the instance storage.
     fn recorded(
         storage: &Arc<scp_platform::in_memory::InMemoryStorage>,
-        slot: &flow::CustodyNamespaceSlot,
+        table: &scp_platform::CustodyNamespaces,
     ) -> CallbackKeyRegistry {
         CallbackKeyRegistry::recorded(
-            flow::custody_record_store(Arc::clone(storage), slot)
-                .expect("no other adapter holds the namespace"),
+            flow::CustodyRecords::open(
+                table,
+                Arc::clone(storage),
+                scp_platform::CustodyNamespace::from_bytes([0x3a; 16]),
+            )
+            .expect("no other adapter holds the namespace"),
         )
     }
 
@@ -1521,7 +1546,7 @@ mod adapter_tests {
             test_host(host),
             recorded(
                 &Arc::new(scp_platform::in_memory::InMemoryStorage::new()),
-                &flow::CustodyNamespaceSlot::fresh().expect("namespace"),
+                &scp_platform::CustodyNamespaces::new(),
             ),
         )
     }
@@ -1550,18 +1575,23 @@ mod adapter_tests {
     async fn rebuilt_adapter_refuses_sign_of_key_event_key_host_reports_p256() {
         let host = Arc::new(FakeHost::default());
         let storage = Arc::new(scp_platform::in_memory::InMemoryStorage::new());
-        let slot = flow::CustodyNamespaceSlot::fresh().expect("namespace");
-        let minted = CallbackAdapter::over(test_host(&host), recorded(&storage, &slot));
+        let table = scp_platform::CustodyNamespaces::new();
+        let minted = CallbackAdapter::over(test_host(&host), recorded(&storage, &table));
         let (key, _) = key_event_key(&minted).await;
         assert!(
-            flow::custody_record_store(Arc::clone(&storage), &slot).is_err(),
+            flow::CustodyRecords::open(
+                &table,
+                Arc::clone(&storage),
+                scp_platform::CustodyNamespace::from_bytes([0x3a; 16])
+            )
+            .is_err(),
             "a second adapter for a live namespace is refused"
         );
         drop(minted);
 
         host.report_as(&key.id().to_string(), KeyType::P256Signing)
             .expect("report");
-        let rebuilt = CallbackAdapter::over(test_host(&host), recorded(&storage, &slot));
+        let rebuilt = CallbackAdapter::over(test_host(&host), recorded(&storage, &table));
         let signs = host.calls("sign");
         let refused = rebuilt.sign(&key, &[0x5a; 32]).await;
         assert!(
@@ -1832,7 +1862,7 @@ mod adapter_tests {
             },
             recorded(
                 &Arc::new(scp_platform::in_memory::InMemoryStorage::new()),
-                &flow::CustodyNamespaceSlot::fresh().expect("namespace"),
+                &scp_platform::CustodyNamespaces::new(),
             ),
         );
         let key = transport

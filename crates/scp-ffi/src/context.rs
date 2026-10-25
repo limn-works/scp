@@ -7174,7 +7174,14 @@ mod tests {
                 .expect("bob's identity")
                 .did()
                 .to_owned();
-            let alice = crate::scp::PyScp::new_in_memory_for_test();
+            // A host custody identity needs storage that persists (spec §17.3).
+            let alice_storage = tempfile::tempdir().expect("alice's storage directory");
+            let alice = crate::scp::PyScp {
+                inner: Arc::new(
+                    crate::runtime::PyBridgeInstance::sqlite_for_test(alice_storage.path())
+                        .expect("alice's SQLCipher storage"),
+                ),
+            };
             // One DHT for both instances, so each resolves the other's DID.
             crate::runtime::set_resolver_dht_client(
                 &alice.inner,
@@ -9657,12 +9664,21 @@ class SlowAgreeCustody(P256Custody):
         scp: crate::scp::PyScp,
         host: Py<PyAny>,
         did: String,
+        /// The `SQLCipher` directory `scp` stores in, removed on drop.
+        _dir: tempfile::TempDir,
     }
 
     /// Alice, with every key in a [`SLOW_AGREE_PY`] host.
     #[cfg(feature = "testing")]
     fn slow_agree_alice() -> SlowAgreeAlice {
-        let scp = crate::scp::PyScp::new_in_memory_for_test();
+        // A host custody identity needs storage that persists (spec §17.3).
+        let dir = tempfile::tempdir().expect("alice's storage directory");
+        let scp = crate::scp::PyScp {
+            inner: Arc::new(
+                crate::runtime::PyBridgeInstance::sqlite_for_test(dir.path())
+                    .expect("alice's SQLCipher storage"),
+            ),
+        };
         Python::with_gil(|py| {
             crate::custody::test_fakes::fake_custody_module(py);
             let host = PyModule::from_code(py, SLOW_AGREE_PY, c"slow_agree.py", c"slow_agree")
@@ -9676,7 +9692,12 @@ class SlowAgreeCustody(P256Custody):
                 .expect("alice's identity over the Python host")
                 .did()
                 .to_owned();
-            SlowAgreeAlice { scp, host, did }
+            SlowAgreeAlice {
+                scp,
+                host,
+                did,
+                _dir: dir,
+            }
         })
     }
 

@@ -13,6 +13,8 @@ Tests that exercise raw bridge methods access ``scp._native`` (the
 from __future__ import annotations
 
 from collections.abc import Iterator
+from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -83,6 +85,20 @@ def skip_reason_if_extension_absent(error: BaseException) -> str:
     raise error
 
 
+def _open_or_skip(storage: dict[str, Any]) -> Any:
+    """An ``scp_sdk.SCP`` over ``storage``, or a skip when the native
+    extension is absent. Every fixture that builds an instance opens it here,
+    so the suite has one skip site for the absent extension."""
+    from scp_sdk import SCP
+
+    try:
+        return SCP(storage=storage)
+    except Exception as exc:
+        if not extension_is_absent(exc):
+            raise
+        pytest.skip(f"native _scp_core extension not installed: {exc}")
+
+
 @pytest.fixture
 def scp() -> Iterator:
     """Fresh ``scp_sdk.SCP`` wrapper per test.
@@ -106,15 +122,7 @@ def scp() -> Iterator:
     # package, such as a from-import of a renamed symbol, and that defect fails
     # the test. An absent extension reaches the ``extension_is_absent`` check
     # below as ``SCP-VALID-7081`` and skips there.
-    from scp_sdk import SCP
-
-    try:
-        instance = SCP(storage={"type": "in_memory"})
-    except Exception as exc:
-        if not extension_is_absent(exc):
-            raise
-        pytest.skip(f"native _scp_core extension not installed: {exc}")
-
+    instance = _open_or_skip({"type": "in_memory"})
     try:
         yield instance
     finally:
@@ -130,4 +138,39 @@ def scp() -> Iterator:
         # that shut its own instance down does not fail here. An error this call
         # raises fails the test rather than being swallowed: a shutdown that cannot
         # complete is a defect this suite exists to surface.
+        instance.__exit__(None, None, None)
+
+
+@pytest.fixture
+def in_memory_scp() -> Iterator:
+    """An in-memory instance like :func:`scp`, for a module that overrides
+    ``scp`` (a fixture that requested ``scp`` would receive the override)."""
+    instance = _open_or_skip({"type": "in_memory"})
+    try:
+        yield instance
+    finally:
+        instance.__exit__(None, None, None)
+
+
+#: The SQLCipher key every :func:`sqlite_scp` instance opens with.
+SQLITE_TEST_KEY = b"\x5c" * 32
+
+
+def open_sqlite_scp(path: Path) -> Any:
+    """An ``scp_sdk.SCP`` over SQLCipher storage in ``path``."""
+    return _open_or_skip({"type": "sqlite", "path": str(path), "key": SQLITE_TEST_KEY})
+
+
+@pytest.fixture
+def sqlite_scp(tmp_path: Path) -> Iterator:
+    """Fresh ``scp_sdk.SCP`` over SQLCipher storage in ``tmp_path``.
+
+    Callback custody refuses storage that does not persist (spec section
+    17.3), so a test that creates an identity with a ``KeyCustodyProvider``
+    runs on this fixture. Teardown matches :func:`scp`.
+    """
+    instance = open_sqlite_scp(tmp_path)
+    try:
+        yield instance
+    finally:
         instance.__exit__(None, None, None)

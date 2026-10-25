@@ -18,6 +18,9 @@
 
 import { describe, expect, test } from "bun:test";
 import * as crypto from "node:crypto";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { CryptoError, KeyNotFoundError, ScpError } from "../src/errors";
 import type {
@@ -44,6 +47,31 @@ const suite = await napiSuite(() => {
   const probe = new SCP({ storage: { type: "in_memory" } });
   probe.shutdown(1).catch(() => {});
 });
+
+// ---------------------------------------------------------------------------
+// Persistent storage: callback custody refuses storage that does not persist
+// (spec §17.3), so every instance that creates with a provider is SQLite.
+// ---------------------------------------------------------------------------
+
+const SQLITE_KEY = new Uint8Array(32).fill(0x5c);
+
+async function freshDir(): Promise<string> {
+  return mkdtemp(join(tmpdir(), "scp-callback-custody-"));
+}
+
+function sqliteScp(dir: string): SCP {
+  return new SCP({ storage: { type: "sqlite", path: dir, key: SQLITE_KEY } });
+}
+
+/** The bridge code a rejected promise carries. */
+async function rejectionCode(p: Promise<unknown>): Promise<string | undefined> {
+  try {
+    await p;
+  } catch (err) {
+    return (err as ScpError).code;
+  }
+  throw new Error("expected the call to reject");
+}
 
 // ---------------------------------------------------------------------------
 // Real-Ed25519 and real-P-256 custody provider backed by node:crypto
@@ -233,7 +261,8 @@ describe("CryptoKeychain hpke-p256", () => {
 suite.describe("identityCreateWithCustody", () => {
   describe("SCP.identityCreateWithCustody (real NAPI)", () => {
     test("creates a did:dht identity backed by a JS custody provider", async () => {
-      const scp = new SCP({ storage: { type: "in_memory" } });
+      const dir = await freshDir();
+      const scp = sqliteScp(dir);
       try {
         const provider = new CryptoKeychain();
         const identity = await scp.identityCreateWithCustody(provider);
@@ -241,13 +270,15 @@ suite.describe("identityCreateWithCustody", () => {
         expect(identity.custodyType).toBe("os_keystore");
       } finally {
         await scp.shutdown(1000).catch(() => {});
+        await rm(dir, { recursive: true, force: true });
       }
     });
 
     // §9.10.4.A: a host that reports key-not-found while deriving fails the
     // production context create with that code, not a derivation identity code.
     test("an encrypted context create fails with SCP-CRYPTO-4006 when the host reports key-not-found", async () => {
-      const scp = new SCP({ storage: { type: "in_memory" } });
+      const dir = await freshDir();
+      const scp = sqliteScp(dir);
       try {
         const identity = await scp.identityCreateWithCustody(
           new CryptoKeychain("deriveKeyNotFound"),
@@ -265,13 +296,15 @@ suite.describe("identityCreateWithCustody", () => {
         expect((caught as ScpError).code).toBe("SCP-CRYPTO-4006");
       } finally {
         await scp.shutdown(1000).catch(() => {});
+        await rm(dir, { recursive: true, force: true });
       }
     });
 
     // §9.10.4: the bridge fails closed with SCP-IDENT-1055 on host pseudonym
     // bytes that are not a compressed P-256 point, such as a retired 32-byte key.
     test("an encrypted context create fails with SCP-IDENT-1055 on a 32-byte host pseudonym", async () => {
-      const scp = new SCP({ storage: { type: "in_memory" } });
+      const dir = await freshDir();
+      const scp = sqliteScp(dir);
       try {
         const identity = await scp.identityCreateWithCustody(new CryptoKeychain("legacy32"));
         let caught: unknown;
@@ -288,17 +321,20 @@ suite.describe("identityCreateWithCustody", () => {
         expect((caught as ScpError).message).toContain("got 32 bytes");
       } finally {
         await scp.shutdown(1000).catch(() => {});
+        await rm(dir, { recursive: true, force: true });
       }
     });
 
     test("rejects a provider missing required methods", async () => {
-      const scp = new SCP({ storage: { type: "in_memory" } });
+      const dir = await freshDir();
+      const scp = sqliteScp(dir);
       try {
         // Intentionally incomplete — only `sign` is present.
         const bad = { sign: () => new Uint8Array(64) } as unknown as KeyCustodyProvider;
         await expect(scp.identityCreateWithCustody(bad)).rejects.toThrow();
       } finally {
         await scp.shutdown(1000).catch(() => {});
+        await rm(dir, { recursive: true, force: true });
       }
     });
 
@@ -308,7 +344,8 @@ suite.describe("identityCreateWithCustody", () => {
     // `sign` callback — NOT to raw key export — so a callback identity reaches
     // parity with an in-memory one for signed export/import.
     test("callback-custody identity exports a signed snapshot that imports", async () => {
-      const scp = new SCP({ storage: { type: "in_memory" } });
+      const dir = await freshDir();
+      const scp = sqliteScp(dir);
       try {
         const identity = await scp.identityCreateWithCustody(new CryptoKeychain());
         const ctx = await scp.contextCreate(
@@ -333,6 +370,7 @@ suite.describe("identityCreateWithCustody", () => {
         expect(importedContextId.length).toBeGreaterThan(0);
       } finally {
         await scp.shutdown(1000).catch(() => {});
+        await rm(dir, { recursive: true, force: true });
       }
     });
 
@@ -340,7 +378,8 @@ suite.describe("identityCreateWithCustody", () => {
     // callback custody, which only signs, proposes, and the single-admin
     // proposal auto-executes after the engine verifies the custody signature.
     test("callback custody proposes governance through sign", async () => {
-      const scp = new SCP({ storage: { type: "in_memory" } });
+      const dir = await freshDir();
+      const scp = sqliteScp(dir);
       try {
         const identity = await scp.identityCreateWithCustody(new CryptoKeychain());
         const ctx = await scp.contextCreate(
@@ -361,13 +400,15 @@ suite.describe("identityCreateWithCustody", () => {
         expect(JSON.parse(response).status).toBe("Approved");
       } finally {
         await scp.shutdown(1000).catch(() => {});
+        await rm(dir, { recursive: true, force: true });
       }
     });
 
     // ADR-049 Decision 7a: a send signs its inner envelope through
     // `KeyCustody::sign`, so a callback custody, which only signs, sends.
     test("callback custody sends through sign", async () => {
-      const scp = new SCP({ storage: { type: "in_memory" } });
+      const dir = await freshDir();
+      const scp = sqliteScp(dir);
       try {
         const identity = await scp.identityCreateWithCustody(new CryptoKeychain());
         const ctx = await scp.contextCreate(
@@ -379,6 +420,92 @@ suite.describe("identityCreateWithCustody", () => {
           }),
         );
         await scp.contextSend(ctx, identity.did, new TextEncoder().encode("sign-only send"));
+      } finally {
+        await scp.shutdown(1000).catch(() => {});
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  // Spec §17.3 (SCP-345 decision D1): the identity's custody entry carries
+  // its namespace, so a new instance over the same directory reaches the
+  // keys the earlier one minted.
+  describe("SCP.identityLoadWithCustody (real NAPI)", () => {
+    /** A {@link CryptoKeychain} that counts the signatures it makes. */
+    class CountingKeychain extends CryptoKeychain {
+      signCalls = 0;
+
+      override sign(keyId: string, message: Uint8Array): Uint8Array {
+        this.signCalls += 1;
+        return super.sign(keyId, message);
+      }
+    }
+
+    test("a new instance loads the identity with its provider and signs with its earlier key", async () => {
+      const dir = await freshDir();
+      const provider = new CountingKeychain();
+      try {
+        const first = sqliteScp(dir);
+        let did: string;
+        try {
+          did = (await first.identityCreateWithCustody(provider)).did;
+        } finally {
+          await first.shutdown(1000);
+        }
+
+        const second = sqliteScp(dir);
+        try {
+          expect(await rejectionCode(second.identityLoad(did))).toBe("SCP-IDENT-1003");
+          const loaded = await second.identityLoadWithCustody(did, provider);
+          expect(loaded.did).toBe(did);
+          expect(loaded.custodyType).toBe("os_keystore");
+          // The identity key was minted by the first instance; its record
+          // lives under the stored namespace, so the loaded adapter resolves
+          // it, and the proposal signs through `provider`.
+          const ctx = await second.contextCreate(
+            loaded,
+            JSON.stringify({
+              ceiling: ["messages:read", "messages:write", "governance:propose", "member:ban"],
+              memoryScope: "ephemeral",
+              governance: "single_admin",
+            }),
+          );
+          const signsBefore = provider.signCalls;
+          const response = await second.contextGovernancePropose(
+            ctx,
+            JSON.stringify({
+              SuspendCapability: { did, capabilities: ["MessagesWrite"] },
+            }),
+            did,
+          );
+          expect(JSON.parse(response).status).toBe("Approved");
+          expect(provider.signCalls).toBeGreaterThan(signsBefore);
+          expect(await rejectionCode(second.identityLoadWithCustody(did, provider))).toBe(
+            "SCP-IDENT-1008",
+          );
+        } finally {
+          await second.shutdown(1000).catch(() => {});
+        }
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    test("in-memory storage refuses a callback custody create and load with SCP-STORAGE-8000", async () => {
+      const scp = new SCP({ storage: { type: "in_memory" } });
+      try {
+        const provider = new CryptoKeychain();
+        expect(await rejectionCode(scp.identityCreateWithCustody(provider))).toBe(
+          "SCP-STORAGE-8000",
+        );
+        expect(
+          await rejectionCode(
+            scp.identityLoadWithCustody(
+              "did:dht:ab3ii3ef4mbcu5rmhkbf5yctwnodzx6a65ghazmtu1ydzhfzezby",
+              provider,
+            ),
+          ),
+        ).toBe("SCP-STORAGE-8000");
       } finally {
         await scp.shutdown(1000).catch(() => {});
       }

@@ -651,6 +651,12 @@ impl CallbackKeyCustody {
         Self { provider, registry }
     }
 
+    /// The custody namespace this adapter's records live under, which the
+    /// identity's callback custody entry stores (spec §17.3).
+    pub(crate) const fn namespace(&self) -> [u8; 16] {
+        self.registry.namespace()
+    }
+
     /// An adapter over `provider` with records in a fresh in-memory store.
     #[cfg(test)]
     pub(crate) fn new_for_test(provider: Box<dyn crate::KeyCustodyProvider>) -> Self {
@@ -7492,6 +7498,21 @@ const fn decided_built(custody: UniffiKeyCustody) -> DecidedCustody {
     custody
 }
 
+/// Maps a callback custody identity refusal to the code every bridge
+/// reports for it (spec §17.3): a storage selection that does not persist in
+/// the storage class, every other refusal in the identity class.
+fn callback_identity_error(
+    error: scp_ffi_common::callback_identity::CallbackIdentityError,
+) -> ScpError {
+    let msg = error.to_string();
+    let code = error.code().to_owned();
+    if error.is_storage_selection() {
+        ScpError::Storage { msg, code }
+    } else {
+        ScpError::Identity { msg, code }
+    }
+}
+
 /// Makes every custody decision for one identity-creation call (spec
 /// `03-identity.md` §3.2.2).
 ///
@@ -7509,14 +7530,16 @@ const fn decided_built(custody: UniffiKeyCustody) -> DecidedCustody {
 /// set.
 ///
 /// An `os_keystore` adapter keeps its custody records in `repository`'s
-/// storage under a fresh namespace (SCP-345, ADR-021 strict refusal), and the
-/// identity's registry entry keeps the namespace by keeping the adapter
-/// (decision D1).
+/// storage under a namespace drawn here and opened through the instance's
+/// `namespaces` table (spec §17.3, SCP-345 decision D1); [`mint_identity`]
+/// stores the namespace in the identity's callback custody entry. Storage
+/// that does not persist is refused with `SCP-STORAGE-8000`.
 fn decide_custody_for_create(
     custody: &str,
     provider: Option<Box<dyn crate::KeyCustodyProvider>>,
     testing_seed: Option<Zeroizing<[u8; 32]>>,
     repository: &scp_ffi_common::bridge_runtime::ProtocolRepoVariant,
+    namespaces: &scp_platform::CustodyNamespaces,
 ) -> Result<(CustodyRequest, DecidedCustody), ScpError> {
     let request = parse_custody_request(CustodyRequestInput {
         request: custody,
@@ -7526,12 +7549,12 @@ fn decide_custody_for_create(
     })?;
     let decided = match (request, provider) {
         (CustodyRequest::OsKeystore, Some(provider)) => {
-            let slot = scp_ffi_common::callback_custody::CustodyNamespaceSlot::fresh()
-                .map_err(|e| ScpError::from(PlatformError::from(e)))?;
             let registry = scp_ffi_common::callback_custody::CallbackKeyRegistry::recorded(
-                repository
-                    .custody_record_store(&slot)
-                    .map_err(|e| ScpError::from(PlatformError::from(e)))?,
+                scp_ffi_common::callback_identity::create_records(
+                    namespaces,
+                    repository.callback_custody_storage(),
+                )
+                .map_err(callback_identity_error)?,
             );
             decided_built(UniffiKeyCustody::Callback(Arc::new(
                 CallbackKeyCustody::new(provider, registry),
@@ -7599,9 +7622,10 @@ async fn open_custody_for_create(
     provider: Option<Box<dyn crate::KeyCustodyProvider>>,
     testing_seed: Option<Zeroizing<[u8; 32]>>,
     repository: &scp_ffi_common::bridge_runtime::ProtocolRepoVariant,
+    namespaces: &scp_platform::CustodyNamespaces,
 ) -> Result<CreateCustody, ScpError> {
     let (request, decided) =
-        decide_custody_for_create(custody, provider, testing_seed, repository)?;
+        decide_custody_for_create(custody, provider, testing_seed, repository, namespaces)?;
     let built = match decided {
         DecidedCustody::Built(built) => built,
         DecidedCustody::OpenFile(inputs) => {
@@ -7634,14 +7658,14 @@ fn open_custody_for_create(
     provider: Option<Box<dyn crate::KeyCustodyProvider>>,
     testing_seed: Option<Zeroizing<[u8; 32]>>,
     repository: &scp_ffi_common::bridge_runtime::ProtocolRepoVariant,
+    namespaces: &scp_platform::CustodyNamespaces,
 ) -> std::future::Ready<Result<CreateCustody, ScpError>> {
     std::future::ready(
-        decide_custody_for_create(custody, provider, testing_seed, repository).and_then(
-            |(_, decided)| {
+        decide_custody_for_create(custody, provider, testing_seed, repository, namespaces)
+            .and_then(|(_, decided)| {
                 drop(decided);
                 Err(no_pre_rotation_backend())
-            },
-        ),
+            }),
     )
 }
 
@@ -10000,6 +10024,29 @@ async fn mint_identity(
     }
     .map_err(ScpError::from)?;
 
+    // A callback custody identity stores its namespace, handles and document
+    // before the create returns (spec §17.3, SCP-345 decision D1), so
+    // `identity_load_with_custody` reopens the same records; a failed write
+    // fails the create.
+    if let UniffiKeyCustody::Callback(adapter) = custody.as_ref() {
+        let storage = bi
+            .protocol_repository()
+            .callback_custody_storage()
+            .ok_or_else(|| {
+                callback_identity_error(
+                    scp_ffi_common::callback_identity::CallbackIdentityError::NotPersistent,
+                )
+            })?;
+        scp_ffi_common::callback_identity::write_entry(
+            storage.as_ref(),
+            adapter.namespace(),
+            &identity,
+            &document,
+        )
+        .await
+        .map_err(callback_identity_error)?;
+    }
+
     // Snapshot the #0 (identity) verifying key for ADR-046 parity.
     let verifying_key_hex =
         snapshot_verifying_key_hex(custody.as_ref(), &identity.identity_key).await;
@@ -10150,6 +10197,7 @@ impl Scp {
                     None,
                     testing_seed_bytes,
                     bi.protocol_repository(),
+                    bi.core.custody_namespaces(),
                 )
                 .await?;
                 #[cfg(not(feature = "testing"))]
@@ -10206,6 +10254,7 @@ impl Scp {
                     Some(provider),
                     None,
                     bi.protocol_repository(),
+                    bi.core.custody_namespaces(),
                 )
                 .await?;
                 #[cfg(not(feature = "testing"))]
@@ -10249,6 +10298,14 @@ impl Scp {
                     });
                 }
 
+                // An identity created with a host custody provider loads only
+                // with that provider (spec §17.3).
+                if let Some(storage) = bi.protocol_repository().callback_custody_storage() {
+                    scp_ffi_common::callback_identity::refuse_plain_load(storage.as_ref(), &did)
+                        .await
+                        .map_err(callback_identity_error)?;
+                }
+
                 // identity_load returns a DID-string-only handle. Key operations
                 // require the KeyCustodyProvider callback interface to be wired.
                 // No live key material, so `verifying_key_hex` is `None`.
@@ -10276,6 +10333,109 @@ impl Scp {
                     core_document: None,
                     custody: None,
                     verifying_key_hex: None,
+                    instance_id: bi.core.instance_id(),
+                    bi: Arc::clone(&bi),
+                    rotation_event_json: None,
+                    pre_rotation_handle: scp_platform::PreRotationKeyHandle::new(0),
+                    #[cfg(feature = "testing")]
+                    pre_rotation_custody,
+                });
+                increment_handle_count();
+                Ok(handle)
+            })
+            .await
+            .map_err(|e| ScpError::Identity {
+                msg: format!("tokio task join error during identity load: {e}"),
+                code: codes::IDENT_1005.to_owned(),
+            })?
+    }
+
+    /// Loads an identity created with
+    /// [`identity_create_with_custody`](Self::identity_create_with_custody)
+    /// on this instance's storage, with the same host custody provider
+    /// (spec §17.3, SCP-345 decision D1).
+    ///
+    /// Reads the identity's callback custody entry, reopens its custody
+    /// records over the stored namespace, and checks that `provider` holds
+    /// the identity key the DID derives from. The handle reports
+    /// `os_keystore` and signs through `provider`, including with keys minted
+    /// in an earlier process.
+    ///
+    /// # Errors
+    ///
+    /// - `SCP-IDENT-1004` for a DID that is not `did:dht`.
+    /// - `SCP-STORAGE-8000` on in-memory storage, which keeps no entry.
+    /// - `SCP-IDENT-1002` when the storage holds no entry for `did`.
+    /// - `SCP-IDENT-1009` when the entry does not decode or names another
+    ///   DID.
+    /// - `SCP-IDENT-1008` while another live adapter of this instance holds
+    ///   the identity's namespace (a second load, or the create's own
+    ///   adapter), or when `provider`'s identity key does not derive `did`.
+    pub async fn identity_load_with_custody(
+        &self,
+        did: String,
+        provider: Box<dyn crate::KeyCustodyProvider>,
+    ) -> Result<Arc<Identity>, ScpError> {
+        let bi = Arc::clone(&self.inner);
+
+        runtime()
+            .spawn(async move {
+                if !did.starts_with("did:dht:") {
+                    return Err(ScpError::Identity {
+                        msg: format!("unsupported DID method: {did} — only did:dht is supported"),
+                        code: codes::IDENT_1004.to_owned(),
+                    });
+                }
+                let scp_ffi_common::callback_identity::LoadedCallbackIdentity {
+                    records,
+                    identity,
+                    document,
+                } = scp_ffi_common::callback_identity::open_entry(
+                    bi.core.custody_namespaces(),
+                    bi.protocol_repository().callback_custody_storage(),
+                    &did,
+                )
+                .await
+                .map_err(callback_identity_error)?;
+                let custody = Arc::new(UniffiKeyCustody::Callback(Arc::new(
+                    CallbackKeyCustody::new(
+                        provider,
+                        scp_ffi_common::callback_custody::CallbackKeyRegistry::recorded(records),
+                    ),
+                )));
+                let verifying_key_hex = Some(
+                    scp_ffi_common::callback_identity::check_provider(custody.as_ref(), &identity)
+                        .await
+                        .map_err(callback_identity_error)?,
+                );
+                // The resolver a governance vote and a UCAN check read this
+                // identity's document from, as create initializes it before minting.
+                ensure_did_resolver_initialized_on(&bi, tokio::runtime::Handle::current())?;
+                register_identity_custody(
+                    &bi,
+                    &identity.did,
+                    &custody,
+                    identity.active_signing_key,
+                )?;
+                // As create does after it registers the identity, publish the
+                // stored document into the resolver's DHT client: this instance's
+                // resolver reads it there to verify the identity's signatures.
+                #[cfg(feature = "testing")]
+                publish_to_resolver_dht_for(&bi, &identity, &document, custody.as_ref()).await;
+                // The pre-rotation key stays in the substrate that created
+                // it, which no load reopens; as on `identity_load`, the
+                // testing-only field holds an empty custody and the handle
+                // names no key.
+                #[cfg(feature = "testing")]
+                let pre_rotation_custody =
+                    Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+                let handle = Arc::new(Identity {
+                    did: identity.did.clone(),
+                    custody_type: CustodyMethod::OsKeystore,
+                    core_id: Some(identity),
+                    core_document: Some(document),
+                    custody: Some(custody),
+                    verifying_key_hex,
                     instance_id: bi.core.instance_id(),
                     bi: Arc::clone(&bi),
                     rotation_event_json: None,
@@ -17801,8 +17961,14 @@ impl Scp {
 
         runtime()
             .spawn(async move {
-                let created =
-                    open_custody_for_create(&custody, None, None, bi.protocol_repository()).await?;
+                let created = open_custody_for_create(
+                    &custody,
+                    None,
+                    None,
+                    bi.protocol_repository(),
+                    bi.core.custody_namespaces(),
+                )
+                .await?;
                 #[cfg(not(feature = "testing"))]
                 {
                     let _ = &bi;
@@ -19461,6 +19627,96 @@ mod tests {
         #[cfg(feature = "testing")]
         crate::runtime::serve_unregistered_wrapping_keys_from_test_custody(&scp.inner);
         scp
+    }
+
+    /// An instance over `SQLCipher` storage in a directory, which the value
+    /// deletes when it drops unless [`closed`](Self::closed) handed it on.
+    /// Callback custody refuses storage that does not persist (spec §17.3),
+    /// so a test that creates an identity with a host custody provider runs
+    /// on one of these.
+    ///
+    /// Dropping it shuts the instance down and waits, so its actors' final
+    /// writes and the store's close finish before the directory goes and
+    /// before process exit (where a still-open `SQLCipher` connection can
+    /// crash in libcrypto's exit handler).
+    struct PersistentScp {
+        scp: Arc<crate::scp::Scp>,
+        dir: Option<tempfile::TempDir>,
+    }
+
+    impl PersistentScp {
+        /// Shuts the instance down and returns its directory, for a new
+        /// instance over the same store.
+        fn closed(mut self) -> tempfile::TempDir {
+            let dir = self
+                .dir
+                .take()
+                .expect("a live PersistentScp holds its directory");
+            drop(self);
+            dir
+        }
+    }
+
+    impl std::ops::Deref for PersistentScp {
+        type Target = Arc<crate::scp::Scp>;
+
+        fn deref(&self) -> &Self::Target {
+            &self.scp
+        }
+    }
+
+    impl Drop for PersistentScp {
+        fn drop(&mut self) {
+            use scp_ffi_common::bridge_instance::{BridgeInstanceCore as _, ShutdownOutcome};
+            let inner = Arc::clone(&self.scp.inner);
+            // The shutdown runs on the process-wide runtime the actors run
+            // on, from a thread of its own, so a drop inside a test's tokio
+            // runtime does not block on that runtime.
+            let outcome = std::thread::scope(|scope| {
+                scope
+                    .spawn(move || {
+                        runtime().block_on(inner.shutdown(std::time::Duration::from_secs(10)))
+                    })
+                    .join()
+            });
+            if !std::thread::panicking() {
+                assert!(
+                    matches!(outcome, Ok(Ok(ShutdownOutcome::GracefulWithin { .. }))),
+                    "the shutdown must drain every actor and close the store: {outcome:?}"
+                );
+            }
+        }
+    }
+
+    /// The fixed `SQLCipher` key every [`PersistentScp`] opens with.
+    const PERSISTENT_TEST_KEY: [u8; 32] = [0x12; 32];
+
+    /// An instance over the `SQLCipher` database in `dir`.
+    fn scp_persistent_at(dir: &std::path::Path) -> Arc<crate::scp::Scp> {
+        let scp = crate::scp::Scp::with_storage(crate::StorageConfig::Sqlite {
+            path: dir.to_string_lossy().into_owned(),
+            key: crate::runtime::SqliteKeyMaterial::Raw {
+                key: PERSISTENT_TEST_KEY.to_vec(),
+            },
+        })
+        .expect("sqlite storage must construct");
+        // Fixtures create contexts for DIDs they never register.
+        #[cfg(feature = "testing")]
+        crate::runtime::serve_unregistered_wrapping_keys_from_test_custody(&scp.inner);
+        scp
+    }
+
+    /// A [`PersistentScp`] over a fresh directory.
+    fn scp_persistent_test() -> PersistentScp {
+        scp_persistent_over(tempfile::tempdir().expect("tempdir"))
+    }
+
+    /// A [`PersistentScp`] over the store in `dir`.
+    fn scp_persistent_over(dir: tempfile::TempDir) -> PersistentScp {
+        PersistentScp {
+            scp: scp_persistent_at(dir.path()),
+            dir: Some(dir),
+        }
     }
 
     /// A declaration that is not valid JSON fails with `SCP-VALID-7000`, the
@@ -25050,18 +25306,20 @@ mod tests {
     #[tokio::test]
     async fn callback_custody_recorded_handle_resolves_and_verifies() {
         use scp_crypto::p256::{P256PublicKey, normalize_low_s, verify_prehash_strict};
-        use scp_ffi_common::callback_custody::{
-            CallbackKeyRegistry, CustodyNamespaceSlot, custody_record_store,
-        };
+        use scp_ffi_common::callback_custody::CallbackKeyRegistry;
         use scp_platform::KeyCustody;
 
         let host = Arc::new(scp_ffi_common::callback_custody::fake_host::FakeHost::default());
         let storage = Arc::new(scp_platform::in_memory::InMemoryStorage::new());
-        let slot = CustodyNamespaceSlot::fresh().expect("namespace");
+        let table = scp_platform::CustodyNamespaces::new();
         let recorded = || {
             CallbackKeyRegistry::recorded(
-                custody_record_store(Arc::clone(&storage), &slot)
-                    .expect("no other adapter holds the namespace"),
+                scp_ffi_common::callback_custody::CustodyRecords::open(
+                    &table,
+                    Arc::clone(&storage),
+                    scp_platform::CustodyNamespace::from_bytes([0x3a; 16]),
+                )
+                .expect("no other adapter holds the namespace"),
             )
         };
         let earlier = CallbackKeyCustody::new(Box::new(FakeHostProvider::over(&host)), recorded());
@@ -25208,23 +25466,30 @@ mod tests {
     /// registry that trusted the host's answer would sign.
     #[tokio::test]
     async fn rebuilt_adapter_refuses_sign_of_key_event_key_host_reports_p256() {
-        use scp_ffi_common::callback_custody::{
-            CallbackKeyRegistry, CustodyNamespaceSlot, custody_record_store,
-        };
+        use scp_ffi_common::callback_custody::CallbackKeyRegistry;
 
         let host = Arc::new(scp_ffi_common::callback_custody::fake_host::FakeHost::default());
         let storage = Arc::new(scp_platform::in_memory::InMemoryStorage::new());
-        let slot = CustodyNamespaceSlot::fresh().expect("namespace");
+        let table = scp_platform::CustodyNamespaces::new();
         let recorded = || {
             CallbackKeyRegistry::recorded(
-                custody_record_store(Arc::clone(&storage), &slot)
-                    .expect("no other adapter holds the namespace"),
+                scp_ffi_common::callback_custody::CustodyRecords::open(
+                    &table,
+                    Arc::clone(&storage),
+                    scp_platform::CustodyNamespace::from_bytes([0x3a; 16]),
+                )
+                .expect("no other adapter holds the namespace"),
             )
         };
         let minted = CallbackKeyCustody::new(Box::new(FakeHostProvider::over(&host)), recorded());
         let (key, _) = key_event_key(&minted).await;
         assert!(
-            custody_record_store(Arc::clone(&storage), &slot).is_err(),
+            scp_ffi_common::callback_custody::CustodyRecords::open(
+                &table,
+                Arc::clone(&storage),
+                scp_platform::CustodyNamespace::from_bytes([0x3a; 16])
+            )
+            .is_err(),
             "a second adapter for a live namespace is refused"
         );
         drop(minted);
@@ -25293,6 +25558,128 @@ mod tests {
         assert_eq!(
             *signed.lock().expect("lock"),
             vec![probe.raw_digest().to_vec()]
+        );
+    }
+
+    /// The callback adapter `identity` holds.
+    fn callback_of(identity: &Identity) -> &CallbackKeyCustody {
+        match identity.custody.as_deref() {
+            Some(UniffiKeyCustody::Callback(adapter)) => adapter,
+            other => panic!("a provider-backed identity holds callback custody, got {other:?}"),
+        }
+    }
+
+    /// Spec §17.3 (SCP-345 decision D1): an identity created with a host
+    /// custody provider on SQLite storage loads on a new instance over the
+    /// same directory with that provider, and a key-event key the earlier
+    /// instance minted signs a change through the loaded handle, which a
+    /// fresh namespace could not resolve. A plain `identity_load` is
+    /// refused with `SCP-IDENT-1003`, and a second load while the first
+    /// handle's adapter is live with `SCP-IDENT-1008`.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn callback_identity_reloads_over_its_stored_namespace() {
+        let host = Arc::new(scp_ffi_common::callback_custody::fake_host::FakeHost::default());
+        let first = scp_persistent_test();
+        let created = first
+            .identity_create_with_custody(Box::new(FakeHostProvider::over(&host)))
+            .await
+            .expect("identity_create_with_custody");
+        let (key, public) = key_event_key(callback_of(&created)).await;
+        let did = created.did.clone();
+        drop(created);
+        let second = scp_persistent_over(first.closed());
+
+        let plain = second
+            .identity_load(did.clone())
+            .await
+            .expect_err("a plain load of a callback identity is refused");
+        assert!(
+            matches!(plain, ScpError::Identity { ref code, .. } if code == codes::IDENT_1003),
+            "{plain:?}"
+        );
+
+        let loaded = second
+            .identity_load_with_custody(did.clone(), Box::new(FakeHostProvider::over(&host)))
+            .await
+            .expect("identity_load_with_custody");
+        assert_eq!(loaded.custody_type(), "os_keystore");
+        let change = scp_testing::conformance::key_custody::v41_signing_change();
+        let IndexedSignature::Raw { signature } = callback_of(&loaded)
+            .sign_change(&key, &change)
+            .await
+            .expect("the earlier instance's key-event key signs")
+        else {
+            panic!("a callback custody signs the raw form");
+        };
+        let point = scp_crypto::p256::P256PublicKey::from_sec1(&public).expect("point");
+        scp_crypto::p256::verify_prehash_strict(&point, &change.digest(), &signature)
+            .expect("verifies over D");
+
+        // The instance's resolver reaches the loaded identity's document, as
+        // after a create: a single-admin proposal verifies the vote its
+        // identity key signs, and executes.
+        let ctx = second
+            .context_create(
+                Arc::clone(&loaded),
+                ContextParams {
+                    ceiling: ["messages:read", "governance:propose", "member:ban"]
+                        .map(str::to_owned)
+                        .to_vec(),
+                    ..encrypted_join_test_params()
+                },
+            )
+            .await
+            .expect("context_create with the loaded identity");
+        let proposed = second
+            .governance_propose(
+                ctx,
+                did.clone(),
+                serde_json::json!({
+                    "SuspendCapability": { "did": did, "capabilities": ["MessagesWrite"] }
+                })
+                .to_string(),
+            )
+            .await
+            .expect("governance_propose with the loaded identity");
+        let status: serde_json::Value = serde_json::from_str(&proposed).expect("JSON result");
+        assert_eq!(status["status"], "Approved", "{status}");
+
+        let again = second
+            .identity_load_with_custody(did, Box::new(FakeHostProvider::over(&host)))
+            .await
+            .expect_err("a second live adapter for the namespace is refused");
+        assert!(
+            matches!(again, ScpError::Identity { ref code, .. } if code == codes::IDENT_1008),
+            "{again:?}"
+        );
+    }
+
+    /// Spec §17.3: callback custody is refused on storage that does not
+    /// persist, on create and on load, with `SCP-STORAGE-8000`.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn callback_identity_refuses_in_memory_storage() {
+        let host = Arc::new(scp_ffi_common::callback_custody::fake_host::FakeHost::default());
+        let scp = scp_test();
+        let created = scp
+            .identity_create_with_custody(Box::new(FakeHostProvider::over(&host)))
+            .await
+            .expect_err("create on in-memory storage");
+        assert!(
+            matches!(created, ScpError::Storage { ref code, .. } if code == codes::STORAGE_8000),
+            "{created:?}"
+        );
+        let loaded = scp
+            .identity_load_with_custody(
+                "did:dht:ab3ii3ef4mbcu5rmhkbf5yctwnodzx6a65ghazmtu1ydzhfzezby".to_owned(),
+                Box::new(FakeHostProvider::over(&host)),
+            )
+            .await
+            .expect_err("load on in-memory storage");
+        assert!(
+            matches!(loaded, ScpError::Storage { ref code, .. } if code == codes::STORAGE_8000),
+            "{loaded:?}"
         );
     }
 
@@ -31158,11 +31545,10 @@ mod tests {
         }
     }
 
-    /// Mints a callback-custody identity over a host with `fault`.
+    /// Mints a callback-custody identity on `scp` over a host with `fault`.
     #[cfg(feature = "testing")]
-    async fn prod_like_identity(fault: HostFault) -> Arc<Identity> {
-        scp_test()
-            .identity_create_with_custody(Box::new(ProdLikeCustody::with_fault(fault)))
+    async fn prod_like_identity(scp: &crate::scp::Scp, fault: HostFault) -> Arc<Identity> {
+        scp.identity_create_with_custody(Box::new(ProdLikeCustody::with_fault(fault)))
             .await
             .expect("identity_create_with_custody")
     }
@@ -31174,7 +31560,8 @@ mod tests {
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn callback_pseudonym_routing_id_is_spec_25_19_vector_30() {
-        let identity = prod_like_identity(HostFault::Vector30).await;
+        let scp = scp_persistent_test();
+        let identity = prod_like_identity(&scp, HostFault::Vector30).await;
         let routing_id = derive_member_pseudonym_required(&identity, "context-alpha")
             .await
             .expect("pseudonym derives");
@@ -31191,7 +31578,7 @@ mod tests {
     #[test]
     fn context_create_surfaces_host_key_not_found_as_crypto_4006() {
         let rt = runtime();
-        let scp = scp_test();
+        let scp = scp_persistent_test();
         let provider = ProdLikeCustody::with_fault(HostFault::None);
         let keys = Arc::clone(&provider.keys);
         let identity = rt
@@ -31212,7 +31599,7 @@ mod tests {
     #[test]
     fn identity_create_with_custody_reports_os_keystore_custody() {
         let identity = runtime()
-            .block_on(scp_test().identity_create_with_custody(Box::new(
+            .block_on(scp_persistent_test().identity_create_with_custody(Box::new(
                 ProdLikeCustody::with_fault(HostFault::None),
             )))
             .expect("identity_create_with_custody");
@@ -31228,7 +31615,7 @@ mod tests {
     async fn callback_identity_signs_through_its_single_custody_field() {
         use ed25519_dalek::Verifier;
 
-        let scp = scp_test();
+        let scp = scp_persistent_test();
         let identity = scp
             .identity_create_with_custody(Box::new(ProdLikeCustody::new()))
             .await
@@ -31308,7 +31695,8 @@ mod tests {
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn legacy_32_byte_host_pseudonym_is_ident_1055() {
-        let identity = prod_like_identity(HostFault::Legacy32).await;
+        let scp = scp_persistent_test();
+        let identity = prod_like_identity(&scp, HostFault::Legacy32).await;
         match derive_member_pseudonym_required(&identity, "ctx").await {
             Err(ScpError::Identity { code, msg }) => {
                 assert_eq!(code, codes::IDENT_1055);
@@ -31325,7 +31713,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn non_canonical_generated_key_id_is_crypto_4060() {
         let provider = ProdLikeCustody::with_fault(HostFault::NonCanonicalKeypairId);
-        match scp_test()
+        match scp_persistent_test()
             .identity_create_with_custody(Box::new(provider))
             .await
         {
@@ -31457,7 +31845,7 @@ mod tests {
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn callback_identity_is_registered_for_remove_if_present() {
-        let scp = scp_test();
+        let scp = scp_persistent_test();
         let identity = scp
             .identity_create_with_custody(Box::new(ProdLikeCustody::new()))
             .await
@@ -31485,7 +31873,7 @@ mod tests {
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn scpid_sign_works_over_callback_custody() {
-        let scp = scp_test();
+        let scp = scp_persistent_test();
         let identity = scp
             .identity_create_with_custody(Box::new(ProdLikeCustody::new()))
             .await
@@ -31523,7 +31911,7 @@ mod tests {
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn link_attestation_create_and_remove_over_callback_custody() {
-        let scp = scp_test();
+        let scp = scp_persistent_test();
         let identity = scp
             .identity_create_with_custody(Box::new(ProdLikeCustody::new()))
             .await
@@ -31569,7 +31957,7 @@ mod tests {
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn add_agent_key_works_over_callback_custody() {
-        let scp = scp_test();
+        let scp = scp_persistent_test();
         let identity = scp
             .identity_create_with_custody(Box::new(ProdLikeCustody::new()))
             .await
@@ -31612,7 +32000,7 @@ mod tests {
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rotate_agent_key_works_over_callback_custody() {
-        let scp = scp_test();
+        let scp = scp_persistent_test();
         let identity = scp
             .identity_create_with_custody(Box::new(ProdLikeCustody::new()))
             .await
@@ -31659,7 +32047,7 @@ mod tests {
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn remove_agent_key_works_over_callback_custody() {
-        let scp = scp_test();
+        let scp = scp_persistent_test();
         let identity = scp
             .identity_create_with_custody(Box::new(ProdLikeCustody::new()))
             .await
@@ -31700,7 +32088,7 @@ mod tests {
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn add_agent_key_without_custody_returns_ident_1008() {
-        let scp = scp_test();
+        let scp = scp_persistent_test();
         // Create a real identity (populating `core_id` + `core_document`),
         // then rebuild a handle that drops ALL custody — modelling an
         // externally-loaded identity that retains its document but not its
@@ -31861,7 +32249,7 @@ mod tests {
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rotate_key_over_callback_custody_round_trips_via_shared_dht() {
-        let scp = scp_test();
+        let scp = scp_persistent_test();
         let identity = scp
             .identity_create_with_custody(Box::new(ProdLikeCustody::new()))
             .await
@@ -31900,7 +32288,7 @@ mod tests {
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rotate_key_invalidates_resolver_cache() {
-        let scp = scp_test();
+        let scp = scp_persistent_test();
         let identity = scp
             .identity_create_with_custody(Box::new(ProdLikeCustody::new()))
             .await
@@ -31967,7 +32355,7 @@ mod tests {
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn migrate_over_callback_custody_fails_fast_at_seed_import() {
-        let scp = scp_test();
+        let scp = scp_persistent_test();
         let identity = scp
             .identity_create_with_custody(Box::new(ProdLikeCustody::new()))
             .await
@@ -32578,7 +32966,7 @@ mod tests {
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn event_log_checkpoint_works_over_callback_custody() {
-        let scp = scp_test();
+        let scp = scp_persistent_test();
         let identity = scp
             .identity_create_with_custody(Box::new(ProdLikeCustody::new()))
             .await
@@ -32616,7 +33004,7 @@ mod tests {
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn event_log_checkpoint_by_did_works_over_callback_custody() {
-        let scp = scp_test();
+        let scp = scp_persistent_test();
         let identity = scp
             .identity_create_with_custody(Box::new(ProdLikeCustody::new()))
             .await
@@ -34698,7 +35086,7 @@ mod tests {
         /// the custody's signature.
         #[tokio::test]
         async fn governance_propose_signs_through_sign_only_custody() {
-            let scp = scp_test();
+            let scp = scp_persistent_test();
             let bi = Arc::clone(&scp.inner);
             install_seedable_resolver(&bi);
             let owner_identity = scp
@@ -34728,7 +35116,7 @@ mod tests {
         /// envelope with the identity key; only a broadcast envelope does.
         #[tokio::test]
         async fn context_send_succeeds_with_sign_only_custody() {
-            let scp = scp_test();
+            let scp = scp_persistent_test();
             let bi = Arc::clone(&scp.inner);
             install_seedable_resolver(&bi);
             let identity = scp

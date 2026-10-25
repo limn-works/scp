@@ -813,7 +813,7 @@
       "name": "reopen",
       "path": "crates/scp-ffi/uniffi/src/testing_custody.rs",
       "kind": "test-fixture",
-      "reason": "SCP-345 test hook; feature-gated (testing). Method that builds a new TestingCallbackCustody around another host provider over this one's custody records, as production rebuilds an identity's adapter over its stored records after a relaunch, so a Swift or Kotlin test reopens keys the first adapter minted and recorded. Not a protocol operation."
+      "reason": "SCP-345 test hook; feature-gated (testing). Method that builds a new TestingCallbackCustody around another host provider over this one's custody records, as identity_load_with_custody rebuilds an identity's adapter over the namespace its stored entry holds, so a Swift or Kotlin test reopens keys the first adapter minted and recorded. Not a protocol operation."
     },
     {
       "name": "testing_p256_verify_strict",
@@ -1175,7 +1175,7 @@
       "name": "reopen",
       "path": "crates/scp-ffi/napi/src/testing.rs",
       "kind": "test-fixture",
-      "reason": "SCP-345 test hook; feature-gated (testing). Method of TestingCallbackCustody that builds a new adapter around another JS provider over this one's custody records, as production rebuilds an identity's adapter over its stored records after a relaunch, so a TypeScript test reaches the check of a host's getPublicKey answer against the record. Not a protocol operation."
+      "reason": "SCP-345 test hook; feature-gated (testing). Method of TestingCallbackCustody that builds a new adapter around another JS provider over this one's custody records, as identityLoadWithCustody rebuilds an identity's adapter over the namespace its stored entry holds, so a TypeScript test reaches the check of a host's getPublicKey answer against the record. Not a protocol operation."
     },
     {
       "name": "generate_keypair",

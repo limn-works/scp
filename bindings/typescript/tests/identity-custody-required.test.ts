@@ -99,6 +99,31 @@ describe("identity-creating methods require custody", () => {
     }
   }
 
+  for (const [label, provider] of [
+    ["undefined", undefined],
+    ["null", null],
+  ] as const) {
+    it(`identityLoadWithCustody given ${label} rejects with SCP-IDENT-1116 before any bridge call`, async () => {
+      const { scp, native } = mountMockScp();
+      native.__stub("identityLoadWithCustody", () => {
+        throw new Error("bridge identityLoadWithCustody must not be reached");
+      });
+
+      const err = await rejection(
+        (scp.identityLoadWithCustody as (d: string, p: unknown) => Promise<unknown>).call(
+          scp,
+          "did:dht:z6MkLoadNeedsProvider",
+          provider,
+        ),
+      );
+
+      expect(err).toBeInstanceOf(IdentityError);
+      expect((err as IdentityError).code).toBe("SCP-IDENT-1116");
+      expect((err as IdentityError).message).toContain("store: pass a KeyCustodyProvider");
+      expect(native.__calls("identityLoadWithCustody")).toHaveLength(0);
+    });
+  }
+
   for (const method of ["identityCreate", "identityCreateWithAgentKey"] as const) {
     it(`${method} given a non-string custody rejects with SCP-VALID-7005 before any bridge call`, async () => {
       const { scp, native } = mountMockScp();

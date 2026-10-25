@@ -734,6 +734,13 @@ impl PyCallbackKeyCustody {
     ) -> Self {
         Self { provider, registry }
     }
+
+    /// The custody namespace this adapter's records live under, which the
+    /// identity's callback custody entry stores (spec §17.3).
+    #[must_use]
+    pub const fn namespace(&self) -> [u8; 16] {
+        self.registry.namespace()
+    }
 }
 
 impl KeyCustody for PyCallbackKeyCustody {
@@ -1433,22 +1440,29 @@ mod tests {
     /// registry that trusted the host's answer would sign.
     #[tokio::test]
     async fn rebuilt_adapter_refuses_sign_of_key_event_key_host_reports_p256() {
-        use scp_ffi_common::callback_custody::{
-            CallbackKeyRegistry, CustodyNamespaceSlot, custody_record_store,
-        };
+        use scp_ffi_common::callback_custody::CallbackKeyRegistry;
 
         let storage = Arc::new(scp_platform::in_memory::InMemoryStorage::new());
-        let slot = CustodyNamespaceSlot::fresh().expect("namespace");
+        let table = scp_platform::CustodyNamespaces::new();
         let recorded = || {
             CallbackKeyRegistry::recorded(
-                custody_record_store(Arc::clone(&storage), &slot)
-                    .expect("no other adapter holds the namespace"),
+                scp_ffi_common::callback_custody::CustodyRecords::open(
+                    &table,
+                    Arc::clone(&storage),
+                    scp_platform::CustodyNamespace::from_bytes([0x3a; 16]),
+                )
+                .expect("no other adapter holds the namespace"),
             )
         };
         let (minted, host) = p256_over(recorded());
         let (key, _) = key_event_key(&minted).await;
         assert!(
-            custody_record_store(Arc::clone(&storage), &slot).is_err(),
+            scp_ffi_common::callback_custody::CustodyRecords::open(
+                &table,
+                Arc::clone(&storage),
+                scp_platform::CustodyNamespace::from_bytes([0x3a; 16])
+            )
+            .is_err(),
             "a second adapter for a live namespace is refused"
         );
         drop(minted);

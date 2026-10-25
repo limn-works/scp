@@ -229,3 +229,27 @@ def test_a_seed_without_in_memory_raises_valid_7009_before_the_request_is_read(
     # The SDK takes no seed, so the raw bridge carries this row of the table.
     with pytest.raises(_scp_core.ValidationError, match=r"^\[SCP-VALID-7009\] "):
         scp._native.identity_create(custody, bytes(32))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("call", ["positional", "keyword"])
+async def test_load_with_custody_given_none_raises_ident_1116_before_any_bridge_call(
+    call: str,
+) -> None:
+    scp, native = _scp_with_mock_native()
+
+    with pytest.raises(IdentityError) as excinfo:
+        if call == "positional":
+            await scp.identity_load_with_custody("did:dht:z6MkLoadNeedsProvider", None)  # type: ignore[arg-type]
+        else:
+            await scp.identity_load_with_custody(
+                did="did:dht:z6MkLoadNeedsProvider",
+                provider=None,  # type: ignore[arg-type]
+            )
+
+    assert excinfo.value.code == "SCP-IDENT-1116"
+    assert excinfo.value.message.startswith(
+        "identity_load_with_custody() requires a custody argument"
+    )
+    assert "store: pass a KeyCustodyProvider" in excinfo.value.message
+    native.identity_load_with_custody.assert_not_called()

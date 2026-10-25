@@ -906,7 +906,9 @@
         /// one the Keychain holds in the identity role.
         @Test("identityCreateWithCustody takes the adapter as its provider")
         func identityCreateWithCustodyTakesTheAdapter() async throws {
-            let scp = try SCP(storage: .inMemory)
+            let dir = try persistentTestDirectory()
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let scp = try persistentTestScp(at: dir)
             let identity = try await scp.identityCreateWithCustody(provider: adapter)
             #expect(identity.custodyType() == "os_keystore")
             let verifyingKey = try hexToData(#require(identity.verifyingKey()))
@@ -919,6 +921,75 @@
                 #expect(reported.publicKey == verifyingKey)
                 try await provider.destroyKey(keyId: keyId)
             }
+            try await scp.shutdown(timeoutMillis: 1000)
+        }
+
+        /// Spec section 17.3: an identity created with the adapter loads on a
+        /// new instance over the same storage with the adapter, and a
+        /// single-admin proposal signs with the identity key the earlier
+        /// instance minted. A plain load is refused with `SCP-IDENT-1003`,
+        /// and a second load while the first is live with `SCP-IDENT-1008`.
+        @Test("identityLoadWithCustody reloads the identity on a new instance with the adapter")
+        func identityLoadWithCustodyReloadsTheIdentity() async throws {
+            let dir = try persistentTestDirectory()
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let first = try persistentTestScp(at: dir)
+            let did = try await first.identityCreateWithCustody(provider: adapter).did()
+            try await first.shutdown(timeoutMillis: 1000)
+
+            let second = try persistentTestScp(at: dir)
+            #expect(await scpErrorCode { _ = try await second.identityLoad(did: did) } == "SCP-IDENT-1003")
+            let loaded = try await second.identityLoadWithCustody(did: did, provider: adapter)
+            #expect(loaded.did() == did)
+            #expect(loaded.custodyType() == "os_keystore")
+            let context = try await second.contextCreate(identity: loaded, params: ContextParams(
+                mode: .encrypted,
+                ceiling: ["messages:read", "governance:propose", "member:ban"],
+                ceilingPolicy: .immutable,
+                governance: .singleAdmin,
+                memoryScope: .ephemeral,
+                ttlSeconds: 0,
+                promotable: false,
+                minProtocolVersion: 0,
+                maxChainDepth: nil,
+                maxNestingDepth: nil,
+                sessionCap: nil,
+                economicPolicy: nil,
+                consequenceRulesJson: nil,
+                consequenceConfigJson: nil,
+                capabilityRequirementsJson: nil,
+                pseudonymRotation: nil
+            ))
+            let response = try await second.governancePropose(
+                handle: context,
+                proposerDid: did,
+                actionJson: #"{"SuspendCapability":{"did":"\#(did)","capabilities":["MessagesWrite"]}}"#
+            )
+            #expect(response.contains(#""status":"Approved""#), "\(response)")
+            #expect(
+                await scpErrorCode { _ = try await second.identityLoadWithCustody(did: did, provider: adapter) }
+                    == "SCP-IDENT-1008"
+            )
+            try await second.shutdown(timeoutMillis: 1000)
+        }
+
+        /// Spec section 17.3: callback custody is refused on storage that
+        /// does not persist, on create and on load, with `SCP-STORAGE-8000`.
+        @Test("in-memory storage refuses a callback custody create and load with SCP-STORAGE-8000")
+        func inMemoryStorageRefusesCallbackCustody() async throws {
+            let scp = try SCP(storage: .inMemory)
+            #expect(
+                await scpErrorCode { _ = try await scp.identityCreateWithCustody(provider: adapter) }
+                    == "SCP-STORAGE-8000"
+            )
+            #expect(
+                await scpErrorCode {
+                    _ = try await scp.identityLoadWithCustody(
+                        did: "did:dht:ab3ii3ef4mbcu5rmhkbf5yctwnodzx6a65ghazmtu1ydzhfzezby",
+                        provider: adapter
+                    )
+                } == "SCP-STORAGE-8000"
+            )
             try await scp.shutdown(timeoutMillis: 1000)
         }
 

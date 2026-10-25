@@ -16,9 +16,9 @@
 //!   mint writes its record before it returns. An unrecorded handle is
 //!   [`PlatformError::KeyNotFound`] with no host call, in every entry point,
 //!   and a host answer that disagrees with the record is refused, so the host
-//!   never decides a key's type or role. A registry built
-//!   [`unrecorded`](CallbackKeyRegistry::unrecorded) has no store: the keys it
-//!   minted itself are its records, and it mints no key-event key.
+//!   never decides a key's type or role. A production registry always has a
+//!   store ([`CustodyRecords`]), opened over the namespace its identity entry
+//!   keeps ([`crate::callback_identity`]).
 //! - [`CallbackKeyRegistry`] caches the public key of each recorded handle
 //!   this adapter minted or resolved. A destroy drops the cache entry and the
 //!   record when the host confirms the key is gone or reports it absent.
@@ -51,8 +51,8 @@ use scp_platform::traits::{
     KeyHandle, KeyRole, KeyType, Pseudonym, PublicKey, SharedSecret, Signature, Storage,
 };
 use scp_platform::{
-    CustodyNamespace, CustodyProbe, CustodyRecord, CustodyRecordStore, IndexedSignature,
-    KeyEventSignError, ProbeSignature, SigningChange, StorageCustodyRecordStore,
+    CustodyNamespace, CustodyNamespaces, CustodyProbe, CustodyRecord, CustodyRecordStore,
+    IndexedSignature, KeyEventSignError, NamespaceLive, ProbeSignature, SigningChange,
     refuse_key_event_mint,
 };
 
@@ -165,9 +165,10 @@ pub struct RegisteredEntry {
 /// Why a callback adapter's custody records could not be opened.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CustodyLoadError {
-    /// Another live callback adapter holds this identity's custody namespace.
-    /// Two adapters over one namespace would each check and write its records
-    /// under their own lock, so the second is refused until the first drops.
+    /// Another live callback adapter of this instance holds the identity's
+    /// custody namespace. Two adapters over one namespace would each check
+    /// and write its records under their own lock, so the second is refused
+    /// until the first drops.
     NamespaceLive,
     /// The operating system's random source failed while drawing a new
     /// namespace; no namespace is drawn from a fallback.
@@ -196,150 +197,168 @@ impl From<CustodyLoadError> for PlatformError {
     }
 }
 
-/// The custody namespace an identity's registry entry keeps for its callback
-/// adapter (spec §17.3; SCP-345 decision D1).
+impl From<NamespaceLive> for CustodyLoadError {
+    fn from(NamespaceLive: NamespaceLive) -> Self {
+        Self::NamespaceLive
+    }
+}
+
+/// One callback adapter's custody records (spec §17.3).
 ///
-/// The slot holds the [`CustodyNamespace`] while no adapter is live. Loading
-/// an adapter ([`custody_record_store`]) takes the namespace out by move and
-/// builds the adapter's one record store from it; the slot is empty until
-/// that adapter's [`CustodyRecords`] drop and return it. A second load while
-/// the first adapter lives finds the slot empty and is refused with
-/// [`CustodyLoadError::NamespaceLive`], so one namespace never backs two
-/// stores whose `put`s could interleave. Clones share one slot.
-#[derive(Debug, Clone)]
-pub struct CustodyNamespaceSlot(Arc<Mutex<Option<CustodyNamespace>>>);
-
-impl CustodyNamespaceSlot {
-    /// A slot holding a namespace drawn from the operating system's random
-    /// source, for a newly created callback identity.
-    ///
-    /// # Errors
-    ///
-    /// [`CustodyLoadError::RandomSource`] when the random source fails.
-    pub fn fresh() -> Result<Self, CustodyLoadError> {
-        let mut bytes = [0u8; 16];
-        rand_core::OsRng
-            .try_fill_bytes(&mut bytes)
-            .map_err(|e| CustodyLoadError::RandomSource(e.to_string()))?;
-        Ok(Self::holding(CustodyNamespace::from_bytes(bytes)))
-    }
-
-    /// A slot holding `namespace`.
-    #[must_use]
-    pub fn holding(namespace: CustodyNamespace) -> Self {
-        Self(Arc::new(Mutex::new(Some(namespace))))
-    }
-
-    /// Takes the namespace out, leaving the slot empty until the returned
-    /// lease drops.
-    fn take(&self) -> Result<(CustodyNamespace, NamespaceLease), CustodyLoadError> {
-        let namespace = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-            .ok_or(CustodyLoadError::NamespaceLive)?;
-        let lease = NamespaceLease {
-            slot: self.clone(),
-            bytes: *namespace.as_bytes(),
-        };
-        Ok((namespace, lease))
-    }
-}
-
-/// Returns its namespace to the slot when the adapter holding it drops.
-struct NamespaceLease {
-    slot: CustodyNamespaceSlot,
-    bytes: [u8; 16],
-}
-
-impl Drop for NamespaceLease {
-    fn drop(&mut self) {
-        // A poisoned slot still takes the namespace back: the lock guards a
-        // plain `Option`, which no panic leaves half-written.
-        *self
-            .slot
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some(CustodyNamespace::from_bytes(self.bytes));
-    }
-}
-
-/// One callback adapter's custody records: the store scoped to its
-/// namespace, and the lease that returns the namespace to its identity's
-/// slot when the adapter drops.
+/// The store is scoped to its identity's namespace and opened through the
+/// instance's [`CustodyNamespaces`] table, which holds the namespace live
+/// until the records drop.
 pub struct CustodyRecords {
-    // Declared before `lease`, so the store drops before the namespace
-    // returns to the slot and a later load builds the only live store.
     store: Arc<dyn CustodyRecordStore>,
-    lease: Option<NamespaceLease>,
+    namespace: [u8; 16],
 }
 
 impl fmt::Debug for CustodyRecords {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CustodyRecords")
-            .field("leased", &self.lease.is_some())
+            .field("namespace", &CustodyNamespace::from_bytes(self.namespace))
             .finish_non_exhaustive()
     }
 }
 
 impl CustodyRecords {
-    /// Records over a store a test built and keeps a handle to, with no
-    /// namespace slot. Production adapters open theirs through
-    /// [`custody_record_store`].
+    /// Opens the records of `namespace` over `storage`, the instance
+    /// storage the operator selected (spec §17.6), through `table`.
+    ///
+    /// # Errors
+    ///
+    /// [`CustodyLoadError::NamespaceLive`] while another adapter opened from
+    /// `table` holds `namespace`.
+    pub fn open<S>(
+        table: &CustodyNamespaces,
+        storage: S,
+        namespace: CustodyNamespace,
+    ) -> Result<Self, CustodyLoadError>
+    where
+        S: Storage + Send + Sync + 'static,
+    {
+        let namespace_bytes = *namespace.as_bytes();
+        let store = table.open(storage, namespace)?;
+        Ok(Self {
+            store: Arc::new(store),
+            namespace: namespace_bytes,
+        })
+    }
+
+    /// Opens the records of a new identity under a namespace drawn from the
+    /// operating system's random source. Only the create path of an
+    /// identity draws a namespace; every later adapter reopens the one its
+    /// identity entry stores ([`crate::callback_identity`]).
+    ///
+    /// # Errors
+    ///
+    /// [`CustodyLoadError::RandomSource`] when the random source fails, and
+    /// [`CustodyLoadError::NamespaceLive`] as in [`open`](Self::open).
+    pub(crate) fn create<S>(table: &CustodyNamespaces, storage: S) -> Result<Self, CustodyLoadError>
+    where
+        S: Storage + Send + Sync + 'static,
+    {
+        let mut bytes = [0u8; 16];
+        rand_core::OsRng
+            .try_fill_bytes(&mut bytes)
+            .map_err(|e| CustodyLoadError::RandomSource(e.to_string()))?;
+        Self::open(table, storage, CustodyNamespace::from_bytes(bytes))
+    }
+
+    /// The namespace these records live under.
+    #[must_use]
+    pub const fn namespace(&self) -> [u8; 16] {
+        self.namespace
+    }
+
+    /// A new namespace table and the records of `namespace` over `storage`
+    /// it holds, for a test adapter that needs records but no instance; see
+    /// [`CustodyNamespaces::open_alone`].
     #[cfg(any(test, feature = "testing"))]
     #[must_use]
-    pub fn unleased(store: Arc<dyn CustodyRecordStore>) -> Self {
-        Self { store, lease: None }
+    pub fn open_alone<S>(storage: S, namespace: CustodyNamespace) -> (CustodyNamespaces, Self)
+    where
+        S: Storage + Send + Sync + 'static,
+    {
+        let namespace_bytes = *namespace.as_bytes();
+        let (table, store) = CustodyNamespaces::open_alone(storage, namespace);
+        (
+            table,
+            Self {
+                store: Arc::new(store),
+                namespace: namespace_bytes,
+            },
+        )
+    }
+
+    /// Records over a store a unit test built and keeps a handle to, with no
+    /// namespace table: a store that fails on demand, or one the test reads
+    /// beside the adapter.
+    #[cfg(test)]
+    pub(crate) fn unleased(store: Arc<dyn CustodyRecordStore>) -> Self {
+        Self {
+            store,
+            namespace: [0; 16],
+        }
     }
 }
 
-/// Opens the custody records of the callback adapter whose identity keeps
-/// `slot`, over the instance storage the operator selected (spec §17.6).
+mod sealed {
+    pub trait Sealed {}
+}
+
+/// Where a [`CallbackKeyRegistry`] reads the records of its keys.
 ///
-/// The namespace leaves the slot by move and returns when the adapter's
-/// records drop.
-///
-/// # Errors
-///
-/// [`CustodyLoadError::NamespaceLive`] while another adapter holds the slot's
-/// namespace.
-pub fn custody_record_store<S>(
-    storage: S,
-    slot: &CustodyNamespaceSlot,
-) -> Result<CustodyRecords, CustodyLoadError>
-where
-    S: Storage + Send + Sync + 'static,
-{
-    let (namespace, lease) = slot.take()?;
-    Ok(CustodyRecords {
-        store: Arc::new(StorageCustodyRecordStore::new(storage, namespace)),
-        lease: Some(lease),
-    })
+/// Sealed: [`CustodyRecords`] is the one source a production adapter has,
+/// and it always holds a store; the record-less source is a unit-test type.
+pub trait RecordSource: sealed::Sealed + fmt::Debug + Send + Sync {
+    /// The record store, or `None` for a source whose records are the
+    /// entries its registry minted.
+    fn store(&self) -> Option<&dyn CustodyRecordStore>;
+}
+
+impl sealed::Sealed for CustodyRecords {}
+
+impl RecordSource for CustodyRecords {
+    fn store(&self) -> Option<&dyn CustodyRecordStore> {
+        Some(self.store.as_ref())
+    }
+}
+
+/// The record source of a unit-test registry with no record store: only the
+/// keys its registry minted are usable, and it mints no key-event key.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct NoRecords;
+
+#[cfg(test)]
+impl sealed::Sealed for NoRecords {}
+
+#[cfg(test)]
+impl RecordSource for NoRecords {
+    fn store(&self) -> Option<&dyn CustodyRecordStore> {
+        None
+    }
 }
 
 /// The custody records and public-key cache of one callback adapter.
 ///
-/// A handle is usable only when it has a record: in the adapter's
-/// [`CustodyRecordStore`] when the registry is
-/// [`recorded`](Self::recorded), or, for an
-/// [`unrecorded`](Self::unrecorded) registry, a cache entry this registry
-/// minted. An unrecorded registry binds no handle it did not mint, because
-/// [`resolve`] refuses a handle with no record before any host call, so its
-/// cache holds exactly its own mints.
+/// A handle is usable only when it has a record in the adapter's
+/// [`CustodyRecordStore`]. [`resolve`] refuses a handle with no record
+/// before any host call. (A unit-test registry with no store treats the
+/// entries it minted as its records.)
 ///
 /// The cache is not the authority on whether a key exists; the host is. A
 /// recorded handle the cache lacks is resolved through the host, and a
 /// destroy removes the entry and the record when the host confirms the key
 /// is gone. The map holds at most one entry per key the caller minted or
 /// used.
-pub struct CallbackKeyRegistry {
+pub struct CallbackKeyRegistry<R: RecordSource = CustodyRecords> {
     entries: Mutex<HashMap<u64, RegisteredEntry>>,
-    records: Option<CustodyRecords>,
+    records: R,
 }
 
-impl fmt::Debug for CallbackKeyRegistry {
+impl<R: RecordSource> fmt::Debug for CallbackKeyRegistry<R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CallbackKeyRegistry")
             .field("records", &self.records)
@@ -353,22 +372,33 @@ impl CallbackKeyRegistry {
     pub fn recorded(records: CustodyRecords) -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
-            records: Some(records),
+            records,
         }
     }
 
-    /// A registry over a fresh in-memory record store, for a test adapter
-    /// that needs records but no instance storage. Infallible: the namespace
-    /// is fixed, since the store is the registry's own.
+    /// The custody namespace this registry's records live under, which the
+    /// identity's callback custody entry stores (spec §17.3).
+    #[must_use]
+    pub const fn namespace(&self) -> [u8; 16] {
+        self.records.namespace()
+    }
+
+    /// A registry over a fresh in-memory record store with its own namespace
+    /// table, for a test adapter that needs records but no instance storage.
     #[cfg(any(test, feature = "testing"))]
     #[must_use]
     pub fn recorded_in_memory() -> Self {
-        Self::recorded(CustodyRecords::unleased(Arc::new(
-            scp_platform::StorageCustodyRecordStore::new(
-                scp_platform::in_memory::InMemoryStorage::new(),
-                CustodyNamespace::from_bytes([0; 16]),
-            ),
-        )))
+        Self::recorded(Self::in_memory_records())
+    }
+
+    /// Records over fresh in-memory storage and a table of their own.
+    #[cfg(any(test, feature = "testing"))]
+    fn in_memory_records() -> CustodyRecords {
+        CustodyRecords::open_alone(
+            scp_platform::in_memory::InMemoryStorage::new(),
+            CustodyNamespace::from_bytes([0; 16]),
+        )
+        .1
     }
 
     /// [`recorded_in_memory`](Self::recorded_in_memory) already holding a
@@ -382,30 +412,28 @@ impl CallbackKeyRegistry {
     pub async fn recorded_in_memory_holding(
         records: &[(KeyHandle, KeyType, KeyRole)],
     ) -> Result<Self, PlatformError> {
-        let store: Arc<dyn CustodyRecordStore> =
-            Arc::new(scp_platform::StorageCustodyRecordStore::new(
-                scp_platform::in_memory::InMemoryStorage::new(),
-                CustodyNamespace::from_bytes([0; 16]),
-            ));
+        let opened = Self::in_memory_records();
         for &(handle, key_type, role) in records {
-            store.put(handle, key_type, role).await?;
+            opened.store.put(handle, key_type, role).await?;
         }
-        Ok(Self::recorded(CustodyRecords::unleased(store)))
+        Ok(Self::recorded(opened))
     }
+}
 
+#[cfg(test)]
+impl CallbackKeyRegistry<NoRecords> {
     /// A registry with no record store. It mints no key-event key, and only
     /// the keys it minted itself are usable; every other handle is
-    /// [`PlatformError::KeyNotFound`] with no host call. Test-only: every
-    /// production adapter is record-backed (SCP-345).
-    #[cfg(any(test, feature = "testing"))]
-    #[must_use]
-    pub fn unrecorded() -> Self {
+    /// [`PlatformError::KeyNotFound`] with no host call.
+    pub(crate) fn unrecorded() -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
-            records: None,
+            records: NoRecords,
         }
     }
+}
 
+impl<R: RecordSource> CallbackKeyRegistry<R> {
     fn lock(
         &self,
     ) -> Result<std::sync::MutexGuard<'_, HashMap<u64, RegisteredEntry>>, PlatformError> {
@@ -496,9 +524,9 @@ impl CallbackKeyRegistry {
         Ok(self.lock()?.contains_key(&handle.id()))
     }
 
-    /// The record store, when this registry has one.
+    /// The record store, when this registry's source has one.
     fn store(&self) -> Option<&dyn CustodyRecordStore> {
-        self.records.as_ref().map(|records| records.store.as_ref())
+        self.records.store()
     }
 }
 
@@ -512,8 +540,8 @@ impl CallbackKeyRegistry {
 /// # Errors
 ///
 /// Any store error, including an undecodable record; a poisoned registry.
-pub async fn record_of(
-    registry: &CallbackKeyRegistry,
+pub async fn record_of<R: RecordSource>(
+    registry: &CallbackKeyRegistry<R>,
     key: &KeyHandle,
 ) -> Result<Option<CustodyRecord>, PlatformError> {
     match registry.store() {
@@ -526,8 +554,8 @@ pub async fn record_of(
 }
 
 /// The record of `key`, or [`PlatformError::KeyNotFound`] when it has none.
-async fn required_record(
-    registry: &CallbackKeyRegistry,
+async fn required_record<R: RecordSource>(
+    registry: &CallbackKeyRegistry<R>,
     key: &KeyHandle,
 ) -> Result<CustodyRecord, PlatformError> {
     record_of(registry, key)
@@ -753,8 +781,8 @@ const fn refuse_key_event_record(
 /// [`PlatformError::WrongKeyType`] for [`KeyType::P256KeyEvent`], with no
 /// host call ([`refuse_key_event_mint`]); otherwise as in
 /// [`generate_identity`].
-pub async fn generate_operational<G, GF, P, PF, D, DF>(
-    registry: &CallbackKeyRegistry,
+pub async fn generate_operational<R: RecordSource, G, GF, P, PF, D, DF>(
+    registry: &CallbackKeyRegistry<R>,
     key_type: KeyType,
     host_generate: G,
     host_get_public_key: P,
@@ -792,8 +820,8 @@ where
 /// [`PlatformError::Unsupported`] for an
 /// [`unrecorded`](CallbackKeyRegistry::unrecorded) registry, with no host
 /// call; otherwise as in [`generate_identity`].
-pub async fn generate_key_event<G, GF, P, PF, D, DF>(
-    registry: &CallbackKeyRegistry,
+pub async fn generate_key_event<R: RecordSource, G, GF, P, PF, D, DF>(
+    registry: &CallbackKeyRegistry<R>,
     host_generate: G,
     host_get_public_key: P,
     host_destroy: D,
@@ -847,8 +875,8 @@ where
 /// Any host or record-store error; [`PlatformError::CustodyError`] for a
 /// non-numeric key id, a refused public key, another stated type or role, a
 /// cached key id, or a different record already stored under the id.
-pub async fn generate_identity<G, GF, P, PF, D, DF>(
-    registry: &CallbackKeyRegistry,
+pub async fn generate_identity<R: RecordSource, G, GF, P, PF, D, DF>(
+    registry: &CallbackKeyRegistry<R>,
     host_generate: G,
     host_get_public_key: P,
     host_destroy: D,
@@ -874,8 +902,8 @@ where
 
 /// The one generation flow; [`generate_operational`], [`generate_identity`]
 /// and [`generate_key_event`] fix the type and role.
-async fn generate<G, GF, P, PF, D, DF>(
-    registry: &CallbackKeyRegistry,
+async fn generate<R: RecordSource, G, GF, P, PF, D, DF>(
+    registry: &CallbackKeyRegistry<R>,
     key_type: KeyType,
     role: KeyRole,
     host_generate: G,
@@ -957,8 +985,8 @@ where
 /// error for a key it lacks; [`PlatformError::CustodyError`] for an answer
 /// that disagrees with the custody record; as in [`registered_key`] and
 /// [`CallbackKeyRegistry::bind_resolved`].
-pub async fn resolve<P, PF>(
-    registry: &CallbackKeyRegistry,
+pub async fn resolve<R: RecordSource, P, PF>(
+    registry: &CallbackKeyRegistry<R>,
     key: &KeyHandle,
     host_get_public_key: &P,
 ) -> Result<(RegisteredEntry, bool), PlatformError>
@@ -971,8 +999,8 @@ where
 }
 
 /// [`resolve`] for a handle whose `record` the caller already read.
-async fn resolve_recorded<P, PF>(
-    registry: &CallbackKeyRegistry,
+async fn resolve_recorded<R: RecordSource, P, PF>(
+    registry: &CallbackKeyRegistry<R>,
     key: &KeyHandle,
     record: CustodyRecord,
     host_get_public_key: &P,
@@ -1016,8 +1044,8 @@ where
 /// Any host or record-store error; [`PlatformError::KeyNotFound`],
 /// [`PlatformError::WrongKeyType`] or [`PlatformError::CustodyError`] as
 /// above and in [`resolve`].
-pub async fn sign<S, SF, P, PF>(
-    registry: &CallbackKeyRegistry,
+pub async fn sign<R: RecordSource, S, SF, P, PF>(
+    registry: &CallbackKeyRegistry<R>,
     key: &KeyHandle,
     data: &[u8],
     host_sign: S,
@@ -1065,8 +1093,8 @@ where
 /// record is not a key-event key; [`KeyEventSignError::Substrate`] for a host
 /// error, a store error, an answer that disagrees with the record, or a
 /// signature that does not verify.
-pub async fn sign_change<S, SF, P, PF>(
-    registry: &CallbackKeyRegistry,
+pub async fn sign_change<R: RecordSource, S, SF, P, PF>(
+    registry: &CallbackKeyRegistry<R>,
     key: &KeyHandle,
     change: &SigningChange,
     host_sign: S,
@@ -1097,8 +1125,8 @@ where
 /// # Errors
 ///
 /// As in [`sign_change`].
-pub async fn sign_probe<S, SF, P, PF>(
-    registry: &CallbackKeyRegistry,
+pub async fn sign_probe<R: RecordSource, S, SF, P, PF>(
+    registry: &CallbackKeyRegistry<R>,
     key: &KeyHandle,
     probe: &CustodyProbe,
     host_sign: S,
@@ -1122,8 +1150,8 @@ where
 }
 
 /// The raw low-`s` signature of the key-event key `key` over `digest`.
-async fn key_event_signature<S, SF, P, PF>(
-    registry: &CallbackKeyRegistry,
+async fn key_event_signature<R: RecordSource, S, SF, P, PF>(
+    registry: &CallbackKeyRegistry<R>,
     key: &KeyHandle,
     digest: [u8; 32],
     host_sign: S,
@@ -1164,8 +1192,8 @@ where
 ///
 /// Any host error; [`PlatformError::CustodyError`] for a refused or changed
 /// key or role, and as in [`resolve`].
-pub async fn public_key<P, PF>(
-    registry: &CallbackKeyRegistry,
+pub async fn public_key<R: RecordSource, P, PF>(
+    registry: &CallbackKeyRegistry<R>,
     key: &KeyHandle,
     host_get_public_key: P,
 ) -> Result<PublicKey, PlatformError>
@@ -1207,8 +1235,8 @@ where
 ///
 /// Any host error; [`PlatformError::WrongKeyType`] or
 /// [`PlatformError::CustodyError`] as above and in [`resolve`].
-pub async fn dh_agree<H, HF, P, PF>(
-    registry: &CallbackKeyRegistry,
+pub async fn dh_agree<R: RecordSource, H, HF, P, PF>(
+    registry: &CallbackKeyRegistry<R>,
     key: &KeyHandle,
     peer_public: &[u8],
     host_dh_agree: H,
@@ -1254,8 +1282,8 @@ where
 /// does not hold; any other host error; [`PlatformError::CustodyError`] when
 /// the record could not be removed after the host's destroy; a poisoned
 /// registry.
-pub async fn destroy_key<D, DF>(
-    registry: &CallbackKeyRegistry,
+pub async fn destroy_key<R: RecordSource, D, DF>(
+    registry: &CallbackKeyRegistry<R>,
     key: &KeyHandle,
     host_destroy: D,
 ) -> Result<(), PlatformError>
@@ -1276,7 +1304,10 @@ where
 
 /// Drops `key`'s cache entry and custody record once the host no longer
 /// holds it.
-async fn forget(registry: &CallbackKeyRegistry, key: &KeyHandle) -> Result<(), PlatformError> {
+async fn forget<R: RecordSource>(
+    registry: &CallbackKeyRegistry<R>,
+    key: &KeyHandle,
+) -> Result<(), PlatformError> {
     registry.remove(*key)?;
     if let Some(store) = registry.store() {
         store.remove(*key).await.map_err(|e| {
@@ -1309,8 +1340,8 @@ async fn forget(registry: &CallbackKeyRegistry, key: &KeyHandle) -> Result<(), P
 /// As above and in [`resolve`]; any `host_derive` error;
 /// [`PlatformError::PseudonymRejected`] (reported as `SCP-IDENT-1055`) for
 /// bytes that are not a compressed P-256 point.
-pub async fn derive_pseudonym<H, HF, P, PF>(
-    registry: &CallbackKeyRegistry,
+pub async fn derive_pseudonym<R: RecordSource, H, HF, P, PF>(
+    registry: &CallbackKeyRegistry<R>,
     key: &KeyHandle,
     epoch: Option<u64>,
     host_derive: H,
@@ -1779,22 +1810,31 @@ mod tests {
         panic!("no get_public_key lookup expected")
     }
 
-    fn live(registry: &CallbackKeyRegistry, id: u64, key: RegisteredKey, role: KeyRole) {
+    fn live<R: RecordSource>(
+        registry: &CallbackKeyRegistry<R>,
+        id: u64,
+        key: RegisteredKey,
+        role: KeyRole,
+    ) {
         registry
             .register(KeyHandle::new(id), RegisteredEntry { key, role })
             .unwrap();
     }
 
-    fn cached(registry: &CallbackKeyRegistry) -> usize {
+    fn cached<R: RecordSource>(registry: &CallbackKeyRegistry<R>) -> usize {
         registry.entries.lock().expect("registry lock").len()
     }
 
     /// A record store over fresh in-memory storage, in namespace `ns`.
     fn store_in(ns: u8) -> Arc<dyn CustodyRecordStore> {
-        Arc::new(StorageCustodyRecordStore::new(
-            scp_platform::in_memory::InMemoryStorage::new(),
-            CustodyNamespace::from_bytes([ns; 16]),
-        ))
+        Arc::new(
+            CustodyNamespaces::new()
+                .open(
+                    scp_platform::in_memory::InMemoryStorage::new(),
+                    CustodyNamespace::from_bytes([ns; 16]),
+                )
+                .unwrap(),
+        )
     }
 
     /// A recorded registry over `store`.
@@ -2008,54 +2048,58 @@ mod tests {
         assert!(p256_peer_for_host(&[]).is_err());
     }
 
+    /// Handle 5 of `registry`, an Ed25519 `key`, refuses a host's 64 junk
+    /// bytes and accepts its real signature.
+    async fn junk_then_real<R: RecordSource>(
+        registry: &CallbackKeyRegistry<R>,
+        key: &ed25519_dalek::SigningKey,
+        calls: &AtomicUsize,
+    ) {
+        let h = KeyHandle::new(5);
+        assert!(matches!(
+            sign(
+                registry,
+                &h,
+                b"data",
+                |_, _| async { Ok(vec![0x11u8; 64]) },
+                lookup(&ed_answer(key), calls)
+            )
+            .await,
+            Err(PlatformError::CustodyError(_))
+        ));
+        let good = key.sign(b"data").to_bytes().to_vec();
+        let expected = good.clone();
+        let sig = sign(
+            registry,
+            &h,
+            b"data",
+            |id, data| async move {
+                assert_eq!((id.as_str(), data.as_slice()), ("5", &b"data"[..]));
+                Ok(good)
+            },
+            no_lookup,
+        )
+        .await
+        .unwrap();
+        assert_eq!(sig.as_bytes(), expected.as_slice());
+    }
+
     /// An Ed25519 handle, minted or resolved, rejects a host that returns
     /// 64 junk bytes, and accepts its real signature.
     #[tokio::test]
     async fn ed25519_sign_rejects_junk_from_the_host() {
         let key = ed(0x51);
         let calls = AtomicUsize::new(0);
+        let minted = CallbackKeyRegistry::unrecorded();
+        live(
+            &minted,
+            5,
+            RegisteredKey::Ed25519(key.verifying_key()),
+            KeyRole::Operational,
+        );
+        junk_then_real(&minted, &key, &calls).await;
         let (resolving, _store) = seeded(&[(5, KeyType::Ed25519, KeyRole::Operational)]).await;
-        for registry in [
-            {
-                let r = CallbackKeyRegistry::unrecorded();
-                live(
-                    &r,
-                    5,
-                    RegisteredKey::Ed25519(key.verifying_key()),
-                    KeyRole::Operational,
-                );
-                r
-            },
-            resolving,
-        ] {
-            let h = KeyHandle::new(5);
-            assert!(matches!(
-                sign(
-                    &registry,
-                    &h,
-                    b"data",
-                    |_, _| async { Ok(vec![0x11u8; 64]) },
-                    lookup(&ed_answer(&key), &calls)
-                )
-                .await,
-                Err(PlatformError::CustodyError(_))
-            ));
-            let good = key.sign(b"data").to_bytes().to_vec();
-            let expected = good.clone();
-            let sig = sign(
-                &registry,
-                &h,
-                b"data",
-                |id, data| async move {
-                    assert_eq!((id.as_str(), data.as_slice()), ("5", &b"data"[..]));
-                    Ok(good)
-                },
-                no_lookup,
-            )
-            .await
-            .unwrap();
-            assert_eq!(sig.as_bytes(), expected.as_slice());
-        }
+        junk_then_real(&resolving, &key, &calls).await;
         assert_eq!(
             calls.load(Ordering::Relaxed),
             1,
@@ -2068,7 +2112,7 @@ mod tests {
     fn registry_with_p256(
         identity: &ed25519_dalek::SigningKey,
         key: &P256SecretKey,
-    ) -> CallbackKeyRegistry {
+    ) -> CallbackKeyRegistry<NoRecords> {
         let registry = CallbackKeyRegistry::unrecorded();
         live(
             &registry,
@@ -2522,8 +2566,8 @@ mod tests {
 
     /// Runs `derive_pseudonym` from `source` with a host that returns
     /// `point`, counting derive calls.
-    async fn derive_from(
-        registry: &CallbackKeyRegistry,
+    async fn derive_from<R: RecordSource>(
+        registry: &CallbackKeyRegistry<R>,
         source: u64,
         epoch: Option<u64>,
         point: Vec<u8>,
@@ -2681,8 +2725,8 @@ mod tests {
 
     type Log = std::sync::Mutex<Vec<String>>;
 
-    async fn generate_with(
-        registry: &CallbackKeyRegistry,
+    async fn generate_with<R: RecordSource>(
+        registry: &CallbackKeyRegistry<R>,
         key_type: KeyType,
         key_id: &str,
         public_key: Result<HostPublicKey, PlatformError>,
@@ -3204,43 +3248,50 @@ mod tests {
     #[tokio::test]
     async fn unrecorded_registry_refuses_sign_of_unminted_handle() {
         let (recorded, _store) = seeded(&[(41, KeyType::Ed25519, KeyRole::Identity)]).await;
+        refuses_every_entry_point_for_an_unminted_handle(&CallbackKeyRegistry::unrecorded()).await;
+        refuses_every_entry_point_for_an_unminted_handle(&recorded).await;
+    }
+
+    async fn refuses_every_entry_point_for_an_unminted_handle<R: RecordSource>(
+        registry: &CallbackKeyRegistry<R>,
+    ) {
         let change = scp_testing::conformance::key_custody::v41_signing_change();
         let probe = CustodyProbe::fresh().unwrap();
         let h = KeyHandle::new(42);
-        for registry in [CallbackKeyRegistry::unrecorded(), recorded] {
-            let signed = sign(&registry, &h, &[0u8; 32], no_host2, no_host).await;
+        {
+            let signed = sign(registry, &h, &[0u8; 32], no_host2, no_host).await;
             assert!(
                 matches!(signed, Err(PlatformError::KeyNotFound)),
                 "{signed:?}"
             );
-            let public = public_key(&registry, &h, no_host).await;
+            let public = public_key(registry, &h, no_host).await;
             assert!(
                 matches!(public, Err(PlatformError::KeyNotFound)),
                 "{public:?}"
             );
-            let agreed = dh_agree(&registry, &h, &[4u8; 65], no_host2, no_host).await;
+            let agreed = dh_agree(registry, &h, &[4u8; 65], no_host2, no_host).await;
             assert!(
                 matches!(agreed, Err(PlatformError::KeyNotFound)),
                 "{agreed:?}"
             );
-            let derived = derive_pseudonym(&registry, &h, None, no_host, no_host).await;
+            let derived = derive_pseudonym(registry, &h, None, no_host, no_host).await;
             assert!(
                 matches!(derived, Err(PlatformError::KeyNotFound)),
                 "{derived:?}"
             );
-            let destroyed = destroy_key(&registry, &h, no_host).await;
+            let destroyed = destroy_key(registry, &h, no_host).await;
             assert!(
                 matches!(destroyed, Err(PlatformError::KeyNotFound)),
                 "{destroyed:?}"
             );
-            let changed = sign_change(&registry, &h, &change, no_host2, no_host).await;
+            let changed = sign_change(registry, &h, &change, no_host2, no_host).await;
             assert_eq!(changed, Err(KeyEventSignError::MemberNotFound));
-            let probed = sign_probe(&registry, &h, &probe, no_host2, no_host).await;
+            let probed = sign_probe(registry, &h, &probe, no_host2, no_host).await;
             assert!(
                 matches!(probed, Err(KeyEventSignError::MemberNotFound)),
                 "{probed:?}"
             );
-            assert_eq!(cached(&registry), 0);
+            assert_eq!(cached(registry), 0);
         }
     }
 
@@ -3521,13 +3572,12 @@ mod tests {
     #[tokio::test]
     async fn providers_with_one_key_id_keep_separate_records() {
         let storage = Arc::new(scp_platform::in_memory::InMemoryStorage::new());
-        let a_slot = CustodyNamespaceSlot::fresh().unwrap();
-        let b_slot = CustodyNamespaceSlot::fresh().unwrap();
+        let table = CustodyNamespaces::new();
         let a = CallbackKeyRegistry::recorded(
-            custody_record_store(Arc::clone(&storage), &a_slot).unwrap(),
+            CustodyRecords::create(&table, Arc::clone(&storage)).unwrap(),
         );
         let b = CallbackKeyRegistry::recorded(
-            custody_record_store(Arc::clone(&storage), &b_slot).unwrap(),
+            CustodyRecords::create(&table, Arc::clone(&storage)).unwrap(),
         );
         let h = KeyHandle::new(5);
         a.store()
@@ -3603,17 +3653,18 @@ mod tests {
         }
     }
 
-    /// The loader refuses a second live adapter for one namespace while the
-    /// first lives, and loads it again, over the same records, once the first
-    /// drops.
+    /// One instance's table refuses a second live adapter for one namespace
+    /// while the first lives, and opens it again, over the same records, once
+    /// the first drops.
     #[tokio::test]
     async fn a_second_live_adapter_for_one_namespace_is_refused() {
         let storage = Arc::new(scp_platform::in_memory::InMemoryStorage::new());
-        let slot = CustodyNamespaceSlot::fresh().unwrap();
+        let table = CustodyNamespaces::new();
         let h = KeyHandle::new(3);
         let first = CallbackKeyRegistry::recorded(
-            custody_record_store(Arc::clone(&storage), &slot).expect("the first load"),
+            CustodyRecords::create(&table, Arc::clone(&storage)).expect("the first open"),
         );
+        let namespace = first.records.namespace();
         first
             .store()
             .unwrap()
@@ -3621,7 +3672,11 @@ mod tests {
             .await
             .unwrap();
 
-        let second = custody_record_store(Arc::clone(&storage), &slot.clone());
+        let second = CustodyRecords::open(
+            &table.clone(),
+            Arc::clone(&storage),
+            CustodyNamespace::from_bytes(namespace),
+        );
         assert!(
             matches!(second, Err(CustodyLoadError::NamespaceLive)),
             "{second:?}"
@@ -3633,7 +3688,12 @@ mod tests {
 
         drop(first);
         let third = CallbackKeyRegistry::recorded(
-            custody_record_store(Arc::clone(&storage), &slot).expect("the namespace is back"),
+            CustodyRecords::open(
+                &table,
+                Arc::clone(&storage),
+                CustodyNamespace::from_bytes(namespace),
+            )
+            .expect("the namespace is free again"),
         );
         assert_eq!(record_of(&third, &h).await.unwrap(), Some(KEY_EVENT));
     }
