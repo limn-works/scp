@@ -1,12 +1,8 @@
 //! The chain a store that validates key-event frames holds as accepted, and
 //! the divergent suffixes it retains beside it (§9.7.4.2 R9).
 
-use super::retention::{
-    Admission, Bounds, Rerank, RetainedSuffix, RetentionBasis, RetentionError, RetentionSet,
-};
-use super::{
-    ChainPairing, Decision, ForkRank, NoResolution, ResolveError, Tournament, pair_chains,
-};
+use super::retention::{Admission, Bounds, Rerank, RetentionBasis, RetentionError, RetentionSet};
+use super::{ChainPairing, ForkRank, ResolveError, pair_chains};
 use crate::validate::ValidatedChain;
 
 /// What holding one more chain did.
@@ -71,9 +67,9 @@ pub enum HoldError {
 /// every pairwise R6 comparison against every other chain it holds at that
 /// routing id, and the displaced chain's events past the shared prefix
 /// become a divergent suffix carrying the rank R6 gave it, which is 2 or 3.
-/// Where no chain wins every pairwise comparison, the relay keeps as
-/// accepted the chain it held first". The rule applies to any store that
-/// validates key-event frames.
+/// Where no chain wins every pairwise comparison, the relay holds as
+/// accepted the chain it held earliest among the chains that no other chain
+/// beats".
 ///
 /// Every chain other than the accepted one goes through
 /// [`RetentionSet::admit`], so the chains held are the accepted chain and
@@ -191,17 +187,13 @@ impl AcceptedChainHolder {
                 },
             };
         let displaced = next.basis().chain().head_digest();
-        let outcome = match (winner(&next)?, admission) {
+        let winner = next
+            .displacing_suffix()?
+            .map(|suffix| suffix.chain().clone());
+        let outcome = match (winner, admission) {
             (None, None) => HoldOutcome::AcceptedExtended { rerank },
             (None, Some(admission)) => HoldOutcome::HeldDivergent { admission },
-            (Some(index), admission) => {
-                let chain = next
-                    .suffixes()
-                    .get(index)
-                    .ok_or(NoResolution)
-                    .map_err(ResolveError::from)?
-                    .chain()
-                    .clone();
+            (Some(chain), admission) => {
                 rerank.absorb(next.rerank(RetentionBasis::Accepted(chain))?);
                 HoldOutcome::AcceptedReplaced {
                     displaced,
@@ -213,24 +205,4 @@ impl AcceptedChainHolder {
         self.set = Some(next);
         Ok(outcome)
     }
-}
-
-/// R6 and R9's held-first rule over `set`'s basis and retained suffixes:
-/// `None` where the basis stays accepted, else the index of the suffix that
-/// becomes accepted.
-fn winner(set: &RetentionSet) -> Result<Option<usize>, ResolveError> {
-    let chains: Vec<&ValidatedChain> = std::iter::once(set.basis().chain())
-        .chain(set.suffixes().iter().map(RetainedSuffix::chain))
-        .collect();
-    let moments: Vec<u64> = std::iter::once(set.basis_observed())
-        .chain(set.suffixes().iter().map(RetainedSuffix::observed))
-        .collect();
-    let index = match Tournament::of(&chains)?.decide()? {
-        Decision::Winner(winner) => winner,
-        Decision::Tie { undefeated, .. } => undefeated
-            .into_iter()
-            .min_by_key(|&index| moments.get(index).copied().unwrap_or(u64::MAX))
-            .ok_or(NoResolution)?,
-    };
-    Ok(index.checked_sub(1))
 }

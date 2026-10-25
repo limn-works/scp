@@ -268,7 +268,7 @@ fn persist_restore_after_adoption() -> TestResult {
     assert_eq!(saved.basis.head, w.head());
     assert_eq!(saved.basis.observed, 2);
     let identifier = w.chain.identifier();
-    let restored = RetentionSet::restore(&identifier, &saved)?;
+    let restored = RetentionSet::restore(&identifier, &saved, Some(w.head()))?;
     assert_eq!(restored, set);
     assert_eq!(restored.persisted(), saved);
     Ok(())
@@ -637,7 +637,81 @@ fn contested_prefix_retains_the_tied_heads_past_it() -> TestResult {
     assert_eq!(saved.basis.kind, BasisKind::ContestedPrefix);
     assert_eq!(saved.basis.head, prefix.head());
     let identifier = prefix.chain.identifier();
-    assert_eq!(RetentionSet::restore(&identifier, &saved)?, set);
+    assert_eq!(RetentionSet::restore(&identifier, &saved, None)?, set);
+    Ok(())
+}
+
+/// `restore` takes the accepted chain from the verifier's adopted state,
+/// never from the persisted bytes: a contested prefix persisted as an
+/// accepted basis is refused at a first contact, a persisted contested
+/// prefix is refused where the caller holds a baseline, and an accepted
+/// head other than the baseline head is refused.
+///
+/// Mutant (run, then restored): `restore` skips the agreement check, so
+/// the flipped kind restores Vector 41 as accepted and reaches the
+/// tournament instead.
+#[test]
+fn restore_refuses_a_basis_the_verifier_did_not_adopt() -> TestResult {
+    let mut keys = Keys::new()?;
+    let prefix = Branch::v41()?;
+    let mut set = RetentionSet::new(RetentionBasis::ContestedPrefix(prefix.chain.clone()));
+    retain(&mut set, &Branch::of(&mut keys, &[Kind::Reveal], 1)?.chain)?;
+    retain(&mut set, &Branch::of(&mut keys, &[Kind::Reveal], 2)?.chain)?;
+    let identifier = prefix.chain.identifier();
+    let saved = set.persisted();
+    let mut flipped = saved.clone();
+    flipped.basis.kind = BasisKind::Accepted;
+    assert_eq!(
+        RetentionSet::restore(&identifier, &flipped, None),
+        Err(RestoreError::BasisDisagrees {
+            adopted: None,
+            kind: BasisKind::Accepted,
+            head: prefix.head(),
+        })
+    );
+    assert_eq!(
+        RetentionSet::restore(&identifier, &saved, Some(prefix.head())),
+        Err(RestoreError::BasisDisagrees {
+            adopted: Some(prefix.head()),
+            kind: BasisKind::ContestedPrefix,
+            head: prefix.head(),
+        })
+    );
+    let basis = basis(&mut keys)?;
+    let accepted_set = registered(&basis);
+    assert_eq!(
+        RetentionSet::restore(&identifier, &accepted_set.persisted(), Some(v41_digest())),
+        Err(RestoreError::BasisDisagrees {
+            adopted: Some(v41_digest()),
+            kind: BasisKind::Accepted,
+            head: basis.head(),
+        })
+    );
+    Ok(())
+}
+
+/// `restore` refuses an accepted basis that R9 would not hold as accepted
+/// over its retained suffixes: A, owner 0's `KeyState` past Vector 41,
+/// against a retained rollover X, which R6 ranks 1 to A's 3. `admit` keeps
+/// X without comparing it to the basis; the holder would have adopted it.
+///
+/// Mutant (run, then restored): `restore` skips the tournament, so the
+/// beaten basis restores.
+#[test]
+fn restore_refuses_an_accepted_basis_a_suffix_beats() -> TestResult {
+    let mut keys = Keys::new()?;
+    let a = basis(&mut keys)?;
+    let x = Branch::of(&mut keys, &[Kind::Reveal], 1)?;
+    let mut set = registered(&a);
+    retain(&mut set, &x.chain)?;
+    let identifier = a.chain.identifier();
+    assert_eq!(
+        RetentionSet::restore(&identifier, &set.persisted(), Some(a.head())),
+        Err(RestoreError::AcceptedDisplaced {
+            accepted: a.head(),
+            by: x.head(),
+        })
+    );
     Ok(())
 }
 
@@ -773,13 +847,15 @@ fn restore_fails_closed() -> TestResult {
     let mut keys = Keys::new()?;
     let basis = basis(&mut keys)?;
     let mut set = registered(&basis);
-    let first = Branch::of(&mut keys, &[Kind::Lost], 1)?;
+    // Both suffixes rank 3 and were held after the basis, so it stays accepted.
+    let first = Branch::of(&mut keys, &[Kind::KeyState, Kind::KeyState], 1)?;
     let second = Branch::of(&mut keys, &[Kind::KeyState], 2)?;
     retain(&mut set, &first.chain)?;
     retain(&mut set, &second.chain)?;
     let saved = set.persisted();
     let identifier = basis.chain.identifier();
-    let restore = |saved: &_| RetentionSet::restore(&identifier, saved);
+    let adopted = Some(basis.head());
+    let restore = |saved: &_| RetentionSet::restore(&identifier, saved, adopted);
     assert_eq!(restore(&saved)?, set);
 
     let mut tampered = saved.clone();
@@ -800,7 +876,7 @@ fn restore_fails_closed() -> TestResult {
     let mut lone = saved.clone();
     lone.units = vec![unit.into()];
     assert!(matches!(
-        RetentionSet::restore(&invalid_identifier, &lone),
+        RetentionSet::restore(&invalid_identifier, &lone, adopted),
         Err(RestoreError::InceptionInvalid(_))
     ));
 
@@ -845,7 +921,7 @@ fn restore_fails_closed() -> TestResult {
     let mut short = saved.clone();
     short.basis.head = v41_digest();
     assert_eq!(
-        restore(&short),
+        RetentionSet::restore(&identifier, &short, Some(v41_digest())),
         Err(RestoreError::Retention(RetentionError::ExtendsAccepted {
             head: v41_digest()
         }))

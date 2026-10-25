@@ -17,7 +17,10 @@ use std::sync::Arc;
 
 use scp_did::Identifier;
 
-use super::{ChainPairing, ForkRank, UnrelatedChains, pair_chains, rank_past};
+use super::{
+    ChainPairing, Decision, ForkRank, NoResolution, ResolveError, Tournament, UnrelatedChains,
+    pair_chains, rank_past,
+};
 use crate::constants::{MAX_RETAINED_BYTES, MAX_RETAINED_SUFFIXES};
 use crate::validate::ValidatedChain;
 use crate::{Discarded, EntryVerdict, InceptionDefect, validate_entry};
@@ -279,6 +282,34 @@ pub enum RestoreError {
     /// Re-admitting a persisted suffix reached a [`RetentionError`].
     #[error(transparent)]
     Retention(#[from] RetentionError),
+    /// The persisted basis is not the verifier's adopted state: an accepted
+    /// basis whose head is not the caller's baseline head, or a basis whose
+    /// kind disagrees with whether the caller holds a baseline, since R9
+    /// makes a contested prefix the basis only at a first contact.
+    #[error(
+        "the persisted {kind:?} basis {head:02x?} disagrees with the adopted head {adopted:02x?}"
+    )]
+    BasisDisagrees {
+        /// The caller's baseline head, or `None` at a first contact.
+        adopted: Option<[u8; 32]>,
+        /// The persisted basis kind.
+        kind: BasisKind,
+        /// The persisted basis head.
+        head: [u8; 32],
+    },
+    /// A retained suffix beats the persisted accepted chain under R6, or
+    /// ties it and was held earlier, so R9 would not hold that chain as
+    /// accepted.
+    #[error("the retained suffix {by:02x?} displaces the persisted accepted chain {accepted:02x?}")]
+    AcceptedDisplaced {
+        /// The persisted accepted chain's head.
+        accepted: [u8; 32],
+        /// The head of the retained suffix R9 holds as accepted instead.
+        by: [u8; 32],
+    },
+    /// R6's comparisons over the restored chains reached no outcome.
+    #[error(transparent)]
+    Resolve(#[from] ResolveError),
 }
 
 /// The divergent suffixes a party retains for one identifier, against one
@@ -605,13 +636,17 @@ impl RetentionSet {
         }
     }
 
-    /// Rebuilds a persisted set: one [`validate_entry`] over its units, and
-    /// the basis and each suffix the prefix through its head of the chain
-    /// holding that head. Every suffix is then
-    /// re-admitted in ascending moment order through [`admit`](Self::admit)'s
-    /// one rule, so a persisted set that rule would not have built is
-    /// refused. The moment counter restarts past the largest persisted
-    /// moment.
+    /// Rebuilds a persisted set against `adopted`, the verifier's adopted
+    /// state: its baseline head, or `None` at a first contact. The persisted
+    /// basis must agree with it, an accepted basis at that head or a
+    /// contested prefix where no baseline exists, so the persisted bytes
+    /// never choose the accepted chain. Then one [`validate_entry`] over the
+    /// units, and the basis and each suffix the prefix through its head of
+    /// the chain holding that head. Every suffix is re-admitted in ascending
+    /// moment order through [`admit`](Self::admit)'s one rule, so a persisted
+    /// set that rule would not have built is refused, and an accepted basis
+    /// must win R6 and R9's held-first rule over the retained suffixes. The
+    /// moment counter restarts past the largest persisted moment.
     ///
     /// # Errors
     ///
@@ -619,7 +654,20 @@ impl RetentionSet {
     pub fn restore(
         identifier: &Identifier,
         saved: &PersistedRetention,
+        adopted: Option<[u8; 32]>,
     ) -> Result<Self, RestoreError> {
+        let agrees = match (adopted, saved.basis.kind) {
+            (Some(head), BasisKind::Accepted) => head == saved.basis.head,
+            (None, BasisKind::ContestedPrefix) => true,
+            (Some(_), BasisKind::ContestedPrefix) | (None, BasisKind::Accepted) => false,
+        };
+        if !agrees {
+            return Err(RestoreError::BasisDisagrees {
+                adopted,
+                kind: saved.basis.kind,
+                head: saved.basis.head,
+            });
+        }
         let chains = rebuild(identifier, &saved.units)?;
         let find = |head: [u8; 32]| {
             chains
@@ -674,7 +722,49 @@ impl RetentionSet {
                 referenced,
             });
         }
+        if let (RetentionBasis::Accepted(accepted), Some(by)) =
+            (&set.basis, set.displacing_suffix()?)
+        {
+            return Err(RestoreError::AcceptedDisplaced {
+                accepted: accepted.head_digest(),
+                by: by.head(),
+            });
+        }
         Ok(set)
+    }
+
+    /// R6 and R9's held-first rule over the basis and the retained
+    /// suffixes: the suffix R9 holds as accepted in place of the basis, or
+    /// `None` where the basis stays.
+    ///
+    /// R9: "after every frame it accepts, the relay holds as accepted the
+    /// chain that wins every pairwise R6 comparison against every other
+    /// chain it holds at that routing id … Where no chain wins every
+    /// pairwise comparison, the relay holds as accepted the chain it held
+    /// earliest among the chains that no other chain beats". The moments
+    /// order "held earliest".
+    ///
+    /// # Errors
+    ///
+    /// [`ResolveError`] where the comparisons reach none of R6's outcomes,
+    /// which valid chains of one identifier never do.
+    pub(super) fn displacing_suffix(&self) -> Result<Option<&RetainedSuffix>, ResolveError> {
+        let chains: Vec<&ValidatedChain> = std::iter::once(self.basis.chain())
+            .chain(self.suffixes.iter().map(RetainedSuffix::chain))
+            .collect();
+        let moments: Vec<u64> = std::iter::once(self.basis_observed)
+            .chain(self.suffixes.iter().map(RetainedSuffix::observed))
+            .collect();
+        let index = match Tournament::of(&chains)?.decide()? {
+            Decision::Winner(winner) => winner,
+            Decision::Tie { undefeated, .. } => undefeated
+                .into_iter()
+                .min_by_key(|&index| moments.get(index).copied().unwrap_or(u64::MAX))
+                .ok_or(NoResolution)?,
+        };
+        Ok(index
+            .checked_sub(1)
+            .and_then(|suffix| self.suffixes.get(suffix)))
     }
 }
 
