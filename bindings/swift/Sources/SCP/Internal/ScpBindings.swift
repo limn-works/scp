@@ -3520,6 +3520,49 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func provenanceAttach(sourceContextId: String, sourceType: String, memoryScopeStr: String, members: [String], targetContextId: String, actorDid: String, existingChainDepth: UInt8?) throws  -> String
     
     /**
+     * Disables push: deregisters the device's push token from every relay
+     * it registered with.
+     *
+     * # Errors
+     *
+     * `SCP-CTX-2138` for a shut-down instance, `SCP-IDENT-1002` for one with
+     * no local member DID, and otherwise `SCP-TRANS-5104`: the device has no
+     * P-256 `#active` signing key to sign a `PushDeregistration` with.
+     */
+    func pushDisable() throws 
+    
+    /**
+     * Enables push: registers the device's push token with every relay in
+     * the relay set (ADR-025 criterion 4, ADR-027 criterion 10).
+     *
+     * # Errors
+     *
+     * `SCP-CTX-2138` for a shut-down instance, `SCP-IDENT-1002` for one with
+     * no local member DID, and otherwise `SCP-TRANS-5104`: the device has no
+     * P-256 `#active` signing key to sign a `PushRegistration` with. Each is
+     * returned before `provider` is called.
+     */
+    func pushEnable(provider: PushProvider, platform: PushPlatform) throws 
+    
+    /**
+     * Handles a silent push. `payload` is what the platform delivered:
+     * the JSON serialization of the APNs `userInfo` dictionary or of the
+     * FCM data map.
+     *
+     * # Errors
+     *
+     * - `SCP-TRANS-5105` when push is not enabled on this instance;
+     * `handle_notification` is not called.
+     * - The [`ScpError`] the provider's `handle_notification` throws,
+     * unchanged; no relay connection opens.
+     * - `SCP-TRANS-5080` when the provider's bytes are not the enabled
+     * platform's wake signal; no relay connection opens.
+     *
+     * Every failure after those checks is [`WakeOutcome::Failed`].
+     */
+    func pushHandleWake(payload: Data) async throws  -> WakeOutcome
+    
+    /**
      * Per-instance equivalent of the free-function `register_local_did`.
      *
      * Routes through `&*self.inner`. Initializes this instance's
@@ -7289,6 +7332,74 @@ open func provenanceAttach(sourceContextId: String, sourceType: String, memorySc
         FfiConverterOptionUInt8.lower(existingChainDepth),$0
     )
 })
+}
+    
+    /**
+     * Disables push: deregisters the device's push token from every relay
+     * it registered with.
+     *
+     * # Errors
+     *
+     * `SCP-CTX-2138` for a shut-down instance, `SCP-IDENT-1002` for one with
+     * no local member DID, and otherwise `SCP-TRANS-5104`: the device has no
+     * P-256 `#active` signing key to sign a `PushDeregistration` with.
+     */
+open func pushDisable()throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_push_disable(self.uniffiClonePointer(),$0
+    )
+}
+}
+    
+    /**
+     * Enables push: registers the device's push token with every relay in
+     * the relay set (ADR-025 criterion 4, ADR-027 criterion 10).
+     *
+     * # Errors
+     *
+     * `SCP-CTX-2138` for a shut-down instance, `SCP-IDENT-1002` for one with
+     * no local member DID, and otherwise `SCP-TRANS-5104`: the device has no
+     * P-256 `#active` signing key to sign a `PushRegistration` with. Each is
+     * returned before `provider` is called.
+     */
+open func pushEnable(provider: PushProvider, platform: PushPlatform)throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_push_enable(self.uniffiClonePointer(),
+        FfiConverterCallbackInterfacePushProvider_lower(provider),
+        FfiConverterTypePushPlatform_lower(platform),$0
+    )
+}
+}
+    
+    /**
+     * Handles a silent push. `payload` is what the platform delivered:
+     * the JSON serialization of the APNs `userInfo` dictionary or of the
+     * FCM data map.
+     *
+     * # Errors
+     *
+     * - `SCP-TRANS-5105` when push is not enabled on this instance;
+     * `handle_notification` is not called.
+     * - The [`ScpError`] the provider's `handle_notification` throws,
+     * unchanged; no relay connection opens.
+     * - `SCP-TRANS-5080` when the provider's bytes are not the enabled
+     * platform's wake signal; no relay connection opens.
+     *
+     * Every failure after those checks is [`WakeOutcome::Failed`].
+     */
+open func pushHandleWake(payload: Data)async throws  -> WakeOutcome  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_push_handle_wake(
+                    self.uniffiClonePointer(),
+                    FfiConverterData.lower(payload)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeWakeOutcome_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
 }
     
     /**
@@ -14182,6 +14293,222 @@ public func FfiConverterTypeUcanTokenData_lower(_ value: UcanTokenData) -> RustB
     return FfiConverterTypeUcanTokenData.lower(value)
 }
 
+
+/**
+ * One context's failed pull in a [`WakeFailureInfo`].
+ */
+public struct WakeContextFailure {
+    /**
+     * The context that failed.
+     */
+    public var contextId: String
+    /**
+     * The failure's stable code.
+     */
+    public var code: String
+    /**
+     * The failure's description.
+     */
+    public var message: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The context that failed.
+         */contextId: String, 
+        /**
+         * The failure's stable code.
+         */code: String, 
+        /**
+         * The failure's description.
+         */message: String) {
+        self.contextId = contextId
+        self.code = code
+        self.message = message
+    }
+}
+
+#if compiler(>=6)
+extension WakeContextFailure: Sendable {}
+#endif
+
+
+extension WakeContextFailure: Equatable, Hashable {
+    public static func ==(lhs: WakeContextFailure, rhs: WakeContextFailure) -> Bool {
+        if lhs.contextId != rhs.contextId {
+            return false
+        }
+        if lhs.code != rhs.code {
+            return false
+        }
+        if lhs.message != rhs.message {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(contextId)
+        hasher.combine(code)
+        hasher.combine(message)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeWakeContextFailure: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> WakeContextFailure {
+        return
+            try WakeContextFailure(
+                contextId: FfiConverterString.read(from: &buf), 
+                code: FfiConverterString.read(from: &buf), 
+                message: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: WakeContextFailure, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.contextId, into: &buf)
+        FfiConverterString.write(value.code, into: &buf)
+        FfiConverterString.write(value.message, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeWakeContextFailure_lift(_ buf: RustBuffer) throws -> WakeContextFailure {
+    return try FfiConverterTypeWakeContextFailure.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeWakeContextFailure_lower(_ value: WakeContextFailure) -> RustBuffer {
+    return FfiConverterTypeWakeContextFailure.lower(value)
+}
+
+
+/**
+ * Why a wake returned [`WakeOutcome::Failed`].
+ */
+public struct WakeFailureInfo {
+    /**
+     * The failure's stable code, `SCP-TRANS-5085` to `SCP-TRANS-5094`.
+     */
+    public var code: String
+    /**
+     * The failure's description.
+     */
+    public var message: String
+    /**
+     * The contexts the failure names, sorted; empty for a failure of the
+     * whole wake.
+     */
+    public var contextIds: [String]
+    /**
+     * Each failed context's pull with its own code; empty unless the
+     * failure is a context pull failure.
+     */
+    public var contextFailures: [WakeContextFailure]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The failure's stable code, `SCP-TRANS-5085` to `SCP-TRANS-5094`.
+         */code: String, 
+        /**
+         * The failure's description.
+         */message: String, 
+        /**
+         * The contexts the failure names, sorted; empty for a failure of the
+         * whole wake.
+         */contextIds: [String], 
+        /**
+         * Each failed context's pull with its own code; empty unless the
+         * failure is a context pull failure.
+         */contextFailures: [WakeContextFailure]) {
+        self.code = code
+        self.message = message
+        self.contextIds = contextIds
+        self.contextFailures = contextFailures
+    }
+}
+
+#if compiler(>=6)
+extension WakeFailureInfo: Sendable {}
+#endif
+
+
+extension WakeFailureInfo: Equatable, Hashable {
+    public static func ==(lhs: WakeFailureInfo, rhs: WakeFailureInfo) -> Bool {
+        if lhs.code != rhs.code {
+            return false
+        }
+        if lhs.message != rhs.message {
+            return false
+        }
+        if lhs.contextIds != rhs.contextIds {
+            return false
+        }
+        if lhs.contextFailures != rhs.contextFailures {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(code)
+        hasher.combine(message)
+        hasher.combine(contextIds)
+        hasher.combine(contextFailures)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeWakeFailureInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> WakeFailureInfo {
+        return
+            try WakeFailureInfo(
+                code: FfiConverterString.read(from: &buf), 
+                message: FfiConverterString.read(from: &buf), 
+                contextIds: FfiConverterSequenceString.read(from: &buf), 
+                contextFailures: FfiConverterSequenceTypeWakeContextFailure.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: WakeFailureInfo, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.code, into: &buf)
+        FfiConverterString.write(value.message, into: &buf)
+        FfiConverterSequenceString.write(value.contextIds, into: &buf)
+        FfiConverterSequenceTypeWakeContextFailure.write(value.contextFailures, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeWakeFailureInfo_lift(_ buf: RustBuffer) throws -> WakeFailureInfo {
+    return try FfiConverterTypeWakeFailureInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeWakeFailureInfo_lower(_ value: WakeFailureInfo) -> RustBuffer {
+    return FfiConverterTypeWakeFailureInfo.lower(value)
+}
+
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
@@ -15763,6 +16090,95 @@ extension OutletKind: Equatable, Hashable {}
 
 
 
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * The push service whose wake signal `push_handle_wake` checks.
+ */
+
+public enum PushPlatform {
+    
+    /**
+     * Apple Push Notification service.
+     */
+    case apns
+    /**
+     * Firebase Cloud Messaging.
+     */
+    case fcm
+    /**
+     * The Web Push protocol (RFC 8030).
+     */
+    case webPush
+}
+
+
+#if compiler(>=6)
+extension PushPlatform: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePushPlatform: FfiConverterRustBuffer {
+    typealias SwiftType = PushPlatform
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PushPlatform {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .apns
+        
+        case 2: return .fcm
+        
+        case 3: return .webPush
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: PushPlatform, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .apns:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .fcm:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .webPush:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePushPlatform_lift(_ buf: RustBuffer) throws -> PushPlatform {
+    return try FfiConverterTypePushPlatform.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePushPlatform_lower(_ value: PushPlatform) -> RustBuffer {
+    return FfiConverterTypePushPlatform.lower(value)
+}
+
+
+extension PushPlatform: Equatable, Hashable {}
+
+
+
+
+
+
 
 /**
  * Unified error type for the `UniFFI` bridge.
@@ -16367,6 +16783,104 @@ public func FfiConverterTypeStorageConfig_lower(_ value: StorageConfig) -> RustB
 
 
 extension StorageConfig: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * What a wake reports to the platform (ADR-029 §2 push-wake pull mode step
+ * 7). iOS maps the three values to `UIBackgroundFetchResult`.
+ */
+
+public enum WakeOutcome {
+    
+    /**
+     * The actor accepted at least one application envelope in some context.
+     */
+    case newData
+    /**
+     * Every step and every context's pull succeeded, and the actor accepted
+     * no application envelope.
+     */
+    case noData
+    /**
+     * The actor accepted no application envelope, and a step or a context's
+     * pull failed.
+     */
+    case failed(
+        /**
+         * Which step or contexts failed.
+         */failure: WakeFailureInfo
+    )
+}
+
+
+#if compiler(>=6)
+extension WakeOutcome: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeWakeOutcome: FfiConverterRustBuffer {
+    typealias SwiftType = WakeOutcome
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> WakeOutcome {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .newData
+        
+        case 2: return .noData
+        
+        case 3: return .failed(failure: try FfiConverterTypeWakeFailureInfo.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: WakeOutcome, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .newData:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .noData:
+            writeInt(&buf, Int32(2))
+        
+        
+        case let .failed(failure):
+            writeInt(&buf, Int32(3))
+            FfiConverterTypeWakeFailureInfo.write(failure, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeWakeOutcome_lift(_ buf: RustBuffer) throws -> WakeOutcome {
+    return try FfiConverterTypeWakeOutcome.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeWakeOutcome_lower(_ value: WakeOutcome) -> RustBuffer {
+    return FfiConverterTypeWakeOutcome.lower(value)
+}
+
+
+extension WakeOutcome: Equatable, Hashable {}
 
 
 
@@ -17454,7 +17968,8 @@ public protocol PushProvider: AnyObject, Sendable {
      * states: "Push payloads MUST contain a wake signal and nothing else. No
      * context ID, no sender identifier, no message preview, no metadata of any
      * kind." A wake signal built from the received bytes would hand the caller
-     * whatever a relay put in them. No Rust code calls this method yet.
+     * whatever a relay put in them. `Scp::push_handle_wake` calls it and
+     * checks the returned bytes against the enabled platform's wake signal.
      */
     func handleNotification(payload: Data) async throws  -> Data
     
@@ -18576,6 +19091,31 @@ fileprivate struct FfiConverterSequenceTypePublishResult: FfiConverterRustBuffer
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypePublishResult.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeWakeContextFailure: FfiConverterRustBuffer {
+    typealias SwiftType = [WakeContextFailure]
+
+    public static func write(_ value: [WakeContextFailure], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeWakeContextFailure.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [WakeContextFailure] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [WakeContextFailure]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeWakeContextFailure.read(from: &buf))
         }
         return seq
     }
@@ -20070,6 +20610,15 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_provenance_attach() != 3158) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_push_disable() != 5430) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_push_enable() != 6683) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_push_handle_wake() != 35062) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_register_local_did() != 49984) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -20241,7 +20790,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_pushprovider_register_push() != 31432) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_pushprovider_handle_notification() != 50826) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_pushprovider_handle_notification() != 3153) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_storageprovider_get() != 34518) {
