@@ -3276,12 +3276,13 @@ pub(super) async fn decrypt_and_dispatch(
                         // Queue the answer, sealed to the request's ephemeral
                         // wrapping key, for MLS-wrap + transmit by
                         // `drain_and_deliver_sender_keys` after the Class-C view
-                        // drops (in `handle_deliver_incoming`). It replaces an
-                        // answer queued to the same requester and key (spec 09
-                        // §9.16.9). A blocked requester returns `None` (§9.16.2
-                        // silent drop) — nothing queued.
+                        // drops (in `handle_deliver_incoming`). It replaces every
+                        // answer queued to the requester at this or an earlier
+                        // epoch, so a request flood keeps one (spec 09 §9.16.9).
+                        // A blocked requester returns `None` (§9.16.2 silent
+                        // drop) — nothing queued.
                         let epoch = cs.sender_key_epoch;
-                        crate::context::actor::state::ContextCryptoState::enqueue_distribution(
+                        crate::context::actor::state::ContextCryptoState::enqueue_answer(
                             &mut cs.pending_distributions,
                             sender_did.clone(),
                             request.wrapping_pubkey.as_bytes().to_vec(),

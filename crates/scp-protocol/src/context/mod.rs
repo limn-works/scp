@@ -677,6 +677,20 @@ pub enum ContextError {
         epoch: u64,
     },
 
+    /// An encrypt was refused because a rotation of the local sender key that
+    /// a membership or access change owes has not landed (spec 09 §9.16.9 "A
+    /// rotation that fails"). The current key may be held by the member the
+    /// change removed or revoked.
+    ///
+    /// The governance timer retries the rotation, and the encrypt succeeds
+    /// once it lands and its distributions are published. Mapped to canonical
+    /// code `SCP-CTX-2141` through the bridge error translators.
+    #[error("SCP-CTX-2141: sender-key rotation owed past epoch {epoch} has not landed")]
+    SenderKeyRotationPending {
+        /// The local sender-key epoch the owed rotation replaces.
+        epoch: u64,
+    },
+
     /// An actor or a reservation the call needed gave no answer (ADR-049 §10).
     ///
     /// Producers, and what each means for a retry:

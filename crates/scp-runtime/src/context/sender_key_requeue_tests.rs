@@ -30,8 +30,11 @@
 //! snapshot holds the distribution, and `SenderKeyDistributionPending` reaches
 //! the event channel. A read revoke drops the member's queued distributions
 //! in its persist and no later rotation queues one to it. A leave or write
-//! revoke whose rotation step fails returns that typed error, and the
-//! operation stands.
+//! revoke whose rotation step fails returns `Ok` and stands; the rotation
+//! stays pending in the persisted snapshot, `seal` refuses, an event reports
+//! it, and the governance timer lands it (spec 09 §9.16.9 "A rotation that
+//! fails"). A flood of `SenderKeyRequest`s from one member at one epoch
+//! leaves one answer queued to it.
 
 #![cfg(test)]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -67,8 +70,15 @@ const T0: u64 = 1_800_000_000;
 type PersistErr = Box<dyn std::error::Error + Send + Sync>;
 type EventRx = tokio::sync::broadcast::Receiver<(String, ContextEvent)>;
 
+/// Persisted snapshots by context, the one-shot rotation refusal, and the
+/// snapshot that was durable when the refusal fired: what a node that
+/// crashed at that moment restores.
 #[derive(Default)]
-struct Store(DashMap<String, ContextSnapshot>, AtomicBool);
+struct Store(
+    DashMap<String, ContextSnapshot>,
+    AtomicBool,
+    DashMap<String, ContextSnapshot>,
+);
 
 /// The local sender-key epoch a snapshot carries, if it carries crypto.
 fn snapshot_sender_epoch(ctx: &str, s: &ContextSnapshot) -> Option<u64> {
@@ -100,8 +110,54 @@ impl Store {
         let bumps = matches!((old, new), (Some(o), Some(n)) if n > o);
         if bumps {
             self.1.store(false, Ordering::SeqCst);
+            if let Some(prev) = self.0.get(id) {
+                self.2.insert(id.to_owned(), prev.value().clone());
+            }
         }
         bumps
+    }
+
+    /// Whether the persisted snapshot of `ctx` owes a sender-key rotation.
+    fn rotation_pending(&self, ctx: &str) -> bool {
+        let snapshot = self
+            .0
+            .get(ctx)
+            .map(|s| s.value().clone())
+            .expect("a persisted snapshot of the context");
+        NodeMlsFactory::build_restored_owned(
+            &scp_protocol::context::context_id_bytes(ctx),
+            &snapshot.mls_crypto_state.0,
+        )
+        .expect("restore the crypto blob")
+        .0
+        .sender_key_rotation_pending
+    }
+
+    /// Whether the snapshot durable when the rotation refusal fired owes a
+    /// sender-key rotation: what a crash right there restores.
+    fn rotation_pending_at_refusal(&self, ctx: &str) -> bool {
+        let snapshot = self
+            .2
+            .get(ctx)
+            .map(|s| s.value().clone())
+            .expect("the refusal fired");
+        NodeMlsFactory::build_restored_owned(
+            &scp_protocol::context::context_id_bytes(ctx),
+            &snapshot.mls_crypto_state.0,
+        )
+        .expect("restore the crypto blob")
+        .0
+        .sender_key_rotation_pending
+    }
+
+    /// The local sender-key epoch of the persisted snapshot of `ctx`.
+    fn sender_epoch(&self, ctx: &str) -> u64 {
+        let snapshot = self
+            .0
+            .get(ctx)
+            .map(|s| s.value().clone())
+            .expect("a persisted snapshot of the context");
+        snapshot_sender_epoch(ctx, &snapshot).expect("the snapshot carries crypto")
     }
 
     /// The distribution queue of the one persisted snapshot of `ctx`.
@@ -348,8 +404,8 @@ fn enqueue(
     );
 }
 
-/// Every `SenderKeyDistribution*` event the context recorded on its receive
-/// buffer since the last call.
+/// Every sender-key distribution or rotation event the context recorded on
+/// its receive buffer since the last call.
 fn distribution_events(cell: &mut ClassSCell) -> Vec<ContextEvent> {
     cell.class_c_view()
         .receive_buffer_mut()
@@ -359,7 +415,8 @@ fn distribution_events(cell: &mut ClassSCell) -> Vec<ContextEvent> {
         .collect()
 }
 
-/// Every `SenderKeyDistribution*` event on `rx` since the last call.
+/// Every sender-key distribution or rotation event on `rx` since the last
+/// call.
 fn channel_events(rx: &mut EventRx) -> Vec<ContextEvent> {
     let mut out = Vec::new();
     loop {
@@ -376,6 +433,7 @@ const fn is_distribution_event(e: &ContextEvent) -> bool {
         e,
         ContextEvent::SenderKeyDistributionPending { .. }
             | ContextEvent::SenderKeyDistributionFailed { .. }
+            | ContextEvent::SenderKeyRotationPending { .. }
     )
 }
 
@@ -856,6 +914,70 @@ async fn a_read_revoked_requester_gets_no_answer() {
     assert_eq!(answers_to_bob(&cell), 1, "a member that reads is answered");
 }
 
+/// Fails if a flood of `SenderKeyRequest`s from one member at one epoch
+/// leaves more than one answer to it in the queue (spec 09 §9.16.9: answers
+/// supersede by target identity and epoch, since each request names a new
+/// recipient key).
+#[tokio::test]
+async fn a_request_flood_keeps_one_answer_per_target_and_epoch() {
+    let ctx = "sender-key-requeue-request-flood";
+    let crate::crypto::mls::two_party_test_support::TwoPartyPair {
+        alice_provider,
+        mut alice_state,
+        mut bob_state,
+        ..
+    } = crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx, ALICE, BOB);
+    let relay = Arc::new(Relay::default());
+    let store = Arc::new(Store::default());
+    let clock = Arc::new(TestClock::new(T0));
+    let (deps, _sup, _events) = alice_deps(alice_provider, &relay, &store, &clock).await;
+    activate(&mut alice_state);
+    let mut cell = ClassSCell::new(alice_state);
+    let bob_cs = bob_state.mode.crypto_mut().expect("encrypted");
+    for i in 0..100_u8 {
+        let request = bob_cs
+            .mls_encrypt_management(&bob_key_request([i; 16]))
+            .expect("Bob seals the request");
+        crate::context::messaging_helpers::deliver_incoming(
+            &mut cell.class_c_view(),
+            &deps,
+            ctx,
+            &request,
+            &mut None,
+            &mut None,
+        )
+        .await
+        .expect("the request is consumed");
+    }
+    let answers: Vec<_> = queue(&cell)
+        .into_iter()
+        .filter(|p| p.target_did == BOB)
+        .collect();
+    assert_eq!(
+        answers.len(),
+        1,
+        "one answer to Bob stays queued: {answers:?}"
+    );
+}
+
+/// Fails if a pushed distribution to a member at a later epoch leaves that
+/// member's answer of an earlier epoch queued, or drops another member's
+/// (spec 09 §9.16.9).
+#[test]
+fn a_push_supersedes_the_targets_answer_of_an_earlier_epoch() {
+    use crate::context::actor::state::ContextCryptoState;
+    use crate::crypto::mls::provider::DistributionKind;
+    let mut q = Vec::new();
+    ContextCryptoState::enqueue_answer(&mut q, BOB.to_owned(), vec![1], 1, vec![0]);
+    ContextCryptoState::enqueue_answer(&mut q, "did:dht:zCarol".to_owned(), vec![2], 1, vec![0]);
+    ContextCryptoState::enqueue_distribution(&mut q, BOB.to_owned(), vec![3], 2, vec![0]);
+    let to_bob: Vec<_> = q.iter().filter(|p| p.target_did == BOB).collect();
+    assert_eq!(to_bob.len(), 1, "{q:?}");
+    assert_eq!(to_bob[0].kind, DistributionKind::Push);
+    assert_eq!(to_bob[0].epoch, 2);
+    assert!(q.iter().any(|p| p.target_did == "did:dht:zCarol"), "{q:?}");
+}
+
 // ---------------------------------------------------------------------------
 // The six operations, through the Supervisor, with the relay down.
 // ---------------------------------------------------------------------------
@@ -1208,30 +1330,47 @@ mod operations {
         );
     }
 
-    /// Fails if a write revoke whose rotation step fails returns `Ok`, or if
-    /// the revoke does not stand.
-    #[tokio::test]
-    async fn write_revoke_reports_a_failed_rotation() {
-        let node = trio(0x38).await;
-        node.store.refuse_next_rotation();
-        let err = node
-            .sup
-            .propose_governance_action_checked(
-                &node.ctx,
+    /// The `SenderKeyRotationPending` events on the channel.
+    fn rotation_pending_events(node: &mut Node) -> usize {
+        channel_events(&mut node.events)
+            .iter()
+            .filter(|e| matches!(e, ContextEvent::SenderKeyRotationPending { .. }))
+            .count()
+    }
+
+    /// Alice's send of one message.
+    async fn send(node: &Node) -> Result<(), scp_protocol::context::ContextError> {
+        // Pseudonym routing needs each peer's routing ID (§9.10.4).
+        for (peer, id) in [(BOB, 1_u8), (CAROL, 2_u8)] {
+            node.sup
+                .seed_peer_pseudonym(&node.ctx, DID::from(peer), [id; 32])
+                .await
+                .expect("seed the peer's pseudonym");
+        }
+        let s = signer(ALICE);
+        node.sup
+            .send_message(
+                &node.handle,
                 &DID::from(ALICE),
-                revoke(BOB, AccessScope::Write),
-                &signer(ALICE),
+                b"after the change",
+                crate::context::supervisor::MessageSigner::Active(&s),
+                None,
+                None,
             )
             .await
-            .expect_err("the failed rotation reaches the caller");
-        assert!(
-            matches!(
-                err,
-                scp_protocol::context::ContextError::PersistenceFailed(_)
-            ),
-            "the rotation's persist error, typed: {err:?}"
-        );
-        // The revoke stood: the persisted state suspends Bob's write.
+    }
+
+    /// Fails if a write revoke whose rotation fails returns an error or does
+    /// not stand, if the rotation is not persisted as pending or reported,
+    /// if Alice can encrypt before it lands, or if the governance timer does
+    /// not land it (spec 09 §9.16.9 "A rotation that fails").
+    #[tokio::test]
+    async fn write_revoke_stands_when_its_rotation_fails() {
+        let mut node = trio(0x38).await;
+        let before = node.store.sender_epoch(&node.ctx);
+        node.store.refuse_next_rotation();
+        govern(&node, revoke(BOB, AccessScope::Write)).await;
+
         let snapshot = node
             .store
             .0
@@ -1245,25 +1384,83 @@ mod operations {
                 .is_some_and(|s| s.contains(&Capability::MessagesWrite)),
             "Bob's write is suspended durably"
         );
-    }
-
-    /// Fails if a leave whose rotation step fails returns `Ok`, or if the
-    /// leave does not stand.
-    #[tokio::test]
-    async fn leave_reports_a_failed_rotation() {
-        let node = trio(0x39).await;
-        node.store.refuse_next_rotation();
-        let err = node
-            .sup
-            .leave_context(&node.handle, &DID::from(ALICE), &DID::from(BOB))
-            .await
-            .expect_err("the failed rotation reaches the caller");
+        assert!(
+            node.store.rotation_pending_at_refusal(&node.ctx),
+            "the change's own persist records the owed rotation"
+        );
+        assert!(
+            node.store.rotation_pending(&node.ctx),
+            "the owed rotation is persisted as pending"
+        );
+        assert_eq!(
+            node.store.sender_epoch(&node.ctx),
+            before,
+            "no rotation landed"
+        );
+        assert_eq!(
+            rotation_pending_events(&mut node),
+            1,
+            "one event reports it"
+        );
+        let refused = send(&node).await.expect_err("encrypt is refused");
         assert!(
             matches!(
-                err,
-                scp_protocol::context::ContextError::PersistenceFailed(_)
+                refused,
+                scp_protocol::context::ContextError::SenderKeyRotationPending { .. }
             ),
-            "the rotation's persist error, typed: {err:?}"
+            "{refused:?}"
+        );
+
+        // The relay comes back and the governance timer fires.
+        node.relay.down.store(false, Ordering::SeqCst);
+        tokio::time::pause();
+        tokio::time::sleep(std::time::Duration::from_secs(
+            crate::context::governance::timeout::TIMEOUT_CHECK_INTERVAL_SECS + 1,
+        ))
+        .await;
+        for _ in 0..200 {
+            if !node.store.rotation_pending(&node.ctx) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        tokio::time::resume();
+        assert!(
+            !node.store.rotation_pending(&node.ctx),
+            "the timer landed the rotation"
+        );
+        assert!(
+            node.store.sender_epoch(&node.ctx) > before,
+            "the epoch rose"
+        );
+        send(&node)
+            .await
+            .expect("Alice encrypts once the rotation landed");
+    }
+
+    /// Fails if Alice's removal of Bob by leave returns an error when the
+    /// rotation it owes fails, if the leave does not stand, or if the
+    /// rotation is not persisted as pending.
+    #[tokio::test]
+    async fn leave_stands_when_its_rotation_fails() {
+        let mut node = trio(0x39).await;
+        node.store.refuse_next_rotation();
+        node.sup
+            .leave_context(&node.handle, &DID::from(ALICE), &DID::from(BOB))
+            .await
+            .expect("the leave returns Ok");
+        assert!(
+            node.store.rotation_pending_at_refusal(&node.ctx),
+            "the change's own persist records the owed rotation"
+        );
+        assert!(
+            node.store.rotation_pending(&node.ctx),
+            "the owed rotation is persisted as pending"
+        );
+        assert_eq!(
+            rotation_pending_events(&mut node),
+            1,
+            "one event reports it"
         );
         let again = node
             .sup

@@ -17609,6 +17609,31 @@ impl Supervisor {
         })?
     }
 
+    /// Arms the one-shot rotation fault seam of `context_id`: the next local
+    /// sender-key rotation there fails before it mutates anything.
+    ///
+    /// Gated behind the `testing` feature — never compiled into production
+    /// builds, never reachable from any FFI bridge.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::CryptoFailed`] if the context has no encrypted crypto.
+    /// - [`ContextError::TransportFailed`] if the actor reply channel closes.
+    #[cfg(feature = "testing")]
+    pub async fn test_arm_rotation_failure(&self, context_id: &str) -> Result<(), ContextError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = MessagingCommand::TestArmRotationFailure {
+            context_id: context_id.to_owned(),
+            reply: tx,
+        };
+        self.dispatch_command(context_id, cmd).await?;
+        bounded_reply_await(rx).await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::test_arm_rotation_failure — actor reply channel closed".to_owned(),
+            )
+        })?
+    }
+
     /// Inserts a member directly into a context's role state via the actor
     /// mailbox — test-only.
     ///

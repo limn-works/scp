@@ -826,6 +826,17 @@ pub enum ContextEvent {
         /// 1-based count of failed attempts, this one included.
         attempt: u32,
     },
+    /// A rotation of the local sender key that a membership or access change
+    /// owes did not land (spec 09 §9.16.9 "A rotation that fails").
+    ///
+    /// The change has completed and is not reversed. The rotation stays
+    /// pending: the local member encrypts nothing until it lands, and its
+    /// governance timer retries it. Local to the rotating member: no Merkle
+    /// leaf records it.
+    SenderKeyRotationPending {
+        /// Why the rotation did not land.
+        error: String,
+    },
     /// The local member dropped a queued sender-key distribution to
     /// `target_did` without delivering it (spec 09 §9.16.9 "A distribution
     /// whose publish fails"): no TTL remained under the republish rule, MLS
@@ -938,6 +949,7 @@ impl ContextEvent {
             Self::CommitBroadcastFailed { .. } => "CommitBroadcastFailed",
             Self::SenderKeyDistributionPending { .. } => "SenderKeyDistributionPending",
             Self::SenderKeyDistributionFailed { .. } => "SenderKeyDistributionFailed",
+            Self::SenderKeyRotationPending { .. } => "SenderKeyRotationPending",
             Self::PseudonymAnnounced { .. } => "PseudonymAnnounced",
             Self::PseudonymRotationDue { .. } => "PseudonymRotationDue",
             Self::PseudonymAnnouncementPending { .. } => "PseudonymAnnouncementPending",

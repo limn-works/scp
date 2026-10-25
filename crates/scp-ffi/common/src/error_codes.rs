@@ -644,6 +644,18 @@ pub const CTX_2139: &str = "SCP-CTX-2139";
 ///
 /// Maps from `ContextError::SenderKeyDistributionPending`.
 pub const CTX_2140: &str = "SCP-CTX-2140";
+/// Sender-key rotation pending.
+///
+/// An encrypt was refused because a rotation of the local sender key that a
+/// membership or access change owes has not landed (spec 09 §9.16.9 "A
+/// rotation that fails"). The governance timer retries the rotation; the
+/// send succeeds once it lands.
+///
+/// Distinct from `CTX_2140`, whose rotation landed and whose distribution
+/// waits on a relay.
+///
+/// Maps from `ContextError::SenderKeyRotationPending`.
+pub const CTX_2141: &str = "SCP-CTX-2141";
 /// Media context error.
 pub const CTX_2500: &str = "SCP-CTX-2500";
 /// Media context key export error.

@@ -3367,7 +3367,17 @@ The zero nonce is safe because each `k_i` seals exactly one plaintext. The advan
 
 Each attempt carries the payload H persisted, and H seals that payload into the group's MLS epoch at the time of the attempt, so a retry seals no second sender key. When H cannot seal the payload into the group, H reports the distribution as unsealable and does not retry it.
 
-When H queues a distribution, it replaces any distribution queued for the same target identity and the same recipient key, the key H sealed the sender key to. A receiver holds one key per sender behind a monotonic epoch floor (§9.16.1), so the newer distribution supersedes the older one, and the queue holds at most one distribution per target identity and recipient key. The answers to `SenderKeyRequest`s stay bounded by the push-chain rule above. When the target identity leaves the context or loses read access, H drops its queued distributions to that identity in the durable step that drops the identity's sender key. When H rolls back an Add, it drops the distributions it queued for the joiner the same way.
+When H queues a distribution, it replaces any distribution queued for the same target identity and the same recipient key, the key H sealed the sender key to. A receiver holds one key per sender behind a monotonic epoch floor (§9.16.1), so the newer distribution supersedes the older one. A `SenderKeyResponse` is sealed to the ephemeral key of the request it answers, so each request names a new recipient key; H therefore supersedes answers by target identity and epoch instead. An answer to a target identity at epoch N replaces every answer queued to that identity at epoch N or earlier, and a pushed distribution to that identity at epoch N + 1 replaces its answer at epoch N. A flood of `SenderKeyRequest`s from one identity thus leaves at most one answer to it per epoch in the queue. When the target identity leaves the context or loses read access, H drops its queued distributions to that identity in the durable step that drops the identity's sender key. When H rolls back an Add, it drops the distributions it queued for the joiner the same way.
+
+**A rotation that fails.** A removal, a leave of another member, a reset, or a write revocation of §9.16.10 obliges H to rotate (§9.16.4). H records the obligation in the durable step that records the membership or access change. When the rotation then fails, before or at its own durable step, H does the following:
+
+1. H keeps the change. The operation completes, and H reports it as complete.
+2. H restores the sender key, epoch, and queue it held before the rotation, so it publishes no distribution of a key that no durable step holds (Persist before publish).
+3. H reports the failure to the operation's caller as a typed event.
+4. H MUST NOT encrypt a message while the obligation stands. An encrypt that this rule refuses fails with a typed error.
+5. H retries the rotation at each tick of its governance timer. The durable step of a rotation that succeeds clears the obligation.
+
+A member that leaves sends nothing after its leave and does not rotate. The members that remain rotate.
 
 An Add that a join or a governance `AddMember` performs queues the new member's distribution in the durable step that records the Add. When H cannot build that distribution, H keeps the Add and reports the distribution as not built, and the new member requests the key as §9.16.2 states.
 

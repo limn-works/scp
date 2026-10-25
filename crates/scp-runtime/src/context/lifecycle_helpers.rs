@@ -314,6 +314,14 @@ pub async fn leave_context(
                 // floors (member-granular; siblings + local scalar retained).
                 deps.supervisor
                     .remove_member_floors(&context_id_bytes, member_did);
+                // §9.16.4: a remaining member rotates when another member
+                // departs, so the departed one holds no current key. The debt
+                // persists with the removal, so a rotation that fails stays
+                // owed (§9.16.9 "A rotation that fails"). A departing local
+                // member sends nothing more and owes none.
+                if member_did.as_ref() != local_did {
+                    state.mark_sender_key_rotation_pending()?;
+                }
                 Some(remove_output.commit_bytes)
             };
 
@@ -382,14 +390,12 @@ pub async fn leave_context(
     // `ContextTransportProvider` is async and cannot be awaited inside the
     // synchronous `_keep` closure above). The membership removal is already
     // fail-closed-persisted; the MLS-Commit broadcast's failure bookkeeping is
-    // itself re-persisted FAIL-CLOSED (see below). A failed sender-key rotation
-    // leaves the leave standing and is returned to the caller at the end; a
+    // itself re-persisted FAIL-CLOSED (see below). A sender-key rotation that
+    // fails stays pending and is reported by event, and the leave stands; a
     // failed delivery stays queued (spec 09 §9.16.9). The captured
     // `mls_commit_bytes` is the removal Commit already produced under the crypto
     // `Arc` (Class-M) inside the closure.
-    let rotation = if is_broadcast {
-        Ok(())
-    } else {
+    if !is_broadcast {
         // Broadcast the MLS Commit to remaining members so they can advance their
         // group epoch and ratchet key material. Broadcast async (ADR-049 Decision
         // 7); on transport FAILURE the retry-queue bookkeeping is persisted
@@ -409,11 +415,13 @@ pub async fn leave_context(
             governance_helpers::keep_broadcast_failure(cell, deps, &context_id, failure).await?;
         }
 
-        // Rotate the local sender key and publish to the remaining members
-        // (§9.16.4: removal implies blocking). The leave stands either way; a
-        // rotation failure is returned after the `MemberLeft` leaf below.
-        rotate_sender_key_and_distribute(cell, deps, &context_id).await
-    };
+        // A remaining member rotates the local sender key and publishes it to
+        // the members left (§9.16.4: removal implies blocking). The departing
+        // local member does not: after its own leave it encrypts nothing.
+        if member_did.as_ref() != deps.crypto.local_did() {
+            rotate_sender_key_and_distribute(cell, deps, &context_id).await;
+        }
+    }
 
     // Append the `MemberLeft` Merkle leaf AFTER the Class-S removal persist.
     // Under ADR-049 Decision 7 `EventLogPersistence` is async, so this append
@@ -454,7 +462,7 @@ pub async fn leave_context(
         handle.transition_to(&ContextState::Closing)?;
     }
 
-    rotation
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -505,42 +513,70 @@ pub(super) fn add_member_and_queue_distribution(
 /// publishes what the rotation queued (spec 09 §9.16.4: removal implies
 /// blocking, and a block is a sender-side rotation; §9.16.10 for a revoke).
 ///
-/// The epoch bump persists fail-closed through `commit_class_s_keep`, and a
-/// bumped epoch advances the floor registry. The publish pass runs whether or
-/// not the rotation landed: a failed publish stays queued and is reported by
-/// event (§9.16.9), and the operation that rotated stands.
+/// The change that owes the rotation marks it pending in its own durable
+/// step (`mark_sender_key_rotation_pending`); the rotation's durable step
+/// clears the mark. The epoch bump persists fail-closed through
+/// `commit_class_s_keep`, and a bumped epoch advances the floor registry.
 ///
-/// # Errors
+/// A rotation that does not land never fails the change that owes it, which
+/// has already completed (spec 09 §9.16.9 "A rotation that fails"). The key,
+/// epoch and queue go back to what they were before the attempt, so nothing
+/// built from a key no durable step holds is published; the rotation stays
+/// pending, so `seal` refuses to encrypt; one `SenderKeyRotationPending`
+/// event reports the error; and the governance timer retries. A floor
+/// registry refusal after the rotation persisted leaves the rotation in
+/// place and keeps it pending, so the retry rotates past it.
 ///
-/// The rotation's error (the `rotate_sender_key` failure or the persist
-/// failure), or the floor registry's. The caller finishes the durable work of
-/// the operation that rotated, then returns this error, so a rotation failure
-/// reaches its caller typed and never only as a log line.
-pub(super) async fn rotate_sender_key_and_distribute(
+/// The publish pass runs either way: a failed publish stays queued and is
+/// reported by event (§9.16.9).
+pub(in crate::context) async fn rotate_sender_key_and_distribute(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
-) -> Result<(), ContextError> {
+) {
     let local_did = deps.crypto.local_did().to_owned();
-    let rotated = cell
+    let preimage = cell
+        .class_c_view()
+        .mode_mut()
+        .crypto_mut()
+        .map(|crypto| crypto.rotation_preimage());
+    let persisted = cell
         .commit_class_s_keep(deps, context_id, |mut v| {
             let s = v.rest_mut();
             s.rotate_sender_key(&local_did, deps.event_tx.as_ref())?;
             Ok(s.local_sender_key_epoch())
         })
-        .await
-        .and_then(|epoch| {
-            crate::context::messaging_helpers::mirror_forward_local_sender_epoch(
-                deps,
-                &state::context_id_to_bytes(context_id),
-                epoch,
-            )
-        });
-    if let Err(e) = &rotated {
+        .await;
+    let failure = match persisted {
+        Ok(epoch) => crate::context::messaging_helpers::mirror_forward_local_sender_epoch(
+            deps,
+            &state::context_id_to_bytes(context_id),
+            epoch,
+        )
+        .err()
+        .map(|e| (e, None)),
+        Err(e) => Some((e, preimage)),
+    };
+    if let Some((error, preimage)) = failure {
         tracing::error!(
             context_id,
-            error = %e,
-            "sender-key rotation failed; members keep the old sender key"
+            error = %error,
+            "sender-key rotation did not land; it stays pending and encrypt is refused"
+        );
+        let ctx_id_hex = hex::encode(state::context_id_to_bytes(context_id));
+        let mut view = cell.class_c_view();
+        if let Some(crypto) = view.mode_mut().crypto_mut() {
+            match preimage {
+                Some(preimage) => crypto.undo_rotation(preimage, &ctx_id_hex, &local_did),
+                None => crypto.sender_key_rotation_pending = true,
+            }
+        }
+        view.emit_event(
+            ContextEvent::SenderKeyRotationPending {
+                error: error.to_string(),
+            },
+            context_id,
+            deps.event_tx.as_ref(),
         );
     }
     drain_and_deliver_sender_keys(
@@ -550,7 +586,20 @@ pub(super) async fn rotate_sender_key_and_distribute(
         DistributionScope::NeverAttempted,
     )
     .await;
-    rotated
+}
+
+/// Retries a sender-key rotation that a membership or access change owes and
+/// that has not landed (spec 09 §9.16.9 "A rotation that fails"). The
+/// governance timer calls it each tick; it does nothing when no rotation is
+/// owed or the context is a broadcast one.
+pub(in crate::context) async fn retry_pending_sender_key_rotation(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    context_id: &str,
+) {
+    if cell.sender_key_rotation_pending() {
+        rotate_sender_key_and_distribute(cell, deps, context_id).await;
+    }
 }
 
 /// Which queued sender-key distributions one pass of

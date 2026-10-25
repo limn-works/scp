@@ -1515,6 +1515,7 @@ pub const fn delivery_reached_verdict(error: &ContextError) -> bool {
         | ContextError::RateLimited { .. }
         | ContextError::CommitBroadcastFault { .. }
         | ContextError::SenderKeyDistributionPending { .. }
+        | ContextError::SenderKeyRotationPending { .. }
         | ContextError::ActorBusy(_)
         | ContextError::NotImplemented(_)
         | ContextError::NotInitialized(_)

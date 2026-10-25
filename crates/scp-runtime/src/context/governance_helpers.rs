@@ -975,6 +975,11 @@ pub async fn execute_revoke(
             let needs_sender_key_rotation =
                 matches!(access, AccessScope::Write | AccessScope::Both)
                     && state.broadcast_context.is_none();
+            // The rotation the revoke owes persists with it, so a rotation
+            // that fails stays owed (spec 09 §9.16.9 "A rotation that fails").
+            if needs_sender_key_rotation {
+                state.mark_sender_key_rotation_pending()?;
+            }
 
             Ok((rotated_authors, needs_sender_key_rotation))
         })
@@ -1074,11 +1079,12 @@ pub async fn execute_revoke(
     }
 
     // H7: rotate the sender key after a write-side revocation. Everything above
-    // is durable, so a rotation failure reaches the caller as its typed error
-    // with the revoke standing (the replay marker is kept, see above).
+    // is durable and the revoke stands: a rotation that fails stays pending,
+    // `seal` refuses until the governance timer lands it, and an event
+    // reports it (spec 09 §9.16.9 "A rotation that fails").
     if needs_sender_key_rotation {
         crate::context::lifecycle_helpers::rotate_sender_key_and_distribute(cell, deps, context_id)
-            .await?;
+            .await;
     }
 
     Ok(rotated_authors.len())
@@ -2744,17 +2750,25 @@ pub async fn execute_reset_member(
     // `rest_mut()`, reachable only through a Class-S combinator, and persisted
     // fail-closed. Every refusal inside `reset_member` returns before the
     // merge, and `commit_class_s_keep` returns the closure's error before it
-    // bumps the epoch or persists. `local_did` is read once here and reused by
-    // the rotation block below.
+    // bumps the epoch or persists.
+    //
+    // The same persist drops the reset member's stale sender key and records
+    // the rotation the reset owes (spec 09 §9.16.4, §9.16.9 "A rotation that
+    // fails"). Both fail only on a broadcast context, which `reset_member`
+    // already refused, so neither returns after the Commit merged.
     let local_did = deps.crypto.local_did().to_owned();
     let reset_output = cell
         .commit_class_s_keep(deps, context_id, |mut v| {
-            v.rest_mut().reset_member(
+            let s = v.rest_mut();
+            let output = s.reset_member(
                 &local_did,
                 did.as_ref(),
                 Some(key_package),
                 deps.clock.as_ref(),
-            )
+            )?;
+            s.remove_member_sender_key(did.as_ref())?;
+            s.mark_sender_key_rotation_pending()?;
+            Ok(output)
         })
         .await?;
 
@@ -2779,77 +2793,15 @@ pub async fn execute_reset_member(
         );
     }
 
-    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): remove the reset member's stale sender
-    // key from the actor-owned store. Routed through `commit_class_s_keep` because
-    // the sender-key store lives behind the whole-`&mut PerContextState` reachable
-    // only via a Class-S combinator; the persist is fail-closed but the outcome is
-    // swallowed to preserve the prior best-effort disposition (the anti-replay
-    // backstop is the never-regressing registry floor pruned just below).
-    if let Err(e) = cell
-        .commit_class_s_keep(deps, context_id, |mut v| {
-            v.rest_mut().remove_member_sender_key(did.as_ref())
-        })
-        .await
-    {
-        tracing::warn!(
-            context_id,
-            member = %did,
-            error = %e,
-            "remove_member_sender_key failed after MLS reset — \
-             sender key layer may retain stale key"
-        );
-    }
-    // ADR-049 PR-6: prune the departed member's Class-M registry floors
+    // ADR-049 PR-6: prune the reset member's Class-M registry floors
     // (member-granular; siblings + the local scalar retained).
     deps.supervisor
         .remove_member_floors(&context_id_bytes, did.as_ref());
-    // ADR-049 PR-7 (RESET-SITE ruling a): the sender-key ROTATION is Class-S per
-    // §9 — the epoch bump is sync-persisted fail-closed via `commit_class_s_keep`
-    // (treated exactly like leave/revoke), NOT the coalesced best-effort it was
-    // when this site only held a `ClassCMut` view. Swallow-and-log disposition
-    // preserved on failure (rotation + distribution best-effort, M23); anti-replay
-    // backstop is the never-regressing registry floor (`mirror_forward`,
-    // `?`-propagated). `local_did` was read once above and is reused here.
-    match cell
-        .commit_class_s_keep(deps, context_id, |mut v| {
-            let s = v.rest_mut();
-            s.rotate_sender_key(&local_did, deps.event_tx.as_ref())?;
-            Ok(s.local_sender_key_epoch())
-        })
-        .await
-    {
-        Ok(epoch) => {
-            // ADR-049 PR-6/PR-7: advance the durably-bumped local epoch (read from
-            // the actor state the rotate above advanced) in the authoritative floor
-            // registry (fail-closed backstop).
-            crate::context::messaging_helpers::mirror_forward_local_sender_epoch(
-                deps,
-                &context_id_bytes,
-                epoch,
-            )?;
-        }
-        Err(e) => {
-            tracing::warn!(
-                context_id,
-                error = %e,
-                "rotate_sender_key failed after MLS reset"
-            );
-        }
-    }
-
-    // ADR-049 PR-7: drain through the actor's crypto state (same one the rotation
-    // populated — reset has no separate `distribute_sender_key`, so `rotate` is the
-    // sole producer of the pending queue). A failed publish stays queued and
-    // is reported by event (spec 09 §9.16.9).
-    {
-        crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
-            deps,
-            &mut cell.class_c_view(),
-            context_id,
-            crate::context::lifecycle_helpers::DistributionScope::NeverAttempted,
-        )
+    // Rotate and publish, as leave and revoke do. The reset stands: a rotation
+    // that fails stays pending, `seal` refuses until the governance timer
+    // lands it, and an event reports it (spec 09 §9.16.9).
+    crate::context::lifecycle_helpers::rotate_sender_key_and_distribute(cell, deps, context_id)
         .await;
-    }
 
     deps.event_log
         .append_context_event(

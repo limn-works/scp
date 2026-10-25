@@ -176,6 +176,10 @@ pub(crate) struct MlsCryptoSnapshot {
     /// before the publish, leaves them to be published again (spec 09
     /// §9.16.9 "A distribution whose publish fails").
     pub(crate) pending_distributions: Vec<PendingDistribution>,
+    /// A sender-key rotation owed and not landed, set in the durable step of
+    /// the change that owes it and cleared in the rotation's (spec 09
+    /// §9.16.9 "A rotation that fails").
+    pub(crate) sender_key_rotation_pending: bool,
 }
 
 impl Drop for MlsCryptoSnapshot {
@@ -229,6 +233,10 @@ impl std::fmt::Debug for MlsCryptoSnapshot {
                 "pending_distributions",
                 &format_args!("[{} entries]", self.pending_distributions.len()),
             )
+            .field(
+                "sender_key_rotation_pending",
+                &self.sender_key_rotation_pending,
+            )
             .finish()
     }
 }
@@ -237,13 +245,16 @@ impl std::fmt::Debug for MlsCryptoSnapshot {
 /// (spec 09 §9.16.9 "A distribution whose publish fails").
 ///
 /// The holder keeps the entry until a relay accepts a publish of it, a newer
-/// distribution to the same [`Self::target_did`] and [`Self::recipient_key`]
-/// replaces it, its target leaves, or no TTL remains under the republish rule
+/// distribution to the same [`Self::target_did`] supersedes it under the
+/// rule of its [`Self::kind`] (spec 09 §9.16.9), its target leaves, or no TTL remains under the republish rule
 /// (§9.10.2): `MAX_BLOB_TTL` after [`Self::first_attempt_at`]. Each attempt
 /// MLS-seals [`Self::message`] into the group's epoch at the time of the
 /// attempt.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct PendingDistribution {
+    /// Whether H pushed the key or answered a `SenderKeyRequest`; the two
+    /// supersede differently (spec 09 §9.16.9).
+    pub kind: DistributionKind,
     /// The member the distribution carries a sender key to.
     pub target_did: String,
     /// The public key the sender key is HPKE-sealed to: the target's
@@ -261,17 +272,30 @@ pub struct PendingDistribution {
     pub failed_attempts: u32,
 }
 
+/// How a queued sender-key distribution came to be (spec 09 §9.16.9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DistributionKind {
+    /// H pushed the key after a rotation or an Add, sealed to the target's
+    /// wrapping key.
+    Push,
+    /// H answered the target's `SenderKeyRequest`, sealed to the request's
+    /// ephemeral key.
+    Answer,
+}
+
 impl PendingDistribution {
     /// A distribution of `epoch` to `target_did`, sealed to `recipient_key`,
     /// that no attempt has published.
     #[must_use]
     pub fn queued(
+        kind: DistributionKind,
         target_did: String,
         recipient_key: Vec<u8>,
         epoch: u64,
         message: Vec<u8>,
     ) -> Self {
         Self {
+            kind,
             target_did,
             recipient_key,
             epoch,
@@ -287,6 +311,7 @@ impl PendingDistribution {
 impl std::fmt::Debug for PendingDistribution {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PendingDistribution")
+            .field("kind", &self.kind)
             .field("target_did", &self.target_did)
             .field("recipient_key", &hex::encode(&self.recipient_key))
             .field("epoch", &self.epoch)
@@ -365,6 +390,9 @@ pub struct OwnedMlsCryptoState {
     /// empty; a restore carries the persisted queue (spec 09 §9.16.9 "A
     /// distribution whose publish fails").
     pub pending_distributions: Vec<PendingDistribution>,
+    /// A sender-key rotation owed and not landed. A fresh birth owes none; a
+    /// restore carries the persisted flag (spec 09 §9.16.9).
+    pub sender_key_rotation_pending: bool,
     /// Nonce dedup cache for sender-key requests (replay protection).
     pub nonce_dedup: NonceDedup,
     /// Remote members' DHKEM(P-256) wrapping public keys (by DID).
@@ -386,6 +414,10 @@ impl std::fmt::Debug for OwnedMlsCryptoState {
             .field(
                 "pending_distributions",
                 &format_args!("[{} entries]", self.pending_distributions.len()),
+            )
+            .field(
+                "sender_key_rotation_pending",
+                &self.sender_key_rotation_pending,
             )
             .field("nonce_dedup", &self.nonce_dedup)
             .field(
@@ -412,6 +444,7 @@ impl OwnedMlsCryptoState {
             sender_key_epoch: 1,
             send_sequence: 0,
             pending_distributions: Vec::new(),
+            sender_key_rotation_pending: false,
             nonce_dedup: NonceDedup::new(),
             member_wrapping_keys: HashMap::new(),
         }
@@ -1146,6 +1179,7 @@ impl NodeMlsFactory {
             send_sequence: snapshot.send_sequence,
             // The persisted queue survives the restart (spec 05 §5.15.3).
             pending_distributions: std::mem::take(&mut snapshot.pending_distributions),
+            sender_key_rotation_pending: snapshot.sender_key_rotation_pending,
             nonce_dedup: NonceDedup::new(),
             member_wrapping_keys,
         };

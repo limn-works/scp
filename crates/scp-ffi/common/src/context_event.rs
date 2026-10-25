@@ -294,6 +294,7 @@ pub fn context_event_wire_string(event: &ContextEvent) -> String {
         CommitBroadcastFailed { operation: text, reason: text, attempts: num }
         SenderKeyDistributionPending { target_did: text, error: text, attempt: num }
         SenderKeyDistributionFailed { target_did: text, reason: text, attempts: num }
+        SenderKeyRotationPending { error: text }
         PseudonymAnnounced { member_did: text, pseudonym: hex }
         PseudonymRotationDue { pseudonym_epoch: num }
         PseudonymAnnouncementPending { pseudonym_epoch: num }
@@ -421,6 +422,16 @@ mod tests {
                 ContextEvent::LocalPseudonymRotated { pseudonym_epoch: 5 },
                 "local_pseudonym_rotated:pseudonym_epoch=5",
             ),
+        ];
+        for (event, expected) in cases {
+            assert_eq!(context_event_wire_string(&event), expected);
+        }
+    }
+
+    /// The sender-key distribution and rotation events render their fields.
+    #[test]
+    fn sender_key_renderings_are_pinned() {
+        let cases = [
             (
                 ContextEvent::SenderKeyDistributionPending {
                     target_did: did("did:dht:zBob"),
@@ -429,6 +440,12 @@ mod tests {
                 },
                 "sender_key_distribution_pending:target_did=did:dht:zBob,error=relay down,\
                  attempt=2",
+            ),
+            (
+                ContextEvent::SenderKeyRotationPending {
+                    error: "store down".to_owned(),
+                },
+                "sender_key_rotation_pending:error=store down",
             ),
             (
                 ContextEvent::SenderKeyDistributionFailed {

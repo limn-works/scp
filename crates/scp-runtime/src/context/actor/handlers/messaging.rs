@@ -170,6 +170,20 @@ pub(crate) async fn dispatch(
             reply,
         } => handle_seed_peer_pseudonym(cell, member_did, pseudonym, reply),
         #[cfg(feature = "testing")]
+        MessagingCommand::TestArmRotationFailure {
+            context_id: _,
+            reply,
+        } => {
+            // A context with no encrypted crypto has no rotation to fail.
+            let armed = cell.class_c_view().mode_mut().crypto_mut().map(|crypto| {
+                crypto.force_rotation_failure = true;
+            });
+            let _ = reply.send(armed.ok_or_else(|| {
+                ContextError::CryptoFailed("no encrypted crypto to arm".to_owned())
+            }));
+            Outcome::ok(())
+        }
+        #[cfg(feature = "testing")]
         MessagingCommand::TestInsertMember {
             context_id: _,
             member_did,

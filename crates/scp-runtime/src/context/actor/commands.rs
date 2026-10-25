@@ -430,6 +430,19 @@ pub enum MessagingCommand {
         reply: oneshot::Sender<Result<(), ContextError>>,
     },
 
+    /// Arms the one-shot rotation fault seam: the next local sender-key
+    /// rotation in this context fails before it mutates anything.
+    ///
+    /// Gated behind the `testing` feature — never compiled into production
+    /// builds, never reachable from any FFI bridge.
+    #[cfg(feature = "testing")]
+    TestArmRotationFailure {
+        /// Context identifier.
+        context_id: String,
+        /// Oneshot reply channel, `Ok(())` once armed.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+
     /// Insert a member directly into the context's role state (`members` +
     /// role `assignments`), bypassing the MLS Welcome / governance round-trip.
     ///

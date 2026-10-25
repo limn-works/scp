@@ -2642,14 +2642,14 @@ fn drain_and_deliver_sender_keys_reports_and_requeues() {
 }
 
 /// A `SenderKeyRequest` answer enters the queue through the enqueue that
-/// supersedes an answer queued to the same requester and key (spec 09
-/// §9.16.9).
+/// supersedes the requester's queued answers at its epoch or earlier, so a
+/// request flood keeps one answer per requester and epoch (spec 09 §9.16.9).
 #[test]
 fn key_request_answer_is_queued_through_the_superseding_enqueue() {
     assert!(
-        fn_body_contains(MANAGER_SRC, "decrypt_and_dispatch", "enqueue_distribution("),
+        fn_body_contains(MANAGER_SRC, "decrypt_and_dispatch", "enqueue_answer("),
         "decrypt_and_dispatch must queue a SenderKeyRequest answer through \
-         enqueue_distribution (spec 09 §9.16.9)"
+         enqueue_answer (spec 09 §9.16.9)"
     );
 }
 
@@ -3010,15 +3010,22 @@ fn execute_remove_member_calls_rotate_sender_key() {
 #[test]
 fn leave_context_calls_rotate_sender_key() {
     assert!(
-        fn_body_contains(MANAGER_SRC, "leave_context", "rotate_sender_key"),
-        "leave_context must call rotate_sender_key (§9.16.4)"
+        fn_body_contains(
+            MANAGER_SRC,
+            "leave_context",
+            "rotate_sender_key_and_distribute(cell, deps, &context_id)"
+        ),
+        "leave_context must call rotate_sender_key_and_distribute (§9.16.4)"
     );
 }
 
-/// The leave and the write revoke rotate through the one helper that rotates,
-/// publishes, and returns the rotation's error (spec 09 §9.16.4, §9.16.10).
+/// The leave, the write revoke and the reset rotate through the one helper
+/// that rotates, publishes, and keeps a failed rotation pending (spec 09
+/// §9.16.4, §9.16.9, §9.16.10); the governance timer retries it.
 #[test]
 fn leave_and_write_revoke_rotate_through_the_reporting_helper() {
+    const HANDLERS_GOVERNANCE_SRC: &str =
+        include_str!("../../../../crates/scp-runtime/src/context/actor/handlers/governance.rs");
     let helper = extract_fn_body(MANAGER_SRC, "rotate_sender_key_and_distribute")
         .expect("rotate_sender_key_and_distribute exists");
     for needle in [
@@ -3031,12 +3038,20 @@ fn leave_and_write_revoke_rotate_through_the_reporting_helper() {
             "rotate_sender_key_and_distribute must contain `{needle}`"
         );
     }
-    for caller in ["leave_context", "execute_revoke"] {
+    for caller in ["leave_context", "execute_revoke", "execute_reset_member"] {
         assert!(
             fn_body_contains(MANAGER_SRC, caller, "rotate_sender_key_and_distribute("),
             "{caller} must rotate through rotate_sender_key_and_distribute"
         );
     }
+    assert!(
+        fn_body_contains(
+            HANDLERS_GOVERNANCE_SRC,
+            "evaluate_governance_timeouts",
+            "retry_pending_sender_key_rotation(cell, deps, &context_id)"
+        ),
+        "the governance timer must retry a pending sender-key rotation (§9.16.9)"
+    );
 }
 
 // --- Proposer eligibility / Participation (#1530) ---

@@ -82,6 +82,7 @@ pub fn classify_context_error(e: &ContextError) -> ContextErrorClass<'_> {
         ContextError::NothingToRestore(_) => K::Context(codes::CTX_2137),
         ContextError::SupervisorShutDown(_) => K::Context(codes::CTX_2138),
         ContextError::SenderKeyDistributionPending { .. } => K::Context(codes::CTX_2140),
+        ContextError::SenderKeyRotationPending { .. } => K::Context(codes::CTX_2141),
         ContextError::PermissionDenied(msg) => K::PermissionDenied(msg),
         ContextError::Outlet(surface) => K::Outlet(&surface.code),
         // The reserve-gate carrier renders no lifecycle state (it runs before
@@ -184,6 +185,18 @@ mod tests {
         assert!(matches!(
             classify_context_error(&refused),
             ContextErrorClass::Context(code) if code == codes::CTX_2140
+        ));
+        assert!(has_dedicated_code(&refused));
+    }
+
+    /// A send refused while an owed sender-key rotation has not landed
+    /// carries its own code (spec 09 §9.16.9), never a call's fallback.
+    #[test]
+    fn a_pending_rotation_refusal_carries_ctx_2141() {
+        let refused = ContextError::SenderKeyRotationPending { epoch: 3 };
+        assert!(matches!(
+            classify_context_error(&refused),
+            ContextErrorClass::Context(code) if code == codes::CTX_2141
         ));
         assert!(has_dedicated_code(&refused));
     }
