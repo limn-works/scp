@@ -1311,6 +1311,16 @@ pub(crate) async fn evaluate_governance_timeouts(
     ))
     .await;
 
+    // Phase 5 also drains the queued event-log units (spec 17 §17.3 "Event
+    // log write failures"), so a unit a failed drain left behind is retried on
+    // every tick even when no command arrives. A failure is logged inside the
+    // drain and leaves the units queued.
+    if let Err(err) =
+        crate::context::log_unit_helpers::drain_pending_log_units(cell, deps, &context_id).await
+    {
+        tracing::debug!(context_id = %context_id, error = %err, "governance tick log unit drain failed");
+    }
+
     Outcome::ok_mutated(true)
 }
 

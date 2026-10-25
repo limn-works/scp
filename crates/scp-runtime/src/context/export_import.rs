@@ -795,6 +795,12 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> Result<ContextSnapsh
         // public scope.
         pending_commits: std::collections::VecDeque::new(),
         commit_fault: None,
+        // Spec 17 §17.3: queued log units and the log fault are local node
+        // state. An export refuses while units are queued, and a foreign node
+        // must never write a unit into its own log, so both are always empty
+        // in public scope.
+        pending_log_units: std::collections::VecDeque::new(),
+        log_fault: None,
         // Checkpoint counters are local runtime state — no meaning to a
         // public observer. Always zero in public scope.
         checkpoint_events_since: 0,
@@ -1130,6 +1136,8 @@ mod tests {
             revoked_spending_ucan_cids: std::collections::HashSet::new(),
             pending_commits: std::collections::VecDeque::new(),
             commit_fault: None,
+            pending_log_units: std::collections::VecDeque::new(),
+            log_fault: None,
             checkpoint_events_since: 0,
             checkpoint_last_time_secs: 0,
             generation: 0,
@@ -2851,6 +2859,59 @@ mod tests {
             decoded.xctx_nonce_dedup.get(&[0xCDu8; 16]).copied(),
             Some(1_700_000_456)
         );
+    }
+
+    /// Queued log units and the log fault (spec 17 §17.3 "Event log write
+    /// failures"; ADR-049 §9 Class S) round-trip through `MessagePack`
+    /// persistence value-stable, in queue order, with each unit's reserved
+    /// `base_seq` and every leaf field. A snapshot written without the fields
+    /// decodes with an empty queue and no fault.
+    #[test]
+    fn snapshot_roundtrips_pending_log_units() {
+        use crate::context::state::{LeafSpec, LogFaultMarker, PendingLogUnit};
+
+        let leaf = |tag: u8, ts: u64| LeafSpec {
+            event_type: scp_event_log::EventType::ConsequenceTriggered,
+            actor_did: "did:key:consequence-actor".to_owned(),
+            payload: scp_event_log::EventPayload {
+                data: vec![tag, 0xEE],
+            },
+            timestamp_secs: ts,
+        };
+        let mut snapshot = test_snapshot("ctx-pending-log-units");
+        snapshot.pending_log_units.push_back(PendingLogUnit {
+            base_seq: Some(17),
+            leaves: vec![leaf(1, 1_700_000_001), leaf(2, 1_700_000_002)],
+        });
+        snapshot.pending_log_units.push_back(PendingLogUnit {
+            base_seq: None,
+            leaves: vec![leaf(3, 1_700_000_003)],
+        });
+        snapshot.log_fault = Some(LogFaultMarker {
+            base_seq: Some(17),
+            log_len: Some(20),
+            detail: "misaligned".to_owned(),
+        });
+
+        let bytes = rmp_serde::to_vec_named(&snapshot).unwrap();
+        let decoded: ContextSnapshot = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(decoded.pending_log_units, snapshot.pending_log_units);
+        assert_eq!(decoded.log_fault, snapshot.log_fault);
+
+        let mut without = rmpv::decode::read_value(&mut bytes.as_slice()).unwrap();
+        let rmpv::Value::Map(entries) = &mut without else {
+            panic!("a snapshot encodes as a map");
+        };
+        let before = entries.len();
+        entries.retain(|(k, _)| {
+            k.as_str() != Some("pending_log_units") && k.as_str() != Some("log_fault")
+        });
+        assert_eq!(entries.len(), before - 2);
+        let mut without_bytes = Vec::new();
+        rmpv::encode::write_value(&mut without_bytes, &without).unwrap();
+        let decoded: ContextSnapshot = rmp_serde::from_slice(&without_bytes).unwrap();
+        assert!(decoded.pending_log_units.is_empty());
+        assert!(decoded.log_fault.is_none());
     }
 
     /// A caller-side durable reservation reversal record (spec §6.2.4; Class S)

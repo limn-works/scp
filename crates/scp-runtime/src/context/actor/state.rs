@@ -1062,6 +1062,17 @@ pub struct ClassSState {
     /// one every peer rejects under the receipt-ordering rule. Same-node
     /// restore rehydrates it; a public export strips it.
     pub(crate) pseudonym_rotation: super::pseudonym_rotation::PseudonymRotationState,
+
+    /// Event-log units queued after an irreversible step and not yet written
+    /// (spec 17 §17.3 "Event log write failures"; ADR-049 §9). Only
+    /// [`ClassSMut::enqueue_log_unit`](super::class_s::ClassSMut::enqueue_log_unit)
+    /// adds a unit, so a unit is queued only inside a fail-closed combinator.
+    pub(crate) pending_log_units: super::class_s::PendingLogUnits,
+
+    /// The log-fault marker (spec 17 §17.3 "Event log write failures"):
+    /// `Some` while a queued unit could not be placed in the log or a log
+    /// read after an irreversible step failed.
+    pub(crate) log_fault: Option<crate::context::state::LogFaultMarker>,
 }
 
 /// Lossless, `Clone`-able mirror of [`ClassSState`] (ADR-049 §9).
@@ -1114,6 +1125,10 @@ pub struct ClassSStateSnapshot {
         HashMap<String, crate::context::outlets::invoke::StreamReservationRecord>,
     /// Mirror of [`ClassSState::pseudonym_rotation`] (`Copy`).
     pub(crate) pseudonym_rotation: super::pseudonym_rotation::PseudonymRotationState,
+    /// Mirror of [`ClassSState::pending_log_units`].
+    pub(crate) pending_log_units: VecDeque<crate::context::state::PendingLogUnit>,
+    /// Mirror of [`ClassSState::log_fault`].
+    pub(crate) log_fault: Option<crate::context::state::LogFaultMarker>,
 }
 
 #[allow(
@@ -1146,6 +1161,8 @@ impl ClassSState {
             caveat_counters: self.caveat_counters.clone(),
             stream_reservations: self.stream_reservations.clone(),
             pseudonym_rotation: self.pseudonym_rotation.clone(),
+            pending_log_units: self.pending_log_units.to_deque(),
+            log_fault: self.log_fault.clone(),
         }
     }
 
@@ -1169,6 +1186,8 @@ impl ClassSState {
         self.caveat_counters = snap.caveat_counters;
         self.stream_reservations = snap.stream_reservations;
         self.pseudonym_rotation = snap.pseudonym_rotation;
+        self.pending_log_units = super::class_s::PendingLogUnits::restored(snap.pending_log_units);
+        self.log_fault = snap.log_fault;
     }
 }
 
@@ -1660,6 +1679,8 @@ impl PerContextState {
             recv_tracker: RecvSequenceTracker::new(),
             xctx_ucan_proofs: InMemoryProofResolver::new(),
             class_s: ClassSState {
+                pending_log_units: super::class_s::PendingLogUnits::default(),
+                log_fault: None,
                 saga_pending: HashMap::new(),
                 // Seed the PRODUCTION saga dedup TTL (strictly longer than the
                 // freshness skew, BLACK-XCTX-01) in the test fixture too, so
@@ -3586,6 +3607,8 @@ mod tests {
             caveat_counters,
             stream_reservations,
             pseudonym_rotation,
+            pending_log_units,
+            log_fault,
         } = class_s;
 
         // Identity + lifetime.
@@ -3614,10 +3637,7 @@ mod tests {
         // Governance / epoch / access / ttl — internals are `pub(crate)`
         // on the legacy manager module; taking a reference witnesses
         // the field is reachable and initialized.
-        let _ = &governance;
-        let _ = &epoch;
-        let _ = &access;
-        let _ = &ttl;
+        let _ = (&governance, &epoch, &access, &ttl);
 
         // Routing — encrypted contexts are pseudonymous with an empty
         // peer registry and a (zero, in the test fixture) local pseudonym.
@@ -3628,8 +3648,7 @@ mod tests {
         assert!(relay_urls.is_empty());
 
         // Anti-replay + reorder buffers.
-        let _ = &sequence_tracker;
-        let _ = &reorder_buffer;
+        let _ = (&sequence_tracker, &reorder_buffer);
 
         // Commit retry + checkpointing.
         assert_eq!(pending_commits.len(), 0);
@@ -3662,7 +3681,10 @@ mod tests {
         // No in-flight streaming reservation recovery records on a fresh context.
         assert!(stream_reservations.is_empty());
         assert_eq!(pseudonym_rotation, rotation_anchored_at(12));
-        assert!(welcome_scratchpad.is_none());
+        // No queued log unit and no log fault on a fresh context (spec 17 §17.3).
+        assert!(
+            pending_log_units.is_empty() && log_fault.is_none() && welcome_scratchpad.is_none()
+        );
         assert_eq!(lifecycle_state, ContextLifecycleState::Open);
 
         // Mode.
@@ -3720,6 +3742,8 @@ mod tests {
                     caveat_counters: _,
                     stream_reservations: _,
                     pseudonym_rotation: _,
+                    pending_log_units: _,
+                    log_fault: _,
                 },
             welcome_scratchpad: _,
             lifecycle_state: _,

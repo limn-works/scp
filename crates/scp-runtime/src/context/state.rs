@@ -256,6 +256,58 @@ pub struct CommitFaultMarker {
 }
 
 // ---------------------------------------------------------------------------
+// Pending log units (spec 17 §17.3 "Event log write failures")
+// ---------------------------------------------------------------------------
+
+/// One event-log entry of a [`PendingLogUnit`]: everything an append takes
+/// except the position, which the drain assigns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeafSpec {
+    /// The entry's closed-taxonomy event type.
+    pub event_type: scp_event_log::EventType,
+    /// The DID of the actor the entry names.
+    pub actor_did: String,
+    /// The entry's payload, part of the leaf preimage.
+    pub payload: scp_event_log::EventPayload,
+    /// The entry's convergent timestamp in seconds since the Unix epoch.
+    pub timestamp_secs: u64,
+}
+
+/// Event-log entries that an operation queued after its irreversible step
+/// (spec 17 §17.3 "Event log write failures").
+///
+/// The operation queues the unit inside the same fail-closed state persist
+/// that records its step. The drain writes the unit's entries to the log as
+/// one unit starting at `base_seq`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingLogUnit {
+    /// The log sequence the unit's first entry takes. `None` until the
+    /// drain reserves it under the provider's write gate; a drain that finds
+    /// the slot taken by an append outside the queue resets it.
+    pub base_seq: Option<u64>,
+    /// The unit's entries, in log order. Never empty.
+    pub leaves: Vec<LeafSpec>,
+}
+
+/// The context's event log fault (spec 17 §17.3 "Event log write failures").
+///
+/// Set when a queued unit cannot be placed in the log, or when a log read
+/// after an irreversible step fails. While it is set, the context refuses the
+/// mutations the commit-fault marker refuses, with `EventLogFailed`. Only a
+/// drain that empties the queue over a loaded log clears it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogFaultMarker {
+    /// The `base_seq` of the unit that could not be placed, or `None` when a
+    /// failed read set the marker.
+    pub base_seq: Option<u64>,
+    /// The log's length when the marker was set, or `None` when it was
+    /// unreadable.
+    pub log_len: Option<u64>,
+    /// What went wrong.
+    pub detail: String,
+}
+
+// ---------------------------------------------------------------------------
 // PendingCeilingModification (M7)
 // ---------------------------------------------------------------------------
 
@@ -992,6 +1044,19 @@ pub struct ContextSnapshot {
     /// `None`, matching pre-feature behavior.
     #[serde(default)]
     pub commit_fault: Option<CommitFaultMarker>,
+    /// Event-log units queued after an irreversible step and not yet written
+    /// (spec 17 §17.3 "Event log write failures").
+    ///
+    /// **Class S** — the queuing operation's fail-closed persist writes the
+    /// unit together with its step. A snapshot written before this field
+    /// existed decodes as an empty queue.
+    #[serde(default)]
+    pub pending_log_units: VecDeque<PendingLogUnit>,
+    /// The log-fault marker (spec 17 §17.3 "Event log write failures").
+    /// **Class S**. A snapshot written before this field existed decodes as
+    /// `None`.
+    #[serde(default)]
+    pub log_fault: Option<LogFaultMarker>,
     /// Number of event log appends since the last consistency checkpoint (§9.9.3).
     /// Persisted so the checkpoint interval counter survives process restarts.
     #[serde(default)]

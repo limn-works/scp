@@ -414,6 +414,11 @@ impl ContextActor {
         // mutation will set `dirty = true`, then the `select!` arm
         // computes the deadline as `last_persist_attempt_at + COALESCE_INTERVAL`
         // — which is in the future relative to actor-spawn `now()`.
+        //
+        // Drain the queued log units first (spec 17 §17.3 "Event log write
+        // failures"): an actor starts on spawn, respawn, and restore, and a
+        // restored queue is written before any command runs.
+        self.drain_log_units().await;
         loop {
             // Reconcile the ACTOR-OWNED timer arms and the push-route watch
             // from owned state before every select (top of run() + after each
@@ -477,6 +482,11 @@ impl ContextActor {
                             // run-loop future under the `clippy::large_futures`
                             // threshold (the streaming-saga seal handlers added
                             // large stack frames held across `.await`).
+                            // Every command runs after a drain of the queued
+                            // log units (spec 17 §17.3), so a fail-closed
+                            // append, an import, an export, a prune, or a
+                            // checkpoint never lands ahead of a queued unit.
+                            self.drain_log_units().await;
                             let succeeded = Box::pin(self.dispatch(cmd)).await;
                             if is_flush {
                                 self.record_persist_attempt(succeeded);
@@ -640,6 +650,29 @@ impl ContextActor {
     /// per-domain actor-shape `dispatch` entry points. Returns whether the
     /// handler's [`Outcome`] carries `Ok`; the run loop reads it to tell
     /// whether a flush's write landed.
+    /// Drains the context's queued log units when there are any (spec 17
+    /// §17.3 "Event log write failures"). A failed drain leaves the units
+    /// queued and the provider fence set, so the command that follows cannot
+    /// write ahead of them; the drain logs the failure.
+    async fn drain_log_units(&mut self) {
+        if !crate::context::log_unit_helpers::has_log_unit_work(&self.state) {
+            return;
+        }
+        if let Err(err) = crate::context::log_unit_helpers::drain_pending_log_units(
+            &mut self.state,
+            &self.deps,
+            &self.context_id,
+        )
+        .await
+        {
+            tracing::debug!(
+                context_id = %self.context_id,
+                error = %err,
+                "log unit drain before the next command failed"
+            );
+        }
+    }
+
     async fn dispatch(&mut self, cmd: ContextCommand) -> bool {
         // `dispatch_state` receives the `&mut ClassSCell` directly and threads
         // it into every domain handler. Every domain mutates through the cell's

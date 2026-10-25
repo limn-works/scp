@@ -195,6 +195,16 @@ pub fn export_context_blocks(
     // the crypto keys the snapshot exports), not a re-hash of the hex id.
     let ctx_id_bytes = state::context_id_to_bytes(context_id);
 
+    // An export carries the log as stored, and the public snapshot carries no
+    // queue, so it waits for the queued log units (spec 17 §17.3 "Event log
+    // write failures"); the actor drains them before every command.
+    if !state.class_s.pending_log_units.is_empty() {
+        return Err(ContextError::EventLogFailed(format!(
+            "context {context_id} has queued event log units; export waits for the drain"
+        )));
+    }
+    governance_helpers::check_log_fault(state)?;
+
     let snapshot = crate::context::messaging_helpers::build_snapshot_from_state(state);
 
     let event_log_data = deps.event_log.export_event_log_data(&ctx_id_bytes)?;
@@ -259,6 +269,7 @@ pub async fn leave_context(
 
             // PR #1606 C6: refuse if a commit fault marker is set.
             governance_helpers::check_commit_fault(state)?;
+            governance_helpers::check_log_fault(state)?;
 
             // Authorization: self-removal always allowed; otherwise MemberRemove
             // required.
@@ -1878,6 +1889,9 @@ pub(in crate::context) async fn create_context(
         // interface state, never authorization secrecy.
         xctx_ucan_proofs: scp_protocol::crypto::ucan::validate::InMemoryProofResolver::new(),
         class_s: crate::context::actor::state::ClassSState {
+            // Spec 17 §17.3: a new context has no queued log unit and no log fault.
+            pending_log_units: crate::context::actor::class_s::PendingLogUnits::default(),
+            log_fault: None,
             saga_pending: HashMap::new(),
             xctx_committed_outputs: HashMap::new(),
             xctx_committed_stream_outputs: HashMap::new(),
@@ -3546,6 +3560,9 @@ pub(in crate::context) async fn import_context(
         // interface state, never authorization secrecy.
         xctx_ucan_proofs: scp_protocol::crypto::ucan::validate::InMemoryProofResolver::new(),
         class_s: crate::context::actor::state::ClassSState {
+            // Spec 17 §17.3: a new context has no queued log unit and no log fault.
+            pending_log_units: crate::context::actor::class_s::PendingLogUnits::default(),
+            log_fault: None,
             saga_pending: HashMap::new(),
             xctx_committed_outputs: HashMap::new(),
             xctx_committed_stream_outputs: HashMap::new(),
@@ -4272,6 +4289,13 @@ pub async fn restore_context(
         // interface is (re-)established.
         xctx_ucan_proofs: scp_protocol::crypto::ucan::validate::InMemoryProofResolver::new(),
         class_s: crate::context::actor::state::ClassSState {
+            // Spec 17 §17.3, ADR-049 §9 Class S: same-node restore REHYDRATES the
+            // queued log units and the log fault; the actor drains the queue when it
+            // starts.
+            pending_log_units: crate::context::actor::class_s::PendingLogUnits::restored(
+                ctx_snapshot.pending_log_units,
+            ),
+            log_fault: ctx_snapshot.log_fault,
             saga_pending: ctx_snapshot
                 .saga_pending
                 .into_iter()

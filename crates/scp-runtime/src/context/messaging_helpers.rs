@@ -959,6 +959,7 @@ pub async fn send_message(
         state::require_active(view.handle_mut())?;
         // Fail-close on commit fault.
         governance_helpers::check_commit_fault_marker(view.commit_fault_mut().as_ref())?;
+        governance_helpers::check_log_fault_marker(view.class_s().log_fault.as_ref())?;
     }
 
     // ADR-039: pair the signer with its persona into a single
@@ -2479,6 +2480,16 @@ async fn create_and_broadcast_checkpoint_if_due(
     let MessageSigner::Active(signer) = signer else {
         return;
     };
+    // A checkpoint covers the log as stored, so it waits for the queued log
+    // units (spec 17 §17.3 "Event log write failures"): with units queued or
+    // the log faulted, the thresholds stay armed and a later send builds it.
+    if crate::context::log_unit_helpers::has_log_unit_work(cell) {
+        tracing::debug!(
+            context_id,
+            "consistency checkpoint deferred: event log units are queued (§9.9.3)"
+        );
+        return;
+    }
     // Build + retain the checkpoint through the non-persisting Class-C view
     // (coalesced — the run loop persists on `mutated`). The `&mut view` borrow
     // ends before the shared-`&` `send_checkpoint` read below (NLL).
@@ -2948,6 +2959,8 @@ pub fn build_snapshot_from_state(
         revoked_spending_ucan_cids: state.governance.revoked_spending_ucan_cids.clone(),
         pending_commits: state.pending_commits.clone(),
         commit_fault: state.commit_fault.clone(),
+        pending_log_units: state.class_s.pending_log_units.to_deque(),
+        log_fault: state.class_s.log_fault.clone(),
         checkpoint_events_since: state.checkpoint_events_since,
         checkpoint_last_time_secs: state.checkpoint_last_time_secs,
         generation: state.generation,

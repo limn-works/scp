@@ -64,7 +64,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use scp_did::DID;
 use scp_event_log::{Event, EventLog, EventPayload, EventType};
 
-use crate::context::builder::{ContextEventLogProvider, EventLogRestore};
+use crate::context::builder::{
+    ContextEventLogProvider, EventLogRestore, UnitAppendError, UnitAppended, UnitWriteGuard,
+};
 use scp_protocol::context::builder::ContextCreationError;
 
 /// Per-context event log wrapping the canonical [`scp_event_log::EventLog`].
@@ -311,6 +313,12 @@ pub struct MerkleEventLogProvider {
     write_gates: dashmap::DashMap<[u8; 32], WriteGate>,
     /// Optional persistence backend for surviving process restarts (#636).
     persistence: Option<std::sync::Arc<dyn EventLogPersistence>>,
+    /// Contexts whose actor holds queued log units (spec 17 §17.3 "Event log
+    /// write failures"). While a context is in this set, a fail-closed
+    /// append, an import, and a prune for it are refused. The drain sets and
+    /// clears membership through
+    /// [`ContextEventLogProvider::set_units_pending`].
+    units_pending: dashmap::DashSet<[u8; 32]>,
 }
 
 /// A context's write gate: a semaphore with one permit. A writer that holds
@@ -337,6 +345,7 @@ impl MerkleEventLogProvider {
             logs: Mutex::new(Logs::default()),
             write_gates: dashmap::DashMap::new(),
             persistence: None,
+            units_pending: dashmap::DashSet::new(),
         }
     }
 
@@ -350,6 +359,7 @@ impl MerkleEventLogProvider {
             logs: Mutex::new(Logs::default()),
             write_gates: dashmap::DashMap::new(),
             persistence: Some(persistence),
+            units_pending: dashmap::DashSet::new(),
         }
     }
 
@@ -443,6 +453,7 @@ impl MerkleEventLogProvider {
 
         let log = rebuild_log_from_events(context_id, &entries)?;
 
+        self.check_no_units_pending(context_id)?;
         let write = self.lock_write_gate(context_id).await?;
         // Store the imported events (one replace) before memory takes them.
         if let Err(e) = self.replace_stored(context_id, &entries).await {
@@ -585,6 +596,7 @@ impl MerkleEventLogProvider {
             .unwrap_or_default()
             .as_secs();
 
+        self.check_no_units_pending(context_id)?;
         let write = self.lock_write_gate(context_id).await?;
 
         // Compute the pruned log without changing memory: memory takes it
@@ -813,6 +825,23 @@ impl MerkleEventLogProvider {
         }
     }
 
+    /// Refuses a write that would land ahead of, or re-chain under, a queued
+    /// log unit (spec 17 §17.3 "Event log write failures").
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextCreationError::EventLogFailed`] while the context has
+    /// queued log units.
+    fn check_no_units_pending(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        if self.units_pending.contains(context_id) {
+            return Err(ContextCreationError::EventLogFailed(format!(
+                "context {} has queued event log units; the drain must write them first",
+                hex::encode(context_id)
+            )));
+        }
+        Ok(())
+    }
+
     /// Fails a write to a context that has no log in memory. The write's
     /// permit drops and the gate is released, so the failed write leaves no
     /// gate behind.
@@ -827,45 +856,6 @@ impl MerkleEventLogProvider {
             "no event log for context {}",
             hex::encode(context_id)
         ))
-    }
-
-    /// Validates the §5.4.5 `chunks_billed` wire invariant of an
-    /// `OutletInvoked` event at the append boundary.
-    ///
-    /// Enforced here so ANY malformed streaming `OutletInvokedEvent`, from
-    /// any source, is durably wire-rejected ("refused at log-insert time, not
-    /// accepted-and-flagged"). The appender holds only the event (opaque
-    /// `payload` bytes), NOT the chunk sequence or `cancel_ack_seq`, so it
-    /// enforces the event-LOCAL bound `chunks_billed <= stream_chunk_count`
-    /// (`verify_outlet_invoked_event_local`); the tighter manifest-derived
-    /// equality is enforced upstream at chunk-emission time by the dispatch
-    /// pump's gate. Only payloads that DECODE as an `OutletInvokedEvent` are
-    /// checked: the `OutletInvoked` discriminator is also carried by the
-    /// unary saga's join-record payload (a distinct JSON shape lacking the
-    /// required event fields), which does not decode here and is passed
-    /// through untouched. This keeps the `scp-event-log` crate
-    /// runtime-independent — the invariant lives in `scp-runtime`, the crate
-    /// only owns the error variant.
-    fn check_append_payload(
-        event_type: EventType,
-        payload: &EventPayload,
-    ) -> Result<(), ContextCreationError> {
-        if event_type == EventType::OutletInvoked
-            && let Ok(invoked) = serde_json::from_slice::<
-                scp_protocol::context::outlets::lifecycle::OutletInvokedEvent,
-            >(&payload.data)
-        {
-            crate::context::outlets::stream::verify_outlet_invoked_event_local(&invoked).map_err(
-                |err| {
-                    let log_err =
-                        crate::context::outlets::stream::chunks_billed_error_to_event_log_error(
-                            err,
-                        );
-                    ContextCreationError::EventLogFailed(log_err.to_string())
-                },
-            )?;
-        }
-        Ok(())
     }
 
     /// Persists `event`, the next event of a context's log, as one unit, or
@@ -894,6 +884,135 @@ impl Default for MerkleEventLogProvider {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Validates the §5.4.5 `chunks_billed` wire invariant of an
+/// `OutletInvoked` event at the append boundary.
+///
+/// Enforced here so ANY malformed streaming `OutletInvokedEvent`, from
+/// any source, is durably wire-rejected ("refused at log-insert time, not
+/// accepted-and-flagged"). The appender holds only the event (opaque
+/// `payload` bytes), NOT the chunk sequence or `cancel_ack_seq`, so it
+/// enforces the event-LOCAL bound `chunks_billed <= stream_chunk_count`
+/// (`verify_outlet_invoked_event_local`); the tighter manifest-derived
+/// equality is enforced upstream at chunk-emission time by the dispatch
+/// pump's gate. Only payloads that DECODE as an `OutletInvokedEvent` are
+/// checked: the `OutletInvoked` discriminator is also carried by the
+/// unary saga's join-record payload (a distinct JSON shape lacking the
+/// required event fields), which does not decode here and is passed
+/// through untouched. This keeps the `scp-event-log` crate
+/// runtime-independent — the invariant lives in `scp-runtime`, the crate
+/// only owns the error variant.
+pub(crate) fn check_append_payload(
+    event_type: EventType,
+    payload: &EventPayload,
+) -> Result<(), ContextCreationError> {
+    if event_type == EventType::OutletInvoked
+        && let Ok(invoked) = serde_json::from_slice::<
+            scp_protocol::context::outlets::lifecycle::OutletInvokedEvent,
+        >(&payload.data)
+    {
+        crate::context::outlets::stream::verify_outlet_invoked_event_local(&invoked).map_err(
+            |err| {
+                let log_err =
+                    crate::context::outlets::stream::chunks_billed_error_to_event_log_error(err);
+                ContextCreationError::EventLogFailed(log_err.to_string())
+            },
+        )?;
+    }
+    Ok(())
+}
+
+/// Where a queued log unit goes in a context's log (spec 17 §17.3 "Event log
+/// write failures").
+#[derive(Debug)]
+pub(crate) enum UnitPlacement {
+    /// The log holds `base_seq` entries; these are the unit's events, chained
+    /// to the log's last entry.
+    Append(Vec<Event>),
+    /// The log holds the unit at `base_seq`, leaf hash for leaf hash.
+    AlreadyPresent,
+    /// Neither holds.
+    Misaligned {
+        /// The log's length.
+        log_len: u64,
+        /// True when the log is longer than `base_seq` and its entry at
+        /// `base_seq` is not the unit's first entry.
+        slot_taken: bool,
+    },
+}
+
+/// Places a unit of `leaves` at `base_seq` in a log holding `events`: builds
+/// the unit's events chained from the entry at `base_seq − 1`, then compares
+/// them with the log by leaf hash (spec 17 §17.3 "Event log write failures").
+///
+/// # Errors
+///
+/// Returns [`ContextCreationError::EventLogFailed`] when `leaves` is empty or
+/// a leaf hash cannot be computed.
+pub(crate) fn place_unit(
+    events: &[Event],
+    base_seq: u64,
+    leaves: &[crate::context::state::LeafSpec],
+) -> Result<UnitPlacement, ContextCreationError> {
+    if leaves.is_empty() {
+        return Err(ContextCreationError::EventLogFailed(
+            "an event log unit holds no entries".into(),
+        ));
+    }
+    let hash = |event: &Event| {
+        scp_event_log::tree::leaf_hash(event).map_err(|e| {
+            ContextCreationError::EventLogFailed(format!("event log leaf hash failed: {e}"))
+        })
+    };
+    let log_len = u64::try_from(events.len())
+        .map_err(|_| ContextCreationError::EventLogFailed("event log length exceeds u64".into()))?;
+    if base_seq > log_len {
+        return Ok(UnitPlacement::Misaligned {
+            log_len,
+            slot_taken: false,
+        });
+    }
+    let base = usize::try_from(base_seq).map_err(|_| {
+        ContextCreationError::EventLogFailed("event log base_seq exceeds usize".into())
+    })?;
+    let mut prev_hash = match base.checked_sub(1).and_then(|i| events.get(i)) {
+        Some(prev) => hash(prev)?,
+        None => scp_event_log::tree::GENESIS_PREV_HASH,
+    };
+    let mut unit = Vec::with_capacity(leaves.len());
+    for (sequence, leaf) in (base_seq..).zip(leaves) {
+        let event = Event {
+            event_type: leaf.event_type,
+            actor_did: DID::from(leaf.actor_did.clone()),
+            timestamp: leaf.timestamp_secs,
+            sequence,
+            payload: leaf.payload.clone(),
+            prev_hash,
+            signature: Vec::new(),
+        };
+        prev_hash = hash(&event)?;
+        unit.push(event);
+    }
+    if base_seq == log_len {
+        return Ok(UnitPlacement::Append(unit));
+    }
+    let stored = events.get(base..).unwrap_or_default();
+    let mut matched = 0usize;
+    for (stored_event, unit_event) in stored.iter().zip(&unit) {
+        if hash(stored_event)? != hash(unit_event)? {
+            break;
+        }
+        matched += 1;
+    }
+    Ok(if matched == unit.len() {
+        UnitPlacement::AlreadyPresent
+    } else {
+        UnitPlacement::Misaligned {
+            log_len,
+            slot_taken: matched == 0,
+        }
+    })
 }
 
 /// Replays a slice of events into a fresh [`EventLog`], verifying the hash
@@ -1065,7 +1184,8 @@ impl ContextEventLogProvider for MerkleEventLogProvider {
         payload: EventPayload,
         timestamp_secs: u64,
     ) -> Result<(), ContextCreationError> {
-        Self::check_append_payload(event_type, &payload)?;
+        check_append_payload(event_type, &payload)?;
+        self.check_no_units_pending(context_id)?;
 
         let write = self.lock_write_gate(context_id).await?;
         // Build the event without changing memory: memory takes it only
@@ -1123,7 +1243,7 @@ impl ContextEventLogProvider for MerkleEventLogProvider {
         payload: EventPayload,
         timestamp_secs: u64,
     ) -> Result<(), ContextCreationError> {
-        Self::check_append_payload(event_type, &payload)?;
+        check_append_payload(event_type, &payload)?;
 
         let write = self.lock_write_gate(context_id).await?;
         // Memory first: the operation's irreversible step already happened,
@@ -1180,6 +1300,118 @@ impl ContextEventLogProvider for MerkleEventLogProvider {
         // no longer counts.
         self.release_write_gate(context_id);
         deleted
+    }
+
+    async fn lock_for_unit(
+        &self,
+        context_id: &[u8; 32],
+    ) -> Result<UnitWriteGuard, ContextCreationError> {
+        let write = self.lock_write_gate(context_id).await?;
+        let len = {
+            let logs = self
+                .logs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            logs.get(context_id)
+                .map(|log| scp_event_log::tree::event_count(&log.log))
+        };
+        let Some(log_len) = len else {
+            return Err(self.no_log(context_id, write));
+        };
+        Ok(UnitWriteGuard::new(*context_id, Some(write), log_len))
+    }
+
+    async fn append_unit(
+        &self,
+        guard: UnitWriteGuard,
+        base_seq: u64,
+        leaves: &[crate::context::state::LeafSpec],
+    ) -> Result<UnitAppended, UnitAppendError> {
+        let context_id = *guard.context_id();
+        let Some(write) = guard.into_permit() else {
+            return Err(UnitAppendError::Failed(
+                ContextCreationError::EventLogFailed(format!(
+                    "the unit write guard of context {} holds no write permit",
+                    hex::encode(context_id)
+                )),
+            ));
+        };
+        for leaf in leaves {
+            check_append_payload(leaf.event_type, &leaf.payload)?;
+        }
+        // Place the unit without changing memory: memory takes it only after
+        // storage does, as a fail-closed append (spec 17 §17.3).
+        let placed = {
+            let logs = self
+                .logs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            logs.get(&context_id).map(|log| {
+                place_unit(log.log.events(), base_seq, leaves).map(|placement| {
+                    let stored_log = log.storage_diverged.then(|| log.log.events().to_vec());
+                    (placement, stored_log)
+                })
+            })
+        };
+        let Some(placed) = placed else {
+            return Err(UnitAppendError::Failed(self.no_log(&context_id, write)));
+        };
+        let (placement, stored_log) = placed?;
+        let unit = match placement {
+            UnitPlacement::Append(unit) => unit,
+            UnitPlacement::AlreadyPresent => return Ok(UnitAppended::AlreadyPresent),
+            UnitPlacement::Misaligned {
+                log_len,
+                slot_taken,
+            } => {
+                return Err(UnitAppendError::Misaligned {
+                    base_seq,
+                    log_len,
+                    slot_taken,
+                });
+            }
+        };
+
+        // One unit, or a replace of the whole stored log when it is diverged.
+        let stored = match stored_log {
+            None => self.persist_unit(&context_id, base_seq, &unit).await,
+            Some(mut entries) => {
+                entries.extend(unit.iter().cloned());
+                self.replace_stored(&context_id, &entries).await
+            }
+        };
+        if let Err(e) = stored {
+            self.settle_write(&context_id, write, false);
+            return Err(UnitAppendError::Failed(e));
+        }
+
+        let committed = {
+            let mut logs = self
+                .logs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            logs.get_mut(&context_id).map(|log| {
+                let committed = unit.iter().try_for_each(|event| log.commit(event));
+                // A commit that fails leaves memory short of the stored log,
+                // so the next write replaces storage with memory.
+                log.storage_diverged = committed.is_err();
+                committed
+            })
+        };
+        match committed {
+            Some(Ok(())) => Ok(UnitAppended::Appended),
+            Some(Err(e)) => Err(UnitAppendError::Failed(e)),
+            // Released while the persist ran: storage holds the unit.
+            None => Err(UnitAppendError::Failed(self.no_log(&context_id, write))),
+        }
+    }
+
+    fn set_units_pending(&self, context_id: &[u8; 32], pending: bool) {
+        if pending {
+            self.units_pending.insert(*context_id);
+        } else {
+            self.units_pending.remove(context_id);
+        }
     }
 
     fn release_event_log(&self, context_id: &[u8; 32]) {
@@ -3019,5 +3251,200 @@ mod tests {
         let entries = provider.entries(&ctx_id).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].event_type, EventType::MemberLeft);
+    }
+
+    fn unit_leaf(tag: u8) -> crate::context::state::LeafSpec {
+        crate::context::state::LeafSpec {
+            event_type: EventType::MemberJoined,
+            actor_did: String::new(),
+            payload: payload_bytes(&[0xC0, tag]),
+            timestamp_secs: 1_650_000_000 + u64::from(tag),
+        }
+    }
+
+    /// A unit put whose storage write landed but reported failure is found by
+    /// a fresh provider as `AlreadyPresent`, not appended a second time; the
+    /// failed provider, whose memory stayed short, re-writes it once through
+    /// a replace (spec 17 §17.3 "Event log write failures").
+    #[tokio::test]
+    async fn append_unit_returns_already_present_when_put_landed_but_reported_failure() {
+        let ctx_id = [41u8; 32];
+        let faulty = fresh_faulty();
+        let provider = faulty_provider(&faulty);
+        provider.init_event_log(&ctx_id).await.unwrap();
+        append_n(&provider, &ctx_id, 0xA1, 2).await;
+        let leaves = [unit_leaf(1), unit_leaf(2)];
+
+        // The unit and the head both land; the head put reports failure.
+        faulty.fail_after_commit_prefix(&format!(
+            "context/{}/merkle_event_log/head",
+            hex::encode(ctx_id)
+        ));
+        let guard = provider.lock_for_unit(&ctx_id).await.unwrap();
+        assert_eq!(guard.log_len(), 2);
+        let first = provider.append_unit(guard, 2, &leaves).await;
+        assert!(
+            matches!(first, Err(UnitAppendError::Failed(_))),
+            "a put reported failed must fail the append: {first:?}"
+        );
+        assert_eq!(
+            provider.entries(&ctx_id).unwrap().len(),
+            2,
+            "memory waits for storage"
+        );
+        faulty.clear_fail();
+
+        // A restart restores the landed unit; the drain's retry finds it.
+        let restarted = faulty_provider(&faulty);
+        assert_eq!(
+            restarted.restore_event_log(&ctx_id).await.unwrap(),
+            EventLogRestore::Loaded { entries: 4 }
+        );
+        let guard = restarted.lock_for_unit(&ctx_id).await.unwrap();
+        assert_eq!(guard.log_len(), 4);
+        assert_eq!(
+            restarted.append_unit(guard, 2, &leaves).await.unwrap(),
+            UnitAppended::AlreadyPresent
+        );
+        assert_eq!(
+            restarted.entries(&ctx_id).unwrap().len(),
+            4,
+            "no duplicate leaf"
+        );
+
+        // Without a restart, the retry writes the unit once.
+        let guard = provider.lock_for_unit(&ctx_id).await.unwrap();
+        assert_eq!(
+            provider.append_unit(guard, 2, &leaves).await.unwrap(),
+            UnitAppended::Appended
+        );
+        assert_eq!(
+            log_bytes(&provider.entries(&ctx_id).unwrap()),
+            log_bytes(&restarted.entries(&ctx_id).unwrap()),
+            "both providers hold the unit exactly once, at the same sequences"
+        );
+        assert_reload_matches(&faulty, &provider, &ctx_id, "unit retry").await;
+    }
+
+    /// A unit whose `base_seq` is past the log's end, or whose slot holds a
+    /// different entry, is refused with the typed misalignment, and the log
+    /// is unchanged.
+    #[tokio::test]
+    async fn append_unit_misaligned_returns_typed_error() {
+        let ctx_id = [42u8; 32];
+        let provider = MerkleEventLogProvider::new();
+        provider.init_event_log(&ctx_id).await.unwrap();
+        append_n(&provider, &ctx_id, 0xA2, 3).await;
+        let before = provider.entries(&ctx_id).unwrap();
+
+        let guard = provider.lock_for_unit(&ctx_id).await.unwrap();
+        let past_end = provider.append_unit(guard, 5, &[unit_leaf(1)]).await;
+        assert!(
+            matches!(
+                past_end,
+                Err(UnitAppendError::Misaligned {
+                    base_seq: 5,
+                    log_len: 3,
+                    slot_taken: false
+                })
+            ),
+            "{past_end:?}"
+        );
+
+        let guard = provider.lock_for_unit(&ctx_id).await.unwrap();
+        let taken = provider.append_unit(guard, 1, &[unit_leaf(1)]).await;
+        assert!(
+            matches!(
+                taken,
+                Err(UnitAppendError::Misaligned {
+                    base_seq: 1,
+                    log_len: 3,
+                    slot_taken: true
+                })
+            ),
+            "{taken:?}"
+        );
+
+        // The first leaf matches and the second does not: misaligned, and the
+        // slot is not free for a re-reserve.
+        let stored_first = &before[1];
+        let partial = [
+            crate::context::state::LeafSpec {
+                event_type: stored_first.event_type,
+                actor_did: stored_first.actor_did.to_string(),
+                payload: stored_first.payload.clone(),
+                timestamp_secs: stored_first.timestamp,
+            },
+            unit_leaf(9),
+        ];
+        let guard = provider.lock_for_unit(&ctx_id).await.unwrap();
+        let half = provider.append_unit(guard, 1, &partial).await;
+        assert!(
+            matches!(
+                half,
+                Err(UnitAppendError::Misaligned {
+                    slot_taken: false,
+                    ..
+                })
+            ),
+            "{half:?}"
+        );
+        assert_eq!(
+            log_bytes(&provider.entries(&ctx_id).unwrap()),
+            log_bytes(&before)
+        );
+    }
+
+    /// While a context has queued units, prune, import, and a fail-closed
+    /// append are refused; the unit write itself is not.
+    #[tokio::test]
+    async fn prune_refused_while_units_pending() {
+        let ctx_id = [43u8; 32];
+        let provider = MerkleEventLogProvider::new();
+        provider.init_event_log(&ctx_id).await.unwrap();
+        append_n(&provider, &ctx_id, 0xA3, 4).await;
+        let export = provider.export_event_log_entries(&ctx_id).unwrap();
+        let policy = scp_protocol::context::governance::PruningPolicy {
+            size_based: Some(scp_protocol::context::governance::SizeBasedPolicy {
+                max_event_count: 1,
+                max_storage_bytes: u64::MAX,
+            }),
+            ..Default::default()
+        };
+
+        provider.set_units_pending(&ctx_id, true);
+        let pruned = provider.prune_before_checkpoint(&ctx_id, 4, &policy).await;
+        assert!(
+            matches!(pruned, Err(ContextCreationError::EventLogFailed(_))),
+            "{pruned:?}"
+        );
+        assert!(
+            provider
+                .import_event_log_entries(&ctx_id, &export)
+                .await
+                .is_err()
+        );
+        let appended = provider
+            .append_event(&ctx_id, EventType::MemberJoined, "", payload_bytes(&[1]), 1)
+            .await;
+        assert!(appended.is_err(), "{appended:?}");
+        assert_eq!(provider.entries(&ctx_id).unwrap().len(), 4);
+        let guard = provider.lock_for_unit(&ctx_id).await.unwrap();
+        assert_eq!(
+            provider
+                .append_unit(guard, 4, &[unit_leaf(1)])
+                .await
+                .unwrap(),
+            UnitAppended::Appended
+        );
+
+        provider.set_units_pending(&ctx_id, false);
+        assert!(
+            provider
+                .prune_before_checkpoint(&ctx_id, 5, &policy)
+                .await
+                .unwrap()
+                .is_some_and(|removed| removed > 0)
+        );
     }
 }
