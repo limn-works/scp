@@ -17,8 +17,8 @@ use proptest::test_runner::{Config, TestCaseError, TestRng, TestRunner};
 use super::super::holder::{AcceptedChainHolder, HoldOutcome};
 use super::super::retention::{Bounds, RetainedSuffix, Slot, plan_evictions};
 use super::super::{
-    Admission, BasisKind, ForkRank, PersistedSuffix, Rerank, RestoreError, RetentionBasis,
-    RetentionError, RetentionSet,
+    Admission, AdoptedBasis, BasisKind, ForkRank, PersistedSuffix, Rerank, RestoreError,
+    RetentionBasis, RetentionError, RetentionSet,
 };
 use super::chain_support::{group, identifier_of, sign_inception, signed_of, vector};
 use super::fixtures::V41_PREIMAGE;
@@ -268,7 +268,11 @@ fn persist_restore_after_adoption() -> TestResult {
     assert_eq!(saved.basis.head, w.head());
     assert_eq!(saved.basis.observed, 2);
     let identifier = w.chain.identifier();
-    let restored = RetentionSet::restore(&identifier, &saved, Some(w.head()))?;
+    let restored = RetentionSet::restore(
+        &identifier,
+        &saved,
+        AdoptedBasis::Accepted { head: w.head() },
+    )?;
     assert_eq!(restored, set);
     assert_eq!(restored.persisted(), saved);
     Ok(())
@@ -637,19 +641,27 @@ fn contested_prefix_retains_the_tied_heads_past_it() -> TestResult {
     assert_eq!(saved.basis.kind, BasisKind::ContestedPrefix);
     assert_eq!(saved.basis.head, prefix.head());
     let identifier = prefix.chain.identifier();
-    assert_eq!(RetentionSet::restore(&identifier, &saved, None)?, set);
+    assert_eq!(
+        RetentionSet::restore(
+            &identifier,
+            &saved,
+            AdoptedBasis::ContestedPrefix {
+                head: prefix.head()
+            }
+        )?,
+        set
+    );
     Ok(())
 }
 
-/// `restore` takes the accepted chain from the verifier's adopted state,
-/// never from the persisted bytes: a contested prefix persisted as an
-/// accepted basis is refused at a first contact, a persisted contested
-/// prefix is refused where the caller holds a baseline, and an accepted
-/// head other than the baseline head is refused.
+/// `restore` takes the basis from the verifier's persisted verdict, never
+/// from the persisted bytes: a basis of the other kind is refused either
+/// way, a contested prefix persisted as an accepted basis included, and a
+/// basis of the named kind at another head is refused.
 ///
-/// Mutant (run, then restored): `restore` skips the agreement check, so
-/// the flipped kind restores Vector 41 as accepted and reaches the
-/// tournament instead.
+/// Mutants (each run, then restored): `restore` compares only the kinds,
+/// so a contested prefix at another head restores; and `restore` accepts
+/// an accepted basis where the verdict names a contested prefix.
 #[test]
 fn restore_refuses_a_basis_the_verifier_did_not_adopt() -> TestResult {
     let mut keys = Keys::new()?;
@@ -659,30 +671,57 @@ fn restore_refuses_a_basis_the_verifier_did_not_adopt() -> TestResult {
     retain(&mut set, &Branch::of(&mut keys, &[Kind::Reveal], 2)?.chain)?;
     let identifier = prefix.chain.identifier();
     let saved = set.persisted();
+    let contested = AdoptedBasis::ContestedPrefix {
+        head: prefix.head(),
+    };
     let mut flipped = saved.clone();
     flipped.basis.kind = BasisKind::Accepted;
     assert_eq!(
-        RetentionSet::restore(&identifier, &flipped, None),
+        RetentionSet::restore(&identifier, &flipped, contested),
         Err(RestoreError::BasisDisagrees {
-            adopted: None,
+            adopted: contested,
             kind: BasisKind::Accepted,
             head: prefix.head(),
         })
     );
+    let accepted = AdoptedBasis::Accepted {
+        head: prefix.head(),
+    };
     assert_eq!(
-        RetentionSet::restore(&identifier, &saved, Some(prefix.head())),
+        RetentionSet::restore(&identifier, &saved, accepted),
         Err(RestoreError::BasisDisagrees {
-            adopted: Some(prefix.head()),
+            adopted: accepted,
+            kind: BasisKind::ContestedPrefix,
+            head: prefix.head(),
+        })
+    );
+    let elsewhere = AdoptedBasis::ContestedPrefix { head: [0x5a; 32] };
+    assert_eq!(
+        RetentionSet::restore(&identifier, &saved, elsewhere),
+        Err(RestoreError::BasisDisagrees {
+            adopted: elsewhere,
             kind: BasisKind::ContestedPrefix,
             head: prefix.head(),
         })
     );
     let basis = basis(&mut keys)?;
-    let accepted_set = registered(&basis);
+    let accepted_set = registered(&basis).persisted();
+    // An accepted basis restored where the verifier's verdict names a
+    // contested prefix, a first contact's among them.
+    let first_contact = AdoptedBasis::ContestedPrefix { head: basis.head() };
     assert_eq!(
-        RetentionSet::restore(&identifier, &accepted_set.persisted(), Some(v41_digest())),
+        RetentionSet::restore(&identifier, &accepted_set, first_contact),
         Err(RestoreError::BasisDisagrees {
-            adopted: Some(v41_digest()),
+            adopted: first_contact,
+            kind: BasisKind::Accepted,
+            head: basis.head(),
+        })
+    );
+    let stale = AdoptedBasis::Accepted { head: v41_digest() };
+    assert_eq!(
+        RetentionSet::restore(&identifier, &accepted_set, stale),
+        Err(RestoreError::BasisDisagrees {
+            adopted: stale,
             kind: BasisKind::Accepted,
             head: basis.head(),
         })
@@ -706,7 +745,11 @@ fn restore_refuses_an_accepted_basis_a_suffix_beats() -> TestResult {
     retain(&mut set, &x.chain)?;
     let identifier = a.chain.identifier();
     assert_eq!(
-        RetentionSet::restore(&identifier, &set.persisted(), Some(a.head())),
+        RetentionSet::restore(
+            &identifier,
+            &set.persisted(),
+            AdoptedBasis::Accepted { head: a.head() }
+        ),
         Err(RestoreError::AcceptedDisplaced {
             accepted: a.head(),
             by: x.head(),
@@ -854,7 +897,7 @@ fn restore_fails_closed() -> TestResult {
     retain(&mut set, &second.chain)?;
     let saved = set.persisted();
     let identifier = basis.chain.identifier();
-    let adopted = Some(basis.head());
+    let adopted = AdoptedBasis::Accepted { head: basis.head() };
     let restore = |saved: &_| RetentionSet::restore(&identifier, saved, adopted);
     assert_eq!(restore(&saved)?, set);
 
@@ -921,7 +964,11 @@ fn restore_fails_closed() -> TestResult {
     let mut short = saved.clone();
     short.basis.head = v41_digest();
     assert_eq!(
-        RetentionSet::restore(&identifier, &short, Some(v41_digest())),
+        RetentionSet::restore(
+            &identifier,
+            &short,
+            AdoptedBasis::Accepted { head: v41_digest() }
+        ),
         Err(RestoreError::Retention(RetentionError::ExtendsAccepted {
             head: v41_digest()
         }))

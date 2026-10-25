@@ -18,6 +18,7 @@ mod rank;
 mod routing;
 mod signature;
 mod validate;
+mod verdict;
 
 pub use client_data::ClientDataError;
 #[doc(hidden)]
@@ -45,10 +46,10 @@ pub use preimage::{
     prerotation_commitment,
 };
 pub use rank::{
-    Admission, BasisKind, ChainPairing, Divergence, ForkRank, NoResolution, PersistedBasis,
-    PersistedRetention, PersistedSuffix, Rerank, ResolveError, RestoreError, RetainedSuffix,
-    RetentionBasis, RetentionError, RetentionSet, SetResolution, TieClass, UnrelatedChains,
-    pair_chains, resolve_set,
+    Admission, AdoptedBasis, BasisKind, ChainPairing, Divergence, ForkRank, NoResolution,
+    PersistedBasis, PersistedRetention, PersistedSuffix, Rerank, ResolveError, RestoreError,
+    RetainedSuffix, RetentionBasis, RetentionError, RetentionSet, SetResolution, TieClass,
+    UnrelatedChains, pair_chains, resolve_set,
 };
 pub use routing::{RoutingKind, routing_id};
 pub use signature::{
@@ -61,4 +62,8 @@ pub use validate::{
     InceptionRefusal, MarkerMode, NamedKey, NotOnChain, ReplayedState, SignerGroupSpec,
     SigningChange, SigningRefusal, ThresholdField, ValidChains, ValidatedChain, ValidatedChange,
     key_state_at, replay, validate_entry, validate_inception,
+};
+pub use verdict::{
+    Classification, ClassifyError, InconclusiveCause, OperatorProof, ResolutionInput,
+    ResolutionVerdict, ResolvedState, SequenceRange, SourceExhaustion, SourceRead, classify,
 };

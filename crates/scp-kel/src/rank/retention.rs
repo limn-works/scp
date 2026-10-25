@@ -167,10 +167,9 @@ pub enum RetentionError {
     #[error("the retention set's moment counter is exhausted")]
     ObservedExhausted,
     /// A contested prefix was offered as the basis of a set whose basis is
-    /// the accepted chain. R9 makes a contested prefix the basis only
-    /// "Where a first-contact resolution returns `Contested`", where the
-    /// party holds no accepted chain, so the move would drop the accepted
-    /// baseline into the set as a ranked suffix.
+    /// the accepted chain. Only a `Contested` verdict moves an accepted
+    /// basis to the shared prefix it names (R7), and the verdict classifier
+    /// makes that move itself, so a move a caller chooses is refused.
     #[error("a contested prefix cannot replace the accepted chain at {accepted:02x?}")]
     ContestedAfterAccepted {
         /// The accepted chain's head digest.
@@ -234,6 +233,38 @@ pub struct PersistedSuffix {
     pub observed: u64,
 }
 
+/// The basis a verifier's persisted verdict names, which
+/// [`RetentionSet::restore`] holds the persisted set's basis to, so the
+/// bytes a store returns never choose it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AdoptedBasis {
+    /// The accepted chain, by the head digest the verifier's last
+    /// `Confirmed` or `Adopted` verdict accepted.
+    Accepted {
+        /// The accepted head's digest.
+        head: [u8; 32],
+    },
+    /// The shared prefix the verifier's last `Contested` verdict named, by
+    /// that verdict's `shared_prefix_head` (§9.7.4.2 R7, R9), at a first
+    /// contact or past an accepted baseline.
+    ContestedPrefix {
+        /// The prefix's head digest.
+        head: [u8; 32],
+    },
+}
+
+impl AdoptedBasis {
+    /// The kind and head digest of `basis`.
+    #[must_use]
+    pub fn of(basis: &RetentionBasis) -> Self {
+        let head = basis.chain().head_digest();
+        match basis {
+            RetentionBasis::Accepted(_) => Self::Accepted { head },
+            RetentionBasis::ContestedPrefix(_) => Self::ContestedPrefix { head },
+        }
+    }
+}
+
 /// Why [`RetentionSet::restore`] rebuilt nothing. Every arm fails closed:
 /// no partial set is returned.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -282,16 +313,12 @@ pub enum RestoreError {
     /// Re-admitting a persisted suffix reached a [`RetentionError`].
     #[error(transparent)]
     Retention(#[from] RetentionError),
-    /// The persisted basis is not the verifier's adopted state: an accepted
-    /// basis whose head is not the caller's baseline head, or a basis whose
-    /// kind disagrees with whether the caller holds a baseline, since R9
-    /// makes a contested prefix the basis only at a first contact.
-    #[error(
-        "the persisted {kind:?} basis {head:02x?} disagrees with the adopted head {adopted:02x?}"
-    )]
+    /// The persisted basis is not the basis the verifier's persisted verdict
+    /// names: another kind, or another head.
+    #[error("the persisted {kind:?} basis {head:02x?} disagrees with the adopted {adopted:?}")]
     BasisDisagrees {
-        /// The caller's baseline head, or `None` at a first contact.
-        adopted: Option<[u8; 32]>,
+        /// The basis the caller's persisted verdict names.
+        adopted: AdoptedBasis,
         /// The persisted basis kind.
         kind: BasisKind,
         /// The persisted basis head.
@@ -547,6 +574,31 @@ impl RetentionSet {
                 accepted: accepted.head_digest(),
             });
         }
+        self.move_to(basis)
+    }
+
+    /// Moves the set to `prefix`, the shared prefix a `Contested` verdict
+    /// names, whatever the basis was. R7: "For a contested identity a
+    /// verifier … uses the shared prefix's key state as the verification
+    /// basis"; R9: "The accepted chain … is the chain the verifier held
+    /// before it observed any divergence". An accepted chain inside `prefix`
+    /// leaves the set, and one diverging from it or running past it becomes
+    /// a retained suffix carrying its eviction rank against `prefix`.
+    ///
+    /// The verdict classifier is the one caller, so only a `Contested`
+    /// verdict moves an accepted basis to a contested prefix; any other move
+    /// goes through [`rerank`](Self::rerank), which refuses it.
+    ///
+    /// # Errors
+    ///
+    /// The first [`RetentionError`] a re-admission reaches. The set is then
+    /// unchanged.
+    pub(crate) fn contest(&mut self, prefix: ValidatedChain) -> Result<Rerank, RetentionError> {
+        self.move_to(RetentionBasis::ContestedPrefix(prefix))
+    }
+
+    /// [`rerank`](Self::rerank)'s move, past every check its caller runs.
+    fn move_to(&mut self, basis: RetentionBasis) -> Result<Rerank, RetentionError> {
         let mut entries: Vec<(u64, ValidatedChain)> = self
             .suffixes
             .iter()
@@ -636,11 +688,9 @@ impl RetentionSet {
         }
     }
 
-    /// Rebuilds a persisted set against `adopted`, the verifier's adopted
-    /// state: its baseline head, or `None` at a first contact. The persisted
-    /// basis must agree with it, an accepted basis at that head or a
-    /// contested prefix where no baseline exists, so the persisted bytes
-    /// never choose the accepted chain. Then one [`validate_entry`] over the
+    /// Rebuilds a persisted set against `adopted`, the basis the verifier's
+    /// persisted verdict names. The persisted basis must equal it in kind and
+    /// head, so the persisted bytes never choose the basis. Then one [`validate_entry`] over the
     /// units, and the basis and each suffix the prefix through its head of
     /// the chain holding that head. Every suffix is re-admitted in ascending
     /// moment order through [`admit`](Self::admit)'s one rule, so a persisted
@@ -654,12 +704,15 @@ impl RetentionSet {
     pub fn restore(
         identifier: &Identifier,
         saved: &PersistedRetention,
-        adopted: Option<[u8; 32]>,
+        adopted: AdoptedBasis,
     ) -> Result<Self, RestoreError> {
         let agrees = match (adopted, saved.basis.kind) {
-            (Some(head), BasisKind::Accepted) => head == saved.basis.head,
-            (None, BasisKind::ContestedPrefix) => true,
-            (Some(_), BasisKind::ContestedPrefix) | (None, BasisKind::Accepted) => false,
+            (AdoptedBasis::Accepted { head }, BasisKind::Accepted)
+            | (AdoptedBasis::ContestedPrefix { head }, BasisKind::ContestedPrefix) => {
+                head == saved.basis.head
+            }
+            (AdoptedBasis::Accepted { .. }, BasisKind::ContestedPrefix)
+            | (AdoptedBasis::ContestedPrefix { .. }, BasisKind::Accepted) => false,
         };
         if !agrees {
             return Err(RestoreError::BasisDisagrees {
@@ -748,7 +801,7 @@ impl RetentionSet {
     ///
     /// [`ResolveError`] where the comparisons reach none of R6's outcomes,
     /// which valid chains of one identifier never do.
-    pub(super) fn displacing_suffix(&self) -> Result<Option<&RetainedSuffix>, ResolveError> {
+    pub(crate) fn displacing_suffix(&self) -> Result<Option<&RetainedSuffix>, ResolveError> {
         let chains: Vec<&ValidatedChain> = std::iter::once(self.basis.chain())
             .chain(self.suffixes.iter().map(RetainedSuffix::chain))
             .collect();

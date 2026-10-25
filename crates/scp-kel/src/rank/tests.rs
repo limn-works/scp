@@ -1042,3 +1042,5 @@ fn chains_of_two_identifiers_are_refused() -> TestResult {
 }
 
 mod retention;
+
+mod verdict;

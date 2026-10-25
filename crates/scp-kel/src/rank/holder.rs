@@ -76,7 +76,7 @@ pub enum HoldError {
 /// the retained suffixes, and nothing else: a chain the bounds refuse or
 /// evict takes no part in deciding the accepted chain. One moment counter,
 /// the set's, orders every chain: a chain extending a held one keeps its
-/// moment, and "held first" is the earliest moment among the chains no
+/// moment, and "held earliest" is the earliest moment among the chains no
 /// other chain beats. R9: "a suffix a party evicted and a party presents
 /// again later is re-ranked as if the party saw it for the first time", so
 /// it takes a new moment.
@@ -146,7 +146,7 @@ impl AcceptedChainHolder {
     /// through [`RetentionSet::admit`]; a refusal returns
     /// [`HoldOutcome::Refused`] and changes nothing. The holder then runs R6
     /// over the accepted chain and the retained suffixes, and where another
-    /// chain wins, or ties and was held first, moves acceptance to it
+    /// chain wins, or ties and was held earliest, moves acceptance to it
     /// through [`RetentionSet::rerank`], which re-admits the chain accepted
     /// before.
     ///
