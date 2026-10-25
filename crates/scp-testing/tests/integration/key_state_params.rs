@@ -7,18 +7,28 @@
 //! classifier constructs it. SCP-310 AC11 forbids any external input position
 //! that names `KeyState`, `KeyStateView` or `ReplayedState`. The gate does not
 //! reason about positions: it parses every Rust file under `crates/*/src` and
-//! `crates/scp-ffi/*/src` with `syn` and counts every top-level item whose
-//! full token stream (attributes, signature, body, macro arguments) names a
-//! gated type. A name a `type` alias or a `use .. as` rename binds to one,
-//! anywhere in the scanned tree, counts as a gated name. Items compiled only
-//! under exactly `#[cfg(test)]` are out of scope: an item carrying it, a file
-//! with `#![cfg(test)]`, and every file a `#[cfg(test)] mod` declaration loads
-//! or whose module descends from one. Every other `cfg`, `cfg(any(test,
-//! feature = "testing"))` included, stays in, because that code can ship. Every item that may
-//! mention one is pinned in [`ALLOWLIST`] by file path and item, with the
-//! reason the mention cannot hand in key state no resolution accepted, and
-//! each entry must match a mention, so a moved or deleted item fails the gate
-//! instead of leaving a stale entry.
+//! `crates/scp-ffi/*/src`, and every file a `#[path]` reaches from them, with
+//! `syn`, and counts every top-level item whose full token stream (attributes,
+//! signature, body, macro arguments) names a gated type. A raw identifier
+//! names what it spells, and a name a `type` alias or a `use .. as` rename
+//! binds to one, anywhere in the scanned tree, counts as a gated name. A
+//! module declaration that loads no scanned file, and an `include!` or
+//! `include_str!` whose target is not a scanned file, count as items too: the
+//! scan cannot see what they bring in.
+//!
+//! Items compiled only under exactly `#[cfg(test)]` are out of scope: an item
+//! carrying it, a file with `#![cfg(test)]`, and a file every non-test-build
+//! declaration of which sits in such a file, with `cfg_attr(test, path = ..)`
+//! resolved per build. Every other `cfg`, `cfg(any(test, feature =
+//! "testing"))` included, stays in, because that code can ship.
+//!
+//! Every counted item is pinned in [`ALLOWLIST`] by file path, item label and
+//! the SHA-256 of its tokens, with the reason the mention cannot hand in key
+//! state no resolution accepted. An edit inside a pinned item, or a second
+//! item under a pinned label, is a new mention naming the entry it differs
+//! from, and each entry must match a mention, so a moved or deleted item fails
+//! the gate instead of leaving a stale entry. Identifiers a macro builds (a
+//! `paste!` concatenation, a proc macro's output) are beyond a syntax scan.
 //!
 //! `verdict_match_has_no_wildcard`: SCP-310 AC8 requires `classify` to match
 //! `EntryVerdict` with no wildcard arm. `crates/scp-kel/src/verdict.rs`
@@ -42,17 +52,31 @@ use syn::visit::Visit;
 const GATED: [&str; 3] = ["KeyState", "KeyStateView", "ReplayedState"];
 
 /// One approved mention: the top-level item `item` of the file at `path`
-/// (relative to the workspace root), with the reason it cannot hand in key
-/// state no resolution accepted. `item` is the label [`item_label`] gives.
+/// (relative to the workspace root) whose token stream hashes to `digest`,
+/// with the reason it cannot hand in key state no resolution accepted. `item`
+/// is the label [`item_label`] gives; `digest` is [`digest`] of the item, so
+/// any edit inside an approved item, and any second item under the same
+/// label, is a new mention to review.
 #[derive(Debug, Clone, Copy)]
 struct Allowed {
     path: &'static str,
     item: &'static str,
+    digest: &'static str,
     reason: &'static str,
 }
 
-const fn allow(path: &'static str, item: &'static str, reason: &'static str) -> Allowed {
-    Allowed { path, item, reason }
+const fn allow(
+    path: &'static str,
+    item: &'static str,
+    digest: &'static str,
+    reason: &'static str,
+) -> Allowed {
+    Allowed {
+        path,
+        item,
+        digest,
+        reason,
+    }
 }
 
 /// Every approved mention of a gated name. SCP-314 adds the `KeyStateView`
@@ -61,162 +85,305 @@ const ALLOWLIST: &[Allowed] = &[
     allow(
         "crates/scp-did/src/key_state.rs",
         "struct KeyState",
+        "743e334d26e0beee3f4270e5d58de29275372989ba76e9691630755250d31fdb",
         "the defining item",
     ),
     allow(
         "crates/scp-did/src/lib.rs",
         "use",
+        "9b8936562f990fc43692603c503829233d671b00163ceeea069e2699c720665d",
         "re-exports the type from its defining crate; takes no input",
     ),
     allow(
         "crates/scp-kel/src/error.rs",
         "enum BodyField",
+        "2832d73c7f86b5473b1b50eb7121153d95fcc5f4db256647a1376ffe86dbcd7d",
         "enum variant `EventKind::KeyState` / `BodyField::KeyState`, not the type",
     ),
     allow(
         "crates/scp-kel/src/error.rs",
         "impl Display for BodyField",
+        "caa28ed21d281fd2fc3fae48cb4646196b2b9744ec59ab9a482873553c1ecd51",
         "enum variant `EventKind::KeyState` / `BodyField::KeyState`, not the type",
     ),
     allow(
         "crates/scp-kel/src/event.rs",
         "use",
+        "16b57a840e48c572d0e10f7a60af23f8beab1dd2d9502b3c6eb44631fd5c8fb5",
         "imports the type for `KeyStateSnapshot::into_key_state`; takes no input",
     ),
     allow(
         "crates/scp-kel/src/event.rs",
         "enum EventKind",
+        "42a0d1ee94b1d10f2c430a017a01ea79ce896e4214c59c6c485754f799bb69b3",
         "enum variant `EventKind::KeyState` / `BodyField::KeyState`, not the type",
     ),
     allow(
         "crates/scp-kel/src/event.rs",
         "impl EventKind",
+        "5e3fc9f677a90072cfad7d42fc5857708ac0f395eddade73497aa0c756f87265",
         "enum variant `EventKind::KeyState` / `BodyField::KeyState`, not the type",
     ),
     allow(
         "crates/scp-kel/src/event.rs",
         "fn signer_group_roles",
+        "b02ad78561fa64637ee0b3820e2b3ad138a6096c2d82ae55b2f00a58600bc268",
         "enum variant `EventKind::KeyState` / `BodyField::KeyState`, not the type",
     ),
     allow(
         "crates/scp-kel/src/event.rs",
         "impl KeyStateSnapshot",
+        "0b68a33a6261f26cf41b483e3c71aaf3c10b7895ad00a920f1add752f4d4087b",
         "`into_key_state` is `pub(crate)` and returns a `KeyState`; only `replay` and `key_state_at` call it, each on a `ValidatedChain`",
     ),
     allow(
         "crates/scp-kel/src/event.rs",
         "impl EventPreimage",
+        "0500d170271b494448847066af1a14d8beaaa6102aa02461252e8c9da0f794a6",
         "enum variant `EventKind::KeyState` / `BodyField::KeyState`, not the type",
     ),
     allow(
         "crates/scp-kel/src/lib.rs",
         "use",
+        "68aa79f0477f3b7088a1156549ba45463595c641a277b89f2ec79cb922a0f0cd",
         "re-exports `ReplayedState` from its defining crate; takes no input",
     ),
     allow(
         "crates/scp-kel/src/preimage.rs",
         "fn kind_byte",
+        "0252f70a616a6a15ac35780fa4ff5158f15f321f9a3641c5cf7464804b6d89c5",
         "enum variant `EventKind::KeyState` / `BodyField::KeyState`, not the type",
     ),
     allow(
         "crates/scp-kel/src/preimage.rs",
         "fn kind_from_byte",
+        "c83f25f45c7f76cbb4ecebe5a790f6c7ba822fb89cecb315522c033ef1cd8867",
         "enum variant `EventKind::KeyState` / `BodyField::KeyState`, not the type",
     ),
     allow(
         "crates/scp-kel/src/preimage.rs",
         "impl EncodedPreimage",
+        "3224c719a1d6682fca9da22d71df58f387ea57c06b59782df23a52f7a3b149fd",
         "enum variant `EventKind::KeyState` / `BodyField::KeyState`, not the type",
     ),
     allow(
         "crates/scp-kel/src/preimage.rs",
         "fn read_snapshot",
+        "a435f895158819499868574e82192bc77f25b93c024e0b13d54799d778836488",
         "enum variant `EventKind::KeyState` / `BodyField::KeyState`, not the type",
     ),
     allow(
         "crates/scp-kel/src/preimage.rs",
         "fn read_key_entry",
+        "c8fd2f49f7ac9a6387d4cd6f8bdb24f9784b367ae3f1aa0fb76118c3d97db356",
         "enum variant `EventKind::KeyState` / `BodyField::KeyState`, not the type",
     ),
     allow(
         "crates/scp-kel/src/validate/content.rs",
         "fn check_sentinels",
+        "7611bc6798af661e56f249f77e6c4b1353f22bff93838fd5e93c158654d3364b",
         "enum variant `EventKind::KeyState` / `BodyField::KeyState`, not the type",
     ),
     allow(
         "crates/scp-kel/src/validate/content.rs",
         "fn check_continuation_present",
+        "39ab64fdd6aefc3f2674fd9080736533323881f1f68bb4bf6d2da10a72420656",
         "enum variant `EventKind::KeyState` / `BodyField::KeyState`, not the type",
     ),
     allow(
         "crates/scp-kel/src/validate/replay.rs",
         "use",
+        "256a1c84308c59bd8b5a080c07a8bfda5cb0d1341b6802c47da0d0d42e31332d",
         "imports the type `ReplayedState` holds; takes no input",
     ),
     allow(
         "crates/scp-kel/src/validate/replay.rs",
         "struct ReplayedState",
+        "7b177092f52185801eec1b12cdeb38b3fb67fc729b4005b08c6ee453b3430ad4",
         "the defining item; private fields, no public constructor",
     ),
     allow(
         "crates/scp-kel/src/validate/replay.rs",
         "impl ReplayedState",
+        "b4f80586750c314d92a1d6c414c7122d18a93b01b06554afd9d77f0d175912be",
         "the defining impl; its accessors return state a `ValidatedChain` derived and take none in",
     ),
     allow(
         "crates/scp-kel/src/validate/replay.rs",
         "fn replay",
+        "d8f622da831f609e11b7b1646e6b1075e8ccc0cffcb2f7fa51ed4dcad7295f3a",
         "returns a `ReplayedState` derived from the `ValidatedChain` it takes",
     ),
     allow(
         "crates/scp-kel/src/validate/replay.rs",
         "fn key_state_at",
+        "28654554755f1b3310a595653906946d7fb1935c33a59366dc6f908a303e90e5",
         "returns a `ReplayedState` derived from the `ValidatedChain` it takes",
     ),
     allow(
         "crates/scp-kel/src/validate.rs",
         "use",
+        "66645f316914f66e17d49757e627292a829496ad36ba2cb9a12636319ab84e65",
         "re-exports `ReplayedState` within its defining crate; takes no input",
     ),
     allow(
         "crates/scp-kel/src/verdict.rs",
         "use",
-        "imports the types `ResolvedState` wraps and returns; takes no input",
+        "1baa861338f8f15797c5f69094b3594fee9c4a63ca75560ed88dfe18e2c7fcd5",
+        "imports `KeyState`, the type `ResolvedState::key_state` returns; takes no input",
+    ),
+    allow(
+        "crates/scp-kel/src/verdict.rs",
+        "use",
+        "76b0a6cb5c39ca77194315eecc83a612b259e58716e8ea483fcb811d6687cdf9",
+        "imports `ReplayedState`, the type `ResolvedState` holds; takes no input",
     ),
     allow(
         "crates/scp-kel/src/verdict.rs",
         "struct ResolvedState",
+        "27f11d950be95e2e0a0356fdb1133bdb04926d5dc7fcede76eb82543e0fb76f1",
         "holds the replayed state of the chain resolution accepted, in a private field",
     ),
     allow(
         "crates/scp-kel/src/verdict.rs",
         "impl ResolvedState",
+        "7e28a093730f2175ac738acf5d34376aeee5a997b57d10d215eb9bcbea330938",
         "`key_state` returns the state of the chain resolution accepted; takes none in",
     ),
     allow(
         "crates/scp-protocol/src/crypto/key_continuity.rs",
         "use",
+        "51aaff0f7442c8b0595a51f675bfb6dbe85a252b496e5d4700212671d838a81f",
         "imports `ReplayedState` for the fingerprint; takes no input",
     ),
     allow(
         "crates/scp-protocol/src/crypto/key_continuity.rs",
         "impl PartyBlock",
+        "e685171a8fd9b5cd12f1783e07a700a1fc6eff5de28728699da56edf0b1e50cc",
         "private block builder over a `ReplayedState` for the §9.11 fingerprint, a display value that gates nothing",
     ),
     allow(
         "crates/scp-protocol/src/crypto/key_continuity.rs",
         "fn compute_key_continuity_fingerprint",
+        "1a30d320845207027b708b801b358682b41ceda93595ede93ec13e5feefaa06a",
         "§9.11 fingerprint, a display value that gates nothing; it reads `ReplayedState` because one party is the device's own adopted log",
+    ),
+    allow(
+        "crates/scp-alloc/src/lib.rs",
+        "#![..]: include_str!(../README.md) reads no scanned file",
+        "f25814d5d88ea602295dc6aef4ae45851273d48d4c003b677f4335e7512dbd12",
+        "the crate's rustdoc text from `README.md`; `include_str!` yields a string literal, never tokens",
+    ),
+    allow(
+        "crates/scp-clock/src/lib.rs",
+        "#![..]: include_str!(../README.md) reads no scanned file",
+        "1a6c0ac7edad41f6626f09fc35e98e73795a71fbcd1d0a2924fdea592f7bc067",
+        "the crate's rustdoc text from `README.md`; `include_str!` yields a string literal, never tokens",
+    ),
+    allow(
+        "crates/scp-crypto/src/lib.rs",
+        "#![..]: include_str!(../README.md) reads no scanned file",
+        "3da064777ddc1753ff33f186c449bfc9b8f3e9de9c5354c8e54fc5a59dc72656",
+        "the crate's rustdoc text from `README.md`; `include_str!` yields a string literal, never tokens",
+    ),
+    allow(
+        "crates/scp-did/src/lib.rs",
+        "#![..]: include_str!(../README.md) reads no scanned file",
+        "e3f76a97793df37d9a5adb468f75a9027910f3dc4cb2a83cf74d4e49d8fe8a94",
+        "the crate's rustdoc text from `README.md`; `include_str!` yields a string literal, never tokens",
+    ),
+    allow(
+        "crates/scp-event-log/src/lib.rs",
+        "#![..]: include_str!(../README.md) reads no scanned file",
+        "8f75520ef198545f3d235d10e286a624232248944951fb2f9f0616effdc52ce3",
+        "the crate's rustdoc text from `README.md`; `include_str!` yields a string literal, never tokens",
+    ),
+    allow(
+        "crates/scp-identity/src/lib.rs",
+        "#![..]: include_str!(../README.md) reads no scanned file",
+        "03ea0f5bba2c445c30af1a02a14fbcdd8bff561323b3cab38d8bcac77b6d35f8",
+        "the crate's rustdoc text from `README.md`; `include_str!` yields a string literal, never tokens",
+    ),
+    allow(
+        "crates/scp-kel/src/lib.rs",
+        "#![..]: include_str!(../README.md) reads no scanned file",
+        "637535730a2605112d62c05468bfbb16c7aa8977a19ca3d10727d678cf682841",
+        "the crate's rustdoc text from `README.md`; `include_str!` yields a string literal, never tokens",
+    ),
+    allow(
+        "crates/scp-mcp/src/lib.rs",
+        "#![..]: include_str!(../README.md) reads no scanned file",
+        "a151153288c495fea8e3410191f3793344503b16358cd927fe1fa85070883163",
+        "the crate's rustdoc text from `README.md`; `include_str!` yields a string literal, never tokens",
+    ),
+    allow(
+        "crates/scp-media/src/lib.rs",
+        "#![..]: include_str!(../README.md) reads no scanned file",
+        "6f152a16d2fbc3770865b9409ec11da56984d3f9b2c5f79d0394a16afd6e4ad2",
+        "the crate's rustdoc text from `README.md`; `include_str!` yields a string literal, never tokens",
+    ),
+    allow(
+        "crates/scp-node/src/lib.rs",
+        "#![..]: include_str!(../README.md) reads no scanned file",
+        "e6e68e8c9b4e559dd4ae0a606852363725b8124750dda3550baab0bfa3129d86",
+        "the crate's rustdoc text from `README.md`; `include_str!` yields a string literal, never tokens",
+    ),
+    allow(
+        "crates/scp-node/src/self_host.rs",
+        "const EMBEDDED_INDEX_HTML: include_str!(../assets/selfhost/index.html) reads no scanned file",
+        "6db4a070444a2f8927fa6467024a11a5a531f41bad9edcf238b1ac969516576f",
+        "a self-hosted page asset served as bytes; `include_str!` yields a string literal, never tokens",
+    ),
+    allow(
+        "crates/scp-node/src/self_host.rs",
+        "const EMBEDDED_STYLE_CSS: include_str!(../assets/selfhost/style.css) reads no scanned file",
+        "6fc3cc95695d78ec3d393181bde47728e2883d195fc9a8479706e6621e3c1bc1",
+        "a self-hosted page asset served as bytes; `include_str!` yields a string literal, never tokens",
+    ),
+    allow(
+        "crates/scp-node/src/self_host.rs",
+        "const EMBEDDED_APP_JS: include_str!(../assets/selfhost/app.js) reads no scanned file",
+        "0a0bc1914b1a87e4165512499d072ca1cbed040c60a529530e4cc861d17c552c",
+        "a self-hosted page asset served as bytes; `include_str!` yields a string literal, never tokens",
+    ),
+    allow(
+        "crates/scp-platform/src/lib.rs",
+        "#![..]: include_str!(../README.md) reads no scanned file",
+        "d26f1b45b033f8f8685aa1932f2b66c7443e4e49e0613a11705ad1e25f726d8a",
+        "the crate's rustdoc text from `README.md`; `include_str!` yields a string literal, never tokens",
+    ),
+    allow(
+        "crates/scp-relay/src/main.rs",
+        "#![..]: include_str!(../README.md) reads no scanned file",
+        "9bf53b799220d705b1a09e6343667ad8c530c9f2f8a90cb25a5229d1df4cac2b",
+        "the crate's rustdoc text from `README.md`; `include_str!` yields a string literal, never tokens",
+    ),
+    allow(
+        "crates/scp-runtime/src/lib.rs",
+        "#![..]: include_str!(../README.md) reads no scanned file",
+        "6f02601a3552a129290a14d9bb9068dc2d83bec9570210a75afed9aeafa2ced7",
+        "the crate's rustdoc text from `README.md`; `include_str!` yields a string literal, never tokens",
+    ),
+    allow(
+        "crates/scp-transport/src/lib.rs",
+        "#![..]: include_str!(../README.md) reads no scanned file",
+        "b5b271c213c6abd07fb29d6e2647f6e0e18028ee415aea3931e0de1699148e84",
+        "the crate's rustdoc text from `README.md`; `include_str!` yields a string literal, never tokens",
     ),
 ];
 
-/// A top-level item whose tokens name a gated type.
+/// A top-level item whose tokens name a gated type, or a hole the scan cannot
+/// see through: a module declaration or `include!` that loads no scanned file.
 #[derive(Debug)]
 struct Mention {
     path: String,
     item: String,
+    digest: String,
     /// Index into [`ALLOWLIST`] of the entry that approves it.
     allowed_by: Option<usize>,
+    /// Index of an entry with this path and label but another digest: the
+    /// approved item changed, or a second item shares its label.
+    changed_from: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -239,11 +406,19 @@ impl Scan {
     }
 }
 
+/// An identifier's name with any `r#` prefix removed, so `r#KeyState` names
+/// `KeyState`.
+fn ident_name(i: &proc_macro2::Ident) -> String {
+    let s = i.to_string();
+    s.strip_prefix("r#")
+        .map_or_else(|| s.clone(), str::to_owned)
+}
+
 /// Every identifier in `tokens`, at any depth.
 fn idents(tokens: TokenStream, out: &mut Vec<String>) {
     for t in tokens {
         match t {
-            TokenTree::Ident(i) => out.push(i.to_string()),
+            TokenTree::Ident(i) => out.push(ident_name(&i)),
             TokenTree::Group(g) => idents(g.stream(), out),
             TokenTree::Punct(_) | TokenTree::Literal(_) => {}
         }
@@ -308,13 +483,16 @@ struct Aliases(Vec<(String, TokenStream)>);
 
 impl<'ast> Visit<'ast> for Aliases {
     fn visit_item_type(&mut self, t: &'ast syn::ItemType) {
-        self.0.push((t.ident.to_string(), t.ty.to_token_stream()));
+        self.0.push((ident_name(&t.ident), t.ty.to_token_stream()));
         syn::visit::visit_item_type(self, t);
     }
 
     fn visit_use_rename(&mut self, r: &'ast syn::UseRename) {
-        self.0
-            .push((r.rename.to_string(), r.ident.to_token_stream()));
+        // `use .. as _` binds no name.
+        if r.rename != "_" {
+            self.0
+                .push((ident_name(&r.rename), r.ident.to_token_stream()));
+        }
     }
 }
 
@@ -385,64 +563,164 @@ fn normalize(path: &str) -> String {
     parts.join("/")
 }
 
-/// The file a `mod ident;` declared in `decl` loads, if it was scanned. A file
-/// loaded through `#[path]`, a crate root, or a `mod.rs` keeps its children in
-/// its own directory; any other file keeps them in the directory named by its
-/// stem.
-fn module_file(
-    decl: &str,
-    path_loaded: &BTreeSet<String>,
-    m: &syn::ItemMod,
-    scanned: &BTreeSet<&str>,
-) -> Option<String> {
-    let (dir, name) = decl.rsplit_once('/').unwrap_or(("", decl));
-    let path_attr = m.attrs.iter().find_map(|a| match &a.meta {
-        syn::Meta::NameValue(nv) if nv.path.is_ident("path") => match &nv.value {
-            syn::Expr::Lit(syn::ExprLit {
-                lit: syn::Lit::Str(s),
-                ..
-            }) => Some(s.value()),
-            _ => None,
-        },
-        _ => None,
-    });
-    if let Some(p) = path_attr {
-        let file = normalize(&format!("{dir}/{p}"));
-        return scanned.contains(file.as_str()).then_some(file);
-    }
-    let mod_rs = matches!(name, "mod.rs" | "lib.rs" | "main.rs")
-        || dir.ends_with("src/bin")
-        || path_loaded.contains(decl);
-    let base = if mod_rs {
-        dir.to_owned()
-    } else {
-        format!("{dir}/{}", name.trim_end_matches(".rs"))
-    };
-    [
-        format!("{base}/{}.rs", m.ident),
-        format!("{base}/{}/mod.rs", m.ident),
-    ]
-    .into_iter()
-    .find(|f| scanned.contains(f.as_str()))
+/// When a `#[path]` applies: always, only in a test build (`cfg_attr(test,
+/// path = ..)`), or under a predicate the gate does not evaluate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Applies {
+    Always,
+    TestBuild,
+    Unknown,
 }
 
-/// Every scanned file compiled only under exactly `#[cfg(test)]`: a file with
-/// an inner `#![cfg(test)]`, the file a `#[cfg(test)] mod x;` loads, and every
-/// file a module declared in one of those loads. A declaration the walk cannot
-/// resolve leaves its file in scope, so the gate over-counts and never hides.
-fn test_only_files(files: &[(String, syn::File)]) -> BTreeSet<String> {
-    let scanned: BTreeSet<&str> = files.iter().map(|(r, _)| r.as_str()).collect();
-    let mut path_loaded = BTreeSet::new();
-    for (rel, file) in files {
-        for item in &file.items {
-            if let syn::Item::Mod(m) = item
-                && m.content.is_none()
-                && m.attrs.iter().any(|a| a.path().is_ident("path"))
-            {
-                path_loaded.extend(module_file(rel, &BTreeSet::new(), m, &scanned));
+fn str_lit(e: &syn::Expr) -> Option<String> {
+    match e {
+        syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Str(s),
+            ..
+        }) => Some(s.value()),
+        _ => None,
+    }
+}
+
+/// Every `#[path = ..]` and `#[cfg_attr(pred, path = ..)]` on a declaration.
+fn path_attrs(m: &syn::ItemMod) -> Vec<(Applies, String)> {
+    let mut out = Vec::new();
+    for a in &m.attrs {
+        match &a.meta {
+            syn::Meta::NameValue(nv) if nv.path.is_ident("path") => {
+                out.extend(str_lit(&nv.value).map(|p| (Applies::Always, p)));
+            }
+            syn::Meta::List(l) if l.path.is_ident("cfg_attr") => {
+                let Ok(metas) = l.parse_args_with(
+                    syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+                ) else {
+                    continue;
+                };
+                let mut metas = metas.into_iter();
+                let applies = match metas.next() {
+                    Some(syn::Meta::Path(pred)) if pred.is_ident("test") => Applies::TestBuild,
+                    _ => Applies::Unknown,
+                };
+                for meta in metas {
+                    if let syn::Meta::NameValue(nv) = meta
+                        && nv.path.is_ident("path")
+                    {
+                        out.extend(str_lit(&nv.value).map(|p| (applies, p)));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The files a `mod` declaration in `from` loads in one build, each as its
+/// alternatives (the first scanned one wins). A file loaded through `#[path]`,
+/// a crate root, or a `mod.rs` keeps its children in its own directory; any
+/// other file keeps them in the directory named by its stem. A `#[path]` under
+/// a predicate the gate does not evaluate adds its file beside the default.
+fn decl_targets(from: &str, m: &syn::ItemMod, mod_rs: bool, test_build: bool) -> Vec<Vec<String>> {
+    let (dir, name) = from.rsplit_once('/').unwrap_or(("", from));
+    let mut out = Vec::new();
+    let mut default = true;
+    for (applies, p) in path_attrs(m) {
+        let file = vec![normalize(&format!("{dir}/{p}"))];
+        match applies {
+            Applies::Always => {
+                out.push(file);
+                default = false;
+            }
+            Applies::TestBuild if test_build => {
+                out.push(file);
+                default = false;
+            }
+            Applies::TestBuild => {}
+            Applies::Unknown => out.push(file),
+        }
+    }
+    if default {
+        let base = if mod_rs {
+            dir.to_owned()
+        } else {
+            format!("{dir}/{}", name.trim_end_matches(".rs"))
+        };
+        out.push(vec![
+            format!("{base}/{}.rs", m.ident),
+            format!("{base}/{}/mod.rs", m.ident),
+        ]);
+    }
+    out
+}
+
+/// One file a `mod x;` declaration loads in one build.
+#[derive(Debug)]
+struct Load {
+    from: String,
+    label: String,
+    /// The build it loads in: a `#[cfg(test)]` declaration loads only in a
+    /// test build, any other in both.
+    test_build: bool,
+    candidates: Vec<String>,
+    /// The scanned file among `candidates`, if any.
+    target: Option<String>,
+}
+
+/// Every load of every top-level `mod x;` declaration in `files`.
+fn loads(files: &[(String, syn::File)]) -> Vec<Load> {
+    let known: BTreeSet<&str> = files.iter().map(|(r, _)| r.as_str()).collect();
+    let decls: Vec<(&str, &syn::ItemMod)> = files
+        .iter()
+        .flat_map(|(r, f)| {
+            f.items.iter().filter_map(move |i| match i {
+                syn::Item::Mod(m) if m.content.is_none() => Some((r.as_str(), m)),
+                _ => None,
+            })
+        })
+        .collect();
+    let path_loaded: BTreeSet<String> = decls
+        .iter()
+        .flat_map(|(from, m)| {
+            let dir = from.rsplit_once('/').map_or("", |(d, _)| d);
+            path_attrs(m)
+                .into_iter()
+                .map(move |(_, p)| normalize(&format!("{dir}/{p}")))
+        })
+        .collect();
+    let mut out = Vec::new();
+    for (from, m) in decls {
+        let (dir, name) = from.rsplit_once('/').unwrap_or(("", from));
+        let mod_rs = matches!(name, "mod.rs" | "lib.rs" | "main.rs")
+            || dir.ends_with("src/bin")
+            || path_loaded.contains(from);
+        let cfg_test = m.attrs.iter().any(is_cfg_test);
+        for test_build in [false, true] {
+            if cfg_test && !test_build {
+                continue;
+            }
+            for candidates in decl_targets(from, m, mod_rs, test_build) {
+                let target = candidates
+                    .iter()
+                    .find(|c| known.contains(c.as_str()))
+                    .cloned();
+                out.push(Load {
+                    from: from.to_owned(),
+                    label: format!("mod {}", m.ident),
+                    test_build,
+                    candidates,
+                    target,
+                });
             }
         }
     }
+    out
+}
+
+/// Every scanned file compiled only under exactly `#[cfg(test)]`: a file with
+/// an inner `#![cfg(test)]`, or a file some declaration loads where every
+/// declaration loading it in a non-test build sits in such a file. A file a
+/// non-test declaration loads, and a file nothing loads, stays in scope.
+fn test_only_files(files: &[(String, syn::File)], loads: &[Load]) -> BTreeSet<String> {
     let mut test_only: BTreeSet<String> = files
         .iter()
         .filter(|(_, f)| f.attrs.iter().any(is_cfg_test))
@@ -450,13 +728,16 @@ fn test_only_files(files: &[(String, syn::File)]) -> BTreeSet<String> {
         .collect();
     loop {
         let before = test_only.len();
-        for (rel, file) in files {
-            let whole = test_only.contains(rel);
-            for item in &file.items {
-                let syn::Item::Mod(m) = item else { continue };
-                if m.content.is_none() && (whole || test_only_item(item)) {
-                    test_only.extend(module_file(rel, &path_loaded, m, &scanned));
-                }
+        for (rel, _) in files {
+            if test_only.contains(rel) {
+                continue;
+            }
+            let mut into = loads
+                .iter()
+                .filter(|l| l.target.as_ref() == Some(rel))
+                .peekable();
+            if into.peek().is_some() && into.all(|l| l.test_build || test_only.contains(&l.from)) {
+                test_only.insert(rel.clone());
             }
         }
         if test_only.len() == before {
@@ -465,14 +746,82 @@ fn test_only_files(files: &[(String, syn::File)]) -> BTreeSet<String> {
     }
 }
 
+/// Every `include!` or `include_str!` in `tokens`, with its argument when that
+/// is one string literal.
+fn includes(tokens: TokenStream, out: &mut Vec<(String, Option<String>)>) {
+    let tokens: Vec<TokenTree> = tokens.into_iter().collect();
+    for (i, t) in tokens.iter().enumerate() {
+        match t {
+            TokenTree::Group(g) => includes(g.stream(), out),
+            TokenTree::Ident(id)
+                if matches!(ident_name(id).as_str(), "include" | "include_str") =>
+            {
+                if let (Some(TokenTree::Punct(bang)), Some(TokenTree::Group(args))) =
+                    (tokens.get(i + 1), tokens.get(i + 2))
+                    && bang.as_char() == '!'
+                {
+                    let arg = syn::parse2::<syn::LitStr>(args.stream())
+                        .ok()
+                        .map(|l| l.value());
+                    out.push((ident_name(id), arg));
+                }
+            }
+            TokenTree::Ident(_) | TokenTree::Punct(_) | TokenTree::Literal(_) => {}
+        }
+    }
+}
+
+/// The SHA-256 of an item's token stream, as lowercase hex.
+fn digest(tokens: &TokenStream) -> String {
+    use sha2::Digest as _;
+    hex::encode(sha2::Sha256::digest(tokens.to_string().as_bytes()))
+}
+
+impl Scan {
+    fn push(&mut self, path: &str, item: String, tokens: &TokenStream) {
+        let digest = digest(tokens);
+        let same_label = |a: &&Allowed| a.path == path && a.item == item;
+        let allowed_by = ALLOWLIST
+            .iter()
+            .position(|a| same_label(&a) && a.digest == digest);
+        let changed_from = match allowed_by {
+            Some(i) => {
+                self.approved[i] += 1;
+                None
+            }
+            None => ALLOWLIST.iter().position(|a| same_label(&a)),
+        };
+        self.mentions.push(Mention {
+            path: path.to_owned(),
+            item,
+            digest,
+            allowed_by,
+            changed_from,
+        });
+    }
+}
+
 fn scan(files: &[(String, syn::File)]) -> Scan {
     let names = gated_names(files);
-    let test_only = test_only_files(files);
+    let loads = loads(files);
+    let test_only = test_only_files(files, &loads);
+    let known: BTreeSet<&str> = files.iter().map(|(r, _)| r.as_str()).collect();
     let mut out = Scan {
         mentions: Vec::new(),
         approved: vec![0; ALLOWLIST.len()],
     };
+    for l in &loads {
+        if l.target.is_none() && !l.test_build && !test_only.contains(&l.from) {
+            let item = format!(
+                "{}: loads no scanned file ({})",
+                l.label,
+                l.candidates.join(" | ")
+            );
+            out.push(&l.from, item, &TokenStream::new());
+        }
+    }
     for (rel, file) in files.iter().filter(|(r, _)| !test_only.contains(r)) {
+        let dir = rel.rsplit_once('/').map_or("", |(d, _)| d);
         let inner: TokenStream = file.attrs.iter().map(ToTokens::to_token_stream).collect();
         let items = file
             .items
@@ -480,20 +829,22 @@ fn scan(files: &[(String, syn::File)]) -> Scan {
             .filter(|i| !test_only_item(i))
             .map(|i| (item_label(i), i.to_token_stream()));
         for (item, tokens) in std::iter::once(("#![..]".to_owned(), inner)).chain(items) {
-            if !names_any(tokens, &names) {
-                continue;
+            let mut incl = Vec::new();
+            includes(tokens.clone(), &mut incl);
+            for (mac, arg) in incl {
+                let target = arg.as_ref().map(|a| normalize(&format!("{dir}/{a}")));
+                if target.as_deref().is_none_or(|t| !known.contains(t)) {
+                    let what = arg.unwrap_or_else(|| "<computed path>".to_owned());
+                    out.push(
+                        rel,
+                        format!("{item}: {mac}!({what}) reads no scanned file"),
+                        &tokens,
+                    );
+                }
             }
-            let allowed_by = ALLOWLIST
-                .iter()
-                .position(|a| a.path == rel && a.item == item);
-            if let Some(i) = allowed_by {
-                out.approved[i] += 1;
+            if names_any(tokens.clone(), &names) {
+                out.push(rel, item, &tokens);
             }
-            out.mentions.push(Mention {
-                path: rel.clone(),
-                item,
-                allowed_by,
-            });
         }
     }
     out
@@ -542,28 +893,47 @@ fn source_roots(root: &Path) -> Vec<PathBuf> {
     roots
 }
 
+fn read_parse(root: &Path, rel: &str) -> (String, syn::File) {
+    let src = std::fs::read_to_string(root.join(rel))
+        .unwrap_or_else(|e| panic!("{rel} is not readable: {e}"));
+    let file = syn::parse_file(&src).unwrap_or_else(|e| panic!("{rel} does not parse: {e}"));
+    (rel.to_owned(), file)
+}
+
+/// Every Rust file under the source roots, plus every file a module
+/// declaration reaches outside them (through `#[path]`, or as a child of such
+/// a file), read until no declaration reaches an unread file on disk.
 fn workspace_files() -> Vec<(String, syn::File)> {
     let root = workspace_root();
     let mut paths = Vec::new();
     for src in source_roots(&root) {
         rust_files(&src, &mut paths);
     }
-    paths.sort();
-    paths
-        .into_iter()
+    let mut files: Vec<_> = paths
+        .iter()
         .map(|p| {
             let rel = p
                 .strip_prefix(&root)
                 .expect("source sits under the workspace root")
                 .to_string_lossy()
                 .replace('\\', "/");
-            let src = std::fs::read_to_string(&p)
-                .unwrap_or_else(|e| panic!("{rel} is not readable: {e}"));
-            let file =
-                syn::parse_file(&src).unwrap_or_else(|e| panic!("{rel} does not parse: {e}"));
-            (rel, file)
+            read_parse(&root, &rel)
         })
-        .collect()
+        .collect();
+    loop {
+        let mut reached: Vec<String> = loads(&files)
+            .into_iter()
+            .filter(|l| l.target.is_none())
+            .filter_map(|l| l.candidates.into_iter().find(|c| root.join(c).is_file()))
+            .collect();
+        reached.sort();
+        reached.dedup();
+        if reached.is_empty() {
+            files.sort_by(|a, b| a.0.cmp(&b.0));
+            return files;
+        }
+        files.extend(reached.iter().map(|r| read_parse(&root, r)));
+    }
 }
 
 const OTHER: &str = "crates/scp-other/src/lib.rs";
@@ -660,6 +1030,23 @@ const FIXTURES: &[(&str, usize)] = &[
         0,
     ),
     ("pub fn f(k: &KeyStates, s: KeyStateSnapshot) {}", 0),
+    // A raw identifier names the type it spells.
+    ("pub fn f(k: scp_did::r#KeyState) {}", 1),
+    ("type r#K = KeyState; pub fn f(k: K) {}", 2),
+    // `use .. as _` binds no name, so `_` elsewhere is no mention.
+    ("use scp_did::KeyState as _; pub fn f() { let _ = 1; }", 1),
+    // A file the scan cannot read is a hole, whatever it holds.
+    ("pub fn f() -> &'static str { include_str!(\"k.json\") }", 1),
+    ("include!(\"gen.rs\");", 1),
+    (
+        "pub fn f() { include!(concat!(env!(\"OUT_DIR\"), \"/k.rs\")); }",
+        1,
+    ),
+    ("pub fn f() { std::include!(\"gen.rs\"); }", 1),
+    ("#[cfg(test)] fn f() { include!(\"gen.rs\"); }", 0),
+    ("mod absent;", 1),
+    ("#[path = \"../elsewhere/absent.rs\"] mod m;", 1),
+    ("#[cfg(test)] mod absent;", 0),
 ];
 
 /// A rename or alias declared in one file reaches a use in another.
@@ -686,77 +1073,140 @@ fn assert_cross_file_aliases() {
     }
 }
 
-/// The file a `#[cfg(test)] mod x;` loads, and every file below it, is out of
-/// scope; a file loaded by any other declaration is in.
+const K: &str = "pub fn f(k: KeyState) {}";
+
+/// Multi-file inputs, each with the number of unapproved mentions: a file is
+/// out of scope only when every declaration loading it in a non-test build is
+/// test-only, and a file reached through `#[path]` or `include!` is scanned.
+const MULTI_FILE_FIXTURES: &[(&[(&str, &str)], usize)] = &[
+    (
+        &[
+            ("crates/x/src/lib.rs", "#[cfg(test)] mod tests;"),
+            ("crates/x/src/tests.rs", K),
+        ],
+        0,
+    ),
+    (
+        &[
+            ("crates/x/src/lib.rs", "#[cfg(test)] mod tests;"),
+            ("crates/x/src/tests/mod.rs", K),
+        ],
+        0,
+    ),
+    (
+        &[
+            ("crates/x/src/lib.rs", "#[cfg(test)] mod tests;"),
+            ("crates/x/src/tests.rs", "mod deep;"),
+            ("crates/x/src/tests/deep.rs", K),
+        ],
+        0,
+    ),
+    (
+        &[
+            ("crates/x/src/a.rs", "#[cfg(test)] mod t;"),
+            ("crates/x/src/a/t.rs", K),
+        ],
+        0,
+    ),
+    (
+        &[
+            (
+                "crates/x/src/a.rs",
+                "#[cfg(test)] #[path = \"a_tests.rs\"] mod t;",
+            ),
+            ("crates/x/src/a_tests.rs", K),
+        ],
+        0,
+    ),
+    (
+        &[
+            ("crates/x/src/lib.rs", "mod tests;"),
+            ("crates/x/src/tests.rs", K),
+        ],
+        1,
+    ),
+    // `a.rs` keeps its children in `a/`, so a sibling `t.rs` is another module.
+    (
+        &[
+            ("crates/x/src/a.rs", "#[cfg(test)] mod t;"),
+            ("crates/x/src/t.rs", K),
+        ],
+        1,
+    ),
+    (
+        &[
+            (
+                "crates/x/src/lib.rs",
+                "#[cfg(any(test, feature = \"testing\"))] mod tests;",
+            ),
+            ("crates/x/src/tests.rs", K),
+        ],
+        1,
+    ),
+    // A file is out only when every declaration loading it is test-only.
+    (
+        &[
+            (
+                "crates/x/src/lib.rs",
+                "#[cfg(test)] pub mod shipped; #[cfg(not(test))] pub mod shipped;",
+            ),
+            ("crates/x/src/shipped.rs", K),
+        ],
+        1,
+    ),
+    (
+        &[
+            (
+                "crates/x/src/lib.rs",
+                "#[cfg(test)] #[path = \"prod.rs\"] mod t; pub mod prod;",
+            ),
+            ("crates/x/src/prod.rs", K),
+        ],
+        1,
+    ),
+    // `cfg_attr(test, path = ..)` loads `t_impl.rs` only in a test build; a
+    // non-test build loads `t.rs`.
+    (
+        &[
+            (
+                "crates/x/src/lib.rs",
+                "#[cfg_attr(test, path = \"t_impl.rs\")] mod t;",
+            ),
+            ("crates/x/src/t.rs", K),
+            ("crates/x/src/t_impl.rs", K),
+        ],
+        1,
+    ),
+    // A `#[path]` outside `src` is scanned like any other file.
+    (
+        &[
+            (
+                "crates/x/src/lib.rs",
+                "#[path = \"../tests/shared.rs\"] mod shared;",
+            ),
+            ("crates/x/tests/shared.rs", K),
+        ],
+        1,
+    ),
+    // An `include!` of a scanned file is no hole; the file is scanned.
+    (
+        &[
+            ("crates/x/src/lib.rs", "include!(\"gen.rs\");"),
+            ("crates/x/src/gen.rs", "pub fn g() {}"),
+        ],
+        0,
+    ),
+    (
+        &[
+            ("crates/x/src/lib.rs", "include!(\"gen.rs\");"),
+            ("crates/x/src/gen.rs", K),
+        ],
+        1,
+    ),
+];
+
 fn assert_test_only_files() {
-    let k = "pub fn f(k: KeyState) {}";
-    let cases: &[(&[(&str, &str)], usize)] = &[
-        (
-            &[
-                ("crates/x/src/lib.rs", "#[cfg(test)] mod tests;"),
-                ("crates/x/src/tests.rs", k),
-            ],
-            0,
-        ),
-        (
-            &[
-                ("crates/x/src/lib.rs", "#[cfg(test)] mod tests;"),
-                ("crates/x/src/tests/mod.rs", k),
-            ],
-            0,
-        ),
-        (
-            &[
-                ("crates/x/src/lib.rs", "#[cfg(test)] mod tests;"),
-                ("crates/x/src/tests.rs", "mod deep;"),
-                ("crates/x/src/tests/deep.rs", k),
-            ],
-            0,
-        ),
-        (
-            &[
-                ("crates/x/src/a.rs", "#[cfg(test)] mod t;"),
-                ("crates/x/src/a/t.rs", k),
-            ],
-            0,
-        ),
-        (
-            &[
-                (
-                    "crates/x/src/a.rs",
-                    "#[cfg(test)] #[path = \"a_tests.rs\"] mod t;",
-                ),
-                ("crates/x/src/a_tests.rs", k),
-            ],
-            0,
-        ),
-        (
-            &[
-                ("crates/x/src/lib.rs", "mod tests;"),
-                ("crates/x/src/tests.rs", k),
-            ],
-            1,
-        ),
-        // `a.rs` keeps its children in `a/`, so a sibling `t.rs` is another module.
-        (
-            &[
-                ("crates/x/src/a.rs", "#[cfg(test)] mod t;"),
-                ("crates/x/src/t.rs", k),
-            ],
-            1,
-        ),
-        (
-            &[
-                (
-                    "crates/x/src/lib.rs",
-                    "#[cfg(any(test, feature = \"testing\"))] mod tests;",
-                ),
-                ("crates/x/src/tests.rs", k),
-            ],
-            1,
-        ),
-    ];
-    for (srcs, want) in cases {
+    for (srcs, want) in MULTI_FILE_FIXTURES {
         let files: Vec<_> = srcs.iter().map(|(r, s)| parse(r, s)).collect();
         let s = scan(&files);
         assert_eq!(s.unapproved().len(), *want, "{srcs:?}: {:#?}", s.mentions);
@@ -772,30 +1222,61 @@ fn assert_fixtures() {
     assert_test_only_files();
 }
 
-/// An approved item gives no unapproved mention, another item in the same
-/// file does, and an entry whose item is missing reads as stale.
-fn assert_allowlist_semantics() {
-    let entry = ALLOWLIST
+fn real(rel: &str) -> (String, syn::File) {
+    read_parse(&workspace_root(), rel)
+}
+
+fn entry(path: &str, item: &str) -> usize {
+    ALLOWLIST
         .iter()
-        .position(|a| a.path == "crates/scp-kel/src/verdict.rs" && a.item == "impl ResolvedState")
-        .expect("verdict.rs `impl ResolvedState` is approved");
-    let path = ALLOWLIST[entry].path;
-    let s = scan(&[parse(
-        path,
-        "impl ResolvedState { pub const fn key_state(&self) -> &KeyState { todo!() } }",
-    )]);
+        .position(|a| a.path == path && a.item == item)
+        .unwrap_or_else(|| panic!("{path} `{item}` is approved"))
+}
+
+/// A pinned file as it stands gives no unapproved mention; an edit inside an
+/// approved item, or a second item under an approved label, gives one naming
+/// the entry; an entry whose item is gone reads as stale.
+fn assert_allowlist_semantics() {
+    let replay = "crates/scp-kel/src/validate/replay.rs";
+    let s = scan(&[real(replay)]);
     assert_eq!(s.unapproved().len(), 0, "{:#?}", s.mentions);
-    assert_eq!(s.approved[entry], 1);
-    let s = scan(&[parse(
-        path,
-        "impl ResolvedState { pub const fn key_state(&self) -> &KeyState { todo!() } } \
-         pub fn leak(k: KeyState) {}",
-    )]);
-    assert_eq!(s.unapproved().len(), 1, "{:#?}", s.mentions);
-    assert_eq!(s.unapproved()[0].item, "fn leak");
-    let s = scan(&[parse(path, "pub struct ResolvedState { n: u8 }")]);
+    let impl_entry = entry(replay, "impl ReplayedState");
+    assert_eq!(s.approved[impl_entry], 1);
+
+    let (rel, mut file) = real(replay);
+    for item in &mut file.items {
+        if let syn::Item::Impl(i) = item
+            && item_label(&syn::Item::Impl(i.clone())) == "impl ReplayedState"
+        {
+            i.items.push(syn::parse_quote!(
+                pub fn leak(&self) -> KeyState {
+                    self.key_state.clone()
+                }
+            ));
+        }
+    }
+    let s = scan(&[(rel, file)]);
+    let bad = s.unapproved();
+    assert_eq!(bad.len(), 1, "{:#?}", s.mentions);
+    assert_eq!(bad[0].item, "impl ReplayedState");
+    assert_eq!(bad[0].changed_from, Some(impl_entry));
+    assert_eq!(s.approved[impl_entry], 0);
+
+    let verdict = "crates/scp-kel/src/verdict.rs";
+    let (rel, mut file) = real(verdict);
+    file.items.push(syn::parse_quote!(
+        use crate::validate::ReplayedState as Leaked;
+    ));
+    let s = scan(&[(rel, file)]);
+    let bad = s.unapproved();
+    assert_eq!(bad.len(), 1, "{:#?}", s.mentions);
+    assert_eq!(bad[0].item, "use");
+    assert!(bad[0].changed_from.is_some());
+
+    let resolved = entry(verdict, "impl ResolvedState");
+    let s = scan(&[parse(verdict, "pub struct ResolvedState { n: u8 }")]);
     assert_eq!(
-        s.approved[entry], 0,
+        s.approved[resolved], 0,
         "a missing approved item reads as matched"
     );
 }
@@ -815,9 +1296,19 @@ fn key_state_params() {
     let bad = s.unapproved();
     println!("  unapproved mentions: {}", bad.len());
     for m in &bad {
-        println!("  MENTION: {} `{}`", m.path, m.item);
+        println!(
+            "  MENTION: {} `{}` digest {} changed_from {:?}",
+            m.path, m.item, m.digest, m.changed_from
+        );
     }
 
+    // `#[path]` reaches outside `src`, and the loader read the file it names.
+    assert!(
+        files
+            .iter()
+            .any(|(r, _)| r == "crates/scp-kel/tests/kel/fixtures.rs"),
+        "the file `crates/scp-kel/src/rank/tests.rs` loads through `#[path]` was not scanned"
+    );
     assert_fixtures();
     assert_allowlist_semantics();
 
@@ -837,7 +1328,14 @@ fn key_state_params() {
          `ResolvedState` instead (`03-identity.md` §3.10.10), or pin the item in \
          ALLOWLIST with the reason its mention cannot hand such state in:\n{}",
         bad.iter()
-            .map(|m| format!("{} `{}`", m.path, m.item))
+            .map(|m| m.changed_from.map_or_else(
+                || format!("{} `{}` (digest {})", m.path, m.item, m.digest),
+                |i| format!(
+                    "{} `{}` (digest {}): changed since ALLOWLIST[{i}] approved it; re-review \
+                     and pin the new digest",
+                    m.path, m.item, m.digest
+                ),
+            ))
             .collect::<Vec<_>>()
             .join("\n")
     );
