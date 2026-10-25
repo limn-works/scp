@@ -1387,9 +1387,9 @@ pub enum ServiceRecordVerdict {
     /// fields are the payload `09-security-model.md` §9.7.4.2 R14's
     /// `SingleSource` cause carries, written here directly and under no
     /// `InconclusiveCause` discriminator: a service record occupies no
-    /// position on any chain, so `MissingEvents`'s sequence range and
-    /// `CopyDefect`'s `at_event` have no referent in this read and an
-    /// exhaustive match would handle two arms no rule can reach.
+    /// position on any chain, so `MissingEvents`'s sequence range has no
+    /// referent in this read and an exhaustive match would handle an arm
+    /// no rule can reach.
     Inconclusive {
         reached_sources: u32,
         proven_sources: u32,
@@ -1420,7 +1420,7 @@ pub enum ServiceRecordRejection {
 }
 ```
 
-**This section declares `ResolutionVerdict`, `InconclusiveCause`, `TieClass` and `SequenceRange`, each field carrying a type, and `09-security-model.md` §9.7.4.2 R14 states the rule that selects a verdict and declares no type.** A head is named by its 32-byte preimage digest and a position by its sequence, so `at_event` and `fork_position` are sequences and `head`, `heads`, `shared_prefix_head` and `accepted_head` are digests.
+**This section declares `ResolutionVerdict`, `InconclusiveCause`, `TieClass` and `SequenceRange`, each field carrying a type, and `09-security-model.md` §9.7.4.2 R14 states the rule that selects a verdict and declares no type.** A head is named by its 32-byte preimage digest and a position by its sequence, so `fork_position` is a sequence and `head`, `heads`, `shared_prefix_head` and `accepted_head` are digests.
 
 ```rust
 /// The six verdicts a resolution returns (`09-security-model.md` §9.7.4.2
@@ -1457,8 +1457,6 @@ pub enum InconclusiveCause {
     /// `failed_sources` holds the relay URLs that failed to serve, and it is
     /// empty where R9's fetch bound stopped the verifier itself.
     MissingEvents { range: SequenceRange, failed_sources: Vec<String> },
-    /// A copy-level defect sits at this sequence.
-    CopyDefect { at_event: u64 },
     /// The resolution did not meet R11's first-contact floor.
     SingleSource {
         reached_sources: u32,
