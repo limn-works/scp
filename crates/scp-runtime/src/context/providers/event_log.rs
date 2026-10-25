@@ -10,14 +10,24 @@
 //!
 //! # Persistence
 //!
-//! When constructed with [`MerkleEventLogProvider::with_persistence`], the
-//! provider persists [`scp_event_log::Event`] values to an
-//! [`EventLogPersistence`] backend after each append operation and loads them
-//! during [`restore_event_log`](MerkleEventLogProvider::restore_event_log).
-//! This ensures events survive process restarts. An append persists one unit
-//! (O(1) per append); bulk operations (init, prune, import) replace the whole
-//! stored log in one commit. A per-context write gate serializes the writes to
-//! one context, so storage receives them in the order memory applied them.
+//! Production builds the provider with
+//! [`MerkleEventLogProvider::with_persistence`]; [`MerkleEventLogProvider::new`],
+//! which keeps the log only in memory, exists for tests (spec section 17.17).
+//! The provider persists [`scp_event_log::Event`] values to an
+//! [`EventLogPersistence`] backend and loads them during
+//! [`restore_event_log`](MerkleEventLogProvider::restore_event_log), so events
+//! survive process restarts. An append persists one unit (O(1) per append);
+//! bulk operations (init, prune, import) replace the whole stored log in one
+//! commit. A per-context write gate serializes the writes to one context, so
+//! storage receives them in the order memory applied them.
+//!
+//! Spec section 17.3, "Event log write failures": a write that comes before
+//! its side effect (init, import, prune, destroy, and a fail-closed append)
+//! stores first and changes memory only after the store succeeded, and
+//! returns the store's error. An append after its side effect
+//! ([`ContextEventLogProvider::append_event_after_side_effect`]) changes
+//! memory first, since the side effect already happened, and its failed store
+//! marks the stored log diverged so the next write replaces it whole.
 //!
 //! # Integrity model
 //!
@@ -83,19 +93,18 @@ impl ContextLog {
         }
     }
 
-    /// Appends a new typed event, computing the sequence + `prev_hash` chain
-    /// link and delegating to [`scp_event_log::tree::append_unsigned_event`].
-    ///
-    /// The event carries an empty signature, and sequence/`prev_hash` are
-    /// derived from the current log state so `append_unsigned_event`'s
-    /// validation always passes.
-    fn append(
-        &mut self,
+    /// Builds the next typed event without changing the log: the sequence and
+    /// `prev_hash` chain link come from the current log state, so
+    /// [`Self::commit`] of the result passes `append_unsigned_event`'s
+    /// validation while the log is unchanged. The event carries an empty
+    /// signature.
+    fn prepare(
+        &self,
         event_type: EventType,
         actor_did: &str,
         payload: EventPayload,
         timestamp: u64,
-    ) -> Result<Event, ContextCreationError> {
+    ) -> Event {
         let sequence = scp_event_log::tree::event_count(&self.log);
         let leaves = self.log.leaves();
         let prev_hash = if leaves.is_empty() {
@@ -104,7 +113,7 @@ impl ContextLog {
             leaves[leaves.len() - 1]
         };
 
-        let event = Event {
+        Event {
             event_type,
             actor_did: DID::from(actor_did.to_owned()),
             timestamp,
@@ -112,13 +121,17 @@ impl ContextLog {
             payload,
             prev_hash,
             signature: Vec::new(),
-        };
+        }
+    }
 
-        scp_event_log::tree::append_unsigned_event(&mut self.log, &event).map_err(|e| {
-            ContextCreationError::EventLogFailed(format!("event log append failed: {e}"))
-        })?;
-
-        Ok(event)
+    /// Appends an event that [`Self::prepare`] built, through
+    /// [`scp_event_log::tree::append_unsigned_event`].
+    fn commit(&mut self, event: &Event) -> Result<(), ContextCreationError> {
+        scp_event_log::tree::append_unsigned_event(&mut self.log, event)
+            .map(|_| ())
+            .map_err(|e| {
+                ContextCreationError::EventLogFailed(format!("event log append failed: {e}"))
+            })
     }
 }
 
@@ -259,7 +272,13 @@ type WriteGate = std::sync::Arc<tokio::sync::Semaphore>;
     reason = "`std::sync::Mutex` guards only synchronous in-memory Merkle-tree operations; every lock is scoped and dropped BEFORE any `.await` on the async `EventLogPersistence` backend (ADR-049 Decision 7), so the guard is never held across a suspension point and a `tokio::sync::Mutex` would add unnecessary overhead."
 )]
 impl MerkleEventLogProvider {
-    /// Creates a new empty event log provider (in-memory only).
+    /// Creates a new empty event log provider that keeps its logs in memory
+    /// only.
+    ///
+    /// Test-only: a production provider persists its logs, so it is built
+    /// with [`Self::with_persistence`] (spec section 17.17, capability
+    /// classification). A log kept only in memory is lost on restart.
+    #[cfg(any(test, feature = "testing"))]
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -358,7 +377,9 @@ impl MerkleEventLogProvider {
     /// # Errors
     ///
     /// Returns [`ContextCreationError::EventLogFailed`] if deserialization
-    /// fails or the hash chain is broken.
+    /// fails, the hash chain is broken, or storing the imported log fails.
+    /// On a storage failure the in-memory log is unchanged (spec section
+    /// 17.3, "Event log write failures").
     pub async fn import_event_log_entries(
         &self,
         context_id: &[u8; 32],
@@ -370,21 +391,18 @@ impl MerkleEventLogProvider {
 
         let log = rebuild_log_from_events(context_id, &entries)?;
 
-        let _write = self.lock_write_gate(context_id).await?;
-        // Persist the imported events (one replace).
-        let stored = self.replace_best_effort(context_id, &entries).await;
+        let write = self.lock_write_gate(context_id).await?;
+        // Store the imported events (one replace) before memory takes them.
+        if let Err(e) = self.replace_stored(context_id, &entries).await {
+            self.settle_write(context_id, write, false);
+            return Err(e);
+        }
 
         let mut logs = self
             .logs
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        logs.insert(
-            *context_id,
-            ContextLog {
-                log,
-                storage_diverged: !stored,
-            },
-        );
+        logs.insert(*context_id, ContextLog::from_log(log));
         Ok(())
     }
 
@@ -496,97 +514,46 @@ impl MerkleEventLogProvider {
     ///
     /// The number of events removed, or `None` if no log exists for the
     /// context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextCreationError::EventLogFailed`] if the write gate
+    /// cannot be taken, the retained tail cannot be rebuilt, or storing the
+    /// pruned log fails. The in-memory log is then unchanged, and a failed
+    /// store marks the stored log diverged (spec section 17.3, "Event log
+    /// write failures").
     pub async fn prune_before_checkpoint(
         &self,
         context_id: &[u8; 32],
         checkpoint_event_count: u64,
         policy: &scp_protocol::context::governance::PruningPolicy,
-    ) -> Option<usize> {
-        /// Minimum retention: 30 days (protocol floor per ADR-030 §2a).
-        const MIN_RETENTION_SECS: u64 = 2_592_000;
-
+    ) -> Result<Option<usize>, ContextCreationError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
-        let _write = match self.lock_write_gate(context_id).await {
-            Ok(permit) => permit,
-            Err(e) => {
-                tracing::error!(
-                    context_id = %hex::encode(context_id),
-                    error = %e,
-                    "event log prune could not take the write gate; skipping prune"
-                );
-                return None;
-            }
-        };
+        let write = self.lock_write_gate(context_id).await?;
 
-        let (prune_count, entries_snapshot) = {
-            let mut logs = self
+        // Compute the pruned log without changing memory: memory takes it
+        // only after storage does.
+        let (prune_count, pruned_log) = {
+            let logs = self
                 .logs
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let context_log = logs.get_mut(context_id)?;
+            let Some(context_log) = logs.get(context_id) else {
+                drop(logs);
+                drop(write);
+                self.release_write_gate(context_id);
+                return Ok(None);
+            };
 
             let events = context_log.log.events();
             let total = events.len();
-            if total == 0 {
-                return Some(0);
-            }
-
-            // Cannot prune beyond the checkpoint boundary (events at or after the
-            // checkpoint are still live).
-            #[allow(clippy::cast_possible_truncation)]
-            let checkpoint_bound = (checkpoint_event_count as usize).min(total);
-
-            let mut prune_count = 0usize;
-
-            // Time-based and size-based pruning evaluate independently; we take the
-            // maximum of the two so that both policies are honored.
-            if let Some(ref time_policy) = policy.time_based {
-                let retention = time_policy.retention_secs.max(MIN_RETENTION_SECS);
-
-                let mut time_prune = 0usize;
-                for event in events.iter().take(checkpoint_bound) {
-                    let is_structural =
-                        scp_event_log::pruning::is_structural_event(&event.event_type);
-                    // Apply structural retention multiplier: structural events are
-                    // retained longer. Uses integer arithmetic (basis points) to
-                    // avoid f64 precision loss on u64 values.
-                    let effective_retention = if is_structural {
-                        let multiplier_bp =
-                            u128::from(policy.event_type_retention.structural_retention_multiplier);
-                        #[allow(clippy::cast_possible_truncation)]
-                        let r = (u128::from(retention) * multiplier_bp / 10_000) as u64;
-                        r.max(retention)
-                    } else {
-                        retention
-                    };
-
-                    if event.timestamp < now.saturating_sub(effective_retention) {
-                        time_prune += 1;
-                    } else {
-                        // Events are ordered by time; once we find a retained
-                        // event, all subsequent are also retained.
-                        break;
-                    }
-                }
-                prune_count = prune_count.max(time_prune);
-            }
-
-            if let Some(ref size_policy) = policy.size_based {
-                // Size-based: keep at most `max_event_count` events.
-                #[allow(clippy::cast_possible_truncation)]
-                let max_count = size_policy.max_event_count as usize;
-                if total > max_count {
-                    let size_prune = (total - max_count).min(checkpoint_bound);
-                    prune_count = prune_count.max(size_prune);
-                }
-            }
-
+            let prune_count = prune_count_for(events, checkpoint_event_count, policy, now);
             if prune_count == 0 {
-                return Some(0);
+                return Ok(Some(0));
             }
 
             // Reconstruct the retained tail via the canonical substrate truncation.
@@ -595,37 +562,43 @@ impl MerkleEventLogProvider {
             // `GENESIS_PREV_HASH`, so every tail leaf hash and the resulting Merkle
             // root CHANGE. Pre-prune proofs against the OLD root are intentionally
             // invalidated, matching RFC 6962 log truncation semantics.
-            let pruned_log = match truncate_log_keeping_tail(&context_log.log, prune_count) {
-                Ok(log) => log,
-                Err(e) => {
-                    tracing::warn!(
-                        context_id = %hex::encode(context_id),
-                        error = %e,
-                        "event log truncation failed; skipping prune"
-                    );
-                    return Some(0);
-                }
-            };
-
+            let pruned_log =
+                truncate_log_keeping_tail(&context_log.log, prune_count).map_err(|e| {
+                    ContextCreationError::EventLogFailed(format!(
+                        "event log truncation failed for context {}: {e}",
+                        hex::encode(context_id)
+                    ))
+                })?;
             tracing::info!(
                 context_id = %hex::encode(context_id),
                 pruned = prune_count,
                 remaining = total - prune_count,
-                "pruned event log entries after checkpoint"
+                "pruning event log entries after checkpoint"
             );
-
-            context_log.log = pruned_log;
-
-            // Persist the pruned state (one replace with renumbered sequences).
-            let entries_snapshot = context_log.log.events().to_vec();
-            (prune_count, entries_snapshot)
+            (prune_count, pruned_log)
         };
-        let stored = self
-            .replace_best_effort(context_id, &entries_snapshot)
-            .await;
-        self.set_storage_diverged(context_id, !stored);
 
-        Some(prune_count)
+        // Store the pruned log (one replace with renumbered sequences).
+        if let Err(e) = self.replace_stored(context_id, pruned_log.events()).await {
+            self.settle_write(context_id, write, false);
+            return Err(e);
+        }
+
+        let mut logs = self
+            .logs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(context_log) = logs.get_mut(context_id) {
+            context_log.log = pruned_log;
+            context_log.storage_diverged = false;
+        } else {
+            // Released while the replace ran: storage holds the pruned log,
+            // and the gate this write held goes with the log.
+            drop(logs);
+            drop(write);
+            self.release_write_gate(context_id);
+        }
+        Ok(Some(prune_count))
     }
 
     /// Returns the write gate for a context, creating it on first use.
@@ -682,87 +655,189 @@ impl MerkleEventLogProvider {
         });
     }
 
-    /// Best-effort persistence of one unit that starts at `base_seq`.
+    /// Persists one unit that starts at `base_seq`: the newly appended event.
+    /// Succeeds without a write when no backend is configured.
     ///
-    /// Used by `append_event` to persist only the newly appended event.
-    /// Returns whether the stored log now matches memory: `true` after a
-    /// successful persist or when no backend is configured.
-    async fn persist_unit_best_effort(
+    /// # Errors
+    ///
+    /// Returns [`ContextCreationError::EventLogFailed`] when the backend's
+    /// persist fails. The unit may still have reached storage.
+    async fn persist_unit(
         &self,
         context_id: &[u8; 32],
         base_seq: u64,
         entries: &[Event],
-    ) -> bool {
+    ) -> Result<(), ContextCreationError> {
         let Some(ref persistence) = self.persistence else {
-            return true;
+            return Ok(());
         };
         let context_id_hex = hex::encode(context_id);
-        match persistence
+        persistence
             .persist_unit(&context_id_hex, base_seq, entries)
             .await
-        {
-            Ok(()) => true,
-            Err(e) => {
-                tracing::warn!(
-                    context_id = %context_id_hex,
-                    error = %e,
-                    "failed to persist event log unit; the next write replaces the stored log"
-                );
-                false
-            }
-        }
+            .map_err(|e| {
+                ContextCreationError::EventLogFailed(format!(
+                    "persisting an event log unit of context {context_id_hex} failed: {e}"
+                ))
+            })
     }
 
-    /// Best-effort replace of the whole stored log.
+    /// Replaces the whole stored log with `entries`. Used by init, prune,
+    /// import, and a write over a diverged stored log. Succeeds without a
+    /// write when no backend is configured.
     ///
-    /// Used by init, prune, import, and an append over a diverged stored log.
-    /// Returns whether the stored log now matches memory: `true` after a
-    /// successful replace or when no backend is configured.
-    async fn replace_best_effort(&self, context_id: &[u8; 32], entries: &[Event]) -> bool {
+    /// # Errors
+    ///
+    /// Returns [`ContextCreationError::EventLogFailed`] when the backend's
+    /// replace fails. The replace may still have committed.
+    async fn replace_stored(
+        &self,
+        context_id: &[u8; 32],
+        entries: &[Event],
+    ) -> Result<(), ContextCreationError> {
         let Some(ref persistence) = self.persistence else {
-            return true;
+            return Ok(());
         };
         let context_id_hex = hex::encode(context_id);
-        match persistence.replace(&context_id_hex, entries).await {
-            Ok(()) => true,
-            Err(e) => {
-                tracing::warn!(
-                    context_id = %context_id_hex,
-                    error = %e,
-                    "failed to replace persisted event log; the next write replaces it again"
-                );
-                false
-            }
+        persistence
+            .replace(&context_id_hex, entries)
+            .await
+            .map_err(|e| {
+                ContextCreationError::EventLogFailed(format!(
+                    "replacing the stored event log of context {context_id_hex} failed: {e}"
+                ))
+            })
+    }
+
+    /// Deletes the stored log. Succeeds without a write when no backend is
+    /// configured.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextCreationError::EventLogFailed`] when the backend's
+    /// delete fails.
+    async fn delete_stored(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        let Some(ref persistence) = self.persistence else {
+            return Ok(());
+        };
+        let context_id_hex = hex::encode(context_id);
+        persistence
+            .delete_entries(&context_id_hex)
+            .await
+            .map_err(|e| {
+                ContextCreationError::EventLogFailed(format!(
+                    "deleting the stored event log of context {context_id_hex} failed: {e}"
+                ))
+            })
+    }
+
+    /// Settles a write after its persist returned, `stored` telling whether
+    /// it succeeded. A failed persist may still have reached storage, so when
+    /// the context has a log in memory its stored log is marked diverged and
+    /// the next write replaces it; a successful one clears the mark. When the
+    /// context has no log in memory (it was released while the persist ran,
+    /// or never had one), the write's permit drops and the gate is released,
+    /// so the write leaves no gate behind (spec section 17.3, "Event log
+    /// write failures").
+    fn settle_write(
+        &self,
+        context_id: &[u8; 32],
+        write: tokio::sync::OwnedSemaphorePermit,
+        stored: bool,
+    ) {
+        let has_log = {
+            let mut logs = self
+                .logs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            logs.get_mut(context_id).is_some_and(|log| {
+                log.storage_diverged = !stored;
+                true
+            })
+        };
+        drop(write);
+        if !has_log {
+            self.release_write_gate(context_id);
         }
     }
 
-    /// Records whether a context's stored log may differ from memory after a
-    /// write. The caller holds the context's write gate.
-    fn set_storage_diverged(&self, context_id: &[u8; 32], diverged: bool) {
-        let mut logs = self
-            .logs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(log) = logs.get_mut(context_id) {
-            log.storage_diverged = diverged;
-        }
+    /// Fails a write to a context that has no log in memory. The write's
+    /// permit drops and the gate is released, so the failed write leaves no
+    /// gate behind.
+    fn no_log(
+        &self,
+        context_id: &[u8; 32],
+        write: tokio::sync::OwnedSemaphorePermit,
+    ) -> ContextCreationError {
+        drop(write);
+        self.release_write_gate(context_id);
+        ContextCreationError::EventLogFailed(format!(
+            "no event log for context {}",
+            hex::encode(context_id)
+        ))
     }
 
-    /// Best-effort persistence deletion.
-    async fn delete_persisted_best_effort(&self, context_id: &[u8; 32]) {
-        if let Some(ref persistence) = self.persistence {
-            let context_id_hex = hex::encode(context_id);
-            if let Err(e) = persistence.delete_entries(&context_id_hex).await {
-                tracing::warn!(
-                    context_id = %context_id_hex,
-                    error = %e,
-                    "failed to delete persisted event log entries (best-effort)"
-                );
+    /// Validates the §5.4.5 `chunks_billed` wire invariant of an
+    /// `OutletInvoked` event at the append boundary.
+    ///
+    /// Enforced here so ANY malformed streaming `OutletInvokedEvent`, from
+    /// any source, is durably wire-rejected ("refused at log-insert time, not
+    /// accepted-and-flagged"). The appender holds only the event (opaque
+    /// `payload` bytes), NOT the chunk sequence or `cancel_ack_seq`, so it
+    /// enforces the event-LOCAL bound `chunks_billed <= stream_chunk_count`
+    /// (`verify_outlet_invoked_event_local`); the tighter manifest-derived
+    /// equality is enforced upstream at chunk-emission time by the dispatch
+    /// pump's gate. Only payloads that DECODE as an `OutletInvokedEvent` are
+    /// checked: the `OutletInvoked` discriminator is also carried by the
+    /// unary saga's join-record payload (a distinct JSON shape lacking the
+    /// required event fields), which does not decode here and is passed
+    /// through untouched. This keeps the `scp-event-log` crate
+    /// runtime-independent — the invariant lives in `scp-runtime`, the crate
+    /// only owns the error variant.
+    fn check_append_payload(
+        event_type: EventType,
+        payload: &EventPayload,
+    ) -> Result<(), ContextCreationError> {
+        if event_type == EventType::OutletInvoked
+            && let Ok(invoked) = serde_json::from_slice::<
+                scp_protocol::context::outlets::lifecycle::OutletInvokedEvent,
+            >(&payload.data)
+        {
+            crate::context::outlets::stream::verify_outlet_invoked_event_local(&invoked).map_err(
+                |err| {
+                    let log_err =
+                        crate::context::outlets::stream::chunks_billed_error_to_event_log_error(
+                            err,
+                        );
+                    ContextCreationError::EventLogFailed(log_err.to_string())
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Persists `event`, the next event of a context's log, as one unit, or
+    /// replaces the whole stored log with `log_with_event` when the stored
+    /// log is diverged: a diverged stored log may lack earlier entries or
+    /// hold a replaced log, so it cannot take one more unit.
+    async fn persist_appended(
+        &self,
+        context_id: &[u8; 32],
+        event: &Event,
+        log_with_event: Option<Vec<Event>>,
+    ) -> Result<(), ContextCreationError> {
+        match log_with_event {
+            // O(1) persist: a one-entry unit holding only the new event.
+            None => {
+                self.persist_unit(context_id, event.sequence, std::slice::from_ref(event))
+                    .await
             }
+            Some(entries) => self.replace_stored(context_id, &entries).await,
         }
     }
 }
 
+#[cfg(any(test, feature = "testing"))]
 impl Default for MerkleEventLogProvider {
     fn default() -> Self {
         Self::new()
@@ -789,6 +864,69 @@ fn rebuild_log_from_events(
         })?;
     }
     Ok(log)
+}
+
+/// Returns how many leading events a prune under `policy` removes from
+/// `events` at `now`, never past the checkpoint boundary
+/// `checkpoint_event_count` (events at or after the checkpoint are still
+/// live). Time-based and size-based pruning evaluate independently, and the
+/// larger count wins so that both policies are honored.
+fn prune_count_for(
+    events: &[Event],
+    checkpoint_event_count: u64,
+    policy: &scp_protocol::context::governance::PruningPolicy,
+    now: u64,
+) -> usize {
+    /// Minimum retention: 30 days (protocol floor per ADR-030 §2a).
+    const MIN_RETENTION_SECS: u64 = 2_592_000;
+
+    let total = events.len();
+    #[allow(clippy::cast_possible_truncation)]
+    let checkpoint_bound = (checkpoint_event_count as usize).min(total);
+
+    let mut prune_count = 0usize;
+
+    if let Some(ref time_policy) = policy.time_based {
+        let retention = time_policy.retention_secs.max(MIN_RETENTION_SECS);
+
+        let mut time_prune = 0usize;
+        for event in events.iter().take(checkpoint_bound) {
+            let is_structural = scp_event_log::pruning::is_structural_event(&event.event_type);
+            // Apply structural retention multiplier: structural events are
+            // retained longer. Uses integer arithmetic (basis points) to
+            // avoid f64 precision loss on u64 values.
+            let effective_retention = if is_structural {
+                let multiplier_bp =
+                    u128::from(policy.event_type_retention.structural_retention_multiplier);
+                #[allow(clippy::cast_possible_truncation)]
+                let r = (u128::from(retention) * multiplier_bp / 10_000) as u64;
+                r.max(retention)
+            } else {
+                retention
+            };
+
+            if event.timestamp < now.saturating_sub(effective_retention) {
+                time_prune += 1;
+            } else {
+                // Events are ordered by time; once we find a retained
+                // event, all subsequent are also retained.
+                break;
+            }
+        }
+        prune_count = prune_count.max(time_prune);
+    }
+
+    if let Some(ref size_policy) = policy.size_based {
+        // Size-based: keep at most `max_event_count` events.
+        #[allow(clippy::cast_possible_truncation)]
+        let max_count = size_policy.max_event_count as usize;
+        if total > max_count {
+            let size_prune = (total - max_count).min(checkpoint_bound);
+            prune_count = prune_count.max(size_prune);
+        }
+    }
+
+    prune_count
 }
 
 /// Drops the first `prune_count` events, returning a new [`EventLog`]
@@ -851,20 +989,19 @@ fn truncate_log_keeping_tail(
 #[allow(clippy::significant_drop_tightening)]
 impl ContextEventLogProvider for MerkleEventLogProvider {
     async fn init_event_log(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        let _write = self.lock_write_gate(context_id).await?;
-        {
-            let mut logs = self
-                .logs
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            logs.insert(*context_id, ContextLog::new(context_id));
+        let write = self.lock_write_gate(context_id).await?;
+        // Store the empty event set first to establish the context in storage
+        // (replaces any stored log from a previous incarnation); memory takes
+        // the new log only after storage does.
+        if let Err(e) = self.replace_stored(context_id, &[]).await {
+            self.settle_write(context_id, write, false);
+            return Err(e);
         }
-
-        // Persist the empty event set to establish the context in storage
-        // (replaces any stored log from a previous incarnation).
-        let stored = self.replace_best_effort(context_id, &[]).await;
-        self.set_storage_diverged(context_id, !stored);
-
+        let mut logs = self
+            .logs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        logs.insert(*context_id, ContextLog::new(context_id));
         Ok(())
     }
 
@@ -876,77 +1013,107 @@ impl ContextEventLogProvider for MerkleEventLogProvider {
         payload: EventPayload,
         timestamp_secs: u64,
     ) -> Result<(), ContextCreationError> {
-        // §5.4.5 `chunks_billed` wire-invariant (C1) — enforced at the
-        // event-log APPEND boundary so ANY malformed streaming
-        // `OutletInvokedEvent`, from any source, is durably wire-rejected
-        // ("refused at log-insert time, not accepted-and-flagged"). The
-        // appender holds only the event (opaque `payload` bytes), NOT the
-        // chunk sequence or `cancel_ack_seq`, so it enforces the
-        // event-LOCAL bound `chunks_billed <= stream_chunk_count`
-        // (`verify_outlet_invoked_event_local`); the tighter
-        // manifest-derived equality is enforced upstream at chunk-emission
-        // time by the dispatch pump's gate. Only payloads that DECODE as an
-        // `OutletInvokedEvent` are checked: the `OutletInvoked`
-        // discriminator is also carried by the unary saga's join-record
-        // payload (a distinct JSON shape lacking the required event fields),
-        // which does not decode here and is passed through untouched. This
-        // keeps the `scp-event-log` crate runtime-independent — the invariant
-        // lives in `scp-runtime`, the crate only owns the error variant.
-        if event_type == EventType::OutletInvoked
-            && let Ok(invoked) = serde_json::from_slice::<
-                scp_protocol::context::outlets::lifecycle::OutletInvokedEvent,
-            >(&payload.data)
+        Self::check_append_payload(event_type, &payload)?;
+
+        let write = self.lock_write_gate(context_id).await?;
+        // Build the event without changing memory: memory takes it only
+        // after storage does (spec section 17.3, "Event log write failures").
+        let prepared = {
+            let logs = self
+                .logs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            logs.get(context_id).map(|log| {
+                let event = log.prepare(event_type, actor_did, payload, timestamp_secs);
+                let log_with_event = log.storage_diverged.then(|| {
+                    let mut entries = log.log.events().to_vec();
+                    entries.push(event.clone());
+                    entries
+                });
+                (event, log_with_event)
+            })
+        };
+        let Some((event, log_with_event)) = prepared else {
+            return Err(self.no_log(context_id, write));
+        };
+
+        if let Err(e) = self
+            .persist_appended(context_id, &event, log_with_event)
+            .await
         {
-            crate::context::outlets::stream::verify_outlet_invoked_event_local(&invoked).map_err(
-                |err| {
-                    let log_err =
-                        crate::context::outlets::stream::chunks_billed_error_to_event_log_error(
-                            err,
-                        );
-                    ContextCreationError::EventLogFailed(log_err.to_string())
-                },
-            )?;
+            self.settle_write(context_id, write, false);
+            return Err(e);
         }
 
-        let _write = self.lock_write_gate(context_id).await?;
-        let (event, diverged_log) = {
+        let committed = {
             let mut logs = self
                 .logs
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let log = logs.get_mut(context_id).ok_or_else(|| {
-                ContextCreationError::EventLogFailed(format!(
-                    "no event log for context {}",
-                    hex::encode(context_id)
-                ))
-            })?;
-            let event = log.append(event_type, actor_did, payload, timestamp_secs)?;
-            // A diverged stored log cannot take one more unit: it may lack
-            // earlier entries or hold a replaced log, so it gets the whole
-            // in-memory log instead.
-            let diverged_log = log.storage_diverged.then(|| log.log.events().to_vec());
-            (event, diverged_log)
+            logs.get_mut(context_id).map(|log| {
+                let committed = log.commit(&event);
+                // A commit that fails leaves memory short of the stored log,
+                // so the next write replaces storage with memory.
+                log.storage_diverged = committed.is_err();
+                committed
+            })
+        };
+        // `None`: released while the persist ran. Storage holds the event,
+        // memory holds no log, and the gate this write held goes with the log.
+        committed.unwrap_or_else(|| Err(self.no_log(context_id, write)))
+    }
+
+    async fn append_event_after_side_effect(
+        &self,
+        context_id: &[u8; 32],
+        event_type: EventType,
+        actor_did: &str,
+        payload: EventPayload,
+        timestamp_secs: u64,
+    ) -> Result<(), ContextCreationError> {
+        Self::check_append_payload(event_type, &payload)?;
+
+        let write = self.lock_write_gate(context_id).await?;
+        // Memory first: the operation's irreversible step already happened,
+        // so the entry is recorded in memory even when storage refuses it
+        // (spec section 17.3, "Event log write failures").
+        let appended = {
+            let mut logs = self
+                .logs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            logs.get_mut(context_id).map(|log| {
+                let event = log.prepare(event_type, actor_did, payload, timestamp_secs);
+                log.commit(&event)?;
+                let log_with_event = log.storage_diverged.then(|| log.log.events().to_vec());
+                Ok::<_, ContextCreationError>((event, log_with_event))
+            })
+        };
+        let (event, log_with_event) = match appended {
+            Some(appended) => appended?,
+            None => return Err(self.no_log(context_id, write)),
         };
 
-        let stored = match diverged_log {
-            // O(1) persist: a one-entry unit holding only the new event.
-            None => {
-                self.persist_unit_best_effort(
-                    context_id,
-                    event.sequence,
-                    std::slice::from_ref(&event),
-                )
-                .await
+        match self
+            .persist_appended(context_id, &event, log_with_event)
+            .await
+        {
+            Ok(()) => self.settle_write(context_id, write, true),
+            Err(e) => {
+                tracing::warn!(
+                    context_id = %hex::encode(context_id),
+                    error = %e,
+                    "an event log append after its side effect was not stored; \
+                     the next write replaces the stored log"
+                );
+                self.settle_write(context_id, write, false);
             }
-            Some(entries) => self.replace_best_effort(context_id, &entries).await,
-        };
-        self.set_storage_diverged(context_id, !stored);
-
+        }
         Ok(())
     }
 
     async fn destroy_event_log(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        {
+        let deleted = {
             let _write = self.lock_write_gate(context_id).await?;
             {
                 let mut logs = self
@@ -955,15 +1122,25 @@ impl ContextEventLogProvider for MerkleEventLogProvider {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 logs.remove(context_id);
             }
-
-            // Remove persisted entries.
-            self.delete_persisted_best_effort(context_id).await;
-        }
+            self.delete_stored(context_id).await
+        };
         // The permit above dropped, so this provider's own clone of the gate
         // no longer counts.
         self.release_write_gate(context_id);
+        deleted
+    }
 
-        Ok(())
+    fn release_event_log(&self, context_id: &[u8; 32]) {
+        {
+            let mut logs = self
+                .logs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            logs.remove(context_id);
+        }
+        // A writer holding the gate keeps it; that writer finds no log when
+        // it re-locks and releases the gate itself.
+        self.release_write_gate(context_id);
     }
 
     fn event_log_entries(
@@ -1047,9 +1224,11 @@ impl ContextEventLogProvider for MerkleEventLogProvider {
         context_id: &[u8; 32],
         checkpoint_event_count: u64,
         policy: &scp_protocol::context::governance::PruningPolicy,
-    ) -> Option<usize> {
+    ) -> Result<Option<usize>, scp_protocol::context::ContextError> {
         // Delegate to the concrete method on MerkleEventLogProvider.
-        Self::prune_before_checkpoint(self, context_id, checkpoint_event_count, policy).await
+        Self::prune_before_checkpoint(self, context_id, checkpoint_event_count, policy)
+            .await
+            .map_err(|e| scp_protocol::context::ContextError::EventLogFailed(e.to_string()))
     }
 
     fn prove_event_inclusion(
@@ -1324,6 +1503,7 @@ mod tests {
         let bad_event = manifest_invoked_event(10, 8, root, Some(5));
         let err = provider
             .append_outlet_invoked_verified(
+                crate::context::builder::AppendMode::FailClosed,
                 &ctx_id,
                 &bad_event,
                 &chunks,
@@ -1351,6 +1531,7 @@ mod tests {
         let good_event = manifest_invoked_event(10, 6, root, Some(5));
         provider
             .append_outlet_invoked_verified(
+                crate::context::builder::AppendMode::FailClosed,
                 &ctx_id,
                 &good_event,
                 &chunks,
@@ -1390,6 +1571,7 @@ mod tests {
         );
         provider
             .append_outlet_invoked_verified(
+                crate::context::builder::AppendMode::FailClosed,
                 &ctx_id,
                 &event,
                 &chunks,
@@ -2160,6 +2342,13 @@ mod tests {
 
     type Faulty = crate::context::supervisor::faulty_storage::FaultyStorage;
 
+    /// A fault-injecting store over a fresh in-memory backend.
+    fn fresh_faulty() -> std::sync::Arc<Faulty> {
+        std::sync::Arc::new(Faulty::new(std::sync::Arc::new(
+            scp_platform::in_memory::InMemoryStorage::new(),
+        )))
+    }
+
     fn faulty_provider(faulty: &std::sync::Arc<Faulty>) -> MerkleEventLogProvider {
         let repo = std::sync::Arc::new(crate::store::ProtocolRepository::new_for_testing(
             std::sync::Arc::clone(faulty),
@@ -2207,9 +2396,30 @@ mod tests {
         );
     }
 
+    /// Runs one replacing operation on `provider`, returning its result.
+    async fn run_replace_op(
+        provider: &MerkleEventLogProvider,
+        op: ReplaceOp,
+        ctx_id: &[u8; 32],
+        import_data: &[u8],
+        prune_policy: &scp_protocol::context::governance::PruningPolicy,
+    ) -> Result<(), ContextCreationError> {
+        match op {
+            ReplaceOp::Prune => provider
+                .prune_before_checkpoint(ctx_id, 5, prune_policy)
+                .await
+                .map(|removed| assert_eq!(removed, Some(3))),
+            ReplaceOp::Import => provider.import_event_log_entries(ctx_id, import_data).await,
+            ReplaceOp::InitOverExisting => provider.init_event_log(ctx_id).await,
+        }
+    }
+
     /// Prune, import, and init over an existing log each replace the stored
     /// log. For a crash at every put N, a fresh provider restores exactly the
-    /// old log or exactly the new one.
+    /// old log or exactly the new one. An operation whose store failed
+    /// returns the error and leaves the old log in memory; one that returned
+    /// `Ok` restores as the new log (spec section 17.3, "Event log write
+    /// failures").
     #[tokio::test]
     async fn replace_crashing_at_any_put_restores_old_or_new_log() {
         let ctx_id = [32u8; 32];
@@ -2244,42 +2454,43 @@ mod tests {
             ReplaceOp::Import,
             ReplaceOp::InitOverExisting,
         ] {
+            // The log the operation produces when every put lands.
+            let target = {
+                let storage = fresh_faulty();
+                let provider = faulty_provider(&storage);
+                provider.init_event_log(&ctx_id).await.unwrap();
+                append_n(&provider, &ctx_id, 0xA0, 5).await;
+                run_replace_op(&provider, op, &ctx_id, &import_data, &prune_policy)
+                    .await
+                    .unwrap();
+                provider.entries(&ctx_id).unwrap()
+            };
             let mut saw_old = false;
             let mut saw_new = false;
             // Prune puts 2 keys, import 3, init 1; N = 4 lets every put land.
             for n in 1..=4u64 {
-                let faulty = std::sync::Arc::new(Faulty::new(std::sync::Arc::new(
-                    scp_platform::in_memory::InMemoryStorage::new(),
-                )));
+                let faulty = fresh_faulty();
                 let provider = faulty_provider(&faulty);
                 provider.init_event_log(&ctx_id).await.unwrap();
                 append_n(&provider, &ctx_id, 0xA0, 5).await;
                 let old = provider.entries(&ctx_id).unwrap();
 
                 faulty.fail_nth_store(n);
-                match op {
-                    ReplaceOp::Prune => {
-                        assert_eq!(
-                            provider
-                                .prune_before_checkpoint(&ctx_id, 5, &prune_policy)
-                                .await,
-                            Some(3)
-                        );
-                    }
-                    ReplaceOp::Import => provider
-                        .import_event_log_entries(&ctx_id, &import_data)
-                        .await
-                        .unwrap(),
-                    ReplaceOp::InitOverExisting => provider.init_event_log(&ctx_id).await.unwrap(),
-                }
+                let outcome =
+                    run_replace_op(&provider, op, &ctx_id, &import_data, &prune_policy).await;
                 faulty.clear_fail();
-                let new = provider.entries(&ctx_id).unwrap();
-
+                let in_memory = provider.entries(&ctx_id).unwrap();
+                let expected_in_memory = if outcome.is_ok() { &target } else { &old };
+                assert_eq!(
+                    log_bytes(&in_memory),
+                    log_bytes(expected_in_memory),
+                    "{op:?} N={n}: memory after {outcome:?}"
+                );
                 assert_stored_log_is_old_or_new(
                     &faulty,
                     &ctx_id,
                     &old,
-                    &new,
+                    &target,
                     &format!("{op:?} N={n}"),
                 )
                 .await;
@@ -2292,16 +2503,23 @@ mod tests {
                         panic!("{op:?} N={n}: restore rejected the stored log: {e}")
                     });
                 let got = restored.entries(&ctx_id).unwrap();
+                if outcome.is_ok() {
+                    assert_eq!(
+                        log_bytes(&got),
+                        log_bytes(&target),
+                        "{op:?} N={n}: an operation that returned Ok restores as the new log"
+                    );
+                }
                 if log_bytes(&got) == log_bytes(&old) {
                     saw_old = true;
                 } else {
                     assert_eq!(
                         log_bytes(&got),
-                        log_bytes(&new),
+                        log_bytes(&target),
                         "{op:?} N={n}: restored {} entries, neither the old log ({}) nor the new one ({})",
                         got.len(),
                         old.len(),
-                        new.len()
+                        target.len()
                     );
                     saw_new = true;
                 }
@@ -2474,14 +2692,14 @@ mod tests {
         );
     }
 
-    /// After a failed prune replace, the next append replaces the whole
-    /// stored log, so a reload gives exactly the in-memory log.
+    /// A prune whose replace fails returns the error and leaves the whole log
+    /// in memory (spec section 17.3, "Event log write failures"). The next
+    /// append replaces the whole stored log, so a reload gives exactly the
+    /// in-memory log.
     #[tokio::test]
     async fn append_after_failed_prune_replace_restores_memory() {
         let ctx_id = [35u8; 32];
-        let faulty = std::sync::Arc::new(Faulty::new(std::sync::Arc::new(
-            scp_platform::in_memory::InMemoryStorage::new(),
-        )));
+        let faulty = fresh_faulty();
         let provider = faulty_provider(&faulty);
         provider.init_event_log(&ctx_id).await.unwrap();
         append_n(&provider, &ctx_id, 0xA0, 5).await;
@@ -2493,17 +2711,21 @@ mod tests {
             ..Default::default()
         };
         faulty.fail_nth_store(1);
-        assert_eq!(
-            provider.prune_before_checkpoint(&ctx_id, 5, &policy).await,
-            Some(3)
+        let pruned = provider.prune_before_checkpoint(&ctx_id, 5, &policy).await;
+        assert!(
+            matches!(pruned, Err(ContextCreationError::EventLogFailed(_))),
+            "a failed prune replace returns the error, got {pruned:?}"
         );
+        assert_eq!(provider.entries(&ctx_id).unwrap().len(), 5);
         faulty.clear_fail();
         append_n(&provider, &ctx_id, 0xB0, 1).await;
         assert_reload_matches(&faulty, &provider, &ctx_id, "prune").await;
     }
 
-    /// After a failed import replace, the next append replaces the whole
-    /// stored log, so a reload gives exactly the in-memory log.
+    /// An import whose replace fails returns the error and leaves the old log
+    /// in memory (spec section 17.3, "Event log write failures"). The next
+    /// append replaces the whole stored log, so a reload gives exactly the
+    /// in-memory log.
     #[tokio::test]
     async fn append_after_failed_import_restores_memory() {
         let ctx_id = [36u8; 32];
@@ -2512,17 +2734,23 @@ mod tests {
         append_n(&source, &ctx_id, 0xC0, 4).await;
         let import_data = source.export_event_log_entries(&ctx_id).unwrap();
 
-        let faulty = std::sync::Arc::new(Faulty::new(std::sync::Arc::new(
-            scp_platform::in_memory::InMemoryStorage::new(),
-        )));
+        let faulty = fresh_faulty();
         let provider = faulty_provider(&faulty);
         provider.init_event_log(&ctx_id).await.unwrap();
         append_n(&provider, &ctx_id, 0xA0, 2).await;
+        let old = provider.entries(&ctx_id).unwrap();
         faulty.fail_nth_store(1);
-        provider
+        let imported = provider
             .import_event_log_entries(&ctx_id, &import_data)
-            .await
-            .unwrap();
+            .await;
+        assert!(
+            matches!(imported, Err(ContextCreationError::EventLogFailed(_))),
+            "a failed import replace returns the error, got {imported:?}"
+        );
+        assert_eq!(
+            log_bytes(&provider.entries(&ctx_id).unwrap()),
+            log_bytes(&old)
+        );
         faulty.clear_fail();
         append_n(&provider, &ctx_id, 0xB0, 1).await;
         assert_reload_matches(&faulty, &provider, &ctx_id, "import").await;
@@ -2533,9 +2761,7 @@ mod tests {
     #[tokio::test]
     async fn appends_after_failed_first_unit_restore_the_full_log() {
         let ctx_id = [37u8; 32];
-        let faulty = std::sync::Arc::new(Faulty::new(std::sync::Arc::new(
-            scp_platform::in_memory::InMemoryStorage::new(),
-        )));
+        let faulty = fresh_faulty();
         let provider = faulty_provider(&faulty);
         // No stored log: the restore starts an empty log and writes no head.
         assert_eq!(
@@ -2543,11 +2769,98 @@ mod tests {
             EventLogRestore::Absent
         );
         faulty.fail_nth_store(1);
-        append_n(&provider, &ctx_id, 0xA0, 1).await;
+        provider
+            .append_event_after_side_effect(
+                &ctx_id,
+                EventType::MemberJoined,
+                "",
+                payload_bytes(&[0xA0, 0]),
+                1_600_000_000,
+            )
+            .await
+            .unwrap();
         faulty.clear_fail();
         append_n(&provider, &ctx_id, 0xB0, 2).await;
         assert_eq!(provider.entries(&ctx_id).unwrap().len(), 3);
         assert_reload_matches(&faulty, &provider, &ctx_id, "first unit").await;
+    }
+
+    /// A fail-closed append whose unit persist fails returns the error and
+    /// leaves the event out of memory, so memory never holds an event the
+    /// store may lack (spec section 17.3, "Event log write failures"). Later
+    /// appends succeed, and a reload gives exactly the in-memory log.
+    #[tokio::test]
+    async fn a_failed_fail_closed_append_leaves_the_event_out_of_memory() {
+        let ctx_id = [38u8; 32];
+        let faulty = fresh_faulty();
+        let provider = faulty_provider(&faulty);
+        provider.init_event_log(&ctx_id).await.unwrap();
+        append_n(&provider, &ctx_id, 0xA0, 2).await;
+        faulty.fail_nth_store(1);
+        let appended = provider
+            .append_event(
+                &ctx_id,
+                EventType::MemberJoined,
+                "",
+                payload_bytes(&[0xEE]),
+                1_600_000_100,
+            )
+            .await;
+        assert!(
+            matches!(appended, Err(ContextCreationError::EventLogFailed(_))),
+            "a failed persist fails the append, got {appended:?}"
+        );
+        assert_eq!(provider.entries(&ctx_id).unwrap().len(), 2);
+        faulty.clear_fail();
+        append_n(&provider, &ctx_id, 0xB0, 1).await;
+        assert_eq!(provider.entries(&ctx_id).unwrap().len(), 3);
+        assert_reload_matches(&faulty, &provider, &ctx_id, "fail-closed append").await;
+    }
+
+    /// An append to a context with no log in memory fails and leaves no write
+    /// gate behind.
+    #[tokio::test]
+    async fn an_append_without_a_log_releases_its_gate() {
+        let provider = MerkleEventLogProvider::new();
+        let ctx_id = [39u8; 32];
+        let appended = provider
+            .append_event(
+                &ctx_id,
+                EventType::MemberJoined,
+                "",
+                EventPayload::default(),
+                1_600_000_000,
+            )
+            .await;
+        assert!(appended.is_err());
+        assert!(
+            !provider.write_gates.contains_key(&ctx_id),
+            "a failed append to a context with no log leaves no gate"
+        );
+    }
+
+    /// Releasing a log drops it from memory and drops its write gate, and
+    /// touches no storage: a fresh provider restores the stored log.
+    #[tokio::test]
+    async fn release_drops_memory_and_gate_and_keeps_the_stored_log() {
+        let ctx_id = [40u8; 32];
+        let faulty = fresh_faulty();
+        let provider = faulty_provider(&faulty);
+        provider.init_event_log(&ctx_id).await.unwrap();
+        append_n(&provider, &ctx_id, 0xA0, 3).await;
+        let before = provider.entries(&ctx_id).unwrap();
+        provider.release_event_log(&ctx_id);
+        assert!(provider.entries(&ctx_id).is_none());
+        assert!(!provider.write_gates.contains_key(&ctx_id));
+        let restored = faulty_provider(&faulty);
+        assert_eq!(
+            restored.restore_event_log(&ctx_id).await.unwrap(),
+            EventLogRestore::Loaded { entries: 3 }
+        );
+        assert_eq!(
+            log_bytes(&restored.entries(&ctx_id).unwrap()),
+            log_bytes(&before)
+        );
     }
 
     #[tokio::test]
@@ -2595,7 +2908,13 @@ mod tests {
 
         provider.init_event_log(&ctx_id).await.unwrap();
         provider
-            .append_context_event(&ctx_id, EventType::MemberLeft, "", 1_700_000_000)
+            .append_context_event(
+                crate::context::builder::AppendMode::FailClosed,
+                &ctx_id,
+                EventType::MemberLeft,
+                "",
+                1_700_000_000,
+            )
             .await
             .unwrap();
 

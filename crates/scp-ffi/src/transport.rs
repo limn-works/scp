@@ -351,7 +351,8 @@ impl crate::scp::PyScp {
         // leaf, so the supervisor log was empty and participation facts were
         // unreadable on the relay (production) path. This matches the
         // local-transport path, which already builds the real provider.
-        let event_log = crate::runtime::build_event_log_provider(bi);
+        let event_log =
+            crate::runtime::build_event_log_provider(bi).map_err(ScpPyError::context)?;
         crate::runtime::init_context_manager_with(
             bi, local_did, crypto, transport, event_log, None,
         );

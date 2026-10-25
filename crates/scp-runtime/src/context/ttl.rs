@@ -216,6 +216,12 @@ impl TtlExpiryResult {
         self.completed_steps |= step;
     }
 
+    /// Records why a step the caller ran outside this module did not complete,
+    /// leaving its bit unset so the expiry retries it.
+    pub(crate) fn record_failure(&mut self, error: String) {
+        self.errors.push(error);
+    }
+
     /// A no-op result for an ABORTED TTL expiry (ADR-049 §9, A3): the
     /// single-source convergent deadline was `None` (promotion / no-TTL / empty
     /// or failed-hydration log), so the timer must NOT transition the FSM or
@@ -481,6 +487,7 @@ pub async fn close_context(
 
     event_log
         .append_context_event(
+            crate::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::ContextClosing,
             initiator_did.as_ref(),
@@ -564,16 +571,16 @@ pub async fn finalize_close(
     // leaf already exists for this context (a prior finalize appended it, then
     // the actor was interrupted / respawned before completing), do NOT append a
     // second one — a duplicate terminal leaf diverges the Merkle root across
-    // members. A provider that cannot read entries falls back to the append
-    // (Risk 3 safe fallback; the production `MerkleEventLogProvider` supports
-    // reading). Runs BEFORE the best-effort relay delete (M2).
+    // members. A log that cannot be read fails the close. Runs BEFORE the
+    // best-effort relay delete (M2).
     if !terminal_leaf_exists(
         event_log,
         &context_id_bytes,
         scp_event_log::EventType::ContextClosed,
-    ) {
+    )? {
         event_log
             .append_context_event(
+                crate::context::builder::AppendMode::AfterSideEffect,
                 &context_id_bytes,
                 scp_event_log::EventType::ContextClosed,
                 scp_event_log::system_actors::SYSTEM_CLOSE_ACTOR,
@@ -835,9 +842,8 @@ pub(crate) fn apply_ttl_terminal_transition(
 /// `ContextExpired` leaf already exists for this context (a prior attempt
 /// appended it, then crashed / was interrupted before recording the step), the
 /// `STEP_EVENT_LOGGED` bit is set WITHOUT re-appending — no duplicate leaf, a
-/// stable Merkle root across respawn. A provider that does not support entry
-/// reading (`Err`) falls back to the bitmask-only behavior (append once per the
-/// `completed_steps` guard).
+/// stable Merkle root across respawn. A log that cannot be read leaves the
+/// step undone and records the error, so the expiry retries it.
 pub(crate) async fn finish_ttl_expiry_io(
     handle: &ContextHandle,
     transport: Option<&dyn ContextTransportProvider>,
@@ -868,30 +874,39 @@ pub(crate) async fn finish_ttl_expiry_io(
         // (d) idempotent leaf: if a terminal `ContextExpired` leaf already
         // exists (a prior attempt appended it but did not record the step
         // before an interruption), mark the step done WITHOUT re-appending so
-        // the Merkle root stays stable across respawn. A provider that cannot
-        // read entries falls back to the append below (bitmask-only guard).
-        if terminal_leaf_exists(
+        // the Merkle root stays stable across respawn. A log that cannot be
+        // read leaves the step undone, so the expiry retries it.
+        match terminal_leaf_exists(
             event_log,
             &context_id_bytes,
             scp_event_log::EventType::ContextExpired,
         ) {
-            result.set_step(STEP_EVENT_LOGGED);
-        } else {
-            match event_log
-                .append_context_event(
-                    &context_id_bytes,
-                    scp_event_log::EventType::ContextExpired,
-                    scp_event_log::system_actors::SYSTEM_TIMER_ACTOR,
-                    expiry_deadline_secs,
-                )
-                .await
-            {
-                Ok(()) => result.set_step(STEP_EVENT_LOGGED),
-                Err(e) => {
-                    let msg = format!("failed to log ContextExpired event: {e}");
-                    tracing::warn!(context_id = %context_id, error = %e,
+            Err(e) => {
+                tracing::warn!(context_id = %context_id, error = %e,
+                    "could not read the event log for the ContextExpired leaf");
+                result.errors.push(format!(
+                    "failed to read the event log for ContextExpired: {e}"
+                ));
+            }
+            Ok(true) => result.set_step(STEP_EVENT_LOGGED),
+            Ok(false) => {
+                match event_log
+                    .append_context_event(
+                        crate::context::builder::AppendMode::AfterSideEffect,
+                        &context_id_bytes,
+                        scp_event_log::EventType::ContextExpired,
+                        scp_event_log::system_actors::SYSTEM_TIMER_ACTOR,
+                        expiry_deadline_secs,
+                    )
+                    .await
+                {
+                    Ok(()) => result.set_step(STEP_EVENT_LOGGED),
+                    Err(e) => {
+                        let msg = format!("failed to log ContextExpired event: {e}");
+                        tracing::warn!(context_id = %context_id, error = %e,
                         "failed to append ContextExpired to event log");
-                    result.errors.push(msg);
+                        result.errors.push(msg);
+                    }
                 }
             }
         }
@@ -931,25 +946,23 @@ pub(crate) async fn finish_ttl_expiry_io(
 /// event log for `context_id_bytes` (ADR-049 §9 amendment, idempotent terminal
 /// leaf — finding (d)).
 ///
-/// Consults [`ContextEventLogProvider::event_log_entries`]. A provider that does
-/// not support entry reading (`Err`) — or a context with no log yet
-/// (`Ok(None)`) — returns `false`: the caller then appends (or re-appends) under
-/// its bitmask guard, the pre-(d) behavior. This is the SAFE fallback (Risk 3):
-/// the production `MerkleEventLogProvider` supports reading, so real deployments
-/// get the idempotent skip; a reduced test/embedded provider degrades to
-/// append-once semantics rather than failing closed.
+/// Consults [`ContextEventLogProvider::event_log_entries`]. A context with no
+/// log yet (`Ok(None)`) has no terminal leaf.
+///
+/// # Errors
+///
+/// Returns the provider's error when it cannot read the log: an unreadable
+/// log is never read as one without the leaf, because the caller would then
+/// append a duplicate terminal leaf (spec section 17.3, "Event log write
+/// failures").
 fn terminal_leaf_exists(
     event_log: &dyn ContextEventLogProvider,
     context_id_bytes: &[u8; 32],
     event_type: scp_event_log::EventType,
-) -> bool {
-    match event_log.event_log_entries(context_id_bytes) {
-        Ok(Some(entries)) => entries.iter().any(|e| e.event_type == event_type),
-        // `Ok(None)` (no log yet) and `Err(_)` (provider cannot read entries)
-        // both fall back to "no existing leaf" ⇒ the caller appends under its
-        // bitmask guard (the safe pre-(d) behavior).
-        Ok(None) | Err(_) => false,
-    }
+) -> Result<bool, ContextError> {
+    Ok(event_log
+        .event_log_entries(context_id_bytes)?
+        .is_some_and(|entries| entries.iter().any(|e| e.event_type == event_type)))
 }
 
 impl TtlExpiryResult {
@@ -1227,6 +1240,8 @@ mod tests {
         // carry this allow.
         #[allow(clippy::disallowed_types)]
         entries: std::sync::Mutex<Vec<scp_event_log::Event>>,
+        /// When set, `event_log_entries` fails.
+        unreadable: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait::async_trait]
@@ -1266,8 +1281,58 @@ mod tests {
             &self,
             _cid: &[u8; 32],
         ) -> Result<Option<Vec<scp_event_log::Event>>, ContextError> {
+            if self.unreadable.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(ContextError::EventLogFailed(
+                    "fixture: the log cannot be read".to_owned(),
+                ));
+            }
             Ok(Some(self.entries.lock().unwrap().clone()))
         }
+    }
+
+    /// An expiry whose log cannot be read leaves its event-log step undone and
+    /// appends no second `ContextExpired` leaf: an unreadable log is never read
+    /// as one without the leaf (spec section 17.3, "Event log write failures").
+    #[tokio::test]
+    async fn an_unreadable_log_appends_no_duplicate_expiry_leaf() {
+        let transport = NullTransport;
+        let event_log = StatefulEventLog::default();
+        let handle = active_handle("ctx-ttl-unreadable", MemoryScope::Full);
+        let first = super::try_ttl_expiry_cleanup(
+            &handle,
+            None,
+            Some(&transport),
+            &event_log,
+            0,
+            1_700_000_000,
+        )
+        .await;
+        assert!(first.is_complete(), "first expiry completes: {first}");
+
+        event_log
+            .unreadable
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let second = super::try_ttl_expiry_cleanup(
+            &handle,
+            None,
+            Some(&transport),
+            &event_log,
+            0,
+            1_700_000_000,
+        )
+        .await;
+        assert!(
+            !second.is_complete(),
+            "an unreadable log leaves the step undone: {second}"
+        );
+        let expired = event_log
+            .entries
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.event_type == scp_event_log::EventType::ContextExpired)
+            .count();
+        assert_eq!(expired, 1, "no duplicate terminal leaf");
     }
 
     /// (d) idempotent terminal leaf (ADR-049 §9 amendment): a SECOND TTL expiry
@@ -1446,6 +1511,14 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ContextEventLogProvider for NullEventLog {
+        fn event_log_entries(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            Ok(None)
+        }
+
         async fn init_event_log(
             &self,
             _cid: &[u8; 32],
@@ -1484,6 +1557,14 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ContextEventLogProvider for CapturingEventLog {
+        fn event_log_entries(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            Ok(None)
+        }
+
         async fn init_event_log(
             &self,
             _cid: &[u8; 32],

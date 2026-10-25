@@ -69,6 +69,7 @@ async fn append_consequence_event(
 ) {
     if let Err(e) = event_log
         .append_context_event_with_payload(
+            crate::context::builder::AppendMode::AfterSideEffect,
             context_id_bytes,
             event_type,
             CONSEQUENCE_ACTOR_DID,
@@ -1052,6 +1053,7 @@ mod convergence_tests {
         let log = MerkleEventLogProvider::new();
         log.init_event_log(&storage_key).await.expect("init log");
         log.append_context_event_with_payload(
+            crate::context::builder::AppendMode::AfterSideEffect,
             &storage_key,
             EventType::GovernanceAction,
             ADMIN,

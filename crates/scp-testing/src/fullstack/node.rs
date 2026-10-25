@@ -284,8 +284,23 @@ impl ContextEventLogProvider for ArcEventLogProvider {
             .append_event(id, event_type, actor_did, payload, timestamp_secs)
             .await
     }
+    async fn append_event_after_side_effect(
+        &self,
+        id: &[u8; 32],
+        event_type: scp_event_log::EventType,
+        actor_did: &str,
+        payload: scp_event_log::EventPayload,
+        timestamp_secs: u64,
+    ) -> Result<(), ContextCreationError> {
+        self.0
+            .append_event_after_side_effect(id, event_type, actor_did, payload, timestamp_secs)
+            .await
+    }
     async fn destroy_event_log(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
         self.0.destroy_event_log(id).await
+    }
+    fn release_event_log(&self, id: &[u8; 32]) {
+        self.0.release_event_log(id);
     }
     fn event_log_entries(
         &self,
@@ -316,10 +331,14 @@ impl ContextEventLogProvider for ArcEventLogProvider {
         id: &[u8; 32],
         checkpoint_event_count: u64,
         policy: &scp_core::context::governance::PruningPolicy,
-    ) -> Option<usize> {
-        self.0
-            .prune_before_checkpoint(id, checkpoint_event_count, policy)
-            .await
+    ) -> Result<Option<usize>, ContextError> {
+        ContextEventLogProvider::prune_before_checkpoint(
+            &*self.0,
+            id,
+            checkpoint_event_count,
+            policy,
+        )
+        .await
     }
 }
 

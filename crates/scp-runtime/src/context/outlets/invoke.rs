@@ -4870,6 +4870,7 @@ async fn record_cross_context_a_event(
     );
     if let Err(err) = a_event_log
         .append_outlet_invoked_verified(
+            crate::context::builder::AppendMode::AfterSideEffect,
             &crate::context::state::context_id_to_bytes(receiving_context_id),
             &event,
             reassembled,
@@ -5731,6 +5732,7 @@ pub(crate) async fn record_streaming_saga_a_event(
     };
     if let Err(err) = a_event_log
         .append_context_event_with_payload(
+            crate::context::builder::AppendMode::AfterSideEffect,
             &receipt.caller_context_id,
             scp_event_log::EventType::CrossContextOutletInvoked,
             &receipt.caller_did,
@@ -9156,7 +9158,14 @@ mod tests {
                 None,
             );
             let err = a_log
-                .append_outlet_invoked_verified(&a_bytes, &bad_event, &chunks, INVOKER, 0)
+                .append_outlet_invoked_verified(
+                    crate::context::builder::AppendMode::AfterSideEffect,
+                    &a_bytes,
+                    &bad_event,
+                    &chunks,
+                    INVOKER,
+                    0,
+                )
                 .await
                 .expect_err("mismatched chunks_billed must be refused at log-insert");
             assert!(

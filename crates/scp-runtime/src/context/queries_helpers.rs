@@ -1287,6 +1287,14 @@ mod equivocation_dedup_tests {
 
     #[async_trait::async_trait]
     impl crate::context::builder::ContextEventLogProvider for CountingEventLog {
+        fn event_log_entries(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            Ok(None)
+        }
+
         async fn init_event_log(
             &self,
             _id: &[u8; 32],

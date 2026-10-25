@@ -69,8 +69,8 @@ use crate::context::state::{CommitOperation, context_id_to_bytes, require_active
 /// Creates a governance-aware checkpoint for a context. State-owning
 /// signature: `state` carries the per-context governance/pruning policy
 /// and lifecycle handle; `deps.clock` produces `created_at`;
-/// `deps.event_log` performs best-effort log pruning when a pruning
-/// policy is configured (#1474).
+/// `deps.event_log` prunes the log when the context configures a pruning
+/// policy, and a failed prune fails the checkpoint.
 ///
 /// Mutation surface: this helper does NOT mutate `state` — the
 /// checkpoint object is returned by value and any pruning is delegated
@@ -118,14 +118,15 @@ pub async fn create_governance_checkpoint(
     };
 
     // Trigger event log pruning if a pruning policy is configured on the
-    // context (#1474). Best-effort: log but do not fail the checkpoint
-    // creation if pruning encounters an error.
+    // context. A failed prune fails the checkpoint, with the
+    // in-memory log unchanged (spec section 17.3, "Event log write
+    // failures").
     if let Some(ref policy) = pruning_policy {
         let context_id_bytes = context_id_to_bytes(context_id);
         if deps
             .event_log
             .prune_before_checkpoint(&context_id_bytes, event_count, policy)
-            .await
+            .await?
             .is_some_and(|pruned| pruned > 0)
         {
             tracing::info!(
@@ -322,6 +323,7 @@ pub async fn recovery_advance_epoch(
             Ok(payload) => {
                 deps.event_log
                     .append_context_event_with_payload(
+                        crate::context::builder::AppendMode::AfterSideEffect,
                         &context_id_bytes,
                         scp_event_log::EventType::RecoveryEpochAdvanced,
                         "system:recovery",

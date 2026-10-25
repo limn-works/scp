@@ -337,6 +337,7 @@ pub async fn tombstone_migrated_context(
         .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
     deps.event_log
         .append_context_event_with_payload(
+            crate::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::ContextTombstoned,
             "system",
@@ -421,6 +422,7 @@ pub async fn withdraw_governance_vote(
     for event in &events {
         deps.event_log
             .append_context_event(
+                crate::context::builder::AppendMode::AfterSideEffect,
                 &context_id_bytes,
                 governance_event_label(event),
                 voter_did.as_ref(),
@@ -506,6 +508,7 @@ pub async fn apply_pending_ceiling_modification(
     let context_id_bytes = context_id_to_bytes(context_id);
     deps.event_log
         .append_context_event(
+            crate::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::CeilingModified,
             "",
@@ -562,6 +565,7 @@ pub async fn apply_pending_economic_policy_change(
     let context_id_bytes = context_id_to_bytes(context_id);
     deps.event_log
         .append_context_event(
+            crate::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::EconomicPolicyApplied,
             "",
@@ -828,6 +832,7 @@ pub async fn execute_suspend_member(
     let context_id_bytes = context_id_to_bytes(context_id);
     deps.event_log
         .append_context_event(
+            crate::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::MemberSuspended,
             actor_did,
@@ -975,6 +980,7 @@ pub async fn execute_revoke(
         .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
     deps.event_log
         .append_context_event_with_payload(
+            crate::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::AccessRevoked,
             actor_did,
@@ -1028,6 +1034,7 @@ pub async fn execute_revoke(
                 if let Err(e) = deps
                     .event_log
                     .append_context_event_with_payload(
+                        crate::context::builder::AppendMode::AfterSideEffect,
                         &context_id_bytes,
                         scp_event_log::EventType::KeyEpochAdvance,
                         rotation.author_did.as_str(),
@@ -1243,6 +1250,7 @@ pub async fn execute_restore_access(
 
     deps.event_log
         .append_context_event(
+            crate::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::AccessRestored,
             actor_did,
@@ -1527,11 +1535,14 @@ pub async fn execute_add_member(
     // (§7.3.2) attributes the join interval to this subject.
     deps.event_log
         .append_membership_change_leaf(
+            crate::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::MemberJoined,
             actor_did,
-            did.as_ref(),
-            role,
+            &scp_event_log::payload::MembershipChangePayload {
+                subject_did: did.as_ref().to_owned(),
+                role_name: role.to_owned(),
+            },
             timestamp_secs,
         )
         .await?;
@@ -1718,11 +1729,14 @@ pub async fn execute_remove_member(
     // attributes the leave interval to this subject.
     deps.event_log
         .append_membership_change_leaf(
+            crate::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::MemberLeft,
             actor_did,
-            did.as_ref(),
-            &removed_role_name,
+            &scp_event_log::payload::MembershipChangePayload {
+                subject_did: did.as_ref().to_owned(),
+                role_name: removed_role_name.clone(),
+            },
             timestamp_secs,
         )
         .await?;
@@ -1781,6 +1795,7 @@ pub async fn execute_change_role(
     // subject.
     deps.event_log
         .append_role_assigned_leaf(
+            crate::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             actor_did,
             did.as_ref(),
@@ -1894,6 +1909,7 @@ pub async fn execute_register_outlet(
     })?;
     deps.event_log
         .append_context_event_with_payload(
+            crate::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::OutletRegistered,
             actor_did,
@@ -1958,6 +1974,7 @@ pub async fn execute_remove_outlet(
     })?;
     deps.event_log
         .append_context_event_with_payload(
+            crate::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::OutletRemoved,
             actor_did,
@@ -2076,6 +2093,7 @@ pub async fn execute_modify_ceiling(
     .await?;
     deps.event_log
         .append_context_event(
+            crate::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::CeilingModificationPending,
             actor_did,
@@ -2146,6 +2164,7 @@ pub async fn execute_close_context(
     .await?;
     deps.event_log
         .append_context_event(
+            crate::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::ContextClosing,
             actor_did,
@@ -2208,6 +2227,7 @@ pub async fn execute_extend_ttl(
         .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
         deps.event_log
             .append_context_event_with_payload(
+                crate::context::builder::AppendMode::AfterSideEffect,
                 &context_id_bytes,
                 scp_event_log::EventType::TtlExtensionRejected,
                 actor_did,
@@ -2252,8 +2272,10 @@ pub async fn execute_extend_ttl(
     // it (`old_deadline + additional_secs`, convergent across members), and
     // stamps the leaf with the committer-assigned `timestamp_secs`
     // (`proposal.created_at`). A context whose log yields no convergent deadline
-    // has no TTL to extend ⇒ no-op, no leaf. The append is best-effort/fail-safe
-    // (a lost leaf re-derives the shorter un-extended base on restore). The
+    // has no TTL to extend ⇒ no-op, no leaf. The governance decision is already
+    // committed, so the append is after its side effect and best-effort (a
+    // lost leaf re-derives the shorter un-extended base on restore); only an
+    // unreadable log returns an error. The
     // combinator credits `checkpoint_events_since` itself, in the one arm where
     // the `TtlExtended` leaf landed, so this helper credits nothing: three of
     // the combinator's paths (no convergent deadline, payload encode failure,
@@ -2271,7 +2293,7 @@ pub async fn execute_extend_ttl(
             consenting_members: consenting,
         },
     )
-    .await;
+    .await?;
 
     crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, context_id).await;
     Ok(())
@@ -2337,6 +2359,7 @@ pub async fn execute_transfer_admin(
     .await?;
     deps.event_log
         .append_context_event(
+            crate::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::AdminTransferred,
             actor_did,
@@ -2382,6 +2405,7 @@ pub async fn execute_create_child_context(
 
     deps.event_log
         .append_context_event(
+            crate::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::ChildContextCreated,
             actor_did,
@@ -2458,6 +2482,7 @@ pub async fn execute_modify_pruning_policy(
     .await;
     deps.event_log
         .append_context_event(
+            crate::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::PruningPolicyModified,
             actor_did,
@@ -2544,6 +2569,7 @@ pub async fn execute_add_signer(
     .await?;
     deps.event_log
         .append_context_event(
+            crate::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::SignerAdded,
             actor_did,
@@ -2627,6 +2653,7 @@ pub async fn execute_remove_signer(
     .await?;
     deps.event_log
         .append_context_event(
+            crate::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::SignerRemoved,
             actor_did,
@@ -2676,6 +2703,7 @@ pub async fn execute_modify_threshold(
     .await?;
     deps.event_log
         .append_context_event(
+            crate::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::ThresholdModified,
             actor_did,
@@ -2733,6 +2761,7 @@ pub async fn execute_establish_outlet_interface(
     .await;
     deps.event_log
         .append_context_event(
+            crate::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::OutletInterfaceEstablished,
             actor_did,
@@ -2917,6 +2946,7 @@ pub async fn execute_reset_member(
 
     deps.event_log
         .append_context_event(
+            crate::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::MemberReset,
             actor_did,
@@ -3054,6 +3084,7 @@ pub async fn execute_resolve_conflict(
     .await?;
     deps.event_log
         .append_context_event(
+            crate::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::GovernanceConflictResolved,
             actor_did,
@@ -3143,6 +3174,7 @@ pub async fn execute_promote_context(
     .await?;
     deps.event_log
         .append_context_event(
+            crate::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::ContextPromoted,
             actor_did,
@@ -3283,6 +3315,7 @@ pub async fn execute_rotate_content_keys(
 
     deps.event_log
         .append_context_event(
+            crate::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::ContentKeysRotated,
             actor_did,
@@ -3337,6 +3370,7 @@ pub async fn execute_rotate_content_keys(
                 if let Err(e) = deps
                     .event_log
                     .append_context_event_with_payload(
+                        crate::context::builder::AppendMode::AfterSideEffect,
                         &context_id_bytes,
                         scp_event_log::EventType::KeyEpochAdvance,
                         advance.author_did.as_str(),
@@ -3459,6 +3493,7 @@ pub async fn execute_reconfigure_governance(
     .await?;
     deps.event_log
         .append_context_event(
+            crate::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::GovernanceReconfigured,
             actor_did,
@@ -3498,6 +3533,7 @@ pub async fn execute_reconfigure_governance(
     .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
     deps.event_log
         .append_context_event_with_payload(
+            crate::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::GovernanceDeadlockRecovery,
             actor_did,
@@ -3600,6 +3636,7 @@ pub async fn execute_set_economic_policy(
     .await;
     deps.event_log
         .append_context_event(
+            crate::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::EconomicPolicyChanged,
             actor_did,
@@ -3656,6 +3693,7 @@ pub async fn execute_approve_spend(
         .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
     deps.event_log
         .append_context_event_with_payload(
+            crate::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::SpendApproved,
             actor_did,
@@ -3721,6 +3759,7 @@ pub async fn execute_lock_economic_policy(
     .await;
     deps.event_log
         .append_context_event(
+            crate::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::EconomicPolicyLocked,
             actor_did,
@@ -3786,6 +3825,7 @@ pub async fn execute_modify_hard_rate_limit(
     .await;
     deps.event_log
         .append_context_event(
+            crate::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::HardRateLimitModified,
             actor_did,
@@ -3912,6 +3952,7 @@ pub async fn execute_modify_pseudonym_rotation_policy(
     .await?;
     deps.event_log
         .append_context_event(
+            crate::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::PseudonymRotationPolicyModified,
             actor_did,
@@ -4159,6 +4200,7 @@ pub fn execute_propose_context_migration<'a>(
             .await;
         deps.event_log
             .append_context_event(
+                crate::context::builder::AppendMode::AfterSideEffect,
                 &context_id_bytes,
                 scp_event_log::EventType::ContextMigrationStarted,
                 actor_did,
@@ -4241,6 +4283,7 @@ pub async fn execute_cancel_context_migration(
     .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
     deps.event_log
         .append_context_event_with_payload(
+            crate::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::ContextMigrationCancelled,
             actor_did,
@@ -4436,6 +4479,7 @@ pub async fn propose_governance_action_inner(
             if let GovernanceEvent::ConflictResolved { .. } = event {
                 deps.event_log
                     .append_context_event(
+                        crate::context::builder::AppendMode::AfterSideEffect,
                         &cid_bytes,
                         scp_event_log::EventType::GovernanceFreezeExpired,
                         proposer_did.as_ref(),
@@ -4484,6 +4528,7 @@ pub async fn propose_governance_action_inner(
                 GovernanceEvent::ConflictDetected { .. } => {
                     deps.event_log
                         .append_context_event(
+                            crate::context::builder::AppendMode::AfterSideEffect,
                             &context_id_bytes,
                             scp_event_log::EventType::GovernanceConflictDetected,
                             proposer_did.as_ref(),
@@ -4498,6 +4543,7 @@ pub async fn propose_governance_action_inner(
                 GovernanceEvent::ConflictResolved { .. } => {
                     deps.event_log
                         .append_context_event(
+                            crate::context::builder::AppendMode::AfterSideEffect,
                             &context_id_bytes,
                             scp_event_log::EventType::GovernanceConflictResolved,
                             proposer_did.as_ref(),
@@ -5038,6 +5084,7 @@ pub async fn vote_on_proposal_inner(
                 GovernanceEvent::ConflictDetected { .. } => {
                     deps.event_log
                         .append_context_event(
+                            crate::context::builder::AppendMode::AfterSideEffect,
                             &context_id_bytes,
                             scp_event_log::EventType::GovernanceConflictDetected,
                             voter_did.as_ref(),
@@ -5049,6 +5096,7 @@ pub async fn vote_on_proposal_inner(
                 GovernanceEvent::ConflictResolved { .. } => {
                     deps.event_log
                         .append_context_event(
+                            crate::context::builder::AppendMode::AfterSideEffect,
                             &context_id_bytes,
                             scp_event_log::EventType::GovernanceConflictResolved,
                             voter_did.as_ref(),
@@ -5768,6 +5816,7 @@ pub async fn dispatch_governance_action(
             let context_id_bytes = context_id_to_bytes(context_id);
             deps.event_log
                 .append_context_event(
+                    crate::context::builder::AppendMode::AfterSideEffect,
                     &context_id_bytes,
                     scp_event_log::EventType::MemberSuspendedAll,
                     actor,
@@ -6061,6 +6110,7 @@ pub async fn finalize_governance_action(
     .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
     deps.event_log
         .append_context_event_with_payload(
+            crate::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             governance_event_label(&executed_event),
             executor_did.as_ref(),
@@ -7188,6 +7238,14 @@ mod commit_broadcast_retry_tests {
     struct TestEventLog;
     #[async_trait::async_trait]
     impl ContextEventLogProvider for TestEventLog {
+        fn event_log_entries(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            Ok(None)
+        }
+
         async fn init_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }

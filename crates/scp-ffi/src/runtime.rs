@@ -909,11 +909,18 @@ pub fn init_context_manager(bi: &PyBridgeInstance, local_did: &str) {
         did,
         std::sync::Arc::new(scp_clock::SystemClock),
     ));
+    let event_log = match build_event_log_provider(bi) {
+        Ok(event_log) => event_log,
+        Err(e) => {
+            tracing::error!(error = %e, "init_context_manager: no event log provider");
+            return;
+        }
+    };
     let supervisor_arc = match build_supervisor(
         bi,
         crypto,
         Box::new(NotConfiguredTransportProvider),
-        build_event_log_provider(bi),
+        event_log,
         None,
     ) {
         Ok(s) => s,
@@ -1001,11 +1008,18 @@ pub fn init_context_manager_with_local_transport(bi: &PyBridgeInstance, local_di
         did,
         std::sync::Arc::new(scp_clock::SystemClock),
     ));
+    let event_log = match build_event_log_provider(bi) {
+        Ok(event_log) => event_log,
+        Err(e) => {
+            tracing::error!(error = %e, "init_context_manager_with_local_transport: no event log provider");
+            return;
+        }
+    };
     let supervisor_arc = match build_supervisor(
         bi,
         crypto,
         Box::new(scp_core::context::LocalTransportProvider),
-        build_event_log_provider(bi),
+        event_log,
         None,
     ) {
         Ok(s) => s,
@@ -1078,13 +1092,14 @@ pub fn init_context_manager_for_test_with_transport(
         local_did.to_owned(),
         std::sync::Arc::new(scp_clock::SystemClock),
     ));
-    let supervisor_arc = match build_supervisor(
-        bi,
-        crypto,
-        transport,
-        build_event_log_provider(bi),
-        None,
-    ) {
+    let event_log = match build_event_log_provider(bi) {
+        Ok(event_log) => event_log,
+        Err(e) => {
+            tracing::error!(error = %e, "init_context_manager_for_test: no event log provider");
+            return;
+        }
+    };
+    let supervisor_arc = match build_supervisor(bi, crypto, transport, event_log, None) {
         Ok(s) => s,
         Err(e) => {
             tracing::error!(error = %e, "init_context_manager_for_test: build_supervisor failed");
@@ -1215,8 +1230,16 @@ impl ContextPersistence for ArcContextPersistence {
 /// This replaced `NoOpEventLogProvider` so that the `PyO3` bridge emits the
 /// same initial `ContextCreated` event as the NAPI and `UniFFI`
 /// bridges (cross-bridge parity, ADR-046 `OP_EVENT_LOG_APPEND`).
-pub(crate) fn build_event_log_provider(bi: &PyBridgeInstance) -> Box<dyn ContextEventLogProvider> {
-    match bi.storage_provider() {
+///
+/// # Errors
+///
+/// Returns an error when the instance has no storage provider: an event log
+/// with no store would lose every event at restart, so the bridge never
+/// builds one (spec section 17.17, capability classification).
+pub(crate) fn build_event_log_provider(
+    bi: &PyBridgeInstance,
+) -> Result<Box<dyn ContextEventLogProvider>, String> {
+    Ok(match bi.storage_provider() {
         Some(StorageProvider::InMemoryEncrypted(storage)) => {
             let protocol_repository = Arc::new(ProtocolRepository::new(Arc::clone(storage)));
             let bridge = ProtocolRepositoryEventLogBridge::new(protocol_repository);
@@ -1227,8 +1250,14 @@ pub(crate) fn build_event_log_provider(bi: &PyBridgeInstance) -> Box<dyn Context
             let bridge = ProtocolRepositoryEventLogBridge::new(protocol_repository);
             Box::new(MerkleEventLogProvider::with_persistence(Arc::new(bridge)))
         }
-        None => Box::new(MerkleEventLogProvider::new()),
-    }
+        None => {
+            return Err(
+                "no storage provider is attached, so the event log has no store; construct the \
+                 bridge with storage first (spec section 17.17)"
+                    .to_owned(),
+            );
+        }
+    })
 }
 
 /// Constructs a fresh per-instance `Supervisor` with the given providers.
@@ -4137,7 +4166,8 @@ mod tests {
                 std::sync::Arc::new(scp_clock::SystemClock),
             )),
             Box::new(scp_core::context::LocalTransportProvider),
-            build_event_log_provider(&isolated),
+            build_event_log_provider(&isolated)
+                .expect("the isolated instance carries in-memory storage"),
             None,
         )
         .expect("build_supervisor must succeed with in-memory storage set");

@@ -4434,6 +4434,14 @@ pub(crate) mod tests {
     // `unused_async` lint is expected and allowed here.
     #[async_trait::async_trait]
     impl ContextEventLogProvider for NoOpEventLog {
+        fn event_log_entries(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            Ok(None)
+        }
+
         #[allow(
             clippy::unused_async,
             reason = "async fn required by the ContextEventLogProvider async_trait; body has no await"
@@ -7327,15 +7335,27 @@ pub(crate) mod tests {
     // Drain before close (ADR-049 Decision 16; ADR-048 §5 as amended)
     // -----------------------------------------------------------------
 
-    /// Event log whose `destroy_event_log` waits for a permit on `gate`. A
-    /// gate with no permits wedges the context actor's `ShutdownSelf`, so the
-    /// Supervisor drain cannot finish until the test adds a permit.
-    struct GatedDestroyEventLog {
+    /// Event log whose `append_event`, once `armed`, signals `entered` and
+    /// then waits for a permit on `gate`. Armed after the context is created,
+    /// it wedges the actor turn that appends, so the `ShutdownSelf` queued
+    /// behind that turn, and with it the Supervisor drain, cannot finish until
+    /// the test adds a permit.
+    struct GatedAppendEventLog {
         gate: Arc<tokio::sync::Semaphore>,
+        armed: Arc<AtomicBool>,
+        entered: Arc<tokio::sync::Notify>,
     }
 
     #[async_trait::async_trait]
-    impl ContextEventLogProvider for GatedDestroyEventLog {
+    impl ContextEventLogProvider for GatedAppendEventLog {
+        fn event_log_entries(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            Ok(None)
+        }
+
         #[allow(
             clippy::unused_async,
             reason = "async fn required by the ContextEventLogProvider async_trait; body has no await"
@@ -7343,10 +7363,6 @@ pub(crate) mod tests {
         async fn init_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        #[allow(
-            clippy::unused_async,
-            reason = "async fn required by the ContextEventLogProvider async_trait; body has no await"
-        )]
         async fn append_event(
             &self,
             _: &[u8; 32],
@@ -7355,14 +7371,22 @@ pub(crate) mod tests {
             _: scp_event_log::EventPayload,
             _timestamp_secs: u64,
         ) -> Result<(), ContextCreationError> {
-            Ok(())
-        }
-        async fn destroy_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
+            if !self.armed.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            self.entered.notify_one();
             self.gate
                 .acquire()
                 .await
                 .map(drop)
                 .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))
+        }
+        #[allow(
+            clippy::unused_async,
+            reason = "async fn required by the ContextEventLogProvider async_trait; body has no await"
+        )]
+        async fn destroy_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Ok(())
         }
     }
 
@@ -7397,21 +7421,31 @@ pub(crate) mod tests {
         dir
     }
 
-    /// Builds a bridge over a Supervisor whose event-log destroy waits on
-    /// `gate`, with one created context so shutdown has an actor to stop.
+    /// Builds a bridge over a Supervisor with one created context, so shutdown
+    /// has an actor to stop. With `wedge`, the context's actor is left inside
+    /// a turn whose event-log append waits for a permit on `gate`: an explicit
+    /// TTL expiry appends its `ContextExpired` leaf, and the helper returns
+    /// once that append has started. Without `wedge`, no append waits.
     async fn sqlite_bridge_with_context(
         dir: &std::path::Path,
         gate: Arc<tokio::sync::Semaphore>,
+        wedge: bool,
     ) -> SqliteBackedBridge {
         let key_resolver: scp_core::context::governance::KeyResolver =
             Arc::new(|_: &scp_did::DID, _: scp_did::SigningKeyId| None);
+        let armed = Arc::new(AtomicBool::new(false));
+        let entered = Arc::new(tokio::sync::Notify::new());
         let supervisor = Supervisor::with_providers(
             Arc::new(NodeMlsFactory::new(
                 "did:dht:zbridgedrain".to_owned(),
                 Arc::new(scp_clock::SystemClock),
             )),
             Box::new(LocalTransportProvider),
-            Box::new(GatedDestroyEventLog { gate }),
+            Box::new(GatedAppendEventLog {
+                gate,
+                armed: Arc::clone(&armed),
+                entered: Arc::clone(&entered),
+            }),
             key_resolver,
             None,
             None,
@@ -7419,19 +7453,40 @@ pub(crate) mod tests {
             None,
             test_mls_storage(),
         );
-        supervisor
+        let params = scp_core::context::ContextParams {
+            ceiling: vec![scp_core::context::Capability::MessagesRead],
+            ttl: Some(Duration::from_secs(3_600)),
+            ..scp_core::context::ContextParams::default()
+        };
+        let handle = supervisor
             .create_context(
                 "bridge-drain-ctx".to_owned(),
-                scp_core::context::ContextParams {
-                    ceiling: vec![scp_core::context::Capability::MessagesRead],
-                    ..scp_core::context::ContextParams::default()
-                },
+                params.clone(),
                 scp_did::DID::from("did:dht:zbridgedraincreator"),
                 None,
                 Vec::new(),
             )
             .await
             .expect("create context");
+        if wedge {
+            armed.store(true, Ordering::SeqCst);
+            let expiring = Arc::clone(&supervisor);
+            let context_id = handle.context_id().to_owned();
+            drop(tokio::spawn(async move {
+                let (reply, _answer) = tokio::sync::oneshot::channel();
+                let cmd = scp_core::context::actor::commands::TtlCloseCommand::ExecuteTtlClose {
+                    payload: Box::new(scp_core::context::actor::commands::TtlContextPayload {
+                        context_id,
+                        params,
+                    }),
+                    reply,
+                };
+                drop(expiring.dispatch_ttl_close_command(cmd).await);
+            }));
+            tokio::time::timeout(Duration::from_secs(10), entered.notified())
+                .await
+                .expect("the expiry turn reaches its event-log append");
+        }
         let storage = Arc::new(
             scp_platform::sqlite::SqliteStorage::new(dir, &SQLITE_TEST_KEY).expect("open store"),
         );
@@ -7469,7 +7524,7 @@ pub(crate) mod tests {
         let dir = unique_store_dir("release-streams");
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
         let bridge = Arc::new(StreamReleasingBridge {
-            inner: sqlite_bridge_with_context(&dir, Arc::clone(&gate)).await,
+            inner: sqlite_bridge_with_context(&dir, Arc::clone(&gate), true).await,
             gate,
         });
         let outcome = bridge
@@ -7494,7 +7549,7 @@ pub(crate) mod tests {
     async fn timed_out_shutdown_keeps_lock_until_drain_finishes() {
         let dir = unique_store_dir("timeout");
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
-        let bridge = Arc::new(sqlite_bridge_with_context(&dir, Arc::clone(&gate)).await);
+        let bridge = Arc::new(sqlite_bridge_with_context(&dir, Arc::clone(&gate), true).await);
 
         let outcome = bridge
             .shutdown(Duration::from_millis(200))
@@ -7554,7 +7609,7 @@ pub(crate) mod tests {
     async fn graceful_shutdown_closes_store_before_returning() {
         let dir = unique_store_dir("graceful");
         let gate = Arc::new(tokio::sync::Semaphore::new(1));
-        let bridge = Arc::new(sqlite_bridge_with_context(&dir, gate).await);
+        let bridge = Arc::new(sqlite_bridge_with_context(&dir, gate, false).await);
 
         let outcome = bridge
             .shutdown(Duration::from_secs(10))

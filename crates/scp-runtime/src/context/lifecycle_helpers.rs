@@ -475,11 +475,14 @@ pub async fn leave_context(
     // ADR-051 (§7.3.1, §9.9.3).
     deps.event_log
         .append_membership_change_leaf(
+            crate::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::MemberLeft,
             member_did.as_ref(),
-            member_did.as_ref(),
-            &left_role_name,
+            &scp_event_log::payload::MembershipChangePayload {
+                subject_did: member_did.as_ref().to_owned(),
+                role_name: left_role_name.clone(),
+            },
             deps.clock.now_secs(),
         )
         .await?;
@@ -1292,11 +1295,14 @@ pub async fn join_context(
     if let Err(e) = deps
         .event_log
         .append_membership_change_leaf(
+            crate::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::MemberJoined,
             member_did.as_ref(),
-            member_did.as_ref(),
-            "member",
+            &scp_event_log::payload::MembershipChangePayload {
+                subject_did: member_did.as_ref().to_owned(),
+                role_name: "member".to_owned(),
+            },
             now_secs,
         )
         .await
@@ -3769,6 +3775,49 @@ async fn restore_event_log_fail_closed(
     Ok(())
 }
 
+/// Releases a restore's in-memory event log and write gate when the restore
+/// ends, by error, panic, or cancellation, after the log loaded and before the
+/// context's actor spawned (spec section 17.3, "Event log write failures").
+/// Without it the loaded log would stay in the provider with no actor to own
+/// it. [`Self::disarm`] runs right after the spawn succeeds.
+///
+/// A release touches no storage, so the next restore loads the stored log
+/// again. The drop skips the release while an actor for the context is
+/// registered: a spawn cancelled after it registered the actor leaves that
+/// actor owning the log.
+struct RestoredEventLogGuard {
+    event_log: Arc<dyn crate::context::builder::ContextEventLogProvider>,
+    supervisor: crate::context::supervisor::handle::SupervisorHandle,
+    context_id: String,
+    context_id_bytes: [u8; 32],
+    armed: bool,
+}
+
+impl RestoredEventLogGuard {
+    fn arm(deps: &ActorDeps, context_id: &str, context_id_bytes: [u8; 32]) -> Self {
+        Self {
+            event_log: Arc::clone(&deps.event_log),
+            supervisor: deps.supervisor.clone(),
+            context_id: context_id.to_owned(),
+            context_id_bytes,
+            armed: true,
+        }
+    }
+
+    /// The spawned actor owns the log; nothing is released.
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RestoredEventLogGuard {
+    fn drop(&mut self) {
+        if self.armed && !matches!(self.supervisor.lookup(&self.context_id), Ok(Some(_))) {
+            self.event_log.release_event_log(&self.context_id_bytes);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 14. restore_context (bootstrap; constructs fresh PerContextState)
 // ---------------------------------------------------------------------------
@@ -3792,8 +3841,10 @@ async fn restore_event_log_fail_closed(
 /// # Errors
 ///
 /// Returns [`ContextError::PersistenceFailed`] if no persisted state
-/// exists. Returns [`ContextError::MembershipFailed`] if the context
-/// cannot be inserted (already registered).
+/// exists. Returns [`ContextError::MembershipFailed`] if an actor for the
+/// context is already registered (checked before the event log loads) or the
+/// context cannot be inserted. Returns [`ContextError::EventLogFailed`] if
+/// the event log cannot be loaded or read.
 #[tracing::instrument(skip_all, fields(context_id))]
 #[allow(clippy::too_many_lines)]
 #[allow(dead_code)] // Bootstrap entry — see `create_context` rationale.
@@ -3821,9 +3872,10 @@ pub async fn restore_context(
     // order. The event log is hydrated only after the binding check, and the
     // floors are merged only after the event log loaded, so a restore refused
     // at any of those steps leaves the registry's floors as they were. A
-    // refusal by the floor merge leaves the hydrated in-memory log, which holds
-    // exactly the stored log and which the next restore of the context
-    // replaces.
+    // restore that fails, or is cancelled, after the event log loaded and
+    // before its actor spawns releases the hydrated in-memory log and write
+    // gate through `RestoredEventLogGuard` (spec section 17.3, "Event log
+    // write failures").
 
     validate_consequence_rules_for_import(
         &ctx_snapshot.consequence_rules,
@@ -3927,7 +3979,18 @@ pub async fn restore_context(
     // The event log is restored first: a stored log that does not load refuses
     // the restore before the floors reach the registry. The TTL deadline below
     // reads the log for the fail-safe `TtlExtended` term.
+    //
+    // A context that already has an actor is refused before the load: the
+    // load replaces the in-memory log, which that actor owns (spec section
+    // 17.3, "Event log write failures"). The guard armed after the load
+    // releases the loaded log on every exit before the spawn succeeds.
+    if deps.supervisor.lookup(context_id)?.is_some() {
+        return Err(ContextError::MembershipFailed(format!(
+            "restore of context {context_id} refused: an actor for it is already registered"
+        )));
+    }
     restore_event_log_fail_closed(deps, &restored_crypto, context_id).await?;
+    let restored_log_guard = RestoredEventLogGuard::arm(deps, context_id, ctx_id_bytes);
     let restored_crypto = restored_crypto.merge_floors(deps, &ctx_id_bytes, true)?;
 
     // Resolve the ABSOLUTE convergent TTL re-arm deadline through the partitioned
@@ -3947,11 +4010,16 @@ pub async fn restore_context(
     // (H1).
     let restore_ttl_base_secs =
         restore_committed_t0.unwrap_or(ctx_snapshot.creation_timestamp_secs);
+    // An unreadable log fails the restore; it is never read as an empty one
+    // (spec section 17.3, "Event log write failures").
     let restore_log_entries = deps
         .event_log
         .event_log_entries(&context_id_to_bytes(context_id))
-        .ok()
-        .flatten()
+        .map_err(|e| {
+            ContextError::EventLogFailed(format!(
+                "reading the restored event log of context {context_id} failed: {e}"
+            ))
+        })?
         .unwrap_or_default();
     let restore_ttl_deadline = crate::context::ttl_close_helpers::convergent_ttl_deadline(
         &restore_log_entries,
@@ -4300,6 +4368,8 @@ pub async fn restore_context(
             ContextError::SupervisorShutDown(_) => e,
             other => ContextError::MembershipFailed(other.to_string()),
         })?;
+    // The spawned actor owns the restored log from here.
+    restored_log_guard.disarm();
 
     // Fix-D — restore-time streaming crash-recovery sweep. The actor is now
     // resident with its Class-S state rehydrated (including any
@@ -4889,6 +4959,14 @@ mod restore_reconcile_tests {
     struct OkEventLog;
     #[async_trait::async_trait]
     impl ContextEventLogProvider for OkEventLog {
+        fn event_log_entries(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            Ok(None)
+        }
+
         async fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }
@@ -4915,6 +4993,14 @@ mod restore_reconcile_tests {
     struct FailingAppendEventLog;
     #[async_trait::async_trait]
     impl ContextEventLogProvider for FailingAppendEventLog {
+        fn event_log_entries(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            Ok(None)
+        }
+
         async fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }
@@ -5559,6 +5645,231 @@ mod restore_reconcile_tests {
         assert!(
             matches!(err, ContextError::PersistenceFailed(ref msg) if msg.contains("malformed")),
             "expected a PersistenceFailed citing the malformed ceiling, got {err:?}"
+        );
+    }
+
+    /// An event log over `storage`, as production builds it.
+    fn stored_event_log(
+        storage: &Arc<InMemoryStorage>,
+    ) -> crate::context::providers::MerkleEventLogProvider {
+        crate::context::providers::MerkleEventLogProvider::with_persistence(Arc::new(
+            crate::store::context::ProtocolRepositoryEventLogBridge::new(Arc::new(
+                crate::store::ProtocolRepository::new_for_testing(Arc::clone(storage)),
+            )),
+        ))
+    }
+
+    /// Restore deps over a supervisor that serves `snapshot` and keeps its
+    /// event log over `storage`.
+    async fn deps_with_stored_event_log(
+        snapshot: ContextSnapshot,
+        storage: &Arc<InMemoryStorage>,
+    ) -> (Arc<Supervisor>, crate::context::actor::deps::ActorDeps) {
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
+            "did:dht:z6MkRestoreReconcile".to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
+        ));
+        let supervisor = Supervisor::with_providers(
+            crypto,
+            Box::new(OkTransport),
+            Box::new(stored_event_log(storage)),
+            Arc::new(|_: &DID, _: scp_did::SigningKeyId| None),
+            Some(Box::new(ServingPersistence { snapshot })),
+            None,
+            None,
+            None,
+            mls_storage(),
+        );
+        let deps = supervisor
+            .build_actor_deps_loaded(&DID("did:dht:z6MkRestoreReconcile".to_owned()))
+            .await
+            .expect("build_actor_deps");
+        (supervisor, deps)
+    }
+
+    /// A restore that fails after the event log loaded, here on the §9.10.4
+    /// routing check, releases the loaded in-memory log, so no log stays in
+    /// the provider without an actor to own it (spec section 17.3, "Event log
+    /// write failures"). The stored log stays.
+    #[tokio::test]
+    async fn a_restore_failing_after_the_load_releases_the_loaded_log() {
+        let ctx_id = "restore-case-release-after-load";
+        let ctx_bytes = crate::context::state::context_id_to_bytes(ctx_id);
+        let (mut snapshot, _) = harvest_snapshot(ctx_id, false).await;
+        snapshot.context_id = ctx_id.to_owned();
+        snapshot.routing = ContextRouting::for_mode(true, [0u8; 32]);
+        let storage = Arc::new(InMemoryStorage::new());
+        let writer = stored_event_log(&storage);
+        writer
+            .init_event_log(&ctx_bytes)
+            .await
+            .expect("the stored log is written");
+        writer
+            .append_event(
+                &ctx_bytes,
+                scp_event_log::EventType::MemberJoined,
+                "",
+                scp_event_log::EventPayload::default(),
+                1_600_000_000,
+            )
+            .await
+            .expect("the stored log holds one entry");
+
+        let (_supervisor, deps) = deps_with_stored_event_log(snapshot, &storage).await;
+        let handle = ContextHandle::new(ctx_id.to_owned(), ContextParams::default());
+        let err = lifecycle_helpers::restore_context(&deps, ctx_id, &handle, None)
+            .await
+            .expect_err("routing/mode disagreement must fail closed");
+        assert!(
+            matches!(err, ContextError::PersistenceFailed(_)),
+            "expected the routing refusal, got {err:?}"
+        );
+        assert!(
+            deps.event_log
+                .event_log_entries(&ctx_bytes)
+                .expect("the provider answers")
+                .is_none(),
+            "the failed restore released the log it loaded"
+        );
+        let reloaded = stored_event_log(&storage);
+        assert_eq!(
+            reloaded.restore_event_log(&ctx_bytes).await.unwrap(),
+            crate::context::builder::EventLogRestore::Loaded { entries: 1 },
+            "the release leaves the stored log"
+        );
+    }
+
+    /// A restore of a context whose actor is registered is refused before the
+    /// event log loads, so the log that actor owns in memory is not replaced
+    /// by the stored one (spec section 17.3, "Event log write failures").
+    #[tokio::test]
+    async fn a_restore_of_a_running_context_leaves_its_log_in_memory() {
+        let ctx_id = "restore-case-running-actor";
+        let ctx_bytes = crate::context::state::context_id_to_bytes(ctx_id);
+        let (mut snapshot, _) = harvest_snapshot(ctx_id, false).await;
+        snapshot.context_id = ctx_id.to_owned();
+        let storage = Arc::new(InMemoryStorage::new());
+        let (supervisor, deps) = deps_with_stored_event_log(snapshot, &storage).await;
+        // The running context's log: one entry in memory.
+        deps.event_log
+            .init_event_log(&ctx_bytes)
+            .await
+            .expect("the running context's log");
+        deps.event_log
+            .append_event(
+                &ctx_bytes,
+                scp_event_log::EventType::MemberJoined,
+                "",
+                scp_event_log::EventPayload::default(),
+                1_599_999_999,
+            )
+            .await
+            .expect("the running context's entry");
+        // Another writer stores a longer log under the same id.
+        let other = stored_event_log(&storage);
+        other.restore_event_log(&ctx_bytes).await.unwrap();
+        for at in 0..2u64 {
+            other
+                .append_event(
+                    &ctx_bytes,
+                    scp_event_log::EventType::MemberJoined,
+                    "",
+                    scp_event_log::EventPayload::default(),
+                    1_600_000_000 + at,
+                )
+                .await
+                .unwrap();
+        }
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        supervisor.register_actor_handle_for_test(
+            ctx_id,
+            crate::context::actor::ContextActorHandle::from_sender(tx),
+        );
+
+        let handle = ContextHandle::new(ctx_id.to_owned(), ContextParams::default());
+        let err = lifecycle_helpers::restore_context(&deps, ctx_id, &handle, None)
+            .await
+            .expect_err("a running context is not restored");
+        assert!(
+            matches!(err, ContextError::MembershipFailed(_)),
+            "expected the running-actor refusal, got {err:?}"
+        );
+        assert_eq!(
+            deps.event_log
+                .event_log_entries(&ctx_bytes)
+                .unwrap()
+                .map(|entries| entries.len()),
+            Some(1),
+            "the running actor's log stays as it was"
+        );
+    }
+
+    /// Shutdown releases each context's in-memory event log and leaves the
+    /// stored log, so a restart restores it (spec section 17.3, "Event log
+    /// write failures"). Shutdown is not a deletion.
+    #[tokio::test]
+    async fn shutdown_keeps_the_stored_event_log() {
+        let ctx_id = "shutdown-keeps-stored-log";
+        let ctx_bytes = crate::context::state::context_id_to_bytes(ctx_id);
+        let storage = Arc::new(InMemoryStorage::new());
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
+            "did:dht:z6MkRestoreReconcile".to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
+        ));
+        let supervisor = Supervisor::with_providers(
+            crypto,
+            Box::new(OkTransport),
+            Box::new(stored_event_log(&storage)),
+            Arc::new(|_: &DID, _: scp_did::SigningKeyId| None),
+            Some(Box::new(SharedCapture(Arc::new(
+                CapturingPersistence::default(),
+            )))),
+            None,
+            None,
+            None,
+            mls_storage(),
+        );
+        supervisor
+            .create_context(
+                ctx_id.to_owned(),
+                ContextParams {
+                    mode: ContextMode::Encrypted,
+                    ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
+                    ..ContextParams::default()
+                },
+                DID("did:dht:z6MkShutdownKeepsLog".to_owned()),
+                Some([7u8; 32]),
+                Vec::new(),
+            )
+            .await
+            .expect("create_context should succeed");
+        let deps = supervisor
+            .build_actor_deps_loaded(&DID("did:dht:z6MkShutdownKeepsLog".to_owned()))
+            .await
+            .expect("build_actor_deps");
+        let created = deps
+            .event_log
+            .event_log_entries(&ctx_bytes)
+            .unwrap()
+            .expect("the created context has a log")
+            .len();
+
+        lifecycle_helpers::shutdown_all_contexts(&supervisor).await;
+
+        assert!(
+            deps.event_log
+                .event_log_entries(&ctx_bytes)
+                .unwrap()
+                .is_none(),
+            "shutdown released the in-memory log"
+        );
+        assert_eq!(
+            stored_event_log(&storage)
+                .restore_event_log(&ctx_bytes)
+                .await
+                .unwrap(),
+            crate::context::builder::EventLogRestore::Loaded { entries: created },
+            "the stored log survives shutdown"
         );
     }
 

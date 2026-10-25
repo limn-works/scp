@@ -2413,7 +2413,7 @@ mod tests {
             .prune_before_checkpoint(&ctx_id_bytes, 10, &policy)
             .await
             .unwrap();
-        assert_eq!(removed, 7);
+        assert_eq!(removed, Some(7));
 
         let entries = provider.entries(&ctx_id_bytes).unwrap();
         assert_eq!(entries.len(), 3);
