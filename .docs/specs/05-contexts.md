@@ -2344,7 +2344,7 @@ Operations fall into two persistence tiers.
 **Sync-persisted** — the caller's acknowledgment implies durable commit. A process crash immediately after the ack does not roll back the operation, and no observer (as defined above) sees the effect before the persist completes. Sync-persisted operations — this is the complete enumeration; §9.4.2 lists the subset that is a security invariant:
 
 - MLS epoch advance, sender-key rotation, MLS member removal
-- A sender-key distribution queued for publish, in the same durable step as the rotation or Add that queued it, kept until a relay accepts it or the republish rule drops it (`09-security-model.md` §9.16.9 "A distribution whose publish fails")
+- A sender-key distribution queued for publish, in the same durable step as the rotation or Add that queued it, kept until a relay accepts it, the republish rule drops it, a newer distribution to the same target and recipient key replaces it, or its target leaves (`09-security-model.md` §9.16.9 "A distribution whose publish fails"); the drop on departure rides the durable step of the removal
 - Every authorization-downward operation enumerated in §9.4.2
 - Event log append (chain integrity)
 - Saga phase transitions and per-actor saga-state transitions (§5.15.4)
