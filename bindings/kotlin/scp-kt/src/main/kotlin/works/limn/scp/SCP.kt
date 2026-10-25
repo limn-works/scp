@@ -750,10 +750,11 @@ class SCP internal constructor(
     suspend fun contextResetTtlTimer(
         handle: ContextHandle,
         newSeconds: ULong,
-    ): Unit = inner.contextResetTtlTimer(
-        handle = handle,
-        newSeconds = newSeconds,
-    )
+    ): Unit =
+        inner.contextResetTtlTimer(
+            handle = handle,
+            newSeconds = newSeconds,
+        )
 
     /**
      * Forwards to [NativeScp.contextSend] on [inner].
