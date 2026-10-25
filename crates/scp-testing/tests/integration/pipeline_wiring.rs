@@ -9241,7 +9241,10 @@ fn no_shipped_source_builds_an_event_log_without_a_store() {
         .collect();
 
     let mut files = Vec::new();
-    let mut scanned = std::collections::BTreeSet::new();
+    // A crate counts as scanned only when its `src` walk yields a file, so a
+    // moved or unreadable source tree fails the must-cover check below
+    // instead of passing it with nothing read.
+    let mut scanned = std::collections::BTreeMap::new();
     let mut test_only = std::collections::BTreeSet::new();
     for (dir, manifest) in crate_dirs.iter().zip(&manifests) {
         let name = manifest_package_name(manifest).expect("a manifest names its package");
@@ -9254,8 +9257,12 @@ fn no_shipped_source_builds_an_event_log_without_a_store() {
             test_only.insert(name);
             continue;
         }
+        let before = files.len();
         collect_rust_files(&dir.join("src"), &mut files);
-        scanned.insert(name);
+        let found = files.len() - before;
+        if found > 0 {
+            scanned.insert(name, found);
+        }
     }
     assert_eq!(
         test_only,
@@ -9272,9 +9279,10 @@ fn no_shipped_source_builds_an_event_log_without_a_store() {
         "scp-relay",
         "scp-client-wasm",
     ] {
+        let found = scanned.get(shipped).copied().unwrap_or(0);
         assert!(
-            scanned.contains(shipped),
-            "the scan must cover {shipped}: {scanned:?}"
+            found >= 1,
+            "the scan must read at least one source file of {shipped}, read {found}: {scanned:?}"
         );
     }
     assert!(
