@@ -42,7 +42,9 @@ use crate::native::server::RelayConfig;
 use crate::native::storage::BlobStorage;
 use crate::relay::push_gate;
 use crate::relay::rate_limit::{self, ConnectionTracker, PublishRateLimiter};
-use scp_relay_client::{ClientMessage, DEFAULT_QUERY_LIMIT, MIN_BLOB_TTL, RelayMessage};
+use scp_relay_client::{
+    ClientMessage, DEFAULT_QUERY_LIMIT, MAX_BLOB_TTL, MIN_BLOB_TTL, RelayMessage,
+};
 
 /// Configuration for the UDP/DTLS listener.
 ///
@@ -936,14 +938,11 @@ async fn handle_udp_publish<S: BlobStorage>(
     }
 
     // Validate TTL.
-    if blob_ttl < MIN_BLOB_TTL || blob_ttl > config.max_blob_ttl {
+    if !(MIN_BLOB_TTL..=MAX_BLOB_TTL).contains(&blob_ttl) {
         let err = RelayMessage::Err {
             ref_id,
             code: 400,
-            msg: format!(
-                "blob_ttl must be {}-{}, got {}",
-                MIN_BLOB_TTL, config.max_blob_ttl, blob_ttl
-            ),
+            msg: format!("blob_ttl must be {MIN_BLOB_TTL}-{MAX_BLOB_TTL}, got {blob_ttl}"),
         };
         send_dtls_response(sessions, remote_addr, &err).await;
         return;

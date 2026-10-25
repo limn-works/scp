@@ -306,8 +306,8 @@ pub enum PseudonymAnnouncementDecision {
 ///
 /// `registry` is the caller's peer registry, or `None` for a broadcast context
 /// (which carries no registry). `own_routing_ids` holds the RECEIVER's own
-/// routing IDs in this context: its current routing ID and, while that value is
-/// in its rotation grace, its previous one (empty when it has derived none).
+/// routing IDs in this context: its current routing ID and every routing ID on
+/// its query-only list (empty when it has derived none).
 /// The function performs NO side effects.
 ///
 /// # Own-routing-ID collision guard (S1)
@@ -317,8 +317,9 @@ pub enum PseudonymAnnouncementDecision {
 /// ID`: the sender binding passes, the value is not reserved, and the victim's
 /// own routing ID is NOT in its PEER registry (which excludes self) — so the
 /// victim would accept it and misroute every honest sender addressing M to the
-/// victim's own address. The in-grace previous routing ID is still subscribed,
-/// so it needs the same guard. This is sound because a member never
+/// victim's own address. A routing ID on the receiver's query-only list is
+/// still read at reconnect catch-up, so it needs the same guard. This is
+/// sound because a member never
 /// legitimately receives a peer announcement carrying its own routing ID — its
 /// own announcements are self-echoes dropped at the MLS layer
 /// (`CannotDecryptOwnMessage`) before reaching this classifier, and a distinct
@@ -739,11 +740,11 @@ mod tests {
         // the RECEIVER's own. The sender binding passes, the value is not
         // reserved, and it is NOT in the peer registry (which excludes self) —
         // but the shared classifier, given the receiver's own routing IDs,
-        // rejects it as a collision. The in-grace previous routing ID is
-        // guarded the same way as the current one.
+        // rejects it as a collision. A routing ID on the receiver's query-only
+        // list is guarded the same way as the current one.
         let current = [0x77u8; 32];
-        let previous = [0x78u8; 32];
-        for claimed in [current, previous] {
+        let query_only = [0x78u8; 32];
+        for claimed in [current, query_only] {
             for bytes in [announcement_bytes(BOB, claimed), v2_bytes(BOB, 3, claimed)] {
                 assert_eq!(
                     classify_pseudonym_announcement(
@@ -751,7 +752,7 @@ mod tests {
                         BOB,
                         CTX,
                         Some(&HashMap::new()),
-                        &[current, previous],
+                        &[current, query_only],
                     ),
                     PseudonymAnnouncementDecision::Rejected {
                         reason: REJECT_COLLISION,
@@ -769,7 +770,7 @@ mod tests {
                 BOB,
                 CTX,
                 Some(&HashMap::new()),
-                &[current, previous],
+                &[current, query_only],
             ),
             PseudonymAnnouncementDecision::Accept {
                 member_did: DID(BOB.to_owned()),
@@ -1029,7 +1030,7 @@ mod tests {
                 v58_rejected("pseudonym announcement collides with another member's routing ID"),
             ),
             (
-                "receiver's in-grace previous routing ID",
+                "receiver's query-only routing ID",
                 golden.to_vec(),
                 Some(HashMap::new()),
                 vec![[0x45u8; 32], [0x43u8; 32]],

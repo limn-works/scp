@@ -543,7 +543,10 @@ pub async fn drain_and_deliver_sender_keys(
             let sealed = crypto_state.mls_encrypt_management(&message);
             match sealed {
                 Ok(sealed) => {
-                    if let Err(e) = deps.transport.send_message(&routing_id, &sealed).await {
+                    // A sealed management message requests the relay maximum
+                    // (spec 09 §9.10.2 "Blob TTL by message type").
+                    let ttl = scp_protocol::envelope::outer::BlobTtl::sealed_management();
+                    if let Err(e) = deps.transport.send_message(&routing_id, &sealed, ttl).await {
                         tracing::warn!(target_did = %target_did, context_id = %context_id, error = %e, "failed to send rotated sender key");
                     }
                 }
@@ -761,9 +764,9 @@ pub async fn close_context_with_key(
         // The context is terminal at this point, so the routing axis no longer
         // needs to agree with the (also torn-down) crypto axis.
         state.routing = ContextRouting::Broadcast;
-        // §9.10.4.1 "Leave, close and expiry during a grace": a terminal
+        // §9.10.4.1 "Leave, close and expiry": a terminal
         // context drops its previous routing ID and pending rotation work.
-        state.class_s.pseudonym_rotation.discard_grace();
+        state.class_s.pseudonym_rotation.discard_rotation_state();
 
         // Participation decay: clear participation cache and cooldown state
         // on context close (#1530).
@@ -1075,7 +1078,7 @@ pub async fn join_context(
     // The same commit records the §9.10.4.1 membership trigger for the local
     // member; the rollbacks below restore `rotation_before_add` with the MLS
     // removal, so an add that does not commit triggers no rotation.
-    let rotation_before_add = cell.class_s.pseudonym_rotation;
+    let rotation_before_add = cell.class_s.pseudonym_rotation.clone();
     let add_output = match cell
         .commit_class_s_keep(deps, &context_id, |mut v| {
             let state = v.rest_mut();
@@ -1692,7 +1695,8 @@ pub(in crate::context) async fn create_context(
     // min_protocol_version.
     params.check_version_compatibility(scp_protocol::envelope::SCP_PROTOCOL_VERSION)?;
     // §9.10.4.1 validity criterion: creation rejects a rotation policy with no
-    // trigger or an interval shorter than the rotation grace.
+    // trigger or an interval shorter than
+    // `PSEUDONYM_MIN_ROTATION_INTERVAL_SECS`.
     if let Some(policy) = &params.pseudonym_rotation {
         policy.validate()?;
     }
@@ -4251,9 +4255,10 @@ pub async fn restore_context(
             // §9.10.4.1 Class S: same-node restore REHYDRATES the rotation state.
             // A restore with `announce_pending` set re-publishes the announcement
             // for the persisted epoch (the actor's rotation arm signals the
-            // driver until the publish succeeds), and a previous routing ID whose
-            // grace ended while the node was down is discarded by the grace arm
-            // on the first actor turn. `T0` is the committed value (§5.13.3 rule
+            // driver until the publish succeeds). The query-only list is restored
+            // whole: an entry that expired while the node was down stays until the
+            // next rotation drops it, and `LocalRoutingIds` leaves it out. `T0` is the
+            // committed value (§5.13.3 rule
             // 9), never the snapshot's copy; a keyless restore holds none and
             // follows no interval schedule until reconnection.
             pseudonym_rotation: ctx_snapshot
@@ -4871,7 +4876,12 @@ mod restore_reconcile_tests {
         async fn delete_published(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        async fn send_message(&self, _id: &[u8; 32], _payload: &[u8]) -> Result<(), ContextError> {
+        async fn send_message(
+            &self,
+            _id: &[u8; 32],
+            _payload: &[u8],
+            _ttl: scp_protocol::envelope::outer::BlobTtl,
+        ) -> Result<(), ContextError> {
             Ok(())
         }
     }

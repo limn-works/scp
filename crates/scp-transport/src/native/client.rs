@@ -2163,10 +2163,17 @@ mod tests {
         let client = NativeRelayClient::connect(&url).await.unwrap();
 
         let routing_id = [0x12; 32];
-        let framed = OuterEnvelope::frame_mls_message(&routing_id, None, 3600, vec![7; 48])
-            .unwrap()
-            .to_bytes()
-            .unwrap();
+        let framed = OuterEnvelope::frame_mls_message(
+            &routing_id,
+            None,
+            scp_protocol::envelope::outer::BlobTtl::for_message_type(
+                scp_protocol::envelope::inner::MessageType::Content,
+            ),
+            vec![7; 48],
+        )
+        .unwrap()
+        .to_bytes()
+        .unwrap();
         for blob in [vec![0xFF; 40], framed] {
             client
                 .publish_raw(&routing_id, 3600, blob)

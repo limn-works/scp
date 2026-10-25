@@ -17,8 +17,8 @@
 //! - A non-committer that processes a reset records no rotation trigger (09
 //!   §9.10.4.1 "Membership-change criterion": one leaf of the DID before and
 //!   after is no change).
-//! - A member that processes its own removal discards its grace and records
-//!   no trigger.
+//! - A member that processes its own removal discards its query-only list and
+//!   records no trigger.
 
 #![cfg(test)]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -123,7 +123,12 @@ impl ContextTransportProvider for RecordingTransport {
     async fn delete_published(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    async fn send_message(&self, _id: &[u8; 32], payload: &[u8]) -> Result<(), ContextError> {
+    async fn send_message(
+        &self,
+        _id: &[u8; 32],
+        payload: &[u8],
+        _ttl: scp_protocol::envelope::outer::BlobTtl,
+    ) -> Result<(), ContextError> {
         self.0.push(payload.to_vec());
         Ok(())
     }
@@ -606,7 +611,7 @@ async fn a_reset_without_the_targets_key_package_changes_nothing() {
 async fn a_non_committer_records_no_rotation_for_a_reset() {
     let ctx = "reset-records-no-rotation";
     let (mut alice, mut bob) = trio(ctx).await;
-    let rotation_before: PseudonymRotationState = bob.cell.class_s.pseudonym_rotation;
+    let rotation_before: PseudonymRotationState = bob.cell.class_s.pseudonym_rotation.clone();
     assert!(!rotation_before.membership_change_pending);
 
     let output = reset_carol(&mut alice, ctx, Some(&key_package(CAROL)))
@@ -635,11 +640,10 @@ async fn a_non_committer_records_no_rotation_for_a_reset() {
 }
 
 /// Spec 09 §9.10.4.1 "Record lifetime": Bob processes the real Commit Alice
-/// committed to remove him. He discards the previous routing ID he kept for
-/// its grace and his pending announcement, and records no rotation trigger,
-/// persisted with the Commit.
+/// committed to remove him. He discards his query-only list and his pending
+/// announcement, and records no rotation trigger, persisted with the Commit.
 #[tokio::test]
-async fn the_removed_member_discards_its_grace_and_records_no_rotation() {
+async fn the_removed_member_discards_its_rotation_state_and_records_no_rotation() {
     let ctx = "processed-own-removal";
     let (mut alice, mut bob) = trio(ctx).await;
     bob.cell
@@ -652,9 +656,9 @@ async fn the_removed_member_discards_its_grace_and_records_no_rotation() {
             Ok(())
         })
         .await
-        .expect("seed Bob's grace");
+        .expect("seed Bob's rotation");
     let seeded = bob.store.snapshot(ctx).expect("the seed persisted");
-    assert!(seeded.pseudonym_rotation.previous().is_some());
+    assert!(!seeded.pseudonym_rotation.query_only.is_empty());
     assert!(seeded.pseudonym_rotation.announce_pending());
 
     let remove = alice
@@ -670,10 +674,9 @@ async fn the_removed_member_discards_its_grace_and_records_no_rotation() {
         .expect("Bob processes his own removal");
 
     let persisted = bob.store.snapshot(ctx).expect("the Commit persisted");
-    assert_eq!(
-        persisted.pseudonym_rotation.previous(),
-        None,
-        "the grace is discarded"
+    assert!(
+        persisted.pseudonym_rotation.query_only.is_empty(),
+        "the query-only list is discarded"
     );
     assert!(
         !persisted.pseudonym_rotation.announce_pending(),

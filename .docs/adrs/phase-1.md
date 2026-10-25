@@ -743,7 +743,6 @@ Published out-of-band (relay metadata page, a service-record entry). Relay MAY i
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `max_blob_size` | 262144 | Max blob bytes |
-| `max_blob_ttl` | 604800 | Max TTL seconds |
 | `max_subscriptions_per_connection` | 100 | Concurrent subscriptions per WebSocket |
 | `max_query_limit` | 1000 | Max QUERY limit |
 | `ipv6_source_prefix` | 64 | Leading bits of an IPv6 source address that key every per-source limit, so one host's /64 counts once; an IPv4 source address counts whole, and an IPv4-mapped IPv6 address (`::ffff:0:0/96`) counts as the IPv4 address it maps |

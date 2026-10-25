@@ -203,6 +203,10 @@ const PSEUDONYM_ROTATION_SRC: &str =
 // the PUSH-013 push routing-ID query (§10.7.1).
 const HANDLERS_PUSH_SRC: &str =
     include_str!("../../../../crates/scp-runtime/src/context/actor/handlers/push.rs");
+// Push helpers source — owns `push_helpers::wake_target`, the push-wake pull
+// target (ADR-029 §2). Pinned by `push_wake_targets_reach_push_helpers`.
+const PUSH_HELPERS_SRC: &str =
+    include_str!("../../../../crates/scp-runtime/src/context/push_helpers.rs");
 // Push registrar source — owns `PushRegistrar::register`, which signs one
 // `PushRegistration` per relay and publishes it at that relay's push routing ID
 // (PUSH-014, §10.7.1). Pinned by `push_registrar_register_reaches_relay_publish`.
@@ -334,7 +338,8 @@ const UNIFFI_SERVER_SRC: &str = include_str!("../../../../crates/scp-ffi/uniffi/
 // bridge's governance propose path.
 // Raised 89 -> 90 when the local member's pseudonym rotation (spec 09
 // §9.10.4.1) was wired: one assertion pins the rotate command, the routing-ID
-// query, and the actor's rotation and grace arms to their helpers.
+// query, and the actor's rotation arm to their helpers. (The grace arm it also
+// pinned was deleted with Alec's approval when spec 09 dropped the grace.)
 // Raised 90 -> 91 when non-committing members began rotating on a processed
 // membership Commit (spec 09 §9.10.4.1): one assertion pins the incoming-Commit
 // handler to the DID classifier, the fail-closed commit, and the rotation signal.
@@ -2694,9 +2699,10 @@ fn modify_pseudonym_rotation_policy_reaches_its_executor() {
 /// `QueriesCommand::LocalRoutingIds`, answered by
 /// `queries_helpers::local_routing_ids`. The actor run loop drives the
 /// rotation arm (`on_rotation_tick`, which signals from
-/// `PseudonymRotationState::wake`) and the grace arm (`on_grace_tick`, which
-/// drops the previous routing ID through the restore commit), and
-/// `reconcile_timers` re-arms both from state.
+/// `PseudonymRotationState::wake`), and `reconcile_timers` re-arms it from
+/// state. `record_rotation` puts the routing ID the member left on the
+/// query-only list, and the rotated state persists inside the compensating
+/// commit.
 #[test]
 fn local_pseudonym_rotation_reaches_its_helpers() {
     assert!(
@@ -2756,8 +2762,8 @@ fn local_pseudonym_rotation_reaches_its_helpers() {
 
     let run = extract_fn_body(ACTOR_MOD_SRC, "run").expect("ContextActor::run exists");
     assert!(
-        run.contains("self.on_rotation_tick()") && run.contains("self.on_grace_tick()"),
-        "the actor run loop must drive the rotation and grace arms"
+        run.contains("self.on_rotation_tick()"),
+        "the actor run loop must drive the rotation arm"
     );
     assert!(
         fn_body_contains(
@@ -2771,15 +2777,32 @@ fn local_pseudonym_rotation_reaches_its_helpers() {
         fn_body_contains(ACTOR_MOD_SRC, "on_rotation_tick", ".wake("),
         "on_rotation_tick must signal from PseudonymRotationState::wake"
     );
+
+    // §9.10.4.1 "Query-only list": the rotation puts the routing ID it left on
+    // the query-only list, and the rotated state reaches the store only
+    // through the fail-closed restore-direction commit, whose failure restores
+    // the old Class-S state and the old routing ID.
+    let record = extract_fn_body(PSEUDONYM_ROTATION_SRC, "record_rotation")
+        .expect("PseudonymRotationState::record_rotation exists");
     assert!(
-        fn_body_contains(ACTOR_MOD_SRC, "on_grace_tick", "commit_class_s_restore(")
-            && fn_body_contains(
-                ACTOR_MOD_SRC,
-                "on_grace_tick",
-                "ContextEvent::PseudonymGraceEnded"
-            ),
-        "on_grace_tick must drop the previous routing ID through the restore commit \
-         and emit PseudonymGraceEnded"
+        record.contains("self.query_only.push(QueryOnlyRoutingId")
+            && record.contains("routing_id: previous_routing_id"),
+        "record_rotation must push the routing ID it left onto query_only"
+    );
+    let record_at = helper
+        .find("record_rotation(")
+        .expect("rotate_pseudonym calls record_rotation");
+    let commit_at = helper
+        .find("commit_class_s_compensating(")
+        .expect("rotate_pseudonym persists through commit_class_s_compensating");
+    let commit_tail = &helper[commit_at..];
+    assert!(
+        record_at < commit_at
+            && commit_tail.contains("state.class_s.pseudonym_rotation = rotation")
+            && commit_tail.contains("set_local_pseudonym(old)"),
+        "rotate_pseudonym must record the rotation, then persist the rotated state \
+         (query-only list included) inside commit_class_s_compensating, whose \
+         compensation restores the old routing ID"
     );
 }
 
@@ -4430,10 +4453,22 @@ fn push_wake_targets_reach_push_helpers() {
         fn_body_contains(
             HANDLERS_PUSH_SRC,
             "dispatch",
-            "push_helpers::wake_target(state, now_secs)"
+            "push_helpers::wake_target(state)"
         ),
         "handlers::push::dispatch must answer PushCommand::WakeTarget from push_helpers::wake_target"
     );
+    // §9.10.4.1 "Subscription" and ADR-029 §2: a push wake pulls the shared
+    // and current routing IDs only. A routing ID the member rotated away from
+    // is queried by reconnect catch-up alone, so the wake target reads no
+    // rotation state.
+    let wake =
+        extract_fn_body(PUSH_HELPERS_SRC, "wake_target").expect("push_helpers::wake_target exists");
+    for forbidden in ["pseudonym_rotation", "query_only", "previous"] {
+        assert!(
+            !wake.contains(forbidden),
+            "push_helpers::wake_target must read no previous routing ID, found `{forbidden}`"
+        );
+    }
 }
 
 /// ADR-029 §2 push-wake pull mode: a silent push reaches the relay

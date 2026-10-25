@@ -68,9 +68,6 @@ use scp_relay_client::{ClientMessage, RelayMessage};
 /// [`TransportAdapter`] methods to ensure the trait is dyn-compatible.
 type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
-/// Default blob TTL for PUBLISH operations (1 hour).
-const DEFAULT_BLOB_TTL: u32 = 3600;
-
 // ---------------------------------------------------------------------------
 // Send+Sync wrapper for JsValue-containing types
 // ---------------------------------------------------------------------------

@@ -77,7 +77,15 @@ pub trait ContextTransportProvider: Send + Sync {
 
     // -- Messaging operations (SCP-020) ------------------------------------
 
-    /// Sends an encrypted message via transport.
+    /// Sends an encrypted message via transport, asking the relay to store it
+    /// for `ttl`.
+    ///
+    /// The caller builds `ttl` with the
+    /// [`BlobTtl`](scp_protocol::envelope::outer::BlobTtl) constructor for the
+    /// kind of message it sends or, for a Commit retry, from the first attempt
+    /// ([`BlobTtl::republish_commit`](scp_protocol::envelope::outer::BlobTtl::republish_commit))
+    /// (`09-security-model.md` §9.10.2 "Blob TTL by message type" and
+    /// "Republish rule"). An implementation frames it unchanged.
     ///
     /// # Errors
     ///
@@ -86,6 +94,7 @@ pub trait ContextTransportProvider: Send + Sync {
         &self,
         context_id: &[u8; 32],
         encrypted_payload: &[u8],
+        ttl: scp_protocol::envelope::outer::BlobTtl,
     ) -> Result<(), ContextError>;
 
     /// Sends a payload to a specific routing ID (e.g., personal invitation routing ID).
@@ -685,6 +694,7 @@ impl ContextTransportProvider for LocalTransportProvider {
         &self,
         _context_id: &[u8; 32],
         _encrypted_payload: &[u8],
+        _ttl: scp_protocol::envelope::outer::BlobTtl,
     ) -> Result<(), ContextError> {
         Ok(())
     }
@@ -735,6 +745,7 @@ impl ContextTransportProvider for NotConfiguredTransportProvider {
         &self,
         _context_id: &[u8; 32],
         _encrypted_payload: &[u8],
+        _ttl: scp_protocol::envelope::outer::BlobTtl,
     ) -> Result<(), ContextError> {
         Err(ContextError::TransportFailed(
             "transport not configured — call transport_connect() to set up a relay \
@@ -1373,7 +1384,12 @@ mod tests {
         async fn delete_published(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        async fn send_message(&self, _: &[u8; 32], _: &[u8]) -> Result<(), ContextError> {
+        async fn send_message(
+            &self,
+            _: &[u8; 32],
+            _: &[u8],
+            _ttl: scp_protocol::envelope::outer::BlobTtl,
+        ) -> Result<(), ContextError> {
             Ok(())
         }
     }

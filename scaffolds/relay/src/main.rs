@@ -52,8 +52,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bind_addr,
         // Maximum blob payload size (256 KB default).
         max_blob_size: 262_144,
-        // Maximum blob TTL in seconds (7 days default).
-        max_blob_ttl: 604_800,
         // Connection limits.
         max_total_connections: 1_000,
         max_connections_per_ip: 10,

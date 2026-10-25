@@ -60,7 +60,7 @@ pub use nesting::{compute_ceiling_intersection, validate_child_ttl, validate_nes
 pub use params::{
     Capability, CeilingPolicy, ContextMode, ContextParams, FieldVisibility, GovernanceModel,
     MemoryScope, MetadataVisibilityPolicy, MigrationSource, OutletRegistration,
-    PSEUDONYM_ROTATION_GRACE_SECS, ProjectionOverride, ProjectionPolicy, ProjectionRule,
+    PSEUDONYM_MIN_ROTATION_INTERVAL_SECS, ProjectionOverride, ProjectionPolicy, ProjectionRule,
     PromotionPolicy, PseudonymRotationPolicy, PseudonymRotationPolicyError, PublicMetadata,
     RoleDefinition, RuntimeMetadata, TemplateId, decode_protocol_version, encode_protocol_version,
 };

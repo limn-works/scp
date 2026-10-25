@@ -113,7 +113,6 @@ Upon WebSocket connection to `/scp/v1`, the relay sends an unsolicited `EVENT` m
   "extensions": ["scp:ext:broadcast-projection/v1"],
   "limits": {
     "max_blob_size": 262144,
-    "max_blob_ttl": 604800,
     "max_subscriptions": 100,
     "max_query_limit": 1000
   }

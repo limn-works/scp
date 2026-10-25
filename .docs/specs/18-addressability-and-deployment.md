@@ -117,7 +117,6 @@ An HTTP-accessible JSON document at `https://<domain>/.well-known/scp` that enab
   ],
   "relay_config": {
     "max_blob_size": 262144,
-    "max_blob_ttl": 86400,
     "rate_limit_publish": 6000,
     "rate_limit_subscribe": 100
   }
@@ -185,7 +184,6 @@ The `relay_config` object exposes operational parameters that agents need to eva
 | Field | Type | Unit | Description |
 |-------|------|------|-------------|
 | `max_blob_size` | integer | bytes | Maximum blob size the relay accepts. **The value is this relay's own** (`03-identity.md` §3.10.5, which states how a publisher segments against it). |
-| `max_blob_ttl` | integer | seconds | Maximum blob TTL the relay enforces. |
 | `rate_limit_publish` | integer | per minute | PUBLISH rate limit per source prefix (ADR-004). |
 | `rate_limit_subscribe` | integer | per connection | Maximum concurrent subscriptions per connection (default: 100). |
 | `economic` | object | — | Relay economic configuration (§19.8). Optional. Absence = free relay. |
@@ -196,12 +194,14 @@ The `relay_config` object exposes operational parameters that agents need to eva
 | `economic.payee` | string | — | The identifier the relay operator receives payments under. |
 | `webpush_vapid_key` | string | — | The relay's VAPID public key (RFC 8292 §3.2): the base64url encoding, without padding, of the 65-byte uncompressed P-256 point, 87 characters. A relay that sends WebPush wakes publishes it (`10-infrastructure-and-self-hosting.md` §10.7.1, ADR-004). An absent field means the relay sends no WebPush wakes and rejects a WebPush registration with `4061`. A browser client passes the decoded key to `PushManager.subscribe` as `applicationServerKey`. |
 
-**Three of these eleven rows — `max_blob_size`, `max_blob_ttl` and `rate_limit_publish` — are the write policy a publisher reads through `IdentityBackend::read_policy`, and the other eight are not**: `03-identity.md` §3.10.10 declares `DeclaredWritePolicy` and states its field set, so a binding author generating that type reads the field set there and reads the wire form here.
+**Two of these ten rows — `max_blob_size` and `rate_limit_publish` — are the write policy a publisher reads through `IdentityBackend::read_policy`, and the other eight are not**: `03-identity.md` §3.10.10 declares `DeclaredWritePolicy` and states its field set, so a binding author generating that type reads the field set there and reads the wire form here.
+
+**`relay_config` carries no blob TTL.** Every relay enforces the protocol constant `MAX_BLOB_TTL` (`09-security-model.md` §9.18.11) as its blob TTL ceiling, and no relay configuration changes it, so the document has nothing to advertise.
 
 **All fields are optional.** Absent fields indicate the relay uses protocol defaults or has no limit. An absent `economic` field indicates a free relay. What an absent term means:
 
 - An absent `rate_limit_publish` is 6,000 a minute, and a relay turns the term off by declaring zero.
-- An absent `max_blob_size` and an absent `max_blob_ttl` each declare no ceiling of the relay's own.
+- An absent `max_blob_size` declares no ceiling of the relay's own.
 - **An absent `relay_config` object is an entry that declares no write policy**, which `read_policy` answers with `None` and no error, and a publisher addressing that entry applies the defaults this list states for each term (`03-identity.md` §3.10.10).
 
 ADR-004 specifies that relay configuration is available "out-of-band." `.well-known/scp` is the canonical location for this out-of-band configuration. Agents evaluating whether to use a relay can fetch `/.well-known/scp` and inspect `relay_config` before establishing a WebSocket connection.

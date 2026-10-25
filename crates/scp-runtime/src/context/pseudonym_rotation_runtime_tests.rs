@@ -1,7 +1,7 @@
 //! Runtime tests for the local member's pseudonym rotation (spec 09
 //! §9.10.4.1): the epoch schedule and membership trigger the actor's rotation
 //! arm signals, the fail-closed `rotate_pseudonym` commit, the announcement,
-//! the grace end, the leave/close/expiry discard, and crash recovery through
+//! the leave/close/expiry discard of the query-only list, and crash recovery through
 //! the production `restore_all_contexts`.
 //!
 //! Every test drives the production Supervisor entry points
@@ -27,9 +27,7 @@ use scp_platform::in_memory::InMemoryStorage;
 use scp_protocol::context::builder::ContextCreationError;
 use scp_protocol::context::governance::{GovernanceAction, ProposalStatus};
 use scp_protocol::context::membership::ContextEvent;
-use scp_protocol::context::params::{
-    ContextMode, ContextParams, PSEUDONYM_ROTATION_GRACE_SECS, PseudonymRotationPolicy,
-};
+use scp_protocol::context::params::{ContextMode, ContextParams, PseudonymRotationPolicy};
 use scp_protocol::context::roles::Capability;
 use scp_protocol::context::{ContextError, context_routing_id};
 use tokio::sync::broadcast;
@@ -196,7 +194,12 @@ impl ContextTransportProvider for RecordingTransport {
     async fn delete_published(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    async fn send_message(&self, id: &[u8; 32], _payload: &[u8]) -> Result<(), ContextError> {
+    async fn send_message(
+        &self,
+        id: &[u8; 32],
+        _payload: &[u8],
+        _ttl: scp_protocol::envelope::outer::BlobTtl,
+    ) -> Result<(), ContextError> {
         if self.0.fail_sends.load(Ordering::SeqCst) {
             return Err(ContextError::TransportFailed(
                 "fixture: transport send fails".to_owned(),
@@ -431,9 +434,10 @@ const PROMPT: Duration = Duration::from_secs(5);
 // ---------------------------------------------------------------------------
 
 /// §9.10.4.1 steps 2, 4, 5: a rotation persists the epoch, the new routing
-/// ID and the previous one with its grace end, emits `LocalPseudonymRotated`
-/// once, sends exactly one announcement on the shared `context_routing_id`,
-/// and clears `announce_pending`; `LocalRoutingIds` reports all of it.
+/// ID and the previous one as a query-only entry, emits
+/// `LocalPseudonymRotated` once, sends exactly one announcement on the shared
+/// `context_routing_id`, and clears `announce_pending`; `LocalRoutingIds`
+/// reports all of it, with the previous routing ID only on `query_only`.
 #[tokio::test]
 async fn a_rotation_persists_emits_once_announces_on_the_shared_channel_and_clears_pending() {
     let mut n = node();
@@ -462,19 +466,23 @@ async fn a_rotation_persists_emits_once_announces_on_the_shared_channel_and_clea
     assert_eq!(after.pseudonym_epoch, Some(1));
     assert_eq!(after.next_pseudonym_epoch, Some(2));
     assert!(!after.announce_pending, "the announcement cleared the flag");
-    let previous = after
-        .previous
-        .expect("the old routing ID is kept for the grace");
-    assert_eq!(previous.routing_id, V1_RID);
     assert_eq!(
-        previous.grace_until_secs,
-        T0 + INTERVAL + PSEUDONYM_ROTATION_GRACE_SECS
+        after
+            .query_only
+            .iter()
+            .map(|e| (e.routing_id, e.expires_at_secs))
+            .collect::<Vec<_>>(),
+        vec![(
+            V1_RID,
+            T0 + INTERVAL + u64::from(scp_relay_client::MAX_BLOB_TTL)
+        )],
+        "the old routing ID is query-only from the moment of the rotation"
     );
 
     let persisted = n.store.snapshot(ctx);
     assert_eq!(persisted.routing.local_pseudonym(), Some(RID_1));
     assert_eq!(persisted.pseudonym_rotation.epoch(), Some(1));
-    assert_eq!(persisted.pseudonym_rotation.previous(), Some(previous));
+    assert_eq!(persisted.pseudonym_rotation.query_only, after.query_only);
     assert!(!persisted.pseudonym_rotation.announce_pending());
 
     assert_eq!(
@@ -732,13 +740,13 @@ async fn rejected_rotations_change_nothing_and_send_nothing() {
     let events = n.collect_for(Duration::from_millis(200)).await;
     assert!(rotated(&events).is_empty(), "no rotation event: {events:?}");
 
-    // The previous routing ID is also rejected while it is held, at the next
+    // A routing ID on the query-only list is also rejected, at the next
     // boundary, where epoch 2 is due.
     n.rotate(ctx, 1, RID_1)
         .await
         .expect("an admissible rotation");
     n.clock.set(T0 + 2 * INTERVAL);
-    invalid(n.rotate(ctx, 2, V1_RID).await, "the previous routing ID");
+    invalid(n.rotate(ctx, 2, V1_RID).await, "a query-only routing ID");
 }
 
 /// §9.10.4.1 "no caller action starts a rotation": `rotate_pseudonym` commits
@@ -1068,40 +1076,17 @@ async fn enabling_rotation_anchors_the_schedule_at_the_commit() {
 }
 
 // ---------------------------------------------------------------------------
-// Grace
+// Leave, close and expiry
 // ---------------------------------------------------------------------------
 
-/// §9.10.4.1 "Transition protocol and grace": at `grace_until` the arm drops
-/// the previous routing ID, persists that, and emits `PseudonymGraceEnded`.
-#[tokio::test(start_paused = true)]
-async fn the_grace_end_drops_the_previous_routing_id_and_emits_its_event() {
-    let mut n = node();
-    let ctx = &cid("rotation-grace");
-    n.create(ctx, params(Some(interval_policy()))).await;
-    n.clock.set(T0 + INTERVAL);
-    n.rotate(ctx, 1, RID_1).await.expect("the rotation commits");
-    assert!(n.ids(ctx).await.previous.is_some());
-
-    n.clock.advance(PSEUDONYM_ROTATION_GRACE_SECS);
-    let ended = n
-        .wait_for(
-            Duration::from_secs(2 * PSEUDONYM_ROTATION_GRACE_SECS),
-            |e| matches!(e, ContextEvent::PseudonymGraceEnded).then_some(()),
-        )
-        .await;
-    assert_eq!(ended, Some(()), "the grace end is announced");
-    assert_eq!(n.ids(ctx).await.previous, None);
-    assert_eq!(n.store.snapshot(ctx).pseudonym_rotation.previous(), None);
-}
-
-/// §9.10.4.1 "Leave, close and expiry during a grace": each discards the
-/// previous routing ID and the pending work.
+/// §9.10.4.1 "Leave, close and expiry": each discards the query-only list
+/// and the pending work.
 #[tokio::test]
-async fn leave_close_and_expiry_discard_the_grace() {
+async fn leave_close_and_expiry_discard_the_rotation_state() {
     for (name, how) in [
-        ("rotation-grace-leave", "leave"),
-        ("rotation-grace-close", "close"),
-        ("rotation-grace-expiry", "expiry"),
+        ("rotation-discard-leave", "leave"),
+        ("rotation-discard-close", "close"),
+        ("rotation-discard-expiry", "expiry"),
     ] {
         let ctx = &cid(name);
         let n = node();
@@ -1122,7 +1107,7 @@ async fn leave_close_and_expiry_discard_the_grace() {
         n.sent.fail_sends.store(false, Ordering::SeqCst);
         let held = n.store.snapshot(ctx).pseudonym_rotation;
         assert!(
-            held.previous().is_some() && held.announce_pending(),
+            !held.query_only.is_empty() && held.announce_pending(),
             "{ctx}"
         );
 
@@ -1153,10 +1138,9 @@ async fn leave_close_and_expiry_discard_the_grace() {
             }
         }
         let after = n.store.snapshot(ctx).pseudonym_rotation;
-        assert_eq!(
-            after.previous(),
-            None,
-            "{how} discards the previous routing ID"
+        assert!(
+            after.query_only.is_empty(),
+            "{how} discards the query-only list"
         );
         assert!(
             !after.announce_pending(),
@@ -1187,7 +1171,7 @@ async fn restart(from: &Node) -> Node {
 /// announcement (step 4) restores the completed rotation with
 /// `announce_pending` set: the arm signals the pending announcement for the
 /// persisted epoch, never a second rotation, and the previous routing ID is
-/// still held while its grace runs.
+/// on the query-only list.
 #[tokio::test]
 async fn a_crash_between_persist_and_announce_restores_the_rotation_and_republishes() {
     let n = node();
@@ -1203,7 +1187,13 @@ async fn a_crash_between_persist_and_announce_restores_the_rotation_and_republis
     assert_eq!(ids.current, RID_1);
     assert_eq!(ids.pseudonym_epoch, Some(1));
     assert!(ids.announce_pending);
-    assert_eq!(ids.previous.map(|p| p.routing_id), Some(V1_RID));
+    assert_eq!(
+        ids.query_only
+            .iter()
+            .map(|e| e.routing_id)
+            .collect::<Vec<_>>(),
+        vec![V1_RID]
+    );
 
     let signal = r
         .wait_for(PROMPT, |e| pending(e).or_else(|| due(e).map(|_| u64::MAX)))

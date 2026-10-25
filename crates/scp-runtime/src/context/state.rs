@@ -1956,8 +1956,7 @@ pub(crate) fn strip_event_payload(event: &ContextEvent) -> ContextEvent {
         | ContextEvent::PseudonymAnnounced { .. }
         | ContextEvent::PseudonymRotationDue { .. }
         | ContextEvent::PseudonymAnnouncementPending { .. }
-        | ContextEvent::LocalPseudonymRotated { .. }
-        | ContextEvent::PseudonymGraceEnded => event.clone(),
+        | ContextEvent::LocalPseudonymRotated { .. } => event.clone(),
     }
 }
 

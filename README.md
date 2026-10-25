@@ -205,7 +205,6 @@ scp-node --health
 | `SCP_RELAY_URL` | none (required) | The relay's public WebSocket URL, which determines its reserved push routing ID (spec §10.7.1, push registration protocol). Read by `scp-relay` and `--relay-only`, which exit 1 when it is unset or empty. A full node does not read it: the node derives the URL from its domain or from the address its NAT tier advertises. Every listener (WebSocket, QUIC, UDP/DTLS) reads the same URL |
 | `SCP_RELAY_BIND_ADDR` | `0.0.0.0:9000` | Listen address |
 | `SCP_RELAY_MAX_BLOB_SIZE` | `262144` | Max blob size (bytes) |
-| `SCP_RELAY_MAX_BLOB_TTL` | `604800` | Max blob TTL (seconds) |
 | `SCP_RELAY_MAX_CONNECTIONS` | `1000` | Max total connections |
 | `SCP_RELAY_MAX_CONNECTIONS_PER_IP` | `10` | Max connections per IP |
 | `SCP_RELAY_RATE_LIMIT` | `100` | Publishes/sec/IP |

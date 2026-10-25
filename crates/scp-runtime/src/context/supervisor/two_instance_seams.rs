@@ -65,6 +65,7 @@ impl ContextTransportProvider for CapturingTransport {
         &self,
         _context_id: &[u8; 32],
         encrypted_payload: &[u8],
+        _ttl: scp_protocol::envelope::outer::BlobTtl,
     ) -> Result<(), ContextError> {
         self.0
             .0
@@ -171,8 +172,24 @@ mod tests {
         let capture = ContextSendCapture::default();
         let transport = capture.transport();
         assert!(transport.is_connected());
-        transport.send_message(&[1; 32], b"first").await?;
-        transport.send_message(&[2; 32], b"second").await?;
+        transport
+            .send_message(
+                &[1; 32],
+                b"first",
+                scp_protocol::envelope::outer::BlobTtl::for_message_type(
+                    scp_protocol::envelope::inner::MessageType::Content,
+                ),
+            )
+            .await?;
+        transport
+            .send_message(
+                &[2; 32],
+                b"second",
+                scp_protocol::envelope::outer::BlobTtl::for_message_type(
+                    scp_protocol::envelope::inner::MessageType::Content,
+                ),
+            )
+            .await?;
         assert_eq!(capture.take(), vec![b"first".to_vec(), b"second".to_vec()]);
         assert!(capture.take().is_empty(), "take clears the capture");
         Ok(())

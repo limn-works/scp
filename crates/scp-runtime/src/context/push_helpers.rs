@@ -61,25 +61,23 @@ pub struct ContextWakeTarget {
     /// The context's persisted relay set, as `PerContextState::relay_urls`
     /// holds it. The wake dials the union of these (ADR-025 criterion 4).
     pub relay_urls: Vec<String>,
-    /// Every routing ID at which a blob for this device arrives: the shared
-    /// routing ID, the current local pseudonym routing ID, and the previous
-    /// one while its grace runs (`09-security-model.md` §9.10.4.1). A
-    /// broadcast context yields `broadcast_routing_id` alone.
+    /// The routing IDs the pull queries: the shared routing ID and the
+    /// current local pseudonym routing ID. A routing ID on the query-only list
+    /// is left to reconnect catch-up (`09-security-model.md` §9.10.4.1
+    /// "Reconnect catch-up", ADR-029 §2). A broadcast context yields
+    /// `broadcast_routing_id` alone.
     pub routing_ids: Vec<[u8; 32]>,
 }
 
-/// Returns the push-wake pull target of the context `state` holds at
-/// wall-clock second `now_secs`, or `None` unless the context is `Active`,
-/// because only an `Active` context accepts delivered envelopes (ADR-029 §2,
-/// push-wake pull mode).
+/// Returns the push-wake pull target of the context `state` holds, or `None`
+/// unless the context is `Active`, because only an `Active` context accepts
+/// delivered envelopes (ADR-029 §2, push-wake pull mode).
 ///
 /// The all-zero pseudonym is the "no pseudonym derived" sentinel (§9.10.4)
-/// and is left out. The previous pseudonym is included only while
-/// [`GraceRoutingId::in_grace`](crate::context::actor::pseudonym_rotation::GraceRoutingId::in_grace)
-/// holds at `now_secs`, so a blob a peer addressed to it before learning the
-/// rotation is still pulled.
+/// and is left out. A previous pseudonym is never pulled here: from the
+/// rotation on, only reconnect catch-up queries it (§9.10.4.1).
 #[must_use]
-pub fn wake_target(state: &PerContextState, now_secs: u64) -> Option<ContextWakeTarget> {
+pub fn wake_target(state: &PerContextState) -> Option<ContextWakeTarget> {
     if state.handle.state() != ContextState::Active {
         return None;
     }
@@ -90,15 +88,6 @@ pub fn wake_target(state: &PerContextState, now_secs: u64) -> Option<ContextWake
             let mut ids = vec![context_routing_id(context_id)];
             if pseudonym != [0u8; 32] {
                 ids.push(pseudonym);
-            }
-            if let Some(previous) = state
-                .class_s
-                .pseudonym_rotation
-                .previous()
-                .filter(|p| p.in_grace(now_secs))
-                && !ids.contains(&previous.routing_id)
-            {
-                ids.push(previous.routing_id);
             }
             ids
         },
@@ -119,7 +108,6 @@ mod tests {
 
     use super::{ContextPushRoutes, ContextWakeTarget, push_routes, wake_target};
     use crate::context::ContextHandle;
-    use crate::context::actor::pseudonym_rotation::GraceRoutingId;
     use crate::context::actor::state::{ContextRouting, PerContextState};
 
     const RELAY: &str = "wss://relay.example/scp/v1";
@@ -210,33 +198,50 @@ mod tests {
     #[test]
     fn wake_target_requires_an_active_context() {
         let state = encrypted([0x77; 32]);
-        assert_eq!(wake_target(&state, 10), None, "Creating yields no target");
+        assert_eq!(wake_target(&state), None, "Creating yields no target");
         activate(&state);
-        assert!(wake_target(&state, 10).is_some(), "Active yields a target");
+        assert!(wake_target(&state).is_some(), "Active yields a target");
         assert!(state.handle.transition_to(&ContextState::Closing).is_ok());
-        assert_eq!(wake_target(&state, 10), None, "Closing yields no target");
+        assert_eq!(wake_target(&state), None, "Closing yields no target");
     }
 
+    /// Spec 09 §9.10.4.1 "Subscription" and "Reconnect catch-up": from the
+    /// moment of a rotation the push-wake pull addresses only the shared and
+    /// the new routing ID; the previous one is on the query-only list.
     #[test]
-    fn wake_target_includes_previous_pseudonym_only_in_grace() {
+    fn wake_target_leaves_out_the_previous_pseudonym_from_the_rotation_on() {
         let mut state = encrypted([0x77; 32]);
         activate(&state);
-        state.class_s.pseudonym_rotation.previous = Some(GraceRoutingId {
-            routing_id: [0x66; 32],
-            grace_until_secs: 100,
-        });
+        assert!(
+            state
+                .class_s
+                .pseudonym_rotation
+                .record_rotation(1, [0x66; 32], None, 1_000)
+                .is_some(),
+            "the rotation records"
+        );
         let shared = context_routing_id(state.handle.context_id());
-        let in_grace = wake_target(&state, 99).map(|t| t.routing_ids);
-        assert_eq!(in_grace, Some(vec![shared, [0x77; 32], [0x66; 32]]));
-        let after = wake_target(&state, 100).map(|t| t.routing_ids);
-        assert_eq!(after, Some(vec![shared, [0x77; 32]]));
+        assert_eq!(
+            wake_target(&state).map(|t| t.routing_ids),
+            Some(vec![shared, [0x77; 32]])
+        );
+        assert_eq!(
+            state
+                .class_s
+                .pseudonym_rotation
+                .live_query_only(1_000)
+                .iter()
+                .map(|e| e.routing_id)
+                .collect::<Vec<_>>(),
+            vec![[0x66; 32]]
+        );
     }
 
     #[test]
     fn wake_target_carries_context_id_and_relays_and_drops_zero_pseudonym() {
         let state = encrypted([0u8; 32]);
         activate(&state);
-        let target = wake_target(&state, 0);
+        let target = wake_target(&state);
         assert_eq!(
             target,
             Some(ContextWakeTarget {
@@ -253,9 +258,6 @@ mod tests {
         state.relay_urls = vec![RELAY.to_owned()];
         activate(&state);
         let rid = broadcast_routing_id(state.handle.context_id());
-        assert_eq!(
-            wake_target(&state, 0).map(|t| t.routing_ids),
-            Some(vec![rid])
-        );
+        assert_eq!(wake_target(&state).map(|t| t.routing_ids), Some(vec![rid]));
     }
 }

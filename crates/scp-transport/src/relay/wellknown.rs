@@ -126,7 +126,6 @@ mod tests {
         "relay": "wss://relay.example.com/scp/v1",
         "relay_config": {
             "max_blob_size": 262144,
-            "max_blob_ttl": 86400,
             "rate_limit_publish": 100,
             "rate_limit_subscribe": 50,
             "economic": {
@@ -146,7 +145,6 @@ mod tests {
         "relay": "wss://relay.example.com/scp/v1",
         "relay_config": {
             "max_blob_size": 262144,
-            "max_blob_ttl": 86400,
             "rate_limit_publish": 100
         }
     }"#;
@@ -222,7 +220,6 @@ mod tests {
             url: "wss://free.example.com/scp/v1".to_owned(),
             relay_config: Some(RelayConfig {
                 max_blob_size: Some(262_144),
-                max_blob_ttl: None,
                 rate_limit_publish: None,
                 rate_limit_subscribe: None,
                 transports: None,
@@ -238,7 +235,6 @@ mod tests {
             url: "wss://paid.example.com/scp/v1".to_owned(),
             relay_config: Some(RelayConfig {
                 max_blob_size: None,
-                max_blob_ttl: None,
                 rate_limit_publish: None,
                 rate_limit_subscribe: None,
                 transports: None,
@@ -268,7 +264,6 @@ mod tests {
                 url: "wss://paid.example.com/scp/v1".to_owned(),
                 relay_config: Some(RelayConfig {
                     max_blob_size: None,
-                    max_blob_ttl: None,
                     rate_limit_publish: None,
                     rate_limit_subscribe: None,
                     transports: None,
@@ -291,7 +286,6 @@ mod tests {
             url: "wss://paid.example.com/scp/v1".to_owned(),
             relay_config: Some(RelayConfig {
                 max_blob_size: None,
-                max_blob_ttl: None,
                 rate_limit_publish: None,
                 rate_limit_subscribe: None,
                 transports: None,
@@ -334,7 +328,6 @@ mod tests {
                 url: "wss://free2.example.com/scp/v1".to_owned(),
                 relay_config: Some(RelayConfig {
                     max_blob_size: Some(1024),
-                    max_blob_ttl: None,
                     rate_limit_publish: None,
                     rate_limit_subscribe: None,
                     transports: None,

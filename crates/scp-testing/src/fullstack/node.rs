@@ -56,8 +56,12 @@ use scp_platform::testing::InMemoryKeyCustody;
 use super::crypto::E2eCryptoProvider;
 use super::exchange::PendingJoin;
 
-/// Shared buffer of `(routing_id, ciphertext)` pairs captured by the transport.
-type SentBuffer = Arc<Mutex<Vec<([u8; 32], Vec<u8>)>>>;
+/// One send captured by the transport: the routing ID, the serialized MLS
+/// message, and the relay TTL the runtime chose for it.
+type SentPublish = ([u8; 32], Vec<u8>, scp_protocol::envelope::outer::BlobTtl);
+
+/// Shared buffer of the sends captured by the transport, in send order.
+type SentBuffer = Arc<Mutex<Vec<SentPublish>>>;
 
 /// A node's shared, cloneable handle — its `Supervisor`.
 /// The creator side reaches a joiner's supervisor to reserve the joiner's own
@@ -124,7 +128,7 @@ async fn dispatch_get_all_access_keys(
 /// `add_member` so they never pollute the application-ciphertext assertions.
 #[derive(Clone)]
 struct CapturingTransport {
-    /// `(routing_id, payload)` pairs, in send order.
+    /// `(routing_id, payload, ttl)` triples, in send order.
     sent: SentBuffer,
     /// While set, every send fails with `TransportFailed` and captures
     /// nothing.
@@ -159,6 +163,7 @@ impl ContextTransportProvider for CapturingTransport {
         &self,
         context_id: &[u8; 32],
         encrypted_payload: &[u8],
+        ttl: scp_protocol::envelope::outer::BlobTtl,
     ) -> Result<(), ContextError> {
         if self.failing.load(Ordering::SeqCst) {
             return Err(ContextError::TransportFailed(
@@ -168,7 +173,7 @@ impl ContextTransportProvider for CapturingTransport {
         self.sent
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push((*context_id, encrypted_payload.to_vec()));
+            .push((*context_id, encrypted_payload.to_vec(), ttl));
         Ok(())
     }
 }
@@ -565,7 +570,7 @@ impl FullStackNode {
     }
 
     /// Locks the captured-send buffer, recovering from poisoning.
-    fn lock_sent(&self) -> std::sync::MutexGuard<'_, Vec<([u8; 32], Vec<u8>)>> {
+    fn lock_sent(&self) -> std::sync::MutexGuard<'_, Vec<SentPublish>> {
         self.sent
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -738,7 +743,9 @@ impl FullStackNode {
                 "add_member: the inviter emitted no WelcomeGenerated event".to_owned(),
             )
         })?;
-        let mut captured = std::mem::take(&mut *self.lock_sent()).into_iter();
+        let mut captured = std::mem::take(&mut *self.lock_sent())
+            .into_iter()
+            .map(|(routing_id, payload, _ttl)| (routing_id, payload));
         let (commit_routing_id, commit) = captured.next().ok_or_else(|| {
             ContextError::TransportFailed("add_member: the inviter sent nothing".to_owned())
         })?;
@@ -1425,6 +1432,39 @@ impl FullStackNode {
     #[must_use]
     pub fn take_sent_ciphertexts(&self) -> Vec<([u8; 32], Vec<u8>)> {
         std::mem::take(&mut *self.lock_sent())
+            .into_iter()
+            .map(|(routing_id, payload, _ttl)| (routing_id, payload))
+            .collect()
+    }
+
+    /// Takes every captured send with the relay TTL the runtime chose for it
+    /// (`09-security-model.md` §9.10.2 "Blob TTL by message type"), and clears
+    /// the buffer.
+    #[must_use]
+    pub fn take_sent_publishes(
+        &self,
+    ) -> Vec<([u8; 32], Vec<u8>, scp_protocol::envelope::outer::BlobTtl)> {
+        std::mem::take(&mut *self.lock_sent())
+    }
+
+    /// Builds and broadcasts a signed consistency checkpoint (§9.9.3) through
+    /// the real `Supervisor`, the reconnection driver's Phase 3 entry point.
+    /// The broadcast lands in the captured-send buffer.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`ContextError`] from the supervisor.
+    pub async fn build_local_checkpoint(
+        &self,
+        context_id: &str,
+    ) -> Result<scp_event_log::checkpoint::ConsistencyCheckpoint, ContextError> {
+        self.manager
+            .build_local_checkpoint(
+                context_id,
+                &self.did,
+                &scp_core::context::actor::CommandSigner::local_ed25519(self.signing_key.clone()),
+            )
+            .await
     }
 
     /// Decrypts a message through the full envelope pipeline (joiner-side).

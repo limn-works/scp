@@ -317,7 +317,7 @@ pub fn snapshot_context(ctx: &PerContextState) -> ContextSnapshot {
         caveat_counters: crate::context::messaging_helpers::caveat_counters_snapshot(ctx),
         // Fix-D Class S: persist the streaming reservation recovery records.
         stream_reservations: crate::context::messaging_helpers::stream_reservations_snapshot(ctx),
-        pseudonym_rotation: ctx.class_s.pseudonym_rotation,
+        pseudonym_rotation: ctx.class_s.pseudonym_rotation.clone(),
         // ADR-049 §9 Class S (§5.14.8 block-before-serve): fold broadcast security
         // + roster state into the snapshot so block / ban / key-epoch advance is
         // durable atomically with `read_exclusion_list`.

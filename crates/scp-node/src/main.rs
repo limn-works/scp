@@ -271,7 +271,6 @@ ENVIRONMENT VARIABLES:
                                 from its domain or its NAT tier address, and a tier
                                 change moves the reserved routing ID on every listener
     SCP_RELAY_MAX_BLOB_SIZE     Max blob size in bytes (default: 262144)
-    SCP_RELAY_MAX_BLOB_TTL      Max blob TTL in seconds (default: 604800)
     SCP_RELAY_MAX_CONNECTIONS   Max total connections (default: 1000)
     SCP_RELAY_MAX_CONNECTIONS_PER_IP  Max connections per IP (default: 10)
     SCP_RELAY_RATE_LIMIT        Publish rate limit per second (default: 100)

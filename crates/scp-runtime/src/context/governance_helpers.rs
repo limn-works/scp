@@ -309,9 +309,9 @@ pub async fn tombstone_migrated_context(
             migration_proposal_id: migration_pid,
         };
         emit(state, tombstone_event, context_id, deps);
-        // §9.10.4.1 "Leave, close and expiry during a grace": a terminal
+        // §9.10.4.1 "Leave, close and expiry": a terminal
         // context drops its previous routing ID and pending rotation work.
-        state.class_s.pseudonym_rotation.discard_grace();
+        state.class_s.pseudonym_rotation.discard_rotation_state();
 
         // TTL + governance timers are actor-owned arms (ADR-049 finding A3);
         // the tombstone leaves the context non-Active so `reconcile_timers`
@@ -2138,9 +2138,9 @@ pub async fn execute_close_context(
         state.ttl.timer.deadline_unix_secs = None;
         state.broadcast_context = None;
         state.governance.decay_participation();
-        // §9.10.4.1 "Leave, close and expiry during a grace": a terminal
+        // §9.10.4.1 "Leave, close and expiry": a terminal
         // context drops its previous routing ID and pending rotation work.
-        state.class_s.pseudonym_rotation.discard_grace();
+        state.class_s.pseudonym_rotation.discard_rotation_state();
         Ok(())
     })
     .await?;
@@ -6693,10 +6693,14 @@ pub async fn try_broadcast_commit(
         return None;
     }
     let routing_id = scp_protocol::context::context_routing_id(context_id);
-    match publish_commit(deps.transport.as_ref(), routing_id, &commit_bytes).await {
+    // Read before the send: a retry's TTL counts from this instant, so no
+    // retried copy outlives a copy this attempt may have stored (spec 09
+    // §9.10.2 "Republish rule").
+    let now = deps.clock.now_secs();
+    let ttl = scp_protocol::envelope::outer::BlobTtl::commit();
+    match publish_commit(deps.transport.as_ref(), routing_id, &commit_bytes, ttl).await {
         Ok(()) => None,
         Err(e) => {
-            let now = deps.clock.now_secs();
             let error_str = e.to_string();
             let backoff = commit_retry_backoff(1);
             let pending = PendingCommit {
@@ -6717,11 +6721,27 @@ pub async fn try_broadcast_commit(
     }
 }
 
-/// Publishes the serialized MLS Commit `commit` to `routing_id`. The
+// Security-model spec §9.18.7 and §9.10.2 "Republish rule": the adder's minimum
+// remaining KeyPackage lifetime covers the TTL a Commit requests (every retry
+// requests at most what remains of it) plus the lifetime margin, so no relay
+// copy of an add-Commit outlives the added KeyPackage under a receiver clock at
+// most one hour ahead. `u64::from` is not const, so the widening is `as`.
+const _: () = assert!(
+    scp_mls::KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS
+        >= scp_protocol::envelope::outer::BlobTtl::commit().secs() as u64
+            + scp_mls::KEY_PACKAGE_LIFETIME_MARGIN_SECS
+);
+const _: () = assert!(
+    scp_mls::KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS
+        >= scp_relay_client::MAX_BLOB_TTL as u64 + scp_mls::KEY_PACKAGE_LIFETIME_MARGIN_SECS
+);
+
+/// Publishes the serialized MLS Commit `commit` to `routing_id` for `ttl`. The
 /// transport frames it in the one relay-visible `OuterEnvelope` (ADR-002,
 /// spec 23 §23.4.1), as it frames every application and management message.
-/// The first broadcast ([`try_broadcast_commit`]) and the retry of a queued
-/// Commit both publish through here.
+/// The first broadcast ([`try_broadcast_commit`]) passes the fresh message TTL
+/// and the retry of a queued Commit the TTL that remains of the first attempt
+/// (spec 09 §9.10.2 "Republish rule"); both publish through here.
 ///
 /// # Errors
 ///
@@ -6732,8 +6752,9 @@ pub(super) async fn publish_commit(
     transport: &dyn crate::context::builder::ContextTransportProvider,
     routing_id: [u8; 32],
     commit: &[u8],
+    ttl: scp_protocol::envelope::outer::BlobTtl,
 ) -> Result<(), ContextError> {
-    transport.send_message(&routing_id, commit).await
+    transport.send_message(&routing_id, commit, ttl).await
 }
 
 /// Applies the retry-queue bookkeeping from a failed [`try_broadcast_commit`] to
@@ -7147,7 +7168,12 @@ mod commit_broadcast_retry_tests {
         async fn delete_published(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        async fn send_message(&self, _: &[u8; 32], _: &[u8]) -> Result<(), ContextError> {
+        async fn send_message(
+            &self,
+            _: &[u8; 32],
+            _: &[u8],
+            _ttl: scp_protocol::envelope::outer::BlobTtl,
+        ) -> Result<(), ContextError> {
             self.sends.fetch_add(1, Ordering::SeqCst);
             if self.fail {
                 Err(ContextError::TransportFailed("induced send failure".into()))
@@ -7705,6 +7731,7 @@ mod commit_broadcast_retry_tests {
             &self,
             routing_id: &[u8; 32],
             payload: &[u8],
+            _ttl: scp_protocol::envelope::outer::BlobTtl,
         ) -> Result<(), ContextError> {
             self.payloads
                 .lock()

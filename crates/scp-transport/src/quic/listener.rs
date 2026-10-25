@@ -100,8 +100,6 @@ pub struct QuicListenerConfig {
     pub bind_addr: SocketAddr,
     /// Maximum blob size in bytes (default: 262144 / 256 KB).
     pub max_blob_size: usize,
-    /// Maximum blob TTL in seconds (default: 604800 / 7 days).
-    pub max_blob_ttl: u32,
     /// Maximum concurrent subscriptions per QUIC connection (default: 100).
     pub max_subscriptions_per_connection: usize,
     /// Maximum QUERY limit (default: 1000).
@@ -157,7 +155,6 @@ impl QuicListenerConfig {
         Self {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 9443)),
             max_blob_size: MAX_BLOB_SIZE,
-            max_blob_ttl: MAX_BLOB_TTL,
             max_subscriptions_per_connection: DEFAULT_MAX_SUBSCRIPTIONS_PER_CONNECTION,
             max_query_limit: MAX_QUERY_LIMIT,
             max_connections_per_ip: DEFAULT_MAX_CONNECTIONS_PER_IP,
@@ -877,14 +874,11 @@ async fn handle_publish<S: BlobStorage>(
     }
 
     // Validate TTL.
-    if blob_ttl < MIN_BLOB_TTL || blob_ttl > config.max_blob_ttl {
+    if !(MIN_BLOB_TTL..=MAX_BLOB_TTL).contains(&blob_ttl) {
         let err = RelayMessage::Err {
             ref_id,
             code: code::TTL_TOO_LONG,
-            msg: format!(
-                "blob_ttl must be {}-{}, got {}",
-                MIN_BLOB_TTL, config.max_blob_ttl, blob_ttl
-            ),
+            msg: format!("blob_ttl must be {MIN_BLOB_TTL}-{MAX_BLOB_TTL}, got {blob_ttl}"),
         };
         return write_and_finish(send, &err).await;
     }
@@ -1448,7 +1442,6 @@ mod tests {
         let config = QuicListenerConfig::defaults(push_gate::test_relay_url());
         assert_eq!(config.bind_addr, SocketAddr::from(([127, 0, 0, 1], 9443)));
         assert_eq!(config.max_blob_size, MAX_BLOB_SIZE);
-        assert_eq!(config.max_blob_ttl, MAX_BLOB_TTL);
         assert_eq!(config.max_subscriptions_per_connection, 100);
         assert_eq!(config.max_query_limit, MAX_QUERY_LIMIT);
         assert_eq!(config.max_connections_per_ip, 10);
@@ -1713,6 +1706,52 @@ mod tests {
             } => {
                 assert_eq!(*c, code::TTL_TOO_LONG);
                 assert_eq!(ref_id.as_deref(), Some("ttl-1"));
+            }
+            other => panic!("expected ERR, got {other:?}"),
+        }
+
+        connection.close(0u32.into(), b"done");
+        handle.shutdown();
+    }
+
+    /// The QUIC listener enforces the protocol constant `MAX_BLOB_TTL` with no
+    /// configuration path (spec 09 §9.18.11): `MAX_BLOB_TTL` is stored and
+    /// `MAX_BLOB_TTL + 1` is refused with `TTL_TOO_LONG` (4011).
+    #[tokio::test]
+    async fn quic_publish_enforces_the_protocol_ttl_ceiling() {
+        let (handle, addr, certs, _storage, _subs) = start_test_listener();
+        let connection = connect_client(addr, &certs).await;
+
+        let at_max = ClientMessage::Publish {
+            ref_id: Some("ttl-max".to_string()),
+            routing_id: [6u8; 32],
+            recipient_hint: None,
+            blob_ttl: MAX_BLOB_TTL,
+            blob: vec![1u8; 10],
+        };
+        let responses = send_and_recv(&connection, &at_max).await;
+        assert_eq!(responses.len(), 1);
+        match &responses[0] {
+            RelayMessage::Ok { ref_id, .. } => assert_eq!(ref_id.as_deref(), Some("ttl-max")),
+            other => panic!("expected OK, got {other:?}"),
+        }
+
+        let over_max = ClientMessage::Publish {
+            ref_id: Some("ttl-over".to_string()),
+            routing_id: [6u8; 32],
+            recipient_hint: None,
+            blob_ttl: MAX_BLOB_TTL + 1,
+            blob: vec![2u8; 10],
+        };
+        let responses = send_and_recv(&connection, &over_max).await;
+        assert_eq!(responses.len(), 1);
+        match &responses[0] {
+            RelayMessage::Err {
+                code: c, ref_id, ..
+            } => {
+                assert_eq!(*c, code::TTL_TOO_LONG);
+                assert_eq!(*c, 4011);
+                assert_eq!(ref_id.as_deref(), Some("ttl-over"));
             }
             other => panic!("expected ERR, got {other:?}"),
         }

@@ -1145,7 +1145,7 @@ impl ClassSState {
             xctx_caller_reservations: self.xctx_caller_reservations.clone(),
             caveat_counters: self.caveat_counters.clone(),
             stream_reservations: self.stream_reservations.clone(),
-            pseudonym_rotation: self.pseudonym_rotation,
+            pseudonym_rotation: self.pseudonym_rotation.clone(),
         }
     }
 

@@ -90,9 +90,8 @@ pub(crate) async fn dispatch(
             context_id: _,
             reply,
         } => {
-            // §9.10.4.1: typed read; the previous routing ID is filtered by
-            // the wall clock so a grace that ended before the grace arm ran
-            // is not reported.
+            // §9.10.4.1: typed read; the query-only list is filtered by the
+            // wall clock so an expired entry is not reported.
             let answer = queries_helpers::local_routing_ids(state, deps.clock.now_secs());
             let _ = reply.send(answer);
             Outcome::ok(())

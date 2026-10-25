@@ -423,7 +423,6 @@ fn invariant_1_relay_economic_config_visible_in_wellknown() {
         contexts: None,
         relay_config: Some(RelayConfig {
             max_blob_size: Some(262_144),
-            max_blob_ttl: None,
             rate_limit_publish: None,
             rate_limit_subscribe: None,
             transports: None,
@@ -1139,7 +1138,6 @@ fn invariant_8_bootstrap_list_has_free_relay() {
         contexts: None,
         relay_config: Some(RelayConfig {
             max_blob_size: Some(262_144),
-            max_blob_ttl: None,
             rate_limit_publish: None,
             rate_limit_subscribe: None,
             transports: None,
@@ -1155,7 +1153,6 @@ fn invariant_8_bootstrap_list_has_free_relay() {
         contexts: None,
         relay_config: Some(RelayConfig {
             max_blob_size: Some(262_144),
-            max_blob_ttl: None,
             rate_limit_publish: None,
             rate_limit_subscribe: None,
             transports: None,
