@@ -329,20 +329,32 @@ impl NodeState {
     ///
     /// [`NodeError::Serve`] when the bind fails or the bound address cannot be
     /// read.
+    ///
+    /// A specific `requested` address is noted before the bind (ADR-004
+    /// **Endpoint refusal**), so no endpoint check passes for it while the
+    /// listener already accepts. A failed bind leaves that address noted,
+    /// which is harmless: [`ApplicationNode::bind`] and
+    /// [`ApplicationNode::serve`] consume the node and return the error, so
+    /// the node never serves, and a failed
+    /// [`ApplicationNode::serve_background`] leaves the node running with
+    /// the address refused although no listener of the node serves it. The
+    /// bound address is noted again after the bind; for a wildcard request
+    /// it is a wildcard too, and adds nothing.
     pub(crate) async fn take_or_bind_public(
         &self,
         requested: SocketAddr,
     ) -> Result<(tokio::net::TcpListener, SocketAddr), NodeError> {
+        self.note_listener_bound(requested);
         let bound = self.take_or_bind_unnoted(requested).await?;
         self.note_listener_bound(bound.1);
         Ok(bound)
     }
 
-    /// Adds the bound address of a public listener to the `WebPush` sender's
-    /// own addresses (ADR-004 **Endpoint refusal**), so an endpoint at a
-    /// listener bound after the start is refused too. A wildcard bind adds
-    /// nothing, and a node whose relay runs no `WebPush` sender tracks
-    /// nothing.
+    /// Adds the address of a public listener to the `WebPush` sender's own
+    /// addresses (ADR-004 **Endpoint refusal**), so an endpoint at a listener
+    /// bound after the start is refused too. Callers note a specific address
+    /// before they bind it. A wildcard address adds nothing, and a node whose
+    /// relay runs no `WebPush` sender tracks nothing.
     pub(crate) fn note_listener_bound(&self, bound: SocketAddr) {
         if let Some(tracker) = &self.own_addresses {
             tracker.add_bind(bound);
@@ -2197,6 +2209,11 @@ fn spawn_http3_listener(http3_config: scp_transport::http3::Http3Config, state: 
     // (spec §10.14.3 item 2: uniform cross-transport tracking).
     let connection_tracker = state.connection_tracker.clone();
     let noted = Arc::clone(state);
+    // A specific address is noted before the bind, so no endpoint check
+    // passes for it while the listener already accepts. A failed bind leaves
+    // it noted: the node keeps running without HTTP/3, and refuses an
+    // address no listener of the node serves.
+    noted.note_listener_bound(http3_config.bind_addr());
 
     tokio::spawn(async move {
         let mut server = Http3Server::new(http3_config, handler);

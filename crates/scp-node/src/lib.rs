@@ -4633,6 +4633,50 @@ mod tests {
         node.shutdown();
     }
 
+    /// PUSH-023: a specific address is noted before its listener binds, so
+    /// no endpoint check passes for it while the listener already accepts. A
+    /// bind on an address this host does not hold fails, and the address
+    /// stays noted: the node refuses an address it does not serve.
+    #[tokio::test]
+    async fn a_specific_bind_is_noted_before_the_listener_binds() {
+        use scp_transport::relay::push_endpoint::{FixedAnswers, OwnAddressLookup};
+
+        let dir = tempfile::tempdir().unwrap();
+        let answers = FixedAnswers::default();
+        answers.insert(WEBPUSH_DOMAIN, vec![[192, 0, 2, 10].into()]);
+        let node = Node::start_for_testing_with_own_lookup(
+            webpush_domain_config(
+                dir.path(),
+                Arc::new(SucceedingTlsProvider {
+                    domain: WEBPUSH_DOMAIN.to_owned(),
+                }),
+            ),
+            OwnAddressLookup::fixed(&answers),
+        )
+        .await
+        .unwrap();
+        let own = || {
+            node.state
+                .relay_config
+                .push
+                .webpush_sender()
+                .expect("the relay runs the WebPush sender")
+                .own_addresses()
+                .known()
+                .expect("the own-address set resolved at start")
+        };
+        // RFC 5737 TEST-NET-1: no host holds it, so the bind fails.
+        let foreign = std::net::IpAddr::from([192, 0, 2, 77]);
+        assert!(!own().contains(foreign), "{:?}", own());
+        let refused = node
+            .state
+            .take_or_bind_public(SocketAddr::new(foreign, 0))
+            .await;
+        assert!(matches!(refused, Err(NodeError::Serve(_))), "{refused:?}");
+        assert!(own().contains(foreign), "{:?}", own());
+        node.shutdown();
+    }
+
     /// PUSH-023 (Decision 8 of its plan): a node on a reach that serves no
     /// `.well-known/scp` refuses a `WebPush` sender with a typed error, and so
     /// does a domain node whose TLS provisioning fails and would fall
