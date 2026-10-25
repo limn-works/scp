@@ -527,16 +527,6 @@ pub struct ConsequenceConfig {
 /// within `MAX_BLOB_TTL`, under [`PSEUDONYM_QUERY_ONLY_MAX_ENTRIES`].
 pub const PSEUDONYM_MIN_ROTATION_INTERVAL_SECS: u64 = 600;
 
-/// How long the runtime's grace arm holds a previous routing ID after a
-/// rotation, in seconds.
-///
-/// Spec 09 §9.10.4.1 no longer has a grace: from the rotation on, the
-/// previous routing ID is only on the query-only list, and no subscriber or
-/// pull reads the grace. The value is kept only for the persisted
-/// `GraceRoutingId` and the actor's grace arm, whose removal needs a change to
-/// the `pipeline_wiring.rs` assertions that a human must approve.
-pub const PSEUDONYM_ROTATION_GRACE_SECS: u64 = 600;
-
 /// Most previous routing IDs a member keeps on its query-only list in one
 /// context (spec §9.18.11, §9.10.4.1 "Query-only list"). A rotation past the
 /// bound drops the entry with the earliest expiry.

@@ -2339,8 +2339,7 @@ pub(crate) const fn affected_resources(event: &ContextEvent) -> AffectedResource
         | ContextEvent::PseudonymAnnounced { .. }
         | ContextEvent::PseudonymRotationDue { .. }
         | ContextEvent::PseudonymAnnouncementPending { .. }
-        | ContextEvent::LocalPseudonymRotated { .. }
-        | ContextEvent::PseudonymGraceEnded => events_only,
+        | ContextEvent::LocalPseudonymRotated { .. } => events_only,
     }
 }
 

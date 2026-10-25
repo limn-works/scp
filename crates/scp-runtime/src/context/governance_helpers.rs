@@ -311,7 +311,7 @@ pub async fn tombstone_migrated_context(
         emit(state, tombstone_event, context_id, deps);
         // §9.10.4.1 "Leave, close and expiry": a terminal
         // context drops its previous routing ID and pending rotation work.
-        state.class_s.pseudonym_rotation.discard_grace();
+        state.class_s.pseudonym_rotation.discard_rotation_state();
 
         // TTL + governance timers are actor-owned arms (ADR-049 finding A3);
         // the tombstone leaves the context non-Active so `reconcile_timers`
@@ -2140,7 +2140,7 @@ pub async fn execute_close_context(
         state.governance.decay_participation();
         // §9.10.4.1 "Leave, close and expiry": a terminal
         // context drops its previous routing ID and pending rotation work.
-        state.class_s.pseudonym_rotation.discard_grace();
+        state.class_s.pseudonym_rotation.discard_rotation_state();
         Ok(())
     })
     .await?;

@@ -224,7 +224,7 @@ pub async fn handle_ttl_expiry(
             state.ttl.timer.deadline_unix_secs = None;
             // §9.10.4.1 "Leave, close and expiry": an expired
             // context drops its previous routing ID and pending rotation work.
-            state.class_s.pseudonym_rotation.discard_grace();
+            state.class_s.pseudonym_rotation.discard_rotation_state();
             Ok(())
         })
         .await;

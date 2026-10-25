@@ -306,8 +306,8 @@ pub enum PseudonymAnnouncementDecision {
 ///
 /// `registry` is the caller's peer registry, or `None` for a broadcast context
 /// (which carries no registry). `own_routing_ids` holds the RECEIVER's own
-/// routing IDs in this context: its current routing ID and, while that value is
-/// in its rotation grace, its previous one (empty when it has derived none).
+/// routing IDs in this context: its current routing ID and every routing ID on
+/// its query-only list (empty when it has derived none).
 /// The function performs NO side effects.
 ///
 /// # Own-routing-ID collision guard (S1)

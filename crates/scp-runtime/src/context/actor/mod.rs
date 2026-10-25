@@ -138,16 +138,15 @@ fn ttl_expiry_retry_backoff(retries: u32) -> Duration {
 /// §9.10.4.1). The signal travels on a channel that drops events when no
 /// receiver listens or a receiver lags, so the arm repeats it, doubling the
 /// interval per consecutive repeat up to [`PSEUDONYM_SIGNAL_RETRY_CAP`], until
-/// the rotation state changes. The same backoff spaces grace-end persist
-/// retries.
+/// the rotation state changes.
 const PSEUDONYM_SIGNAL_RETRY_BASE: Duration = Duration::from_secs(30);
 
-/// CAP on the rotation-signal and grace-retry backoff: one repeat every
+/// CAP on the rotation-signal backoff: one repeat every
 /// 15 min while a signal stays unanswered.
 const PSEUDONYM_SIGNAL_RETRY_CAP: Duration = Duration::from_mins(15);
 
-/// Backoff before the n-th (1-based) consecutive repeat of a rotation signal
-/// or grace-end retry: `PSEUDONYM_SIGNAL_RETRY_BASE · 2^(n−1)`, saturating at
+/// Backoff before the n-th (1-based) consecutive repeat of a rotation signal:
+/// `PSEUDONYM_SIGNAL_RETRY_BASE · 2^(n−1)`, saturating at
 /// [`PSEUDONYM_SIGNAL_RETRY_CAP`].
 fn pseudonym_signal_backoff(repeats: u32) -> Duration {
     let shift = repeats.saturating_sub(1).min(32);
@@ -317,16 +316,6 @@ pub struct ContextActor {
     /// Consecutive signals the rotation arm sent for the current
     /// [`Self::rotation_armed_key`]; drives [`pseudonym_signal_backoff`].
     rotation_signals: u32,
-    /// One-shot grace-end arm (spec 09 §9.10.4.1 "Transition protocol and
-    /// grace"): fires at the previous routing ID's `grace_until_secs`.
-    /// [`Self::on_grace_tick`] clears the previous routing ID fail-closed and
-    /// emits `PseudonymGraceEnded`.
-    grace_timer: Option<Pin<Box<Sleep>>>,
-    /// The `grace_until_secs` [`Self::grace_timer`] was armed for.
-    grace_armed_deadline: Option<u64>,
-    /// Consecutive failed grace-end persists for the current
-    /// [`Self::grace_armed_deadline`]; drives [`pseudonym_signal_backoff`].
-    grace_retries: u32,
     /// The push routes ([`push_helpers::push_routes`]) last observed at the
     /// top of the run loop. A turn that changes them wakes the Supervisor's
     /// push-route watch (`10-infrastructure-and-self-hosting.md` §10.7.1
@@ -398,9 +387,6 @@ impl ContextActor {
             rotation_timer: None,
             rotation_armed_key: None,
             rotation_signals: 0,
-            grace_timer: None,
-            grace_armed_deadline: None,
-            grace_retries: 0,
             push_routes_seen,
         }
     }
@@ -414,8 +400,7 @@ impl ContextActor {
     /// 3. **Governance timeout** — only when `governance_timeout.is_some()`.
     /// 4. **Pseudonym rotation** (Arm 3b) — only when
     ///    `rotation_timer.is_some()`.
-    /// 5. **Rotation grace end** (Arm 3c) — only when `grace_timer.is_some()`.
-    /// 6. **Persistence coalesce** (Arm 4) — only when `dirty == true`.
+    /// 5. **Persistence coalesce** (Arm 4) — only when `dirty == true`.
     ///
     /// `biased;` ordering keeps shutdown priority and gives deterministic
     /// dispatch under test reproducers.
@@ -594,12 +579,6 @@ impl ContextActor {
                 () = one_shot(self.rotation_timer.as_mut()), if self.rotation_timer.is_some() => {
                     self.consecutive_inbox = 0;
                     self.on_rotation_tick();
-                }
-
-                // --- Arm 3c: rotation grace end (one-shot) ---------
-                () = one_shot(self.grace_timer.as_mut()), if self.grace_timer.is_some() => {
-                    self.consecutive_inbox = 0;
-                    self.on_grace_tick().await;
                 }
 
                 // --- Arm 4: persistence coalesce -------------------
@@ -909,18 +888,13 @@ impl ContextActor {
         self.reconcile_pseudonym_timers(is_active);
     }
 
-    /// Reconciles the pseudonym rotation and grace-end arms (spec 09
-    /// §9.10.4.1) from owned state; see [`Self::reconcile_timers`].
-    ///
-    /// - **Rotation**: armed only while the context is `Active`, uses
-    ///   pseudonymous routing, and lists the local member, so a member that
-    ///   left, or a closed or expired context, signals nothing. It re-arms,
-    ///   resetting the backoff, only when the persisted rotation state or the
-    ///   policy changes; a committed rotation, a membership trigger, a policy
-    ///   change, or a cleared announcement flag each change it.
-    /// - **Grace**: armed while a previous routing ID is held, re-armed when
-    ///   its `grace_until_secs` changes. Not gated on `Active`: leave, close
-    ///   and expiry discard the previous routing ID, which disarms it.
+    /// Reconciles the pseudonym rotation arm (spec 09 §9.10.4.1) from owned
+    /// state; see [`Self::reconcile_timers`]. Armed only while the context is
+    /// `Active`, uses pseudonymous routing, and lists the local member, so a
+    /// member that left, or a closed or expired context, signals nothing. It
+    /// re-arms, resetting the backoff, only when the persisted rotation state
+    /// or the policy changes; a committed rotation, a membership trigger, a
+    /// policy change, or a cleared announcement flag each change it.
     fn reconcile_pseudonym_timers(&mut self, is_active: bool) {
         let eligible = is_active
             && self.state.routing.local_pseudonym().is_some()
@@ -952,23 +926,6 @@ impl ContextActor {
             self.rotation_timer = None;
             self.rotation_armed_key = None;
             self.rotation_signals = 0;
-        }
-
-        let grace_deadline = self
-            .state
-            .class_s
-            .pseudonym_rotation
-            .previous()
-            .map(|p| p.grace_until_secs);
-        if grace_deadline != self.grace_armed_deadline {
-            self.grace_armed_deadline = grace_deadline;
-            self.grace_retries = 0;
-            let now_secs = self.deps.clock.now_secs();
-            self.grace_timer = grace_deadline.map(|deadline| {
-                Box::pin(tokio::time::sleep(Duration::from_secs(
-                    deadline.saturating_sub(now_secs),
-                )))
-            });
         }
     }
 
@@ -1027,61 +984,6 @@ impl ContextActor {
         self.rotation_timer = Some(Box::pin(tokio::time::sleep(pseudonym_signal_backoff(
             self.rotation_signals,
         ))));
-    }
-
-    /// Drives the grace-end arm (spec 09 §9.10.4.1 "Transition protocol and
-    /// grace"): once the wall clock reaches the previous routing ID's
-    /// `grace_until_secs`, clears it with a fail-closed persist and emits
-    /// `PseudonymGraceEnded`. A persist failure keeps the previous routing ID
-    /// and retries after [`pseudonym_signal_backoff`]; the bridge driver keeps
-    /// its subscription until the event arrives. A tick that fires before the
-    /// wall clock reaches the deadline re-arms for the remainder.
-    async fn on_grace_tick(&mut self) {
-        self.grace_timer = None;
-        let Some(previous) = self.state.class_s.pseudonym_rotation.previous() else {
-            return;
-        };
-        let now_secs = self.deps.clock.now_secs();
-        if previous.in_grace(now_secs) {
-            self.grace_timer = Some(Box::pin(tokio::time::sleep(Duration::from_secs(
-                previous.grace_until_secs.saturating_sub(now_secs),
-            ))));
-            return;
-        }
-        let committed = self
-            .state
-            .commit_class_s_restore(&self.deps, &self.context_id, |mut view| {
-                let rotation = &mut view.rest_mut().class_s.pseudonym_rotation;
-                if rotation.previous == Some(previous) {
-                    rotation.previous = None;
-                }
-                Ok(())
-            })
-            .await;
-        match committed {
-            Ok(()) => {
-                self.state.class_c_view().emit_event(
-                    scp_protocol::context::membership::ContextEvent::PseudonymGraceEnded,
-                    &self.context_id,
-                    self.deps.event_tx.as_ref(),
-                );
-                // The buffered event is Class-C state: persist it with the
-                // next coalesced write.
-                self.dirty = true;
-            }
-            Err(err) => {
-                self.grace_retries = self.grace_retries.saturating_add(1);
-                tracing::warn!(
-                    context_id = %self.context_id,
-                    error = %err,
-                    retries = self.grace_retries,
-                    "pseudonym grace end failed to persist; the previous routing ID stays until a retry persists"
-                );
-                self.grace_timer = Some(Box::pin(tokio::time::sleep(pseudonym_signal_backoff(
-                    self.grace_retries,
-                ))));
-            }
-        }
     }
 
     /// Drive the TTL expiry (SEC-1 / ADR-049 §9 amendment): run the

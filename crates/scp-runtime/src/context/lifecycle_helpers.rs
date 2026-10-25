@@ -766,7 +766,7 @@ pub async fn close_context_with_key(
         state.routing = ContextRouting::Broadcast;
         // §9.10.4.1 "Leave, close and expiry": a terminal
         // context drops its previous routing ID and pending rotation work.
-        state.class_s.pseudonym_rotation.discard_grace();
+        state.class_s.pseudonym_rotation.discard_rotation_state();
 
         // Participation decay: clear participation cache and cooldown state
         // on context close (#1530).

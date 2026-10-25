@@ -853,10 +853,6 @@ pub enum ContextEvent {
         /// The epoch the member rotated to.
         pseudonym_epoch: u64,
     },
-    /// The local member's rotation grace ended and it discarded its previous
-    /// routing ID (spec 09 §9.10.4.1 "Transition protocol: query-only until expiry").
-    /// Carries no routing ID.
-    PseudonymGraceEnded,
 }
 
 impl ContextEvent {
@@ -914,7 +910,6 @@ impl ContextEvent {
             Self::PseudonymRotationDue { .. } => "PseudonymRotationDue",
             Self::PseudonymAnnouncementPending { .. } => "PseudonymAnnouncementPending",
             Self::LocalPseudonymRotated { .. } => "LocalPseudonymRotated",
-            Self::PseudonymGraceEnded => "PseudonymGraceEnded",
         }
     }
 }

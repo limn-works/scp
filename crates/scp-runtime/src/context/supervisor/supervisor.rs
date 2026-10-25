@@ -18238,7 +18238,6 @@ impl Supervisor {
     ///
     /// Fails rather than return a partial set, because a wake that skips a
     /// context reports `NoData` for traffic it never pulled:
-    /// - [`ContextError::NotInitialized`] when no clock is wired;
     /// - [`ContextError::ContextPoisoned`] or [`ContextError::ActorCrashed`]
     ///   when a context's actor is down;
     /// - [`ContextError::ActorBusy`] from a mailbox send;
@@ -18247,25 +18246,11 @@ impl Supervisor {
     pub async fn wake_targets(
         &self,
     ) -> Result<Vec<crate::context::push_helpers::ContextWakeTarget>, ContextError> {
-        let now_secs = self
-            .clock_ref()
-            .ok_or_else(|| {
-                ContextError::NotInitialized(
-                    "Supervisor::wake_targets — clock not configured".to_owned(),
-                )
-            })?
-            .now_secs();
         let replies = futures::future::join_all(self.known_context_ids().into_iter().map(
             |ctx_id| async move {
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 match self
-                    .dispatch_push_command(
-                        &ctx_id,
-                        PushCommand::WakeTarget {
-                            now_secs,
-                            reply: tx,
-                        },
-                    )
+                    .dispatch_push_command(&ctx_id, PushCommand::WakeTarget { reply: tx })
                     .await
                 {
                     Ok(_) => {}

@@ -2257,12 +2257,10 @@ pub enum PushCommand {
         reply: oneshot::Sender<Option<crate::context::push_helpers::ContextPushRoutes>>,
     },
     /// This context's push-wake pull target (ADR-029 §2, push-wake pull
-    /// mode): its ID, relay set, and every routing ID a blob for this device
-    /// arrives at, including the previous pseudonym while its grace runs at
-    /// `now_secs`. `None` unless the context is `Active`.
+    /// mode): its ID, relay set, and the shared and current pseudonym routing
+    /// IDs. A routing ID on the query-only list is left to reconnect catch-up.
+    /// `None` unless the context is `Active`.
     WakeTarget {
-        /// Wall-clock second the grace check reads.
-        now_secs: u64,
         /// Oneshot reply channel.
         reply: oneshot::Sender<Option<crate::context::push_helpers::ContextWakeTarget>>,
     },
@@ -2725,8 +2723,8 @@ pub enum QueriesCommand {
         reply: oneshot::Sender<Result<[u8; 32], ContextError>>,
     },
     /// The local member's routing IDs and rotation state (spec 09
-    /// §9.10.4.1): the current routing ID, the previous one while its grace
-    /// runs, the epoch, the epoch the next rotation must carry, and whether
+    /// §9.10.4.1): the current routing ID, the live query-only routing IDs,
+    /// the epoch, the epoch the next rotation must carry, and whether
     /// an announcement is pending. Read-only. `Err(NotPseudonymousContext)`
     /// for a broadcast context.
     LocalRoutingIds {

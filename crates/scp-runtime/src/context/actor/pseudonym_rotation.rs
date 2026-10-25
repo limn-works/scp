@@ -6,8 +6,8 @@
 //! point of the §9.10.4.1 rotation order restores either the old state or the
 //! completed rotation with `announce_pending` set. The current routing ID stays
 //! in [`ContextRouting`](super::state::ContextRouting); this state holds the
-//! epoch, the previous routing ID during its grace, and the schedule
-//! bookkeeping.
+//! epoch, the query-only list of routing IDs it rotated away from, and the
+//! schedule bookkeeping.
 //!
 //! The context actor holds no key custody, so it never derives a routing ID.
 //! It decides when a rotation is due ([`PseudonymRotationState::rotation_due`])
@@ -15,33 +15,11 @@
 //! [`PseudonymRotationState::next_epoch`] names and dispatches the rotation
 //! back.
 
-use scp_protocol::context::params::{
-    PSEUDONYM_QUERY_ONLY_MAX_ENTRIES, PSEUDONYM_ROTATION_GRACE_SECS, PseudonymRotationPolicy,
-};
+use scp_protocol::context::params::{PSEUDONYM_QUERY_ONLY_MAX_ENTRIES, PseudonymRotationPolicy};
 use scp_protocol::context::pseudonym::CommitMembershipChange;
 use serde::{Deserialize, Serialize};
 
 use super::state::PerContextState;
-
-/// The routing ID a member held before its latest rotation, kept for the
-/// rotation grace (spec 09 §9.10.4.1 "Transition protocol: query-only until expiry").
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GraceRoutingId {
-    /// The previous routing ID.
-    #[serde(with = "serde_bytes")]
-    pub routing_id: [u8; 32],
-    /// Wall-clock second at which the grace ends: the persist time of the
-    /// rotation plus [`PSEUDONYM_ROTATION_GRACE_SECS`].
-    pub grace_until_secs: u64,
-}
-
-impl GraceRoutingId {
-    /// Returns `true` while the grace runs at wall-clock second `now_secs`.
-    #[must_use]
-    pub const fn in_grace(&self, now_secs: u64) -> bool {
-        now_secs < self.grace_until_secs
-    }
-}
 
 /// A routing ID the member held before a rotation, which its reconnect
 /// catch-up queries, and never subscribes to, until the last blob a peer could
@@ -69,18 +47,14 @@ impl QueryOnlyRoutingId {
 /// "Rotation order and crash recovery").
 ///
 /// Every field carries `#[serde(default)]`, so a snapshot written before
-/// rotation existed decodes as the default: no v2 epoch, no previous routing
-/// ID, nothing pending.
+/// rotation existed decodes as the default: no v2 epoch, an empty query-only
+/// list, nothing pending.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct PseudonymRotationState {
     /// The member's v2 rotation epoch, or `None` while it holds a v1 routing
     /// ID. Never decreases.
     #[serde(default)]
     pub(crate) epoch: Option<u64>,
-    /// The previous routing ID and its grace end. A second rotation during a
-    /// grace replaces it, so a member holds at most two routing IDs.
-    #[serde(default)]
-    pub(crate) previous: Option<GraceRoutingId>,
     /// Every routing ID the member rotated away from whose last possible blob
     /// has not expired, in rotation order, at most
     /// [`PSEUDONYM_QUERY_ONLY_MAX_ENTRIES`] entries (spec 09 §9.10.4.1
@@ -202,13 +176,6 @@ impl PseudonymRotationState {
         self.epoch
     }
 
-    /// The previous routing ID and its grace end, whether or not the grace
-    /// has elapsed by the wall clock.
-    #[must_use]
-    pub const fn previous(&self) -> Option<GraceRoutingId> {
-        self.previous
-    }
-
     /// Whether a persisted rotation still waits for its announcement.
     #[must_use]
     pub const fn announce_pending(&self) -> bool {
@@ -241,7 +208,7 @@ impl PseudonymRotationState {
     /// change is pending, or the member's join-time v2 derivation is pending. A
     /// disabled policy (`None`) makes nothing due, which freezes the current
     /// routing ID. Nothing is due while the previous rotation's announcement
-    /// is pending, because a rotation drops the previous routing ID.
+    /// is pending, so a member announces each rotation before the next.
     #[must_use]
     pub fn rotation_due(&self, policy: Option<&PseudonymRotationPolicy>, now_secs: u64) -> bool {
         let Some(p) = policy else {
@@ -314,20 +281,19 @@ impl PseudonymRotationState {
         }
     }
 
-    /// Applies a rotation to `new_epoch` (spec 09 §9.10.4.1 step 2): keeps
-    /// `previous_routing_id` for the grace from `now_secs`, sets
-    /// `announce_pending`, marks every boundary up to `now_secs` handled and
-    /// clears a pending membership change and join derivation. Any older
-    /// previous routing ID is dropped.
+    /// Applies a rotation to `new_epoch` (spec 09 §9.10.4.1 step 2): puts
+    /// `previous_routing_id` on the query-only list until
+    /// `now_secs + MAX_BLOB_TTL`, sets `announce_pending`, marks every boundary
+    /// up to `now_secs` handled and clears a pending membership change and
+    /// join derivation.
     ///
-    /// The rotation also puts the previous routing ID on the query-only list
-    /// until `now_secs + MAX_BLOB_TTL`, drops expired entries, and drops the
-    /// entry with the earliest expiry while the list exceeds
+    /// The rotation also drops expired query-only entries, and drops the entry
+    /// with the earliest expiry while the list exceeds
     /// [`PSEUDONYM_QUERY_ONLY_MAX_ENTRIES`] (spec 09 §9.10.4.1 "Query-only
     /// list").
     ///
-    /// Returns `None`, leaving `self` unchanged, when `now_secs` plus the grace
-    /// or plus `MAX_BLOB_TTL` overflows `u64`.
+    /// Returns `None`, leaving `self` unchanged, when `now_secs` plus
+    /// `MAX_BLOB_TTL` overflows `u64`.
     #[must_use]
     pub fn record_rotation(
         &mut self,
@@ -336,13 +302,8 @@ impl PseudonymRotationState {
         policy: Option<&PseudonymRotationPolicy>,
         now_secs: u64,
     ) -> Option<()> {
-        let grace_until_secs = now_secs.checked_add(PSEUDONYM_ROTATION_GRACE_SECS)?;
         let expires_at_secs = now_secs.checked_add(u64::from(scp_relay_client::MAX_BLOB_TTL))?;
         self.epoch = Some(new_epoch);
-        self.previous = Some(GraceRoutingId {
-            routing_id: previous_routing_id,
-            grace_until_secs,
-        });
         self.query_only.retain(|entry| entry.live(now_secs));
         self.query_only.push(QueryOnlyRoutingId {
             routing_id: previous_routing_id,
@@ -395,12 +356,11 @@ impl PseudonymRotationState {
             .collect()
     }
 
-    /// Discards the grace state and the query-only list when the member leaves
-    /// the context or the context closes or expires (spec 09 §9.10.4.1 "Leave,
-    /// close and expiry"). A terminal context announces nothing
-    /// further, so the pending announcement and membership trigger go too.
-    pub fn discard_grace(&mut self) {
-        self.previous = None;
+    /// Discards the query-only list when the member leaves the context or the
+    /// context closes or expires (spec 09 §9.10.4.1 "Leave, close and
+    /// expiry"). A terminal context announces nothing further, so the pending
+    /// announcement, membership trigger and join derivation go too.
+    pub fn discard_rotation_state(&mut self) {
         self.query_only.clear();
         self.announce_pending = false;
         self.membership_change_pending = false;
@@ -452,10 +412,10 @@ pub(crate) fn note_member_added(state: &mut PerContextState, local_did: &str, ad
 /// member's rotation state, inside the Class-S commit that applies it. Another
 /// member's departure triggers a rotation under `on_membership_change` (spec 09
 /// §9.10.4.1 "Membership trigger"); the local member's own departure discards
-/// its grace state ("Leave, close and expiry").
+/// its query-only list and pending work ("Leave, close and expiry").
 pub(crate) fn note_member_removed(state: &mut PerContextState, local_did: &str, removed_did: &str) {
     if removed_did == local_did {
-        state.class_s.pseudonym_rotation.discard_grace();
+        state.class_s.pseudonym_rotation.discard_rotation_state();
     } else {
         let policy = state.handle.params().pseudonym_rotation;
         state
@@ -525,7 +485,7 @@ pub(crate) fn note_processed_commit(
         }
     }
     if commit.change.removed_dids.iter().any(|d| d == local_did) {
-        state.class_s.pseudonym_rotation.discard_grace();
+        state.class_s.pseudonym_rotation.discard_rotation_state();
         return;
     }
     if commit.committer_did != local_did && !commit.change.is_empty() {
@@ -739,32 +699,39 @@ mod tests {
         assert_eq!(state.due_epoch(Some(&policy), T0 + I + 1), Some(2));
     }
 
+    /// A rotation puts the routing ID it left on the query-only list until
+    /// rotation time + `MAX_BLOB_TTL`, and a second rotation appends rather
+    /// than replaces it (spec 09 §9.10.4.1 "Query-only list").
     #[test]
-    fn rotation_keeps_at_most_one_previous_and_sets_the_grace() {
+    fn rotation_appends_the_old_routing_id_to_the_query_only_list() {
         let policy = interval_policy();
+        let ttl = u64::from(scp_relay_client::MAX_BLOB_TTL);
         let mut state = at_t0();
         state
             .record_rotation(1, [1; 32], Some(&policy), T0 + I)
             .unwrap();
-        let previous = state.previous().unwrap();
-        assert_eq!(previous.routing_id, [1; 32]);
-        assert_eq!(
-            previous.grace_until_secs,
-            T0 + I + PSEUDONYM_ROTATION_GRACE_SECS
-        );
-        assert!(previous.in_grace(T0 + I + PSEUDONYM_ROTATION_GRACE_SECS - 1));
-        assert!(!previous.in_grace(T0 + I + PSEUDONYM_ROTATION_GRACE_SECS));
         assert!(state.announce_pending());
-
         state
             .record_rotation(2, [2; 32], Some(&policy), T0 + I + 1)
             .unwrap();
-        assert_eq!(state.previous().unwrap().routing_id, [2; 32]);
+        assert_eq!(
+            state.query_only,
+            vec![
+                QueryOnlyRoutingId {
+                    routing_id: [1; 32],
+                    expires_at_secs: T0 + I + ttl,
+                },
+                QueryOnlyRoutingId {
+                    routing_id: [2; 32],
+                    expires_at_secs: T0 + I + 1 + ttl,
+                },
+            ]
+        );
         assert_eq!(state.epoch(), Some(2));
     }
 
     #[test]
-    fn exhausted_epoch_and_overflowing_grace_admit_no_rotation() {
+    fn exhausted_epoch_and_overflowing_expiry_admit_no_rotation() {
         let policy = interval_policy();
         let state = PseudonymRotationState {
             epoch: Some(u64::MAX),
@@ -783,15 +750,15 @@ mod tests {
     }
 
     #[test]
-    fn discard_grace_drops_previous_and_pending_work() {
+    fn discard_rotation_state_drops_query_only_and_pending_work() {
         let policy = membership_policy();
         let mut state = at_t0();
         state
             .record_rotation(0, [1; 32], Some(&policy), T0)
             .unwrap();
         state.note_membership_change(Some(&policy));
-        state.discard_grace();
-        assert_eq!(state.previous(), None);
+        state.discard_rotation_state();
+        assert!(state.query_only.is_empty());
         assert!(!state.announce_pending());
         assert!(!state.membership_change_pending);
         assert_eq!(state.epoch(), Some(0));
@@ -835,9 +802,9 @@ mod tests {
     }
 
     /// A peer's removal triggers a rotation; the local member's own removal
-    /// discards its grace and pending work instead.
+    /// discards its query-only list and pending work instead.
     #[test]
-    fn the_local_members_removal_discards_its_grace() {
+    fn the_local_members_removal_discards_its_rotation_state() {
         let policy = membership_policy();
         let mut state = context_state(Some(policy));
         note_member_removed(&mut state, LOCAL, PEER);
@@ -850,7 +817,7 @@ mod tests {
             .unwrap();
         note_member_removed(&mut state, LOCAL, LOCAL);
         let rotation = &state.class_s.pseudonym_rotation;
-        assert_eq!(rotation.previous(), None);
+        assert!(rotation.query_only.is_empty());
         assert!(!rotation.announce_pending());
         assert!(!rotation.membership_change_pending);
     }

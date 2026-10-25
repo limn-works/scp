@@ -1800,8 +1800,9 @@ pub async fn encrypt_and_send(
     if routing_ids.is_empty() {
         return Ok(());
     }
-    // The one place a context message's relay TTL is chosen: from its type
-    // (spec 09 §9.10.2 "Blob TTL by message type").
+    // A context message's relay TTL comes from its type (spec 09 §9.10.2
+    // "Blob TTL by message type"); every other blob kind takes its own
+    // `BlobTtl` constructor at its send site.
     let ttl = scp_protocol::envelope::outer::BlobTtl::for_message_type(message_type);
     let mut last_err = None;
     let mut any_success = false;
@@ -4034,7 +4035,7 @@ pub(super) fn encode_local_announcement(
 /// [`LocalRoutingIds::next_pseudonym_epoch`](crate::context::actor::pseudonym_rotation::LocalRoutingIds)
 /// names, subscribes to it, and dispatches it here. This helper validates the
 /// pair, persists the rotation fail-closed (new epoch, new routing ID, the
-/// previous routing ID with its grace end, and `announce_pending`), emits
+/// previous routing ID on the query-only list, and `announce_pending`), emits
 /// [`ContextEvent::LocalPseudonymRotated`], then sends the announcement and
 /// clears `announce_pending`.
 ///
@@ -4050,10 +4051,11 @@ pub(super) fn encode_local_announcement(
 ///   creation timestamp under an interval policy, or an exhausted epoch), when
 ///   `new_epoch` is not the
 ///   due epoch, when `new_routing_id` is a
-///   reserved value, the current or previous routing ID, or a peer's routing
-///   ID, or when the grace end overflows. Nothing changes on any of these.
-/// - The persist error of the rotation; the epoch, routing ID and grace state
-///   are restored and nothing is sent.
+///   reserved value, the current routing ID, a routing ID on the query-only
+///   list, or a peer's routing ID, or when the query-only expiry overflows.
+///   Nothing changes on any of these.
+/// - The persist error of the rotation; the epoch, routing ID and query-only
+///   list are restored and nothing is sent.
 /// - The [`send_pseudonym_announcement`] error; the rotation stays committed
 ///   with `announce_pending` set, and the rotation arm keeps signalling
 ///   [`ContextEvent::PseudonymAnnouncementPending`] until an announcement
@@ -4103,8 +4105,9 @@ pub(super) async fn rotate_pseudonym(
     if pseudonym::is_reserved_pseudonym(&new_routing_id, &context_id)
         || new_routing_id == old_routing_id
         || rotation
-            .previous()
-            .is_some_and(|p| p.routing_id == new_routing_id)
+            .query_only
+            .iter()
+            .any(|entry| entry.routing_id == new_routing_id)
         || collides_with_peer
     {
         return Err(ContextError::InvalidState(
@@ -4116,7 +4119,7 @@ pub(super) async fn rotate_pseudonym(
     rotation
         .record_rotation(new_epoch, old_routing_id, policy.as_ref(), now_secs)
         .ok_or_else(|| {
-            ContextError::InvalidState("pseudonym rotation grace end overflows u64".into())
+            ContextError::InvalidState("pseudonym query-only expiry overflows u64".into())
         })?;
 
     // §9.10.4.1 step 2: the fail-closed persist. On failure the combinator
@@ -4505,9 +4508,7 @@ mod pseudonym_routing_tests {
     }
 
     /// Spec 09 §9.10.4.1 "Receipt ordering": an announcement claiming a
-    /// routing ID on the receiver's query-only list is a collision, with no
-    /// grace state involved. The previous routing ID is cleared here so the
-    /// query-only list alone must carry the rejection.
+    /// routing ID on the receiver's query-only list is a collision.
     #[test]
     fn ingest_rejects_an_announcement_of_a_query_only_routing_id() {
         use scp_protocol::context::pseudonym::REJECT_COLLISION;
@@ -4521,7 +4522,6 @@ mod pseudonym_routing_tests {
             .pseudonym_rotation
             .record_rotation(1, old, None, 1_000)
             .expect("the rotation records");
-        state.class_s.pseudonym_rotation.previous = None;
 
         let outcome = ingest_pseudonym_announcement(
             &mut ClassCMut::from_state(&mut state),

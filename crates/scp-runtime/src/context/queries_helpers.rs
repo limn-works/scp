@@ -134,7 +134,7 @@ pub fn local_pseudonym(state: &PerContextState) -> Result<[u8; 32], ContextError
 /// Returns the local member's routing IDs and rotation state (spec 09
 /// §9.10.4.1) at wall-clock second `now_secs`.
 ///
-/// `previous` is reported only while its grace runs at `now_secs`.
+/// `query_only` lists the entries live at `now_secs`.
 /// `next_pseudonym_epoch` is the epoch a rotation must carry now, or `None`
 /// when no rotation is admissible.
 ///

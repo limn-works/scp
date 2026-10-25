@@ -69,21 +69,15 @@ pub struct ContextWakeTarget {
     pub routing_ids: Vec<[u8; 32]>,
 }
 
-/// Returns the push-wake pull target of the context `state` holds at
-/// wall-clock second `now_secs`, or `None` unless the context is `Active`,
-/// because only an `Active` context accepts delivered envelopes (ADR-029 §2,
-/// push-wake pull mode).
+/// Returns the push-wake pull target of the context `state` holds, or `None`
+/// unless the context is `Active`, because only an `Active` context accepts
+/// delivered envelopes (ADR-029 §2, push-wake pull mode).
 ///
 /// The all-zero pseudonym is the "no pseudonym derived" sentinel (§9.10.4)
 /// and is left out. A previous pseudonym is never pulled here: from the
 /// rotation on, only reconnect catch-up queries it (§9.10.4.1).
-///
-/// `_now_secs` selects nothing: the target holds no time-bounded routing ID.
-/// The parameter stays because `pipeline_wiring.rs` pins the call
-/// `push_helpers::wake_target(state, now_secs)` in `handlers::push::dispatch`,
-/// and changing that assertion needs a human's approval.
 #[must_use]
-pub fn wake_target(state: &PerContextState, _now_secs: u64) -> Option<ContextWakeTarget> {
+pub fn wake_target(state: &PerContextState) -> Option<ContextWakeTarget> {
     if state.handle.state() != ContextState::Active {
         return None;
     }
@@ -204,11 +198,11 @@ mod tests {
     #[test]
     fn wake_target_requires_an_active_context() {
         let state = encrypted([0x77; 32]);
-        assert_eq!(wake_target(&state, 10), None, "Creating yields no target");
+        assert_eq!(wake_target(&state), None, "Creating yields no target");
         activate(&state);
-        assert!(wake_target(&state, 10).is_some(), "Active yields a target");
+        assert!(wake_target(&state).is_some(), "Active yields a target");
         assert!(state.handle.transition_to(&ContextState::Closing).is_ok());
-        assert_eq!(wake_target(&state, 10), None, "Closing yields no target");
+        assert_eq!(wake_target(&state), None, "Closing yields no target");
     }
 
     /// Spec 09 §9.10.4.1 "Subscription" and "Reconnect catch-up": from the
@@ -228,7 +222,7 @@ mod tests {
         );
         let shared = context_routing_id(state.handle.context_id());
         assert_eq!(
-            wake_target(&state, 1_000).map(|t| t.routing_ids),
+            wake_target(&state).map(|t| t.routing_ids),
             Some(vec![shared, [0x77; 32]])
         );
         assert_eq!(
@@ -247,7 +241,7 @@ mod tests {
     fn wake_target_carries_context_id_and_relays_and_drops_zero_pseudonym() {
         let state = encrypted([0u8; 32]);
         activate(&state);
-        let target = wake_target(&state, 0);
+        let target = wake_target(&state);
         assert_eq!(
             target,
             Some(ContextWakeTarget {
@@ -264,9 +258,6 @@ mod tests {
         state.relay_urls = vec![RELAY.to_owned()];
         activate(&state);
         let rid = broadcast_routing_id(state.handle.context_id());
-        assert_eq!(
-            wake_target(&state, 0).map(|t| t.routing_ids),
-            Some(vec![rid])
-        );
+        assert_eq!(wake_target(&state).map(|t| t.routing_ids), Some(vec![rid]));
     }
 }
