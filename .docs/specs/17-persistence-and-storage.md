@@ -128,6 +128,8 @@ context/{context_id}/spending_ucan/{token_id}
 
 wrapping_key/{did}
 
+custody/record/{namespace}/{key_id}
+
 key_event_log_cache/{did}
 tofu/{did}
 key_package/{sha256_hex(relay_url)}/{index}
@@ -144,6 +146,8 @@ mls/{context_id}/...
 **Identity bootstrap key.** The `scp/identity` key stores a `StoredValue<PersistedIdentity>` for the node's own identity. This is a top-level singleton key (no entity ID) because it is read during identity bootstrap before any DID is known. Written via the `Storage` trait directly, not through `ProtocolRepository` domain methods (see §17.4 for the exception rationale).
 
 **Push relay ledger.** Each `push_relay/{sha256_hex(relay_url)}/{sha256_hex(token)}` key holds a `StoredValue<PushRelayRecord>` (canonical relay URL, push platform, device token): a relay that may hold a push registration of that token (§10.7.1). The push registrar writes the record before its first publish to the relay and deletes it only when the relay accepts a `PushDeregistration` of the token or answers `4061` or `4063`, so a registration whose OK was lost, or a restart, still leaves a record, and the registrar deregisters every recorded relay that hosts no context of this device. Both key components are SHA-256 hex, so neither the URL nor the token appears in a key. A record that does not decode fails the whole ledger load, because skipping it would leave its relay never deregistered. The token is a secret, so the serialized buffer is zeroized after the write.
+
+**Custody records.** Each `custody/record/{namespace}/{key_id}` key holds the type and role a callback custody adapter minted one host key with (ADR-021, amended 2026-10-10; SCP-345). The records live in the instance storage the operator selected (section 17.6). `{namespace}` is a 16-byte value fixed when the adapter is built, written as 32 lowercase hex characters, so two adapters whose hosts reuse a key id never read, overwrite or delete each other's records. `{key_id}` is the host key id in decimal. The value is three bytes: the version `0x01`, the key type code (`0` Ed25519, `2` P-256 signing, `3` HPKE P-256, the codes `SqliteKeyCustody` also stores), and the role byte (`0x00` operational, `0x01` identity). A reader refuses a value with an unknown version, type code or role byte, or of any length but 3, and never substitutes a default. A put that finds a different record under the key is refused, and a put of the identical record succeeds without a write.
 
 **Zero-padded sequences.** Event sequence numbers and private state sequence numbers use `:020d` formatting (20-digit zero-padded decimal). This ensures lexicographic ordering matches numeric ordering, enabling efficient range queries via `list_keys`. Example: event 42 is stored at `context/{id}/event/00000000000000000042`.
 
