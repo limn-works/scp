@@ -53,7 +53,7 @@
 //! See ADR-008 (context creation), spec section 9.9 (event log), and the
 //! ADR-011 typed-event unification amendment in `.docs/adrs/phase-2.md`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 #[allow(
     clippy::disallowed_types,
     reason = "`std::sync::Mutex` guards only synchronous in-memory Merkle-tree operations; every lock is scoped and dropped BEFORE any `.await` on the async `EventLogPersistence` backend (ADR-049 Decision 7), so the guard is never held across a suspension point and a `tokio::sync::Mutex` would add unnecessary overhead."
@@ -77,6 +77,58 @@ struct ContextLog {
     /// (spec section 17.3, "Merkle event log entries"). Read and written only
     /// under the context's write gate.
     storage_diverged: bool,
+}
+
+/// The provider's in-memory logs, and the contexts whose log was released.
+///
+/// A released context's log is still in storage but not in memory, so a read
+/// of it answers "not loaded", never "no log" (spec section 17.3, "Event log
+/// write failures"). Every change to which contexts hold a log goes through
+/// [`Self::load`], [`Self::destroy`] or [`Self::release`], so the released
+/// set cannot drift from the loaded map.
+#[derive(Default)]
+struct Logs {
+    /// Per-context event logs, keyed by context ID bytes.
+    loaded: HashMap<[u8; 32], ContextLog>,
+    /// Contexts released since their log was last loaded or destroyed.
+    released: HashSet<[u8; 32]>,
+}
+
+impl Logs {
+    fn get(&self, context_id: &[u8; 32]) -> Option<&ContextLog> {
+        self.loaded.get(context_id)
+    }
+
+    fn get_mut(&mut self, context_id: &[u8; 32]) -> Option<&mut ContextLog> {
+        self.loaded.get_mut(context_id)
+    }
+
+    fn contains_key(&self, context_id: &[u8; 32]) -> bool {
+        self.loaded.contains_key(context_id)
+    }
+
+    /// Puts a context's log in memory (create, import, restore).
+    fn load(&mut self, context_id: [u8; 32], log: ContextLog) {
+        self.released.remove(&context_id);
+        self.loaded.insert(context_id, log);
+    }
+
+    /// Drops a context's log for good: the stored log is deleted too.
+    fn destroy(&mut self, context_id: &[u8; 32]) {
+        self.released.remove(context_id);
+        self.loaded.remove(context_id);
+    }
+
+    /// Drops a context's log from memory only: storage still holds it.
+    fn release(&mut self, context_id: &[u8; 32]) {
+        if self.loaded.remove(context_id).is_some() {
+            self.released.insert(*context_id);
+        }
+    }
+
+    fn is_released(&self, context_id: &[u8; 32]) -> bool {
+        self.released.contains(context_id)
+    }
 }
 
 impl ContextLog {
@@ -245,12 +297,12 @@ pub trait EventLogPersistence: Send + Sync {
 /// provider persists events to the given backend after each mutation and loads
 /// them via [`restore_event_log`](Self::restore_event_log).
 pub struct MerkleEventLogProvider {
-    /// Per-context event logs, keyed by context ID bytes.
+    /// Per-context event logs, and the contexts whose log was released.
     #[allow(
         clippy::disallowed_types,
         reason = "`std::sync::Mutex` guards only synchronous in-memory Merkle-tree operations; every lock is scoped and dropped BEFORE any `.await` on the async `EventLogPersistence` backend (ADR-049 Decision 7), so the guard is never held across a suspension point and a `tokio::sync::Mutex` would add unnecessary overhead."
     )]
-    logs: Mutex<HashMap<[u8; 32], ContextLog>>,
+    logs: Mutex<Logs>,
     /// Per-context write gates. Each write to a context holds its gate's one
     /// permit from the in-memory change through the persist, so writes to one
     /// context never interleave and storage applies them in memory's order.
@@ -282,7 +334,7 @@ impl MerkleEventLogProvider {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            logs: Mutex::new(HashMap::new()),
+            logs: Mutex::new(Logs::default()),
             write_gates: dashmap::DashMap::new(),
             persistence: None,
         }
@@ -295,7 +347,7 @@ impl MerkleEventLogProvider {
     #[must_use]
     pub fn with_persistence(persistence: std::sync::Arc<dyn EventLogPersistence>) -> Self {
         Self {
-            logs: Mutex::new(HashMap::new()),
+            logs: Mutex::new(Logs::default()),
             write_gates: dashmap::DashMap::new(),
             persistence: Some(persistence),
         }
@@ -402,7 +454,7 @@ impl MerkleEventLogProvider {
             .logs
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        logs.insert(*context_id, ContextLog::from_log(log));
+        logs.load(*context_id, ContextLog::from_log(log));
         Ok(())
     }
 
@@ -435,7 +487,7 @@ impl MerkleEventLogProvider {
                     .logs
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                logs.insert(*context_id, ContextLog::from_log(log));
+                logs.load(*context_id, ContextLog::from_log(log));
                 Ok(restore)
             }
             Err(e) => {
@@ -1001,7 +1053,7 @@ impl ContextEventLogProvider for MerkleEventLogProvider {
             .logs
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        logs.insert(*context_id, ContextLog::new(context_id));
+        logs.load(*context_id, ContextLog::new(context_id));
         Ok(())
     }
 
@@ -1120,7 +1172,7 @@ impl ContextEventLogProvider for MerkleEventLogProvider {
                     .logs
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                logs.remove(context_id);
+                logs.destroy(context_id);
             }
             self.delete_stored(context_id).await
         };
@@ -1136,7 +1188,7 @@ impl ContextEventLogProvider for MerkleEventLogProvider {
                 .logs
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            logs.remove(context_id);
+            logs.release(context_id);
         }
         // A writer holding the gate keeps it; that writer finds no log when
         // it re-locks and releases the gate itself.
@@ -1147,7 +1199,24 @@ impl ContextEventLogProvider for MerkleEventLogProvider {
         &self,
         context_id: &[u8; 32],
     ) -> Result<Option<Vec<Event>>, scp_protocol::context::ContextError> {
-        Ok(self.entries(context_id))
+        let logs = self
+            .logs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(log) = logs.get(context_id) {
+            return Ok(Some(log.log.events().to_vec()));
+        }
+        if logs.is_released(context_id) {
+            // Storage still holds this log; answering `None` would tell the
+            // caller the context has no log at all.
+            return Err(scp_protocol::context::ContextError::ContextNotRegistered(
+                format!(
+                    "the event log of context {} is released and not loaded",
+                    hex::encode(context_id)
+                ),
+            ));
+        }
+        Ok(None)
     }
 
     fn export_event_log_data(
@@ -2861,6 +2930,35 @@ mod tests {
             log_bytes(&restored.entries(&ctx_id).unwrap()),
             log_bytes(&before)
         );
+    }
+
+    /// A read of a released log answers "not loaded" with a typed error,
+    /// never "no log": storage still holds it. Restoring loads it again, and
+    /// destroying it, or never creating it, answers "no log".
+    #[tokio::test]
+    async fn a_released_log_reads_as_not_loaded_until_restored() {
+        let ctx_id = [41u8; 32];
+        let faulty = fresh_faulty();
+        let provider = faulty_provider(&faulty);
+        assert!(provider.event_log_entries(&ctx_id).unwrap().is_none());
+        provider.init_event_log(&ctx_id).await.unwrap();
+        append_n(&provider, &ctx_id, 0xB0, 2).await;
+        provider.release_event_log(&ctx_id);
+        assert!(matches!(
+            provider.event_log_entries(&ctx_id),
+            Err(scp_protocol::context::ContextError::ContextNotRegistered(_))
+        ));
+        assert_eq!(
+            provider.restore_event_log(&ctx_id).await.unwrap(),
+            EventLogRestore::Loaded { entries: 2 }
+        );
+        assert_eq!(
+            provider.event_log_entries(&ctx_id).unwrap().unwrap().len(),
+            2
+        );
+        provider.release_event_log(&ctx_id);
+        provider.destroy_event_log(&ctx_id).await.unwrap();
+        assert!(provider.event_log_entries(&ctx_id).unwrap().is_none());
     }
 
     #[tokio::test]

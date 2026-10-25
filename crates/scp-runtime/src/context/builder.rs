@@ -547,7 +547,8 @@ pub trait ContextEventLogProvider: Send + Sync {
     /// writes, `event_log_entries` reads. Without this method, callers holding
     /// a `Box<dyn ContextEventLogProvider>` can write but not read.
     ///
-    /// Returns `Ok(None)` if no log exists for the context.
+    /// Returns `Ok(None)` only if no log exists for the context: it was
+    /// never created, or it was destroyed.
     ///
     /// Required, with no default: callers read an `Err` as a failure and never
     /// as an empty log (spec section 17.3, "Event log write failures"), so a
@@ -557,7 +558,9 @@ pub trait ContextEventLogProvider: Send + Sync {
     /// # Errors
     ///
     /// Returns [`ContextError::EventLogFailed`] when the stored log cannot be
-    /// read.
+    /// read, and [`ContextError::ContextNotRegistered`] when the log was
+    /// released ([`Self::release_event_log`]) and not loaded again: storage
+    /// still holds it, so it is not loaded rather than absent.
     fn event_log_entries(
         &self,
         context_id: &[u8; 32],

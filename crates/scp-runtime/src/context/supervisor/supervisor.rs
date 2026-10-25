@@ -17870,6 +17870,34 @@ impl Supervisor {
             .map_err(|e| ContextError::EventLogFailed(e.to_string()))
     }
 
+    /// Releases `context_id`'s in-memory event log while its actor keeps
+    /// running — test-only.
+    ///
+    /// Shutdown releases the log the same way but also stops the actor, and
+    /// the FFI reads refuse a context that is not `Active` before they reach
+    /// the log. This leaves the context `Active`, so a bridge read reaches
+    /// the provider's "not loaded" answer (spec section 17.3, "Event log
+    /// write failures").
+    ///
+    /// Gated behind the `testing` feature — never compiled into production
+    /// builds, never reachable from any FFI bridge.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::NotInitialized`] if no event-log provider is wired.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn test_release_event_log(&self, context_id_bytes: &[u8; 32]) -> Result<(), ContextError> {
+        self.event_log_ref()
+            .ok_or_else(|| {
+                ContextError::NotInitialized(
+                    "Supervisor::test_release_event_log — event_log provider not configured"
+                        .to_owned(),
+                )
+            })?
+            .release_event_log(context_id_bytes);
+        Ok(())
+    }
+
     /// Lists every governance proposal currently tracked by the
     /// context's engine via the actor mailbox.
     ///
@@ -23489,6 +23517,95 @@ mod tests {
                     .clone(),
             ))
         }
+    }
+
+    /// A governance checkpoint whose event-log prune fails returns the
+    /// error, not a checkpoint over a log that kept the entries the policy
+    /// prunes (spec section 17.3, "Event log write failures").
+    #[tokio::test]
+    async fn a_checkpoint_whose_prune_fails_returns_the_error() {
+        use crate::context::builder::ContextEventLogProvider as _;
+        const T0: u64 = 1_700_000_000;
+        let faulty = Arc::new(
+            crate::context::supervisor::faulty_storage::FaultyStorage::new(Arc::new(
+                scp_platform::in_memory::InMemoryStorage::new(),
+            )),
+        );
+        let log = crate::context::providers::event_log::MerkleEventLogProvider::with_persistence(
+            Arc::new(
+                crate::store::context::ProtocolRepositoryEventLogBridge::new(Arc::new(
+                    crate::store::ProtocolRepository::new_for_testing(Arc::clone(&faulty)),
+                )),
+            ),
+        );
+        let ctx_id = hex::encode([0x6Cu8; 32]);
+        let ctx_bytes = crate::context::state::context_id_to_bytes(&ctx_id);
+        log.init_event_log(&ctx_bytes).await.expect("init log");
+        for i in 0..5u64 {
+            log.append_event(
+                &ctx_bytes,
+                scp_event_log::EventType::MemberJoined,
+                "did:example:checkpoint-admin",
+                scp_event_log::EventPayload::default(),
+                T0 + i,
+            )
+            .await
+            .expect("append");
+        }
+        let sup = supervisor_with_clock_persistence_and_event_log(
+            Arc::new(TestClock::new(T0)),
+            Box::new(MapPersistence::default()),
+            Box::new(log),
+        );
+        let deps = test_actor_deps(&sup).await;
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            [0x6Cu8; 32],
+            T0,
+            DID("did:example:checkpoint-admin".to_owned()),
+        );
+        state.handle = crate::context::ContextHandle::new(
+            ctx_id.clone(),
+            scp_protocol::context::params::ContextParams::default(),
+        );
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .unwrap();
+        state.governance.pruning_policy = Some(scp_protocol::context::governance::PruningPolicy {
+            size_based: Some(scp_protocol::context::governance::SizeBasedPolicy {
+                max_event_count: 2,
+                max_storage_bytes: u64::MAX,
+            }),
+            ..Default::default()
+        });
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
+
+        faulty.fail_nth_store(1);
+        let checkpoint = crate::context::trust_recovery_helpers::create_governance_checkpoint(
+            &mut cell,
+            &deps,
+            &ctx_id,
+            1,
+            [0u8; 32],
+            5,
+            [0u8; 32],
+            [0u8; 32],
+            &DID("did:example:checkpoint-admin".to_owned()),
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            matches!(checkpoint, Err(ContextError::EventLogFailed(_))),
+            "the failed prune fails the checkpoint: {checkpoint:?}"
+        );
+        assert_eq!(
+            deps.event_log
+                .event_log_entries(&ctx_bytes)
+                .expect("the log reads")
+                .map(|entries| entries.len()),
+            Some(5),
+            "the in-memory log is unchanged"
+        );
     }
 
     /// M1 (retry stamps the convergent deadline, REGRESSION GATE): when the

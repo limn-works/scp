@@ -5725,10 +5725,10 @@ mod restore_reconcile_tests {
             "expected the routing refusal, got {err:?}"
         );
         assert!(
-            deps.event_log
-                .event_log_entries(&ctx_bytes)
-                .expect("the provider answers")
-                .is_none(),
+            matches!(
+                deps.event_log.event_log_entries(&ctx_bytes),
+                Err(ContextError::ContextNotRegistered(_))
+            ),
             "the failed restore released the log it loaded"
         );
         let reloaded = stored_event_log(&storage);
@@ -5857,11 +5857,11 @@ mod restore_reconcile_tests {
         lifecycle_helpers::shutdown_all_contexts(&supervisor).await;
 
         assert!(
-            deps.event_log
-                .event_log_entries(&ctx_bytes)
-                .unwrap()
-                .is_none(),
-            "shutdown released the in-memory log"
+            matches!(
+                deps.event_log.event_log_entries(&ctx_bytes),
+                Err(ContextError::ContextNotRegistered(_))
+            ),
+            "shutdown released the in-memory log, which reads as not loaded"
         );
         assert_eq!(
             stored_event_log(&storage)
@@ -5870,6 +5870,78 @@ mod restore_reconcile_tests {
                 .unwrap(),
             crate::context::builder::EventLogRestore::Loaded { entries: created },
             "the stored log survives shutdown"
+        );
+    }
+
+    /// A restore's guard releases the log it loaded only when no actor for
+    /// the context is registered: a guard dropped while an actor owns the
+    /// context leaves that actor's log loaded (spec section 17.3, "Event log
+    /// write failures").
+    #[tokio::test]
+    async fn a_restore_guard_keeps_a_registered_actors_log() {
+        let owner = DID("did:dht:z6MkGuardKeepsLog".to_owned());
+        let live = "restore-guard-registered-actor";
+        let live_bytes = crate::context::state::context_id_to_bytes(live);
+        let storage = Arc::new(InMemoryStorage::new());
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
+            owner.0.clone(),
+            std::sync::Arc::new(scp_clock::SystemClock),
+        ));
+        let supervisor = Supervisor::with_providers(
+            crypto,
+            Box::new(OkTransport),
+            Box::new(stored_event_log(&storage)),
+            Arc::new(|_: &DID, _: scp_did::SigningKeyId| None),
+            Some(Box::new(SharedCapture(Arc::new(
+                CapturingPersistence::default(),
+            )))),
+            None,
+            None,
+            None,
+            mls_storage(),
+        );
+        supervisor
+            .create_context(
+                live.to_owned(),
+                ContextParams {
+                    mode: ContextMode::Encrypted,
+                    ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
+                    ..ContextParams::default()
+                },
+                owner.clone(),
+                Some([7u8; 32]),
+                Vec::new(),
+            )
+            .await
+            .expect("create_context should succeed");
+        let deps = supervisor
+            .build_actor_deps_loaded(&owner)
+            .await
+            .expect("build_actor_deps");
+
+        drop(super::RestoredEventLogGuard::arm(&deps, live, live_bytes));
+        assert!(
+            matches!(deps.event_log.event_log_entries(&live_bytes), Ok(Some(_))),
+            "the registered actor's log stays loaded"
+        );
+
+        let orphan = "restore-guard-no-actor";
+        let orphan_bytes = crate::context::state::context_id_to_bytes(orphan);
+        deps.event_log
+            .init_event_log(&orphan_bytes)
+            .await
+            .expect("init log");
+        drop(super::RestoredEventLogGuard::arm(
+            &deps,
+            orphan,
+            orphan_bytes,
+        ));
+        assert!(
+            matches!(
+                deps.event_log.event_log_entries(&orphan_bytes),
+                Err(ContextError::ContextNotRegistered(_))
+            ),
+            "a log no actor owns is released"
         );
     }
 
