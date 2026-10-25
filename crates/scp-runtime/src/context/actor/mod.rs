@@ -1669,24 +1669,20 @@ mod tests {
         let deps = new_test_deps().await;
         let mut state = writable_encrypted_state(0x31, DIRECT_ALICE);
         let ctx = ctx_hex(0x31);
-        let ctx_bytes = [0x31u8; 32];
         let pseudonym = [0x42u8; 32];
         let inner = minimal_inner(&ctx, DIRECT_ALICE, 1);
 
-        let mut downward_auth_applied: Option<crate::context::actor::class_s::ClassSCommitToken> =
-            None;
+        let mut downward_auth_applied = crate::context::log_unit_helpers::ConsequenceSink::new();
         let consumed = crate::context::messaging_helpers::deliver_message_and_drain_buffered(
             &mut crate::context::actor::class_s::ClassCMut::from_state(&mut state),
             &deps,
             &ctx,
-            &ctx_bytes,
             DIRECT_ALICE,
             &inner,
             &announcement_bytes(DIRECT_ALICE, pseudonym),
             true,
             &mut downward_auth_applied,
         )
-        .await
         .expect("a legitimate announcement is consumed, not an error");
         assert!(consumed, "an announcement is reported as consumed (true)");
         let reg = state.routing.peer_registry().expect("encrypted ⇒ registry");
@@ -1702,24 +1698,20 @@ mod tests {
         let deps = new_test_deps().await;
         let mut state = writable_encrypted_state(0x32, DIRECT_ALICE);
         let ctx = ctx_hex(0x32);
-        let ctx_bytes = [0x32u8; 32];
         // Authenticated sender is ALICE, but the announcement claims BOB.
         let inner = minimal_inner(&ctx, DIRECT_ALICE, 1);
 
-        let mut downward_auth_applied: Option<crate::context::actor::class_s::ClassSCommitToken> =
-            None;
+        let mut downward_auth_applied = crate::context::log_unit_helpers::ConsequenceSink::new();
         let result = crate::context::messaging_helpers::deliver_message_and_drain_buffered(
             &mut crate::context::actor::class_s::ClassCMut::from_state(&mut state),
             &deps,
             &ctx,
-            &ctx_bytes,
             DIRECT_ALICE,
             &inner,
             &announcement_bytes(DIRECT_BOB, [0x42u8; 32]),
             true,
             &mut downward_auth_applied,
-        )
-        .await;
+        );
         assert!(
             matches!(result, Err(ContextError::PermissionDenied(_))),
             "the direct ingest site maps a rejection to PermissionDenied; got {result:?}"
@@ -1739,23 +1731,19 @@ mod tests {
         let deps = new_test_deps().await;
         let mut state = writable_encrypted_state(0x33, DIRECT_ALICE);
         let ctx = ctx_hex(0x33);
-        let ctx_bytes = [0x33u8; 32];
         let inner = minimal_inner(&ctx, DIRECT_ALICE, 1);
 
-        let mut downward_auth_applied: Option<crate::context::actor::class_s::ClassSCommitToken> =
-            None;
+        let mut downward_auth_applied = crate::context::log_unit_helpers::ConsequenceSink::new();
         let result = crate::context::messaging_helpers::deliver_message_and_drain_buffered(
             &mut crate::context::actor::class_s::ClassCMut::from_state(&mut state),
             &deps,
             &ctx,
-            &ctx_bytes,
             DIRECT_ALICE,
             &inner,
             &announcement_bytes(DIRECT_ALICE, [0u8; 32]), // zero sentinel = reserved
             true,
             &mut downward_auth_applied,
-        )
-        .await;
+        );
         assert!(
             matches!(result, Err(ContextError::PermissionDenied(_))),
             "a reserved routing-ID value is rejected on the direct path; got {result:?}"
@@ -1767,25 +1755,21 @@ mod tests {
         let deps = new_test_deps().await;
         let mut state = writable_encrypted_state(0x34, DIRECT_ALICE);
         let ctx = ctx_hex(0x34);
-        let ctx_bytes = [0x34u8; 32];
 
         for (seq, rid) in [(1u64, [0x42u8; 32]), (2u64, [0x43u8; 32])] {
             let inner = minimal_inner(&ctx, DIRECT_ALICE, seq);
-            let mut downward_auth_applied: Option<
-                crate::context::actor::class_s::ClassSCommitToken,
-            > = None;
+            let mut downward_auth_applied =
+                crate::context::log_unit_helpers::ConsequenceSink::new();
             let consumed = crate::context::messaging_helpers::deliver_message_and_drain_buffered(
                 &mut crate::context::actor::class_s::ClassCMut::from_state(&mut state),
                 &deps,
                 &ctx,
-                &ctx_bytes,
                 DIRECT_ALICE,
                 &inner,
                 &announcement_bytes(DIRECT_ALICE, rid),
                 true,
                 &mut downward_auth_applied,
             )
-            .await
             .expect("same-DID re-announce must succeed");
             assert!(consumed);
         }
@@ -1800,7 +1784,7 @@ mod tests {
 
     /// Ingests `member`'s v2 announcement at `pseudonym_epoch` through the
     /// real in-order ingest path.
-    async fn ingest_v2_announcement(
+    fn ingest_v2_announcement(
         state: &mut state::PerContextState,
         deps: &deps::ActorDeps,
         ctx_byte: u8,
@@ -1821,20 +1805,17 @@ mod tests {
         })
         .expect("serialize v2 announcement");
         let inner = minimal_inner(&ctx, member, sequence);
-        let mut downward_auth_applied: Option<crate::context::actor::class_s::ClassSCommitToken> =
-            None;
+        let mut downward_auth_applied = crate::context::log_unit_helpers::ConsequenceSink::new();
         crate::context::messaging_helpers::deliver_message_and_drain_buffered(
             &mut crate::context::actor::class_s::ClassCMut::from_state(state),
             deps,
             &ctx,
-            &[ctx_byte; 32],
             member,
             &inner,
             &plaintext,
             true,
             &mut downward_auth_applied,
         )
-        .await
     }
 
     /// Spec 09 §9.10.4.1 "Record lifetime": once a member processes a Commit
@@ -1866,11 +1847,10 @@ mod tests {
 
         assert!(
             ingest_v2_announcement(&mut state, &deps, 0x35, DIRECT_BOB, 1, 1, [0x51; 32])
-                .await
                 .expect("the epoch-1 announcement is accepted")
         );
         let rejected =
-            ingest_v2_announcement(&mut state, &deps, 0x35, DIRECT_BOB, 2, 0, [0x50; 32]).await;
+            ingest_v2_announcement(&mut state, &deps, 0x35, DIRECT_BOB, 2, 0, [0x50; 32]);
         assert!(
             matches!(rejected, Err(ContextError::PermissionDenied(_))),
             "a lower epoch over a recorded epoch is rejected; got {rejected:?}"
@@ -1902,7 +1882,6 @@ mod tests {
         );
         assert!(
             ingest_v2_announcement(&mut state, &deps, 0x35, DIRECT_BOB, 3, 0, [0x52; 32])
-                .await
                 .expect("the rejoiner's epoch-0 announcement is accepted")
         );
         let record = state

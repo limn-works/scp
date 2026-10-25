@@ -8,13 +8,14 @@ use scp_protocol::context::membership::{ContextEvent, ReceiveBuffer};
 use scp_protocol::context::params::Capability;
 use scp_protocol::trust::consequence::{ConsequenceRule, TriggeredConsequence};
 
-use super::actor::class_s::{ClassSCommitToken, ConsequenceRoleStateMut};
+use super::actor::class_s::{ClassSCommitToken, ConsequenceRoleStateMut, PendingLogUnits};
+use super::log_unit_helpers::ConsequenceSink;
 // Re-export the consequence split (defined in `class_s`) for the consequence
 // callers that reach it via this module's path. `pub(in crate::context)` matches
 // the type's `pub(crate)` effective reach within the context module tree without
 // tripping `redundant_pub_crate` (the module itself is private to `context`).
 pub(in crate::context) use super::actor::class_s::ConsequenceStateSplit;
-use super::state::{context_id_to_bytes, emit_event_into};
+use super::state::{LeafSpec, context_id_to_bytes, emit_event_into};
 
 // ---------------------------------------------------------------------------
 // Consequence enforcement — synthetic actor DID + shared wire-stable labels
@@ -46,46 +47,62 @@ use scp_protocol::trust::consequence::{
     consequence_action_type, convergent_consequence_timestamp, trigger_kind_str,
 };
 
-/// Best-effort durable append of one consequence event log entry. A failed
-/// append is logged via `tracing::warn!` but never blocks the matching
-/// `receive_buffer.push(...)` call — the receive buffer remains a useful
-/// in-session signal even when the durable log is unavailable. Returns
-/// nothing because the failure mode is observed via tracing, not callers.
-///
-/// `payload` is the shared [`consequence_event_payload`] output — JSON bytes
-/// wrapped in an [`scp_event_log::EventPayload`]. The consequence engine reads
-/// `target_did` back out of these bytes via
-/// `scp_protocol::trust::consequence::payload_target_is`.
-async fn append_consequence_event(
-    event_log: &dyn crate::context::builder::ContextEventLogProvider,
-    context_id: &str,
-    context_id_bytes: &[u8; 32],
+/// One durable consequence leaf for `consequence` (H4): the shared
+/// [`consequence_event_payload`] bytes under the system consequence actor, at
+/// the convergent timestamp of the triggering event (see
+/// [`convergent_consequence_timestamp`]), never a per-member evaluation `now()`
+/// (§7.3.1, §9.9.3). The consequence engine reads `target_did` back out of
+/// the payload via `scp_protocol::trust::consequence::payload_target_is`.
+fn consequence_leaf(
     event_type: scp_event_log::EventType,
     member_did: &DID,
-    payload: scp_event_log::EventPayload,
-    // Convergent leaf timestamp: the `timestamp` of the convergent triggering
-    // event (see [`convergent_consequence_timestamp`]). Copied identically by
-    // every member, never a per-member evaluation `now()` (§7.3.1, §9.9.3).
-    trigger_timestamp_secs: u64,
+    consequence: &TriggeredConsequence,
+    trigger_kind: &str,
+    action_type: &str,
+) -> LeafSpec {
+    LeafSpec {
+        event_type,
+        actor_did: CONSEQUENCE_ACTOR_DID.to_owned(),
+        payload: consequence_event_payload(
+            member_did.as_ref(),
+            consequence.rule_index,
+            trigger_kind,
+            action_type,
+        ),
+        timestamp_secs: convergent_consequence_timestamp(consequence),
+    }
+}
+
+/// Appends consequence leaves in memory first, for a caller that keeps the
+/// memory-first rule after its irreversible step (spec 17 §17.3 "Event log
+/// write failures": every append after a step that does not queue a pending
+/// log unit). A failed append is logged and never fails the caller.
+pub async fn append_consequence_leaves_after_side_effect(
+    event_log: &dyn crate::context::builder::ContextEventLogProvider,
+    context_id: &str,
+    leaves: Vec<LeafSpec>,
 ) {
-    if let Err(e) = event_log
-        .append_context_event_with_payload(
-            crate::context::builder::AppendMode::AfterSideEffect,
-            context_id_bytes,
-            event_type,
-            CONSEQUENCE_ACTOR_DID,
-            payload,
-            trigger_timestamp_secs,
-        )
-        .await
-    {
-        tracing::warn!(
-            context_id,
-            member = %member_did,
-            event = ?event_type,
-            error = %e,
-            "failed to append consequence event to durable event log"
-        );
+    let context_id_bytes = context_id_to_bytes(context_id);
+    for leaf in leaves {
+        let event_type = leaf.event_type;
+        if let Err(e) = event_log
+            .append_context_event_with_payload(
+                crate::context::builder::AppendMode::AfterSideEffect,
+                &context_id_bytes,
+                event_type,
+                &leaf.actor_did,
+                leaf.payload,
+                leaf.timestamp_secs,
+            )
+            .await
+        {
+            tracing::warn!(
+                context_id,
+                event = ?event_type,
+                error = %e,
+                "failed to append consequence event to durable event log"
+            );
+        }
     }
 }
 
@@ -117,7 +134,6 @@ pub struct EnforceConsequencesCtx<'a> {
     pub triggered: &'a [TriggeredConsequence],
     pub rules: &'a [ConsequenceRule],
     pub clock: &'a dyn scp_clock::Clock,
-    pub event_log: &'a dyn crate::context::builder::ContextEventLogProvider,
     /// Optional broadcast channel for event propagation from free
     /// functions that lack `&self` access to `ContextManager`.
     pub event_tx: Option<
@@ -189,22 +205,14 @@ pub struct EnforceConsequencesCtx<'a> {
 /// observe the signal directly, but the obligation arming itself is now carried by
 /// the sink, not by the caller reacting to the return value.
 #[must_use]
-pub async fn enforce_triggered_consequences(
+pub fn enforce_triggered_consequences(
     state: &mut ConsequenceStateSplit<'_>,
     args: &EnforceConsequencesCtx<'_>,
-    obligation: &mut Option<ClassSCommitToken>,
+    sink: &mut ConsequenceSink,
 ) -> bool {
-    let context_id_bytes = context_id_to_bytes(args.context_id);
     let mut downward_auth_applied = false;
     for consequence in args.triggered {
-        downward_auth_applied |= process_one_triggered_consequence(
-            state,
-            args,
-            &context_id_bytes,
-            consequence,
-            obligation,
-        )
-        .await;
+        downward_auth_applied |= process_one_triggered_consequence(state, args, consequence, sink);
     }
     downward_auth_applied
 }
@@ -219,12 +227,11 @@ pub async fn enforce_triggered_consequences(
 /// replacement (a demotion shrinks the member's effective authority). The caller
 /// OR-accumulates this across the triggered set to decide whether a fail-closed
 /// persist of the already-mutated state is owed.
-async fn process_one_triggered_consequence(
+fn process_one_triggered_consequence(
     state: &mut ConsequenceStateSplit<'_>,
     args: &EnforceConsequencesCtx<'_>,
-    context_id_bytes: &[u8; 32],
     consequence: &TriggeredConsequence,
-    obligation: &mut Option<ClassSCommitToken>,
+    sink: &mut ConsequenceSink,
 ) -> bool {
     let member_did = args.member_did;
     let now = args.now;
@@ -277,13 +284,11 @@ async fn process_one_triggered_consequence(
     emit_consequence_triggered(
         state,
         args,
-        context_id_bytes,
         consequence,
         &trigger_kind,
         action_type,
-        durable,
-    )
-    .await;
+        durable.then_some(&mut *sink),
+    );
 
     if !member_present {
         // Member left between evaluation and enforcement: emit a failed
@@ -295,13 +300,11 @@ async fn process_one_triggered_consequence(
         emit_absent_member_enforcement_failed(
             state,
             args,
-            context_id_bytes,
             consequence,
             &trigger_kind,
             action_type,
-            durable,
-        )
-        .await;
+            durable.then_some(&mut *sink),
+        );
         return false;
     }
 
@@ -311,7 +314,7 @@ async fn process_one_triggered_consequence(
         consequence,
         args.clock,
         args.context_id,
-        obligation,
+        &mut sink.obligation,
     );
 
     if !enforcement.success {
@@ -322,9 +325,8 @@ async fn process_one_triggered_consequence(
             &trigger_kind,
             action_type,
             durable,
-            obligation,
-        )
-        .await;
+            sink,
+        );
         // The H10 escalation unconditionally applies `suspend_all` (a Class-S
         // `suspended_capabilities` mutation), so this path always owes a
         // fail-closed persist regardless of which action originally failed.
@@ -345,13 +347,11 @@ async fn process_one_triggered_consequence(
     emit_consequence_enforced_success(
         state,
         args,
-        context_id_bytes,
         consequence,
         &trigger_kind,
         action_type,
-        durable,
-    )
-    .await;
+        durable.then_some(sink),
+    );
 
     // `true` iff this successful action reduced the member's effective authority
     // and therefore owes a fail-closed persist (ADR-049 §9): a
@@ -369,32 +369,22 @@ async fn process_one_triggered_consequence(
 /// velocity/rate-triggered, non-convergent consequence — ADR-051 §6), the
 /// durable leaf and counter bump are suppressed and only the `ContextEvent` is
 /// surfaced.
-async fn emit_consequence_triggered(
+fn emit_consequence_triggered(
     state: &mut ConsequenceStateSplit<'_>,
     args: &EnforceConsequencesCtx<'_>,
-    context_id_bytes: &[u8; 32],
     consequence: &TriggeredConsequence,
     trigger_kind: &str,
     action_type: &str,
-    durable: bool,
+    durable_sink: Option<&mut ConsequenceSink>,
 ) {
-    if durable {
-        let payload = consequence_event_payload(
-            args.member_did.as_ref(),
-            consequence.rule_index,
-            trigger_kind,
-            action_type,
-        );
-        append_consequence_event(
-            args.event_log,
-            args.context_id,
-            context_id_bytes,
+    if let Some(sink) = durable_sink {
+        sink.push_leaf(consequence_leaf(
             scp_event_log::EventType::ConsequenceTriggered,
             args.member_did,
-            payload,
-            convergent_consequence_timestamp(consequence),
-        )
-        .await;
+            consequence,
+            trigger_kind,
+            action_type,
+        ));
         *state.checkpoint_events_since += 1;
     }
     let event = ContextEvent::ConsequenceTriggered {
@@ -412,32 +402,22 @@ async fn emit_consequence_triggered(
 /// "member-departed-mid-flight" path. Separate from
 /// [`emit_failure_escalation`] because no escalation is applied when the
 /// member is absent — there is nothing to escalate against.
-async fn emit_absent_member_enforcement_failed(
+fn emit_absent_member_enforcement_failed(
     state: &mut ConsequenceStateSplit<'_>,
     args: &EnforceConsequencesCtx<'_>,
-    context_id_bytes: &[u8; 32],
     consequence: &TriggeredConsequence,
     trigger_kind: &str,
     action_type: &str,
-    durable: bool,
+    durable_sink: Option<&mut ConsequenceSink>,
 ) {
-    if durable {
-        let payload = consequence_event_payload(
-            args.member_did.as_ref(),
-            consequence.rule_index,
-            trigger_kind,
-            action_type,
-        );
-        append_consequence_event(
-            args.event_log,
-            args.context_id,
-            context_id_bytes,
+    if let Some(sink) = durable_sink {
+        sink.push_leaf(consequence_leaf(
             scp_event_log::EventType::ConsequenceEnforcementFailed,
             args.member_did,
-            payload,
-            convergent_consequence_timestamp(consequence),
-        )
-        .await;
+            consequence,
+            trigger_kind,
+            action_type,
+        ));
         *state.checkpoint_events_since += 1;
     }
     let event = ContextEvent::ConsequenceEnforced {
@@ -451,32 +431,22 @@ async fn emit_absent_member_enforcement_failed(
 
 /// Emits a `ConsequenceEnforced { success: true }` durable entry plus the
 /// matching receive-buffer push for the success path.
-async fn emit_consequence_enforced_success(
+fn emit_consequence_enforced_success(
     state: &mut ConsequenceStateSplit<'_>,
     args: &EnforceConsequencesCtx<'_>,
-    context_id_bytes: &[u8; 32],
     consequence: &TriggeredConsequence,
     trigger_kind: &str,
     action_type: &str,
-    durable: bool,
+    durable_sink: Option<&mut ConsequenceSink>,
 ) {
-    if durable {
-        let payload = consequence_event_payload(
-            args.member_did.as_ref(),
-            consequence.rule_index,
-            trigger_kind,
-            action_type,
-        );
-        append_consequence_event(
-            args.event_log,
-            args.context_id,
-            context_id_bytes,
+    if let Some(sink) = durable_sink {
+        sink.push_leaf(consequence_leaf(
             scp_event_log::EventType::ConsequenceEnforced,
             args.member_did,
-            payload,
-            convergent_consequence_timestamp(consequence),
-        )
-        .await;
+            consequence,
+            trigger_kind,
+            action_type,
+        ));
         *state.checkpoint_events_since += 1;
     }
     let event = ContextEvent::ConsequenceEnforced {
@@ -681,21 +651,17 @@ fn enforce_assign_role(
 /// durable event log entries (`ConsequenceEnforcementFailed` then
 /// `ConsequenceEscalatedToSuspendAll`) so an audit can reconstruct
 /// (a) which action failed and (b) that escalation was applied.
-async fn emit_failure_escalation(
+fn emit_failure_escalation(
     state: &mut ConsequenceStateSplit<'_>,
     args: &EnforceConsequencesCtx<'_>,
     consequence: &TriggeredConsequence,
     trigger_kind: &str,
     action_type: &str,
     durable: bool,
-    obligation: &mut Option<ClassSCommitToken>,
+    sink: &mut ConsequenceSink,
 ) {
     let context_id = args.context_id;
     let member_did = args.member_did;
-    // Recomputed from `args.context_id` (a pure SHA-256) on this RARE
-    // failure-escalation path rather than threaded as a parameter — keeps the
-    // signature within the `clippy::too_many_arguments` budget without bundling.
-    let context_id_bytes = &context_id_to_bytes(context_id);
     tracing::warn!(
         context_id,
         member = %member_did,
@@ -709,48 +675,29 @@ async fn emit_failure_escalation(
     // `obligation` so the escalation's suspension is persisted fail-closed.
     state
         .role_state
-        .suspend_all(member_did.as_ref(), obligation, context_id);
+        .suspend_all(member_did.as_ref(), &mut sink.obligation, context_id);
 
     // The two audit records (failure then escalation) are durable Merkle leaves
     // only for convergent triggers (ADR-051 §6); for a velocity/rate trigger
     // they are suppressed (the `ContextEvent` below still surfaces the outcome).
     if durable {
-        // First the failure record, then the escalation record. Both go to
-        // the durable log before the receive buffer push.
-        let failed_payload = consequence_event_payload(
-            member_did.as_ref(),
-            consequence.rule_index,
-            trigger_kind,
-            action_type,
-        );
-        append_consequence_event(
-            args.event_log,
-            context_id,
-            context_id_bytes,
+        // First the failure record, then the escalation record, as one
+        // unit with the escalation's suspension.
+        sink.push_leaf(consequence_leaf(
             scp_event_log::EventType::ConsequenceEnforcementFailed,
             member_did,
-            failed_payload,
-            convergent_consequence_timestamp(consequence),
-        )
-        .await;
-        *state.checkpoint_events_since += 1;
-        let escalation_payload = consequence_event_payload(
-            member_did.as_ref(),
-            consequence.rule_index,
+            consequence,
             trigger_kind,
-            "SuspendAll",
-        );
-        append_consequence_event(
-            args.event_log,
-            context_id,
-            context_id_bytes,
+            action_type,
+        ));
+        sink.push_leaf(consequence_leaf(
             scp_event_log::EventType::ConsequenceEscalatedToSuspendAll,
             member_did,
-            escalation_payload,
-            convergent_consequence_timestamp(consequence),
-        )
-        .await;
-        *state.checkpoint_events_since += 1;
+            consequence,
+            trigger_kind,
+            "SuspendAll",
+        ));
+        *state.checkpoint_events_since += 2;
     }
     let event = ContextEvent::ConsequenceEnforced {
         context_id: context_id.to_owned(),
@@ -813,38 +760,69 @@ async fn emit_failure_escalation(
 /// already has uses [`event_log_entries_for_consequences_after_side_effect`].
 pub fn event_log_entries_for_consequences(
     receive_buffer: &ReceiveBuffer,
+    queued: &PendingLogUnits,
     context_id: &str,
     now: u64,
     event_log: &dyn crate::context::builder::ContextEventLogProvider,
 ) -> Result<(Vec<scp_event_log::Event>, u64), ContextError> {
-    // Source 1: Full event log history (persisted, with real timestamps and
-    // actor_did). Acquired here from the provider.
-    //
-    // ADR-056: key by the canonical digest (matches the event log init in
-    // `builder::create_context` and `state.context_id`), not a re-hash of the
-    // hex id — `context_id_to_bytes` resolves a real 64-hex id to its digest.
-    let context_id_bytes = context_id_to_bytes(context_id);
-    let log_entries = event_log
-        .event_log_entries(&context_id_bytes)?
-        .unwrap_or_default();
+    let log_entries = read_consequence_log(queued, context_id, event_log)?;
     Ok(merge_for_consequences(&log_entries, receive_buffer, now))
 }
 
+/// Source 1 of [`event_log_entries_for_consequences`]: the durable log
+/// followed by the entries of every queued log unit, which count as evidence
+/// (spec 17 §17.3 "Event log write failures").
+///
+/// ADR-056: the log is keyed by the canonical digest (matches the event log
+/// init in `builder::create_context` and `state.context_id`), not a re-hash
+/// of the hex id.
+///
+/// # Errors
+///
+/// Returns the provider's read error ([`ContextError::EventLogFailed`] or
+/// [`ContextError::ContextNotRegistered`]).
+pub fn read_consequence_log(
+    queued: &PendingLogUnits,
+    context_id: &str,
+    event_log: &dyn crate::context::builder::ContextEventLogProvider,
+) -> Result<Vec<scp_event_log::Event>, ContextError> {
+    let context_id_bytes = context_id_to_bytes(context_id);
+    let mut entries = event_log
+        .event_log_entries(&context_id_bytes)?
+        .unwrap_or_default();
+    // A queued entry has no position in the log yet, so its sequence and
+    // chain link are placeholders; the merge reads its type, actor, payload,
+    // and timestamp.
+    let mut sequence = u64::try_from(entries.len()).unwrap_or(u64::MAX);
+    for leaf in queued.iter().flat_map(|unit| unit.leaves.iter()) {
+        entries.push(scp_event_log::Event {
+            event_type: leaf.event_type,
+            actor_did: DID::from(leaf.actor_did.clone()),
+            timestamp: leaf.timestamp_secs,
+            sequence,
+            payload: leaf.payload.clone(),
+            prev_hash: [0u8; 32],
+            signature: Vec::new(),
+        });
+        sequence = sequence.saturating_add(1);
+    }
+    Ok(entries)
+}
+
 /// [`event_log_entries_for_consequences`] for a caller whose operation already
-/// took its irreversible step (an executed governance action, a delivered or
-/// sent message, a committed join, an executed outlet call): failing the
-/// operation cannot undo that step, so a failed read is logged and the
-/// evaluation runs over the receive buffer alone. Spec section 17.3 ("Event
-/// log write failures") names these sites; the pending-log-unit work gives
-/// them a read that cannot fail this way.
+/// took its irreversible step and keeps the memory-first rule (governance
+/// finalize and the post-join participation update; spec 17 §17.3 "Event log
+/// write failures"): a failed read is logged and the evaluation runs over the
+/// receive buffer alone.
 pub(in crate::context) fn event_log_entries_for_consequences_after_side_effect(
     receive_buffer: &ReceiveBuffer,
+    queued: &PendingLogUnits,
     context_id: &str,
     now: u64,
     event_log: &dyn crate::context::builder::ContextEventLogProvider,
 ) -> (Vec<scp_event_log::Event>, u64) {
-    event_log_entries_for_consequences(receive_buffer, context_id, now, event_log).unwrap_or_else(
-        |e| {
+    event_log_entries_for_consequences(receive_buffer, queued, context_id, now, event_log)
+        .unwrap_or_else(|e| {
             tracing::warn!(
                 context_id,
                 error = %e,
@@ -852,14 +830,36 @@ pub(in crate::context) fn event_log_entries_for_consequences_after_side_effect(
                  consequences are evaluated over the receive buffer alone"
             );
             merge_for_consequences(&[], receive_buffer, now)
-        },
-    )
+        })
+}
+
+/// [`event_log_entries_for_consequences`] for an operation that queues its
+/// leaves as a pending log unit after its irreversible step (the received and
+/// buffered deliveries and the outlet capture; spec 17 §17.3 "Event log write
+/// failures"). A failed read is recorded in `sink`, whose discharge sets the
+/// log fault, and returns `None`: the step completes and the consequence
+/// evaluation for it does not run.
+pub(in crate::context) fn consequence_events_after_step(
+    receive_buffer: &ReceiveBuffer,
+    queued: &PendingLogUnits,
+    context_id: &str,
+    now: u64,
+    event_log: &dyn crate::context::builder::ContextEventLogProvider,
+    sink: &mut ConsequenceSink,
+) -> Option<(Vec<scp_event_log::Event>, u64)> {
+    match event_log_entries_for_consequences(receive_buffer, queued, context_id, now, event_log) {
+        Ok(read) => Some(read),
+        Err(e) => {
+            sink.note_read_fault(e.to_string());
+            None
+        }
+    }
 }
 
 /// Merges Source 1 (`log_entries`) with Source 2 (the receive buffer) for
 /// [`event_log_entries_for_consequences`], returning the merged events and the
 /// convergent window anchor.
-fn merge_for_consequences(
+pub(in crate::context) fn merge_for_consequences(
     log_entries: &[scp_event_log::Event],
     receive_buffer: &ReceiveBuffer,
     now: u64,
@@ -990,7 +990,7 @@ mod convergence_tests {
             // The `rule()` helper's action is `SuspendAccess`, which always
             // mutates `suspended_capabilities` for a present member, so the
             // downward-auth obligation sink must be ARMED (ADR-049 §9).
-            let mut obligation = None;
+            let mut obligation = crate::context::log_unit_helpers::ConsequenceSink::new();
             let suspended = enforce_triggered_consequences(
                 &mut split,
                 &EnforceConsequencesCtx {
@@ -1000,21 +1000,23 @@ mod convergence_tests {
                     triggered: &triggered,
                     rules: &rules,
                     clock: &clock,
-                    event_log: &event_log,
                     event_tx: Some(&tx),
                 },
                 &mut obligation,
-            )
-            .await;
+            );
             assert!(
                 suspended,
                 "SuspendAccess against a present member applies a suspension"
             );
-            let token =
-                obligation.expect("a SuspendAccess GROW arms the fail-closed obligation sink");
+            let (token, leaves) = obligation.into_parts();
+            let token = token.expect("a SuspendAccess GROW arms the fail-closed obligation sink");
             // No persistence backend is wired in this convergence-discriminator
             // test, so defuse the obligation instead of driving a real persist.
             token.defuse_for_test();
+            // The memory-first adapter writes the durable leaves the engine
+            // produced; a non-convergent trigger produced none.
+            super::append_consequence_leaves_after_side_effect(&event_log, &context_id_str, leaves)
+                .await;
         }
 
         let root_after = event_log
@@ -1147,9 +1149,14 @@ mod convergence_tests {
     /// `Custom` triggers match) in the merged consequence-evaluation event list.
     async fn governance_bucket_count(buffer: &ReceiveBuffer) -> usize {
         let (log, ctx) = convergent_log().await;
-        let (merged, _convergent_now) =
-            event_log_entries_for_consequences(buffer, &ctx, 1_700_000_100, &log)
-                .expect("the log reads");
+        let (merged, _convergent_now) = event_log_entries_for_consequences(
+            buffer,
+            &crate::context::actor::class_s::PendingLogUnits::default(),
+            &ctx,
+            1_700_000_100,
+            &log,
+        )
+        .expect("the log reads");
         merged
             .iter()
             .filter(|e| e.event_type == EventType::GovernanceAction)
@@ -1204,8 +1211,13 @@ mod convergence_tests {
         log.release_event_log(&storage_key);
         let buffer = buffer_with_local_activity(3);
 
-        let read =
-            event_log_entries_for_consequences(&buffer, &context_id_str, 1_700_000_100, &log);
+        let read = event_log_entries_for_consequences(
+            &buffer,
+            &crate::context::actor::class_s::PendingLogUnits::default(),
+            &context_id_str,
+            1_700_000_100,
+            &log,
+        );
         assert!(
             matches!(
                 read,
@@ -1215,6 +1227,7 @@ mod convergence_tests {
         );
         let (merged, convergent_now) = super::event_log_entries_for_consequences_after_side_effect(
             &buffer,
+            &crate::context::actor::class_s::PendingLogUnits::default(),
             &context_id_str,
             1_700_000_100,
             &log,
@@ -1249,9 +1262,14 @@ mod convergence_tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
             .as_secs();
-        let (merged, _convergent_now) =
-            event_log_entries_for_consequences(&buffer, &context_id_str, now, &log)
-                .expect("the log reads");
+        let (merged, _convergent_now) = event_log_entries_for_consequences(
+            &buffer,
+            &crate::context::actor::class_s::PendingLogUnits::default(),
+            &context_id_str,
+            now,
+            &log,
+        )
+        .expect("the log reads");
         let message_count = merged
             .iter()
             .filter(|e| e.event_type == EventType::MessageSent)

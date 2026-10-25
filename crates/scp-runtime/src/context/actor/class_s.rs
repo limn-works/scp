@@ -491,6 +491,11 @@ impl PendingLogUnits {
         self.0.len()
     }
 
+    /// The queued units, oldest first.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &crate::context::state::PendingLogUnit> {
+        self.0.iter()
+    }
+
     /// The oldest queued unit, which the drain writes next.
     pub(crate) fn front(&self) -> Option<&crate::context::state::PendingLogUnit> {
         self.0.front()
@@ -506,6 +511,38 @@ impl PendingLogUnits {
 /// failures"). Each runs inside the combinator that handed out this view, so
 /// the combinator's fail-closed persist stores the change.
 impl ClassSMut<'_> {
+    /// Queues `leaves` as one pending log unit, in the persist that records
+    /// the operation's irreversible step. An empty `leaves` queues nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::EventLogFailed`] when a leaf breaks the payload
+    /// rules the append enforces; nothing is queued then.
+    pub(crate) fn enqueue_log_unit(
+        &mut self,
+        leaves: Vec<crate::context::state::LeafSpec>,
+    ) -> Result<(), ContextError> {
+        if leaves.is_empty() {
+            return Ok(());
+        }
+        for leaf in &leaves {
+            crate::context::providers::event_log::check_append_payload(
+                leaf.event_type,
+                &leaf.payload,
+            )
+            .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
+        }
+        self.state
+            .class_s
+            .pending_log_units
+            .0
+            .push_back(crate::context::state::PendingLogUnit {
+                base_seq: None,
+                leaves,
+            });
+        Ok(())
+    }
+
     /// Sets the `base_seq` of the oldest queued unit. Returns `false` when the
     /// queue is empty.
     pub(crate) fn set_front_log_unit_base(&mut self, base_seq: Option<u64>) -> bool {
@@ -2648,6 +2685,13 @@ impl<'a> ClassCMut<'a> {
     /// to the consequence-only view, see the module section above.)
     pub(crate) const fn class_s(&self) -> &ClassSState {
         self.class_s.get()
+    }
+
+    /// The two inputs a consequence evaluation reads besides the durable log:
+    /// the receive buffer and the queued log units, whose entries count as
+    /// evidence (spec 17 §17.3 "Event log write failures").
+    pub(crate) const fn consequence_read_inputs(&self) -> (&ReceiveBuffer, &PendingLogUnits) {
+        (self.receive_buffer, &self.class_s.get().pending_log_units)
     }
 
     // NOTE: This view intentionally holds NO whole `&mut PerContextState` /
@@ -5008,14 +5052,16 @@ mod tests {
     fn subsume_caller_allowlist_is_bounded() {
         // The closed positive allowlist: each sanctioned production file and the
         // EXACT number of `.subsume(` call sites it is permitted to contain. A new
-        // caller (a 3rd site in either file, or a call in any other file) trips the
-        // assert. Adding a deliberately-sanctioned site means bumping the count
-        // here WITH a §9 sibling-commit safety argument on the new call.
+        // caller (a 2nd site in the listed file, or a call in a file listed with
+        // 0) trips the assert. Adding a deliberately-sanctioned site means bumping
+        // the count here WITH a §9 sibling-commit safety argument on the new call.
+        // The send path discharges its consequences through `ConsequenceSink`
+        // and commits its spending nonce before the send, so it subsumes nothing.
         const KNOWN_SUBSUME_SITES: [(&str, &str, usize); 2] = [
             (
                 "messaging_helpers.rs",
                 include_str!("../messaging_helpers.rs"),
-                1,
+                0,
             ),
             (
                 "governance_helpers.rs",
@@ -6039,7 +6085,7 @@ impl ClassSCell
 
         // Drive the suspension through the handler's exact view path. The GROW
         // method ARMS the obligation sink (coupled to the mutation — GAP-A closed).
-        let mut obligation = None;
+        let mut obligation = crate::context::log_unit_helpers::ConsequenceSink::new();
         let downward_auth_applied = {
             let mut view = cell.class_c_view();
             let mut split = view.consequence_split();
@@ -6052,21 +6098,18 @@ impl ClassSCell
                     triggered: &triggered,
                     rules: &rules,
                     clock: deps.clock.as_ref(),
-                    event_log: deps.event_log.as_ref(),
                     event_tx: None,
                 },
                 &mut obligation,
             )
-            .await
         };
         assert!(
             downward_auth_applied,
             "a SuspendCapability against a present member applies a downward-auth \
              suspension and must signal the fail-closed flag (RED-CS3)"
         );
-        let token = obligation
-            .take()
-            .expect("the SuspendCapability GROW arms the fail-closed obligation sink");
+        let (token, _leaves) = obligation.into_parts();
+        let token = token.expect("the SuspendCapability GROW arms the fail-closed obligation sink");
         assert!(
             cell.role_state
                 .suspended_for(subject.as_ref())
@@ -6094,161 +6137,215 @@ impl ClassSCell
         );
     }
 
-    /// ADR-049 §9 (RED-CS3) — a PAID send (one that burns a spending nonce, minting
-    /// the deferred nonce [`ClassSCommitToken`]) that ALSO trips a downward-auth
-    /// consequence suspension persists the WHOLE Class-S state — the burned nonce
-    /// AND the new suspension — under EXACTLY ONE fail-closed persist, and that
-    /// persist is fail-closed (not a silent coalesced ack).
-    ///
-    /// This drives the PRODUCTION `finalize_send` end-to-end on the paid branch,
-    /// exercising the seam Item 2 targets:
-    /// - `finalize_send` evaluates this send's consequence rules. A
-    ///   `SuspendCapability` `WarningCount` rule against the sender (seeded as a
-    ///   `GovernanceAction` leaf in a real [`MerkleEventLogProvider`] — the
-    ///   convergent Source-1 evidence the receive buffer never supplies) fires and
-    ///   ARMS the `downward_auth_sink` from inside the GROW (GAP-A coupled).
-    /// - The reconcile match (`(downward_auth_sink, token.is_some())`) sees the PAID
-    ///   token, so it `subsume`s the redundant sink token (consuming it WITHOUT a
-    ///   second persist — NOT a drop, NOT a `mem::forget`) and threads `None` as the
-    ///   separate obligation into `persist_finalized_send`.
-    /// - `persist_finalized_send`'s paid arm then commits the SINGLE nonce token
-    ///   fail-closed: under `FailPersistence` it surfaces `PersistenceFailed` rather
-    ///   than acking silently, and the suspension stays applied in memory
-    ///   (keep-direction).
-    ///
-    /// The single nonce `commit` is the ONLY persist owed: the paid branch mints no
-    /// second obligation, and the `subsume` discharges the redundant armed sink — so
-    /// no double-commit and no lost obligation. (A leaked sink token would trip the
-    /// `Drop` guard inside `finalize_send`; reaching the `PersistenceFailed`
-    /// assertion proves the reconcile consumed it cleanly.)
-    ///
-    /// END-TO-END SCOPE: this drives the real `finalize_send` → consequence
-    /// enforcement → GROW-arming → reconcile/`subsume` → paid-branch fail-closed
-    /// `commit`. The ONE element it does not drive through production wiring is the
-    /// nonce BURN itself: minting the deferred nonce token directly
-    /// (`ClassSCommitToken::new_for_test`) is exactly how the existing production
-    /// `finalize_send` send-path tests model a paid send (the burn lives upstream in
-    /// `enforce_send_economy`, a separate seam with its own coverage), so the paid
-    /// branch is exercised with a faithful stand-in for the burned-nonce obligation.
-    #[tokio::test]
-    async fn paid_send_with_suspension_owes_single_fail_closed_persist() {
-        use crate::context::builder::ContextEventLogProvider;
-        use scp_protocol::context::roles::Capability;
-        use scp_protocol::trust::consequence::{
-            ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
-        };
+    use crate::context::log_unit_helpers::test_support::{
+        SUSPENSION_LEAVES, fail_log_entry_writes, faulty_merkle_log, log_len, queued_unit_types,
+        seed_warning_leaf,
+    };
 
-        let event_log = crate::context::providers::event_log::MerkleEventLogProvider::new();
-        let ctx_byte = 0x73u8;
-        let ctx = ctx_hex(ctx_byte);
-        // ADR-056: the event-log key the consequence reader derives from the
-        // context-id STRING is the canonical digest — for a real 64-hex id
-        // (`ctx_hex` = `hex([ctx_byte; 32])`) that is the DECODED digest
-        // `[ctx_byte; 32]`, NOT `SHA-256(ctx)`. The seeded governance leaf must
-        // be stored under that same digest to be visible to
-        // `event_log_entries_for_consequences`.
-        let ctx_id_bytes = crate::context::state::context_id_to_bytes(&ctx);
-        let sender = DID("did:example:paid-suspend-sender".to_owned());
-
-        // Seed a convergent `WarningCount` evidence leaf: a `GovernanceAction`
-        // whose actor is SOMEONE ELSE and whose payload `target_did` is the sender
-        // (the `matches_trigger(WarningCount, …)` shape). This MUST come from the
-        // durable log (Source 1) — `merge_consequence_events` deliberately omits
-        // governance events from the receive buffer to preserve durable-leaf
-        // convergence.
-        event_log
-            .init_event_log(&ctx_id_bytes)
-            .await
-            .expect("init event log");
-        let warning_payload = scp_event_log::EventPayload {
-            data: serde_json::to_vec(&serde_json::json!({ "target_did": sender.as_ref() }))
-                .expect("serialize warning payload"),
-        };
-        event_log
-            .append_event(
-                &ctx_id_bytes,
-                scp_event_log::EventType::GovernanceAction,
-                "did:example:warning-issuer",
-                warning_payload,
-                1_700_000_050,
-            )
-            .await
-            .expect("seed governance warning leaf");
-
-        // FailPersistence ⇒ the single nonce-token commit must surface the §9
-        // durability error (not a silent coalesced ack).
-        let deps = build_deps_with_event_log(Box::new(FailPersistence), Box::new(event_log)).await;
+    /// An Active cell with `sender` a member and a `SuspendCapability`
+    /// `WarningCount` rule (threshold 1) that the seeded warning trips.
+    fn suspension_send_cell(ctx_byte: u8, sender: &DID) -> ClassSCell {
         let mut cell = ClassSCell::new(fresh_state(ctx_byte));
-
-        // The send path requires an ACTIVE context (else `finalize_send` takes the
-        // TTL-inactive early return and never runs consequence enforcement).
         cell.class_c_view()
             .handle_mut()
             .transition_to(&crate::context::ContextState::Active)
             .expect("transition to Active");
-
-        // The sender must be a present member for the suspension GROW to apply.
         cell.class_c_view().membership_class_c_mut().add_member(
             sender.clone(),
             "member".to_owned(),
             Vec::new(),
         );
+        *cell
+            .class_c_view()
+            .governance_class_c_mut()
+            .consequence_rules_mut() =
+            vec![crate::context::log_unit_helpers::test_support::suspend_messages_write_rule()];
+        cell
+    }
 
-        // Configure the consequence rule this send will evaluate: a
-        // `SuspendCapability` (threshold 1) keyed on `WarningCount`.
-        {
-            let mut view = cell.class_c_view();
-            *view.governance_class_c_mut().consequence_rules_mut() = vec![ConsequenceRule {
-                trigger: ConsequenceTrigger::WarningCount,
-                action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
-                    capabilities: vec![Capability::MessagesWrite],
-                }),
-                threshold: 1,
-                window: std::time::Duration::from_hours(1),
-            }];
-        }
-
-        // Drive the PRODUCTION paid send. `Some(nonce_token)` models the burned
-        // spending-nonce obligation (the exact stand-in the production send-path
-        // fail-closed tests use). The send signs any due checkpoint through a
-        // local test signer; the consequence path runs regardless.
-        let paid = crate::context::messaging_helpers::finalize_send(
-            &mut cell,
-            &deps,
-            &ctx,
+    /// Reads the consequence log fail-closed, as `send_message` does before
+    /// the send, then drives the production `finalize_send` after it.
+    async fn finalize_suspension_send(
+        cell: &mut ClassSCell,
+        deps: &ActorDeps,
+        ctx: &str,
+        sender: &DID,
+    ) -> Result<(), ContextError> {
+        let ctx_id_bytes = crate::context::state::context_id_to_bytes(ctx);
+        let log_entries = crate::context::governance_logic::read_consequence_log(
+            &cell.class_s.pending_log_units,
+            ctx,
+            deps.event_log.as_ref(),
+        )
+        .expect("the log reads before the send");
+        crate::context::messaging_helpers::finalize_send(
+            cell,
+            deps,
+            ctx,
             &ctx_id_bytes,
-            &sender,
+            sender,
             0,
-            b"paid-with-suspension",
+            b"send-with-suspension",
             crate::context::supervisor::MessageSigner::Active(
                 &crate::context::actor::signer::CommandSigner::local_ed25519(
                     ed25519_dalek::SigningKey::from_bytes(&[0x5au8; 32]),
                 ),
             ),
-            Some(ClassSCommitToken::new_for_test(&ctx)),
-            /* is_broadcast = */ false,
+            &log_entries,
         )
-        .await;
+        .await
+    }
 
-        // The single nonce-token commit covers BOTH the burned nonce and the armed
-        // suspension; under FailPersistence it surfaces the §9 durability error
-        // (the redundant sink token was `subsume`d, leaving exactly one obligation —
-        // a leaked sink would have tripped the Drop guard before we got here).
+    /// ADR-049 §9 (RED-CS3); spec 17 §17.3 "Event log write failures": a send
+    /// that trips a downward-auth suspension persists the suspension and its
+    /// consequence leaves in one fail-closed keep persist after the send. Under
+    /// a failing backend the persist error surfaces (not a silent coalesced
+    /// ack), and the suspension and the queued unit both stay in memory
+    /// (keep-direction): the step is not undone and the leaves are not lost.
+    #[tokio::test]
+    async fn send_consequence_persist_failure_keeps_suspension_and_queued_unit() {
+        use scp_protocol::context::roles::Capability;
+
+        let ctx_byte = 0x73u8;
+        let ctx = ctx_hex(ctx_byte);
+        let ctx_id_bytes = crate::context::state::context_id_to_bytes(&ctx);
+        let sender = DID("did:example:paid-suspend-sender".to_owned());
+        let event_log = crate::context::providers::event_log::MerkleEventLogProvider::new();
+        seed_warning_leaf(&event_log, &ctx_id_bytes, &sender).await;
+        let deps = build_deps_with_event_log(Box::new(FailPersistence), Box::new(event_log)).await;
+        let mut cell = suspension_send_cell(ctx_byte, &sender);
+
+        let sent = finalize_suspension_send(&mut cell, &deps, &ctx, &sender).await;
+
         assert!(
-            matches!(paid, Err(ContextError::PersistenceFailed(_))),
-            "a paid send that also armed a downward-auth suspension must persist \
-             fail-closed through the single nonce token (not a silent ack): {paid:?}"
+            matches!(sent, Err(ContextError::PersistenceFailed(_))),
+            "a send that armed a downward-auth suspension must persist it \
+             fail-closed (not a silent ack): {sent:?}"
         );
-
-        // KEEP-direction: the suspension applied during the send stays in memory
-        // through the failed persist — the denied capability is not silently
-        // re-granted on a coalesce-window crash.
         assert!(
             cell.role_state
                 .suspended_for(sender.as_ref())
                 .is_some_and(|caps| caps.contains(&Capability::MessagesWrite)),
-            "keep-direction: the consequence suspension armed during the paid send \
-             is retained in memory even when the fail-closed persist fails (RED-CS3)"
+            "keep-direction: the suspension stays in memory when the persist fails"
+        );
+        assert_eq!(
+            queued_unit_types(&cell.class_s.pending_log_units),
+            vec![SUSPENSION_LEAVES.to_vec()],
+            "the consequence leaves stay queued as one unit when the persist fails"
+        );
+    }
+
+    /// One persisted snapshot's queued unit event types, and whether the
+    /// subject is suspended in it.
+    type SeenSnapshot = (Vec<Vec<scp_event_log::EventType>>, bool);
+
+    /// Records, for each persisted snapshot, the queued units' event types and
+    /// whether `subject` is suspended in it.
+    struct RecordingPersistence {
+        subject: String,
+        seen: Arc<std::sync::RwLock<Vec<SeenSnapshot>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ContextPersistence for RecordingPersistence {
+        async fn persist_context(
+            &self,
+            _: &str,
+            snap: &crate::context::state::ContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            let units = snap
+                .pending_log_units
+                .iter()
+                .map(|unit| unit.leaves.iter().map(|leaf| leaf.event_type).collect())
+                .collect();
+            let suspended = snap.role_state.suspended_for(&self.subject).is_some();
+            self.seen
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((units, suspended));
+            Ok(())
+        }
+        async fn load_context(
+            &self,
+            _: &str,
+        ) -> Result<
+            Option<crate::context::state::ContextSnapshot>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(None)
+        }
+        async fn delete_context(
+            &self,
+            _: &str,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        async fn list_persisted_contexts(
+            &self,
+        ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Spec 17 §17.3 "Event log write failures"; ADR-049 §9: the leaves of one
+    /// consequence are queued as ONE pending unit in the same persist that
+    /// stores the consequence's mutations, so no stored state holds the
+    /// suspension without its leaves. The log's entry writes fail here, so the
+    /// drain after the persist leaves the unit queued and the log unchanged,
+    /// and the send still succeeds: it already left.
+    #[tokio::test]
+    async fn multi_leaf_consequence_enqueued_as_one_unit_with_its_mutations() {
+        let ctx_byte = 0x74u8;
+        let ctx = ctx_hex(ctx_byte);
+        let ctx_id_bytes = crate::context::state::context_id_to_bytes(&ctx);
+        let sender = DID("did:example:multi-leaf-sender".to_owned());
+
+        let (event_log, faulty) = faulty_merkle_log();
+        seed_warning_leaf(&event_log, &ctx_id_bytes, &sender).await;
+        fail_log_entry_writes(&faulty, &ctx_id_bytes);
+        let seen = Arc::new(std::sync::RwLock::new(Vec::new()));
+        let deps = build_deps_with_event_log(
+            Box::new(RecordingPersistence {
+                subject: sender.as_ref().to_owned(),
+                seen: Arc::clone(&seen),
+            }),
+            Box::new(event_log),
+        )
+        .await;
+        let mut cell = suspension_send_cell(ctx_byte, &sender);
+
+        let sent = finalize_suspension_send(&mut cell, &deps, &ctx, &sender).await;
+        assert!(
+            sent.is_ok(),
+            "the persist succeeded; a failed drain leaves the unit queued and \
+             does not fail the send: {sent:?}"
+        );
+
+        let seen = seen
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let first = seen.first().expect("the send's keep persist ran");
+        assert_eq!(
+            first,
+            &(vec![SUSPENSION_LEAVES.to_vec()], true),
+            "the first persist after the send holds the suspension AND its \
+             leaves as one unit"
+        );
+        assert!(
+            seen.iter()
+                .all(|(units, suspended)| *suspended && units.len() == 1),
+            "no persisted snapshot holds the suspension without its unit: {seen:?}"
+        );
+        assert_eq!(
+            queued_unit_types(&cell.class_s.pending_log_units),
+            vec![SUSPENSION_LEAVES.to_vec()],
+            "the unit stays queued while the log rejects the write"
+        );
+        assert_eq!(
+            log_len(&deps, &ctx_id_bytes),
+            1,
+            "only the seeded warning is in the log"
         );
     }
 
@@ -6351,7 +6448,7 @@ impl ClassSCell
         // Drive the demotion through the handler's exact view path. The GROW
         // (`system_assign_role` on the consequence view) ARMS the obligation sink
         // (coupled to the mutation — GAP-A closed).
-        let mut obligation = None;
+        let mut obligation = crate::context::log_unit_helpers::ConsequenceSink::new();
         let downward_auth_applied = {
             let mut view = cell.class_c_view();
             let mut split = view.consequence_split();
@@ -6364,21 +6461,19 @@ impl ClassSCell
                     triggered: &triggered,
                     rules: &rules,
                     clock: deps.clock.as_ref(),
-                    event_log: deps.event_log.as_ref(),
                     event_tx: None,
                 },
                 &mut obligation,
             )
-            .await
         };
         assert!(
             downward_auth_applied,
             "an AssignRole demotion shrinks `member_capabilities` and must signal \
              the downward-auth fail-closed flag (RED-CS3)"
         );
-        let token = obligation
-            .take()
-            .expect("the AssignRole demotion GROW arms the fail-closed obligation sink");
+        let (token, _leaves) = obligation.into_parts();
+        let token =
+            token.expect("the AssignRole demotion GROW arms the fail-closed obligation sink");
         assert_eq!(
             cell.role_state.member_capabilities.get(subject.as_ref()),
             Some(&HashSet::from([Capability::MessagesRead])),

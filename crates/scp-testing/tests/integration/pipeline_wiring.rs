@@ -10077,3 +10077,631 @@ fn reached_only_by_tests<'a>(name: &str, others: impl Iterator<Item = &'a String
     }
     true
 }
+
+/// The call shapes that write a leaf to a context's event log.
+const EVENT_LOG_APPEND_CALLS: &[&str] = &[
+    ".append_event(",
+    ".append_event_in(",
+    ".append_context_event",
+    ".append_outlet_invoked_verified(",
+    ".append_unit(",
+];
+
+/// Each shipped function that may write a leaf to a context's event log, once
+/// per call it makes, with the reason it may.
+///
+/// Spec 17 §17.3 "Event log write failures": a leaf written after an
+/// irreversible step goes into a pending log unit in the step's commit, and
+/// only the drain writes it. Every other append is either the provider or
+/// builder layer the drain and the fail-closed appends go through, or a
+/// fail-closed append that runs before its step.
+const EVENT_LOG_APPEND_ALLOWLIST: &[(&str, &str, &str)] = &[
+    // The drain.
+    (
+        "scp-runtime/src/context/log_unit_helpers.rs",
+        "drain_queue",
+        "the pending-unit drain",
+    ),
+    // The provider and the builder trait.
+    (
+        "scp-runtime/src/store/event_log.rs",
+        "append_event_full",
+        "the event-log store",
+    ),
+    (
+        "scp-runtime/src/context/builder.rs",
+        "append_event_after_side_effect",
+        "the builder trait",
+    ),
+    (
+        "scp-runtime/src/context/builder.rs",
+        "append_event_in",
+        "the builder trait",
+    ),
+    (
+        "scp-runtime/src/context/builder.rs",
+        "append_unit",
+        "the builder trait",
+    ),
+    (
+        "scp-runtime/src/context/builder.rs",
+        "append_context_event",
+        "the builder trait",
+    ),
+    (
+        "scp-runtime/src/context/builder.rs",
+        "append_context_event_with_payload",
+        "the builder trait",
+    ),
+    (
+        "scp-runtime/src/context/builder.rs",
+        "append_outlet_invoked_verified",
+        "the builder trait",
+    ),
+    (
+        "scp-runtime/src/context/builder.rs",
+        "append_membership_change_leaf",
+        "the builder trait",
+    ),
+    (
+        "scp-runtime/src/context/builder.rs",
+        "append_role_assigned_leaf",
+        "the builder trait",
+    ),
+    // Fail-closed appends that run before their step.
+    (
+        "scp-runtime/src/context/builder.rs",
+        "create_context",
+        "a fail-closed append",
+    ),
+    (
+        "scp-runtime/src/context/builder.rs",
+        "create_context",
+        "a fail-closed append",
+    ),
+    // A seam that only the `testing` feature compiles.
+    (
+        "scp-runtime/src/context/supervisor/supervisor.rs",
+        "test_append_event_log",
+        "a testing-feature seam",
+    ),
+    // KeyEpochAdvance leaves.
+    (
+        "scp-runtime/src/context/broadcast_helpers.rs",
+        "unsubscribe_broadcast",
+        "SCP-349",
+    ),
+    (
+        "scp-runtime/src/context/broadcast_helpers.rs",
+        "block_broadcast_subscriber",
+        "SCP-349",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_revoke",
+        "SCP-349",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_rotate_content_keys",
+        "SCP-349",
+    ),
+    // Leaves whose resolution PR-4 of the #3066 re-plan defines.
+    (
+        "scp-runtime/src/context/outlets/invoke.rs",
+        "record_streaming_saga_a_event",
+        "PR-4 of the #3066 re-plan",
+    ),
+    (
+        "scp-runtime/src/context/actor/handlers/saga.rs",
+        "emit_divergence_marker",
+        "PR-4 of the #3066 re-plan",
+    ),
+    // Sites that PR-3b of the #3066 re-plan converts to pending log units.
+    (
+        "scp-runtime/src/context/governance_logic.rs",
+        "append_consequence_leaves_after_side_effect",
+        "converted by PR-3b of the #3066 re-plan",
+    ),
+    (
+        "scp-runtime/src/context/actor/handlers/saga.rs",
+        "commit_b_settle_finalize",
+        "converted by PR-3b of the #3066 re-plan",
+    ),
+    (
+        "scp-runtime/src/context/actor/handlers/saga.rs",
+        "commit_b_stream_settle_finalize",
+        "converted by PR-3b of the #3066 re-plan",
+    ),
+    (
+        "scp-runtime/src/context/actor/handlers/saga.rs",
+        "commit_a",
+        "converted by PR-3b of the #3066 re-plan",
+    ),
+    (
+        "scp-runtime/src/context/outlets/invoke.rs",
+        "record_cross_context_a_event",
+        "converted by PR-3b of the #3066 re-plan",
+    ),
+    (
+        "scp-runtime/src/context/broadcast_helpers.rs",
+        "block_broadcast_subscriber",
+        "converted by PR-3b of the #3066 re-plan",
+    ),
+    (
+        "scp-runtime/src/context/broadcast_helpers.rs",
+        "unblock_broadcast_subscriber",
+        "converted by PR-3b of the #3066 re-plan",
+    ),
+    (
+        "scp-runtime/src/context/ttl.rs",
+        "close_context",
+        "converted by PR-3b of the #3066 re-plan",
+    ),
+    (
+        "scp-runtime/src/context/ttl.rs",
+        "finalize_close",
+        "converted by PR-3b of the #3066 re-plan",
+    ),
+    (
+        "scp-runtime/src/context/ttl.rs",
+        "finish_ttl_expiry_io",
+        "converted by PR-3b of the #3066 re-plan",
+    ),
+    (
+        "scp-runtime/src/context/ttl_close_helpers.rs",
+        "extend_ttl_deadline_and_record",
+        "converted by PR-3b of the #3066 re-plan",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "tombstone_migrated_context",
+        "converted by PR-3b of the #3066 re-plan",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "withdraw_governance_vote",
+        "converted by PR-3b of the #3066 re-plan",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "apply_pending_ceiling_modification",
+        "converted by PR-3b of the #3066 re-plan",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "apply_pending_economic_policy_change",
+        "converted by PR-3b of the #3066 re-plan",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_suspend_member",
+        "converted by PR-3b of the #3066 re-plan",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_revoke",
+        "converted by PR-3b of the #3066 re-plan",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_restore_access",
+        "converted by PR-3b of the #3066 re-plan",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_register_outlet",
+        "converted by PR-3b of the #3066 re-plan",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_remove_outlet",
+        "converted by PR-3b of the #3066 re-plan",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_modify_ceiling",
+        "converted by PR-3b of the #3066 re-plan",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_close_context",
+        "converted by PR-3b of the #3066 re-plan",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_extend_ttl",
+        "converted by PR-3b of the #3066 re-plan",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_transfer_admin",
+        "converted by PR-3b of the #3066 re-plan",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_create_child_context",
+        "converted by PR-3b of the #3066 re-plan",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_modify_pruning_policy",
+        "converted by PR-3b of the #3066 re-plan",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_add_signer",
+        "converted by PR-3b of the #3066 re-plan",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_remove_signer",
+        "converted by PR-3b of the #3066 re-plan",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_modify_threshold",
+        "converted by PR-3b of the #3066 re-plan",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_establish_outlet_interface",
+        "converted by PR-3b of the #3066 re-plan",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_reset_member",
+        "converted by PR-3b of the #3066 re-plan",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_resolve_conflict",
+        "converted by PR-3b of the #3066 re-plan",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_promote_context",
+        "converted by PR-3b of the #3066 re-plan",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_rotate_content_keys",
+        "converted by PR-3b of the #3066 re-plan",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_reconfigure_governance",
+        "converted by PR-3b of the #3066 re-plan",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_reconfigure_governance",
+        "converted by PR-3b of the #3066 re-plan",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_set_economic_policy",
+        "converted by PR-3b of the #3066 re-plan",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_approve_spend",
+        "converted by PR-3b of the #3066 re-plan",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_lock_economic_policy",
+        "converted by PR-3b of the #3066 re-plan",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_modify_hard_rate_limit",
+        "converted by PR-3b of the #3066 re-plan",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_modify_pseudonym_rotation_policy",
+        "converted by PR-3b of the #3066 re-plan",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_propose_context_migration",
+        "converted by PR-3b of the #3066 re-plan",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "execute_cancel_context_migration",
+        "converted by PR-3b of the #3066 re-plan",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "propose_governance_action_inner",
+        "converted by PR-3b of the #3066 re-plan",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "propose_governance_action_inner",
+        "converted by PR-3b of the #3066 re-plan",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "propose_governance_action_inner",
+        "converted by PR-3b of the #3066 re-plan",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "vote_on_proposal_inner",
+        "converted by PR-3b of the #3066 re-plan",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "vote_on_proposal_inner",
+        "converted by PR-3b of the #3066 re-plan",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "dispatch_governance_action",
+        "converted by PR-3b of the #3066 re-plan",
+    ),
+    (
+        "scp-runtime/src/context/governance_helpers.rs",
+        "finalize_governance_action",
+        "converted by PR-3b of the #3066 re-plan",
+    ),
+];
+
+/// Spec 17 §17.3 "Event log write failures": no shipped function writes a
+/// leaf to a context's event log unless [`EVENT_LOG_APPEND_ALLOWLIST`] names
+/// it, once per call. A call outside the allowlist, a second call in a listed
+/// function, and an entry whose call is gone all fail.
+///
+/// The scan covers each shipped crate's `src` tree, minus test-gated `mod`
+/// blocks and the files test-gated `mod` declarations load, and minus the
+/// crates on [`TEST_ONLY_CRATES`].
+#[test]
+fn no_shipped_source_appends_outside_the_allowlist() {
+    let sources = shipped_crate_sources();
+    let scanned_runtime = sources
+        .iter()
+        .filter(|(rel, _)| rel.starts_with("scp-runtime/src/"))
+        .count();
+    assert!(
+        scanned_runtime > 100,
+        "the scan must read the scp-runtime sources, read {scanned_runtime}"
+    );
+    let mismatches = event_log_append_mismatches(&sources, EVENT_LOG_APPEND_ALLOWLIST);
+    assert!(
+        mismatches.is_empty(),
+        "shipped event-log appends differ from the allowlist; a leaf written after an \
+         irreversible step goes into a pending log unit instead (spec 17 §17.3): {mismatches:#?}"
+    );
+}
+
+/// The append scan's must-fail companion: a call planted in a temporary copy
+/// of the scanned sources fails the scan, in a new function and as a second
+/// call in a listed function; the same call in a test-gated module does not.
+#[test]
+fn the_event_log_append_scan_reports_a_planted_call() {
+    let sources = shipped_crate_sources();
+    assert!(
+        event_log_append_mismatches(&sources, EVENT_LOG_APPEND_ALLOWLIST).is_empty(),
+        "the unplanted copy passes"
+    );
+    let planted_in = "scp-runtime/src/context/messaging_helpers.rs";
+    let plant = |extra: &str| -> Vec<(String, String)> {
+        let mut copy = sources.clone();
+        let entry = copy
+            .iter_mut()
+            .find(|(rel, _)| rel == planted_in)
+            .expect("the scan reads the messaging helpers");
+        entry.1.push_str(&strip_non_code_keeping_cfg(extra));
+        copy
+    };
+    for call in EVENT_LOG_APPEND_CALLS {
+        let planted = plant(&format!(
+            "\nasync fn planted_after_send(log: &L) {{ let _ = log{call}a, b).await; }}\n"
+        ));
+        let found = event_log_append_mismatches(&planted, EVENT_LOG_APPEND_ALLOWLIST);
+        assert_eq!(
+            found,
+            vec![format!(
+                "{planted_in}::planted_after_send: 1 call(s), allowlisted 0"
+            )],
+            "a planted `{call}` call is reported"
+        );
+    }
+    let gated = plant(
+        "\n#[cfg(test)]\nmod planted_tests { async fn t(log: &L) { log.append_event(a).await; } }\n",
+    );
+    assert!(
+        event_log_append_mismatches(&gated, EVENT_LOG_APPEND_ALLOWLIST).is_empty(),
+        "a call in a test-gated module is not shipped"
+    );
+
+    let mut nested = sources.clone();
+    let drain = nested
+        .iter_mut()
+        .find(|(rel, _)| rel == "scp-runtime/src/context/log_unit_helpers.rs")
+        .expect("the scan reads the drain");
+    let at = drain
+        .1
+        .find("fn drain_queue")
+        .expect("the drain is defined");
+    let open = at + drain.1[at..].find('{').expect("the drain has a body") + 1;
+    drain.1.insert_str(open, " log.append_unit(a); ");
+    assert_eq!(
+        event_log_append_mismatches(&nested, EVENT_LOG_APPEND_ALLOWLIST),
+        vec![
+            "scp-runtime/src/context/log_unit_helpers.rs::drain_queue: 2 call(s), allowlisted 1"
+                .to_owned()
+        ],
+        "a second call in a listed function is reported"
+    );
+
+    let stale: Vec<(&str, &str, &str)> = EVENT_LOG_APPEND_ALLOWLIST
+        .iter()
+        .copied()
+        .chain([("scp-runtime/src/context/ttl.rs", "gone", "a removed site")])
+        .collect();
+    assert_eq!(
+        event_log_append_mismatches(&sources, &stale),
+        vec!["scp-runtime/src/context/ttl.rs::gone: 0 call(s), allowlisted 1".to_owned()],
+        "an entry whose call is gone is reported"
+    );
+}
+
+/// Each shipped source file as (path under `crates/`, its
+/// [`strip_non_code_keeping_cfg`] output), skipping the crates on
+/// [`TEST_ONLY_CRATES`] and the files a test-gated `mod name;` loads.
+fn shipped_crate_sources() -> Vec<(String, String)> {
+    let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("scp-testing sits under crates/");
+    let mut crate_dirs = Vec::new();
+    for krate in std::fs::read_dir(crates)
+        .expect("crates/ is readable")
+        .flatten()
+    {
+        let dir = krate.path();
+        if dir.join("Cargo.toml").is_file() {
+            crate_dirs.push(dir.clone());
+        }
+        if let Ok(nested) = std::fs::read_dir(&dir) {
+            for sub in nested.flatten() {
+                if sub.path().join("Cargo.toml").is_file() {
+                    crate_dirs.push(sub.path());
+                }
+            }
+        }
+    }
+    let mut files = Vec::new();
+    for dir in &crate_dirs {
+        let manifest =
+            std::fs::read_to_string(dir.join("Cargo.toml")).expect("a manifest is readable");
+        let name = manifest_package_name(&manifest).expect("a manifest names its package");
+        if !TEST_ONLY_CRATES.contains(&name.as_str()) {
+            collect_rust_files(&dir.join("src"), &mut files);
+        }
+    }
+    let read: Vec<(std::path::PathBuf, String, String)> = files
+        .into_iter()
+        .map(|file| {
+            let src = std::fs::read_to_string(&file).expect("a source file is readable");
+            let code = strip_non_code_keeping_cfg(&src);
+            (file, src, code)
+        })
+        .collect();
+    let test_files: std::collections::HashSet<std::path::PathBuf> = read
+        .iter()
+        .flat_map(|(file, src, code)| test_gated_mod_files(file, src, code))
+        .collect();
+    let mut out: Vec<(String, String)> = read
+        .into_iter()
+        .filter(|(file, _, _)| !test_files.contains(file))
+        .map(|(file, _, code)| {
+            let rel = file
+                .strip_prefix(crates)
+                .expect("a source file sits under crates/")
+                .to_string_lossy()
+                .replace('\\', "/");
+            (rel, code)
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Every (file, function) whose count of [`EVENT_LOG_APPEND_CALLS`] in
+/// shipped code differs from its count of `allowlist` entries, as
+/// `"file::fn: N call(s), allowlisted M"`, sorted. A call outside any
+/// function counts against the function name `<item>`.
+fn event_log_append_mismatches(
+    sources: &[(String, String)],
+    allowlist: &[(&str, &str, &str)],
+) -> Vec<String> {
+    let mut found: std::collections::BTreeMap<(String, String), usize> =
+        std::collections::BTreeMap::new();
+    for (rel, code) in sources {
+        let shipped = without_test_gated_mod_blocks(code);
+        let bodies = fn_bodies(&shipped);
+        for call in EVENT_LOG_APPEND_CALLS {
+            for (at, _) in shipped.match_indices(call) {
+                let owner = bodies
+                    .iter()
+                    .filter(|(open, end, _)| *open < at && at < *end)
+                    .max_by_key(|(open, _, _)| *open)
+                    .map_or("<item>", |(_, _, name)| *name);
+                *found.entry((rel.clone(), owner.to_owned())).or_default() += 1;
+            }
+        }
+    }
+    let mut allowed: std::collections::BTreeMap<(String, String), usize> =
+        std::collections::BTreeMap::new();
+    for (file, func, _) in allowlist {
+        *allowed
+            .entry(((*file).to_owned(), (*func).to_owned()))
+            .or_default() += 1;
+    }
+    let keys: std::collections::BTreeSet<&(String, String)> =
+        found.keys().chain(allowed.keys()).collect();
+    keys.into_iter()
+        .filter_map(|key| {
+            let calls = found.get(key).copied().unwrap_or(0);
+            let listed = allowed.get(key).copied().unwrap_or(0);
+            (calls != listed).then(|| {
+                format!(
+                    "{}::{}: {calls} call(s), allowlisted {listed}",
+                    key.0, key.1
+                )
+            })
+        })
+        .collect()
+}
+
+/// Each `fn name` with a body in `code`: (byte of its opening `{`, byte past
+/// its closing `}`, name). A declaration that ends in `;` has no body.
+fn fn_bodies(code: &str) -> Vec<(usize, usize, &str)> {
+    let mut bodies = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = code[from..].find("fn ") {
+        let at = from + rel;
+        from = at + 3;
+        let boundary = code[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+        if !boundary {
+            continue;
+        }
+        let rest = &code[at + 3..];
+        let len = rest
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        if len == 0 {
+            continue;
+        }
+        let name = &rest[..len];
+        let sig = at + 3 + len;
+        // A `;` inside the signature's brackets, as in `&[u8; 32]`, does not
+        // end the item.
+        let mut depth = 0usize;
+        let Some(stop) = code[sig..].find(|c: char| {
+            match c {
+                '(' | '[' => depth += 1,
+                ')' | ']' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+            depth == 0 && (c == '{' || c == ';')
+        }) else {
+            continue;
+        };
+        let open = sig + stop;
+        if !code[open..].starts_with('{') {
+            continue;
+        }
+        if let Some(body) = matching_brace_end(&code[open..]) {
+            bodies.push((open, open + body, name));
+        }
+    }
+    bodies
+}

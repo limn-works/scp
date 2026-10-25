@@ -876,17 +876,18 @@ async fn handle_deliver_incoming(
     mode: crate::context::actor::commands::DeliveryMode,
     reply: crate::context::actor::commands::DeliverIncomingReply,
 ) -> Outcome<()> {
-    // ADR-049 §9 (RED-CS3): a fail-closed-persist obligation populated when the
-    // receive cascade performs a downward-auth mutation (a `suspended_capabilities`
-    // GROW or an `AssignRole` `member_capabilities` replacement). Owned HERE as a
-    // `&mut Option<ClassSCommitToken>` sink, at the cell boundary, so the obligation
-    // is `commit`ted (a fail-closed, keep-direction persist) once the borrowing
-    // `class_c_view` drops — it must not ride only the coalesced persist (a ≤50ms
-    // crash would silently re-grant the member's removed authority). The token
-    // carrier (vs. the prior `bool`) makes a populated-but-undischarged obligation a
-    // Drop-guard PANIC in debug/CI, so a missed discharge cannot slip through.
-    let mut downward_auth_obligation: Option<crate::context::actor::class_s::ClassSCommitToken> =
-        None;
+    // ADR-049 §9 (RED-CS3); spec 17 §17.3 "Event log write failures": the sink
+    // the receive cascade fills with a fail-closed-persist obligation when it
+    // performs a downward-auth mutation (a `suspended_capabilities` GROW or an
+    // `AssignRole` `member_capabilities` replacement), with the durable
+    // consequence leaves, and with a log read that failed after the delivery.
+    // Owned HERE, at the cell boundary, so it is discharged (one fail-closed,
+    // keep-direction persist that also queues the leaves as one pending log
+    // unit) once the borrowing `class_c_view` drops — the mutation must not ride
+    // only the coalesced persist (a ≤50ms crash would silently re-grant the
+    // member's removed authority). The message is delivered whether or not the
+    // queue drains.
+    let mut consequence_sink = crate::context::log_unit_helpers::ConsequenceSink::new();
     // Spec 09 §9.10.4.1: a Commit another member committed, with its
     // membership changes counted by DID. `deliver_incoming` fills it; the
     // registry deletion and rotation trigger it owes are Class-S, so they are
@@ -898,7 +899,7 @@ async fn handle_deliver_incoming(
     // (sequence/reorder/receive buffers, membership[read], role[read], routing,
     // ConsequenceStateSplit Class-C only). The downward-auth mutations it can make
     // — a consequence-engine capability suspension or an `AssignRole` demotion —
-    // populate `downward_auth_obligation` and are persisted fail-closed below, not
+    // populate `consequence_sink` and are persisted fail-closed below, not
     // through the view.
     let (outcome, reply_result) = {
         let mut view = cell.class_c_view();
@@ -908,7 +909,7 @@ async fn handle_deliver_incoming(
                 deps,
                 context_id,
                 envelope_bytes,
-                &mut downward_auth_obligation,
+                &mut consequence_sink,
                 &mut processed_commit,
             )
             .await
@@ -983,29 +984,25 @@ async fn handle_deliver_incoming(
         reply_result
     };
 
-    // Fail-closed persist of an applied downward-auth mutation (ADR-049 §9,
-    // keep-direction): the mutation (suspension or `AssignRole` demotion) is
-    // already in memory; committing the obligation's token makes it durable before
-    // acking, closing the coalesce-window crash hole (RED-CS3). `take()` discharges
-    // the Drop guard. On persist failure the mutation STAYS in memory (the token's
-    // `commit` is keep-direction) and the §9 durability error is surfaced in place
-    // of the original reply (durability is the security obligation). When the
-    // deliver itself already errored (`Ok(Err(_))`), that original cause is
-    // preserved in the surfaced message so it is not lost. Skipped (the obligation
-    // stays `None`) when no downward-auth mutation occurred (the ordinary coalesced
-    // persist via `mutated` is sufficient).
-    let reply_result = if let Some(token) = downward_auth_obligation.take() {
-        match token.commit(cell, deps, context_id).await {
-            Ok(()) => reply_result,
-            Err(persist_err) => Err(match reply_result {
-                Ok(_) => persist_err,
-                Err(deliver_err) => ContextError::PersistenceFailed(format!(
-                    "{persist_err} (after a delivery error: {deliver_err})"
-                )),
-            }),
-        }
-    } else {
-        reply_result
+    // Fail-closed discharge of the sink (ADR-049 §9, keep-direction; spec 17
+    // §17.3): the downward-auth mutation (suspension or `AssignRole` demotion) is
+    // already in memory; one keep persist makes it durable before acking, closing
+    // the coalesce-window crash hole (RED-CS3), and queues the consequence leaves
+    // as one pending log unit, which the discharge then drains. On persist
+    // failure the mutation and the unit STAY in memory and the §9 durability
+    // error is surfaced in place of the original reply (durability is the
+    // security obligation). When the deliver itself already errored
+    // (`Ok(Err(_))`), that original cause is preserved in the surfaced message so
+    // it is not lost. A sink that owes nothing does nothing (the ordinary
+    // coalesced persist via `mutated` is sufficient).
+    let reply_result = match consequence_sink.discharge(cell, deps, context_id).await {
+        Ok(()) => reply_result,
+        Err(persist_err) => Err(match reply_result {
+            Ok(_) => persist_err,
+            Err(deliver_err) => ContextError::PersistenceFailed(format!(
+                "{persist_err} (after a delivery error: {deliver_err})"
+            )),
+        }),
     };
 
     let _ = reply.send(reply_result);

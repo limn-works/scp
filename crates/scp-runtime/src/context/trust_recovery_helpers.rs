@@ -230,8 +230,6 @@ pub async fn recovery_advance_epoch(
     deps: &ActorDeps,
     context_id: &str,
 ) -> Result<u64, ContextError> {
-    let context_id_bytes = context_id_to_bytes(context_id);
-
     // 1. Validate the context is active.
     require_active(&cell.handle)?;
 
@@ -248,11 +246,22 @@ pub async fn recovery_advance_epoch(
         .supervisor
         .my_wrapping_key(&deps.owned_identity)?
         .public();
+    // The `RecoveryEpochAdvanced` leaf is planned and checked before the step
+    // and queued in the same keep persist as the ratchet (spec 17 §17.3 "Event
+    // log write failures"), so a log write failure after the Commit leaves
+    // cannot lose it. The leaf describes the bookkeeping advance in step 4
+    // below. A leaf that cannot be built refuses the recovery before the step.
+    let recovery_leaf = plan_recovery_epoch_leaf(cell, deps)?;
     let epoch_commit_bytes = cell
         .commit_class_s_keep(deps, context_id, |mut v| {
-            v.rest_mut()
+            let commit_bytes = v
+                .rest_mut()
                 .advance_epoch(wrapping_public_key, deps.clock.as_ref())
-                .map(|out| out.commit_bytes)
+                .map(|out| out.commit_bytes)?;
+            // The leaf passed the payload check above, so the enqueue cannot
+            // refuse it.
+            v.enqueue_log_unit(vec![recovery_leaf])?;
+            Ok(commit_bytes)
         })
         .await?;
 
@@ -291,56 +300,19 @@ pub async fn recovery_advance_epoch(
     //    Class-C epoch fields with a coalesced (best-effort) persist below;
     //    route through the non-persisting Class-C view so no whole `&mut`
     //    is taken (ADR-049 §9). Borrow ends before the event-log step.
-    let (old_epoch, new_epoch) = {
+    let new_epoch = {
         let mut view = cell.class_c_view();
         let epoch = view.epoch_mut();
         let old_epoch = epoch.mls_epoch;
         epoch.mls_epoch = old_epoch.saturating_add(1);
         let _expired = epoch.grace_store.add_epoch(old_epoch);
-        (old_epoch, epoch.mls_epoch)
+        epoch.mls_epoch
     };
 
-    // 5. Emit epoch advancement event to event log. Event log failures
-    //    are non-fatal — recovery must not be blocked by logging issues.
-    let recovery_payload = scp_event_log::payload::encode_payload(
-        &scp_event_log::payload::RecoveryEpochAdvancedPayload {
-            old_epoch,
-            new_epoch,
-        },
-    );
-    // Committer-assigned timestamp for the recovery epoch-advance commit: the
-    // initiator's clock — the source of the `created_at` on the broadcast MLS
-    // Commit, copied by every member (§7.3.1, §9.9.3).
-    let recovery_ts = deps.clock.now_secs();
-    // The append is now async (ADR-049 Decision 7), so the former
-    // `.map_err(..).and_then(|payload| ...)` combinator chain (whose closure
-    // cannot `.await`) is unrolled imperatively: encode the payload first, then
-    // await the append. Both the encode failure and the append failure are
-    // non-fatal (recovery must not be blocked by logging issues), warned with
-    // the same message as before.
-    let append_result =
-        match recovery_payload.map_err(|e| ContextError::EventLogFailed(e.to_string())) {
-            Ok(payload) => {
-                deps.event_log
-                    .append_context_event_with_payload(
-                        crate::context::builder::AppendMode::AfterSideEffect,
-                        &context_id_bytes,
-                        scp_event_log::EventType::RecoveryEpochAdvanced,
-                        "system:recovery",
-                        payload,
-                        recovery_ts,
-                    )
-                    .await
-            }
-            Err(e) => Err(e),
-        };
-    if let Err(e) = append_result {
-        tracing::warn!(
-            context_id = %context_id,
-            error = %e,
-            "failed to append recovery epoch advancement event to event log"
-        );
-    }
+    // 5. The queued `RecoveryEpochAdvanced` unit is written to the event log.
+    //    A drain failure leaves it queued for the next drain; recovery is not
+    //    blocked by logging issues.
+    let _ = crate::context::log_unit_helpers::drain_pending_log_units(cell, deps, context_id).await;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
 
     // 6. Persist if configured (best-effort). The actor's coalesced
@@ -548,4 +520,118 @@ fn persist_state_best_effort<'d, 'c>(
     // snapshot, exports the crypto state with the Supervisor's floors, and
     // persists nothing when the Supervisor has dropped.
     crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id)
+}
+
+/// Plans the `RecoveryEpochAdvanced { old, old + 1 }` leaf of a recovery epoch
+/// advance from the bookkeeping epoch before the step (spec 17 §17.3 "Event
+/// log write failures"). The timestamp is committer-assigned: the initiator's
+/// clock, the source of the `created_at` on the broadcast MLS Commit that every
+/// member copies (§7.3.1, §9.9.3).
+///
+/// # Errors
+///
+/// Returns [`ContextError::EventLogFailed`] when the payload does not encode
+/// or breaks the append's payload rules. Nothing has changed then.
+fn plan_recovery_epoch_leaf(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+) -> Result<crate::context::state::LeafSpec, ContextError> {
+    let old_epoch = cell.class_c_view().epoch_mut().mls_epoch;
+    let payload = scp_event_log::payload::encode_payload(
+        &scp_event_log::payload::RecoveryEpochAdvancedPayload {
+            old_epoch,
+            new_epoch: old_epoch.saturating_add(1),
+        },
+    )
+    .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
+    let event_type = scp_event_log::EventType::RecoveryEpochAdvanced;
+    crate::context::providers::event_log::check_append_payload(event_type, &payload)
+        .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
+    Ok(crate::context::state::LeafSpec {
+        event_type,
+        actor_did: "system:recovery".to_owned(),
+        payload,
+        timestamp_secs: deps.clock.now_secs(),
+    })
+}
+
+/// The recovery family of spec 17 §17.3 "Event log write failures".
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod log_unit_family_tests {
+    use scp_did::DID;
+
+    use crate::context::actor::class_s::ClassSCell;
+    use crate::context::actor::state::PerContextState;
+    use crate::context::log_unit_helpers::test_support::{
+        deps_with, fail_log_entry_writes, faulty_merkle_log, log_len, queued_unit_types,
+    };
+
+    const OWNER: &str = "did:dht:z6MkOwnerRecoveryLogUnit";
+
+    mod recovery_leaf {
+        use super::*;
+
+        /// The recovery Commit ratchets the group before the
+        /// `RecoveryEpochAdvanced` leaf is written. A log that rejects the
+        /// write keeps the advanced epoch and queues the leaf; the recovery
+        /// succeeds.
+        #[tokio::test]
+        async fn append_failure_after_side_effect_keeps_step_and_queues_leaf() {
+            let ctx_id_bytes = [0x6Au8; 32];
+            let ctx = hex::encode(ctx_id_bytes);
+            let (log, faulty) = faulty_merkle_log();
+            let deps = deps_with(OWNER, None, Box::new(log)).await;
+            deps.event_log
+                .init_event_log(&ctx_id_bytes)
+                .await
+                .expect("init event log");
+            fail_log_entry_writes(&faulty, &ctx_id_bytes);
+
+            let wrapping_public = *deps
+                .supervisor
+                .my_wrapping_key(&deps.owned_identity)
+                .expect("the owner's wrapping key is loaded")
+                .public();
+            let owned = crate::crypto::mls::provider::NodeMlsFactory::new(
+                OWNER.to_owned(),
+                std::sync::Arc::new(scp_clock::SystemClock),
+            )
+            .create_bare_group_owned(&wrapping_public)
+            .expect("birth an MLS group");
+            let mut state = PerContextState::new_for_test_encrypted(
+                ctx_id_bytes,
+                1_700_000_000,
+                DID(OWNER.to_owned()),
+            );
+            state.seed_encrypted_crypto_from_owned(owned);
+            state
+                .handle
+                .transition_to(&crate::context::ContextState::Active)
+                .expect("transition to Active");
+            let mut cell = ClassSCell::new(state);
+
+            let advanced = crate::context::trust_recovery_helpers::recovery_advance_epoch(
+                &mut cell, &deps, &ctx,
+            )
+            .await;
+
+            assert_eq!(
+                advanced.expect("the leaf is queued, so the recovery succeeds"),
+                1,
+                "the epoch advanced"
+            );
+            assert_eq!(cell.epoch.mls_epoch, 1, "the advanced epoch is kept");
+            assert_eq!(
+                queued_unit_types(&cell.class_s.pending_log_units),
+                vec![vec![scp_event_log::EventType::RecoveryEpochAdvanced]],
+                "the recovery leaf stays queued"
+            );
+            assert_eq!(
+                log_len(&deps, &ctx_id_bytes),
+                0,
+                "the log rejected the write"
+            );
+        }
+    }
 }

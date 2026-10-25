@@ -4537,8 +4537,13 @@ fn actor_check_proposer_eligibility(
         // `convergent_now` (the consequence window anchor) is unused here.
         // A gate before the proposal is recorded: an unreadable log fails the
         // proposal (spec section 17.3, "Event log write failures").
-        let (events, _convergent_now) =
-            event_log_entries_for_consequences(&cell.receive_buffer, &context_id, now, event_log)?;
+        let (events, _convergent_now) = event_log_entries_for_consequences(
+            &cell.receive_buffer,
+            &cell.class_s.pending_log_units,
+            &context_id,
+            now,
+            event_log,
+        )?;
         if !events.is_empty() {
             match compute_participation_record(
                 &events,
@@ -6076,6 +6081,7 @@ pub async fn finalize_governance_action(
             // window anchor so both evaluations are convergent across members.
             let (buf_events, convergent_now) = event_log_entries_for_consequences_after_side_effect(
                 &state.receive_buffer,
+                &state.class_s.pending_log_units,
                 context_id,
                 now,
                 &*deps.event_log,
@@ -6114,8 +6120,7 @@ pub async fn finalize_governance_action(
             // FAIL-CLOSED persist of the post-finalize state (keep-direction). So an
             // armed sink here is REDUNDANT — it is subsumed by the caller's
             // discharge (no second persist) below.
-            let mut downward_auth_sink: Option<crate::context::actor::class_s::ClassSCommitToken> =
-                None;
+            let mut sink = crate::context::log_unit_helpers::ConsequenceSink::new();
             let mut split = ConsequenceStateSplit::from_state(state);
             let _ = enforce_triggered_consequences(
                 &mut split,
@@ -6126,12 +6131,10 @@ pub async fn finalize_governance_action(
                     triggered: &triggered_proposer,
                     rules: &rules,
                     clock: &*deps.clock,
-                    event_log: &*deps.event_log,
                     event_tx: deps.event_tx.as_ref(),
                 },
-                &mut downward_auth_sink,
-            )
-            .await;
+                &mut sink,
+            );
             if let Some((target, triggered)) = triggered_target {
                 let mut split = ConsequenceStateSplit::from_state(state);
                 let _ = enforce_triggered_consequences(
@@ -6143,16 +6146,23 @@ pub async fn finalize_governance_action(
                         triggered: &triggered,
                         rules: &rules,
                         clock: &*deps.clock,
-                        event_log: &*deps.event_log,
                         event_tx: deps.event_tx.as_ref(),
                     },
-                    &mut downward_auth_sink,
-                )
-                .await;
+                    &mut sink,
+                );
             }
+            // Governance finalize keeps the memory-first rule for its leaves
+            // (spec 17 §17.3 "Event log write failures").
+            let (obligation, leaves) = sink.into_parts();
+            crate::context::governance_logic::append_consequence_leaves_after_side_effect(
+                &*deps.event_log,
+                context_id,
+                leaves,
+            )
+            .await;
             // Covered fail-closed by the caller's `discharge_with` commit (above):
             // subsume any armed obligation so EXACTLY ONE persist is owed.
-            if let Some(token) = downward_auth_sink.take() {
+            if let Some(token) = obligation {
                 token.subsume(context_id);
             }
         }
@@ -6164,6 +6174,7 @@ pub async fn finalize_governance_action(
         // Participation-record path: only the merged event set is consumed.
         let (gov_events, _convergent_now) = event_log_entries_for_consequences_after_side_effect(
             &state.receive_buffer,
+            &state.class_s.pending_log_units,
             context_id,
             now,
             &*deps.event_log,
