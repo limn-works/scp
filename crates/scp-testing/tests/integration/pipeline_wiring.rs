@@ -9794,17 +9794,6 @@ const EVENT_LOG_APPEND_ALLOWLIST: &[(&str, &str, &str)] = &[
         "test_append_event_log",
         "a testing-feature seam",
     ),
-    // KeyEpochAdvance leaves.
-    (
-        "scp-runtime/src/context/broadcast_helpers.rs",
-        "unsubscribe_broadcast",
-        "SCP-349",
-    ),
-    (
-        "scp-runtime/src/context/broadcast_helpers.rs",
-        "block_broadcast_subscriber",
-        "SCP-349",
-    ),
     // The streaming saga's A-side record.
     (
         "scp-runtime/src/context/outlets/invoke.rs",
@@ -9855,16 +9844,6 @@ const EVENT_LOG_APPEND_ALLOWLIST: &[(&str, &str, &str)] = &[
         "forwards to `append_streaming_outlet_invoked_event`",
     ),
     (
-        "scp-runtime/src/context/broadcast_helpers.rs",
-        "subscribe_broadcast",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/broadcast_helpers.rs",
-        "unsubscribe_broadcast",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
         "scp-runtime/src/context/lifecycle_helpers.rs",
         "join_context",
         "spec 17 §17.3, memory-first after the step",
@@ -9892,16 +9871,6 @@ const EVENT_LOG_APPEND_ALLOWLIST: &[(&str, &str, &str)] = &[
     (
         "scp-runtime/src/context/outlets/invoke.rs",
         "record_cross_context_a_event",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/broadcast_helpers.rs",
-        "block_broadcast_subscriber",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/broadcast_helpers.rs",
-        "unblock_broadcast_subscriber",
         "spec 17 §17.3, memory-first after the step",
     ),
     (

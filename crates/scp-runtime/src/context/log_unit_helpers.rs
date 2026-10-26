@@ -304,6 +304,47 @@ pub fn plan_outlet_invoked_verified_leaf(
     )
 }
 
+/// Plans one `KeyEpochAdvance` record per broadcast author whose key a
+/// step rotated (§5.14.10; ADR-007 §5 for a broadcast block or unsubscribe),
+/// in the order given. Each rotation
+/// advances by exactly 1, so `old_epoch = new_epoch - 1`.
+///
+/// The records are known only once the rotation ran, so they are planned
+/// inside the step's persist. A record that does not encode or breaks the
+/// append's payload rules is logged at ERROR and skipped (SCP-349): the
+/// rotation is already taken, and refusing it here would report a rotation
+/// that landed as one that did not.
+pub fn key_epoch_advance_leaves<'a>(
+    advances: impl IntoIterator<Item = (&'a str, u64)>,
+    timestamp_secs: u64,
+    context_id: &str,
+) -> Vec<LeafSpec> {
+    advances
+        .into_iter()
+        .filter_map(|(author_did, new_epoch)| {
+            plan_encoded_leaf(
+                scp_event_log::EventType::KeyEpochAdvance,
+                author_did,
+                &scp_event_log::payload::KeyEpochAdvancePayload {
+                    old_epoch: new_epoch.saturating_sub(1),
+                    new_epoch,
+                },
+                timestamp_secs,
+            )
+            .inspect_err(|e| {
+                tracing::error!(
+                    context_id = %context_id,
+                    author_did = %author_did,
+                    error = %e,
+                    "KeyEpochAdvance record refused after a key rotation — \
+                     the event log is short one leaf for this author"
+                );
+            })
+            .ok()
+        })
+        .collect()
+}
+
 /// True when the context has queued log units or a log fault, so a drain has
 /// work to do.
 pub fn has_log_unit_work(cell: &ClassSCell) -> bool {
@@ -576,6 +617,85 @@ pub mod test_support {
                     .collect()
             })
             .collect()
+    }
+
+    /// A snapshot store the supervisor writes through while the test reads
+    /// the stored snapshot back, so a test can assert that a unit reached the
+    /// persist that recorded its step and not only the in-memory queue.
+    #[derive(Clone, Default)]
+    pub struct SharedSnapshots(Arc<crate::context::providers::persistence::InMemoryPersistence>);
+
+    impl SharedSnapshots {
+        /// The event types of each unit in the stored snapshot's queue,
+        /// oldest first; empty when nothing was stored.
+        pub async fn persisted_unit_types(&self, context_id: &str) -> Vec<Vec<EventType>> {
+            self.0
+                .load_context(context_id)
+                .await
+                .expect("the snapshot store reads")
+                .map(|snapshot| {
+                    snapshot
+                        .pending_log_units
+                        .iter()
+                        .map(|unit| {
+                            unit.leaves
+                                .iter()
+                                .map(crate::context::state::LeafSpec::event_type)
+                                .collect()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ContextPersistence for SharedSnapshots {
+        async fn persist_context(
+            &self,
+            context_id: &str,
+            snapshot: &crate::context::state::ContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.0.persist_context(context_id, snapshot).await
+        }
+        async fn load_context(
+            &self,
+            context_id: &str,
+        ) -> Result<
+            Option<crate::context::state::ContextSnapshot>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            self.0.load_context(context_id).await
+        }
+        async fn delete_context(
+            &self,
+            context_id: &str,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.0.delete_context(context_id).await
+        }
+        async fn list_persisted_contexts(
+            &self,
+        ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+            self.0.list_persisted_contexts().await
+        }
+    }
+
+    /// Supervisor-backed deps for `owner` over a Merkle log whose entry writes
+    /// for `context_id` fail once [`fail_log_entry_writes`] runs, and a
+    /// [`SharedSnapshots`] store. The log is initialised for `context_id`, so
+    /// the failure a test sees is the refused entry write.
+    pub async fn deps_over_faulty_log(
+        owner: &str,
+        context_id: &str,
+    ) -> (ActorDeps, Arc<FaultyStorage>, SharedSnapshots) {
+        let (log, faulty) = faulty_merkle_log();
+        let snapshots = SharedSnapshots::default();
+        let deps = deps_with(owner, Some(Box::new(snapshots.clone())), Box::new(log)).await;
+        deps.event_log
+            .init_event_log(&crate::context::state::context_id_to_bytes(context_id))
+            .await
+            .expect("init event log");
+        (deps, faulty, snapshots)
     }
 
     /// The number of entries in the context's log.

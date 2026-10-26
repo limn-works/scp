@@ -736,6 +736,59 @@ mod tests {
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             Ok(())
         }
+        /// The log's length is the count of recorded leaves, so the drain of a
+        /// queued unit writes through [`Self::append_event`] and a test counts
+        /// the leaves a drain wrote.
+        async fn lock_for_unit(
+            &self,
+            context_id: &[u8; 32],
+        ) -> Result<
+            crate::context::builder::UnitWriteGuard,
+            scp_protocol::context::builder::ContextCreationError,
+        > {
+            let len = u64::try_from(self.appended.load(Ordering::SeqCst)).map_err(|_| {
+                scp_protocol::context::builder::ContextCreationError::EventLogFailed(
+                    "leaf count exceeds u64".into(),
+                )
+            })?;
+            Ok(crate::context::builder::UnitWriteGuard::new(
+                *context_id,
+                None,
+                len,
+            ))
+        }
+        async fn append_unit(
+            &self,
+            guard: crate::context::builder::UnitWriteGuard,
+            base_seq: u64,
+            leaves: &[crate::context::state::LeafSpec],
+        ) -> Result<crate::context::builder::UnitAppended, crate::context::builder::UnitAppendError>
+        {
+            let log_len = guard.log_len();
+            if base_seq > log_len {
+                return Err(crate::context::builder::UnitAppendError::PastEnd {
+                    base_seq,
+                    log_len,
+                });
+            }
+            if base_seq < log_len {
+                return Err(crate::context::builder::UnitAppendError::Misaligned {
+                    base_seq,
+                    log_len,
+                });
+            }
+            for leaf in leaves {
+                self.append_event(
+                    guard.context_id(),
+                    leaf.event_type(),
+                    leaf.actor_did(),
+                    leaf.payload().clone(),
+                    leaf.timestamp_secs(),
+                )
+                .await?;
+            }
+            Ok(crate::context::builder::UnitAppended::Appended)
+        }
     }
 
     struct TestPersistence;
@@ -1587,6 +1640,10 @@ mod tests {
 
         // The un-banned DID can re-subscribe with a fresh grant, emitting a
         // MemberJoined leaf.
+        // The actor drains the queue before it handles each command.
+        crate::context::log_unit_helpers::drain_pending_log_units(&mut cell, &deps, &ctx_hex)
+            .await
+            .expect("the earlier records drain");
         let appends_before = appends.load(Ordering::SeqCst);
         let regrant = mint_read_ucan(&ctx_hex, CREATOR_DID, SUBSCRIBER_DID, &creator_key());
         dispatch_subscribe(&mut cell, &deps, &ctx_hex, Some(regrant))
@@ -1992,6 +2049,236 @@ mod tests {
             "checkpoint_events_since must credit MemberLeft AND every rotated \
              author's KeyEpochAdvance leaf"
         );
+    }
+
+    // ---- Spec 17 §17.3 "Event log write failures": a refused log write after
+    // a broadcast step keeps the step and leaves its leaves queued in the
+    // persist that recorded the step. Each test fails the log's entry writes
+    // from just before the operation under test, so the operation's own drain
+    // is refused and its unit stays queued.
+
+    /// An ACTIVE open broadcast cell with `authors`, deps over a Merkle log the
+    /// test can fail, and the snapshot store the deps write through.
+    async fn broadcast_over_faulty_log(
+        authors: &[&str],
+    ) -> (
+        ClassSCell,
+        String,
+        ActorDeps,
+        Arc<crate::context::supervisor::faulty_storage::FaultyStorage>,
+        crate::context::log_unit_helpers::test_support::SharedSnapshots,
+    ) {
+        let (cell, ctx_hex) = build_broadcast_cell_with_authors(BroadcastAdmission::Open, authors);
+        let (deps, faulty, snapshots) =
+            crate::context::log_unit_helpers::test_support::deps_over_faulty_log(
+                "did:example:broadcast-actor",
+                &ctx_hex,
+            )
+            .await;
+        (cell, ctx_hex, deps, faulty, snapshots)
+    }
+
+    /// Fails the log's entry writes from here on and returns the log's length
+    /// at that point.
+    fn fail_entry_writes(
+        deps: &ActorDeps,
+        faulty: &crate::context::supervisor::faulty_storage::FaultyStorage,
+        ctx_hex: &str,
+    ) -> usize {
+        let ctx_bytes = crate::context::state::context_id_to_bytes(ctx_hex);
+        crate::context::log_unit_helpers::test_support::fail_log_entry_writes(faulty, &ctx_bytes);
+        crate::context::log_unit_helpers::test_support::log_len(deps, &ctx_bytes)
+    }
+
+    /// Asserts the in-memory queue and the stored snapshot's queue both hold
+    /// exactly `expected`, and that the log still holds `log_before` entries.
+    async fn assert_queued_and_persisted(
+        queued: Vec<Vec<scp_event_log::EventType>>,
+        deps: &ActorDeps,
+        snapshots: &crate::context::log_unit_helpers::test_support::SharedSnapshots,
+        ctx_hex: &str,
+        expected: &[Vec<scp_event_log::EventType>],
+        log_before: usize,
+    ) {
+        use crate::context::log_unit_helpers::test_support::log_len;
+        assert_eq!(
+            queued, expected,
+            "the refused leaves stay queued as one unit"
+        );
+        assert_eq!(
+            snapshots.persisted_unit_types(ctx_hex).await,
+            expected,
+            "the unit is in the fail-closed persist that recorded the step"
+        );
+        assert_eq!(
+            log_len(deps, &crate::context::state::context_id_to_bytes(ctx_hex)),
+            log_before,
+            "the refused leaves never reached the log"
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribe_append_failure_after_side_effect_keeps_step_and_queues_leaf() {
+        let (mut cell, ctx_hex, deps, faulty, snapshots) =
+            broadcast_over_faulty_log(&[CREATOR_DID]).await;
+        let log_before = fail_entry_writes(&deps, &faulty, &ctx_hex);
+
+        dispatch_subscribe(&mut cell, &deps, &ctx_hex, None)
+            .await
+            .expect("a refused log write after the roster ADD must not fail the subscribe");
+
+        assert!(
+            crate::context::broadcast_helpers::is_broadcast_subscriber(&mut cell, SUBSCRIBER_DID),
+            "the subscribe is kept, not compensated"
+        );
+        assert!(cell.membership.contains(&DID(SUBSCRIBER_DID.to_owned())));
+        assert_queued_and_persisted(
+            crate::context::log_unit_helpers::test_support::queued_unit_types(
+                &cell.class_s.pending_log_units,
+            ),
+            &deps,
+            &snapshots,
+            &ctx_hex,
+            &[vec![scp_event_log::EventType::MemberJoined]],
+            log_before,
+        )
+        .await;
+        assert_eq!(
+            cell.checkpoint_events_since, 1,
+            "the queued leaf is credited"
+        );
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_append_failure_after_side_effect_keeps_step_and_queues_leaf() {
+        let (mut cell, ctx_hex, deps, faulty, snapshots) =
+            broadcast_over_faulty_log(&AUTHORS_3).await;
+        dispatch_subscribe(&mut cell, &deps, &ctx_hex, None)
+            .await
+            .expect("open subscribe");
+        let log_before = fail_entry_writes(&deps, &faulty, &ctx_hex);
+        reset_leaf_counter(&mut cell);
+
+        crate::context::broadcast_helpers::unsubscribe_broadcast(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &DID(SUBSCRIBER_DID.to_owned()),
+            true,
+        )
+        .await
+        .expect("a refused log write after the roster REMOVE must not fail the unsubscribe");
+
+        assert!(
+            !crate::context::broadcast_helpers::is_broadcast_subscriber(&mut cell, SUBSCRIBER_DID),
+            "the unsubscribe is kept, not compensated"
+        );
+        let mut unit = vec![scp_event_log::EventType::MemberLeft];
+        unit.extend([scp_event_log::EventType::KeyEpochAdvance; AUTHORS_3.len()]);
+        assert_queued_and_persisted(
+            crate::context::log_unit_helpers::test_support::queued_unit_types(
+                &cell.class_s.pending_log_units,
+            ),
+            &deps,
+            &snapshots,
+            &ctx_hex,
+            &[unit],
+            log_before,
+        )
+        .await;
+        assert_eq!(
+            cell.checkpoint_events_since,
+            1 + AUTHORS_3.len() as u64,
+            "every queued leaf is credited"
+        );
+    }
+
+    #[tokio::test]
+    async fn block_append_failure_after_side_effect_keeps_step_and_queues_leaf() {
+        let (mut cell, ctx_hex, deps, faulty, snapshots) =
+            broadcast_over_faulty_log(&[CREATOR_DID]).await;
+        dispatch_subscribe(&mut cell, &deps, &ctx_hex, None)
+            .await
+            .expect("open subscribe");
+        let log_before = fail_entry_writes(&deps, &faulty, &ctx_hex);
+
+        crate::context::broadcast_helpers::block_broadcast_subscriber(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &DID(CREATOR_DID.to_owned()),
+            &DID(SUBSCRIBER_DID.to_owned()),
+        )
+        .await
+        .expect("a refused log write after the block must not fail the block");
+
+        assert!(
+            cell.broadcast_context
+                .as_ref()
+                .is_some_and(|bc| bc.is_blocked(CREATOR_DID, SUBSCRIBER_DID)),
+            "the block is kept, not compensated"
+        );
+        assert_queued_and_persisted(
+            crate::context::log_unit_helpers::test_support::queued_unit_types(
+                &cell.class_s.pending_log_units,
+            ),
+            &deps,
+            &snapshots,
+            &ctx_hex,
+            &[vec![
+                scp_event_log::EventType::MemberBlocked,
+                scp_event_log::EventType::KeyEpochAdvance,
+            ]],
+            log_before,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn unblock_append_failure_after_side_effect_keeps_step_and_queues_leaf() {
+        let (mut cell, ctx_hex, deps, faulty, snapshots) =
+            broadcast_over_faulty_log(&[CREATOR_DID]).await;
+        dispatch_subscribe(&mut cell, &deps, &ctx_hex, None)
+            .await
+            .expect("open subscribe");
+        crate::context::broadcast_helpers::block_broadcast_subscriber(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &DID(CREATOR_DID.to_owned()),
+            &DID(SUBSCRIBER_DID.to_owned()),
+        )
+        .await
+        .expect("block");
+        let log_before = fail_entry_writes(&deps, &faulty, &ctx_hex);
+
+        crate::context::broadcast_helpers::unblock_broadcast_subscriber(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &DID(CREATOR_DID.to_owned()),
+            &DID(SUBSCRIBER_DID.to_owned()),
+        )
+        .await
+        .expect("a refused log write after the unblock must not fail the unblock");
+
+        assert!(
+            cell.broadcast_context
+                .as_ref()
+                .is_some_and(|bc| !bc.is_blocked(CREATOR_DID, SUBSCRIBER_DID)),
+            "the unblock is kept, not compensated"
+        );
+        assert_queued_and_persisted(
+            crate::context::log_unit_helpers::test_support::queued_unit_types(
+                &cell.class_s.pending_log_units,
+            ),
+            &deps,
+            &snapshots,
+            &ctx_hex,
+            &[vec![scp_event_log::EventType::MemberUnblocked]],
+            log_before,
+        )
+        .await;
     }
 
     /// `execute_rotate_content_keys` writes nothing to the log after its step:
@@ -3132,6 +3419,29 @@ mod tests {
         );
     }
 
+    /// The event types the log recorded, then those still queued, in order:
+    /// every record the operation produced, whether or not a drain has
+    /// written it yet.
+    fn logged_then_queued(
+        recorded: &RecordedLeaves,
+        cell: &ClassSCell,
+    ) -> Vec<scp_event_log::EventType> {
+        let mut types: Vec<scp_event_log::EventType> = recorded
+            .read()
+            .expect("recorded leaves lock")
+            .iter()
+            .map(|(event_type, _)| *event_type)
+            .collect();
+        types.extend(
+            crate::context::log_unit_helpers::test_support::queued_unit_types(
+                &cell.class_s.pending_log_units,
+            )
+            .into_iter()
+            .flatten(),
+        );
+        types
+    }
+
     /// A rejected TTL extension is the one dispatch that advances the cell's
     /// `mutation_epoch` without applying a governance effect: `execute_extend_ttl`
     /// queues and credits a `TtlExtensionRejected` record, then returns
@@ -3149,7 +3459,7 @@ mod tests {
     async fn unanimity_rejected_extend_ttl_keeps_marker_and_appends_no_executed_leaf() {
         use scp_protocol::context::governance::GovernanceAction;
 
-        let (deps, appends) = build_deps().await;
+        let (deps, appends, recorded) = build_deps_recording().await;
         let (mut state, ctx_hex) =
             build_broadcast_state_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
         let proposal_id = seed_approved_proposal(
@@ -3169,6 +3479,7 @@ mod tests {
             vec![],
         );
         appends.store(0, Ordering::SeqCst);
+        recorded.write().expect("recorded leaves lock").clear();
         reset_leaf_counter(&mut cell);
 
         let first = crate::context::governance_helpers::execute_governance_action(
@@ -3190,18 +3501,11 @@ mod tests {
             "the unanimity rejection must reach the caller unchanged; got {first:?}"
         );
         assert_eq!(
-            appends.load(Ordering::SeqCst),
-            0,
-            "no record is written outside the queue"
-        );
-        assert_eq!(
-            crate::context::log_unit_helpers::test_support::queued_unit_types(
-                &cell.class_s.pending_log_units
-            ),
-            vec![vec![scp_event_log::EventType::TtlExtensionRejected]],
-            "exactly the `TtlExtensionRejected` record is queued: a second record \
-             would be the `GovernanceActionExecuted` record finalize produces, \
-             which records an extension that did not happen"
+            logged_then_queued(&recorded, &cell),
+            vec![scp_event_log::EventType::TtlExtensionRejected],
+            "exactly the `TtlExtensionRejected` record is logged or queued: a \
+             second record would be the `GovernanceActionExecuted` record \
+             finalize produces, which records an extension that did not happen"
         );
         assert_eq!(
             cell.checkpoint_events_since, 1,
@@ -3241,11 +3545,9 @@ mod tests {
             "the same proposal id must be refused as already executed; got {second:?}"
         );
         assert_eq!(
-            crate::context::log_unit_helpers::test_support::queued_unit_types(
-                &cell.class_s.pending_log_units
-            ),
-            vec![vec![scp_event_log::EventType::TtlExtensionRejected]],
-            "the refused replay queues nothing: a second `TtlExtensionRejected` \
+            logged_then_queued(&recorded, &cell),
+            vec![scp_event_log::EventType::TtlExtensionRejected],
+            "the refused replay records nothing: a second `TtlExtensionRejected` \
              record on this member alone would diverge its Merkle root"
         );
     }

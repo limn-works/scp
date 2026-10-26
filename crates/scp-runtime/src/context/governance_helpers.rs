@@ -848,46 +848,6 @@ pub async fn execute_suspend_member(
     .await
 }
 
-/// Plans one `KeyEpochAdvance` record per broadcast author whose key a
-/// governance step rotated (§5.14.10), in the order given. Each rotation
-/// advances by exactly 1, so `old_epoch = new_epoch - 1`.
-///
-/// The records are known only once the rotation ran, so they are planned
-/// inside the step's persist. A record that does not encode or breaks the
-/// append's payload rules is logged at ERROR and skipped (SCP-349): the
-/// rotation is already taken, and refusing it here would report a rotation
-/// that landed as one that did not.
-fn key_epoch_advance_leaves<'a>(
-    advances: impl IntoIterator<Item = (&'a str, u64)>,
-    timestamp_secs: u64,
-    context_id: &str,
-) -> Vec<LeafSpec> {
-    advances
-        .into_iter()
-        .filter_map(|(author_did, new_epoch)| {
-            plan_encoded_leaf(
-                scp_event_log::EventType::KeyEpochAdvance,
-                author_did,
-                &scp_event_log::payload::KeyEpochAdvancePayload {
-                    old_epoch: new_epoch.saturating_sub(1),
-                    new_epoch,
-                },
-                timestamp_secs,
-            )
-            .inspect_err(|e| {
-                tracing::error!(
-                    context_id = %context_id,
-                    author_did = %author_did,
-                    error = %e,
-                    "KeyEpochAdvance record refused after a key rotation — \
-                     the event log is short one leaf for this author"
-                );
-            })
-            .ok()
-        })
-        .collect()
-}
-
 // ---------------------------------------------------------------------------
 // execute_revoke (per-action leaf helper)
 // ---------------------------------------------------------------------------
@@ -1029,7 +989,7 @@ pub async fn execute_revoke(
             // §5.14.10: one KeyEpochAdvance leaf per author whose broadcast
             // key the ban rotated, known only once the rotation ran above.
             let mut unit = vec![access_revoked_leaf];
-            unit.extend(key_epoch_advance_leaves(
+            unit.extend(crate::context::log_unit_helpers::key_epoch_advance_leaves(
                 rotated_authors
                     .iter()
                     .map(|r| (r.author_did.as_str(), r.new_epoch)),
@@ -3213,7 +3173,7 @@ pub async fn execute_rotate_content_keys(
             // (milliseconds) is for the relay-message consumer on the
             // per-author block path and is not used here.
             let mut unit = vec![rotated_leaf];
-            unit.extend(key_epoch_advance_leaves(
+            unit.extend(crate::context::log_unit_helpers::key_epoch_advance_leaves(
                 advances
                     .iter()
                     .map(|a| (a.author_did.as_str(), a.new_epoch)),

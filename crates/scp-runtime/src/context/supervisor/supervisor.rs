@@ -35623,13 +35623,14 @@ mod tests {
         );
     }
 
-    /// Test 6 — the UNBLOCK path (upward authorization, block-list REMOVE) stays
-    /// BEST-EFFORT: with a persistence backend that always fails, unblock still
-    /// returns `Ok`. Proves the fail-closed tightening did not over-reach onto the
-    /// grant direction (no liveness regression).
+    /// Test 6 — the UNBLOCK path (upward authorization, block-list REMOVE)
+    /// persists fail-closed: its `MemberUnblocked` record is queued in the
+    /// persist that records the unblock, so a failed persist leaves the record
+    /// with no durable home and returns `Err(PersistenceFailed)`. The unblock
+    /// stays applied in memory (spec 17 §17.3 "Event log write failures").
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn broadcast_unblock_stays_best_effort_on_persist_failure() {
+    async fn broadcast_unblock_persist_failure_fails_closed_and_keeps_unblock() {
         let sup = supervisor_with_providers();
         let mut deps = test_actor_deps(&sup).await;
         deps.persistence = Arc::new(FailingPersistence);
@@ -35654,9 +35655,9 @@ mod tests {
         )
         .await;
         assert!(
-            res.is_ok(),
-            "unblock (upward authorization) must stay best-effort and return Ok on \
-             persist failure — no over-tightening: got {res:?}"
+            matches!(res, Err(ContextError::PersistenceFailed(_))),
+            "an unblock whose persist fails must return the durability error, \
+             since its queued record has no durable home: got {res:?}"
         );
         assert!(
             !cell
