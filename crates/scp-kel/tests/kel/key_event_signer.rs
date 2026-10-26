@@ -48,10 +48,14 @@ impl KeyEventSigner for EchoSigner {
     }
 }
 
+// `MaybeSend` is `Send` on every target but wasm32, which runs on one
+// thread, so the `Send` proof below holds natively only.
+#[cfg(not(target_arch = "wasm32"))]
 const fn assert_send<T: Send>(_: &T) {}
 
 /// Compiles only when every `KeyEventSigner`'s futures are `Send`, whatever
 /// the implementor: the bound comes from the trait, not from `EchoSigner`.
+#[cfg(not(target_arch = "wasm32"))]
 fn futures_are_send<S: KeyEventSigner>(
     signer: &S,
     member: &S::Member,
@@ -78,6 +82,7 @@ fn ready_value<F: Future>(future: F) -> Option<F::Output> {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn futures_are_send_natively() -> TestResult {
     futures_are_send(&EchoSigner, &(), &v41_change()?, &CustodyProbe::fresh()?);

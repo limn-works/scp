@@ -15,6 +15,7 @@ mod event_codec;
 mod key_event_signer;
 mod preimage;
 mod rank;
+pub mod recovery_store;
 mod relation;
 mod routing;
 mod signature;

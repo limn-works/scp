@@ -35,11 +35,20 @@ testing = []
 [dev-dependencies]
 hex = { workspace = true }
 # Round-trips encode and decode over generated preimages of all four kinds.
-proptest = "1"
+# Without the default `fork` and `timeout` features, which pull in process
+# APIs that do not build for wasm32: the crate's tests compile for the browser
+# target too (`17-persistence-and-storage.md` §17.8; SCP-311).
+proptest = { version = "1", default-features = false, features = ["std", "bit-set"] }
 # Compile-time proof that no Default, Deserialize or From impl builds a
 # ValidatedChain or a ReplayedState (tests/kel/construction.rs).
 serde = { workspace = true }
 static_assertions = { workspace = true }
+
+# proptest draws its seed through getrandom 0.3, which builds for wasm32 only
+# with the `wasm_js` feature; the root .cargo/config.toml selects that backend.
+# Test-only: the library itself draws no randomness.
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
 
 [lints]
 workspace = true

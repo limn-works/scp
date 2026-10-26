@@ -15,6 +15,7 @@ software_platform = [
     "dep:ed25519-dalek",
     "dep:rand",
     "dep:hmac",
+    "dep:sha2",
     "dep:subtle",
     "dep:uuid",
 ]
@@ -113,13 +114,9 @@ scp-crypto = { path = "../scp-crypto", version = "=0.1.0-beta.2" }
 # direct scp-kel dependency (09-security-model.md §9.7.4.2 R10; SCP-345).
 # scp-kel is a wasm-safe leaf that depends on no platform crate.
 scp-kel = { path = "../scp-kel", version = "=0.1.0-beta.2" }
-# The 32-byte `Identifier` a recovery handle and a last-reveal marker carry
+# The 32-byte `Identifier` a recovery lease is keyed on beside the credential
 # (09-security-model.md §9.7.4.2 R10; SCP-311). scp-kel already depends on it.
 scp-did = { path = "../scp-did", version = "=0.1.0-beta.2" }
-# Hashes a WebAuthn credential identifier into the recovery store's storage key
-# (17-persistence-and-storage.md §17.3; SCP-311), and the software backends
-# use it under `software_platform`.
-sha2 = { workspace = true }
 serde = { workspace = true }
 tokio.workspace = true
 thiserror.workspace = true
@@ -142,6 +139,7 @@ argon2 = { workspace = true, optional = true }
 ed25519-dalek = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 hmac = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 # Constant-time equality for a file-custody passphrase commitment and a file
 # HMAC, so neither comparison leaks a prefix-match length.
 subtle = { workspace = true, optional = true }

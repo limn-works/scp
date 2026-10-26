@@ -1543,6 +1543,9 @@ jobs:
           save-if: false
       - uses: ./.github/actions/cargo-fetch
       - run: cargo check -p scp-alloc -p scp-clock -p scp-crypto -p scp-did -p scp-kel -p scp-protocol -p scp-relay-client -p scp-mls -p scp-client -p scp-event-log -p scp-client-wasm --target wasm32-unknown-unknown
+      # The store set's traits must stay satisfiable by a browser member, so its
+      # tests, which implement every member trait, compile for wasm32 too.
+      - run: cargo check -p scp-kel --tests --target wasm32-unknown-unknown
 
   wasm-test:
     needs: changes

@@ -5261,6 +5261,7 @@ dependencies = [
 name = "scp-kel"
 version = "0.1.0-beta.2"
 dependencies = [
+ "getrandom 0.3.4",
  "hex",
  "proptest",
  "rand_core 0.6.4",
