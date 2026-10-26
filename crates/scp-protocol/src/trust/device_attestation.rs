@@ -2,10 +2,10 @@
 //!
 //! This module holds the reader's public outcome types; in [`digest`], the
 //! four digests §9.3.1 defines: the binding digest `D`, the tag `T`, the
-//! assertion digest `A` and the policy digest `P`; the App Attest checks,
-//! which only the full reader calls, with a `D` it computed itself; and the
-//! owner's re-encoding of an attestation object,
-//! [`canonicalize_app_attest_object`].
+//! assertion digest `A` and the policy digest `P`; the App Attest checks, the
+//! Play Integrity checks and the `PlayIntegrityVerifier` entry parser, which
+//! only the full reader calls, with a `D` it computed itself; and the owner's
+//! re-encoding of an attestation object, [`canonicalize_app_attest_object`].
 
 #[cfg_attr(
     not(test),
@@ -17,6 +17,14 @@
 mod app_attest;
 mod cbor;
 pub mod digest;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the SCP-316 reader (keri/p6-reader-scp-316) is the first caller outside the tests"
+    )
+)]
+mod play_integrity;
 #[cfg(test)]
 mod test_ca;
 #[cfg_attr(
@@ -84,7 +92,7 @@ pub struct VerifiedDeviceAttestation {
 impl VerifiedDeviceAttestation {
     /// Builds the outcome of a read whose every check passed. Only the
     /// platform readers in this module call it.
-    pub(crate) const fn new(
+    const fn new(
         platform: DeviceAttestationPlatform,
         entry_id: String,
         credential: [u8; 32],
