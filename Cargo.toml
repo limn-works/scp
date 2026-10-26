@@ -125,6 +125,9 @@ tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+# The Public Suffix List, compiled in, for the WebAuthn registrable-domain rule
+# (09-security-model.md §9.7.4.1 item 4, the Passkey row's Browser cell).
+psl = "2.1"
 ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
 rand = "0.8"
 hmac = "0.12"

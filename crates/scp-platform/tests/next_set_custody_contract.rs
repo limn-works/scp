@@ -12,7 +12,7 @@ use core::future::{Future, ready};
 use scp_platform::{
     BackupArtifact, BackupRequest, CustodyProbe, IndexedSignature, KeyEventSignError,
     KeyEventSigner, MaybeSend, NextSetCustody, NextSetCustodyError, NextSetKeyHandle,
-    PreRotationCustodyKind, ProbeSignature, SigningChange,
+    PreRotationCustodyKind, ProbeSignature, RestoreMaterial, SigningChange,
 };
 
 struct Complete;
@@ -71,7 +71,7 @@ impl NextSetCustody for Complete {
 
     fn restore(
         &self,
-        _artifact: BackupArtifact,
+        _material: RestoreMaterial,
         _expected_commitment: [u8; 32],
     ) -> impl Future<Output = Result<NextSetKeyHandle, NextSetCustodyError>> + Send {
         ready(Err(NextSetCustodyError::MethodNotOffered))
@@ -102,12 +102,15 @@ async fn a_complete_implementor_compiles_and_dispatches() -> Result<(), Box<dyn 
     Ok(())
 }
 
-/// `BackupArtifact`, `BackupRequest` and `PassphraseSource` name the method
-/// in their `Debug` output and never the secret.
+/// `BackupArtifact`, `RestoreMaterial`, `BackupRequest` and
+/// `PassphraseSource` name the method in their `Debug` output and never the
+/// secret.
 #[test]
 fn backup_types_redact_their_secrets() {
     use scp_platform::{ENCRYPTED_BACKUP_BYTES, PassphraseSource, SHAMIR_SHARE_BYTES};
     use zeroize::Zeroizing;
+
+    let share = || Zeroizing::new([0xAB; SHAMIR_SHARE_BYTES]);
 
     let secret = "hunter2-secret";
     let rendered = [
@@ -121,7 +124,26 @@ fn backup_types_redact_their_secrets() {
         format!(
             "{:?}",
             BackupArtifact::Shamir {
-                shares: vec![Zeroizing::new([0xAB; SHAMIR_SHARE_BYTES]); 3],
+                shares: [share(), share(), share(), share(), share()],
+            }
+        ),
+        format!(
+            "{:?}",
+            RestoreMaterial::Shamir {
+                shares: [share(), share(), share()],
+            }
+        ),
+        format!(
+            "{:?}",
+            RestoreMaterial::Encrypted {
+                backup: [0xAB; ENCRYPTED_BACKUP_BYTES],
+                passphrase: Zeroizing::new(secret.to_owned()),
+            }
+        ),
+        format!(
+            "{:?}",
+            RestoreMaterial::Paper {
+                words: Zeroizing::new(secret.to_owned()),
             }
         ),
         format!(
@@ -142,5 +164,44 @@ fn backup_types_redact_their_secrets() {
         assert!(!text.contains("171"), "{text}");
         assert!(!text.to_lowercase().contains("ab, "), "{text}");
     }
-    assert!(rendered[1].contains("share_count: 3"), "{}", rendered[1]);
+    assert!(rendered[1].contains("share_count: 5"), "{}", rendered[1]);
+    assert!(rendered[2].contains("share_count: 3"), "{}", rendered[2]);
+}
+
+/// Each request and each restore material names the custody kind of its
+/// method, which a headless custody compares with its own kind.
+#[test]
+fn requests_and_material_name_their_method_kind() {
+    use scp_platform::{ENCRYPTED_BACKUP_BYTES, PassphraseSource, SHAMIR_SHARE_BYTES};
+    use zeroize::Zeroizing;
+
+    let share = || Zeroizing::new([0u8; SHAMIR_SHARE_BYTES]);
+    let requests = [
+        BackupRequest::Encrypted {
+            passphrase: PassphraseSource::Generate,
+        },
+        BackupRequest::Shamir,
+        BackupRequest::Paper,
+    ];
+    let material = [
+        RestoreMaterial::Encrypted {
+            backup: [0; ENCRYPTED_BACKUP_BYTES],
+            passphrase: Zeroizing::new(String::new()),
+        },
+        RestoreMaterial::Shamir {
+            shares: [share(), share(), share()],
+        },
+        RestoreMaterial::Paper {
+            words: Zeroizing::new(String::new()),
+        },
+    ];
+    let kinds = [
+        PreRotationCustodyKind::EncryptedOfflineBackup,
+        PreRotationCustodyKind::ShamirSecretSharing,
+        PreRotationCustodyKind::PaperBackupBip39,
+    ];
+    for ((request, material), kind) in requests.iter().zip(&material).zip(kinds) {
+        assert_eq!(request.custody_kind(), kind, "{request:?}");
+        assert_eq!(material.custody_kind(), kind, "{material:?}");
+    }
 }

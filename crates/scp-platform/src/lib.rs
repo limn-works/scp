@@ -108,6 +108,6 @@ pub use traits::{
     ENCRYPTED_BACKUP_BYTES, KeyCustody, KeyHandle, KeyRole, KeyType, NextSetCustody,
     NextSetCustodyError, NextSetKeyHandle, PassphraseSource, PreRotationCustody,
     PreRotationCustodyError, PreRotationCustodyKind, PreRotationKeyHandle, Pseudonym, PublicKey,
-    Push, PushToken, SHAMIR_SHARE_BYTES, SharedSecret, Signature, Storage, WakeSignal,
-    refuse_key_event_mint, require_derive_source,
+    Push, PushToken, RestoreMaterial, SHAMIR_SHARE_BYTES, SHAMIR_SHARE_COUNT, SHAMIR_THRESHOLD,
+    SharedSecret, Signature, Storage, WakeSignal, refuse_key_event_mint, require_derive_source,
 };

@@ -27,7 +27,7 @@ use tokio::sync::Mutex;
 
 use crate::traits::{
     BackupArtifact, BackupRequest, NextSetCustody, NextSetCustodyError, NextSetKeyHandle,
-    PreRotationCustodyKind, generate_p256_os_rng, sign_key_event_digest,
+    PreRotationCustodyKind, RestoreMaterial, generate_p256_os_rng, sign_key_event_digest,
 };
 
 /// In-memory [`NextSetCustody`] for tests: software P-256 keys, raw-arm
@@ -137,7 +137,7 @@ impl NextSetCustody for InMemoryNextSetCustody {
     /// Refused for the reason [`seal_backup`](Self::seal_backup) is.
     async fn restore(
         &self,
-        _artifact: BackupArtifact,
+        _material: RestoreMaterial,
         _expected_commitment: [u8; 32],
     ) -> Result<NextSetKeyHandle, NextSetCustodyError> {
         Err(NextSetCustodyError::MethodNotOffered)
@@ -150,3 +150,17 @@ impl NextSetCustody for InMemoryNextSetCustody {
 
 // `scp_testing::next_set_custody_conformance!` runs the spec 16 §16.12.3a
 // suite against this custody (`crates/scp-testing/src/conformance/next_set_custody.rs`).
+
+#[cfg(test)]
+mod tests {
+    use super::InMemoryNextSetCustody;
+    use crate::traits::{NextSetCustody, PreRotationCustodyKind};
+
+    #[test]
+    fn declares_the_in_memory_kind() {
+        assert_eq!(
+            InMemoryNextSetCustody::new().custody_kind(),
+            PreRotationCustodyKind::InMemory
+        );
+    }
+}

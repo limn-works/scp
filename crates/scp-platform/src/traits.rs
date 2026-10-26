@@ -1463,6 +1463,14 @@ pub const ENCRYPTED_BACKUP_BYTES: usize = 77;
 /// (`09-security-model.md` §9.18.17): version, x, and 32-byte y.
 pub const SHAMIR_SHARE_BYTES: usize = 34;
 
+/// The number of Shamir shares a seal emits (`09-security-model.md`
+/// §9.7.4.1 item 4, the 3-of-5 split).
+pub const SHAMIR_SHARE_COUNT: usize = 5;
+
+/// The number of Shamir shares a restore combines (`09-security-model.md`
+/// §9.7.4.1 item 4, the 3-of-5 split).
+pub const SHAMIR_THRESHOLD: usize = 3;
+
 /// Where the passphrase of an encrypted offline backup comes from
 /// (`09-security-model.md` §9.7.4.1 item 4, the sealing window).
 pub enum PassphraseSource {
@@ -1497,9 +1505,28 @@ pub enum BackupRequest {
     Paper,
 }
 
-/// A copyable artifact of one next-set key: what
-/// [`NextSetCustody::seal_backup`] emits and [`NextSetCustody::restore`]
-/// takes (`09-security-model.md` §9.7.4.1 item 4).
+impl BackupRequest {
+    /// The custody kind whose method this request names. A headless custody
+    /// refuses, with [`NextSetCustodyError::MethodNotOffered`], a request
+    /// whose kind differs from its own
+    /// [`custody_kind`](NextSetCustody::custody_kind).
+    #[must_use]
+    pub const fn custody_kind(&self) -> PreRotationCustodyKind {
+        match self {
+            Self::Encrypted { .. } => PreRotationCustodyKind::EncryptedOfflineBackup,
+            Self::Shamir => PreRotationCustodyKind::ShamirSecretSharing,
+            Self::Paper => PreRotationCustodyKind::PaperBackupBip39,
+        }
+    }
+}
+
+/// The copyable artifact of one next-set key that
+/// [`NextSetCustody::seal_backup`] emits (`09-security-model.md` §9.7.4.1
+/// item 4).
+///
+/// [`NextSetCustody::restore`] takes a [`RestoreMaterial`], which
+/// holds the three Shamir shares a restore combines where this type holds
+/// the five a seal emits.
 ///
 /// Its `Debug` output names the method and redacts every secret.
 pub enum BackupArtifact {
@@ -1511,10 +1538,11 @@ pub enum BackupArtifact {
         /// The passphrase.
         passphrase: zeroize::Zeroizing<String>,
     },
-    /// Shamir shares: the five a seal emits, or the three a restore combines.
+    /// The five Shamir shares a seal emits.
     Shamir {
-        /// The shares, each `SHAMIR_SHARE_BYTES` bytes.
-        shares: Vec<zeroize::Zeroizing<[u8; SHAMIR_SHARE_BYTES]>>,
+        /// The shares, each `SHAMIR_SHARE_BYTES` bytes, held in place so no
+        /// reallocation leaves a copy in freed memory.
+        shares: [zeroize::Zeroizing<[u8; SHAMIR_SHARE_BYTES]>; SHAMIR_SHARE_COUNT],
     },
     /// The 24 BIP39 English words, joined by single ASCII spaces.
     Paper {
@@ -1524,6 +1552,58 @@ pub enum BackupArtifact {
 }
 
 impl std::fmt::Debug for BackupArtifact {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Encrypted { .. } => f.debug_struct("Encrypted").finish_non_exhaustive(),
+            Self::Shamir { shares } => f
+                .debug_struct("Shamir")
+                .field("share_count", &shares.len())
+                .finish_non_exhaustive(),
+            Self::Paper { .. } => f.debug_struct("Paper").finish_non_exhaustive(),
+        }
+    }
+}
+
+/// What [`NextSetCustody::restore`] reconstructs a next-set key from
+/// (`09-security-model.md` §9.7.4.1 item 4, restore).
+///
+/// Its `Debug` output names the method and redacts every secret.
+pub enum RestoreMaterial {
+    /// An encrypted offline backup and the passphrase that opens it.
+    Encrypted {
+        /// The `ENCRYPTED_BACKUP_BYTES`-byte backup.
+        backup: [u8; ENCRYPTED_BACKUP_BYTES],
+        /// The passphrase.
+        passphrase: zeroize::Zeroizing<String>,
+    },
+    /// Three of the five Shamir shares a seal emitted.
+    Shamir {
+        /// The shares, each `SHAMIR_SHARE_BYTES` bytes.
+        shares: [zeroize::Zeroizing<[u8; SHAMIR_SHARE_BYTES]>; SHAMIR_THRESHOLD],
+    },
+    /// The 24 BIP39 English words, joined by single ASCII spaces.
+    Paper {
+        /// The words.
+        words: zeroize::Zeroizing<String>,
+    },
+}
+
+impl RestoreMaterial {
+    /// The custody kind whose method this material belongs to. A headless
+    /// custody refuses, with [`NextSetCustodyError::MethodNotOffered`],
+    /// material whose kind differs from its own
+    /// [`custody_kind`](NextSetCustody::custody_kind).
+    #[must_use]
+    pub const fn custody_kind(&self) -> PreRotationCustodyKind {
+        match self {
+            Self::Encrypted { .. } => PreRotationCustodyKind::EncryptedOfflineBackup,
+            Self::Shamir { .. } => PreRotationCustodyKind::ShamirSecretSharing,
+            Self::Paper { .. } => PreRotationCustodyKind::PaperBackupBip39,
+        }
+    }
+}
+
+impl std::fmt::Debug for RestoreMaterial {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Encrypted { .. } => f.debug_struct("Encrypted").finish_non_exhaustive(),
@@ -1553,7 +1633,7 @@ impl std::fmt::Debug for BackupArtifact {
 /// use scp_platform::{
 ///     BackupArtifact, BackupRequest, CustodyProbe, KeyEventSignError, KeyEventSigner,
 ///     MaybeSend, NextSetCustody, NextSetCustodyError, NextSetKeyHandle,
-///     PreRotationCustodyKind, ProbeSignature,
+///     PreRotationCustodyKind, ProbeSignature, RestoreMaterial,
 /// };
 ///
 /// struct Partial;
@@ -1601,7 +1681,7 @@ impl std::fmt::Debug for BackupArtifact {
 ///
 ///     fn restore(
 ///         &self,
-///         _artifact: BackupArtifact,
+///         _material: RestoreMaterial,
 ///         _expected_commitment: [u8; 32],
 ///     ) -> impl Future<Output = Result<NextSetKeyHandle, NextSetCustodyError>> + Send {
 ///         async { Err(NextSetCustodyError::MethodNotOffered) }
@@ -1620,7 +1700,7 @@ impl std::fmt::Debug for BackupArtifact {
 /// use scp_platform::{
 ///     BackupArtifact, BackupRequest, CustodyProbe, IndexedSignature, KeyEventSignError,
 ///     KeyEventSigner, MaybeSend, NextSetCustody, NextSetCustodyError, NextSetKeyHandle,
-///     PreRotationCustodyKind, ProbeSignature, SigningChange,
+///     PreRotationCustodyKind, ProbeSignature, RestoreMaterial, SigningChange,
 /// };
 ///
 /// struct Partial;
@@ -1676,7 +1756,7 @@ impl std::fmt::Debug for BackupArtifact {
 ///
 ///     fn restore(
 ///         &self,
-///         _artifact: BackupArtifact,
+///         _material: RestoreMaterial,
 ///         _expected_commitment: [u8; 32],
 ///     ) -> impl Future<Output = Result<NextSetKeyHandle, NextSetCustodyError>> + Send {
 ///         async { Err(NextSetCustodyError::MethodNotOffered) }
@@ -1724,30 +1804,40 @@ pub trait NextSetCustody: Send + Sync + scp_kel::KeyEventSigner<Member = NextSet
     /// Emits the copyable artifact `request` names for the key under
     /// `handle`, wipes the key's scalar from the custody, and keeps its
     /// public key (`09-security-model.md` §9.7.4.1 item 4, the sealing
-    /// window).
+    /// window). Only a headless custody seals, and only by the method its
+    /// [`custody_kind`](Self::custody_kind) declares. The sealing-window
+    /// errors §9.7.4.1 names arrive with the headless custody.
     ///
     /// # Errors
     ///
-    /// [`NextSetCustodyError::MethodNotOffered`] from every custody that is
-    /// not headless, whatever `request` names.
+    /// - [`NextSetCustodyError::MethodNotOffered`] from every custody that is
+    ///   not headless, whatever `request` names, and from a headless custody
+    ///   when [`BackupRequest::custody_kind`] differs from its own kind.
+    /// - [`NextSetCustodyError::HandleNotFound`] from a headless custody when
+    ///   `handle` names no key it holds.
     fn seal_backup(
         &self,
         handle: &NextSetKeyHandle,
         request: BackupRequest,
     ) -> impl std::future::Future<Output = Result<BackupArtifact, NextSetCustodyError>> + Send;
 
-    /// Reconstructs a key from `artifact` inside the custody and returns its
+    /// Reconstructs a key from `material` inside the custody and returns its
     /// handle, never its scalar (`09-security-model.md` §9.7.4.1 item 4,
     /// restore). `expected_commitment` is the pre-rotation commitment the
-    /// restored key must derive.
+    /// caller expects the restored key to derive. Only a headless custody
+    /// restores, and only material of the method its
+    /// [`custody_kind`](Self::custody_kind) declares. The check of
+    /// `expected_commitment`, and the error that reports a mismatch, arrive
+    /// with the headless custody.
     ///
     /// # Errors
     ///
     /// [`NextSetCustodyError::MethodNotOffered`] from every custody that is
-    /// not headless, whatever `artifact` holds.
+    /// not headless, whatever `material` holds, and from a headless custody
+    /// when [`RestoreMaterial::custody_kind`] differs from its own kind.
     fn restore(
         &self,
-        artifact: BackupArtifact,
+        material: RestoreMaterial,
         expected_commitment: [u8; 32],
     ) -> impl std::future::Future<Output = Result<NextSetKeyHandle, NextSetCustodyError>> + Send;
 

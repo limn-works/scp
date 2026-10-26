@@ -5,25 +5,42 @@
 //!
 //! [`CustodyType::offered_on`] encodes the method-by-profile table, then the
 //! build state of the methods whose custody this build does not yet ship.
-//! [`CustodyDisclosure::at_selection`] encodes the four-cell table's residual
-//! for a selection and the root and pre-rotation co-residence.
+//! [`CustodyDisclosure::at_selection`] states the four-cell table's columns
+//! for a selection, the root and pre-rotation co-residence, and the
+//! separations the SDK offers. Every type here is a unit enum or a record of
+//! public fields, so each crosses every binding in one shape.
 
 use std::fmt;
 
 use crate::key_state::CustodyType;
 
-/// Where an SDK runs (`09-security-model.md` §9.7.4.1 item 4). A profile is
-/// a property of a running SDK, never of an identity.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// Where an SDK runs (`09-security-model.md` §9.7.4.1 item 4, the custody
+/// profile).
+///
+/// The SDK computes it from one question with three answers: does
+/// this platform expose a `WebAuthn` credential API this process may call,
+/// and if so does that API arrive through a desktop platform credential
+/// provider, a mobile one, or a page's `navigator.credentials`. Whether a
+/// human attends decides nothing. A profile is a property of a running SDK,
+/// never of an identity.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum CustodyProfile {
-    /// A server or other process with no attending user.
+    /// The platform exposes no `WebAuthn` credential API this process may
+    /// call.
     Headless,
-    /// A desktop application.
+    /// The process may call a `WebAuthn` credential API, and it arrives
+    /// through a desktop platform credential provider.
     Desktop,
-    /// A mobile application.
+    /// The process may call a `WebAuthn` credential API, and it arrives
+    /// through a mobile platform credential provider.
     Mobile,
-    /// The in-browser client.
-    Browser,
+    /// The process may call a `WebAuthn` credential API, and it arrives
+    /// through a page's `navigator.credentials`.
+    Browser {
+        /// The page's origin and the relying-party identifier the passkey is
+        /// registered against.
+        origin: RpOrigin,
+    },
 }
 
 impl fmt::Display for CustodyProfile {
@@ -32,44 +49,57 @@ impl fmt::Display for CustodyProfile {
             Self::Headless => "Headless",
             Self::Desktop => "Desktop",
             Self::Mobile => "Mobile",
-            Self::Browser => "Browser",
+            Self::Browser { .. } => "Browser",
         })
     }
 }
 
-/// The browser origin a passkey would be used from, and the relying-party
-/// identifier the passkey was registered against.
-///
-/// [`new`](Self::new) checks that both are lowercase-folded ASCII DNS names
-/// and nothing more; [`CustodyType::offered_on`] checks whether the origin's
-/// effective domain falls under the identifier.
+/// The two names an [`RpOrigin`] is built from.
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RpOriginConfig {
+    /// The page origin's effective domain: a host name such as
+    /// `login.example.com`, without scheme or port.
+    pub effective_domain: String,
+    /// The relying-party identifier the passkey is registered against, such
+    /// as `example.com`.
+    pub rp_id: String,
+}
+
+/// A page origin's effective domain and the relying-party identifier a
+/// passkey is registered against, each a lowercase DNS name.
+///
+/// [`new`](Self::new) refuses a relying-party identifier that is a public
+/// suffix. The [`CustodyProfile::Browser`] cell of the `Passkey` row then
+/// asks whether the identifier is the effective domain or a registrable-domain
+/// suffix of it, which is the HTML Standard's "is a registrable domain suffix
+/// of or is equal to" over the Public Suffix List the `psl` crate compiles
+/// in, including its private section.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RpOrigin {
     effective_domain: String,
     rp_id: String,
 }
 
 impl RpOrigin {
-    /// Validates `effective_domain` and `rp_id` as DNS names, folding ASCII
-    /// to lowercase.
+    /// Validates both names, folding ASCII to lowercase.
     ///
     /// A name has labels of 1 to 63 characters from `a-z`, `0-9` and `-`,
     /// no label starting or ending with `-`, at most 253 characters in all,
-    /// no trailing dot, and a final label that is not all digits, which
-    /// rejects an IPv4 literal. `rp_id` must also have at least two labels,
-    /// so a single-label name such as a top-level domain is never the
-    /// identifier a suffix is checked against.
+    /// and no trailing dot. Its final label must not end in a number in the
+    /// WHATWG URL Standard's sense, being all digits or `0x` followed by hex
+    /// digits, since a URL parser reads such a host as an IPv4 address. The
+    /// relying-party identifier must not itself be a public suffix.
     ///
     /// # Errors
     ///
     /// [`RpOriginError::EffectiveDomain`] or [`RpOriginError::RpId`], naming
     /// the first rule the value breaks.
-    pub fn new(effective_domain: &str, rp_id: &str) -> Result<Self, RpOriginError> {
+    pub fn new(config: RpOriginConfig) -> Result<Self, RpOriginError> {
         let effective_domain =
-            dns_name(effective_domain).map_err(RpOriginError::EffectiveDomain)?;
-        let rp_id = dns_name(rp_id).map_err(RpOriginError::RpId)?;
-        if !rp_id.contains('.') {
-            return Err(RpOriginError::RpId(DomainRefusal::SingleLabel));
+            dns_name(config.effective_domain).map_err(RpOriginError::EffectiveDomain)?;
+        let rp_id = dns_name(config.rp_id).map_err(RpOriginError::RpId)?;
+        if psl::domain(rp_id.as_bytes()).is_none() {
+            return Err(RpOriginError::RpId(RpDomainRefusal::PublicSuffix));
         }
         Ok(Self {
             effective_domain,
@@ -89,67 +119,91 @@ impl RpOrigin {
         &self.rp_id
     }
 
-    /// Whether the effective domain is the relying-party identifier or a
-    /// subdomain of it, which is the `WebAuthn` registrable-suffix rule the
-    /// `Passkey` row's Browser cell names.
+    /// Whether the relying-party identifier is the effective domain or a
+    /// registrable-domain suffix of it. [`new`](Self::new) has refused an
+    /// identifier that is a public suffix; this refuses an identifier that
+    /// reaches into the effective domain's own public suffix, as
+    /// `amazonaws.com` does under `bucket.s3.amazonaws.com`.
     fn within_rp_suffix(&self) -> bool {
-        self.effective_domain == self.rp_id
-            || self
-                .effective_domain
-                .strip_suffix(self.rp_id.as_str())
-                .is_some_and(|head| head.ends_with('.'))
+        if self.effective_domain == self.rp_id {
+            return true;
+        }
+        let Some(head) = self.effective_domain.strip_suffix(self.rp_id.as_str()) else {
+            return false;
+        };
+        if !head.ends_with('.') {
+            return false;
+        }
+        let Some(public_suffix) = psl::suffix(self.effective_domain.as_bytes()) else {
+            return false;
+        };
+        let public_suffix = public_suffix.as_bytes();
+        let reaches_suffix = public_suffix == self.rp_id.as_bytes()
+            || public_suffix
+                .strip_suffix(self.rp_id.as_bytes())
+                .is_some_and(|rest| rest.ends_with(b"."));
+        !reaches_suffix
     }
 }
 
 /// Folds `name` to lowercase and checks the DNS-name rules
-/// [`RpOrigin::new`] lists.
-fn dns_name(name: &str) -> Result<String, DomainRefusal> {
+/// [`RpOrigin::new`] lists, all but the public-suffix rule.
+fn dns_name(mut name: String) -> Result<String, RpDomainRefusal> {
     if name.is_empty() {
-        return Err(DomainRefusal::Empty);
+        return Err(RpDomainRefusal::Empty);
     }
     if name.len() > 253 {
-        return Err(DomainRefusal::TooLong);
+        return Err(RpDomainRefusal::TooLong);
     }
-    let name = name.to_ascii_lowercase();
+    name.make_ascii_lowercase();
     let mut last = "";
     for label in name.split('.') {
         if label.is_empty() {
-            return Err(DomainRefusal::EmptyLabel);
+            return Err(RpDomainRefusal::EmptyLabel);
         }
         if label.len() > 63 {
-            return Err(DomainRefusal::LabelTooLong);
+            return Err(RpDomainRefusal::LabelTooLong);
         }
         if !label
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
         {
-            return Err(DomainRefusal::BadCharacter);
+            return Err(RpDomainRefusal::BadCharacter);
         }
         if label.starts_with('-') || label.ends_with('-') {
-            return Err(DomainRefusal::HyphenAtLabelEdge);
+            return Err(RpDomainRefusal::HyphenAtLabelEdge);
         }
         last = label;
     }
-    if last.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(DomainRefusal::NumericFinalLabel);
+    if ends_in_a_number(last) {
+        return Err(RpDomainRefusal::EndsInANumber);
     }
     Ok(name)
+}
+
+/// The WHATWG URL Standard's "ends in a number" test on a lowercase final
+/// label: all digits, or `0x` followed by zero or more hex digits.
+fn ends_in_a_number(last: &str) -> bool {
+    last.bytes().all(|byte| byte.is_ascii_digit())
+        || last
+            .strip_prefix("0x")
+            .is_some_and(|hex| hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
 
 /// Which half of an [`RpOrigin`] failed validation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RpOriginError {
     /// The origin's effective domain is not a DNS name.
-    #[error("the origin's effective domain is not a DNS name: {0}")]
-    EffectiveDomain(DomainRefusal),
-    /// The relying-party identifier is not a DNS name of two or more labels.
-    #[error("the relying-party identifier is not a DNS name of two or more labels: {0}")]
-    RpId(DomainRefusal),
+    #[error("the origin's effective domain is refused: {0}")]
+    EffectiveDomain(RpDomainRefusal),
+    /// The relying-party identifier is not a DNS name, or is a public suffix.
+    #[error("the relying-party identifier is refused: {0}")]
+    RpId(RpDomainRefusal),
 }
 
-/// The DNS-name rule a value breaks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum DomainRefusal {
+/// The rule a name breaks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, thiserror::Error)]
+pub enum RpDomainRefusal {
     /// The name is empty.
     #[error("the name is empty")]
     Empty,
@@ -168,74 +222,64 @@ pub enum DomainRefusal {
     /// A label starts or ends with `-`.
     #[error("a label starts or ends with -")]
     HyphenAtLabelEdge,
-    /// The final label is all digits, as in an IPv4 literal.
-    #[error("the final label is all digits")]
-    NumericFinalLabel,
-    /// The relying-party identifier has one label.
-    #[error("the name has one label")]
-    SingleLabel,
+    /// The final label ends in a number, so a URL parser reads the name as
+    /// an IPv4 address.
+    #[error("the final label ends in a number")]
+    EndsInANumber,
+    /// The relying-party identifier is a public suffix, such as `co.uk` or
+    /// `github.io`.
+    #[error("the name is a public suffix")]
+    PublicSuffix,
 }
 
 /// Whether the SDK offers a custody method on a profile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Offer {
+pub enum CustodyOffer {
     /// The method conforms on the profile and this build ships it.
     Offered,
     /// The method does not conform on the profile, so the SDK MUST NOT offer
     /// it there (`09-security-model.md` §9.7.4.1 item 4, "Method by
     /// profile").
     NotConforming,
-    /// The method conforms on the profile, but this build ships no custody
-    /// for it.
-    NotBuilt(NotBuiltReason),
-}
-
-/// Why a build ships no custody for a conforming method.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum NotBuiltReason {
-    /// The `Fido2Token` and `Hsm` custodies wait on a ruling on hardware
-    /// custody.
+    /// `Fido2Token` or `Hsm` conforms on the profile, and this build ships no
+    /// custody for it while Alec's ruling on hardware custody is open
+    /// (`00-open-questions.md` §Identity and Custody, "Whether hardware
+    /// next-set custody ships with SCP-311's software and callback
+    /// custodies").
     HardwareCustodyAwaitingRuling,
-    /// The three copyable headless methods wait on a ruling on the server
-    /// floor.
+    /// A copyable method conforms on the profile, and this build ships no
+    /// custody for it while Alec's ruling on the headless floor is open
+    /// (`00-open-questions.md` §Identity and Custody, "The headless
+    /// pre-rotation floor").
     ServerFloorAwaitingRuling,
 }
 
-/// Whether a build ships one custody.
+/// Which gated custodies a build ships, each `true` when it does. The crate
+/// root does not export it, so only scp-did names a build state.
+/// [`CustodyType::offered_on`] reads [`THIS_BUILD`]; tests reach
+/// [`CustodyType::offer_under`] with other values so both states of each
+/// custody stay tested.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum BuildState {
-    /// The build ships the custody.
-    Built,
-    /// The build ships no custody for the method.
-    NotBuilt,
-}
-
-/// Which gated custodies a build ships. [`CustodyType::offered_on`] reads it
-/// only for a method that conforms on the profile.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct BuiltCustodies {
+pub struct CustodyBuilds {
     /// The `Fido2Token` custody.
-    pub fido2_token: BuildState,
+    pub fido2_token: bool,
     /// The `Hsm` custody.
-    pub hsm: BuildState,
+    pub hsm: bool,
     /// The custody behind `EncryptedOfflineBackup`, `ShamirShares` and
     /// `PaperBackup`.
-    pub headless_backup: BuildState,
+    pub headless_backup: bool,
 }
 
-impl BuiltCustodies {
-    /// What this build ships: none of the gated custodies.
-    // Stub — see SCP-311: the FIDO2, HSM and headless-backup custodies land
-    // with their own pull requests, and each flips its field to `Built`.
-    #[must_use]
-    pub const fn this_build() -> Self {
-        Self {
-            fido2_token: BuildState::NotBuilt,
-            hsm: BuildState::NotBuilt,
-            headless_backup: BuildState::NotBuilt,
-        }
-    }
-}
+/// What this build ships: none of the gated custodies.
+// Stub — see SCP-311: the headless-backup custody adds a cargo feature on
+// scp-did that sets `headless_backup`, and the FIDO2 and HSM
+// custodies set their fields when Alec's hardware-custody ruling lets them
+// ship. The state is scp-did's own, so no caller can assert it.
+pub const THIS_BUILD: CustodyBuilds = CustodyBuilds {
+    fido2_token: false,
+    hsm: false,
+    headless_backup: false,
+};
 
 impl CustodyType {
     /// Whether the SDK offers this method as pre-rotation custody on
@@ -243,59 +287,64 @@ impl CustodyType {
     /// profile").
     ///
     /// The table decides first: a method that does not conform on `profile`
-    /// is [`Offer::NotConforming`] whatever `built` says. A `Passkey` on
-    /// `Browser` conforms only with an `origin` whose effective domain is
-    /// the relying-party identifier or a subdomain of it; without an origin
-    /// it does not conform. On every other profile `origin` is not read. A
-    /// conforming `Fido2Token`, `Hsm` or copyable method is then
-    /// [`Offer::NotBuilt`] when `built` marks its custody not built.
+    /// is [`CustodyOffer::NotConforming`] whatever this build ships. A
+    /// `Passkey` on [`CustodyProfile::Browser`] conforms only when its
+    /// origin's relying-party identifier is the effective domain or a
+    /// registrable-domain suffix of it. A conforming `Fido2Token`, `Hsm` or
+    /// copyable method is then refused with the open ruling its custody
+    /// waits on when this build does not ship that custody.
     #[must_use]
-    pub fn offered_on(
+    pub fn offered_on(self, profile: &CustodyProfile) -> CustodyOffer {
+        self.offer_under(profile, THIS_BUILD)
+    }
+
+    /// [`offered_on`](Self::offered_on) under the build state `builds`.
+    pub(crate) fn offer_under(
         self,
-        profile: CustodyProfile,
-        origin: Option<&RpOrigin>,
-        built: BuiltCustodies,
-    ) -> Offer {
+        profile: &CustodyProfile,
+        builds: CustodyBuilds,
+    ) -> CustodyOffer {
         use CustodyProfile::{Browser, Desktop, Headless, Mobile};
         let conforms = match self {
             Self::Passkey => match profile {
                 Headless => false,
                 Desktop | Mobile => true,
-                Browser => origin.is_some_and(RpOrigin::within_rp_suffix),
+                Browser { origin } => origin.within_rp_suffix(),
             },
             Self::Fido2Token => true,
             Self::Hsm => match profile {
                 Headless | Desktop | Mobile => true,
-                Browser => false,
+                Browser { .. } => false,
             },
             Self::EncryptedOfflineBackup | Self::ShamirShares | Self::PaperBackup => {
                 match profile {
                     Headless => true,
-                    Desktop | Mobile | Browser => false,
+                    Desktop | Mobile | Browser { .. } => false,
                 }
             }
             Self::SecureEnclave | Self::AndroidKeystore | Self::Software => false,
         };
         if !conforms {
-            return Offer::NotConforming;
+            return CustodyOffer::NotConforming;
         }
-        let (state, reason) = match self {
+        let (built, refusal) = match self {
             Self::Fido2Token => (
-                built.fido2_token,
-                NotBuiltReason::HardwareCustodyAwaitingRuling,
+                builds.fido2_token,
+                CustodyOffer::HardwareCustodyAwaitingRuling,
             ),
-            Self::Hsm => (built.hsm, NotBuiltReason::HardwareCustodyAwaitingRuling),
+            Self::Hsm => (builds.hsm, CustodyOffer::HardwareCustodyAwaitingRuling),
             Self::EncryptedOfflineBackup | Self::ShamirShares | Self::PaperBackup => (
-                built.headless_backup,
-                NotBuiltReason::ServerFloorAwaitingRuling,
+                builds.headless_backup,
+                CustodyOffer::ServerFloorAwaitingRuling,
             ),
             Self::Passkey | Self::SecureEnclave | Self::AndroidKeystore | Self::Software => {
-                return Offer::Offered;
+                return CustodyOffer::Offered;
             }
         };
-        match state {
-            BuildState::Built => Offer::Offered,
-            BuildState::NotBuilt => Offer::NotBuilt(reason),
+        if built {
+            CustodyOffer::Offered
+        } else {
+            refusal
         }
     }
 }
@@ -315,9 +364,9 @@ pub enum PreRotationResidence {
 }
 
 /// Whether the party holding a copy of the pre-rotation key also holds the
-/// standing root (the four-cell table's columns).
+/// standing root: the four-cell table's two columns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum CopyHolder {
+pub enum CustodyCopyHolder {
     /// The copy holder holds the root.
     HoldsRoot,
     /// The copy holder holds no root.
@@ -327,7 +376,7 @@ pub enum CopyHolder {
 /// One cell of the four-cell outcome table (`09-security-model.md`
 /// §9.7.4.1 item 4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum FourCellOutcome {
+pub enum CustodyFourCellOutcome {
     /// Both suffixes are rank 1; the identity is contested, terminal by key
     /// material.
     ContestedRank1,
@@ -340,47 +389,42 @@ pub enum FourCellOutcome {
     ContestedRank2,
 }
 
-/// The part of the four-cell table that applies to a selection: whether the
-/// copy holder holds the root, and the outcome under each kind of revealing
-/// event the controller can publish.
+/// One column of the four-cell table: who the copy holder is, and the
+/// outcome under each of the two rows, the kinds of revealing event the
+/// controller can publish.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct ResidualRow {
-    copy_holder: CopyHolder,
-}
-
-impl ResidualRow {
+pub struct CustodyColumn {
     /// Whether the copy holder holds the root.
-    #[must_use]
-    pub const fn copy_holder(&self) -> CopyHolder {
-        self.copy_holder
-    }
-
+    pub copy_holder: CustodyCopyHolder,
     /// The outcome when the controller's revealing event carried the
     /// standing root's signature.
-    #[must_use]
-    pub const fn root_cosigned(&self) -> FourCellOutcome {
-        match self.copy_holder {
-            CopyHolder::HoldsRoot => FourCellOutcome::ContestedRank1,
-            CopyHolder::HoldsNoRoot => FourCellOutcome::ControllerWins,
-        }
-    }
-
+    pub root_cosigned: CustodyFourCellOutcome,
     /// The outcome when the controller's revealing event carried no root
     /// signature.
-    #[must_use]
-    pub const fn no_root_signature(&self) -> FourCellOutcome {
-        match self.copy_holder {
-            CopyHolder::HoldsRoot => FourCellOutcome::ForkWins,
-            CopyHolder::HoldsNoRoot => FourCellOutcome::ContestedRank2,
-        }
+    pub no_root_signature: CustodyFourCellOutcome,
+}
+
+/// The column of the four-cell table for `copy_holder`.
+const fn column(copy_holder: CustodyCopyHolder) -> CustodyColumn {
+    match copy_holder {
+        CustodyCopyHolder::HoldsRoot => CustodyColumn {
+            copy_holder,
+            root_cosigned: CustodyFourCellOutcome::ContestedRank1,
+            no_root_signature: CustodyFourCellOutcome::ForkWins,
+        },
+        CustodyCopyHolder::HoldsNoRoot => CustodyColumn {
+            copy_holder,
+            root_cosigned: CustodyFourCellOutcome::ControllerWins,
+            no_root_signature: CustodyFourCellOutcome::ContestedRank2,
+        },
     }
 }
 
 /// Whether the root and pre-rotation credentials share one platform account.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum CoResidence {
+pub enum CustodyCoResidence {
     /// Both sit behind one platform account's authentication factor. The SDK
-    /// states it and offers [`CustodyDisclosure::separations_to_offer`].
+    /// states it and offers [`CustodyDisclosure::separations`].
     OnePlatformAccount,
     /// The pre-rotation credential sits outside the root's platform account.
     Separate,
@@ -390,60 +434,79 @@ pub enum CoResidence {
 /// credentials share one platform account (`09-security-model.md` §9.7.4.1
 /// item 4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Separation {
+pub enum CustodySeparation {
     /// The pre-rotation credential on a FIDO2 security token.
     Fido2Token,
-    /// The pre-rotation credential under a second platform account.
+    /// The pre-rotation credential, a passkey, under a second platform
+    /// account.
     SecondPlatformAccount,
 }
 
 /// What the SDK states at custody selection (`09-security-model.md`
 /// §9.7.4.1 item 4, "One disclosure rule" and the co-residence paragraph).
-///
-/// Only [`at_selection`](Self::at_selection) builds one, so its fields always
-/// follow the four-cell table.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// [`at_selection`](Self::at_selection) computes every field.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CustodyDisclosure {
-    residual_row: Option<ResidualRow>,
-    co_residence: CoResidence,
+    /// The four-cell columns the SDK states. A passkey has the one its
+    /// residence decides. A copyable method has both, since the root's
+    /// custody can sit on the host that holds the artifact. A `Fido2Token`
+    /// or `Hsm` emits no copy and has none.
+    pub copy_holder_column: Vec<CustodyColumn>,
+    /// Whether the root and pre-rotation credentials share one platform
+    /// account.
+    pub co_residence: CustodyCoResidence,
+    /// The separations the SDK offers: when the credentials share one
+    /// platform account, each separation whose method the SDK offers on the
+    /// profile; none otherwise.
+    pub separations: Vec<CustodySeparation>,
 }
 
 impl CustodyDisclosure {
-    /// The disclosure for selecting `custody`, held at `residence`.
-    ///
-    /// A passkey carries a provider-retained copy, so it has a residual row:
-    /// under the root's platform account the copy holder holds the root, and
-    /// under a second account it holds none. The three copyable methods have
-    /// a residual row whose copy holder holds no root. `Fido2Token` and `Hsm`
-    /// emit no copy, so they have none.
+    /// The disclosure for selecting `custody` at `residence` on `profile`.
     ///
     /// # Errors
     ///
-    /// - [`DisclosureError::NotConformingOnAnyProfile`] for `SecureEnclave`,
-    ///   `AndroidKeystore` and `Software`.
-    /// - [`DisclosureError::PasskeyOutsidePlatformAccount`] for a passkey at
-    ///   [`PreRotationResidence::OutsidePlatformAccount`].
-    /// - [`DisclosureError::PlatformAccountWithoutPasskey`] for any other
-    ///   method under a platform account.
-    pub const fn at_selection(
+    /// - [`CustodyDisclosureError::NotOffered`] when
+    ///   [`CustodyType::offered_on`] does not offer `custody` on `profile`.
+    /// - [`CustodyDisclosureError::PasskeyOutsidePlatformAccount`] for a
+    ///   passkey at [`PreRotationResidence::OutsidePlatformAccount`].
+    /// - [`CustodyDisclosureError::PlatformAccountWithoutPasskey`] for any
+    ///   other method under a platform account.
+    pub fn at_selection(
         custody: CustodyType,
         residence: PreRotationResidence,
-    ) -> Result<Self, DisclosureError> {
-        let (copy_holder, co_residence) = match (custody, residence) {
+        profile: &CustodyProfile,
+    ) -> Result<Self, CustodyDisclosureError> {
+        Self::under(custody, residence, profile, THIS_BUILD)
+    }
+
+    /// [`at_selection`](Self::at_selection) under the build state `builds`.
+    pub(crate) fn under(
+        custody: CustodyType,
+        residence: PreRotationResidence,
+        profile: &CustodyProfile,
+        builds: CustodyBuilds,
+    ) -> Result<Self, CustodyDisclosureError> {
+        use CustodyCopyHolder::{HoldsNoRoot, HoldsRoot};
+        let offer = custody.offer_under(profile, builds);
+        if offer != CustodyOffer::Offered {
+            return Err(CustodyDisclosureError::NotOffered { custody, offer });
+        }
+        let (copy_holders, co_residence): (&[CustodyCopyHolder], _) = match (custody, residence) {
             (
                 CustodyType::SecureEnclave | CustodyType::AndroidKeystore | CustodyType::Software,
                 PreRotationResidence::RootPlatformAccount
                 | PreRotationResidence::SecondPlatformAccount
                 | PreRotationResidence::OutsidePlatformAccount,
-            ) => return Err(DisclosureError::NotConformingOnAnyProfile(custody)),
+            ) => return Err(CustodyDisclosureError::NotOffered { custody, offer }),
             (CustodyType::Passkey, PreRotationResidence::RootPlatformAccount) => {
-                (Some(CopyHolder::HoldsRoot), CoResidence::OnePlatformAccount)
+                (&[HoldsRoot], CustodyCoResidence::OnePlatformAccount)
             }
             (CustodyType::Passkey, PreRotationResidence::SecondPlatformAccount) => {
-                (Some(CopyHolder::HoldsNoRoot), CoResidence::Separate)
+                (&[HoldsNoRoot], CustodyCoResidence::Separate)
             }
             (CustodyType::Passkey, PreRotationResidence::OutsidePlatformAccount) => {
-                return Err(DisclosureError::PasskeyOutsidePlatformAccount);
+                return Err(CustodyDisclosureError::PasskeyOutsidePlatformAccount);
             }
             (
                 CustodyType::Fido2Token
@@ -453,61 +516,55 @@ impl CustodyDisclosure {
                 | CustodyType::PaperBackup,
                 PreRotationResidence::RootPlatformAccount
                 | PreRotationResidence::SecondPlatformAccount,
-            ) => return Err(DisclosureError::PlatformAccountWithoutPasskey(custody)),
+            ) => {
+                return Err(CustodyDisclosureError::PlatformAccountWithoutPasskey(
+                    custody,
+                ));
+            }
             (
                 CustodyType::Fido2Token | CustodyType::Hsm,
                 PreRotationResidence::OutsidePlatformAccount,
-            ) => (None, CoResidence::Separate),
+            ) => (&[], CustodyCoResidence::Separate),
             (
                 CustodyType::EncryptedOfflineBackup
                 | CustodyType::ShamirShares
                 | CustodyType::PaperBackup,
                 PreRotationResidence::OutsidePlatformAccount,
-            ) => (Some(CopyHolder::HoldsNoRoot), CoResidence::Separate),
+            ) => (&[HoldsRoot, HoldsNoRoot], CustodyCoResidence::Separate),
         };
-        let residual_row = match copy_holder {
-            Some(copy_holder) => Some(ResidualRow { copy_holder }),
-            None => None,
+        let separations = match co_residence {
+            CustodyCoResidence::OnePlatformAccount => [
+                (CustodySeparation::Fido2Token, CustodyType::Fido2Token),
+                (
+                    CustodySeparation::SecondPlatformAccount,
+                    CustodyType::Passkey,
+                ),
+            ]
+            .into_iter()
+            .filter(|(_, method)| method.offer_under(profile, builds) == CustodyOffer::Offered)
+            .map(|(separation, _)| separation)
+            .collect(),
+            CustodyCoResidence::Separate => Vec::new(),
         };
         Ok(Self {
-            residual_row,
+            copy_holder_column: copy_holders.iter().copied().map(column).collect(),
             co_residence,
+            separations,
         })
-    }
-
-    /// The four-cell residual the SDK states, or `None` for a method that
-    /// emits no copy.
-    #[must_use]
-    pub const fn residual_row(&self) -> Option<ResidualRow> {
-        self.residual_row
-    }
-
-    /// Whether the root and pre-rotation credentials share one platform
-    /// account.
-    #[must_use]
-    pub const fn co_residence(&self) -> CoResidence {
-        self.co_residence
-    }
-
-    /// The separations the SDK MUST offer: both when the credentials share
-    /// one platform account, none otherwise.
-    #[must_use]
-    pub const fn separations_to_offer(&self) -> &'static [Separation] {
-        match self.co_residence {
-            CoResidence::OnePlatformAccount => {
-                &[Separation::Fido2Token, Separation::SecondPlatformAccount]
-            }
-            CoResidence::Separate => &[],
-        }
     }
 }
 
 /// Why [`CustodyDisclosure::at_selection`] refused a selection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum DisclosureError {
-    /// The method conforms on no profile, so it is never selected.
-    #[error("{0} conforms as pre-rotation custody on no profile")]
-    NotConformingOnAnyProfile(CustodyType),
+pub enum CustodyDisclosureError {
+    /// The SDK does not offer the method on the profile.
+    #[error("{custody} is not offered on this profile: {offer:?}")]
+    NotOffered {
+        /// The selected method.
+        custody: CustodyType,
+        /// What [`CustodyType::offered_on`] answered.
+        offer: CustodyOffer,
+    },
     /// A passkey always lives under a platform account.
     #[error("a passkey lives under a platform account")]
     PasskeyOutsidePlatformAccount,
@@ -532,145 +589,119 @@ mod tests {
         CustodyType::Software,
     ];
 
-    const PROFILES: [CustodyProfile; 4] = [
-        CustodyProfile::Headless,
-        CustodyProfile::Desktop,
-        CustodyProfile::Mobile,
-        CustodyProfile::Browser,
-    ];
-
-    const ALL_BUILT: BuiltCustodies = BuiltCustodies {
-        fido2_token: BuildState::Built,
-        hsm: BuildState::Built,
-        headless_backup: BuildState::Built,
+    const ALL_BUILT: CustodyBuilds = CustodyBuilds {
+        fido2_token: true,
+        hsm: true,
+        headless_backup: true,
     };
 
-    type TestResult = Result<(), RpOriginError>;
+    const NONE_BUILT: CustodyBuilds = CustodyBuilds {
+        fido2_token: false,
+        hsm: false,
+        headless_backup: false,
+    };
 
-    fn in_suffix() -> Result<RpOrigin, RpOriginError> {
-        RpOrigin::new("login.Example.com", "example.com")
+    const YES: CustodyOffer = CustodyOffer::Offered;
+    const NO: CustodyOffer = CustodyOffer::NotConforming;
+    const HARDWARE: CustodyOffer = CustodyOffer::HardwareCustodyAwaitingRuling;
+    const FLOOR: CustodyOffer = CustodyOffer::ServerFloorAwaitingRuling;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn origin(effective_domain: &str, rp_id: &str) -> Result<RpOrigin, RpOriginError> {
+        RpOrigin::new(RpOriginConfig {
+            effective_domain: effective_domain.to_owned(),
+            rp_id: rp_id.to_owned(),
+        })
     }
 
-    /// The table's row for `custody`, Headless, Desktop, Mobile, Browser,
-    /// with an in-suffix origin on Browser and every custody built.
-    fn row(custody: CustodyType) -> Result<[Offer; 4], RpOriginError> {
-        let origin = in_suffix()?;
-        Ok(PROFILES.map(|profile| custody.offered_on(profile, Some(&origin), ALL_BUILT)))
+    fn browser(effective_domain: &str, rp_id: &str) -> Result<CustodyProfile, RpOriginError> {
+        Ok(CustodyProfile::Browser {
+            origin: origin(effective_domain, rp_id)?,
+        })
     }
 
-    const YES: Offer = Offer::Offered;
-    const NO: Offer = Offer::NotConforming;
-
-    #[test]
-    fn passkey_row() -> TestResult {
-        assert_eq!(row(CustodyType::Passkey)?, [NO, YES, YES, YES]);
-        Ok(())
+    /// Headless, Desktop, Mobile, and Browser from an origin inside the
+    /// relying-party suffix.
+    fn profiles() -> Result<[CustodyProfile; 4], RpOriginError> {
+        Ok([
+            CustodyProfile::Headless,
+            CustodyProfile::Desktop,
+            CustodyProfile::Mobile,
+            browser("login.Example.com", "example.com")?,
+        ])
     }
 
-    #[test]
-    fn fido2_token_row() -> TestResult {
-        assert_eq!(row(CustodyType::Fido2Token)?, [YES, YES, YES, YES]);
-        Ok(())
-    }
-
-    #[test]
-    fn hsm_row() -> TestResult {
-        assert_eq!(row(CustodyType::Hsm)?, [YES, YES, YES, NO]);
-        Ok(())
-    }
-
-    #[test]
-    fn encrypted_offline_backup_row() -> TestResult {
-        assert_eq!(row(CustodyType::EncryptedOfflineBackup)?, [YES, NO, NO, NO]);
-        Ok(())
-    }
-
-    #[test]
-    fn shamir_shares_row() -> TestResult {
-        assert_eq!(row(CustodyType::ShamirShares)?, [YES, NO, NO, NO]);
-        Ok(())
-    }
-
-    #[test]
-    fn paper_backup_row() -> TestResult {
-        assert_eq!(row(CustodyType::PaperBackup)?, [YES, NO, NO, NO]);
-        Ok(())
+    /// The table's row for `custody` across [`profiles`] under `builds`.
+    fn row(
+        custody: CustodyType,
+        builds: CustodyBuilds,
+    ) -> Result<[CustodyOffer; 4], RpOriginError> {
+        Ok(profiles()?.map(|profile| custody.offer_under(&profile, builds)))
     }
 
     #[test]
-    fn secure_enclave_row() -> TestResult {
-        assert_eq!(row(CustodyType::SecureEnclave)?, [NO, NO, NO, NO]);
-        Ok(())
-    }
-
-    #[test]
-    fn android_keystore_row() -> TestResult {
-        assert_eq!(row(CustodyType::AndroidKeystore)?, [NO, NO, NO, NO]);
-        Ok(())
-    }
-
-    #[test]
-    fn software_row() -> TestResult {
-        assert_eq!(row(CustodyType::Software)?, [NO, NO, NO, NO]);
-        Ok(())
-    }
-
-    #[test]
-    fn passkey_on_headless_is_not_offered_with_or_without_origin() -> TestResult {
-        let origin = in_suffix()?;
-        for origin in [None, Some(&origin)] {
-            assert_eq!(
-                CustodyType::Passkey.offered_on(CustodyProfile::Headless, origin, ALL_BUILT),
-                Offer::NotConforming
-            );
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn passkey_on_browser_needs_an_origin_under_the_rp_suffix() -> TestResult {
-        let offer = |origin: Option<&RpOrigin>| {
-            CustodyType::Passkey.offered_on(CustodyProfile::Browser, origin, ALL_BUILT)
-        };
-        assert_eq!(offer(None), Offer::NotConforming);
-        for (domain, expected) in [
-            ("example.com", Offer::Offered),
-            ("a.b.example.com", Offer::Offered),
-            ("evil.com", Offer::NotConforming),
-            ("notexample.com", Offer::NotConforming),
-            ("example.com.evil.com", Offer::NotConforming),
-            ("com", Offer::NotConforming),
+    fn every_cell_with_every_custody_built() -> TestResult {
+        for (custody, expected) in [
+            (CustodyType::Passkey, [NO, YES, YES, YES]),
+            (CustodyType::Fido2Token, [YES, YES, YES, YES]),
+            (CustodyType::Hsm, [YES, YES, YES, NO]),
+            (CustodyType::EncryptedOfflineBackup, [YES, NO, NO, NO]),
+            (CustodyType::ShamirShares, [YES, NO, NO, NO]),
+            (CustodyType::PaperBackup, [YES, NO, NO, NO]),
+            (CustodyType::SecureEnclave, [NO, NO, NO, NO]),
+            (CustodyType::AndroidKeystore, [NO, NO, NO, NO]),
+            (CustodyType::Software, [NO, NO, NO, NO]),
         ] {
-            let origin = RpOrigin::new(domain, "example.com")?;
-            assert_eq!(offer(Some(&origin)), expected, "{domain}");
-        }
-        // The suffix runs one way: a parent domain is not under its child.
-        let parent = RpOrigin::new("example.com", "login.example.com")?;
-        assert_eq!(offer(Some(&parent)), Offer::NotConforming);
-        Ok(())
-    }
-
-    #[test]
-    fn origin_is_not_read_off_browser() -> TestResult {
-        let outside = RpOrigin::new("evil.com", "example.com")?;
-        for profile in [CustodyProfile::Desktop, CustodyProfile::Mobile] {
-            assert_eq!(
-                CustodyType::Passkey.offered_on(profile, Some(&outside), ALL_BUILT),
-                Offer::Offered
-            );
+            assert_eq!(row(custody, ALL_BUILT)?, expected, "{custody}");
         }
         Ok(())
     }
 
+    /// Every gated method on every profile, in both build states: a
+    /// conforming cell answers the open ruling when its custody is not built
+    /// and `Offered` when it is, and a non-conforming cell answers
+    /// `NotConforming` in both.
     #[test]
-    fn secure_enclave_is_not_offered_on_any_profile_or_build() -> TestResult {
-        let origin = in_suffix()?;
-        for built in [ALL_BUILT, BuiltCustodies::this_build()] {
-            for profile in PROFILES {
+    fn every_gated_cell_in_both_build_states() -> TestResult {
+        for (custody, built, not_built) in [
+            (CustodyType::Fido2Token, [YES, YES, YES, YES], [HARDWARE; 4]),
+            (
+                CustodyType::Hsm,
+                [YES, YES, YES, NO],
+                [HARDWARE, HARDWARE, HARDWARE, NO],
+            ),
+            (
+                CustodyType::EncryptedOfflineBackup,
+                [YES, NO, NO, NO],
+                [FLOOR, NO, NO, NO],
+            ),
+            (
+                CustodyType::ShamirShares,
+                [YES, NO, NO, NO],
+                [FLOOR, NO, NO, NO],
+            ),
+            (
+                CustodyType::PaperBackup,
+                [YES, NO, NO, NO],
+                [FLOOR, NO, NO, NO],
+            ),
+        ] {
+            assert_eq!(row(custody, ALL_BUILT)?, built, "{custody} built");
+            assert_eq!(row(custody, NONE_BUILT)?, not_built, "{custody} not built");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn this_build_ships_no_gated_custody_and_offered_on_reads_it() -> TestResult {
+        assert_eq!(THIS_BUILD, NONE_BUILT);
+        for custody in ALL_TYPES {
+            for profile in profiles()? {
                 assert_eq!(
-                    CustodyType::SecureEnclave.offered_on(profile, Some(&origin), built),
-                    Offer::NotConforming,
-                    "{profile}"
+                    custody.offered_on(&profile),
+                    custody.offer_under(&profile, NONE_BUILT),
+                    "{custody} on {profile}"
                 );
             }
         }
@@ -678,64 +709,25 @@ mod tests {
     }
 
     #[test]
-    fn hardware_custody_is_not_built_in_this_build() {
-        let built = BuiltCustodies::this_build();
-        for custody in [CustodyType::Fido2Token, CustodyType::Hsm] {
-            assert_eq!(
-                custody.offered_on(CustodyProfile::Desktop, None, built),
-                Offer::NotBuilt(NotBuiltReason::HardwareCustodyAwaitingRuling),
-                "{custody}"
-            );
-        }
-        // Conformance decides before the build state.
-        assert_eq!(
-            CustodyType::Hsm.offered_on(CustodyProfile::Browser, None, built),
-            Offer::NotConforming
-        );
-    }
-
-    #[test]
-    fn copyable_methods_are_not_built_in_this_build() {
-        let built = BuiltCustodies::this_build();
-        for custody in [
-            CustodyType::EncryptedOfflineBackup,
-            CustodyType::ShamirShares,
-            CustodyType::PaperBackup,
-        ] {
-            assert_eq!(
-                custody.offered_on(CustodyProfile::Headless, None, built),
-                Offer::NotBuilt(NotBuiltReason::ServerFloorAwaitingRuling),
-                "{custody}"
-            );
-            assert_eq!(
-                custody.offered_on(CustodyProfile::Mobile, None, built),
-                Offer::NotConforming,
-                "{custody}"
-            );
-        }
-    }
-
-    #[test]
-    fn each_build_field_gates_only_its_own_methods() -> TestResult {
-        let origin = in_suffix()?;
+    fn each_build_field_gates_only_its_own_methods() {
         let cases = [
             (
-                BuiltCustodies {
-                    fido2_token: BuildState::NotBuilt,
+                CustodyBuilds {
+                    fido2_token: false,
                     ..ALL_BUILT
                 },
                 vec![CustodyType::Fido2Token],
             ),
             (
-                BuiltCustodies {
-                    hsm: BuildState::NotBuilt,
+                CustodyBuilds {
+                    hsm: false,
                     ..ALL_BUILT
                 },
                 vec![CustodyType::Hsm],
             ),
             (
-                BuiltCustodies {
-                    headless_backup: BuildState::NotBuilt,
+                CustodyBuilds {
+                    headless_backup: false,
                     ..ALL_BUILT
                 },
                 vec![
@@ -745,64 +737,122 @@ mod tests {
                 ],
             ),
         ];
-        for (built, gated) in cases {
+        for (builds, gated) in cases {
             for custody in ALL_TYPES {
-                let offer = custody.offered_on(CustodyProfile::Headless, Some(&origin), built);
-                let expected =
-                    custody.offered_on(CustodyProfile::Headless, Some(&origin), ALL_BUILT);
+                let offer = custody.offer_under(&CustodyProfile::Headless, builds);
                 if gated.contains(&custody) {
-                    assert!(matches!(offer, Offer::NotBuilt(_)), "{custody}: {offer:?}");
+                    assert!(matches!(offer, HARDWARE | FLOOR), "{custody}: {offer:?}");
                 } else {
-                    assert_eq!(offer, expected, "{custody}");
+                    assert_eq!(
+                        offer,
+                        custody.offer_under(&CustodyProfile::Headless, ALL_BUILT),
+                        "{custody}"
+                    );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn passkey_on_browser_needs_its_rp_id_to_be_a_registrable_suffix() -> TestResult {
+        for (effective_domain, rp_id, expected) in [
+            ("example.com", "example.com", YES),
+            ("a.b.example.com", "example.com", YES),
+            ("login.example.co.uk", "example.co.uk", YES),
+            ("evil.com", "example.com", NO),
+            ("notexample.com", "example.com", NO),
+            ("example.com.evil.com", "example.com", NO),
+            ("com", "example.com", NO),
+            // The suffix runs one way: a parent domain is not under its child.
+            ("example.com", "login.example.com", NO),
+            // `amazonaws.com` is registrable, but reaches into the origin's
+            // public suffix `s3.amazonaws.com`.
+            ("bucket.s3.amazonaws.com", "amazonaws.com", NO),
+        ] {
+            let profile = browser(effective_domain, rp_id)?;
+            assert_eq!(
+                CustodyType::Passkey.offered_on(&profile),
+                expected,
+                "{effective_domain} under {rp_id}"
+            );
         }
         Ok(())
     }
 
     #[test]
-    fn rp_origin_rejects_non_dns_names() {
-        for (domain, refusal) in [
-            ("", DomainRefusal::Empty),
-            ("a..com", DomainRefusal::EmptyLabel),
-            ("example.com.", DomainRefusal::EmptyLabel),
-            (".example.com", DomainRefusal::EmptyLabel),
-            ("exa mple.com", DomainRefusal::BadCharacter),
-            ("exämple.com", DomainRefusal::BadCharacter),
-            ("example.com:443", DomainRefusal::BadCharacter),
-            ("-a.com", DomainRefusal::HyphenAtLabelEdge),
-            ("a-.com", DomainRefusal::HyphenAtLabelEdge),
-            ("192.168.0.1", DomainRefusal::NumericFinalLabel),
+    fn rp_origin_refuses_a_public_suffix_rp_id() {
+        for (effective_domain, rp_id) in [
+            ("evil.github.io", "github.io"),
+            ("a.co.uk", "co.uk"),
+            ("example.com", "com"),
+            ("bucket.s3.amazonaws.com", "s3.amazonaws.com"),
         ] {
             assert_eq!(
-                RpOrigin::new(domain, "example.com"),
+                origin(effective_domain, rp_id),
+                Err(RpOriginError::RpId(RpDomainRefusal::PublicSuffix)),
+                "{effective_domain} under {rp_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn rp_origin_refuses_non_dns_names() {
+        for (domain, refusal) in [
+            ("", RpDomainRefusal::Empty),
+            ("a..com", RpDomainRefusal::EmptyLabel),
+            ("example.com.", RpDomainRefusal::EmptyLabel),
+            (".example.com", RpDomainRefusal::EmptyLabel),
+            ("exa mple.com", RpDomainRefusal::BadCharacter),
+            ("exämple.com", RpDomainRefusal::BadCharacter),
+            ("example.com:443", RpDomainRefusal::BadCharacter),
+            ("https://example.com", RpDomainRefusal::BadCharacter),
+            ("-a.com", RpDomainRefusal::HyphenAtLabelEdge),
+            ("a-.com", RpDomainRefusal::HyphenAtLabelEdge),
+            ("192.168.0.1", RpDomainRefusal::EndsInANumber),
+            ("1.2.3.0x4", RpDomainRefusal::EndsInANumber),
+            ("1.2.3.0X4", RpDomainRefusal::EndsInANumber),
+            ("a.0x", RpDomainRefusal::EndsInANumber),
+        ] {
+            assert_eq!(
+                origin(domain, "example.com"),
                 Err(RpOriginError::EffectiveDomain(refusal)),
                 "{domain:?}"
             );
         }
         let long_label = format!("{}.com", "a".repeat(64));
         assert_eq!(
-            RpOrigin::new(&long_label, "example.com"),
-            Err(RpOriginError::EffectiveDomain(DomainRefusal::LabelTooLong))
+            origin(&long_label, "example.com"),
+            Err(RpOriginError::EffectiveDomain(
+                RpDomainRefusal::LabelTooLong
+            ))
         );
         let long_name = format!("{}com", "a.".repeat(126));
         assert_eq!(
-            RpOrigin::new(&long_name, "example.com"),
-            Err(RpOriginError::EffectiveDomain(DomainRefusal::TooLong))
+            origin(&long_name, "example.com"),
+            Err(RpOriginError::EffectiveDomain(RpDomainRefusal::TooLong))
         );
         assert_eq!(
-            RpOrigin::new("example.com", "com"),
-            Err(RpOriginError::RpId(DomainRefusal::SingleLabel))
+            origin("example.com", "exa_mple.com"),
+            Err(RpOriginError::RpId(RpDomainRefusal::BadCharacter))
         );
         assert_eq!(
-            RpOrigin::new("example.com", "exa_mple.com"),
-            Err(RpOriginError::RpId(DomainRefusal::BadCharacter))
+            origin("example.com", "example.0x1f"),
+            Err(RpOriginError::RpId(RpDomainRefusal::EndsInANumber))
         );
     }
 
     #[test]
-    fn rp_origin_folds_case() -> TestResult {
-        let origin = RpOrigin::new("LOGIN.Example.COM", "EXAMPLE.com")?;
+    fn a_final_label_that_only_looks_numeric_is_a_name() -> Result<(), RpOriginError> {
+        // `0xg` is not hex, and `1a` is not all digits, so neither ends in a
+        // number.
+        origin("a.0xg", "example.com")?;
+        origin("a.1a", "example.com")?;
+        Ok(())
+    }
+
+    #[test]
+    fn rp_origin_folds_case() -> Result<(), RpOriginError> {
+        let origin = origin("LOGIN.Example.COM", "EXAMPLE.com")?;
         assert_eq!(origin.effective_domain(), "login.example.com");
         assert_eq!(origin.rp_id(), "example.com");
         Ok(())
@@ -810,116 +860,171 @@ mod tests {
 
     #[test]
     fn the_four_cells_follow_the_table() {
-        let holds_root = ResidualRow {
-            copy_holder: CopyHolder::HoldsRoot,
-        };
-        let holds_no_root = ResidualRow {
-            copy_holder: CopyHolder::HoldsNoRoot,
-        };
-        assert_eq!(holds_root.root_cosigned(), FourCellOutcome::ContestedRank1);
         assert_eq!(
-            holds_no_root.root_cosigned(),
-            FourCellOutcome::ControllerWins
+            column(CustodyCopyHolder::HoldsRoot),
+            CustodyColumn {
+                copy_holder: CustodyCopyHolder::HoldsRoot,
+                root_cosigned: CustodyFourCellOutcome::ContestedRank1,
+                no_root_signature: CustodyFourCellOutcome::ForkWins,
+            }
         );
-        assert_eq!(holds_root.no_root_signature(), FourCellOutcome::ForkWins);
         assert_eq!(
-            holds_no_root.no_root_signature(),
-            FourCellOutcome::ContestedRank2
+            column(CustodyCopyHolder::HoldsNoRoot),
+            CustodyColumn {
+                copy_holder: CustodyCopyHolder::HoldsNoRoot,
+                root_cosigned: CustodyFourCellOutcome::ControllerWins,
+                no_root_signature: CustodyFourCellOutcome::ContestedRank2,
+            }
         );
     }
 
     #[test]
-    fn default_passkey_discloses_co_residence_and_the_root_holding_column()
-    -> Result<(), DisclosureError> {
-        let disclosure = CustodyDisclosure::at_selection(
+    fn default_passkey_states_co_residence_and_the_root_holding_column() -> TestResult {
+        let disclosure = CustodyDisclosure::under(
             CustodyType::Passkey,
             PreRotationResidence::RootPlatformAccount,
+            &CustodyProfile::Desktop,
+            ALL_BUILT,
         )?;
-        assert_eq!(disclosure.co_residence(), CoResidence::OnePlatformAccount);
         assert_eq!(
-            disclosure.separations_to_offer(),
-            &[Separation::Fido2Token, Separation::SecondPlatformAccount]
-        );
-        assert_eq!(
-            disclosure.residual_row().map(|row| row.copy_holder()),
-            Some(CopyHolder::HoldsRoot)
+            disclosure,
+            CustodyDisclosure {
+                copy_holder_column: vec![column(CustodyCopyHolder::HoldsRoot)],
+                co_residence: CustodyCoResidence::OnePlatformAccount,
+                separations: vec![
+                    CustodySeparation::Fido2Token,
+                    CustodySeparation::SecondPlatformAccount
+                ],
+            }
         );
         Ok(())
     }
 
+    /// A separation whose method this build does not offer is not offered:
+    /// with no FIDO2 custody built, only the second platform account is.
     #[test]
-    fn second_account_passkey_still_has_a_residual() -> Result<(), DisclosureError> {
+    fn separations_list_only_offered_methods() -> TestResult {
+        for profile in [
+            CustodyProfile::Desktop,
+            CustodyProfile::Mobile,
+            browser("login.example.com", "example.com")?,
+        ] {
+            let disclosure = CustodyDisclosure::at_selection(
+                CustodyType::Passkey,
+                PreRotationResidence::RootPlatformAccount,
+                &profile,
+            )?;
+            assert_eq!(
+                disclosure.separations,
+                vec![CustodySeparation::SecondPlatformAccount],
+                "{profile}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn second_account_passkey_still_states_a_column() -> TestResult {
         let disclosure = CustodyDisclosure::at_selection(
             CustodyType::Passkey,
             PreRotationResidence::SecondPlatformAccount,
+            &CustodyProfile::Mobile,
         )?;
-        assert_eq!(disclosure.co_residence(), CoResidence::Separate);
-        assert!(disclosure.separations_to_offer().is_empty());
         assert_eq!(
-            disclosure.residual_row().map(|row| row.copy_holder()),
-            Some(CopyHolder::HoldsNoRoot)
+            disclosure,
+            CustodyDisclosure {
+                copy_holder_column: vec![column(CustodyCopyHolder::HoldsNoRoot)],
+                co_residence: CustodyCoResidence::Separate,
+                separations: Vec::new(),
+            }
         );
         Ok(())
     }
 
+    /// The root's custody does not decide whether the holder of a copyable
+    /// artifact also holds the root, so the SDK states both columns.
     #[test]
-    fn copyable_methods_disclose_a_residual_and_hardware_does_not() -> Result<(), DisclosureError> {
+    fn copyable_methods_state_both_columns_and_hardware_states_none() -> TestResult {
         for custody in [
             CustodyType::EncryptedOfflineBackup,
             CustodyType::ShamirShares,
             CustodyType::PaperBackup,
         ] {
-            let disclosure = CustodyDisclosure::at_selection(
+            let disclosure = CustodyDisclosure::under(
                 custody,
                 PreRotationResidence::OutsidePlatformAccount,
+                &CustodyProfile::Headless,
+                ALL_BUILT,
             )?;
             assert_eq!(
-                disclosure.residual_row().map(|row| row.copy_holder()),
-                Some(CopyHolder::HoldsNoRoot),
+                disclosure,
+                CustodyDisclosure {
+                    copy_holder_column: vec![
+                        column(CustodyCopyHolder::HoldsRoot),
+                        column(CustodyCopyHolder::HoldsNoRoot)
+                    ],
+                    co_residence: CustodyCoResidence::Separate,
+                    separations: Vec::new(),
+                },
                 "{custody}"
             );
-            assert_eq!(disclosure.co_residence(), CoResidence::Separate);
         }
         for custody in [CustodyType::Fido2Token, CustodyType::Hsm] {
-            let disclosure = CustodyDisclosure::at_selection(
+            let disclosure = CustodyDisclosure::under(
                 custody,
                 PreRotationResidence::OutsidePlatformAccount,
+                &CustodyProfile::Desktop,
+                ALL_BUILT,
             )?;
-            assert_eq!(disclosure.residual_row(), None, "{custody}");
+            assert!(disclosure.copy_holder_column.is_empty(), "{custody}");
         }
         Ok(())
     }
 
     #[test]
-    fn disclosure_refuses_mismatched_selections() {
-        for custody in [
-            CustodyType::SecureEnclave,
-            CustodyType::AndroidKeystore,
-            CustodyType::Software,
+    fn disclosure_refuses_a_method_not_offered_on_the_profile() {
+        for (custody, profile, offer) in [
+            (CustodyType::SecureEnclave, CustodyProfile::Mobile, NO),
+            (CustodyType::Software, CustodyProfile::Headless, NO),
+            (CustodyType::Passkey, CustodyProfile::Headless, NO),
+            (CustodyType::PaperBackup, CustodyProfile::Headless, FLOOR),
+            (CustodyType::Hsm, CustodyProfile::Desktop, HARDWARE),
         ] {
             assert_eq!(
                 CustodyDisclosure::at_selection(
                     custody,
-                    PreRotationResidence::OutsidePlatformAccount
+                    PreRotationResidence::OutsidePlatformAccount,
+                    &profile
                 ),
-                Err(DisclosureError::NotConformingOnAnyProfile(custody))
+                Err(CustodyDisclosureError::NotOffered { custody, offer }),
+                "{custody} on {profile}"
             );
         }
+    }
+
+    #[test]
+    fn disclosure_refuses_mismatched_residences() {
         assert_eq!(
             CustodyDisclosure::at_selection(
                 CustodyType::Passkey,
-                PreRotationResidence::OutsidePlatformAccount
+                PreRotationResidence::OutsidePlatformAccount,
+                &CustodyProfile::Desktop
             ),
-            Err(DisclosureError::PasskeyOutsidePlatformAccount)
+            Err(CustodyDisclosureError::PasskeyOutsidePlatformAccount)
         );
-        for custody in [CustodyType::Fido2Token, CustodyType::PaperBackup] {
+        for (custody, profile) in [
+            (CustodyType::Fido2Token, CustodyProfile::Desktop),
+            (CustodyType::PaperBackup, CustodyProfile::Headless),
+        ] {
             for residence in [
                 PreRotationResidence::RootPlatformAccount,
                 PreRotationResidence::SecondPlatformAccount,
             ] {
                 assert_eq!(
-                    CustodyDisclosure::at_selection(custody, residence),
-                    Err(DisclosureError::PlatformAccountWithoutPasskey(custody))
+                    CustodyDisclosure::under(custody, residence, &profile, ALL_BUILT),
+                    Err(CustodyDisclosureError::PlatformAccountWithoutPasskey(
+                        custody
+                    ))
                 );
             }
         }
