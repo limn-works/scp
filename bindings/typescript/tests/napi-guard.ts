@@ -49,6 +49,25 @@ export function skipReasonIfAddonAbsent(
   throw error;
 }
 
+/**
+ * Throws when the environment variable `variable` is `"1"` and `suite` skips,
+ * so a CI run that sets the variable fails the file instead of passing over a
+ * skipped suite. `bun test` exits 0 when every suite skips.
+ *
+ * @param suite - The suite {@link napiSuite} returned.
+ * @param variable - The variable that demands the suite run.
+ * @param env - The environment to read; tests pass a stand-in.
+ */
+export function requireSuiteRuns(
+  suite: NapiSuite<unknown>,
+  variable: string,
+  env: Record<string, string | undefined> = process.env,
+): void {
+  if (env[variable] === "1" && suite.skipReason !== "") {
+    throw new Error(`${variable}=1, but the suite skips: ${suite.skipReason}`);
+  }
+}
+
 /** A real-NAPI suite: the value its probe built, or why it skips. */
 export interface NapiSuite<T> {
   /** The probe's value, or `undefined` when no native addon is installed. */

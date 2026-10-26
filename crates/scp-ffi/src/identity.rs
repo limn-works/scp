@@ -841,8 +841,8 @@ impl PyDIDDocument {
 /// The key custody a caller requested, resolved from the request string, the
 /// provider and the seed before any directory or key file is touched.
 ///
-/// [`resolve_custody`] validates every input; [`build_key_custody`] then
-/// builds the backend, or, on a shipped build, refuses identity creation
+/// [`resolve_custody`] validates every input; [`open_custody_for_create`]
+/// then builds the backend, or, on a shipped build, refuses identity creation
 /// before a key file is opened.
 enum CustodySelection {
     /// `in_memory`: test-harness in-memory custody, optionally seeded
@@ -932,36 +932,54 @@ fn custody_request_error(
     }
 }
 
-/// Builds the key custody a [`CustodySelection`] names for an
-/// identity-creation path, with the request value the identity handle reports
-/// (spec 03 §3.2.2).
-///
-/// No substrate satisfies §9.7.4.1 item 3a on a shipped build, so a shipped
-/// build refuses `encrypted_file` here with `SCP-IDENT-1100`
-/// (`03-identity.md` §3.10.10) before the selection creates
-/// `$HOME/.scp` or opens a key file. Opening first would leave a key file
-/// sealed under whatever passphrase was set, for a call that fails. An
-/// `os_keystore` selection opens only its custody records over `bi`'s
-/// storage, which writes nothing, so it builds here and the refusal runs
-/// where `identity_create_with_custody` states it.
+/// The custody a `testing` build mints a new identity over, with the request
+/// value the identity handle reports (spec 03 §3.2.2).
+#[cfg(feature = "testing")]
+struct CreateCustody {
+    custody: Arc<FfiKeyCustody>,
+    request: String,
+}
+
+/// A shipped build refuses every identity creation with `SCP-IDENT-1100` in
+/// [`open_custody_for_create`] (`03-identity.md` §3.10.10), so this type has
+/// no value and a shipped creation path ends at `match created {}`.
 #[cfg(not(feature = "testing"))]
-fn build_key_custody(
+enum CreateCustody {}
+
+/// The one refusal point of every shipped identity-creation entry point
+/// (`identity_create`, `identity_create_with_agent_key`,
+/// `identity_create_with_custody`): no substrate satisfies the
+/// independent-residence requirement of `09-security-model.md` §9.7.4.1 item
+/// 3a, so it returns `SCP-IDENT-1100` (`03-identity.md` §3.10.10) and its
+/// success type has no value.
+///
+/// `encrypted_file` is refused before the selection creates `$HOME/.scp` or
+/// opens a key file, so a failed call leaves no key file sealed under
+/// whatever passphrase was set. `os_keystore` first opens its custody records
+/// over `bi`'s storage, which writes nothing, so storage that does not
+/// persist keeps its `SCP-STORAGE-8000` (spec §17.3); no provider method is
+/// called.
+#[cfg(not(feature = "testing"))]
+fn open_custody_for_create(
     selection: CustodySelection,
     bi: &PyBridgeInstance,
-) -> Result<(Arc<FfiKeyCustody>, String), ScpPyError> {
-    use scp_ffi_common::custody_request::CustodyRequest;
+) -> Result<CreateCustody, ScpPyError> {
     match selection {
-        CustodySelection::EncryptedFile(inputs) => {
-            drop(inputs);
-            Err(no_independent_substrate())
-        }
-        CustodySelection::OsKeystore(provider) => Ok((
-            Arc::new(FfiKeyCustody::Callback(
-                crate::custody::PyCallbackKeyCustody::new(provider, callback_registry(bi)?),
-            )),
-            CustodyRequest::OsKeystore.as_str().to_owned(),
-        )),
+        CustodySelection::EncryptedFile(inputs) => drop(inputs),
+        CustodySelection::OsKeystore(provider) => drop(callback_custody(provider, bi)?),
     }
+    Err(no_independent_substrate())
+}
+
+/// The callback custody of an `os_keystore` selection, over a record-backed
+/// registry in `bi`'s storage (spec §17.3, SCP-345 decision D1).
+fn callback_custody(
+    provider: crate::custody::PyKeyCustodyProvider,
+    bi: &PyBridgeInstance,
+) -> Result<Arc<FfiKeyCustody>, ScpPyError> {
+    Ok(Arc::new(FfiKeyCustody::Callback(
+        crate::custody::PyCallbackKeyCustody::new(provider, callback_registry(bi)?),
+    )))
 }
 
 /// Builds the key custody a [`CustodySelection`] names for an
@@ -969,10 +987,10 @@ fn build_key_custody(
 /// custody later, so it opens here. An `os_keystore` selection opens its
 /// custody records over `bi`'s storage.
 #[cfg(feature = "testing")]
-fn build_key_custody(
+fn open_custody_for_create(
     selection: CustodySelection,
     bi: &PyBridgeInstance,
-) -> Result<(Arc<FfiKeyCustody>, String), ScpPyError> {
+) -> Result<CreateCustody, ScpPyError> {
     use scp_ffi_common::custody_request::CustodyRequest;
     match selection {
         CustodySelection::InMemory(testing_seed) => {
@@ -987,24 +1005,22 @@ fn build_key_custody(
                 .map_or_else(InMemoryKeyCustody::new, |seed| {
                     InMemoryKeyCustody::from_seed_bytes(**seed)
                 });
-            Ok((
-                Arc::new(FfiKeyCustody::InMemory(kc)),
-                CustodyRequest::InMemory.as_str().to_owned(),
-            ))
+            Ok(CreateCustody {
+                custody: Arc::new(FfiKeyCustody::InMemory(kc)),
+                request: CustodyRequest::InMemory.as_str().to_owned(),
+            })
         }
         CustodySelection::EncryptedFile(inputs) => {
             let file_kc = inputs.open().map_err(|e| file_custody_error(&e))?;
-            Ok((
-                Arc::new(FfiKeyCustody::File(file_kc)),
-                CustodyRequest::EncryptedFile.as_str().to_owned(),
-            ))
+            Ok(CreateCustody {
+                custody: Arc::new(FfiKeyCustody::File(file_kc)),
+                request: CustodyRequest::EncryptedFile.as_str().to_owned(),
+            })
         }
-        CustodySelection::OsKeystore(provider) => Ok((
-            Arc::new(FfiKeyCustody::Callback(
-                crate::custody::PyCallbackKeyCustody::new(provider, callback_registry(bi)?),
-            )),
-            CustodyRequest::OsKeystore.as_str().to_owned(),
-        )),
+        CustodySelection::OsKeystore(provider) => Ok(CreateCustody {
+            custody: callback_custody(provider, bi)?,
+            request: CustodyRequest::OsKeystore.as_str().to_owned(),
+        }),
     }
 }
 
@@ -1552,9 +1568,10 @@ impl crate::scp::PyScp {
             .transpose()?
             .map(zeroize::Zeroizing::new);
         // Resolve the custody (no file touched), then open it; a shipped build
-        // refuses with SCP-IDENT-1100 at the open, before any key file exists.
-        let (key_custody, custody_str) =
-            build_key_custody(resolve_custody(custody, None, testing_seed_array)?, &bi_arc)?;
+        // refuses with SCP-IDENT-1100 at the open, before any key file exists
+        // or any provider method runs.
+        let created =
+            open_custody_for_create(resolve_custody(custody, None, testing_seed_array)?, &bi_arc)?;
         let rt = crate::runtime()?;
 
         // Ensure the production DID resolver is initialized on this bridge
@@ -1565,19 +1582,20 @@ impl crate::scp::PyScp {
             async {
                 let did_method = shared_did_method(&bi_arc)?;
 
-                // No substrate satisfies §9.7.4.1 item 3a on a shipped build, so
-                // creation FAILS CLOSED with IDENT_1100 before any key exists
-                // (`03-identity.md` §3.10.10) rather than minting the
-                // test-harness `InMemoryPreRotationCustody` nullifier.
+                // A shipped build refused in `open_custody_for_create` with
+                // SCP-IDENT-1100 (`03-identity.md` §3.10.10), so `created` has
+                // no value there.
                 #[cfg(not(feature = "testing"))]
                 {
-                    let _ = (&bi_arc, &key_custody, &custody_str, &did_method);
-                    Err::<PyIdentity, pyo3::PyErr>(
-                        crate::identity::no_independent_substrate().into(),
-                    )
+                    let _ = (&bi_arc, &did_method);
+                    match created {}
                 }
                 #[cfg(feature = "testing")]
                 {
+                    let CreateCustody {
+                        custody: key_custody,
+                        request: custody_str,
+                    } = created;
                     // Mint a fresh per-identity pre-rotation custody. ADR-003
                     // §4b: the pre-rotation key lives in a separate substrate
                     // from operational `key_custody`. The same `Arc` is
@@ -1688,8 +1706,7 @@ impl crate::scp::PyScp {
         custody: &str,
     ) -> PyResult<PyIdentity> {
         let bi_arc = Arc::clone(&self.inner);
-        let (key_custody, custody_str) =
-            build_key_custody(resolve_custody(custody, None, None)?, &bi_arc)?;
+        let created = open_custody_for_create(resolve_custody(custody, None, None)?, &bi_arc)?;
         let rt = crate::runtime()?;
 
         // Ensure the production DID resolver is initialized on this bridge
@@ -1700,17 +1717,20 @@ impl crate::scp::PyScp {
             async {
                 let did_method = shared_did_method(&bi_arc)?;
 
-                // FAIL CLOSED on a shipped build: no substrate satisfies
-                // §9.7.4.1 item 3a (IDENT_1100). See `identity_create`.
+                // A shipped build refused in `open_custody_for_create` with
+                // SCP-IDENT-1100 (`03-identity.md` §3.10.10), so `created` has
+                // no value there.
                 #[cfg(not(feature = "testing"))]
                 {
-                    let _ = (&bi_arc, &key_custody, &custody_str, &did_method);
-                    Err::<PyIdentity, pyo3::PyErr>(
-                        crate::identity::no_independent_substrate().into(),
-                    )
+                    let _ = (&bi_arc, &did_method);
+                    match created {}
                 }
                 #[cfg(feature = "testing")]
                 {
+                    let CreateCustody {
+                        custody: key_custody,
+                        request: custody_str,
+                    } = created;
                     // Fresh per-identity pre-rotation custody (see
                     // `identity_create` for rationale).
                     let pre_rotation_custody =
@@ -1835,7 +1855,7 @@ impl crate::scp::PyScp {
                     code: scp_ffi_common::error_codes::VALID_7005.to_owned(),
                 }
             })?;
-        let (key_custody, custody_str) = build_key_custody(
+        let created = open_custody_for_create(
             resolve_custody(
                 scp_ffi_common::custody_request::CustodyRequest::OsKeystore.as_str(),
                 Some(provider_shim),
@@ -1859,19 +1879,20 @@ impl crate::scp::PyScp {
             async {
                 let did_method = shared_did_method(&bi_arc)?;
 
-                // FAIL CLOSED on a shipped build: no substrate satisfies
-                // §9.7.4.1 item 3a (IDENT_1100). This callback-custody path
-                // refuses identically to every other create path, before any
-                // provider call. See `identity_create`.
+                // A shipped build refused in `open_custody_for_create` with
+                // SCP-IDENT-1100 (`03-identity.md` §3.10.10), so `created` has
+                // no value there.
                 #[cfg(not(feature = "testing"))]
                 {
-                    let _ = (&bi_arc, &key_custody, &custody_str, &did_method);
-                    Err::<PyIdentity, pyo3::PyErr>(
-                        crate::identity::no_independent_substrate().into(),
-                    )
+                    let _ = (&bi_arc, &did_method);
+                    match created {}
                 }
                 #[cfg(feature = "testing")]
                 {
+                    let CreateCustody {
+                        custody: key_custody,
+                        request: custody_str,
+                    } = created;
                     // Fresh per-identity pre-rotation custody (see
                     // `identity_create` for rationale). The pre-rotation key lives
                     // in a separate in-memory substrate from the caller's
@@ -3687,9 +3708,21 @@ mod custody_request_tests {
         // `os_keystore` builds only over storage that persists (spec §17.3).
         let dir = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
         let bi = PyBridgeInstance::sqlite_for_test(dir.path()).map_err(|e| format!("{e:?}"))?;
-        build_key_custody(selection, &bi)
-            .map(|(_, label)| label)
+        open_custody_for_create(selection, &bi)
+            .map(label)
             .map_err(|e| format!("{e:?}"))
+    }
+
+    /// The request value a built custody's identity handle reports.
+    #[cfg(feature = "testing")]
+    fn label(created: CreateCustody) -> String {
+        created.request
+    }
+
+    /// A shipped build builds no custody to label.
+    #[cfg(not(feature = "testing"))]
+    fn label(created: CreateCustody) -> String {
+        match created {}
     }
 
     /// Decision D2 (SCP-345): `os_keystore` on a bridge with no storage is
@@ -3697,12 +3730,11 @@ mod custody_request_tests {
     /// build that fell back to an unrecorded or in-memory registry would
     /// succeed.
     #[test]
-    fn build_key_custody_refuses_os_keystore_without_storage_with_storage_8000()
+    fn open_custody_for_create_refuses_os_keystore_without_storage_with_storage_8000()
     -> Result<(), String> {
         let selection =
             resolve_custody("os_keystore", Some(provider()), None).map_err(|e| format!("{e:?}"))?;
-        let built =
-            build_key_custody(selection, &PyBridgeInstance::new_py()).map(|(_, label)| label);
+        let built = open_custody_for_create(selection, &PyBridgeInstance::new_py()).map(label);
         assert!(
             matches!(&built, Err(ScpPyError::ContextError { code, .. }) if code == codes::STORAGE_8000),
             "expected SCP-STORAGE-8000, got {built:?}"
@@ -3716,16 +3748,10 @@ mod custody_request_tests {
     /// in its own identity's namespace. A shared namespace would refuse the
     /// second record as a different record for handle 1.
     #[test]
-    fn build_key_custody_gives_each_os_keystore_identity_its_own_namespace() -> Result<(), String> {
+    fn callback_custody_gives_each_os_keystore_identity_its_own_namespace() -> Result<(), String> {
         let dir = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
         let bi = PyBridgeInstance::sqlite_for_test(dir.path()).map_err(|e| format!("{e:?}"))?;
-        let custody = || {
-            let selection = resolve_custody("os_keystore", Some(provider()), None)
-                .map_err(|e| format!("{e:?}"))?;
-            build_key_custody(selection, &bi)
-                .map(|(custody, _)| custody)
-                .map_err(|e| format!("custody: {e:?}"))
-        };
+        let custody = || callback_custody(provider(), &bi).map_err(|e| format!("custody: {e:?}"));
         let (first, second) = (custody()?, custody()?);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -3741,15 +3767,20 @@ mod custody_request_tests {
         Ok(())
     }
 
-    /// `os_keystore` with a provider resolves, and `build_key_custody` labels
-    /// the identity `os_keystore` on every build.
+    /// `os_keystore` with a provider resolves. A `testing` build labels the
+    /// identity `os_keystore`; a shipped build refuses the open with
+    /// `SCP-IDENT-1100` (`03-identity.md` §3.10.10).
     #[test]
     fn resolve_custody_accepts_os_keystore_with_a_provider() {
         let selection = resolve_custody("os_keystore", Some(provider()), None);
         assert_eq!(outcome(selection).0, "os_keystore");
-        assert_eq!(
-            build_label("os_keystore", Some(provider()), None),
-            Ok("os_keystore".to_owned())
+        let built = build_label("os_keystore", Some(provider()), None);
+        #[cfg(feature = "testing")]
+        assert_eq!(built, Ok("os_keystore".to_owned()));
+        #[cfg(not(feature = "testing"))]
+        assert!(
+            matches!(&built, Err(e) if e.contains(codes::IDENT_1100)),
+            "expected SCP-IDENT-1100, got {built:?}"
         );
     }
 

@@ -5869,9 +5869,9 @@ fn create_identity(
 #[allow(clippy::expect_used, clippy::panic)]
 mod custody_request_tests {
     use super::*;
-    use scp_ffi_common::custody_file::{
-        FileCustodyError, FileCustodyInputs, resolve_file_custody_inputs_from,
-    };
+    use scp_ffi_common::custody_file::resolve_file_custody_inputs_from;
+    #[cfg(feature = "testing")]
+    use scp_ffi_common::custody_file::{FileCustodyError, FileCustodyInputs};
     use scp_ffi_common::custody_request::ACCEPTED_CUSTODY;
     use zeroize::Zeroizing;
 
@@ -5905,6 +5905,7 @@ mod custody_request_tests {
 
     /// Resolves `encrypted_file` inputs under `home` without reading the
     /// process environment, so a test never races another on `HOME`.
+    #[cfg(feature = "testing")]
     fn inputs_under(
         home: &std::path::Path,
         passphrase: &str,
@@ -6088,50 +6089,75 @@ mod custody_request_tests {
         assert!(agent.has_agent_key());
     }
 
-    /// Selects `encrypted_file` under `home`, runs the shipped
-    /// `create_identity`, and asserts it refused with `SCP-IDENT-1100` (never
-    /// the superseded `SCP-IDENT-1059`) and left no `$HOME/.scp` behind.
+    /// Calls the `identityCreate` export (or `identityCreateWithAgentKey`
+    /// when `with_agent_key`) with `"encrypted_file"` in a child process whose
+    /// `HOME` is a fresh directory. With `SCP_KEY_PASSPHRASE` set, a shipped
+    /// build refuses with `SCP-IDENT-1100` (`03-identity.md` §3.10.10);
+    /// without it, with `SCP-VALID-7001`. Neither case leaves `$HOME/.scp`
+    /// behind.
     #[cfg(not(feature = "testing"))]
-    fn assert_encrypted_file_create_refuses_with_ident_1100(with_agent_key: bool) {
+    fn run_encrypted_file_export_cases(test_name: &str, with_agent_key: bool) {
+        if let Some(case) = crate::test_env::child_case() {
+            let scp = Scp::new_in_memory_for_test();
+            let result = if with_agent_key {
+                crate::runtime()
+                    .block_on(scp.identity_create_with_agent_key("encrypted_file".to_owned()))
+            } else {
+                crate::runtime().block_on(scp.identity_create("encrypted_file".to_owned(), None))
+            };
+            let want = match case.as_str() {
+                "with a passphrase" => codes::IDENT_1100,
+                "without a passphrase" => codes::VALID_7001,
+                other => panic!("unknown case {other}"),
+            };
+            let Err(err) = result else {
+                panic!("{test_name} {case}: a shipped build must not mint an identity");
+            };
+            assert!(err.to_string().contains(want), "{test_name} {case}: {err}");
+            return;
+        }
         let home = tempfile::tempdir().expect("tempdir");
-        let scp = Scp::new_in_memory_for_test();
-        let selection = crate::custody::select_key_custody(
-            "encrypted_file",
-            None,
-            None,
-            inputs_under(home.path(), PASSPHRASE),
-        )
-        .expect("encrypted_file selects the key file");
-        let Err(err) = crate::runtime().block_on(create_identity(
-            Arc::clone(&scp.inner),
-            selection,
-            with_agent_key,
-        )) else {
-            panic!("a shipped build must not mint an identity");
-        };
-        assert!(err.to_string().contains(codes::IDENT_1100), "{err}");
-        assert!(!err.to_string().contains(codes::IDENT_1059), "{err}");
+        let passphrase = std::ffi::OsStr::new(PASSPHRASE);
+        for (case, passphrase) in [
+            ("with a passphrase", Some(passphrase)),
+            ("without a passphrase", None),
+        ] {
+            crate::test_env::run_case(
+                module_path!(),
+                test_name,
+                case,
+                &[
+                    ("HOME", Some(home.path().as_os_str())),
+                    ("SCP_KEY_PASSPHRASE", passphrase),
+                ],
+            );
+        }
         assert!(
             !home.path().join(".scp").exists(),
             "the refused call must not create the key directory"
         );
     }
 
-    /// A shipped build resolves `encrypted_file`, then refuses with
-    /// `SCP-IDENT-1100` before the key file opens, so the failed call leaves
-    /// no `$HOME/.scp` behind.
+    /// The `identityCreate` export resolves `encrypted_file`, then a shipped
+    /// build refuses with `SCP-IDENT-1100` before the key file opens, so the
+    /// failed call leaves no `$HOME/.scp` behind.
     #[cfg(not(feature = "testing"))]
     #[test]
     fn encrypted_file_on_a_shipped_build_refuses_with_ident_1100_before_opening() {
-        assert_encrypted_file_create_refuses_with_ident_1100(false);
+        run_encrypted_file_export_cases(
+            "encrypted_file_on_a_shipped_build_refuses_with_ident_1100_before_opening",
+            false,
+        );
     }
 
-    /// The agent-key create path (`identityCreateWithAgentKey`, which calls
-    /// `create_identity` with `with_agent_key = true`) refuses on a shipped
-    /// build with `SCP-IDENT-1100` before the key file opens.
+    /// The `identityCreateWithAgentKey` export refuses `encrypted_file` on a
+    /// shipped build with `SCP-IDENT-1100` before the key file opens.
     #[cfg(not(feature = "testing"))]
     #[test]
     fn identity_create_with_agent_key_encrypted_file_refuses_with_ident_1100() {
-        assert_encrypted_file_create_refuses_with_ident_1100(true);
+        run_encrypted_file_export_cases(
+            "identity_create_with_agent_key_encrypted_file_refuses_with_ident_1100",
+            true,
+        );
     }
 }

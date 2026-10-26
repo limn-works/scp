@@ -717,8 +717,8 @@ jobs:
         # One cargo invocation resolves one feature set per package, so every
         # workspace-wide test build compiles scp-identity with `testing`
         # on — which compiles out its two `#[cfg(not(feature = "testing"))]`
-        # assertions (ephemeral_create_fails_closed_without_pre_rotation_backend
-        # and persisted_create_fails_closed_without_pre_rotation_backend at
+        # assertions (ephemeral_create_fails_closed_with_ident_1100
+        # and persisted_create_fails_closed_with_ident_1100 at
         # crates/scp-identity/src/config.rs). Job rust-test therefore never ran
         # them. A `-p scp-identity` build reads none of those three manifests,
         # so `testing` stays off and both assertions execute here.
@@ -726,7 +726,7 @@ jobs:
         # zero tests, and check_testing_unification_readers in
         # scripts/tests/ci-gate/ci_gate_selftest.py rejects re-pairing these
         # assertions with a lane whose build turns `testing` back on.
-        run: cargo nextest run --no-tests=fail -p scp-identity --lib -E 'test(fails_closed_without_pre_rotation_backend)'
+        run: cargo nextest run --no-tests=fail -p scp-identity --lib -E 'test(create_fails_closed_with_ident_1100)'
 
   # ── G1: shipped-feature-graph prove-absence gate (ADR-062 §Decision 6) ──
   # Asserts every shipped FFI bridge and the scp-node/scp-relay binaries' resolved

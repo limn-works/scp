@@ -2227,6 +2227,5 @@ mod identity_error_code_tests {
         use scp_identity::IdentityError as I;
         assert_eq!(IDENT_1100, I::NoIndependentSubstrate.code());
         assert_eq!(IDENT_1116, I::CustodyRequired.code());
-        assert_ne!(IDENT_1100, IDENT_1059);
     }
 }

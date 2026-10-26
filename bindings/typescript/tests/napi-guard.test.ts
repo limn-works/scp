@@ -20,7 +20,7 @@ import {
   requireNativeAddon,
 } from "../src/internal/native";
 import { addonLoadError, requireAddonExport } from "../src/scp";
-import { napiSuite, skipReasonIfAddonAbsent } from "./napi-guard";
+import { napiSuite, requireSuiteRuns, skipReasonIfAddonAbsent } from "./napi-guard";
 
 const BROKEN_PACKAGE = "scp-broken-native-addon";
 let root = "";
@@ -201,6 +201,32 @@ describe("skipReasonIfAddonAbsent", () => {
 function absent(): never {
   throw new ValidationError("no addon for this platform", NATIVE_ADDON_ABSENT_CODE);
 }
+
+describe("requireSuiteRuns", () => {
+  const VAR = "SCP_EXPECT_SHIPPED_ADDON";
+  const skipped = () =>
+    napiSuite(() => {
+      throw new Error("probe threw");
+    }, absent);
+
+  test("a skipped suite with the variable set to 1 throws and names the skip reason", async () => {
+    const suite = await skipped();
+    expect(() => requireSuiteRuns(suite, VAR, { [VAR]: "1" })).toThrow(
+      /SCP_EXPECT_SHIPPED_ADDON=1, but the suite skips: native addon not installed/,
+    );
+  });
+
+  test("a skipped suite without the variable does not throw", async () => {
+    const suite = await skipped();
+    expect(() => requireSuiteRuns(suite, VAR, {})).not.toThrow();
+    expect(() => requireSuiteRuns(suite, VAR, { [VAR]: "0" })).not.toThrow();
+  });
+
+  test("a running suite with the variable set to 1 does not throw", async () => {
+    const suite = await napiSuite(() => 1, absent);
+    expect(() => requireSuiteRuns(suite, VAR, { [VAR]: "1" })).not.toThrow();
+  });
+});
 
 describe("napiSuite", () => {
   const probeError = new Error("probe threw");

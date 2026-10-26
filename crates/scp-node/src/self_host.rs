@@ -3166,24 +3166,16 @@ mod tests {
         }
     }
 
-    /// `HostSiteError::NodeBuild` keeps the typed `NodeError`, so a caller
-    /// detects a missing independent substrate by pattern, and the same pattern
-    /// rejects every other node-build failure. `NodeBuild` and `Deploy` each
-    /// print their wrapped error once, in Display, and return no `source()`.
+    /// `NodeBuild` and `Deploy` each print their wrapped error once, in
+    /// Display, and return no `source()`. That `host_site` returns the typed
+    /// `NodeBuild(IdentityCreation(NoIndependentSubstrate))` on a shipped build
+    /// is asserted over its real output by
+    /// `pre_rotation_severance_host_site_returns_typed_node_build`.
     #[test]
-    fn node_build_error_keeps_typed_no_independent_substrate() {
-        let is_missing_backend = |e: &HostSiteError| {
-            matches!(
-                e,
-                HostSiteError::NodeBuild(NodeError::IdentityCreation(
-                    scp_identity::IdentityError::NoIndependentSubstrate
-                ))
-            )
-        };
+    fn node_build_and_deploy_errors_print_their_wrapped_error_once() {
         let missing = HostSiteError::NodeBuild(NodeError::IdentityCreation(
             scp_identity::IdentityError::NoIndependentSubstrate,
         ));
-        assert!(is_missing_backend(&missing));
         // The NodeError text is in Display only; returning it from `source()`
         // as well would print it twice in a chain-walking reporter.
         assert!(
@@ -3207,14 +3199,6 @@ mod tests {
             deploy.to_string(),
             "deploy error: failed to commit deploy: x"
         );
-
-        let other = HostSiteError::NodeBuild(NodeError::Nat("no tier".to_owned()));
-        assert!(!is_missing_backend(&other));
-        let superseded =
-            HostSiteError::NodeBuild(NodeError::Identity(IdentityError::NoPreRotationBackend));
-        assert!(!is_missing_backend(&superseded));
-        let other_config = HostSiteError::InvalidConfig("x".to_owned());
-        assert!(!is_missing_backend(&other_config));
     }
 
     /// A setup drain that times out or fails reaches the caller as the typed

@@ -282,6 +282,51 @@ pub fn scp_version() -> String {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Runs one test case in a child process of this test binary, so a case that
+/// sets `HOME` or `SCP_KEY_PASSPHRASE` never changes the environment of a
+/// process where other tests run. The same helper as the `UniFFI` bridge's.
+/// Only the shipped-build export tests use it.
+#[cfg(all(test, not(feature = "testing")))]
+#[allow(clippy::expect_used)]
+mod test_env {
+    use std::ffi::OsStr;
+
+    /// The variable that carries the case name into the child process.
+    const CASE_VAR: &str = "SCP_NAPI_TEST_ENV_CASE";
+
+    /// The case this process runs, or `None` in the parent test process.
+    pub fn child_case() -> Option<String> {
+        std::env::var(CASE_VAR).ok()
+    }
+
+    /// Re-runs the test `test_fn` of module `module` (pass `module_path!()`)
+    /// in a fresh process of this test binary with `CASE_VAR` set to `case`,
+    /// each `(name, Some(value))` variable set and each `(name, None)` removed.
+    /// Panics unless the child ran exactly that one test and it passed.
+    pub fn run_case(module: &str, test_fn: &str, case: &str, vars: &[(&str, Option<&OsStr>)]) {
+        let module = module.split_once("::").map_or("", |(_, rest)| rest);
+        let name = format!("{module}::{test_fn}");
+        let mut cmd = std::process::Command::new(std::env::current_exe().expect("current_exe"));
+        cmd.args([name.as_str(), "--exact", "--test-threads=1"])
+            .env(CASE_VAR, case);
+        for (var, value) in vars {
+            match value {
+                Some(value) => cmd.env(var, value),
+                None => cmd.env_remove(var),
+            };
+        }
+        let out = cmd.output().expect("spawn the test binary");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // libtest exits 0 when the filter matches no test, so require the
+        // count of tests that ran as well as the exit status.
+        assert!(
+            out.status.success() && stdout.contains("test result: ok. 1 passed;"),
+            "case {case} of {name} did not pass in its child process:\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {

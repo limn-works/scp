@@ -44,7 +44,7 @@ pub mod resolution;
 pub mod resolver;
 
 pub use cache::{DidCache, DidResolutionResult, Staleness};
-pub use config::{CreatedIdentity, Identity, IdentityConfig, NoPersistence};
+pub use config::{CreateIdentityError, CreatedIdentity, Identity, IdentityConfig, NoPersistence};
 #[cfg(any(test, feature = "testing"))]
 pub use dht::InMemorySequenceStore;
 pub use dht::{

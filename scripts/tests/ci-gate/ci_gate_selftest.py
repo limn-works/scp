@@ -4451,16 +4451,59 @@ NAPI_ASSERTION_FRAGMENTS = (
 )
 
 
+# The assignment that makes a shipped-addon test file fail, rather than skip,
+# when the addon does not load (bindings/typescript/tests/shipped-addon.test.ts).
+NAPI_SHIPPED_EXPECTATION = "SCP_EXPECT_SHIPPED_ADDON=1"
+
+# A command line that builds the NAPI addon in the job itself.
+NAPI_BUILD_LINE = re.compile(r"\bcargo build\b[^\n]*-p scp-ffi-napi\b")
+
+
+def napi_builders_missing_the_shipped_expectation(job_id: str, steps: list) -> list[str]:
+    r"""Return a gap for each `bun test` line a NAPI-building job runs unprotected.
+
+    CRITERION: in a job whose step runs a line matching NAPI_BUILD_LINE, every
+    line matching `\bbun test\b` at or after that line carries
+    NAPI_SHIPPED_EXPECTATION, and its step carries no `if:` and no
+    `continue-on-error` other than false.
+
+    WHY: such a job tests the addon it builds, and downloads none, so the
+    download rule above never reads it. Its test file resolves its suite to
+    `describe.skip` when the addon does not load, and `bun test` exits 0 over
+    zero assertions, unless NAPI_SHIPPED_EXPECTATION makes the file throw.
+    """
+    gaps: list[str] = []
+    built = False
+    for step in steps:
+        for line in str(step.get("run") or "").splitlines():
+            if NAPI_BUILD_LINE.search(line):
+                built = True
+            if not built or not re.search(r"\bbun test\b", line):
+                continue
+            if NAPI_SHIPPED_EXPECTATION not in line:
+                gaps.append(
+                    f"{job_id} builds a NAPI addon and runs `{line.strip()}` "
+                    f"without {NAPI_SHIPPED_EXPECTATION}"
+                )
+            elif not a_step_that_runs_and_can_fail_its_job(step):
+                gaps.append(
+                    f"{job_id} builds a NAPI addon and runs `{line.strip()}` in a "
+                    f"step that may be skipped or may fail open"
+                )
+    return gaps
+
+
 def napi_consumers_missing_an_assertion_fragment(
     doc: dict, artifacts: tuple[str, ...]
 ) -> list[str]:
-    r"""Return every NAPI-downloading job that lacks a fragment before its tests.
+    r"""Return every NAPI-testing job that can pass over a skipped suite.
 
     CRITERION: in every job that downloads an artifact named in `artifacts`, each
     fragment in NAPI_ASSERTION_FRAGMENTS occurs in the `run:` text of a step that
     comes before the first step whose `run:` text matches `\bbun test\b` or
     `\bpytest tests` and that carries no `if:` and no `continue-on-error` other
-    than false.
+    than false. Every other job meets the criterion of
+    napi_builders_missing_the_shipped_expectation.
 
     WHY: every real-NAPI test file under bindings/typescript/tests wraps its addon load
     and its first construction in one `try`, passes the caught error to
@@ -4480,6 +4523,7 @@ def napi_consumers_missing_an_assertion_fragment(
             and (step.get("with") or {}).get("name") in artifacts
             for step in steps
         ):
+            gaps.extend(napi_builders_missing_the_shipped_expectation(job_id, steps))
             continue
         found = dict.fromkeys(NAPI_ASSERTION_FRAGMENTS, False)
         for step in steps:
@@ -4537,6 +4581,60 @@ def check_napi_assertion_control(
         ),
         f"deleting {fragment!r} went unreported: {gaps}",
     )
+
+
+def check_napi_shipped_expectation_controls(
+    doc: dict, artifacts: tuple[str, ...], job_id: str
+) -> None:
+    """A NAPI-building job that drops the shipped expectation is reported.
+
+    The first mutant deletes NAPI_SHIPPED_EXPECTATION from `job_id`'s `bun test`
+    line; the second sets `if:` on that step. The job as written must not be
+    reported.
+    """
+    prefix = f"{job_id} builds a NAPI addon"
+    check(
+        f"{job_id}, which builds a NAPI addon and runs bun test, is not reported",
+        not any(
+            gap.startswith(prefix)
+            for gap in napi_consumers_missing_an_assertion_fragment(doc, artifacts)
+        ),
+        "the workflow as written must meet the criterion",
+    )
+    hits = [
+        step
+        for step in doc["jobs"][job_id]["steps"]
+        if NAPI_SHIPPED_EXPECTATION in str(step.get("run") or "")
+    ]
+    check(
+        f"{job_id} sets {NAPI_SHIPPED_EXPECTATION} in exactly one step",
+        len(hits) == 1,
+        f"{len(hits)} steps carry it, so the mutants are not the ones intended",
+    )
+    if len(hits) != 1:
+        return
+    index = doc["jobs"][job_id]["steps"].index(hits[0])
+    for name, mutate in (
+        (
+            f"drops {NAPI_SHIPPED_EXPECTATION}",
+            lambda step: step.update(
+                run=str(step["run"]).replace(NAPI_SHIPPED_EXPECTATION + " ", "")
+            ),
+        ),
+        ("sets `if:` on its bun test step", lambda step: step.update({"if": "false"})),
+        (
+            "sets `continue-on-error: true` on its bun test step",
+            lambda step: step.update({"continue-on-error": True}),
+        ),
+    ):
+        mutated = copy.deepcopy(doc)
+        mutate(mutated["jobs"][job_id]["steps"][index])
+        gaps = napi_consumers_missing_an_assertion_fragment(mutated, artifacts)
+        check(
+            f"a {job_id} that {name} is reported",
+            any(gap.startswith(prefix) for gap in gaps),
+            f"the mutant went unreported: {gaps}",
+        )
 
 
 def check_pyo3_assertion_control(
@@ -9253,6 +9351,9 @@ def run_downloaded_addon(inputs: Inputs) -> None:
         workflow, NAPI_UPLOAD_FILENAME, napi_artifacts
     )
     check_napi_consumer_assertion_fragments(workflow, napi_artifacts)
+    check_napi_shipped_expectation_controls(
+        workflow, napi_artifacts, "rust-test-napi-production"
+    )
     check_artifact_names_reach_a_consumer(
         workflow, napi_artifacts, NAPI_UPLOAD_FILENAME
     )

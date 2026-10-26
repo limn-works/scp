@@ -17,8 +17,9 @@
  *
  * Job `rust-test-napi-production` in `.github/workflows/ci.yml` builds the
  * shipped addon and runs this file with `SCP_EXPECT_SHIPPED_ADDON=1`, which
- * fails the file when the addon carries the testing-only method, so that run
- * cannot pass through the `testing` branch.
+ * fails the file when the addon carries the testing-only method or does not
+ * load, so that run cannot pass through the `testing` branch or a skipped
+ * suite.
  */
 
 import { expect, test } from "bun:test";
@@ -29,7 +30,7 @@ import { join } from "node:path";
 import type { ScpError } from "../src/errors";
 import type { KeyCustodyProvider } from "../src/scp";
 import { __getNativeScp, SCP } from "../src/scp";
-import { napiSuite } from "./napi-guard";
+import { napiSuite, requireSuiteRuns } from "./napi-guard";
 
 /** The code a shipped addon returns for every identity creation. */
 const IDENT_1100 = "SCP-IDENT-1100";
@@ -49,6 +50,9 @@ const suite = await napiSuite(() => {
   }
   return { shipped };
 });
+// With the variable set, an addon that does not load fails the file: the
+// suite would otherwise skip and `bun test` would exit 0.
+requireSuiteRuns(suite, "SCP_EXPECT_SHIPPED_ADDON");
 
 /** A provider whose every method records its name and throws. */
 function recordingProvider(calls: string[]): KeyCustodyProvider {

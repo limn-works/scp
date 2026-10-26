@@ -31,14 +31,18 @@
 //!
 //! A shipped (no-`testing`) build therefore mints nothing, and reaches
 //! [`DidMethod::create`] on none of these paths. This module's `create_inner`
-//! returns [`IdentityError::NoPreRotationBackend`], which every bridge surfaces
-//! as the error code `SCP-IDENT-1059`. The Node builder and the three FFI
-//! `identity_create*` entry points return that same typed error before minting.
+//! returns [`CreateIdentityError::IdentityCreation`] holding
+//! [`crate::IdentityError::NoIndependentSubstrate`] (`SCP-IDENT-1100`,
+//! `03-identity.md` §3.10.10), because no substrate satisfies the
+//! independent-residence requirement of `09-security-model.md` §9.7.4.1 item
+//! 3a. The Node builder and the three FFI `identity_create*` entry points
+//! return that same refusal before minting.
 //! Only a `testing` build mints a fresh per-identity `InMemoryPreRotationCustody`,
 //! and `create_inner` performs that mint internally, because the
 //! construction-standard `IdentityConfig` shape carries no pre-rotation slot for
 //! a caller to fill. `create_inner` documents the full contract, and the
-//! `ephemeral_create_fails_closed_*` and `persisted_create_fails_closed_*` tests
+//! `ephemeral_create_fails_closed_with_ident_1100` and
+//! `persisted_create_fails_closed_with_ident_1100` tests
 //! in this file execute it. Issue #1729, production `PreRotationCustody`
 //! backends, and the pre-rotation custody realization RFC, #2130, track the real
 //! backends.
@@ -261,15 +265,36 @@ pub struct Identity;
 /// to `migrate_identity`.
 pub type CreatedIdentity = (ScpIdentity, DidDocument, PreRotationKeyHandle);
 
+/// The error of [`Identity::create`] and [`Identity::create_ephemeral`].
+///
+/// A refusal the key-event-log identity model mandates
+/// (`03-identity.md` §3.10.10) is [`IdentityCreation`](Self::IdentityCreation);
+/// every failure of the `did:dht` creation path a `testing` build runs is
+/// [`Identity`](Self::Identity). The same split as `scp_node::NodeError`'s
+/// `IdentityCreation` and `Identity` variants.
+#[derive(Debug, thiserror::Error)]
+pub enum CreateIdentityError {
+    /// Identity creation refused before any key exists. A shipped build
+    /// returns [`crate::IdentityError::NoIndependentSubstrate`]
+    /// (`SCP-IDENT-1100`).
+    #[error("identity creation error: {0}")]
+    IdentityCreation(crate::IdentityError),
+
+    /// Key generation, DID creation, or persisting the document failed.
+    #[error("identity error: {0}")]
+    Identity(#[from] IdentityError),
+}
+
 impl Identity {
     /// Creates a new standalone identity from an [`IdentityConfig`]
     /// (production path).
     ///
     /// Lowers the flat config to the existing [`DidMethod::create`] call via the
     /// shared [`create_inner`] pre-rotation lowering. On a shipped (no-`testing`)
-    /// build there is no real pre-rotation backend, so this **fails closed** with
-    /// [`IdentityError::NoPreRotationBackend`] rather than minting the in-memory
-    /// nullifier (see [`create_inner`]). When `config.persistence` is `Some` and
+    /// build no substrate satisfies independent residence, so this **fails
+    /// closed** with [`CreateIdentityError::IdentityCreation`] holding
+    /// [`crate::IdentityError::NoIndependentSubstrate`] (`SCP-IDENT-1100`)
+    /// rather than minting the in-memory nullifier (see [`create_inner`]). When `config.persistence` is `Some` and
     /// creation succeeds, the identity's public DID document is persisted under
     /// the spec §17.3 key `identity/{did}/document`.
     ///
@@ -284,11 +309,12 @@ impl Identity {
     ///
     /// # Errors
     ///
-    /// Returns [`IdentityError`] if key generation / DID creation fails, or if
-    /// persisting the document to `config.persistence` fails.
+    /// Returns [`CreateIdentityError::IdentityCreation`] when creation is
+    /// refused, and [`CreateIdentityError::Identity`] if key generation, DID
+    /// creation, or persisting the document to `config.persistence` fails.
     pub async fn create<K, D, S>(
         config: IdentityConfig<K, D, S>,
-    ) -> Result<CreatedIdentity, IdentityError>
+    ) -> Result<CreatedIdentity, CreateIdentityError>
     where
         K: KeyCustody,
         D: DidMethod,
@@ -319,10 +345,12 @@ impl Identity {
     ///
     /// # Errors
     ///
-    /// Returns [`IdentityError`] if key generation / DID creation fails.
+    /// Returns [`CreateIdentityError::IdentityCreation`] when creation is
+    /// refused, and [`CreateIdentityError::Identity`] if key generation or DID
+    /// creation fails.
     pub async fn create_ephemeral<K, D>(
         config: IdentityConfig<K, D, NoPersistence>,
-    ) -> Result<CreatedIdentity, IdentityError>
+    ) -> Result<CreatedIdentity, CreateIdentityError>
     where
         K: KeyCustody,
         D: DidMethod,
@@ -366,9 +394,11 @@ impl Identity {
 ///   DOA-safe property this severance secures is the `Result` return *shape*: the
 ///   fail-closed arm already returns `Err`, so adding the backend never changes
 ///   the signature's fallibility, only supplies the missing capability.
-/// - **shipped (no-`testing`) build:** there is NO real pre-rotation backend, so
-///   creation FAILS CLOSED with [`IdentityError::NoPreRotationBackend`] rather
-///   than silently minting the nullifier. Masking a missing production backend
+/// - **shipped (no-`testing`) build:** no substrate satisfies the
+///   independent-residence requirement of `09-security-model.md` §9.7.4.1 item
+///   3a, so creation FAILS CLOSED with
+///   [`crate::IdentityError::NoIndependentSubstrate`] (`SCP-IDENT-1100`,
+///   `03-identity.md` §3.10.10) rather than silently minting the nullifier. Masking a missing production backend
 ///   with a dev stand-in would ship a false durability guarantee (AGENTS.md
 ///   builder tenet "No dev/test-only stand-ins in production"). A real backend is
 ///   tracked by #1729 / RFC #2130; non-committing create (Option A, #1553) is out
@@ -377,7 +407,7 @@ impl Identity {
 // the `async` signature is preserved for the `testing` build (which awaits
 // `method.create`) and the callers' `.await` sites.
 #[cfg_attr(not(feature = "testing"), allow(clippy::unused_async))]
-async fn create_inner<K, D>(method: &D, custody: &K) -> Result<CreatedIdentity, IdentityError>
+async fn create_inner<K, D>(method: &D, custody: &K) -> Result<CreatedIdentity, CreateIdentityError>
 where
     K: KeyCustody,
     D: DidMethod,
@@ -399,15 +429,17 @@ where
     }
     #[cfg(not(feature = "testing"))]
     {
-        // Fail closed: no real pre-rotation backend exists yet (RFC #2130 / #1729).
-        // Never silently substitute the in-memory nullifier on a shipped build.
+        // Fail closed: no substrate satisfies independent residence
+        // (03-identity.md §3.10.10). Never silently substitute the in-memory nullifier on a shipped build.
         // The `testing` feature is the SOLE activation path for the mint arm above
         // (ADR-062 A5), so this arm is selected by any build with `testing` off —
         // a shipped binary AND this crate's own default-feature unit-test lane
         // (`cargo test -p scp-identity`), which is exactly what proves the
-        // fail-closed behavior end-to-end (`ephemeral_create_fails_closed_*`).
+        // fail-closed behavior end-to-end (`ephemeral_create_fails_closed_with_ident_1100`).
         let _ = (method, custody);
-        Err(IdentityError::NoPreRotationBackend)
+        Err(CreateIdentityError::IdentityCreation(
+            crate::IdentityError::NoIndependentSubstrate,
+        ))
     }
 }
 
@@ -511,10 +543,10 @@ mod tests {
     }
 
     /// AC5 core path (ADR-062 §Decision 6 / SCP-CAPINJECT-006): on a shipped
-    /// (no-`testing`) build there is NO real pre-rotation custody backend, so the
+    /// (no-`testing`) build no substrate satisfies independent residence, so the
     /// shared [`create_inner`] lowering FAILS CLOSED with
-    /// [`IdentityError::NoPreRotationBackend`] (surfaced across the FFI as
-    /// SCP-IDENT-1059) rather than minting the in-memory
+    /// [`crate::IdentityError::NoIndependentSubstrate`] (`SCP-IDENT-1100`,
+    /// `03-identity.md` §3.10.10) rather than minting the in-memory
     /// `InMemoryPreRotationCustody` nullifier.
     ///
     /// Gated `#[cfg(not(feature = "testing"))]`: the fail-closed arm of
@@ -534,19 +566,22 @@ mod tests {
     /// carry one.
     #[cfg(not(feature = "testing"))]
     #[tokio::test]
-    async fn ephemeral_create_fails_closed_without_pre_rotation_backend() {
+    async fn ephemeral_create_fails_closed_with_ident_1100() {
         let result = Identity::create_ephemeral(IdentityConfig::ephemeral(
             crate::DidDht::with_client(Arc::new(InMemoryDhtClient::new())),
             InMemoryKeyCustody::new(),
         ))
         .await;
         match result {
-            Err(IdentityError::NoPreRotationBackend) => {}
+            Err(CreateIdentityError::IdentityCreation(e)) => {
+                assert_eq!(e, crate::IdentityError::NoIndependentSubstrate);
+                assert_eq!(e.code(), "SCP-IDENT-1100");
+            }
             Err(other) => {
-                panic!("expected NoPreRotationBackend (SCP-IDENT-1059), got: {other:?}")
+                panic!("expected NoIndependentSubstrate (SCP-IDENT-1100), got: {other:?}")
             }
             Ok(_) => panic!(
-                "expected fail-closed NoPreRotationBackend, got Ok — the in-memory \
+                "expected fail-closed NoIndependentSubstrate, got Ok — the in-memory \
                  pre-rotation nullifier was minted on a shipped-config create path!"
             ),
         }
@@ -557,7 +592,7 @@ mod tests {
     /// closed on a shipped build — BEFORE ever writing the document to storage.
     #[cfg(not(feature = "testing"))]
     #[tokio::test]
-    async fn persisted_create_fails_closed_without_pre_rotation_backend() {
+    async fn persisted_create_fails_closed_with_ident_1100() {
         let storage = encrypted_test_storage();
         let result = Identity::create(IdentityConfig {
             method: crate::DidDht::with_client(Arc::new(InMemoryDhtClient::new())),
@@ -566,12 +601,15 @@ mod tests {
         })
         .await;
         match result {
-            Err(IdentityError::NoPreRotationBackend) => {}
+            Err(CreateIdentityError::IdentityCreation(e)) => {
+                assert_eq!(e, crate::IdentityError::NoIndependentSubstrate);
+                assert_eq!(e.code(), "SCP-IDENT-1100");
+            }
             Err(other) => {
-                panic!("expected NoPreRotationBackend (SCP-IDENT-1059), got: {other:?}")
+                panic!("expected NoIndependentSubstrate (SCP-IDENT-1100), got: {other:?}")
             }
             Ok(_) => panic!(
-                "expected fail-closed NoPreRotationBackend, got Ok — the in-memory \
+                "expected fail-closed NoIndependentSubstrate, got Ok — the in-memory \
                  pre-rotation nullifier was minted on a shipped-config persist create path!"
             ),
         }
@@ -581,7 +619,7 @@ mod tests {
     // `testing` feature supplies (`InMemoryPreRotationCustody`). On a shipped
     // build `create_inner` fails closed, so these assertions only hold — and only
     // compile the mint arm — under `--features testing`. The fail-closed behavior
-    // is proven separately by `ephemeral_create_fails_closed_*` below.
+    // is proven separately by `ephemeral_create_fails_closed_with_ident_1100`.
     #[cfg(feature = "testing")]
     #[tokio::test]
     async fn ephemeral_create_produces_valid_did_dht() {
