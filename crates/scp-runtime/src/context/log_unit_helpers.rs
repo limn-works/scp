@@ -600,6 +600,168 @@ mod tests {
         );
     }
 
+    /// Spec 17 §17.3 "Event log write failures": after a failed put leaves a
+    /// unit queued, every writer that applies its entry in memory first is
+    /// refused until the drain writes the queue, so none takes the unit's
+    /// reserved slot. The drain then writes the unit with no log fault, and
+    /// the context keeps accepting mutations.
+    #[tokio::test]
+    async fn after_side_effect_writers_wait_for_the_drain_after_a_failed_put() {
+        use crate::context::builder::AppendMode;
+
+        let ctx_id_bytes = [0x62u8; 32];
+        let ctx = hex::encode(ctx_id_bytes);
+        let (log, faulty) = faulty_merkle_log();
+        let deps = deps_with(OWNER, None, Box::new(log)).await;
+        deps.event_log
+            .init_event_log(&ctx_id_bytes)
+            .await
+            .expect("init event log");
+        let mut cell = ClassSCell::new(PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            1_700_000_000,
+            scp_did::DID(OWNER.to_owned()),
+        ));
+
+        // A failed put leaves one unit queued at base_seq 0.
+        fail_log_entry_writes(&faulty, &ctx_id_bytes);
+        cell.commit_class_s_keep(&deps, &ctx, |mut v| {
+            v.enqueue_log_unit(vec![tagged_leaf(1)]);
+            Ok(())
+        })
+        .await
+        .expect("the enqueue persists");
+        assert!(
+            drain_pending_log_units(&mut cell, &deps, &ctx)
+                .await
+                .is_err(),
+            "the log rejects the unit's write"
+        );
+        faulty.clear_fail();
+
+        // Every writer that applies its entry in memory first: the provider
+        // primitive (the supervisor's same-context streaming close), the
+        // divergence marker's entry, and the two cross-context A-side
+        // recorders.
+        let direct = deps
+            .event_log
+            .append_event_after_side_effect(
+                &ctx_id_bytes,
+                EventType::MemberJoined,
+                "",
+                tagged_payload(2),
+                1_700_000_002,
+            )
+            .await;
+        assert!(direct.is_err(), "{direct:?}");
+        let marker = deps
+            .event_log
+            .append_context_event_with_payload(
+                AppendMode::AfterSideEffect,
+                &ctx_id_bytes,
+                EventType::CrossContextDivergenceMarker,
+                scp_event_log::system_actors::SYSTEM_SAGA_ACTOR,
+                tagged_payload(3),
+                1_700_000_003,
+            )
+            .await;
+        assert!(
+            matches!(marker, Err(ContextError::EventLogFailed(_))),
+            "{marker:?}"
+        );
+        record_both_a_side_events(&deps, &ctx, ctx_id_bytes).await;
+        assert_eq!(
+            log_len(&deps, &ctx_id_bytes),
+            0,
+            "no writer took the queued unit's slot"
+        );
+
+        // The drain writes the unit where it was reserved, with no fault.
+        drain_pending_log_units(&mut cell, &deps, &ctx)
+            .await
+            .expect("the drain writes the unit");
+        assert!(cell.class_s.pending_log_units.is_empty());
+        assert!(cell.class_s.log_fault.is_none(), "no log fault is set");
+        assert_eq!(log_len(&deps, &ctx_id_bytes), 1);
+
+        // The context keeps accepting mutations and appends.
+        deps.event_log
+            .append_event_after_side_effect(
+                &ctx_id_bytes,
+                EventType::MemberJoined,
+                "",
+                tagged_payload(2),
+                1_700_000_002,
+            )
+            .await
+            .expect("the append lands after the drain");
+        assert_eq!(log_len(&deps, &ctx_id_bytes), 2);
+        let mutation = crate::context::governance_helpers::execute_governance_action(
+            &mut cell,
+            &deps,
+            &ctx,
+            &[0u8; 32],
+            Some(&scp_did::DID(OWNER.to_owned())),
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            !matches!(mutation, Err(ContextError::EventLogFailed(_))),
+            "no log fault refuses the mutation: {mutation:?}"
+        );
+    }
+
+    /// Runs both cross-context A-side recorders for `ctx`.
+    async fn record_both_a_side_events(
+        deps: &crate::context::actor::deps::ActorDeps,
+        ctx: &str,
+        ctx_id_bytes: [u8; 32],
+    ) {
+        crate::context::outlets::invoke::record_cross_context_a_event(
+            &deps.event_log,
+            ctx,
+            &scp_did::DID("did:dht:z6MkInvoker".to_owned()),
+            [1u8; 16],
+            &"outlet-x".to_owned(),
+            "0".repeat(64),
+            5,
+            &crate::context::outlets::invoke::StreamTerminalSummary::default(),
+            &[],
+            1_700_000_004,
+        )
+        .await;
+        let receipt =
+            scp_protocol::context::outlets::cross_context_saga::CrossContextOutletStreamReceipt {
+                caller_context_id: ctx_id_bytes,
+                target_context_id: [0x63; 32],
+                caller_did: "did:dht:z6MkCaller".to_owned(),
+                nonce: [7; 16],
+                outlet_registration_id: "outlet-x".to_owned(),
+                stream_manifest_hash: [0; 32],
+                outlet_invoked_event_id: "evt-b".to_owned(),
+                chain_depth: 1,
+                timestamp_ms: 1_700_000_005_000,
+                signature: [0; 64],
+            };
+        crate::context::outlets::invoke::record_streaming_saga_a_event(
+            &deps.event_log,
+            &crate::context::supervisor::saga_journal::SagaId("saga-trace".to_owned()),
+            &crate::context::actor::commands::CommitBStreamSettleOutcome {
+                receipt: serde_json::to_vec(&receipt).expect("receipt json"),
+                stream_manifest_hash: [0; 32],
+                billed: scp_protocol::economy::types::Amount(0),
+                refund: scp_protocol::economy::types::Amount(0),
+                billed_count: 0,
+                stream_chunk_count: 0,
+                outlet_invoked_event_id: "evt-b".to_owned(),
+                settlement: None,
+                generation: 1,
+            },
+        )
+        .await;
+    }
+
     /// A unit queued ahead of the log at `base_seq`, and the cell holding it.
     fn cell_with_reserved_unit(
         ctx_id_bytes: [u8; 32],

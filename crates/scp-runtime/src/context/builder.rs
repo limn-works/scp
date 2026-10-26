@@ -363,8 +363,10 @@ pub trait ContextEventLogProvider: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`ContextCreationError`] if the context has no log or the event
-    /// is malformed. A storage failure is not an error here.
+    /// Returns [`ContextCreationError`] if the context has no log, the event
+    /// is malformed, or the context has queued log units (spec 17 §17.3
+    /// "Event log write failures"); the in-memory log is then unchanged. A
+    /// storage failure is not an error here.
     async fn append_event_after_side_effect(
         &self,
         context_id: &[u8; 32],
@@ -526,8 +528,9 @@ pub trait ContextEventLogProvider: Send + Sync {
 
     /// Records whether the context has queued log units (spec 17 §17.3
     /// "Event log write failures"). While it does, a provider that keeps a
-    /// write gate refuses a fail-closed append, an import, a prune, and an
-    /// init for the context, checked under the gate, so no entry lands ahead
+    /// write gate refuses every write to the context's log except the
+    /// drain's (a fail-closed append, an append after an irreversible step,
+    /// an import, a prune, and an init), checked under the gate, so no entry lands ahead
     /// of a queued one and no replace re-chains the sequences a reserved
     /// `base_seq` names. The actor calls this when it starts, and the drain
     /// calls it before it takes the write gate and on every exit.

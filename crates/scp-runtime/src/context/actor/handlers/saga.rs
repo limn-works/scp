@@ -6174,6 +6174,65 @@ mod tests {
             .expect("marker verifies");
     }
 
+    /// While the context has queued log units, the divergence marker's
+    /// append after the irreversible commit is refused at the provider's
+    /// write gate (spec 17 §17.3 "Event log write failures"): the handler
+    /// replies with the typed error and the log is unchanged. With no queued
+    /// unit the same marker appends.
+    #[tokio::test]
+    async fn emit_divergence_marker_is_refused_while_units_are_queued() {
+        let issuer = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let st = target_state(0xD7, OTHER, CALLER).await;
+        let deps = build_deps_with_providers(
+            OTHER.to_owned(),
+            issuer.verifying_key(),
+            Box::new(crate::context::providers::event_log::MerkleEventLogProvider::new()),
+            Box::new(OkPersistence),
+        )
+        .await;
+        deps.event_log
+            .init_event_log(&st.context_id)
+            .await
+            .expect("init log");
+        let ctx_hex = hex_context_id(&st.context_id);
+        let signing = test_signer(0x99);
+        let saga = SagaId("saga-divergence-fenced".to_owned());
+
+        for pending in [true, false] {
+            deps.event_log.set_units_pending(&st.context_id, pending);
+            let (tx, rx) = oneshot::channel();
+            let out = emit_divergence_marker(
+                st.context_id,
+                build_snapshot_for_persist(&st, &deps, &ctx_hex),
+                &deps,
+                &saga,
+                [0xAB; 16],
+                CommittedSide::Target,
+                "evt-committed-11",
+                1_700_000_000,
+                &signing,
+                tx,
+            )
+            .await;
+            let reply = rx.await.expect("reply");
+            let (len, _) = deps
+                .event_log
+                .event_log_summary(&st.context_id)
+                .expect("summary");
+            if pending {
+                assert!(out.result.is_err(), "the Outcome records the refusal");
+                assert!(
+                    matches!(reply, Err(ContextError::EventLogFailed(_))),
+                    "{reply:?}"
+                );
+                assert_eq!(len, 0, "no marker while a unit is queued");
+            } else {
+                reply.expect("emit ack");
+                assert_eq!(len, 1, "the marker appends once the queue is empty");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn emit_divergence_marker_writes_nothing_after_supervisor_drops() {
         use crate::context::messaging_helpers::dropped_supervisor_tests::{

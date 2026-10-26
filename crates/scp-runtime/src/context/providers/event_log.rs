@@ -314,9 +314,11 @@ pub struct MerkleEventLogProvider {
     /// Optional persistence backend for surviving process restarts (#636).
     persistence: Option<std::sync::Arc<dyn EventLogPersistence>>,
     /// Contexts whose actor holds queued log units (spec 17 §17.3 "Event log
-    /// write failures"). While a context is in this set, a fail-closed
-    /// append, an import, a prune, and an init for it are refused, each
-    /// checked after the writer takes the context's write gate. The actor
+    /// write failures"). While a context is in this set, every write to its
+    /// log except the drain's is refused: a fail-closed append, an append
+    /// after an irreversible step, an import, a prune, and an init, each
+    /// checked after the writer takes the context's write gate
+    /// ([`MerkleEventLogProvider::lock_write_gate`]). The actor
     /// sets and clears membership through
     /// [`ContextEventLogProvider::set_units_pending`]; destroying or releasing
     /// the context's log removes it.
@@ -327,6 +329,24 @@ pub struct MerkleEventLogProvider {
 /// or awaits the permit holds a clone of the `Arc`, which
 /// [`MerkleEventLogProvider::release_write_gate`] counts.
 type WriteGate = std::sync::Arc<tokio::sync::Semaphore>;
+
+/// The writers that take a context's write gate without the pending-unit
+/// fence (spec 17 §17.3 "Event log write failures"). Naming one is the only
+/// way to reach [`MerkleEventLogProvider::lock_write_gate_unfenced`], so a
+/// new writer either takes the fenced gate or adds a variant here.
+#[derive(Debug, Clone, Copy)]
+enum UnfencedWrite {
+    /// The pending-unit drain, which writes the queue the fence protects.
+    Drain,
+    /// A restore, which loads the stored log before the context's actor
+    /// records its queue.
+    Restore,
+    /// A destroy, which removes the log and the fence with it.
+    Destroy,
+    /// [`MerkleEventLogProvider::lock_write_gate`], which checks the fence
+    /// once it holds the gate.
+    FencedGate,
+}
 
 #[allow(clippy::significant_drop_tightening)]
 #[allow(
@@ -455,7 +475,7 @@ impl MerkleEventLogProvider {
 
         let log = rebuild_log_from_events(context_id, &entries)?;
 
-        let write = self.lock_write_gate_fenced(context_id).await?;
+        let write = self.lock_write_gate(context_id).await?;
         // Store the imported events (one replace) before memory takes them.
         if let Err(e) = self.replace_stored(context_id, &entries).await {
             self.settle_write(context_id, write, false);
@@ -492,7 +512,9 @@ impl MerkleEventLogProvider {
         &self,
         context_id: &[u8; 32],
     ) -> Result<EventLogRestore, ContextCreationError> {
-        let write = self.lock_write_gate(context_id).await?;
+        let write = self
+            .lock_write_gate_unfenced(context_id, UnfencedWrite::Restore)
+            .await?;
         match self.load_log_for_restore(context_id).await {
             Ok((log, restore)) => {
                 let mut logs = self
@@ -597,7 +619,7 @@ impl MerkleEventLogProvider {
             .unwrap_or_default()
             .as_secs();
 
-        let write = self.lock_write_gate_fenced(context_id).await?;
+        let write = self.lock_write_gate(context_id).await?;
 
         // Compute the pruned log without changing memory: memory takes it
         // only after storage does.
@@ -677,16 +699,19 @@ impl MerkleEventLogProvider {
         )
     }
 
-    /// Waits for and takes a context's write gate. The returned permit holds
-    /// a clone of the gate until it drops.
+    /// Waits for and takes a context's write gate without the pending-unit
+    /// fence. Only the writers [`UnfencedWrite`] names take the gate this
+    /// way; every other writer takes it through [`Self::lock_write_gate`].
+    /// The returned permit holds a clone of the gate until it drops.
     ///
     /// # Errors
     ///
     /// Returns [`ContextCreationError::EventLogFailed`] if the gate's
     /// semaphore is closed. No code closes it, so this error marks a bug.
-    async fn lock_write_gate(
+    async fn lock_write_gate_unfenced(
         &self,
         context_id: &[u8; 32],
+        _writer: UnfencedWrite,
     ) -> Result<tokio::sync::OwnedSemaphorePermit, ContextCreationError> {
         self.write_gate(context_id)
             .acquire_owned()
@@ -699,22 +724,26 @@ impl MerkleEventLogProvider {
             })
     }
 
-    /// Takes a context's write gate for a writer outside the pending-unit
-    /// drain, then refuses the write while the context has queued log units
-    /// (spec 17 §17.3 "Event log write failures"). The check runs under the
-    /// gate, so a writer that waited while the drain held the gate sees the
-    /// queue the drain left.
+    /// Takes a context's write gate, then refuses the write while the
+    /// context has queued log units (spec 17 §17.3 "Event log write
+    /// failures"). Every write to a context's log takes the gate here except
+    /// the drain, a restore, and a destroy ([`UnfencedWrite`]): a fail-closed
+    /// append, an append after an irreversible step, an import, a prune, and
+    /// an init. The check runs under the gate, so a writer that waited while
+    /// the drain held the gate sees the queue the drain left.
     ///
     /// # Errors
     ///
     /// Returns [`ContextCreationError::EventLogFailed`] when the gate is
     /// closed or the context has queued log units. On refusal the permit
     /// drops, and the gate is released when the context has no log.
-    async fn lock_write_gate_fenced(
+    async fn lock_write_gate(
         &self,
         context_id: &[u8; 32],
     ) -> Result<tokio::sync::OwnedSemaphorePermit, ContextCreationError> {
-        let write = self.lock_write_gate(context_id).await?;
+        let write = self
+            .lock_write_gate_unfenced(context_id, UnfencedWrite::FencedGate)
+            .await?;
         if let Err(e) = self.check_no_units_pending(context_id) {
             self.drop_write(context_id, write);
             return Err(e);
@@ -1194,7 +1223,7 @@ fn truncate_log_keeping_tail(
 #[allow(clippy::significant_drop_tightening)]
 impl ContextEventLogProvider for MerkleEventLogProvider {
     async fn init_event_log(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        let write = self.lock_write_gate_fenced(context_id).await?;
+        let write = self.lock_write_gate(context_id).await?;
         // Store the empty event set first to establish the context in storage
         // (replaces any stored log from a previous incarnation); memory takes
         // the new log only after storage does.
@@ -1220,7 +1249,7 @@ impl ContextEventLogProvider for MerkleEventLogProvider {
     ) -> Result<(), ContextCreationError> {
         check_append_payload(event_type, &payload)?;
 
-        let write = self.lock_write_gate_fenced(context_id).await?;
+        let write = self.lock_write_gate(context_id).await?;
         // Build the event without changing memory: memory takes it only
         // after storage does (spec section 17.3, "Event log write failures").
         let prepared = {
@@ -1278,6 +1307,9 @@ impl ContextEventLogProvider for MerkleEventLogProvider {
     ) -> Result<(), ContextCreationError> {
         check_append_payload(event_type, &payload)?;
 
+        // The fenced gate: while units are queued this entry would take a
+        // queued unit's slot, so it is refused before memory changes (spec 17
+        // §17.3 "Event log write failures").
         let write = self.lock_write_gate(context_id).await?;
         // Memory first: the operation's irreversible step already happened,
         // so the entry is recorded in memory even when storage refuses it
@@ -1319,7 +1351,9 @@ impl ContextEventLogProvider for MerkleEventLogProvider {
 
     async fn destroy_event_log(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
         let deleted = {
-            let _write = self.lock_write_gate(context_id).await?;
+            let _write = self
+                .lock_write_gate_unfenced(context_id, UnfencedWrite::Destroy)
+                .await?;
             {
                 let mut logs = self
                     .logs
@@ -1340,7 +1374,9 @@ impl ContextEventLogProvider for MerkleEventLogProvider {
         &self,
         context_id: &[u8; 32],
     ) -> Result<UnitWriteGuard, ContextCreationError> {
-        let write = self.lock_write_gate(context_id).await?;
+        let write = self
+            .lock_write_gate_unfenced(context_id, UnfencedWrite::Drain)
+            .await?;
         let len = {
             let logs = self
                 .logs
@@ -3484,6 +3520,99 @@ mod tests {
                 .unwrap()
                 .is_some_and(|removed| removed > 0)
         );
+    }
+
+    /// While a context has queued units, an append after an irreversible step
+    /// is refused at the write gate before memory changes (spec 17 §17.3
+    /// "Event log write failures"), through every trait entry that reaches
+    /// it: the direct call, `append_event_in`,
+    /// `append_context_event_with_payload`, and
+    /// `append_outlet_invoked_verified`. Without queued units each appends.
+    #[tokio::test]
+    async fn after_side_effect_append_refused_while_units_pending() {
+        use crate::context::builder::AppendMode;
+        use scp_protocol::context::ContextError;
+
+        let ctx_id = [46u8; 32];
+        let provider = MerkleEventLogProvider::new();
+        provider.init_event_log(&ctx_id).await.unwrap();
+        append_n(&provider, &ctx_id, 0xA6, 2).await;
+        let chunks = vec![stream_end_chunk(0)];
+        let root = scp_protocol::context::outlets::stream::compute_chunk_manifest_root(&chunks)
+            .expect("manifest root");
+        let event = manifest_invoked_event(1, 0, root, None);
+
+        for pending in [true, false] {
+            provider.set_units_pending(&ctx_id, pending);
+            let direct = provider
+                .append_event_after_side_effect(
+                    &ctx_id,
+                    EventType::MemberJoined,
+                    "",
+                    payload_bytes(&[1]),
+                    1,
+                )
+                .await;
+            let in_mode = provider
+                .append_event_in(
+                    AppendMode::AfterSideEffect,
+                    &ctx_id,
+                    EventType::MemberJoined,
+                    "",
+                    payload_bytes(&[2]),
+                    2,
+                )
+                .await;
+            let with_payload = provider
+                .append_context_event_with_payload(
+                    AppendMode::AfterSideEffect,
+                    &ctx_id,
+                    EventType::MemberJoined,
+                    "",
+                    payload_bytes(&[3]),
+                    3,
+                )
+                .await;
+            let verified = provider
+                .append_outlet_invoked_verified(
+                    AppendMode::AfterSideEffect,
+                    &ctx_id,
+                    &event,
+                    &chunks,
+                    "did:dht:z6MkInvoker",
+                    4,
+                )
+                .await;
+            if pending {
+                assert!(
+                    matches!(direct, Err(ContextCreationError::EventLogFailed(_))),
+                    "{direct:?}"
+                );
+                assert!(
+                    matches!(in_mode, Err(ContextCreationError::EventLogFailed(_))),
+                    "{in_mode:?}"
+                );
+                assert!(
+                    matches!(with_payload, Err(ContextError::EventLogFailed(_))),
+                    "{with_payload:?}"
+                );
+                assert!(
+                    matches!(verified, Err(ContextCreationError::EventLogFailed(_))),
+                    "{verified:?}"
+                );
+                assert_eq!(
+                    provider.entries(&ctx_id).unwrap().len(),
+                    2,
+                    "a refused append leaves memory unchanged"
+                );
+            } else {
+                direct.expect("direct");
+                in_mode.expect("append_event_in");
+                with_payload.expect("with payload");
+                verified.expect("verified");
+                assert_eq!(provider.entries(&ctx_id).unwrap().len(), 6);
+            }
+        }
     }
 
     /// The fence is checked after the write gate is taken (spec 17 §17.3
