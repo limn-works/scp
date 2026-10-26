@@ -397,8 +397,9 @@ pub const CLOCK_SKEW_TOLERANCE_SECS: u64 = 300;
 /// in each variant's docs are the §9.7.1 check numbers.
 ///
 /// Check 1's role rule is [`SignerNotActive`](Self::SignerNotActive). Check 1's
-/// current-key resolution and check 2 (the resolving document is no older than
-/// [`MAX_ATTESTATION_KEY_RESOLUTION_STALENESS`]) are the runtime caller's: the
+/// current-key resolution and check 2 (the resolving document's resolution is
+/// fresh under [`MAX_ATTESTATION_KEY_RESOLUTION_STALENESS`], as
+/// `scp_kel::ResolvedState::is_fresh` defines it) are the runtime caller's: the
 /// caller resolves `#active` and passes the resolved current key in
 /// [`AttestationVerificationContext::resolved_current_vm_pubkey`]. See
 /// [`verify_attestation`] for the exact caller contract.
@@ -503,8 +504,8 @@ pub struct AttestationVerificationContext<'a> {
     /// **Caller contract (§9.7.1 checks 1–2 — NOT re-checked here).** The caller
     /// MUST resolve the verification method named by
     /// `attestation.signing_key_id` from the signer's DID document, and that
-    /// document MUST be no older than
-    /// [`MAX_ATTESTATION_KEY_RESOLUTION_STALENESS`] (300s). On an
+    /// document's resolution MUST be fresh under
+    /// [`MAX_ATTESTATION_KEY_RESOLUTION_STALENESS`] (§9.18.7; `scp_kel::ResolvedState::is_fresh`). On an
     /// [`AttestationTrigger::Add`] this resolution is **fail-closed** (a
     /// resolution failure rejects the join; no stale/pre-rotation fallback). On
     /// an [`AttestationTrigger::Update`] a *transient resolution failure* may use
@@ -581,8 +582,9 @@ pub const fn require_active_signer(
 /// [`AttestationVerifyError`] for the variant each check maps to.
 ///
 /// Check 1's resolution — the caller resolves the DID's *current* `#active`
-/// key, never the role the record names — and check 2 (the resolving document
-/// is no older than [`MAX_ATTESTATION_KEY_RESOLUTION_STALENESS`]) are the
+/// key, never the role the record names — and check 2 (the resolving document's
+/// resolution is fresh under [`MAX_ATTESTATION_KEY_RESOLUTION_STALENESS`],
+/// as `scp_kel::ResolvedState::is_fresh` defines it) are the
 /// runtime caller's responsibility and are documented as a contract on
 /// [`AttestationVerificationContext::resolved_current_vm_pubkey`]. **This is what
 /// a later wiring slice (S4/S6/S7) MUST enforce before calling**, including the

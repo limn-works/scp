@@ -19,9 +19,9 @@
 //!
 //! # Check 2 is not met here
 //!
-//! §9.7.1 check 2 requires the resolving document to be no older than
+//! §9.7.1 check 2 requires the resolving document's resolution to be fresh under
 //! [`MAX_ATTESTATION_KEY_RESOLUTION_STALENESS`](scp_mls::MAX_ATTESTATION_KEY_RESOLUTION_STALENESS)
-//! (300 s). The [`KeyResolver`] returns a key, not a document with its
+//! (§9.18.7; `scp_kel::ResolvedState::is_fresh`). The [`KeyResolver`] returns a key, not a document with its
 //! resolution time, and the production resolver reads through a DID cache
 //! that refreshes on a 24-hour cycle. The freshness seam is SCP-CRYPTO22-005
 //! and `.docs/prds/keypackage-attestation.json` open question (a).
