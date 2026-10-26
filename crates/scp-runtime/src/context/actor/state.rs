@@ -1755,9 +1755,15 @@ impl PerContextState {
         mode: ContextModeState,
     ) -> Self {
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        // The fixture models a context that creation admitted, so its params
+        // carry a non-empty ceiling: restore and import run the same params
+        // validator as creation and refuse an empty one.
         let handle = ContextHandle::new(
             context_id_str.to_owned(),
-            scp_protocol::context::ContextParams::default(),
+            scp_protocol::context::ContextParams {
+                ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
+                ..scp_protocol::context::ContextParams::default()
+            },
         );
         // Routing axis mirrors the crypto axis: encrypted ⇒ pseudonymous,
         // broadcast ⇒ broadcast. Test fixtures start the pseudonymous

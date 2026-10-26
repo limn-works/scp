@@ -4250,27 +4250,38 @@ pub async fn propose_governance_action_inner(
         ));
     }
 
-    // A migration's destination create rejects an empty ceiling
-    // (construction.md M2), so a proposal carrying one would fail only when it
-    // executes. Reject it here with the typed error, before any proposal is
-    // recorded and after every check that refuses the proposer: the capability
-    // check (when `check_propose_capability` is set) and the presence-only check
+    // The destination of a migration and a child context are created with the
+    // params the proposal carries, and that create runs
+    // `params_validation::validate_params` with `Creation`, so a proposal whose
+    // params fail it would fail only when it executes. Run the same validator
+    // here and refuse such a proposal with `into_proposal_error`'s typed error
+    // (`CeilingRequired(Empty)`, `VersionIncompatible`,
+    // `InvalidMemoryScopeForBroadcast`, `TemplateMismatch`, or `CreationFailed`
+    // naming the field), before any proposal is recorded and after every check
+    // that refuses the proposer: the capability check (when
+    // `check_propose_capability` is set) and the presence-only check
     // (`PermissionDenied`), the proposer-eligibility gate (`PermissionDenied`),
     // the freeze gate (`GovernanceFailed`), and the governance engine's own
     // proposer check (`GovernanceFailed`), which `check_proposer` runs here
     // without recording and `propose` runs again below.
-    if let GovernanceAction::ProposeContextMigration {
-        new_context_params, ..
-    } = &action
-        && new_context_params.ceiling.is_empty()
-    {
+    let proposed_params = match &action {
+        GovernanceAction::ProposeContextMigration {
+            new_context_params, ..
+        } => Some(new_context_params.as_ref()),
+        GovernanceAction::CreateChildContext { params } => Some(params.as_ref()),
+        _ => None,
+    };
+    if let Some(Err(rejection)) = proposed_params.map(|params| {
+        crate::context::params_validation::validate_params(
+            params,
+            crate::context::params_validation::ParamsOrigin::Creation,
+        )
+    }) {
         cell.governance
             .engine
             .check_proposer(proposer_did)
             .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?;
-        return Err(ContextError::CeilingRequired(
-            scp_protocol::context::CeilingDeclaration::Empty,
-        ));
+        return Err(rejection.into_proposal_error());
     }
 
     // ADR-049 Decision 7a: precheck, sign once, apply, all on this one

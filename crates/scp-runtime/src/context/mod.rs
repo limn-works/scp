@@ -50,6 +50,7 @@ pub(crate) mod lifecycle_logic;
 pub(crate) mod manager_methods;
 pub(crate) mod messaging_helpers;
 pub(crate) mod outlets_helpers;
+pub(crate) mod params_validation;
 pub mod persistence;
 pub mod policy;
 pub mod providers;

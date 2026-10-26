@@ -15,6 +15,7 @@ pub mod challenge;
 mod challenge_fixtures;
 pub mod consequence;
 pub mod custody_violation;
+pub mod device_attestation;
 pub mod identifier;
 mod language_tag;
 pub mod participation;

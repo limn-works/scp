@@ -999,6 +999,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/rust-toolchain
       - uses: ./.github/actions/cargo-fetch
+      - run: bash scripts/check-protocol-deps.sh --self-test
       - run: bash scripts/check-protocol-deps.sh
       - run: bash scripts/check-no-shim-reexports.sh
       # A publishable crate with a normal or build dependency on a

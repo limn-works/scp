@@ -1202,7 +1202,8 @@ class TestTrust:
         #    the admin's context_creation_count increments by one.
         child_params = {
             "mode": "Encrypted",
-            "ceiling": [],
+            # The governance arm refuses an empty ceiling, as creation does.
+            "ceiling": ["MessagesRead"],
             "ceiling_policy": "Immutable",
             "promotion_policy": "NoPromotion",
             "roles": [],

@@ -47,7 +47,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use scp_did::DID;
+use scp_did::{DID, Identifier};
 
 use scp_clock::Clock;
 
@@ -549,6 +549,226 @@ pub struct ContextSybilPolicy {
     /// Whether to require device attestation for admission.
     /// `false` by default — desktop gap acknowledged (§9.3).
     pub require_device_attestation: bool,
+
+    /// The context's device-attestation challenge (§9.3.1). The creator draws
+    /// it from a cryptographically secure random source when it sets the
+    /// context to weight the signal. 32 bytes of `0x00`, the default, reads as
+    /// unset, and a reader then returns `Rejected{ContextChallengeUnset}`.
+    #[serde(default, with = "canonical_hex_32_serde")]
+    pub device_attestation_challenge: [u8; 32],
+
+    /// The longest time after minting that a reader accepts a device
+    /// attestation, in seconds (§9.3.1). Defaults to
+    /// [`DEFAULT_DEVICE_ATTESTATION_MAX_AGE_SECS`]; a value above
+    /// [`MAX_DEVICE_ATTESTATION_MAX_AGE_SECS`] fails
+    /// [`validated`](Self::validated).
+    #[serde(default = "default_device_attestation_max_age_secs")]
+    pub device_attestation_max_age_secs: u64,
+
+    /// The App IDs whose App Attest entries this context accepts, each for one
+    /// Apple platform (§9.3.1). Empty, the default, verifies no App Attest
+    /// entry. Two elements naming one (`app_id`, `platform`) pair fail
+    /// [`validated`](Self::validated).
+    #[serde(default)]
+    pub accepted_app_ids: Vec<AcceptedAppId>,
+
+    /// The Apple launch validation categories this context accepts (§9.3.1).
+    /// Empty, the default, accepts category 4 alone.
+    #[serde(default)]
+    pub accepted_validation_categories: Vec<u32>,
+
+    /// When true, an App Attest entry on the iOS path that carries no
+    /// validation-category extension fails (§9.3.1, App Attest check 11).
+    /// `false` by default.
+    #[serde(default)]
+    pub require_validation_category: bool,
+
+    /// The Android packages whose Play Integrity entries this context accepts,
+    /// each naming the one verifier whose verdict it accepts (§9.3.1). Empty,
+    /// the default, verifies no Play Integrity entry.
+    #[serde(default)]
+    pub accepted_android_packages: Vec<AcceptedAndroidPackage>,
+}
+
+/// The default `device_attestation_max_age_secs`: 2,592,000 seconds, 30 days
+/// (§9.3.1).
+pub const DEFAULT_DEVICE_ATTESTATION_MAX_AGE_SECS: u64 = 2_592_000;
+
+/// The largest `device_attestation_max_age_secs` a valid policy states:
+/// 31,536,000 seconds, 365 days (§9.3.1).
+pub const MAX_DEVICE_ATTESTATION_MAX_AGE_SECS: u64 = 31_536_000;
+
+const fn default_device_attestation_max_age_secs() -> u64 {
+    DEFAULT_DEVICE_ATTESTATION_MAX_AGE_SECS
+}
+
+/// The Apple platform an [`AcceptedAppId`] names (§9.3.1). App Attest check 7
+/// reads the platform from the credential certificate, and check 8 matches it
+/// against this value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ApplePlatform {
+    /// iOS and iPadOS.
+    Ios,
+    /// macOS.
+    MacOs,
+}
+
+/// One App ID a context accepts App Attest entries from (§9.3.1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceptedAppId {
+    /// The string whose SHA-256 Apple writes as the attestation's RP ID: on
+    /// iOS the App ID `<Team ID>.<bundle ID>`, on macOS the identifier Apple
+    /// names in place of the bundle ID.
+    pub app_id: String,
+    /// The platform this element accepts the App ID on.
+    pub platform: ApplePlatform,
+    /// The bundle versions this element accepts (App Attest check 12).
+    pub accepted_bundle_versions: Vec<String>,
+}
+
+/// One Android package a context accepts Play Integrity entries from
+/// (§9.3.1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceptedAndroidPackage {
+    /// The Android package name.
+    pub package_name: String,
+    /// The SHA-256 digest of the app's signing certificate, as Google reports
+    /// it in `appIntegrity.certificateSha256Digest`.
+    #[serde(with = "canonical_hex_32_serde")]
+    pub signing_cert_sha256: [u8; 32],
+    /// The identifier of the one party whose verdict this context accepts for
+    /// this package's tokens. Serialized as its `scp:` text form.
+    #[serde(with = "identifier_text_serde")]
+    pub verifier_identifier: Identifier,
+}
+
+/// Serializes a 32-byte value as 64 lowercase hexadecimal characters and
+/// parses only that form, so one value has one encoding, as
+/// [`identifier_text_serde`] does for an identifier. Uppercase, mixed case, a
+/// prefix, whitespace or any other length fails to parse.
+mod canonical_hex_32_serde {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(bytes: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&hex::encode(bytes))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 32], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let text = String::deserialize(deserializer)?;
+        if text.len() != 64 || !text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            return Err(serde::de::Error::custom(
+                "expected 64 lowercase hexadecimal characters",
+            ));
+        }
+        let mut bytes = [0u8; 32];
+        hex::decode_to_slice(&text, &mut bytes).map_err(serde::de::Error::custom)?;
+        Ok(bytes)
+    }
+}
+
+/// Serializes an [`Identifier`] as its canonical `scp:` text form and parses
+/// only that form (`03-identity.md` §3.1).
+mod identifier_text_serde {
+    use scp_did::Identifier;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(identifier: &Identifier, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.collect_str(identifier)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Identifier, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let text = String::deserialize(deserializer)?;
+        text.parse::<Identifier>().map_err(serde::de::Error::custom)
+    }
+}
+
+/// Why a [`ContextSybilPolicy`] fails [`ContextSybilPolicy::validated`]
+/// (§9.3.1).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SybilPolicyError {
+    /// `device_attestation_max_age_secs` exceeds
+    /// [`MAX_DEVICE_ATTESTATION_MAX_AGE_SECS`].
+    #[error("device_attestation_max_age_secs is {value}, above the maximum {max}")]
+    DeviceAttestationMaxAgeTooLarge {
+        /// The policy's value.
+        value: u64,
+        /// [`MAX_DEVICE_ATTESTATION_MAX_AGE_SECS`].
+        max: u64,
+    },
+    /// A `RequiredSignal` for the `DeviceAttestation` category carries a
+    /// `min_strength` other than 1. The signal's strength is always 1, so 0
+    /// states nothing and any value above 1 passes no identity.
+    #[error("a DeviceAttestation required signal has min_strength {min_strength}; it must be 1")]
+    DeviceAttestationMinStrength {
+        /// The required signal's `min_strength`.
+        min_strength: u64,
+    },
+    /// Two `accepted_app_ids` elements name one (`app_id`, `platform`) pair,
+    /// so App Attest check 8 would match both and readers would disagree on
+    /// check 12.
+    #[error("accepted_app_ids lists app_id {app_id:?} on {platform:?} more than once")]
+    DuplicateAcceptedAppId {
+        /// The repeated App ID.
+        app_id: String,
+        /// The repeated platform.
+        platform: ApplePlatform,
+    },
+}
+
+/// A [`ContextSybilPolicy`] that passed [`ContextSybilPolicy::validated`].
+///
+/// [`ContextSybilPolicy::validated`] is the only way to hold one, so a reader
+/// that takes it never runs on a policy §9.3.1 calls invalid.
+///
+/// ```compile_fail,E0451
+/// # use scp_protocol::trust::sybil::{ContextSybilPolicy, ValidatedSybilPolicy};
+/// let policy = ContextSybilPolicy::casual();
+/// let validated = ValidatedSybilPolicy { policy: &policy };
+/// ```
+///
+/// The positive control: [`ContextSybilPolicy::validated`] returns one.
+///
+/// ```
+/// # use scp_protocol::trust::sybil::{ContextSybilPolicy, SybilPolicyError, ValidatedSybilPolicy};
+/// # fn main() -> Result<(), SybilPolicyError> {
+/// let policy = ContextSybilPolicy::casual();
+/// let validated: ValidatedSybilPolicy<'_> = policy.validated()?;
+/// assert_eq!(validated.policy(), &policy);
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ValidatedSybilPolicy<'a> {
+    policy: &'a ContextSybilPolicy,
+}
+
+impl<'a> ValidatedSybilPolicy<'a> {
+    /// The policy that passed validation.
+    #[must_use]
+    pub const fn policy(&self) -> &'a ContextSybilPolicy {
+        self.policy
+    }
+
+    /// The last second at which a reader accepts a device attestation minted
+    /// at `minted_at`: `minted_at` plus `device_attestation_max_age_secs`,
+    /// saturating at `u64::MAX` as §9.3.1 requires of every sum it forms with
+    /// that value.
+    #[must_use]
+    pub const fn device_attestation_expiry(&self, minted_at: u64) -> u64 {
+        minted_at.saturating_add(self.policy.device_attestation_max_age_secs)
+    }
 }
 
 /// A required trust signal for context admission.
@@ -593,6 +813,12 @@ impl ContextSybilPolicy {
             freshness_config: FreshnessWeight::default_config(),
             capacity_policy: CapacityTierPolicy::default_policy(),
             require_device_attestation: false,
+            device_attestation_challenge: [0u8; 32],
+            device_attestation_max_age_secs: DEFAULT_DEVICE_ATTESTATION_MAX_AGE_SECS,
+            accepted_app_ids: Vec::new(),
+            accepted_validation_categories: Vec::new(),
+            require_validation_category: false,
+            accepted_android_packages: Vec::new(),
         }
     }
 
@@ -607,6 +833,12 @@ impl ContextSybilPolicy {
             freshness_config: FreshnessWeight::default_config(),
             capacity_policy: CapacityTierPolicy::default_policy(),
             require_device_attestation: false,
+            device_attestation_challenge: [0u8; 32],
+            device_attestation_max_age_secs: DEFAULT_DEVICE_ATTESTATION_MAX_AGE_SECS,
+            accepted_app_ids: Vec::new(),
+            accepted_validation_categories: Vec::new(),
+            require_validation_category: false,
+            accepted_android_packages: Vec::new(),
         }
     }
 
@@ -641,7 +873,55 @@ impl ContextSybilPolicy {
             freshness_config: FreshnessWeight::default_config(),
             capacity_policy: CapacityTierPolicy::default_policy(),
             require_device_attestation: false,
+            device_attestation_challenge: [0u8; 32],
+            device_attestation_max_age_secs: DEFAULT_DEVICE_ATTESTATION_MAX_AGE_SECS,
+            accepted_app_ids: Vec::new(),
+            accepted_validation_categories: Vec::new(),
+            require_validation_category: false,
+            accepted_android_packages: Vec::new(),
         }
+    }
+}
+
+impl ContextSybilPolicy {
+    /// Checks the policy against every rule §9.3.1 states for its
+    /// device-attestation inputs and returns the only handle a reader takes.
+    ///
+    /// # Errors
+    ///
+    /// - [`SybilPolicyError::DeviceAttestationMaxAgeTooLarge`] when
+    ///   `device_attestation_max_age_secs` exceeds
+    ///   [`MAX_DEVICE_ATTESTATION_MAX_AGE_SECS`].
+    /// - [`SybilPolicyError::DeviceAttestationMinStrength`] when a
+    ///   `RequiredSignal` for the `DeviceAttestation` category has a
+    ///   `min_strength` other than 1.
+    /// - [`SybilPolicyError::DuplicateAcceptedAppId`] when two
+    ///   `accepted_app_ids` elements name one (`app_id`, `platform`) pair.
+    pub fn validated(&self) -> Result<ValidatedSybilPolicy<'_>, SybilPolicyError> {
+        if self.device_attestation_max_age_secs > MAX_DEVICE_ATTESTATION_MAX_AGE_SECS {
+            return Err(SybilPolicyError::DeviceAttestationMaxAgeTooLarge {
+                value: self.device_attestation_max_age_secs,
+                max: MAX_DEVICE_ATTESTATION_MAX_AGE_SECS,
+            });
+        }
+        if let Some(required) = self.required_signals.iter().find(|required| {
+            required.category == TrustSignalCategory::DeviceAttestation
+                && required.min_strength != 1
+        }) {
+            return Err(SybilPolicyError::DeviceAttestationMinStrength {
+                min_strength: required.min_strength,
+            });
+        }
+        let mut seen = std::collections::HashSet::with_capacity(self.accepted_app_ids.len());
+        for accepted in &self.accepted_app_ids {
+            if !seen.insert((accepted.app_id.as_str(), accepted.platform)) {
+                return Err(SybilPolicyError::DuplicateAcceptedAppId {
+                    app_id: accepted.app_id.clone(),
+                    platform: accepted.platform,
+                });
+            }
+        }
+        Ok(ValidatedSybilPolicy { policy: self })
     }
 }
 
@@ -2502,5 +2782,300 @@ mod tests {
             ),
             "a revoked endorsement must not count toward endorsement independence: {result:?}"
         );
+    }
+}
+
+/// The §9.3.1 device-attestation policy inputs: the six fields, the presets'
+/// values, and [`ContextSybilPolicy::validated`].
+#[cfg(test)]
+mod device_attestation_policy_tests {
+    use super::{
+        AcceptedAndroidPackage, AcceptedAppId, ApplePlatform, CapacityTierPolicy,
+        ContextSybilPolicy, DEFAULT_DEVICE_ATTESTATION_MAX_AGE_SECS, FreshnessWeight,
+        MAX_DEVICE_ATTESTATION_MAX_AGE_SECS, RequiredSignal, SybilPolicyError, TrustSignalCategory,
+    };
+    use scp_did::Identifier;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn app_id(app_id: &str, platform: ApplePlatform) -> AcceptedAppId {
+        AcceptedAppId {
+            app_id: app_id.to_owned(),
+            platform,
+            accepted_bundle_versions: vec!["1.0".to_owned()],
+        }
+    }
+
+    fn device_attestation_signal(min_strength: u64) -> RequiredSignal {
+        RequiredSignal {
+            category: TrustSignalCategory::DeviceAttestation,
+            min_strength,
+            max_age_secs: DEFAULT_DEVICE_ATTESTATION_MAX_AGE_SECS,
+            threshold_requirement: None,
+        }
+    }
+
+    /// A policy that sets every device-attestation field to a value other than
+    /// its default, and passes validation.
+    fn populated() -> ContextSybilPolicy {
+        ContextSybilPolicy {
+            device_attestation_challenge: [0x5a; 32],
+            device_attestation_max_age_secs: 86_400,
+            accepted_app_ids: vec![app_id("ABCDE12345.com.example.scp", ApplePlatform::Ios)],
+            accepted_validation_categories: vec![4, 5],
+            require_validation_category: true,
+            accepted_android_packages: vec![AcceptedAndroidPackage {
+                package_name: "com.example.scp".to_owned(),
+                signing_cert_sha256: [0x11; 32],
+                verifier_identifier: Identifier::from_bytes([0x22; 32]),
+            }],
+            required_signals: vec![device_attestation_signal(1)],
+            ..ContextSybilPolicy::casual()
+        }
+    }
+
+    /// The policy has exactly the six §9.3.1 device-attestation fields beside
+    /// the six it had before. The pattern names every field and has no `..`,
+    /// so adding or removing a field breaks the build.
+    #[test]
+    fn policy_has_exactly_six_device_attestation_fields() {
+        let ContextSybilPolicy {
+            min_signal_breadth: _,
+            min_weighted_strength: _,
+            required_signals: _,
+            freshness_config: _,
+            capacity_policy: _,
+            require_device_attestation: _,
+            device_attestation_challenge,
+            device_attestation_max_age_secs,
+            accepted_app_ids,
+            accepted_validation_categories,
+            require_validation_category,
+            accepted_android_packages,
+        } = populated();
+        let _: [u8; 32] = device_attestation_challenge;
+        let _: u64 = device_attestation_max_age_secs;
+        let _: Vec<AcceptedAppId> = accepted_app_ids;
+        let _: Vec<u32> = accepted_validation_categories;
+        let _: bool = require_validation_category;
+        let _: Vec<AcceptedAndroidPackage> = accepted_android_packages;
+    }
+
+    /// `casual()`, `standard()` and `high_trust()` each take every §9.3.1
+    /// default and require no device attestation.
+    #[test]
+    fn presets_device_attestation_defaults() {
+        for (name, preset) in [
+            ("casual", ContextSybilPolicy::casual()),
+            ("standard", ContextSybilPolicy::standard()),
+            ("high_trust", ContextSybilPolicy::high_trust()),
+        ] {
+            assert!(!preset.require_device_attestation, "{name}");
+            assert!(
+                preset
+                    .required_signals
+                    .iter()
+                    .all(|required| required.category != TrustSignalCategory::DeviceAttestation),
+                "{name}"
+            );
+            assert_eq!(preset.device_attestation_challenge, [0u8; 32], "{name}");
+            assert_eq!(preset.device_attestation_max_age_secs, 2_592_000, "{name}");
+            assert!(preset.accepted_app_ids.is_empty(), "{name}");
+            assert!(preset.accepted_validation_categories.is_empty(), "{name}");
+            assert!(!preset.require_validation_category, "{name}");
+            assert!(preset.accepted_android_packages.is_empty(), "{name}");
+            assert!(preset.validated().is_ok(), "{name}");
+        }
+    }
+
+    /// A policy serialized before the six fields existed reads every one at its
+    /// §9.3.1 default.
+    #[test]
+    fn missing_device_attestation_fields_read_as_defaults() -> TestResult {
+        let preset = ContextSybilPolicy::standard();
+        let earlier = serde_json::json!({
+            "min_signal_breadth": preset.min_signal_breadth,
+            "min_weighted_strength": preset.min_weighted_strength,
+            "required_signals": preset.required_signals,
+            "freshness_config": FreshnessWeight::default_config(),
+            "capacity_policy": CapacityTierPolicy::default_policy(),
+            "require_device_attestation": false,
+        });
+        let read: ContextSybilPolicy = serde_json::from_value(earlier)?;
+        assert_eq!(read, preset);
+        Ok(())
+    }
+
+    /// Every field survives JSON and `MessagePack`, and the verifier identifier
+    /// travels as its `scp:` text form.
+    #[test]
+    fn device_attestation_fields_round_trip() -> TestResult {
+        let policy = populated();
+        let json = serde_json::to_value(&policy)?;
+        assert_eq!(
+            json["accepted_android_packages"][0]["verifier_identifier"],
+            serde_json::Value::String(Identifier::from_bytes([0x22; 32]).to_string())
+        );
+        assert_eq!(serde_json::from_value::<ContextSybilPolicy>(json)?, policy);
+        let packed = rmp_serde::to_vec_named(&policy)?;
+        assert_eq!(
+            rmp_serde::from_slice::<ContextSybilPolicy>(&packed)?,
+            policy
+        );
+        Ok(())
+    }
+
+    /// A verifier identifier that is not the canonical text form fails to
+    /// parse; the uppercase text of a valid identifier is the must-fail case.
+    #[test]
+    fn non_canonical_verifier_identifier_is_refused() -> TestResult {
+        let mut json = serde_json::to_value(populated())?;
+        let upper = Identifier::from_bytes([0x22; 32])
+            .to_string()
+            .to_uppercase();
+        json["accepted_android_packages"][0]["verifier_identifier"] =
+            serde_json::Value::String(upper);
+        assert!(serde_json::from_value::<ContextSybilPolicy>(json).is_err());
+        Ok(())
+    }
+
+    /// The challenge and a package's signing-certificate digest parse only as
+    /// 64 lowercase hexadecimal characters. The uppercase text of a valid
+    /// value, a mixed-case value, a `0x` prefix and a 63-character value each
+    /// fail; the lowercase text of the same value parses.
+    #[test]
+    fn non_canonical_challenge_hex_is_refused() -> TestResult {
+        type ReadField = fn(&ContextSybilPolicy) -> [u8; 32];
+        let base = serde_json::to_value(populated())?;
+        let lower = hex::encode([0x3c; 32]);
+        let non_canonical = [
+            lower.to_uppercase(),
+            format!("3C{}", &lower[2..]),
+            format!("0x{}", &lower[2..]),
+            lower[1..].to_owned(),
+        ];
+        let challenge: ReadField = |p| p.device_attestation_challenge;
+        let signing_cert: ReadField = |p| {
+            p.accepted_android_packages
+                .first()
+                .map_or([0u8; 32], |package| package.signing_cert_sha256)
+        };
+        let fields = [
+            ("/device_attestation_challenge", challenge),
+            (
+                "/accepted_android_packages/0/signing_cert_sha256",
+                signing_cert,
+            ),
+        ];
+        for (pointer, read) in fields {
+            for text in &non_canonical {
+                let mut json = base.clone();
+                let field = json.pointer_mut(pointer).ok_or("field present")?;
+                *field = serde_json::Value::String(text.clone());
+                assert!(
+                    serde_json::from_value::<ContextSybilPolicy>(json).is_err(),
+                    "{pointer} must refuse {text}"
+                );
+            }
+            let mut json = base.clone();
+            let field = json.pointer_mut(pointer).ok_or("field present")?;
+            *field = serde_json::Value::String(lower.clone());
+            let parsed = serde_json::from_value::<ContextSybilPolicy>(json)?;
+            assert_eq!(
+                read(&parsed),
+                [0x3c; 32],
+                "{pointer} must parse its lowercase text"
+            );
+        }
+        Ok(())
+    }
+
+    /// 31,536,000 seconds passes and one second more fails.
+    #[test]
+    fn max_age_above_one_year_fails_validation() {
+        let at_limit = ContextSybilPolicy {
+            device_attestation_max_age_secs: MAX_DEVICE_ATTESTATION_MAX_AGE_SECS,
+            ..populated()
+        };
+        assert!(at_limit.validated().is_ok());
+        let over = ContextSybilPolicy {
+            device_attestation_max_age_secs: 31_536_001,
+            ..populated()
+        };
+        assert_eq!(
+            over.validated(),
+            Err(SybilPolicyError::DeviceAttestationMaxAgeTooLarge {
+                value: 31_536_001,
+                max: 31_536_000,
+            })
+        );
+    }
+
+    /// A `DeviceAttestation` required signal passes validation only with
+    /// `min_strength` 1; 0 and 2 fail. A `min_strength` of 2 on another
+    /// category stays valid.
+    #[test]
+    fn device_attestation_min_strength_other_than_one_fails_validation() {
+        assert!(populated().validated().is_ok());
+        for min_strength in [0, 2] {
+            let policy = ContextSybilPolicy {
+                required_signals: vec![device_attestation_signal(min_strength)],
+                ..populated()
+            };
+            assert_eq!(
+                policy.validated(),
+                Err(SybilPolicyError::DeviceAttestationMinStrength { min_strength })
+            );
+        }
+        let other_category = ContextSybilPolicy {
+            required_signals: vec![RequiredSignal {
+                category: TrustSignalCategory::Endorsement,
+                ..device_attestation_signal(2)
+            }],
+            ..populated()
+        };
+        assert!(other_category.validated().is_ok());
+    }
+
+    /// One (`app_id`, `platform`) pair in two elements fails validation; the
+    /// same `app_id` on the other platform passes.
+    #[test]
+    fn dup_app_id_same_platform_fails_other_platform_passes() {
+        let other_platform = ContextSybilPolicy {
+            accepted_app_ids: vec![
+                app_id("ABCDE12345.com.example.scp", ApplePlatform::Ios),
+                app_id("ABCDE12345.com.example.scp", ApplePlatform::MacOs),
+            ],
+            ..populated()
+        };
+        assert!(other_platform.validated().is_ok());
+        let same_platform = ContextSybilPolicy {
+            accepted_app_ids: vec![
+                app_id("ABCDE12345.com.example.scp", ApplePlatform::Ios),
+                AcceptedAppId {
+                    accepted_bundle_versions: vec!["2.0".to_owned()],
+                    ..app_id("ABCDE12345.com.example.scp", ApplePlatform::Ios)
+                },
+            ],
+            ..populated()
+        };
+        assert_eq!(
+            same_platform.validated(),
+            Err(SybilPolicyError::DuplicateAcceptedAppId {
+                app_id: "ABCDE12345.com.example.scp".to_owned(),
+                platform: ApplePlatform::Ios,
+            })
+        );
+    }
+
+    /// `minted_at` plus the maximum age saturates at `u64::MAX` rather than
+    /// wrapping to a time in the past.
+    #[test]
+    fn max_age_sum_saturates() -> TestResult {
+        let policy = populated();
+        let validated = policy.validated()?;
+        assert_eq!(validated.device_attestation_expiry(1_000), 1_000 + 86_400);
+        assert_eq!(validated.device_attestation_expiry(u64::MAX - 10), u64::MAX);
+        Ok(())
     }
 }

@@ -81,6 +81,13 @@ pub enum TemplateError {
     /// permitted. Projection is only meaningful for broadcast contexts.
     #[error("projection_policy is only valid for Broadcast contexts, but mode is Encrypted")]
     ProjectionPolicyOnEncrypted,
+
+    /// `sybil_policy` fails [`ContextSybilPolicy::validated`]
+    /// (`09-security-model.md` §9.3.1).
+    ///
+    /// [`ContextSybilPolicy::validated`]: crate::trust::sybil::ContextSybilPolicy::validated
+    #[error("invalid sybil_policy: {0}")]
+    InvalidSybilPolicy(#[from] crate::trust::sybil::SybilPolicyError),
 }
 
 // ---------------------------------------------------------------------------
@@ -804,14 +811,21 @@ pub fn validate_against_template(params: &ContextParams) -> Result<(), TemplateE
 /// Currently enforces:
 /// - `projection_policy` must be `None` for [`ContextMode::Encrypted`] contexts.
 ///   Projection is a broadcast-only feature (spec section 18.11.2.1).
+/// - `sybil_policy`, when present, passes
+///   [`ContextSybilPolicy::validated`](crate::trust::sybil::ContextSybilPolicy::validated)
+///   (spec section 9.3.1).
 ///
 /// # Errors
 ///
 /// Returns [`TemplateError::ProjectionPolicyOnEncrypted`] if `projection_policy`
-/// is `Some(_)` and `mode` is `Encrypted`.
+/// is `Some(_)` and `mode` is `Encrypted`, and
+/// [`TemplateError::InvalidSybilPolicy`] if `sybil_policy` fails validation.
 pub fn validate_context_params(params: &ContextParams) -> Result<(), TemplateError> {
     if params.mode == ContextMode::Encrypted && params.projection_policy.is_some() {
         return Err(TemplateError::ProjectionPolicyOnEncrypted);
+    }
+    if let Some(policy) = &params.sybil_policy {
+        policy.validated()?;
     }
     Ok(())
 }
@@ -2269,6 +2283,35 @@ mod tests {
             ..ContextParams::default()
         };
         assert!(validate_context_params(&params).is_ok());
+    }
+
+    /// A `sybil_policy` that fails §9.3.1 validation is refused; the same
+    /// params with a valid policy pass, so the policy is the only cause.
+    #[test]
+    fn validate_context_params_rejects_invalid_sybil_policy() {
+        use crate::trust::sybil::{ContextSybilPolicy, SybilPolicyError};
+        let valid = ContextParams {
+            mode: ContextMode::Encrypted,
+            sybil_policy: Some(ContextSybilPolicy::standard()),
+            ..ContextParams::default()
+        };
+        assert!(validate_context_params(&valid).is_ok());
+        let invalid = ContextParams {
+            sybil_policy: Some(ContextSybilPolicy {
+                device_attestation_max_age_secs: 31_536_001,
+                ..ContextSybilPolicy::standard()
+            }),
+            ..valid
+        };
+        assert!(matches!(
+            validate_context_params(&invalid),
+            Err(TemplateError::InvalidSybilPolicy(
+                SybilPolicyError::DeviceAttestationMaxAgeTooLarge {
+                    value: 31_536_001,
+                    ..
+                }
+            ))
+        ));
     }
 
     #[test]

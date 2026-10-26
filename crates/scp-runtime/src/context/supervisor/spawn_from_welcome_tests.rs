@@ -1060,6 +1060,202 @@ async fn over_cap_genesis_outlets_are_rejected_before_the_kp_consume() {
     );
 }
 
+/// Precheck C runs `validate_context_params`, the validator create, import,
+/// restore and governance run, on the inviter's params. A creator-signed
+/// bundle whose sybil policy carries a device-attestation max age one second
+/// above the §9.3.1 one-year maximum is refused before the consume, and the
+/// joiner persists no snapshot a later restore would refuse. Non-vacuity: the
+/// SAME reservation and Welcome, retried with the max age at the maximum,
+/// succeed and persist, so the KeyPackage was never burned and the max age
+/// alone decided the refusal.
+#[tokio::test]
+async fn welcome_rejects_invalid_policy_before_the_kp_consume() {
+    use scp_protocol::trust::sybil::{ContextSybilPolicy, MAX_DEVICE_ATTESTATION_MAX_AGE_SECS};
+
+    let bob = DID::from(BOB_DID);
+    let ctx_id = ctx_hex(0x2e);
+
+    let rec = RecordingPersistence::default();
+    let (sup, _bob_crypto) = bob_supervisor(Some(Box::new(rec.clone())));
+    let (reservation_id, kp_public_bytes) = reserve_bob_kp(&sup, &bob).await;
+    let (_alice, welcome) = alice_welcome_for(&ctx_id, &kp_public_bytes);
+
+    let bob_recipient = wrapping_point(&sup, &bob).await;
+    let make_req = |max_age: u64| {
+        let params = ContextParams {
+            sybil_policy: Some(ContextSybilPolicy {
+                device_attestation_max_age_secs: max_age,
+                ..ContextSybilPolicy::casual()
+            }),
+            ..joiner_params()
+        };
+        let bundle = signed_bundle(
+            &alice_signing_key(),
+            &DID::from(ALICE_DID),
+            &ctx_id,
+            &params,
+            welcome.clone(),
+        );
+        seal_bundle(
+            &bundle,
+            &bob_recipient,
+            &ctx_id,
+            &DID::from(ALICE_DID),
+            reservation_id.clone(),
+            some_pseudonym(),
+        )
+    };
+
+    let err = sup
+        .spawn_actor_from_welcome(
+            bob.clone(),
+            make_req(MAX_DEVICE_ATTESTATION_MAX_AGE_SECS + 1),
+        )
+        .await
+        .expect_err("an invalid inviter sybil policy must be refused on the joiner");
+    // `let-else { return }` after the assert, for the reason the over-cap
+    // outlet test above records.
+    assert!(
+        matches!(err, crate::context::ContextError::CreationFailed(_)),
+        "expected CreationFailed for an invalid sybil policy, got {err:?}"
+    );
+    let crate::context::ContextError::CreationFailed(message) = &err else {
+        return;
+    };
+    assert!(
+        message.contains("sybil_policy"),
+        "the refusal must name the sybil policy (not some other precheck), got {message}"
+    );
+    assert!(
+        sup.lookup(&ctx_id).is_none(),
+        "no actor may be registered after an invalid sybil policy"
+    );
+    assert!(
+        rec.store.get(&ctx_id).is_none(),
+        "the joiner must persist no snapshot for a refused sybil policy"
+    );
+
+    sup.spawn_actor_from_welcome(bob, make_req(MAX_DEVICE_ATTESTATION_MAX_AGE_SECS))
+        .await
+        .expect("the valid-policy retry succeeds — the KeyPackage was never burned");
+    assert!(
+        rec.store.get(&ctx_id).is_some(),
+        "the valid-policy retry persists the joiner's snapshot"
+    );
+}
+
+/// Sends a creator-signed Welcome whose params are `refused` and asserts that
+/// Precheck C refuses it before the KeyPackage consume: `CreationFailed`
+/// naming `field`, no actor registered, no snapshot persisted. Non-vacuity:
+/// the SAME reservation and Welcome, retried with `joiner_params()`, succeed
+/// and persist, so the KeyPackage was never burned and the one field
+/// `refused` changes decided the refusal.
+async fn assert_welcome_refuses_before_the_kp_consume(
+    seed: u8,
+    refused: ContextParams,
+    field: &str,
+) {
+    let bob = DID::from(BOB_DID);
+    let ctx_id = ctx_hex(seed);
+
+    let rec = RecordingPersistence::default();
+    let (sup, _bob_crypto) = bob_supervisor(Some(Box::new(rec.clone())));
+    let (reservation_id, kp_public_bytes) = reserve_bob_kp(&sup, &bob).await;
+    let (_alice, welcome) = alice_welcome_for(&ctx_id, &kp_public_bytes);
+
+    let bob_recipient = wrapping_point(&sup, &bob).await;
+    let make_req = |params: &ContextParams| {
+        let bundle = signed_bundle(
+            &alice_signing_key(),
+            &DID::from(ALICE_DID),
+            &ctx_id,
+            params,
+            welcome.clone(),
+        );
+        seal_bundle(
+            &bundle,
+            &bob_recipient,
+            &ctx_id,
+            &DID::from(ALICE_DID),
+            reservation_id.clone(),
+            some_pseudonym(),
+        )
+    };
+
+    let err = sup
+        .spawn_actor_from_welcome(bob.clone(), make_req(&refused))
+        .await
+        .expect_err("params that fail a params check must be refused on the joiner");
+    assert!(
+        matches!(&err, crate::context::ContextError::CreationFailed(m) if m.contains(field)),
+        "expected CreationFailed naming {field}, got {err:?}"
+    );
+    assert!(
+        sup.lookup(&ctx_id).is_none(),
+        "no actor may be registered after a refused {field}"
+    );
+    assert!(
+        rec.store.get(&ctx_id).is_none(),
+        "the joiner must persist no snapshot for a refused {field}"
+    );
+
+    sup.spawn_actor_from_welcome(bob, make_req(&joiner_params()))
+        .await
+        .expect("the valid-params retry succeeds — the KeyPackage was never burned");
+    assert!(
+        rec.store.get(&ctx_id).is_some(),
+        "the valid-params retry persists the joiner's snapshot"
+    );
+}
+
+/// Precheck C refuses inviter params with an empty ceiling before the
+/// consume.
+#[tokio::test]
+async fn welcome_rejects_an_empty_ceiling_before_the_kp_consume() {
+    assert_welcome_refuses_before_the_kp_consume(
+        0x31,
+        crate::context::params_validation::failing::empty_ceiling(joiner_params()),
+        "ceiling is empty",
+    )
+    .await;
+}
+
+/// Precheck C refuses inviter params with an invalid consequence rule before
+/// the consume.
+#[tokio::test]
+async fn welcome_rejects_an_invalid_consequence_rule_before_the_kp_consume() {
+    assert_welcome_refuses_before_the_kp_consume(
+        0x32,
+        crate::context::params_validation::failing::empty_suspension_rule(joiner_params()),
+        "consequence_rules[0]",
+    )
+    .await;
+}
+
+/// Precheck C refuses inviter params whose pricing formula reads an
+/// unpopulated metric before the consume.
+#[tokio::test]
+async fn welcome_rejects_an_unavailable_pricing_metric_before_the_kp_consume() {
+    assert_welcome_refuses_before_the_kp_consume(
+        0x33,
+        crate::context::params_validation::failing::unavailable_pricing_metric(joiner_params()),
+        "economic_policy",
+    )
+    .await;
+}
+
+/// Precheck C refuses inviter params for a Broadcast context without `Full`
+/// memory before the consume.
+#[tokio::test]
+async fn welcome_rejects_an_ephemeral_broadcast_before_the_kp_consume() {
+    assert_welcome_refuses_before_the_kp_consume(
+        0x34,
+        crate::context::params_validation::failing::ephemeral_broadcast(joiner_params()),
+        "memory_scope",
+    )
+    .await;
+}
+
 // ---------------------------------------------------------------------------
 // Test A2 — the joiner seeds its ABSOLUTE MLS epoch from the joined group.
 // ---------------------------------------------------------------------------
@@ -2270,12 +2466,15 @@ async fn tamper_ceiling_policy_mismatch_is_refused_before_install() {
 }
 
 /// The caller's `mode` diverges (Encrypted committed vs Broadcast requested):
-/// `ModeMismatch` → refused before install.
+/// `ModeMismatch` → refused before install. The tampered params carry `Full`
+/// memory, so they pass Precheck C's §5.11 Broadcast memory-scope check and
+/// reach the binding check.
 #[tokio::test]
 async fn tamper_mode_mismatch_is_refused_before_install() {
     let rec = RecordingPersistence::default();
     let mut tampered = joiner_params();
     tampered.mode = ContextMode::Broadcast;
+    tampered.memory_scope = scp_protocol::context::MemoryScope::Full;
     let (result, j) = run_join_with(
         0xc4,
         Some(Box::new(rec.clone())),
