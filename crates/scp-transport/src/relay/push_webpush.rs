@@ -57,6 +57,13 @@
 //! [`SendDeferral::LookupPoolFull`], records no back-off and counts nothing,
 //! and the dispatcher retries the wake when a lookup frees a permit.
 //!
+//! **Own addresses.** While the relay's own-address set is unresolved, a
+//! send checks no endpoint and sends nothing: it returns
+//! [`SendDeferral::OwnAddressesUnresolved`] and records no back-off, and the
+//! dispatcher counts the wake as transient, toward no removal (ADR-004
+//! **Endpoint refusal**). [`EndpointError::says_nothing_about_endpoint`]
+//! sorts every relay-state error, at the literal check and at the lookup.
+//!
 //! No log line or `Debug` output carries the endpoint, its host or origin,
 //! `p256dh`, `auth`, the VAPID key or a JWT.
 
@@ -82,7 +89,7 @@ use super::push::{
     SendDeferral, compact_jws_bytes, read_bounded, transport_error_kind,
 };
 use super::push_endpoint::{
-    CheckedResolver, EndpointError, Nat64Prefixes, OwnAddresses, parse_endpoint,
+    CheckedResolver, EndpointError, Nat64Prefixes, OwnAddresses, ParsedEndpoint, parse_endpoint,
 };
 use crate::backoff::ReconnectBackoff;
 
@@ -365,40 +372,6 @@ impl Backoffs {
     }
 }
 
-/// The most verbose level the relay logs from a crate outside SCP.
-#[cfg(any(test, feature = "startup"))]
-const OTHER_CRATE_CAP: tracing::Level = tracing::Level::INFO;
-
-/// The target prefix of every SCP crate: each is named `scp-*`, so its
-/// module path, the default `tracing` and `log` target, starts with `scp_`.
-#[cfg(any(test, feature = "startup"))]
-const SCP_CRATE_PREFIX: &str = "scp_";
-
-/// Whether the relay's log keeps an event with `metadata`. A `WebPush`
-/// endpoint's host is a registrant's choice that PUSH-022 keeps out of the
-/// log. A dependency's DEBUG or TRACE lines can name the host a connection
-/// goes to: hyper-util's connector and pool, reqwest's connector, and rustls's
-/// client handshake (`No cached session for DnsName(..)`) all do. So only an
-/// SCP crate's event is kept below [`OTHER_CRATE_CAP`]; every other target,
-/// including a crate added later, is held at that cap whatever `RUST_LOG`
-/// asks for. The relay's tracing subscriber (`startup`) and the push sender
-/// tests' log capture apply this one predicate.
-#[cfg(any(test, feature = "startup"))]
-pub(crate) fn admits_log_event(metadata: &tracing::Metadata<'_>) -> bool {
-    metadata.target().starts_with(SCP_CRATE_PREFIX) || *metadata.level() <= OTHER_CRATE_CAP
-}
-
-/// The endpoint origin of a registered `WebPush` token, the key of the
-/// per-origin back-off and in-flight cap. `None` when the token or its
-/// endpoint does not decode; the send of such a token sends nothing.
-#[cfg(feature = "push-store")]
-pub(crate) fn token_origin(token: &[u8]) -> Option<String> {
-    let subscription = WebPushSubscription::decode(token).ok()?;
-    parse_endpoint(subscription.endpoint())
-        .ok()
-        .map(|parsed| parsed.aud().to_owned())
-}
-
 /// Whether a request error is one spec 10 §10.7.1 **Unreachable `WebPush`
 /// push service** counts: the request deadline passed, or the connection was
 /// refused, reset or aborted before an answer arrived.
@@ -553,6 +526,22 @@ impl WebPushSender {
         self.vapid_key.public_key()
     }
 
+    /// The VAPID public key as the relay publishes it in
+    /// `relay_config.webpush_vapid_key` (spec 10 §10.7.1): the base64url,
+    /// unpadded form of the 65-byte uncompressed point, 87 characters.
+    #[must_use]
+    pub fn vapid_k(&self) -> &str {
+        &self.vapid_k
+    }
+
+    /// The relay's own-address handle this sender's endpoint checks read.
+    /// Relay startup keeps it current with
+    /// [`track_own_addresses`](super::push_endpoint::track_own_addresses).
+    #[must_use]
+    pub fn own_addresses(&self) -> OwnAddresses {
+        self.resolver.own_addresses()
+    }
+
     /// The registration-time ADR-004 check of `endpoint` (PUSH-022): its URL
     /// rules, then its IP literal or every address its host resolves to.
     ///
@@ -603,23 +592,47 @@ impl WebPushSender {
         self.resolver.exhaust_permits()
     }
 
+    /// Parses `subscription`'s endpoint and checks an IP-literal host, or
+    /// returns the attempt that ends the send before any request.
+    ///
+    /// Only a refusal counts toward removal. An error from the relay's own
+    /// state ([`EndpointError::says_nothing_about_endpoint`]) defers the
+    /// wake, with no back-off step.
+    fn checked_endpoint(
+        &self,
+        subscription: &WebPushSubscription,
+    ) -> Result<ParsedEndpoint, SendAttempt> {
+        let parsed = parse_endpoint(subscription.endpoint()).map_err(|error| {
+            tracing::debug!(platform = "webpush", %error, "endpoint refused before sending");
+            SendAttempt::Sent(PushSendOutcome::InvalidToken)
+        })?;
+        if let Err(error) = self.resolver.check_literal(&parsed) {
+            if let Some(deferral) = error.says_nothing_about_endpoint() {
+                tracing::debug!(platform = "webpush", %error, "endpoint not checked; wake deferred");
+                return Err(SendAttempt::Deferred(deferral));
+            }
+            if error.is_refusal() {
+                tracing::debug!(platform = "webpush", %error, "endpoint refused before sending");
+                return Err(SendAttempt::Sent(PushSendOutcome::InvalidToken));
+            }
+            tracing::debug!(platform = "webpush", %error, "endpoint not checked; wake not sent");
+            return Err(SendAttempt::Sent(PushSendOutcome::Transient));
+        }
+        Ok(parsed)
+    }
+
     /// Sends one wake signal to `subscription`, or defers it without
     /// sending: [`SendDeferral::BackingOff`] at once while the endpoint's
-    /// origin is backing off, and [`SendDeferral::LookupPoolFull`] when the
-    /// relay's endpoint lookup pool is full. A deferred send records no
-    /// back-off step. It never waits out a back-off.
+    /// origin is backing off, [`SendDeferral::LookupPoolFull`] when the
+    /// relay's endpoint lookup pool is full, and
+    /// [`SendDeferral::OwnAddressesUnresolved`] while the relay's own-address
+    /// set is unresolved. A deferred send records no back-off step. It never
+    /// waits out a back-off.
     pub async fn send(&self, subscription: &WebPushSubscription) -> SendAttempt {
-        let parsed = match parse_endpoint(subscription.endpoint()) {
+        let parsed = match self.checked_endpoint(subscription) {
             Ok(parsed) => parsed,
-            Err(error) => {
-                tracing::debug!(platform = "webpush", %error, "endpoint refused before sending");
-                return SendAttempt::Sent(PushSendOutcome::InvalidToken);
-            }
+            Err(ended) => return ended,
         };
-        if let Err(error) = self.resolver.check_literal(&parsed) {
-            tracing::debug!(platform = "webpush", %error, "endpoint refused before sending");
-            return SendAttempt::Sent(PushSendOutcome::InvalidToken);
-        }
         let aud = parsed.aud();
         // The dispatcher holds a wake for an origin in back-off; this check
         // covers a back-off that began after it looked.
@@ -678,11 +691,12 @@ impl WebPushSender {
                 outcome
             }
             Err(error) => match endpoint_error_in(&error) {
-                Some(EndpointError::LookupPoolFull) => {
-                    // The relay's own pool was full: nothing is known about
-                    // the endpoint, so no back-off step and no count.
-                    tracing::debug!(platform = "webpush", "endpoint lookup pool full; wake held");
-                    return SendAttempt::Deferred(SendDeferral::LookupPoolFull);
+                Some(found) if let Some(deferral) = found.says_nothing_about_endpoint() => {
+                    // The relay's own state stopped the lookup: nothing is
+                    // known about the endpoint, so no back-off step and no
+                    // count.
+                    tracing::debug!(platform = "webpush", error = %found, "endpoint not resolved; wake deferred");
+                    return SendAttempt::Deferred(deferral);
                 }
                 Some(refusal) if refusal.is_refusal() => {
                     tracing::debug!(platform = "webpush", error = %refusal, "endpoint refused at connect");
@@ -786,7 +800,7 @@ pub(crate) mod tests {
     use scp_crypto::p256::jose::es256_verify_lenient;
 
     use super::super::log_capture::LogCapture;
-    use super::super::push::PushSender;
+    use super::super::push::{PushSender, admits_log_event};
     use super::super::push_test_server::{
         CapturedRequest, HUNG_HOSTS, Reply, TLS_TEST_HOSTS, TestServer, TlsTestServer, hung_host,
     };
@@ -1329,6 +1343,81 @@ pub(crate) mod tests {
             Some(EndpointError::Refused(_))
         ));
         assert!(server.requests().await.is_empty());
+        Ok(())
+    }
+
+    /// PUSH-023 criterion 7: an endpoint naming one of the relay's own
+    /// addresses, as a literal or through its host name, gets no request,
+    /// and the sender reads the set its [`OwnAddresses`] handle holds at the
+    /// moment of the send. While the set is unresolved the sender sends
+    /// nothing and defers the wake with
+    /// [`SendDeferral::OwnAddressesUnresolved`], at the literal check and at
+    /// the host's lookup alike, and records no back-off for the origin, so
+    /// once the set resolves the same sender delivers at once. A second
+    /// sender with no own address delivers to the same endpoints, so the
+    /// refusal comes from the own-address rule alone.
+    #[tokio::test]
+    async fn endpoint_at_an_own_address_gets_no_request() -> TestResult {
+        use super::super::push_endpoint::OwnAddressSet;
+
+        let server = TlsTestServer::start_routed(vec![("/", vec![Reply::empty(201); 3])]).await;
+        let port = port_of(&server.endpoint("push.example.net", "/"))?;
+        let endpoints = [
+            server.endpoint("push.example.net", PATH),
+            format!("https://127.0.0.1:{port}{PATH}"),
+        ];
+        let sender = sender_for(&server, true, clock())?;
+        let own = sender.own_addresses();
+        own.replace(Some(OwnAddressSet::new([IpAddr::V4(Ipv4Addr::LOCALHOST)])));
+        for (i, endpoint) in endpoints.iter().enumerate() {
+            let (_, subscription) = subscribe(endpoint.clone())?;
+            assert_eq!(
+                sender.send(&subscription).await,
+                SendAttempt::Sent(PushSendOutcome::InvalidToken),
+                "endpoint #{i}"
+            );
+        }
+        own.replace(None);
+        for (i, endpoint) in endpoints.iter().enumerate() {
+            let (_, subscription) = subscribe(endpoint.clone())?;
+            for _ in 0..3 {
+                assert_eq!(
+                    sender.send(&subscription).await,
+                    SendAttempt::Deferred(SendDeferral::OwnAddressesUnresolved),
+                    "endpoint #{i} while unresolved"
+                );
+            }
+            let aud = super::super::push_endpoint::parse_endpoint(endpoint)?
+                .aud()
+                .to_owned();
+            assert_eq!(sender.retry_at(&aud), None, "endpoint #{i} backs off");
+        }
+        assert!(server.requests().await.is_empty());
+
+        // Resolved, with no own address: the same sender delivers at once.
+        own.replace(Some(OwnAddressSet::new([])));
+        let (_, subscription) = subscribe(endpoints[0].clone())?;
+        assert_eq!(
+            sender.send(&subscription).await,
+            SendAttempt::Sent(PushSendOutcome::Delivered)
+        );
+
+        // The control: with no own address the host name is delivered. The
+        // test certificate names host names only, so the literal fails TLS
+        // and is transient, but the address rule does not refuse it.
+        let control = sender_for(&server, true, clock())?;
+        let (_, subscription) = subscribe(endpoints[0].clone())?;
+        assert_eq!(
+            control.send(&subscription).await,
+            SendAttempt::Sent(PushSendOutcome::Delivered)
+        );
+        let (_, subscription) = subscribe(endpoints[1].clone())?;
+        assert_eq!(
+            control.send(&subscription).await,
+            SendAttempt::Sent(PushSendOutcome::Transient)
+        );
+        // The resolved sender's delivery and the control's.
+        assert_eq!(server.requests().await.len(), 2);
         Ok(())
     }
 

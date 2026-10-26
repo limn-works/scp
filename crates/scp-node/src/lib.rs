@@ -69,8 +69,8 @@ pub use self_host::{
 // lowering in `config`; the `pub use` brings them into crate-root scope for
 // both that path and external consumers.
 pub use config::{
-    DhtMode, ExplicitIdentity, IdentitySource, NatSlot, Node, NodeConfig, PushSlot, Reach, TlsMode,
-    validate_reach_and_tls,
+    DhtMode, ExplicitIdentity, IdentitySource, NatSlot, Node, NodeConfig, NodePushProviders,
+    PushSlot, Reach, TlsMode, validate_reach_and_tls,
 };
 
 // ---------------------------------------------------------------------------
@@ -277,6 +277,24 @@ pub enum NodeError {
     /// TLS provisioning failed.
     #[error("TLS error: {0}")]
     Tls(#[from] tls::TlsError),
+
+    /// The push selection holds a `WebPush` sender, but the node is starting
+    /// on a path that serves no `.well-known/scp` document, so a browser could
+    /// never read its VAPID key: a reach other than [`Reach::Domain`], or a
+    /// domain whose TLS provisioning failed (spec 10 §10.12, ADR-004 **VAPID
+    /// key publication**).
+    #[error(
+        "WebPush needs a node that serves /.well-known/scp: a Reach::Domain node whose TLS \
+         provisioning succeeds; this node serves no well-known document, so no browser could \
+         read its VAPID key (SCP-CAPSEL-8001)"
+    )]
+    WebPushWithoutWellKnown,
+
+    /// The relay's own addresses did not resolve at start, so the `WebPush`
+    /// sender could never tell an endpoint at the relay itself from another
+    /// (ADR-004 **Endpoint refusal**).
+    #[error("WebPush own addresses: {0}")]
+    OwnAddresses(#[from] scp_transport::relay::push_endpoint::OwnAddressError),
 }
 
 // ---------------------------------------------------------------------------
@@ -691,6 +709,9 @@ impl<S: Storage> ApplicationNode<S> {
         // keep re-putting this node's address on the DHT for the life of the
         // process — the §10.12.1 disclosure past shutdown.
         self.republish.stop_and_wait();
+        if let Some(tracker) = &self.state.own_addresses {
+            tracker.stop();
+        }
     }
 
     /// How many republish arms this node is running, per layer.
@@ -743,10 +764,7 @@ impl<S: Storage> ApplicationNode<S> {
         app_router: axum::Router,
         surface: PublicSurface,
     ) -> axum::Router {
-        let cors = http::build_cors_layer(&self.state.cors_origins);
-        let well_known = http::well_known_router(Arc::clone(&self.state)).layer(cors.clone());
-        let projection =
-            crate::projection::broadcast_projection_router(Arc::clone(&self.state)).layer(cors);
+        let (well_known, projection) = http::public_read_routers(&self.state);
 
         match surface {
             PublicSurface::Full => {
@@ -3444,6 +3462,7 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
     #[cfg(feature = "quic")] did_slot_registry: scp_transport::native::did_slot::DidSlotRegistry,
     acme_challenges: Option<Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>>,
     #[cfg(feature = "http3")] http3_config: Option<scp_transport::http3::Http3Config>,
+    own_lookup: scp_transport::relay::push_endpoint::OwnAddressLookup,
 ) -> Result<ApplicationNode<S>, NodeError> {
     // Node::start already rejected a domain whose relay URL has no §9.18.2
     // canonical form (config.rs builds the relay's `RelayUrl` from the same
@@ -3494,6 +3513,22 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
     // publishes.
     let publisher = NodePublisher::new(Arc::clone(&did_method), dht_mode, &relay_config);
     let live_state = seed_from_startup_publish(&publisher, &identity, &entries).await?;
+
+    // The one resolution of the WebPush sender's own addresses for the start
+    // (ADR-004 **Endpoint refusal**): after TLS provisioning, which may create
+    // the domain's record, and after the startup publish reserved every relay
+    // URL the node publishes, and before the node reports started. Until it
+    // finishes the set is unresolved and refuses every endpoint. A reserved
+    // host that does not resolve fails the start, and dropping the still-armed
+    // relay guard shuts the relay down.
+    let binds: Vec<SocketAddr> = std::iter::once(bound_addr).chain(http_bind_addr).collect();
+    let own_addresses = config::resolve_own_addresses_for_start(
+        &relay_config.push,
+        &relay_config.relay_url,
+        &binds,
+        &own_lookup,
+    )
+    .await?;
 
     // Build the rustls ServerConfig from the provisioned certificate.
     // Uses the reloadable config so that ACME renewal can hot-swap certs
@@ -3550,6 +3585,7 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
         // A domain node advertises `wss://<domain>/scp/v1`, which names no
         // port, so it binds its public listener only when it serves.
         prebound_public: std::sync::Mutex::new(None),
+        own_addresses,
         shutdown_token: CancellationToken::new(),
         cors_origins,
         projection_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter::new(
@@ -3874,6 +3910,9 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
         start_time: std::time::Instant::now(),
         http_bind_addr,
         prebound_public: std::sync::Mutex::new(prebound_public),
+        // `build_node_no_domain` and the TLS-failure fall-through refuse a
+        // `WebPush` sender, so no sender here has own addresses to track.
+        own_addresses: None,
         shutdown_token: CancellationToken::new(),
         cors_origins,
         projection_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter::new(
@@ -4383,6 +4422,362 @@ mod tests {
         // Verify relay is actually bound.
         let addr = node.relay().bound_addr();
         assert_ne!(addr.port(), 0, "relay should be bound to a real port");
+    }
+
+    /// A push slot whose only sender is a `WebPush` sender with an unresolved
+    /// own-address set, over a SQLite store at `dir/push.sqlite`.
+    fn webpush_slot(dir: &std::path::Path) -> crate::config::PushSlot {
+        use scp_transport::relay::push::{VapidSubject, WebPushConfig, WebPushSender};
+        use scp_transport::relay::push_endpoint::{Nat64Prefixes, OwnAddresses};
+        use scp_transport::relay::push_gate::PushSenders;
+        use scp_transport::relay::push_store::{PushRegistrationStore, PushStoreAtRest};
+
+        let sender = WebPushSender::new(WebPushConfig {
+            vapid_key: scp_crypto::p256::P256SecretKey::random(&mut rand::rngs::OsRng),
+            subject: VapidSubject::parse("mailto:operator@node.example").unwrap(),
+            own_addresses: OwnAddresses::unresolved(),
+            nat64_prefixes: Nat64Prefixes::new([]),
+        })
+        .unwrap();
+        crate::config::PushSlot::Enabled(Box::new(crate::NodePushProviders {
+            store: PushRegistrationStore::open_sqlite(
+                &dir.join("push.sqlite"),
+                PushStoreAtRest::Unkeyed,
+            )
+            .unwrap(),
+            senders: PushSenders {
+                apns: None,
+                fcm: None,
+            },
+            webpush: Some(sender),
+        }))
+    }
+
+    /// A TLS provider that, like a DNS provider, creates the domain's address
+    /// record while it provisions: `domain` resolves in `answers` only once
+    /// `provision` ran.
+    struct RecordCreatingTlsProvider {
+        domain: String,
+        answers: scp_transport::relay::push_endpoint::FixedAnswers,
+    }
+
+    impl TlsProvider for RecordCreatingTlsProvider {
+        fn provision(
+            &self,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<tls::CertificateData, tls::TlsError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            self.answers
+                .insert(&self.domain, vec![[192, 0, 2, 10].into()]);
+            let domain = self.domain.clone();
+            Box::pin(async move { tls::generate_self_signed(&domain) })
+        }
+    }
+
+    /// The domain of the `WebPush` start tests: a hostname, so the own-address
+    /// resolution looks it up.
+    const WEBPUSH_DOMAIN: &str = "node.example";
+
+    /// A domain node config for [`WEBPUSH_DOMAIN`] with `tls` and a `WebPush`
+    /// push slot over a store in `dir`.
+    fn webpush_domain_config(
+        dir: &std::path::Path,
+        tls: Arc<dyn TlsProvider>,
+    ) -> NodeConfig<InMemoryKeyCustody, TestDidDht, InMemoryStorage> {
+        NodeConfig {
+            reach: Reach::Domain {
+                domain: WEBPUSH_DOMAIN.to_owned(),
+            },
+            tls: TlsMode::Custom(tls),
+            push: webpush_slot(dir),
+            ..domain_config()
+        }
+    }
+
+    /// PUSH-023: a domain node whose relay runs a `WebPush` sender resolves
+    /// the sender's own addresses once, after TLS provisioning, from the host
+    /// of every relay URL it reserves and its non-wildcard relay bind, and
+    /// keeps the tracker that refreshes them. A DNS provider creates the
+    /// domain's record while it provisions, so a lookup before provisioning
+    /// would fail the start of every such node: the provider here creates the
+    /// record in `provision`, and the node starts. The control's provider
+    /// creates none, and its start fails with `OwnAddresses`.
+    #[tokio::test]
+    async fn domain_node_tracks_the_webpush_own_addresses() {
+        use scp_transport::relay::push_endpoint::{FixedAnswers, OwnAddressLookup};
+
+        let dir = tempfile::tempdir().unwrap();
+        let answers = FixedAnswers::default();
+        let node = Node::start_for_testing_with_own_lookup(
+            webpush_domain_config(
+                dir.path(),
+                Arc::new(RecordCreatingTlsProvider {
+                    domain: WEBPUSH_DOMAIN.to_owned(),
+                    answers: answers.clone(),
+                }),
+            ),
+            OwnAddressLookup::fixed(&answers),
+        )
+        .await
+        .unwrap();
+        let own = node
+            .state
+            .relay_config
+            .push
+            .webpush_sender()
+            .expect("the relay runs the WebPush sender")
+            .own_addresses()
+            .known()
+            .expect("the own-address set resolved at start");
+        for ip in [[192, 0, 2, 10], [127, 0, 0, 1]] {
+            assert!(own.contains(ip.into()), "{ip:?} missing from {own:?}");
+        }
+        assert!(
+            node.state.own_addresses.is_some(),
+            "the node keeps the tracker"
+        );
+        // Criterion 4 end to end: the started node publishes its running
+        // sender's key.
+        let k = node
+            .state
+            .relay_config
+            .push
+            .webpush_sender()
+            .map(|sender| sender.vapid_k().to_owned());
+        assert_eq!(k.as_ref().map(String::len), Some(87));
+        let doc = crate::well_known::build_well_known_scp(&node.state).await;
+        assert_eq!(doc.relay_config.and_then(|c| c.webpush_vapid_key), k);
+        node.shutdown();
+
+        // The control: no record ever appears, so the start fails.
+        let dir = tempfile::tempdir().unwrap();
+        let answers = FixedAnswers::default();
+        let refused = Node::start_for_testing_with_own_lookup(
+            webpush_domain_config(
+                dir.path(),
+                Arc::new(SucceedingTlsProvider {
+                    domain: WEBPUSH_DOMAIN.to_owned(),
+                }),
+            ),
+            OwnAddressLookup::fixed(&answers),
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(NodeError::OwnAddresses(_))),
+            "{:?}",
+            refused.err()
+        );
+    }
+
+    /// PUSH-023: the start's own-address resolution covers the tier 3 hosts
+    /// the startup publish reserves (§10.7.1 "Tier 3 relays"), not only the
+    /// domain. An `IdentitySource::Explicit` document with a tier 3 entry for
+    /// this node whose bridge host does not resolve fails the start with
+    /// `OwnAddresses`; once the host resolves, the node starts and its set
+    /// holds the bridge's address.
+    #[tokio::test]
+    async fn an_unresolved_tier3_host_fails_the_webpush_start() {
+        use scp_transport::relay::push_endpoint::{FixedAnswers, OwnAddressLookup};
+
+        async fn start_with(
+            answers: &FixedAnswers,
+        ) -> Result<ApplicationNode<InMemoryStorage>, NodeError> {
+            let (identity, mut document, custody) = create_test_identity().await;
+            let target = node_bridge_target(&identity.did).expect("not the absent value");
+            document.add_relay_service(&scp_did::RelayService::bridge(
+                scp_did::BridgeEndpoint::new(SLOT_BRIDGE_URL).expect("a wss bridge URL"),
+                target,
+            ));
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = webpush_domain_config(
+                dir.path(),
+                Arc::new(SucceedingTlsProvider {
+                    domain: WEBPUSH_DOMAIN.to_owned(),
+                }),
+            );
+            config.identity = IdentitySource::Explicit(Box::new(ExplicitIdentity {
+                identity,
+                document,
+                did_method: Arc::new(make_test_dht(&custody)),
+            }));
+            Node::start_for_testing_with_own_lookup(config, OwnAddressLookup::fixed(answers)).await
+        }
+
+        let answers = FixedAnswers::default();
+        answers.insert(WEBPUSH_DOMAIN, vec![[192, 0, 2, 10].into()]);
+        let refused = start_with(&answers).await;
+        assert!(
+            matches!(refused, Err(NodeError::OwnAddresses(_))),
+            "{:?}",
+            refused.err()
+        );
+
+        answers.insert("bridge.example.com", vec![[198, 51, 100, 7].into()]);
+        let node = start_with(&answers)
+            .await
+            .expect("the tier 3 host resolves");
+        let own = node
+            .state
+            .relay_config
+            .push
+            .webpush_sender()
+            .expect("the relay runs the WebPush sender")
+            .own_addresses()
+            .known()
+            .expect("the own-address set resolved at start");
+        assert!(own.contains([198, 51, 100, 7].into()), "{own:?}");
+        node.shutdown();
+    }
+
+    /// PUSH-023: a public listener the node binds after the start adds its
+    /// address to the `WebPush` sender's own addresses, so an endpoint at it
+    /// is refused (ADR-004 **Endpoint refusal**).
+    #[tokio::test]
+    async fn a_listener_bound_after_start_is_an_own_address() {
+        use scp_transport::relay::push_endpoint::{FixedAnswers, OwnAddressLookup};
+
+        let dir = tempfile::tempdir().unwrap();
+        let answers = FixedAnswers::default();
+        answers.insert(WEBPUSH_DOMAIN, vec![[192, 0, 2, 10].into()]);
+        let node = Node::start_for_testing_with_own_lookup(
+            webpush_domain_config(
+                dir.path(),
+                Arc::new(SucceedingTlsProvider {
+                    domain: WEBPUSH_DOMAIN.to_owned(),
+                }),
+            ),
+            OwnAddressLookup::fixed(&answers),
+        )
+        .await
+        .unwrap();
+        let own = || {
+            node.state
+                .relay_config
+                .push
+                .webpush_sender()
+                .expect("the relay runs the WebPush sender")
+                .own_addresses()
+                .known()
+                .expect("the own-address set resolved at start")
+        };
+        let later = std::net::IpAddr::from(std::net::Ipv6Addr::LOCALHOST);
+        assert!(!own().contains(later), "{:?}", own());
+        let (listener, bound) = node
+            .state
+            .take_or_bind_public(SocketAddr::new(later, 0))
+            .await
+            .unwrap();
+        assert!(own().contains(bound.ip()), "{:?}", own());
+        drop(listener);
+        node.shutdown();
+    }
+
+    /// PUSH-023: a specific address is noted before its listener binds, so
+    /// no endpoint check passes for it while the listener already accepts. A
+    /// bind on an address this host does not hold fails, and the address
+    /// stays noted: the node refuses an address it does not serve.
+    #[tokio::test]
+    async fn a_specific_bind_is_noted_before_the_listener_binds() {
+        use scp_transport::relay::push_endpoint::{FixedAnswers, OwnAddressLookup};
+
+        let dir = tempfile::tempdir().unwrap();
+        let answers = FixedAnswers::default();
+        answers.insert(WEBPUSH_DOMAIN, vec![[192, 0, 2, 10].into()]);
+        let node = Node::start_for_testing_with_own_lookup(
+            webpush_domain_config(
+                dir.path(),
+                Arc::new(SucceedingTlsProvider {
+                    domain: WEBPUSH_DOMAIN.to_owned(),
+                }),
+            ),
+            OwnAddressLookup::fixed(&answers),
+        )
+        .await
+        .unwrap();
+        let own = || {
+            node.state
+                .relay_config
+                .push
+                .webpush_sender()
+                .expect("the relay runs the WebPush sender")
+                .own_addresses()
+                .known()
+                .expect("the own-address set resolved at start")
+        };
+        // RFC 5737 TEST-NET-1: no host holds it, so the bind fails.
+        let foreign = std::net::IpAddr::from([192, 0, 2, 77]);
+        assert!(!own().contains(foreign), "{:?}", own());
+        let refused = node
+            .state
+            .take_or_bind_public(SocketAddr::new(foreign, 0))
+            .await;
+        assert!(matches!(refused, Err(NodeError::Serve(_))), "{refused:?}");
+        assert!(own().contains(foreign), "{:?}", own());
+        node.shutdown();
+    }
+
+    /// PUSH-023 (Decision 8 of its plan): a node on a reach that serves no
+    /// `.well-known/scp` refuses a `WebPush` sender with a typed error, and so
+    /// does a domain node whose TLS provisioning fails and would fall
+    /// through to NAT-traversed mode (spec 10 §10.12). The same domain node
+    /// without `WebPush` falls through and starts.
+    #[tokio::test]
+    async fn a_node_without_well_known_refuses_webpush() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = Node::start_for_testing(NodeConfig {
+            reach: Reach::Local,
+            dht: DhtMode::Disabled,
+            push: webpush_slot(dir.path()),
+            ..domain_config()
+        })
+        .await;
+        assert!(
+            matches!(local, Err(NodeError::WebPushWithoutWellKnown)),
+            "{:?}",
+            local.err()
+        );
+        // The message names the code ADR-004 assigns the refusal.
+        assert!(
+            NodeError::WebPushWithoutWellKnown
+                .to_string()
+                .contains("(SCP-CAPSEL-8001)"),
+            "{}",
+            NodeError::WebPushWithoutWellKnown
+        );
+
+        // A hostname nothing resolves: the own-address resolution runs only
+        // after TLS provisioning succeeds, so the start reaches the
+        // fall-through and refuses there.
+        let failing_tls = |push| NodeConfig {
+            reach: Reach::Domain {
+                domain: WEBPUSH_DOMAIN.to_owned(),
+            },
+            tls: TlsMode::Custom(Arc::new(FailingTlsProvider)),
+            dht: DhtMode::Disabled,
+            push,
+            ..domain_config()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let fell_through = Node::start_for_testing(failing_tls(webpush_slot(dir.path()))).await;
+        assert!(
+            matches!(fell_through, Err(NodeError::WebPushWithoutWellKnown)),
+            "{:?}",
+            fell_through.err()
+        );
+
+        let control = Node::start_for_testing(failing_tls(crate::config::PushSlot::Disabled))
+            .await
+            .unwrap();
+        assert_eq!(
+            control.domain(),
+            None,
+            "the control fell through to no-domain"
+        );
+        control.shutdown();
     }
 
     #[tokio::test]

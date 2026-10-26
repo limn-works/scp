@@ -288,8 +288,50 @@ scp-transport/push-store
 scp-transport/redb-blob
 scp-transport/sqlite-blob
 scp-transport/startup
+scp-transport/webpush
 EOF
 )"
+
+# ---------------------------------------------------------------------------
+# Per-artifact exclusions: `<package>|<crate/feature>` rows. Every ARTIFACTS
+# entry of <package> must resolve a feature set WITHOUT <crate/feature>, even
+# when the permitted-production allowlist above admits that feature for
+# another artifact.
+#
+#   - `scp-relay|scp-transport/webpush` — the `WebPush` sender,
+#     `PushRole::start_with_webpush` and the full-node push loader compile only
+#     under `scp-transport/webpush`. Only a relay that publishes its VAPID key
+#     in a `.well-known/scp` document may wake browsers (ADR-004 **VAPID key
+#     publication**); `scp-relay` serves no such document, so its build must
+#     not be able to construct a `WebPush` sender (PUSH-023). `scp-node`
+#     enables the feature, which is why the allowlist carries it.
+# ---------------------------------------------------------------------------
+ARTIFACT_EXCLUDED_FEATURES=(
+  "scp-relay|scp-transport/webpush"
+)
+
+# ---------------------------------------------------------------------------
+# artifact_excluded_offenders <package> <resolved-lines> <exclusion-rows>
+#   Pure. Prints every `<crate/feature>` that an exclusion row names for
+#   <package> and that <resolved-lines> contains. Returns 0 when it prints
+#   nothing, 1 otherwise. The fixture harness drives it with synthetic inputs.
+# ---------------------------------------------------------------------------
+artifact_excluded_offenders() {
+  local package="$1" resolved="$2" rows="$3" row feature offenders=""
+  while IFS= read -r row; do
+    [[ -z "$row" ]] && continue
+    [[ "${row%%|*}" == "$package" ]] || continue
+    feature="${row#*|}"
+    if printf '%s\n' "$resolved" | grep -xF -- "$feature" >/dev/null; then
+      offenders+="$feature"$'\n'
+    fi
+  done <<< "$rows"
+  if [[ -n "$offenders" ]]; then
+    printf '%s' "$offenders"
+    return 1
+  fi
+  return 0
+}
 
 # ---------------------------------------------------------------------------
 # Permitted-production CRATE list (EXPLICIT, closed): the whitelist for the
@@ -1224,6 +1266,18 @@ run_gate() {
       echo "   optional transport features such as scp-node/quic and scp-node/upnp"
       echo "   (ADR-062 §Decision 6 and §Enforcement G1; ZERO-nullifier mandate,"
       echo "   zero nullifier exceptions)."
+      failures=$((failures + 1))
+    fi
+
+    local excluded
+    if excluded="$(artifact_excluded_offenders "$crate" "$resolved" \
+        "$(printf '%s\n' "${ARTIFACT_EXCLUDED_FEATURES[@]}")")"; then
+      echo "   OK — resolves no feature ARTIFACT_EXCLUDED_FEATURES excludes for $crate"
+    else
+      echo "   FAIL — resolves a feature ARTIFACT_EXCLUDED_FEATURES excludes for $crate:"
+      printf '%s\n' "$excluded" | sed 's/^/       ✗ /'
+      echo "   Remove the dependency edge that enables it; the comment above"
+      echo "   ARTIFACT_EXCLUDED_FEATURES says why this artifact must not build it."
       failures=$((failures + 1))
     fi
   done
@@ -2790,6 +2844,26 @@ TREE
   run_crate_dimension_fixtures
   assert_permitted_crates_have_no_nullifier_crate "$PERMITTED_CRATES"
 
+  # (excl) A per-artifact exclusion rejects the excluded feature for its own
+  #     package only, and every exclusion row names a feature the allowlist
+  #     admits (a row the allowlist already rejects would add nothing).
+  local exclusion_rows
+  exclusion_rows="$(printf '%s\n' "${ARTIFACT_EXCLUDED_FEATURES[@]}")"
+  artifact_excluded_offenders "scp-relay" \
+    "$(printf 'scp-transport/startup\nscp-transport/webpush')" "$exclusion_rows" >/dev/null; rc=$?
+  expect "(excl) scp-relay resolving scp-transport/webpush is REJECTED" "FAIL" "$rc"
+  artifact_excluded_offenders "scp-relay" \
+    "$(printf 'scp-transport/startup\nscp-transport/push-store')" "$exclusion_rows" >/dev/null; rc=$?
+  expect "(excl) scp-relay without scp-transport/webpush is ACCEPTED" "PASS" "$rc"
+  artifact_excluded_offenders "scp-node" \
+    "$(printf 'scp-transport/startup\nscp-transport/webpush')" "$exclusion_rows" >/dev/null; rc=$?
+  expect "(excl) scp-node resolving scp-transport/webpush is ACCEPTED" "PASS" "$rc"
+  local row
+  for row in "${ARTIFACT_EXCLUDED_FEATURES[@]}"; do
+    printf '%s\n' "$PERMITTED_ALLOWLIST" | grep -xF -- "${row#*|}" >/dev/null; rc=$?
+    expect "(excl) the allowlist admits ${row#*|}, which '$row' excludes" "PASS" "$rc"
+  done
+
   assert_shipping_invocations_are_gated
 
   assert_wheel_feature_selection_is_gated "${MATURIN_PROJECT_FILES[@]}"
@@ -2853,13 +2927,16 @@ main() {
     echo
     echo "G1 PASSED: every shipped artifact's SCP-crate feature set ⊆ this permitted-production allowlist (durability-only + real-backend, zero nullifier exceptions)."
     echo "G1 PASSED: the local-path crate set of every ARTIFACTS entry and of every package a shipping file builds ⊆ PERMITTED_CRATES, and every entry there is reached."
+    echo "G1 PASSED: no ARTIFACTS entry resolves a feature ARTIFACT_EXCLUDED_FEATURES excludes for its package."
     exit 0
   fi
   echo
   echo "G1 FAILED: a shipped artifact resolves a non-allowlisted (nullifier/test-harness)"
   echo "feature. Fix the dependency edge — do NOT add the feature to the allowlist."
   echo "Or a shipped artifact reaches a local-path crate PERMITTED_CRATES does not name,"
-  echo "or that list names a crate no artifact reaches; the FAIL lines above say which."
+  echo "or that list names a crate no artifact reaches. Or a shipped artifact resolves"
+  echo "a feature ARTIFACT_EXCLUDED_FEATURES excludes for its package. The FAIL lines"
+  echo "above say which."
   exit 1
 }
 

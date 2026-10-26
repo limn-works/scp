@@ -683,7 +683,7 @@ fn log_format_is_json(raw: Option<OsString>) -> Result<bool, StartupError> {
 }
 
 /// The relay's subscriber: `filter`, then the relay's fixed cap
-/// (`push_webpush::admits_log_event`, which holds every crate outside SCP at
+/// (`push::admits_log_event`, which holds every crate outside SCP at
 /// INFO so no line names a `WebPush` endpoint's host), formatted as JSON when
 /// `json`, written to `writer`.
 fn relay_subscriber<W>(
@@ -695,7 +695,7 @@ where
     W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
 {
     use tracing_subscriber::layer::SubscriberExt as _;
-    let cap = tracing_subscriber::filter::filter_fn(crate::relay::push_webpush::admits_log_event);
+    let cap = tracing_subscriber::filter::filter_fn(crate::relay::push::admits_log_event);
     if json {
         Box::new(
             tracing_subscriber::fmt()
@@ -777,6 +777,42 @@ const APNS_ENVIRONMENT_VAR: &str = "SCP_RELAY_APNS_ENVIRONMENT";
 const FCM_SERVICE_ACCOUNT_PATH_VAR: &str = "SCP_RELAY_FCM_SERVICE_ACCOUNT_PATH";
 /// The variable that holds the Firebase project ID.
 const FCM_PROJECT_ID_VAR: &str = "SCP_RELAY_FCM_PROJECT_ID";
+/// The variable that names the `WebPush` VAPID key file (PKCS#8 PEM).
+const WEBPUSH_VAPID_KEY_PATH_VAR: &str = "SCP_RELAY_WEBPUSH_VAPID_KEY_PATH";
+/// The variable that holds the VAPID subject, a `mailto:` or `https:` URI.
+const WEBPUSH_VAPID_SUBJECT_VAR: &str = "SCP_RELAY_WEBPUSH_VAPID_SUBJECT";
+/// The variable that lists the NAT64 network-specific prefixes of the
+/// relay's network, or `none`.
+const WEBPUSH_NAT64_PREFIXES_VAR: &str = "SCP_RELAY_WEBPUSH_NAT64_PREFIXES";
+
+/// The `SCP_RELAY_PUSH_PLATFORMS` and `SCP_RELAY_WEBPUSH_*` lines of the
+/// `scp-node` help text: only a full node offers `WebPush` (ADR-004 **VAPID
+/// key publication**).
+pub const NODE_WEBPUSH_HELP: &str = "\
+    SCP_RELAY_PUSH_PLATFORMS    Push platforms the relay serves: none, or a comma list of
+                                apns, fcm and webpush. Required in --relay-only and full
+                                node mode: no default, and an unset or empty value exits 1.
+                                A listed platform needs its SCP_RELAY_APNS_*,
+                                SCP_RELAY_FCM_* or SCP_RELAY_WEBPUSH_* variables. Only a
+                                full node accepts webpush; --relay-only exits 1 on it.
+                                --self-host and --ephemeral do not read it and offer no push
+    SCP_RELAY_WEBPUSH_VAPID_KEY_PATH  Required with webpush: absolute path of the VAPID
+                                P-256 private key, PKCS#8 PEM, mode 0600. It must not be
+                                the APNs key
+    SCP_RELAY_WEBPUSH_VAPID_SUBJECT  Required with webpush: a mailto: or https: contact URI
+    SCP_RELAY_WEBPUSH_NAT64_PREFIXES  Required with webpush: comma-separated RFC 6052
+                                prefixes of the network's NAT64 translator (for example
+                                2001:db8:64::/96), or none";
+
+/// The `SCP_RELAY_PUSH_PLATFORMS` values `scp-relay` and
+/// `scp-node --relay-only` accept, as their refusals name them.
+const RELAY_PUSH_PLATFORM_VALUES: &str = "none, apns, fcm, apns,fcm";
+
+/// The `SCP_RELAY_PUSH_PLATFORMS` values an `scp-node` full node accepts, as
+/// its refusals name them.
+#[cfg(any(test, feature = "webpush"))]
+const NODE_PUSH_PLATFORM_VALUES: &str =
+    "none, or a comma-separated list of one or more of apns, fcm, webpush";
 
 /// The largest credential file the relay reads. An APNs .p8 key is about 250
 /// bytes and a service-account JSON about 2.4 KB; a larger file is not a
@@ -794,19 +830,21 @@ pub enum PushStartupError {
     /// default (persistence spec §17.17.1, SCP-CAPSEL-8000).
     #[error(
         "{PUSH_PLATFORMS_VAR} is unset or empty, and it has no default (SCP-CAPSEL-8000: a relay \
-         offers push only on platforms the operator names). Set it to one of: none, apns, fcm, \
-         apns,fcm"
+         offers push only on platforms the operator names). Set it to {accepts}"
     )]
-    SelectionMissing,
-    /// `SCP_RELAY_PUSH_PLATFORMS` lists a value other than `none`, `apns` and
-    /// `fcm`, lists one twice, or combines `none` with a platform.
-    #[error(
-        "{PUSH_PLATFORMS_VAR} is invalid: {reason}. Set it to one of: none, apns, fcm, apns,fcm \
-         (SCP-CAPSEL-8000)"
-    )]
+    SelectionMissing {
+        /// The values the reading path accepts.
+        accepts: &'static str,
+    },
+    /// `SCP_RELAY_PUSH_PLATFORMS` lists a value other than `none`, `apns`,
+    /// `fcm` and `webpush`, lists one twice, or combines `none` with a
+    /// platform.
+    #[error("{PUSH_PLATFORMS_VAR} is invalid: {reason}. Set it to {accepts} (SCP-CAPSEL-8000)")]
     SelectionInvalid {
         /// What is wrong with the list.
         reason: &'static str,
+        /// The values the reading path accepts.
+        accepts: &'static str,
     },
     /// The platform list names a platform and `SCP_RELAY_PUSH_STORE` is unset
     /// or blank. The store selection has no default (SCP-CAPSEL-8000).
@@ -866,7 +904,7 @@ pub enum PushStartupError {
     #[error("{APNS_KEY_PATH_VAR} names a file that is not an APNs .p8 key: {error}")]
     ApnsKeyInvalid {
         /// What is wrong with the file.
-        error: crate::relay::push::ApnsKeyError,
+        error: crate::relay::push::P256KeyError,
     },
     /// `SCP_RELAY_PUSH_PLATFORMS` lists `fcm` and
     /// `SCP_RELAY_FCM_SERVICE_ACCOUNT_PATH` is unset or blank.
@@ -953,6 +991,71 @@ pub enum PushStartupError {
         /// The refusal of [`PushRole::start`].
         error: PushRoleError,
     },
+    /// `SCP_RELAY_PUSH_PLATFORMS` lists `webpush` for `scp-relay` or
+    /// `scp-node --relay-only`. Neither serves a `.well-known/scp` document,
+    /// so neither can publish a VAPID key, and a relay that publishes none
+    /// sends no `WebPush` wakes (ADR-004 **VAPID key publication**). Only an
+    /// `scp-node` full node offers `WebPush` (SCP-CAPSEL-8001).
+    #[error(
+        "{PUSH_PLATFORMS_VAR} lists webpush, but this relay serves no .well-known/scp document \
+         to publish a VAPID key in; only an scp-node full node with a domain offers webpush. \
+         Remove webpush from the list (SCP-CAPSEL-8001)"
+    )]
+    WebPushNotOfferedByRelay,
+    /// `SCP_RELAY_PUSH_PLATFORMS` lists `webpush` and
+    /// `SCP_RELAY_WEBPUSH_VAPID_KEY_PATH` is unset or blank.
+    #[error(
+        "{PUSH_PLATFORMS_VAR} lists webpush, so {WEBPUSH_VAPID_KEY_PATH_VAR} must name the VAPID \
+         key file; it has no default"
+    )]
+    WebPushVapidKeyPathMissing,
+    /// `SCP_RELAY_PUSH_PLATFORMS` lists `webpush` and
+    /// `SCP_RELAY_WEBPUSH_VAPID_SUBJECT` is unset or blank.
+    #[error(
+        "{PUSH_PLATFORMS_VAR} lists webpush, so {WEBPUSH_VAPID_SUBJECT_VAR} must be a mailto: or \
+         https: URI; it has no default"
+    )]
+    WebPushVapidSubjectMissing,
+    /// `SCP_RELAY_PUSH_PLATFORMS` lists `webpush` and
+    /// `SCP_RELAY_WEBPUSH_NAT64_PREFIXES` is unset or blank. A network with
+    /// no NAT64 translator sets it to `none`.
+    #[error(
+        "{PUSH_PLATFORMS_VAR} lists webpush, so {WEBPUSH_NAT64_PREFIXES_VAR} must list the \
+         network's NAT64 prefixes, or be none when it has no NAT64 translator; it has no default"
+    )]
+    WebPushNat64PrefixesMissing,
+    /// An item of `SCP_RELAY_WEBPUSH_NAT64_PREFIXES` is not an IPv6
+    /// `address/length` pair, the list has an empty item, or it combines
+    /// `none` with a prefix.
+    #[error("{WEBPUSH_NAT64_PREFIXES_VAR} is invalid: {reason}")]
+    WebPushNat64Malformed {
+        /// What is wrong with the list.
+        reason: &'static str,
+    },
+    /// An item of `SCP_RELAY_WEBPUSH_NAT64_PREFIXES` is not an RFC 6052 §2.2
+    /// prefix.
+    #[error("{WEBPUSH_NAT64_PREFIXES_VAR} lists {prefix}, which is refused: {error}")]
+    WebPushNat64Invalid {
+        /// The item as listed.
+        prefix: String,
+        /// Why the prefix is refused.
+        error: crate::relay::push_endpoint::Nat64PrefixError,
+    },
+    /// The file `SCP_RELAY_WEBPUSH_VAPID_KEY_PATH` names is not a P-256
+    /// private key in PKCS#8 PEM form.
+    #[error("{WEBPUSH_VAPID_KEY_PATH_VAR} names a file that is not a PKCS#8 P-256 key: {error}")]
+    VapidKeyInvalid {
+        /// What is wrong with the file.
+        error: crate::relay::push::P256KeyError,
+    },
+    /// The VAPID key's public key equals the APNs key's. ADR-004 **VAPID key
+    /// publication** requires a VAPID key pair the relay uses for nothing
+    /// else (SCP-CAPSEL-8001).
+    #[error(
+        "{WEBPUSH_VAPID_KEY_PATH_VAR} names the same key as {APNS_KEY_PATH_VAR}; the VAPID key \
+         must be a key pair used for nothing else (SCP-CAPSEL-8001)"
+    )]
+    VapidKeyIsApnsKey,
     /// A full node read `SCP_RELAY_PUSH_STORE` or `SCP_RELAY_PUSH_STORE_PATH`.
     /// A full node keeps its push store in its instance storage directory
     /// and reads neither, so a set value is an operator choice it cannot
@@ -987,7 +1090,7 @@ impl PushStartupError {
     #[must_use]
     pub const fn rule(&self) -> &'static str {
         match self {
-            Self::SelectionMissing | Self::SelectionInvalid { .. } | Self::StoreMissing => {
+            Self::SelectionMissing { .. } | Self::SelectionInvalid { .. } | Self::StoreMissing => {
                 "SCP-CAPSEL-8000"
             }
             Self::StoreUnsupported { .. }
@@ -1009,7 +1112,15 @@ impl PushStartupError {
             | Self::StoreOpen { .. }
             | Self::ServiceStart { .. }
             | Self::StoreVariableInFullNode { .. }
-            | Self::NodeStoreOpen { .. } => "SCP-CAPSEL-8001",
+            | Self::NodeStoreOpen { .. }
+            | Self::WebPushNotOfferedByRelay
+            | Self::WebPushVapidKeyPathMissing
+            | Self::WebPushVapidSubjectMissing
+            | Self::WebPushNat64PrefixesMissing
+            | Self::WebPushNat64Malformed { .. }
+            | Self::WebPushNat64Invalid { .. }
+            | Self::VapidKeyInvalid { .. }
+            | Self::VapidKeyIsApnsKey => "SCP-CAPSEL-8001",
         }
     }
 }
@@ -1050,7 +1161,7 @@ pub enum PushSelection {
 ///
 /// | Variable | Required when | Values |
 /// |---|---|---|
-/// | `SCP_RELAY_PUSH_PLATFORMS` | always | `none`, `apns`, `fcm`, `apns,fcm` |
+/// | `SCP_RELAY_PUSH_PLATFORMS` | always | `none`, `apns`, `fcm`, `apns,fcm`; `webpush` is refused |
 /// | `SCP_RELAY_PUSH_STORE` | a platform is listed | `sqlite` |
 /// | `SCP_RELAY_PUSH_STORE_PATH` | the store is `sqlite` | absolute path |
 /// | `SCP_RELAY_APNS_KEY_PATH` | `apns` is listed | absolute path to the .p8 key |
@@ -1076,51 +1187,96 @@ pub fn push_selection_from_env() -> Result<PushSelection, StartupError> {
     push_selection_from(&|var| env::var_os(var))
 }
 
-/// The two platforms a relay can serve.
+/// The two platforms `scp-relay` and `scp-node --relay-only` can serve. It
+/// has no `WebPush` field, so the relay path has no value that selects a
+/// `WebPush` sender (ADR-004 **VAPID key publication**).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PushPlatforms {
     apns: bool,
     fcm: bool,
 }
 
+/// The platforms an `scp-node` full node can serve: the relay's two and
+/// `WebPush`. Only [`push_senders_from`] parses it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NodePushPlatforms {
+    relay: PushPlatforms,
+    webpush: bool,
+}
+
+/// Parses a `SCP_RELAY_PUSH_PLATFORMS` value for `scp-relay` or
+/// `scp-node --relay-only`: `None` for `none`, otherwise the listed
+/// platforms. A list that names `webpush` is refused with
+/// [`PushStartupError::WebPushNotOfferedByRelay`].
+fn parse_push_platforms(value: &str) -> Result<Option<PushPlatforms>, PushStartupError> {
+    match parse_platform_list(value, RELAY_PUSH_PLATFORM_VALUES)? {
+        None => Ok(None),
+        Some(NodePushPlatforms { webpush: true, .. }) => {
+            Err(PushStartupError::WebPushNotOfferedByRelay)
+        }
+        Some(NodePushPlatforms { relay, .. }) => Ok(Some(relay)),
+    }
+}
+
+/// Parses a `SCP_RELAY_PUSH_PLATFORMS` value for an `scp-node` full node:
+/// `None` for `none`, otherwise the listed platforms.
+#[cfg(any(test, feature = "webpush"))]
+fn parse_node_push_platforms(value: &str) -> Result<Option<NodePushPlatforms>, PushStartupError> {
+    parse_platform_list(value, NODE_PUSH_PLATFORM_VALUES)
+}
+
 /// Parses a `SCP_RELAY_PUSH_PLATFORMS` value: `None` for `none`, otherwise the
 /// listed platforms. Items are comma separated, trimmed and matched ignoring
-/// case.
-fn parse_push_platforms(value: &str) -> Result<Option<PushPlatforms>, PushStartupError> {
+/// case. A refusal names `accepts`, the values its path accepts.
+fn parse_platform_list(
+    value: &str,
+    accepts: &'static str,
+) -> Result<Option<NodePushPlatforms>, PushStartupError> {
     if value.trim().is_empty() {
-        return Err(PushStartupError::SelectionMissing);
+        return Err(PushStartupError::SelectionMissing { accepts });
     }
-    let mut platforms = PushPlatforms {
-        apns: false,
-        fcm: false,
+    let mut platforms = NodePushPlatforms {
+        relay: PushPlatforms {
+            apns: false,
+            fcm: false,
+        },
+        webpush: false,
     };
     let mut none = false;
     for item in value.split(',') {
         let slot = match item.trim().to_ascii_lowercase().as_str() {
             "none" => &mut none,
-            "apns" => &mut platforms.apns,
-            "fcm" => &mut platforms.fcm,
+            "apns" => &mut platforms.relay.apns,
+            "fcm" => &mut platforms.relay.fcm,
+            "webpush" => &mut platforms.webpush,
             "" => {
                 return Err(PushStartupError::SelectionInvalid {
                     reason: "the list has an empty item",
+                    accepts,
                 });
             }
             _ => {
                 return Err(PushStartupError::SelectionInvalid {
                     reason: "the list names an unknown platform",
+                    accepts,
                 });
             }
         };
         if *slot {
             return Err(PushStartupError::SelectionInvalid {
                 reason: "the list names a value twice",
+                accepts,
             });
         }
         *slot = true;
     }
-    match (none, platforms.apns || platforms.fcm) {
+    match (
+        none,
+        platforms.relay.apns || platforms.relay.fcm || platforms.webpush,
+    ) {
         (true, true) => Err(PushStartupError::SelectionInvalid {
             reason: "none cannot be combined with a platform",
+            accepts,
         }),
         (true, false) => Ok(None),
         (false, _) => Ok(Some(platforms)),
@@ -1133,7 +1289,12 @@ fn push_selection_from(
     lookup: &dyn Fn(&'static str) -> Option<OsString>,
 ) -> Result<PushSelection, StartupError> {
     let platforms = match lookup(PUSH_PLATFORMS_VAR) {
-        None => return Err(PushStartupError::SelectionMissing.into()),
+        None => {
+            return Err(PushStartupError::SelectionMissing {
+                accepts: RELAY_PUSH_PLATFORM_VALUES,
+            }
+            .into());
+        }
         Some(raw) => parse_push_platforms(&utf8(PUSH_PLATFORMS_VAR, raw)?)?,
     };
     let Some(platforms) = platforms else {
@@ -1154,18 +1315,42 @@ fn push_selection_from(
 /// `Debug` prints no credential: each sender's own `Debug` omits its key, its
 /// JWT or access token, and every device token.
 #[derive(Debug)]
+#[cfg(any(test, feature = "webpush"))]
 pub enum PushSenderSelection {
     /// `none`: the relay offers no push.
     Disabled,
-    /// One or both platforms, with their senders.
-    Enabled(Box<PushSenders>),
+    /// One or more platforms, with their senders.
+    Enabled(Box<NodePushSenders>),
+}
+
+/// The senders a full node's platform list selects.
+///
+/// They are the APNs and FCM senders any relay may run, and the `WebPush`
+/// sender only a relay that publishes its VAPID key may run (ADR-004 **VAPID
+/// key publication**), which the caller hands to
+/// [`PushRole::start_with_webpush`](crate::relay::push_gate::PushRole::start_with_webpush).
+#[derive(Debug)]
+#[cfg(any(test, feature = "webpush"))]
+pub struct NodePushSenders {
+    /// The APNs and FCM senders.
+    pub senders: PushSenders,
+    /// The `WebPush` sender, or `None` when the list omits `webpush`.
+    pub webpush: Option<crate::relay::push::WebPushSender>,
 }
 
 /// Reads the push platform list and each listed platform's credentials from
 /// the environment, through the same loaders as [`push_selection_from_env`].
 ///
 /// It reads `SCP_RELAY_PUSH_PLATFORMS` and the `SCP_RELAY_APNS_*` and
-/// `SCP_RELAY_FCM_*` variables in that function's table. The caller provides
+/// `SCP_RELAY_FCM_*` variables in that function's table. Unlike that
+/// function, it accepts `webpush` in the list, because a full node publishes
+/// the VAPID key in its `.well-known/scp` document; with `webpush` listed it
+/// reads `SCP_RELAY_WEBPUSH_VAPID_KEY_PATH` (a PKCS#8 PEM P-256 key file),
+/// `SCP_RELAY_WEBPUSH_VAPID_SUBJECT` (a `mailto:` or `https:` URI) and
+/// `SCP_RELAY_WEBPUSH_NAT64_PREFIXES` (RFC 6052 prefixes, or `none`), none
+/// with a default. The `WebPush` sender it returns checks no endpoint until
+/// the caller resolves its own addresses with
+/// [`track_own_addresses`](crate::relay::push_endpoint::track_own_addresses). The caller provides
 /// the store, so it refuses `SCP_RELAY_PUSH_STORE` and
 /// `SCP_RELAY_PUSH_STORE_PATH` when either is set, whatever the platform
 /// list says: an operator who set one expects it to take effect. Like that
@@ -1175,14 +1360,18 @@ pub enum PushSenderSelection {
 ///
 /// - [`PushStartupError::StoreVariableInFullNode`] when either store
 ///   variable is set.
+/// - [`PushStartupError::VapidKeyIsApnsKey`] when the VAPID key is the APNs
+///   key.
 /// - As [`push_selection_from_env`], less the store variants:
 ///   [`StartupError::Push`] for the first missing or invalid value, and
 ///   [`StartupError::InvalidValue`] for a value that is not UTF-8.
+#[cfg(any(test, feature = "webpush"))]
 pub fn push_senders_from_env() -> Result<PushSenderSelection, StartupError> {
     push_senders_from(&|var| env::var_os(var))
 }
 
 /// Reads the platform list and senders through `lookup`.
+#[cfg(any(test, feature = "webpush"))]
 fn push_senders_from(
     lookup: &dyn Fn(&'static str) -> Option<OsString>,
 ) -> Result<PushSenderSelection, StartupError> {
@@ -1192,15 +1381,36 @@ fn push_senders_from(
         }
     }
     let platforms = match lookup(PUSH_PLATFORMS_VAR) {
-        None => return Err(PushStartupError::SelectionMissing.into()),
-        Some(raw) => parse_push_platforms(&utf8(PUSH_PLATFORMS_VAR, raw)?)?,
+        None => {
+            return Err(PushStartupError::SelectionMissing {
+                accepts: NODE_PUSH_PLATFORM_VALUES,
+            }
+            .into());
+        }
+        Some(raw) => parse_node_push_platforms(&utf8(PUSH_PLATFORMS_VAR, raw)?)?,
     };
-    let Some(platforms) = platforms else {
+    let Some(NodePushPlatforms { relay, webpush }) = platforms else {
         return Ok(PushSenderSelection::Disabled);
     };
-    Ok(PushSenderSelection::Enabled(Box::new(senders_for(
-        platforms, lookup,
-    )?)))
+    let senders = senders_for(relay, lookup)?;
+    let webpush = if webpush {
+        let sender = webpush_sender_from(lookup)?;
+        // ADR-004 VAPID key publication: a key pair used for nothing else.
+        if senders
+            .apns
+            .as_ref()
+            .is_some_and(|apns| apns.public_key() == sender.vapid_public_key())
+        {
+            return Err(PushStartupError::VapidKeyIsApnsKey.into());
+        }
+        Some(sender)
+    } else {
+        None
+    };
+    Ok(PushSenderSelection::Enabled(Box::new(NodePushSenders {
+        senders,
+        webpush,
+    })))
 }
 
 /// Builds one sender for each platform in `platforms`.
@@ -1218,6 +1428,8 @@ fn senders_for(
     } else {
         None
     };
+    // `PushSenders` has no WebPush field, so the relay path never builds a
+    // WebPush sender; only `push_senders_from` builds one, beside it.
     Ok(PushSenders { apns, fcm })
 }
 
@@ -1271,7 +1483,7 @@ fn push_store_from(
 fn apns_sender_from(
     lookup: &dyn Fn(&'static str) -> Option<OsString>,
 ) -> Result<crate::relay::push::ApnsSender, StartupError> {
-    use crate::relay::push::{ApnsConfig, ApnsEnvironment, ApnsSender, apns_key_from_p8};
+    use crate::relay::push::{ApnsConfig, ApnsEnvironment, ApnsSender, p256_key_from_pkcs8_pem};
 
     let key_path = required_push_path(
         lookup,
@@ -1299,8 +1511,8 @@ fn apns_sender_from(
         _ => return Err(PushStartupError::ApnsEnvironmentInvalid.into()),
     };
     let key_file = read_credential_file(APNS_KEY_PATH_VAR, &key_path)?;
-    let signing_key =
-        apns_key_from_p8(&key_file).map_err(|error| PushStartupError::ApnsKeyInvalid { error })?;
+    let signing_key = p256_key_from_pkcs8_pem(&key_file)
+        .map_err(|error| PushStartupError::ApnsKeyInvalid { error })?;
     drop(key_file);
     let sender = ApnsSender::new(ApnsConfig {
         signing_key,
@@ -1352,6 +1564,101 @@ fn fcm_sender_from(
     })?;
     tracing::info!("fcm push credentials loaded");
     Ok(sender)
+}
+
+/// Reads the `WebPush` variables and VAPID key file and builds the sender
+/// (PUSH-023). Only [`push_senders_from`], the `scp-node` full-node loader,
+/// calls it.
+///
+/// The sender starts with an unresolved own-address set, so it checks no
+/// endpoint until the node resolves its own addresses with
+/// [`track_own_addresses`](crate::relay::push_endpoint::track_own_addresses).
+#[cfg(any(test, feature = "webpush"))]
+fn webpush_sender_from(
+    lookup: &dyn Fn(&'static str) -> Option<OsString>,
+) -> Result<crate::relay::push::WebPushSender, StartupError> {
+    use crate::relay::push::{VapidSubject, WebPushConfig, WebPushSender, p256_key_from_pkcs8_pem};
+    use crate::relay::push_endpoint::OwnAddresses;
+
+    let key_path = required_push_path(
+        lookup,
+        WEBPUSH_VAPID_KEY_PATH_VAR,
+        PushStartupError::WebPushVapidKeyPathMissing,
+    )?;
+    let subject = required_push_value(
+        lookup,
+        WEBPUSH_VAPID_SUBJECT_VAR,
+        PushStartupError::WebPushVapidSubjectMissing,
+    )?;
+    let nat64 = required_push_value(
+        lookup,
+        WEBPUSH_NAT64_PREFIXES_VAR,
+        PushStartupError::WebPushNat64PrefixesMissing,
+    )?;
+    let subject =
+        VapidSubject::parse(subject.trim()).map_err(|error| PushStartupError::Sender {
+            platform: "webpush",
+            error,
+        })?;
+    let nat64_prefixes = parse_nat64_prefixes(&nat64)?;
+    let key_file = read_credential_file(WEBPUSH_VAPID_KEY_PATH_VAR, &key_path)?;
+    let vapid_key = p256_key_from_pkcs8_pem(&key_file)
+        .map_err(|error| PushStartupError::VapidKeyInvalid { error })?;
+    drop(key_file);
+    let sender = WebPushSender::new(WebPushConfig {
+        vapid_key,
+        subject,
+        own_addresses: OwnAddresses::unresolved(),
+        nat64_prefixes,
+    })
+    .map_err(|error| PushStartupError::Sender {
+        platform: "webpush",
+        error,
+    })?;
+    tracing::info!("webpush push credentials loaded");
+    Ok(sender)
+}
+
+/// Parses a `SCP_RELAY_WEBPUSH_NAT64_PREFIXES` value: `none` for no prefix,
+/// otherwise comma-separated `address/length` items, each an RFC 6052 §2.2
+/// prefix.
+#[cfg(any(test, feature = "webpush"))]
+fn parse_nat64_prefixes(
+    value: &str,
+) -> Result<crate::relay::push_endpoint::Nat64Prefixes, PushStartupError> {
+    use crate::relay::push_endpoint::{Nat64Prefix, Nat64Prefixes};
+
+    if value.trim().eq_ignore_ascii_case("none") {
+        return Ok(Nat64Prefixes::new([]));
+    }
+    let mut prefixes = Vec::new();
+    for item in value.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            return Err(PushStartupError::WebPushNat64Malformed {
+                reason: "the list has an empty item",
+            });
+        }
+        if item.eq_ignore_ascii_case("none") {
+            return Err(PushStartupError::WebPushNat64Malformed {
+                reason: "none cannot be combined with a prefix",
+            });
+        }
+        let not_prefix = || PushStartupError::WebPushNat64Malformed {
+            reason: "an item is not an IPv6 address/length prefix",
+        };
+        let (address, len) = item.split_once('/').ok_or_else(not_prefix)?;
+        let address: std::net::Ipv6Addr = address.parse().map_err(|_| not_prefix())?;
+        let len: u8 = len.parse().map_err(|_| not_prefix())?;
+        let prefix = Nat64Prefix::new(address, len).map_err(|error| {
+            PushStartupError::WebPushNat64Invalid {
+                prefix: item.to_owned(),
+                error,
+            }
+        })?;
+        prefixes.push(prefix);
+    }
+    Ok(Nat64Prefixes::new(prefixes))
 }
 
 /// Reads the credential file at `path`, which variable `var` names, into a
@@ -1991,9 +2298,11 @@ mod push_tests {
     use super::{
         APNS_ENVIRONMENT_VAR, APNS_KEY_ID_VAR, APNS_KEY_PATH_VAR, APNS_TEAM_ID_VAR, APNS_TOPIC_VAR,
         FCM_PROJECT_ID_VAR, FCM_SERVICE_ACCOUNT_PATH_VAR, MAX_CREDENTIAL_FILE_BYTES,
-        PUSH_PLATFORMS_VAR, PUSH_STORE_PATH_VAR, PUSH_STORE_VAR, PushPlatforms, PushSelection,
-        PushSenderSelection, PushStartupError, PushStoreChoice, StartupError, parse_push_platforms,
-        push_role_from, push_selection_from, push_senders_from,
+        NODE_PUSH_PLATFORM_VALUES, PUSH_PLATFORMS_VAR, PUSH_STORE_PATH_VAR, PUSH_STORE_VAR,
+        PushPlatforms, PushSelection, PushSenderSelection, PushStartupError, PushStoreChoice,
+        RELAY_PUSH_PLATFORM_VALUES, StartupError, WEBPUSH_NAT64_PREFIXES_VAR,
+        WEBPUSH_VAPID_KEY_PATH_VAR, WEBPUSH_VAPID_SUBJECT_VAR, parse_node_push_platforms,
+        parse_push_platforms, push_role_from, push_selection_from, push_senders_from,
     };
     use crate::relay::log_capture::LogCapture;
     use crate::relay::push_gate::PushRole;
@@ -2073,16 +2382,22 @@ mod push_tests {
         path
     }
 
-    /// A complete `apns,fcm` environment whose credential files live in `dir`.
+    /// A complete `apns,fcm` environment whose credential files live in `dir`,
+    /// with a VAPID key file that [`Env::node_webpush`] names.
     struct Env {
         vars: HashMap<&'static str, OsString>,
         apns_scalar: [u8; 32],
         apns_pem: String,
+        vapid_scalar: [u8; 32],
+        vapid_pem: String,
+        vapid_path: PathBuf,
     }
 
     impl Env {
         fn full(dir: &Path) -> Self {
             let (apns_scalar, apns_pem) = apns_key();
+            let (vapid_scalar, vapid_pem) = apns_key();
+            let vapid_path = write_file(dir, "vapid.pem", vapid_pem.as_bytes(), 0o600);
             let p8 = write_file(dir, "AuthKey.p8", apns_pem.as_bytes(), 0o600);
             let sa = write_file(
                 dir,
@@ -2111,6 +2426,42 @@ mod push_tests {
                 vars,
                 apns_scalar,
                 apns_pem,
+                vapid_scalar,
+                vapid_pem,
+                vapid_path,
+            }
+        }
+
+        /// The environment of an `scp-node` full node that lists `apns`,
+        /// `fcm` and `webpush`: no store variable, and every `WebPush`
+        /// variable set.
+        fn node_webpush(&mut self) -> &mut Self {
+            let vapid = self.vapid_path.clone();
+            self.unset(PUSH_STORE_VAR)
+                .unset(PUSH_STORE_PATH_VAR)
+                .set(PUSH_PLATFORMS_VAR, "apns,fcm,webpush")
+                .set(WEBPUSH_VAPID_KEY_PATH_VAR, vapid)
+                .set(WEBPUSH_VAPID_SUBJECT_VAR, "mailto:operator@relay.example")
+                .set(WEBPUSH_NAT64_PREFIXES_VAR, "none")
+        }
+
+        fn node(&self) -> Result<PushSenderSelection, StartupError> {
+            push_senders_from(&|var| self.vars.get(var).cloned())
+        }
+
+        fn node_error(&self) -> PushStartupError {
+            match self.node() {
+                Err(StartupError::Push(error)) => error,
+                other => panic!("expected a push refusal, got {other:?}"),
+            }
+        }
+
+        fn webpush_sender(&self) -> crate::relay::push::WebPushSender {
+            match self.node() {
+                Ok(PushSenderSelection::Enabled(senders)) => senders
+                    .webpush
+                    .unwrap_or_else(|| panic!("the selection has no WebPush sender")),
+                other => panic!("expected push enabled, got {other:?}"),
             }
         }
 
@@ -2154,11 +2505,12 @@ mod push_tests {
             let Err(StartupError::Push(error)) = result else {
                 panic!("expected a refusal, got {result:?}");
             };
-            assert!(matches!(error, PushStartupError::SelectionMissing));
+            assert!(matches!(error, PushStartupError::SelectionMissing { .. }));
             assert_eq!(error.rule(), "SCP-CAPSEL-8000");
             let message = StartupError::Push(error).to_string();
             assert!(message.contains(PUSH_PLATFORMS_VAR), "{message}");
-            assert!(message.contains("none, apns, fcm, apns,fcm"), "{message}");
+            assert!(message.contains(RELAY_PUSH_PLATFORM_VALUES), "{message}");
+            assert!(!message.contains("webpush"), "{message}");
         }
     }
 
@@ -2220,7 +2572,8 @@ mod push_tests {
         let PushSenderSelection::Enabled(senders) = selection else {
             panic!("expected both senders: {selection:?}");
         };
-        assert!(senders.apns.is_some() && senders.fcm.is_some());
+        assert!(senders.senders.apns.is_some() && senders.senders.fcm.is_some());
+        assert!(senders.webpush.is_none());
         let read = read.into_inner();
         assert!(read.contains(&APNS_KEY_PATH_VAR), "{read:?}");
         assert!(read.contains(&FCM_SERVICE_ACCOUNT_PATH_VAR), "{read:?}");
@@ -2248,8 +2601,12 @@ mod push_tests {
         env.unset(PUSH_PLATFORMS_VAR);
         match push_senders_from(&|var| env.vars.get(var).cloned()) {
             Err(StartupError::Push(error)) => {
-                assert!(matches!(error, PushStartupError::SelectionMissing));
+                assert!(matches!(error, PushStartupError::SelectionMissing { .. }));
                 assert_eq!(error.rule(), "SCP-CAPSEL-8000");
+                assert!(
+                    error.to_string().contains(NODE_PUSH_PLATFORM_VALUES),
+                    "{error}"
+                );
             }
             other => panic!("expected SelectionMissing, got {other:?}"),
         }
@@ -2290,7 +2647,7 @@ mod push_tests {
     #[test]
     fn a_malformed_platform_list_is_refused() {
         for value in [
-            "webpush",
+            "webpush,webpush",
             "apns,apns",
             "none,none",
             "apns,",
@@ -2306,6 +2663,36 @@ mod push_tests {
             assert_eq!(error.rule(), "SCP-CAPSEL-8000");
             assert!(error.to_string().contains(PUSH_PLATFORMS_VAR));
         }
+    }
+
+    /// Each path's refusal names the values that path accepts, from one
+    /// constant per path: the relay path's never names `webpush`, which it
+    /// refuses, and the full node's names it.
+    #[test]
+    fn each_path_names_the_values_it_accepts() {
+        for value in ["", "apns;fcm", "apns,apns", "none,fcm", ",apns"] {
+            let relay = parse_push_platforms(value).unwrap_err().to_string();
+            assert!(
+                relay.contains(RELAY_PUSH_PLATFORM_VALUES),
+                "{value}: {relay}"
+            );
+            assert!(!relay.contains("webpush"), "{value}: {relay}");
+            let node = parse_node_push_platforms(value).unwrap_err().to_string();
+            assert!(node.contains(NODE_PUSH_PLATFORM_VALUES), "{value}: {node}");
+            assert!(node.contains("webpush"), "{value}: {node}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut env = Env::full(dir.path());
+        env.node_webpush().unset(PUSH_PLATFORMS_VAR);
+        let missing = env.node_error();
+        assert!(
+            matches!(missing, PushStartupError::SelectionMissing { .. }),
+            "{missing}"
+        );
+        assert!(
+            missing.to_string().contains(NODE_PUSH_PLATFORM_VALUES),
+            "{missing}"
+        );
     }
 
     /// A non-UTF-8 platform list is an invalid value naming the variable.
@@ -2542,7 +2929,7 @@ mod push_tests {
         assert!(matches!(
             env.push_error(),
             PushStartupError::ApnsKeyInvalid {
-                error: crate::relay::push::ApnsKeyError::NotP256Pkcs8
+                error: crate::relay::push::P256KeyError::NotP256Pkcs8
             }
         ));
 
@@ -2734,23 +3121,388 @@ mod push_tests {
         assert!(!path.exists());
     }
 
+    /// PUSH-023 criterion 4, the relay half, and Alec's 2026-10-25 ruling
+    /// ("Refuse webpush there"): the `scp-relay` and `--relay-only` loader
+    /// refuses a list naming `webpush` with `WebPushNotOfferedByRelay` under
+    /// SCP-CAPSEL-8001, before it reads any credential variable, while the
+    /// full-node loader accepts the same list.
+    #[test]
+    fn relay_refuses_webpush() {
+        let dir = tempfile::tempdir().unwrap();
+        for value in ["webpush", "WebPush", "apns,webpush", "fcm , webpush ,apns"] {
+            let mut env = Env::full(dir.path());
+            env.set(PUSH_PLATFORMS_VAR, value);
+            let read = std::cell::RefCell::new(Vec::new());
+            let result = push_selection_from(&|var| {
+                read.borrow_mut().push(var);
+                env.vars.get(var).cloned()
+            });
+            let Err(StartupError::Push(error)) = result else {
+                panic!("{value}: expected a refusal, got {result:?}");
+            };
+            assert!(
+                matches!(error, PushStartupError::WebPushNotOfferedByRelay),
+                "{value}: {error:?}"
+            );
+            assert_eq!(error.rule(), "SCP-CAPSEL-8001");
+            let message = error.to_string();
+            assert!(message.contains(PUSH_PLATFORMS_VAR), "{message}");
+            assert!(message.contains("SCP-CAPSEL-8001"), "{message}");
+            assert_eq!(*read.borrow(), vec![PUSH_PLATFORMS_VAR], "{value}");
+            assert!(
+                matches!(
+                    parse_push_platforms(value),
+                    Err(PushStartupError::WebPushNotOfferedByRelay)
+                ),
+                "{value}"
+            );
+
+            env.node_webpush().set(PUSH_PLATFORMS_VAR, value);
+            let Ok(PushSenderSelection::Enabled(senders)) = env.node() else {
+                panic!("{value}: the full node refused webpush: {:?}", env.node());
+            };
+            assert!(senders.webpush.is_some(), "{value}");
+        }
+    }
+
+    /// PUSH-023: a full node listing `webpush` builds a `WebPush` sender
+    /// whose published key is the 87-character base64url form of the VAPID
+    /// key file's public key, whose subject is the configured one, and whose
+    /// own-address set starts unresolved, so it checks no endpoint until the
+    /// node resolves its own addresses. `webpush` alone builds no other
+    /// sender.
+    #[test]
+    fn a_full_node_with_webpush_builds_the_sender() {
+        use base64::Engine as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut env = Env::full(dir.path());
+        env.node_webpush();
+        let sender = env.webpush_sender();
+        let public = scp_crypto::p256::P256SecretKey::from_scalar_bytes(&env.vapid_scalar)
+            .unwrap()
+            .public_key()
+            .to_uncompressed();
+        let k = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(public);
+        assert_eq!(sender.vapid_k(), k);
+        assert_eq!(sender.vapid_k().len(), 87);
+        assert!(format!("{sender:?}").contains("mailto:operator@relay.example"));
+        assert!(sender.own_addresses().known().is_none());
+
+        env.set(PUSH_PLATFORMS_VAR, "webpush");
+        let Ok(PushSenderSelection::Enabled(senders)) = env.node() else {
+            panic!("expected webpush alone to load: {:?}", env.node());
+        };
+        assert!(senders.senders.apns.is_none() && senders.senders.fcm.is_none());
+        assert!(senders.webpush.is_some());
+    }
+
+    /// PUSH-023 criteria 1 and 8: with `webpush` listed, each `WebPush`
+    /// variable missing or blank yields its own variant naming that
+    /// variable, under SCP-CAPSEL-8001.
+    #[test]
+    fn each_missing_webpush_variable_is_named() {
+        let dir = tempfile::tempdir().unwrap();
+        for var in [
+            WEBPUSH_VAPID_KEY_PATH_VAR,
+            WEBPUSH_VAPID_SUBJECT_VAR,
+            WEBPUSH_NAT64_PREFIXES_VAR,
+        ] {
+            for blank in [None, Some(""), Some("  ")] {
+                let mut env = Env::full(dir.path());
+                env.node_webpush();
+                match blank {
+                    None => env.unset(var),
+                    Some(value) => env.set(var, value),
+                };
+                let error = env.node_error();
+                let expected = match var {
+                    WEBPUSH_VAPID_KEY_PATH_VAR => {
+                        matches!(error, PushStartupError::WebPushVapidKeyPathMissing)
+                    }
+                    WEBPUSH_VAPID_SUBJECT_VAR => {
+                        matches!(error, PushStartupError::WebPushVapidSubjectMissing)
+                    }
+                    _ => matches!(error, PushStartupError::WebPushNat64PrefixesMissing),
+                };
+                assert!(expected, "{var} {blank:?}: {error:?}");
+                assert_eq!(error.rule(), "SCP-CAPSEL-8001");
+                let message = error.to_string();
+                assert!(message.contains(var), "{var}: {message}");
+            }
+        }
+    }
+
+    /// PUSH-023 criterion 2: the VAPID key file goes through the same file
+    /// checks and the same PKCS#8 P-256 loader as the APNs key. A file with
+    /// group or world permission bits, a missing file and a relative path
+    /// are refused naming the variable; an RSA key, a SEC1 `EC PRIVATE KEY`
+    /// block and a file holding no PEM are `VapidKeyInvalid`.
+    #[test]
+    fn the_vapid_key_file_is_checked_and_loaded_as_pkcs8() {
+        use crate::relay::push::P256KeyError;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut env = Env::full(dir.path());
+        env.node_webpush();
+        for mode in [0o644, 0o640, 0o604] {
+            let path = write_file(dir.path(), "loose.pem", env.vapid_pem.as_bytes(), mode);
+            env.set(WEBPUSH_VAPID_KEY_PATH_VAR, path);
+            let error = env.node_error();
+            assert!(
+                matches!(
+                    error,
+                    PushStartupError::CredentialPermissions { var, mode: m, .. }
+                        if var == WEBPUSH_VAPID_KEY_PATH_VAR && m == mode
+                ),
+                "{mode:o}: {error:?}"
+            );
+        }
+        env.set(WEBPUSH_VAPID_KEY_PATH_VAR, dir.path().join("absent.pem"));
+        assert!(matches!(
+            env.node_error(),
+            PushStartupError::CredentialUnreadable { var, .. } if var == WEBPUSH_VAPID_KEY_PATH_VAR
+        ));
+        env.set(WEBPUSH_VAPID_KEY_PATH_VAR, "vapid.pem");
+        assert!(matches!(
+            env.node(),
+            Err(StartupError::RelativePath { var, .. }) if var == WEBPUSH_VAPID_KEY_PATH_VAR
+        ));
+
+        // The SEC1 form of the same scalar: an `ECPrivateKey` with no PKCS#8
+        // wrapper.
+        let mut sec1 = vec![0x30, 0x25, 0x02, 0x01, 0x01, 0x04, 0x20];
+        sec1.extend_from_slice(&env.vapid_scalar);
+        let sec1 = pem("EC PRIVATE KEY", &sec1);
+        for (name, contents, expected) in [
+            (
+                "rsa.pem",
+                rsa_key_pem().to_owned(),
+                P256KeyError::NotP256Pkcs8,
+            ),
+            ("sec1.pem", sec1, P256KeyError::NotPem),
+            ("text.pem", "not a key".to_owned(), P256KeyError::NotPem),
+        ] {
+            let path = write_file(dir.path(), name, contents.as_bytes(), 0o600);
+            env.set(WEBPUSH_VAPID_KEY_PATH_VAR, path);
+            let error = env.node_error();
+            assert!(
+                matches!(error, PushStartupError::VapidKeyInvalid { error } if error == expected),
+                "{name}: {error:?}"
+            );
+            assert_eq!(error.rule(), "SCP-CAPSEL-8001");
+            assert!(error.to_string().contains(WEBPUSH_VAPID_KEY_PATH_VAR));
+        }
+    }
+
+    /// PUSH-023 criterion 3: a subject that is neither a `mailto:` address
+    /// nor an `https:` URI with a host is refused naming the platform.
+    #[test]
+    fn the_vapid_subject_is_mailto_or_https() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut env = Env::full(dir.path());
+        env.node_webpush();
+        for subject in [
+            "https://relay.example/contact",
+            " mailto:ops@relay.example ",
+        ] {
+            env.set(WEBPUSH_VAPID_SUBJECT_VAR, subject);
+            assert!(env.node().is_ok(), "{subject}: {:?}", env.node());
+        }
+        for subject in [
+            "http://relay.example",
+            "operator@relay.example",
+            "tel:+15555550100",
+            "mailto:",
+            "ftp://relay.example",
+            "https://relay.example/ contact",
+        ] {
+            env.set(WEBPUSH_VAPID_SUBJECT_VAR, subject);
+            let error = env.node_error();
+            assert!(
+                matches!(
+                    error,
+                    PushStartupError::Sender {
+                        platform: "webpush",
+                        error: crate::relay::push::PushSenderError::InvalidConfig {
+                            field: "subject",
+                            ..
+                        }
+                    }
+                ),
+                "{subject}: {error:?}"
+            );
+            assert_eq!(error.rule(), "SCP-CAPSEL-8001");
+        }
+    }
+
+    /// PUSH-023 criterion 8: `none` and a list of RFC 6052 prefixes parse; a
+    /// length outside 32, 40, 48, 56, 64 and 96, host bits past the length,
+    /// an IPv4 network, a missing length, an empty item and `none` with a
+    /// prefix are each refused naming the variable. The parsed prefixes
+    /// reach the sender: an endpoint whose address embeds a private IPv4
+    /// address under a configured prefix is refused, and the same endpoint
+    /// passes when the prefix is not configured.
+    #[test]
+    fn nat64_prefixes_parse_and_reach_the_sender() {
+        use crate::relay::push_endpoint::{EndpointError, Nat64PrefixError, OwnAddressSet};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut env = Env::full(dir.path());
+        env.node_webpush();
+        for value in [
+            "none",
+            " NONE ",
+            "64:ff9b:1::/48",
+            "2a00:1450:64::/96, 2001:db8::/32",
+        ] {
+            env.set(WEBPUSH_NAT64_PREFIXES_VAR, value);
+            assert!(env.node().is_ok(), "{value}: {:?}", env.node());
+        }
+        for (value, length) in [
+            ("2001:db8::/33", Some(Nat64PrefixError::Length(33))),
+            ("2001:db8::/128", Some(Nat64PrefixError::Length(128))),
+            ("2001:db8::1/96", Some(Nat64PrefixError::HostBits)),
+            ("10.0.0.0/8", None),
+            ("64:ff9b::", None),
+            ("64:ff9b::/x", None),
+            ("64:ff9b::/96,", None),
+            ("none,64:ff9b::/96", None),
+            ("64:ff9b::/96,none", None),
+        ] {
+            env.set(WEBPUSH_NAT64_PREFIXES_VAR, value);
+            let error = env.node_error();
+            match length {
+                Some(expected) => assert!(
+                    matches!(
+                        &error,
+                        PushStartupError::WebPushNat64Invalid { error, .. } if *error == expected
+                    ),
+                    "{value}: {error:?}"
+                ),
+                None => assert!(
+                    matches!(error, PushStartupError::WebPushNat64Malformed { .. }),
+                    "{value}: {error:?}"
+                ),
+            }
+            assert_eq!(error.rule(), "SCP-CAPSEL-8001");
+            assert!(error.to_string().contains(WEBPUSH_NAT64_PREFIXES_VAR));
+        }
+
+        // 2a00:1450:64::a00:1 embeds 10.0.0.1 under the /96 prefix.
+        let endpoint = "https://[2a00:1450:64::a00:1]/p";
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        for (value, refused) in [("2a00:1450:64::/96", true), ("none", false)] {
+            env.set(WEBPUSH_NAT64_PREFIXES_VAR, value);
+            let sender = env.webpush_sender();
+            sender.own_addresses().replace(Some(OwnAddressSet::new([])));
+            let result = rt.block_on(sender.check_registration_endpoint(endpoint));
+            assert_eq!(
+                matches!(result, Err(EndpointError::Refused(_))),
+                refused,
+                "{value}: {result:?}"
+            );
+            if !refused {
+                assert_eq!(result, Ok(()));
+            }
+        }
+    }
+
+    /// PUSH-023 criterion 9: a VAPID key whose public key equals the APNs
+    /// key's, whether the same file or a copy, is `VapidKeyIsApnsKey` under
+    /// SCP-CAPSEL-8001; without APNs listed the same key loads.
+    #[test]
+    fn a_vapid_key_equal_to_the_apns_key_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut env = Env::full(dir.path());
+        env.node_webpush();
+        let apns = env.vars[APNS_KEY_PATH_VAR].clone();
+        let copy = write_file(dir.path(), "copy.pem", env.apns_pem.as_bytes(), 0o600);
+        for path in [apns, copy.into_os_string()] {
+            env.set(WEBPUSH_VAPID_KEY_PATH_VAR, path);
+            let error = env.node_error();
+            assert!(
+                matches!(error, PushStartupError::VapidKeyIsApnsKey),
+                "{error:?}"
+            );
+            assert_eq!(error.rule(), "SCP-CAPSEL-8001");
+            let message = error.to_string();
+            assert!(message.contains(WEBPUSH_VAPID_KEY_PATH_VAR), "{message}");
+            assert!(message.contains(APNS_KEY_PATH_VAR), "{message}");
+        }
+        env.set(PUSH_PLATFORMS_VAR, "fcm,webpush");
+        assert!(env.node().is_ok(), "{:?}", env.node());
+    }
+
+    /// PUSH-023 criterion 6: loading a VAPID key writes no key byte to any
+    /// log line, and neither the loaded selection's `Debug` nor any VAPID
+    /// refusal's `Display` or `Debug` carries one.
+    // A current-thread runtime, so the per-thread log capture sees the lines
+    // the loader writes.
+    #[tokio::test]
+    async fn loading_a_vapid_key_logs_and_prints_no_key_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut env = Env::full(dir.path());
+        env.node_webpush();
+        let fragments = secret_fragments(&env);
+        let capture = LogCapture::install(crate::relay::push::admits_log_event);
+
+        let selection = env.node().unwrap();
+        let mut printed = format!("{selection:?} {selection:#?}");
+        let mut refusals = Vec::new();
+        let loose = write_file(dir.path(), "loose.pem", env.vapid_pem.as_bytes(), 0o644);
+        env.set(WEBPUSH_VAPID_KEY_PATH_VAR, loose);
+        refusals.push(env.node().unwrap_err());
+        let mut sec1 = vec![0x30, 0x25, 0x02, 0x01, 0x01, 0x04, 0x20];
+        sec1.extend_from_slice(&env.vapid_scalar);
+        let sec1 = write_file(
+            dir.path(),
+            "sec1.pem",
+            pem("EC PRIVATE KEY", &sec1).as_bytes(),
+            0o600,
+        );
+        env.set(WEBPUSH_VAPID_KEY_PATH_VAR, sec1);
+        refusals.push(env.node().unwrap_err());
+        let apns = env.vars[APNS_KEY_PATH_VAR].clone();
+        env.set(WEBPUSH_VAPID_KEY_PATH_VAR, apns);
+        refusals.push(env.node().unwrap_err());
+        let vapid = env.vapid_path.clone();
+        env.set(WEBPUSH_VAPID_KEY_PATH_VAR, vapid)
+            .set(WEBPUSH_VAPID_SUBJECT_VAR, "tel:+15555550100");
+        refusals.push(env.node().unwrap_err());
+        printed.extend(
+            refusals
+                .iter()
+                .map(|refusal| format!(" {refusal} {refusal:?}")),
+        );
+        let logs = capture.contents();
+        assert!(logs.contains("webpush push credentials loaded"), "{logs}");
+        assert_no_secret(&printed, &fragments);
+        assert_no_secret(&logs, &fragments);
+    }
+
     /// The fragments of a credential that must never appear in a log line or
     /// in `Debug` or `Display` output: each base64 line of each PEM body, the
     /// APNs scalar in hex, and the scalar bytes as `Debug` would print them.
     fn secret_fragments(env: &Env) -> Vec<String> {
-        let mut fragments: Vec<String> = [env.apns_pem.as_str(), rsa_key_pem()]
-            .iter()
-            .flat_map(|pem| pem.lines())
-            .filter(|line| !line.starts_with("-----") && line.len() >= 16)
-            .map(str::to_owned)
-            .collect();
-        fragments.push(hex::encode(env.apns_scalar));
-        fragments.push(hex::encode_upper(env.apns_scalar));
-        fragments.push(
-            format!("{:?}", &env.apns_scalar[..8])
-                .trim_end_matches(']')
-                .to_owned(),
-        );
+        let mut fragments: Vec<String> =
+            [env.apns_pem.as_str(), env.vapid_pem.as_str(), rsa_key_pem()]
+                .iter()
+                .flat_map(|pem| pem.lines())
+                .filter(|line| !line.starts_with("-----") && line.len() >= 16)
+                .map(str::to_owned)
+                .collect();
+        for scalar in [env.apns_scalar, env.vapid_scalar] {
+            fragments.push(hex::encode(scalar));
+            fragments.push(hex::encode_upper(scalar));
+            fragments.push(
+                format!("{:?}", &scalar[..8])
+                    .trim_end_matches(']')
+                    .to_owned(),
+            );
+        }
         fragments
     }
 
@@ -2798,7 +3550,7 @@ mod push_tests {
         let dir = tempfile::tempdir().unwrap();
         let mut env = Env::full(dir.path());
         let fragments = secret_fragments(&env);
-        let capture = LogCapture::install(crate::relay::push_webpush::admits_log_event);
+        let capture = LogCapture::install(crate::relay::push::admits_log_event);
 
         let selection = env.parse().unwrap();
         let printed = format!("{selection:?} {selection:#?}");

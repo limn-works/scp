@@ -57,8 +57,10 @@ use scp_relay_client::{RelayMessage, code};
 use super::push::PushSender;
 #[cfg(feature = "push-store")]
 use super::push_dispatch::PushService;
+#[cfg(all(feature = "push-store", any(test, feature = "webpush")))]
+use super::push_endpoint::EndpointError;
 #[cfg(feature = "push-store")]
-use super::push_endpoint::{EndpointError, parse_endpoint};
+use super::push_endpoint::parse_endpoint;
 #[cfg(feature = "push-store")]
 use super::push_store::{PushRegistrationKey, PushRegistrationRecord, PushRegistrationStore};
 
@@ -299,6 +301,14 @@ impl PushServiceConfig {
 /// Both fields may be `None`; [`PushRole::start`] refuses that with
 /// [`PushRoleError::NoSender`]. `Debug` prints no credential: each sender's
 /// own `Debug` omits its key, its JWT or access token, and every device token.
+///
+/// No field holds a `WebPush` sender: only a relay that publishes the
+/// sender's VAPID key in a `.well-known/scp` document may wake browsers
+/// (ADR-004 **VAPID key publication**), so a `WebPush` sender reaches a role
+/// only through `PushRole::start_with_webpush`, which the full node's
+/// domain build calls. That function and the sender compile only under this
+/// crate's `webpush` feature, which `scp-node` enables and `scp-relay` does
+/// not.
 #[cfg(feature = "push-store")]
 #[derive(Debug)]
 pub struct PushSenders {
@@ -352,6 +362,32 @@ impl PushRole {
     /// - [`PushRoleError::NoSender`] when `providers` holds no sender.
     /// - [`PushRoleError::NoRuntime`] outside a tokio runtime.
     pub fn start(providers: PushProviders) -> Result<Self, PushRoleError> {
+        Self::start_senders(providers, None)
+    }
+
+    /// Starts the push service on `providers` and `webpush`, for a relay
+    /// that publishes `webpush`'s VAPID public key in its `.well-known/scp`
+    /// document (ADR-004 **VAPID key publication**). The full node's domain
+    /// build is its only production caller.
+    ///
+    /// # Errors
+    ///
+    /// [`PushRoleError::NoRuntime`] outside a tokio runtime.
+    #[cfg(any(test, feature = "webpush"))]
+    pub fn start_with_webpush(
+        providers: PushProviders,
+        webpush: super::push_webpush::WebPushSender,
+    ) -> Result<Self, PushRoleError> {
+        Self::start_senders(providers, Some(PushSender::WebPush(webpush)))
+    }
+
+    /// Starts the service on the APNs and FCM senders of `providers` and on
+    /// `webpush`, the `WebPush` sender when
+    /// `start_with_webpush` calls it and `None` otherwise.
+    fn start_senders(
+        providers: PushProviders,
+        webpush: Option<PushSender>,
+    ) -> Result<Self, PushRoleError> {
         let PushProviders {
             store,
             senders: PushSenders { apns, fcm },
@@ -360,6 +396,7 @@ impl PushRole {
             .map(PushSender::Apns)
             .into_iter()
             .chain(fcm.map(PushSender::Fcm))
+            .chain(webpush)
             .collect();
         if senders.is_empty() {
             return Err(PushRoleError::NoSender);
@@ -373,6 +410,21 @@ impl PushRole {
         })
         .map_err(|_| PushRoleError::NoRuntime)?;
         Ok(Self::Enabled(service))
+    }
+
+    /// The running `WebPush` sender, whose VAPID public key the relay
+    /// publishes (ADR-004 **VAPID key publication**), or `None` when the role
+    /// wakes no browser.
+    #[must_use]
+    #[cfg(any(test, feature = "webpush"))]
+    pub fn webpush_sender(&self) -> Option<&super::push_webpush::WebPushSender> {
+        match self {
+            Self::Disabled => None,
+            Self::Enabled(service) => match service.config().sender_for(PushPlatform::WebPush)? {
+                PushSender::WebPush(sender) => Some(sender),
+                _ => None,
+            },
+        }
     }
 }
 
@@ -460,6 +512,34 @@ struct UrlState {
 #[derive(Debug, Clone)]
 pub struct LiveRelayUrl(Arc<watch::Sender<UrlState>>);
 
+/// A watcher of one [`LiveRelayUrl`]'s current set, from
+/// [`LiveRelayUrl::subscribe`].
+pub(crate) struct RelayUrlChanges(watch::Receiver<UrlState>);
+
+impl RelayUrlChanges {
+    /// The current set, which [`changed`](Self::changed) then counts as seen.
+    pub(crate) fn current(&mut self) -> ReservedRelayUrls {
+        self.0.borrow_and_update().current.clone()
+    }
+
+    /// Completes when the current set changes after the last
+    /// [`current`](Self::current) read, with `true`, or with `false` once
+    /// every [`LiveRelayUrl`] clone is gone.
+    pub(crate) async fn changed(&mut self) -> bool {
+        self.0.changed().await.is_ok()
+    }
+
+    /// Runs `install` only while the set read by the last
+    /// [`current`](Self::current) is still current, and holds the set
+    /// unchanged until `install` returns, so a [`LiveRelayUrl::set`] waits
+    /// for it. `None`, without running `install`, once the set changed or
+    /// every [`LiveRelayUrl`] clone is gone.
+    pub(crate) fn while_current<R>(&self, install: impl FnOnce() -> R) -> Option<R> {
+        let _held = self.0.borrow();
+        matches!(self.0.has_changed(), Ok(false)).then(install)
+    }
+}
+
 /// Where a PUBLISH routing ID falls against the relay's URL history.
 enum Reservation {
     /// The reserved routing ID of a current entry with no `bridgeTarget`,
@@ -497,6 +577,13 @@ impl LiveRelayUrl {
     #[must_use]
     pub fn current(&self) -> ReservedRelayUrls {
         self.0.borrow().current.clone()
+    }
+
+    /// A watcher that sees each later [`set`](Self::set) that changed the
+    /// current set. It does not keep the handle's set alive: once every
+    /// handle clone is gone, [`RelayUrlChanges::changed`] returns `false`.
+    pub(crate) fn subscribe(&self) -> RelayUrlChanges {
+        RelayUrlChanges(self.0.subscribe())
     }
 
     /// Whether `routing_id` is the push routing ID of a current entry or of
@@ -756,11 +843,18 @@ async fn handle(
     }
 
     // The WebPush byte and URL rules need no I/O, so they run first (PUSH-022).
+    // A build without `webpush` holds no WebPush sender whose address check
+    // would read the endpoint, so it only applies the rules.
+    #[cfg(any(test, feature = "webpush"))]
     let webpush = if platform == PushPlatform::WebPush {
         Some(webpush_endpoint(decoded.token())?)
     } else {
         None
     };
+    #[cfg(not(any(test, feature = "webpush")))]
+    if platform == PushPlatform::WebPush {
+        webpush_endpoint(decoded.token())?;
+    }
 
     // Freshness runs before verification (§10.7.1 "Freshness").
     let timestamp = decoded.timestamp();
@@ -808,6 +902,7 @@ async fn handle(
 
     // The ADR-004 address check resolves the endpoint's host, so it runs only
     // for a verified registration; a deregistration only removes a token.
+    #[cfg(any(test, feature = "webpush"))]
     if let (Some(endpoint), Decoded::Registration(_)) = (&webpush, &decoded) {
         check_webpush_addresses(service, endpoint).await?;
     }
@@ -854,10 +949,11 @@ fn webpush_endpoint(token: &[u8]) -> Result<String, PushPublishGate> {
 
 /// The registration-time ADR-004 address check of `endpoint`, through the
 /// configured `WebPush` sender's resolver: `4060` when an address is refused
-/// or the lookup fails, and `5000` when the relay's own lookup pool is full,
-/// which says nothing about the endpoint and which the registrant retries
-/// (ADR-004, every `5xxx` code).
-#[cfg(feature = "push-store")]
+/// or the lookup fails, and `5000` when the relay's own lookup pool is full
+/// or its own addresses are unresolved, neither of which says anything about
+/// the endpoint and both of which the registrant retries (ADR-004, every
+/// `5xxx` code).
+#[cfg(all(feature = "push-store", any(test, feature = "webpush")))]
 async fn check_webpush_addresses(
     service: &PushServiceConfig,
     endpoint: &str,
@@ -866,14 +962,15 @@ async fn check_webpush_addresses(
         Some(PushSender::WebPush(sender)) => sender
             .check_registration_endpoint(endpoint)
             .await
-            .map_err(|e| match e {
-                EndpointError::LookupPoolFull => {
+            .map_err(|e: EndpointError| {
+                if e.says_nothing_about_endpoint().is_some() {
                     PushPublishGate::rejected(code::INTERNAL_ERROR, e.to_string())
+                } else {
+                    PushPublishGate::rejected(
+                        code::PUSH_REGISTRATION_REJECTED,
+                        format!("WebPush endpoint refused: {e}"),
+                    )
                 }
-                _ => PushPublishGate::rejected(
-                    code::PUSH_REGISTRATION_REJECTED,
-                    format!("WebPush endpoint refused: {e}"),
-                ),
             }),
         // The recording sender sends nothing, so it reaches no address.
         #[cfg(feature = "testing")]
@@ -1038,6 +1135,45 @@ mod tests {
         let platforms: Vec<PushPlatform> =
             config.senders.iter().map(PushSender::platform).collect();
         assert_eq!(platforms, vec![PushPlatform::Apns]);
+    }
+
+    /// `PushRole::start_with_webpush` is the one route a `WebPush` sender
+    /// takes into a role: with no other sender it starts, wires the KEL
+    /// verifier, and its role names the sender whose key the node publishes.
+    #[cfg(feature = "push-store")]
+    #[tokio::test]
+    async fn push_role_start_with_webpush_runs_the_sender() {
+        use crate::relay::push_store::PushRegistrationStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sender = super::super::push_webpush::WebPushSender::new(
+            super::super::push_webpush::tests::config().unwrap(),
+        )
+        .unwrap();
+        let k = sender.vapid_k().to_owned();
+        let role = PushRole::start_with_webpush(
+            PushProviders {
+                store: PushRegistrationStore::open_sqlite(
+                    &dir.path().join("push.sqlite"),
+                    crate::relay::push_store::PushStoreAtRest::Unkeyed,
+                )
+                .unwrap(),
+                senders: PushSenders {
+                    apns: None,
+                    fcm: None,
+                },
+            },
+            sender,
+        )
+        .unwrap();
+        assert_eq!(
+            role.webpush_sender().map(|s| s.vapid_k().to_owned()),
+            Some(k)
+        );
+        let PushRole::Enabled(service) = &role else {
+            unreachable!("PushRole::start_with_webpush returned {role:?}");
+        };
+        assert!(format!("{:?}", service.config().verifier).contains("KelPushVerifier"));
     }
 
     /// Outside a tokio runtime `PushRole::start` returns `NoRuntime`.
@@ -1815,6 +1951,70 @@ mod tests {
             );
             assert_eq!(stored, None);
             drop(held);
+            let (gate, stored) = present(&service, &blob, &token).await?;
+            assert!(matches!(gate, PushPublishGate::Accepted), "{gate:?}");
+            assert_eq!(stored, Some(GATE_NOW));
+            Ok(())
+        }
+
+        /// PUSH-023 criterion 5: a relay started without `webpush`, here one
+        /// whose only sender is APNs, answers a well-formed, correctly
+        /// signed `WebPush` registration with `4061` and stores nothing, and
+        /// its role names no `WebPush` sender whose key could be published.
+        #[tokio::test]
+        async fn relay_without_webpush_answers_4061() -> TestResult {
+            use super::super::{PushProviders, PushRole, PushSenders};
+
+            let dir = tempfile::tempdir()?;
+            let role = PushRole::start(PushProviders {
+                store: PushRegistrationStore::open_sqlite(
+                    &dir.path().join("push.db"),
+                    crate::relay::push_store::PushStoreAtRest::Unkeyed,
+                )?,
+                senders: PushSenders {
+                    apns: Some(super::apns_sender()),
+                    fcm: None,
+                },
+            })?;
+            assert!(role.webpush_sender().is_none());
+            let PushRole::Enabled(service) = &role else {
+                return Err("the role is disabled".into());
+            };
+            let (_, subscription) = subscribe("https://push.example.net/s/1".to_owned())?;
+            let token = subscription.encode();
+            let blob = signed(false, &token, GATE_NOW, false)?;
+            let (gate, stored) = present(service, &blob, &token).await?;
+            assert!(
+                matches!(gate, PushPublishGate::Rejected { code: 4061, .. }),
+                "{gate:?}"
+            );
+            assert_eq!(stored, None);
+            Ok(())
+        }
+
+        /// A registration that arrives while the relay's own addresses are
+        /// unresolved is `5000`, not the `4060` refusal of its endpoint, and
+        /// nothing is stored; once the set resolves, the same registration is
+        /// accepted.
+        #[tokio::test]
+        async fn unresolved_own_addresses_are_5000_not_a_refusal() -> TestResult {
+            let dir = tempfile::tempdir()?;
+            let (service, server) = relay(dir.path(), true).await?;
+            let (_, good) = subscribe(server.endpoint("push.example.net", "/s/1"))?;
+            let token = good.encode();
+            let blob = signed(false, &token, GATE_NOW, false)?;
+            let Some(PushSender::WebPush(sender)) = service.config().senders.first() else {
+                return Err("the service has no WebPush sender".into());
+            };
+            let own = sender.own_addresses();
+            own.replace(None);
+            let (gate, stored) = present(&service, &blob, &token).await?;
+            assert!(
+                matches!(gate, PushPublishGate::Rejected { code: 5000, .. }),
+                "{gate:?}"
+            );
+            assert_eq!(stored, None);
+            own.replace(Some(crate::relay::push_endpoint::OwnAddressSet::new([])));
             let (gate, stored) = present(&service, &blob, &token).await?;
             assert!(matches!(gate, PushPublishGate::Accepted), "{gate:?}");
             assert_eq!(stored, Some(GATE_NOW));

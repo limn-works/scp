@@ -42,7 +42,6 @@ use scp_platform::EncryptedStorage;
 use scp_platform::sqlite::{SqliteKeyCustody, SqliteStorage};
 use scp_transport::native::server::RelayServer;
 use scp_transport::native::storage::BlobStorageBackend;
-use scp_transport::relay::push_gate::PushProviders;
 use scp_transport::relay::push_store::{PushRegistrationStore, PushStoreAtRest};
 use scp_transport::{shutdown, startup};
 
@@ -192,7 +191,13 @@ fn unavailable_mode(config: &CliConfig, ephemeral_compiled: bool) -> Option<&'st
 
 /// Prints usage information and exits with code 0.
 fn print_help() -> ! {
-    eprintln!(
+    eprintln!("{}", help_text());
+    std::process::exit(0);
+}
+
+/// The usage text [`print_help`] prints.
+fn help_text() -> String {
+    format!(
         "\
 scp-node — SCP application node
 
@@ -261,12 +266,7 @@ ENVIRONMENT VARIABLES:
     SCP_RELAY_DATABASE_URL      PostgreSQL connection URL (required when backend=postgres)
     SCP_RELAY_S3_BUCKET         S3 bucket name (required when backend=s3)
     SCP_RELAY_S3_PREFIX         S3 key prefix (default: blobs/)
-    SCP_RELAY_PUSH_PLATFORMS    Push platforms the relay serves: none, apns, fcm, apns,fcm.
-                                Required in --relay-only and full node mode: no default,
-                                and an unset or empty value exits 1. A listed platform
-                                needs its SCP_RELAY_APNS_* or SCP_RELAY_FCM_* variables
-                                (scp-relay README). --self-host and --ephemeral do not
-                                read it and offer no push
+{webpush}
     SCP_RELAY_PUSH_STORE        Push registration store: sqlite. Read only in --relay-only
                                 mode, when a platform is listed. A full node exits 1
                                 when this or SCP_RELAY_PUSH_STORE_PATH is set
@@ -287,9 +287,9 @@ ENVIRONMENT VARIABLES:
     SCP_RELAY_RATE_LIMIT        Publish rate limit per second (default: 100)
     SCP_RELAY_LOG_LEVEL         Log level (default: info)
     SCP_RELAY_LOG_FORMAT        Log format: 'json' or 'pretty' (default: pretty)
-    RUST_LOG                    Override log level (takes precedence over SCP_RELAY_LOG_LEVEL)"
-    );
-    std::process::exit(0);
+    RUST_LOG                    Override log level (takes precedence over SCP_RELAY_LOG_LEVEL)",
+        webpush = startup::NODE_WEBPUSH_HELP,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -738,7 +738,7 @@ fn push_slot_from(
     storage_dir: &std::path::Path,
     storage_key: &[u8; 32],
 ) -> Result<PushSlot, startup::StartupError> {
-    let senders = match senders {
+    let startup::NodePushSenders { senders, webpush } = match senders {
         startup::PushSenderSelection::Disabled => {
             tracing::info!("push: none (SCP_RELAY_PUSH_PLATFORMS=none)");
             return Ok(PushSlot::Disabled);
@@ -757,12 +757,14 @@ fn push_slot_from(
     tracing::info!(
         apns = senders.apns.is_some(),
         fcm = senders.fcm.is_some(),
+        webpush = webpush.is_some(),
         store = %path.display(),
         "push: enabled with the keyed sqlite push store in the storage directory"
     );
-    Ok(PushSlot::Enabled(Box::new(PushProviders {
+    Ok(PushSlot::Enabled(Box::new(scp_node::NodePushProviders {
         store,
         senders,
+        webpush,
     })))
 }
 
@@ -1402,6 +1404,28 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
+    /// PUSH-023: the help text documents the push platform list with
+    /// `webpush` and each `WebPush` variable a full node reads.
+    #[test]
+    fn help_lists_webpush_variables() {
+        let help = super::help_text();
+        for needed in [
+            "SCP_RELAY_PUSH_PLATFORMS",
+            "apns, fcm and webpush",
+            "--relay-only exits 1 on it",
+            "SCP_RELAY_WEBPUSH_VAPID_KEY_PATH",
+            "SCP_RELAY_WEBPUSH_VAPID_SUBJECT",
+            "SCP_RELAY_WEBPUSH_NAT64_PREFIXES",
+            "RUST_LOG",
+        ] {
+            assert!(help.contains(needed), "{needed} missing from the help text");
+        }
+        assert!(
+            !help.contains("{webpush}"),
+            "the placeholder was not filled"
+        );
+    }
+
     use super::*;
 
     /// `--self-host` and `--ephemeral` each reject `postgres` and `s3` in any
@@ -1476,12 +1500,13 @@ mod tests {
         assert!(!dir.path().join(PUSH_STORE_FILE).exists());
 
         let enabled = push_slot_from(
-            startup::PushSenderSelection::Enabled(Box::new(
-                scp_transport::relay::push_gate::PushSenders {
+            startup::PushSenderSelection::Enabled(Box::new(startup::NodePushSenders {
+                senders: scp_transport::relay::push_gate::PushSenders {
                     apns: Some(apns()?),
                     fcm: None,
                 },
-            )),
+                webpush: None,
+            })),
             dir.path(),
             &key,
         );
@@ -1507,12 +1532,13 @@ mod tests {
 
         let missing = dir.path().join("no-such-dir");
         let refused = push_slot_from(
-            startup::PushSenderSelection::Enabled(Box::new(
-                scp_transport::relay::push_gate::PushSenders {
+            startup::PushSenderSelection::Enabled(Box::new(startup::NodePushSenders {
+                senders: scp_transport::relay::push_gate::PushSenders {
                     apns: Some(apns()?),
                     fcm: None,
                 },
-            )),
+                webpush: None,
+            })),
             &missing,
             &key,
         );

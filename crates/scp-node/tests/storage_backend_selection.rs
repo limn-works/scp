@@ -67,6 +67,47 @@ fn relay_only_requires_a_push_selection() {
     }
 }
 
+/// PUSH-023: a `--relay-only` node serves no `.well-known/scp` document, so
+/// it refuses `webpush` in `SCP_RELAY_PUSH_PLATFORMS`: it exits 1 naming the
+/// variable and SCP-CAPSEL-8001 before it opens its blob store, though every
+/// `WebPush` variable is set. Only a full node offers `WebPush`.
+#[test]
+fn relay_only_refuses_webpush() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db_path = tmp.path().join("must-not-exist.db");
+    for value in ["webpush", "apns,webpush"] {
+        let mut command = node_command();
+        command
+            .arg("--relay-only")
+            .current_dir(tmp.path())
+            .env("SCP_RELAY_PUSH_PLATFORMS", value)
+            .env("SCP_RELAY_PUSH_STORE", "sqlite")
+            .env("SCP_RELAY_PUSH_STORE_PATH", tmp.path().join("push.db"))
+            .env(
+                "SCP_RELAY_WEBPUSH_VAPID_KEY_PATH",
+                tmp.path().join("vapid.pem"),
+            )
+            .env(
+                "SCP_RELAY_WEBPUSH_VAPID_SUBJECT",
+                "mailto:operator@relay.example",
+            )
+            .env("SCP_RELAY_WEBPUSH_NAT64_PREFIXES", "none")
+            .env("SCP_RELAY_STORAGE_BACKEND", "sqlite")
+            .env("SCP_RELAY_STORAGE_PATH", &db_path)
+            .env("SCP_RELAY_BIND_ADDR", "127.0.0.1:0")
+            .env_remove("RUST_LOG");
+        let output = output_within_deadline(&mut command);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{value}: {stderr}");
+        assert!(
+            stderr.contains("SCP_RELAY_PUSH_PLATFORMS lists webpush"),
+            "{value}: {stderr}"
+        );
+        assert!(stderr.contains("SCP-CAPSEL-8001"), "{value}: {stderr}");
+        assert!(!db_path.exists(), "{value} opened {}", db_path.display());
+    }
+}
+
 /// Runs `command` and returns its output, killing the child and failing the
 /// test when it has not exited after 30 seconds.
 ///

@@ -47,9 +47,13 @@ scp-transport = { path = "../scp-transport", version = "=0.1.0-beta.2", features
     # blob backend on every shipped relay. `redb-blob` and `startup` come
     # from `node-bin`. `push-store` is ungated for the same reason: an enabled
     # `NodeConfig::push` carries the SQLite push registration store, the only
-    # shipped arm (§17.17.5, PUSH-012).
+    # shipped arm (§17.17.5, PUSH-012). `webpush` is ungated because a domain
+    # node publishes `.well-known/scp` and so may run the `WebPush` sender
+    # (ADR-004 **VAPID key publication**, PUSH-023); `scp-relay` serves no such
+    # document and does not enable it.
     "sqlite-blob",
     "push-store",
+    "webpush",
 ] }
 # Durability-only + real backends ONLY (ADR-062 §Decision 6). `testing` is NO
 # LONGER enabled here: the production `Node::start` / first-start create path
@@ -136,6 +140,9 @@ http-body-util = "0.1"
 hyper = "1"
 rcgen = "0.14"
 tempfile = "3"
+# `FixedAnswers` and `OwnAddressLookup::fixed`, which let the node's tests make a
+# relay host resolve only after TLS provisioning, without real DNS.
+scp-transport = { path = "../scp-transport", features = ["testing"] }
 
 [features]
 # `default` holds only `node-bin`, so a shipped `scp-node` binary enables

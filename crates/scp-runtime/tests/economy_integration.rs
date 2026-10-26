@@ -426,6 +426,7 @@ fn invariant_1_relay_economic_config_visible_in_wellknown() {
             rate_limit_publish: None,
             rate_limit_subscribe: None,
             transports: None,
+            webpush_vapid_key: None,
             economic: Some(RelayEconomicConfig {
                 currency: usd(),
                 per_publish: Some(Amount(5)),
@@ -1141,6 +1142,7 @@ fn invariant_8_bootstrap_list_has_free_relay() {
             rate_limit_publish: None,
             rate_limit_subscribe: None,
             transports: None,
+            webpush_vapid_key: None,
             economic: None, // Free relay -- no economic config.
         }),
         handles: None,
@@ -1156,6 +1158,7 @@ fn invariant_8_bootstrap_list_has_free_relay() {
             rate_limit_publish: None,
             rate_limit_subscribe: None,
             transports: None,
+            webpush_vapid_key: None,
             economic: Some(RelayEconomicConfig {
                 currency: usd(),
                 per_publish: Some(Amount(10)),

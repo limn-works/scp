@@ -1031,7 +1031,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn no_log_line_carries_the_key_assertion_access_token_or_registration_token() {
-        let capture = LogCapture::install(crate::relay::push_webpush::admits_log_event);
+        let capture = LogCapture::install(crate::relay::push::admits_log_event);
         let (sender, server, _) = sender_with(
             vec![
                 token_reply(ACCESS_TOKEN_1, 3599),

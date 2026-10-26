@@ -36,7 +36,10 @@
 //!
 //! The operator names the push platforms the relay serves in
 //! `SCP_RELAY_PUSH_PLATFORMS` (`none`, `apns`, `fcm` or `apns,fcm`), which has
-//! no default either: unset or empty exits 1 under SCP-CAPSEL-8000. A listed
+//! no default either: unset or empty exits 1 under SCP-CAPSEL-8000. A list
+//! that names `webpush` exits 1 under SCP-CAPSEL-8001: the relay serves no
+//! `.well-known/scp` document to publish a VAPID key in, so only an
+//! `scp-node` full node with a domain offers `WebPush`. A listed
 //! platform needs its push store and credential files, read by
 //! [`startup::push_selection_from_env`]; any missing or invalid one exits 1
 //! naming its variable. A listed platform opens the SQLite push store at

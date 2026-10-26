@@ -430,11 +430,11 @@ and are documented with their own features.
 
 | `ServerError` variant | Code | Condition |
 |---|---|---|
-| `InvalidConfig`, `Node(MissingField)`, `Node(InvalidConfig)` | `SCP-STORAGE-8007` | The node start configuration is invalid: a required field is missing, a field value is invalid, or `scp_node::validate_reach_and_tls` rejected the reach and TLS pair. The check runs before `node_start` creates any directory or file |
+| `InvalidConfig`, `Node(MissingField)`, `Node(InvalidConfig)`, `Node(WebPushWithoutWellKnown)` | `SCP-STORAGE-8007` | The node start configuration is invalid: a required field is missing, a field value is invalid, or `scp_node::validate_reach_and_tls` rejected the reach and TLS pair. The check runs before `node_start` creates any directory or file. `Node(WebPushWithoutWellKnown)`: the push selection names `WebPush` for a node that serves no `/.well-known/scp`. A node without a domain refuses it before it opens any store or binds any listener. A domain node whose TLS provisioning fell back to NAT-traversed mode refuses it after its relay listener bound, and shuts that listener down. Not reachable through FFI `node_start` (no push field) |
 | `Storage`, `Io` | `SCP-STORAGE-8008` | The blob storage backend failed to open (`Storage`), or `node_start` could not create the blob storage directory (`Io`) |
 | `Node(Storage)` | `SCP-STORAGE-8009` | The core node returned a storage error |
 | `OperatorIdentityUnavailable`, `Node(Identity(_))` | `SCP-IDENT-1063` | The operator identity is not available to the node: the identity is not registered on this `SCP` instance, the config's identity DID differs from the handle's, or the core node's identity operation failed |
-| `Node(Relay)` | `SCP-TRANS-5051` | The node's relay failed to start, such as a failed bind on `bind_addr` |
+| `Node(Relay)`, `Node(OwnAddresses)` | `SCP-TRANS-5051` | The node's relay failed to start, such as a failed bind on `bind_addr` (`Relay`). `Node(OwnAddresses)`: a `WebPush` node could not resolve, after TLS provisioning and the startup publish, the host of a relay URL it reserves into its own-address set, so the start fails and the relay listener shuts down. Not reachable through FFI `node_start` (no push field) |
 | `Node(Tls)` | `SCP-TRANS-5052` | TLS provisioning failed |
 | `Node(Serve)`, `Node(Nat)` | `SCP-TRANS-5054` | The HTTP server failed to bind or hit a fatal I/O error (`Serve`), or NAT traversal failed (`Nat`) |
 | `Relay` | `SCP-TRANS-5050` | An SDK relay start failed: the relay server could not bind or accept |

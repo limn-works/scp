@@ -2820,6 +2820,7 @@ mod tests {
             start_time: Instant::now(),
             http_bind_addr: Some(SocketAddr::from(([0, 0, 0, 0], 8443))),
             prebound_public: std::sync::Mutex::new(None),
+            own_addresses: None,
             shutdown_token: tokio_util::sync::CancellationToken::new(),
             cors_origins: None,
             projection_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter::new(

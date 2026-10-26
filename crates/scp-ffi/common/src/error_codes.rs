@@ -1978,11 +1978,14 @@ pub const fn server_error_code(e: &crate::server::ServerError) -> &'static str {
     use crate::server::ServerError as E;
     use scp_node::NodeError as N;
     match e {
-        E::InvalidConfig(_) | E::Node(N::MissingField(_) | N::InvalidConfig(_)) => STORAGE_8007,
+        E::InvalidConfig(_)
+        | E::Node(N::MissingField(_) | N::InvalidConfig(_) | N::WebPushWithoutWellKnown) => {
+            STORAGE_8007
+        }
         E::Storage(_) | E::Io(_) => STORAGE_8008,
         E::Node(N::Storage(_)) => STORAGE_8009,
         E::OperatorIdentityUnavailable | E::Node(N::Identity(_)) => IDENT_1063,
-        E::Node(N::Relay(_)) => TRANS_5051,
+        E::Node(N::Relay(_) | N::OwnAddresses(_)) => TRANS_5051,
         E::Node(N::Tls(_)) => TRANS_5052,
         E::Node(N::Serve(_) | N::Nat(_)) => TRANS_5054,
         E::Relay(_) => TRANS_5050,
@@ -2023,14 +2026,16 @@ pub const fn server_error_class(e: &crate::server::ServerError) -> ServerErrorCl
     use scp_node::NodeError as N;
     match e {
         E::InvalidConfig(_)
-        | E::Node(N::MissingField(_) | N::InvalidConfig(_) | N::Storage(_))
+        | E::Node(
+            N::MissingField(_) | N::InvalidConfig(_) | N::WebPushWithoutWellKnown | N::Storage(_),
+        )
         | E::Storage(_)
         | E::Io(_)
         | E::MissingPassphrase => ServerErrorClass::Validation,
         E::OperatorIdentityUnavailable | E::Node(N::Identity(_)) | E::DhtInit(_) => {
             ServerErrorClass::Identity
         }
-        E::Node(N::Relay(_) | N::Tls(_) | N::Serve(_) | N::Nat(_))
+        E::Node(N::Relay(_) | N::OwnAddresses(_) | N::Tls(_) | N::Serve(_) | N::Nat(_))
         | E::Relay(_)
         | E::DevStartUnavailable
         | E::SupervisorWiring(_) => ServerErrorClass::Transport,
@@ -2050,7 +2055,7 @@ mod server_error_tests {
         use crate::server::SupervisorWiringError as W;
         use ServerErrorClass::{Context, Identity, Transport, Validation};
         let io = || std::io::Error::other("x");
-        vec![
+        let mut rows = vec![
             (E::InvalidConfig("x".into()), STORAGE_8007, Validation),
             (E::Node(N::MissingField("reach")), STORAGE_8007, Validation),
             (
@@ -2075,20 +2080,6 @@ mod server_error_tests {
                 IDENT_1063,
                 Identity,
             ),
-            (
-                E::Node(N::Relay(
-                    scp_transport::native::server::RelayError::BindFailed("x".into()),
-                )),
-                TRANS_5051,
-                Transport,
-            ),
-            (
-                E::Node(N::Tls(scp_node::tls::TlsError::Acme("x".into()))),
-                TRANS_5052,
-                Transport,
-            ),
-            (E::Node(N::Serve("x".into())), TRANS_5054, Transport),
-            (E::Node(N::Nat("x".into())), TRANS_5054, Transport),
             (
                 E::Relay(scp_transport::native::server::RelayError::BindFailed(
                     "x".into(),
@@ -2135,6 +2126,44 @@ mod server_error_tests {
                 CTX_2053,
                 Context,
             ),
+        ];
+        rows.extend(core_node_rows());
+        rows
+    }
+
+    /// The rows for a `NodeError` the core node returns from its relay, push,
+    /// TLS, HTTP server and NAT steps.
+    fn core_node_rows() -> Vec<(E, &'static str, ServerErrorClass)> {
+        use ServerErrorClass::{Transport, Validation};
+        vec![
+            (
+                E::Node(N::Relay(
+                    scp_transport::native::server::RelayError::BindFailed("x".into()),
+                )),
+                TRANS_5051,
+                Transport,
+            ),
+            (
+                E::Node(N::WebPushWithoutWellKnown),
+                STORAGE_8007,
+                Validation,
+            ),
+            (
+                E::Node(N::OwnAddresses(
+                    scp_transport::relay::push_endpoint::OwnAddressError::NoHost {
+                        url: "x".into(),
+                    },
+                )),
+                TRANS_5051,
+                Transport,
+            ),
+            (
+                E::Node(N::Tls(scp_node::tls::TlsError::Acme("x".into()))),
+                TRANS_5052,
+                Transport,
+            ),
+            (E::Node(N::Serve("x".into())), TRANS_5054, Transport),
+            (E::Node(N::Nat("x".into())), TRANS_5054, Transport),
         ]
     }
 

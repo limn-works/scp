@@ -139,11 +139,11 @@ Additional `RelayConfig` fields with fixed defaults (not configurable via env va
 
 ### Push configuration (`scp-relay`, `scp-node --relay-only`, and an `scp-node` full node)
 
-A relay wakes a registered mobile device through APNs or FCM when a message arrives for it (spec §10.7.1). The operator names the platforms the relay serves in `SCP_RELAY_PUSH_PLATFORMS`, which has no default (persistence spec §17.17.1, SCP-CAPSEL-8000): a relay that reads it unset, empty or only whitespace prints `SCP_RELAY_PUSH_PLATFORMS is unset or empty, and it has no default (SCP-CAPSEL-8000 ...)` and exits 1 before it opens any store. A persistent `scp-node` full node reads the same variables, except the two store variables, as the full-node paragraph below states. `scp-node --self-host` and `--ephemeral` read none of them, and their embedded relays offer no push.
+A relay wakes a registered mobile device through APNs or FCM, and a full node also wakes a browser through WebPush, when a message arrives for it (spec §10.7.1). The operator names the platforms the relay serves in `SCP_RELAY_PUSH_PLATFORMS`, which has no default (persistence spec §17.17.1, SCP-CAPSEL-8000): a relay that reads it unset, empty or only whitespace prints `SCP_RELAY_PUSH_PLATFORMS is unset or empty, and it has no default (SCP-CAPSEL-8000 ...)` and exits 1 before it opens any store. A persistent `scp-node` full node reads the same variables, except the two store variables, as the full-node paragraph below states. `scp-node --self-host` and `--ephemeral` read none of them, and their embedded relays offer no push.
 
 | Environment Variable | Required when | Values |
 |---------------------|---------------|--------|
-| `SCP_RELAY_PUSH_PLATFORMS` | always | `none`, `apns`, `fcm`, or `apns,fcm` (any order and case) |
+| `SCP_RELAY_PUSH_PLATFORMS` | always | `none`, or a comma list of `apns` and `fcm` (any order and case); a persistent full node also accepts `webpush` in the list |
 | `SCP_RELAY_PUSH_STORE` | a platform is listed (`scp-relay` and `--relay-only` only) | `sqlite` |
 | `SCP_RELAY_PUSH_STORE_PATH` | the store is `sqlite` (`scp-relay` and `--relay-only` only) | Absolute path of the push registration database |
 | `SCP_RELAY_APNS_KEY_PATH` | `apns` is listed | Absolute path of the APNs authentication key (`.p8`) |
@@ -153,12 +153,17 @@ A relay wakes a registered mobile device through APNs or FCM when a message arri
 | `SCP_RELAY_APNS_ENVIRONMENT` | `apns` is listed | `production` or `sandbox`, no default |
 | `SCP_RELAY_FCM_SERVICE_ACCOUNT_PATH` | `fcm` is listed | Absolute path of the Firebase service-account JSON |
 | `SCP_RELAY_FCM_PROJECT_ID` | `fcm` is listed and the JSON names no `project_id` | The Firebase project ID |
+| `SCP_RELAY_WEBPUSH_VAPID_KEY_PATH` | `webpush` is listed (full node only) | Absolute path of the VAPID P-256 private key in PKCS#8 PEM form. It must not be the APNs key |
+| `SCP_RELAY_WEBPUSH_VAPID_SUBJECT` | `webpush` is listed (full node only) | A `mailto:` or `https:` URI where a push service can reach the operator |
+| `SCP_RELAY_WEBPUSH_NAT64_PREFIXES` | `webpush` is listed (full node only) | Comma-separated RFC 6052 NAT64 prefixes of the network (`/32`, `/40`, `/48`, `/56`, `/64` or `/96`), or `none` when the network has no NAT64 translator |
 
 `none` reads no other push variable, and the relay serves no push. Every other variable has no default: a listed platform with any of its variables unset or blank exits 1 with an error that names the variable. `SCP_RELAY_PUSH_STORE=memory` exits 1, because the in-memory push store compiles only into test builds (persistence spec §17.17.5).
 
 Credentials load only from files, never from an environment value. Each credential file must be a regular file of at most 64 KiB whose mode grants nothing to its group or to others (`chmod 600` or `chmod 400`); a looser mode exits 1 naming the variable and the mode. The relay reads key bytes into buffers it zeroes on release, and no log line or error message carries them: startup logs only that each platform's credentials loaded, and the APNs environment.
 
 One relay serves one Apple team, topic and APNs environment, and one Firebase project.
+
+`webpush` is accepted only by a persistent `scp-node` full node with a domain, because a browser reads the VAPID public key from the node's `/.well-known/scp` document and only such a node serves one (ADR-004 **VAPID key publication**). `scp-relay` and `scp-node --relay-only` exit 1 on a list that names `webpush`, with `SCP_RELAY_PUSH_PLATFORMS lists webpush, but this relay serves no .well-known/scp document ... (SCP-CAPSEL-8001)`. A full node whose TLS provisioning fails falls back to NAT-traversed mode, serves no `/.well-known/scp`, and fails its start with SCP-CAPSEL-8001 when `webpush` is listed. With `webpush` listed, each of the three `SCP_RELAY_WEBPUSH_*` variables is required and has no default, and a blank value counts as unset. The key file follows the credential file rules above, and a VAPID key equal to the APNs key exits 1 (SCP-CAPSEL-8001), because the VAPID key pair must serve nothing else. The node publishes the key's public half as `relay_config.webpush_vapid_key` in `/.well-known/scp`. Before it reports started, the node resolves the host of every relay URL it reserves, after TLS provisioning and its startup publish, and a host that does not resolve fails the start; WebPush refuses to send to any of those addresses or to a specific address a listener binds.
 
 With a platform listed, the relay opens the SQLite push store at `SCP_RELAY_PUSH_STORE_PATH` before it opens its blob store and serves its reserved push routing ID through the push gate. The relay creates the store file with mode 0600, so `SQLite` gives its `-wal` and `-shm` files the same mode, and it refuses a store file or sidecar that is not a regular file or whose mode grants anything to its group or to others. A store that cannot open, or a refused file, exits 1 with `SCP_RELAY_PUSH_STORE=sqlite cannot open the push store at SCP_RELAY_PUSH_STORE_PATH='<path>' ... (SCP-CAPSEL-8001)`, and nothing falls back to another store. The relay verifies each registration's signature against the registrant's key-event log; until that verifier's key-state resolution is built, it refuses every registration with `5003` `PUSH_VERIFIER_UNAVAILABLE` and stores none.
 

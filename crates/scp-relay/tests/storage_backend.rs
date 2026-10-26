@@ -181,6 +181,51 @@ fn unset_push_platforms_exits_with_capsel_8000() {
     }
 }
 
+/// PUSH-023: `scp-relay` serves no `.well-known/scp` document, so it refuses
+/// `webpush` in `SCP_RELAY_PUSH_PLATFORMS`: it exits 1 naming the variable and
+/// SCP-CAPSEL-8001, though every `WebPush` variable is set, and opens neither
+/// the push store nor the blob store.
+#[test]
+fn webpush_is_refused_with_capsel_8001() {
+    let tmp = tempfile::tempdir().expect("failed to create tempdir");
+    let db_path = tmp.path().join("must-not-exist.db");
+    let push_path = tmp.path().join("push-must-not-exist.db");
+    for value in ["webpush", "fcm,webpush"] {
+        let mut command = relay_command();
+        command
+            .env("SCP_RELAY_PUSH_PLATFORMS", value)
+            .env("SCP_RELAY_PUSH_STORE", "sqlite")
+            .env("SCP_RELAY_PUSH_STORE_PATH", &push_path)
+            .env(
+                "SCP_RELAY_WEBPUSH_VAPID_KEY_PATH",
+                tmp.path().join("vapid.pem"),
+            )
+            .env(
+                "SCP_RELAY_WEBPUSH_VAPID_SUBJECT",
+                "mailto:operator@relay.example",
+            )
+            .env("SCP_RELAY_WEBPUSH_NAT64_PREFIXES", "none")
+            .env("SCP_RELAY_STORAGE_BACKEND", "sqlite")
+            .env("SCP_RELAY_STORAGE_PATH", &db_path)
+            .env("SCP_RELAY_BIND_ADDR", "127.0.0.1:0")
+            .env_remove("RUST_LOG");
+        let output = output_within_deadline(&mut command);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{value}: {stderr}");
+        assert!(
+            stderr.contains("SCP_RELAY_PUSH_PLATFORMS lists webpush"),
+            "{value}: {stderr}"
+        );
+        assert!(stderr.contains("SCP-CAPSEL-8001"), "{value}: {stderr}");
+        assert!(!db_path.exists(), "{value} opened {}", db_path.display());
+        assert!(
+            !push_path.exists(),
+            "{value} opened {}",
+            push_path.display()
+        );
+    }
+}
+
 /// PUSH-012: a push platform with a partial configuration makes the relay
 /// exit 1 naming the first missing variable, and opens neither the push store
 /// nor the blob store.

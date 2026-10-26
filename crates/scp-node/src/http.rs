@@ -132,6 +132,14 @@ pub struct NodeState {
     /// second, unrelated port. A serve on any other address and
     /// [`ApplicationNode::shutdown`](crate::ApplicationNode::shutdown) close it.
     pub(crate) prebound_public: std::sync::Mutex<Option<tokio::net::TcpListener>>,
+    /// The task that keeps the `WebPush` sender's own-address set current as
+    /// the relay URLs change and on the refresh timer (ADR-004 **Endpoint
+    /// refusal**). `Some` exactly when the relay runs a `WebPush` sender,
+    /// which only a domain node does. Each public listener the node binds
+    /// later adds its address through [`Self::note_listener_bound`].
+    /// [`ApplicationNode::shutdown`](crate::ApplicationNode::shutdown) stops
+    /// it, and so does dropping the state.
+    pub(crate) own_addresses: Option<scp_transport::relay::push_endpoint::OwnAddressTracker>,
     /// Shared cancellation token for graceful shutdown of both the public
     /// HTTPS listener and the dev API listener. Cancelled by
     /// [`ApplicationNode::shutdown`].
@@ -321,7 +329,40 @@ impl NodeState {
     ///
     /// [`NodeError::Serve`] when the bind fails or the bound address cannot be
     /// read.
+    ///
+    /// A specific `requested` address is noted before the bind (ADR-004
+    /// **Endpoint refusal**), so no endpoint check passes for it while the
+    /// listener already accepts. A failed bind leaves that address noted,
+    /// which is harmless: [`ApplicationNode::bind`] and
+    /// [`ApplicationNode::serve`] consume the node and return the error, so
+    /// the node never serves, and a failed
+    /// [`ApplicationNode::serve_background`] leaves the node running with
+    /// the address refused although no listener of the node serves it. The
+    /// bound address is noted again after the bind; for a wildcard request
+    /// it is a wildcard too, and adds nothing.
     pub(crate) async fn take_or_bind_public(
+        &self,
+        requested: SocketAddr,
+    ) -> Result<(tokio::net::TcpListener, SocketAddr), NodeError> {
+        self.note_listener_bound(requested);
+        let bound = self.take_or_bind_unnoted(requested).await?;
+        self.note_listener_bound(bound.1);
+        Ok(bound)
+    }
+
+    /// Adds the address of a public listener to the `WebPush` sender's own
+    /// addresses (ADR-004 **Endpoint refusal**), so an endpoint at a listener
+    /// bound after the start is refused too. Callers note a specific address
+    /// before they bind it. A wildcard address adds nothing, and a node whose
+    /// relay runs no `WebPush` sender tracks nothing.
+    pub(crate) fn note_listener_bound(&self, bound: SocketAddr) {
+        if let Some(tracker) = &self.own_addresses {
+            tracker.add_bind(bound);
+        }
+    }
+
+    /// [`Self::take_or_bind_public`] before the bound address is noted.
+    async fn take_or_bind_unnoted(
         &self,
         requested: SocketAddr,
     ) -> Result<(tokio::net::TcpListener, SocketAddr), NodeError> {
@@ -439,10 +480,26 @@ const BRIDGE_IDLE_TIMEOUT: Duration = Duration::from_mins(5);
 ///
 /// The handler dynamically generates the `.well-known/scp` JSON document
 /// from the provided [`NodeState`]. See spec section 18.3.
+///
+/// The router answers every origin with `Access-Control-Allow-Origin: *`,
+/// whatever CORS origins the node configures: a browser client reads the
+/// document, and the VAPID key in it, from a page of another origin, and the
+/// document holds only public data (§18.3.3).
 pub fn well_known_router(state: Arc<NodeState>) -> Router {
     Router::new()
         .route("/.well-known/scp", get(well_known_handler))
         .with_state(state)
+        .layer(build_cors_layer(&None))
+}
+
+/// The node's two public read-only routers, each with its CORS policy:
+/// `.well-known/scp` answers every origin (§18.3.3), and the broadcast
+/// projection answers the node's configured CORS origins.
+pub(crate) fn public_read_routers(state: &Arc<NodeState>) -> (Router, Router) {
+    let well_known = well_known_router(Arc::clone(state));
+    let projection = crate::projection::broadcast_projection_router(Arc::clone(state))
+        .layer(build_cors_layer(&state.cors_origins));
+    (well_known, projection)
 }
 
 /// Returns an axum [`Router`] handling WebSocket upgrade at `/scp/v1`.
@@ -1395,6 +1452,17 @@ mod tests {
 
     /// Creates a minimal `NodeState` for CORS tests.
     fn test_state(cors_origins: Option<Vec<String>>) -> Arc<NodeState> {
+        test_state_with_push(
+            cors_origins,
+            scp_transport::relay::push_gate::PushRole::Disabled,
+        )
+    }
+
+    /// [`test_state`] whose relay runs `push`.
+    fn test_state_with_push(
+        cors_origins: Option<Vec<String>>,
+        push: scp_transport::relay::push_gate::PushRole,
+    ) -> Arc<NodeState> {
         Arc::new(NodeState {
             did: "did:dht:cors_test".to_owned(),
             live_state: crate::LiveSlot::new(crate::NodePublishedState {
@@ -1417,15 +1485,21 @@ mod tests {
             dev_bind_addr: None,
             projected_contexts: RwLock::new(HashMap::new()),
             blob_storage: Arc::new(BlobStorageBackend::in_memory()),
-            relay_config: scp_transport::native::server::RelayConfig::defaults(
-                scp_transport::relay::push_gate::LiveRelayUrl::new(
-                    scp_transport::relay::push_gate::RelayUrl::new("ws://127.0.0.1:9000/scp/v1")
+            relay_config: scp_transport::native::server::RelayConfig {
+                push,
+                ..scp_transport::native::server::RelayConfig::defaults(
+                    scp_transport::relay::push_gate::LiveRelayUrl::new(
+                        scp_transport::relay::push_gate::RelayUrl::new(
+                            "ws://127.0.0.1:9000/scp/v1",
+                        )
                         .unwrap(),
-                ),
-            ),
+                    ),
+                )
+            },
             start_time: Instant::now(),
             http_bind_addr: Some(SocketAddr::from(([0, 0, 0, 0], 8443))),
             prebound_public: std::sync::Mutex::new(None),
+            own_addresses: None,
             shutdown_token: CancellationToken::new(),
             cors_origins,
             projection_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter::new(
@@ -1452,83 +1526,117 @@ mod tests {
         })
     }
 
+    /// The configured origin list the CORS tests use.
+    fn allowed_only() -> Vec<String> {
+        vec!["https://allowed.example".to_owned()]
+    }
+
+    /// The `Access-Control-Allow-Origin` value of `router`'s answer to a
+    /// `method` request for `uri` from `origin`, with the status.
+    async fn acao(
+        router: Router,
+        method: Method,
+        uri: &str,
+        origin: &str,
+    ) -> (StatusCode, Option<String>) {
+        let mut req = Request::builder()
+            .method(method.clone())
+            .uri(uri)
+            .header("Origin", origin);
+        if method == Method::OPTIONS {
+            req = req.header("Access-Control-Request-Method", "GET");
+        }
+        let resp = router
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let value = resp
+            .headers()
+            .get("access-control-allow-origin")
+            .map(|v| v.to_str().unwrap().to_owned());
+        (resp.status(), value)
+    }
+
+    /// A projection path that reaches a handler, so the CORS layer answers.
+    const PROJECTION_URI: &str =
+        "/scp/broadcast/0000000000000000000000000000000000000000000000000000000000000000/feed";
+
     #[tokio::test]
     async fn cors_permissive_well_known_returns_wildcard_origin() {
-        let state = test_state(None);
-        let cors = build_cors_layer(&state.cors_origins);
-        let router = well_known_router(state).layer(cors);
-
-        let req = Request::builder()
-            .uri("/.well-known/scp")
-            .header("Origin", "https://example.com")
-            .body(Body::empty())
-            .unwrap();
-
-        let resp = router.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let acao = resp
-            .headers()
-            .get("access-control-allow-origin")
-            .expect("should have ACAO header")
-            .to_str()
-            .unwrap();
-        assert_eq!(acao, "*", "permissive mode should return wildcard origin");
+        let (well_known, _) = public_read_routers(&test_state(None));
+        let (status, acao) = acao(
+            well_known,
+            Method::GET,
+            "/.well-known/scp",
+            "https://example.com",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(acao.as_deref(), Some("*"));
     }
 
+    /// §18.3.3: the node serves `.well-known/scp` with
+    /// `Access-Control-Allow-Origin: *` even when it configures CORS origins,
+    /// to a listed origin, to an unlisted one, and to a preflight.
     #[tokio::test]
-    async fn cors_restricted_well_known_allows_matching_origin() {
-        let origins = Some(vec!["https://allowed.example".to_owned()]);
-        let state = test_state(origins);
-        let cors = build_cors_layer(&state.cors_origins);
-        let router = well_known_router(state).layer(cors);
-
-        let req = Request::builder()
-            .uri("/.well-known/scp")
-            .header("Origin", "https://allowed.example")
-            .body(Body::empty())
-            .unwrap();
-
-        let resp = router.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let acao = resp
-            .headers()
-            .get("access-control-allow-origin")
-            .expect("should have ACAO header for allowed origin")
-            .to_str()
-            .unwrap();
-        assert_eq!(acao, "https://allowed.example");
+    async fn well_known_cors_is_star_despite_configured_origins() {
+        let state = test_state(Some(allowed_only()));
+        for origin in ["https://allowed.example", "https://evil.example"] {
+            let (well_known, _) = public_read_routers(&state);
+            let (status, acao) = acao(well_known, Method::GET, "/.well-known/scp", origin).await;
+            assert_eq!(status, StatusCode::OK, "{origin}");
+            assert_eq!(acao.as_deref(), Some("*"), "{origin}");
+        }
+        let (well_known, _) = public_read_routers(&state);
+        let (status, acao) = acao(
+            well_known,
+            Method::OPTIONS,
+            "/.well-known/scp",
+            "https://evil.example",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(acao.as_deref(), Some("*"));
     }
 
+    /// The broadcast projection keeps the configured origin list: a listed
+    /// origin is echoed and an unlisted one gets no header.
     #[tokio::test]
-    async fn cors_restricted_well_known_rejects_non_matching_origin() {
-        let origins = Some(vec!["https://allowed.example".to_owned()]);
-        let state = test_state(origins);
-        let cors = build_cors_layer(&state.cors_origins);
-        let router = well_known_router(state).layer(cors);
+    async fn projection_cors_follows_configured_origins() {
+        let state = test_state(Some(allowed_only()));
+        let (_, projection) = public_read_routers(&state);
+        let (_, allowed) = acao(
+            projection,
+            Method::GET,
+            PROJECTION_URI,
+            "https://allowed.example",
+        )
+        .await;
+        assert_eq!(allowed.as_deref(), Some("https://allowed.example"));
+        let (_, projection) = public_read_routers(&state);
+        let (_, other) = acao(
+            projection,
+            Method::GET,
+            PROJECTION_URI,
+            "https://evil.example",
+        )
+        .await;
+        assert_eq!(other, None);
 
-        let req = Request::builder()
-            .uri("/.well-known/scp")
-            .header("Origin", "https://evil.example")
-            .body(Body::empty())
-            .unwrap();
-
-        let resp = router.oneshot(req).await.unwrap();
-        // The response should succeed (CORS doesn't block the response,
-        // it omits the ACAO header so the browser rejects it client-side).
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert!(
-            resp.headers().get("access-control-allow-origin").is_none(),
-            "non-matching origin should NOT receive ACAO header"
-        );
+        let (_, projection) = public_read_routers(&test_state(None));
+        let (_, any) = acao(
+            projection,
+            Method::GET,
+            PROJECTION_URI,
+            "https://evil.example",
+        )
+        .await;
+        assert_eq!(any.as_deref(), Some("*"));
     }
 
     #[tokio::test]
     async fn cors_preflight_options_returns_200() {
-        let state = test_state(None);
-        let cors = build_cors_layer(&state.cors_origins);
-        let router = well_known_router(state).layer(cors);
+        let router = well_known_router(test_state(None));
 
         let req = Request::builder()
             .method(Method::OPTIONS)
@@ -1556,6 +1664,128 @@ mod tests {
             .to_str()
             .unwrap();
         assert!(methods.contains("GET"), "should allow GET method");
+    }
+
+    /// A push role whose only sender is a `WebPush` sender, and that
+    /// sender's published key. Call it inside a tokio runtime.
+    fn webpush_role(dir: &std::path::Path) -> (scp_transport::relay::push_gate::PushRole, String) {
+        use scp_transport::relay::push::{VapidSubject, WebPushConfig, WebPushSender};
+        use scp_transport::relay::push_endpoint::{Nat64Prefixes, OwnAddresses};
+        use scp_transport::relay::push_gate::{PushProviders, PushRole, PushSenders};
+        use scp_transport::relay::push_store::{PushRegistrationStore, PushStoreAtRest};
+
+        let sender = WebPushSender::new(WebPushConfig {
+            vapid_key: scp_crypto::p256::P256SecretKey::from_scalar_bytes(&[7; 32]).unwrap(),
+            subject: VapidSubject::parse("mailto:operator@node.example").unwrap(),
+            own_addresses: OwnAddresses::unresolved(),
+            nat64_prefixes: Nat64Prefixes::new([]),
+        })
+        .unwrap();
+        let k = sender.vapid_k().to_owned();
+        let role = PushRole::start_with_webpush(
+            PushProviders {
+                store: PushRegistrationStore::open_sqlite(
+                    &dir.join("push.sqlite"),
+                    PushStoreAtRest::Unkeyed,
+                )
+                .unwrap(),
+                senders: PushSenders {
+                    apns: None,
+                    fcm: None,
+                },
+            },
+            sender,
+        )
+        .unwrap();
+        (role, k)
+    }
+
+    /// PUSH-023 criterion 4: a full node whose relay runs a `WebPush` sender
+    /// publishes that sender's key, 87 base64url characters of the 65-byte
+    /// uncompressed point, as `relay_config.webpush_vapid_key`, served with
+    /// `Access-Control-Allow-Origin: *` though the node configures a CORS
+    /// origin list. A node with no `WebPush` sender publishes no key.
+    #[tokio::test]
+    async fn well_known_publishes_the_running_webpush_key() {
+        use base64::Engine as _;
+        use http_body_util::BodyExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (role, k) = webpush_role(dir.path());
+        let expected = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            scp_crypto::p256::P256SecretKey::from_scalar_bytes(&[7; 32])
+                .unwrap()
+                .public_key()
+                .to_uncompressed(),
+        );
+        assert_eq!(k, expected);
+        assert_eq!(k.len(), 87);
+
+        for (state, published) in [
+            (test_state_with_push(Some(allowed_only()), role), Some(k)),
+            (test_state(Some(allowed_only())), None),
+        ] {
+            let (well_known, _) = public_read_routers(&state);
+            let req = Request::builder()
+                .uri("/.well-known/scp")
+                .header("Origin", "https://browser-app.example")
+                .body(Body::empty())
+                .unwrap();
+            let resp = well_known.oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                resp.headers()
+                    .get("access-control-allow-origin")
+                    .map(|v| v.to_str().unwrap()),
+                Some("*")
+            );
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            let doc: scp_core::well_known::WellKnownScp = serde_json::from_slice(&body).unwrap();
+            let config = doc.relay_config.expect("the node publishes relay_config");
+            assert_eq!(config.webpush_vapid_key, published);
+        }
+    }
+
+    /// PUSH-023 criterion 4 over HTTP/3: the HTTP/3 handler serves the same
+    /// document, the published VAPID key included, with
+    /// `Access-Control-Allow-Origin: *` whatever origins the node
+    /// configures, and 404 elsewhere.
+    #[cfg(feature = "http3")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http3_well_known_carries_the_key_and_cors_star() {
+        use scp_transport::http3::adapter::RequestHandler as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (role, k) = webpush_role(dir.path());
+        let handler = Arc::new(super::H3RequestHandler {
+            state: test_state_with_push(Some(allowed_only()), role),
+            rt: tokio::runtime::Handle::current(),
+        });
+        let h = Arc::clone(&handler);
+        let resp = tokio::task::spawn_blocking(move || h.handle("GET", "/.well-known/scp", &[]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("access-control-allow-origin")
+                .map(|v| v.to_str().unwrap()),
+            Some("*")
+        );
+        assert_eq!(
+            resp.headers()
+                .get("content-type")
+                .map(|v| v.to_str().unwrap()),
+            Some("application/json")
+        );
+        let doc: scp_core::well_known::WellKnownScp = serde_json::from_slice(resp.body()).unwrap();
+        assert_eq!(doc.relay_config.unwrap().webpush_vapid_key, Some(k));
+
+        let h = Arc::clone(&handler);
+        let resp = tokio::task::spawn_blocking(move || h.handle("GET", "/other", &[]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }
 
@@ -1629,6 +1859,7 @@ mod vhost_tests {
             start_time: Instant::now(),
             http_bind_addr: Some(SocketAddr::from(([0, 0, 0, 0], 8443))),
             prebound_public: std::sync::Mutex::new(None),
+            own_addresses: None,
             shutdown_token: tokio_util::sync::CancellationToken::new(),
             cors_origins: None,
             projection_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter::new(
@@ -1968,40 +2199,6 @@ fn spawn_http3_listener(http3_config: scp_transport::http3::Http3Config, state: 
     use scp_transport::http3::Http3Server;
     use scp_transport::http3::adapter::RequestHandler;
 
-    struct H3RequestHandler {
-        state: Arc<NodeState>,
-        rt: tokio::runtime::Handle,
-    }
-
-    impl RequestHandler for H3RequestHandler {
-        fn handle(
-            &self,
-            method: &str,
-            uri: &str,
-            _headers: &[(String, String)],
-        ) -> axum::http::Response<Vec<u8>> {
-            if method == "GET" && uri == "/.well-known/scp" {
-                // Build the full WellKnownScp document using the same
-                // function as the Axum handler, ensuring identical
-                // responses across transports.
-                let doc = self
-                    .rt
-                    .block_on(crate::well_known::build_well_known_scp(&self.state));
-                let body_bytes = serde_json::to_vec(&doc).unwrap_or_default();
-                axum::http::Response::builder()
-                    .status(200)
-                    .header("content-type", "application/json")
-                    .body(body_bytes)
-                    .unwrap_or_else(|_| axum::http::Response::new(b"internal error".to_vec()))
-            } else {
-                axum::http::Response::builder()
-                    .status(404)
-                    .body(b"not found".to_vec())
-                    .unwrap_or_else(|_| axum::http::Response::new(Vec::new()))
-            }
-        }
-    }
-
     let handler: Arc<dyn RequestHandler> = Arc::new(H3RequestHandler {
         state: Arc::clone(state),
         rt: tokio::runtime::Handle::current(),
@@ -2011,11 +2208,18 @@ fn spawn_http3_listener(http3_config: scp_transport::http3::Http3Config, state: 
     // same per-IP connection limits as the WebSocket and QUIC relay listeners
     // (spec §10.14.3 item 2: uniform cross-transport tracking).
     let connection_tracker = state.connection_tracker.clone();
+    let noted = Arc::clone(state);
+    // A specific address is noted before the bind, so no endpoint check
+    // passes for it while the listener already accepts. A failed bind leaves
+    // it noted: the node keeps running without HTTP/3, and refuses an
+    // address no listener of the node serves.
+    noted.note_listener_bound(http3_config.bind_addr());
 
     tokio::spawn(async move {
         let mut server = Http3Server::new(http3_config, handler);
         match server.bind() {
             Ok(addr) => {
+                noted.note_listener_bound(addr);
                 tracing::info!(addr = %addr, "HTTP/3 server started");
                 if let Err(e) = server.serve(connection_tracker).await {
                     tracing::error!(error = %e, "HTTP/3 server exited with error");
@@ -2026,6 +2230,66 @@ fn spawn_http3_listener(http3_config: scp_transport::http3::Http3Config, state: 
             }
         }
     });
+}
+
+/// The HTTP/3 request handler: the full `.well-known/scp` document, the one
+/// the HTTP/1.1 and HTTP/2 handler serves, and 404 for every other path.
+#[cfg(feature = "http3")]
+struct H3RequestHandler {
+    state: Arc<NodeState>,
+    rt: tokio::runtime::Handle,
+}
+
+#[cfg(feature = "http3")]
+impl scp_transport::http3::adapter::RequestHandler for H3RequestHandler {
+    fn handle(
+        &self,
+        method: &str,
+        uri: &str,
+        _headers: &[(String, String)],
+    ) -> axum::http::Response<Vec<u8>> {
+        use axum::http::{HeaderValue, StatusCode, header};
+
+        if method != "GET" || uri != "/.well-known/scp" {
+            return h3_response(StatusCode::NOT_FOUND, b"not found".to_vec());
+        }
+        // The same builder as the Axum handler, so both transports serve one
+        // document.
+        let doc = self
+            .rt
+            .block_on(crate::well_known::build_well_known_scp(&self.state));
+        let mut response = match serde_json::to_vec(&doc) {
+            Ok(body) => {
+                let mut response = h3_response(StatusCode::OK, body);
+                response.headers_mut().insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                );
+                response
+            }
+            Err(error) => {
+                tracing::error!(%error, "serializing the .well-known/scp document failed");
+                h3_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    b"internal error".to_vec(),
+                )
+            }
+        };
+        // §18.3.3: every origin may read the document, as over HTTP.
+        response.headers_mut().insert(
+            header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            HeaderValue::from_static("*"),
+        );
+        response
+    }
+}
+
+/// A response with `status` and `body`.
+#[cfg(feature = "http3")]
+fn h3_response(status: axum::http::StatusCode, body: Vec<u8>) -> axum::http::Response<Vec<u8>> {
+    let mut response = axum::http::Response::new(body);
+    *response.status_mut() = status;
+    response
 }
 
 /// Starts the relay-side QUIC listener when a QUIC server config is present.

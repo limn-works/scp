@@ -1507,28 +1507,42 @@
       "gate": "gate-push-webpush",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-transport/src/startup.rs",
-        "crates/scp-transport/src/native/server.rs",
+        "crates/scp-transport/src/relay/push_gate.rs",
+        "crates/scp-transport/src/relay/push_webpush.rs",
+        "crates/scp-transport/src/relay/push_endpoint.rs",
+        "crates/scp-transport/src/relay/push_apns.rs",
+        "crates/scp-transport/src/relay/push.rs",
+        "crates/scp-runtime/src/well_known.rs",
+        "crates/scp-node/src/main.rs",
+        "crates/scp-node/src/config.rs",
+        "crates/scp-node/src/well_known.rs",
+        "crates/scp-node/src/http.rs",
+        "crates/scp-node/src/lib.rs",
+        "crates/scp-relay/src/main.rs",
         "crates/scp-relay/README.md",
         ".docs/adrs/phase-1.md",
-        "crates/scp-node/src/lib.rs"
+        ".docs/specs/10-infrastructure-and-self-hosting.md",
+        ".docs/standards/construction.md"
       ],
-      "description": "Extends the PUSH-012 startup rules to WebPush. The variable names are indicators; the rules are the contract. `SCP_RELAY_PUSH_PLATFORMS` accepts `webpush` in its list. With `webpush` listed, `SCP_RELAY_WEBPUSH_VAPID_KEY_PATH` (a P-256 private key file) and `SCP_RELAY_WEBPUSH_VAPID_SUBJECT` (a `mailto:` or `https:` URI) are required, with no defaults. The key loads only from a file with no group or world permissions, into a zeroizing buffer, and no `Debug` implementation prints it. The relay publishes the VAPID public key where PUSH-021 states. The ADR-004 operator table records the two variables. The `scp-node` embedded relay takes WebPush through the same explicit selection as PUSH-012, defaulting to `Disabled`; the `scp-node` file path is an indicator. Startup also builds the three other `WebPushConfig` fields PUSH-022 defines: the parsed VAPID subject; the relay's own addresses for the ADR-004 endpoint refusal rule, which are the addresses the host of the canonical relay URL resolves to plus each specific address a relay listener binds to; and the relay's NAT64 network-specific prefixes (ADR-004 **Endpoint refusal**), from `SCP_RELAY_WEBPUSH_NAT64_PREFIXES`, a comma-separated list of RFC 6052 prefixes that is required with `webpush` listed, has no default, and is empty when the relay's network has no NAT64 translator.",
+      "description": "Extends the PUSH-012 startup rules to WebPush. The variable names are indicators; the rules are the contract. The scp-node full node accepts `webpush` in `SCP_RELAY_PUSH_PLATFORMS`. With `webpush` listed, three variables are required, with no defaults: `SCP_RELAY_WEBPUSH_VAPID_KEY_PATH`, a P-256 private key file in PKCS#8 PEM form; `SCP_RELAY_WEBPUSH_VAPID_SUBJECT`, a `mailto:` or `https:` URI; and `SCP_RELAY_WEBPUSH_NAT64_PREFIXES`, a comma-separated list of RFC 6052 network-specific prefixes, or the literal `none` when the relay's network has no NAT64 translator. A blank value counts as missing. The key loads only from a file with no group or world permissions, into a zeroizing buffer, through the one PKCS#8 P-256 loader the APNs key also uses, and no `Debug` implementation, error or log line prints a byte of it. ADR-004 **VAPID key publication** requires a VAPID key pair the relay uses for nothing else, so startup refuses a VAPID key equal to the APNs key. The scp-node full node publishes its running sender's VAPID public key as `relay_config.webpush_vapid_key` in its `.well-known/scp` document, which it serves with `Access-Control-Allow-Origin: *` (spec 18 \u00a718.3.3). Alec ruled on 2026-10-25 (\"Refuse webpush there\") that `scp-relay` and `scp-node --relay-only` refuse `webpush`, because neither serves a `.well-known/scp` document where the key could be published. A full node without a domain serves no such document either, so it also refuses a WebPush sender. Startup builds the three other `WebPushConfig` fields PUSH-022 defines: the parsed VAPID subject; the relay's own addresses for the ADR-004 endpoint refusal rule, which are the addresses the host of every URL the relay currently reserves resolves to, plus each specific address a relay listener binds to; and the parsed NAT64 prefixes. The node resolves the own-address set again on every change of its reserved URL set and every 300 s. While a resolution fails, the sender refuses every endpoint without sending, and a host that does not resolve at startup fails the node start.",
       "acceptanceCriteria": [
         "With `webpush` listed, each missing WebPush variable yields its own typed `StartupError` variant naming that variable.",
-        "A key file that is unreadable, has group or world permissions, or holds no P-256 private key yields a typed error.",
+        "A key file that is unreadable, has group or world permissions, or holds no P-256 private key in PKCS#8 PEM form yields a typed error.",
         "A subject that is neither `mailto:` nor `https:` yields a typed error.",
-        "A relay started with `webpush` publishes its VAPID public key where PUSH-021 states, and a test reads it back and checks it matches the key file.",
+        "An scp-node full node started with `webpush` publishes `relay_config.webpush_vapid_key`, the 87-character base64url form of its sender's public key, at `/.well-known/scp` with `Access-Control-Allow-Origin: *`. `scp-relay` and `scp-node --relay-only` refuse `webpush` with `WebPushNotOfferedByRelay` (8001).",
         "A relay started without `webpush` rejects a WebPush registration with 4061.",
         "A test checks that the `Debug` output of the push config contains no VAPID key byte.",
-        "Startup passes the parsed VAPID subject and the relay's own addresses, built from the canonical relay URL host and every specific listener bind address, to the WebPush sender; a test checks that a WebPush endpoint naming one of those addresses gets no request.",
-        "With `webpush` listed, a missing `SCP_RELAY_WEBPUSH_NAT64_PREFIXES` yields its typed `StartupError` variant, and a prefix that is not an IPv6 network of length 32, 40, 48, 56, 64 or 96 yields a typed error; startup passes the parsed prefixes to the WebPush sender."
+        "Startup passes the parsed VAPID subject and the relay's own addresses, built from the host of every reserved relay URL and every specific listener bind address, to the WebPush sender; a test checks that a WebPush endpoint naming one of those addresses gets no request.",
+        "With `webpush` listed, a missing `SCP_RELAY_WEBPUSH_NAT64_PREFIXES` yields its typed `StartupError` variant, and a prefix that is not an IPv6 network of length 32, 40, 48, 56, 64 or 96 yields a typed error; startup passes the parsed prefixes to the WebPush sender.",
+        "A VAPID key whose public key equals the APNs key's public key yields the typed `VapidKeyIsApnsKey` error (8001)."
       ],
       "actionItems": [
         "Parse the WebPush variables with one typed error per failure.",
-        "Load the VAPID key and publish its public half.",
+        "Load the VAPID key through the shared PKCS#8 P-256 loader and publish its public half.",
+        "Keep the own-address set current with the reserved URL set.",
         "Add the operator table rows, the README section and the `scp-node` selection."
       ],
       "blockedBy": [

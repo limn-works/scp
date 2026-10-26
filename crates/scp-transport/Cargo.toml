@@ -19,6 +19,14 @@ relay-persistence = ["dep:scp-platform"]
 # The relay push registration store (spec §10.7.1, PUSH-006). Its one shipped
 # arm is SQLite through scp-sqlite-pools.
 push-store = ["dep:rusqlite", "dep:scp-sqlite-pools"]
+# The `WebPush` sender (PUSH-022), `PushRole::start_with_webpush`, and the
+# full-node push loader that builds the sender (PUSH-023). Only a relay that
+# publishes its VAPID key in a `.well-known/scp` document may wake browsers
+# (ADR-004 **VAPID key publication**), so `scp-node` enables it and
+# `scp-relay` does not; `scripts/check-shipped-feature-graph.sh` asserts that
+# `scp-relay` resolves no `webpush`. This crate's own tests compile the
+# sender without it.
+webpush = ["push-store"]
 # Compiles test-only arms: today the push store's in-memory arm, which is
 # durability-only (spec §17.17.2) and absent from every build without it.
 testing = []

@@ -2345,17 +2345,25 @@ def command_enables_testing(tokens: list[str], package: str) -> bool:
     return False
 
 
-# Every dependency section a Cargo manifest may carry. testing_edge scans all
-# three in every manifest it reads, although a dev-dependency joins feature
-# unification only when cargo builds that manifest's own test targets. Its
-# callers use a found edge to REJECT a lane, so counting a dev section in a
-# crate the build reaches as a plain dependency errs toward reporting a gap
-# rather than toward passing one.
-DEPENDENCY_SECTIONS = ("dependencies", "dev-dependencies", "build-dependencies")
+# The dependency sections cargo builds for every package a build reaches, and
+# the one it builds only for a package the command selects. Cargo enables a
+# dev-dependency only for a selected package: `cargo test -p a` compiles a's
+# `[dev-dependencies]`, and not those of a crate a reaches as a dependency, so
+# a feature such an unbuilt dev entry names never joins the build's feature
+# set. testing_edge reads DEV_SECTION only when its caller says the manifest's
+# package is selected.
+ALWAYS_BUILT_SECTIONS = ("dependencies", "build-dependencies")
+DEV_SECTION = "dev-dependencies"
 
 
-def testing_edge(manifest: Path, package: str) -> str | None:
+def testing_edge(manifest: Path, package: str, *, selected: bool) -> str | None:
     """Return how `manifest` turns `package`'s `testing` feature on, or None.
+
+    `selected` says whether the command builds `manifest`'s package's own test
+    targets. Cargo enables a dev-dependency only for a selected package, so
+    the `[dev-dependencies]` tables (top-level and `[target.*]`) count only
+    when `selected` is true; `[dependencies]` and `[build-dependencies]` count
+    for every package the build reaches.
 
     Two spellings count: a dependency entry on `package` whose `features` list
     names `testing` (its own list, or the list of the `[workspace.dependencies]`
@@ -2367,9 +2375,10 @@ def testing_edge(manifest: Path, package: str) -> str | None:
     """
     document = tomllib.loads(manifest.read_text())
     inherited, _ = workspace_dependency_specs(manifest)
-    tables = [document.get(section) or {} for section in DEPENDENCY_SECTIONS]
+    sections = ALWAYS_BUILT_SECTIONS + ((DEV_SECTION,) if selected else ())
+    tables = [document.get(section) or {} for section in sections]
     for target in (document.get("target") or {}).values():
-        tables += [target.get(section) or {} for section in DEPENDENCY_SECTIONS]
+        tables += [target.get(section) or {} for section in sections]
     for table in tables:
         for name, spec in table.items():
             if not isinstance(spec, dict):
@@ -2489,8 +2498,9 @@ def command_unifies_testing(
     manifests: set[Path] = set()
     for manifest in selected:
         manifests |= test_build_manifests(manifest, root)
+    roots = {manifest.resolve() for manifest in selected}
     for manifest in sorted(manifests):
-        edge = testing_edge(manifest, package)
+        edge = testing_edge(manifest, package, selected=manifest in roots)
         if edge is not None:
             return edge
     return None
@@ -2740,15 +2750,15 @@ def check_shipped_assertion_readers() -> None:
 
 
 def write_unification_fixture(root: Path) -> None:
-    """Write a five-crate workspace holding each spelling of a manifest edge
+    """Write a seven-crate workspace holding each spelling of a manifest edge
     that turns a sibling's `testing` feature on.
 
     leaf     declares the feature and no dependencies.
     enabler  depends on leaf with `features = ["testing"]` — the
              dependency-entry spelling that crates/scp-runtime/Cargo.toml and
              crates/scp-ffi/common/Cargo.toml write against scp-identity in
-             their `[dev-dependencies]`; testing_edge reads the three
-             dependency sections identically.
+             their `[dev-dependencies]`; testing_edge reads `[dependencies]`
+             and `[build-dependencies]` identically.
     implier  declares a feature naming `"leaf/testing"`, the spelling
              crates/scp-identity/Cargo.toml's `testing` feature carries against
              scp-dht.
@@ -2756,10 +2766,16 @@ def write_unification_fixture(root: Path) -> None:
     selfdev  dev-depends on itself with `features = ["testing"]`, the spelling
              crates/scp-dht/Cargo.toml uses to turn its own feature on in its
              tests.
+    devonly  dev-depends on leaf with `features = ["testing"]`, the edge
+             crates/scp-node/Cargo.toml carries against scp-transport.
+    user     depends on devonly, as scp-transport's tests reach scp-node
+             through scp-testing; cargo builds no dev-dependency of devonly
+             when only user is selected.
     """
     (root / "Cargo.toml").write_text(
         "[workspace]\n"
-        'members = ["leaf", "enabler", "implier", "middle", "selfdev"]\n'
+        'members = ["leaf", "enabler", "implier", "middle", "selfdev", '
+        '"devonly", "user"]\n'
     )
     bodies = {
         "leaf": "[features]\ntesting = []\n",
@@ -2778,6 +2794,11 @@ def write_unification_fixture(root: Path) -> None:
             "[dev-dependencies]\n"
             'selfdev = { path = ".", features = ["testing"] }\n'
         ),
+        "devonly": (
+            "[dev-dependencies]\n"
+            'leaf = { path = "../leaf", features = ["testing"] }\n'
+        ),
+        "user": '[dependencies]\ndevonly = { path = "../devonly" }\n',
     }
     for name, body in bodies.items():
         (root / name).mkdir(parents=True)
@@ -2853,14 +2874,34 @@ def check_testing_unification_readers() -> None:
             command_unifies_testing(
                 split_command(
                     "cargo nextest run --workspace --exclude enabler "
-                    "--exclude implier --exclude middle"
+                    "--exclude implier --exclude middle --exclude devonly"
                 ),
                 "leaf",
                 root,
             )
             is None,
-            "leaf and selfdev remain, and neither reaches enabler's manifest "
-            "nor implier's feature table",
+            "leaf, selfdev and user remain; none reaches enabler's manifest "
+            "or implier's feature table, and user's build compiles devonly "
+            "without devonly's dev-dependencies",
+        )
+        check(
+            "a dev-dependency edge counts when its package is selected",
+            command_unifies_testing(
+                split_command("cargo test -p devonly"), "leaf", root
+            )
+            is not None,
+            "`cargo test -p devonly` compiles devonly's dev-dependency on "
+            "leaf with `testing`, so narrowing dev sections to selected "
+            "packages must still report it",
+        )
+        check(
+            "a dev-dependency edge of a non-selected package is not reported",
+            command_unifies_testing(
+                split_command("cargo test -p user"), "leaf", root
+            )
+            is None,
+            "user reaches devonly as a plain dependency, and cargo enables "
+            "devonly's dev-dependencies only when devonly is selected",
         )
         check(
             "a feature-table value naming `leaf/testing` is an edge",
@@ -2896,7 +2937,9 @@ def check_testing_unification_readers() -> None:
     # fact of the build cargo resolves, not of manifest text, and job
     # rust-test-optional-features checks it with
     # `cargo check -p scp-testing --lib --features testing`.
-    scp_testing_edge = testing_edge(scp_testing_manifest, "scp-identity")
+    scp_testing_edge = testing_edge(
+        scp_testing_manifest, "scp-identity", selected=True
+    )
     check(
         "a workspace build turns scp-identity/testing on through scp-testing",
         live_edge is not None and scp_testing_edge is not None,
@@ -2905,6 +2948,29 @@ def check_testing_unification_readers() -> None:
         f'`[dev-dependencies]` entry on scp-identity the feature "testing", and '
         f"a reader that misses it re-greens pairing scp-identity's assertions "
         f"with a workspace lane",
+    )
+    check(
+        "a -p scp-node build turns scp-transport/testing on",
+        command_unifies_testing(
+            split_command("cargo test -p scp-node"), "scp-transport"
+        )
+        is not None,
+        "crates/scp-node/Cargo.toml dev-depends on scp-transport with "
+        "`testing`, and cargo builds that edge when scp-node is selected",
+    )
+    check(
+        "a -p scp-transport build skips scp-node's dev-dependencies",
+        command_unifies_testing(
+            split_command(
+                "cargo nextest run --no-tests=fail -p scp-transport "
+                "--features push-store --lib --tests"
+            ),
+            "scp-transport",
+        )
+        is None,
+        "scp-transport's tests reach scp-node through scp-testing as a plain "
+        "dependency, so scp-node's dev edge on scp-transport/testing is never "
+        "built; job rust-test-optional-features rests on that",
     )
     check(
         "a -p scp-identity build leaves scp-identity/testing off",
@@ -6996,6 +7062,11 @@ LEG_COMMANDS: tuple[tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]], ..
             (
                 "cargo clippy -p scp-transport --features "
                 "sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --all-targets -- -D warnings"
+            ),
+            (
+                "cargo clippy -p scp-transport --features "
+                "sqlite-blob,redb-blob,postgres-blob,s3-blob,startup,webpush --all-targets "
+                "-- -D warnings"
             ),
             "cargo clippy -p scp-transport --features push-store --all-targets -- -D warnings",
             (

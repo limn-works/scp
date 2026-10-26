@@ -1773,6 +1773,12 @@ jobs:
           # would compile the backends for scp-relay even when scp-relay's own
           # `cloud-blobs` no longer enables them.
           cargo clippy -p scp-transport --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --all-targets -- -D warnings
+          # The same build with `webpush`, which scp-node enables and scp-relay
+          # does not: the WebPush sender, `PushRole::start_with_webpush`, and
+          # the startup push loader compile outside tests only under it. The
+          # command above stays without it, because it lints scp-relay's build.
+          # `webpush` adds no dependency, so only scp-transport recompiles.
+          cargo clippy -p scp-transport --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup,webpush --all-targets -- -D warnings
           # The relay push registration store compiles only under `push-store`,
           # with and without its `testing`-only in-memory arm.
           cargo clippy -p scp-transport --features push-store --all-targets -- -D warnings
@@ -2121,6 +2127,9 @@ jobs:
           # it keeps selecting tests after both arms are gone.
           cargo nextest run --no-tests=fail -p scp-node --features http3,udp,testing --lib -E 'test(=well_known::tests::advertised_transports_includes_webtransport_with_feature)'
           cargo nextest run --no-tests=fail -p scp-node --features http3,udp,testing --lib -E 'test(=well_known::tests::advertised_transports_includes_udp_dtls_with_feature)'
+          # The HTTP/3 `.well-known/scp` handler's VAPID key and CORS `*` test
+          # compiles only under `http3`, so it runs on this exact path alone.
+          cargo nextest run --no-tests=fail -p scp-node --features http3,testing --lib -E 'test(=http::tests::http3_well_known_carries_the_key_and_cors_star)'
           # scp-node and scp-relay compile the PostgreSQL and S3 arms of
           # `storage_from_env` only under their off-by-default `cloud-blobs`
           # feature, which --workspace leaves off. Run the two binaries' backend

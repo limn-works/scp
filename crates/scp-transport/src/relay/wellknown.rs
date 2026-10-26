@@ -223,6 +223,7 @@ mod tests {
                 rate_limit_publish: None,
                 rate_limit_subscribe: None,
                 transports: None,
+                webpush_vapid_key: None,
                 economic: None,
             }),
         };
@@ -238,6 +239,7 @@ mod tests {
                 rate_limit_publish: None,
                 rate_limit_subscribe: None,
                 transports: None,
+                webpush_vapid_key: None,
                 economic: Some(RelayEconomicConfig {
                     currency: CurrencyCode::from("USD"),
                     per_publish: Some(Amount::new(10)),
@@ -267,6 +269,7 @@ mod tests {
                     rate_limit_publish: None,
                     rate_limit_subscribe: None,
                     transports: None,
+                    webpush_vapid_key: None,
                     economic: Some(RelayEconomicConfig {
                         currency: CurrencyCode::from("USD"),
                         per_publish: Some(Amount::new(10)),
@@ -289,6 +292,7 @@ mod tests {
                 rate_limit_publish: None,
                 rate_limit_subscribe: None,
                 transports: None,
+                webpush_vapid_key: None,
                 economic: Some(RelayEconomicConfig {
                     currency: CurrencyCode::from("USD"),
                     per_publish: Some(Amount::new(10)),
@@ -331,6 +335,7 @@ mod tests {
                     rate_limit_publish: None,
                     rate_limit_subscribe: None,
                     transports: None,
+                    webpush_vapid_key: None,
                     economic: None,
                 }),
             },
