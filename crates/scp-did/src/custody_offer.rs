@@ -7,8 +7,23 @@
 //! build state of the methods whose custody this build does not yet ship.
 //! [`CustodyDisclosure::at_selection`] states the four-cell table's columns
 //! for a selection, the root and pre-rotation co-residence, and the
-//! separations the SDK offers. Every type here is a unit enum or a record of
-//! public fields, so each crosses every binding in one shape.
+//! separations the SDK offers.
+//!
+//! Shapes:
+//! - `CustodyOffer`, `RpDomainRefusal`, `PreRotationResidence`,
+//!   `CustodyCopyHolder`, `CustodyFourCellOutcome`, `CustodyCoResidence` and
+//!   `CustodySeparation` are unit enums.
+//! - `RpOriginConfig`, `CustodyColumn` and `CustodyDisclosure` are records
+//!   with public fields.
+//! - `CustodyProfile` has unit variants and one data variant,
+//!   `Browser { origin }`.
+//! - `RpOrigin` has private fields and getters, so it exists only through
+//!   [`RpOrigin::new`], which validates both names.
+//! - `RpOriginError` and `CustodyDisclosureError` carry payloads:
+//!   each `RpOriginError` variant wraps an `RpDomainRefusal`.
+//!   `CustodyDisclosureError::NotOffered` names a `CustodyType` and a
+//!   `CustodyOffer`, and `PlatformAccountWithoutPasskey` names a
+//!   `CustodyType`.
 
 use std::fmt;
 
