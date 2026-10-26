@@ -64,6 +64,42 @@ root=$(new_root gradle-script)
 printf 'tasks.register("exportSigningKeyBytes")\n' > "$root/bindings/build.gradle.kts"
 run_case "camel-case-in-gradle-script" 1 "[exportSigningKeyBytes] 1 match(es) in bindings (*)" "$root"
 
+# A deleted NodeConfig placeholder redefined, and a capability-trait bound
+# given a default (the persistence spec's mandatory-selection rule,
+# SCP-CAPSEL-8000, §17.17.1 Selection Requirements).
+root=$(new_root noop-custody)
+printf 'pub struct NoOpCustody;\n' > "$root/crates/lib.rs"
+run_case "noop-custody-redefined" 1 "[struct NoOpCustody[[:space:];{<(]] 1 match(es) in crates (*.rs)" "$root"
+
+root=$(new_root noop-did-method)
+printf 'pub struct NoOpDidMethod;\n' > "$root/crates/lib.rs"
+run_case "noop-did-method-redefined" 1 "[struct NoOpDidMethod[[:space:];{<(]] 1 match(es) in crates (*.rs)" "$root"
+
+root=$(new_root noop-storage)
+printf 'pub struct NoOpStorage;\n' > "$root/crates/lib.rs"
+run_case "noop-storage-redefined" 1 "[struct NoOpStorage[[:space:];{<(]] 1 match(es) in crates (*.rs)" "$root"
+
+root=$(new_root defaulted-custody)
+printf 'pub struct NodeConfig<K: KeyCustody = X> {}\n' > "$root/crates/config.rs"
+run_case "defaulted-custody-parameter" 1 "[:[[:space:]]*KeyCustody[[:space:]]*=[[:space:]]*[A-Za-z]] 1 match(es) in crates (*.rs)" "$root"
+
+root=$(new_root defaulted-did-method)
+printf 'struct C<D: DidMethod = X> {}\n' > "$root/crates/config.rs"
+run_case "defaulted-did-method-parameter" 1 "[:[[:space:]]*DidMethod[[:space:]]*=[[:space:]]*[A-Za-z]] 1 match(es) in crates (*.rs)" "$root"
+
+root=$(new_root defaulted-storage)
+printf 'struct C<S: Storage = X> {}\n' > "$root/crates/config.rs"
+run_case "defaulted-storage-parameter" 1 "[:[[:space:]]*Storage[[:space:]]*=[[:space:]]*[A-Za-z]] 1 match(es) in crates (*.rs)" "$root"
+
+root=$(new_root defaulted-encrypted-storage)
+printf 'struct C<S: EncryptedStorage = X> {}\n' > "$root/crates/config.rs"
+run_case "defaulted-encrypted-storage-parameter" 1 "[:[[:space:]]*EncryptedStorage[[:space:]]*=[[:space:]]*[A-Za-z]] 1 match(es) in crates (*.rs)" "$root"
+
+# A type alias that names a DID method is not a defaulted bound.
+root=$(new_root did-method-alias)
+printf 'pub type ConcreteDidMethod = DidDht<A, B>;\n' > "$root/crates/lib.rs"
+run_case "did-method-alias-passes" 0 "PASSED" "$root"
+
 echo ""
 echo "deleted-primitives fixture tests: $passed passed, $failed failed"
 [[ $failed -eq 0 ]]
