@@ -159,19 +159,26 @@ fn policy_preimage(policy: ValidatedSybilPolicy<'_>) -> Result<Vec<u8>, Canonica
 }
 
 /// A binding digest `D` (§9.3.1), which only
-/// [`device_attestation_binding_digest`] builds.
+/// [`device_attestation_binding_digest`] builds, with the identifier it
+/// covers.
 ///
-/// The App Attest checks take a `BindingDigest`, never raw bytes, so no
-/// caller can have an attestation verified against a `D` it chose: the
-/// digest always covers an identifier, a context id and a challenge. The
-/// field is private, so code outside this module cannot build one.
+/// The App Attest and Play Integrity checks take a `BindingDigest`, never raw
+/// bytes, so no caller can have an attestation verified against a `D` it
+/// chose: the digest always covers an identifier, a context id and a
+/// challenge. Play Integrity check 6 reads the verdict preimage's `subject`
+/// from the same value, so no caller can pair one identifier's `D` with
+/// another subject. The fields are private, so code outside this module
+/// cannot build one.
 ///
-/// ```compile_fail,E0423
-/// let forged = scp_protocol::trust::device_attestation::digest::BindingDigest([0; 32]);
+/// ```compile_fail,E0451
+/// let forged = scp_protocol::trust::device_attestation::digest::BindingDigest {
+///     digest: [0; 32],
+///     subject: scp_did::Identifier::ZERO,
+/// };
 /// ```
 ///
-/// The positive control: the type and its accessor are public, so the call
-/// above fails on the private field alone.
+/// The positive control: the type and its accessor are public, so the
+/// literal above fails on the private fields alone.
 ///
 /// ```
 /// use scp_protocol::trust::device_attestation::digest::BindingDigest;
@@ -180,14 +187,30 @@ fn policy_preimage(policy: ValidatedSybilPolicy<'_>) -> Result<Vec<u8>, Canonica
 /// }
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BindingDigest([u8; 32]);
+pub struct BindingDigest {
+    digest: [u8; 32],
+    subject: Identifier,
+}
 
 impl BindingDigest {
     /// The digest's 32 bytes: the App Attest `clientDataHash`, and in
     /// lowercase hexadecimal the Play Integrity `requestHash`.
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
+        &self.digest
+    }
+
+    /// The identifier the digest covers: the subject of a Play Integrity
+    /// verdict preimage (§9.3.1 Play Integrity check 6).
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the SCP-316 reader (keri/p6-reader-scp-316) is the first caller outside the tests"
+        )
+    )]
+    pub(crate) const fn subject(&self) -> &Identifier {
+        &self.subject
     }
 }
 
@@ -207,7 +230,10 @@ pub fn device_attestation_binding_digest(
     challenge: &[u8; 32],
 ) -> Result<BindingDigest, CanonicalError> {
     let preimage = binding_preimage(BINDING_SEPARATOR, identifier, context_id, challenge)?;
-    Ok(BindingDigest(Sha256::digest(preimage).into()))
+    Ok(BindingDigest {
+        digest: Sha256::digest(preimage).into(),
+        subject: *identifier,
+    })
 }
 
 /// The tag `T` (§9.3.1) an entry publishes in place of the challenge. It
