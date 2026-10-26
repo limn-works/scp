@@ -20183,12 +20183,12 @@ mod tests {
     /// Runs one shipped `encrypted_file` create case in this process (the
     /// child) or starts each case in a child process (the parent).
     ///
-    /// `encrypted_file` resolves HOME and SCP_KEY_PASSPHRASE on a shipped
+    /// `encrypted_file` resolves `HOME` and `SCP_KEY_PASSPHRASE` on a shipped
     /// build, so a bad variable is `SCP-VALID-7001`, and then refuses with
     /// `SCP-IDENT-1100` before the key file opens, so a refused call leaves no
     /// `$HOME/.scp` (spec 03 §3.2.2 and §3.10.10). Each case runs in a child
-    /// process that `test_env::run_case` starts with its own HOME and
-    /// SCP_KEY_PASSPHRASE, so no test sets an environment variable in a process
+    /// process that `test_env::run_case` starts with its own `HOME` and
+    /// `SCP_KEY_PASSPHRASE`, so no test sets an environment variable in a process
     /// where other tests run.
     #[cfg(not(feature = "testing"))]
     fn run_encrypted_file_create_cases(test_name: &str, with_agent_key: bool) {
