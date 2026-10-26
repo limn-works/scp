@@ -1795,11 +1795,6 @@ pub(in crate::context) async fn create_context(
     if let Some(policy) = &params.pseudonym_rotation {
         policy.validate()?;
     }
-    // §9.3.1: creation rejects a sybil policy whose device-attestation inputs
-    // break a validity rule, before any context state exists.
-    if let Some(policy) = &params.sybil_policy {
-        policy.validated()?;
-    }
     state::validate_governance_model(&params.governance)?;
     crate::context::lifecycle_logic::validate_consequence_rules(
         &params.consequence_rules,
@@ -3114,10 +3109,11 @@ pub(in crate::context) async fn import_context(
         &export.snapshot.consequence_rules,
         &export.snapshot.context_params.consequence_config,
     )?;
-    // §9.3.1: an imported sybil policy passes the same validity rules a
-    // created one does, with the same SCP-CTX-2092 refusal.
-    crate::context::lifecycle_logic::validate_sybil_policy_for_import(
-        export.snapshot.context_params.sybil_policy.as_ref(),
+    // The imported params pass the same `validate_context_params` a created
+    // context's do (§9.3.1 sybil policy included), with the same SCP-CTX-2092
+    // refusal.
+    crate::context::lifecycle_logic::validate_context_params_for_import(
+        &export.snapshot.context_params,
     )?;
 
     // Ceiling-entry grammar enforcement on the IMPORTED ceiling (spec §5.3.1.1).
@@ -3956,7 +3952,7 @@ pub async fn restore_context(
     use crate::context::governance::timeout::DeadlockDetectionState;
     use crate::context::lifecycle_logic::{
         derive_message_pricing, sanitize_cooldown_until, validate_consequence_rules_for_import,
-        validate_sybil_policy_for_import,
+        validate_context_params_for_import,
     };
     use crate::context::state::{
         context_id_to_bytes, restore_governance_engine_from_snapshot,
@@ -3967,7 +3963,7 @@ pub async fn restore_context(
 
     let (mut ctx_snapshot, broadcast_ctx) =
         load_persisted_context_state(deps, context_id, preloaded_snapshot).await?;
-    // Every refusal below (consequence rules, sybil policy, ceiling grammar, the §5.13.3
+    // Every refusal below (consequence rules, context params, ceiling grammar, the §5.13.3
     // binding check, the event-log load, the replay-floor merge) runs in that
     // order. The event log is hydrated only after the binding check, and the
     // floors are merged only after the event log loaded, so a restore refused
@@ -3981,7 +3977,7 @@ pub async fn restore_context(
         &ctx_snapshot.consequence_rules,
         &ctx_snapshot.context_params.consequence_config,
     )?;
-    validate_sybil_policy_for_import(ctx_snapshot.context_params.sybil_policy.as_ref())?;
+    validate_context_params_for_import(&ctx_snapshot.context_params)?;
 
     // Ceiling-entry grammar enforcement on the RESTORED ceiling (spec §5.3.1.1).
     // This is the self-respawn / process-restart path reading a LOCAL snapshot.

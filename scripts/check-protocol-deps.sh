@@ -7,8 +7,25 @@ set -euo pipefail
 # whose lines read "<crate> v<version>". A name matches only whole: `h2`
 # matches "h2 v0.4.0" and not "oauth2 v4.4.2", and `hyper` matches neither
 # "hyperlocal v0.9.0" nor a crate whose name merely contains it.
+# `|| true` covers grep alone, whose exit 1 means "no line matched"; a
+# failing awk or sort still fails the pipeline under pipefail.
 network_crates_in() {
-    echo "$1" | grep -E '^(reqwest|hyper|hyper-util|ureq|isahc|surf|h2|rustls|tokio|async-std|smol) v' | awk '{print $1}' | sort -u || true
+    echo "$1" | { grep -E '^(reqwest|hyper|hyper-util|ureq|isahc|surf|h2|rustls|tokio|async-std|smol) v' || true; } | awk '{print $1}' | sort -u
+}
+
+# ALLOWLIST is the checked-in list of every package scp-protocol's production
+# graph may hold.
+ALLOWLIST="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/protocol-allowed-packages.txt"
+
+# packages_outside_allowlist LISTING ALLOWFILE prints, one per line and
+# sorted, every package named in LISTING (a `cargo tree --prefix none --format
+# '{p}'` listing) that ALLOWFILE does not name. Names compare whole, so
+# "sha2-asm" is not allowed by "sha2". `|| true` covers grep alone.
+packages_outside_allowlist() {
+    local names allowed
+    names=$(echo "$1" | awk 'NF {print $1}' | LC_ALL=C sort -u)
+    allowed=$({ grep -vE '^[[:space:]]*(#|$)' "$2" || true; } | awk '{print $1}' | LC_ALL=C sort -u)
+    LC_ALL=C comm -23 <(echo "$names") <(echo "$allowed") | { grep -v '^$' || true; }
 }
 
 # --self-test feeds network_crates_in a canned listing with two network crates
@@ -23,6 +40,24 @@ if [ "${1:-}" = "--self-test" ]; then
         exit 1
     fi
     echo "network_crates_in self-test passed: matched exactly h2 and reqwest."
+
+    # The allowlist check: a listing of allowed packages, a duplicate marker
+    # and the root line passes; that listing plus reqwest, native-tls, mio or
+    # a name that only extends an allowed one each fails with that name.
+    allowed_listing=$'scp-protocol v0.1.0 (/src/crates/scp-protocol)\nsha2 v0.10.9\nserde v1.0.228 (*)'
+    got=$(packages_outside_allowlist "$allowed_listing" "$ALLOWLIST")
+    if [ -n "$got" ]; then
+        echo "ERROR: packages_outside_allowlist self-test: allowed listing reported [$got]"
+        exit 1
+    fi
+    for intruder in reqwest native-tls mio sha2-asm; do
+        got=$(packages_outside_allowlist "$allowed_listing"$'\n'"$intruder v1.0.0" "$ALLOWLIST")
+        if [ "$got" != "$intruder" ]; then
+            echo "ERROR: packages_outside_allowlist self-test: want [$intruder], got [$got]"
+            exit 1
+        fi
+    done
+    echo "packages_outside_allowlist self-test passed: refused reqwest, native-tls, mio and sha2-asm."
     exit 0
 fi
 
@@ -152,3 +187,32 @@ protocol_has_no_network_crates() {
     echo "scp-protocol network check passed: no HTTP, TLS or async runtime crate."
 }
 protocol_has_no_network_crates
+
+# protocol_packages_are_allowlisted: the denylist above names known network
+# crates and misses any it does not name (curl, native-tls, mio, socket2,
+# quinn). This check compares every package of scp-protocol's production
+# graph, every feature and every target resolved, against the checked-in
+# ALLOWLIST and fails on any package the list does not name, so a new
+# dependency of any kind needs a reviewed line in that file.
+protocol_packages_are_allowlisted() {
+    local listing err outside
+    err=$(mktemp)
+    listing=$(cargo tree -p scp-protocol --edges no-dev --all-features --target all --prefix none --format '{p}' 2>"$err") || {
+        echo "ERROR: cargo tree failed: $(cat "$err")"
+        rm -f "$err"
+        exit 1
+    }
+    rm -f "$err"
+    if [ -z "$listing" ]; then
+        echo "ERROR: cargo tree printed no package for scp-protocol"
+        exit 1
+    fi
+    outside=$(packages_outside_allowlist "$listing" "$ALLOWLIST")
+    if [ -n "$outside" ]; then
+        echo "ERROR: scp-protocol depends on packages outside $ALLOWLIST:"
+        echo "$outside"
+        exit 1
+    fi
+    echo "scp-protocol allowlist check passed: every package is in $(basename "$ALLOWLIST")."
+}
+protocol_packages_are_allowlisted

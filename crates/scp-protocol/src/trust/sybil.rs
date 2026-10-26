@@ -554,7 +554,7 @@ pub struct ContextSybilPolicy {
     /// it from a cryptographically secure random source when it sets the
     /// context to weight the signal. 32 bytes of `0x00`, the default, reads as
     /// unset, and a reader then returns `Rejected{ContextChallengeUnset}`.
-    #[serde(default, with = "crate::identity::scpid::hex_serde_32")]
+    #[serde(default, with = "canonical_hex_32_serde")]
     pub device_attestation_challenge: [u8; 32],
 
     /// The longest time after minting that a reader accepts a device
@@ -634,12 +634,42 @@ pub struct AcceptedAndroidPackage {
     pub package_name: String,
     /// The SHA-256 digest of the app's signing certificate, as Google reports
     /// it in `appIntegrity.certificateSha256Digest`.
-    #[serde(with = "crate::identity::scpid::hex_serde_32")]
+    #[serde(with = "canonical_hex_32_serde")]
     pub signing_cert_sha256: [u8; 32],
     /// The identifier of the one party whose verdict this context accepts for
     /// this package's tokens. Serialized as its `scp:` text form.
     #[serde(with = "identifier_text_serde")]
     pub verifier_identifier: Identifier,
+}
+
+/// Serializes a 32-byte value as 64 lowercase hexadecimal characters and
+/// parses only that form, so one value has one encoding, as
+/// [`identifier_text_serde`] does for an identifier. Uppercase, mixed case, a
+/// prefix, whitespace or any other length fails to parse.
+mod canonical_hex_32_serde {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(bytes: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&hex::encode(bytes))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 32], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let text = String::deserialize(deserializer)?;
+        if text.len() != 64 || !text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            return Err(serde::de::Error::custom(
+                "expected 64 lowercase hexadecimal characters",
+            ));
+        }
+        let mut bytes = [0u8; 32];
+        hex::decode_to_slice(&text, &mut bytes).map_err(serde::de::Error::custom)?;
+        Ok(bytes)
+    }
 }
 
 /// Serializes an [`Identifier`] as its canonical `scp:` text form and parses
@@ -2906,6 +2936,57 @@ mod device_attestation_policy_tests {
         json["accepted_android_packages"][0]["verifier_identifier"] =
             serde_json::Value::String(upper);
         assert!(serde_json::from_value::<ContextSybilPolicy>(json).is_err());
+        Ok(())
+    }
+
+    /// The challenge and a package's signing-certificate digest parse only as
+    /// 64 lowercase hexadecimal characters. The uppercase text of a valid
+    /// value, a mixed-case value, a `0x` prefix and a 63-character value each
+    /// fail; the lowercase text of the same value parses.
+    #[test]
+    fn non_canonical_challenge_hex_is_refused() -> TestResult {
+        type ReadField = fn(&ContextSybilPolicy) -> [u8; 32];
+        let base = serde_json::to_value(populated())?;
+        let lower = hex::encode([0x3c; 32]);
+        let non_canonical = [
+            lower.to_uppercase(),
+            format!("3C{}", &lower[2..]),
+            format!("0x{}", &lower[2..]),
+            lower[1..].to_owned(),
+        ];
+        let challenge: ReadField = |p| p.device_attestation_challenge;
+        let signing_cert: ReadField = |p| {
+            p.accepted_android_packages
+                .first()
+                .map_or([0u8; 32], |package| package.signing_cert_sha256)
+        };
+        let fields = [
+            ("/device_attestation_challenge", challenge),
+            (
+                "/accepted_android_packages/0/signing_cert_sha256",
+                signing_cert,
+            ),
+        ];
+        for (pointer, read) in fields {
+            for text in &non_canonical {
+                let mut json = base.clone();
+                let field = json.pointer_mut(pointer).ok_or("field present")?;
+                *field = serde_json::Value::String(text.clone());
+                assert!(
+                    serde_json::from_value::<ContextSybilPolicy>(json).is_err(),
+                    "{pointer} must refuse {text}"
+                );
+            }
+            let mut json = base.clone();
+            let field = json.pointer_mut(pointer).ok_or("field present")?;
+            *field = serde_json::Value::String(lower.clone());
+            let parsed = serde_json::from_value::<ContextSybilPolicy>(json)?;
+            assert_eq!(
+                read(&parsed),
+                [0x3c; 32],
+                "{pointer} must parse its lowercase text"
+            );
+        }
         Ok(())
     }
 

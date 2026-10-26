@@ -174,9 +174,9 @@ mod tests {
     use scp_did::Identifier;
 
     use super::{
-        BINDING_SEPARATOR, TAG_SEPARATOR, assertion_preimage, binding_preimage,
-        device_assertion_digest, device_attestation_binding_digest, device_attestation_tag,
-        policy_digest, policy_preimage,
+        ASSERTION_SEPARATOR, BINDING_SEPARATOR, TAG_SEPARATOR, assertion_preimage,
+        binding_preimage, device_assertion_digest, device_attestation_binding_digest,
+        device_attestation_tag, policy_digest, policy_preimage,
     };
     use crate::trust::sybil::{
         AcceptedAndroidPackage, AcceptedAppId, ApplePlatform, ContextSybilPolicy,
@@ -313,22 +313,38 @@ mod tests {
         Ok(())
     }
 
-    /// §25.35 Vector 85, and an `m` equal to the `D` preimage after its
-    /// separator: the separators differ, so `A` still differs from `D`.
+    /// The separator alone keeps `A` from equalling a digest under `D`'s
+    /// separator: for an `m` equal to the `D` preimage after its separator,
+    /// `A`'s preimage after its separator is copied behind `D`'s separator, so
+    /// the two preimages differ only in the separator, and the two digests
+    /// must differ. The check runs before the §25.35 Vector 85 pins, so making
+    /// `A`'s separator equal to `D`'s fails at this `assert_ne!` and not at a
+    /// pin.
     #[test]
     fn assertion_digest_differs_from_binding_digest_on_equal_concatenation() -> TestResult {
+        let d_preimage = binding_preimage(BINDING_SEPARATOR, &subject(), "ctx-1", &challenge())?;
+        let m = d_preimage
+            .get(BINDING_SEPARATOR.len()..)
+            .ok_or("the D preimage is shorter than its separator")?;
+        let a_preimage = assertion_preimage(m)?;
+        let a_body = a_preimage
+            .get(ASSERTION_SEPARATOR.len()..)
+            .ok_or("the A preimage is shorter than its separator")?;
+        let under_d_separator = [BINDING_SEPARATOR, a_body].concat();
+        let a = device_assertion_digest(m)?;
+        assert_eq!(<[u8; 32]>::from(Sha256::digest(&a_preimage)), a);
+        assert_ne!(
+            a,
+            <[u8; 32]>::from(Sha256::digest(&under_d_separator)),
+            "A over m must differ from a digest of the same bytes under D's separator"
+        );
+        assert_ne!(hex::encode(a), D_HEX);
+
         let request = b"SCP test vector assertion request";
         let preimage = assertion_preimage(request)?;
         assert_eq!(preimage.len(), 24 + 4 + 33);
         assert_eq!(hex::encode(&preimage), A_PREIMAGE_HEX);
         assert_eq!(hex::encode(device_assertion_digest(request)?), A_HEX);
-
-        let d_preimage = binding_preimage(BINDING_SEPARATOR, &subject(), "ctx-1", &challenge())?;
-        let tail = d_preimage
-            .get(BINDING_SEPARATOR.len()..)
-            .ok_or("the D preimage is shorter than its separator")?;
-        let a = device_assertion_digest(tail)?;
-        assert_ne!(hex::encode(a), D_HEX);
         Ok(())
     }
 

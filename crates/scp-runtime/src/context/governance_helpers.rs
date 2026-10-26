@@ -4273,11 +4273,12 @@ pub async fn propose_governance_action_inner(
         ));
     }
 
-    // §9.3.1: the destination of a migration and a child context are created
-    // with the params the proposal carries, and creation refuses a sybil
-    // policy that breaks a validity rule. Refuse such a proposal here with the
-    // typed `SybilPolicyError`, before any proposal is recorded, after the
-    // same proposer checks the empty-ceiling refusal above runs after.
+    // The destination of a migration and a child context are created with the
+    // params the proposal carries, and creation refuses params that fail
+    // `validate_context_params` (a §9.3.1 sybil policy among them). Refuse
+    // such a proposal here with the typed `TemplateError`, before any proposal
+    // is recorded, after the same proposer check the empty-ceiling refusal
+    // above runs.
     let proposed_params = match &action {
         GovernanceAction::ProposeContextMigration {
             new_context_params, ..
@@ -4285,16 +4286,14 @@ pub async fn propose_governance_action_inner(
         GovernanceAction::CreateChildContext { params } => Some(params.as_ref()),
         _ => None,
     };
-    if let Some(policy) = proposed_params.and_then(|params| params.sybil_policy.as_ref())
-        && let Err(e) = policy.validated()
+    if let Some(Err(e)) =
+        proposed_params.map(scp_protocol::context::templates::validate_context_params)
     {
         cell.governance
             .engine
             .check_proposer(proposer_did)
             .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?;
-        return Err(ContextError::TemplateMismatch(
-            scp_protocol::context::templates::TemplateError::InvalidSybilPolicy(e),
-        ));
+        return Err(ContextError::TemplateMismatch(e));
     }
 
     // ADR-049 Decision 7a: precheck, sign once, apply, all on this one

@@ -2519,87 +2519,100 @@ mod tests {
         }
     }
 
-    /// A `ProposeContextMigration` whose destination sybil policy breaks a
-    /// §9.3.1 validity rule (a device-attestation max age one second above the
-    /// one-year maximum) would fail its destination create after the vote, so
-    /// the proposal step refuses it with the typed `InvalidSybilPolicy` and
-    /// records no proposal. The control, the same proposal at the one-year
-    /// maximum, passes that check and reaches the version check the
-    /// destination params fail later.
+    /// A `ProposeContextMigration` or `CreateChildContext` whose params carry a
+    /// sybil policy that breaks a §9.3.1 validity rule (a device-attestation
+    /// max age one second above the one-year maximum) would fail its create
+    /// after the vote, so the proposal step refuses each with the typed
+    /// `InvalidSybilPolicy` and records no proposal. The control, the same
+    /// proposal at the one-year maximum, passes that check. Each action runs
+    /// on its own fresh context, so a control that records a proposal cannot
+    /// mask the next action's refusal.
     #[tokio::test]
     async fn governance_change_rejects_invalid_policy() {
         use scp_protocol::context::governance::GovernanceAction;
+        use scp_protocol::context::params::ContextParams;
         use scp_protocol::trust::sybil::{
             ContextSybilPolicy, MAX_DEVICE_ATTESTATION_MAX_AGE_SECS, SybilPolicyError,
         };
 
-        let (deps, _appends) = build_deps().await;
-        let (state, ctx_hex) =
-            build_broadcast_state_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
-        let mut cell = ClassSCell::new(state);
-        let proposer = DID(CREATOR_DID.to_owned());
-        let migrate = |max_age: u64| GovernanceAction::ProposeContextMigration {
-            new_context_params: Box::new(scp_protocol::context::params::ContextParams {
+        let params = |max_age: u64| {
+            Box::new(ContextParams {
                 sybil_policy: Some(ContextSybilPolicy {
                     device_attestation_max_age_secs: max_age,
                     ..ContextSybilPolicy::casual()
                 }),
                 ..undeliverable_destination_params()
-            }),
+            })
+        };
+        let migrate = |max_age: u64| GovernanceAction::ProposeContextMigration {
+            new_context_params: params(max_age),
             reason: "fixture".to_owned(),
             grace_period_secs: 60,
             auto_invite: false,
         };
+        let child = |max_age: u64| GovernanceAction::CreateChildContext {
+            params: params(max_age),
+        };
+        let actions: [(&str, &dyn Fn(u64) -> GovernanceAction); 2] =
+            [("migration", &migrate), ("child context", &child)];
 
-        let refused = crate::context::governance_helpers::propose_governance_action_inner(
-            &mut cell,
-            &deps,
-            &ctx_hex,
-            &proposer,
-            migrate(MAX_DEVICE_ATTESTATION_MAX_AGE_SECS + 1),
-            &crate::context::actor::CommandSigner::local_ed25519(creator_key().clone()),
-            false,
-            None,
-        )
-        .await;
-        assert!(
-            matches!(
-                refused,
-                Err(ContextError::TemplateMismatch(
-                    scp_protocol::context::templates::TemplateError::InvalidSybilPolicy(
-                        SybilPolicyError::DeviceAttestationMaxAgeTooLarge { .. }
-                    )
-                ))
-            ),
-            "an invalid destination sybil policy must be refused at proposal time; \
-             got {refused:?}"
-        );
-        assert!(
-            crate::context::governance_helpers::list_proposals(&cell).is_empty(),
-            "a refused migration proposal must record no proposal"
-        );
+        let (deps, _appends) = build_deps().await;
+        let proposer = DID(CREATOR_DID.to_owned());
+        for (label, action) in actions {
+            let (state, ctx_hex) =
+                build_broadcast_state_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
+            let mut cell = ClassSCell::new(state);
 
-        let admitted = crate::context::governance_helpers::propose_governance_action_inner(
-            &mut cell,
-            &deps,
-            &ctx_hex,
-            &proposer,
-            migrate(MAX_DEVICE_ATTESTATION_MAX_AGE_SECS),
-            &crate::context::actor::CommandSigner::local_ed25519(creator_key().clone()),
-            false,
-            None,
-        )
-        .await;
-        assert!(
-            !matches!(
-                admitted,
-                Err(ContextError::TemplateMismatch(
-                    scp_protocol::context::templates::TemplateError::InvalidSybilPolicy(_)
-                ))
-            ),
-            "a valid destination sybil policy must pass the proposal-time check; \
-             got {admitted:?}"
-        );
+            let refused = crate::context::governance_helpers::propose_governance_action_inner(
+                &mut cell,
+                &deps,
+                &ctx_hex,
+                &proposer,
+                action(MAX_DEVICE_ATTESTATION_MAX_AGE_SECS + 1),
+                &crate::context::actor::CommandSigner::local_ed25519(creator_key().clone()),
+                false,
+                None,
+            )
+            .await;
+            assert!(
+                matches!(
+                    refused,
+                    Err(ContextError::TemplateMismatch(
+                        scp_protocol::context::templates::TemplateError::InvalidSybilPolicy(
+                            SybilPolicyError::DeviceAttestationMaxAgeTooLarge { .. }
+                        )
+                    ))
+                ),
+                "an invalid {label} sybil policy must be refused at proposal time; \
+                 got {refused:?}"
+            );
+            assert!(
+                crate::context::governance_helpers::list_proposals(&cell).is_empty(),
+                "a refused {label} proposal must record no proposal"
+            );
+
+            let admitted = crate::context::governance_helpers::propose_governance_action_inner(
+                &mut cell,
+                &deps,
+                &ctx_hex,
+                &proposer,
+                action(MAX_DEVICE_ATTESTATION_MAX_AGE_SECS),
+                &crate::context::actor::CommandSigner::local_ed25519(creator_key().clone()),
+                false,
+                None,
+            )
+            .await;
+            assert!(
+                !matches!(
+                    admitted,
+                    Err(ContextError::TemplateMismatch(
+                        scp_protocol::context::templates::TemplateError::InvalidSybilPolicy(_)
+                    ))
+                ),
+                "a valid {label} sybil policy must pass the proposal-time check; \
+                 got {admitted:?}"
+            );
+        }
     }
 
     /// A `ProposeContextMigration` whose destination ceiling is empty would

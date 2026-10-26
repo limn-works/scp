@@ -164,26 +164,25 @@ pub fn validate_consequence_rules_for_import(
     Ok(())
 }
 
-/// Validates an imported or restored `sybil_policy` against the §9.3.1
-/// validity rules and returns [`ContextError::ImportRejected`] on failure, so
-/// the bridge translators surface `SCP-CTX-2092` as they do for
+/// Runs [`validate_context_params`](scp_protocol::context::templates::validate_context_params),
+/// the one params validator every entry point calls, on imported or restored
+/// params and returns [`ContextError::ImportRejected`] on failure, so the
+/// bridge translators surface `SCP-CTX-2092` as they do for
 /// [`validate_consequence_rules_for_import`].
 ///
 /// # Errors
 ///
-/// [`ContextError::ImportRejected`] when `policy` is present and fails
-/// [`ContextSybilPolicy::validated`](scp_protocol::trust::sybil::ContextSybilPolicy::validated).
-pub fn validate_sybil_policy_for_import(
-    policy: Option<&scp_protocol::trust::sybil::ContextSybilPolicy>,
+/// [`ContextError::ImportRejected`] when `params` fails
+/// `validate_context_params`, for example a `sybil_policy` that breaks a
+/// §9.3.1 validity rule.
+pub(super) fn validate_context_params_for_import(
+    params: &scp_protocol::context::ContextParams,
 ) -> Result<(), ContextError> {
-    if let Some(policy) = policy {
-        policy
-            .validated()
-            .map_err(|e| ContextError::ImportRejected {
-                reason: format!("sybil_policy invalid: {e}"),
-            })?;
-    }
-    Ok(())
+    scp_protocol::context::templates::validate_context_params(params).map_err(|e| {
+        ContextError::ImportRejected {
+            reason: format!("context_params invalid: {e}"),
+        }
+    })
 }
 
 // ADR-049 Phase 2A finalization keystone — type unification (ADR-049 §15):

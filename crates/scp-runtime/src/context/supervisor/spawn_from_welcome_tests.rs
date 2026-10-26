@@ -1060,6 +1060,90 @@ async fn over_cap_genesis_outlets_are_rejected_before_the_kp_consume() {
     );
 }
 
+/// Precheck C runs `validate_context_params`, the validator create, import,
+/// restore and governance run, on the inviter's params. A creator-signed
+/// bundle whose sybil policy carries a device-attestation max age one second
+/// above the §9.3.1 one-year maximum is refused before the consume, and the
+/// joiner persists no snapshot a later restore would refuse. Non-vacuity: the
+/// SAME reservation and Welcome, retried with the max age at the maximum,
+/// succeed and persist, so the KeyPackage was never burned and the max age
+/// alone decided the refusal.
+#[tokio::test]
+async fn welcome_rejects_invalid_policy_before_the_kp_consume() {
+    use scp_protocol::trust::sybil::{ContextSybilPolicy, MAX_DEVICE_ATTESTATION_MAX_AGE_SECS};
+
+    let bob = DID::from(BOB_DID);
+    let ctx_id = ctx_hex(0x2e);
+
+    let rec = RecordingPersistence::default();
+    let (sup, _bob_crypto) = bob_supervisor(Some(Box::new(rec.clone())));
+    let (reservation_id, kp_public_bytes) = reserve_bob_kp(&sup, &bob).await;
+    let (_alice, welcome) = alice_welcome_for(&ctx_id, &kp_public_bytes);
+
+    let bob_recipient = wrapping_point(&sup, &bob).await;
+    let make_req = |max_age: u64| {
+        let params = ContextParams {
+            sybil_policy: Some(ContextSybilPolicy {
+                device_attestation_max_age_secs: max_age,
+                ..ContextSybilPolicy::casual()
+            }),
+            ..joiner_params()
+        };
+        let bundle = signed_bundle(
+            &alice_signing_key(),
+            &DID::from(ALICE_DID),
+            &ctx_id,
+            &params,
+            welcome.clone(),
+        );
+        seal_bundle(
+            &bundle,
+            &bob_recipient,
+            &ctx_id,
+            &DID::from(ALICE_DID),
+            reservation_id.clone(),
+            some_pseudonym(),
+        )
+    };
+
+    let err = sup
+        .spawn_actor_from_welcome(
+            bob.clone(),
+            make_req(MAX_DEVICE_ATTESTATION_MAX_AGE_SECS + 1),
+        )
+        .await
+        .expect_err("an invalid inviter sybil policy must be refused on the joiner");
+    // `let-else { return }` after the assert, for the reason the over-cap
+    // outlet test above records.
+    assert!(
+        matches!(err, crate::context::ContextError::CreationFailed(_)),
+        "expected CreationFailed for an invalid sybil policy, got {err:?}"
+    );
+    let crate::context::ContextError::CreationFailed(message) = &err else {
+        return;
+    };
+    assert!(
+        message.contains("sybil_policy"),
+        "the refusal must name the sybil policy (not some other precheck), got {message}"
+    );
+    assert!(
+        sup.lookup(&ctx_id).is_none(),
+        "no actor may be registered after an invalid sybil policy"
+    );
+    assert!(
+        rec.store.get(&ctx_id).is_none(),
+        "the joiner must persist no snapshot for a refused sybil policy"
+    );
+
+    sup.spawn_actor_from_welcome(bob, make_req(MAX_DEVICE_ATTESTATION_MAX_AGE_SECS))
+        .await
+        .expect("the valid-policy retry succeeds — the KeyPackage was never burned");
+    assert!(
+        rec.store.get(&ctx_id).is_some(),
+        "the valid-policy retry persists the joiner's snapshot"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Test A2 — the joiner seeds its ABSOLUTE MLS epoch from the joined group.
 // ---------------------------------------------------------------------------

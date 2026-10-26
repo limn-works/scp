@@ -89,152 +89,107 @@ impl VerifiedDeviceAttestation {
     }
 }
 
-/// Why the context's entry failed a check the reader ran to completion
-/// (§9.3.1). Twenty-one values.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum DeviceAttestationRejection {
-    /// The policy's challenge is 32 bytes of `0x00`.
-    ContextChallengeUnset,
-    /// The entry's `serviceEndpoint` is not the platform's field layout.
-    MalformedEntry,
-    /// The platform token does not decode.
-    MalformedToken,
-    /// App Attest `authData` is shorter than its fields require.
-    AuthDataTruncated,
-    /// App Attest `authData` names a credential ID that is not 32 bytes.
-    CredentialIdLengthInvalid,
-    /// The certificate chain does not verify to the pinned root.
-    CertificateChainInvalid,
-    /// The reader's time is past `minted_at` plus the policy's maximum age.
-    Expired,
-    /// The attestation's start time is later than the skew allows.
-    NotYetValid,
-    /// The App Attest nonce does not cover the binding digest.
-    NonceMismatch,
-    /// The credential ID differs from the credential key's digest.
-    KeyIdMismatch,
-    /// The App ID is not in the policy's accepted list.
-    AppIdNotAccepted,
-    /// The App Attest sign counter is not zero.
-    CounterNotZero,
-    /// The attestation comes from Apple's development environment.
-    DevelopmentEnvironment,
-    /// The credential certificate fits neither the iOS nor the macOS path.
-    PlatformUnreported,
-    /// An accepted App ID matches, but no matching element names the
-    /// platform path the credential certificate took.
-    PlatformMismatch,
-    /// On the macOS path, the `aclBlob` extension is not the value §9.3.1
-    /// fixes.
-    AclBlobMismatch,
-    /// The launch validation category is not accepted.
-    ValidationCategoryNotAccepted,
-    /// The bundle version is not accepted.
-    BundleVersionNotAccepted,
-    /// The Android package or its signing certificate is not accepted.
-    PackageNotAccepted,
-    /// The Play Integrity verdict's signature does not verify.
-    VerdictSignatureInvalid,
-    /// More than [`MAX_DEVICE_ATTESTATIONS_PER_CHALLENGE`] entries carry the
-    /// context's tag.
-    TooManyEntries,
+/// Defines a §9.3.1 verdict-cause enum, its `ALL` list and its `as_str`
+/// from one variant list, so no variant can exist outside `ALL` and every
+/// `as_str` value is the variant's own name.
+macro_rules! verdict_cause_enum {
+    (
+        $(#[$enum_meta:meta])*
+        $name:ident {
+            $( $(#[$variant_meta:meta])* $variant:ident, )+
+        }
+    ) => {
+        $(#[$enum_meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum $name {
+            $( $(#[$variant_meta])* $variant, )+
+        }
+
+        impl $name {
+            /// Every value, in §9.3.1's order.
+            pub const ALL: [Self; [$(stringify!($variant)),+].len()] = [$(Self::$variant),+];
+
+            /// The value's §9.3.1 name.
+            #[must_use]
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => stringify!($variant),)+
+                }
+            }
+        }
+    };
 }
 
-impl DeviceAttestationRejection {
-    /// Every value, in §9.3.1's order.
-    pub const ALL: [Self; 21] = [
-        Self::ContextChallengeUnset,
-        Self::MalformedEntry,
-        Self::MalformedToken,
-        Self::AuthDataTruncated,
-        Self::CredentialIdLengthInvalid,
-        Self::CertificateChainInvalid,
-        Self::Expired,
-        Self::NotYetValid,
-        Self::NonceMismatch,
-        Self::KeyIdMismatch,
-        Self::AppIdNotAccepted,
-        Self::CounterNotZero,
-        Self::DevelopmentEnvironment,
-        Self::PlatformUnreported,
-        Self::PlatformMismatch,
-        Self::AclBlobMismatch,
-        Self::ValidationCategoryNotAccepted,
-        Self::BundleVersionNotAccepted,
-        Self::PackageNotAccepted,
-        Self::VerdictSignatureInvalid,
-        Self::TooManyEntries,
-    ];
-
-    /// The value's §9.3.1 name.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::ContextChallengeUnset => "ContextChallengeUnset",
-            Self::MalformedEntry => "MalformedEntry",
-            Self::MalformedToken => "MalformedToken",
-            Self::AuthDataTruncated => "AuthDataTruncated",
-            Self::CredentialIdLengthInvalid => "CredentialIdLengthInvalid",
-            Self::CertificateChainInvalid => "CertificateChainInvalid",
-            Self::Expired => "Expired",
-            Self::NotYetValid => "NotYetValid",
-            Self::NonceMismatch => "NonceMismatch",
-            Self::KeyIdMismatch => "KeyIdMismatch",
-            Self::AppIdNotAccepted => "AppIdNotAccepted",
-            Self::CounterNotZero => "CounterNotZero",
-            Self::DevelopmentEnvironment => "DevelopmentEnvironment",
-            Self::PlatformUnreported => "PlatformUnreported",
-            Self::PlatformMismatch => "PlatformMismatch",
-            Self::AclBlobMismatch => "AclBlobMismatch",
-            Self::ValidationCategoryNotAccepted => "ValidationCategoryNotAccepted",
-            Self::BundleVersionNotAccepted => "BundleVersionNotAccepted",
-            Self::PackageNotAccepted => "PackageNotAccepted",
-            Self::VerdictSignatureInvalid => "VerdictSignatureInvalid",
-            Self::TooManyEntries => "TooManyEntries",
-        }
+verdict_cause_enum! {
+    /// Why the context's entry failed a check the reader ran to completion
+    /// (§9.3.1). Twenty-one values.
+    DeviceAttestationRejection {
+        /// The policy's challenge is 32 bytes of `0x00`.
+        ContextChallengeUnset,
+        /// The entry's `serviceEndpoint` is not the platform's field layout.
+        MalformedEntry,
+        /// The platform token does not decode.
+        MalformedToken,
+        /// App Attest `authData` is shorter than its fields require.
+        AuthDataTruncated,
+        /// App Attest `authData` names a credential ID that is not 32 bytes.
+        CredentialIdLengthInvalid,
+        /// The certificate chain does not verify to the pinned root.
+        CertificateChainInvalid,
+        /// The reader's time is past `minted_at` plus the policy's maximum age.
+        Expired,
+        /// The attestation's start time is later than the skew allows.
+        NotYetValid,
+        /// The App Attest nonce does not cover the binding digest.
+        NonceMismatch,
+        /// The credential ID differs from the credential key's digest.
+        KeyIdMismatch,
+        /// The App ID is not in the policy's accepted list.
+        AppIdNotAccepted,
+        /// The App Attest sign counter is not zero.
+        CounterNotZero,
+        /// The attestation comes from Apple's development environment.
+        DevelopmentEnvironment,
+        /// The credential certificate fits neither the iOS nor the macOS path.
+        PlatformUnreported,
+        /// An accepted App ID matches, but no matching element names the
+        /// platform path the credential certificate took.
+        PlatformMismatch,
+        /// On the macOS path, the `aclBlob` extension is not the value §9.3.1
+        /// fixes.
+        AclBlobMismatch,
+        /// The launch validation category is not accepted.
+        ValidationCategoryNotAccepted,
+        /// The bundle version is not accepted.
+        BundleVersionNotAccepted,
+        /// The Android package or its signing certificate is not accepted.
+        PackageNotAccepted,
+        /// The Play Integrity verdict's signature does not verify.
+        VerdictSignatureInvalid,
+        /// More than [`MAX_DEVICE_ATTESTATIONS_PER_CHALLENGE`] entries carry the
+        /// context's tag.
+        TooManyEntries,
     }
 }
 
-/// Why the reader could not run a check to completion (§9.3.1). Five values.
-///
-/// A reader never caches one of these outcomes, because each depends on a
-/// record or key state that can become reachable on a later read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum DeviceAttestationUnverifiable {
-    /// The service record read was `Rejected`, `Inconclusive`, or named
-    /// another identifier.
-    ServiceRecordUnavailable,
-    /// The policy names no verifier for the entry's Android package.
-    NoVerifierNamed,
-    /// The Play Integrity entry carries no verdict.
-    VerdictAbsent,
-    /// The verdict names a verifier other than the one the policy names.
-    VerdictFromUnnamedVerifier,
-    /// The verifier's key state is unresolved or older than the freshness
-    /// bound allows.
-    VerifierKeyStateUnresolved,
-}
-
-impl DeviceAttestationUnverifiable {
-    /// Every value, in §9.3.1's order.
-    pub const ALL: [Self; 5] = [
-        Self::ServiceRecordUnavailable,
-        Self::NoVerifierNamed,
-        Self::VerdictAbsent,
-        Self::VerdictFromUnnamedVerifier,
-        Self::VerifierKeyStateUnresolved,
-    ];
-
-    /// The value's §9.3.1 name.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::ServiceRecordUnavailable => "ServiceRecordUnavailable",
-            Self::NoVerifierNamed => "NoVerifierNamed",
-            Self::VerdictAbsent => "VerdictAbsent",
-            Self::VerdictFromUnnamedVerifier => "VerdictFromUnnamedVerifier",
-            Self::VerifierKeyStateUnresolved => "VerifierKeyStateUnresolved",
-        }
+verdict_cause_enum! {
+    /// Why the reader could not run a check to completion (§9.3.1). Five values.
+    ///
+    /// A reader never caches one of these outcomes, because each depends on a
+    /// record or key state that can become reachable on a later read.
+    DeviceAttestationUnverifiable {
+        /// The service record read was `Rejected`, `Inconclusive`, or named
+        /// another identifier.
+        ServiceRecordUnavailable,
+        /// The policy names no verifier for the entry's Android package.
+        NoVerifierNamed,
+        /// The Play Integrity entry carries no verdict.
+        VerdictAbsent,
+        /// The verdict names a verifier other than the one the policy names.
+        VerdictFromUnnamedVerifier,
+        /// The verifier's key state is unresolved or older than the freshness
+        /// bound allows.
+        VerifierKeyStateUnresolved,
     }
 }
 

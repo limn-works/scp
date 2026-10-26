@@ -15,7 +15,9 @@
 
 use super::ContextHandle;
 use crate::crypto::mls::provider::NodeMlsFactory;
-use scp_protocol::context::templates::validate_against_template;
+use scp_protocol::context::templates::{
+    TemplateError, validate_against_template, validate_context_params,
+};
 use scp_protocol::context::{
     CapabilityCeiling, ContextError, ContextMode, ContextParams, ContextState, ScpContextExtension,
 };
@@ -1019,7 +1021,9 @@ impl CreationReceipt {
 /// `pseudonym_rotation` fails the §9.10.4.1 validity criterion.
 ///
 /// Returns [`ContextCreationError::InvalidSybilPolicy`] if `sybil_policy`
-/// fails the §9.3.1 validity rules.
+/// fails the §9.3.1 validity rules, and
+/// [`ContextCreationError::TemplateValidationFailed`] if
+/// `projection_policy` is set on an encrypted context (§18.11.2.1).
 fn validate_params(params: &ContextParams) -> Result<(), ContextCreationError> {
     // Governance model validation (SCP-267, ADR-031).
     // GovernanceModel is a variant-only enum in ContextParams. Structural
@@ -1065,12 +1069,18 @@ fn validate_params(params: &ContextParams) -> Result<(), ContextCreationError> {
         policy.validate()?;
     }
 
-    // §9.3.1 validity rules: creation rejects an invalid sybil policy.
-    // `lifecycle_helpers::create_context` checks it first; this check makes
-    // the rule hold for every in-crate caller of `create_context`.
-    if let Some(policy) = &params.sybil_policy {
-        policy.validated()?;
-    }
+    // `validate_context_params` is the one validator of the cross-field and
+    // policy rules every params entry point applies: creation here, import and
+    // restore (`lifecycle_logic::validate_context_params_for_import`), the
+    // Welcome join (`Supervisor::spawn_actor_from_welcome` Precheck C), and the
+    // migration and child-context proposals (`governance_helpers`). Every
+    // create path reaches this Phase 1 call before any side effect, so
+    // `lifecycle_helpers::create_context` does not repeat it. A §9.3.1 sybil
+    // policy refusal keeps its typed `InvalidSybilPolicy` variant.
+    validate_context_params(params).map_err(|e| match e {
+        TemplateError::InvalidSybilPolicy(e) => ContextCreationError::InvalidSybilPolicy(e),
+        other => ContextCreationError::TemplateValidationFailed(other.to_string()),
+    })?;
 
     // Validate memory scope is permitted for the context mode (§5.11).
     // Broadcast contexts only support MemoryScope::Full — Ephemeral and
@@ -1512,6 +1522,39 @@ mod tests {
         assert!(
             validate_params(&ceilinged_params()).is_ok(),
             "a non-empty ceiling must be accepted"
+        );
+    }
+
+    /// Phase 1 validation refuses a sybil policy whose device-attestation max
+    /// age is one second above the §9.3.1 one-year maximum, with the typed
+    /// `InvalidSybilPolicy`. The same params at the maximum pass, so the max
+    /// age alone decides the refusal.
+    #[test]
+    fn validate_params_rejects_invalid_policy() {
+        use scp_protocol::trust::sybil::{
+            ContextSybilPolicy, MAX_DEVICE_ATTESTATION_MAX_AGE_SECS, SybilPolicyError,
+        };
+        let with_max_age = |max_age: u64| ContextParams {
+            sybil_policy: Some(ContextSybilPolicy {
+                device_attestation_max_age_secs: max_age,
+                ..ContextSybilPolicy::casual()
+            }),
+            ..ceilinged_params()
+        };
+        let err = validate_params(&with_max_age(MAX_DEVICE_ATTESTATION_MAX_AGE_SECS + 1))
+            .expect_err("a max age above the maximum must be refused");
+        assert!(
+            matches!(
+                err,
+                ContextCreationError::InvalidSybilPolicy(
+                    SybilPolicyError::DeviceAttestationMaxAgeTooLarge { .. }
+                )
+            ),
+            "expected InvalidSybilPolicy(DeviceAttestationMaxAgeTooLarge), got {err:?}"
+        );
+        assert!(
+            validate_params(&with_max_age(MAX_DEVICE_ATTESTATION_MAX_AGE_SECS)).is_ok(),
+            "a max age at the maximum must be accepted"
         );
     }
 

@@ -16657,6 +16657,12 @@ impl Supervisor {
                 .validate()
                 .map_err(|e| ContextError::CreationFailed(e.to_string()))?;
         }
+        // The one params validator create, import, restore and governance call
+        // (§9.3.1 sybil policy, §18.11.2.1 projection policy). A joiner's
+        // `params` arrive from a peer, and a policy restore later refuses must
+        // not be persisted, so run it before the consume.
+        scp_protocol::context::templates::validate_context_params(&params)
+            .map_err(|e| ContextError::CreationFailed(e.to_string()))?;
 
         // Build the joiner's actor deps (crypto, transport, event log, KP store,
         // mls_storage, persistence, capability token) for the owning identity.
