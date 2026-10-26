@@ -45,7 +45,6 @@ use crate::context::actor::state::PerContextState;
 use crate::context::governance_logic::ConsequenceStateSplit;
 use crate::context::governance_logic::{
     EnforceConsequencesCtx, enforce_triggered_consequences, event_log_entries_for_consequences,
-    event_log_entries_for_consequences_after_side_effect,
 };
 use crate::context::log_unit_helpers::{plan_encoded_leaf, queue_log_unit};
 use crate::context::state::{
@@ -5813,26 +5812,113 @@ pub async fn dispatch_governance_action(
 // finalize_governance_action (post-dispatch)
 // ---------------------------------------------------------------------------
 
+/// What finalize needs that can fail, read or planned before the action's
+/// irreversible step (spec 17 §17.3 "Event log write failures"): the
+/// committing member, the planned `GovernanceActionExecuted` record, and the
+/// consequence evidence. `execute_governance_action` builds it before the
+/// replay marker, so a failure refuses the action with nothing applied and
+/// finalize, which runs after the step, reads nothing that can fail.
+struct PreStepFinalize {
+    /// The committing member — the DID whose approval crossed quorum (or, for
+    /// auto-execute, the proposer). Stamped as the `GovernanceActionExecuted`
+    /// record's `actor_did` and the event's `executor_did` per ADR-031 §8
+    /// ("executor DID") / §7.3.1 ("committing member") / ADR-051 §6. This is
+    /// DISTINCT from `proposal.proposer_did`, which remains the consequence
+    /// SUBJECT in finalize.
+    executor_did: DID,
+    /// The `GovernanceActionExecuted` record, which opens the finalize unit.
+    executed_leaf: crate::context::state::LeafSpec,
+    /// The log and the queued units as read before the step.
+    evidence: crate::context::governance_logic::PreStepEvidence,
+}
+
+impl PreStepFinalize {
+    /// Plans the executed record and reads the consequence evidence.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::EventLogFailed`] when the record's payload breaks the
+    /// append's payload rules or the log cannot be read, or
+    /// [`ContextError::ContextNotRegistered`] from the log read.
+    fn read(
+        state: &PerContextState,
+        deps: &ActorDeps,
+        context_id: &str,
+        proposal: &GovernanceProposal,
+        executor_did: &DID,
+    ) -> Result<Self, ContextError> {
+        Ok(Self {
+            executor_did: executor_did.clone(),
+            executed_leaf: plan_governance_action_executed_leaf(proposal, executor_did)?,
+            evidence: crate::context::governance_logic::PreStepEvidence::read(
+                &state.governance.consequence_rules,
+                &state.class_s.pending_log_units,
+                context_id,
+                &*deps.event_log,
+            )?,
+        })
+    }
+}
+
+/// Plans the `GovernanceActionExecuted` record of `proposal`, committed by
+/// `executor_did`.
+///
+/// Its timestamp is the proposal's signed `created_at` — identical and
+/// tamper-evident for every member that processes the signed proposal
+/// (convergent by construction), never local `now()`.
+///
+/// # Errors
+///
+/// [`ContextError::EventLogFailed`] when the payload does not encode or breaks
+/// the append's payload rules.
+fn plan_governance_action_executed_leaf(
+    proposal: &GovernanceProposal,
+    executor_did: &DID,
+) -> Result<crate::context::state::LeafSpec, ContextError> {
+    plan_encoded_leaf(
+        scp_event_log::EventType::GovernanceActionExecuted,
+        executor_did.as_ref(),
+        &scp_event_log::payload::GovernanceActionExecutedPayload {
+            target_did: proposal
+                .action
+                .target_did()
+                .map(|d| d.as_ref().to_owned())
+                .unwrap_or_default(),
+            action_type: proposal.action.variant_name().to_owned(),
+        },
+        proposal.created_at,
+    )
+}
+
 /// Post-dispatch finalization for an executed governance action.
 ///
 /// Handles MLS epoch coordination (ADR-031 §8), event emission
 /// (PRD SCP-269/SCP-270), checkpoint cosignature triggering (ADR-031 §9),
-/// and cleanup of approved proposals (ADR-031 §7).
+/// consequence evaluation (ADR-017), and the participation record.
+///
+/// It writes nothing to the log and reads nothing that can fail (spec 17
+/// §17.3 "Event log write failures"). It returns the finalize unit as a
+/// [`ConsequenceSink`](crate::context::log_unit_helpers::ConsequenceSink):
+/// the `GovernanceActionExecuted` record first, then each consequence record,
+/// with any downward-auth obligation. The discharge tail queues the unit and
+/// subsumes the obligation in the action's one fail-closed persist. The
+/// evidence is the log read before the step (`pre_step`), then `journal` (the
+/// records the dispatch queued since), then the unit's records so far.
 #[allow(clippy::too_many_lines, clippy::option_if_let_else)]
-pub async fn finalize_governance_action(
+fn finalize_governance_action(
     state: &mut PerContextState,
     deps: &ActorDeps,
     context_id: &str,
     proposal: &GovernanceProposal,
-    // The committing member — the DID whose approval crossed quorum (or, for
-    // auto-execute, the proposer). Stamped as the `GovernanceActionExecuted`
-    // leaf `actor_did` and the event's `executor_did` per ADR-031 §8
-    // ("executor DID") / §7.3.1 ("committing member") / ADR-051 §6. This is
-    // DISTINCT from `proposal.proposer_did`, which remains the consequence
-    // SUBJECT below (a different semantic — see the consequence-evaluation
-    // block).
-    executor_did: &DID,
-) -> Result<(), ContextError> {
+    pre_step: PreStepFinalize,
+    journal: &[crate::context::state::LeafSpec],
+) -> Result<crate::context::log_unit_helpers::ConsequenceSink, ContextError> {
+    let PreStepFinalize {
+        executor_did,
+        executed_leaf,
+        evidence,
+    } = pre_step;
+    let executor_did = &executor_did;
     // For MLS-mutating actions (AddMember, RemoveMember, Revoke,
     // ResetMember), increment the epoch counter, place the old epoch into
     // the grace store (§23.11), record the coordination in the
@@ -5862,9 +5948,9 @@ pub async fn finalize_governance_action(
         None
     };
 
-    // Construct the structured GovernanceEvent::GovernanceActionExecuted
-    // and emit it to both the Merkle event log and the receive buffer
-    // (ADR-031 §8, PRD SCP-269/SCP-270).
+    // Construct the structured GovernanceEvent::GovernanceActionExecuted,
+    // whose record opens the finalize unit and whose event goes to the receive
+    // buffer (ADR-031 §8, PRD SCP-269/SCP-270).
     let executed_event = GovernanceEvent::GovernanceActionExecuted {
         proposal_id: proposal.proposal_id,
         action: Box::new(proposal.action.clone()),
@@ -5873,33 +5959,17 @@ pub async fn finalize_governance_action(
     };
 
     let context_id_bytes = context_id_to_bytes(context_id);
-    let action_variant = proposal.action.variant_name();
-    let executed_payload = scp_event_log::payload::encode_payload(
-        &scp_event_log::payload::GovernanceActionExecutedPayload {
-            target_did: proposal
-                .action
-                .target_did()
-                .map(|d| d.as_ref().to_owned())
-                .unwrap_or_default(),
-            action_type: action_variant.to_owned(),
-        },
-    )
-    .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
-    deps.event_log
-        .append_context_event_with_payload(
-            crate::context::builder::AppendMode::AfterSideEffect,
-            &context_id_bytes,
-            governance_event_label(&executed_event),
-            executor_did.as_ref(),
-            executed_payload,
-            // Committer-assigned timestamp: the proposal's signed `created_at` —
-            // identical and tamper-evident for every member that processes the
-            // signed proposal (convergent-by-construction), never local `now()`.
-            // The leaf is currently committer-appended-only; cross-member leaf
-            // replication is the forward step under ADR-051 (§7.3.1, §9.9.3).
-            proposal.created_at,
-        )
-        .await?;
+    // The `GovernanceActionExecuted` record, planned before the step, opens
+    // the finalize unit; it carries the type `governance_event_label` gives
+    // the event above. The record is currently committer-written only;
+    // cross-member replication is the forward step under ADR-051 (§7.3.1,
+    // §9.9.3). Nothing below can fail, so the sink always reaches the caller.
+    debug_assert_eq!(
+        executed_leaf.event_type(),
+        governance_event_label(&executed_event)
+    );
+    let mut sink = crate::context::log_unit_helpers::ConsequenceSink::new();
+    sink.push_leaf(executed_leaf);
 
     let action_summary = proposal.action.variant_name().to_owned();
     let target_did = proposal.action.target_did().cloned();
@@ -5950,13 +6020,12 @@ pub async fn finalize_governance_action(
         if !rules.is_empty() {
             // Proposer and target share one merged event set and one convergent
             // window anchor so both evaluations are convergent across members.
-            let (buf_events, convergent_now) = event_log_entries_for_consequences_after_side_effect(
-                &state.receive_buffer,
-                &state.class_s.pending_log_units,
-                context_id,
-                now,
-                &*deps.event_log,
-            );
+            let staged: Vec<crate::context::state::LeafSpec> = journal
+                .iter()
+                .chain(sink.staged_leaves())
+                .cloned()
+                .collect();
+            let (buf_events, convergent_now) = evidence.events(&staged, &state.receive_buffer, now);
             let triggered_proposer = scp_protocol::trust::consequence::evaluate_consequence_rules(
                 &rules,
                 &buf_events,
@@ -5983,15 +6052,13 @@ pub async fn finalize_governance_action(
 
             // ADR-049 §9 (RED-CS3): a consequence here may apply a downward-auth
             // mutation (a capability suspension or an `AssignRole` demotion), which
-            // ARMS `downward_auth_sink` via the GROW method. On THIS path the
+            // ARMS the sink's obligation via the GROW method. On THIS path the
             // fail-closed persist is already owed by the caller —
-            // `execute_governance_action` runs this whole
-            // `finalize_governance_action` body inside the deferred
-            // `ClassSCommitToken::discharge_with`, which performs a SINGLE
-            // FAIL-CLOSED persist of the post-finalize state (keep-direction). So an
-            // armed sink here is REDUNDANT — it is subsumed by the caller's
-            // discharge (no second persist) below.
-            let mut sink = crate::context::log_unit_helpers::ConsequenceSink::new();
+            // `discharge_and_order_governance_action` runs this whole body inside
+            // the deferred token's `begin_discharge` guard, which performs a
+            // SINGLE FAIL-CLOSED persist of the post-finalize state
+            // (keep-direction). So the armed obligation is REDUNDANT — the tail
+            // subsumes it (no second persist).
             let mut split = ConsequenceStateSplit::from_state(state);
             let _ = enforce_triggered_consequences(
                 &mut split,
@@ -6022,34 +6089,20 @@ pub async fn finalize_governance_action(
                     &mut sink,
                 );
             }
-            // Governance finalize keeps the memory-first rule for its leaves
-            // (spec 17 §17.3 "Event log write failures").
-            let (obligation, leaves) = sink.into_parts();
-            crate::context::governance_logic::append_consequence_leaves_after_side_effect(
-                &*deps.event_log,
-                context_id,
-                leaves,
-            )
-            .await;
-            // Covered fail-closed by the caller's `discharge_with` commit (above):
-            // subsume any armed obligation so EXACTLY ONE persist is owed.
-            if let Some(token) = obligation {
-                token.subsume(context_id);
-            }
         }
     }
 
     // Update participation record after governance action (#1530).
     {
         let now = deps.clock.now_secs();
-        // Participation-record path: only the merged event set is consumed.
-        let (gov_events, _convergent_now) = event_log_entries_for_consequences_after_side_effect(
-            &state.receive_buffer,
-            &state.class_s.pending_log_units,
-            context_id,
-            now,
-            &*deps.event_log,
-        );
+        // Participation-record path: only the merged event set is consumed,
+        // with the consequence records the unit gained above.
+        let staged: Vec<crate::context::state::LeafSpec> = journal
+            .iter()
+            .chain(sink.staged_leaves())
+            .cloned()
+            .collect();
+        let (gov_events, _convergent_now) = evidence.events(&staged, &state.receive_buffer, now);
         let gov_merkle = deps
             .event_log
             .event_log_merkle_root(&context_id_bytes)
@@ -6081,11 +6134,11 @@ pub async fn finalize_governance_action(
     // strengthening): the caller `execute_governance_action` now persists the
     // whole post-finalize state via the deferred `ClassSCommitToken`'s
     // FAIL-CLOSED `commit` (previously this was a best-effort persist), so the
-    // `executed_proposals` replay marker and every other finalize mutation are
-    // durable before the governance action is acknowledged. `state`, `deps`, and
-    // `context_id` remain used above (MLS-epoch / event-log append / cache).
+    // `executed_proposals` replay marker, the finalize unit, and every other
+    // finalize mutation are durable before the governance action is
+    // acknowledged.
 
-    Ok(())
+    Ok(sink)
 }
 
 // ---------------------------------------------------------------------------
@@ -6208,6 +6261,11 @@ pub async fn execute_governance_action(
             "governance proposal has already been executed".into(),
         ));
     }
+    // Spec 17 §17.3 "Event log write failures": finalize runs after the
+    // step and reads nothing that can fail, so its executed record is planned
+    // and its evidence read here, before the replay marker; a failure refuses
+    // the action with nothing applied.
+    let pre_step = PreStepFinalize::read(cell, deps, context_id, proposal, executor_did)?;
     // ADR-049 Decision 9: the replay marker below is this call's first
     // record, so a migration's bootstrap is reserved before it and a busy
     // lock or claim leaves the proposal executable by a retry.
@@ -6226,12 +6284,17 @@ pub async fn execute_governance_action(
     // keep-direction: the replay window must be closed durably whichever way it
     // resolves). The top `state` borrow has ended (NLL) so the cell is free for
     // the combinator and the downstream dispatch chain.
+    //
+    // The same transition opens the queue's journal, so finalize sees the
+    // records the dispatch queues after `pre_step` read the queue, whether
+    // or not a drain writes them first.
     let ((), token) = cell.begin_class_s(context_id, |mut view| {
         let class_s = view.governance_class_s_mut();
         class_s
             .executed_proposals
             .retain(|_, ts| now.saturating_sub(*ts) < EXECUTED_PROPOSALS_TTL_SECS);
         class_s.executed_proposals.insert(proposal.proposal_id, now);
+        view.begin_log_unit_journal();
         Ok(())
     })?;
 
@@ -6251,14 +6314,14 @@ pub async fn execute_governance_action(
     //     it from `approved_proposals` (the conflict-tracking set), fail-closed
     //     in the same persist: an entry that stays there makes every later
     //     conflicting proposal lose to a proposal that can never run. Finalize
-    //     does NOT run on this path: `finalize_governance_action` appends the
-    //     `GovernanceActionExecuted` leaf and emits the executed event, and
+    //     does NOT run on this path: `finalize_governance_action` produces the
+    //     `GovernanceActionExecuted` record and emits the executed event, and
     //     each of those asserts a completed action, while the helper reported
     //     failure. An advanced
     //     epoch does not prove the action's effect landed — `execute_extend_ttl`
-    //     credits its `TtlExtensionRejected` leaf and then returns
+    //     queues and credits its `TtlExtensionRejected` record and then returns
     //     `PermissionDenied` with the TTL unchanged — so a finalize here would
-    //     write an executed record for a rejected extension. The marker stays
+    //     queue an executed record for a rejected extension. The marker stays
     //     because dropping it would let the same proposal id run the helper
     //     again and re-apply a non-idempotent effect (`governance_ban_subscriber`
     //     and `rotate_all_author_keys` advance every author's epoch a second
@@ -6298,6 +6361,9 @@ pub async fn execute_governance_action(
                     view.governance_class_s_mut()
                         .executed_proposals
                         .remove(&proposal.proposal_id);
+                    // The dispatch queued nothing (the epoch is unchanged),
+                    // so the journal is empty; it closes here.
+                    let _ = view.take_log_unit_journal();
                     Ok(())
                 })
                 .await?;
@@ -6308,13 +6374,9 @@ pub async fn execute_governance_action(
                 context_id,
                 proposal_id = %hex::encode(proposal.proposal_id),
                 error = %e,
-                "governance dispatch failed AFTER a mutation or a leaf landed \
-                 (the cell's mutation epoch advanced); the executed-proposal \
-                 replay marker is kept and persisted so the same id cannot re-run \
-                 a non-idempotent action, and finalize is skipped so no \
-                 GovernanceActionExecuted leaf asserts an action the helper \
-                 reported as failed. The caller sees this error; the effect that \
-                 landed is not undone."
+                "governance dispatch failed after its mutation epoch advanced; \
+                 the replay marker is kept, finalize is skipped, and the effect \
+                 that landed is not undone"
             );
             Err(e)
         }
@@ -6328,9 +6390,8 @@ pub async fn execute_governance_action(
     // by the SINGLE deferred persist the token owed — no whole-state `state_mut`.
     // On a finalize error the persist STILL runs (keep-direction — the executed
     // marker stays set and must persist) and the finalize error is surfaced
-    // after. The guard replaces a synchronous `discharge_with` closure because
-    // finalize appends to the async `EventLogPersistence`-backed Merkle log while
-    // mutating the state, interleaved (ADR-049 Decision 7). On a post-effect
+    // after. Finalize queues its unit through the guard's view, in the same
+    // persist (spec 17 §17.3 "Event log write failures"). On a post-effect
     // `Err`, the same guard persists the kept marker and the proposal's removal
     // from `approved_proposals`, and finalize does not run (see the
     // replay-marker contract above).
@@ -6340,7 +6401,7 @@ pub async fn execute_governance_action(
         deps,
         context_id,
         proposal,
-        executor_did,
+        pre_step,
         dispatch_outcome,
     )
     .await
@@ -6361,15 +6422,16 @@ pub async fn execute_governance_action(
 /// own this removal, which meant a finalize error before its removal step, or
 /// a post-effect dispatch error that skips finalize, left the entry behind.
 ///
-/// On a dispatch `Ok`: finalize inside the guard, then the removal, then the
-/// single fail-closed persist that runs REGARDLESS of the finalize result
-/// (keep-direction), then the ordering of the two results — a finalize error
-/// first, then a persist error.
+/// On a dispatch `Ok`: finalize inside the guard; its unit is queued after
+/// the dispatch's records and its downward-auth obligation subsumed; then the
+/// removal, then the single fail-closed persist that runs REGARDLESS of the
+/// finalize result (keep-direction), then a drain, then the ordering of the
+/// two results — a finalize error first, then a persist error.
 ///
 /// On a post-effect dispatch `Err` (the cell's `mutation_epoch` advanced, so
 /// the caller kept the replay marker): the removal, then the persist, then the
-/// dispatch error is returned. Finalize does NOT run: it appends the
-/// `GovernanceActionExecuted` leaf and emits the executed event, and each of
+/// dispatch error is returned. Finalize does NOT run: it produces the
+/// `GovernanceActionExecuted` record and emits the executed event, and each of
 /// those records a completed action, while the helper reported that the action
 /// did not complete. A persist error on this path is logged here because the
 /// dispatch error is the one returned; `persist_snapshot_fail_closed` logs the
@@ -6380,21 +6442,31 @@ async fn discharge_and_order_governance_action(
     deps: &ActorDeps,
     context_id: &str,
     proposal: &GovernanceProposal,
-    executor_did: &DID,
+    pre_step: PreStepFinalize,
     dispatch_outcome: Result<GovernanceActionResult, ContextError>,
 ) -> Result<GovernanceActionResult, ContextError> {
     let mut discharge = token.begin_discharge(cell);
+    // The records the dispatch queued since `pre_step` read the queue.
+    let journal = discharge.view().take_log_unit_journal();
     let finalize_result = match &dispatch_outcome {
-        Ok(_) => {
-            finalize_governance_action(
-                discharge.view().rest_mut(),
-                deps,
-                context_id,
-                proposal,
-                executor_did,
-            )
-            .await
-        }
+        Ok(_) => finalize_governance_action(
+            discharge.view().rest_mut(),
+            deps,
+            context_id,
+            proposal,
+            pre_step,
+            &journal,
+        )
+        .map(|sink| {
+            // The finalize unit follows the dispatch's records in the queue
+            // and rides this guard's one fail-closed persist, which also
+            // covers the obligation a downward-auth consequence armed.
+            let (obligation, unit) = sink.into_parts();
+            discharge.view().enqueue_log_unit(unit);
+            if let Some(token) = obligation {
+                token.subsume(context_id);
+            }
+        }),
         Err(_) => Ok(()),
     };
     // The proposal is consumed on every path that reaches here (the replay
@@ -6407,11 +6479,11 @@ async fn discharge_and_order_governance_action(
         .approved_proposals
         .remove(&proposal.proposal_id);
     let persist_result = discharge.commit_fail_closed(deps, context_id).await;
-    // The per-action helpers queue their records and never drain, so the
-    // records are written here, after the persist that made them durable
-    // (spec 17 §17.3 "Event log write failures"). A failed drain leaves them
-    // queued for the next drain and logs its own error; the action's step is
-    // already durable, so a failed drain does not fail the action.
+    // The per-action helpers and finalize queue their records and never
+    // drain, so the records are written here, after the persist that made them
+    // durable (spec 17 §17.3 "Event log write failures"). A failed drain leaves
+    // them queued for the next drain and logs its own error; the action's step
+    // is already durable, so a failed drain does not fail the action.
     let _ = crate::context::log_unit_helpers::drain_pending_log_units(cell, deps, context_id).await;
     let result = match dispatch_outcome {
         Ok(result) => result,
@@ -8758,5 +8830,163 @@ mod queued_record_tests {
             "the timer arms the extended deadline"
         );
         assert_queued_only(&cell, &deps, &ctx, &[EventType::TtlExtended]);
+    }
+
+    fn admin_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[0x5A; 32])
+    }
+
+    /// The non-broadcast fixture context with a `SingleAdminEngine` holding
+    /// `ADMIN`'s approved proposal to revoke `TARGET`'s read access, and
+    /// `rules` as its consequence rules. Returns the cell and the proposal id.
+    fn cell_with_approved_revoke(
+        ctx: [u8; 32],
+        rules: Vec<scp_protocol::trust::consequence::ConsequenceRule>,
+    ) -> (ClassSCell, [u8; 32]) {
+        use scp_did::SigningKeyId;
+        use scp_protocol::context::governance::GovernanceEngineRawKey as _;
+        use scp_protocol::context::governance::{
+            GovernanceAction, GovernanceContext, KeyResolver, SingleAdminEngine,
+        };
+        let admin_vk = admin_key().verifying_key();
+        let resolver: KeyResolver = Arc::new(move |did: &DID, kid: SigningKeyId| {
+            (did.as_ref() == ADMIN && kid == SigningKeyId::Active).then_some(admin_vk)
+        });
+        let mut engine = SingleAdminEngine::new(did(ADMIN), resolver);
+        let (proposal, _events) = engine
+            .propose(
+                &did(ADMIN),
+                GovernanceAction::RevokeAccess {
+                    did: did(TARGET),
+                    access: AccessScope::Read,
+                },
+                &GovernanceContext {
+                    context_id: hex::encode(ctx),
+                    members: vec![(did(ADMIN), "admin".to_owned())],
+                    admin_dids: vec![did(ADMIN)],
+                    current_epoch: Some(0),
+                    now: TS,
+                },
+                &admin_key(),
+            )
+            .expect("a single-admin proposal is approved on submission");
+        let mut state = cell(ctx, false).into_inner();
+        state.governance.engine = Box::new(engine);
+        state.governance.consequence_rules = rules;
+        (ClassSCell::new(state), proposal.proposal_id)
+    }
+
+    /// Deps over a Merkle log of `ctx` holding one `GovernanceAction` record
+    /// by `ADMIN` against `subject` (the evidence `WarningCount` counts) and
+    /// refusing every later entry write.
+    async fn refusing_log_deps_with_warning(
+        ctx: [u8; 32],
+        subject: &str,
+    ) -> (ActorDeps, Arc<FaultyStorage>) {
+        let (log, faulty) = faulty_merkle_log();
+        let deps = deps_with(ADMIN, None, Box::new(log)).await;
+        deps.event_log
+            .init_event_log(&ctx)
+            .await
+            .expect("init event log");
+        deps.event_log
+            .append_event(
+                &ctx,
+                EventType::GovernanceAction,
+                ADMIN,
+                scp_event_log::EventPayload {
+                    data: serde_json::to_vec(&serde_json::json!({ "target_did": subject }))
+                        .expect("encode the target payload"),
+                },
+                TS,
+            )
+            .await
+            .expect("seed the warning record");
+        fail_log_entry_writes(&faulty, &ctx);
+        (deps, faulty)
+    }
+
+    fn warning_rule() -> scp_protocol::trust::consequence::ConsequenceRule {
+        use scp_protocol::trust::consequence::{
+            ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
+        };
+        ConsequenceRule {
+            trigger: ConsequenceTrigger::WarningCount,
+            action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
+            threshold: 1,
+            window: std::time::Duration::from_hours(1),
+        }
+    }
+
+    /// Finalize writes nothing: its unit (the executed record, then each
+    /// consequence record) is queued after the per-action unit, in order, and
+    /// the refusing log holds only the seeded record.
+    #[tokio::test]
+    async fn finalize_queues_its_unit_after_the_per_action_unit() {
+        let ctx = [0x66u8; 32];
+        let (deps, _faulty) = refusing_log_deps_with_warning(ctx, TARGET).await;
+        let (mut cell, pid) = cell_with_approved_revoke(ctx, vec![warning_rule()]);
+
+        super::execute_governance_action(
+            &mut cell,
+            &deps,
+            &hex::encode(ctx),
+            &pid,
+            Some(&did(ADMIN)),
+            None,
+            None,
+        )
+        .await
+        .expect("the action lands though the log refuses writes");
+
+        assert_eq!(
+            queued_unit_types(&cell.class_s.pending_log_units),
+            vec![
+                vec![EventType::AccessRevoked],
+                vec![
+                    EventType::GovernanceActionExecuted,
+                    EventType::ConsequenceTriggered,
+                    EventType::ConsequenceEnforced,
+                ],
+            ],
+            "the per-action unit, then the finalize unit"
+        );
+        assert_eq!(log_len(&deps, &ctx), 1, "the log holds only the seed");
+        assert!(
+            cell.role_state.suspended_for(TARGET).is_some(),
+            "the consequence is applied"
+        );
+    }
+
+    /// Finalize's evidence includes the records the dispatch queued after the
+    /// pre-step read: the proposer's participation counts the queued
+    /// `AccessRevoked` record as well as the executed record.
+    #[tokio::test]
+    async fn finalize_sees_per_action_leaf_in_evidence() {
+        let ctx = [0x67u8; 32];
+        let (deps, _faulty) = refusing_log_deps(ctx).await;
+        let (mut cell, pid) = cell_with_approved_revoke(ctx, Vec::new());
+
+        super::execute_governance_action(
+            &mut cell,
+            &deps,
+            &hex::encode(ctx),
+            &pid,
+            Some(&did(ADMIN)),
+            None,
+            None,
+        )
+        .await
+        .expect("the action lands though the log refuses writes");
+
+        assert_eq!(log_len(&deps, &ctx), 0, "the refusing log holds no entry");
+        assert_eq!(
+            cell.governance
+                .participation_cache
+                .get(ADMIN)
+                .map(|record| record.participation_count),
+            Some(2),
+            "the queued AccessRevoked and GovernanceActionExecuted records both count"
+        );
     }
 }

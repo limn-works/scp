@@ -877,25 +877,14 @@ async fn handle_evaluate_periodic_consequences_actor(
         }
         // `split` / `view` drop here, releasing the `&mut cell` borrow.
     }
-    // The sweep keeps the memory-first rule for its leaves (spec 17 §17.3).
-    let (mut downward_auth_obligation, leaves) = sink.into_parts();
-    crate::context::governance_logic::append_consequence_leaves_after_side_effect(
-        deps.event_log.as_ref(),
-        &context_id,
-        leaves,
-    )
-    .await;
-
-    // Fail-closed persist of an applied downward-auth mutation (keep-direction):
-    // the mutation (suspension or `AssignRole` demotion) is already in memory;
-    // committing the obligation's token makes it durable before acking (`take()`
-    // discharges the Drop guard). On persist failure the mutation STAYS and the
-    // error is surfaced to the caller; the handler still reports `mutated` so the
-    // run loop also persists.
-    let reply_result = match downward_auth_obligation.take() {
-        Some(token) => token.commit(cell, deps, &context_id).await,
-        None => Ok(()),
-    };
+    // The sweep's consequence records are queued as one unit in the same
+    // fail-closed persist that makes an applied downward-auth mutation
+    // (suspension or `AssignRole` demotion) durable, then drained (spec 17
+    // §17.3 "Event log write failures"; ADR-049 §9 keep-direction). On persist
+    // failure the mutation and the unit STAY in memory and the error is
+    // surfaced to the caller; the handler still reports `mutated` so the run
+    // loop also persists.
+    let reply_result = sink.discharge(cell, deps, &context_id).await;
     let _ = reply.send(reply_result);
     Outcome::ok_mutated(())
 }
@@ -1547,6 +1536,65 @@ mod consequence_fail_closed_tests {
         assert!(
             outcome.mutated,
             "the sweep mutated state (the suspension), so the outcome is `mutated`"
+        );
+    }
+
+    /// The sweep writes nothing to the log: a convergent consequence queues
+    /// its records as one unit in the persist that makes the suspension
+    /// durable, and a log that refuses writes fails nothing (spec 17 §17.3
+    /// "Event log write failures").
+    #[tokio::test]
+    async fn periodic_sweep_queues_its_records_when_the_log_refuses_writes() {
+        use crate::context::log_unit_helpers::test_support::{
+            deps_with, fail_log_entry_writes, faulty_merkle_log, log_len, queued_unit_types,
+        };
+        let ctx = [CTX_BYTE; 32];
+        let (log, faulty) = faulty_merkle_log();
+        let deps = deps_with(ADMIN, None, Box::new(log)).await;
+        deps.event_log.init_event_log(&ctx).await.expect("init log");
+        // The `WarningCount` evidence: one governance record by ADMIN against
+        // SUBJECT.
+        deps.event_log
+            .append_event(
+                &ctx,
+                scp_event_log::EventType::GovernanceAction,
+                ADMIN,
+                scp_event_log::EventPayload {
+                    data: serde_json::to_vec(&serde_json::json!({ "target_did": SUBJECT }))
+                        .expect("encode the target payload"),
+                },
+                1_700_000_000,
+            )
+            .await
+            .expect("seed the warning record");
+        fail_log_entry_writes(&faulty, &ctx);
+        let mut state = seed_state();
+        state.governance.consequence_rules = vec![ConsequenceRule {
+            trigger: ConsequenceTrigger::WarningCount,
+            action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
+            threshold: 1,
+            window: Duration::from_hours(1),
+        }];
+        let mut cell = ClassSCell::new(state);
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ =
+            super::handle_evaluate_periodic_consequences_actor(&mut cell, &deps, reply_tx).await;
+
+        let reply = reply_rx.await.expect("handler replies");
+        assert!(reply.is_ok(), "the sweep fails nothing; got {reply:?}");
+        assert_eq!(
+            queued_unit_types(&cell.class_s.pending_log_units),
+            vec![vec![
+                scp_event_log::EventType::ConsequenceTriggered,
+                scp_event_log::EventType::ConsequenceEnforced,
+            ]],
+            "the consequence records wait in the queue as one unit"
+        );
+        assert_eq!(log_len(&deps, &ctx), 1, "the log holds only the seed");
+        assert!(
+            cell.role_state.suspended_for(SUBJECT).is_some(),
+            "the consequence is applied"
         );
     }
 

@@ -475,8 +475,23 @@ impl Deref for ClassSMut<'_> {
 /// A queue read back from storage enters only through [`Self::validated`],
 /// which refuses a unit with no entry and an entry that breaks the append's
 /// payload rules.
+///
+/// The queue also keeps a journal of the entries queued since
+/// [`ClassSMut::begin_log_unit_journal`], for an evaluation that read its
+/// evidence before an operation's step and runs after it (governance
+/// finalize). A drain moves entries from the queue to the log, so the
+/// queue alone cannot tell which entries the operation queued; the journal
+/// can, because only [`ClassSMut::enqueue_log_unit`] writes it. The journal is
+/// never persisted, and a snapshot restore restores it together with the
+/// queue, so an entry a restore removes from the queue leaves the journal too.
 #[derive(Debug, Default, Clone)]
-pub(crate) struct PendingLogUnits(VecDeque<crate::context::state::PendingLogUnit>);
+pub(crate) struct PendingLogUnits {
+    /// The queued units, oldest first.
+    units: VecDeque<crate::context::state::PendingLogUnit>,
+    /// The entries queued since the journal began, in queue order; `None`
+    /// when no journal is open.
+    journal: Option<Vec<crate::context::state::LeafSpec>>,
+}
 
 impl PendingLogUnits {
     /// Rebuilds the queue from a persisted context snapshot (same-node
@@ -500,32 +515,35 @@ impl PendingLogUnits {
                 )));
             }
         }
-        Ok(Self(units))
+        Ok(Self {
+            units,
+            journal: None,
+        })
     }
 
     /// True when no unit is queued.
     pub(crate) fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.units.is_empty()
     }
 
     /// The number of queued units.
     pub(crate) fn len(&self) -> usize {
-        self.0.len()
+        self.units.len()
     }
 
     /// The queued units, oldest first.
     pub(crate) fn iter(&self) -> impl Iterator<Item = &crate::context::state::PendingLogUnit> {
-        self.0.iter()
+        self.units.iter()
     }
 
     /// The oldest queued unit, which the drain writes next.
     pub(crate) fn front(&self) -> Option<&crate::context::state::PendingLogUnit> {
-        self.0.front()
+        self.units.front()
     }
 
-    /// A copy of the queue for a snapshot.
+    /// A copy of the queue for a snapshot. The journal is not part of it.
     pub(crate) fn to_deque(&self) -> VecDeque<crate::context::state::PendingLogUnit> {
-        self.0.clone()
+        self.units.clone()
     }
 }
 
@@ -543,14 +561,34 @@ impl ClassSMut<'_> {
         if leaves.is_empty() {
             return;
         }
-        self.state
-            .class_s
-            .pending_log_units
-            .0
+        let queue = &mut self.state.class_s.pending_log_units;
+        if let Some(journal) = queue.journal.as_mut() {
+            journal.extend(leaves.iter().cloned());
+        }
+        queue
+            .units
             .push_back(crate::context::state::PendingLogUnit {
                 base_seq: None,
                 leaves,
             });
+    }
+
+    /// Opens the queue's journal, empty, discarding any journal still open.
+    /// Every entry [`Self::enqueue_log_unit`] queues from here until
+    /// [`Self::take_log_unit_journal`] is recorded in it.
+    pub(crate) fn begin_log_unit_journal(&mut self) {
+        self.state.class_s.pending_log_units.journal = Some(Vec::new());
+    }
+
+    /// Closes the queue's journal and returns the entries queued since it
+    /// opened, in queue order; empty when no journal was open.
+    pub(crate) fn take_log_unit_journal(&mut self) -> Vec<crate::context::state::LeafSpec> {
+        self.state
+            .class_s
+            .pending_log_units
+            .journal
+            .take()
+            .unwrap_or_default()
     }
 
     /// Queues `leaves` as one pending log unit, as [`Self::enqueue_log_unit`]
@@ -574,7 +612,7 @@ impl ClassSMut<'_> {
         self.state
             .class_s
             .pending_log_units
-            .0
+            .units
             .front_mut()
             .is_some_and(|unit| {
                 unit.base_seq = base_seq;
@@ -584,7 +622,7 @@ impl ClassSMut<'_> {
 
     /// Removes the oldest queued unit after the drain wrote it.
     pub(crate) fn pop_front_log_unit(&mut self) -> Option<crate::context::state::PendingLogUnit> {
-        self.state.class_s.pending_log_units.0.pop_front()
+        self.state.class_s.pending_log_units.units.pop_front()
     }
 
     /// Sets the log-fault marker.
@@ -3777,8 +3815,9 @@ impl ClassSCommitToken {
     ///   `ClassSMut::governance_class_s_mut`), and that removal must be the
     ///   state the deferred persist makes durable;
     /// - the success / finalize-failure terminal runs `finalize_governance_action`
-    ///   (a Class-C body, reached via [`ClassSMut::rest_mut`]) and then performs
-    ///   the token's owed persist over the finalized state.
+    ///   (a Class-C body, reached via [`ClassSMut::rest_mut`]), queues its unit,
+    ///   and then performs the token's owed persist over the finalized state;
+    ///   it does so through [`Self::begin_discharge`].
     ///
     /// Rather than reach a whole-state `&mut` to mutate, then call
     /// [`Self::commit`] (two reaches), this runs the mutation through the same
@@ -3851,19 +3890,16 @@ impl ClassSCommitToken {
 
     /// Begin an `async`-body deferred discharge (ADR-049 Decision 7).
     ///
-    /// RAII counterpart to [`Self::discharge_with`] for a finalize body that must
-    /// `.await` while holding the `&mut PerContextState` view — e.g.
-    /// `finalize_governance_action`, which appends to the async
-    /// `EventLogPersistence`-backed Merkle event log AND mutates the state,
-    /// interleaved, so it cannot be expressed as a synchronous `discharge_with`
-    /// closure. A closure returning a borrowing future would need an
-    /// `for<'a> Fn(..) -> BoxFuture<'a>` bound that (via the boxed trait-object
-    /// lifetime) demands `'static` captures — hence this guard shape, which keeps
-    /// a single ordinary borrow lifetime.
+    /// RAII counterpart to [`Self::discharge_with`] for a terminal that runs
+    /// several steps through the view before the persist —
+    /// `discharge_and_order_governance_action` takes the queue's journal, runs
+    /// `finalize_governance_action`, queues its unit, and removes the consumed
+    /// proposal. Finalize writes nothing to the event log (spec 17 §17.3 "Event
+    /// log write failures"), so no step awaits; the guard keeps one ordinary
+    /// borrow lifetime across them.
     ///
     /// The returned [`ClassSDischargeGuard`] hands out the `ClassSMut` view via
-    /// [`ClassSDischargeGuard::view`] (held across the finalize awaits — a
-    /// `&mut PerContextState` across an await is `Send`), then performs the SINGLE
+    /// [`ClassSDischargeGuard::view`], then performs the SINGLE
     /// deferred fail-closed persist via
     /// [`ClassSDischargeGuard::commit_fail_closed`]. Semantics match
     /// `discharge_with` exactly: the `Drop` obligation is discharged BEFORE the
@@ -3965,12 +4001,12 @@ impl Drop for ClassSCommitToken {
     }
 }
 
-/// RAII discharge guard for an `async`-body deferred Class-S persist (ADR-049
-/// Decision 7). Minted by [`ClassSCommitToken::begin_discharge`].
+/// RAII discharge guard for a deferred Class-S persist (ADR-049 Decision 7).
+/// Minted by [`ClassSCommitToken::begin_discharge`].
 ///
 /// Holds the owed [`ClassSCommitToken`] AND the `&mut PerContextState` view for
-/// the finalize body's duration, so the finalize can `.await` (its interleaved
-/// async Merkle-event-log appends) while mutating the state. The SINGLE deferred
+/// the terminal's steps (governance finalize, the queueing of its unit, the
+/// consumed proposal's removal). The SINGLE deferred
 /// fail-closed persist is performed by [`Self::commit_fail_closed`]; dropping the
 /// guard without committing lets the owned token's `Drop` obligation fire — so a
 /// panicking finalize does not silently skip the owed persist.

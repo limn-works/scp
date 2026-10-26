@@ -79,41 +79,6 @@ fn consequence_leaf(
     )
 }
 
-/// Appends consequence leaves in memory first, for a caller that keeps the
-/// memory-first rule after its irreversible step (spec 17 §17.3 "Event log
-/// write failures": every append after a step that does not queue a pending
-/// log unit). A failed append is logged and never fails the caller.
-pub async fn append_consequence_leaves_after_side_effect(
-    event_log: &dyn crate::context::builder::ContextEventLogProvider,
-    context_id: &str,
-    leaves: Vec<LeafSpec>,
-) {
-    let context_id_bytes = context_id_to_bytes(context_id);
-    for leaf in leaves {
-        let event_type = leaf.event_type();
-        let actor_did = leaf.actor_did().to_owned();
-        let timestamp_secs = leaf.timestamp_secs();
-        if let Err(e) = event_log
-            .append_context_event_with_payload(
-                crate::context::builder::AppendMode::AfterSideEffect,
-                &context_id_bytes,
-                event_type,
-                &actor_did,
-                leaf.into_payload(),
-                timestamp_secs,
-            )
-            .await
-        {
-            tracing::warn!(
-                context_id,
-                event = ?event_type,
-                error = %e,
-                "failed to append consequence event to durable event log"
-            );
-        }
-    }
-}
-
 // `ConsequenceStateSplit` (the consequence-engine split) is DEFINED in
 // `super::actor::class_s` and RE-EXPORTED here (`use` above). It is its own
 // struct — NOT an alias of `ClassCSplit` (ADR-049 §9 / RED-CS3 / R1): its
@@ -1085,10 +1050,23 @@ mod convergence_tests {
             // No persistence backend is wired in this convergence-discriminator
             // test, so defuse the obligation instead of driving a real persist.
             token.defuse_for_test();
-            // The memory-first adapter writes the durable leaves the engine
-            // produced; a non-convergent trigger produced none.
-            super::append_consequence_leaves_after_side_effect(&event_log, &context_id_str, leaves)
-                .await;
+            // The drain writes the durable leaves the engine produced as one
+            // unit; a non-convergent trigger produced none.
+            if !leaves.is_empty() {
+                // The log is fresh, so the unit starts at 0; `append_unit`
+                // refuses any other base as misaligned.
+                event_log
+                    .append_unit(
+                        event_log
+                            .lock_for_unit(&storage_key)
+                            .await
+                            .expect("lock the log for the unit"),
+                        0,
+                        &leaves,
+                    )
+                    .await
+                    .expect("append the consequence unit");
+            }
         }
 
         let root_after = event_log

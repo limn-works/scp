@@ -2408,14 +2408,13 @@ mod tests {
         );
     }
 
-    /// A finalize error — the `GovernanceActionExecuted` append fails after the
-    /// dispatch applied its effect — keeps the replay marker, so the proposal is
-    /// consumed and must leave `approved_proposals` in the same fail-closed
-    /// persist. Before the fix `finalize_governance_action` owned the removal
-    /// and ran it after that append, so the append failure skipped it and the
-    /// entry outlived its marker.
+    /// A log that refuses the `GovernanceActionExecuted` record cannot fail
+    /// the action: finalize writes nothing and queues the record after the
+    /// dispatch's unit, in the persist that keeps the replay marker and removes
+    /// the consumed proposal from `approved_proposals` (spec 17 §17.3 "Event
+    /// log write failures").
     #[tokio::test]
-    async fn finalize_leaf_failure_removes_the_consumed_proposal_from_approved_proposals() {
+    async fn finalize_record_refusal_does_not_fail_the_action() {
         use scp_protocol::context::governance::{AccessScope, GovernanceAction};
 
         let (mut deps, _appends) = build_deps().await;
@@ -2457,20 +2456,23 @@ mod tests {
         .await;
 
         assert!(
-            matches!(result, Err(ContextError::EventLogFailed(_))),
-            "the executed-leaf append failure must reach the caller; got {result:?}"
+            result.is_ok(),
+            "a refused executed record does not fail the action; got {result:?}"
         );
         assert_eq!(
             crate::context::log_unit_helpers::test_support::queued_unit_types(
                 &cell.class_s.pending_log_units
             ),
-            vec![vec![
-                scp_event_log::EventType::AccessRevoked,
-                scp_event_log::EventType::KeyEpochAdvance,
-                scp_event_log::EventType::KeyEpochAdvance,
-                scp_event_log::EventType::KeyEpochAdvance,
-            ]],
-            "the dispatch queued its own records before finalize failed"
+            vec![
+                vec![
+                    scp_event_log::EventType::AccessRevoked,
+                    scp_event_log::EventType::KeyEpochAdvance,
+                    scp_event_log::EventType::KeyEpochAdvance,
+                    scp_event_log::EventType::KeyEpochAdvance,
+                ],
+                vec![scp_event_log::EventType::GovernanceActionExecuted],
+            ],
+            "the dispatch's unit, then the finalize unit"
         );
         assert_eq!(appends.load(Ordering::SeqCst), 0, "nothing reached the log");
         assert!(
@@ -2478,15 +2480,14 @@ mod tests {
                 .class_s
                 .executed_proposals
                 .contains_key(&proposal_id),
-            "a finalize error after a landed effect keeps the replay marker"
+            "the executed action keeps its replay marker"
         );
         assert!(
             !cell
                 .governance
                 .approved_proposals
                 .contains_key(&proposal_id),
-            "the consumed proposal must leave `approved_proposals` even though \
-             finalize failed before its own tail ran"
+            "the consumed proposal leaves `approved_proposals`"
         );
     }
 

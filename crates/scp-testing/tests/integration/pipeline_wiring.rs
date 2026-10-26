@@ -9855,11 +9855,6 @@ const EVENT_LOG_APPEND_ALLOWLIST: &[(&str, &str, &str)] = &[
         "forwards to `append_streaming_outlet_invoked_event`",
     ),
     (
-        "scp-runtime/src/context/actor/handlers/governance.rs",
-        "handle_evaluate_periodic_consequences_actor",
-        "spec 17 §17.3, memory-first after the step, through `append_consequence_leaves_after_side_effect`",
-    ),
-    (
         "scp-runtime/src/context/broadcast_helpers.rs",
         "subscribe_broadcast",
         "spec 17 §17.3, memory-first after the step",
@@ -9877,16 +9872,6 @@ const EVENT_LOG_APPEND_ALLOWLIST: &[(&str, &str, &str)] = &[
     (
         "scp-runtime/src/context/lifecycle_helpers.rs",
         "leave_context",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "finalize_governance_action",
-        "spec 17 §17.3, memory-first after the step, through `append_consequence_leaves_after_side_effect`",
-    ),
-    (
-        "scp-runtime/src/context/governance_logic.rs",
-        "append_consequence_leaves_after_side_effect",
         "spec 17 §17.3, memory-first after the step",
     ),
     (
@@ -9937,11 +9922,6 @@ const EVENT_LOG_APPEND_ALLOWLIST: &[(&str, &str, &str)] = &[
     (
         "scp-runtime/src/context/ttl_close_helpers.rs",
         "extend_ttl_deadline_and_record",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "finalize_governance_action",
         "spec 17 §17.3, memory-first after the step",
     ),
 ];
