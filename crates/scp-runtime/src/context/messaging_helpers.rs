@@ -821,12 +821,11 @@ pub fn run_buffered_post_delivery(
     // delivery's state (spec 17 §17.3). Application messages (`None`) add no
     // leaf but still run governance below.
     if let Some(event_name) = event_name {
-        sink.push_leaf(crate::context::state::LeafSpec {
-            event_type: event_name,
-            actor_did: sender_did.to_owned(),
-            payload: scp_event_log::EventPayload::default(),
-            timestamp_secs: event_timestamp_secs,
-        });
+        sink.push_leaf(crate::context::state::LeafSpec::without_payload(
+            event_name,
+            sender_did.to_owned(),
+            event_timestamp_secs,
+        ));
     }
 
     // ADR-049 §9 (RED-CS3): `true` iff consequence enforcement performed a
@@ -5705,7 +5704,7 @@ mod log_unit_family_tests {
             assert_eq!(
                 sink.staged_leaves()
                     .iter()
-                    .map(|leaf| leaf.event_type)
+                    .map(crate::context::state::LeafSpec::event_type)
                     .collect::<Vec<_>>(),
                 SUSPENSION_LEAVES.to_vec(),
                 "the evaluation ran and staged the consequence leaves"

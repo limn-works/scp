@@ -486,8 +486,10 @@ impl PendingLogUnits {
     ///
     /// # Errors
     ///
-    /// Returns [`ContextError::PersistenceFailed`] when a unit holds no entry
-    /// or an entry breaks the append's payload rules.
+    /// Returns [`ContextError::PersistenceFailed`] when a unit holds no entry.
+    /// An entry that breaks the append's payload rules never reaches here:
+    /// deserializing a [`LeafSpec`](crate::context::state::LeafSpec) checks
+    /// it.
     pub(crate) fn validated(
         units: VecDeque<crate::context::state::PendingLogUnit>,
     ) -> Result<Self, ContextError> {
@@ -496,18 +498,6 @@ impl PendingLogUnits {
                 return Err(ContextError::PersistenceFailed(format!(
                     "restore: queued event log unit {index} holds no entry (spec 17 §17.3)"
                 )));
-            }
-            for leaf in &unit.leaves {
-                crate::context::providers::event_log::check_append_payload(
-                    leaf.event_type,
-                    &leaf.payload,
-                )
-                .map_err(|e| {
-                    ContextError::PersistenceFailed(format!(
-                        "restore: queued event log unit {index} breaks the append's payload \
-                         rules (spec 17 §17.3): {e}"
-                    ))
-                })?;
             }
         }
         Ok(Self(units))
@@ -6301,7 +6291,12 @@ impl ClassSCell
             let units = snap
                 .pending_log_units
                 .iter()
-                .map(|unit| unit.leaves.iter().map(|leaf| leaf.event_type).collect())
+                .map(|unit| {
+                    unit.leaves
+                        .iter()
+                        .map(crate::context::state::LeafSpec::event_type)
+                        .collect()
+                })
                 .collect();
             let suspended = snap.role_state.suspended_for(&self.subject).is_some();
             self.seen

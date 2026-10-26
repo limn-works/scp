@@ -478,8 +478,8 @@ pub trait ContextEventLogProvider: Send + Sync {
         let context_id = *guard.context_id();
         for leaf in leaves {
             crate::context::providers::event_log::check_append_payload(
-                leaf.event_type,
-                &leaf.payload,
+                leaf.event_type(),
+                leaf.payload(),
             )?;
         }
         let entries = match self.event_log_entries(&context_id) {
@@ -503,10 +503,10 @@ pub trait ContextEventLogProvider: Send + Sync {
                 for leaf in leaves {
                     self.append_event(
                         &context_id,
-                        leaf.event_type,
-                        &leaf.actor_did,
-                        leaf.payload.clone(),
-                        leaf.timestamp_secs,
+                        leaf.event_type(),
+                        leaf.actor_did(),
+                        leaf.payload().clone(),
+                        leaf.timestamp_secs(),
                     )
                     .await?;
                 }

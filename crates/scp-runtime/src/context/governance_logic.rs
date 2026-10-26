@@ -15,7 +15,7 @@ use super::log_unit_helpers::ConsequenceSink;
 // the type's `pub(crate)` effective reach within the context module tree without
 // tripping `redundant_pub_crate` (the module itself is private to `context`).
 pub(in crate::context) use super::actor::class_s::ConsequenceStateSplit;
-use super::state::{LeafSpec, context_id_to_bytes, emit_event_into};
+use super::state::{ConsequenceLeafType, LeafSpec, context_id_to_bytes, emit_event_into};
 
 // ---------------------------------------------------------------------------
 // Consequence enforcement — synthetic actor DID + shared wire-stable labels
@@ -54,28 +54,29 @@ use scp_protocol::trust::consequence::{
 /// (§7.3.1, §9.9.3). The consequence engine reads `target_did` back out of
 /// the payload via `scp_protocol::trust::consequence::payload_target_is`.
 ///
-/// The consequence event types carry no append payload rule
-/// (`check_append_payload` checks only `OutletInvoked`), so a leaf planned
-/// here can never be refused when it is queued after the step (spec 17 §17.3
-/// "Event log write failures"); a test in `log_unit_helpers` pins that.
+/// The consequence event types carry no append payload rule, so a leaf
+/// planned here can never be refused when it is queued after the step (spec
+/// 17 §17.3 "Event log write failures"); [`LeafSpec::consequence`] admits
+/// only those types, and a test in `log_unit_helpers` pins that the rules
+/// accept each.
 fn consequence_leaf(
-    event_type: scp_event_log::EventType,
+    leaf_type: ConsequenceLeafType,
     member_did: &DID,
     consequence: &TriggeredConsequence,
     trigger_kind: &str,
     action_type: &str,
 ) -> LeafSpec {
-    LeafSpec {
-        event_type,
-        actor_did: CONSEQUENCE_ACTOR_DID.to_owned(),
-        payload: consequence_event_payload(
+    LeafSpec::consequence(
+        leaf_type,
+        CONSEQUENCE_ACTOR_DID.to_owned(),
+        consequence_event_payload(
             member_did.as_ref(),
             consequence.rule_index,
             trigger_kind,
             action_type,
         ),
-        timestamp_secs: convergent_consequence_timestamp(consequence),
-    }
+        convergent_consequence_timestamp(consequence),
+    )
 }
 
 /// Appends consequence leaves in memory first, for a caller that keeps the
@@ -89,15 +90,17 @@ pub async fn append_consequence_leaves_after_side_effect(
 ) {
     let context_id_bytes = context_id_to_bytes(context_id);
     for leaf in leaves {
-        let event_type = leaf.event_type;
+        let event_type = leaf.event_type();
+        let actor_did = leaf.actor_did().to_owned();
+        let timestamp_secs = leaf.timestamp_secs();
         if let Err(e) = event_log
             .append_context_event_with_payload(
                 crate::context::builder::AppendMode::AfterSideEffect,
                 &context_id_bytes,
                 event_type,
-                &leaf.actor_did,
-                leaf.payload,
-                leaf.timestamp_secs,
+                &actor_did,
+                leaf.into_payload(),
+                timestamp_secs,
             )
             .await
         {
@@ -384,7 +387,7 @@ fn emit_consequence_triggered(
 ) {
     if let Some(sink) = durable_sink {
         sink.push_leaf(consequence_leaf(
-            scp_event_log::EventType::ConsequenceTriggered,
+            ConsequenceLeafType::Triggered,
             args.member_did,
             consequence,
             trigger_kind,
@@ -417,7 +420,7 @@ fn emit_absent_member_enforcement_failed(
 ) {
     if let Some(sink) = durable_sink {
         sink.push_leaf(consequence_leaf(
-            scp_event_log::EventType::ConsequenceEnforcementFailed,
+            ConsequenceLeafType::EnforcementFailed,
             args.member_did,
             consequence,
             trigger_kind,
@@ -446,7 +449,7 @@ fn emit_consequence_enforced_success(
 ) {
     if let Some(sink) = durable_sink {
         sink.push_leaf(consequence_leaf(
-            scp_event_log::EventType::ConsequenceEnforced,
+            ConsequenceLeafType::Enforced,
             args.member_did,
             consequence,
             trigger_kind,
@@ -689,14 +692,14 @@ fn emit_failure_escalation(
         // First the failure record, then the escalation record, as one
         // unit with the escalation's suspension.
         sink.push_leaf(consequence_leaf(
-            scp_event_log::EventType::ConsequenceEnforcementFailed,
+            ConsequenceLeafType::EnforcementFailed,
             member_did,
             consequence,
             trigger_kind,
             action_type,
         ));
         sink.push_leaf(consequence_leaf(
-            scp_event_log::EventType::ConsequenceEscalatedToSuspendAll,
+            ConsequenceLeafType::EscalatedToSuspendAll,
             member_did,
             consequence,
             trigger_kind,
@@ -812,11 +815,11 @@ fn push_unwritten_leaves<'a>(
     let mut sequence = u64::try_from(entries.len()).unwrap_or(u64::MAX);
     for leaf in leaves {
         entries.push(scp_event_log::Event {
-            event_type: leaf.event_type,
-            actor_did: DID::from(leaf.actor_did.clone()),
-            timestamp: leaf.timestamp_secs,
+            event_type: leaf.event_type(),
+            actor_did: DID::from(leaf.actor_did().to_owned()),
+            timestamp: leaf.timestamp_secs(),
             sequence,
-            payload: leaf.payload.clone(),
+            payload: leaf.payload().clone(),
             prev_hash: [0u8; 32],
             signature: Vec::new(),
         });

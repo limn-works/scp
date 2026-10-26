@@ -1020,11 +1020,11 @@ pub(crate) fn place_unit(
     let mut unit = Vec::with_capacity(leaves.len());
     for (sequence, leaf) in (base_seq..).zip(leaves) {
         let event = Event {
-            event_type: leaf.event_type,
-            actor_did: DID::from(leaf.actor_did.clone()),
-            timestamp: leaf.timestamp_secs,
+            event_type: leaf.event_type(),
+            actor_did: DID::from(leaf.actor_did().to_owned()),
+            timestamp: leaf.timestamp_secs(),
             sequence,
-            payload: leaf.payload.clone(),
+            payload: leaf.payload().clone(),
             prev_hash,
             signature: Vec::new(),
         };
@@ -1371,7 +1371,7 @@ impl ContextEventLogProvider for MerkleEventLogProvider {
             ));
         };
         for leaf in leaves {
-            check_append_payload(leaf.event_type, &leaf.payload)?;
+            check_append_payload(leaf.event_type(), leaf.payload())?;
         }
         // Place the unit without changing memory: memory takes it only after
         // storage does, as a fail-closed append (spec 17 §17.3).
@@ -3292,12 +3292,13 @@ mod tests {
     }
 
     fn unit_leaf(tag: u8) -> crate::context::state::LeafSpec {
-        crate::context::state::LeafSpec {
-            event_type: EventType::MemberJoined,
-            actor_did: String::new(),
-            payload: payload_bytes(&[0xC0, tag]),
-            timestamp_secs: 1_650_000_000 + u64::from(tag),
-        }
+        crate::context::state::LeafSpec::new(
+            EventType::MemberJoined,
+            String::new(),
+            payload_bytes(&[0xC0, tag]),
+            1_650_000_000 + u64::from(tag),
+        )
+        .expect("a valid leaf")
     }
 
     /// A unit put whose storage write landed but reported failure is found by
@@ -3405,12 +3406,13 @@ mod tests {
         // The first leaf matches and the second does not: misaligned.
         let stored_first = &before[1];
         let partial = [
-            crate::context::state::LeafSpec {
-                event_type: stored_first.event_type,
-                actor_did: stored_first.actor_did.to_string(),
-                payload: stored_first.payload.clone(),
-                timestamp_secs: stored_first.timestamp,
-            },
+            crate::context::state::LeafSpec::new(
+                stored_first.event_type,
+                stored_first.actor_did.to_string(),
+                stored_first.payload.clone(),
+                stored_first.timestamp,
+            )
+            .expect("a valid leaf"),
             unit_leaf(9),
         ];
         let guard = provider.lock_for_unit(&ctx_id).await.unwrap();
