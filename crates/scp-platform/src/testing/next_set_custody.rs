@@ -26,8 +26,8 @@ use scp_kel::{
 use tokio::sync::Mutex;
 
 use crate::traits::{
-    NextSetCustody, NextSetCustodyError, NextSetKeyHandle, PreRotationCustodyKind,
-    generate_p256_os_rng, sign_key_event_digest,
+    BackupArtifact, BackupRequest, NextSetCustody, NextSetCustodyError, NextSetKeyHandle,
+    PreRotationCustodyKind, RestoreMaterial, generate_p256_os_rng, sign_key_event_digest,
 };
 
 /// In-memory [`NextSetCustody`] for tests: software P-256 keys, raw-arm
@@ -124,163 +124,43 @@ impl NextSetCustody for InMemoryNextSetCustody {
             .ok_or(NextSetCustodyError::HandleNotFound)
     }
 
+    /// Refused: an in-memory custody is not the headless custody §9.7.4.1
+    /// item 4 lets seal a copyable artifact.
+    async fn seal_backup(
+        &self,
+        _handle: &NextSetKeyHandle,
+        _request: BackupRequest,
+    ) -> Result<BackupArtifact, NextSetCustodyError> {
+        Err(NextSetCustodyError::MethodNotOffered)
+    }
+
+    /// Refused for the reason [`seal_backup`](Self::seal_backup) is.
+    async fn restore(
+        &self,
+        _material: RestoreMaterial,
+        _expected_commitment: [u8; 32],
+    ) -> Result<NextSetKeyHandle, NextSetCustodyError> {
+        Err(NextSetCustodyError::MethodNotOffered)
+    }
+
     fn custody_kind(&self) -> PreRotationCustodyKind {
         PreRotationCustodyKind::InMemory
     }
 }
 
-/// The five behaviours spec 16 §16.12.3a requires of every `NextSetCustody`.
+// `scp_testing::next_set_custody_conformance!` runs the spec 16 §16.12.3a
+// suite against this custody (`crates/scp-testing/src/conformance/next_set_custody.rs`).
+
 #[cfg(test)]
 mod tests {
-    use scp_crypto::p256::{P256PublicKey, verify_prehash_strict};
-    use scp_kel::{
-        CustodyProbe, IndexedSignature, KeyEventSignError, KeyEventSigner, SignatureForm,
-        SigningChange,
-    };
-    use sha2::{Digest, Sha256};
-
     use super::InMemoryNextSetCustody;
-    use crate::traits::{
-        NextSetCustody, NextSetCustodyError, NextSetKeyHandle, PreRotationCustodyKind,
-    };
+    use crate::traits::{NextSetCustody, PreRotationCustodyKind};
 
-    type TestResult = Result<(), Box<dyn std::error::Error>>;
-
-    /// Spec 25 Vector 41's preimage (364 bytes, separator included).
-    const V41_PREIMAGE: &str = concat!(
-        "5343502d4b454c2d4556454e542d56313a010000000000000000000000000000",
-        "0000000000000000000000000000000000000000000000000000000000000000",
-        "0000000000000000000000000000000000000000000000000000000000000100",
-        "00000001010000000000000001033b1cac23f45cf1cdfdf0b32f8f777b99166c",
-        "1b69649c2295b1517883d47f3027000000010000000100000002033b1cac23f4",
-        "5cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f30270101000000",
-        "000000000001010223702a648232f2d00713de9289753c2fbd4c4efa7e1e3390",
-        "5e3723a412b20aea020100000000000000000101000000019d94df95bc0a13f1",
-        "963f484414c320354c73c75bb86e96559e97765f5bc2d31300000e1002000000",
-        "0000000000000000000000000000000000000000000000000000000000000000",
-        "000100000001421be508c6ed135a9737895007e5ba16f9542e1b3440f6d00a51",
-        "5de80a3e43eb010100000001",
-    );
-    /// Spec 25 Vector 41's preimage digest D.
-    const V41_DIGEST: &str = "d8ba4ebad52657208736f4cac675352f5f9cc0aa837620f8d742dbf42aeedbd7";
-
-    fn v41_change() -> Result<SigningChange, Box<dyn std::error::Error>> {
-        let change = SigningChange::inception(&hex::decode(V41_PREIMAGE)?)
-            .map_err(|refusal| format!("{refusal:?}"))?;
-        assert_eq!(hex::encode(change.digest()), V41_DIGEST);
-        Ok(change)
-    }
-
-    fn raw(signature: IndexedSignature) -> Result<[u8; 64], String> {
-        match signature {
-            IndexedSignature::Raw { signature } => Ok(signature),
-            other @ IndexedSignature::WebAuthnAssertion(_) => {
-                Err(format!("expected the raw arm, got {other:?}"))
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn generate_then_reveal_gives_compressed_point() -> TestResult {
-        let custody = InMemoryNextSetCustody::new();
-        let first = custody.generate().await?;
-        let second = custody.generate().await?;
-        assert_ne!(first, second);
-        let point = custody.reveal_public_key(&first).await?;
-        assert!(matches!(point[0], 0x02 | 0x03), "{:#04x}", point[0]);
-        P256PublicKey::from_sec1(&point)?;
-        assert_ne!(point, custody.reveal_public_key(&second).await?);
-        assert_eq!(custody.custody_kind(), PreRotationCustodyKind::InMemory);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn sign_change_verifies() -> TestResult {
-        let custody = InMemoryNextSetCustody::new();
-        let handle = custody.generate().await?;
-        let key = P256PublicKey::from_sec1(&custody.reveal_public_key(&handle).await?)?;
-        let change = v41_change()?;
-        let signature = raw(custody.sign_change(&handle, &change).await?)?;
-        verify_prehash_strict(&key, &change.digest(), &signature)?;
-        // Not a signature over the 49-byte assertion challenge's hash.
-        let challenge_hash: [u8; 32] = Sha256::digest(change.key_event_challenge()).into();
-        assert!(verify_prehash_strict(&key, &challenge_hash, &signature).is_err());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn sign_probe_signs_the_probe_preimage_only() -> TestResult {
-        let custody = InMemoryNextSetCustody::new();
-        let handle = custody.generate().await?;
-        let point = custody.reveal_public_key(&handle).await?;
-        let probe = CustodyProbe::fresh()?;
-        let signature = custody.sign_probe(&handle, &probe).await?;
-        assert_eq!(signature.form(), SignatureForm::Raw);
-        // `verify` recomputes the probe's raw digest, so a signature over the
-        // nonce, an event digest or a key-event challenge fails here.
-        signature.verify(&probe, &point)?;
-        // The signature covers this probe's nonce and no other.
-        assert!(signature.verify(&CustodyProbe::fresh()?, &point).is_err());
-        // A change signature by the same key is not a probe signature.
-        let over_event = raw(custody.sign_change(&handle, &v41_change()?).await?)?;
-        assert!(
-            scp_kel::ProbeSignature::raw(over_event)
-                .verify(&probe, &point)
-                .is_err()
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn destroy_prevents_sign() -> TestResult {
-        let custody = InMemoryNextSetCustody::new();
-        let handle = custody.generate().await?;
-        let kept = custody.generate().await?;
-        let change = v41_change()?;
-        custody.sign_change(&handle, &change).await?;
-        custody.destroy(&handle).await?;
+    #[test]
+    fn declares_the_in_memory_kind() {
         assert_eq!(
-            custody.sign_change(&handle, &change).await,
-            Err(KeyEventSignError::MemberNotFound)
+            InMemoryNextSetCustody::new().custody_kind(),
+            PreRotationCustodyKind::InMemory
         );
-        assert_eq!(
-            custody.sign_probe(&handle, &CustodyProbe::fresh()?).await,
-            Err(KeyEventSignError::MemberNotFound)
-        );
-        assert!(matches!(
-            custody.reveal_public_key(&handle).await,
-            Err(NextSetCustodyError::HandleNotFound)
-        ));
-        assert!(matches!(
-            custody.destroy(&handle).await,
-            Err(NextSetCustodyError::HandleNotFound)
-        ));
-        // Destroying one key leaves the other.
-        custody.sign_change(&kept, &change).await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn invalid_handle_errors() -> TestResult {
-        let custody = InMemoryNextSetCustody::new();
-        custody.generate().await?;
-        let unknown = NextSetKeyHandle::new(999);
-        assert!(matches!(
-            custody.reveal_public_key(&unknown).await,
-            Err(NextSetCustodyError::HandleNotFound)
-        ));
-        assert!(matches!(
-            custody.destroy(&unknown).await,
-            Err(NextSetCustodyError::HandleNotFound)
-        ));
-        assert_eq!(
-            custody.sign_change(&unknown, &v41_change()?).await,
-            Err(KeyEventSignError::MemberNotFound)
-        );
-        assert_eq!(
-            custody.sign_probe(&unknown, &CustodyProbe::fresh()?).await,
-            Err(KeyEventSignError::MemberNotFound)
-        );
-        Ok(())
     }
 }

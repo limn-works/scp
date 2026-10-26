@@ -22,11 +22,18 @@
 //! (`09-security-model.md` §9.7.4.2).
 
 pub mod attestation;
+mod custody_offer;
 pub mod document;
 mod identifier;
 mod key_state;
 mod relay_url;
 
+pub use custody_offer::{
+    CustodyCoResidence, CustodyColumn, CustodyCopyHolder, CustodyDisclosure,
+    CustodyDisclosureError, CustodyFourCellOutcome, CustodyOffer, CustodyProfile,
+    CustodySeparation, PreRotationResidence, RpDomainRefusal, RpOrigin, RpOriginConfig,
+    RpOriginError,
+};
 pub use document::{
     ABSENT_BRIDGE_TARGET, BridgeTarget, DidDocument, DidError, DidRotationEvent, MigrationProof,
     PreRotationProof, RelayService, SCP_RELAY_SERVICE_TYPE, Service, VerificationMethod,

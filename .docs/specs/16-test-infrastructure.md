@@ -1244,7 +1244,7 @@ macro_rules! key_custody_conformance {
 
 ### 16.12.3a `next_set_custody_conformance!()`
 
-The macro runs against every `NextSetCustody` implementor (`09-security-model.md` §9.7.4.1, §9.7.4.2 R10).
+The macro runs against every `NextSetCustody` implementor (`09-security-model.md` §9.7.4.1, §9.7.4.2 R10). Its argument is an expression that builds a fresh custody, as `key_custody_conformance!`'s is; each test evaluates it once. A headless custody refuses `reveal_public_key`, `sign_change` and `sign_probe` until its key is sealed (§9.7.4.1 item 4, the sealing window), so on a headless custody the first five cases seal each key they generate before they reveal or sign with it.
 
 ```rust
 /// scp-testing/src/conformance/next_set_custody.rs
@@ -1254,7 +1254,7 @@ The macro runs against every `NextSetCustody` implementor (`09-security-model.md
 /// Usage:
 /// ```rust
 /// #[cfg(test)]
-/// next_set_custody_conformance!(|| InMemoryNextSetCustody::new());
+/// next_set_custody_conformance!(InMemoryNextSetCustody::new());
 /// ```
 #[macro_export]
 macro_rules! next_set_custody_conformance {
