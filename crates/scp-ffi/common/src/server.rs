@@ -25,8 +25,8 @@ use std::sync::Arc;
 use scp_clock::SystemClock;
 use scp_core::context::supervisor::Supervisor;
 use scp_did::DidDocument;
-use scp_identity::ScpIdentity;
 use scp_identity::dht::DidDht;
+use scp_identity::dht::ScpIdentity;
 use scp_node::{
     DhtMode, ExplicitIdentity, IdentitySource, NatSlot, Node, NodeConfig, NodeError, Reach,
     TlsMode, bound_relay_ws_url,

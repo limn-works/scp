@@ -86,7 +86,8 @@ use scp_platform::EncryptedStorage;
 use scp_platform::testing::InMemoryPreRotationCustody;
 use scp_platform::traits::{KeyCustody, PreRotationKeyHandle, Storage};
 
-use crate::{DidMethod, IdentityError, ScpIdentity};
+use crate::DidMethod;
+use crate::dht::{IdentityError, ScpIdentity};
 use scp_did::DidDocument;
 
 /// An uninhabited placeholder storage type for the **ephemeral** construction

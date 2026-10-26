@@ -41,7 +41,7 @@
 
 use std::sync::Arc;
 
-use scp_identity::IdentityError;
+use scp_identity::dht::IdentityError;
 use scp_identity::relay_querier::MAX_CANDIDATES_PER_RELAY;
 use scp_identity::resolution::{RelayQuerier, RelayQueryRecord};
 use scp_protocol::envelope::did_record::DidRecordV1;

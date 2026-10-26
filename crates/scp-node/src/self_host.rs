@@ -41,7 +41,7 @@ use scp_dht::{DhtClient, DisabledDhtClient, PkarrDhtClient};
 #[cfg(any(test, feature = "testing"))]
 use scp_dht::InMemoryDhtClient;
 use scp_identity::dht::SequenceStore;
-use scp_identity::{DidCache, DidDht, DidMethod as _, IdentityError};
+use scp_identity::{DidCache, DidDht, DidMethod as _, dht::IdentityError};
 use scp_platform::sqlite::{SqliteKeyCustody, SqliteStorage};
 use scp_platform::traits::Storage;
 use scp_platform::{KeyCustody, PlatformError};

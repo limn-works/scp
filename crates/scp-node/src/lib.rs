@@ -31,7 +31,10 @@ use std::time::Duration;
 
 use scp_core::store::{CURRENT_STORE_VERSION, ProtocolRepository, StoredValue};
 use scp_did::DidDocument;
-use scp_identity::{DidMethod, IdentityError, ScpIdentity};
+use scp_identity::{
+    DidMethod,
+    dht::{IdentityError, ScpIdentity},
+};
 use scp_platform::traits::{KeyCustody, Storage};
 use scp_transport::nat::{NatTierChange, NetworkChangeDetector};
 use scp_transport::native::server::{RelayConfig, RelayError, ShutdownHandle};

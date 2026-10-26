@@ -113,8 +113,9 @@ fn assert_refused(args: &[&str], self_host_env: Option<&str>, health: bool, refu
 /// logs it with `%e`.
 #[test]
 fn no_pre_rotation_backend_display_matches_documented_log_text() {
-    let logged = scp_node::NodeError::Identity(scp_identity::IdentityError::NoPreRotationBackend)
-        .to_string();
+    let logged =
+        scp_node::NodeError::Identity(scp_identity::dht::IdentityError::NoPreRotationBackend)
+            .to_string();
     assert!(
         logged.starts_with("identity error: no production pre-rotation custody backend available"),
         "the documented log text drifted from NodeError's Display: {logged}"

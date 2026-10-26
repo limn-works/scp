@@ -34,7 +34,7 @@ use std::sync::Arc;
 
 use scp_did::{BridgeTarget, DidDocument, RelayService};
 use scp_identity::DidMethod;
-use scp_identity::ScpIdentity;
+use scp_identity::dht::ScpIdentity;
 use scp_identity::republish::RepublishEntry;
 use scp_transport::nat::NatTierChange;
 use scp_transport::native::server::RelayConfig;

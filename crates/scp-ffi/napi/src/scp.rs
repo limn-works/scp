@@ -5755,7 +5755,7 @@ async fn create_identity(
 async fn write_created_callback_entry(
     bi: &NapiBridgeInstance,
     custody: &crate::custody::NapiKeyCustody,
-    identity: &scp_identity::ScpIdentity,
+    identity: &scp_identity::dht::ScpIdentity,
     document: &scp_did::DidDocument,
 ) -> napi::Result<()> {
     let crate::custody::NapiKeyCustody::Callback(adapter) = custody else {
@@ -5813,7 +5813,7 @@ pub(crate) async fn rewrite_callback_entry(
     bi: &NapiBridgeInstance,
     slot: &mut scp_ffi_common::identity_update::IdentityUpdateGuard,
     custody: &crate::custody::NapiKeyCustody,
-    identity: &scp_identity::ScpIdentity,
+    identity: &scp_identity::dht::ScpIdentity,
     document: &scp_did::DidDocument,
 ) -> napi::Result<()> {
     if let crate::custody::NapiKeyCustody::Callback(adapter) = custody {

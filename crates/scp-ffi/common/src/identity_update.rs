@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use scp_did::DidDocument;
-use scp_identity::ScpIdentity;
+use scp_identity::dht::ScpIdentity;
 use tokio::sync::OwnedMutexGuard;
 
 use crate::error_codes;

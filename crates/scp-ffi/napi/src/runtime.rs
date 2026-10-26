@@ -1560,7 +1560,7 @@ pub(crate) fn init_supervisor_with_transport_for_test(
 /// without DHT access (#1144 C6).
 pub(crate) struct NapiIdentityEntry {
     /// The scp-core identity handle (DID string, key handles).
-    pub(crate) identity: scp_identity::ScpIdentity,
+    pub(crate) identity: scp_identity::dht::ScpIdentity,
     /// The key custody provider holding (or delegating to) the key material.
     ///
     /// Enum-dispatched ([`NapiKeyCustody`](crate::custody::NapiKeyCustody)) so

@@ -11,7 +11,7 @@
 //!
 //! # Architecture
 //!
-//! - [`ScpIdentity`] — The identity handle containing key handles, DID string,
+//! - [`dht::ScpIdentity`] — The identity handle containing key handles, DID string,
 //!   and pre-rotation commitment.
 //! - [`DidMethod`] — Abstract trait enabling DID method swaps (e.g., `did:web`
 //!   fallback) without changing calling code.
@@ -71,405 +71,8 @@ pub use resolver::{
     NoHealing, NoOpRelayQuerier, ResolutionSource, ResolvedDidDocument, StaleLayer,
 };
 
-use serde::{Deserialize, Serialize};
-
 use scp_did::DidDocument;
-use scp_platform::traits::{KeyCustody, KeyHandle, PreRotationCustody, PreRotationKeyHandle};
-
-/// An SCP identity containing the DID string, key handles, and pre-rotation
-/// commitment.
-///
-/// Key material never leaves the [`KeyCustody`] boundary — only opaque
-/// [`KeyHandle`]s are stored here. The pre-rotation commitment is the SHA-256
-/// hash of the pre-rotation key's public key bytes, published in the DID
-/// document as a `PreRotationCommitment` service.
-///
-/// See ADR-003 acceptance criterion 1 and ADR-039 for the full construction.
-///
-/// `Debug` is implemented manually to redact opaque [`KeyHandle`] slot
-/// indices: leaking them via logs/traces enables cross-identity
-/// correlation (ordering of key creation across identities sharing a
-/// custody) without revealing key material. The DID and commitment
-/// hash are public values, so they print verbatim.
-#[derive(Clone, Serialize, Deserialize)]
-pub struct ScpIdentity {
-    /// `did:dht` Identity Key (`#0`). Derives the DID string. Stored in
-    /// highest-security custody (Secure Enclave, HSM). Used ONLY for DID
-    /// document updates and signing pre-rotation commitments. NEVER for MLS,
-    /// envelopes, or UCANs.
-    pub identity_key: KeyHandle,
-
-    /// Current Active Signing Key (`#active`). A verification method in the
-    /// DID document. Used for MLS credentials, inner envelope signatures, UCAN
-    /// issuance. Rotatable via `rotate_active_key` (DID string stays the same).
-    pub active_signing_key: KeyHandle,
-
-    /// Optional Agent Signing Key (`#agent`). Software-held key for autonomous
-    /// agent operations. `None` when no agent is delegated. Rotatable
-    /// independently of `#active`. See ADR-039.
-    pub agent_signing_key: Option<KeyHandle>,
-
-    /// SHA-256 hash of the next Identity Key's public key.
-    /// Published in DID document as a `PreRotationCommitment` service.
-    ///
-    /// The corresponding pre-rotation private key is held in a separate
-    /// [`PreRotationCustody`](scp_platform::PreRotationCustody) instance
-    /// — never in operational [`KeyCustody`] alongside `identity_key` or
-    /// `active_signing_key`. Per spec §9.7.4.1 step 3 ("storage isolation")
-    /// the pre-rotation key MUST be on a separate custody provider /
-    /// authentication flow from daily operations, so that compromise of
-    /// the operational custody path does not compromise the recovery path.
-    ///
-    /// **Snapshot semantics — not authoritative for verification.** This
-    /// field is captured at `create_identity` / `migrate_identity` time
-    /// and is a convenience cache only. The authoritative source for
-    /// migration verification is the `PreRotationCommitment` service
-    /// entry on the published [`DidDocument`](scp_did::DidDocument)
-    /// (consulted by [`crate::dht::verify_migration`]). If a future SDK
-    /// path were to mutate pre-rotation custody outside
-    /// `migrate_identity` and the cached value drifted from the
-    /// document, the document is canonical — verifiers MUST consult
-    /// the document service entry, not this snapshot.
-    pub pre_rotation_commitment: [u8; 32],
-
-    /// The DID string: `did:dht:z<z-base-32(identity_key.public)>`.
-    pub did: String,
-}
-
-impl std::fmt::Debug for ScpIdentity {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ScpIdentity")
-            .field("did", &self.did)
-            .field("identity_key", &"KeyHandle(<redacted>)")
-            .field("active_signing_key", &"KeyHandle(<redacted>)")
-            .field(
-                "agent_signing_key",
-                &self
-                    .agent_signing_key
-                    .map_or("None", |_| "KeyHandle(<redacted>)"),
-            )
-            .field(
-                "pre_rotation_commitment",
-                &format_args!("{}", hex::encode(self.pre_rotation_commitment)),
-            )
-            .finish()
-    }
-}
-
-/// Errors produced by identity operations.
-///
-/// Covers key generation failures, encoding errors, DID verification
-/// failures, and DHT publish/resolve errors. Platform-level key custody
-/// errors are wrapped via the `Platform` variant.
-#[derive(Debug, thiserror::Error)]
-pub enum IdentityError {
-    /// A platform key custody operation failed.
-    #[error("platform error: {0}")]
-    Platform(#[from] scp_platform::PlatformError),
-
-    /// A pre-rotation custody operation failed.
-    ///
-    /// Distinct from [`Platform`](Self::Platform) so that callers can
-    /// distinguish a daily-operations custody failure from a recovery-path
-    /// failure — the two surfaces have different SDK UX implications
-    /// (re-authenticate vs. re-prompt for the cold-storage substrate).
-    #[error("pre-rotation custody error: {0}")]
-    PreRotation(#[from] scp_platform::PreRotationCustodyError),
-
-    /// No production pre-rotation custody backend is available.
-    ///
-    /// Every identity-creation path commits a pre-rotation commitment at
-    /// creation time (spec §9.7.4.1 item 5(a) — pre-rotation is mandatory, not
-    /// optional), which requires a [`PreRotationCustody`](scp_platform::PreRotationCustody)
-    /// backend. The only implementation that exists today is the in-memory test
-    /// nullifier (`InMemoryPreRotationCustody`), which is now gated to the test
-    /// harness only (ADR-062 §Decision 6). On a shipped (no-`testing`) build
-    /// there is no real backend, so identity creation FAILS CLOSED with this
-    /// typed error rather than silently minting the nullifier — masking a
-    /// missing production backend with a dev stand-in would ship a false
-    /// durability guarantee (AGENTS.md builder tenet "No dev/test-only stand-ins
-    /// in production"). Absence is honest and detectable; a nullifier lies.
-    ///
-    /// A real, persistent pre-rotation backend is tracked by #1729 / RFC #2130.
-    /// Non-committing creation (Option A) is out of scope (Discussion #1553) and
-    /// would violate spec §9.7.4.1.
-    #[error(
-        "no production pre-rotation custody backend available; pre-rotation \
-         recovery custody is not yet implemented — see #1729 / RFC #2130"
-    )]
-    NoPreRotationBackend,
-
-    /// The DID string has an invalid format.
-    #[error("invalid DID format: {0}")]
-    InvalidDidFormat(String),
-
-    /// DID document serialization failed.
-    #[error("document serialization error: {0}")]
-    DocumentSerializationError(String),
-
-    /// Publishing a DID document to the DHT failed.
-    #[error("DHT publish failed: {0}")]
-    DhtPublishFailed(String),
-
-    /// Resolving a DID from the DHT failed.
-    #[error("DHT resolve failed: {0}")]
-    DhtResolveFailed(String),
-
-    /// BEP44 signature verification failed on a resolved DHT record.
-    #[error("BEP44 signature verification failed: {0}")]
-    Bep44SignatureInvalid(String),
-
-    /// Self-certification check failed: the public key in the resolved
-    /// document does not match the z-base-32 decoded DID suffix.
-    #[error("self-certification failed: {0}")]
-    SelfCertificationFailed(String),
-
-    /// The resolved DID document could not be deserialized.
-    #[error("DID document deserialization error: {0}")]
-    DocumentDeserializationError(String),
-
-    /// The DID was not found on the DHT.
-    #[error("DID not found on DHT: {0}")]
-    DhtNotFound(String),
-
-    /// Migration verification failed.
-    #[error("migration verification failed: {0}")]
-    MigrationVerificationFailed(String),
-
-    /// Key rotation failed.
-    #[error("key rotation failed: {0}")]
-    KeyRotationFailed(String),
-
-    /// A relay URL fails `18-addressability-and-deployment.md` §18.2.1: it
-    /// has no `09-security-model.md` §9.18.2 canonical form, its canonical
-    /// path does not end in `/scp/v1`, or it names a bridge relay over `ws`.
-    #[error("invalid relay URL {url:?}: {reason}")]
-    InvalidRelayUrl {
-        /// The rejected URL with any user information removed.
-        url: String,
-        /// Which rule the URL fails.
-        reason: scp_did::RelayEntryUrlError,
-    },
-
-    /// A relay entry's `bridgeTarget` equals `SHA-256(0x00)`, which §18.2.1
-    /// forbids as a present value.
-    #[error("bridgeTarget equals SHA-256(0x00), the absent-value encoding")]
-    AbsentSentinelBridgeTarget,
-
-    /// Publishing a DID document to an SCP relay failed.
-    #[error("relay publish failed: {0}")]
-    RelayPublishFailed(String),
-
-    /// A relay PUBLISH was attempted while NO relay is bound at all.
-    ///
-    /// Distinct from [`RelayPublishFailed`](Self::RelayPublishFailed): no relay
-    /// rejected the record, there was simply nowhere to send it. That is a
-    /// configuration state no retry can heal, so the republish loop reports it
-    /// on the transition and then rate-limits, instead of alarming every cycle
-    /// for the life of a node that has no relay client wired.
-    #[error("relay publish failed: no relay bound")]
-    NoRelayBound,
-
-    /// A BEP44 record could not be wrapped into a `DidRecordV1` relay frame
-    /// (§9.10.12) — the document bytes are empty or exceed the maximum frame
-    /// `value` length.
-    ///
-    /// Distinct from [`RelayPublishFailed`](Self::RelayPublishFailed) because
-    /// framing happens BEFORE any layer is contacted: nothing was published, and
-    /// nothing about a relay went wrong. Collapsing the two would misattribute a
-    /// local well-formedness fault to a remote layer, sending operators to look
-    /// at relay health for a bug in their own document.
-    #[error("DID-record framing failed: {0}")]
-    DidRecordFramingFailed(String),
-
-    /// Querying an SCP relay for a DID document failed.
-    #[error("relay query failed: {0}")]
-    RelayQueryFailed(String),
-
-    /// A relay querier has no live connection to the specified relay URL.
-    ///
-    /// Returned by `TransportRelayQuerier` (SCP-RELAYRES-002) when the relay
-    /// connection pool does not hold an active connection to the requested
-    /// relay URL and cannot establish one in time. Callers (`RealMultiRelayQuerier`)
-    /// treat this as a soft failure and advance to the next relay in priority
-    /// order — identical to `RelayQueryFailed` in terms of fall-through behavior.
-    #[error("relay not connected: {0}")]
-    RelayNotConnected(String),
-
-    /// The resolved document has a stale sequence number (lower than last known).
-    #[error("stale sequence number: received {received}, last known {last_known}")]
-    StaleSequenceNumber {
-        /// The sequence number in the received document.
-        received: u64,
-        /// The last known sequence number for this DID.
-        last_known: u64,
-    },
-
-    /// An `#agent` verification method already exists in the DID document.
-    #[error("agent key already exists in DID document")]
-    AgentKeyAlreadyExists,
-
-    /// No `#agent` verification method exists in the DID document.
-    #[error("no agent key exists in DID document")]
-    AgentKeyNotFound,
-
-    /// The DID document contains multiple `#agent` verification methods.
-    #[error("DID document contains {count} #agent verification methods, expected at most 1")]
-    MultipleAgentKeys {
-        /// The number of `#agent` VMs found.
-        count: usize,
-    },
-
-    /// Too many retired agent keys in the DID document.
-    #[error("too many retired agent keys: found {count}, maximum is {max}")]
-    TooManyRetiredAgentKeys {
-        /// The number of retired agent keys found.
-        count: usize,
-        /// The maximum allowed.
-        max: usize,
-    },
-
-    /// A DHT publish step inside [`DidDht::migrate_identity`](crate::dht::DidDht::migrate_identity)
-    /// failed AFTER the irreversible cold-custody mutation (step 5
-    /// `destroy_after_migration`) — meaning the caller cannot simply
-    /// re-invoke `migrate_identity`. The carried
-    /// [`MigrationPartialState`](crate::dht::MigrationPartialState) is the
-    /// byte-identical artifact set needed by
-    /// [`DidDht::resume_migration_publish`](crate::dht::DidDht::resume_migration_publish)
-    /// to finish the migration without re-deriving keys.
-    ///
-    /// `partial` is boxed to keep [`IdentityError`]'s size bounded — the
-    /// partial state holds two full identities, two documents, and a
-    /// rotation event, which would otherwise inflate every `Err` path in
-    /// the crate.
-    #[error("migration publish failed at {phase:?}: {source}")]
-    MigrationPublishFailed {
-        /// Which publish step failed; dictates which steps the resume
-        /// path must re-run.
-        phase: MigrationResumePhase,
-        /// The recovery handle — pass to
-        /// [`DidDht::resume_migration_publish`](crate::dht::DidDht::resume_migration_publish)
-        /// to finish the migration. Boxed to keep [`IdentityError`] size
-        /// bounded; the partial state aggregates two full identities,
-        /// two documents, the rotation event, and a pre-rotation handle.
-        partial: Box<crate::dht::MigrationPartialState>,
-        /// The underlying publish failure (DHT, relay, or sequence-store
-        /// error). Boxed for `IdentityError` size, and surfaced via
-        /// [`std::error::Error::source`] so callers can drill into the
-        /// root cause.
-        #[source]
-        source: Box<Self>,
-    },
-}
-
-/// Maps the DHT transport-layer error ([`scp_dht::DhtError`]) into the
-/// identically-named [`IdentityError`] variant, preserving the message.
-///
-/// This is the one-way seam that lets the DID-method layer here depend on the
-/// transport crate (`scp-identity` → `scp-dht`) while surfacing a single error
-/// taxonomy to its own callers. The `?` operator in this crate's DHT
-/// publish/resolve paths relies on it (ADR-057 T1c-a).
-impl From<scp_dht::DhtError> for IdentityError {
-    fn from(err: scp_dht::DhtError) -> Self {
-        match err {
-            scp_dht::DhtError::DhtPublishFailed(msg) => Self::DhtPublishFailed(msg),
-            scp_dht::DhtError::DhtResolveFailed(msg) => Self::DhtResolveFailed(msg),
-            scp_dht::DhtError::Bep44SignatureInvalid(msg) => Self::Bep44SignatureInvalid(msg),
-            // `DhtMode::Disabled` refuses to publish (fail-closed); surface it
-            // as a publish failure so callers see the honest refusal, never a
-            // silent success (ADR-062 §Decision 1, A2).
-            scp_dht::DhtError::Disabled => Self::DhtPublishFailed(
-                "DHT layer disabled: publish refused (fail-closed)".to_owned(),
-            ),
-        }
-    }
-}
-
-impl IdentityError {
-    /// Borrows the partial state from a
-    /// [`IdentityError::MigrationPublishFailed`] variant. Returns
-    /// `None` for any other variant.
-    ///
-    /// Useful when a caller bubbled the error up through `?` and only
-    /// wants to peek at the recovery handle without destructuring the
-    /// `IdentityError` enum manually (for example, to log the in-flight
-    /// migration's old/new DID strings via
-    /// [`crate::dht::MigrationPartialState::old_did`] and
-    /// [`crate::dht::MigrationPartialState::new_did`]).
-    ///
-    /// For owning access — needed when calling
-    /// [`crate::dht::DidDht::resume_migration_publish`] — use
-    /// [`Self::into_migration_partial`] instead.
-    #[must_use]
-    pub fn as_migration_partial(&self) -> Option<&crate::dht::MigrationPartialState> {
-        match self {
-            Self::MigrationPublishFailed { partial, .. } => Some(partial),
-            _ => None,
-        }
-    }
-
-    /// Consumes this error, returning the owned partial state when the
-    /// variant is [`IdentityError::MigrationPublishFailed`]. Otherwise
-    /// returns the original error verbatim in the `Err` arm so the
-    /// caller can re-propagate it.
-    ///
-    /// This is the idiomatic shape for handing a recovery handle to
-    /// [`crate::dht::DidDht::resume_migration_publish`], which consumes
-    /// the partial state by value:
-    ///
-    /// ```ignore
-    /// match err.into_migration_partial() {
-    ///     Ok(partial) => dht.resume_migration_publish(partial, &custody).await?,
-    ///     Err(other) => return Err(other),
-    /// }
-    /// ```
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err(self)` if the variant is not
-    /// [`IdentityError::MigrationPublishFailed`] — the original error is
-    /// returned unchanged so callers can re-propagate without
-    /// allocating a fresh wrapper.
-    pub fn into_migration_partial(self) -> Result<crate::dht::MigrationPartialState, Self> {
-        match self {
-            Self::MigrationPublishFailed { partial, .. } => Ok(*partial),
-            other => Err(other),
-        }
-    }
-}
-
-/// Maps the wasm-safe [`DidError`](scp_did::DidError) (raised by the
-/// DID-document, verification-method, attestation, and multibase-decode types
-/// that live in `scp-did` per ADR-057) onto the corresponding `IdentityError`
-/// variant.
-///
-/// The mapping is variant-for-variant onto the pre-existing `IdentityError`
-/// variants, so `?`-propagation from a `scp-did` method yields the *identical*
-/// observable error (`IdentityError::InvalidRelayUrl { .. }`, etc.) it did before
-/// the move — the split is behavior-preserving for every existing consumer,
-/// not just compile-preserving. `scp-identity`'s own code constructs these
-/// same variants directly for its DHT/config paths. Each `DidError` variant
-/// has exactly one `IdentityError` counterpart of the same name.
-impl From<scp_did::DidError> for IdentityError {
-    fn from(err: scp_did::DidError) -> Self {
-        match err {
-            scp_did::DidError::InvalidDidFormat(msg) => Self::InvalidDidFormat(msg),
-            scp_did::DidError::DocumentSerializationError(msg) => {
-                Self::DocumentSerializationError(msg)
-            }
-            scp_did::DidError::DocumentDeserializationError(msg) => {
-                Self::DocumentDeserializationError(msg)
-            }
-            scp_did::DidError::InvalidRelayUrl { url, reason } => {
-                Self::InvalidRelayUrl { url, reason }
-            }
-            scp_did::DidError::AbsentSentinelBridgeTarget => Self::AbsentSentinelBridgeTarget,
-            scp_did::DidError::AgentKeyAlreadyExists => Self::AgentKeyAlreadyExists,
-            scp_did::DidError::AgentKeyNotFound => Self::AgentKeyNotFound,
-            scp_did::DidError::MultipleAgentKeys { count } => Self::MultipleAgentKeys { count },
-        }
-    }
-}
+use scp_platform::traits::{KeyCustody, PreRotationCustody, PreRotationKeyHandle};
 
 /// Abstract trait for DID method implementations.
 ///
@@ -532,7 +135,7 @@ pub trait DidMethod: Send + Sync {
     /// custodies MUST be distinct instances on distinct substrates per
     /// §9.7.4.1 §3 (storage isolation).
     ///
-    /// Returns the [`ScpIdentity`] handle, the constructed [`DidDocument`],
+    /// Returns the [`ScpIdentity`](dht::ScpIdentity) handle, the constructed [`DidDocument`],
     /// and the [`PreRotationKeyHandle`] referencing the cold-stored
     /// pre-rotation key. The caller persists the handle alongside the
     /// identity so it can be presented to `migrate_identity` later.
@@ -543,7 +146,7 @@ pub trait DidMethod: Send + Sync {
         key_custody: &impl KeyCustody,
         pre_rotation_custody: &impl PreRotationCustody,
     ) -> impl Future<
-        Output = Result<(ScpIdentity, DidDocument, PreRotationKeyHandle), IdentityError>,
+        Output = Result<(dht::ScpIdentity, DidDocument, PreRotationKeyHandle), dht::IdentityError>,
     > + Send;
 
     /// Verifies that a DID string is self-certifying for the given public key.
@@ -576,14 +179,14 @@ pub trait DidMethod: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns an [`IdentityError`] if signing or the underlying publish fails.
+    /// Returns an [`IdentityError`](dht::IdentityError) if signing or the underlying publish fails.
     /// An implementation that cannot publish MUST return a typed error — never
     /// a fabricated record.
     fn publish(
         &self,
-        identity: &ScpIdentity,
+        identity: &dht::ScpIdentity,
         document: &DidDocument,
-    ) -> impl Future<Output = Result<republish::RepublishEntry, IdentityError>> + Send;
+    ) -> impl Future<Output = Result<republish::RepublishEntry, dht::IdentityError>> + Send;
 
     /// Bootstraps this method's monotonic publish sequence counter to the
     /// highest value known across its persistent store and the live network
@@ -615,7 +218,7 @@ pub trait DidMethod: Send + Sync {
     fn initialize_sequence(
         &self,
         _did: &str,
-    ) -> impl Future<Output = Result<(), IdentityError>> + Send {
+    ) -> impl Future<Output = Result<(), dht::IdentityError>> + Send {
         async { Ok(()) }
     }
 
@@ -629,7 +232,7 @@ pub trait DidMethod: Send + Sync {
     fn resolve(
         &self,
         did_string: &str,
-    ) -> impl Future<Output = Result<DidDocument, IdentityError>> + Send;
+    ) -> impl Future<Output = Result<DidDocument, dht::IdentityError>> + Send;
 
     /// Rotates the active signing key for an identity.
     ///
@@ -640,7 +243,7 @@ pub trait DidMethod: Send + Sync {
     /// implemented in story SCP-008, not SCP-006.
     fn rotate(
         &self,
-        identity: &ScpIdentity,
+        identity: &dht::ScpIdentity,
         key_custody: &impl KeyCustody,
-    ) -> impl Future<Output = Result<(ScpIdentity, DidDocument), IdentityError>> + Send;
+    ) -> impl Future<Output = Result<(dht::ScpIdentity, DidDocument), dht::IdentityError>> + Send;
 }

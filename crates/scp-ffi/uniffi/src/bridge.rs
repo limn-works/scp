@@ -59,11 +59,11 @@ use scp_ffi_common::dht::FfiDhtClient;
 // identity-create (production create fails closed before resolver init —
 // ADR-062 §Decision 6).
 use scp_identity::DidCache;
-use scp_identity::IdentityError;
+use scp_identity::dht::IdentityError;
 use scp_identity::resolver::{DualLayerResolver, NoOpRelayQuerier};
 
 use scp_did::DidDocument as CoreDidDocument;
-use scp_identity::{DidDht, DidMethod, ScpIdentity};
+use scp_identity::{DidDht, DidMethod, dht::ScpIdentity};
 use scp_platform::error::PlatformError;
 use scp_platform::file::FileKeyCustody;
 #[cfg(feature = "testing")]
@@ -1557,9 +1557,9 @@ impl From<scp_ffi_common::bridge_instance::HandleAffinityError> for ScpError {
     }
 }
 
-impl From<scp_identity::IdentityError> for ScpError {
-    fn from(e: scp_identity::IdentityError) -> Self {
-        use scp_identity::IdentityError as IE;
+impl From<scp_identity::dht::IdentityError> for ScpError {
+    fn from(e: scp_identity::dht::IdentityError) -> Self {
+        use scp_identity::dht::IdentityError as IE;
         use scp_platform::PreRotationCustodyError as PE;
 
         // A custody failure keeps its custody code (key-not-found is
@@ -7590,7 +7590,7 @@ const fn decided_built(custody: UniffiKeyCustody) -> DecidedCustody {
 async fn write_created_callback_entry(
     bi: &crate::runtime::UniffiBridgeInstance,
     custody: &UniffiKeyCustody,
-    identity: &scp_identity::ScpIdentity,
+    identity: &scp_identity::dht::ScpIdentity,
     document: &scp_did::DidDocument,
 ) -> Result<(), ScpError> {
     let UniffiKeyCustody::Callback(adapter) = custody else {
@@ -7655,7 +7655,7 @@ async fn rewrite_callback_entry(
     bi: &Arc<crate::runtime::UniffiBridgeInstance>,
     slot: &mut scp_ffi_common::identity_update::IdentityUpdateGuard,
     custody: &UniffiKeyCustody,
-    identity: &scp_identity::ScpIdentity,
+    identity: &scp_identity::dht::ScpIdentity,
     document: &scp_did::DidDocument,
 ) -> Result<(), ScpError> {
     if let UniffiKeyCustody::Callback(adapter) = custody {
@@ -30785,7 +30785,7 @@ mod tests {
     // its typed error code on the UniFFI bridge. Mirrors the PyO3 tests in
     // `crates/scp-ffi/src/error.rs` (same function names, same semantics)
     // so any future re-ordering or accidental swap of match arms in the
-    // `From<scp_identity::IdentityError>` impl breaks here, not at the
+    // `From<scp_identity::dht::IdentityError>` impl breaks here, not at the
     // Swift/Kotlin SDK boundary where it would be harder to diagnose.
     // -----------------------------------------------------------------------
 
@@ -30798,7 +30798,7 @@ mod tests {
 
     #[test]
     fn pre_rotation_handle_not_found_surfaces_typed_code() {
-        let err: ScpError = scp_identity::IdentityError::PreRotation(
+        let err: ScpError = scp_identity::dht::IdentityError::PreRotation(
             scp_platform::PreRotationCustodyError::HandleNotFound,
         )
         .into();
@@ -30807,7 +30807,7 @@ mod tests {
 
     #[test]
     fn pre_rotation_unavailable_surfaces_typed_code() {
-        let err: ScpError = scp_identity::IdentityError::PreRotation(
+        let err: ScpError = scp_identity::dht::IdentityError::PreRotation(
             scp_platform::PreRotationCustodyError::Unavailable("hardware key not connected".into()),
         )
         .into();
@@ -30816,7 +30816,7 @@ mod tests {
 
     #[test]
     fn pre_rotation_user_declined_surfaces_typed_code() {
-        let err: ScpError = scp_identity::IdentityError::PreRotation(
+        let err: ScpError = scp_identity::dht::IdentityError::PreRotation(
             scp_platform::PreRotationCustodyError::UserDeclined,
         )
         .into();
@@ -30825,7 +30825,7 @@ mod tests {
 
     #[test]
     fn pre_rotation_storage_surfaces_typed_code() {
-        let err: ScpError = scp_identity::IdentityError::PreRotation(
+        let err: ScpError = scp_identity::dht::IdentityError::PreRotation(
             scp_platform::PreRotationCustodyError::Storage("disk full".into()),
         )
         .into();
@@ -30834,7 +30834,7 @@ mod tests {
 
     #[test]
     fn pre_rotation_invalid_callback_response_surfaces_typed_code() {
-        let err: ScpError = scp_identity::IdentityError::PreRotation(
+        let err: ScpError = scp_identity::dht::IdentityError::PreRotation(
             scp_platform::PreRotationCustodyError::InvalidCallbackResponse(
                 "handle is empty".into(),
             ),
@@ -30845,7 +30845,7 @@ mod tests {
 
     #[test]
     fn pre_rotation_commitment_mismatch_surfaces_typed_code() {
-        let err: ScpError = scp_identity::IdentityError::PreRotation(
+        let err: ScpError = scp_identity::dht::IdentityError::PreRotation(
             scp_platform::PreRotationCustodyError::CommitmentMismatch,
         )
         .into();
@@ -30854,7 +30854,7 @@ mod tests {
 
     #[test]
     fn non_pre_rotation_identity_errors_keep_generic_envelope() {
-        let err: ScpError = scp_identity::IdentityError::InvalidDidFormat("bad".into()).into();
+        let err: ScpError = scp_identity::dht::IdentityError::InvalidDidFormat("bad".into()).into();
         assert_eq!(pre_rotation_code_of(err), codes::IDENT_1001);
     }
 

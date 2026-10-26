@@ -16,7 +16,7 @@
 use std::fmt;
 
 use scp_did::DidDocument;
-use scp_identity::ScpIdentity;
+use scp_identity::dht::ScpIdentity;
 use scp_platform::store_value::{
     from_stored_value_bytes, sanitize_key_component, to_stored_value_bytes,
 };

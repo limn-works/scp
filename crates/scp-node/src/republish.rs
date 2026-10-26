@@ -1096,7 +1096,7 @@ mod tests {
     #[cfg(feature = "testing")]
     use scp_did::DidDocument;
     #[cfg(feature = "testing")]
-    use scp_identity::{DidMethod as _, ScpIdentity};
+    use scp_identity::{DidMethod as _, dht::ScpIdentity};
     #[cfg(feature = "testing")]
     use scp_platform::testing::{InMemoryKeyCustody, InMemoryPreRotationCustody};
 

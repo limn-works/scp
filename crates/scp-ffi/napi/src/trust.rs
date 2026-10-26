@@ -1061,7 +1061,7 @@ mod tests {
             ) -> impl std::future::Future<
                 Output = Result<
                     Option<scp_identity::resolver::ResolvedDidDocument>,
-                    scp_identity::IdentityError,
+                    scp_identity::dht::IdentityError,
                 >,
             > + Send {
                 let entered = Arc::clone(&self.entered);

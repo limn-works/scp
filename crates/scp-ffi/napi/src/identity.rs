@@ -73,8 +73,8 @@ use scp_did::DidDocument;
 use scp_ffi_common::dht::FfiDhtClient;
 #[cfg(all(test, feature = "testing"))]
 use scp_identity::DidMethod;
-use scp_identity::IdentityError;
-use scp_identity::{DidCache, DidDht, DualLayerResolver, NoOpRelayQuerier, ScpIdentity};
+use scp_identity::dht::IdentityError;
+use scp_identity::{DidCache, DidDht, DualLayerResolver, NoOpRelayQuerier, dht::ScpIdentity};
 #[cfg(feature = "testing")]
 use scp_platform::testing::InMemoryKeyCustody;
 #[cfg(feature = "testing")]

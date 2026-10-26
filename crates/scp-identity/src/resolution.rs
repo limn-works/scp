@@ -29,7 +29,7 @@
 
 use sha2::{Digest, Sha256};
 
-use crate::IdentityError;
+use crate::dht::IdentityError;
 use crate::dht::verify_self_certification;
 use scp_dht::verify_bep44_signature;
 use scp_did::DidDocument;

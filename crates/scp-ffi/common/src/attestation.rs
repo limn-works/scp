@@ -602,7 +602,7 @@ mod link_verification_tests {
         async fn resolve(
             &self,
             _did: &str,
-        ) -> Result<Option<ResolvedDidDocument>, scp_identity::IdentityError> {
+        ) -> Result<Option<ResolvedDidDocument>, scp_identity::dht::IdentityError> {
             Ok(self.0.clone().map(|document| ResolvedDidDocument {
                 document,
                 seq: 1,

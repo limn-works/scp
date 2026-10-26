@@ -3854,7 +3854,7 @@ async fn resolve_napi_creator_verifying_key(
 /// or `None` when the DID is not a local identity on this bridge instance.
 ///
 /// Uses the creator identity's `#active` signing-key handle
-/// ([`scp_identity::ScpIdentity::active_signing_key`]) — the verification
+/// ([`scp_identity::dht::ScpIdentity::active_signing_key`]) — the verification
 /// method §23.16.8 designates as the export signer — and resolves its public
 /// half via [`KeyCustody::public_key`]. Only the public verifying key crosses
 /// out of custody; the private signing key is never materialized (ADR-006).

@@ -295,7 +295,7 @@ pub const IDENT_1058: &str = "SCP-IDENT-1058";
 /// §Decision 6). Rather than silently mint the nullifier (which would ship a
 /// false durability guarantee — AGENTS.md builder tenet "No dev/test-only
 /// stand-ins in production"), creation fails closed with this typed code. Maps
-/// from [`scp_identity::IdentityError::NoPreRotationBackend`]. A real, persistent
+/// from [`scp_identity::dht::IdentityError::NoPreRotationBackend`]. A real, persistent
 /// pre-rotation backend is tracked by #1729 / RFC #2130; non-committing creation
 /// (Option A) is out of scope (Discussion #1553).
 pub const IDENT_1059: &str = "SCP-IDENT-1059";
@@ -2069,7 +2069,7 @@ mod server_error_tests {
             (E::Node(N::Storage("x".into())), STORAGE_8009, Validation),
             (E::OperatorIdentityUnavailable, IDENT_1063, Identity),
             (
-                E::Node(N::Identity(scp_identity::IdentityError::Platform(
+                E::Node(N::Identity(scp_identity::dht::IdentityError::Platform(
                     scp_platform::error::PlatformError::StorageClosed,
                 ))),
                 IDENT_1063,

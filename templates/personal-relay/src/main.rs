@@ -25,7 +25,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use scp_clock::SystemClock;
 use scp_dht::PkarrDhtClient;
-use scp_identity::{DidDht, IdentityError, SequenceStore};
+use scp_identity::{DidDht, SequenceStore, dht::IdentityError};
 use scp_node::{ApplicationNodeBuilder, TlsProvider};
 use scp_platform::sqlite::{SqliteKeyCustody, SqliteStorage};
 use scp_platform::traits::Storage;
