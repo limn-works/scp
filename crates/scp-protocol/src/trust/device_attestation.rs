@@ -6,10 +6,7 @@
 
 pub mod digest;
 
-pub use digest::{
-    device_assertion_digest, device_attestation_binding_digest, device_attestation_tag,
-    policy_digest,
-};
+pub use digest::device_attestation_binding_digest;
 
 /// The most `ScpDeviceAttestation` entries one record may carry for one
 /// context's tag (§9.18.17). A reader that finds more returns

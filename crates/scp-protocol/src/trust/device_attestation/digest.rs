@@ -17,10 +17,31 @@ use crate::trust::sybil::{ApplePlatform, ValidatedSybilPolicy};
 /// Separator of the binding digest `D` (§9.18.2).
 const BINDING_SEPARATOR: &[u8] = b"SCP-DEVICE-ATTESTATION-V1:";
 /// Separator of the tag `T` (§9.18.2).
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the SCP-316 reader (keri/p6-reader-scp-316) is the first caller outside the tests"
+    )
+)]
 const TAG_SEPARATOR: &[u8] = b"SCP-DEVICE-ATTESTATION-TAG-V1:";
 /// Separator of the assertion digest `A` (§9.18.2).
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the SCP-316 reader (keri/p6-reader-scp-316) is the first caller outside the tests"
+    )
+)]
 const ASSERTION_SEPARATOR: &[u8] = b"SCP-DEVICE-ASSERTION-V1:";
 /// Separator of the policy digest `P` (§9.18.2).
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the SCP-316 reader (keri/p6-reader-scp-316) is the first caller outside the tests"
+    )
+)]
 const POLICY_SEPARATOR: &[u8] = b"SCP-DEVICE-ATTESTATION-POLICY-V1:";
 
 /// The `D` and `T` preimage after its separator: `BE32(56) || identifier_text
@@ -42,6 +63,13 @@ fn binding_preimage(
     )
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the SCP-316 reader (keri/p6-reader-scp-316) is the first caller outside the tests"
+    )
+)]
 fn assertion_preimage(request: &[u8]) -> Result<Vec<u8>, CanonicalError> {
     crate::crypto::canonical::canonical_hash_bytes(
         ASSERTION_SEPARATOR,
@@ -50,6 +78,13 @@ fn assertion_preimage(request: &[u8]) -> Result<Vec<u8>, CanonicalError> {
 }
 
 /// `BE32(len) || bytes`, under §9.5.1's variable-length rule.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the SCP-316 reader (keri/p6-reader-scp-316) is the first caller outside the tests"
+    )
+)]
 fn put_var(preimage: &mut Vec<u8>, bytes: &[u8]) -> Result<(), CanonicalError> {
     put_count(preimage, bytes.len())?;
     preimage.extend_from_slice(bytes);
@@ -57,6 +92,13 @@ fn put_var(preimage: &mut Vec<u8>, bytes: &[u8]) -> Result<(), CanonicalError> {
 }
 
 /// A list's `BE32(count)` prefix, or a length prefix.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the SCP-316 reader (keri/p6-reader-scp-316) is the first caller outside the tests"
+    )
+)]
 fn put_count(preimage: &mut Vec<u8>, count: usize) -> Result<(), CanonicalError> {
     let count = u32::try_from(count).map_err(|_| CanonicalError::FieldTooLarge {
         size: count,
@@ -66,6 +108,13 @@ fn put_count(preimage: &mut Vec<u8>, count: usize) -> Result<(), CanonicalError>
     Ok(())
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the SCP-316 reader (keri/p6-reader-scp-316) is the first caller outside the tests"
+    )
+)]
 const fn platform_byte(platform: ApplePlatform) -> u8 {
     match platform {
         ApplePlatform::Ios => 0x00,
@@ -73,6 +122,13 @@ const fn platform_byte(platform: ApplePlatform) -> u8 {
     }
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the SCP-316 reader (keri/p6-reader-scp-316) is the first caller outside the tests"
+    )
+)]
 fn policy_preimage(policy: ValidatedSybilPolicy<'_>) -> Result<Vec<u8>, CanonicalError> {
     let policy = policy.policy();
     let mut preimage = Vec::with_capacity(256);
@@ -129,7 +185,14 @@ pub fn device_attestation_binding_digest(
 ///
 /// [`CanonicalError::FieldTooLarge`] when `context_id` exceeds `u32::MAX`
 /// bytes.
-pub fn device_attestation_tag(
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the SCP-316 reader (keri/p6-reader-scp-316) is the first caller outside the tests"
+    )
+)]
+pub(crate) fn device_attestation_tag(
     identifier: &Identifier,
     context_id: &str,
     challenge: &[u8; 32],
@@ -145,7 +208,14 @@ pub fn device_attestation_tag(
 /// # Errors
 ///
 /// [`CanonicalError::FieldTooLarge`] when `request` exceeds `u32::MAX` bytes.
-pub fn device_assertion_digest(request: &[u8]) -> Result<[u8; 32], CanonicalError> {
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the SCP-316 reader (keri/p6-reader-scp-316) is the first caller outside the tests"
+    )
+)]
+pub(crate) fn device_assertion_digest(request: &[u8]) -> Result<[u8; 32], CanonicalError> {
     let preimage = assertion_preimage(request)?;
     Ok(Sha256::digest(preimage).into())
 }
@@ -158,7 +228,14 @@ pub fn device_assertion_digest(request: &[u8]) -> Result<[u8; 32], CanonicalErro
 ///
 /// [`CanonicalError::FieldTooLarge`] when a list holds more than `u32::MAX`
 /// elements or a string exceeds `u32::MAX` bytes.
-pub fn policy_digest(policy: ValidatedSybilPolicy<'_>) -> Result<[u8; 32], CanonicalError> {
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the SCP-316 reader (keri/p6-reader-scp-316) is the first caller outside the tests"
+    )
+)]
+pub(crate) fn policy_digest(policy: ValidatedSybilPolicy<'_>) -> Result<[u8; 32], CanonicalError> {
     let preimage = policy_preimage(policy)?;
     Ok(Sha256::digest(preimage).into())
 }

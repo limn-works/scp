@@ -28,6 +28,37 @@ packages_outside_allowlist() {
     LC_ALL=C comm -23 <(echo "$names") <(echo "$allowed") | { grep -v '^$' || true; }
 }
 
+# packages_from_other_sources LISTING MEMBERS prints every line of LISTING (a
+# `cargo tree --prefix none --format '{p}'` listing) whose package comes from a
+# source other than crates.io or a workspace member. cargo prints no source for
+# a crates.io package and "(<source>)" after the version for any other: a git
+# URL, a registry, or a path, a `[patch]` included. A path is allowed only
+# when MEMBERS, one workspace member directory per line, holds it exactly, so
+# a path outside the workspace or a patched path inside it fails. The
+# trailing "(*)" duplicate and "(proc-macro)" markers are not sources.
+packages_from_other_sources() {
+    local line source
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        source=$(echo "$line" | sed -E 's/( \((\*|proc-macro)\))+$//' | sed -nE 's/^[^ ]+ [^ ]+ \((.*)\)$/\1/p')
+        [ -n "$source" ] || continue
+        if ! printf '%s\n' "$2" | grep -Fxq -- "$source"; then
+            echo "$line"
+        fi
+    done <<< "$1"
+}
+
+# workspace_member_dirs prints the directory of every workspace member, one
+# per line, from `cargo metadata`.
+workspace_member_dirs() {
+    local metadata
+    metadata=$(cargo metadata --no-deps --format-version 1 2>&1) || {
+        echo "ERROR: cargo metadata failed: $metadata" >&2
+        return 1
+    }
+    echo "$metadata" | grep -oE '"manifest_path":"[^"]*"' | sed -E 's/^"manifest_path":"(.*)\/Cargo\.toml"$/\1/'
+}
+
 # --self-test feeds network_crates_in a canned listing with two network crates
 # and three names that contain a network crate's name, and requires exactly
 # the two network crates back. It runs no cargo command.
@@ -58,6 +89,31 @@ if [ "${1:-}" = "--self-test" ]; then
         fi
     done
     echo "packages_outside_allowlist self-test passed: refused reqwest, native-tls, mio and sha2-asm."
+
+    # The source check: crates.io packages, workspace members and the two
+    # markers pass; a git source, a path outside the workspace, a patched
+    # path inside it that no member owns, and another registry each fail with
+    # that line.
+    members=$'/src/crates/scp-protocol\n/src/crates/scp-did'
+    sourced_listing=$'scp-protocol v0.1.0 (/src/crates/scp-protocol)\nscp-did v0.1.0 (/src/crates/scp-did) (*)\nsha2 v0.10.9\nasync-trait v0.1.89 (proc-macro) (*)'
+    got=$(packages_from_other_sources "$sourced_listing" "$members")
+    if [ -n "$got" ]; then
+        echo "ERROR: packages_from_other_sources self-test: allowed listing reported [$got]"
+        exit 1
+    fi
+    for foreign in \
+        'openmls v0.9.0 (https://github.com/openmls/openmls?rev=be248d4b#be248d4b)' \
+        'sha2 v0.10.9 (/elsewhere/sha2)' \
+        'sha2 v0.10.9 (/src/vendor/sha2) (*)' \
+        'sha2 v0.10.9 (registry `mirror`)' \
+        'scp-did v0.1.0 (/src/crates/scp-did-fork)'; do
+        got=$(packages_from_other_sources "$sourced_listing"$'\n'"$foreign" "$members")
+        if [ "$got" != "$foreign" ]; then
+            echo "ERROR: packages_from_other_sources self-test: want [$foreign], got [$got]"
+            exit 1
+        fi
+    done
+    echo "packages_from_other_sources self-test passed: refused a git source, two foreign paths, a registry and a non-member path."
     exit 0
 fi
 
@@ -216,3 +272,32 @@ protocol_packages_are_allowlisted() {
     echo "scp-protocol allowlist check passed: every package is in $(basename "$ALLOWLIST")."
 }
 protocol_packages_are_allowlisted
+
+# protocol_packages_come_from_crates_io: the allowlist names packages, not
+# where they come from, so a `[patch]`, a git dependency or a path outside the
+# workspace could swap an allowed name for other code. This check fails on
+# any package of scp-protocol's production graph, every feature and every
+# target resolved, whose source is neither crates.io nor a workspace member.
+protocol_packages_come_from_crates_io() {
+    local listing err members foreign
+    err=$(mktemp)
+    listing=$(cargo tree -p scp-protocol --edges no-dev --all-features --target all --prefix none --format '{p}' 2>"$err") || {
+        echo "ERROR: cargo tree failed: $(cat "$err")"
+        rm -f "$err"
+        exit 1
+    }
+    rm -f "$err"
+    members=$(workspace_member_dirs) || exit 1
+    if [ -z "$members" ]; then
+        echo "ERROR: cargo metadata printed no workspace member"
+        exit 1
+    fi
+    foreign=$(packages_from_other_sources "$listing" "$members")
+    if [ -n "$foreign" ]; then
+        echo "ERROR: scp-protocol depends on packages from a source other than crates.io or a workspace member:"
+        echo "$foreign"
+        exit 1
+    fi
+    echo "scp-protocol source check passed: every package comes from crates.io or a workspace member."
+}
+protocol_packages_come_from_crates_io

@@ -6,7 +6,6 @@
 use std::collections::HashMap;
 
 use scp_protocol::context::ContextError;
-use scp_protocol::context::builder::ContextCreationError;
 
 use scp_did::DID;
 
@@ -74,23 +73,6 @@ pub(super) fn build_identity_assessment(
     scp_protocol::trust::sybil::IdentityDepthAssessment::new(member_did.clone(), signals, now)
 }
 
-/// Validates all consequence rule string fields (defense-in-depth).
-///
-/// Called from `create_context` to catch internal callers that bypass FFI
-/// validation. Rejects control characters, HTML-special characters, and
-/// overly long strings.
-pub fn validate_consequence_rules(
-    rules: &[scp_protocol::trust::consequence::ConsequenceRule],
-    config: &scp_protocol::context::params::ConsequenceConfig,
-) -> Result<(), ContextCreationError> {
-    for rule in rules {
-        rule.validate_against_config(config).map_err(|e| {
-            ContextCreationError::CreationFailed(format!("consequence rule validation failed: {e}"))
-        })?;
-    }
-    Ok(())
-}
-
 /// Maximum permitted future cooldown horizon, in seconds.
 ///
 /// Cooldown timestamps in an imported or restored snapshot are clamped
@@ -144,13 +126,15 @@ pub fn sanitize_cooldown_until(
     });
 }
 
-/// Validates imported `consequence_rules` against `consequence_config` and
-/// returns [`ContextError::ImportRejected`] on failure.
+/// Validates a snapshot's live `consequence_rules` against its params'
+/// `consequence_config` and returns [`ContextError::ImportRejected`] on
+/// failure.
 ///
-/// Distinct from [`validate_consequence_rules`] which targets the
-/// create-time path and returns [`ContextCreationError`]. This variant
-/// is used by `import_context` and `restore_context` so the bridge
-/// translators surface the canonical `SCP-CTX-2092` code.
+/// The live rule set is input beyond the params: governance replaces it after
+/// creation, so it lives on the snapshot, not in `ContextParams`, and
+/// [`validate_context_params_for_import`] does not read it. `import_context`
+/// and `restore_context` call this so the bridge translators surface the
+/// canonical `SCP-CTX-2092` code.
 pub fn validate_consequence_rules_for_import(
     rules: &[scp_protocol::trust::consequence::ConsequenceRule],
     config: &scp_protocol::context::params::ConsequenceConfig,
@@ -164,24 +148,29 @@ pub fn validate_consequence_rules_for_import(
     Ok(())
 }
 
-/// Runs [`validate_context_params`](scp_protocol::context::templates::validate_context_params),
-/// the one params validator every entry point calls, on imported or restored
-/// params and returns [`ContextError::ImportRejected`] on failure, so the
-/// bridge translators surface `SCP-CTX-2092` as they do for
-/// [`validate_consequence_rules_for_import`].
+/// Runs [`validate_params`](crate::context::params_validation::validate_params),
+/// the one validator of every check that reads only `ContextParams`, on
+/// imported or restored params with
+/// [`ParamsOrigin::Existing`](crate::context::params_validation::ParamsOrigin::Existing),
+/// and returns [`ContextError::ImportRejected`] on failure, so the bridge
+/// translators surface `SCP-CTX-2092` as they do for
+/// [`validate_consequence_rules_for_import`]. The template check does not
+/// run, because §5.10 promotion changes a context's params after creation.
 ///
 /// # Errors
 ///
-/// [`ContextError::ImportRejected`] when `params` fails
-/// `validate_context_params`, for example a `sybil_policy` that breaks a
-/// §9.3.1 validity rule.
+/// [`ContextError::ImportRejected`] naming the refused field when `params`
+/// fails any check `validate_params` runs, for example a `sybil_policy` that
+/// breaks a §9.3.1 validity rule.
 pub(super) fn validate_context_params_for_import(
     params: &scp_protocol::context::ContextParams,
 ) -> Result<(), ContextError> {
-    scp_protocol::context::templates::validate_context_params(params).map_err(|e| {
-        ContextError::ImportRejected {
-            reason: format!("context_params invalid: {e}"),
-        }
+    crate::context::params_validation::validate_params(
+        params,
+        crate::context::params_validation::ParamsOrigin::Existing,
+    )
+    .map_err(|e| ContextError::ImportRejected {
+        reason: format!("context_params invalid: {e}"),
     })
 }
 

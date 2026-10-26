@@ -1748,12 +1748,15 @@ fn rollback_join_economy_ticket(
 ///   `params.pseudonym_rotation` fails the §9.10.4.1 validity criterion.
 /// - [`ContextCreationError::InvalidSybilPolicy`] when `params.sybil_policy`
 ///   fails the §9.3.1 validity rules.
+/// - [`ContextCreationError::TemplateValidationFailed`] when
+///   `params.projection_policy` is set on an encrypted context (§18.11.2.1)
+///   or the params differ from their template.
 /// - [`ContextCreationError::StateTransition`] wrapping
 ///   [`ContextError::SupervisorShutDown`] when the actor spawn is refused
 ///   because shutdown has begun or the Supervisor dropped (ADR-049 Decision 16).
-/// - [`ContextCreationError::CreationFailed`] for governance /
-///   consequence-rule / economic-policy validation failures, or supervisor
-///   registration failures.
+/// - [`ContextCreationError::CreationFailed`] for governance-model,
+///   consequence-rule, economic-policy, genesis-outlet, or Broadcast
+///   memory-scope validation failures, or supervisor registration failures.
 /// - Crypto / transport / event-log failures during the initial MLS
 ///   group setup.
 #[allow(clippy::too_many_lines)]
@@ -1771,39 +1774,19 @@ pub(in crate::context) async fn create_context(
     relay_urls: Vec<String>,
     first_state: &FirstStateRollback,
 ) -> Result<SpawnedContext, ContextCreationError> {
-    // The ceiling must be non-empty (construction.md M2, Alec's ruling of
-    // 2026-09-30): an empty ceiling describes a context no member can use.
-    // Every create path (`Supervisor::create`, `Supervisor::create_context`,
-    // the `CreateContext` lifecycle command, the standing-pair recreate, and
-    // the governance migration) reaches this function. The rejection runs
-    // here, before any context state exists; `builder::create_context`, which
-    // builds the MLS group, repeats it in its Phase 1 validation so the rule
-    // holds for every in-crate caller.
-    if params.ceiling.is_empty() {
-        return Err(ContextCreationError::StateTransition(
-            scp_protocol::context::ContextError::CeilingRequired(
-                scp_protocol::context::CeilingDeclaration::Empty,
-            ),
-        ));
-    }
-    // Defense-in-depth: verify creator's SDK version satisfies
-    // min_protocol_version.
-    params.check_version_compatibility(scp_protocol::envelope::SCP_PROTOCOL_VERSION)?;
-    // §9.10.4.1 validity criterion: creation rejects a rotation policy with no
-    // trigger or an interval shorter than
-    // `PSEUDONYM_MIN_ROTATION_INTERVAL_SECS`.
-    if let Some(policy) = &params.pseudonym_rotation {
-        policy.validate()?;
-    }
-    state::validate_governance_model(&params.governance)?;
-    crate::context::lifecycle_logic::validate_consequence_rules(
-        &params.consequence_rules,
-        &params.consequence_config,
+    // Every check that reads only `params` (construction.md M2's non-empty
+    // ceiling, the §5.3.1.1 ceiling grammar, `min_protocol_version`, the
+    // governance model, consequence rules, economic-policy metrics,
+    // §9.10.4.1 rotation, genesis outlets, the §5.11 Broadcast memory scope,
+    // §18.11.2.1 projection, §9.3.1 sybil, and the template) runs here,
+    // before any governance state exists. Every create path
+    // (`Supervisor::create`, `Supervisor::create_context`, the
+    // `CreateContext` lifecycle command, the standing-pair recreate, and the
+    // governance migration) reaches this call.
+    crate::context::params_validation::validate_params(
+        &params,
+        crate::context::params_validation::ParamsOrigin::Creation,
     )?;
-    scp_protocol::economy::policy::validate_economic_policy_metrics(
-        params.economic_policy.as_ref(),
-    )
-    .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
     let governance_engine = state::create_governance_engine(
         &params.governance,
         &creator_did,
@@ -3100,18 +3083,19 @@ pub(in crate::context) async fn import_context(
         )));
     }
 
-    // C3: Validate consequence rules on import. Uses
-    // validate_against_config to enforce the opt-in gate for
-    // RevokeAccess even on imported snapshots and rejects with the
-    // canonical SCP-CTX-2092 envelope so SDK callers can detect
-    // structural rejection by `.code` rather than message body.
+    // C3: the snapshot's live consequence rules, which governance replaces
+    // after creation, are input beyond the params, so they are checked here.
+    // `validate_against_config` enforces the opt-in gate for RevokeAccess even
+    // on imported snapshots and rejects with the canonical SCP-CTX-2092
+    // envelope so SDK callers can detect structural rejection by `.code`
+    // rather than message body.
     crate::context::lifecycle_logic::validate_consequence_rules_for_import(
         &export.snapshot.consequence_rules,
         &export.snapshot.context_params.consequence_config,
     )?;
-    // The imported params pass the same `validate_context_params` a created
-    // context's do (§9.3.1 sybil policy included), with the same SCP-CTX-2092
-    // refusal.
+    // The imported params pass every check that reads only `ContextParams`
+    // (`params_validation::validate_params`, the template check excepted),
+    // with the same SCP-CTX-2092 refusal.
     crate::context::lifecycle_logic::validate_context_params_for_import(
         &export.snapshot.context_params,
     )?;
@@ -3963,7 +3947,8 @@ pub async fn restore_context(
 
     let (mut ctx_snapshot, broadcast_ctx) =
         load_persisted_context_state(deps, context_id, preloaded_snapshot).await?;
-    // Every refusal below (consequence rules, context params, ceiling grammar, the §5.13.3
+    // Every refusal below (the snapshot's live consequence rules, every check
+    // that reads only the context params, the role-state ceiling grammar, the §5.13.3
     // binding check, the event-log load, the replay-floor merge) runs in that
     // order. The event log is hydrated only after the binding check, and the
     // floors are merged only after the event log loaded, so a restore refused

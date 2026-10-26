@@ -16623,46 +16623,19 @@ impl Supervisor {
             )
         })?;
 
-        // Precheck C (BLACK-2J-02) — reversible legible-param validation. These
-        // depend ONLY on `params` (not on the joined group), so run them before
-        // the consume: malformed params fail without burning the KeyPackage.
-        params
-            .check_version_compatibility(scp_protocol::envelope::SCP_PROTOCOL_VERSION)
-            .map_err(|e| ContextError::CreationFailed(e.to_string()))?;
-        crate::context::state::validate_governance_model(&params.governance)
-            .map_err(|e| ContextError::CreationFailed(e.to_string()))?;
-        // Ceiling-grammar validation (§5.3.1.1). `build_welcome_joiner_state` →
-        // `ContextRoleState::new` runs `ceiling.validate_entries()` only AFTER the
-        // irreversible consume, so a malformed ceiling category
-        // (`InvalidCeilingCategory`) would otherwise burn the single-use KeyPackage
-        // before failing. It depends only on `params`, so validate the SAME ceiling
-        // here to keep the rejection reversible.
-        scp_protocol::context::roles::CapabilityCeiling::new(params.ceiling.iter().cloned())
-            .validate_entries()
-            .map_err(|e| ContextError::CreationFailed(e.to_string()))?;
-        // Genesis outlet validation (§5.9, §5.4.2, §6.2). `builder::validate_params`
-        // runs this on the creator's own parameters, and `create_context` is its only
-        // caller, so a joiner — whose `params` arrive from a peer — would otherwise
-        // accept an outlet declaration of any length, carrying any schema and any
-        // operator DID, and retain it in `handle` and in the persisted
-        // `context_params`. Call the SAME validator here, on the same `params`, so
-        // the checks hold on both sides of the invitation (GitHub #2250).
-        crate::context::state::validate_genesis_outlets(&params.outlets)
-            .map_err(|e| ContextError::CreationFailed(e.to_string()))?;
-        // §9.10.4.1 validity criterion. Creation and the governance action both
-        // reject an invalid rotation policy; a joiner's `params` arrive from a
-        // peer, so apply the same criterion before the consume.
-        if let Some(policy) = &params.pseudonym_rotation {
-            policy
-                .validate()
-                .map_err(|e| ContextError::CreationFailed(e.to_string()))?;
-        }
-        // The one params validator create, import, restore and governance call
-        // (§9.3.1 sybil policy, §18.11.2.1 projection policy). A joiner's
-        // `params` arrive from a peer, and a policy restore later refuses must
-        // not be persisted, so run it before the consume.
-        scp_protocol::context::templates::validate_context_params(&params)
-            .map_err(|e| ContextError::CreationFailed(e.to_string()))?;
+        // Precheck C (BLACK-2J-02) — reversible legible-param validation. A
+        // joiner's `params` arrive from a peer, and every check that reads only
+        // `params` (not the joined group) runs here, before the consume, so
+        // malformed params fail without burning the KeyPackage and a joiner
+        // never persists params a later restore would refuse. This is the one
+        // validator create, import, restore and governance call; the inviter's
+        // params may be §5.10-promoted, so it runs with `Existing` and skips
+        // the template check.
+        crate::context::params_validation::validate_params(
+            &params,
+            crate::context::params_validation::ParamsOrigin::Existing,
+        )
+        .map_err(|e| ContextError::CreationFailed(e.to_string()))?;
 
         // Build the joiner's actor deps (crypto, transport, event log, KP store,
         // mls_storage, persistence, capability token) for the owning identity.
@@ -22222,6 +22195,7 @@ mod tests {
         state.handle = crate::context::ContextHandle::new(
             ctx_key.clone(),
             scp_protocol::context::params::ContextParams {
+                ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
                 ttl: Some(std::time::Duration::from_secs(TTL_SECS)),
                 ..Default::default()
             },
@@ -22333,6 +22307,7 @@ mod tests {
         state.handle = crate::context::ContextHandle::new(
             ctx_key.clone(),
             scp_protocol::context::params::ContextParams {
+                ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
                 ttl: Some(std::time::Duration::from_secs(TTL_SECS)),
                 // Ephemeral scope with a live TTL (`params.ttl == Some`) ⇒
                 // `convergent_ttl_deadline` derives the `creation + ttl` base and
@@ -22442,6 +22417,7 @@ mod tests {
         state.handle = crate::context::ContextHandle::new(
             ctx_key.clone(),
             scp_protocol::context::params::ContextParams {
+                ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
                 ttl: None,
                 memory_scope: scp_protocol::context::params::MemoryScope::Full,
                 ..Default::default()
@@ -22527,6 +22503,7 @@ mod tests {
         state.handle = crate::context::ContextHandle::new(
             ctx_key.clone(),
             scp_protocol::context::params::ContextParams {
+                ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
                 ttl: Some(std::time::Duration::from_secs(TTL_SECS)),
                 // Created `Full` scope (NOT promoted) — the case the old gate
                 // mis-classified.
@@ -22627,6 +22604,7 @@ mod tests {
         state.handle = crate::context::ContextHandle::new(
             ctx_key.clone(),
             scp_protocol::context::params::ContextParams {
+                ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
                 ttl: Some(std::time::Duration::from_secs(TTL_SECS)),
                 ..Default::default()
             },
@@ -24991,7 +24969,11 @@ mod tests {
             context_id: context_id.to_owned(),
             creation_timestamp_secs: 1_700_000_000,
             state: ContextState::Active,
-            context_params: ContextParams::default(),
+            // A non-empty ceiling: import runs the params validator, which refuses an empty one.
+            context_params: ContextParams {
+                ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
+                ..ContextParams::default()
+            },
             membership: MembershipState::new(),
             role_state,
             event_log_merkle_root: [0u8; 32],
@@ -26483,6 +26465,7 @@ mod tests {
     /// `RULE9_T0 + 9_000`.
     fn rule9_params() -> scp_protocol::context::ContextParams {
         scp_protocol::context::ContextParams {
+            ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
             pseudonym_rotation: Some(scp_protocol::context::params::PseudonymRotationPolicy {
                 interval_secs: Some(3_600),
                 on_membership_change: false,
@@ -28980,10 +28963,14 @@ mod tests {
         // context's id + params — so the load-time §5.13.3 binding check on the
         // respawn path (`restore_context`) passes on this legitimate
         // self-respawn, exactly as a real persisted group would. The snapshot's
-        // `context_params` is the state handle's `ContextParams::default()`
-        // (see `new_for_test_encrypted`), and its `context_id` is `ctx_key`, so
-        // the extension is bound to precisely those values.
-        let ctx_params = scp_protocol::context::ContextParams::default();
+        // `context_params` are the state handle's params (see
+        // `new_for_test_encrypted`: the defaults plus a `MessagesRead`
+        // ceiling), and its `context_id` is `ctx_key`, so the extension is
+        // bound to precisely those values.
+        let ctx_params = scp_protocol::context::ContextParams {
+            ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
+            ..scp_protocol::context::ContextParams::default()
+        };
         // The committed genesis creator must equal the snapshot's
         // `role_state.creator_did` so the restore-time §5.13.3 rule-8 creator
         // binding passes on this legitimate self-respawn. The state below is

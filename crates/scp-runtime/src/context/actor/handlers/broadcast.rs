@@ -2519,6 +2519,235 @@ mod tests {
         }
     }
 
+    /// Destination params that pass every `params_validation::validate_params`
+    /// check, so a proposal carrying them passes the proposal-time check and a
+    /// `failing` fixture applied to them fails exactly one check.
+    fn destination_params() -> scp_protocol::context::params::ContextParams {
+        scp_protocol::context::params::ContextParams {
+            ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
+            ..scp_protocol::context::params::ContextParams::default()
+        }
+    }
+
+    /// The two governance actions whose params a later create consumes.
+    #[derive(Clone, Copy, Debug)]
+    enum ProposedArm {
+        Migration,
+        Child,
+    }
+
+    /// Proposes `arm` carrying `params` on a fresh context, as the admin, and
+    /// returns the outcome with whether a proposal was recorded.
+    async fn propose_destination(
+        arm: ProposedArm,
+        params: scp_protocol::context::params::ContextParams,
+    ) -> (Result<(), ContextError>, bool) {
+        use scp_protocol::context::governance::GovernanceAction;
+
+        let action = match arm {
+            ProposedArm::Migration => GovernanceAction::ProposeContextMigration {
+                new_context_params: Box::new(params),
+                reason: "fixture".to_owned(),
+                grace_period_secs: 60,
+                auto_invite: false,
+            },
+            ProposedArm::Child => GovernanceAction::CreateChildContext {
+                params: Box::new(params),
+            },
+        };
+        let (deps, _appends) = build_deps().await;
+        let (state, ctx_hex) =
+            build_broadcast_state_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
+        let mut cell = ClassSCell::new(state);
+        let outcome = crate::context::governance_helpers::propose_governance_action_inner(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &DID(CREATOR_DID.to_owned()),
+            action,
+            &crate::context::actor::CommandSigner::local_ed25519(creator_key().clone()),
+            false,
+            None,
+        )
+        .await
+        .map(|_| ());
+        let recorded = !crate::context::governance_helpers::list_proposals(&cell).is_empty();
+        (outcome, recorded)
+    }
+
+    /// One test per (arm, check): the proposal carries `destination_params`
+    /// with one `params_validation::failing` fixture applied, so it fails
+    /// that check alone, and the proposal step must refuse it with `$expect`
+    /// and record no proposal.
+    macro_rules! proposal_refuses {
+        ($name:ident, $arm:expr, $fixture:path, $expect:expr) => {
+            #[tokio::test]
+            async fn $name() {
+                let expect: fn(&ContextError) -> bool = $expect;
+                let (outcome, recorded) =
+                    propose_destination($arm, $fixture(destination_params())).await;
+                assert!(
+                    outcome.as_ref().is_err_and(expect),
+                    "{:?}: the proposal step must refuse {}; got {outcome:?}",
+                    $arm,
+                    stringify!($fixture)
+                );
+                assert!(!recorded, "a refused proposal must record no proposal");
+            }
+        };
+    }
+
+    fn names(field: &'static str) -> impl Fn(&ContextError) -> bool {
+        move |e| matches!(e, ContextError::CreationFailed(m) if m.contains(field))
+    }
+
+    proposal_refuses!(
+        child_refuses_an_empty_ceiling,
+        ProposedArm::Child,
+        crate::context::params_validation::failing::empty_ceiling,
+        |e| matches!(
+            e,
+            ContextError::CeilingRequired(scp_protocol::context::CeilingDeclaration::Empty)
+        )
+    );
+    proposal_refuses!(
+        migration_refuses_a_malformed_ceiling_entry,
+        ProposedArm::Migration,
+        crate::context::params_validation::failing::malformed_ceiling_entry,
+        |e| names("ceiling entry invalid")(e)
+    );
+    proposal_refuses!(
+        child_refuses_a_malformed_ceiling_entry,
+        ProposedArm::Child,
+        crate::context::params_validation::failing::malformed_ceiling_entry,
+        |e| names("ceiling entry invalid")(e)
+    );
+    proposal_refuses!(
+        migration_refuses_an_unsupported_version,
+        ProposedArm::Migration,
+        crate::context::params_validation::failing::unsupported_version,
+        |e| matches!(e, ContextError::VersionIncompatible { .. })
+    );
+    proposal_refuses!(
+        child_refuses_an_unsupported_version,
+        ProposedArm::Child,
+        crate::context::params_validation::failing::unsupported_version,
+        |e| matches!(e, ContextError::VersionIncompatible { .. })
+    );
+    proposal_refuses!(
+        migration_refuses_voterless_governance,
+        ProposedArm::Migration,
+        crate::context::params_validation::failing::voterless_governance,
+        |e| names("governance invalid")(e)
+    );
+    proposal_refuses!(
+        child_refuses_voterless_governance,
+        ProposedArm::Child,
+        crate::context::params_validation::failing::voterless_governance,
+        |e| names("governance invalid")(e)
+    );
+    proposal_refuses!(
+        migration_refuses_an_invalid_consequence_rule,
+        ProposedArm::Migration,
+        crate::context::params_validation::failing::empty_suspension_rule,
+        |e| names("consequence_rules[0]")(e)
+    );
+    proposal_refuses!(
+        child_refuses_an_invalid_consequence_rule,
+        ProposedArm::Child,
+        crate::context::params_validation::failing::empty_suspension_rule,
+        |e| names("consequence_rules[0]")(e)
+    );
+    proposal_refuses!(
+        migration_refuses_an_unavailable_pricing_metric,
+        ProposedArm::Migration,
+        crate::context::params_validation::failing::unavailable_pricing_metric,
+        |e| names("economic_policy")(e)
+    );
+    proposal_refuses!(
+        child_refuses_an_unavailable_pricing_metric,
+        ProposedArm::Child,
+        crate::context::params_validation::failing::unavailable_pricing_metric,
+        |e| names("economic_policy")(e)
+    );
+    proposal_refuses!(
+        migration_refuses_a_triggerless_rotation,
+        ProposedArm::Migration,
+        crate::context::params_validation::failing::triggerless_rotation,
+        |e| names("pseudonym_rotation")(e)
+    );
+    proposal_refuses!(
+        child_refuses_a_triggerless_rotation,
+        ProposedArm::Child,
+        crate::context::params_validation::failing::triggerless_rotation,
+        |e| names("pseudonym_rotation")(e)
+    );
+    proposal_refuses!(
+        migration_refuses_a_property_free_genesis_outlet,
+        ProposedArm::Migration,
+        crate::context::params_validation::failing::property_free_outlet,
+        |e| names("outlets invalid")(e)
+    );
+    proposal_refuses!(
+        child_refuses_a_property_free_genesis_outlet,
+        ProposedArm::Child,
+        crate::context::params_validation::failing::property_free_outlet,
+        |e| names("outlets invalid")(e)
+    );
+    proposal_refuses!(
+        migration_refuses_an_ephemeral_broadcast,
+        ProposedArm::Migration,
+        crate::context::params_validation::failing::ephemeral_broadcast,
+        |e| matches!(e, ContextError::InvalidMemoryScopeForBroadcast)
+    );
+    proposal_refuses!(
+        child_refuses_an_ephemeral_broadcast,
+        ProposedArm::Child,
+        crate::context::params_validation::failing::ephemeral_broadcast,
+        |e| matches!(e, ContextError::InvalidMemoryScopeForBroadcast)
+    );
+    proposal_refuses!(
+        migration_refuses_a_template_mismatch,
+        ProposedArm::Migration,
+        crate::context::params_validation::failing::template_mismatch,
+        |e| matches!(
+            e,
+            ContextError::TemplateMismatch(
+                scp_protocol::context::templates::TemplateError::Mismatch { .. }
+            )
+        )
+    );
+    proposal_refuses!(
+        child_refuses_a_template_mismatch,
+        ProposedArm::Child,
+        crate::context::params_validation::failing::template_mismatch,
+        |e| matches!(
+            e,
+            ContextError::TemplateMismatch(
+                scp_protocol::context::templates::TemplateError::Mismatch { .. }
+            )
+        )
+    );
+
+    /// The control for every `proposal_refuses!` test: `destination_params`
+    /// itself passes the proposal-time check on both arms.
+    #[tokio::test]
+    async fn valid_destination_params_pass_the_proposal_check() {
+        for arm in [ProposedArm::Migration, ProposedArm::Child] {
+            let (outcome, _recorded) = propose_destination(arm, destination_params()).await;
+            assert!(
+                !matches!(
+                    outcome,
+                    Err(ContextError::CeilingRequired(_)
+                        | ContextError::VersionIncompatible { .. }
+                        | ContextError::InvalidMemoryScopeForBroadcast
+                        | ContextError::TemplateMismatch(_))
+                ) && !matches!(&outcome, Err(ContextError::CreationFailed(m)) if m.contains("invalid")),
+                "{arm:?}: valid destination params must pass the proposal check; got {outcome:?}"
+            );
+        }
+    }
+
     /// A `ProposeContextMigration` or `CreateChildContext` whose params carry a
     /// sybil policy that breaks a §9.3.1 validity rule (a device-attestation
     /// max age one second above the one-year maximum) would fail its create
@@ -2541,7 +2770,7 @@ mod tests {
                     device_attestation_max_age_secs: max_age,
                     ..ContextSybilPolicy::casual()
                 }),
-                ..undeliverable_destination_params()
+                ..destination_params()
             })
         };
         let migrate = |max_age: u64| GovernanceAction::ProposeContextMigration {
@@ -3066,7 +3295,7 @@ mod tests {
         let creator = DID(CREATOR_DID.to_owned());
         let signer = crate::context::actor::CommandSigner::local_ed25519(creator_key());
         let migrate = || GovernanceAction::ProposeContextMigration {
-            new_context_params: Box::new(undeliverable_destination_params()),
+            new_context_params: Box::new(destination_params()),
             reason: "fixture".to_owned(),
             grace_period_secs: 60,
             auto_invite: false,

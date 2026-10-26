@@ -14,10 +14,8 @@
 //! the builder names the concrete type directly.
 
 use super::ContextHandle;
+use crate::context::params_validation::{self, ParamsOrigin};
 use crate::crypto::mls::provider::NodeMlsFactory;
-use scp_protocol::context::templates::{
-    TemplateError, validate_against_template, validate_context_params,
-};
 use scp_protocol::context::{
     CapabilityCeiling, ContextError, ContextMode, ContextParams, ContextState, ScpContextExtension,
 };
@@ -1001,105 +999,40 @@ impl CreationReceipt {
 // Validation (Phase 1)
 // ---------------------------------------------------------------------------
 
-/// Validates `ContextParams` for internal consistency.
-///
-/// Checks that required fields are present and consistent, including template
-/// validation when `template_id` is present. This is a pure function with no
-/// side effects.
+/// Phase 1 validation: runs [`params_validation::validate_params`], the one
+/// validator of every check that reads only `ContextParams`, with
+/// [`ParamsOrigin::Creation`] so the template check runs. It is a pure
+/// function with no side effects. `lifecycle_helpers::create_context` calls
+/// the same validator before it builds governance state; this call makes the
+/// rules hold for every in-crate caller of [`create_context`], test code
+/// included.
 ///
 /// # Errors
 ///
-/// Returns [`ContextCreationError::StateTransition`] wrapping
-/// [`ContextError::CeilingRequired`] with
-/// [`CeilingDeclaration::Empty`](scp_protocol::context::CeilingDeclaration::Empty)
-/// if the ceiling is empty (construction.md M2).
+/// The [`ContextCreationError`] that `From<ParamsRejection>` maps the first
+/// refusal to:
+/// - [`ContextCreationError::StateTransition`] wrapping
+///   [`ContextError::CeilingRequired`] with
+///   [`CeilingDeclaration::Empty`](scp_protocol::context::CeilingDeclaration::Empty)
+///   for an empty ceiling (construction.md M2), or wrapping
+///   [`ContextError::VersionIncompatible`] when the SDK does not satisfy
+///   `min_protocol_version`;
+/// - [`ContextCreationError::InvalidCeilingCategory`] for a ceiling entry
+///   that breaks the §5.3.1.1 grammar;
+/// - [`ContextCreationError::InvalidPseudonymRotationPolicy`] for a
+///   `pseudonym_rotation` that fails §9.10.4.1;
+/// - [`ContextCreationError::InvalidSybilPolicy`] for a `sybil_policy` that
+///   fails §9.3.1;
+/// - [`ContextCreationError::TemplateValidationFailed`] for a
+///   `projection_policy` on an encrypted context (§18.11.2.1) or params that
+///   differ from their template;
+/// - [`ContextCreationError::CreationFailed`] for the governance model,
+///   consequence rules, economic-policy metrics, genesis outlets, and the
+///   Broadcast memory scope (§5.11).
 ///
-/// Returns [`ContextCreationError::TemplateValidationFailed`] if a template
-/// is specified and the params do not match the template definition.
-///
-/// Returns [`ContextCreationError::InvalidPseudonymRotationPolicy`] if
-/// `pseudonym_rotation` fails the §9.10.4.1 validity criterion.
-///
-/// Returns [`ContextCreationError::InvalidSybilPolicy`] if `sybil_policy`
-/// fails the §9.3.1 validity rules, and
-/// [`ContextCreationError::TemplateValidationFailed`] if
-/// `projection_policy` is set on an encrypted context (§18.11.2.1).
+/// [`ParamsRejection`]: params_validation::ParamsRejection
 fn validate_params(params: &ContextParams) -> Result<(), ContextCreationError> {
-    // Governance model validation (SCP-267, ADR-031).
-    // GovernanceModel is a variant-only enum in ContextParams. Structural
-    // validation (e.g., threshold bounds, signer counts) happens in the
-    // ContextManager's create_context/create_context_with_governance methods
-    // where the rich GovernanceModelConfig is available. Here we validate
-    // only that the governance field is set (it always is — enforced by the
-    // type system, since GovernanceModel has no Option wrapper).
-    let _ = &params.governance; // field presence guaranteed by the type
-
-    // The ceiling must be non-empty (construction.md M2, Alec's ruling of
-    // 2026-09-30): an empty ceiling describes a context no member can use.
-    // `lifecycle_helpers::create_context` rejects it too, before it builds any
-    // governance state; this check makes the rule hold for every in-crate
-    // caller of `builder::create_context`, test code included.
-    if params.ceiling.is_empty() {
-        return Err(ContextCreationError::StateTransition(
-            scp_protocol::context::ContextError::CeilingRequired(
-                scp_protocol::context::CeilingDeclaration::Empty,
-            ),
-        ));
-    }
-
-    // §5.1/§5.12: outlets are declared at creation and the creator installs them
-    // into the live registry (GitHub #2020). The creator therefore writes
-    // `params.outlets` straight into the live authorization registry, so every
-    // check `registry::register_outlet` applies to a governance-registered
-    // outlet must apply here too: the `MAX_REGISTERED_OUTLETS` cap, the §5.4.2
-    // Query cost floor, both JSON Schemas, the §6.2/§9.2.1 specificity floor,
-    // the operator DID, and `outlet_id` uniqueness.
-    // `state::validate_genesis_outlets` runs all of them, and
-    // `governance_helpers::execute_register_outlet` calls the same protocol
-    // validator, so neither install path admits a registration the other
-    // refuses. A joiner receives its `params` from a peer rather than from this
-    // caller, so `Supervisor::spawn_actor_from_welcome`'s Precheck C calls the
-    // SAME validator on the creator-signed parameters (GitHub #2250).
-    crate::context::state::validate_genesis_outlets(&params.outlets)?;
-
-    // §9.10.4.1 validity criterion: creation rejects an invalid rotation
-    // policy. `lifecycle_helpers::create_context` checks it first; this check
-    // makes the rule hold for every in-crate caller of `create_context`.
-    if let Some(policy) = &params.pseudonym_rotation {
-        policy.validate()?;
-    }
-
-    // `validate_context_params` is the one validator of the cross-field and
-    // policy rules every params entry point applies: creation here, import and
-    // restore (`lifecycle_logic::validate_context_params_for_import`), the
-    // Welcome join (`Supervisor::spawn_actor_from_welcome` Precheck C), and the
-    // migration and child-context proposals (`governance_helpers`). Every
-    // create path reaches this Phase 1 call before any side effect, so
-    // `lifecycle_helpers::create_context` does not repeat it. A §9.3.1 sybil
-    // policy refusal keeps its typed `InvalidSybilPolicy` variant.
-    validate_context_params(params).map_err(|e| match e {
-        TemplateError::InvalidSybilPolicy(e) => ContextCreationError::InvalidSybilPolicy(e),
-        other => ContextCreationError::TemplateValidationFailed(other.to_string()),
-    })?;
-
-    // Validate memory scope is permitted for the context mode (§5.11).
-    // Broadcast contexts only support MemoryScope::Full — Ephemeral and
-    // Summary require MLS group state destruction which broadcast mode lacks.
-    scp_protocol::context::memory_scope::validate_memory_scope_for_broadcast(
-        params.mode,
-        params.memory_scope,
-    )
-    .map_err(|e: scp_protocol::context::ContextError| {
-        ContextCreationError::CreationFailed(e.to_string())
-    })?;
-
-    // If a template is specified, validate all params match the template
-    // definition exactly.
-    if params.template_id.is_some() {
-        validate_against_template(params)
-            .map_err(|e| ContextCreationError::TemplateValidationFailed(e.to_string()))?;
-    }
-
+    params_validation::validate_params(params, ParamsOrigin::Creation)?;
     Ok(())
 }
 
