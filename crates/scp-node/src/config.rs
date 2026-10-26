@@ -39,10 +39,10 @@ use scp_transport::relay::push_gate::{
 use scp_transport::relay::push_store::PushRegistrationStore;
 
 use crate::{
-    ApplicationNode, DEFAULT_PROJECTION_RATE_LIMIT, NatStrategy, NoOpCustody, NoOpDidMethod,
-    NoOpStorage, NodeError, TlsProvider, build_domain_inner, build_no_domain_inner,
-    domain_relay_url, generate_bridge_secret, generate_dev_token,
-    provision_with_challenge_listener, resolve_identity_persistent, resolve_nat, resolve_tls,
+    ApplicationNode, DEFAULT_PROJECTION_RATE_LIMIT, NatStrategy, NodeError, TlsProvider,
+    build_domain_inner, build_no_domain_inner, domain_relay_url, generate_bridge_secret,
+    generate_dev_token, provision_with_challenge_listener, resolve_identity_persistent,
+    resolve_nat, resolve_tls,
 };
 
 // ---------------------------------------------------------------------------
@@ -502,13 +502,35 @@ pub(crate) async fn resolve_own_addresses_for_start(
 /// }).await?;
 /// ```
 ///
-/// The `<K, D, S>` generics survive from the former builder, carried
-/// by the config and its selectors; the `Dom`/`Id` phantom-state markers are gone.
-pub struct NodeConfig<
-    K: KeyCustody = NoOpCustody,
-    D: DidMethod = NoOpDidMethod,
-    S: Storage = NoOpStorage,
-> {
+/// ## Type parameters
+///
+/// `K` (key custody), `D` (DID method) and `S` (storage) have no default
+/// (§17.17 SCP-CAPSEL-8000, construction.md M4): a default type argument
+/// would select a backend the caller never named. The compiler infers all
+/// three from [`NodeConfig::defaults`] or from a struct literal, and a type
+/// position names all three. Naming `NodeConfig` with no arguments does not
+/// compile:
+///
+/// ```compile_fail,E0107
+/// // E0107: missing generics for struct `NodeConfig`.
+/// fn omitted(_config: scp_node::NodeConfig) {}
+/// ```
+///
+/// The same position naming all three compiles. This positive control pins
+/// the failure above to the missing arguments, since a bare `compile_fail`
+/// passes for any error:
+///
+/// ```
+/// use scp_identity::DidMethod;
+/// use scp_platform::traits::{KeyCustody, Storage};
+///
+/// fn named<K: KeyCustody, D: DidMethod, S: Storage>(_c: scp_node::NodeConfig<K, D, S>) {}
+/// ```
+///
+/// `cargo nextest` does not run doctests, so
+/// `crates/scp-node/tests/encrypted_storage_seal.rs` repeats the positive
+/// control.
+pub struct NodeConfig<K: KeyCustody, D: DidMethod, S: Storage> {
     // --- Required (irreducible; no whole-struct Default — M4) ---
     /// How the node is reached from the outside (addressing XOR).
     pub reach: Reach,
