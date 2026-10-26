@@ -2517,6 +2517,7 @@ dependencies = [
  "scp-crypto",
  "scp-dht",
  "scp-did",
+ "scp-kel",
  "scp-platform",
  "scp-protocol",
  "scp-relay-client",
