@@ -6,6 +6,8 @@
 //! - [`verify_ed25519_signature`]: strict Ed25519 verification (cofactorless,
 //!   rejects small-order points).
 //! - [`p256`]: the P-256 primitives (§9.5).
+//! - [`p384`]: P-384 verification of Apple's App Attest issuer signatures
+//!   (§9.3.1).
 //! - [`pseudonym`]: the software-custody pseudonym derivation (§9.10.4).
 //! - [`custody`]: the typed [`CustodyFailure`] a failed custody call carries.
 //! - [`signer`]: the curve-neutral [`ScpSigner`] trait and its object-safe
@@ -15,6 +17,7 @@
 
 pub mod custody;
 pub mod p256;
+pub mod p384;
 pub mod pseudonym;
 pub mod signer;
 pub mod webpush;

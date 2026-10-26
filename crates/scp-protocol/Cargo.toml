@@ -41,6 +41,10 @@ unicode-normalization = { workspace = true }
 jsonschema = { version = "0.28", default-features = false }
 regex-syntax = "0.8"
 metrics = { workspace = true }
+# Strict DER parsing of the App Attest certificates' `tbsCertificate`
+# (09-security-model.md §9.3.1 check 3). No default features: the reader needs
+# neither alloc-backed types nor OID helpers, and compares OID bytes directly.
+der = { version = "0.8", default-features = false }
 
 [features]
 default = []

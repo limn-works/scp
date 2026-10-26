@@ -1,7 +1,7 @@
 [package]
 name = "scp-crypto"
 version = "0.1.0-beta.2"
-description = "Low-level cryptographic anchor (Ed25519 verification, P-256 primitives) for SCP (Shared Context Protocol)"
+description = "Low-level cryptographic anchor (Ed25519 verification, P-256 primitives, P-384 verification) for SCP (Shared Context Protocol)"
 edition.workspace = true
 repository.workspace = true
 license.workspace = true
@@ -12,7 +12,8 @@ categories = ["cryptography"]
 
 [features]
 # Test support only: `p256::sign_prehash_rfc6979_unnormalized`, the raw RFC 6979
-# signature before low-s normalisation, for tests that pin a high-s input.
+# signature before low-s normalisation, for tests that pin a high-s input, and
+# `p384::{P384SecretKey, sign_prehash_der}`, which issue test certificate chains.
 # Enabled only from dev-dependencies, so no shipped build resolves it.
 testing = []
 
@@ -31,6 +32,9 @@ zeroize = { workspace = true }
 # P-256 primitives (§9.5, §9.10.4): signing, strict/lenient verification, ECDH,
 # SEC1 point validation, and the FIPS 186-5 A.2.1 seed-to-scalar step.
 p256 = { workspace = true }
+# P-384 verification (§9.3.1 App Attest check 3): the App Attestation Root CA
+# and its intermediate hold P-384 keys. SCP signs nothing with P-384.
+p384 = { workspace = true }
 # The RNG trait `P256SecretKey::random` takes. p256 0.14 re-exports rand_core 0.10,
 # which `rand` 0.8 (`rand::rngs::OsRng`, the workspace RNG) does not implement, so
 # the key draw names the 0.6 trait directly. The `getrandom` feature gives

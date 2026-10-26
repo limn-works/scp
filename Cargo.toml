@@ -142,6 +142,11 @@ hkdf = "0.12"
 # wasm32 graph through rand_core 0.6's `getrandom` feature, which rand 0.8 and
 # aes-gcm 0.10 (via crypto-common 0.1) enable, so it needs the `js` backend there.
 p256 = { version = "0.14", default-features = false, features = ["ecdsa", "ecdh", "arithmetic", "alloc"] }
+# P-384 verification of Apple's App Attest issuer signatures (§9.3.1 check 3),
+# confined to scp-crypto by deny.toml. The same 0.14 generation as p256, already
+# in the graph through hpke-rs-rust-crypto and openmls. `ecdsa` enables the
+# curve arithmetic and ECDSA verification.
+p384 = { version = "0.14", default-features = false, features = ["ecdsa"] }
 uuid = { version = "1", features = ["v4", "v7"] }
 # No `libcrux-provider`. That feature does one thing — add the optional dependency
 # `openmls_libcrux_crypto` (openmls 0.9.0 Cargo.toml: `libcrux-provider =
