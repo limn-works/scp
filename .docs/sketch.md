@@ -1894,7 +1894,7 @@ Spending UCANs are AND-composed with action UCANs. Agent needs both `messagesWri
 
 ### Configure Payment Adapter (§19.2.4, §19.11)
 
-`IdentityConfig` carries three slots and no payment slot (`.docs/standards/construction.md`). An identity's payment adapters are registered through `configureAdapter` (`19-economic-governance.md` §19.11).
+`IdentityConfig` carries no payment slot (`.docs/standards/construction.md`). An identity's payment adapters are registered through `configureAdapter` (`19-economic-governance.md` §19.11).
 
 ### Context Creation with Economic Policy (§19.3, §19.11)
 
