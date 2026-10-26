@@ -716,7 +716,7 @@ The resolution protocol runs seven steps.
 
 **Two relays serving heads of one chain at one sequence** are compared event by event over each event's preimage digest, never over the chain bytes and never over the framing. Where every position's digests agree the two records are one chain, whether or not their bytes match, because §9.5 admits a hardware signer and a platform signer that each draw their own nonce, and two encodings of one event are then ordinary. Where the digests differ at any position the two heads are divergent events at one sequence, and step 4 settles them. KERI identifies an event by its digest in the same way, under `spec-body` §SAID fields.
 
-**Where every relay fails**, a cached key state under seven days old is returned as a `Confirmed` verdict carrying the cached head, with `HeadProvenance` unchanged and no relays reached; otherwise resolution fails with `IdentityError::NoRelayReachable` (§3.10.10). `Confirmed` is the verdict because the cached head is a head the party already adopted and re-adopts, which is what that verdict means everywhere else in `09-security-model.md` §9.7.4.2 R14. **The resolver MUST NOT fabricate a key state.** A relay that does not answer within the per-relay timeout is a failure for that attempt, and the resolver falls through to the others rather than retrying it synchronously.
+**Where every relay fails**, a cached key state under seven days old is returned as a `Confirmed` verdict carrying the cached head, with `HeadProvenance` unchanged and no relays reached; otherwise resolution fails. `IdentityError` carries no variant for that failure, and §3.10.10 reserves `SCP-IDENT-1105` for it. `Confirmed` is the verdict because the cached head is a head the party already adopted and re-adopts, which is what that verdict means everywhere else in `09-security-model.md` §9.7.4.2 R14. **The resolver MUST NOT fabricate a key state.** A relay that does not answer within the per-relay timeout is a failure for that attempt, and the resolver falls through to the others rather than retrying it synchronously.
 
 ### 3.10.5 Publishing Protocol
 
@@ -773,11 +773,14 @@ impl<S: Storage> Identity<S> {
 }
 ```
 
-**The write API is one method per consequential act on the identity handle, and every event that needs a root threshold goes through one collection flow**: `create`'s inception, `rotate_active` and `set_witnesses`, and the rollover, recovery and abandonment `Recovery::begin` composes. **Under `SignerPlan::ThisSdk` the composing method signs every group with the members this SDK's custody holds, publishes, and returns `EventOutcome::Published` in one call**, refusing with `IdentityError::SignatureSetIncomplete` where those members fall short of a group's threshold. **Under `SignerPlan::Groups` it returns `EventOutcome::AwaitingSignatures`** carrying the unsigned `PendingEvent`, whose preimage binds the signer index list and form list the plan names for each group the kind carries; a group the kind does not carry is empty, and an inception's one group is `installed_root`. **Each holder of a named member, the composer included, calls `Identity::cosign`**, which runs the display confirmation `09-security-model.md` §9.7.4.2 R10's device-boundary paragraph states and returns the `IndexedSignature` of the one member its custody holds, after it refuses a `PendingEvent` whose `chain` ends at a head other than the one this device holds, and refuses with `IdentityError::SignaturePending` an event at a sequence where this device's `PendingSignatureRecord` names a different event (`09-security-model.md` §9.7.4.2 R10). **`Identity::abandon_pending` is local**: the device's own user discards that device's own `PendingSignatureRecord` for the `PendingEvent` and, on the composing device, its `KeptComposition`, after which that device's `attach` refuses the composition with `IdentityError::NoPendingSignature`; no other device's state changes, and the call refuses with `IdentityError::NoPendingSignature` where the device holds neither (R10). **`cosign` and `attach` each compute the event digest as SHA-256 of `PendingEvent::preimage` and refuse a `PendingEvent` whose `event_digest` differs with `IdentityError::PendingDigestMismatch`.** **`attach` verifies each signature against its group and index, refuses with `IdentityError::SignatureSetIncomplete` where a group falls short of the plan, publishes the signed event, and returns the cycle's `PublishOutcome`**; for a reveal-authorized event it runs R10's ceremony from the `Signed` write through the removal. The application carries a `PendingEvent` and each `IndexedSignature` between the holders' devices, and the protocol defines no transport for them. `Identity::create` composes the inception event and returns the handle beside the flow's outcome. `rotate_active` composes a `KeyState` that installs a fresh `#active` key, and its `RotationReason` decides the replaced key's condition: `Routine` drops it as `Superseded`, and `Compromised` drops it as `Compromised{from: N}`, where N is the rotating event's own sequence. `set_witnesses` composes a `KeyState` that names the witness set and its witnessing interval. Every composing method refuses a threshold that breaks `09-security-model.md` §9.7.4.1's quorum-overlap rule. `Recovery::begin` (R10) composes the reveal-authorized events, and a compromised root member leaves the root set under a `RootRecovery`, because a `KeyState` drops no root member (R3).
+**The write API is one method per consequential act on the identity handle, and every event that needs a root threshold goes through one collection flow**: `create`'s inception, `rotate_active` and `set_witnesses`, and the rollover, recovery and abandonment `Recovery::begin` composes. **Under `SignerPlan::ThisSdk` the composing method signs every group with the members this SDK's custody holds, publishes, and returns `EventOutcome::Published` in one call**, refusing with `IdentityError::SignatureSetIncomplete` where those members fall short of a group's threshold. **Under `SignerPlan::Groups` it returns `EventOutcome::AwaitingSignatures`** carrying the unsigned `PendingEvent`, whose preimage binds the signer index list and form list the plan names for each group the kind carries; a group the kind does not carry is empty, and an inception's one group is `installed_root`. **Each holder of a named member, the composer included, calls `Identity::cosign`**, which runs the display confirmation `09-security-model.md` §9.7.4.2 R10's device-boundary paragraph states and returns the `IndexedSignature` of the one member its custody holds, after it refuses a `PendingEvent` whose `chain` ends at a head other than the one this device holds, and refuses with `IdentityError::SignaturePending` an event at a sequence where this device's `PendingSignatureRecord` names a different event (`09-security-model.md` §9.7.4.2 R10). **`Identity::abandon_pending` is local**: the device's own user discards that device's own `PendingSignatureRecord` for the `PendingEvent` and, on the composing device, its `KeptComposition`, after which that device's `attach` refuses the composition with `IdentityError::NoPendingSignature`; no other device's state changes, and the call refuses with `IdentityError::NoPendingSignature` where the device holds neither (R10). **On the composing device of an inception, `abandon_pending` destroys the keys that composition minted, the next-set member, the root member `#0` and `#active`, before it writes the device record without the `KeptComposition`** (`17-persistence-and-storage.md` §17.3), because an inception that is never published installs those keys on no chain. Destroying them is safe only while no signature over that event has been released: a released signature can complete the event, publishing it fixes the commitment list, and `09-security-model.md` §9.7.4.1 item 8 then requires every standing next-set key to be retained. **`cosign` and `abandon_pending` each take the `IdentityConfig` the device's handle is built from**, because the member's custody, the next-set custody and the store holding the device record are all on it, and each works after a restart that left no handle. **`cosign` and `attach` each compute the event digest as SHA-256 of `PendingEvent::preimage` and refuse a `PendingEvent` whose `event_digest` differs with `IdentityError::PendingDigestMismatch`.** **`attach` verifies each signature against its group and index, refuses with `IdentityError::SignatureSetIncomplete` where a group falls short of the plan, publishes the signed event, and returns the cycle's `PublishOutcome`**; for a reveal-authorized event it runs R10's ceremony from the `Signed` write through the removal. The application carries a `PendingEvent` and each `IndexedSignature` between the holders' devices, and the protocol defines no transport for them. `Identity::create` composes the inception event, writes its `KeptComposition` into the device record before it returns (`09-security-model.md` §9.7.4.2 R10), and returns the handle beside the flow's outcome. `rotate_active` composes a `KeyState` that installs a fresh `#active` key, and its `RotationReason` decides the replaced key's condition: `Routine` drops it as `Superseded`, and `Compromised` drops it as `Compromised{from: N}`, where N is the rotating event's own sequence. `set_witnesses` composes a `KeyState` that names the witness set and its witnessing interval. Every composing method refuses a threshold that breaks `09-security-model.md` §9.7.4.1's quorum-overlap rule. `Recovery::begin` (R10) composes the reveal-authorized events, and a compromised root member leaves the root set under a `RootRecovery`, because a `KeyState` drops no root member (R3).
 
 ```rust
-impl<S: EncryptedStorage> Identity<S> {
-    /// Composes the inception event under the collection flow above.
+impl<S: EncryptedStorage + Clone> Identity<S> {
+    /// Composes the inception event under the collection flow above, and
+    /// writes its `KeptComposition` into this device's record
+    /// (`17-persistence-and-storage.md` §17.3) before it returns
+    /// (`09-security-model.md` §9.7.4.2 R10).
     pub fn create(config: IdentityConfig<S>, signers: SignerPlan)
         -> impl Future<Output = Result<(Identity<S>, EventOutcome), IdentityError>> + Send;
 
@@ -795,9 +798,10 @@ impl<S: EncryptedStorage> Identity<S> {
     ) -> impl Future<Output = Result<EventOutcome, IdentityError>> + Send;
 
     /// Called by any holder of a named member, with that holder's own
-    /// custody, whether or not it holds this identity's handle.
-    pub fn cosign(custody: &KeyCustodySlot, pending: &PendingEvent)
-        -> Result<IndexedSignature, IdentityError>;
+    /// config, whether or not it holds this identity's handle. The config's
+    /// store holds the device's `PendingSignatureRecord`.
+    pub fn cosign(config: &IdentityConfig<S>, pending: &PendingEvent)
+        -> impl Future<Output = Result<IndexedSignature, IdentityError>> + Send;
 
     pub fn attach(&self, pending: PendingEvent, signatures: Vec<IndexedSignature>)
         -> impl Future<Output = Result<PublishOutcome, IdentityError>> + Send;
@@ -806,9 +810,28 @@ impl<S: EncryptedStorage> Identity<S> {
     /// this device's `PendingSignatureRecord` naming `pending.event_digest`
     /// and, on the composing device, discards the composition, so this device
     /// neither attaches nor publishes it; no other device's state changes
-    /// (`09-security-model.md` §9.7.4.2 R10).
-    pub fn abandon_pending(custody: &KeyCustodySlot, pending: &PendingEvent)
-        -> Result<(), IdentityError>;
+    /// (`09-security-model.md` §9.7.4.2 R10). For an inception composition
+    /// it first destroys the keys that composition minted.
+    pub fn abandon_pending(config: &IdentityConfig<S>, pending: &PendingEvent)
+        -> impl Future<Output = Result<(), IdentityError>> + Send;
+}
+
+/// What `create`, `cosign` and `abandon_pending` take. Every field is
+/// required, and none has a default (`.docs/standards/construction.md`).
+#[derive(Clone)]
+pub struct IdentityConfig<S: EncryptedStorage + Clone> {
+    /// Holds the root members and `#active`.
+    pub custody: KeyCustodySlot,
+    /// Holds each next-set member, apart from `custody`
+    /// (`09-security-model.md` §9.7.4.1 item 3).
+    pub next_set_custody: NextSetCustodySlot,
+    /// The device's encrypted store, which holds its device record
+    /// (`17-persistence-and-storage.md` §17.3). Required, because `create`
+    /// persists the `KeptComposition` before it returns (R10).
+    pub persistence: S,
+    /// The `CustodyProfile` `09-security-model.md` §9.7.4.1 states, against
+    /// which `create` checks the next-set custody's method.
+    pub profile: CustodyProfile,
 }
 
 /// The members that sign one group, each by root-set or next-set index and
@@ -921,8 +944,8 @@ pub trait IdentityBackend: Send + Sync {
 }
 
 /// The error half of this trait's six methods and of the three recovery entry
-/// points `09-security-model.md` §9.7.4.2 R10 declares. The type carries twenty-one
-/// variants and no others. A refusal the protocol mandates carries one of these
+/// points `09-security-model.md` §9.7.4.2 R10 declares. The type carries twenty
+/// variants and no others, and `SCP-IDENT-1105` is reserved and names none. A refusal the protocol mandates carries one of these
 /// variants, so four bindings mint one code rather than four and a caller tells
 /// a custody choice from a network condition. **The identity half's one refusal reaches a caller through
 /// `EntryResult::Refused` alone**, because a refusal is what one entry answered
@@ -956,11 +979,10 @@ pub enum IdentityError {
     /// event reveals (`09-security-model.md` §9.7.4.2 R10).
     RevealAlreadyPending,
     /// SCP-IDENT-1104. The verifier could not persist a contested verdict, its
-    /// retained suffixes, or the accepted-head baseline (§9.7.4.2 R14).
+    /// retained suffixes, or the accepted-head baseline (§9.7.4.2 R14), or a
+    /// device could not read or write its device record
+    /// (`17-persistence-and-storage.md` §17.3).
     PersistFailed,
-    /// SCP-IDENT-1105. Every relay failed and no cached key state is fresh
-    /// enough to return (§3.10.4).
-    NoRelayReachable,
     /// SCP-IDENT-1106. A string reached an admission gate that is not the
     /// canonical form of an inception-derived identifier (§3.1).
     NonCanonicalIdentifier,
@@ -984,7 +1006,9 @@ pub enum IdentityError {
     /// signed event in any store it reaches (`09-security-model.md` §9.7.4.2 R10).
     RecoveryPreimageMissing,
     /// SCP-IDENT-1111. The custody backend returned an error while the SDK
-    /// signed a key event (`09-security-model.md` §9.7.4.2 R10).
+    /// generated, signed with or destroyed a key-event key, or a next-set
+    /// custody's probe signature did not verify (`09-security-model.md`
+    /// §9.7.4.1 item 5, §9.7.4.2 R10).
     CustodySigningFailed,
     /// SCP-IDENT-1112. `Identity::attach` received signatures that fall short
     /// of a group the event's `SignerPlan` names (§3.10.10).
