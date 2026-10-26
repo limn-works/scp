@@ -2579,6 +2579,7 @@ dependencies = [
  "rand 0.8.8",
  "rmp-serde",
  "scp-crypto",
+ "scp-did",
  "scp-kel",
  "serde",
  "sha2 0.10.9",
