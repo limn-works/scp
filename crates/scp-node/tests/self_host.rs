@@ -129,7 +129,7 @@ impl BuiltNode {
     /// client and `DidCache` (ADR-053 / spec §10.17, SHB-002) — the same shape
     /// the production `host_site` path uses, never the `|_, _| None` stub.
     fn key_resolver(&self) -> scp_core::context::governance::KeyResolver {
-        let resolver = Arc::new(scp_identity::DualLayerResolver::new(
+        let resolver = Arc::new(scp_identity::DualLayerResolver::without_healing(
             Arc::new(scp_identity::resolver::NoOpRelayQuerier),
             Arc::clone(&self.dht_client),
             Arc::clone(&self.cache),
@@ -963,7 +963,7 @@ async fn self_host_shares_single_root_storage_handle_and_serves() {
     // -- The REAL document-derived governance resolver over the node's shared
     //    DHT client + cache (ADR-053 / spec §10.17, SHB-002). --
     let key_resolver = {
-        let resolver = Arc::new(scp_identity::DualLayerResolver::new(
+        let resolver = Arc::new(scp_identity::DualLayerResolver::without_healing(
             Arc::new(scp_identity::resolver::NoOpRelayQuerier),
             Arc::clone(&dht_client),
             Arc::clone(&cache),

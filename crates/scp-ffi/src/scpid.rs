@@ -455,7 +455,7 @@ mod tests {
         // function uses via the BridgeInstance DID resolver. This validates that the
         // `scp_identity::resolver::DidResolver` impl on
         // `IdentityBackedDidResolver` works end-to-end.
-        let dual = DualLayerResolver::new(
+        let dual = DualLayerResolver::without_healing(
             Arc::new(NoOpRelayQuerier),
             dht_client,
             Arc::new(DidCache::new()),

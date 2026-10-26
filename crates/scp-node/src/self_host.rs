@@ -1733,7 +1733,7 @@ fn build_shared_cache_key_resolver<D: scp_dht::DhtClient + 'static>(
     handle: tokio::runtime::Handle,
 ) -> scp_core::context::governance::KeyResolver {
     let relay = Arc::new(scp_identity::resolver::NoOpRelayQuerier);
-    let resolver = Arc::new(scp_identity::DualLayerResolver::new(
+    let resolver = Arc::new(scp_identity::DualLayerResolver::without_healing(
         relay,
         dht_client,
         cache,
@@ -3748,7 +3748,7 @@ mod tests {
 
         // Build the co-located participant resolver over the SHARED cache + DHT,
         // exactly as the production `host_site` path wires it.
-        let resolver = Arc::new(scp_identity::DualLayerResolver::new(
+        let resolver = Arc::new(scp_identity::DualLayerResolver::without_healing(
             Arc::new(scp_identity::resolver::NoOpRelayQuerier),
             Arc::clone(&dht),
             Arc::clone(&cache),
@@ -3817,7 +3817,7 @@ mod tests {
         // Build the co-located participant resolver over the SHARED cache + DHT,
         // exactly as the production `host_site` path wires it. `Handle::current()`
         // here is the bare-`#[tokio::test]` CURRENT-THREAD runtime handle.
-        let resolver = Arc::new(scp_identity::DualLayerResolver::new(
+        let resolver = Arc::new(scp_identity::DualLayerResolver::without_healing(
             Arc::new(scp_identity::resolver::NoOpRelayQuerier),
             Arc::clone(&dht),
             Arc::clone(&cache),

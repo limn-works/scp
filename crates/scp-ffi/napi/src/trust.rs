@@ -1037,7 +1037,7 @@ mod tests {
         /// Installs a resolver over a caller-retained in-memory DHT on `bi`.
         fn install_resolver(bi: &NapiBridgeInstance) -> Arc<scp_dht::InMemoryDhtClient> {
             let dht_client = Arc::new(scp_dht::InMemoryDhtClient::new());
-            let resolver = Arc::new(scp_identity::DualLayerResolver::new(
+            let resolver = Arc::new(scp_identity::DualLayerResolver::without_healing(
                 Arc::new(scp_identity::NoOpRelayQuerier),
                 Arc::clone(&dht_client),
                 Arc::new(scp_identity::DidCache::new()),
