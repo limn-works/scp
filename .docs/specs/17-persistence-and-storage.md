@@ -131,7 +131,6 @@ wrapping_key/{did}
 
 custody/record/{namespace}/{key_id}
 
-recovery/{sha256_hex(credential_id)}/record
 recovery/{sha256_hex(credential_id)}/entry
 recovery/{sha256_hex(credential_id)}/event/{event_digest_hex}
 
@@ -153,6 +152,8 @@ mls/{context_id}/...
 **Push relay ledger.** Each `push_relay/{sha256_hex(relay_url)}/{sha256_hex(token)}` key holds a `StoredValue<PushRelayRecord>` (canonical relay URL, push platform, device token): a relay that may hold a push registration of that token (§10.7.1). The push registrar writes the record before its first publish to the relay and deletes it only when the relay accepts a `PushDeregistration` of the token or answers `4061` or `4063`, so a registration whose OK was lost, or a restart, still leaves a record, and the registrar deregisters every recorded relay that hosts no context of this device. Both key components are SHA-256 hex, so neither the URL nor the token appears in a key. A record that does not decode fails the whole ledger load, because skipping it would leave its relay never deregistered. The token is a secret, so the serialized buffer is zeroized after the write.
 
 **Custody records.** Each `custody/record/{namespace}/{key_id}` key holds the type and role a callback custody adapter minted one host key with (ADR-021, amended 2026-10-10; SCP-345). The records live in the instance storage the operator selected (section 17.6). `{namespace}` is a 16-byte value drawn from the operating system's random source when the identity is created, written as 32 lowercase hex characters, so two identities whose hosts reuse a key id never read, overwrite or delete each other's records. The identity's callback custody entry stores the namespace, and every later adapter for that identity reuses it. `{key_id}` is the host key id in decimal. The value is three bytes: the version `0x01`, the key type code (`0` Ed25519, `2` P-256 signing, `3` HPKE P-256, `4` P-256 key event, the codes `SqliteKeyCustody` also stores), and the role byte (`0x00` operational, `0x01` identity). A reader refuses a value with an unknown version, type code or role byte, or of any length but 3, and never substitutes a default. A put that finds a different record under the key is refused, and a put of the identical record succeeds without a write. A host never reuses a key id within one namespace, so a refused put over a stale record means the host broke its contract, and the adapter reports the refusal instead of overwriting the record. A host key with no record, left when the process stops between the host's generate and the put, is unusable: no SCP operation reads, signs with or destroys it, and the host alone removes it.
+
+**Recovery store-set keys.** Each `recovery/{sha256_hex(credential_id)}/…` key holds one value of the store set `09-security-model.md` §9.7.4.2 R10 keys on the pre-rotation credential: `entry` the §17.8 entry record, and `event/{event_digest_hex}` a signed event under its preimage digest written as 64 lowercase hex characters. `{sha256_hex(credential_id)}` is SHA-256 of the credential identifier's bytes, as 64 lowercase hex characters, so an identifier of up to 1,023 bytes yields a fixed-length component that passes `sanitize_key_component`. The platform-account member holds these two keys and, where it exists, `recovery/{sha256_hex(credential_id)}/record`, the §17.8 store-set record.
 
 **Callback custody identity entry.** The `identity/{did}/callback_custody` key holds a `StoredValue` (section 17.5) of the identity created with a host custody provider (spec 03 §3.2.2 `os_keystore`): its custody namespace (16 bytes), its key handles and pre-rotation commitment, and its DID document (SCP-345 decision D1). Creating such an identity writes the entry after the DID exists and before the create returns. A failed write fails the create, and the create destroys every key it minted, on the host and in the custody records, before it reports the failure; a key it fails to destroy is named in the error. Every operation that changes the identity's key handles or document (rotation of the active or agent key, an agent key's addition or removal, a device attestation, a migration) rewrites the entry with the changed handles and document before it returns, and a failed rewrite fails the operation; a migration writes the entry under the new DID and removes the entry under the retired one. Loading the identity reads the entry and rebuilds the adapter over the stored namespace, never a new one, so the records of keys minted in an earlier process stay reachable. The load takes the host custody provider as a required argument and checks that the provider's identity key derives the stored DID; a load of the identity without a provider is refused. A load is refused while another live adapter of the same instance holds the namespace, because two adapters would each check and write the records under their own lock. An entry that does not decode, or whose DID differs from the requested DID, fails the load and is never replaced by a default. Creating or loading such an identity is refused on storage that does not persist (the `in_memory` selection, section 17.6), because the entry and the custody records would end with the instance while the host keys remain.
 
@@ -770,7 +771,7 @@ Key custody is the `KeyCustody` trait ADR-006 defines, named here for completene
 **Which hosts carry the platform-account member**, as `09-security-model.md` §9.7.4.2 R10 states it:
 
 <!-- scp:include id="platform-account-member" from=".docs/specs/09-security-model.md" -->
-**The platform-account member, per host.** The platform-account member exists only where the host gives the SDK a data API that writes into the store through which the platform account syncs the pre-rotation credential. Where the member does not exist, the SDK records one of two absence reasons: `NoDataApiToCredentialSyncStore`, where the credential syncs through a store that no data API of the host reaches, and `NoPlatformCredential`, where the host holds no platform credential.
+**The platform-account member, per host.** The platform-account member exists only where the host gives the SDK a data API that writes into the store through which the platform account syncs the pre-rotation credential. Where the member does not exist, the SDK reports one of two absence reasons: `NoDataApiToCredentialSyncStore`, where the credential syncs through a store that no data API of the host reaches, and `NoPlatformCredential`, where the host holds no platform credential.
 
 | Host | Platform-account member | Basis |
 |---|---|---|
@@ -782,37 +783,39 @@ Key custody is the `KeyCustody` trait ADR-006 defines, named here for completene
 **The Apple member's capacity is proved by test, not by vendor documentation.** Apple's `kSecValueData` page (https://developer.apple.com/documentation/security/ksecvaluedata) and its `kSecAttrSynchronizable` page state no size limit for a Keychain item, so the claim that the member holds a signed event rests on two checks. A Swift SDK test writes a synchronizable item of 65,675 bytes, one byte more than `MAX_EVENT_BYTES`, `RECOVERY_HANDLE_BYTES` and `LAST_REVEAL_MARKER_BYTES` together (`09-security-model.md` §9.18.17), reads the item back, compares it byte for byte, and runs on iOS and on macOS in CI. CI cannot sign into iCloud, so a release-checklist step writes an item of that size on one device, reads it on a second device signed into the same iCloud account, and compares the bytes there.
 <!-- scp:end id="platform-account-member" -->
 
-**The store-set record.** `StoreSetRecord` carries three fields:
+**The store-set record.** `StoreSetRecord` carries two fields:
 
 - `credential_id`: the pre-rotation credential's WebAuthn credential identifier, on which the record is keyed;
-- `platform_account`: a `PlatformAccountMember`, which is `Present`, or `Absent` carrying a `PlatformAccountAbsence` of `NoDataApiToCredentialSyncStore` or `NoPlatformCredential`;
-- `large_blob`: a `LargeBlobMembership`, which records whether a `largeBlob` write landed at the credential's designation, and so whether the credential's `largeBlob` store is a member.
+- `large_blob`: a `LargeBlobMembership`, which records whether the credential's `largeBlob` store is a member.
 
-The SDK writes the record at credential creation into this section's local store and, where the platform-account member is present, into that member. `09-security-model.md` §9.7.4.2 R10 states when each field may change and what an SDK that does not reach a recorded member does.
+Where the platform-account member exists (`09-security-model.md` §9.7.4.2 R10), the SDK writes the record once, at credential creation, into that member under `recovery/{sha256_hex(credential_id)}/record`, and no other store holds it. Where that member holds a record naming the same credential, creation writes nothing; where it holds a different record, creation is refused. Where the member does not exist, no record is written. `09-security-model.md` §9.7.4.2 R10 states when the `large_blob` field changes and what an SDK that does not reach a member does.
 
 The record is encoded as follows:
 
 ```
-version           u8          0x01
-platform_account  u8          0x00 Present; 0x01 Absent(NoDataApiToCredentialSyncStore); 0x02 Absent(NoPlatformCredential)
-large_blob        u8          0x00 the largeBlob store is not a member; 0x01 it is a member
-id_len            u16         big-endian length of credential_id, 1 to 1,023 (WebAuthn's bound on a credential identifier)
-credential_id     [u8; id_len]
+version        u8            0x01
+large_blob     u8            0x00 not a member; 0x01 a member
+id_len         u16           big-endian length of credential_id, 1 to 1,023 (WebAuthn's bound on a credential identifier)
+credential_id  [u8; id_len]
 ```
 
-A decoder refuses an unknown version, platform-account byte or `largeBlob` byte, an `id_len` of 0 or above 1,023, and a record whose length is not `5 + id_len`. Where the local store holds no record and the platform-account member holds one, the SDK copies that record into the local store unchanged, and from then on the local copy is the one it reads. A record whose `credential_id` differs from the credential it was read under is refused.
+A decoder refuses an unknown version or `large_blob` byte, an `id_len` of 0 or above 1,023, and any length other than `4 + id_len`. A record whose `credential_id` differs from the credential it was read under is refused.
 
-**Where the SDK's local store keeps the set's values.** Three §17.3 keys hold them, each under `recovery/{sha256_hex(credential_id)}/`, so a credential identifier of up to 1,023 bytes yields a fixed-length key component: `record` holds the encoded `StoreSetRecord`; `entry` holds the `largeBlob` record layout below, which is also the layout of the entry every other member holds; and `event/{event_digest_hex}` holds a signed event of 1 to `MAX_EVENT_BYTES` bytes, keyed on its preimage digest as lowercase hex. A stored event outside that range is bytes the SDK cannot decode.
-
-**The `largeBlob` record.** A `largeBlob` member holds one record of at most 139 bytes:
+**The entry record.** Every member holds one entry, in this layout, of at most 139 bytes:
 
 ```
-flags   u8         bit 0 set: a RecoveryHandle follows; bit 1 set: a LastRevealMarker follows; bits 2 to 7 zero
-handle  [u8; 66]   present only when bit 0 is set (RECOVERY_HANDLE_BYTES)
-marker  [u8; 72]   present only when bit 1 is set (LAST_REVEAL_MARKER_BYTES)
+flags   u8         bit 0: a RecoveryHandle follows; bit 1: a LastRevealMarker follows;
+                   bit 2: set only in the SDK's own store, the handle's composition did not land in the largeBlob store;
+                   bits 3 to 7 zero
+handle  [u8; 66]   only when bit 0 is set (RECOVERY_HANDLE_BYTES): discriminant ‖ identifier[32] ‖ phase ‖ event_digest[32]
+marker  [u8; 72]   only when bit 1 is set (LAST_REVEAL_MARKER_BYTES): identifier[32] ‖ sequence u64 big-endian ‖ event_digest[32]
 ```
 
-A decoder refuses a record with any of bits 2 to 7 set, and a record whose length differs from the length its flags name, which is 1, 67, 73 or 139 bytes. A record of the one byte `0x00` holds neither value and reads as an empty member. In the handle, the discriminant byte is `0x00` for `FixesCommitment` and `0x01` for `Abandons`, and the phase byte is `0x00` to `0x05` for `Composed`, `Signed`, `PublishSent`, `Confirmed`, `Discarded` and `Lost` in that order; a decoder refuses any other discriminant or phase byte. A record the decoder refuses is bytes the SDK cannot decode, which `09-security-model.md` §9.7.4.2 R10 counts as a member the SDK did not reach.
+The handle's discriminant is `0x00` for `FixesCommitment` and `0x01` for `Abandons`, and its phase byte is `0x00` to `0x05` for `Composed`, `Signed`, `PublishSent`, `Confirmed`, `Discarded` and `Lost` in that order. A decoder refuses any of bits 3 to 7, bit 2 without bit 0, bit 2 in an entry read from any member other than the SDK's own store, a length other than the 1, 67, 73 or 139 bytes bits 0 and 1 name, and any other discriminant or phase byte. The one-byte entry `0x00` holds neither value; it is what a removal writes where no marker exists, and it reads as an empty member, as an absent value does. An entry the decoder refuses, or whose handle or marker names another identity, is bytes the SDK cannot decode, which `09-security-model.md` §9.7.4.2 R10 counts as a member the SDK did not reach.
+
+**What the local store holds.** The SDK's local store holds the entry, and each signed event of 1 to `MAX_EVENT_BYTES` bytes, under the §17.3 keys; a stored event outside that range is bytes the SDK cannot decode. The local store holds no record; R10 states where membership is read.
+
+**How a member's entry is written.** Each write reads the member's entry and writes only the merge of that entry with the change: a handle is written by its composing ceremony once and never re-written by a retry; a phase moves only from `Composed` through `Signed`, `PublishSent` and `Confirmed` to `Discarded` or `Lost`, and never back; a handle naming another digest at `Composed` through `Confirmed`, whose event no member's marker names, is never replaced; a marker is replaced only by one of equal or higher sequence; a removal drops only the handle it names. A write that adds a handle carries the last-reveal marker its ceremony read, and is refused where the stores' markers differ from it. A write that adds a handle at a later phase than `Composed` is made only into a `largeBlob` store the handle's composition did not land in. A write that would change nothing is not made. The SDK writes the platform-account member first, the `largeBlob` store second and its local store last, and then, where the `largeBlob` membership changed, the record.
 
 **What each member holds.** **Every member holds the `RecoveryHandle` and the `LastRevealMarker`** `09-security-model.md` §9.7.4.2 R10 declares, and the handle is at the width `RECOVERY_HANDLE_BYTES` registers (`09-security-model.md` §9.18.17), which is why an authenticator's large-blob array and never the object's own size is what bounds what the set can hold. **The handle, as `09-security-model.md` §9.7.4.2 R10 declares it**: <!-- scp:include id="recovery-handle-declaration" from=".docs/specs/09-security-model.md" -->**`RecoveryHandle` is one enum whose variants are `FixesCommitment` and `Abandons`, each carrying the identity's 32-byte identifier, a `RecoveryPhase`, and the 32-byte preimage digest of the composed event, and `RecoveryPhase`'s six values are `Composed`, `Signed`, `PublishSent`, `Confirmed`, `Discarded` and `Lost`.**<!-- scp:end id="recovery-handle-declaration" --> It carries the composed preimage and the signed event never, because <!-- scp:fragment id="large-blob-arithmetic" -->CTAP 2.1 floors an authenticator's whole large-blob array at 1,024 bytes across every credential it holds, and `MAX_EVENT_BYTES` is 65,536, so a duty to write the event itself would ask for a write between one and two orders of magnitude larger than the store.<!-- scp:end id="large-blob-arithmetic" --> **The composed preimage, the next commitment list and the next threshold sit in this section's own local store, and the signed event also sits in the platform account's store where that member exists, each keyed on that digest**, and `09-security-model.md` §9.7.4.2 R10 states what an SDK whose local store holds no preimage under a handle's digest does.
 
