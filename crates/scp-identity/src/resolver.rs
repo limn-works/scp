@@ -247,8 +247,11 @@ const LAYER_TIMEOUT: Duration = Duration::from_secs(10);
 ///
 /// # The healing parameter has no default
 ///
-/// ADR-062 D-A allows one defaulted capability type parameter, `Clock =
-/// SystemClock`. `H` comes before `C` because Rust requires defaulted
+/// Persistence spec §17.17.1, SCP-CAPSEL-8000: "Selection is mandatory; there
+/// is no default." A binding that can express the requirement at compile time
+/// "MUST do so", so `H` is a required type parameter. ADR-062 D-A is the
+/// precedent: it removed `DidDht`'s defaulted DHT client and kept only
+/// `Clock = SystemClock`, which this type keeps too. `H` comes before `C` because Rust requires defaulted
 /// parameters to trail. Every construction names its healing choice:
 /// [`DualLayerResolver::with_healing`] takes a publisher, and
 /// [`DualLayerResolver::without_healing`] binds `H = NoHealing`. A type that
@@ -411,11 +414,16 @@ impl<D: DhtClient + 'static, R: RelayPublisher + 'static> HealingPublisher
 }
 
 impl<R: MultiRelayQuerier, D: DhtClient, C: Clock> DualLayerResolver<R, D, NoHealing, C> {
-    /// Creates a dual-layer resolver that performs no protocol-level healing
-    /// (§3.10.7 makes healing a SHOULD). The resolver still returns the
-    /// highest-sequence document and republishes nothing to a stale layer. The
-    /// constructor name states the choice at every call site, because the
-    /// healing type parameter has no default (ADR-062 D-A).
+    /// Creates a dual-layer resolver that republishes nothing to a stale layer.
+    ///
+    /// Spec 03 §3.10.7 says "a resolver replaces a stale head by re-publishing
+    /// the longer chain to the relay that served the shorter one", and "the
+    /// sequence decides nothing between two chains that diverge from a shared
+    /// prefix"; fork precedence (spec 09 §9.7.4.2 R6) settles those. A resolver
+    /// built here performs no such re-publish: it returns the document it
+    /// selects and leaves the stale layer as it found it. The constructor name
+    /// states that choice at every call site, because the healing type
+    /// parameter has no default (SCP-CAPSEL-8000).
     #[must_use]
     pub const fn without_healing(
         relay_querier: Arc<R>,
@@ -2259,11 +2267,9 @@ mod tests {
         );
     }
 
-    /// Positive control for the `compile_fail,E0107` doctest on
-    /// [`DualLayerResolver`]: the production shape names `NoHealing` and lets
-    /// only the clock default (ADR-062 D-A), and it resolves an unknown DID to
-    /// the honest absent state. `cargo nextest` skips doctests, so this test
-    /// keeps the control in the default test run.
+    /// A resolver in the production shape, built with `without_healing` over a
+    /// relay arm and a DHT arm that both hold nothing, resolves an unknown DID
+    /// to the honest absent state `Ok(None)` and never fabricates a document.
     #[tokio::test]
     async fn resolver_named_without_healing_resolves_to_honest_absence() {
         let (_signing_key, did, _doc) = make_test_identity();
