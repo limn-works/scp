@@ -94,6 +94,14 @@ ppv-lite86
 primefield
 primeorder
 proc-macro2
+# psl 2.1.245, through scp-did: #![no_std] and #![forbid(unsafe_code)] in
+# src/lib.rs, `build = false` in Cargo.toml, and src/list.rs is a generated
+# match over label bytes. It does no I/O and depends only on psl-types.
+psl
+# psl-types 2.0.11, through psl: #![no_std] and #![forbid(unsafe_code)] in
+# src/lib.rs, no build script, no dependencies, and std appears only in its
+# #[cfg(test)] module. It does no I/O.
+psl-types
 quote
 r-efi
 rand
