@@ -10144,7 +10144,7 @@ pub(crate) fn ensure_did_resolver_initialized_on(
         .map(Arc::clone)
         .unwrap_or(candidate_cache);
 
-    let resolver = Arc::new(DualLayerResolver::new(
+    let resolver = Arc::new(DualLayerResolver::without_healing(
         Arc::new(NoOpRelayQuerier),
         dht_client,
         cache,
@@ -27545,7 +27545,7 @@ mod tests {
 
         // Verify using IdentityBackedDidResolver — the same type the bridge
         // function uses via the BridgeInstance DID resolver.
-        let dual = DualLayerResolver::new(
+        let dual = DualLayerResolver::without_healing(
             Arc::new(NoOpRelayQuerier),
             dht_client,
             Arc::new(DidCache::new()),
@@ -34614,7 +34614,7 @@ mod tests {
                 scp_dht::InMemoryDhtClient::new(),
             ));
             let cache = Arc::new(scp_identity::DidCache::new());
-            let resolver = Arc::new(scp_identity::resolver::DualLayerResolver::new(
+            let resolver = Arc::new(scp_identity::resolver::DualLayerResolver::without_healing(
                 Arc::new(scp_identity::resolver::NoOpRelayQuerier),
                 Arc::clone(&dht_client),
                 Arc::clone(&cache),

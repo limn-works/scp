@@ -203,7 +203,7 @@ fn install_seedable_resolver(
         scp_dht::InMemoryDhtClient::new(),
     ));
     let cache = Arc::new(scp_identity::DidCache::new());
-    let resolver = Arc::new(scp_identity::resolver::DualLayerResolver::new(
+    let resolver = Arc::new(scp_identity::resolver::DualLayerResolver::without_healing(
         Arc::new(scp_identity::resolver::NoOpRelayQuerier),
         Arc::clone(&dht_client),
         Arc::clone(&cache),

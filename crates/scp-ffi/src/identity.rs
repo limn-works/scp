@@ -176,7 +176,7 @@ pub(crate) fn ensure_did_resolver_initialized_on(
     crate::runtime::set_resolver_cache(bi, Arc::clone(&candidate_cache));
     let cache = crate::runtime::resolver_cache(bi).unwrap_or(candidate_cache);
 
-    let resolver = Arc::new(DualLayerResolver::new(
+    let resolver = Arc::new(DualLayerResolver::without_healing(
         Arc::new(NoOpRelayQuerier),
         dht_client,
         cache,

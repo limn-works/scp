@@ -271,7 +271,7 @@ impl IdentityBackedDidResolver {
     ///
     /// The resolver's generic type parameters are erased by boxing the
     /// resolve future. This allows the FFI layer to construct a concrete
-    /// `DualLayerResolver<R, D, C, H>` and wrap it without propagating
+    /// `DualLayerResolver<R, D, H, C>` and wrap it without propagating
     /// the generics.
     ///
     /// # Arguments
@@ -1172,7 +1172,7 @@ mod tests {
     use scp_did::DidDocument;
     use scp_identity::cache::DidCache;
     use scp_identity::resolver::{ResolutionSource, ResolvedDidDocument};
-    use scp_identity::{DidMethod, DualLayerResolver, NoOpRelayQuerier};
+    use scp_identity::{DidMethod, DualLayerResolver, NoHealing, NoOpRelayQuerier};
     use std::sync::Arc;
 
     /// A probe runs the replay check and records nothing, so the same token
@@ -1236,11 +1236,17 @@ mod tests {
     }
 
     /// Helper: create a `DualLayerResolver` with in-memory backends for testing.
-    fn make_test_resolver() -> Arc<DualLayerResolver<NoOpRelayQuerier, InMemoryDhtClient>> {
+    fn make_test_resolver() -> Arc<DualLayerResolver<NoOpRelayQuerier, InMemoryDhtClient, NoHealing>>
+    {
         let dht = Arc::new(InMemoryDhtClient::new());
         let relay = Arc::new(NoOpRelayQuerier);
         let cache = Arc::new(DidCache::new());
-        Arc::new(DualLayerResolver::new(relay, dht, cache, Vec::new()))
+        Arc::new(DualLayerResolver::without_healing(
+            relay,
+            dht,
+            cache,
+            Vec::new(),
+        ))
     }
 
     /// Helper: create an `IdentityBackedDidResolver` wrapping a test resolver.
@@ -1691,7 +1697,12 @@ mod tests {
     ) -> Arc<IdentityBackedDidResolver> {
         let relay = Arc::new(NoOpRelayQuerier);
         let cache = Arc::new(DidCache::new());
-        let resolver = Arc::new(DualLayerResolver::new(relay, dht, cache, Vec::new()));
+        let resolver = Arc::new(DualLayerResolver::without_healing(
+            relay,
+            dht,
+            cache,
+            Vec::new(),
+        ));
         Arc::new(IdentityBackedDidResolver::new(resolver, handle))
     }
 

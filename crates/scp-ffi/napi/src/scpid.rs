@@ -433,7 +433,7 @@ mod tests {
 
         // Verify using IdentityBackedDidResolver — the same type the bridge
         // function uses via the BridgeInstance DID resolver.
-        let dual = DualLayerResolver::new(
+        let dual = DualLayerResolver::without_healing(
             Arc::new(NoOpRelayQuerier),
             dht_client,
             Arc::new(DidCache::new()),

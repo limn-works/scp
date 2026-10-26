@@ -244,11 +244,39 @@ const LAYER_TIMEOUT: Duration = Duration::from_secs(10);
 ///    fresher document to the stale layer.
 ///
 /// See §3.10.4 and §3.10.7 for the full resolution protocol.
+///
+/// # The healing parameter has no default
+///
+/// Persistence spec §17.17.1, SCP-CAPSEL-8000: "Selection is mandatory; there
+/// is no default." A binding that can express the requirement at compile time
+/// "MUST do so", so `H` is a required type parameter. ADR-062 D-A is the
+/// precedent: it removed `DidDht`'s defaulted DHT client and kept only
+/// `Clock = SystemClock`, which this type keeps too. `H` comes before `C` because Rust requires defaulted
+/// parameters to trail. Every construction names its healing choice:
+/// [`DualLayerResolver::with_healing`] takes a publisher, and
+/// [`DualLayerResolver::without_healing`] binds `H = NoHealing`. A type that
+/// names only the relay and DHT layers does not compile:
+///
+/// ```compile_fail,E0107
+/// use scp_dht::DisabledDhtClient;
+/// use scp_identity::{DualLayerResolver, NoOpRelayQuerier};
+///
+/// fn bind(_: Option<DualLayerResolver<NoOpRelayQuerier, DisabledDhtClient>>) {}
+/// ```
+///
+/// Naming the healing parameter compiles:
+///
+/// ```
+/// use scp_dht::DisabledDhtClient;
+/// use scp_identity::{DualLayerResolver, NoHealing, NoOpRelayQuerier};
+///
+/// fn bind(_: Option<DualLayerResolver<NoOpRelayQuerier, DisabledDhtClient, NoHealing>>) {}
+/// ```
 pub struct DualLayerResolver<
     R: MultiRelayQuerier,
     D: DhtClient,
+    H: HealingPublisher,
     C: Clock = SystemClock,
-    H: HealingPublisher = NoHealing,
 > {
     relay_querier: Arc<R>,
     dht_client: Arc<D>,
@@ -262,7 +290,8 @@ pub struct DualLayerResolver<
     healing_publisher: Option<Arc<H>>,
 }
 
-/// The healing-publisher type parameter for a resolver built without healing.
+/// The healing-publisher type parameter for a resolver built with
+/// [`DualLayerResolver::without_healing`].
 ///
 /// Uninhabited by construction: a resolver without healing stores
 /// `healing_publisher: None`, and no value of this type exists, so no caller can
@@ -384,10 +413,19 @@ impl<D: DhtClient + 'static, R: RelayPublisher + 'static> HealingPublisher
     }
 }
 
-impl<R: MultiRelayQuerier, D: DhtClient, C: Clock> DualLayerResolver<R, D, C> {
-    /// Creates a new dual-layer resolver without healing.
+impl<R: MultiRelayQuerier, D: DhtClient, C: Clock> DualLayerResolver<R, D, NoHealing, C> {
+    /// Creates a dual-layer resolver that republishes nothing to a stale layer.
+    ///
+    /// Spec 03 §3.10.7 says "a resolver replaces a stale head by re-publishing
+    /// the longer chain to the relay that served the shorter one", and "the
+    /// sequence decides nothing between two chains that diverge from a shared
+    /// prefix"; fork precedence (spec 09 §9.7.4.2 R6) settles those. A resolver
+    /// built here performs no such re-publish: it returns the document it
+    /// selects and leaves the stale layer as it found it. The constructor name
+    /// states that choice at every call site, because the healing type
+    /// parameter has no default (SCP-CAPSEL-8000).
     #[must_use]
-    pub const fn new(
+    pub const fn without_healing(
         relay_querier: Arc<R>,
         dht_client: Arc<D>,
         cache: Arc<DidCache<C>>,
@@ -404,7 +442,7 @@ impl<R: MultiRelayQuerier, D: DhtClient, C: Clock> DualLayerResolver<R, D, C> {
 }
 
 impl<R: MultiRelayQuerier, D: DhtClient, C: Clock, H: HealingPublisher>
-    DualLayerResolver<R, D, C, H>
+    DualLayerResolver<R, D, H, C>
 {
     /// Creates a new dual-layer resolver with protocol-level healing (§3.10.7).
     ///
@@ -438,7 +476,7 @@ impl<
     D: DhtClient + 'static,
     C: Clock + 'static,
     H: HealingPublisher + 'static,
-> DidResolver for DualLayerResolver<R, D, C, H>
+> DidResolver for DualLayerResolver<R, D, H, C>
 {
     fn resolve(
         &self,
@@ -1035,8 +1073,8 @@ mod tests {
         relay: Arc<R>,
         dht: Arc<D>,
         cache: Arc<DidCache<Arc<TestClock>>>,
-    ) -> DualLayerResolver<R, D, Arc<TestClock>> {
-        DualLayerResolver::new(
+    ) -> DualLayerResolver<R, D, NoHealing, Arc<TestClock>> {
+        DualLayerResolver::without_healing(
             relay,
             dht,
             cache,
@@ -1708,7 +1746,7 @@ mod tests {
         dht: Arc<D>,
         cache: Arc<DidCache<Arc<TestClock>>>,
         healer: Arc<InMemoryHealingPublisher>,
-    ) -> DualLayerResolver<R, D, Arc<TestClock>, InMemoryHealingPublisher> {
+    ) -> DualLayerResolver<R, D, InMemoryHealingPublisher, Arc<TestClock>> {
         DualLayerResolver::with_healing(
             relay,
             dht,
@@ -2226,6 +2264,31 @@ mod tests {
         assert!(
             answer.is_none(),
             "the shipped relay arm holds no DID record and must answer Ok(None)"
+        );
+    }
+
+    /// A resolver in the production shape, built with `without_healing` over a
+    /// relay arm and a DHT arm that both hold nothing, resolves an unknown DID
+    /// to the honest absent state `Ok(None)` and never fabricates a document.
+    #[tokio::test]
+    async fn resolver_named_without_healing_resolves_to_honest_absence() {
+        let (_signing_key, did, _doc) = make_test_identity();
+        let resolver: DualLayerResolver<NoOpRelayQuerier, scp_dht::DisabledDhtClient, NoHealing> =
+            DualLayerResolver::without_healing(
+                Arc::new(NoOpRelayQuerier),
+                Arc::new(scp_dht::DisabledDhtClient),
+                Arc::new(DidCache::new()),
+                Vec::new(),
+            );
+
+        let answer = resolver
+            .resolve(&did)
+            .await
+            .expect("both layers report absence, so resolution must not error");
+
+        assert!(
+            answer.is_none(),
+            "a resolver with no relay record, no DHT and no healing must answer Ok(None)"
         );
     }
 }

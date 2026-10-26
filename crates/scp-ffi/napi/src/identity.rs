@@ -235,7 +235,7 @@ pub(crate) fn ensure_did_resolver_initialized_on(
         .unwrap_or(candidate_cache);
     let bootstrap_relays = Vec::new();
 
-    let resolver = Arc::new(DualLayerResolver::new(
+    let resolver = Arc::new(DualLayerResolver::without_healing(
         relay_querier,
         dht_client,
         cache,

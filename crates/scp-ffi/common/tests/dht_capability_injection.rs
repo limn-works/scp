@@ -143,7 +143,7 @@ async fn disabled_node_resolution_returns_ok_none_for_unknown_did() {
         format!("did:dht:z{}", zbase32::encode(vk.as_bytes()))
     };
 
-    let resolver = DualLayerResolver::new(
+    let resolver = DualLayerResolver::without_healing(
         Arc::new(NoOpRelayQuerier),
         Arc::new(DisabledDhtClient),
         Arc::new(DidCache::new()),
@@ -194,7 +194,7 @@ async fn rotation_is_reflected_by_resolve_through_shared_resolver() {
 
     // The resolver shares the DID method's DHT client and cache — the same
     // wiring the node uses (build_shared_cache_key_resolver).
-    let resolver = DualLayerResolver::new(
+    let resolver = DualLayerResolver::without_healing(
         Arc::new(NoOpRelayQuerier),
         did_dht.dht_client(),
         Arc::clone(did_dht.cache()),

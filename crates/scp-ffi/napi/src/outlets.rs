@@ -2171,7 +2171,7 @@ mod tests {
             bi: &std::sync::Arc<crate::runtime::NapiBridgeInstance>,
         ) -> std::sync::Arc<scp_dht::InMemoryDhtClient> {
             let dht_client = std::sync::Arc::new(scp_dht::InMemoryDhtClient::new());
-            let resolver = std::sync::Arc::new(scp_identity::DualLayerResolver::new(
+            let resolver = std::sync::Arc::new(scp_identity::DualLayerResolver::without_healing(
                 std::sync::Arc::new(scp_identity::NoOpRelayQuerier),
                 std::sync::Arc::clone(&dht_client),
                 std::sync::Arc::new(scp_identity::DidCache::new()),
