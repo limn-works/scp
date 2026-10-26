@@ -261,16 +261,169 @@ pub struct CommitFaultMarker {
 
 /// One event-log entry of a [`PendingLogUnit`]: everything an append takes
 /// except the position, which the drain assigns.
+///
+/// The fields are private, so every leaf passes the append's payload rules
+/// when it is built, before the operation's irreversible step (spec 17 §17.3
+/// "Event log write failures"): [`Self::new`] checks them,
+/// [`Self::consequence`] and [`Self::without_payload`] build only leaves the
+/// rules cannot refuse, and deserialization runs [`Self::new`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "LeafSpecWire")]
 pub struct LeafSpec {
+    event_type: scp_event_log::EventType,
+    actor_did: String,
+    payload: scp_event_log::EventPayload,
+    timestamp_secs: u64,
+}
+
+/// The serialized form of a [`LeafSpec`], checked by [`LeafSpec::new`] when
+/// it is read back.
+#[derive(Deserialize)]
+struct LeafSpecWire {
+    event_type: scp_event_log::EventType,
+    actor_did: String,
+    payload: scp_event_log::EventPayload,
+    timestamp_secs: u64,
+}
+
+impl TryFrom<LeafSpecWire> for LeafSpec {
+    type Error = ContextError;
+
+    fn try_from(wire: LeafSpecWire) -> Result<Self, Self::Error> {
+        Self::new(
+            wire.event_type,
+            wire.actor_did,
+            wire.payload,
+            wire.timestamp_secs,
+        )
+    }
+}
+
+/// The consequence engine's leaf types. None carries an
+/// append payload rule, so [`LeafSpec::consequence`] needs no check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsequenceLeafType {
+    /// `ConsequenceTriggered`.
+    Triggered,
+    /// `ConsequenceEnforced`.
+    Enforced,
+    /// `ConsequenceEnforcementFailed`.
+    EnforcementFailed,
+    /// `ConsequenceEscalatedToSuspendAll`.
+    EscalatedToSuspendAll,
+}
+
+impl ConsequenceLeafType {
+    /// Every consequence leaf type.
+    pub const ALL: [Self; 4] = [
+        Self::Triggered,
+        Self::Enforced,
+        Self::EnforcementFailed,
+        Self::EscalatedToSuspendAll,
+    ];
+
+    /// The event type the leaf carries.
+    #[must_use]
+    pub const fn event_type(self) -> scp_event_log::EventType {
+        match self {
+            Self::Triggered => scp_event_log::EventType::ConsequenceTriggered,
+            Self::Enforced => scp_event_log::EventType::ConsequenceEnforced,
+            Self::EnforcementFailed => scp_event_log::EventType::ConsequenceEnforcementFailed,
+            Self::EscalatedToSuspendAll => {
+                scp_event_log::EventType::ConsequenceEscalatedToSuspendAll
+            }
+        }
+    }
+}
+
+impl LeafSpec {
+    /// Builds a leaf, checking it against the append's payload rules (spec
+    /// 17 §17.3 "Event log write failures"), so a payload that breaks them
+    /// refuses the operation before its step and never after it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::EventLogFailed`] when the payload breaks the
+    /// append's payload rules for `event_type`.
+    pub fn new(
+        event_type: scp_event_log::EventType,
+        actor_did: String,
+        payload: scp_event_log::EventPayload,
+        timestamp_secs: u64,
+    ) -> Result<Self, ContextError> {
+        crate::context::providers::event_log::check_append_payload(event_type, &payload)
+            .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
+        Ok(Self {
+            event_type,
+            actor_did,
+            payload,
+            timestamp_secs,
+        })
+    }
+
+    /// Builds a consequence leaf. The consequence leaf types carry no append
+    /// payload rule; a test pins that the rules accept every one of them.
+    #[must_use]
+    pub const fn consequence(
+        leaf_type: ConsequenceLeafType,
+        actor_did: String,
+        payload: scp_event_log::EventPayload,
+        timestamp_secs: u64,
+    ) -> Self {
+        Self {
+            event_type: leaf_type.event_type(),
+            actor_did,
+            payload,
+            timestamp_secs,
+        }
+    }
+
+    /// Builds a leaf with an empty payload. An empty payload decodes as no
+    /// event, so the append's payload rules accept it for every event type;
+    /// a test pins that.
+    #[must_use]
+    pub fn without_payload(
+        event_type: scp_event_log::EventType,
+        actor_did: String,
+        timestamp_secs: u64,
+    ) -> Self {
+        Self {
+            event_type,
+            actor_did,
+            payload: scp_event_log::EventPayload::default(),
+            timestamp_secs,
+        }
+    }
+
     /// The entry's closed-taxonomy event type.
-    pub event_type: scp_event_log::EventType,
+    #[must_use]
+    pub const fn event_type(&self) -> scp_event_log::EventType {
+        self.event_type
+    }
+
     /// The DID of the actor the entry names.
-    pub actor_did: String,
+    #[must_use]
+    pub fn actor_did(&self) -> &str {
+        &self.actor_did
+    }
+
     /// The entry's payload, part of the leaf preimage.
-    pub payload: scp_event_log::EventPayload,
+    #[must_use]
+    pub const fn payload(&self) -> &scp_event_log::EventPayload {
+        &self.payload
+    }
+
     /// The entry's convergent timestamp in seconds since the Unix epoch.
-    pub timestamp_secs: u64,
+    #[must_use]
+    pub const fn timestamp_secs(&self) -> u64 {
+        self.timestamp_secs
+    }
+
+    /// The entry's payload, by value.
+    #[must_use]
+    pub fn into_payload(self) -> scp_event_log::EventPayload {
+        self.payload
+    }
 }
 
 /// Event-log entries that an operation queued after its irreversible step

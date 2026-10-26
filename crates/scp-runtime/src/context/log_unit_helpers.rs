@@ -138,14 +138,7 @@ pub fn plan_leaf(
     payload: scp_event_log::EventPayload,
     timestamp_secs: u64,
 ) -> Result<LeafSpec, ContextError> {
-    crate::context::providers::event_log::check_append_payload(event_type, &payload)
-        .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
-    Ok(LeafSpec {
-        event_type,
-        actor_did,
-        payload,
-        timestamp_secs,
-    })
+    LeafSpec::new(event_type, actor_did, payload, timestamp_secs)
 }
 
 /// True when the context has queued log units or a log fault, so a drain has
@@ -413,7 +406,12 @@ pub mod test_support {
     pub fn queued_unit_types(units: &PendingLogUnits) -> Vec<Vec<EventType>> {
         units
             .iter()
-            .map(|unit| unit.leaves.iter().map(|leaf| leaf.event_type).collect())
+            .map(|unit| {
+                unit.leaves
+                    .iter()
+                    .map(crate::context::state::LeafSpec::event_type)
+                    .collect()
+            })
             .collect()
     }
 
@@ -505,12 +503,13 @@ mod tests {
     }
 
     fn tagged_leaf(tag: u8) -> LeafSpec {
-        LeafSpec {
-            event_type: EventType::MemberJoined,
-            actor_did: String::new(),
-            payload: tagged_payload(tag),
-            timestamp_secs: 1_700_000_000 + u64::from(tag),
-        }
+        LeafSpec::new(
+            EventType::MemberJoined,
+            String::new(),
+            tagged_payload(tag),
+            1_700_000_000 + u64::from(tag),
+        )
+        .expect("a valid leaf")
     }
 
     /// Spec 17 §17.3 "Event log write failures": while units are queued, a
@@ -779,22 +778,19 @@ mod tests {
             "{empty:?}"
         );
 
-        let breach = PendingLogUnits::validated(
-            std::iter::once(PendingLogUnit {
-                base_seq: None,
-                leaves: vec![LeafSpec {
-                    event_type: EventType::OutletInvoked,
-                    actor_did: String::new(),
-                    payload: outlet_invoked_payload(2, 3),
-                    timestamp_secs: 1_700_000_000,
-                }],
-            })
-            .collect(),
-        );
-        assert!(
-            matches!(breach, Err(ContextError::PersistenceFailed(_))),
-            "{breach:?}"
-        );
+        // A stored entry that breaks the payload rules cannot be read back:
+        // deserialization builds the leaf through `LeafSpec::new`.
+        let mut stored = serde_json::to_value(PendingLogUnit {
+            base_seq: None,
+            leaves: vec![tagged_leaf(1)],
+        })
+        .expect("serialize a unit");
+        stored["leaves"][0]["event_type"] =
+            serde_json::to_value(EventType::OutletInvoked).expect("event type");
+        stored["leaves"][0]["payload"] =
+            serde_json::to_value(outlet_invoked_payload(2, 3)).expect("payload");
+        let breach = serde_json::from_value::<PendingLogUnit>(stored);
+        assert!(breach.is_err(), "{breach:?}");
 
         let valid = PendingLogUnits::validated(
             std::iter::once(PendingLogUnit {
@@ -831,25 +827,54 @@ mod tests {
         .expect("chunks_billed equal to the chunk count is admissible");
     }
 
-    /// The consequence leaves carry no payload rule, so a consequence planned
-    /// by the engine can never be refused by the append.
+    /// Spec 17 §17.3: every `LeafSpec` constructor yields only leaves the
+    /// append's payload rules accept. `new` refuses a breach; `consequence`
+    /// and `without_payload`, which do not check, build leaves the rules
+    /// accept even from a payload that breaks the `OutletInvoked` rule. A
+    /// payload rule added for a consequence type, or for an empty payload,
+    /// fails this test.
     #[test]
-    fn consequence_leaf_types_have_no_payload_rule() {
-        for event_type in [
-            EventType::ConsequenceTriggered,
-            EventType::ConsequenceEnforced,
-            EventType::ConsequenceEnforcementFailed,
-            EventType::ConsequenceEscalatedToSuspendAll,
-            EventType::RecoveryEpochAdvanced,
-        ] {
-            crate::context::providers::event_log::check_append_payload(
-                event_type,
-                &EventPayload {
-                    data: b"{\"any\":\"payload\"}".to_vec(),
-                },
-            )
-            .expect("no payload rule for this type");
+    fn every_leaf_constructor_yields_a_leaf_the_payload_rules_accept() {
+        use crate::context::providers::event_log::check_append_payload;
+        use crate::context::state::ConsequenceLeafType;
+
+        let refused = LeafSpec::new(
+            EventType::OutletInvoked,
+            String::new(),
+            outlet_invoked_payload(2, 3),
+            1_700_000_000,
+        );
+        assert!(
+            matches!(refused, Err(ContextError::EventLogFailed(_))),
+            "{refused:?}"
+        );
+
+        let payloads = [
+            outlet_invoked_payload(2, 3),
+            EventPayload {
+                data: b"{\"any\":\"payload\"}".to_vec(),
+            },
+            EventPayload::default(),
+        ];
+        for leaf_type in ConsequenceLeafType::ALL {
+            for payload in &payloads {
+                let leaf =
+                    LeafSpec::consequence(leaf_type, String::new(), payload.clone(), 1_700_000_000);
+                check_append_payload(leaf.event_type(), leaf.payload())
+                    .expect("the rules accept every consequence leaf");
+            }
         }
+        for event_type in [
+            EventType::OutletInvoked,
+            EventType::MemberJoined,
+            EventType::GovernanceAction,
+        ] {
+            let leaf = LeafSpec::without_payload(event_type, String::new(), 1_700_000_000);
+            check_append_payload(leaf.event_type(), leaf.payload())
+                .expect("the rules accept an empty payload");
+        }
+        check_append_payload(EventType::RecoveryEpochAdvanced, &payloads[1])
+            .expect("the recovery leaf, planned through `new`, has no payload rule");
     }
 
     /// An `OutletInvokedEvent` payload with the given chunk counts.

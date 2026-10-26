@@ -28090,14 +28090,15 @@ mod tests {
     /// A queued-unit leaf whose payload carries `tag`.
     #[cfg(feature = "testing")]
     fn respawn_unit_leaf(tag: u8) -> crate::context::state::LeafSpec {
-        crate::context::state::LeafSpec {
-            event_type: scp_event_log::EventType::MemberJoined,
-            actor_did: String::new(),
-            payload: scp_event_log::EventPayload {
+        crate::context::state::LeafSpec::new(
+            scp_event_log::EventType::MemberJoined,
+            String::new(),
+            scp_event_log::EventPayload {
                 data: vec![0xC0, tag],
             },
-            timestamp_secs: 1_700_000_000 + u64::from(tag),
-        }
+            1_700_000_000 + u64::from(tag),
+        )
+        .expect("a valid leaf")
     }
 
     /// The payload tags of a log's entries, in log order.

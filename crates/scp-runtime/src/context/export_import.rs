@@ -2870,13 +2870,15 @@ mod tests {
     fn snapshot_roundtrips_pending_log_units() {
         use crate::context::state::{LeafSpec, LogFaultMarker, PendingLogUnit};
 
-        let leaf = |tag: u8, ts: u64| LeafSpec {
-            event_type: scp_event_log::EventType::ConsequenceTriggered,
-            actor_did: "did:key:consequence-actor".to_owned(),
-            payload: scp_event_log::EventPayload {
-                data: vec![tag, 0xEE],
-            },
-            timestamp_secs: ts,
+        let leaf = |tag: u8, ts: u64| {
+            LeafSpec::consequence(
+                crate::context::state::ConsequenceLeafType::Triggered,
+                "did:key:consequence-actor".to_owned(),
+                scp_event_log::EventPayload {
+                    data: vec![tag, 0xEE],
+                },
+                ts,
+            )
         };
         let mut snapshot = test_snapshot("ctx-pending-log-units");
         snapshot.pending_log_units.push_back(PendingLogUnit {
