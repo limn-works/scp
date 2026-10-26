@@ -7,16 +7,16 @@ library call, [`scp_node::host_site`]. It is the same deploy + serve core that
 the turnkey `scp-node --self-host` binary runs, exposed as a library function so
 you can embed it in your own program.
 
-**Until a production `PreRotationCustody` backend exists ([#1729]), no build
-runs this example without a test-harness stand-in.** `cargo run -p scp-node
+**Until a substrate satisfies §9.7.4.1 item 3a of the security model ([#1729]),
+no build runs this example without a test-harness stand-in.** `cargo run -p scp-node
 --example website` compiles, then exits 1 on every run. `host_site` asks for
 `IdentitySource::Persisted`, which `Node::start` resolves by loading the stored
 identity or, when the directory holds none, creating one on its `Generate`
 path. The example gives `host_site` a new, empty directory on every run, so every run
 takes `Generate`. On a build without `scp-node`'s `testing` feature that path
-returns `NoPreRotationBackend` whatever custody or storage is supplied: it
-takes no `PreRotationCustody` input, so it fails closed rather than mint a
-nullifier-backed identity. The example's own doc comment quotes the error.
+returns `NoIndependentSubstrate` (`SCP-IDENT-1100`) whatever custody or storage
+is supplied: it takes no next-set custody, so it fails closed before any key
+exists rather than mint a nullifier-backed identity. The example's own doc comment quotes the error.
 
 A `testing` build is not a way to run it. `testing` mints the identity through
 `scp_platform::testing::InMemoryPreRotationCustody`, the test-harness
@@ -73,7 +73,7 @@ SCP_NODE_DHT_MODE=disabled scp-node --self-host --site-dir ./my-site
 `production`, which puts the host's public IP, bound to its DID, on the global
 Mainline DHT. Set it to `disabled` for a site that publishes nothing. When its
 default storage directory holds no identity, this path exits with the same
-`NoPreRotationBackend` error as the example above. When that directory already
+`NoIndependentSubstrate` error as the example above. When that directory already
 holds an identity, the binary reloads it and serves, whatever build created it
 ([#2558]).
 

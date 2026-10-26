@@ -104,21 +104,35 @@ pub(crate) fn build_ffi_dht_client() -> Result<FfiDhtClient, ScpNapiError> {
     })
 }
 
-/// Fail-closed error for a production identity path when no real pre-rotation
-/// custody backend is available (ADR-062 §Decision 6).
+/// Fail-closed error for a production rotation, agent-key or migration path
+/// when no real pre-rotation custody backend is available (ADR-062 §Decision 6).
 ///
-/// Every identity commits a pre-rotation commitment at creation (spec §9.7.4.1
-/// item 5(a) — mandatory), which requires a `PreRotationCustody` backend. The only
-/// implementation is the test-harness `InMemoryPreRotationCustody` nullifier,
-/// severed from every production dependency line, so a shipped (no-`testing`)
-/// build returns this typed [`codes::IDENT_1059`] error rather than silently
-/// minting the nullifier. Mirrors the `PyO3` reference bridge's
-/// `no_pre_rotation_backend`.
+/// Those paths read or reveal a pre-rotation key, which requires a
+/// `PreRotationCustody` backend. The only implementation is the test-harness
+/// `InMemoryPreRotationCustody` nullifier, severed from every production
+/// dependency line, so a shipped (no-`testing`) build returns this typed
+/// [`codes::IDENT_1059`] error rather than silently minting the nullifier.
+/// Identity creation returns [`no_independent_substrate`] instead. Mirrors the
+/// `PyO3` reference bridge's `no_pre_rotation_backend`.
 #[cfg(not(feature = "testing"))]
 pub(crate) fn no_pre_rotation_backend() -> ScpNapiError {
     ScpNapiError::Identity {
         message: IdentityError::NoPreRotationBackend.to_string(),
         code: codes::IDENT_1059.to_owned(),
+    }
+}
+
+/// Fail-closed error for every production identity-creation path: no
+/// substrate satisfies the independent-residence requirement of
+/// `09-security-model.md` §9.7.4.1 item 3a (`03-identity.md` §3.10.10), so a
+/// shipped (no-`testing`) build returns this typed [`codes::IDENT_1100`] error
+/// before any key exists. Mirrors the `PyO3` reference bridge's
+/// `no_independent_substrate`.
+#[cfg(not(feature = "testing"))]
+pub(crate) fn no_independent_substrate() -> ScpNapiError {
+    ScpNapiError::Identity {
+        message: scp_identity::IdentityError::NoIndependentSubstrate.to_string(),
+        code: codes::IDENT_1100.to_owned(),
     }
 }
 
@@ -2484,26 +2498,27 @@ mod prod_fail_closed_tests {
     /// `identity_create(kind)` string entry point mints no identity for any
     /// custody request, so the pre-rotation nullifier is unreachable via this
     /// surface. `encrypted_file` resolves its inputs and then fails closed with
-    /// `SCP-IDENT-1059` before the key file opens (pinned with injected inputs by
-    /// `scp::custody_request_tests::encrypted_file_on_a_shipped_build_refuses_with_ident_1059_before_opening`);
+    /// `SCP-IDENT-1100` before the key file opens (pinned with injected inputs by
+    /// `scp::custody_request_tests::encrypted_file_on_a_shipped_build_refuses_with_ident_1100_before_opening`);
     /// `in_memory` is severed (`SCP-IDENT-1008`); `os_keystore` needs the
     /// provider `identity_create_with_custody` takes (`SCP-IDENT-1003`); every
     /// other string is `SCP-VALID-7005` (spec `03-identity.md` §3.2.2). This test
     /// pins the last three on the real entry point.
     ///
-    /// The *callback* path's own pre-rotation fail-closed (`SCP-IDENT-1059`) is NOT
+    /// The *callback* path's own fail-closed (`SCP-IDENT-1100`) is NOT
     /// exercised here — it takes a napi `Env` + JS `Function`s that cannot be
-    /// constructed in a Rust `#[test]`. It reaches the same shipped
-    /// `create_identity` in `scp.rs` as the string path, whose only body is
-    /// `CustodySelection::refuse_create` (`crate::identity::no_pre_rotation_backend`,
-    /// `IDENT_1059`); the mint arm is `#[cfg(feature = "testing")]`, and the G1
+    /// constructed in a Rust `#[test]`; the TypeScript shipped test
+    /// `identityCreateWithCustody refuses with SCP-IDENT-1100` drives it. It
+    /// reaches the same shipped `create_identity` in `scp.rs` as the string
+    /// path, whose only body is `CustodySelection::refuse_create`
+    /// (`crate::identity::no_independent_substrate`, `IDENT_1100`); the mint arm is `#[cfg(feature = "testing")]`, and the G1
     /// shipped-feature-graph gate (`check-shipped-feature-graph.sh`) mechanically
     /// proves `InMemoryPreRotationCustody` is absent from the shipped graph.
     ///
     /// `identity_create` is `async`; the crate tokio runtime drives it, mirroring the
     /// napi-rs worker's `block_on`.
     #[test]
-    fn identity_create_fails_closed_without_pre_rotation_backend() {
+    fn identity_create_fails_closed_on_a_shipped_build() {
         use scp_ffi_common::error_codes::{IDENT_1003, IDENT_1008, VALID_7005};
         for (custody, code) in [
             ("in_memory", IDENT_1008),

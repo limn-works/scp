@@ -89,8 +89,9 @@ scp-node = { path = "../../scp-node", default-features = false, optional = true 
 # `{"type":"in_memory"}` storage affordance, SCP-CAPSEL-8011) plus
 # `software_platform` for the crypto primitives — NEVER `testing` (ADR-062
 # §Decision 6). The in-memory custody/attestation/pre-rotation nullifiers are
-# NOT reachable in production: production pre-rotation create FAILS CLOSED with a
-# typed `IdentityError` (SCP-IDENT-1059) rather than mint `InMemoryPreRotationCustody`.
+# NOT reachable in production: production create FAILS CLOSED before any key
+# exists with `IdentityError::NoIndependentSubstrate` (SCP-IDENT-1100) rather than
+# mint `InMemoryPreRotationCustody`.
 # The `testing` crate-feature adds `scp-platform/testing` on top for test builds.
 # `file` compiles `FileKeyCustody`, the backend custody "encrypted_file"
 # selects (spec 03 §3.2.2); `scp-ffi-common/custody` already enables it, and

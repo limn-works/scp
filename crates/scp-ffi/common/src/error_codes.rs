@@ -284,20 +284,22 @@ pub const IDENT_1056: &str = "SCP-IDENT-1056";
 /// an identity that was never registered on this bridge.
 pub const IDENT_1058: &str = "SCP-IDENT-1058";
 
-/// No production pre-rotation custody backend is available (FAIL CLOSED).
+/// No production pre-rotation custody backend is available for a rotation or
+/// migration (FAIL CLOSED).
 ///
-/// Surfaced by all native bridges (`PyO3`, napi-rs, `UniFFI`) and `scp-node`
-/// when a production identity-creation path is invoked on a shipped (no-`testing`)
-/// build. Every identity commits a pre-rotation commitment at creation (spec
-/// §9.7.4.1 item 5(a)), which requires a `PreRotationCustody` backend; the
-/// only implementation that exists today is the in-memory test nullifier
-/// (`InMemoryPreRotationCustody`), now gated to the test harness only (ADR-062
-/// §Decision 6). Rather than silently mint the nullifier (which would ship a
-/// false durability guarantee — AGENTS.md builder tenet "No dev/test-only
-/// stand-ins in production"), creation fails closed with this typed code. Maps
-/// from [`scp_identity::dht::IdentityError::NoPreRotationBackend`]. A real, persistent
-/// pre-rotation backend is tracked by #1729 / RFC #2130; non-committing creation
-/// (Option A) is out of scope (Discussion #1553).
+/// Surfaced by all native bridges (`PyO3`, napi-rs, `UniFFI`) when a
+/// production rotation, migration or agent-key operation of the superseded
+/// `did:dht` model is invoked on a shipped (no-`testing`) build. Those
+/// operations need a `PreRotationCustody` backend, and the only implementation
+/// that exists today is the in-memory test nullifier
+/// (`InMemoryPreRotationCustody`), gated to the test harness only (ADR-062
+/// §Decision 6). Rather than silently mint the nullifier, which would ship a
+/// false durability guarantee (AGENTS.md builder tenet "No dev/test-only
+/// stand-ins in production"), the operation fails closed with this typed
+/// code. Maps from [`scp_identity::dht::IdentityError::NoPreRotationBackend`].
+/// Identity creation no longer returns this code: it returns [`IDENT_1100`]
+/// (ADR-054, ADR-062 amendments of 2026-10-25). Rotation and migration keep
+/// this code until SCP-315 cuts them over to the key-event log.
 pub const IDENT_1059: &str = "SCP-IDENT-1059";
 
 /// Identity-link attestation verification could not resolve an issuer's DID
@@ -378,6 +380,21 @@ pub const IDENT_1062: &str = "SCP-IDENT-1062";
 /// instance, or the core node's identity operation failed (sdk-common.md
 /// §"Node start error codes").
 pub const IDENT_1063: &str = "SCP-IDENT-1063";
+
+/// Identity creation fails closed: no substrate satisfies independent residence.
+///
+/// The requirement is `09-security-model.md` §9.7.4.1 item 3a; the refusal is
+/// `03-identity.md` §3.10.10, `IdentityError::NoIndependentSubstrate`.
+///
+/// Surfaced by all native bridges (`PyO3`, napi-rs, `UniFFI`) and by
+/// `scp-node`'s identity resolvers on every shipped identity-creation path,
+/// before any key exists: no next-set custody that keeps each next-set key
+/// apart from the operational custody is built into a shipped binary yet.
+/// Maps from [`scp_identity::IdentityError::NoIndependentSubstrate`], whose
+/// [`code`](scp_identity::IdentityError::code) returns this literal. It is the
+/// first code of the `SCP-IDENT-1100`..`1199` sub-block (`sdk-common.md`
+/// §Error code format).
+pub const IDENT_1100: &str = "SCP-IDENT-1100";
 
 /// An identity-creating SDK entry received no custody argument (FAIL CLOSED).
 ///
@@ -1985,6 +2002,7 @@ pub const fn server_error_code(e: &crate::server::ServerError) -> &'static str {
         E::Storage(_) | E::Io(_) => STORAGE_8008,
         E::Node(N::Storage(_)) => STORAGE_8009,
         E::OperatorIdentityUnavailable | E::Node(N::Identity(_)) => IDENT_1063,
+        E::Node(N::IdentityCreation(e)) => e.code(),
         E::Node(N::Relay(_) | N::OwnAddresses(_)) => TRANS_5051,
         E::Node(N::Tls(_)) => TRANS_5052,
         E::Node(N::Serve(_) | N::Nat(_)) => TRANS_5054,
@@ -2006,8 +2024,8 @@ pub enum ServerErrorClass {
     /// storage selection the bridge could not honour (`SCP-STORAGE-*`, as for
     /// the selection layer's `SCP-STORAGE-8004`).
     Validation,
-    /// An identity error: the operator identity is unavailable, or the DHT
-    /// client could not be built.
+    /// An identity error: the operator identity is unavailable, the node
+    /// refused to create an identity, or the DHT client could not be built.
     Identity,
     /// A transport error: the relay, TLS, HTTP server or NAT traversal failed,
     /// the bridge could not wire its `Supervisor` to a started node, or a
@@ -2032,9 +2050,9 @@ pub const fn server_error_class(e: &crate::server::ServerError) -> ServerErrorCl
         | E::Storage(_)
         | E::Io(_)
         | E::MissingPassphrase => ServerErrorClass::Validation,
-        E::OperatorIdentityUnavailable | E::Node(N::Identity(_)) | E::DhtInit(_) => {
-            ServerErrorClass::Identity
-        }
+        E::OperatorIdentityUnavailable
+        | E::Node(N::Identity(_) | N::IdentityCreation(_))
+        | E::DhtInit(_) => ServerErrorClass::Identity,
         E::Node(N::Relay(_) | N::OwnAddresses(_) | N::Tls(_) | N::Serve(_) | N::Nat(_))
         | E::Relay(_)
         | E::DevStartUnavailable
@@ -2078,6 +2096,13 @@ mod server_error_tests {
                     scp_platform::error::PlatformError::StorageClosed,
                 ))),
                 IDENT_1063,
+                Identity,
+            ),
+            (
+                E::Node(N::IdentityCreation(
+                    scp_identity::IdentityError::NoIndependentSubstrate,
+                )),
+                IDENT_1100,
                 Identity,
             ),
             (
@@ -2167,11 +2192,41 @@ mod server_error_tests {
         ]
     }
 
+    /// A node that refuses identity creation returns `SCP-IDENT-1100`, the
+    /// code of the refusal it carries, and never the operator-identity code
+    /// `SCP-IDENT-1063` or the superseded `SCP-IDENT-1059`.
+    #[test]
+    fn node_identity_creation_refusal_maps_to_ident_1100() {
+        let err = E::Node(N::IdentityCreation(
+            scp_identity::IdentityError::NoIndependentSubstrate,
+        ));
+        assert_eq!(server_error_code(&err), IDENT_1100);
+        assert_ne!(server_error_code(&err), IDENT_1063);
+        assert_ne!(server_error_code(&err), IDENT_1059);
+        assert_eq!(server_error_class(&err), ServerErrorClass::Identity);
+    }
+
     #[test]
     fn server_error_code_and_class_match_every_sdk_common_row() {
         for (err, code, class) in rows() {
             assert_eq!(server_error_code(&err), code, "{err:?}");
             assert_eq!(server_error_class(&err), class, "{err:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod identity_error_code_tests {
+    use super::*;
+
+    /// The bridge constants of the key-event-log sub-block carry the literal
+    /// `scp_identity::IdentityError::code` returns, so a bridge that raises a
+    /// constant and a node that maps through `code()` agree.
+    #[test]
+    fn kel_identity_constants_match_identity_error_codes() {
+        use scp_identity::IdentityError as I;
+        assert_eq!(IDENT_1100, I::NoIndependentSubstrate.code());
+        assert_eq!(IDENT_1116, I::CustodyRequired.code());
+        assert_ne!(IDENT_1100, IDENT_1059);
     }
 }

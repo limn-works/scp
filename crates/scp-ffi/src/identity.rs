@@ -92,15 +92,14 @@ pub(crate) fn build_ffi_dht_client() -> Result<FfiDhtClient, ScpPyError> {
     })
 }
 
-/// Fail-closed error for a production identity-creation path when no real
+/// Fail-closed error for a production rotation or migration path when no real
 /// pre-rotation custody backend is available (ADR-062 §Decision 6).
 ///
-/// Every identity commits a pre-rotation commitment at creation (spec §9.7.4.1
-/// item 5(a) — mandatory), which requires a `PreRotationCustody` backend. The only
-/// implementation is the test-harness `InMemoryPreRotationCustody` nullifier, so
-/// a shipped (no-`testing`) build returns this typed [`IDENT_1059`] error rather
-/// than silently minting the nullifier. See #1729 / RFC #2130 for the real
-/// backend; Option A (non-committing create) is #1553, out of scope.
+/// `identity_migrate` reveals a pre-rotation key, which requires a
+/// `PreRotationCustody` backend. The only implementation is the test-harness
+/// `InMemoryPreRotationCustody` nullifier, so a shipped (no-`testing`) build
+/// returns this typed [`IDENT_1059`] error rather than silently minting the
+/// nullifier. Identity creation returns [`no_independent_substrate`] instead.
 ///
 /// [`IDENT_1059`]: scp_ffi_common::error_codes::IDENT_1059
 #[cfg(not(feature = "testing"))]
@@ -108,6 +107,23 @@ pub(crate) fn no_pre_rotation_backend() -> ScpPyError {
     ScpPyError::identity_with_code(
         scp_identity::dht::IdentityError::NoPreRotationBackend.to_string(),
         scp_ffi_common::error_codes::IDENT_1059,
+    )
+}
+
+/// Fail-closed error for every production identity-creation path: no
+/// substrate satisfies the independent-residence requirement of
+/// `09-security-model.md` §9.7.4.1 item 3a (`03-identity.md` §3.10.10).
+///
+/// A shipped (no-`testing`) build returns this typed [`IDENT_1100`] error
+/// before any key exists, rather than minting the in-memory pre-rotation
+/// nullifier (ADR-062 §Decision 6).
+///
+/// [`IDENT_1100`]: scp_ffi_common::error_codes::IDENT_1100
+#[cfg(not(feature = "testing"))]
+pub(crate) fn no_independent_substrate() -> ScpPyError {
+    ScpPyError::identity_with_code(
+        scp_identity::IdentityError::NoIndependentSubstrate.to_string(),
+        scp_ffi_common::error_codes::IDENT_1100,
     )
 }
 
@@ -920,10 +936,9 @@ fn custody_request_error(
 /// identity-creation path, with the request value the identity handle reports
 /// (spec 03 §3.2.2).
 ///
-/// Every identity commits a pre-rotation commitment at creation (spec
-/// §9.7.4.1 item 5(a)), and a shipped build has no `PreRotationCustody`
-/// backend, so a shipped build refuses `encrypted_file` here with
-/// `SCP-IDENT-1059` (ADR-062 §Decision 6) before the selection creates
+/// No substrate satisfies §9.7.4.1 item 3a on a shipped build, so a shipped
+/// build refuses `encrypted_file` here with `SCP-IDENT-1100`
+/// (`03-identity.md` §3.10.10) before the selection creates
 /// `$HOME/.scp` or opens a key file. Opening first would leave a key file
 /// sealed under whatever passphrase was set, for a call that fails. An
 /// `os_keystore` selection opens only its custody records over `bi`'s
@@ -938,7 +953,7 @@ fn build_key_custody(
     match selection {
         CustodySelection::EncryptedFile(inputs) => {
             drop(inputs);
-            Err(no_pre_rotation_backend())
+            Err(no_independent_substrate())
         }
         CustodySelection::OsKeystore(provider) => Ok((
             Arc::new(FfiKeyCustody::Callback(
@@ -1537,7 +1552,7 @@ impl crate::scp::PyScp {
             .transpose()?
             .map(zeroize::Zeroizing::new);
         // Resolve the custody (no file touched), then open it; a shipped build
-        // refuses with SCP-IDENT-1059 at the open, before any key file exists.
+        // refuses with SCP-IDENT-1100 at the open, before any key file exists.
         let (key_custody, custody_str) =
             build_key_custody(resolve_custody(custody, None, testing_seed_array)?, &bi_arc)?;
         let rt = crate::runtime()?;
@@ -1550,16 +1565,15 @@ impl crate::scp::PyScp {
             async {
                 let did_method = shared_did_method(&bi_arc)?;
 
-                // Pre-rotation is mandatory at creation (spec §9.7.4.1 item 5(a)), which
-                // requires a `PreRotationCustody` backend. The only implementation
-                // is the test-harness `InMemoryPreRotationCustody` nullifier, so a
-                // shipped build FAILS CLOSED (ADR-062 §Decision 6, IDENT_1059)
-                // rather than silently minting it.
+                // No substrate satisfies §9.7.4.1 item 3a on a shipped build, so
+                // creation FAILS CLOSED with IDENT_1100 before any key exists
+                // (`03-identity.md` §3.10.10) rather than minting the
+                // test-harness `InMemoryPreRotationCustody` nullifier.
                 #[cfg(not(feature = "testing"))]
                 {
                     let _ = (&bi_arc, &key_custody, &custody_str, &did_method);
                     Err::<PyIdentity, pyo3::PyErr>(
-                        crate::identity::no_pre_rotation_backend().into(),
+                        crate::identity::no_independent_substrate().into(),
                     )
                 }
                 #[cfg(feature = "testing")]
@@ -1686,13 +1700,13 @@ impl crate::scp::PyScp {
             async {
                 let did_method = shared_did_method(&bi_arc)?;
 
-                // FAIL CLOSED on a shipped build — no real pre-rotation backend
-                // (ADR-062 §Decision 6, IDENT_1059). See `identity_create`.
+                // FAIL CLOSED on a shipped build: no substrate satisfies
+                // §9.7.4.1 item 3a (IDENT_1100). See `identity_create`.
                 #[cfg(not(feature = "testing"))]
                 {
                     let _ = (&bi_arc, &key_custody, &custody_str, &did_method);
                     Err::<PyIdentity, pyo3::PyErr>(
-                        crate::identity::no_pre_rotation_backend().into(),
+                        crate::identity::no_independent_substrate().into(),
                     )
                 }
                 #[cfg(feature = "testing")]
@@ -1845,15 +1859,15 @@ impl crate::scp::PyScp {
             async {
                 let did_method = shared_did_method(&bi_arc)?;
 
-                // FAIL CLOSED on a shipped build — no real pre-rotation backend
-                // (ADR-062 §Decision 6, IDENT_1059). This callback-custody path
-                // funnels through the same pre-rotation commitment as every other
-                // create path, so it fails closed identically. See `identity_create`.
+                // FAIL CLOSED on a shipped build: no substrate satisfies
+                // §9.7.4.1 item 3a (IDENT_1100). This callback-custody path
+                // refuses identically to every other create path, before any
+                // provider call. See `identity_create`.
                 #[cfg(not(feature = "testing"))]
                 {
                     let _ = (&bi_arc, &key_custody, &custody_str, &did_method);
                     Err::<PyIdentity, pyo3::PyErr>(
-                        crate::identity::no_pre_rotation_backend().into(),
+                        crate::identity::no_independent_substrate().into(),
                     )
                 }
                 #[cfg(feature = "testing")]

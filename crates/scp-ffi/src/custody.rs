@@ -912,7 +912,7 @@ impl KeyCustody for PyCallbackKeyCustody {
         // depends on the `PreRotationCustody` backend, and no such backend
         // ships — the only implementation is the `testing`-gated
         // `InMemoryPreRotationCustody` nullifier, so a shipped build fails
-        // closed with `SCP-IDENT-1059` instead (#1729 / RFC #2130 track the
+        // closed with `SCP-IDENT-1100` instead (#1729 / RFC #2130 track the
         // real backends). HSM-bound platforms should route platform-CSPRNG
         // bytes directly into a `PreRotationCustody`, bypassing `KeyCustody`.
         use rand::RngCore;

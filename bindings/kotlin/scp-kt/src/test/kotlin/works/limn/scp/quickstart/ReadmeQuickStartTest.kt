@@ -10,8 +10,8 @@
 // input, so an edit to the README alone reruns these tests.
 //
 // The quick start uses `CustodyType.ENCRYPTED_FILE`, for which a native library
-// built without the `testing` feature has no pre-rotation custody backend
-// (`SCP-IDENT-1059`); the test task builds it with
+// built without the `testing` feature has no independent next-set substrate
+// (`SCP-IDENT-1100`); the test task builds it with
 // `-Pscp.uniffi.cargoFeatures=testing`, as CI does, and the run test points
 // `HOME` and `SCP_KEY_PASSPHRASE` at a temporary key file. The error-handling
 // test creates its identity through the test-harness in-memory key store

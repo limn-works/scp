@@ -27,7 +27,7 @@ swift run
 `Sources/main.swift` passes `AppleKeyCustody()`, the SDK's `KeyCustodyProvider`
 over the Keychain, to `identityCreateWithCustody(provider:)`: the `os_keystore`
 custody request of spec 03 §3.2.2. A build without the bridge's `testing`
-feature has no pre-rotation custody backend and throws `SCP-IDENT-1059` from
+feature has no independent next-set substrate and throws `SCP-IDENT-1100` from
 that call; the custody paragraph of `docs/guides/sdk-quickstart.md` states which
 identity creations a shipped build refuses.
 

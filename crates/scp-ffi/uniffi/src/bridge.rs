@@ -257,21 +257,34 @@ pub(crate) fn build_ffi_dht_client() -> Result<FfiDhtClient, ScpError> {
     })
 }
 
-/// Fail-closed error for a production identity-creation / rotation / migration
-/// path when no real pre-rotation custody backend is available (ADR-062
-/// §Decision 6).
+/// Fail-closed error for a production rotation, agent-key or migration path
+/// when no real pre-rotation custody backend is available (ADR-062 §Decision 6).
 ///
-/// Every identity commits a pre-rotation commitment at creation (spec §9.7.4.1
-/// item 5(a) — mandatory), which requires a `PreRotationCustody` backend. The only
-/// implementation is the test-harness `InMemoryPreRotationCustody` nullifier, so
-/// a shipped (no-`testing`) build returns this typed [`codes::IDENT_1059`] error
-/// rather than silently minting the nullifier. Mirrors the `PyO3` reference
-/// bridge's `no_pre_rotation_backend` helper.
+/// Those paths read or reveal a pre-rotation key, which requires a
+/// `PreRotationCustody` backend. The only implementation is the test-harness
+/// `InMemoryPreRotationCustody` nullifier, so a shipped (no-`testing`) build
+/// returns this typed [`codes::IDENT_1059`] error rather than silently minting
+/// the nullifier. Identity creation returns [`no_independent_substrate`]
+/// instead. Mirrors the `PyO3` reference bridge's `no_pre_rotation_backend`.
 #[cfg(not(feature = "testing"))]
 fn no_pre_rotation_backend() -> ScpError {
     ScpError::Identity {
         msg: IdentityError::NoPreRotationBackend.to_string(),
         code: codes::IDENT_1059.to_owned(),
+    }
+}
+
+/// Fail-closed error for every production identity-creation path: no
+/// substrate satisfies the independent-residence requirement of
+/// `09-security-model.md` §9.7.4.1 item 3a (`03-identity.md` §3.10.10), so a
+/// shipped (no-`testing`) build returns this typed [`codes::IDENT_1100`] error
+/// before any key exists. Mirrors the `PyO3` reference bridge's
+/// `no_independent_substrate`.
+#[cfg(not(feature = "testing"))]
+fn no_independent_substrate() -> ScpError {
+    ScpError::Identity {
+        msg: scp_identity::IdentityError::NoIndependentSubstrate.to_string(),
+        code: codes::IDENT_1100.to_owned(),
     }
 }
 
@@ -923,9 +936,10 @@ impl KeyCustody for CallbackKeyCustody {
         // implementation in the tree, `InMemoryPreRotationCustody`, is
         // a test-harness nullifier in `scp-platform`'s
         // `#[cfg(feature = "testing")]` `testing` module (ADR-062
-        // §Decision 6). On a shipped (no-`testing`) build the identity
-        // paths fail closed with `SCP-IDENT-1059` via
-        // `no_pre_rotation_backend` rather than substituting it, so a caller
+        // §Decision 6). On a shipped (no-`testing`) build identity creation
+        // fails closed with `SCP-IDENT-1100` via `no_independent_substrate`,
+        // and rotation and migration with `SCP-IDENT-1059` via
+        // `no_pre_rotation_backend`, rather than substituting it, so a caller
         // reads the capability as absent rather than as present and weak.
         //
         // Full §9.7.4.1 §3 substrate isolation requires a non-in-memory
@@ -1021,8 +1035,8 @@ pub(crate) enum UniffiKeyCustody {
     /// `FileKeyCustody`, the Argon2id plus AES-256-GCM key file at
     /// `$HOME/.scp/keys.bin` of spec §17.8.
     ///
-    /// A shipped build refuses every identity creation with `SCP-IDENT-1059`
-    /// before it opens the key file (ADR-062 §Decision 6, see
+    /// A shipped build refuses every identity creation with `SCP-IDENT-1100`
+    /// before it opens the key file (`03-identity.md` §3.10.10, see
     /// [`open_custody_for_create`]), so only a `testing` build constructs this
     /// variant today.
     #[cfg_attr(not(feature = "testing"), allow(dead_code))]
@@ -3059,7 +3073,7 @@ pub struct Identity {
     /// the sole `PreRotationCustody` implementation is the in-memory
     /// `InMemoryPreRotationCustody` nullifier, which the `testing` feature
     /// severs from every production line. On a shipped (no-`testing`) build the
-    /// create funnels fail closed with [`codes::IDENT_1059`] BEFORE any
+    /// create funnels fail closed with [`codes::IDENT_1100`] BEFORE any
     /// `Identity` is constructed, so no production handle ever carries this
     /// field — hence it is gated out of the bare build entirely.
     ///
@@ -7541,8 +7555,8 @@ struct CreateCustody {
     method: CustodyMethod,
 }
 
-/// A shipped build refuses every identity creation with `SCP-IDENT-1059`
-/// before it builds a custody (ADR-062 §Decision 6), so this type has no
+/// A shipped build refuses every identity creation with `SCP-IDENT-1100`
+/// before it builds a custody (`03-identity.md` §3.10.10), so this type has no
 /// value and a shipped creation path ends at `match created {}`.
 #[cfg(not(feature = "testing"))]
 enum CreateCustody {}
@@ -7712,7 +7726,7 @@ fn callback_identity_error(
 ///
 /// An `encrypted_file` request resolves `$HOME/.scp/keys.bin` and
 /// `SCP_KEY_PASSPHRASE` first, so a bad variable surfaces on every build. A
-/// shipped build then refuses with `SCP-IDENT-1059` before the key file opens,
+/// shipped build then refuses with `SCP-IDENT-1100` before the key file opens,
 /// so a failed call leaves no key file sealed under whatever passphrase was
 /// set.
 ///
@@ -7753,7 +7767,7 @@ fn decide_custody_for_create(
             #[cfg(not(feature = "testing"))]
             {
                 drop(inputs);
-                return Err(no_pre_rotation_backend());
+                return Err(no_independent_substrate());
             }
             #[cfg(feature = "testing")]
             {
@@ -7833,10 +7847,10 @@ async fn open_custody_for_create(
 }
 
 /// Answers one identity-creation call on a shipped build. Every request
-/// [`decide_custody_for_create`] accepts is refused with `SCP-IDENT-1059`:
-/// every identity commits a pre-rotation commitment at creation (spec
-/// §9.7.4.1 item 5(a)), and a shipped build has no `PreRotationCustody`
-/// backend (ADR-062 §Decision 6). The refusal comes after the custody is
+/// [`decide_custody_for_create`] accepts is refused with `SCP-IDENT-1100`: no
+/// substrate satisfies the independent-residence requirement of §9.7.4.1
+/// item 3a on a shipped build (`03-identity.md` §3.10.10). The refusal comes
+/// after the custody is
 /// decided and before any key is generated. Nothing here waits, so the
 /// result is an already-ready future and the callers share one `.await`.
 #[cfg(not(feature = "testing"))]
@@ -7851,7 +7865,7 @@ fn open_custody_for_create(
         decide_custody_for_create(custody, provider, testing_seed, repository, namespaces)
             .and_then(|(_, decided)| {
                 drop(decided);
-                Err(no_pre_rotation_backend())
+                Err(no_independent_substrate())
             }),
     )
 }
@@ -10184,7 +10198,7 @@ enum MintShape {
 /// `Arc` the registry holds.
 ///
 /// Only a `testing` build reaches this: a shipped build refuses every creation
-/// with `SCP-IDENT-1059` first (ADR-062 §Decision 6).
+/// with `SCP-IDENT-1100` first (`03-identity.md` §3.10.10).
 #[cfg(feature = "testing")]
 async fn mint_identity(
     bi: &Arc<crate::runtime::UniffiBridgeInstance>,
@@ -10413,11 +10427,11 @@ impl Scp {
         runtime()
             .spawn(async move {
                 // A shipped build refuses inside `open_custody_for_create`
-                // with SCP-IDENT-1059 after it binds the provider (ADR-062
-                // §Decision 6): every create commits a mandatory pre-rotation
-                // commitment (spec §9.7.4.1 item 5(a)), and the only
-                // `PreRotationCustody` is the test-harness nullifier the
-                // `testing` feature severs from production. Mirrors PyO3
+                // with SCP-IDENT-1100 after it binds the provider
+                // (`03-identity.md` §3.10.10): no substrate satisfies the
+                // independent-residence requirement of §9.7.4.1 item 3a, and
+                // the only `PreRotationCustody` is the test-harness nullifier
+                // the `testing` feature severs from production. Mirrors PyO3
                 // `identity_create_with_custody`.
                 let created = open_custody_for_create(
                     CustodyRequest::OsKeystore.as_str(),
@@ -20056,8 +20070,8 @@ mod tests {
 
     /// A `KeyCustodyProvider` whose every method returns an error, used to prove
     /// that `identity_create_with_custody` declines BEFORE it calls the provider.
-    /// A shipped build must reject the create at the pre-rotation check, so a
-    /// provider that can satisfy no request still yields `SCP-IDENT-1059` — never
+    /// A shipped build must reject the create before any key exists, so a
+    /// provider that can satisfy no request still yields `SCP-IDENT-1100` — never
     /// a custody error and never an identity.
     #[cfg(not(feature = "testing"))]
     struct NeverAnsweringCustodyProvider;
@@ -20068,8 +20082,8 @@ mod tests {
             ScpError::Identity {
                 msg: format!(
                     "NeverAnsweringCustodyProvider::{method} was called — \
-                     identity_create_with_custody must fail closed on the pre-rotation \
-                     check before it reaches the injected custody provider"
+                     identity_create_with_custody must fail closed with SCP-IDENT-1100 \
+                     before it reaches the injected custody provider"
                 ),
                 code: codes::IDENT_1003.to_owned(),
             }
@@ -20119,8 +20133,8 @@ mod tests {
         }
 
         /// The only infallible method on the trait. It reports `"software"`
-        /// because the create path must decline for want of a pre-rotation
-        /// backend, not for want of a recognized custody type.
+        /// because the create path must decline for want of an independent
+        /// substrate, not for want of a recognized custody type.
         fn custody_type(&self, _key_id: String) -> String {
             "software".to_owned()
         }
@@ -20128,56 +20142,22 @@ mod tests {
 
     /// ADR-062 §Decision 6 acceptance criterion 5, the `UniFFI` arm: on a shipped
     /// (no-`testing`) build `identity_create_with_custody` returns the typed
-    /// `SCP-IDENT-1059` error instead of minting an identity, because the tree's
-    /// only `PreRotationCustody` implementation is the `testing`-gated
-    /// `InMemoryPreRotationCustody` nullifier.
+    /// `SCP-IDENT-1100` error before it calls the provider, instead of minting
+    /// an identity, because no substrate satisfies §9.7.4.1 item 3a
+    /// (`03-identity.md` §3.10.10).
     ///
-    /// This is the per-bridge twin of the `PyO3`
-    /// `identity_create_fails_closed_without_pre_rotation_backend`
-    /// (`crates/scp-ffi/src/scp.rs`) and the NAPI test of the same name
-    /// (`crates/scp-ffi/napi/src/identity.rs`). It asserts more than either of
-    /// those two: a `UniFFI` `KeyCustodyProvider` is a plain Rust trait, so this
-    /// test drives the callback-custody entry point itself and reads
-    /// `SCP-IDENT-1059` off it directly, rather than stopping at the earlier
-    /// custody-unavailable codes those bridges reach.
-    ///
-    /// Gated `#[cfg(not(feature = "testing"))]`, because the FEATURE being off
+    /// A `UniFFI` `KeyCustodyProvider` is a plain Rust trait, so this test
+    /// drives the callback-custody entry point itself. Gated
+    /// `#[cfg(not(feature = "testing"))]`, because the FEATURE being off
     /// selects the fail-closed arm and `test` cfg does not. Job
     /// rust-build-uniffi-production names this test in its `-E` filter and runs
     /// it against `--features server`, which is the configuration a released
     /// Swift/Kotlin SDK compiles.
     #[cfg(not(feature = "testing"))]
     #[test]
-    fn identity_create_with_custody_fails_closed_without_pre_rotation_backend() {
-        let scp = scp_test();
-        if let Some(case) = crate::test_env::child_case() {
-            let (result, want) = match case.as_str() {
-                "identity_create" => (
-                    runtime().block_on(scp.identity_create("encrypted_file".to_owned(), None)),
-                    codes::IDENT_1059,
-                ),
-                "identity_create_with_agent_key" => (
-                    runtime()
-                        .block_on(scp.identity_create_with_agent_key("encrypted_file".to_owned())),
-                    codes::IDENT_1059,
-                ),
-                "identity_create without a passphrase" => (
-                    runtime().block_on(scp.identity_create("encrypted_file".to_owned(), None)),
-                    codes::VALID_7001,
-                ),
-                other => panic!("unknown case {other}"),
-            };
-            match result {
-                Err(ScpError::Identity { code, msg } | ScpError::Validation { code, msg }) => {
-                    assert_eq!(code, want, "{case}(encrypted_file): {msg}");
-                }
-                Err(other) => panic!("{case}(encrypted_file): expected {want}, got {other:?}"),
-                Ok(_) => panic!("{case}(encrypted_file) must FAIL CLOSED on a shipped build"),
-            }
-            return;
-        }
+    fn identity_create_with_custody_fails_closed_with_ident_1100() {
         // Callback custody refuses storage that does not persist before it
-        // reaches the pre-rotation backend, so this arm runs on SQLite.
+        // reaches the creation refusal, so this runs on SQLite.
         let persistent = scp_persistent_test();
         let result = runtime().block_on(
             persistent.identity_create_with_custody(Box::new(NeverAnsweringCustodyProvider)),
@@ -20185,38 +20165,64 @@ mod tests {
         match result {
             Ok(_) => panic!(
                 "shipped identity_create_with_custody must FAIL CLOSED — no identity may \
-                 be minted on a production path without a real pre-rotation backend"
+                 be minted on a production path"
             ),
             Err(ScpError::Identity { msg, code }) => {
                 assert_eq!(
                     code,
-                    codes::IDENT_1059,
-                    "expected the pre-rotation fail-closed code SCP-IDENT-1059, got \
-                     code {code} with message: {msg}"
+                    codes::IDENT_1100,
+                    "expected SCP-IDENT-1100, got code {code} with message: {msg}"
                 );
             }
             Err(other) => {
-                panic!("expected ScpError::Identity carrying SCP-IDENT-1059, got: {other:?}")
+                panic!("expected ScpError::Identity carrying SCP-IDENT-1100, got: {other:?}")
             }
         }
+    }
 
-        // `encrypted_file` resolves HOME and SCP_KEY_PASSPHRASE on a shipped
-        // build, so a bad variable is SCP-VALID-7001, and then refuses with
-        // SCP-IDENT-1059 before the key file opens, so a refused call leaves
-        // no `$HOME/.scp` (spec 03 §3.2.2, ADR-062 §Decision 6). Each case
-        // runs in a child process that `test_env::run_case` starts with its
-        // own HOME and SCP_KEY_PASSPHRASE, so this test sets no environment
-        // variable in a process where other tests run.
+    /// Runs one shipped `encrypted_file` create case in this process (the
+    /// child) or starts each case in a child process (the parent).
+    ///
+    /// `encrypted_file` resolves HOME and SCP_KEY_PASSPHRASE on a shipped
+    /// build, so a bad variable is `SCP-VALID-7001`, and then refuses with
+    /// `SCP-IDENT-1100` before the key file opens, so a refused call leaves no
+    /// `$HOME/.scp` (spec 03 §3.2.2 and §3.10.10). Each case runs in a child
+    /// process that `test_env::run_case` starts with its own HOME and
+    /// SCP_KEY_PASSPHRASE, so no test sets an environment variable in a process
+    /// where other tests run.
+    #[cfg(not(feature = "testing"))]
+    fn run_encrypted_file_create_cases(test_name: &str, with_agent_key: bool) {
+        if let Some(case) = crate::test_env::child_case() {
+            let scp = scp_test();
+            let result = if with_agent_key {
+                runtime().block_on(scp.identity_create_with_agent_key("encrypted_file".to_owned()))
+            } else {
+                runtime().block_on(scp.identity_create("encrypted_file".to_owned(), None))
+            };
+            let want = match case.as_str() {
+                "with a passphrase" => codes::IDENT_1100,
+                "without a passphrase" => codes::VALID_7001,
+                other => panic!("unknown case {other}"),
+            };
+            match result {
+                Err(ScpError::Identity { code, msg } | ScpError::Validation { code, msg }) => {
+                    assert_eq!(code, want, "{test_name} {case}: {msg}");
+                    assert_ne!(code, codes::IDENT_1059, "{test_name} {case}: {msg}");
+                }
+                Err(other) => panic!("{test_name} {case}: expected {want}, got {other:?}"),
+                Ok(_) => panic!("{test_name} {case} must FAIL CLOSED on a shipped build"),
+            }
+            return;
+        }
         let home = tempfile::tempdir().expect("tempdir");
         let passphrase = std::ffi::OsStr::new("fail-closed-test-passphrase");
         for (case, passphrase) in [
-            ("identity_create", Some(passphrase)),
-            ("identity_create_with_agent_key", Some(passphrase)),
-            ("identity_create without a passphrase", None),
+            ("with a passphrase", Some(passphrase)),
+            ("without a passphrase", None),
         ] {
             crate::test_env::run_case(
                 module_path!(),
-                "identity_create_with_custody_fails_closed_without_pre_rotation_backend",
+                test_name,
                 case,
                 &[
                     ("HOME", Some(home.path().as_os_str())),
@@ -20229,6 +20235,30 @@ mod tests {
             !key_dir.exists(),
             "a refused encrypted_file create must not create {}",
             key_dir.display()
+        );
+    }
+
+    /// `identity_create("encrypted_file")` on a shipped build refuses with
+    /// `SCP-IDENT-1100` before the key file opens. Named in job
+    /// rust-build-uniffi-production's `-E` filter.
+    #[cfg(not(feature = "testing"))]
+    #[test]
+    fn identity_create_encrypted_file_refuses_with_ident_1100() {
+        run_encrypted_file_create_cases(
+            "identity_create_encrypted_file_refuses_with_ident_1100",
+            false,
+        );
+    }
+
+    /// `identity_create_with_agent_key("encrypted_file")` on a shipped build
+    /// refuses with `SCP-IDENT-1100` before the key file opens. Named in job
+    /// rust-build-uniffi-production's `-E` filter.
+    #[cfg(not(feature = "testing"))]
+    #[test]
+    fn identity_create_with_agent_key_encrypted_file_refuses_with_ident_1100() {
+        run_encrypted_file_create_cases(
+            "identity_create_with_agent_key_encrypted_file_refuses_with_ident_1100",
+            true,
         );
     }
 

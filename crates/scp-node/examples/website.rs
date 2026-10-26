@@ -1,16 +1,17 @@
 //! Host a static website on SCP with `scp_node::host_site`.
 //!
-//! UNTIL A PRODUCTION `PreRotationCustody` BACKEND EXISTS, NO BUILD RUNS THIS
+//! UNTIL A SUBSTRATE SATISFIES SPEC §9.7.4.1 ITEM 3A, NO BUILD RUNS THIS
 //! EXAMPLE WITHOUT A TEST-HARNESS STAND-IN. `cargo run -p scp-node --example
 //! website` compiles, then exits 1 on every run with
-//! `IdentityError::NoPreRotationBackend`, which `main` prints as:
+//! `IdentityError::NoIndependentSubstrate` (`SCP-IDENT-1100`), which `main`
+//! prints as:
 //!
 //! ```text
-//! Error: NodeBuild(Identity(NoPreRotationBackend))
+//! Error: NodeBuild(IdentityCreation(NoIndependentSubstrate))
 //! ```
 //!
 //! An embedder detects the same failure by matching
-//! `HostSiteError::NodeBuild(NodeError::Identity(IdentityError::NoPreRotationBackend))`.
+//! `HostSiteError::NodeBuild(NodeError::IdentityCreation(IdentityError::NoIndependentSubstrate))`.
 //!
 //! A `testing` build is not a way to run it: `testing` mints the identity
 //! through `scp_platform::testing::InMemoryPreRotationCustody`, which holds the
@@ -22,9 +23,10 @@
 //! resolves by loading the stored identity or, when the directory holds none,
 //! creating one on its `Generate` path. Every run uses a new, empty directory
 //! (below), so every run takes `Generate`. On a build without `testing` that path
-//! returns `NoPreRotationBackend` whatever custody or storage is supplied: it
-//! takes no `PreRotationCustody` input, the backend spec §9.7.4.1 item 3 requires,
-//! so it fails closed here instead of minting a nullifier-backed identity.
+//! returns `NoIndependentSubstrate` whatever custody or storage is supplied: it
+//! takes no next-set custody, the substrate spec §9.7.4.1 item 3 requires, so it
+//! fails closed here before any key exists instead of minting a
+//! nullifier-backed identity.
 //!
 //! The `PORT` env var overrides the listen port, which defaults to 8080.
 //!

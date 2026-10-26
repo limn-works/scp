@@ -26,8 +26,8 @@ python main.py
 3. Opens an encrypted single-admin context
 4. Shuts the instance down when the `async with` block exits
 
-A build without the bridge's `testing` feature has no pre-rotation custody
-backend and raises `SCP-IDENT-1059` for `CustodyType.ENCRYPTED_FILE`.
+A build without the bridge's `testing` feature has no independent next-set
+substrate and raises `SCP-IDENT-1100` for `CustodyType.ENCRYPTED_FILE`.
 
 ## Next Steps
 

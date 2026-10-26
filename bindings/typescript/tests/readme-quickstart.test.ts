@@ -14,7 +14,7 @@
  * directory and a fixed `SCP_KEY_PASSPHRASE`, so the key file it writes,
  * `$HOME/.scp/keys.bin`, never touches the real home directory. Only a
  * `testing` addon creates the identity (a shipped one answers
- * `SCP-IDENT-1059`); every SDK test run builds the addon with that feature.
+ * `SCP-IDENT-1100`); every SDK test run builds the addon with that feature.
  */
 
 import { describe, expect, it } from "bun:test";

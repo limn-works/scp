@@ -250,9 +250,18 @@ pub enum NodeError {
     #[error("missing required field: {0}")]
     MissingField(&'static str),
 
-    /// An identity operation (create, publish) failed.
+    /// An identity operation of the superseded `did:dht` model (load, publish,
+    /// resolve) failed.
     #[error("identity error: {0}")]
     Identity(#[from] IdentityError),
+
+    /// Identity creation refused under the key-event-log identity model
+    /// (`03-identity.md` §3.10.10). A shipped build returns
+    /// [`scp_identity::IdentityError::NoIndependentSubstrate`]
+    /// (`SCP-IDENT-1100`) before any key exists, because no substrate
+    /// satisfies `09-security-model.md` §9.7.4.1 item 3a.
+    #[error("identity creation error: {0}")]
+    IdentityCreation(scp_identity::IdentityError),
 
     /// The relay server failed to start.
     #[error("relay error: {0}")]
@@ -2935,11 +2944,13 @@ async fn resolve_identity<K: KeyCustody, D: DidMethod>(
             }
             #[cfg(not(feature = "testing"))]
             {
-                // FAIL CLOSED (ADR-062 §Decision 6): no real PreRotationCustody
-                // backend exists yet (RFC #2130 / #1729). Never mint the in-memory
-                // nullifier on a shipped build — return a typed error instead.
+                // FAIL CLOSED before any key exists: no substrate satisfies
+                // §9.7.4.1 item 3a on a shipped build (`03-identity.md`
+                // §3.10.10, SCP-IDENT-1100). Never mint the in-memory nullifier.
                 let _ = (custody, did_method);
-                Err(NodeError::Identity(IdentityError::NoPreRotationBackend))
+                Err(NodeError::IdentityCreation(
+                    scp_identity::IdentityError::NoIndependentSubstrate,
+                ))
             }
         }
         IdentitySource::Explicit(e) => Ok((e.identity, e.document, e.did_method)),
@@ -3167,11 +3178,14 @@ pub(crate) async fn resolve_identity_persistent<K: KeyCustody, D: DidMethod, S: 
                 }
                 #[cfg(not(feature = "testing"))]
                 {
-                    // FAIL CLOSED (ADR-062 §Decision 6): no real PreRotationCustody
-                    // backend exists yet (RFC #2130 / #1729). Never mint the
-                    // in-memory nullifier on a shipped build — return a typed error.
+                    // FAIL CLOSED before any key exists: no substrate satisfies
+                    // §9.7.4.1 item 3a on a shipped build (`03-identity.md`
+                    // §3.10.10, SCP-IDENT-1100). Never mint the in-memory
+                    // nullifier.
                     let _ = (&custody, &did_method, storage);
-                    Err(NodeError::Identity(IdentityError::NoPreRotationBackend))
+                    Err(NodeError::IdentityCreation(
+                        scp_identity::IdentityError::NoIndependentSubstrate,
+                    ))
                 }
             }
         }
@@ -4260,11 +4274,13 @@ mod tests {
         DidDht::with_client_and_signer(dht_client, cache, sign_fn)
     }
 
-    /// ADR-062 §Decision 6 / SCP-CAPINJECT-006: on a shipped (no-`testing`) build
-    /// the production `Node` / self-host identity-generation path has no
-    /// pre-rotation custody backend, so it FAILS CLOSED with
-    /// [`IdentityError::NoPreRotationBackend`] (surfaced as SCP-IDENT-1059) rather
-    /// than minting the in-memory `InMemoryPreRotationCustody` nullifier.
+    /// SCP-006 AC10: on a shipped (no-`testing`) build the production `Node` /
+    /// self-host identity-generation path has no substrate satisfying
+    /// §9.7.4.1 item 3a, so it FAILS CLOSED with
+    /// `NodeError::IdentityCreation(NoIndependentSubstrate)` (SCP-IDENT-1100)
+    /// rather than minting the in-memory `InMemoryPreRotationCustody` nullifier
+    /// (ADR-062 §Decision 6). The superseded `NoPreRotationBackend`
+    /// (SCP-IDENT-1059) fails this test.
     ///
     /// Gated `#[cfg(not(feature = "testing"))]`: the fail-closed behavior only
     /// holds when the nullifier is severed. `resolve_identity`'s `Generate` arm
@@ -4285,10 +4301,15 @@ mod tests {
         // The Ok type contains `Arc<DidDht<..>>` which is not `Debug`, so match
         // explicitly rather than `expect_err`.
         match resolve_identity(source).await {
-            Err(NodeError::Identity(IdentityError::NoPreRotationBackend)) => {}
-            Err(other) => panic!("expected NoPreRotationBackend (SCP-IDENT-1059), got: {other:?}"),
+            Err(NodeError::IdentityCreation(e)) => {
+                assert_eq!(e, scp_identity::IdentityError::NoIndependentSubstrate);
+                assert_eq!(e.code(), "SCP-IDENT-1100");
+            }
+            Err(other) => {
+                panic!("expected IdentityCreation(NoIndependentSubstrate), got: {other:?}")
+            }
             Ok(_) => panic!(
-                "expected fail-closed NoPreRotationBackend, got Ok — the in-memory \
+                "expected fail-closed NoIndependentSubstrate, got Ok — the in-memory \
                  pre-rotation nullifier was minted on a shipped-config create path!"
             ),
         }
@@ -4296,7 +4317,8 @@ mod tests {
 
     /// Companion to the above for the persisting create path
     /// (`resolve_identity_persistent`'s generate branch): it likewise funnels
-    /// through the pre-rotation commitment and fails closed on a shipped build.
+    /// through the same refusal and fails closed with SCP-IDENT-1100 on a
+    /// shipped build.
     #[cfg(not(feature = "testing"))]
     #[tokio::test]
     async fn pre_rotation_severance_persistent_fails_closed() {
@@ -4308,10 +4330,15 @@ mod tests {
         };
         let storage = InMemoryStorage::new();
         match resolve_identity_persistent(source, true, &storage).await {
-            Err(NodeError::Identity(IdentityError::NoPreRotationBackend)) => {}
-            Err(other) => panic!("expected NoPreRotationBackend (SCP-IDENT-1059), got: {other:?}"),
+            Err(NodeError::IdentityCreation(e)) => {
+                assert_eq!(e, scp_identity::IdentityError::NoIndependentSubstrate);
+                assert_eq!(e.code(), "SCP-IDENT-1100");
+            }
+            Err(other) => {
+                panic!("expected IdentityCreation(NoIndependentSubstrate), got: {other:?}")
+            }
             Ok(_) => panic!(
-                "expected fail-closed NoPreRotationBackend, got Ok — the in-memory \
+                "expected fail-closed NoIndependentSubstrate, got Ok — the in-memory \
                  pre-rotation nullifier was minted on a shipped-config persist create path!"
             ),
         }

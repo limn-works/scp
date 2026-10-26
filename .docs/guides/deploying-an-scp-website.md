@@ -9,12 +9,12 @@ no separate web server and no DNS requirement on the origin). See the example at
 
 On every build without `scp-node`'s `testing` feature, `host_site` fails closed when it has
 to create an identity, returning
-`HostSiteError::NodeBuild(NodeError::Identity(IdentityError::NoPreRotationBackend))`, a typed
+`HostSiteError::NodeBuild(NodeError::IdentityCreation(IdentityError::NoIndependentSubstrate))`, a typed
 value a caller matches without reading the message text. `host_site` first
 reloads any identity its storage directory holds, and creates one on `Node::start`'s
 `Generate` path only when the directory holds none. On a build without `testing`, that path
-returns `NoPreRotationBackend` whatever custody or storage the caller supplies: it takes no
-`PreRotationCustody` input. A failed run persists no identity, so the next run against the
+returns `NoIndependentSubstrate` whatever custody or storage the caller supplies: it takes no
+next-set custody input. A failed run persists no identity, so the next run against the
 same directory takes the same path. So on a shipped build, each recipe below fails on every
 run whose `storage_path` directory holds no identity, and its `Verify` step cannot succeed.
 No build creates an identity without a test-harness stand-in until a production

@@ -13,7 +13,7 @@ import XCTest
 ///
 /// The quick start uses `CustodyType.encryptedFile`, which only an XCFramework
 /// built with the `testing` feature serves (`build-xcframework.sh --dev`, which
-/// CI uses; a release build throws `SCP-IDENT-1059`). Its run test points `HOME`
+/// CI uses; a release build throws `SCP-IDENT-1100`). Its run test points `HOME`
 /// at a scratch directory, sets `SCP_KEY_PASSPHRASE`, and checks that the key
 /// file lands there. The error-handling test creates its identity through
 /// `TestHarnessCustody.swift`.

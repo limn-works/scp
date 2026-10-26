@@ -707,53 +707,124 @@ mod tests {
     // These run in the shipped (no-`testing`) test lane (`cargo test -p scp-ffi`
     // with the crate's own `testing` feature OFF), where this PyO3 bridge's own
     // `identity_create` / device-attestation *verify* arms select the fail-closed
-    // path. They are the AC5 (create → SCP-IDENT-1059) and AC3 (verify →
+    // path. They are the AC5 (create → SCP-IDENT-1100) and AC3 (verify →
     // SCP-IDENT-1016) per-bridge assertions, independent of the scp-identity
     // `config.rs` and scp-node proofs. Gated `#[cfg(not(feature = "testing"))]`.
     // -----------------------------------------------------------------------
 
-    /// AC5: on a shipped build the production `identity_create` path fails closed
-    /// with [`IDENT_1059`](scp_ffi_common::error_codes::IDENT_1059) rather than
-    /// minting the `InMemoryPreRotationCustody` nullifier. `encrypted_file` custody is used
-    /// because `in_memory` custody is itself severed on shipped builds; a temp
-    /// `HOME` + `SCP_KEY_PASSPHRASE` resolve its inputs. The
-    /// refusal runs after those inputs resolve and before the key directory or
-    /// key file is created, so a failed call leaves no `$HOME/.scp`.
+    /// Sets a temp `HOME` and `SCP_KEY_PASSPHRASE` so `encrypted_file` custody
+    /// resolves its inputs. nextest runs each test in its own process, so these
+    /// env mutations do not leak into sibling tests.
     #[cfg(not(feature = "testing"))]
-    #[test]
-    fn identity_create_fails_closed_without_pre_rotation_backend() {
+    fn encrypted_file_env() -> tempfile::TempDir {
         pyo3::prepare_freethreaded_python();
         crate::init_runtime().expect("runtime init");
         let tmp = tempfile::tempdir().expect("tempdir");
-        // Isolate the File custody key directory (`$HOME/.scp/keys.bin`) and set
-        // the passphrase it requires. nextest runs each test in its own process,
-        // so these env mutations do not leak into sibling tests.
         // SAFETY: single-threaded test process (nextest process-per-test); no
         // other thread reads the environment concurrently.
         unsafe {
             std::env::set_var("HOME", tmp.path());
             std::env::set_var("SCP_KEY_PASSPHRASE", "fail-closed-test-passphrase");
         }
-        Python::with_gil(|py| {
-            let scp = PyScp::new_in_memory_for_test();
-            let msg = match scp.identity_create(py, "encrypted_file", None) {
-                Ok(_) => panic!(
-                    "shipped identity_create must FAIL CLOSED — the in-memory \
-                     pre-rotation nullifier must not be minted on a production path"
-                ),
-                Err(err) => err.to_string(),
-            };
-            assert!(
-                msg.contains(scp_ffi_common::error_codes::IDENT_1059),
-                "shipped identity_create must fail closed with SCP-IDENT-1059, got: {msg}"
-            );
-        });
-        let key_dir = tmp.path().join(".scp");
+        tmp
+    }
+
+    /// Asserts a shipped create call refused with `SCP-IDENT-1100`, never the
+    /// superseded `SCP-IDENT-1059`, and created no `$HOME/.scp`.
+    #[cfg(not(feature = "testing"))]
+    fn assert_refused_with_ident_1100<T>(op: &str, result: PyResult<T>, home: &std::path::Path) {
+        let msg = match result {
+            Ok(_) => panic!(
+                "shipped {op} must FAIL CLOSED: the in-memory pre-rotation \
+                 nullifier must not be minted on a production path"
+            ),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            msg.contains(scp_ffi_common::error_codes::IDENT_1100),
+            "shipped {op} must fail closed with SCP-IDENT-1100, got: {msg}"
+        );
+        assert!(
+            !msg.contains(scp_ffi_common::error_codes::IDENT_1059),
+            "shipped {op} must not return the superseded SCP-IDENT-1059: {msg}"
+        );
+        let key_dir = home.join(".scp");
         assert!(
             !key_dir.exists(),
-            "a refused identity_create must not create {}",
+            "a refused {op} must not create {}",
             key_dir.display()
         );
+    }
+
+    /// AC5: on a shipped build the production `identity_create` path fails closed
+    /// with [`IDENT_1100`](scp_ffi_common::error_codes::IDENT_1100) before any
+    /// key exists. `encrypted_file` custody is used because `in_memory` custody
+    /// is itself severed on shipped builds. The refusal runs after its inputs
+    /// resolve and before the key directory or key file is created.
+    #[cfg(not(feature = "testing"))]
+    #[test]
+    fn identity_create_fails_closed_with_ident_1100() {
+        let tmp = encrypted_file_env();
+        Python::with_gil(|py| {
+            let scp = PyScp::new_in_memory_for_test();
+            assert_refused_with_ident_1100(
+                "identity_create",
+                scp.identity_create(py, "encrypted_file", None),
+                tmp.path(),
+            );
+        });
+    }
+
+    /// The agent-key create path refuses on a shipped build with
+    /// `SCP-IDENT-1100`, before the key directory exists.
+    #[cfg(not(feature = "testing"))]
+    #[test]
+    fn identity_create_with_agent_key_fails_closed_with_ident_1100() {
+        let tmp = encrypted_file_env();
+        Python::with_gil(|py| {
+            let scp = PyScp::new_in_memory_for_test();
+            assert_refused_with_ident_1100(
+                "identity_create_with_agent_key",
+                scp.identity_create_with_agent_key(py, "encrypted_file"),
+                tmp.path(),
+            );
+        });
+    }
+
+    /// The callback-custody create path refuses on a shipped build with
+    /// `SCP-IDENT-1100` before it calls the provider: every provider method
+    /// raises, so a call would surface a custody error in place of 1100. The
+    /// instance has `SQLCipher` storage, because callback custody over storage
+    /// that does not persist is refused earlier with `SCP-STORAGE-8000`.
+    #[cfg(not(feature = "testing"))]
+    #[test]
+    fn identity_create_with_custody_fails_closed_with_ident_1100() {
+        let tmp = encrypted_file_env();
+        Python::with_gil(|py| {
+            let module = pyo3::types::PyModule::from_code(
+                py,
+                c"class Provider:\n    def _refuse(self, *a):\n        raise RuntimeError('provider called')\n    sign = get_public_key = destroy_key = generate_keypair = _refuse\n    dh_agree = derive_pseudonym = derive_rotatable_pseudonym = custody_type = _refuse\n",
+                c"refusing_provider.py",
+                c"refusing_provider",
+            )
+            .expect("provider module compiles");
+            let provider = module
+                .getattr("Provider")
+                .and_then(|cls| cls.call0())
+                .expect("provider instance")
+                .unbind();
+            let scp = PyScp {
+                inner: std::sync::Arc::new(
+                    crate::runtime::PyBridgeInstance::sqlite_for_test(tmp.path())
+                        .expect("sqlite storage opens"),
+                ),
+            };
+            assert_refused_with_ident_1100(
+                "identity_create_with_custody",
+                scp.identity_create_with_custody(py, provider),
+                tmp.path(),
+            );
+        });
     }
 
     /// AC3: on a shipped build the device-attestation *verify* op fails closed

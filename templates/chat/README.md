@@ -39,7 +39,7 @@ export SCP_KEY_PASSPHRASE=...      # seals $HOME/.scp/keys.bin
 export SCP_STORAGE_PASSPHRASE=...  # encrypts the SQLCipher database
 ```
 
-A build without the bridge's `testing` feature has no pre-rotation custody backend and raises `SCP-IDENT-1059` for `CustodyType.ENCRYPTED_FILE`.
+A build without the bridge's `testing` feature has no independent next-set substrate and raises `SCP-IDENT-1100` for `CustodyType.ENCRYPTED_FILE`.
 
 Run the commands below from `templates/chat/python`.
 

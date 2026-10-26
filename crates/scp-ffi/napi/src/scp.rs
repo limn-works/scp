@@ -393,10 +393,10 @@ impl Scp {
     /// `"in_memory"` is `SCP-VALID-7009`, reported before the custody string
     /// is read.
     ///
-    /// A shipped build has no pre-rotation custody backend, so
+    /// On a shipped build no substrate satisfies §9.7.4.1 item 3a, so
     /// `"encrypted_file"` resolves its inputs (`SCP-VALID-7001` for a bad
-    /// `HOME` or `SCP_KEY_PASSPHRASE`) and then returns `SCP-IDENT-1059` before
-    /// the key file opens (ADR-062 §Decision 6).
+    /// `HOME` or `SCP_KEY_PASSPHRASE`) and then returns `SCP-IDENT-1100` before
+    /// the key file opens (`03-identity.md` §3.10.10).
     #[napi(js_name = "identityCreate")]
     pub async fn identity_create(
         &self,
@@ -517,14 +517,14 @@ impl Scp {
         // This is a PRODUCTION path (not feature-gated): the identity registry
         // retains the caller's callback custody so later signing / event-log /
         // SCPID operations reach it, mirroring the PyO3 reference bridge.
-        // ADR-003, DID creation on did:dht, §4b puts the pre-rotation key in a
-        // substrate separate from that operational custody, and no such substrate
+        // Spec §9.7.4.1 item 3a puts the next-set keys in a substrate
+        // independent of that operational custody, and no such substrate
         // ships: the tree's only `PreRotationCustody` implementation is the
         // `testing`-gated `InMemoryPreRotationCustody` nullifier (ADR-062,
         // capability injection and prove-absent dev backends, §Decision 6). A
         // shipped build of this entry point therefore fails closed with
-        // `codes::IDENT_1059` inside the spawned future (`create_identity`)
-        // rather than minting a pre-rotation key at all. Every custody operation
+        // `codes::IDENT_1100` inside the spawned future (`create_identity`)
+        // before any key exists. Every custody operation
         // keeps the caller's private keys in custody (never imported into Rust)
         // per ADR-006, and every signing path signs through `KeyCustody::sign`
         // (ADR-049 Decision 7a).
@@ -5848,9 +5848,9 @@ fn callback_identity_error(
     })
 }
 
-/// A shipped build has no `PreRotationCustody` backend, so every identity
-/// creation fails closed with `SCP-IDENT-1059` before the selected custody
-/// opens (ADR-062 §Decision 6, spec §9.7.4.1 item 5(a)). It returns a ready
+/// On a shipped build no substrate satisfies §9.7.4.1 item 3a, so every
+/// identity creation fails closed with `SCP-IDENT-1100` before the selected
+/// custody opens (`03-identity.md` §3.10.10). It returns a ready
 /// future so callers await it exactly as they await the `testing` build's.
 #[cfg(not(feature = "testing"))]
 fn create_identity(
@@ -6088,12 +6088,11 @@ mod custody_request_tests {
         assert!(agent.has_agent_key());
     }
 
-    /// A shipped build resolves `encrypted_file`, then refuses with the
-    /// shipped `SCP-IDENT-1059` before the key file opens, so the failed call
-    /// leaves no `$HOME/.scp` behind.
+    /// Selects `encrypted_file` under `home`, runs the shipped
+    /// `create_identity`, and asserts it refused with `SCP-IDENT-1100` (never
+    /// the superseded `SCP-IDENT-1059`) and left no `$HOME/.scp` behind.
     #[cfg(not(feature = "testing"))]
-    #[test]
-    fn encrypted_file_on_a_shipped_build_refuses_with_ident_1059_before_opening() {
+    fn assert_encrypted_file_create_refuses_with_ident_1100(with_agent_key: bool) {
         let home = tempfile::tempdir().expect("tempdir");
         let scp = Scp::new_in_memory_for_test();
         let selection = crate::custody::select_key_custody(
@@ -6103,15 +6102,36 @@ mod custody_request_tests {
             inputs_under(home.path(), PASSPHRASE),
         )
         .expect("encrypted_file selects the key file");
-        let Err(err) =
-            crate::runtime().block_on(create_identity(Arc::clone(&scp.inner), selection, false))
-        else {
+        let Err(err) = crate::runtime().block_on(create_identity(
+            Arc::clone(&scp.inner),
+            selection,
+            with_agent_key,
+        )) else {
             panic!("a shipped build must not mint an identity");
         };
-        assert!(err.to_string().contains(codes::IDENT_1059), "{err}");
+        assert!(err.to_string().contains(codes::IDENT_1100), "{err}");
+        assert!(!err.to_string().contains(codes::IDENT_1059), "{err}");
         assert!(
             !home.path().join(".scp").exists(),
             "the refused call must not create the key directory"
         );
+    }
+
+    /// A shipped build resolves `encrypted_file`, then refuses with
+    /// `SCP-IDENT-1100` before the key file opens, so the failed call leaves
+    /// no `$HOME/.scp` behind.
+    #[cfg(not(feature = "testing"))]
+    #[test]
+    fn encrypted_file_on_a_shipped_build_refuses_with_ident_1100_before_opening() {
+        assert_encrypted_file_create_refuses_with_ident_1100(false);
+    }
+
+    /// The agent-key create path (`identityCreateWithAgentKey`, which calls
+    /// `create_identity` with `with_agent_key = true`) refuses on a shipped
+    /// build with `SCP-IDENT-1100` before the key file opens.
+    #[cfg(not(feature = "testing"))]
+    #[test]
+    fn identity_create_with_agent_key_encrypted_file_refuses_with_ident_1100() {
+        assert_encrypted_file_create_refuses_with_ident_1100(true);
     }
 }
