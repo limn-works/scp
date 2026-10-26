@@ -904,8 +904,33 @@ pub enum RemovalBasis {
 /// A cosigner's authority to write a composer's `Composed` handle.
 ///
 /// It is bound to the event's digest (`09-security-model.md` §9.7.4.2 R10,
-/// the cosigner clause). The ceremony layer builds it from the cosigner
-/// record it persisted for that digest before it signs.
+/// the cosigner clause), and [`StoreSet::hold`] is its only consumer. Its
+/// fields are private and it has no public constructor, `Default`, `From` or
+/// deserializer, so no caller outside this crate mints one: a composer
+/// cannot call `hold`. The only producer will be the cosigner record the
+/// ceremony persists for that digest before it signs; until that record
+/// exists, `hold` has no caller outside this crate's tests.
+///
+/// ```compile_fail,E0451
+/// # use scp_kel::recovery_store::{CosignHold, RevealKind};
+/// let token = CosignHold { kind: RevealKind::FixesCommitment, event_digest: [0; 32] };
+/// ```
+///
+/// ```compile_fail,E0599
+/// # use scp_kel::recovery_store::{CosignHold, RevealKind};
+/// let token = CosignHold::new(RevealKind::FixesCommitment, [0; 32]);
+/// ```
+///
+/// The positive control: the same imports resolve, and the type is held by
+/// value where `hold` takes it.
+///
+/// ```
+/// # use scp_kel::recovery_store::{CosignHold, RevealKind};
+/// fn bound_to(token: &CosignHold, kind: RevealKind) -> bool {
+///     token.kind() == kind
+/// }
+/// let _ = bound_to;
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct CosignHold {
     kind: RevealKind,
@@ -914,10 +939,23 @@ pub struct CosignHold {
 
 impl CosignHold {
     /// The hold for the event of `kind` whose preimage digest is
-    /// `event_digest`, as the cosigner record names it.
-    #[must_use]
-    pub const fn from_cosigner_record(kind: RevealKind, event_digest: [u8; 32]) -> Self {
+    /// `event_digest`. Crate-private, and test-only until the cosigner
+    /// record that produces it exists.
+    #[cfg(test)]
+    pub(crate) const fn new(kind: RevealKind, event_digest: [u8; 32]) -> Self {
         Self { kind, event_digest }
+    }
+
+    /// The kind of the event the hold is bound to.
+    #[must_use]
+    pub const fn kind(&self) -> RevealKind {
+        self.kind
+    }
+
+    /// The preimage digest of the event the hold is bound to.
+    #[must_use]
+    pub const fn event_digest(&self) -> [u8; 32] {
+        self.event_digest
     }
 }
 
@@ -993,9 +1031,10 @@ impl<T: ?Sized> MaybeSync for T {}
 
 /// The one-writer lease on a credential's store set on this device.
 ///
-/// It is keyed on `(credential_id, identifier)`. A [`StoreSet`] takes its
-/// credential and identity from the lease, so the two cannot disagree, and
-/// holds the lease for its whole life.
+/// It is keyed on the credential alone, because every member keys its entry
+/// on the credential: one writer per entry, whichever identity it acts for.
+/// A [`StoreSet`] takes its credential and identity from the lease, so the
+/// two cannot disagree, and holds the lease for its whole life.
 pub trait SetLease {
     /// The pre-rotation credential the set is keyed on.
     fn credential_id(&self) -> &CredentialId;
@@ -1193,18 +1232,6 @@ impl Snapshot {
         })
     }
 
-    /// The ceremony's basis for `event_digest`: the marker the entry holding
-    /// its handle carries, the local store's first. A composition writes its
-    /// basis into every entry it writes.
-    fn ceremony_basis(&self, event_digest: &[u8; 32]) -> Option<LastRevealMarker> {
-        if self.local.holds(event_digest) {
-            return self.local.marker;
-        }
-        self.entries()
-            .find(|entry| entry.holds(event_digest))
-            .and_then(|entry| entry.marker)
-    }
-
     /// Whether the `largeBlob` store is a member.
     fn blob_is_member(&self) -> bool {
         match (&self.record, &self.blob) {
@@ -1258,6 +1285,7 @@ enum Change {
     Advance {
         event_digest: [u8; 32],
         target: AdvanceTarget,
+        basis: Option<LastRevealMarker>,
     },
     Complete {
         marker: LastRevealMarker,
@@ -1307,7 +1335,8 @@ fn merge(
         Change::Advance {
             event_digest,
             target,
-        } => merge_advance(store, entry, snapshot, event_digest, target)?,
+            basis,
+        } => merge_advance(store, entry, snapshot, event_digest, target, basis.as_ref())?,
         Change::Complete { marker } => merge_complete(entry, marker)?,
         Change::Remove { event_digest, .. } => {
             if entry.holds(&event_digest) {
@@ -1326,6 +1355,7 @@ fn merge_advance(
     snapshot: &Snapshot,
     event_digest: [u8; 32],
     target: AdvanceTarget,
+    basis: Option<&LastRevealMarker>,
 ) -> Result<Merge, RecoveryStoreError> {
     let phase = target.phase();
     match entry.handle {
@@ -1363,9 +1393,9 @@ fn merge_advance(
                 // The composition never reached this store, so no other
                 // device's abort can be undone here; the write is made only
                 // where no other ceremony completed since this one read its
-                // basis.
-                let basis = snapshot.ceremony_basis(&event_digest);
-                if !snapshot.basis_holds(basis.as_ref()) {
+                // basis. The basis comes from the caller, never from an
+                // entry: `complete` rewrites every entry's marker.
+                if !snapshot.basis_holds(basis) {
                     return Err(RecoveryStoreError::MarkerMoved);
                 }
                 let handle = snapshot
@@ -1561,7 +1591,10 @@ where
     /// `event_digest` is the one pending handle, at `Composed` to
     /// `Confirmed`, held by every member that must hold it, and that no
     /// other ceremony completed since this one read its basis. Returns the
-    /// handle at its merged phase.
+    /// handle at its merged phase. `basis` is the marker the ceremony's
+    /// last-reveal rule ran against: the composer passes the one it gave
+    /// [`Self::compose`], and a resuming device the one its rule ran against
+    /// at resume.
     ///
     /// # Errors
     ///
@@ -1574,6 +1607,7 @@ where
     pub async fn confirm_pending(
         &self,
         event_digest: &[u8; 32],
+        basis: Option<&LastRevealMarker>,
     ) -> Result<RecoveryHandle, RecoveryStoreError> {
         let snapshot = self.snapshot().await?;
         if !snapshot.is_live(event_digest) {
@@ -1588,8 +1622,7 @@ where
         if other_live {
             return Err(RecoveryStoreError::HandleGone);
         }
-        let basis = snapshot.ceremony_basis(event_digest);
-        if !snapshot.basis_holds(basis.as_ref()) {
+        if !snapshot.basis_holds(basis) {
             return Err(RecoveryStoreError::MarkerMoved);
         }
         if snapshot
@@ -1686,6 +1719,9 @@ where
 
     /// Moves the handle naming `event_digest` to `target` in every store. A
     /// phase never moves to a lower rank, so a retry changes nothing.
+    /// `basis` is the ceremony's, as for [`Self::confirm_pending`]; it is
+    /// checked where a `largeBlob` store the composition skipped takes the
+    /// handle.
     ///
     /// # Errors
     ///
@@ -1703,6 +1739,7 @@ where
         &mut self,
         event_digest: [u8; 32],
         target: AdvanceTarget,
+        basis: Option<LastRevealMarker>,
     ) -> Result<WriteReport, RecoveryStoreError> {
         let snapshot = self.snapshot().await?;
         if target.phase().is_pending() && !snapshot.any_holds(&event_digest) {
@@ -1713,6 +1750,7 @@ where
             Change::Advance {
                 event_digest,
                 target,
+                basis,
             },
         )?;
         let to_signed = target == AdvanceTarget::Signed;

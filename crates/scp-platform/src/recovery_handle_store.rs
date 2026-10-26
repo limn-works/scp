@@ -120,21 +120,22 @@ impl<S: EncryptedStorage> RecoveryEventStore for SdkLocalMember<S> {
 // The one-writer lease
 // ---------------------------------------------------------------------------
 
-/// A held lease's key: the credential identifier's bytes and the identity.
-type LeaseKey = (Vec<u8>, [u8; 32]);
-
 /// The registry of store-set leases over one local database.
 ///
-/// A device runs one writer per `(credential_id, identifier)`: R10's
+/// A device runs one writer per pre-rotation credential: R10's
 /// one-reveal-at-a-time rule reads every store and then writes, so two
 /// writers on one device would each merge against a read the other's write
-/// makes stale. The registry is keyed on the pair, not on a storage
-/// instance, so two storage instances over one database share it when the
-/// caller injects the registry for that database path into both. Clones
-/// share the registry.
+/// makes stale. The lease is keyed on the credential because every member
+/// keys its entry on the credential alone
+/// (`recovery/{sha256_hex(credential_id)}/entry`,
+/// `17-persistence-and-storage.md` §17.8): two identities sharing one
+/// credential share one entry, so they take turns. The registry is keyed on
+/// the credential, not on a storage instance, so two storage instances over
+/// one database share it when the caller injects the registry for that
+/// database path into both. Clones share the registry.
 #[derive(Clone, Debug)]
 pub struct RecoveryLeases {
-    held: Arc<Mutex<HashSet<LeaseKey>>>,
+    held: Arc<Mutex<HashSet<CredentialId>>>,
 }
 
 impl RecoveryLeases {
@@ -151,21 +152,20 @@ impl RecoveryLeases {
     ///
     /// # Errors
     ///
-    /// [`RecoveryStoreError::SetInUse`] while another lease on the pair is
-    /// held.
+    /// [`RecoveryStoreError::SetInUse`] while another lease on the
+    /// credential is held, for any identity.
     pub fn acquire(
         &self,
         credential_id: CredentialId,
         identifier: Identifier,
     ) -> Result<RecoveryLease, RecoveryStoreError> {
-        let key = (credential_id.as_bytes().to_vec(), *identifier.as_bytes());
         // A poisoned lock means a holder panicked while inserting or
         // removing one key; the set is still a valid set of keys.
         let inserted = self
             .held
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(key);
+            .insert(credential_id.clone());
         if !inserted {
             return Err(RecoveryStoreError::SetInUse);
         }
@@ -183,9 +183,9 @@ impl Default for RecoveryLeases {
     }
 }
 
-/// A held lease on one credential's store set for one identity. A
+/// A held lease on one credential's store set, taken for one identity. A
 /// [`StoreSet`](scp_kel::recovery_store::StoreSet) takes it and holds it for
-/// its life; dropping it releases the pair.
+/// its life; dropping it releases the credential.
 #[derive(Debug)]
 pub struct RecoveryLease {
     leases: RecoveryLeases,
@@ -205,14 +205,10 @@ impl SetLease for RecoveryLease {
 
 impl Drop for RecoveryLease {
     fn drop(&mut self) {
-        let key = (
-            self.credential_id.as_bytes().to_vec(),
-            *self.identifier.as_bytes(),
-        );
         self.leases
             .held
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .remove(&key);
+            .remove(&self.credential_id);
     }
 }

@@ -264,23 +264,31 @@ fn local_member_refuses_undecodable_bytes() -> TestResult {
 // RecoveryLeases
 // ---------------------------------------------------------------------------
 
-/// Mutant M13: no lease. A second lease on the pair is refused while the
-/// first is held, and released when it drops; another identity on the same
-/// credential takes its own lease.
+/// Mutant M13: no lease. A second lease on the credential is refused while
+/// the first is held, for the same identity or another, because every
+/// member keys its entry on the credential alone; it is released when the
+/// first drops.
 #[test]
-fn a_second_lease_on_the_pair_is_refused_until_the_first_drops() -> TestResult {
+fn a_second_lease_on_the_credential_is_refused_until_the_first_drops() -> TestResult {
     let leases = RecoveryLeases::new();
     let first = leases.acquire(credential()?, identifier())?;
     assert!(matches!(
         leases.acquire(credential()?, identifier()),
         Err(RecoveryStoreError::SetInUse)
     ));
+    // The entry is keyed on the credential alone, so another identity on the
+    // same credential waits too.
+    assert!(matches!(
+        leases.acquire(credential()?, Identifier::from_bytes([0x08; 32])),
+        Err(RecoveryStoreError::SetInUse)
+    ));
+    drop(first);
     let other_identity = leases.acquire(credential()?, Identifier::from_bytes([0x08; 32]))?;
     assert_eq!(
         other_identity.identifier(),
         Identifier::from_bytes([0x08; 32])
     );
-    drop(first);
+    drop(other_identity);
     let again = leases.acquire(credential()?, identifier())?;
     assert_eq!(again.credential_id(), &credential()?);
     Ok(())
@@ -299,10 +307,12 @@ fn two_storage_instances_over_one_database_share_the_lease() -> TestResult {
         leases_for_db.acquire(credential()?, identifier())?,
     ))?;
     let second_instance = Arc::clone(&database);
-    assert!(matches!(
-        leases_for_db.acquire(credential()?, identifier()),
-        Err(RecoveryStoreError::SetInUse)
-    ));
+    for other in [identifier(), Identifier::from_bytes([0x08; 32])] {
+        assert!(matches!(
+            leases_for_db.acquire(credential()?, other),
+            Err(RecoveryStoreError::SetInUse)
+        ));
+    }
     drop(first);
     let second = run(StoreSet::open(
         local_only(second_instance)?,

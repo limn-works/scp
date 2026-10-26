@@ -68,7 +68,7 @@ const fn entry(handle: Option<RecoveryHandle>, marker: Option<LastRevealMarker>)
 }
 
 const fn token(digest: [u8; 32]) -> CosignHold {
-    CosignHold::from_cosigner_record(RevealKind::FixesCommitment, digest)
+    CosignHold::new(RevealKind::FixesCommitment, digest)
 }
 
 fn record(large_blob: LargeBlobMembership) -> StoreSetRecord {
@@ -553,8 +553,18 @@ fn compose(set: &mut Set, digest: [u8; 32], basis: Option<LastRevealMarker>) -> 
     Ok(())
 }
 
+/// Advances `digest` to `target` for a ceremony composed with no basis.
 fn advance(set: &mut Set, digest: [u8; 32], target: AdvanceTarget) -> TestResult {
-    run(set.advance(digest, target))?.completed()?;
+    advance_on(set, digest, target, None)
+}
+
+fn advance_on(
+    set: &mut Set,
+    digest: [u8; 32],
+    target: AdvanceTarget,
+    basis: Option<LastRevealMarker>,
+) -> TestResult {
+    run(set.advance(digest, target, basis))?.completed()?;
     Ok(())
 }
 
@@ -566,9 +576,9 @@ fn ceremony(
     sequence: u64,
 ) -> TestResult {
     compose(set, digest, basis)?;
-    advance(set, digest, AdvanceTarget::Signed)?;
-    advance(set, digest, AdvanceTarget::PublishSent)?;
-    advance(set, digest, AdvanceTarget::Confirmed)?;
+    advance_on(set, digest, AdvanceTarget::Signed, basis)?;
+    advance_on(set, digest, AdvanceTarget::PublishSent, basis)?;
+    advance_on(set, digest, AdvanceTarget::Confirmed, basis)?;
     let report = run(set.complete(sequence, digest))?;
     assert!(
         report.per_store.iter().all(MemberRemoval::removed),
@@ -1263,7 +1273,7 @@ fn each_store_is_read_for_itself() -> TestResult {
         ]
     );
     assert_eq!(
-        run(set.confirm_pending(&D1)),
+        run(set.confirm_pending(&D1, None)),
         Err(RecoveryStoreError::HandleGone)
     );
     Ok(())
@@ -1280,12 +1290,12 @@ fn confirm_pending_refuses_a_handle_another_device_lost() -> TestResult {
         compose(&mut set_a, D1, None)?;
         advance(&mut set_a, D1, AdvanceTarget::Signed)?;
         assert_eq!(
-            run(set_a.confirm_pending(&D1))?,
+            run(set_a.confirm_pending(&D1, None))?,
             h(D1, RecoveryPhase::Signed)
         );
         advance(&mut world.device().open()?, D1, AdvanceTarget::Lost)?;
         assert_eq!(
-            run(set_a.confirm_pending(&D1)),
+            run(set_a.confirm_pending(&D1, None)),
             Err(RecoveryStoreError::HandleGone),
             "{host:?}"
         );
@@ -1304,7 +1314,7 @@ fn confirm_pending_refuses_beside_another_pending_handle() -> TestResult {
         .blob
         .serve(&entry(Some(h(D2, RecoveryPhase::Composed)), None));
     assert_eq!(
-        run(set.confirm_pending(&D1)),
+        run(set.confirm_pending(&D1, None)),
         Err(RecoveryStoreError::HandleGone)
     );
     let pending = run(set.read_set())?.pending();
@@ -1517,7 +1527,7 @@ fn a_retry_after_a_crash_records_the_landed_store() -> TestResult {
     world.platform.heal();
     device.local.fail_write(KeyKind::Entry);
     assert!(
-        run(set.advance(D1, AdvanceTarget::Signed))?
+        run(set.advance(D1, AdvanceTarget::Signed, None))?
             .completed()
             .is_err()
     );
@@ -1530,7 +1540,7 @@ fn a_retry_after_a_crash_records_the_landed_store() -> TestResult {
         phase_in(world.blob.entry(), D1),
         Some(RecoveryPhase::Signed)
     );
-    let report = run(set.advance(D1, AdvanceTarget::Signed))?;
+    let report = run(set.advance(D1, AdvanceTarget::Signed, None))?;
     report.completed()?;
     assert_eq!(report.large_blob, LargeBlobWrite::Unchanged);
     assert_eq!(
@@ -1633,7 +1643,7 @@ fn a_phase_never_moves_backward() -> TestResult {
         let mut set = device.open()?;
         compose(&mut set, D1, None)?;
         advance(&mut set, D1, AdvanceTarget::PublishSent)?;
-        let report = run(set.advance(D1, AdvanceTarget::Signed))?;
+        let report = run(set.advance(D1, AdvanceTarget::Signed, None))?;
         report.completed()?;
         assert_eq!(report.sdk_local, MemberWrite::Unchanged);
         for stored in [device.local.entry(), world.blob.entry()] {
@@ -1655,7 +1665,7 @@ fn platform_failure_stops_before_the_local_write() -> TestResult {
     let mut set = device.open()?;
     compose(&mut set, D1, None)?;
     world.platform.fail_write(KeyKind::Entry);
-    let report = run(set.advance(D1, AdvanceTarget::Signed))?;
+    let report = run(set.advance(D1, AdvanceTarget::Signed, None))?;
     assert!(matches!(
         report.completed(),
         Err(RecoveryStoreError::PlatformAccountWriteFailed { .. })
@@ -1683,7 +1693,7 @@ fn signed_write_that_does_not_land_stops_and_keeps_the_member() -> TestResult {
         world
             .blob
             .not_landed_next(LargeBlobClearingAct::RetryVerification);
-        let report = run(set.advance(D1, AdvanceTarget::Signed))?;
+        let report = run(set.advance(D1, AdvanceTarget::Signed, None))?;
         assert_eq!(
             report.completed(),
             Err(RecoveryStoreError::LargeBlobStopped {
@@ -1723,7 +1733,7 @@ fn later_large_blob_failures_are_surfaced_and_continue() -> TestResult {
         world
             .blob
             .not_landed_next(LargeBlobClearingAct::RetryVerification);
-        let report = run(set.advance(D1, AdvanceTarget::PublishSent))?;
+        let report = run(set.advance(D1, AdvanceTarget::PublishSent, None))?;
         report.completed()?;
         assert!(
             matches!(report.large_blob, LargeBlobWrite::NotLanded { .. }),
@@ -1765,7 +1775,7 @@ fn terminal_advance_on_a_member_without_the_handle_is_unchanged() -> TestResult 
     compose(&mut set, D1, None)?;
     advance(&mut set, D1, AdvanceTarget::Discarded)?;
     world.blob.evict();
-    let report = run(set.advance(D1, AdvanceTarget::Discarded))?;
+    let report = run(set.advance(D1, AdvanceTarget::Discarded, None))?;
     report.completed()?;
     assert_eq!(report.large_blob, LargeBlobWrite::Unchanged);
     assert_eq!(world.blob.bytes(), None);
@@ -1779,7 +1789,7 @@ fn advance_refuses_a_gone_or_foreign_handle() -> TestResult {
     let (world, device) = World::created(Host::Apple)?;
     let mut set = device.open()?;
     assert_eq!(
-        run(set.advance(D1, AdvanceTarget::Signed)).err(),
+        run(set.advance(D1, AdvanceTarget::Signed, None)).err(),
         Some(RecoveryStoreError::HandleGone)
     );
     compose(&mut set, D1, None)?;
@@ -1787,7 +1797,7 @@ fn advance_refuses_a_gone_or_foreign_handle() -> TestResult {
         .platform
         .put_entry(&entry(Some(h(D2, RecoveryPhase::Composed)), None));
     assert_eq!(
-        run(set.advance(D1, AdvanceTarget::Signed)).err(),
+        run(set.advance(D1, AdvanceTarget::Signed, None)).err(),
         Some(RecoveryStoreError::ForeignHandle)
     );
     Ok(())
@@ -1805,7 +1815,7 @@ fn signed_write_fills_a_skipped_store_and_clears_the_bit() -> TestResult {
         .blob
         .not_landed_next(LargeBlobClearingAct::RetryVerification);
     compose(&mut set, D1, None)?;
-    let report = run(set.advance(D1, AdvanceTarget::Signed))?;
+    let report = run(set.advance(D1, AdvanceTarget::Signed, None))?;
     report.completed()?;
     assert_eq!(report.large_blob, LargeBlobWrite::Landed);
     assert_eq!(
@@ -1815,7 +1825,10 @@ fn signed_write_fills_a_skipped_store_and_clears_the_bit() -> TestResult {
     let local = device.local.entry().ok_or("no local entry")?;
     assert!(!local.is_large_blob_skipped());
     assert_eq!(local.handle(), Some(h(D1, RecoveryPhase::Signed)));
-    assert_eq!(run(set.confirm_pending(&D1))?, h(D1, RecoveryPhase::Signed));
+    assert_eq!(
+        run(set.confirm_pending(&D1, None))?,
+        h(D1, RecoveryPhase::Signed)
+    );
     Ok(())
 }
 
@@ -1835,11 +1848,42 @@ fn signed_write_does_not_undo_another_devices_abort() -> TestResult {
     assert!(removal.per_store.iter().all(MemberRemoval::removed));
     assert_eq!(world.blob.bytes(), Some(vec![0x00]));
     assert_eq!(
-        run(set_a.advance(D1, AdvanceTarget::Signed)).err(),
+        run(set_a.advance(D1, AdvanceTarget::Signed, None)).err(),
         Some(RecoveryStoreError::HandleGone)
     );
     assert_eq!(world.blob.bytes(), Some(vec![0x00]));
     assert_eq!(phase_in(a.local.entry(), D1), Some(RecoveryPhase::Composed));
+    Ok(())
+}
+
+/// Mutant M33: the ceremony basis read from the entry holding the handle.
+/// `complete` rewrites that entry's marker, so after X completes Y's reveal
+/// its own entry would carry Y's marker as its basis. With the basis the
+/// caller passes, X's `advance(Signed)` and its re-read refuse.
+#[test]
+fn a_later_complete_does_not_become_the_ceremony_basis() -> TestResult {
+    let world = World::new(Host::Android);
+    let x = world.device();
+    let mut set_x = x.open()?;
+    world
+        .blob
+        .not_landed_next(LargeBlobClearingAct::RetryVerification);
+    compose(&mut set_x, D1, None)?;
+    ceremony(&mut world.device().open()?, D2, None, 1)?;
+    let _ = run(set_x.complete(1, D2))?;
+    assert_eq!(
+        x.local.entry().and_then(|entry| entry.marker),
+        Some(m(1, D2))
+    );
+    assert_eq!(
+        run(set_x.advance(D1, AdvanceTarget::Signed, None)).err(),
+        Some(RecoveryStoreError::MarkerMoved)
+    );
+    assert_eq!(
+        run(set_x.confirm_pending(&D1, None)),
+        Err(RecoveryStoreError::MarkerMoved)
+    );
+    assert_eq!(phase_in(world.blob.entry(), D1), None);
     Ok(())
 }
 
@@ -1858,11 +1902,11 @@ fn skipped_store_write_refuses_where_another_reveal_completed() -> TestResult {
     ceremony(&mut world.device().open()?, D2, None, 1)?;
     assert_eq!(world.blob.entry(), Some(entry(None, Some(m(1, D2)))));
     assert_eq!(
-        run(set_x.advance(D1, AdvanceTarget::Signed)).err(),
+        run(set_x.advance(D1, AdvanceTarget::Signed, None)).err(),
         Some(RecoveryStoreError::MarkerMoved)
     );
     assert_eq!(
-        run(set_x.confirm_pending(&D1)),
+        run(set_x.confirm_pending(&D1, None)),
         Err(RecoveryStoreError::MarkerMoved)
     );
     assert_eq!(world.blob.entry(), Some(entry(None, Some(m(1, D2)))));
@@ -1954,7 +1998,7 @@ fn terminal_removal_judges_each_member_at_the_merged_phase() -> TestResult {
     world
         .blob
         .not_landed_next(LargeBlobClearingAct::RetryVerification);
-    run(set.advance(D1, AdvanceTarget::Discarded))?.completed()?;
+    run(set.advance(D1, AdvanceTarget::Discarded, None))?.completed()?;
     assert_eq!(
         phase_in(world.blob.entry(), D1),
         Some(RecoveryPhase::Signed)
@@ -2094,7 +2138,7 @@ fn residual_vi_skipped_store_lost_update() -> TestResult {
         Some(RecoveryPhase::Signed)
     );
     assert_eq!(
-        run(y.open()?.confirm_pending(&D2)),
+        run(y.open()?.confirm_pending(&D2, None)),
         Err(RecoveryStoreError::HandleGone)
     );
     Ok(())
