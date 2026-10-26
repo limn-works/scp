@@ -7039,7 +7039,7 @@ pub fn translate_timeout_events(
     clippy::disallowed_types
 )]
 mod commit_broadcast_retry_tests {
-    //! ADR-049 Decision 7, PR-3: pins the retry-queue bookkeeping split out of
+    //! ADR-049 Decision 7: pins the retry-queue bookkeeping split out of
     //! the (now async) MLS-Commit broadcast.
     //!
     //! [`try_broadcast_commit`] performs ONLY the async transport send and, on

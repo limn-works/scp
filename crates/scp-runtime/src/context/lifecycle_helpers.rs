@@ -1873,7 +1873,7 @@ pub(in crate::context) async fn create_context(
     // §6.2.4 cross-context outlet saga compares `target_context_id` against on
     // the wire, and the bytes the creation crypto (builder) keys under.
     let context_id_bytes = state::context_id_to_bytes(&context_id);
-    // ADR-049 PR-4 §5: create-seed the supervisor floor registry so a
+    // ADR-049 Decision 9 (Class M): create-seed the supervisor floor registry so a
     // default-empty entry exists from creation (it then grows via
     // mirror-forward). Insert-if-absent — never resets an advanced entry.
     deps.supervisor.seed_context_floors(&context_id_bytes)?;
