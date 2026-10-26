@@ -111,9 +111,7 @@ where
 /// `ExplicitIdentity` holds no custody, so the compiler infers every type
 /// parameter of this config with no annotation. If a custody type parameter
 /// returned to `ExplicitIdentity` or to `NodeConfig`, nothing here would
-/// constrain it and this function would stop compiling. The paired
-/// `compile_fail,E0107` doctest on `NodeConfig` asserts that an
-/// `ExplicitIdentity` naming a custody type does not compile.
+/// constrain it and this function would stop compiling.
 #[allow(dead_code)]
 fn _assert_explicit_identity_config_names_no_custody<D: DidMethod + 'static>(
     identity: ScpIdentity,

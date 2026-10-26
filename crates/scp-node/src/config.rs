@@ -587,20 +587,21 @@ pub(crate) async fn resolve_own_addresses_for_start(
 /// A position that supplies only `I` therefore compiles exactly when some
 /// parameter has a default, in any spelling: a default written after an
 /// inline bound, or `S = X` with the bound in a `where` clause, which the
-/// text bans in `scripts/check-deleted-primitives.sh` do not match. It fails
-/// with E0107 here:
+/// text bans in `scripts/check-deleted-primitives.sh` do not match. It does
+/// not compile here:
 ///
 /// ```compile_fail,E0107
 /// use scp_identity::DidMethod;
 /// use scp_node::ExplicitIdentity;
 ///
-/// // E0107: struct takes 2 generic arguments but 1 was supplied.
+/// // Expected: struct takes 2 generic arguments but 1 was supplied.
 /// fn one<D: DidMethod + 'static>(_c: scp_node::NodeConfig<ExplicitIdentity<D>>) {}
 /// ```
 ///
-/// The same position naming both compiles. This positive control pins the
-/// failure above to the missing argument, since a bare `compile_fail`
-/// passes for any error:
+/// rustdoc does not check the error code a `compile_fail` doctest names, so
+/// this doctest passes on any compile error, a typo included. The same
+/// position naming both arguments compiles below, which rules out every
+/// error but the argument count:
 ///
 /// ```
 /// use scp_identity::DidMethod;
@@ -613,16 +614,21 @@ pub(crate) async fn resolve_own_addresses_for_start(
 /// }
 /// ```
 ///
-/// The explicit path names no custody type. An `ExplicitIdentity` that took
-/// one back would fail the positive control above, and this position, which
-/// supplies a custody type, fails with E0107:
+/// The explicit path names no custody type. What catches a custody type
+/// coming back is the positive control above, which names
+/// `ExplicitIdentity<D>` with one argument and stops compiling if
+/// `ExplicitIdentity` takes a second, and the compile-only test in
+/// `crates/scp-node/tests/encrypted_storage_seal.rs`, which builds an
+/// explicit-identity config with no annotation and stops compiling if any
+/// custody parameter is left for inference. This position, which supplies a
+/// custody type, does not compile:
 ///
 /// ```compile_fail,E0107
 /// use scp_identity::DidMethod;
 /// use scp_node::ExplicitIdentity;
 /// use scp_platform::traits::{KeyCustody, Storage};
 ///
-/// // E0107: struct takes 1 generic argument but 2 were supplied.
+/// // Expected: struct takes 1 generic argument but 2 were supplied.
 /// fn custody<K: KeyCustody, D: DidMethod + 'static, S: Storage>(
 ///     _c: scp_node::NodeConfig<ExplicitIdentity<K, D>, S>,
 /// ) {

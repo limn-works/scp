@@ -176,7 +176,7 @@ NodeConfig {
 }
 ```
 
-Entry: `Node::start(NodeConfig)` (production, `where S: EncryptedStorage`) + `Node::start_for_testing(NodeConfig)` (feature-gated). The `Dom`/`Id` typestate markers are deleted. The config is `NodeConfig<I, S>`: `I` is `IdentitySource<K, D>` or `ExplicitIdentity<D>`, so a config over a pre-existing identity names no custody type, and `S` is the storage (ADR-052 amendment, 2026-10-25). (The `IdentitySource` name-reconciliation against the existing private `scp-node` enum is an implementation-sequencing detail — see the ADR-052 Dependencies bullet, not restated here.)
+Entry: `Node::start(NodeConfig)` (production, `where S: EncryptedStorage`) + `Node::start_for_testing(NodeConfig)` (feature-gated). The `Dom`/`Id` typestate markers are deleted. The config is `NodeConfig<I, S>`: `I` is `IdentitySource<K, D>` or `ExplicitIdentity<D>`, so a config over a pre-existing identity names no custody type, and `S` is the storage (ADR-052 amendment, 2026-10-26). (The `IdentitySource` name-reconciliation against the existing private `scp-node` enum is an implementation-sequencing detail — see the ADR-052 Dependencies bullet, not restated here.)
 
 ### Node start — `NodeStartConfig`
 
