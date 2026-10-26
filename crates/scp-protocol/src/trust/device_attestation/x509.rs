@@ -97,14 +97,14 @@ pub(super) enum CertificateMalformed {
     /// The `signatureValue` `BIT STRING` is empty.
     #[error("empty BIT STRING")]
     EmptyBitString,
-    /// An INTEGER has no content octets (X.690 §8.3.1).
+    /// An INTEGER has no content octets (X.690 clause 8.3.1).
     #[error("empty INTEGER")]
     EmptyInteger,
     /// An INTEGER that must be non-negative is negative.
     #[error("negative INTEGER")]
     NegativeInteger,
     /// An INTEGER's first nine bits are all ones or all zeros, so a shorter
-    /// encoding exists (X.690 §8.3.2).
+    /// encoding exists (X.690 clause 8.3.2).
     #[error("INTEGER not minimally encoded")]
     IntegerNotMinimal,
     /// The `[0]` version is absent or is not v3 (`INTEGER 2`).
@@ -177,15 +177,15 @@ pub(super) enum CertificateMalformed {
     #[error("keyUsage malformed")]
     KeyUsageMalformed,
     /// A `BIT STRING` declares more than 7 unused bits, or declares unused
-    /// bits and holds no bit (X.690 §8.6.2.2 and §8.6.2.3).
+    /// bits and holds no bit (X.690 clause 8.6.2.2 and clause 8.6.2.3).
     #[error("BIT STRING unused-bits count invalid")]
     BitStringUnusedBitsInvalid,
     /// A `BIT STRING` padding bit is one; DER sets every padding bit to zero
-    /// (X.690 §11.2.1).
+    /// (X.690 clause 11.2.1).
     #[error("BIT STRING padding bit not zero")]
     BitStringPaddingNotZero,
     /// A named-bit `BIT STRING` ends with a zero bit; DER removes trailing
-    /// zero bits (X.690 §11.2.2).
+    /// zero bits (X.690 clause 11.2.2).
     #[error("named-bit BIT STRING has a trailing zero bit")]
     BitStringTrailingZeroBit,
 }
@@ -271,7 +271,7 @@ fn lenient_tlv(input: &[u8]) -> Result<Tlv<'_>, CertificateMalformed> {
 }
 
 /// Checks a DER INTEGER's content octets: present and minimally encoded
-/// (X.690 §8.3.1 and §8.3.2).
+/// (X.690 clause 8.3.1 and clause 8.3.2).
 fn strict_integer(content: &[u8]) -> Result<(), CertificateMalformed> {
     match content {
         [] => Err(CertificateMalformed::EmptyInteger),
@@ -292,8 +292,8 @@ fn strict_unsigned(content: &[u8]) -> Result<(), CertificateMalformed> {
 
 /// The content bits of a DER `BIT STRING` that holds a named-bit list such
 /// as keyUsage: the unused-bits count is at most 7, is 0 when no bit
-/// follows, every padding bit is zero (X.690 §11.2.1), and the last used
-/// bit is one (X.690 §11.2.2).
+/// follows, every padding bit is zero (X.690 clause 11.2.1), and the last used
+/// bit is one (X.690 clause 11.2.2).
 fn named_bits(content: &[u8]) -> Result<&[u8], CertificateMalformed> {
     let [unused, bits @ ..] = content else {
         return Err(CertificateMalformed::KeyUsageMalformed);
@@ -609,7 +609,7 @@ fn parse_extensions(wrapper: AnyRef<'_>) -> Result<Vec<Extension>, CertificateMa
                 let critical = value.tag() == Tag::Boolean;
                 if critical {
                     // DER encodes TRUE as 0xff and never encodes the FALSE
-                    // default (X.690 §11.1 and §11.5).
+                    // default (X.690 clause 11.1 and clause 11.5).
                     if value.value() != [0xff] {
                         return Err(CertificateMalformed::CriticalNotTrue);
                     }
@@ -727,7 +727,7 @@ pub(super) fn parse_tbs(tbs: &[u8]) -> Result<Tbs, CertificateMalformed> {
 /// Whether a basicConstraints `extnValue` asserts `cA TRUE`.
 pub(super) fn basic_constraints_ca(value: &[u8]) -> Result<bool, CertificateMalformed> {
     AnyRef::from_der(value)?.sequence(|reader: &mut SliceReader<'_>| {
-        // DER omits the FALSE default (X.690 §11.5), so a present cA is TRUE.
+        // DER omits the FALSE default (X.690 clause 11.5), so a present cA is TRUE.
         let ca = !reader.is_finished() && Tag::peek(reader)? == Tag::Boolean;
         if ca && AnyRef::decode(reader)?.value() != [0xff] {
             return Err(CertificateMalformed::BasicConstraintsMalformed);
