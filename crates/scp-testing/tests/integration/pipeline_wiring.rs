@@ -9666,7 +9666,13 @@ const NON_EVENT_LOG_APPENDS: &[(&str, &str)] = &[
 ];
 
 /// Free functions that write leaves to a context's event log.
-const EVENT_LOG_APPEND_FREE_FNS: &[&str] = &["append_consequence_leaves_after_side_effect"];
+const EVENT_LOG_APPEND_FREE_FNS: &[&str] = &[
+    "append_consequence_leaves_after_side_effect",
+    // Wrappers that forward to the builder trait.
+    "record_streaming_saga_a_event",
+    "record_cross_context_a_event",
+    "emit_divergence_marker",
+];
 
 /// The byte offset of each call in `code` that writes a leaf to a context's
 /// event log: every `.append_<name>(` method call whose name
@@ -9820,6 +9826,32 @@ const EVENT_LOG_APPEND_ALLOWLIST: &[(&str, &str, &str)] = &[
         "scp-runtime/src/context/actor/handlers/saga.rs",
         "emit_divergence_marker",
         "spec 17 §17.3",
+    ),
+    // Callers of the free wrappers on `EVENT_LOG_APPEND_FREE_FNS`.
+    (
+        "scp-runtime/src/context/actor/handlers/saga.rs",
+        "dispatch_commit_phase",
+        "through `emit_divergence_marker`, spec 17 §17.3",
+    ),
+    (
+        "scp-runtime/src/context/outlets/invoke.rs",
+        "run_cross_context_bridge",
+        "through `record_cross_context_a_event`, spec 17 §17.3, memory-first after the step",
+    ),
+    (
+        "scp-runtime/src/context/outlets/invoke.rs",
+        "run_streaming_saga_seal_task",
+        "through `record_streaming_saga_a_event`, spec 06 §6.2.4",
+    ),
+    (
+        "scp-runtime/src/context/supervisor/supervisor.rs",
+        "complete_unsettled_streaming_saga",
+        "through `record_streaming_saga_a_event`, spec 06 §6.2.4",
+    ),
+    (
+        "scp-runtime/src/context/supervisor/supervisor.rs",
+        "recover_streaming_saga_truncated_close",
+        "through `record_streaming_saga_a_event`, spec 06 §6.2.4",
     ),
     // Leaves after a step, written memory-first; spec 17 §17.3 moves each
     // into a pending log unit.
@@ -10186,6 +10218,8 @@ fn the_event_log_append_scan_reports_a_planted_call() {
         "sup.append_streaming_outlet_invoked_event(a, b)",
         "log.append_some_new_leaf(a)",
         "crate::context::governance_logic::append_consequence_leaves_after_side_effect(a, b)",
+        // A free wrapper that forwards to the builder trait.
+        "crate::context::outlets::invoke::record_streaming_saga_a_event(a, b)",
     ] {
         let planted = plant(&format!(
             "\nasync fn planted_after_send(log: &L) {{ let _ = {call}.await; }}\n"
