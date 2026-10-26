@@ -89,9 +89,11 @@ fn _assert_encrypted_filesystem_reaches_production_node_start<K, D>(
 /// Counterpart of the `NodeConfig` `compile_fail,E0107` doctest
 /// (`crates/scp-node/src/config.rs`).
 ///
-/// `NodeConfig` has no default type arguments (§17.17 SCP-CAPSEL-8000,
-/// construction.md M4), so a type position names all three. This position
-/// does, and compiles; that doctest asserts that a bare `NodeConfig` does not.
+/// `NodeConfig` has no default type arguments, which the persistence spec's
+/// mandatory-selection rule SCP-CAPSEL-8000 ("Selection is mandatory; there
+/// is no default", §17.17.1 Selection Requirements) requires, so a type
+/// position names all three. This position does, and compiles; that doctest
+/// asserts that a position naming only two does not.
 /// The leading underscore keeps this never-called function free of a
 /// `dead_code` warning.
 fn _assert_node_config_names_every_slot<K, D, S>(_config: NodeConfig<K, D, S>)
