@@ -437,7 +437,7 @@ use Certificate::{Intermediate as Int, Leaf, Root};
 /// Every rule of check 3, each with an input only that rule refuses: every
 /// row leaves the other rules satisfied, so deleting the named rule turns the
 /// row's expected fault into a later one or into `Ok`.
-const CHAIN_FAULTS: [ChainRow; 34] = [
+const CHAIN_FAULTS: [ChainRow; 36] = [
     (
         "foreign root",
         |f| f.anchor_seed = Some([0x09; 32]),
@@ -644,6 +644,24 @@ const CHAIN_FAULTS: [ChainRow; 34] = [
         "intermediate keyUsage without keyCertSign",
         |f| replace_intermediate_extension(f, x509::OID_KEY_USAGE, &[0x03, 0x02, 0x07, 0x80]),
         ChainFault::IntermediateCannotSignCertificates,
+        true,
+    ),
+    (
+        "intermediate keyUsage keyCertSign only in padding",
+        |f| replace_intermediate_extension(f, x509::OID_KEY_USAGE, &[0x03, 0x02, 0x03, 0x04]),
+        ChainFault::Malformed(Int, CertificateMalformed::BitStringPaddingNotZero),
+        true,
+    ),
+    (
+        "intermediate pathLenConstraint not minimal",
+        |f| {
+            replace_intermediate_extension(
+                f,
+                x509::OID_BASIC_CONSTRAINTS,
+                &[0x30, 0x07, 0x01, 0x01, 0xff, 0x02, 0x02, 0x00, 0x00],
+            );
+        },
+        ChainFault::Malformed(Int, CertificateMalformed::IntegerNotMinimal),
         true,
     ),
     (

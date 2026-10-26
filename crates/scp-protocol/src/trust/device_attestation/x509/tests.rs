@@ -81,7 +81,7 @@ impl Fields {
 
 type FieldsRow = (&'static str, fn(&mut Fields) -> BoxResult<()>, M);
 
-const REFUSALS: [FieldsRow; 15] = [
+const REFUSALS: [FieldsRow; 18] = [
     (
         "version absent (v1 by default)",
         |f| {
@@ -121,6 +121,30 @@ const REFUSALS: [FieldsRow; 15] = [
             Ok(())
         },
         M::SerialNotInteger,
+    ),
+    (
+        "serial INTEGER empty",
+        |f| {
+            f.serial = tlv(&[0x02], &[]);
+            Ok(())
+        },
+        M::EmptyInteger,
+    ),
+    (
+        "serial with a redundant leading zero",
+        |f| {
+            f.serial = tlv(&[0x02], &[0x00, 0x07]);
+            Ok(())
+        },
+        M::IntegerNotMinimal,
+    ),
+    (
+        "serial with a redundant leading 0xff",
+        |f| {
+            f.serial = tlv(&[0x02], &[0xff, 0x80]);
+            Ok(())
+        },
+        M::IntegerNotMinimal,
     ),
     (
         "issuer not a SEQUENCE",
@@ -363,8 +387,23 @@ fn repeated_extension_check_is_quasilinear() -> TestResult {
 
 #[test]
 fn basic_constraints_rows() {
-    let rows: [(&[u8], Result<bool, M>); 6] = [
+    let rows: [(&[u8], Result<bool, M>); 12] = [
         (&BASIC_CONSTRAINTS_CA, Ok(true)),
+        (
+            &[0x30, 0x07, 0x01, 0x01, 0xff, 0x02, 0x02, 0x00, 0x80],
+            Ok(true),
+        ),
+        (&[0x30, 0x03, 0x02, 0x01, 0x7f], Ok(false)),
+        (&[0x30, 0x02, 0x02, 0x00], Err(M::EmptyInteger)),
+        (
+            &[0x30, 0x04, 0x02, 0x02, 0x00, 0x01],
+            Err(M::IntegerNotMinimal),
+        ),
+        (
+            &[0x30, 0x04, 0x02, 0x02, 0xff, 0x80],
+            Err(M::IntegerNotMinimal),
+        ),
+        (&[0x30, 0x03, 0x02, 0x01, 0x80], Err(M::NegativeInteger)),
         (&[0x30, 0x03, 0x01, 0x01, 0xff], Ok(true)),
         (&[0x30, 0x00], Ok(false)),
         (&[0x30, 0x03, 0x02, 0x01, 0x00], Ok(false)),
@@ -384,12 +423,32 @@ fn basic_constraints_rows() {
 
 #[test]
 fn key_usage_rows() {
-    let rows: [(&[u8], Result<bool, M>); 5] = [
+    let rows: [(&[u8], Result<bool, M>); 15] = [
         (&KEY_USAGE_CA, Ok(true)),
         (&[0x03, 0x02, 0x02, 0x04], Ok(true)),
+        (&[0x03, 0x03, 0x07, 0x04, 0x80], Ok(true)),
         (&[0x03, 0x02, 0x07, 0x80], Ok(false)),
+        (&[0x03, 0x03, 0x07, 0x00, 0x80], Ok(false)),
         (&[0x03, 0x01, 0x00], Ok(false)),
         (&[0x04, 0x01, 0x06], Err(M::KeyUsageMalformed)),
+        (&[0x03, 0x00], Err(M::KeyUsageMalformed)),
+        // keyCertSign (bit 5) sits in the 3 declared padding bits.
+        (&[0x03, 0x02, 0x03, 0x04], Err(M::BitStringPaddingNotZero)),
+        (&[0x03, 0x02, 0x01, 0x05], Err(M::BitStringPaddingNotZero)),
+        (
+            &[0x03, 0x02, 0x08, 0x04],
+            Err(M::BitStringUnusedBitsInvalid),
+        ),
+        (
+            &[0x03, 0x02, 0xff, 0x04],
+            Err(M::BitStringUnusedBitsInvalid),
+        ),
+        (&[0x03, 0x01, 0x01], Err(M::BitStringUnusedBitsInvalid)),
+        (&[0x03, 0x02, 0x00, 0x04], Err(M::BitStringTrailingZeroBit)),
+        (
+            &[0x03, 0x03, 0x00, 0x04, 0x00],
+            Err(M::BitStringTrailingZeroBit),
+        ),
     ];
     for (value, expected) in rows {
         assert_eq!(key_usage_cert_sign(value), expected, "{value:02x?}");

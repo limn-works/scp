@@ -97,12 +97,16 @@ pub(super) enum CertificateMalformed {
     /// The `signatureValue` `BIT STRING` is empty.
     #[error("empty BIT STRING")]
     EmptyBitString,
-    /// A signature INTEGER is empty.
+    /// An INTEGER has no content octets (X.690 §8.3.1).
     #[error("empty INTEGER")]
     EmptyInteger,
-    /// A signature INTEGER is negative.
+    /// An INTEGER that must be non-negative is negative.
     #[error("negative INTEGER")]
     NegativeInteger,
+    /// An INTEGER's first nine bits are all ones or all zeros, so a shorter
+    /// encoding exists (X.690 §8.3.2).
+    #[error("INTEGER not minimally encoded")]
+    IntegerNotMinimal,
     /// The `[0]` version is absent or is not v3 (`INTEGER 2`).
     #[error("version is not v3")]
     VersionNotV3,
@@ -172,6 +176,18 @@ pub(super) enum CertificateMalformed {
     /// keyUsage is not a non-empty `BIT STRING`.
     #[error("keyUsage malformed")]
     KeyUsageMalformed,
+    /// A `BIT STRING` declares more than 7 unused bits, or declares unused
+    /// bits and holds no bit (X.690 §8.6.2.2 and §8.6.2.3).
+    #[error("BIT STRING unused-bits count invalid")]
+    BitStringUnusedBitsInvalid,
+    /// A `BIT STRING` padding bit is one; DER sets every padding bit to zero
+    /// (X.690 §11.2.1).
+    #[error("BIT STRING padding bit not zero")]
+    BitStringPaddingNotZero,
+    /// A named-bit `BIT STRING` ends with a zero bit; DER removes trailing
+    /// zero bits (X.690 §11.2.2).
+    #[error("named-bit BIT STRING has a trailing zero bit")]
+    BitStringTrailingZeroBit,
 }
 
 impl From<der::Error> for CertificateMalformed {
@@ -252,6 +268,49 @@ fn lenient_tlv(input: &[u8]) -> Result<Tlv<'_>, CertificateMalformed> {
         .get(..header_len + len)
         .ok_or(CertificateMalformed::ContentPastInput)?;
     Ok((*tag, whole, content, after))
+}
+
+/// Checks a DER INTEGER's content octets: present and minimally encoded
+/// (X.690 §8.3.1 and §8.3.2).
+fn strict_integer(content: &[u8]) -> Result<(), CertificateMalformed> {
+    match content {
+        [] => Err(CertificateMalformed::EmptyInteger),
+        [0x00, next, ..] if next & 0x80 == 0 => Err(CertificateMalformed::IntegerNotMinimal),
+        [0xff, next, ..] if next & 0x80 != 0 => Err(CertificateMalformed::IntegerNotMinimal),
+        _ => Ok(()),
+    }
+}
+
+/// Checks a DER INTEGER that must be non-negative.
+fn strict_unsigned(content: &[u8]) -> Result<(), CertificateMalformed> {
+    strict_integer(content)?;
+    match content.first() {
+        Some(first) if first & 0x80 != 0 => Err(CertificateMalformed::NegativeInteger),
+        _ => Ok(()),
+    }
+}
+
+/// The content bits of a DER `BIT STRING` that holds a named-bit list such
+/// as keyUsage: the unused-bits count is at most 7, is 0 when no bit
+/// follows, every padding bit is zero (X.690 §11.2.1), and the last used
+/// bit is one (X.690 §11.2.2).
+fn named_bits(content: &[u8]) -> Result<&[u8], CertificateMalformed> {
+    let [unused, bits @ ..] = content else {
+        return Err(CertificateMalformed::KeyUsageMalformed);
+    };
+    let unused = *unused;
+    if unused > 7 || (bits.is_empty() && unused != 0) {
+        return Err(CertificateMalformed::BitStringUnusedBitsInvalid);
+    }
+    if let Some(last) = bits.last() {
+        if last & ((1u8 << unused) - 1) != 0 {
+            return Err(CertificateMalformed::BitStringPaddingNotZero);
+        }
+        if (last >> unused) & 1 == 0 {
+            return Err(CertificateMalformed::BitStringTrailingZeroBit);
+        }
+    }
+    Ok(bits)
 }
 
 /// A lenient non-negative INTEGER's magnitude, leading zero bytes removed.
@@ -614,6 +673,9 @@ pub(super) fn parse_tbs(tbs: &[u8]) -> Result<Tbs, CertificateMalformed> {
         }
         let serial = AnyRef::decode(reader)?;
         expect_tag(serial, Tag::Integer, CertificateMalformed::SerialNotInteger)?;
+        // RFC 5280 §4.1.2.2 asks relying parties to tolerate a negative
+        // serial, so only the DER encoding rules apply here.
+        strict_integer(serial.value())?;
         let signature_algorithm_tlv = reader.tlv_bytes()?.to_vec();
         let signature_algorithm = parse_signature_algorithm(&signature_algorithm_tlv)?;
         let issuer = reader.tlv_bytes()?.to_vec();
@@ -671,11 +733,14 @@ pub(super) fn basic_constraints_ca(value: &[u8]) -> Result<bool, CertificateMalf
             return Err(CertificateMalformed::BasicConstraintsMalformed);
         }
         if !reader.is_finished() {
+            let path_len = AnyRef::decode(reader)?;
             expect_tag(
-                AnyRef::decode(reader)?,
+                path_len,
                 Tag::Integer,
                 CertificateMalformed::BasicConstraintsMalformed,
             )?;
+            // pathLenConstraint is INTEGER (0..MAX) (RFC 5280 §4.2.1.9).
+            strict_unsigned(path_len.value())?;
         }
         Ok(ca)
     })
@@ -689,11 +754,11 @@ pub(super) fn key_usage_cert_sign(value: &[u8]) -> Result<bool, CertificateMalfo
         Tag::BitString,
         CertificateMalformed::KeyUsageMalformed,
     )?;
-    match bits.value() {
-        [] => Err(CertificateMalformed::KeyUsageMalformed),
-        [_, first, ..] => Ok(first & KEY_CERT_SIGN != 0),
-        [_] => Ok(false),
-    }
+    // A bit past the unused-bits boundary is padding, which `named_bits`
+    // requires to be zero, so a set keyCertSign bit is a used bit.
+    Ok(named_bits(bits.value())?
+        .first()
+        .is_some_and(|first| first & KEY_CERT_SIGN != 0))
 }
 
 /// Verifies that `issuer` signed `tbs` with `algorithm`.
