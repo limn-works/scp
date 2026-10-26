@@ -1203,7 +1203,7 @@ class TestTrust:
         child_params = {
             "mode": "Encrypted",
             # The governance arm refuses an empty ceiling, as creation does.
-            "ceiling": ["messages:read"],
+            "ceiling": ["MessagesRead"],
             "ceiling_policy": "Immutable",
             "promotion_policy": "NoPromotion",
             "roles": [],

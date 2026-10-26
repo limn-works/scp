@@ -1070,7 +1070,7 @@ suite.describe("Real NAPI bridge E2E", ({ createNativeBridge, rawAddon }) => {
             params: {
               mode: "Encrypted",
               // The governance arm refuses an empty ceiling, as creation does.
-              ceiling: ["messages:read"],
+              ceiling: ["MessagesRead"],
               ceiling_policy: "Immutable",
               promotion_policy: "NoPromotion",
               roles: [],
@@ -1170,7 +1170,7 @@ suite.describe("Real NAPI bridge E2E", ({ createNativeBridge, rawAddon }) => {
             params: {
               mode: "Encrypted",
               // The governance arm refuses an empty ceiling, as creation does.
-              ceiling: ["messages:read"],
+              ceiling: ["MessagesRead"],
               ceiling_policy: "Immutable",
               promotion_policy: "NoPromotion",
               roles: [],
