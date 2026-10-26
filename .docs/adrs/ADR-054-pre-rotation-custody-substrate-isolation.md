@@ -17,7 +17,7 @@
 
 **Amended 2026-10-26 (SCP-311), two rulings by Alec.**
 - On the headless floor, Alec ruled "Follow the adr". The server-profile floor of the 2026-07-14 amendment governs `Headless`, and `09-security-model.md` §9.7.4.1 item 4 now carries it: the floor MUST be an independent-principal KMS, HSM or cloud-vault backend, and the SDK offers each copyable method on `Headless` only under the condition this ADR's per-backend §3-soundness table states for it, never as the standalone floor.
-- On the bridges, Alec ruled "Ok uniffi only". UniFFI alone declares `AssertionCustodyProvider`, `CredentialBlobProvider` and `SyncedStoreProvider`, and PyO3 and NAPI carry exemptions for them in `bridge-aliases.json` and the SDK capability matrix (§Assertion-arm and store-set host interfaces).
+- On the bridges, Alec ruled "Ok uniffi only". UniFFI alone declares `AssertionCustodyProvider`, `CredentialBlobProvider` and `SyncedStoreProvider`, and PyO3 and NAPI carry exemptions for them in the SDK capability matrix, `.docs/standards/sdk-capability-matrix.json`, alone, written in S8 PR 5b (§Assertion-arm and store-set host interfaces).
 
 **Amended 2026-09-10 (the identity substrate).** ADR-063, inception-derived self-certifying identity over a key-event log, superseded ADR-003, the identity-creation record that defined the reveal and commitment flow this ADR realizes. The flow now lives in the key-event log: the inception event fixes the first pre-rotation commitment, and every reveal-authorized event consumes one commitment and fixes the next (`09-security-model.md` §9.7.4.2 R1 and R2). The residence rule this ADR authored, which `09-security-model.md` §9.7.4.1 item 3a owns, is untouched, because it fixes where the recovery authority lives and names no identity method. This record keeps its Proposed status.
 
@@ -157,7 +157,7 @@ The record is the `largeBlob` record `17-persistence-and-storage.md` §17.8 lays
 
 The Rust adapter forms every key and encodes every value: the `StoreSetRecord` keyed on the credential, the `RecoveryHandle`, the `LastRevealMarker`, and the signed event keyed on its digest (`17-persistence-and-storage.md` §17.8).
 
-**Which bridges declare the three interfaces.** UniFFI alone declares all three, because the Swift and Kotlin SDKs are the hosts that reach a passkey API, a `largeBlob` store and a platform-account store. Alec ruled on 2026-10-26, "Ok uniffi only": PyO3 and NAPI declare none of the three and carry exemptions for them in `bridge-aliases.json` and the SDK capability matrix. The casing columns above bind every bridge that declares an interface.
+**Which bridges declare the three interfaces.** UniFFI alone declares all three, because the Swift and Kotlin SDKs are the hosts that reach a passkey API, a `largeBlob` store and a platform-account store. Alec ruled on 2026-10-26, "Ok uniffi only": PyO3 and NAPI declare none of the three and carry exemptions for them in the SDK capability matrix, `.docs/standards/sdk-capability-matrix.json`, alone, written in S8 PR 5b. The casing columns above bind every bridge that declares an interface.
 
 ## Consequences
 
