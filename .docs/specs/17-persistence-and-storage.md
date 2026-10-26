@@ -131,6 +131,10 @@ wrapping_key/{did}
 
 custody/record/{namespace}/{key_id}
 
+recovery/{sha256_hex(credential_id)}/record
+recovery/{sha256_hex(credential_id)}/entry
+recovery/{sha256_hex(credential_id)}/event/{event_digest_hex}
+
 key_event_log_cache/{did}
 tofu/{did}
 key_package/{sha256_hex(relay_url)}/{index}
@@ -786,6 +790,20 @@ Key custody is the `KeyCustody` trait ADR-006 defines, named here for completene
 
 The SDK writes the record at credential creation into this section's local store and, where the platform-account member is present, into that member. `09-security-model.md` §9.7.4.2 R10 states when each field may change and what an SDK that does not reach a recorded member does.
 
+The record is encoded as follows:
+
+```
+version           u8          0x01
+platform_account  u8          0x00 Present; 0x01 Absent(NoDataApiToCredentialSyncStore); 0x02 Absent(NoPlatformCredential)
+large_blob        u8          0x00 the largeBlob store is not a member; 0x01 it is a member
+id_len            u16         big-endian length of credential_id, 1 to 1,023 (WebAuthn's bound on a credential identifier)
+credential_id     [u8; id_len]
+```
+
+A decoder refuses an unknown version, platform-account byte or `largeBlob` byte, an `id_len` of 0 or above 1,023, and a record whose length is not `5 + id_len`. Where the local store holds no record and the platform-account member holds one, the SDK copies that record into the local store unchanged, and from then on the local copy is the one it reads. A record whose `credential_id` differs from the credential it was read under is refused.
+
+**Where the SDK's local store keeps the set's values.** Three §17.3 keys hold them, each under `recovery/{sha256_hex(credential_id)}/`, so a credential identifier of up to 1,023 bytes yields a fixed-length key component: `record` holds the encoded `StoreSetRecord`; `entry` holds the `largeBlob` record layout below, which is also the layout of the entry every other member holds; and `event/{event_digest_hex}` holds a signed event of 1 to `MAX_EVENT_BYTES` bytes, keyed on its preimage digest as lowercase hex. A stored event outside that range is bytes the SDK cannot decode.
+
 **The `largeBlob` record.** A `largeBlob` member holds one record of at most 139 bytes:
 
 ```
@@ -794,7 +812,7 @@ handle  [u8; 66]   present only when bit 0 is set (RECOVERY_HANDLE_BYTES)
 marker  [u8; 72]   present only when bit 1 is set (LAST_REVEAL_MARKER_BYTES)
 ```
 
-A decoder refuses a record with any of bits 2 to 7 set, and a record whose length differs from the length its flags name, which is 1, 67, 73 or 139 bytes. A record the decoder refuses is bytes the SDK cannot decode, which `09-security-model.md` §9.7.4.2 R10 counts as a member the SDK did not reach.
+A decoder refuses a record with any of bits 2 to 7 set, and a record whose length differs from the length its flags name, which is 1, 67, 73 or 139 bytes. A record of the one byte `0x00` holds neither value and reads as an empty member. In the handle, the discriminant byte is `0x00` for `FixesCommitment` and `0x01` for `Abandons`, and the phase byte is `0x00` to `0x05` for `Composed`, `Signed`, `PublishSent`, `Confirmed`, `Discarded` and `Lost` in that order; a decoder refuses any other discriminant or phase byte. A record the decoder refuses is bytes the SDK cannot decode, which `09-security-model.md` §9.7.4.2 R10 counts as a member the SDK did not reach.
 
 **What each member holds.** **Every member holds the `RecoveryHandle` and the `LastRevealMarker`** `09-security-model.md` §9.7.4.2 R10 declares, and the handle is at the width `RECOVERY_HANDLE_BYTES` registers (`09-security-model.md` §9.18.17), which is why an authenticator's large-blob array and never the object's own size is what bounds what the set can hold. **The handle, as `09-security-model.md` §9.7.4.2 R10 declares it**: <!-- scp:include id="recovery-handle-declaration" from=".docs/specs/09-security-model.md" -->**`RecoveryHandle` is one enum whose variants are `FixesCommitment` and `Abandons`, each carrying the identity's 32-byte identifier, a `RecoveryPhase`, and the 32-byte preimage digest of the composed event, and `RecoveryPhase`'s six values are `Composed`, `Signed`, `PublishSent`, `Confirmed`, `Discarded` and `Lost`.**<!-- scp:end id="recovery-handle-declaration" --> It carries the composed preimage and the signed event never, because <!-- scp:fragment id="large-blob-arithmetic" -->CTAP 2.1 floors an authenticator's whole large-blob array at 1,024 bytes across every credential it holds, and `MAX_EVENT_BYTES` is 65,536, so a duty to write the event itself would ask for a write between one and two orders of magnitude larger than the store.<!-- scp:end id="large-blob-arithmetic" --> **The composed preimage, the next commitment list and the next threshold sit in this section's own local store, and the signed event also sits in the platform account's store where that member exists, each keyed on that digest**, and `09-security-model.md` §9.7.4.2 R10 states what an SDK whose local store holds no preimage under a handle's digest does.
 

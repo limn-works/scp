@@ -82,6 +82,9 @@ pub mod sqlite;
 // the `StoredValue` format and `identity/{did}/document` key convention shared
 // by `scp-runtime`'s `ProtocolRepository` and `scp-identity`'s `Identity::create`
 // persistence path, so both produce byte-identical storage writes.
+// The store set a pending recovery handle lives in (09-security-model.md
+// §9.7.4.2 R10, 17-persistence-and-storage.md §17.8; SCP-311).
+pub mod recovery_handle_store;
 pub mod signer;
 pub mod store_value;
 #[cfg(feature = "sync")]
@@ -94,6 +97,15 @@ pub use encrypted::EncryptedStorage;
 // The key-event signer contract (09-security-model.md §9.7.4.2 R10), so a
 // custody implementor and its callers need no direct scp-kel dependency.
 pub use error::{PlatformError, PushFailureKind};
+pub use recovery_handle_store::{
+    CredentialId, CredentialIdError, CredentialStore, LAST_REVEAL_MARKER_BYTES,
+    LargeBlobClearingAct, LargeBlobMembership, LargeBlobNotLanded, LargeBlobWrite,
+    LastRevealMarker, MAX_CREDENTIAL_ID_BYTES, MaybeSync, MemberRead, NoLargeBlob,
+    NoPlatformAccount, NotReachedCause, PlatformAccountAbsence, PlatformAccountMember,
+    PlatformAccountSlot, RECOVERY_HANDLE_BYTES, RecordDecodeError, RecoveryHandle,
+    RecoveryHandleStore, RecoveryPhase, RecoveryRecordStore, RecoveryStoreError, SdkLocalMember,
+    SetRead, StoreEntry, StoreRead, StoreSet, StoreSetMembers, StoreSetRecord, StoreWriteFailure,
+};
 pub use scp_kel::{
     CustodyProbe, IndexedSignature, KeyEventSignError, KeyEventSigner, MaybeSend, ProbeSignature,
     SigningChange,

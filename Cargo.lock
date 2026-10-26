@@ -5410,6 +5410,7 @@ dependencies = [
  "rmp-serde",
  "rusqlite",
  "scp-crypto",
+ "scp-did",
  "scp-kel",
  "scp-sqlite-pools",
  "scp-testing",

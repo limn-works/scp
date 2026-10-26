@@ -11264,6 +11264,9 @@
       "status": "pending",
       "files": [
         "crates/scp-platform/src/recovery_handle_store.rs",
+        "crates/scp-platform/src/recovery_handle_store/",
+        "crates/scp-platform/src/lib.rs",
+        "crates/scp-platform/Cargo.toml",
         "crates/scp-platform/src/headless_backup.rs",
         "crates/scp-client-wasm/src/credentials.rs",
         "crates/scp-platform/src/next_set/",
