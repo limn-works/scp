@@ -22,7 +22,7 @@
 //! - `RpOriginError` and `CustodyDisclosureError` carry payloads:
 //!   each `RpOriginError` variant wraps an `RpDomainRefusal`.
 //!   `CustodyDisclosureError::NotOffered` names a `CustodyType` and a
-//!   `CustodyOffer`, and `PlatformAccountWithoutPasskey` names a
+//!   `CustodyOffer`, and `NotUnderPlatformAccount` names a
 //!   `CustodyType`.
 
 use std::fmt;
@@ -485,7 +485,7 @@ impl CustodyDisclosure {
     ///   [`CustodyType::offered_on`] does not offer `custody` on `profile`.
     /// - [`CustodyDisclosureError::PasskeyOutsidePlatformAccount`] for a
     ///   passkey at [`PreRotationResidence::OutsidePlatformAccount`].
-    /// - [`CustodyDisclosureError::PlatformAccountWithoutPasskey`] for any
+    /// - [`CustodyDisclosureError::NotUnderPlatformAccount`] for any
     ///   other method under a platform account.
     pub fn at_selection(
         custody: CustodyType,
@@ -532,9 +532,7 @@ impl CustodyDisclosure {
                 PreRotationResidence::RootPlatformAccount
                 | PreRotationResidence::SecondPlatformAccount,
             ) => {
-                return Err(CustodyDisclosureError::PlatformAccountWithoutPasskey(
-                    custody,
-                ));
+                return Err(CustodyDisclosureError::NotUnderPlatformAccount(custody));
             }
             (
                 CustodyType::Fido2Token | CustodyType::Hsm,
@@ -585,7 +583,7 @@ pub enum CustodyDisclosureError {
     PasskeyOutsidePlatformAccount,
     /// Only a passkey lives under a platform account.
     #[error("{0} does not live under a platform account")]
-    PlatformAccountWithoutPasskey(CustodyType),
+    NotUnderPlatformAccount(CustodyType),
 }
 
 #[cfg(test)]
@@ -1037,9 +1035,7 @@ mod tests {
             ] {
                 assert_eq!(
                     CustodyDisclosure::under(custody, residence, &profile, ALL_BUILT),
-                    Err(CustodyDisclosureError::PlatformAccountWithoutPasskey(
-                        custody
-                    ))
+                    Err(CustodyDisclosureError::NotUnderPlatformAccount(custody))
                 );
             }
         }
