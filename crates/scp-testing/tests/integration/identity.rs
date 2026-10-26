@@ -14,7 +14,7 @@
 //! `InMemoryKeyCustody` and `InMemoryDhtClient` implementations.
 
 use scp_did::{DidDocument, SigningKeyId};
-use scp_identity::{DidDht, DidMethod, ScpIdentity};
+use scp_identity::{DidDht, DidMethod, dht::ScpIdentity};
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{KeyCustody, KeyType};
 

@@ -55,7 +55,7 @@ use scp_did::DidDocument;
 // `scp_ffi_common::dht::build_ffi_dht_client`; this bridge only maps its error.
 use scp_ffi_common::dht::FfiDhtClient;
 use scp_ffi_common::identity_update::IdentityUpdateGuard;
-use scp_identity::ScpIdentity;
+use scp_identity::dht::ScpIdentity;
 use scp_identity::{DidCache, DidDht, DidMethod, DualLayerResolver, NoOpRelayQuerier};
 #[cfg(feature = "testing")]
 use scp_platform::testing::InMemoryKeyCustody;
@@ -106,7 +106,7 @@ pub(crate) fn build_ffi_dht_client() -> Result<FfiDhtClient, ScpPyError> {
 #[cfg(not(feature = "testing"))]
 pub(crate) fn no_pre_rotation_backend() -> ScpPyError {
     ScpPyError::identity_with_code(
-        scp_identity::IdentityError::NoPreRotationBackend.to_string(),
+        scp_identity::dht::IdentityError::NoPreRotationBackend.to_string(),
         scp_ffi_common::error_codes::IDENT_1059,
     )
 }
@@ -365,7 +365,7 @@ fn republish_identity(
             }
         };
         let verifying_key = custody.public_key(&new_identity.identity_key).await.ok();
-        Ok::<_, scp_identity::IdentityError>(((new_identity, new_document), verifying_key))
+        Ok::<_, scp_identity::dht::IdentityError>(((new_identity, new_document), verifying_key))
     })?
     .map_err(|e| {
         tracing::warn!(did = %did, error = %e, "{}", update.failure());

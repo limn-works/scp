@@ -33,8 +33,8 @@ use std::time::Duration;
 
 use tracing::{debug, info, warn};
 
-use crate::IdentityError;
 use crate::cache::DidCache;
+use crate::dht::IdentityError;
 use crate::dht::extract_public_key;
 use crate::republish::RelayPublisher;
 use crate::resolution::verify_relay_record;

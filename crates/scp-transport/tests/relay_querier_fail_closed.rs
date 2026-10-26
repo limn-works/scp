@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use scp_identity::IdentityError;
+use scp_identity::dht::IdentityError;
 use scp_identity::resolution::RelayQuerier;
 use scp_transport::native::TransportRelayQuerier;
 use scp_transport::native::adapter::NativeRelayAdapter;

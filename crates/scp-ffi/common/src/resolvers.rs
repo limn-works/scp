@@ -19,7 +19,7 @@ use scp_core::crypto::ucan::validate::{
 use scp_core::trust::TrustError;
 use scp_core::trust::attestation::ActiveKeyResolver;
 use scp_did::decode_multibase_key;
-use scp_identity::IdentityError;
+use scp_identity::dht::IdentityError;
 use scp_identity::resolver::ResolvedDidDocument;
 
 // ---------------------------------------------------------------------------

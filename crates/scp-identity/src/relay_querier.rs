@@ -29,7 +29,7 @@ use std::time::Duration;
 use tokio::task::JoinSet;
 use tracing::{debug, warn};
 
-use crate::IdentityError;
+use crate::dht::IdentityError;
 use crate::dht::extract_public_key;
 use crate::resolution::{RelayQuerier, did_routing_id, verify_relay_record};
 use crate::resolver::{MultiRelayQuerier, RelayRecord};

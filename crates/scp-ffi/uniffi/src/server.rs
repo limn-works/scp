@@ -529,7 +529,7 @@ pub(crate) async fn relay_start_local_on(
 #[allow(clippy::type_complexity)]
 fn build_node_identity_from_uniffi(id: &Identity) -> Result<server::NodeIdentity, ScpError> {
     use scp_ffi_common::server::ConcreteDidMethod;
-    use scp_identity::{DidCache, IdentityError};
+    use scp_identity::{DidCache, dht::IdentityError};
     use scp_platform::traits::KeyCustody;
 
     // Each missing piece names why the identity cannot run a node; all three

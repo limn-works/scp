@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use scp_core::store::ProtocolRepository;
 use scp_did::DidDocument;
-use scp_identity::{DidMethod, ScpIdentity};
+use scp_identity::{DidMethod, dht::ScpIdentity};
 use scp_platform::EncryptedStorage;
 use scp_platform::traits::{KeyCustody, Storage};
 use scp_transport::nat::NetworkChangeDetector;

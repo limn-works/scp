@@ -47,7 +47,7 @@
 
 use std::sync::Arc;
 
-use scp_identity::IdentityError;
+use scp_identity::dht::IdentityError;
 use scp_identity::republish::{RelayPublishOutcome, RelayPublisher};
 use scp_protocol::envelope::did_record::DidRecordV1;
 use tracing::{debug, warn};

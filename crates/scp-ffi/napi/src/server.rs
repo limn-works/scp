@@ -433,8 +433,9 @@ fn build_node_identity(bi: &NapiBridgeInstance, did: &str) -> napi::Result<NodeI
                 Vec<u8>,
             ) -> std::pin::Pin<
                 Box<
-                    dyn std::future::Future<Output = Result<Vec<u8>, scp_identity::IdentityError>>
-                        + Send,
+                    dyn std::future::Future<
+                            Output = Result<Vec<u8>, scp_identity::dht::IdentityError>,
+                        > + Send,
                 >,
             > + Send
             + Sync,
@@ -445,7 +446,7 @@ fn build_node_identity(bi: &NapiBridgeInstance, did: &str) -> napi::Result<NodeI
             let sig = kc
                 .sign(&handle, &data)
                 .await
-                .map_err(scp_identity::IdentityError::Platform)?;
+                .map_err(scp_identity::dht::IdentityError::Platform)?;
             Ok(sig.into_bytes())
         })
     });

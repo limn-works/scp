@@ -22,7 +22,7 @@ use scp_core::trust::custody_violation::{
     classify_action,
 };
 use scp_did::{DID, SigningKeyId};
-use scp_identity::{DidDht, DidMethod, ScpIdentity};
+use scp_identity::{DidDht, DidMethod, dht::ScpIdentity};
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{KeyCustody, KeyType};
 

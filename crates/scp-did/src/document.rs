@@ -51,7 +51,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 /// unchanged.
 ///
 /// Only the variants the DID data model actually constructs live here. The
-/// async/custody/DHT/relay variants stay in `scp_identity::IdentityError`.
+/// async/custody/DHT/relay variants stay in `scp_identity::dht::IdentityError`.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DidError {
     /// The DID string (or a multibase key payload) has an invalid format.

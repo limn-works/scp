@@ -6388,7 +6388,7 @@ mod tests {
             bi,
             did,
             crate::runtime::IdentityEntry {
-                identity: scp_identity::ScpIdentity {
+                identity: scp_identity::dht::ScpIdentity {
                     did: did.to_owned(),
                     identity_key,
                     active_signing_key: identity_key,

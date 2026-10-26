@@ -353,7 +353,10 @@ mod tests {
 
     use super::*;
     use scp_did::{DidDocument, DidError, RelayEntryUrlError, RelayUrlError, Service};
-    use scp_identity::{DidMethod, IdentityError, ScpIdentity};
+    use scp_identity::{
+        DidMethod,
+        dht::{IdentityError, ScpIdentity},
+    };
 
     use scp_platform::PreRotationKeyHandle;
     use scp_platform::traits::{KeyCustody, PreRotationCustody};

@@ -224,7 +224,7 @@ mod create_unwind {
 
     use scp_did::DidDocument;
     use scp_ffi_common::callback_identity::{CallbackIdentityError, write_created_entry};
-    use scp_identity::{DidMethod, ScpIdentity};
+    use scp_identity::{DidMethod, dht::ScpIdentity};
     use scp_platform::Storage;
     use scp_platform::testing::InMemoryPreRotationCustody;
 

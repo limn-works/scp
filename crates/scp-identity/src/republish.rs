@@ -36,7 +36,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use super::IdentityError;
+use super::dht::IdentityError;
 use scp_dht::DhtClient;
 use scp_protocol::envelope::did_record::{DidRecordBuildError, DidRecordV1};
 

@@ -1048,11 +1048,11 @@ mod tests {
         ) -> impl Future<
             Output = Result<
                 Option<scp_identity::resolver::ResolvedDidDocument>,
-                scp_identity::IdentityError,
+                scp_identity::dht::IdentityError,
             >,
         > + Send {
             let result = if self.fail {
-                Err(scp_identity::IdentityError::DhtResolveFailed(
+                Err(scp_identity::dht::IdentityError::DhtResolveFailed(
                     "test resolver failure".to_owned(),
                 ))
             } else {

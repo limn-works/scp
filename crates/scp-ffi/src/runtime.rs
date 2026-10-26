@@ -77,7 +77,7 @@ use scp_ffi_common::bridge_instance::StreamRegistry;
 use scp_clock::{Clock, SystemClock};
 use scp_did::DidDocument;
 pub use scp_ffi_common::bridge_instance::CoreFields;
-use scp_identity::ScpIdentity;
+use scp_identity::dht::ScpIdentity;
 use scp_platform::PlatformError;
 use scp_platform::encrypting_adapter::EncryptingAdapter;
 use scp_platform::in_memory::InMemoryStorage;
