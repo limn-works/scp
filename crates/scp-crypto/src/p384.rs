@@ -166,16 +166,17 @@ pub fn verify_prehash_der_lenient(
 /// short-form length that covers the input exactly, holding exactly two
 /// INTEGERs, each minimally encoded, non-negative, and at most 48 bytes of
 /// magnitude. A P-384 `ECDSA-Sig-Value` is at most 2 + 2·(2 + 49) = 104 bytes,
-/// so a long-form length is non-minimal and rejected.
+/// so its lengths are all short form. A first length byte of 0x80 or more is
+/// read as a short-form length of 128 or more: the SEQUENCE then holds more
+/// bytes than two 48-byte INTEGERs fill, and an INTEGER then runs past the
+/// SEQUENCE or exceeds 48 bytes, so a long-form length fails without a check
+/// of its own.
 fn der_to_signature(der: &[u8]) -> Result<Signature, P384Error> {
     let [tag, len, body @ ..] = der else {
         return Err(P384Error::MalformedDer("truncated SEQUENCE header"));
     };
     if *tag != 0x30 {
         return Err(P384Error::MalformedDer("expected SEQUENCE tag"));
-    }
-    if *len & 0x80 != 0 {
-        return Err(P384Error::MalformedDer("SEQUENCE length is not short form"));
     }
     if usize::from(*len) != body.len() {
         return Err(P384Error::MalformedDer(
@@ -202,9 +203,6 @@ fn parse_der_integer(input: &[u8]) -> Result<(&[u8], &[u8]), P384Error> {
     };
     if *tag != 0x02 {
         return Err(P384Error::MalformedDer("expected INTEGER tag"));
-    }
-    if *len & 0x80 != 0 {
-        return Err(P384Error::MalformedDer("INTEGER length is not short form"));
     }
     let len = usize::from(*len);
     let (value, rest) = rest
@@ -348,51 +346,94 @@ fn encode_signature_der(r: &[u8], s: &[u8]) -> Result<Vec<u8>, P384Error> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use ::p384::elliptic_curve::scalar::IsHigh;
     use sha2::{Digest, Sha256, Sha384};
 
     use super::*;
 
-    fn key(seed: u8) -> P384SecretKey {
-        P384SecretKey::from_seed(&[seed; 32]).unwrap()
+    type BoxError = Box<dyn std::error::Error>;
+    type TestResult = Result<(), BoxError>;
+
+    fn key(seed: u8) -> Result<P384SecretKey, P384Error> {
+        P384SecretKey::from_seed(&[seed; 32])
     }
 
-    fn s_is_high(der: &[u8]) -> bool {
-        bool::from(der_to_signature(der).unwrap().s().is_high())
+    fn s_is_high(der: &[u8]) -> Result<bool, P384Error> {
+        Ok(bool::from(der_to_signature(der)?.s().is_high()))
+    }
+
+    /// A DER TLV with a short-form length.
+    fn tlv(tag: u8, content: &[u8]) -> Result<Vec<u8>, BoxError> {
+        let mut out = vec![tag, u8::try_from(content.len())?];
+        out.extend_from_slice(content);
+        Ok(out)
+    }
+
+    /// The `r` and `s` INTEGER contents of a strict-DER signature, sign pads
+    /// kept.
+    fn integers(der: &[u8]) -> Result<(Vec<u8>, Vec<u8>), BoxError> {
+        let body = der.get(2..).ok_or("short")?;
+        let r_len = usize::from(*body.get(1).ok_or("short")?);
+        let r = body.get(2..2 + r_len).ok_or("short")?.to_vec();
+        let rest = body.get(2 + r_len..).ok_or("short")?;
+        let s_len = usize::from(*rest.get(1).ok_or("short")?);
+        let s = rest.get(2..2 + s_len).ok_or("short")?.to_vec();
+        Ok((r, s))
+    }
+
+    /// The first deterministic signature, over `SHA-384([i])`, whose `r`
+    /// content satisfies `wanted`.
+    fn signature_where(
+        key: &P384SecretKey,
+        wanted: fn(&[u8]) -> bool,
+    ) -> Result<(Vec<u8>, Vec<u8>), BoxError> {
+        for i in 0..=u8::MAX {
+            let digest = Sha384::digest([i]).to_vec();
+            let signature = sign_prehash_der(key, &digest, false)?;
+            if wanted(&integers(&signature)?.0) {
+                return Ok((digest, signature));
+            }
+        }
+        Err("no signature found".into())
+    }
+
+    fn sequence(r: &[u8], tail: &[u8]) -> Result<Vec<u8>, BoxError> {
+        tlv(0x30, &[r, tail].concat())
     }
 
     #[test]
-    fn sha384_digest_low_and_high_s_both_verify() {
-        let key = key(1);
-        let public = key.public_key().unwrap();
+    fn sha384_digest_low_and_high_s_both_verify() -> TestResult {
+        let key = key(1)?;
+        let public = key.public_key()?;
         let digest = Sha384::digest(b"tbs");
-        let low = sign_prehash_der(&key, &digest, false).unwrap();
-        let high = sign_prehash_der(&key, &digest, true).unwrap();
-        assert!(!s_is_high(&low));
-        assert!(s_is_high(&high));
+        let low = sign_prehash_der(&key, &digest, false)?;
+        let high = sign_prehash_der(&key, &digest, true)?;
+        assert!(!s_is_high(&low)?);
+        assert!(s_is_high(&high)?);
         assert_ne!(low, high);
         assert_eq!(verify_prehash_der_lenient(&public, &digest, &low), Ok(()));
         assert_eq!(verify_prehash_der_lenient(&public, &digest, &high), Ok(()));
+        Ok(())
     }
 
     #[test]
-    fn sha256_digest_verifies_under_p384_key() {
-        let key = key(2);
-        let public = key.public_key().unwrap();
+    fn sha256_digest_verifies_under_p384_key() -> TestResult {
+        let key = key(2)?;
+        let public = key.public_key()?;
         let digest = Sha256::digest(b"tbs");
-        let sig = sign_prehash_der(&key, &digest, false).unwrap();
+        let sig = sign_prehash_der(&key, &digest, false)?;
         assert_eq!(verify_prehash_der_lenient(&public, &digest, &sig), Ok(()));
+        Ok(())
     }
 
     #[test]
-    fn wrong_digest_key_or_bit_fails() {
-        let key1 = key(3);
-        let public = key1.public_key().unwrap();
-        let other = key(4).public_key().unwrap();
+    fn wrong_digest_key_or_bit_fails() -> TestResult {
+        let key1 = key(3)?;
+        let public = key1.public_key()?;
+        let other = key(4)?.public_key()?;
         let digest = Sha384::digest(b"tbs");
-        let sig = sign_prehash_der(&key1, &digest, false).unwrap();
+        let sig = sign_prehash_der(&key1, &digest, false)?;
         assert_eq!(verify_prehash_der_lenient(&public, &digest, &sig), Ok(()));
         let other_digest = Sha384::digest(b"other");
         assert_eq!(
@@ -404,20 +445,21 @@ mod tests {
             Err(P384Error::VerificationFailed)
         );
         let mut flipped = sig;
-        let last = flipped.len() - 1;
-        flipped[last] ^= 1;
+        let last = flipped.last_mut().ok_or("empty signature")?;
+        *last ^= 1;
         assert_eq!(
             verify_prehash_der_lenient(&public, &digest, &flipped),
             Err(P384Error::VerificationFailed)
         );
+        Ok(())
     }
 
     #[test]
-    fn digest_length_other_than_32_or_48_rejected() {
-        let key = key(5);
-        let public = key.public_key().unwrap();
+    fn digest_length_other_than_32_or_48_rejected() -> TestResult {
+        let key = key(5)?;
+        let public = key.public_key()?;
         let digest = Sha384::digest(b"tbs");
-        let sig = sign_prehash_der(&key, &digest, false).unwrap();
+        let sig = sign_prehash_der(&key, &digest, false)?;
         assert_eq!(verify_prehash_der_lenient(&public, &digest, &sig), Ok(()));
         for len in [0, 31, 33, 47, 49, 64] {
             assert_eq!(
@@ -425,60 +467,121 @@ mod tests {
                 Err(P384Error::InvalidDigestLength(len))
             );
         }
+        Ok(())
     }
 
+    /// One row per rule of the strict-DER parser, each with the exact reason
+    /// that rule gives. Every row fails while parsing, before any
+    /// verification, so one digest serves every row.
     #[test]
-    fn non_strict_der_rejected() {
-        let key = key(6);
-        let public = key.public_key().unwrap();
-        let digest = Sha384::digest(b"tbs");
-        let sig = sign_prehash_der(&key, &digest, false).unwrap();
-        assert_eq!(verify_prehash_der_lenient(&public, &digest, &sig), Ok(()));
+    fn non_strict_der_rejected() -> TestResult {
+        use P384Error::{MalformedDer as M, SignatureScalarOutOfRange as Range};
 
-        // Long-form SEQUENCE length.
-        let mut long_form = vec![0x30, 0x81];
-        long_form.extend_from_slice(&sig[1..]);
-        assert!(matches!(
-            verify_prehash_der_lenient(&public, &digest, &long_form),
-            Err(P384Error::MalformedDer(_))
-        ));
-        // Trailing byte after the SEQUENCE.
-        let mut trailing = sig.clone();
-        trailing.push(0);
-        assert!(matches!(
-            verify_prehash_der_lenient(&public, &digest, &trailing),
-            Err(P384Error::MalformedDer(_))
-        ));
-        // A redundant leading zero on r.
-        let r_len = usize::from(sig[3]);
-        let mut padded = vec![0x30, sig[1] + 1, 0x02, sig[3] + 1, 0x00];
-        padded.extend_from_slice(&sig[4..4 + r_len]);
-        padded.extend_from_slice(&sig[4 + r_len..]);
-        if sig[4] & 0x80 == 0 {
-            assert!(matches!(
-                verify_prehash_der_lenient(&public, &digest, &padded),
-                Err(P384Error::MalformedDer(_))
-            ));
+        let key = key(6)?;
+        let public = key.public_key()?;
+        // `r` with its high bit set, so DER writes a sign pad.
+        let (padded_digest, padded) = signature_where(&key, |r| r.len() == 49)?;
+        // `r` of 48 bytes whose high bit is clear.
+        let (digest, plain) = signature_where(&key, |r| {
+            r.len() == 48 && r.first().is_some_and(|b| *b != 0)
+        })?;
+        for (signed, signature) in [(&padded_digest, &padded), (&digest, &plain)] {
+            assert_eq!(
+                verify_prehash_der_lenient(&public, signed, signature),
+                Ok(())
+            );
         }
-        assert!(matches!(
-            verify_prehash_der_lenient(&public, &digest, &[]),
-            Err(P384Error::MalformedDer(_))
-        ));
+        let (padded_r, padded_s) = integers(&padded)?;
+        let (r, s) = integers(&plain)?;
+        let s = tlv(0x02, &s)?;
+        let mut appended = plain.clone();
+        appended.push(0x00);
+        let mut wrong_tag = plain;
+        *wrong_tag.first_mut().ok_or("empty")? = 0x31;
+
+        let rows: [(&str, Vec<u8>, P384Error); 12] = [
+            ("empty input", vec![], M("truncated SEQUENCE header")),
+            ("SET tag", wrong_tag, M("expected SEQUENCE tag")),
+            (
+                "byte after the SEQUENCE",
+                appended,
+                M("SEQUENCE length does not match the input"),
+            ),
+            (
+                "byte inside the SEQUENCE after s",
+                sequence(&tlv(0x02, &r)?, &[s.as_slice(), &[0x00]].concat())?,
+                M("trailing bytes inside SEQUENCE"),
+            ),
+            (
+                "BIT STRING for r",
+                sequence(&tlv(0x03, &r)?, &s)?,
+                M("expected INTEGER tag"),
+            ),
+            (
+                "truncated INTEGER header",
+                vec![0x30, 0x01, 0x02],
+                M("truncated INTEGER header"),
+            ),
+            (
+                "INTEGER past the SEQUENCE",
+                vec![0x30, 0x03, 0x02, 0x05, 0x01],
+                M("INTEGER runs past the SEQUENCE"),
+            ),
+            (
+                "empty INTEGER",
+                vec![0x30, 0x02, 0x02, 0x00],
+                M("empty INTEGER"),
+            ),
+            (
+                "r with its sign pad removed",
+                sequence(
+                    &tlv(0x02, padded_r.get(1..).ok_or("pad")?)?,
+                    &tlv(0x02, &padded_s)?,
+                )?,
+                M("negative INTEGER"),
+            ),
+            (
+                "redundant leading zero",
+                sequence(&tlv(0x02, &[&[0x00], r.as_slice()].concat())?, &s)?,
+                M("INTEGER has a redundant leading zero"),
+            ),
+            (
+                "49-byte magnitude",
+                sequence(&tlv(0x02, &[&[0x01], r.as_slice()].concat())?, &s)?,
+                Range,
+            ),
+            (
+                "r above the group order",
+                sequence(&tlv(0x02, &[&[0x00][..], &[0xff; 48]].concat())?, &s)?,
+                Range,
+            ),
+        ];
+        for (what, signature, reason) in rows {
+            assert_eq!(
+                verify_prehash_der_lenient(&public, &digest, &signature),
+                Err(reason),
+                "{what}"
+            );
+        }
+        Ok(())
     }
 
     #[test]
-    fn point_validation() {
-        let public = key(7).public_key().unwrap();
+    fn point_validation() -> TestResult {
+        let public = key(7)?.public_key()?;
         let point = public.to_uncompressed();
         assert_eq!(P384PublicKey::from_sec1(&point), Ok(public));
+        let compressed = public.0.to_sec1_point(true);
+        assert_eq!(compressed.as_bytes().len(), COMPRESSED_POINT_LEN);
+        assert_eq!(P384PublicKey::from_sec1(compressed.as_bytes()), Ok(public));
         let mut off_curve = point;
-        off_curve[96] ^= 1;
+        *off_curve.last_mut().ok_or("empty point")? ^= 1;
         assert_eq!(
             P384PublicKey::from_sec1(&off_curve),
             Err(P384Error::PointNotOnCurve)
         );
         let mut bad_prefix = point;
-        bad_prefix[0] = 0x06;
+        *bad_prefix.first_mut().ok_or("empty point")? = 0x06;
         assert_eq!(
             P384PublicKey::from_sec1(&bad_prefix),
             Err(P384Error::InvalidPointPrefix {
@@ -486,13 +589,23 @@ mod tests {
                 prefix: 0x06
             })
         );
+        let mut uncompressed_prefix = compressed.as_bytes().to_vec();
+        *uncompressed_prefix.first_mut().ok_or("empty point")? = 0x04;
         assert_eq!(
-            P384PublicKey::from_sec1(&point[..65]),
+            P384PublicKey::from_sec1(&uncompressed_prefix),
+            Err(P384Error::InvalidPointPrefix {
+                len: 49,
+                prefix: 0x04
+            })
+        );
+        assert_eq!(
+            P384PublicKey::from_sec1(point.get(..65).ok_or("short")?),
             Err(P384Error::InvalidPointLength(65))
         );
         assert_eq!(
             P384PublicKey::from_sec1(&[0x00]),
             Err(P384Error::InvalidPointLength(1))
         );
+        Ok(())
     }
 }

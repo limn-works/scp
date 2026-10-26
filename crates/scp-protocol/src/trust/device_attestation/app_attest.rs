@@ -6,6 +6,10 @@
 //! or the first failing check's rejection. Procedure steps 1 through 5 (the
 //! challenge, the service record, the tag and the entry fields) belong to the
 //! full reader, which computes the binding digest `D` and calls this function.
+//! The function is private to the device-attestation module and takes `D`
+//! only as a [`BindingDigest`], which only
+//! [`device_attestation_binding_digest`](super::device_attestation_binding_digest)
+//! builds, so no caller verifies an attestation against a `D` it chose.
 //!
 //! The checks run in [`APP_ATTEST_CHECKS`] order, one function per check, and
 //! check 7's `aclBlob` comparison is its own entry so the record of checks
@@ -23,7 +27,8 @@ use scp_crypto::p384::P384PublicKey;
 use sha2::{Digest, Sha256};
 
 use super::cbor::{self, Value};
-use super::x509::{self, SubjectKey, Tbs};
+use super::digest::BindingDigest;
+use super::x509::{self, CertificateMalformed, SignatureFault, SubjectKey, Tbs};
 use super::{DeviceAttestationPlatform, DeviceAttestationRejection, VerifiedDeviceAttestation};
 use crate::trust::sybil::{ApplePlatform, ValidatedSybilPolicy};
 
@@ -112,6 +117,20 @@ const CREDENTIAL_ID_LEN: usize = 32;
 /// The trust anchor a chain must verify to. Production reads only
 /// [`APPLE_APP_ATTESTATION_ROOT`]; the field is private, so no other module
 /// builds one outside test code.
+///
+/// The module is private too, so code outside the crate cannot even name the
+/// type, and a struct literal fails before field privacy applies:
+///
+/// ```compile_fail,E0603
+/// use scp_protocol::trust::device_attestation::app_attest::AppAttestRoot;
+/// ```
+///
+/// The positive control: the parent module is public, so the `use` above
+/// fails on the private `app_attest` module alone.
+///
+/// ```
+/// use scp_protocol::trust::device_attestation::VerifiedDeviceAttestation;
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct AppAttestRoot<'a> {
     der: &'a [u8],
@@ -136,20 +155,42 @@ pub(super) const APPLE_APP_ATTESTATION_ROOT: AppAttestRoot<'static> = AppAttestR
     der: &APPLE_ROOT_DER,
 };
 
+/// The client data check 5 hashes after `authData`. Production builds it only
+/// from a [`BindingDigest`]; the field is private, and the one other
+/// constructor exists only in test code, where Apple's recorded samples carry
+/// client data that no `D` produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ClientData<'a>(&'a [u8]);
+
+impl<'a> From<&'a BindingDigest> for ClientData<'a> {
+    fn from(digest: &'a BindingDigest) -> Self {
+        Self(digest.as_bytes())
+    }
+}
+
+#[cfg(test)]
+impl<'a> ClientData<'a> {
+    /// Client data taken as given, for a recorded sample.
+    pub(super) const fn from_test_bytes(bytes: &'a [u8]) -> Self {
+        Self(bytes)
+    }
+}
+
 /// The inputs of one App Attest read.
 #[derive(Debug, Clone, Copy)]
-pub struct AppAttestRead<'a> {
+pub(super) struct AppAttestRead<'a> {
     /// The attestation object, decoded from the entry's base64url field.
-    pub attestation_object: &'a [u8],
-    /// The binding digest `D` the full reader computed for the identifier,
-    /// the context id and the context's challenge.
-    pub binding_digest: [u8; 32],
+    pub(super) attestation_object: &'a [u8],
+    /// The client data: in production, the binding digest `D` the full reader
+    /// computed for the identifier, the context id and the context's
+    /// challenge.
+    pub(super) client_data: ClientData<'a>,
     /// The context's validated Sybil policy.
-    pub policy: ValidatedSybilPolicy<'a>,
+    pub(super) policy: ValidatedSybilPolicy<'a>,
     /// The reader's current time, Unix seconds.
-    pub now_secs: u64,
+    pub(super) now_secs: u64,
     /// The service-record entry's `id`, which a `Verified` outcome carries.
-    pub entry_id: &'a str,
+    pub(super) entry_id: &'a str,
 }
 
 /// Runs App Attest checks 1 through 12 against the pinned Apple root.
@@ -157,7 +198,7 @@ pub struct AppAttestRead<'a> {
 /// # Errors
 ///
 /// The first failing check's [`DeviceAttestationRejection`].
-pub fn read_app_attest(
+pub(super) fn read_app_attest(
     read: &AppAttestRead<'_>,
 ) -> Result<VerifiedDeviceAttestation, DeviceAttestationRejection> {
     read_with_root(&APPLE_APP_ATTESTATION_ROOT, read)
@@ -608,85 +649,219 @@ fn parse_auth_data(raw: &[u8]) -> Result<AuthData, DeviceAttestationRejection> {
         let Ok(Value::Map(pairs)) = cbor::decode_exact(extensions) else {
             return Err(DeviceAttestationRejection::MalformedToken);
         };
-        let mut keys = Vec::with_capacity(pairs.len());
-        for (key, _) in &pairs {
-            let mut encoded = Vec::new();
-            cbor::encode_canonical(key, &mut encoded)
-                .map_err(|_| DeviceAttestationRejection::MalformedToken)?;
-            if keys.contains(&encoded) {
-                return Err(DeviceAttestationRejection::MalformedToken);
-            }
-            keys.push(encoded);
+        if !extension_keys_distinct(&pairs) {
+            return Err(DeviceAttestationRejection::MalformedToken);
         }
         fields.extensions = Some(pairs);
     }
     Ok(fields)
 }
 
-/// Check 3 on the three certificates: each equals its rebuild, the root and
-/// the intermediate hold P-384 keys and the leaf a P-256 key, each signature
-/// uses an accepted algorithm and verifies, each certificate is valid at the
-/// leaf's `notBefore`, and that `notBefore` is no later than `now_secs` plus
-/// the skew.
+/// Whether every key of the `authData` extensions map is a text string or an
+/// integer and no two keys are equal (§9.3.1 check 2). Keys are compared by
+/// their canonical encodings after a sort, so the cost is `O(n log n)` in the
+/// number of keys with no cap on it.
+fn extension_keys_distinct(pairs: &[(Value, Value)]) -> bool {
+    let mut keys = Vec::with_capacity(pairs.len());
+    for (key, _) in pairs {
+        if !matches!(
+            key,
+            Value::Text(_) | Value::Unsigned(_) | Value::Negative(_)
+        ) {
+            return false;
+        }
+        let mut encoded = Vec::new();
+        if cbor::encode_canonical(key, &mut encoded).is_err() {
+            return false;
+        }
+        keys.push(encoded);
+    }
+    keys.sort_unstable();
+    !keys.windows(2).any(|pair| match pair {
+        [left, right] => left == right,
+        _ => false,
+    })
+}
+
+/// A certificate of the chain check 3 reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Certificate {
+    /// The pinned root.
+    Root,
+    /// `x5c[1]`.
+    Intermediate,
+    /// `x5c[0]`, the credential certificate.
+    Leaf,
+}
+
+/// Why check 3 refused a chain. Every value becomes
+/// `Rejected{CertificateChainInvalid}`; the variant names the rule, so a test
+/// shows which rule refused an input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ChainFault {
+    /// The certificate could not be read.
+    Malformed(Certificate, CertificateMalformed),
+    /// The certificate differs from its rebuild.
+    RebuildDiffers(Certificate),
+    /// An issuing certificate's key is not P-384.
+    IssuerKeyNotP384(Certificate),
+    /// An issuing certificate's P-384 point is not on the curve.
+    P384PointInvalid(Certificate),
+    /// The leaf's key is not P-256.
+    LeafKeyNotP256,
+    /// The leaf's P-256 point is not on the curve.
+    P256PointInvalid,
+    /// The certificate's issuer name differs from its parent's subject name.
+    IssuerNameMismatch(Certificate),
+    /// The intermediate does not carry basicConstraints with `cA TRUE`.
+    IntermediateNotCa,
+    /// The intermediate does not carry keyUsage with keyCertSign.
+    IntermediateCannotSignCertificates,
+    /// The certificate carries a critical extension the reader does not
+    /// recognise.
+    UnrecognisedCriticalExtension(Certificate),
+    /// The certificate's signature algorithm is not one check 3 accepts.
+    UnsupportedAlgorithm(Certificate),
+    /// The certificate's signature does not verify under its parent's key.
+    SignatureInvalid(Certificate),
+    /// The certificate is not valid at the leaf's `notBefore`.
+    NotValidAtMinting(Certificate),
+    /// The leaf's `notBefore` is later than the reader's time plus the skew.
+    MintedInFuture,
+}
+
+/// Splits and parses one certificate.
+fn read_certificate(
+    which: Certificate,
+    der: &[u8],
+) -> Result<(x509::CertificateParts<'_>, Tbs), ChainFault> {
+    let fault = |cause| ChainFault::Malformed(which, cause);
+    let parts = x509::split_certificate(der).map_err(fault)?;
+    let tbs = x509::parse_tbs(parts.tbs).map_err(fault)?;
+    Ok((parts, tbs))
+}
+
+/// An issuing certificate's P-384 key.
+fn issuer_key(which: Certificate, key: &SubjectKey) -> Result<P384PublicKey, ChainFault> {
+    match key {
+        SubjectKey::P384(point) => {
+            P384PublicKey::from_sec1(point).map_err(|_| ChainFault::P384PointInvalid(which))
+        }
+        SubjectKey::P256(_) | SubjectKey::Other => Err(ChainFault::IssuerKeyNotP384(which)),
+    }
+}
+
+/// The RFC 5280 path rules check 3 states for `x5c[1]`: basicConstraints
+/// with `cA TRUE` and keyUsage with keyCertSign.
+fn check_intermediate_may_issue(intermediate: &Tbs) -> Result<(), ChainFault> {
+    let malformed = |cause| ChainFault::Malformed(Certificate::Intermediate, cause);
+    let ca = intermediate
+        .extension(x509::OID_BASIC_CONSTRAINTS)
+        .map(x509::basic_constraints_ca)
+        .transpose()
+        .map_err(malformed)?;
+    if ca != Some(true) {
+        return Err(ChainFault::IntermediateNotCa);
+    }
+    let cert_sign = intermediate
+        .extension(x509::OID_KEY_USAGE)
+        .map(x509::key_usage_cert_sign)
+        .transpose()
+        .map_err(malformed)?;
+    if cert_sign != Some(true) {
+        return Err(ChainFault::IntermediateCannotSignCertificates);
+    }
+    Ok(())
+}
+
+/// Verifies one certificate's signature under its parent's key.
+fn check_signature(
+    which: Certificate,
+    issuer: &P384PublicKey,
+    tbs: &Tbs,
+    parts: &x509::CertificateParts<'_>,
+) -> Result<(), ChainFault> {
+    x509::verify_signature(issuer, tbs.signature_algorithm, parts).map_err(|fault| match fault {
+        SignatureFault::UnsupportedAlgorithm => ChainFault::UnsupportedAlgorithm(which),
+        SignatureFault::DoesNotVerify => ChainFault::SignatureInvalid(which),
+    })
+}
+
+/// Check 3 on the three certificates, in this order: each parses; the
+/// intermediate and the leaf equal their rebuilds; the root and the
+/// intermediate hold P-384 keys and the leaf a P-256 key; each issuer name
+/// equals its parent's subject name; the intermediate may issue
+/// certificates; neither `x5c` certificate carries an unrecognised critical
+/// extension; each signature uses an accepted algorithm and verifies; each
+/// certificate is valid at the leaf's `notBefore`; and that `notBefore` is no
+/// later than `now_secs` plus the skew.
 pub(super) fn verify_chain(
     root_der: &[u8],
     intermediate_der: &[u8],
     leaf_der: &[u8],
     now_secs: u64,
-) -> Result<(), x509::CertificateMalformed> {
-    use x509::CertificateMalformed as Bad;
-
-    let root = x509::parse_tbs(x509::split_certificate(root_der)?.tbs)?;
-    let intermediate_parts = x509::split_certificate(intermediate_der)?;
-    let intermediate = x509::parse_tbs(intermediate_parts.tbs)?;
-    let leaf_parts = x509::split_certificate(leaf_der)?;
-    let leaf = x509::parse_tbs(leaf_parts.tbs)?;
+) -> Result<(), ChainFault> {
+    let (_, root) = read_certificate(Certificate::Root, root_der)?;
+    let (intermediate_parts, intermediate) =
+        read_certificate(Certificate::Intermediate, intermediate_der)?;
+    let (leaf_parts, leaf) = read_certificate(Certificate::Leaf, leaf_der)?;
 
     if !x509::rebuild_matches(
         intermediate_der,
         &intermediate_parts,
         &intermediate.signature_algorithm_tlv,
     ) {
-        return Err(Bad("intermediate differs from its rebuild"));
+        return Err(ChainFault::RebuildDiffers(Certificate::Intermediate));
     }
     if !x509::rebuild_matches(leaf_der, &leaf_parts, &leaf.signature_algorithm_tlv) {
-        return Err(Bad("leaf differs from its rebuild"));
+        return Err(ChainFault::RebuildDiffers(Certificate::Leaf));
     }
 
-    let p384 = |key: &SubjectKey| match key {
-        SubjectKey::P384(point) => {
-            P384PublicKey::from_sec1(point).map_err(|_| Bad("P-384 point invalid"))
-        }
-        SubjectKey::P256(_) | SubjectKey::Other => Err(Bad("issuer key is not P-384")),
-    };
-    let root_key = p384(&root.key)?;
-    let intermediate_key = p384(&intermediate.key)?;
+    let root_key = issuer_key(Certificate::Root, &root.key)?;
+    let intermediate_key = issuer_key(Certificate::Intermediate, &intermediate.key)?;
     match &leaf.key {
         SubjectKey::P256(point) => {
-            P256PublicKey::from_uncompressed(point).map_err(|_| Bad("P-256 point invalid"))?;
+            P256PublicKey::from_uncompressed(point).map_err(|_| ChainFault::P256PointInvalid)?;
         }
-        SubjectKey::P384(_) | SubjectKey::Other => return Err(Bad("leaf key is not P-256")),
+        SubjectKey::P384(_) | SubjectKey::Other => return Err(ChainFault::LeafKeyNotP256),
     }
 
-    if !x509::verify_signature(
+    if leaf.issuer != intermediate.subject {
+        return Err(ChainFault::IssuerNameMismatch(Certificate::Leaf));
+    }
+    if intermediate.issuer != root.subject {
+        return Err(ChainFault::IssuerNameMismatch(Certificate::Intermediate));
+    }
+    check_intermediate_may_issue(&intermediate)?;
+    for (which, tbs) in [
+        (Certificate::Intermediate, &intermediate),
+        (Certificate::Leaf, &leaf),
+    ] {
+        if tbs.has_unrecognised_critical_extension() {
+            return Err(ChainFault::UnrecognisedCriticalExtension(which));
+        }
+    }
+
+    check_signature(
+        Certificate::Intermediate,
         &root_key,
-        intermediate.signature_algorithm,
+        &intermediate,
         &intermediate_parts,
-    ) {
-        return Err(Bad("intermediate signature does not verify"));
-    }
-    if !x509::verify_signature(&intermediate_key, leaf.signature_algorithm, &leaf_parts) {
-        return Err(Bad("leaf signature does not verify"));
-    }
+    )?;
+    check_signature(Certificate::Leaf, &intermediate_key, &leaf, &leaf_parts)?;
 
     let minted_at = leaf.not_before;
-    for certificate in [&root, &intermediate, &leaf] {
-        if minted_at < certificate.not_before || minted_at > certificate.not_after {
-            return Err(Bad("certificate not valid at the leaf's notBefore"));
+    for (which, tbs) in [
+        (Certificate::Root, &root),
+        (Certificate::Intermediate, &intermediate),
+        (Certificate::Leaf, &leaf),
+    ] {
+        if minted_at < tbs.not_before || minted_at > tbs.not_after {
+            return Err(ChainFault::NotValidAtMinting(which));
         }
     }
     if minted_at > now_secs.saturating_add(CLOCK_SKEW_SECS) {
-        return Err(Bad("leaf notBefore is later than the skew allows"));
+        return Err(ChainFault::MintedInFuture);
     }
     Ok(())
 }
@@ -751,10 +926,10 @@ fn check_max_age(state: &mut State<'_>) -> Result<Ran, Stop> {
 }
 
 fn check_nonce(state: &mut State<'_>) -> Result<Ran, Stop> {
-    let binding_digest = state.read.binding_digest;
+    let ClientData(client_data) = state.read.client_data;
     let mut hasher = Sha256::new();
     hasher.update(&state.object()?.auth_data);
-    hasher.update(binding_digest);
+    hasher.update(client_data);
     let nonce = hasher.finalize();
     let extension = state
         .chain()?

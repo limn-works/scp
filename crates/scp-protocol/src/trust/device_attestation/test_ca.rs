@@ -11,7 +11,9 @@ use scp_crypto::p256::P256SecretKey;
 use scp_crypto::p384::{self, P384SecretKey};
 use sha2::{Digest, Sha256, Sha384, Sha512};
 
-use super::app_attest::{self, AppAttestCheck, AppAttestRead, AppAttestRoot, CheckFn, Run};
+use super::app_attest::{
+    self, AppAttestCheck, AppAttestRead, AppAttestRoot, CheckFn, ClientData, Run,
+};
 use crate::trust::sybil::{AcceptedAppId, ApplePlatform, ContextSybilPolicy};
 
 pub(super) type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -62,7 +64,7 @@ pub(super) fn explicit(number: u8, content: &[u8]) -> Vec<u8> {
     tlv(&[0xa0 | number], content)
 }
 
-fn integer(magnitude: &[u8]) -> Vec<u8> {
+pub(super) fn integer(magnitude: &[u8]) -> Vec<u8> {
     let mut content = Vec::new();
     if magnitude.first().is_none_or(|b| b & 0x80 != 0) {
         content.push(0);
@@ -72,7 +74,7 @@ fn integer(magnitude: &[u8]) -> Vec<u8> {
 }
 
 /// `UTCTime` for a Unix time between 1950 and 2049.
-fn utc_time(secs: u64) -> BoxResult<Vec<u8>> {
+pub(super) fn utc_time(secs: u64) -> BoxResult<Vec<u8>> {
     let date = der::DateTime::from_unix_duration(core::time::Duration::from_secs(secs))?;
     let text = format!(
         "{:02}{:02}{:02}{:02}{:02}{:02}Z",
@@ -86,7 +88,7 @@ fn utc_time(secs: u64) -> BoxResult<Vec<u8>> {
     Ok(tlv(&[0x17], text.as_bytes()))
 }
 
-fn name(common_name: &str) -> Vec<u8> {
+pub(super) fn name(common_name: &str) -> Vec<u8> {
     let attribute = seq(&[
         &oid(&[0x55, 0x04, 0x03]),
         &tlv(&[0x0c], common_name.as_bytes()),
@@ -144,13 +146,27 @@ impl Alg {
 pub(super) enum Curve {
     P256,
     P384,
+    /// A 65-byte P-256 encoding whose point is not on the curve.
+    P256Invalid,
+    /// A 97-byte P-384 encoding whose point is not on the curve.
+    P384Invalid,
 }
 
-fn spki(curve: Curve, point: &[u8]) -> Vec<u8> {
+/// `point` with its last byte flipped: the same `x` with a `y` that is not
+/// either of the two curve solutions.
+fn off_curve(point: &[u8]) -> Vec<u8> {
+    let mut out = point.to_vec();
+    if let Some(last) = out.last_mut() {
+        *last ^= 0x01;
+    }
+    out
+}
+
+pub(super) fn spki(curve: Curve, point: &[u8]) -> Vec<u8> {
     use super::x509::{OID_EC_PUBLIC_KEY, OID_PRIME256V1, OID_SECP384R1};
     let curve_oid = match curve {
-        Curve::P256 => OID_PRIME256V1,
-        Curve::P384 => OID_SECP384R1,
+        Curve::P256 | Curve::P256Invalid => OID_PRIME256V1,
+        Curve::P384 | Curve::P384Invalid => OID_SECP384R1,
     };
     let mut bits = vec![0x00];
     bits.extend_from_slice(point);
@@ -212,13 +228,79 @@ impl Issued {
     }
 }
 
+/// One extension a test certificate carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct TestExtension {
+    pub(super) oid: Vec<u8>,
+    /// Written as `critical BOOLEAN TRUE` when set, omitted otherwise.
+    pub(super) critical: bool,
+    pub(super) value: Vec<u8>,
+}
+
+impl TestExtension {
+    /// A non-critical extension.
+    pub(super) fn plain(oid: &[u8], value: Vec<u8>) -> Self {
+        Self {
+            oid: oid.to_vec(),
+            critical: false,
+            value,
+        }
+    }
+
+    /// A critical extension.
+    pub(super) fn critical(oid: &[u8], value: Vec<u8>) -> Self {
+        Self {
+            oid: oid.to_vec(),
+            critical: true,
+            value,
+        }
+    }
+
+    /// The DER `Extension`.
+    pub(super) fn der(&self) -> Vec<u8> {
+        if self.critical {
+            seq(&[&oid(&self.oid), &[0x01, 0x01, 0xff], &octets(&self.value)])
+        } else {
+            seq(&[&oid(&self.oid), &octets(&self.value)])
+        }
+    }
+}
+
+/// basicConstraints `cA TRUE, pathLenConstraint 0`, as Apple's intermediate
+/// writes it.
+pub(super) const BASIC_CONSTRAINTS_CA: [u8; 8] = [0x30, 0x06, 0x01, 0x01, 0xff, 0x02, 0x01, 0x00];
+/// basicConstraints with `cA` omitted (FALSE), as Apple's leaf writes it.
+pub(super) const BASIC_CONSTRAINTS_END_ENTITY: [u8; 2] = [0x30, 0x00];
+/// keyUsage keyCertSign and cRLSign.
+pub(super) const KEY_USAGE_CA: [u8; 4] = [0x03, 0x02, 0x01, 0x06];
+/// keyUsage digitalSignature.
+pub(super) const KEY_USAGE_DIGITAL_SIGNATURE: [u8; 4] = [0x03, 0x02, 0x07, 0x80];
+
+/// The critical basicConstraints and keyUsage of a certificate authority.
+pub(super) fn ca_extensions() -> Vec<TestExtension> {
+    use super::x509::{OID_BASIC_CONSTRAINTS, OID_KEY_USAGE};
+    vec![
+        TestExtension::critical(OID_BASIC_CONSTRAINTS, BASIC_CONSTRAINTS_CA.to_vec()),
+        TestExtension::critical(OID_KEY_USAGE, KEY_USAGE_CA.to_vec()),
+    ]
+}
+
+/// The critical basicConstraints and keyUsage of a credential certificate.
+pub(super) fn end_entity_extensions() -> Vec<TestExtension> {
+    use super::x509::{OID_BASIC_CONSTRAINTS, OID_KEY_USAGE};
+    vec![
+        TestExtension::critical(OID_BASIC_CONSTRAINTS, BASIC_CONSTRAINTS_END_ENTITY.to_vec()),
+        TestExtension::critical(OID_KEY_USAGE, KEY_USAGE_DIGITAL_SIGNATURE.to_vec()),
+    ]
+}
+
 fn issue(
     spec: &CertSpec,
     serial: u8,
     issuer_name: &str,
     subject_name: &str,
     subject_key: &[u8],
-    extensions: &[(Vec<u8>, Vec<u8>)],
+    extensions: &[TestExtension],
     issuer: &P384SecretKey,
 ) -> BoxResult<Issued> {
     let mut fields = vec![
@@ -231,10 +313,7 @@ fn issue(
         subject_key.to_vec(),
     ];
     if !extensions.is_empty() {
-        let list: Vec<Vec<u8>> = extensions
-            .iter()
-            .map(|(id, value)| seq(&[&oid(id), &octets(value)]))
-            .collect();
+        let list: Vec<Vec<u8>> = extensions.iter().map(TestExtension::der).collect();
         let list: Vec<&[u8]> = list.iter().map(Vec::as_slice).collect();
         fields.push(explicit(3, &seq(&list)));
     }
@@ -364,12 +443,28 @@ pub(super) fn platform_extension(system: &[u8]) -> Vec<u8> {
 
 pub(super) use super::app_attest::MACOS_ACL_BLOB;
 
+// ── Timing bounds ───────────────────────────────────────────────────────────
+
+/// The number of keys in the duplicate-check timing tests: more than a
+/// 4 MiB record can hold as distinct keys of the shortest form, so the bound
+/// covers every input a reader can be handed.
+pub(super) const MANY: u64 = 47_500;
+
+/// The time bound of the timing tests. A pairwise comparison of `MANY` keys
+/// makes over 10^9 comparisons and takes tens of seconds in a debug build;
+/// a sort takes milliseconds.
+pub(super) const MANY_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
+
 // ── Fixture ─────────────────────────────────────────────────────────────────
 
 /// The leaf `notBefore` of the valid fixture: 2027-01-15T08:00:00Z.
 pub(super) const T0: u64 = 1_800_000_000;
 pub(super) const DAY: u64 = 86_400;
 pub(super) const APP_ID: &str = "TEAMID1234.org.example.app";
+/// The root's subject and issuer common name.
+pub(super) const ROOT_NAME: &str = "Test App Attestation Root CA";
+/// The intermediate's subject common name.
+pub(super) const INTERMEDIATE_NAME: &str = "Test App Attestation CA 1";
 pub(super) const MAX_AGE_SECS: u64 = 30 * DAY;
 pub(super) const AAGUID_PRODUCTION: [u8; 16] = *b"appattest\0\0\0\0\0\0\0";
 pub(super) const AAGUID_DEVELOPMENT: [u8; 16] = *b"appattestdevelop";
@@ -421,8 +516,16 @@ pub(super) struct Fixture {
     pub(super) acl_blob: Option<Vec<u8>>,
     /// Extension 8.7's value, `None` for no 8.7.
     pub(super) platform: Option<Vec<u8>>,
+    /// The leaf's extensions before the Apple ones.
+    pub(super) leaf_extensions: Vec<TestExtension>,
     /// Extensions added to the leaf after the Apple ones.
-    pub(super) extra_leaf_extensions: Vec<(Vec<u8>, Vec<u8>)>,
+    pub(super) extra_leaf_extensions: Vec<TestExtension>,
+    /// The intermediate's extensions.
+    pub(super) intermediate_extensions: Vec<TestExtension>,
+    /// The leaf's `issuer` common name.
+    pub(super) leaf_issuer_name: String,
+    /// The intermediate's `issuer` common name.
+    pub(super) intermediate_issuer_name: String,
     pub(super) rp_id: String,
     pub(super) flags: u8,
     pub(super) counter: u32,
@@ -496,7 +599,11 @@ impl Fixture {
             nonce: Nonce::Derived,
             acl_blob: None,
             platform: Some(platform_extension(b"iphoneos")),
+            leaf_extensions: end_entity_extensions(),
             extra_leaf_extensions: Vec::new(),
+            intermediate_extensions: ca_extensions(),
+            leaf_issuer_name: INTERMEDIATE_NAME.to_owned(),
+            intermediate_issuer_name: ROOT_NAME.to_owned(),
             rp_id: APP_ID.to_owned(),
             flags: FLAGS_AT_ED,
             counter: 0,
@@ -555,27 +662,32 @@ impl Fixture {
 
     /// The leaf's extensions: 8.2 over `auth_data`, then 8.6, 8.7 and the
     /// extra ones.
-    fn leaf_extensions(&self, auth_data: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    fn all_leaf_extensions(&self, auth_data: &[u8]) -> Vec<TestExtension> {
         let nonce_for = |digest: &[u8; 32]| {
             let mut hasher = Sha256::new();
             hasher.update(auth_data);
             hasher.update(digest);
             nonce_extension(&hasher.finalize())
         };
-        let mut extensions = Vec::new();
+        let mut extensions = self.leaf_extensions.clone();
         match &self.nonce {
             Nonce::Derived => {
-                extensions.push((OID_NONCE.to_vec(), nonce_for(&self.binding_digest)));
+                extensions.push(TestExtension::plain(
+                    OID_NONCE,
+                    nonce_for(&self.binding_digest),
+                ));
             }
-            Nonce::ForDigest(digest) => extensions.push((OID_NONCE.to_vec(), nonce_for(digest))),
+            Nonce::ForDigest(digest) => {
+                extensions.push(TestExtension::plain(OID_NONCE, nonce_for(digest)));
+            }
             Nonce::Absent => {}
-            Nonce::Raw(value) => extensions.push((OID_NONCE.to_vec(), value.clone())),
+            Nonce::Raw(value) => extensions.push(TestExtension::plain(OID_NONCE, value.clone())),
         }
         if let Some(value) = &self.acl_blob {
-            extensions.push((OID_ACL_BLOB.to_vec(), value.clone()));
+            extensions.push(TestExtension::plain(OID_ACL_BLOB, value.clone()));
         }
         if let Some(value) = &self.platform {
-            extensions.push((OID_PLATFORM.to_vec(), value.clone()));
+            extensions.push(TestExtension::plain(OID_PLATFORM, value.clone()));
         }
         extensions.extend(self.extra_leaf_extensions.iter().cloned());
         extensions
@@ -594,18 +706,22 @@ impl Fixture {
             None => spki(own, point),
             Some(Curve::P256) => spki(Curve::P256, &p256_stand_in),
             Some(Curve::P384) => spki(Curve::P384, &root_point),
+            Some(Curve::P256Invalid) => spki(Curve::P256, &off_curve(&p256_stand_in)),
+            Some(Curve::P384Invalid) => spki(Curve::P384, &off_curve(&root_point)),
         };
 
         let root = issue(
             &self.root,
             1,
-            "Test App Attestation Root CA",
-            "Test App Attestation Root CA",
+            ROOT_NAME,
+            ROOT_NAME,
             &key_for(Curve::P384, &root_point, &self.root),
-            &[],
+            &ca_extensions(),
             &root_key,
         )?
         .der();
+        // A foreign anchor carries the fixture root's name, so only its key
+        // differs and only the intermediate's signature can refuse it.
         let anchor = match self.anchor_seed {
             None => root.clone(),
             Some(seed) => {
@@ -614,10 +730,10 @@ impl Fixture {
                 issue(
                     &self.root,
                     9,
-                    "Foreign Root CA",
-                    "Foreign Root CA",
+                    ROOT_NAME,
+                    ROOT_NAME,
                     &spki(Curve::P384, &point),
-                    &[],
+                    &ca_extensions(),
                     &foreign,
                 )?
                 .der()
@@ -626,10 +742,10 @@ impl Fixture {
         let intermediate_issued = issue(
             &self.intermediate,
             2,
-            "Test App Attestation Root CA",
-            "Test App Attestation CA 1",
+            &self.intermediate_issuer_name,
+            INTERMEDIATE_NAME,
             &key_for(Curve::P384, &intermediate_point, &self.intermediate),
-            &[],
+            &self.intermediate_extensions,
             &root_key,
         )?;
         let intermediate = self.intermediate_hook.map_or_else(
@@ -641,11 +757,11 @@ impl Fixture {
         if let Some(hook) = self.auth_data_hook {
             hook(&mut auth_data);
         }
-        let extensions = self.leaf_extensions(&auth_data);
+        let extensions = self.all_leaf_extensions(&auth_data);
         let leaf_issued = issue(
             &self.leaf,
             3,
-            "Test App Attestation CA 1",
+            &self.leaf_issuer_name,
             "credential",
             &key_for(Curve::P256, &leaf_point, &self.leaf),
             &extensions,
@@ -679,7 +795,7 @@ impl Fixture {
         let policy = self.policy.validated()?;
         let read = AppAttestRead {
             attestation_object: &built.object,
-            binding_digest: self.binding_digest,
+            client_data: ClientData::from_test_bytes(&self.binding_digest),
             policy,
             now_secs: self.now_secs,
             entry_id: "entry-1",

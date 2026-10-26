@@ -10,6 +10,19 @@ unchanged. The tests in `../tests.rs` read them with `include_bytes!`.
 | `go-dev.cbor` | 17.6.1 | `appattestdevelop` | the attestation in `TestAppAttestDev` in `appattest/appattest_impl_test.go` of https://github.com/splitsecure/go-app-attest at commit `b4cf46a249f27449ce53a83b3967da56f46b5fba` |
 | `go-prod.cbor` | 18.0 | `appattest` and seven zero bytes | the attestation in `TestAppAttest` in the same file and commit |
 
+## App IDs and client data
+
+`recorded_samples_run_every_check` runs checks 1 through 12 on each object
+with the App ID and the client data its upstream test passed to Apple. Each
+pair reproduces the object's `rpIdHash` and its 8.2 nonce,
+`SHA-256(authData ‖ clientData)`.
+
+| File | App ID | Client data | Upstream source |
+|---|---|---|---|
+| `ios-14.4.cbor` | `6MURL8TA57.de.vincent-haupert.apple-appattest-poc` | the 32 bytes whose base64 is `i+ZcylFa0JfJU5Z9GNY12G3XihQu09B3UmvtEca+xns=` | the `clientDataHash` and App ID fields of `src/test/resources/ios-14.4.yaml` |
+| `go-dev.cbor` | `NFVU6DQWLM.com.turtlecrypt.appattestfun` | SHA-256 of the ASCII string `server_challenge` | the challenge and App ID in `TestAppAttestDev` |
+| `go-prod.cbor` | `0352187391.com.apple.example_app_attest` | the 21 ASCII bytes `test_server_challenge`, unhashed | the challenge and App ID in `TestAppAttest` |
+
 SHA-256 of each file:
 
 - `ios-14.4.cbor`: `9472e19c33e28e8cca9b1bc3a0417f6690ac0425d23b36be0a3f1d115ddda9d1`

@@ -2,19 +2,34 @@
 //!
 //! This module holds the reader's public outcome types; in [`digest`], the
 //! four digests §9.3.1 defines: the binding digest `D`, the tag `T`, the
-//! assertion digest `A` and the policy digest `P`; and the App Attest checks,
-//! [`read_app_attest`], with the owner's re-encoding of an attestation object,
+//! assertion digest `A` and the policy digest `P`; the App Attest checks,
+//! which only the full reader calls, with a `D` it computed itself; and the
+//! owner's re-encoding of an attestation object,
 //! [`canonicalize_app_attest_object`].
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the SCP-316 reader (keri/p6-reader-scp-316) is the first caller outside the tests"
+    )
+)]
 mod app_attest;
 mod cbor;
 pub mod digest;
 #[cfg(test)]
 mod test_ca;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the SCP-316 reader (keri/p6-reader-scp-316) is the first caller outside the tests"
+    )
+)]
 mod x509;
 
 pub use cbor::{APP_ATTEST_FMT, AppAttestObjectError, canonicalize_app_attest_object};
-pub use digest::device_attestation_binding_digest;
+pub use digest::{BindingDigest, device_attestation_binding_digest};
 
 /// The most `ScpDeviceAttestation` entries one record may carry for one
 /// context's tag (§9.18.17). A reader that finds more returns

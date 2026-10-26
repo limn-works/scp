@@ -516,7 +516,10 @@ mod tests {
             &[0xff][..],                   // a break with nothing open
             &[0x81][..],                   // array missing its element
             &[0x62, 0xff, 0xfe][..],       // invalid UTF-8 text
-            &[0x01, 0x02][..],             // trailing bytes
+            // "é" (c3 a9) split across two text chunks: the joined text is
+            // UTF-8, but RFC 8949 §3.2.3 requires each chunk to be.
+            &[0x7f, 0x61, 0xc3, 0x61, 0xa9, 0xff][..],
+            &[0x01, 0x02][..], // trailing bytes
         ] {
             assert_eq!(decode_exact(input), Err(NotWellFormed), "{input:02x?}");
         }

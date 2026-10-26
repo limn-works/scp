@@ -13,17 +13,20 @@ use sha2::{Digest, Sha256};
 
 use super::{
     APP_ATTEST_CHECKS, APPLE_APP_ATTESTATION_ROOT, AppAttestCheck, AppAttestRead, AppAttestRoot,
-    CheckFn, Run, Stop, choose_platform_path, lenient_object, read_app_attest, read_with_root, run,
+    Certificate, ChainFault, CheckFn, ClientData, Run, Stop, choose_platform_path, lenient_object,
+    parse_auth_data, read_app_attest, read_with_root, run, verify_chain,
 };
 use crate::trust::device_attestation::test_ca::{
     AAGUID_DEVELOPMENT, Alg, BoxResult, Built, CredentialId, Curve, DAY, Fixture, Issued,
-    MACOS_ACL_BLOB, MAX_AGE_SECS, Nonce, T0, TestResult, acl_blob_extension, attestation_object,
-    cbor_array, cbor_bytes, cbor_head, cbor_map, cbor_text, explicit, extensions_with_category,
-    nonce_extension, octets, platform_extension, policy_for, seq, tlv,
+    MACOS_ACL_BLOB, MANY, MANY_BOUND, MAX_AGE_SECS, Nonce, T0, TestExtension, TestResult,
+    acl_blob_extension, cbor_array, cbor_bytes, cbor_head, cbor_map, cbor_text, explicit,
+    extensions_with_category, nonce_extension, octets, platform_extension, policy_for, seq, tlv,
 };
+use crate::trust::device_attestation::x509::CertificateMalformed;
 use crate::trust::device_attestation::{
-    AppAttestObjectError, DeviceAttestationPlatform, DeviceAttestationRejection as R,
-    canonicalize_app_attest_object, device_attestation_binding_digest, x509,
+    AppAttestObjectError, BindingDigest, DeviceAttestationPlatform,
+    DeviceAttestationRejection as R, canonicalize_app_attest_object,
+    device_attestation_binding_digest, x509,
 };
 use crate::trust::sybil::{AcceptedAppId, ApplePlatform};
 
@@ -303,7 +306,72 @@ fn repeated_x5c_key(built: &Built) -> Vec<u8> {
     ])
 }
 
+fn packed_fmt(built: &Built) -> Vec<u8> {
+    cbor_map(&[
+        (cbor_text("fmt"), cbor_text("packed")),
+        statement_pair(built),
+        auth_data_pair(built),
+    ])
+}
+
+fn x5c_three_elements(built: &Built) -> Vec<u8> {
+    cbor_map(&[
+        fmt_pair(),
+        (
+            cbor_text("attStmt"),
+            cbor_map(&[(
+                cbor_text("x5c"),
+                cbor_array(&[
+                    cbor_bytes(&built.leaf),
+                    cbor_bytes(&built.intermediate),
+                    cbor_bytes(&built.root),
+                ]),
+            )]),
+        ),
+        auth_data_pair(built),
+    ])
+}
+
 // ── authData hooks (check 2) ────────────────────────────────────────────────
+
+/// An extensions map of `MANY` distinct integer keys, with a repeat of the
+/// first key appended when `repeat` is set.
+fn many_extension_keys(repeat: bool) -> Vec<u8> {
+    let count = MANY + u64::from(repeat);
+    let mut map = cbor_head(5, count);
+    for key in 0..MANY {
+        map.extend(cbor_head(0, key));
+        map.extend(cbor_head(0, 0));
+    }
+    if repeat {
+        map.extend(cbor_head(0, 0));
+        map.extend(cbor_head(0, 0));
+    }
+    map
+}
+
+#[test]
+fn extension_key_check_is_quasilinear() -> TestResult {
+    for repeat in [false, true] {
+        let mut fixture = Fixture::valid();
+        fixture.extensions = Some(many_extension_keys(repeat));
+        let built = fixture.build()?;
+        let started = std::time::Instant::now();
+        let parsed = parse_auth_data(&built.auth_data);
+        let elapsed = started.elapsed();
+        assert!(elapsed < MANY_BOUND, "took {elapsed:?}");
+        if repeat {
+            assert_eq!(parsed.err(), Some(R::MalformedToken));
+        } else {
+            let pairs = parsed
+                .map_err(|reason| format!("{reason:?}"))?
+                .extensions
+                .ok_or("extensions read")?;
+            assert_eq!(pairs.len(), usize::try_from(MANY)?);
+        }
+    }
+    Ok(())
+}
 
 fn truncate_to_54(auth_data: &mut Vec<u8>) {
     auth_data.truncate(54);
@@ -334,61 +402,333 @@ fn padded_signature_length(issued: &Issued) -> Vec<u8> {
     seq(&[&issued.tbs, &issued.outer_alg, &field])
 }
 
-/// Each mutation that changes only bytes outside `tbsCertificate`, or sets an
-/// algorithm check 3 refuses, with the leaf's signature left valid.
-type Mutation = fn(&mut Fixture);
+/// The leaf with the last byte of its signature's `s` flipped: the DER and the
+/// rebuild are unchanged, and only the signature no longer verifies.
+fn forged_signature(issued: &Issued) -> Vec<u8> {
+    let mut forged = issued.clone();
+    if let Some(last) = forged.signature.last_mut() {
+        *last ^= 0x01;
+    }
+    forged.der()
+}
 
-const LEAF_CHAIN_MUTATIONS: [(&str, Mutation); 8] = [
-    ("long-form outer length", |f| {
-        f.leaf_hook = Some(long_form_algorithm_length);
-    }),
-    ("0x82 0x00 nn length", |f| {
-        f.leaf_hook = Some(padded_signature_length);
-    }),
-    ("NULL outer parameters", |f| {
-        f.leaf.outer_alg = Alg::Sha256Null;
-    }),
-    ("nonzero unused bits", |f| f.leaf.unused_bits = 1),
-    ("outer algorithm differs from inner", |f| {
-        f.leaf.outer_alg = Alg::Sha384;
-    }),
-    ("inner ecdsa-with-SHA512", |f| {
-        f.leaf.inner_alg = Alg::Sha512;
-        f.leaf.outer_alg = Alg::Sha512;
-    }),
-    ("inner ecdsa-with-SHA256 with NULL", |f| {
-        f.leaf.inner_alg = Alg::Sha256Null;
-        f.leaf.outer_alg = Alg::Sha256Null;
-    }),
-    ("inner RSA", |f| {
-        f.leaf.inner_alg = Alg::Rsa;
-        f.leaf.outer_alg = Alg::Rsa;
-    }),
+/// An unrecognised OID, 1.3.6.1.4.1.99999.1.
+const OID_UNRECOGNISED: &[u8] = &[0x2b, 0x06, 0x01, 0x04, 0x01, 0x86, 0x8d, 0x1f, 0x01];
+
+fn without_intermediate_extension(fixture: &mut Fixture, oid: &[u8]) {
+    fixture
+        .intermediate_extensions
+        .retain(|extension| extension.oid != oid);
+}
+
+fn replace_intermediate_extension(fixture: &mut Fixture, oid: &[u8], value: &[u8]) {
+    without_intermediate_extension(fixture, oid);
+    fixture
+        .intermediate_extensions
+        .push(TestExtension::critical(oid, value.to_vec()));
+}
+
+/// One check 3 refusal: the mutation, the rule that refuses it, and whether
+/// the leaf's signature still verifies over the mutated leaf's digest.
+type ChainRow = (&'static str, fn(&mut Fixture), ChainFault, bool);
+
+use Certificate::{Intermediate as Int, Leaf, Root};
+
+/// Every rule of check 3, each with an input only that rule refuses: every
+/// row leaves the other rules satisfied, so deleting the named rule turns the
+/// row's expected fault into a later one or into `Ok`.
+const CHAIN_FAULTS: [ChainRow; 34] = [
+    (
+        "foreign root",
+        |f| f.anchor_seed = Some([0x09; 32]),
+        ChainFault::SignatureInvalid(Int),
+        true,
+    ),
+    (
+        "leaf notBefore later than now plus 300 s",
+        |f| f.now_secs = T0 - 301,
+        ChainFault::MintedInFuture,
+        true,
+    ),
+    (
+        "intermediate ends before leaf notBefore",
+        |f| f.intermediate.not_after = T0 - 1,
+        ChainFault::NotValidAtMinting(Int),
+        true,
+    ),
+    (
+        "intermediate starts after leaf notBefore",
+        |f| f.intermediate.not_before = T0 + 1,
+        ChainFault::NotValidAtMinting(Int),
+        true,
+    ),
+    (
+        "root ends before leaf notBefore",
+        |f| f.root.not_after = T0 - 1,
+        ChainFault::NotValidAtMinting(Root),
+        true,
+    ),
+    (
+        "leaf notBefore after its notAfter",
+        |f| f.leaf.not_after = T0 - 1,
+        ChainFault::NotValidAtMinting(Leaf),
+        true,
+    ),
+    (
+        "root key P-256",
+        |f| f.root.curve_override = Some(Curve::P256),
+        ChainFault::IssuerKeyNotP384(Root),
+        true,
+    ),
+    (
+        "intermediate key P-256",
+        |f| f.intermediate.curve_override = Some(Curve::P256),
+        ChainFault::IssuerKeyNotP384(Int),
+        true,
+    ),
+    (
+        "leaf key P-384",
+        |f| f.leaf.curve_override = Some(Curve::P384),
+        ChainFault::LeafKeyNotP256,
+        true,
+    ),
+    (
+        "root P-384 point off the curve",
+        |f| f.root.curve_override = Some(Curve::P384Invalid),
+        ChainFault::P384PointInvalid(Root),
+        true,
+    ),
+    (
+        "intermediate P-384 point off the curve",
+        |f| f.intermediate.curve_override = Some(Curve::P384Invalid),
+        ChainFault::P384PointInvalid(Int),
+        true,
+    ),
+    (
+        "leaf P-256 point off the curve",
+        |f| f.leaf.curve_override = Some(Curve::P256Invalid),
+        ChainFault::P256PointInvalid,
+        true,
+    ),
+    (
+        "intermediate inner ecdsa-with-SHA512",
+        |f| {
+            f.intermediate.inner_alg = Alg::Sha512;
+            f.intermediate.outer_alg = Alg::Sha512;
+        },
+        ChainFault::UnsupportedAlgorithm(Int),
+        true,
+    ),
+    (
+        "intermediate outer algorithm differs",
+        |f| f.intermediate.outer_alg = Alg::Sha256,
+        ChainFault::RebuildDiffers(Int),
+        true,
+    ),
+    (
+        "leaf long-form outer length",
+        |f| f.leaf_hook = Some(long_form_algorithm_length),
+        ChainFault::RebuildDiffers(Leaf),
+        true,
+    ),
+    (
+        "leaf 0x82 0x00 nn length",
+        |f| f.leaf_hook = Some(padded_signature_length),
+        ChainFault::RebuildDiffers(Leaf),
+        true,
+    ),
+    (
+        "leaf NULL outer parameters",
+        |f| f.leaf.outer_alg = Alg::Sha256Null,
+        ChainFault::RebuildDiffers(Leaf),
+        true,
+    ),
+    (
+        "leaf nonzero unused bits",
+        |f| f.leaf.unused_bits = 1,
+        ChainFault::RebuildDiffers(Leaf),
+        true,
+    ),
+    (
+        "leaf outer algorithm differs from inner",
+        |f| f.leaf.outer_alg = Alg::Sha384,
+        ChainFault::RebuildDiffers(Leaf),
+        true,
+    ),
+    (
+        "leaf inner ecdsa-with-SHA512",
+        |f| {
+            f.leaf.inner_alg = Alg::Sha512;
+            f.leaf.outer_alg = Alg::Sha512;
+        },
+        ChainFault::UnsupportedAlgorithm(Leaf),
+        true,
+    ),
+    (
+        "leaf inner ecdsa-with-SHA256 with NULL",
+        |f| {
+            f.leaf.inner_alg = Alg::Sha256Null;
+            f.leaf.outer_alg = Alg::Sha256Null;
+        },
+        ChainFault::UnsupportedAlgorithm(Leaf),
+        true,
+    ),
+    (
+        "leaf inner RSA",
+        |f| {
+            f.leaf.inner_alg = Alg::Rsa;
+            f.leaf.outer_alg = Alg::Rsa;
+        },
+        ChainFault::UnsupportedAlgorithm(Leaf),
+        true,
+    ),
+    (
+        "forged SHA-256 leaf signature",
+        |f| f.leaf_hook = Some(forged_signature),
+        ChainFault::SignatureInvalid(Leaf),
+        false,
+    ),
+    (
+        "forged SHA-384 leaf signature",
+        |f| {
+            f.leaf.inner_alg = Alg::Sha384;
+            f.leaf.outer_alg = Alg::Sha384;
+            f.leaf_hook = Some(forged_signature);
+        },
+        ChainFault::SignatureInvalid(Leaf),
+        false,
+    ),
+    (
+        "leaf issuer is not the intermediate's subject",
+        |f| f.leaf_issuer_name = "Other CA".to_owned(),
+        ChainFault::IssuerNameMismatch(Leaf),
+        true,
+    ),
+    (
+        "intermediate issuer is not the root's subject",
+        |f| f.intermediate_issuer_name = "Other Root".to_owned(),
+        ChainFault::IssuerNameMismatch(Int),
+        true,
+    ),
+    (
+        "intermediate without basicConstraints",
+        |f| without_intermediate_extension(f, x509::OID_BASIC_CONSTRAINTS),
+        ChainFault::IntermediateNotCa,
+        true,
+    ),
+    (
+        "intermediate basicConstraints cA omitted",
+        |f| replace_intermediate_extension(f, x509::OID_BASIC_CONSTRAINTS, &[0x30, 0x00]),
+        ChainFault::IntermediateNotCa,
+        true,
+    ),
+    (
+        "intermediate basicConstraints cA written FALSE",
+        |f| {
+            replace_intermediate_extension(
+                f,
+                x509::OID_BASIC_CONSTRAINTS,
+                &[0x30, 0x03, 0x01, 0x01, 0x00],
+            );
+        },
+        ChainFault::Malformed(Int, CertificateMalformed::BasicConstraintsMalformed),
+        true,
+    ),
+    (
+        "intermediate without keyUsage",
+        |f| without_intermediate_extension(f, x509::OID_KEY_USAGE),
+        ChainFault::IntermediateCannotSignCertificates,
+        true,
+    ),
+    (
+        "intermediate keyUsage without keyCertSign",
+        |f| replace_intermediate_extension(f, x509::OID_KEY_USAGE, &[0x03, 0x02, 0x07, 0x80]),
+        ChainFault::IntermediateCannotSignCertificates,
+        true,
+    ),
+    (
+        "intermediate keyUsage not a BIT STRING",
+        |f| replace_intermediate_extension(f, x509::OID_KEY_USAGE, &[0x04, 0x01, 0x06]),
+        ChainFault::Malformed(Int, CertificateMalformed::KeyUsageMalformed),
+        true,
+    ),
+    (
+        "intermediate unrecognised critical extension",
+        |f| {
+            f.intermediate_extensions
+                .push(TestExtension::critical(OID_UNRECOGNISED, vec![0x05, 0x00]));
+        },
+        ChainFault::UnrecognisedCriticalExtension(Int),
+        true,
+    ),
+    (
+        "leaf unrecognised critical extension",
+        |f| {
+            f.extra_leaf_extensions
+                .push(TestExtension::critical(OID_UNRECOGNISED, vec![0x05, 0x00]));
+        },
+        ChainFault::UnrecognisedCriticalExtension(Leaf),
+        true,
+    ),
 ];
 
 fn intermediate_public_key(fixture: &Fixture) -> BoxResult<p384::P384PublicKey> {
     Ok(P384SecretKey::from_seed(&fixture.intermediate_seed)?.public_key()?)
 }
 
+fn chain_of(fixture: &Fixture) -> BoxResult<Result<(), ChainFault>> {
+    let built = fixture.build()?;
+    Ok(verify_chain(
+        &built.anchor,
+        &built.intermediate,
+        &built.leaf,
+        fixture.now_secs,
+    ))
+}
+
 #[test]
-fn leaf_chain_mutations_keep_a_valid_signature_and_fail_check_3() -> TestResult {
-    for (what, mutate) in LEAF_CHAIN_MUTATIONS {
+fn every_chain_rule_refuses_its_own_input() -> TestResult {
+    assert_eq!(chain_of(&Fixture::valid())?, Ok(()), "unmutated chain");
+    for (what, mutate, fault, signature_verifies) in CHAIN_FAULTS {
         let mut fixture = Fixture::valid();
         mutate(&mut fixture);
+        assert_eq!(chain_of(&fixture)?, Err(fault), "{what}");
         let built = fixture.build()?;
-        let issuer = intermediate_public_key(&fixture)?;
-        p384::verify_prehash_der_lenient(
-            &issuer,
+        let verifies = p384::verify_prehash_der_lenient(
+            &intermediate_public_key(&fixture)?,
             &built.leaf_issued.digest,
-            &built.leaf_issued.signature,
+            &x509::ecdsa_sig_value_der(
+                x509::split_certificate(&built.leaf)?.r,
+                x509::split_certificate(&built.leaf)?.s,
+            ),
         )
-        .map_err(|error| format!("{what}: signature must verify: {error}"))?;
+        .is_ok();
+        assert_eq!(verifies, signature_verifies, "{what}: leaf signature");
         rejection_case(
             mutate,
             AppAttestCheck::CertificateChain,
             R::CertificateChainInvalid,
         )
         .map_err(|error| format!("{what}: {error}"))?;
+    }
+    Ok(())
+}
+
+#[test]
+fn apple_samples_meet_the_path_rules() -> TestResult {
+    for (name, object, ..) in SAMPLES {
+        let parts = lenient_object(object).ok_or("sample object did not decode")?;
+        let at_minting = sample_leaf(object)?.not_before;
+        assert_eq!(
+            verify_chain(
+                APPLE_APP_ATTESTATION_ROOT.der(),
+                &parts.intermediate,
+                &parts.leaf,
+                at_minting,
+            ),
+            Ok(()),
+            "{name}"
+        );
     }
     Ok(())
 }
@@ -401,11 +741,10 @@ fn rebuild_comparison_runs_separately_from_signature_check() -> TestResult {
     let parts = x509::split_certificate(&built.leaf)?;
     let tbs = x509::parse_tbs(parts.tbs)?;
     let issuer = intermediate_public_key(&fixture)?;
-    assert!(x509::verify_signature(
-        &issuer,
-        tbs.signature_algorithm,
-        &parts
-    ));
+    assert_eq!(
+        x509::verify_signature(&issuer, tbs.signature_algorithm, &parts),
+        Ok(())
+    );
     assert!(!x509::rebuild_matches(
         &built.leaf,
         &parts,
@@ -415,11 +754,10 @@ fn rebuild_comparison_runs_separately_from_signature_check() -> TestResult {
     let clean = Fixture::valid().build()?;
     let parts = x509::split_certificate(&clean.leaf)?;
     let tbs = x509::parse_tbs(parts.tbs)?;
-    assert!(x509::verify_signature(
-        &issuer,
-        tbs.signature_algorithm,
-        &parts
-    ));
+    assert_eq!(
+        x509::verify_signature(&issuer, tbs.signature_algorithm, &parts),
+        Ok(())
+    );
     assert!(x509::rebuild_matches(
         &clean.leaf,
         &parts,
@@ -436,11 +774,12 @@ fn other_identifier_digest(
     context: &str,
 ) -> BoxResult<[u8; 32]> {
     let identifier = Identifier::from_bytes(Sha256::digest(identifier.as_bytes()).into());
-    Ok(device_attestation_binding_digest(
+    Ok(*device_attestation_binding_digest(
         &identifier,
         context,
         &fixture.policy.device_attestation_challenge,
-    )?)
+    )?
+    .as_bytes())
 }
 
 fn bundle_and_category(version: Vec<u8>) -> Vec<u8> {
@@ -496,6 +835,10 @@ rejection_cases! {
         |f| f.object_hook = Some(long_x5c_byte_string_head);
     repeated_x5c_key_malformed: ObjectEncoding => MalformedToken,
         |f| f.object_hook = Some(repeated_x5c_key);
+    packed_fmt_malformed: ObjectEncoding => MalformedToken,
+        |f| f.object_hook = Some(packed_fmt);
+    x5c_with_three_elements_malformed: ObjectEncoding => MalformedToken,
+        |f| f.object_hook = Some(x5c_three_elements);
     // AC17: offsets.
     auth_data_54_bytes_truncated: AuthData => AuthDataTruncated,
         |f| f.auth_data_hook = Some(truncate_to_54);
@@ -522,40 +865,32 @@ rejection_cases! {
                 (cbor_text("other"), cbor_head(0, 2)),
             ]));
         };
+    // A COSE key that is well-formed CBOR but not a map. Check 6 reads the
+    // leaf's key, not this one, so only check 2 can see it.
+    cose_key_not_a_map_malformed: AuthData => MalformedToken,
+        |f| f.cose_key = Some(cbor_bytes(&[0u8; 4]));
+    // Keys checks 11 and 12 never read, so only check 2 can see them.
+    extensions_byte_string_key_malformed: AuthData => MalformedToken,
+        |f| f.extensions = Some(cbor_map(&[(cbor_bytes(b"key"), cbor_head(0, 1))]));
+    extensions_array_key_malformed: AuthData => MalformedToken,
+        |f| f.extensions = Some(cbor_map(&[(cbor_array(&[]), cbor_head(0, 1))]));
+    extensions_repeated_integer_key_malformed: AuthData => MalformedToken,
+        |f| {
+            f.extensions = Some(cbor_map(&[
+                (cbor_head(1, 4), cbor_head(0, 1)),
+                (cbor_head(1, 4), cbor_head(0, 2)),
+            ]));
+        };
     extensions_trailing_bytes_malformed: AuthData => MalformedToken,
         |f| {
             let mut extensions = extensions_with_category(&4u32.to_le_bytes());
             extensions.push(0x00);
             f.extensions = Some(extensions);
         };
-    // AC19: the chain.
+    // AC19: the chain. `every_chain_rule_refuses_its_own_input` runs one
+    // case per rule of check 3 through `rejection_case`.
     chain_to_foreign_root_invalid: CertificateChain => CertificateChainInvalid,
         |f| f.anchor_seed = Some([0x09; 32]);
-    leaf_not_before_now_plus_301_invalid: CertificateChain => CertificateChainInvalid,
-        |f| f.now_secs = T0 - 301;
-    intermediate_ends_before_leaf_not_before_invalid: CertificateChain => CertificateChainInvalid,
-        |f| f.intermediate.not_after = T0 - 1;
-    intermediate_starts_after_leaf_not_before_invalid: CertificateChain => CertificateChainInvalid,
-        |f| f.intermediate.not_before = T0 + 1;
-    root_ends_before_leaf_not_before_invalid: CertificateChain => CertificateChainInvalid,
-        |f| f.root.not_after = T0 - 1;
-    leaf_not_before_after_its_not_after_invalid: CertificateChain => CertificateChainInvalid,
-        |f| f.leaf.not_after = T0 - 1;
-    // Curves at the root, x5c[1] and the leaf.
-    root_key_p256_invalid: CertificateChain => CertificateChainInvalid,
-        |f| f.root.curve_override = Some(Curve::P256);
-    intermediate_key_p256_invalid: CertificateChain => CertificateChainInvalid,
-        |f| f.intermediate.curve_override = Some(Curve::P256);
-    leaf_key_p384_invalid: CertificateChain => CertificateChainInvalid,
-        |f| f.leaf.curve_override = Some(Curve::P384);
-    // The intermediate's algorithm is read from its own tbsCertificate.
-    intermediate_inner_sha512_invalid: CertificateChain => CertificateChainInvalid,
-        |f| {
-            f.intermediate.inner_alg = Alg::Sha512;
-            f.intermediate.outer_alg = Alg::Sha512;
-        };
-    intermediate_outer_differs_invalid: CertificateChain => CertificateChainInvalid,
-        |f| f.intermediate.outer_alg = Alg::Sha256;
     // AC21: maximum age.
     app_attest_expired: MaxAge => Expired,
         |f| f.now_secs = T0 + MAX_AGE_SECS + 1;
@@ -684,18 +1019,6 @@ rejection_cases! {
 // ── Must-pass cases ─────────────────────────────────────────────────────────
 
 #[test]
-fn statement_without_receipt_passes() -> TestResult {
-    let fixture = Fixture::valid();
-    let built = fixture.build()?;
-    // The valid fixture's attStmt holds x5c alone.
-    assert_eq!(
-        built.object,
-        attestation_object(&built.auth_data, &built.leaf, &built.intermediate)
-    );
-    passes(|_| {})
-}
-
-#[test]
 fn statement_with_byte_string_receipt_passes() -> TestResult {
     passes(|f| f.object_hook = Some(byte_string_receipt))
 }
@@ -790,13 +1113,6 @@ fn high_s_chain_verifies() -> TestResult {
         high.intermediate_issued.signature
     );
     require_verified(&fixture.run_all()?, "high-s chain")
-}
-
-#[test]
-fn category_4_with_empty_list_passes() -> TestResult {
-    let fixture = Fixture::valid();
-    assert!(fixture.policy.accepted_validation_categories.is_empty());
-    passes(|_| {})
 }
 
 #[test]
@@ -960,14 +1276,6 @@ const APPLE_ROOT_SHA256_HEX: &str =
 fn pinned_root_fingerprint() -> TestResult {
     let pinned = APPLE_APP_ATTESTATION_ROOT.der();
     assert_eq!(hex::encode(Sha256::digest(pinned)), APPLE_ROOT_SHA256_HEX);
-    // Any one-byte change moves the fingerprint.
-    for index in [0, pinned.len() / 2, pinned.len() - 1] {
-        let mut changed = pinned.to_vec();
-        if let Some(byte) = changed.get_mut(index) {
-            *byte ^= 0x01;
-        }
-        assert_ne!(hex::encode(Sha256::digest(&changed)), APPLE_ROOT_SHA256_HEX);
-    }
     // The pinned root is a P-384 certificate the chain parser reads.
     let root = x509::parse_tbs(x509::split_certificate(pinned)?.tbs)?;
     assert!(matches!(root.key, x509::SubjectKey::P384(_)));
@@ -985,12 +1293,12 @@ fn macos_acl_blob_is_the_spec_base64() -> TestResult {
 }
 
 #[test]
-fn test_ca_attestation_refused_by_public_reader() -> TestResult {
+fn test_ca_attestation_refused_by_pinned_root_reader() -> TestResult {
     let fixture = Fixture::valid();
     let built = fixture.build()?;
     let read = AppAttestRead {
         attestation_object: &built.object,
-        binding_digest: fixture.binding_digest,
+        client_data: ClientData::from_test_bytes(&fixture.binding_digest),
         policy: fixture.policy.validated()?,
         now_secs: fixture.now_secs,
         entry_id: "entry-1",
@@ -1000,12 +1308,101 @@ fn test_ca_attestation_refused_by_public_reader() -> TestResult {
     Ok(())
 }
 
+/// The production path: `D` from [`device_attestation_binding_digest`],
+/// passed as a [`BindingDigest`], is the client data check 5 hashes.
+#[test]
+fn binding_digest_is_the_client_data() -> TestResult {
+    let mut fixture = Fixture::valid();
+    let identifier = Identifier::from_bytes(Sha256::digest(b"identifier").into());
+    let digest: BindingDigest = device_attestation_binding_digest(
+        &identifier,
+        "ctx-1",
+        &fixture.policy.device_attestation_challenge,
+    )?;
+    fixture.binding_digest = *digest.as_bytes();
+    let built = fixture.build()?;
+    let read = AppAttestRead {
+        attestation_object: &built.object,
+        client_data: ClientData::from(&digest),
+        policy: fixture.policy.validated()?,
+        now_secs: fixture.now_secs,
+        entry_id: "entry-1",
+    };
+    let root = AppAttestRoot::from_test_der(&built.root);
+    assert!(read_with_root(&root, &read).is_ok());
+    // The same object under the digest of another context fails check 5.
+    let other = device_attestation_binding_digest(
+        &identifier,
+        "ctx-2",
+        &fixture.policy.device_attestation_challenge,
+    )?;
+    let read = AppAttestRead {
+        client_data: ClientData::from(&other),
+        ..read
+    };
+    assert_eq!(read_with_root(&root, &read), Err(R::NonceMismatch));
+    Ok(())
+}
+
 // ── Recorded Apple samples ──────────────────────────────────────────────────
 
-const SAMPLES: [(&str, &[u8]); 3] = [
-    ("ios-14.4", include_bytes!("samples/ios-14.4.cbor")),
-    ("go-dev", include_bytes!("samples/go-dev.cbor")),
-    ("go-prod", include_bytes!("samples/go-prod.cbor")),
+/// The client data an upstream test passed to Apple with a sample
+/// (`samples/SOURCES.md`).
+#[derive(Debug, Clone, Copy)]
+enum SampleClientData {
+    /// A `clientDataHash` the upstream test records in base64.
+    Base64(&'static str),
+    /// SHA-256 of a challenge, as the upstream test hashes it.
+    Sha256Of(&'static [u8]),
+    /// Client data the upstream test passes unhashed.
+    Raw(&'static [u8]),
+}
+
+impl SampleClientData {
+    fn bytes(self) -> BoxResult<Vec<u8>> {
+        use base64::Engine as _;
+        Ok(match self {
+            Self::Base64(text) => base64::engine::general_purpose::STANDARD.decode(text)?,
+            Self::Sha256Of(challenge) => Sha256::digest(challenge).to_vec(),
+            Self::Raw(bytes) => bytes.to_vec(),
+        })
+    }
+}
+
+/// Each sample's name, object, App ID, client data, and the outcome of
+/// checks 1 through 12 against the pinned root: the two development objects
+/// stop at check 10, and the production object verifies.
+/// A sample's name, object, App ID, client data and expected outcome.
+type Sample = (
+    &'static str,
+    &'static [u8],
+    &'static str,
+    SampleClientData,
+    Option<R>,
+);
+
+const SAMPLES: [Sample; 3] = [
+    (
+        "ios-14.4",
+        include_bytes!("samples/ios-14.4.cbor"),
+        "6MURL8TA57.de.vincent-haupert.apple-appattest-poc",
+        SampleClientData::Base64("i+ZcylFa0JfJU5Z9GNY12G3XihQu09B3UmvtEca+xns="),
+        Some(R::DevelopmentEnvironment),
+    ),
+    (
+        "go-dev",
+        include_bytes!("samples/go-dev.cbor"),
+        "NFVU6DQWLM.com.turtlecrypt.appattestfun",
+        SampleClientData::Sha256Of(b"server_challenge"),
+        Some(R::DevelopmentEnvironment),
+    ),
+    (
+        "go-prod",
+        include_bytes!("samples/go-prod.cbor"),
+        "0352187391.com.apple.example_app_attest",
+        SampleClientData::Raw(b"test_server_challenge"),
+        None,
+    ),
 ];
 
 fn sample_leaf(object: &[u8]) -> BoxResult<x509::Tbs> {
@@ -1013,41 +1410,78 @@ fn sample_leaf(object: &[u8]) -> BoxResult<x509::Tbs> {
     Ok(x509::parse_tbs(x509::split_certificate(&parts.leaf)?.tbs)?)
 }
 
-#[test]
-fn recorded_sample_after_not_after() -> TestResult {
+/// A policy accepting `app_id` on iOS with the longest maximum age.
+fn sample_policy(app_id: &str) -> crate::trust::sybil::ContextSybilPolicy {
     let mut policy = policy_for(ApplePlatform::Ios);
     policy.device_attestation_max_age_secs =
         crate::trust::sybil::MAX_DEVICE_ATTESTATION_MAX_AGE_SECS;
-    for (name, object) in SAMPLES {
+    if let Some(accepted) = policy.accepted_app_ids.first_mut() {
+        accepted.app_id = app_id.to_owned();
+    }
+    policy
+}
+
+/// Checks 1 through 12 on Apple's bytes against the pinned root, with each
+/// sample's own App ID and client data, a minute after the leaf's
+/// `notBefore` and a day after its `notAfter`. Every check, the nonce over
+/// `authData ‖ clientData` and the key ID over the 65-byte point among them,
+/// runs on data Apple produced, so a formula the reader and the test CA share
+/// cannot pass here unless Apple uses it too.
+#[test]
+fn recorded_samples_run_every_check() -> TestResult {
+    for (name, object, app_id, client_data, expected) in SAMPLES {
+        let policy = sample_policy(app_id);
+        let client_data = client_data.bytes()?;
         let leaf = sample_leaf(object)?;
-        // A day after the leaf expired, and inside the maximum age.
-        let now_secs = leaf.not_after + DAY;
-        assert!(
-            now_secs
-                <= policy
-                    .validated()?
-                    .device_attestation_expiry(leaf.not_before),
-            "{name}: the read is inside the maximum age"
-        );
+        for now_secs in [leaf.not_before + 60, leaf.not_after + DAY] {
+            assert!(
+                now_secs
+                    <= policy
+                        .validated()?
+                        .device_attestation_expiry(leaf.not_before),
+                "{name}: the read is inside the maximum age"
+            );
+            let read = AppAttestRead {
+                attestation_object: object,
+                client_data: ClientData::from_test_bytes(&client_data),
+                policy: policy.validated()?,
+                now_secs,
+                entry_id: "entry-1",
+            };
+            let recorded = run(&APPLE_APP_ATTESTATION_ROOT, &read, &APP_ATTEST_CHECKS);
+            if let Some(cause) = expected {
+                assert_eq!(recorded.result, Err(Stop::Reject(cause)), "{name}");
+                assert_eq!(recorded.ran.last(), Some(&AppAttestCheck::Aaguid), "{name}");
+            } else {
+                let verified = recorded
+                    .result
+                    .map_err(|stop| format!("{name}: expected Verified, got {stop:?}"))?;
+                assert_eq!(verified.minted_at(), leaf.not_before, "{name}");
+                assert_eq!(recorded.ran.len(), 12, "{name}: every iOS check ran");
+            }
+            assert_eq!(
+                read_app_attest(&read).err(),
+                expected,
+                "{name}: the pinned-root reader agrees"
+            );
+        }
+        // Other client data breaks the nonce.
+        let other = [0x5a; 32];
         let read = AppAttestRead {
             attestation_object: object,
-            binding_digest: [0x5a; 32],
+            client_data: ClientData::from_test_bytes(&other),
             policy: policy.validated()?,
-            now_secs,
+            now_secs: leaf.not_before + 60,
             entry_id: "entry-1",
         };
         assert_eq!(read_app_attest(&read), Err(R::NonceMismatch), "{name}");
-        // Checks 1 through 4 passed against the pinned root: the run stopped
-        // at check 5.
-        let recorded = run(&APPLE_APP_ATTESTATION_ROOT, &read, &APP_ATTEST_CHECKS);
-        assert_eq!(recorded.ran.last(), Some(&AppAttestCheck::Nonce), "{name}");
     }
     Ok(())
 }
 
 #[test]
 fn recorded_sample_leaves_take_the_ios_path() -> TestResult {
-    for (name, object) in SAMPLES {
+    for (name, object, ..) in SAMPLES {
         assert_eq!(
             choose_platform_path(&sample_leaf(object)?),
             Some(ApplePlatform::Ios),
@@ -1070,7 +1504,7 @@ fn vendored_samples_pass_encoding_checks() -> TestResult {
         })
         .copied()
         .collect();
-    for (name, object) in SAMPLES {
+    for (name, object, ..) in SAMPLES {
         let canonical = canonicalize_app_attest_object(object)?;
         assert_eq!(
             canonicalize_app_attest_object(&canonical)?,
@@ -1080,7 +1514,7 @@ fn vendored_samples_pass_encoding_checks() -> TestResult {
         for input in [object, canonical.as_slice()] {
             let read = AppAttestRead {
                 attestation_object: input,
-                binding_digest: [0x5a; 32],
+                client_data: ClientData::from_test_bytes(&[0x5a; 32]),
                 policy: policy.validated()?,
                 now_secs: T0,
                 entry_id: "entry-1",
