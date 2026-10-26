@@ -47,10 +47,11 @@ use crate::context::governance_logic::{
     EnforceConsequencesCtx, enforce_triggered_consequences, event_log_entries_for_consequences,
     event_log_entries_for_consequences_after_side_effect,
 };
+use crate::context::log_unit_helpers::{plan_encoded_leaf, queue_log_unit};
 use crate::context::state::{
     CEILING_CHANGE_NOTIFICATION_PERIOD_SECS, CommitFaultMarker, CommitOperation,
     ContentKeysRotatedResult, ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS,
-    EXECUTED_PROPOSALS_TTL_SECS, GovernanceActionResult, GovernanceReconfiguredResult,
+    EXECUTED_PROPOSALS_TTL_SECS, GovernanceActionResult, GovernanceReconfiguredResult, LeafSpec,
     MAX_OUTLET_INTERFACES, MAX_PENDING_COMMITS, MAX_REGISTERED_OUTLETS, MAX_THRESHOLD_SIGNERS,
     MigrationProposedResult, MigrationState, PendingCeilingModification, PendingCommit,
     PendingEconomicPolicyChange, ProposalOutcome, RestoreAccessResult, RevokeResult,
@@ -283,7 +284,6 @@ pub async fn tombstone_migrated_context(
     deps: &ActorDeps,
     context_id: &str,
 ) -> Result<(), ContextError> {
-    let context_id_bytes = context_id_to_bytes(context_id);
     let now = deps.clock.now_secs();
 
     let handle_state = cell.handle.state();
@@ -312,6 +312,18 @@ pub async fn tombstone_migrated_context(
     // timestamp is the pre-computed grace-period deadline (deterministic across
     // members), never local `now()` (§7.3.1, §9.9.3).
     let tombstone_ts = migration.grace_period_end;
+    // The `ContextTombstoned` record is planned before the transition, so an
+    // entry the append would refuse refuses the tombstone before its step
+    // (spec 17 §17.3 "Event log write failures").
+    let leaf = plan_encoded_leaf(
+        scp_event_log::EventType::ContextTombstoned,
+        "system",
+        &scp_event_log::payload::ContextTombstonedPayload {
+            destination_id: destination_id.clone(),
+            migration_proposal_id: migration_pid,
+        },
+        tombstone_ts,
+    )?;
 
     // The handle FSM is an external effect; the `.await` runs BEFORE the fail-
     // closed persist (the combinator closure is sync). A failed transition
@@ -354,29 +366,10 @@ pub async fn tombstone_migrated_context(
         state.migration_state = None;
         // M7: Participation decay on tombstone (#1530).
         state.governance.decay_participation();
+        view.enqueue_counted_log_unit(vec![leaf]);
         Ok(())
     })
-    .await?;
-
-    let tombstone_payload =
-        scp_event_log::payload::encode_payload(&scp_event_log::payload::ContextTombstonedPayload {
-            destination_id,
-            migration_proposal_id: migration_pid,
-        })
-        .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
-    deps.event_log
-        .append_context_event_with_payload(
-            crate::context::builder::AppendMode::AfterSideEffect,
-            &context_id_bytes,
-            scp_event_log::EventType::ContextTombstoned,
-            "system",
-            tombstone_payload,
-            tombstone_ts,
-        )
-        .await?;
-    *cell.class_c_view().checkpoint_events_since_mut() += 1;
-
-    Ok(())
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -446,30 +439,27 @@ pub async fn withdraw_governance_vote(
             .map_err(|e| ContextError::PermissionDenied(e.to_string()))?
     };
 
-    let context_id_bytes = context_id_to_bytes(context_id);
-    let mut event_count: u64 = 0;
-    for event in &events {
-        deps.event_log
-            .append_context_event(
-                crate::context::builder::AppendMode::AfterSideEffect,
-                &context_id_bytes,
+    // One record per governance event the withdrawal produced, queued in the
+    // fail-closed persist of the withdrawal, so the records have a durable
+    // home once the engine has changed (spec 17 §17.3 "Event log write
+    // failures"). A record without a payload cannot break the append's payload
+    // rules, so building it after the step refuses nothing after the step.
+    let leaves: Vec<LeafSpec> = events
+        .iter()
+        .map(|event| {
+            LeafSpec::without_payload(
                 governance_event_label(event),
-                voter_did.as_ref(),
+                voter_did.to_string(),
                 withdraw_ts,
             )
-            .await?;
-        event_count += 1;
-    }
-
-    // Best-effort persist (matches the pre-migration unconditional
-    // `persist_state_best_effort`); the checkpoint bump remains conditional on
-    // events having been appended.
-    cell.commit_class_c_best_effort(deps, context_id, |mut view| {
-        if event_count > 0 {
-            *view.checkpoint_events_since_mut() += event_count;
-        }
+        })
+        .collect();
+    cell.commit_class_s_keep(deps, context_id, |mut view| {
+        view.enqueue_counted_log_unit(leaves);
+        Ok(())
     })
-    .await;
+    .await?;
+    let _ = crate::context::log_unit_helpers::drain_pending_log_units(cell, deps, context_id).await;
 
     Ok(status)
 }
@@ -507,7 +497,16 @@ pub async fn apply_pending_ceiling_modification(
     // ceiling STAYS — restoring the prior, broader ceiling is the unsafe
     // direction). The not-yet-effective early return above ran before any
     // mutation. The `ceiling` set + pending clear (Class-C) ride the fail-closed
-    // persist via `view.rest_mut()`.
+    // persist via `view.rest_mut()`, and so does the queued `CeilingModified`
+    // record (spec 17 §17.3 "Event log write failures"). Timer-triggered
+    // deferred application: the record's convergent timestamp is the
+    // pre-computed effective deadline (deterministic across members), never
+    // local `now()` (§7.3.1, §9.9.3).
+    let leaf = LeafSpec::without_payload(
+        scp_event_log::EventType::CeilingModified,
+        String::new(),
+        pending.effective_at,
+    );
     cell.commit_class_s_keep(deps, context_id, |mut view| {
         let state = view.rest_mut();
         // ADR-049 §9: downward-auth ceiling WRITE via the named `set_ceiling`
@@ -530,24 +529,11 @@ pub async fn apply_pending_ceiling_modification(
                 ))
             })?;
         state.governance.pending_ceiling_modification = None;
+        view.enqueue_counted_log_unit(vec![leaf]);
         Ok(())
     })
     .await?;
-
-    let context_id_bytes = context_id_to_bytes(context_id);
-    deps.event_log
-        .append_context_event(
-            crate::context::builder::AppendMode::AfterSideEffect,
-            &context_id_bytes,
-            scp_event_log::EventType::CeilingModified,
-            "",
-            // Timer-triggered deferred application: the convergent leaf timestamp is
-            // the pre-computed effective deadline (deterministic across members),
-            // never local `now()` (§7.3.1, §9.9.3).
-            pending.effective_at,
-        )
-        .await?;
-    *cell.class_c_view().checkpoint_events_since_mut() += 1;
+    let _ = crate::context::log_unit_helpers::drain_pending_log_units(cell, deps, context_id).await;
 
     Ok(true)
 }
@@ -573,9 +559,11 @@ pub async fn apply_pending_economic_policy_change(
 ) -> Result<bool, ContextError> {
     // Applying a matured pending economic-policy change is Class-C governance
     // config. The active-state gate + effective-window read go through the
-    // cell's `Deref`; the `economic_policy` set + `pending` clear (Class-C) ride
-    // `commit_class_c_best_effort`, preserving the prior best-effort persist
-    // exactly. The not-yet-effective early return runs before any mutation.
+    // cell's `Deref`. The `economic_policy` set + `pending` clear ride a
+    // fail-closed keep persist together with the queued
+    // `EconomicPolicyApplied` record, which needs a durable home once the
+    // policy has changed (spec 17 §17.3 "Event log write failures"). The
+    // not-yet-effective early return runs before any mutation.
     require_active(&cell.handle)?;
 
     let pending = match &cell.governance.pending_economic_policy_change {
@@ -583,28 +571,23 @@ pub async fn apply_pending_economic_policy_change(
         _ => return Ok(false),
     };
 
-    let effective_at = pending.effective_at;
-    cell.commit_class_c_best_effort(deps, context_id, |mut view| {
-        let gov = view.governance_class_c_mut();
-        *gov.economic_policy_mut() = Some(pending.new_policy);
-        *gov.pending_economic_policy_change_mut() = None;
+    // Timer-triggered deferred application: the convergent leaf timestamp is
+    // the pre-computed effective deadline (deterministic across members),
+    // never local `now()` (§7.3.1, §9.9.3).
+    let leaf = LeafSpec::without_payload(
+        scp_event_log::EventType::EconomicPolicyApplied,
+        String::new(),
+        pending.effective_at,
+    );
+    cell.commit_class_s_keep(deps, context_id, |mut view| {
+        let state = view.rest_mut();
+        state.governance.economic_policy = Some(pending.new_policy);
+        state.governance.pending_economic_policy_change = None;
+        view.enqueue_counted_log_unit(vec![leaf]);
+        Ok(())
     })
-    .await;
-
-    let context_id_bytes = context_id_to_bytes(context_id);
-    deps.event_log
-        .append_context_event(
-            crate::context::builder::AppendMode::AfterSideEffect,
-            &context_id_bytes,
-            scp_event_log::EventType::EconomicPolicyApplied,
-            "",
-            // Timer-triggered deferred application: the convergent leaf timestamp is
-            // the pre-computed effective deadline (deterministic across members),
-            // never local `now()` (§7.3.1, §9.9.3).
-            effective_at,
-        )
-        .await?;
-    *cell.class_c_view().checkpoint_events_since_mut() += 1;
+    .await?;
+    let _ = crate::context::log_unit_helpers::drain_pending_log_units(cell, deps, context_id).await;
 
     Ok(true)
 }
@@ -827,7 +810,13 @@ pub async fn execute_suspend_member(
     // caller was told was suspended is the unsafe direction). The
     // reject-before-mutate guards return `Err` from inside the closure (no
     // persist runs); the `role_state` strip + emit (Class-C) ride the SAME
-    // fail-closed persist via `view.rest_mut()`.
+    // fail-closed persist via `view.rest_mut()`, and so does the queued
+    // `MemberSuspended` record (spec 17 §17.3 "Event log write failures").
+    let leaf = LeafSpec::without_payload(
+        scp_event_log::EventType::MemberSuspended,
+        actor_did.to_owned(),
+        timestamp_secs,
+    );
     cell.commit_class_s_keep(deps, context_id, |mut view| {
         require_active(&view.handle)?;
 
@@ -854,22 +843,50 @@ pub async fn execute_suspend_member(
             context_id,
             deps,
         );
+        view.enqueue_counted_log_unit(vec![leaf]);
         Ok(())
     })
-    .await?;
+    .await
+}
 
-    let context_id_bytes = context_id_to_bytes(context_id);
-    deps.event_log
-        .append_context_event(
-            crate::context::builder::AppendMode::AfterSideEffect,
-            &context_id_bytes,
-            scp_event_log::EventType::MemberSuspended,
-            actor_did,
-            timestamp_secs,
-        )
-        .await?;
-    *cell.class_c_view().checkpoint_events_since_mut() += 1;
-    Ok(())
+/// Plans one `KeyEpochAdvance` record per broadcast author whose key a
+/// governance step rotated (§5.14.10), in the order given. Each rotation
+/// advances by exactly 1, so `old_epoch = new_epoch - 1`.
+///
+/// The records are known only once the rotation ran, so they are planned
+/// inside the step's persist. A record that does not encode or breaks the
+/// append's payload rules is logged at ERROR and skipped (SCP-349): the
+/// rotation is already taken, and refusing it here would report a rotation
+/// that landed as one that did not.
+fn key_epoch_advance_leaves<'a>(
+    advances: impl IntoIterator<Item = (&'a str, u64)>,
+    timestamp_secs: u64,
+    context_id: &str,
+) -> Vec<LeafSpec> {
+    advances
+        .into_iter()
+        .filter_map(|(author_did, new_epoch)| {
+            plan_encoded_leaf(
+                scp_event_log::EventType::KeyEpochAdvance,
+                author_did,
+                &scp_event_log::payload::KeyEpochAdvancePayload {
+                    old_epoch: new_epoch.saturating_sub(1),
+                    new_epoch,
+                },
+                timestamp_secs,
+            )
+            .inspect_err(|e| {
+                tracing::error!(
+                    context_id = %context_id,
+                    author_did = %author_did,
+                    error = %e,
+                    "KeyEpochAdvance record refused after a key rotation — \
+                     the event log is short one leaf for this author"
+                );
+            })
+            .ok()
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -911,9 +928,21 @@ pub async fn execute_revoke(
     // `ContextSnapshot`, so the combinator's fail-closed persist covers it
     // ATOMICALLY with `read_exclusion_list` — the prior trailing best-effort
     // `persist_broadcast_snapshot` (a separate warn-and-continue write) is gone
-    // (§5.14.8 block-before-serve). The post-persist external work (event-log
-    // append, sender-key rotation, the coalesced `checkpoint_events_since` bump)
-    // is UNCHANGED and runs after.
+    // (§5.14.8 block-before-serve). The `AccessRevoked` record and one
+    // `KeyEpochAdvance` record per rotated author ride the same persist as one
+    // queued log unit (spec 17 §17.3 "Event log write failures"); the
+    // sender-key rotation runs after.
+    //
+    // `AccessRevoked` is planned here, before the step, so an entry the append
+    // would refuse refuses the revoke before it lands.
+    let access_revoked_leaf = plan_encoded_leaf(
+        scp_event_log::EventType::AccessRevoked,
+        actor_did,
+        &scp_event_log::payload::AccessRevokedPayload {
+            target_did: did.as_ref().to_owned(),
+        },
+        timestamp_secs,
+    )?;
     let (rotated_authors, needs_sender_key_rotation) = cell
         .commit_class_s_keep(deps, context_id, |mut view| {
             let state = view.rest_mut();
@@ -998,102 +1027,20 @@ pub async fn execute_revoke(
                 matches!(access, AccessScope::Write | AccessScope::Both)
                     && state.broadcast_context.is_none();
 
+            // §5.14.10: one KeyEpochAdvance leaf per author whose broadcast
+            // key the ban rotated, known only once the rotation ran above.
+            let mut unit = vec![access_revoked_leaf];
+            unit.extend(key_epoch_advance_leaves(
+                rotated_authors
+                    .iter()
+                    .map(|r| (r.author_did.as_str(), r.new_epoch)),
+                timestamp_secs,
+                context_id,
+            ));
+            view.enqueue_counted_log_unit(unit);
             Ok((rotated_authors, needs_sender_key_rotation))
         })
         .await?;
-
-    let access_revoked_payload =
-        scp_event_log::payload::encode_payload(&scp_event_log::payload::AccessRevokedPayload {
-            target_did: did.as_ref().to_owned(),
-        })
-        .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
-    deps.event_log
-        .append_context_event_with_payload(
-            crate::context::builder::AppendMode::AfterSideEffect,
-            &context_id_bytes,
-            scp_event_log::EventType::AccessRevoked,
-            actor_did,
-            access_revoked_payload,
-            timestamp_secs,
-        )
-        .await?;
-    // Class-C counter bump for the AccessRevoked leaf, inline immediately after
-    // its `?`-append. The counter must track the true durable-leaf count
-    // (governance_logic.rs:156-158) to prevent §9.9.3 checkpoint-position drift.
-    *cell.class_c_view().checkpoint_events_since_mut() += 1;
-
-    // §5.14.10: one KeyEpochAdvance leaf per author whose broadcast key was
-    // rotated by the governance ban. Each rotation advances by exactly 1, so
-    // old_epoch = new_epoch.saturating_sub(1).
-    //
-    // THIS LOOP MUST NOT RETURN `Err`. By the time it runs, the ban and every
-    // author-key rotation are durably persisted (the fail-closed
-    // `commit_class_s_keep` above) and the `AccessRevoked` anchor leaf is
-    // appended, so an `Err` here would tell the caller that a revoke which
-    // landed did not land. `execute_governance_action` keeps the proposal's
-    // replay marker whenever the cell's `mutation_epoch` advanced during
-    // dispatch, so the `Err` would not re-arm replay; it would only misreport
-    // the outcome and skip the remaining authors' leaves.
-    // `governance_ban_subscriber` rotates every author unconditionally (it has
-    // no already-banned early return), which is why a replayed RevokeAccess
-    // would advance every author's epoch a SECOND time, write a second
-    // `AccessRevoked` leaf, and leave this member's log divergent from every
-    // member that applied the commit once — a divergence §9.9.3 reads as
-    // equivocation. The epoch rule in `execute_governance_action` closes that
-    // replay for every helper in this file.
-    //
-    // The failure still reaches an operator: each miss logs at ERROR with the
-    // context, the author DID, and the underlying error. A log line is an
-    // honest signal that the log is short a leaf; an `Err` return is a false
-    // one, because it reports "the revoke did not happen" about a revoke that
-    // did happen.
-    //
-    // The counter is bumped INLINE in the success arm, never coalesced at the
-    // end, so the leaves that did land are still credited when a later one
-    // fails.
-    for rotation in &rotated_authors {
-        let old_epoch = rotation.new_epoch.saturating_sub(1);
-        match scp_event_log::payload::encode_payload(
-            &scp_event_log::payload::KeyEpochAdvancePayload {
-                old_epoch,
-                new_epoch: rotation.new_epoch,
-            },
-        ) {
-            Ok(payload) => {
-                if let Err(e) = deps
-                    .event_log
-                    .append_context_event_with_payload(
-                        crate::context::builder::AppendMode::AfterSideEffect,
-                        &context_id_bytes,
-                        scp_event_log::EventType::KeyEpochAdvance,
-                        rotation.author_did.as_str(),
-                        payload,
-                        timestamp_secs,
-                    )
-                    .await
-                {
-                    tracing::error!(
-                        context_id = %context_id,
-                        author_did = %rotation.author_did,
-                        error = %e,
-                        "KeyEpochAdvance event-log append failed after governance ban — \
-                         the event log is short one leaf for this author"
-                    );
-                } else {
-                    *cell.class_c_view().checkpoint_events_since_mut() += 1;
-                }
-            }
-            Err(e) => {
-                tracing::error!(
-                    context_id = %context_id,
-                    author_did = %rotation.author_did,
-                    error = %e,
-                    "KeyEpochAdvance payload encode failed after governance ban — \
-                     the event log is short one leaf for this author"
-                );
-            }
-        }
-    }
 
     // H7: Rotate sender key after write-side revocation.
     if needs_sender_key_rotation {
@@ -1169,7 +1116,6 @@ pub async fn execute_restore_access(
         actor_did,
         timestamp_secs,
     } = meta;
-    let context_id_bytes = context_id_to_bytes(context_id);
 
     // SECURITY-FLAG (ADR-049 §9, CONSCIOUS SAFE STRENGTHENING best-effort→FC):
     // restoring access (clearing a suspension / read-exclusion, re-minting the
@@ -1190,6 +1136,11 @@ pub async fn execute_restore_access(
     // best-effort `persist_broadcast_snapshot` is gone. The post-persist external
     // work (event-log append, coalesced `checkpoint_events_since` bump) is
     // unchanged.
+    let leaf = LeafSpec::without_payload(
+        scp_event_log::EventType::AccessRestored,
+        actor_did.to_owned(),
+        timestamp_secs,
+    );
     cell.commit_class_s_keep(deps, context_id, |mut view| {
         let state = view.rest_mut();
         require_active(&state.handle)?;
@@ -1273,21 +1224,10 @@ pub async fn execute_restore_access(
             );
         }
 
+        view.enqueue_counted_log_unit(vec![leaf]);
         Ok(())
     })
     .await?;
-
-    deps.event_log
-        .append_context_event(
-            crate::context::builder::AppendMode::AfterSideEffect,
-            &context_id_bytes,
-            scp_event_log::EventType::AccessRestored,
-            actor_did,
-            timestamp_secs,
-        )
-        .await?;
-    // Coalesced Class-C counter bump (rides the next run-loop persist).
-    *cell.class_c_view().checkpoint_events_since_mut() += 1;
 
     Ok(())
 }
@@ -1321,7 +1261,6 @@ pub async fn execute_add_member(
         actor_did,
         timestamp_secs,
     } = meta;
-    let context_id_bytes = context_id_to_bytes(context_id);
 
     require_active(&cell.handle)?;
 
@@ -1377,6 +1316,23 @@ pub async fn execute_add_member(
     // `rest_mut()` inside `commit_class_s_keep`, mirroring the `join_context`
     // add path. On add failure NO MLS rollback is needed (no member was added),
     // matching the prior provider disposition; the error propagates unchanged.
+    //
+    // Subject-bearing leaf (ADR-011 amendment): the `MemberJoined` record
+    // carries the *affected member* (`did`) in the payload, not just
+    // `actor_did` (which on this admin-driven add is the executing admin).
+    // Participation `participation_duration_secs` (§7.3.2) attributes the join
+    // interval to this subject. It is planned here, before the MLS add, so an
+    // entry the append would refuse refuses the add before its step (spec 17
+    // §17.3 "Event log write failures").
+    let joined_leaf = crate::context::log_unit_helpers::plan_membership_change_leaf(
+        scp_event_log::EventType::MemberJoined,
+        actor_did,
+        &scp_event_log::payload::MembershipChangePayload {
+            subject_did: did.as_ref().to_owned(),
+            role_name: role.to_owned(),
+        },
+        timestamp_secs,
+    )?;
     let add_output = cell
         .commit_class_s_keep(deps, context_id, |mut v| {
             let state = v.rest_mut();
@@ -1438,11 +1394,10 @@ pub async fn execute_add_member(
     // field-granular Class-C role view (ADR-049 §9): `system_assign_role` mints +
     // inserts assignments / member_capabilities and runs the SHRINK-only suspension
     // prune over the view's own disjoint fields — no whole `&mut ContextRoleState`,
-    // no downward-auth GROW. It runs in a NON-PERSISTING Class-C view borrow (the
-    // run-loop / the best-effort persist below covers it): this site is best-effort
-    // BY DESIGN — member ADD is coalesce-window-rollback acceptable (ADR-049 §9), so
-    // the suspension prune rides the SAME best-effort persist it always did. It is
-    // NOT strengthened to fail-closed.
+    // no downward-auth GROW. It runs in a NON-PERSISTING Class-C view borrow; the
+    // fail-closed persist that queues the `MemberJoined` record below covers it.
+    // Member ADD is coalesce-window-rollback acceptable (ADR-049 §9); that
+    // persist is fail-closed because the queued record needs a durable home.
     let tokens = {
         let mut view = cell.class_c_view();
         let mut role_state = view.role_state_class_c_mut();
@@ -1454,9 +1409,13 @@ pub async fn execute_add_member(
     let creator_did = cell.role_state.creator_did.clone();
 
     // Infallible in-state mutations + the MemberJoined / WelcomeGenerated emits,
-    // all riding ONE best-effort persist (unchanged from the pre-migration
-    // single `persist_state_best_effort`).
-    cell.commit_class_c_best_effort(deps, context_id, |mut view| {
+    // applied through the non-persisting Class-C view, then persisted
+    // fail-closed together with the queued `MemberJoined` record below, which
+    // needs a durable home once the member is in the group (spec 17 §17.3
+    // "Event log write failures"). Keep-direction: on persist failure the
+    // member stays added, as the MLS add above already did.
+    {
+        let mut view = cell.class_c_view();
         view.membership_class_c_mut()
             .add_member(did.clone(), role.to_owned(), tokens);
 
@@ -1493,8 +1452,12 @@ pub async fn execute_add_member(
                 deps.event_tx.as_ref(),
             );
         }
+    }
+    cell.commit_class_s_keep(deps, context_id, |mut view| {
+        view.enqueue_counted_log_unit(vec![joined_leaf]);
+        Ok(())
     })
-    .await;
+    .await?;
 
     // ROOT FIX (parity with `execute_remove_member` / `execute_reset_member`):
     // broadcast the MLS Commit to the EXISTING members. An MLS Add advances the
@@ -1505,12 +1468,11 @@ pub async fn execute_add_member(
     // + `apply_broadcast_failure`) as the remove/reset commits. A no-op when
     // `commit_for_broadcast` is empty (the `cfg(test)` no-crypto pipeline).
     //
-    // Hoisted AFTER the best-effort persist above (ADR-049 Decision 7 — transport
+    // Hoisted AFTER the persist above (ADR-049 Decision 7 — transport
     // is async and cannot be awaited inside the sync closure). The broadcast is
     // async; on failure the retry-queue bookkeeping is applied Class-C (coalesced
     // — picked up by the actor's persist tick), which is this add's correct class
-    // (member-add is not a downward-authorization transition — parity with the
-    // pre-async `commit_class_c_best_effort` shape).
+    // (member-add is not a downward-authorization transition).
     if !commit_for_broadcast.is_empty()
         && let Some(failure) = try_broadcast_commit(
             deps,
@@ -1535,7 +1497,7 @@ pub async fn execute_add_member(
     // actor-owned `pending_distributions` the `distribute_sender_key` above
     // populated (same crypto state), MLS-wraps each entry, and sends it — the
     // MLS-wrap is mandatory (see `drain_and_deliver_sender_keys`). Runs AFTER the
-    // best-effort persist (transport is async — ADR-049 Decision 7), matching the
+    // persist (transport is async — ADR-049 Decision 7), matching the
     // remove/revoke drain call sites. Best-effort: a per-target send failure is
     // warned; the member recovers via `SenderKeyRequest`. `&mut` view scoped so
     // `cell` is free afterward. No-op on the `cfg(test)` no-crypto pipeline (the
@@ -1558,24 +1520,6 @@ pub async fn execute_add_member(
         }
     }
 
-    // Subject-bearing leaf (ADR-011 amendment): carry the *affected member*
-    // (`did`) in the payload, not just `actor_did` (which on this admin-driven
-    // add is the executing admin). Participation `participation_duration_secs`
-    // (§7.3.2) attributes the join interval to this subject.
-    deps.event_log
-        .append_membership_change_leaf(
-            crate::context::builder::AppendMode::AfterSideEffect,
-            &context_id_bytes,
-            scp_event_log::EventType::MemberJoined,
-            actor_did,
-            &scp_event_log::payload::MembershipChangePayload {
-                subject_did: did.as_ref().to_owned(),
-                role_name: role.to_owned(),
-            },
-            timestamp_secs,
-        )
-        .await?;
-    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(scp_protocol::context::builder::AddMemberOutput {
         welcome_bytes: welcome_bytes_out,
         commit_bytes: commit_bytes_out,
@@ -1611,7 +1555,7 @@ pub async fn execute_remove_member(
     // where the fail-close `commit_fault` marker is set but NOT persisted before
     // the early return). All structural mutations + emit + broadcast + sender-
     // key drain ride the SAME fail-closed persist via `view.rest_mut()`.
-    let (removed_role_name, remove_commit_bytes) = cell
+    let remove_commit_bytes = cell
         .commit_class_s_keep(deps, context_id, |mut view| {
             let state = view.rest_mut();
 
@@ -1621,12 +1565,27 @@ pub async fn execute_remove_member(
                 return Err(ContextError::MemberNotFound(did.to_string()));
             }
 
-            // Role at departure, captured BEFORE the strip below for the
-            // subject-bearing MemberLeft leaf (ADR-011 amendment; §7.3.2).
-            let removed_role_name = state
-                .membership
-                .get(did.as_ref())
-                .map_or_else(String::new, |info| info.role_name.clone());
+            // Subject-bearing leaf (ADR-011 amendment): the `MemberLeft`
+            // record carries the *affected member* (`did`) and the role it
+            // held at departure, captured BEFORE the strip below, not just
+            // `actor_did` (the executing admin). Participation
+            // `participation_duration_secs` (§7.3.2) attributes the leave
+            // interval to this subject. It is planned before the MLS removal,
+            // so an entry the append would refuse refuses the removal before
+            // its step, and it is queued in this persist (spec 17 §17.3 "Event
+            // log write failures").
+            let left_leaf = crate::context::log_unit_helpers::plan_membership_change_leaf(
+                scp_event_log::EventType::MemberLeft,
+                actor_did,
+                &scp_event_log::payload::MembershipChangePayload {
+                    subject_did: did.as_ref().to_owned(),
+                    role_name: state
+                        .membership
+                        .get(did.as_ref())
+                        .map_or_else(String::new, |info| info.role_name.clone()),
+                },
+                timestamp_secs,
+            )?;
 
             // H9: MLS group removal FIRST (hard security boundary). ADR-049 PR-7:
             // the whole in-closure crypto orchestration (MLS remove, per-member
@@ -1647,7 +1606,7 @@ pub async fn execute_remove_member(
                     "remove_member_sender_key",
                     &e.to_string(),
                 )
-                .map(|()| (String::new(), None));
+                .map(|()| None);
             }
             // ADR-049 PR-6: prune the departed member's Class-M registry floors
             // (member-granular; siblings + the local scalar retained). See
@@ -1664,7 +1623,7 @@ pub async fn execute_remove_member(
                     "rotate_sender_key",
                     &e.to_string(),
                 )
-                .map(|()| (String::new(), None));
+                .map(|()| None);
             }
             // ADR-049 PR-6/PR-7: rotate succeeded (the Err arm returns above) —
             // advance the durably-bumped local epoch (read from the actor `state`,
@@ -1702,7 +1661,8 @@ pub async fn execute_remove_member(
             // `_keep` closure (ADR-049 Decision 7 — transport is async). `None`
             // on the fail-close paths above, which skip the broadcast/drain
             // exactly as the pre-hoist early returns did.
-            Ok((removed_role_name, Some(remove_output.commit_bytes)))
+            view.enqueue_counted_log_unit(vec![left_leaf]);
+            Ok(Some(remove_output.commit_bytes))
         })
         .await?;
 
@@ -1752,24 +1712,6 @@ pub async fn execute_remove_member(
         }
     }
 
-    // Subject-bearing leaf (ADR-011 amendment): carry the *affected member*
-    // (`did`) and the role it held at departure, not just `actor_did` (the
-    // executing admin). Participation `participation_duration_secs` (§7.3.2)
-    // attributes the leave interval to this subject.
-    deps.event_log
-        .append_membership_change_leaf(
-            crate::context::builder::AppendMode::AfterSideEffect,
-            &context_id_bytes,
-            scp_event_log::EventType::MemberLeft,
-            actor_did,
-            &scp_event_log::payload::MembershipChangePayload {
-                subject_did: did.as_ref().to_owned(),
-                role_name: removed_role_name.clone(),
-            },
-            timestamp_secs,
-        )
-        .await?;
-    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -1790,7 +1732,6 @@ pub async fn execute_change_role(
         actor_did,
         timestamp_secs,
     } = meta;
-    let context_id_bytes = context_id_to_bytes(context_id);
 
     // ADR-049 §9 Class S: a role change can be a demotion (downward
     // authorization) — route the role assignment through `commit_class_s_keep`
@@ -1799,6 +1740,19 @@ pub async fn execute_change_role(
     // direction). The reject-before-mutate guards return `Err` from inside the
     // closure (no persist runs); the `role_state` + membership mutation (Class-C)
     // rides the SAME fail-closed persist via `view.rest_mut()`.
+    //
+    // Subject-bearing leaf (ADR-011 amendment): the `RoleAssigned` record
+    // carries the *affected member* (`did`) and the newly-assigned role, not
+    // just `actor_did` (which on this admin-driven change is the executing
+    // admin). Participation `role_progression_count` (§7.3.2) attributes the
+    // role transition to this subject. It is planned before the step and
+    // queued in the same persist (spec 17 §17.3 "Event log write failures").
+    let leaf = crate::context::log_unit_helpers::plan_role_assigned_leaf(
+        actor_did,
+        did.as_ref(),
+        new_role,
+        timestamp_secs,
+    )?;
     cell.commit_class_s_keep(deps, context_id, |mut view| {
         require_active(&view.handle)?;
 
@@ -1814,26 +1768,10 @@ pub async fn execute_change_role(
             new_role.clone_into(&mut info.role_name);
             info.tokens = tokens;
         }
+        view.enqueue_counted_log_unit(vec![leaf]);
         Ok(())
     })
-    .await?;
-    // Subject-bearing leaf (ADR-011 amendment): carry the *affected member*
-    // (`did`) and the newly-assigned role, not just `actor_did` (which on this
-    // admin-driven change is the executing admin). Participation
-    // `role_progression_count` (§7.3.2) attributes the role transition to this
-    // subject.
-    deps.event_log
-        .append_role_assigned_leaf(
-            crate::context::builder::AppendMode::AfterSideEffect,
-            &context_id_bytes,
-            actor_did,
-            did.as_ref(),
-            new_role,
-            timestamp_secs,
-        )
-        .await?;
-    *cell.class_c_view().checkpoint_events_since_mut() += 1;
-    Ok(())
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -1852,12 +1790,9 @@ pub async fn execute_register_outlet(
         actor_did,
         timestamp_secs,
     } = meta;
-    let context_id_bytes = context_id_to_bytes(context_id);
 
     // Outlet registration is an UPWARD grant (Class-C governance config). The
-    // fallible guards read through the cell's `Deref` (no mutation); the
-    // `registered_outlets` push (Class-C) rides `commit_class_c_best_effort`,
-    // preserving the prior best-effort persist exactly.
+    // fallible guards read through the cell's `Deref` (no mutation).
     require_active(&cell.handle)?;
 
     if !cell
@@ -1909,45 +1844,46 @@ pub async fn execute_register_outlet(
         )));
     }
 
-    cell.commit_class_c_best_effort(deps, context_id, |mut view| {
-        view.governance_class_c_mut()
-            .registered_outlets_mut()
-            .push(registration.clone());
-    })
-    .await;
-
     // The leaf names the outlet it registered. `EventPayload::default()` would
     // name none, leaving a reader able to count registrations without learning
     // which outlets they registered, and leaving the genesis path (which writes
     // the same payload) and this path emitting indistinguishable leaves for
-    // different outlets (GitHub #2250).
-    let event = scp_protocol::context::outlets::OutletRegisteredEvent {
-        outlet_id: registration.outlet_id.clone(),
-        name: registration.name.clone(),
-        description: registration.description.clone(),
-        implementation_hash: registration.implementation_hash,
-        operator_did: registration.operator_did.clone(),
-        registrant_did: scp_did::DID(actor_did.to_owned()),
-        test_vector_count: registration.test_vectors.len(),
-    };
-    let payload = scp_event_log::payload::encode_payload(&event).map_err(|e| {
+    // different outlets (GitHub #2250). It is planned before the push, so an
+    // entry the append would refuse refuses the registration before its step.
+    let leaf = plan_encoded_leaf(
+        scp_event_log::EventType::OutletRegistered,
+        actor_did,
+        &scp_protocol::context::outlets::OutletRegisteredEvent {
+            outlet_id: registration.outlet_id.clone(),
+            name: registration.name.clone(),
+            description: registration.description.clone(),
+            implementation_hash: registration.implementation_hash,
+            operator_did: registration.operator_did.clone(),
+            registrant_did: scp_did::DID(actor_did.to_owned()),
+            test_vector_count: registration.test_vectors.len(),
+        },
+        timestamp_secs,
+    )
+    .map_err(|e| {
         ContextError::EventLogFailed(format!(
-            "failed to encode the OutletRegistered payload for outlet {:?}: {e}",
+            "the OutletRegistered record for outlet {:?} is refused: {e}",
             registration.outlet_id,
         ))
     })?;
-    deps.event_log
-        .append_context_event_with_payload(
-            crate::context::builder::AppendMode::AfterSideEffect,
-            &context_id_bytes,
-            scp_event_log::EventType::OutletRegistered,
-            actor_did,
-            payload,
-            timestamp_secs,
-        )
-        .await?;
-    *cell.class_c_view().checkpoint_events_since_mut() += 1;
-    Ok(())
+
+    // The push rides a fail-closed keep persist together with the queued
+    // record, which needs a durable home once the outlet is registered (spec
+    // 17 §17.3 "Event log write failures"). Keep-direction: on persist failure
+    // the registration stays, as the best-effort persist it replaces left it.
+    cell.commit_class_s_keep(deps, context_id, |mut view| {
+        view.rest_mut()
+            .governance
+            .registered_outlets
+            .push(registration.clone());
+        view.enqueue_counted_log_unit(vec![leaf]);
+        Ok(())
+    })
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -1966,7 +1902,6 @@ pub async fn execute_remove_outlet(
         actor_did,
         timestamp_secs,
     } = meta;
-    let context_id_bytes = context_id_to_bytes(context_id);
 
     // ADR-049 §9 Class S: removing a registered outlet revokes the authority to
     // invoke it — a downward-authorization transition (the inverse of
@@ -1976,7 +1911,27 @@ pub async fn execute_remove_outlet(
     // was removed is the unsafe direction). The reject-before-mutate guard
     // returns `Err` from inside the closure (no persist runs); the
     // `registered_outlets` retain (Class-C) rides the SAME fail-closed persist via
-    // `view.rest_mut()`.
+    // `view.rest_mut()`, and so does the queued record (spec 17 §17.3 "Event
+    // log write failures").
+    //
+    // The leaf names the outlet whose invocation authority this removal
+    // withdrew. `EventPayload::default()` would name none, so a reader holding
+    // both the registration leaves and this removal leaf could not tell which
+    // registration the removal withdrew (GitHub #2250).
+    let leaf = plan_encoded_leaf(
+        scp_event_log::EventType::OutletRemoved,
+        actor_did,
+        &scp_protocol::context::outlets::OutletRemovedEvent {
+            outlet_id: outlet_id.to_owned(),
+            remover_did: scp_did::DID(actor_did.to_owned()),
+        },
+        timestamp_secs,
+    )
+    .map_err(|e| {
+        ContextError::EventLogFailed(format!(
+            "the OutletRemoved record for outlet {outlet_id:?} is refused: {e}"
+        ))
+    })?;
     cell.commit_class_s_keep(deps, context_id, |mut view| {
         require_active(&view.handle)?;
 
@@ -1984,35 +1939,10 @@ pub async fn execute_remove_outlet(
             .governance
             .registered_outlets
             .retain(|t| t.outlet_id != outlet_id);
+        view.enqueue_counted_log_unit(vec![leaf]);
         Ok(())
     })
-    .await?;
-
-    // The leaf names the outlet whose invocation authority this removal
-    // withdrew. `EventPayload::default()` would name none, so a reader holding
-    // both the registration leaves and this removal leaf could not tell which
-    // registration the removal withdrew (GitHub #2250).
-    let event = scp_protocol::context::outlets::OutletRemovedEvent {
-        outlet_id: outlet_id.to_owned(),
-        remover_did: scp_did::DID(actor_did.to_owned()),
-    };
-    let payload = scp_event_log::payload::encode_payload(&event).map_err(|e| {
-        ContextError::EventLogFailed(format!(
-            "failed to encode the OutletRemoved payload for outlet {outlet_id:?}: {e}"
-        ))
-    })?;
-    deps.event_log
-        .append_context_event_with_payload(
-            crate::context::builder::AppendMode::AfterSideEffect,
-            &context_id_bytes,
-            scp_event_log::EventType::OutletRemoved,
-            actor_did,
-            payload,
-            timestamp_secs,
-        )
-        .await?;
-    *cell.class_c_view().checkpoint_events_since_mut() += 1;
-    Ok(())
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -2031,7 +1961,6 @@ pub async fn execute_modify_ceiling(
         actor_did,
         timestamp_secs,
     } = meta;
-    let context_id_bytes = context_id_to_bytes(context_id);
 
     // ADR-049 §9 Class S: staging a pending ceiling modification is part of a
     // ceiling-lowering decision chain (downward authorization) — route it
@@ -2040,7 +1969,14 @@ pub async fn execute_modify_ceiling(
     // a pending downward-authorization record is the unsafe direction). The
     // reject-before-mutate guards return `Err` from inside the closure (no
     // persist runs); the `pending_ceiling_modification` set + emit (Class-C) ride
-    // the SAME fail-closed persist via `view.rest_mut()`.
+    // the SAME fail-closed persist via `view.rest_mut()`, and so does the
+    // queued `CeilingModificationPending` record (spec 17 §17.3 "Event log
+    // write failures").
+    let leaf = LeafSpec::without_payload(
+        scp_event_log::EventType::CeilingModificationPending,
+        actor_did.to_owned(),
+        timestamp_secs,
+    );
     cell.commit_class_s_keep(deps, context_id, |mut view| {
         let state = view.rest_mut();
         require_active(&state.handle)?;
@@ -2117,20 +2053,10 @@ pub async fn execute_modify_ceiling(
             context_id,
             deps,
         );
+        view.enqueue_counted_log_unit(vec![leaf]);
         Ok(())
     })
-    .await?;
-    deps.event_log
-        .append_context_event(
-            crate::context::builder::AppendMode::AfterSideEffect,
-            &context_id_bytes,
-            scp_event_log::EventType::CeilingModificationPending,
-            actor_did,
-            timestamp_secs,
-        )
-        .await?;
-    *cell.class_c_view().checkpoint_events_since_mut() += 1;
-    Ok(())
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -2154,7 +2080,6 @@ pub async fn execute_close_context(
         actor_did,
         timestamp_secs,
     } = meta;
-    let context_id_bytes = context_id_to_bytes(context_id);
 
     require_active(&cell.handle)?;
     let handle = cell.handle.clone();
@@ -2173,6 +2098,11 @@ pub async fn execute_close_context(
     // (keep-direction: on persist failure the close STAYS — silently re-opening a
     // closed context is the unsafe direction). The timer/broadcast/participation
     // cleanup (Class-C) rides the fail-closed persist via `view.rest_mut()`.
+    let leaf = LeafSpec::without_payload(
+        scp_event_log::EventType::ContextClosing,
+        actor_did.to_owned(),
+        timestamp_secs,
+    );
     cell.commit_class_s_keep(deps, context_id, |mut view| {
         let state = view.rest_mut();
         // TTL + governance timers are actor-owned arms (ADR-049 finding A3):
@@ -2188,19 +2118,10 @@ pub async fn execute_close_context(
         // §9.10.4.1 "Leave, close and expiry": a terminal
         // context drops its previous routing ID and pending rotation work.
         state.class_s.pseudonym_rotation.discard_rotation_state();
+        view.enqueue_counted_log_unit(vec![leaf]);
         Ok(())
     })
     .await?;
-    deps.event_log
-        .append_context_event(
-            crate::context::builder::AppendMode::AfterSideEffect,
-            &context_id_bytes,
-            scp_event_log::EventType::ContextClosing,
-            actor_did,
-            timestamp_secs,
-        )
-        .await?;
-    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -2225,7 +2146,6 @@ pub async fn execute_extend_ttl(
         actor_did,
         timestamp_secs,
     } = meta;
-    let context_id_bytes = context_id_to_bytes(context_id);
 
     require_active(&cell.handle)?;
 
@@ -2246,32 +2166,24 @@ pub async fn execute_extend_ttl(
     let mut missing: Vec<&str> = member_dids.difference(&approval_dids).copied().collect();
     missing.sort_unstable();
     if !missing.is_empty() {
-        let rejecting_members: Vec<&str> = missing.clone();
-        let rejected_payload = scp_event_log::payload::encode_payload(
+        let rejected_leaf = plan_encoded_leaf(
+            scp_event_log::EventType::TtlExtensionRejected,
+            actor_did,
             &scp_event_log::payload::TtlExtensionRejectedPayload {
                 proposal_id,
-                rejecting_members: rejecting_members.iter().map(|m| (*m).to_owned()).collect(),
+                rejecting_members: missing.iter().map(|m| (*m).to_owned()).collect(),
             },
-        )
-        .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
-        deps.event_log
-            .append_context_event_with_payload(
-                crate::context::builder::AppendMode::AfterSideEffect,
-                &context_id_bytes,
-                scp_event_log::EventType::TtlExtensionRejected,
-                actor_did,
-                rejected_payload,
-                timestamp_secs,
-            )
-            .await?;
+            timestamp_secs,
+        )?;
         let missing_len = missing.len();
         let member_count = member_dids.len();
         // Drop the `member_dids` / `missing` borrows of `cell` (held via
         // `member_dids()`) before taking the Class-C view.
         drop(missing);
         drop(member_dids);
-        // The rejection leaf landed and is credited here, which advances the
-        // cell's `mutation_epoch`, so `execute_governance_action` keeps this
+        // The rejection leaf is queued, with its checkpoint count, in a
+        // fail-closed keep persist (spec 17 §17.3 "Event log write failures"),
+        // which advances the cell's `mutation_epoch`, so `execute_governance_action` keeps this
         // proposal's replay marker: a rejected attempt consumes the proposal
         // (§5.10.1 step 6 of the contexts spec: the extension fails and the
         // original TTL remains), and the members submit a new ExtendTtl
@@ -2279,8 +2191,9 @@ pub async fn execute_extend_ttl(
         // append a second `TtlExtensionRejected` leaf per attempt. The `Err`
         // also keeps `execute_governance_action` from running finalize, so no
         // `GovernanceActionExecuted` leaf records an extension that did not
-        // happen.
-        *cell.class_c_view().checkpoint_events_since_mut() += 1;
+        // happen. A persist failure returns its own error in place of the
+        // refusal.
+        queue_log_unit(cell, deps, context_id, vec![rejected_leaf]).await?;
         return Err(ContextError::PermissionDenied(format!(
             "TTL extension requires unanimous consent — {missing_len} of {member_count} members have not approved",
         )));
@@ -2291,41 +2204,49 @@ pub async fn execute_extend_ttl(
     drop(approval_dids);
     drop(member_dids);
 
-    // Leaf-atomic TTL extension (ADR-049 §9, B3): raise the log-derived
-    // convergent deadline by `additional_secs`, mutate the recorded (actor-owned,
-    // §A3) timer AND append the matching `TtlExtended` leaf from the SAME
-    // resolved value, via the shared `extend_ttl_deadline_and_record` combinator
-    // (also used by the bilateral `reset_ttl_timer` path) so a deadline mutation
-    // can never drift from its convergent leaf. The combinator derives the
-    // current deadline from the single authoritative source (the log), extends
-    // it (`old_deadline + additional_secs`, convergent across members), and
-    // stamps the leaf with the committer-assigned `timestamp_secs`
-    // (`proposal.created_at`). A context whose log yields no convergent deadline
-    // has no TTL to extend ⇒ no-op, no leaf. The governance decision is already
-    // committed, so the read and the append are after its side effect and
-    // best-effort (a lost leaf re-derives the shorter un-extended base on
-    // restore). The
-    // combinator credits `checkpoint_events_since` itself, in the one arm where
-    // the `TtlExtended` leaf landed, so this helper credits nothing: three of
-    // the combinator's paths (no convergent deadline, payload encode failure,
-    // append failure) append no leaf, and an unconditional credit here would
-    // run the §9.9.3 checkpoint position one leaf ahead of the log on each.
-    crate::context::ttl_close_helpers::extend_ttl_deadline_and_record(
-        cell,
+    // Leaf-atomic TTL extension (ADR-049 §9, B3): the planner raises the
+    // convergent deadline by `additional_secs` and plans the matching
+    // `TtlExtended` leaf from the SAME resolved value, stamped with the
+    // committer-assigned `timestamp_secs` (`proposal.created_at`). The base is
+    // derived from the log followed by the queued units, so an extension queued
+    // and not yet drained is the base a second one builds on. Both run before
+    // the step: an unreadable log or a refused leaf refuses the extension with
+    // the timer unchanged (spec 17 §17.3 "Event log write failures"). The keep
+    // then arms the recorded (actor-owned, §A3) timer and queues the leaf in
+    // one fail-closed persist, so the two cannot drift. A context with no
+    // convergent deadline (promoted / no-TTL) has no TTL to extend ⇒ no-op, no
+    // leaf.
+    let evidence = crate::context::governance_logic::read_consequence_log(
+        &cell.class_s.pending_log_units,
+        context_id,
         deps.event_log.as_ref(),
-        &context_id_bytes,
+    )?;
+    let Some((extended, leaf)) = crate::context::ttl_close_helpers::plan_governance_ttl_extension(
+        cell,
+        &evidence,
         actor_did,
         additional_secs,
-        crate::context::ttl_close_helpers::ExtensionLeaf::Governance {
-            proposal_id,
-            committer_timestamp_secs: timestamp_secs,
-            consenting_members: consenting,
-        },
-    )
-    .await?;
-
-    crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, context_id).await;
-    Ok(())
+        proposal_id,
+        timestamp_secs,
+        consenting,
+    )?
+    else {
+        tracing::warn!(
+            context_id,
+            "ExtendTtl: no convergent deadline to extend (promoted / no-TTL context) — \
+             no-op, no leaf (H2)"
+        );
+        return Ok(());
+    };
+    cell.commit_class_s_keep(deps, context_id, |mut view| {
+        crate::context::ttl_close_helpers::start_ttl_timer(
+            &mut view.rest_mut().ttl.timer,
+            extended,
+        );
+        view.enqueue_counted_log_unit(vec![leaf]);
+        Ok(())
+    })
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -2344,7 +2265,6 @@ pub async fn execute_transfer_admin(
         actor_did,
         timestamp_secs,
     } = meta;
-    let context_id_bytes = context_id_to_bytes(context_id);
 
     // ADR-049 §9 Class S: admin transfer is an authorization transition (the
     // prior admin loses admin authority) — route the role reassignment through
@@ -2354,6 +2274,11 @@ pub async fn execute_transfer_admin(
     // mutate guards return `Err` from inside the closure (no persist runs); the
     // `role_state` + membership reassignment (Class-C) rides the SAME fail-closed
     // persist via `view.rest_mut()`.
+    let leaf = LeafSpec::without_payload(
+        scp_event_log::EventType::AdminTransferred,
+        actor_did.to_owned(),
+        timestamp_secs,
+    );
     cell.commit_class_s_keep(deps, context_id, |mut view| {
         let state = view.rest_mut();
         require_active(&state.handle)?;
@@ -2383,19 +2308,10 @@ pub async fn execute_transfer_admin(
             "admin".clone_into(&mut info.role_name);
             info.tokens = tokens;
         }
+        view.enqueue_counted_log_unit(vec![leaf]);
         Ok(())
     })
     .await?;
-    deps.event_log
-        .append_context_event(
-            crate::context::builder::AppendMode::AfterSideEffect,
-            &context_id_bytes,
-            scp_event_log::EventType::AdminTransferred,
-            actor_did,
-            timestamp_secs,
-        )
-        .await?;
-    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -2415,11 +2331,11 @@ pub async fn execute_create_child_context(
         actor_did,
         timestamp_secs,
     } = meta;
-    let context_id_bytes = context_id_to_bytes(context_id);
 
-    // Pure read-gate + event-log append; the only state mutation is the
-    // coalesced checkpoint counter (no site persist today). Guards read through
-    // the cell's `Deref`; the counter bumps via the non-persisting Class-C view.
+    // Pure read-gate + the `ChildContextCreated` record. Guards read through
+    // the cell's `Deref`; the record is queued, with its checkpoint count, in a
+    // fail-closed keep persist, so it has a durable home before the action
+    // acknowledges (spec 17 §17.3 "Event log write failures").
     require_active(&cell.handle)?;
 
     if !cell
@@ -2432,17 +2348,16 @@ pub async fn execute_create_child_context(
         ));
     }
 
-    deps.event_log
-        .append_context_event(
-            crate::context::builder::AppendMode::AfterSideEffect,
-            &context_id_bytes,
-            scp_event_log::EventType::ChildContextCreated,
-            actor_did,
-            timestamp_secs,
-        )
-        .await?;
-    *cell.class_c_view().checkpoint_events_since_mut() += 1;
-    Ok(())
+    let leaf = LeafSpec::without_payload(
+        scp_event_log::EventType::ChildContextCreated,
+        actor_did.to_owned(),
+        timestamp_secs,
+    );
+    cell.commit_class_s_keep(deps, context_id, |mut view| {
+        view.enqueue_counted_log_unit(vec![leaf]);
+        Ok(())
+    })
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -2461,7 +2376,6 @@ pub async fn execute_modify_pruning_policy(
         actor_did,
         timestamp_secs,
     } = meta;
-    let context_id_bytes = context_id_to_bytes(context_id);
 
     let structural_mul_bp = new_policy
         .event_type_retention
@@ -2501,25 +2415,24 @@ pub async fn execute_modify_pruning_policy(
     }
 
     // Validation guards above read only the borrowed `new_policy`. The
-    // active-state gate reads through the cell's `Deref`; the `pruning_policy`
-    // set (Class-C governance config) rides `commit_class_c_best_effort`,
-    // preserving the prior best-effort persist exactly.
+    // active-state gate reads through the cell's `Deref`. The `pruning_policy`
+    // set (Class-C governance config) rides a fail-closed keep persist together
+    // with the queued `PruningPolicyModified` record, which needs a durable
+    // home once the policy has changed (spec 17 §17.3 "Event log write
+    // failures"). Keep-direction: on persist failure the policy stays set, as
+    // the best-effort persist it replaces left it.
     require_active(&cell.handle)?;
-    cell.commit_class_c_best_effort(deps, context_id, |mut view| {
-        *view.governance_class_c_mut().pruning_policy_mut() = Some(new_policy.clone());
+    let leaf = LeafSpec::without_payload(
+        scp_event_log::EventType::PruningPolicyModified,
+        actor_did.to_owned(),
+        timestamp_secs,
+    );
+    cell.commit_class_s_keep(deps, context_id, |mut view| {
+        view.rest_mut().governance.pruning_policy = Some(new_policy.clone());
+        view.enqueue_counted_log_unit(vec![leaf]);
+        Ok(())
     })
-    .await;
-    deps.event_log
-        .append_context_event(
-            crate::context::builder::AppendMode::AfterSideEffect,
-            &context_id_bytes,
-            scp_event_log::EventType::PruningPolicyModified,
-            actor_did,
-            timestamp_secs,
-        )
-        .await?;
-    *cell.class_c_view().checkpoint_events_since_mut() += 1;
-    Ok(())
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -2538,7 +2451,6 @@ pub async fn execute_add_signer(
         actor_did,
         timestamp_secs,
     } = meta;
-    let context_id_bytes = context_id_to_bytes(context_id);
 
     // ADR-049 §9 Class S: adding a threshold signer is an UPWARD governance
     // grant. Migrating onto `commit_class_s_keep` STRENGTHENS the prior
@@ -2548,6 +2460,11 @@ pub async fn execute_add_signer(
     // is the unsafe move). The Class-S `threshold_signers.push` and the Class-C
     // capability/token grants ride the SAME fail-closed persist (both inside the
     // closure); the reject-before-mutate guards return `Err` (no persist).
+    let leaf = LeafSpec::without_payload(
+        scp_event_log::EventType::SignerAdded,
+        actor_did.to_owned(),
+        timestamp_secs,
+    );
     cell.commit_class_s_keep(deps, context_id, |mut view| {
         require_active(&view.handle)?;
 
@@ -2593,19 +2510,10 @@ pub async fn execute_add_signer(
                 info.tokens.push(token);
             }
         }
+        view.enqueue_counted_log_unit(vec![leaf]);
         Ok(())
     })
     .await?;
-    deps.event_log
-        .append_context_event(
-            crate::context::builder::AppendMode::AfterSideEffect,
-            &context_id_bytes,
-            scp_event_log::EventType::SignerAdded,
-            actor_did,
-            timestamp_secs,
-        )
-        .await?;
-    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -2625,7 +2533,6 @@ pub async fn execute_remove_signer(
         actor_did,
         timestamp_secs,
     } = meta;
-    let context_id_bytes = context_id_to_bytes(context_id);
 
     // ADR-049 §9 Class S: removing a threshold signer TIGHTENS governance
     // authorization. `commit_class_s_keep` is the keep-direction: on persist
@@ -2637,6 +2544,11 @@ pub async fn execute_remove_signer(
     // Class-C capability/token strip. The reject-before-mutate guards return
     // `Err` from inside the closure (no persist); the threshold-floor guard
     // undoes its own `retain` before returning, exactly as before.
+    let leaf = LeafSpec::without_payload(
+        scp_event_log::EventType::SignerRemoved,
+        actor_did.to_owned(),
+        timestamp_secs,
+    );
     cell.commit_class_s_keep(deps, context_id, |mut view| {
         require_active(&view.handle)?;
 
@@ -2677,19 +2589,10 @@ pub async fn execute_remove_signer(
                 })
             });
         }
+        view.enqueue_counted_log_unit(vec![leaf]);
         Ok(())
     })
     .await?;
-    deps.event_log
-        .append_context_event(
-            crate::context::builder::AppendMode::AfterSideEffect,
-            &context_id_bytes,
-            scp_event_log::EventType::SignerRemoved,
-            actor_did,
-            timestamp_secs,
-        )
-        .await?;
-    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -2709,13 +2612,17 @@ pub async fn execute_modify_threshold(
         actor_did,
         timestamp_secs,
     } = meta;
-    let context_id_bytes = context_id_to_bytes(context_id);
 
     // ADR-049 §9 Class S: changing the governance threshold is an
     // authorization-control transition. The reject-before-mutate guards run
     // inside the closure (returning `Err` skips the persist and drops the
     // snapshot); on persist failure the combinator RESTORES `threshold_value`
     // so the caller never observes success for an undurable change.
+    let leaf = LeafSpec::without_payload(
+        scp_event_log::EventType::ThresholdModified,
+        actor_did.to_owned(),
+        timestamp_secs,
+    );
     cell.commit_class_s_restore(deps, context_id, |mut view| {
         require_active(&view.handle)?;
 
@@ -2727,19 +2634,10 @@ pub async fn execute_modify_threshold(
             )));
         }
         view.governance_class_s_mut().threshold_value = new_threshold;
+        view.enqueue_counted_log_unit(vec![leaf]);
         Ok(())
     })
     .await?;
-    deps.event_log
-        .append_context_event(
-            crate::context::builder::AppendMode::AfterSideEffect,
-            &context_id_bytes,
-            scp_event_log::EventType::ThresholdModified,
-            actor_did,
-            timestamp_secs,
-        )
-        .await?;
-    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -2759,12 +2657,14 @@ pub async fn execute_establish_outlet_interface(
         actor_did,
         timestamp_secs,
     } = meta;
-    let context_id_bytes = context_id_to_bytes(context_id);
 
     // Establishing a outlet interface is Class-C governance config. The fallible
     // guards read through the cell's `Deref`; the `outlet_interfaces` push
-    // (Class-C) rides `commit_class_c_best_effort`, preserving the prior
-    // best-effort persist exactly.
+    // rides a fail-closed keep persist together with the queued
+    // `OutletInterfaceEstablished` record, which needs a durable home once the
+    // interface is established (spec 17 §17.3 "Event log write failures").
+    // Keep-direction: on persist failure the interface stays, as the
+    // best-effort persist it replaces left it.
     require_active(&cell.handle)?;
 
     if !cell
@@ -2782,23 +2682,20 @@ pub async fn execute_establish_outlet_interface(
             "outlet interface limit of {MAX_OUTLET_INTERFACES} exceeded"
         )));
     }
-    cell.commit_class_c_best_effort(deps, context_id, |mut view| {
-        view.governance_class_c_mut()
-            .outlet_interfaces_mut()
+    let leaf = LeafSpec::without_payload(
+        scp_event_log::EventType::OutletInterfaceEstablished,
+        actor_did.to_owned(),
+        timestamp_secs,
+    );
+    cell.commit_class_s_keep(deps, context_id, |mut view| {
+        view.rest_mut()
+            .governance
+            .outlet_interfaces
             .push(interface.clone());
+        view.enqueue_counted_log_unit(vec![leaf]);
+        Ok(())
     })
-    .await;
-    deps.event_log
-        .append_context_event(
-            crate::context::builder::AppendMode::AfterSideEffect,
-            &context_id_bytes,
-            scp_event_log::EventType::OutletInterfaceEstablished,
-            actor_did,
-            timestamp_secs,
-        )
-        .await?;
-    *cell.class_c_view().checkpoint_events_since_mut() += 1;
-    Ok(())
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -2862,15 +2759,24 @@ pub async fn execute_reset_member(
     // merge, and `commit_class_s_keep` returns the closure's error before it
     // bumps the epoch or persists. `local_did` is read once here and reused by
     // the rotation block below.
+    // The `MemberReset` record rides the same persist as a queued log unit
+    // (spec 17 §17.3 "Event log write failures").
     let local_did = deps.crypto.local_did().to_owned();
+    let reset_leaf = LeafSpec::without_payload(
+        scp_event_log::EventType::MemberReset,
+        actor_did.to_owned(),
+        timestamp_secs,
+    );
     let reset_output = cell
         .commit_class_s_keep(deps, context_id, |mut v| {
-            v.rest_mut().reset_member(
+            let output = v.rest_mut().reset_member(
                 &local_did,
                 did.as_ref(),
                 Some(key_package),
                 deps.clock.as_ref(),
-            )
+            )?;
+            v.enqueue_counted_log_unit(vec![reset_leaf]);
+            Ok(output)
         })
         .await?;
 
@@ -2973,24 +2879,12 @@ pub async fn execute_reset_member(
         }
     }
 
-    deps.event_log
-        .append_context_event(
-            crate::context::builder::AppendMode::AfterSideEffect,
-            &context_id_bytes,
-            scp_event_log::EventType::MemberReset,
-            actor_did,
-            timestamp_secs,
-        )
-        .await?;
-    // Coalesced Class-C bookkeeping through a short-lived view (the checkpoint
-    // counter + the pending epoch-reset queue are Class-C, ride the next persist).
-    {
-        let mut view = cell.class_c_view();
-        *view.checkpoint_events_since_mut() += 1;
-        view.governance_class_c_mut()
-            .pending_epoch_resets_mut()
-            .push(did.clone());
-    }
+    // Coalesced Class-C bookkeeping through a short-lived view (the pending
+    // epoch-reset queue is Class-C and rides the next persist).
+    cell.class_c_view()
+        .governance_class_c_mut()
+        .pending_epoch_resets_mut()
+        .push(did.clone());
 
     Ok(reset_output)
 }
@@ -3018,7 +2912,6 @@ pub async fn execute_resolve_conflict(
         actor_did,
         timestamp_secs,
     } = meta;
-    let context_id_bytes = context_id_to_bytes(context_id);
 
     // ADR-049 §9 Class S: `executed_proposals` is security-critical replay-
     // protection state that does NOT survive an actor crash (it lives in the
@@ -3029,6 +2922,11 @@ pub async fn execute_resolve_conflict(
     // returned. All reject-before-mutate guards return `Err` from inside the
     // closure (no persist runs); `governance.freeze = None` (Class-C) rides the
     // same fail-closed persist.
+    let leaf = LeafSpec::without_payload(
+        scp_event_log::EventType::GovernanceConflictResolved,
+        actor_did.to_owned(),
+        timestamp_secs,
+    );
     cell.commit_class_s_keep(deps, context_id, |mut view| {
         require_active(&view.handle)?;
 
@@ -3108,19 +3006,10 @@ pub async fn execute_resolve_conflict(
         }
 
         view.rest_mut().governance.freeze = None;
+        view.enqueue_counted_log_unit(vec![leaf]);
         Ok(())
     })
     .await?;
-    deps.event_log
-        .append_context_event(
-            crate::context::builder::AppendMode::AfterSideEffect,
-            &context_id_bytes,
-            scp_event_log::EventType::GovernanceConflictResolved,
-            actor_did,
-            timestamp_secs,
-        )
-        .await?;
-    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -3140,7 +3029,6 @@ pub async fn execute_promote_context(
         actor_did,
         timestamp_secs,
     } = meta;
-    let context_id_bytes = context_id_to_bytes(context_id);
 
     // Promotion clears the TTL timer + applies the §5.10 params mutation
     // (memory scope → Full AND `params.ttl` → None). Clearing `params.ttl` is the
@@ -3160,7 +3048,7 @@ pub async fn execute_promote_context(
     // active-state + promotable-policy + unanimity guards read through the cell's
     // `Deref` before the commit; the `ttl` / `handle` mutations ride the
     // fail-closed persist via `view.rest_mut()`. The `ContextPromoted` leaf is
-    // appended AFTER the durable persist succeeds, and remains only a RECORD (it
+    // queued in that persist (spec 17 §17.3), and remains only a RECORD (it
     // is NOT read back to disarm the TTL — re-adding a leaf-fallback read would
     // let a forged/spurious leaf make a finite context never expire, the other
     // fail-dangerous direction pass-4e closed).
@@ -3190,6 +3078,11 @@ pub async fn execute_promote_context(
     drop(member_dids);
     drop(approval_dids);
 
+    let leaf = LeafSpec::without_payload(
+        scp_event_log::EventType::ContextPromoted,
+        actor_did.to_owned(),
+        timestamp_secs,
+    );
     cell.commit_class_s_keep(deps, context_id, |mut view| {
         let state = view.rest_mut();
         // Clear the recorded deadline so the actor-owned TTL arm disarms on the
@@ -3198,19 +3091,10 @@ pub async fn execute_promote_context(
         // §5.10 params mutation: memory scope → Full AND `params.ttl` → None (the
         // prune-immune promotion authority the deadline reader consults).
         state.handle.promote_params();
+        view.enqueue_counted_log_unit(vec![leaf]);
         Ok(())
     })
     .await?;
-    deps.event_log
-        .append_context_event(
-            crate::context::builder::AppendMode::AfterSideEffect,
-            &context_id_bytes,
-            scp_event_log::EventType::ContextPromoted,
-            actor_did,
-            timestamp_secs,
-        )
-        .await?;
-    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -3231,7 +3115,6 @@ pub async fn execute_rotate_content_keys(
         actor_did,
         timestamp_secs,
     } = meta;
-    let context_id_bytes = context_id_to_bytes(context_id);
 
     // ADR-049 §9 Class S: content-key rotation is a forward-secrecy transition
     // (the prior wrapping/content keys are superseded) — route the rotation
@@ -3245,8 +3128,16 @@ pub async fn execute_rotate_content_keys(
     // its correct class. Broadcast per-author key epochs still ride the Class-S
     // `ContextSnapshot`, so the all-author key-epoch advance persists fail-closed
     // atomically inside the combinator — the prior trailing best-effort
-    // `persist_broadcast_snapshot` is gone (§5.14.8).
-    let (rotate_commit_bytes, key_advances) = cell
+    // `persist_broadcast_snapshot` is gone (§5.14.8). The `ContentKeysRotated`
+    // record and one `KeyEpochAdvance` record per rotated broadcast author ride
+    // the same persist as one queued log unit (spec 17 §17.3 "Event log write
+    // failures").
+    let rotated_leaf = LeafSpec::without_payload(
+        scp_event_log::EventType::ContentKeysRotated,
+        actor_did.to_owned(),
+        timestamp_secs,
+    );
+    let rotate_commit_bytes = cell
         .commit_class_s_keep(deps, context_id, |mut view| {
             let state = view.rest_mut();
             require_active(&state.handle)?;
@@ -3313,12 +3204,25 @@ pub async fn execute_rotate_content_keys(
             // Commit broadcast runs AFTER the fail-closed persist, outside this sync
             // `_keep` closure (ADR-049 Decision 7 — transport is async). `None` on
             // the broadcast path (no MLS Commit) or when no epoch advance occurred.
-            // The `advances` Vec carries per-author BroadcastKeyEpochAdvance data
-            // for KeyEpochAdvance event-log appends AFTER the persist (below).
-            Ok((
-                epoch_output.map(|epoch_out| epoch_out.commit_bytes),
-                advances,
-            ))
+            //
+            // One `KeyEpochAdvance` leaf per broadcast author whose key was
+            // rotated (§5.14.10). `advances` is empty on the non-broadcast
+            // path, and arrives in DID-lexicographic order by construction (the
+            // `authors` `BTreeMap` in `scp_protocol::context::broadcast`), so
+            // the leaf sequence, and therefore the Merkle root, is identical on
+            // every member and across replays. `advance.timestamp`
+            // (milliseconds) is for the relay-message consumer on the
+            // per-author block path and is not used here.
+            let mut unit = vec![rotated_leaf];
+            unit.extend(key_epoch_advance_leaves(
+                advances
+                    .iter()
+                    .map(|a| (a.author_did.as_str(), a.new_epoch)),
+                timestamp_secs,
+                context_id,
+            ));
+            view.enqueue_counted_log_unit(unit);
+            Ok(epoch_output.map(|epoch_out| epoch_out.commit_bytes))
         })
         .await?;
 
@@ -3340,95 +3244,6 @@ pub async fn execute_rotate_content_keys(
         .await
     {
         keep_broadcast_failure(cell, deps, context_id, failure).await?;
-    }
-
-    deps.event_log
-        .append_context_event(
-            crate::context::builder::AppendMode::AfterSideEffect,
-            &context_id_bytes,
-            scp_event_log::EventType::ContentKeysRotated,
-            actor_did,
-            timestamp_secs,
-        )
-        .await?;
-
-    // Class-C counter bump for the ContentKeysRotated leaf, inline immediately
-    // after its `?`-append. The counter must track the true durable-leaf count
-    // (governance_logic.rs:156-158) to prevent §9.9.3 checkpoint-position drift.
-    *cell.class_c_view().checkpoint_events_since_mut() += 1;
-
-    // One `KeyEpochAdvance` leaf per broadcast author whose key was rotated
-    // (§5.14.10, #1847). `key_advances` is empty on the non-broadcast path, and
-    // arrives in DID-lexicographic order by construction (the `authors`
-    // `BTreeMap` in `scp_protocol::context::broadcast`), so the leaf sequence —
-    // and therefore the Merkle root — is identical on every member and across
-    // replays.
-    //
-    // THIS LOOP MUST NOT RETURN `Err`, for the reason spelled out at the
-    // matching loop in `execute_revoke`: the rotation and the
-    // `ContentKeysRotated` anchor leaf are already durable, so an `Err` here
-    // would misreport a rotation that landed and skip the remaining authors'
-    // leaves. `execute_governance_action` keeps the replay marker on a
-    // post-effect error (the cell's `mutation_epoch` advanced), so the `Err`
-    // would not re-arm replay of `rotate_all_author_keys`, which advances every
-    // author unconditionally and would otherwise advance every epoch a second
-    // time and write a second `ContentKeysRotated` leaf (§9.9.3 divergence).
-    //
-    // The failure still reaches an operator: each miss logs at ERROR with the
-    // context, the author DID, and the underlying error.
-    //
-    // The counter is bumped INLINE in the success arm, never coalesced at the
-    // end, so the leaves that did land are still credited when a later one
-    // fails.
-    //
-    // NOTE: `advance.timestamp` (milliseconds) is not used here — the event-log
-    // append takes `timestamp_secs` directly. The ms field is carried by
-    // `BroadcastKeyEpochAdvance` for the relay-message consumer on the per-author
-    // block path; it is dead data in this governance path. `old_epoch` is
-    // derived as `new_epoch - 1` because `rotate_all_author_keys` always
-    // increments by exactly 1 (pre-validated, sound by construction).
-    for advance in &key_advances {
-        let old_epoch = advance.new_epoch.saturating_sub(1);
-        match scp_event_log::payload::encode_payload(
-            &scp_event_log::payload::KeyEpochAdvancePayload {
-                old_epoch,
-                new_epoch: advance.new_epoch,
-            },
-        ) {
-            Ok(payload) => {
-                if let Err(e) = deps
-                    .event_log
-                    .append_context_event_with_payload(
-                        crate::context::builder::AppendMode::AfterSideEffect,
-                        &context_id_bytes,
-                        scp_event_log::EventType::KeyEpochAdvance,
-                        advance.author_did.as_str(),
-                        payload,
-                        timestamp_secs,
-                    )
-                    .await
-                {
-                    tracing::error!(
-                        context_id = %context_id,
-                        author_did = %advance.author_did,
-                        error = %e,
-                        "KeyEpochAdvance event-log append failed after RotateContentKeys — \
-                         the event log is short one leaf for this author"
-                    );
-                } else {
-                    *cell.class_c_view().checkpoint_events_since_mut() += 1;
-                }
-            }
-            Err(e) => {
-                tracing::error!(
-                    context_id = %context_id,
-                    author_did = %advance.author_did,
-                    error = %e,
-                    "KeyEpochAdvance payload encode failed after RotateContentKeys — \
-                     the event log is short one leaf for this author"
-                );
-            }
-        }
     }
     Ok(())
 }
@@ -3469,8 +3284,6 @@ pub async fn execute_reconfigure_governance(
         ));
     }
 
-    let context_id_bytes = context_id_to_bytes(context_id);
-
     // ADR-049 §9 Class S: governance reconfiguration (signer/threshold changes)
     // is an authorization-control transition — persist fail-closed so a crash
     // cannot revert to the prior governance configuration after the
@@ -3478,7 +3291,41 @@ pub async fn execute_reconfigure_governance(
     // snapshot/restore SUBSUMES the former hand-rolled `original_signers` /
     // `original_threshold` save+rollback: a validation failure returns `Err`
     // from inside the closure (snapshot dropped, nothing persisted), and a
-    // persist failure restores both Class-S sub-structs.
+    // persist failure restores both Class-S sub-structs, the queued records
+    // with them.
+    //
+    // The `GovernanceReconfigured` record and its companion
+    // `GovernanceDeadlockRecovery` record, which carries the structured
+    // recovery justification (#1847), ride that persist as one queued log unit
+    // (spec 17 §17.3 "Event log write failures"), so the two land together or
+    // not at all. They share the actor and timestamp so verifiers can correlate
+    // them. Both are planned here, so an entry the append would refuse refuses
+    // the reconfiguration before its step.
+    let unit = vec![
+        LeafSpec::without_payload(
+            scp_event_log::EventType::GovernanceReconfigured,
+            actor_did.to_owned(),
+            timestamp_secs,
+        ),
+        plan_encoded_leaf(
+            scp_event_log::EventType::GovernanceDeadlockRecovery,
+            actor_did,
+            &scp_event_log::payload::GovernanceDeadlockRecoveryPayload {
+                unavailable_dids: justification
+                    .unavailable_dids
+                    .iter()
+                    .map(|d| d.0.clone())
+                    .collect(),
+                missed_windows: justification
+                    .missed_windows
+                    .iter()
+                    .map(|(d, n)| (d.0.clone(), *n))
+                    .collect(),
+                detected_at: justification.detected_at,
+            },
+            timestamp_secs,
+        )?,
+    ];
     cell.commit_class_s_restore(deps, context_id, |mut view| {
         require_active(&view.handle)?;
 
@@ -3517,60 +3364,10 @@ pub async fn execute_reconfigure_governance(
                 )));
             }
         }
+        view.enqueue_counted_log_unit(unit);
         Ok(())
     })
     .await?;
-    deps.event_log
-        .append_context_event(
-            crate::context::builder::AppendMode::AfterSideEffect,
-            &context_id_bytes,
-            scp_event_log::EventType::GovernanceReconfigured,
-            actor_did,
-            timestamp_secs,
-        )
-        .await?;
-    // Inline Class-C counter bump for THIS leaf. This helper appends TWO durable
-    // leaves; each needs its own bump immediately after its `?`-append so a
-    // failure on the second still credits the first (governance_logic.rs:156-158,
-    // §9.9.3 checkpoint-position drift).
-    *cell.class_c_view().checkpoint_events_since_mut() += 1;
-
-    // Append the companion GovernanceDeadlockRecovery leaf carrying the
-    // structured recovery justification (issue #1847).  The two leaves share
-    // the same actor_did and timestamp so verifiers can correlate them.
-    // Fail-closed (error-surfaced, not atomically co-present): the signer
-    // removal and the GovernanceReconfigured leaf above are already durable
-    // by this point, so an append failure here does not roll back the
-    // reconfiguration.  Fail-closed is still preferred over best-effort
-    // because it surfaces the failure to the caller rather than swallowing
-    // it silently, giving operators a concrete error signal to investigate.
-    let recovery_payload = scp_event_log::payload::encode_payload(
-        &scp_event_log::payload::GovernanceDeadlockRecoveryPayload {
-            unavailable_dids: justification
-                .unavailable_dids
-                .iter()
-                .map(|d| d.0.clone())
-                .collect(),
-            missed_windows: justification
-                .missed_windows
-                .iter()
-                .map(|(d, n)| (d.0.clone(), *n))
-                .collect(),
-            detected_at: justification.detected_at,
-        },
-    )
-    .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
-    deps.event_log
-        .append_context_event_with_payload(
-            crate::context::builder::AppendMode::AfterSideEffect,
-            &context_id_bytes,
-            scp_event_log::EventType::GovernanceDeadlockRecovery,
-            actor_did,
-            recovery_payload,
-            timestamp_secs,
-        )
-        .await?;
-    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -3593,13 +3390,11 @@ pub async fn execute_set_economic_policy(
     scp_protocol::economy::policy::validate_economic_policy_metrics(Some(policy))
         .map_err(|e| ContextError::PermissionDenied(format!("invalid economic policy: {e}")))?;
 
-    let context_id_bytes = context_id_to_bytes(context_id);
-
     // Staging a pending economic-policy change is Class-C governance config. The
     // validation + active-state + locked/already-pending guards read through
     // the cell's `Deref`; the pending-change set + notification emit (Class-C)
-    // ride `commit_class_c_best_effort`, preserving the prior best-effort
-    // persist exactly. The notification `emit` is inlined as `emit_event_into`
+    // ride the same fail-closed persist as the queued record. The notification
+    // `emit` is inlined as `emit_event_into`
     // over the view's `receive_buffer_mut()` (identical to the free `emit`
     // helper, which the airtight Class-C view cannot be handed whole-state to).
     require_active(&cell.handle)?;
@@ -3640,7 +3435,8 @@ pub async fn execute_set_economic_policy(
     let notified_at = timestamp_secs;
     let effective_at = notified_at + ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS;
     let observed_at = deps.clock.now_secs();
-    cell.commit_class_c_best_effort(deps, context_id, |mut view| {
+    {
+        let mut view = cell.class_c_view();
         *view
             .governance_class_c_mut()
             .pending_economic_policy_change_mut() = Some(PendingEconomicPolicyChange {
@@ -3661,19 +3457,18 @@ pub async fn execute_set_economic_policy(
             context_id,
             deps.event_tx.as_ref(),
         );
-    })
-    .await;
-    deps.event_log
-        .append_context_event(
-            crate::context::builder::AppendMode::AfterSideEffect,
-            &context_id_bytes,
+    }
+    queue_log_unit(
+        cell,
+        deps,
+        context_id,
+        vec![LeafSpec::without_payload(
             scp_event_log::EventType::EconomicPolicyChanged,
-            actor_did,
+            actor_did.to_owned(),
             timestamp_secs,
-        )
-        .await?;
-    *cell.class_c_view().checkpoint_events_since_mut() += 1;
-    Ok(())
+        )],
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -3695,50 +3490,37 @@ pub async fn execute_approve_spend(
         actor_did,
         timestamp_secs,
     } = meta;
-    let context_id_bytes = context_id_to_bytes(context_id);
 
     // Granting spend budget is Class-C governance state. The fallible guards
-    // read through the cell's `Deref`; the `budget_tracker.grant` (Class-C)
-    // rides `commit_class_c_best_effort`, preserving the prior best-effort
-    // persist exactly.
+    // read through the cell's `Deref`; the `budget_tracker.grant` (Class-C) is
+    // persisted fail-closed by `queue_log_unit` together with the queued
+    // `SpendApproved` record, which needs a durable home once the grant is
+    // made (spec 17 §17.3 "Event log write failures"). The record also counts
+    // toward the §9.9.3 checkpoint triggers, so a context whose only
+    // governance traffic is ApproveSpend still mints checkpoints.
     require_active(&cell.handle)?;
 
     if !cell.membership.contains(spender.as_ref()) {
         return Err(ContextError::MemberNotFound(spender.to_string()));
     }
 
-    cell.commit_class_c_best_effort(deps, context_id, |mut view| {
-        view.governance_class_c_mut()
-            .budget_tracker_mut()
-            .grant(spender, amount);
-    })
-    .await;
-    let spend_payload =
-        scp_event_log::payload::encode_payload(&scp_event_log::payload::SpendApprovedPayload {
+    // Planned before the grant, so an entry the append would refuse refuses
+    // the grant before its step.
+    let leaf = plan_encoded_leaf(
+        scp_event_log::EventType::SpendApproved,
+        actor_did,
+        &scp_event_log::payload::SpendApprovedPayload {
             spender: spender.as_ref().to_owned(),
             amount: amount.value(),
             purpose: purpose.to_owned(),
-        })
-        .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
-    deps.event_log
-        .append_context_event_with_payload(
-            crate::context::builder::AppendMode::AfterSideEffect,
-            &context_id_bytes,
-            scp_event_log::EventType::SpendApproved,
-            actor_did,
-            spend_payload,
-            timestamp_secs,
-        )
-        .await?;
-    // Class-C counter bump for the SpendApproved leaf, inline immediately after
-    // its `?`-append. The counter must track the true durable-leaf count
-    // (governance_logic.rs:156-158): `create_checkpoint_if_due_view`
-    // (queries_helpers.rs) gates BOTH §9.9.3 triggers on it — `events_since >=
-    // 50` and `events_since > 0 && elapsed >= 600` — so a context whose only
-    // governance traffic is ApproveSpend would never mint a checkpoint at all,
-    // and a mixed context drifts its checkpoint position by one leaf per grant.
-    *cell.class_c_view().checkpoint_events_since_mut() += 1;
-    Ok(())
+        },
+        timestamp_secs,
+    )?;
+    cell.class_c_view()
+        .governance_class_c_mut()
+        .budget_tracker_mut()
+        .grant(spender, amount);
+    queue_log_unit(cell, deps, context_id, vec![leaf]).await
 }
 
 // ---------------------------------------------------------------------------
@@ -3756,14 +3538,13 @@ pub async fn execute_lock_economic_policy(
         actor_did,
         timestamp_secs,
     } = meta;
-    let context_id_bytes = context_id_to_bytes(context_id);
 
     // Locking the economic policy is Class-C governance config. The active-state
     // gate + presence/already-locked checks read through the cell's `Deref`;
-    // the `locked = true` set (Class-C) rides `commit_class_c_best_effort`,
-    // preserving the prior best-effort persist exactly. The reject checks run
-    // BEFORE the commit closure (the closure is infallible) so a rejected lock
-    // triggers no persist, matching the prior reject-before-persist behaviour.
+    // the `locked = true` set (Class-C) is persisted fail-closed by
+    // `queue_log_unit` together with the queued `EconomicPolicyLocked` record
+    // (spec 17 §17.3 "Event log write failures"). The reject checks run BEFORE
+    // the set, so a rejected lock triggers no persist.
     require_active(&cell.handle)?;
 
     match &cell.governance.economic_policy {
@@ -3780,23 +3561,24 @@ pub async fn execute_lock_economic_policy(
         Some(_) => {}
     }
 
-    cell.commit_class_c_best_effort(deps, context_id, |mut view| {
-        if let Some(policy) = view.governance_class_c_mut().economic_policy_mut() {
-            policy.locked = true;
-        }
-    })
-    .await;
-    deps.event_log
-        .append_context_event(
-            crate::context::builder::AppendMode::AfterSideEffect,
-            &context_id_bytes,
+    if let Some(policy) = cell
+        .class_c_view()
+        .governance_class_c_mut()
+        .economic_policy_mut()
+    {
+        policy.locked = true;
+    }
+    queue_log_unit(
+        cell,
+        deps,
+        context_id,
+        vec![LeafSpec::without_payload(
             scp_event_log::EventType::EconomicPolicyLocked,
-            actor_did,
+            actor_did.to_owned(),
             timestamp_secs,
-        )
-        .await?;
-    *cell.class_c_view().checkpoint_events_since_mut() += 1;
-    Ok(())
+        )],
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -3815,7 +3597,6 @@ pub async fn execute_modify_hard_rate_limit(
         actor_did,
         timestamp_secs,
     } = meta;
-    let context_id_bytes = context_id_to_bytes(context_id);
 
     new_config.validate().map_err(|e| {
         ContextError::GovernanceFailed(format!(
@@ -3825,11 +3606,11 @@ pub async fn execute_modify_hard_rate_limit(
 
     // The hard rate limiter is Class-C defense-in-depth state. Validation +
     // the preserved-state snapshot read happen BEFORE the commit (reading the
-    // limiter through the cell's `Deref`); the limiter REPLACEMENT (Class-C)
-    // rides `commit_class_c_best_effort`, preserving the prior best-effort
-    // persist exactly. A validation/sanitization reject returns `Err` before
-    // the commit closure runs, so no persist fires — matching the prior
-    // reject-before-persist behaviour.
+    // limiter through the cell's `Deref`); the limiter REPLACEMENT (Class-C) is
+    // persisted fail-closed by `queue_log_unit` together with the queued
+    // `HardRateLimitModified` record (spec 17 §17.3 "Event log write
+    // failures"). A validation/sanitization reject returns `Err` before the
+    // replacement, so no persist fires.
     require_active(&cell.handle)?;
 
     let mut preserved_state = cell.governance.hard_rate_limit.snapshot_entries();
@@ -3844,25 +3625,24 @@ pub async fn execute_modify_hard_rate_limit(
             "ModifyHardRateLimit: preserved state sanitization failed: {e}"
         ))
     })?;
-    cell.commit_class_c_best_effort(deps, context_id, |mut view| {
-        *view.governance_class_c_mut().hard_rate_limit_mut() =
-            scp_protocol::economy::antispam::TokenBucketLimiter::from_snapshot(
-                new_config.clone(),
-                preserved_state,
-            );
-    })
-    .await;
-    deps.event_log
-        .append_context_event(
-            crate::context::builder::AppendMode::AfterSideEffect,
-            &context_id_bytes,
+    *cell
+        .class_c_view()
+        .governance_class_c_mut()
+        .hard_rate_limit_mut() = scp_protocol::economy::antispam::TokenBucketLimiter::from_snapshot(
+        new_config.clone(),
+        preserved_state,
+    );
+    queue_log_unit(
+        cell,
+        deps,
+        context_id,
+        vec![LeafSpec::without_payload(
             scp_event_log::EventType::HardRateLimitModified,
-            actor_did,
+            actor_did.to_owned(),
             timestamp_secs,
-        )
-        .await?;
-    *cell.class_c_view().checkpoint_events_since_mut() += 1;
-    Ok(())
+        )],
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -3947,7 +3727,6 @@ pub async fn execute_modify_pseudonym_rotation_policy(
         actor_did,
         timestamp_secs,
     } = meta;
-    let context_id_bytes = context_id_to_bytes(context_id);
 
     if let Some(policy) = &new_policy {
         policy.validate().map_err(|e| {
@@ -3969,6 +3748,11 @@ pub async fn execute_modify_pseudonym_rotation_policy(
     // interval boundaries that passed before the change trigger nothing, and a
     // pending membership trigger survives only under `on_membership_change`.
     let now_secs = deps.clock.now_secs();
+    let leaf = LeafSpec::without_payload(
+        scp_event_log::EventType::PseudonymRotationPolicyModified,
+        actor_did.to_owned(),
+        timestamp_secs,
+    );
     cell.commit_class_s_keep(deps, context_id, |mut view| {
         let state = view.rest_mut();
         state.handle.set_pseudonym_rotation(new_policy);
@@ -3976,19 +3760,10 @@ pub async fn execute_modify_pseudonym_rotation_policy(
             .class_s
             .pseudonym_rotation
             .anchor_schedule(new_policy.as_ref(), now_secs);
+        view.enqueue_counted_log_unit(vec![leaf]);
         Ok(())
     })
     .await?;
-    deps.event_log
-        .append_context_event(
-            crate::context::builder::AppendMode::AfterSideEffect,
-            &context_id_bytes,
-            scp_event_log::EventType::PseudonymRotationPolicyModified,
-            actor_did,
-            timestamp_secs,
-        )
-        .await?;
-    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -4034,8 +3809,6 @@ pub fn execute_propose_context_migration<'a>(
         timestamp_secs,
     } = meta;
     Box::pin(async move {
-        let context_id_bytes = context_id_to_bytes(context_id);
-
         let destination_context_id = migration_destination_id(context_id, &proposal_id);
         let MigrationBootstrap {
             guard: bootstrap_guard,
@@ -4225,18 +3998,20 @@ pub fn execute_propose_context_migration<'a>(
             let _ = tx.send((context_id.to_owned(), strip_event_payload(&started_event)));
         }
 
-        crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, context_id)
-            .await;
-        deps.event_log
-            .append_context_event(
-                crate::context::builder::AppendMode::AfterSideEffect,
-                &context_id_bytes,
+        // The staging above and the `ContextMigrationStarted` record ride one
+        // fail-closed keep persist; the record needs a durable home once the
+        // destination exists (spec 17 §17.3 "Event log write failures").
+        queue_log_unit(
+            cell,
+            deps,
+            context_id,
+            vec![LeafSpec::without_payload(
                 scp_event_log::EventType::ContextMigrationStarted,
-                actor_did,
+                actor_did.to_owned(),
                 timestamp_secs,
-            )
-            .await?;
-        *cell.class_c_view().checkpoint_events_since_mut() += 1;
+            )],
+        )
+        .await?;
 
         Ok(MigrationProposedResult {
             destination_context_id,
@@ -4265,7 +4040,6 @@ pub async fn execute_cancel_context_migration(
         actor_did,
         timestamp_secs,
     } = meta;
-    let context_id_bytes = context_id_to_bytes(context_id);
 
     // Reads via the cell's `Deref`; `transition_to` takes `&self`.
     let s = cell.handle.state();
@@ -4274,6 +4048,27 @@ pub async fn execute_cancel_context_migration(
             "context is not in MigratingOut state — cannot cancel migration".to_owned(),
         ));
     }
+    // The cancellation's record names the proposal it cancels, so it is read
+    // and the leaf planned before the transition: a missing migration state or
+    // a refused leaf refuses the cancel with the context still MigratingOut
+    // (spec 17 §17.3 "Event log write failures").
+    let original_proposal_id = cell
+        .migration_state
+        .as_ref()
+        .map(|migration| migration.proposal_id)
+        .ok_or_else(|| {
+            ContextError::PermissionDenied(
+                "no migration state found despite MigratingOut state".to_owned(),
+            )
+        })?;
+    let leaf = plan_encoded_leaf(
+        scp_event_log::EventType::ContextMigrationCancelled,
+        actor_did,
+        &scp_event_log::payload::ContextMigrationCancelledPayload {
+            original_proposal_id,
+        },
+        timestamp_secs,
+    )?;
 
     cell.handle
         .transition_to(&ContextState::Active)
@@ -4284,15 +4079,11 @@ pub async fn execute_cancel_context_migration(
         })?;
 
     // Class-C migration-state clear + cancel-event emit run after the
-    // transition await, in a short non-persisting view borrow.
-    let original_proposal_id = {
+    // transition, in a short non-persisting view borrow; the queued record
+    // and they ride one fail-closed keep persist.
+    {
         let mut view = cell.class_c_view();
-        let migration = view.migration_state_mut().take().ok_or_else(|| {
-            ContextError::PermissionDenied(
-                "no migration state found despite MigratingOut state".to_owned(),
-            )
-        })?;
-        let original_proposal_id = migration.proposal_id;
+        *view.migration_state_mut() = None;
         view.emit_event(
             ContextEvent::ContextMigrationCancelled {
                 original_proposal_id,
@@ -4300,28 +4091,8 @@ pub async fn execute_cancel_context_migration(
             context_id,
             deps.event_tx.as_ref(),
         );
-        original_proposal_id
-    };
-
-    crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, context_id).await;
-    let cancel_payload = scp_event_log::payload::encode_payload(
-        &scp_event_log::payload::ContextMigrationCancelledPayload {
-            original_proposal_id,
-        },
-    )
-    .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
-    deps.event_log
-        .append_context_event_with_payload(
-            crate::context::builder::AppendMode::AfterSideEffect,
-            &context_id_bytes,
-            scp_event_log::EventType::ContextMigrationCancelled,
-            actor_did,
-            cancel_payload,
-            timestamp_secs,
-        )
-        .await?;
-    *cell.class_c_view().checkpoint_events_since_mut() += 1;
-    Ok(())
+    }
+    queue_log_unit(cell, deps, context_id, vec![leaf]).await
 }
 
 // ---------------------------------------------------------------------------
@@ -4498,27 +4269,27 @@ pub async fn propose_governance_action_inner(
         .governance
         .freeze
         .map(|(_, _, freeze_start)| freeze_start.saturating_add(FREEZE_TIMEOUT_SECONDS));
+    // The freeze-expiry and conflict records this propose produces are
+    // collected in order and queued as one log unit, in a fail-closed keep
+    // persist, before the auto-execute queues its own (spec 17 §17.3 "Event
+    // log write failures"). Each is payload-free, so planning cannot fail.
+    let mut propose_unit: Vec<LeafSpec> = Vec::new();
     let freeze_events = check_and_resolve_expired_freezes(cell, freeze_now);
-    if !freeze_events.is_empty() {
-        let cid_bytes = context_id_to_bytes(context_id);
-        // The freeze was present when `freeze_events` is non-empty (expiry just
-        // fired), so the deadline is always `Some` here.
-        let freeze_ts = freeze_expiry_deadline.unwrap_or(0);
-        for event in &freeze_events {
-            if let GovernanceEvent::ConflictResolved { .. } = event {
-                deps.event_log
-                    .append_context_event(
-                        crate::context::builder::AppendMode::AfterSideEffect,
-                        &cid_bytes,
-                        scp_event_log::EventType::GovernanceFreezeExpired,
-                        proposer_did.as_ref(),
-                        freeze_ts,
-                    )
-                    .await?;
-                *cell.class_c_view().checkpoint_events_since_mut() += 1;
-            }
-        }
-    }
+    // The freeze was present when `freeze_events` is non-empty (expiry just
+    // fired), so the deadline is always `Some` here.
+    let freeze_ts = freeze_expiry_deadline.unwrap_or(0);
+    propose_unit.extend(
+        freeze_events
+            .iter()
+            .filter(|event| matches!(event, GovernanceEvent::ConflictResolved { .. }))
+            .map(|_| {
+                LeafSpec::without_payload(
+                    scp_event_log::EventType::GovernanceFreezeExpired,
+                    proposer_did.as_ref().to_owned(),
+                    freeze_ts,
+                )
+            }),
+    );
 
     let (proposal, events) = cell
         .class_c_view()
@@ -4548,45 +4319,27 @@ pub async fn propose_governance_action_inner(
 
     let in_freeze = cell.governance.freeze.is_some();
 
-    // Emit conflict events to the event log.
-    if !conflict_events.is_empty() {
-        let context_id_bytes = context_id_to_bytes(context_id);
-        let mut conflict_event_count: u64 = 0;
-        for event in &conflict_events {
-            match event {
-                GovernanceEvent::ConflictDetected { .. } => {
-                    deps.event_log
-                        .append_context_event(
-                            crate::context::builder::AppendMode::AfterSideEffect,
-                            &context_id_bytes,
-                            scp_event_log::EventType::GovernanceConflictDetected,
-                            proposer_did.as_ref(),
-                            // Conflict detected deterministically while processing
-                            // this proposal: the convergent leaf timestamp is the
-                            // proposal's signed `created_at` (§7.3.1, §9.9.3).
-                            proposal.created_at,
-                        )
-                        .await?;
-                    conflict_event_count += 1;
-                }
-                GovernanceEvent::ConflictResolved { .. } => {
-                    deps.event_log
-                        .append_context_event(
-                            crate::context::builder::AppendMode::AfterSideEffect,
-                            &context_id_bytes,
-                            scp_event_log::EventType::GovernanceConflictResolved,
-                            proposer_did.as_ref(),
-                            proposal.created_at,
-                        )
-                        .await?;
-                    conflict_event_count += 1;
-                }
-                _ => {}
+    // Conflict records. A conflict is detected deterministically while
+    // processing this proposal, so the convergent leaf timestamp is the
+    // proposal's signed `created_at` (§7.3.1, §9.9.3).
+    propose_unit.extend(conflict_events.iter().filter_map(|event| {
+        let event_type = match event {
+            GovernanceEvent::ConflictDetected { .. } => {
+                scp_event_log::EventType::GovernanceConflictDetected
             }
-        }
-        if conflict_event_count > 0 {
-            *cell.class_c_view().checkpoint_events_since_mut() += conflict_event_count;
-        }
+            GovernanceEvent::ConflictResolved { .. } => {
+                scp_event_log::EventType::GovernanceConflictResolved
+            }
+            _ => return None,
+        };
+        Some(LeafSpec::without_payload(
+            event_type,
+            proposer_did.as_ref().to_owned(),
+            proposal.created_at,
+        ))
+    }));
+    if !propose_unit.is_empty() {
+        queue_log_unit(cell, deps, context_id, propose_unit).await?;
     }
 
     // If the proposal was auto-approved (SingleAdmin), execute
@@ -4616,6 +4369,8 @@ pub async fn propose_governance_action_inner(
     };
 
     crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, context_id).await;
+    // The command's one drain, after every unit this propose queued.
+    let _ = crate::context::log_unit_helpers::drain_pending_log_units(cell, deps, context_id).await;
 
     Ok((proposal, events, execution_result))
 }
@@ -5107,46 +4862,33 @@ pub async fn vote_on_proposal_inner(
             detect_and_handle_conflicts(cell, deps, proposal)
         });
 
-    // Emit conflict events to the event log.
-    if !conflict_events.is_empty() {
-        let context_id_bytes = context_id_to_bytes(context_id);
-        // Conflict detected/resolved deterministically while processing this
-        // approved proposal: the convergent leaf timestamp is the proposal's
-        // signed `created_at` (§7.3.1, §9.9.3).
-        let conflict_ts = proposal_for_execution.as_ref().map_or(0, |p| p.created_at);
-        let mut conflict_event_count: u64 = 0;
-        for event in &conflict_events {
-            match event {
+    // Conflict records, queued as one log unit in a fail-closed keep persist
+    // before the execution queues its own (spec 17 §17.3 "Event log write
+    // failures"). A conflict is detected/resolved deterministically while
+    // processing this approved proposal: the convergent leaf timestamp is the
+    // proposal's signed `created_at` (§7.3.1, §9.9.3).
+    let conflict_ts = proposal_for_execution.as_ref().map_or(0, |p| p.created_at);
+    let conflict_unit: Vec<LeafSpec> = conflict_events
+        .iter()
+        .filter_map(|event| {
+            let event_type = match event {
                 GovernanceEvent::ConflictDetected { .. } => {
-                    deps.event_log
-                        .append_context_event(
-                            crate::context::builder::AppendMode::AfterSideEffect,
-                            &context_id_bytes,
-                            scp_event_log::EventType::GovernanceConflictDetected,
-                            voter_did.as_ref(),
-                            conflict_ts,
-                        )
-                        .await?;
-                    conflict_event_count += 1;
+                    scp_event_log::EventType::GovernanceConflictDetected
                 }
                 GovernanceEvent::ConflictResolved { .. } => {
-                    deps.event_log
-                        .append_context_event(
-                            crate::context::builder::AppendMode::AfterSideEffect,
-                            &context_id_bytes,
-                            scp_event_log::EventType::GovernanceConflictResolved,
-                            voter_did.as_ref(),
-                            conflict_ts,
-                        )
-                        .await?;
-                    conflict_event_count += 1;
+                    scp_event_log::EventType::GovernanceConflictResolved
                 }
-                _ => {}
-            }
-        }
-        if conflict_event_count > 0 {
-            *cell.class_c_view().checkpoint_events_since_mut() += conflict_event_count;
-        }
+                _ => return None,
+            };
+            Some(LeafSpec::without_payload(
+                event_type,
+                voter_did.as_ref().to_owned(),
+                conflict_ts,
+            ))
+        })
+        .collect();
+    if !conflict_unit.is_empty() {
+        queue_log_unit(cell, deps, context_id, conflict_unit).await?;
     }
 
     let invalidated_by_conflict = conflict_events.iter().any(|e| {
@@ -5185,6 +4927,8 @@ pub async fn vote_on_proposal_inner(
     }
 
     crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, context_id).await;
+    // The command's one drain, after every unit this vote queued.
+    let _ = crate::context::log_unit_helpers::drain_pending_log_units(cell, deps, context_id).await;
 
     Ok((status, events))
 }
@@ -5821,7 +5565,14 @@ pub async fn dispatch_governance_action(
             // capabilities after the caller was told the ban applied is the unsafe
             // direction). The reject-before-mutate guards return `Err` from inside
             // the closure (no persist runs); the `suspend_all` + emit (Class-C)
-            // ride the SAME fail-closed persist via `view.rest_mut()`.
+            // ride the SAME fail-closed persist via `view.rest_mut()`, and so
+            // does the queued `MemberSuspendedAll` record (spec 17 §17.3
+            // "Event log write failures").
+            let leaf = LeafSpec::without_payload(
+                scp_event_log::EventType::MemberSuspendedAll,
+                actor.to_owned(),
+                ts,
+            );
             cell.commit_class_s_keep(deps, context_id, |mut view| {
                 let state = view.rest_mut();
                 require_active(&state.handle)?;
@@ -5846,20 +5597,10 @@ pub async fn dispatch_governance_action(
                     context_id,
                     deps,
                 );
+                view.enqueue_counted_log_unit(vec![leaf]);
                 Ok(())
             })
             .await?;
-            let context_id_bytes = context_id_to_bytes(context_id);
-            deps.event_log
-                .append_context_event(
-                    crate::context::builder::AppendMode::AfterSideEffect,
-                    &context_id_bytes,
-                    scp_event_log::EventType::MemberSuspendedAll,
-                    actor,
-                    ts,
-                )
-                .await?;
-            *cell.class_c_view().checkpoint_events_since_mut() += 1;
             Ok(GovernanceActionResult::Executed)
         }
         GovernanceAction::RevokeAccess { did, access } => {
@@ -6666,6 +6407,12 @@ async fn discharge_and_order_governance_action(
         .approved_proposals
         .remove(&proposal.proposal_id);
     let persist_result = discharge.commit_fail_closed(deps, context_id).await;
+    // The per-action helpers queue their records and never drain, so the
+    // records are written here, after the persist that made them durable
+    // (spec 17 §17.3 "Event log write failures"). A failed drain leaves them
+    // queued for the next drain and logs its own error; the action's step is
+    // already durable, so a failed drain does not fail the action.
+    let _ = crate::context::log_unit_helpers::drain_pending_log_units(cell, deps, context_id).await;
     let result = match dispatch_outcome {
         Ok(result) => result,
         Err(dispatch_err) => {
@@ -8748,5 +8495,268 @@ mod commit_broadcast_retry_tests {
                 "the clock did advance inside the sign"
             );
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod queued_record_tests {
+    //! Spec 17 §17.3 "Event log write failures": a governance step whose
+    //! record is written after the step queues that record in the step's
+    //! fail-closed persist. A log that refuses every entry write therefore
+    //! fails no step: the step lands, its record waits in the queue, and the
+    //! log is untouched until a drain writes it.
+
+    use std::sync::Arc;
+
+    use scp_did::DID;
+    use scp_event_log::EventType;
+    use scp_protocol::context::broadcast::{BroadcastAdmission, BroadcastContext};
+    use scp_protocol::context::governance::{AccessScope, SignedVote, VoteType};
+    use scp_protocol::context::roles::{Capability, CapabilityCeiling, ContextRoleState};
+    use scp_protocol::context::{ContextMode, ContextParams, ContextState};
+
+    use super::CommitMeta;
+    use crate::context::ContextHandle;
+    use crate::context::actor::class_s::ClassSCell;
+    use crate::context::actor::deps::ActorDeps;
+    use crate::context::actor::state::PerContextState;
+    use crate::context::log_unit_helpers::test_support::{
+        deps_with, fail_log_entry_writes, faulty_merkle_log, log_len, queued_unit_types,
+    };
+    use crate::context::supervisor::faulty_storage::FaultyStorage;
+
+    const ADMIN: &str = "did:dht:z6MkQueuedRecordAdmin";
+    const TARGET: &str = "did:dht:z6MkQueuedRecordTarget";
+    const AUTHOR: &str = "did:dht:z6MkQueuedRecordAuthor";
+    const CREATED: u64 = 1_700_000_000;
+    const TTL: u64 = 3_600;
+    const TS: u64 = CREATED + 10;
+
+    fn did(s: &str) -> DID {
+        DID(s.to_owned())
+    }
+
+    const fn meta() -> CommitMeta<'static> {
+        CommitMeta {
+            pid: [0x3C; 32],
+            actor_did: ADMIN,
+            timestamp_secs: TS,
+        }
+    }
+
+    /// An active context with a one-hour TTL whose ceiling holds `MemberBan`,
+    /// with `ADMIN` and `TARGET` as members. `broadcast` makes it a broadcast
+    /// context with `AUTHOR` registered, so a read ban rotates a key.
+    fn cell(ctx: [u8; 32], broadcast: bool) -> ClassSCell {
+        let mut state = if broadcast {
+            PerContextState::new_for_test_broadcast(ctx, CREATED, did(ADMIN))
+        } else {
+            PerContextState::new_for_test_encrypted(ctx, CREATED, did(ADMIN))
+        };
+        let ctx_hex = hex::encode(ctx);
+        let ceiling = [
+            Capability::MessagesRead,
+            Capability::MessagesWrite,
+            Capability::MemberBan,
+        ];
+        state.handle = ContextHandle::new(
+            ctx_hex.clone(),
+            ContextParams {
+                ceiling: ceiling.to_vec(),
+                ttl: Some(std::time::Duration::from_secs(TTL)),
+                ..ContextParams::default()
+            },
+        );
+        state
+            .handle
+            .transition_to(&ContextState::Active)
+            .expect("activate");
+        state.role_state = ContextRoleState::new(
+            ctx_hex.clone(),
+            ADMIN,
+            CapabilityCeiling::new(ceiling),
+            Vec::new(),
+            &scp_clock::SystemClock,
+        )
+        .expect("role state");
+        state.role_state.members.insert(TARGET.to_owned());
+        state
+            .membership
+            .add_member(did(ADMIN), "admin".to_owned(), vec![]);
+        state
+            .membership
+            .add_member(did(TARGET), "member".to_owned(), vec![]);
+        if broadcast {
+            let mut bc =
+                BroadcastContext::new(ctx_hex, &ContextMode::Broadcast, BroadcastAdmission::Open)
+                    .expect("broadcast context");
+            bc.add_author(AUTHOR).expect("add author");
+            state.broadcast_context = Some(bc);
+        }
+        ClassSCell::new(state)
+    }
+
+    /// Deps over a Merkle log that refuses every entry write of `ctx`. The
+    /// storage handle is returned so the refusal lives as long as the test.
+    async fn refusing_log_deps(ctx: [u8; 32]) -> (ActorDeps, Arc<FaultyStorage>) {
+        let (log, faulty) = faulty_merkle_log();
+        let deps = deps_with(ADMIN, None, Box::new(log)).await;
+        deps.event_log
+            .init_event_log(&ctx)
+            .await
+            .expect("init event log");
+        fail_log_entry_writes(&faulty, &ctx);
+        (deps, faulty)
+    }
+
+    fn assert_queued_only(cell: &ClassSCell, deps: &ActorDeps, ctx: &[u8; 32], want: &[EventType]) {
+        assert_eq!(
+            queued_unit_types(&cell.class_s.pending_log_units),
+            vec![want.to_vec()],
+            "the step queues its record as one unit"
+        );
+        assert_eq!(log_len(deps, ctx), 0, "the refusing log holds no entry");
+    }
+
+    #[tokio::test]
+    async fn suspend_queues_its_record_when_the_log_refuses_writes() {
+        let ctx = [0x61u8; 32];
+        let (deps, _faulty) = refusing_log_deps(ctx).await;
+        let mut cell = cell(ctx, false);
+
+        super::execute_suspend_member(
+            &mut cell,
+            &deps,
+            &hex::encode(ctx),
+            &did(TARGET),
+            &[Capability::MessagesWrite],
+            meta(),
+        )
+        .await
+        .expect("the suspension lands though the log refuses writes");
+
+        assert!(
+            cell.role_state
+                .suspended_for(TARGET)
+                .is_some_and(|caps| caps.contains(&Capability::MessagesWrite)),
+            "the suspension is applied"
+        );
+        assert_queued_only(&cell, &deps, &ctx, &[EventType::MemberSuspended]);
+    }
+
+    #[tokio::test]
+    async fn revoke_queues_its_record_and_key_epoch_advance_when_the_log_refuses_writes() {
+        let ctx = [0x62u8; 32];
+        let (deps, _faulty) = refusing_log_deps(ctx).await;
+        let mut cell = cell(ctx, true);
+
+        let rotated = super::execute_revoke(
+            &mut cell,
+            &deps,
+            &hex::encode(ctx),
+            &did(TARGET),
+            AccessScope::Read,
+            meta(),
+        )
+        .await
+        .expect("the revoke lands though the log refuses writes");
+
+        assert_eq!(rotated, 1, "the ban rotates the one author's key");
+        assert!(
+            cell.access.read_exclusion_list.contains(&did(TARGET)),
+            "the read revocation is applied"
+        );
+        assert_queued_only(
+            &cell,
+            &deps,
+            &ctx,
+            &[EventType::AccessRevoked, EventType::KeyEpochAdvance],
+        );
+    }
+
+    #[tokio::test]
+    async fn add_member_queues_its_record_when_the_log_refuses_writes() {
+        const JOINER: &str = "did:dht:z6MkQueuedRecordJoiner";
+        let ctx = [0x63u8; 32];
+        let (deps, _faulty) = refusing_log_deps(ctx).await;
+        let mut cell = cell(ctx, false);
+
+        super::execute_add_member(
+            &mut cell,
+            &deps,
+            &hex::encode(ctx),
+            &did(JOINER),
+            "member",
+            None,
+            meta(),
+        )
+        .await
+        .expect("the add lands though the log refuses writes");
+
+        assert!(cell.membership.contains(JOINER), "the member is added");
+        assert_queued_only(&cell, &deps, &ctx, &[EventType::MemberJoined]);
+    }
+
+    #[tokio::test]
+    async fn change_role_queues_its_record_when_the_log_refuses_writes() {
+        let ctx = [0x64u8; 32];
+        let (deps, _faulty) = refusing_log_deps(ctx).await;
+        let mut cell = cell(ctx, false);
+
+        super::execute_change_role(
+            &mut cell,
+            &deps,
+            &hex::encode(ctx),
+            &did(TARGET),
+            "observer",
+            meta(),
+        )
+        .await
+        .expect("the role change lands though the log refuses writes");
+
+        assert_eq!(
+            cell.membership.get(TARGET).map(|m| m.role_name.as_str()),
+            Some("observer"),
+            "the role change is applied"
+        );
+        assert_queued_only(&cell, &deps, &ctx, &[EventType::RoleAssigned]);
+    }
+
+    #[tokio::test]
+    async fn extend_ttl_queues_its_record_when_the_log_refuses_writes() {
+        const ADDITIONAL: u64 = 600;
+        let ctx = [0x65u8; 32];
+        let (deps, _faulty) = refusing_log_deps(ctx).await;
+        let mut cell = cell(ctx, false);
+        // `execute_extend_ttl` tallies `voter_did` only; the engine verified
+        // each vote when it approved the proposal.
+        let approvals: Vec<SignedVote> = [ADMIN, TARGET]
+            .into_iter()
+            .map(|voter| SignedVote {
+                voter_did: did(voter),
+                vote: VoteType::Approve,
+                timestamp: TS,
+                signature: vec![0; 64],
+            })
+            .collect();
+
+        super::execute_extend_ttl(
+            &mut cell,
+            &deps,
+            &hex::encode(ctx),
+            ADDITIONAL,
+            &approvals,
+            meta(),
+        )
+        .await
+        .expect("the extension lands though the log refuses writes");
+
+        assert_eq!(
+            cell.ttl.timer.deadline_unix_secs,
+            Some(CREATED + TTL + ADDITIONAL),
+            "the timer arms the extended deadline"
+        );
+        assert_queued_only(&cell, &deps, &ctx, &[EventType::TtlExtended]);
     }
 }

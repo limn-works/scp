@@ -3968,38 +3968,36 @@ async fn unsubscribe_broadcast_counter_with_kea() {
 }
 
 // =========================================================================
-// KeyEpochAdvance append failure after a durable epoch advance.
+// A refused KeyEpochAdvance write after a durable epoch advance.
 //
-// `execute_revoke` and `execute_rotate_content_keys` append their per-author
-// `KeyEpochAdvance` leaves AFTER `commit_class_s_keep` has durably persisted
-// the ban / every author's epoch advance and after the `AccessRevoked` /
-// `ContentKeysRotated` leaf is durable. `execute_governance_action` removes
-// the proposal's `executed_proposals` replay marker on every dispatch `Err`,
-// and neither `governance_ban_subscriber` nor `rotate_all_author_keys` has
-// an already-applied early return, so an `Err` from the KEA loop would let a
-// retry of the same proposal advance every author's epoch a second time and
-// append a second anchor leaf (§9.9.3 reads the log divergence as
-// equivocation). The loop therefore logs the miss and continues.
+// `execute_revoke` and `execute_rotate_content_keys` queue their anchor
+// record (`AccessRevoked` / `ContentKeysRotated`) and one `KeyEpochAdvance`
+// per rotated author as one pending log unit inside the fail-closed persist
+// that makes the ban / every author's epoch advance durable (spec 17 §17.3
+// "Event log write failures"; SCP-349). Neither helper writes to the log
+// after its step, so a log that refuses the unit cannot fail the proposal:
+// an `Err` there would tell `execute_governance_action` the action failed
+// after its non-idempotent effect landed. The refused unit stays queued at
+// its reserved position and the next drain writes it whole, ahead of any
+// later operation's records (§5.14.8: no record lands at a later position).
 //
-// These tests inject a failure on the second `KeyEpochAdvance` append and
-// assert: the proposal executes (`Ok`, `Approved`), exactly one anchor leaf
-// lands, the author whose append succeeded has its leaf, and the checkpoint
-// counter equals the durable-leaf delta (the failed leaf is not credited).
-// On a `?`-propagating loop, `propose_governance_action` returns
-// `Err(EventLogFailed)` and the first assertion fails.
+// These tests refuse the first unit write that carries a `KeyEpochAdvance`
+// and assert: the proposal executes (`Ok`, `Approved`), the unit lands
+// exactly once and whole (anchor then one `KeyEpochAdvance` per author), and
+// the checkpoint counter equals the durable-leaf delta.
 // =========================================================================
 
 /// A `ContextEventLogProvider` that delegates to a real
-/// `MerkleEventLogProvider` and fails the `fail_on_nth` (1-based)
-/// `KeyEpochAdvance` append it sees. Every other event type appends normally.
-struct FailNthKeaEventLog {
+/// `MerkleEventLogProvider` and refuses, once, the first unit write that
+/// carries a `KeyEpochAdvance` record, before any of its records lands.
+/// Every other write passes through.
+struct RefuseFirstKeaUnitEventLog {
     inner: scp_runtime::context::providers::MerkleEventLogProvider,
-    kea_appends_seen: AtomicUsize,
-    fail_on_nth: usize,
+    kea_units_refused: Arc<AtomicUsize>,
 }
 
 #[async_trait::async_trait]
-impl ContextEventLogProvider for FailNthKeaEventLog {
+impl ContextEventLogProvider for RefuseFirstKeaUnitEventLog {
     async fn init_event_log(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
         self.inner.init_event_log(id).await
     }
@@ -4011,14 +4009,6 @@ impl ContextEventLogProvider for FailNthKeaEventLog {
         payload: scp_event_log::EventPayload,
         timestamp_secs: u64,
     ) -> Result<(), ContextCreationError> {
-        if event_type == scp_event_log::EventType::KeyEpochAdvance {
-            let n = self.kea_appends_seen.fetch_add(1, Ordering::SeqCst) + 1;
-            if n == self.fail_on_nth {
-                return Err(ContextCreationError::EventLogFailed(format!(
-                    "injected failure on KeyEpochAdvance append #{n}"
-                )));
-            }
-        }
         self.inner
             .append_event(id, event_type, actor_did, payload, timestamp_secs)
             .await
@@ -4032,25 +4022,59 @@ impl ContextEventLogProvider for FailNthKeaEventLog {
     ) -> Result<Option<Vec<scp_event_log::Event>>, ContextError> {
         self.inner.event_log_entries(id)
     }
+    async fn lock_for_unit(
+        &self,
+        id: &[u8; 32],
+    ) -> Result<scp_runtime::context::builder::UnitWriteGuard, ContextCreationError> {
+        self.inner.lock_for_unit(id).await
+    }
+    async fn append_unit(
+        &self,
+        guard: scp_runtime::context::builder::UnitWriteGuard,
+        base_seq: u64,
+        leaves: &[scp_runtime::context::state::LeafSpec],
+    ) -> Result<
+        scp_runtime::context::builder::UnitAppended,
+        scp_runtime::context::builder::UnitAppendError,
+    > {
+        let carries_kea = leaves
+            .iter()
+            .any(|leaf| leaf.event_type() == scp_event_log::EventType::KeyEpochAdvance);
+        if carries_kea
+            && self
+                .kea_units_refused
+                .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            return Err(scp_runtime::context::builder::UnitAppendError::Failed(
+                ContextCreationError::EventLogFailed(
+                    "injected refusal of the first KeyEpochAdvance unit".to_owned(),
+                ),
+            ));
+        }
+        self.inner.append_unit(guard, base_seq, leaves).await
+    }
 }
 
-/// Like [`new_manager_with_real_event_log`] but the event log fails the
-/// `fail_on_nth` `KeyEpochAdvance` append.
-fn new_manager_with_failing_kea_event_log(fail_on_nth: usize) -> std::sync::Arc<Supervisor> {
+/// Like [`new_manager_with_real_event_log`] but the event log refuses the
+/// first unit write that carries a `KeyEpochAdvance` record. Returns the
+/// refusal counter, which reads 1 once the refusal happened.
+fn new_manager_refusing_first_kea_unit() -> (std::sync::Arc<Supervisor>, Arc<AtomicUsize>) {
     use scp_runtime::context::providers::MerkleEventLogProvider;
-    scp_runtime::context::test_supervisor(
+    let refused = Arc::new(AtomicUsize::new(0));
+    let manager = scp_runtime::context::test_supervisor(
         Arc::new(NodeMlsFactory::new(
             "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         )),
         Box::new(MockTransport::connected()),
-        Box::new(FailNthKeaEventLog {
+        Box::new(RefuseFirstKeaUnitEventLog {
             inner: MerkleEventLogProvider::new(),
-            kea_appends_seen: AtomicUsize::new(0),
-            fail_on_nth,
+            kea_units_refused: Arc::clone(&refused),
         }),
         mock_key_resolver(),
-    )
+    );
+    (manager, refused)
 }
 
 /// Creates a two-author broadcast context (alice + seeded bob) with carol
@@ -4089,139 +4113,121 @@ async fn two_author_broadcast_with_subscriber(manager: &Arc<Supervisor>, ctx_id:
     scp_protocol::context::context_id_bytes(ctx_id)
 }
 
+/// Proposes `action` from alice on a context whose log refuses the first
+/// `KeyEpochAdvance` unit, then asserts the proposal executed and the refused
+/// unit landed once and whole: `anchor` directly followed by one
+/// `KeyEpochAdvance` per author, and the counter delta equal to the durable
+/// delta (`GovernanceProposed` + anchor + 2 `KeyEpochAdvance`).
+async fn assert_refused_kea_unit_lands_whole(
+    manager: &Arc<Supervisor>,
+    refused: &AtomicUsize,
+    ctx_id: &str,
+    ctx_bytes: &[u8; 32],
+    action: GovernanceAction,
+    anchor: scp_event_log::EventType,
+) {
+    let baseline = manager
+        .event_log_entries(ctx_bytes)
+        .unwrap()
+        .expect("event log must exist")
+        .len();
+    let counter_before = manager.checkpoint_events_since(ctx_id).await.unwrap();
+
+    let sk_alice = signing_key_for_did(&alice());
+    let (proposal, _events, result) = manager
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            action,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+        )
+        .await
+        .expect(
+            "a refused KeyEpochAdvance write after the durable step must not fail the proposal",
+        );
+    assert_eq!(proposal.status, ProposalStatus::Approved);
+    assert!(result.is_some(), "a SingleAdmin proposal must auto-execute");
+    assert_eq!(
+        refused.load(Ordering::SeqCst),
+        1,
+        "the log refused the KeyEpochAdvance unit once (non-vacuity)"
+    );
+
+    // An actor command drains the queue before it runs.
+    let counter_after = manager.checkpoint_events_since(ctx_id).await.unwrap();
+    let entries = manager
+        .event_log_entries(ctx_bytes)
+        .unwrap()
+        .expect("event log must exist after the step");
+    let anchors: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.event_type == anchor)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(anchors.len(), 1, "the step executed exactly once");
+    let kea: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.event_type == scp_event_log::EventType::KeyEpochAdvance)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        kea,
+        vec![anchors[0] + 1, anchors[0] + 2],
+        "the refused unit landed whole: one KeyEpochAdvance per author, directly after its anchor"
+    );
+    // GovernanceProposed + anchor + 2 KeyEpochAdvance.
+    assert_eq!(entries.len() - baseline, 4);
+    assert_eq!(
+        counter_after - counter_before,
+        (entries.len() - baseline) as u64,
+        "checkpoint_events_since delta must equal the durable-leaf delta"
+    );
+}
+
 #[tokio::test]
-async fn revoke_kea_append_failure_after_durable_ban_does_not_fail_the_proposal() {
-    let manager = new_manager_with_failing_kea_event_log(2);
+async fn revoke_kea_unit_refusal_after_durable_ban_does_not_fail_the_proposal() {
+    let (manager, refused) = new_manager_refusing_first_kea_unit();
     let ctx_id = "ctx-ban-kea-append-failure";
     let ctx_bytes = two_author_broadcast_with_subscriber(&manager, ctx_id).await;
-
-    let baseline = manager
-        .event_log_entries(&ctx_bytes)
-        .unwrap()
-        .expect("event log must exist")
-        .len();
-    let counter_before = manager.checkpoint_events_since(ctx_id).await.unwrap();
-
-    let sk_alice = signing_key_for_did(&alice());
-    let (proposal, _events, result) = manager
-        .propose_governance_action(
-            ctx_id,
-            &alice(),
-            GovernanceAction::RevokeAccess {
-                did: carol(),
-                access: AccessScope::Both,
-            },
-            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
-        )
-        .await
-        .expect(
-            "a KeyEpochAdvance append failure after the durable ban must not fail the proposal",
-        );
-    assert_eq!(proposal.status, ProposalStatus::Approved);
-    assert!(
-        result.is_some(),
-        "SingleAdmin RevokeAccess must auto-execute"
-    );
-
-    let entries = manager
-        .event_log_entries(&ctx_bytes)
-        .unwrap()
-        .expect("event log must exist after ban");
-    let access_revoked = entries
-        .iter()
-        .filter(|e| e.event_type == scp_event_log::EventType::AccessRevoked)
-        .count();
-    let kea = entries
-        .iter()
-        .filter(|e| e.event_type == scp_event_log::EventType::KeyEpochAdvance)
-        .count();
-    assert_eq!(access_revoked, 1, "the ban executed exactly once");
-    assert_eq!(
-        kea, 1,
-        "the first author's KeyEpochAdvance landed; the injected failure dropped the second"
-    );
-    // GovernanceProposed + AccessRevoked + 1 KeyEpochAdvance.
-    assert_eq!(entries.len() - baseline, 3);
-
-    // The failed leaf was never durable, so it is not credited (§9.9.3).
-    let counter_after = manager.checkpoint_events_since(ctx_id).await.unwrap();
-    assert_eq!(
-        counter_after - counter_before,
-        (entries.len() - baseline) as u64,
-        "checkpoint_events_since delta must equal the durable-leaf delta"
-    );
+    assert_refused_kea_unit_lands_whole(
+        &manager,
+        &refused,
+        ctx_id,
+        &ctx_bytes,
+        GovernanceAction::RevokeAccess {
+            did: carol(),
+            access: AccessScope::Both,
+        },
+        scp_event_log::EventType::AccessRevoked,
+    )
+    .await;
 }
 
 #[tokio::test]
-async fn rotate_content_keys_kea_append_failure_after_durable_advance_does_not_fail_the_proposal() {
-    let manager = new_manager_with_failing_kea_event_log(2);
+async fn rotate_content_keys_kea_unit_refusal_after_durable_advance_does_not_fail_the_proposal() {
+    let (manager, refused) = new_manager_refusing_first_kea_unit();
     let ctx_id = "ctx-rotate-kea-append-failure";
     let ctx_bytes = two_author_broadcast_with_subscriber(&manager, ctx_id).await;
-
-    let baseline = manager
-        .event_log_entries(&ctx_bytes)
-        .unwrap()
-        .expect("event log must exist")
-        .len();
-    let counter_before = manager.checkpoint_events_since(ctx_id).await.unwrap();
-
-    let sk_alice = signing_key_for_did(&alice());
-    let (proposal, _events, result) = manager
-        .propose_governance_action(
-            ctx_id,
-            &alice(),
-            GovernanceAction::RotateContentKeys { reason: None },
-            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
-        )
-        .await
-        .expect(
-            "a KeyEpochAdvance append failure after the durable rotation must not fail the proposal",
-        );
-    assert_eq!(proposal.status, ProposalStatus::Approved);
-    assert!(
-        result.is_some(),
-        "SingleAdmin RotateContentKeys must auto-execute"
-    );
-
-    let entries = manager
-        .event_log_entries(&ctx_bytes)
-        .unwrap()
-        .expect("event log must exist after rotation");
-    let rotated = entries
-        .iter()
-        .filter(|e| e.event_type == scp_event_log::EventType::ContentKeysRotated)
-        .count();
-    let kea = entries
-        .iter()
-        .filter(|e| e.event_type == scp_event_log::EventType::KeyEpochAdvance)
-        .count();
-    assert_eq!(rotated, 1, "the rotation executed exactly once");
-    assert_eq!(
-        kea, 1,
-        "the first author's KeyEpochAdvance landed; the injected failure dropped the second"
-    );
-    // GovernanceProposed + ContentKeysRotated + 1 KeyEpochAdvance.
-    assert_eq!(entries.len() - baseline, 3);
-
-    let counter_after = manager.checkpoint_events_since(ctx_id).await.unwrap();
-    assert_eq!(
-        counter_after - counter_before,
-        (entries.len() - baseline) as u64,
-        "checkpoint_events_since delta must equal the durable-leaf delta"
-    );
+    assert_refused_kea_unit_lands_whole(
+        &manager,
+        &refused,
+        ctx_id,
+        &ctx_bytes,
+        GovernanceAction::RotateContentKeys { reason: None },
+        scp_event_log::EventType::ContentKeysRotated,
+    )
+    .await;
 }
 
-/// §5.14.8 *Event-log leaf append failure*: the member MUST NOT append a
-/// dropped `KeyEpochAdvance` leaf at a later position. Drives one fully
-/// successful `RotateContentKeys` after the operation whose second author's
-/// leaf was dropped, then asserts that the second operation appended exactly
-/// one `KeyEpochAdvance` leaf per author and nothing else: the dropped author
-/// holds one leaf in the whole log (the second operation's), the other author
-/// holds two, and both new leaves follow the second operation's
-/// `ContentKeysRotated` anchor. A later-position re-append of the dropped leaf
-/// (in the failing operation, on the next mutation, or on the next rotation)
-/// raises the total to four and turns the per-author split into `[2, 2]`.
-async fn assert_dropped_kea_leaf_is_never_reappended(
+/// §5.14.8: no record of an operation lands at a later position. After the
+/// refused unit of the first operation landed, one fully successful
+/// `RotateContentKeys` appends exactly its own four records after every
+/// record of the first operation: each author then holds two
+/// `KeyEpochAdvance` records, and both new ones follow the follow-up
+/// `ContentKeysRotated` anchor.
+async fn assert_later_rotation_follows_the_refused_unit(
     manager: &Arc<Supervisor>,
     ctx_id: &str,
     ctx_bytes: &[u8; 32],
@@ -4235,25 +4241,24 @@ async fn assert_dropped_kea_leaf_is_never_reappended(
         .filter(|e| e.event_type == scp_event_log::EventType::KeyEpochAdvance)
         .count();
     assert_eq!(
-        kea_before, 1,
-        "precondition: exactly one leaf survived the failing operation"
+        kea_before, 2,
+        "precondition: the refused unit landed with one KeyEpochAdvance per author"
     );
     let counter_before = manager.checkpoint_events_since(ctx_id).await.unwrap();
 
     let sk_alice = signing_key_for_did(&alice());
     // `compute_proposal_id` hashes (context id, proposer DID, JCS(action),
-    // `context.now` in whole seconds). A caller whose failing operation was
+    // `context.now` in whole seconds). A caller whose first operation was
     // `RotateContentKeys { reason: None }` from alice on this context would
     // collide with a second identical proposal inside the same second and
     // `propose` would reject it as `DuplicateProposal`, so the follow-up
-    // rotation carries a distinct `reason` and its proposal id differs from
-    // every caller's first proposal regardless of the wall clock.
+    // rotation carries a distinct `reason`.
     let (proposal, _events, result) = manager
         .propose_governance_action(
             ctx_id,
             &alice(),
             GovernanceAction::RotateContentKeys {
-                reason: Some("follow-up rotation after a dropped KeyEpochAdvance leaf".to_string()),
+                reason: Some("follow-up rotation after a refused KeyEpochAdvance unit".to_string()),
             },
             &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
@@ -4265,10 +4270,19 @@ async fn assert_dropped_kea_leaf_is_never_reappended(
         "SingleAdmin RotateContentKeys must auto-execute"
     );
 
+    let counter_after = manager.checkpoint_events_since(ctx_id).await.unwrap();
     let entries = manager
         .event_log_entries(ctx_bytes)
         .unwrap()
         .expect("event log must exist after the follow-up rotation");
+    let signatures = |events: &[scp_event_log::Event]| -> Vec<Vec<u8>> {
+        events.iter().map(|e| e.signature.clone()).collect()
+    };
+    assert_eq!(
+        entries.get(..entries_before.len()).map(signatures),
+        Some(signatures(&entries_before)),
+        "the follow-up rotation only appends: every earlier record keeps its position"
+    );
     let kea_positions: Vec<usize> = entries
         .iter()
         .enumerate()
@@ -4278,8 +4292,7 @@ async fn assert_dropped_kea_leaf_is_never_reappended(
     assert_eq!(
         kea_positions.len(),
         kea_before + 2,
-        "the follow-up rotation appends exactly one KeyEpochAdvance per author; \
-         a later-position re-append of the dropped leaf would make this four"
+        "the follow-up rotation appends exactly one KeyEpochAdvance per author"
     );
     // GovernanceProposed + ContentKeysRotated + 2 KeyEpochAdvance, and nothing else.
     assert_eq!(
@@ -4295,13 +4308,11 @@ async fn assert_dropped_kea_leaf_is_never_reappended(
     {
         *per_author.entry(e.actor_did.as_ref()).or_insert(0) += 1;
     }
-    let mut counts: Vec<usize> = per_author.values().copied().collect();
-    counts.sort_unstable();
+    let counts: Vec<usize> = per_author.values().copied().collect();
     assert_eq!(
         counts,
-        [1, 2],
-        "the author whose leaf was dropped holds one KeyEpochAdvance leaf (the follow-up \
-         rotation's); the other author holds two; a re-append would read [2, 2]"
+        [2, 2],
+        "each author holds one KeyEpochAdvance from each operation"
     );
 
     let last_anchor = entries
@@ -4314,8 +4325,6 @@ async fn assert_dropped_kea_leaf_is_never_reappended(
         "both follow-up KeyEpochAdvance leaves follow the follow-up ContentKeysRotated anchor \
          (anchor at {last_anchor}, KEA at {new_kea:?})"
     );
-
-    let counter_after = manager.checkpoint_events_since(ctx_id).await.unwrap();
     assert_eq!(
         counter_after - counter_before,
         4,
@@ -4324,50 +4333,42 @@ async fn assert_dropped_kea_leaf_is_never_reappended(
 }
 
 #[tokio::test]
-async fn revoke_dropped_kea_leaf_is_never_reappended_by_a_later_rotation() {
-    let manager = new_manager_with_failing_kea_event_log(2);
+async fn revoke_refused_kea_unit_lands_before_a_later_rotation() {
+    let (manager, refused) = new_manager_refusing_first_kea_unit();
     let ctx_id = "ctx-ban-kea-no-reappend";
     let ctx_bytes = two_author_broadcast_with_subscriber(&manager, ctx_id).await;
+    assert_refused_kea_unit_lands_whole(
+        &manager,
+        &refused,
+        ctx_id,
+        &ctx_bytes,
+        GovernanceAction::RevokeAccess {
+            did: carol(),
+            access: AccessScope::Both,
+        },
+        scp_event_log::EventType::AccessRevoked,
+    )
+    .await;
 
-    let sk_alice = signing_key_for_did(&alice());
-    manager
-        .propose_governance_action(
-            ctx_id,
-            &alice(),
-            GovernanceAction::RevokeAccess {
-                did: carol(),
-                access: AccessScope::Both,
-            },
-            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
-        )
-        .await
-        .expect(
-            "a KeyEpochAdvance append failure after the durable ban must not fail the proposal",
-        );
-
-    assert_dropped_kea_leaf_is_never_reappended(&manager, ctx_id, &ctx_bytes).await;
+    assert_later_rotation_follows_the_refused_unit(&manager, ctx_id, &ctx_bytes).await;
 }
 
 #[tokio::test]
-async fn rotate_content_keys_dropped_kea_leaf_is_never_reappended_by_a_later_rotation() {
-    let manager = new_manager_with_failing_kea_event_log(2);
+async fn rotate_content_keys_refused_kea_unit_lands_before_a_later_rotation() {
+    let (manager, refused) = new_manager_refusing_first_kea_unit();
     let ctx_id = "ctx-rotate-kea-no-reappend";
     let ctx_bytes = two_author_broadcast_with_subscriber(&manager, ctx_id).await;
+    assert_refused_kea_unit_lands_whole(
+        &manager,
+        &refused,
+        ctx_id,
+        &ctx_bytes,
+        GovernanceAction::RotateContentKeys { reason: None },
+        scp_event_log::EventType::ContentKeysRotated,
+    )
+    .await;
 
-    let sk_alice = signing_key_for_did(&alice());
-    manager
-        .propose_governance_action(
-            ctx_id,
-            &alice(),
-            GovernanceAction::RotateContentKeys { reason: None },
-            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
-        )
-        .await
-        .expect(
-            "a KeyEpochAdvance append failure after the durable rotation must not fail the proposal",
-        );
-
-    assert_dropped_kea_leaf_is_never_reappended(&manager, ctx_id, &ctx_bytes).await;
+    assert_later_rotation_follows_the_refused_unit(&manager, ctx_id, &ctx_bytes).await;
 }
 
 /// A custody that never answers fails the export with kind `TimedOut`

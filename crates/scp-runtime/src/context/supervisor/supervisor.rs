@@ -36050,17 +36050,17 @@ mod tests {
     }
 
     /// Test 5 — §5.14.8: a governance ban whose fail-closed persist FAILS returns
-    /// `Err(PersistenceFailed)` (NOT `Ok`) BEFORE any post-persist event-log
-    /// append or ack, and the ban is RETAINED in memory (keep-direction). Proves
-    /// the context-wide ban path shares the block path's fail-closed guarantee:
-    /// a crash in the coalesce window can never surface a ban the caller was told
+    /// `Err(PersistenceFailed)` (NOT `Ok`) and writes nothing to the event log,
+    /// and the ban is RETAINED in memory (keep-direction). Proves the
+    /// context-wide ban path shares the block path's fail-closed guarantee: a
+    /// crash in the coalesce window can never surface a ban the caller was told
     /// succeeded but that did not durably land.
     ///
-    /// The "BEFORE event-log" ordering is pinned with a [`RecordingEventLog`]:
-    /// the failing arm must record ZERO durable appends, and a control arm with
-    /// working persistence proves the SAME revoke path DOES append
-    /// `AccessRevoked` through this recorder — so the zero-append assertion is
-    /// non-vacuous (moving the append ahead of the persist fails the test).
+    /// The ban's `AccessRevoked` record rides the same persist as the ban
+    /// (spec 17 §17.3 "Event log write failures"): the failing arm keeps it
+    /// queued in memory beside the ban and the [`RecordingEventLog`] records
+    /// nothing, and a control arm with working persistence queues the same
+    /// record, so the record's presence in the failing arm is the ban's own.
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn broadcast_governance_ban_persist_is_fail_closed() {
@@ -36102,8 +36102,16 @@ mod tests {
             .clone();
         assert!(
             events.is_empty(),
-            "a failed ban persist must return BEFORE any durable event-log \
-             append: got {events:?}"
+            "the ban writes nothing to the event log: got {events:?}"
+        );
+        assert_eq!(
+            crate::context::log_unit_helpers::test_support::queued_unit_types(
+                &cell.class_s.pending_log_units
+            )
+            .first()
+            .and_then(|unit| unit.first()),
+            Some(&scp_event_log::EventType::AccessRevoked),
+            "keep-direction: the ban's record stays queued in memory beside the ban"
         );
         // Keep-direction: the ban is RETAINED in memory (un-banning would be the
         // unsafe re-grant direction). The banned DID stays excluded + blocked.
@@ -36120,9 +36128,8 @@ mod tests {
             "the ban all-author block must be RETAINED in memory (keep-direction)"
         );
 
-        // CONTROL (non-vacuity): the same revoke path with WORKING persistence
-        // appends `AccessRevoked` through this recorder — proving the recorder
-        // observes the exact append site the failing arm asserted silent.
+        // CONTROL: the same revoke path with WORKING persistence queues the
+        // same record and writes nothing to the recorder.
         let control_ctx_bytes = [0xB9u8; 32];
         let control_ctx_key = hex::encode(control_ctx_bytes);
         let control_deps = test_actor_deps(&sup).await;
@@ -36147,16 +36154,18 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        let control_appends = events
-            .iter()
-            .filter(|(id, event_type, ..)| {
-                *id == control_ctx_bytes && *event_type == scp_event_log::EventType::AccessRevoked
-            })
-            .count();
+        assert!(
+            events.is_empty(),
+            "the control ban writes nothing to the event log: got {events:?}"
+        );
         assert_eq!(
-            control_appends, 1,
-            "the successful control ban must append exactly one AccessRevoked \
-             (proves the recorder sees the revoke append site): got {events:?}"
+            crate::context::log_unit_helpers::test_support::queued_unit_types(
+                &control_cell.class_s.pending_log_units
+            )
+            .first()
+            .and_then(|unit| unit.first()),
+            Some(&scp_event_log::EventType::AccessRevoked),
+            "the control ban queues its AccessRevoked record"
         );
     }
 

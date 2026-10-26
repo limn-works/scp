@@ -9662,7 +9662,6 @@ const NON_EVENT_LOG_APPENDS: &[(&str, &str)] = &[
     ),
     ("append_entry_by_text", "an OpenSSL X.509 name"),
     ("append_own_leaf_node", "the MLS provider's storage"),
-    ("append_mode", "a TTL leaf's append-mode accessor"),
 ];
 
 /// Free functions that write leaves to a context's event log.
@@ -9806,16 +9805,6 @@ const EVENT_LOG_APPEND_ALLOWLIST: &[(&str, &str, &str)] = &[
         "block_broadcast_subscriber",
         "SCP-349",
     ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_revoke",
-        "SCP-349",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_rotate_content_keys",
-        "SCP-349",
-    ),
     // The streaming saga's A-side record.
     (
         "scp-runtime/src/context/outlets/invoke.rs",
@@ -9892,21 +9881,6 @@ const EVENT_LOG_APPEND_ALLOWLIST: &[(&str, &str, &str)] = &[
     ),
     (
         "scp-runtime/src/context/governance_helpers.rs",
-        "execute_add_member",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_remove_member",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_change_role",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
         "finalize_governance_action",
         "spec 17 §17.3, memory-first after the step, through `append_consequence_leaves_after_side_effect`",
     ),
@@ -9963,196 +9937,6 @@ const EVENT_LOG_APPEND_ALLOWLIST: &[(&str, &str, &str)] = &[
     (
         "scp-runtime/src/context/ttl_close_helpers.rs",
         "extend_ttl_deadline_and_record",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "tombstone_migrated_context",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "withdraw_governance_vote",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "apply_pending_ceiling_modification",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "apply_pending_economic_policy_change",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_suspend_member",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_revoke",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_restore_access",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_register_outlet",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_remove_outlet",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_modify_ceiling",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_close_context",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_extend_ttl",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_transfer_admin",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_create_child_context",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_modify_pruning_policy",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_add_signer",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_remove_signer",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_modify_threshold",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_establish_outlet_interface",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_reset_member",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_resolve_conflict",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_promote_context",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_rotate_content_keys",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_reconfigure_governance",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_reconfigure_governance",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_set_economic_policy",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_approve_spend",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_lock_economic_policy",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_modify_hard_rate_limit",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_modify_pseudonym_rotation_policy",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_propose_context_migration",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_cancel_context_migration",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "propose_governance_action_inner",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "propose_governance_action_inner",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "propose_governance_action_inner",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "vote_on_proposal_inner",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "vote_on_proposal_inner",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "dispatch_governance_action",
         "spec 17 §17.3, memory-first after the step",
     ),
     (

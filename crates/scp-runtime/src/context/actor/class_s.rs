@@ -60,7 +60,7 @@
 //!   GROW-confined to the consequence-only view — see the dedicated section below.)
 //! - **Mutation through a combinator** — every combinator hands `f` a *view*
 //!   (`ClassSMut` for the Class-S-capable combinators, `ClassCMut` for the
-//!   Class-C best-effort combinator) rather than the bare `&mut PerContextState`.
+//!   non-persisting Class-C view) rather than the bare `&mut PerContextState`.
 //!   The view chooses which slice of the state `f` can reach `&mut`. The
 //!   Class-S-capable combinators ([`commit_class_s_keep`](ClassSCell::commit_class_s_keep),
 //!   [`commit_class_s_restore`](ClassSCell::commit_class_s_restore),
@@ -68,8 +68,8 @@
 //!   [`commit_class_s_keep_compensating`](ClassSCell::commit_class_s_keep_compensating),
 //!   [`commit_class_s_then_append`](ClassSCell::commit_class_s_then_append))
 //!   perform the fail-closed persist;
-//!   [`commit_class_c_best_effort`](ClassSCell::commit_class_c_best_effort)
-//!   performs the best-effort persist (Class C).
+//!   [`class_c_view`](ClassSCell::class_c_view) persists nothing (Class C,
+//!   coalesced by the run loop).
 //!
 //! # View-typed combinators (this PR)
 //!
@@ -141,8 +141,8 @@
 //! one extra shape of a fail-closed persist FOLLOWED BY an external durable
 //! append (event-log) that can itself fail, and `*_keep_restore_split` for a
 //! single fail-closed persist that KEEPs one Class-S field while RESTOREing
-//! another (the `prepare_b` decomposition shape). `commit_class_c_best_effort`
-//! covers the Class-C best-effort path. They are chosen because they are the
+//! another (the `prepare_b` decomposition shape). `class_c_view` covers the
+//! coalesced Class-C path. They are chosen because they are the
 //! shapes that recur; they are NOT proof that every site fits one of them.
 //!
 //! A site whose shape falls OUTSIDE this set is handled when **that site
@@ -292,7 +292,7 @@ use super::state::{
 };
 use crate::context::ContextHandle;
 use crate::context::governance::timeout::DeadlockDetectionState;
-use crate::context::messaging_helpers::{persist_state_best_effort, persist_state_fail_closed};
+use crate::context::messaging_helpers::persist_state_fail_closed;
 use crate::context::state::{
     AccessControlState, CommitFaultMarker, EpochState, GovernanceClassS, GovernanceState,
     MigrationState, PendingCeilingModification, PendingCommit, PendingEconomicPolicyChange,
@@ -553,6 +553,21 @@ impl ClassSMut<'_> {
             });
     }
 
+    /// Queues `leaves` as one pending log unit, as [`Self::enqueue_log_unit`]
+    /// does, and counts each entry toward the next checkpoint in the same
+    /// persist. `checkpoint_events_since` counts the operation records written
+    /// since the last checkpoint, so an operation that queues its record
+    /// counts it here and never in a separate, later write.
+    pub(crate) fn enqueue_counted_log_unit(
+        &mut self,
+        leaves: Vec<crate::context::state::LeafSpec>,
+    ) {
+        let count = u64::try_from(leaves.len()).unwrap_or(u64::MAX);
+        self.enqueue_log_unit(leaves);
+        self.state.checkpoint_events_since =
+            self.state.checkpoint_events_since.saturating_add(count);
+    }
+
     /// Sets the `base_seq` of the oldest queued unit. Returns `false` when the
     /// queue is empty.
     pub(crate) fn set_front_log_unit_base(&mut self, base_seq: Option<u64>) -> bool {
@@ -622,8 +637,8 @@ impl<'a> SharedClassS<'a> {
 /// `governance_class_s_mut`, and (deliberately) **no** `rest_mut` /
 /// `governance_mut` either.
 ///
-/// Handed to [`ClassSCell::commit_class_c_best_effort`] (Class-C, best-effort
-/// persist) and to the async compensation closures of
+/// Returned by [`ClassSCell::class_c_view`] (Class-C, coalesced persist) and
+/// handed to the async compensation closures of
 /// [`ClassSCell::commit_class_s_compensating`] /
 /// [`ClassSCell::commit_class_s_keep_compensating`] — all of which run with NO
 /// subsequent fail-closed persist (best-effort, or the persist-FAILURE arm). So
@@ -2841,7 +2856,7 @@ pub(crate) struct AppendOutcomeError {
 /// module docs). Mutations go through the view-typed combinators
 /// ([`Self::commit_class_s_keep`] / `_restore` / `_compensating` /
 /// `_keep_compensating` / `_then_append` for fail-closed persist,
-/// [`Self::commit_class_c_best_effort`] for best-effort).
+/// [`Self::class_c_view`] for coalesced Class-C).
 pub(crate) struct ClassSCell {
     /// The wrapped state. Private — the only mutable access is through the
     /// persist-on-commit combinators (or the single sanctioned no-persist
@@ -3351,54 +3366,20 @@ impl ClassSCell {
         }
     }
 
-    /// Class-C best-effort persist (the Class-C path — no Class-S mutator on the
-    /// view, persist failure is not surfaced).
+    /// NON-PERSISTING Class-C view (ADR-049 §9): construct a restricted,
+    /// airtight [`ClassCMut`] directly and perform NO persist.
     ///
-    /// Mutate Class-C state through a [`ClassCMut`] view and persist
-    /// **best-effort** (ADR-049 §9). Runs `f`, then [`persist_state_best_effort`] —
-    /// a persist failure is logged + metered but not surfaced (the ≤50 ms
-    /// coalesce-window rollback is acceptable for liveness / structural state).
-    /// The [`ClassCMut`] view exposes no Class-S mutator, so a best-effort `f`
-    /// cannot stage a Class-S transition.
+    /// Actor dispatch-arm Class-C mutations rely on the run-loop's COALESCED
+    /// persist, NOT a per-site persist: the run loop (`mod.rs`) tracks a
+    /// `dirty` flag (set from the handler's `Outcome.mutated`) and flushes a
+    /// single `persist_snapshot` after a ≤50 ms `COALESCE_INTERVAL`. A site
+    /// whose Class-C mutation must be durable at once (one that queues a log
+    /// unit with it, spec 17 §17.3) follows the view with a fail-closed
+    /// `commit_class_s_keep`, which persists the whole state.
     ///
-    pub(crate) async fn commit_class_c_best_effort(
-        &mut self,
-        deps: &ActorDeps,
-        context_id: &str,
-        f: impl FnOnce(ClassCMut),
-    ) {
-        f(ClassCMut::new(&mut self.state));
-        self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
-        persist_state_best_effort(&self.state, deps, context_id).await;
-    }
-
-    /// NON-PERSISTING Class-C view (ADR-049 §9): construct a [`ClassCMut`]
-    /// directly — the same restricted, airtight view
-    /// [`Self::commit_class_c_best_effort`] hands to its closure — but perform
-    /// NO persist.
+    /// # Airtight
     ///
-    /// # When to use this vs [`Self::commit_class_c_best_effort`]
-    ///
-    /// Most actor dispatch-arm Class-C mutations rely on the run-loop's
-    /// COALESCED persist, NOT a per-site persist: the run loop (`mod.rs`) tracks
-    /// a `dirty` flag (set from the handler's `Outcome.mutated`) and flushes a
-    /// single `persist_snapshot` after a ≤50 ms `COALESCE_INTERVAL`. Those sites
-    /// must mutate Class-C state WITHOUT injecting a persist of their own —
-    /// routing them through [`Self::commit_class_c_best_effort`] would add a
-    /// per-site best-effort persist they do not have today, a behaviour change
-    /// (an extra durable write per mutation).
-    ///
-    /// - Use `class_c_view` when the run loop will coalesce-persist the mutation
-    ///   (the handler reports `mutated`, the loop flushes). NO persist happens
-    ///   here; the view is the ONLY thing returned.
-    /// - Use [`Self::commit_class_c_best_effort`] when the site must persist
-    ///   immediately, best-effort, AT the mutation (e.g. a site with no
-    ///   coalescing run-loop behind it).
-    ///
-    /// # Airtight — same view, same guarantee
-    ///
-    /// The returned [`ClassCMut`] is structurally identical to the one
-    /// [`Self::commit_class_c_best_effort`] hands out: it holds NO whole
+    /// The returned [`ClassCMut`] holds NO whole
     /// `&mut PerContextState`, only field-granular references with a shared `&`
     /// read of Class-S — so it CANNOT mutate Class-S. The absence of a persist
     /// here is therefore safe: a Class-C mutation through this view is exactly
@@ -4815,13 +4796,9 @@ mod tests {
     /// - `new` / `into_inner` — ownership in/out; `new` takes `state` by value (no
     ///   `self` receiver, so it is not even enumerated), `into_inner` unwraps by
     ///   value. Neither mutates Class-S behind a caller ack.
-    /// - `class_c_view` / `commit_class_c_best_effort` — Class-C: the [`ClassCMut`]
-    ///   view they hand out, by construction, holds NO `&mut` to any Class-S field
-    ///   (shared `&` to `class_s`), so they cannot perform a Class-S mutation at
-    ///   all. (`commit_class_c_best_effort` performs a *best-effort* persist, which
-    ///   is deliberately NOT a Class-S persist marker — a Class-S mutator that only
-    ///   best-effort-persists must TRIP, so it is whitelisted by NAME here on the
-    ///   grounds that it cannot reach Class-S, not on the grounds that it persists.)
+    /// - `class_c_view` — Class-C: the [`ClassCMut`] view it hands out, by
+    ///   construction, holds NO `&mut` to any Class-S field (shared `&` to
+    ///   `class_s`), so it cannot perform a Class-S mutation at all.
     /// - `clear_committed_reservation_idempotent` — the SINGLE sanctioned
     ///   no-persist Class-S mutator; its §9 safety argument (the committed
     ///   terminal is already durably witnessed; the removal is an idempotent
@@ -4859,18 +4836,17 @@ mod tests {
         // (coalesced) persistence does NOT satisfy §9 for Class-S — a crash in the
         // ≤50ms coalesce window rolls the mutation back behind a caller who already
         // saw success. A method that mutates Class-S and only best-effort-persists
-        // is exactly the §9 hazard and MUST trip. The sole best-effort combinator,
-        // `commit_class_c_best_effort`, is Class-C (its `ClassCMut` view cannot
-        // reach Class-S) and is therefore on `KNOWN_SAFE`, not cleared by a marker.
+        // is exactly the §9 hazard and MUST trip. The non-persisting
+        // `class_c_view` is Class-C (its `ClassCMut` view cannot reach Class-S)
+        // and is therefore on `KNOWN_SAFE`, not cleared by a marker.
         const PERSIST_MARKERS: [&str; 2] = ["persist_state_fail_closed", "ClassSCommitToken::new"];
 
         // The closed allowlist of self-receiver methods that legitimately perform
         // NO fail-closed persist of a Class-S mutation. A NEW no-persist mutator
         // NOT in this set trips the assert.
-        // - `class_c_view` / `commit_class_c_best_effort` — Class-C: the `ClassCMut`
-        //   view they hand out holds NO `&mut` to any Class-S field (it cannot name
-        //   one), so they cannot perform a Class-S mutation at all; no fail-closed
-        //   persist is required of them.
+        // - `class_c_view` — Class-C: the `ClassCMut` view it hands out holds NO
+        //   `&mut` to any Class-S field (it cannot name one), so it cannot perform
+        //   a Class-S mutation at all; no fail-closed persist is required of it.
         // - `restore_class_s` — the PRIVATE combinator-internal restore arm: reached
         //   ONLY from inside `commit_class_s_restore` / `_compensating` (whose own
         //   bodies own the fail-closed persist), to roll a Class-S sub-struct back to
@@ -4878,11 +4854,10 @@ mod tests {
         //   wrapped by a persisting combinator, never a standalone mutation entry.
         // - `mutation_epoch` — a `&self` reader of the view hand-out counter; it
         //   holds no `&mut` at all, so it can perform no mutation of any class.
-        const KNOWN_SAFE: [&str; 7] = [
+        const KNOWN_SAFE: [&str; 6] = [
             "into_inner",
             "mutation_epoch",
             "class_c_view",
-            "commit_class_c_best_effort",
             "clear_committed_reservation_idempotent",
             "set_generation_for_test",
             "restore_class_s",
@@ -7274,52 +7249,17 @@ impl ClassSCell
     }
 
     // ------------------------------------------------------------------
-    // commit_class_c_best_effort
+    // ClassCMut field-granular accessors, through class_c_view
     // ------------------------------------------------------------------
-
-    /// `commit_class_c_best_effort` runs the Class-C mutation and issues exactly one
-    /// best-effort persist.
-    #[tokio::test]
-    async fn best_effort_runs_mutation_and_persists() {
-        let persist_calls = Arc::new(AtomicUsize::new(0));
-        let deps = build_deps(Box::new(SpyPersistence {
-            persist_calls: Arc::clone(&persist_calls),
-        }))
-        .await;
-        let mut cell = ClassSCell::new(fresh_state(0x51));
-        let ctx = ctx_hex(0x51);
-        let member = DID("did:example:best-effort-member".to_owned());
-        let member_for_closure = member.clone();
-
-        cell.commit_class_c_best_effort(&deps, &ctx, move |mut view| {
-            view.members_mut().insert(member_for_closure);
-        })
-        .await;
-
-        assert!(
-            cell.members.contains(&member),
-            "best-effort mutation is applied"
-        );
-        assert_eq!(
-            persist_calls.load(Ordering::SeqCst),
-            1,
-            "commit_class_c_best_effort issues exactly one persist"
-        );
-    }
 
     /// `ClassCMut::split_class_c` yields the five disjoint borrows the
     /// `ConsequenceStateSplit` pattern needs, simultaneously.
-    #[tokio::test]
-    async fn best_effort_split_yields_disjoint_class_c_borrows() {
-        let persist_calls = Arc::new(AtomicUsize::new(0));
-        let deps = build_deps(Box::new(SpyPersistence {
-            persist_calls: Arc::clone(&persist_calls),
-        }))
-        .await;
+    #[test]
+    fn class_c_view_split_yields_disjoint_class_c_borrows() {
         let mut cell = ClassSCell::new(fresh_state(0x52));
-        let ctx = ctx_hex(0x52);
 
-        cell.commit_class_c_best_effort(&deps, &ctx, |mut view| {
+        {
+            let mut view = cell.class_c_view();
             let mut split = view.split_class_c();
             // Hold all five borrows live at once; mutate two of them to prove
             // they are independent mutable references.
@@ -7335,8 +7275,7 @@ impl ClassSCell
             let _ = &split.role_state;
             let _ = split.membership.count();
             let _ = split.receive_buffer.len();
-        })
-        .await;
+        }
 
         assert_eq!(
             cell.checkpoint_events_since, 3,
@@ -7353,17 +7292,12 @@ impl ClassSCell
     /// field-granular accessors mutate a Class-C governance field, and whose
     /// field-granular read accessor (`next_proposal_seq`) reads a Class-C
     /// governance field — with no `&mut` path to `governance.class_s`.
-    #[tokio::test]
-    async fn best_effort_governance_class_c_mut_mutates_class_c_field() {
-        let persist_calls = Arc::new(AtomicUsize::new(0));
-        let deps = build_deps(Box::new(SpyPersistence {
-            persist_calls: Arc::clone(&persist_calls),
-        }))
-        .await;
+    #[test]
+    fn class_c_view_governance_class_c_mut_mutates_class_c_field() {
         let mut cell = ClassSCell::new(fresh_state(0x53));
-        let ctx = ctx_hex(0x53);
 
-        cell.commit_class_c_best_effort(&deps, &ctx, |mut view| {
+        {
+            let mut view = cell.class_c_view();
             let gov = view.governance_class_c_mut();
             // Mutate a Class-C governance field through the field-granular
             // accessor.
@@ -7373,38 +7307,30 @@ impl ClassSCell
             // no `&mut self.gov` / `class_s` accessor to reach Class-S, and the
             // whole-bucket Deref was removed.
             let _ = gov.next_proposal_seq();
-        })
-        .await;
+        }
 
         assert_eq!(
             cell.governance.cooldown_until.get(&3usize),
             Some(&1_700_000_500),
             "Class-C governance field mutated through governance_class_c_mut"
         );
-        assert_eq!(
-            persist_calls.load(Ordering::SeqCst),
-            1,
-            "best-effort issues exactly one persist"
-        );
     }
 
     /// `GovernanceClassCMut::velocity_tracker_mut` hands out a `&mut` to the
     /// per-sender velocity tracker; a recorded message is observable on the
     /// underlying `cell.governance.velocity_tracker`.
-    #[tokio::test]
-    async fn best_effort_velocity_tracker_mut_records_through_view() {
-        let deps = build_deps(Box::new(OkPersistence)).await;
+    #[test]
+    fn class_c_view_velocity_tracker_mut_records_through_view() {
         let mut cell = ClassSCell::new(fresh_state(0x54));
-        let ctx = ctx_hex(0x54);
         let sender = DID("did:example:velocity-sender".to_owned());
         let sender_for_closure = sender.clone();
 
-        cell.commit_class_c_best_effort(&deps, &ctx, move |mut view| {
+        {
+            let mut view = cell.class_c_view();
             let gov = view.governance_class_c_mut();
             let vt = gov.velocity_tracker_mut();
             vt.record_message(&sender_for_closure, 1_700_000_000);
-        })
-        .await;
+        }
 
         assert_eq!(
             cell.governance
@@ -7418,22 +7344,20 @@ impl ClassSCell
     /// `GovernanceClassCMut::budget_tracker_mut` hands out a `&mut` to the
     /// per-member budget tracker; a grant is observable on the underlying
     /// `cell.governance.budget_tracker`.
-    #[tokio::test]
-    async fn best_effort_budget_tracker_mut_grants_through_view() {
+    #[test]
+    fn class_c_view_budget_tracker_mut_grants_through_view() {
         use scp_protocol::economy::types::Amount;
 
-        let deps = build_deps(Box::new(OkPersistence)).await;
         let mut cell = ClassSCell::new(fresh_state(0x55));
-        let ctx = ctx_hex(0x55);
         let member = DID("did:example:budget-member".to_owned());
         let member_for_closure = member.clone();
 
-        cell.commit_class_c_best_effort(&deps, &ctx, move |mut view| {
+        {
+            let mut view = cell.class_c_view();
             view.governance_class_c_mut()
                 .budget_tracker_mut()
                 .grant(&member_for_closure, Amount(500));
-        })
-        .await;
+        }
 
         assert_eq!(
             cell.governance.budget_tracker.remaining(&member),
@@ -7445,13 +7369,11 @@ impl ClassSCell
     /// `GovernanceClassCMut::economic_policy_mut` hands out a `&mut Option<…>`;
     /// setting it to `Some(policy)` is observable on the underlying
     /// `cell.governance.economic_policy`.
-    #[tokio::test]
-    async fn best_effort_economic_policy_mut_sets_through_view() {
+    #[test]
+    fn class_c_view_economic_policy_mut_sets_through_view() {
         use scp_protocol::economy::types::{CostSchedule, CurrencyCode};
 
-        let deps = build_deps(Box::new(OkPersistence)).await;
         let mut cell = ClassSCell::new(fresh_state(0x56));
-        let ctx = ctx_hex(0x56);
 
         let policy = EconomicPolicy {
             locked: false,
@@ -7469,10 +7391,10 @@ impl ClassSCell
         };
         let expected = policy.clone();
 
-        cell.commit_class_c_best_effort(&deps, &ctx, move |mut view| {
+        {
+            let mut view = cell.class_c_view();
             *view.governance_class_c_mut().economic_policy_mut() = Some(policy);
-        })
-        .await;
+        }
 
         assert_eq!(
             cell.governance.economic_policy,
@@ -7483,22 +7405,20 @@ impl ClassSCell
 
     /// `ClassCMut::receive_buffer_mut` hands out a `&mut ReceiveBuffer`; a pushed
     /// event is observable on the underlying `cell.receive_buffer`.
-    #[tokio::test]
-    async fn best_effort_receive_buffer_mut_pushes_through_view() {
+    #[test]
+    fn class_c_view_receive_buffer_mut_pushes_through_view() {
         use scp_protocol::context::membership::ContextEvent;
 
-        let deps = build_deps(Box::new(OkPersistence)).await;
         let mut cell = ClassSCell::new(fresh_state(0x57));
-        let ctx = ctx_hex(0x57);
 
         let before = cell.receive_buffer.len();
 
-        cell.commit_class_c_best_effort(&deps, &ctx, |mut view| {
+        {
+            let mut view = cell.class_c_view();
             view.receive_buffer_mut().push(ContextEvent::MemberLeft {
                 member_did: DID("did:example:left".to_owned()),
             });
-        })
-        .await;
+        }
 
         assert_eq!(
             cell.receive_buffer.len(),
@@ -7510,20 +7430,18 @@ impl ClassSCell
     /// `ClassCMut::role_state_class_c_mut` hands out a `RoleStateClassCMut` (no
     /// whole `&mut`, no GROW); a member inserted into its `members` set via
     /// `members_mut()` is observable on the underlying `cell.role_state`.
-    #[tokio::test]
-    async fn best_effort_role_state_class_c_mut_mutates_members_through_view() {
-        let deps = build_deps(Box::new(OkPersistence)).await;
+    #[test]
+    fn class_c_view_role_state_class_c_mut_mutates_members_through_view() {
         let mut cell = ClassSCell::new(fresh_state(0x58));
-        let ctx = ctx_hex(0x58);
         let member_did = "did:example:role-member".to_owned();
         let member_for_assert = member_did.clone();
 
-        cell.commit_class_c_best_effort(&deps, &ctx, move |mut view| {
+        {
+            let mut view = cell.class_c_view();
             view.role_state_class_c_mut()
                 .members_mut()
                 .insert(member_did);
-        })
-        .await;
+        }
 
         assert!(
             cell.role_state.members.contains(&member_for_assert),
@@ -7575,16 +7493,15 @@ impl ClassSCell
     /// assignments, role definitions) and READS the granted/derived capabilities
     /// (`member_capabilities`, read-only — the F2 whole-`&mut` shrink accessor is
     /// deleted) and the downward-auth fields (`ceiling`, `suspended_capabilities`)
-    /// — observed via `commit_class_c_best_effort`.
-    #[tokio::test]
-    async fn role_state_class_c_mut_mutates_structural_and_reads_downward_auth() {
-        let deps = build_deps(Box::new(OkPersistence)).await;
+    /// — observed via `class_c_view`.
+    #[test]
+    fn role_state_class_c_mut_mutates_structural_and_reads_downward_auth() {
         let mut cell = ClassSCell::new(fresh_state(0x72));
-        let ctx = ctx_hex(0x72);
         let member = "did:example:rs-classc-member".to_owned();
         let member_for_f = member.clone();
 
-        cell.commit_class_c_best_effort(&deps, &ctx, move |mut view| {
+        {
+            let mut view = cell.class_c_view();
             let mut rs = view.role_state_class_c_mut();
             // Structural &mut: add a member to the role-state member set.
             rs.members_mut().insert(member_for_f);
@@ -7599,8 +7516,7 @@ impl ClassSCell
             // `member_capabilities` is READ-ONLY on this best-effort view (the F2
             // whole-`&mut` shrink accessor is deleted).
             let _ = rs.member_capabilities().len();
-        })
-        .await;
+        }
 
         assert!(
             cell.role_state.members.contains(&member),
@@ -7613,17 +7529,16 @@ impl ClassSCell
     // ------------------------------------------------------------------
 
     /// `MembershipClassCMut` forwards the STRUCTURAL membership mutators (add,
-    /// sequence bookkeeping) and reads — observed via `commit_class_c_best_effort`.
+    /// sequence bookkeeping) and reads — observed via `class_c_view`.
     /// It deliberately exposes NO `remove_member`.
-    #[tokio::test]
-    async fn membership_class_c_mut_adds_and_bumps_sequence() {
-        let deps = build_deps(Box::new(OkPersistence)).await;
+    #[test]
+    fn membership_class_c_mut_adds_and_bumps_sequence() {
         let mut cell = ClassSCell::new(fresh_state(0x73));
-        let ctx = ctx_hex(0x73);
         let member = DID("did:example:membership-classc".to_owned());
         let member_for_f = member.clone();
 
-        cell.commit_class_c_best_effort(&deps, &ctx, move |mut view| {
+        {
+            let mut view = cell.class_c_view();
             let mut m = view.membership_class_c_mut();
             m.add_member(member_for_f.clone(), "member".to_owned(), Vec::new());
             assert!(
@@ -7638,8 +7553,7 @@ impl ClassSCell
             assert!(m.get_mut(member_for_f.0.as_str()).is_some());
             let _ = m.get(member_for_f.0.as_str());
             let _ = m.count();
-        })
-        .await;
+        }
 
         assert!(
             cell.membership.contains(member.0.as_str()),
@@ -7834,17 +7748,16 @@ impl ClassSCell
     /// budget_tracker held SIMULTANEOUSLY with shared reads of velocity_tracker,
     /// economic_policy, consequence_rules, and message_pricing — a debit through
     /// the `&mut` lands while the four reads are live in the same scope.
-    #[tokio::test]
-    async fn economy_pre_check_borrows_debits_while_reading() {
+    #[test]
+    fn economy_pre_check_borrows_debits_while_reading() {
         use scp_protocol::economy::types::Amount;
 
-        let deps = build_deps(Box::new(OkPersistence)).await;
         let mut cell = ClassSCell::new(fresh_state(0x90));
-        let ctx = ctx_hex(0x90);
         let member = DID("did:example:precheck-member".to_owned());
         let member_for_closure = member.clone();
 
-        cell.commit_class_c_best_effort(&deps, &ctx, move |mut view| {
+        {
+            let mut view = cell.class_c_view();
             let gov = view.governance_class_c_mut();
             let borrows = gov.economy_pre_check_borrows();
             // The four shared reads are live alongside the single &mut.
@@ -7861,8 +7774,7 @@ impl ClassSCell
             borrows
                 .budget_tracker
                 .grant(&member_for_closure, Amount(700));
-        })
-        .await;
+        }
 
         assert_eq!(
             cell.governance.budget_tracker.remaining(&member),
@@ -7938,15 +7850,14 @@ impl ClassSCell
     /// `MembershipClassCMut::remove_subscriber` removes a broadcast subscriber
     /// from the roster (returns `true` when present, `false` when absent), via
     /// the restricted Class-C membership view.
-    #[tokio::test]
-    async fn remove_subscriber_removes_from_roster() {
-        let deps = build_deps(Box::new(OkPersistence)).await;
+    #[test]
+    fn remove_subscriber_removes_from_roster() {
         let mut cell = ClassSCell::new(fresh_state(0x92));
-        let ctx = ctx_hex(0x92);
         let sub = DID("did:example:broadcast-subscriber".to_owned());
         let sub_for_f = sub.clone();
 
-        cell.commit_class_c_best_effort(&deps, &ctx, move |mut view| {
+        {
+            let mut view = cell.class_c_view();
             let mut m = view.membership_class_c_mut();
             m.add_member(sub_for_f.clone(), "member".to_owned(), Vec::new());
             assert!(
@@ -7967,8 +7878,7 @@ impl ClassSCell
                 !m.remove_subscriber(&sub_for_f),
                 "remove_subscriber returns false for an absent subscriber"
             );
-        })
-        .await;
+        }
 
         assert!(
             !cell.membership.contains(sub.0.as_str()),
@@ -8362,27 +8272,6 @@ impl ClassSCell
             cell.mutation_epoch(),
             1,
             "a persisted restore-direction mutation counts once"
-        );
-    }
-
-    /// `commit_class_c_best_effort` applies a Class-C mutation in memory and
-    /// advances the epoch once, regardless of the best-effort persist.
-    #[tokio::test]
-    async fn mutation_epoch_advances_on_commit_class_c_best_effort() {
-        let deps = build_deps(Box::new(FailPersistence)).await;
-        let mut cell = ClassSCell::new(fresh_state(0x95));
-        let ctx = ctx_hex(0x95);
-
-        cell.commit_class_c_best_effort(&deps, &ctx, |mut view| {
-            view.members_mut()
-                .insert(DID("did:example:best-effort-member".to_owned()));
-        })
-        .await;
-
-        assert_eq!(
-            cell.mutation_epoch(),
-            1,
-            "the in-memory Class-C mutation counts even when its best-effort persist fails"
         );
     }
 

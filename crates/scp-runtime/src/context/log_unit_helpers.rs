@@ -123,6 +123,29 @@ impl Drop for ConsequenceSink {
     }
 }
 
+/// Queues `leaves` as one pending log unit, counted toward the §9.9.3
+/// checkpoint triggers, in one fail-closed keep persist that also carries
+/// every in-memory mutation the step made before it (spec 17 §17.3 "Event log
+/// write failures"). It does not drain: per-action helpers leave the drain to
+/// the actor's next command.
+///
+/// # Errors
+///
+/// Returns [`ContextError::PersistenceFailed`] when the persist fails (the
+/// queued unit and the step's mutations stay in memory).
+pub async fn queue_log_unit(
+    cell: &mut ClassSCell,
+    deps: &ActorDeps,
+    context_id: &str,
+    leaves: Vec<LeafSpec>,
+) -> Result<(), ContextError> {
+    cell.commit_class_s_keep(deps, context_id, move |mut view: ClassSMut| {
+        view.enqueue_counted_log_unit(leaves);
+        Ok(())
+    })
+    .await
+}
+
 /// Plans one entry of a pending log unit before the operation's irreversible
 /// step, checking it against the append's payload rules (spec 17 §17.3 "Event
 /// log write failures"), so a payload that breaks them refuses the operation
@@ -139,6 +162,29 @@ pub fn plan_leaf(
     timestamp_secs: u64,
 ) -> Result<LeafSpec, ContextError> {
     LeafSpec::new(event_type, actor_did, payload, timestamp_secs)
+}
+
+/// Plans one entry whose payload is `payload` encoded as the log's payload
+/// encoding, before the operation's step (spec 17 §17.3 "Event log write
+/// failures").
+///
+/// # Errors
+///
+/// Returns [`ContextError::EventLogFailed`] when the payload does not encode
+/// or breaks the append's payload rules for `event_type`.
+pub fn plan_encoded_leaf<T: serde::Serialize>(
+    event_type: scp_event_log::EventType,
+    actor_did: &str,
+    payload: &T,
+    timestamp_secs: u64,
+) -> Result<LeafSpec, ContextError> {
+    plan_leaf(
+        event_type,
+        actor_did.to_owned(),
+        scp_event_log::payload::encode_payload(payload)
+            .map_err(|e| ContextError::EventLogFailed(e.to_string()))?,
+        timestamp_secs,
+    )
 }
 
 /// Plans a `MemberJoined` / `MemberLeft` leaf. It is the one encoder for that

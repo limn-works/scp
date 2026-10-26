@@ -679,8 +679,8 @@ impl ContextActor {
         // `dispatch_state` receives the `&mut ClassSCell` directly and threads
         // it into every domain handler. Every domain mutates through the cell's
         // combinators — the fail-closed `commit_class_s_*` / `ClassSCommitToken`
-        // for Class-S transitions, and the airtight `class_c_view()` /
-        // `commit_class_c_best_effort` for Class-C / structural state. There is
+        // for Class-S transitions, and the airtight `class_c_view()` for
+        // Class-C / structural state. There is
         // no `state_mut()` escape hatch (deleted), and the broadcast member-
         // removal in `unsubscribe_broadcast` routes through the restricted
         // `MembershipClassCMut::remove_subscriber` (a public-content subscriber

@@ -1908,6 +1908,16 @@ mod tests {
 
     /// Zero the leaf counter so an assertion measures ONLY the operation under
     /// test, not the fixture's own setup leaves.
+    /// Every queued record as `(event type, payload bytes)`, oldest first.
+    fn queued_leaves(cell: &ClassSCell) -> Vec<(scp_event_log::EventType, Vec<u8>)> {
+        cell.class_s
+            .pending_log_units
+            .iter()
+            .flat_map(|unit| unit.leaves.iter())
+            .map(|leaf| (leaf.event_type(), leaf.payload().data.clone()))
+            .collect()
+    }
+
     fn reset_leaf_counter(cell: &mut ClassSCell) {
         *cell.class_c_view().checkpoint_events_since_mut() = 0;
     }
@@ -1984,21 +1994,18 @@ mod tests {
         );
     }
 
-    /// `execute_rotate_content_keys` must RETURN `Ok` when a `KeyEpochAdvance`
-    /// append fails, must keep appending the remaining leaves, and must credit
-    /// exactly the leaves that landed.
-    ///
-    /// The rotation and the `ContentKeysRotated` anchor leaf are already durable
-    /// when the loop runs, so an `Err` here would not undo them — it would tell
-    /// `execute_governance_action` to remove the proposal id from
-    /// `executed_proposals`, re-arming replay of an action that advances every
-    /// author's epoch again (see
-    /// `key_epoch_advance_failure_keeps_executed_proposal_marker`).
+    /// `execute_rotate_content_keys` writes nothing to the log after its step:
+    /// the `ContentKeysRotated` record and one `KeyEpochAdvance` per rotated
+    /// author are queued as one unit in the rotation's fail-closed persist
+    /// (spec 17 §17.3 "Event log write failures"), and every queued record is
+    /// credited. A log that refuses `KeyEpochAdvance` writes therefore cannot
+    /// fail the rotation: an `Err` here would tell `execute_governance_action`
+    /// to treat a durable rotation as failed.
     #[tokio::test]
-    async fn rotate_content_keys_survives_key_epoch_advance_append_failure() {
+    async fn rotate_content_keys_queues_every_key_epoch_advance_record() {
         let (mut deps, _appends) = build_deps().await;
-        // Anchor leaf + KEA #0 land; KEA #1 (of three) fails; KEA #2 must still
-        // be attempted and must land.
+        // A log that refuses the second KeyEpochAdvance write; the helper
+        // writes none, so the refusal never reaches it.
         let appends = inject_kea_failing_log(&mut deps, 1);
         let (mut cell, ctx_hex) =
             build_broadcast_cell_with_authors(BroadcastAdmission::Open, &AUTHORS_3);
@@ -2015,27 +2022,36 @@ mod tests {
 
         assert!(
             result.is_ok(),
-            "a KeyEpochAdvance append failure must NOT become the dispatch's \
-             error: `execute_governance_action` rolls back the executed-proposal \
-             replay marker on any dispatch error, and the rotation is already \
-             durable here; got {result:?}"
+            "a log that refuses KeyEpochAdvance writes must not fail a durable \
+             rotation; got {result:?}"
         );
         assert_eq!(
             appends.load(Ordering::SeqCst),
-            3,
-            "ContentKeysRotated + KEA #0 + KEA #2 became durable — the loop must \
-             continue past the failed KEA #1 rather than abort on it"
+            0,
+            "the helper writes no record to the log; its records are queued"
         );
         assert_eq!(
-            cell.checkpoint_events_since, 3,
-            "the inline per-leaf bump must credit exactly the three leaves that \
-             landed and must not credit the failed one"
+            crate::context::log_unit_helpers::test_support::queued_unit_types(
+                &cell.class_s.pending_log_units
+            ),
+            vec![vec![
+                scp_event_log::EventType::ContentKeysRotated,
+                scp_event_log::EventType::KeyEpochAdvance,
+                scp_event_log::EventType::KeyEpochAdvance,
+                scp_event_log::EventType::KeyEpochAdvance,
+            ]],
+            "the anchor record and one KeyEpochAdvance per author are one unit"
+        );
+        assert_eq!(
+            cell.checkpoint_events_since, 4,
+            "every queued record is credited"
         );
     }
 
-    /// `execute_revoke`'s governance-ban KeyEpochAdvance loop, same contract.
+    /// `execute_revoke`'s governance ban, same contract: the `AccessRevoked`
+    /// record and one `KeyEpochAdvance` per rotated author are one queued unit.
     #[tokio::test]
-    async fn revoke_survives_key_epoch_advance_append_failure() {
+    async fn revoke_queues_every_key_epoch_advance_record() {
         use scp_protocol::context::governance::AccessScope;
 
         let (mut deps, _appends) = build_deps().await;
@@ -2049,8 +2065,8 @@ mod tests {
             "member".to_owned(),
             vec![],
         );
-        // AccessRevoked + KEA #0 land; KEA #1 (of three) fails; KEA #2 must
-        // still be attempted and must land.
+        // A log that refuses the second KeyEpochAdvance write; the helper
+        // writes none, so the refusal never reaches it.
         let appends = inject_kea_failing_log(&mut deps, 1);
         reset_leaf_counter(&mut cell);
 
@@ -2066,21 +2082,29 @@ mod tests {
 
         assert!(
             result.is_ok(),
-            "a KeyEpochAdvance append failure must NOT become the dispatch's \
-             error: the ban and every author-key rotation are already durable \
-             here, and `execute_governance_action` rolls back the \
-             executed-proposal replay marker on any dispatch error; got {result:?}"
+            "a log that refuses KeyEpochAdvance writes must not fail a durable \
+             ban; got {result:?}"
         );
         assert_eq!(
             appends.load(Ordering::SeqCst),
-            3,
-            "AccessRevoked + KEA #0 + KEA #2 became durable — the loop must \
-             continue past the failed KEA #1 rather than abort on it"
+            0,
+            "the helper writes no record to the log; its records are queued"
         );
         assert_eq!(
-            cell.checkpoint_events_since, 3,
-            "the inline per-leaf bump must credit exactly the three leaves that \
-             landed and must not credit the failed one"
+            crate::context::log_unit_helpers::test_support::queued_unit_types(
+                &cell.class_s.pending_log_units
+            ),
+            vec![vec![
+                scp_event_log::EventType::AccessRevoked,
+                scp_event_log::EventType::KeyEpochAdvance,
+                scp_event_log::EventType::KeyEpochAdvance,
+                scp_event_log::EventType::KeyEpochAdvance,
+            ]],
+            "the anchor record and one KeyEpochAdvance per author are one unit"
+        );
+        assert_eq!(
+            cell.checkpoint_events_since, 4,
+            "every queued record is credited"
         );
     }
 
@@ -2181,22 +2205,17 @@ mod tests {
         );
     }
 
-    /// THE CLASS GATE. The anchor-leaf append that follows a helper's
-    /// fail-closed `commit_class_s_keep` fails, so the helper returns `Err`
-    /// after the ban and every author-key rotation are durable. The replay
-    /// marker must survive that error: `execute_governance_action` reads the
-    /// cell's `mutation_epoch` before and after dispatch, the keep-commit
-    /// advanced it, and so the error is classified as post-effect. A second
-    /// execute of the same proposal id must be refused as already executed and
-    /// must append nothing.
-    ///
-    /// Before the epoch rule, this exact sequence removed the marker and let a
-    /// retry run `governance_ban_subscriber` again, which advances every
-    /// author's epoch a second time (§9.9.3 divergence). The same shape sits at
-    /// the anchor leaf of every other `execute_*` helper in
-    /// `governance_helpers.rs`; the rule closes them all at the one caller.
+    /// A log that refuses the ban's `AccessRevoked` write cannot fail the ban:
+    /// `execute_revoke` queues the record with one `KeyEpochAdvance` per
+    /// rotated author in the ban's fail-closed persist and writes nothing
+    /// after its step (spec 17 §17.3 "Event log write failures"). The action
+    /// completes, the replay marker stays, the proposal leaves
+    /// `approved_proposals`, and a second execute of the same proposal id is
+    /// refused as already executed and queues nothing: a second run of
+    /// `governance_ban_subscriber` would advance every author's epoch again
+    /// (§9.9.3 divergence).
     #[tokio::test]
-    async fn anchor_leaf_failure_after_commit_keeps_marker_and_blocks_re_execution() {
+    async fn log_refusal_after_the_ban_queues_its_records_and_blocks_re_execution() {
         use scp_protocol::context::governance::{AccessScope, GovernanceAction};
 
         let (mut deps, _appends) = build_deps().await;
@@ -2220,8 +2239,7 @@ mod tests {
             "member".to_owned(),
             vec![],
         );
-        // The first `AccessRevoked` append fails — after `commit_class_s_keep`
-        // has persisted the ban and rotated every author.
+        // A log that refuses the `AccessRevoked` write.
         let appends = inject_failing_log(&mut deps, scp_event_log::EventType::AccessRevoked, 0);
 
         let first = crate::context::governance_helpers::execute_governance_action(
@@ -2236,15 +2254,15 @@ mod tests {
         .await;
 
         assert!(
-            matches!(first, Err(ContextError::EventLogFailed(_))),
-            "the anchor-leaf append failure must reach the caller unchanged; got {first:?}"
+            first.is_ok(),
+            "a log that refuses the record's write cannot fail the ban; got {first:?}"
         );
         assert!(
             cell.governance
                 .class_s
                 .executed_proposals
                 .contains_key(&proposal_id),
-            "a dispatch error raised AFTER the keep-commit must keep the replay marker"
+            "an executed proposal keeps its replay marker"
         );
         assert!(
             !cell
@@ -2255,15 +2273,20 @@ mod tests {
              blocks its re-execution, so an entry that stayed would make every \
              later conflicting proposal lose to a proposal that can never run"
         );
-        let landed_after_first = appends.load(Ordering::SeqCst);
-        assert_eq!(
-            landed_after_first, 0,
-            "`AccessRevoked` is the first append `execute_revoke` makes and it \
-             failed, so nothing else may land: a `GovernanceActionExecuted` leaf \
-             here would record as completed an action the helper reported as \
-             failed, so `execute_governance_action` must not run finalize on a \
-             post-effect dispatch error"
+        let queued_after_first = crate::context::log_unit_helpers::test_support::queued_unit_types(
+            &cell.class_s.pending_log_units,
         );
+        assert_eq!(
+            queued_after_first.first(),
+            Some(&vec![
+                scp_event_log::EventType::AccessRevoked,
+                scp_event_log::EventType::KeyEpochAdvance,
+                scp_event_log::EventType::KeyEpochAdvance,
+                scp_event_log::EventType::KeyEpochAdvance,
+            ]),
+            "the ban's records are queued as one unit"
+        );
+        let landed_after_first = appends.load(Ordering::SeqCst);
 
         let second = crate::context::governance_helpers::execute_governance_action(
             &mut cell,
@@ -2286,14 +2309,21 @@ mod tests {
         assert_eq!(
             appends.load(Ordering::SeqCst),
             landed_after_first,
-            "the refused replay must append no leaf: a second run would rotate \
-             every author again and write a second AccessRevoked leaf"
+            "the refused replay must write no record"
+        );
+        assert_eq!(
+            crate::context::log_unit_helpers::test_support::queued_unit_types(
+                &cell.class_s.pending_log_units
+            ),
+            queued_after_first,
+            "the refused replay must queue no record: a second run would rotate \
+             every author again and queue a second AccessRevoked record"
         );
     }
 
     /// A later proposal that conflicts with a consumed one (a same-DID
     /// `RevokeAccess`, per `actions_conflict`) must be admitted once the
-    /// consumed proposal's post-effect failure has removed it from
+    /// consumed proposal's execution has removed it from
     /// `approved_proposals`. Before the fix, `detect_and_handle_conflicts`
     /// found the consumed entry, saw the later proposal's higher sequence,
     /// returned `ConflictResolved` with the later proposal as loser, and never
@@ -2336,8 +2366,8 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(first, Err(ContextError::EventLogFailed(_))),
-            "the fixture's anchor-leaf failure must be post-effect; got {first:?}"
+            first.is_ok(),
+            "the fixture executes the proposal; got {first:?}"
         );
         assert!(
             cell.governance
@@ -2430,10 +2460,19 @@ mod tests {
             matches!(result, Err(ContextError::EventLogFailed(_))),
             "the executed-leaf append failure must reach the caller; got {result:?}"
         );
-        assert!(
-            appends.load(Ordering::SeqCst) >= 1,
-            "the dispatch's own leaves landed before finalize failed"
+        assert_eq!(
+            crate::context::log_unit_helpers::test_support::queued_unit_types(
+                &cell.class_s.pending_log_units
+            ),
+            vec![vec![
+                scp_event_log::EventType::AccessRevoked,
+                scp_event_log::EventType::KeyEpochAdvance,
+                scp_event_log::EventType::KeyEpochAdvance,
+                scp_event_log::EventType::KeyEpochAdvance,
+            ]],
+            "the dispatch queued its own records before finalize failed"
         );
+        assert_eq!(appends.load(Ordering::SeqCst), 0, "nothing reached the log");
         assert!(
             cell.governance
                 .class_s
@@ -3094,7 +3133,7 @@ mod tests {
 
     /// A rejected TTL extension is the one dispatch that advances the cell's
     /// `mutation_epoch` without applying a governance effect: `execute_extend_ttl`
-    /// appends and credits a `TtlExtensionRejected` leaf, then returns
+    /// queues and credits a `TtlExtensionRejected` record, then returns
     /// `PermissionDenied` with the TTL unchanged. `execute_governance_action`
     /// keeps the replay marker (a retry would append a second rejection leaf on
     /// this member only, which §9.9.3 of the security-model spec reads as
@@ -3151,14 +3190,21 @@ mod tests {
         );
         assert_eq!(
             appends.load(Ordering::SeqCst),
-            1,
-            "exactly the `TtlExtensionRejected` leaf lands: a second leaf would be \
-             the `GovernanceActionExecuted` leaf finalize appends, which records \
-             an extension that did not happen"
+            0,
+            "no record is written outside the queue"
+        );
+        assert_eq!(
+            crate::context::log_unit_helpers::test_support::queued_unit_types(
+                &cell.class_s.pending_log_units
+            ),
+            vec![vec![scp_event_log::EventType::TtlExtensionRejected]],
+            "exactly the `TtlExtensionRejected` record is queued: a second record \
+             would be the `GovernanceActionExecuted` record finalize produces, \
+             which records an extension that did not happen"
         );
         assert_eq!(
             cell.checkpoint_events_since, 1,
-            "the rejection leaf is credited once and the executed leaf never lands"
+            "the rejection record is credited once and no executed record exists"
         );
         assert!(
             cell.governance
@@ -3194,10 +3240,12 @@ mod tests {
             "the same proposal id must be refused as already executed; got {second:?}"
         );
         assert_eq!(
-            appends.load(Ordering::SeqCst),
-            1,
-            "the refused replay appends nothing: a second `TtlExtensionRejected` \
-             leaf on this member alone would diverge its Merkle root"
+            crate::context::log_unit_helpers::test_support::queued_unit_types(
+                &cell.class_s.pending_log_units
+            ),
+            vec![vec![scp_event_log::EventType::TtlExtensionRejected]],
+            "the refused replay queues nothing: a second `TtlExtensionRejected` \
+             record on this member alone would diverge its Merkle root"
         );
     }
 
@@ -3337,8 +3385,12 @@ mod tests {
             matches!(&result, Err(ContextError::PermissionDenied(msg)) if msg.contains("4 of 5")),
             "four of five members have not approved; got {result:?}"
         );
-        let leaves = recorded.read().expect("recorded leaves lock").clone();
-        assert_eq!(leaves.len(), 1, "exactly the rejection leaf lands");
+        assert!(
+            recorded.read().expect("recorded leaves lock").is_empty(),
+            "the helper writes no record to the log; its record is queued"
+        );
+        let leaves = queued_leaves(&cell);
+        assert_eq!(leaves.len(), 1, "exactly the rejection record is queued");
         let (event_type, bytes) = &leaves[0];
         assert_eq!(*event_type, scp_event_log::EventType::TtlExtensionRejected);
         let payload: scp_event_log::payload::TtlExtensionRejectedPayload =
@@ -3404,8 +3456,12 @@ mod tests {
         .await
         .expect("unanimous consent extends the TTL");
 
-        let leaves = recorded.read().expect("recorded leaves lock").clone();
-        assert_eq!(leaves.len(), 1, "exactly the TtlExtended leaf lands");
+        assert!(
+            recorded.read().expect("recorded leaves lock").is_empty(),
+            "the helper writes no record to the log; its record is queued"
+        );
+        let leaves = queued_leaves(&cell);
+        assert_eq!(leaves.len(), 1, "exactly the TtlExtended record is queued");
         let (event_type, bytes) = &leaves[0];
         assert_eq!(*event_type, scp_event_log::EventType::TtlExtended);
         let payload: scp_event_log::payload::TtlExtendedPayload =
@@ -3420,7 +3476,7 @@ mod tests {
         );
         assert_eq!(
             cell.checkpoint_events_since, 1,
-            "the landed leaf is credited once"
+            "the queued record is credited once"
         );
     }
 
