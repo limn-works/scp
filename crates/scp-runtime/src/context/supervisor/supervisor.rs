@@ -43999,12 +43999,35 @@ mod streaming_saga_tests {
     }
     #[async_trait::async_trait]
     impl ContextEventLogProvider for SsRecordingEventLog {
+        /// The recorded appends for `context_id`, in order, so the drain of
+        /// queued log units places each unit at the log's length (spec 17
+        /// §17.3 "Event log write failures") and the recording shows what the
+        /// drain wrote.
         fn event_log_entries(
             &self,
-            _context_id: &[u8; 32],
+            context_id: &[u8; 32],
         ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
         {
-            Ok(None)
+            Ok(Some(
+                (0u64..)
+                    .zip(
+                        self.snapshot()
+                            .into_iter()
+                            .filter(|(id, ..)| id == context_id),
+                    )
+                    .map(|(sequence, (_, event_type, actor, data, timestamp))| {
+                        scp_event_log::Event {
+                            event_type,
+                            actor_did: DID(actor),
+                            timestamp,
+                            sequence,
+                            payload: scp_event_log::EventPayload { data },
+                            prev_hash: [0u8; 32],
+                            signature: Vec::new(),
+                        }
+                    })
+                    .collect(),
+            ))
         }
 
         async fn init_event_log(

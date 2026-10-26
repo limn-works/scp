@@ -41,8 +41,8 @@
 //! - **Abort** ([`abort`]) — releases the staged reservations (live carrier or
 //!   the durable caller-reservation record on the crash-recovery `None` path).
 //!
-//! - **Divergence marker** ([`emit_divergence_marker`]) — on a one-sided
-//!   `NeedsRepair`, each reachable side signs + appends its OWN
+//! - **Divergence marker** ([`queue_divergence_marker`]) — on a one-sided
+//!   `NeedsRepair`, each reachable side signs + queues its OWN
 //!   [`CrossContextDivergenceMarker`] into its own log.
 //!
 //! # Error band
@@ -77,9 +77,7 @@ use crate::context::actor::outcome::{Outcome, outcome_error_sketch};
 use crate::context::actor::signer::CommandSigner;
 use crate::context::actor::state::PerContextState;
 use crate::context::economy_logic::{ContextRevocationChecker, KeyResolverDidResolver};
-use crate::context::messaging_helpers::{
-    build_snapshot_for_persist, persist_snapshot_fail_closed, persist_state_best_effort,
-};
+use crate::context::messaging_helpers::persist_state_best_effort;
 use crate::context::outlets_helpers::reserve_outlet_economy;
 use crate::context::supervisor::saga_journal::SagaId;
 use crate::context::supervisor::saga_prepared_state::{
@@ -477,21 +475,16 @@ async fn dispatch_commit_phase(
             signer,
             reply,
         } => {
-            // Build the owned snapshot HERE (holding `&mut ClassSCell`) and hand
-            // it to the handler, so no `&PerContextState` is held across the
-            // handler's persist `.await` (ADR-049 Decision 7 `Send` discipline).
-            let ctx_id = cell.context_id;
-            let context_hex = hex_context_id(&ctx_id);
-            let snapshot = build_snapshot_for_persist(cell, deps, &context_hex);
-            emit_divergence_marker(
-                ctx_id,
-                snapshot,
+            queue_divergence_marker(
+                cell,
                 deps,
-                &saga_id,
-                nonce,
-                committed_side,
-                &committed_event_id,
-                committed_timestamp_secs,
+                DivergenceMarkerRequest {
+                    saga_id,
+                    nonce,
+                    committed_side,
+                    committed_event_id,
+                    committed_timestamp_secs,
+                },
                 &signer,
                 reply,
             )
@@ -1759,48 +1752,24 @@ fn reemit_committed_settle(
 }
 
 /// First (non-replay) Commit-B settle: sign the receipt over the STAGED
-/// provenance + captured output, append `OutletInvoked`, durably capture the
-/// output keyed by `SagaId`, clear the staged slot, and Class-S persist
-/// fail-closed. Returns the settle outcome (the caller sends the reply).
+/// provenance + captured output, durably capture the output keyed by `SagaId`,
+/// clear the staged slot, queue the `OutletInvoked` record, and Class-S persist
+/// fail-closed, all in one persist. Returns the settle outcome (the caller
+/// sends the reply).
 ///
-/// On a persist failure the durable capture + staged slot are rolled back so a
-/// retried settle re-runs cleanly. The error is returned as `(mutated, err)`:
-/// `mutated == false` for the pre-append failures (no staged slot — 13031; or
-/// receipt signing — 13032-13034), `true` once the `OutletInvoked` append has
-/// run (the event log was touched even if the durable capture was rolled back).
-// Sync wrapper preserved for the existing call shape; the body is now `async`
-// (the combinators are `async`-friendly but the persists here are sync — the
-// `async` keyword is required because `commit_b_settle` awaits this). See the
-// FLAG below for why this site uses a TWO-combinator decomposition rather than
-// the single `commit_class_s_then_append`.
-//
-// ── FLAG-COMMIT-B (then_append NOT used — persist-fail direction mismatch) ───
-// The roadmap maps this site to `commit_class_s_then_append` (Class-S commit in
-// `f`, event-log append in `after`). That combinator's PERSIST-FAILURE arm
-// KEEPS the Class-S mutation in memory and reports `durability_diverged: true`
-// (its doc step 3: "the restore is the caller's call … matches `*_keep`"). But
-// `commit_b_first_settle`'s persist-failure arm must RESTORE — it removes the
-// just-inserted `xctx_committed_outputs` capture and RE-INSERTS the owned
-// `saga_pending` slot so a retried settle sees `ReadyToExecute` and re-runs.
-// Keeping the capture (the `then_append` behaviour) would make the next
-// `commit_b_reserve` report `AlreadyCommitted` against an in-memory-only capture
-// and SKIP the `OutletInvoked` append forever — a missing convergent leaf on an
-// in-process retry after a survived persist failure. `then_append` exposes no
-// way to recover the owned `prepared` on its persist-failure arm (the
-// `append_input` is dropped by the early `?`), and `CrossContextOutletInvocationPrepared`
-// is deliberately NOT `Clone` (§9.4.3 non-derive barrier), so the slot cannot be
-// reconstructed afterward. The faithful, behaviour-preserving form is therefore
-// a TWO-combinator decomposition:
-//   (1) `commit_class_s_restore` — capture (remove slot, sign, insert outputs) +
-//       fail-closed persist; on persist failure RESTORE (snapshot taken before
-//       `f` ⇒ slot back, capture gone) — byte-identical to the prior inline
-//       persist-failure rollback, reported `(false, persist_err)`.
-//   (2) the event-log append runs AFTER (1) succeeds; on append failure the
-//       compensating rollback (remove capture, re-insert the owned slot) + its
-//       RE-PERSIST is wrapped in `commit_class_s_keep` — keep-on-persist-failure
-//       matches the prior `(true, persist_err)` (re-persist failed ⇒ capture
-//       stays durable) / `(false, original_err)` (re-persist succeeded) mapping.
-// No Class-S mutation is left outside a combinator.
+/// The `OutletInvoked` record is written after the capture, an irreversible
+/// step, so it is queued as a pending log unit in the capture's own persist
+/// (spec 17 §17.3 "Event log write failures") and only the drain writes it to
+/// the log. The record is planned before the capture, so a payload that does
+/// not encode refuses the settle before any state changes. On a persist
+/// failure `commit_class_s_restore` rolls the capture, the staged slot and the
+/// queue back together, so a retried settle re-runs cleanly and queues the
+/// record exactly once.
+///
+/// The error is returned as `(mutated, err)`: `mutated == false` for every
+/// failure up to and including the capture persist (no staged slot — 13031;
+/// receipt signing — 13032-13034; record planning — 13038; the restored
+/// persist), `true` once the capture landed.
 async fn commit_b_first_settle(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
@@ -1810,9 +1779,8 @@ async fn commit_b_first_settle(
 ) -> Result<CommitBSettleOutcome, (bool, ContextError)> {
     // Peek the staged slot to derive the persist `context_id` (target hex) BEFORE
     // the capture combinator (which needs `context_id` up front) and to reject the
-    // no-slot / wrong-variant case as `(false, 13031)` with NO persist — exactly
-    // as the prior inline remove+match did (the authoritative move-out happens
-    // inside `f` below).
+    // no-slot / wrong-variant case as `(false, 13031)` with NO persist (the
+    // authoritative move-out happens inside `f` below).
     let Some(SagaPreparedState::CrossContextOutletInvocation(peek)) =
         cell.class_s.saga_pending.get(saga_id)
     else {
@@ -1838,25 +1806,44 @@ async fn commit_b_first_settle(
         .await
         .map_err(|e| (false, e))?;
 
-    // (1) CAPTURE + fail-closed persist with RESTORE-on-persist-failure.
-    //
-    // `f` MOVES the staged slot out (owning the original `SagaPreparedState` for a
-    // lossless rollback) and inserts the durable output capture with the receipt
-    // signed above. `commit_class_s_restore` snapshots Class-S BEFORE `f`, so its
-    // persist-failure RESTORE rolls the capture back and re-stages the slot
-    // verbatim (matching the prior inline rollback). Both the `f`-error (13031)
-    // and the persist failure surface as `(false, err)` — `mutated = false` (no
-    // event-log touch).
-    //
-    // `f` returns the data the post-persist append + reply need, plus the OWNED
-    // `prepared` so the append-failure compensation in (2) can re-insert the slot.
+    // Plan B's `OutletInvoked` record (spec §6.2.4 "Commit") before the capture:
+    // caller ctx id / caller DID actor / B's re-derived depth + staged timestamp.
+    // CONVERGENT committer-assigned leaf timestamp: the saga's `OutletInvoked` is a
+    // commit-ordered convergent durable leaf (ADR-011 Amendment §6 carve-out),
+    // NOT a per-author-excluded event. The timestamp is B's signed
+    // `recorded_timestamp_ms` (the receipt's `timestamp_ms`, in ms), the single
+    // staged value a replayed Commit reproduces byte-for-byte, never a fresh
+    // Commit-time `now()`, so two honest members reconstruct the identical leaf
+    // (§7.3.1, §9.9.3).
+    let invoked_leaf = plan_saga_json_leaf(
+        scp_event_log::EventType::OutletInvoked,
+        &peek.caller_did.0,
+        &serde_json::json!({
+            "saga_id": saga_id.0,
+            "outlet_invoked_event_id": event_id,
+            "caller_context_id": hex_context_id(&peek.caller_context_id),
+            "outlet_registration_id": peek.outlet_registration_id,
+            "chain_depth": receipt.chain_depth,
+            "timestamp_ms": receipt.timestamp_ms,
+        }),
+        receipt.timestamp_ms / 1000,
+        "SCP-SAGA-13038: OutletInvoked payload serialization failed",
+    )
+    .map_err(|e| (false, e))?;
+
+    // CAPTURE + queue the record + fail-closed persist with RESTORE-on-persist-
+    // failure. `f` MOVES the staged slot out and inserts the durable output
+    // capture with the receipt signed above. `commit_class_s_restore` snapshots
+    // Class-S BEFORE `f` (the snapshot covers `pending_log_units`), so its
+    // persist-failure RESTORE rolls the capture and the queued record back and
+    // re-stages the slot verbatim. Both the `f`-error (13031) and the persist
+    // failure surface as `(false, err)`.
     let captured = cell.commit_class_s_restore(deps, &target_hex, |mut view| {
         let saga_pending = &mut view.class_s_mut().saga_pending;
-        // Move the staged slot OUT (owning the original for a lossless rollback).
         // The peek above already proved a cross-context slot is present, so this
         // match is infallible; the `else` is a defensive re-insert + 13031.
         let removed = saga_pending.remove(saga_id);
-        let Some(SagaPreparedState::CrossContextOutletInvocation(prepared)) = removed else {
+        let Some(SagaPreparedState::CrossContextOutletInvocation(_prepared)) = removed else {
             if let Some(other) = removed {
                 saga_pending.insert(saga_id.clone(), other);
             }
@@ -1870,30 +1857,8 @@ async fn commit_b_first_settle(
         // The receipt's JCS output bytes are the canonical preimage A re-hashes.
         let canonical_output = receipt.output_jcs.clone();
 
-        // Snapshot the fields the OutletInvoked record needs. `recorded_chain_depth`
-        // / `recorded_timestamp_ms` are B's staged values (never re-read from
-        // wire).
-        let caller_did_str = prepared.caller_did.0.clone();
-        let target_context_id = prepared.target_context_id;
-        let caller_context_id = prepared.caller_context_id;
-        let outlet_registration_id = prepared.outlet_registration_id.clone();
-
-        // Order matters (provenance-integrity): the durable output capture +
-        // Class-S persist land BEFORE the `OutletInvoked` event-log append. The
-        // event log is a SEPARATE provider not covered by
-        // `persist_state_fail_closed` and the append is NOT provider-idempotent,
-        // so appending FIRST would double-append on a persist-failure retry: a
-        // persist failure rolls the capture back and re-stages the slot, the next
-        // reserve reports `ReadyToExecute`, and `commit_b_first_settle` re-runs —
-        // re-appending a SECOND `OutletInvoked` for one saga. Appending only after
-        // the capture + persist succeed makes a persist failure leave NO orphan
-        // log entry, so the retry produces exactly one `OutletInvoked`.
-
         // Durably capture the output + signed receipt keyed by SagaId (§6.2.4
-        // "Exactly-once execution with durable output capture"). The staged slot
-        // was already removed up front (the session reservation is now applied via
-        // the capture). No event-log mutation yet — a failure before the append is
-        // recoverable by re-inserting the owned staged slot.
+        // "Exactly-once execution with durable output capture").
         view.class_s_mut().xctx_committed_outputs.insert(
             saga_id.clone(),
             CommittedOutletInvocation {
@@ -1902,130 +1867,15 @@ async fn commit_b_first_settle(
                 outlet_invoked_event_id: event_id.clone(),
             },
         );
-
-        Ok(CommitBCaptured {
-            prepared,
-            receipt,
-            canonical_output,
-            event_id,
-            caller_did_str,
-            target_context_id,
-            caller_context_id,
-            outlet_registration_id,
-        })
+        view.enqueue_log_unit(vec![invoked_leaf]);
+        Ok(canonical_output)
     });
+    let canonical_output = captured.await.map_err(|err| (false, err))?;
 
-    // Both `f`-error and persist-failure surface as `(false, err)` (mutated =
-    // false). `commit_class_s_restore` already restored Class-S on persist
-    // failure (capture rolled back, slot re-staged).
-    let captured_fields = match captured.await {
-        Ok(c) => c,
-        Err(err) => return Err((false, err)),
-    };
+    drain_saga_log_units(cell, deps, &target_hex).await;
 
-    // (2) Append `OutletInvoked` + finalize (split out to keep this helper within
-    // the per-function line budget).
-    commit_b_settle_finalize(cell, deps, saga_id, &target_hex, captured_fields).await
-}
-
-/// Post-capture half of [`commit_b_first_settle`] (step 2): append the
-/// `OutletInvoked` event-log leaf, and on append failure roll the capture back +
-/// re-stage the owned slot + RE-PERSIST via [`ClassSCell::commit_class_s_keep`](crate::context::actor::class_s::ClassSCell::commit_class_s_keep).
-/// Split out of [`commit_b_first_settle`] only to stay within the per-function
-/// line budget — the behaviour is exactly the prior inline append path. See
-/// FLAG-COMMIT-B on the capture side for why this is a two-combinator
-/// decomposition rather than `commit_class_s_then_append`.
-async fn commit_b_settle_finalize(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
-    deps: &ActorDeps,
-    saga_id: &SagaId,
-    target_hex: &str,
-    captured: CommitBCaptured,
-) -> Result<CommitBSettleOutcome, (bool, ContextError)> {
-    let CommitBCaptured {
-        prepared,
-        receipt,
-        canonical_output,
-        event_id,
-        caller_did_str,
-        target_context_id,
-        caller_context_id,
-        outlet_registration_id,
-    } = captured;
-
-    // Append `OutletInvoked` to the local (target) log (spec §6.2.4 "Commit"):
-    // caller ctx id / caller DID actor / B's re-derived depth + staged timestamp.
-    // Runs ONLY after the capture + persist landed, so it appears exactly once
-    // across retries.
-    let outlet_invoked_payload = serde_json::json!({
-        "saga_id": saga_id.0,
-        "outlet_invoked_event_id": event_id,
-        "caller_context_id": hex_context_id(&caller_context_id),
-        "outlet_registration_id": outlet_registration_id,
-        "chain_depth": receipt.chain_depth,
-        "timestamp_ms": receipt.timestamp_ms,
-    });
-    // CONVERGENT committer-assigned leaf timestamp: the saga's `OutletInvoked` is a
-    // commit-ordered convergent durable leaf (ADR-011 Amendment §6 carve-out),
-    // NOT a per-author-excluded event. Draw the timestamp from B's signed
-    // `recorded_timestamp_ms` (the receipt's `timestamp_ms`, in ms) — the single
-    // staged value B also wrote into the receipt and that a replayed Commit
-    // reproduces byte-for-byte — never a fresh Commit-time `now()`, so two honest
-    // members reconstruct the identical leaf (§7.3.1, §9.9.3).
-    let append_result = match serde_json::to_vec(&outlet_invoked_payload) {
-        Ok(outlet_invoked_payload_bytes) => {
-            deps.event_log
-                .append_context_event_with_payload(
-                    crate::context::builder::AppendMode::AfterSideEffect,
-                    &target_context_id,
-                    scp_event_log::EventType::OutletInvoked,
-                    &caller_did_str,
-                    scp_event_log::EventPayload {
-                        data: outlet_invoked_payload_bytes,
-                    },
-                    receipt.timestamp_ms / 1000,
-                )
-                .await
-        }
-        Err(e) => Err(ContextError::EventLogFailed(format!(
-            "SCP-SAGA-13038: OutletInvoked payload serialization failed: {e}"
-        ))),
-    };
-
-    if let Err(append_err) = append_result {
-        // The append (or its payload encode) failed AFTER the capture+persist
-        // landed. Roll the capture back and re-stage the owned slot, then
-        // RE-PERSIST so the rolled-back state is durable — otherwise the next
-        // reserve would see the already-persisted capture, report
-        // `AlreadyCommitted`, and SKIP the append forever (a missing
-        // `OutletInvoked`). With the compensating re-persist, the retry sees
-        // `ReadyToExecute` and re-runs settle, appending exactly once. The
-        // rollback+re-persist is a fail-closed Class-S commit of the rolled-back
-        // state — `commit_class_s_keep` keeps it on a re-persist failure (matching
-        // the prior `(true, persist_err)`: capture stays durable, a genuine
-        // fail-closed terminal the operator / crash-recovery sweep reconciles);
-        // on re-persist success the original append error surfaces as
-        // `(false, append_err)`.
-        return match cell
-            .commit_class_s_keep(deps, target_hex, |mut view| {
-                let class_s = view.class_s_mut();
-                class_s.xctx_committed_outputs.remove(saga_id);
-                class_s.saga_pending.insert(
-                    saga_id.clone(),
-                    SagaPreparedState::CrossContextOutletInvocation(prepared),
-                );
-                Ok(())
-            })
-            .await
-        {
-            Ok(()) => Err((false, append_err)),
-            Err(persist_err) => Err((true, persist_err)),
-        };
-    }
-
-    // The capture + persist + append all landed; serializing the receipt for the
-    // reply is a pure encode of already-committed state — a failure here is
-    // `mutated`.
+    // The capture landed; serializing the receipt for the reply is a pure encode
+    // of already-committed state — a failure here is `mutated`.
     let receipt_bytes = jcs_receipt_bytes(&receipt).map_err(|e| (true, e))?;
     Ok(CommitBSettleOutcome {
         receipt: receipt_bytes,
@@ -2034,20 +1884,45 @@ async fn commit_b_settle_finalize(
     })
 }
 
-/// The data `commit_b_first_settle`'s capture combinator (`f`) produces for the
-/// post-persist event-log append + reply: the OWNED original `prepared` (so the
-/// append-failure compensation can re-stage the slot losslessly), the signed
-/// receipt + canonical output + stable event id, and the `OutletInvoked` record
-/// fields. Lives only between the two combinators in that one helper.
-struct CommitBCaptured {
-    prepared: CrossContextOutletInvocationPrepared,
-    receipt: CrossContextOutletReceipt,
-    canonical_output: Vec<u8>,
-    event_id: String,
-    caller_did_str: String,
-    target_context_id: [u8; 32],
-    caller_context_id: [u8; 32],
-    outlet_registration_id: String,
+/// Plans a saga record whose payload is `payload` serialized as JSON, the
+/// encoding every saga record uses, before the saga's irreversible step (spec
+/// 17 §17.3 "Event log write failures").
+///
+/// # Errors
+///
+/// Returns [`ContextError::EventLogFailed`] carrying `serialize_context` when
+/// the payload does not serialize, or when it breaks the append's payload
+/// rules for `event_type`.
+fn plan_saga_json_leaf(
+    event_type: scp_event_log::EventType,
+    actor_did: &str,
+    payload: &serde_json::Value,
+    timestamp_secs: u64,
+    serialize_context: &str,
+) -> Result<crate::context::state::LeafSpec, ContextError> {
+    let data = serde_json::to_vec(payload)
+        .map_err(|e| ContextError::EventLogFailed(format!("{serialize_context}: {e}")))?;
+    crate::context::log_unit_helpers::plan_leaf(
+        event_type,
+        actor_did.to_owned(),
+        scp_event_log::EventPayload { data },
+        timestamp_secs,
+    )
+}
+
+/// Drains the saga actor's queued log units after a saga step queued its
+/// record (spec 17 §17.3 "Event log write failures").
+///
+/// The result is not returned: the step and its record are already durable,
+/// the record stays queued when the drain fails, the drain logs its own
+/// error, and the actor's next command drains again before it runs.
+async fn drain_saga_log_units(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    context_id: &str,
+) {
+    // Ignored on purpose; see the doc comment above.
+    let _ = crate::context::log_unit_helpers::drain_pending_log_units(cell, deps, context_id).await;
 }
 
 /// Sign the [`CrossContextOutletReceipt`] over the staged B-recorded provenance +
@@ -2565,15 +2440,16 @@ fn reemit_committed_stream_settle(
 }
 
 /// First (non-replay) streaming seal-close: seal the frontier root, sign the
-/// streaming receipt, durably capture the witness keyed by `SagaId`, append the
-/// B-side `OutletInvoked`, clear the staged slot, and Class-S persist fail-closed.
+/// streaming receipt, durably capture the witness keyed by `SagaId`, clear the
+/// staged slot, queue the B-side `OutletInvoked` record, and Class-S persist
+/// fail-closed, all in one persist.
 ///
-/// Mirrors [`commit_b_first_settle`]'s two-combinator decomposition (and its
-/// FLAG-COMMIT-B rationale): a capture combinator that RESTORES on persist
-/// failure, then an event-log append whose failure rolls the capture back +
-/// re-stages the slot + re-persists via `commit_class_s_keep`. `(mutated, err)`:
-/// `false` for the pre-append failures (no slot 13042; signing 13044), `true`
-/// once the `OutletInvoked` append has run.
+/// Mirrors [`commit_b_first_settle`]: the record is planned before the capture
+/// and queued in the capture's persist (spec 17 §17.3 "Event log write
+/// failures"), and a persist failure restores the capture, the slot and the
+/// queue together. `(mutated, err)`: `false` for every failure up to and
+/// including the capture persist (no slot 13042; signing 13044; record
+/// planning 13043), `true` once the capture landed.
 #[allow(clippy::too_many_lines)]
 async fn commit_b_stream_first_settle(
     cell: &mut crate::context::actor::class_s::ClassSCell,
@@ -2614,7 +2490,40 @@ async fn commit_b_stream_first_settle(
         .await
         .map_err(|e| (false, e))?;
 
-    // (1) SEAL + CAPTURE + fail-closed persist with RESTORE-on-persist-failure.
+    // Finalize the §5.4.5 counts from the durable frontier prefix. `f` moves out
+    // this same slot, so the counts match the frontier it seals.
+    let billed_count = u32::try_from(peek.frontier.billed_count()).unwrap_or(u32::MAX);
+    let stream_chunk_count = peek.frontier.leaf_count();
+
+    // Plan B's `OutletInvoked` record (spec §6.2.5 dual event-log recording,
+    // target side) before the capture. The streaming record carries the REAL
+    // manifest root + billable + chunk counts + terminal status (never the unary
+    // `output_hash`). CONVERGENT committer-assigned leaf timestamp: B's staged
+    // `recorded_timestamp_ms` (the receipt's `timestamp_ms`), reproduced
+    // byte-for-byte on replay.
+    let invoked_leaf = plan_saga_json_leaf(
+        scp_event_log::EventType::OutletInvoked,
+        &peek.caller_did.0,
+        &serde_json::json!({
+            "saga_id": saga_id.0,
+            "outlet_invoked_event_id": event_id,
+            "caller_context_id": hex_context_id(&peek.caller_context_id),
+            "outlet_registration_id": peek.outlet_registration_id,
+            "chain_depth": receipt.chain_depth,
+            "timestamp_ms": receipt.timestamp_ms,
+            "stream_manifest_hash": hex::encode(stream_manifest_hash),
+            "chunks_billed": billed_count,
+            "stream_chunk_count": stream_chunk_count,
+            "stream_terminal_status": terminal_status,
+            "cancel_ack_seq": cancel_ack_seq,
+        }),
+        receipt.timestamp_ms / 1000,
+        "SCP-SAGA-13043: streaming OutletInvoked payload serialization failed",
+    )
+    .map_err(|e| (false, e))?;
+
+    // SEAL + CAPTURE + queue the record + fail-closed persist with
+    // RESTORE-on-persist-failure (the snapshot covers `pending_log_units`).
     let captured = cell.commit_class_s_restore(deps, &target_hex, |mut view| {
         let saga_pending = &mut view.class_s_mut().saga_pending;
         let removed = saga_pending.remove(saga_id);
@@ -2629,10 +2538,6 @@ async fn commit_b_stream_first_settle(
                 saga_id.0
             )));
         };
-
-        // Finalize the §5.4.5 counts from the same durable frontier prefix.
-        let billed_count = u32::try_from(prepared.frontier.billed_count()).unwrap_or(u32::MAX);
-        let stream_chunk_count = prepared.frontier.leaf_count();
 
         // Settle escrow from the DURABLE ledger (ADR-061 seal step 3; ADR-049
         // §3a(b) decoupled release): reconstruct the pinned escrow from
@@ -2669,11 +2574,6 @@ async fn commit_b_stream_first_settle(
             );
         }
 
-        let caller_did_str = prepared.caller_did.0.clone();
-        let target_context_id = prepared.target_context_id;
-        let caller_context_id = prepared.caller_context_id;
-        let outlet_registration_id = prepared.outlet_registration_id.clone();
-
         // Build the complete close-time settlement from the DURABLE ledger
         // (SCP-OUT-046): escrow refund (`reserved − billed`) + billed capture +
         // §7.3.8 cumulative-counter release, all from the staged fields. The
@@ -2682,7 +2582,7 @@ async fn commit_b_stream_first_settle(
         // Crash recovery builds the IDENTICAL settlement from the same durable
         // prefix, so normal close and recovery settle identically.
         let settlement = crate::context::outlets::invoke::StreamSettlement {
-            context_id: hex_context_id(&target_context_id),
+            context_id: hex_context_id(&prepared.target_context_id),
             invoker_did: prepared.caller_did.clone(),
             reserved: prepared.reserved,
             billed_amount: billed,
@@ -2700,8 +2600,8 @@ async fn commit_b_stream_first_settle(
             cost_per_chunk: prepared.cost_per_chunk,
         };
 
-        // Durable capture keyed by SagaId (AC7 replay witness) — BEFORE the
-        // `OutletInvoked` append, so a persist failure leaves no orphan log entry.
+        // Durable capture keyed by SagaId (AC7 replay witness), in the same
+        // persist as the queued `OutletInvoked` record.
         // SCP-OUT-046 CRITICAL: `settled = false` — the money move is a SEPARATE
         // off-mailbox `settle_outlet_stream_via_actor` the seal task runs next, so
         // a crash / eviction in that window leaves this witness present but
@@ -2733,151 +2633,20 @@ async fn commit_b_stream_first_settle(
             },
         );
 
+        view.enqueue_log_unit(vec![invoked_leaf]);
         Ok(CommitBStreamCaptured {
-            prepared,
-            receipt,
-            stream_manifest_hash,
             billed,
             refund,
-            billed_count,
-            stream_chunk_count,
-            event_id,
-            caller_did_str,
-            target_context_id,
-            caller_context_id,
-            outlet_registration_id,
             settlement,
         })
     });
-
-    let captured = match captured.await {
-        Ok(c) => c,
-        Err(err) => return Err((false, err)),
-    };
-
-    commit_b_stream_settle_finalize(
-        cell,
-        deps,
-        saga_id,
-        &target_hex,
-        terminal_status,
-        cancel_ack_seq,
-        captured,
-        generation,
-    )
-    .await
-}
-
-/// The data the streaming capture combinator produces for the post-persist
-/// event-log append + reply: the OWNED `prepared` (so the append-failure
-/// compensation re-stages the slot losslessly), the signed receipt + sealed root
-/// + counts + stable event id, and the `OutletInvoked` record fields.
-struct CommitBStreamCaptured {
-    prepared: CrossContextStreamingOutletInvocationPrepared,
-    receipt: CrossContextOutletStreamReceipt,
-    stream_manifest_hash: [u8; 32],
-    billed: scp_protocol::economy::types::Amount,
-    refund: scp_protocol::economy::types::Amount,
-    billed_count: u32,
-    stream_chunk_count: u64,
-    event_id: String,
-    caller_did_str: String,
-    target_context_id: [u8; 32],
-    caller_context_id: [u8; 32],
-    outlet_registration_id: String,
-    /// The complete close-time settlement built from the durable ledger
-    /// (SCP-OUT-046) — the off-mailbox seal task applies it.
-    settlement: crate::context::outlets::invoke::StreamSettlement,
-}
-
-/// Post-capture half of [`commit_b_stream_first_settle`]: append the B-side
-/// `OutletInvoked` (streaming shape — real root, `chunks_billed`,
-/// `stream_chunk_count`, terminal status), and on append failure roll the capture
-/// back + re-stage the owned slot + re-persist via
-/// [`ClassSCell::commit_class_s_keep`](crate::context::actor::class_s::ClassSCell::commit_class_s_keep). Mirrors [`commit_b_settle_finalize`].
-#[allow(clippy::too_many_arguments)]
-async fn commit_b_stream_settle_finalize(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
-    deps: &ActorDeps,
-    saga_id: &SagaId,
-    target_hex: &str,
-    terminal_status: &StreamTerminalStatus,
-    cancel_ack_seq: Option<u64>,
-    captured: CommitBStreamCaptured,
-    generation: u64,
-) -> Result<CommitBStreamSettleOutcome, (bool, ContextError)> {
     let CommitBStreamCaptured {
-        prepared,
-        receipt,
-        stream_manifest_hash,
         billed,
         refund,
-        billed_count,
-        stream_chunk_count,
-        event_id,
-        caller_did_str,
-        target_context_id,
-        caller_context_id,
-        outlet_registration_id,
         settlement,
-    } = captured;
+    } = captured.await.map_err(|err| (false, err))?;
 
-    // Append `OutletInvoked` to the local (target) log (spec §6.2.5 dual event-log
-    // recording, target side). The streaming record carries the REAL manifest root
-    // + billable + chunk counts + terminal status (never the unary `output_hash`).
-    // CONVERGENT committer-assigned leaf timestamp: B's staged `recorded_timestamp_ms`
-    // (the receipt's `timestamp_ms`), reproduced byte-for-byte on replay.
-    let outlet_invoked_payload = serde_json::json!({
-        "saga_id": saga_id.0,
-        "outlet_invoked_event_id": event_id,
-        "caller_context_id": hex_context_id(&caller_context_id),
-        "outlet_registration_id": outlet_registration_id,
-        "chain_depth": receipt.chain_depth,
-        "timestamp_ms": receipt.timestamp_ms,
-        "stream_manifest_hash": hex::encode(stream_manifest_hash),
-        "chunks_billed": billed_count,
-        "stream_chunk_count": stream_chunk_count,
-        "stream_terminal_status": terminal_status,
-        "cancel_ack_seq": cancel_ack_seq,
-    });
-    let append_result = match serde_json::to_vec(&outlet_invoked_payload) {
-        Ok(bytes) => {
-            deps.event_log
-                .append_context_event_with_payload(
-                    crate::context::builder::AppendMode::AfterSideEffect,
-                    &target_context_id,
-                    scp_event_log::EventType::OutletInvoked,
-                    &caller_did_str,
-                    scp_event_log::EventPayload { data: bytes },
-                    receipt.timestamp_ms / 1000,
-                )
-                .await
-        }
-        Err(e) => Err(ContextError::EventLogFailed(format!(
-            "SCP-SAGA-13043: streaming OutletInvoked payload serialization failed: {e}"
-        ))),
-    };
-
-    if let Err(append_err) = append_result {
-        // Append failed AFTER the capture+persist landed: roll the capture back +
-        // re-stage the owned slot + re-persist (KEEP on re-persist failure), so a
-        // retry re-runs the seal and appends exactly once (mirrors the unary path).
-        return match cell
-            .commit_class_s_keep(deps, target_hex, |mut view| {
-                let class_s = view.class_s_mut();
-                class_s.xctx_committed_stream_outputs.remove(saga_id);
-                class_s.saga_pending.insert(
-                    saga_id.clone(),
-                    SagaPreparedState::CrossContextStreamingOutletInvocation(prepared),
-                );
-                Ok(())
-            })
-            .await
-        {
-            Ok(()) => Err((false, append_err)),
-            Err(persist_err) => Err((true, persist_err)),
-        };
-    }
+    drain_saga_log_units(cell, deps, &target_hex).await;
 
     let receipt_bytes = jcs_stream_receipt_bytes(&receipt).map_err(|e| (true, e))?;
     Ok(CommitBStreamSettleOutcome {
@@ -2893,6 +2662,16 @@ async fn commit_b_stream_settle_finalize(
         settlement: Some(Box::new(settlement)),
         generation,
     })
+}
+
+/// The settlement figures the streaming capture combinator computes from the
+/// durable ledger, for the reply.
+struct CommitBStreamCaptured {
+    billed: scp_protocol::economy::types::Amount,
+    refund: scp_protocol::economy::types::Amount,
+    /// The complete close-time settlement built from the durable ledger
+    /// (SCP-OUT-046) — the off-mailbox seal task applies it.
+    settlement: crate::context::outlets::invoke::StreamSettlement,
 }
 
 /// Sign the [`CrossContextOutletStreamReceipt`] over the staged B-recorded
@@ -2957,8 +2736,9 @@ struct CommitARequest {
     output_bytes: Vec<u8>,
 }
 
-/// Builds the caller-side `CrossContextOutletInvoked` leaf: its CONVERGENT
-/// committer-assigned timestamp (seconds) + its JSON payload bytes.
+/// Plans the caller-side `CrossContextOutletInvoked` leaf with its CONVERGENT
+/// committer-assigned timestamp (seconds) and its JSON payload, before
+/// Commit-A's irreversible settle (spec 17 §17.3 "Event log write failures").
 ///
 /// The caller-side record is a commit-ordered convergent durable leaf (ADR-011
 /// Amendment §6 carve-out), NOT a per-author-excluded event. It MUST hash the
@@ -2976,49 +2756,42 @@ struct CommitARequest {
 /// # Errors
 ///
 /// Returns [`ContextError::EventLogFailed`] if the receipt cannot be parsed for
-/// its timestamp or the payload cannot be serialized.
-//
-// Takes the individual fields rather than `&CommitARequest` because by this
-// point `req.reservation` has been partially moved (its ticket was consumed by
-// the settle path), so a whole-`req` borrow would not compile.
+/// its timestamp, the payload cannot be serialized, or the payload breaks the
+/// append's payload rules.
 fn cross_context_invoked_leaf(
-    receipt_bytes: &[u8],
-    saga_id: &str,
-    target_context_id: &[u8; 32],
-    nonce: &[u8; 16],
-    output_bytes: &[u8],
-) -> Result<(u64, Vec<u8>), ContextError> {
+    req: &CommitARequest,
+) -> Result<crate::context::state::LeafSpec, ContextError> {
     let receipt: CrossContextOutletReceipt =
-        serde_json::from_slice(receipt_bytes).map_err(|err| {
+        serde_json::from_slice(&req.receipt).map_err(|err| {
             ContextError::EventLogFailed(format!(
                 "SCP-SAGA-13039: CrossContextOutletInvoked timestamp could not be \
                  read from the receipt: {err}"
             ))
         })?;
-    let invoked_leaf_secs = receipt.timestamp_ms / 1000;
-    let invoked_payload = serde_json::json!({
-        "saga_id": saga_id,
-        "target_context_id": hex_context_id(target_context_id),
-        "nonce": hex::encode(nonce),
-        "output_hash": hex_output_hash(output_bytes),
-        "receipt_len": receipt_bytes.len(),
-    });
-    let invoked_payload_bytes = serde_json::to_vec(&invoked_payload).map_err(|err| {
-        ContextError::EventLogFailed(format!(
-            "SCP-SAGA-13040: CrossContextOutletInvoked payload serialization failed: {err}"
-        ))
-    })?;
-    Ok((invoked_leaf_secs, invoked_payload_bytes))
+    plan_saga_json_leaf(
+        scp_event_log::EventType::CrossContextOutletInvoked,
+        req.caller_did.as_ref(),
+        &serde_json::json!({
+            "saga_id": req.saga_id.0,
+            "target_context_id": hex_context_id(&req.target_context_id),
+            "nonce": hex::encode(req.nonce),
+            "output_hash": hex_output_hash(&req.output_bytes),
+            "receipt_len": req.receipt.len(),
+        }),
+        receipt.timestamp_ms / 1000,
+        "SCP-SAGA-13040: CrossContextOutletInvoked payload serialization failed",
+    )
 }
 
 /// Commit-A handler (spec §6.2.4 "Commit", caller side). Runs on the LOCAL
 /// caller-context actor.
 ///
 /// Settles the escrow + outbound-rate-limit reservation staged at Prepare-A
-/// (§19.2.2), appends `CrossContextOutletInvoked` referencing the target ctx id +
+/// (§19.2.2), queues `CrossContextOutletInvoked` referencing the target ctx id +
 /// the SAME `nonce` (the join key between the two records, §6.2.4 "Dual
-/// event-log recording"), Class-S sync-persists fail-closed, and acks.
-/// Idempotent by `SagaId`: a replay re-acks without re-settling or re-appending
+/// event-log recording") in the witness's fail-closed Class-S persist (spec 17
+/// §17.3 "Event log write failures"), and acks.
+/// Idempotent by `SagaId`: a replay re-acks without re-settling or re-queueing
 /// (the reservation's RAII ticket is consumed, so a true double-settle cannot
 /// occur — but the durable marker is the idempotency witness).
 async fn commit_a(
@@ -3089,6 +2862,21 @@ async fn commit_a(
         };
     }
 
+    // Plan the convergent `CrossContextOutletInvoked` leaf BEFORE the settle, the
+    // saga's irreversible step (spec 17 §17.3 "Event log write failures"). A
+    // malformed receipt or a payload that does not encode refuses Commit-A before
+    // the escrow moves. The reservation's ticket must still be consumed, so the
+    // refusal releases it through the abort path (the same release a live Abort
+    // runs: generation-checked ticket rollback + durable record consumed). The
+    // FSM verified this receipt from the same bytes before sending Commit-A, so
+    // this branch is unreachable for a receipt the FSM accepted.
+    let invoked_leaf = match cross_context_invoked_leaf(&req) {
+        Ok(leaf) => leaf,
+        Err(plan_err) => {
+            return refuse_commit_a_before_settle(cell, deps, req, plan_err, reply).await;
+        }
+    };
+
     // Settle (capture) the escrow + outbound rate-limit reservation. The
     // reservation was staged at Prepare-A and held by the FSM; Commit-A applies
     // it via the existing single-context settle/capture path (§19.2.2).
@@ -3104,48 +2892,17 @@ async fn commit_a(
         return Outcome::err_mutated(sketch);
     }
 
-    // Order matters (provenance-integrity), mirroring `commit_b_first_settle`:
-    // the idempotency witness + Class-S persist land BEFORE the
-    // `CrossContextOutletInvoked` event-log append. The event log is a SEPARATE
-    // provider not covered by `persist_state_fail_closed` and the append is NOT
-    // provider-idempotent, so appending FIRST (the inverse, B-side-documented
-    // hazard) would leave a DURABLE A-side `CrossContextOutletInvoked` orphan when
-    // the post-append persist fails: the witness is rolled back, but the log
-    // entry already landed — an A-without-B record that B's log denies and that
-    // `divergence_marker_plan` (keyed off the B-committed event id) would not
-    // surface, a silent one-sided A-record. Appending only AFTER the witness +
-    // persist succeed makes a persist failure leave NO orphan log entry.
-
-    // Order matters (provenance-integrity), mirroring `commit_b_first_settle`:
-    // the idempotency witness + Class-S persist land BEFORE the
-    // `CrossContextOutletInvoked` event-log append. The same persist-fail-direction
-    // mismatch as `commit_b_first_settle` applies here, so this site uses the SAME
-    // two-combinator decomposition — see FLAG-COMMIT-B. `commit_class_s_then_append`
-    // would KEEP the witness on a persist failure; Commit-A must RESTORE it (roll
-    // the witness back AND re-stash the consumed record). Decomposition:
-    //   (1) `commit_class_s_restore` — insert the witness + remove the durable
-    //       caller-reservation record, fail-closed persist; on persist failure
-    //       RESTORE both (witness un-inserted, record re-inserted) — byte-identical
-    //       to the prior inline rollback, reported `err_mutated` (the settle above
-    //       already mutated owned economy).
-    //   (2) the leaf build + append run AFTER (1); on either failure the
-    //       compensation rolls back the WITNESS ONLY (the consumed record stays
-    //       consumed — matching the prior leaf/append arms, which re-insert the
-    //       witness but NOT the record) and re-persists via `commit_class_s_keep`
-    //       (keep on re-persist failure ⇒ witness stays durable, the prior
-    //       `err_mutated` terminal).
-
-    // (1) Record the committed A-side saga (the idempotency witness) and consume
-    // the durable caller-reservation record in the SAME Class-S snapshot, then
-    // persist fail-closed BEFORE the append. A crash that rolled the settle/marker
-    // back behind an acked Commit-A would double-settle on replay; the consumed
-    // record (the reservation was just SETTLED via the carrier) must go in the
-    // same snapshot so a surviving record can never let a later spurious abort
-    // reverse already-settled state. On persist failure `commit_class_s_restore`
-    // rolls BOTH back together (witness removed, record re-inserted) and the saga
-    // is retried from a clean state. The settle already mutated owned economy and
-    // NO `CrossContextOutletInvoked` was appended, so the failure is reported
-    // `err_mutated` with no orphan log entry.
+    // Record the committed A-side saga (the idempotency witness), consume the
+    // durable caller-reservation record, and queue the `CrossContextOutletInvoked`
+    // record in the SAME Class-S snapshot, then persist fail-closed. A crash that
+    // rolled the settle/marker back behind an acked Commit-A would double-settle
+    // on replay; the consumed record (the reservation was just SETTLED via the
+    // carrier) must go in the same snapshot so a surviving record can never let a
+    // later spurious abort reverse already-settled state. On persist failure
+    // `commit_class_s_restore` rolls all three back together (witness removed,
+    // record re-inserted, record unqueued; the snapshot covers
+    // `pending_log_units`), so no orphan A-side record can reach the log. The
+    // settle already mutated owned economy, so the failure is `err_mutated`.
     if let Err(persist_err) = cell
         .commit_class_s_restore(deps, &caller_hex, |mut view| {
             let class_s = view.class_s_mut();
@@ -3153,6 +2910,7 @@ async fn commit_a(
                 .xctx_committed_invocations
                 .insert(req.saga_id.clone());
             class_s.xctx_caller_reservations.remove(&req.saga_id);
+            view.enqueue_log_unit(vec![invoked_leaf]);
             Ok(())
         })
         .await
@@ -3162,72 +2920,60 @@ async fn commit_a(
         return Outcome::err_mutated(sketch);
     }
 
-    // (2) Build the convergent `CrossContextOutletInvoked` leaf (timestamp + payload
-    // bytes) from the forwarded receipt + request. A malformed receipt or
-    // serialization failure here is a post-witness fault handled by the SAME
-    // witness-only rollback + re-persist as the append-failure path below.
-    let leaf = cross_context_invoked_leaf(
-        &req.receipt,
-        &req.saga_id.0,
-        &req.target_context_id,
-        &req.nonce,
-        &req.output_bytes,
-    );
-    let append_result = match leaf {
-        Ok((invoked_leaf_secs, invoked_payload_bytes)) => {
-            deps.event_log
-                .append_context_event_with_payload(
-                    crate::context::builder::AppendMode::AfterSideEffect,
-                    &req.caller_context_id,
-                    scp_event_log::EventType::CrossContextOutletInvoked,
-                    req.caller_did.as_ref(),
-                    scp_event_log::EventPayload {
-                        data: invoked_payload_bytes,
-                    },
-                    invoked_leaf_secs,
-                )
-                .await
-        }
-        Err(err) => Err(err),
-    };
-
-    if let Err(append_err) = append_result {
-        // The leaf build or append failed AFTER the witness + persist landed. Roll
-        // the WITNESS back (the consumed record stays consumed — the prior arms
-        // re-inserted the witness but NOT the record) and RE-PERSIST so the
-        // rolled-back state is durable — otherwise the next Commit-A would see the
-        // already-persisted witness, re-ack as committed, and SKIP the append
-        // forever (a missing `CrossContextOutletInvoked`). With the compensating
-        // re-persist, a retry re-runs Commit-A and appends exactly once. The
-        // rollback+re-persist is a fail-closed Class-S commit — `commit_class_s_keep`
-        // keeps it on a re-persist failure (witness stays durable, a genuine
-        // fail-closed terminal the operator / crash-recovery sweep reconciles).
-        // Mirrors `commit_b_first_settle`'s append-failure compensation. Both arms
-        // reply + return `err_mutated`.
-        let (reply_err, sketch) = match cell
-            .commit_class_s_keep(deps, &caller_hex, |mut view| {
-                view.class_s_mut()
-                    .xctx_committed_invocations
-                    .remove(&req.saga_id);
-                Ok(())
-            })
-            .await
-        {
-            Ok(()) => {
-                let sketch = outcome_error_sketch(&append_err);
-                (append_err, sketch)
-            }
-            Err(persist_err) => {
-                let sketch = outcome_error_sketch(&persist_err);
-                (persist_err, sketch)
-            }
-        };
-        let _ = reply.send(Err(reply_err));
-        return Outcome::err_mutated(sketch);
-    }
+    drain_saga_log_units(cell, deps, &caller_hex).await;
 
     let _ = reply.send(Ok(()));
     Outcome::ok_mutated(())
+}
+
+/// Refuses a Commit-A whose `CrossContextOutletInvoked` record could not be
+/// planned, before the settle. The held reservation is released through
+/// [`abort`], so its ticket is consumed and the durable caller-reservation
+/// record cannot reverse anything later. The caller receives `plan_err`, or
+/// the release's own error when the release fails (the plan error is then
+/// logged).
+async fn refuse_commit_a_before_settle(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    req: CommitARequest,
+    plan_err: ContextError,
+    reply: tokio::sync::oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let released = Box::pin(abort(
+        cell,
+        deps,
+        &req.saga_id,
+        Some(req.reservation),
+        release_tx,
+    ))
+    .await;
+    let reply_err = match release_rx.await {
+        Ok(Ok(())) => plan_err,
+        Ok(Err(release_err)) => {
+            tracing::error!(
+                saga_id = %req.saga_id.0,
+                error = %plan_err,
+                "Commit-A refused before the settle; releasing the reservation failed too"
+            );
+            release_err
+        }
+        Err(_) => {
+            tracing::error!(
+                saga_id = %req.saga_id.0,
+                error = %plan_err,
+                "Commit-A refused before the settle; the release sent no reply"
+            );
+            plan_err
+        }
+    };
+    let sketch = outcome_error_sketch(&reply_err);
+    let _ = reply.send(Err(reply_err));
+    if released.mutated {
+        Outcome::err_mutated(sketch)
+    } else {
+        Outcome::err(sketch)
+    }
 }
 
 /// Commit-A witness check (spec §17.16.4). Runs on the LOCAL caller-context
@@ -3497,33 +3243,6 @@ async fn abort(
 // EmitDivergenceMarker — either side (spec §6.2.4 "Dual event-log recording")
 // ---------------------------------------------------------------------------
 
-/// Emit a signed [`CrossContextDivergenceMarker`] into the LOCAL event log on a
-/// `NeedsRepair` outcome (spec §6.2.4 "Dual event-log recording"). Runs on the
-/// LOCAL actor; the emitting side's Active Signing Key is passed per-call (the
-/// actor holds no key).
-///
-/// The marker records which side committed, the `SagaId`, the `nonce`, and the
-/// committed-side event id — making a one-sided commit durably auditable rather
-/// than a silent repudiation primitive. Class-S sync-persists fail-closed.
-///
-/// `committed_timestamp_secs` is the CONVERGENT committer-assigned leaf
-/// timestamp — B's staged `recorded_timestamp_ms / 1000`, the same convergent
-/// instant the committed-side `OutletInvoked` leaf carries (spec §6.2.4 *Recorded
-/// timestamp*). The marker is a commit-ordered convergent durable leaf (ADR-011
-/// Amendment §6 carve-out), so the timestamp MUST be this convergent value and
-/// NOT an actor-local clock read, or two honest members would derive divergent
-/// marker leaves (§9.9.3).
-// `Send` discipline (ADR-049 Decision 7): the Class-S persist is now `.await`ed
-// (async `ContextPersistence`), so this handler takes the ALREADY-BUILT owned
-// `snapshot` and the `Copy` `context_id` — NOT a `&PerContextState`. A shared
-// `&PerContextState` (`!Sync`, holds a `dyn FnMut` sink) held across the persist
-// `.await` would make the actor future `!Send` and fail `tokio::spawn`. The
-// caller builds the snapshot (holding its `&mut ClassSCell`) BEFORE calling this,
-// then hands over the owned snapshot; the event-log append targets
-// `deps.event_log` (independent of `state`), so building the snapshot first is
-// behaviour-preserving. A snapshot the caller could not build (no floor export:
-// the Supervisor has dropped, ADR-049 Decision 16) persists nothing and replies
-// with that typed error.
 /// Sign a [`CrossContextDivergenceMarker`] through the emitting side's custody
 /// signer (ADR-049 Decision 7a). A preimage failure is `SCP-SAGA-13036`; a
 /// custody refusal or timeout keeps its typed [`ContextError::Custody`].
@@ -3542,36 +3261,60 @@ async fn sign_divergence_marker(
     Ok(unsigned.with_signature(signature))
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn emit_divergence_marker(
-    context_id: [u8; 32],
-    snapshot: Result<crate::context::state::ContextSnapshot, ContextError>,
-    deps: &ActorDeps,
-    saga_id: &SagaId,
+/// The marker fields [`queue_divergence_marker`] signs and records.
+struct DivergenceMarkerRequest {
+    saga_id: SagaId,
     nonce: [u8; 16],
     committed_side: CommittedSide,
-    committed_event_id: &str,
+    committed_event_id: String,
+    /// The CONVERGENT committer-assigned leaf timestamp — B's staged
+    /// `recorded_timestamp_ms / 1000`, the same convergent instant the
+    /// committed-side `OutletInvoked` leaf carries (spec §6.2.4 *Recorded
+    /// timestamp*). The marker is a commit-ordered convergent durable leaf
+    /// (ADR-011 Amendment §6 carve-out), so the timestamp MUST be this value
+    /// and NOT an actor-local clock read, or two honest members would derive
+    /// divergent marker leaves (§9.9.3).
     committed_timestamp_secs: u64,
+}
+
+/// Signs a [`CrossContextDivergenceMarker`] and queues it for the LOCAL event
+/// log on a `NeedsRepair` outcome (spec §6.2.4 "Dual event-log recording").
+/// Runs on the LOCAL actor; the emitting side's Active Signing Key is passed
+/// per-call (the actor holds no key).
+///
+/// The marker records which side committed, the `SagaId`, the `nonce`, and the
+/// committed-side event id — making a one-sided commit durably auditable rather
+/// than a silent repudiation primitive.
+///
+/// The marker is written after the saga's irreversible commit, so it is queued
+/// as a pending log unit in a fail-closed keep persist (spec 17 §17.3 "Event
+/// log write failures") and only the drain writes it to the log. A queued unit
+/// ahead of it therefore never refuses the marker: the marker joins the queue's
+/// tail. A persist failure (including a snapshot that cannot be built because
+/// the Supervisor has dropped, ADR-049 Decision 16) replies with that typed
+/// error; the marker stays queued in memory, and the actor's next drain writes
+/// it.
+async fn queue_divergence_marker(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    request: DivergenceMarkerRequest,
     signer: &CommandSigner,
     reply: tokio::sync::oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    // Bound by reference: a moved-out copy would give this future a second
-    // `ContextSnapshot`-sized slot (clippy `large_futures`).
-    let snapshot = match snapshot {
-        Ok(ref snapshot) => snapshot,
-        Err(e) => {
-            let sketch = outcome_error_sketch(&e);
-            let _ = reply.send(Err(e));
-            return Outcome::err(sketch);
-        }
-    };
-    let context_hex = hex_context_id(&context_id);
+    let context_hex = hex_context_id(&cell.context_id);
+    let DivergenceMarkerRequest {
+        saga_id,
+        nonce,
+        committed_side,
+        committed_event_id,
+        committed_timestamp_secs,
+    } = request;
 
     let fields = CrossContextDivergenceMarkerFields {
         saga_id: saga_id.0.clone(),
         nonce,
         committed_side,
-        committed_event_id: committed_event_id.to_owned(),
+        committed_event_id,
     };
     let marker = match sign_divergence_marker(signer, fields).await {
         Ok(m) => m,
@@ -3583,50 +3326,46 @@ async fn emit_divergence_marker(
     };
 
     // Serialize the signed marker as the event-leaf payload so an auditor can
-    // verify it directly from the log entry. The `saga_id` provenance formerly
-    // carried in the event-name string now rides INSIDE the payload — `saga_id`
-    // is a signed field of the `CrossContextDivergenceMarker` — while the typed
-    // `EventType::CrossContextDivergenceMarker` replaces the string name.
-    let marker_payload_bytes = match serde_json::to_vec(&marker) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            let err = ContextError::CryptoFailed(format!(
+    // verify it directly from the log entry. The `saga_id` provenance rides
+    // INSIDE the payload — `saga_id` is a signed field of the
+    // `CrossContextDivergenceMarker` — and the typed
+    // `EventType::CrossContextDivergenceMarker` names the record.
+    let marker_leaf = match serde_json::to_vec(&marker)
+        .map_err(|e| {
+            ContextError::CryptoFailed(format!(
                 "SCP-SAGA-13037: divergence-marker serialization failed for saga '{}': {e}",
                 saga_id.0
-            ));
+            ))
+        })
+        .and_then(|data| {
+            crate::context::log_unit_helpers::plan_leaf(
+                scp_event_log::EventType::CrossContextDivergenceMarker,
+                scp_event_log::system_actors::SYSTEM_SAGA_ACTOR.to_owned(),
+                scp_event_log::EventPayload { data },
+                committed_timestamp_secs,
+            )
+        }) {
+        Ok(leaf) => leaf,
+        Err(err) => {
             let sketch = outcome_error_sketch(&err);
             let _ = reply.send(Err(err));
             return Outcome::err(sketch);
         }
     };
-    if let Err(err) = deps
-        .event_log
-        .append_context_event_with_payload(
-            crate::context::builder::AppendMode::AfterSideEffect,
-            &context_id,
-            scp_event_log::EventType::CrossContextDivergenceMarker,
-            scp_event_log::system_actors::SYSTEM_SAGA_ACTOR,
-            scp_event_log::EventPayload {
-                data: marker_payload_bytes,
-            },
-            committed_timestamp_secs,
-        )
+
+    if let Err(persist_err) = cell
+        .commit_class_s_keep(deps, &context_hex, |mut view| {
+            view.enqueue_log_unit(vec![marker_leaf]);
+            Ok(())
+        })
         .await
     {
-        let sketch = outcome_error_sketch(&err);
-        let _ = reply.send(Err(err));
-        return Outcome::err(sketch);
-    }
-
-    // Class-S persist fail-closed: the divergence record is the durable
-    // audit witness operator-repair relies on; it MUST land before acking. The
-    // `snapshot` was built by the caller (from its `&mut ClassSCell`) before this
-    // handler ran, so no `&PerContextState` is held across the persist `.await`.
-    if let Err(persist_err) = persist_snapshot_fail_closed(snapshot, deps, &context_hex).await {
         let sketch = outcome_error_sketch(&persist_err);
         let _ = reply.send(Err(persist_err));
         return Outcome::err_mutated(sketch);
     }
+
+    drain_saga_log_units(cell, deps, &context_hex).await;
 
     let _ = reply.send(Ok(()));
     Outcome::ok_mutated(())
@@ -3922,12 +3661,14 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl crate::context::builder::ContextEventLogProvider for CountingEventLog {
+        // An empty log that exists, so the drain's default unit write places
+        // the unit at sequence 0 and reaches the counting `append_event`.
         fn event_log_entries(
             &self,
             _context_id: &[u8; 32],
         ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
         {
-            Ok(None)
+            Ok(Some(Vec::new()))
         }
 
         async fn init_event_log(
@@ -5713,6 +5454,10 @@ mod tests {
             !st_cell.class_s.xctx_committed_invocations.contains(&saga),
             "the rolled-back witness must not survive a persist failure"
         );
+        assert!(
+            st_cell.class_s.pending_log_units.is_empty(),
+            "the restore rolled the queued record back with the witness"
+        );
     }
 
     #[tokio::test]
@@ -6122,67 +5867,14 @@ mod tests {
         );
     }
 
+    /// A signed divergence marker is queued in its persist and the drain
+    /// writes it as the log's `CrossContextDivergenceMarker` leaf; the leaf's
+    /// payload is the signed marker and verifies under the emitting key.
     #[tokio::test]
-    async fn emit_divergence_marker_appends_verifiable_marker() {
+    async fn divergence_marker_queues_and_drains_a_verifiable_leaf() {
         use scp_protocol::context::outlets::cross_context_saga::CrossContextDivergenceMarker;
         let issuer = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
         let st = target_state(0xC7, OTHER, CALLER).await;
-        let deps = build_deps(
-            OTHER.to_owned(),
-            issuer.verifying_key(),
-            Box::new(OkPersistence),
-        )
-        .await;
-
-        let signing = test_signer(0x99);
-        let saga = SagaId("saga-divergence".to_owned());
-        let (tx, rx) = oneshot::channel();
-        let ctx_hex = hex_context_id(&st.context_id);
-        let snap = build_snapshot_for_persist(&st, &deps, &ctx_hex);
-        let out = emit_divergence_marker(
-            st.context_id,
-            snap,
-            &deps,
-            &saga,
-            [0xAB; 16],
-            CommittedSide::Target,
-            "evt-committed-9",
-            // Convergent committer-assigned leaf timestamp (B's staged
-            // recorded_timestamp_ms / 1000); fixed here so the test is
-            // deterministic.
-            1_700_000_000,
-            &signing,
-            tx,
-        )
-        .await;
-        assert!(out.result.is_ok(), "emit: {:?}", out.result);
-        rx.await.unwrap().expect("emit ack");
-
-        // The marker the handler signed verifies against the emitting key.
-        let marker = CrossContextDivergenceMarker::sign(
-            &ed25519_dalek::SigningKey::from_bytes(&[0x99; 32]),
-            CrossContextDivergenceMarkerFields {
-                saga_id: saga.0.clone(),
-                nonce: [0xAB; 16],
-                committed_side: CommittedSide::Target,
-                committed_event_id: "evt-committed-9".to_owned(),
-            },
-        )
-        .expect("marker");
-        marker
-            .verify(&signing.verifying_key().expect("signer key"))
-            .expect("marker verifies");
-    }
-
-    /// While the context has queued log units, the divergence marker's
-    /// append after the irreversible commit is refused at the provider's
-    /// write gate (spec 17 §17.3 "Event log write failures"): the handler
-    /// replies with the typed error and the log is unchanged. With no queued
-    /// unit the same marker appends.
-    #[tokio::test]
-    async fn emit_divergence_marker_is_refused_while_units_are_queued() {
-        let issuer = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
-        let st = target_state(0xD7, OTHER, CALLER).await;
         let deps = build_deps_with_providers(
             OTHER.to_owned(),
             issuer.verifying_key(),
@@ -6190,74 +5882,159 @@ mod tests {
             Box::new(OkPersistence),
         )
         .await;
-        deps.event_log
-            .init_event_log(&st.context_id)
-            .await
-            .expect("init log");
-        let ctx_hex = hex_context_id(&st.context_id);
+        let ctx = st.context_id;
+        deps.event_log.init_event_log(&ctx).await.expect("init log");
         let signing = test_signer(0x99);
-        let saga = SagaId("saga-divergence-fenced".to_owned());
+        let saga = SagaId("saga-divergence".to_owned());
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(st);
 
-        for pending in [true, false] {
-            deps.event_log.set_units_pending(&st.context_id, pending);
-            let (tx, rx) = oneshot::channel();
-            let out = emit_divergence_marker(
-                st.context_id,
-                build_snapshot_for_persist(&st, &deps, &ctx_hex),
-                &deps,
-                &saga,
-                [0xAB; 16],
-                CommittedSide::Target,
-                "evt-committed-11",
-                1_700_000_000,
-                &signing,
-                tx,
-            )
-            .await;
-            let reply = rx.await.expect("reply");
-            let (len, _) = deps
-                .event_log
-                .event_log_summary(&st.context_id)
-                .expect("summary");
-            if pending {
-                assert!(out.result.is_err(), "the Outcome records the refusal");
-                assert!(
-                    matches!(reply, Err(ContextError::EventLogFailed(_))),
-                    "{reply:?}"
-                );
-                assert_eq!(len, 0, "no marker while a unit is queued");
-            } else {
-                reply.expect("emit ack");
-                assert_eq!(len, 1, "the marker appends once the queue is empty");
-            }
-        }
+        let (tx, rx) = oneshot::channel();
+        let out = queue_divergence_marker(
+            &mut cell,
+            &deps,
+            DivergenceMarkerRequest {
+                saga_id: saga.clone(),
+                nonce: [0xAB; 16],
+                committed_side: CommittedSide::Target,
+                committed_event_id: "evt-committed-9".to_owned(),
+                // Convergent committer-assigned leaf timestamp (B's staged
+                // recorded_timestamp_ms / 1000).
+                committed_timestamp_secs: 1_700_000_000,
+            },
+            &signing,
+            tx,
+        )
+        .await;
+        assert!(out.result.is_ok(), "marker: {:?}", out.result);
+        rx.await.unwrap().expect("marker ack");
+
+        assert!(
+            cell.class_s.pending_log_units.is_empty(),
+            "the drain wrote the queued marker"
+        );
+        let entries = deps
+            .event_log
+            .event_log_entries(&ctx)
+            .expect("the log reads")
+            .expect("the log exists");
+        assert_eq!(entries.len(), 1, "exactly one marker leaf");
+        let leaf = &entries[0];
+        assert_eq!(
+            leaf.event_type,
+            scp_event_log::EventType::CrossContextDivergenceMarker
+        );
+        assert_eq!(leaf.timestamp, 1_700_000_000, "the convergent timestamp");
+        let marker: CrossContextDivergenceMarker =
+            serde_json::from_slice(&leaf.payload.data).expect("the payload is the marker");
+        marker
+            .verify(&signing.verifying_key().expect("signer key"))
+            .expect("the logged marker verifies under the emitting key");
+        assert_eq!(marker.saga_id, saga.0);
+    }
+
+    /// Must-fail (spec 17 §17.3 "Event log write failures"): with a unit
+    /// already queued and the log refusing writes, the divergence marker is
+    /// queued behind that unit and acknowledged; it is never refused. Once
+    /// the log accepts writes the drain writes both units in order.
+    #[tokio::test]
+    async fn divergence_marker_queues_behind_a_waiting_unit_when_the_log_fails() {
+        use crate::context::log_unit_helpers::test_support::{
+            fail_log_entry_writes, faulty_merkle_log, log_len, queued_unit_types,
+        };
+        use scp_event_log::EventType;
+        let issuer = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let st = target_state(0xD7, OTHER, CALLER).await;
+        let ctx = st.context_id;
+        let (log, faulty) = faulty_merkle_log();
+        let deps = build_deps_with_providers(
+            OTHER.to_owned(),
+            issuer.verifying_key(),
+            Box::new(log),
+            Box::new(OkPersistence),
+        )
+        .await;
+        deps.event_log.init_event_log(&ctx).await.expect("init log");
+        fail_log_entry_writes(&faulty, &ctx);
+        let ctx_hex = hex_context_id(&ctx);
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(st);
+        let waiting = crate::context::log_unit_helpers::plan_leaf(
+            EventType::GovernanceAction,
+            OTHER.to_owned(),
+            scp_event_log::EventPayload {
+                data: br#"{"waiting":true}"#.to_vec(),
+            },
+            1_699_999_999,
+        )
+        .expect("plan the waiting leaf");
+        cell.commit_class_s_keep(&deps, &ctx_hex, |mut view| {
+            view.enqueue_log_unit(vec![waiting]);
+            Ok(())
+        })
+        .await
+        .expect("queue the waiting unit");
+
+        let (tx, rx) = oneshot::channel();
+        let out = queue_divergence_marker(
+            &mut cell,
+            &deps,
+            DivergenceMarkerRequest {
+                saga_id: SagaId("saga-divergence-queued".to_owned()),
+                nonce: [0xAB; 16],
+                committed_side: CommittedSide::Target,
+                committed_event_id: "evt-committed-11".to_owned(),
+                committed_timestamp_secs: 1_700_000_000,
+            },
+            &test_signer(0x99),
+            tx,
+        )
+        .await;
+        assert!(out.result.is_ok(), "the marker is not refused");
+        rx.await
+            .unwrap()
+            .expect("the marker is acknowledged while the log refuses writes");
+        assert_eq!(
+            queued_unit_types(&cell.class_s.pending_log_units),
+            vec![
+                vec![EventType::GovernanceAction],
+                vec![EventType::CrossContextDivergenceMarker],
+            ],
+            "the marker waits behind the earlier unit"
+        );
+        assert_eq!(log_len(&deps, &ctx), 0, "the refused log holds nothing");
+
+        faulty.clear_fail();
+        crate::context::log_unit_helpers::drain_pending_log_units(&mut cell, &deps, &ctx_hex)
+            .await
+            .expect("the drain writes both units");
+        assert_eq!(log_len(&deps, &ctx), 2, "both units land, in order");
+        assert!(cell.class_s.pending_log_units.is_empty());
     }
 
     #[tokio::test]
-    async fn emit_divergence_marker_writes_nothing_after_supervisor_drops() {
+    async fn divergence_marker_writes_nothing_after_supervisor_drops() {
         use crate::context::messaging_helpers::dropped_supervisor_tests::{
-            Fixture, assert_shut_down, ctx_hex, state,
+            Fixture, assert_shut_down, state,
         };
         let f = Fixture::new().await.drop_supervisor();
-        let st = state();
-        let snap = build_snapshot_for_persist(&st, &f.deps, &ctx_hex());
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(state());
         let (tx, rx) = oneshot::channel();
-        let out = emit_divergence_marker(
-            st.context_id,
-            snap,
+        let out = queue_divergence_marker(
+            &mut cell,
             &f.deps,
-            &SagaId("saga-divergence-dropped".to_owned()),
-            [0xAB; 16],
-            CommittedSide::Target,
-            "evt-committed-10",
-            1_700_000_000,
+            DivergenceMarkerRequest {
+                saga_id: SagaId("saga-divergence-dropped".to_owned()),
+                nonce: [0xAB; 16],
+                committed_side: CommittedSide::Target,
+                committed_event_id: "evt-committed-10".to_owned(),
+                committed_timestamp_secs: 1_700_000_000,
+            },
             &test_signer(0x99),
             tx,
         )
         .await;
         assert!(
             out.result.is_err(),
-            "the Outcome must record the refused marker"
+            "the Outcome must record the refused persist"
         );
         assert_shut_down(&rx.await.unwrap());
         assert_eq!(
@@ -6269,6 +6046,210 @@ mod tests {
             f.persists.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "no snapshot persist"
+        );
+    }
+
+    /// Must-fail (spec 17 §17.3 "Event log write failures"): a Commit-B whose
+    /// `OutletInvoked` write fails after the capture keeps the capture,
+    /// acknowledges the settle, and leaves the record queued. Nothing is
+    /// compensated.
+    #[tokio::test]
+    async fn commit_b_append_failure_keeps_capture_and_queues_record() {
+        use crate::context::log_unit_helpers::test_support::{
+            fail_log_entry_writes, faulty_merkle_log, log_len, queued_unit_types,
+        };
+        let issuer = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let st = target_state(0xE1, OTHER, CALLER).await;
+        let ctx = st.context_id;
+        let (log, faulty) = faulty_merkle_log();
+        let deps = build_deps_with_providers(
+            OTHER.to_owned(),
+            issuer.verifying_key(),
+            Box::new(log),
+            Box::new(OkPersistence),
+        )
+        .await;
+        deps.event_log.init_event_log(&ctx).await.expect("init log");
+        let now_ms = deps.clock.now_millis();
+        let saga = SagaId("saga-commit-b-log-fails".to_owned());
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(st);
+        stage_prepared_b(&mut cell, &deps, 0xE1, &saga.0, now_ms).await;
+        let len_before = log_len(&deps, &ctx);
+        fail_log_entry_writes(&faulty, &ctx);
+
+        let (tx, rx) = oneshot::channel();
+        let out = commit_b_settle(
+            &mut cell,
+            &deps,
+            &saga,
+            br#"{"result":42}"#.to_vec(),
+            &test_signer(0x55),
+            tx,
+        )
+        .await;
+        assert!(out.result.is_ok(), "settle: {:?}", out.result);
+        rx.await
+            .unwrap()
+            .expect("the settle is acknowledged although the log refused the record");
+        assert!(
+            cell.class_s.xctx_committed_outputs.contains_key(&saga),
+            "the capture witness stays: nothing was compensated"
+        );
+        assert_eq!(
+            queued_unit_types(&cell.class_s.pending_log_units),
+            vec![vec![scp_event_log::EventType::OutletInvoked]],
+            "the OutletInvoked record waits in the queue"
+        );
+        assert_eq!(
+            log_len(&deps, &ctx),
+            len_before,
+            "the log refused the write"
+        );
+    }
+
+    /// Must-fail (spec 17 §17.3 "Event log write failures"): a streaming
+    /// Commit-B seal whose `OutletInvoked` write fails after the capture keeps
+    /// the sealed witness, acknowledges the seal, and leaves the record queued.
+    #[tokio::test]
+    async fn commit_b_stream_append_failure_keeps_witness_and_queues_record() {
+        use crate::context::log_unit_helpers::test_support::{
+            fail_log_entry_writes, faulty_merkle_log, log_len, queued_unit_types,
+        };
+        let issuer = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let st = target_state(0xE2, OTHER, CALLER).await;
+        let ctx = st.context_id;
+        let (log, faulty) = faulty_merkle_log();
+        let deps = build_deps_with_providers(
+            OTHER.to_owned(),
+            issuer.verifying_key(),
+            Box::new(log),
+            Box::new(OkPersistence),
+        )
+        .await;
+        deps.event_log.init_event_log(&ctx).await.expect("init log");
+        let now_ms = deps.clock.now_millis();
+        let saga = SagaId("saga-commit-b-stream-log-fails".to_owned());
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(st);
+        let mut req = prepare_b_request(0xE2, None, 2, now_ms);
+        req.saga_id = saga.clone();
+        let (tx, rx) = oneshot::channel();
+        let out = prepare_b_streaming(
+            &mut cell,
+            &deps,
+            req,
+            scp_protocol::economy::types::Amount::new(100),
+            scp_protocol::economy::types::Amount::new(10),
+            [0x11; 16],
+            None,
+            tx,
+        )
+        .await;
+        assert!(out.result.is_ok(), "stage streaming: {:?}", out.result);
+        expect_prepared_b(rx.await.unwrap(), "prepared-B streaming staged");
+        let len_before = log_len(&deps, &ctx);
+        fail_log_entry_writes(&faulty, &ctx);
+
+        let (tx, rx) = oneshot::channel();
+        let out = commit_b_stream_settle(
+            &mut cell,
+            &deps,
+            &saga,
+            &StreamTerminalStatus::Ok,
+            None,
+            &test_signer(0x56),
+            tx,
+        )
+        .await;
+        assert!(out.result.is_ok(), "seal: {:?}", out.result);
+        rx.await
+            .unwrap()
+            .expect("the seal is acknowledged although the log refused the record");
+        assert!(
+            cell.class_s
+                .xctx_committed_stream_outputs
+                .contains_key(&saga),
+            "the sealed witness stays: nothing was compensated"
+        );
+        assert_eq!(
+            queued_unit_types(&cell.class_s.pending_log_units),
+            vec![vec![scp_event_log::EventType::OutletInvoked]],
+            "the streaming OutletInvoked record waits in the queue"
+        );
+        assert_eq!(
+            log_len(&deps, &ctx),
+            len_before,
+            "the log refused the write"
+        );
+    }
+
+    /// Must-fail (spec 17 §17.3 "Event log write failures"): a Commit-A whose
+    /// `CrossContextOutletInvoked` write fails after the settle keeps the
+    /// idempotency witness, acknowledges Commit-A, and leaves the record
+    /// queued. Nothing is compensated.
+    #[tokio::test]
+    async fn commit_a_append_failure_keeps_witness_and_queues_record() {
+        use crate::context::log_unit_helpers::test_support::{
+            fail_log_entry_writes, faulty_merkle_log, log_len, queued_unit_types,
+        };
+        let issuer = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let mut st = target_state(0xC4, OTHER, CALLER).await;
+        st.role_state.creator_did = CALLER.to_owned();
+        let ctx = st.context_id;
+        let (log, faulty) = faulty_merkle_log();
+        let deps = build_deps_with_providers(
+            CALLER.to_owned(),
+            issuer.verifying_key(),
+            Box::new(log),
+            Box::new(OkPersistence),
+        )
+        .await;
+        deps.event_log.init_event_log(&ctx).await.expect("init log");
+        let saga = SagaId("saga-commit-a-log-fails".to_owned());
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(st);
+        let (tx, rx) = oneshot::channel();
+        prepare_a(
+            &mut cell,
+            &deps,
+            &saga,
+            &ctx,
+            &DID(CALLER.to_owned()),
+            OUTLET,
+            tx,
+        )
+        .await;
+        let prepared_a = expect_prepared_a(rx.await.unwrap(), "prepared-A");
+        let len_before = log_len(&deps, &ctx);
+        fail_log_entry_writes(&faulty, &ctx);
+
+        let req = CommitARequest {
+            saga_id: saga.clone(),
+            reservation: prepared_a,
+            caller_context_id: ctx,
+            caller_did: DID(CALLER.to_owned()),
+            target_context_id: [0xEE; 32],
+            nonce: [0x42; 16],
+            receipt: test_receipt_bytes(1_700_000_000_000),
+            output_bytes: br#"{"result":1}"#.to_vec(),
+        };
+        let (tx, rx) = oneshot::channel();
+        let out = commit_a(&mut cell, &deps, req, tx).await;
+        assert!(out.result.is_ok(), "commit_a: {:?}", out.result);
+        rx.await
+            .unwrap()
+            .expect("Commit-A is acknowledged although the log refused the record");
+        assert!(
+            cell.class_s.xctx_committed_invocations.contains(&saga),
+            "the idempotency witness stays: nothing was compensated"
+        );
+        assert_eq!(
+            queued_unit_types(&cell.class_s.pending_log_units),
+            vec![vec![scp_event_log::EventType::CrossContextOutletInvoked]],
+            "the CrossContextOutletInvoked record waits in the queue"
+        );
+        assert_eq!(
+            log_len(&deps, &ctx),
+            len_before,
+            "the log refused the write"
         );
     }
 
@@ -6391,7 +6372,11 @@ mod tests {
         assert_eq!(
             outlet_invoked_appends.load(std::sync::atomic::Ordering::SeqCst),
             0,
-            "a persist failure must NOT append OutletInvoked (append is sequenced after persist)"
+            "a persist failure must NOT append OutletInvoked (the record is queued in that persist)"
+        );
+        assert!(
+            st_cell.class_s.pending_log_units.is_empty(),
+            "the restore rolled the queued record back with the capture"
         );
         assert!(!st_cell.class_s.xctx_committed_outputs.contains_key(&saga));
         assert!(st_cell.class_s.saga_pending.contains_key(&saga));

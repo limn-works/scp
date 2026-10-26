@@ -9800,17 +9800,7 @@ const EVENT_LOG_APPEND_ALLOWLIST: &[(&str, &str, &str)] = &[
         "record_streaming_saga_a_event",
         "spec 06 §6.2.4",
     ),
-    (
-        "scp-runtime/src/context/actor/handlers/saga.rs",
-        "emit_divergence_marker",
-        "spec 17 §17.3",
-    ),
     // Callers of the free wrappers on `EVENT_LOG_APPEND_FREE_FNS`.
-    (
-        "scp-runtime/src/context/actor/handlers/saga.rs",
-        "dispatch_commit_phase",
-        "through `emit_divergence_marker`, spec 17 §17.3",
-    ),
     (
         "scp-runtime/src/context/outlets/invoke.rs",
         "run_cross_context_bridge",
@@ -9842,21 +9832,6 @@ const EVENT_LOG_APPEND_ALLOWLIST: &[(&str, &str, &str)] = &[
         "scp-runtime/src/context/outlets/stream_settlement_adapter.rs",
         "record",
         "forwards to `append_streaming_outlet_invoked_event`",
-    ),
-    (
-        "scp-runtime/src/context/actor/handlers/saga.rs",
-        "commit_b_settle_finalize",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/actor/handlers/saga.rs",
-        "commit_b_stream_settle_finalize",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/actor/handlers/saga.rs",
-        "commit_a",
-        "spec 17 §17.3, memory-first after the step",
     ),
     (
         "scp-runtime/src/context/outlets/invoke.rs",
