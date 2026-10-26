@@ -651,27 +651,26 @@ pub trait ContextEventLogProvider: Send + Sync {
         actor_did: &str,
         timestamp_secs: u64,
     ) -> Result<(), ContextCreationError> {
-        // (1) FULL §5.4.5:566 manifest-derived equality — the tighter check the
-        // opaque `append_event` boundary cannot make. Wire-reject on mismatch.
-        crate::context::outlets::stream::verify_outlet_invoked_event_manifest(event, chunks)
-            .map_err(|err| {
-                let log_err =
-                    crate::context::outlets::stream::chunks_billed_error_to_event_log_error(err);
-                ContextCreationError::EventLogFailed(log_err.to_string())
-            })?;
-        // (2) Serialize and append through the standard boundary, which
-        // re-runs the durable event-local `<=` backstop.
-        let data = serde_json::to_vec(event).map_err(|e| {
-            ContextCreationError::EventLogFailed(format!(
-                "failed to serialize OutletInvokedEvent: {e}"
-            ))
+        // The FULL §5.4.5:566 manifest-derived equality (the tighter check the
+        // opaque `append_event` boundary cannot make), then the append through
+        // the standard boundary, which re-runs the durable event-local `<=`
+        // backstop.
+        let leaf = crate::context::log_unit_helpers::plan_outlet_invoked_verified_leaf(
+            event,
+            chunks,
+            actor_did,
+            timestamp_secs,
+        )
+        .map_err(|e| match e {
+            ContextError::EventLogFailed(msg) => ContextCreationError::EventLogFailed(msg),
+            other => ContextCreationError::EventLogFailed(other.to_string()),
         })?;
         self.append_event_in(
             mode,
             context_id,
             scp_event_log::EventType::OutletInvoked,
             actor_did,
-            scp_event_log::EventPayload { data },
+            leaf.into_payload(),
             timestamp_secs,
         )
         .await
@@ -700,8 +699,13 @@ pub trait ContextEventLogProvider: Send + Sync {
         change: &scp_event_log::payload::MembershipChangePayload,
         timestamp_secs: u64,
     ) -> Result<(), ContextError> {
-        let payload = scp_event_log::payload::encode_payload(change)
-            .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
+        let payload = crate::context::log_unit_helpers::plan_membership_change_leaf(
+            event_type,
+            actor_did,
+            change,
+            timestamp_secs,
+        )?
+        .into_payload();
         self.append_context_event_with_payload(
             mode,
             context_id,
@@ -735,12 +739,13 @@ pub trait ContextEventLogProvider: Send + Sync {
         role: &str,
         timestamp_secs: u64,
     ) -> Result<(), ContextError> {
-        let payload =
-            scp_event_log::payload::encode_payload(&scp_event_log::payload::RoleAssignedPayload {
-                subject_did: subject_did.to_owned(),
-                role: role.to_owned(),
-            })
-            .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
+        let payload = crate::context::log_unit_helpers::plan_role_assigned_leaf(
+            actor_did,
+            subject_did,
+            role,
+            timestamp_secs,
+        )?
+        .into_payload();
         self.append_context_event_with_payload(
             mode,
             context_id,

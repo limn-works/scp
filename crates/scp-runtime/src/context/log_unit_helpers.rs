@@ -141,6 +141,123 @@ pub fn plan_leaf(
     LeafSpec::new(event_type, actor_did, payload, timestamp_secs)
 }
 
+/// Plans a `MemberJoined` / `MemberLeft` leaf. It is the one encoder for that
+/// leaf: [`ContextEventLogProvider::append_membership_change_leaf`] appends
+/// the payload it plans, so a queued leaf and an appended one carry the same
+/// bytes (spec 17 §17.3 "Event log write failures").
+///
+/// [`ContextEventLogProvider::append_membership_change_leaf`]:
+///     crate::context::builder::ContextEventLogProvider::append_membership_change_leaf
+///
+/// # Errors
+///
+/// Returns [`ContextError::EventLogFailed`] when the payload does not encode
+/// or breaks the append's payload rules.
+pub fn plan_membership_change_leaf(
+    event_type: scp_event_log::EventType,
+    actor_did: &str,
+    change: &scp_event_log::payload::MembershipChangePayload,
+    timestamp_secs: u64,
+) -> Result<LeafSpec, ContextError> {
+    plan_leaf(
+        event_type,
+        actor_did.to_owned(),
+        scp_event_log::payload::encode_payload(change)
+            .map_err(|e| ContextError::EventLogFailed(e.to_string()))?,
+        timestamp_secs,
+    )
+}
+
+/// Plans a `RoleAssigned` leaf for `subject_did` taking `role`. It is the one
+/// encoder for that leaf: [`ContextEventLogProvider::append_role_assigned_leaf`]
+/// appends the payload it plans (spec 17 §17.3 "Event log write failures").
+///
+/// [`ContextEventLogProvider::append_role_assigned_leaf`]:
+///     crate::context::builder::ContextEventLogProvider::append_role_assigned_leaf
+///
+/// # Errors
+///
+/// Returns [`ContextError::EventLogFailed`] when the payload does not encode
+/// or breaks the append's payload rules.
+pub fn plan_role_assigned_leaf(
+    actor_did: &str,
+    subject_did: &str,
+    role: &str,
+    timestamp_secs: u64,
+) -> Result<LeafSpec, ContextError> {
+    plan_leaf(
+        scp_event_log::EventType::RoleAssigned,
+        actor_did.to_owned(),
+        scp_event_log::payload::encode_payload(&scp_event_log::payload::RoleAssignedPayload {
+            subject_did: subject_did.to_owned(),
+            role: role.to_owned(),
+        })
+        .map_err(|e| ContextError::EventLogFailed(e.to_string()))?,
+        timestamp_secs,
+    )
+}
+
+/// Plans a `TtlExtended` leaf. It is the one encoder for that leaf: the
+/// bilateral reset's fail-closed append writes the payload it plans (spec 17
+/// §17.3 "Event log write failures").
+///
+/// # Errors
+///
+/// Returns [`ContextError::EventLogFailed`] when the payload does not encode
+/// or breaks the append's payload rules.
+pub fn plan_ttl_extended_leaf(
+    actor_did: &str,
+    extension: &scp_event_log::payload::TtlExtendedPayload,
+    timestamp_secs: u64,
+) -> Result<LeafSpec, ContextError> {
+    plan_leaf(
+        scp_event_log::EventType::TtlExtended,
+        actor_did.to_owned(),
+        scp_event_log::payload::encode_payload(extension).map_err(|e| {
+            ContextError::EventLogFailed(format!("failed to encode TtlExtended payload: {e}"))
+        })?,
+        timestamp_secs,
+    )
+}
+
+/// Plans an `OutletInvoked` leaf after the FULL §5.4.5:566 manifest check
+/// over the `reassembled` chunk sequence. It is the one encoder for that leaf:
+/// [`ContextEventLogProvider::append_outlet_invoked_verified`] appends the
+/// payload it plans (spec 17 §17.3 "Event log write failures"). The leaf's own
+/// construction then runs the event-local backstop.
+///
+/// [`ContextEventLogProvider::append_outlet_invoked_verified`]:
+///     crate::context::builder::ContextEventLogProvider::append_outlet_invoked_verified
+///
+/// # Errors
+///
+/// Returns [`ContextError::EventLogFailed`] when the manifest check rejects
+/// the event, the event does not serialize, or the payload breaks the
+/// append's payload rules.
+pub fn plan_outlet_invoked_verified_leaf(
+    event: &scp_protocol::context::outlets::lifecycle::OutletInvokedEvent,
+    reassembled: &[scp_protocol::context::outlets::stream::OutletStreamChunk],
+    actor_did: &str,
+    timestamp_secs: u64,
+) -> Result<LeafSpec, ContextError> {
+    crate::context::outlets::stream::verify_outlet_invoked_event_manifest(event, reassembled)
+        .map_err(|err| {
+            ContextError::EventLogFailed(
+                crate::context::outlets::stream::chunks_billed_error_to_event_log_error(err)
+                    .to_string(),
+            )
+        })?;
+    let data = serde_json::to_vec(event).map_err(|e| {
+        ContextError::EventLogFailed(format!("failed to serialize OutletInvokedEvent: {e}"))
+    })?;
+    plan_leaf(
+        scp_event_log::EventType::OutletInvoked,
+        actor_did.to_owned(),
+        scp_event_log::EventPayload { data },
+        timestamp_secs,
+    )
+}
+
 /// True when the context has queued log units or a log fault, so a drain has
 /// work to do.
 pub fn has_log_unit_work(cell: &ClassSCell) -> bool {
@@ -963,6 +1080,86 @@ mod tests {
         )
         .expect("a valid unit is restored");
         assert_eq!(valid.len(), 1);
+    }
+
+    /// Spec 17 §17.3 "Event log write failures": each subject-bearing planner
+    /// plans the leaf its builder wrapper appends, byte for byte, so a queued
+    /// leaf and an appended one hash the same.
+    #[tokio::test]
+    async fn planners_match_their_builder_wrappers() {
+        use crate::context::builder::{AppendMode, ContextEventLogProvider};
+        use crate::context::providers::event_log::MerkleEventLogProvider;
+        use scp_event_log::payload::{MembershipChangePayload, TtlExtendedPayload};
+
+        let provider = MerkleEventLogProvider::new();
+        let ctx_id = [0x7Au8; 32];
+        provider.init_event_log(&ctx_id).await.expect("init");
+        let change = MembershipChangePayload {
+            subject_did: "did:example:subject".to_owned(),
+            role_name: "member".to_owned(),
+        };
+        let planned = [
+            super::plan_membership_change_leaf(
+                EventType::MemberJoined,
+                "did:example:admin",
+                &change,
+                1_700_000_001,
+            )
+            .expect("plans"),
+            super::plan_role_assigned_leaf(
+                "did:example:admin",
+                "did:example:subject",
+                "admin",
+                1_700_000_002,
+            )
+            .expect("plans"),
+        ];
+        provider
+            .append_membership_change_leaf(
+                AppendMode::FailClosed,
+                &ctx_id,
+                EventType::MemberJoined,
+                "did:example:admin",
+                &change,
+                1_700_000_001,
+            )
+            .await
+            .expect("appends");
+        provider
+            .append_role_assigned_leaf(
+                AppendMode::FailClosed,
+                &ctx_id,
+                "did:example:admin",
+                "did:example:subject",
+                "admin",
+                1_700_000_002,
+            )
+            .await
+            .expect("appends");
+        let appended = provider.entries(&ctx_id).expect("the log exists");
+        assert_eq!(appended.len(), planned.len());
+        for (leaf, event) in planned.iter().zip(&appended) {
+            assert_eq!(leaf.event_type(), event.event_type);
+            assert_eq!(leaf.actor_did(), event.actor_did.as_ref());
+            assert_eq!(leaf.payload().data, event.payload.data);
+            assert_eq!(leaf.timestamp_secs(), event.timestamp);
+        }
+
+        let extension = TtlExtendedPayload {
+            old_deadline_unix: 10,
+            new_deadline_unix: 20,
+            proposal_id: [3u8; 32],
+            consenting_members: vec!["did:example:a".to_owned()],
+        };
+        let ttl = super::plan_ttl_extended_leaf("did:example:admin", &extension, 1_700_000_003)
+            .expect("plans");
+        assert_eq!(ttl.event_type(), EventType::TtlExtended);
+        assert_eq!(
+            ttl.payload().data,
+            scp_event_log::payload::encode_payload(&extension)
+                .expect("encodes")
+                .data
+        );
     }
 
     /// Spec 17 §17.3: an entry is checked against the append's payload rules

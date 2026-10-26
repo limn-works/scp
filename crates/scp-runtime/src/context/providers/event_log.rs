@@ -1958,6 +1958,60 @@ mod tests {
         assert_eq!(provider.entries(&ctx_id).unwrap().len(), 1);
     }
 
+    /// Spec 17 §17.3 "Event log write failures": the `OutletInvoked` planner
+    /// runs the FULL §5.4.5:566 manifest check before the step, refusing the
+    /// event the verified append refuses, and the leaf it plans for a
+    /// well-formed event carries the bytes the verified append writes.
+    #[tokio::test]
+    async fn planned_outlet_invoked_leaf_matches_the_verified_append() {
+        use crate::context::log_unit_helpers::plan_outlet_invoked_verified_leaf;
+
+        let mut chunks: Vec<_> = (0..8).map(stream_data_chunk).collect();
+        chunks.push(stream_progress_chunk(8));
+        chunks.push(stream_end_chunk(9));
+        let root = scp_protocol::context::outlets::stream::compute_chunk_manifest_root(&chunks)
+            .expect("manifest root");
+
+        let refused = plan_outlet_invoked_verified_leaf(
+            &manifest_invoked_event(10, 8, root, Some(5)),
+            &chunks,
+            "did:dht:z6MkInvoker",
+            1_700_000_000,
+        );
+        assert!(
+            matches!(&refused, Err(scp_protocol::context::ContextError::EventLogFailed(msg)) if msg.contains("chunks_billed mismatch")),
+            "{refused:?}"
+        );
+
+        let event = manifest_invoked_event(10, 6, root, Some(5));
+        let leaf = plan_outlet_invoked_verified_leaf(
+            &event,
+            &chunks,
+            "did:dht:z6MkInvoker",
+            1_700_000_000,
+        )
+        .expect("a manifest-consistent event plans");
+        let provider = MerkleEventLogProvider::new();
+        let ctx_id = [23u8; 32];
+        provider.init_event_log(&ctx_id).await.unwrap();
+        provider
+            .append_outlet_invoked_verified(
+                crate::context::builder::AppendMode::FailClosed,
+                &ctx_id,
+                &event,
+                &chunks,
+                "did:dht:z6MkInvoker",
+                1_700_000_000,
+            )
+            .await
+            .expect("the verified append writes the event");
+        let appended = provider.entries(&ctx_id).unwrap().remove(0);
+        assert_eq!(leaf.event_type(), appended.event_type);
+        assert_eq!(leaf.actor_did(), appended.actor_did.as_ref());
+        assert_eq!(leaf.payload().data, appended.payload.data);
+        assert_eq!(leaf.timestamp_secs(), appended.timestamp);
+    }
+
     /// §5.4.5 C1: the unary saga's `OutletInvoked` join-record payload (a
     /// distinct JSON shape lacking the streaming event fields) is passed
     /// through untouched — the append-boundary check only fires on payloads

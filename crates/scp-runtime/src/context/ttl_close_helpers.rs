@@ -649,29 +649,30 @@ pub async fn extend_ttl_deadline_and_record(
     // failure) would mint this member's checkpoint one position early, and a
     // landed leaf with no credit would leave a reset-only context never
     // reaching `events_since > 0`.
-    let appended =
-        match scp_event_log::payload::encode_payload(&scp_event_log::payload::TtlExtendedPayload {
+    let appended = match crate::context::log_unit_helpers::plan_ttl_extended_leaf(
+        actor_did,
+        &scp_event_log::payload::TtlExtendedPayload {
             old_deadline_unix: old_dl,
             new_deadline_unix: new_dl,
             proposal_id,
             consenting_members,
-        }) {
-            Ok(payload) => {
-                event_log
-                    .append_context_event_with_payload(
-                        mode,
-                        context_id_bytes,
-                        scp_event_log::EventType::TtlExtended,
-                        actor_did,
-                        payload,
-                        timestamp_secs,
-                    )
-                    .await
-            }
-            Err(e) => Err(ContextError::EventLogFailed(format!(
-                "failed to encode TtlExtended payload: {e}"
-            ))),
-        };
+        },
+        timestamp_secs,
+    ) {
+        Ok(leaf) => {
+            event_log
+                .append_context_event_with_payload(
+                    mode,
+                    context_id_bytes,
+                    scp_event_log::EventType::TtlExtended,
+                    actor_did,
+                    leaf.into_payload(),
+                    timestamp_secs,
+                )
+                .await
+        }
+        Err(e) => Err(e),
+    };
     match (appended, mode) {
         (Ok(()), AppendMode::FailClosed) => {
             let mut view = cell.class_c_view();
