@@ -4822,7 +4822,7 @@ async fn forward_bridge_terminal(
 /// (best-effort, non-atomic dual recording; the atomic guarantee is the
 /// streaming saga's, SCP-OUT-046).
 #[allow(clippy::too_many_arguments)]
-async fn record_cross_context_a_event(
+pub(crate) async fn record_cross_context_a_event(
     a_event_log: &std::sync::Arc<dyn crate::context::builder::ContextEventLogProvider>,
     receiving_context_id: &str,
     invoker_did: &DID,
@@ -6038,6 +6038,94 @@ mod tests {
             Capability::GovernanceVote,
             Capability::ContextClose,
         ])
+    }
+
+    /// A Merkle event log with an initialized log for `ctx_id`, erased to the
+    /// provider trait the A-side recorders take.
+    async fn fenced_a_log(
+        ctx_id: &[u8; 32],
+    ) -> std::sync::Arc<dyn crate::context::builder::ContextEventLogProvider> {
+        let log: std::sync::Arc<dyn crate::context::builder::ContextEventLogProvider> =
+            std::sync::Arc::new(
+                crate::context::providers::event_log::MerkleEventLogProvider::new(),
+            );
+        log.init_event_log(ctx_id).await.expect("init log");
+        log
+    }
+
+    fn a_log_len(
+        log: &std::sync::Arc<dyn crate::context::builder::ContextEventLogProvider>,
+        ctx_id: &[u8; 32],
+    ) -> usize {
+        log.event_log_summary(ctx_id).expect("summary").0
+    }
+
+    /// While context A has queued log units, the cross-context bridge's
+    /// A-side `OutletInvoked` record is refused at the provider's write gate
+    /// (spec 17 §17.3 "Event log write failures") and A's log is unchanged.
+    /// With no queued unit the same record appends.
+    #[tokio::test]
+    async fn cross_context_a_record_is_refused_while_units_are_queued() {
+        let ctx_id = [0x47u8; 32];
+        let log = fenced_a_log(&ctx_id).await;
+        let invoker = DID("did:dht:z6MkInvoker".to_owned());
+        for (pending, expected) in [(true, 0), (false, 1)] {
+            log.set_units_pending(&ctx_id, pending);
+            record_cross_context_a_event(
+                &log,
+                &hex::encode(ctx_id),
+                &invoker,
+                [1u8; 16],
+                &"outlet-x".to_owned(),
+                "0".repeat(64),
+                5,
+                &StreamTerminalSummary::default(),
+                &[],
+                1_700_000_000,
+            )
+            .await;
+            assert_eq!(a_log_len(&log, &ctx_id), expected, "pending={pending}");
+        }
+    }
+
+    /// While context A has queued log units, the streaming saga's A-side
+    /// `CrossContextOutletInvoked` record is refused at the provider's write
+    /// gate (spec 17 §17.3 "Event log write failures") and A's log is
+    /// unchanged. With no queued unit the same record appends.
+    #[tokio::test]
+    async fn streaming_saga_a_record_is_refused_while_units_are_queued() {
+        use scp_protocol::context::outlets::cross_context_saga::CrossContextOutletStreamReceipt;
+        let ctx_id = [0x48u8; 32];
+        let log = fenced_a_log(&ctx_id).await;
+        let receipt = CrossContextOutletStreamReceipt {
+            caller_context_id: ctx_id,
+            target_context_id: [0x49; 32],
+            caller_did: "did:dht:z6MkCaller".to_owned(),
+            nonce: [7; 16],
+            outlet_registration_id: "outlet-x".to_owned(),
+            stream_manifest_hash: [0; 32],
+            outlet_invoked_event_id: "evt-b".to_owned(),
+            chain_depth: 1,
+            timestamp_ms: 1_700_000_000_000,
+            signature: [0; 64],
+        };
+        let outcome = crate::context::actor::commands::CommitBStreamSettleOutcome {
+            receipt: serde_json::to_vec(&receipt).expect("receipt json"),
+            stream_manifest_hash: [0; 32],
+            billed: scp_protocol::economy::types::Amount(0),
+            refund: scp_protocol::economy::types::Amount(0),
+            billed_count: 0,
+            stream_chunk_count: 0,
+            outlet_invoked_event_id: "evt-b".to_owned(),
+            settlement: None,
+            generation: 1,
+        };
+        let saga_id = crate::context::supervisor::saga_journal::SagaId("saga-a-fenced".to_owned());
+        for (pending, expected) in [(true, 0), (false, 1)] {
+            log.set_units_pending(&ctx_id, pending);
+            record_streaming_saga_a_event(&log, &saga_id, &outcome).await;
+            assert_eq!(a_log_len(&log, &ctx_id), expected, "pending={pending}");
+        }
     }
 
     /// Creates a `ContextRoleState` with a creator that has admin (all) capabilities.
