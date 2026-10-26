@@ -599,9 +599,9 @@ pub(crate) async fn resolve_own_addresses_for_start(
 /// ```
 ///
 /// rustdoc does not check the error code a `compile_fail` doctest names, so
-/// this doctest passes on any compile error, a typo included. The same
-/// position naming both arguments compiles below, which rules out every
-/// error but the argument count:
+/// this doctest passes on any compile error, a typo included. The positive
+/// control below proves only that the same construction, with both
+/// arguments supplied, compiles:
 ///
 /// ```
 /// use scp_identity::DidMethod;
