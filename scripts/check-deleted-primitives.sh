@@ -170,6 +170,20 @@ BAN_ENTRIES=(
     "exportSigningKeyBytes|bindings|*|Custody providers sign and never export a seed; the host export callback is deleted"
     "SigningKeyBytes|crates|*.rs|Carry a CommandSigner in the command; no command carries raw key bytes"
     "dispatch_broadcast_command_with_custody|crates|*.rs|Broadcast publish signs in the actor turn through CommandSigner; the reserve/sign-outside/apply pattern is deleted"
+    # §17.17 SCP-CAPSEL-8000/8002 and construction.md M4: no capability is
+    # selected by default. The criterion: a deleted NodeConfig placeholder is
+    # redefined, or a capability-trait bound on a type parameter gets a
+    # default. The tokens below are indicators of that criterion, not the
+    # criterion. Known gaps: a fully qualified bound
+    # (`K: scp_platform::traits::KeyCustody = X`) and a multi-bound form
+    # (`K: Send + KeyCustody = X`) match no token.
+    "struct NoOpCustody[[:space:];{<(]|crates|*.rs|NodeConfig names its custody; the default placeholder custody is deleted (SCP-CAPSEL-8000)"
+    "struct NoOpDidMethod[[:space:];{<(]|crates|*.rs|NodeConfig names its DID method; the default placeholder DID method is deleted (SCP-CAPSEL-8000)"
+    "struct NoOpStorage[[:space:];{<(]|crates|*.rs|A storage that keeps nothing is a nullifier (§17.17.2, SCP-CAPSEL-8012); NodeConfig names a real backend"
+    ":[[:space:]]*KeyCustody[[:space:]]*=[[:space:]]*[A-Za-z]|crates|*.rs|A KeyCustody type parameter takes no default (SCP-CAPSEL-8000, construction.md M4)"
+    ":[[:space:]]*DidMethod[[:space:]]*=[[:space:]]*[A-Za-z]|crates|*.rs|A DidMethod type parameter takes no default (SCP-CAPSEL-8000, construction.md M4)"
+    ":[[:space:]]*Storage[[:space:]]*=[[:space:]]*[A-Za-z]|crates|*.rs|A Storage type parameter takes no default (SCP-CAPSEL-8000, construction.md M4)"
+    ":[[:space:]]*EncryptedStorage[[:space:]]*=[[:space:]]*[A-Za-z]|crates|*.rs|An EncryptedStorage type parameter takes no default (SCP-CAPSEL-8000, construction.md M4)"
     # #2148 (birth-into-actor): the six provider-dissolution symbols
     # (take_crypto_state / with_context / create_group_into_slot method defs, and
     # the contexts / taken_context_ids / broadcast_keys fields) are NOT banned
