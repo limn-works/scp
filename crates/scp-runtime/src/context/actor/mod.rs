@@ -1117,7 +1117,16 @@ impl ContextActor {
         // Any weaker condition would either lose an undestroyed key (incomplete
         // cleanup) or let a crash resurrect the context as `Active` against a
         // stale snapshot (undurable terminal state) — the SEC-1 window.
-        if terminal && outcome.result.is_complete() && outcome.persist_result.is_ok() {
+        //
+        // AND its queued log units are written: a despawn drops the in-memory
+        // queue, and restore skips a terminal snapshot, so a record still queued
+        // would never be written. The retry arm below re-runs the expiry, which
+        // drains again (spec 17 §17.3 "Event log write failures").
+        if terminal
+            && outcome.result.is_complete()
+            && outcome.persist_result.is_ok()
+            && self.state.class_s.pending_log_units.is_empty()
+        {
             // Clear the retry arm (a prior incomplete attempt may have armed it)
             // before reporting terminal so `run()` despawns cleanly. Reset the
             // retry counter — the expiry converged.
@@ -2695,16 +2704,17 @@ mod tests {
         state
     }
 
-    /// SEC-1i (MUST FAIL pre-fix): with the event-log I/O stalling past
-    /// `HANDLER_TIMEOUT`, the terminal `Expired` state is persisted FAIL-CLOSED
-    /// BEFORE the actor could tear down, and the actor stays alive to retry the
-    /// unfinished cleanup. Pre-fix, the terminal persist was best-effort AFTER
-    /// the timed-out I/O (so a relay stall cancelled it, leaving only a
-    /// post-despawn coalesce drain to record `Expired` — a resurrection window)
-    /// AND the actor despawned unconditionally on `Expired` (mailbox closed).
+    /// SEC-1i (MUST FAIL pre-fix): with the event-log write stalling, the
+    /// terminal `Expired` state is persisted FAIL-CLOSED, with the
+    /// `ContextExpired` record queued in that persist, BEFORE any event-log or
+    /// relay I/O runs. Pre-fix, the terminal persist was best-effort AFTER the
+    /// timed-out I/O (so a relay stall cancelled it, leaving only a
+    /// post-despawn coalesce drain to record `Expired` — a resurrection window).
+    /// The keep-alive on an unwritten record is covered by
+    /// `incomplete_cleanup_keeps_actor_alive_and_retries`.
     #[cfg(feature = "testing")]
     #[tokio::test]
-    async fn ttl_expiry_persists_before_despawn_with_stalling_transport() {
+    async fn ttl_expiry_persists_its_record_before_a_stalled_log_write() {
         let recorder = RecordingPersistence::new();
         let deps = new_test_deps_with_providers(
             Box::new(recorder.clone()),
@@ -2716,7 +2726,6 @@ mod tests {
 
         let now = deps.clock.now_secs();
         let state = active_state_with_past_ttl(0x71, now);
-        let ctx = hex_encode_context_id(&[0x71u8; 32]);
 
         let (tx, rx) = mpsc::channel::<ContextCommand>(4);
         let actor = ContextActor::new(state, deps, rx, handle::ExitRecord::default());
@@ -2742,31 +2751,25 @@ mod tests {
             "the durable snapshot must be Expired BEFORE any teardown — anti-resurrection \
              keys off this (a stale Active snapshot would resurrect on respawn)"
         );
-
-        // Advance past the I/O transport budget so the stalled event-log append
-        // times out. Post-fix: cleanup is incomplete ⇒ the actor keeps itself
-        // alive and re-arms a retry (it does NOT despawn). Pre-fix: the actor
-        // despawned here (mailbox closed).
-        tokio::time::advance(
-            handlers::ttl_close::HANDLER_TIMEOUT + std::time::Duration::from_secs(1),
-        )
-        .await;
-
-        let state_after = handle
-            .send(|reply| {
-                ContextCommand::Queries(QueriesCommand::ReadContextState {
-                    context_id: ctx.clone(),
-                    reply,
-                })
+        let persisted_units: Vec<Vec<scp_event_log::EventType>> = snap
+            .pending_log_units
+            .iter()
+            .map(|unit| {
+                unit.leaves
+                    .iter()
+                    .map(crate::context::state::LeafSpec::event_type)
+                    .collect()
             })
-            .await
-            .expect("actor is still alive after an INCOMPLETE expiry (SEC-1 keep-alive)");
+            .collect();
         assert_eq!(
-            state_after,
-            scp_protocol::context::ContextState::Expired,
-            "the still-alive actor reports the terminal Expired state"
+            persisted_units,
+            vec![vec![scp_event_log::EventType::ContextExpired]],
+            "the ContextExpired record rides the fail-closed persist, ahead of the \
+             stalled write (spec 17 §17.3)"
         );
 
+        // The drain's write stalls, so the actor never finishes this turn; the
+        // test ends with the durable state asserted above.
         drop(handle);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(1), actor_task).await;
     }

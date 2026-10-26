@@ -45,6 +45,7 @@ use crate::context::ContextHandle;
 use crate::context::actor::class_s::ClassSCell;
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::state::PerContextState;
+use crate::context::log_unit_helpers::drain_pending_log_units;
 use crate::context::state::{context_id_to_bytes, strip_event_payload};
 use crate::context::ttl::{self, TtlExtension, TtlTimer};
 
@@ -60,8 +61,9 @@ use crate::context::ttl::{self, TtlExtension, TtlTimer};
 /// `ttl_expiry_completed` and feeds back as `prior_completed` on a retry) AND
 /// the fail-closed persist result of the terminal `Expired` state. The actor
 /// treats the expiry as terminal (despawns) ONLY when `result.is_complete()`
-/// AND `persist_result.is_ok()` (the terminal `Expired` state is durable);
-/// otherwise it keeps the actor alive and re-arms a bounded retry.
+/// AND `persist_result.is_ok()` (the terminal `Expired` state is durable) AND
+/// its queue of log units is empty; otherwise it keeps the actor alive and
+/// re-arms a bounded retry.
 pub struct TtlExpiryOutcome {
     /// Which cleanup steps completed (state transition, key destruction, event
     /// leaf), carried forward across on-actor retries.
@@ -96,16 +98,18 @@ pub struct TtlExpiryOutcome {
 ///    KEEP-direction: a persist failure surfaces via
 ///    [`TtlExpiryOutcome::persist_result`] but does NOT roll the FSM back to
 ///    `Active`.
-/// 2. **Bounded-I/O phase, INSIDE `timeout(HANDLER_TIMEOUT)`.** Best-effort
-///    relay deletion + the idempotent `ContextExpired` append
-///    ([`ttl::finish_ttl_expiry_io`]) — the unbounded provider awaits that a
-///    hung relay could otherwise wedge on.
+/// 2. **Record and relay phase.** The `ContextExpired` record, planned before
+///    phase 1 from the log plus the queue, rides phase 1's persist and is
+///    drained after it; a failed drain leaves it queued for the actor's next
+///    drain (spec 17 §17.3 "Event log write failures"). The best-effort relay
+///    delete then runs under its own budget ([`ttl::delete_published_bounded`]).
 ///
 /// # `prior_completed` (retry carry)
 ///
 /// The caller passes the `completed_steps` bitmask from the previous attempt so
 /// a retry re-runs ONLY the failed step (e.g. a transient key-destruction
-/// failure re-destroys just that key, and an already-appended leaf is skipped).
+/// failure re-destroys just that key, and an already-queued record is not
+/// planned again).
 ///
 /// # No relock / generation gate
 ///
@@ -116,8 +120,8 @@ pub struct TtlExpiryOutcome {
 /// concurrent close-and-recreate window for a sibling actor to slip a
 /// new context into.
 // A single cohesive TTL-expiry flow: derive the convergent deadline, run the
-// sync terminal transition + actor-owned key disposal, fail-closed persist, then
-// the bounded relay/leaf I/O. Splitting the phases across helpers would obscure
+// sync terminal transition + actor-owned key disposal, fail-closed persist with
+// the queued record, then the drain and the bounded relay delete. Splitting the phases across helpers would obscure
 // the ordering the SEC-1 rework pins.
 #[allow(clippy::too_many_lines)]
 pub async fn handle_ttl_expiry(
@@ -149,10 +153,7 @@ pub async fn handle_ttl_expiry(
     //
     // The abort decision reads only the prune-immune snapshot: the deadline is
     // `None` iff `params.ttl` is `None`, whatever the log holds. The log's
-    // extension term is read in Phase 2, where only the leaf's timestamp needs
-    // it, and a failed read there leaves the leaf step undone instead of
-    // stamping the shorter un-extended base (spec section 17.3, "Event log
-    // write failures").
+    // extension term only stamps the record, read below before the step.
     let creation_timestamp_secs = cell.creation_timestamp_secs;
     let params_ttl = handle.params().ttl.map(|t| t.as_secs());
     let Some(expiry_base) = convergent_ttl_deadline_secs(creation_timestamp_secs, params_ttl)
@@ -168,6 +169,44 @@ pub async fn handle_ttl_expiry(
             result: crate::context::ttl::TtlExpiryResult::aborted_no_deadline(),
             persist_result: Ok(()),
         };
+    };
+
+    // The `ContextExpired` record, planned before the step from the log plus
+    // the queue (spec 17 §17.3 "Event log write failures"). Its timestamp
+    // raises the snapshot base to the highest recorded extension, so it is
+    // identical on every attempt (M1) and across members. When the log or the
+    // queue already holds the record (a prior attempt queued or wrote it), none
+    // is planned: a duplicate terminal record diverges the Merkle root (ADR-049
+    // §9 amendment, finding (d)). A step done on a prior attempt needs no read.
+    //
+    // A log that cannot be read does not refuse the expiry. The terminal
+    // transition and key destruction must not wait on the log, and a refusal
+    // would leave the context `Active` with a past deadline, which re-fires
+    // the timer at once. The record step stays undone with the read error
+    // recorded, and the retry reads again; no record is stamped from a log
+    // read as empty, so none carries the shorter un-extended base.
+    let planned_record = if ttl::TtlExpiryResult::event_logged_in(prior_completed) {
+        Ok(None)
+    } else {
+        crate::context::governance_logic::read_consequence_log(
+            &cell.class_s.pending_log_units,
+            &context_id,
+            deps.event_log.as_ref(),
+        )
+        .map(|entries| {
+            (!entries
+                .iter()
+                .any(|e| e.event_type == scp_event_log::EventType::ContextExpired))
+            .then(|| {
+                crate::context::state::LeafSpec::without_payload(
+                    scp_event_log::EventType::ContextExpired,
+                    scp_event_log::system_actors::SYSTEM_TIMER_ACTOR.to_owned(),
+                    convergent_ttl_deadline(&entries, creation_timestamp_secs, params_ttl)
+                        .unwrap_or(expiry_base)
+                        .as_secs(),
+                )
+            })
+        })
     };
 
     // -- Phase 1: terminal transition + key destruction (sync), then a single
@@ -211,8 +250,17 @@ pub async fn handle_ttl_expiry(
     // SAME fail-closed snapshot (mirrors `close_context_with_key`). KEEP-
     // direction: a persist failure is surfaced but the FSM is NOT rolled back —
     // silently re-opening an expired context is the unsafe direction (SEC-1i).
+    // The `ContextExpired` record rides the same persist; a failed transition
+    // queues none.
+    let queued_record = match &planned_record {
+        Ok(Some(record)) if terminal_result.state_transitioned() => Some(record.clone()),
+        _ => None,
+    };
     let persist_result = cell
         .commit_class_s_keep(deps, &context_id, |mut view| {
+            if let Some(record) = queued_record {
+                view.enqueue_log_unit(vec![record]);
+            }
             let state = view.rest_mut();
             // Participation decay on TTL expiry (#1530): clear participation
             // cache + cooldown so stale data does not carry over on a later
@@ -230,108 +278,47 @@ pub async fn handle_ttl_expiry(
         })
         .await;
 
-    // -- Phase 2: bounded relay/event-log I/O, INSIDE the transport timeout. On
-    //    elapse the event-log step stays unrecorded; the actor keeps itself
-    //    alive and a retry (carrying `prior_completed`) re-attempts only that
-    //    step. The terminal `Expired` state is ALREADY durable from Phase 1.
-    //
-    //    GATED on the Phase-1 fail-closed persist succeeding (L1, crypto): the
-    //    observable `ContextExpired` leaf must not be appended until the terminal
-    //    `Expired` state it announces is DURABLE. If the fail-closed persist
-    //    failed, skip Phase 2 entirely this round — the FSM stays `Expired`
-    //    (keep-direction, SEC-1i) and the actor stays alive; the bounded retry
-    //    re-runs BOTH Phase 1 (persist) and Phase 2 once persist succeeds. The
-    //    leaf append is idempotent (`ttl::finish_ttl_expiry_io` skips it via
-    //    `terminal_leaf_exists`), so re-running after a successful retry cannot
-    //    produce a duplicate leaf.
-    //
-    //    The leaf's convergent deadline raises the snapshot base to the log's
-    //    highest extension, so the log is read first. A read that fails leaves
-    //    the leaf step undone with the error recorded, and the retry reads
-    //    again; the leaf is never stamped from a log read as empty. A step
-    //    already done on a prior attempt needs no read.
-    let leaf_deadline = if persist_result.is_err() || terminal_result.event_logged() {
-        Ok(expiry_base.as_secs())
-    } else {
-        deps.event_log
-            .event_log_entries(&context_id_bytes)
-            .map(|entries| {
-                convergent_ttl_deadline(
-                    &entries.unwrap_or_default(),
-                    creation_timestamp_secs,
-                    params_ttl,
-                )
-                .unwrap_or(expiry_base)
-                .as_secs()
-            })
-    };
-    let result = if persist_result.is_ok()
-        && let Err(e) = &leaf_deadline
-    {
-        tracing::warn!(
-            context_id = %context_id,
-            error = %e,
-            "TTL expiry: the event log cannot be read for the ContextExpired \
-             deadline; the leaf step stays undone and the retry reads again"
-        );
-        let mut unlogged = terminal_result;
-        unlogged.record_failure(format!(
-            "failed to read the event log for the ContextExpired deadline: {e}"
-        ));
-        unlogged
-    } else if let (Ok(()), Ok(expiry_deadline_secs)) = (&persist_result, leaf_deadline) {
-        let io_fut = ttl::finish_ttl_expiry_io(
-            handle,
-            Some(deps.transport.as_ref()),
-            deps.event_log.as_ref(),
-            terminal_result.clone(),
-            expiry_deadline_secs,
-        );
-        match tokio::time::timeout(
-            crate::context::actor::handlers::ttl_close::HANDLER_TIMEOUT,
-            io_fut,
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(_elapsed) => {
-                tracing::warn!(
-                    context_id = %context_id,
-                    budget = ?crate::context::actor::handlers::ttl_close::HANDLER_TIMEOUT,
-                    "TTL expiry relay/event-log I/O exceeded its transport budget; \
-                     terminal Expired state already persisted fail-closed, retry \
-                     will re-attempt the unfinished cleanup step"
-                );
-                terminal_result
-            }
+    // -- Phase 2: the record and the relay delete. The record step is done once
+    //    the persist that recorded `Expired` landed with the record queued, or
+    //    the log or the queue already held it. A failed persist leaves the step
+    //    undone: the keep-direction combinator keeps the record queued in
+    //    memory, so the retry plans none and re-runs the persist. This function
+    //    drains only after the persist landed, so it never writes the record
+    //    ahead of a durable terminal snapshot (L1).
+    let mut result = terminal_result;
+    match (&persist_result, planned_record) {
+        (Ok(()), Ok(_)) if result.state_transitioned() => result.mark_event_logged(),
+        (Ok(()), Err(e)) if result.state_transitioned() => {
+            tracing::warn!(
+                context_id = %context_id,
+                error = %e,
+                "TTL expiry: the event log cannot be read for the ContextExpired \
+                 record; the record step stays undone and the retry reads again"
+            );
+            result.record_failure(format!(
+                "failed to read the event log for the ContextExpired record: {e}"
+            ));
+        }
+        _ => {}
+    }
+    if persist_result.is_ok() {
+        // The step is durable with its records queued; write them now. A failed
+        // drain leaves them queued for the actor's next drain and logs its own
+        // error, so it does not fail the step that already landed (spec 17 §17.3
+        // "Event log write failures"). The actor stays alive until the queue is
+        // empty, and its retry drains again.
+        let _ = drain_pending_log_units(cell, deps, &context_id).await;
+        if result.state_transitioned() {
+            ttl::delete_published_bounded(handle, deps.transport.as_ref()).await;
         }
     } else {
-        // Phase-1 fail-closed persist failed: do NOT append the observable
-        // `ContextExpired` leaf against a not-yet-durable terminal snapshot.
-        // `terminal_result` carries no `event_logged` bit, so `is_complete()`
-        // stays false and the actor keeps itself alive to retry (persist +
-        // append) next round.
-        //
-        // L2 residual (black-hat P3-005) — accepted crash-window: the retry
-        // state (that a `ContextExpired` append is still pending for this
-        // terminal id) lives only in the resident actor's `ttl_expiry_completed`
-        // bitmask, not in the persisted snapshot. A crash DURING this pending
-        // retry drops the not-yet-appended leaf: on restart the durable snapshot
-        // is already terminal (`Expired`), restore skips non-`Active` contexts,
-        // and B8 refuses re-create — so this is NOT resurrection or an
-        // access-control bypass, only a missing provenance leaf for a context
-        // that is nonetheless terminal for good. Accepted this pass; a
-        // restore-path leaf reconciliation for terminal snapshots is possible
-        // future hardening (see ADR-049 §9 TTL carve-out).
         tracing::warn!(
             context_id = %context_id,
-            "TTL expiry: terminal Expired persist failed (fail-closed); skipping \
-             ContextExpired leaf append this round so the observable leaf is not \
-             recorded ahead of a durable terminal snapshot — retry will re-run \
-             persist + append (L1)"
+            "TTL expiry: terminal Expired persist failed (fail-closed); the \
+             ContextExpired record is not drained ahead of a durable terminal \
+             snapshot, and the retry re-runs the persist (L1)"
         );
-        terminal_result
-    };
+    }
 
     // Emit the completion event onto the actor's owned receive buffer (Class-C,
     // best-effort — rides the coalesced persist).
@@ -882,12 +869,14 @@ pub fn convergent_ttl_deadline(
 
 /// Completes context closure on actor-owned state.
 ///
-/// Destroys MLS group state and sender keys, issues relay deletion
-/// requests for ephemeral/summary scopes, transitions from `Closing` to
-/// `Closed`, and appends the final `ContextClosed` event.
+/// Transitions from `Closing` to `Closed`, destroys MLS group state and
+/// sender keys, queues the final `ContextClosed` record in a keep commit and
+/// drains it, and issues relay deletion requests for ephemeral/summary
+/// scopes. The `ContextClosed` record is planned before the transition from
+/// the log plus the queue (spec 17 §17.3 "Event log write failures").
 ///
-/// Persisted snapshot is deleted on success (best-effort) so a later
-/// restore does not resurrect the closed context.
+/// The persisted snapshot is then deleted so a later restore does not
+/// resurrect the closed context.
 ///
 /// The lifecycle transition runs through `handle.transition_to`; the
 /// `ContextClosed` leaf is stamped with the ACTUAL close instant
@@ -908,6 +897,15 @@ pub fn convergent_ttl_deadline(
 /// FFI reply (the oneshot stays `Result<(), ContextError>`), and recording it
 /// into the event log / `ContextClosed` leaf is a separate DOA wire-format
 /// decision tracked by #2215.
+///
+/// # Errors
+///
+/// - The log read's error ([`ContextError::EventLogFailed`]) before the
+///   transition; nothing changes then.
+/// - [`ContextError::InvalidTransition`] if the context is not in `Closing`;
+///   nothing is destroyed then.
+/// - [`ContextError::PersistenceFailed`] when the keep commit fails, after the
+///   rest of the teardown ran; the close stays applied in memory.
 ///
 /// [`handle_finalize_close`]: crate::context::actor::handlers
 pub async fn finalize_close(
@@ -939,15 +937,19 @@ pub async fn finalize_close(
     // leaf's instant is legitimately a local `now`.
     let close_ts = deps.clock.now_secs();
 
-    // FSM transition (`Closing → Closed`) + terminal leaf + best-effort relay
-    // ciphertext delete. Returns Ok only if the transition landed.
-    ttl::finalize_close(
-        handle,
-        deps.transport.as_ref(),
+    // The log plus the queue, read before the transition: a log that cannot be
+    // read refuses the finalize before its step, never read as one without the
+    // `ContextClosed` record (spec 17 §17.3 "Event log write failures").
+    let entries = crate::context::governance_logic::read_consequence_log(
+        &cell.class_s.pending_log_units,
+        &context_id,
         deps.event_log.as_ref(),
-        close_ts,
-    )
-    .await?;
+    )?;
+
+    // FSM transition (`Closing → Closed`). Returns the planned `ContextClosed`
+    // record (`None` when the log or the queue already holds one) only if the
+    // transition landed.
+    let closed_record = ttl::finalize_close(handle, &entries, close_ts)?;
 
     // #2148 (ADR-049 birth-into-actor): now that the close transition has landed,
     // dispose the ACTOR-owned MLS crypto for Ephemeral/Summary scope (the provider
@@ -1010,11 +1012,40 @@ pub async fn finalize_close(
         }
     }
 
-    // Delete persisted state after finalize (best-effort). Mirrors
-    // the legacy path which only ran the delete when a persistence
-    // provider was attached; ContextPersistence is always present on
-    // ActorDeps so we always issue the delete.
-    let _ = deps.persistence.delete_context(&context_id).await;
+    // The `ContextClosed` record rides a keep commit after the keys are
+    // disposed, so the stored snapshot holds no key material. A persist failure
+    // keeps the close in memory (a closed context must not re-open) and is
+    // returned once the teardown below has run.
+    let persisted = cell
+        .commit_class_s_keep(deps, &context_id, |mut view| {
+            if let Some(record) = closed_record {
+                view.enqueue_log_unit(vec![record]);
+            }
+            Ok(())
+        })
+        .await;
+    if persisted.is_ok() {
+        // The step is durable with its records queued; write them now. A failed
+        // drain leaves them queued for the actor's next drain and logs its own
+        // error, so it does not fail the step that already landed (spec 17 §17.3
+        // "Event log write failures").
+        let _ = drain_pending_log_units(cell, deps, &context_id).await;
+    }
+
+    // Best-effort relay ciphertext delete, after the record is queued and under
+    // its own budget (M2).
+    ttl::delete_published_bounded(handle, deps.transport.as_ref()).await;
+
+    // Delete the persisted snapshot: an explicit close is a permanent teardown,
+    // and a later restore must not resurrect it. A record a failed drain left
+    // queued stays in memory for the actor's next drain.
+    if let Err(e) = deps.persistence.delete_context(&context_id).await {
+        tracing::warn!(
+            context_id = %context_id,
+            error = %e,
+            "finalize_close: the persisted snapshot could not be deleted"
+        );
+    }
 
     // Prune the authoritative Class-M floor registry entry (ADR-049):
     // an explicit close is a PERMANENT teardown. While this closed actor stays
@@ -1039,6 +1070,9 @@ pub async fn finalize_close(
     // stream opens), so drop its per-context admission-tracker registry
     // entry. An in-flight pump holding its own Arc keeps the tracker alive.
     deps.supervisor.reap_stream_admission(&context_id);
+
+    // The keep commit's failure, now that the teardown above has run.
+    persisted?;
 
     // #2199 (F2): hand the truthful attestation back to the local caller (which
     // logs it). Pure in-process value — not surfaced across the FFI reply.
@@ -1556,6 +1590,288 @@ mod tests {
             "the ConvergentDeadline constructor set is closed at three \
              (log-derivation, create-base, extend); a fourth must be a reviewed \
              addition, never a from_raw (B1/B4)"
+        );
+    }
+
+    const EXPIRY_CREATED_AT: u64 = 1_699_990_000;
+    const EXPIRY_TTL_SECS: u64 = 3_600;
+
+    /// An `Active` encrypted Full-scope cell with a finite TTL, its context id,
+    /// and its handle (a clone shares the cell's lifecycle state).
+    fn expiring_cell(
+        ctx_byte: u8,
+    ) -> (
+        String,
+        crate::context::actor::class_s::ClassSCell,
+        crate::context::ContextHandle,
+    ) {
+        let context_id = hex::encode([ctx_byte; 32]);
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            [ctx_byte; 32],
+            EXPIRY_CREATED_AT,
+            scp_did::DID("did:example:expiry-admin".to_owned()),
+        );
+        state.handle = crate::context::ContextHandle::new(
+            context_id.clone(),
+            scp_protocol::context::params::ContextParams {
+                ttl: Some(std::time::Duration::from_secs(EXPIRY_TTL_SECS)),
+                memory_scope: scp_protocol::context::params::MemoryScope::Full,
+                ..Default::default()
+            },
+        );
+        state
+            .handle
+            .transition_to(&scp_protocol::context::ContextState::Active)
+            .unwrap();
+        let cell = crate::context::actor::class_s::ClassSCell::new(state);
+        let handle = cell.handle.clone();
+        (context_id, cell, handle)
+    }
+
+    fn context_expired_records(
+        deps: &crate::context::actor::ActorDeps,
+        context_id: &str,
+    ) -> Vec<(String, u64)> {
+        deps.event_log
+            .event_log_entries(&crate::context::state::context_id_to_bytes(context_id))
+            .expect("the log reads")
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|e| e.event_type == scp_event_log::EventType::ContextExpired)
+            .map(|e| (e.actor_did.as_ref().to_owned(), e.timestamp))
+            .collect()
+    }
+
+    /// A TTL expiry whose `ContextExpired` record the log refuses still
+    /// completes: the record rides the persist that records `Expired`, stays
+    /// queued for the next drain, and the log is unchanged (spec 17 §17.3
+    /// "Event log write failures").
+    #[tokio::test]
+    async fn ttl_expiry_queues_context_expired_in_the_terminal_persist() {
+        use crate::context::log_unit_helpers::test_support;
+
+        let (context_id, mut cell, handle) = expiring_cell(0x7a);
+        let context_id_bytes = crate::context::state::context_id_to_bytes(&context_id);
+        let (deps, faulty, snapshots) =
+            test_support::deps_over_faulty_log("did:example:expiry-queue-owner", &context_id).await;
+        test_support::fail_log_entry_writes(&faulty, &context_id_bytes);
+        let log_before = test_support::log_len(&deps, &context_id_bytes);
+
+        let out = super::handle_ttl_expiry(&mut cell, &deps, &handle, 0).await;
+
+        assert!(
+            out.persist_result.is_ok(),
+            "the terminal persist lands: {:?}",
+            out.persist_result
+        );
+        assert!(
+            out.result.is_complete(),
+            "a refused record write does not leave the expiry incomplete: {}",
+            out.result
+        );
+        let expected = vec![vec![scp_event_log::EventType::ContextExpired]];
+        assert_eq!(
+            test_support::queued_unit_types(&cell.class_s.pending_log_units),
+            expected,
+            "the ContextExpired record stays queued"
+        );
+        let snapshot = snapshots
+            .snapshot(&context_id)
+            .await
+            .expect("the terminal persist stored a snapshot");
+        assert_eq!(
+            snapshot.state,
+            scp_protocol::context::ContextState::Expired,
+            "the stored snapshot records Expired"
+        );
+        assert_eq!(
+            snapshots.persisted_unit_types(&context_id).await,
+            expected,
+            "the record rides the persist that recorded Expired"
+        );
+        let record = &cell
+            .class_s
+            .pending_log_units
+            .front()
+            .expect("one queued unit")
+            .leaves[0];
+        assert_eq!(record.actor_did(), "system:timer");
+        assert_eq!(
+            record.timestamp_secs(),
+            EXPIRY_CREATED_AT + EXPIRY_TTL_SECS,
+            "the record carries the convergent deadline"
+        );
+        assert_eq!(
+            test_support::log_len(&deps, &context_id_bytes),
+            log_before,
+            "the refused write leaves the log unchanged"
+        );
+    }
+
+    /// (d) idempotent terminal record (ADR-049 §9 amendment): an expiry re-run
+    /// from a lost completed-steps bitmask (`prior_completed = 0`, a respawn)
+    /// plans no second `ContextExpired` record, because the log already holds
+    /// one. A duplicate diverges the Merkle root across members.
+    #[tokio::test]
+    async fn ttl_expiry_writes_one_context_expired_across_a_respawn() {
+        use crate::context::log_unit_helpers::test_support;
+
+        let (context_id, mut cell, handle) = expiring_cell(0x7b);
+        let (deps, _faulty, _snapshots) =
+            test_support::deps_over_faulty_log("did:example:expiry-idem-owner", &context_id).await;
+
+        let first = super::handle_ttl_expiry(&mut cell, &deps, &handle, 0).await;
+        assert!(
+            first.result.is_complete() && first.persist_result.is_ok(),
+            "the first expiry completes: {}",
+            first.result
+        );
+        assert!(
+            cell.class_s.pending_log_units.is_empty(),
+            "the drain wrote the record"
+        );
+
+        let second = super::handle_ttl_expiry(&mut cell, &deps, &handle, 0).await;
+        assert!(
+            second.result.is_complete() && second.persist_result.is_ok(),
+            "the re-run completes (idempotent): {}",
+            second.result
+        );
+
+        assert_eq!(
+            context_expired_records(&deps, &context_id),
+            vec![(
+                "system:timer".to_owned(),
+                EXPIRY_CREATED_AT + EXPIRY_TTL_SECS
+            )],
+            "exactly one ContextExpired record, stamped \"system:timer\" at the \
+             convergent deadline (§9.9.3)"
+        );
+    }
+
+    /// A finalize whose `ContextClosed` record the log refuses still closes:
+    /// the record is queued in the finalize's keep commit, the finalize returns
+    /// `Ok`, the log is unchanged, and the snapshot is deleted (spec 17 §17.3
+    /// "Event log write failures").
+    #[tokio::test]
+    async fn finalize_close_queues_context_closed_when_the_log_refuses_it() {
+        use crate::context::log_unit_helpers::test_support;
+
+        let (context_id, mut cell, handle) = expiring_cell(0x7c);
+        handle
+            .transition_to(&scp_protocol::context::ContextState::Closing)
+            .unwrap();
+        let context_id_bytes = crate::context::state::context_id_to_bytes(&context_id);
+        let (deps, faulty, snapshots) =
+            test_support::deps_over_faulty_log("did:example:finalize-queue-owner", &context_id)
+                .await;
+        test_support::fail_log_entry_writes(&faulty, &context_id_bytes);
+        let log_before = test_support::log_len(&deps, &context_id_bytes);
+
+        let result = super::finalize_close(&mut cell, &deps, &handle).await;
+
+        assert!(
+            result.is_ok(),
+            "a refused ContextClosed write must not fail a finalize whose close \
+             landed: got {result:?}"
+        );
+        assert_eq!(handle.state(), scp_protocol::context::ContextState::Closed);
+        assert_eq!(
+            test_support::queued_unit_types(&cell.class_s.pending_log_units),
+            vec![vec![scp_event_log::EventType::ContextClosed]],
+            "the ContextClosed record stays queued"
+        );
+        let record = &cell
+            .class_s
+            .pending_log_units
+            .front()
+            .expect("one queued unit")
+            .leaves[0];
+        assert_eq!(record.actor_did(), "system:close");
+        assert_eq!(
+            test_support::log_len(&deps, &context_id_bytes),
+            log_before,
+            "the refused write leaves the log unchanged"
+        );
+        assert!(
+            snapshots.snapshot(&context_id).await.is_none(),
+            "an explicit close deletes the persisted snapshot"
+        );
+    }
+
+    /// An event log whose reads fail.
+    struct UnreadableLog;
+
+    #[async_trait::async_trait]
+    impl crate::context::builder::ContextEventLogProvider for UnreadableLog {
+        async fn init_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+        async fn append_event(
+            &self,
+            _id: &[u8; 32],
+            _event: scp_event_log::EventType,
+            _actor: &str,
+            _payload: scp_event_log::EventPayload,
+            _timestamp_secs: u64,
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            panic!("an unreadable log takes no write")
+        }
+        async fn destroy_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+        fn event_log_entries(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            Err(scp_protocol::context::ContextError::EventLogFailed(
+                "fixture: the log cannot be read".to_owned(),
+            ))
+        }
+    }
+
+    /// A finalize whose log cannot be read refuses before the transition: an
+    /// unreadable log is never read as one without the `ContextClosed` record
+    /// (spec 17 §17.3 "Event log write failures").
+    #[tokio::test]
+    async fn finalize_close_with_an_unreadable_log_refuses_before_the_transition() {
+        use crate::context::log_unit_helpers::test_support;
+
+        let (_context_id, mut cell, handle) = expiring_cell(0x7d);
+        handle
+            .transition_to(&scp_protocol::context::ContextState::Closing)
+            .unwrap();
+        let deps = test_support::deps_with(
+            "did:example:finalize-unreadable-owner",
+            None,
+            Box::new(UnreadableLog),
+        )
+        .await;
+
+        let result = super::finalize_close(&mut cell, &deps, &handle).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(scp_protocol::context::ContextError::EventLogFailed(_))
+            ),
+            "an unreadable log refuses the finalize: {result:?}"
+        );
+        assert_eq!(
+            handle.state(),
+            scp_protocol::context::ContextState::Closing,
+            "the refused finalize leaves the context Closing"
+        );
+        assert!(
+            cell.class_s.pending_log_units.is_empty(),
+            "nothing is queued"
         );
     }
 }

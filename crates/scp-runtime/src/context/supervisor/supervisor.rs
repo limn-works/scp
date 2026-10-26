@@ -22718,7 +22718,7 @@ mod tests {
             // The distinguishing signal (N3): the expiry pipeline never ran, so
             // no `ContextExpired` leaf was appended against the terminal context.
             // A regressed `is_active` reconcile gate would fire `on_ttl_tick` →
-            // `handle_ttl_expiry` → `finish_ttl_expiry_io` and record one here.
+            // `handle_ttl_expiry`, which queues and drains one, recorded here.
             assert_eq!(
                 expiry_counter
                     .context_expired_appends
@@ -23612,10 +23612,10 @@ mod tests {
         );
     }
 
-    /// M1 (retry stamps the convergent deadline, REGRESSION GATE): when the
-    /// FIRST TTL-expiry attempt's `ContextExpired` append fails and a RETRY
-    /// performs the actual append, the stamped leaf timestamp must be the
-    /// CONVERGENT deadline (`creation + ttl`), NOT the retry-time clock.
+    /// M1 (the convergent deadline survives a retry, REGRESSION GATE): when the
+    /// FIRST TTL-expiry attempt's `ContextExpired` write fails and a RETRY
+    /// drains the queued record, the written timestamp must be the CONVERGENT
+    /// deadline (`creation + ttl`), NOT the retry-time clock.
     ///
     /// Pre-fix this FAILED: `handle_ttl_expiry` read the leaf timestamp as
     /// `deadline_unix_secs.unwrap_or(now())` at the top; Phase 1 cleared
@@ -23714,15 +23714,23 @@ mod tests {
             "a registry floor entry exists before the terminal TTL expiry"
         );
 
-        // First attempt: append FAILS ⇒ incomplete. Phase 1 clears the recorded
-        // deadline.
+        // First attempt: the record write FAILS, so the record stays queued.
+        // Phase 1 clears the recorded deadline.
         let out1 =
             crate::context::ttl_close_helpers::handle_ttl_expiry(&mut cell, &deps, &handle, 0)
                 .await;
         assert!(
-            !out1.result.is_complete(),
-            "first attempt's append must fail (forcing a retry): {}",
+            out1.result.is_complete() && out1.persist_result.is_ok(),
+            "the first attempt completes with the ContextExpired record queued in \
+             its persist: {}",
             out1.result
+        );
+        assert_eq!(
+            crate::context::log_unit_helpers::test_support::queued_unit_types(
+                &cell.class_s.pending_log_units
+            ),
+            vec![vec![scp_event_log::EventType::ContextExpired]],
+            "the refused write leaves the record queued for the retry's drain"
         );
         assert!(
             !sup.floors.contains_key(&ctx_id_bytes),
@@ -23734,8 +23742,9 @@ mod tests {
             "Phase 1 clears the recorded convergent deadline"
         );
 
-        // Retry: the recorded deadline is gone, so the leaf timestamp must be
-        // RE-DERIVED as `creation + ttl` — NOT the skewed local clock.
+        // Retry: drains the queued record, whose timestamp was derived as
+        // `creation + ttl` — NOT the skewed local clock — although Phase 1
+        // cleared the recorded deadline.
         let out2 = crate::context::ttl_close_helpers::handle_ttl_expiry(
             &mut cell,
             &deps,
@@ -23745,7 +23754,7 @@ mod tests {
         .await;
         assert!(
             out2.result.is_complete(),
-            "retry re-appends the ContextExpired leaf ⇒ complete: {}",
+            "the retry drains the queued ContextExpired record: {}",
             out2.result
         );
 
@@ -23772,7 +23781,8 @@ mod tests {
     /// live deadline was pushed out by a `reset_ttl_timer` extension (now recorded
     /// as a `TtlExtended` leaf), a failed-then-retried `ContextExpired` append
     /// must stamp the EXTENDED deadline — re-derived from the log's `TtlExtended`
-    /// leaf, not the create base and not the skewed retry-time clock. This proves
+    /// leaf, not the create base and not the skewed retry-time clock, after the
+    /// retry drains the queued record. This proves
     /// the single-source terminal-leaf derivation reads reset extensions too (the
     /// whole point of making reset emit a leaf).
     #[tokio::test]
@@ -23794,31 +23804,10 @@ mod tests {
             fail_next: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             ..Default::default()
         };
-        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(NOW_SKEWED));
-
-        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
-            "did:dht:z6MktestM1Reset".to_owned(),
-            std::sync::Arc::new(scp_clock::SystemClock),
-        ));
-        let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
-            Box::new(crate::context::builder::NotConfiguredTransportProvider);
-        let key_resolver: KeyResolver = Arc::new(|_: &DID, _: scp_did::SigningKeyId| None);
-        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
-            Arc::new(
-                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
-                    InMemoryStorage::new(),
-                )),
-            );
-        let sup = Supervisor::with_providers(
-            crypto,
-            transport,
+        let sup = supervisor_with_clock_persistence_and_event_log(
+            Arc::new(TestClock::new(NOW_SKEWED)),
+            Box::new(MapPersistence::default()),
             Box::new(event_log.clone()),
-            key_resolver,
-            Some(Box::new(MapPersistence::default())),
-            None,
-            None,
-            Some(clock_dyn),
-            mls_storage,
         );
         let deps = test_actor_deps(&sup).await;
 
@@ -23851,9 +23840,17 @@ mod tests {
             crate::context::ttl_close_helpers::handle_ttl_expiry(&mut cell, &deps, &handle, 0)
                 .await;
         assert!(
-            !out1.result.is_complete(),
-            "first attempt's append must fail (forcing a retry): {}",
+            out1.result.is_complete() && out1.persist_result.is_ok(),
+            "the first attempt completes with the ContextExpired record queued in \
+             its persist: {}",
             out1.result
+        );
+        assert_eq!(
+            crate::context::log_unit_helpers::test_support::queued_unit_types(
+                &cell.class_s.pending_log_units
+            ),
+            vec![vec![scp_event_log::EventType::ContextExpired]],
+            "the refused write leaves the record queued for the retry's drain"
         );
 
         let out2 = crate::context::ttl_close_helpers::handle_ttl_expiry(
@@ -23865,7 +23862,7 @@ mod tests {
         .await;
         assert!(
             out2.result.is_complete(),
-            "retry re-appends the ContextExpired leaf ⇒ complete: {}",
+            "the retry drains the queued ContextExpired record: {}",
             out2.result
         );
 
@@ -27820,8 +27817,8 @@ mod tests {
 
     /// Event-log double that COUNTS `ContextExpired` append attempts (N3). A TTL
     /// arm that (wrongly) fired against a terminal context would drive
-    /// `handle_ttl_expiry`'s Phase-2 `finish_ttl_expiry_io`, which appends a
-    /// `ContextExpired` leaf — so a non-zero count is the distinguishing signal
+    /// `handle_ttl_expiry`, which queues and drains a `ContextExpired` record —
+    /// so a non-zero count is the distinguishing signal
     /// that the `is_active` reconcile gate regressed. Every other call is a
     /// success no-op.
     #[derive(Clone, Default)]

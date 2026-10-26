@@ -626,6 +626,17 @@ pub mod test_support {
     pub struct SharedSnapshots(Arc<crate::context::providers::persistence::InMemoryPersistence>);
 
     impl SharedSnapshots {
+        /// The stored snapshot of `context_id`, if any.
+        pub async fn snapshot(
+            &self,
+            context_id: &str,
+        ) -> Option<crate::context::state::ContextSnapshot> {
+            self.0
+                .load_context(context_id)
+                .await
+                .expect("the snapshot store reads")
+        }
+
         /// The event types of each unit in the stored snapshot's queue,
         /// oldest first; empty when nothing was stored.
         pub async fn persisted_unit_types(&self, context_id: &str) -> Vec<Vec<EventType>> {

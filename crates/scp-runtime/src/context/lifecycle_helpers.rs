@@ -597,6 +597,42 @@ pub async fn close_context(
 // 5. close_context_with_key (per-context)
 // ---------------------------------------------------------------------------
 
+/// Queues the `ContextClosing` record in a keep commit right after the close
+/// transition, then drains it (spec 17 §17.3 "Event log write failures").
+///
+/// Returns whether the persist landed and every queued record is written,
+/// which the final close checkpoint requires. A failed persist keeps the
+/// record queued in memory (keep-direction); the close's teardown commit
+/// stores it and returns that persist's error.
+async fn queue_closing_record(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    context_id: &str,
+    closing_record: crate::context::state::LeafSpec,
+) -> bool {
+    let queued = cell
+        .commit_class_s_keep(deps, context_id, |mut view| {
+            view.enqueue_log_unit(vec![closing_record]);
+            Ok(())
+        })
+        .await;
+    if let Err(e) = &queued {
+        tracing::warn!(
+            context_id = %context_id,
+            error = %e,
+            "close: the persist that queues the ContextClosing record failed; \
+             the teardown persist stores it"
+        );
+        return false;
+    }
+    // The step is durable with its records queued; write them now. A failed
+    // drain leaves them queued for the actor's next drain and logs its own
+    // error, so it does not fail the step that already landed (spec 17 §17.3
+    // "Event log write failures").
+    let _ = drain_pending_log_units(cell, deps, context_id).await;
+    cell.class_s.pending_log_units.is_empty()
+}
+
 /// Builds and signs the final checkpoint a close records (§9.9.3). A refused
 /// or timed-out sign is logged and yields `None`: the close transition has
 /// already committed and must persist.
@@ -680,7 +716,7 @@ pub async fn close_context_with_key(
     let role_state = cell.role_state.clone();
 
     // Delegate to ttl::close_context for the lifecycle transition + role
-    // gate (async). The initiator assigns the `ContextClosing` leaf timestamp
+    // gate. The initiator assigns the `ContextClosing` leaf timestamp
     // from its own clock — the same value stamped on the outgoing close
     // commit. This is the convergent-by-construction value WHEN cross-member
     // leaf replication lands; the receive-side append path is currently
@@ -688,30 +724,37 @@ pub async fn close_context_with_key(
     // replicated to other members. Cross-member convergence is the forward
     // step under ADR-051 (§7.3.1, §9.9.3).
     //
-    // This `.await` runs BEFORE the Class-S persist below and does NOT mutate
+    // This call runs BEFORE the Class-S persist below and does NOT mutate
     // `PerContextState` (it drives the shared `handle` lifecycle FSM), so it
     // stays OUTSIDE the `_keep` combinator closure that wraps the subsequent
     // state mutations + fail-closed persist.
-    let result = ttl::close_context(
-        handle,
-        initiator_did,
-        &role_state,
-        deps.event_log.as_ref(),
-        deps.clock.now_secs(),
-    )
-    .await?;
+    let (result, closing_record) =
+        ttl::close_context(handle, initiator_did, &role_state, deps.clock.now_secs())?;
+
+    // The final checkpoint covers the whole log, so it waits for every queued
+    // record to be written.
+    let log_complete = queue_closing_record(cell, deps, &context_id, closing_record).await;
 
     // Final checkpoint before close (§9.9.3): capture the terminal event log
-    // state, including the `ContextClosing` leaf just appended, so equivocation
+    // state, including the `ContextClosing` record just drained, so equivocation
     // detection covers the full context lifetime. It is built and signed HERE,
     // before the synchronous Class-S combinator below, because signing awaits
     // custody (ADR-049 Decision 7a). The epoch is read before the broadcast
     // teardown, so a broadcast context's checkpoint carries no epoch
     // (§23.16.1). Best-effort: the close transition above has already
     // committed and must persist, so a refused or timed-out sign skips the
-    // checkpoint (logged) rather than aborting the close.
+    // checkpoint (logged) rather than aborting the close. A log still short of
+    // a queued record skips it the same way.
     let final_checkpoint = match signer {
         None => None,
+        Some(_) if !log_complete => {
+            tracing::warn!(
+                context_id = %context_id,
+                "final close checkpoint skipped: a queued event log record is not \
+                 yet written (§9.9.3)"
+            );
+            None
+        }
         Some(signer) => {
             let broadcast_context_is_none = cell.broadcast_context.is_none();
             let mls_epoch = cell.epoch.mls_epoch;
@@ -7183,6 +7226,80 @@ mod restore_reconcile_tests {
         assert!(
             cell.broadcast_context.is_none(),
             "keep-direction: the close teardown stays applied through persist failure"
+        );
+    }
+
+    /// A close whose `ContextClosing` record the log refuses still lands: the
+    /// record is queued in the persist that records the close, the close
+    /// returns `Ok`, and the log is unchanged (spec 17 §17.3 "Event log write
+    /// failures").
+    #[tokio::test]
+    async fn close_append_failure_after_transition_keeps_close_and_queues_leaf() {
+        use crate::context::log_unit_helpers::test_support;
+        use scp_protocol::context::roles::Capability;
+
+        let admin = DID("did:dht:z6MkCloseQueuesAdmin".to_owned());
+        let context_id = hex::encode([0x4du8; 32]);
+        let context_id_bytes = crate::context::state::context_id_to_bytes(&context_id);
+        let (deps, faulty, snapshots) =
+            test_support::deps_over_faulty_log(admin.as_ref(), &context_id).await;
+
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            context_id_bytes,
+            scp_clock::Clock::now_secs(&scp_clock::SystemClock),
+            admin.clone(),
+        );
+        state.role_state.members.insert(admin.as_ref().to_owned());
+        state.role_state.member_capabilities.insert(
+            admin.as_ref().to_owned(),
+            std::iter::once(Capability::ContextClose).collect(),
+        );
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .unwrap();
+        let handle = ContextHandle::new(context_id.clone(), state.handle.params().clone());
+        handle
+            .transition_to(&crate::context::ContextState::Active)
+            .unwrap();
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
+
+        test_support::fail_log_entry_writes(&faulty, &context_id_bytes);
+        let log_before = test_support::log_len(&deps, &context_id_bytes);
+
+        let result = lifecycle_helpers::close_context(&mut cell, &deps, &handle, &admin).await;
+
+        assert!(
+            result.is_ok(),
+            "a refused ContextClosing write must not fail a close whose transition \
+             persisted: got {result:?}"
+        );
+        assert_eq!(handle.state(), crate::context::ContextState::Closing);
+        let expected = vec![vec![scp_event_log::EventType::ContextClosing]];
+        assert_eq!(
+            test_support::queued_unit_types(&cell.class_s.pending_log_units),
+            expected,
+            "the ContextClosing record stays queued"
+        );
+        assert_eq!(
+            snapshots.persisted_unit_types(&context_id).await,
+            expected,
+            "the record rides the persist that recorded the close"
+        );
+        assert_eq!(
+            cell.class_s
+                .pending_log_units
+                .front()
+                .expect("one queued unit")
+                .leaves[0]
+                .actor_did(),
+            admin.as_ref(),
+            "the record names the initiator"
+        );
+        assert_eq!(
+            test_support::log_len(&deps, &context_id_bytes),
+            log_before,
+            "the refused write leaves the log unchanged"
         );
     }
 

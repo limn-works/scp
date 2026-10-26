@@ -9864,21 +9864,6 @@ const EVENT_LOG_APPEND_ALLOWLIST: &[(&str, &str, &str)] = &[
         "spec 17 §17.3, memory-first after the step",
     ),
     (
-        "scp-runtime/src/context/ttl.rs",
-        "close_context",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/ttl.rs",
-        "finalize_close",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/ttl.rs",
-        "finish_ttl_expiry_io",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
         "scp-runtime/src/context/ttl_close_helpers.rs",
         "extend_ttl_deadline_and_record",
         "spec 17 §17.3, memory-first after the step",
