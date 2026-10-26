@@ -11290,7 +11290,7 @@
         "crates/scp-testing/src/conformance/next_set_custody.rs",
         ".docs/standards/sdk-capability-matrix.json"
       ],
-      "description": "Architecture slice S8. A root or pre-rotation key held in a passkey signs through the `KeyEventSigner` contract of SCP-345, whose assertion-arm implementation each platform supplies through a host callback; the ADR-057 browser client implements `KeyEventSigner` directly over `navigator.credentials`, and the store set R10 names is reached through a `RecoveryHandleStore` trait. The headless profile offers the three copyable methods `09-security-model.md` §9.7.4.1 names. §9.7.4.1 states which method conforms on which profile. This story owns the production implementors: the passkey and FIDO2 `KeyEventSigner`s, every production `NextSetCustody`, the headless copyable methods as `NextSetCustody::seal_backup` and `restore`, the ADR-054 callback interfaces in PyO3, UniFFI and napi, and the four SDK host adapters. SCP-345 owns the contract and the raw-arm implementors.",
+      "description": "Architecture slice S8. A root or pre-rotation key held in a passkey signs through the `KeyEventSigner` contract of SCP-345, whose assertion-arm implementation each platform supplies through a host callback; the ADR-057 browser client implements `KeyEventSigner` directly over `navigator.credentials`, and the store set R10 names is reached through a `RecoveryHandleStore` trait. On the headless profile, `09-security-model.md` §9.7.4.1 item 4 requires the floor of ADR-054, pre-rotation custody substrate isolation, an independent-principal KMS, HSM or cloud-vault backend, and offers the three copyable methods only under the conditions it states, never as the floor. §9.7.4.1 states which method conforms on which profile. This story owns the production implementors: the passkey and FIDO2 `KeyEventSigner`s, every production `NextSetCustody`, the headless copyable methods as `NextSetCustody::seal_backup` and `restore`, the ADR-054 raw-arm callback interface in PyO3, UniFFI and napi, the three ADR-054 assertion-arm and store-set host interfaces in UniFFI alone, and the four SDK host adapters. SCP-345 owns the contract and the raw-arm implementors.",
       "acceptanceCriteria": [
         "The passkey `KeyEventSigner` returns `IndexedSignature::WebAuthnAssertion` whose client-data challenge is `change.key_event_challenge()`, on Swift through `ASAuthorization`, on Kotlin through Credential Manager, and in the browser through `navigator.credentials`: one test per platform against a platform fake (`09-security-model.md` §9.7.4.1 item 4)",
         "`RecoveryHandleStore` reads and writes the platform-account member and the `largeBlob` member of the store set, and reports a `largeBlob` write that does not land: a test per member (`09-security-model.md` §9.7.4.2 R10)",
@@ -11298,8 +11298,14 @@
         "The Shamir method, through `NextSetCustody::seal_backup` and `restore`, splits a key 3-of-5 over GF(2^8) into 34-byte shares, and any three shares reconstruct it: a property test (`09-security-model.md` §9.7.4.1 item 4)",
         "The paper method, through `NextSetCustody::seal_backup` and `restore`, encodes a key as a 24-word BIP39 mnemonic and decodes it back: a known-answer test (`09-security-model.md` §9.7.4.1 item 4)",
         "The SDK offers each method only on the profiles the method-by-profile table marks as conforming: a test per table row (`09-security-model.md` §9.7.4.1 item 4)",
+        "On `Headless`, the SDK requires an independent-principal KMS, HSM or cloud-vault backend as the next-set floor, and never accepts a FIDO2 token or a copyable method as the standalone floor: a test per method (`09-security-model.md` §9.7.4.1 item 4, headless methods; ADR-054 §OQ2 resolved)",
+        "On `Headless`, identity creation fails closed where no independent-principal substrate is available, with no fallback to co-located storage: a test (`09-security-model.md` §9.7.4.1 items 3a and 4)",
+        "On `Headless`, the SDK offers the encrypted offline backup only when its passphrase or key-encryption key inherits KMS, HSM or second-device isolation, or when the user supplies the passphrase at each recovery and the passphrase is never persisted where the server can reach it, and refuses it with an auto-generated passphrase the server can reach: a test per case (`09-security-model.md` §9.7.4.1 item 4, headless methods)",
+        "On `Headless`, the SDK offers the Shamir split only when at least 3 shares reside in domains independent of the operational host's blast radius, and refuses it with every share local to the operational host: a test per case (`09-security-model.md` §9.7.4.1 item 4, headless methods)",
+        "On `Headless`, the SDK offers the paper mnemonic only as human custody and never as a substrate the unattended server holds: a test (`09-security-model.md` §9.7.4.1 item 4, headless methods)",
         "A FIDO2 token over CTAP is a `KeyEventSigner` and a `NextSetCustody` for `PreRotationCustodyKind::HardwareSecurityKey`, returning `IndexedSignature::WebAuthnAssertion` over `change.key_event_challenge()`: a test against a CTAP fake (`09-security-model.md` §9.7.4.1)",
         "PyO3, UniFFI and napi each declare the ADR-054 next-set callback interface with exactly the methods `generate`, `public_key` (33 bytes), `sign_change` (`signChange`, receiving the 32-byte digest), `sign_probe` (`signProbe`, receiving the 32-byte probe digest) and `destroy`, and the host implements the raw arm only: a test per bridge drives each method through a host fake (ADR-054)",
+        "UniFFI alone declares `AssertionCustodyProvider`, `CredentialBlobProvider` and `SyncedStoreProvider` with the methods and casing ADR-054 names, and PyO3 and napi declare none of the three and carry exemptions for them in the SDK capability matrix, `.docs/standards/sdk-capability-matrix.json`, alone, written in S8 PR 5b: a UniFFI test drives each method through a host fake, and `scripts/check-bridge-symmetry.sh` and `scripts/check-sdk-coverage.py` pass (ADR-054 §Assertion-arm and store-set host interfaces)",
         "The Swift, Kotlin, TypeScript and Python SDKs each ship a host adapter for that callback interface, and the SDK capability matrix lists each adapter for each SDK: a test per SDK calls each method",
         "`next_set_custody_conformance!()` runs first against SCP-345's in-memory `NextSetCustody` at `crates/scp-platform/src/testing/next_set_custody.rs`, its first caller, and then against every `NextSetCustody` implementor this story ships (`16-test-infrastructure.md` §16.12.3a)",
         "`seal_backup` is offered only on the `Headless` profile and only at generation, and every implementor that is not `Headless` returns `NextSetCustodyError::MethodNotOffered`; the codecs in `crates/scp-platform/src/headless_backup.rs` are `pub(crate)` to scp-platform: a test per implementor (`09-security-model.md` §9.7.4.1)",
@@ -11335,6 +11341,14 @@
         {
           "file": ".docs/adrs/ADR-054-pre-rotation-custody-substrate-isolation.md",
           "section": "### Canonical method names (locked across bindings)"
+        },
+        {
+          "file": ".docs/adrs/ADR-054-pre-rotation-custody-substrate-isolation.md",
+          "section": "### Assertion-arm and store-set host interfaces"
+        },
+        {
+          "file": ".docs/adrs/ADR-054-pre-rotation-custody-substrate-isolation.md",
+          "section": "### OQ2 resolved — per-profile floors (full menu retained)"
         }
       ],
       "details": {}
