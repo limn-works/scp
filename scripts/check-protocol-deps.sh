@@ -2,6 +2,30 @@
 # Verify scp-protocol has no async runtime dependencies in production.
 set -euo pipefail
 
+# network_crates_in LISTING prints, one per line and sorted, the network
+# crates named in LISTING, a `cargo tree --prefix none --format '{p}'` listing
+# whose lines read "<crate> v<version>". A name matches only whole: `h2`
+# matches "h2 v0.4.0" and not "oauth2 v4.4.2", and `hyper` matches neither
+# "hyperlocal v0.9.0" nor a crate whose name merely contains it.
+network_crates_in() {
+    echo "$1" | grep -E '^(reqwest|hyper|hyper-util|ureq|isahc|surf|h2|rustls|tokio|async-std|smol) v' | awk '{print $1}' | sort -u || true
+}
+
+# --self-test feeds network_crates_in a canned listing with two network crates
+# and three names that contain a network crate's name, and requires exactly
+# the two network crates back. It runs no cargo command.
+if [ "${1:-}" = "--self-test" ]; then
+    canned=$'sha2 v0.10.9\noauth2 v4.4.2\nh2 v0.4.0\nhyperlocal v0.9.0\nreqwest v0.12.0'
+    got=$(network_crates_in "$canned")
+    want=$'h2\nreqwest'
+    if [ "$got" != "$want" ]; then
+        echo "ERROR: network_crates_in self-test: want [$want], got [$got]"
+        exit 1
+    fi
+    echo "network_crates_in self-test passed: matched exactly h2 and reqwest."
+    exit 0
+fi
+
 echo "Checking scp-protocol dependency tree..."
 
 # async-trait is excluded: it's a proc-macro that generates trait impls at
@@ -107,3 +131,24 @@ jsonschema_has_no_resolve_features() {
     echo "jsonschema feature check passed: no resolve-http, resolve-file or default."
 }
 jsonschema_has_no_resolve_features
+
+# protocol_has_no_network_crates: scp-protocol verifies device attestations
+# offline from the bytes a candidate presents (spec 09 §9.3.1), and it builds
+# for wasm32, so its production graph holds no HTTP client, HTTP or TLS stack,
+# or async runtime. Every target's edges are resolved, so a cfg-gated edge
+# cannot hide.
+protocol_has_no_network_crates() {
+    local listing found
+    listing=$(cargo tree -p scp-protocol --edges no-dev --target all --prefix none --format '{p}' 2>&1) || {
+        echo "ERROR: cargo tree failed: $listing"
+        exit 1
+    }
+    found=$(network_crates_in "$listing")
+    if [ -n "$found" ]; then
+        echo "ERROR: scp-protocol depends on network crates:"
+        echo "$found"
+        exit 1
+    fi
+    echo "scp-protocol network check passed: no HTTP, TLS or async runtime crate."
+}
+protocol_has_no_network_crates

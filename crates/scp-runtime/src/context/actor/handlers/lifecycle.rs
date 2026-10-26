@@ -152,7 +152,18 @@ async fn dispatch_actor_inner(
             // Capture the blocks synchronously so no state borrow spans the
             // sign's await.
             let blocks = crate::context::lifecycle_helpers::export_context_blocks(&*cell, deps);
-            handle_export_context_actor(blocks, deps, context_id, exporter_did, signer, reply).await
+            // The export future holds the snapshot blocks across the sign's
+            // await; boxing it keeps the dispatch future under the
+            // `large_futures` bound.
+            Box::pin(handle_export_context_actor(
+                blocks,
+                deps,
+                context_id,
+                exporter_did,
+                signer,
+                reply,
+            ))
+            .await
         }
         LifecycleCommand::ImportContext { export, reply, .. } => {
             // Bootstrap variant — see `CreateContext` arm comment.

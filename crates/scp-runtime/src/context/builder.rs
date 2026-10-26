@@ -1017,6 +1017,9 @@ impl CreationReceipt {
 ///
 /// Returns [`ContextCreationError::InvalidPseudonymRotationPolicy`] if
 /// `pseudonym_rotation` fails the §9.10.4.1 validity criterion.
+///
+/// Returns [`ContextCreationError::InvalidSybilPolicy`] if `sybil_policy`
+/// fails the §9.3.1 validity rules.
 fn validate_params(params: &ContextParams) -> Result<(), ContextCreationError> {
     // Governance model validation (SCP-267, ADR-031).
     // GovernanceModel is a variant-only enum in ContextParams. Structural
@@ -1060,6 +1063,13 @@ fn validate_params(params: &ContextParams) -> Result<(), ContextCreationError> {
     // makes the rule hold for every in-crate caller of `create_context`.
     if let Some(policy) = &params.pseudonym_rotation {
         policy.validate()?;
+    }
+
+    // §9.3.1 validity rules: creation rejects an invalid sybil policy.
+    // `lifecycle_helpers::create_context` checks it first; this check makes
+    // the rule hold for every in-crate caller of `create_context`.
+    if let Some(policy) = &params.sybil_policy {
+        policy.validated()?;
     }
 
     // Validate memory scope is permitted for the context mode (§5.11).

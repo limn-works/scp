@@ -350,6 +350,11 @@ pub enum ContextCreationError {
     #[error(transparent)]
     InvalidPseudonymRotationPolicy(#[from] crate::context::params::PseudonymRotationPolicyError),
 
+    /// `ContextParams.sybil_policy` fails the §9.3.1 validity rules, so the
+    /// context is not created.
+    #[error(transparent)]
+    InvalidSybilPolicy(#[from] crate::trust::sybil::SybilPolicyError),
+
     /// Generic creation failure with a descriptive message.
     #[error("context creation failed: {0}")]
     CreationFailed(String),

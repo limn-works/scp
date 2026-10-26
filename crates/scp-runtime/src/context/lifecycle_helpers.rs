@@ -1746,6 +1746,8 @@ fn rollback_join_economy_ticket(
 ///   breaks the ceiling-entry grammar (spec §5.3.1.1).
 /// - [`ContextCreationError::InvalidPseudonymRotationPolicy`] when
 ///   `params.pseudonym_rotation` fails the §9.10.4.1 validity criterion.
+/// - [`ContextCreationError::InvalidSybilPolicy`] when `params.sybil_policy`
+///   fails the §9.3.1 validity rules.
 /// - [`ContextCreationError::StateTransition`] wrapping
 ///   [`ContextError::SupervisorShutDown`] when the actor spawn is refused
 ///   because shutdown has begun or the Supervisor dropped (ADR-049 Decision 16).
@@ -1792,6 +1794,11 @@ pub(in crate::context) async fn create_context(
     // `PSEUDONYM_MIN_ROTATION_INTERVAL_SECS`.
     if let Some(policy) = &params.pseudonym_rotation {
         policy.validate()?;
+    }
+    // §9.3.1: creation rejects a sybil policy whose device-attestation inputs
+    // break a validity rule, before any context state exists.
+    if let Some(policy) = &params.sybil_policy {
+        policy.validated()?;
     }
     state::validate_governance_model(&params.governance)?;
     crate::context::lifecycle_logic::validate_consequence_rules(
@@ -3107,6 +3114,11 @@ pub(in crate::context) async fn import_context(
         &export.snapshot.consequence_rules,
         &export.snapshot.context_params.consequence_config,
     )?;
+    // §9.3.1: an imported sybil policy passes the same validity rules a
+    // created one does, with the same SCP-CTX-2092 refusal.
+    crate::context::lifecycle_logic::validate_sybil_policy_for_import(
+        export.snapshot.context_params.sybil_policy.as_ref(),
+    )?;
 
     // Ceiling-entry grammar enforcement on the IMPORTED ceiling (spec §5.3.1.1).
     // The imported `role_state` is taken from a signed snapshot produced by an
@@ -3944,6 +3956,7 @@ pub async fn restore_context(
     use crate::context::governance::timeout::DeadlockDetectionState;
     use crate::context::lifecycle_logic::{
         derive_message_pricing, sanitize_cooldown_until, validate_consequence_rules_for_import,
+        validate_sybil_policy_for_import,
     };
     use crate::context::state::{
         context_id_to_bytes, restore_governance_engine_from_snapshot,
@@ -3954,7 +3967,7 @@ pub async fn restore_context(
 
     let (mut ctx_snapshot, broadcast_ctx) =
         load_persisted_context_state(deps, context_id, preloaded_snapshot).await?;
-    // Every refusal below (consequence rules, ceiling grammar, the §5.13.3
+    // Every refusal below (consequence rules, sybil policy, ceiling grammar, the §5.13.3
     // binding check, the event-log load, the replay-floor merge) runs in that
     // order. The event log is hydrated only after the binding check, and the
     // floors are merged only after the event log loaded, so a restore refused
@@ -3968,6 +3981,7 @@ pub async fn restore_context(
         &ctx_snapshot.consequence_rules,
         &ctx_snapshot.context_params.consequence_config,
     )?;
+    validate_sybil_policy_for_import(ctx_snapshot.context_params.sybil_policy.as_ref())?;
 
     // Ceiling-entry grammar enforcement on the RESTORED ceiling (spec §5.3.1.1).
     // This is the self-respawn / process-restart path reading a LOCAL snapshot.
@@ -5732,6 +5746,34 @@ mod restore_reconcile_tests {
         assert!(
             matches!(err, ContextError::PersistenceFailed(ref msg) if msg.contains("malformed")),
             "expected a PersistenceFailed citing the malformed ceiling, got {err:?}"
+        );
+    }
+
+    /// Restore refuses a persisted `sybil_policy` that breaks a §9.3.1
+    /// validity rule (a device-attestation max age one second above the
+    /// one-year maximum) with `ImportRejected`, the import path's refusal.
+    /// The reason names the sybil policy, so the refusal comes from this check
+    /// and not from the §5.13.3 binding check that runs after it.
+    /// `restore_succeeds_when_routing_agrees_with_mode` is the control: the
+    /// same harvested snapshot, unmodified, restores.
+    #[tokio::test]
+    async fn restore_rejects_invalid_policy() {
+        let ctx_id = "restore-case-invalid-sybil-policy";
+        let (mut enc_snapshot, _) = harvest_snapshot(ctx_id, false).await;
+        let routing = enc_snapshot.routing.clone();
+        enc_snapshot.context_params.sybil_policy =
+            Some(scp_protocol::trust::sybil::ContextSybilPolicy {
+                device_attestation_max_age_secs:
+                    scp_protocol::trust::sybil::MAX_DEVICE_ATTESTATION_MAX_AGE_SECS + 1,
+                ..scp_protocol::trust::sybil::ContextSybilPolicy::casual()
+            });
+        let result = restore_with(enc_snapshot, routing, None, ctx_id).await;
+        assert!(
+            matches!(
+                result,
+                Err(ContextError::ImportRejected { ref reason }) if reason.contains("sybil_policy")
+            ),
+            "an invalid restored sybil policy must fail closed with ImportRejected; got {result:?}"
         );
     }
 

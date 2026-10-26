@@ -653,7 +653,10 @@ impl ContextActor {
         //
         // `state` and `deps` are disjoint fields of `self`, so the
         // borrow checker permits the simultaneous `&mut`/`&` borrows.
-        let outcome = Self::dispatch_state(&mut self.state, &self.deps, cmd).await;
+        // Boxed: the routed handler futures carry `ContextParams` across
+        // awaits, which puts the inline future above the `large_futures`
+        // bound.
+        let outcome = Box::pin(Self::dispatch_state(&mut self.state, &self.deps, cmd)).await;
         if outcome.mutated {
             self.dirty = true;
         }

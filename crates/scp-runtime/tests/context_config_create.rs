@@ -424,6 +424,85 @@ async fn create_context_with_non_empty_ceiling_succeeds() {
     );
 }
 
+/// `params` with a sybil policy whose device-attestation max age is
+/// `max_age_secs` and every other field valid.
+fn params_with_device_attestation_max_age(max_age_secs: u64) -> ContextParams {
+    ContextParams {
+        sybil_policy: Some(scp_protocol::trust::sybil::ContextSybilPolicy {
+            device_attestation_max_age_secs: max_age_secs,
+            ..scp_protocol::trust::sybil::ContextSybilPolicy::casual()
+        }),
+        ..params_with_ceiling(vec![Capability::MessagesRead])
+    }
+}
+
+/// Creation refuses a sybil policy that breaks a §9.3.1 validity rule, here a
+/// device-attestation max age one second above the one-year maximum, with the
+/// typed `InvalidSybilPolicy`, and creates no context.
+#[tokio::test]
+async fn create_context_rejects_invalid_policy() {
+    let manager = new_manager();
+
+    let result = manager
+        .create_context(
+            "ctx-params-invalid-sybil".into(),
+            params_with_device_attestation_max_age(
+                scp_protocol::trust::sybil::MAX_DEVICE_ATTESTATION_MAX_AGE_SECS + 1,
+            ),
+            alice(),
+            None,
+            Vec::new(),
+        )
+        .await;
+
+    assert!(
+        matches!(
+            result,
+            Err(ContextCreationError::InvalidSybilPolicy(
+                scp_protocol::trust::sybil::SybilPolicyError::DeviceAttestationMaxAgeTooLarge { .. }
+            ))
+        ),
+        "create_context must reject an invalid sybil policy; got {result:?}"
+    );
+    assert!(
+        matches!(
+            manager
+                .read_context_state_checked("ctx-params-invalid-sybil")
+                .await,
+            Ok(None)
+        ),
+        "a rejected create_context must not leave a context behind"
+    );
+}
+
+/// The control for `create_context_rejects_invalid_policy`: a sybil policy at
+/// the one-year maximum creates an `Active` context carrying that policy.
+#[tokio::test]
+async fn create_context_accepts_valid_policy() {
+    let manager = new_manager();
+    let params = params_with_device_attestation_max_age(
+        scp_protocol::trust::sybil::MAX_DEVICE_ATTESTATION_MAX_AGE_SECS,
+    );
+
+    let result = manager
+        .create_context(
+            "ctx-params-valid-sybil".into(),
+            params.clone(),
+            alice(),
+            None,
+            Vec::new(),
+        )
+        .await;
+
+    match result {
+        Ok(handle) => {
+            assert_eq!(handle.state(), ContextState::Active);
+            assert_eq!(handle.params().sybil_policy, params.sybil_policy);
+        }
+        Err(e) => panic!("a valid sybil policy must create a context; got {e:?}"),
+    }
+}
+
 /// A minimum protocol version no SDK of the current major satisfies.
 const UNSATISFIABLE_MIN_VERSION: Option<(u8, u8)> = Some((9, 0));
 
