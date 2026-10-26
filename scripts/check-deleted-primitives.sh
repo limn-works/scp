@@ -180,8 +180,8 @@ BAN_ENTRIES=(
     # multi-bound form (`K: Send + KeyCustody = X`), and a default whose bound
     # sits in a `where` clause (`S = X` with `where S: Storage`). For
     # NodeConfig, the `compile_fail,E0107` doctest in
-    # crates/scp-node/src/config.rs covers all three: it supplies two of the
-    # three type arguments and compiles only when a parameter has a default.
+    # crates/scp-node/src/config.rs covers all three: it supplies one of the
+    # two type arguments and compiles only when a parameter has a default.
     "struct NoOpCustody[[:space:];{<(]|crates|*.rs|NodeConfig names its custody; the default placeholder custody is deleted (persistence spec mandatory-selection rule, SCP-CAPSEL-8000, §17.17.1)"
     "struct NoOpDidMethod[[:space:];{<(]|crates|*.rs|NodeConfig names its DID method; the default placeholder DID method is deleted (persistence spec mandatory-selection rule, SCP-CAPSEL-8000, §17.17.1)"
     "struct NoOpStorage[[:space:];{<(]|crates|*.rs|A storage that keeps nothing is a nullifier, which the persistence spec rule SCP-CAPSEL-8012 (§17.17.2 Security Classification of Development Arms) keeps out of shipped artifacts; NodeConfig names a real backend"
@@ -189,6 +189,7 @@ BAN_ENTRIES=(
     ":[[:space:]]*DidMethod[[:space:]]*=[[:space:]]*[A-Za-z]|crates|*.rs|A DidMethod type parameter takes no default (persistence spec mandatory-selection rule, SCP-CAPSEL-8000, §17.17.1)"
     ":[[:space:]]*Storage[[:space:]]*=[[:space:]]*[A-Za-z]|crates|*.rs|A Storage type parameter takes no default (persistence spec mandatory-selection rule, SCP-CAPSEL-8000, §17.17.1)"
     ":[[:space:]]*EncryptedStorage[[:space:]]*=[[:space:]]*[A-Za-z]|crates|*.rs|An EncryptedStorage type parameter takes no default (persistence spec mandatory-selection rule, SCP-CAPSEL-8000, §17.17.1)"
+    ":[[:space:]]*NodeIdentitySource[[:space:]]*=[[:space:]]*[A-Za-z]|crates|*.rs|A NodeIdentitySource type parameter takes no default (persistence spec mandatory-selection rule, SCP-CAPSEL-8000, §17.17.1)"
     # #2148 (birth-into-actor): the six provider-dissolution symbols
     # (take_crypto_state / with_context / create_group_into_slot method defs, and
     # the contexts / taken_context_ids / broadcast_keys fields) are NOT banned

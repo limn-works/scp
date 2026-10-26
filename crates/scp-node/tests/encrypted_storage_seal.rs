@@ -37,13 +37,17 @@
 //!    `cargo nextest` / `cargo clippy --all-targets` lane type-checks them, not
 //!    just CI's doctest job.
 
+use std::sync::Arc;
+
 use scp_core::store::ProtocolRepository;
+use scp_did::DidDocument;
 use scp_identity::DidMethod;
-use scp_node::{Node, NodeConfig};
+use scp_identity::dht::ScpIdentity;
+use scp_node::{ExplicitIdentity, Node, NodeConfig, NodeIdentitySource, Reach};
 use scp_platform::encrypting_adapter::EncryptingAdapter;
 use scp_platform::filesystem::FilesystemStorage;
-use scp_platform::traits::KeyCustody;
 use scp_platform::{EncryptedStorage, Storage};
+use scp_transport::native::storage::BlobStorageBackend;
 
 // ---------------------------------------------------------------------------
 // Compile-time supertrait assertion
@@ -77,11 +81,10 @@ fn _assert_encrypted_storage_extends_storage<S: EncryptedStorage>() {
 /// bound, so a production constructor accepts it. That doctest asserts a bare
 /// `FilesystemStorage` form does not compile.
 #[allow(dead_code)]
-fn _assert_encrypted_filesystem_reaches_production_node_start<K, D>(
-    config: NodeConfig<K, D, EncryptingAdapter<FilesystemStorage>>,
+fn _assert_encrypted_filesystem_reaches_production_node_start<I>(
+    config: NodeConfig<I, EncryptingAdapter<FilesystemStorage>>,
 ) where
-    K: KeyCustody + 'static,
-    D: DidMethod + 'static,
+    I: NodeIdentitySource + 'static,
 {
     let _fut = Node::start(config);
 }
@@ -92,16 +95,41 @@ fn _assert_encrypted_filesystem_reaches_production_node_start<K, D>(
 /// `NodeConfig` has no default type arguments, which the persistence spec's
 /// mandatory-selection rule SCP-CAPSEL-8000 ("Selection is mandatory; there
 /// is no default", §17.17.1 Selection Requirements) requires, so a type
-/// position names all three. This position does, and compiles; that doctest
-/// asserts that a position naming only two does not.
+/// position names both. This position does, and compiles; that doctest
+/// asserts that a position naming only one does not.
 /// The leading underscore keeps this never-called function free of a
 /// `dead_code` warning.
-fn _assert_node_config_names_every_slot<K, D, S>(_config: NodeConfig<K, D, S>)
+fn _assert_node_config_names_every_slot<D, S>(_config: NodeConfig<ExplicitIdentity<D>, S>)
 where
-    K: KeyCustody,
-    D: DidMethod,
+    D: DidMethod + 'static,
     S: Storage,
 {
+}
+
+/// A config over a pre-existing identity names no key-custody type.
+///
+/// `ExplicitIdentity` holds no custody, so the compiler infers every type
+/// parameter of this config with no annotation. If a custody type parameter
+/// returned to `ExplicitIdentity` or to `NodeConfig`, nothing here would
+/// constrain it and this function would stop compiling.
+#[allow(dead_code)]
+fn _assert_explicit_identity_config_names_no_custody<D: DidMethod + 'static>(
+    identity: ScpIdentity,
+    document: DidDocument,
+    did_method: Arc<D>,
+    storage: EncryptingAdapter<FilesystemStorage>,
+) {
+    let config = NodeConfig::defaults(
+        Reach::Local,
+        ExplicitIdentity {
+            identity,
+            document,
+            did_method,
+        },
+        storage,
+        BlobStorageBackend::in_memory(),
+    );
+    let _fut = Node::start(config);
 }
 
 /// Counterpart of a `ProtocolRepository::new` compile-fail doctest.

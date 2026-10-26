@@ -94,7 +94,7 @@ use scp_did::DidDocument;
 /// path, used as the `S` type argument when `persistence` is `None`.
 ///
 /// [`IdentityConfig`] is generic over its storage type `S` (exactly as
-/// `NodeConfig<K, D, S>` is). On the ephemeral path the caller never supplies a
+/// `NodeConfig<I, S>` is). On the ephemeral path the caller never supplies a
 /// storage value, so there is no concrete `S` to infer — this uninhabited type
 /// fills that slot. It implements [`Storage`] only to satisfy the `S: Storage`
 /// bound on [`IdentityConfig`]; because it has no constructor and no variants,

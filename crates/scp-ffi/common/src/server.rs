@@ -497,18 +497,11 @@ pub async fn start_node_in_memory(
                     Reach::Domain {
                         domain: "localhost".to_owned(),
                     },
-                    // `Explicit` carries no custody, so `K` is unconstrained by
-                    // the variant; annotate it to a production custody type
-                    // (`FileKeyCustody`) so a caller-supplied identity runs on
-                    // no test-only nullifier type (ADR-062 §Decision 6). This
-                    // path compiles only under `test` or `testing` (SCP-327).
-                    IdentitySource::<FileKeyCustody, ConcreteDidMethod>::Explicit(Box::new(
-                        ExplicitIdentity {
-                            identity: id.identity,
-                            document: id.document,
-                            did_method: id.did_method,
-                        },
-                    )),
+                    ExplicitIdentity {
+                        identity: id.identity,
+                        document: id.document,
+                        did_method: id.did_method,
+                    },
                     Arc::new(EncryptingAdapter::new(InMemoryStorage::new(), storage_key)),
                     // Explicit durability-only selection for this in-memory
                     // server front door (SCP-CAPINJECT-010): the blob backend is
@@ -722,7 +715,7 @@ where
     let blob_storage = BlobStorageBackend::redb(&blob_path)?;
 
     // Build the node via the ADR-052 flat-config front door (Phase B-P2). The
-    // two identity arms differ only in their `IdentitySource`; the dropped
+    // two identity arms differ only in their identity source; the dropped
     // explicit `SelfSignedTlsProvider::new("localhost")` is reproduced by the
     // default `TlsMode::SelfSigned`. This node opts into `DhtMode::Production`
     // (M2 accepts `Disabled` for every `Reach`, `Domain` included), which makes
@@ -737,18 +730,11 @@ where
                 Reach::Domain {
                     domain: "localhost".to_owned(),
                 },
-                // `Explicit` carries no custody, so `K` is unconstrained by the
-                // variant; annotate it to `FileKeyCustody` (matching the
-                // persisted arm below), so a caller-supplied identity runs on no
-                // test-only nullifier type (ADR-062 §Decision 6). This path
-                // compiles only under `test` or `testing` (SCP-327).
-                IdentitySource::<FileKeyCustody, ConcreteDidMethod>::Explicit(Box::new(
-                    ExplicitIdentity {
-                        identity: id.identity,
-                        document: id.document,
-                        did_method: id.did_method,
-                    },
-                )),
+                ExplicitIdentity {
+                    identity: id.identity,
+                    document: id.document,
+                    did_method: id.did_method,
+                },
                 storage,
                 // The operator-chosen durable redb blob backend (opened above),
                 // passed as the required selection (SCP-CAPINJECT-010).
@@ -767,11 +753,9 @@ where
         // on this future's worker thread. A panicked or cancelled task
         // surfaces as `ServerError::Io`.
         let key_custody = Arc::new(
-            tokio::task::spawn_blocking(move || {
-                scp_platform::file::FileKeyCustody::new(&key_path, &passphrase)
-            })
-            .await
-            .map_err(std::io::Error::from)??,
+            tokio::task::spawn_blocking(move || FileKeyCustody::new(&key_path, &passphrase))
+                .await
+                .map_err(std::io::Error::from)??,
         );
 
         // Build the node's DHT client for its DID method: the in-memory
@@ -1060,7 +1044,7 @@ fn node_config<S: EncryptedStorage>(
     identity: NodeIdentity,
     blob_storage: BlobStorageBackend,
     storage: S,
-) -> NodeConfig<FileKeyCustody, ConcreteDidMethod, S> {
+) -> NodeConfig<ExplicitIdentity<ConcreteDidMethod>, S> {
     NodeConfig {
         tls: v.tls,
         dht: DhtMode::Disabled,
@@ -1071,16 +1055,11 @@ fn node_config<S: EncryptedStorage>(
         nat: NatSlot::Auto,
         ..NodeConfig::defaults(
             v.reach,
-            // `Explicit` carries no custody, so `K` is annotated to the
-            // production `FileKeyCustody`, and no test-only nullifier type
-            // appears on this shipped path (ADR-062 §Decision 6).
-            IdentitySource::<FileKeyCustody, ConcreteDidMethod>::Explicit(Box::new(
-                ExplicitIdentity {
-                    identity: identity.identity,
-                    document: identity.document,
-                    did_method: identity.did_method,
-                },
-            )),
+            ExplicitIdentity {
+                identity: identity.identity,
+                document: identity.document,
+                did_method: identity.did_method,
+            },
             storage,
             blob_storage,
         )
@@ -1095,7 +1074,7 @@ fn node_config<S: EncryptedStorage>(
 /// check, `scp_node::validate_reach_and_tls`, and the identity match run
 /// before any directory or file exists. Only then does `node_start` create the
 /// blob directory, open the blob backend, and call [`Node::start`] with
-/// `IdentitySource::Explicit` and `DhtMode::Disabled`.
+/// `ExplicitIdentity` and `DhtMode::Disabled`.
 ///
 /// # Errors
 ///

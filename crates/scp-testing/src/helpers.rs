@@ -131,7 +131,8 @@ impl NatStrategy for FailingNatStrategy {
 /// through the in-memory `did_method` and fail the start if that publish fails.
 /// Drive it with `Node::start_for_testing(test_node_config()).await`.
 #[must_use]
-pub fn test_node_config() -> NodeConfig<InMemoryKeyCustody, TestDidDht, InMemoryStorage> {
+pub fn test_node_config()
+-> NodeConfig<IdentitySource<InMemoryKeyCustody, TestDidDht>, InMemoryStorage> {
     let custody = Arc::new(InMemoryKeyCustody::new());
     let did_method = Arc::new(make_test_dht(&custody));
     NodeConfig {
@@ -162,7 +163,7 @@ pub fn test_node_config() -> NodeConfig<InMemoryKeyCustody, TestDidDht, InMemory
 #[must_use]
 pub fn test_no_domain_node_config(
     tier: ReachabilityTier,
-) -> NodeConfig<InMemoryKeyCustody, TestDidDht, InMemoryStorage> {
+) -> NodeConfig<IdentitySource<InMemoryKeyCustody, TestDidDht>, InMemoryStorage> {
     let custody = Arc::new(InMemoryKeyCustody::new());
     let did_method = Arc::new(make_test_dht(&custody));
     NodeConfig {

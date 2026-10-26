@@ -159,7 +159,7 @@ NodeConfig {
     // `Reach` is a NEW enum (P1) that folds the existing addressing machinery —
     // `PublicSurface`, `ReachabilityTier`, and the `skip_nat` / `no_domain` flags
     // (`crates/scp-node/src`) — into one required field.
-    identity: IdentitySource,  // Generate{custody, did_method} | Persisted{custody, did_method} | Explicit{identity, document}
+    identity: I,               // I: NodeIdentitySource (sealed) = IdentitySource::{Generate{custody, did_method} | Persisted{custody, did_method}} or ExplicitIdentity{identity, document, did_method}; only IdentitySource carries a custody type
     // `IdentitySource::Persisted` means "load-or-create the node's identity, persisting it
     // into the Node's OWN `storage` slot below." It carries no separate storage slot — it
     // reuses `NodeConfig.storage`. (Same persist-to-an-encrypted-slot model as standalone
@@ -176,7 +176,7 @@ NodeConfig {
 }
 ```
 
-Entry: `Node::start(NodeConfig)` (production, `where S: EncryptedStorage`) + `Node::start_for_testing(NodeConfig)` (feature-gated). The `Dom`/`Id` typestate markers are deleted; the `<K, D, S>` generics survive, carried by the config and its selectors. (The `IdentitySource` name-reconciliation against the existing private `scp-node` enum is an implementation-sequencing detail — see the ADR-052 Dependencies bullet, not restated here.)
+Entry: `Node::start(NodeConfig)` (production, `where S: EncryptedStorage`) + `Node::start_for_testing(NodeConfig)` (feature-gated). The `Dom`/`Id` typestate markers are deleted. The config is `NodeConfig<I, S>`: `I` is `IdentitySource<K, D>` or `ExplicitIdentity<D>`, so a config over a pre-existing identity names no custody type, and `S` is the storage (ADR-052 amendment, 2026-10-26). (The `IdentitySource` name-reconciliation against the existing private `scp-node` enum is an implementation-sequencing detail — see the ADR-052 Dependencies bullet, not restated here.)
 
 ### Node start — `NodeStartConfig`
 
@@ -198,7 +198,7 @@ Entry: `Node::start(NodeConfig)` (production, `where S: EncryptedStorage`) + `No
 
 Field rules:
 
-- **`identity` names the operator.** Alec ruled on 2026-08-17: "nodes don't get identities and don't act. they are not participants". The handle names an operator identity that is already registered on the same `SCP` instance, and the bridge lowers it to `IdentitySource::Explicit`. `NodeStartConfig` has no `Persisted` arm, no passphrase field and no key path.
+- **`identity` names the operator.** Alec ruled on 2026-08-17: "nodes don't get identities and don't act. they are not participants". The handle names an operator identity that is already registered on the same `SCP` instance, and the bridge lowers it to `ExplicitIdentity`. `NodeStartConfig` has no `Persisted` arm, no passphrase field and no key path.
 - **No storage field.** `node_start` takes the `SCP` instance's own storage handle (`17-persistence-and-storage.md` §17.6, first-party storage adapters). A second store on the same directory fails, because `SqliteStorage::new` takes a non-blocking exclusive lock on `scp.db.lock` in that directory. When the instance store is in-memory, `node_start` logs a warning that the node loses all state on drop.
 - **`tls` and `dht` are required at the FFI layer, although the core `NodeConfig` defaults both.** The PyO3 and napi-rs bridges read untyped input, so an optional field with a default would let a misspelled key select that default.
 - **`cors_origins` is required, because the core `NodeConfig` reads `None` as the permissive `*` origin.** `AnyOrigin` selects `*` only when the caller names it. The listed arm is `Allowlist`, not `List`: UniFFI generates a Kotlin data class per data arm, and a class named `List` shadows `kotlin.collections.List` in its own `origins` field, so the Kotlin bindings do not compile.
