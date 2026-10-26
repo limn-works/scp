@@ -27,7 +27,7 @@ Build order: ADR-008 + ADR-011 (parallel, both depend on Phase 1) --> ADR-009 --
 
 ## ADR-008: Context Lifecycle State Machine
 
-**Status:** Decided
+**Status:** Accepted
 
 ### Context
 
@@ -299,7 +299,7 @@ pub enum MemoryScope {
 
 ## ADR-009: Role Assignment and Capability Ceiling Enforcement
 
-**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
+**Status:** Accepted. **Amended:** 2026-09-10 (the P-256 curve ruling).
 
 **Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, left a human identity one operational role, so a verifier resolves an issuer's key from that issuer's key state (`09-security-model.md` §9.1 invariant 1, `03-identity.md` §3.10.4).
 
@@ -480,7 +480,7 @@ pub struct RoleDefinition {
 
 ## ADR-010: Outlet Registration and Invocation
 
-**Status:** Decided
+**Status:** Accepted
 
 ### Context
 
@@ -691,7 +691,7 @@ pub struct OutletSession {
 
 ## ADR-011: Verifiable Event Log (Merkle Tree)
 
-**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
+**Status:** Accepted. **Amended:** 2026-09-10 (the P-256 curve ruling).
 
 **Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, left one operational role, and a verifier resolves an actor's key by replaying that actor's key-event log (`03-identity.md` §3.10.4, `09-security-model.md` §9.1 invariant 1).
 
@@ -1209,7 +1209,7 @@ pub struct ConsistencyCheckpoint {
 
 ## ADR-012: Multi-Transport Routing
 
-**Status:** Decided
+**Status:** Accepted
 
 **Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, moved transport metadata into a separately signed service record (`03-identity.md` §3.10.13).
 
@@ -1358,7 +1358,7 @@ This test proves: context lifecycle works, roles enforce, outlets invoke, event 
 
 > **Note:** ADR-032 is numbered non-sequentially because it was added as a cross-cutting concern after the original phase numbering was established. It lives in the Phase 2 document because its scope (relay discovery, `.well-known/scp`, URI format) is transport-adjacent and depends on Phase 1–2 ADRs. See also ADR-033 in phase-3.md.
 
-**Status:** Decided
+**Status:** Accepted
 
 **Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, moved every `SCPRelay` entry below into the identity's service record, which its designated operational key signs and which carries its own monotonic sequence (`03-identity.md` §3.10.13). `18-addressability-and-deployment.md` §18.2.1 defines the entry type and §18.5.1 states the bootstrap order.
 
@@ -1450,7 +1450,7 @@ Implement a complete addressability and deployment layer as specified in §18:
 
 > **Note:** ADR-035 is numbered non-sequentially (same pattern as ADR-032). Both features are `ApplicationNode`-scope extensions that depend on Phase 2 ADRs and live in the `scp-node` crate. They are application-layer conveniences, not protocol changes.
 
-**Status:** Decided
+**Status:** Accepted
 
 **Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, replaced the record this endpoint returns, and `03-identity.md` §3.10.13 defines the service record it returns instead.
 
@@ -1550,7 +1550,7 @@ Implement two `ApplicationNode` features in the `scp-node` crate:
 
 ## ADR-036: Transport Profiles and Adaptive Resource Management
 
-**Status:** Decided
+**Status:** Accepted
 
 ### Context
 
@@ -1628,7 +1628,7 @@ Introduce named transport profiles and tiered cover traffic configuration to ada
 
 ## ADR-037: Alternative Transport Bindings (QUIC, WebTransport, UDP/DTLS)
 
-**Status:** Decided
+**Status:** Accepted
 
 ### Context
 
@@ -1782,7 +1782,7 @@ Key design choices:
 
 ## ADR-042: Broadcast Content Delivery
 
-**Status:** Decided
+**Status:** Accepted
 
 ### Context
 
@@ -1877,7 +1877,7 @@ Key design choices:
 
 > **Note:** ADR-052 is numbered non-sequentially (same convention as ADR-032/035/042). It lives in the Phase 2 document because its primary worked example is `ApplicationNode` construction (ADR-032, `scp-node`), but its scope is cross-cutting: it governs every developer-facing construction entry point across all five language SDKs.
 
-**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
+**Status:** Accepted. **Amended:** 2026-09-10 (the P-256 curve ruling).
 
 **Amendment (2026-09-10 — `BRIDGE_REGISTER` authentication is an ECDSA signature on P-256).** ADR-063, inception-derived self-certifying identity over a key-event log, carries the curve ruling in §The curve and the root's custody, which names §9.5 of `09-security-model.md` as the home of its reason, and carries the provenance of the curve it superseded in §Alternatives considered. The `BRIDGE_REGISTER` authentication this ADR's `BridgeRole` enum gates is an ECDSA signature on P-256. The unified construction pattern itself names no algorithm, so the ruling reaches one sentence of this ADR and no decision in it.
 
@@ -1951,7 +1951,7 @@ The two guarantees the typestate markers previously enforced collapse into **req
 
 > **Note:** ADR-053 is numbered sequentially after ADR-052 but, like ADR-032/035/042/052, lives in the Phase 2 document by *subject*, not by number: it governs `scp-node` (Phase 2, Context + Transport) and the self-host binary the SHB PRD ships. Its scope is cross-cutting — it constrains every construction site where a participant is created relative to a node.
 
-**Status:** Decided
+**Status:** Accepted
 
 ### Context
 
@@ -2009,7 +2009,7 @@ The relay's `/scp/v1` route is served on the node's existing TLS-terminated **Fu
 >
 > **Note:** ADR-059 lives in the Phase 2 document by *subject*, not by number (like ADR-032/035/042/052/053): it governs the capability/trust-validation surface (§7.2, Phase 2 — Context + Transport) as it crosses the FFI bridges into the language SDKs. Its scope is cross-cutting — it constrains every bridge that returns a validation outcome and every SDK that consumes one.
 
-**Status:** Decided
+**Status:** Accepted
 
 ### Context
 

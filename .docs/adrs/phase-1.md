@@ -26,7 +26,7 @@ Build order: ADR-003 + ADR-001 + ADR-006 (parallel, no deps) --> ADR-002 --> ADR
 
 ## ADR-001: MLS Wrapper (OpenMLS Integration)
 
-**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
+**Status:** Accepted. **Amended:** 2026-09-10 (the P-256 curve ruling).
 
 **Amendment (2026-09-10 — the single ciphersuite is RFC 9420 ciphersuite 2).** ADR-063, inception-derived self-certifying identity over a key-event log, carries the curve ruling in §The curve and the root's custody, which names §9.5 of `09-security-model.md` as the home of its reason, and carries the provenance of the curve it superseded in §Alternatives considered. The single ciphersuite this ADR fixes is therefore `MLS_128_DHKEMP256_AES128GCM_SHA256_P256`, RFC 9420 ciphersuite 2, and the Decision and Implementation text below names it. The no-negotiation rule is untouched: this ADR fixes one ciphersuite and the ruling changed which one.
 
@@ -138,7 +138,7 @@ Each function below must be implemented and tested:
 
 ## ADR-002: Envelope Creation, Signing, and Verification
 
-**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
+**Status:** Accepted. **Amended:** 2026-09-10 (the P-256 curve ruling).
 
 **Amendment (2026-09-10 — the envelope's inner signature is ECDSA on P-256).** ADR-063, inception-derived self-certifying identity over a key-event log, carries the curve ruling in §The curve and the root's custody, which names §9.5 of `09-security-model.md` as the home of its reason, and carries the provenance of the curve it superseded in §Alternatives considered. This ADR now decides a P-256 inner signature: the construction is `P256_ECDSA_sign(SHA256(context_id || sender_did || epoch || generation || sequence || timestamp || payload_hash || provenance_hash || signing_key_id))` over the same preimage, in the 64-byte raw `r || s` form of `09-security-model.md` §9.5, and the signing dependency names the `p256` crate. The pseudonym derivation gains the seed-to-scalar step of §9.10.4 of the security-model spec, because P-256 has no analogue of the seed expansion RFC 8032 fixed for the superseded curve. The preimage's field order, the signature-inside-encryption placement, and the verification order are untouched: the ruling changed the algorithm and no part of the construction.
 
@@ -541,7 +541,7 @@ None. This is foundational. Key generation uses the platform adapter (in-memory 
 
 ## ADR-004: SCP Native Relay Protocol
 
-**Status:** Decided. **Amended:** 2026-10-20 (SCP-309, `4044` KEY_EVENT_ILLEGAL refuses a key-event frame carrying an event that fails R3's check order past R2's binding, and `4040` no longer covers chain verification; a frame that fails a §9.10.12 decoder rule of the security-model spec stays `4040` at any chain position, so each failure maps to one code).
+**Status:** Accepted. **Amended:** 2026-10-20 (SCP-309, `4044` KEY_EVENT_ILLEGAL refuses a key-event frame carrying an event that fails R3's check order past R2's binding, and `4040` no longer covers chain verification; a frame that fails a §9.10.12 decoder rule of the security-model spec stays `4040` at any chain position, so each failure maps to one code).
 
 ### Context
 
@@ -782,7 +782,7 @@ Serialized via `serde` with `rmp-serde`. The `op` field is handled by tagged enu
 
 ## ADR-005: Transport Abstraction Trait
 
-**Status:** Decided
+**Status:** Accepted
 
 ### Context
 
@@ -903,7 +903,7 @@ pub enum TransportEvent {
 
 ## ADR-006: Platform Abstraction (In-Memory Testing Adapter)
 
-**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling) and 2026-09-29 (SCP-307, a pseudonym has no private key, and the typed custody failure; `InMemoryPush` returns a fixed wake signal and copies no payload byte into it; acceptance criterion 3; the `Push` trait's `handle_notification` returns one fixed wake signal; `WakeSignal`'s `&'static` bytes rule out returning the borrowed payload or a temporary copy of it, and `check_fixed_wake_signal` checks that the signal does not vary across the payloads it sends; `push_conformance!()` requires a fixed wake signal of every adapter, in the testing harness paragraph) and 2026-10-10 (SCP-307, a key's role is fixed when custody first holds it, and `dh_agree` takes the peer as a byte slice) and 2026-10-11 (ADR-049 Decision 7a, a custody sign past the signing budget is `SCP-CRYPTO-4062`) and 2026-10-12 (`InMemoryPush` is a test double behind the `testing` feature, in acceptance criterion 3; `InMemoryPush` cites the APNs body of the wake-signal table in `10-infrastructure-and-self-hosting.md` §10.7.1 step 5 instead of restating the bytes, in acceptance criterion 3; `push_conformance!()` sends the §10.7.1 step 5 bodies as its permitted payloads and fails an adapter that accepts a payload no device receipt rule of that step accepts, in the testing harness paragraph) and 2026-10-20 (SCP-307 criterion 37, the custody key-type set is `Ed25519`, `P256Signing` and `HpkeP256`) and 2026-10-20 (SCP-345, a key-event key signs only a checked change through `KeyEventSigner`, and `generate_key_event_keypair` is its one mint).
+**Status:** Accepted. **Amended:** 2026-09-10 (the P-256 curve ruling) and 2026-09-29 (SCP-307, a pseudonym has no private key, and the typed custody failure; `InMemoryPush` returns a fixed wake signal and copies no payload byte into it; acceptance criterion 3; the `Push` trait's `handle_notification` returns one fixed wake signal; `WakeSignal`'s `&'static` bytes rule out returning the borrowed payload or a temporary copy of it, and `check_fixed_wake_signal` checks that the signal does not vary across the payloads it sends; `push_conformance!()` requires a fixed wake signal of every adapter, in the testing harness paragraph) and 2026-10-10 (SCP-307, a key's role is fixed when custody first holds it, and `dh_agree` takes the peer as a byte slice) and 2026-10-11 (ADR-049 Decision 7a, a custody sign past the signing budget is `SCP-CRYPTO-4062`) and 2026-10-12 (`InMemoryPush` is a test double behind the `testing` feature, in acceptance criterion 3; `InMemoryPush` cites the APNs body of the wake-signal table in `10-infrastructure-and-self-hosting.md` §10.7.1 step 5 instead of restating the bytes, in acceptance criterion 3; `push_conformance!()` sends the §10.7.1 step 5 bodies as its permitted payloads and fails an adapter that accepts a payload no device receipt rule of that step accepts, in the testing harness paragraph) and 2026-10-20 (SCP-307 criterion 37, the custody key-type set is `Ed25519`, `P256Signing` and `HpkeP256`) and 2026-10-20 (SCP-345, a key-event key signs only a checked change through `KeyEventSigner`, and `generate_key_event_keypair` is its one mint).
 
 **Amendment (2026-09-10 — the `KeyCustody` key types are both P-256).** ADR-063, inception-derived self-certifying identity over a key-event log, carries the curve ruling in §The curve and the root's custody, which names §9.5 of `09-security-model.md` as the home of its reason, and carries the provenance of the curve it superseded in §Alternatives considered. The `KeyType` enum this ADR defines named one variant per curve and now names both by purpose: `P256Signing` and `HpkeP256`. Every method contract below reads the same way afterwards — `sign` rejects an agreement-only handle, `dh_agree` rejects a signing-only handle — because the split was always a purpose split and the curve names hid that. The pseudonym derivation gains the seed-to-scalar step of §9.10.4 of the security-model spec, because P-256 has no analogue of the seed expansion RFC 8032 fixed for the superseded curve. This ADR's adapter is the in-memory testing one, so no custody claim changes.
 
@@ -1118,7 +1118,7 @@ pub trait Storage: Send + Sync {
 
 ## ADR-007: Sender-Side Key Layer
 
-**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
+**Status:** Accepted. **Amended:** 2026-09-10 (the P-256 curve ruling).
 
 **Amendment (2026-09-10 — every sender-key signature is ECDSA on P-256 and the HPKE suite is DHKEM(P-256)).** ADR-063, inception-derived self-certifying identity over a key-event log, carries the curve ruling in §The curve and the root's custody, which names §9.5 of `09-security-model.md` as the home of its reason, and carries the provenance of the curve it superseded in §Alternatives considered. Each signature this ADR defines — the `SenderKeyEpochAdvance`, the `SenderKeyRequest`, and the block record — is an ECDSA signature on P-256, and each `signature` field carries the type `P256Signature`. The HPKE suite that seals a sender key to a requester is DHKEM(P-256, HKDF-SHA256), and the ephemeral wrapping keypair a requester generates is a DHKEM(P-256) keypair. The pull-based distribution model, the block-list check, and the `info` domain separation are untouched.
 

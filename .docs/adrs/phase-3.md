@@ -31,7 +31,7 @@ Build order: ADR-013 (depends on all Phase 1 + Phase 2 Rust crates) --> ADR-014 
 
 ## ADR-013: PyO3 Bridge Layer
 
-**Status:** Decided
+**Status:** Accepted
 
 ### Context
 
@@ -186,7 +186,7 @@ Implement the FFI bridge in `crates/scp-ffi/src/` using PyO3 and maturin. The br
 
 ## ADR-014: Python SDK Wrappers
 
-**Status:** Decided
+**Status:** Accepted
 
 ### Context
 
@@ -503,7 +503,7 @@ Implement the Python SDK as the `scp_sdk` package in `bindings/python/scp_sdk/`.
 
 ## ADR-015: MCP Adapter
 
-**Status:** Decided
+**Status:** Accepted
 
 ### Context
 
@@ -670,7 +670,7 @@ Implement the MCP adapter as the `scp-mcp` crate (Rust) with a Python interface 
 
 ## ADR-016: UCAN Validation
 
-**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
+**Status:** Accepted. **Amended:** 2026-09-10 (the P-256 curve ruling).
 
 **Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, left one operational role. A verifier resolves an issuer's public key from that issuer's key state, a `kid` names the role `#active`, and a human delegates to its agent's own identifier rather than to a second key on its own (`09-security-model.md` §9.1 invariant 1, `03-identity.md` §3.10.4).
 
@@ -1004,7 +1004,7 @@ This test proves: pip install works without Rust on a platform and CPython minor
 
 > **Note:** ADR-033 is numbered non-sequentially because it was added as a cross-cutting concern after the original phase numbering. It lives in the Phase 3 document because its scope (payment adapters, spending UCANs, economic policy) extends the UCAN and context systems specified in ADR-009/ADR-016. See also ADR-032 in phase-2.md.
 
-**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
+**Status:** Accepted. **Amended:** 2026-09-10 (the P-256 curve ruling).
 
 **Amendment (2026-09-10 — the governance signature is ECDSA on P-256).** ADR-063, inception-derived self-certifying identity over a key-event log, carries the curve ruling in §The curve and the root's custody, which names §9.5 of `09-security-model.md` as the home of its reason, and carries the provenance of the curve it superseded in §Alternatives considered. The `signature` field on this ADR's signed governance structure carries the type `P256Signature`. No other sentence of this ADR names a curve, so the ruling reaches its wire type and no decision in it.
 

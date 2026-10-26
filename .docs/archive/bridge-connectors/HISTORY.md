@@ -35,7 +35,7 @@ Alec introduced the feature in planning session 02 (`.docs/planning-sessions/pla
 
 **Origin.** ADR-023 entered `.docs/adrs/phase-5.md` on 2026-02-23 in the commit "integrate broadcast contexts, pull-based key distribution, and spec refinements". Four pull requests changed it: #167, "refactor(identity): simplify claim_shadow return type" (2026-03-02); #274, "ADR-039: Shared-DID human-agent identity model" (2026-03-04); #479, "feat: close remaining issues — 11 PR integration merge" (2026-03-10); and #775, "fix(ffi): add governance_did param to bridge_register" (2026-03-11). Pull request #2484, "docs(identity): replace did:dht with a key-event-log identity (ADR-063)" (2026-09-27), replaced its `did:dht` references.
 
-**State at archiving.** Status Decided, amended 2026-09-10 by the P-256 curve ruling. Its decision text was implemented and wired as follows:
+**State at archiving.** Status Accepted, amended 2026-09-10 by the P-256 curve ruling. Its decision text was implemented and wired as follows:
 
 - `crates/scp-protocol/src/bridge/` held `mod.rs` (`BridgeMode` at line 29), `registration.rs`, `shadow.rs`, `provenance.rs`, `claiming.rs` and `envelope.rs`.
 - Each FFI `bridge_register` call built a `BridgeRegistry` and discarded it on return, and no governance action drove a registry. Only `registration.rs` wrote `bridge_operator_dids`.
