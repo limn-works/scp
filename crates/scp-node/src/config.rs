@@ -41,8 +41,7 @@ use scp_transport::relay::push_store::PushRegistrationStore;
 use crate::{
     ApplicationNode, DEFAULT_PROJECTION_RATE_LIMIT, NatStrategy, NodeError, TlsProvider,
     build_domain_inner, build_no_domain_inner, domain_relay_url, generate_bridge_secret,
-    generate_dev_token, provision_with_challenge_listener, resolve_identity_persistent,
-    resolve_nat, resolve_tls,
+    generate_dev_token, provision_with_challenge_listener, resolve_nat, resolve_tls,
 };
 
 // ---------------------------------------------------------------------------
@@ -62,11 +61,11 @@ pub struct Node;
 // IdentitySource — how a node obtains its identity (ADR-052 §AC-3)
 // ---------------------------------------------------------------------------
 
-/// Specifies how a node obtains its identity.
+/// Specifies how a node obtains an identity it creates through a key custody.
 ///
 /// This is the public, ADR-052-shaped reconciliation of the formerly private
 /// `scp-node` `IdentitySource` enum (see the ADR-052 "Name reconciliation"
-/// Dependencies bullet). It carries three variants:
+/// Dependencies bullet). It carries two variants:
 ///
 /// - [`Generate`](IdentitySource::Generate) — create a fresh DID identity from
 ///   the supplied custody + DID method on every start (no persistence).
@@ -74,8 +73,10 @@ pub struct Node;
 ///   identity, persisting it into the Node's **own** [`NodeConfig::storage`]
 ///   slot. On the first start it generates and stores; on subsequent starts
 ///   with the same storage it reloads the same DID.
-/// - [`Explicit`](IdentitySource::Explicit) — use a pre-existing identity and
-///   DID document supplied by the caller.
+///
+/// A pre-existing identity and DID document is an [`ExplicitIdentity`], the
+/// other [`NodeIdentitySource`]. It holds no custody, so it carries no custody
+/// type parameter, and a `NodeConfig` built from it names none.
 pub enum IdentitySource<K: KeyCustody, D: DidMethod> {
     /// Generate a new identity using the provided key custody and DID method.
     ///
@@ -97,13 +98,12 @@ pub enum IdentitySource<K: KeyCustody, D: DidMethod> {
         /// DID method used to create (and on first run, publish) the identity.
         did_method: Arc<D>,
     },
-    /// Use a pre-existing identity and document (boxed to avoid a large variant
-    /// size difference).
-    Explicit(Box<ExplicitIdentity<D>>),
 }
 
-/// Data for an explicitly provided identity (the payload of
-/// [`IdentitySource::Explicit`]).
+/// A pre-existing identity and DID document supplied by the caller.
+///
+/// The node uses the identity as given: it creates no key and persists
+/// nothing, so it takes no key custody.
 pub struct ExplicitIdentity<D: DidMethod> {
     /// The pre-existing SCP identity.
     pub identity: ScpIdentity,
@@ -111,6 +111,71 @@ pub struct ExplicitIdentity<D: DidMethod> {
     pub document: DidDocument,
     /// DID method used to publish the identity to the DHT.
     pub did_method: Arc<D>,
+}
+
+/// The type of [`NodeConfig::identity`]: [`IdentitySource`] for an identity
+/// the node creates through a key custody, or [`ExplicitIdentity`] for a
+/// pre-existing one.
+///
+/// The trait is sealed, and those two types are its only implementors. The
+/// identity choice stays one required field of one flat config (ADR-052),
+/// and only the custody-backed choice carries a custody type parameter.
+pub trait NodeIdentitySource: identity_source::Resolve {}
+
+impl<K: KeyCustody + 'static, D: DidMethod + 'static> NodeIdentitySource for IdentitySource<K, D> {}
+
+impl<D: DidMethod + 'static> NodeIdentitySource for ExplicitIdentity<D> {}
+
+/// Seals [`NodeIdentitySource`] and holds its resolution, which no caller
+/// outside this crate can name or call.
+mod identity_source {
+    use std::future::Future;
+    use std::sync::Arc;
+
+    use scp_did::DidDocument;
+    use scp_identity::{DidMethod, dht::ScpIdentity};
+    use scp_platform::traits::{KeyCustody, Storage};
+
+    use super::{ExplicitIdentity, IdentitySource};
+    use crate::{NodeError, resolve_identity_persistent};
+
+    /// The identity, its DID document, and the DID method that publishes it.
+    pub type Resolved<D> = (ScpIdentity, DidDocument, Arc<D>);
+
+    /// Resolves a [`super::NodeIdentitySource`] against the node's storage.
+    pub trait Resolve: Send + Sized {
+        /// The DID method that publishes the resolved identity.
+        type Method: DidMethod + 'static;
+
+        /// Resolves the identity against the node's own storage.
+        fn resolve<S: Storage>(
+            self,
+            storage: &S,
+        ) -> impl Future<Output = Result<Resolved<Self::Method>, NodeError>> + Send;
+    }
+
+    impl<K: KeyCustody + 'static, D: DidMethod + 'static> Resolve for IdentitySource<K, D> {
+        type Method = D;
+
+        fn resolve<S: Storage>(
+            self,
+            storage: &S,
+        ) -> impl Future<Output = Result<Resolved<D>, NodeError>> + Send {
+            resolve_identity_persistent(self, storage)
+        }
+    }
+
+    impl<D: DidMethod + 'static> Resolve for ExplicitIdentity<D> {
+        type Method = D;
+
+        /// An explicit identity is never persisted: the caller manages it.
+        fn resolve<S: Storage>(
+            self,
+            _storage: &S,
+        ) -> impl Future<Output = Result<Resolved<D>, NodeError>> + Send {
+            std::future::ready(Ok((self.identity, self.document, self.did_method)))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -504,50 +569,76 @@ pub(crate) async fn resolve_own_addresses_for_start(
 ///
 /// ## Type parameters
 ///
-/// `K` (key custody), `D` (DID method) and `S` (storage) have no default.
-/// The mandatory-selection rule of the persistence spec, SCP-CAPSEL-8000
-/// ("Selection is mandatory; there is no default", §17.17.1 Selection
-/// Requirements), forbids one: a default type argument would select a
-/// backend the caller never named. The compiler infers all three from
+/// `I` (the identity source, a [`NodeIdentitySource`]) and `S` (storage)
+/// have no default. The mandatory-selection rule of the persistence spec,
+/// SCP-CAPSEL-8000 ("Selection is mandatory; there is no default", §17.17.1
+/// Selection Requirements), forbids one: a default type argument would
+/// select a backend the caller never named. The compiler infers both from
 /// [`NodeConfig::defaults`] or from a struct literal, and a type position
-/// names all three.
+/// names both.
+///
+/// `I` carries the key custody only when the identity needs one:
+/// `NodeConfig<IdentitySource<K, D>, S>` for an identity the node creates
+/// through custody `K`, and `NodeConfig<ExplicitIdentity<D>, S>` for a
+/// pre-existing identity, which names no custody type.
 ///
 /// Rust requires every defaulted type parameter to follow every parameter
-/// without a default, so a default on any of the three implies one on `S`.
-/// A position that supplies only `K` and `D` therefore compiles exactly when
-/// some parameter has a default, in any spelling: a default written after
-/// an inline bound, or `S = X` with the bound in a `where` clause, which the
+/// without a default, so a default on either parameter implies one on `S`.
+/// A position that supplies only `I` therefore compiles exactly when some
+/// parameter has a default, in any spelling: a default written after an
+/// inline bound, or `S = X` with the bound in a `where` clause, which the
 /// text bans in `scripts/check-deleted-primitives.sh` do not match. It fails
 /// with E0107 here:
 ///
 /// ```compile_fail,E0107
 /// use scp_identity::DidMethod;
-/// use scp_platform::traits::KeyCustody;
+/// use scp_node::ExplicitIdentity;
 ///
-/// // E0107: struct takes 3 generic arguments but 2 were supplied.
-/// fn two<K: KeyCustody, D: DidMethod>(_c: scp_node::NodeConfig<K, D>) {}
+/// // E0107: struct takes 2 generic arguments but 1 was supplied.
+/// fn one<D: DidMethod + 'static>(_c: scp_node::NodeConfig<ExplicitIdentity<D>>) {}
 /// ```
 ///
-/// The same position naming all three compiles. This positive control pins
-/// the failure above to the missing arguments, since a bare `compile_fail`
+/// The same position naming both compiles. This positive control pins the
+/// failure above to the missing argument, since a bare `compile_fail`
 /// passes for any error:
 ///
 /// ```
 /// use scp_identity::DidMethod;
+/// use scp_node::ExplicitIdentity;
+/// use scp_platform::traits::Storage;
+///
+/// fn named<D: DidMethod + 'static, S: Storage>(
+///     _c: scp_node::NodeConfig<ExplicitIdentity<D>, S>,
+/// ) {
+/// }
+/// ```
+///
+/// The explicit path names no custody type. An `ExplicitIdentity` that took
+/// one back would fail the positive control above, and this position, which
+/// supplies a custody type, fails with E0107:
+///
+/// ```compile_fail,E0107
+/// use scp_identity::DidMethod;
+/// use scp_node::ExplicitIdentity;
 /// use scp_platform::traits::{KeyCustody, Storage};
 ///
-/// fn named<K: KeyCustody, D: DidMethod, S: Storage>(_c: scp_node::NodeConfig<K, D, S>) {}
+/// // E0107: struct takes 1 generic argument but 2 were supplied.
+/// fn custody<K: KeyCustody, D: DidMethod + 'static, S: Storage>(
+///     _c: scp_node::NodeConfig<ExplicitIdentity<K, D>, S>,
+/// ) {
+/// }
 /// ```
 ///
 /// `cargo nextest` does not run doctests, so
 /// `crates/scp-node/tests/encrypted_storage_seal.rs` repeats the positive
-/// control.
-pub struct NodeConfig<K: KeyCustody, D: DidMethod, S: Storage> {
+/// control and builds an explicit-identity config with no type annotation.
+pub struct NodeConfig<I: NodeIdentitySource, S: Storage> {
     // --- Required (irreducible; no whole-struct Default — M4) ---
     /// How the node is reached from the outside (addressing XOR).
     pub reach: Reach,
-    /// How the node obtains its identity.
-    pub identity: IdentitySource<K, D>,
+    /// How the node obtains its identity: an [`IdentitySource`] or an
+    /// [`ExplicitIdentity`].
+    pub identity: I,
     /// The node's storage backend. On the production [`Node::start`] path this
     /// is `EncryptedStorage`-bound (encryption-at-rest, compile-time enforced).
     pub storage: S,
@@ -633,7 +724,7 @@ pub struct NodeConfig<K: KeyCustody, D: DidMethod, S: Storage> {
     pub push: PushSlot,
 }
 
-impl<K: KeyCustody, D: DidMethod, S: Storage> NodeConfig<K, D, S> {
+impl<I: NodeIdentitySource, S: Storage> NodeConfig<I, S> {
     /// Constructs a [`NodeConfig`] from the irreducible required fields, filling
     /// every other field with its **fail-safe** default (ADR-052 M4).
     ///
@@ -660,7 +751,7 @@ impl<K: KeyCustody, D: DidMethod, S: Storage> NodeConfig<K, D, S> {
     #[must_use]
     pub fn defaults(
         reach: Reach,
-        identity: IdentitySource<K, D>,
+        identity: I,
         storage: S,
         blob_storage: BlobStorageBackend,
     ) -> Self {
@@ -853,9 +944,9 @@ pub fn validate_reach_and_tls(reach: &Reach, tls: &TlsMode) -> Result<(), NodeEr
 ///
 /// [`NodeError::InvalidConfig`] and [`NodeError::WebPushWithoutWellKnown`]
 /// from [`start_push_slot`].
-fn split_config<K: KeyCustody, D: DidMethod, S: Storage>(
-    config: NodeConfig<K, D, S>,
-) -> Result<(S, IdentitySource<K, D>, ConfigTail), NodeError> {
+fn split_config<I: NodeIdentitySource, S: Storage>(
+    config: NodeConfig<I, S>,
+) -> Result<(S, I, ConfigTail), NodeError> {
     let NodeConfig {
         reach,
         identity,
@@ -1463,16 +1554,12 @@ impl Node {
     /// plaintext backend in:
     ///
     /// ```compile_fail,E0277
-    /// use scp_identity::DidMethod;
-    /// use scp_node::{Node, NodeConfig};
+    /// use scp_node::{Node, NodeConfig, NodeIdentitySource};
     /// use scp_platform::filesystem::FilesystemStorage;
-    /// use scp_platform::traits::KeyCustody;
     ///
     /// // E0277: a trait bound `FilesystemStorage: EncryptedStorage`
     /// // is not satisfied.
-    /// fn unsealed<K: KeyCustody + 'static, D: DidMethod + 'static>(
-    ///     config: NodeConfig<K, D, FilesystemStorage>,
-    /// ) {
+    /// fn unsealed<I: NodeIdentitySource + 'static>(config: NodeConfig<I, FilesystemStorage>) {
     ///     let _fut = Node::start(config);
     /// }
     /// ```
@@ -1484,14 +1571,12 @@ impl Node {
     /// type rather than to a typo or an unrelated breakage:
     ///
     /// ```
-    /// use scp_identity::DidMethod;
-    /// use scp_node::{Node, NodeConfig};
+    /// use scp_node::{Node, NodeConfig, NodeIdentitySource};
     /// use scp_platform::encrypting_adapter::EncryptingAdapter;
     /// use scp_platform::filesystem::FilesystemStorage;
-    /// use scp_platform::traits::KeyCustody;
     ///
-    /// fn sealed<K: KeyCustody + 'static, D: DidMethod + 'static>(
-    ///     config: NodeConfig<K, D, EncryptingAdapter<FilesystemStorage>>,
+    /// fn sealed<I: NodeIdentitySource + 'static>(
+    ///     config: NodeConfig<I, EncryptingAdapter<FilesystemStorage>>,
     /// ) {
     ///     let _fut = Node::start(config);
     /// }
@@ -1508,12 +1593,9 @@ impl Node {
     /// Returns [`NodeError::InvalidConfig`] for contradictory configs (e.g.
     /// `Reach::Domain` + `TlsMode::Plaintext`), or any [`NodeError`] from
     /// storage, identity, relay, or TLS setup.
-    pub async fn start<K, D, S>(
-        config: NodeConfig<K, D, S>,
-    ) -> Result<ApplicationNode<S>, NodeError>
+    pub async fn start<I, S>(config: NodeConfig<I, S>) -> Result<ApplicationNode<S>, NodeError>
     where
-        K: KeyCustody + 'static,
-        D: DidMethod + 'static,
+        I: NodeIdentitySource + 'static,
         S: EncryptedStorage + 'static,
     {
         // `validate_reach_and_tls` borrows `config.reach` / `config.tls`, so it MUST
@@ -1566,12 +1648,11 @@ impl Node {
     /// Returns [`NodeError::InvalidConfig`] for contradictory configs, or any
     /// [`NodeError`] from storage, identity, relay, or TLS setup.
     #[cfg(any(test, feature = "allow_unencrypted_storage"))]
-    pub async fn start_for_testing<K, D, S>(
-        config: NodeConfig<K, D, S>,
+    pub async fn start_for_testing<I, S>(
+        config: NodeConfig<I, S>,
     ) -> Result<ApplicationNode<S>, NodeError>
     where
-        K: KeyCustody + 'static,
-        D: DidMethod + 'static,
+        I: NodeIdentitySource + 'static,
         S: Storage + 'static,
     {
         // `validate_reach_and_tls` borrows `config.reach` / `config.tls`, so it MUST
@@ -1589,13 +1670,12 @@ impl Node {
     /// hosts in place of the operating system's resolver, so a test can make
     /// a host resolve only once TLS provisioning ran.
     #[cfg(test)]
-    pub(crate) async fn start_for_testing_with_own_lookup<K, D, S>(
-        config: NodeConfig<K, D, S>,
+    pub(crate) async fn start_for_testing_with_own_lookup<I, S>(
+        config: NodeConfig<I, S>,
         lookup: OwnAddressLookup,
     ) -> Result<ApplicationNode<S>, NodeError>
     where
-        K: KeyCustody + 'static,
-        D: DidMethod + 'static,
+        I: NodeIdentitySource + 'static,
         S: Storage + 'static,
     {
         validate_reach_and_tls(&config.reach, &config.tls)?;
@@ -1609,37 +1689,20 @@ impl Node {
 /// Resolves the identity against `protocol_repository`'s storage and builds
 /// the node: the part both start constructors share after each builds its
 /// repository.
-async fn start_on_repository<K, D, S>(
+async fn start_on_repository<I, S>(
     protocol_repository: Arc<ProtocolRepository<S>>,
-    identity: IdentitySource<K, D>,
+    identity: I,
     tail: ConfigTail,
 ) -> Result<ApplicationNode<S>, NodeError>
 where
-    K: KeyCustody + 'static,
-    D: DidMethod + 'static,
+    I: NodeIdentitySource + 'static,
     S: Storage + 'static,
 {
-    // `Persisted` is the load-or-create-and-persist source. It normalizes to
-    // a `Generate` source with `persist = true` (exactly as the legacy
-    // builder's `identity_with_storage` did): `resolve_identity_persistent`
-    // checks storage first and only generates+persists on a cache miss.
-    // `Generate` / `Explicit` resolve with `persist = false`.
-    let (resolved_source, persist) = match identity {
-        IdentitySource::Persisted {
-            custody,
-            did_method,
-        } => (
-            IdentitySource::Generate {
-                custody,
-                did_method,
-            },
-            true,
-        ),
-        other => (other, false),
-    };
+    // `Persisted` loads or creates and persists into the node's own storage;
+    // `Generate` creates without persisting; an `ExplicitIdentity` resolves to
+    // itself.
     let (scp_identity, document, did_method) =
-        resolve_identity_persistent(resolved_source, persist, protocol_repository.storage())
-            .await?;
+        identity.resolve(protocol_repository.storage()).await?;
     build_node(
         protocol_repository,
         scp_identity,
@@ -1787,13 +1850,11 @@ mod tests {
                 Reach::Domain {
                     domain: "config-explicit.example.com".to_owned(),
                 },
-                IdentitySource::<InMemoryKeyCustody, TestDidDht>::Explicit(Box::new(
-                    ExplicitIdentity {
-                        identity,
-                        document,
-                        did_method,
-                    },
-                )),
+                ExplicitIdentity {
+                    identity,
+                    document,
+                    did_method,
+                },
                 InMemoryStorage::new(),
                 BlobStorageBackend::in_memory(),
             )

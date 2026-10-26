@@ -69,8 +69,8 @@ pub use self_host::{
 // lowering in `config`; the `pub use` brings them into crate-root scope for
 // both that path and external consumers.
 pub use config::{
-    DhtMode, ExplicitIdentity, IdentitySource, NatSlot, Node, NodeConfig, NodePushProviders,
-    PushSlot, Reach, TlsMode, validate_reach_and_tls,
+    DhtMode, ExplicitIdentity, IdentitySource, NatSlot, Node, NodeConfig, NodeIdentitySource,
+    NodePushProviders, PushSlot, Reach, TlsMode, validate_reach_and_tls,
 };
 
 // ---------------------------------------------------------------------------
@@ -2898,58 +2898,45 @@ fn spawn_tier_reevaluation(
 // Bridge secret generation
 // ---------------------------------------------------------------------------
 
-/// Resolves the identity from an [`IdentitySource`], returning the identity,
-/// document, and DID method.
+/// Creates a fresh, unpersisted identity from `custody` and `did_method` (the
+/// [`IdentitySource::Generate`] arm), returning the identity, document, and
+/// DID method.
 ///
-/// On a shipped build the `Generate` arm fails closed with no `.await`; the
-/// `async` signature is kept for the `testing` build and callers' `.await`.
+/// On a shipped build this fails closed with no `.await`; the `async`
+/// signature is kept for the `testing` build and callers' `.await`.
 #[cfg_attr(not(feature = "testing"), allow(clippy::unused_async))]
-async fn resolve_identity<K: KeyCustody, D: DidMethod>(
-    source: IdentitySource<K, D>,
+async fn generate_unpersisted_identity<K: KeyCustody, D: DidMethod>(
+    custody: Arc<K>,
+    did_method: Arc<D>,
 ) -> Result<(ScpIdentity, DidDocument, Arc<D>), NodeError> {
-    match source {
-        IdentitySource::Generate {
-            custody,
-            did_method,
-        } => {
-            // Pre-rotation is mandatory at creation (spec §9.7.4.1 item 5(a)), which
-            // requires a `PreRotationCustody` backend. The only implementation
-            // is the test-harness `InMemoryPreRotationCustody` nullifier.
-            #[cfg(feature = "testing")]
-            {
-                // KNOWN LIMITATION (testing builds): this path drops the
-                // `PreRotationKeyHandle` because `ApplicationNode`'s generic
-                // parameter list does not yet carry a `P: PreRotationCustody`
-                // slot, so identities produced here cannot be migrated later.
-                let pre_rotation_custody = scp_platform::testing::InMemoryPreRotationCustody::new();
-                let (identity, document, _pre_rotation_handle) =
-                    did_method.create(&*custody, &pre_rotation_custody).await?;
-                tracing::warn!(
-                    did = %identity.did,
-                    "identity created without a persistent PreRotationCustody — migration \
-                     (Layer-2 DID rotation) will be impossible until the builder API is \
-                     widened to accept a real backend. The reveal that spec §9.7.4.1 item 4 \
-                     says recovers a root compromise is unreachable for this identity."
-                );
-                Ok((identity, document, did_method))
-            }
-            #[cfg(not(feature = "testing"))]
-            {
-                // FAIL CLOSED (ADR-062 §Decision 6): no real PreRotationCustody
-                // backend exists yet (RFC #2130 / #1729). Never mint the in-memory
-                // nullifier on a shipped build — return a typed error instead.
-                let _ = (custody, did_method);
-                Err(NodeError::Identity(IdentityError::NoPreRotationBackend))
-            }
-        }
-        IdentitySource::Explicit(e) => Ok((e.identity, e.document, e.did_method)),
-        // `Node::start` normalizes `Persisted` to a `Generate` source with
-        // `persist = true` before calling the resolvers, so a `Persisted`
-        // variant never reaches `resolve_identity`.
-        IdentitySource::Persisted { .. } => unreachable!(
-            "IdentitySource::Persisted is normalized to Generate by Node::start \
-             and never reaches resolve_identity"
-        ),
+    // Pre-rotation is mandatory at creation (spec §9.7.4.1 item 5(a)), which
+    // requires a `PreRotationCustody` backend. The only implementation
+    // is the test-harness `InMemoryPreRotationCustody` nullifier.
+    #[cfg(feature = "testing")]
+    {
+        // KNOWN LIMITATION (testing builds): this path drops the
+        // `PreRotationKeyHandle` because `ApplicationNode`'s generic
+        // parameter list does not yet carry a `P: PreRotationCustody`
+        // slot, so identities produced here cannot be migrated later.
+        let pre_rotation_custody = scp_platform::testing::InMemoryPreRotationCustody::new();
+        let (identity, document, _pre_rotation_handle) =
+            did_method.create(&*custody, &pre_rotation_custody).await?;
+        tracing::warn!(
+            did = %identity.did,
+            "identity created without a persistent PreRotationCustody — migration \
+             (Layer-2 DID rotation) will be impossible until the builder API is \
+             widened to accept a real backend. The reveal that spec §9.7.4.1 item 4 \
+             says recovers a root compromise is unreachable for this identity."
+        );
+        Ok((identity, document, did_method))
+    }
+    #[cfg(not(feature = "testing"))]
+    {
+        // FAIL CLOSED (ADR-062 §Decision 6): no real PreRotationCustody
+        // backend exists yet (RFC #2130 / #1729). Never mint the in-memory
+        // nullifier on a shipped build — return a typed error instead.
+        let _ = (custody, did_method);
+        Err(NodeError::Identity(IdentityError::NoPreRotationBackend))
     }
 }
 
@@ -3058,27 +3045,25 @@ fn verify_vm_match(
     Ok(())
 }
 
-/// Resolves identity with automatic persistence.
+/// Resolves a custody-backed [`IdentitySource`] against the node's storage.
 ///
-/// When `persist` is `true` and the identity source is `Generate`:
+/// `Generate` delegates to [`generate_unpersisted_identity`]. `Persisted`
+/// loads or creates:
 ///   1. Check storage for [`IDENTITY_STORAGE_KEY`].
 ///   2. If found, deserialize the [`PersistedIdentity`] and return the
 ///      stored identity + document (skipping generation).
 ///   3. If not found, generate via `did_method.create()`, serialize to
 ///      storage, then return the new identity.
-///
-/// When `persist` is `false`, delegates to [`resolve_identity`].
 pub(crate) async fn resolve_identity_persistent<K: KeyCustody, D: DidMethod, S: Storage>(
     source: IdentitySource<K, D>,
-    persist: bool,
     storage: &S,
 ) -> Result<(ScpIdentity, DidDocument, Arc<D>), NodeError> {
-    if !persist {
-        return resolve_identity(source).await;
-    }
-
     match source {
         IdentitySource::Generate {
+            custody,
+            did_method,
+        } => generate_unpersisted_identity(custody, did_method).await,
+        IdentitySource::Persisted {
             custody,
             did_method,
         } => {
@@ -3175,15 +3160,6 @@ pub(crate) async fn resolve_identity_persistent<K: KeyCustody, D: DidMethod, S: 
                 }
             }
         }
-        // Explicit identities are never persisted — caller already manages them.
-        IdentitySource::Explicit(e) => Ok((e.identity, e.document, e.did_method)),
-        // `Node::start` normalizes `Persisted` to a `Generate` source with
-        // `persist = true` before calling this resolver, so a `Persisted`
-        // variant never reaches `resolve_identity_persistent`.
-        IdentitySource::Persisted { .. } => unreachable!(
-            "IdentitySource::Persisted is normalized to Generate by Node::start \
-             and never reaches resolve_identity_persistent"
-        ),
     }
 }
 
@@ -3476,7 +3452,7 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
     // relay reserves before the publish (§10.7.1 step 2, "Tier 3 relays"): the
     // domain entry, which carries no `bridgeTarget` and so reserves its
     // `"scp-push-registration"` ID, and every tier 3 entry of an
-    // `IdentitySource::Explicit` document with the node's `bridgeTarget`.
+    // `ExplicitIdentity` document with the node's `bridgeTarget`.
     // `seed_from_startup_publish` reserves them on the publisher's own handle,
     // `relay_config.relay_url`, before it publishes.
     let bridge_target = node_bridge_target(&identity.did)?;
@@ -3819,7 +3795,7 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
     let bridge_target = node_bridge_target(&identity.did)?;
     let relay_url = no_domain_relay_service(tier.as_ref(), http_port, bridge_target)?;
 
-    // Inserted ahead of any relay a caller's `IdentitySource::Explicit`
+    // Inserted ahead of any relay a caller's `ExplicitIdentity`
     // document names, so the first `SCPRelay` entry, which a tier change
     // rewrites through `set_preferred_relay`, is the node's own.
     document.insert_preferred_relay(&relay_url);
@@ -3983,6 +3959,9 @@ mod tests {
     /// The concrete `DidDht` type used in tests (with in-memory DHT and system clock).
     type TestDidDht = DidDht<InMemoryDhtClient, SystemClock>;
 
+    /// The custody-backed identity source most tests start a node from.
+    type TestSource = IdentitySource<InMemoryKeyCustody, TestDidDht>;
+
     /// Creates a `DidDht` instance with signing capability for tests.
     fn make_test_dht(custody: &Arc<InMemoryKeyCustody>) -> TestDidDht {
         let dht_client = Arc::new(InMemoryDhtClient::new());
@@ -3998,7 +3977,7 @@ mod tests {
     /// than minting the in-memory `InMemoryPreRotationCustody` nullifier.
     ///
     /// Gated `#[cfg(not(feature = "testing"))]`: the fail-closed behavior only
-    /// holds when the nullifier is severed. `resolve_identity`'s `Generate` arm
+    /// holds when the nullifier is severed. `generate_unpersisted_identity`
     /// mints under `feature = "testing"`; with the feature off (this crate's
     /// standalone `cargo test -p scp-node` build) it returns the typed error. The
     /// test constructs its `Generate` inputs via the dev-dependency in-memory
@@ -4009,13 +3988,9 @@ mod tests {
     async fn pre_rotation_severance_generate_fails_closed() {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let did_method = Arc::new(make_test_dht(&custody));
-        let source = IdentitySource::Generate {
-            custody,
-            did_method,
-        };
         // The Ok type contains `Arc<DidDht<..>>` which is not `Debug`, so match
         // explicitly rather than `expect_err`.
-        match resolve_identity(source).await {
+        match generate_unpersisted_identity(custody, did_method).await {
             Err(NodeError::Identity(IdentityError::NoPreRotationBackend)) => {}
             Err(other) => panic!("expected NoPreRotationBackend (SCP-IDENT-1059), got: {other:?}"),
             Ok(_) => panic!(
@@ -4026,19 +4001,19 @@ mod tests {
     }
 
     /// Companion to the above for the persisting create path
-    /// (`resolve_identity_persistent`'s generate branch): it likewise funnels
+    /// (`resolve_identity_persistent`'s `Persisted` arm): it likewise funnels
     /// through the pre-rotation commitment and fails closed on a shipped build.
     #[cfg(not(feature = "testing"))]
     #[tokio::test]
     async fn pre_rotation_severance_persistent_fails_closed() {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let did_method = Arc::new(make_test_dht(&custody));
-        let source = IdentitySource::Generate {
+        let source = IdentitySource::Persisted {
             custody,
             did_method,
         };
         let storage = InMemoryStorage::new();
-        match resolve_identity_persistent(source, true, &storage).await {
+        match resolve_identity_persistent(source, &storage).await {
             Err(NodeError::Identity(IdentityError::NoPreRotationBackend)) => {}
             Err(other) => panic!("expected NoPreRotationBackend (SCP-IDENT-1059), got: {other:?}"),
             Ok(_) => panic!(
@@ -4095,9 +4070,17 @@ mod tests {
     /// every `Reach`, `Reach::Domain` included), so `Node::start` publishes the
     /// identity document to the in-memory `TestDidDht`, which receives it in
     /// process and never reaches live Mainline.
-    fn domain_config() -> NodeConfig<InMemoryKeyCustody, TestDidDht, InMemoryStorage> {
+    fn domain_config() -> NodeConfig<TestSource, InMemoryStorage> {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let did_method = Arc::new(make_test_dht(&custody));
+        domain_config_with(IdentitySource::Generate {
+            custody,
+            did_method,
+        })
+    }
+
+    /// [`domain_config`] over the caller's `identity`.
+    fn domain_config_with<I: NodeIdentitySource>(identity: I) -> NodeConfig<I, InMemoryStorage> {
         NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
             dht: DhtMode::Production,
@@ -4108,10 +4091,7 @@ mod tests {
                 Reach::Domain {
                     domain: "test.example.com".to_owned(),
                 },
-                IdentitySource::Generate {
-                    custody,
-                    did_method,
-                },
+                identity,
                 InMemoryStorage::new(),
                 BlobStorageBackend::in_memory(),
             )
@@ -4218,14 +4198,32 @@ mod tests {
     fn webpush_domain_config(
         dir: &std::path::Path,
         tls: Arc<dyn TlsProvider>,
-    ) -> NodeConfig<InMemoryKeyCustody, TestDidDht, InMemoryStorage> {
+    ) -> NodeConfig<TestSource, InMemoryStorage> {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let did_method = Arc::new(make_test_dht(&custody));
+        webpush_domain_config_with(
+            dir,
+            tls,
+            IdentitySource::Generate {
+                custody,
+                did_method,
+            },
+        )
+    }
+
+    /// [`webpush_domain_config`] over the caller's `identity`.
+    fn webpush_domain_config_with<I: NodeIdentitySource>(
+        dir: &std::path::Path,
+        tls: Arc<dyn TlsProvider>,
+        identity: I,
+    ) -> NodeConfig<I, InMemoryStorage> {
         NodeConfig {
             reach: Reach::Domain {
                 domain: WEBPUSH_DOMAIN.to_owned(),
             },
             tls: TlsMode::Custom(tls),
             push: webpush_slot(dir),
-            ..domain_config()
+            ..domain_config_with(identity)
         }
     }
 
@@ -4306,7 +4304,7 @@ mod tests {
 
     /// PUSH-023: the start's own-address resolution covers the tier 3 hosts
     /// the startup publish reserves (§10.7.1 "Tier 3 relays"), not only the
-    /// domain. An `IdentitySource::Explicit` document with a tier 3 entry for
+    /// domain. An `ExplicitIdentity` document with a tier 3 entry for
     /// this node whose bridge host does not resolve fails the start with
     /// `OwnAddresses`; once the host resolves, the node starts and its set
     /// holds the bridge's address.
@@ -4324,17 +4322,17 @@ mod tests {
                 target,
             ));
             let dir = tempfile::tempdir().unwrap();
-            let mut config = webpush_domain_config(
+            let config = webpush_domain_config_with(
                 dir.path(),
                 Arc::new(SucceedingTlsProvider {
                     domain: WEBPUSH_DOMAIN.to_owned(),
                 }),
+                ExplicitIdentity {
+                    identity,
+                    document,
+                    did_method: Arc::new(make_test_dht(&custody)),
+                },
             );
-            config.identity = IdentitySource::Explicit(Box::new(ExplicitIdentity {
-                identity,
-                document,
-                did_method: Arc::new(make_test_dht(&custody)),
-            }));
             Node::start_for_testing_with_own_lookup(config, OwnAddressLookup::fixed(answers)).await
         }
 
@@ -4527,13 +4525,11 @@ mod tests {
                 Reach::Domain {
                     domain: "explicit.example.com".to_owned(),
                 },
-                IdentitySource::<InMemoryKeyCustody, TestDidDht>::Explicit(Box::new(
-                    ExplicitIdentity {
-                        identity,
-                        document,
-                        did_method,
-                    },
-                )),
+                ExplicitIdentity {
+                    identity,
+                    document,
+                    did_method,
+                },
                 InMemoryStorage::new(),
                 BlobStorageBackend::in_memory(),
             )
@@ -4870,9 +4866,7 @@ mod tests {
     /// is a `MockNatStrategy` returning `tier` (no real STUN). The config opts
     /// into `DhtMode::Production` (M2 accepts `Disabled` for every `Reach`,
     /// `NatTraversal` included).
-    fn no_domain_config(
-        tier: ReachabilityTier,
-    ) -> NodeConfig<InMemoryKeyCustody, TestDidDht, InMemoryStorage> {
+    fn no_domain_config(tier: ReachabilityTier) -> NodeConfig<TestSource, InMemoryStorage> {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let did_method = Arc::new(make_test_dht(&custody));
         NodeConfig {
@@ -4952,7 +4946,7 @@ mod tests {
         };
         let custody = Arc::new(InMemoryKeyCustody::new());
         let did_method = Arc::new(make_test_dht(&custody));
-        let config: NodeConfig<InMemoryKeyCustody, TestDidDht, InMemoryStorage> = NodeConfig {
+        let config: NodeConfig<TestSource, InMemoryStorage> = NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
             dht: DhtMode::Production,
             nat: NatSlot::Custom(Arc::new(MockNatStrategy { tier })),
@@ -5030,7 +5024,7 @@ mod tests {
         const DOMAIN: &str = "bücher.example";
         let custody = Arc::new(InMemoryKeyCustody::new());
         let did_method = Arc::new(make_test_dht(&custody));
-        let config: NodeConfig<InMemoryKeyCustody, TestDidDht, InMemoryStorage> = NodeConfig {
+        let config: NodeConfig<TestSource, InMemoryStorage> = NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
             dht: DhtMode::Production,
             tls: TlsMode::Custom(Arc::new(SucceedingTlsProvider {
@@ -5156,7 +5150,7 @@ mod tests {
     fn failing_publish_no_domain_config(
         dht: DhtMode,
     ) -> (
-        NodeConfig<InMemoryKeyCustody, FailingPublishDidMethod, InMemoryStorage>,
+        NodeConfig<IdentitySource<InMemoryKeyCustody, FailingPublishDidMethod>, InMemoryStorage>,
         Arc<std::sync::atomic::AtomicU32>,
     ) {
         let custody = Arc::new(InMemoryKeyCustody::new());
@@ -5328,7 +5322,7 @@ mod tests {
         let shared_dht = Arc::new(InMemoryDhtClient::new());
 
         // Create the node's identity ONCE; the restart reuses it verbatim via
-        // `IdentitySource::Explicit` (a restart keeps the same DID).
+        // `ExplicitIdentity` (a restart keeps the same DID).
         let prior_method = Arc::new(DidDht::with_client_and_signer(
             Arc::clone(&shared_dht),
             Arc::clone(&cache),
@@ -5363,17 +5357,17 @@ mod tests {
         let tier = ReachabilityTier::Stun {
             external_addr: SocketAddr::from(([198, 51, 100, 9], 32893)),
         };
-        let config: NodeConfig<InMemoryKeyCustody, TestDidDht, InMemoryStorage> = NodeConfig {
+        let config = NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
             dht: DhtMode::Memory,
             nat: NatSlot::Custom(Arc::new(MockNatStrategy { tier })),
             ..NodeConfig::defaults(
                 Reach::NatTraversal,
-                IdentitySource::Explicit(Box::new(ExplicitIdentity {
+                ExplicitIdentity {
                     identity: identity.clone(),
                     document: document.clone(),
                     did_method: restart_method,
-                })),
+                },
                 InMemoryStorage::new(),
                 BlobStorageBackend::in_memory(),
             )
@@ -5426,7 +5420,7 @@ mod tests {
     fn failing_publish_domain_config(
         dht: DhtMode,
     ) -> (
-        NodeConfig<InMemoryKeyCustody, FailingPublishDidMethod, InMemoryStorage>,
+        NodeConfig<IdentitySource<InMemoryKeyCustody, FailingPublishDidMethod>, InMemoryStorage>,
         Arc<std::sync::atomic::AtomicU32>,
     ) {
         let custody = Arc::new(InMemoryKeyCustody::new());
@@ -7742,11 +7736,28 @@ mod tests {
     fn tier_change_config(
         dht: DhtMode,
     ) -> (
-        NodeConfig<InMemoryKeyCustody, TestDidDht, InMemoryStorage>,
+        NodeConfig<TestSource, InMemoryStorage>,
         tokio::sync::mpsc::Sender<()>,
     ) {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let did_method = Arc::new(make_test_dht(&custody));
+        tier_change_config_with(
+            dht,
+            IdentitySource::Generate {
+                custody,
+                did_method,
+            },
+        )
+    }
+
+    /// [`tier_change_config`] over the caller's `identity`.
+    fn tier_change_config_with<I: NodeIdentitySource>(
+        dht: DhtMode,
+        identity: I,
+    ) -> (
+        NodeConfig<I, InMemoryStorage>,
+        tokio::sync::mpsc::Sender<()>,
+    ) {
         let (net_change_tx, net_change_rx) = tokio::sync::mpsc::channel(16);
         let config = NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
@@ -7764,10 +7775,7 @@ mod tests {
             )),
             ..NodeConfig::defaults(
                 Reach::NatTraversal,
-                IdentitySource::Generate {
-                    custody,
-                    did_method,
-                },
+                identity,
                 InMemoryStorage::new(),
                 BlobStorageBackend::in_memory(),
             )
@@ -8230,7 +8238,7 @@ mod tests {
         node.shutdown();
     }
 
-    /// Criterion 6 for several entries: a node whose `IdentitySource::Explicit`
+    /// Criterion 6 for several entries: a node whose `ExplicitIdentity`
     /// document carries a second tier 3 entry with the node's `bridgeTarget`
     /// reserves that entry's tier 3 ID beside its own entry's ID at startup,
     /// and again after a tier change moves its own entry to a bridge. An
@@ -8253,12 +8261,14 @@ mod tests {
         document.add_relay_service(&second);
         document.add_relay_service(&foreign);
 
-        let (mut config, net_change_tx) = tier_change_config(DhtMode::Disabled);
-        config.identity = IdentitySource::Explicit(Box::new(ExplicitIdentity {
-            identity,
-            document,
-            did_method: Arc::new(make_test_dht(&custody)),
-        }));
+        let (mut config, net_change_tx) = tier_change_config_with(
+            DhtMode::Disabled,
+            ExplicitIdentity {
+                identity,
+                document,
+                did_method: Arc::new(make_test_dht(&custody)),
+            },
+        );
         config.nat = NatSlot::Custom(Arc::new(SequenceNatStrategy::new(vec![
             ReachabilityTier::Stun {
                 external_addr: SocketAddr::from(([198, 51, 100, 7], 32891)),
@@ -8321,7 +8331,7 @@ mod tests {
     }
 
     /// §10.7.1 "Tier 3 relays" on the domain builder: a domain node whose
-    /// `IdentitySource::Explicit` document carries a tier 3 entry with the
+    /// `ExplicitIdentity` document carries a tier 3 entry with the
     /// node's `bridgeTarget` reserves that entry's tier 3 ID beside the domain
     /// entry's `"scp-push-registration"` ID before its startup publish, so a
     /// plaintext PUBLISH there gets `4063` and a QUERY returns nothing. An
@@ -8341,12 +8351,11 @@ mod tests {
         );
         document.add_relay_service(&tier3);
         document.add_relay_service(&foreign);
-        let mut config = domain_config();
-        config.identity = IdentitySource::Explicit(Box::new(ExplicitIdentity {
+        let config = domain_config_with(ExplicitIdentity {
             identity,
             document,
             did_method: Arc::new(make_test_dht(&custody)),
-        }));
+        });
 
         let node = Node::start_for_testing(config)
             .await
@@ -8736,7 +8745,7 @@ mod tests {
     /// The node's own entry lands FIRST even when the caller's document already
     /// names a relay — the position premise `set_preferred_relay` keys on.
     ///
-    /// `IdentitySource::Explicit` hands a caller-supplied document through
+    /// `ExplicitIdentity` hands a caller-supplied document through
     /// verbatim. While the node's installer appended, the node's own entry landed
     /// at position 1 behind the caller's, so `document_relay_service` (position 0)
     /// reported the CALLER's relay while the slot reported the node's. The first

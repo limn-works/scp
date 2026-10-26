@@ -1877,7 +1877,7 @@ Key design choices:
 
 > **Note:** ADR-052 is numbered non-sequentially (same convention as ADR-032/035/042). It lives in the Phase 2 document because its primary worked example is `ApplicationNode` construction (ADR-032, `scp-node`), but its scope is cross-cutting: it governs every developer-facing construction entry point across all five language SDKs.
 
-**Status:** Accepted. **Amended:** 2026-09-10 (the P-256 curve ruling); 2026-10-25 (identity construction over the key-event log).
+**Status:** Accepted. **Amended:** 2026-09-10 (the P-256 curve ruling); 2026-10-25 (identity construction over the key-event log); 2026-10-25 (an explicit node identity names no custody type).
 
 **Amendment (2026-09-10 — `BRIDGE_REGISTER` authentication is an ECDSA signature on P-256).** ADR-063, inception-derived self-certifying identity over a key-event log, carries the curve ruling in §The curve and the root's custody, which names §9.5 of `09-security-model.md` as the home of its reason, and carries the provenance of the curve it superseded in §Alternatives considered. The `BRIDGE_REGISTER` authentication this ADR's `BridgeRole` enum gates is an ECDSA signature on P-256. The unified construction pattern itself names no algorithm, so the ruling reaches one sentence of this ADR and no decision in it.
 
@@ -1887,6 +1887,8 @@ Key design choices:
 - **M2 and acceptance criterion 9(c)** lose Identity's ephemeral default, because no ephemeral identity exists.
 
 `.docs/standards/construction.md` carries the resulting shapes.
+
+**Amendment (2026-10-25 — an explicit node identity names no custody type).** Decision 3 and the `IdentitySource` bullet change, and no other part does. A pre-existing identity holds no key custody, but the `Explicit` variant sat in `IdentitySource<K, D>`, so every `NodeConfig` built from one named a custody type it never used. `NodeConfig<I, S>` now takes its identity as `I`, a sealed `NodeIdentitySource` whose two implementors are `IdentitySource<K, D>` (`Generate { custody, did_method }` | `Persisted { custody, did_method }`) and `ExplicitIdentity<D>` (`{ identity, document, did_method }`). The identity stays one required field of one flat config, with no builder, typestate or default type argument, and only the custody-backed choice carries `K`. A variant-local custody type is impossible in a Rust enum without erasing the custody, which Rejected Alternative 2 still forbids outside the two creation-time slots.
 
 ### Context
 

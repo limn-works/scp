@@ -92,8 +92,8 @@ TYPESTATE_PREFIX_RE = re.compile(
 # naming convention.  Extend this set when a new legitimate pattern emerges.
 M5_STRUCT_ALLOWLIST: frozenset[str] = frozenset(
     [
-        # ExplicitIdentity is a payload struct (the data for
-        # IdentitySource::Explicit), not a typestate marker.
+        # ExplicitIdentity is a data struct (a pre-existing node identity,
+        # one NodeIdentitySource), not a typestate marker.
         "ExplicitIdentity",
     ]
 )

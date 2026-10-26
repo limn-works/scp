@@ -420,7 +420,7 @@ mod reservation {
     /// It holds the node's own entry, the one its NAT tier or its domain
     /// yields, and every `SCPRelay` entry of the document the node is about
     /// to publish whose `bridgeTarget` is the node's own. An
-    /// `IdentitySource::Explicit` document can carry further tier 3 entries
+    /// `ExplicitIdentity` document can carry further tier 3 entries
     /// with the node's target, one per bridge relay (§10.12.4 "Multiple
     /// bridges"). The own entry is a separate field, so the set is never
     /// empty and the reservation cannot fail.
