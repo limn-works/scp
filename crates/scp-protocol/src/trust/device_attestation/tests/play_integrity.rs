@@ -8,9 +8,9 @@
 //! the list the meta-test reads, so a case cannot be counted without
 //! existing.
 //!
-//! The verifiers' key states come from key-event logs these tests sign under
-//! §25.2's seed-to-scalar rule, resolved through `scp_kel::classify`, the only
-//! constructor of a `ResolvedState`.
+//! The verifiers' key states come from spec 25's key-event logs (Vectors 41,
+//! 51, 54 and 69, through scp-kel's shared fixtures), resolved through
+//! `scp_kel::classify`, the only constructor of a `ResolvedState`.
 
 use std::time::{Duration, SystemTime};
 
@@ -20,10 +20,9 @@ use scp_did::{
     KeyEntry, KeyRole,
 };
 use scp_kel::{
-    Continuation, EncodedPreimage, EventPreimage, InceptionFields, KeyStateFields,
-    KeyStateSnapshot, OperatorProof, ResolutionInput, ResolutionVerdict, ResolvedState,
-    SignatureForm, SignerGroup, SourceExhaustion, SourceRead, classify, encode_preimage,
-    prerotation_commitment,
+    Continuation, EventPreimage, InceptionFields, KeyStateSnapshot, OperatorProof, ResolutionInput,
+    ResolutionVerdict, ResolvedState, SignatureForm, SignerGroup, SourceExhaustion, SourceRead,
+    classify, encode_preimage, prerotation_commitment,
 };
 use sha2::{Digest, Sha256};
 
@@ -119,134 +118,94 @@ fn negate_s(signature: &mut [u8; 64]) {
 
 // ── Key-event logs and resolution ───────────────────────────────────────────
 
+#[expect(
+    dead_code,
+    reason = "spec 25's key-event-log fixtures, shared with scp-kel's tests; these tests read a subset"
+)]
+#[path = "../../../../../scp-kel/tests/kel/fixtures.rs"]
+mod fixtures;
+
+/// §25.2's secondary seed, whose key is Vector 41's `#active` key.
+const SECONDARY_SEED: &str = "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb";
+
 fn key(seed: [u8; 32]) -> P256SecretKey {
     P256SecretKey::from_seed(SeedLabel::TestVectorKey, &seed)
 }
 
-fn point(seed: [u8; 32]) -> [u8; 33] {
-    key(seed).public_key().to_compressed()
+/// The key spec 25 derives from the seed `SHA-256(label)`.
+fn labelled(label: &str) -> P256SecretKey {
+    key(Sha256::digest(label).into())
 }
 
-const fn entry(key: [u8; 33], role: KeyRole, condition: KeyCondition) -> KeyEntry {
-    KeyEntry {
-        key,
-        role,
-        condition,
-        compromised_from: 0,
-        custody_type: CustodyType::Software,
-        key_algorithm: KeyAlgorithm::EcdsaP256Sha256,
-    }
-}
-
-fn root_group() -> SignerGroup {
-    SignerGroup {
-        indices: vec![0],
-        forms: vec![SignatureForm::Raw],
-    }
-}
-
-/// `BE32(len) ‖ signed preimage ‖ the root key's raw signature`.
-fn unit(encoded: &EncodedPreimage, root: &P256SecretKey) -> BoxResult<Vec<u8>> {
-    let signed = encoded.signed_preimage();
-    let signature = sign_prehash_rfc6979(root, &Sha256::digest(&signed).into())?;
-    let mut unit = u32::try_from(signed.len())?.to_be_bytes().to_vec();
-    unit.extend_from_slice(&signed);
-    unit.extend_from_slice(&signature);
-    Ok(unit)
-}
-
-/// A verifier identity: its root key, its `#active` key and its log.
+/// A verifier identity: the signed units of its log and the key its current
+/// `#active` entry names.
 struct Identity {
-    root: P256SecretKey,
-    active: P256SecretKey,
     identifier: Identifier,
     units: Vec<Vec<u8>>,
-    head: [u8; 32],
-    snapshot: KeyStateSnapshot,
+    active: P256SecretKey,
 }
 
 impl Identity {
-    /// An inception with one root member at threshold 1, one `#active` key
-    /// and a commitment to one next key.
-    fn incept(root_seed: [u8; 32], active_seed: [u8; 32]) -> BoxResult<Self> {
-        let root = key(root_seed);
-        let snapshot = KeyStateSnapshot {
-            root_threshold: 1,
-            keys: vec![
-                entry(point(root_seed), KeyRole::RootMember, KeyCondition::Current),
-                entry(point(active_seed), KeyRole::Active, KeyCondition::Current),
-            ],
-            witnesses: vec![Identifier::from_bytes([0x77; 32])],
-            witnessing_interval: 3600,
-            service_key_role: KeyRole::Active,
-            delegator: Identifier::ZERO,
-        };
-        let encoded = encode_preimage(&EventPreimage::inception(InceptionFields {
-            root_group: root_group(),
-            key_state: snapshot.clone(),
-            continuation: Continuation::FixesCommitment(FixedCommitment {
-                commitments: vec![CommitmentEntry {
-                    commitment: prerotation_commitment(&point([0xee; 32])),
-                    custody_type: CustodyType::Software,
-                    key_algorithm: KeyAlgorithm::EcdsaP256Sha256,
-                }],
-                next_threshold: 1,
-            }),
-        }))?;
-        let identifier = encoded
-            .inception_identifier()
-            .ok_or("an inception derives its identifier")?;
+    /// Vector 41: root member §25.2's reference key, `#active` its secondary
+    /// key.
+    fn v41() -> BoxResult<Self> {
         Ok(Self {
-            units: vec![unit(&encoded, &root)?],
-            head: encoded.event_digest(),
-            root,
-            active: key(active_seed),
-            identifier,
-            snapshot,
+            identifier: fixtures::identifier(fixtures::V41_IDENTIFIER)?,
+            units: vec![fixtures::event_unit(
+                fixtures::V41_PREIMAGE,
+                fixtures::V41_SIGNATURE,
+            )?],
+            active: key(bytes32(SECONDARY_SEED)?),
         })
     }
 
-    /// The log extended by a `KeyState` its root signs, which installs
-    /// `active_seed`'s key and drops the earlier `#active` key `Superseded`.
-    fn rotate(mut self, active_seed: [u8; 32]) -> BoxResult<Self> {
-        let (dropped, kept): (Vec<KeyEntry>, Vec<KeyEntry>) = self
-            .snapshot
-            .keys
-            .iter()
-            .copied()
-            .partition(|entry| entry.role == KeyRole::Active);
-        let mut snapshot = self.snapshot.clone();
-        snapshot.keys = kept;
-        snapshot.keys.push(entry(
-            point(active_seed),
-            KeyRole::Active,
-            KeyCondition::Current,
-        ));
-        snapshot
-            .keys
-            .extend(dropped.into_iter().map(|entry| KeyEntry {
-                condition: KeyCondition::Superseded,
-                ..entry
-            }));
-        let encoded = encode_preimage(&EventPreimage::key_state(KeyStateFields {
-            identifier: self.identifier,
-            sequence: u64::try_from(self.units.len())?,
-            predecessor_digest: self.head,
-            root_group: root_group(),
-            key_state: snapshot.clone(),
-            seals: Vec::new(),
-        }))?;
-        self.units.push(unit(&encoded, &self.root)?);
-        self.head = encoded.event_digest();
-        self.snapshot = snapshot;
-        self.active = key(active_seed);
-        Ok(self)
+    /// Vector 41 then Vector 69, which installs a new `#active` key and drops
+    /// Vector 41's as `Compromised{from: 1}`.
+    fn v41_v69() -> BoxResult<Self> {
+        let mut identity = Self::v41()?;
+        identity.units.push(fixtures::event_unit(
+            fixtures::V69_PREIMAGE,
+            fixtures::V69_ROOT_SIGNATURE,
+        )?);
+        identity.active = labelled("scp-25-compromise-active");
+        Ok(identity)
+    }
+
+    /// Vector 41 then Vector 54, a `RootRecovery{CoSigns}` that installs a
+    /// new `#active` key and drops Vector 41's as `Superseded`.
+    fn v41_v54() -> BoxResult<Self> {
+        let mut identity = Self::v41()?;
+        identity.units.push(fixtures::event_unit(
+            fixtures::V54_PREIMAGE,
+            fixtures::V54_SIGNATURE_FIELD,
+        )?);
+        identity.active = labelled("scp-25-recovery-cosigns-active");
+        Ok(identity)
+    }
+
+    /// Vector 51's inception, whose `#active` key derives from
+    /// `SHA-256("scp-25-custody-active")`.
+    fn v51() -> BoxResult<Self> {
+        Ok(Self {
+            identifier: fixtures::identifier(fixtures::V51_IDENTIFIER)?,
+            units: vec![fixtures::event_unit(
+                fixtures::V51_INCEPTION_PREIMAGE,
+                fixtures::V51_INCEPTION_SIGNATURE,
+            )?],
+            active: labelled("scp-25-custody-active"),
+        })
     }
 
     /// The key state a first-contact resolution at `resolved_at_secs`
-    /// accepts: two sources, read to the end under two distinct proven
-    /// operator keys, serve the log (R11's floor).
+    /// accepts.
     fn resolved(&self, resolved_at_secs: u64) -> BoxResult<ResolvedState> {
+        self.resolved_at(Duration::from_secs(resolved_at_secs))
+    }
+
+    /// The key state a first-contact resolution at `resolved_at` since the
+    /// epoch accepts: two sources, read to the end under two distinct proven
+    /// operator keys, serve the log (R11's floor).
+    fn resolved_at(&self, resolved_at: Duration) -> BoxResult<ResolvedState> {
         let source = |name: &str, operator: u8| SourceRead {
             name: name.to_owned(),
             units: self.units.clone(),
@@ -260,7 +219,7 @@ impl Identity {
             identifier: self.identifier,
             held: None,
             reads: &reads,
-            now: SystemTime::UNIX_EPOCH + Duration::from_secs(resolved_at_secs),
+            now: SystemTime::UNIX_EPOCH + resolved_at,
         })?;
         match classification.verdict {
             ResolutionVerdict::Adopted { .. } | ResolutionVerdict::Confirmed => {}
@@ -273,11 +232,65 @@ impl Identity {
 }
 
 fn verifier_a() -> BoxResult<Identity> {
-    Identity::incept([0x31; 32], [0x32; 32])
+    Identity::v41()
 }
 
 fn verifier_b() -> BoxResult<Identity> {
-    Identity::incept([0x41; 32], [0x42; 32])
+    Identity::v51()
+}
+
+/// The one key state these tests build outside spec 25's logs, because no
+/// spec 25 log names §25.2's reference key, which signs Vector 87, as its
+/// `#active` key: an inception whose root member at threshold 1 is
+/// `root_seed`'s key and whose `#active` key is `active_seed`'s, resolved at
+/// `NOW`.
+fn reference_active_state(root_seed: [u8; 32], active_seed: [u8; 32]) -> BoxResult<ResolvedState> {
+    let entry = |seed: [u8; 32], role: KeyRole| KeyEntry {
+        key: key(seed).public_key().to_compressed(),
+        role,
+        condition: KeyCondition::Current,
+        compromised_from: 0,
+        custody_type: CustodyType::Software,
+        key_algorithm: KeyAlgorithm::EcdsaP256Sha256,
+    };
+    let encoded = encode_preimage(&EventPreimage::inception(InceptionFields {
+        root_group: SignerGroup {
+            indices: vec![0],
+            forms: vec![SignatureForm::Raw],
+        },
+        key_state: KeyStateSnapshot {
+            root_threshold: 1,
+            keys: vec![
+                entry(root_seed, KeyRole::RootMember),
+                entry(active_seed, KeyRole::Active),
+            ],
+            witnesses: vec![Identifier::from_bytes([0x77; 32])],
+            witnessing_interval: 3600,
+            service_key_role: KeyRole::Active,
+            delegator: Identifier::ZERO,
+        },
+        continuation: Continuation::FixesCommitment(FixedCommitment {
+            commitments: vec![CommitmentEntry {
+                commitment: prerotation_commitment(&key([0xee; 32]).public_key().to_compressed()),
+                custody_type: CustodyType::Software,
+                key_algorithm: KeyAlgorithm::EcdsaP256Sha256,
+            }],
+            next_threshold: 1,
+        }),
+    }))?;
+    let signed = encoded.signed_preimage();
+    let signature = sign_prehash_rfc6979(&key(root_seed), &Sha256::digest(&signed).into())?;
+    let mut unit = u32::try_from(signed.len())?.to_be_bytes().to_vec();
+    unit.extend_from_slice(&signed);
+    unit.extend_from_slice(&signature);
+    Identity {
+        identifier: encoded
+            .inception_identifier()
+            .ok_or("an inception derives its identifier")?,
+        units: vec![unit],
+        active: key(active_seed),
+    }
+    .resolved(NOW)
 }
 
 // ── Fixture ─────────────────────────────────────────────────────────────────
@@ -323,6 +336,8 @@ struct Fixture {
     signature_hook: fn(&mut [u8; 64]),
     verdict_hook: fn(&mut Vec<u8>),
     key_states: Vec<ResolvedState>,
+    /// The reader's time since the epoch.
+    now: Duration,
 }
 
 fn package(name: &str, verifier: Identifier) -> AcceptedAndroidPackage {
@@ -364,6 +379,7 @@ impl Fixture {
             signature_hook: |_| {},
             verdict_hook: |_| {},
             key_states: vec![a.resolved(NOW - 10)?],
+            now: Duration::from_secs(NOW),
         })
     }
 
@@ -419,7 +435,7 @@ impl Fixture {
             binding: &binding,
             policy,
             verifiers: &verifiers,
-            now_secs: NOW,
+            now: self.now,
             entry_id: "entry-0",
         };
         let full = run(&read, checks);
@@ -556,6 +572,18 @@ rejection_cases! {
         };
         Ok(())
     };
+    verdict_empty_malformed: VerdictLength => Rejected(R::MalformedEntry), |f| {
+        f.verdict_hook = Vec::clear;
+        Ok(())
+    };
+    // 175 zero bytes are malformed, not absent: absence is 176 zero bytes.
+    verdict_175_zero_bytes_malformed: VerdictLength => Rejected(R::MalformedEntry), |f| {
+        f.verdict_hook = |verdict| {
+            verdict.clear();
+            verdict.resize(VERDICT_LEN - 1, 0);
+        };
+        Ok(())
+    };
     verdict_177_bytes_malformed: VerdictLength => Rejected(R::MalformedEntry), |f| {
         f.verdict_hook = |verdict| verdict.push(0);
         Ok(())
@@ -611,7 +639,7 @@ rejection_cases! {
         f.key_states = vec![verifier_b()?.resolved(NOW - 10)?];
         Ok(())
     };
-    // Binding B9: resolved exactly MAX_ATTESTATION_KEY_RESOLUTION_STALENESS ago.
+    // Check 5: resolved exactly MAX_ATTESTATION_KEY_RESOLUTION_STALENESS ago.
     stale_verifier_key_state_unresolved:
         VerifierKeyState => Unverifiable(U::VerifierKeyStateUnresolved), |f| {
         f.key_states = vec![verifier_a()?.resolved(NOW - 300)?];
@@ -631,12 +659,18 @@ rejection_cases! {
         f.signature_hook = negate_s;
         Ok(())
     };
-    signed_by_previous_active_after_rotation:
+    // Vector 41 then Vector 69: the signer stays Vector 41's `#active` key,
+    // which the rotated state lists `Compromised{from: 1}`.
+    signed_by_compromised_active_after_rotation:
         Signature => Rejected(R::VerdictSignatureInvalid), |f| {
-        let rotated = verifier_a()?.rotate([0x33; 32])?;
-        f.key_states = vec![rotated.resolved(NOW - 10)?];
-        // The signer stays A's old `#active` key, which the rotated state
-        // lists `Superseded`.
+        f.key_states = vec![Identity::v41_v69()?.resolved(NOW - 10)?];
+        Ok(())
+    };
+    // Vector 41 then Vector 54: the signer stays Vector 41's `#active` key,
+    // which the recovered state lists `Superseded`.
+    signed_by_superseded_active_after_recovery:
+        Signature => Rejected(R::VerdictSignatureInvalid), |f| {
+        f.key_states = vec![Identity::v41_v54()?.resolved(NOW - 10)?];
         Ok(())
     };
     // Binding B5: the tag is this context's, the verdict covers another's `D`.
@@ -704,14 +738,58 @@ fn package_two_verifiers_accepts_either() -> TestResult {
     })
 }
 
-/// AC39: after a rotation, a verdict under the new Current `#active` key
-/// passes, which makes the rotation case fail on the key alone.
+/// AC39: after Vector 69's rotation and after Vector 54's recovery, a verdict
+/// under the new Current `#active` key passes, which makes each rotation case
+/// fail on the key alone.
 #[test]
 fn signed_by_current_active_after_rotation_passes() -> TestResult {
     passes(|f| {
-        let rotated = verifier_a()?.rotate([0x33; 32])?;
+        let rotated = Identity::v41_v69()?;
         f.signer = rotated.active.clone();
         f.key_states = vec![rotated.resolved(NOW - 10)?];
+        Ok(())
+    })?;
+    passes(|f| {
+        let recovered = Identity::v41_v54()?;
+        f.signer = recovered.active.clone();
+        f.key_states = vec![recovered.resolved(NOW - 10)?];
+        Ok(())
+    })
+}
+
+/// Check 5 compares at full precision: a key state resolved at 0.4 s into
+/// the reader's current second passes a read at 0.6 s into it, which a reader
+/// truncating its time to whole seconds would refuse as before the
+/// resolution.
+#[test]
+fn key_state_resolved_within_current_second_passes() -> TestResult {
+    passes(|f| {
+        f.now = Duration::new(NOW, 600_000_000);
+        f.key_states = vec![verifier_a()?.resolved_at(Duration::new(NOW, 400_000_000))?];
+        Ok(())
+    })
+}
+
+/// Check 5: a key state resolved after the reader's time is not fresh, by a
+/// fraction of a second.
+#[test]
+fn key_state_resolved_after_now_unresolved() -> TestResult {
+    let mut fixture = Fixture::valid()?;
+    fixture.now = Duration::new(NOW, 400_000_000);
+    fixture.key_states = vec![verifier_a()?.resolved_at(Duration::new(NOW, 600_000_000))?];
+    match fixture.run_all()?.result {
+        Err(Stop::Fail(PlayIntegrityFailure::Unverifiable(U::VerifierKeyStateUnresolved))) => {
+            Ok(())
+        }
+        other => Err(format!("expected VerifierKeyStateUnresolved, got {other:?}").into()),
+    }
+}
+
+/// Check 4: `token_issued_at` equal to `checked_at` is in order.
+#[test]
+fn token_issued_at_equals_checked_at_passes() -> TestResult {
+    passes(|f| {
+        f.token_issued_at = f.checked_at;
         Ok(())
     })
 }
@@ -813,12 +891,11 @@ fn verdict_preimage_238_bytes_matches_generator() -> TestResult {
 
 /// AC39: Vector 87's signature verifies through check 6's verification under
 /// a key state whose Current `#active` key is §25.2's reference key, and fails
-/// in its high-`s` form and under a rotated-away key.
+/// in its high-`s` form and under Vector 41's state, where the reference key
+/// is a root member and not `#active`.
 #[test]
 fn generator_verdict_signature_verifies() -> TestResult {
-    let reference = bytes32(REFERENCE_SEED)?;
-    let identity = Identity::incept([0x51; 32], reference)?;
-    let resolved = identity.resolved(NOW)?;
+    let resolved = reference_active_state([0x51; 32], bytes32(REFERENCE_SEED)?)?;
     let digest = bytes32(V87_PREIMAGE_DIGEST)?;
     let signature: [u8; 64] = hex::decode(V87_SIGNATURE)?
         .try_into()
@@ -830,8 +907,10 @@ fn generator_verdict_signature_verifies() -> TestResult {
     assert_ne!(high_s, signature);
     assert!(!verify_under_current_active(&resolved, &digest, &high_s));
 
-    let rotated = identity.rotate([0x52; 32])?.resolved(NOW)?;
-    assert!(!verify_under_current_active(&rotated, &digest, &signature));
+    let root_only = verifier_a()?.resolved(NOW)?;
+    assert!(!verify_under_current_active(
+        &root_only, &digest, &signature
+    ));
     Ok(())
 }
 

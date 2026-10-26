@@ -88,8 +88,12 @@ pub(super) struct PlayIntegrityRead<'a> {
     /// The key states the caller resolved for verifiers, each from a
     /// `Confirmed` or `Adopted` resolution, the only verdicts that yield one.
     pub(super) verifiers: &'a [&'a ResolvedState],
-    /// The reader's current time, Unix seconds.
-    pub(super) now_secs: u64,
+    /// The reader's current time since the Unix epoch, at full precision:
+    /// check 4 compares its whole seconds with the verdict's timestamps, and
+    /// check 5 compares the time itself with the resolution instant, which
+    /// carries sub-second precision. One value serves both, so the two checks
+    /// cannot read different clocks.
+    pub(super) now: Duration,
     /// The service-record entry's `id`, which a `Verified` outcome carries.
     pub(super) entry_id: &'a str,
 }
@@ -507,7 +511,7 @@ fn check_timestamp_order(state: &mut State<'_>) -> Result<(), Stop> {
 /// `token_issued_at` at most `checked_at`, this bounds both.
 fn check_not_yet_valid(state: &mut State<'_>) -> Result<(), Stop> {
     let verdict = state.verdict()?;
-    if verdict.checked_at > state.read.now_secs.saturating_add(CLOCK_SKEW_SECS) {
+    if verdict.checked_at > state.read.now.as_secs().saturating_add(CLOCK_SKEW_SECS) {
         return Err(reject(DeviceAttestationRejection::NotYetValid));
     }
     Ok(())
@@ -516,7 +520,7 @@ fn check_not_yet_valid(state: &mut State<'_>) -> Result<(), Stop> {
 /// Check 4: the reader's time exceeds `token_issued_at` plus the maximum age.
 fn check_max_age(state: &mut State<'_>) -> Result<(), Stop> {
     let verdict = state.verdict()?;
-    if state.read.now_secs
+    if state.read.now.as_secs()
         > state
             .read
             .policy
@@ -528,14 +532,16 @@ fn check_max_age(state: &mut State<'_>) -> Result<(), Stop> {
 }
 
 /// Check 5: the caller supplied a key state of the verdict's `verifier`, from
-/// a `Confirmed` or `Adopted` resolution, resolved no more than
-/// `MAX_ATTESTATION_KEY_RESOLUTION_STALENESS` before the reader's time.
+/// a `Confirmed` or `Adopted` resolution, and fresh under
+/// `ResolvedState::is_fresh` (`03-identity.md`): resolved less than
+/// `MAX_ATTESTATION_KEY_RESOLUTION_STALENESS` before the reader's time, and
+/// not after it.
 fn check_verifier_key_state(state: &mut State<'_>) -> Result<(), Stop> {
     let unresolved = unverified(DeviceAttestationUnverifiable::VerifierKeyStateUnresolved);
     let resolved = state.verifier_key_state()?.ok_or(unresolved)?;
     // A time past `SystemTime`'s range has no resolution within the bound.
     let now = SystemTime::UNIX_EPOCH
-        .checked_add(Duration::from_secs(state.read.now_secs))
+        .checked_add(state.read.now)
         .ok_or(unresolved)?;
     if !resolved.is_fresh(now) {
         return Err(unresolved);

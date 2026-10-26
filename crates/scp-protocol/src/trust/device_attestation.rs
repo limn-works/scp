@@ -92,7 +92,7 @@ pub struct VerifiedDeviceAttestation {
 impl VerifiedDeviceAttestation {
     /// Builds the outcome of a read whose every check passed. Only the
     /// platform readers in this module call it.
-    pub(crate) const fn new(
+    const fn new(
         platform: DeviceAttestationPlatform,
         entry_id: String,
         credential: [u8; 32],
