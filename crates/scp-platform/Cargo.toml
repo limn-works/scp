@@ -114,6 +114,9 @@ scp-crypto = { path = "../scp-crypto", version = "=0.1.0-beta.2" }
 # direct scp-kel dependency (09-security-model.md §9.7.4.2 R10; SCP-345).
 # scp-kel is a wasm-safe leaf that depends on no platform crate.
 scp-kel = { path = "../scp-kel", version = "=0.1.0-beta.2" }
+# The 32-byte `Identifier` a recovery lease is keyed on beside the credential
+# (09-security-model.md §9.7.4.2 R10; SCP-311). scp-kel already depends on it.
+scp-did = { path = "../scp-did", version = "=0.1.0-beta.2" }
 serde = { workspace = true }
 tokio.workspace = true
 thiserror.workspace = true

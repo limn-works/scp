@@ -82,6 +82,9 @@ pub mod sqlite;
 // the `StoredValue` format and `identity/{did}/document` key convention shared
 // by `scp-runtime`'s `ProtocolRepository` and `scp-identity`'s `Identity::create`
 // persistence path, so both produce byte-identical storage writes.
+// The store set a pending recovery handle lives in (09-security-model.md
+// §9.7.4.2 R10, 17-persistence-and-storage.md §17.8; SCP-311).
+pub mod recovery_handle_store;
 pub mod signer;
 pub mod store_value;
 #[cfg(feature = "sync")]
@@ -94,6 +97,21 @@ pub use encrypted::EncryptedStorage;
 // The key-event signer contract (09-security-model.md §9.7.4.2 R10), so a
 // custody implementor and its callers need no direct scp-kel dependency.
 pub use error::{PlatformError, PushFailureKind};
+pub use recovery_handle_store::{RecoveryLease, RecoveryLeases, SdkLocalMember};
+// The store set (09-security-model.md §9.7.4.2 R10; SCP-311) lives in the
+// wasm-safe scp-kel so a browser member implements the same traits; these
+// names are re-exported so a platform adapter needs no direct scp-kel import.
+pub use scp_kel::recovery_store::{
+    AdvanceTarget, CosignHold, CredentialId, CredentialIdError, CredentialStore, EntrySource,
+    LAST_REVEAL_MARKER_BYTES, LargeBlobClearingAct, LargeBlobMembership, LargeBlobNotLanded,
+    LargeBlobWrite, LastRevealMarker, MAX_CREDENTIAL_ID_BYTES, MaybeSync, MemberRead,
+    MemberRemoval, MemberWrite, NoLargeBlob, NoPlatformAccount, NotReachedCause,
+    PlatformAccountAbsence, PlatformAccountSlot, RECOVERY_HANDLE_BYTES, RecordDecodeError,
+    RecoveryEventStore, RecoveryHandle, RecoveryHandleStore, RecoveryPhase, RecoveryRecordStore,
+    RecoveryStoreError, RemovalBasis, RemovalCause, RemovalReport, RevealKind, SetLease, SetRead,
+    StoreEntry, StoreRead, StoreSet, StoreSetMembers, StoreSetRecord, StoreWriteFailure,
+    WriteReport,
+};
 pub use scp_kel::{
     CustodyProbe, IndexedSignature, KeyEventSignError, KeyEventSigner, MaybeSend, ProbeSignature,
     SigningChange,

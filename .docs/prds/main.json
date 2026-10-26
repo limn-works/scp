@@ -11272,7 +11272,11 @@
       "severity": "critical",
       "status": "pending",
       "files": [
+        "crates/scp-kel/src/recovery_store.rs",
+        "crates/scp-kel/src/recovery_store/",
         "crates/scp-platform/src/recovery_handle_store.rs",
+        "crates/scp-platform/src/lib.rs",
+        "crates/scp-platform/Cargo.toml",
         "crates/scp-platform/src/headless_backup.rs",
         "crates/scp-client-wasm/src/credentials.rs",
         "crates/scp-platform/src/next_set/",
@@ -11306,7 +11310,7 @@
         "The SDK offers the pre-rotation credential on a FIDO2 token or under a second platform account: a test per SDK (`09-security-model.md` §9.7.4.1 item 4)"
       ],
       "actionItems": [
-        "Declare `RecoveryHandleStore` in `scp-platform`, and implement the passkey and FIDO2 `KeyEventSigner`s and every production `NextSetCustody`.",
+        "Declare `RecoveryHandleStore` in `scp-kel` (wasm-safe), with `SdkLocalMember` in `scp-platform`, and implement the passkey and FIDO2 `KeyEventSigner`s and every production `NextSetCustody`.",
         "Wire the Swift, Kotlin and browser host callbacks.",
         "Implement the three headless backup methods.",
         "Write the tests the acceptance criteria name."
