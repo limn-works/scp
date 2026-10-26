@@ -479,6 +479,7 @@ const NODE_START_CODES: readonly (readonly [string, new (...a: never[]) => ScpEr
   ["SCP-STORAGE-8008", StorageError],
   ["SCP-STORAGE-8009", StorageError],
   ["SCP-IDENT-1063", IdentityError],
+  ["SCP-IDENT-1100", IdentityError],
   ["SCP-TRANS-5051", TransportError],
   ["SCP-TRANS-5052", TransportError],
   ["SCP-TRANS-5054", TransportError],

@@ -410,7 +410,7 @@ home line doesn't have. Honest, not fixable from here.
   command above now builds without `testing` and exits 1 on every run, because
   the example gives `Node::start` a storage directory that holds no identity and, on a build
   without `testing`, its identity-creation (`Generate`) path returns
-  `NoPreRotationBackend` whatever custody or storage the caller supplies. A `testing` build
+  `NoIndependentSubstrate` whatever custody or storage the caller supplies. A `testing` build
   is not a way to run it: it mints the identity through the test-harness
   `InMemoryPreRotationCustody`. No build runs the example without that
   stand-in until a production `PreRotationCustody` backend exists;

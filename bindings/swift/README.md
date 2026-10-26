@@ -16,7 +16,7 @@ dependencies: [
 
 ## Quick Start
 
-This quick start runs only against an XCFramework built with the `testing` feature (`./build-xcframework.sh --dev`). A release build has no pre-rotation custody backend, so it throws `SCP-IDENT-1059` for `CustodyType.encryptedFile`. Set `SCP_KEY_PASSPHRASE` before you run it: the identity's keys go to `$HOME/.scp/keys.bin`, sealed under that passphrase.
+This quick start runs only against an XCFramework built with the `testing` feature (`./build-xcframework.sh --dev`). A release build has no independent next-set substrate, so it throws `SCP-IDENT-1100` for `CustodyType.encryptedFile`. Set `SCP_KEY_PASSPHRASE` before you run it: the identity's keys go to `$HOME/.scp/keys.bin`, sealed under that passphrase.
 
 ```swift
 import Foundation

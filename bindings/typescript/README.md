@@ -14,7 +14,7 @@ bun add @limn-works/scp-ts
 
 ## Quick Start
 
-The identity below asks for `"encrypted_file"` custody (spec `03-identity.md` §3.2.2): its keys live in the encrypted key file `$HOME/.scp/keys.bin`, sealed under the passphrase in the `SCP_KEY_PASSPHRASE` environment variable, so set that variable before you run it. The quick start runs only with a native addon built with the `testing` feature (`cargo build -p scp-ffi-napi --features testing`), because a published addon has no pre-rotation custody backend and answers `"encrypted_file"`, and a `KeyCustodyProvider`, with `SCP-IDENT-1059`. For a key store you own, pass a `KeyCustodyProvider` to `identityCreateWithCustody`, which creates an `"os_keystore"` identity.
+The identity below asks for `"encrypted_file"` custody (spec `03-identity.md` §3.2.2): its keys live in the encrypted key file `$HOME/.scp/keys.bin`, sealed under the passphrase in the `SCP_KEY_PASSPHRASE` environment variable, so set that variable before you run it. The quick start runs only with a native addon built with the `testing` feature (`cargo build -p scp-ffi-napi --features testing`), because a published addon has no independent next-set substrate and answers `"encrypted_file"`, and a `KeyCustodyProvider`, with `SCP-IDENT-1100`. For a key store you own, pass a `KeyCustodyProvider` to `identityCreateWithCustody`, which creates an `"os_keystore"` identity.
 
 ```typescript
 import { SCP } from "@limn-works/scp-ts";

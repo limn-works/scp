@@ -2647,6 +2647,25 @@
       }
     },
     {
+      "rule_id": "identity-create-with-custody-reaches-create-identity-napi",
+      "description": "The napi `identity_create_with_custody` must hand its custody selection to `create_identity`, the one function whose shipped body refuses identity creation with SCP-IDENT-1100 before any key exists (spec 03 section 3.10.10, security model section 9.7.4.1 item 3a). A callback path that built its identity outside `create_identity` would bypass that refusal; no Rust test can drive the callback path, so this rule and the TypeScript shipped-addon test pin it.",
+      "applies_to": [
+        "napi"
+      ],
+      "pattern": {
+        "caller_matches": "^identity_create_with_custody$",
+        "required_callee": "create_identity",
+        "scope": "same-function",
+        "min_occurrences": 1
+      },
+      "evidence": {
+        "code_sites": [
+          "crates/scp-ffi/napi/src/scp.rs Scp::identity_create_with_custody → create_identity",
+          "bindings/typescript/tests/shipped-addon.test.ts identityCreateWithCustody refuses with SCP-IDENT-1100 before any provider call"
+        ]
+      }
+    },
+    {
       "rule_id": "callback-custody-identity-load-opens-entry",
       "description": "Every bridge's `identity_load_with_custody` must rebuild the callback custody adapter through `open_entry`, which reads the identity's callback custody entry and opens its records over the stored namespace through the instance's namespace table, refusing a namespace another adapter holds (spec 17 section 17.3 callback custody identity entry, decision D1, SCP-345). A load that drew a fresh namespace instead would lose every key the identity minted before the restart.",
       "applies_to": [

@@ -28,8 +28,8 @@ import Foundation
 /// test reaches the in-memory key store outside this type; a bridge built
 /// without the `testing` feature answers the raw string with `SCP-IDENT-1008`.
 ///
-/// A shipped build also refuses every identity creation with `SCP-IDENT-1059`
-/// until a production pre-rotation custody backend exists (ADR-062
+/// A shipped build also refuses every identity creation with `SCP-IDENT-1100`
+/// until a production independent next-set substrate exists (ADR-062
 /// §Decision 6).
 ///
 /// This type is a pure Swift type and conflicts with no UniFFI-generated type.

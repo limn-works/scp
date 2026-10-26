@@ -8413,7 +8413,7 @@ public protocol TestingCallbackCustodyProtocol: AnyObject, Sendable {
      * # Errors
      *
      * `SCP-IDENT-1008` when this adapter is already closed, or while a call
-     * on it still holds its records (the namespace is live).
+     * on it still holds its records; that refusal leaves this adapter open.
      */
     func reopen(provider: KeyCustodyProvider) throws  -> TestingCallbackCustody
     
@@ -8634,7 +8634,7 @@ open func publicKey(keyId: String)async throws  -> Data  {
      * # Errors
      *
      * `SCP-IDENT-1008` when this adapter is already closed, or while a call
-     * on it still holds its records (the namespace is live).
+     * on it still holds its records; that refusal leaves this adapter open.
      */
 open func reopen(provider: KeyCustodyProvider)throws  -> TestingCallbackCustody  {
     return try  FfiConverterTypeTestingCallbackCustody_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
@@ -21661,7 +21661,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_testingcallbackcustody_public_key() != 64484) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_testingcallbackcustody_reopen() != 40072) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_testingcallbackcustody_reopen() != 60486) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_testingcallbackcustody_sign() != 17590) {

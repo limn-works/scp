@@ -4,8 +4,8 @@
 /// (the `os_keystore` custody request, spec 03 §3.2.2), to
 /// `identityCreateWithCustody(provider:)`, then opens an encrypted context.
 ///
-/// A build without the bridge's `testing` feature has no pre-rotation custody
-/// backend, so step 1 throws `SCP-IDENT-1059` in a shipped build. The custody
+/// A build without the bridge's `testing` feature has no independent next-set
+/// substrate, so step 1 throws `SCP-IDENT-1100` in a shipped build. The custody
 /// paragraph of `docs/guides/sdk-quickstart.md` states which identity creations
 /// a shipped build refuses.
 
@@ -26,7 +26,7 @@ let storageDir = try FileManager.default
 let scp = try SCP.withStorage(sqliteDir: storageDir, passphrase: passphrase)
 
 // 1. Create a DID identity whose keys the Keychain holds. A shipped build
-//    throws `SCP-IDENT-1059` here.
+//    throws `SCP-IDENT-1100` here.
 let identity = try await scp.identityCreateWithCustody(provider: AppleKeyCustody())
 print("Created identity: \(identity.did())")
 

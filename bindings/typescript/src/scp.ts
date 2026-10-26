@@ -1306,8 +1306,8 @@ export class SCP {
    *   or `SCP_KEY_PASSPHRASE` is unset, empty, or (for `HOME`) relative.
    * @throws IdentityError `SCP-IDENT-1008` for `"encrypted_file"` when the key
    *   file does not open.
-   * @throws IdentityError `SCP-IDENT-1059` on a shipped addon, which has no
-   *   pre-rotation custody backend.
+   * @throws IdentityError `SCP-IDENT-1100` on a shipped addon, which has no
+   *   independent next-set substrate.
    */
   async identityCreate(custody: CustodyType): Promise<Identity> {
     requireCustody("identityCreate", custody);
