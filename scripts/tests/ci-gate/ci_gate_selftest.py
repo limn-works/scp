@@ -6997,6 +6997,11 @@ LEG_COMMANDS: tuple[tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]], ..
                 "cargo clippy -p scp-transport --features "
                 "sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --all-targets -- -D warnings"
             ),
+            (
+                "cargo clippy -p scp-transport --features "
+                "sqlite-blob,redb-blob,postgres-blob,s3-blob,startup,webpush --all-targets "
+                "-- -D warnings"
+            ),
             "cargo clippy -p scp-transport --features push-store --all-targets -- -D warnings",
             (
                 "cargo clippy -p scp-transport --features push-store,testing --all-targets "
