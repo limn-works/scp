@@ -233,17 +233,18 @@ pub async fn recovery_advance_epoch(
     // 1. Validate the context is active.
     require_active(&cell.handle)?;
 
-    // 2. Perform the MLS epoch advance (Update + self-Commit). ADR-049 PR-7
-    //    (SCP-CRYPTOMOVE-001): now driven on the actor `state.mode` via
-    //    `commit_class_s_keep` -> `rest_mut` — §9 Class-S, the ratchet is durable
-    //    before the Commit is broadcast (this is the highest-stakes safety-gated
-    //    advance; see the broadcast note below). The Update keeps publishing
-    //    the identity's wrapping key (spec 09 §9.16.1); with none loaded it
-    //    fails closed before anything ratchets. If the advance fails, the
-    //    error `?`-propagates and the bookkeeping counter is NOT incremented.
-    //    If only its fail-closed persist fails, the group has ratcheted, so the
-    //    Commit is still broadcast, the counter still advances, and the persist
-    //    error is returned at the end.
+    // 2. Perform the MLS epoch advance (Update + self-Commit) on the actor's
+    //    `state.mode` via `commit_class_s_keep_settled` -> `rest_mut`
+    //    (SCP-CRYPTOMOVE-001). §9 Class-S: the ratchet is durable before the
+    //    Commit is broadcast (this is the highest-stakes safety-gated advance;
+    //    see the broadcast note below). The Update keeps publishing the
+    //    identity's wrapping key (spec 09 §9.16.1); with none loaded it fails
+    //    closed before anything ratchets. If the advance fails, the error
+    //    `?`-propagates and the bookkeeping counter is NOT incremented. Once
+    //    the group has advanced, step 3 increments the counter before any
+    //    other fallible step runs, so no later error leaves the counter behind
+    //    the group's epoch; a failed persist of the advance is returned at the
+    //    end.
     let wrapping_public_key = *deps
         .supervisor
         .my_wrapping_key(&deps.owned_identity)?
@@ -251,7 +252,7 @@ pub async fn recovery_advance_epoch(
     // The `RecoveryEpochAdvanced` leaf is planned and checked before the step
     // and queued in the same keep persist as the ratchet (spec 17 §17.3 "Event
     // log write failures"), so a log write failure after the Commit leaves
-    // cannot lose it. The leaf describes the bookkeeping advance in step 4
+    // cannot lose it. The leaf describes the bookkeeping advance in step 3
     // below. A leaf that cannot be built refuses the recovery before the step.
     let recovery_leaf = plan_recovery_epoch_leaf(cell, deps)?;
     // A failed persist keeps the advanced epoch and the queued leaf in memory
@@ -269,18 +270,33 @@ pub async fn recovery_advance_epoch(
         })
         .await?;
 
-    // 2b. Broadcast the MLS Commit to all members so they advance their group
-    //     epoch and ratchet key material AWAY from the compromised keys. Broadcast
-    //     async (ADR-049 Decision 7); on FAILURE the retry-queue bookkeeping — the
-    //     `commit_fault` safety-gate marker and the `pending_commits` entry that is
-    //     the ONLY re-delivery of this Commit — is persisted FAIL-CLOSED via
-    //     `keep_broadcast_failure`. This is the highest-stakes safety-gated
-    //     broadcast in the system: a warn-and-drop here would leave the local node
-    //     at epoch N+1 believing recovery succeeded while remaining members stay at
-    //     epoch N still using the compromised keys — silent post-compromise desync
-    //     letting the excluded/compromised party retain read access (spec §9.12).
-    //     `try_broadcast_commit` no-ops on empty bytes (the cfg(test) no-crypto
-    //     pipeline), so no `is_empty` guard is needed here.
+    // 3. The group has advanced, so the bookkeeping counter and grace store
+    //    advance with it here, before the broadcast, the lifecycle re-check,
+    //    or the persist result can return early. These are Class-C epoch
+    //    fields with a coalesced (best-effort) persist below; route through
+    //    the non-persisting Class-C view so no whole `&mut` is taken (ADR-049
+    //    §9). The borrow ends before the broadcast.
+    let new_epoch = {
+        let mut view = cell.class_c_view();
+        let epoch = view.epoch_mut();
+        let old_epoch = epoch.mls_epoch;
+        epoch.mls_epoch = old_epoch.saturating_add(1);
+        let _expired = epoch.grace_store.add_epoch(old_epoch);
+        epoch.mls_epoch
+    };
+
+    // 4. Broadcast the MLS Commit to all members so they advance their group
+    //    epoch and ratchet key material AWAY from the compromised keys. Broadcast
+    //    async (ADR-049 Decision 7); on FAILURE the retry-queue bookkeeping — the
+    //    `commit_fault` safety-gate marker and the `pending_commits` entry that is
+    //    the ONLY re-delivery of this Commit — is persisted FAIL-CLOSED via
+    //    `keep_broadcast_failure`. This is the highest-stakes safety-gated
+    //    broadcast in the system: a warn-and-drop here would leave the local node
+    //    at epoch N+1 believing recovery succeeded while remaining members stay at
+    //    epoch N still using the compromised keys — silent post-compromise desync
+    //    letting the excluded/compromised party retain read access (spec §9.12).
+    //    `try_broadcast_commit` no-ops on empty bytes (the cfg(test) no-crypto
+    //    pipeline), so no `is_empty` guard is needed here.
     if let Some(failure) = try_broadcast_commit(
         deps,
         context_id,
@@ -292,34 +308,20 @@ pub async fn recovery_advance_epoch(
         keep_broadcast_failure(cell, deps, context_id, failure).await?;
     }
 
-    // 3. Re-validate after the crypto op to close the TOCTOU window
-    //    between the active check in step 1 and the counter increment
-    //    here. The actor owns `state`, but a `LifecycleControl::Pause`
-    //    delivered between awaits would have flipped the lifecycle —
-    //    however the mailbox ordering serializes commands, so this is
-    //    defense-in-depth.
+    // 5. Re-validate after the crypto op to close the TOCTOU window between
+    //    the active check in step 1 and the steps below. The actor owns
+    //    `state`, but a `LifecycleControl::Pause` delivered between awaits
+    //    would have flipped the lifecycle — however the mailbox ordering
+    //    serializes commands, so this is defense-in-depth.
     require_active(&cell.handle)?;
 
-    // 4. Increment bookkeeping counter and manage grace store. These are
-    //    Class-C epoch fields with a coalesced (best-effort) persist below;
-    //    route through the non-persisting Class-C view so no whole `&mut`
-    //    is taken (ADR-049 §9). Borrow ends before the event-log step.
-    let new_epoch = {
-        let mut view = cell.class_c_view();
-        let epoch = view.epoch_mut();
-        let old_epoch = epoch.mls_epoch;
-        epoch.mls_epoch = old_epoch.saturating_add(1);
-        let _expired = epoch.grace_store.add_epoch(old_epoch);
-        epoch.mls_epoch
-    };
-
-    // 5. The queued `RecoveryEpochAdvanced` unit is written to the event log.
+    // 6. The queued `RecoveryEpochAdvanced` unit is written to the event log.
     //    A drain failure leaves it queued for the next drain; recovery is not
     //    blocked by logging issues.
     let _ = crate::context::log_unit_helpers::drain_pending_log_units(cell, deps, context_id).await;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
 
-    // 6. Persist if configured (best-effort). The actor's coalesced
+    // 7. Persist if configured (best-effort). The actor's coalesced
     //    persist arm of the `tokio::select!` loop will catch this on
     //    the next 50ms tick anyway, but the legacy path persisted
     //    inline — preserve that timing for behaviour parity. Best-effort
@@ -715,6 +717,22 @@ mod log_unit_family_tests {
                 queued_unit_types(&cell.class_s.pending_log_units),
                 vec![vec![scp_event_log::EventType::RecoveryEpochAdvanced]],
                 "the recovery leaf stays queued in memory"
+            );
+            // The retry-queue persist failed too and returned early; the
+            // bookkeeping counter still matches the group it describes.
+            let group_epoch = match &cell.mode {
+                crate::context::actor::state::ContextModeState::Encrypted(c) => c
+                    .mls_group
+                    .as_ref()
+                    .expect("group present")
+                    .epoch()
+                    .expect("group epoch"),
+                crate::context::actor::state::ContextModeState::Broadcast(_) => u64::MAX,
+            };
+            assert_eq!(group_epoch, 1, "the group advanced");
+            assert_eq!(
+                cell.epoch.mls_epoch, group_epoch,
+                "the counter advances with the group"
             );
         }
     }
