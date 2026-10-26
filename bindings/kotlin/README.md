@@ -15,7 +15,7 @@ dependencies {
 
 ## Quick Start
 
-This quick start runs only with a native library built with the `testing` feature (`./gradlew :scp-kt:test -Pscp.uniffi.cargoFeatures=testing` builds one). A release build has no pre-rotation custody backend, so it refuses every identity creation with `SCP-IDENT-1059` (ADR-062 §Decision 6). Set `SCP_KEY_PASSPHRASE` before you run it: the identity's keys go to `$HOME/.scp/keys.bin`, sealed under that passphrase.
+This quick start runs only with a native library built with the `testing` feature (`./gradlew :scp-kt:test -Pscp.uniffi.cargoFeatures=testing` builds one). A release build has no independent next-set substrate, so it refuses every identity creation with `SCP-IDENT-1100` (ADR-062 §Decision 6). Set `SCP_KEY_PASSPHRASE` before you run it: the identity's keys go to `$HOME/.scp/keys.bin`, sealed under that passphrase.
 
 ```kotlin
 import uniffi.scp.CeilingPolicy

@@ -94,8 +94,8 @@ export interface IdentityLinkAttestation {
  *
  * The bridge answers any other string, `"platform"`, `"software"`, `"file"`
  * and `"callback"` included, with a `ValidationError` carrying
- * `SCP-VALID-7005`. A shipped addon has no pre-rotation custody backend, so it
- * answers `"encrypted_file"` with an `IdentityError` carrying `SCP-IDENT-1059`
+ * `SCP-VALID-7005`. A shipped addon has no independent next-set substrate, so it
+ * answers `"encrypted_file"` with an `IdentityError` carrying `SCP-IDENT-1100`
  * once the inputs resolve and before the key file opens.
  *
  * No SDK method defaults custody: the caller names the key store, and a call

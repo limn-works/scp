@@ -2902,7 +2902,7 @@ pub struct IdentityEntry {
     ///
     /// TEST-HARNESS ONLY (`#[cfg(feature = "testing")]`, ADR-062 §Decision 6):
     /// the only `PreRotationCustody` backend is the in-memory nullifier. On a
-    /// shipped build, identity creation FAILS CLOSED (`IDENT_1059`) before any
+    /// shipped build, identity creation FAILS CLOSED (`IDENT_1100`) before any
     /// `IdentityEntry` is constructed, so no production entry ever carries this
     /// field — the retained-custody + migration machinery is gated with it.
     #[cfg(feature = "testing")]

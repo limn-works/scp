@@ -250,9 +250,18 @@ pub enum NodeError {
     #[error("missing required field: {0}")]
     MissingField(&'static str),
 
-    /// An identity operation (create, publish) failed.
+    /// An identity operation of the superseded `did:dht` model (load, publish,
+    /// resolve) failed.
     #[error("identity error: {0}")]
     Identity(#[from] IdentityError),
+
+    /// Identity creation refused under the key-event-log identity model
+    /// (`03-identity.md` §3.10.10). A shipped build returns
+    /// [`scp_identity::IdentityError::NoIndependentSubstrate`]
+    /// (`SCP-IDENT-1100`) before any key exists, because no substrate
+    /// satisfies `09-security-model.md` §9.7.4.1 item 3a.
+    #[error("identity creation error: {0}")]
+    IdentityCreation(scp_identity::IdentityError),
 
     /// The relay server failed to start.
     #[error("relay error: {0}")]
@@ -2935,11 +2944,13 @@ async fn resolve_identity<K: KeyCustody, D: DidMethod>(
             }
             #[cfg(not(feature = "testing"))]
             {
-                // FAIL CLOSED (ADR-062 §Decision 6): no real PreRotationCustody
-                // backend exists yet (RFC #2130 / #1729). Never mint the in-memory
-                // nullifier on a shipped build — return a typed error instead.
+                // FAIL CLOSED before any key exists: no substrate satisfies
+                // §9.7.4.1 item 3a on a shipped build (`03-identity.md`
+                // §3.10.10, SCP-IDENT-1100). Never mint the in-memory nullifier.
                 let _ = (custody, did_method);
-                Err(NodeError::Identity(IdentityError::NoPreRotationBackend))
+                Err(NodeError::IdentityCreation(
+                    scp_identity::IdentityError::NoIndependentSubstrate,
+                ))
             }
         }
         IdentitySource::Explicit(e) => Ok((e.identity, e.document, e.did_method)),
@@ -3167,11 +3178,14 @@ pub(crate) async fn resolve_identity_persistent<K: KeyCustody, D: DidMethod, S: 
                 }
                 #[cfg(not(feature = "testing"))]
                 {
-                    // FAIL CLOSED (ADR-062 §Decision 6): no real PreRotationCustody
-                    // backend exists yet (RFC #2130 / #1729). Never mint the
-                    // in-memory nullifier on a shipped build — return a typed error.
+                    // FAIL CLOSED before any key exists: no substrate satisfies
+                    // §9.7.4.1 item 3a on a shipped build (`03-identity.md`
+                    // §3.10.10, SCP-IDENT-1100). Never mint the in-memory
+                    // nullifier.
                     let _ = (&custody, &did_method, storage);
-                    Err(NodeError::Identity(IdentityError::NoPreRotationBackend))
+                    Err(NodeError::IdentityCreation(
+                        scp_identity::IdentityError::NoIndependentSubstrate,
+                    ))
                 }
             }
         }
@@ -3962,275 +3976,6 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
 }
 
 // ---------------------------------------------------------------------------
-// NoOp placeholder types for the default NodeConfig type parameters
-// ---------------------------------------------------------------------------
-
-/// Placeholder key custody used as the default type parameter for
-/// [`NodeConfig`](crate::NodeConfig). All methods return errors -- callers must
-/// provide a real implementation via the config's
-/// [`IdentitySource`](crate::IdentitySource).
-#[doc(hidden)]
-pub struct NoOpCustody;
-
-impl scp_platform::KeyEventSigner for NoOpCustody {
-    type Member = scp_platform::KeyHandle;
-
-    fn sign_change(
-        &self,
-        _member: &scp_platform::KeyHandle,
-        _change: &scp_platform::SigningChange,
-    ) -> impl std::future::Future<
-        Output = Result<scp_platform::IndexedSignature, scp_platform::KeyEventSignError>,
-    > + Send {
-        std::future::ready(Err(scp_platform::PlatformError::StorageError(
-            "NoOpCustody: not configured".to_owned(),
-        )
-        .into()))
-    }
-
-    fn sign_probe(
-        &self,
-        _member: &scp_platform::KeyHandle,
-        _probe: &scp_platform::CustodyProbe,
-    ) -> impl std::future::Future<
-        Output = Result<scp_platform::ProbeSignature, scp_platform::KeyEventSignError>,
-    > + Send {
-        std::future::ready(Err(scp_platform::PlatformError::StorageError(
-            "NoOpCustody: not configured".to_owned(),
-        )
-        .into()))
-    }
-}
-
-impl KeyCustody for NoOpCustody {
-    fn generate_key_event_keypair(
-        &self,
-    ) -> impl std::future::Future<
-        Output = Result<scp_platform::KeyHandle, scp_platform::PlatformError>,
-    > + Send {
-        std::future::ready(Err(scp_platform::PlatformError::StorageError(
-            "NoOpCustody: not configured".to_owned(),
-        )))
-    }
-
-    fn generate_keypair(
-        &self,
-        _key_type: scp_platform::KeyType,
-    ) -> impl std::future::Future<
-        Output = Result<scp_platform::KeyHandle, scp_platform::PlatformError>,
-    > + Send {
-        std::future::ready(Err(scp_platform::PlatformError::StorageError(
-            "NoOpCustody: not configured".to_owned(),
-        )))
-    }
-
-    fn generate_identity_keypair(
-        &self,
-    ) -> impl std::future::Future<
-        Output = Result<scp_platform::KeyHandle, scp_platform::PlatformError>,
-    > + Send {
-        std::future::ready(Err(scp_platform::PlatformError::StorageError(
-            "NoOpCustody: not configured".to_owned(),
-        )))
-    }
-
-    fn public_key(
-        &self,
-        _handle: &scp_platform::KeyHandle,
-    ) -> impl std::future::Future<
-        Output = Result<scp_platform::PublicKey, scp_platform::PlatformError>,
-    > + Send {
-        std::future::ready(Err(scp_platform::PlatformError::StorageError(
-            "NoOpCustody: not configured".to_owned(),
-        )))
-    }
-
-    fn sign(
-        &self,
-        _handle: &scp_platform::KeyHandle,
-        _data: &[u8],
-    ) -> impl std::future::Future<
-        Output = Result<scp_platform::Signature, scp_platform::PlatformError>,
-    > + Send {
-        std::future::ready(Err(scp_platform::PlatformError::StorageError(
-            "NoOpCustody: not configured".to_owned(),
-        )))
-    }
-
-    fn destroy_key(
-        &self,
-        _handle: &scp_platform::KeyHandle,
-    ) -> impl std::future::Future<Output = Result<(), scp_platform::PlatformError>> + Send {
-        std::future::ready(Err(scp_platform::PlatformError::StorageError(
-            "NoOpCustody: not configured".to_owned(),
-        )))
-    }
-
-    fn dh_agree(
-        &self,
-        _handle: &scp_platform::KeyHandle,
-        _peer_public: &[u8],
-    ) -> impl std::future::Future<
-        Output = Result<scp_platform::SharedSecret, scp_platform::PlatformError>,
-    > + Send {
-        std::future::ready(Err(scp_platform::PlatformError::StorageError(
-            "NoOpCustody: not configured".to_owned(),
-        )))
-    }
-
-    fn derive_pseudonym(
-        &self,
-        _handle: &scp_platform::KeyHandle,
-        _context_id: &[u8],
-    ) -> impl std::future::Future<
-        Output = Result<scp_platform::Pseudonym, scp_platform::PlatformError>,
-    > + Send {
-        std::future::ready(Err(scp_platform::PlatformError::StorageError(
-            "NoOpCustody: not configured".to_owned(),
-        )))
-    }
-
-    fn derive_rotatable_pseudonym(
-        &self,
-        _handle: &scp_platform::KeyHandle,
-        _context_id: &[u8],
-        _pseudonym_epoch: u64,
-    ) -> impl std::future::Future<
-        Output = Result<scp_platform::Pseudonym, scp_platform::PlatformError>,
-    > + Send {
-        std::future::ready(Err(scp_platform::PlatformError::StorageError(
-            "NoOpCustody: not configured".to_owned(),
-        )))
-    }
-
-    fn custody_type(&self, _handle: &scp_platform::KeyHandle) -> scp_platform::CustodyType {
-        scp_platform::CustodyType::InMemory
-    }
-}
-
-/// Placeholder DID method used as the default type parameter for
-/// [`NodeConfig`](crate::NodeConfig). All methods return errors -- callers must
-/// provide a real implementation.
-#[doc(hidden)]
-pub struct NoOpDidMethod;
-
-impl DidMethod for NoOpDidMethod {
-    /// Every other method here returns an error, so the keep-alive client is the
-    /// one that refuses to publish rather than one that would report a false
-    /// success: `DisabledDhtClient::publish` returns `DhtError::Disabled`.
-    type Dht = scp_dht::DisabledDhtClient;
-
-    fn dht_client(&self) -> Arc<scp_dht::DisabledDhtClient> {
-        Arc::new(scp_dht::DisabledDhtClient)
-    }
-
-    fn create(
-        &self,
-        _key_custody: &impl KeyCustody,
-        _pre_rotation_custody: &impl scp_platform::PreRotationCustody,
-    ) -> impl std::future::Future<
-        Output = Result<
-            (ScpIdentity, DidDocument, scp_platform::PreRotationKeyHandle),
-            IdentityError,
-        >,
-    > + Send {
-        std::future::ready(Err(IdentityError::DhtPublishFailed(
-            "NoOpDidMethod: not configured".to_owned(),
-        )))
-    }
-
-    fn verify(&self, _did_string: &str, _public_key: &[u8]) -> bool {
-        false
-    }
-
-    fn publish(
-        &self,
-        _identity: &ScpIdentity,
-        _document: &DidDocument,
-    ) -> impl std::future::Future<
-        Output = Result<scp_identity::republish::RepublishEntry, IdentityError>,
-    > + Send {
-        // Fails closed with a typed error — never a fabricated signed record.
-        std::future::ready(Err(IdentityError::DhtPublishFailed(
-            "NoOpDidMethod: not configured".to_owned(),
-        )))
-    }
-
-    fn resolve(
-        &self,
-        _did_string: &str,
-    ) -> impl std::future::Future<Output = Result<DidDocument, IdentityError>> + Send {
-        std::future::ready(Err(IdentityError::DhtResolveFailed(
-            "NoOpDidMethod: not configured".to_owned(),
-        )))
-    }
-
-    fn rotate(
-        &self,
-        _identity: &ScpIdentity,
-        _key_custody: &impl KeyCustody,
-    ) -> impl std::future::Future<Output = Result<(ScpIdentity, DidDocument), IdentityError>> + Send
-    {
-        std::future::ready(Err(IdentityError::KeyRotationFailed(
-            "NoOpDidMethod: not configured".to_owned(),
-        )))
-    }
-}
-
-/// Placeholder storage used as the default type parameter for
-/// [`NodeConfig`](crate::NodeConfig).
-#[doc(hidden)]
-#[derive(Debug, Default)]
-pub struct NoOpStorage;
-
-impl Storage for NoOpStorage {
-    fn store(
-        &self,
-        _key: &str,
-        _data: &[u8],
-    ) -> impl std::future::Future<Output = Result<(), scp_platform::PlatformError>> + Send {
-        std::future::ready(Ok(()))
-    }
-
-    fn retrieve(
-        &self,
-        _key: &str,
-    ) -> impl std::future::Future<Output = Result<Option<Vec<u8>>, scp_platform::PlatformError>> + Send
-    {
-        std::future::ready(Ok(None))
-    }
-
-    fn delete(
-        &self,
-        _key: &str,
-    ) -> impl std::future::Future<Output = Result<(), scp_platform::PlatformError>> + Send {
-        std::future::ready(Ok(()))
-    }
-
-    fn list_keys(
-        &self,
-        _prefix: &str,
-    ) -> impl std::future::Future<Output = Result<Vec<String>, scp_platform::PlatformError>> + Send
-    {
-        std::future::ready(Ok(Vec::new()))
-    }
-
-    fn delete_prefix(
-        &self,
-        _prefix: &str,
-    ) -> impl std::future::Future<Output = Result<u64, scp_platform::PlatformError>> + Send {
-        std::future::ready(Ok(0))
-    }
-
-    fn exists(
-        &self,
-        _key: &str,
-    ) -> impl std::future::Future<Output = Result<bool, scp_platform::PlatformError>> + Send {
-        std::future::ready(Ok(false))
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -4260,11 +4005,13 @@ mod tests {
         DidDht::with_client_and_signer(dht_client, cache, sign_fn)
     }
 
-    /// ADR-062 §Decision 6 / SCP-CAPINJECT-006: on a shipped (no-`testing`) build
-    /// the production `Node` / self-host identity-generation path has no
-    /// pre-rotation custody backend, so it FAILS CLOSED with
-    /// [`IdentityError::NoPreRotationBackend`] (surfaced as SCP-IDENT-1059) rather
-    /// than minting the in-memory `InMemoryPreRotationCustody` nullifier.
+    /// SCP-006 AC10: on a shipped (no-`testing`) build the production `Node` /
+    /// self-host identity-generation path has no substrate satisfying
+    /// §9.7.4.1 item 3a, so it FAILS CLOSED with
+    /// `NodeError::IdentityCreation(NoIndependentSubstrate)` (SCP-IDENT-1100)
+    /// rather than minting the in-memory `InMemoryPreRotationCustody` nullifier
+    /// (ADR-062 §Decision 6). The superseded `NoPreRotationBackend`
+    /// (SCP-IDENT-1059) fails this test.
     ///
     /// Gated `#[cfg(not(feature = "testing"))]`: the fail-closed behavior only
     /// holds when the nullifier is severed. `resolve_identity`'s `Generate` arm
@@ -4285,10 +4032,15 @@ mod tests {
         // The Ok type contains `Arc<DidDht<..>>` which is not `Debug`, so match
         // explicitly rather than `expect_err`.
         match resolve_identity(source).await {
-            Err(NodeError::Identity(IdentityError::NoPreRotationBackend)) => {}
-            Err(other) => panic!("expected NoPreRotationBackend (SCP-IDENT-1059), got: {other:?}"),
+            Err(NodeError::IdentityCreation(e)) => {
+                assert_eq!(e, scp_identity::IdentityError::NoIndependentSubstrate);
+                assert_eq!(e.code(), "SCP-IDENT-1100");
+            }
+            Err(other) => {
+                panic!("expected IdentityCreation(NoIndependentSubstrate), got: {other:?}")
+            }
             Ok(_) => panic!(
-                "expected fail-closed NoPreRotationBackend, got Ok — the in-memory \
+                "expected fail-closed NoIndependentSubstrate, got Ok — the in-memory \
                  pre-rotation nullifier was minted on a shipped-config create path!"
             ),
         }
@@ -4296,7 +4048,8 @@ mod tests {
 
     /// Companion to the above for the persisting create path
     /// (`resolve_identity_persistent`'s generate branch): it likewise funnels
-    /// through the pre-rotation commitment and fails closed on a shipped build.
+    /// through the same refusal and fails closed with SCP-IDENT-1100 on a
+    /// shipped build.
     #[cfg(not(feature = "testing"))]
     #[tokio::test]
     async fn pre_rotation_severance_persistent_fails_closed() {
@@ -4308,10 +4061,15 @@ mod tests {
         };
         let storage = InMemoryStorage::new();
         match resolve_identity_persistent(source, true, &storage).await {
-            Err(NodeError::Identity(IdentityError::NoPreRotationBackend)) => {}
-            Err(other) => panic!("expected NoPreRotationBackend (SCP-IDENT-1059), got: {other:?}"),
+            Err(NodeError::IdentityCreation(e)) => {
+                assert_eq!(e, scp_identity::IdentityError::NoIndependentSubstrate);
+                assert_eq!(e.code(), "SCP-IDENT-1100");
+            }
+            Err(other) => {
+                panic!("expected IdentityCreation(NoIndependentSubstrate), got: {other:?}")
+            }
             Ok(_) => panic!(
-                "expected fail-closed NoPreRotationBackend, got Ok — the in-memory \
+                "expected fail-closed NoIndependentSubstrate, got Ok — the in-memory \
                  pre-rotation nullifier was minted on a shipped-config persist create path!"
             ),
         }

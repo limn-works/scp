@@ -1091,7 +1091,7 @@ class SCP:
         section 3.2.2, and the identity's
         :attr:`~scp_sdk.Identity.custody_type` reports it. A build without the
         bridge's ``testing`` feature raises ``IdentityError`` with
-        ``SCP-IDENT-1059`` (:class:`~scp_sdk.types.CustodyType`).
+        ``SCP-IDENT-1100`` (:class:`~scp_sdk.types.CustodyType`).
 
         The blocking bridge call runs in :func:`asyncio.to_thread` so the
         provider's (potentially blocking) keystore operations do not stall the

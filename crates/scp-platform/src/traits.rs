@@ -1223,8 +1223,8 @@ pub enum PreRotationCustodyKind {
     /// §Decision 6) — a test-harness nullifier, never compiled into a shipped
     /// artifact. A production build therefore has *no* `PreRotationCustody`
     /// backend at all: identity creation fails closed with
-    /// `IdentityError::NoPreRotationBackend`, surfaced across every bridge as
-    /// `SCP-IDENT-1059`. Real backends (passkey-PRF, hardware token, Shamir,
+    /// `IdentityError::NoIndependentSubstrate`, surfaced across every bridge as
+    /// `SCP-IDENT-1100`. Real backends (passkey-PRF, hardware token, Shamir,
     /// …) are tracked by #1729 / RFC #2130.
     InMemory,
     /// FIDO2/U2F hardware security key. Highest security per §9.7.4.1 §4.
@@ -1345,7 +1345,7 @@ pub enum PreRotationCustodyKind {
 ///
 /// A shipped build consequently has no backend to select at all, and
 /// identity creation fails closed with
-/// `IdentityError::NoPreRotationBackend` (`SCP-IDENT-1059`) rather
+/// `IdentityError::NoIndependentSubstrate` (`SCP-IDENT-1100`) rather
 /// than substituting the nullifier. Production backends are tracked
 /// by #1729 / RFC #2130.
 ///

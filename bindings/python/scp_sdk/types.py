@@ -56,9 +56,9 @@ class CustodyType(enum.Enum):
       ``HOME`` is unset, empty or relative, or ``SCP_KEY_PASSPHRASE`` is unset
       or empty.
 
-    A build without the ``testing`` feature has no pre-rotation custody
-    backend, so an identity-creating call that passes these checks raises
-    ``IdentityError`` with ``SCP-IDENT-1059`` (ADR-062 Decision 6), a call to
+    A build without the ``testing`` feature has no independent next-set
+    substrate, so an identity-creating call that passes these checks raises
+    ``IdentityError`` with ``SCP-IDENT-1100`` (ADR-062 Decision 6), a call to
     :meth:`scp_sdk.SCP.identity_create_with_custody` included.  Only a
     ``testing`` build opens the key file, and it raises ``SCP-IDENT-1008`` when
     it cannot create ``$HOME/.scp`` or open the key file.

@@ -29,7 +29,7 @@ example that creates an identity takes a `KeyCustodyProvider`. The SDK ships no
 key store that `identityCreate(custody:)` reaches in a shipped build; the doc
 comment on `CustodyType` in `Sources/SCP/Types.swift` states how a shipped
 build answers each case, and a shipped build refuses every identity creation,
-`identityCreateWithCustody` included, with `SCP-IDENT-1059`. `AppleKeyCustody`
+`identityCreateWithCustody` included, with `SCP-IDENT-1100`. `AppleKeyCustody`
 is the SDK's `KeyCustodyProvider` over the Keychain, the `os_keystore` custody
 request of spec 03 §3.2.2:
 

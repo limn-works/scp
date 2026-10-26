@@ -1600,7 +1600,7 @@ pub(crate) struct NapiIdentityEntry {
     /// implementation is the in-memory nullifier `InMemoryPreRotationCustody`,
     /// which is severed from every production dependency line (ADR-062 §Decision
     /// 6). On a shipped (no-`testing`) build no identity can be created — every
-    /// production create path fails closed with `codes::IDENT_1059` before any
+    /// production create path fails closed with `codes::IDENT_1100` before any
     /// `NapiIdentityEntry` is built — so this field, and the type it names,
     /// exist only under `testing`.
     #[cfg(feature = "testing")]

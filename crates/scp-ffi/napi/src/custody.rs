@@ -18,7 +18,7 @@
 //!   `"os_keystore"` (spec `03-identity.md` §3.2.2).
 //! - `File` — the encrypted key file `FileKeyCustody`: custody
 //!   `"encrypted_file"` (feature-gated, since a shipped build refuses identity
-//!   creation with `SCP-IDENT-1059` before any key file opens).
+//!   creation with `SCP-IDENT-1100` before any key file opens).
 
 use std::fmt;
 
@@ -950,7 +950,7 @@ pub(crate) enum NapiKeyCustody {
     /// The encrypted key file at `$HOME/.scp/keys.bin`: custody
     /// `"encrypted_file"` (spec `03-identity.md` §3.2.2, spec §17.8).
     /// Gated on `testing`: a shipped build refuses identity creation with
-    /// `SCP-IDENT-1059` before any key file opens (ADR-062 §Decision 6), so
+    /// `SCP-IDENT-1100` before any key file opens (ADR-062 §Decision 6), so
     /// it never builds this variant.
     #[cfg(feature = "testing")]
     File(FileKeyCustody),
@@ -1185,8 +1185,8 @@ impl KeyCustody for NapiKeyCustody {
 ///
 /// [`select_key_custody`] builds it; `CustodySelection::open` opens it on a
 /// `testing` build, and `CustodySelection::refuse_create` refuses identity
-/// creation on a shipped build, which has no `PreRotationCustody` backend
-/// (ADR-062 §Decision 6).
+/// creation on a shipped build, where no substrate satisfies §9.7.4.1 item 3a
+/// (`SCP-IDENT-1100`).
 pub(crate) enum CustodySelection {
     /// `in_memory`, optionally seeded for the cross-bridge parity harness
     /// (ADR-046). A testing-build affordance (§3.2.2).
@@ -1281,12 +1281,11 @@ impl CustodySelection {
         Ok(std::sync::Arc::new(custody))
     }
 
-    /// Refuses identity creation on a shipped build with `SCP-IDENT-1059`
-    /// (ADR-062 §Decision 6), before anything opens.
+    /// Refuses identity creation on a shipped build with `SCP-IDENT-1100`
+    /// (`03-identity.md` §3.10.10), before anything opens.
     ///
-    /// Every identity commits a pre-rotation commitment at creation (spec
-    /// §9.7.4.1 item 5(a)), and a shipped build has no `PreRotationCustody`
-    /// backend. Refusing before `encrypted_file` opens keeps a failed call
+    /// No substrate satisfies the independent-residence requirement of
+    /// §9.7.4.1 item 3a on a shipped build. Refusing before `encrypted_file` opens keeps a failed call
     /// from leaving `$HOME/.scp/keys.bin` sealed under whatever passphrase was
     /// set, as the `PyO3` bridge's `open_custody_for_create` does.
     #[cfg(not(feature = "testing"))]
@@ -1295,7 +1294,7 @@ impl CustodySelection {
             Self::EncryptedFile(inputs) => drop(inputs),
             Self::OsKeystore(custody) => drop(custody),
         }
-        crate::identity::no_pre_rotation_backend()
+        crate::identity::no_independent_substrate()
     }
 }
 

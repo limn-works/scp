@@ -1127,11 +1127,12 @@ pub struct HostSiteReady {
 ///
 /// See the example at `crates/scp-node/examples/website.rs` and the guide
 /// `.docs/guides/self-hosting-a-website-on-scp.md`. Until a production
-/// `PreRotationCustody` backend exists, [`host_site`] and [`host_site_until`]
-/// fail on every build without the `testing` feature whenever the resolved
-/// `storage_path` directory holds no persisted identity, a first deployment
-/// included: they return [`HostSiteError::NodeBuild`] holding
-/// `NodeError::Identity(IdentityError::NoPreRotationBackend)` as a typed value,
+/// substrate satisfies `09-security-model.md` §9.7.4.1 item 3a, [`host_site`]
+/// and [`host_site_until`] fail on every build without the `testing` feature
+/// whenever the resolved `storage_path` directory holds no persisted identity,
+/// a first deployment included: they return [`HostSiteError::NodeBuild`]
+/// holding `NodeError::IdentityCreation(IdentityError::NoIndependentSubstrate)`
+/// (`SCP-IDENT-1100`) as a typed value,
 /// and the example exits 1 with it. A
 /// `testing` build creates the identity only through the test-harness
 /// `InMemoryPreRotationCustody` stand-in.
@@ -1339,9 +1340,9 @@ pub enum HostSiteError {
     #[error("DID method error: {0}")]
     DidMethod(String),
     /// The application node failed to build. Carries the typed [`NodeError`],
-    /// so a caller matches `NodeBuild(NodeError::Identity(
-    /// IdentityError::NoPreRotationBackend))` to detect a missing pre-rotation
-    /// custody backend without reading the message text. The `NodeError` text is
+    /// so a caller matches `NodeBuild(NodeError::IdentityCreation(
+    /// IdentityError::NoIndependentSubstrate))` to detect that no independent
+    /// next-set substrate exists without reading the message text. The `NodeError` text is
     /// in this variant's Display and not returned from `source()`, so a
     /// chain-walking reporter prints it once.
     #[error("node build error: {0}")]
@@ -1505,10 +1506,10 @@ fn lower_host_site_reach_tls(reach: &Reach, tls: &TlsMode) -> Result<(bool, bool
 ///
 /// On every build without the `testing` feature, returns
 /// [`HostSiteError::NodeBuild`] holding
-/// `NodeError::Identity(IdentityError::NoPreRotationBackend)` as a typed value
-/// whenever the resolved `storage_path` directory holds no persisted
-/// identity, because no production `PreRotationCustody` backend exists to
-/// create one.
+/// `NodeError::IdentityCreation(IdentityError::NoIndependentSubstrate)`
+/// (`SCP-IDENT-1100`) as a typed value whenever the resolved `storage_path`
+/// directory holds no persisted identity, because no substrate satisfying
+/// `09-security-model.md` §9.7.4.1 item 3a exists to create one.
 pub async fn host_site(config: HostSiteConfig) -> Result<(), HostSiteError> {
     let shutdown =
         scp_transport::shutdown::shutdown_signal().map_err(HostSiteError::ShutdownSignal)?;
@@ -3165,21 +3166,16 @@ mod tests {
         }
     }
 
-    /// `HostSiteError::NodeBuild` keeps the typed `NodeError`, so a caller
-    /// detects a missing pre-rotation backend by pattern, and the same pattern
-    /// rejects every other node-build failure. `NodeBuild` and `Deploy` each
-    /// print their wrapped error once, in Display, and return no `source()`.
+    /// `NodeBuild` and `Deploy` each print their wrapped error once, in
+    /// Display, and return no `source()`. That `host_site` returns the typed
+    /// `NodeBuild(IdentityCreation(NoIndependentSubstrate))` on a shipped build
+    /// is asserted over its real output by
+    /// `pre_rotation_severance_host_site_returns_typed_node_build`.
     #[test]
-    fn node_build_error_keeps_typed_no_pre_rotation_backend() {
-        let is_missing_backend = |e: &HostSiteError| {
-            matches!(
-                e,
-                HostSiteError::NodeBuild(NodeError::Identity(IdentityError::NoPreRotationBackend))
-            )
-        };
-        let missing =
-            HostSiteError::NodeBuild(NodeError::Identity(IdentityError::NoPreRotationBackend));
-        assert!(is_missing_backend(&missing));
+    fn node_build_and_deploy_errors_print_their_wrapped_error_once() {
+        let missing = HostSiteError::NodeBuild(NodeError::IdentityCreation(
+            scp_identity::IdentityError::NoIndependentSubstrate,
+        ));
         // The NodeError text is in Display only; returning it from `source()`
         // as well would print it twice in a chain-walking reporter.
         assert!(
@@ -3189,7 +3185,7 @@ mod tests {
         assert!(
             missing
                 .to_string()
-                .starts_with("node build error: identity error: no production pre-rotation"),
+                .starts_with("node build error: identity creation error: no substrate satisfies"),
             "Display keeps the message text: {missing}"
         );
 
@@ -3203,11 +3199,6 @@ mod tests {
             deploy.to_string(),
             "deploy error: failed to commit deploy: x"
         );
-
-        let other = HostSiteError::NodeBuild(NodeError::Nat("no tier".to_owned()));
-        assert!(!is_missing_backend(&other));
-        let other_config = HostSiteError::InvalidConfig("x".to_owned());
-        assert!(!is_missing_backend(&other_config));
     }
 
     /// A setup drain that times out or fails reaches the caller as the typed
@@ -3339,8 +3330,9 @@ mod tests {
     }
 
     /// On a build without `testing`, `host_site_until` over an empty storage
-    /// directory returns `HostSiteError::NodeBuild(NodeError::Identity(
-    /// IdentityError::NoPreRotationBackend))`, the typed value the rustdoc,
+    /// directory returns `HostSiteError::NodeBuild(NodeError::IdentityCreation(
+    /// IdentityError::NoIndependentSubstrate))` (SCP-IDENT-1100), the typed
+    /// value the rustdoc,
     /// `examples/website.rs`, and the deploying guide promise an embedder can
     /// match. The name carries `pre_rotation_severance` so the CI lane that
     /// runs `-p scp-node --lib -E 'test(pre_rotation_severance)'` without
@@ -3371,11 +3363,11 @@ mod tests {
         .await
         .expect("host_site_until must fail closed, not serve");
         match outcome {
-            Err(HostSiteError::NodeBuild(NodeError::Identity(
-                IdentityError::NoPreRotationBackend,
-            ))) => {}
+            Err(HostSiteError::NodeBuild(NodeError::IdentityCreation(e))) => {
+                assert_eq!(e.code(), "SCP-IDENT-1100");
+            }
             other => panic!(
-                "expected NodeBuild(Identity(NoPreRotationBackend)) on a build without \
+                "expected NodeBuild(IdentityCreation(NoIndependentSubstrate)) on a build without \
                  `testing`, got: {other:?}"
             ),
         }

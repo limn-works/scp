@@ -105,23 +105,26 @@ fn assert_refused(args: &[&str], self_host_env: Option<&str>, health: bool, refu
     );
 }
 
-/// `NodeError::Identity(IdentityError::NoPreRotationBackend)` displays the
-/// text `docs/guides/relay-operations.md` and `main.rs` tell an operator to
-/// search a shipped full node's log for, and its `Display` does not name the
-/// variant. This pins the `Display` string only. It does not run a node, so it
-/// does not prove that a shipped full node reaches this error or that `main`
-/// logs it with `%e`.
+/// `NodeError::IdentityCreation(IdentityError::NoIndependentSubstrate)`
+/// (`SCP-IDENT-1100`) displays the text `docs/guides/relay-operations.md` and
+/// `main.rs` tell an operator to search a shipped node's log for, and its
+/// `Display` does not name the variant. This pins the `Display` string only. It
+/// does not run a node, so it does not prove that a shipped full node reaches
+/// this error or that `main` logs it with `%e`. The superseded
+/// `NoPreRotationBackend` (`SCP-IDENT-1059`) text fails it.
 #[test]
-fn no_pre_rotation_backend_display_matches_documented_log_text() {
+fn no_independent_substrate_display_matches_documented_log_text() {
     let logged =
-        scp_node::NodeError::Identity(scp_identity::dht::IdentityError::NoPreRotationBackend)
+        scp_node::NodeError::IdentityCreation(scp_identity::IdentityError::NoIndependentSubstrate)
             .to_string();
     assert!(
-        logged.starts_with("identity error: no production pre-rotation custody backend available"),
+        logged.starts_with(
+            "identity creation error: no substrate satisfies the independent-residence requirement"
+        ),
         "the documented log text drifted from NodeError's Display: {logged}"
     );
     assert!(
-        !logged.contains("NoPreRotationBackend"),
+        !logged.contains("NoIndependentSubstrate"),
         "the log now names the variant; update the operator docs: {logged}"
     );
 }

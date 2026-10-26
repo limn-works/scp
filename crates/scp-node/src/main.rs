@@ -6,8 +6,8 @@
 //!    relay, and HTTP server (`.well-known/scp` + WebSocket upgrade). Uses
 //!    persistent `SQLite` storage by default (`SQLCipher` encrypted), and asks
 //!    for a newly generated identity on every run, so a shipped build logs
-//!    `no production pre-rotation custody backend available`
-//!    (`IdentityError::NoPreRotationBackend`) and exits 1.
+//!    `no substrate satisfies the independent-residence requirement`
+//!    (`IdentityError::NoIndependentSubstrate`, `SCP-IDENT-1100`) and exits 1.
 //! 2. **Relay-only** (`--relay-only`): Runs a bare [`RelayServer`], identical
 //!    to the standalone `scp-relay` binary.
 //! 3. **Ephemeral** (`--ephemeral`, `testing` builds only): Runs a full node
@@ -19,8 +19,8 @@
 //!    (`SCP_NODE_SELF_HOST_PLAINTEXT=1` for plain HTTP). A shipped build
 //!    starts only from a storage directory that already holds an identity;
 //!    given a directory that holds none it logs `self-host mode failed` with
-//!    `no production pre-rotation custody backend available`
-//!    (`IdentityError::NoPreRotationBackend`) and exits 1.
+//!    `no substrate satisfies the independent-residence requirement`
+//!    (`IdentityError::NoIndependentSubstrate`, `SCP-IDENT-1100`) and exits 1.
 //!
 //! Configuration is read from CLI flags and environment variables.
 
@@ -173,7 +173,7 @@ fn conflicting_modes(config: &CliConfig) -> Option<String> {
 /// The refusal a shipped build prints for `--ephemeral`.
 const EPHEMERAL_UNAVAILABLE: &str = "ERROR: --ephemeral is a test-harness mode (in-memory DHT/custody) and is not \
      available in this build. A shipped build creates no identity in any mode \
-     (no production pre-rotation custody backend available): the persistent full \
+     (no substrate satisfies the independent-residence requirement): the persistent full \
      node exits 1 on every run, and \
      --self-host starts only from a storage directory that already holds an \
      identity. Build with --features testing to run --ephemeral.";
@@ -216,8 +216,8 @@ OPTIONS:
                             for plain HTTP). See the loud startup banner for the full warning.
                             A shipped binary starts only from a storage directory that
                             already holds an identity; otherwise it logs 'self-host mode
-                            failed' ('no production pre-rotation custody backend
-                            available') and exits 1
+                            failed' ('no substrate satisfies the independent-residence
+                            requirement') and exits 1
     --site-dir <PATH>       Directory of static files to host in --self-host mode
                             (must contain index.html). Default: embedded site.
                             Also configurable via SCP_NODE_SITE_DIR env var
@@ -229,8 +229,8 @@ OPTIONS:
 ENVIRONMENT VARIABLES:
     SCP_NODE_DOMAIN             Domain for full node mode (required unless --relay-only
                                or --self-host). Full node mode is the default; a
-                               shipped binary's full node logs 'no production
-                               pre-rotation custody backend available' and exits 1
+                               shipped binary's full node logs 'no substrate
+                               satisfies the independent-residence requirement' and exits 1
     SCP_NODE_SELF_HOST         Set to '1' to enable self-host mode (same as --self-host)
     SCP_NODE_SITE_DIR          Static site directory for self-host mode (same as --site-dir)
     SCP_NODE_SELF_HOST_PORT    HTTP/site port for self-host mode (default: 8443)
@@ -594,8 +594,9 @@ fn validate_storage_path_or_exit(dir: &std::path::Path) {
 }
 
 /// Runs the full node with persistent `SQLite` storage (the default mode). A
-/// shipped build logs `no production pre-rotation custody backend available`
-/// (`IdentityError::NoPreRotationBackend`) and exits 1, because the node asks for
+/// shipped build logs `no substrate satisfies the independent-residence
+/// requirement` (`IdentityError::NoIndependentSubstrate`, `SCP-IDENT-1100`) and
+/// exits 1, because the node asks for
 /// a newly generated identity on every run.
 async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
     // Parse the blob backend before anything below creates the storage

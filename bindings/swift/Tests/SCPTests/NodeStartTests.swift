@@ -282,6 +282,7 @@
         ("SCP-STORAGE-8008", "Storage"),
         ("SCP-STORAGE-8009", "Storage"),
         ("SCP-IDENT-1063", "Identity"),
+        ("SCP-IDENT-1100", "Identity"),
         ("SCP-TRANS-5051", "Transport"),
         ("SCP-TRANS-5052", "Transport"),
         ("SCP-TRANS-5054", "Transport"),
