@@ -9844,16 +9844,6 @@ const EVENT_LOG_APPEND_ALLOWLIST: &[(&str, &str, &str)] = &[
         "forwards to `append_streaming_outlet_invoked_event`",
     ),
     (
-        "scp-runtime/src/context/lifecycle_helpers.rs",
-        "join_context",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/lifecycle_helpers.rs",
-        "leave_context",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
         "scp-runtime/src/context/actor/handlers/saga.rs",
         "commit_b_settle_finalize",
         "spec 17 §17.3, memory-first after the step",

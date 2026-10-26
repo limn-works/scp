@@ -232,14 +232,16 @@ pub fn evaluate_sybil_resistance(
 /// unified [`PerContextState`](crate::context::actor::state::PerContextState) (ADR-049 §Decision 1) — a cell-holder supplies
 /// the cache via `governance_class_c_mut().participation_cache_mut()` and the
 /// buffer via `receive_buffer_mut()`, so no whole `&mut GovernanceState` (and no
-/// `state_mut()`) is needed.
+/// `state_mut()`) is needed. `evidence` is the log and the queued units the join
+/// read before its MLS add, so this reads no log entry after the step (spec 17
+/// §17.3 "Event log write failures").
 pub fn post_join_bookkeeping(
     participation_cache: &mut std::collections::HashMap<
         String,
         scp_protocol::trust::participation::ParticipationRecord,
     >,
     receive_buffer: &scp_protocol::context::membership::ReceiveBuffer,
-    queued: &crate::context::actor::class_s::PendingLogUnits,
+    evidence: &super::governance_logic::PreStepEvidence,
     context_id: &str,
     member_did: &DID,
     now: u64,
@@ -251,14 +253,7 @@ pub fn post_join_bookkeeping(
         .unwrap_or([0u8; 32]);
     // Participation-record path consumes only the merged event set;
     // the consequence window anchor is not used here.
-    let (join_events, _convergent_now) =
-        super::governance_logic::event_log_entries_for_consequences_after_side_effect(
-            receive_buffer,
-            queued,
-            context_id,
-            now,
-            event_log,
-        );
+    let (join_events, _convergent_now) = evidence.events(&[], receive_buffer, now);
     if !join_events.is_empty()
         && let Ok(record) = scp_protocol::trust::participation::compute_participation_record(
             &join_events,

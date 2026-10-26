@@ -728,9 +728,9 @@ fn emit_failure_escalation(
 /// # Errors
 ///
 /// Returns the provider's read error ([`ContextError::EventLogFailed`] or
-/// [`ContextError::ContextNotRegistered`]). A caller whose operation has not
-/// yet taken its irreversible step fails with it; a caller whose operation
-/// already has uses [`event_log_entries_for_consequences_after_side_effect`].
+/// [`ContextError::ContextNotRegistered`]). The caller reads before its
+/// operation's irreversible step and fails with it; an evaluation that runs
+/// after the step uses the [`PreStepEvidence`] it read before the step.
 pub fn event_log_entries_for_consequences(
     receive_buffer: &ReceiveBuffer,
     queued: &PendingLogUnits,
@@ -867,30 +867,6 @@ impl PreStepEvidence {
         push_unwritten_leaves(&mut entries, staged.iter());
         merge_for_consequences(&entries, receive_buffer, now)
     }
-}
-
-/// [`event_log_entries_for_consequences`] for a caller whose operation already
-/// took its irreversible step and keeps the memory-first rule (governance
-/// finalize and the post-join participation update; spec 17 §17.3 "Event log
-/// write failures"): a failed read is logged and the evaluation runs over the
-/// receive buffer alone.
-pub(in crate::context) fn event_log_entries_for_consequences_after_side_effect(
-    receive_buffer: &ReceiveBuffer,
-    queued: &PendingLogUnits,
-    context_id: &str,
-    now: u64,
-    event_log: &dyn crate::context::builder::ContextEventLogProvider,
-) -> (Vec<scp_event_log::Event>, u64) {
-    event_log_entries_for_consequences(receive_buffer, queued, context_id, now, event_log)
-        .unwrap_or_else(|e| {
-            tracing::warn!(
-                context_id,
-                error = %e,
-                "the event log could not be read after the operation's side effect; \
-                 consequences are evaluated over the receive buffer alone"
-            );
-            merge_for_consequences(&[], receive_buffer, now)
-        })
 }
 
 /// Merges Source 1 (`log_entries`) with Source 2 (the receive buffer) for
@@ -1249,11 +1225,10 @@ mod convergence_tests {
         );
     }
 
-    /// An unreadable log is an error, never an empty log, and the
-    /// after-side-effect read logs it and evaluates over the receive buffer
-    /// alone (spec section 17.3, "Event log write failures").
+    /// An unreadable log is an error, never an empty log (spec section 17.3,
+    /// "Event log write failures").
     #[tokio::test]
-    async fn an_unreadable_log_is_an_error_except_after_the_side_effect() {
+    async fn an_unreadable_log_is_an_error() {
         let context_id_str = hex::encode(CTX_BYTES);
         let storage_key = crate::context::state::context_id_to_bytes(&context_id_str);
         let log = MerkleEventLogProvider::new();
@@ -1274,23 +1249,6 @@ mod convergence_tests {
                 Err(scp_protocol::context::ContextError::ContextNotRegistered(_))
             ),
             "an unreadable log is an error: {read:?}"
-        );
-        let (merged, convergent_now) = super::event_log_entries_for_consequences_after_side_effect(
-            &buffer,
-            &crate::context::actor::class_s::PendingLogUnits::default(),
-            &context_id_str,
-            1_700_000_100,
-            &log,
-        );
-        assert_eq!(
-            convergent_now, 1_700_000_100,
-            "no log evidence anchors the window"
-        );
-        assert!(
-            merged
-                .iter()
-                .any(|e| e.event_type == EventType::MessageSent),
-            "the receive buffer still feeds the evaluation"
         );
     }
 
