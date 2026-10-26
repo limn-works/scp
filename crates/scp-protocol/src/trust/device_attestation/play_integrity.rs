@@ -88,11 +88,11 @@ pub(super) struct PlayIntegrityRead<'a> {
     /// The key states the caller resolved for verifiers, each from a
     /// `Confirmed` or `Adopted` resolution, the only verdicts that yield one.
     pub(super) verifiers: &'a [&'a ResolvedState],
-    /// The reader's current time since the Unix epoch, at full precision:
-    /// check 4 compares its whole seconds with the verdict's timestamps, and
-    /// check 5 compares the time itself with the resolution instant, which
-    /// carries sub-second precision. One value serves both, so the two checks
-    /// cannot read different clocks.
+    /// The reader's current time since the Unix epoch. Check 4 compares it
+    /// with the verdict's whole-second timestamps, and check 5 with the
+    /// resolution instant, both at full precision, never truncated to whole
+    /// seconds. One value serves both, so the two checks cannot read
+    /// different clocks.
     pub(super) now: Duration,
     /// The service-record entry's `id`, which a `Verified` outcome carries.
     pub(super) entry_id: &'a str,
@@ -511,21 +511,22 @@ fn check_timestamp_order(state: &mut State<'_>) -> Result<(), Stop> {
 /// `token_issued_at` at most `checked_at`, this bounds both.
 fn check_not_yet_valid(state: &mut State<'_>) -> Result<(), Stop> {
     let verdict = state.verdict()?;
-    if verdict.checked_at > state.read.now.as_secs().saturating_add(CLOCK_SKEW_SECS) {
+    let skew = Duration::from_secs(CLOCK_SKEW_SECS);
+    if Duration::from_secs(verdict.checked_at) > state.read.now.saturating_add(skew) {
         return Err(reject(DeviceAttestationRejection::NotYetValid));
     }
     Ok(())
 }
 
-/// Check 4: the reader's time exceeds `token_issued_at` plus the maximum age.
+/// Check 4: the reader's time exceeds `token_issued_at` plus the maximum age,
+/// compared at the reader's full precision.
 fn check_max_age(state: &mut State<'_>) -> Result<(), Stop> {
     let verdict = state.verdict()?;
-    if state.read.now.as_secs()
-        > state
-            .read
-            .policy
-            .device_attestation_expiry(verdict.token_issued_at)
-    {
+    let expiry = state
+        .read
+        .policy
+        .device_attestation_expiry(verdict.token_issued_at);
+    if state.read.now > Duration::from_secs(expiry) {
         return Err(reject(DeviceAttestationRejection::Expired));
     }
     Ok(())

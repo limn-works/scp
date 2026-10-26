@@ -628,6 +628,13 @@ rejection_cases! {
         f.token_issued_at = NOW - MAX_AGE_SECS - 1;
         Ok(())
     };
+    // Check 4 compares at full precision: half a second past the maximum age
+    // is expired, which a reader truncating its time would read as on time.
+    issued_max_age_and_half_second_ago_expired: MaxAge => Rejected(R::Expired), |f| {
+        f.token_issued_at = NOW - MAX_AGE_SECS;
+        f.now = Duration::new(NOW, 500_000_000);
+        Ok(())
+    };
     // AC37.
     verifier_absent_from_list: VerifierKeyState => Unverifiable(U::VerifierKeyStateUnresolved), |f| {
         f.key_states.clear();
