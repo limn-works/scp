@@ -23627,7 +23627,7 @@ mod tests {
     #[tokio::test]
     #[allow(
         clippy::too_many_lines,
-        reason = "linear TTL-expiry retry fixture (setup + two-attempt drive + convergent-timestamp asserts + ADR-049 PR-4 floor-prune asserts); reads clearer unsplit"
+        reason = "linear TTL-expiry retry fixture (setup + two-attempt drive + convergent-timestamp asserts + ADR-049 Decision 9 Class-M floor-prune asserts); reads clearer unsplit"
     )]
     async fn retry_stamps_convergent_leaf_timestamp() {
         const T0: u64 = 1_700_000_000;
