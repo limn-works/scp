@@ -85,6 +85,7 @@ once_cell
 opaque-debug
 outref
 p256
+p384
 percent-encoding
 pin-project-lite
 polyval

@@ -158,6 +158,39 @@ fn policy_preimage(policy: ValidatedSybilPolicy<'_>) -> Result<Vec<u8>, Canonica
     Ok(preimage)
 }
 
+/// A binding digest `D` (§9.3.1), which only
+/// [`device_attestation_binding_digest`] builds.
+///
+/// The App Attest checks take a `BindingDigest`, never raw bytes, so no
+/// caller can have an attestation verified against a `D` it chose: the
+/// digest always covers an identifier, a context id and a challenge. The
+/// field is private, so code outside this module cannot build one.
+///
+/// ```compile_fail,E0423
+/// let forged = scp_protocol::trust::device_attestation::digest::BindingDigest([0; 32]);
+/// ```
+///
+/// The positive control: the type and its accessor are public, so the call
+/// above fails on the private field alone.
+///
+/// ```
+/// use scp_protocol::trust::device_attestation::digest::BindingDigest;
+/// fn bytes(d: &BindingDigest) -> [u8; 32] {
+///     *d.as_bytes()
+/// }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BindingDigest([u8; 32]);
+
+impl BindingDigest {
+    /// The digest's 32 bytes: the App Attest `clientDataHash`, and in
+    /// lowercase hexadecimal the Play Integrity `requestHash`.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
 /// The binding digest `D` (§9.3.1) over the identifier, the context and the
 /// challenge.
 ///
@@ -172,9 +205,9 @@ pub fn device_attestation_binding_digest(
     identifier: &Identifier,
     context_id: &str,
     challenge: &[u8; 32],
-) -> Result<[u8; 32], CanonicalError> {
+) -> Result<BindingDigest, CanonicalError> {
     let preimage = binding_preimage(BINDING_SEPARATOR, identifier, context_id, challenge)?;
-    Ok(Sha256::digest(preimage).into())
+    Ok(BindingDigest(Sha256::digest(preimage).into()))
 }
 
 /// The tag `T` (§9.3.1) an entry publishes in place of the challenge. It
@@ -350,9 +383,9 @@ mod tests {
         assert_eq!(preimage.len(), 122 + 5);
         assert_eq!(hex::encode(&preimage), D_PREIMAGE_HEX);
         let d = device_attestation_binding_digest(&subject(), "ctx-1", &challenge())?;
-        assert_eq!(hex::encode(d), D_HEX);
+        assert_eq!(hex::encode(d.as_bytes()), D_HEX);
         let other = device_attestation_binding_digest(&subject(), "ctx-2", &challenge())?;
-        assert_ne!(hex::encode(other), D_HEX);
+        assert_ne!(hex::encode(other.as_bytes()), D_HEX);
         Ok(())
     }
 
@@ -385,7 +418,7 @@ mod tests {
         assert_ne!(first, other_identity);
         assert_ne!(
             first,
-            device_attestation_binding_digest(&subject(), "ctx-1", &challenge())?
+            *device_attestation_binding_digest(&subject(), "ctx-1", &challenge())?.as_bytes()
         );
         Ok(())
     }
