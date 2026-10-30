@@ -36,23 +36,19 @@ mod tests;
 /// `recovery/{sha256_hex(credential_id)}/` (`17-persistence-and-storage.md`
 /// §17.3), and no store-set record: the record lives only in the
 /// platform-account member (§17.8). It is the one member whose entry may
-/// carry the `largeBlob` skip bit.
+/// carry the `largeBlob` skip bit. It holds no credential: each call keys on
+/// the credential its [`StoreSet`](scp_kel::recovery_store::StoreSet)
+/// passes.
 #[derive(Debug)]
 pub struct SdkLocalMember<S: EncryptedStorage> {
     storage: S,
-    entry_key: String,
-    credential_id: CredentialId,
 }
 
 impl<S: EncryptedStorage> SdkLocalMember<S> {
-    /// Binds `storage` to `credential_id`'s entry and events.
+    /// The member over `storage`.
     #[must_use]
-    pub fn new(storage: S, credential_id: &CredentialId) -> Self {
-        Self {
-            storage,
-            entry_key: credential_id.entry_key(),
-            credential_id: credential_id.clone(),
-        }
+    pub const fn new(storage: S) -> Self {
+        Self { storage }
     }
 
     async fn read_decoded<T>(
@@ -86,21 +82,30 @@ impl<S: EncryptedStorage> SdkLocalMember<S> {
 impl<S: EncryptedStorage> RecoveryHandleStore for SdkLocalMember<S> {
     type WriteFailure = StoreWriteFailure;
 
-    async fn read_entry(&self) -> MemberRead<StoreEntry> {
-        self.read_decoded(&self.entry_key, |bytes| {
+    async fn read_entry(&self, credential_id: &CredentialId) -> MemberRead<StoreEntry> {
+        self.read_decoded(&credential_id.entry_key(), |bytes| {
             decode_entry(bytes, EntrySource::SdkLocal)
         })
         .await
     }
 
-    async fn write_entry(&self, entry: &StoreEntry) -> Result<(), StoreWriteFailure> {
-        self.store(&self.entry_key, &encode_entry(entry)).await
+    async fn write_entry(
+        &self,
+        credential_id: &CredentialId,
+        entry: &StoreEntry,
+    ) -> Result<(), StoreWriteFailure> {
+        self.store(&credential_id.entry_key(), &encode_entry(entry))
+            .await
     }
 }
 
 impl<S: EncryptedStorage> RecoveryEventStore for SdkLocalMember<S> {
-    async fn read_event(&self, event_digest: &[u8; 32]) -> MemberRead<Vec<u8>> {
-        self.read_decoded(&self.credential_id.event_key(event_digest), |bytes| {
+    async fn read_event(
+        &self,
+        credential_id: &CredentialId,
+        event_digest: &[u8; 32],
+    ) -> MemberRead<Vec<u8>> {
+        self.read_decoded(&credential_id.event_key(event_digest), |bytes| {
             check_event_length(bytes).map(|()| Some(bytes.to_vec()))
         })
         .await
@@ -108,10 +113,11 @@ impl<S: EncryptedStorage> RecoveryEventStore for SdkLocalMember<S> {
 
     async fn write_event(
         &self,
+        credential_id: &CredentialId,
         event_digest: &[u8; 32],
         event: &[u8],
     ) -> Result<(), StoreWriteFailure> {
-        self.store(&self.credential_id.event_key(event_digest), event)
+        self.store(&credential_id.event_key(event_digest), event)
             .await
     }
 }

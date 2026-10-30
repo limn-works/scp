@@ -124,7 +124,6 @@ struct View {
 struct ScriptedStore {
     db: Arc<Db>,
     view: Arc<View>,
-    credential: CredentialId,
 }
 
 impl ScriptedStore {
@@ -141,7 +140,6 @@ impl ScriptedStore {
                 frozen: Mutex::new(None),
                 before_write: Mutex::new(None),
             }),
-            credential: credential(),
         }
     }
 
@@ -212,24 +210,21 @@ impl ScriptedStore {
     }
 
     fn entry(&self) -> Option<StoreEntry> {
-        let bytes = self.raw(&self.credential.entry_key())?;
+        let bytes = self.raw(&credential().entry_key())?;
         decode_entry(&bytes, self.view.source).ok().flatten()
     }
 
     fn put_entry(&self, entry: &StoreEntry) {
-        self.put_raw(&self.credential.entry_key(), encode_entry(entry));
+        self.put_raw(&credential().entry_key(), encode_entry(entry));
     }
 
     fn record(&self) -> Option<StoreSetRecord> {
-        let bytes = self.raw(&self.credential.record_key())?;
+        let bytes = self.raw(&credential().record_key())?;
         decode_store_set_record(&bytes).ok()
     }
 
     fn put_record(&self, record: &StoreSetRecord) {
-        self.put_raw(
-            &self.credential.record_key(),
-            encode_store_set_record(record),
-        );
+        self.put_raw(&credential().record_key(), encode_store_set_record(record));
     }
 
     fn read<T>(
@@ -273,55 +268,68 @@ impl ScriptedStore {
 impl RecoveryHandleStore for ScriptedStore {
     type WriteFailure = StoreWriteFailure;
 
-    async fn read_entry(&self) -> MemberRead<StoreEntry> {
+    async fn read_entry(&self, credential_id: &CredentialId) -> MemberRead<StoreEntry> {
         let source = self.view.source;
-        self.read(KeyKind::Entry, &self.credential.entry_key(), |bytes| {
+        self.read(KeyKind::Entry, &credential_id.entry_key(), |bytes| {
             decode_entry(bytes, source)
         })
     }
 
-    async fn write_entry(&self, entry: &StoreEntry) -> Result<(), StoreWriteFailure> {
+    async fn write_entry(
+        &self,
+        credential_id: &CredentialId,
+        entry: &StoreEntry,
+    ) -> Result<(), StoreWriteFailure> {
         self.write(
             KeyKind::Entry,
-            &self.credential.entry_key(),
+            &credential_id.entry_key(),
             encode_entry(entry),
         )
     }
 }
 
 impl RecoveryEventStore for ScriptedStore {
-    async fn read_event(&self, event_digest: &[u8; 32]) -> MemberRead<Vec<u8>> {
+    async fn read_event(
+        &self,
+        credential_id: &CredentialId,
+        event_digest: &[u8; 32],
+    ) -> MemberRead<Vec<u8>> {
         self.read(
             KeyKind::Event,
-            &self.credential.event_key(event_digest),
+            &credential_id.event_key(event_digest),
             |bytes| check_event_length(bytes).map(|()| Some(bytes.to_vec())),
         )
     }
 
     async fn write_event(
         &self,
+        credential_id: &CredentialId,
         event_digest: &[u8; 32],
         event: &[u8],
     ) -> Result<(), StoreWriteFailure> {
         self.write(
             KeyKind::Event,
-            &self.credential.event_key(event_digest),
+            &credential_id.event_key(event_digest),
             event.to_vec(),
         )
     }
 }
 
 impl RecoveryRecordStore for ScriptedStore {
-    async fn read_record(&self) -> MemberRead<StoreSetRecord> {
-        self.read(KeyKind::Record, &self.credential.record_key(), |bytes| {
+    async fn read_record(&self, credential_id: &CredentialId) -> MemberRead<StoreSetRecord> {
+        self.read(KeyKind::Record, &credential_id.record_key(), |bytes| {
             decode_store_set_record(bytes).map(Some)
         })
     }
 
-    async fn write_record(&self, record: &StoreSetRecord) -> Result<(), StoreWriteFailure> {
+    async fn write_record(
+        &self,
+        credential_id: &CredentialId,
+        record: &StoreSetRecord,
+    ) -> Result<(), StoreWriteFailure> {
         self.write(
             KeyKind::Record,
-            &self.credential.record_key(),
+            &credential_id.record_key(),
             encode_store_set_record(record),
         )
     }
@@ -398,7 +406,7 @@ impl ScriptedBlob {
 impl RecoveryHandleStore for ScriptedBlob {
     type WriteFailure = LargeBlobNotLanded;
 
-    async fn read_entry(&self) -> MemberRead<StoreEntry> {
+    async fn read_entry(&self, _credential_id: &CredentialId) -> MemberRead<StoreEntry> {
         if self.db.fail_read.load(Ordering::SeqCst) {
             return MemberRead::NotReached(NotReachedCause::Unreachable {
                 cause: "injected largeBlob read failure".to_owned(),
@@ -413,7 +421,11 @@ impl RecoveryHandleStore for ScriptedBlob {
         })
     }
 
-    async fn write_entry(&self, entry: &StoreEntry) -> Result<(), LargeBlobNotLanded> {
+    async fn write_entry(
+        &self,
+        _credential_id: &CredentialId,
+        entry: &StoreEntry,
+    ) -> Result<(), LargeBlobNotLanded> {
         let hook = lock(&self.view.before_write).take();
         if let Some(hook) = hook {
             hook();

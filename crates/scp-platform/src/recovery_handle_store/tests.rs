@@ -185,10 +185,10 @@ const fn marker(sequence: u64, digest: u8) -> LastRevealMarker {
 #[test]
 fn local_member_keys_are_the_hashed_credential() -> TestResult {
     let storage = Arc::new(TestStorage::default());
-    let member = SdkLocalMember::new(Arc::clone(&storage), &credential()?);
+    let member = SdkLocalMember::new(Arc::clone(&storage));
     let entry = StoreEntry::new(Some(handle(0x11, RecoveryPhase::Composed)), None);
-    run(member.write_entry(&entry))?;
-    run(member.write_event(&[0x22; 32], b"signed event"))?;
+    run(member.write_entry(&credential()?, &entry))?;
+    run(member.write_event(&credential()?, &[0x22; 32], b"signed event"))?;
     let entry_key = format!("recovery/{C1_COMPONENT}/entry");
     let event_key = format!("recovery/{C1_COMPONENT}/event/{}", "22".repeat(32));
     assert_eq!(storage.keys(), vec![entry_key.clone(), event_key]);
@@ -201,16 +201,25 @@ fn local_member_keys_are_the_hashed_credential() -> TestResult {
 #[test]
 fn local_member_round_trips_the_skip_bit_and_reads_empty() -> TestResult {
     let storage = Arc::new(TestStorage::default());
-    let member = SdkLocalMember::new(Arc::clone(&storage), &credential()?);
-    assert_eq!(run(member.read_entry()), MemberRead::ReachedEmpty);
+    let member = SdkLocalMember::new(Arc::clone(&storage));
+    assert_eq!(
+        run(member.read_entry(&credential()?)),
+        MemberRead::ReachedEmpty
+    );
     let skipped = StoreEntry::large_blob_skipped(
         handle(0x11, RecoveryPhase::Composed),
         Some(marker(3, 0x33)),
     );
-    run(member.write_entry(&skipped))?;
-    assert_eq!(run(member.read_entry()), MemberRead::Reached(skipped));
+    run(member.write_entry(&credential()?, &skipped))?;
+    assert_eq!(
+        run(member.read_entry(&credential()?)),
+        MemberRead::Reached(skipped)
+    );
     storage.set_raw(&credential()?.entry_key(), &[0x00])?;
-    assert_eq!(run(member.read_entry()), MemberRead::ReachedEmpty);
+    assert_eq!(
+        run(member.read_entry(&credential()?)),
+        MemberRead::ReachedEmpty
+    );
     Ok(())
 }
 
@@ -219,16 +228,16 @@ fn local_member_round_trips_the_skip_bit_and_reads_empty() -> TestResult {
 #[test]
 fn local_member_storage_failures_are_typed() -> TestResult {
     let storage = Arc::new(TestStorage::default());
-    let member = SdkLocalMember::new(Arc::clone(&storage), &credential()?);
+    let member = SdkLocalMember::new(Arc::clone(&storage));
     storage.fail_reads.store(true, Ordering::SeqCst);
-    let read = run(member.read_entry());
+    let read = run(member.read_entry(&credential()?));
     let MemberRead::NotReached(NotReachedCause::Unreachable { cause }) = read else {
         return Err(format!("expected Unreachable, got {read:?}").into());
     };
     assert!(cause.contains("injected read failure"), "{cause}");
     storage.fail_reads.store(false, Ordering::SeqCst);
     storage.fail_writes.store(true, Ordering::SeqCst);
-    let written = run(member.write_entry(&StoreEntry::EMPTY));
+    let written = run(member.write_entry(&credential()?, &StoreEntry::EMPTY));
     let Err(StoreWriteFailure { cause }) = written else {
         return Err(format!("expected a write failure, got {written:?}").into());
     };
@@ -242,17 +251,17 @@ fn local_member_storage_failures_are_typed() -> TestResult {
 fn local_member_refuses_undecodable_bytes() -> TestResult {
     let storage = Arc::new(TestStorage::default());
     let credential = credential()?;
-    let member = SdkLocalMember::new(Arc::clone(&storage), &credential);
+    let member = SdkLocalMember::new(Arc::clone(&storage));
     storage.set_raw(&credential.entry_key(), &[0x08])?;
     assert_eq!(
-        run(member.read_entry()),
+        run(member.read_entry(&credential)),
         MemberRead::NotReached(NotReachedCause::Undecodable(
             RecordDecodeError::UnknownFlags(0x08)
         ))
     );
     storage.set_raw(&credential.event_key(&[0x22; 32]), &[])?;
     assert_eq!(
-        run(member.read_event(&[0x22; 32])),
+        run(member.read_event(&credential, &[0x22; 32])),
         MemberRead::NotReached(NotReachedCause::Undecodable(
             RecordDecodeError::EventLength(0)
         ))
@@ -303,7 +312,7 @@ fn two_storage_instances_over_one_database_share_the_lease() -> TestResult {
     let database = Arc::new(TestStorage::default());
     let leases_for_db = RecoveryLeases::new();
     let first = run(StoreSet::open(
-        local_only(Arc::clone(&database))?,
+        local_only(Arc::clone(&database)),
         leases_for_db.acquire(credential()?, identifier())?,
     ))?;
     let second_instance = Arc::clone(&database);
@@ -315,7 +324,7 @@ fn two_storage_instances_over_one_database_share_the_lease() -> TestResult {
     }
     drop(first);
     let second = run(StoreSet::open(
-        local_only(second_instance)?,
+        local_only(second_instance),
         leases_for_db.acquire(credential()?, identifier())?,
     ))?;
     assert!(run(second.read_set())?.pending().is_empty());
@@ -329,7 +338,7 @@ fn a_local_only_set_composes_through_the_local_member() -> TestResult {
     let database = Arc::new(TestStorage::default());
     let leases = RecoveryLeases::new();
     let mut set = run(StoreSet::open(
-        local_only(Arc::clone(&database))?,
+        local_only(Arc::clone(&database)),
         leases.acquire(credential()?, identifier())?,
     ))?;
     let report = run(set.compose(RevealKind::Abandons, [0x44; 32], None))?;
@@ -352,12 +361,12 @@ fn a_local_only_set_composes_through_the_local_member() -> TestResult {
 
 type LocalOnly = StoreSetMembers<SdkLocalMember<Arc<TestStorage>>, NoPlatformAccount, NoLargeBlob>;
 
-fn local_only(storage: Arc<TestStorage>) -> Result<LocalOnly, Box<dyn std::error::Error>> {
-    Ok(StoreSetMembers {
-        sdk_local: SdkLocalMember::new(storage, &credential()?),
+const fn local_only(storage: Arc<TestStorage>) -> LocalOnly {
+    StoreSetMembers {
+        sdk_local: SdkLocalMember::new(storage),
         platform_account: PlatformAccountSlot::Absent(
             PlatformAccountAbsence::NoDataApiToCredentialSyncStore,
         ),
         large_blob: None,
-    })
+    }
 }

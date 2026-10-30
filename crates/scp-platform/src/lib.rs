@@ -100,7 +100,8 @@ pub use error::{PlatformError, PushFailureKind};
 pub use recovery_handle_store::{RecoveryLease, RecoveryLeases, SdkLocalMember};
 // The store set (09-security-model.md §9.7.4.2 R10; SCP-311) lives in the
 // wasm-safe scp-kel so a browser member implements the same traits; these
-// names are re-exported so a platform adapter needs no direct scp-kel import.
+// names, the §17.8 codecs included, are re-exported so a platform adapter
+// needs no direct scp-kel import.
 pub use scp_kel::recovery_store::{
     AdvanceTarget, CosignHold, CredentialId, CredentialIdError, CredentialStore, EntrySource,
     LAST_REVEAL_MARKER_BYTES, LargeBlobClearingAct, LargeBlobMembership, LargeBlobNotLanded,
@@ -110,7 +111,8 @@ pub use scp_kel::recovery_store::{
     RecoveryEventStore, RecoveryHandle, RecoveryHandleStore, RecoveryPhase, RecoveryRecordStore,
     RecoveryStoreError, RemovalBasis, RemovalCause, RemovalReport, RevealKind, SetLease, SetRead,
     StoreEntry, StoreRead, StoreSet, StoreSetMembers, StoreSetRecord, StoreWriteFailure,
-    WriteReport,
+    WriteReport, check_event_length, decode_entry, decode_store_set_record, encode_entry,
+    encode_store_set_record,
 };
 pub use scp_kel::{
     CustodyProbe, IndexedSignature, KeyEventSignError, KeyEventSigner, MaybeSend, ProbeSignature,

@@ -75,6 +75,9 @@ pub mod bridge;
 pub mod outlet_stream;
 pub mod p256_host;
 pub mod push;
+// The host impls that adapt `SyncedStoreProvider` and
+// `CredentialBlobProvider` to the store-set members of scp-ffi-common.
+pub mod recovery_hosts;
 pub mod runtime;
 pub mod scp;
 // Test-only custody handle and P-256 oracles for host tests; never in a
@@ -734,6 +737,133 @@ pub trait DeviceAttestationProvider: Send + Sync {
     /// Returns the platform assertion object bytes (Apple: CBOR assertion;
     /// Android: integrity verdict).
     async fn assert_request(&self, request_hash: Vec<u8>) -> Result<Vec<u8>, ScpError>;
+}
+
+/// What the platform reported for a `largeBlob` write.
+///
+/// It is a platform fact, never a clearing act. The bridge maps each fact to
+/// the act that clears a write that did not land (`09-security-model.md`
+/// §9.7.4.2 R10; ADR-054 §Assertion-arm and store-set host interfaces), so
+/// the host never picks one.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum BlobWriteOutcome {
+    /// The platform reported `largeBlob: { written: true }`.
+    Landed,
+    /// The platform reported `largeBlob: { written: false }` with no error.
+    /// The bridge reads it as the authenticator's large-blob array at
+    /// capacity, cleared by removing the credential that consumed it. A
+    /// credential that does not support `largeBlob` also reports it; its
+    /// store never holds a handle or a marker, so it never stops a ceremony.
+    NotWritten,
+    /// The assertion returned no `largeBlob` output: the client or route did
+    /// not process the extension. The bridge reads it as cleared by a retry
+    /// through a route that processes it, never by a plain retry.
+    NoOutput,
+    /// The user declined or cancelled the verification gesture. The bridge
+    /// reads it as cleared by a retry.
+    VerificationDeclined {
+        /// The cause the platform reported, where it reported one.
+        cause: Option<String>,
+    },
+}
+
+/// Callback for the pre-rotation credential's `WebAuthn` `largeBlob` store.
+///
+/// It is one member of the credential's store set (`09-security-model.md`
+/// §9.7.4.2 R10; ADR-054 §Assertion-arm and store-set host interfaces).
+///
+/// The Swift and Kotlin SDKs implement it over the platform passkey API's
+/// `largeBlob` extension.
+///
+/// The bridge encodes and decodes every byte; the host passes them through
+/// unread, and reads and writes the store of `credential_id` and no other.
+///
+/// Host contract (ADR-054):
+/// - `write_blob` reports what the platform reported and never picks a
+///   clearing act. It returns [`BlobWriteOutcome::Landed`] only where the
+///   platform reports `written: true`; the store set reads no `largeBlob`
+///   write back, so a false `Landed` leaves a member behind the ceremony.
+///   `written: false` with no error is `NotWritten`, a missing `largeBlob`
+///   output is `NoOutput`, and a declined or cancelled verification gesture
+///   is `VerificationDeclined`.
+/// - `read_blob` returns `nil`/`null` only where the platform reports the
+///   store holds nothing, and throws on every other failure.
+/// - Freshness (ADR-054, one rule for both store-set hosts): `read_blob`
+///   returns the platform's current value, read through a `largeBlob` read
+///   assertion on that call, and never a cache or the bytes of the host's
+///   last write.
+/// - A host that cannot answer throws `ScpError.Storage` with the code
+///   `SCP-STORAGE-8016` and the platform's error text: `UniFFI` panics on
+///   any other error a callback throws, and the bridge reads only the text.
+///   A thrown `write_blob` reaches the store set as a write that did not
+///   land, cleared by a retry.
+///
+/// # SAFETY: Thread execution context
+///
+/// `UniFFI` callbacks execute on Rust tokio threads, NOT the Swift/Kotlin main
+/// thread. All implementations MUST be thread-safe (`Send + Sync`) and MUST
+/// NOT assume main-thread execution.
+///
+/// See sdk-common.md §"FFI Async Bridging Risks" rule 2.
+#[uniffi::export(callback_interface)]
+#[async_trait::async_trait]
+pub trait CredentialBlobProvider: Send + Sync {
+    /// Read the bytes `credential_id`'s `largeBlob` store holds, or `None`
+    /// where it holds none.
+    async fn read_blob(&self, credential_id: Vec<u8>) -> Result<Option<Vec<u8>>, ScpError>;
+
+    /// Write `entry` into `credential_id`'s `largeBlob` store and report
+    /// what the platform reported.
+    async fn write_blob(
+        &self,
+        credential_id: Vec<u8>,
+        entry: Vec<u8>,
+    ) -> Result<BlobWriteOutcome, ScpError>;
+}
+
+/// Callback for the platform account's synced store.
+///
+/// It is the platform-account member of the pre-rotation credential's store
+/// set (`09-security-model.md` §9.7.4.2 R10; ADR-054 §Assertion-arm and
+/// store-set host interfaces).
+///
+/// Swift SDK: a synchronizable generic-password Keychain item
+/// (`kSecAttrSynchronizable`) in the application's access group. A host
+/// whose row of the R10 platform-account host table is Absent (Android, the
+/// browser, headless) implements none.
+///
+/// The bridge forms every key and encodes every value; the host stores the
+/// bytes unread.
+///
+/// Host contract (ADR-054):
+/// - `get` returns `nil`/`null` only where the platform reports the item
+///   absent, and throws on every other platform failure, so a store that
+///   failed to answer is never read as an empty one.
+/// - Freshness (ADR-054, one rule for both store-set hosts): `get` returns
+///   the platform's current value, read from the platform store on that
+///   call, and never a cache: the store set merges every member's current
+///   value and reads each write back to check it.
+/// - `put` returns only after the platform reports the item stored.
+/// - A host that cannot answer throws `ScpError.Storage` with the code
+///   `SCP-STORAGE-8016` and the platform's error text: `UniFFI` panics on
+///   any other error a callback throws, and the bridge reads only the text.
+///
+/// # SAFETY: Thread execution context
+///
+/// `UniFFI` callbacks execute on Rust tokio threads, NOT the Swift/Kotlin main
+/// thread. All implementations MUST be thread-safe (`Send + Sync`) and MUST
+/// NOT assume main-thread execution.
+///
+/// See sdk-common.md §"FFI Async Bridging Risks" rule 2.
+#[uniffi::export(callback_interface)]
+#[async_trait::async_trait]
+pub trait SyncedStoreProvider: Send + Sync {
+    /// Read the bytes stored under `key`, or `None` where the platform
+    /// reports the item absent.
+    async fn get(&self, key: String) -> Result<Option<Vec<u8>>, ScpError>;
+
+    /// Store `value` under `key`, replacing any value there.
+    async fn put(&self, key: String, value: Vec<u8>) -> Result<(), ScpError>;
 }
 
 // ---------------------------------------------------------------------------
