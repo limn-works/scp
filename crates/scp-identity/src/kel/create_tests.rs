@@ -1336,60 +1336,77 @@ async fn a_failed_cleanup_is_listed_and_abandoned() -> TestResult {
     Ok(())
 }
 
+/// Polls `F` with `handle` entered, so every task `F` spawns lands on that
+/// runtime while the test's own runtime drives `F`.
+struct SpawnOn<F> {
+    handle: tokio::runtime::Handle,
+    future: std::pin::Pin<Box<F>>,
+}
+
+impl<F: Future> Future for SpawnOn<F> {
+    type Output = F::Output;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<F::Output> {
+        let _entered = self.handle.clone().enter();
+        self.future.as_mut().poll(cx)
+    }
+}
+
 // AC21: a runtime that shuts down mid-create cancels the task before any
 // cleanup runs. `create` then reports every minted key as possibly live,
 // never an empty list, and `unfinished` lists the creation that names them.
-#[test]
-fn a_cancelled_create_reports_every_minted_key() -> TestResult {
+#[tokio::test]
+async fn a_cancelled_create_reports_every_minted_key() -> TestResult {
     let rec = Arc::new(Rec::default());
     rec.hold_active_generate.store(true, Ordering::SeqCst);
     let config = desktop(&rec);
+    // `create` spawns its composition onto `doomed`, which shuts down while
+    // `#active`'s generation is held, so the composition is cancelled.
     let doomed = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
         .enable_all()
         .build()?;
-    let mut create = Box::pin(Identity::create(config.clone(), one_root()));
-    doomed.block_on(async {
-        tokio::select! {
-            biased;
-            () = rec.active_held.notified() => Ok(()),
-            _ = &mut create => Err("create finished before #active"),
-        }
-    })?;
+    let mut create = SpawnOn {
+        handle: doomed.handle().clone(),
+        future: Box::pin(Identity::create(config.clone(), one_root())),
+    };
+    tokio::select! {
+        biased;
+        () = rec.active_held.notified() => {}
+        _ = &mut create => return Err("create finished before #active".into()),
+    }
     doomed.shutdown_background();
 
-    let after = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    after.block_on(async {
-        let error = create.await.err().ok_or("create succeeded")?;
-        assert_eq!(error.error, IdentityError::PersistFailed);
-        let Some(CleanupFailure::NotAttempted {
-            creation,
-            composition,
-            minted,
-        }) = error.cleanup.map(|cleanup| *cleanup)
-        else {
-            return Err("the cancelled create did not report NotAttempted".into());
-        };
-        let next = *lock(&rec.next).first().ok_or("no next-set member")?;
-        let root = *lock(&rec.keys).first().ok_or("no #0")?;
-        assert_eq!(composition, None);
-        assert_eq!(
-            minted,
-            [
-                UndestroyedKey::NextSetMember(next),
-                UndestroyedKey::Key(root)
-            ]
-        );
-        assert_eq!(rec.live(), 2);
-        let listed = Unfinished::Creation(creation);
-        assert_eq!(Identity::unfinished(&config).await?, [listed]);
-        Identity::abandon_unfinished(&config, &listed).await?;
-        assert_eq!(rec.live(), 0);
-        assert!(records(&config.persistence).await?.is_empty());
-        Ok(())
-    })
+    let error = create.await.err().ok_or("create succeeded")?;
+    assert_eq!(error.error, IdentityError::PersistFailed);
+    let Some(CleanupFailure::NotAttempted {
+        creation,
+        composition,
+        minted,
+    }) = error.cleanup.map(|cleanup| *cleanup)
+    else {
+        return Err("the cancelled create did not report NotAttempted".into());
+    };
+    let next = *lock(&rec.next).first().ok_or("no next-set member")?;
+    let root = *lock(&rec.keys).first().ok_or("no #0")?;
+    assert_eq!(composition, None);
+    assert_eq!(
+        minted,
+        [
+            UndestroyedKey::NextSetMember(next),
+            UndestroyedKey::Key(root)
+        ]
+    );
+    assert_eq!(rec.live(), 2);
+    let listed = Unfinished::Creation(creation);
+    assert_eq!(Identity::unfinished(&config).await?, [listed]);
+    Identity::abandon_unfinished(&config, &listed).await?;
+    assert_eq!(rec.live(), 0);
+    assert!(records(&config.persistence).await?.is_empty());
+    Ok(())
 }
 
 // AC21: a composition whose abandon failed is listed, and
