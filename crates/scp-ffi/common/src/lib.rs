@@ -129,6 +129,12 @@ pub mod custody_parse;
 #[cfg(feature = "custody")]
 pub mod callback_custody;
 
+// The store set's platform-account and `largeBlob` members over host
+// callbacks (09-security-model.md §9.7.4.2 R10, 17-persistence-and-storage.md
+// §17.8; ADR-054 §Assertion-arm and store-set host interfaces).
+#[cfg(feature = "custody")]
+pub mod callback_store;
+
 // The custody record store over the instance storage and the namespace
 // table that admits one live store per namespace within one bridge instance
 // (spec §17.3). Each bridge instance holds one table.
