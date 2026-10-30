@@ -949,8 +949,6 @@ pub async fn send_message(
     spending_ucan: Option<&UcanToken>,
 ) -> Result<(), ContextError> {
     let context_id = handle.context_id().to_owned();
-    // ADR-056: canonical digest, not a re-hash of the hex id.
-    let context_id_bytes = state::context_id_to_bytes(&context_id);
 
     // Pre-economy active + commit-fault gates run FIRST (matching the legacy
     // ordering: `require_active` → `check_commit_fault_marker` → signer-`None` →
@@ -1233,15 +1231,22 @@ pub async fn send_message(
     }
 
     // The consequence evaluation after the send reads the log as it stands
-    // before the send, plus the queued log units (spec 17 §17.3 "Event log
-    // write failures"). An unreadable log refuses the send before anything
-    // leaves: the economy reservation and the sequence are reversed.
-    let log_entries = match crate::context::governance_logic::read_consequence_log(
+    // before the send, plus the queued log units, and the participation record
+    // binds the log's Merkle root as it stands before the send (spec 17 §17.3
+    // "Event log write failures"). An unreadable log or root refuses the send
+    // before anything leaves: the economy reservation and the sequence are
+    // reversed.
+    let pre_send_read = crate::context::governance_logic::read_consequence_log(
         &cell.class_s.pending_log_units,
         &context_id,
         &*deps.event_log,
-    ) {
-        Ok(entries) => entries,
+    )
+    .and_then(|entries| {
+        crate::context::participation::ParticipationRoot::read(&context_id, &*deps.event_log)
+            .map(|root| (entries, root))
+    });
+    let (log_entries, participation_root) = match pre_send_read {
+        Ok(read) => read,
         Err(e) => {
             if !is_broadcast {
                 cell.class_c_view()
@@ -1335,7 +1340,6 @@ pub async fn send_message(
         cell,
         deps,
         &context_id,
-        &context_id_bytes,
         sender_did,
         sequence,
         payload,
@@ -1343,6 +1347,7 @@ pub async fn send_message(
         // periodic checkpoint only under `MessageSigner::Active`.
         signer,
         &log_entries,
+        participation_root,
     )
     .await;
 
@@ -2154,34 +2159,19 @@ fn record_payment_capture_failure(
 
 /// Computes and caches the sender's participation record after a send.
 /// Factored out of [`finalize_send`] to keep that function within the line
-/// budget; pure bookkeeping with no error path (a missing Merkle root or a
-/// zero-count record is simply not cached).
+/// budget. `root` is the log's Merkle root [`send_message`] read before the
+/// send, so this reads nothing and has no error path; a zero-count record is
+/// not cached.
 fn record_send_participation(
     view: &mut ClassCMut,
-    deps: &ActorDeps,
+    root: crate::context::participation::ParticipationRoot,
     context_id: &str,
-    context_id_bytes: &[u8; 32],
     sender_did: &DID,
     send_events: &[scp_event_log::Event],
     now: u64,
 ) {
-    let send_merkle = deps
-        .event_log
-        .event_log_merkle_root(context_id_bytes)
-        .unwrap_or([0u8; 32]);
     if !send_events.is_empty()
-        && let Ok(record) = scp_protocol::trust::participation::compute_participation_record(
-            send_events,
-            sender_did.as_ref(),
-            context_id,
-            send_merkle,
-            now,
-            // attestation_count is a credential-layer, verifier-relative fact
-            // (§7.3.2); this messaging path gates only on participation_count and
-            // has no attestation-cache access, so it passes an empty accessible-
-            // attestation set (count 0) by design — NOT a stub.
-            &[],
-        )
+        && let Ok(record) = root.record(send_events, sender_did.as_ref(), context_id, now)
         && record.participation_count > 0
     {
         view.governance_class_c_mut()
@@ -2198,7 +2188,9 @@ fn record_send_participation(
 /// `log_entries` is the durable log plus the queued log units, read by
 /// [`send_message`] before the send
 /// ([`read_consequence_log`](crate::context::governance_logic::read_consequence_log));
-/// the evaluation merges it with the receive buffer. The consequence leaves go
+/// the evaluation merges it with the receive buffer. `participation_root` is
+/// the log's Merkle root, read by [`send_message`] beside `log_entries`, which
+/// the sender's participation record binds. The consequence leaves go
 /// into a [`ConsequenceSink`](crate::context::log_unit_helpers::ConsequenceSink)
 /// whose discharge queues them as one pending log unit in the same fail-closed
 /// keep persist as their mutations (ADR-049 §9, RED-CS3), then drains the
@@ -2219,12 +2211,12 @@ pub async fn finalize_send(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
-    context_id_bytes: &[u8; 32],
     sender_did: &DID,
     sequence: u64,
     payload: &[u8],
     signer: MessageSigner<'_>,
     log_entries: &[scp_event_log::Event],
+    participation_root: crate::context::participation::ParticipationRoot,
 ) -> Result<(), ContextError> {
     // `MessageSent` is not a durable Merkle leaf — per ADR-051 §6 / the
     // phase-2.md ADR-011 amendment exclusion taxonomy §2 it is a per-author,
@@ -2295,9 +2287,8 @@ pub async fn finalize_send(
         // Participation record (#1530).
         record_send_participation(
             &mut view,
-            deps,
+            participation_root,
             context_id,
-            context_id_bytes,
             sender_did,
             &send_events,
             now,
@@ -4545,6 +4536,16 @@ mod pseudonym_routing_tests {
             Ok(None)
         }
 
+        /// The fixture holds no entry, so its root is the empty log's root.
+        fn event_log_merkle_root(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok(scp_event_log::tree::root(&scp_event_log::EventLog::new(
+                String::new(),
+            )))
+        }
+
         async fn init_event_log(
             &self,
             _id: &[u8; 32],
@@ -4762,6 +4763,16 @@ mod pseudonym_routing_tests {
         ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
         {
             Ok(None)
+        }
+
+        /// The fixture holds no entry, so its root is the empty log's root.
+        fn event_log_merkle_root(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok(scp_event_log::tree::root(&scp_event_log::EventLog::new(
+                String::new(),
+            )))
         }
 
         async fn init_event_log(
@@ -5354,6 +5365,87 @@ mod log_unit_family_tests {
         );
     }
 
+    /// Spec 17 §17.3 ("Event log write failures"): the send reads the
+    /// participation root beside the log before anything leaves, so a root
+    /// that cannot be read refuses the send: the reserved sequence is rolled
+    /// back, nothing reaches the transport or the queue, and no participation
+    /// record is cached.
+    #[tokio::test]
+    async fn send_refuses_when_the_participation_root_read_fails() {
+        let ctx_id_bytes = [0x62u8; 32];
+        let ctx = hex::encode(ctx_id_bytes);
+        let member = DID(MEMBER.to_owned());
+        let (deps, snapshots) =
+            crate::context::log_unit_helpers::test_support::deps_over_root_refusing_log(
+                OWNER, &ctx,
+            )
+            .await;
+        let mut state = PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            1_700_000_000,
+            DID(OWNER.to_owned()),
+        );
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .expect("transition to Active");
+        state
+            .membership
+            .add_member(member.clone(), "member".to_owned(), Vec::new());
+        state.members.insert(member.clone());
+        state.role_state.members.insert(MEMBER.to_owned());
+        state.role_state.member_capabilities.insert(
+            MEMBER.to_owned(),
+            std::iter::once(Capability::MessagesWrite).collect(),
+        );
+        // An announcement addresses the shared routing ID, so the send
+        // reaches its pre-send read without a peer pseudonym.
+        state.routing.set_local_pseudonym([0x63u8; 32]);
+        let handle = state.handle.clone();
+        let mut cell = ClassSCell::new(state);
+        let sequence_before = cell
+            .membership
+            .get(MEMBER)
+            .expect("the sender is a member")
+            .sequence_number;
+
+        let sent = crate::context::messaging_helpers::send_pseudonym_announcement(
+            &mut cell,
+            &deps,
+            &handle,
+            &member,
+            &crate::context::actor::signer::CommandSigner::local_ed25519(
+                ed25519_dalek::SigningKey::from_bytes(&[0x64u8; 32]),
+            ),
+        )
+        .await;
+
+        assert!(
+            matches!(sent, Err(ContextError::EventLogFailed(_))),
+            "the send fails with the root read error: got {sent:?}"
+        );
+        assert_eq!(
+            cell.membership
+                .get(MEMBER)
+                .expect("the sender is a member")
+                .sequence_number,
+            sequence_before,
+            "the reserved sequence is rolled back"
+        );
+        assert!(
+            cell.governance.participation_cache.is_empty(),
+            "no participation record is cached"
+        );
+        assert!(
+            cell.class_s.pending_log_units.is_empty(),
+            "no record is queued"
+        );
+        assert!(
+            snapshots.snapshot(&ctx).await.is_none(),
+            "nothing is persisted"
+        );
+    }
+
     mod finalize_send {
         use super::*;
 
@@ -5375,12 +5467,14 @@ mod log_unit_family_tests {
                 deps.event_log.as_ref(),
             )
             .expect("the log reads before the send");
+            let root =
+                crate::context::participation::ParticipationRoot::read(&ctx, &*deps.event_log)
+                    .expect("the root reads before the send");
 
             let sent = crate::context::messaging_helpers::finalize_send(
                 &mut cell,
                 &deps,
                 &ctx,
-                &ctx_id_bytes,
                 &member,
                 reserved,
                 b"sent",
@@ -5390,6 +5484,7 @@ mod log_unit_family_tests {
                     ),
                 ),
                 &log_entries,
+                root,
             )
             .await;
 
@@ -5746,6 +5841,16 @@ pub mod dropped_supervisor_tests {
         ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
         {
             Ok(None)
+        }
+
+        /// The fixture holds no entry, so its root is the empty log's root.
+        fn event_log_merkle_root(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok(scp_event_log::tree::root(&scp_event_log::EventLog::new(
+                String::new(),
+            )))
         }
 
         async fn init_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {

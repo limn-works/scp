@@ -2273,6 +2273,16 @@ mod tests {
             ) -> Result<Option<Vec<scp_event_log::Event>>, ContextError> {
                 Ok(None)
             }
+
+            /// The fixture holds no entry, so its root is the empty log's root.
+            fn event_log_merkle_root(
+                &self,
+                _context_id: &[u8; 32],
+            ) -> Result<[u8; 32], ContextError> {
+                Ok(scp_event_log::tree::root(&scp_event_log::EventLog::new(
+                    String::new(),
+                )))
+            }
         }
 
         // ADR-049 §15: `ContextManager` is gone. Build the

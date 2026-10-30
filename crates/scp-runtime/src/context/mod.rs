@@ -51,6 +51,7 @@ pub(crate) mod log_unit_helpers;
 pub(crate) mod manager_methods;
 pub(crate) mod messaging_helpers;
 pub(crate) mod outlets_helpers;
+pub mod participation;
 pub mod persistence;
 pub mod policy;
 pub mod providers;

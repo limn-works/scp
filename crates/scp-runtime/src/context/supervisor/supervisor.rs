@@ -16764,6 +16764,8 @@ impl Supervisor {
         // irreversible: if the elapse lands AFTER the consume the KeyPackage is
         // already spent (the same accepted cost as a crash), but the rollback still
         // leaves no half-keyed crypto or orphaned durable snapshot resident.
+        // Raised by step 3c before it initializes the joiner's event log.
+        let joiner_log_written = std::sync::atomic::AtomicBool::new(false);
         let spawn_outcome: Result<crate::context::ContextHandle, ContextError> =
             match tokio::time::timeout(
                 Self::LIFECYCLE_TIMEOUT,
@@ -17010,6 +17012,23 @@ impl Supervisor {
                         )));
                     }
 
+                    // 3c. Initialize the joiner's event log, as a create does (spec
+                    //     17 §17.3): the participation root every send, proposal,
+                    //     and outlet reserve reads, and every log unit the actor
+                    //     writes, live in this log. The flag goes up before the
+                    //     init, so a join that fails or times out from here on
+                    //     destroys whatever the init wrote.
+                    joiner_log_written.store(true, std::sync::atomic::Ordering::SeqCst);
+                    if let Err(e) = deps.event_log.init_event_log(&context_id_bytes).await {
+                        // Rollback path: no attestation is built here, so the
+                        // disposal outcome has no reader.
+                        let _ = state.dispose_secrets();
+                        return Err(ContextError::EventLogFailed(format!(
+                            "spawn-from-Welcome: initializing the event log of \
+                             '{context_id}' failed: {e}"
+                        )));
+                    }
+
                     // 4. Write the joiner's first `last_relay_contact` (ADR-029
                     //    Implementation), then persist the initial Class-S snapshot
                     //    FAIL-CLOSED, both BEFORE the spawn is acked: the member's history
@@ -17100,13 +17119,31 @@ impl Supervisor {
         drop(bootstrap_guard);
         // A failed or timed-out join puts back what step 4 wrote; a no-op after
         // the spawn committed or when step 4 never ran.
+        // The joiner's event log goes first, while `first_state` still claims
+        // the id, so no other operation over the id can initialize a log the
+        // destroy would remove.
         let spawn_outcome = match spawn_outcome {
-            Err(e) => match first_state.rollback(self.bootstrap_spawn_lock.lock()).await {
-                Ok(()) => Err(e),
-                Err(rollback) => Err(crate::context::lifecycle_helpers::fold_rollback_failure(
-                    &e, &rollback,
-                )),
-            },
+            Err(e) => {
+                let e = if joiner_log_written.load(std::sync::atomic::Ordering::SeqCst) {
+                    match deps.event_log.destroy_event_log(&context_id_bytes).await {
+                        Ok(()) => e,
+                        Err(destroy) => crate::context::lifecycle_helpers::fold_rollback_failure(
+                            &e,
+                            &ContextError::EventLogFailed(format!(
+                                "destroying the event log of '{context_id}' failed: {destroy}"
+                            )),
+                        ),
+                    }
+                } else {
+                    e
+                };
+                match first_state.rollback(self.bootstrap_spawn_lock.lock()).await {
+                    Ok(()) => Err(e),
+                    Err(rollback) => Err(crate::context::lifecycle_helpers::fold_rollback_failure(
+                        &e, &rollback,
+                    )),
+                }
+            }
             ok => ok,
         };
         // Propagate a step-internal error or the timeout error; on success bind the
@@ -21455,6 +21492,14 @@ mod tests {
             Ok(None)
         }
 
+        /// The fixture holds no entry, so its root is the empty log's root.
+        fn event_log_merkle_root(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok(crate::context::participation::test_support::empty_tree_root())
+        }
+
         async fn init_event_log(
             &self,
             _context_id: &[u8; 32],
@@ -24868,6 +24913,8 @@ mod tests {
         // A settle request for a context that has no actor registered.
         let ticket = crate::context::outlets_helpers::OutletEconomyTicket::new_for_test_no_escrow(
             invoker.clone(),
+            crate::context::participation::test_support::empty_log_root()
+                .expect("the empty log's root"),
         );
         let request = crate::context::outlets_helpers::OutletSettleRequest::Rollback {
             generation: 1,
@@ -26953,6 +27000,16 @@ mod tests {
             Ok(None)
         }
 
+        /// The fixture holds no entry, so its root is the empty log's root.
+        fn event_log_merkle_root(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok(scp_event_log::tree::root(&scp_event_log::EventLog::new(
+                String::new(),
+            )))
+        }
+
         async fn init_event_log(
             &self,
             _id: &[u8; 32],
@@ -27001,6 +27058,16 @@ mod tests {
         ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
         {
             Ok(None)
+        }
+
+        /// The fixture holds no entry, so its root is the empty log's root.
+        fn event_log_merkle_root(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok(scp_event_log::tree::root(&scp_event_log::EventLog::new(
+                String::new(),
+            )))
         }
 
         async fn init_event_log(
@@ -27992,6 +28059,16 @@ mod tests {
         ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
         {
             Ok(None)
+        }
+
+        /// The fixture holds no entry, so its root is the empty log's root.
+        fn event_log_merkle_root(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok(scp_event_log::tree::root(&scp_event_log::EventLog::new(
+                String::new(),
+            )))
         }
 
         async fn init_event_log(
@@ -35712,12 +35789,13 @@ mod tests {
             &mut cell,
             &deps,
             &ctx_key,
-            &ctx_id_bytes,
             &sender,
             1,
             b"free",
             crate::context::supervisor::MessageSigner::Active(&signing_key),
             &[],
+            crate::context::participation::ParticipationRoot::read(&ctx_key, &*deps.event_log)
+                .expect("the root reads before the send"),
         )
         .await;
         assert!(
@@ -35764,12 +35842,13 @@ mod tests {
             &mut cell,
             &deps,
             &ctx_key,
-            &ctx_id_bytes,
             &sender,
             0,
             b"agent",
             MessageSigner::Agent(&agent),
             &[],
+            crate::context::participation::ParticipationRoot::read(&ctx_key, &*deps.event_log)
+                .expect("the root reads before the send"),
         )
         .await
         .unwrap();
@@ -35783,12 +35862,13 @@ mod tests {
             &mut cell,
             &deps,
             &ctx_key,
-            &ctx_id_bytes,
             &sender,
             1,
             b"active",
             MessageSigner::Active(&active),
             &[],
+            crate::context::participation::ParticipationRoot::read(&ctx_key, &*deps.event_log)
+                .expect("the root reads before the send"),
         )
         .await
         .unwrap();
@@ -36906,12 +36986,13 @@ mod tests {
             &mut cell,
             &deps,
             &ctx_key,
-            &ctx_id_bytes,
             &sender,
             reserved,
             b"sent",
             crate::context::supervisor::MessageSigner::Active(&signing_key),
             &[],
+            crate::context::participation::ParticipationRoot::read(&ctx_key, &*deps.event_log)
+                .expect("the root reads before the send"),
         )
         .await;
         let state = cell.into_inner();
@@ -36957,6 +37038,41 @@ mod tests {
     struct RecordingEventLog {
         events: Arc<std::sync::Mutex<Vec<RecordedEvent>>>,
     }
+    impl RecordingEventLog {
+        /// The recorded appends for `context_id` as a hash-chained Merkle log,
+        /// so the entries and the root this fixture answers describe one log.
+        fn recorded_log(
+            &self,
+            context_id: &[u8; 32],
+        ) -> Result<scp_event_log::EventLog, scp_protocol::context::ContextError> {
+            let to_failure = |e: scp_event_log::EventLogError| {
+                scp_protocol::context::ContextError::EventLogFailed(e.to_string())
+            };
+            let events = self
+                .events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let mut log = scp_event_log::EventLog::new(hex::encode(context_id));
+            let mut prev_hash = scp_event_log::tree::GENESIS_PREV_HASH;
+            for (sequence, (_, event_type, actor, data, timestamp)) in
+                (0u64..).zip(events.into_iter().filter(|(id, ..)| id == context_id))
+            {
+                let event = scp_event_log::Event {
+                    event_type,
+                    actor_did: DID(actor),
+                    timestamp,
+                    sequence,
+                    payload: scp_event_log::EventPayload { data },
+                    prev_hash,
+                    signature: Vec::new(),
+                };
+                prev_hash = scp_event_log::tree::leaf_hash(&event).map_err(to_failure)?;
+                scp_event_log::tree::append_unsigned_event(&mut log, &event).map_err(to_failure)?;
+            }
+            Ok(log)
+        }
+    }
     #[async_trait::async_trait]
     impl crate::context::builder::ContextEventLogProvider for RecordingEventLog {
         /// The recorded appends for `context_id`, in order, so the drain of
@@ -36968,27 +37084,15 @@ mod tests {
             context_id: &[u8; 32],
         ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
         {
-            let events = self
-                .events
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
-            Ok(Some(
-                (0u64..)
-                    .zip(events.into_iter().filter(|(id, ..)| id == context_id))
-                    .map(|(sequence, (_, event_type, actor, data, timestamp))| {
-                        scp_event_log::Event {
-                            event_type,
-                            actor_did: DID(actor),
-                            timestamp,
-                            sequence,
-                            payload: scp_event_log::EventPayload { data },
-                            prev_hash: [0u8; 32],
-                            signature: Vec::new(),
-                        }
-                    })
-                    .collect(),
-            ))
+            Ok(Some(self.recorded_log(context_id)?.events().to_vec()))
+        }
+
+        /// The root of the recorded appends for `context_id`.
+        fn event_log_merkle_root(
+            &self,
+            context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok(scp_event_log::tree::root(&self.recorded_log(context_id)?))
         }
 
         async fn init_event_log(
@@ -42343,6 +42447,8 @@ mod tests {
         // in `OutletEconomyTicket::drop` would fire.
         let ticket = crate::context::outlets_helpers::OutletEconomyTicket::new_for_test_no_escrow(
             DID("did:dht:z6MkHoldRepair".to_owned()),
+            crate::context::participation::test_support::empty_log_root()
+                .expect("the empty log's root"),
         );
         ticket.hold_external_for_repair();
         // Reaching here without a drop-guard panic proves the carrier was marked
@@ -42462,7 +42568,11 @@ mod tests {
             evaluated_cost: Amount(50),
         };
         let ticket = crate::context::outlets_helpers::OutletEconomyTicket::new_for_test_with_escrow(
-            invoker, escrow, policy,
+            invoker,
+            escrow,
+            policy,
+            crate::context::participation::test_support::empty_log_root()
+                .expect("the empty log's root"),
         );
         let reservation = crate::context::outlets_helpers::OutletEconomyReservation {
             handle,
@@ -42559,8 +42669,11 @@ mod tests {
             &scp_clock::SystemClock,
         )
         .unwrap();
-        let ticket =
-            crate::context::outlets_helpers::OutletEconomyTicket::new_for_test_no_escrow(invoker);
+        let ticket = crate::context::outlets_helpers::OutletEconomyTicket::new_for_test_no_escrow(
+            invoker,
+            crate::context::participation::test_support::empty_log_root()
+                .expect("the empty log's root"),
+        );
         let reservation = crate::context::outlets_helpers::OutletEconomyReservation {
             handle,
             role_state,

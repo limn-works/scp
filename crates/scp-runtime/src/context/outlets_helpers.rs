@@ -155,6 +155,10 @@ pub struct OutletEconomyTicket {
     /// The consequence rules and the log read before the outlet ran, for the
     /// evaluation after it (spec 17 §17.3 "Event log write failures").
     consequence_evidence: crate::context::governance_logic::PreStepEvidence,
+    /// The log's Merkle root read before the outlet ran, which the invoker's
+    /// participation record binds after it (spec 17 §17.3 "Event log write
+    /// failures").
+    participation_root: crate::context::participation::ParticipationRoot,
     needs_hard_rate_limit_refund: bool,
     consumed: bool,
 }
@@ -202,7 +206,10 @@ impl OutletEconomyTicket {
     /// the private ticket fields. No payment escrow ⇒
     /// `void_external_and_consume` is a pure consume.
     #[cfg(any(test, feature = "testing"))]
-    pub fn new_for_test_no_escrow(actor_did: DID) -> Self {
+    pub fn new_for_test_no_escrow(
+        actor_did: DID,
+        participation_root: crate::context::participation::ParticipationRoot,
+    ) -> Self {
         let tracker = scp_protocol::economy::antispam::SenderVelocityTracker::new(60);
         let velocity_token = tracker.record_message(&actor_did, 0);
         Self {
@@ -213,6 +220,7 @@ impl OutletEconomyTicket {
             policy_for_capture: None,
             metrics_for_capture: ObservableMetrics::default(),
             consequence_evidence: crate::context::governance_logic::PreStepEvidence::default(),
+            participation_root,
             needs_hard_rate_limit_refund: true,
             consumed: false,
         }
@@ -229,6 +237,7 @@ impl OutletEconomyTicket {
         actor_did: DID,
         escrow: PreparedAction,
         policy: scp_protocol::economy::types::EconomicPolicy,
+        participation_root: crate::context::participation::ParticipationRoot,
     ) -> Self {
         let tracker = scp_protocol::economy::antispam::SenderVelocityTracker::new(60);
         let velocity_token = tracker.record_message(&actor_did, 0);
@@ -240,6 +249,7 @@ impl OutletEconomyTicket {
             policy_for_capture: Some(policy),
             metrics_for_capture: ObservableMetrics::default(),
             consequence_evidence: crate::context::governance_logic::PreStepEvidence::default(),
+            participation_root,
             needs_hard_rate_limit_refund: true,
             consumed: false,
         }
@@ -722,6 +732,7 @@ pub async fn reserve_outlet_economy(
     let economic_policy;
     let action_cost;
     let consequence_evidence;
+    let participation_root;
     {
         let mut view = cell.class_c_view();
 
@@ -774,11 +785,11 @@ pub async fn reserve_outlet_economy(
         economic_policy = gov.economic_policy_mut().clone();
 
         // Before the outlet runs or any budget is debited: an unreadable log
-        // fails the invocation, and the velocity tick and hard-rate token
-        // taken above are returned (spec section 17.3, "Event log write
-        // failures").
-        // The same read is the evidence for the evaluation after the outlet
-        // runs, which reads nothing itself.
+        // or log root fails the invocation, and the velocity tick and
+        // hard-rate token taken above are returned (spec section 17.3, "Event
+        // log write failures").
+        // The same reads are the evidence and the participation root for the
+        // bookkeeping after the outlet runs, which reads nothing itself.
         let rules = view
             .governance_class_c_mut()
             .consequence_rules_mut()
@@ -790,13 +801,18 @@ pub async fn reserve_outlet_economy(
             context_id,
             event_log.as_ref(),
         )
-        .map(|evidence| {
+        .and_then(|evidence| {
+            crate::context::participation::ParticipationRoot::read(context_id, event_log.as_ref())
+                .map(|root| (evidence, root))
+        })
+        .map(|(evidence, root)| {
             let merged = evidence.events(&[], receive_buffer, now_secs);
-            (evidence, merged)
+            (evidence, root, merged)
         });
         let (events_snapshot, convergent_now) = match read {
-            Ok((evidence, merged)) => {
+            Ok((evidence, root, merged)) => {
                 consequence_evidence = evidence;
+                participation_root = root;
                 merged
             }
             Err(e) => {
@@ -810,7 +826,7 @@ pub async fn reserve_outlet_economy(
 
         let mut participation_cache: HashMap<
             String,
-            scp_protocol::trust::participation::ParticipationRecord,
+            crate::context::participation::RootedParticipationRecord,
         > = HashMap::new();
 
         action_cost = {
@@ -829,7 +845,10 @@ pub async fn reserve_outlet_economy(
                     now: now_secs,
                     events: &events_snapshot,
                     convergent_now,
-                    participation_cache: &mut participation_cache,
+                    participation: crate::context::outlets::invoke::OutletParticipation {
+                        root: participation_root,
+                        cache: &mut participation_cache,
+                    },
                     consequence_rules: borrows.consequence_rules,
                     payment_adapter: payment_adapter.clone(),
                     metrics: metrics.clone(),
@@ -1156,6 +1175,7 @@ pub async fn reserve_outlet_economy(
         policy_for_capture: economic_policy,
         metrics_for_capture: metrics,
         consequence_evidence,
+        participation_root,
         needs_hard_rate_limit_refund: true,
         consumed: false,
     };
@@ -2400,7 +2420,10 @@ pub async fn settle_outlet_economy_capture(
         context_id,
         now,
         convergent_now,
-        view.governance_class_c_mut().participation_cache_mut(),
+        crate::context::outlets::invoke::OutletParticipation {
+            root: ticket.participation_root,
+            cache: view.governance_class_c_mut().participation_cache_mut(),
+        },
         &consequence_rules,
     );
 
@@ -3253,8 +3276,11 @@ mod tests {
         assert!(try_consume_hard_rate_limit(cell.class_c_view(), &did, 10));
     }
 
-    fn ticket_with_budget(did: &DID) -> OutletEconomyTicket {
-        OutletEconomyTicket::new_for_test_no_escrow(did.clone())
+    fn ticket_with_budget(did: &DID) -> Result<OutletEconomyTicket, crate::context::ContextError> {
+        Ok(OutletEconomyTicket::new_for_test_no_escrow(
+            did.clone(),
+            crate::context::participation::test_support::empty_log_root()?,
+        ))
     }
 
     /// `OutletSettleRequest::generation()` reports the reservation's
@@ -3262,12 +3288,12 @@ mod tests {
     /// ticket back so the orchestrator can reverse it on an unreachable
     /// settle.
     #[test]
-    fn settle_request_exposes_generation_and_ticket() {
+    fn settle_request_exposes_generation_and_ticket() -> Result<(), crate::context::ContextError> {
         let did = test_did();
 
         let capture = OutletSettleRequest::Capture {
             generation: 42,
-            ticket: ticket_with_budget(&did),
+            ticket: ticket_with_budget(&did)?,
         };
         assert_eq!(capture.generation(), 42);
         // Consume the reclaimed ticket so its Drop balance guard does not
@@ -3276,10 +3302,11 @@ mod tests {
 
         let rollback = OutletSettleRequest::Rollback {
             generation: 7,
-            ticket: ticket_with_budget(&did),
+            ticket: ticket_with_budget(&did)?,
         };
         assert_eq!(rollback.generation(), 7);
         rollback.into_ticket().consume_abandoning_escrow();
+        Ok(())
     }
 
     /// The unreachable-actor reversal path
@@ -3289,11 +3316,13 @@ mod tests {
     /// payment adapter there is no external escrow to void, so this is a
     /// pure consume; reaching the end without a panic is the assertion.
     #[tokio::test]
-    async fn void_external_and_consume_consumes_ticket_without_panic() {
+    async fn void_external_and_consume_consumes_ticket_without_panic()
+    -> Result<(), crate::context::ContextError> {
         let did = test_did();
-        let ticket = ticket_with_budget(&did);
+        let ticket = ticket_with_budget(&did)?;
         ticket.void_external_and_consume(None).await;
         // No panic on Drop ⇒ the ticket was consumed.
+        Ok(())
     }
 
     /// ADR-049 §9 (RED-CS3): the outlet-settle CAPTURE-FAILURE path must NOT
@@ -3467,6 +3496,8 @@ mod tests {
                     evaluated_cost: Amount(50),
                 },
                 paid_policy(),
+                crate::context::participation::test_support::empty_log_root()
+                    .expect("the empty log's root"),
             )
         }
 
@@ -3614,7 +3645,8 @@ mod tests {
         /// suspension and the committed ticket) and queues the leaves as one
         /// unit; the capture succeeds.
         #[tokio::test]
-        async fn append_failure_after_side_effect_keeps_step_and_queues_leaf() {
+        async fn append_failure_after_side_effect_keeps_step_and_queues_leaf()
+        -> Result<(), crate::context::ContextError> {
             let ctx_id_bytes = [0x7bu8; 32];
             let ctx = hex::encode(ctx_id_bytes);
             let invoker = DID(INVOKER.to_owned());
@@ -3639,8 +3671,13 @@ mod tests {
 
             // The reserve reads the log before the outlet runs and carries the
             // read on the ticket.
-            let mut ticket =
-                super::super::OutletEconomyTicket::new_for_test_no_escrow(invoker.clone());
+            let mut ticket = super::super::OutletEconomyTicket::new_for_test_no_escrow(
+                invoker.clone(),
+                crate::context::participation::ParticipationRoot::read(
+                    &ctx,
+                    deps.event_log.as_ref(),
+                )?,
+            );
             ticket.consequence_evidence =
                 crate::context::log_unit_helpers::test_support::pre_step_evidence(
                     &cell,
@@ -3676,6 +3713,7 @@ mod tests {
                 1,
                 "only the seeded warning is logged"
             );
+            Ok(())
         }
     }
 
@@ -4227,10 +4265,17 @@ mod tests {
                 mls_storage,
             );
             crate::context::supervisor::supervisor::leak_for_test(&supervisor);
-            supervisor
+            let deps = supervisor
                 .build_actor_deps_loaded(&DID(INVOKER.to_owned()))
                 .await
-                .expect("build_actor_deps")
+                .expect("build_actor_deps");
+            // The reserve reads the context's participation root, so the
+            // context has a log, as a created context does.
+            deps.event_log
+                .init_event_log(&crate::context::state::context_id_to_bytes(&ctx_key()))
+                .await
+                .expect("init log");
+            deps
         }
 
         fn active_state() -> PerContextState {
@@ -4374,6 +4419,63 @@ mod tests {
             assert!(
                 !super::super::try_consume_hard_rate_limit(cell.class_c_view(), &invoker, now),
                 "exactly the one token the reserve took comes back"
+            );
+        }
+
+        /// Spec section 17.3 ("Event log write failures"): the reserve reads
+        /// the participation root beside its evidence, before the outlet
+        /// runs, so a root that cannot be read fails the reserve with the
+        /// read error, hands back the velocity tick and the hard-rate token
+        /// it took, and caches no participation record.
+        #[tokio::test]
+        async fn reserve_refuses_when_the_participation_root_read_fails() {
+            let mut deps = build_deps(Box::new(OkPersistence)).await;
+            deps.event_log = Arc::new(
+                crate::context::participation::test_support::RootRefusingLog(
+                    crate::context::providers::MerkleEventLogProvider::new(),
+                ),
+            );
+            deps.event_log
+                .init_event_log(&crate::context::state::context_id_to_bytes(&ctx_key()))
+                .await
+                .expect("init log");
+            let mut cell = ClassSCell::new(active_state());
+            let invoker = DID(INVOKER.to_owned());
+            let now = 1_700_000_100;
+
+            // Leave exactly one hard-rate token: drain the bucket, then
+            // return one.
+            let mut drained = 0_u32;
+            while super::super::try_consume_hard_rate_limit(cell.class_c_view(), &invoker, now) {
+                drained += 1;
+                assert!(drained < 10_000, "the hard-rate bucket never empties");
+            }
+            super::super::refund_hard_rate_limit(cell.class_c_view(), &invoker);
+
+            let err = reserve_step(&mut cell, &deps, None, None, &serde_json::json!({}), now)
+                .await
+                .expect_err("an unreadable root fails the reserve");
+            assert!(
+                matches!(err, ContextError::EventLogFailed(_)),
+                "the reserve fails with the root read error; got {err:?}"
+            );
+
+            assert_eq!(
+                cell.governance.velocity_tracker.get_velocity(&invoker, now),
+                0,
+                "the velocity tick is rolled back"
+            );
+            assert!(
+                super::super::try_consume_hard_rate_limit(cell.class_c_view(), &invoker, now),
+                "the hard-rate token is refunded"
+            );
+            assert!(
+                !super::super::try_consume_hard_rate_limit(cell.class_c_view(), &invoker, now),
+                "exactly the one token the reserve took comes back"
+            );
+            assert!(
+                cell.governance.participation_cache.is_empty(),
+                "no participation record is cached"
             );
         }
 
@@ -4778,10 +4880,17 @@ mod tests {
                 mls_storage,
             );
             crate::context::supervisor::supervisor::leak_for_test(&supervisor);
-            supervisor
+            let deps = supervisor
                 .build_actor_deps_loaded(&DID(INVOKER.to_owned()))
                 .await
-                .expect("build_actor_deps")
+                .expect("build_actor_deps");
+            // The reserve reads the context's participation root, so the
+            // context has a log, as a created context does.
+            deps.event_log
+                .init_event_log(&crate::context::state::context_id_to_bytes(&ctx_key()))
+                .await
+                .expect("init log");
+            deps
         }
 
         /// `active_state()` plus a paid economic policy and a funded budget for

@@ -976,13 +976,17 @@ pub async fn join_context(
         .params()
         .check_version_compatibility(scp_protocol::envelope::SCP_PROTOCOL_VERSION)?;
 
-    // The participation record's evidence is read now, before any step, so a
-    // failed read refuses the join with nothing to roll back; nothing queues or
-    // drains between this read and the Phase-4 bookkeeping that reads it (spec
-    // 17 §17.3 "Event log write failures").
+    // The participation record's evidence and the log's Merkle root are read
+    // now, before any step, so a failed read refuses the join with nothing to
+    // roll back; nothing queues or drains between these reads and the Phase-4
+    // bookkeeping that uses them (spec 17 §17.3 "Event log write failures").
     let evidence = crate::context::governance_logic::PreStepEvidence::read(
         &cell.governance.consequence_rules,
         &cell.class_s.pending_log_units,
+        &context_id,
+        deps.event_log.as_ref(),
+    )?;
+    let participation_root = crate::context::participation::ParticipationRoot::read(
         &context_id,
         deps.event_log.as_ref(),
     )?;
@@ -1298,6 +1302,7 @@ pub async fn join_context(
         &mut cell.class_c_view(),
         deps,
         &evidence,
+        participation_root,
         &context_id,
         &member_did,
         add_output,
@@ -1439,6 +1444,7 @@ pub fn join_context_membership(
     view: &mut crate::context::actor::class_s::ClassCMut<'_>,
     deps: &ActorDeps,
     evidence: &crate::context::governance_logic::PreStepEvidence,
+    participation_root: crate::context::participation::ParticipationRoot,
     context_id: &str,
     member_did: &DID,
     add_output: scp_protocol::context::builder::AddMemberOutput,
@@ -1450,17 +1456,18 @@ pub fn join_context_membership(
     // once (the `ConsequenceStateSplit` shape); the split drops before the
     // role / membership / access mutations below re-borrow the view.
     {
-        // `evidence` is the log and the queued units [`join_context`] read
-        // before the MLS add (spec 17 §17.3 "Event log write failures").
+        // `evidence` and `participation_root` are the log, the queued units,
+        // and the log's Merkle root that [`join_context`] read before the MLS
+        // add (spec 17 §17.3 "Event log write failures").
         let mut split = view.split_class_c();
         crate::context::lifecycle_logic::post_join_bookkeeping(
             split.governance.participation_cache_mut(),
             split.receive_buffer,
             evidence,
+            participation_root,
             context_id,
             member_did,
             deps.clock.now_secs(),
-            deps.event_log.as_ref(),
         );
     }
 
@@ -5019,6 +5026,16 @@ mod restore_reconcile_tests {
             Ok(None)
         }
 
+        /// The fixture holds no entry, so its root is the empty log's root.
+        fn event_log_merkle_root(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok(scp_event_log::tree::root(&scp_event_log::EventLog::new(
+                String::new(),
+            )))
+        }
+
         async fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }
@@ -5051,6 +5068,14 @@ mod restore_reconcile_tests {
         ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
         {
             Ok(None)
+        }
+
+        /// The fixture holds no entry, so its root is the empty log's root.
+        fn event_log_merkle_root(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok(crate::context::participation::test_support::empty_tree_root())
         }
 
         async fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
@@ -6529,7 +6554,6 @@ mod restore_reconcile_tests {
             &mut cell,
             &deps,
             &context_id,
-            &context_id_bytes,
             &sender,
             reserved,
             b"payload",
@@ -6539,6 +6563,8 @@ mod restore_reconcile_tests {
                 ),
             ),
             &[],
+            crate::context::participation::ParticipationRoot::read(&context_id, &*deps.event_log)
+                .expect("the root reads before the send"),
         )
         .await;
         let mut state = cell.into_inner();
@@ -7117,6 +7143,53 @@ mod restore_reconcile_tests {
             test_support::log_len(&deps, &context_id_bytes),
             log_before,
             "the refused record never reached the log"
+        );
+    }
+
+    /// Spec 17 §17.3 ("Event log write failures"): the join reads the
+    /// participation root beside its evidence, before the MLS add, so a root
+    /// that cannot be read refuses the join with no member added, nothing
+    /// queued or persisted, and no participation record cached.
+    #[tokio::test]
+    async fn join_refuses_when_the_participation_root_read_fails() {
+        use crate::context::log_unit_helpers::test_support;
+
+        let admin = DID("did:dht:z6MkJoinRootAdmin".to_owned());
+        let context_id = hex::encode([0x4cu8; 32]);
+        let (deps, snapshots) =
+            test_support::deps_over_root_refusing_log(admin.as_ref(), &context_id).await;
+        let (mut cell, handle) = joinable_cell(&context_id, &admin, true);
+
+        let joiner = DID("did:dht:z6MkRootRefusedJoiner".to_owned());
+        let result = lifecycle_helpers::join_context(
+            &mut cell,
+            &deps,
+            &handle,
+            scp_protocol::context::membership::KeyPackage::mock(joiner.clone()),
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(&result, Err(ContextError::EventLogFailed(_))),
+            "the join fails with the root read error: got {result:?}"
+        );
+        assert!(
+            !cell.membership.contains(joiner.as_ref()),
+            "the refused joiner is not a member"
+        );
+        assert!(
+            cell.governance.participation_cache.is_empty(),
+            "no participation record is cached"
+        );
+        assert!(
+            cell.class_s.pending_log_units.is_empty(),
+            "no record is queued"
+        );
+        assert!(
+            snapshots.snapshot(&context_id).await.is_none(),
+            "nothing is persisted"
         );
     }
 

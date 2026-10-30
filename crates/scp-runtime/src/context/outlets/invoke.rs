@@ -306,6 +306,20 @@ impl From<OutletStreamOpenError> for OutletOpenError {
 // Economy context for outlet invocation
 // ---------------------------------------------------------------------------
 
+/// The participation cache an outlet invocation refreshes, and the log's
+/// Merkle root, read before the outlet ran, that the refreshed record binds
+/// (spec 17 §17.3 "Event log write failures").
+pub struct OutletParticipation<'a, S: BuildHasher = std::hash::RandomState> {
+    /// The log's Merkle root as read before the outlet ran.
+    pub root: crate::context::participation::ParticipationRoot,
+    /// The cache that receives the invoker's record.
+    pub cache: &'a mut std::collections::HashMap<
+        String,
+        crate::context::participation::RootedParticipationRecord,
+        S,
+    >,
+}
+
 /// Optional economy parameters for outlet invocation.
 ///
 /// When provided, `invoke_outlet` enforces budget checks before execution
@@ -334,12 +348,9 @@ pub struct OutletEconomyContext<'a, S: BuildHasher = std::hash::RandomState> {
     /// across skewed members (§9.9.3); derived from the same call to
     /// `event_log_entries_for_consequences` that produced `events`.
     pub convergent_now: u64,
-    /// Participation cache for proposer eligibility evaluation.
-    pub participation_cache: &'a mut std::collections::HashMap<
-        String,
-        scp_protocol::trust::participation::ParticipationRecord,
-        S,
-    >,
+    /// Participation cache for proposer eligibility evaluation, with the log
+    /// root its refreshed record binds.
+    pub participation: OutletParticipation<'a, S>,
     /// Consequence rules from the context's governance state.
     pub consequence_rules: &'a [scp_protocol::trust::consequence::ConsequenceRule],
     /// Optional payment adapter for the 9-step payment flow (spec §19.2.2, #1537).
@@ -804,7 +815,10 @@ fn economy_post_check<S: BuildHasher>(
         economy.context_id,
         economy.now,
         economy.convergent_now,
-        economy.participation_cache,
+        OutletParticipation {
+            root: economy.participation.root,
+            cache: &mut *economy.participation.cache,
+        },
         economy.consequence_rules,
     )
 }
@@ -1056,39 +1070,23 @@ where
 /// Post-invocation bookkeeping: participation record update and consequence evaluation.
 ///
 /// Called after a successful outlet invocation to update governance state.
-/// `compute_participation_record` refreshes the cache for proposer eligibility
-/// (#1530). `evaluate_consequence_rules` checks whether the outlet invocation
-/// triggered any consequence rules (#1531).
+/// The invoker's participation record, bound to the log's Merkle root that
+/// `participation.root` carries (read before the outlet ran), refreshes
+/// `participation.cache` for proposer eligibility (#1530).
+/// `evaluate_consequence_rules` checks whether the outlet invocation triggered
+/// any consequence rules (#1531).
+#[must_use]
 pub fn post_outlet_invocation_bookkeeping<S: std::hash::BuildHasher>(
     events: &[scp_event_log::Event],
     invoker_did: &DID,
     context_id: &str,
     now: u64,
     convergent_now: u64,
-    participation_cache: &mut std::collections::HashMap<
-        String,
-        scp_protocol::trust::participation::ParticipationRecord,
-        S,
-    >,
+    OutletParticipation { root, cache }: OutletParticipation<'_, S>,
     consequence_rules: &[scp_protocol::trust::consequence::ConsequenceRule],
 ) -> Vec<scp_protocol::trust::consequence::TriggeredConsequence> {
     // Update participation record after outlet execution (#1530).
-    if !events.is_empty()
-        && let Ok(record) = scp_protocol::trust::participation::compute_participation_record(
-            events,
-            invoker_did.as_ref(),
-            context_id,
-            [0u8; 32],
-            now,
-            // attestation_count is a credential-layer, verifier-relative fact
-            // (§7.3.2); this outlet-invoke path gates only on participation_count
-            // and has no attestation-cache access, so it passes an empty
-            // accessible-attestation set (count 0) by design — NOT a stub.
-            &[],
-        )
-    {
-        participation_cache.insert(invoker_did.to_string(), record);
-    }
+    root.refresh(cache, events, invoker_did.as_ref(), context_id, now);
 
     // Evaluate consequence rules after outlet execution (#1531).
     // The caller is responsible for enforcing triggered consequences via
@@ -7363,6 +7361,7 @@ mod tests {
     // budget_exceeded on outlet invocation returns BudgetExceeded
     #[tokio::test]
     async fn budget_exceeded_outlet_invoke() {
+        use crate::context::participation::test_support::empty_log_root;
         use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
         let policy = EconomicPolicy {
@@ -7412,10 +7411,7 @@ mod tests {
             sender_velocity: 0,
             storage_usage: 0,
         };
-        let mut participation: std::collections::HashMap<
-            String,
-            scp_protocol::trust::participation::ParticipationRecord,
-        > = std::collections::HashMap::new();
+        let mut participation = std::collections::HashMap::new();
         // Provide a spending UCAN so the AND-composition check passes;
         // the budget check (the actual test target) runs after.
         let spending_ucan = {
@@ -7459,7 +7455,11 @@ mod tests {
             now: 0,
             events: &[],
             convergent_now: 0,
-            participation_cache: &mut participation,
+            participation: super::OutletParticipation {
+                // The test's log holds no event, so its root is the empty log's.
+                root: empty_log_root().expect("the empty log's root"),
+                cache: &mut participation,
+            },
             consequence_rules: &[],
             payment_adapter: None,
             metrics,

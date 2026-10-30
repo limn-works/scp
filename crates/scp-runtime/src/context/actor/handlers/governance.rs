@@ -1617,17 +1617,22 @@ mod consequence_fail_closed_tests {
             .expect("transition to Active");
         let mut cell = ClassSCell::new(state);
         let ctx_str = hex::encode([CTX_BYTE; 32]);
-        // ADR-056: `ctx_str` is a real 64-hex id, so the code under test keys
-        // under its DECODED digest. Resolve the explicit arg the same way the
-        // internal keying does, not via the raw `SHA-256(ctx_str)` primitive.
-        let ctx_bytes = crate::context::state::context_id_to_bytes(&ctx_str);
+        deps.event_log
+            .init_event_log(&[CTX_BYTE; 32])
+            .await
+            .expect("init log");
+        // The root is read before the send, as `send_message` reads it.
+        let root = crate::context::participation::ParticipationRoot::read(
+            &ctx_str,
+            deps.event_log.as_ref(),
+        )
+        .expect("the root reads before the send");
 
         // Free (non-paid) send: no token, a local test signer, not broadcast.
         let result = crate::context::messaging_helpers::finalize_send(
             &mut cell,
             &deps,
             &ctx_str,
-            &ctx_bytes,
             &DID(SUBJECT.to_owned()),
             0,
             b"payload",
@@ -1637,6 +1642,7 @@ mod consequence_fail_closed_tests {
                 ),
             ),
             &[],
+            root,
         )
         .await;
 

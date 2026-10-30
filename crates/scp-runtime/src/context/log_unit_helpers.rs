@@ -757,6 +757,31 @@ pub mod test_support {
         (deps, faulty, snapshots)
     }
 
+    /// Supervisor-backed deps for `owner` over a Merkle log that serves every
+    /// read and write but refuses its root read, initialised for
+    /// `context_id`, and a [`SharedSnapshots`] store.
+    pub async fn deps_over_root_refusing_log(
+        owner: &str,
+        context_id: &str,
+    ) -> (ActorDeps, SharedSnapshots) {
+        let snapshots = SharedSnapshots::default();
+        let deps = deps_with(
+            owner,
+            Some(Box::new(snapshots.clone())),
+            Box::new(
+                crate::context::participation::test_support::RootRefusingLog(
+                    MerkleEventLogProvider::new(),
+                ),
+            ),
+        )
+        .await;
+        deps.event_log
+            .init_event_log(&crate::context::state::context_id_to_bytes(context_id))
+            .await
+            .expect("init event log");
+        (deps, snapshots)
+    }
+
     /// The number of entries in the context's log.
     pub fn log_len(deps: &ActorDeps, context_id_bytes: &[u8; 32]) -> usize {
         deps.event_log

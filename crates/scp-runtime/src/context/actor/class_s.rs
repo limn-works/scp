@@ -293,6 +293,7 @@ use super::state::{
 use crate::context::ContextHandle;
 use crate::context::governance::timeout::DeadlockDetectionState;
 use crate::context::messaging_helpers::persist_state_fail_closed;
+use crate::context::participation::RootedParticipationRecord;
 use crate::context::state::{
     AccessControlState, CommitFaultMarker, EpochState, GovernanceClassS, GovernanceState,
     MigrationState, PendingCeilingModification, PendingCommit, PendingEconomicPolicyChange,
@@ -325,7 +326,6 @@ use scp_protocol::economy::budget::MemberBudgetTracker;
 use scp_protocol::economy::types::EconomicPolicy;
 use scp_protocol::envelope::{ReorderBuffer, SequenceTracker};
 use scp_protocol::trust::consequence::ConsequenceRule;
-use scp_protocol::trust::participation::ParticipationRecord;
 
 /// Mutable view over a [`PerContextState`] that EXPOSES the Class-S sub-structs.
 ///
@@ -1116,7 +1116,7 @@ pub(crate) struct GovernanceClassCMut<'a> {
     /// `&mut` to the consequence rules declared at creation (ADR-017).
     consequence_rules: &'a mut Vec<ConsequenceRule>,
     /// `&mut` to the per-member participation record cache (#1530 proposer eligibility).
-    participation_cache: &'a mut HashMap<String, ParticipationRecord>,
+    participation_cache: &'a mut HashMap<String, RootedParticipationRecord>,
     /// `&mut` to the per-DID escalating-cost message pricing config (§19.7).
     message_pricing: &'a mut Option<ContextMessagePricingConfig>,
     /// `&mut` to the defense-in-depth Matrix-style hard rate limiter (§19.7).
@@ -1330,7 +1330,7 @@ impl<'a> GovernanceClassCMut<'a> {
     /// eligibility). Class-C: a derived cache, best-effort-rollback acceptable.
     pub(crate) const fn participation_cache_mut(
         &mut self,
-    ) -> &mut HashMap<String, ParticipationRecord> {
+    ) -> &mut HashMap<String, RootedParticipationRecord> {
         self.participation_cache
     }
 
@@ -5503,6 +5503,16 @@ impl ClassSCell
             Ok(None)
         }
 
+        /// The fixture holds no entry, so its root is the empty log's root.
+        fn event_log_merkle_root(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok(scp_event_log::tree::root(&scp_event_log::EventLog::new(
+                String::new(),
+            )))
+        }
+
         async fn init_event_log(
             &self,
             _id: &[u8; 32],
@@ -6217,18 +6227,19 @@ impl ClassSCell
         ctx: &str,
         sender: &DID,
     ) -> Result<(), ContextError> {
-        let ctx_id_bytes = crate::context::state::context_id_to_bytes(ctx);
         let log_entries = crate::context::governance_logic::read_consequence_log(
             &cell.class_s.pending_log_units,
             ctx,
             deps.event_log.as_ref(),
         )
         .expect("the log reads before the send");
+        let root =
+            crate::context::participation::ParticipationRoot::read(ctx, deps.event_log.as_ref())
+                .expect("the root reads before the send");
         crate::context::messaging_helpers::finalize_send(
             cell,
             deps,
             ctx,
-            &ctx_id_bytes,
             sender,
             0,
             b"send-with-suspension",
@@ -6238,6 +6249,7 @@ impl ClassSCell
                 ),
             ),
             &log_entries,
+            root,
         )
         .await
     }

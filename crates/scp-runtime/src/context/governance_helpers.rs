@@ -4366,7 +4366,7 @@ fn actor_check_proposer_eligibility(
     event_log: &dyn crate::context::builder::ContextEventLogProvider,
 ) -> Result<(), ContextError> {
     use scp_protocol::context::params::GovernanceModel;
-    use scp_protocol::trust::participation::{compute_participation_record, meets_threshold};
+    use scp_protocol::trust::participation::meets_threshold;
 
     // Pending-removal defense-in-depth (read via the cell's `Deref`).
     for (proposal, _seq, _ts) in cell.governance.approved_proposals.values() {
@@ -4394,14 +4394,11 @@ fn actor_check_proposer_eligibility(
         .participation_cache
         .contains_key(proposer_did.as_ref())
     {
-        let context_id_bytes = context_id_to_bytes(&context_id);
-        let merkle_root = event_log
-            .event_log_merkle_root(&context_id_bytes)
-            .unwrap_or([0u8; 32]);
+        // A gate before the proposal is recorded: an unreadable log or root
+        // fails the proposal (spec section 17.3, "Event log write failures").
+        // The log is read first, as the send and the join read it.
         // Participation-record path consumes only the merged event set;
         // `convergent_now` (the consequence window anchor) is unused here.
-        // A gate before the proposal is recorded: an unreadable log fails the
-        // proposal (spec section 17.3, "Event log write failures").
         let (events, _convergent_now) = event_log_entries_for_consequences(
             &cell.receive_buffer,
             &cell.class_s.pending_log_units,
@@ -4409,20 +4406,9 @@ fn actor_check_proposer_eligibility(
             now,
             event_log,
         )?;
+        let root = crate::context::participation::ParticipationRoot::read(&context_id, event_log)?;
         if !events.is_empty() {
-            match compute_participation_record(
-                &events,
-                proposer_did.as_ref(),
-                &context_id,
-                merkle_root,
-                now,
-                // attestation_count is a credential-layer, verifier-relative
-                // fact (§7.3.2); proposer eligibility gates only on
-                // participation_count and has no attestation-cache access, so it
-                // passes an empty accessible-attestation set (count 0) by
-                // design — NOT a stub.
-                &[],
-            ) {
+            match root.record(&events, proposer_did.as_ref(), &context_id, now) {
                 Err(e) => {
                     tracing::warn!(
                         proposer = %proposer_did,
@@ -5817,16 +5803,20 @@ struct PreStepFinalize {
     executed_leaf: crate::context::state::LeafSpec,
     /// The log and the queued units as read before the step.
     evidence: crate::context::governance_logic::PreStepEvidence,
+    /// The log's Merkle root as read before the step, bound into the
+    /// proposer's participation record.
+    participation_root: crate::context::participation::ParticipationRoot,
 }
 
 impl PreStepFinalize {
-    /// Plans the executed record and reads the consequence evidence.
+    /// Plans the executed record and reads the consequence evidence and the
+    /// log's Merkle root.
     ///
     /// # Errors
     ///
     /// [`ContextError::EventLogFailed`] when the record's payload breaks the
-    /// append's payload rules or the log cannot be read, or
-    /// [`ContextError::ContextNotRegistered`] from the log read.
+    /// append's payload rules or the log or its root cannot be read, or
+    /// [`ContextError::ContextNotRegistered`] from a log read.
     fn read(
         state: &PerContextState,
         deps: &ActorDeps,
@@ -5840,6 +5830,10 @@ impl PreStepFinalize {
             evidence: crate::context::governance_logic::PreStepEvidence::read(
                 &state.governance.consequence_rules,
                 &state.class_s.pending_log_units,
+                context_id,
+                &*deps.event_log,
+            )?,
+            participation_root: crate::context::participation::ParticipationRoot::read(
                 context_id,
                 &*deps.event_log,
             )?,
@@ -5904,6 +5898,7 @@ fn finalize_governance_action(
         executor_did,
         executed_leaf,
         evidence,
+        participation_root,
     } = pre_step;
     let executor_did = &executor_did;
     // For MLS-mutating actions (AddMember, RemoveMember, Revoke,
@@ -5945,7 +5940,6 @@ fn finalize_governance_action(
         resulting_epoch,
     };
 
-    let context_id_bytes = context_id_to_bytes(context_id);
     // The `GovernanceActionExecuted` record, planned before the step, opens
     // the finalize unit; it carries the type `governance_event_label` gives
     // the event above. The record is currently committer-written only;
@@ -6090,23 +6084,12 @@ fn finalize_governance_action(
             .cloned()
             .collect();
         let (gov_events, _convergent_now) = evidence.events(&staged, &state.receive_buffer, now);
-        let gov_merkle = deps
-            .event_log
-            .event_log_merkle_root(&context_id_bytes)
-            .unwrap_or([0u8; 32]);
         if !gov_events.is_empty()
-            && let Ok(record) = scp_protocol::trust::participation::compute_participation_record(
+            && let Ok(record) = participation_root.record(
                 &gov_events,
                 proposal.proposer_did.as_ref(),
                 context_id,
-                gov_merkle,
                 now,
-                // attestation_count is a credential-layer, verifier-relative
-                // fact (§7.3.2); proposer eligibility gates only on
-                // participation_count and has no attestation-cache access, so it
-                // passes an empty accessible-attestation set (count 0) by
-                // design — NOT a stub.
-                &[],
             )
             && record.participation_count > 0
         {
@@ -7097,6 +7080,14 @@ mod commit_broadcast_retry_tests {
         ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
         {
             Ok(None)
+        }
+
+        /// The fixture holds no entry, so its root is the empty log's root.
+        fn event_log_merkle_root(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok(crate::context::participation::test_support::empty_tree_root())
         }
 
         async fn init_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
@@ -8209,6 +8200,57 @@ mod commit_broadcast_retry_tests {
             );
         }
 
+        /// Spec section 17.3 ("Event log write failures"): the proposer
+        /// eligibility gate reads the participation root before the proposal
+        /// is recorded, so a root that cannot be read refuses the proposal
+        /// with no proposal recorded, nothing persisted, and no participation
+        /// record cached.
+        #[tokio::test]
+        async fn propose_refuses_when_the_participation_root_read_fails() {
+            use crate::context::builder::ContextEventLogProvider as _;
+
+            let (mut deps, clock, persists) = deps_and_clock().await;
+            let log = crate::context::providers::MerkleEventLogProvider::new();
+            log.init_event_log(&crate::context::state::context_id_to_bytes(&ctx_hex()))
+                .await
+                .expect("init log");
+            deps.event_log =
+                Arc::new(crate::context::participation::test_support::RootRefusingLog(log));
+            let mut cell = majority_cell(&clock);
+            let persists_before = persists.load(Ordering::SeqCst);
+
+            let err = crate::context::governance_helpers::propose_governance_action_inner(
+                &mut cell,
+                &deps,
+                &ctx_hex(),
+                &did(B),
+                change_role(),
+                &local(B),
+                false,
+                None,
+            )
+            .await
+            .expect_err("an unreadable root refuses the proposal");
+
+            assert!(
+                matches!(err, scp_protocol::context::ContextError::EventLogFailed(_)),
+                "the proposal fails with the root read error; got {err:?}"
+            );
+            assert!(
+                cell.governance.participation_cache.is_empty(),
+                "no participation record is cached"
+            );
+            assert!(
+                cell.governance.engine.list_proposals().is_empty(),
+                "no proposal is recorded"
+            );
+            assert_eq!(
+                persists.load(Ordering::SeqCst),
+                persists_before,
+                "nothing is persisted"
+            );
+        }
+
         /// A vote signature is Ed25519 (spec 07), so a P-256 custody fails the
         /// vote with the key-type error and custody is never asked to sign.
         #[tokio::test]
@@ -8979,5 +9021,67 @@ mod queued_record_tests {
             Some(2),
             "the queued AccessRevoked and GovernanceActionExecuted records both count"
         );
+    }
+
+    /// Spec section 17.3 ("Event log write failures"): finalize reads the
+    /// participation root before the replay marker, so a root that cannot be
+    /// read refuses the execution with nothing applied, nothing queued, and
+    /// no participation record cached.
+    #[tokio::test]
+    async fn finalize_refuses_when_the_participation_root_read_fails() {
+        let ctx = [0x68u8; 32];
+        let deps = deps_with(
+            ADMIN,
+            None,
+            Box::new(
+                crate::context::participation::test_support::RootRefusingLog(
+                    crate::context::providers::MerkleEventLogProvider::new(),
+                ),
+            ),
+        )
+        .await;
+        deps.event_log
+            .init_event_log(&ctx)
+            .await
+            .expect("init event log");
+        let (mut cell, pid) = cell_with_approved_revoke(ctx, Vec::new());
+
+        let err = super::execute_governance_action(
+            &mut cell,
+            &deps,
+            &hex::encode(ctx),
+            &pid,
+            Some(&did(ADMIN)),
+            None,
+            None,
+        )
+        .await
+        .expect_err("an unreadable root refuses the execution");
+
+        assert!(
+            matches!(err, scp_protocol::context::ContextError::EventLogFailed(_)),
+            "the execution fails with the root read error; got {err:?}"
+        );
+        assert!(
+            cell.governance.participation_cache.is_empty(),
+            "no participation record is cached"
+        );
+        assert!(
+            !cell
+                .governance
+                .class_s
+                .executed_proposals
+                .contains_key(&pid),
+            "the replay marker is never set"
+        );
+        assert!(
+            !cell.access.read_exclusion_list.contains(&did(TARGET)),
+            "the revoke is never applied"
+        );
+        assert!(
+            cell.class_s.pending_log_units.is_empty(),
+            "no record is queued"
+        );
+        assert_eq!(log_len(&deps, &ctx), 0, "the log holds no entry");
     }
 }
