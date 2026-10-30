@@ -1015,16 +1015,46 @@ pub mod test_support {
     /// A snapshot store the supervisor writes through while the test reads
     /// the stored snapshot back, so a test can assert that a unit reached the
     /// persist that recorded its step and not only the in-memory queue.
-    #[derive(Clone, Default)]
-    pub struct SharedSnapshots(Arc<crate::context::providers::persistence::InMemoryPersistence>);
+    /// [`Self::fail_persists_after`] makes later persists fail.
+    #[derive(Clone)]
+    pub struct SharedSnapshots {
+        store: Arc<crate::context::providers::persistence::InMemoryPersistence>,
+        /// Persists still allowed to land; each persist past zero fails.
+        allowance: Arc<std::sync::atomic::AtomicUsize>,
+        /// Persists that landed.
+        landed: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Default for SharedSnapshots {
+        fn default() -> Self {
+            Self {
+                store: Arc::default(),
+                allowance: Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX)),
+                landed: Arc::default(),
+            }
+        }
+    }
 
     impl SharedSnapshots {
+        /// Lets the next `landed` persists land and fails every persist after
+        /// them, leaving the stored snapshot as the last landed persist wrote
+        /// it.
+        pub fn fail_persists_after(&self, landed: usize) {
+            self.allowance
+                .store(landed, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        /// The number of persists that have landed.
+        pub fn persists_landed(&self) -> usize {
+            self.landed.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
         /// The stored snapshot of `context_id`, if any.
         pub async fn snapshot(
             &self,
             context_id: &str,
         ) -> Option<crate::context::state::ContextSnapshot> {
-            self.0
+            self.store
                 .load_context(context_id)
                 .await
                 .expect("the snapshot store reads")
@@ -1033,7 +1063,7 @@ pub mod test_support {
         /// The event types of each unit in the stored snapshot's queue,
         /// oldest first; empty when nothing was stored.
         pub async fn persisted_unit_types(&self, context_id: &str) -> Vec<Vec<EventType>> {
-            self.0
+            self.store
                 .load_context(context_id)
                 .await
                 .expect("the snapshot store reads")
@@ -1060,7 +1090,18 @@ pub mod test_support {
             context_id: &str,
             snapshot: &crate::context::state::ContextSnapshot,
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-            self.0.persist_context(context_id, snapshot).await
+            let allowed = self.allowance.fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |left| left.checked_sub(1),
+            );
+            if allowed.is_err() {
+                return Err("the test store refuses this persist".into());
+            }
+            self.store.persist_context(context_id, snapshot).await?;
+            self.landed
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
         }
         async fn load_context(
             &self,
@@ -1069,18 +1110,18 @@ pub mod test_support {
             Option<crate::context::state::ContextSnapshot>,
             Box<dyn std::error::Error + Send + Sync>,
         > {
-            self.0.load_context(context_id).await
+            self.store.load_context(context_id).await
         }
         async fn delete_context(
             &self,
             context_id: &str,
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-            self.0.delete_context(context_id).await
+            self.store.delete_context(context_id).await
         }
         async fn list_persisted_contexts(
             &self,
         ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
-            self.0.list_persisted_contexts().await
+            self.store.list_persisted_contexts().await
         }
     }
 

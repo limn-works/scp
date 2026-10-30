@@ -990,8 +990,10 @@ pub async fn join_context(
         &context_id,
         deps.event_log.as_ref(),
     )?;
-    // The `MemberJoined` record is planned before the step and queued at Phase 5
-    // in the persist that records the join.
+    // The `MemberJoined` record is planned before the step and queued in the
+    // Phase-3 commit that adds the member, so no stored state holds the added
+    // member without its record; [`JoinRollback`] withdraws the record in the
+    // commit that removes the member.
     //
     // Subject-bearing leaf (ADR-011 amendment): carry the joining member
     // (`member_did`, which on a self-join already equals `actor_did`) and the
@@ -1166,13 +1168,23 @@ pub async fn join_context(
     // which retains it as a birth-seam).
     let local_did = deps.crypto.local_did().to_owned();
 
-    // add_member — Class-S. On failure NO MLS rollback is needed (the add itself
-    // failed, so no member was added), matching the prior provider disposition.
-    //
-    // The same commit records the §9.10.4.1 membership trigger for the local
-    // member; the rollbacks below restore `rotation_before_add` with the MLS
-    // removal, so an add that does not commit triggers no rotation.
+    // add_member — Class-S. The same commit records the §9.10.4.1 membership
+    // trigger for the local member and queues the `MemberJoined` record (spec
+    // 17 §17.3 "Event log write failures"). A refused add applies nothing, so
+    // it needs no MLS rollback. An add whose persist failed stays applied in
+    // memory (keep direction) with its record queued, so it rolls back through
+    // [`JoinRollback`] like every later failure: the rollback restores
+    // `rotation_before_add` and withdraws the record with the MLS removal, so
+    // an add that does not commit triggers no rotation and leaves no record.
     let rotation_before_add = cell.class_s.pseudonym_rotation.clone();
+    let undo = JoinRollback {
+        local_did: &local_did,
+        member_did: &member_did,
+        context_id: &context_id,
+        context_id_bytes: &context_id_bytes,
+        rotation_before_add,
+        joined_leaf: &joined_leaf,
+    };
     let add_output = match cell
         .commit_class_s_keep(deps, &context_id, |mut v| {
             let state = v.rest_mut();
@@ -1182,11 +1194,32 @@ pub async fn join_context(
                 &local_did,
                 member_did.as_ref(),
             );
+            v.enqueue_counted_log_unit(vec![joined_leaf.clone()]);
             Ok(output)
         })
         .await
     {
         Ok(output) => output,
+        Err(e)
+            if cell
+                .class_s
+                .pending_log_units
+                .last_is_unwritten(std::slice::from_ref(&joined_leaf)) =>
+        {
+            return Err(undo
+                .run(
+                    cell,
+                    deps,
+                    JoinCharges {
+                        nonce_token: spending_nonce_token.take(),
+                        auth,
+                        ticket,
+                    },
+                    None,
+                    e,
+                )
+                .await);
+        }
         Err(e) => {
             // Keep-direction (ADR-049 §9): persist the burned nonce fail-closed
             // before the existing escrow-void + ticket rollback. Nonce-commit +
@@ -1209,45 +1242,26 @@ pub async fn join_context(
     };
 
     // distribute_sender_key — Class-S. On failure roll back the just-added member
-    // on the ACTOR (best-effort MLS remove + sender-key prune) + the registry
-    // floor, then the nonce/escrow/ticket rollback.
+    // through [`JoinRollback`].
     if let Err(e) = cell
         .commit_class_s_keep(deps, &context_id, |mut v| {
             v.rest_mut().distribute_sender_key(&local_did, &member_did)
         })
         .await
     {
-        // Sender-key distribution failed after MLS add — roll back the MLS state
-        // on the actor's owned crypto (§9 Class-S, fail-closed persist).
-        let _ = cell
-            .commit_class_s_keep(deps, &context_id, |mut v| {
-                let s = v.rest_mut();
-                let _ = s.remove_member(&local_did, &member_did, deps.clock.as_ref());
-                // §9.10.4.1: the add did not commit, so neither does its
-                // membership trigger.
-                s.class_s.pseudonym_rotation = rotation_before_add;
-                s.remove_member_sender_key(&member_did)
-            })
-            .await;
-        // ADR-049 PR-6: prune the departed member's Class-M registry floors
-        // (member-granular; siblings + the local scalar retained).
-        deps.supervisor
-            .remove_member_floors(&context_id_bytes, &member_did);
-        // Keep-direction (ADR-049 §9): persist the burned nonce fail-closed
-        // before the existing escrow-void + ticket rollback.
-        let err = crate::context::messaging_helpers::commit_send_nonce_token_on_abort(
-            spending_nonce_token.take(),
-            &*cell,
-            deps,
-            &context_id,
-            e,
-        )
-        .await;
-        if let Some(a) = auth {
-            crate::context::economy_helpers::void_paid_action(deps, a, &context_id).await;
-        }
-        rollback_join_economy_ticket(cell, ticket);
-        return Err(err);
+        return Err(undo
+            .run(
+                cell,
+                deps,
+                JoinCharges {
+                    nonce_token: spending_nonce_token.take(),
+                    auth,
+                    ticket,
+                },
+                None,
+                e,
+            )
+            .await);
     }
 
     // Drain pending HPKE-sealed sender-key distribution messages and deliver them
@@ -1261,43 +1275,33 @@ pub async fn join_context(
         drain_and_deliver_sender_keys(deps, view.mode_mut().crypto_mut(), &context_id).await
     };
     if let Err(e) = drain_result {
-        // Drain failed catastrophically — roll back the MLS add on the actor,
-        // the sender key, the registry floor, the escrow, and the economy ticket
-        // so the join is fully aborted.
-        let _ = cell
-            .commit_class_s_keep(deps, &context_id, |mut v| {
-                let s = v.rest_mut();
-                let _ = s.remove_member(&local_did, &member_did, deps.clock.as_ref());
-                // §9.10.4.1: the add did not commit, so neither does its
-                // membership trigger.
-                s.class_s.pseudonym_rotation = rotation_before_add;
-                s.remove_member_sender_key(&member_did)
-            })
-            .await;
-        // ADR-049 PR-6: prune the departed member's Class-M registry floors
-        // (member-granular; siblings + the local scalar retained).
-        deps.supervisor
-            .remove_member_floors(&context_id_bytes, &member_did);
-        // Keep-direction (ADR-049 §9): persist the burned nonce fail-closed
-        // before the existing escrow-void + ticket rollback.
-        let err = crate::context::messaging_helpers::commit_send_nonce_token_on_abort(
-            spending_nonce_token.take(),
-            &*cell,
-            deps,
-            &context_id,
-            e,
-        )
-        .await;
-        if let Some(a) = auth {
-            crate::context::economy_helpers::void_paid_action(deps, a, &context_id).await;
-        }
-        rollback_join_economy_ticket(cell, ticket);
-        return Err(err);
+        // Drain failed catastrophically — roll the join back through
+        // [`JoinRollback`] so it is fully aborted.
+        return Err(undo
+            .run(
+                cell,
+                deps,
+                JoinCharges {
+                    nonce_token: spending_nonce_token.take(),
+                    auth,
+                    ticket,
+                },
+                None,
+                e,
+            )
+            .await);
     }
 
-    // Phase 4: Membership mutation. On failure: void escrow + rollback
-    // ticket + rollback MLS state. Routed through `cell.class_c_view()` — the
-    // membership / role / access / receive-buffer mutations are all Class-C.
+    // Phase 4: Membership mutation. Routed through `cell.class_c_view()` — the
+    // membership / role / access / receive-buffer mutations are all Class-C. A
+    // failure part-way may have cached a participation record and entered the
+    // member in the role state, so [`JoinRollback`] tears the member's state
+    // down with the MLS add.
+    let previous_participation = cell
+        .governance
+        .participation_cache
+        .get(member_did.as_ref())
+        .cloned();
     if let Err(e) = join_context_membership(
         &mut cell.class_c_view(),
         deps,
@@ -1307,106 +1311,99 @@ pub async fn join_context(
         &member_did,
         add_output,
     ) {
-        // Roll back the MLS add on the actor's owned crypto (§9 Class-S).
-        let _ = cell
-            .commit_class_s_keep(deps, &context_id, |mut v| {
-                let s = v.rest_mut();
-                let _ = s.remove_member(&local_did, &member_did, deps.clock.as_ref());
-                // §9.10.4.1: the add did not commit, so neither does its
-                // membership trigger.
-                s.class_s.pseudonym_rotation = rotation_before_add;
-                s.remove_member_sender_key(&member_did)
-            })
-            .await;
-        // ADR-049 PR-6: prune the departed member's Class-M registry floors
-        // (member-granular; siblings + the local scalar retained).
-        deps.supervisor
-            .remove_member_floors(&context_id_bytes, &member_did);
-        // Keep-direction (ADR-049 §9): persist the burned nonce fail-closed
-        // before the existing escrow-void + ticket rollback.
-        let err = crate::context::messaging_helpers::commit_send_nonce_token_on_abort(
-            spending_nonce_token.take(),
-            &*cell,
-            deps,
-            &context_id,
-            e,
-        )
-        .await;
-        if let Some(a) = auth {
-            crate::context::economy_helpers::void_paid_action(deps, a, &context_id).await;
-        }
-        rollback_join_economy_ticket(cell, ticket);
-        return Err(err);
+        let membership = MembershipUndo {
+            previous_participation,
+            previous_pseudonym: None,
+            announced: false,
+        };
+        return Err(undo
+            .run(
+                cell,
+                deps,
+                JoinCharges {
+                    nonce_token: spending_nonce_token.take(),
+                    auth,
+                    ticket,
+                },
+                Some(membership),
+                e,
+            )
+            .await);
     }
 
     // Phase 4.5: Store local pseudonym after membership mutation succeeds.
     // §9.10.4: `set_local_pseudonym` is a no-op on a broadcast context (which
     // carries no pseudonym state), so this only updates encrypted contexts.
     // Routed through the Class-C routing view; the view drops immediately.
+    let previous_pseudonym = cell.routing.local_pseudonym();
     if let Some(pseudonym) = local_pseudonym {
         cell.class_c_view()
             .routing_mut()
             .set_local_pseudonym(pseudonym);
     }
 
-    // Phase 5: commit the economy ticket (in-memory budget debit), THEN durably
-    // persist the join with its `MemberJoined` record queued, THEN settle the
-    // external escrow. Consume the ticket — commit returns the deducted cost and
-    // marks the ticket committed so the Drop guard stays quiet.
-    let deducted_cost = crate::context::economy_logic::commit_economy_ticket(ticket);
-
+    // Phase 5: durably persist the join, THEN commit the economy ticket
+    // (in-memory budget debit), THEN settle the external escrow. The
+    // `MemberJoined` record already rides the Phase-3 add commit, so this
+    // persist queues nothing.
+    //
     // ADR-049 §9 Class S (BLACK-001): a PAID join consumed a spending-UCAN
     // nonce in Phase 1 (`enforce_join_economy` → `enforce_economy` →
     // `commit_spending_ucan_nonce`, mutating the actor-owned
     // `spending_nonce_tracker`) — the same Class-S monotonic state the
     // message-send and outlet-invoke paths persist fail-closed. Its deferred
-    // token's owed persist carries the queued `MemberJoined` record
-    // (`discharge_with`). A free join persists the record through
-    // `commit_class_s_keep`: the record needs a durable home, so the free path's
-    // persist is fail-closed too (spec 17 §17.3 "Event log write failures").
-    // On a persist failure the join is NOT acknowledged. The membership / MLS
-    // state already applied above is NOT reversed — it is Class-S security
-    // state that, like the consumed nonce, must persist; the joiner re-drives
-    // the (now nonce-consumed, idempotent) join, and the surviving in-memory
-    // actor already holds the member and its queued record. The consumed nonce
-    // stays CONSUMED (the fail-closed direction; un-consuming re-opens the
-    // replay window).
+    // token's owed persist is this persist (`discharge_with`). A free join
+    // persists through `commit_class_s_keep`, fail-closed too. On a persist
+    // failure the join is NOT acknowledged and rolls back through
+    // [`JoinRollback`] like every earlier failure: the member, its Phase-4
+    // state and its queued record leave memory together, and the ticket rolls
+    // back. The consumed nonce stays CONSUMED (the fail-closed direction;
+    // un-consuming re-opens the replay window), so the joiner's retry is
+    // idempotent.
     //
     // MONEY-ORDERING (round-7, mirrors the send path): the external escrow is
     // CAPTURED only AFTER the fail-closed persist succeeds. Capturing before
     // would charge the joiner (irreversible escrow settlement) and then hand
     // them an `Err` if the persist failed — a double-charge on retry. On
-    // persist failure we VOID the escrow hold instead (releasing the funds) so
-    // the charge is atomic with durability; the consumed nonce stays consumed,
-    // so the joiner's retry is idempotent and they are charged at most once.
-    // `auth`, a `PaidActionAuthorization`, has NO `Drop` impl, so the failure
-    // branch must void it or the hold leaks (round-9). The deferred token is
-    // `Some` exactly on the paid (nonce-burning) branch — the same gating the
-    // legacy `deducted_cost.is_some() && spending_ucan.is_some()` expressed.
+    // persist failure the rollback VOIDS the escrow hold instead (releasing the
+    // funds) so the charge is atomic with durability. `auth`, a
+    // `PaidActionAuthorization`, has NO `Drop` impl, so the failure branch must
+    // void it or the hold leaks (round-9). The deferred token is `Some` exactly
+    // on the paid (nonce-burning) branch — the same gating the legacy
+    // `deducted_cost.is_some() && spending_ucan.is_some()` expressed.
     debug_assert_eq!(
         spending_nonce_token.is_some(),
-        deducted_cost.is_some() && spending_ucan.is_some(),
+        ticket.deducted_cost.is_some() && spending_ucan.is_some(),
         "spending-nonce token must be Some iff a paid join burned a nonce",
     );
     let persisted = if let Some(t) = spending_nonce_token.take() {
-        t.discharge_with(cell, deps, &context_id, |mut view| {
-            view.enqueue_counted_log_unit(vec![joined_leaf]);
-            Ok(())
-        })
-        .await
+        t.discharge_with(cell, deps, &context_id, |_view| Ok(()))
+            .await
     } else {
-        cell.commit_class_s_keep(deps, &context_id, |mut view| {
-            view.enqueue_counted_log_unit(vec![joined_leaf]);
-            Ok(())
-        })
-        .await
+        cell.commit_class_s_keep(deps, &context_id, |_view| Ok(()))
+            .await
     };
     if let Err(e) = persisted {
-        if let Some(a) = auth {
-            crate::context::economy_helpers::void_paid_action(deps, a, &context_id).await;
-        }
-        return Err(e);
+        let membership = MembershipUndo {
+            previous_participation,
+            previous_pseudonym: local_pseudonym.and(previous_pseudonym),
+            announced: true,
+        };
+        return Err(undo
+            .run(
+                cell,
+                deps,
+                JoinCharges {
+                    nonce_token: None,
+                    auth,
+                    ticket,
+                },
+                Some(membership),
+                e,
+            )
+            .await);
     }
+    let deducted_cost = crate::context::economy_logic::commit_economy_ticket(ticket);
     // The step is durable with its records queued; write them now. A failed
     // drain leaves them queued for the actor's next drain and logs its own
     // error, so it does not fail the step that already landed (spec 17 §17.3
@@ -1419,6 +1416,176 @@ pub async fn join_context(
     capture_join_payment(cell, deps, auth, &member_did, &context_id, deducted_cost).await;
 
     Ok(())
+}
+
+/// What a [`join_context`] that fails after its Phase-3 MLS add takes back.
+///
+/// The Phase-3 add commit applies the MLS add and the §9.10.4.1 membership
+/// trigger and queues the `MemberJoined` record together, so the rollback
+/// removes all three in one commit: the stored state never holds the member
+/// without its record, or the record without the member (spec 17 §17.3 "Event
+/// log write failures").
+struct JoinRollback<'a> {
+    /// The local member, who removes the joiner from the MLS group.
+    local_did: &'a str,
+    /// The joiner.
+    member_did: &'a DID,
+    /// The context, hex-encoded.
+    context_id: &'a str,
+    /// The context's 32-byte id, which keys the registry floors.
+    context_id_bytes: &'a [u8; 32],
+    /// The §9.10.4.1 rotation state read before the add.
+    rotation_before_add: crate::context::actor::pseudonym_rotation::PseudonymRotationState,
+    /// The `MemberJoined` record the add commit queued.
+    joined_leaf: &'a crate::context::state::LeafSpec,
+}
+
+/// The join's Phase-1 and Phase-2 charges a [`JoinRollback`] settles.
+struct JoinCharges {
+    /// The deferred persist of a burned spending nonce, on a paid join that
+    /// has not persisted it yet.
+    nonce_token: Option<crate::context::actor::class_s::ClassSCommitToken>,
+    /// The escrow hold, voided by the rollback.
+    auth: Option<crate::context::economy_logic::PaidActionAuthorization>,
+    /// The Phase-1 economy ticket, rolled back.
+    ticket: crate::context::economy_logic::EconomyTicket,
+}
+
+/// The Phase-4 membership state a [`JoinRollback`] takes back as well, once
+/// [`join_context_membership`] has run.
+struct MembershipUndo {
+    /// The joiner's participation record cached before Phase 4, restored in
+    /// place of the one Phase 4 cached.
+    previous_participation: Option<crate::context::participation::RootedParticipationRecord>,
+    /// The local pseudonym before Phase 4.5 set a new one; `None` when Phase
+    /// 4.5 changed nothing.
+    previous_pseudonym: Option<[u8; 32]>,
+    /// True once Phase 4 emitted `MemberJoined` to subscribers, so the
+    /// rollback emits `MemberLeft` for the same member.
+    announced: bool,
+}
+
+impl JoinRollback<'_> {
+    /// Removes the joiner from the MLS group, restores the rotation state,
+    /// withdraws the queued `MemberJoined` record, prunes the joiner's sender
+    /// key, and tears down any Phase-4 state, all in one fail-closed keep
+    /// commit; then prunes the registry floors, persists a burned spending
+    /// nonce, voids the escrow hold, and rolls the economy ticket back.
+    ///
+    /// Returns the error the join returns: `cause`, or the nonce persist's
+    /// error when that persist fails. A rollback commit whose persist fails is
+    /// logged and does not replace `cause`; its changes stay in memory (keep
+    /// direction), and the stored state keeps the member with its record
+    /// queued until the next persist replaces it.
+    async fn run(
+        self,
+        cell: &mut crate::context::actor::class_s::ClassSCell,
+        deps: &ActorDeps,
+        charges: JoinCharges,
+        membership: Option<MembershipUndo>,
+        cause: ContextError,
+    ) -> ContextError {
+        let JoinCharges {
+            nonce_token,
+            auth,
+            ticket,
+        } = charges;
+        let Self {
+            local_did,
+            member_did,
+            context_id,
+            context_id_bytes,
+            rotation_before_add,
+            joined_leaf,
+        } = self;
+        let committed = cell
+            .commit_class_s_keep(deps, context_id, |mut v| {
+                if !v.withdraw_counted_log_unit(std::slice::from_ref(joined_leaf)) {
+                    tracing::error!(
+                        context_id,
+                        member = %member_did,
+                        "join rollback found no queued MemberJoined record to withdraw"
+                    );
+                }
+                let s = v.rest_mut();
+                if let Err(e) = s.remove_member(local_did, member_did, deps.clock.as_ref()) {
+                    tracing::warn!(
+                        context_id,
+                        member = %member_did,
+                        error = %e,
+                        "join rollback could not remove the member from the MLS group"
+                    );
+                }
+                // §9.10.4.1: the add did not commit, so neither does its
+                // membership trigger.
+                s.class_s.pseudonym_rotation = rotation_before_add;
+                if let Some(undo) = membership {
+                    s.remove_member_state(context_id, member_did);
+                    match undo.previous_participation {
+                        Some(record) => {
+                            s.governance
+                                .participation_cache
+                                .insert(member_did.to_string(), record);
+                        }
+                        None => {
+                            s.governance.participation_cache.remove(member_did.as_ref());
+                        }
+                    }
+                    if let Some(pseudonym) = undo.previous_pseudonym {
+                        s.routing.set_local_pseudonym(pseudonym);
+                    }
+                    if undo.announced {
+                        state::emit_event_into(
+                            &mut s.receive_buffer,
+                            ContextEvent::MemberLeft {
+                                member_did: member_did.clone(),
+                            },
+                            context_id,
+                            deps.event_tx.as_ref(),
+                        );
+                    }
+                }
+                if let Err(e) = s.remove_member_sender_key(member_did) {
+                    tracing::warn!(
+                        context_id,
+                        member = %member_did,
+                        error = %e,
+                        "join rollback could not prune the member's sender key"
+                    );
+                }
+                Ok(())
+            })
+            .await;
+        if let Err(persist_err) = committed {
+            tracing::error!(
+                context_id,
+                member = %member_did,
+                error = %persist_err,
+                cause = %cause,
+                "join rollback did not persist; memory holds the rollback, and the \
+                 stored state keeps the member with its MemberJoined record queued"
+            );
+        }
+        // ADR-049 PR-6: prune the departed member's Class-M registry floors
+        // (member-granular; siblings + the local scalar retained).
+        deps.supervisor
+            .remove_member_floors(context_id_bytes, member_did);
+        // Keep-direction (ADR-049 §9): persist the burned nonce fail-closed
+        // before the escrow-void + ticket rollback.
+        let err = crate::context::messaging_helpers::commit_send_nonce_token_on_abort(
+            nonce_token,
+            &*cell,
+            deps,
+            context_id,
+            cause,
+        )
+        .await;
+        if let Some(a) = auth {
+            crate::context::economy_helpers::void_paid_action(deps, a, context_id).await;
+        }
+        rollback_join_economy_ticket(cell, ticket);
+        err
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -6478,8 +6645,7 @@ mod restore_reconcile_tests {
 
         // ADR-049 §9: the paid path's fail-closed persist rides the deferred
         // `ClassSCommitToken`'s `discharge_with` (which calls
-        // `persist_state_fail_closed` internally and queues the `MemberJoined`
-        // record in the same persist) rather than an inline
+        // `persist_state_fail_closed` internally) rather than an inline
         // `persist_state_fail_closed` call. The ordering invariant is asserted
         // relative to that Phase-5 site.
         let persist_idx = body
@@ -6497,15 +6663,23 @@ mod restore_reconcile_tests {
         );
 
         // The persist-failure branch (between the fail-closed persist and the
-        // success-path capture) MUST void the escrow. `void_paid_action` also
-        // appears in the earlier MLS-rollback branches, so search the slice
-        // AFTER the persist call for the failure escape hatch specifically.
+        // success-path capture) MUST void the escrow. It rolls the join back
+        // through `JoinRollback::run`, which voids the hold it is handed.
         let post_persist = &body[persist_idx..capture_idx];
         assert!(
-            post_persist.contains("void_paid_action(deps, a, &context_id)"),
-            "the persist-failure branch must void the escrow (between the \
-             fail-closed persist and the success-path capture) so a durability \
-             failure releases the hold instead of charging the joiner"
+            post_persist.contains("undo\n            .run(") && post_persist.contains("auth,"),
+            "the persist-failure branch must hand the escrow hold to the join \
+             rollback (between the fail-closed persist and the success-path \
+             capture) so a durability failure releases the hold instead of \
+             charging the joiner"
+        );
+        let rollback = &SRC[SRC
+            .find("impl JoinRollback<'_> {")
+            .expect("JoinRollback exists")..];
+        let rollback = &rollback[..rollback.find("\n}\n").expect("the impl ends")];
+        assert!(
+            rollback.contains("void_paid_action(deps, a, context_id)"),
+            "the join rollback voids the escrow hold"
         );
     }
 
@@ -6620,19 +6794,20 @@ mod restore_reconcile_tests {
 
     /// ADR-049 §9 (round-9 leak fix) — STRUCTURAL. In `join_context` the
     /// `MemberJoined` record writes nothing to the log after the step: it is
-    /// queued in the Phase-5 persist on both the paid and the free path (spec 17
-    /// §17.3 "Event log write failures"), after the economy ticket is committed.
-    /// That persist's failure branch must void the external escrow hold (`auth`,
-    /// a `PaidActionAuthorization` with NO `Drop`) before the success-path
-    /// capture, or the hold leaks and the joiner is charged for an
-    /// unacknowledged join. The runtime tail (post-commit, pre-capture) is
-    /// reached only by the not-yet-wired explicit paid-acceptance flow (the
-    /// public entry rejects an auto-accept paid join at SCP-ECON-12030 first —
-    /// see `paid_join_blocked_at_auto_accept_guard_touches_no_escrow`), so this
-    /// is a STRUCTURAL assertion on the real `join_context` body, mirroring
+    /// queued once, in the Phase-3 commit that adds the member (spec 17 §17.3
+    /// "Event log write failures"), and the economy ticket is committed only
+    /// after the Phase-5 persist lands. That persist's failure branch must hand
+    /// the external escrow hold (`auth`, a `PaidActionAuthorization` with NO
+    /// `Drop`) to the join rollback before the success-path capture, or the
+    /// hold leaks and the joiner is charged for an unacknowledged join. The
+    /// runtime tail (post-commit, pre-capture) is reached only by the
+    /// not-yet-wired explicit paid-acceptance flow (the public entry rejects an
+    /// auto-accept paid join at SCP-ECON-12030 first — see
+    /// `paid_join_blocked_at_auto_accept_guard_touches_no_escrow`), so this is
+    /// a STRUCTURAL assertion on the real `join_context` body, mirroring
     /// `paid_join_captures_escrow_after_persist_not_before`.
     #[test]
-    fn join_context_queues_member_joined_in_the_persist_that_voids_escrow() {
+    fn join_context_queues_member_joined_in_the_add_commit() {
         const SRC: &str = include_str!("lifecycle_helpers.rs");
 
         let start = SRC
@@ -6648,39 +6823,52 @@ mod restore_reconcile_tests {
             !body.contains(".append_membership_change_leaf("),
             "join_context writes no record to the log after its step"
         );
-        let commit_idx = body
-            .find("commit_economy_ticket(ticket)")
-            .expect("join_context must commit the economy ticket");
+        let add_idx = body
+            .find("state.add_member(&member_did, kp_bytes")
+            .expect("join_context must add the member");
+        let distribute_idx = body
+            .find("distribute_sender_key(&local_did, &member_did)")
+            .expect("join_context must distribute the sender key");
         let failure_idx = body
             .find("if let Err(e) = persisted")
             .expect("join_context must branch on the Phase-5 persist's failure");
+        let commit_idx = body
+            .find("commit_economy_ticket(ticket)")
+            .expect("join_context must commit the economy ticket");
         let capture_idx = body
             .find("capture_join_payment(")
             .expect("join_context must capture the escrow");
         let enqueues: Vec<usize> = body
-            .match_indices("view.enqueue_counted_log_unit(vec![joined_leaf])")
+            .match_indices("enqueue_counted_log_unit(")
             .map(|(idx, _)| idx)
             .collect();
         assert_eq!(
-            enqueues.len(),
-            2,
-            "the paid and the free path each queue the MemberJoined record"
+            enqueues,
+            vec![
+                body.find("v.enqueue_counted_log_unit(vec![joined_leaf.clone()])")
+                    .expect("the add commit queues the MemberJoined record")
+                    + "v.".len()
+            ],
+            "the MemberJoined record is queued exactly once"
         );
         assert!(
-            enqueues
-                .iter()
-                .all(|idx| commit_idx < *idx && *idx < failure_idx),
-            "both paths queue the record in the Phase-5 persist, after the ticket \
-             commit and before that persist's failure branch"
+            add_idx < enqueues[0] && enqueues[0] < distribute_idx,
+            "the record is queued in the Phase-3 add commit"
         );
         assert!(
-            failure_idx < capture_idx,
-            "the persist's failure branch precedes the success-path capture"
+            body.contains("withdraw_counted_log_unit(std::slice::from_ref(joined_leaf))"),
+            "the join rollback withdraws the queued record"
         );
         assert!(
-            body[failure_idx..capture_idx].contains("void_paid_action(deps, a, &context_id)"),
-            "the Phase-5 persist-failure branch must void the escrow so a failed \
-             persist releases the hold instead of leaking it (ADR-049 §9 round-9)"
+            failure_idx < commit_idx && commit_idx < capture_idx,
+            "the ticket is committed after the Phase-5 persist's failure branch \
+             and before the success-path capture"
+        );
+        assert!(
+            body[failure_idx..commit_idx].contains("auth,"),
+            "the Phase-5 persist-failure branch must hand the escrow hold to the \
+             join rollback so a failed persist releases the hold instead of \
+             leaking it (ADR-049 §9 round-9)"
         );
     }
 
@@ -7223,11 +7411,10 @@ mod restore_reconcile_tests {
         );
     }
 
-    /// A join that rolls back after its MLS add queues no `MemberJoined`
-    /// record, in memory or in the stored state: the record is queued only in
-    /// the Phase-5 persist, which a rolled-back join never reaches, because the
-    /// rollback branches cannot take a queued record back out (spec 17 §17.3
-    /// "Event log write failures").
+    /// A join that rolls back after its MLS add leaves no `MemberJoined`
+    /// record, in memory or in the stored state: the Phase-3 add commit queues
+    /// the record, and the rollback withdraws it in the commit that removes the
+    /// member (spec 17 §17.3 "Event log write failures").
     #[tokio::test]
     async fn join_rolled_back_after_the_mls_add_queues_no_member_joined() {
         use crate::context::log_unit_helpers::test_support;
@@ -7265,6 +7452,141 @@ mod restore_reconcile_tests {
         assert!(
             snapshots.persisted_unit_types(&context_id).await.is_empty(),
             "the rollback's persist stores no MemberJoined record"
+        );
+    }
+
+    /// A join whose Phase-5 persist fails rolls back like every earlier
+    /// failure: the member, its Phase-4 state, and the `MemberJoined` record
+    /// the Phase-3 add commit queued all leave memory, the checkpoint count
+    /// returns to its value before the join, and the join returns the persist
+    /// error (spec 17 §17.3 "Event log write failures").
+    #[tokio::test]
+    async fn join_phase_five_persist_failure_rolls_the_member_and_record_back() {
+        use crate::context::log_unit_helpers::test_support;
+
+        let admin = DID("did:dht:z6MkJoinPhaseFiveAdmin".to_owned());
+        let probe_id = hex::encode([0x4du8; 32]);
+        let context_id = hex::encode([0x4eu8; 32]);
+        let (deps, _faulty, snapshots) =
+            test_support::deps_over_faulty_log(admin.as_ref(), &context_id).await;
+
+        // A join that lands counts the persists a join takes. The drain after
+        // Phase 5 persists the one queued unit twice, recording its base and
+        // then removing it, so Phase 5 is the third persist from the end.
+        deps.event_log
+            .init_event_log(&crate::context::state::context_id_to_bytes(&probe_id))
+            .await
+            .expect("init the probe's event log");
+        let (mut probe, probe_handle) = joinable_cell(&probe_id, &admin, true);
+        lifecycle_helpers::join_context(
+            &mut probe,
+            &deps,
+            &probe_handle,
+            scp_protocol::context::membership::KeyPackage::mock(DID(
+                "did:dht:z6MkPhaseFiveProbe".to_owned()
+            )),
+            None,
+            None,
+        )
+        .await
+        .expect("the probe join lands");
+        let persists_per_join = snapshots.persists_landed();
+        assert!(
+            persists_per_join >= 4,
+            "a join persists its add, its Phase-5 commit, and two drain steps"
+        );
+
+        let (mut cell, handle) = joinable_cell(&context_id, &admin, true);
+        let credited_before = cell.checkpoint_events_since;
+        let before_phase_five = persists_per_join - 3;
+        snapshots.fail_persists_after(before_phase_five);
+        let joiner = DID("did:dht:z6MkPhaseFiveJoiner".to_owned());
+        let result = lifecycle_helpers::join_context(
+            &mut cell,
+            &deps,
+            &handle,
+            scp_protocol::context::membership::KeyPackage::mock(joiner.clone()),
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(&result, Err(ContextError::PersistenceFailed(_))),
+            "the join returns the Phase-5 persist error: got {result:?}"
+        );
+        assert_eq!(
+            snapshots.persists_landed(),
+            persists_per_join + before_phase_five,
+            "every persist of this join before Phase 5 landed"
+        );
+        assert!(
+            !cell.membership.contains(joiner.as_ref()),
+            "the joiner leaves the MLS membership"
+        );
+        assert!(
+            !cell.role_state.members.contains(joiner.as_ref()),
+            "the joiner leaves the role state Phase 4 entered it in"
+        );
+        assert!(
+            !cell
+                .governance
+                .participation_cache
+                .contains_key(joiner.as_ref()),
+            "the participation record Phase 4 cached is withdrawn"
+        );
+        assert!(
+            cell.class_s.pending_log_units.is_empty(),
+            "the queued MemberJoined record is withdrawn"
+        );
+        assert_eq!(
+            cell.checkpoint_events_since, credited_before,
+            "the withdrawn record is no longer credited"
+        );
+    }
+
+    /// A crash after the Phase-3 add commit lands leaves the stored state
+    /// holding the queued `MemberJoined` record: the record rides the commit
+    /// that adds the member, so no stored state holds the member without it
+    /// (spec 17 §17.3 "Event log write failures"). The test key package makes
+    /// the MLS add itself a no-op, so the record is what the stored add shows.
+    #[tokio::test]
+    async fn join_add_commit_stores_the_member_with_its_record() {
+        use crate::context::log_unit_helpers::test_support;
+
+        let admin = DID("did:dht:z6MkJoinAddCommitAdmin".to_owned());
+        let context_id = hex::encode([0x4fu8; 32]);
+        let (deps, _faulty, snapshots) =
+            test_support::deps_over_faulty_log(admin.as_ref(), &context_id).await;
+        let (mut cell, handle) = joinable_cell(&context_id, &admin, true);
+
+        // Only the add commit lands; every later persist, the rollback's
+        // included, fails, which is what a crash right after it stores.
+        snapshots.fail_persists_after(1);
+        let joiner = DID("did:dht:z6MkAddCommitJoiner".to_owned());
+        let result = lifecycle_helpers::join_context(
+            &mut cell,
+            &deps,
+            &handle,
+            scp_protocol::context::membership::KeyPackage::mock(joiner.clone()),
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(&result, Err(ContextError::PersistenceFailed(_))),
+            "the persist after the add fails the join: got {result:?}"
+        );
+        assert_eq!(snapshots.persists_landed(), 1, "only the add commit landed");
+        assert_eq!(
+            snapshots.persisted_unit_types(&context_id).await,
+            vec![vec![scp_event_log::EventType::MemberJoined]],
+            "the stored state holds the member's MemberJoined record"
+        );
+        assert!(
+            cell.class_s.pending_log_units.is_empty() && !cell.membership.contains(joiner.as_ref()),
+            "memory holds the rollback"
         );
     }
 

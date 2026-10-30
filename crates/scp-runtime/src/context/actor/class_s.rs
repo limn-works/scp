@@ -547,6 +547,14 @@ impl PendingLogUnits {
     pub(crate) fn to_deque(&self) -> VecDeque<crate::context::state::PendingLogUnit> {
         self.units.clone()
     }
+
+    /// True when the newest queued unit holds exactly `leaves` and no drain
+    /// has started writing it.
+    pub(crate) fn last_is_unwritten(&self, leaves: &[crate::context::state::LeafSpec]) -> bool {
+        self.units
+            .back()
+            .is_some_and(|unit| unit.base_seq.is_none() && unit.leaves.as_slice() == leaves)
+    }
 }
 
 /// The queue and log-fault mutators (spec 17 §17.3 "Event log write
@@ -606,6 +614,26 @@ impl ClassSMut<'_> {
         self.enqueue_log_unit(leaves);
         self.state.checkpoint_events_since =
             self.state.checkpoint_events_since.saturating_add(count);
+    }
+
+    /// Takes back the unit [`Self::enqueue_counted_log_unit`] queued with
+    /// `leaves`, and its checkpoint count, when it is still the newest unit
+    /// and no drain has started writing it: the rollback of an operation that
+    /// queued its record in the commit of a step it then undoes. Returns
+    /// `false`, changing nothing, when the newest unit is not that one.
+    pub(crate) fn withdraw_counted_log_unit(
+        &mut self,
+        leaves: &[crate::context::state::LeafSpec],
+    ) -> bool {
+        let queue = &mut self.state.class_s.pending_log_units;
+        if !queue.last_is_unwritten(leaves) {
+            return false;
+        }
+        queue.units.pop_back();
+        let count = u64::try_from(leaves.len()).unwrap_or(u64::MAX);
+        self.state.checkpoint_events_since =
+            self.state.checkpoint_events_since.saturating_sub(count);
+        true
     }
 
     /// Sets the `base_seq` of the oldest queued unit. Returns `false` when the
