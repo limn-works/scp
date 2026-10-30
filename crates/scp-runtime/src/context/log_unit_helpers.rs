@@ -107,7 +107,13 @@ impl ConsequenceSink {
             Some(token) => token.discharge_with(cell, deps, context_id, mutate).await,
             None => cell.commit_class_s_keep(deps, context_id, mutate).await,
         };
-        let _ = drain_pending_log_units(cell, deps, context_id).await;
+        // The drain result is ignored on purpose: `result` is the operation's
+        // outcome. With a landed persist the step is durable, and on a persist
+        // failure the keep direction leaves the step and its queued unit in
+        // memory and `result` carries that error. A failed drain leaves the
+        // unit queued for the actor's next drain and logs its own error (spec
+        // 17 §17.3 "Event log write failures").
+        let _records_stay_queued_on_failure = drain_pending_log_units(cell, deps, context_id).await;
         result
     }
 }

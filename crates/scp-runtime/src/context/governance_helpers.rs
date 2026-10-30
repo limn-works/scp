@@ -458,7 +458,12 @@ pub async fn withdraw_governance_vote(
         Ok(())
     })
     .await?;
-    let _ = crate::context::log_unit_helpers::drain_pending_log_units(cell, deps, context_id).await;
+    // The step is durable with its records queued; write them now. The drain
+    // result is ignored on purpose: a failed drain leaves the records queued
+    // for the actor's next drain and logs its own error, so it does not fail
+    // the step that already landed (spec 17 §17.3 "Event log write failures").
+    let _records_stay_queued_on_failure =
+        crate::context::log_unit_helpers::drain_pending_log_units(cell, deps, context_id).await;
 
     Ok(status)
 }
@@ -532,7 +537,12 @@ pub async fn apply_pending_ceiling_modification(
         Ok(())
     })
     .await?;
-    let _ = crate::context::log_unit_helpers::drain_pending_log_units(cell, deps, context_id).await;
+    // The step is durable with its records queued; write them now. The drain
+    // result is ignored on purpose: a failed drain leaves the records queued
+    // for the actor's next drain and logs its own error, so it does not fail
+    // the step that already landed (spec 17 §17.3 "Event log write failures").
+    let _records_stay_queued_on_failure =
+        crate::context::log_unit_helpers::drain_pending_log_units(cell, deps, context_id).await;
 
     Ok(true)
 }
@@ -586,7 +596,12 @@ pub async fn apply_pending_economic_policy_change(
         Ok(())
     })
     .await?;
-    let _ = crate::context::log_unit_helpers::drain_pending_log_units(cell, deps, context_id).await;
+    // The step is durable with its records queued; write them now. The drain
+    // result is ignored on purpose: a failed drain leaves the records queued
+    // for the actor's next drain and logs its own error, so it does not fail
+    // the step that already landed (spec 17 §17.3 "Event log write failures").
+    let _records_stay_queued_on_failure =
+        crate::context::log_unit_helpers::drain_pending_log_units(cell, deps, context_id).await;
 
     Ok(true)
 }
@@ -4328,8 +4343,14 @@ pub async fn propose_governance_action_inner(
     };
 
     crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, context_id).await;
-    // The command's one drain, after every unit this propose queued.
-    let _ = crate::context::log_unit_helpers::drain_pending_log_units(cell, deps, context_id).await;
+    // The command's one drain, after every unit this propose queued. Each unit
+    // was queued inside the fail-closed persist of its step, so the step is
+    // durable. The drain result is ignored on purpose: a failed drain leaves
+    // the records queued for the actor's next drain and logs its own error,
+    // so it does not fail the command (spec 17 §17.3 "Event log write
+    // failures").
+    let _records_stay_queued_on_failure =
+        crate::context::log_unit_helpers::drain_pending_log_units(cell, deps, context_id).await;
 
     Ok((proposal, events, execution_result))
 }
@@ -4886,8 +4907,14 @@ pub async fn vote_on_proposal_inner(
     }
 
     crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, context_id).await;
-    // The command's one drain, after every unit this vote queued.
-    let _ = crate::context::log_unit_helpers::drain_pending_log_units(cell, deps, context_id).await;
+    // The command's one drain, after every unit this vote queued. Each unit
+    // was queued inside the fail-closed persist of its step, so the step is
+    // durable. The drain result is ignored on purpose: a failed drain leaves
+    // the records queued for the actor's next drain and logs its own error,
+    // so it does not fail the command (spec 17 §17.3 "Event log write
+    // failures").
+    let _records_stay_queued_on_failure =
+        crate::context::log_unit_helpers::drain_pending_log_units(cell, deps, context_id).await;
 
     Ok((status, events))
 }
@@ -6440,11 +6467,15 @@ async fn discharge_and_order_governance_action(
         .remove(&proposal.proposal_id);
     let persist_result = discharge.commit_fail_closed(deps, context_id).await;
     // The per-action helpers and finalize queue their records and never
-    // drain, so the records are written here, after the persist that made them
-    // durable (spec 17 §17.3 "Event log write failures"). A failed drain leaves
-    // them queued for the next drain and logs its own error; the action's step
-    // is already durable, so a failed drain does not fail the action.
-    let _ = crate::context::log_unit_helpers::drain_pending_log_units(cell, deps, context_id).await;
+    // drain, so the records are written here, after the persist (spec 17
+    // §17.3 "Event log write failures"). The drain result is ignored on
+    // purpose. With a landed persist the step is durable; on a failed one the
+    // keep direction leaves the step and its queued records in memory, and
+    // `persist_result` carries that error to the caller below. A failed drain
+    // leaves the records queued for the next drain and logs its own error, so
+    // it does not fail the action.
+    let _records_stay_queued_on_failure =
+        crate::context::log_unit_helpers::drain_pending_log_units(cell, deps, context_id).await;
     let result = match dispatch_outcome {
         Ok(result) => result,
         Err(dispatch_err) => {
