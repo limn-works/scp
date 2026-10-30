@@ -2126,7 +2126,7 @@ fn stream_settle_check_witness(
         return Outcome::ok(());
     };
     // Both witness-present arms carry the A-side dual-log leaf inputs
-    // (SCP-OUT-046 #135): the seal task queues that leaf through A's actor, and
+    // (SCP-OUT-046): the seal task queues that leaf through A's actor, and
     // a crash or an unreachable A can leave it unqueued whether or not the
     // money moved, so recovery re-sends it in either case (spec 17 §17.3). A
     // receipt that will not re-serialize fails the read, because recovery

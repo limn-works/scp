@@ -176,7 +176,8 @@ pub async fn handle_ttl_expiry(
     // identical on every attempt (M1) and across members. When the log or the
     // queue already holds the record (a prior attempt queued or wrote it), none
     // is planned: a duplicate terminal record diverges the Merkle root (ADR-049
-    // §9 amendment, finding (d)). A step done on a prior attempt needs no read.
+    // §9, "Terminal leaf append is idempotent"). A step done on a prior attempt
+    // needs no read.
     //
     // A log that cannot be read does not refuse the expiry. The terminal
     // transition and key destruction must not wait on the log, and a refusal

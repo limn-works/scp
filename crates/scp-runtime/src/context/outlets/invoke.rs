@@ -1072,9 +1072,9 @@ where
 /// Called after a successful outlet invocation to update governance state.
 /// The invoker's participation record, bound to the log's Merkle root that
 /// `participation.root` carries (read before the outlet ran), refreshes
-/// `participation.cache` for proposer eligibility (#1530).
+/// `participation.cache` for proposer eligibility.
 /// `evaluate_consequence_rules` checks whether the outlet invocation triggered
-/// any consequence rules (#1531).
+/// any consequence rules.
 #[must_use]
 pub fn post_outlet_invocation_bookkeeping<S: std::hash::BuildHasher>(
     events: &[scp_event_log::Event],
@@ -5539,7 +5539,7 @@ pub(crate) async fn run_streaming_saga_seal_task(
                 manifest_root = %hex::encode(outcome.stream_manifest_hash),
                 "streaming-saga seal task: sealed — Committing→Committed"
             );
-            // #135 — queue the receiving-context (A) `CrossContextOutletInvoked`
+            // Queue the receiving-context (A) `CrossContextOutletInvoked`
             // dual-log leaf through A's actor, completing the atomic dual-log
             // (B's `OutletInvoked` was queued by the seal handler). Sent BEFORE
             // the settlement move below so it borrows the whole `outcome`. Uses
@@ -5684,11 +5684,11 @@ pub(crate) async fn run_streaming_saga_seal_task(
 }
 
 /// Queues the receiving-context (A) `CrossContextOutletInvoked` dual-log leaf of
-/// a streaming-saga seal-close through A's actor (SCP-OUT-046 #135; the
+/// a streaming-saga seal-close through A's actor (SCP-OUT-046; the
 /// streaming sibling of the unary saga's caller-side
 /// `cross_context_invoked_leaf`; spec 17 §17.3 "Event log write failures").
-/// Shared by the seal task, the key-bearing crash-recovery truncated close
-/// (#136), and the keyless recovery sweep, so all three queue the identical
+/// Shared by the seal task, the key-bearing crash-recovery truncated close,
+/// and the keyless recovery sweep, so all three queue the identical
 /// A-side leaf.
 ///
 /// The leaf is a commit-ordered CONVERGENT durable leaf (ADR-011 Amendment §6

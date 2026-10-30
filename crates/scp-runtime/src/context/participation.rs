@@ -2,10 +2,12 @@
 //! cached record itself (ADR-017 acceptance criterion 1; spec 17 §17.3 "Event
 //! log write failures").
 //!
-//! A participation record's `event_log_root` claims the log state the record
-//! was computed from. A root that failed to read must never stand in for one:
-//! an all-zero root bound to real participation facts reads as a record of a
-//! real log state. Two types make that impossible by construction:
+//! A participation record's `event_log_root` is the Merkle root of the
+//! context's durable event log as read before the step, and covers no more:
+//! it commits to no leaf the step queues or that has not yet reached the log.
+//! A root that failed to read must never stand in for one: an
+//! all-zero root bound to real participation facts reads as a record of a real
+//! log state. Two types make that impossible by construction:
 //!
 //! - [`ParticipationRoot`] is built only by [`ParticipationRoot::read`], which
 //!   returns the provider's error when the read fails. A participation path

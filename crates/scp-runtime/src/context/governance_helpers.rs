@@ -1838,7 +1838,7 @@ pub async fn execute_register_outlet(
     // name none, leaving a reader able to count registrations without learning
     // which outlets they registered, and leaving the genesis path (which writes
     // the same payload) and this path emitting indistinguishable leaves for
-    // different outlets (GitHub #2250). It is planned before the push, so an
+    // different outlets. It is planned before the push, so an
     // entry the append would refuse refuses the registration before its step.
     let leaf = plan_encoded_leaf(
         scp_event_log::EventType::OutletRegistered,
@@ -1907,7 +1907,7 @@ pub async fn execute_remove_outlet(
     // The leaf names the outlet whose invocation authority this removal
     // withdrew. `EventPayload::default()` would name none, so a reader holding
     // both the registration leaves and this removal leaf could not tell which
-    // registration the removal withdrew (GitHub #2250).
+    // registration the removal withdrew.
     let leaf = plan_encoded_leaf(
         scp_event_log::EventType::OutletRemoved,
         actor_did,
@@ -3290,7 +3290,7 @@ pub async fn execute_reconfigure_governance(
     //
     // The `GovernanceReconfigured` record and its companion
     // `GovernanceDeadlockRecovery` record, which carries the structured
-    // recovery justification (#1847), ride that persist as one queued log unit
+    // recovery justification, ride that persist as one queued log unit
     // (spec 17 §17.3 "Event log write failures"), so the two land together or
     // not at all. They share the actor and timestamp so verifiers can correlate
     // them. Both are planned here, so an entry the append would refuse refuses

@@ -8204,7 +8204,7 @@ impl Supervisor {
         }
 
         // The seal task queues the atomic dual-log's A-side leaf through the
-        // RECEIVING context A's actor (SCP-OUT-046 #135; spec 17 §17.3) — fail
+        // RECEIVING context A's actor (SCP-OUT-046; spec 17 §17.3) — fail
         // closed WITHOUT reserving when no actor serves A (mirrors the
         // best-effort bridge's early check).
         if self.lookup(&caller_hex).is_none() {
@@ -15545,10 +15545,15 @@ impl Supervisor {
 
         // §5.4.5 / SCP-OUT-035 — the durable close-event sink, wired INTERNALLY
         // here (not by the FFI caller, which passes `None`) so the "ONE event
-        // per stream at close" record is persisted in production and the full
-        // §5.4.5:566 wire-rejection fires at the real log-insert boundary. A
-        // caller-supplied `invoked_event_sink` (tests capturing the event) takes
-        // precedence; otherwise the durable production sink is used.
+        // per stream at close" record is persisted in production. The sink
+        // plans the leaf with only the event-local `chunks_billed <=
+        // stream_chunk_count` backstop: the pump keeps no chunks, so it enforces
+        // same-context billing integrity inline
+        // (`AuditAnomaly::ChunksBilledSelfMismatch`), and the full §5.4.5:566
+        // manifest re-derivation runs only on the cross-context receiver
+        // (`plan_outlet_invoked_verified_leaf`). A caller-supplied
+        // `invoked_event_sink` (tests capturing the event) takes precedence;
+        // otherwise the durable production sink is used.
         let durable_invoked_sink: Arc<dyn crate::context::outlets::invoke::OutletInvokedEventSink> =
             Arc::new(
                 crate::context::outlets::stream_settlement_adapter::ActorOutletInvokedEventSink::new(
