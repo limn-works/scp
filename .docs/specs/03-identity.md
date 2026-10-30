@@ -944,7 +944,7 @@ pub trait IdentityBackend: Send + Sync {
 }
 
 /// The error half of this trait's six methods and of the three recovery entry
-/// points `09-security-model.md` §9.7.4.2 R10 declares. The type carries twenty
+/// points `09-security-model.md` §9.7.4.2 R10 declares. The type carries twenty-one
 /// variants and no others, and `SCP-IDENT-1105` is reserved and names none. A refusal the protocol mandates carries one of these
 /// variants, so four bindings mint one code rather than four and a caller tells
 /// a custody choice from a network condition. **The identity half's one refusal reaches a caller through
@@ -1050,6 +1050,14 @@ pub enum IdentityError {
     /// reveal-authorized and whose `KeptComposition` this device does not hold, so
     /// nothing was published (`09-security-model.md` §9.7.4.2 R10).
     NoPendingSignature { event_digest: [u8; 32] },
+    /// SCP-IDENT-1121. The method of the next-set custody `create` was
+    /// handed does not conform on the config's `CustodyProfile`, while
+    /// another method is offered on that profile, so `create` generated no
+    /// key (`09-security-model.md` §9.7.4.1 item 4, "Method by profile").
+    /// The caller changes its next-set custody to a method the profile
+    /// offers. Where no method is offered on the profile, `create` returns
+    /// `NoIndependentSubstrate` instead.
+    MethodNotOfferedOnProfile,
 }
 
 /// The step of `09-security-model.md` §9.7.4.2 R3's check order at which an
