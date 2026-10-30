@@ -205,6 +205,15 @@ const HANDLERS_PUSH_SRC: &str =
     include_str!("../../../../crates/scp-runtime/src/context/actor/handlers/push.rs");
 const HANDLERS_LOG_UNIT_SRC: &str =
     include_str!("../../../../crates/scp-runtime/src/context/actor/handlers/log_unit.rs");
+// Streaming settlement adapter source — owns `ActorOutletInvokedEventSink::record`,
+// the streaming close sink pinned by
+// `log_unit_writers_reach_the_pending_queue_through_the_actor_mailbox`.
+const OUTLETS_STREAM_SETTLEMENT_ADAPTER_SRC: &str =
+    include_str!("../../../../crates/scp-runtime/src/context/outlets/stream_settlement_adapter.rs");
+// Log-unit helpers source — owns the leaf planners, pinned by
+// `log_unit_writers_reach_the_pending_queue_through_the_actor_mailbox`.
+const LOG_UNIT_HELPERS_SRC: &str =
+    include_str!("../../../../crates/scp-runtime/src/context/log_unit_helpers.rs");
 // Push helpers source — owns `push_helpers::wake_target`, the push-wake pull
 // target (ADR-029 §2). Pinned by `push_wake_targets_reach_push_helpers`.
 const PUSH_HELPERS_SRC: &str =
@@ -1576,6 +1585,27 @@ fn log_unit_writers_reach_the_pending_queue_through_the_actor_mailbox() {
             "self.send_log_unit("
         ),
         "the streaming close record must be queued through send_log_unit"
+    );
+    assert!(
+        fn_body_contains(
+            OUTLETS_STREAM_SETTLEMENT_ADAPTER_SRC,
+            "record",
+            ".enqueue_streaming_outlet_invoked_unit("
+        ),
+        "ActorOutletInvokedEventSink::record must queue the streaming close record through \
+         enqueue_streaming_outlet_invoked_unit"
+    );
+    assert!(
+        fn_body_contains(
+            SUPERVISOR_SRC,
+            "enqueue_streaming_outlet_invoked_unit",
+            "plan_outlet_invoked_leaf("
+        ) && fn_body_contains(
+            LOG_UNIT_HELPERS_SRC,
+            "plan_outlet_invoked_verified_leaf",
+            "plan_outlet_invoked_leaf("
+        ),
+        "both OutletInvoked writers must encode through plan_outlet_invoked_leaf"
     );
     for writer in ["send_streaming_saga_a_unit", "send_cross_context_a_unit"] {
         assert!(

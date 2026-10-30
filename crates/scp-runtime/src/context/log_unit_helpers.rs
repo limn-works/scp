@@ -295,13 +295,7 @@ pub fn plan_membership_change_leaf(
     change: &scp_event_log::payload::MembershipChangePayload,
     timestamp_secs: u64,
 ) -> Result<LeafSpec, ContextError> {
-    plan_leaf(
-        event_type,
-        actor_did.to_owned(),
-        scp_event_log::payload::encode_payload(change)
-            .map_err(|e| ContextError::EventLogFailed(e.to_string()))?,
-        timestamp_secs,
-    )
+    plan_encoded_leaf(event_type, actor_did, change, timestamp_secs)
 }
 
 /// Plans a `RoleAssigned` leaf for `subject_did` taking `role`. It is the one
@@ -319,14 +313,13 @@ pub fn plan_role_assigned_leaf(
     role: &str,
     timestamp_secs: u64,
 ) -> Result<LeafSpec, ContextError> {
-    plan_leaf(
+    plan_encoded_leaf(
         scp_event_log::EventType::RoleAssigned,
-        actor_did.to_owned(),
-        scp_event_log::payload::encode_payload(&scp_event_log::payload::RoleAssignedPayload {
+        actor_did,
+        &scp_event_log::payload::RoleAssignedPayload {
             subject_did: subject_did.to_owned(),
             role: role.to_owned(),
-        })
-        .map_err(|e| ContextError::EventLogFailed(e.to_string()))?,
+        },
         timestamp_secs,
     )
 }
@@ -344,22 +337,19 @@ pub fn plan_ttl_extended_leaf(
     extension: &scp_event_log::payload::TtlExtendedPayload,
     timestamp_secs: u64,
 ) -> Result<LeafSpec, ContextError> {
-    plan_leaf(
+    plan_encoded_leaf(
         scp_event_log::EventType::TtlExtended,
-        actor_did.to_owned(),
-        scp_event_log::payload::encode_payload(extension).map_err(|e| {
-            ContextError::EventLogFailed(format!("failed to encode TtlExtended payload: {e}"))
-        })?,
+        actor_did,
+        extension,
         timestamp_secs,
     )
 }
 
 /// Plans an `OutletInvoked` leaf after the FULL §5.4.5:566 manifest check
-/// over the `reassembled` chunk sequence. It is the one encoder for that leaf:
-/// the receiving context queues the leaf it plans through
-/// `LogUnitRequest::VerifiedOutletInvoked`, and only the pending-unit drain
-/// writes it (spec 17 §17.3 "Event log write failures"). The leaf's own
-/// construction then runs the event-local backstop.
+/// over the `reassembled` chunk sequence, then encodes it with
+/// [`plan_outlet_invoked_leaf`]. The receiving context queues the leaf it plans
+/// through `LogUnitRequest::VerifiedOutletInvoked`, and only the pending-unit
+/// drain writes it (spec 17 §17.3 "Event log write failures").
 ///
 /// # Errors
 ///
@@ -379,6 +369,26 @@ pub fn plan_outlet_invoked_verified_leaf(
                     .to_string(),
             )
         })?;
+    plan_outlet_invoked_leaf(event, actor_did, timestamp_secs)
+}
+
+/// Plans an `OutletInvoked` leaf. It is the one encoder for that leaf: the
+/// cross-context receiver plans through [`plan_outlet_invoked_verified_leaf`],
+/// which runs the manifest check over the reassembled chunks first, and the
+/// same-context streaming close, whose pump keeps no chunks, plans through it
+/// directly (spec 17 §17.3 "Event log write failures"). The leaf's own
+/// construction runs the event-local `chunks_billed <= stream_chunk_count`
+/// backstop.
+///
+/// # Errors
+///
+/// Returns [`ContextError::EventLogFailed`] when the event does not serialize
+/// or the payload breaks the append's payload rules.
+pub fn plan_outlet_invoked_leaf(
+    event: &scp_protocol::context::outlets::lifecycle::OutletInvokedEvent,
+    actor_did: &str,
+    timestamp_secs: u64,
+) -> Result<LeafSpec, ContextError> {
     let data = serde_json::to_vec(event).map_err(|e| {
         ContextError::EventLogFailed(format!("failed to serialize OutletInvokedEvent: {e}"))
     })?;

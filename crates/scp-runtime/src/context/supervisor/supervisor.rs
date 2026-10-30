@@ -3170,13 +3170,9 @@ impl Supervisor {
         event: scp_protocol::context::outlets::lifecycle::OutletInvokedEvent,
         actor_did: String,
     ) -> Result<(), LogUnitSendError> {
-        let data = serde_json::to_vec(&event).map_err(|e| {
-            ContextError::EventLogFailed(format!("failed to serialize OutletInvokedEvent: {e}"))
-        })?;
-        let leaf = crate::context::log_unit_helpers::plan_leaf(
-            scp_event_log::EventType::OutletInvoked,
-            actor_did,
-            scp_event_log::EventPayload { data },
+        let leaf = crate::context::log_unit_helpers::plan_outlet_invoked_leaf(
+            &event,
+            &actor_did,
             self.now_secs()?,
         )?;
         self.send_log_unit(
