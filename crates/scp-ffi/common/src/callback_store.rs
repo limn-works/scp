@@ -16,15 +16,21 @@
 //! forms a key and never reads the bytes it stores: the member forms every
 //! key from the credential and encodes every value.
 //!
-//! Both members take the credential from the set's lease ([`SetLease`]), the
-//! one source a [`StoreSet`](scp_platform::StoreSet) also reads, so a member
-//! cannot be bound to a credential other than the set's.
+//! Neither member holds a credential. Each call keys on the credential the
+//! [`StoreSet`](scp_platform::StoreSet) passes from its own lease, so a member
+//! cannot read or write the store of a credential other than its set's.
+//!
+//! Every read either member makes returns the platform's current value and
+//! never a cache (ADR-054 §Assertion-arm and store-set host interfaces, the
+//! freshness rule).
 //!
 //! What a member does not decide: whether it exists on the host (the
 //! caller's [`PlatformAccountSlot`](scp_platform::PlatformAccountSlot)
 //! states it), whether a platform write read back equal (the store set reads
 //! each one back), and what a `largeBlob` write that did not land does to the
-//! ceremony (the store set decides).
+//! ceremony (the store set decides). What a member does decide: the act that
+//! clears a `largeBlob` write that did not land, from the platform facts the
+//! host reports ([`BlobWrite`]), so no host picks an act.
 
 use std::fmt;
 use std::future::Future;
@@ -33,9 +39,8 @@ use std::sync::Arc;
 use scp_platform::{
     CredentialId, EntrySource, LargeBlobClearingAct, LargeBlobNotLanded, MemberRead,
     NotReachedCause, RecordDecodeError, RecoveryEventStore, RecoveryHandleStore,
-    RecoveryRecordStore, SetLease, StoreEntry, StoreSetRecord, StoreWriteFailure,
-    check_event_length, decode_entry, decode_store_set_record, encode_entry,
-    encode_store_set_record,
+    RecoveryRecordStore, StoreEntry, StoreSetRecord, StoreWriteFailure, check_event_length,
+    decode_entry, decode_store_set_record, encode_entry, encode_store_set_record,
 };
 
 #[cfg(test)]
@@ -62,9 +67,9 @@ impl std::error::Error for HostStoreFailure {}
 ///
 /// The host contract (ADR-054): `get` answers `Ok(None)` only where the
 /// platform reports the item absent and fails on every other platform
-/// failure; `get` reads the platform store on every call and never answers
-/// from a cache; `put` returns only after the platform reports the item
-/// stored.
+/// failure; `put` returns only after the platform reports the item stored.
+/// `get` follows ADR-054's freshness rule: it returns the platform's current
+/// value, read from the platform store on that call, and never a cache.
 pub trait SyncedStoreHost: Send + Sync {
     /// The bytes stored under `key`, or `None` where the platform reports
     /// the item absent.
@@ -81,24 +86,56 @@ pub trait SyncedStoreHost: Send + Sync {
     ) -> impl Future<Output = Result<(), HostStoreFailure>> + Send;
 }
 
-/// What a host reports for a `largeBlob` write it answered.
+/// What the platform reported for a `largeBlob` write the host answered.
+/// The host reports a platform fact and never a clearing act; the
+/// [`CredentialBlobMember`] maps each fact to the act (ADR-054).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BlobWrite {
-    /// The platform reported `written: true`.
+    /// The platform reported `largeBlob: { written: true }`.
     Landed,
-    /// The write did not land: the cause where the platform reported one,
-    /// and the act that clears it.
-    NotLanded(LargeBlobNotLanded),
+    /// The platform reported `largeBlob: { written: false }` with no error:
+    /// the authenticator's large-blob array at capacity, cleared by
+    /// [`LargeBlobClearingAct::RemoveConsumingCredential`].
+    NotWritten,
+    /// The assertion returned no `largeBlob` output: a client that did not
+    /// process the extension, cleared by
+    /// [`LargeBlobClearingAct::RetryVerification`].
+    NoOutput,
+    /// The user declined or cancelled the verification gesture, cleared by
+    /// [`LargeBlobClearingAct::RetryVerification`].
+    VerificationDeclined {
+        /// The cause the platform reported, where it reported one.
+        cause: Option<String>,
+    },
+}
+
+impl BlobWrite {
+    /// The R10 rule (`09-security-model.md` §9.7.4.2, ADR-054): the act that
+    /// clears each write that did not land.
+    fn landed(self) -> Result<(), LargeBlobNotLanded> {
+        let (cause, clears_by) = match self {
+            Self::Landed => return Ok(()),
+            Self::NotWritten => (None, LargeBlobClearingAct::RemoveConsumingCredential),
+            Self::NoOutput => (None, LargeBlobClearingAct::RetryVerification),
+            Self::VerificationDeclined { cause } => {
+                (cause, LargeBlobClearingAct::RetryVerification)
+            }
+        };
+        Err(LargeBlobNotLanded { cause, clears_by })
+    }
 }
 
 /// A host's reach into one credential's `WebAuthn` `largeBlob` store.
 ///
 /// The host contract (ADR-054): `write_blob` answers [`BlobWrite::Landed`]
 /// only where the platform reports `written: true`, and a `largeBlob` output
-/// the platform does not return is [`BlobWrite::NotLanded`]; `read_blob`
+/// the platform does not return is [`BlobWrite::NoOutput`]; `read_blob`
 /// answers `Ok(None)` only where the platform reports the store holds
 /// nothing. The host passes the bytes through unread, and reads and writes
-/// the store of `credential_id` and no other.
+/// the store of `credential_id` and no other. `read_blob` follows ADR-054's
+/// freshness rule: it returns the platform's current value, read through a
+/// `largeBlob` read assertion on that call, and never a cache or the bytes of
+/// the host's last write.
 pub trait CredentialBlobHost: Send + Sync {
     /// The bytes `credential_id`'s `largeBlob` store holds, or `None`.
     fn read_blob(
@@ -187,22 +224,13 @@ fn synced_entry(bytes: &[u8]) -> Result<Option<StoreEntry>, RecordDecodeError> {
 #[derive(Debug)]
 pub struct SyncedStoreMember<H> {
     host: H,
-    credential_id: CredentialId,
-    entry_key: String,
-    record_key: String,
 }
 
 impl<H: SyncedStoreHost> SyncedStoreMember<H> {
-    /// Binds `host` to the credential of `lease`, the set this member joins.
+    /// The member over `host`.
     #[must_use]
-    pub fn new(host: H, lease: &impl SetLease) -> Self {
-        let credential_id = lease.credential_id().clone();
-        Self {
-            host,
-            entry_key: credential_id.entry_key(),
-            record_key: credential_id.record_key(),
-            credential_id,
-        }
+    pub const fn new(host: H) -> Self {
+        Self { host }
     }
 
     async fn put(&self, key: &str, bytes: &[u8]) -> Result<(), StoreWriteFailure> {
@@ -218,21 +246,30 @@ impl<H: SyncedStoreHost> SyncedStoreMember<H> {
 impl<H: SyncedStoreHost> RecoveryHandleStore for SyncedStoreMember<H> {
     type WriteFailure = StoreWriteFailure;
 
-    async fn read_entry(&self) -> MemberRead<StoreEntry> {
-        decoded(self.host.get(&self.entry_key).await, synced_entry)
+    async fn read_entry(&self, credential_id: &CredentialId) -> MemberRead<StoreEntry> {
+        decoded(
+            self.host.get(&credential_id.entry_key()).await,
+            synced_entry,
+        )
     }
 
-    async fn write_entry(&self, entry: &StoreEntry) -> Result<(), StoreWriteFailure> {
-        self.put(&self.entry_key, &encode_entry(entry)).await
+    async fn write_entry(
+        &self,
+        credential_id: &CredentialId,
+        entry: &StoreEntry,
+    ) -> Result<(), StoreWriteFailure> {
+        self.put(&credential_id.entry_key(), &encode_entry(entry))
+            .await
     }
 }
 
 impl<H: SyncedStoreHost> RecoveryEventStore for SyncedStoreMember<H> {
-    async fn read_event(&self, event_digest: &[u8; 32]) -> MemberRead<Vec<u8>> {
-        let answer = self
-            .host
-            .get(&self.credential_id.event_key(event_digest))
-            .await;
+    async fn read_event(
+        &self,
+        credential_id: &CredentialId,
+        event_digest: &[u8; 32],
+    ) -> MemberRead<Vec<u8>> {
+        let answer = self.host.get(&credential_id.event_key(event_digest)).await;
         decoded(answer, |bytes| {
             check_event_length(bytes).map(|()| Some(bytes.to_vec()))
         })
@@ -240,24 +277,32 @@ impl<H: SyncedStoreHost> RecoveryEventStore for SyncedStoreMember<H> {
 
     async fn write_event(
         &self,
+        credential_id: &CredentialId,
         event_digest: &[u8; 32],
         event: &[u8],
     ) -> Result<(), StoreWriteFailure> {
-        self.put(&self.credential_id.event_key(event_digest), event)
+        self.put(&credential_id.event_key(event_digest), event)
             .await
     }
 }
 
 impl<H: SyncedStoreHost> RecoveryRecordStore for SyncedStoreMember<H> {
-    async fn read_record(&self) -> MemberRead<StoreSetRecord> {
-        decoded(self.host.get(&self.record_key).await, |bytes| {
+    async fn read_record(&self, credential_id: &CredentialId) -> MemberRead<StoreSetRecord> {
+        decoded(self.host.get(&credential_id.record_key()).await, |bytes| {
             decode_store_set_record(bytes).map(Some)
         })
     }
 
-    async fn write_record(&self, record: &StoreSetRecord) -> Result<(), StoreWriteFailure> {
-        self.put(&self.record_key, &encode_store_set_record(record))
-            .await
+    async fn write_record(
+        &self,
+        credential_id: &CredentialId,
+        record: &StoreSetRecord,
+    ) -> Result<(), StoreWriteFailure> {
+        self.put(
+            &credential_id.record_key(),
+            &encode_store_set_record(record),
+        )
+        .await
     }
 }
 
@@ -268,42 +313,42 @@ impl<H: SyncedStoreHost> RecoveryRecordStore for SyncedStoreMember<H> {
 /// The credential's `largeBlob` member over a host's `largeBlob` reads and
 /// writes. It holds the §17.8 entry record and nothing else.
 ///
-/// A write the host reports as not landed, and a write the host failed to
-/// answer, are both [`LargeBlobNotLanded`]: a thrown write is never a landed
-/// one. A thrown write names [`LargeBlobClearingAct::RetryVerification`],
-/// with the host's error text as the cause (ADR-054).
+/// Every write that did not land, and every write the host failed to
+/// answer, is [`LargeBlobNotLanded`] with the act this member maps from the
+/// platform fact ([`BlobWrite`]): a thrown write is never a landed one, and
+/// names [`LargeBlobClearingAct::RetryVerification`] with the host's error
+/// text as the cause (ADR-054).
 #[derive(Debug)]
 pub struct CredentialBlobMember<H> {
     host: H,
-    credential_id: CredentialId,
 }
 
 impl<H: CredentialBlobHost> CredentialBlobMember<H> {
-    /// Binds `host` to the credential of `lease`, the set this member joins.
+    /// The member over `host`.
     #[must_use]
-    pub fn new(host: H, lease: &impl SetLease) -> Self {
-        Self {
-            host,
-            credential_id: lease.credential_id().clone(),
-        }
+    pub const fn new(host: H) -> Self {
+        Self { host }
     }
 }
 
 impl<H: CredentialBlobHost> RecoveryHandleStore for CredentialBlobMember<H> {
     type WriteFailure = LargeBlobNotLanded;
 
-    async fn read_entry(&self) -> MemberRead<StoreEntry> {
-        decoded(self.host.read_blob(&self.credential_id).await, synced_entry)
+    async fn read_entry(&self, credential_id: &CredentialId) -> MemberRead<StoreEntry> {
+        decoded(self.host.read_blob(credential_id).await, synced_entry)
     }
 
-    async fn write_entry(&self, entry: &StoreEntry) -> Result<(), LargeBlobNotLanded> {
+    async fn write_entry(
+        &self,
+        credential_id: &CredentialId,
+        entry: &StoreEntry,
+    ) -> Result<(), LargeBlobNotLanded> {
         match self
             .host
-            .write_blob(&self.credential_id, &encode_entry(entry))
+            .write_blob(credential_id, &encode_entry(entry))
             .await
         {
-            Ok(BlobWrite::Landed) => Ok(()),
-            Ok(BlobWrite::NotLanded(not_landed)) => Err(not_landed),
+            Ok(outcome) => outcome.landed(),
             Err(failure) => Err(LargeBlobNotLanded {
                 cause: Some(failure.cause),
                 clears_by: LargeBlobClearingAct::RetryVerification,

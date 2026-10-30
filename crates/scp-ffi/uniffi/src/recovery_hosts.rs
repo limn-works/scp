@@ -15,11 +15,9 @@ use std::sync::Arc;
 use scp_ffi_common::callback_store::{
     BlobWrite, CredentialBlobHost, HostStoreFailure, SyncedStoreHost,
 };
-use scp_platform::{CredentialId, LargeBlobClearingAct, LargeBlobNotLanded};
+use scp_platform::CredentialId;
 
-use crate::{
-    BlobClearingAct, BlobWriteOutcome, CredentialBlobProvider, ScpError, SyncedStoreProvider,
-};
+use crate::{BlobWriteOutcome, CredentialBlobProvider, ScpError, SyncedStoreProvider};
 
 fn host_failure(error: &ScpError) -> HostStoreFailure {
     HostStoreFailure {
@@ -82,11 +80,15 @@ impl std::fmt::Debug for ForeignCredentialBlob {
     }
 }
 
-const fn clearing_act(act: BlobClearingAct) -> LargeBlobClearingAct {
-    match act {
-        BlobClearingAct::RetryVerification => LargeBlobClearingAct::RetryVerification,
-        BlobClearingAct::RemoveConsumingCredential => {
-            LargeBlobClearingAct::RemoveConsumingCredential
+/// The platform fact the host reported, carried over one to one; the
+/// member maps it to its clearing act.
+fn blob_write(outcome: BlobWriteOutcome) -> BlobWrite {
+    match outcome {
+        BlobWriteOutcome::Landed => BlobWrite::Landed,
+        BlobWriteOutcome::NotWritten => BlobWrite::NotWritten,
+        BlobWriteOutcome::NoOutput => BlobWrite::NoOutput,
+        BlobWriteOutcome::VerificationDeclined { cause } => {
+            BlobWrite::VerificationDeclined { cause }
         }
     }
 }
@@ -112,15 +114,7 @@ impl CredentialBlobHost for ForeignCredentialBlob {
             .write_blob(credential_id.as_bytes().to_vec(), entry.to_vec())
             .await
             .map_err(|error| host_failure(&error))?;
-        Ok(match outcome {
-            BlobWriteOutcome::Landed => BlobWrite::Landed,
-            BlobWriteOutcome::NotLanded { cause, clears_by } => {
-                BlobWrite::NotLanded(LargeBlobNotLanded {
-                    cause,
-                    clears_by: clearing_act(clears_by),
-                })
-            }
-        })
+        Ok(blob_write(outcome))
     }
 }
 
@@ -132,16 +126,17 @@ mod tests {
     use std::sync::Mutex;
     use std::task::{Context, Poll, Waker};
 
-    use scp_did::Identifier;
     use scp_ffi_common::callback_store::{CredentialBlobMember, SyncedStoreMember};
+    use scp_ffi_common::error_codes::STORAGE_8016;
     use scp_platform::{
-        MemberRead, NotReachedCause, RecoveryHandleStore, RecoveryLease, RecoveryLeases,
+        LargeBlobClearingAct, LargeBlobNotLanded, MemberRead, NotReachedCause, RecoveryHandleStore,
         StoreEntry, StoreWriteFailure,
     };
 
     use super::*;
 
-    const CODE: &str = "SCP-STORAGE-7001";
+    /// The code ADR-054 names for a store-set host that cannot answer.
+    const CODE: &str = STORAGE_8016;
 
     fn run<F: Future>(future: F) -> F::Output {
         let mut future = pin!(future);
@@ -162,12 +157,6 @@ mod tests {
 
     fn credential() -> CredentialId {
         CredentialId::new(vec![0xc1; 64]).unwrap()
-    }
-
-    fn lease(leases: &RecoveryLeases) -> RecoveryLease {
-        leases
-            .acquire(credential(), Identifier::from_bytes([0x07; 32]))
-            .unwrap()
     }
 
     /// A Rust stand-in for a foreign synced store: it answers `get` from a
@@ -230,7 +219,7 @@ mod tests {
         async fn write_blob(
             &self,
             credential_id: Vec<u8>,
-            _record: Vec<u8>,
+            _entry: Vec<u8>,
         ) -> Result<BlobWriteOutcome, ScpError> {
             self.credentials.lock().unwrap().push(credential_id);
             self.write.lock().unwrap().clone()
@@ -238,13 +227,11 @@ mod tests {
     }
 
     fn synced_member(provider: ScriptedSynced) -> SyncedStoreMember<ForeignSyncedStore> {
-        let leases = RecoveryLeases::new();
-        SyncedStoreMember::new(ForeignSyncedStore::new(Arc::new(provider)), &lease(&leases))
+        SyncedStoreMember::new(ForeignSyncedStore::new(Arc::new(provider)))
     }
 
     fn blob_member(provider: Arc<ScriptedBlob>) -> CredentialBlobMember<ForeignCredentialBlob> {
-        let leases = RecoveryLeases::new();
-        CredentialBlobMember::new(ForeignCredentialBlob::new(provider), &lease(&leases))
+        CredentialBlobMember::new(ForeignCredentialBlob::new(provider))
     }
 
     /// A thrown `ScpError` reaches the member as the host's failure with the
@@ -255,13 +242,13 @@ mod tests {
         assert!(text.contains(CODE), "{text}");
         let member = synced_member(ScriptedSynced::new(Err(thrown()), Err(thrown())));
         assert_eq!(
-            run(member.read_entry()),
+            run(member.read_entry(&credential())),
             MemberRead::NotReached(NotReachedCause::Unreachable {
                 cause: text.clone()
             })
         );
         assert_eq!(
-            run(member.write_entry(&StoreEntry::EMPTY)),
+            run(member.write_entry(&credential(), &StoreEntry::EMPTY)),
             Err(StoreWriteFailure { cause: text })
         );
     }
@@ -271,10 +258,13 @@ mod tests {
     #[test]
     fn uniffi_synced_get_none_vs_throw() {
         let absent = synced_member(ScriptedSynced::new(Ok(None), Ok(())));
-        assert_eq!(run(absent.read_entry()), MemberRead::ReachedEmpty);
+        assert_eq!(
+            run(absent.read_entry(&credential())),
+            MemberRead::ReachedEmpty
+        );
         let throws = synced_member(ScriptedSynced::new(Err(thrown()), Ok(())));
         assert!(matches!(
-            run(throws.read_entry()),
+            run(throws.read_entry(&credential())),
             MemberRead::NotReached(NotReachedCause::Unreachable { .. })
         ));
     }
@@ -283,12 +273,10 @@ mod tests {
     #[test]
     fn uniffi_synced_put_passes_key_and_bytes() {
         let provider = Arc::new(ScriptedSynced::new(Ok(None), Ok(())));
-        let leases = RecoveryLeases::new();
-        let member = SyncedStoreMember::new(
-            ForeignSyncedStore::new(Arc::clone(&provider) as Arc<dyn SyncedStoreProvider>),
-            &lease(&leases),
-        );
-        run(member.write_entry(&StoreEntry::EMPTY)).unwrap();
+        let member = SyncedStoreMember::new(ForeignSyncedStore::new(
+            Arc::clone(&provider) as Arc<dyn SyncedStoreProvider>
+        ));
+        run(member.write_entry(&credential(), &StoreEntry::EMPTY)).unwrap();
         assert_eq!(
             *provider.puts.lock().unwrap(),
             vec![(credential().entry_key(), vec![0x00])]
@@ -296,12 +284,12 @@ mod tests {
     }
 
     /// Mutant: a thrown `read_blob` mapped to `nil`. `nil` reads as empty and
-    /// a throw reads as not reached; each call names the bound credential.
+    /// a throw reads as not reached; each call names the credential passed.
     #[test]
     fn uniffi_blob_read_none_vs_throw() {
         let absent = Arc::new(ScriptedBlob::new(Ok(None), Ok(BlobWriteOutcome::Landed)));
         assert_eq!(
-            run(blob_member(Arc::clone(&absent)).read_entry()),
+            run(blob_member(Arc::clone(&absent)).read_entry(&credential())),
             MemberRead::ReachedEmpty
         );
         assert_eq!(
@@ -313,7 +301,7 @@ mod tests {
             Ok(BlobWriteOutcome::Landed),
         ));
         assert_eq!(
-            run(blob_member(throws).read_entry()),
+            run(blob_member(throws).read_entry(&credential())),
             MemberRead::NotReached(NotReachedCause::Unreachable {
                 cause: thrown().to_string()
             })
@@ -326,7 +314,7 @@ mod tests {
     fn uniffi_blob_write_throw_is_not_landed() {
         let throws = Arc::new(ScriptedBlob::new(Ok(None), Err(thrown())));
         assert_eq!(
-            run(blob_member(throws).write_entry(&StoreEntry::EMPTY)),
+            run(blob_member(throws).write_entry(&credential(), &StoreEntry::EMPTY)),
             Err(LargeBlobNotLanded {
                 cause: Some(thrown().to_string()),
                 clears_by: LargeBlobClearingAct::RetryVerification,
@@ -334,41 +322,48 @@ mod tests {
         );
     }
 
-    /// Each `BlobWriteOutcome` maps to the member's answer unchanged: each
-    /// act to its own act, each cause to itself.
+    /// Each `BlobWriteOutcome` fact reaches the member unchanged, and the
+    /// member maps it to the act R10 names: `NotWritten` to removing the
+    /// consuming credential, `NoOutput` and a declined gesture to a retry.
+    /// Mutants: any two facts swapped in `blob_write`; `NotWritten` mapped to
+    /// a retry.
     #[test]
-    fn uniffi_blob_outcome_maps_to_not_landed() {
+    fn uniffi_blob_outcome_maps_to_its_act() {
         let landed = Arc::new(ScriptedBlob::new(Ok(None), Ok(BlobWriteOutcome::Landed)));
         assert_eq!(
-            run(blob_member(landed).write_entry(&StoreEntry::EMPTY)),
+            run(blob_member(landed).write_entry(&credential(), &StoreEntry::EMPTY)),
             Ok(())
         );
-        for (act, expected) in [
+        let cases = [
             (
-                BlobClearingAct::RetryVerification,
+                BlobWriteOutcome::NotWritten,
+                None,
+                LargeBlobClearingAct::RemoveConsumingCredential,
+            ),
+            (
+                BlobWriteOutcome::NoOutput,
+                None,
                 LargeBlobClearingAct::RetryVerification,
             ),
             (
-                BlobClearingAct::RemoveConsumingCredential,
-                LargeBlobClearingAct::RemoveConsumingCredential,
+                BlobWriteOutcome::VerificationDeclined { cause: None },
+                None,
+                LargeBlobClearingAct::RetryVerification,
             ),
-        ] {
-            for cause in [None, Some("cancelled".to_owned())] {
-                let provider = Arc::new(ScriptedBlob::new(
-                    Ok(None),
-                    Ok(BlobWriteOutcome::NotLanded {
-                        cause: cause.clone(),
-                        clears_by: act,
-                    }),
-                ));
-                assert_eq!(
-                    run(blob_member(provider).write_entry(&StoreEntry::EMPTY)),
-                    Err(LargeBlobNotLanded {
-                        cause,
-                        clears_by: expected,
-                    })
-                );
-            }
+            (
+                BlobWriteOutcome::VerificationDeclined {
+                    cause: Some("cancelled".to_owned()),
+                },
+                Some("cancelled".to_owned()),
+                LargeBlobClearingAct::RetryVerification,
+            ),
+        ];
+        for (outcome, cause, clears_by) in cases {
+            let provider = Arc::new(ScriptedBlob::new(Ok(None), Ok(outcome)));
+            assert_eq!(
+                run(blob_member(provider).write_entry(&credential(), &StoreEntry::EMPTY)),
+                Err(LargeBlobNotLanded { cause, clears_by })
+            );
         }
     }
 }

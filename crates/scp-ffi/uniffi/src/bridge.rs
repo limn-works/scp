@@ -1407,7 +1407,7 @@ mod storage_code_tests {
     ];
 
     /// Every registered `SCP-STORAGE-` code in `error_codes.rs`.
-    const STORAGE_CODES: [&str; 8] = [
+    const STORAGE_CODES: [&str; 10] = [
         codes::STORAGE_8000,
         codes::STORAGE_8004,
         codes::STORAGE_8005,
@@ -1416,6 +1416,8 @@ mod storage_code_tests {
         codes::STORAGE_8008,
         codes::STORAGE_8009,
         codes::STORAGE_8014,
+        codes::STORAGE_8015,
+        codes::STORAGE_8016,
     ];
 
     /// Every custody failure kind; the match fails to compile when a kind is

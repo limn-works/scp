@@ -965,20 +965,26 @@ impl CosignHold {
 
 /// One member of a credential's store set: it holds the credential's entry.
 ///
-/// A member is bound to one credential when it is built, so no method takes
-/// the credential. Futures are `Send` on native targets and unbounded on
-/// `wasm32`, so a browser member can implement the trait.
+/// A member holds no credential. Every method takes the credential the
+/// [`StoreSet`] passes from its own lease, so a member cannot read or write
+/// the store of a credential other than its set's. Futures are `Send` on
+/// native targets and unbounded on `wasm32`, so a browser member can
+/// implement the trait.
 pub trait RecoveryHandleStore {
     /// What a write that does not complete reports.
     type WriteFailure: MaybeSend;
 
-    /// Reads the member's entry. An absent value and the one byte `0x00`
-    /// both read as [`MemberRead::ReachedEmpty`].
-    fn read_entry(&self) -> impl Future<Output = MemberRead<StoreEntry>> + MaybeSend;
+    /// Reads `credential_id`'s entry. An absent value and the one byte
+    /// `0x00` both read as [`MemberRead::ReachedEmpty`].
+    fn read_entry(
+        &self,
+        credential_id: &CredentialId,
+    ) -> impl Future<Output = MemberRead<StoreEntry>> + MaybeSend;
 
-    /// Replaces the member's entry with `entry`.
+    /// Replaces `credential_id`'s entry with `entry`.
     fn write_entry(
         &self,
+        credential_id: &CredentialId,
         entry: &StoreEntry,
     ) -> impl Future<Output = Result<(), Self::WriteFailure>> + MaybeSend;
 }
@@ -987,15 +993,18 @@ pub trait RecoveryHandleStore {
 /// platform-account member (`17-persistence-and-storage.md` §17.8). A
 /// `largeBlob` store holds none.
 pub trait RecoveryEventStore: RecoveryHandleStore {
-    /// Reads the signed event keyed on `event_digest`.
+    /// Reads `credential_id`'s signed event keyed on `event_digest`.
     fn read_event(
         &self,
+        credential_id: &CredentialId,
         event_digest: &[u8; 32],
     ) -> impl Future<Output = MemberRead<Vec<u8>>> + MaybeSend;
 
-    /// Stores `event` under `event_digest`. The caller has checked its length.
+    /// Stores `event` under `credential_id` and `event_digest`. The caller
+    /// has checked its length.
     fn write_event(
         &self,
+        credential_id: &CredentialId,
         event_digest: &[u8; 32],
         event: &[u8],
     ) -> impl Future<Output = Result<(), Self::WriteFailure>> + MaybeSend;
@@ -1003,12 +1012,16 @@ pub trait RecoveryEventStore: RecoveryHandleStore {
 
 /// The platform-account member, which alone holds the [`StoreSetRecord`].
 pub trait RecoveryRecordStore: RecoveryEventStore {
-    /// Reads the credential's store-set record.
-    fn read_record(&self) -> impl Future<Output = MemberRead<StoreSetRecord>> + MaybeSend;
+    /// Reads `credential_id`'s store-set record.
+    fn read_record(
+        &self,
+        credential_id: &CredentialId,
+    ) -> impl Future<Output = MemberRead<StoreSetRecord>> + MaybeSend;
 
-    /// Replaces the credential's store-set record.
+    /// Replaces `credential_id`'s store-set record.
     fn write_record(
         &self,
+        credential_id: &CredentialId,
         record: &StoreSetRecord,
     ) -> impl Future<Output = Result<(), Self::WriteFailure>> + MaybeSend;
 }
@@ -1053,22 +1066,31 @@ pub struct NoPlatformAccount(Infallible);
 impl RecoveryHandleStore for NoPlatformAccount {
     type WriteFailure = StoreWriteFailure;
 
-    async fn read_entry(&self) -> MemberRead<StoreEntry> {
+    async fn read_entry(&self, _credential_id: &CredentialId) -> MemberRead<StoreEntry> {
         match self.0 {}
     }
 
-    async fn write_entry(&self, _entry: &StoreEntry) -> Result<(), StoreWriteFailure> {
+    async fn write_entry(
+        &self,
+        _credential_id: &CredentialId,
+        _entry: &StoreEntry,
+    ) -> Result<(), StoreWriteFailure> {
         match self.0 {}
     }
 }
 
 impl RecoveryEventStore for NoPlatformAccount {
-    async fn read_event(&self, _event_digest: &[u8; 32]) -> MemberRead<Vec<u8>> {
+    async fn read_event(
+        &self,
+        _credential_id: &CredentialId,
+        _event_digest: &[u8; 32],
+    ) -> MemberRead<Vec<u8>> {
         match self.0 {}
     }
 
     async fn write_event(
         &self,
+        _credential_id: &CredentialId,
         _event_digest: &[u8; 32],
         _event: &[u8],
     ) -> Result<(), StoreWriteFailure> {
@@ -1077,11 +1099,15 @@ impl RecoveryEventStore for NoPlatformAccount {
 }
 
 impl RecoveryRecordStore for NoPlatformAccount {
-    async fn read_record(&self) -> MemberRead<StoreSetRecord> {
+    async fn read_record(&self, _credential_id: &CredentialId) -> MemberRead<StoreSetRecord> {
         match self.0 {}
     }
 
-    async fn write_record(&self, _record: &StoreSetRecord) -> Result<(), StoreWriteFailure> {
+    async fn write_record(
+        &self,
+        _credential_id: &CredentialId,
+        _record: &StoreSetRecord,
+    ) -> Result<(), StoreWriteFailure> {
         match self.0 {}
     }
 }
@@ -1096,11 +1122,15 @@ pub struct NoLargeBlob(Infallible);
 impl RecoveryHandleStore for NoLargeBlob {
     type WriteFailure = LargeBlobNotLanded;
 
-    async fn read_entry(&self) -> MemberRead<StoreEntry> {
+    async fn read_entry(&self, _credential_id: &CredentialId) -> MemberRead<StoreEntry> {
         match self.0 {}
     }
 
-    async fn write_entry(&self, _entry: &StoreEntry) -> Result<(), LargeBlobNotLanded> {
+    async fn write_entry(
+        &self,
+        _credential_id: &CredentialId,
+        _entry: &StoreEntry,
+    ) -> Result<(), LargeBlobNotLanded> {
         match self.0 {}
     }
 }
@@ -1507,7 +1537,7 @@ where
             }
             PlatformAccountSlot::Present(platform) => platform,
         };
-        match platform.read_record().await {
+        match platform.read_record(set.lease.credential_id()).await {
             MemberRead::Reached(existing) => {
                 if existing.credential_id == *set.lease.credential_id() {
                     return Ok(set);
@@ -1523,7 +1553,7 @@ where
             credential_id: set.lease.credential_id().clone(),
             large_blob: LargeBlobMembership::NotMember,
         };
-        write_record_checked(platform, &record)
+        write_record_checked(platform, set.lease.credential_id(), &record)
             .await
             .map_err(|cause| RecoveryStoreError::PlatformAccountWriteFailed { cause })?;
         Ok(set)
@@ -1859,13 +1889,18 @@ where
         check_event_length(event)
             .map_err(|_| RecoveryStoreError::EventLength { len: event.len() })?;
         if let Some((platform, _)) = self.resolve_record().await? {
-            write_event_checked(platform, event_digest, event)
+            write_event_checked(platform, self.lease.credential_id(), event_digest, event)
                 .await
                 .map_err(|cause| RecoveryStoreError::PlatformAccountWriteFailed { cause })?;
         }
-        write_event_checked(&self.members.sdk_local, event_digest, event)
-            .await
-            .map_err(|cause| RecoveryStoreError::SdkLocalWriteFailed { cause })
+        write_event_checked(
+            &self.members.sdk_local,
+            self.lease.credential_id(),
+            event_digest,
+            event,
+        )
+        .await
+        .map_err(|cause| RecoveryStoreError::SdkLocalWriteFailed { cause })
     }
 
     /// Reads the signed event keyed on `event_digest` from the local store,
@@ -1882,13 +1917,21 @@ where
         event_digest: &[u8; 32],
     ) -> Result<Option<Vec<u8>>, RecoveryStoreError> {
         let platform = self.resolve_record().await?.map(|(platform, _)| platform);
-        let local_miss = match self.members.sdk_local.read_event(event_digest).await {
+        let local_miss = match self
+            .members
+            .sdk_local
+            .read_event(self.lease.credential_id(), event_digest)
+            .await
+        {
             MemberRead::Reached(event) => return Ok(Some(event)),
             MemberRead::ReachedEmpty => None,
             MemberRead::NotReached(cause) => Some(unreadable(CredentialStore::SdkLocal, cause)),
         };
         let platform_miss = match platform {
-            Some(platform) => match platform.read_event(event_digest).await {
+            Some(platform) => match platform
+                .read_event(self.lease.credential_id(), event_digest)
+                .await
+            {
                 MemberRead::Reached(event) => return Ok(Some(event)),
                 MemberRead::ReachedEmpty => None,
                 MemberRead::NotReached(cause) => {
@@ -1917,7 +1960,7 @@ where
             }
             PlatformAccountSlot::Present(platform) => platform,
         };
-        let record = match platform.read_record().await {
+        let record = match platform.read_record(self.lease.credential_id()).await {
             MemberRead::Reached(record) => record,
             MemberRead::ReachedEmpty => {
                 return Err(unreadable(
@@ -1949,7 +1992,7 @@ where
         let platform = match &resolved {
             Some((platform, _)) => Some(checked_entry(
                 CredentialStore::PlatformAccount,
-                platform.read_entry().await,
+                platform.read_entry(self.lease.credential_id()).await,
                 identifier,
                 EntrySource::Synced,
             )?),
@@ -1960,7 +2003,7 @@ where
             None => BlobRead::NoHandle,
             Some(large_blob) => match checked_entry(
                 CredentialStore::LargeBlob,
-                large_blob.read_entry().await,
+                large_blob.read_entry(self.lease.credential_id()).await,
                 identifier,
                 EntrySource::Synced,
             ) {
@@ -1979,7 +2022,10 @@ where
         };
         let local = checked_entry(
             CredentialStore::SdkLocal,
-            self.members.sdk_local.read_entry().await,
+            self.members
+                .sdk_local
+                .read_entry(self.lease.credential_id())
+                .await,
             identifier,
             EntrySource::SdkLocal,
         )?;
@@ -2064,7 +2110,8 @@ where
                 }
             }
         }
-        report.sdk_local = write_local(&self.members.sdk_local, local).await;
+        report.sdk_local =
+            write_local(&self.members.sdk_local, self.lease.credential_id(), local).await;
         if let MemberWrite::Failed { cause } = &report.sdk_local {
             report.stop = Some(RecoveryStoreError::SdkLocalWriteFailed {
                 cause: cause.clone(),
@@ -2123,7 +2170,14 @@ where
         let cause = if planned.local_refused {
             Some(RemovalCause::PhaseNotRemovable)
         } else {
-            member_cause(write_local(&self.members.sdk_local, planned.local).await)
+            member_cause(
+                write_local(
+                    &self.members.sdk_local,
+                    self.lease.credential_id(),
+                    planned.local,
+                )
+                .await,
+            )
         };
         per_store.push(MemberRemoval {
             store: CredentialStore::SdkLocal,
@@ -2143,7 +2197,14 @@ where
         let Some(entry) = merge else {
             return MemberWrite::Unchanged;
         };
-        match write_entry_checked(platform, &entry.without_skip(), EntrySource::Synced).await {
+        match write_entry_checked(
+            platform,
+            self.lease.credential_id(),
+            &entry.without_skip(),
+            EntrySource::Synced,
+        )
+        .await
+        {
             Ok(()) => MemberWrite::Written,
             Err(cause) => MemberWrite::Failed { cause },
         }
@@ -2165,7 +2226,10 @@ where
         let Some(entry) = merge else {
             return LargeBlobWrite::Unchanged;
         };
-        match large_blob.write_entry(&entry.without_skip()).await {
+        match large_blob
+            .write_entry(self.lease.credential_id(), &entry.without_skip())
+            .await
+        {
             Ok(()) => LargeBlobWrite::Landed,
             Err(not_landed) => LargeBlobWrite::NotLanded {
                 cause: not_landed.cause,
@@ -2190,7 +2254,7 @@ where
         let PlatformAccountSlot::Present(platform) = &self.members.platform_account else {
             return MemberWrite::NotInSet;
         };
-        match platform.read_record().await {
+        match platform.read_record(self.lease.credential_id()).await {
             MemberRead::Reached(fresh) if fresh.credential_id == *self.lease.credential_id() => {
                 if fresh.large_blob == target {
                     return MemberWrite::Unchanged;
@@ -2216,7 +2280,7 @@ where
             credential_id: current.credential_id.clone(),
             large_blob: target,
         };
-        match write_record_checked(platform, &record).await {
+        match write_record_checked(platform, self.lease.credential_id(), &record).await {
             Ok(()) => MemberWrite::Written,
             Err(cause) => MemberWrite::Failed { cause },
         }
@@ -2296,14 +2360,14 @@ fn member_cause(write: MemberWrite) -> Option<RemovalCause> {
     }
 }
 
-async fn write_local<L>(local: &L, merge: Merge) -> MemberWrite
+async fn write_local<L>(local: &L, credential_id: &CredentialId, merge: Merge) -> MemberWrite
 where
     L: RecoveryHandleStore<WriteFailure = StoreWriteFailure> + MaybeSync,
 {
     let Some(entry) = merge else {
         return MemberWrite::Unchanged;
     };
-    match write_entry_checked(local, &entry, EntrySource::SdkLocal).await {
+    match write_entry_checked(local, credential_id, &entry, EntrySource::SdkLocal).await {
         Ok(()) => MemberWrite::Written,
         Err(cause) => MemberWrite::Failed { cause },
     }
@@ -2312,6 +2376,7 @@ where
 /// Writes `entry` and reads it back; a different read-back is a failure.
 async fn write_entry_checked<M>(
     member: &M,
+    credential_id: &CredentialId,
     entry: &StoreEntry,
     source: EntrySource,
 ) -> Result<(), String>
@@ -2319,10 +2384,10 @@ where
     M: RecoveryHandleStore<WriteFailure = StoreWriteFailure> + MaybeSync,
 {
     member
-        .write_entry(entry)
+        .write_entry(credential_id, entry)
         .await
         .map_err(|failure| failure.cause)?;
-    let read_back = match member.read_entry().await {
+    let read_back = match member.read_entry(credential_id).await {
         MemberRead::Reached(read) => read,
         MemberRead::ReachedEmpty => StoreEntry::EMPTY,
         MemberRead::NotReached(cause) => return Err(format!("read-back failed: {cause:?}")),
@@ -2340,6 +2405,7 @@ where
 
 async fn write_event_checked<M>(
     member: &M,
+    credential_id: &CredentialId,
     event_digest: &[u8; 32],
     event: &[u8],
 ) -> Result<(), String>
@@ -2347,10 +2413,10 @@ where
     M: RecoveryEventStore<WriteFailure = StoreWriteFailure> + MaybeSync,
 {
     member
-        .write_event(event_digest, event)
+        .write_event(credential_id, event_digest, event)
         .await
         .map_err(|failure| failure.cause)?;
-    match member.read_event(event_digest).await {
+    match member.read_event(credential_id, event_digest).await {
         MemberRead::Reached(read) if read == event => Ok(()),
         MemberRead::Reached(_) | MemberRead::ReachedEmpty => {
             Err("the event read back differs from the event written".to_owned())
@@ -2359,15 +2425,19 @@ where
     }
 }
 
-async fn write_record_checked<P>(platform: &P, record: &StoreSetRecord) -> Result<(), String>
+async fn write_record_checked<P>(
+    platform: &P,
+    credential_id: &CredentialId,
+    record: &StoreSetRecord,
+) -> Result<(), String>
 where
     P: RecoveryRecordStore<WriteFailure = StoreWriteFailure> + MaybeSync,
 {
     platform
-        .write_record(record)
+        .write_record(credential_id, record)
         .await
         .map_err(|failure| failure.cause)?;
-    match platform.read_record().await {
+    match platform.read_record(credential_id).await {
         MemberRead::Reached(read) if read == *record => Ok(()),
         MemberRead::Reached(_) | MemberRead::ReachedEmpty => {
             Err("the record read back differs from the record written".to_owned())

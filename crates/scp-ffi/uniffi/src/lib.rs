@@ -739,37 +739,30 @@ pub trait DeviceAttestationProvider: Send + Sync {
     async fn assert_request(&self, request_hash: Vec<u8>) -> Result<Vec<u8>, ScpError>;
 }
 
-/// The act that clears a `largeBlob` write that did not land
-/// (`09-security-model.md` §9.7.4.2 R10; ADR-054 §Assertion-arm and
-/// store-set host interfaces).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
-pub enum BlobClearingAct {
-    /// The user declined or cancelled the verification gesture; a retry
-    /// clears it.
-    RetryVerification,
-    /// The platform reported `largeBlob: { written: false }` with no error:
-    /// the authenticator's large-blob array is at capacity, and removing the
-    /// credential that consumed it, through the authenticator's own
-    /// credential management, clears it. A credential that does not support
-    /// `largeBlob` also reports `written: false`; for it this act clears
-    /// nothing, and its store never holds a handle or a marker, so it never
-    /// stops a ceremony.
-    RemoveConsumingCredential,
-}
-
-/// What a host reports for a `largeBlob` write it answered.
+/// What the platform reported for a `largeBlob` write.
+///
+/// It is a platform fact, never a clearing act. The bridge maps each fact to
+/// the act that clears a write that did not land (`09-security-model.md`
+/// §9.7.4.2 R10; ADR-054 §Assertion-arm and store-set host interfaces), so
+/// the host never picks one.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
 pub enum BlobWriteOutcome {
-    /// The platform reported `written: true`, and nothing else.
+    /// The platform reported `largeBlob: { written: true }`.
     Landed,
-    /// The write did not land, or the platform returned no `largeBlob`
-    /// output.
-    NotLanded {
-        /// The cause where the platform reported one; `written: false`
-        /// reports none.
+    /// The platform reported `largeBlob: { written: false }` with no error.
+    /// The bridge reads it as the authenticator's large-blob array at
+    /// capacity, cleared by removing the credential that consumed it. A
+    /// credential that does not support `largeBlob` also reports it; its
+    /// store never holds a handle or a marker, so it never stops a ceremony.
+    NotWritten,
+    /// The assertion returned no `largeBlob` output: the client did not
+    /// process the extension. The bridge reads it as cleared by a retry.
+    NoOutput,
+    /// The user declined or cancelled the verification gesture. The bridge
+    /// reads it as cleared by a retry.
+    VerificationDeclined {
+        /// The cause the platform reported, where it reported one.
         cause: Option<String>,
-        /// The act that clears the condition.
-        clears_by: BlobClearingAct,
     },
 }
 
@@ -785,18 +778,24 @@ pub enum BlobWriteOutcome {
 /// unread, and reads and writes the store of `credential_id` and no other.
 ///
 /// Host contract (ADR-054):
-/// - `write_blob` returns [`BlobWriteOutcome::Landed`] only where the
-///   platform reports `written: true`. The store set reads no `largeBlob`
+/// - `write_blob` reports what the platform reported and never picks a
+///   clearing act. It returns [`BlobWriteOutcome::Landed`] only where the
+///   platform reports `written: true`; the store set reads no `largeBlob`
 ///   write back, so a false `Landed` leaves a member behind the ceremony.
-/// - A `largeBlob` output the platform does not return is `NotLanded`.
-/// - A declined or cancelled verification gesture is `NotLanded` with
-///   [`BlobClearingAct::RetryVerification`]; `written: false` with no error
-///   is `NotLanded` with [`BlobClearingAct::RemoveConsumingCredential`].
+///   `written: false` with no error is `NotWritten`, a missing `largeBlob`
+///   output is `NoOutput`, and a declined or cancelled verification gesture
+///   is `VerificationDeclined`.
 /// - `read_blob` returns `nil`/`null` only where the platform reports the
 ///   store holds nothing, and throws on every other failure.
-/// - A host throws only `ScpError`: `UniFFI` panics on any other error a
-///   callback throws. A thrown `write_blob` reaches the store set as a
-///   write that did not land, cleared by a retry.
+/// - Freshness (ADR-054, one rule for both store-set hosts): `read_blob`
+///   returns the platform's current value, read through a `largeBlob` read
+///   assertion on that call, and never a cache or the bytes of the host's
+///   last write.
+/// - A host that cannot answer throws `ScpError.Storage` with the code
+///   `SCP-STORAGE-8016` and the platform's error text: `UniFFI` panics on
+///   any other error a callback throws, and the bridge reads only the text.
+///   A thrown `write_blob` reaches the store set as a write that did not
+///   land, cleared by a retry.
 ///
 /// # SAFETY: Thread execution context
 ///
@@ -812,12 +811,12 @@ pub trait CredentialBlobProvider: Send + Sync {
     /// where it holds none.
     async fn read_blob(&self, credential_id: Vec<u8>) -> Result<Option<Vec<u8>>, ScpError>;
 
-    /// Write `record` into `credential_id`'s `largeBlob` store and report
-    /// whether it landed.
+    /// Write `entry` into `credential_id`'s `largeBlob` store and report
+    /// what the platform reported.
     async fn write_blob(
         &self,
         credential_id: Vec<u8>,
-        record: Vec<u8>,
+        entry: Vec<u8>,
     ) -> Result<BlobWriteOutcome, ScpError>;
 }
 
@@ -839,11 +838,14 @@ pub trait CredentialBlobProvider: Send + Sync {
 /// - `get` returns `nil`/`null` only where the platform reports the item
 ///   absent, and throws on every other platform failure, so a store that
 ///   failed to answer is never read as an empty one.
-/// - `get` reads the platform store on every call and never answers from a
-///   cache: the store set reads each write back to check it.
+/// - Freshness (ADR-054, one rule for both store-set hosts): `get` returns
+///   the platform's current value, read from the platform store on that
+///   call, and never a cache: the store set merges every member's current
+///   value and reads each write back to check it.
 /// - `put` returns only after the platform reports the item stored.
-/// - A host throws only `ScpError`: `UniFFI` panics on any other error a
-///   callback throws.
+/// - A host that cannot answer throws `ScpError.Storage` with the code
+///   `SCP-STORAGE-8016` and the platform's error text: `UniFFI` panics on
+///   any other error a callback throws, and the bridge reads only the text.
 ///
 /// # SAFETY: Thread execution context
 ///

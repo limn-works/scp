@@ -1563,6 +1563,16 @@ pub const STORAGE_8014: &str = "SCP-STORAGE-8014";
 /// instead, naming the flush failure in its message.
 pub const STORAGE_8015: &str = "SCP-STORAGE-8015";
 
+/// A store-set host call failed.
+///
+/// The platform store did not answer a `SyncedStoreProvider` `get` or `put`,
+/// or a `CredentialBlobProvider` `read_blob` or `write_blob`. The `UniFFI`
+/// host throws it as `ScpError.Storage` with the platform's error text, and
+/// the store-set member reads only that text: a thrown read is a member not
+/// reached, a thrown `put` a failed write, and a thrown `write_blob` a write
+/// that did not land (ADR-054 §Assertion-arm and store-set host interfaces).
+pub const STORAGE_8016: &str = "SCP-STORAGE-8016";
+
 // -------------------------------------------------------------------------
 // Attestation (SCP-ATTEST- 9000--9999)
 // -------------------------------------------------------------------------

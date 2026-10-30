@@ -159,7 +159,8 @@ impl SyncedStoreHost for MapHost {
 #[derive(Clone, Debug)]
 enum NextBlobWrite {
     Land,
-    NotLanded(LargeBlobNotLanded),
+    /// A platform fact other than `Landed`.
+    Report(BlobWrite),
     Throw,
 }
 
@@ -221,7 +222,7 @@ impl CredentialBlobHost for BlobSlot {
                 *lock(&self.bytes) = Some(entry.to_vec());
                 Ok(BlobWrite::Landed)
             }
-            NextBlobWrite::NotLanded(not_landed) => Ok(BlobWrite::NotLanded(not_landed)),
+            NextBlobWrite::Report(fact) => Ok(fact),
             NextBlobWrite::Throw => Err(thrown()),
         };
         std::future::ready(answer)
@@ -238,48 +239,42 @@ struct LocalMap {
 impl RecoveryHandleStore for LocalMap {
     type WriteFailure = StoreWriteFailure;
 
-    async fn read_entry(&self) -> MemberRead<StoreEntry> {
-        let Ok(key) = credential().map(|c| c.entry_key()) else {
-            return MemberRead::ReachedEmpty;
-        };
+    async fn read_entry(&self, credential_id: &CredentialId) -> MemberRead<StoreEntry> {
+        let key = credential_id.entry_key();
         decoded(Ok(lock(&self.map).get(&key).cloned()), |bytes| {
             decode_entry(bytes, EntrySource::SdkLocal)
         })
     }
 
-    async fn write_entry(&self, entry: &StoreEntry) -> Result<(), StoreWriteFailure> {
-        let key = credential()
-            .map_err(|e| StoreWriteFailure {
-                cause: e.to_string(),
-            })?
-            .entry_key();
-        lock(&self.map).insert(key, encode_entry(entry));
+    async fn write_entry(
+        &self,
+        credential_id: &CredentialId,
+        entry: &StoreEntry,
+    ) -> Result<(), StoreWriteFailure> {
+        lock(&self.map).insert(credential_id.entry_key(), encode_entry(entry));
         Ok(())
     }
 }
 
 impl RecoveryEventStore for LocalMap {
-    async fn read_event(&self, event_digest: &[u8; 32]) -> MemberRead<Vec<u8>> {
-        let Ok(key) = credential().map(|c| c.event_key(event_digest)) else {
-            return MemberRead::ReachedEmpty;
-        };
+    async fn read_event(
+        &self,
+        credential_id: &CredentialId,
+        event_digest: &[u8; 32],
+    ) -> MemberRead<Vec<u8>> {
         lock(&self.map)
-            .get(&key)
+            .get(&credential_id.event_key(event_digest))
             .cloned()
             .map_or(MemberRead::ReachedEmpty, MemberRead::Reached)
     }
 
     async fn write_event(
         &self,
+        credential_id: &CredentialId,
         event_digest: &[u8; 32],
         event: &[u8],
     ) -> Result<(), StoreWriteFailure> {
-        let key = credential()
-            .map_err(|e| StoreWriteFailure {
-                cause: e.to_string(),
-            })?
-            .event_key(event_digest);
-        lock(&self.map).insert(key, event.to_vec());
+        lock(&self.map).insert(credential_id.event_key(event_digest), event.to_vec());
         Ok(())
     }
 }
@@ -312,7 +307,6 @@ impl Device {
 
     fn members(
         &self,
-        lease: &RecoveryLease,
     ) -> StoreSetMembers<
         LocalMap,
         SyncedStoreMember<Arc<MapHost>>,
@@ -320,45 +314,35 @@ impl Device {
     > {
         StoreSetMembers {
             sdk_local: self.local.clone(),
-            platform_account: PlatformAccountSlot::Present(SyncedStoreMember::new(
-                Arc::clone(&self.platform),
-                lease,
-            )),
+            platform_account: PlatformAccountSlot::Present(SyncedStoreMember::new(Arc::clone(
+                &self.platform,
+            ))),
             large_blob: self
                 .blob
                 .as_ref()
-                .map(|blob| CredentialBlobMember::new(Arc::clone(blob), lease)),
+                .map(|blob| CredentialBlobMember::new(Arc::clone(blob))),
         }
     }
 
     fn create(&self) -> Result<PresentSet, Box<dyn std::error::Error>> {
         let lease = lease(&self.leases)?;
-        Ok(run(StoreSet::create(self.members(&lease), lease))?)
+        Ok(run(StoreSet::create(self.members(), lease))?)
     }
 
     fn open(&self) -> Result<PresentSet, RecoveryStoreError> {
         let lease = lease(&self.leases).map_err(|e| RecoveryStoreError::SdkLocalWriteFailed {
             cause: e.to_string(),
         })?;
-        run(StoreSet::open(self.members(&lease), lease))
+        run(StoreSet::open(self.members(), lease))
     }
 }
 
-fn synced_member(
-    host: &Arc<MapHost>,
-) -> Result<SyncedStoreMember<Arc<MapHost>>, Box<dyn std::error::Error>> {
-    let leases = RecoveryLeases::new();
-    Ok(SyncedStoreMember::new(Arc::clone(host), &lease(&leases)?))
+fn synced_member(host: &Arc<MapHost>) -> SyncedStoreMember<Arc<MapHost>> {
+    SyncedStoreMember::new(Arc::clone(host))
 }
 
-fn blob_member(
-    slot: &Arc<BlobSlot>,
-) -> Result<CredentialBlobMember<Arc<BlobSlot>>, Box<dyn std::error::Error>> {
-    let leases = RecoveryLeases::new();
-    Ok(CredentialBlobMember::new(
-        Arc::clone(slot),
-        &lease(&leases)?,
-    ))
+fn blob_member(slot: &Arc<BlobSlot>) -> CredentialBlobMember<Arc<BlobSlot>> {
+    CredentialBlobMember::new(Arc::clone(slot))
 }
 
 fn compose(set: &mut PresentSet) -> Result<scp_platform::WriteReport, RecoveryStoreError> {
@@ -374,20 +358,26 @@ fn compose(set: &mut PresentSet) -> Result<scp_platform::WriteReport, RecoverySt
 #[test]
 fn synced_member_round_trips_entry_record_and_max_event() -> TestResult {
     let host = Arc::new(MapHost::default());
-    let member = synced_member(&host)?;
+    let member = synced_member(&host);
     let entry = full_entry(RecoveryPhase::Signed);
-    run(member.write_entry(&entry))?;
+    run(member.write_entry(&credential()?, &entry))?;
     assert_eq!(
         host.raw(&credential()?.entry_key()).map(|b| b.len()),
         Some(139)
     );
-    assert_eq!(run(member.read_entry()), MemberRead::Reached(entry));
+    assert_eq!(
+        run(member.read_entry(&credential()?)),
+        MemberRead::Reached(entry)
+    );
     let record = StoreSetRecord {
         credential_id: credential()?,
         large_blob: LargeBlobMembership::Member,
     };
-    run(member.write_record(&record))?;
-    assert_eq!(run(member.read_record()), MemberRead::Reached(record));
+    run(member.write_record(&credential()?, &record))?;
+    assert_eq!(
+        run(member.read_record(&credential()?)),
+        MemberRead::Reached(record)
+    );
 
     let device = Device::new(false);
     let mut set = device.create()?;
@@ -434,14 +424,14 @@ fn synced_member_truncating_host_fails_read_back() -> TestResult {
 #[test]
 fn synced_member_forms_credential_keys() -> TestResult {
     let host = Arc::new(MapHost::default());
-    let member = synced_member(&host)?;
-    run(member.write_entry(&full_entry(RecoveryPhase::Composed)))?;
+    let member = synced_member(&host);
+    run(member.write_entry(&credential()?, &full_entry(RecoveryPhase::Composed)))?;
     let record = StoreSetRecord {
         credential_id: credential()?,
         large_blob: LargeBlobMembership::NotMember,
     };
-    run(member.write_record(&record))?;
-    run(member.write_event(&[0x22; 32], b"signed event"))?;
+    run(member.write_record(&credential()?, &record))?;
+    run(member.write_event(&credential()?, &[0x22; 32], b"signed event"))?;
     let entry_key = format!("recovery/{C1_COMPONENT}/entry");
     let record_key = format!("recovery/{C1_COMPONENT}/record");
     let event_key = format!("recovery/{C1_COMPONENT}/event/{}", "22".repeat(32));
@@ -488,13 +478,13 @@ fn synced_member_get_error_is_unreachable_not_empty() -> TestResult {
 #[test]
 fn synced_member_skip_bit_entry_is_undecodable() -> TestResult {
     let host = Arc::new(MapHost::default());
-    let member = synced_member(&host)?;
+    let member = synced_member(&host);
     let skipped = StoreEntry::large_blob_skipped(handle(RecoveryPhase::Composed), None);
     let bytes = encode_entry(&skipped);
     assert_eq!(bytes.first(), Some(&0x05));
     host.set_raw(&credential()?.entry_key(), &bytes);
     assert_eq!(
-        run(member.read_entry()),
+        run(member.read_entry(&credential()?)),
         MemberRead::NotReached(NotReachedCause::Undecodable(
             RecordDecodeError::SkipInSyncedMember
         ))
@@ -507,11 +497,11 @@ fn synced_member_skip_bit_entry_is_undecodable() -> TestResult {
 #[test]
 fn synced_member_event_out_of_range_is_undecodable() -> TestResult {
     let host = Arc::new(MapHost::default());
-    let member = synced_member(&host)?;
+    let member = synced_member(&host);
     for len in [0, MAX_EVENT + 1] {
         host.set_raw(&credential()?.event_key(&D1), &vec![0xe5; len]);
         assert_eq!(
-            run(member.read_event(&D1)),
+            run(member.read_event(&credential()?, &D1)),
             MemberRead::NotReached(NotReachedCause::Undecodable(
                 RecordDecodeError::EventLength(len)
             ))
@@ -524,7 +514,7 @@ fn synced_member_event_out_of_range_is_undecodable() -> TestResult {
 #[test]
 fn synced_member_bad_record_is_undecodable() -> TestResult {
     let host = Arc::new(MapHost::default());
-    let member = synced_member(&host)?;
+    let member = synced_member(&host);
     let mut bytes = encode_store_set_record(&StoreSetRecord {
         credential_id: credential()?,
         large_blob: LargeBlobMembership::NotMember,
@@ -534,7 +524,7 @@ fn synced_member_bad_record_is_undecodable() -> TestResult {
     }
     host.set_raw(&credential()?.record_key(), &bytes);
     assert_eq!(
-        run(member.read_record()),
+        run(member.read_record(&credential()?)),
         MemberRead::NotReached(NotReachedCause::Undecodable(
             RecordDecodeError::UnknownVersion(0x02)
         ))
@@ -548,18 +538,24 @@ fn synced_member_bad_record_is_undecodable() -> TestResult {
 #[test]
 fn synced_member_put_error_is_store_write_failure() -> TestResult {
     let host = Arc::new(MapHost::default());
-    let member = synced_member(&host)?;
+    let member = synced_member(&host);
     host.fail_puts.store(true, Ordering::SeqCst);
     let failure = Err(StoreWriteFailure {
         cause: THROWN.to_owned(),
     });
-    assert_eq!(run(member.write_entry(&StoreEntry::EMPTY)), failure);
-    assert_eq!(run(member.write_event(&D1, b"event")), failure);
+    assert_eq!(
+        run(member.write_entry(&credential()?, &StoreEntry::EMPTY)),
+        failure
+    );
+    assert_eq!(
+        run(member.write_event(&credential()?, &D1, b"event")),
+        failure
+    );
     let record = StoreSetRecord {
         credential_id: credential()?,
         large_blob: LargeBlobMembership::NotMember,
     };
-    assert_eq!(run(member.write_record(&record)), failure);
+    assert_eq!(run(member.write_record(&credential()?, &record)), failure);
 
     let device = Device::new(false);
     let mut set = device.create()?;
@@ -593,11 +589,11 @@ fn synced_member_put_error_is_store_write_failure() -> TestResult {
 #[test]
 fn blob_member_round_trips_handle_and_marker() -> TestResult {
     let slot = Arc::new(BlobSlot::default());
-    let member = blob_member(&slot)?;
+    let member = blob_member(&slot);
     let entry = full_entry(RecoveryPhase::Composed);
-    run(member.write_entry(&entry))?;
+    run(member.write_entry(&credential()?, &entry))?;
     assert_eq!(lock(&slot.written).first().map(Vec::len), Some(139));
-    let read = run(member.read_entry());
+    let read = run(member.read_entry(&credential()?));
     assert_eq!(read, MemberRead::Reached(entry));
     assert_ne!(read, MemberRead::Reached(full_entry(RecoveryPhase::Signed)));
     Ok(())
@@ -608,11 +604,11 @@ fn blob_member_round_trips_handle_and_marker() -> TestResult {
 #[test]
 fn blob_member_refuses_skip_bit() -> TestResult {
     let slot = Arc::new(BlobSlot::default());
-    let member = blob_member(&slot)?;
+    let member = blob_member(&slot);
     let skipped = StoreEntry::large_blob_skipped(handle(RecoveryPhase::Composed), None);
     slot.set_raw(Some(&encode_entry(&skipped)));
     assert_eq!(
-        run(member.read_entry()),
+        run(member.read_entry(&credential()?)),
         MemberRead::NotReached(NotReachedCause::Undecodable(
             RecordDecodeError::SkipInSyncedMember
         ))
@@ -625,10 +621,16 @@ fn blob_member_refuses_skip_bit() -> TestResult {
 #[test]
 fn blob_member_empty_reads() -> TestResult {
     let slot = Arc::new(BlobSlot::default());
-    let member = blob_member(&slot)?;
-    assert_eq!(run(member.read_entry()), MemberRead::ReachedEmpty);
+    let member = blob_member(&slot);
+    assert_eq!(
+        run(member.read_entry(&credential()?)),
+        MemberRead::ReachedEmpty
+    );
     slot.set_raw(Some(&[0x00]));
-    assert_eq!(run(member.read_entry()), MemberRead::ReachedEmpty);
+    assert_eq!(
+        run(member.read_entry(&credential()?)),
+        MemberRead::ReachedEmpty
+    );
     Ok(())
 }
 
@@ -636,10 +638,10 @@ fn blob_member_empty_reads() -> TestResult {
 #[test]
 fn blob_member_read_error_is_unreachable() -> TestResult {
     let slot = Arc::new(BlobSlot::default());
-    let member = blob_member(&slot)?;
+    let member = blob_member(&slot);
     slot.fail_reads.store(true, Ordering::SeqCst);
     assert_eq!(
-        run(member.read_entry()),
+        run(member.read_entry(&credential()?)),
         MemberRead::NotReached(NotReachedCause::Unreachable {
             cause: THROWN.to_owned()
         })
@@ -647,25 +649,50 @@ fn blob_member_read_error_is_unreachable() -> TestResult {
     Ok(())
 }
 
-/// Mutant: `clears_by` fixed to one act. Each act and each cause, `None`
-/// included, arrive unchanged.
+/// The R10 rule maps each platform fact to its act, and the host names no
+/// act (ADR-054). Mutants: `NotWritten` mapped to `RetryVerification`;
+/// `NoOutput` or a declined gesture mapped to `RemoveConsumingCredential`; a
+/// declined gesture's cause dropped; any fact read as landed.
 #[test]
-fn blob_member_not_landed_carries_cause_and_act() -> TestResult {
+fn blob_member_maps_each_platform_fact_to_its_act() -> TestResult {
     let slot = Arc::new(BlobSlot::default());
-    let member = blob_member(&slot)?;
-    for clears_by in [
-        LargeBlobClearingAct::RetryVerification,
-        LargeBlobClearingAct::RemoveConsumingCredential,
-    ] {
-        for cause in [None, Some("user cancelled".to_owned())] {
-            let not_landed = LargeBlobNotLanded {
-                cause: cause.clone(),
-                clears_by,
-            };
-            slot.answer_next(NextBlobWrite::NotLanded(not_landed.clone()));
-            assert_eq!(run(member.write_entry(&StoreEntry::EMPTY)), Err(not_landed));
-        }
+    let member = blob_member(&slot);
+    let cases = [
+        (
+            BlobWrite::NotWritten,
+            None,
+            LargeBlobClearingAct::RemoveConsumingCredential,
+        ),
+        (
+            BlobWrite::NoOutput,
+            None,
+            LargeBlobClearingAct::RetryVerification,
+        ),
+        (
+            BlobWrite::VerificationDeclined { cause: None },
+            None,
+            LargeBlobClearingAct::RetryVerification,
+        ),
+        (
+            BlobWrite::VerificationDeclined {
+                cause: Some("user cancelled".to_owned()),
+            },
+            Some("user cancelled".to_owned()),
+            LargeBlobClearingAct::RetryVerification,
+        ),
+    ];
+    for (fact, cause, clears_by) in cases {
+        slot.answer_next(NextBlobWrite::Report(fact));
+        assert_eq!(
+            run(member.write_entry(&credential()?, &StoreEntry::EMPTY)),
+            Err(LargeBlobNotLanded { cause, clears_by })
+        );
     }
+    slot.answer_next(NextBlobWrite::Report(BlobWrite::Landed));
+    assert_eq!(
+        run(member.write_entry(&credential()?, &StoreEntry::EMPTY)),
+        Ok(())
+    );
     Ok(())
 }
 
@@ -674,10 +701,10 @@ fn blob_member_not_landed_carries_cause_and_act() -> TestResult {
 #[test]
 fn blob_member_thrown_write_is_not_landed() -> TestResult {
     let slot = Arc::new(BlobSlot::default());
-    let member = blob_member(&slot)?;
+    let member = blob_member(&slot);
     slot.answer_next(NextBlobWrite::Throw);
     assert_eq!(
-        run(member.write_entry(&full_entry(RecoveryPhase::Composed))),
+        run(member.write_entry(&credential()?, &full_entry(RecoveryPhase::Composed))),
         Err(LargeBlobNotLanded {
             cause: Some(THROWN.to_owned()),
             clears_by: LargeBlobClearingAct::RetryVerification,
@@ -691,10 +718,10 @@ fn blob_member_thrown_write_is_not_landed() -> TestResult {
 #[test]
 fn blob_member_passes_entry_bytes_and_credential() -> TestResult {
     let slot = Arc::new(BlobSlot::default());
-    let member = blob_member(&slot)?;
+    let member = blob_member(&slot);
     let entry = full_entry(RecoveryPhase::Composed);
-    run(member.write_entry(&entry))?;
-    let _ = run(member.read_entry());
+    run(member.write_entry(&credential()?, &entry))?;
+    let _ = run(member.read_entry(&credential()?));
     assert_eq!(*lock(&slot.written), vec![encode_entry(&entry)]);
     assert_eq!(*lock(&slot.credentials), vec![credential()?, credential()?]);
     Ok(())
@@ -707,20 +734,16 @@ fn blob_member_passes_entry_bytes_and_credential() -> TestResult {
 fn large_blob_not_landed_over_real_member_removes_only_blob() -> TestResult {
     let device = Device::new(true);
     let mut set = device.create()?;
-    let not_landed = LargeBlobNotLanded {
-        cause: None,
-        clears_by: LargeBlobClearingAct::RemoveConsumingCredential,
-    };
     if let Some(blob) = &device.blob {
-        blob.answer_next(NextBlobWrite::NotLanded(not_landed.clone()));
+        blob.answer_next(NextBlobWrite::Report(BlobWrite::NotWritten));
     }
     let report = compose(&mut set)?;
     assert_eq!(report.platform_account, MemberWrite::Written);
     assert_eq!(
         report.large_blob,
         LargeBlobWrite::NotLanded {
-            cause: not_landed.cause,
-            clears_by: not_landed.clears_by,
+            cause: None,
+            clears_by: LargeBlobClearingAct::RemoveConsumingCredential,
         }
     );
     report.completed()?;
@@ -755,10 +778,31 @@ fn blob_member_fits_an_absent_host_set() -> TestResult {
         platform_account: PlatformAccountSlot::Absent(
             scp_platform::PlatformAccountAbsence::NoDataApiToCredentialSyncStore,
         ),
-        large_blob: Some(CredentialBlobMember::new(Arc::clone(&slot), &lease)),
+        large_blob: Some(CredentialBlobMember::new(Arc::clone(&slot))),
     };
     let mut set = run(StoreSet::create(members, lease))?;
     run(set.compose(RevealKind::FixesCommitment, D1, None))?.completed()?;
     assert_eq!(lock(&slot.credentials).first(), Some(&credential()?));
+    Ok(())
+}
+
+/// A member holds no credential: every call it makes keys on the credential
+/// the set passes from its own lease. Members built before any lease exists
+/// read and write only the store of the set's credential. Mutant: the set
+/// passes a credential other than its lease's.
+#[test]
+fn members_key_on_the_credential_of_the_sets_lease() -> TestResult {
+    let device = Device::new(true);
+    let other = CredentialId::new(vec![0xc2; 64])?;
+    let lease = device.leases.acquire(other.clone(), identifier())?;
+    let mut set = run(StoreSet::create(device.members(), lease))?;
+    compose(&mut set)?.completed()?;
+    assert!(device.platform.raw(&other.entry_key()).is_some());
+    assert!(device.platform.raw(&other.record_key()).is_some());
+    assert_eq!(device.platform.raw(&credential()?.entry_key()), None);
+    let blob = device.blob.as_ref().ok_or("no blob slot")?;
+    let seen = lock(&blob.credentials).clone();
+    assert!(!seen.is_empty());
+    assert!(seen.iter().all(|c| *c == other), "{seen:?}");
     Ok(())
 }

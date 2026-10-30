@@ -19,7 +19,7 @@
 
 use scp_ffi_common::error_codes::{
     STORAGE_8000, STORAGE_8004, STORAGE_8005, STORAGE_8006, STORAGE_8007, STORAGE_8008,
-    STORAGE_8009, STORAGE_8014, STORAGE_8015,
+    STORAGE_8009, STORAGE_8014, STORAGE_8015, STORAGE_8016,
 };
 
 /// Numbers the `scp-kt-android` `AndroidStorage` backend owns
@@ -51,6 +51,7 @@ fn ffi_common_storage_codes_carry_their_registered_numbers() {
     assert_eq!(STORAGE_8009, "SCP-STORAGE-8009");
     assert_eq!(STORAGE_8014, "SCP-STORAGE-8014");
     assert_eq!(STORAGE_8015, "SCP-STORAGE-8015");
+    assert_eq!(STORAGE_8016, "SCP-STORAGE-8016");
 }
 
 /// No `SCP-STORAGE-` code `scp-ffi-common` defines takes a number another
@@ -69,6 +70,7 @@ fn ffi_common_storage_codes_avoid_every_other_owner_sub_block() {
         STORAGE_8009,
         STORAGE_8014,
         STORAGE_8015,
+        STORAGE_8016,
     ] {
         assert!(
             !ANDROID_OWNED.contains(&code),
