@@ -460,9 +460,19 @@ pub trait ContextEventLogProvider: Send + Sync {
     /// Returns [`UnitAppended::Appended`] when the log held `base_seq`
     /// entries and the unit was stored, and [`UnitAppended::AlreadyPresent`]
     /// when the log already holds the unit at `base_seq`, leaf hash for leaf
-    /// hash. The default, for a provider that keeps no write gate, places the
-    /// unit from [`Self::event_log_entries`] and writes it through
-    /// [`Self::append_event`].
+    /// hash. A unit is written whole or not at all: after an error the log
+    /// holds none of the unit's entries that it did not hold before.
+    ///
+    /// The default, for a provider that keeps no write gate, places the unit
+    /// from [`Self::event_log_entries`] and writes a one-entry unit through
+    /// [`Self::append_event`]. One `append_event` per entry cannot store a
+    /// unit of several entries whole: a failure at a later entry leaves the
+    /// earlier ones in the log, and the drain's next placement finds them
+    /// misaligned. So the default refuses such a unit with
+    /// [`UnitAppendError::Failed`], and the unit stays queued. A provider
+    /// that writes such units overrides this method with one atomic write, as
+    /// [`MerkleEventLogProvider`](crate::context::providers::event_log::MerkleEventLogProvider)
+    /// does.
     ///
     /// # Errors
     ///
@@ -470,7 +480,8 @@ pub trait ContextEventLogProvider: Send + Sync {
     /// the log's length, [`UnitAppendError::Misaligned`] when the log holds
     /// other entries at `base_seq`, and
     /// [`UnitAppendError::Failed`] when the unit is malformed, the context has
-    /// no log, or storing the unit fails.
+    /// no log, storing the unit fails, or (in the default) the unit holds
+    /// more than one entry.
     async fn append_unit(
         &self,
         guard: UnitWriteGuard,
@@ -502,16 +513,23 @@ pub trait ContextEventLogProvider: Send + Sync {
         };
         match crate::context::providers::event_log::place_unit(&entries, base_seq, leaves)? {
             crate::context::providers::event_log::UnitPlacement::Append(_) => {
-                for leaf in leaves {
-                    self.append_event(
-                        &context_id,
-                        leaf.event_type(),
-                        leaf.actor_did(),
-                        leaf.payload().clone(),
-                        leaf.timestamp_secs(),
-                    )
-                    .await?;
-                }
+                let [leaf] = leaves else {
+                    return Err(UnitAppendError::Failed(
+                        ContextCreationError::EventLogFailed(format!(
+                            "this event log provider cannot store a unit of {} entries \
+                             atomically; the unit stays queued",
+                            leaves.len()
+                        )),
+                    ));
+                };
+                self.append_event(
+                    &context_id,
+                    leaf.event_type(),
+                    leaf.actor_did(),
+                    leaf.payload().clone(),
+                    leaf.timestamp_secs(),
+                )
+                .await?;
                 Ok(UnitAppended::Appended)
             }
             crate::context::providers::event_log::UnitPlacement::AlreadyPresent => {

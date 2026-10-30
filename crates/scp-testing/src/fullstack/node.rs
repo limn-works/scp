@@ -340,6 +340,27 @@ impl ContextEventLogProvider for ArcEventLogProvider {
         )
         .await
     }
+    // The drain's write gate, unit write, and fence go to the shared provider,
+    // which writes a unit of any length atomically; the trait defaults would
+    // bypass its gate and refuse a unit of several entries.
+    async fn lock_for_unit(
+        &self,
+        id: &[u8; 32],
+    ) -> Result<scp_core::context::builder::UnitWriteGuard, ContextCreationError> {
+        self.0.lock_for_unit(id).await
+    }
+    async fn append_unit(
+        &self,
+        guard: scp_core::context::builder::UnitWriteGuard,
+        base_seq: u64,
+        leaves: &[scp_core::context::state::LeafSpec],
+    ) -> Result<scp_core::context::builder::UnitAppended, scp_core::context::builder::UnitAppendError>
+    {
+        self.0.append_unit(guard, base_seq, leaves).await
+    }
+    fn set_units_pending(&self, id: &[u8; 32], pending: bool) {
+        self.0.set_units_pending(id, pending);
+    }
 }
 
 // ---------------------------------------------------------------------------
