@@ -121,6 +121,21 @@ mod tests {
         assert_eq!(ARGON2_PARALLELISM, 1);
     }
 
+    /// Pins one Argon2id output under the §17.8 parameters, so a change to the
+    /// derivation path cannot silently change a key that an existing file or
+    /// database was sealed under.
+    #[test]
+    fn derivation_matches_known_answer() {
+        const KAT_KEY: [u8; DERIVED_KEY_LEN] = [
+            0xc8, 0x89, 0x28, 0xc7, 0xf6, 0xa2, 0x33, 0x0f, 0x14, 0x20, 0x99, 0x0e, 0x82, 0xde,
+            0x0c, 0xf8, 0x38, 0x1a, 0xf4, 0xdd, 0x19, 0xce, 0x2b, 0x45, 0x27, 0x61, 0x13, 0x7c,
+            0x1e, 0xb4, 0x25, 0x77,
+        ];
+        let key =
+            derive_argon2id_key(b"correct horse battery staple", b"scp-kdf-kat-salt").unwrap();
+        assert_eq!(*key, KAT_KEY);
+    }
+
     #[test]
     fn derived_key_is_32_bytes() {
         let salt = [0u8; ARGON2_SALT_LEN];
