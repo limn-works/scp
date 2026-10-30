@@ -1,13 +1,14 @@
 //! The identity error of the key-event-log identity model
 //! (`03-identity.md` §3.10.10).
 //!
-//! The type carries twenty variants and no others. Their codes take
-//! `SCP-IDENT-1100` through `SCP-IDENT-1120`; `SCP-IDENT-1105` is reserved and
+//! The type carries twenty-one variants and no others. Their codes take
+//! `SCP-IDENT-1100` through `SCP-IDENT-1121`; `SCP-IDENT-1105` is reserved and
 //! names no variant. The superseded `did:dht` model's error is
 //! [`crate::dht::IdentityError`], whose codes sit in `SCP-IDENT-1000` through
 //! `SCP-IDENT-1099` (`.docs/standards/sdk-common.md` §Error code format).
 
-use scp_kel::CheckStep;
+use scp_did::IdentifierError;
+use scp_kel::{CheckStep, InceptionRefusal};
 
 /// The error half of `IdentityBackend`'s six methods, of `Identity`'s write
 /// API, and of the three recovery entry points `09-security-model.md`
@@ -187,6 +188,40 @@ pub enum IdentityError {
         /// The event digest the call named.
         event_digest: [u8; 32],
     },
+
+    /// SCP-IDENT-1121. The method of the next-set custody `create` was handed
+    /// does not conform on the config's `CustodyProfile`, while another
+    /// method is offered on that profile, so `create` generated no key
+    /// (`09-security-model.md` §9.7.4.1 item 4). Where no method is offered
+    /// on the profile, `create` returns
+    /// [`NoIndependentSubstrate`](Self::NoIndependentSubstrate) instead.
+    #[error(
+        "the next-set custody's method does not conform on this custody profile, \
+         and another method is offered there"
+    )]
+    MethodNotOfferedOnProfile,
+}
+
+impl From<IdentifierError> for IdentityError {
+    /// A string that is not the canonical identifier form is
+    /// [`NonCanonicalIdentifier`](Self::NonCanonicalIdentifier), SCP-IDENT-1106
+    /// (`03-identity.md` §3.1).
+    fn from(error: IdentifierError) -> Self {
+        match error {
+            IdentifierError::NonCanonicalIdentifier { .. } => Self::NonCanonicalIdentifier,
+        }
+    }
+}
+
+impl From<InceptionRefusal> for IdentityError {
+    /// An inception that fails R2 or R3's check order is
+    /// [`IllegalKeyEvent`](Self::IllegalKeyEvent) at the failing step,
+    /// SCP-IDENT-1117 (`09-security-model.md` §9.7.4.2 R10).
+    fn from(refusal: InceptionRefusal) -> Self {
+        Self::IllegalKeyEvent {
+            stage: refusal.stage(),
+        }
+    }
 }
 
 impl IdentityError {
@@ -216,6 +251,7 @@ impl IdentityError {
             Self::SigningBaseStale { .. } => "SCP-IDENT-1118",
             Self::SignaturePending { .. } => "SCP-IDENT-1119",
             Self::NoPendingSignature { .. } => "SCP-IDENT-1120",
+            Self::MethodNotOfferedOnProfile => "SCP-IDENT-1121",
         }
     }
 }
@@ -261,6 +297,7 @@ mod tests {
             IdentityError::NoPendingSignature {
                 event_digest: [5; 32],
             },
+            IdentityError::MethodNotOfferedOnProfile,
         ]
     }
 
@@ -285,17 +322,18 @@ mod tests {
             | IdentityError::IllegalKeyEvent { .. }
             | IdentityError::SigningBaseStale { .. }
             | IdentityError::SignaturePending { .. }
-            | IdentityError::NoPendingSignature { .. } => 20,
+            | IdentityError::NoPendingSignature { .. }
+            | IdentityError::MethodNotOfferedOnProfile => 21,
         }
     }
 
     #[test]
-    fn codes_cover_1100_through_1120_without_1105() {
+    fn codes_cover_1100_through_1121_without_1105() {
         let variants = every_variant();
         assert_eq!(variants.len(), variant_count(&IdentityError::PersistFailed));
         let mut codes: Vec<&str> = variants.iter().map(IdentityError::code).collect();
         codes.sort_unstable();
-        let expected: Vec<String> = (1100..=1120)
+        let expected: Vec<String> = (1100..=1121)
             .filter(|n| *n != 1105)
             .map(|n| format!("SCP-IDENT-{n}"))
             .collect();

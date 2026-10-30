@@ -38,9 +38,13 @@ migration generated a fresh key whose hash could not match. Three fixes were wei
    `ScpIdentity` carries only `pre_rotation_commitment`; `create` returns
    `(ScpIdentity, KeyEvent, PreRotationKeyHandle)`; `migrate_identity` takes the handle
    and a `&impl PreRotationCustody`. The only implementation, `InMemoryPreRotationCustody`,
-   compiles under the `testing` feature alone, so a shipped build has no backend and
-   `create_inner` in `crates/scp-identity/src/config.rs` fails closed with
+   compiles under the `testing` feature alone, so a shipped build had no backend and
+   `create_inner` in `crates/scp-identity/src/config.rs` failed closed with
    `IdentityError::NoPreRotationBackend` (`SCP-IDENT-1059`), per ADR-062 §Decision 6.
+   SCP-006 deleted that path: `Identity::create` in
+   `crates/scp-identity/src/kel/create.rs` takes a `NextSetCustody`, and refuses before
+   any key with `SCP-IDENT-1100` or `SCP-IDENT-1121` where the config's profile does not
+   admit the custody's method.
 
 A distinct trait stops one object from serving both roles and cannot prove two foreign
 callbacks use different hardware; see

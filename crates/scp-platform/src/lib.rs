@@ -79,9 +79,8 @@ pub mod kdf;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 // Versioned storage envelope + spec §17.3 key conventions. The single source of
-// the `StoredValue` format and `identity/{did}/document` key convention shared
-// by `scp-runtime`'s `ProtocolRepository` and `scp-identity`'s `Identity::create`
-// persistence path, so both produce byte-identical storage writes.
+// the `StoredValue` format and `identity/{did}/document` key convention that
+// `scp-runtime`'s `ProtocolRepository` writes.
 // The store set a pending recovery handle lives in (09-security-model.md
 // §9.7.4.2 R10, 17-persistence-and-storage.md §17.8; SCP-311).
 pub mod recovery_handle_store;

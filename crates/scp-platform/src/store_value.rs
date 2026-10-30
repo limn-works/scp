@@ -20,14 +20,12 @@
 //!
 //! # Why the platform layer
 //!
-//! Both `scp-runtime` (via `ProtocolRepository`) and `scp-identity` (via the
-//! standalone `Identity::create` construction path) persist an identity's DID
-//! document under the **same** spec §17.3 storage slot `identity/{did}/document`.
-//! `scp-identity` sits below `scp-runtime` in the dependency graph and cannot
-//! import it; both, however, depend on `scp-platform`. Lifting the envelope and
-//! key convention here lets both call the same helper, eliminating the
-//! format-divergence class of bug (one path writing bare JSON while the other
-//! writes a `MessagePack` envelope — mutually undeserializable).
+//! `scp-runtime` (via `ProtocolRepository`) persists an identity's DID
+//! document under the spec §17.3 storage slot `identity/{did}/document`.
+//! The envelope and key convention live here, below every crate that writes
+//! the slot, so any writer calls the same helper and no two writers can
+//! diverge in format (one writing bare JSON while another writes a
+//! `MessagePack` envelope, mutually undeserializable).
 
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -164,9 +162,7 @@ pub fn sanitize_key_component(s: &str) -> Result<&str, StoreValueError> {
 ///
 /// Format: `identity/{did}/document`, with `did` passed through
 /// [`sanitize_key_component`] first. This is the single source of the key
-/// convention shared by `ProtocolRepository::store_identity_document` and the
-/// standalone `Identity::create` persistence path, guaranteeing both address
-/// the identical storage slot.
+/// convention `ProtocolRepository::store_identity_document` writes under.
 ///
 /// # Errors
 ///

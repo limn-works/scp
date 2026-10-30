@@ -22,19 +22,14 @@ scp-kel = { path = "../scp-kel", version = "=0.1.0-beta.2" }
 # `scp-protocol` leaf. Acyclic: `scp-protocol` depends only on `scp-did` /
 # `scp-event-log`, neither of which depends on `scp-identity`.
 scp-protocol = { path = "../scp-protocol", version = "=0.1.0-beta.2" }
-# Crypto primitives ONLY (ADR-062 §Decision 6). `testing` is NO LONGER enabled
-# here: the standalone identity construction front-end (`config.rs`, ADR-052
-# Phase B-P3e) previously minted an `InMemoryPreRotationCustody` (a §17.17.2
-# security nullifier) on its production `Identity::create` path. With no real
-# pre-rotation backend yet (RFC #2130 / #1729), that create path now FAILS CLOSED
-# with a typed `IdentityError` (SCP-IDENT-1059) rather than mint the nullifier —
-# so `scp-platform/testing` is gone from the shipped graph. The `testing`
-# crate-feature (below) re-adds it for the test harness only. `software_platform`
-# supplies the Ed25519/P-256 crypto primitives. `in-memory-storage` is NOT
-# enabled on this normal edge: `InMemoryStorage` is used only by `config.rs`'s
-# `#[cfg(test)]` persisted-round-trip test, which reaches it via the `testing`
-# dev-dependency (which pulls `in-memory-storage`) — no non-test code needs it.
-scp-platform = { path = "../scp-platform", version = "=0.1.0-beta.2", features = ["software_platform"] }
+# Crypto primitives ONLY (ADR-062 §Decision 6), plus the file custody the
+# `KeyCustodySlot::EncryptedFile` arm names (`file`, `kel/slot.rs`). `testing`
+# is not enabled here: no shipped path in this crate mints an in-memory custody,
+# and the `testing` crate feature (below) adds it for the test harness only.
+# `Identity::create` refuses with SCP-IDENT-1100 or 1121 before any key where
+# the next-set custody's method is not admitted on the config's profile
+# (`kel/create.rs`).
+scp-platform = { path = "../scp-platform", version = "=0.1.0-beta.2", features = ["software_platform", "file"] }
 tokio = { workspace = true }
 serde = { workspace = true }
 # The push signature verifier seam (`push_verify.rs`, PUSH-005): an async trait
@@ -71,9 +66,10 @@ testing = ["scp-platform/testing", "scp-dht/testing"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
-# `encrypting` provides `EncryptingAdapter`, the `EncryptedStorage` test backend
-# used by the persisted-`Identity::create` round-trip test in `config.rs`.
-scp-platform = { path = "../scp-platform", features = ["testing", "encrypting"] }
+# `encrypting` and `sqlite` provide `EncryptingAdapter<SqliteStorage>`, the
+# store the `kel/create.rs` tests reopen to read a device record a second
+# writer wrote; `testing` provides the in-memory custodies those tests record.
+scp-platform = { path = "../scp-platform", features = ["testing", "encrypting", "sqlite"] }
 # The dht.rs `#[cfg(test)]` module constructs `InMemoryDhtClient` (now gated
 # behind `scp-dht/testing`); this dev-dep activates that feature for this
 # crate's own test build (per-crate `cargo test -p scp-identity`).

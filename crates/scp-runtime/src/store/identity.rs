@@ -29,8 +29,8 @@ use super::{ProtocolRepository, StoreError};
 /// Format: `identity/{did}/document`
 /// See spec section 17.3.
 ///
-/// Delegates to the shared `store_value` key builder so this path and the
-/// standalone `Identity::create` persistence path address the identical slot.
+/// Delegates to the shared `store_value` key builder, the single source of
+/// the key convention.
 fn identity_document_key(did: &DID) -> Result<String, super::StoreError> {
     Ok(scp_platform::store_value::identity_document_key(
         did.as_ref(),

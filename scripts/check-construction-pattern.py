@@ -68,8 +68,10 @@ CONSTRUCTION_MODULE_GLOBS = [
 # nested crate directory. Each path must exist, so a rename fails this check
 # instead of silently leaving the file unscanned.
 # `node_start_config.rs`: construction.md §"Node start — `NodeStartConfig`".
+# `kel/config.rs`: scp-identity's `IdentityConfig` (`03-identity.md` §3.10.10).
 CONSTRUCTION_MODULE_FILES = [
     "crates/scp-ffi/common/src/node_start_config.rs",
+    "crates/scp-identity/src/kel/config.rs",
 ]
 
 # ---------------------------------------------------------------------------

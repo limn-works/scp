@@ -34,7 +34,6 @@
 //! See ADR-003 and ADR-039 in `.docs/adrs/phase-1.md` for the full design.
 
 pub mod cache;
-pub mod config;
 pub mod dht;
 pub mod kel;
 pub mod push_verify;
@@ -44,7 +43,6 @@ pub mod resolution;
 pub mod resolver;
 
 pub use cache::{DidCache, DidResolutionResult, Staleness};
-pub use config::{CreateIdentityError, CreatedIdentity, Identity, IdentityConfig, NoPersistence};
 #[cfg(any(test, feature = "testing"))]
 pub use dht::InMemorySequenceStore;
 pub use dht::{
@@ -52,7 +50,11 @@ pub use dht::{
     SequenceStore, did_from_ed25519_public_key, extract_public_key, verify_migration,
     verify_self_certification,
 };
-pub use kel::IdentityError;
+pub use kel::{
+    ErasedKeyCustody, ErasedNextSetCustody, EventOutcome, GroupSigners, Identity, IdentityConfig,
+    IdentityError, KeyCustodySlot, NextSetCustodySlot, PendingEvent, ScpIdentity, SignerPlan,
+    parse_identifier, verify_did,
+};
 #[cfg(any(test, feature = "testing"))]
 pub use push_verify::TestPushVerifier;
 pub use push_verify::{KelPushVerifier, PushMessage, PushSignatureVerifier, PushVerifyError};

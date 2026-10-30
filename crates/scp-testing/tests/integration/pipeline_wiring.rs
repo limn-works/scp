@@ -64,6 +64,14 @@ const STATE_SRC: &str = include_str!("../../../../crates/scp-runtime/src/context
 const SUPERVISOR_SRC: &str =
     include_str!("../../../../crates/scp-runtime/src/context/supervisor/supervisor.rs");
 
+// SCP-006 `Identity::create` and `Identity::abandon_pending`
+// (`03-identity.md` §3.10.10; `09-security-model.md` §9.7.4.1 items 3 to 5,
+// §9.7.4.2 R10). `create` runs its refusals synchronously and hands the keyed
+// work to a spawned task, so each order below spans the functions on that path.
+const IDENTITY_CREATE_SRC: &str = include_str!("../../../../crates/scp-identity/src/kel/create.rs");
+const IDENTITY_ABANDON_SRC: &str =
+    include_str!("../../../../crates/scp-identity/src/kel/abandon.rs");
+
 // Outlet invocation source — owns the SCP-OUT-046 off-mailbox streaming-saga
 // seal task (`run_streaming_saga_seal_task`). The `ac8_*` structural assertion
 // below pins the ADR-061 "commit once over the bounded root" invariant: the
@@ -2733,6 +2741,157 @@ fn send_message_does_not_call_encrypt_message() {
         !fn_body_contains(MANAGER_SRC, "send_message", ".encrypt_message("),
         "send_message must NOT call the old encrypt_message (replaced by seal)"
     );
+}
+
+// ===========================================================================
+// SCP-006 — identity creation and abandonment
+// ===========================================================================
+
+/// Offset of `needle` in `body`, panicking with `what` when it is absent.
+fn offset_of(body: &str, needle: &str, what: &str) -> usize {
+    body.find(needle)
+        .unwrap_or_else(|| panic!("{what}: `{needle}` not found"))
+}
+
+/// The body of `fn_name` in `source`, panicking when it is absent.
+fn body_of(source: &str, fn_name: &str) -> String {
+    extract_fn_body(source, fn_name).unwrap_or_else(|| panic!("`fn {fn_name}` not found"))
+}
+
+/// §9.7.4.1 items 3 and 4: every refusal that needs no key runs before the
+/// first key generation of any kind. `create` runs `check_create` (the plan
+/// shape, the threshold rule and the method-by-profile check) and returns its
+/// refusal before it spawns `compose_inception`, and the three generate calls
+/// sit only in `compose_keys_and_record`, which that task runs.
+#[test]
+fn identity_create_refuses_before_any_key() {
+    let create = body_of(IDENTITY_CREATE_SRC, "create");
+    let spawn = offset_of(&create, "tokio::spawn(compose_inception(", "create spawns");
+    assert!(
+        offset_of(&create, "check_create(", "create checks") < spawn
+            && offset_of(&create, "checked?", "create refuses") < spawn,
+        "create must run check_create and return its refusal before it spawns the keyed task"
+    );
+    let check = body_of(IDENTITY_CREATE_SRC, "check_create");
+    assert!(
+        check.contains("check_plan(") && check.contains("check_offer("),
+        "check_create must run the plan-shape and method-by-profile checks"
+    );
+    let plan = body_of(IDENTITY_CREATE_SRC, "check_plan");
+    assert!(
+        plan.contains("ThresholdAdmitsDisjointQuorums"),
+        "check_plan must run the threshold rule"
+    );
+    assert!(
+        fn_body_contains(
+            IDENTITY_CREATE_SRC,
+            "compose_inception",
+            "compose_keys_and_record("
+        ),
+        "compose_inception must run compose_keys_and_record"
+    );
+    let code = strip_non_code(IDENTITY_CREATE_SRC);
+    let keyed = body_of(IDENTITY_CREATE_SRC, "compose_keys_and_record");
+    for generate in [
+        ".generate(",
+        "generate_key_event_keypair(",
+        "generate_keypair(",
+    ] {
+        let in_file = code.matches(generate).count();
+        let in_compose = keyed.matches(generate).count();
+        assert!(
+            in_compose >= 1 && in_file == in_compose,
+            "`{generate}` must appear only in compose_keys_and_record ({in_compose} of {in_file})"
+        );
+    }
+}
+
+/// §9.7.4.1 item 5(d): the next-set member signs and verifies the probe
+/// before the inception is composed and checked.
+#[test]
+fn identity_create_probes_before_composing() {
+    let keyed = body_of(IDENTITY_CREATE_SRC, "compose_keys_and_record");
+    let probe = offset_of(&keyed, ".sign_probe(", "the probe");
+    let verify = offset_of(&keyed, ".verify(&probe", "the probe verification");
+    let compose = offset_of(&keyed, "SigningChange::inception(", "the inception check");
+    assert!(
+        probe < verify && verify < compose,
+        "sign_probe and its verification must precede SigningChange::inception"
+    );
+}
+
+/// §9.7.4.2 R10: the device record naming every key is written before the
+/// pending event leaves the task, and `create` returns that event only as
+/// `EventOutcome::AwaitingSignatures` through `CreateResult::take`.
+#[test]
+fn identity_create_writes_the_record_before_returning() {
+    let keyed = body_of(IDENTITY_CREATE_SRC, "compose_keys_and_record");
+    let write = offset_of(&keyed, "write_device_record(", "the record write");
+    assert!(
+        write < offset_of(&keyed, "PendingEvent {", "the pending event"),
+        "write_device_record must precede the pending event"
+    );
+    assert!(
+        fn_body_contains(
+            IDENTITY_CREATE_SRC,
+            "take",
+            "EventOutcome::AwaitingSignatures"
+        ),
+        "CreateResult::take must wrap the pending event as AwaitingSignatures"
+    );
+    assert!(
+        fn_body_contains(IDENTITY_CREATE_SRC, "create", ".take()"),
+        "create must return the outcome through CreateResult::take"
+    );
+}
+
+/// §3.10.10: abandonment destroys the composition's keys before it removes
+/// or rewrites the record, and both `abandon_pending` and the guard on a
+/// dropped `create` reach it.
+#[test]
+fn identity_abandon_destroys_before_the_record() {
+    let abandon = body_of(IDENTITY_ABANDON_SRC, "abandon_composition");
+    let destroy = offset_of(&abandon, "destroy_keys(", "the key destruction");
+    assert!(
+        destroy < offset_of(&abandon, "delete_device_record(", "the record removal")
+            && destroy < offset_of(&abandon, "write_device_record(", "the record rewrite"),
+        "abandon_composition must destroy the keys before it removes or rewrites the record"
+    );
+    assert!(
+        fn_body_contains(
+            IDENTITY_ABANDON_SRC,
+            "abandon_pending",
+            "abandon_composition("
+        ),
+        "abandon_pending must run abandon_composition"
+    );
+    assert!(
+        fn_body_contains(IDENTITY_CREATE_SRC, "drop", "abandon_composition("),
+        "the CreateResult guard must run abandon_composition"
+    );
+    assert!(
+        fn_body_contains(IDENTITY_CREATE_SRC, "compose_inception", "destroy_keys("),
+        "a failed composition must destroy the keys it minted"
+    );
+}
+
+/// SCP-313 adds `dispatch_identity_create` and
+/// `dispatch_identity_abandon_pending` to the Supervisor. This file forbids
+/// `#[ignore]` (`no_stale_ignores`), so the pending dispatch is asserted
+/// here: each dispatch method, once it exists, reaches its `Identity` method.
+#[test]
+fn identity_dispatch_reaches_create_and_abandon_pending() {
+    for (dispatch, callee) in [
+        ("dispatch_identity_create", "Identity::create("),
+        (
+            "dispatch_identity_abandon_pending",
+            "Identity::abandon_pending(",
+        ),
+    ] {
+        if let Some(body) = extract_fn_body(SUPERVISOR_SRC, dispatch) {
+            assert!(body.contains(callee), "{dispatch} must call {callee}");
+        }
+    }
 }
 
 // ===========================================================================

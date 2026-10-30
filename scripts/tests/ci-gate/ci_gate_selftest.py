@@ -82,10 +82,9 @@ nothing:
                check reading that table reported each one running by name.
                That normal-dependency line is now the `testing` feature of the
                same manifest, which that crate's own `[dev-dependencies]` turn
-               on, and crates/scp-runtime/Cargo.toml and
-               crates/scp-ffi/common/Cargo.toml each carry the same edge in
-               their `[dev-dependencies]`. A workspace build reads all three,
-               so the pairing this entry records stays rejected.
+               on, and crates/scp-ffi/common/Cargo.toml carries the same edge
+               in its `[dev-dependencies]`. A workspace build reads both, so
+               the pairing this entry records stays rejected.
   filter-source
                A `changes` job publishes each output from a
                `steps.filter.outputs.<key>` expression, and dorny/paths-filter
@@ -639,9 +638,9 @@ SHIPPED_CONFIG_LANES = {
 #
 # Job fail-closed-pre-rotation selects each crate with `-p` and names its two
 # assertions in an `-E` filter. A workspace-wide command cannot serve as
-# scp-identity's lane: three manifests turn `scp-identity/testing` on, each in
-# its own `[dev-dependencies]` — crates/scp-testing/Cargo.toml,
-# crates/scp-runtime/Cargo.toml and crates/scp-ffi/common/Cargo.toml — and
+# scp-identity's lane: two manifests turn `scp-identity/testing` on, each in
+# its own `[dev-dependencies]` — crates/scp-testing/Cargo.toml and
+# crates/scp-ffi/common/Cargo.toml — and
 # one cargo invocation resolves one feature set per package, so a build reading
 # any one of them compiles scp-identity's
 # `#[cfg(not(feature = "testing"))]` assertions out. An earlier revision of
@@ -2755,9 +2754,9 @@ def write_unification_fixture(root: Path) -> None:
 
     leaf     declares the feature and no dependencies.
     enabler  depends on leaf with `features = ["testing"]` — the
-             dependency-entry spelling that crates/scp-runtime/Cargo.toml and
-             crates/scp-ffi/common/Cargo.toml write against scp-identity in
-             their `[dev-dependencies]`; testing_edge reads `[dependencies]`
+             dependency-entry spelling that crates/scp-ffi/common/Cargo.toml
+             writes against scp-identity in its `[dev-dependencies]`;
+             testing_edge reads `[dependencies]`
              and `[build-dependencies]` identically.
     implier  declares a feature naming `"leaf/testing"`, the spelling
              crates/scp-identity/Cargo.toml's `testing` feature carries against
@@ -2816,10 +2815,9 @@ def check_testing_unification_readers() -> None:
     to every question would re-green the pairing this file's unified-feature
     entry records: scp-identity paired with job rust-test, whose workspace
     build reads every manifest turning `scp-identity/testing` on — the
-    `[dev-dependencies]` of crates/scp-testing/Cargo.toml,
-    crates/scp-runtime/Cargo.toml and crates/scp-ffi/common/Cargo.toml — and
-    compiles both of scp-identity's
-    fail-closed assertions out.
+    `[dev-dependencies]` of crates/scp-testing/Cargo.toml and
+    crates/scp-ffi/common/Cargo.toml — and compiles scp-identity's
+    fail-closed assertion out.
     """
     workspace = split_command("cargo nextest run --workspace")
     with tempfile.TemporaryDirectory() as scratch:
@@ -2929,8 +2927,8 @@ def check_testing_unification_readers() -> None:
     # Two conjuncts, each able to go red on its own. The first asks whether a
     # workspace build reads any manifest edge turning scp-identity/testing on.
     # Which edge command_unifies_testing returns is an artifact of sorted-path
-    # order — crates/scp-ffi/common/Cargo.toml and crates/scp-runtime/Cargo.toml
-    # sort ahead of crates/scp-testing/Cargo.toml — so the second conjunct names
+    # order — crates/scp-ffi/common/Cargo.toml sorts ahead of
+    # crates/scp-testing/Cargo.toml — so the second conjunct names
     # the manifest this entry records by asking testing_edge, the one-manifest
     # reader command_unifies_testing is built on, about that manifest alone.
     # Whether scp-testing's own `testing` feature compiles src/helpers.rs is a
