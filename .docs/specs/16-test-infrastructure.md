@@ -1166,7 +1166,11 @@ macro_rules! key_custody_conformance {
 
             #[tokio::test]
             async fn destroy_prevents_sign() {
-                // Generate keypair, destroy, attempt sign, verify error.
+                // Generate keypair, destroy, attempt sign, verify error. Later
+                // `generate_keypair` calls never return the destroyed id: a
+                // custody issues each id once over the life of its store, so
+                // a holder that destroys by a recorded id after a crash never
+                // reaches a newer key.
             }
 
             #[tokio::test]
@@ -1284,7 +1288,9 @@ macro_rules! next_set_custody_conformance {
 
             #[tokio::test]
             async fn destroy_prevents_sign() {
-                // `destroy`, then `sign_change` with the same handle fails.
+                // `destroy`, then `sign_change` with the same handle fails,
+                // and later `generate` calls never return the destroyed id,
+                // which the custody issues once over the life of its store.
             }
 
             #[tokio::test]
