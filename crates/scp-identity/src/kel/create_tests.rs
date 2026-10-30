@@ -2,6 +2,8 @@
 //! `Identity::unfinished` and `Identity::abandon_unfinished`
 //! (`03-identity.md` §3.10.10; SCP-006 AC1–5, 9, 15, 17–22).
 
+#![cfg(test)]
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -64,6 +66,10 @@ struct Rec {
     hold_generate: AtomicBool,
     generated: Notify,
     release: Notify,
+    /// `#active`'s generation never returns while set, and notifies
+    /// `active_held` before it mints anything.
+    hold_active_generate: AtomicBool,
+    active_held: Notify,
 }
 
 impl Rec {
@@ -145,6 +151,10 @@ impl KeyCustody for RecordingKeyCustody {
         );
         if self.rec.fail_active_generate.load(Ordering::SeqCst) {
             return Err(PlatformError::StorageError("injected".to_owned()));
+        }
+        if self.rec.hold_active_generate.load(Ordering::SeqCst) {
+            self.rec.active_held.notify_one();
+            std::future::pending::<()>().await;
         }
         let key = self.inner.generate_keypair(key_type).await?;
         lock(&self.rec.keys).push(key);
@@ -1059,6 +1069,44 @@ async fn abandoning_a_signed_or_later_event_rewrites_the_record() -> TestResult 
     Ok(())
 }
 
+// AC19: a device that signed its own inception holds a
+// `PendingSignatureRecord` for it; abandoning the inception then removes
+// both entries and destroys no key, because the released signature can
+// complete the event (`17-persistence-and-storage.md` §17.3).
+#[tokio::test]
+async fn abandoning_a_signed_inception_destroys_no_key() -> TestResult {
+    let rec = Arc::new(Rec::default());
+    let config = desktop(&rec);
+    let (identity, inception) = created(config.clone()).await?;
+    let id = *identity.identifier();
+    let mut record = read_device_record(&config.persistence, &id)
+        .await?
+        .ok_or("no device record")?;
+    record.pending.push(EventRef {
+        identifier: id,
+        sequence: 0,
+        event_digest: inception.event_digest,
+    });
+    write_device_record(&config.persistence, &id, &record).await?;
+
+    Identity::abandon_pending(&config, &inception).await?;
+    assert_eq!(rec.count("destroy") + rec.count("destroy_key"), 0);
+    assert_eq!(rec.live(), 3);
+    let left = read_device_record(&config.persistence, &id)
+        .await?
+        .ok_or("the record naming the keys is gone")?;
+    assert!(left.kept.is_empty() && left.pending.is_empty());
+    assert_eq!(left.next, record.next);
+    assert_eq!(left.root, record.root);
+    assert_eq!(left.active, record.active);
+    assert!(matches!(
+        Identity::abandon_pending(&config, &inception).await,
+        Err(IdentityError::NoPendingSignature { .. })
+    ));
+    assert_eq!(rec.live(), 3);
+    Ok(())
+}
+
 // The offer check runs before the plan check: Headless with `ThisSdk`
 // gives 1100, not the plan's refusal.
 #[tokio::test]
@@ -1252,17 +1300,23 @@ async fn a_failed_cleanup_is_listed_and_abandoned() -> TestResult {
         .err()
         .ok_or("create succeeded")?;
     assert_eq!(error.error, IdentityError::CustodySigningFailed);
-    let cleanup = error.cleanup.ok_or("the cleanup reported no failure")?;
+    let Some(CleanupFailure::Incomplete {
+        creation,
+        undestroyed,
+    }) = error.cleanup.map(|cleanup| *cleanup)
+    else {
+        return Err("the cleanup reported no incomplete cleanup".into());
+    };
     let next = *lock(&rec.next).first().ok_or("no next-set member")?;
     let root = *lock(&rec.keys).first().ok_or("no #0")?;
     assert_eq!(
-        cleanup.undestroyed,
+        undestroyed,
         [
             UndestroyedKey::NextSetMember(next),
             UndestroyedKey::Key(root)
         ]
     );
-    let creation = Unfinished::Creation(cleanup.creation);
+    let creation = Unfinished::Creation(creation);
     assert_eq!(Identity::unfinished(&config).await?, [creation]);
 
     rec.fail_next_destroy.store(false, Ordering::SeqCst);
@@ -1280,6 +1334,62 @@ async fn a_failed_cleanup_is_listed_and_abandoned() -> TestResult {
     assert!(records(&config.persistence).await?.is_empty());
     assert!(Identity::unfinished(&config).await?.is_empty());
     Ok(())
+}
+
+// AC21: a runtime that shuts down mid-create cancels the task before any
+// cleanup runs. `create` then reports every minted key as possibly live,
+// never an empty list, and `unfinished` lists the creation that names them.
+#[test]
+fn a_cancelled_create_reports_every_minted_key() -> TestResult {
+    let rec = Arc::new(Rec::default());
+    rec.hold_active_generate.store(true, Ordering::SeqCst);
+    let config = desktop(&rec);
+    let doomed = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()?;
+    let mut create = Box::pin(Identity::create(config.clone(), one_root()));
+    doomed.block_on(async {
+        tokio::select! {
+            biased;
+            () = rec.active_held.notified() => Ok(()),
+            _ = &mut create => Err("create finished before #active"),
+        }
+    })?;
+    doomed.shutdown_background();
+
+    let after = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    after.block_on(async {
+        let error = create.await.err().ok_or("create succeeded")?;
+        assert_eq!(error.error, IdentityError::PersistFailed);
+        let Some(CleanupFailure::NotAttempted {
+            creation,
+            composition,
+            minted,
+        }) = error.cleanup.map(|cleanup| *cleanup)
+        else {
+            return Err("the cancelled create did not report NotAttempted".into());
+        };
+        let next = *lock(&rec.next).first().ok_or("no next-set member")?;
+        let root = *lock(&rec.keys).first().ok_or("no #0")?;
+        assert_eq!(composition, None);
+        assert_eq!(
+            minted,
+            [
+                UndestroyedKey::NextSetMember(next),
+                UndestroyedKey::Key(root)
+            ]
+        );
+        assert_eq!(rec.live(), 2);
+        let listed = Unfinished::Creation(creation);
+        assert_eq!(Identity::unfinished(&config).await?, [listed]);
+        Identity::abandon_unfinished(&config, &listed).await?;
+        assert_eq!(rec.live(), 0);
+        assert!(records(&config.persistence).await?.is_empty());
+        Ok(())
+    })
 }
 
 // AC21: a composition whose abandon failed is listed, and
@@ -1682,9 +1792,11 @@ async fn the_inception_carries_the_witness_set() -> TestResult {
                 witnesses: vec![
                     WitnessDesignation {
                         operator: operator(1),
+                        key: [1; 33],
                     },
                     WitnessDesignation {
                         operator: operator(3),
+                        key: [3; 33],
                     },
                 ],
                 listed: vec![listed(1)],
@@ -1731,6 +1843,7 @@ async fn a_repeated_designated_witness_is_refused_before_any_key() -> TestResult
     let mut config = desktop(&rec);
     let twice = WitnessDesignation {
         operator: operator(1),
+        key: [1; 33],
     };
     config.witnesses = WitnessChoice::Designated {
         witnesses: vec![twice, twice],

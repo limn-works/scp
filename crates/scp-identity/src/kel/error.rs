@@ -12,6 +12,7 @@ use scp_kel::{CheckStep, InceptionRefusal};
 use scp_platform::{KeyHandle, NextSetKeyHandle};
 
 use super::creation_record::CreationId;
+use super::unfinished::KeptComposition;
 
 /// The error half of `IdentityBackend`'s six methods, of `Identity`'s write
 /// API, and of the three recovery entry points `09-security-model.md`
@@ -226,8 +227,9 @@ pub struct CreateError {
     /// The error of the step that failed.
     #[source]
     pub error: IdentityError,
-    /// The cleanup that did not complete, if any.
-    pub cleanup: Option<CleanupFailure>,
+    /// The cleanup that did not complete, if any, boxed so the error stays
+    /// small on the success path.
+    pub cleanup: Option<Box<CleanupFailure>>,
 }
 
 impl From<IdentityError> for CreateError {
@@ -241,14 +243,30 @@ impl From<IdentityError> for CreateError {
 }
 
 /// A cleanup after a failed `create` that did not complete
-/// (`17-persistence-and-storage.md` §17.3).
+/// (`17-persistence-and-storage.md` §17.3; `03-identity.md` §3.10.10).
+/// [`Identity::unfinished`](super::Identity::unfinished) lists what it names.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CleanupFailure {
-    /// The creation whose record still names every key in `undestroyed`.
-    pub creation: CreationId,
-    /// Every key the cleanup failed to destroy. Empty where every key was
-    /// destroyed and only the record's removal failed.
-    pub undestroyed: Vec<UndestroyedKey>,
+pub enum CleanupFailure {
+    /// The cleanup ran, and left keys live or the creation record in place.
+    Incomplete {
+        /// The creation whose record still names every key in `undestroyed`.
+        creation: CreationId,
+        /// Every key the cleanup failed to destroy. Empty where every key
+        /// was destroyed and only the record's removal failed.
+        undestroyed: Vec<UndestroyedKey>,
+    },
+    /// The runtime cancelled `create`'s task, so no cleanup ran, and every
+    /// key in `minted` may be live.
+    NotAttempted {
+        /// The creation whose record names each key it had recorded, unless
+        /// the device record superseded it.
+        creation: CreationId,
+        /// The inception's composition where the device record was written;
+        /// that record then names every key.
+        composition: Option<KeptComposition>,
+        /// Every key the composition minted.
+        minted: Vec<UndestroyedKey>,
+    },
 }
 
 /// One key a destroy pass failed to destroy.

@@ -22,12 +22,17 @@ pub struct ListedOperator {
     pub key: [u8; 33],
 }
 
-/// One designated witness: the operator identifier its community-list entry
-/// declares (`09-security-model.md` §9.7.4.2 definitions).
+/// One designated witness: its operator identifier and operator key.
+///
+/// Both are what its community-list entry declares (`09-security-model.md`
+/// §9.7.4.2 definitions). One operator key is one witness, so the key is
+/// what `create` checks against the list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WitnessDesignation {
     /// The witness's operator identifier.
     pub operator: Identifier,
+    /// The 33-byte compressed operator key the witness's entry declares.
+    pub key: [u8; 33],
 }
 
 /// Which witnesses `create` installs. No variant is a default
@@ -106,10 +111,10 @@ pub fn default_witness_set(listed: &[ListedOperator]) -> Vec<Identifier> {
         if set.len() == cap {
             break;
         }
-        let conflicting = listed
-            .iter()
-            .any(|other| other.operator == entry.operator && other.key != entry.key);
-        if conflicting || keys.contains(&entry.key) || set.contains(&entry.operator) {
+        if declared_under_two_keys(listed, &entry.operator)
+            || keys.contains(&entry.key)
+            || set.contains(&entry.operator)
+        {
             continue;
         }
         keys.push(entry.key);
@@ -118,13 +123,35 @@ pub fn default_witness_set(listed: &[ListedOperator]) -> Vec<Identifier> {
     set
 }
 
+/// True where two entries declare `operator` under different keys, which
+/// the definitions read as that operator's absence from the list
+/// (`09-security-model.md` §9.7.4.2 definitions).
+fn declared_under_two_keys(listed: &[ListedOperator], operator: &Identifier) -> bool {
+    let mut keys = listed
+        .iter()
+        .filter(|entry| entry.operator == *operator)
+        .map(|entry| entry.key);
+    keys.next()
+        .is_some_and(|first| keys.any(|other| other != first))
+}
+
+/// True where an entry declares the designated operator under the
+/// designated key and no entry declares it under another key.
+fn counts_as_listed(listed: &[ListedOperator], designation: &WitnessDesignation) -> bool {
+    listed
+        .iter()
+        .any(|entry| entry.operator == designation.operator && entry.key == designation.key)
+        && !declared_under_two_keys(listed, &designation.operator)
+}
+
 /// The set the inception installs, and the warning §9.7.4.3 requires where
 /// it is empty or names an unlisted operator.
 ///
 /// # Errors
 ///
 /// [`IdentityError::IllegalKeyEvent`] at `CheckStep::Content` where a
-/// designated set names one operator twice or exceeds
+/// designated set names one operator twice, names two operators under one
+/// operator key (one operator key is one witness), or exceeds
 /// `MAX_WITNESS_SET_SIZE` (R3's defect list), before any key exists.
 pub(super) fn resolve_witnesses(
     choice: &WitnessChoice,
@@ -139,16 +166,20 @@ pub(super) fn resolve_witnesses(
             if witnesses.len() > MAX_WITNESS_SET_SIZE as usize {
                 return Err(illegal);
             }
-            let set: Vec<Identifier> = witnesses.iter().map(|w| w.operator).collect();
-            for (position, operator) in set.iter().enumerate() {
-                if set.iter().skip(position + 1).any(|other| other == operator) {
+            for (position, witness) in witnesses.iter().enumerate() {
+                let repeated = witnesses
+                    .iter()
+                    .skip(position + 1)
+                    .any(|other| other.operator == witness.operator || other.key == witness.key);
+                if repeated {
                     return Err(illegal);
                 }
             }
-            let unlisted: Vec<Identifier> = set
+            let set: Vec<Identifier> = witnesses.iter().map(|w| w.operator).collect();
+            let unlisted: Vec<Identifier> = witnesses
                 .iter()
-                .filter(|operator| !listed.iter().any(|entry| entry.operator == **operator))
-                .copied()
+                .filter(|witness| !counts_as_listed(listed, witness))
+                .map(|witness| witness.operator)
                 .collect();
             if !unlisted.is_empty() {
                 return Ok((set, Some(WitnessWarning::UnlistedOperators(unlisted))));
@@ -219,7 +250,10 @@ mod tests {
         let designated = |ops: &[u8]| WitnessChoice::Designated {
             witnesses: ops
                 .iter()
-                .map(|n| WitnessDesignation { operator: op(*n) })
+                .map(|n| WitnessDesignation {
+                    operator: op(*n),
+                    key: [*n; 33],
+                })
                 .collect(),
             listed: vec![entry(1, 1)],
         };
@@ -246,13 +280,69 @@ mod tests {
         let designated = |ops: Vec<u8>| WitnessChoice::Designated {
             witnesses: ops
                 .into_iter()
-                .map(|n| WitnessDesignation { operator: op(n) })
+                .map(|n| WitnessDesignation {
+                    operator: op(n),
+                    key: [n; 33],
+                })
                 .collect(),
             listed: vec![],
         };
         assert_eq!(resolve_witnesses(&designated(vec![1, 2, 1])), illegal);
         assert_eq!(resolve_witnesses(&designated((0..33).collect())), illegal);
         assert!(resolve_witnesses(&designated((0..32).collect())).is_ok());
+    }
+
+    // AC22: a designated operator counts as listed only under the key its
+    // entry declares, and not at all where two entries declare it under
+    // different keys.
+    #[test]
+    fn a_designation_is_listed_only_under_its_own_key() -> Result<(), IdentityError> {
+        let designated = |key: u8, listed: Vec<ListedOperator>| WitnessChoice::Designated {
+            witnesses: vec![WitnessDesignation {
+                operator: op(1),
+                key: [key; 33],
+            }],
+            listed,
+        };
+        let unlisted = Some(WitnessWarning::UnlistedOperators(vec![op(1)]));
+        assert_eq!(
+            resolve_witnesses(&designated(10, vec![entry(1, 10)]))?,
+            (vec![op(1)], None)
+        );
+        assert_eq!(
+            resolve_witnesses(&designated(11, vec![entry(1, 10)]))?,
+            (vec![op(1)], unlisted.clone())
+        );
+        assert_eq!(
+            resolve_witnesses(&designated(10, vec![entry(1, 10), entry(1, 12)]))?,
+            (vec![op(1)], unlisted)
+        );
+        Ok(())
+    }
+
+    // AC22: two designated operators under one operator key install one
+    // witness twice, so the set is refused.
+    #[test]
+    fn two_designated_operators_under_one_key_are_illegal() {
+        let choice = WitnessChoice::Designated {
+            witnesses: vec![
+                WitnessDesignation {
+                    operator: op(1),
+                    key: [10; 33],
+                },
+                WitnessDesignation {
+                    operator: op(2),
+                    key: [10; 33],
+                },
+            ],
+            listed: vec![entry(1, 10), entry(2, 10)],
+        };
+        assert_eq!(
+            resolve_witnesses(&choice),
+            Err(IdentityError::IllegalKeyEvent {
+                stage: CheckStep::Content,
+            })
+        );
     }
 
     #[test]

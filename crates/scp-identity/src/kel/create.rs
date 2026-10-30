@@ -37,6 +37,7 @@ use super::creation_record::{
 use super::device_record::{DeviceRecord, EventRef, read_device_record, write_device_record};
 use super::error::{CleanupFailure, CreateError, UndestroyedKey};
 use super::slot::KeyCustodySlot;
+use super::unfinished::KeptComposition;
 use super::witness::{WitnessWarning, resolve_witnesses};
 use super::{Identity, IdentityConfig, IdentityError, ScpIdentity};
 
@@ -167,7 +168,9 @@ impl<S: EncryptedStorage + Clone + 'static> Identity<S> {
     ///   or the runtime cancelled the task.
     ///
     /// [`CreateError::cleanup`] is `Some` where the cleanup after that
-    /// failure left a key live or the creation record in place.
+    /// failure left a key live or the creation record in place
+    /// ([`CleanupFailure::Incomplete`]), or where the runtime cancelled the
+    /// task before any cleanup ran ([`CleanupFailure::NotAttempted`]).
     pub fn create(
         config: IdentityConfig<S>,
         signers: SignerPlan,
@@ -176,7 +179,13 @@ impl<S: EncryptedStorage + Clone + 'static> Identity<S> {
         async move {
             let (plan, witness_warning) = checked?;
             let creation = CreationId::fresh()?;
-            let task = tokio::spawn(compose_inception(config, plan, creation));
+            let shared = SharedMinted::default();
+            let task = tokio::spawn(compose_inception(
+                config,
+                plan,
+                creation,
+                Arc::clone(&shared),
+            ));
             match task.await {
                 Ok(Ok(mut result)) => {
                     let (identity, outcome) = result.take().ok_or(IdentityError::PersistFailed)?;
@@ -190,14 +199,22 @@ impl<S: EncryptedStorage + Clone + 'static> Identity<S> {
                 Err(join) if join.is_panic() => std::panic::resume_unwind(join.into_panic()),
                 Err(join) => {
                     tracing::error!(%join, %creation, "the runtime cancelled identity creation");
-                    // The cancelled task attempted no cleanup; the creation
-                    // or device record names every key it minted.
+                    // The cancelled task attempted no cleanup, so every key
+                    // it minted may be live.
+                    let minted = minted_now(&shared);
                     Err(CreateError {
                         error: IdentityError::PersistFailed,
-                        cleanup: Some(CleanupFailure {
+                        cleanup: Some(Box::new(CleanupFailure::NotAttempted {
                             creation,
-                            undestroyed: vec![],
-                        }),
+                            composition: minted.recorded.map(|(identifier, event_digest)| {
+                                KeptComposition {
+                                    identifier,
+                                    sequence: 0,
+                                    event_digest,
+                                }
+                            }),
+                            minted: minted.all(),
+                        })),
                     })
                 }
             }
@@ -342,8 +359,8 @@ pub(super) async fn compose_inception<S: EncryptedStorage + Clone + 'static>(
     config: IdentityConfig<S>,
     plan: CheckedPlan,
     creation: CreationId,
+    shared: SharedMinted,
 ) -> Result<CreateResult<S>, CreateError> {
-    let shared = SharedMinted::default();
     let composing = tokio::spawn(compose_keys_and_record(
         config.clone(),
         plan,
@@ -399,7 +416,7 @@ pub(super) async fn compose_inception<S: EncryptedStorage + Clone + 'static>(
             named = named.is_ok(),
             "identity creation failed, and its cleanup did not complete"
         );
-        CleanupFailure {
+        CleanupFailure::Incomplete {
             creation,
             // Where the record could not be rewritten, it may not name the
             // last key, so the caller gets every key minted.
@@ -413,7 +430,10 @@ pub(super) async fn compose_inception<S: EncryptedStorage + Clone + 'static>(
     if let Some(panic) = panic {
         std::panic::resume_unwind(panic);
     }
-    Err(CreateError { error, cleanup })
+    Err(CreateError {
+        error,
+        cleanup: cleanup.map(Box::new),
+    })
 }
 
 /// Adds a key to the shared list, then rewrites the creation record to name

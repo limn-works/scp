@@ -22,13 +22,15 @@ impl<S: EncryptedStorage + Clone + 'static> Identity<S> {
     /// the composing device, its `KeptComposition`. No other device's state
     /// changes.
     ///
-    /// On the composing device of an inception, where the record then holds
-    /// no other entry, it first destroys the keys that composition minted,
-    /// the next-set member, `#0` and `#active`, then removes the device
-    /// record, because an inception never published installs those keys on
-    /// no chain. Where another entry remains it removes only this event's
-    /// entries and destroys no key, because that entry may record a released
-    /// signature (§9.7.4.1 item 8; `17-persistence-and-storage.md` §17.3).
+    /// On the composing device of an inception, where the record holds no
+    /// `PendingSignatureRecord`, the inception's own included, and no other
+    /// `KeptComposition`, it first destroys the keys that composition
+    /// minted, the next-set member, `#0` and `#active`, then removes the
+    /// device record, because an inception never published installs those
+    /// keys on no chain. Otherwise it removes only this event's entries and
+    /// destroys no key, because a `PendingSignatureRecord` records a
+    /// signature this device released, which can complete the event
+    /// (§9.7.4.1 item 8; `17-persistence-and-storage.md` §17.3).
     ///
     /// Must be awaited inside a Tokio runtime: the work runs in a spawned
     /// task, so dropping the returned future leaves no key destroyed and the
@@ -111,16 +113,20 @@ pub(super) async fn abandon_composition<S: EncryptedStorage + Clone>(
     if kept.is_none() && signed.is_none() {
         return Err(not_held);
     }
+    // A `PendingSignatureRecord`, this event's own included, records a
+    // signature this device released, which can complete its event and
+    // forbids destroying a standing next-set key (§9.7.4.1 item 8).
+    let released = !record.pending.is_empty();
     if let Some(index) = signed {
         record.pending.remove(index);
     }
     let composition = kept.map(|index| record.kept.remove(index));
-    // An unpublished inception installs its keys on no chain: destroy them,
-    // then remove the record that names them. Another entry may record a
-    // released signature, which forbids destroying a standing next-set key
-    // (§9.7.4.1 item 8), so then only this event's entries go.
-    let sole = record.kept.is_empty() && record.pending.is_empty();
-    if sole && composition.is_some_and(|entry| entry.sequence == 0) {
+    // An unsigned, unpublished inception installs its keys on no chain:
+    // destroy them, then remove the record that names them. Otherwise only
+    // this event's entries go, and the record keeps naming every key.
+    let unsigned_inception =
+        !released && record.kept.is_empty() && composition.is_some_and(|entry| entry.sequence == 0);
+    if unsigned_inception {
         let keys: Vec<KeyHandle> = record
             .root
             .iter()
