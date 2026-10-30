@@ -93,12 +93,6 @@ pub enum VerdictRequestError {
     /// The policy's challenge is 32 bytes of `0x00`, so no entry can verify.
     #[error("the context's device-attestation challenge is unset")]
     ChallengeUnset,
-    /// A string member is empty.
-    #[error("the verdict request's {member} is empty")]
-    EmptyMember {
-        /// The member's name.
-        member: &'static str,
-    },
     /// The token is longer than [`MAX_VERDICT_TOKEN_LEN`] bytes.
     #[error("the integrity token is {len} bytes, more than {MAX_VERDICT_TOKEN_LEN}")]
     TokenTooLong {
@@ -147,20 +141,11 @@ impl VerdictRequest {
     ///
     /// # Errors
     ///
-    /// A [`VerdictRequestError`] for an unset challenge, an empty member, a
-    /// token longer than [`MAX_VERDICT_TOKEN_LEN`] bytes, or a body longer
-    /// than [`MAX_VERDICT_REQUEST_LEN`] bytes; the owner then sends nothing.
+    /// A [`VerdictRequestError`] for an unset challenge, a token longer than
+    /// [`MAX_VERDICT_TOKEN_LEN`] bytes, or a body longer than
+    /// [`MAX_VERDICT_REQUEST_LEN`] bytes; the owner then sends nothing.
     pub fn new(input: &VerdictRequestInput<'_>) -> Result<Self, VerdictRequestError> {
         let challenge = set_challenge(input.policy).ok_or(VerdictRequestError::ChallengeUnset)?;
-        for (member, value) in [
-            ("context_id", input.context_id),
-            ("package_name", input.package_name),
-            ("token", input.token),
-        ] {
-            if value.is_empty() {
-                return Err(VerdictRequestError::EmptyMember { member });
-            }
-        }
         if input.token.len() > MAX_VERDICT_TOKEN_LEN {
             return Err(VerdictRequestError::TokenTooLong {
                 len: input.token.len(),

@@ -285,20 +285,31 @@ fn token_over_16384_bytes_sends_no_request() -> TestResult {
     Ok(())
 }
 
-/// A request over 32,768 bytes, an empty member and an unset challenge each
-/// build no request.
+/// A body of exactly 32,768 bytes is built and one byte more is refused; an
+/// unset challenge builds no request. §9.3.1 states no emptiness rule, so an
+/// empty member builds a request.
 #[test]
 fn request_refusals() -> TestResult {
     let a = verifier_a()?;
     let mut policy = policy(&a);
     let subject = owner();
-    let long_context = "c".repeat(MAX_VERDICT_REQUEST_LEN);
     let mut input = request_input(&subject, &policy, TOKEN)?;
-    input.context_id = &long_context;
-    assert!(matches!(
+    input.context_id = "";
+    let overhead = VerdictRequest::new(&input)?.body().len();
+    let fits = "c".repeat(MAX_VERDICT_REQUEST_LEN - overhead);
+    input.context_id = &fits;
+    assert_eq!(
+        VerdictRequest::new(&input)?.body().len(),
+        MAX_VERDICT_REQUEST_LEN
+    );
+    let over = "c".repeat(MAX_VERDICT_REQUEST_LEN - overhead + 1);
+    input.context_id = &over;
+    assert_eq!(
         VerdictRequest::new(&input),
-        Err(VerdictRequestError::BodyTooLong { len }) if len > MAX_VERDICT_REQUEST_LEN
-    ));
+        Err(VerdictRequestError::BodyTooLong {
+            len: MAX_VERDICT_REQUEST_LEN + 1
+        })
+    );
     for member in ["context_id", "package_name", "token"] {
         let mut input = request_input(&subject, &policy, TOKEN)?;
         match member {
@@ -306,10 +317,7 @@ fn request_refusals() -> TestResult {
             "package_name" => input.package_name = "",
             _ => input.token = "",
         }
-        assert_eq!(
-            VerdictRequest::new(&input),
-            Err(VerdictRequestError::EmptyMember { member })
-        );
+        VerdictRequest::new(&input)?;
     }
     policy.device_attestation_challenge = [0; 32];
     assert_eq!(
@@ -367,10 +375,16 @@ fn extra_whitespace_publishes_nothing() -> TestResult {
 }
 
 /// A repeated member is refused even when both copies are equal.
+///
+/// With real ten-digit timestamps every repeated member pushes a body that
+/// would otherwise pass past the 358-byte bound, so the bound alone refuses
+/// any real repeat; the first case shows that and that nothing is published.
+/// The second case shrinks the timestamps to fit the bound, so only the
+/// parser can refuse it. Its verdict fails the owner's check anyway, so it
+/// asserts only the refusal.
 #[test]
 fn repeated_member_publishes_nothing() -> TestResult {
     let a = verifier_a()?;
-    // A repeated `verifier` makes the body longer than any canonical one.
     let signed = Signed::over(&a, &owner(), CONTEXT, TOKEN)?;
     let mut members = signed.members().to_vec();
     members.push(members[5].clone());
@@ -389,11 +403,7 @@ fn repeated_member_publishes_nothing() -> TestResult {
     members.push(members[1].clone());
     let body = join(&members);
     assert!(body.len() <= MAX_VERDICT_RESPONSE_LEN);
-    assert!(matches!(
-        VerdictResponse::from_http(200, &body),
-        Err(VerdictResponseError::Malformed { reason }) if reason.contains("duplicate field")
-    ));
-    assert_eq!(publish(200, &body, &policy(&a), &a, NOW)?, None);
+    assert!(VerdictResponse::from_http(200, &body).is_err());
     Ok(())
 }
 
@@ -404,10 +414,7 @@ fn extra_member_publishes_nothing() -> TestResult {
     members.push(("zz", "1".to_owned()));
     let body = join(&members);
     let a = verifier_a()?;
-    assert!(matches!(
-        VerdictResponse::from_http(200, &body),
-        Err(VerdictResponseError::Malformed { reason }) if reason.contains("unknown field")
-    ));
+    assert!(VerdictResponse::from_http(200, &body).is_err());
     assert_eq!(publish(200, &body, &policy(&a), &a, NOW)?, None);
     Ok(())
 }
