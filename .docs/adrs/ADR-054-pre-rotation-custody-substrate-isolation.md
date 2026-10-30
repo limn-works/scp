@@ -20,7 +20,10 @@
 - On the bridges, Alec ruled "Ok uniffi only". UniFFI alone declares `AssertionCustodyProvider`, `CredentialBlobProvider` and `SyncedStoreProvider`, and PyO3 and NAPI carry exemptions for them in the SDK capability matrix, `.docs/standards/sdk-capability-matrix.json`, alone, written in S8 PR 5b (§Assertion-arm and store-set host interfaces).
 
 **Amended 2026-10-30 (SCP-311), the two store-set host interfaces.**
-- `CredentialBlobProvider` holds the entry record of `17-persistence-and-storage.md` §17.8, which the earlier text called a `largeBlob` record. `read_blob` and `write_blob` take the credential identifier, and `write_blob` returns a typed outcome that names the clearing act `09-security-model.md` §9.7.4.2 R10 requires.
+- `CredentialBlobProvider` holds the entry record of `17-persistence-and-storage.md` §17.8, which the earlier text called a `largeBlob` record. `read_blob` and `write_blob` take the credential identifier, and `write_blob` returns a typed outcome that reports what the platform reported. The Rust adapter maps that report to the clearing act `09-security-model.md` §9.7.4.2 R10 requires, so no host picks an act.
+- No member of a store set holds a credential: the store set passes the credential of its own lease on every call, so no member reads or writes the store of another credential.
+- Every read the store set makes through either interface returns the platform's current value and never a cache.
+- A host that throws from either interface throws `ScpError.Storage` with `SCP-STORAGE-8016`.
 - `SyncedStoreProvider` loses `remove`. `StoreSet::remove` rewrites the entry and never deletes a value, and no path deletes a signed event, so the method had no caller. When an event may be deleted is an open defect of the spec, not of this interface.
 - Both interfaces gain a host contract: the two write checks the store set makes rest on it.
 - The text listing what the Rust adapter writes to the platform account's store now names the entry record, which holds the `RecoveryHandle` and the `LastRevealMarker`, in place of those two values keyed apart.
@@ -149,20 +152,22 @@ The callback adapter derives its foreign-call names from the FFI columns of this
 | Concept | FFI method (canonical) | UniFFI | NAPI | PyO3 | Swift | Kotlin |
 |---------|------------------------|--------|------|------|-------|--------|
 | read the bytes the credential's `largeBlob` store holds, given the credential identifier, or report that it holds none | `read_blob` | `read_blob` | `readBlob` | `read_blob` | `readBlob()` | `readBlob()` |
-| write bytes into the credential's `largeBlob` store, given the credential identifier, and return a `BlobWriteOutcome`: `Landed`, or `NotLanded` with the cause the platform reported, where it reported one, and the act that clears it | `write_blob` | `write_blob` | `writeBlob` | `write_blob` | `writeBlob()` | `writeBlob()` |
+| write bytes into the credential's `largeBlob` store, given the credential identifier, and return a `BlobWriteOutcome` reporting what the platform reported: `Landed`, `NotWritten`, `NoOutput`, or `VerificationDeclined` with the cause the platform reported, where it reported one | `write_blob` | `write_blob` | `writeBlob` | `write_blob` | `writeBlob()` | `writeBlob()` |
 
-The bytes are the entry record `17-persistence-and-storage.md` §17.8 lays out. The Rust adapter encodes and decodes it, and the host passes its bytes through without reading them. Each method takes the identifier of the credential the Rust adapter is bound to, and the host reads and writes that credential's store and no other.
+The bytes are the entry record `17-persistence-and-storage.md` §17.8 lays out. The Rust adapter encodes and decodes it, and the host passes its bytes through without reading them. Each method takes a credential identifier, and the host reads and writes that credential's store and no other. The Rust adapter holds no credential: the store set passes the credential of its own lease on every call, so no adapter reads or writes the store of a credential other than its set's.
 
-The clearing act is a `BlobClearingAct`, mapped from what the platform reports:
-- a declined or cancelled verification gesture is `RetryVerification`;
-- `largeBlob: { written: false }` with no error is `RemoveConsumingCredential`, the authenticator's large-blob array at capacity;
-- any other platform error reaches the Rust adapter as a thrown error, and the adapter maps it to `NotLanded` with `RetryVerification` and the error's text as the cause.
+The host reports what the platform reported, and the Rust adapter maps each report to the act that clears a write that did not land. The host never names an act.
+- `Landed`: the platform reported `largeBlob: { written: true }`.
+- `NotWritten`: the platform reported `largeBlob: { written: false }` with no error. The adapter maps it to `RemoveConsumingCredential`, because R10 reads that report as the authenticator's large-blob array at capacity.
+- `NoOutput`: the assertion returned no `largeBlob` output, the report of a client that did not process the extension. It is not the capacity report, so the adapter maps it to `RetryVerification`, the act a retry on a client that processes the extension clears.
+- `VerificationDeclined`: the user declined or cancelled the verification gesture, with the cause the platform reported, where it reported one. The adapter maps it to `RetryVerification`.
+- Any other platform failure throws, and the adapter maps the throw to `RetryVerification` with the error's text as the cause.
 
 `written: false` is also what a credential that does not support `largeBlob` reports. For that credential `RemoveConsumingCredential` names an act that clears nothing. That has no effect on safety: such a store never holds a handle or a marker, so it is never a member that stops a ceremony.
 
 The host contract for `CredentialBlobProvider`:
 - `write_blob` returns `Landed` only where the platform reports `written: true`. The store set reads no `largeBlob` write back, so a false `Landed` would leave a member at `Composed` while the ceremony believes it moved to `Signed`, the state R10 stops the ceremony in.
-- A `largeBlob` output the platform does not return is `NotLanded`, never `Landed`.
+- A `largeBlob` output the platform does not return is `NoOutput`, never `Landed`.
 - `read_blob` returns no bytes only where the platform reports that the store holds none, and every other failure throws, so a store that failed to answer is never read as an empty one.
 
 **`SyncedStoreProvider`** reaches the platform account's synced store, on a host where the host table of `09-security-model.md` §9.7.4.2 R10 marks that member present:
@@ -179,7 +184,9 @@ The host contract for `SyncedStoreProvider`:
 - `get` reads the platform store on every call and never answers from a cache. The store set reads each platform write back to check it, and a cached answer would pass that check after a write that failed.
 - `put` returns only after the platform reports the item stored.
 
-On every interface in this section, a UniFFI host throws only `ScpError`: UniFFI panics on any other error a callback throws.
+**One freshness rule for both interfaces.** Every read the store set makes, through `get` or `read_blob`, returns the value the platform holds when the call is made, read from the platform store on that call (for `read_blob`, through a `largeBlob` read assertion), and never a cache or the bytes of the host's last write. The store set merges every member's current value before it writes: a cached `read_blob` would let a composition proceed past a handle or marker another device wrote, and a cached `get` would also pass the read-back check after a platform write that failed.
+
+On every interface in this section, a UniFFI host throws only `ScpError`: UniFFI panics on any other error a callback throws. A host that cannot answer a `CredentialBlobProvider` or `SyncedStoreProvider` call throws `ScpError.Storage` with the code `SCP-STORAGE-8016` and the platform's error text as the message. The Rust adapter reads only that text: a thrown read is a member not reached, a thrown `put` is a failed write, and a thrown `write_blob` is a write that did not land.
 
 **Which bridges declare the three interfaces.** UniFFI alone declares all three, because the Swift and Kotlin SDKs are the hosts that reach a passkey API, a `largeBlob` store and a platform-account store. Alec ruled on 2026-10-26, "Ok uniffi only": PyO3 and NAPI declare none of the three and carry exemptions for them in the SDK capability matrix, `.docs/standards/sdk-capability-matrix.json`, alone, written in S8 PR 5b. The casing columns above bind every bridge that declares an interface.
 
