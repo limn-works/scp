@@ -178,6 +178,13 @@ impl KeyRole {
 /// material stored internally (e.g., in a `HashMap`, Secure Enclave slot, or
 /// Android Keystore alias). The raw private key never leaves the custody
 /// boundary.
+///
+/// **An implementation issues each id once over the life of its store,
+/// restarts included, and never reissues the id of a destroyed key.** A
+/// holder that recorded a handle destroys by it after a crash and treats
+/// [`PlatformError::KeyNotFound`] as already destroyed, so a reissued id
+/// would let that retry destroy a newer, unrelated key
+/// (`17-persistence-and-storage.md` §17.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct KeyHandle(u64);
 
@@ -407,6 +414,33 @@ pub enum CustodyType {
     /// Key material is stored in software (e.g., encrypted file on disk) but
     /// not in a hardware security module.
     Software,
+}
+
+impl CustodyType {
+    /// The key-entry custody type (`09-security-model.md` §9.7.4.2
+    /// definitions, the 45-byte key entry) a key held under this custody
+    /// type discloses.
+    ///
+    /// `InMemory` and `Software` keys are copyable software keys, so both
+    /// disclose `Software`. A `Hardware` key discloses the keystore this
+    /// target ships: the Secure Enclave on Apple targets, the Android
+    /// Keystore on Android, and on every other target the TPM or hardware
+    /// security module this type's own documentation names, which is `Hsm`.
+    #[must_use]
+    pub const fn key_entry_custody_type(self) -> scp_did::CustodyType {
+        match self {
+            Self::InMemory | Self::Software => scp_did::CustodyType::Software,
+            Self::Hardware => {
+                if cfg!(any(target_os = "ios", target_os = "macos")) {
+                    scp_did::CustodyType::SecureEnclave
+                } else if cfg!(target_os = "android") {
+                    scp_did::CustodyType::AndroidKeystore
+                } else {
+                    scp_did::CustodyType::Hsm
+                }
+            }
+        }
+    }
 }
 
 /// A device attestation token produced by [`DeviceAttestation::attest`].
@@ -961,6 +995,9 @@ pub trait KeyCustody: Send + Sync + scp_kel::KeyEventSigner<Member = KeyHandle> 
     /// a derivation from a destroyed identity fails with key-not-found
     /// (`SCP-CRYPTO-4006`, `09-security-model.md` §9.10.4.A).
     ///
+    /// The destroyed key's id is never issued again (see [`KeyHandle`]), so
+    /// every later call with `key` returns [`PlatformError::KeyNotFound`].
+    ///
     /// # Errors
     ///
     /// Returns [`PlatformError::KeyNotFound`] if the handle is already invalid.
@@ -1206,10 +1243,13 @@ pub enum PreRotationCustodyError {
 /// Discriminator for the six approved §9.7.4.1 §4 custody methods, plus the
 /// bridge-callback variant that routes to one of the six.
 ///
-/// Used for diagnostics and SDK UX (e.g., "Your pre-rotation key is on a
-/// hardware token — please tap your `YubiKey`"). MUST NOT be used for security
-/// decisions — the [`PreRotationCustody`] instance itself is the security
-/// boundary.
+/// Used for diagnostics, SDK UX (e.g., "Your pre-rotation key is on a
+/// hardware token — please tap your `YubiKey`"), and the method-by-profile
+/// check identity creation runs through
+/// [`declared_custody_type`](Self::declared_custody_type)
+/// (`09-security-model.md` §9.7.4.1 item 4). The custody instance itself
+/// stays the isolation boundary: a kind declares a method, and the check
+/// refuses a method the profile does not offer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PreRotationCustodyKind {
     /// In-process registry. Satisfies the §9.7.4.1 §3 type-level isolation
@@ -1245,6 +1285,31 @@ pub enum PreRotationCustodyKind {
     /// operational custody, Android Keystore alias with separate
     /// authentication flow, FIDO2/PRF, encrypted backup, etc.).
     Callback,
+}
+
+impl PreRotationCustodyKind {
+    /// The `CustodyType` the kind declares for the commitment entry it backs
+    /// (`09-security-model.md` §9.7.4.2 definitions; §9.7.4.1 item 4, "Method
+    /// by profile"), or `None` where the kind names no one method.
+    ///
+    /// `SecondaryDeviceEnclave` names a device rather than a method, and
+    /// `Callback` names whichever method the host callback runs, so neither
+    /// declares a type, and a caller that needs one refuses the custody.
+    /// `PlatformCloudKeyStore` is a synced platform passkey store, so it
+    /// declares `Passkey`. `InMemory` keeps its key in process memory, the
+    /// operational path's own copyable substrate, so it declares `Software`.
+    #[must_use]
+    pub const fn declared_custody_type(self) -> Option<scp_did::CustodyType> {
+        match self {
+            Self::HardwareSecurityKey => Some(scp_did::CustodyType::Fido2Token),
+            Self::EncryptedOfflineBackup => Some(scp_did::CustodyType::EncryptedOfflineBackup),
+            Self::ShamirSecretSharing => Some(scp_did::CustodyType::ShamirShares),
+            Self::PaperBackupBip39 => Some(scp_did::CustodyType::PaperBackup),
+            Self::PlatformCloudKeyStore => Some(scp_did::CustodyType::Passkey),
+            Self::InMemory => Some(scp_did::CustodyType::Software),
+            Self::SecondaryDeviceEnclave | Self::Callback => None,
+        }
+    }
 }
 
 /// Cold-custody interface for pre-rotation keys (spec §9.7.4.1).
@@ -1411,6 +1476,12 @@ pub trait PreRotationCustody: Send + Sync {
 /// A distinct type from [`KeyHandle`] and [`PreRotationKeyHandle`], so no
 /// operational or pre-rotation handle reaches a next-set custody. A handle is
 /// meaningful only to the custody that generated it.
+///
+/// **A custody issues each id once over the life of its store, restarts
+/// included, and never reissues the id of a destroyed key**, because a
+/// holder retrying a destroy after a crash treats
+/// [`NextSetCustodyError::HandleNotFound`] as already destroyed, and a
+/// reissued id would let that retry destroy a newer next-set key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NextSetKeyHandle(u64);
 
@@ -1790,7 +1861,8 @@ pub trait NextSetCustody: Send + Sync + scp_kel::KeyEventSigner<Member = NextSet
         handle: &NextSetKeyHandle,
     ) -> impl std::future::Future<Output = Result<[u8; 33], NextSetCustodyError>> + Send;
 
-    /// Destroys the key, so every later call with `handle` fails.
+    /// Destroys the key, so every later call with `handle` fails. The id is
+    /// never issued again (see [`NextSetKeyHandle`]).
     ///
     /// # Errors
     ///
@@ -1841,9 +1913,16 @@ pub trait NextSetCustody: Send + Sync + scp_kel::KeyEventSigner<Member = NextSet
         expected_commitment: [u8; 32],
     ) -> impl std::future::Future<Output = Result<NextSetKeyHandle, NextSetCustodyError>> + Send;
 
-    /// The substrate this custody keeps its keys in (ADR-054). A fixed value
-    /// per implementation, for diagnostics; the custody object itself is the
-    /// security boundary.
+    /// The substrate this custody keeps its keys in (ADR-054), a fixed value
+    /// per implementation. It is security-relevant: `Identity::create` checks
+    /// the method it declares against the config's `CustodyProfile` and
+    /// refuses a method that profile does not admit as the next set's one
+    /// member (`09-security-model.md` §9.7.4.1 item 4), and writes that
+    /// method into the inception's commitment entry, which the signed
+    /// preimage, and so the identifier, hashes. An implementation returns
+    /// the kind of the substrate it actually uses, because a misstated kind
+    /// passes the profile check falsely and signs a false method into the
+    /// identity's log.
     fn custody_kind(&self) -> PreRotationCustodyKind;
 }
 
@@ -2368,5 +2447,53 @@ mod tests {
             assert_eq!(KeyType::parse(bad), None, "{bad}");
             assert_eq!(KeyRole::parse(bad), None, "{bad}");
         }
+    }
+
+    /// Each next-set kind declares the §9.7.4.2 custody type of its one
+    /// method, and the two kinds that name no one method declare none.
+    #[test]
+    fn next_set_kinds_declare_their_method() {
+        use super::PreRotationCustodyKind as Kind;
+        use scp_did::CustodyType as Type;
+        let table = [
+            (Kind::HardwareSecurityKey, Some(Type::Fido2Token)),
+            (
+                Kind::EncryptedOfflineBackup,
+                Some(Type::EncryptedOfflineBackup),
+            ),
+            (Kind::ShamirSecretSharing, Some(Type::ShamirShares)),
+            (Kind::PaperBackupBip39, Some(Type::PaperBackup)),
+            (Kind::PlatformCloudKeyStore, Some(Type::Passkey)),
+            (Kind::InMemory, Some(Type::Software)),
+            (Kind::SecondaryDeviceEnclave, None),
+            (Kind::Callback, None),
+        ];
+        for (kind, declared) in table {
+            assert_eq!(kind.declared_custody_type(), declared, "{kind:?}");
+        }
+    }
+
+    /// Software and in-memory keys disclose `Software`; a hardware key
+    /// discloses the keystore of the target the test runs on.
+    #[test]
+    fn operational_custody_types_map_to_key_entry_types() {
+        use super::CustodyType;
+        use scp_did::CustodyType as Type;
+        assert_eq!(
+            CustodyType::InMemory.key_entry_custody_type(),
+            Type::Software
+        );
+        assert_eq!(
+            CustodyType::Software.key_entry_custody_type(),
+            Type::Software
+        );
+        let hardware = if cfg!(any(target_os = "ios", target_os = "macos")) {
+            Type::SecureEnclave
+        } else if cfg!(target_os = "android") {
+            Type::AndroidKeystore
+        } else {
+            Type::Hsm
+        };
+        assert_eq!(CustodyType::Hardware.key_entry_custody_type(), hardware);
     }
 }

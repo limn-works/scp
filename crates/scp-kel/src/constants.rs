@@ -81,6 +81,31 @@ pub const MAX_WITNESSING_INTERVAL: u32 = 604_800;
 /// `0x00` for `Any` and `0x01` for `RevealOnly` (§9.18.17; §9.7.4.2 R10).
 pub const HELD_HEAD_MARKER_BYTES: u32 = 73;
 
+/// The witnessing interval, in seconds, the SDK writes into a new identity's
+/// first key-state snapshot (§9.18.17; §9.7.4.3, the SDK's default witness
+/// set).
+pub const DEFAULT_WITNESSING_INTERVAL: u32 = 3_600;
+
+/// The encoded width of a `KeptComposition` (§9.18.17).
+///
+/// It holds the 32-byte identifier, the 8-byte big-endian sequence, and the
+/// 32-byte preimage digest of an event the composing device returned as
+/// awaiting signatures (§9.7.4.2 R10's abandonment rule).
+pub const KEPT_COMPOSITION_BYTES: u32 = 72;
+
+/// The encoded width of a `PendingSignatureRecord` (§9.18.17).
+///
+/// It holds the 32-byte identifier, the 8-byte big-endian sequence, and the
+/// 32-byte preimage digest of an event a device signed and has not adopted
+/// (§9.7.4.2 R10's signing rule).
+pub const PENDING_SIGNATURE_RECORD_BYTES: u32 = 72;
+
+// §9.18.17 bounds the default interval by the registered range.
+const _: () = assert!(
+    DEFAULT_WITNESSING_INTERVAL >= MIN_WITNESSING_INTERVAL
+        && DEFAULT_WITNESSING_INTERVAL <= MAX_WITNESSING_INTERVAL
+);
+
 /// Prefixes an event's preimage digest in the `WebAuthn` challenge of an
 /// assertion-form indexed signature (§9.7.4.2 definitions; §9.18.2). It is
 /// distinct from [`KEL_EVENT_SEPARATOR`], so no key-event preimage is a

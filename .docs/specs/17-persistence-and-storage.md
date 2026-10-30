@@ -91,6 +91,7 @@ identity/{did}/block_list_events
 identity/{did}/adapter_credentials/{adapter_id}
 identity/{did}/callback_custody
 identity/{identifier}/device_state
+identity/creation/{creation_id}
 
 context/{context_id}/state
 context/{context_id}/params
@@ -172,6 +173,20 @@ mls/{context_id}/...
 Each `KeptComposition` and each `PendingSignatureRecord` is 72 bytes, the 32-byte identifier, the 8-byte big-endian sequence and the 32-byte preimage digest (`KEPT_COMPOSITION_BYTES` and `PENDING_SIGNATURE_RECORD_BYTES`, `09-security-model.md` §9.18.17). The bounds 16 are `MAX_ROOT_SET_SIZE` and `MAX_NEXT_SET_SIZE`. The decoder refuses, and never substitutes a default for, a value with an unknown version; a truncated value or one with trailing bytes; a count outside its range; a root index at or above `MAX_ROOT_SET_SIZE`, or one that repeats; an entry whose identifier differs from the key's; and two entries of one list that carry the same digest.
 
 The device's whole state for an identity sits under one key because a put of a single key is the only atomic write every `Storage` backend offers (the Merkle event log entries below rely on the same property), and R10 clears a `KeptComposition` in the same transaction as the device's `PendingSignatureRecord`. `Identity::create` writes the record once, holding the key handles and the inception's `KeptComposition`, before it returns. `Identity::abandon_pending` on an inception composition destroys the keys that composition minted and then writes the record without the entry, which for an inception deletes the key: a crash between the two steps leaves a record naming destroyed keys, which a retry clears, where the reverse order would leave keys no record names. `Identity::cosign` writes the `PendingSignatureRecord` list. The handles are key ids and carry no secret: a `NextSetKeyHandle` reaches its key only through the next-set custody's own authority, so a reader of this store gains no recovery authority from the record (`09-security-model.md` §9.7.4.1 item 3a). A device that only cosigns with a root member writes a record with no `#active` handle and no next-set handle.
+
+**Inception abandonment scope.** `Identity::abandon_pending` on an inception composition removes that composition's `KeptComposition` and the device's `PendingSignatureRecord` for the same event, and nothing else. It destroys the keys and deletes the record only where the record held no `PendingSignatureRecord`, the inception's own included, and no `KeptComposition` other than the abandoned one. Otherwise it writes the record without the two removed entries and destroys no key, because a `PendingSignatureRecord` records a signature this device released, a released signature over the inception can complete it, and `09-security-model.md` §9.7.4.1 item 8 then requires every standing next-set key to be retained (`03-identity.md` §3.10.10: destroying the keys is safe only while no signature over that event has been released). The record then keeps naming every key.
+
+**Record lock.** Every read-modify-write of a device record or a creation record runs under the `RecordLock` of the `IdentityConfig` the call takes. Clones of one config share one lock, and two configs over one store in one process share it when one copies the other's `record_lock`. `Storage` offers no compare-and-swap, so the lock serializes the writers of one process and no others.
+
+**Creation record.** The `identity/creation/{creation_id}` key holds the keys one `Identity::create` call has minted and not yet handed to a device record. `{creation_id}` is 32 lowercase hexadecimal characters encoding 16 bytes `create` draws from the operating system's random source for that call, which passes `sanitize_key_component`. The record lives in the same `EncryptedStorage` as the device record. The value, format version 1, is:
+
+```
+0x01
+‖ u8 n_next (0..=1)   ‖ n_next × BE64 NextSetKeyHandle
+‖ u8 n_keys (0..=2)   ‖ n_keys × BE64 KeyHandle
+```
+
+The decoder refuses, and never substitutes a default for, a value with an unknown version, a truncated value or one with trailing bytes, and a count outside its range. `create` writes the record with both counts 0 before it generates any key. After each generation, it rewrites the record with the new handle before it starts the next generation: the next-set member, then `#0`, then `#active`. After it writes the device record, it deletes the creation record, and the device record then names every key. A failure at any step, or a panic, makes `create` destroy every key it minted, delete the device record where it wrote one, and then delete the creation record; a key it fails to destroy stays named in the creation record and in the error `create` returns (`03-identity.md` §3.10.10). A creation record that a crash, a runtime shutdown or a failed cleanup left behind is what `Identity::unfinished` lists as `Unfinished::Creation`, and `Identity::abandon_unfinished` destroys every key it names and then deletes it, treating a handle its custody no longer holds as destroyed. `create` reads the record back before each rewrite and before its delete, and fails where the record is gone, because `abandon_unfinished` has destroyed the keys it named. A crash after a custody generates a key and before the rewrite that names it leaves that one key named by no record. No write can close that window, because no write can name a key before its custody returns the handle.
 
 **Zero-padded sequences.** Event sequence numbers and private state sequence numbers use `:020d` formatting (20-digit zero-padded decimal). This ensures lexicographic ordering matches numeric ordering, enabling efficient range queries via `list_keys`. Example: event 42 is stored at `context/{id}/event/00000000000000000042`.
 

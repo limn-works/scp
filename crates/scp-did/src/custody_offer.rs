@@ -590,18 +590,6 @@ pub enum CustodyDisclosureError {
 mod tests {
     use super::*;
 
-    const ALL_TYPES: [CustodyType; 9] = [
-        CustodyType::Passkey,
-        CustodyType::Fido2Token,
-        CustodyType::Hsm,
-        CustodyType::SecureEnclave,
-        CustodyType::AndroidKeystore,
-        CustodyType::EncryptedOfflineBackup,
-        CustodyType::ShamirShares,
-        CustodyType::PaperBackup,
-        CustodyType::Software,
-    ];
-
     const ALL_BUILT: CustodyBuilds = CustodyBuilds {
         fido2_token: true,
         hsm: true,
@@ -706,10 +694,23 @@ mod tests {
         Ok(())
     }
 
+    // `CustodyType::ALL` comes from the macro's variant list, so every byte
+    // that decodes to a custody type is in it.
+    #[test]
+    fn all_lists_every_decodable_custody_type() {
+        let mut decoded: Vec<CustodyType> = (0..=u8::MAX)
+            .filter_map(|byte| CustodyType::try_from(byte).ok())
+            .collect();
+        let mut all = CustodyType::ALL.to_vec();
+        decoded.sort_by_key(|custody| custody.to_byte());
+        all.sort_by_key(|custody| custody.to_byte());
+        assert_eq!(decoded, all);
+    }
+
     #[test]
     fn this_build_ships_no_gated_custody_and_offered_on_reads_it() -> TestResult {
         assert_eq!(THIS_BUILD, NONE_BUILT);
-        for custody in ALL_TYPES {
+        for &custody in CustodyType::ALL {
             for profile in profiles()? {
                 assert_eq!(
                     custody.offered_on(&profile),
@@ -751,7 +752,7 @@ mod tests {
             ),
         ];
         for (builds, gated) in cases {
-            for custody in ALL_TYPES {
+            for &custody in CustodyType::ALL {
                 let offer = custody.offer_under(&CustodyProfile::Headless, builds);
                 if gated.contains(&custody) {
                     assert!(matches!(offer, HARDWARE | FLOOR), "{custody}: {offer:?}");

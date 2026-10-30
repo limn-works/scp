@@ -773,7 +773,7 @@ impl<S: Storage> Identity<S> {
 }
 ```
 
-**The write API is one method per consequential act on the identity handle, and every event that needs a root threshold goes through one collection flow**: `create`'s inception, `rotate_active` and `set_witnesses`, and the rollover, recovery and abandonment `Recovery::begin` composes. **Under `SignerPlan::ThisSdk` the composing method signs every group with the members this SDK's custody holds, publishes, and returns `EventOutcome::Published` in one call**, refusing with `IdentityError::SignatureSetIncomplete` where those members fall short of a group's threshold. **Under `SignerPlan::Groups` it returns `EventOutcome::AwaitingSignatures`** carrying the unsigned `PendingEvent`, whose preimage binds the signer index list and form list the plan names for each group the kind carries; a group the kind does not carry is empty, and an inception's one group is `installed_root`. **Each holder of a named member, the composer included, calls `Identity::cosign`**, which runs the display confirmation `09-security-model.md` §9.7.4.2 R10's device-boundary paragraph states and returns the `IndexedSignature` of the one member its custody holds, after it refuses a `PendingEvent` whose `chain` ends at a head other than the one this device holds, and refuses with `IdentityError::SignaturePending` an event at a sequence where this device's `PendingSignatureRecord` names a different event (`09-security-model.md` §9.7.4.2 R10). **`Identity::abandon_pending` is local**: the device's own user discards that device's own `PendingSignatureRecord` for the `PendingEvent` and, on the composing device, its `KeptComposition`, after which that device's `attach` refuses the composition with `IdentityError::NoPendingSignature`; no other device's state changes, and the call refuses with `IdentityError::NoPendingSignature` where the device holds neither (R10). **On the composing device of an inception, `abandon_pending` destroys the keys that composition minted, the next-set member, the root member `#0` and `#active`, before it writes the device record without the `KeptComposition`** (`17-persistence-and-storage.md` §17.3), because an inception that is never published installs those keys on no chain. Destroying them is safe only while no signature over that event has been released: a released signature can complete the event, publishing it fixes the commitment list, and `09-security-model.md` §9.7.4.1 item 8 then requires every standing next-set key to be retained. **`cosign` and `abandon_pending` each take the `IdentityConfig` the device's handle is built from**, because the member's custody, the next-set custody and the store holding the device record are all on it, and each works after a restart that left no handle. **`cosign` and `attach` each compute the event digest as SHA-256 of `PendingEvent::preimage` and refuse a `PendingEvent` whose `event_digest` differs with `IdentityError::PendingDigestMismatch`.** **`attach` verifies each signature against its group and index, refuses with `IdentityError::SignatureSetIncomplete` where a group falls short of the plan, publishes the signed event, and returns the cycle's `PublishOutcome`**; for a reveal-authorized event it runs R10's ceremony from the `Signed` write through the removal. The application carries a `PendingEvent` and each `IndexedSignature` between the holders' devices, and the protocol defines no transport for them. `Identity::create` composes the inception event, writes its `KeptComposition` into the device record before it returns (`09-security-model.md` §9.7.4.2 R10), and returns the handle beside the flow's outcome. `rotate_active` composes a `KeyState` that installs a fresh `#active` key, and its `RotationReason` decides the replaced key's condition: `Routine` drops it as `Superseded`, and `Compromised` drops it as `Compromised{from: N}`, where N is the rotating event's own sequence. `set_witnesses` composes a `KeyState` that names the witness set and its witnessing interval. Every composing method refuses a threshold that breaks `09-security-model.md` §9.7.4.1's quorum-overlap rule. `Recovery::begin` (R10) composes the reveal-authorized events, and a compromised root member leaves the root set under a `RootRecovery`, because a `KeyState` drops no root member (R3).
+**The write API is one method per consequential act on the identity handle, and every event that needs a root threshold goes through one collection flow**: `create`'s inception, `rotate_active` and `set_witnesses`, and the rollover, recovery and abandonment `Recovery::begin` composes. **Under `SignerPlan::ThisSdk` the composing method signs every group with the members this SDK's custody holds, publishes, and returns `EventOutcome::Published` in one call**, refusing with `IdentityError::SignatureSetIncomplete` where those members fall short of a group's threshold. **Under `SignerPlan::Groups` it returns `EventOutcome::AwaitingSignatures`** carrying the unsigned `PendingEvent`, whose preimage binds the signer index list and form list the plan names for each group the kind carries; a group the kind does not carry is empty, and an inception's one group is `installed_root`. **Each holder of a named member, the composer included, calls `Identity::cosign`**, which runs the display confirmation `09-security-model.md` §9.7.4.2 R10's device-boundary paragraph states and returns the `IndexedSignature` of the one member its custody holds, after it refuses a `PendingEvent` whose `chain` ends at a head other than the one this device holds, and refuses with `IdentityError::SignaturePending` an event at a sequence where this device's `PendingSignatureRecord` names a different event (`09-security-model.md` §9.7.4.2 R10). **`Identity::abandon_pending` is local**: the device's own user discards that device's own `PendingSignatureRecord` for the `PendingEvent` and, on the composing device, its `KeptComposition`, after which that device's `attach` refuses the composition with `IdentityError::NoPendingSignature`; no other device's state changes, and the call refuses with `IdentityError::NoPendingSignature` where the device holds neither (R10). **On the composing device of an inception, `abandon_pending` destroys the keys that composition minted, the next-set member, the root member `#0` and `#active`, before it writes the device record without the `KeptComposition`** (`17-persistence-and-storage.md` §17.3), because an inception that is never published installs those keys on no chain. Destroying them is safe only while no signature over that event has been released: a released signature can complete the event, publishing it fixes the commitment list, and `09-security-model.md` §9.7.4.1 item 8 then requires every standing next-set key to be retained. **`cosign` and `abandon_pending` each take the `IdentityConfig` the device's handle is built from**, because the member's custody, the next-set custody and the store holding the device record are all on it, and each works after a restart that left no handle. **`cosign` and `attach` each compute the event digest as SHA-256 of `PendingEvent::preimage` and refuse a `PendingEvent` whose `event_digest` differs with `IdentityError::PendingDigestMismatch`.** **`attach` verifies each signature against its group and index, refuses with `IdentityError::SignatureSetIncomplete` where a group falls short of the plan, publishes the signed event, and returns the cycle's `PublishOutcome`**; for a reveal-authorized event it runs R10's ceremony from the `Signed` write through the removal. The application carries a `PendingEvent` and each `IndexedSignature` between the holders' devices, and the protocol defines no transport for them. `Identity::create` composes the inception event, writes its `KeptComposition` into the device record before it returns (`09-security-model.md` §9.7.4.2 R10), and returns the handle beside the flow's outcome and any witness warning, as `Created`. **`create`'s first check is the method-by-profile check** (`09-security-model.md` §9.7.4.1 item 4): a config whose next-set method its profile does not admit is refused with `IdentityError::NoIndependentSubstrate` or `IdentityError::MethodNotOfferedOnProfile` before the signer plan is read, so a `Headless` caller learns the substrate requirement whatever plan it passed. **`IdentityConfig.witnesses` is a required `WitnessChoice` with no default**: `CommunityDefault` installs the default set `09-security-model.md` §9.7.4.3 states, which `default_witness_set` computes from the community-list entries the caller hands it, because the list is read by the caller's transport and not by this crate; `Designated` installs the operators the caller names; `NoWitness` installs none. A `WitnessDesignation` names an operator and its operator key. A designated set that names one operator twice, names two operators under one operator key, or names more than `MAX_WITNESS_SET_SIZE` operators is refused with `IdentityError::IllegalKeyEvent{stage: Content}` before any key, because one operator key is one witness (`09-security-model.md` §9.7.4.2 definitions). A designated operator counts as listed only where a handed entry declares that operator under that key and no handed entry declares it under another key, because the definitions read an operator declared under two keys as absent from the list. Where the installed set is empty, or names an operator that does not count as listed, `Created.witness_warning` carries a `WitnessWarning` whose `consequence` states the terms `09-security-model.md` §9.7.4.3 requires; the warning for a set that answers capacity to every submission belongs to the submission path, which `create` does not run. **No failure leaves a key no call reaches**: `create` names each key it mints in a creation record (`17-persistence-and-storage.md` §17.3) before it generates the next, and on a failure or a panic destroys every key it minted; a failed cleanup returns `CreateError` with the original error and `CleanupFailure::Incomplete` naming the creation and every key left live. Where the runtime cancels `create`'s task, no cleanup runs, and `CleanupFailure::NotAttempted` names the creation, the inception's `KeptComposition` where the device record was written, and every key minted, each of which may be live. **`Identity::unfinished` lists every creation record and every `KeptComposition` the config's store holds**, and `Identity::abandon_unfinished` abandons one: for a creation it destroys every key the record names and deletes the record, and for a composition it runs `abandon_pending`'s body. **`abandon_pending` on an inception destroys keys only where the record holds no `PendingSignatureRecord`, the inception's own included, and no other `KeptComposition`**; otherwise it removes only the abandoned event's entries and destroys no key, because a `PendingSignatureRecord` records a signature this device released, and a released signature forbids destroying a standing next-set key (`09-security-model.md` §9.7.4.1 item 8). `rotate_active` composes a `KeyState` that installs a fresh `#active` key, and its `RotationReason` decides the replaced key's condition: `Routine` drops it as `Superseded`, and `Compromised` drops it as `Compromised{from: N}`, where N is the rotating event's own sequence. `set_witnesses` composes a `KeyState` that names the witness set and its witnessing interval. Every composing method refuses a threshold that breaks `09-security-model.md` §9.7.4.1's quorum-overlap rule. `Recovery::begin` (R10) composes the reveal-authorized events, and a compromised root member leaves the root set under a `RootRecovery`, because a `KeyState` drops no root member (R3).
 
 ```rust
 impl<S: EncryptedStorage + Clone> Identity<S> {
@@ -782,7 +782,17 @@ impl<S: EncryptedStorage + Clone> Identity<S> {
     /// (`17-persistence-and-storage.md` §17.3) before it returns
     /// (`09-security-model.md` §9.7.4.2 R10).
     pub fn create(config: IdentityConfig<S>, signers: SignerPlan)
-        -> impl Future<Output = Result<(Identity<S>, EventOutcome), IdentityError>> + Send;
+        -> impl Future<Output = Result<Created<S>, CreateError>> + Send;
+
+    /// Lists every creation record and every `KeptComposition` the config's
+    /// store holds (`17-persistence-and-storage.md` §17.3).
+    pub fn unfinished(config: &IdentityConfig<S>)
+        -> impl Future<Output = Result<Vec<Unfinished>, IdentityError>> + Send;
+
+    /// Abandons one listed item: a creation's keys are destroyed and its
+    /// record deleted; a composition is abandoned as `abandon_pending` does.
+    pub fn abandon_unfinished(config: &IdentityConfig<S>, item: &Unfinished)
+        -> impl Future<Output = Result<(), IdentityError>> + Send;
 
     /// Composes a `KeyState` under the collection flow above.
     pub fn rotate_active(&self, reason: RotationReason, signers: SignerPlan)
@@ -832,7 +842,73 @@ pub struct IdentityConfig<S: EncryptedStorage + Clone> {
     /// The `CustodyProfile` `09-security-model.md` §9.7.4.1 states, against
     /// which `create` checks the next-set custody's method.
     pub profile: CustodyProfile,
+    /// The witness set `create` installs in the inception.
+    pub witnesses: WitnessChoice,
+    /// Serializes this process's read-modify-writes of the device and
+    /// creation records (`17-persistence-and-storage.md` §17.3). Two configs
+    /// over one store share it by copying it.
+    pub record_lock: RecordLock,
 }
+
+/// What `create` returns once the device record holds the composition.
+pub struct Created<S: EncryptedStorage + Clone> {
+    pub identity: Identity<S>,
+    pub outcome: EventOutcome,
+    /// `Some` where the installed witness set is empty or names an unlisted
+    /// operator (`09-security-model.md` §9.7.4.3).
+    pub witness_warning: Option<WitnessWarning>,
+}
+
+/// Why `create` failed: the error of the failing step, and the cleanup that
+/// did not complete, if any.
+pub struct CreateError { pub error: IdentityError, pub cleanup: Option<Box<CleanupFailure>> }
+
+/// A cleanup that did not complete; what it names stays listed by
+/// `unfinished`.
+pub enum CleanupFailure {
+    /// The cleanup ran and left keys live or the creation record in place.
+    Incomplete { creation: CreationId, undestroyed: Vec<UndestroyedKey> },
+    /// The runtime cancelled the task, so no cleanup ran: every key in
+    /// `minted` may be live, named by the creation record or, where
+    /// `composition` is `Some`, by the device record.
+    NotAttempted { creation: CreationId, composition: Option<KeptComposition>, minted: Vec<UndestroyedKey> },
+}
+
+/// One key a cleanup failed to destroy.
+pub enum UndestroyedKey { NextSetMember(NextSetKeyHandle), Key(KeyHandle) }
+
+/// The 16 random bytes naming one creation record.
+pub struct CreationId(pub [u8; 16]);
+
+/// One item `unfinished` lists.
+pub enum Unfinished { Creation(CreationId), Composition(KeptComposition) }
+
+/// Which witnesses `create` installs. No variant is a default.
+pub enum WitnessChoice {
+    /// The default set `default_witness_set` computes from `listed`.
+    CommunityDefault { listed: Vec<ListedOperator> },
+    /// The operators the controller designates, checked against `listed`.
+    Designated { witnesses: Vec<WitnessDesignation>, listed: Vec<ListedOperator> },
+    /// No witness.
+    NoWitness,
+}
+
+/// One community-list entry: the operator identifier and the P-256 key the
+/// entry declares (`09-security-model.md` §9.7.4.2 definitions).
+pub struct ListedOperator { pub operator: Identifier, pub key: [u8; 33] }
+
+/// The entries in list order under distinct keys, skipping an operator that
+/// two entries declare under different keys, capped at
+/// `MAX_WITNESS_SET_SIZE`. Pure.
+pub fn default_witness_set(listed: &[ListedOperator]) -> Vec<Identifier>;
+
+/// The warning `09-security-model.md` §9.7.4.3 requires. `consequence`
+/// returns "the identity's freshness then rests on that peer's own relay
+/// reads".
+pub enum WitnessWarning { NoWitness, UnlistedOperators(Vec<Identifier>) }
+
+/// A lock clones share.
+pub struct RecordLock(Arc<tokio::sync::Mutex<()>>);
 
 /// The members that sign one group, each by root-set or next-set index and
 /// by signature form (`09-security-model.md` §9.7.4.2 definitions).
@@ -869,9 +945,10 @@ pub struct PendingEvent {
 /// form fixes.
 pub struct IndexedSignature { pub group: SignatureGroup, pub index: u8, pub signature: Vec<u8> }
 
-/// One designated witness: the operator identifier its community-relay-list
-/// entry declares (`09-security-model.md` §9.7.4.2 definitions).
-pub struct WitnessDesignation { pub operator: Identifier }
+/// One designated witness: the operator identifier and the operator key its
+/// community-relay-list entry declares (`09-security-model.md` §9.7.4.2
+/// definitions).
+pub struct WitnessDesignation { pub operator: Identifier, pub key: [u8; 33] }
 
 /// Why `rotate_active` replaces the `#active` key, which decides the replaced
 /// key's condition.
@@ -944,7 +1021,7 @@ pub trait IdentityBackend: Send + Sync {
 }
 
 /// The error half of this trait's six methods and of the three recovery entry
-/// points `09-security-model.md` §9.7.4.2 R10 declares. The type carries twenty
+/// points `09-security-model.md` §9.7.4.2 R10 declares. The type carries twenty-two
 /// variants and no others, and `SCP-IDENT-1105` is reserved and names none. A refusal the protocol mandates carries one of these
 /// variants, so four bindings mint one code rather than four and a caller tells
 /// a custody choice from a network condition. **The identity half's one refusal reaches a caller through
@@ -1050,6 +1127,18 @@ pub enum IdentityError {
     /// reveal-authorized and whose `KeptComposition` this device does not hold, so
     /// nothing was published (`09-security-model.md` §9.7.4.2 R10).
     NoPendingSignature { event_digest: [u8; 32] },
+    /// SCP-IDENT-1121. The method of the next-set custody `create` was
+    /// handed does not conform on the config's `CustodyProfile`, while
+    /// another method is offered on that profile, so `create` generated no
+    /// key (`09-security-model.md` §9.7.4.1 item 4, "Method by profile").
+    /// The caller changes its next-set custody to a method the profile
+    /// offers. Where no method is offered on the profile, `create` returns
+    /// `NoIndependentSubstrate` instead.
+    MethodNotOfferedOnProfile,
+    /// SCP-IDENT-1122. `abandon_unfinished` named a creation for which the
+    /// store holds no creation record (`17-persistence-and-storage.md`
+    /// §17.3), so nothing was destroyed.
+    NoUnfinishedCreation,
 }
 
 /// The step of `09-security-model.md` §9.7.4.2 R3's check order at which an

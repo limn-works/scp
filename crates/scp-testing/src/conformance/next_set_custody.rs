@@ -227,7 +227,8 @@ pub async fn sign_probe_signs_the_probe_preimage_only<C: NextSetCustody>(
 }
 
 /// After `destroy`, the key signs nothing, reveals nothing, seals nothing
-/// and cannot be destroyed again, and a second key still signs.
+/// and cannot be destroyed again, a second key still signs, and later
+/// `generate` calls never return the destroyed id.
 ///
 /// # Errors
 ///
@@ -248,8 +249,24 @@ pub async fn destroy_prevents_sign<C: NextSetCustody>(
         .sign_change(&kept, &change)
         .await
         .map_err(context("sign_change by the key destroy left"))?;
+    for _ in 0..REISSUE_PROBES {
+        let fresh = custody
+            .generate()
+            .await
+            .map_err(context("generate after destroy"))?;
+        if fresh.id() == handle.id() {
+            return Err(failure_saw(
+                "a destroyed handle's id issued again".to_owned(),
+                &fresh,
+            ));
+        }
+    }
     Ok(())
 }
+
+/// How many keys `destroy_prevents_sign` generates after a destroy while it
+/// looks for the destroyed id.
+const REISSUE_PROBES: usize = 4;
 
 /// A handle the custody did not issue errors on every method that takes a
 /// handle.
@@ -509,7 +526,9 @@ macro_rules! next_set_custody_conformance {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::future::Future;
+    use std::sync::{Mutex, PoisonError};
 
     use scp_platform::testing::InMemoryNextSetCustody;
     use scp_platform::{
@@ -541,11 +560,18 @@ mod tests {
         /// Declares the encrypted-backup kind, and seals and restores by
         /// every method.
         HeadlessAnyMethod,
+        /// The first `generate` after a `destroy` returns the destroyed id,
+        /// naming a fresh inner key.
+        ReissuesDestroyedId,
     }
 
     struct Mutant {
         inner: InMemoryNextSetCustody,
         flaw: Flaw,
+        /// The id the last `destroy` named, for `ReissuesDestroyedId`.
+        destroyed: Mutex<Option<u64>>,
+        /// Reissued ids and the inner handles they name.
+        reissued: Mutex<HashMap<u64, NextSetKeyHandle>>,
     }
 
     impl Mutant {
@@ -553,7 +579,19 @@ mod tests {
             Self {
                 inner: InMemoryNextSetCustody::new(),
                 flaw,
+                destroyed: Mutex::new(None),
+                reissued: Mutex::new(HashMap::new()),
             }
+        }
+
+        /// The inner handle `handle` names.
+        fn inner_of(&self, handle: NextSetKeyHandle) -> NextSetKeyHandle {
+            self.reissued
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&handle.id())
+                .copied()
+                .unwrap_or(handle)
         }
 
         fn headless(&self) -> bool {
@@ -576,7 +614,8 @@ mod tests {
             member: &NextSetKeyHandle,
             change: &SigningChange,
         ) -> impl Future<Output = Result<IndexedSignature, KeyEventSignError>> + MaybeSend {
-            self.inner.sign_change(member, change)
+            let member = self.inner_of(*member);
+            async move { self.inner.sign_change(&member, change).await }
         }
 
         async fn sign_probe(
@@ -584,6 +623,7 @@ mod tests {
             member: &NextSetKeyHandle,
             probe: &CustodyProbe,
         ) -> Result<ProbeSignature, KeyEventSignError> {
+            let member = &self.inner_of(*member);
             if self.flaw != Flaw::ProbeSignsD {
                 return self.inner.sign_probe(member, probe).await;
             }
@@ -598,24 +638,40 @@ mod tests {
     }
 
     impl NextSetCustody for Mutant {
-        fn generate(
-            &self,
-        ) -> impl Future<Output = Result<NextSetKeyHandle, NextSetCustodyError>> + Send {
-            self.inner.generate()
+        async fn generate(&self) -> Result<NextSetKeyHandle, NextSetCustodyError> {
+            let fresh = self.inner.generate().await?;
+            if self.flaw != Flaw::ReissuesDestroyedId {
+                return Ok(fresh);
+            }
+            let Some(id) = self
+                .destroyed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+            else {
+                return Ok(fresh);
+            };
+            self.reissued
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(id, fresh);
+            Ok(NextSetKeyHandle::new(id))
         }
 
-        fn reveal_public_key(
+        async fn reveal_public_key(
             &self,
             handle: &NextSetKeyHandle,
-        ) -> impl Future<Output = Result<[u8; 33], NextSetCustodyError>> + Send {
-            self.inner.reveal_public_key(handle)
+        ) -> Result<[u8; 33], NextSetCustodyError> {
+            self.inner.reveal_public_key(&self.inner_of(*handle)).await
         }
 
-        fn destroy(
-            &self,
-            handle: &NextSetKeyHandle,
-        ) -> impl Future<Output = Result<(), NextSetCustodyError>> + Send {
-            self.inner.destroy(handle)
+        async fn destroy(&self, handle: &NextSetKeyHandle) -> Result<(), NextSetCustodyError> {
+            self.inner.destroy(&self.inner_of(*handle)).await?;
+            *self
+                .destroyed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(handle.id());
+            Ok(())
         }
 
         async fn seal_backup(
@@ -623,8 +679,11 @@ mod tests {
             handle: &NextSetKeyHandle,
             request: BackupRequest,
         ) -> Result<BackupArtifact, NextSetCustodyError> {
+            let handle = &self.inner_of(*handle);
             match self.flaw {
-                Flaw::Unbroken | Flaw::ProbeSignsD => self.inner.seal_backup(handle, request).await,
+                Flaw::Unbroken | Flaw::ProbeSignsD | Flaw::ReissuesDestroyedId => {
+                    self.inner.seal_backup(handle, request).await
+                }
                 Flaw::SealsUnknownHandle => {
                     if self.inner.reveal_public_key(handle).await.is_err() {
                         return Ok(encrypted_artifact());
@@ -697,6 +756,17 @@ mod tests {
     #[tokio::test]
     async fn the_unbroken_custody_passes_every_case() {
         assert_eq!(checks(Flaw::Unbroken).await, expected(&[]));
+    }
+
+    #[tokio::test]
+    async fn a_custody_that_reissues_a_destroyed_id_fails_the_destroy_case() {
+        assert_eq!(
+            checks(Flaw::ReissuesDestroyedId).await,
+            expected(&[(
+                "destroy_prevents_sign",
+                "a destroyed handle's id issued again"
+            )])
+        );
     }
 
     #[tokio::test]

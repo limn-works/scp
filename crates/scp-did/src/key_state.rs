@@ -67,6 +67,10 @@ macro_rules! name_bound_enum {
         }
 
         impl $name {
+            /// Every variant, in declaration order. The list is the macro's
+            /// own variant list, so a variant added to the type is in it.
+            pub const ALL: &'static [Self] = &[$(Self::$variant),+];
+
             /// The registered one-byte discriminator this value encodes as.
             #[must_use]
             pub const fn to_byte(self) -> u8 {

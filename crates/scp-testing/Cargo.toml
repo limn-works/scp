@@ -100,7 +100,7 @@ scp-testing = { path = ".", features = ["testing"] }
 # `Node::start_for_testing`, which crates/scp-node/src/config.rs compiles under
 # `allow_unencrypted_storage`. Those nodes generate their identity, which
 # crates/scp-node/src/lib.rs mints only under scp-node's `testing` feature (it fails
-# closed with `NoPreRotationBackend` otherwise), so `testing` rides here too; without it
+# closed with `NodeError::IdentityCreation(NoIndependentSubstrate)` otherwise), so `testing` rides here too; without it
 # only a `--workspace` build, which unifies the feature in from other crates, passes them.
 # The features ride here rather than on the `[dependencies]` entry above, because no
 # module in this library names the items they gate.

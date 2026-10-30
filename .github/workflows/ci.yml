@@ -664,8 +664,9 @@ jobs:
   # FAIL CLOSED rather than minting the severed in-memory pre-rotation nullifier:
   # scp-node with the typed NodeError::IdentityCreation carrying
   # IdentityError::NoIndependentSubstrate (SCP-IDENT-1100, spec 03 §3.10.10), and
-  # scp-identity's `config.rs` with IdentityError::NoPreRotationBackend
-  # (SCP-IDENT-1059). The job name keeps the 1059 label. These tests
+  # scp-identity's `Identity::create` (`kel/create.rs`) with the same 1100 where
+  # no method is offered on the Headless profile. The job name keeps the 1059
+  # label. These tests
   # are `#[cfg(not(feature = "testing"))]`, so they compile/run ONLY in the bare
   # build where the nullifier is severed (the workspace test lane runs WITH
   # `testing`, which mints — there the tests are excluded by cfg). This lane is the
@@ -713,20 +714,18 @@ jobs:
       - name: scp-identity create paths fail closed
         # Three manifests turn `scp-identity/testing` on, each in its own
         # `[dev-dependencies]`: crates/scp-testing/Cargo.toml,
-        # crates/scp-runtime/Cargo.toml, and crates/scp-ffi/common/Cargo.toml.
+        # crates/scp-ffi/common/Cargo.toml and crates/scp-transport/Cargo.toml.
         # One cargo invocation resolves one feature set per package, so every
-        # workspace-wide test build compiles scp-identity with `testing`
-        # on — which compiles out its two `#[cfg(not(feature = "testing"))]`
-        # assertions (ephemeral_create_fails_closed_with_ident_1100
-        # and persisted_create_fails_closed_with_ident_1100 at
-        # crates/scp-identity/src/config.rs). Job rust-test therefore never ran
-        # them. A `-p scp-identity` build reads none of those three manifests,
-        # so `testing` stays off and both assertions execute here.
-        # `--no-tests=fail` exits 4 rather than 0 when a feature flip selects
-        # zero tests, and check_testing_unification_readers in
-        # scripts/tests/ci-gate/ci_gate_selftest.py rejects re-pairing these
-        # assertions with a lane whose build turns `testing` back on.
-        run: cargo nextest run --no-tests=fail -p scp-identity --lib -E 'test(create_fails_closed_with_ident_1100)'
+        # workspace-wide test build compiles scp-identity with `testing` on.
+        # create_fails_closed_without_independent_substrate
+        # (crates/scp-identity/src/kel/create_tests.rs) runs in those builds
+        # too. A `-p scp-identity` build reads none of the three manifests, so
+        # `testing` stays off and this step runs the test in the shipped
+        # feature set. `--no-tests=fail` exits 4 rather than 0 when the filter
+        # selects zero tests, and check_testing_unification_readers in
+        # scripts/tests/ci-gate/ci_gate_selftest.py rejects pairing scp-identity
+        # with a lane whose build turns `testing` back on.
+        run: cargo nextest run --no-tests=fail -p scp-identity --lib -E 'test(fails_closed_without_independent_substrate)'
 
   # ── G1: shipped-feature-graph prove-absence gate (ADR-062 §Decision 6) ──
   # Asserts every shipped FFI bridge and the scp-node/scp-relay binaries' resolved
