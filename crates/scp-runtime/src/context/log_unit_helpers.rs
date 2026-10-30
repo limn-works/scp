@@ -236,52 +236,6 @@ pub async fn queue_log_unit(
     .await
 }
 
-/// Returns the leaves of `leaves` that neither the context's log nor its
-/// queue already holds. A leaf matches a log entry identical in event type,
-/// actor, payload and timestamp, or an equal queued leaf. A re-send after an
-/// unanswered `LogUnitCommand` filters through it, so the record lands once
-/// (spec 17 §17.3 "Event log write failures").
-///
-/// # Errors
-///
-/// Returns [`ContextError::EventLogFailed`] when the context has no event log,
-/// or the provider's error when the log cannot be read: an unread log cannot
-/// prove the leaf absent, so the caller retries instead of risking a second
-/// copy.
-pub fn leaves_absent_from_log_and_queue(
-    cell: &ClassSCell,
-    deps: &ActorDeps,
-    context_id_bytes: &[u8; 32],
-    leaves: Vec<LeafSpec>,
-) -> Result<Vec<LeafSpec>, ContextError> {
-    let entries = deps
-        .event_log
-        .event_log_entries(context_id_bytes)?
-        .ok_or_else(|| {
-            ContextError::EventLogFailed(format!(
-                "no event log for context {}; a re-sent leaf cannot be proven absent",
-                hex::encode(context_id_bytes)
-            ))
-        })?;
-    Ok(leaves
-        .into_iter()
-        .filter(|leaf| {
-            let in_log = entries.iter().any(|event| {
-                event.event_type == leaf.event_type()
-                    && event.actor_did.0 == leaf.actor_did()
-                    && event.payload == *leaf.payload()
-                    && event.timestamp == leaf.timestamp_secs()
-            });
-            let queued = cell
-                .class_s
-                .pending_log_units
-                .iter()
-                .any(|unit| unit.leaves.iter().any(|q| q == leaf));
-            !in_log && !queued
-        })
-        .collect())
-}
-
 /// Plans one entry of a pending log unit before the operation's irreversible
 /// step, checking it against the append's payload rules (spec 17 §17.3 "Event
 /// log write failures"), so a payload that breaks them refuses the operation

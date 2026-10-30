@@ -953,6 +953,13 @@ pub struct ClassSState {
     /// witness and re-acks without re-settling the escrow or re-appending the
     /// `CrossContextOutletInvoked` record.
     ///
+    /// A streaming saga's A-side `CrossContextOutletInvoked` record uses the
+    /// same witness: a `LogUnitCommand` sent with `UnitDedup::OncePerSaga`
+    /// inserts the `SagaId` in the persist that queues the record, and a
+    /// re-send for a `SagaId` already here queues nothing, so the record lands
+    /// once even after a checkpoint prune removed it from the log (spec 17
+    /// §17.3).
+    ///
     /// **Class S** — synchronously persisted fail-closed (ADR-049 §9): without
     /// it, a crash that rolled the witness back behind an acked Commit-A would
     /// double-settle the escrow on replay. Survives same-node restore; dropped

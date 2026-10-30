@@ -5548,7 +5548,7 @@ pub(crate) async fn run_streaming_saga_seal_task(
             // every honest member's leaf is byte-identical. No local payload
             // buffer is read — B's durable frontier is the authoritative
             // manifest. A failed send leaves the journal `Committing`, and the
-            // recovery sweep re-sends the leaf with `UnitDedup::IfAbsent`
+            // recovery sweep re-sends the leaf with `UnitDedup::OncePerSaga`
             // (spec 17 §17.3).
             let a_sent = match supervisor.upgrade() {
                 Some(sup) => send_streaming_saga_a_unit(&sup, &saga_id, &outcome).await,
@@ -5701,9 +5701,9 @@ pub(crate) async fn run_streaming_saga_seal_task(
 /// records date the one provenance edge identically (§6.2.4 "Dual event-log
 /// recording"; §7.3.1 / §9.9.3).
 ///
-/// The send uses `UnitDedup::IfAbsent`: a later sender may re-send a leaf an
+/// The send uses `UnitDedup::OncePerSaga`: a later sender may re-send a leaf an
 /// earlier one queued (a seal task whose settle deferred, then the sweep), and
-/// the byte-identical leaf lands once.
+/// A's durable per-saga set, not a scan of its prunable log, lands it once.
 ///
 /// # Errors
 ///
@@ -5722,7 +5722,7 @@ pub(crate) async fn send_streaming_saga_a_unit(
         .send_log_unit(
             &caller_context_hex,
             crate::context::actor::commands::LogUnitRequest::Leaves(vec![leaf]),
-            crate::context::actor::commands::UnitDedup::IfAbsent,
+            crate::context::actor::commands::UnitDedup::OncePerSaga(saga_id.clone()),
         )
         .await
 }

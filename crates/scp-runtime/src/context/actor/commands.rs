@@ -2309,15 +2309,17 @@ pub enum LogUnitRequest {
     },
 }
 
-/// Whether a [`LogUnitCommand::Enqueue`] drops a leaf already recorded.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Whether a [`LogUnitCommand::Enqueue`] drops a record already queued.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnitDedup {
     /// Queue every leaf.
     None,
-    /// Drop a leaf identical in event type, actor, payload and timestamp to an
-    /// entry of the context's log or a leaf of its queue. A re-send after an
-    /// unanswered command uses it, so the record lands once.
-    IfAbsent,
+    /// Queue the leaves once for this saga. The context's durable
+    /// `xctx_committed_invocations` set decides: a saga id already in it drops
+    /// the leaves, and otherwise the persist that queues the leaves inserts
+    /// it. The set outlives the log's checkpoint prune, so a re-send after a
+    /// lost reply, a crash, or a prune lands the record once (spec 17 §17.3).
+    OncePerSaga(crate::context::supervisor::saga_journal::SagaId),
 }
 
 /// See [`ContextCommand::Outlets`]. Real variants cover every public
@@ -3397,7 +3399,7 @@ pub enum StreamWitnessRecoveryStatus {
         /// sealed root + counts + event id). The seal task queues the leaf
         /// through A's actor before it resolves, and an unreachable A leaves
         /// the journal `Committing`, so recovery re-sends it with
-        /// `UnitDedup::IfAbsent` (spec 17 §17.3).
+        /// `UnitDedup::OncePerSaga` (spec 17 §17.3).
         a_event: Box<CommitBStreamSettleOutcome>,
     },
     /// The witness is durably captured but NOT settled — B sealed, then crashed /
@@ -3413,9 +3415,9 @@ pub enum StreamWitnessRecoveryStatus {
         settlement: Box<crate::context::outlets::invoke::StreamSettlement>,
         /// The A-side dual-log leaf reconstruction inputs (JCS receipt bytes +
         /// sealed root + counts + event id). Recovery re-sends the
-        /// `CrossContextOutletInvoked` leaf from this with `UnitDedup::IfAbsent`,
-        /// so the dual-log is completed even if the seal task crashed before
-        /// queueing it (SCP-OUT-046 #135; spec 17 §17.3).
+        /// `CrossContextOutletInvoked` leaf from this with
+        /// `UnitDedup::OncePerSaga`, so the dual-log is completed even if the
+        /// seal task crashed before queueing it (SCP-OUT-046; spec 17 §17.3).
         a_event: Box<CommitBStreamSettleOutcome>,
     },
 }

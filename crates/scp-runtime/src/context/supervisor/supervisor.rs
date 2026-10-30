@@ -8708,7 +8708,7 @@ impl Supervisor {
         // whole `outcome` before the settlement move), through the SAME helper
         // the seal task uses (spec 17 §17.3). A failed send leaves the saga
         // unresolved: the witness is now present, so the keyless sweep re-sends
-        // the leaf with `UnitDedup::IfAbsent`.
+        // the leaf with `UnitDedup::OncePerSaga`.
         if let Err(err) =
             crate::context::outlets::invoke::send_streaming_saga_a_unit(self, &saga_id, &outcome)
                 .await
@@ -9649,7 +9649,7 @@ impl Supervisor {
     ///   recovery COMPLETES it here: apply the rebuilt `StreamSettlement` via
     ///   [`Self::settle_outlet_stream_via_actor`] against B's CURRENT generation
     ///   (`witness_saga_id: Some` flips `settled` atomically with the money),
-    ///   queue the A-side dual-log leaf (#135) with `UnitDedup::IfAbsent`, then
+    ///   queue the A-side dual-log leaf with `UnitDedup::OncePerSaga`, then
     ///   resolve `Committed`. A deferral (B respawned again between the read and
     ///   the settle) leaves the journal `Committing` for the next sweep — the flag
     ///   makes the money move exactly once.
@@ -9812,15 +9812,17 @@ impl Supervisor {
     /// budget/counter ops — NO signing key — so this applies the rebuilt
     /// settlement against B's CURRENT generation (`witness_saga_id: Some` flips
     /// `settled` atomically with the money), then queues the A-side dual-log leaf
-    /// (#135) through A's actor with `UnitDedup::IfAbsent`, then resolves
+    /// through A's actor with `UnitDedup::OncePerSaga`, then resolves
     /// `Committed`.
     ///
     /// The journal resolves only when the settle applied AND the A-side send
-    /// returned `Ok`. A deferral (B respawned again between the witness read and
-    /// the settle), a failed settle, or a failed A-side send leaves the journal
-    /// `Committing`: the next sweep reads a settled witness and re-sends the A-side
-    /// leaf (the `settled` flag makes the money move exactly once; `IfAbsent`
-    /// makes the leaf land once). No caller waits on the sweep, so every failure
+    /// returned `Ok`, or the send did not queue the record and A's context is
+    /// deleted (counted once by [`Self::report_streaming_a_record_lost`]). A
+    /// deferral (B respawned again between the witness read and the settle), a
+    /// failed settle, or another failed A-side send leaves the journal
+    /// `Committing`: the next sweep reads a settled witness and re-sends the
+    /// A-side leaf (the `settled` flag makes the money move exactly once;
+    /// `OncePerSaga` makes the leaf land once). No caller waits on the sweep, so every failure
     /// is logged at error level (spec 17 §17.3).
     async fn complete_unsettled_streaming_saga(
         &self,
