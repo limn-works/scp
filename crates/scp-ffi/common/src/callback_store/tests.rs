@@ -651,8 +651,10 @@ fn blob_member_read_error_is_unreachable() -> TestResult {
 
 /// The R10 rule maps each platform fact to its act, and the host names no
 /// act (ADR-054). Mutants: `NotWritten` mapped to `RetryVerification`;
-/// `NoOutput` or a declined gesture mapped to `RemoveConsumingCredential`; a
-/// declined gesture's cause dropped; any fact read as landed.
+/// `NoOutput` mapped to `RetryVerification` or `RemoveConsumingCredential`;
+/// a declined gesture mapped to `RemoveConsumingCredential` or
+/// `RetryThroughLargeBlobRoute`; a declined gesture's cause dropped; any fact
+/// read as landed.
 #[test]
 fn blob_member_maps_each_platform_fact_to_its_act() -> TestResult {
     let slot = Arc::new(BlobSlot::default());
@@ -666,7 +668,7 @@ fn blob_member_maps_each_platform_fact_to_its_act() -> TestResult {
         (
             BlobWrite::NoOutput,
             None,
-            LargeBlobClearingAct::RetryVerification,
+            LargeBlobClearingAct::RetryThroughLargeBlobRoute,
         ),
         (
             BlobWrite::VerificationDeclined { cause: None },

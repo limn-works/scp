@@ -97,9 +97,10 @@ pub enum BlobWrite {
     /// the authenticator's large-blob array at capacity, cleared by
     /// [`LargeBlobClearingAct::RemoveConsumingCredential`].
     NotWritten,
-    /// The assertion returned no `largeBlob` output: a client that did not
-    /// process the extension, cleared by
-    /// [`LargeBlobClearingAct::RetryVerification`].
+    /// The assertion returned no `largeBlob` output: a client or route that
+    /// did not process the extension, cleared by
+    /// [`LargeBlobClearingAct::RetryThroughLargeBlobRoute`] and never by a
+    /// plain retry.
     NoOutput,
     /// The user declined or cancelled the verification gesture, cleared by
     /// [`LargeBlobClearingAct::RetryVerification`].
@@ -116,7 +117,7 @@ impl BlobWrite {
         let (cause, clears_by) = match self {
             Self::Landed => return Ok(()),
             Self::NotWritten => (None, LargeBlobClearingAct::RemoveConsumingCredential),
-            Self::NoOutput => (None, LargeBlobClearingAct::RetryVerification),
+            Self::NoOutput => (None, LargeBlobClearingAct::RetryThroughLargeBlobRoute),
             Self::VerificationDeclined { cause } => {
                 (cause, LargeBlobClearingAct::RetryVerification)
             }

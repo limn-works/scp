@@ -324,9 +324,10 @@ mod tests {
 
     /// Each `BlobWriteOutcome` fact reaches the member unchanged, and the
     /// member maps it to the act R10 names: `NotWritten` to removing the
-    /// consuming credential, `NoOutput` and a declined gesture to a retry.
-    /// Mutants: any two facts swapped in `blob_write`; `NotWritten` mapped to
-    /// a retry.
+    /// consuming credential, `NoOutput` to a retry through a route that
+    /// processes `largeBlob`, and a declined gesture to a plain retry.
+    /// Mutants: any two facts swapped in `blob_write`; `NotWritten` or
+    /// `NoOutput` mapped to a plain retry.
     #[test]
     fn uniffi_blob_outcome_maps_to_its_act() {
         let landed = Arc::new(ScriptedBlob::new(Ok(None), Ok(BlobWriteOutcome::Landed)));
@@ -343,7 +344,7 @@ mod tests {
             (
                 BlobWriteOutcome::NoOutput,
                 None,
-                LargeBlobClearingAct::RetryVerification,
+                LargeBlobClearingAct::RetryThroughLargeBlobRoute,
             ),
             (
                 BlobWriteOutcome::VerificationDeclined { cause: None },

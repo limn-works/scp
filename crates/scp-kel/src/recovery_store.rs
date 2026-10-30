@@ -570,6 +570,12 @@ pub struct StoreWriteFailure {
 pub enum LargeBlobClearingAct {
     /// The user declined the verification gesture; a retry clears it.
     RetryVerification,
+    /// The assertion returned no `largeBlob` output: the client or route that
+    /// served it did not process the extension. A retry through a route that
+    /// processes it clears it, and the read that preceded the write went
+    /// through such a route; a retry through the route that dropped the
+    /// extension clears nothing.
+    RetryThroughLargeBlobRoute,
     /// The authenticator's large-blob array is at capacity; removing the
     /// credential that consumed it, through the authenticator's own CTAP 2.1
     /// credential management, clears it. The SDK names this act and does not

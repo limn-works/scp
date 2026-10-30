@@ -755,8 +755,9 @@ pub enum BlobWriteOutcome {
     /// credential that does not support `largeBlob` also reports it; its
     /// store never holds a handle or a marker, so it never stops a ceremony.
     NotWritten,
-    /// The assertion returned no `largeBlob` output: the client did not
-    /// process the extension. The bridge reads it as cleared by a retry.
+    /// The assertion returned no `largeBlob` output: the client or route did
+    /// not process the extension. The bridge reads it as cleared by a retry
+    /// through a route that processes it, never by a plain retry.
     NoOutput,
     /// The user declined or cancelled the verification gesture. The bridge
     /// reads it as cleared by a retry.
