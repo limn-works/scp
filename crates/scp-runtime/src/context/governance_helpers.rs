@@ -5803,6 +5803,13 @@ struct PreStepFinalize {
     executed_leaf: crate::context::state::LeafSpec,
     /// The log and the queued units as read before the step.
     evidence: crate::context::governance_logic::PreStepEvidence,
+    /// The number of units queued when `evidence` was read. Finalize reads
+    /// the units after them as the records the dispatch queued. No drain runs
+    /// between this read and finalize: the dispatch reaches only the
+    /// `execute_*` helpers, none of which drains the queue, and the drain
+    /// after the action runs after finalize, so the units counted here are
+    /// still the oldest in the queue when finalize reads it.
+    queued_len: usize,
     /// The log's Merkle root as read before the step, bound into the
     /// proposer's participation record.
     participation_root: crate::context::participation::ParticipationRoot,
@@ -5833,6 +5840,7 @@ impl PreStepFinalize {
                 context_id,
                 &*deps.event_log,
             )?,
+            queued_len: state.class_s.pending_log_units.len(),
             participation_root: crate::context::participation::ParticipationRoot::read(
                 context_id,
                 &*deps.event_log,
@@ -5883,8 +5891,8 @@ fn plan_governance_action_executed_leaf(
 /// the `GovernanceActionExecuted` record first, then each consequence record,
 /// with any downward-auth obligation. The discharge tail queues the unit and
 /// subsumes the obligation in the action's one fail-closed persist. The
-/// evidence is the log read before the step (`pre_step`), then `journal` (the
-/// records the dispatch queued since), then the unit's records so far.
+/// evidence is the log and queue read before the step (`pre_step`), then the
+/// units the dispatch queued since, then the unit's records so far.
 #[allow(clippy::too_many_lines, clippy::option_if_let_else)]
 fn finalize_governance_action(
     state: &mut PerContextState,
@@ -5892,14 +5900,20 @@ fn finalize_governance_action(
     context_id: &str,
     proposal: &GovernanceProposal,
     pre_step: PreStepFinalize,
-    journal: &[crate::context::state::LeafSpec],
 ) -> Result<crate::context::log_unit_helpers::ConsequenceSink, ContextError> {
     let PreStepFinalize {
         executor_did,
         executed_leaf,
         evidence,
+        queued_len,
         participation_root,
     } = pre_step;
+    debug_assert!(
+        state.class_s.pending_log_units.len() >= queued_len,
+        "no drain runs between the pre-step read and finalize"
+    );
+    // The records the dispatch queued after `pre_step` read the queue.
+    let dispatched = state.class_s.pending_log_units.leaves_after(queued_len);
     let executor_did = &executor_did;
     // For MLS-mutating actions (AddMember, RemoveMember, Revoke,
     // ResetMember), increment the epoch counter, place the old epoch into
@@ -6001,7 +6015,7 @@ fn finalize_governance_action(
         if !rules.is_empty() {
             // Proposer and target share one merged event set and one convergent
             // window anchor so both evaluations are convergent across members.
-            let staged: Vec<crate::context::state::LeafSpec> = journal
+            let staged: Vec<crate::context::state::LeafSpec> = dispatched
                 .iter()
                 .chain(sink.staged_leaves())
                 .cloned()
@@ -6078,7 +6092,7 @@ fn finalize_governance_action(
         let now = deps.clock.now_secs();
         // Participation-record path: only the merged event set is consumed,
         // with the consequence records the unit gained above.
-        let staged: Vec<crate::context::state::LeafSpec> = journal
+        let staged: Vec<crate::context::state::LeafSpec> = dispatched
             .iter()
             .chain(sink.staged_leaves())
             .cloned()
@@ -6254,17 +6268,12 @@ pub async fn execute_governance_action(
     // keep-direction: the replay window must be closed durably whichever way it
     // resolves). The top `state` borrow has ended (NLL) so the cell is free for
     // the combinator and the downstream dispatch chain.
-    //
-    // The same transition opens the queue's journal, so finalize sees the
-    // records the dispatch queues after `pre_step` read the queue, whether
-    // or not a drain writes them first.
     let ((), token) = cell.begin_class_s(context_id, |mut view| {
         let class_s = view.governance_class_s_mut();
         class_s
             .executed_proposals
             .retain(|_, ts| now.saturating_sub(*ts) < EXECUTED_PROPOSALS_TTL_SECS);
         class_s.executed_proposals.insert(proposal.proposal_id, now);
-        view.begin_log_unit_journal();
         Ok(())
     })?;
 
@@ -6331,9 +6340,6 @@ pub async fn execute_governance_action(
                     view.governance_class_s_mut()
                         .executed_proposals
                         .remove(&proposal.proposal_id);
-                    // The dispatch queued nothing (the epoch is unchanged),
-                    // so the journal is empty; it closes here.
-                    let _ = view.take_log_unit_journal();
                     Ok(())
                 })
                 .await?;
@@ -6416,8 +6422,6 @@ async fn discharge_and_order_governance_action(
     dispatch_outcome: Result<GovernanceActionResult, ContextError>,
 ) -> Result<GovernanceActionResult, ContextError> {
     let mut discharge = token.begin_discharge(cell);
-    // The records the dispatch queued since `pre_step` read the queue.
-    let journal = discharge.view().take_log_unit_journal();
     let finalize_result = match &dispatch_outcome {
         Ok(_) => finalize_governance_action(
             discharge.view().rest_mut(),
@@ -6425,7 +6429,6 @@ async fn discharge_and_order_governance_action(
             context_id,
             proposal,
             pre_step,
-            &journal,
         )
         .map(|sink| {
             // The finalize unit follows the dispatch's records in the queue

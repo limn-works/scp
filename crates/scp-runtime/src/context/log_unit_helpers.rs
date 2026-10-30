@@ -1264,68 +1264,47 @@ mod tests {
         .expect("a valid leaf")
     }
 
-    /// The queue's journal holds every entry queued since it opened, in
-    /// order, though a drain wrote and removed the first of them in between;
-    /// entries queued before it opened or after it closed are not in it.
+    /// `leaves_after` returns the entries of the units queued after the
+    /// first `queued_len`, in queue order: governance finalize reads the
+    /// records its dispatch queued this way, so a unit queued before the read
+    /// is not counted twice and a unit queued after it is not missed.
     #[tokio::test]
-    async fn the_journal_keeps_entries_a_drain_wrote() {
+    async fn leaves_after_returns_the_units_queued_since_the_read() {
         let ctx_id_bytes = [0x5Fu8; 32];
         let ctx = hex::encode(ctx_id_bytes);
         let (log, _faulty) = faulty_merkle_log();
         let deps = deps_with(OWNER, None, Box::new(log)).await;
-        deps.event_log
-            .init_event_log(&ctx_id_bytes)
-            .await
-            .expect("init event log");
         let mut cell = ClassSCell::new(PerContextState::new_for_test_encrypted(
             ctx_id_bytes,
             1_700_000_000,
             scp_did::DID(OWNER.to_owned()),
         ));
-        let enqueue = |tag: u8| {
-            move |mut v: crate::context::actor::class_s::ClassSMut<'_>| {
-                v.enqueue_log_unit(vec![tagged_leaf(tag)]);
-                Ok(())
-            }
-        };
-
-        cell.commit_class_s_keep(&deps, &ctx, enqueue(1))
-            .await
-            .expect("the enqueue persists");
         cell.commit_class_s_keep(&deps, &ctx, |mut v| {
-            v.begin_log_unit_journal();
-            v.enqueue_log_unit(vec![tagged_leaf(2)]);
+            v.enqueue_log_unit(vec![tagged_leaf(1)]);
             Ok(())
         })
         .await
         .expect("the enqueue persists");
-        drain_pending_log_units(&mut cell, &deps, &ctx)
-            .await
-            .expect("the drain writes both units");
-        assert!(cell.class_s.pending_log_units.is_empty());
-        cell.commit_class_s_keep(&deps, &ctx, enqueue(3))
-            .await
-            .expect("the enqueue persists");
-        let mut journal = Vec::new();
+        let queued_len = cell.class_s.pending_log_units.len();
         cell.commit_class_s_keep(&deps, &ctx, |mut v| {
-            journal = v.take_log_unit_journal();
+            v.enqueue_log_unit(vec![tagged_leaf(2), tagged_leaf(3)]);
+            v.enqueue_log_unit(vec![tagged_leaf(4)]);
             Ok(())
         })
         .await
-        .expect("the close persists");
-        cell.commit_class_s_keep(&deps, &ctx, enqueue(4))
-            .await
-            .expect("the enqueue persists");
+        .expect("the enqueue persists");
 
-        assert_eq!(journal, vec![tagged_leaf(2), tagged_leaf(3)]);
-        let mut reopened = vec![tagged_leaf(0)];
-        cell.commit_class_s_keep(&deps, &ctx, |mut v| {
-            reopened = v.take_log_unit_journal();
-            Ok(())
-        })
-        .await
-        .expect("the close persists");
-        assert!(reopened.is_empty(), "a closed journal records nothing");
+        assert_eq!(
+            cell.class_s.pending_log_units.leaves_after(queued_len),
+            vec![tagged_leaf(2), tagged_leaf(3), tagged_leaf(4)]
+        );
+        assert!(
+            cell.class_s
+                .pending_log_units
+                .leaves_after(cell.class_s.pending_log_units.len())
+                .is_empty(),
+            "nothing queued after the last read"
+        );
     }
 
     /// Spec 17 §17.3 "Event log write failures": while units are queued, a

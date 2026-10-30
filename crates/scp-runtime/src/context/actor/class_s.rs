@@ -477,22 +477,10 @@ impl Deref for ClassSMut<'_> {
 /// A queue read back from storage enters only through [`Self::validated`],
 /// which refuses a unit with no entry and an entry that breaks the append's
 /// payload rules.
-///
-/// The queue also keeps a journal of the entries queued since
-/// [`ClassSMut::begin_log_unit_journal`], for an evaluation that read its
-/// evidence before an operation's step and runs after it (governance
-/// finalize). A drain moves entries from the queue to the log, so the
-/// queue alone cannot tell which entries the operation queued; the journal
-/// can, because only [`ClassSMut::enqueue_log_unit`] writes it. The journal is
-/// never persisted, and a snapshot restore restores it together with the
-/// queue, so an entry a restore removes from the queue leaves the journal too.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct PendingLogUnits {
     /// The queued units, oldest first.
     units: VecDeque<crate::context::state::PendingLogUnit>,
-    /// The entries queued since the journal began, in queue order; `None`
-    /// when no journal is open.
-    journal: Option<Vec<crate::context::state::LeafSpec>>,
 }
 
 impl PendingLogUnits {
@@ -517,10 +505,7 @@ impl PendingLogUnits {
                 )));
             }
         }
-        Ok(Self {
-            units,
-            journal: None,
-        })
+        Ok(Self { units })
     }
 
     /// True when no unit is queued.
@@ -543,7 +528,18 @@ impl PendingLogUnits {
         self.units.front()
     }
 
-    /// A copy of the queue for a snapshot. The journal is not part of it.
+    /// The entries of every unit queued after the oldest `queued_len` units,
+    /// in queue order: what an operation queued since it read
+    /// [`Self::len`], provided no drain ran in between.
+    pub(crate) fn leaves_after(&self, queued_len: usize) -> Vec<crate::context::state::LeafSpec> {
+        self.units
+            .iter()
+            .skip(queued_len)
+            .flat_map(|unit| unit.leaves.iter().cloned())
+            .collect()
+    }
+
+    /// A copy of the queue for a snapshot.
     pub(crate) fn to_deque(&self) -> VecDeque<crate::context::state::PendingLogUnit> {
         self.units.clone()
     }
@@ -571,34 +567,12 @@ impl ClassSMut<'_> {
         if leaves.is_empty() {
             return;
         }
-        let queue = &mut self.state.class_s.pending_log_units;
-        if let Some(journal) = queue.journal.as_mut() {
-            journal.extend(leaves.iter().cloned());
-        }
-        queue
-            .units
-            .push_back(crate::context::state::PendingLogUnit {
+        self.state.class_s.pending_log_units.units.push_back(
+            crate::context::state::PendingLogUnit {
                 base_seq: None,
                 leaves,
-            });
-    }
-
-    /// Opens the queue's journal, empty, discarding any journal still open.
-    /// Every entry [`Self::enqueue_log_unit`] queues from here until
-    /// [`Self::take_log_unit_journal`] is recorded in it.
-    pub(crate) fn begin_log_unit_journal(&mut self) {
-        self.state.class_s.pending_log_units.journal = Some(Vec::new());
-    }
-
-    /// Closes the queue's journal and returns the entries queued since it
-    /// opened, in queue order; empty when no journal was open.
-    pub(crate) fn take_log_unit_journal(&mut self) -> Vec<crate::context::state::LeafSpec> {
-        self.state
-            .class_s
-            .pending_log_units
-            .journal
-            .take()
-            .unwrap_or_default()
+            },
+        );
     }
 
     /// Queues `leaves` as one pending log unit, as [`Self::enqueue_log_unit`]
@@ -3922,7 +3896,7 @@ impl ClassSCommitToken {
     ///
     /// RAII counterpart to [`Self::discharge_with`] for a terminal that runs
     /// several steps through the view before the persist —
-    /// `discharge_and_order_governance_action` takes the queue's journal, runs
+    /// `discharge_and_order_governance_action` runs
     /// `finalize_governance_action`, queues its unit, and removes the consumed
     /// proposal. Finalize writes nothing to the event log (spec 17 §17.3 "Event
     /// log write failures"), so no step awaits; the guard keeps one ordinary
