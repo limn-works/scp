@@ -1477,6 +1477,135 @@ mod tests {
             .expect("the recovery leaf, planned through `new`, has no payload rule");
     }
 
+    /// A log held in memory that relies on the trait's default
+    /// `lock_for_unit` and `append_unit`, and whose `append_event` fails on
+    /// call number `fail_on` (counted from 1).
+    struct FailNthAppendLog {
+        entries: std::sync::RwLock<Vec<scp_event_log::Event>>,
+        appends: std::sync::atomic::AtomicUsize,
+        fail_on: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::context::builder::ContextEventLogProvider for FailNthAppendLog {
+        async fn init_event_log(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+        async fn append_event(
+            &self,
+            _context_id: &[u8; 32],
+            event_type: EventType,
+            actor_did: &str,
+            payload: EventPayload,
+            timestamp_secs: u64,
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            let call = self
+                .appends
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            if call == self.fail_on {
+                return Err(
+                    scp_protocol::context::builder::ContextCreationError::EventLogFailed(
+                        "the append fails".into(),
+                    ),
+                );
+            }
+            let mut entries = self
+                .entries
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let prev_hash = entries.last().map_or(
+                Ok(scp_event_log::tree::GENESIS_PREV_HASH),
+                scp_event_log::tree::leaf_hash,
+            );
+            let sequence = u64::try_from(entries.len()).expect("the length fits");
+            entries.push(scp_event_log::Event {
+                event_type,
+                actor_did: scp_did::DID(actor_did.to_owned()),
+                timestamp: timestamp_secs,
+                sequence,
+                payload,
+                prev_hash: prev_hash.expect("the leaf hashes"),
+                signature: Vec::new(),
+            });
+            drop(entries);
+            Ok(())
+        }
+        async fn destroy_event_log(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+        fn event_log_entries(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, ContextError> {
+            Ok(Some(
+                self.entries
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            ))
+        }
+    }
+
+    /// Spec 17 §17.3 "Event log write failures": a unit is written whole or
+    /// not at all. With a provider whose second `append_event` fails, the
+    /// default `append_unit` leaves none of a two-entry unit in the log and
+    /// keeps the whole unit queued, so no later drain finds a partial unit
+    /// and no log fault is set.
+    #[tokio::test]
+    async fn unit_failing_at_its_second_entry_leaves_no_entry_and_stays_queued() {
+        let ctx_id_bytes = [0x62u8; 32];
+        let ctx = hex::encode(ctx_id_bytes);
+        let deps = deps_with(
+            OWNER,
+            None,
+            Box::new(FailNthAppendLog {
+                entries: std::sync::RwLock::new(Vec::new()),
+                appends: std::sync::atomic::AtomicUsize::new(0),
+                fail_on: 2,
+            }),
+        )
+        .await;
+        let unit = vec![tagged_leaf(1), tagged_leaf(2)];
+        let mut cell = ClassSCell::new(PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            1_700_000_000,
+            scp_did::DID(OWNER.to_owned()),
+        ));
+        cell.commit_class_s_keep(&deps, &ctx, |mut v| {
+            v.enqueue_log_unit(unit.clone());
+            Ok(())
+        })
+        .await
+        .expect("the enqueue persists");
+
+        for drain in 1..=2 {
+            let drained = drain_pending_log_units(&mut cell, &deps, &ctx).await;
+            assert!(
+                matches!(drained, Err(ContextError::EventLogFailed(_))),
+                "drain {drain} refuses the unit: {drained:?}"
+            );
+            assert_eq!(
+                log_len(&deps, &ctx_id_bytes),
+                0,
+                "drain {drain} leaves no entry of the unit in the log"
+            );
+            let queued: Vec<_> = cell.class_s.pending_log_units.iter().collect();
+            assert_eq!(queued.len(), 1, "drain {drain} keeps the unit queued");
+            assert_eq!(queued[0].leaves, unit, "the whole unit stays queued");
+            assert!(
+                cell.class_s.log_fault.is_none(),
+                "drain {drain} sets no log fault"
+            );
+        }
+    }
+
     /// An `OutletInvokedEvent` payload with the given chunk counts.
     fn outlet_invoked_payload(stream_chunk_count: u32, chunks_billed: u32) -> EventPayload {
         use scp_protocol::context::outlets::OutletStatus;
