@@ -21,6 +21,7 @@
 
 **Amended 2026-10-30 (SCP-311), the two store-set host interfaces.**
 - `CredentialBlobProvider` holds the entry record of `17-persistence-and-storage.md` §17.8, which the earlier text called a `largeBlob` record. `read_blob` and `write_blob` take the credential identifier, and `write_blob` returns a typed outcome that reports what the platform reported. The Rust adapter maps that report to the clearing act `09-security-model.md` §9.7.4.2 R10 requires, so no host picks an act.
+- A write that returns no `largeBlob` output maps to `RetryThroughLargeBlobRoute`, the act `09-security-model.md` §9.7.4.2 R10 names for that cause, and never to the plain retry a declined gesture takes.
 - No member of a store set holds a credential: the store set passes the credential of its own lease on every call, so no member reads or writes the store of another credential.
 - Every read the store set makes through either interface returns the platform's current value and never a cache.
 - A host that throws from either interface throws `ScpError.Storage` with `SCP-STORAGE-8016`.
@@ -159,7 +160,7 @@ The bytes are the entry record `17-persistence-and-storage.md` §17.8 lays out. 
 The host reports what the platform reported, and the Rust adapter maps each report to the act that clears a write that did not land. The host never names an act.
 - `Landed`: the platform reported `largeBlob: { written: true }`.
 - `NotWritten`: the platform reported `largeBlob: { written: false }` with no error. The adapter maps it to `RemoveConsumingCredential`, because R10 reads that report as the authenticator's large-blob array at capacity.
-- `NoOutput`: the assertion returned no `largeBlob` output, the report of a client that did not process the extension. It is not the capacity report, so the adapter maps it to `RetryVerification`, the act a retry on a client that processes the extension clears.
+- `NoOutput`: the assertion returned no `largeBlob` output, the report of a client or route that did not process the extension. The adapter maps it to `RetryThroughLargeBlobRoute`, the act R10 names for that cause: a retry through a route that processes the extension, which the read preceding the write proved the host has. It never maps to `RetryVerification`, because a retry through the route that dropped the extension clears nothing, and the distinct act keeps the cause in the outcome.
 - `VerificationDeclined`: the user declined or cancelled the verification gesture, with the cause the platform reported, where it reported one. The adapter maps it to `RetryVerification`.
 - Any other platform failure throws, and the adapter maps the throw to `RetryVerification` with the error's text as the cause.
 
@@ -168,7 +169,7 @@ The host reports what the platform reported, and the Rust adapter maps each repo
 The host contract for `CredentialBlobProvider`:
 - `write_blob` returns `Landed` only where the platform reports `written: true`. The store set reads no `largeBlob` write back, so a false `Landed` would leave a member at `Composed` while the ceremony believes it moved to `Signed`, the state R10 stops the ceremony in.
 - A `largeBlob` output the platform does not return is `NoOutput`, never `Landed`.
-- `read_blob` returns no bytes only where the platform reports that the store holds none, and every other failure throws, so a store that failed to answer is never read as an empty one.
+- `read_blob` returns no bytes only where the platform reports that the store holds none, and every other failure throws, a read assertion that returns no `largeBlob` output included, so a store that failed to answer is never read as an empty one.
 
 **`SyncedStoreProvider`** reaches the platform account's synced store, on a host where the host table of `09-security-model.md` §9.7.4.2 R10 marks that member present:
 
@@ -181,7 +182,7 @@ The Rust adapter forms every key and encodes every value, each keyed on the cred
 
 The host contract for `SyncedStoreProvider`:
 - `get` returns no bytes only where the platform reports the item absent, and every other platform failure throws, so a store that failed to answer is never read as an empty one.
-- `get` reads the platform store on every call and never answers from a cache. The store set reads each platform write back to check it, and a cached answer would pass that check after a write that failed.
+- `get` follows the freshness rule below.
 - `put` returns only after the platform reports the item stored.
 
 **One freshness rule for both interfaces.** Every read the store set makes, through `get` or `read_blob`, returns the value the platform holds when the call is made, read from the platform store on that call (for `read_blob`, through a `largeBlob` read assertion), and never a cache or the bytes of the host's last write. The store set merges every member's current value before it writes: a cached `read_blob` would let a composition proceed past a handle or marker another device wrote, and a cached `get` would also pass the read-back check after a platform write that failed.
