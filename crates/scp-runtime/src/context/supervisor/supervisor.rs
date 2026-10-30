@@ -43138,8 +43138,9 @@ mod open_outlet_stream_tests {
     /// event is PERSISTED in production. `open_outlet_stream` wires the durable
     /// [`ActorOutletInvokedEventSink`](crate::context::outlets::stream_settlement_adapter::ActorOutletInvokedEventSink)
     /// INTERNALLY (the FFI bridges pass `None`), so a streaming close writes
-    /// EXACTLY ONE `OutletInvokedEvent` to the context event log — routed
-    /// through the verified `append_outlet_invoked_verified` boundary — carrying
+    /// EXACTLY ONE `OutletInvokedEvent` to the context event log — planned
+    /// through the verified `plan_outlet_invoked_verified_leaf` boundary and
+    /// written by the pending-unit drain — carrying
     /// the correct `chunks_billed`, `stream_manifest_hash`, and `cancel_ack_seq`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn open_outlet_stream_persists_one_invoked_event_035() {

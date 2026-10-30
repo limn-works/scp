@@ -284,18 +284,6 @@ impl ContextEventLogProvider for ArcEventLogProvider {
             .append_event(id, event_type, actor_did, payload, timestamp_secs)
             .await
     }
-    async fn append_event_after_side_effect(
-        &self,
-        id: &[u8; 32],
-        event_type: scp_event_log::EventType,
-        actor_did: &str,
-        payload: scp_event_log::EventPayload,
-        timestamp_secs: u64,
-    ) -> Result<(), ContextCreationError> {
-        self.0
-            .append_event_after_side_effect(id, event_type, actor_did, payload, timestamp_secs)
-            .await
-    }
     async fn destroy_event_log(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
         self.0.destroy_event_log(id).await
     }
