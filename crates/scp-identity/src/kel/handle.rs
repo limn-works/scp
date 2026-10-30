@@ -31,23 +31,48 @@ pub struct ScpIdentity {
 /// built from (`03-identity.md` §3.10.10).
 ///
 /// No accessor returns key material: the handle names keys its custody
-/// holds.
+/// holds. Each accessor that reaches a key yields a handle or a custody,
+/// never bytes:
 ///
-/// ```compile_fail,E0599
+/// ```compile_fail,E0308
 /// fn secret<S: scp_platform::EncryptedStorage + Clone>(
 ///     identity: &scp_identity::Identity<S>,
-/// ) -> Vec<u8> {
-///     identity.identity_key_bytes()
+/// ) -> [u8; 32] {
+///     identity.scp_identity().identity_key
+/// }
+/// ```
+///
+/// ```compile_fail,E0308
+/// fn secret<S: scp_platform::EncryptedStorage + Clone>(
+///     identity: &scp_identity::Identity<S>,
+/// ) -> [u8; 32] {
+///     identity.scp_identity().active_signing_key
+/// }
+/// ```
+///
+/// ```compile_fail,E0308
+/// fn secret<S: scp_platform::EncryptedStorage + Clone>(
+///     identity: &scp_identity::Identity<S>,
+/// ) -> &[u8] {
+///     &identity.config().custody
 /// }
 /// ```
 ///
 /// The positive control:
 ///
 /// ```
-/// fn handle<S: scp_platform::EncryptedStorage + Clone>(
+/// fn handles<S: scp_platform::EncryptedStorage + Clone>(
 ///     identity: &scp_identity::Identity<S>,
-/// ) -> scp_platform::KeyHandle {
-///     identity.scp_identity().identity_key
+/// ) -> (
+///     scp_platform::KeyHandle,
+///     scp_platform::KeyHandle,
+///     &scp_identity::KeyCustodySlot,
+/// ) {
+///     (
+///         identity.scp_identity().identity_key,
+///         identity.scp_identity().active_signing_key,
+///         &identity.config().custody,
+///     )
 /// }
 /// ```
 pub struct Identity<S: EncryptedStorage + Clone> {

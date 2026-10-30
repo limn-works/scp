@@ -15,6 +15,12 @@ use super::IdentityError;
 /// The record's format version (§17.3).
 const FORMAT_VERSION: u8 = 0x01;
 
+/// The prefix every device record's key carries (§17.3).
+pub(super) const DEVICE_RECORD_PREFIX: &str = "identity/";
+
+/// The suffix every device record's key carries (§17.3).
+pub(super) const DEVICE_RECORD_SUFFIX: &str = "/device_state";
+
 /// The width of one root entry: a BE16 root index and a BE64 handle.
 const ROOT_ENTRY_BYTES: usize = 2 + 8;
 
@@ -103,7 +109,9 @@ pub(super) fn device_record_key(identifier: &Identifier) -> Result<String, Ident
         tracing::error!(%error, "an identifier's text form failed key sanitization");
         IdentityError::PersistFailed
     })?;
-    Ok(format!("identity/{component}/device_state"))
+    Ok(format!(
+        "{DEVICE_RECORD_PREFIX}{component}{DEVICE_RECORD_SUFFIX}"
+    ))
 }
 
 impl DeviceRecord {
@@ -253,12 +261,12 @@ impl DeviceRecord {
 }
 
 /// A cursor that refuses to read past the value's end.
-struct Reader<'a> {
-    bytes: &'a [u8],
+pub(super) struct Reader<'a> {
+    pub(super) bytes: &'a [u8],
 }
 
 impl Reader<'_> {
-    fn array<const N: usize>(&mut self) -> Result<[u8; N], RecordDefect> {
+    pub(super) fn array<const N: usize>(&mut self) -> Result<[u8; N], RecordDefect> {
         let (head, rest) = self
             .bytes
             .split_first_chunk::<N>()
@@ -267,7 +275,7 @@ impl Reader<'_> {
         Ok(*head)
     }
 
-    fn u8(&mut self) -> Result<u8, RecordDefect> {
+    pub(super) fn u8(&mut self) -> Result<u8, RecordDefect> {
         let [byte] = self.array::<1>()?;
         Ok(byte)
     }

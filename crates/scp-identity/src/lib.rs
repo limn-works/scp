@@ -51,9 +51,11 @@ pub use dht::{
     verify_self_certification,
 };
 pub use kel::{
-    ErasedKeyCustody, ErasedNextSetCustody, EventOutcome, GroupSigners, Identity, IdentityConfig,
-    IdentityError, KeyCustodySlot, NextSetCustodySlot, PendingEvent, ScpIdentity, SignerPlan,
-    parse_identifier, verify_did,
+    CleanupFailure, CreateError, Created, CreationId, ErasedKeyCustody, ErasedNextSetCustody,
+    EventOutcome, GroupSigners, Identity, IdentityConfig, IdentityError, KeptComposition,
+    KeyCustodySlot, ListedOperator, NextSetCustodySlot, PendingEvent, RecordLock, ScpIdentity,
+    SignerPlan, UndestroyedKey, Unfinished, WitnessChoice, WitnessDesignation, WitnessWarning,
+    default_witness_set, parse_identifier, verify_did,
 };
 #[cfg(any(test, feature = "testing"))]
 pub use push_verify::TestPushVerifier;

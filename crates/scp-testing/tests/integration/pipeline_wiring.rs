@@ -71,6 +71,8 @@ const SUPERVISOR_SRC: &str =
 const IDENTITY_CREATE_SRC: &str = include_str!("../../../../crates/scp-identity/src/kel/create.rs");
 const IDENTITY_ABANDON_SRC: &str =
     include_str!("../../../../crates/scp-identity/src/kel/abandon.rs");
+const IDENTITY_UNFINISHED_SRC: &str =
+    include_str!("../../../../crates/scp-identity/src/kel/unfinished.rs");
 
 // Outlet invocation source — owns the SCP-OUT-046 off-mailbox streaming-saga
 // seal task (`run_streaming_saga_seal_task`). The `ac8_*` structural assertion
@@ -2875,23 +2877,100 @@ fn identity_abandon_destroys_before_the_record() {
     );
 }
 
-/// SCP-313 adds `dispatch_identity_create` and
-/// `dispatch_identity_abandon_pending` to the Supervisor. This file forbids
-/// `#[ignore]` (`no_stale_ignores`), so the pending dispatch is asserted
-/// here: each dispatch method, once it exists, reaches its `Identity` method.
+/// §9.7.4.1 item 4: the method-by-profile check runs before the plan check,
+/// and the witness check (§9.7.4.3) after both, all before any key.
 #[test]
-fn identity_dispatch_reaches_create_and_abandon_pending() {
-    for (dispatch, callee) in [
-        ("dispatch_identity_create", "Identity::create("),
-        (
-            "dispatch_identity_abandon_pending",
-            "Identity::abandon_pending(",
-        ),
-    ] {
-        if let Some(body) = extract_fn_body(SUPERVISOR_SRC, dispatch) {
-            assert!(body.contains(callee), "{dispatch} must call {callee}");
-        }
+fn identity_create_checks_the_offer_first() {
+    let check = body_of(IDENTITY_CREATE_SRC, "check_create");
+    let offer = offset_of(&check, "check_offer(", "the offer check");
+    let plan = offset_of(&check, "check_plan(", "the plan check");
+    let witnesses = offset_of(&check, "resolve_witnesses(", "the witness check");
+    assert!(
+        offer < plan && plan < witnesses,
+        "check_create must run check_offer, then check_plan, then resolve_witnesses"
+    );
+}
+
+/// §17.3: the creation record exists before the first key, each key is
+/// named in it before the next is generated, and the creation record is
+/// deleted only after the device record is written.
+#[test]
+fn identity_create_names_each_key_before_the_next() {
+    let keyed = body_of(IDENTITY_CREATE_SRC, "compose_keys_and_record");
+    let mut steps = vec![(
+        offset_of(&keyed, "write_creation_record(", "the creation record"),
+        "write_creation_record(",
+    )];
+    let noted: Vec<usize> = keyed
+        .match_indices("note_minted(")
+        .map(|(at, _)| at)
+        .collect();
+    assert_eq!(
+        noted.len(),
+        3,
+        "compose_keys_and_record must name each of three keys"
+    );
+    for (index, generate) in [
+        ".generate(",
+        "generate_key_event_keypair(",
+        "generate_keypair(",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        steps.push((offset_of(&keyed, generate, "a generation"), generate));
+        steps.push((noted[index], "note_minted("));
     }
+    steps.push((
+        offset_of(&keyed, "write_device_record(", "the device record"),
+        "write_device_record(",
+    ));
+    steps.push((
+        offset_of(
+            &keyed,
+            "delete_creation_record(",
+            "the creation record removal",
+        ),
+        "delete_creation_record(",
+    ));
+    for pair in steps.windows(2) {
+        assert!(
+            pair[0].0 < pair[1].0,
+            "`{}` must precede `{}` in compose_keys_and_record",
+            pair[0].1,
+            pair[1].1
+        );
+    }
+    let note = body_of(IDENTITY_CREATE_SRC, "note_minted");
+    assert!(
+        note.contains("record_lock.hold()") && note.contains("write_creation_record("),
+        "note_minted must rewrite the creation record under the record lock"
+    );
+}
+
+/// §17.3: every read-modify-write of a device or creation record holds the
+/// record lock, and `abandon_unfinished` reaches both abandon paths.
+#[test]
+fn identity_records_change_under_the_record_lock() {
+    let abandon = body_of(IDENTITY_ABANDON_SRC, "abandon_composition");
+    assert!(
+        offset_of(&abandon, "record_lock.hold()", "the lock")
+            < offset_of(&abandon, "read_device_record(", "the record read"),
+        "abandon_composition must hold the record lock before it reads the record"
+    );
+    let creation = body_of(IDENTITY_UNFINISHED_SRC, "abandon_creation");
+    let held = offset_of(&creation, "record_lock.hold()", "the lock");
+    let destroy = offset_of(&creation, "destroy_keys(", "the key destruction");
+    assert!(
+        held < offset_of(&creation, "read_creation_record(", "the record read")
+            && destroy < offset_of(&creation, "delete_creation_record(", "the record removal"),
+        "abandon_creation must hold the lock and destroy the keys before it deletes the record"
+    );
+    let unfinished = body_of(IDENTITY_UNFINISHED_SRC, "abandon_unfinished");
+    assert!(
+        unfinished.contains("abandon_creation(") && unfinished.contains("abandon_composition("),
+        "abandon_unfinished must reach both the creation and the composition abandon"
+    );
 }
 
 // ===========================================================================

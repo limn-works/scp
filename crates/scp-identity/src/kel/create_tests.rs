@@ -1,8 +1,9 @@
-//! Tests for `Identity::create` and `Identity::abandon_pending`
-//! (`03-identity.md` §3.10.10; SCP-006 AC1–5, 9, 15, 17–20).
+//! Tests for `Identity::create`, `Identity::abandon_pending`,
+//! `Identity::unfinished` and `Identity::abandon_unfinished`
+//! (`03-identity.md` §3.10.10; SCP-006 AC1–5, 9, 15, 17–22).
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -27,7 +28,10 @@ use zeroize::Zeroizing;
 
 use super::super::device_record::{EventRef, read_device_record, write_device_record};
 use super::*;
-use crate::kel::{KeyCustodySlot, NextSetCustodySlot};
+use crate::kel::{
+    KeptComposition, KeyCustodySlot, ListedOperator, NextSetCustodySlot, RecordLock,
+    UndestroyedKey, Unfinished, WitnessChoice, WitnessDesignation, WitnessWarning,
+};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 type Store = Arc<EncryptingAdapter<InMemoryStorage>>;
@@ -49,7 +53,13 @@ struct Rec {
     revealed: Mutex<Option<[u8; 33]>>,
     key_types: Mutex<Vec<KeyType>>,
     fail_key_event_generate: AtomicBool,
+    fail_active_generate: AtomicBool,
+    panic_active_generate: AtomicBool,
     fail_key_destroy: AtomicBool,
+    fail_next_destroy: AtomicBool,
+    /// `#0` reports `PlatformCustodyType::Hardware` while set.
+    hardware_root: AtomicBool,
+    hardware: Mutex<Vec<KeyHandle>>,
     probe_with_other_key: AtomicBool,
     hold_generate: AtomicBool,
     generated: Notify,
@@ -129,6 +139,13 @@ impl KeyCustody for RecordingKeyCustody {
     async fn generate_keypair(&self, key_type: KeyType) -> Result<KeyHandle, PlatformError> {
         self.rec.call("generate_keypair");
         lock(&self.rec.key_types).push(key_type);
+        assert!(
+            !self.rec.panic_active_generate.load(Ordering::SeqCst),
+            "injected panic generating #active"
+        );
+        if self.rec.fail_active_generate.load(Ordering::SeqCst) {
+            return Err(PlatformError::StorageError("injected".to_owned()));
+        }
         let key = self.inner.generate_keypair(key_type).await?;
         lock(&self.rec.keys).push(key);
         Ok(key)
@@ -141,6 +158,9 @@ impl KeyCustody for RecordingKeyCustody {
         }
         let key = self.inner.generate_key_event_keypair().await?;
         lock(&self.rec.keys).push(key);
+        if self.rec.hardware_root.load(Ordering::SeqCst) {
+            lock(&self.rec.hardware).push(key);
+        }
         Ok(key)
     }
 
@@ -195,6 +215,9 @@ impl KeyCustody for RecordingKeyCustody {
     }
 
     fn custody_type(&self, key: &KeyHandle) -> PlatformCustodyType {
+        if lock(&self.rec.hardware).contains(key) {
+            return PlatformCustodyType::Hardware;
+        }
         self.inner.custody_type(key)
     }
 }
@@ -262,7 +285,7 @@ impl NextSetCustody for RecordingNextSetCustody {
 
     async fn destroy(&self, handle: &NextSetKeyHandle) -> Result<(), NextSetCustodyError> {
         self.rec.call("destroy");
-        if self.rec.fail_key_destroy.load(Ordering::SeqCst) {
+        if self.rec.fail_next_destroy.load(Ordering::SeqCst) {
             return Err(NextSetCustodyError::Unavailable("injected".to_owned()));
         }
         self.inner.destroy(handle).await?;
@@ -316,6 +339,8 @@ fn config_over<S: scp_platform::EncryptedStorage + Clone>(
         }),
         persistence,
         profile,
+        witnesses: WitnessChoice::NoWitness,
+        record_lock: RecordLock::new(),
     }
 }
 
@@ -348,10 +373,12 @@ fn pending_of(outcome: EventOutcome) -> PendingEvent {
     }
 }
 
-async fn created(
-    config: IdentityConfig<Store>,
-) -> Result<(Identity<Store>, PendingEvent), Box<dyn std::error::Error>> {
-    let (identity, outcome) = Identity::create(config, one_root()).await?;
+async fn created<S: scp_platform::EncryptedStorage + Clone + 'static>(
+    config: IdentityConfig<S>,
+) -> Result<(Identity<S>, PendingEvent), Box<dyn std::error::Error>> {
+    let Created {
+        identity, outcome, ..
+    } = Identity::create(config, one_root()).await?;
     Ok((identity, pending_of(outcome)))
 }
 
@@ -383,6 +410,24 @@ async fn records_reach<S: Storage>(store: &S, count: usize) -> TestResult {
     })
     .await
     .map_err(|_| format!("timed out waiting for {count} records"))??;
+    Ok(())
+}
+
+/// Waits until `store` holds one device record and no creation record.
+async fn device_record_alone<S: Storage>(store: &S) -> TestResult {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match records(store).await {
+                Ok(keys) if keys.len() == 1 && keys[0].ends_with("/device_state") => {
+                    return Ok(());
+                }
+                Ok(_) => tokio::time::sleep(Duration::from_millis(2)).await,
+                Err(error) => return Err(error),
+            }
+        }
+    })
+    .await
+    .map_err(|_| "timed out waiting for the device record alone")??;
     Ok(())
 }
 
@@ -420,7 +465,8 @@ async fn a_root_generation_failure_destroys_the_next_set_member() -> TestResult 
     let error = Identity::create(config, one_root())
         .await
         .err()
-        .ok_or("create succeeded")?;
+        .ok_or("create succeeded")?
+        .error;
     assert_eq!(error, IdentityError::CustodySigningFailed);
     assert_eq!(rec.count("destroy"), 1);
     assert_eq!(rec.live(), 0);
@@ -467,11 +513,13 @@ async fn the_identifier_hashes_the_signed_preimage() -> TestResult {
     let (identity, pending) = created(desktop(&rec)).await?;
     let expected = Identifier::from_bytes(sha256(&[b"SCP-KEL-ID-V1:", &pending.preimage]));
     assert_eq!(*identity.identifier(), expected);
-    let mut flipped = pending.preimage;
-    let last = flipped.len() - 1;
-    flipped[last] ^= 0x01;
-    assert_ne!(
-        Identifier::from_bytes(sha256(&[b"SCP-KEL-ID-V1:", &flipped])),
+    // A verifier derives the same identifier from the bytes it decodes.
+    let fields = pending
+        .preimage
+        .strip_prefix(SEPARATOR)
+        .ok_or("no separator")?;
+    assert_eq!(
+        scp_kel::derive_identifier(decode_preimage(fields)?.preimage())?,
         expected
     );
     Ok(())
@@ -565,6 +613,7 @@ fn an_interval_of_299_is_refused_at_content() -> TestResult {
             }],
             next_threshold: 1,
         },
+        witnesses: vec![],
         witnessing_interval: 299,
     })?;
     let refusal = SigningChange::inception(&encoded.signed_preimage())
@@ -621,7 +670,8 @@ async fn plan_refusals_mint_no_key() -> TestResult {
         let error = Identity::create(desktop(&rec), signers.clone())
             .await
             .err()
-            .ok_or("create succeeded")?;
+            .ok_or("create succeeded")?
+            .error;
         assert_eq!(error, expected, "{signers:?}");
         assert_eq!(rec.generate_calls(), 0, "{signers:?}");
     }
@@ -634,7 +684,6 @@ async fn plan_refusals_mint_no_key() -> TestResult {
 
 // AC15: the shipped build offers no method on Headless, so create refuses
 // with 1100 before any key.
-#[cfg(not(feature = "testing"))]
 #[tokio::test]
 async fn create_fails_closed_without_independent_substrate() -> TestResult {
     for kind in [
@@ -648,7 +697,8 @@ async fn create_fails_closed_without_independent_substrate() -> TestResult {
         let error = Identity::create(config, one_root())
             .await
             .err()
-            .ok_or("create succeeded on Headless")?;
+            .ok_or("create succeeded on Headless")?
+            .error;
         assert_eq!(error, IdentityError::NoIndependentSubstrate, "{kind:?}");
         assert_eq!(error.code(), "SCP-IDENT-1100");
         assert_eq!(rec.generate_calls(), 0, "{kind:?}");
@@ -671,7 +721,8 @@ async fn a_method_not_offered_where_another_is_gives_1121() -> TestResult {
         let error = Identity::create(config, one_root())
             .await
             .err()
-            .ok_or("create succeeded")?;
+            .ok_or("create succeeded")?
+            .error;
         assert_eq!(error, IdentityError::MethodNotOfferedOnProfile, "{kind:?}");
         assert_eq!(error.code(), "SCP-IDENT-1121");
         assert_eq!(rec.generate_calls(), 0, "{kind:?}");
@@ -731,7 +782,8 @@ async fn a_probe_signed_by_another_key_gives_1111() -> TestResult {
     let error = Identity::create(config, one_root())
         .await
         .err()
-        .ok_or("create succeeded")?;
+        .ok_or("create succeeded")?
+        .error;
     assert_eq!(error, IdentityError::CustodySigningFailed);
     assert_eq!(rec.count("generate_key_event_keypair"), 0);
     assert_eq!(rec.count("generate_keypair"), 0);
@@ -808,7 +860,10 @@ async fn device_record_written_by_create_is_read_by_a_second_writer() -> TestRes
     );
     let custody = a.custody.clone();
     let next_set_custody = a.next_set_custody.clone();
-    let (identity, outcome) = Identity::create(a, one_root()).await?;
+    let record_lock = a.record_lock.clone();
+    let Created {
+        identity, outcome, ..
+    } = Identity::create(a, one_root()).await?;
     let pending = pending_of(outcome);
     drop(identity);
 
@@ -817,6 +872,8 @@ async fn device_record_written_by_create_is_read_by_a_second_writer() -> TestRes
         next_set_custody: next_set_custody.clone(),
         persistence: sqlite(&dir)?,
         profile: CustodyProfile::Desktop,
+        witnesses: WitnessChoice::NoWitness,
+        record_lock,
     };
     Identity::abandon_pending(&b, &pending).await?;
     assert_eq!(rec.live(), 0);
@@ -944,9 +1001,10 @@ async fn dropping_create_after_the_send_destroys_every_key() -> TestResult {
         _ = &mut create => return Err("create finished before generate returned".into()),
     }
     rec.release.notify_one();
-    // The in-memory store never yields, so once the record exists the task
-    // has run past its last await and sent its result into the join handle.
-    records_reach(&store, 1).await?;
+    // The in-memory store never yields, so once the device record alone
+    // remains the task has run past its last await and sent its result into
+    // the join handle.
+    device_record_alone(&store).await?;
     assert_eq!(rec.live(), 3);
     drop(create);
     eventually("the composition to be abandoned", || rec.live() == 0).await?;
@@ -998,5 +1056,696 @@ async fn abandoning_a_signed_or_later_event_rewrites_the_record() -> TestResult 
     assert_eq!(left.kept[0].event_digest, inception.event_digest);
     assert_eq!(rec.count("destroy") + rec.count("destroy_key"), 0);
     assert_eq!(rec.live(), 3);
+    Ok(())
+}
+
+// The offer check runs before the plan check: Headless with `ThisSdk`
+// gives 1100, not the plan's refusal.
+#[tokio::test]
+async fn the_offer_check_runs_before_the_plan_check() -> TestResult {
+    let rec = Arc::new(Rec::default());
+    let config = config_over(
+        &rec,
+        PreRotationCustodyKind::PlatformCloudKeyStore,
+        CustodyProfile::Headless,
+        store(),
+    );
+    let error = Identity::create(config, SignerPlan::ThisSdk)
+        .await
+        .err()
+        .ok_or("create succeeded")?;
+    assert_eq!(error.error, IdentityError::NoIndependentSubstrate);
+    assert_eq!(error.cleanup, None);
+    assert_eq!(rec.generate_calls(), 0);
+    Ok(())
+}
+
+/// A store that yields on every call, so tasks interleave between a read and
+/// a write, and fails the put whose ordinal `fail_put` names, once.
+#[derive(Clone)]
+struct FaultStore {
+    inner: Arc<InMemoryStorage>,
+    puts: Arc<AtomicUsize>,
+    fail_put: Arc<AtomicUsize>,
+}
+
+impl Storage for FaultStore {
+    async fn store(&self, key: &str, data: &[u8]) -> Result<(), PlatformError> {
+        let put = self.puts.fetch_add(1, Ordering::SeqCst) + 1;
+        tokio::task::yield_now().await;
+        if put == self.fail_put.load(Ordering::SeqCst) {
+            return Err(PlatformError::StorageError("injected".to_owned()));
+        }
+        self.inner.store(key, data).await
+    }
+
+    async fn retrieve(&self, key: &str) -> Result<Option<Vec<u8>>, PlatformError> {
+        tokio::task::yield_now().await;
+        self.inner.retrieve(key).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), PlatformError> {
+        tokio::task::yield_now().await;
+        self.inner.delete(key).await
+    }
+
+    async fn list_keys(&self, prefix: &str) -> Result<Vec<String>, PlatformError> {
+        self.inner.list_keys(prefix).await
+    }
+
+    async fn delete_prefix(&self, prefix: &str) -> Result<u64, PlatformError> {
+        self.inner.delete_prefix(prefix).await
+    }
+
+    async fn exists(&self, key: &str) -> Result<bool, PlatformError> {
+        self.inner.exists(key).await
+    }
+}
+
+type FaultStored = Arc<EncryptingAdapter<FaultStore>>;
+
+fn fault_store() -> (FaultStore, FaultStored) {
+    let faults = FaultStore {
+        inner: Arc::new(InMemoryStorage::new()),
+        puts: Arc::new(AtomicUsize::new(0)),
+        fail_put: Arc::new(AtomicUsize::new(0)),
+    };
+    let store = Arc::new(EncryptingAdapter::new(
+        faults.clone(),
+        Zeroizing::new([3; 32]),
+    ));
+    (faults, store)
+}
+
+fn desktop_over<S: scp_platform::EncryptedStorage + Clone>(
+    rec: &Arc<Rec>,
+    persistence: S,
+) -> IdentityConfig<S> {
+    config_over(
+        rec,
+        PreRotationCustodyKind::PlatformCloudKeyStore,
+        CustodyProfile::Desktop,
+        persistence,
+    )
+}
+
+// AC21: the creation record exists before the first key, and `unfinished`
+// lists it while the composition runs.
+#[tokio::test]
+async fn the_creation_record_precedes_the_first_key() -> TestResult {
+    let rec = Arc::new(Rec::default());
+    rec.hold_generate.store(true, Ordering::SeqCst);
+    let config = desktop(&rec);
+    let store = config.persistence.clone();
+    let task = tokio::spawn(Identity::create(config.clone(), one_root()));
+    rec.generated.notified().await;
+    let listed = Identity::unfinished(&config).await?;
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert!(matches!(listed[0], Unfinished::Creation(_)), "{listed:?}");
+    assert_eq!(records(&store).await?.len(), 1);
+    rec.release.notify_one();
+    let Created { identity, .. } = task.await??;
+    // The device record supersedes the creation record.
+    assert_eq!(records(&store).await?.len(), 1);
+    assert_eq!(
+        Identity::unfinished(&config).await?,
+        [Unfinished::Composition(KeptComposition {
+            identifier: *identity.identifier(),
+            sequence: 0,
+            event_digest: read_device_record(&store, identity.identifier())
+                .await?
+                .ok_or("no device record")?
+                .kept[0]
+                .event_digest,
+        })]
+    );
+    Ok(())
+}
+
+// AC21: a put that fails at any step leaves no key and no record.
+#[tokio::test]
+async fn a_failed_put_at_each_step_leaves_no_key_and_no_record() -> TestResult {
+    // A clean create puts the empty creation record, one rewrite per key,
+    // and the device record.
+    let rec = Arc::new(Rec::default());
+    let (faults, store) = fault_store();
+    created(desktop_over(&rec, store)).await?;
+    assert_eq!(faults.puts.load(Ordering::SeqCst), 5);
+
+    for put in 1..=5 {
+        let rec = Arc::new(Rec::default());
+        let (faults, store) = fault_store();
+        faults.fail_put.store(put, Ordering::SeqCst);
+        let error = Identity::create(desktop_over(&rec, store.clone()), one_root())
+            .await
+            .err()
+            .ok_or("create succeeded")?;
+        assert_eq!(error.error, IdentityError::PersistFailed, "put {put}");
+        assert_eq!(error.cleanup, None, "put {put}");
+        assert_eq!(rec.live(), 0, "put {put}");
+        assert!(records(&store).await?.is_empty(), "put {put}");
+    }
+    Ok(())
+}
+
+// AC21: `abandon_unfinished` on a creation still running makes it clean up
+// after itself.
+#[tokio::test]
+async fn abandoning_a_running_creation_stops_it() -> TestResult {
+    let rec = Arc::new(Rec::default());
+    rec.hold_generate.store(true, Ordering::SeqCst);
+    let config = desktop(&rec);
+    let store = config.persistence.clone();
+    let task = tokio::spawn(Identity::create(config.clone(), one_root()));
+    rec.generated.notified().await;
+    let listed = Identity::unfinished(&config).await?;
+    let [creation] = listed.as_slice() else {
+        return Err(format!("{listed:?}").into());
+    };
+    Identity::abandon_unfinished(&config, creation).await?;
+    rec.release.notify_one();
+    let error = task.await?.err().ok_or("create succeeded")?;
+    assert_eq!(error.error, IdentityError::PersistFailed);
+    assert_eq!(error.cleanup, None);
+    assert_eq!(rec.live(), 0);
+    assert!(records(&store).await?.is_empty());
+    let again = Identity::abandon_unfinished(&config, creation)
+        .await
+        .err()
+        .ok_or("a second abandon succeeded")?;
+    assert_eq!(again, IdentityError::NoUnfinishedCreation);
+    assert_eq!(again.code(), "SCP-IDENT-1122");
+    Ok(())
+}
+
+// AC21: a cleanup that fails to destroy keys reports every one, the creation
+// record names them, and `abandon_unfinished` destroys them.
+#[tokio::test]
+async fn a_failed_cleanup_is_listed_and_abandoned() -> TestResult {
+    let rec = Arc::new(Rec::default());
+    rec.fail_active_generate.store(true, Ordering::SeqCst);
+    rec.fail_next_destroy.store(true, Ordering::SeqCst);
+    rec.fail_key_destroy.store(true, Ordering::SeqCst);
+    let config = desktop(&rec);
+    let error = Identity::create(config.clone(), one_root())
+        .await
+        .err()
+        .ok_or("create succeeded")?;
+    assert_eq!(error.error, IdentityError::CustodySigningFailed);
+    let cleanup = error.cleanup.ok_or("the cleanup reported no failure")?;
+    let next = *lock(&rec.next).first().ok_or("no next-set member")?;
+    let root = *lock(&rec.keys).first().ok_or("no #0")?;
+    assert_eq!(
+        cleanup.undestroyed,
+        [
+            UndestroyedKey::NextSetMember(next),
+            UndestroyedKey::Key(root)
+        ]
+    );
+    let creation = Unfinished::Creation(cleanup.creation);
+    assert_eq!(Identity::unfinished(&config).await?, [creation]);
+
+    rec.fail_next_destroy.store(false, Ordering::SeqCst);
+    let partial = Identity::abandon_unfinished(&config, &creation)
+        .await
+        .err()
+        .ok_or("abandon succeeded")?;
+    assert_eq!(partial, IdentityError::CustodySigningFailed);
+    assert_eq!(rec.live_next(), 0, "every handle is attempted");
+    assert_eq!(Identity::unfinished(&config).await?, [creation]);
+
+    rec.fail_key_destroy.store(false, Ordering::SeqCst);
+    Identity::abandon_unfinished(&config, &creation).await?;
+    assert_eq!(rec.live(), 0);
+    assert!(records(&config.persistence).await?.is_empty());
+    assert!(Identity::unfinished(&config).await?.is_empty());
+    Ok(())
+}
+
+// AC21: a composition whose abandon failed is listed, and
+// `abandon_unfinished` finishes it.
+#[tokio::test]
+async fn a_kept_composition_is_listed_and_abandoned() -> TestResult {
+    let rec = Arc::new(Rec::default());
+    let config = desktop(&rec);
+    let (identity, pending) = created(config.clone()).await?;
+    rec.fail_key_destroy.store(true, Ordering::SeqCst);
+    assert!(Identity::abandon_pending(&config, &pending).await.is_err());
+    let kept = Unfinished::Composition(KeptComposition {
+        identifier: *identity.identifier(),
+        sequence: 0,
+        event_digest: pending.event_digest,
+    });
+    assert_eq!(Identity::unfinished(&config).await?, [kept]);
+    rec.fail_key_destroy.store(false, Ordering::SeqCst);
+    Identity::abandon_unfinished(&config, &kept).await?;
+    assert_eq!(rec.live(), 0);
+    assert!(records(&config.persistence).await?.is_empty());
+    Ok(())
+}
+
+// A panic in the composition destroys every minted key, then resumes.
+#[tokio::test]
+async fn a_panic_in_the_composition_destroys_every_key() -> TestResult {
+    let rec = Arc::new(Rec::default());
+    rec.panic_active_generate.store(true, Ordering::SeqCst);
+    let config = desktop(&rec);
+    let store = config.persistence.clone();
+    let join = tokio::spawn(Identity::create(config, one_root()))
+        .await
+        .err()
+        .ok_or("create returned")?;
+    assert!(join.is_panic());
+    assert_eq!(rec.count("destroy"), 1);
+    assert_eq!(rec.count("destroy_key"), 1);
+    assert_eq!(rec.live(), 0);
+    assert!(records(&store).await?.is_empty());
+    Ok(())
+}
+
+// A FIDO2 next-set custody's commitment entry declares `Fido2Token`.
+#[tokio::test]
+async fn a_fido2_commitment_declares_fido2_token() -> TestResult {
+    let rec = Arc::new(Rec::default());
+    let config = config_over(
+        &rec,
+        PreRotationCustodyKind::HardwareSecurityKey,
+        CustodyProfile::Desktop,
+        store(),
+    );
+    let (identity, pending) = created(config).await?;
+    let standing = &identity.scp_identity().pre_rotation_commitment;
+    assert_eq!(
+        standing.commitments[0].custody_type,
+        CustodyType::Fido2Token
+    );
+    let fields = pending
+        .preimage
+        .strip_prefix(SEPARATOR)
+        .ok_or("no separator")?;
+    assert_eq!(
+        decode_preimage(fields)?.preimage().continuation,
+        Some(Continuation::FixesCommitment(standing.clone()))
+    );
+    Ok(())
+}
+
+// Each key entry declares its own key's custody type.
+#[tokio::test]
+async fn each_key_entry_declares_its_own_custody_type() -> TestResult {
+    let rec = Arc::new(Rec::default());
+    rec.hardware_root.store(true, Ordering::SeqCst);
+    let (_identity, pending) = created(desktop(&rec)).await?;
+    let fields = pending
+        .preimage
+        .strip_prefix(SEPARATOR)
+        .ok_or("no separator")?;
+    let decoded = decode_preimage(fields)?;
+    let state = decoded
+        .preimage()
+        .key_state
+        .as_ref()
+        .ok_or("no key state")?;
+    assert_eq!(
+        state.keys[0].custody_type,
+        PlatformCustodyType::Hardware.key_entry_custody_type()
+    );
+    assert_eq!(state.keys[1].custody_type, CustodyType::Software);
+    Ok(())
+}
+
+// AC19: a next-set destroy that fails still lets every other key go, and a
+// retry counts the keys already destroyed as destroyed.
+#[tokio::test]
+async fn a_partial_destroy_failure_then_a_retry_destroys_every_key() -> TestResult {
+    let rec = Arc::new(Rec::default());
+    let config = desktop(&rec);
+    let (identity, pending) = created(config.clone()).await?;
+    rec.fail_next_destroy.store(true, Ordering::SeqCst);
+    let error = Identity::abandon_pending(&config, &pending)
+        .await
+        .err()
+        .ok_or("abandon succeeded")?;
+    assert_eq!(error, IdentityError::CustodySigningFailed);
+    assert_eq!(rec.live_keys(), 0, "#0 and #active are destroyed");
+    assert_eq!(rec.live_next(), 1);
+    assert!(
+        read_device_record(&config.persistence, identity.identifier())
+            .await?
+            .is_some()
+    );
+    rec.fail_next_destroy.store(false, Ordering::SeqCst);
+    Identity::abandon_pending(&config, &pending).await?;
+    assert_eq!(rec.live(), 0);
+    assert!(records(&config.persistence).await?.is_empty());
+    Ok(())
+}
+
+// A key its custody no longer holds counts as destroyed.
+#[tokio::test]
+async fn a_key_destroyed_beforehand_counts_as_destroyed() -> TestResult {
+    let rec = Arc::new(Rec::default());
+    let config = desktop(&rec);
+    let (identity, pending) = created(config.clone()).await?;
+    config
+        .custody
+        .destroy_key(&identity.scp_identity().identity_key)
+        .await?;
+    let next = *lock(&rec.next).first().ok_or("no next-set member")?;
+    config.next_set_custody.destroy(&next).await?;
+    Identity::abandon_pending(&config, &pending).await?;
+    assert_eq!(rec.live(), 0);
+    assert!(records(&config.persistence).await?.is_empty());
+    Ok(())
+}
+
+/// The state two `TwinNextSet` custodies share: every handle either issues
+/// is an alias of one key, so two creates over seeded key custodies derive
+/// one identifier.
+#[derive(Default)]
+struct Twins {
+    inner: InMemoryNextSetCustody,
+    source: tokio::sync::Mutex<Option<NextSetKeyHandle>>,
+    aliases: Mutex<Vec<u64>>,
+    next_alias: AtomicU64,
+}
+
+struct TwinNextSet(Arc<Twins>);
+
+impl TwinNextSet {
+    async fn source(&self, handle: &NextSetKeyHandle) -> Option<NextSetKeyHandle> {
+        if !lock(&self.0.aliases).contains(&handle.id()) {
+            return None;
+        }
+        *self.0.source.lock().await
+    }
+}
+
+impl KeyEventSigner for TwinNextSet {
+    type Member = NextSetKeyHandle;
+
+    async fn sign_change(
+        &self,
+        member: &NextSetKeyHandle,
+        change: &SigningChange,
+    ) -> Result<IndexedSignature, KeyEventSignError> {
+        let source = self
+            .source(member)
+            .await
+            .ok_or(KeyEventSignError::MemberNotFound)?;
+        self.0.inner.sign_change(&source, change).await
+    }
+
+    async fn sign_probe(
+        &self,
+        member: &NextSetKeyHandle,
+        probe: &CustodyProbe,
+    ) -> Result<ProbeSignature, KeyEventSignError> {
+        let source = self
+            .source(member)
+            .await
+            .ok_or(KeyEventSignError::MemberNotFound)?;
+        self.0.inner.sign_probe(&source, probe).await
+    }
+}
+
+impl NextSetCustody for TwinNextSet {
+    async fn generate(&self) -> Result<NextSetKeyHandle, NextSetCustodyError> {
+        let mut source = self.0.source.lock().await;
+        if source.is_none() {
+            *source = Some(self.0.inner.generate().await?);
+        }
+        drop(source);
+        let alias = 1000 + self.0.next_alias.fetch_add(1, Ordering::SeqCst);
+        lock(&self.0.aliases).push(alias);
+        Ok(NextSetKeyHandle::new(alias))
+    }
+
+    async fn reveal_public_key(
+        &self,
+        handle: &NextSetKeyHandle,
+    ) -> Result<[u8; 33], NextSetCustodyError> {
+        let source = self
+            .source(handle)
+            .await
+            .ok_or(NextSetCustodyError::HandleNotFound)?;
+        self.0.inner.reveal_public_key(&source).await
+    }
+
+    async fn destroy(&self, handle: &NextSetKeyHandle) -> Result<(), NextSetCustodyError> {
+        let mut aliases = lock(&self.0.aliases);
+        let index = aliases
+            .iter()
+            .position(|alias| *alias == handle.id())
+            .ok_or(NextSetCustodyError::HandleNotFound)?;
+        aliases.remove(index);
+        drop(aliases);
+        Ok(())
+    }
+
+    async fn seal_backup(
+        &self,
+        _handle: &NextSetKeyHandle,
+        _request: BackupRequest,
+    ) -> Result<BackupArtifact, NextSetCustodyError> {
+        Err(NextSetCustodyError::Unavailable("twin".to_owned()))
+    }
+
+    async fn restore(
+        &self,
+        _material: RestoreMaterial,
+        _expected_commitment: [u8; 32],
+    ) -> Result<NextSetKeyHandle, NextSetCustodyError> {
+        Err(NextSetCustodyError::Unavailable("twin".to_owned()))
+    }
+
+    fn custody_kind(&self) -> PreRotationCustodyKind {
+        PreRotationCustodyKind::PlatformCloudKeyStore
+    }
+}
+
+fn twin_config(
+    rec: &Arc<Rec>,
+    twins: &Arc<Twins>,
+    persistence: Store,
+    record_lock: RecordLock,
+) -> IdentityConfig<Store> {
+    IdentityConfig {
+        custody: KeyCustodySlot::custom(RecordingKeyCustody {
+            inner: InMemoryKeyCustody::from_seed_bytes([8; 32]),
+            rec: Arc::clone(rec),
+        }),
+        next_set_custody: NextSetCustodySlot::custom(TwinNextSet(Arc::clone(twins))),
+        persistence,
+        profile: CustodyProfile::Desktop,
+        witnesses: WitnessChoice::NoWitness,
+        record_lock,
+    }
+}
+
+// A create that derives an identifier a device record already names never
+// overwrites that record, and destroys its own keys.
+#[tokio::test]
+async fn create_never_overwrites_an_existing_device_record() -> TestResult {
+    let twins = Arc::new(Twins::default());
+    let store = store();
+    let record_lock = RecordLock::new();
+    let first = Arc::new(Rec::default());
+    let (identity, _) = created(twin_config(
+        &first,
+        &twins,
+        store.clone(),
+        record_lock.clone(),
+    ))
+    .await?;
+    let before = read_device_record(&store, identity.identifier()).await?;
+
+    let second = Arc::new(Rec::default());
+    let error = Identity::create(
+        twin_config(&second, &twins, store.clone(), record_lock),
+        one_root(),
+    )
+    .await
+    .err()
+    .ok_or("the second create succeeded")?;
+    assert_eq!(error.error, IdentityError::PersistFailed);
+    assert_eq!(error.cleanup, None);
+    assert_eq!(
+        read_device_record(&store, identity.identifier()).await?,
+        before
+    );
+    assert_eq!(second.live_keys(), 0);
+    assert_eq!(first.live_keys(), 2);
+    assert_eq!(records(&store).await?.len(), 1);
+    Ok(())
+}
+
+// Two abandons of one identity's events in one process lose no update.
+#[tokio::test]
+async fn concurrent_abandons_lose_no_update() -> TestResult {
+    let rec = Arc::new(Rec::default());
+    let (_faults, store) = fault_store();
+    let config = desktop_over(&rec, store);
+    let (identity, inception) = created(config.clone()).await?;
+    let id = *identity.identifier();
+    let mut record = read_device_record(&config.persistence, &id)
+        .await?
+        .ok_or("no device record")?;
+    let events: Vec<PendingEvent> = [0x61, 0x62]
+        .into_iter()
+        .zip(1..)
+        .map(|(byte, sequence)| {
+            record.kept.push(EventRef {
+                identifier: id,
+                sequence,
+                event_digest: [byte; 32],
+            });
+            PendingEvent {
+                identifier: id,
+                preimage: vec![],
+                event_digest: [byte; 32],
+                chain: vec![],
+            }
+        })
+        .collect();
+    write_device_record(&config.persistence, &id, &record).await?;
+    let (a, b) = tokio::join!(
+        Identity::abandon_pending(&config, &events[0]),
+        Identity::abandon_pending(&config, &events[1]),
+    );
+    a?;
+    b?;
+    let left = read_device_record(&config.persistence, &id)
+        .await?
+        .ok_or("the record is gone")?;
+    assert_eq!(left.kept.len(), 1, "{:?}", left.kept);
+    assert_eq!(left.kept[0].event_digest, inception.event_digest);
+    Ok(())
+}
+
+// Abandoning the inception while another entry remains removes only the
+// inception's entries and destroys no key.
+#[tokio::test]
+async fn abandoning_the_inception_beside_another_entry_keeps_that_entry() -> TestResult {
+    let rec = Arc::new(Rec::default());
+    let config = desktop(&rec);
+    let (identity, inception) = created(config.clone()).await?;
+    let id = *identity.identifier();
+    let other = EventRef {
+        identifier: id,
+        sequence: 1,
+        event_digest: [0x71; 32],
+    };
+    let mut record = read_device_record(&config.persistence, &id)
+        .await?
+        .ok_or("no device record")?;
+    record.pending.push(other);
+    let signed_inception = record.kept[0];
+    record.pending.push(signed_inception);
+    write_device_record(&config.persistence, &id, &record).await?;
+    Identity::abandon_pending(&config, &inception).await?;
+    let left = read_device_record(&config.persistence, &id)
+        .await?
+        .ok_or("the record is gone")?;
+    assert!(left.kept.is_empty());
+    assert_eq!(left.pending, [other]);
+    assert_eq!(rec.count("destroy") + rec.count("destroy_key"), 0);
+    assert_eq!(rec.live(), 3);
+    Ok(())
+}
+
+fn operator(byte: u8) -> Identifier {
+    Identifier::from_bytes([byte; 32])
+}
+
+fn listed(byte: u8) -> ListedOperator {
+    ListedOperator {
+        operator: operator(byte),
+        key: [byte; 33],
+    }
+}
+
+// AC22: the inception carries the chosen witness set, and `create` reports
+// the warning the choice earns.
+#[tokio::test]
+async fn the_inception_carries_the_witness_set() -> TestResult {
+    let cases = [
+        (
+            WitnessChoice::CommunityDefault {
+                listed: vec![listed(1), listed(2)],
+            },
+            vec![operator(1), operator(2)],
+            None,
+        ),
+        (
+            WitnessChoice::Designated {
+                witnesses: vec![
+                    WitnessDesignation {
+                        operator: operator(1),
+                    },
+                    WitnessDesignation {
+                        operator: operator(3),
+                    },
+                ],
+                listed: vec![listed(1)],
+            },
+            vec![operator(1), operator(3)],
+            Some(WitnessWarning::UnlistedOperators(vec![operator(3)])),
+        ),
+        (
+            WitnessChoice::NoWitness,
+            vec![],
+            Some(WitnessWarning::NoWitness),
+        ),
+    ];
+    for (choice, set, warning) in cases {
+        let rec = Arc::new(Rec::default());
+        let mut config = desktop(&rec);
+        config.witnesses = choice;
+        let Created {
+            outcome,
+            witness_warning,
+            ..
+        } = Identity::create(config, one_root()).await?;
+        assert_eq!(witness_warning, warning);
+        let pending = pending_of(outcome);
+        let fields = pending
+            .preimage
+            .strip_prefix(SEPARATOR)
+            .ok_or("no separator")?;
+        let decoded = decode_preimage(fields)?;
+        let state = decoded
+            .preimage()
+            .key_state
+            .as_ref()
+            .ok_or("no key state")?;
+        assert_eq!(state.witnesses, set);
+    }
+    Ok(())
+}
+
+// AC22: a designated set that repeats an operator is refused before any key.
+#[tokio::test]
+async fn a_repeated_designated_witness_is_refused_before_any_key() -> TestResult {
+    let rec = Arc::new(Rec::default());
+    let mut config = desktop(&rec);
+    let twice = WitnessDesignation {
+        operator: operator(1),
+    };
+    config.witnesses = WitnessChoice::Designated {
+        witnesses: vec![twice, twice],
+        listed: vec![listed(1)],
+    };
+    let error = Identity::create(config, one_root())
+        .await
+        .err()
+        .ok_or("create succeeded")?;
+    assert_eq!(
+        error.error,
+        IdentityError::IllegalKeyEvent {
+            stage: CheckStep::Content
+        }
+    );
+    assert_eq!(rec.generate_calls(), 0);
     Ok(())
 }

@@ -178,6 +178,13 @@ impl KeyRole {
 /// material stored internally (e.g., in a `HashMap`, Secure Enclave slot, or
 /// Android Keystore alias). The raw private key never leaves the custody
 /// boundary.
+///
+/// **An implementation issues each id once over the life of its store,
+/// restarts included, and never reissues the id of a destroyed key.** A
+/// holder that recorded a handle destroys by it after a crash and treats
+/// [`PlatformError::KeyNotFound`] as already destroyed, so a reissued id
+/// would let that retry destroy a newer, unrelated key
+/// (`17-persistence-and-storage.md` §17.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct KeyHandle(u64);
 
@@ -988,6 +995,9 @@ pub trait KeyCustody: Send + Sync + scp_kel::KeyEventSigner<Member = KeyHandle> 
     /// a derivation from a destroyed identity fails with key-not-found
     /// (`SCP-CRYPTO-4006`, `09-security-model.md` §9.10.4.A).
     ///
+    /// The destroyed key's id is never issued again (see [`KeyHandle`]), so
+    /// every later call with `key` returns [`PlatformError::KeyNotFound`].
+    ///
     /// # Errors
     ///
     /// Returns [`PlatformError::KeyNotFound`] if the handle is already invalid.
@@ -1466,6 +1476,12 @@ pub trait PreRotationCustody: Send + Sync {
 /// A distinct type from [`KeyHandle`] and [`PreRotationKeyHandle`], so no
 /// operational or pre-rotation handle reaches a next-set custody. A handle is
 /// meaningful only to the custody that generated it.
+///
+/// **A custody issues each id once over the life of its store, restarts
+/// included, and never reissues the id of a destroyed key**, because a
+/// holder retrying a destroy after a crash treats
+/// [`NextSetCustodyError::HandleNotFound`] as already destroyed, and a
+/// reissued id would let that retry destroy a newer next-set key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NextSetKeyHandle(u64);
 
@@ -1845,7 +1861,8 @@ pub trait NextSetCustody: Send + Sync + scp_kel::KeyEventSigner<Member = NextSet
         handle: &NextSetKeyHandle,
     ) -> impl std::future::Future<Output = Result<[u8; 33], NextSetCustodyError>> + Send;
 
-    /// Destroys the key, so every later call with `handle` fails.
+    /// Destroys the key, so every later call with `handle` fails. The id is
+    /// never issued again (see [`NextSetKeyHandle`]).
     ///
     /// # Errors
     ///
@@ -1896,9 +1913,16 @@ pub trait NextSetCustody: Send + Sync + scp_kel::KeyEventSigner<Member = NextSet
         expected_commitment: [u8; 32],
     ) -> impl std::future::Future<Output = Result<NextSetKeyHandle, NextSetCustodyError>> + Send;
 
-    /// The substrate this custody keeps its keys in (ADR-054). A fixed value
-    /// per implementation, for diagnostics; the custody object itself is the
-    /// security boundary.
+    /// The substrate this custody keeps its keys in (ADR-054), a fixed value
+    /// per implementation. It is security-relevant: `Identity::create` checks
+    /// the method it declares against the config's `CustodyProfile` and
+    /// refuses a method that profile does not admit as the next set's one
+    /// member (`09-security-model.md` §9.7.4.1 item 4), and writes that
+    /// method into the inception's commitment entry, which the signed
+    /// preimage, and so the identifier, hashes. An implementation returns
+    /// the kind of the substrate it actually uses, because a misstated kind
+    /// passes the profile check falsely and signs a false method into the
+    /// identity's log.
     fn custody_kind(&self) -> PreRotationCustodyKind;
 }
 

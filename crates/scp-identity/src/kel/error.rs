@@ -1,14 +1,17 @@
 //! The identity error of the key-event-log identity model
 //! (`03-identity.md` §3.10.10).
 //!
-//! The type carries twenty-one variants and no others. Their codes take
-//! `SCP-IDENT-1100` through `SCP-IDENT-1121`; `SCP-IDENT-1105` is reserved and
+//! The type carries twenty-two variants and no others. Their codes take
+//! `SCP-IDENT-1100` through `SCP-IDENT-1122`; `SCP-IDENT-1105` is reserved and
 //! names no variant. The superseded `did:dht` model's error is
 //! [`crate::dht::IdentityError`], whose codes sit in `SCP-IDENT-1000` through
 //! `SCP-IDENT-1099` (`.docs/standards/sdk-common.md` §Error code format).
 
 use scp_did::IdentifierError;
 use scp_kel::{CheckStep, InceptionRefusal};
+use scp_platform::{KeyHandle, NextSetKeyHandle};
+
+use super::creation_record::CreationId;
 
 /// The error half of `IdentityBackend`'s six methods, of `Identity`'s write
 /// API, and of the three recovery entry points `09-security-model.md`
@@ -200,6 +203,61 @@ pub enum IdentityError {
          and another method is offered there"
     )]
     MethodNotOfferedOnProfile,
+
+    /// SCP-IDENT-1122. `abandon_unfinished` named a creation for which the
+    /// store holds no creation record (`17-persistence-and-storage.md`
+    /// §17.3), so nothing was destroyed.
+    #[error("the store holds no creation record for the named creation")]
+    NoUnfinishedCreation,
+}
+
+/// Why [`Identity::create`](super::Identity::create) failed
+/// (`03-identity.md` §3.10.10).
+///
+/// `error` is the failing step's own error. `cleanup` is `Some` where the
+/// cleanup after that failure left a key live or the creation record in
+/// place; the creation then stays listed by
+/// [`Identity::unfinished`](super::Identity::unfinished), and
+/// [`Identity::abandon_unfinished`](super::Identity::abandon_unfinished)
+/// finishes the cleanup.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("identity creation failed: {error}")]
+pub struct CreateError {
+    /// The error of the step that failed.
+    #[source]
+    pub error: IdentityError,
+    /// The cleanup that did not complete, if any.
+    pub cleanup: Option<CleanupFailure>,
+}
+
+impl From<IdentityError> for CreateError {
+    /// A failure before any key exists, which leaves nothing to clean up.
+    fn from(error: IdentityError) -> Self {
+        Self {
+            error,
+            cleanup: None,
+        }
+    }
+}
+
+/// A cleanup after a failed `create` that did not complete
+/// (`17-persistence-and-storage.md` §17.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleanupFailure {
+    /// The creation whose record still names every key in `undestroyed`.
+    pub creation: CreationId,
+    /// Every key the cleanup failed to destroy. Empty where every key was
+    /// destroyed and only the record's removal failed.
+    pub undestroyed: Vec<UndestroyedKey>,
+}
+
+/// One key a destroy pass failed to destroy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UndestroyedKey {
+    /// A next-set member, held by the config's `next_set_custody`.
+    NextSetMember(NextSetKeyHandle),
+    /// A root member or `#active`, held by the config's `custody`.
+    Key(KeyHandle),
 }
 
 impl From<IdentifierError> for IdentityError {
@@ -252,6 +310,7 @@ impl IdentityError {
             Self::SignaturePending { .. } => "SCP-IDENT-1119",
             Self::NoPendingSignature { .. } => "SCP-IDENT-1120",
             Self::MethodNotOfferedOnProfile => "SCP-IDENT-1121",
+            Self::NoUnfinishedCreation => "SCP-IDENT-1122",
         }
     }
 }
@@ -298,6 +357,7 @@ mod tests {
                 event_digest: [5; 32],
             },
             IdentityError::MethodNotOfferedOnProfile,
+            IdentityError::NoUnfinishedCreation,
         ]
     }
 
@@ -323,17 +383,18 @@ mod tests {
             | IdentityError::SigningBaseStale { .. }
             | IdentityError::SignaturePending { .. }
             | IdentityError::NoPendingSignature { .. }
-            | IdentityError::MethodNotOfferedOnProfile => 21,
+            | IdentityError::MethodNotOfferedOnProfile
+            | IdentityError::NoUnfinishedCreation => 22,
         }
     }
 
     #[test]
-    fn codes_cover_1100_through_1121_without_1105() {
+    fn codes_cover_1100_through_1122_without_1105() {
         let variants = every_variant();
         assert_eq!(variants.len(), variant_count(&IdentityError::PersistFailed));
         let mut codes: Vec<&str> = variants.iter().map(IdentityError::code).collect();
         codes.sort_unstable();
-        let expected: Vec<String> = (1100..=1121)
+        let expected: Vec<String> = (1100..=1122)
             .filter(|n| *n != 1105)
             .map(|n| format!("SCP-IDENT-{n}"))
             .collect();

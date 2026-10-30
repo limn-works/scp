@@ -5,7 +5,8 @@
 //! protocol specification (ADR-006):
 //!
 //! 1. `generate_sign_verify_roundtrip` — generate Ed25519 keypair, sign data, verify signature
-//! 2. `destroy_prevents_sign` — generate, destroy, attempt sign -> `KeyNotFound`
+//! 2. `destroy_prevents_sign` — generate, destroy, attempt sign -> `KeyNotFound`;
+//!    later generates never return the destroyed id
 //! 3. `distinct_handles` — generate two keypairs, handles are different
 //! 4. `sign_with_invalid_handle_errors` — sign with non-existent handle -> `KeyNotFound`
 //! 5. `p256_generate_sign_verify` — P-256 signing key: 33-byte public key;
@@ -389,6 +390,15 @@ macro_rules! key_custody_conformance {
                     custody.sign(&handle, b"data").await.map(|_| ()),
                     "sign with a destroyed key",
                 );
+
+                // The destroyed id is never issued again (spec 16 §16.12.3).
+                for _ in 0..4 {
+                    let fresh = custody
+                        .generate_keypair(KeyType::Ed25519)
+                        .await
+                        .expect("generate_keypair after destroy should succeed");
+                    assert_ne!(fresh, handle, "a destroyed key's id was issued again");
+                }
             }
 
             #[tokio::test]
