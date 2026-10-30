@@ -90,7 +90,7 @@ impl ContextEventLogProvider for NoOpEventLog {
         &self,
         _context_id: &[u8; 32],
     ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError> {
-        Ok(None)
+        Ok(Some(Vec::new()))
     }
 
     /// The fixture holds no entry, so its root is the empty log's root.

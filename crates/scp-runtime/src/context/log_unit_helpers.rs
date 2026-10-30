@@ -653,13 +653,14 @@ async fn drain_queue<Q: LogUnitQueue>(
     // this drain.
     let mut re_reserved = false;
     while let Some((reserved, leaves)) = queue.front() {
-        let appended = write_front_unit(
-            queue,
-            event_log,
+        let (guard, base_seq) =
+            lock_front_unit(queue, event_log, context_id, context_id_bytes, reserved).await?;
+        // The guard moves into the append, so the gate is released when the
+        // append ends or the time bound drops its future.
+        let appended = within_write_bound(
+            event_log.append_unit(guard, base_seq, &leaves),
+            "appending a queued event log unit",
             context_id,
-            context_id_bytes,
-            reserved,
-            &leaves,
         )
         .await?;
         match appended {
@@ -708,18 +709,16 @@ async fn drain_queue<Q: LogUnitQueue>(
     Ok(())
 }
 
-/// Writes the queue's front unit under the provider's write gate, reserving
-/// its base at the log's length first when it holds none. Each wait runs
-/// under [`LOG_UNIT_WRITE_TIMEOUT`]; the write guard moves into the append,
-/// so the gate is released when the append ends or its future is dropped.
-async fn write_front_unit<Q: LogUnitQueue>(
+/// Takes the provider's write gate for the queue's front unit, waiting at
+/// most [`LOG_UNIT_WRITE_TIMEOUT`], and returns the guard with the unit's
+/// base: its reserved base, or the log's length, which it reserves first.
+async fn lock_front_unit<Q: LogUnitQueue>(
     queue: &mut Q,
     event_log: &dyn ContextEventLogProvider,
     context_id: &str,
     context_id_bytes: &[u8; 32],
     reserved: Option<u64>,
-    leaves: &[LeafSpec],
-) -> Result<Result<UnitAppended, UnitAppendError>, ContextError> {
+) -> Result<(crate::context::builder::UnitWriteGuard, u64), ContextError> {
     let guard = within_write_bound(
         event_log.lock_for_unit(context_id_bytes),
         "waiting for the event log write gate",
@@ -734,12 +733,7 @@ async fn write_front_unit<Q: LogUnitQueue>(
         queue.set_front_base(Some(base_seq)).await?;
         base_seq
     };
-    within_write_bound(
-        event_log.append_unit(guard, base_seq, leaves),
-        "appending a queued event log unit",
-        context_id,
-    )
-    .await
+    Ok((guard, base_seq))
 }
 
 /// What the restore's drain-only pass did with a stored non-Active snapshot

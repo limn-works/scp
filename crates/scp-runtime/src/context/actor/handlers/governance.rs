@@ -1401,6 +1401,12 @@ mod consequence_fail_closed_tests {
         let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
         let event_log: Box<dyn ContextEventLogProvider> = Box::new(MerkleEventLogProvider::new());
+        // The context holds an empty log: a context with no log refuses the
+        // sweep's read before it reaches the persist under test.
+        event_log
+            .init_event_log(&[CTX_BYTE; 32])
+            .await
+            .expect("init the empty log");
         let key_resolver: scp_protocol::context::governance::KeyResolver = Arc::new(|_, _| None);
         let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
             Arc::new(

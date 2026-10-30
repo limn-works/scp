@@ -1236,14 +1236,14 @@ pub async fn send_message(
     // "Event log write failures"). An unreadable log or root refuses the send
     // before anything leaves: the economy reservation and the sequence are
     // reversed.
-    let pre_send_read = crate::context::governance_logic::read_consequence_log(
-        &cell.class_s.pending_log_units,
+    let pre_send_read = crate::context::governance_logic::LogAndQueue::read(
+        cell.class_s.pending_log_units.iter(),
         &context_id,
         &*deps.event_log,
     )
-    .and_then(|entries| {
+    .and_then(|log| {
         crate::context::participation::ParticipationRoot::read(&context_id, &*deps.event_log)
-            .map(|root| (entries, root))
+            .map(|root| (log.into_entries(), root))
     });
     let (log_entries, participation_root) = match pre_send_read {
         Ok(read) => read,
@@ -2187,7 +2187,7 @@ fn record_send_participation(
 ///
 /// `log_entries` is the durable log plus the queued log units, read by
 /// [`send_message`] before the send
-/// ([`read_consequence_log`](crate::context::governance_logic::read_consequence_log));
+/// ([`LogAndQueue::read`](crate::context::governance_logic::LogAndQueue::read));
 /// the evaluation merges it with the receive buffer. `participation_root` is
 /// the log's Merkle root, read by [`send_message`] beside `log_entries`, which
 /// the sender's participation record binds. The consequence leaves go
@@ -4533,7 +4533,7 @@ mod pseudonym_routing_tests {
             _context_id: &[u8; 32],
         ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
         {
-            Ok(None)
+            Ok(Some(Vec::new()))
         }
 
         /// The fixture holds no entry, so its root is the empty log's root.
@@ -4762,7 +4762,7 @@ mod pseudonym_routing_tests {
             _context_id: &[u8; 32],
         ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
         {
-            Ok(None)
+            Ok(Some(Vec::new()))
         }
 
         /// The fixture holds no entry, so its root is the empty log's root.
@@ -5461,12 +5461,13 @@ mod log_unit_family_tests {
                 .membership_class_c_mut()
                 .next_sequence_number(MEMBER)
                 .expect("the sender is a member");
-            let log_entries = crate::context::governance_logic::read_consequence_log(
-                &cell.class_s.pending_log_units,
+            let log_entries = crate::context::governance_logic::LogAndQueue::read(
+                cell.class_s.pending_log_units.iter(),
                 &ctx,
                 deps.event_log.as_ref(),
             )
-            .expect("the log reads before the send");
+            .expect("the log reads before the send")
+            .into_entries();
             let root =
                 crate::context::participation::ParticipationRoot::read(&ctx, &*deps.event_log)
                     .expect("the root reads before the send");
@@ -5840,7 +5841,7 @@ pub mod dropped_supervisor_tests {
             _context_id: &[u8; 32],
         ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
         {
-            Ok(None)
+            Ok(Some(Vec::new()))
         }
 
         /// The fixture holds no entry, so its root is the empty log's root.

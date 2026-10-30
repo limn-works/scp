@@ -260,29 +260,42 @@ async fn participation_record_empty_attestations_yields_zero_count() {
     assert_eq!(record.governance_actions_against.len(), 1);
 }
 
-#[test]
-fn participation_record_empty_log_errors() {
-    let supervisor = Supervisor::with_providers(
+/// Builds a supervisor over `provider` with no persistence or transport.
+fn supervisor_over(provider: MerkleEventLogProvider) -> Arc<Supervisor> {
+    Supervisor::with_providers(
         Arc::new(NodeMlsFactory::new(
             ADMIN.to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         )),
         Box::new(NotConfiguredTransportProvider),
-        Box::new(MerkleEventLogProvider::new()),
+        Box::new(provider),
         mock_key_resolver(),
         None,
         None,
         None,
         None,
         test_mls_storage(),
-    );
-    // No log for this context → empty event set → core returns EmptyEventLog,
-    // surfaced as the DEDICATED, machine-detectable `NoParticipationFacts`
-    // variant (Finding 3) so the FFI bridges map it to the stable CTX_2076 code
-    // instead of collapsing it with genuine failures — not a panic, not a silent
-    // empty record, and NOT the generic InvalidState catch-all.
+    )
+}
+
+#[tokio::test]
+async fn participation_record_empty_log_errors() {
+    const EMPTY_CONTEXT: &str = "ctx-empty-log";
+    let provider = MerkleEventLogProvider::new();
+    provider
+        .init_event_log(&scp_runtime::context::state::context_id_to_bytes(
+            EMPTY_CONTEXT,
+        ))
+        .await
+        .expect("init the empty log");
+    let supervisor = supervisor_over(provider);
+    // An empty log -> empty event set -> core returns EmptyEventLog, surfaced
+    // as the DEDICATED, machine-detectable `NoParticipationFacts` variant
+    // (Finding 3) so the FFI bridges map it to the stable CTX_2076 code instead
+    // of collapsing it with genuine failures: not a panic, not a silent empty
+    // record, and NOT the generic InvalidState catch-all.
     let err = supervisor
-        .participation_record("ctx-never-created", SUBJECT, &[])
+        .participation_record(EMPTY_CONTEXT, SUBJECT, &[])
         .expect_err("empty log must error");
     assert!(
         matches!(
@@ -294,6 +307,21 @@ fn participation_record_empty_log_errors() {
     assert!(
         format!("{err}").contains("SCP-CTX-2076"),
         "expected the dedicated SCP-CTX-2076 code in the message, got: {err}"
+    );
+}
+
+/// A context with no log is an absent state, never an empty log (spec 17
+/// §17.3 "Event log write failures"): the record refuses with
+/// `EventLogFailed`, not the empty log's `NoParticipationFacts`.
+#[test]
+fn participation_record_absent_log_refuses() {
+    let supervisor = supervisor_over(MerkleEventLogProvider::new());
+    let err = supervisor
+        .participation_record("ctx-never-created", SUBJECT, &[])
+        .expect_err("an absent log must refuse");
+    assert!(
+        matches!(err, scp_protocol::context::ContextError::EventLogFailed(_)),
+        "expected EventLogFailed, got: {err:?}"
     );
 }
 

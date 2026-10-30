@@ -5500,7 +5500,7 @@ impl ClassSCell
             _context_id: &[u8; 32],
         ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
         {
-            Ok(None)
+            Ok(Some(Vec::new()))
         }
 
         /// The fixture holds no entry, so its root is the empty log's root.
@@ -6227,12 +6227,13 @@ impl ClassSCell
         ctx: &str,
         sender: &DID,
     ) -> Result<(), ContextError> {
-        let log_entries = crate::context::governance_logic::read_consequence_log(
-            &cell.class_s.pending_log_units,
+        let log_entries = crate::context::governance_logic::LogAndQueue::read(
+            cell.class_s.pending_log_units.iter(),
             ctx,
             deps.event_log.as_ref(),
         )
-        .expect("the log reads before the send");
+        .expect("the log reads before the send")
+        .into_entries();
         let root =
             crate::context::participation::ParticipationRoot::read(ctx, deps.event_log.as_ref())
                 .expect("the root reads before the send");

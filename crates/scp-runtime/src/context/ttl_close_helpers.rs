@@ -187,20 +187,21 @@ pub async fn handle_ttl_expiry(
     let planned_record = if ttl::TtlExpiryResult::event_logged_in(prior_completed) {
         Ok(None)
     } else {
-        crate::context::governance_logic::read_consequence_log(
-            &cell.class_s.pending_log_units,
+        crate::context::governance_logic::LogAndQueue::read(
+            cell.class_s.pending_log_units.iter(),
             &context_id,
             deps.event_log.as_ref(),
         )
-        .map(|entries| {
-            (!entries
+        .map(|log| {
+            (!log
+                .entries()
                 .iter()
                 .any(|e| e.event_type == scp_event_log::EventType::ContextExpired))
             .then(|| {
                 crate::context::state::LeafSpec::without_payload(
                     scp_event_log::EventType::ContextExpired,
                     scp_event_log::system_actors::SYSTEM_TIMER_ACTOR.to_owned(),
-                    convergent_ttl_deadline(&entries, creation_timestamp_secs, params_ttl)
+                    convergent_ttl_deadline(&log, creation_timestamp_secs, params_ttl)
                         .unwrap_or(expiry_base)
                         .as_secs(),
                 )
@@ -488,7 +489,7 @@ pub async fn reset_ttl_timer(
 /// and the two can never drift apart.
 ///
 /// `evidence` is the durable log followed by the queued log units
-/// ([`read_consequence_log`](crate::context::governance_logic::read_consequence_log)).
+/// ([`LogAndQueue::read`](crate::context::governance_logic::LogAndQueue::read)).
 /// The queued units count: a second extension queued before a drain extends
 /// the first one's deadline, never the stale log-only base. The base is never
 /// the untrusted cached scalar.
@@ -504,7 +505,7 @@ pub async fn reset_ttl_timer(
 /// extension before its step.
 pub fn plan_governance_ttl_extension(
     cell: &ClassSCell,
-    evidence: &[scp_event_log::Event],
+    evidence: &crate::context::governance_logic::LogAndQueue,
     actor_did: &str,
     additional_secs: u64,
     proposal_id: [u8; 32],
@@ -565,10 +566,12 @@ pub async fn extend_ttl_deadline_and_record(
     consenting_members: Vec<String>,
 ) -> Result<(), ContextError> {
     let params_ttl = cell.handle.params().ttl.map(|t| t.as_secs());
-    let entries = event_log
-        .event_log_entries(context_id_bytes)?
-        .unwrap_or_default();
-    let Some(current) = convergent_ttl_deadline(&entries, cell.creation_timestamp_secs, params_ttl)
+    let log = crate::context::governance_logic::LogAndQueue::read(
+        cell.class_s.pending_log_units.iter(),
+        cell.handle.context_id(),
+        event_log,
+    )?;
+    let Some(current) = convergent_ttl_deadline(&log, cell.creation_timestamp_secs, params_ttl)
     else {
         tracing::warn!(
             "extend_ttl_deadline_and_record: no convergent deadline to extend \
@@ -800,7 +803,11 @@ pub const fn convergent_ttl_deadline_secs(
 /// extension primitive) derives the deadline through THIS function instead of
 /// trusting an independent persisted scalar, a `memory_scope` heuristic, or
 /// params alone — collapsing the competing sources that produced the H1/M1/M3
-/// deadline bugs into one.
+/// deadline bugs into one. It takes only a [`LogAndQueue`], so every reader
+/// counts a queued `TtlExtended` entry and none reads an absent log as an
+/// empty one (spec 17 §17.3 "Event log write failures").
+///
+/// [`LogAndQueue`]: crate::context::governance_logic::LogAndQueue
 ///
 /// # Returns
 ///
@@ -810,7 +817,7 @@ pub const fn convergent_ttl_deadline_secs(
 ///   TtlExtended.new_deadline_unix))`.
 #[must_use]
 pub fn convergent_ttl_deadline(
-    entries: &[scp_event_log::Event],
+    log: &crate::context::governance_logic::LogAndQueue,
     creation_timestamp_secs: u64,
     params_ttl: Option<u64>,
 ) -> Option<ConvergentDeadline> {
@@ -831,7 +838,7 @@ pub fn convergent_ttl_deadline(
     // silently) so a corrupt leaf that shortens the derived deadline is
     // observable rather than an invisible security regression.
     let ext =
-        entries
+        log.entries()
             .iter()
             .filter(|e| e.event_type == EventType::TtlExtended)
             .filter_map(|e| {
@@ -938,8 +945,8 @@ pub async fn finalize_close(
     // The log plus the queue, read before the transition: a log that cannot be
     // read refuses the finalize before its step, never read as one without the
     // `ContextClosed` record (spec 17 §17.3 "Event log write failures").
-    let entries = crate::context::governance_logic::read_consequence_log(
-        &cell.class_s.pending_log_units,
+    let log = crate::context::governance_logic::LogAndQueue::read(
+        cell.class_s.pending_log_units.iter(),
         &context_id,
         deps.event_log.as_ref(),
     )?;
@@ -947,7 +954,7 @@ pub async fn finalize_close(
     // FSM transition (`Closing → Closed`). Returns the planned `ContextClosed`
     // record (`None` when the log or the queue already holds one) only if the
     // transition landed.
-    let closed_record = ttl::finalize_close(handle, &entries, close_ts)?;
+    let closed_record = ttl::finalize_close(handle, log.entries(), close_ts)?;
 
     // #2148 (ADR-049 birth-into-actor): now that the close transition has landed,
     // dispose the ACTOR-owned MLS crypto for Ephemeral/Summary scope (the provider
@@ -1274,7 +1281,7 @@ mod tests {
         const ADDITIONAL: u64 = 600;
         let cell = ttl_cell([0x7Bu8; 32]);
         let queued = CREATION + TTL + 300;
-        let evidence = [created(0), ttl_extended(1, CREATION + TTL, queued)];
+        let evidence = log_of(&[created(0), ttl_extended(1, CREATION + TTL, queued)]);
         let (deadline, leaf) = super::plan_governance_ttl_extension(
             &cell,
             &evidence,
@@ -1323,13 +1330,18 @@ mod tests {
         );
     }
 
+    /// The read result holding `entries`, for the deadline derivation.
+    fn log_of(entries: &[scp_event_log::Event]) -> crate::context::governance_logic::LogAndQueue {
+        crate::context::governance_logic::LogAndQueue::from_entries(entries.to_vec())
+    }
+
     /// No finite TTL (`params.ttl == None`) and no recorded extension ⇒ no
     /// deadline. The `None` is returned before any log read.
     #[test]
     fn convergent_deadline_no_ttl_is_none() {
         let entries = [created(0)];
         assert_eq!(
-            secs(convergent_ttl_deadline(&entries, CREATION, None)),
+            secs(convergent_ttl_deadline(&log_of(&entries), CREATION, None)),
             None
         );
     }
@@ -1340,7 +1352,11 @@ mod tests {
     fn convergent_deadline_create_ttl_is_base() {
         let entries = [created(0)];
         assert_eq!(
-            secs(convergent_ttl_deadline(&entries, CREATION, Some(TTL))),
+            secs(convergent_ttl_deadline(
+                &log_of(&entries),
+                CREATION,
+                Some(TTL)
+            )),
             Some(CREATION + TTL)
         );
     }
@@ -1355,7 +1371,11 @@ mod tests {
         let stray_leaf_ts = CREATION + 12_345;
         let entries = [created_at(0, stray_leaf_ts)];
         assert_eq!(
-            secs(convergent_ttl_deadline(&entries, CREATION, Some(TTL))),
+            secs(convergent_ttl_deadline(
+                &log_of(&entries),
+                CREATION,
+                Some(TTL)
+            )),
             Some(CREATION + TTL),
             "base must be the snapshot creation_timestamp_secs + ttl, not the genesis leaf ts"
         );
@@ -1367,7 +1387,11 @@ mod tests {
         let extended = CREATION + TTL + 500;
         let entries = [created(0), ttl_extended(1, CREATION + TTL, extended)];
         assert_eq!(
-            secs(convergent_ttl_deadline(&entries, CREATION, Some(TTL))),
+            secs(convergent_ttl_deadline(
+                &log_of(&entries),
+                CREATION,
+                Some(TTL)
+            )),
             Some(extended)
         );
     }
@@ -1380,7 +1404,11 @@ mod tests {
         let below = CREATION + 10; // < CREATION + TTL
         let entries = [created(0), ttl_extended(1, 0, below)];
         assert_eq!(
-            secs(convergent_ttl_deadline(&entries, CREATION, Some(TTL))),
+            secs(convergent_ttl_deadline(
+                &log_of(&entries),
+                CREATION,
+                Some(TTL)
+            )),
             Some(CREATION + TTL),
             "an extension below the create base must not shorten the deadline"
         );
@@ -1395,7 +1423,7 @@ mod tests {
         let extended = CREATION + 999;
         let entries = [created(0), ttl_extended(1, 0, extended)];
         assert_eq!(
-            secs(convergent_ttl_deadline(&entries, CREATION, None)),
+            secs(convergent_ttl_deadline(&log_of(&entries), CREATION, None)),
             None,
             "params.ttl == None ⇒ None regardless of any TtlExtended leaf"
         );
@@ -1413,7 +1441,11 @@ mod tests {
             ttl_extended(1, CREATION + TTL, first),
         ];
         assert_eq!(
-            secs(convergent_ttl_deadline(&entries, CREATION, Some(TTL))),
+            secs(convergent_ttl_deadline(
+                &log_of(&entries),
+                CREATION,
+                Some(TTL)
+            )),
             Some(second)
         );
     }
@@ -1430,7 +1462,7 @@ mod tests {
             promoted(2),
         ];
         assert_eq!(
-            secs(convergent_ttl_deadline(&entries, CREATION, None)),
+            secs(convergent_ttl_deadline(&log_of(&entries), CREATION, None)),
             None,
             "a promoted context (params.ttl == None) never arms, even with a stale extension leaf"
         );
@@ -1445,7 +1477,11 @@ mod tests {
     fn convergent_deadline_ignores_context_promoted_leaf() {
         let entries = [created(0), promoted(1)];
         assert_eq!(
-            secs(convergent_ttl_deadline(&entries, CREATION, Some(TTL))),
+            secs(convergent_ttl_deadline(
+                &log_of(&entries),
+                CREATION,
+                Some(TTL)
+            )),
             Some(CREATION + TTL),
             "params.ttl == Some ⇒ arm; a ContextPromoted leaf is not read for the arm decision"
         );
@@ -1459,7 +1495,11 @@ mod tests {
         let reset_deadline = CREATION + TTL + 250;
         let entries = [created(0), ttl_extended(1, CREATION + TTL, reset_deadline)];
         assert_eq!(
-            secs(convergent_ttl_deadline(&entries, CREATION, Some(TTL))),
+            secs(convergent_ttl_deadline(
+                &log_of(&entries),
+                CREATION,
+                Some(TTL)
+            )),
             Some(reset_deadline)
         );
     }
@@ -1473,7 +1513,11 @@ mod tests {
     fn convergent_deadline_empty_log_uses_snapshot_base() {
         let entries: [scp_event_log::Event; 0] = [];
         assert_eq!(
-            secs(convergent_ttl_deadline(&entries, CREATION, Some(TTL))),
+            secs(convergent_ttl_deadline(
+                &log_of(&entries),
+                CREATION,
+                Some(TTL)
+            )),
             Some(CREATION + TTL),
             "an empty / pruned log still derives the prune-immune snapshot base (E1)"
         );
@@ -1485,7 +1529,7 @@ mod tests {
     fn convergent_deadline_empty_log_no_ttl_is_none() {
         let entries: [scp_event_log::Event; 0] = [];
         assert_eq!(
-            secs(convergent_ttl_deadline(&entries, CREATION, None)),
+            secs(convergent_ttl_deadline(&log_of(&entries), CREATION, None)),
             None,
             "an empty log with params.ttl == None arms nothing (promotion survives log loss)"
         );
@@ -1589,7 +1633,7 @@ mod tests {
         // 2. log-derivation (snapshot base raised to the fail-safe extension term).
         let entries = [created(0)];
         let derived: Option<ConvergentDeadline> =
-            convergent_ttl_deadline(&entries, CREATION, Some(TTL));
+            convergent_ttl_deadline(&log_of(&entries), CREATION, Some(TTL));
         // 3. extend (on an already-convergent deadline).
         let extended: Option<ConvergentDeadline> = base.map(|d| d.extend(TTL));
 

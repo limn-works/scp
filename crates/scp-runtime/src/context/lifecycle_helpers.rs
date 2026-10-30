@@ -3264,6 +3264,17 @@ pub(in crate::context) async fn import_context(
         &export.event_log_data,
     )
     .await?;
+    // The imported log, as the provider verified and stored it, read before
+    // the spawn for the TTL arm in step 8. The imported actor starts with an
+    // empty queue, so the export's queued units are not evidence this node
+    // will ever hold, and the read counts none of them. An export with no log
+    // fails the import here, before any actor starts; an absent log is never
+    // read as an empty one (spec section 17.3, "Event log write failures").
+    let import_log = crate::context::governance_logic::LogAndQueue::read(
+        std::iter::empty(),
+        &context_id,
+        deps.event_log.as_ref(),
+    )?;
 
     // 4. Reconstruct the ContextHandle.
     let handle = ContextHandle::new(context_id.clone(), export.snapshot.context_params.clone());
@@ -3705,10 +3716,8 @@ pub(in crate::context) async fn import_context(
     //
     // The base is `ttl_base_secs`: the committed `T0`, or the snapshot's
     // recorded creation timestamp on a keyless import (see its definition).
-    let import_log_entries: Vec<scp_event_log::Event> =
-        rmp_serde::from_slice(&export.event_log_data).unwrap_or_default();
     let ttl = crate::context::ttl_close_helpers::convergent_ttl_deadline(
-        &import_log_entries,
+        &import_log,
         ttl_base_secs,
         handle.params().ttl.map(|t| t.as_secs()),
     )
@@ -4064,19 +4073,21 @@ pub async fn restore_context(
     // (H1).
     let restore_ttl_base_secs =
         restore_committed_t0.unwrap_or(ctx_snapshot.creation_timestamp_secs);
-    // An unreadable log fails the restore; it is never read as an empty one
-    // (spec section 17.3, "Event log write failures").
-    let restore_log_entries = deps
-        .event_log
-        .event_log_entries(&context_id_to_bytes(context_id))
-        .map_err(|e| {
-            ContextError::EventLogFailed(format!(
-                "reading the restored event log of context {context_id} failed: {e}"
-            ))
-        })?
-        .unwrap_or_default();
+    // The log plus the snapshot's queued units, so a `TtlExtended` entry still
+    // queued counts. An unreadable or absent log fails the restore; neither is
+    // read as an empty one (spec section 17.3, "Event log write failures").
+    let restore_log = crate::context::governance_logic::LogAndQueue::read(
+        pending_log_units.iter(),
+        context_id,
+        deps.event_log.as_ref(),
+    )
+    .map_err(|e| {
+        ContextError::EventLogFailed(format!(
+            "reading the restored event log of context {context_id} failed: {e}"
+        ))
+    })?;
     let restore_ttl_deadline = crate::context::ttl_close_helpers::convergent_ttl_deadline(
-        &restore_log_entries,
+        &restore_log,
         restore_ttl_base_secs,
         handle.params().ttl.map(|t| t.as_secs()),
     );
@@ -5042,7 +5053,7 @@ mod restore_reconcile_tests {
             _context_id: &[u8; 32],
         ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
         {
-            Ok(None)
+            Ok(Some(Vec::new()))
         }
 
         /// The fixture holds no entry, so its root is the empty log's root.
@@ -5086,7 +5097,7 @@ mod restore_reconcile_tests {
             _context_id: &[u8; 32],
         ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
         {
-            Ok(None)
+            Ok(Some(Vec::new()))
         }
 
         /// The fixture holds no entry, so its root is the empty log's root.

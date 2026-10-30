@@ -2190,8 +2190,8 @@ pub async fn execute_extend_ttl(
     // one fail-closed persist, so the two cannot drift. A context with no
     // convergent deadline (promoted / no-TTL) has no TTL to extend ⇒ no-op, no
     // leaf.
-    let evidence = crate::context::governance_logic::read_consequence_log(
-        &cell.class_s.pending_log_units,
+    let evidence = crate::context::governance_logic::LogAndQueue::read(
+        cell.class_s.pending_log_units.iter(),
         context_id,
         deps.event_log.as_ref(),
     )?;
@@ -7079,7 +7079,7 @@ mod commit_broadcast_retry_tests {
             _context_id: &[u8; 32],
         ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
         {
-            Ok(None)
+            Ok(Some(Vec::new()))
         }
 
         /// The fixture holds no entry, so its root is the empty log's root.

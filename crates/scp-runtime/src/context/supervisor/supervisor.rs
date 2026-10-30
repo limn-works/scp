@@ -14395,9 +14395,17 @@ impl Supervisor {
         let context_id_bytes = crate::context::state::context_id_to_bytes(context_id);
         // FULL, unfiltered event set — `governance_actions_against` needs
         // events where the subject is the projected target, not the actor.
+        // The durable log only: the record binds the log's Merkle root, which
+        // covers no queued unit. A context with no log refuses; an absent log
+        // is never read as an empty one (spec 17 §17.3 "Event log write
+        // failures").
         let events = event_log
             .event_log_entries(&context_id_bytes)?
-            .unwrap_or_default();
+            .ok_or_else(|| {
+                ContextError::EventLogFailed(format!(
+                    "Supervisor::participation_record — context {context_id} has no event log"
+                ))
+            })?;
         // FAIL CLOSED on the Merkle root (white-hat P2). A log that HAS events
         // must carry a real root: substituting `[0u8; 32]` would emit a record
         // with real participation facts bound to a zero root, which a verifier
@@ -21582,7 +21590,7 @@ mod tests {
             _context_id: &[u8; 32],
         ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
         {
-            Ok(None)
+            Ok(Some(Vec::new()))
         }
 
         /// The fixture holds no entry, so its root is the empty log's root.
@@ -22921,6 +22929,105 @@ mod tests {
             .unwrap()
             .expect("expiry must persist a durable snapshot");
         assert_eq!(persisted.state, crate::context::ContextState::Expired);
+    }
+
+    /// A `TtlExtended` entry that a refusing log left queued in the stored
+    /// snapshot counts at restore: the restore reads the log plus the queued
+    /// units, so it arms the extended deadline, not `creation + ttl` (spec 17
+    /// §17.3 "Event log write failures"). The log holds only `ContextCreated`.
+    #[tokio::test(start_paused = true)]
+    async fn restore_arms_the_deadline_of_a_queued_ttl_extension() {
+        const T0: u64 = 1_700_000_000;
+        const TTL_SECS: u64 = 20;
+        const EXTENDED_DEADLINE: u64 = T0 + 50;
+
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(T0));
+        let persistence = MapPersistence::default();
+        let sup = supervisor_with_clock_persistence_and_event_log(
+            clock_dyn,
+            Box::new(persistence.clone()),
+            Box::new(SeededEventLog::new(vec![seeded_context_created(0)])),
+        );
+
+        let ctx_id_bytes = [0x5Cu8; 32];
+        let ctx_key = hex::encode(ctx_id_bytes);
+        let admin = DID("did:example:restore-queued-extension-admin".to_owned());
+
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            T0,
+            admin.clone(),
+        );
+        state.handle = crate::context::ContextHandle::new(
+            ctx_key.clone(),
+            scp_protocol::context::params::ContextParams {
+                ttl: Some(std::time::Duration::from_secs(TTL_SECS)),
+                ..Default::default()
+            },
+        );
+        // The governance extension armed the timer and queued its leaf in one
+        // persist while the log refused the write.
+        state.ttl.timer.deadline_unix_secs = Some(EXTENDED_DEADLINE);
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .unwrap();
+        let mut snap = crate::context::manager_methods::snapshot_context(&state);
+        snap.pending_log_units
+            .push_back(crate::context::state::PendingLogUnit {
+                base_seq: None,
+                leaves: vec![
+                    crate::context::log_unit_helpers::plan_ttl_extended_leaf(
+                        admin.as_ref(),
+                        &scp_event_log::payload::TtlExtendedPayload {
+                            old_deadline_unix: T0 + TTL_SECS,
+                            new_deadline_unix: EXTENDED_DEADLINE,
+                            proposal_id: [0x5C; 32],
+                            consenting_members: vec![admin.as_ref().to_owned()],
+                        },
+                        T0 + 5,
+                    )
+                    .expect("the TtlExtended leaf plans"),
+                ],
+            });
+        persistence.persist_context(&ctx_key, &snap).await.unwrap();
+
+        sup.load_wrapping_key(&admin)
+            .await
+            .expect("an entry point loads the owner's wrapping key");
+        sup.respawn_from_snapshot(&ctx_key, &admin)
+            .await
+            .expect("respawn must restore the Active snapshot");
+
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        // Past `creation + ttl` (T0+20), before the queued extension's deadline
+        // (T0+50): a restore that read the log without the queue armed T0+20
+        // and the context has expired.
+        tokio::time::advance(std::time::Duration::from_secs(TTL_SECS + 5)).await;
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            sup.read_context_state(&ctx_key).await,
+            Some(crate::context::ContextState::Active),
+            "restore must arm the deadline of the queued TtlExtended entry"
+        );
+
+        tokio::time::advance(std::time::Duration::from_secs(30)).await;
+        let mut despawned = false;
+        for _ in 0..64 {
+            if sup.lookup(&ctx_key).is_none() {
+                despawned = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            despawned,
+            "the extended TTL arm fires once paused time passes the extended deadline"
+        );
     }
 
     /// BUG-1 (stale TTL arm on Closed/Tombstoned, REGRESSION GATE): once a
@@ -27090,7 +27197,7 @@ mod tests {
             _context_id: &[u8; 32],
         ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
         {
-            Ok(None)
+            Ok(Some(Vec::new()))
         }
 
         /// The fixture holds no entry, so its root is the empty log's root.
@@ -27150,7 +27257,7 @@ mod tests {
             _context_id: &[u8; 32],
         ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
         {
-            Ok(None)
+            Ok(Some(Vec::new()))
         }
 
         /// The fixture holds no entry, so its root is the empty log's root.
@@ -28151,7 +28258,7 @@ mod tests {
             _context_id: &[u8; 32],
         ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
         {
-            Ok(None)
+            Ok(Some(Vec::new()))
         }
 
         /// The fixture holds no entry, so its root is the empty log's root.

@@ -2271,7 +2271,7 @@ mod tests {
                 &self,
                 _: &[u8; 32],
             ) -> Result<Option<Vec<scp_event_log::Event>>, ContextError> {
-                Ok(None)
+                Ok(Some(Vec::new()))
             }
 
             /// The fixture holds no entry, so its root is the empty log's root.
