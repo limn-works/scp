@@ -1221,6 +1221,67 @@ mod tests {
         );
     }
 
+    /// A rotating unsubscribe plans every author's `KeyEpochAdvance` record
+    /// before it rotates any key, so an author at the last epoch refuses the
+    /// unsubscribe with no author rotated (spec 17 §17.3 "Event log write
+    /// failures"; ADR-007 §5). Without the plan, the rotation advances the
+    /// authors before the last one and then fails, leaving those epochs
+    /// advanced with no record.
+    #[tokio::test]
+    async fn rotating_unsubscribe_with_an_author_at_the_last_epoch_rotates_no_author() {
+        const LAST_AUTHOR: &str = "did:example:zz-author-at-the-last-epoch";
+        let (deps, _appends) = build_deps().await;
+        let (mut state, ctx_hex) = build_broadcast_state_with_authors(
+            BroadcastAdmission::Gated,
+            &[CREATOR_DID, LAST_AUTHOR],
+        );
+        let mut snapshot = state
+            .broadcast_context
+            .as_ref()
+            .expect("a broadcast context")
+            .to_snapshot();
+        snapshot
+            .authors
+            .get_mut(LAST_AUTHOR)
+            .expect("the second author")
+            .epoch = u64::MAX;
+        state.broadcast_context = Some(BroadcastContext::from_snapshot(snapshot));
+        let mut cell = ClassSCell::new(state);
+        let grant = mint_read_ucan(&ctx_hex, CREATOR_DID, SUBSCRIBER_DID, &creator_key());
+        dispatch_subscribe(&mut cell, &deps, &ctx_hex, Some(grant))
+            .await
+            .expect("the subscribe lands");
+
+        let result = crate::context::broadcast_helpers::unsubscribe_broadcast(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &DID(SUBSCRIBER_DID.to_owned()),
+            true,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(ContextError::CryptoFailed(_))),
+            "the unsubscribe is refused: {result:?}"
+        );
+        let broadcast = cell
+            .broadcast_context
+            .as_ref()
+            .expect("a broadcast context");
+        assert_eq!(
+            broadcast
+                .get_author(CREATOR_DID)
+                .map(scp_protocol::context::AuthorState::epoch),
+            Some(0),
+            "the first author's key did not rotate"
+        );
+        assert!(
+            crate::context::broadcast_helpers::is_broadcast_subscriber(&mut cell, SUBSCRIBER_DID),
+            "the refused unsubscribe leaves the subscriber on the roster"
+        );
+    }
+
     /// Uniform deny-reason constant for the ban admission rejection.
     fn subscribe_deny_reason() -> &'static str {
         scp_protocol::context::broadcast::SUBSCRIBE_DENY_REASON

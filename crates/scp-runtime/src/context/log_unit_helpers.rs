@@ -360,45 +360,110 @@ pub fn plan_outlet_invoked_verified_leaf(
     )
 }
 
-/// Plans one `KeyEpochAdvance` record per broadcast author whose key a
-/// step rotated (§5.14.10; ADR-007 §5 for a broadcast block or unsubscribe),
-/// in the order given. Each rotation
-/// advances by exactly 1, so `old_epoch = new_epoch - 1`.
+/// The `KeyEpochAdvance` records of a broadcast key rotation (§5.14.10;
+/// ADR-007 §5), planned before the rotation runs (spec 17 §17.3 "Event log
+/// write failures").
 ///
-/// The records are known only once the rotation ran, so they are planned
-/// inside the step's persist. A record that does not encode or breaks the
-/// append's payload rules is logged at ERROR and skipped (SCP-349): the
-/// rotation is already taken, and refusing it here would report a rotation
-/// that landed as one that did not.
-pub fn key_epoch_advance_leaves<'a>(
-    advances: impl IntoIterator<Item = (&'a str, u64)>,
-    timestamp_secs: u64,
-    context_id: &str,
-) -> Vec<LeafSpec> {
-    advances
-        .into_iter()
-        .filter_map(|(author_did, new_epoch)| {
-            plan_encoded_leaf(
-                scp_event_log::EventType::KeyEpochAdvance,
-                author_did,
-                &scp_event_log::payload::KeyEpochAdvancePayload {
-                    old_epoch: new_epoch.saturating_sub(1),
-                    new_epoch,
-                },
-                timestamp_secs,
-            )
-            .inspect_err(|e| {
-                tracing::error!(
-                    context_id = %context_id,
-                    author_did = %author_did,
-                    error = %e,
-                    "KeyEpochAdvance record refused after a key rotation — \
-                     the event log is short one leaf for this author"
-                );
+/// [`Self::plan`] reads each author's current epoch and plans the record of
+/// its next one, `current + 1`, since every rotation advances an epoch by
+/// exactly 1. A record that cannot be planned refuses the rotation before it
+/// runs. [`Self::for_rotations`] then returns the records of the rotations
+/// that ran, so the planned set may cover authors the step does not rotate.
+#[derive(Debug, Default)]
+#[must_use]
+pub struct PlannedKeyEpochAdvances(Vec<(String, u64, LeafSpec)>);
+
+impl PlannedKeyEpochAdvances {
+    /// Plans the record of the next epoch of each `(author_did,
+    /// current_epoch)`, in the order given.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::CryptoFailed`] when an author's epoch is at `u64::MAX`,
+    /// which the rotation refuses as well, or [`ContextError::EventLogFailed`]
+    /// when a record does not encode or breaks the append's payload rules.
+    pub fn plan<'a>(
+        authors: impl IntoIterator<Item = (&'a str, u64)>,
+        timestamp_secs: u64,
+    ) -> Result<Self, ContextError> {
+        authors
+            .into_iter()
+            .map(|(author_did, old_epoch)| {
+                let new_epoch = old_epoch.checked_add(1).ok_or_else(|| {
+                    ContextError::CryptoFailed(format!(
+                        "broadcast key epoch overflow for author {author_did}"
+                    ))
+                })?;
+                let leaf = plan_encoded_leaf(
+                    scp_event_log::EventType::KeyEpochAdvance,
+                    author_did,
+                    &scp_event_log::payload::KeyEpochAdvancePayload {
+                        old_epoch,
+                        new_epoch,
+                    },
+                    timestamp_secs,
+                )?;
+                Ok((author_did.to_owned(), new_epoch, leaf))
             })
-            .ok()
-        })
-        .collect()
+            .collect::<Result<_, _>>()
+            .map(Self)
+    }
+
+    /// Plans the record of the next epoch of every author of `broadcast`, in
+    /// the author order the rotation runs in (DID-lexicographic, from the
+    /// backing `BTreeMap`).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::plan`].
+    pub fn plan_all_authors(
+        broadcast: &scp_protocol::context::broadcast::BroadcastContext,
+        timestamp_secs: u64,
+    ) -> Result<Self, ContextError> {
+        Self::plan(
+            broadcast.author_dids().filter_map(|author_did| {
+                broadcast
+                    .get_author(author_did)
+                    .map(|author| (author_did.as_str(), author.epoch()))
+            }),
+            timestamp_secs,
+        )
+    }
+
+    /// The planned records of the rotations that ran, as `(author_did,
+    /// new_epoch)` in rotation order.
+    ///
+    /// Each rotation ran on the state the plan read, in the same actor turn,
+    /// so each has its planned record. A rotation without one is a defect in
+    /// the caller; it is logged at ERROR and fails a debug build.
+    pub fn for_rotations<'a>(
+        mut self,
+        rotations: impl IntoIterator<Item = (&'a str, u64)>,
+        context_id: &str,
+    ) -> Vec<LeafSpec> {
+        rotations
+            .into_iter()
+            .filter_map(|(author_did, new_epoch)| {
+                let index = self
+                    .0
+                    .iter()
+                    .position(|(planned, epoch, _)| planned == author_did && *epoch == new_epoch);
+                debug_assert!(
+                    index.is_some(),
+                    "a broadcast key rotation ran without its planned KeyEpochAdvance record"
+                );
+                if index.is_none() {
+                    tracing::error!(
+                        context_id,
+                        author_did,
+                        new_epoch,
+                        "a broadcast key rotation ran without its planned KeyEpochAdvance record"
+                    );
+                }
+                index.map(|i| self.0.swap_remove(i).2)
+            })
+            .collect()
+    }
 }
 
 /// True when the context has queued log units or a log fault, so a drain has
@@ -1252,6 +1317,48 @@ mod tests {
         EventPayload {
             data: vec![0xC0, tag],
         }
+    }
+
+    /// A `KeyEpochAdvance` record is planned from the epoch before the
+    /// rotation, as `current -> current + 1`, and an author at the last epoch
+    /// refuses the whole plan, so the caller refuses the rotation before it
+    /// runs (spec 17 §17.3 "Event log write failures").
+    #[test]
+    fn key_epoch_advances_plan_the_next_epoch_and_refuse_the_last() {
+        let planned = super::PlannedKeyEpochAdvances::plan(
+            [("did:example:a", 4), ("did:example:b", 0)],
+            1_700_000_000,
+        )
+        .expect("both epochs advance");
+        let leaves = planned.for_rotations([("did:example:b", 1), ("did:example:a", 5)], "ctx");
+        let decoded: Vec<(String, scp_event_log::payload::KeyEpochAdvancePayload)> = leaves
+            .iter()
+            .map(|leaf| {
+                assert_eq!(leaf.event_type(), EventType::KeyEpochAdvance);
+                (
+                    leaf.actor_did().to_owned(),
+                    scp_event_log::payload::decode_payload(leaf.payload())
+                        .expect("the planned payload decodes"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            decoded
+                .iter()
+                .map(|(did, p)| (did.as_str(), p.old_epoch, p.new_epoch))
+                .collect::<Vec<_>>(),
+            vec![("did:example:b", 0, 1), ("did:example:a", 4, 5)],
+            "one record per rotation, in rotation order, from the planned epochs"
+        );
+
+        let refused = super::PlannedKeyEpochAdvances::plan(
+            [("did:example:a", 0), ("did:example:b", u64::MAX)],
+            1_700_000_000,
+        );
+        assert!(
+            matches!(refused, Err(ContextError::CryptoFailed(_))),
+            "an author at the last epoch refuses the plan: {refused:?}"
+        );
     }
 
     fn tagged_leaf(tag: u8) -> LeafSpec {

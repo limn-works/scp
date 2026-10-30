@@ -931,6 +931,21 @@ pub async fn execute_revoke(
                 return Err(ContextError::MemberNotFound(did.to_string()));
             }
 
+            // §5.14.10: a read-ban rotates every author's broadcast key by
+            // exactly 1 (a write-ban first drops `did` as an author), so each
+            // author's `KeyEpochAdvance` record is planned here, before any
+            // change, and a record that cannot be planned refuses the revoke
+            // with nothing changed.
+            let planned_advances = match state.broadcast_context.as_ref() {
+                Some(broadcast) if matches!(access, AccessScope::Read | AccessScope::Both) => {
+                    crate::context::log_unit_helpers::PlannedKeyEpochAdvances::plan_all_authors(
+                        broadcast,
+                        timestamp_secs,
+                    )?
+                }
+                _ => crate::context::log_unit_helpers::PlannedKeyEpochAdvances::default(),
+            };
+
             let mut rotated_authors: Vec<AuthorKeyRotation> = Vec::new();
 
             // Write revocation.
@@ -1002,15 +1017,16 @@ pub async fn execute_revoke(
                     && state.broadcast_context.is_none();
 
             // §5.14.10: one KeyEpochAdvance leaf per author whose broadcast
-            // key the ban rotated, known only once the rotation ran above.
+            // key the ban rotated, from the records planned above.
             let mut unit = vec![access_revoked_leaf];
-            unit.extend(crate::context::log_unit_helpers::key_epoch_advance_leaves(
-                rotated_authors
-                    .iter()
-                    .map(|r| (r.author_did.as_str(), r.new_epoch)),
-                timestamp_secs,
-                context_id,
-            ));
+            unit.extend(
+                planned_advances.for_rotations(
+                    rotated_authors
+                        .iter()
+                        .map(|r| (r.author_did.as_str(), r.new_epoch)),
+                    context_id,
+                ),
+            );
             view.enqueue_counted_log_unit(unit);
             Ok((rotated_authors, needs_sender_key_rotation))
         })
@@ -3116,14 +3132,24 @@ pub async fn execute_rotate_content_keys(
             let state = view.rest_mut();
             require_active(&state.handle)?;
 
-            let (epoch_output, advances) = if let Some(ref mut bc) = state.broadcast_context {
-                // `rotate_all_author_keys` now returns per-author advance data so
-                // the caller can emit `KeyEpochAdvance` event-log leaves after the
-                // fail-closed persist (async appends cannot run inside this sync
-                // `commit_class_s_keep` closure — ADR-049 Decision 7). The advance
-                // Vec is threaded out of the closure as the second tuple element.
+            let (epoch_output, advance_leaves) = if let Some(ref mut bc) = state.broadcast_context {
+                // Each author's `KeyEpochAdvance` record is planned before the
+                // rotation, which advances every author's epoch by exactly 1, so
+                // a record that cannot be planned refuses the rotation with
+                // nothing changed (spec 17 §17.3 "Event log write failures").
+                let planned =
+                    crate::context::log_unit_helpers::PlannedKeyEpochAdvances::plan_all_authors(
+                        bc,
+                        timestamp_secs,
+                    )?;
                 let advances = bc.rotate_all_author_keys(timestamp_secs.saturating_mul(1_000))?;
-                (None, advances)
+                let leaves = planned.for_rotations(
+                    advances
+                        .iter()
+                        .map(|a| (a.author_did.as_str(), a.new_epoch)),
+                    context_id,
+                );
+                (None, leaves)
             } else {
                 // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): advance the MLS epoch on the
                 // actor state (already inside this fail-closed `commit_class_s_keep`
@@ -3188,13 +3214,7 @@ pub async fn execute_rotate_content_keys(
             // (milliseconds) is for the relay-message consumer on the
             // per-author block path and is not used here.
             let mut unit = vec![rotated_leaf];
-            unit.extend(crate::context::log_unit_helpers::key_epoch_advance_leaves(
-                advances
-                    .iter()
-                    .map(|a| (a.author_did.as_str(), a.new_epoch)),
-                timestamp_secs,
-                context_id,
-            ));
+            unit.extend(advance_leaves);
             view.enqueue_counted_log_unit(unit);
             Ok(epoch_output.map(|epoch_out| epoch_out.commit_bytes))
         })

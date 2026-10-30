@@ -39,7 +39,7 @@ use crate::context::actor::class_s::ClassSCell;
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::signer::CommandSigner;
 use crate::context::log_unit_helpers::{
-    drain_pending_log_units, key_epoch_advance_leaves, plan_leaf, plan_membership_change_leaf,
+    PlannedKeyEpochAdvances, drain_pending_log_units, plan_leaf, plan_membership_change_leaf,
     queue_log_unit,
 };
 use crate::context::state::{require_active, strip_event_payload};
@@ -216,6 +216,16 @@ pub async fn unsubscribe_broadcast(
         },
         unsub_ts,
     )?;
+    // ADR-007 §5: a rotating unsubscribe advances every author's epoch by
+    // exactly 1, so each author's `KeyEpochAdvance` record is planned here,
+    // before the rotation, and a record that cannot be planned refuses the
+    // unsubscribe with nothing changed.
+    let planned_advances = match cell.broadcast_context.as_ref() {
+        Some(broadcast) if rotate_keys => {
+            PlannedKeyEpochAdvances::plan_all_authors(broadcast, unsub_ts)?
+        }
+        _ => PlannedKeyEpochAdvances::default(),
+    };
 
     let result = {
         let mut view = cell.class_c_view();
@@ -261,14 +271,15 @@ pub async fn unsubscribe_broadcast(
     // §17.3 "Event log write failures"); its leaves count toward the §9.9.3
     // checkpoint triggers there.
     let mut unit = vec![left_leaf];
-    unit.extend(key_epoch_advance_leaves(
-        result
-            .key_rotations
-            .iter()
-            .map(|rotation| (rotation.author_did.as_str(), rotation.new_epoch)),
-        unsub_ts,
-        context_id,
-    ));
+    unit.extend(
+        planned_advances.for_rotations(
+            result
+                .key_rotations
+                .iter()
+                .map(|rotation| (rotation.author_did.as_str(), rotation.new_epoch)),
+            context_id,
+        ),
+    );
     queue_log_unit(cell, deps, context_id, unit).await?;
     // The step is durable with its records queued; write them now. A failed
     // drain leaves them queued for the actor's next drain and logs its own
@@ -658,22 +669,27 @@ pub async fn block_broadcast_subscriber(
     // (spec 17 §17.3 "Event log write failures"): `MemberBlocked`, then the
     // author's `KeyEpochAdvance` (ADR-007 §5: the block rotates the author's
     // sender-key epoch by exactly 1), so the two leaves sit next to each other
-    // in the Merkle log. The epoch is known only once the block ran, so that
-    // leaf is planned inside the closure; one that does not encode is logged
-    // and skipped (SCP-349), since the block is already in force.
+    // in the Merkle log. The block advances the author's epoch by exactly 1,
+    // so that record is planned from the current epoch before the block runs,
+    // and a record that cannot be planned refuses the block with nothing
+    // changed.
     let result = cell
         .commit_class_s_keep(deps, context_id, |mut view| {
             let bc =
                 view.rest_mut().broadcast_context.as_mut().ok_or_else(|| {
                     ContextError::MembershipFailed("not a broadcast context".into())
                 })?;
+            let planned_advance = PlannedKeyEpochAdvances::plan(
+                bc.get_author(author_did.as_ref())
+                    .map(|author| (author_did.as_ref(), author.epoch())),
+                block_ts,
+            )?;
             let result = bc.block_subscriber(author_did, subscriber_did)?;
             let mut unit = vec![blocked_leaf];
-            unit.extend(key_epoch_advance_leaves(
-                [(author_did.as_ref(), result.new_epoch)],
-                block_ts,
-                context_id,
-            ));
+            unit.extend(
+                planned_advance
+                    .for_rotations([(author_did.as_ref(), result.new_epoch)], context_id),
+            );
             view.enqueue_counted_log_unit(unit);
             Ok(result)
         })
