@@ -29,12 +29,13 @@ use sha2::{Digest, Sha256};
 use super::{
     CheckFn, PLAY_INTEGRITY_CHECKS, PREIMAGE_LEN, PlayIntegrityCheck, PlayIntegrityFailure,
     PlayIntegrityRead, PreimageFields, Run, Stop, VERDICT_LEN, Verdict, VerifierEntryFault,
-    parse_play_integrity_verifier_entry, read_play_integrity, run, verify_under_current_active,
+    parse_play_integrity_verifier_entry, read_play_integrity, run, run_play_integrity_checks,
+    verify_under_current_active,
 };
 use crate::trust::device_attestation::test_ca::{BoxResult, DAY, T0, TestResult};
 use crate::trust::device_attestation::{
     DeviceAttestationPlatform, DeviceAttestationRejection as R, DeviceAttestationUnverifiable as U,
-    device_attestation_binding_digest,
+    VerifiedDeviceAttestation, device_attestation_binding_digest,
 };
 use crate::trust::sybil::{AcceptedAndroidPackage, ContextSybilPolicy};
 
@@ -72,7 +73,7 @@ const V87_SIGNATURE: &str = concat!(
     "456fb375ccf6b28573637ee2084719cf04b9a2502d37baf66a2dd475e6358eb1",
 );
 /// Vector 87's 176-byte verdict.
-const V87_VERDICT: &str = concat!(
+pub(in crate::trust::device_attestation) const V87_VERDICT: &str = concat!(
     "aca2c93825d53244c823000db9dec0a02498bdb3ed96aa2ce038425b4c65001e",
     "ee760b2de75a5f5a5e7eaa046eca0df481765a163b7088338eb7c54dee70daae",
     "83599d12bbbeff09725d9d6ea2222acadb684c092b9f534dbaf10f973f6f5bd0",
@@ -90,7 +91,7 @@ fn bytes32(hex_text: &str) -> BoxResult<[u8; 32]> {
 }
 
 /// `SHA-256(label)` as an identifier, as §25.35 derives its fixtures.
-fn fixture_identifier(label: &str) -> Identifier {
+pub(in crate::trust::device_attestation) fn fixture_identifier(label: &str) -> Identifier {
     Identifier::from_bytes(Sha256::digest(label).into())
 }
 
@@ -139,10 +140,10 @@ fn labelled(label: &str) -> P256SecretKey {
 
 /// A verifier identity: the signed units of its log and the key its current
 /// `#active` entry names.
-struct Identity {
-    identifier: Identifier,
+pub(in crate::trust::device_attestation) struct Identity {
+    pub(in crate::trust::device_attestation) identifier: Identifier,
     units: Vec<Vec<u8>>,
-    active: P256SecretKey,
+    pub(in crate::trust::device_attestation) active: P256SecretKey,
 }
 
 impl Identity {
@@ -198,7 +199,10 @@ impl Identity {
 
     /// The key state a first-contact resolution at `resolved_at_secs`
     /// accepts.
-    fn resolved(&self, resolved_at_secs: u64) -> BoxResult<ResolvedState> {
+    pub(in crate::trust::device_attestation) fn resolved(
+        &self,
+        resolved_at_secs: u64,
+    ) -> BoxResult<ResolvedState> {
         self.resolved_at(Duration::from_secs(resolved_at_secs))
     }
 
@@ -231,7 +235,7 @@ impl Identity {
     }
 }
 
-fn verifier_a() -> BoxResult<Identity> {
+pub(in crate::trust::device_attestation) fn verifier_a() -> BoxResult<Identity> {
     Identity::v41()
 }
 
@@ -296,7 +300,7 @@ fn reference_active_state(root_seed: [u8; 32], active_seed: [u8; 32]) -> BoxResu
 // ── Fixture ─────────────────────────────────────────────────────────────────
 
 /// The reader's time.
-const NOW: u64 = T0;
+pub(in crate::trust::device_attestation) const NOW: u64 = T0;
 const MAX_AGE_SECS: u64 = 30 * DAY;
 const PACKAGE: &str = "com.example.scp";
 const OTHER_PACKAGE: &str = "com.example.other";
@@ -436,22 +440,47 @@ impl Fixture {
             policy,
             verifiers: &verifiers,
             now: self.now,
-            entry_id: "entry-0",
         };
         let full = run(&read, checks);
         if checks.len() == PLAY_INTEGRITY_CHECKS.len() {
-            // The production entry point returns what the full array does.
-            let entry_point = read_play_integrity(&read);
-            let expected = full.result.clone().map_err(|stop| match stop {
+            // The production entry points return what the full array does.
+            let expected = full.result.map_err(|stop| match stop {
                 Stop::Fail(failure) => failure,
                 Stop::Prerequisite(check) => check.prerequisite_failure(),
             });
             assert_eq!(
-                entry_point, expected,
+                run_play_integrity_checks(&read),
+                expected,
+                "run_play_integrity_checks runs every check"
+            );
+            assert_eq!(
+                read_play_integrity(&read, "entry-0").map(|verified| verified.minted_at()),
+                expected,
                 "read_play_integrity runs every check"
             );
         }
         Ok(full)
+    }
+
+    /// The reader's outcome for the fixture, through `read_play_integrity`.
+    fn read_entry(&self) -> BoxResult<Result<VerifiedDeviceAttestation, PlayIntegrityFailure>> {
+        let policy = self.policy.validated()?;
+        let binding = device_attestation_binding_digest(
+            &self.subject,
+            &self.context_id,
+            &self.policy.device_attestation_challenge,
+        )?;
+        let verdict = self.verdict()?;
+        let verifiers: Vec<&ResolvedState> = self.key_states.iter().collect();
+        let read = PlayIntegrityRead {
+            token: &self.token,
+            verdict: &verdict,
+            binding: &binding,
+            policy,
+            verifiers: &verifiers,
+            now: self.now,
+        };
+        Ok(read_play_integrity(&read, "entry-0"))
     }
 
     fn run_all(&self) -> BoxResult<Run> {
@@ -823,9 +852,8 @@ fn subject_differs_from_reader_identifier_passes() -> TestResult {
 fn verified_fields() -> TestResult {
     let fixture = Fixture::valid()?;
     let verified = fixture
-        .run_all()?
-        .result
-        .map_err(|stop| format!("{stop:?}"))?;
+        .read_entry()?
+        .map_err(|failure| format!("{failure:?}"))?;
     assert_eq!(
         verified.platform(),
         DeviceAttestationPlatform::PlayIntegrity

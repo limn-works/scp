@@ -11770,8 +11770,9 @@
       "gate": "gate-kel",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "in-progress",
       "files": [
+        "crates/scp-protocol/src/trust/device_attestation/produce.rs",
         "crates/scp-runtime/src/identity/device_attestation.rs",
         "crates/scp-runtime/src/identity/mod.rs",
         "crates/scp-ffi/uniffi/src/lib.rs",
