@@ -75,6 +75,17 @@ pub(crate) fn record_saga_repair_needed() {
     metrics::counter!("scp_saga_repair_needed_total").increment(1);
 }
 
+/// Records an event-log record that code outside a context's actor could not
+/// queue through the actor, on a background path with no caller to return
+/// the error to (spec 17 §17.3 "Event log write failures"): the streaming
+/// close sink and the cross-context bridge's A-side `OutletInvoked` record.
+/// Each increment is paired with an error log that names the context. A
+/// nonzero rate means a context's log is missing a record its operation
+/// performed.
+pub(crate) fn record_log_unit_undelivered() {
+    metrics::counter!("scp_log_unit_undelivered_total").increment(1);
+}
+
 /// Records a cross-context saga caller-side reversal left OUTSTANDING (§6.2.4).
 ///
 /// Incremented at every abort site that returns

@@ -807,6 +807,9 @@ impl ContextActor {
             ContextCommand::Queries(sub) => handlers::queries::dispatch(cell, deps, sub).await,
             // Push domain (§10.7.1): read-only, answered from owned state.
             ContextCommand::Push(sub) => handlers::push::dispatch(cell, sub),
+            // Records sent by code outside the actor (spec 17 §17.3): queued in
+            // the restore persist, then drained.
+            ContextCommand::LogUnit(sub) => handlers::log_unit::dispatch(cell, deps, sub).await,
             // SagaPhase + LifecycleControl already migrated to the
             // state-owning signature.
             ContextCommand::SagaPhase(msg) => handlers::saga::dispatch(cell, deps, msg).await,

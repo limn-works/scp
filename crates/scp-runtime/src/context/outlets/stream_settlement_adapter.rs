@@ -63,6 +63,7 @@ fn spawn_supervisor_op<F, Fut>(
 {
     let operation = kind.label();
     let Some(owner) = supervisor.upgrade() else {
+        kind.record_not_run();
         tracing::error!(
             operation,
             "streaming sink: supervisor dropped; operation not run"
@@ -71,17 +72,18 @@ fn spawn_supervisor_op<F, Fut>(
     };
     let weak = Weak::clone(supervisor);
     let task = async move {
-        match weak.upgrade() {
-            Some(sup) => op(sup).await,
-            None => {
-                tracing::error!(
-                    operation,
-                    "streaming sink: supervisor dropped; operation not run"
-                );
-            }
-        }
+        let Some(sup) = weak.upgrade() else {
+            kind.record_not_run();
+            tracing::error!(
+                operation,
+                "streaming sink: supervisor dropped; operation not run"
+            );
+            return;
+        };
+        op(sup).await;
     };
     if let Err(e) = owner.spawn_tracked_on(kind, task, runtime) {
+        kind.record_not_run();
         tracing::error!(operation, error = %e, "streaming sink: operation not run");
     }
 }
@@ -237,10 +239,10 @@ impl StreamSettlementSink for ActorStreamSettlementSink {
 }
 
 /// Concrete [`OutletInvokedEventSink`] routing a stream's close-time §5.4.5
-/// `OutletInvokedEvent` to the durable context event log via the supervisor's
-/// append boundary
-/// ([`Supervisor::append_streaming_outlet_invoked_event`]), which persists
-/// through plain `append_event` and its durable event-local `<=` backstop
+/// `OutletInvokedEvent` to the hosting context's actor
+/// ([`Supervisor::enqueue_streaming_outlet_invoked_unit`]), which queues it as a
+/// pending log unit in a persisted commit and drains it to the durable event
+/// log (spec 17 §17.3); planning re-runs the durable event-local `<=` backstop
 /// (same-context integrity is enforced inline in the pump before `record`).
 ///
 /// Constructed INTERNALLY by the streaming open orchestrator
@@ -248,17 +250,17 @@ impl StreamSettlementSink for ActorStreamSettlementSink {
 /// caller-facing `invoked_event_sink`, so wiring this sink supervisor-side is
 /// what makes the §5.4.5 "ONE event per stream at close" record durable in
 /// production (mirrors the internally-wired [`ActorStreamSettlementSink`]). The
-/// `record` callback is `Sync` fire-and-forget: it spawns the async append onto
-/// the captured runtime handle. A missing/torn-down event log or a persist
-/// failure is surfaced to the operator log (the money-moving settlement is a
-/// separate sink; this one carries the audit record).
+/// `record` callback is `Sync` fire-and-forget: it spawns the async send onto
+/// the captured runtime handle. No caller waits on the close record, so a
+/// dropped Supervisor, an absent actor, a full mailbox after the send's
+/// retries, or a refused enqueue is logged at error level and counted by
+/// `scp_log_unit_undelivered_total` (the money-moving settlement is a separate
+/// sink; this one carries the audit record).
 pub(crate) struct ActorOutletInvokedEventSink {
-    /// The supervisor whose shared event-log provider owns the target context's
-    /// durable log.
+    /// The supervisor whose actor registry serves the hosting context.
     supervisor: Weak<Supervisor>,
-    /// The canonical event-log key for the hosting context
-    /// (`context_id_to_bytes`), pinned at open.
-    context_id_bytes: [u8; 32],
+    /// The hosting context's actor key, pinned at open.
+    context_id: String,
     /// The §5.4.5 stream `invoker_did`, recorded as the event-log leaf's
     /// `actor_did`.
     actor_did: String,
@@ -268,18 +270,14 @@ pub(crate) struct ActorOutletInvokedEventSink {
 }
 
 impl ActorOutletInvokedEventSink {
-    /// Wrap a `Weak` supervisor reference + the hosting context's event-log key + the
+    /// Wrap a `Weak` supervisor reference + the hosting context's actor key + the
     /// stream `invoker_did` as the durable close-event sink, capturing the
     /// current runtime handle. Sole non-test constructor: the streaming open
     /// orchestrator (`Supervisor::open_outlet_stream`).
-    pub(crate) fn new(
-        supervisor: Weak<Supervisor>,
-        context_id_bytes: [u8; 32],
-        actor_did: String,
-    ) -> Self {
+    pub(crate) fn new(supervisor: Weak<Supervisor>, context_id: String, actor_did: String) -> Self {
         Self {
             supervisor,
-            context_id_bytes,
+            context_id,
             actor_did,
             runtime: tokio::runtime::Handle::current(),
         }
@@ -288,7 +286,7 @@ impl ActorOutletInvokedEventSink {
 
 impl OutletInvokedEventSink for ActorOutletInvokedEventSink {
     fn record(&self, event: OutletInvokedEvent) {
-        let context_id_bytes = self.context_id_bytes;
+        let context_id = self.context_id.clone();
         let actor_did = self.actor_did.clone();
         spawn_supervisor_op(
             &self.supervisor,
@@ -296,12 +294,16 @@ impl OutletInvokedEventSink for ActorOutletInvokedEventSink {
             SinkHandoff::OutletInvokedEventAppend,
             move |supervisor| async move {
                 if let Err(e) = supervisor
-                    .append_streaming_outlet_invoked_event(context_id_bytes, event, actor_did)
+                    .enqueue_streaming_outlet_invoked_unit(&context_id, event, actor_did)
                     .await
                 {
-                    // Best-effort: a torn-down context or persist failure leaves the
-                    // operator log the only record of the durable-append failure.
-                    tracing::warn!("streaming OutletInvokedEvent durable append failed: {e}");
+                    crate::metrics::record_log_unit_undelivered();
+                    tracing::error!(
+                        context_id = %context_id,
+                        error = %e,
+                        "streaming OutletInvokedEvent was not queued; the context's log lacks \
+                         this stream's close record (spec 17 §17.3)"
+                    );
                 }
             },
         );

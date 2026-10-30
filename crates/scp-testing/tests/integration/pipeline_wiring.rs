@@ -203,6 +203,8 @@ const PSEUDONYM_ROTATION_SRC: &str =
 // the PUSH-013 push routing-ID query (§10.7.1).
 const HANDLERS_PUSH_SRC: &str =
     include_str!("../../../../crates/scp-runtime/src/context/actor/handlers/push.rs");
+const HANDLERS_LOG_UNIT_SRC: &str =
+    include_str!("../../../../crates/scp-runtime/src/context/actor/handlers/log_unit.rs");
 // Push helpers source — owns `push_helpers::wake_target`, the push-wake pull
 // target (ADR-029 §2). Pinned by `push_wake_targets_reach_push_helpers`.
 const PUSH_HELPERS_SRC: &str =
@@ -1520,6 +1522,92 @@ fn push_routing_ids_reach_push_helpers_through_the_actor_mailbox() {
             "push_helpers::push_routes(state)"
         ),
         "handlers::push::dispatch must answer PushCommand::Routes from push_helpers::push_routes"
+    );
+}
+
+// Spec 17 §17.3 "Event log write failures": a writer outside a context's actor
+// (the streaming close sink, the cross-context bridge, the streaming saga's
+// seal task and both of its recovery paths) queues its leaves as a pending log
+// unit through `Supervisor::send_log_unit` → `dispatch_log_unit_command` →
+// actor mailbox → `handlers::log_unit::dispatch`, which enqueues them in a
+// persisted commit.
+#[test]
+fn log_unit_writers_reach_the_pending_queue_through_the_actor_mailbox() {
+    assert!(
+        fn_body_contains(
+            SUPERVISOR_SRC,
+            "send_log_unit",
+            "dispatch_log_unit_command("
+        ),
+        "Supervisor::send_log_unit must send through dispatch_log_unit_command"
+    );
+    assert!(
+        fn_body_contains(
+            SUPERVISOR_SRC,
+            "dispatch_log_unit_command",
+            "dispatch_via_mailbox(&actor, ContextCommand::LogUnit(cmd))"
+        ),
+        "dispatch_log_unit_command must send ContextCommand::LogUnit through the actor mailbox"
+    );
+    assert!(
+        fn_body_contains(
+            ACTOR_MOD_SRC,
+            "dispatch_state",
+            "handlers::log_unit::dispatch("
+        ),
+        "the actor's dispatch_state must route ContextCommand::LogUnit to handlers::log_unit::dispatch"
+    );
+    assert!(
+        fn_body_contains(
+            HANDLERS_LOG_UNIT_SRC,
+            "enqueue",
+            "enqueue_counted_log_unit("
+        ) && fn_body_contains(HANDLERS_LOG_UNIT_SRC, "dispatch", "enqueue(cell, deps"),
+        "handlers::log_unit::dispatch must enqueue the leaves as a pending log unit"
+    );
+    assert!(
+        fn_body_contains(HANDLERS_LOG_UNIT_SRC, "enqueue", "commit_class_s_restore("),
+        "handlers::log_unit::dispatch must enqueue inside a persisted Class-S commit"
+    );
+    assert!(
+        fn_body_contains(
+            SUPERVISOR_SRC,
+            "enqueue_streaming_outlet_invoked_unit",
+            "self.send_log_unit("
+        ),
+        "the streaming close record must be queued through send_log_unit"
+    );
+    for writer in ["send_streaming_saga_a_unit", "send_cross_context_a_unit"] {
+        assert!(
+            fn_body_contains(OUTLETS_INVOKE_SRC, writer, ".send_log_unit("),
+            "{writer} must queue its leaf through send_log_unit"
+        );
+    }
+    assert!(
+        fn_body_contains(
+            OUTLETS_INVOKE_SRC,
+            "run_streaming_saga_seal_task",
+            "send_streaming_saga_a_unit("
+        ),
+        "run_streaming_saga_seal_task must queue the A-side leaf through send_streaming_saga_a_unit"
+    );
+    for caller in [
+        "recover_streaming_saga_truncated_close",
+        "recover_streaming_committing_entry",
+        "complete_unsettled_streaming_saga",
+    ] {
+        assert!(
+            fn_body_contains(SUPERVISOR_SRC, caller, "send_streaming_saga_a_unit("),
+            "{caller} must queue the A-side leaf through send_streaming_saga_a_unit"
+        );
+    }
+    assert!(
+        fn_body_contains(
+            OUTLETS_INVOKE_SRC,
+            "invoke_outlet_cross_context",
+            "send_cross_context_a_unit("
+        ),
+        "the cross-context bridge's close must queue A's record through send_cross_context_a_unit"
     );
 }
 
@@ -7771,14 +7859,14 @@ fn uniffi_saga_export_wires_binding_chokepoint_and_producer() {
 #[test]
 fn ac8_streaming_saga_seal_commits_once_no_per_chunk_2pc() {
     // Bound the seal-task function body: from its `fn` to the next item
-    // (`record_streaming_saga_a_event`, which immediately follows it).
+    // (`send_streaming_saga_a_unit`, which immediately follows it).
     let fn_start = OUTLETS_INVOKE_SRC
         .find("pub(crate) async fn run_streaming_saga_seal_task")
         .expect("run_streaming_saga_seal_task must exist in invoke.rs");
     let after_fn = &OUTLETS_INVOKE_SRC[fn_start..];
     let fn_len = after_fn
-        .find("async fn record_streaming_saga_a_event")
-        .expect("record_streaming_saga_a_event follows the seal task");
+        .find("async fn send_streaming_saga_a_unit")
+        .expect("send_streaming_saga_a_unit follows the seal task");
     // Strip `//` line comments (doc/rationale references to the message names are
     // not code) before matching — mirrors the gating gate's comment-stripping, so
     // the guard asserts on the actual dispatch code, not prose.
@@ -9794,50 +9882,8 @@ const EVENT_LOG_APPEND_ALLOWLIST: &[(&str, &str, &str)] = &[
         "test_append_event_log",
         "a testing-feature seam",
     ),
-    // The streaming saga's A-side record.
-    (
-        "scp-runtime/src/context/outlets/invoke.rs",
-        "record_streaming_saga_a_event",
-        "spec 06 §6.2.4",
-    ),
-    // Callers of the free wrappers on `EVENT_LOG_APPEND_FREE_FNS`.
-    (
-        "scp-runtime/src/context/outlets/invoke.rs",
-        "run_cross_context_bridge",
-        "through `record_cross_context_a_event`, spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/outlets/invoke.rs",
-        "run_streaming_saga_seal_task",
-        "through `record_streaming_saga_a_event`, spec 06 §6.2.4",
-    ),
-    (
-        "scp-runtime/src/context/supervisor/supervisor.rs",
-        "complete_unsettled_streaming_saga",
-        "through `record_streaming_saga_a_event`, spec 06 §6.2.4",
-    ),
-    (
-        "scp-runtime/src/context/supervisor/supervisor.rs",
-        "recover_streaming_saga_truncated_close",
-        "through `record_streaming_saga_a_event`, spec 06 §6.2.4",
-    ),
     // Leaves after a step, written memory-first; spec 17 §17.3 moves each
     // into a pending log unit.
-    (
-        "scp-runtime/src/context/supervisor/supervisor.rs",
-        "append_streaming_outlet_invoked_event",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/outlets/stream_settlement_adapter.rs",
-        "record",
-        "forwards to `append_streaming_outlet_invoked_event`",
-    ),
-    (
-        "scp-runtime/src/context/outlets/invoke.rs",
-        "record_cross_context_a_event",
-        "spec 17 §17.3, memory-first after the step",
-    ),
     (
         "scp-runtime/src/context/ttl_close_helpers.rs",
         "extend_ttl_deadline_and_record",

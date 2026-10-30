@@ -2120,39 +2120,46 @@ fn stream_settle_check_witness(
 ) -> Outcome<()> {
     use crate::context::actor::commands::StreamWitnessRecoveryStatus;
     let generation = cell.generation;
-    let status = match cell.class_s.xctx_committed_stream_outputs.get(saga_id) {
+    let Some(committed) = cell.class_s.xctx_committed_stream_outputs.get(saga_id) else {
         // Witness absent — seal never landed (or was rolled back).
-        None => StreamWitnessRecoveryStatus::Absent,
+        let _ = reply.send(Ok(StreamWitnessRecoveryStatus::Absent));
+        return Outcome::ok(());
+    };
+    // Both witness-present arms carry the A-side dual-log leaf inputs
+    // (SCP-OUT-046 #135): the seal task queues that leaf through A's actor, and
+    // a crash or an unreachable A can leave it unqueued whether or not the
+    // money moved, so recovery re-sends it in either case (spec 17 §17.3). A
+    // receipt that will not re-serialize fails the read, because recovery
+    // must not resolve a saga whose A-side leaf it cannot build.
+    let receipt = match jcs_stream_receipt_bytes(&committed.receipt) {
+        Ok(receipt) => receipt,
+        Err(err) => {
+            let sketch = outcome_error_sketch(&err);
+            let _ = reply.send(Err(err));
+            return Outcome::err(sketch);
+        }
+    };
+    let a_event = Box::new(CommitBStreamSettleOutcome {
+        receipt,
+        stream_manifest_hash: committed.stream_manifest_hash,
+        billed: committed.billed,
+        refund: committed.refund,
+        billed_count: committed.billed_count,
+        stream_chunk_count: committed.stream_chunk_count,
+        outlet_invoked_event_id: committed.outlet_invoked_event_id.clone(),
+        settlement: None,
+        generation,
+    });
+    let status = if committed.settled {
         // Witness present + settled — the money already moved on the first settle.
-        Some(committed) if committed.settled => StreamWitnessRecoveryStatus::Settled,
-        // Witness present + UNSETTLED — the money move never ran; rebuild it (money
-        // ops need no signing key) plus the A-side dual-log leaf inputs.
-        Some(committed) => {
-            let settlement = Box::new(rebuild_stream_settlement(committed));
-            // Reconstruct the A-side dual-log leaf inputs (SCP-OUT-046 #135) so
-            // recovery can complete the best-effort `CrossContextOutletInvoked`
-            // leaf the seal task records BEFORE the money move (and may miss on a
-            // crash). A receipt that will not re-serialize simply omits the leaf.
-            let a_event = jcs_stream_receipt_bytes(&committed.receipt)
-                .ok()
-                .map(|receipt| {
-                    Box::new(CommitBStreamSettleOutcome {
-                        receipt,
-                        stream_manifest_hash: committed.stream_manifest_hash,
-                        billed: committed.billed,
-                        refund: committed.refund,
-                        billed_count: committed.billed_count,
-                        stream_chunk_count: committed.stream_chunk_count,
-                        outlet_invoked_event_id: committed.outlet_invoked_event_id.clone(),
-                        settlement: None,
-                        generation,
-                    })
-                });
-            StreamWitnessRecoveryStatus::Unsettled {
-                generation,
-                settlement,
-                a_event,
-            }
+        StreamWitnessRecoveryStatus::Settled { a_event }
+    } else {
+        // Witness present + UNSETTLED — the money move never ran; rebuild it
+        // (money ops need no signing key).
+        StreamWitnessRecoveryStatus::Unsettled {
+            generation,
+            settlement: Box::new(rebuild_stream_settlement(committed)),
+            a_event,
         }
     };
     let _ = reply.send(Ok(status));

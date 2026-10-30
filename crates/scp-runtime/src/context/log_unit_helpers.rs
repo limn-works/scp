@@ -146,6 +146,52 @@ pub async fn queue_log_unit(
     .await
 }
 
+/// Returns the leaves of `leaves` that neither the context's log nor its
+/// queue already holds. A leaf matches a log entry identical in event type,
+/// actor, payload and timestamp, or an equal queued leaf. A re-send after an
+/// unanswered `LogUnitCommand` filters through it, so the record lands once
+/// (spec 17 §17.3 "Event log write failures").
+///
+/// # Errors
+///
+/// Returns [`ContextError::EventLogFailed`] when the context has no event log,
+/// or the provider's error when the log cannot be read: an unread log cannot
+/// prove the leaf absent, so the caller retries instead of risking a second
+/// copy.
+pub fn leaves_absent_from_log_and_queue(
+    cell: &ClassSCell,
+    deps: &ActorDeps,
+    context_id_bytes: &[u8; 32],
+    leaves: Vec<LeafSpec>,
+) -> Result<Vec<LeafSpec>, ContextError> {
+    let entries = deps
+        .event_log
+        .event_log_entries(context_id_bytes)?
+        .ok_or_else(|| {
+            ContextError::EventLogFailed(format!(
+                "no event log for context {}; a re-sent leaf cannot be proven absent",
+                hex::encode(context_id_bytes)
+            ))
+        })?;
+    Ok(leaves
+        .into_iter()
+        .filter(|leaf| {
+            let in_log = entries.iter().any(|event| {
+                event.event_type == leaf.event_type()
+                    && event.actor_did.0 == leaf.actor_did()
+                    && event.payload == *leaf.payload()
+                    && event.timestamp == leaf.timestamp_secs()
+            });
+            let queued = cell
+                .class_s
+                .pending_log_units
+                .iter()
+                .any(|unit| unit.leaves.iter().any(|q| q == leaf));
+            !in_log && !queued
+        })
+        .collect())
+}
+
 /// Plans one entry of a pending log unit before the operation's irreversible
 /// step, checking it against the append's payload rules (spec 17 §17.3 "Event
 /// log write failures"), so a payload that breaks them refuses the operation
@@ -1027,7 +1073,6 @@ mod tests {
             matches!(marker, Err(ContextError::EventLogFailed(_))),
             "{marker:?}"
         );
-        record_both_a_side_events(&deps, &ctx, ctx_id_bytes).await;
         assert_eq!(
             log_len(&deps, &ctx_id_bytes),
             0,
@@ -1068,56 +1113,6 @@ mod tests {
             !matches!(mutation, Err(ContextError::EventLogFailed(_))),
             "no log fault refuses the mutation: {mutation:?}"
         );
-    }
-
-    /// Runs both cross-context A-side recorders for `ctx`.
-    async fn record_both_a_side_events(
-        deps: &crate::context::actor::deps::ActorDeps,
-        ctx: &str,
-        ctx_id_bytes: [u8; 32],
-    ) {
-        crate::context::outlets::invoke::record_cross_context_a_event(
-            &deps.event_log,
-            ctx,
-            &scp_did::DID("did:dht:z6MkInvoker".to_owned()),
-            [1u8; 16],
-            &"outlet-x".to_owned(),
-            "0".repeat(64),
-            5,
-            &crate::context::outlets::invoke::StreamTerminalSummary::default(),
-            &[],
-            1_700_000_004,
-        )
-        .await;
-        let receipt =
-            scp_protocol::context::outlets::cross_context_saga::CrossContextOutletStreamReceipt {
-                caller_context_id: ctx_id_bytes,
-                target_context_id: [0x63; 32],
-                caller_did: "did:dht:z6MkCaller".to_owned(),
-                nonce: [7; 16],
-                outlet_registration_id: "outlet-x".to_owned(),
-                stream_manifest_hash: [0; 32],
-                outlet_invoked_event_id: "evt-b".to_owned(),
-                chain_depth: 1,
-                timestamp_ms: 1_700_000_005_000,
-                signature: [0; 64],
-            };
-        crate::context::outlets::invoke::record_streaming_saga_a_event(
-            &deps.event_log,
-            &crate::context::supervisor::saga_journal::SagaId("saga-trace".to_owned()),
-            &crate::context::actor::commands::CommitBStreamSettleOutcome {
-                receipt: serde_json::to_vec(&receipt).expect("receipt json"),
-                stream_manifest_hash: [0; 32],
-                billed: scp_protocol::economy::types::Amount(0),
-                refund: scp_protocol::economy::types::Amount(0),
-                billed_count: 0,
-                stream_chunk_count: 0,
-                outlet_invoked_event_id: "evt-b".to_owned(),
-                settlement: None,
-                generation: 1,
-            },
-        )
-        .await;
     }
 
     /// A unit queued ahead of the log at `base_seq`, and the cell holding it.
