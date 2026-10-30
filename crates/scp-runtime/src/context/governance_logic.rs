@@ -1128,7 +1128,6 @@ mod convergence_tests {
         let log = MerkleEventLogProvider::new();
         log.init_event_log(&storage_key).await.expect("init log");
         log.append_context_event_with_payload(
-            crate::context::builder::AppendMode::AfterSideEffect,
             &storage_key,
             EventType::GovernanceAction,
             ADMIN,

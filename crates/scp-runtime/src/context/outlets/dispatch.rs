@@ -3432,7 +3432,7 @@ async fn run_stream_pump_v2(
     // divergence is emitted as `AuditAnomaly::ChunksBilledSelfMismatch` on the
     // event itself (never dropped). The pump does NOT retain the emitted
     // payload set, so the full §5.4.5:566 manifest re-derivation
-    // (`verify_outlet_invoked_event_manifest` / `append_outlet_invoked_verified`)
+    // (`verify_outlet_invoked_event_manifest` / `plan_outlet_invoked_verified_leaf`)
     // cannot run here — it applies only where the chunk sequence IS retained:
     // the Sequence path (cross-context reassembly / import, slice 3). Re-running
     // an equality against a commitment built from THIS same summary would be

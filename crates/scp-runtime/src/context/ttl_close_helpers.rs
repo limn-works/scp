@@ -35,7 +35,6 @@
 
 use scp_did::DID;
 
-use crate::context::builder::AppendMode;
 use scp_protocol::context::ContextError;
 use scp_protocol::context::MemoryScope;
 use scp_protocol::context::membership::ContextEvent;
@@ -425,7 +424,7 @@ pub async fn propose_ttl_extension(
 /// `proposal_id` (this bilateral activation has no governance proposal id).
 ///
 /// The reset leaf comes before any side effect of the reset, so it is
-/// appended fail-closed ([`AppendMode::FailClosed`]): the deadline moves and
+/// appended fail-closed, before the step: the deadline moves and
 /// the consent tally clears only after the leaf is stored (spec section 17.3,
 /// "Event log write failures").
 ///
@@ -592,7 +591,6 @@ pub async fn extend_ttl_deadline_and_record(
     )?;
     event_log
         .append_context_event_with_payload(
-            AppendMode::FailClosed,
             context_id_bytes,
             scp_event_log::EventType::TtlExtended,
             actor_did,

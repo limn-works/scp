@@ -267,11 +267,9 @@ pub fn plan_membership_change_leaf(
 }
 
 /// Plans a `RoleAssigned` leaf for `subject_did` taking `role`. It is the one
-/// encoder for that leaf: [`ContextEventLogProvider::append_role_assigned_leaf`]
-/// appends the payload it plans (spec 17 §17.3 "Event log write failures").
-///
-/// [`ContextEventLogProvider::append_role_assigned_leaf`]:
-///     crate::context::builder::ContextEventLogProvider::append_role_assigned_leaf
+/// encoder for that leaf: the step that assigns the role queues the leaf it
+/// plans, and only the pending-unit drain writes it (spec 17 §17.3 "Event log
+/// write failures").
 ///
 /// # Errors
 ///
@@ -320,12 +318,10 @@ pub fn plan_ttl_extended_leaf(
 
 /// Plans an `OutletInvoked` leaf after the FULL §5.4.5:566 manifest check
 /// over the `reassembled` chunk sequence. It is the one encoder for that leaf:
-/// [`ContextEventLogProvider::append_outlet_invoked_verified`] appends the
-/// payload it plans (spec 17 §17.3 "Event log write failures"). The leaf's own
+/// the receiving context queues the leaf it plans through
+/// `LogUnitRequest::VerifiedOutletInvoked`, and only the pending-unit drain
+/// writes it (spec 17 §17.3 "Event log write failures"). The leaf's own
 /// construction then runs the event-local backstop.
-///
-/// [`ContextEventLogProvider::append_outlet_invoked_verified`]:
-///     crate::context::builder::ContextEventLogProvider::append_outlet_invoked_verified
 ///
 /// # Errors
 ///
@@ -1010,30 +1006,192 @@ mod tests {
         );
     }
 
-    /// Spec 17 §17.3 "Event log write failures": after a failed put leaves a
-    /// unit queued, every writer that applies its entry in memory first is
-    /// refused until the drain writes the queue, so none takes the unit's
-    /// reserved slot. The drain then writes the unit with no log fault, and
-    /// the context keeps accepting mutations.
+    /// An active broadcast cell whose ceiling holds `MemberBan` and
+    /// `ContextClose`, with `admin` and `target` as members and `author`
+    /// registered.
+    fn fence_cell(ctx_id_bytes: [u8; 32], admin: &str, target: &str, author: &str) -> ClassSCell {
+        use scp_protocol::context::broadcast::{BroadcastAdmission, BroadcastContext};
+        use scp_protocol::context::roles::{Capability, CapabilityCeiling, ContextRoleState};
+        use scp_protocol::context::{ContextMode, ContextParams, ContextState};
+
+        let did = |s: &str| scp_did::DID(s.to_owned());
+        let ctx = hex::encode(ctx_id_bytes);
+        let mut state =
+            PerContextState::new_for_test_broadcast(ctx_id_bytes, 1_700_000_000, did(admin));
+        let ceiling = [
+            Capability::MessagesRead,
+            Capability::MessagesWrite,
+            Capability::MemberBan,
+            Capability::ContextClose,
+        ];
+        state.handle = crate::context::ContextHandle::new(
+            ctx.clone(),
+            ContextParams {
+                ceiling: ceiling.to_vec(),
+                ttl: Some(std::time::Duration::from_secs(3_600)),
+                ..ContextParams::default()
+            },
+        );
+        state
+            .handle
+            .transition_to(&ContextState::Active)
+            .expect("activate");
+        state.role_state = ContextRoleState::new(
+            ctx.clone(),
+            admin,
+            CapabilityCeiling::new(ceiling),
+            Vec::new(),
+            &scp_clock::SystemClock,
+        )
+        .expect("role state");
+        state.role_state.members.insert(target.to_owned());
+        state
+            .membership
+            .add_member(did(admin), "admin".to_owned(), vec![]);
+        state
+            .membership
+            .add_member(did(target), "member".to_owned(), vec![]);
+        let mut bc = BroadcastContext::new(ctx, &ContextMode::Broadcast, BroadcastAdmission::Open)
+            .expect("broadcast context");
+        bc.add_author(author).expect("add author");
+        state.broadcast_context = Some(bc);
+        ClassSCell::new(state)
+    }
+
+    const FENCE_ADMIN: &str = "did:dht:z6MkFenceAdmin";
+    const FENCE_TARGET: &str = "did:dht:z6MkFenceTarget";
+    const FENCE_AUTHOR: &str = "did:dht:z6MkFenceAuthor";
+    const FENCE_SUBSCRIBER: &str = "did:dht:z6MkFenceSubscriber";
+
+    /// The governance per-action, broadcast roster, and leave sites of
+    /// `fence_refuses_no_after_step_write`, run in order, each with its result.
+    async fn fence_member_sites(
+        cell: &mut ClassSCell,
+        deps: &crate::context::actor::deps::ActorDeps,
+        ctx: &str,
+        handle: &crate::context::ContextHandle,
+    ) -> Vec<(&'static str, Result<(), ContextError>)> {
+        use scp_protocol::context::roles::Capability;
+
+        let did = |s: &str| scp_did::DID(s.to_owned());
+        let suspend = crate::context::governance_helpers::execute_suspend_member(
+            cell,
+            deps,
+            ctx,
+            &did(FENCE_TARGET),
+            &[Capability::MessagesWrite],
+            crate::context::governance_helpers::CommitMeta {
+                pid: [0x3C; 32],
+                actor_did: FENCE_ADMIN,
+                timestamp_secs: 1_700_000_010,
+            },
+        )
+        .await;
+        let block = crate::context::broadcast_helpers::block_broadcast_subscriber(
+            cell,
+            deps,
+            ctx,
+            &did(FENCE_AUTHOR),
+            &did(FENCE_SUBSCRIBER),
+        )
+        .await
+        .map(|_| ());
+        let leave = crate::context::lifecycle_helpers::leave_context(
+            cell,
+            deps,
+            handle,
+            &did(FENCE_TARGET),
+            &did(FENCE_TARGET),
+        )
+        .await;
+        vec![("suspend", suspend), ("block", block), ("leave", leave)]
+    }
+
+    /// The typed log-unit command, saga divergence marker, and close sites of
+    /// `fence_refuses_no_after_step_write`, run in order, each with its result
+    /// and, for a mailbox command, its reply. The close runs last because it
+    /// ends the context's mutations.
+    async fn fence_command_sites(
+        cell: &mut ClassSCell,
+        deps: &crate::context::actor::deps::ActorDeps,
+        handle: &crate::context::ContextHandle,
+    ) -> Vec<(&'static str, Result<(), ContextError>)> {
+        use crate::context::actor::commands::{
+            LogUnitCommand, LogUnitRequest, SagaPhaseMessage, UnitDedup,
+        };
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let unit = crate::context::actor::handlers::log_unit::dispatch(
+            cell,
+            deps,
+            LogUnitCommand::Enqueue {
+                request: LogUnitRequest::Leaves(vec![tagged_leaf(2)]),
+                dedup: UnitDedup::None,
+                reply: tx,
+            },
+        )
+        .await
+        .result;
+        let unit_reply = rx.await.expect("the log-unit command replies");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let marker = crate::context::actor::handlers::saga::dispatch(
+            cell,
+            deps,
+            SagaPhaseMessage::EmitDivergenceMarker {
+                saga_id: crate::context::supervisor::saga_journal::SagaId("saga-fence".to_owned()),
+                nonce: [0xAB; 16],
+                committed_side:
+                    scp_protocol::context::outlets::cross_context_saga::CommittedSide::Target,
+                committed_event_id: "evt-fence".to_owned(),
+                committed_timestamp_secs: 1_700_000_020,
+                signer: crate::context::actor::signer::CommandSigner::local_ed25519(
+                    ed25519_dalek::SigningKey::from_bytes(&[0x99; 32]),
+                ),
+                reply: tx,
+            },
+        )
+        .await
+        .result;
+        let marker_reply = rx.await.expect("the marker replies");
+        let close = crate::context::lifecycle_helpers::close_context(
+            cell,
+            deps,
+            handle,
+            &scp_did::DID(FENCE_ADMIN.to_owned()),
+        )
+        .await
+        .map(|_| ());
+        vec![
+            ("log-unit command", unit),
+            ("log-unit command reply", unit_reply),
+            ("divergence marker", marker),
+            ("divergence marker reply", marker_reply),
+            ("close", close),
+        ]
+    }
+
+    /// Spec 17 §17.3 "Event log write failures": no write path survives that
+    /// writes a leaf after its step, so a unit queued ahead of the log refuses
+    /// no step. With one unit queued and the log refusing every entry write,
+    /// one site from every family of after-step records runs: a governance
+    /// per-action record, a broadcast roster record, a leave, the typed
+    /// log-unit command the A-side records ride, a saga divergence marker, and
+    /// a close. None fails; each queues its leaves behind the unit in the
+    /// persist that recorded its step, and the log is untouched. Once the store
+    /// heals, one drain writes every leaf in FIFO order.
     #[tokio::test]
-    async fn after_side_effect_writers_wait_for_the_drain_after_a_failed_put() {
-        use crate::context::builder::AppendMode;
+    async fn fence_refuses_no_after_step_write() {
+        use super::test_support::{deps_over_faulty_log, queued_unit_types};
 
         let ctx_id_bytes = [0x62u8; 32];
         let ctx = hex::encode(ctx_id_bytes);
-        let (log, faulty) = faulty_merkle_log();
-        let deps = deps_with(OWNER, None, Box::new(log)).await;
-        deps.event_log
-            .init_event_log(&ctx_id_bytes)
-            .await
-            .expect("init event log");
-        let mut cell = ClassSCell::new(PerContextState::new_for_test_encrypted(
-            ctx_id_bytes,
-            1_700_000_000,
-            scp_did::DID(OWNER.to_owned()),
-        ));
+        let (deps, faulty, snapshots) = deps_over_faulty_log(FENCE_ADMIN, &ctx).await;
 
-        // A failed put leaves one unit queued at base_seq 0.
+        let mut cell = fence_cell(ctx_id_bytes, FENCE_ADMIN, FENCE_TARGET, FENCE_AUTHOR);
+        let handle = cell.handle.clone();
+
+        // One unit queued at base_seq 0 whose write the log refuses, and the
+        // log refusing every entry write from here until it heals.
         fail_log_entry_writes(&faulty, &ctx_id_bytes);
         cell.commit_class_s_keep(&deps, &ctx, |mut v| {
             v.enqueue_log_unit(vec![tagged_leaf(1)]);
@@ -1045,79 +1203,58 @@ mod tests {
             drain_pending_log_units(&mut cell, &deps, &ctx)
                 .await
                 .is_err(),
-            "the log rejects the unit's write"
+            "the log refuses the unit's write"
         );
-        faulty.clear_fail();
 
-        // Every writer that applies its entry in memory first: the provider
-        // primitive (the supervisor's same-context streaming close), the
-        // divergence marker's entry, and the two cross-context A-side
-        // recorders.
-        let direct = deps
-            .event_log
-            .append_event_after_side_effect(
-                &ctx_id_bytes,
-                EventType::MemberJoined,
-                "",
-                tagged_payload(2),
-                1_700_000_002,
-            )
-            .await;
-        assert!(direct.is_err(), "{direct:?}");
-        let marker = deps
-            .event_log
-            .append_context_event_with_payload(
-                AppendMode::AfterSideEffect,
-                &ctx_id_bytes,
-                EventType::CrossContextDivergenceMarker,
-                scp_event_log::system_actors::SYSTEM_SAGA_ACTOR,
-                tagged_payload(3),
-                1_700_000_003,
-            )
-            .await;
-        assert!(
-            matches!(marker, Err(ContextError::EventLogFailed(_))),
-            "{marker:?}"
+        let mut results = fence_member_sites(&mut cell, &deps, &ctx, &handle).await;
+        results.extend(fence_command_sites(&mut cell, &deps, &handle).await);
+        assert_eq!(results.len(), 8, "every site ran");
+        for (site, result) in &results {
+            assert!(
+                result.is_ok(),
+                "{site} must land; the queued unit refuses no step: {result:?}"
+            );
+        }
+
+        let expected = vec![
+            vec![EventType::MemberJoined],
+            vec![EventType::MemberSuspended],
+            vec![EventType::MemberBlocked, EventType::KeyEpochAdvance],
+            vec![EventType::MemberLeft],
+            vec![EventType::MemberJoined],
+            vec![EventType::CrossContextDivergenceMarker],
+            vec![EventType::ContextClosing],
+        ];
+        assert_eq!(
+            queued_unit_types(&cell.class_s.pending_log_units),
+            expected,
+            "every site queued its leaves behind the unit, in order"
         );
         assert_eq!(
-            log_len(&deps, &ctx_id_bytes),
-            0,
-            "no writer took the queued unit's slot"
+            snapshots.persisted_unit_types(&ctx).await,
+            expected,
+            "every unit is in the persist that recorded its step"
         );
+        assert_eq!(log_len(&deps, &ctx_id_bytes), 0, "the log is untouched");
 
-        // The drain writes the unit where it was reserved, with no fault.
+        // The store heals; one drain writes every leaf in FIFO order.
+        faulty.clear_fail();
         drain_pending_log_units(&mut cell, &deps, &ctx)
             .await
-            .expect("the drain writes the unit");
+            .expect("the drain writes the queue");
         assert!(cell.class_s.pending_log_units.is_empty());
-        assert!(cell.class_s.log_fault.is_none(), "no log fault is set");
-        assert_eq!(log_len(&deps, &ctx_id_bytes), 1);
-
-        // The context keeps accepting mutations and appends.
-        deps.event_log
-            .append_event_after_side_effect(
-                &ctx_id_bytes,
-                EventType::MemberJoined,
-                "",
-                tagged_payload(2),
-                1_700_000_002,
-            )
-            .await
-            .expect("the append lands after the drain");
-        assert_eq!(log_len(&deps, &ctx_id_bytes), 2);
-        let mutation = crate::context::governance_helpers::execute_governance_action(
-            &mut cell,
-            &deps,
-            &ctx,
-            &[0u8; 32],
-            Some(&scp_did::DID(OWNER.to_owned())),
-            None,
-            None,
-        )
-        .await;
-        assert!(
-            !matches!(mutation, Err(ContextError::EventLogFailed(_))),
-            "no log fault refuses the mutation: {mutation:?}"
+        let written: Vec<EventType> = deps
+            .event_log
+            .event_log_entries(&ctx_id_bytes)
+            .expect("the log reads")
+            .expect("the log exists")
+            .iter()
+            .map(|entry| entry.event_type)
+            .collect();
+        assert_eq!(
+            written,
+            expected.concat(),
+            "the drain writes the queued leaves oldest first"
         );
     }
 
@@ -1324,14 +1461,17 @@ mod tests {
         assert_eq!(valid.len(), 1);
     }
 
-    /// Spec 17 §17.3 "Event log write failures": each subject-bearing planner
-    /// plans the leaf its builder wrapper appends, byte for byte, so a queued
-    /// leaf and an appended one hash the same.
+    /// Spec 17 §17.3 "Event log write failures": the membership planner plans
+    /// the leaf its fail-closed builder wrapper appends, byte for byte, so a
+    /// queued leaf and an appended one hash the same; the role and TTL
+    /// planners, which have no wrapper, encode exactly their typed payload.
     #[tokio::test]
     async fn planners_match_their_builder_wrappers() {
-        use crate::context::builder::{AppendMode, ContextEventLogProvider};
+        use crate::context::builder::ContextEventLogProvider;
         use crate::context::providers::event_log::MerkleEventLogProvider;
-        use scp_event_log::payload::{MembershipChangePayload, TtlExtendedPayload};
+        use scp_event_log::payload::{
+            MembershipChangePayload, RoleAssignedPayload, TtlExtendedPayload,
+        };
 
         let provider = MerkleEventLogProvider::new();
         let ctx_id = [0x7Au8; 32];
@@ -1340,52 +1480,49 @@ mod tests {
             subject_did: "did:example:subject".to_owned(),
             role_name: "member".to_owned(),
         };
-        let planned = [
-            super::plan_membership_change_leaf(
-                EventType::MemberJoined,
-                "did:example:admin",
-                &change,
-                1_700_000_001,
-            )
-            .expect("plans"),
-            super::plan_role_assigned_leaf(
-                "did:example:admin",
-                "did:example:subject",
-                "admin",
-                1_700_000_002,
-            )
-            .expect("plans"),
-        ];
+        let planned = super::plan_membership_change_leaf(
+            EventType::MemberJoined,
+            "did:example:admin",
+            &change,
+            1_700_000_001,
+        )
+        .expect("plans");
         provider
             .append_membership_change_leaf(
-                AppendMode::FailClosed,
                 &ctx_id,
                 EventType::MemberJoined,
                 "did:example:admin",
                 &change,
                 1_700_000_001,
-            )
-            .await
-            .expect("appends");
-        provider
-            .append_role_assigned_leaf(
-                AppendMode::FailClosed,
-                &ctx_id,
-                "did:example:admin",
-                "did:example:subject",
-                "admin",
-                1_700_000_002,
             )
             .await
             .expect("appends");
         let appended = provider.entries(&ctx_id).expect("the log exists");
-        assert_eq!(appended.len(), planned.len());
-        for (leaf, event) in planned.iter().zip(&appended) {
-            assert_eq!(leaf.event_type(), event.event_type);
-            assert_eq!(leaf.actor_did(), event.actor_did.as_ref());
-            assert_eq!(leaf.payload().data, event.payload.data);
-            assert_eq!(leaf.timestamp_secs(), event.timestamp);
-        }
+        assert_eq!(appended.len(), 1);
+        assert_eq!(planned.event_type(), appended[0].event_type);
+        assert_eq!(planned.actor_did(), appended[0].actor_did.as_ref());
+        assert_eq!(planned.payload().data, appended[0].payload.data);
+        assert_eq!(planned.timestamp_secs(), appended[0].timestamp);
+
+        let role = super::plan_role_assigned_leaf(
+            "did:example:admin",
+            "did:example:subject",
+            "admin",
+            1_700_000_002,
+        )
+        .expect("plans");
+        assert_eq!(role.event_type(), EventType::RoleAssigned);
+        assert_eq!(role.actor_did(), "did:example:admin");
+        assert_eq!(role.timestamp_secs(), 1_700_000_002);
+        assert_eq!(
+            role.payload().data,
+            scp_event_log::payload::encode_payload(&RoleAssignedPayload {
+                subject_did: "did:example:subject".to_owned(),
+                role: "admin".to_owned(),
+            })
+            .expect("encodes")
+            .data
+        );
 
         let extension = TtlExtendedPayload {
             old_deadline_unix: 10,
