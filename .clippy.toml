@@ -12,6 +12,10 @@ stack-size-threshold = 900000
 # to create_context/join_context pushed test futures to 16416 bytes. Raise the
 # threshold slightly to accommodate. Production code is unaffected.
 future-size-threshold = 16512
+# `expect` in a `#[cfg(test)]` item or a `#[test]` function names the broken
+# fixture when it panics. The workspace denies `expect_used`; this admits it in
+# tests only, so no test module carries its own `#[allow(clippy::expect_used)]`.
+allow-expect-in-tests = true
 
 # ----- Disallowed methods -----
 # now_secs/now_millis are private to scp-clock — the compiler enforces

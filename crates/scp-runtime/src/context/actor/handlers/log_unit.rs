@@ -102,7 +102,6 @@ async fn enqueue(
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use scp_event_log::{EventPayload, EventType};
     use scp_protocol::context::ContextError;

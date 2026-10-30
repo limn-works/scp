@@ -2549,7 +2549,6 @@ pub(crate) fn create_supervisor_context_for_test(
 /// Panics when no supervisor is attached, or when the host call or the
 /// wrapping-key load fails, each a broken test fixture.
 #[cfg(test)]
-#[allow(clippy::expect_used)] // A broken test fixture panics; production paths keep the deny.
 pub(crate) fn register_host_custody_for_test(
     bi: &PyBridgeInstance,
     did: &str,
@@ -2611,7 +2610,6 @@ pub(crate) fn register_host_custody_for_test(
 /// Panics when the tokio runtime is unavailable or `create_context` rejects
 /// the request, each a broken test fixture.
 #[cfg(test)]
-#[allow(clippy::expect_used)] // A broken test fixture panics; production paths keep the deny.
 pub(crate) fn create_supervisor_context_with_params_for_test(
     bi: &PyBridgeInstance,
     context_id: &str,

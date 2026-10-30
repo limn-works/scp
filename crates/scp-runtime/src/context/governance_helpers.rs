@@ -8604,7 +8604,6 @@ mod commit_broadcast_retry_tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod queued_record_tests {
     //! Spec 17 §17.3 "Event log write failures": a governance step whose
     //! record is written after the step queues that record in the step's

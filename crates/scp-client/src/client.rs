@@ -2378,7 +2378,6 @@ mod ingest_emit_tests {
 /// Alice's group to propose, and Bob receives through
 /// [`ScpClient::receive_message`].
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod received_proposal_tests {
     use std::sync::Arc;
 

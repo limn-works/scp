@@ -908,7 +908,6 @@ pub async fn set_log_fault(
 /// Fixtures the per-family tests of the queued log units share (spec 17
 /// §17.3 "Event log write failures").
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 pub mod test_support {
     use std::sync::Arc;
 
@@ -1195,7 +1194,6 @@ pub mod test_support {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use scp_event_log::{EventPayload, EventType};
 

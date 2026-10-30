@@ -5288,7 +5288,6 @@ mod pseudonym_routing_tests {
 /// failures": a consequence evaluated after the message left or arrived keeps
 /// its step and queues its leaves when the log rejects their write.
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod log_unit_family_tests {
     use scp_did::DID;
     use scp_protocol::context::ContextError;

@@ -2062,7 +2062,6 @@ impl crate::scp::PyScp {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod custody_error_tests {
     use super::*;
     use scp_core::context::outlets::CancelError;

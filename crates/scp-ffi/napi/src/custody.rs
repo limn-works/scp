@@ -1174,7 +1174,6 @@ impl CustodySelection {
 
 #[cfg(test)]
 #[cfg(feature = "testing")]
-#[allow(clippy::expect_used)]
 mod tests {
     use scp_platform::testing::InMemoryKeyCustody;
 
@@ -1323,7 +1322,6 @@ mod tests {
 /// in for the JS callbacks, one method per callback: a `ThreadsafeFunction`
 /// needs a live Node.js runtime. The TypeScript SDK test covers the JS side.
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod adapter_tests {
     use std::sync::Arc;
 
