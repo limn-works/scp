@@ -133,7 +133,10 @@ rmp-serde = { workspace = true }
 # `zeroize` clears an AES key schedule and a GHASH subkey when a cipher object
 # drops; aes-gcm leaves that feature off by default.
 aes-gcm = { workspace = true, features = ["zeroize"], optional = true }
-argon2 = { workspace = true, optional = true }
+# argon2's `zeroize` implements `Zeroize` for `Block`, which `kdf.rs` needs to
+# wipe its caller-owned block memory, and wipes the crate's own initial hash and
+# final block hash (spec §17.8).
+argon2 ={ workspace = true, features = ["zeroize"], optional = true }
 
 # software_platform dependencies, gated behind the `software_platform` feature flag.
 ed25519-dalek = { workspace = true, optional = true }
