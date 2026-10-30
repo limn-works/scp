@@ -861,7 +861,7 @@ pub struct Created<S: EncryptedStorage + Clone> {
 
 /// Why `create` failed: the error of the failing step, and the cleanup that
 /// did not complete, if any.
-pub struct CreateError { pub error: IdentityError, pub cleanup: Option<CleanupFailure> }
+pub struct CreateError { pub error: IdentityError, pub cleanup: Option<Box<CleanupFailure>> }
 
 /// A cleanup that did not complete; what it names stays listed by
 /// `unfinished`.
