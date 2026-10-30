@@ -6374,6 +6374,83 @@ impl Supervisor {
         Ok(())
     }
 
+    /// Runs the restore's drain-only pass over the stored snapshot of a
+    /// context that is not Active (spec 17 §17.3 "Event log write failures",
+    /// "Restart"): writes the snapshot's queued log units to the context's log
+    /// with no lifecycle transition and no actor. Takes `bootstrap_spawn_lock`
+    /// and loads the snapshot under it, so no restore or bootstrap of the id
+    /// runs alongside the pass.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::PersistenceFailed`] when no persistence provider is
+    ///   configured or the snapshot load fails.
+    /// - [`ContextError::ContextNotRegistered`] when no snapshot is stored or
+    ///   a discard of the id is in progress.
+    /// - [`ContextError::ActorBusy`] while a bootstrap's first state is
+    ///   unsettled, or an actor for the id is registered (that actor drains
+    ///   its own queue).
+    /// - The pass's error from
+    ///   [`drain_dormant_snapshot`](crate::context::log_unit_helpers::drain_dormant_snapshot).
+    pub(crate) async fn drain_dormant_context(
+        &self,
+        ctx_id: &str,
+    ) -> Result<crate::context::log_unit_helpers::DormantDrain, ContextError> {
+        let bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
+        self.refuse_pending_discard(ctx_id, &bootstrap_guard)?;
+        self.refuse_pending_first_state(ctx_id, &bootstrap_guard)?;
+        let persistence = self.persistence_ref().ok_or_else(|| {
+            ContextError::PersistenceFailed("no persistence provider configured".into())
+        })?;
+        let snapshot = persistence
+            .load_context(ctx_id)
+            .await
+            .map_err(|e| {
+                ContextError::PersistenceFailed(format!(
+                    "loading the snapshot of dormant context {ctx_id} failed: {e}"
+                ))
+            })?
+            .map(Box::new)
+            .ok_or_else(|| {
+                ContextError::ContextNotRegistered(format!("{ctx_id} has no stored snapshot"))
+            })?;
+        self.drain_dormant_snapshot_locked(snapshot, &bootstrap_guard)
+            .await
+    }
+
+    /// Body of [`Self::drain_dormant_context`] for a caller that holds
+    /// `bootstrap_spawn_lock` and the loaded snapshot.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::drain_dormant_context`].
+    async fn drain_dormant_snapshot_locked(
+        &self,
+        snapshot: Box<crate::context::state::ContextSnapshot>,
+        _bootstrap_guard: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> Result<crate::context::log_unit_helpers::DormantDrain, ContextError> {
+        if self.lookup(&snapshot.context_id).is_some() {
+            return Err(ContextError::ActorBusy(format!(
+                "{}: an actor is registered; it drains its own queue",
+                snapshot.context_id
+            )));
+        }
+        let event_log = self.event_log_ref().ok_or_else(|| {
+            ContextError::EventLogFailed("no event log provider configured".into())
+        })?;
+        let persistence = self.persistence_ref().ok_or_else(|| {
+            ContextError::PersistenceFailed("no persistence provider configured".into())
+        })?;
+        // Boxed: the pass's future holds the snapshot, and every respawn and
+        // restore future awaits this one.
+        Box::pin(crate::context::log_unit_helpers::drain_dormant_snapshot(
+            event_log.as_ref(),
+            persistence.as_ref(),
+            snapshot,
+        ))
+        .await
+    }
+
     /// Body of [`Self::respawn_from_snapshot`], run by a caller that already
     /// holds `bootstrap_spawn_lock`; the guard parameter proves it.
     /// [`Self::clear_poison`] takes the lock itself so that it clears the
@@ -6473,6 +6550,22 @@ impl Supervisor {
             // otherwise just clear the marker, preserving its real crash
             // history.
             self.release_respawn_marker(ctx_id);
+            // The dormant context's queued log units are written now, with no
+            // transition and no actor (spec 17 §17.3 "Event log write
+            // failures", "Restart"). A failed pass leaves them stored for the
+            // next restore; the respawn's answer stays `ContextClosed`.
+            if (!snapshot.pending_log_units.is_empty() || snapshot.log_fault.is_some())
+                && let Err(e) = self
+                    .drain_dormant_snapshot_locked(Box::new(snapshot), bootstrap_guard)
+                    .await
+            {
+                tracing::error!(
+                    context_id = %ctx_id,
+                    error = %e,
+                    "drain-only pass over the dormant snapshot failed; its queued log units \
+                     stay stored"
+                );
+            }
             return Err(ContextError::ContextClosed);
         }
 

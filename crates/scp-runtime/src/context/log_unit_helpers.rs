@@ -23,13 +23,21 @@
 //! Every reserve and removal persists through the restore combinator, so the
 //! stored queue never holds a unit the in-memory queue has removed, and a
 //! context whose in-memory queue is empty has an empty stored queue.
+//!
+//! Each gate wait and each append runs under [`LOG_UNIT_WRITE_TIMEOUT`]; a
+//! write past the bound fails the drain with the unit still queued.
+//! [`drain_dormant_snapshot`] runs the same loop over a stored snapshot that is
+//! not Active, for the restore's drain-only pass.
 
-use scp_protocol::context::ContextError;
+use scp_protocol::context::{ContextError, ContextState};
 
 use crate::context::actor::class_s::{ClassSCell, ClassSCommitToken, ClassSMut};
 use crate::context::actor::deps::ActorDeps;
-use crate::context::builder::{UnitAppendError, UnitAppended};
-use crate::context::state::{LeafSpec, LogFaultMarker, context_id_to_bytes};
+use crate::context::builder::{
+    ContextEventLogProvider, EventLogRestore, UnitAppendError, UnitAppended,
+};
+use crate::context::persistence::ContextPersistence;
+use crate::context::state::{ContextSnapshot, LeafSpec, LogFaultMarker, context_id_to_bytes};
 
 /// What consequence enforcement owes after an operation's irreversible step
 /// (spec 17 §17.3 "Event log write failures"; ADR-049 §9): the downward-auth
@@ -420,7 +428,17 @@ pub async fn drain_pending_log_units(
     if !has_log_unit_work(cell) {
         return Ok(());
     }
-    let drained = drain_queue(cell, deps, context_id, &context_id_bytes).await;
+    let drained = drain_queue(
+        &mut ActorQueue {
+            cell,
+            deps,
+            context_id,
+        },
+        deps.event_log.as_ref(),
+        context_id,
+        &context_id_bytes,
+    )
+    .await;
     sync_units_pending(cell, deps, &context_id_bytes);
     if let Err(e) = &drained {
         tracing::warn!(
@@ -441,51 +459,218 @@ fn sync_units_pending(cell: &ClassSCell, deps: &ActorDeps, context_id_bytes: &[u
         .set_units_pending(context_id_bytes, !cell.class_s.pending_log_units.is_empty());
 }
 
-async fn drain_queue(
-    cell: &mut ClassSCell,
-    deps: &ActorDeps,
+/// The bound on each wait for the provider's write gate and on each unit
+/// append a drain makes (spec 17 §17.3 "Event log write failures", "Time
+/// bound"). A write that runs past it counts as a failed write: the unit stays
+/// queued, and dropping the write's future drops its write guard, which
+/// releases the gate.
+pub const LOG_UNIT_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Runs one drain write under [`LOG_UNIT_WRITE_TIMEOUT`].
+///
+/// # Errors
+///
+/// Returns [`ContextError::EventLogFailed`] when `write` runs past the bound.
+async fn within_write_bound<T>(
+    write: impl std::future::Future<Output = T>,
+    what: &str,
+    context_id: &str,
+) -> Result<T, ContextError> {
+    tokio::time::timeout(LOG_UNIT_WRITE_TIMEOUT, write)
+        .await
+        .map_err(|_elapsed| {
+            ContextError::EventLogFailed(format!(
+                "{what} for context {context_id} ran past {LOG_UNIT_WRITE_TIMEOUT:?}; the unit \
+                 stays queued (spec 17 §17.3)"
+            ))
+        })
+}
+
+/// The queue a drain writes from (spec 17 §17.3 "Event log write failures"):
+/// a live actor's Class-S state ([`ActorQueue`]) or a stored snapshot that the
+/// restore's drain-only pass drains ([`DormantQueue`]). Each mutator persists
+/// fail-closed before it returns `Ok`, so the stored queue never holds a unit
+/// the drain has removed.
+trait LogUnitQueue {
+    /// The oldest queued unit's `base_seq` and entries.
+    fn front(&self) -> Option<(Option<u64>, Vec<LeafSpec>)>;
+    /// True when the log fault is set.
+    fn has_fault(&self) -> bool;
+    /// Sets the oldest unit's `base_seq`; a failed persist leaves it unchanged.
+    async fn set_front_base(&mut self, base_seq: Option<u64>) -> Result<(), ContextError>;
+    /// Removes the oldest unit; a failed persist leaves it queued.
+    async fn pop_front(&mut self) -> Result<(), ContextError>;
+    /// Sets the log fault.
+    async fn set_fault(&mut self, marker: LogFaultMarker) -> Result<(), ContextError>;
+    /// Clears the log fault.
+    async fn clear_fault(&mut self) -> Result<(), ContextError>;
+}
+
+/// A live actor's queue: each mutation persists through the actor's
+/// fail-closed combinators.
+struct ActorQueue<'a> {
+    cell: &'a mut ClassSCell,
+    deps: &'a ActorDeps,
+    context_id: &'a str,
+}
+
+impl LogUnitQueue for ActorQueue<'_> {
+    fn front(&self) -> Option<(Option<u64>, Vec<LeafSpec>)> {
+        self.cell
+            .class_s
+            .pending_log_units
+            .front()
+            .map(|unit| (unit.base_seq, unit.leaves.clone()))
+    }
+
+    fn has_fault(&self) -> bool {
+        self.cell.class_s.log_fault.is_some()
+    }
+
+    async fn set_front_base(&mut self, base_seq: Option<u64>) -> Result<(), ContextError> {
+        self.cell
+            .commit_class_s_restore(self.deps, self.context_id, |mut view| {
+                view.set_front_log_unit_base(base_seq);
+                Ok(())
+            })
+            .await
+    }
+
+    async fn pop_front(&mut self) -> Result<(), ContextError> {
+        self.cell
+            .commit_class_s_restore(self.deps, self.context_id, |mut view| {
+                view.pop_front_log_unit();
+                Ok(())
+            })
+            .await
+    }
+
+    async fn set_fault(&mut self, marker: LogFaultMarker) -> Result<(), ContextError> {
+        set_log_fault(self.cell, self.deps, self.context_id, marker).await
+    }
+
+    async fn clear_fault(&mut self) -> Result<(), ContextError> {
+        self.cell
+            .commit_class_s_keep(self.deps, self.context_id, |mut view| {
+                view.clear_log_fault();
+                Ok(())
+            })
+            .await
+    }
+}
+
+/// A stored snapshot's queue, drained by the restore's drain-only pass. Each
+/// mutation changes the snapshot, stores it, and puts the snapshot back as it
+/// was when the store fails, so the snapshot in hand always equals the stored
+/// one.
+struct DormantQueue<'a> {
+    snapshot: &'a mut ContextSnapshot,
+    persistence: &'a dyn ContextPersistence,
+}
+
+impl DormantQueue<'_> {
+    /// Applies `change` to the snapshot and stores it; on a failed store,
+    /// restores the snapshot's queue and fault as they were.
+    async fn store(
+        &mut self,
+        change: impl FnOnce(&mut ContextSnapshot),
+    ) -> Result<(), ContextError> {
+        let queue = self.snapshot.pending_log_units.clone();
+        let fault = self.snapshot.log_fault.clone();
+        change(self.snapshot);
+        let context_id = self.snapshot.context_id.clone();
+        if let Err(e) = self
+            .persistence
+            .persist_context(&context_id, self.snapshot)
+            .await
+        {
+            self.snapshot.pending_log_units = queue;
+            self.snapshot.log_fault = fault;
+            return Err(ContextError::PersistenceFailed(format!(
+                "storing the drained snapshot of context {context_id} failed: {e}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl LogUnitQueue for DormantQueue<'_> {
+    fn front(&self) -> Option<(Option<u64>, Vec<LeafSpec>)> {
+        self.snapshot
+            .pending_log_units
+            .front()
+            .map(|unit| (unit.base_seq, unit.leaves.clone()))
+    }
+
+    fn has_fault(&self) -> bool {
+        self.snapshot.log_fault.is_some()
+    }
+
+    async fn set_front_base(&mut self, base_seq: Option<u64>) -> Result<(), ContextError> {
+        self.store(|snapshot| {
+            if let Some(unit) = snapshot.pending_log_units.front_mut() {
+                unit.base_seq = base_seq;
+            }
+        })
+        .await
+    }
+
+    async fn pop_front(&mut self) -> Result<(), ContextError> {
+        self.store(|snapshot| {
+            snapshot.pending_log_units.pop_front();
+        })
+        .await
+    }
+
+    async fn set_fault(&mut self, marker: LogFaultMarker) -> Result<(), ContextError> {
+        tracing::error!(
+            context_id = %self.snapshot.context_id,
+            base_seq = ?marker.base_seq,
+            log_len = ?marker.log_len,
+            detail = %marker.detail,
+            "dormant context event log faulted; its queued units stay stored"
+        );
+        self.store(|snapshot| snapshot.log_fault = Some(marker))
+            .await
+    }
+
+    async fn clear_fault(&mut self) -> Result<(), ContextError> {
+        self.store(|snapshot| snapshot.log_fault = None).await
+    }
+}
+
+/// Writes `queue`'s units to `event_log` in order (spec 17 §17.3 "Event log
+/// write failures"), then clears the log fault when the queue is empty and the
+/// log is loaded. Each gate wait and each append runs under
+/// [`LOG_UNIT_WRITE_TIMEOUT`].
+async fn drain_queue<Q: LogUnitQueue>(
+    queue: &mut Q,
+    event_log: &dyn ContextEventLogProvider,
     context_id: &str,
     context_id_bytes: &[u8; 32],
 ) -> Result<(), ContextError> {
     // Whether the front unit was already reserved again past the log's end in
     // this drain.
     let mut re_reserved = false;
-    while let Some(front) = cell.class_s.pending_log_units.front() {
-        let leaves: Vec<LeafSpec> = front.leaves.clone();
-        let reserved = front.base_seq;
-        let guard = deps
-            .event_log
-            .lock_for_unit(context_id_bytes)
-            .await
-            .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
-        let base_seq = if let Some(base_seq) = reserved {
-            base_seq
-        } else {
-            let base_seq = guard.log_len();
-            cell.commit_class_s_restore(deps, context_id, |mut view| {
-                view.set_front_log_unit_base(Some(base_seq));
-                Ok(())
-            })
-            .await?;
-            base_seq
-        };
-        match deps.event_log.append_unit(guard, base_seq, &leaves).await {
+    while let Some((reserved, leaves)) = queue.front() {
+        let appended = write_front_unit(
+            queue,
+            event_log,
+            context_id,
+            context_id_bytes,
+            reserved,
+            &leaves,
+        )
+        .await?;
+        match appended {
             Ok(UnitAppended::Appended | UnitAppended::AlreadyPresent) => {
-                cell.commit_class_s_restore(deps, context_id, |mut view| {
-                    view.pop_front_log_unit();
-                    Ok(())
-                })
-                .await?;
+                queue.pop_front().await?;
                 re_reserved = false;
             }
             Err(UnitAppendError::PastEnd { .. }) if !re_reserved => {
                 // The unit is not in the log and nothing sits ahead of it:
                 // reserve it again at the log's length.
-                cell.commit_class_s_restore(deps, context_id, |mut view| {
-                    view.set_front_log_unit_base(None);
-                    Ok(())
-                })
-                .await?;
+                queue.set_front_base(None).await?;
                 re_reserved = true;
             }
             Err(
@@ -495,17 +680,13 @@ async fn drain_queue(
                 let detail = format!(
                     "queued event log unit misaligned: base_seq {base_seq}, log length {log_len}"
                 );
-                set_log_fault(
-                    cell,
-                    deps,
-                    context_id,
-                    LogFaultMarker {
+                queue
+                    .set_fault(LogFaultMarker {
                         base_seq,
                         log_len,
                         detail: detail.clone(),
-                    },
-                )
-                .await?;
+                    })
+                    .await?;
                 return Err(ContextError::EventLogFailed(detail));
             }
             Err(UnitAppendError::Failed(e)) => {
@@ -513,15 +694,9 @@ async fn drain_queue(
             }
         }
     }
-    if cell.class_s.log_fault.is_some() {
-        match deps.event_log.event_log_entries(context_id_bytes) {
-            Ok(Some(_)) => {
-                cell.commit_class_s_keep(deps, context_id, |mut view| {
-                    view.clear_log_fault();
-                    Ok(())
-                })
-                .await?;
-            }
+    if queue.has_fault() {
+        match event_log.event_log_entries(context_id_bytes) {
+            Ok(Some(_)) => queue.clear_fault().await?,
             Ok(None) => {
                 return Err(ContextError::EventLogFailed(format!(
                     "no event log for context {context_id}; the log fault stays set"
@@ -531,6 +706,183 @@ async fn drain_queue(
         }
     }
     Ok(())
+}
+
+/// Writes the queue's front unit under the provider's write gate, reserving
+/// its base at the log's length first when it holds none. Each wait runs
+/// under [`LOG_UNIT_WRITE_TIMEOUT`]; the write guard moves into the append,
+/// so the gate is released when the append ends or its future is dropped.
+async fn write_front_unit<Q: LogUnitQueue>(
+    queue: &mut Q,
+    event_log: &dyn ContextEventLogProvider,
+    context_id: &str,
+    context_id_bytes: &[u8; 32],
+    reserved: Option<u64>,
+    leaves: &[LeafSpec],
+) -> Result<Result<UnitAppended, UnitAppendError>, ContextError> {
+    let guard = within_write_bound(
+        event_log.lock_for_unit(context_id_bytes),
+        "waiting for the event log write gate",
+        context_id,
+    )
+    .await?
+    .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
+    let base_seq = if let Some(base_seq) = reserved {
+        base_seq
+    } else {
+        let base_seq = guard.log_len();
+        queue.set_front_base(Some(base_seq)).await?;
+        base_seq
+    };
+    within_write_bound(
+        event_log.append_unit(guard, base_seq, leaves),
+        "appending a queued event log unit",
+        context_id,
+    )
+    .await
+}
+
+/// What the restore's drain-only pass did with a stored non-Active snapshot
+/// (spec 17 §17.3 "Event log write failures", "Restart").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DormantDrain {
+    /// The snapshot held no queued unit and no log fault; nothing ran.
+    NothingQueued,
+    /// Every queued unit is in the log and the stored snapshot holds an empty
+    /// queue.
+    Drained,
+    /// Every queued unit is in the log, and the closed context's stored state
+    /// is deleted.
+    DrainedAndDeleted,
+}
+
+/// The restore's drain-only pass over a stored snapshot that is not Active
+/// (spec 17 §17.3 "Event log write failures", "Restart"): loads the context's
+/// log, writes the snapshot's queued units to it, stores the snapshot without
+/// the drained units, and releases the log. It makes no lifecycle transition
+/// and starts no actor. When the queue empties on a closed context, it deletes
+/// the context's stored state.
+///
+/// The caller holds the supervisor's bootstrap spawn lock and has checked that
+/// no actor is registered for the context, so no other writer holds the log.
+///
+/// # Errors
+///
+/// - [`ContextError::PersistenceFailed`] when the snapshot's queue holds an
+///   empty unit, a drained-snapshot store fails, or the closed context's
+///   stored state cannot be deleted.
+/// - [`ContextError::EventLogFailed`] when the stored log cannot be loaded,
+///   storage holds no log for the context (an absent log is never drained into
+///   as an empty one), or a gate wait, an append or the log read fails or runs
+///   past [`LOG_UNIT_WRITE_TIMEOUT`].
+///
+/// Units not yet written stay in the stored snapshot for the next restore.
+pub async fn drain_dormant_snapshot(
+    event_log: &dyn ContextEventLogProvider,
+    persistence: &dyn ContextPersistence,
+    mut snapshot: Box<ContextSnapshot>,
+) -> Result<DormantDrain, ContextError> {
+    if snapshot.state == ContextState::Active {
+        return Err(ContextError::InvalidState(format!(
+            "the drain-only pass refuses the Active context {}; its restored actor drains it",
+            snapshot.context_id
+        )));
+    }
+    if snapshot.pending_log_units.is_empty() && snapshot.log_fault.is_none() {
+        return Ok(DormantDrain::NothingQueued);
+    }
+    // The same check a restore applies to a stored queue.
+    crate::context::actor::class_s::PendingLogUnits::validated(snapshot.pending_log_units.clone())?;
+    let context_id = snapshot.context_id.clone();
+    let context_id_bytes = context_id_to_bytes(&context_id);
+    let restored = event_log
+        .restore_event_log(&context_id_bytes)
+        .await
+        .map_err(|e| {
+            ContextError::EventLogFailed(format!(
+                "restoring the event log of dormant context {context_id} failed: {e}"
+            ))
+        });
+    // Release the log on every exit: the pass never hands it to an actor.
+    let _release = DormantLogRelease {
+        event_log,
+        context_id_bytes,
+    };
+    if matches!(restored?, EventLogRestore::Absent) {
+        return Err(ContextError::EventLogFailed(format!(
+            "dormant context {context_id} has no stored event log; its queued units stay stored"
+        )));
+    }
+    event_log.set_units_pending(&context_id_bytes, !snapshot.pending_log_units.is_empty());
+    let drained = drain_queue(
+        &mut DormantQueue {
+            snapshot: &mut snapshot,
+            persistence,
+        },
+        event_log,
+        &context_id,
+        &context_id_bytes,
+    )
+    .await;
+    event_log.set_units_pending(&context_id_bytes, !snapshot.pending_log_units.is_empty());
+    drained?;
+    if snapshot.state == ContextState::Closed {
+        persistence.delete_context(&context_id).await.map_err(|e| {
+            ContextError::PersistenceFailed(format!(
+                "deleting the drained closed context {context_id} failed: {e}"
+            ))
+        })?;
+        return Ok(DormantDrain::DrainedAndDeleted);
+    }
+    Ok(DormantDrain::Drained)
+}
+
+/// Releases the drain-only pass's in-memory log and write gate when the pass
+/// ends, by any exit, cancellation included.
+struct DormantLogRelease<'a> {
+    event_log: &'a dyn ContextEventLogProvider,
+    context_id_bytes: [u8; 32],
+}
+
+impl Drop for DormantLogRelease<'_> {
+    fn drop(&mut self) {
+        self.event_log.release_event_log(&self.context_id_bytes);
+    }
+}
+
+/// Deletes a closed context's stored state once its queue is empty (spec 17
+/// §17.3 "Event log write failures", "Restart"). An explicit close is a
+/// permanent teardown, so the stored state stays only while it carries queued
+/// units the next restore's drain-only pass must write.
+///
+/// Does nothing when the context is not closed or units stay queued. The
+/// cell is read before the returned future starts, so the future holds no
+/// borrow of it (a `ClassSCell` is not `Sync`).
+///
+/// # Errors
+///
+/// The future returns [`ContextError::PersistenceFailed`] when the delete
+/// fails.
+pub fn retire_closed_snapshot<'a>(
+    cell: &ClassSCell,
+    deps: &'a ActorDeps,
+    context_id: &'a str,
+) -> impl std::future::Future<Output = Result<(), ContextError>> + Send + 'a {
+    let retire =
+        cell.handle.state() == ContextState::Closed && cell.class_s.pending_log_units.is_empty();
+    async move {
+        if !retire {
+            return Ok(());
+        }
+        deps.persistence
+            .delete_context(context_id)
+            .await
+            .map_err(|e| {
+                ContextError::PersistenceFailed(format!(
+                    "deleting the closed context {context_id}'s stored state failed: {e}"
+                ))
+            })
+    }
 }
 
 /// Sets the context's log fault through a keep persist: the marker stays in
@@ -1765,6 +2117,340 @@ mod tests {
             assert!(
                 cell.class_s.log_fault.is_none(),
                 "drain {drain} sets no log fault"
+            );
+        }
+    }
+
+    /// A supervisor over a Merkle log stored in `faulty` and the `snapshots`
+    /// store, as a restarted node builds it.
+    fn restarted_supervisor(
+        faulty: &std::sync::Arc<crate::context::supervisor::faulty_storage::FaultyStorage>,
+        snapshots: &super::test_support::SharedSnapshots,
+    ) -> std::sync::Arc<crate::context::supervisor::supervisor::Supervisor> {
+        let crypto = std::sync::Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
+            OWNER.to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
+        ));
+        let mls_storage: std::sync::Arc<
+            dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+        > = std::sync::Arc::new(
+            crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+                std::sync::Arc::new(scp_platform::in_memory::InMemoryStorage::new()),
+            ),
+        );
+        crate::context::supervisor::supervisor::Supervisor::with_providers(
+            crypto,
+            Box::new(crate::context::builder::NotConfiguredTransportProvider),
+            Box::new(super::test_support::merkle_log_over(faulty)),
+            std::sync::Arc::new(|_, _| None),
+            Some(Box::new(snapshots.clone())),
+            None,
+            None,
+            Some(std::sync::Arc::new(scp_clock::TestClock::new(
+                1_700_000_000,
+            ))),
+            mls_storage,
+        )
+    }
+
+    /// The entries of the context's log as a restarted node reads them.
+    async fn stored_log_types(
+        faulty: &std::sync::Arc<crate::context::supervisor::faulty_storage::FaultyStorage>,
+        ctx_id_bytes: &[u8; 32],
+    ) -> Vec<EventType> {
+        use crate::context::builder::ContextEventLogProvider;
+        let log = super::test_support::merkle_log_over(faulty);
+        log.restore_event_log(ctx_id_bytes)
+            .await
+            .expect("the stored log loads");
+        log.event_log_entries(ctx_id_bytes)
+            .expect("the log reads")
+            .expect("the log exists")
+            .into_iter()
+            .map(|e| e.event_type)
+            .collect()
+    }
+
+    /// A restore that finds a Tombstoned, Closing or Expired snapshot with a
+    /// queued unit writes the unit to the log, stores the snapshot with an
+    /// empty queue, and starts no actor (spec 17 §17.3 "Event log write
+    /// failures", "Restart").
+    #[tokio::test]
+    async fn restore_writes_the_queued_unit_of_a_dormant_snapshot() {
+        use scp_protocol::context::ContextState;
+        for (n, state) in [
+            ContextState::Tombstoned,
+            ContextState::Closing,
+            ContextState::Expired,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let ctx_id_bytes = [0x60 + u8::try_from(n).expect("small index"); 32];
+            let ctx = hex::encode(ctx_id_bytes);
+            let (seed_log, faulty) = faulty_merkle_log();
+            super::test_support::seed_warning_leaf(
+                &seed_log,
+                &ctx_id_bytes,
+                &scp_did::DID("did:example:target".to_owned()),
+            )
+            .await;
+            let snapshots = super::test_support::SharedSnapshots::default();
+            let mut snapshot = crate::context::messaging_helpers::build_snapshot_from_state(
+                &PerContextState::new_for_test_encrypted(
+                    ctx_id_bytes,
+                    1_700_000_000,
+                    scp_did::DID(OWNER.to_owned()),
+                ),
+            );
+            snapshot.state = state.clone();
+            snapshot.pending_log_units.push_back(PendingLogUnit {
+                base_seq: None,
+                leaves: vec![tagged_leaf(n_tag(n))],
+            });
+            crate::context::persistence::ContextPersistence::persist_context(
+                &snapshots, &ctx, &snapshot,
+            )
+            .await
+            .expect("seed the dormant snapshot");
+
+            let supervisor = restarted_supervisor(&faulty, &snapshots);
+            let restored = crate::context::lifecycle_helpers::restore_all_contexts(&supervisor)
+                .await
+                .expect("restore runs");
+
+            assert!(
+                restored.is_empty(),
+                "{state:?}: a dormant snapshot restores no actor: {restored:?}"
+            );
+            assert!(
+                supervisor.lookup(&ctx).is_none(),
+                "{state:?}: no actor is registered"
+            );
+            assert_eq!(
+                stored_log_types(&faulty, &ctx_id_bytes).await,
+                vec![EventType::GovernanceAction, EventType::MemberJoined],
+                "{state:?}: the queued unit is in the stored log after the seed"
+            );
+            let stored = snapshots
+                .snapshot(&ctx)
+                .await
+                .expect("a dormant snapshot that is not Closed stays stored");
+            assert!(
+                stored.pending_log_units.is_empty(),
+                "{state:?}: the stored snapshot holds no queued unit"
+            );
+            assert_eq!(stored.state, state, "{state:?}: the state is unchanged");
+        }
+    }
+
+    fn n_tag(n: usize) -> u8 {
+        0x10 + u8::try_from(n).expect("small index")
+    }
+
+    /// A finalize whose `ContextClosed` record the log refuses keeps the
+    /// snapshot with the record queued, and a later restore over a log that
+    /// takes writes lands the record and deletes the snapshot (spec 17 §17.3
+    /// "Event log write failures", "Restart").
+    #[tokio::test]
+    async fn a_refused_close_record_survives_restart_and_restore_retires_the_snapshot() {
+        use scp_protocol::context::ContextState;
+        let ctx_id_bytes = [0x6Au8; 32];
+        let ctx = hex::encode(ctx_id_bytes);
+        let (log, faulty) = faulty_merkle_log();
+        let snapshots = super::test_support::SharedSnapshots::default();
+        let deps = deps_with(OWNER, Some(Box::new(snapshots.clone())), Box::new(log)).await;
+        super::test_support::seed_warning_leaf(
+            deps.event_log.as_ref(),
+            &ctx_id_bytes,
+            &scp_did::DID("did:example:target".to_owned()),
+        )
+        .await;
+        let mut state = PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            1_700_000_000,
+            scp_did::DID(OWNER.to_owned()),
+        );
+        state.handle = crate::context::ContextHandle::new(
+            ctx.clone(),
+            scp_protocol::context::params::ContextParams::default(),
+        );
+        state
+            .handle
+            .transition_to(&ContextState::Active)
+            .expect("Active");
+        state
+            .handle
+            .transition_to(&ContextState::Closing)
+            .expect("Closing");
+        let mut cell = ClassSCell::new(state);
+        let handle = cell.handle.clone();
+        fail_log_entry_writes(&faulty, &ctx_id_bytes);
+
+        crate::context::ttl_close_helpers::finalize_close(&mut cell, &deps, &handle)
+            .await
+            .expect("a refused record does not fail the close");
+
+        let kept = snapshots
+            .snapshot(&ctx)
+            .await
+            .expect("the snapshot is kept while its record is queued");
+        assert_eq!(kept.state, ContextState::Closed);
+        assert_eq!(
+            snapshots.persisted_unit_types(&ctx).await,
+            vec![vec![EventType::ContextClosed]],
+            "the stored snapshot holds the queued ContextClosed record"
+        );
+        drop(cell);
+        drop(deps);
+
+        faulty.clear_fail();
+        let supervisor = restarted_supervisor(&faulty, &snapshots);
+        let restored = crate::context::lifecycle_helpers::restore_all_contexts(&supervisor)
+            .await
+            .expect("restore runs");
+
+        assert!(restored.is_empty(), "a closed context restores no actor");
+        assert_eq!(
+            stored_log_types(&faulty, &ctx_id_bytes).await,
+            vec![EventType::GovernanceAction, EventType::ContextClosed],
+            "the restore wrote the queued ContextClosed record"
+        );
+        assert!(
+            snapshots.snapshot(&ctx).await.is_none(),
+            "the restore deletes the closed context's snapshot once its queue is empty"
+        );
+    }
+
+    /// A Merkle log whose unit writes take the real write gate and then never
+    /// finish, counting each attempt.
+    struct StallingUnitWrites {
+        inner: crate::context::providers::event_log::MerkleEventLogProvider,
+        attempts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::context::builder::ContextEventLogProvider for StallingUnitWrites {
+        async fn init_event_log(
+            &self,
+            id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            self.inner.init_event_log(id).await
+        }
+        async fn append_event(
+            &self,
+            id: &[u8; 32],
+            event: EventType,
+            actor: &str,
+            payload: EventPayload,
+            timestamp_secs: u64,
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            self.inner
+                .append_event(id, event, actor, payload, timestamp_secs)
+                .await
+        }
+        async fn destroy_event_log(
+            &self,
+            id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            self.inner.destroy_event_log(id).await
+        }
+        fn event_log_entries(
+            &self,
+            id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, ContextError> {
+            self.inner.event_log_entries(id)
+        }
+        async fn lock_for_unit(
+            &self,
+            id: &[u8; 32],
+        ) -> Result<
+            crate::context::builder::UnitWriteGuard,
+            scp_protocol::context::builder::ContextCreationError,
+        > {
+            self.inner.lock_for_unit(id).await
+        }
+        async fn append_unit(
+            &self,
+            _guard: crate::context::builder::UnitWriteGuard,
+            _base_seq: u64,
+            _leaves: &[LeafSpec],
+        ) -> Result<crate::context::builder::UnitAppended, crate::context::builder::UnitAppendError>
+        {
+            self.attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::pending().await
+        }
+    }
+
+    /// A unit write that never finishes ends at `LOG_UNIT_WRITE_TIMEOUT`: the
+    /// drain returns `EventLogFailed`, the unit stays queued with no log
+    /// fault, and the write gate is released, so the next drain reaches the
+    /// write again (spec 17 §17.3 "Event log write failures", "Time bound").
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_unit_write_ends_at_the_time_bound_and_releases_the_gate() {
+        let ctx_id_bytes = [0x6Bu8; 32];
+        let ctx = hex::encode(ctx_id_bytes);
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let deps = deps_with(
+            OWNER,
+            None,
+            Box::new(StallingUnitWrites {
+                inner: crate::context::providers::event_log::MerkleEventLogProvider::new(),
+                attempts: std::sync::Arc::clone(&attempts),
+            }),
+        )
+        .await;
+        deps.event_log
+            .init_event_log(&ctx_id_bytes)
+            .await
+            .expect("init event log");
+        let mut cell = ClassSCell::new(PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            1_700_000_000,
+            scp_did::DID(OWNER.to_owned()),
+        ));
+        cell.commit_class_s_keep(&deps, &ctx, |mut v| {
+            v.enqueue_log_unit(vec![tagged_leaf(1)]);
+            Ok(())
+        })
+        .await
+        .expect("the enqueue persists");
+
+        for drain in 1..=2 {
+            let started = tokio::time::Instant::now();
+            let result = tokio::time::timeout(
+                super::LOG_UNIT_WRITE_TIMEOUT * 2,
+                drain_pending_log_units(&mut cell, &deps, &ctx),
+            )
+            .await
+            .expect("the drain ends at its own time bound");
+            assert!(
+                matches!(result, Err(ContextError::EventLogFailed(_))),
+                "drain {drain}: a stalled write is a typed failure: {result:?}"
+            );
+            assert_eq!(
+                started.elapsed(),
+                super::LOG_UNIT_WRITE_TIMEOUT,
+                "drain {drain} gives the write up at the bound"
+            );
+            assert_eq!(
+                attempts.load(std::sync::atomic::Ordering::SeqCst),
+                drain,
+                "drain {drain} reaches the write, so the earlier drain released the gate"
+            );
+            assert_eq!(
+                cell.class_s
+                    .pending_log_units
+                    .iter()
+                    .map(|unit| unit.leaves.clone())
+                    .collect::<Vec<_>>(),
+                vec![vec![tagged_leaf(1)]],
+                "drain {drain} keeps the unit queued"
+            );
+            assert!(
+                cell.class_s.log_fault.is_none(),
+                "drain {drain}: a timeout sets no log fault"
             );
         }
     }

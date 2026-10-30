@@ -1034,10 +1034,23 @@ pub async fn finalize_close(
     // its own budget (M2).
     ttl::delete_published_bounded(handle, deps.transport.as_ref()).await;
 
-    // Delete the persisted snapshot: an explicit close is a permanent teardown,
-    // and a later restore must not resurrect it. A record a failed drain left
-    // queued stays in memory for the actor's next drain.
-    if let Err(e) = deps.persistence.delete_context(&context_id).await {
+    // Delete the persisted snapshot only once its queue is empty: an explicit
+    // close is a permanent teardown, and a later restore must not resurrect it,
+    // but a snapshot that still holds queued units stays stored so the next
+    // restore's drain-only pass writes them and then deletes it (spec 17 §17.3
+    // "Event log write failures", "Restart"). The kept snapshot was written
+    // after the keys were disposed, so it holds no key material. When the keep
+    // commit failed, the stored snapshot is the one from before the close,
+    // which may hold key material and no queued record, so it is deleted.
+    let retired = if persisted.is_ok() {
+        crate::context::log_unit_helpers::retire_closed_snapshot(cell, deps, &context_id).await
+    } else {
+        deps.persistence
+            .delete_context(&context_id)
+            .await
+            .map_err(|e| ContextError::PersistenceFailed(e.to_string()))
+    };
+    if let Err(e) = retired {
         tracing::warn!(
             context_id = %context_id,
             error = %e,
@@ -1749,8 +1762,8 @@ mod tests {
 
     /// A finalize whose `ContextClosed` record the log refuses still closes:
     /// the record is queued in the finalize's keep commit, the finalize returns
-    /// `Ok`, the log is unchanged, and the snapshot is deleted (spec 17 §17.3
-    /// "Event log write failures").
+    /// `Ok`, the log is unchanged, and the snapshot is kept with the record
+    /// queued (spec 17 §17.3 "Event log write failures", "Restart").
     #[tokio::test]
     async fn finalize_close_queues_context_closed_when_the_log_refuses_it() {
         use crate::context::log_unit_helpers::test_support;
@@ -1791,9 +1804,15 @@ mod tests {
             log_before,
             "the refused write leaves the log unchanged"
         );
-        assert!(
-            snapshots.snapshot(&context_id).await.is_none(),
-            "an explicit close deletes the persisted snapshot"
+        let kept = snapshots
+            .snapshot(&context_id)
+            .await
+            .expect("a close with a queued record keeps the snapshot");
+        assert_eq!(kept.state, scp_protocol::context::ContextState::Closed);
+        assert_eq!(
+            snapshots.persisted_unit_types(&context_id).await,
+            vec![vec![scp_event_log::EventType::ContextClosed]],
+            "the stored snapshot holds the queued ContextClosed record"
         );
     }
 

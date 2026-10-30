@@ -654,14 +654,30 @@ impl ContextActor {
     /// there is nothing to drain. A failed drain leaves the units queued and
     /// the fence set, so the command that follows cannot write ahead of them;
     /// the drain logs the failure.
+    ///
+    /// A drain that empties the queue of a closed context deletes the
+    /// context's stored state, which close kept only for those units (spec 17
+    /// §17.3 "Event log write failures", "Restart").
     async fn drain_log_units(&mut self) {
-        if let Err(err) = crate::context::log_unit_helpers::drain_pending_log_units(
+        let had_units = !self.state.class_s.pending_log_units.is_empty();
+        let drained = crate::context::log_unit_helpers::drain_pending_log_units(
             &mut self.state,
             &self.deps,
             &self.context_id,
         )
-        .await
-        {
+        .await;
+        let retired = match drained {
+            Ok(()) if had_units => {
+                crate::context::log_unit_helpers::retire_closed_snapshot(
+                    &self.state,
+                    &self.deps,
+                    &self.context_id,
+                )
+                .await
+            }
+            other => other,
+        };
+        if let Err(err) = retired {
             tracing::debug!(
                 context_id = %self.context_id,
                 error = %err,
@@ -1055,11 +1071,13 @@ impl ContextActor {
         let handle = self.state.handle.clone();
 
         // Run the fail-closed expiry, carrying the completed-steps bitmask from
-        // any prior attempt so only the failed step re-runs. `handle_ttl_expiry`
-        // wraps ONLY the relay/event-log I/O in `timeout(HANDLER_TIMEOUT)`; the
-        // fail-closed terminal persist runs OUTSIDE that bound (SEC-1), so NO
-        // outer timeout here (an outer wrap would re-expose the persist to
-        // relay-stall cancellation — the exact bug this pass fixes).
+        // any prior attempt so only the failed step re-runs. The expiry bounds
+        // its own I/O: each event-log write of its drain runs under
+        // `LOG_UNIT_WRITE_TIMEOUT` (spec 17 §17.3 "Event log write failures",
+        // "Time bound"), and the relay delete runs under its own budget. The
+        // fail-closed terminal persist runs outside both bounds (SEC-1), so no
+        // outer timeout wraps the call: an outer timeout would cancel the
+        // persist when the relay or the log stalls.
         let outcome = crate::context::ttl_close_helpers::handle_ttl_expiry(
             &mut self.state,
             &self.deps,
@@ -1121,10 +1139,11 @@ impl ContextActor {
         // cleanup) or let a crash resurrect the context as `Active` against a
         // stale snapshot (undurable terminal state) — the SEC-1 window.
         //
-        // AND its queued log units are written: a despawn drops the in-memory
-        // queue, and restore skips a terminal snapshot, so a record still queued
-        // would never be written. The retry arm below re-runs the expiry, which
-        // drains again (spec 17 §17.3 "Event log write failures").
+        // AND its queued log units are written. The stored snapshot keeps any
+        // unit still queued, and the drain-only pass of the next restore or
+        // respawn writes it (spec 17 §17.3 "Event log write failures",
+        // "Restart"), but the resident actor writes it sooner: the retry arm
+        // below re-runs the expiry, which drains again.
         if terminal
             && outcome.result.is_complete()
             && outcome.persist_result.is_ok()
@@ -1153,14 +1172,19 @@ impl ContextActor {
             //
             // ACCEPTED crash-window residuals at this pending-retry point
             // (ADR-049 §9 TTL carve-out; NOT resurrection or an access-control
-            // bypass — the persisted snapshot is already TERMINAL, restore skips
-            // non-`Active` contexts, and B8 refuses re-create):
-            //  - L2 (black-hat P3-005): the retry state (that a `ContextExpired`
-            //    leaf append is still pending) lives only in this resident
-            //    actor's `ttl_expiry_completed` bitmask, not the persisted
-            //    snapshot. A crash DURING the pending retry drops the
-            //    not-yet-appended leaf — a missing PROVENANCE leaf only; the
-            //    context stays terminal for good.
+            // bypass — the persisted snapshot is already TERMINAL, restore
+            // starts no actor for a non-`Active` context, and B8 refuses
+            // re-create):
+            //  - L2 (black-hat P3-005): a `ContextExpired` record that the
+            //    terminal persist queued is in the stored snapshot, and the
+            //    drain-only pass of the next restore writes it (spec 17 §17.3
+            //    "Event log write failures", "Restart"). The residual is a
+            //    record the expiry never queued: when the log read before the
+            //    step failed, the record step stays undone in this resident
+            //    actor's `ttl_expiry_completed` bitmask, which no snapshot
+            //    stores. A crash during that retry leaves the log without the
+            //    record — a missing PROVENANCE leaf only; the context stays
+            //    terminal for good.
             //  - L4 (security): when key destruction itself is the still-failing
             //    step, a crash here can leave that context's key material
             //    ORPHANED in MLS storage. This is a STORAGE-HYGIENE residual —
@@ -2714,7 +2738,9 @@ mod tests {
     /// timed-out I/O (so a relay stall cancelled it, leaving only a
     /// post-despawn coalesce drain to record `Expired` — a resurrection window).
     /// The keep-alive on an unwritten record is covered by
-    /// `incomplete_cleanup_keeps_actor_alive_and_retries`.
+    /// `incomplete_cleanup_keeps_actor_alive_and_retries`. The test then shows
+    /// that the stalled write cannot hold the actor: the drain gives the write
+    /// up at its time bound, and the actor exits on a Shutdown.
     #[cfg(feature = "testing")]
     #[tokio::test]
     async fn ttl_expiry_persists_its_record_before_a_stalled_log_write() {
@@ -2771,10 +2797,23 @@ mod tests {
              stalled write (spec 17 §17.3)"
         );
 
-        // The drain's write stalls, so the actor never finishes this turn; the
-        // test ends with the durable state asserted above.
-        drop(handle);
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), actor_task).await;
+        // The drain's write stalls, and the drain gives it up after
+        // `LOG_UNIT_WRITE_TIMEOUT` with the record still queued (spec 17 §17.3
+        // "Event log write failures", "Time bound"). So the actor finishes the
+        // expiry turn and then handles a Shutdown; without the bound it waits
+        // on the stalled write forever and never reads the command. The
+        // virtual-time budget covers the expiry's drain and the drain before
+        // the Shutdown, each stopped at the bound.
+        let budget = crate::context::log_unit_helpers::LOG_UNIT_WRITE_TIMEOUT * 4;
+        tokio::time::timeout(budget, async {
+            handle
+                .send_shutdown()
+                .await
+                .expect("the actor answers the Shutdown");
+            actor_task.await.expect("the actor task joins");
+        })
+        .await
+        .expect("a stalled log write must not hold the actor past the drain's time bound");
     }
 
     /// M2 (bounded exponential TTL-expiry backoff): the retry delay grows

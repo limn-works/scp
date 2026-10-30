@@ -4562,6 +4562,25 @@ pub async fn restore_all_contexts(
         };
 
         if ctx_snapshot.state != scp_protocol::context::ContextState::Active {
+            // A context that is not Active gets no actor. Its queued log units
+            // are written by the drain-only pass, which makes no transition
+            // (spec 17 §17.3 "Event log write failures", "Restart"). A failed
+            // pass leaves them stored for the next restore.
+            if !ctx_snapshot.pending_log_units.is_empty() || ctx_snapshot.log_fault.is_some() {
+                match supervisor.drain_dormant_context(ctx_id).await {
+                    Ok(drained) => tracing::info!(
+                        context_id = %ctx_id,
+                        ?drained,
+                        "drain-only pass wrote the dormant context's queued log units"
+                    ),
+                    Err(e) => tracing::error!(
+                        context_id = %ctx_id,
+                        error = %e,
+                        "drain-only pass over the dormant snapshot failed; its queued log units \
+                         stay stored"
+                    ),
+                }
+            }
             continue;
         }
 
