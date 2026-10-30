@@ -252,10 +252,12 @@ impl StreamSettlementSink for ActorStreamSettlementSink {
 /// production (mirrors the internally-wired [`ActorStreamSettlementSink`]). The
 /// `record` callback is `Sync` fire-and-forget: it spawns the async send onto
 /// the captured runtime handle. No caller waits on the close record, so a
-/// dropped Supervisor, an absent actor, a full mailbox after the send's
-/// retries, or a refused enqueue is logged at error level and counted by
-/// `scp_log_unit_undelivered_total` (the money-moving settlement is a separate
-/// sink; this one carries the audit record).
+/// dropped Supervisor, an absent actor, a full mailbox, or a refused enqueue
+/// is logged at error level and counted by `scp_log_unit_undelivered_total`,
+/// and a lost reply is logged at warn level
+/// ([`report_background_log_unit`](crate::context::log_unit_helpers::report_background_log_unit)).
+/// The money-moving settlement is a separate sink; this one carries the audit
+/// record.
 pub(crate) struct ActorOutletInvokedEventSink {
     /// The supervisor whose actor registry serves the hosting context.
     supervisor: Weak<Supervisor>,
@@ -293,18 +295,14 @@ impl OutletInvokedEventSink for ActorOutletInvokedEventSink {
             &self.runtime,
             SinkHandoff::OutletInvokedEventAppend,
             move |supervisor| async move {
-                if let Err(e) = supervisor
+                let sent = supervisor
                     .enqueue_streaming_outlet_invoked_unit(&context_id, event, actor_did)
-                    .await
-                {
-                    crate::metrics::record_log_unit_undelivered();
-                    tracing::error!(
-                        context_id = %context_id,
-                        error = %e,
-                        "streaming OutletInvokedEvent was not queued; the context's log lacks \
-                         this stream's close record (spec 17 §17.3)"
-                    );
-                }
+                    .await;
+                crate::context::log_unit_helpers::report_background_log_unit(
+                    &context_id,
+                    "streaming OutletInvokedEvent",
+                    sent,
+                );
             },
         );
     }
@@ -1300,6 +1298,103 @@ mod tests {
             gone.load(Ordering::SeqCst),
             0,
             "a dropped Supervisor runs no sink operation"
+        );
+    }
+
+    /// A close event with `stream_chunk_count` chunks, `chunks_billed` billed.
+    fn close_event(
+        stream_chunk_count: u32,
+        chunks_billed: u32,
+    ) -> scp_protocol::context::outlets::lifecycle::OutletInvokedEvent {
+        scp_protocol::context::outlets::lifecycle::OutletInvokedEvent {
+            request_id: "req-close".to_owned(),
+            outlet_id: "outlet-close".to_owned(),
+            invoker_did: invoker(),
+            status: scp_protocol::context::outlets::OutletStatus::Success,
+            execution_time_ms: 1,
+            input_hash: "0".repeat(64),
+            output_hash: None,
+            cost: None,
+            stream_chunk_count,
+            chunks_billed,
+            stream_manifest_hash: [0u8; 32],
+            stream_terminal_status:
+                scp_protocol::context::outlets::stream::StreamTerminalStatus::Ok,
+            cancel_ack_seq: None,
+            audit_anomaly: None,
+        }
+    }
+
+    /// Polls `scp_log_unit_undelivered_total` until it reads `expected`, and
+    /// returns the last read.
+    async fn undelivered_reaches(
+        snapshotter: &metrics_util::debugging::Snapshotter,
+        expected: u64,
+    ) -> u64 {
+        use crate::metrics::test_support::log_unit_undelivered_total;
+        for _ in 0..200 {
+            if log_unit_undelivered_total(snapshotter) == expected {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        log_unit_undelivered_total(snapshotter)
+    }
+
+    /// Spec 17 §17.3: the streaming close sink has no caller to return an
+    /// error to, so each close record it cannot queue increments
+    /// `scp_log_unit_undelivered_total`: a context with no actor, a record the
+    /// log's payload rules refuse at planning while the actor is live, and a
+    /// dropped Supervisor, whose hand-off never runs.
+    #[test]
+    fn outlet_invoked_sink_counts_each_record_it_cannot_queue() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a current-thread runtime");
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(outlet_invoked_sink_failures(&snapshotter));
+        });
+    }
+
+    async fn outlet_invoked_sink_failures(snapshotter: &metrics_util::debugging::Snapshotter) {
+        use super::ActorOutletInvokedEventSink;
+        use crate::context::outlets::invoke::OutletInvokedEventSink;
+
+        let no_actor = build_supervisor(None);
+        ActorOutletInvokedEventSink::new(
+            Arc::downgrade(&no_actor),
+            "ctx-with-no-actor".to_owned(),
+            INVOKER.to_owned(),
+        )
+        .record(close_event(3, 3));
+        assert_eq!(
+            undelivered_reaches(snapshotter, 1).await,
+            1,
+            "a close record for a context with no actor is counted"
+        );
+
+        let live = build_supervisor(None);
+        let deps = deps_for(&live).await;
+        live.spawn_actor_with_state(member_state(0, 0), deps, None)
+            .await
+            .expect("register the actor");
+        ActorOutletInvokedEventSink::new(Arc::downgrade(&live), ctx_key(), INVOKER.to_owned())
+            .record(close_event(3, 4));
+        assert_eq!(
+            undelivered_reaches(snapshotter, 2).await,
+            2,
+            "a close record the payload rules refuse is counted"
+        );
+
+        ActorOutletInvokedEventSink::new(std::sync::Weak::new(), ctx_key(), INVOKER.to_owned())
+            .record(close_event(3, 3));
+        assert_eq!(
+            undelivered_reaches(snapshotter, 3).await,
+            3,
+            "a close record whose Supervisor dropped is counted"
         );
     }
 

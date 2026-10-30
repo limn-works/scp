@@ -52,6 +52,7 @@ use crate::context::actor::handle::ContextActorHandle;
 use crate::context::actor::outcome::Outcome;
 use crate::context::actor::{BoundedReplyError, bounded_reply_await};
 use crate::context::builder::{ContextEventLogProvider, ContextTransportProvider};
+use crate::context::log_unit_helpers::LogUnitSendError;
 use crate::context::outlets::stream::{OriginAdmissionTracker, StreamAdmissionTracker};
 use crate::context::persistence::ContextPersistence;
 use crate::context::supervisor::key_package_actor::KeyPackageStoreHandle;
@@ -922,10 +923,6 @@ const _: () = assert!(
         > COMMIT_EXECUTOR_TIMEOUT.as_secs()
             + crate::context::actor::signer::SIGNING_HANDLER_TIMEOUT.as_secs()
 );
-
-/// Sends [`Supervisor::send_log_unit`] makes before it reports a full mailbox.
-/// Each send already waits up to the mailbox send timeout for capacity.
-const LOG_UNIT_SEND_ATTEMPTS: u32 = 3;
 
 /// Number of crashes within [`CRASH_WINDOW_MS`] that poisons a context
 /// (ADR-049 §10): "3 crashes in 60s poisons the context."
@@ -3160,17 +3157,19 @@ impl Supervisor {
     ///
     /// # Errors
     ///
-    /// - [`ContextError::NotInitialized`] when the Supervisor has no clock.
-    /// - [`ContextError::EventLogFailed`] when the event does not serialize or
+    /// - [`LogUnitSendError::NotQueued`] with [`ContextError::NotInitialized`]
+    ///   when the Supervisor has no clock, or with
+    ///   [`ContextError::EventLogFailed`] when the event does not serialize or
     ///   breaks the payload backstop.
     /// - The errors of [`Self::send_log_unit`] when the context's actor is
-    ///   absent, its mailbox stays full, it does not reply, or the enqueue fails.
+    ///   absent, its mailbox stays full, its reply is lost, or the enqueue
+    ///   fails.
     pub(crate) async fn enqueue_streaming_outlet_invoked_unit(
         &self,
         context_id: &str,
         event: scp_protocol::context::outlets::lifecycle::OutletInvokedEvent,
         actor_did: String,
-    ) -> Result<(), ContextError> {
+    ) -> Result<(), LogUnitSendError> {
         let data = serde_json::to_vec(&event).map_err(|e| {
             ContextError::EventLogFailed(format!("failed to serialize OutletInvokedEvent: {e}"))
         })?;
@@ -9701,24 +9700,26 @@ impl Supervisor {
                 // Money already moved on the first settle. The seal task resolves
                 // `Committed` only after BOTH the settle applied and the A-side
                 // leaf was queued, so a settled witness on a `Committing` entry
-                // can mean the A-side send failed: re-send it with
-                // `UnitDedup::IfAbsent` (a leaf already queued or logged lands
-                // once), then resolve. A failed send leaves the entry
-                // `Committing` for the next sweep (spec 17 §17.3).
-                if let Err(err) = crate::context::outlets::invoke::send_streaming_saga_a_unit(
-                    self, saga_id, &a_event,
-                )
-                .await
-                {
-                    tracing::error!(
-                        saga_id = %saga_id,
-                        %err,
-                        "streaming saga recovery — witness settled, but the A-side \
-                         CrossContextOutletInvoked leaf was not queued; left Committing for the \
-                         next sweep"
-                    );
-                    return;
-                }
+                // can mean the A-side send failed: re-send it, then resolve. A
+                // failed send leaves the entry `Committing` for the next sweep,
+                // unless A's context is deleted (spec 17 §17.3).
+                let caller_deleted =
+                    match crate::context::outlets::invoke::send_streaming_saga_a_unit(
+                        self, saga_id, &a_event,
+                    )
+                    .await
+                    {
+                        Ok(()) => false,
+                        Err(err) => {
+                            if !self
+                                .streaming_a_record_caller_deleted(saga_id, &a_event, &err)
+                                .await
+                            {
+                                return;
+                            }
+                            true
+                        }
+                    };
                 if let Err(err) = self
                     .saga_journal
                     .mark_resolved(saga_id.clone(), SagaTerminalState::Committed, false)
@@ -9732,6 +9733,9 @@ impl Supervisor {
                          sweep"
                     );
                     return;
+                }
+                if caller_deleted {
+                    Self::report_streaming_a_record_lost(saga_id);
                 }
                 tracing::info!(
                     saga_id = %saga_id,
@@ -9856,19 +9860,23 @@ impl Supervisor {
 
         // The seal task sends the A-side leaf BEFORE the money move, so the leaf
         // may already be queued or logged (a seal task whose settle deferred);
-        // `IfAbsent` skips a byte-identical leaf found in A's log or queue.
-        if let Err(err) =
-            crate::context::outlets::invoke::send_streaming_saga_a_unit(self, saga_id, &a_event)
-                .await
+        // A's per-saga dedup queues it once.
+        let caller_deleted = match crate::context::outlets::invoke::send_streaming_saga_a_unit(
+            self, saga_id, &a_event,
+        )
+        .await
         {
-            tracing::error!(
-                saga_id = %saga_id,
-                %err,
-                "streaming saga recovery — settled, but the A-side CrossContextOutletInvoked \
-                 leaf was not queued; left Committing for the next sweep"
-            );
-            return;
-        }
+            Ok(()) => false,
+            Err(err) => {
+                if !self
+                    .streaming_a_record_caller_deleted(saga_id, &a_event, &err)
+                    .await
+                {
+                    return;
+                }
+                true
+            }
+        };
 
         if let Err(err) = self
             .saga_journal
@@ -9883,10 +9891,67 @@ impl Supervisor {
             );
             return;
         }
+        if caller_deleted {
+            Self::report_streaming_a_record_lost(saga_id);
+        }
         tracing::info!(
             saga_id = %saga_id,
             "streaming saga recovery — witness present + unsettled; completed the escrow \
              refund + counter release keylessly and resolved Committed"
+        );
+    }
+
+    /// Classifies a failed A-side send of a sealed streaming saga during the
+    /// keyless sweep (spec 17 §17.3 "Event log write failures").
+    ///
+    /// Returns `true` when the send did not queue the record and A's context
+    /// is deleted from durable persistence
+    /// ([`Self::caller_context_deleted_from_persistence`]): the record has no
+    /// log to land in, so the caller resolves the saga and then calls
+    /// [`Self::report_streaming_a_record_lost`] once. Otherwise it logs the
+    /// failure and returns `false`, and the caller leaves the saga
+    /// `Committing`: a later sweep re-sends the record, and A's per-saga dedup
+    /// queues it once.
+    async fn streaming_a_record_caller_deleted(
+        &self,
+        saga_id: &SagaId,
+        a_event: &crate::context::actor::commands::CommitBStreamSettleOutcome,
+        err: &LogUnitSendError,
+    ) -> bool {
+        let deleted = match err {
+            LogUnitSendError::NotQueued(_) => {
+                match crate::context::outlets::invoke::plan_streaming_saga_a_leaf(saga_id, a_event)
+                {
+                    Ok((caller_hex, _)) => {
+                        self.caller_context_deleted_from_persistence(&caller_hex)
+                            .await
+                    }
+                    Err(_) => false,
+                }
+            }
+            LogUnitSendError::OutcomeUnknown(_) => false,
+        };
+        if !deleted {
+            tracing::error!(
+                saga_id = %saga_id,
+                %err,
+                "streaming saga recovery — the A-side CrossContextOutletInvoked leaf was not \
+                 queued; left Committing for the next sweep"
+            );
+        }
+        deleted
+    }
+
+    /// Logs and counts, once, the A-side record of a streaming saga the sweep
+    /// resolved after A's context was deleted (spec 17 §17.3 "Event log write
+    /// failures"). B's record and the money move stand; A's log, which no
+    /// longer exists, lacks the record.
+    fn report_streaming_a_record_lost(saga_id: &SagaId) {
+        crate::metrics::record_log_unit_undelivered();
+        tracing::error!(
+            saga_id = %saga_id,
+            "streaming saga recovery — the caller context is deleted, so its \
+             CrossContextOutletInvoked record has no log to land in; resolved Committed"
         );
     }
 
@@ -18430,57 +18495,44 @@ impl Supervisor {
 
     /// Queues `request`'s records in `ctx_id`'s pending log units through its
     /// actor, and returns once the actor replied (spec 17 §17.3 "Event log
-    /// write failures"). A send the mailbox refused was never delivered, so it
-    /// is retried, up to [`LOG_UNIT_SEND_ATTEMPTS`] sends in all; a delivered
-    /// command is never re-sent here, because its reply alone says whether the
-    /// unit was queued.
+    /// write failures"). It sends once: the mailbox send already waits for
+    /// capacity up to its timeout, and a delivered command's reply alone says
+    /// whether the unit was queued.
     ///
     /// # Errors
     ///
-    /// - The lookup errors of [`Self::dispatch_log_unit_command`] when no actor
-    ///   serves `ctx_id`.
-    /// - [`ContextError::ActorBusy`] when the mailbox refused every send, or the
-    ///   actor did not reply within the reply bound.
-    /// - [`ContextError::TransportFailed`] when the actor dropped the reply.
-    /// - The handler's error when planning, the dedup read, or the persist
-    ///   failed; the queue is then unchanged.
+    /// - [`LogUnitSendError::NotQueued`] with the lookup errors of
+    ///   [`Self::dispatch_log_unit_command`] when no actor serves `ctx_id`, with
+    ///   [`ContextError::ActorBusy`] when the mailbox stayed full, or with the
+    ///   handler's error when planning, the dedup read, or the persist failed;
+    ///   the queue is then unchanged.
+    /// - [`LogUnitSendError::OutcomeUnknown`] when the actor took the command
+    ///   but dropped the reply or did not reply within the reply bound, so the
+    ///   unit may have been queued.
     pub(in crate::context) async fn send_log_unit(
         &self,
         ctx_id: &str,
         request: LogUnitRequest,
         dedup: UnitDedup,
-    ) -> Result<(), ContextError> {
-        let mut attempt = 1;
-        loop {
-            let (reply, rx) = tokio::sync::oneshot::channel();
-            let cmd = LogUnitCommand::Enqueue {
-                request: request.clone(),
-                dedup,
-                reply,
-            };
-            match self.dispatch_log_unit_command(ctx_id, cmd).await {
-                Ok(_) => {
-                    return match bounded_reply_await(rx).await {
-                        Ok(reply) => reply,
-                        Err(BoundedReplyError::Dropped) => Err(ContextError::TransportFailed(
-                            format!("send_log_unit — the actor of `{ctx_id}` dropped the reply"),
-                        )),
-                        Err(BoundedReplyError::Elapsed) => Err(ContextError::ActorBusy(format!(
-                            "send_log_unit — the actor of `{ctx_id}` did not reply in time"
-                        ))),
-                    };
-                }
-                Err(ContextError::ActorBusy(detail)) if attempt < LOG_UNIT_SEND_ATTEMPTS => {
-                    tracing::warn!(
-                        context_id = ctx_id,
-                        attempt,
-                        detail = %detail,
-                        "log unit send refused by the mailbox; retrying"
-                    );
-                    attempt += 1;
-                    tokio::task::yield_now().await;
-                }
-                Err(err) => return Err(err),
+    ) -> Result<(), LogUnitSendError> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let cmd = LogUnitCommand::Enqueue {
+            request,
+            dedup,
+            reply,
+        };
+        self.dispatch_log_unit_command(ctx_id, cmd).await?;
+        match bounded_reply_await(rx).await {
+            Ok(reply) => Ok(reply?),
+            Err(BoundedReplyError::Dropped) => Err(LogUnitSendError::OutcomeUnknown(
+                ContextError::TransportFailed(format!(
+                    "send_log_unit — the actor of `{ctx_id}` dropped the reply"
+                )),
+            )),
+            Err(BoundedReplyError::Elapsed) => {
+                Err(LogUnitSendError::OutcomeUnknown(ContextError::ActorBusy(
+                    format!("send_log_unit — the actor of `{ctx_id}` did not reply in time"),
+                )))
             }
         }
     }
@@ -34403,8 +34455,7 @@ mod tests {
         );
     }
 
-    /// A log-unit command that `send_log_unit` cannot deliver after its
-    /// bounded retries.
+    /// A log-unit command that fills a one-slot mailbox.
     fn ss_empty_log_unit(
         reply: tokio::sync::oneshot::Sender<Result<(), ContextError>>,
     ) -> ContextCommand {
@@ -34416,8 +34467,7 @@ mod tests {
     }
 
     /// Spec 17 §17.3: a full mailbox refuses the log unit. `send_log_unit`
-    /// retries the undelivered command a bounded number of times, then returns
-    /// `ActorBusy` to its caller, and delivers nothing.
+    /// returns `NotQueued(ActorBusy)` to its caller and delivers nothing.
     #[tokio::test(start_paused = true)]
     async fn send_log_unit_to_a_full_mailbox_fails_closed() {
         let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
@@ -34439,8 +34489,15 @@ mod tests {
             )
             .await;
         assert!(
-            matches!(sent, Err(ContextError::ActorBusy(_))),
-            "a mailbox that stays full returns ActorBusy, got {sent:?}"
+            matches!(
+                sent,
+                Err(
+                    crate::context::log_unit_helpers::LogUnitSendError::NotQueued(
+                        ContextError::ActorBusy(_)
+                    )
+                )
+            ),
+            "a mailbox that stays full returns NotQueued(ActorBusy), got {sent:?}"
         );
         assert!(rx.try_recv().is_ok(), "the prefill is still queued");
         assert!(
@@ -34449,11 +34506,11 @@ mod tests {
         );
     }
 
-    /// A log unit delivered to an actor that never replies returns `ActorBusy`
-    /// after the reply bound, and is not re-sent: a delivered command may still
-    /// run, so a re-send could queue the unit twice.
+    /// A log unit delivered to an actor that never replies returns
+    /// `OutcomeUnknown` after the reply bound, not `NotQueued`: the delivered
+    /// command may still run and queue the unit (spec 17 §17.3).
     #[tokio::test(start_paused = true)]
-    async fn send_log_unit_is_not_resent_after_delivery() {
+    async fn send_log_unit_with_a_lost_reply_reports_the_outcome_unknown() {
         let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
         let sup =
             supervisor_with_clock_and_persistence(clock_dyn, Box::new(MapPersistence::default()));
@@ -34470,11 +34527,14 @@ mod tests {
             )
             .await;
         assert!(
-            matches!(sent, Err(ContextError::ActorBusy(_))),
-            "an actor that never replies returns ActorBusy, got {sent:?}"
+            matches!(
+                sent,
+                Err(crate::context::log_unit_helpers::LogUnitSendError::OutcomeUnknown(_))
+            ),
+            "an actor that never replies returns OutcomeUnknown, got {sent:?}"
         );
         assert!(rx.try_recv().is_ok(), "the log unit was delivered once");
-        assert!(rx.try_recv().is_err(), "the log unit was not re-sent");
+        assert!(rx.try_recv().is_err(), "the log unit was sent once");
     }
 
     /// A log unit for a context no actor serves fails with the lookup-miss
@@ -34492,9 +34552,35 @@ mod tests {
             )
             .await;
         assert!(
-            matches!(sent, Err(ContextError::ContextNotRegistered(_))),
+            matches!(
+                sent,
+                Err(
+                    crate::context::log_unit_helpers::LogUnitSendError::NotQueued(
+                        ContextError::ContextNotRegistered(_)
+                    )
+                )
+            ),
             "an absent actor fails closed, got {sent:?}"
         );
+    }
+
+    /// A close-time `OutletInvokedEvent` hand-off that never ran is a record
+    /// no caller waits on, so it increments `scp_log_unit_undelivered_total`;
+    /// a settlement hand-off that never ran counts nothing here (spec 17
+    /// §17.3).
+    #[test]
+    fn a_dropped_outlet_invoked_hand_off_counts_one_undelivered_record() {
+        use super::SinkHandoff;
+        use crate::metrics::test_support::log_unit_undelivered_total;
+
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            SinkHandoff::StreamSettlement.record_not_run();
+            assert_eq!(log_unit_undelivered_total(&snapshotter), 0);
+            SinkHandoff::OutletInvokedEventAppend.record_not_run();
+            assert_eq!(log_unit_undelivered_total(&snapshotter), 1);
+        });
     }
 
     /// A context in the respawn gap, and a context whose last respawn failed
@@ -44821,6 +44907,21 @@ mod streaming_saga_tests {
         journal: Arc<dyn SagaJournal>,
         event_log: Box<dyn ContextEventLogProvider>,
     ) -> Arc<Supervisor> {
+        build_ss_supervisor_with_persistence(
+            captured,
+            journal,
+            event_log,
+            Box::new(crate::context::persistence::NoOpContextPersistence),
+        )
+    }
+
+    /// [`build_ss_supervisor`] over `persistence`.
+    fn build_ss_supervisor_with_persistence(
+        captured: &Arc<AtomicUsize>,
+        journal: Arc<dyn SagaJournal>,
+        event_log: Box<dyn ContextEventLogProvider>,
+        persistence: Box<dyn crate::context::persistence::ContextPersistence>,
+    ) -> Arc<Supervisor> {
         let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             ss_creator(),
             Arc::new(scp_clock::SystemClock),
@@ -44844,7 +44945,7 @@ mod streaming_saga_tests {
             transport,
             event_log,
             key_resolver,
-            Box::new(crate::context::persistence::NoOpContextPersistence),
+            persistence,
             Some(payment_adapter),
             None,
             Some(clock),
@@ -46209,6 +46310,69 @@ mod streaming_saga_tests {
     /// Drives a paid streaming saga into the seal→settle crash window (see
     /// `xctx_streaming_crash_after_witness_before_settle_recovers_exactly_once`).
     async fn ss_drive_crash_window() -> SsCrashWindow {
+        Box::pin(ss_drive_crash_window_with(Box::new(
+            crate::context::persistence::NoOpContextPersistence,
+        )))
+        .await
+    }
+
+    /// A persistence that keeps every snapshot it is given, so the sweep's
+    /// deletion check reads a persisted context as present, and a test deletes
+    /// one by removing it.
+    #[derive(Clone, Default)]
+    struct SsPersistence {
+        contexts: Arc<dashmap::DashMap<String, crate::context::state::ContextSnapshot>>,
+    }
+
+    impl SsPersistence {
+        /// Stores the caller context's snapshot, as a durable caller has one.
+        fn persist_caller(&self) {
+            self.contexts.insert(
+                hex::encode(SS_CALLER),
+                crate::context::manager_methods::snapshot_context(&ss_caller_state_for(
+                    SS_CALLER, SS_TARGET,
+                )),
+            );
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::context::persistence::ContextPersistence for SsPersistence {
+        async fn persist_context(
+            &self,
+            id: &str,
+            snap: &crate::context::state::ContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.contexts.insert(id.to_owned(), snap.clone());
+            Ok(())
+        }
+        async fn load_context(
+            &self,
+            id: &str,
+        ) -> Result<
+            Option<crate::context::state::ContextSnapshot>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(self.contexts.get(id).map(|s| s.value().clone()))
+        }
+        async fn delete_context(
+            &self,
+            id: &str,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.contexts.remove(id);
+            Ok(())
+        }
+        async fn list_persisted_contexts(
+            &self,
+        ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self.contexts.iter().map(|e| e.key().clone()).collect())
+        }
+    }
+
+    /// [`ss_drive_crash_window`] over `persistence`.
+    async fn ss_drive_crash_window_with(
+        persistence: Box<dyn crate::context::persistence::ContextPersistence>,
+    ) -> SsCrashWindow {
         use crate::context::actor::commands::StreamSettleApplication;
 
         let captured = Arc::new(AtomicUsize::new(0));
@@ -46217,8 +46381,12 @@ mod streaming_saga_tests {
         let journal: Arc<dyn SagaJournal> =
             Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
         let recording = SsRecordingEventLog::default();
-        let supervisor =
-            build_ss_supervisor(&captured, Arc::clone(&journal), Box::new(recording.clone()));
+        let supervisor = build_ss_supervisor_with_persistence(
+            &captured,
+            Arc::clone(&journal),
+            Box::new(recording.clone()),
+            persistence,
+        );
         spawn_ss_pair(&supervisor).await;
 
         let registry = ss_registry();
@@ -46467,8 +46635,10 @@ mod streaming_saga_tests {
     /// nothing, and the money moved exactly once throughout.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn log_unit_command_to_a_gone_actor_fails_closed() {
-        let window = Box::pin(ss_drive_crash_window()).await;
+        let persistence = SsPersistence::default();
+        let window = Box::pin(ss_drive_crash_window_with(Box::new(persistence.clone()))).await;
         let caller_hex = hex::encode(SS_CALLER);
+        persistence.persist_caller();
         assert!(
             window.supervisor.despawn_actor(&caller_hex).await,
             "the caller actor was resident and is now gone"
@@ -46509,6 +46679,78 @@ mod streaming_saga_tests {
         recovered_assertions(&window).await;
     }
 
+    /// Spec 17 §17.3: when A's context is deleted from durable persistence,
+    /// its `CrossContextOutletInvoked` record has no log to land in. The sweep
+    /// resolves the saga `Committed` (B's record and the money move stand) and
+    /// logs and counts the lost record once; a later sweep has nothing to retry
+    /// and counts nothing more.
+    #[test]
+    fn recovery_retires_the_saga_once_when_the_caller_context_is_deleted() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("a multi-thread runtime");
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(Box::pin(deleted_caller_retires_the_saga(&snapshotter)));
+        });
+    }
+
+    async fn deleted_caller_retires_the_saga(snapshotter: &metrics_util::debugging::Snapshotter) {
+        use crate::metrics::test_support::log_unit_undelivered_total;
+        let persistence = SsPersistence::default();
+        let window = Box::pin(ss_drive_crash_window_with(Box::new(persistence.clone()))).await;
+        let caller_hex = hex::encode(SS_CALLER);
+        persistence.persist_caller();
+        assert!(
+            window.supervisor.despawn_actor(&caller_hex).await,
+            "the caller actor was resident and is now gone"
+        );
+        assert!(
+            persistence.contexts.remove(&caller_hex).is_some(),
+            "the caller context was persisted, and is now deleted"
+        );
+
+        window
+            .supervisor
+            .replay_unresolved_sagas(&super::RestoredContexts::new(Vec::new()))
+            .await
+            .expect("keyless recovery sweep runs");
+        assert_eq!(
+            ss_saga_state(&window.journal, &window.saga_id).await,
+            None,
+            "a deleted caller retires the saga to Committed"
+        );
+        assert_eq!(
+            ss_caller_a_leaves(&window.recording),
+            0,
+            "no A-side leaf is written for a deleted caller"
+        );
+        assert_eq!(
+            window.captured.load(Ordering::SeqCst),
+            1,
+            "the settlement moved the money once"
+        );
+        assert_eq!(
+            log_unit_undelivered_total(snapshotter),
+            1,
+            "the lost A-side record is counted once"
+        );
+
+        window
+            .supervisor
+            .replay_unresolved_sagas(&super::RestoredContexts::new(Vec::new()))
+            .await
+            .expect("a later sweep runs");
+        assert_eq!(
+            log_unit_undelivered_total(snapshotter),
+            1,
+            "a later sweep counts nothing more"
+        );
+    }
+
     /// Spec 17 §17.3: the seal task resolves the saga `Committed` only when the
     /// settle applied AND A's `CrossContextOutletInvoked` record was queued.
     /// With the caller's actor gone at close, the settle still moves the money
@@ -46523,8 +46765,14 @@ mod streaming_saga_tests {
         let journal: Arc<dyn SagaJournal> =
             Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
         let recording = SsRecordingEventLog::default();
-        let supervisor =
-            build_ss_supervisor(&captured, Arc::clone(&journal), Box::new(recording.clone()));
+        let persistence = SsPersistence::default();
+        persistence.persist_caller();
+        let supervisor = build_ss_supervisor_with_persistence(
+            &captured,
+            Arc::clone(&journal),
+            Box::new(recording.clone()),
+            Box::new(persistence),
+        );
         spawn_ss_pair(&supervisor).await;
 
         let registry = ss_registry();

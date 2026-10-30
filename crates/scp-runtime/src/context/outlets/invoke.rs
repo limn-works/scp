@@ -5189,10 +5189,12 @@ pub(crate) async fn run_cross_context_bridge(
 /// §17.3 "Event log write failures").
 ///
 /// The bridge runs after the open returned A's receiver, so no caller waits on
-/// this record: a planning failure, a dropped Supervisor, an absent A actor, a
-/// full mailbox after the send's retries, or a refused enqueue is logged at
-/// error level and counted by `scp_log_unit_undelivered_total`. Returns whether
-/// the record was queued.
+/// this record, and
+/// [`report_background_log_unit`](crate::context::log_unit_helpers::report_background_log_unit)
+/// reports the result: a planning failure, a dropped Supervisor, an absent A
+/// actor, a full mailbox, or a refused enqueue is logged at error level and
+/// counted by `scp_log_unit_undelivered_total`; a lost reply is logged at warn
+/// level. Returns whether the record is known to be queued.
 pub(crate) async fn send_cross_context_a_unit(
     supervisor: &std::sync::Weak<crate::context::supervisor::Supervisor>,
     receiving_context_id: &str,
@@ -5201,12 +5203,15 @@ pub(crate) async fn send_cross_context_a_unit(
         scp_protocol::context::ContextError,
     >,
 ) -> bool {
+    use crate::context::log_unit_helpers::LogUnitSendError;
     let sent = match (request, supervisor.upgrade()) {
-        (Err(err), _) => Err(err),
-        (Ok(_), None) => Err(scp_protocol::context::ContextError::SupervisorShutDown(
-            "cross-context bridge: the Supervisor dropped before A's OutletInvoked record was \
-             queued"
-                .to_owned(),
+        (Err(err), _) => Err(LogUnitSendError::NotQueued(err)),
+        (Ok(_), None) => Err(LogUnitSendError::NotQueued(
+            scp_protocol::context::ContextError::SupervisorShutDown(
+                "cross-context bridge: the Supervisor dropped before A's OutletInvoked record \
+                 was queued"
+                    .to_owned(),
+            ),
         )),
         (Ok(request), Some(sup)) => {
             sup.send_log_unit(
@@ -5217,19 +5222,11 @@ pub(crate) async fn send_cross_context_a_unit(
             .await
         }
     };
-    match sent {
-        Ok(()) => true,
-        Err(err) => {
-            crate::metrics::record_log_unit_undelivered();
-            tracing::error!(
-                %err,
-                context_id = %receiving_context_id,
-                "cross-context bridge: A-side OutletInvoked record was not queued; A's log \
-                 lacks this stream's record (spec 17 §17.3)"
-            );
-            false
-        }
-    }
+    crate::context::log_unit_helpers::report_background_log_unit(
+        receiving_context_id,
+        "cross-context bridge A-side OutletInvoked",
+        sent,
+    )
 }
 
 /// The transactional streaming-saga seal task (SCP-OUT-046 #134; the ADR-061
@@ -5555,11 +5552,15 @@ pub(crate) async fn run_streaming_saga_seal_task(
             // (spec 17 §17.3).
             let a_sent = match supervisor.upgrade() {
                 Some(sup) => send_streaming_saga_a_unit(&sup, &saga_id, &outcome).await,
-                None => Err(scp_protocol::context::ContextError::SupervisorShutDown(
-                    "streaming-saga seal task: supervisor dropped before the A-side leaf was \
-                     queued"
-                        .to_owned(),
-                )),
+                None => Err(
+                    crate::context::log_unit_helpers::LogUnitSendError::NotQueued(
+                        scp_protocol::context::ContextError::SupervisorShutDown(
+                            "streaming-saga seal task: supervisor dropped before the A-side leaf \
+                         was queued"
+                                .to_owned(),
+                        ),
+                    ),
+                ),
             };
             if let Err(err) = &a_sent {
                 tracing::error!(
@@ -5706,15 +5707,16 @@ pub(crate) async fn run_streaming_saga_seal_task(
 ///
 /// # Errors
 ///
-/// - [`ContextError::EventLogFailed`](scp_protocol::context::ContextError::EventLogFailed)
+/// - `LogUnitSendError::NotQueued` with
+///   [`ContextError::EventLogFailed`](scp_protocol::context::ContextError::EventLogFailed)
 ///   when the sealed receipt does not parse or the payload does not serialize.
 /// - The errors of `Supervisor::send_log_unit` when A's actor is absent, its
-///   mailbox stays full, it does not reply, or the enqueue fails.
+///   mailbox stays full, its reply is lost, or the enqueue fails.
 pub(crate) async fn send_streaming_saga_a_unit(
     supervisor: &crate::context::supervisor::Supervisor,
     saga_id: &crate::context::supervisor::saga_journal::SagaId,
     outcome: &crate::context::actor::commands::CommitBStreamSettleOutcome,
-) -> Result<(), scp_protocol::context::ContextError> {
+) -> Result<(), crate::context::log_unit_helpers::LogUnitSendError> {
     let (caller_context_hex, leaf) = plan_streaming_saga_a_leaf(saga_id, outcome)?;
     supervisor
         .send_log_unit(
@@ -6166,13 +6168,34 @@ mod tests {
 
     /// The bridge's A-side record has no caller at close: a dropped
     /// Supervisor, a context with no actor, or a planning failure takes the
-    /// undelivered branch, which reports `false` (and logs and counts the
-    /// drop) instead of queuing.
-    #[tokio::test]
-    async fn cross_context_a_unit_without_a_supervisor_is_undelivered() {
+    /// undelivered branch, which reports `false` and increments
+    /// `scp_log_unit_undelivered_total` once per dropped record instead of
+    /// queuing (spec 17 §17.3).
+    #[test]
+    fn cross_context_a_unit_without_a_supervisor_is_undelivered() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a current-thread runtime");
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(cross_context_a_unit_undelivered_branches(&snapshotter));
+        });
+    }
+
+    async fn cross_context_a_unit_undelivered_branches(
+        snapshotter: &metrics_util::debugging::Snapshotter,
+    ) {
+        use crate::metrics::test_support::log_unit_undelivered_total;
         let request = crate::context::actor::commands::LogUnitRequest::Leaves(Vec::new());
         assert!(
             !send_cross_context_a_unit(&std::sync::Weak::new(), "ctx", Ok(request.clone())).await
+        );
+        assert_eq!(
+            log_unit_undelivered_total(snapshotter),
+            1,
+            "a dropped Supervisor counts the record"
         );
         let supervisor = crate::context::test_supervisor(
             std::sync::Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
@@ -6192,10 +6215,20 @@ mod tests {
             .await,
             "a receiving context with no actor is undelivered"
         );
+        assert_eq!(
+            log_unit_undelivered_total(snapshotter),
+            2,
+            "a receiving context with no actor counts the record"
+        );
         let refused = Err(scp_protocol::context::ContextError::EventLogFailed(
             "manifest".to_owned(),
         ));
         assert!(!send_cross_context_a_unit(&std::sync::Weak::new(), "ctx", refused).await);
+        assert_eq!(
+            log_unit_undelivered_total(snapshotter),
+            3,
+            "a record that did not plan counts"
+        );
     }
 
     /// Creates a `ContextRoleState` with a creator that has admin (all) capabilities.

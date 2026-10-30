@@ -137,6 +137,82 @@ impl Drop for ConsequenceSink {
     }
 }
 
+/// Why a log-unit send from outside a context's actor did not return `Ok`
+/// (spec 17 §17.3 "Event log write failures").
+#[derive(Debug)]
+pub enum LogUnitSendError {
+    /// The unit was not queued: its leaf did not plan, no actor serves the
+    /// context, the mailbox refused the command, or the actor replied with the
+    /// enqueue's error.
+    NotQueued(ContextError),
+    /// The actor received the command, but its reply was dropped or did not
+    /// arrive in time, so the unit may have been queued.
+    OutcomeUnknown(ContextError),
+}
+
+impl From<ContextError> for LogUnitSendError {
+    fn from(err: ContextError) -> Self {
+        Self::NotQueued(err)
+    }
+}
+
+impl std::fmt::Display for LogUnitSendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotQueued(err) => write!(f, "log unit not queued: {err}"),
+            Self::OutcomeUnknown(err) => {
+                write!(f, "log unit delivered, outcome unknown: {err}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for LogUnitSendError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::NotQueued(err) | Self::OutcomeUnknown(err) => Some(err),
+        }
+    }
+}
+
+/// Reports the result of a log-unit send that no caller waits on (spec 17
+/// §17.3 "Event log write failures"), and returns whether the unit is known
+/// to be queued.
+///
+/// A unit that was not queued is lost from `context_id`'s log, so it logs at
+/// error level and increments `scp_log_unit_undelivered_total`. A unit whose
+/// outcome is unknown may still land, so it logs at warn level and counts
+/// nothing. `record` names the record in the log line.
+pub fn report_background_log_unit(
+    context_id: &str,
+    record: &str,
+    sent: Result<(), LogUnitSendError>,
+) -> bool {
+    match sent {
+        Ok(()) => true,
+        Err(LogUnitSendError::NotQueued(err)) => {
+            crate::metrics::record_log_unit_undelivered();
+            tracing::error!(
+                %err,
+                context_id,
+                record,
+                "log unit was not queued; the context's log lacks this record (spec 17 §17.3)"
+            );
+            false
+        }
+        Err(LogUnitSendError::OutcomeUnknown(err)) => {
+            tracing::warn!(
+                %err,
+                context_id,
+                record,
+                "log unit was delivered but its reply was lost; the record may still land \
+                 (spec 17 §17.3)"
+            );
+            false
+        }
+    }
+}
+
 /// Queues `leaves` as one pending log unit, counted toward the §9.9.3
 /// checkpoint triggers, in one fail-closed keep persist that also carries
 /// every in-memory mutation the step made before it (spec 17 §17.3 "Event log
@@ -1317,6 +1393,46 @@ mod tests {
         EventPayload {
             data: vec![0xC0, tag],
         }
+    }
+
+    /// A background send that did not queue its unit logs and counts it; one
+    /// whose reply was lost may still land, so it counts nothing; a queued one
+    /// reports `true` (spec 17 §17.3 "Event log write failures").
+    #[test]
+    fn background_log_unit_report_counts_only_an_unqueued_unit() {
+        use super::{LogUnitSendError, report_background_log_unit};
+        use crate::metrics::test_support::log_unit_undelivered_total;
+
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            assert!(report_background_log_unit("ctx", "record", Ok(())));
+            assert_eq!(log_unit_undelivered_total(&snapshotter), 0);
+            assert!(!report_background_log_unit(
+                "ctx",
+                "record",
+                Err(LogUnitSendError::OutcomeUnknown(ContextError::ActorBusy(
+                    "late reply".to_owned()
+                ))),
+            ));
+            assert_eq!(
+                log_unit_undelivered_total(&snapshotter),
+                0,
+                "a unit whose outcome is unknown is not counted undelivered"
+            );
+            assert!(!report_background_log_unit(
+                "ctx",
+                "record",
+                Err(LogUnitSendError::NotQueued(
+                    ContextError::ContextNotRegistered("gone".to_owned())
+                )),
+            ));
+            assert_eq!(
+                log_unit_undelivered_total(&snapshotter),
+                1,
+                "a unit that was not queued is counted once"
+            );
+        });
     }
 
     /// A `KeyEpochAdvance` record is planned from the epoch before the

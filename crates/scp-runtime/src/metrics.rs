@@ -141,3 +141,26 @@ pub fn set_buffer_occupancy(count: usize) {
     #[allow(clippy::cast_precision_loss)]
     metrics::gauge!("scp_buffer_occupancy").set(count as f64);
 }
+
+/// Test reads of the counters this module records.
+#[cfg(test)]
+pub(crate) mod test_support {
+    /// Reads `scp_log_unit_undelivered_total` from a `DebuggingRecorder`
+    /// snapshot; 0 when nothing incremented it.
+    pub fn log_unit_undelivered_total(snapshotter: &metrics_util::debugging::Snapshotter) -> u64 {
+        use metrics_util::debugging::DebugValue;
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(key, _, _, value)| match value {
+                DebugValue::Counter(count)
+                    if key.key().name() == "scp_log_unit_undelivered_total" =>
+                {
+                    Some(count)
+                }
+                _ => None,
+            })
+            .unwrap_or(0)
+    }
+}
