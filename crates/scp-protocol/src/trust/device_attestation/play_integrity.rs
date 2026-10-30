@@ -45,7 +45,7 @@ const CLOCK_SKEW_SECS: u64 = 300;
 
 /// The verdict's length: `verifier ‖ package_hash ‖ cert_digest ‖
 /// BE64(token_issued_at) ‖ BE64(checked_at) ‖ signature`.
-pub(super) const VERDICT_LEN: usize = 176;
+pub const VERDICT_LEN: usize = 176;
 
 /// The verdict signature's separator (§9.18.2), with no length prefix.
 const VERDICT_SEPARATOR: &[u8; 30] = b"SCP-PLAY-INTEGRITY-VERDICT-V1:";
@@ -94,18 +94,38 @@ pub(super) struct PlayIntegrityRead<'a> {
     /// seconds. One value serves both, so the two checks cannot read
     /// different clocks.
     pub(super) now: Duration,
-    /// The service-record entry's `id`, which a `Verified` outcome carries.
-    pub(super) entry_id: &'a str,
 }
 
-/// Runs Play Integrity checks 1 through 6.
+/// Runs Play Integrity checks 1 through 6 for the reader, whose `Verified`
+/// outcome carries the service-record entry's `id`.
 ///
 /// # Errors
 ///
 /// The first failing check's [`PlayIntegrityFailure`].
 pub(super) fn read_play_integrity(
     read: &PlayIntegrityRead<'_>,
+    entry_id: &str,
 ) -> Result<VerifiedDeviceAttestation, PlayIntegrityFailure> {
+    let minted_at = run_play_integrity_checks(read)?;
+    Ok(VerifiedDeviceAttestation::new(
+        DeviceAttestationPlatform::PlayIntegrity,
+        entry_id.to_owned(),
+        Sha256::digest(read.token).into(),
+        minted_at,
+    ))
+}
+
+/// Runs Play Integrity checks 1 through 6, the whole of
+/// [`PLAY_INTEGRITY_CHECKS`], and returns the verdict's `token_issued_at`, the
+/// `minted_at` a reader reports. The reader and the owner's check before it
+/// publishes (`super::produce`) both call it, so the two run one check list.
+///
+/// # Errors
+///
+/// The first failing check's [`PlayIntegrityFailure`].
+pub(super) fn run_play_integrity_checks(
+    read: &PlayIntegrityRead<'_>,
+) -> Result<u64, PlayIntegrityFailure> {
     run(read, &PLAY_INTEGRITY_CHECKS)
         .result
         .map_err(|stop| match stop {
@@ -213,8 +233,9 @@ pub(super) const PLAY_INTEGRITY_CHECKS: [(PlayIntegrityCheck, CheckFn); 10] = [
 /// stopped the run included.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Run {
-    /// The verified attestation, or why the run stopped.
-    pub(super) result: Result<VerifiedDeviceAttestation, Stop>,
+    /// The verdict's `token_issued_at` when every check passed, or why the
+    /// run stopped.
+    pub(super) result: Result<u64, Stop>,
     /// The checks that ran.
     pub(super) ran: Vec<PlayIntegrityCheck>,
 }
@@ -236,7 +257,7 @@ pub(super) fn run(read: &PlayIntegrityRead<'_>, checks: &[(PlayIntegrityCheck, C
         }
     }
     Run {
-        result: state.verified(),
+        result: state.verdict().map(|verdict| verdict.token_issued_at),
         ran,
     }
 }
@@ -413,16 +434,6 @@ impl<'a> State<'a> {
                 Sha256::digest(package.package_name.as_bytes()).as_slice() == package_hash
                     && package.signing_cert_sha256 == cert_digest
             })
-    }
-
-    fn verified(&self) -> Result<VerifiedDeviceAttestation, Stop> {
-        let verdict = self.verdict()?;
-        Ok(VerifiedDeviceAttestation::new(
-            DeviceAttestationPlatform::PlayIntegrity,
-            self.read.entry_id.to_owned(),
-            Sha256::digest(self.read.token).into(),
-            verdict.token_issued_at,
-        ))
     }
 }
 
@@ -652,4 +663,4 @@ pub(super) fn parse_play_integrity_verifier_entry(
 
 #[cfg(test)]
 #[path = "tests/play_integrity.rs"]
-mod tests;
+pub(super) mod tests;

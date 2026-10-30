@@ -5,7 +5,10 @@
 //! assertion digest `A` and the policy digest `P`; the App Attest checks, the
 //! Play Integrity checks and the `PlayIntegrityVerifier` entry parser, which
 //! only the full reader calls, with a `D` it computed itself; and the owner's
-//! re-encoding of an attestation object, [`canonicalize_app_attest_object`].
+//! re-encoding of an attestation object, [`canonicalize_app_attest_object`];
+//! and the owner's pure producer half: the Play Integrity verdict request and
+//! response, the assembled verdict, the owner's check before it publishes, the
+//! two entries' `serviceEndpoint` strings and the renewal deadline.
 
 #[cfg_attr(
     not(test),
@@ -25,6 +28,7 @@ pub mod digest;
     )
 )]
 mod play_integrity;
+mod produce;
 #[cfg(test)]
 mod test_ca;
 #[cfg_attr(
@@ -38,6 +42,14 @@ mod x509;
 
 pub use cbor::{APP_ATTEST_FMT, AppAttestObjectError, canonicalize_app_attest_object};
 pub use digest::{BindingDigest, device_attestation_binding_digest};
+pub use play_integrity::VERDICT_LEN;
+pub use produce::{
+    AppAttestEntryError, AppAttestEntryInput, CheckedVerdict, MAX_VERDICT_REQUEST_LEN,
+    MAX_VERDICT_RESPONSE_LEN, MAX_VERDICT_TOKEN_LEN, VERDICT_REFUSED_BODY, VerdictCheck,
+    VerdictCheckInput, VerdictRequest, VerdictRequestError, VerdictRequestInput, VerdictResponse,
+    VerdictResponseError, app_attest_entry_endpoint, assemble_verdict,
+    check_play_integrity_verdict, play_integrity_entry_endpoint, renewal_deadline,
+};
 
 /// The most `ScpDeviceAttestation` entries one record may carry for one
 /// context's tag (§9.18.17). A reader that finds more returns

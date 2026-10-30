@@ -17,13 +17,6 @@ use crate::trust::sybil::{ApplePlatform, ValidatedSybilPolicy};
 /// Separator of the binding digest `D` (§9.18.2).
 const BINDING_SEPARATOR: &[u8] = b"SCP-DEVICE-ATTESTATION-V1:";
 /// Separator of the tag `T` (§9.18.2).
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the SCP-316 reader (keri/p6-reader-scp-316) is the first caller outside the tests"
-    )
-)]
 const TAG_SEPARATOR: &[u8] = b"SCP-DEVICE-ATTESTATION-TAG-V1:";
 /// Separator of the assertion digest `A` (§9.18.2).
 #[cfg_attr(
@@ -202,13 +195,6 @@ impl BindingDigest {
 
     /// The identifier the digest covers: the subject of a Play Integrity
     /// verdict preimage (§9.3.1 Play Integrity check 6).
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the SCP-316 reader (keri/p6-reader-scp-316) is the first caller outside the tests"
-        )
-    )]
     pub(crate) const fn subject(&self) -> &Identifier {
         &self.subject
     }
@@ -244,13 +230,6 @@ pub fn device_attestation_binding_digest(
 ///
 /// [`CanonicalError::FieldTooLarge`] when `context_id` exceeds `u32::MAX`
 /// bytes.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the SCP-316 reader (keri/p6-reader-scp-316) is the first caller outside the tests"
-    )
-)]
 pub(crate) fn device_attestation_tag(
     identifier: &Identifier,
     context_id: &str,
