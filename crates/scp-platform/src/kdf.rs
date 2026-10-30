@@ -21,8 +21,8 @@
 //! [`FileKeyCustody`]: crate::file::FileKeyCustody
 //! [`SqliteStorage`]: crate::sqlite::SqliteStorage
 
-use argon2::{Argon2, Block};
-use zeroize::{Zeroize, Zeroizing};
+use argon2::Argon2;
+use zeroize::Zeroizing;
 
 use crate::error::PlatformError;
 
@@ -51,11 +51,6 @@ const DERIVED_KEY_LEN: usize = 32;
 /// The derived key is returned in [`Zeroizing`] memory so it is cleared on
 /// drop. Callers MUST NOT log the passphrase, salt, or derived key.
 ///
-/// The 64 MiB of Argon2id block memory is allocated here, not inside the
-/// argon2 crate, and zeroed before it is freed (spec §17.8): the last pass's
-/// blocks XOR to the value whose BLAKE2b-long hash is the derived key, so an
-/// unwiped buffer leaves the key recoverable from freed heap.
-///
 /// # Errors
 ///
 /// Returns [`PlatformError::CustodyError`] if the Argon2id parameters are
@@ -64,28 +59,6 @@ pub fn derive_argon2id_key(
     passphrase: &[u8],
     salt: &[u8; ARGON2_SALT_LEN],
 ) -> Result<Zeroizing<[u8; DERIVED_KEY_LEN]>, PlatformError> {
-    let argon2 = argon2id()?;
-    // Not `Zeroizing<Vec<Block>>`: `derive_into_memory` already wipes every
-    // block on every exit, and `Vec`'s `Zeroize` would wipe them a second
-    // time and then volatile-zero all 64 MiB byte by byte, which in an
-    // unoptimized build outlasts the 10 s a racing `FileKeyCustody::new`
-    // waits for the creator's header.
-    let mut blocks = vec![Block::new(); argon2.params().block_count()];
-    derive_into_memory(&argon2, passphrase, salt, &mut blocks)
-}
-
-/// Zeroes the Argon2id block memory it borrows when it drops, so the wipe
-/// runs on a normal return, an error return, and an unwind out of argon2.
-struct WipeBlocksOnDrop<'a>(&'a mut [Block]);
-
-impl Drop for WipeBlocksOnDrop<'_> {
-    fn drop(&mut self) {
-        self.0.iter_mut().for_each(Zeroize::zeroize);
-    }
-}
-
-/// Builds the one Argon2id instance under the normative §17.8 parameters.
-fn argon2id() -> Result<Argon2<'static>, PlatformError> {
     let params = argon2::Params::new(
         ARGON2_MEMORY_KIB,
         ARGON2_ITERATIONS,
@@ -93,26 +66,14 @@ fn argon2id() -> Result<Argon2<'static>, PlatformError> {
         Some(DERIVED_KEY_LEN),
     )
     .map_err(|e| PlatformError::CustodyError(format!("argon2 params error: {e}")))?;
-    Ok(Argon2::new(
-        argon2::Algorithm::Argon2id,
-        argon2::Version::V0x13,
-        params,
-    ))
-}
 
-/// Runs the derivation over caller-owned block memory and zeroes every block
-/// before returning, on the success and the error path alike.
-fn derive_into_memory(
-    argon2: &Argon2<'_>,
-    passphrase: &[u8],
-    salt: &[u8; ARGON2_SALT_LEN],
-    blocks: &mut [Block],
-) -> Result<Zeroizing<[u8; DERIVED_KEY_LEN]>, PlatformError> {
-    let blocks = WipeBlocksOnDrop(blocks);
+    let argon2 = Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
+
     let mut key = Zeroizing::new([0u8; DERIVED_KEY_LEN]);
     argon2
-        .hash_password_into_with_memory(passphrase, salt, key.as_mut(), &mut *blocks.0)
+        .hash_password_into(passphrase, salt, key.as_mut())
         .map_err(|e| PlatformError::CustodyError(format!("argon2 key derivation failed: {e}")))?;
+
     Ok(key)
 }
 
@@ -160,54 +121,19 @@ mod tests {
         assert_eq!(ARGON2_PARALLELISM, 1);
     }
 
-    /// Pinned from `derive_argon2id_key` as it stood before the block memory
-    /// moved to a caller-owned buffer, so a change to the derivation path
-    /// cannot change any key that an existing file or database was sealed
-    /// under.
-    const KAT_SALT: [u8; ARGON2_SALT_LEN] = *b"scp-kdf-kat-salt";
-    const KAT_PASSPHRASE: &[u8] = b"correct horse battery staple";
-    const KAT_KEY: [u8; DERIVED_KEY_LEN] = [
-        0xc8, 0x89, 0x28, 0xc7, 0xf6, 0xa2, 0x33, 0x0f, 0x14, 0x20, 0x99, 0x0e, 0x82, 0xde, 0x0c,
-        0xf8, 0x38, 0x1a, 0xf4, 0xdd, 0x19, 0xce, 0x2b, 0x45, 0x27, 0x61, 0x13, 0x7c, 0x1e, 0xb4,
-        0x25, 0x77,
-    ];
-
-    fn all_zero(blocks: &[Block]) -> bool {
-        blocks.iter().all(|b| b.as_ref().iter().all(|w| *w == 0))
-    }
-
+    /// Pins one Argon2id output under the §17.8 parameters, so a change to the
+    /// derivation path cannot silently change a key that an existing file or
+    /// database was sealed under.
     #[test]
     fn derivation_matches_known_answer() {
-        let key = derive_argon2id_key(KAT_PASSPHRASE, &KAT_SALT).unwrap();
+        const KAT_KEY: [u8; DERIVED_KEY_LEN] = [
+            0xc8, 0x89, 0x28, 0xc7, 0xf6, 0xa2, 0x33, 0x0f, 0x14, 0x20, 0x99, 0x0e, 0x82, 0xde,
+            0x0c, 0xf8, 0x38, 0x1a, 0xf4, 0xdd, 0x19, 0xce, 0x2b, 0x45, 0x27, 0x61, 0x13, 0x7c,
+            0x1e, 0xb4, 0x25, 0x77,
+        ];
+        let key =
+            derive_argon2id_key(b"correct horse battery staple", b"scp-kdf-kat-salt").unwrap();
         assert_eq!(*key, KAT_KEY);
-    }
-
-    #[test]
-    fn block_memory_is_zeroed_after_successful_derivation() {
-        let argon2 = argon2id().unwrap();
-        let mut blocks = vec![Block::new(); argon2.params().block_count()];
-        let key = derive_into_memory(&argon2, KAT_PASSPHRASE, &KAT_SALT, &mut blocks).unwrap();
-        // The derivation really ran over this buffer: the key matches the KAT.
-        assert_eq!(*key, KAT_KEY);
-        assert!(
-            all_zero(&blocks),
-            "Argon2id block memory must be zeroed after derivation"
-        );
-    }
-
-    #[test]
-    fn block_memory_is_zeroed_after_failed_derivation() {
-        let argon2 = argon2id().unwrap();
-        // One block short: the argon2 crate refuses with `MemoryTooLittle`.
-        let mut filled = Block::new();
-        filled.as_mut().fill(u64::MAX);
-        let mut blocks = vec![filled; argon2.params().block_count() - 1];
-        let err = derive_into_memory(&argon2, KAT_PASSPHRASE, &KAT_SALT, &mut blocks).unwrap_err();
-        assert!(matches!(err, PlatformError::CustodyError(_)));
-        assert!(
-            all_zero(&blocks),
-            "Argon2id block memory must be zeroed on the error path"
-        );
     }
 
     #[test]

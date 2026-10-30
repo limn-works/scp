@@ -851,8 +851,6 @@ output_len = 32                      // 32-byte derived key
 salt       = per-file 16-byte salt   // generated once, persisted with the custody file
 ```
 
-The derivation's 64 MiB of Argon2id block memory MUST be zeroed before it is freed, on the error path as on the success path, because the last pass's blocks recompute the derived key; an implementation supplies that memory itself and does not let the Argon2id library allocate and free it.
-
 ### FileKeyCustody Key-File Format
 
 A `FileKeyCustody` file holds a header followed by zero or more fixed-width encrypted entries. Version `0x02` is current:
