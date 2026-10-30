@@ -9752,14 +9752,9 @@ const NON_EVENT_LOG_APPENDS: &[(&str, &str)] = &[
     ("append_own_leaf_node", "the MLS provider's storage"),
 ];
 
-/// Free functions that write leaves to a context's event log.
-const EVENT_LOG_APPEND_FREE_FNS: &[&str] = &[
-    "append_consequence_leaves_after_side_effect",
-    // Wrappers that forward to the builder trait.
-    "record_streaming_saga_a_event",
-    "record_cross_context_a_event",
-    "emit_divergence_marker",
-];
+/// Free functions that write leaves to a context's event log. None exists
+/// today: every write goes through a `.append_*(` method call.
+const EVENT_LOG_APPEND_FREE_FNS: &[&str] = &[];
 
 /// The byte offset of each call in `code` that writes a leaf to a context's
 /// event log: every `.append_<name>(` method call whose name
@@ -9911,17 +9906,14 @@ fn the_event_log_append_scan_reports_a_planted_call() {
         entry.1.push_str(&strip_non_code_keeping_cfg(extra));
         copy
     };
-    // A provider call, a builder wrapper, a supervisor wrapper, a method no
-    // list names yet, and the free consequence-leaf writer.
+    // A provider call, a builder wrapper, a supervisor wrapper, and a method
+    // no list names yet.
     for call in [
         "log.append_event(a, b)",
         "log.append_unit(a, b)",
         "log.append_membership_change_leaf(a, b)",
         "sup.append_streaming_outlet_invoked_event(a, b)",
         "log.append_some_new_leaf(a)",
-        "crate::context::governance_logic::append_consequence_leaves_after_side_effect(a, b)",
-        // A free wrapper that forwards to the builder trait.
-        "crate::context::outlets::invoke::record_streaming_saga_a_event(a, b)",
     ] {
         let planted = plant(&format!(
             "\nasync fn planted_after_send(log: &L) {{ let _ = {call}.await; }}\n"
@@ -9981,138 +9973,6 @@ fn the_event_log_append_scan_reports_a_planted_call() {
         event_log_append_mismatches(&sources, &stale),
         vec!["scp-runtime/src/context/ttl.rs::gone: 0 call(s), allowlisted 1".to_owned()],
         "an entry whose call is gone is reported"
-    );
-}
-
-/// The names of the deleted after-step write path (spec 17 §17.3 "Event log
-/// write failures"): a leaf written after an irreversible step goes into a
-/// pending log unit in the step's persist, and only the drain writes it. Any
-/// identifier ending in `_after_side_effect` is banned too.
-const AFTER_STEP_WRITE_NAMES: &[&str] = &[
-    "AppendMode",
-    "AfterSideEffect",
-    "append_event_in",
-    "append_event_after_side_effect",
-    "append_consequence_leaves_after_side_effect",
-    "event_log_entries_for_consequences_after_side_effect",
-    "append_role_assigned_leaf",
-    "append_outlet_invoked_verified",
-];
-
-/// Every identifier token in `src` that names the deleted after-step write
-/// path, lexed with `proc_macro2` so comments, doc comments and string
-/// literals never match and macro bodies always do.
-///
-/// # Errors
-///
-/// Returns the lexer's error when `src` does not lex as Rust tokens.
-fn after_step_write_idents(src: &str) -> Result<Vec<String>, String> {
-    fn walk(stream: proc_macro2::TokenStream, out: &mut Vec<String>) {
-        for tree in stream {
-            match tree {
-                proc_macro2::TokenTree::Ident(ident) => {
-                    let name = ident.to_string();
-                    let name = name.strip_prefix("r#").unwrap_or(&name);
-                    if AFTER_STEP_WRITE_NAMES.contains(&name)
-                        || name.ends_with("_after_side_effect")
-                    {
-                        out.push(name.to_owned());
-                    }
-                }
-                proc_macro2::TokenTree::Group(group) => walk(group.stream(), out),
-                proc_macro2::TokenTree::Punct(_) | proc_macro2::TokenTree::Literal(_) => {}
-            }
-        }
-    }
-    let stream: proc_macro2::TokenStream = src.parse().map_err(|e| format!("{e:?}"))?;
-    let mut out = Vec::new();
-    walk(stream, &mut out);
-    Ok(out)
-}
-
-/// Spec 17 §17.3 "Event log write failures": no source under any crate's
-/// `src` tree names the deleted after-step write path, so no code can write a
-/// leaf to the log after its step except through a queued unit and the drain.
-/// The scan covers every crate, test-only crates and test-gated modules
-/// included, because the scp-testing harness once forwarded one of these
-/// methods. A file that does not lex fails the test.
-#[test]
-fn no_shipped_source_names_after_side_effect() {
-    // The scanner's must-fail companion: an identifier, a path segment, a
-    // macro body and a suffix match are reported; a comment, a doc comment and
-    // a string literal are not.
-    let planted = after_step_write_idents(
-        "/// append_role_assigned_leaf in a doc comment\n\
-         // AppendMode in a line comment\n\
-         fn planted(log: &L) {\n\
-             let _ = \"append_outlet_invoked_verified\";\n\
-             log.append_event_after_side_effect(a);\n\
-             let _ = AppendMode::AfterSideEffect;\n\
-             tracing::warn!(\"planted\", append_event_in(a));\n\
-             record_leaf_after_side_effect(a);\n\
-         }\n",
-    )
-    .expect("the planted snippet lexes");
-    assert_eq!(
-        planted,
-        [
-            "append_event_after_side_effect",
-            "AppendMode",
-            "AfterSideEffect",
-            "append_event_in",
-            "record_leaf_after_side_effect",
-        ],
-        "the scanner reports code identifiers and only those"
-    );
-
-    let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("scp-testing sits under crates/");
-    let mut files = Vec::new();
-    for krate in std::fs::read_dir(crates)
-        .expect("crates/ is readable")
-        .flatten()
-    {
-        let dir = krate.path();
-        if dir.join("Cargo.toml").is_file() {
-            collect_rust_files(&dir.join("src"), &mut files);
-        }
-        if let Ok(nested) = std::fs::read_dir(&dir) {
-            for sub in nested.flatten() {
-                if sub.path().join("Cargo.toml").is_file() {
-                    collect_rust_files(&sub.path().join("src"), &mut files);
-                }
-            }
-        }
-    }
-    let runtime = files
-        .iter()
-        .filter(|f| f.to_string_lossy().contains("/scp-runtime/src/"))
-        .count();
-    assert!(
-        runtime > 100,
-        "the scan must read the scp-runtime sources, read {runtime}"
-    );
-    assert!(
-        files
-            .iter()
-            .any(|f| f.ends_with("scp-testing/src/fullstack/node.rs")),
-        "the scan must read the scp-testing harness"
-    );
-
-    let mut found = Vec::new();
-    for file in &files {
-        let src = std::fs::read_to_string(file).expect("a source file is readable");
-        let rel = file.strip_prefix(crates).unwrap_or(file).display();
-        match after_step_write_idents(&src) {
-            Ok(names) => found.extend(names.into_iter().map(|n| format!("{rel}: {n}"))),
-            Err(e) => found.push(format!("{rel}: does not lex: {e}")),
-        }
-    }
-    assert!(
-        found.is_empty(),
-        "the after-step write path is deleted; queue the leaf in the step's persist and let \
-         the drain write it (spec 17 §17.3): {found:#?}"
     );
 }
 

@@ -163,9 +163,11 @@
 //!   state between them is recoverable), or by introducing a site-specific
 //!   field-granular combinator if decomposition is not sound for that site.
 //! - **Append-then-persist of UNCHANGED state.** A site that appends a record
-//!   to an external sink and then persists *without mutating Class-S* (e.g.
-//!   `emit_divergence_marker`) is not a Class-S mutation site at all and needs
-//!   no combinator — it routes through the ordinary persist path.
+//!   to an external sink and then persists *without mutating Class-S* is not a
+//!   Class-S mutation site at all and needs no combinator — it routes through
+//!   the ordinary persist path. A leaf for the context's own event log is not
+//!   such a record: it is queued as a pending log unit, a Class-S field, inside
+//!   the step's combinator (spec 17 §17.3), as the divergence marker is.
 //!
 //! For the three PRIVATIZED Class-S fields — `PerContextState.class_s`,
 //! `GovernanceState.class_s`, and `GovernanceState.revoked_spending_ucan_cids` —

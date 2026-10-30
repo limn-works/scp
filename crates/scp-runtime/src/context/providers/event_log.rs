@@ -304,12 +304,10 @@ pub struct MerkleEventLogProvider {
         reason = "`std::sync::Mutex` guards only synchronous in-memory Merkle-tree operations; every lock is scoped and dropped BEFORE any `.await` on the async `EventLogPersistence` backend (ADR-049 Decision 7), so the guard is never held across a suspension point and a `tokio::sync::Mutex` would add unnecessary overhead."
     )]
     logs: Mutex<Logs>,
-    /// Per-context write gates. Each write to a context holds its gate's one
-    /// permit from the in-memory change through the persist, so writes to one
-    /// context never interleave and storage applies them in memory's order.
+    /// Per-context write gates ([`WriteGates`]).
     /// [`MerkleEventLogProvider::release_write_gate`] removes a gate only
     /// when no writer holds or waits on it.
-    write_gates: dashmap::DashMap<[u8; 32], WriteGate>,
+    write_gates: WriteGates,
     /// Optional persistence backend for surviving process restarts (#636).
     persistence: Option<std::sync::Arc<dyn EventLogPersistence>>,
     /// Contexts whose actor holds queued log units (spec 17 §17.3 "Event log
@@ -327,54 +325,106 @@ pub struct MerkleEventLogProvider {
 /// A context's write gate and the pending-unit fence (spec 17 §17.3 "Event log
 /// write failures").
 ///
-/// Every write to a context's log takes the gate here. The fenced path,
-/// [`MerkleEventLogProvider::lock_write_gate`], checks the fence once it holds
-/// the gate; the three writers [`UnfencedWrite`] names besides it take the gate
-/// without the fence. [`UnfencedWrite::FencedGate`] carries a [`FenceChecked`]
-/// whose field is private to this module, so no writer outside it can claim
-/// the fenced path without running the fence check.
+/// [`WriteGates`] keeps its map private to this module, so a write permit
+/// comes only from one of the four functions here.
+/// [`MerkleEventLogProvider::lock_write_gate`] checks the fence once it holds
+/// the gate, and every writer takes the gate through it except three, each
+/// with its own function: the drain
+/// ([`MerkleEventLogProvider::lock_write_gate_for_drain`]), a restore
+/// ([`MerkleEventLogProvider::lock_write_gate_for_restore`]), and a destroy
+/// ([`MerkleEventLogProvider::lock_write_gate_for_destroy`]).
 mod gate {
     use scp_protocol::context::builder::ContextCreationError;
 
     use super::MerkleEventLogProvider;
 
-    include!("event_log_gate_seal.rs");
-
     /// A context's write gate: a semaphore with one permit. A writer that
     /// holds or awaits the permit holds a clone of the `Arc`, which
-    /// [`MerkleEventLogProvider::release_write_gate`] counts.
-    pub(super) type WriteGate = std::sync::Arc<tokio::sync::Semaphore>;
+    /// [`WriteGates::release`] counts.
+    type WriteGate = std::sync::Arc<tokio::sync::Semaphore>;
 
-    impl MerkleEventLogProvider {
+    /// The per-context write gates. Each write to a context holds its gate's
+    /// one permit from the in-memory change through the persist, so writes to
+    /// one context never interleave and storage applies them in memory's
+    /// order. The map is private to this module, so no code outside it takes
+    /// a permit except through the gate functions below.
+    #[derive(Default)]
+    pub(super) struct WriteGates(dashmap::DashMap<[u8; 32], WriteGate>);
+
+    impl WriteGates {
         /// Returns the write gate for a context, creating it on first use.
-        fn write_gate(&self, context_id: &[u8; 32]) -> WriteGate {
+        fn get(&self, context_id: &[u8; 32]) -> WriteGate {
             // The shard guard drops at the end of this statement, before any
             // caller awaits the gate.
             std::sync::Arc::clone(
-                self.write_gates
+                self.0
                     .entry(*context_id)
                     .or_insert_with(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1)))
                     .value(),
             )
         }
 
-        /// Waits for and takes a context's write gate for `writer`. Outside
-        /// this module only the drain, a restore, and a destroy take the gate
-        /// this way; every other writer takes it through
-        /// [`Self::lock_write_gate`], the one place that builds
-        /// [`UnfencedWrite::FencedGate`]. The returned permit holds a clone of
-        /// the gate until it drops.
+        /// Removes a context's write gate when no writer holds or waits on it.
+        ///
+        /// Every writer clones the gate inside [`Self::get`] under the map's
+        /// shard lock, and `remove_if` reads the clone count under that same
+        /// lock. A count of 1 (the map's own reference) therefore means no
+        /// writer holds the gate and none can take it before the removal. A
+        /// gate that a waiter still holds stays in the map, so a later writer
+        /// reuses it rather than creating a second gate for the context.
+        pub(super) fn release(&self, context_id: &[u8; 32]) {
+            self.0.remove_if(context_id, |_, gate| {
+                std::sync::Arc::strong_count(gate) == 1
+            });
+        }
+
+        /// The number of contexts that hold a gate.
+        #[cfg(test)]
+        pub(super) fn len(&self) -> usize {
+            self.0.len()
+        }
+
+        /// True when no context holds a gate.
+        #[cfg(test)]
+        pub(super) fn is_empty(&self) -> bool {
+            self.0.is_empty()
+        }
+
+        /// True when `context_id` holds a gate.
+        #[cfg(test)]
+        pub(super) fn contains_key(&self, context_id: &[u8; 32]) -> bool {
+            self.0.contains_key(context_id)
+        }
+    }
+
+    /// The writer that takes a gate, named in the error a closed gate returns.
+    #[derive(Debug, Clone, Copy)]
+    enum Writer {
+        /// A write through [`MerkleEventLogProvider::lock_write_gate`].
+        Fenced,
+        /// The pending-unit drain.
+        Drain,
+        /// A restore, which replaces the in-memory log with the stored one.
+        Restore,
+        /// A destroy, which removes the context's log.
+        Destroy,
+    }
+
+    impl MerkleEventLogProvider {
+        /// Waits for and takes a context's write gate for `writer`. The
+        /// returned permit holds a clone of the gate until it drops.
         ///
         /// # Errors
         ///
         /// Returns [`ContextCreationError::EventLogFailed`] if the gate's
         /// semaphore is closed. No code closes it, so this error marks a bug.
-        pub(super) async fn lock_write_gate_unfenced(
+        async fn acquire_write_gate(
             &self,
             context_id: &[u8; 32],
-            writer: UnfencedWrite,
+            writer: Writer,
         ) -> Result<tokio::sync::OwnedSemaphorePermit, ContextCreationError> {
-            self.write_gate(context_id)
+            self.write_gates
+                .get(context_id)
                 .acquire_owned()
                 .await
                 .map_err(|e| {
@@ -383,6 +433,46 @@ mod gate {
                         hex::encode(context_id)
                     ))
                 })
+        }
+
+        /// Takes a context's write gate for the pending-unit drain, the one
+        /// writer the fence admits, because it writes the queued units.
+        ///
+        /// # Errors
+        ///
+        /// As [`Self::acquire_write_gate`].
+        pub(super) async fn lock_write_gate_for_drain(
+            &self,
+            context_id: &[u8; 32],
+        ) -> Result<tokio::sync::OwnedSemaphorePermit, ContextCreationError> {
+            self.acquire_write_gate(context_id, Writer::Drain).await
+        }
+
+        /// Takes a context's write gate for a restore. A restore replaces the
+        /// in-memory log with the stored one and writes nothing to storage, so
+        /// it neither lands ahead of a queued unit nor re-chains one.
+        ///
+        /// # Errors
+        ///
+        /// As [`Self::acquire_write_gate`].
+        pub(super) async fn lock_write_gate_for_restore(
+            &self,
+            context_id: &[u8; 32],
+        ) -> Result<tokio::sync::OwnedSemaphorePermit, ContextCreationError> {
+            self.acquire_write_gate(context_id, Writer::Restore).await
+        }
+
+        /// Takes a context's write gate for a destroy, which removes the log
+        /// and the context's fence entry together.
+        ///
+        /// # Errors
+        ///
+        /// As [`Self::acquire_write_gate`].
+        pub(super) async fn lock_write_gate_for_destroy(
+            &self,
+            context_id: &[u8; 32],
+        ) -> Result<tokio::sync::OwnedSemaphorePermit, ContextCreationError> {
+            self.acquire_write_gate(context_id, Writer::Destroy).await
         }
 
         /// Takes a context's write gate, then refuses the write while the
@@ -402,16 +492,13 @@ mod gate {
             &self,
             context_id: &[u8; 32],
         ) -> Result<tokio::sync::OwnedSemaphorePermit, ContextCreationError> {
-            let write = self
-                .lock_write_gate_unfenced(context_id, UnfencedWrite::FencedGate(FenceChecked(())))
-                .await?;
+            let write = self.acquire_write_gate(context_id, Writer::Fenced).await?;
             if let Err(e) = self.check_no_units_pending(context_id) {
                 self.drop_write(context_id, write);
                 return Err(e);
             }
             Ok(write)
         }
-
         /// Drops a write permit that wrote nothing, and releases the gate when
         /// the context has no log in memory, so the write leaves no gate
         /// behind.
@@ -453,7 +540,7 @@ mod gate {
     }
 }
 
-use gate::{UnfencedWrite, WriteGate};
+use gate::WriteGates;
 
 #[allow(clippy::significant_drop_tightening)]
 #[allow(
@@ -472,7 +559,7 @@ impl MerkleEventLogProvider {
     pub fn new() -> Self {
         Self {
             logs: Mutex::new(Logs::default()),
-            write_gates: dashmap::DashMap::new(),
+            write_gates: WriteGates::default(),
             persistence: None,
             units_pending: dashmap::DashSet::new(),
         }
@@ -486,7 +573,7 @@ impl MerkleEventLogProvider {
     pub fn with_persistence(persistence: std::sync::Arc<dyn EventLogPersistence>) -> Self {
         Self {
             logs: Mutex::new(Logs::default()),
-            write_gates: dashmap::DashMap::new(),
+            write_gates: WriteGates::default(),
             persistence: Some(persistence),
             units_pending: dashmap::DashSet::new(),
         }
@@ -619,9 +706,7 @@ impl MerkleEventLogProvider {
         &self,
         context_id: &[u8; 32],
     ) -> Result<EventLogRestore, ContextCreationError> {
-        let write = self
-            .lock_write_gate_unfenced(context_id, UnfencedWrite::Restore)
-            .await?;
+        let write = self.lock_write_gate_for_restore(context_id).await?;
         match self.load_log_for_restore(context_id).await {
             Ok((log, restore)) => {
                 let mut logs = self
@@ -802,16 +887,9 @@ impl MerkleEventLogProvider {
     /// one such path; a restore that fails while the context has no log in
     /// memory is another.
     ///
-    /// Every writer clones the gate inside [`Self::write_gate`] under the
-    /// map's shard lock, and `remove_if` reads the clone count under that same
-    /// lock. A count of 1 (the map's own reference) therefore means no writer
-    /// holds the gate and none can take it before the removal. A gate that a
-    /// waiter still holds stays in the map, so a later writer reuses it rather
-    /// than creating a second gate for the context.
+    /// [`WriteGates::release`] states why the removal cannot race a writer.
     fn release_write_gate(&self, context_id: &[u8; 32]) {
-        self.write_gates.remove_if(context_id, |_, gate| {
-            std::sync::Arc::strong_count(gate) == 1
-        });
+        self.write_gates.release(context_id);
     }
 
     /// Persists one unit that starts at `base_seq`: the newly appended event.
@@ -1311,9 +1389,7 @@ impl ContextEventLogProvider for MerkleEventLogProvider {
 
     async fn destroy_event_log(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
         let deleted = {
-            let _write = self
-                .lock_write_gate_unfenced(context_id, UnfencedWrite::Destroy)
-                .await?;
+            let _write = self.lock_write_gate_for_destroy(context_id).await?;
             {
                 let mut logs = self
                     .logs
@@ -1334,9 +1410,7 @@ impl ContextEventLogProvider for MerkleEventLogProvider {
         &self,
         context_id: &[u8; 32],
     ) -> Result<UnitWriteGuard, ContextCreationError> {
-        let write = self
-            .lock_write_gate_unfenced(context_id, UnfencedWrite::Drain)
-            .await?;
+        let write = self.lock_write_gate_for_drain(context_id).await?;
         let len = {
             let logs = self
                 .logs
