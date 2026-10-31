@@ -1458,7 +1458,10 @@ struct MembershipUndo {
     /// place of the one Phase 4 cached.
     previous_participation: Option<crate::context::participation::RootedParticipationRecord>,
     /// The local pseudonym before Phase 4.5 set a new one; `None` when Phase
-    /// 4.5 changed nothing.
+    /// 4.5 changed nothing. A pseudonymous (encrypted) context's routing
+    /// always holds a pseudonym, so "no pseudonym before the join" exists
+    /// only on a broadcast context, where Phase 4.5 sets nothing; the rollback
+    /// therefore never has a pseudonym to clear, only one to put back.
     previous_pseudonym: Option<[u8; 32]>,
     /// True once Phase 4 emitted `MemberJoined` to subscribers, so the
     /// rollback emits `MemberLeft` for the same member.
@@ -7498,6 +7501,13 @@ mod restore_reconcile_tests {
 
         let (mut cell, handle) = joinable_cell(&context_id, &admin, true);
         let credited_before = cell.checkpoint_events_since;
+        let pseudonym_before = cell.routing.local_pseudonym();
+        let joins_pseudonym = [0x5au8; 32];
+        assert_ne!(
+            pseudonym_before,
+            Some(joins_pseudonym),
+            "the join's pseudonym differs from the one the context holds"
+        );
         let before_phase_five = persists_per_join - 3;
         snapshots.fail_persists_after(before_phase_five);
         let joiner = DID("did:dht:z6MkPhaseFiveJoiner".to_owned());
@@ -7507,7 +7517,7 @@ mod restore_reconcile_tests {
             &handle,
             scp_protocol::context::membership::KeyPackage::mock(joiner.clone()),
             None,
-            None,
+            Some(joins_pseudonym),
         )
         .await;
 
@@ -7542,6 +7552,11 @@ mod restore_reconcile_tests {
         assert_eq!(
             cell.checkpoint_events_since, credited_before,
             "the withdrawn record is no longer credited"
+        );
+        assert_eq!(
+            cell.routing.local_pseudonym(),
+            pseudonym_before,
+            "the pseudonym Phase 4.5 set is rolled back to the one held before the join"
         );
     }
 
