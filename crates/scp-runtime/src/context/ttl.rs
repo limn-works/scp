@@ -8,9 +8,12 @@
 //! - [`close_context`] -- Initiates cooperative close (Active -> Closing).
 //! - [`finalize_close`] -- Completes close after members process notifications
 //!   (Closing -> Closed).
-//! - [`try_ttl_expiry_cleanup`] -- Automatic expiry when TTL elapses
-//!   (Active -> Expired): terminal transition + key destruction +
-//!   idempotent `ContextExpired` leaf.
+//! - [`apply_ttl_terminal_transition`] -- Automatic expiry when TTL elapses
+//!   (Active -> Expired): terminal transition + key destruction. The caller
+//!   (`ttl_close_helpers::handle_ttl_expiry`) queues the `ContextExpired`
+//!   record in the persist that records the transition.
+//! - [`delete_published_bounded`] -- Best-effort relay ciphertext deletion for
+//!   a terminal Ephemeral or Summary context.
 //! - [`TtlTimer`] -- Records a context's convergent TTL expiry deadline
 //!   (the actor-owned TTL arm reconciles a one-shot sleep against it;
 //!   ADR-049 finding A3).
@@ -46,7 +49,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::ContextHandle;
-use super::builder::{ContextEventLogProvider, ContextTransportProvider};
+use super::builder::ContextTransportProvider;
+use super::state::LeafSpec;
 // #2148 (ADR-049 birth-into-actor): production TTL/close paths no longer take a
 // crypto provider (key destruction runs on the actor-owned crypto). The single
 // test that constructs a provider imports it locally.
@@ -164,11 +168,10 @@ const ALL_STEPS: u8 =
 
 /// Per-op budget for the BEST-EFFORT relay ciphertext deletion in the terminal
 /// (expiry / close) paths (M2). Well under the handler-level
-/// `HANDLER_TIMEOUT` (30 s) so a hostile/stalled relay cannot consume the whole
-/// handler budget and starve the completeness-critical terminal leaf append —
-/// which now runs BEFORE the relay delete. On elapse the delete is logged and
-/// skipped: the keys are already destroyed, so the retained ciphertext is
-/// unreadable regardless (§5.11).
+/// `HANDLER_TIMEOUT` (30 s) so a hostile/stalled relay cannot hold the actor's
+/// turn open; the terminal record is queued before the delete runs. On elapse
+/// the delete is logged and skipped: the keys are already destroyed, so the
+/// retained ciphertext is unreadable regardless (§5.11).
 const RELAY_DELETE_BUDGET: Duration = Duration::from_secs(5);
 
 impl TtlExpiryResult {
@@ -190,7 +193,8 @@ impl TtlExpiryResult {
         self.completed_steps & STEP_SENDER_KEY_DESTROYED != 0
     }
 
-    /// Whether the event log append succeeded.
+    /// Whether the `ContextExpired` record is durable: queued in the persist
+    /// that recorded `Expired`, or already in the log or the queue.
     #[must_use]
     pub const fn event_logged(&self) -> bool {
         self.completed_steps & STEP_EVENT_LOGGED != 0
@@ -220,6 +224,19 @@ impl TtlExpiryResult {
     /// leaving its bit unset so the expiry retries it.
     pub(crate) fn record_failure(&mut self, error: String) {
         self.errors.push(error);
+    }
+
+    /// Marks the `ContextExpired` record step done: the record is queued in
+    /// the persist that recorded `Expired`, or the log or the queue already
+    /// held it.
+    pub(crate) const fn mark_event_logged(&mut self) {
+        self.set_step(STEP_EVENT_LOGGED);
+    }
+
+    /// Whether `steps`, a carried `completed_steps` bitmask, includes the
+    /// `ContextExpired` record step.
+    pub(crate) const fn event_logged_in(steps: u8) -> bool {
+        steps & STEP_EVENT_LOGGED != 0
     }
 
     /// A no-op result for an ABORTED TTL expiry (ADR-049 §9, A3): the
@@ -443,27 +460,26 @@ impl TtlExtensionProposal {
 ///
 /// See ADR-008 acceptance criterion 5.
 ///
+/// Returns the close result and the `ContextClosing` record, planned before
+/// the `Active -> Closing` transition. The caller queues the record in the
+/// persist that records the transition (spec 17 §17.3 "Event log write
+/// failures"); this function writes nothing to the event log.
+///
 /// # Errors
 ///
 /// Returns [`ContextError::ContextNotActive`] if the context is not `Active`.
 /// Returns [`ContextError::PermissionDenied`] if the initiator lacks the
 /// `ContextClose` capability.
-// ADR-049 §Decision 12: `state`/`transition_to` are now synchronous lock-free
-// ArcSwap ops. Async is retained as the ContextManager helper API contract —
-// callers await uniformly, and the event-log provider calls regain await
-// points under ADR-049 Decision 7 (async-provider-trait conversion).
-#[allow(clippy::unused_async)]
-pub async fn close_context(
+pub fn close_context(
     handle: &ContextHandle,
     initiator_did: &DID,
     role_state: &ContextRoleState,
-    event_log: &dyn ContextEventLogProvider,
     // Convergent close timestamp recorded on the `ContextClosing` leaf: the
     // initiator's close-commit time (the `created_at` of the outgoing close
     // commit), copied by every member — never a per-member local `now()`
     // (§7.3.1, §9.9.3).
     timestamp_secs: u64,
-) -> Result<CloseResult, ContextError> {
+) -> Result<(CloseResult, LeafSpec), ContextError> {
     let state = handle.state();
     if state != ContextState::Active {
         return Err(ContextError::ContextNotActive);
@@ -475,30 +491,26 @@ pub async fn close_context(
         )));
     }
 
-    handle.transition_to(&ContextState::Closing)?;
+    let closing_record = LeafSpec::without_payload(
+        scp_event_log::EventType::ContextClosing,
+        initiator_did.as_ref().to_owned(),
+        timestamp_secs,
+    );
 
-    let context_id = handle.context_id().to_owned();
-    let context_id_bytes = context_id_to_bytes(&context_id);
+    handle.transition_to(&ContextState::Closing)?;
 
     let memory_scope = handle.params().memory_scope;
     let should_generate_summary = memory_scope == MemoryScope::Summary;
     let should_schedule_key_destruction =
         memory_scope == MemoryScope::Ephemeral || memory_scope == MemoryScope::Summary;
 
-    event_log
-        .append_context_event(
-            crate::context::builder::AppendMode::AfterSideEffect,
-            &context_id_bytes,
-            scp_event_log::EventType::ContextClosing,
-            initiator_did.as_ref(),
-            timestamp_secs,
-        )
-        .await?;
-
-    Ok(CloseResult {
-        should_generate_summary,
-        should_schedule_key_destruction,
-    })
+    Ok((
+        CloseResult {
+            should_generate_summary,
+            should_schedule_key_destruction,
+        },
+        closing_record,
+    ))
 }
 
 /// Result of a successful `close_context` call.
@@ -518,19 +530,25 @@ pub struct CloseResult {
 ///
 /// See ADR-008 acceptance criterion 6.
 ///
+/// Transitions `Closing -> Closed` and returns the `ContextClosed` record,
+/// planned before the transition, for the caller to queue in the persist that
+/// records it (spec 17 §17.3 "Event log write failures"). `log_entries` is the
+/// context's log plus its queued records, which the caller reads before this
+/// call. When they already hold a `ContextClosed` record (a prior finalize
+/// queued or wrote it), this returns `None`: a duplicate terminal record
+/// diverges the Merkle root across members (ADR-049 §9 amendment, finding
+/// (d)).
+///
+/// The caller destroys the actor-owned keys after this returns `Ok`, then
+/// issues the best-effort relay delete ([`delete_published_bounded`]).
+///
 /// # Errors
 ///
 /// Returns [`ContextError::InvalidTransition`] if the context is not in
-/// `Closing` state.
-// ADR-049 §Decision 12: `transition_to` is now a synchronous lock-free ArcSwap
-// store. Async is retained as the ContextManager helper API contract — callers
-// await uniformly, and the crypto/transport/event-log provider calls regain
-// await points under ADR-049 Decision 7 (async-provider-trait conversion).
-#[allow(clippy::unused_async)]
-pub async fn finalize_close(
+/// `Closing` state; nothing is planned or destroyed then.
+pub fn finalize_close(
     handle: &ContextHandle,
-    transport: &dyn ContextTransportProvider,
-    event_log: &dyn ContextEventLogProvider,
+    log_entries: &[scp_event_log::Event],
     // Timestamp recorded on the `ContextClosed` leaf. This lower-level producer
     // records whatever instant the caller supplies. The sole production caller,
     // `ttl_close_helpers::finalize_close`, is the EXPLICIT Closing→Closed path and
@@ -542,142 +560,73 @@ pub async fn finalize_close(
     // TTL path stamps a `ContextExpired` leaf off the convergent deadline in
     // `handle_ttl_expiry` and never reaches this function (§7.3.1, §9.9.3).
     timestamp_secs: u64,
-) -> Result<(), ContextError> {
-    // Validate state transition BEFORE any key destruction (which the caller,
+) -> Result<Option<LeafSpec>, ContextError> {
+    let closed_record = (!log_entries
+        .iter()
+        .any(|e| e.event_type == scp_event_log::EventType::ContextClosed))
+    .then(|| {
+        LeafSpec::without_payload(
+            scp_event_log::EventType::ContextClosed,
+            scp_event_log::system_actors::SYSTEM_CLOSE_ACTOR.to_owned(),
+            timestamp_secs,
+        )
+    });
+
+    // Validate the transition BEFORE any key destruction (which the caller,
     // `ttl_close_helpers::finalize_close`, performs on the ACTOR-owned crypto
     // AFTER this returns Ok). Key destruction is irreversible — once destroyed
-    // (sender keys, MLS signer, and MLS provider storage zeroized), encrypted content becomes
-    // permanently unreadable. If the transition fails
-    // (e.g. context is not in Closing state), no keys must be destroyed.
+    // (sender keys, MLS signer, and MLS provider storage zeroized), encrypted
+    // content becomes permanently unreadable. If the transition fails (e.g. the
+    // context is not in Closing state), no keys must be destroyed.
     handle.transition_to(&ContextState::Closed)?;
 
-    let context_id = handle.context_id().to_owned();
-    let context_id_bytes = context_id_to_bytes(&context_id);
-    let memory_scope = handle.params().memory_scope;
-
-    // #2148 (ADR-049 birth-into-actor): the MLS group + sender key are
-    // ACTOR-owned (the provider holds none — its `destroy_mls_group` /
-    // `destroy_sender_key` methods are DELETED). The actual key destruction for
-    // Ephemeral/Summary scope is performed by the caller
-    // (`ttl_close_helpers::finalize_close`) on the actor-owned crypto via the
-    // `ClassSCell`, AFTER this transition succeeds. This function only stamps
-    // the terminal leaf and issues the best-effort relay ciphertext delete —
-    // the latter still gated on `needs_key_destruction`: Full scope retains
-    // keys and content, so its ciphertext is NOT deleted.
-    let needs_key_destruction =
-        memory_scope == MemoryScope::Ephemeral || memory_scope == MemoryScope::Summary;
-
-    // (d) idempotent terminal leaf (ADR-049 §9 amendment): if a `ContextClosed`
-    // leaf already exists for this context (a prior finalize appended it, then
-    // the actor was interrupted / respawned before completing), do NOT append a
-    // second one — a duplicate terminal leaf diverges the Merkle root across
-    // members. A log that cannot be read fails the close. Runs BEFORE the
-    // best-effort relay delete (M2).
-    if !terminal_leaf_exists(
-        event_log,
-        &context_id_bytes,
-        scp_event_log::EventType::ContextClosed,
-    )? {
-        event_log
-            .append_context_event(
-                crate::context::builder::AppendMode::AfterSideEffect,
-                &context_id_bytes,
-                scp_event_log::EventType::ContextClosed,
-                scp_event_log::system_actors::SYSTEM_CLOSE_ACTOR,
-                timestamp_secs,
-            )
-            .await?;
-    }
-
-    // Best-effort relay ciphertext deletion (§5.11), AFTER the critical
-    // `ContextClosed` append and under its OWN bounded budget (M2) so a
-    // hostile/stalled relay cannot delay the terminal leaf. Best-effort by
-    // design: the keys are already destroyed, so the ciphertext is unreadable
-    // regardless of whether the relay honours the delete.
-    if needs_key_destruction {
-        match tokio::time::timeout(
-            RELAY_DELETE_BUDGET,
-            transport.delete_published(&context_id_bytes),
-        )
-        .await
-        {
-            Ok(_) => {}
-            Err(_elapsed) => {
-                tracing::warn!(context_id = %context_id, budget = ?RELAY_DELETE_BUDGET,
-                    "best-effort relay deletion exceeded its budget after close; \
-                     skipping (keys already destroyed — ciphertext is unreadable)");
-            }
-        }
-    }
-
-    Ok(())
+    Ok(closed_record)
 }
 
-/// Single-call TTL-expiry COMPOSITION.
+/// Best-effort relay ciphertext deletion (§5.11) for a terminal context whose
+/// memory scope destroys its keys (Ephemeral or Summary). A Full-scope context
+/// keeps its keys and content, so nothing is deleted.
 ///
-/// Runs the terminal phase (`apply_ttl_terminal_transition`) and, if it
-/// transitioned, the bounded-I/O phase (`finish_ttl_expiry_io`) back-to-back,
-/// returning a structured result.
-///
-/// This is NOT the live automatic-expiry path and it is NOT dead code. The live
-/// actor path (`crate::context::ttl_close_helpers::handle_ttl_expiry`) drives
-/// the two phases SEPARATELY so the fail-closed persist of the terminal
-/// `Expired` state runs OUTSIDE the relay/event-log transport timeout (SEC-1).
-/// This function is the convenient whole-in-one form, and is exercised by this
-/// module's idempotency tests as the phase-equivalence composition (it must
-/// produce the same result as the two phases run in sequence).
-///
-/// Returns a [`TtlExpiryResult`] that tracks which operations succeeded and
-/// which failed. The `prior_completed` bitmask carries forward steps that
-/// already succeeded on a previous attempt so they are not re-executed.
-/// This prevents duplicate event log entries and redundant crypto operations
-/// across retries.
-///
-/// State transition is inherently idempotent (an already-`Expired` context
-/// is recognized as transitioned), but crypto destruction and event log
-/// appends are **not** idempotent — hence the bitmask guard.
-// ADR-049 §Decision 12: `state`/`transition_to` are now synchronous lock-free
-// ArcSwap ops. Async is retained as the ContextManager helper API contract —
-// callers await uniformly, and the crypto/transport/event-log provider calls
-// regain await points under ADR-049 Decision 7 (async-provider-trait conversion).
-#[allow(clippy::unused_async)]
-pub async fn try_ttl_expiry_cleanup(
+/// The terminal paths call this after the terminal record is queued, and the
+/// delete runs under its own budget (`RELAY_DELETE_BUDGET`, M2), so a hostile
+/// or stalled relay cannot delay the record or hold the actor's turn open. A
+/// refused or timed-out delete is logged and skipped: the keys are already
+/// destroyed, so the retained ciphertext is unreadable.
+pub(crate) async fn delete_published_bounded(
     handle: &ContextHandle,
-    // #2148 (ADR-049 birth-into-actor): the actor-owned crypto to dispose on
-    // Ephemeral/Summary expiry (`None` for Broadcast / already-disposed).
-    crypto_state: Option<&mut crate::context::actor::ContextCryptoState>,
-    transport: Option<&dyn ContextTransportProvider>,
-    event_log: &dyn ContextEventLogProvider,
-    prior_completed: u8,
-    // Timer-triggered expiry: the pre-computed convergent TTL deadline (every
-    // member holds the identical value), recorded on the `ContextExpired` leaf
-    // instead of a per-member local `now()` (§7.3.1, §9.9.3).
-    expiry_deadline_secs: u64,
-) -> TtlExpiryResult {
-    // The SEC-1 rework (ADR-049 §9 amendment) splits this into a SYNC terminal
-    // phase (FSM transition + key destruction — the security-critical steps the
-    // actor persists FAIL-CLOSED before teardown) and an ASYNC bounded-I/O phase
-    // (best-effort relay deletion + idempotent `ContextExpired` append). This
-    // whole-in-one composition is the convenient single-call form (exercised by
-    // this module's tests); the actor
-    // (`ttl_close_helpers::handle_ttl_expiry`) drives the two phases
-    // ([`apply_ttl_terminal_transition`] + [`finish_ttl_expiry_io`]) SEPARATELY
-    // so the fail-closed persist runs OUTSIDE the relay/event-log transport
-    // timeout.
-    let result = apply_ttl_terminal_transition(handle, crypto_state, prior_completed);
-    if result.completed_steps & STEP_STATE_TRANSITIONED == 0 {
-        // Transition failed / context not in an expiry-eligible state — bail
-        // before any I/O (mirrors the prior early return).
-        return result;
+    transport: &dyn ContextTransportProvider,
+) {
+    let memory_scope = handle.params().memory_scope;
+    if memory_scope != MemoryScope::Ephemeral && memory_scope != MemoryScope::Summary {
+        return;
     }
-    finish_ttl_expiry_io(handle, transport, event_log, result, expiry_deadline_secs).await
+    let context_id = handle.context_id();
+    let context_id_bytes = context_id_to_bytes(context_id);
+    match tokio::time::timeout(
+        RELAY_DELETE_BUDGET,
+        transport.delete_published(&context_id_bytes),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            tracing::warn!(context_id = %context_id, error = %e,
+                "best-effort relay deletion failed after the terminal transition");
+        }
+        Err(_elapsed) => {
+            tracing::warn!(context_id = %context_id, budget = ?RELAY_DELETE_BUDGET,
+                "best-effort relay deletion exceeded its budget after the terminal \
+                 transition; skipping (keys already destroyed — ciphertext is unreadable)");
+        }
+    }
 }
 
 /// SYNC terminal phase of TTL expiry (SEC-1): FSM transition + key destruction.
 ///
 /// Transitions `Active`/`Expired` → `Expired` and destroys keys
-/// (Ephemeral/Summary scopes). No transport or event-log I/O — those are the
-/// caller's bounded-I/O phase ([`finish_ttl_expiry_io`]).
+/// (Ephemeral/Summary scopes). No transport or event-log I/O: the caller queues
+/// the `ContextExpired` record in its persist and issues the relay delete
+/// ([`delete_published_bounded`]).
 ///
 /// These are the security-critical steps the actor persists FAIL-CLOSED (ADR-049
 /// §9 amendment, SEC-1): a lost persist of the terminal `Expired` state re-opens
@@ -820,149 +769,6 @@ pub(crate) fn apply_ttl_terminal_transition(
     }
 
     result
-}
-
-/// ASYNC bounded-I/O phase of TTL expiry (SEC-1): relay deletion + leaf append.
-///
-/// Best-effort relay ciphertext deletion (§5.11) followed by the IDEMPOTENT
-/// `ContextExpired` event-log append (ADR-049 §9 amendment, finding (d)).
-/// Consumes and returns the running [`TtlExpiryResult`] so the caller can carry
-/// `completed_steps` forward across retries.
-///
-/// The caller wraps this in `tokio::time::timeout(HANDLER_TIMEOUT, …)`: both the
-/// relay deletion and the event-log append issue UNBOUNDED provider awaits, so a
-/// hung relay must not wedge the single-threaded actor. The security-critical
-/// terminal transition + fail-closed persist ran BEFORE this in
-/// [`apply_ttl_terminal_transition`], outside that timeout.
-///
-/// # Idempotent leaf ((d))
-///
-/// Before appending, the running-tail of the event log is consulted
-/// ([`ContextEventLogProvider::event_log_entries`]): if a terminal
-/// `ContextExpired` leaf already exists for this context (a prior attempt
-/// appended it, then crashed / was interrupted before recording the step), the
-/// `STEP_EVENT_LOGGED` bit is set WITHOUT re-appending — no duplicate leaf, a
-/// stable Merkle root across respawn. A log that cannot be read leaves the
-/// step undone and records the error, so the expiry retries it.
-pub(crate) async fn finish_ttl_expiry_io(
-    handle: &ContextHandle,
-    transport: Option<&dyn ContextTransportProvider>,
-    event_log: &dyn ContextEventLogProvider,
-    mut result: TtlExpiryResult,
-    expiry_deadline_secs: u64,
-) -> TtlExpiryResult {
-    let context_id = handle.context_id().to_owned();
-    let context_id_bytes = context_id_to_bytes(&context_id);
-    let memory_scope = handle.params().memory_scope;
-    let needs_key_destruction =
-        memory_scope == MemoryScope::Ephemeral || memory_scope == MemoryScope::Summary;
-
-    // ORDERING (M2): the completeness-critical `ContextExpired` leaf append runs
-    // FIRST — BEFORE the best-effort relay deletion below — and the relay
-    // deletion is bounded by its OWN budget. Pre-fix, `delete_published` was
-    // awaited first while sharing the single outer `timeout(HANDLER_TIMEOUT)`
-    // with the append: a hostile/stalled relay could consume the whole budget,
-    // the append never ran, `is_complete()` never went true, and the actor's
-    // TTL-expiry retry re-fired forever — the terminal leaf was never recorded.
-    // Appending first (a committed side effect even if the outer timeout later
-    // elapses) plus a bounded relay budget decouples the two so a stalled relay
-    // can never starve the leaf.
-
-    // 3. Event log append — skip if already succeeded on a prior attempt to
-    //    avoid duplicate ContextExpired entries in the Merkle log.
-    if result.completed_steps & STEP_EVENT_LOGGED == 0 {
-        // (d) idempotent leaf: if a terminal `ContextExpired` leaf already
-        // exists (a prior attempt appended it but did not record the step
-        // before an interruption), mark the step done WITHOUT re-appending so
-        // the Merkle root stays stable across respawn. A log that cannot be
-        // read leaves the step undone, so the expiry retries it.
-        match terminal_leaf_exists(
-            event_log,
-            &context_id_bytes,
-            scp_event_log::EventType::ContextExpired,
-        ) {
-            Err(e) => {
-                tracing::warn!(context_id = %context_id, error = %e,
-                    "could not read the event log for the ContextExpired leaf");
-                result.errors.push(format!(
-                    "failed to read the event log for ContextExpired: {e}"
-                ));
-            }
-            Ok(true) => result.set_step(STEP_EVENT_LOGGED),
-            Ok(false) => {
-                match event_log
-                    .append_context_event(
-                        crate::context::builder::AppendMode::AfterSideEffect,
-                        &context_id_bytes,
-                        scp_event_log::EventType::ContextExpired,
-                        scp_event_log::system_actors::SYSTEM_TIMER_ACTOR,
-                        expiry_deadline_secs,
-                    )
-                    .await
-                {
-                    Ok(()) => result.set_step(STEP_EVENT_LOGGED),
-                    Err(e) => {
-                        let msg = format!("failed to log ContextExpired event: {e}");
-                        tracing::warn!(context_id = %context_id, error = %e,
-                        "failed to append ContextExpired to event log");
-                        result.errors.push(msg);
-                    }
-                }
-            }
-        }
-    }
-
-    // Best-effort relay ciphertext deletion (§5.11), AFTER the critical append
-    // and under its OWN bounded budget (M2). Relay deletion is non-blocking —
-    // even if the relay retains the encrypted blobs, the keys are destroyed and
-    // the data is unreadable — so it is NOT tracked in the completeness bitmask.
-    // Bounding it here means a hostile/stalled relay cannot hold this future
-    // open and starve the actor's retry loop: the append above already ran, and
-    // a stall past `RELAY_DELETE_BUDGET` is logged and skipped.
-    if needs_key_destruction && let Some(transport) = transport {
-        match tokio::time::timeout(
-            RELAY_DELETE_BUDGET,
-            transport.delete_published(&context_id_bytes),
-        )
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                tracing::warn!(context_id = %context_id, error = %e,
-                    "best-effort relay deletion failed after TTL expiry");
-            }
-            Err(_elapsed) => {
-                tracing::warn!(context_id = %context_id, budget = ?RELAY_DELETE_BUDGET,
-                    "best-effort relay deletion exceeded its budget after TTL expiry; \
-                     skipping (keys already destroyed — ciphertext is unreadable)");
-            }
-        }
-    }
-
-    result
-}
-
-/// Returns `true` iff a terminal leaf of `event_type` already exists in the
-/// event log for `context_id_bytes` (ADR-049 §9 amendment, idempotent terminal
-/// leaf — finding (d)).
-///
-/// Consults [`ContextEventLogProvider::event_log_entries`]. A context with no
-/// log yet (`Ok(None)`) has no terminal leaf.
-///
-/// # Errors
-///
-/// Returns the provider's error when it cannot read the log: an unreadable
-/// log is never read as one without the leaf, because the caller would then
-/// append a duplicate terminal leaf (spec section 17.3, "Event log write
-/// failures").
-fn terminal_leaf_exists(
-    event_log: &dyn ContextEventLogProvider,
-    context_id_bytes: &[u8; 32],
-    event_type: scp_event_log::EventType,
-) -> Result<bool, ContextError> {
-    Ok(event_log
-        .event_log_entries(context_id_bytes)?
-        .is_some_and(|entries| entries.iter().any(|e| e.event_type == event_type)))
 }
 
 impl TtlExpiryResult {
@@ -1185,208 +991,13 @@ mod tests {
     use scp_protocol::context::roles::{Capability, CapabilityCeiling, ContextRoleState};
     use std::time::Duration;
 
-    use crate::context::builder::{ContextEventLogProvider, ContextTransportProvider};
+    use crate::context::builder::ContextTransportProvider;
 
     // #2148 (ADR-049 birth-into-actor): `mk_crypto` was DELETED — the production
     // TTL/close paths no longer take a crypto provider (key destruction runs on
-    // the actor-owned crypto), and these tests exercise the FSM + leaf/relay
+    // the actor-owned crypto), and these tests exercise the FSM + record/relay
     // behaviour with `None` crypto state (an unregistered context has nothing to
     // dispose).
-
-    // ---------------------------------------------------------------------------
-    // Transport / event-log mocks — these do NOT touch crypto.
-    // ---------------------------------------------------------------------------
-
-    struct NullTransport;
-
-    #[async_trait::async_trait]
-    impl ContextTransportProvider for NullTransport {
-        fn is_connected(&self) -> bool {
-            true
-        }
-        async fn publish_context(
-            &self,
-            _cid: &[u8; 32],
-            _p: &ContextParams,
-        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
-            Ok(())
-        }
-        async fn delete_published(
-            &self,
-            _cid: &[u8; 32],
-        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
-            Ok(())
-        }
-        async fn send_message(
-            &self,
-            _cid: &[u8; 32],
-            _payload: &[u8],
-            _ttl: scp_protocol::envelope::outer::BlobTtl,
-        ) -> Result<(), ContextError> {
-            Ok(())
-        }
-    }
-
-    /// Event-log double that STORES appended leaves and returns them from
-    /// `event_log_entries`, so the idempotent-terminal-leaf guard ((d)) can
-    /// observe an already-present `ContextExpired` leaf across a simulated
-    /// respawn (a second attempt whose completed-steps bitmask was lost). The
-    /// production `MerkleEventLogProvider` supports the same read (Risk 3).
-    #[derive(Default)]
-    struct StatefulEventLog {
-        // Test-only capture buffer; the guard is never held across an `.await`
-        // (locked, mutated, dropped synchronously). Per
-        // `crates/scp-runtime/clippy.toml`, test-only `std::sync::Mutex` sites
-        // carry this allow.
-        #[allow(clippy::disallowed_types)]
-        entries: std::sync::Mutex<Vec<scp_event_log::Event>>,
-        /// When set, `event_log_entries` fails.
-        unreadable: std::sync::atomic::AtomicBool,
-    }
-
-    #[async_trait::async_trait]
-    impl ContextEventLogProvider for StatefulEventLog {
-        async fn init_event_log(
-            &self,
-            _cid: &[u8; 32],
-        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
-            Ok(())
-        }
-        async fn append_event(
-            &self,
-            _cid: &[u8; 32],
-            event: scp_event_log::EventType,
-            actor_did: &str,
-            payload: scp_event_log::EventPayload,
-            timestamp_secs: u64,
-        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
-            self.entries.lock().unwrap().push(scp_event_log::Event {
-                event_type: event,
-                actor_did: scp_did::DID(actor_did.to_owned()),
-                timestamp: timestamp_secs,
-                sequence: 0,
-                payload,
-                prev_hash: [0u8; 32],
-                signature: Vec::new(),
-            });
-            Ok(())
-        }
-        async fn destroy_event_log(
-            &self,
-            _cid: &[u8; 32],
-        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
-            Ok(())
-        }
-        fn event_log_entries(
-            &self,
-            _cid: &[u8; 32],
-        ) -> Result<Option<Vec<scp_event_log::Event>>, ContextError> {
-            if self.unreadable.load(std::sync::atomic::Ordering::SeqCst) {
-                return Err(ContextError::EventLogFailed(
-                    "fixture: the log cannot be read".to_owned(),
-                ));
-            }
-            Ok(Some(self.entries.lock().unwrap().clone()))
-        }
-    }
-
-    /// An expiry whose log cannot be read leaves its event-log step undone and
-    /// appends no second `ContextExpired` leaf: an unreadable log is never read
-    /// as one without the leaf (spec section 17.3, "Event log write failures").
-    #[tokio::test]
-    async fn an_unreadable_log_appends_no_duplicate_expiry_leaf() {
-        let transport = NullTransport;
-        let event_log = StatefulEventLog::default();
-        let handle = active_handle("ctx-ttl-unreadable", MemoryScope::Full);
-        let first = super::try_ttl_expiry_cleanup(
-            &handle,
-            None,
-            Some(&transport),
-            &event_log,
-            0,
-            1_700_000_000,
-        )
-        .await;
-        assert!(first.is_complete(), "first expiry completes: {first}");
-
-        event_log
-            .unreadable
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        let second = super::try_ttl_expiry_cleanup(
-            &handle,
-            None,
-            Some(&transport),
-            &event_log,
-            0,
-            1_700_000_000,
-        )
-        .await;
-        assert!(
-            !second.is_complete(),
-            "an unreadable log leaves the step undone: {second}"
-        );
-        let expired = event_log
-            .entries
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|e| e.event_type == scp_event_log::EventType::ContextExpired)
-            .count();
-        assert_eq!(expired, 1, "no duplicate terminal leaf");
-    }
-
-    /// (d) idempotent terminal leaf (ADR-049 §9 amendment): a SECOND TTL expiry
-    /// whose in-memory completed-steps bitmask was lost (a respawn re-running
-    /// from `prior_completed = 0`) must NOT re-append a duplicate
-    /// `ContextExpired` leaf — a duplicate diverges the Merkle root across
-    /// members. Pre-fix, `try_ttl_expiry_cleanup` appended unconditionally
-    /// whenever `STEP_EVENT_LOGGED` was unset, so the second attempt appended a
-    /// second leaf. Post-fix it consults the log tail and skips.
-    #[tokio::test]
-    async fn expiry_leaf_append_is_idempotent_across_respawn() {
-        let transport = NullTransport;
-        let event_log = StatefulEventLog::default();
-        let handle = active_handle("ctx-ttl-idem", MemoryScope::Full);
-
-        // First expiry — appends the ContextExpired leaf.
-        let r1 = super::try_ttl_expiry_cleanup(
-            &handle,
-            None,
-            Some(&transport),
-            &event_log,
-            0,
-            1_700_000_000,
-        )
-        .await;
-        assert!(r1.is_complete(), "first expiry completes: {r1}");
-
-        // Second expiry from a FRESH bitmask (respawn lost `prior_completed`):
-        // the terminal leaf already exists, so the append is skipped.
-        let r2 = super::try_ttl_expiry_cleanup(
-            &handle,
-            None,
-            Some(&transport),
-            &event_log,
-            0,
-            1_700_000_000,
-        )
-        .await;
-        assert!(
-            r2.is_complete(),
-            "second expiry completes (idempotent): {r2}"
-        );
-
-        let entries = event_log.entries.lock().unwrap();
-        let expired_count = entries
-            .iter()
-            .filter(|e| e.event_type == scp_event_log::EventType::ContextExpired)
-            .count();
-        assert_eq!(
-            expired_count, 1,
-            "ContextExpired must be appended EXACTLY once across a respawn \
-             (idempotent terminal leaf, (d)); pre-fix it appended twice"
-        );
-    }
 
     /// A transport whose `delete_published` STALLS (sleeps far past any budget),
     /// modelling a hostile/wedged relay. `send`/`publish` succeed. Records
@@ -1429,222 +1040,182 @@ mod tests {
         }
     }
 
-    /// M2 (relay stall must not starve the leaf append, REGRESSION GATE): a
-    /// hostile/stalled relay `delete_published` must NOT prevent the
-    /// completeness-critical `ContextExpired` leaf from being recorded within
-    /// the handler budget.
-    ///
-    /// Pre-fix this FAILED: `finish_ttl_expiry_io` awaited `delete_published`
-    /// FIRST, sharing the single outer `timeout(HANDLER_TIMEOUT)` with the leaf
-    /// append. A relay that stalls past the budget consumed the whole timeout,
-    /// the append never ran, `is_complete()` never went true, and the actor's
-    /// TTL-expiry retry re-fired forever with the leaf never recorded. The fix
-    /// appends the leaf FIRST and bounds the best-effort relay delete with its
-    /// own `RELAY_DELETE_BUDGET`, so a stalled relay cannot starve the append.
+    /// M2 (a stalled relay must not hold the terminal path open, REGRESSION
+    /// GATE): the best-effort relay delete runs under its own
+    /// `RELAY_DELETE_BUDGET`, so a relay whose `delete_published` stalls past
+    /// any budget still lets the call return well within `HANDLER_TIMEOUT`.
     #[tokio::test(start_paused = true)]
-    async fn relay_stall_does_not_starve_leaf_append() {
+    async fn delete_published_bounded_does_not_wait_on_a_stalled_relay() {
         let transport = StallingTransport::default();
-        let event_log = StatefulEventLog::default();
-        // Ephemeral scope ⇒ the terminal path DOES issue the best-effort relay
-        // delete (the op that stalls). Crypto is `None` here (a fixture
-        // convenience — a real Ephemeral context carries Some); #2199 F-BH makes
-        // the destruction STEP complete UNCONDITIONALLY once it executes (nothing
-        // to destroy ⇒ trivially done), so `is_complete()` still holds and the
-        // actor despawns. The M2 property under test is the leaf append.
+        // Ephemeral scope ⇒ the delete is issued (the op that stalls).
         let handle = active_handle("ctx-ttl-relay-stall", MemoryScope::Ephemeral);
 
-        // Wrap exactly as the actor does: a single outer `timeout(HANDLER_TIMEOUT)`
-        // around the terminal I/O. Under `start_paused`, tokio auto-advances
-        // virtual time to the next timer, so the bounded relay delete resolves at
-        // `RELAY_DELETE_BUDGET` (5 s) — well within `HANDLER_TIMEOUT` (30 s) —
+        // Under `start_paused`, tokio auto-advances virtual time to the next
+        // timer, so the bounded delete resolves at `RELAY_DELETE_BUDGET` (5 s)
         // rather than the relay's 3600 s stall.
-        let outcome = tokio::time::timeout(
+        tokio::time::timeout(
             crate::context::actor::handlers::ttl_close::HANDLER_TIMEOUT,
-            super::try_ttl_expiry_cleanup(
-                &handle,
-                None,
-                Some(&transport),
-                &event_log,
-                0,
-                1_700_000_000,
-            ),
+            super::delete_published_bounded(&handle, &transport),
         )
-        .await;
-
-        let result = outcome.expect(
-            "append-first + bounded relay budget must let the terminal I/O finish \
-             within HANDLER_TIMEOUT despite the relay stall (M2); pre-fix the \
-             relay-first ordering consumed the whole budget and this elapsed",
-        );
-        // M2's property is that the completeness-critical `ContextExpired` leaf is
-        // RECORDED despite the relay stall. #2199 F-BH restored completion-only
-        // STEP-bit semantics on the TTL path: the destruction step is marked done
-        // once it executes (here the None-crypto case is trivially done), so all
-        // four steps complete and the whole result `is_complete()` — the actor
-        // despawns rather than spinning. Assert full completion (which subsumes
-        // the leaf append `event_logged()`).
-        assert!(
-            result.is_complete(),
-            "the ContextExpired leaf is recorded AND the terminal cleanup completes \
-             despite the relay stall (M2), so the actor despawns: {result}"
-        );
-
-        let entries = event_log.entries.lock().unwrap();
-        let expired_count = entries
-            .iter()
-            .filter(|e| e.event_type == scp_event_log::EventType::ContextExpired)
-            .count();
-        assert_eq!(
-            expired_count, 1,
-            "the ContextExpired leaf MUST be recorded exactly once despite the stall"
+        .await
+        .expect(
+            "the bounded relay delete returns within HANDLER_TIMEOUT despite the \
+             relay stall (M2)",
         );
         assert!(
             transport
                 .delete_entered
                 .load(std::sync::atomic::Ordering::SeqCst),
-            "the best-effort relay delete WAS attempted (and stalled) — the append \
-             simply no longer waits on it"
+            "the best-effort relay delete WAS attempted (and stalled)"
         );
     }
 
-    struct NullEventLog;
+    /// A Full-scope context keeps its keys and content, so the terminal path
+    /// issues no relay delete.
+    #[tokio::test(start_paused = true)]
+    async fn delete_published_bounded_keeps_full_scope_content() {
+        let transport = StallingTransport::default();
+        let handle = active_handle("ctx-ttl-full-keep", MemoryScope::Full);
+        super::delete_published_bounded(&handle, &transport).await;
+        assert!(
+            !transport
+                .delete_entered
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "a Full-scope context issues no relay delete"
+        );
+    }
 
-    #[async_trait::async_trait]
-    impl ContextEventLogProvider for NullEventLog {
-        fn event_log_entries(
-            &self,
-            _context_id: &[u8; 32],
-        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
-        {
-            Ok(None)
-        }
-
-        async fn init_event_log(
-            &self,
-            _cid: &[u8; 32],
-        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
-            Ok(())
-        }
-        async fn append_event(
-            &self,
-            _cid: &[u8; 32],
-            _event: scp_event_log::EventType,
-            _actor_did: &str,
-            _payload: scp_event_log::EventPayload,
-            _timestamp_secs: u64,
-        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
-            Ok(())
-        }
-        async fn destroy_event_log(
-            &self,
-            _cid: &[u8; 32],
-        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
-            Ok(())
+    /// A stored `ContextClosed` entry, for the finalize de-duplication tests.
+    fn closed_entry() -> scp_event_log::Event {
+        scp_event_log::Event {
+            event_type: scp_event_log::EventType::ContextClosed,
+            actor_did: scp_did::DID("system:close".to_owned()),
+            timestamp: 1_699_999_000,
+            sequence: 0,
+            payload: scp_event_log::EventPayload { data: Vec::new() },
+            prev_hash: [0u8; 32],
+            signature: Vec::new(),
         }
     }
 
-    /// Records the `(EventType, actor_did)` of every append so a test can
-    /// assert the real producer stamps the convergent system-leaf sentinel.
-    #[derive(Default)]
-    struct CapturingEventLog {
-        // Test-only capture buffer; the guard is never held across an `.await`
-        // (locked, pushed, and dropped synchronously inside `append_event`).
-        // Per `crates/scp-runtime/clippy.toml`, test-only `std::sync::Mutex`
-        // sites carry this allow.
-        #[allow(clippy::disallowed_types)]
-        appends: std::sync::Mutex<Vec<(scp_event_log::EventType, String)>>,
-    }
-
-    #[async_trait::async_trait]
-    impl ContextEventLogProvider for CapturingEventLog {
-        fn event_log_entries(
-            &self,
-            _context_id: &[u8; 32],
-        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
-        {
-            Ok(None)
-        }
-
-        async fn init_event_log(
-            &self,
-            _cid: &[u8; 32],
-        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
-            Ok(())
-        }
-        async fn append_event(
-            &self,
-            _cid: &[u8; 32],
-            event: scp_event_log::EventType,
-            actor_did: &str,
-            _payload: scp_event_log::EventPayload,
-            _timestamp_secs: u64,
-        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
-            self.appends
-                .lock()
-                .unwrap()
-                .push((event, actor_did.to_owned()));
-            Ok(())
-        }
-        async fn destroy_event_log(
-            &self,
-            _cid: &[u8; 32],
-        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
-            Ok(())
-        }
-    }
-
-    /// §9.9.3 convergence: the native `finalize_close` producer MUST
-    /// stamp the descriptive sentinel `"system:close"` on the `ContextClosed`
-    /// leaf so it is byte-identical across all honest members' `finalize_close` leaves.
-    #[tokio::test]
-    async fn finalize_close_stamps_system_close_actor_did() {
-        let transport = NullTransport;
-        let event_log = CapturingEventLog::default();
+    /// §9.9.3 convergence: finalize plans the `ContextClosed` record with the
+    /// descriptive sentinel `"system:close"` so it is byte-identical across all
+    /// honest members, stamped with the caller's instant, and transitions the
+    /// context to `Closed`.
+    #[test]
+    fn finalize_close_plans_a_system_close_record() {
         let handle = active_handle("ctx-close-actor", MemoryScope::Full);
         handle.transition_to(&ContextState::Closing).unwrap();
-        finalize_close(&handle, &transport, &event_log, 1_700_000_000)
-            .await
-            .unwrap();
 
-        let appends = event_log.appends.lock().unwrap();
-        let closed = appends
-            .iter()
-            .find(|(e, _)| *e == scp_event_log::EventType::ContextClosed)
-            .expect("ContextClosed leaf must be appended by finalize_close");
+        let record = finalize_close(&handle, &[], 1_700_000_000)
+            .unwrap()
+            .expect("a log without ContextClosed gets one planned");
+
+        assert_eq!(record.event_type(), scp_event_log::EventType::ContextClosed);
         assert_eq!(
-            closed.1, "system:close",
-            "native ContextClosed leaf MUST stamp \"system:close\" (§9.9.3 convergence)"
+            record.actor_did(),
+            "system:close",
+            "the ContextClosed record MUST stamp \"system:close\" (§9.9.3 convergence)"
         );
+        assert_eq!(record.timestamp_secs(), 1_700_000_000);
+        assert_eq!(handle.state(), ContextState::Closed);
     }
 
-    /// §9.9.3 convergence: the native TTL-expiry producer
-    /// ([`try_ttl_expiry_cleanup`]) MUST stamp the descriptive sentinel
-    /// `"system:timer"` on the `ContextExpired` leaf so it is byte-identical
-    /// across all honest members' leaves.
-    #[tokio::test]
-    async fn ttl_expiry_stamps_system_timer_actor_did() {
-        let event_log = CapturingEventLog::default();
-        let handle = active_handle("ctx-ttl-actor", MemoryScope::Full);
-        let res = super::try_ttl_expiry_cleanup(
-            &handle,
-            None,
-            Some(&NullTransport),
-            &event_log,
-            0,
-            1_700_000_000,
-        )
-        .await;
-        assert!(!res.has_failures(), "expiry cleanup completes: {res}");
+    /// (d) idempotent terminal record (ADR-049 §9 amendment): when the log or
+    /// the queue already holds a `ContextClosed` record, finalize plans none, so
+    /// no member writes a duplicate that diverges the Merkle root.
+    #[test]
+    fn finalize_close_plans_no_second_closed_record() {
+        let handle = active_handle("ctx-close-idem", MemoryScope::Full);
+        handle.transition_to(&ContextState::Closing).unwrap();
 
-        let appends = event_log.appends.lock().unwrap();
-        let expired = appends
-            .iter()
-            .find(|(e, _)| *e == scp_event_log::EventType::ContextExpired)
-            .expect("ContextExpired leaf must be appended by try_ttl_expiry_cleanup");
-        assert_eq!(
-            expired.1, "system:timer",
-            "native ContextExpired leaf MUST stamp \"system:timer\" (§9.9.3 convergence)"
+        let record = finalize_close(&handle, &[closed_entry()], 1_700_000_000).unwrap();
+
+        assert!(
+            record.is_none(),
+            "an existing ContextClosed record gets no duplicate: {record:?}"
         );
+        assert_eq!(handle.state(), ContextState::Closed);
+    }
+
+    /// Finalize refuses a context that is not `Closing` and leaves its state
+    /// unchanged.
+    #[test]
+    fn finalize_close_refuses_a_context_not_closing() {
+        let handle = active_handle("ctx-close-active", MemoryScope::Ephemeral);
+
+        let res = finalize_close(&handle, &[], 1_700_000_000);
+
+        assert!(
+            matches!(res, Err(ContextError::InvalidTransition { .. })),
+            "an Active context cannot be finalized: {res:?}"
+        );
+        assert_eq!(handle.state(), ContextState::Active);
+    }
+
+    /// A role state whose creator is `did:example:roles-creator` and in which
+    /// no one else holds a capability.
+    fn creator_only_roles() -> ContextRoleState {
+        ContextRoleState::new(
+            "ctx-close-roles",
+            "did:example:roles-creator",
+            CapabilityCeiling::new([Capability::ContextClose]),
+            Vec::new(),
+            &TestClock::new(1_700_000_000),
+        )
+        .unwrap()
+    }
+
+    /// A role state in which `did` holds `ContextClose`.
+    fn closer_roles(did: &DID) -> ContextRoleState {
+        let mut role_state = creator_only_roles();
+        role_state.members.insert(did.as_ref().to_owned());
+        role_state.member_capabilities.insert(
+            did.as_ref().to_owned(),
+            std::iter::once(Capability::ContextClose).collect(),
+        );
+        role_state
+    }
+
+    /// Close plans the `ContextClosing` record for the initiator at the
+    /// caller's convergent instant and transitions `Active -> Closing`.
+    #[test]
+    fn close_context_plans_the_closing_record_for_the_initiator() {
+        let initiator = DID("did:example:closer".to_owned());
+        let handle = active_handle("ctx-close-plan", MemoryScope::Summary);
+
+        let (result, record) = close_context(
+            &handle,
+            &initiator,
+            &closer_roles(&initiator),
+            1_700_000_123,
+        )
+        .unwrap();
+
+        assert_eq!(
+            record.event_type(),
+            scp_event_log::EventType::ContextClosing
+        );
+        assert_eq!(record.actor_did(), initiator.as_ref());
+        assert_eq!(record.timestamp_secs(), 1_700_000_123);
+        assert_eq!(handle.state(), ContextState::Closing);
+        assert!(result.should_generate_summary && result.should_schedule_key_destruction);
+    }
+
+    /// Close refuses an initiator without `ContextClose`, plans nothing, and
+    /// leaves the context `Active`.
+    #[test]
+    fn close_context_refuses_an_initiator_without_close_capability() {
+        let initiator = DID("did:example:not-a-closer".to_owned());
+        let handle = active_handle("ctx-close-denied", MemoryScope::Full);
+
+        let res = close_context(&handle, &initiator, &creator_only_roles(), 1_700_000_000);
+
+        assert!(
+            matches!(res, Err(ContextError::PermissionDenied(_))),
+            "close without ContextClose is refused: {res:?}"
+        );
+        assert_eq!(handle.state(), ContextState::Active);
     }
 
     fn active_handle(context_id: &str, memory_scope: MemoryScope) -> ContextHandle {
@@ -1657,57 +1228,34 @@ mod tests {
         handle
     }
 
-    // ---------------------------------------------------------------------------
-    // Smoke tests — just exercise the real NodeMlsFactory path.
-    // Deeper behaviour was covered by mock trackers that no longer exist;
-    // those tests are deferred to ADR-049 §15 (MlsBackend injection).
-    // ---------------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn finalize_close_full_scope_skips_destruction() {
-        let transport = NullTransport;
-        let event_log = NullEventLog;
-        let handle = active_handle("ctx-1", MemoryScope::Full);
-        handle.transition_to(&ContextState::Closing).unwrap();
-        let res = finalize_close(&handle, &transport, &event_log, 1_700_000_000).await;
-        assert!(res.is_ok());
-    }
-
-    #[tokio::test]
-    async fn finalize_close_ephemeral_scope_runs_destruction() {
-        let transport = NullTransport;
-        let event_log = NullEventLog;
-        let handle = active_handle("ctx-eph", MemoryScope::Ephemeral);
-        handle.transition_to(&ContextState::Closing).unwrap();
-        let res = finalize_close(&handle, &transport, &event_log, 1_700_000_000).await;
-        // Real NodeMlsFactory is idempotent on destroy for unregistered ctxs.
-        assert!(res.is_ok());
-    }
     // #2148 (ADR-049 birth-into-actor): the ADR-056 TTL-expiry chokepoint
-    // regression test was DELETED — `try_ttl_expiry_cleanup` now disposes the
+    // regression test was DELETED — the terminal transition disposes the
     // actor-owned crypto passed to it directly and no longer resolves a
     // context-id string to provider-map bytes, so there is no id-resolution to
     // guard here. The decode-not-rehash keying invariant is proved at the birth
     // seam / actor level (see `builder::create_context` tests).
 
-    #[tokio::test]
-    async fn ttl_expiry_transitions_active_to_expired() {
-        let event_log = NullEventLog;
+    /// The terminal transition moves `Active -> Expired`. The `ContextExpired`
+    /// record step is the caller's (it rides the caller's persist), so it stays
+    /// undone here.
+    #[test]
+    fn ttl_expiry_transitions_active_to_expired() {
         let handle = active_handle("ctx-ttl", MemoryScope::Full);
-        let res =
-            super::try_ttl_expiry_cleanup(&handle, None, None, &event_log, 0, 1_700_000_000).await;
-        assert!(!res.has_failures(), "expiry cleanup completes: {res}");
+        let res = super::apply_ttl_terminal_transition(&handle, None, 0);
+        assert!(res.state_transitioned(), "Active ⇒ Expired: {res}");
+        assert!(
+            !res.event_logged(),
+            "the record step is the caller's: {res}"
+        );
         assert_eq!(handle.state(), ContextState::Expired);
     }
 
-    #[tokio::test]
-    async fn ttl_expiry_rejects_non_active_contexts() {
-        let event_log = NullEventLog;
+    #[test]
+    fn ttl_expiry_rejects_non_active_contexts() {
         let handle = ContextHandle::new("ctx-new".to_owned(), ContextParams::default());
         // Handle is in Creating state — not Active / Expired, so the terminal
-        // transition is refused: the cleanup reports failure and no transition.
-        let res =
-            super::try_ttl_expiry_cleanup(&handle, None, None, &event_log, 0, 1_700_000_000).await;
+        // transition is refused: the result reports failure and no transition.
+        let res = super::apply_ttl_terminal_transition(&handle, None, 0);
         assert!(res.has_failures(), "non-active expiry must report failure");
         assert!(
             !res.state_transitioned(),
@@ -1774,13 +1322,14 @@ mod tests {
             "None crypto ⇒ nothing to destroy ⇒ destruction step trivially complete: \
              BOTH completion bits set so the actor can despawn (not spin): {result}"
         );
-        // The async leaf-append phase is the only remaining step; once it lands the
-        // result is fully complete and the despawn gate (`is_complete()`) is met.
-        // Simulate it here to prove the terminal cleanup CONVERGES (does NOT loop).
-        result.set_step(STEP_EVENT_LOGGED);
+        // The record step is the only remaining one; once the caller queues the
+        // record in its persist the result is fully complete and the despawn gate
+        // (`is_complete()`) is met. Simulate it here to prove the terminal cleanup
+        // CONVERGES (does NOT loop).
+        result.mark_event_logged();
         assert!(
             result.is_complete(),
-            "with the leaf appended the None-crypto expiry is COMPLETE ⇒ the actor \
+            "with the record queued the None-crypto expiry is COMPLETE ⇒ the actor \
              despawns rather than re-arming a retry forever (F-BH): {result}"
         );
     }
@@ -1884,15 +1433,4 @@ mod tests {
         assert!(!ext.is_unanimous_active(&active));
         assert_eq!(ext.active_remaining(&active), 1);
     }
-
-    // Unused trait/type imports from the pre-ADR-049 §15 test scaffolding
-    // must keep compiling: silence the "unused import" lint only where
-    // the import truly has no downstream reference in the shrunk test
-    // module.
-    #[allow(dead_code)]
-    const _CEILING_SMOKE: [Capability; 0] = [];
-    #[allow(dead_code)]
-    const _ROLE_STATE_SMOKE: Option<ContextRoleState> = None;
-    #[allow(dead_code)]
-    const _CEILING_STATE: Option<CapabilityCeiling> = None;
 }

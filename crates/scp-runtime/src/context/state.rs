@@ -256,6 +256,210 @@ pub struct CommitFaultMarker {
 }
 
 // ---------------------------------------------------------------------------
+// Pending log units (spec 17 §17.3 "Event log write failures")
+// ---------------------------------------------------------------------------
+
+/// One event-log entry of a [`PendingLogUnit`]: everything an append takes
+/// except the position, which the drain assigns.
+///
+/// The fields are private, so every leaf passes the append's payload rules
+/// when it is built, before the operation's irreversible step (spec 17 §17.3
+/// "Event log write failures"): [`Self::new`] checks them,
+/// [`Self::consequence`] and [`Self::without_payload`] build only leaves the
+/// rules cannot refuse, and deserialization runs [`Self::new`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "LeafSpecWire")]
+pub struct LeafSpec {
+    event_type: scp_event_log::EventType,
+    actor_did: String,
+    payload: scp_event_log::EventPayload,
+    timestamp_secs: u64,
+}
+
+/// The serialized form of a [`LeafSpec`], checked by [`LeafSpec::new`] when
+/// it is read back.
+#[derive(Deserialize)]
+struct LeafSpecWire {
+    event_type: scp_event_log::EventType,
+    actor_did: String,
+    payload: scp_event_log::EventPayload,
+    timestamp_secs: u64,
+}
+
+impl TryFrom<LeafSpecWire> for LeafSpec {
+    type Error = ContextError;
+
+    fn try_from(wire: LeafSpecWire) -> Result<Self, Self::Error> {
+        Self::new(
+            wire.event_type,
+            wire.actor_did,
+            wire.payload,
+            wire.timestamp_secs,
+        )
+    }
+}
+
+/// The consequence engine's leaf types. None carries an
+/// append payload rule, so [`LeafSpec::consequence`] needs no check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsequenceLeafType {
+    /// `ConsequenceTriggered`.
+    Triggered,
+    /// `ConsequenceEnforced`.
+    Enforced,
+    /// `ConsequenceEnforcementFailed`.
+    EnforcementFailed,
+    /// `ConsequenceEscalatedToSuspendAll`.
+    EscalatedToSuspendAll,
+}
+
+impl ConsequenceLeafType {
+    /// Every consequence leaf type.
+    pub const ALL: [Self; 4] = [
+        Self::Triggered,
+        Self::Enforced,
+        Self::EnforcementFailed,
+        Self::EscalatedToSuspendAll,
+    ];
+
+    /// The event type the leaf carries.
+    #[must_use]
+    pub const fn event_type(self) -> scp_event_log::EventType {
+        match self {
+            Self::Triggered => scp_event_log::EventType::ConsequenceTriggered,
+            Self::Enforced => scp_event_log::EventType::ConsequenceEnforced,
+            Self::EnforcementFailed => scp_event_log::EventType::ConsequenceEnforcementFailed,
+            Self::EscalatedToSuspendAll => {
+                scp_event_log::EventType::ConsequenceEscalatedToSuspendAll
+            }
+        }
+    }
+}
+
+impl LeafSpec {
+    /// Builds a leaf, checking it against the append's payload rules (spec
+    /// 17 §17.3 "Event log write failures"), so a payload that breaks them
+    /// refuses the operation before its step and never after it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::EventLogFailed`] when the payload breaks the
+    /// append's payload rules for `event_type`.
+    pub fn new(
+        event_type: scp_event_log::EventType,
+        actor_did: String,
+        payload: scp_event_log::EventPayload,
+        timestamp_secs: u64,
+    ) -> Result<Self, ContextError> {
+        crate::context::providers::event_log::check_append_payload(event_type, &payload)
+            .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
+        Ok(Self {
+            event_type,
+            actor_did,
+            payload,
+            timestamp_secs,
+        })
+    }
+
+    /// Builds a consequence leaf. The consequence leaf types carry no append
+    /// payload rule; a test pins that the rules accept every one of them.
+    #[must_use]
+    pub const fn consequence(
+        leaf_type: ConsequenceLeafType,
+        actor_did: String,
+        payload: scp_event_log::EventPayload,
+        timestamp_secs: u64,
+    ) -> Self {
+        Self {
+            event_type: leaf_type.event_type(),
+            actor_did,
+            payload,
+            timestamp_secs,
+        }
+    }
+
+    /// Builds a leaf with an empty payload. An empty payload decodes as no
+    /// event, so the append's payload rules accept it for every event type;
+    /// a test pins that.
+    #[must_use]
+    pub fn without_payload(
+        event_type: scp_event_log::EventType,
+        actor_did: String,
+        timestamp_secs: u64,
+    ) -> Self {
+        Self {
+            event_type,
+            actor_did,
+            payload: scp_event_log::EventPayload::default(),
+            timestamp_secs,
+        }
+    }
+
+    /// The entry's closed-taxonomy event type.
+    #[must_use]
+    pub const fn event_type(&self) -> scp_event_log::EventType {
+        self.event_type
+    }
+
+    /// The DID of the actor the entry names.
+    #[must_use]
+    pub fn actor_did(&self) -> &str {
+        &self.actor_did
+    }
+
+    /// The entry's payload, part of the leaf preimage.
+    #[must_use]
+    pub const fn payload(&self) -> &scp_event_log::EventPayload {
+        &self.payload
+    }
+
+    /// The entry's convergent timestamp in seconds since the Unix epoch.
+    #[must_use]
+    pub const fn timestamp_secs(&self) -> u64 {
+        self.timestamp_secs
+    }
+
+    /// The entry's payload, by value.
+    #[must_use]
+    pub fn into_payload(self) -> scp_event_log::EventPayload {
+        self.payload
+    }
+}
+
+/// Event-log entries that an operation queued after its irreversible step
+/// (spec 17 §17.3 "Event log write failures").
+///
+/// The operation queues the unit inside the same fail-closed state persist
+/// that records its step. The drain writes the unit's entries to the log as
+/// one unit starting at `base_seq`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingLogUnit {
+    /// The log sequence the unit's first entry takes. `None` until the
+    /// drain reserves it under the provider's write gate; a drain that finds
+    /// it past the log's end reserves it again, once per drain.
+    pub base_seq: Option<u64>,
+    /// The unit's entries, in log order. Never empty.
+    pub leaves: Vec<LeafSpec>,
+}
+
+/// The context's event log fault (spec 17 §17.3 "Event log write failures").
+///
+/// Set when a queued unit cannot be placed in the log: the log holds other
+/// entries at its `base_seq`, or its `base_seq` is still past the log's end
+/// after one re-reservation. While it is set, the context refuses the
+/// mutations the commit-fault marker refuses, with `EventLogFailed`. Only a
+/// drain that empties the queue over a loaded log clears it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogFaultMarker {
+    /// The `base_seq` of the unit that could not be placed.
+    pub base_seq: u64,
+    /// The log's length when the marker was set.
+    pub log_len: u64,
+    /// What went wrong.
+    pub detail: String,
+}
+
+// ---------------------------------------------------------------------------
 // PendingCeilingModification (M7)
 // ---------------------------------------------------------------------------
 
@@ -891,7 +1095,7 @@ pub struct ContextSnapshot {
     /// Per-member participation record cache for proposer eligibility (#1530).
     #[serde(default)]
     pub participation_cache:
-        HashMap<String, scp_protocol::trust::participation::ParticipationRecord>,
+        HashMap<String, crate::context::participation::RootedParticipationRecord>,
     /// Sender velocity tracker window configuration for anti-spam and
     /// consequence evaluation (§19.7, #1537). Persisted so velocity state
     /// survives process restarts. Contains the `window_secs` configuration.
@@ -992,6 +1196,19 @@ pub struct ContextSnapshot {
     /// `None`, matching pre-feature behavior.
     #[serde(default)]
     pub commit_fault: Option<CommitFaultMarker>,
+    /// Event-log units queued after an irreversible step and not yet written
+    /// (spec 17 §17.3 "Event log write failures").
+    ///
+    /// **Class S** — the queuing operation's fail-closed persist writes the
+    /// unit together with its step. A snapshot written before this field
+    /// existed decodes as an empty queue.
+    #[serde(default)]
+    pub pending_log_units: VecDeque<PendingLogUnit>,
+    /// The log-fault marker (spec 17 §17.3 "Event log write failures").
+    /// **Class S**. A snapshot written before this field existed decodes as
+    /// `None`.
+    #[serde(default)]
+    pub log_fault: Option<LogFaultMarker>,
     /// Number of event log appends since the last consistency checkpoint (§9.9.3).
     /// Persisted so the checkpoint interval counter survives process restarts.
     #[serde(default)]
@@ -1431,7 +1648,7 @@ pub(crate) struct GovernanceState {
     /// hoisted free function lives outside the `manager` submodule tree
     /// and requires explicit `pub(crate)` to access it).
     pub(crate) participation_cache:
-        HashMap<String, scp_protocol::trust::participation::ParticipationRecord>,
+        HashMap<String, crate::context::participation::RootedParticipationRecord>,
     /// Cooldown tracking for consequence rules: maps `rule_index` to the Unix
     /// timestamp (seconds) until which the rule should not re-fire. Prevents
     /// repeated consequence dispatch within a rule's evaluation window.

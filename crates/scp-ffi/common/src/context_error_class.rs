@@ -83,6 +83,11 @@ pub fn classify_context_error(e: &ContextError) -> ContextErrorClass<'_> {
         ContextError::SupervisorShutDown(_) => K::Context(codes::CTX_2138),
         ContextError::SenderKeyDistributionPending { .. } => K::Context(codes::CTX_2140),
         ContextError::SenderKeyRotationPending { .. } => K::Context(codes::CTX_2141),
+        // §7.3.2: a context whose log exists and holds no entry has no
+        // participation facts. The SDKs fold this one code, and no other, into a
+        // zeroed behavioral record; a context with no log, or an unregistered
+        // one, keeps a generic code and surfaces as an error (spec 17 §17.3).
+        ContextError::NoParticipationFacts { .. } => K::Context(codes::CTX_2076),
         ContextError::PermissionDenied(msg) => K::PermissionDenied(msg),
         ContextError::Outlet(surface) => K::Outlet(&surface.code),
         // The reserve-gate carrier renders no lifecycle state (it runs before
@@ -114,7 +119,6 @@ pub fn classify_context_error(e: &ContextError) -> ContextErrorClass<'_> {
         | ContextError::CommitBroadcastFault { .. }
         | ContextError::NotImplemented(_)
         | ContextError::NotInitialized(_)
-        | ContextError::NoParticipationFacts { .. }
         | ContextError::TransportTimeout(_) => K::Generic,
     }
 }
@@ -200,6 +204,30 @@ mod tests {
             ContextErrorClass::Context(code) if code == codes::CTX_2141
         ));
         assert!(has_dedicated_code(&refused));
+    }
+
+    /// An empty log's `NoParticipationFacts` carries `SCP-CTX-2076`, the one
+    /// code the SDKs fold into a zeroed record; an unregistered context and a
+    /// context with no log carry no dedicated code, so no SDK folds them
+    /// (spec 17 §17.3, spec 07 §7.3.2).
+    #[test]
+    fn only_an_empty_log_carries_the_no_participation_facts_code() {
+        let empty = ContextError::NoParticipationFacts {
+            subject_did: "did:dht:alice".to_owned(),
+        };
+        assert!(matches!(
+            classify_context_error(&empty),
+            ContextErrorClass::Context(code) if code == codes::CTX_2076
+        ));
+        for absent in [
+            ContextError::ContextNotRegistered("ctx".to_owned()),
+            ContextError::EventLogFailed("no event log".to_owned()),
+        ] {
+            assert!(matches!(
+                classify_context_error(&absent),
+                ContextErrorClass::Generic
+            ));
+        }
     }
 
     /// A create refused with a coded `ContextError` (a custody failure, a

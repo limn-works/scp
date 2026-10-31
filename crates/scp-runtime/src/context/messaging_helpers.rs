@@ -773,21 +773,26 @@ fn ingest_pseudonym_announcement(
 /// append. The `Some` branch remains so a future sender-authenticated received
 /// event can opt into a durable append without re-plumbing this helper.
 ///
-/// Arms `obligation` (the caller's `&mut Option<ClassSCommitToken>` sink) iff
-/// consequence enforcement performed a downward-authorization mutation (a
-/// `suspended_capabilities` GROW or an `AssignRole` `member_capabilities`
-/// replacement) — the GROW methods do the arming, so it cannot be forgotten
-/// (ADR-049 §9, RED-CS3, GAP-A). The cell holder discharges the populated sink
-/// fail-closed after the borrowing view drops; evaluation otherwise stays
-/// best-effort / coalesced. The returned `bool` mirrors whether the sink was
-/// armed (retained as the RED-CS3b engine signal for callers that observe it).
+/// Fills `sink` (ADR-049 §9, RED-CS3, GAP-A; spec 17 §17.3 "Event log write
+/// failures"): the GROW methods arm its obligation when consequence enforcement
+/// performed a downward-authorization mutation (a `suspended_capabilities` GROW
+/// or an `AssignRole` `member_capabilities` replacement); the durable leaves
+/// (the `Some(event_name)` leaf and every consequence leaf) go into it instead
+/// of being appended here. The evaluation runs over `evidence`, the log read
+/// before the delivery's step, plus the leaves already staged in `sink` and
+/// the receive buffer, so it reads nothing after the step. The cell holder
+/// discharges the sink after the borrowing view drops: one fail-closed keep
+/// persist queues the leaves as one pending log unit and persists the
+/// mutation. The returned `bool` mirrors whether the obligation
+/// was armed (retained as the RED-CS3b engine signal for callers that observe
+/// it).
 #[must_use]
 #[allow(clippy::too_many_arguments)]
-pub async fn run_buffered_post_delivery(
+pub fn run_buffered_post_delivery(
     view: &mut ClassCMut<'_>,
-    obligation: &mut Option<crate::context::actor::class_s::ClassSCommitToken>,
+    sink: &mut crate::context::log_unit_helpers::ConsequenceSink,
+    evidence: &crate::context::governance_logic::PreStepEvidence,
     context_id: &str,
-    context_id_bytes: &[u8; 32],
     sender_did: &str,
     event_name: Option<scp_event_log::EventType>,
     // Committer-assigned leaf timestamp copied from the inbound message
@@ -803,7 +808,6 @@ pub async fn run_buffered_post_delivery(
     // only and do NOT converge cross-member. Do not assume this value is live.
     event_timestamp_secs: u64,
     clock: &dyn Clock,
-    event_log: &dyn crate::context::builder::ContextEventLogProvider,
     event_tx: Option<&ContextEventSender>,
 ) -> bool {
     let now = clock.now_secs();
@@ -813,107 +817,103 @@ pub async fn run_buffered_post_delivery(
         .velocity_tracker_mut()
         .record_message(&DID(sender_did.to_owned()), now);
 
-    // Durable Merkle append ONLY for sender-authenticated events. Application
-    // messages (`None`) skip the append but still run governance below.
-    if let Some(event_name) = event_name
-        && let Err(e) = event_log
-            .append_context_event(
-                crate::context::builder::AppendMode::AfterSideEffect,
-                context_id_bytes,
-                event_name,
-                sender_did,
-                event_timestamp_secs,
-            )
-            .await
-    {
-        tracing::warn!(
-            context_id,
-            sender_did,
-            event_name = ?event_name,
-            "failed to append buffered event to event log: {e}"
-        );
+    // Durable leaf ONLY for sender-authenticated events, queued with the
+    // delivery's state (spec 17 §17.3). Application messages (`None`) add no
+    // leaf but still run governance below.
+    if let Some(event_name) = event_name {
+        sink.push_leaf(crate::context::state::LeafSpec::without_payload(
+            event_name,
+            sender_did.to_owned(),
+            event_timestamp_secs,
+        ));
     }
 
-    let consequence_rules: Vec<ConsequenceRule> = view
-        .governance_class_c_mut()
-        .consequence_rules_mut()
-        .clone();
     // ADR-049 §9 (RED-CS3): `true` iff consequence enforcement performed a
     // downward-authorization mutation on this delivery (a capability suspension
-    // or an `AssignRole` demotion) — propagated to the cell-holding caller so the
-    // mutation persists fail-closed (keep-direction).
-    let downward_auth_applied = if consequence_rules.is_empty() {
-        false
-    } else {
-        let (events, convergent_now) =
-            crate::context::governance_logic::event_log_entries_for_consequences_after_side_effect(
-                view.receive_buffer_mut(),
-                context_id,
-                now,
-                event_log,
-            );
-        let triggered = evaluate_consequence_rules(
-            &consequence_rules,
-            &events,
-            sender_did,
-            now,
-            convergent_now,
-        );
-        let member_did = DID(sender_did.to_owned());
-        // The `receive_buffer` read above has ended (NLL) before `consequence_split`
-        // reborrows the disjoint consequence fields (incl. the GROW role view).
-        let mut split = view.consequence_split();
-        crate::context::governance_logic::enforce_triggered_consequences(
-            &mut split,
-            &crate::context::governance_logic::EnforceConsequencesCtx {
-                context_id,
-                member_did: &member_did,
-                now,
-                triggered: &triggered,
-                rules: &consequence_rules,
-                clock,
-                event_log,
-                event_tx,
-            },
-            obligation,
-        )
-        .await
-    };
+    // or an `AssignRole` demotion).
+    let (events, convergent_now) = received_consequence_events(view, sink, evidence, now);
+    let triggered =
+        evaluate_consequence_rules(evidence.rules(), &events, sender_did, now, convergent_now);
+    let downward_auth_applied = enforce_after_receive(
+        view, sink, evidence, &triggered, context_id, sender_did, now, clock, event_tx,
+    );
 
     *view.checkpoint_events_since_mut() += 1;
     downward_auth_applied
+}
+
+/// The consequence evidence for a received or buffered delivery (spec 17
+/// §17.3 "Event log write failures"): the log read before the delivery's
+/// step (`evidence`), then the leaves already staged in `sink`, merged with
+/// the receive buffer, so the evaluation reads nothing after the step.
+fn received_consequence_events(
+    view: &ClassCMut<'_>,
+    sink: &crate::context::log_unit_helpers::ConsequenceSink,
+    evidence: &crate::context::governance_logic::PreStepEvidence,
+    now: u64,
+) -> (Vec<scp_event_log::Event>, u64) {
+    let (receive_buffer, _) = view.consequence_read_inputs();
+    evidence.events(sink.staged_leaves(), receive_buffer, now)
+}
+
+/// Enforces what the evaluation after a received or buffered delivery
+/// `triggered` for `sender_did`, staging the leaves in `sink`. Returns `true`
+/// when the enforcement performed a downward-authorization mutation.
+#[allow(clippy::too_many_arguments)]
+fn enforce_after_receive(
+    view: &mut ClassCMut<'_>,
+    sink: &mut crate::context::log_unit_helpers::ConsequenceSink,
+    evidence: &crate::context::governance_logic::PreStepEvidence,
+    triggered: &[scp_protocol::trust::consequence::TriggeredConsequence],
+    context_id: &str,
+    sender_did: &str,
+    now: u64,
+    clock: &dyn Clock,
+    event_tx: Option<&ContextEventSender>,
+) -> bool {
+    if triggered.is_empty() {
+        return false;
+    }
+    let member_did = DID(sender_did.to_owned());
+    let mut split = view.consequence_split();
+    crate::context::governance_logic::enforce_triggered_consequences(
+        &mut split,
+        &crate::context::governance_logic::EnforceConsequencesCtx {
+            context_id,
+            member_did: &member_did,
+            now,
+            triggered,
+            rules: evidence.rules(),
+            clock,
+            event_tx,
+        },
+        sink,
+    )
 }
 
 // ---------------------------------------------------------------------------
 // 7. send_message (top-level, actor-shape)
 // ---------------------------------------------------------------------------
 
-/// Discharges a [`send_message`] Phase-1 routing/envelope ABORT (ADR-049 §9,
-/// keep-direction): persists the burned spending-nonce token FAIL-CLOSED (a
-/// Class-S obligation owed on every terminal path, via a SHARED
-/// `&PerContextState` auto-derefed from `cell`) BEFORE reversing the Class-C
-/// economy ticket through a fresh `ClassCMut` governance view, then returns the
-/// (possibly persist-promoted) error.
+/// Discharges a [`send_message`] abort that happens before the send: reverses
+/// the Class-C economy ticket through a fresh `ClassCMut` governance view and
+/// returns `abort_err`. A burned spending nonce is already durable (it commits
+/// fail-closed right after `enforce_send_economy`, spec 17 §17.3), so it stays
+/// consumed.
 ///
 /// Each call site has ALREADY reversed its own sequence reservation (or reserved
 /// none) inside the view before invoking this — so this helper never touches the
-/// per-sender sequence. Returns the original `abort_err` when the token persists
-/// cleanly (or no token was burned), or the [`ContextError::PersistenceFailed`]
-/// when the fail-closed persist of the burned nonce itself fails.
-async fn discharge_send_abort(
+/// per-sender sequence.
+fn discharge_send_abort(
     cell: &mut crate::context::actor::class_s::ClassSCell,
-    deps: &ActorDeps,
-    context_id: &str,
-    token: Option<crate::context::actor::class_s::ClassSCommitToken>,
     ticket: crate::context::economy_logic::EconomyTicket,
     abort_err: ContextError,
 ) -> Result<(), ContextError> {
-    let err = commit_send_nonce_token_on_abort(token, cell, deps, context_id, abort_err).await;
     crate::context::economy_logic::rollback_economy_ticket_inline_view(
         cell.class_c_view().governance_class_c_mut(),
         ticket,
     );
-    Err(err)
+    Err(abort_err)
 }
 
 /// Sends a message within a context (actor-shape).
@@ -923,14 +923,18 @@ async fn discharge_send_abort(
 /// per-context commands, so encryption + transport happen with `state`
 /// borrowed throughout.
 ///
-/// 1. Capability + commit-fault gate, hard-rate-limit consume, velocity
-///    record, economy enforcement, broadcast-envelope build (broadcast)
-///    OR sequence assignment + routing-ID list (encrypted) — produces
-///    an [`EconomyTicket`](crate::context::economy_logic::EconomyTicket).
-/// 2. Payment authorization (escrow hold).
-/// 3. Encrypt + transport fan-out.
-/// 4. On failure: void escrow, drain ticket, rollback sequence.
-/// 5. On success: commit ticket, capture payment, [`finalize_send`].
+/// 1. Capability + commit-fault + log-fault gate, hard-rate-limit consume,
+///    velocity record, economy enforcement and the fail-closed persist of a
+///    burned spending nonce, broadcast-envelope build (broadcast) OR sequence
+///    assignment + routing-ID list (encrypted) — produces an
+///    [`EconomyTicket`](crate::context::economy_logic::EconomyTicket).
+/// 2. Fail-closed read of the event log for the consequence evaluation (spec
+///    17 §17.3 "Event log write failures").
+/// 3. Payment authorization (escrow hold).
+/// 4. Encrypt + transport fan-out.
+/// 5. On failure: void escrow, drain ticket, rollback sequence.
+/// 6. After the send: [`finalize_send`], then commit the ticket and capture the
+///    payment whatever finalize returns, because the send cannot be undone.
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::too_many_arguments)]
 pub async fn send_message(
@@ -945,8 +949,6 @@ pub async fn send_message(
     spending_ucan: Option<&UcanToken>,
 ) -> Result<(), ContextError> {
     let context_id = handle.context_id().to_owned();
-    // ADR-056: canonical digest, not a re-hash of the hex id.
-    let context_id_bytes = state::context_id_to_bytes(&context_id);
 
     // Pre-economy active + commit-fault gates run FIRST (matching the legacy
     // ordering: `require_active` → `check_commit_fault_marker` → signer-`None` →
@@ -959,6 +961,7 @@ pub async fn send_message(
         state::require_active(view.handle_mut())?;
         // Fail-close on commit fault.
         governance_helpers::check_commit_fault_marker(view.commit_fault_mut().as_ref())?;
+        governance_helpers::check_log_fault_marker(view.class_s().log_fault.as_ref())?;
     }
 
     // ADR-039: pair the signer with its persona into a single
@@ -1021,10 +1024,9 @@ pub async fn send_message(
     // `enforce_send_economy` routes the spending-nonce consume through the
     // DEFERRED-persist combinator (ADR-049 §9): it returns the cost plus an
     // `Option<ClassSCommitToken>` that is `Some` only on the PAID (nonce-burning)
-    // branch. That token's fail-closed persist is owed on EVERY terminal path
-    // below (keep-direction) — the Err arm here issues NO token (nothing was
-    // consumed), so it is unchanged.
-    let (deducted_cost, mut spending_nonce_token) = match enforce_send_economy(
+    // branch. The token commits fail-closed below, before the send — the Err
+    // arm here issues NO token (nothing was consumed), so it is unchanged.
+    let (deducted_cost, spending_nonce_token) = match enforce_send_economy(
         cell,
         sender_did,
         now_secs,
@@ -1055,23 +1057,29 @@ pub async fn send_message(
         needs_hard_rate_limit_refund: true,
         consumed: false,
     };
+    // The burned spending nonce persists fail-closed before the send (spec 17
+    // §17.3 "Event log write failures"; ADR-049 §9 Class S, BLACK-001): a
+    // crash in the ≤50ms coalesce window must not roll the consume back after
+    // the message left. On persist failure the send is refused and the economy
+    // reservation reversed; the nonce stays CONSUMED in memory (keep-direction,
+    // un-consuming would re-open the replay window).
+    debug_assert_eq!(
+        spending_nonce_token.is_some(),
+        deducted_cost.is_some() && spending_ucan.is_some(),
+        "spending-nonce token must be Some iff a paid send burned a nonce",
+    );
+    if let Some(token) = spending_nonce_token
+        && let Err(e) = token.commit(cell, deps, &context_id).await
+    {
+        return discharge_send_abort(cell, ticket, e);
+    }
 
     // Phase 1 routing/envelope build runs through the non-persisting Class-C
-    // view. An abort here owes the keep-direction nonce-token persist (Class-S,
-    // FAIL-CLOSED via `&*cell`) BEFORE its Class-C reversal — but the token
-    // commit needs a SHARED `&PerContextState` that cannot overlap the `&mut
-    // view`. So the view block computes the routing tuple OR a typed
-    // [`SendAbort`] carrying the error and whether the sequence was reserved; the
-    // abort is then discharged AFTER the view borrow ends (NLL), committing the
-    // token through `&*cell` and reversing the economy ticket / sequence through
-    // a fresh view.
-    // The view block computes the routing tuple OR returns a typed `Err` carrying
-    // the abort error. Each abort variant fully reverses its OWN Class-C side
-    // effects inside the view (the `PseudonymRegistryEmpty` arm rolls the reserved
-    // sequence; the others reserved none). The abort is discharged AFTER the view
-    // borrow ends (NLL): the keep-direction nonce-token persist needs a SHARED
-    // `&PerContextState` (auto-derefed from `cell`) that cannot overlap the
-    // `&mut view`, and the economy-ticket reversal takes a fresh view.
+    // view. The view block computes the routing tuple OR returns a typed `Err`
+    // carrying the abort error. Each abort variant fully reverses its OWN Class-C
+    // side effects inside the view (the `PseudonymRegistryEmpty` arm rolls the
+    // reserved sequence; the others reserved none). The economy-ticket reversal
+    // takes a fresh view once the view borrow ends (NLL).
     #[allow(clippy::type_complexity)]
     let routing: Result<
         (
@@ -1108,15 +1116,11 @@ pub async fn send_message(
             else {
                 return discharge_send_abort(
                     cell,
-                    deps,
-                    &context_id,
-                    spending_nonce_token.take(),
                     ticket,
                     ContextError::MemberNotFound(format!(
                         "cannot assign sequence: {sender_did} is not a member"
                     )),
-                )
-                .await;
+                );
             };
             // §9.10.4: encrypted contexts fan out to each member's pseudonym
             // routing ID. App data embeds NO correlating routing value: the outer
@@ -1174,14 +1178,9 @@ pub async fn send_message(
                     // discharge must NOT roll it again — hence the explicit reversal
                     // here rather than relying on the (sequence-agnostic) discharge.
                     //
-                    // Ordering note: the rollback runs HERE (inside the `&mut view`)
-                    // BEFORE the keep-direction nonce persist in `discharge_send_abort`
-                    // (which needs a non-overlapping `&*cell` shared borrow), so the
-                    // persisted snapshot reflects the rolled-BACK (reusable) sequence.
-                    // This is safe: the message was never transmitted, and the
-                    // per-sender outbound counter only needs monotonicity for sequences
-                    // actually sent — persisting the reusable value cannot reorder or
-                    // replay a delivered message.
+                    // The rolled-BACK (reusable) sequence is safe: the message was
+                    // never transmitted, and the per-sender outbound counter only
+                    // needs monotonicity for sequences actually sent.
                     view.membership_class_c_mut()
                         .rollback_sequence_number(sender_did);
                     let err = ContextError::PseudonymRegistryEmpty {
@@ -1190,15 +1189,7 @@ pub async fn send_message(
                     };
                     // `view`'s last use is the sequence rollback above; its borrow
                     // ends here (NLL) so `cell` is free for the discharge below.
-                    return discharge_send_abort(
-                        cell,
-                        deps,
-                        &context_id,
-                        spending_nonce_token.take(),
-                        ticket,
-                        err,
-                    )
-                    .await;
+                    return discharge_send_abort(cell, ticket, err);
                 }
                 let recipients = view.access_mut().access_key_store.get_all(&context_id);
                 Ok((None, recipients, seq, false, peer_pseudonyms))
@@ -1208,17 +1199,7 @@ pub async fn send_message(
     let (broadcast_envelope, recipients_data, sequence, is_broadcast, send_routing_ids) =
         match routing {
             Ok(tuple) => tuple,
-            Err(err) => {
-                return discharge_send_abort(
-                    cell,
-                    deps,
-                    &context_id,
-                    spending_nonce_token.take(),
-                    ticket,
-                    err,
-                )
-                .await;
-            }
+            Err(err) => return discharge_send_abort(cell, ticket, err),
         };
 
     // §9.10.4 lone-member no-op: a single-member encrypted context produces an
@@ -1237,17 +1218,8 @@ pub async fn send_message(
     // multi-member empty-registry case hard-fails above with
     // `PseudonymRegistryEmpty` before reaching here.
     if !is_broadcast && send_routing_ids.is_empty() {
-        // Keep-direction (ADR-049 §9): even on this no-charge no-op exit, a
-        // spending-UCAN nonce burned in Phase 1 MUST persist fail-closed — a
-        // crash in the coalesce window must not un-burn it and re-open replay.
-        // Commit the token first; if its persist fails, surface that error
-        // (fail-closed) instead of the no-op `Ok(())`. The Class-C reversal
-        // (ticket + sequence) runs regardless.
-        // The token's `commit` takes a SHARED `&PerContextState` (via `&*cell`).
-        let nonce_persist = match spending_nonce_token.take() {
-            Some(t) => t.commit(cell, deps, &context_id).await,
-            None => Ok(()),
-        };
+        // A spending-UCAN nonce burned in Phase 1 is already durable and stays
+        // consumed (keep-direction, ADR-049 §9).
         crate::context::economy_logic::rollback_economy_ticket_inline_view(
             cell.class_c_view().governance_class_c_mut(),
             ticket,
@@ -1255,8 +1227,35 @@ pub async fn send_message(
         cell.class_c_view()
             .membership_class_c_mut()
             .rollback_sequence_number(sender_did);
-        return nonce_persist;
+        return Ok(());
     }
+
+    // The consequence evaluation after the send reads the log as it stands
+    // before the send, plus the queued log units, and the participation record
+    // binds the log's Merkle root as it stands before the send (spec 17 §17.3
+    // "Event log write failures"). An unreadable log or root refuses the send
+    // before anything leaves: the economy reservation and the sequence are
+    // reversed.
+    let pre_send_read = crate::context::governance_logic::LogAndQueue::read(
+        cell.class_s.pending_log_units.iter(),
+        &context_id,
+        &*deps.event_log,
+    )
+    .and_then(|log| {
+        crate::context::participation::ParticipationRoot::read(&context_id, &*deps.event_log)
+            .map(|root| (log.into_entries(), root))
+    });
+    let (log_entries, participation_root) = match pre_send_read {
+        Ok(read) => read,
+        Err(e) => {
+            if !is_broadcast {
+                cell.class_c_view()
+                    .membership_class_c_mut()
+                    .rollback_sequence_number(sender_did);
+            }
+            return discharge_send_abort(cell, ticket, e);
+        }
+    };
 
     // Payment flow: authorize (hold) before action. The sync PREPARE reads the
     // SHARED `&PerContextState` (via `&*cell`) and its borrow drops at the call
@@ -1274,26 +1273,12 @@ pub async fn send_message(
         {
             Ok(auth) => auth,
             Err(e) => {
-                // Keep-direction (ADR-049 §9): persist the burned nonce fail-closed
-                // (via `&*cell`) before the existing Class-C reversal.
-                let err = commit_send_nonce_token_on_abort(
-                    spending_nonce_token.take(),
-                    cell,
-                    deps,
-                    &context_id,
-                    e,
-                )
-                .await;
-                crate::context::economy_logic::rollback_economy_ticket_inline_view(
-                    cell.class_c_view().governance_class_c_mut(),
-                    ticket,
-                );
                 if !is_broadcast {
                     cell.class_c_view()
                         .membership_class_c_mut()
                         .rollback_sequence_number(sender_did);
                 }
-                return Err(err);
+                return discharge_send_abort(cell, ticket, e);
             }
         },
     };
@@ -1327,20 +1312,9 @@ pub async fn send_message(
         )
         .await
     };
-    if let Err(e) = phase2_result {
-        // Keep-direction (ADR-049 §9): persist the burned nonce fail-closed
-        // (via `&*cell`) BEFORE the existing escrow-void + ticket rollback. If the
-        // persist fails, surface that error (fail-closed); the Class-C reversal
-        // runs either way.
-        let err = commit_send_nonce_token_on_abort(
-            spending_nonce_token.take(),
-            cell,
-            deps,
-            &context_id,
-            e,
-        )
-        .await;
-        // Void escrow + roll back ticket on send failure.
+    if let Err(err) = phase2_result {
+        // Void escrow + roll back ticket on send failure; the burned nonce is
+        // already durable and stays consumed.
         if let Some(a) = auth {
             crate::context::economy_helpers::void_paid_action(deps, a, &context_id).await;
         }
@@ -1356,74 +1330,30 @@ pub async fn send_message(
         return Err(err);
     }
 
-    // Phase 3: finalize, then capture escrow + commit ticket.
-    //
-    // ADR-049 §9 Class S (BLACK-001): the spending-nonce consume that
-    // `enforce_send_economy` performed in Phase 1 mutated the actor-owned
-    // `spending_nonce_tracker` — security-critical monotonic state that does
-    // NOT survive an actor crash. It MUST be durably persisted (fail-closed)
-    // BEFORE this paid send is acknowledged to the caller, exactly as the
-    // structurally-identical OUTLET-INVOKE path does in `reserve_outlet_economy`.
-    // A best-effort (coalesced) persist would let an actor crash in the ≤50ms
-    // coalesce window roll the consume back, freshening the spending UCAN's
-    // nonce after the caller already saw the send succeed — a replay /
-    // double-spend window. `finalize_send` therefore persists fail-closed when
-    // a spending nonce was committed for THIS send (mirroring the exact gating
-    // `reserve_outlet_economy` uses: `deducted_cost.is_some() &&
-    // spending_ucan.is_some()`); on persist failure it returns an error and we
-    // REVERSE the economy reservation (budget / velocity / rate-limit) and void
-    // the escrow hold below — leaving the consumed nonce CONSUMED (the
-    // fail-closed direction; un-consuming would re-open the replay window) and
-    // surfacing the error so the caller does not observe a phantom success.
-    // Non-spending / free sends keep the best-effort persist inside
-    // `finalize_send` (the common path is not regressed). The deferred
-    // [`ClassSCommitToken`] carries the fail-closed-persist obligation: it is
-    // `Some` exactly on the paid (nonce-burning) branch, so the assertion below
-    // pins the token's presence to the legacy `deducted_cost.is_some() &&
-    // spending_ucan.is_some()` gating.
-    debug_assert_eq!(
-        spending_nonce_token.is_some(),
-        deducted_cost.is_some() && spending_ucan.is_some(),
-        "spending-nonce token must be Some iff a paid send burned a nonce",
-    );
-    if let Err(e) = finalize_send(
+    // Phase 3: the message has left, so nothing below undoes it (spec 17
+    // §17.3 "Event log write failures"). `finalize_send` queues the consequence
+    // leaves with their mutations in one fail-closed keep persist; its only
+    // error is that persist failing, which leaves the leaves queued in memory.
+    // The ticket commits and the payment is captured either way, and the
+    // persist error is surfaced so the caller sees the durability failure.
+    let finalized = finalize_send(
         cell,
         deps,
         &context_id,
-        &context_id_bytes,
         sender_did,
         sequence,
         payload,
         // The persona travels with the key: `finalize_send` builds a due
         // periodic checkpoint only under `MessageSigner::Active`.
         signer,
-        spending_nonce_token.take(),
-        is_broadcast,
+        &log_entries,
+        participation_root,
     )
-    .await
-    {
-        // Fail-closed persist of the Class-S nonce consume failed. Reverse the
-        // economy reservation (the ticket is still alive — it is NOT committed
-        // until finalize succeeds) and void the escrow hold. The sequence
-        // rollback is INTENTIONALLY NOT performed here: `finalize_send` owns the
-        // sequence rollback on all of its error exits (ADR-049 §9 round-5
-        // regression fix). Rolling it back here too would revert the reserved
-        // sequence twice (a +1 undone by −2 via `saturating_sub`), leaving the
-        // counter one below correct. The consumed nonce is intentionally left
-        // consumed (the fail-closed direction).
-        if let Some(a) = auth {
-            crate::context::economy_helpers::void_paid_action(deps, a, &context_id).await;
-        }
-        crate::context::economy_logic::rollback_economy_ticket_inline_view(
-            cell.class_c_view().governance_class_c_mut(),
-            ticket,
-        );
-        return Err(e);
-    }
+    .await;
 
     let deducted_cost = crate::context::economy_logic::commit_economy_ticket(ticket);
     capture_send_payment(cell, deps, auth, sender_did, &context_id, deducted_cost).await;
-    Ok(())
+    finalized
 }
 
 // ---------------------------------------------------------------------------
@@ -1493,7 +1423,7 @@ pub async fn deliver_incoming(
     deps: &ActorDeps,
     context_id: &str,
     encrypted_blob: &[u8],
-    downward_auth_sink: &mut Option<crate::context::actor::class_s::ClassSCommitToken>,
+    downward_auth_sink: &mut crate::context::log_unit_helpers::ConsequenceSink,
     commit_sink: &mut Option<crate::context::actor::pseudonym_rotation::ProcessedCommit>,
 ) -> Result<DeliverOutcome, ContextError> {
     // ADR-056: canonical digest (matches the MLS group / sender keys), not a
@@ -1526,6 +1456,25 @@ pub async fn deliver_incoming(
         .map(|did| did.0.clone())
         .collect();
     drop(local_dids);
+
+    // The consequence evaluation after this delivery reads the log as it
+    // stands before the message is opened, plus the queued log units (spec 17
+    // §17.3 "Event log write failures"). Opening the envelope consumes MLS
+    // key material, so an unreadable log refuses the delivery here, before
+    // anything is consumed.
+    let evidence = {
+        let rules = view
+            .governance_class_c_mut()
+            .consequence_rules_mut()
+            .clone();
+        let (_, queued) = view.consequence_read_inputs();
+        crate::context::governance_logic::PreStepEvidence::read_for_rules(
+            &rules,
+            queued,
+            context_id,
+            &*deps.event_log,
+        )?
+    };
 
     // Phase 2: open envelope (MLS + sender key + deserialize + integrity).
     // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): open through the actor's field-granular
@@ -1631,9 +1580,15 @@ pub async fn deliver_incoming(
 
     // Anti-replay + reorder buffer (§9.8.2, §9.8.5).
     let now_ms = deps.clock.now_millis();
-    let sequence_check =
-        validate_and_drain_timeouts(view, deps, context_id, &inner, now_ms, downward_auth_sink)
-            .await?;
+    let sequence_check = validate_and_drain_timeouts(
+        view,
+        deps,
+        context_id,
+        &inner,
+        now_ms,
+        &evidence,
+        downward_auth_sink,
+    )?;
 
     let is_local_sender = sender_did == local_member_did;
 
@@ -1643,14 +1598,13 @@ pub async fn deliver_incoming(
                 view,
                 deps,
                 context_id,
-                &context_id_bytes,
                 &sender_did,
                 &inner,
                 &plaintext,
                 is_local_sender,
+                &evidence,
                 downward_auth_sink,
-            )
-            .await?;
+            )?;
             if consumed_as_announcement {
                 Ok(DeliverOutcome::Handled)
             } else {
@@ -1666,9 +1620,9 @@ pub async fn deliver_incoming(
                 &sender_did,
                 &plaintext,
                 now_ms,
+                &evidence,
                 downward_auth_sink,
-            )
-            .await;
+            );
             Ok(DeliverOutcome::Handled)
         }
     }
@@ -2214,34 +2168,19 @@ fn record_payment_capture_failure(
 
 /// Computes and caches the sender's participation record after a send.
 /// Factored out of [`finalize_send`] to keep that function within the line
-/// budget; pure bookkeeping with no error path (a missing Merkle root or a
-/// zero-count record is simply not cached).
+/// budget. `root` is the log's Merkle root [`send_message`] read before the
+/// send, so this reads nothing and has no error path; a zero-count record is
+/// not cached.
 fn record_send_participation(
     view: &mut ClassCMut,
-    deps: &ActorDeps,
+    root: crate::context::participation::ParticipationRoot,
     context_id: &str,
-    context_id_bytes: &[u8; 32],
     sender_did: &DID,
     send_events: &[scp_event_log::Event],
     now: u64,
 ) {
-    let send_merkle = deps
-        .event_log
-        .event_log_merkle_root(context_id_bytes)
-        .unwrap_or([0u8; 32]);
     if !send_events.is_empty()
-        && let Ok(record) = scp_protocol::trust::participation::compute_participation_record(
-            send_events,
-            sender_did.as_ref(),
-            context_id,
-            send_merkle,
-            now,
-            // attestation_count is a credential-layer, verifier-relative fact
-            // (§7.3.2); this messaging path gates only on participation_count and
-            // has no attestation-cache access, so it passes an empty accessible-
-            // attestation set (count 0) by design — NOT a stub.
-            &[],
-        )
+        && let Ok(record) = root.record(send_events, sender_did.as_ref(), context_id, now)
         && record.participation_count > 0
     {
         view.governance_class_c_mut()
@@ -2250,109 +2189,60 @@ fn record_send_participation(
     }
 }
 
-/// Pushes a `MessageSent` event, appends to the event log, runs
-/// consequence enforcement, and persists. Actor-shape: no relock
-/// dance — `state` is borrowed throughout.
+/// Pushes a `MessageSent` event, runs the consequence evaluation and
+/// enforcement, records participation, persists, and builds a due checkpoint.
+/// Runs after the send, so nothing here undoes it (spec 17 §17.3 "Event log
+/// write failures").
 ///
-/// Sync — no await points in the actor body. The caller (`send_message`)
-/// stays `async` because it threads through escrow / transport awaits
-/// before `finalize_send`.
+/// `log_entries` is the durable log plus the queued log units, read by
+/// [`send_message`] before the send
+/// ([`LogAndQueue::read`](crate::context::governance_logic::LogAndQueue::read));
+/// the evaluation merges it with the receive buffer. `participation_root` is
+/// the log's Merkle root, read by [`send_message`] beside `log_entries`, which
+/// the sender's participation record binds. The consequence leaves go
+/// into a [`ConsequenceSink`](crate::context::log_unit_helpers::ConsequenceSink)
+/// whose discharge queues them as one pending log unit in the same fail-closed
+/// keep persist as their mutations (ADR-049 §9, RED-CS3), then drains the
+/// queue. With nothing owed the persist stays best-effort (Class C). The
+/// spending nonce was committed before the send, so no nonce obligation reaches
+/// this function.
 ///
-/// `token` carries the ADR-049 §9 deferred-persist obligation for this send
-/// (BLACK-001): it is `Some` when a paid send burned a spending-UCAN nonce in
-/// Phase 1 (`enforce_send_economy` mutated the actor-owned
-/// `spending_nonce_tracker`, Class S monotonic state that does NOT survive an
-/// actor crash), and `None` for a free / non-spending send. When `Some`, the
-/// final persist is the token's FAIL-CLOSED `commit`: a persist failure returns
-/// [`ContextError::PersistenceFailed`] so the paid send is NOT acknowledged
-/// while its nonce-consume is unpersisted, exactly mirroring the outlet-invoke
-/// path in `reserve_outlet_economy`. When `None`, the persist stays best-effort
-/// (Class C) — the common path is not regressed. The token is consumed on EVERY
-/// path `finalize_send` can take (the TTL-expiry arm commits it too — a late TTL
-/// expiry must still persist the burned nonce, keep-direction).
+/// When a TTL expiry closed the context between the send and this call, the
+/// function returns `Ok(())` and evaluates nothing: the message left with its
+/// sequence, so the sequence stays used.
 ///
-/// # Sequence-rollback ownership (ADR-049 §9, round-9 leak fix)
+/// # Errors
 ///
-/// `finalize_send` OWNS the per-sender sequence rollback on ALL of its error
-/// exits — the TTL early-return below and the final persist failure (in
-/// [`persist_finalized_send`]). (The former FIRST `MessageSent` durable-append
-/// rollback site is gone: per ADR-051 §6 / the phase-2.md ADR-011 amendment
-/// exclusion taxonomy §2, `MessageSent` is a per-author, non-convergent event
-/// excluded from the canonical Merkle log — there is no durable append to fail,
-/// so the local `ContextEvent::MessageSent` emission below is now the sole
-/// surfacing of a send.) The
-/// `send_message` caller deliberately does NOT roll the sequence back when
-/// `finalize_send` returns `Err`: doing so would double-revert, a `+1`
-/// reservation undone by a `−2` via `saturating_sub`, leaving a per-sender gap
-/// that a receiver reads as a `SequenceGapForceClose`. A broadcast publish
-/// reserves NO per-sender sequence (`sequence` is 0 and `next_sequence_number`
-/// was never called), so rolling back would spuriously decrement the
-/// publisher's counter — every rollback is therefore gated on `!is_broadcast`.
-/// The escrow hold + economy ticket are voided by the caller (they are still
-/// alive — finalize did not commit them); only the sequence is the caller's
-/// deferred responsibility, discharged here.
+/// [`ContextError::PersistenceFailed`] when the keep persist fails; the
+/// mutations and the queued unit stay in memory for the next persist.
 #[allow(clippy::too_many_arguments)]
 pub async fn finalize_send(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
-    context_id_bytes: &[u8; 32],
     sender_did: &DID,
     sequence: u64,
     payload: &[u8],
     signer: MessageSigner<'_>,
-    token: Option<crate::context::actor::class_s::ClassSCommitToken>,
-    is_broadcast: bool,
+    log_entries: &[scp_event_log::Event],
+    participation_root: crate::context::participation::ParticipationRoot,
 ) -> Result<(), ContextError> {
-    // M12: `MessageSent` is no longer a durable Merkle leaf — per ADR-051 §6 /
-    // the phase-2.md ADR-011 amendment exclusion taxonomy §2 it is a per-author,
+    // `MessageSent` is not a durable Merkle leaf — per ADR-051 §6 / the
+    // phase-2.md ADR-011 amendment exclusion taxonomy §2 it is a per-author,
     // non-convergent event surfaced only as the local `ContextEvent::MessageSent`
-    // emitted below. The former pre-consequence durable append (and its
-    // sequence-rollback-on-append-failure) is removed so two honest members
-    // derive the same `event_log_merkle_root` (§9.9.3).
-
-    // Phase 3 reacquire-and-mutate is unnecessary in the actor model;
-    // the actor owns state for the duration of the command. We DO
-    // re-check the lifecycle state — a TTL expiry could land between
-    // Phase 1 and finalize within the same command if the actor's TTL
-    // arm fires (Phase 2A.9 wires this). For Phase 2A.7 this matches
-    // the legacy contract: rollback the sequence number and exit. The
-    // handle read goes through the Class-C view (its borrow ends before the
-    // shared-`&` token commit below).
+    // emitted below (§9.9.3).
     if state::require_active(cell.class_c_view().handle_mut()).is_err() {
-        // Only encrypted sends reserved a sequence (broadcast publishes carry 0
-        // and never call `next_sequence_number`) — broadcast must not roll back.
-        if !is_broadcast {
-            cell.class_c_view()
-                .membership_class_c_mut()
-                .rollback_sequence_number(sender_did);
-        }
-        // A spending-UCAN nonce burned in Phase 1 stays CONSUMED (a late TTL
-        // expiry must not freshen it); commit its deferred token so it persists
-        // fail-closed — a crash before coalesce cannot roll the consume back
-        // (ADR-049 §9 Class S, keep-direction). A free send carries no token. The
-        // token's `commit` takes a SHARED `&PerContextState` (via `&*cell`).
-        if let Some(t) = token {
-            t.commit(cell, deps, context_id).await?;
-        }
         return Ok(());
     }
 
     let now = deps.clock.now_secs();
-    // ADR-049 §9 (RED-CS3): `true` when consequence enforcement performs a
-    // downward-authorization mutation (a capability suspension or an `AssignRole`
-    // demotion), so the final persist is upgraded to fail-closed (keep-direction)
-    // — a coalesce-window crash must not lose the mutation. Bound from the view
-    // block below so the value is set exactly once, then folded into a token
-    // obligation (free branch only) at the persist site.
-    // The GROW methods arm this sink directly when a downward-auth mutation is
-    // applied (GAP-A: arming is coupled to the mutation, not a separate call). It
-    // is owned here at the cell boundary and reconciled with the send's nonce
-    // `token` below.
-    let mut downward_auth_sink: Option<crate::context::actor::class_s::ClassSCommitToken> = None;
+    // The GROW methods arm the sink's obligation when a downward-auth mutation
+    // is applied (GAP-A: arming is coupled to the mutation, not a separate
+    // call); the consequence leaves land in it too.
+    let mut sink = crate::context::log_unit_helpers::ConsequenceSink::new();
     // Class-C field mutations run through the non-persisting view (coalesced —
     // the run loop persists on `mutated`); the view borrow ends (NLL) before the
-    // cell-taking checkpoint-broadcast + fail-closed persist below.
+    // cell-taking persist and checkpoint broadcast below.
     {
         let mut view = cell.class_c_view();
         let sent_event = ContextEvent::MessageSent {
@@ -2367,13 +2257,13 @@ pub async fn finalize_send(
             deps.event_tx.as_ref(),
         );
 
-        // Consequence enforcement.
+        // Consequence enforcement over the pre-send log read plus the receive
+        // buffer (which now holds this `MessageSent`).
         let (send_events, convergent_now) =
-            crate::context::governance_logic::event_log_entries_for_consequences_after_side_effect(
+            crate::context::governance_logic::merge_for_consequences(
+                log_entries,
                 view.receive_buffer_mut(),
-                context_id,
                 now,
-                &*deps.event_log,
             );
         let consequence_rules: Vec<ConsequenceRule> = view
             .governance_class_c_mut()
@@ -2388,11 +2278,6 @@ pub async fn finalize_send(
         );
         {
             let mut split = view.consequence_split();
-            // ADR-049 §9 (RED-CS3): a downward-auth mutation (a
-            // `suspended_capabilities` GROW or an `AssignRole` `member_capabilities`
-            // replacement) ARMS `downward_auth_sink` via the GROW method itself.
-            // When armed, the final persist below is upgraded to fail-closed so the
-            // mutation is durable before this send acks.
             let _ = crate::context::governance_logic::enforce_triggered_consequences(
                 &mut split,
                 &crate::context::governance_logic::EnforceConsequencesCtx {
@@ -2402,20 +2287,17 @@ pub async fn finalize_send(
                     triggered: &send_triggered,
                     rules: &consequence_rules,
                     clock: &*deps.clock,
-                    event_log: &*deps.event_log,
                     event_tx: deps.event_tx.as_ref(),
                 },
-                &mut downward_auth_sink,
-            )
-            .await;
+                &mut sink,
+            );
         }
 
         // Participation record (#1530).
         record_send_participation(
             &mut view,
-            deps,
+            participation_root,
             context_id,
-            context_id_bytes,
             sender_did,
             &send_events,
             now,
@@ -2424,37 +2306,19 @@ pub async fn finalize_send(
         // Checkpoint tracking (§9.9.3).
         *view.checkpoint_events_since_mut() += 1;
     }
-    create_and_broadcast_checkpoint_if_due(cell, deps, context_id, sender_did, signer, now).await;
 
-    // Reconcile the GROW-armed `downward_auth_sink` with the send's nonce `token`
-    // so EXACTLY ONE fail-closed persist is owed on every branch (ADR-049 §9,
-    // RED-CS3):
-    // - FREE branch (`token.is_none()`): the armed sink token IS the obligation —
-    //   pass it straight through.
-    // - PAID branch (`token.is_some()`): the nonce `token` already owes a
-    //   fail-closed `commit` that covers the same GROW (one persist makes the whole
-    //   in-memory state durable). An armed sink token here is genuinely REDUNDANT;
-    //   it is subsumed by the nonce token (consuming it without a second persist).
-    let downward_auth_obligation = match (downward_auth_sink, token.is_some()) {
-        (Some(sink_token), false) => Some(sink_token),
-        (Some(sink_token), true) => {
-            // The nonce token's commit covers this GROW — subsume the redundant one.
-            sink_token.subsume(context_id);
-            None
-        }
-        (None, _) => None,
+    // A downward-auth mutation or a consequence leaf makes the persist
+    // fail-closed (keep-direction); otherwise it stays best-effort (Class C).
+    let persisted = if sink.is_empty() {
+        persist_state_best_effort(cell, deps, context_id).await;
+        Ok(())
+    } else {
+        sink.discharge(cell, deps, context_id).await
     };
-
-    persist_finalized_send(
-        cell,
-        deps,
-        context_id,
-        sender_did,
-        token,
-        is_broadcast,
-        downward_auth_obligation,
-    )
-    .await
+    // The discharge drained the queue first, so a due checkpoint covers the
+    // log with this send's leaves in it.
+    create_and_broadcast_checkpoint_if_due(cell, deps, context_id, sender_did, signer, now).await;
+    persisted
 }
 
 /// Creates a consistency checkpoint when due (§9.9.3 thresholds) and, when one
@@ -2488,6 +2352,16 @@ async fn create_and_broadcast_checkpoint_if_due(
     let MessageSigner::Active(signer) = signer else {
         return;
     };
+    // A checkpoint covers the log as stored, so it waits for the queued log
+    // units (spec 17 §17.3 "Event log write failures"): with units queued or
+    // the log faulted, the thresholds stay armed and a later send builds it.
+    if crate::context::log_unit_helpers::has_log_unit_work(cell) {
+        tracing::debug!(
+            context_id,
+            "consistency checkpoint deferred: event log units are queued (§9.9.3)"
+        );
+        return;
+    }
     // Build + retain the checkpoint through the non-persisting Class-C view
     // (coalesced — the run loop persists on `mutated`). The `&mut view` borrow
     // ends before the shared-`&` `send_checkpoint` read below (NLL).
@@ -2533,75 +2407,6 @@ async fn create_and_broadcast_checkpoint_if_due(
              send not rolled back) (§9.9.3)"
         );
     }
-}
-
-/// Final persist step of [`finalize_send`], factored out so the success body
-/// stays within the line budget. ADR-049 §9 Class S vs Class C: a paid send
-/// that committed a spending-UCAN nonce MUST persist fail-closed (a best-effort
-/// persist would let a crash in the ≤50ms coalesce window roll the consume back
-/// after the caller saw success — replay / double-spend); the free path keeps
-/// best-effort (not regressed).
-///
-/// This is the LAST of [`finalize_send`]'s rollback sites (the persist-failure
-/// path); it shares the single sequence-rollback ownership invariant documented
-/// on [`finalize_send`] (gated `!is_broadcast`, no caller double-revert).
-///
-/// `downward_auth_obligation` (ADR-049 §9, RED-CS3): a fail-closed-persist token
-/// minted ONLY on the FREE-send branch when this send's consequence enforcement
-/// performed a downward-authorization mutation (a `suspended_capabilities` GROW or
-/// an `AssignRole` `member_capabilities` replacement). On the PAID branch the
-/// downward-auth mutation rides the nonce `token`'s own fail-closed `commit` (one
-/// persist covers all in-memory state), so `finalize_send` mints no separate
-/// obligation there and this is `None`. The free path commits this token to upgrade
-/// from best-effort to fail-closed so a coalesce-window crash cannot silently
-/// re-grant removed authority. The token carrier (vs. the prior `bool`) makes a
-/// populated-but-undischarged obligation a Drop-guard PANIC in debug/CI.
-async fn persist_finalized_send(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
-    deps: &ActorDeps,
-    context_id: &str,
-    sender_did: &DID,
-    token: Option<crate::context::actor::class_s::ClassSCommitToken>,
-    is_broadcast: bool,
-    downward_auth_obligation: Option<crate::context::actor::class_s::ClassSCommitToken>,
-) -> Result<(), ContextError> {
-    match token {
-        // Paid send: commit the deferred nonce token — its `commit` performs the
-        // fail-closed persist (ADR-049 §9 Class S, keep-direction) of ALL in-memory
-        // state, so a downward-auth mutation applied on this send is already covered
-        // (no separate obligation is minted on this branch, so
-        // `downward_auth_obligation` is `None` here). The token's `commit` takes a
-        // SHARED `&PerContextState` (via `&*cell`). On failure roll the reserved
-        // sequence back through the Class-C view (this fn owns that rollback; the
-        // caller does not double-revert) and surface the error.
-        Some(t) => {
-            debug_assert!(
-                downward_auth_obligation.is_none(),
-                "paid send mints no separate downward-auth obligation — the nonce \
-                 token's commit covers the GROW",
-            );
-            if let Err(e) = t.commit(cell, deps, context_id).await {
-                if !is_broadcast {
-                    cell.class_c_view()
-                        .membership_class_c_mut()
-                        .rollback_sequence_number(sender_did);
-                }
-                return Err(e);
-            }
-        }
-        // Free / non-spending send: best-effort persist (Class C — not regressed)
-        // UNLESS this send applied a downward-auth mutation (a capability
-        // suspension or an `AssignRole` demotion), in which case the downward-auth
-        // obligation's token commits fail-closed (ADR-049 §9, keep-direction).
-        None => {
-            if let Some(obligation) = downward_auth_obligation {
-                obligation.commit(cell, deps, context_id).await?;
-            } else {
-                persist_state_best_effort(cell, deps, context_id).await;
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Build the snapshot for `context_id` from owned actor state, threading in
@@ -2957,6 +2762,8 @@ pub fn build_snapshot_from_state(
         revoked_spending_ucan_cids: state.governance.revoked_spending_ucan_cids.clone(),
         pending_commits: state.pending_commits.clone(),
         commit_fault: state.commit_fault.clone(),
+        pending_log_units: state.class_s.pending_log_units.to_deque(),
+        log_fault: state.class_s.log_fault.clone(),
         checkpoint_events_since: state.checkpoint_events_since,
         checkpoint_last_time_secs: state.checkpoint_last_time_secs,
         generation: state.generation,
@@ -3514,13 +3321,14 @@ pub(in crate::context) fn mirror_forward_local_sender_epoch(
 /// runs consequence enforcement that performs a downward-authorization mutation (a
 /// capability suspension or an `AssignRole` demotion), so the cell-holding caller
 /// commits it fail-closed.
-pub async fn validate_and_drain_timeouts(
+pub fn validate_and_drain_timeouts(
     view: &mut ClassCMut<'_>,
     deps: &ActorDeps,
     context_id: &str,
     inner: &scp_protocol::envelope::inner::InnerEnvelope,
     now_ms: u64,
-    downward_auth_sink: &mut Option<crate::context::actor::class_s::ClassSCommitToken>,
+    evidence: &crate::context::governance_logic::PreStepEvidence,
+    downward_auth_sink: &mut crate::context::log_unit_helpers::ConsequenceSink,
 ) -> Result<SequenceCheck, ContextError> {
     // Timestamp validation first.
     let tv = scp_protocol::envelope::validation::TimestampValidator::default();
@@ -3535,8 +3343,6 @@ pub async fn validate_and_drain_timeouts(
 
     // Drain timed-out gaps. `drain_timed_out_gaps` bundles the simultaneous
     // `&mut reorder_buffer` + `&sequence_tracker` borrow internally.
-    // ADR-056: canonical digest, not a re-hash of the hex id.
-    let context_id_bytes = state::context_id_to_bytes(context_id);
     let timed_out = view.drain_timed_out_gaps(now_ms);
     for (gap_info, messages) in timed_out {
         let gap_event = ContextEvent::SequenceGapDetected {
@@ -3578,8 +3384,8 @@ pub async fn validate_and_drain_timeouts(
             let _ = run_buffered_post_delivery(
                 view,
                 downward_auth_sink,
+                evidence,
                 context_id,
-                &context_id_bytes,
                 &msg.sender_did,
                 event_name,
                 // Dormant: `event_name` here is always `None`
@@ -3589,10 +3395,8 @@ pub async fn validate_and_drain_timeouts(
                 // (ADR-051). See `run_buffered_post_delivery`'s param doc.
                 msg.inner.timestamp / 1000,
                 &*deps.clock,
-                &*deps.event_log,
                 deps.event_tx.as_ref(),
-            )
-            .await;
+            );
         }
     }
 
@@ -3612,7 +3416,7 @@ pub async fn validate_and_drain_timeouts(
 /// capability suspension or an `AssignRole` demotion), so the cell-holding caller
 /// commits it fail-closed.
 #[allow(clippy::too_many_arguments)]
-pub async fn buffer_ahead_message(
+pub fn buffer_ahead_message(
     view: &mut ClassCMut<'_>,
     deps: &ActorDeps,
     context_id: &str,
@@ -3620,7 +3424,8 @@ pub async fn buffer_ahead_message(
     sender_did: &str,
     plaintext: &[u8],
     now_ms: u64,
-    downward_auth_sink: &mut Option<crate::context::actor::class_s::ClassSCommitToken>,
+    evidence: &crate::context::governance_logic::PreStepEvidence,
+    downward_auth_sink: &mut crate::context::log_unit_helpers::ConsequenceSink,
 ) {
     let buffered_msg = scp_protocol::envelope::validation::BufferedMessage {
         inner: inner.clone(),
@@ -3630,8 +3435,6 @@ pub async fn buffer_ahead_message(
     };
 
     if let Some((mut gap_info, messages)) = view.reorder_buffer_mut().buffer(buffered_msg) {
-        // ADR-056: canonical digest, not a re-hash of the hex id.
-        let context_id_bytes = state::context_id_to_bytes(context_id);
         let expected = view
             .sequence_tracker_mut()
             .expected_sequence(context_id, sender_did)
@@ -3677,8 +3480,8 @@ pub async fn buffer_ahead_message(
             let _ = run_buffered_post_delivery(
                 view,
                 downward_auth_sink,
+                evidence,
                 context_id,
-                &context_id_bytes,
                 &msg.sender_did,
                 event_name,
                 // Dormant: `event_name` here is always `None`
@@ -3688,10 +3491,8 @@ pub async fn buffer_ahead_message(
                 // (ADR-051). See `run_buffered_post_delivery`'s param doc.
                 msg.inner.timestamp / 1000,
                 &*deps.clock,
-                &*deps.event_log,
                 deps.event_tx.as_ref(),
-            )
-            .await;
+            );
         }
     }
 }
@@ -3713,16 +3514,16 @@ pub async fn buffer_ahead_message(
 /// fail-closed (keep-direction).
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::too_many_arguments)]
-pub async fn deliver_message_and_drain_buffered(
+pub fn deliver_message_and_drain_buffered(
     view: &mut ClassCMut<'_>,
     deps: &ActorDeps,
     context_id: &str,
-    context_id_bytes: &[u8; 32],
     sender_did: &str,
     inner: &scp_protocol::envelope::inner::InnerEnvelope,
     plaintext: &[u8],
     skip_velocity: bool,
-    downward_auth_sink: &mut Option<crate::context::actor::class_s::ClassSCommitToken>,
+    evidence: &crate::context::governance_logic::PreStepEvidence,
+    downward_auth_sink: &mut crate::context::log_unit_helpers::ConsequenceSink,
 ) -> Result<bool, ContextError> {
     let sender_did_obj = DID(sender_did.to_owned());
 
@@ -3813,8 +3614,8 @@ pub async fn deliver_message_and_drain_buffered(
                 let _ = run_buffered_post_delivery(
                     view,
                     downward_auth_sink,
+                    evidence,
                     context_id,
-                    context_id_bytes,
                     &msg.sender_did,
                     event_name,
                     // Dormant: `event_name` here is always `None`
@@ -3825,10 +3626,8 @@ pub async fn deliver_message_and_drain_buffered(
                     // doc.
                     msg.inner.timestamp / 1000,
                     &*deps.clock,
-                    &*deps.event_log,
                     deps.event_tx.as_ref(),
-                )
-                .await;
+                );
             }
 
             let now = deps.clock.now_secs();
@@ -3837,44 +3636,26 @@ pub async fn deliver_message_and_drain_buffered(
                     .velocity_tracker_mut()
                     .record_message(&DID(sender_did.to_owned()), now);
             }
-            let consequence_rules: Vec<ConsequenceRule> = view
-                .governance_class_c_mut()
-                .consequence_rules_mut()
-                .clone();
-            if !consequence_rules.is_empty() {
-                let (recv_events, convergent_now) =
-                    crate::context::governance_logic::event_log_entries_for_consequences_after_side_effect(
-                        view.receive_buffer_mut(),
-                        context_id,
-                        now,
-                        &*deps.event_log,
-                    );
-                let recv_triggered = evaluate_consequence_rules(
-                    &consequence_rules,
-                    &recv_events,
-                    sender_did,
-                    now,
-                    convergent_now,
-                );
-                let recv_member_did = DID(sender_did.to_owned());
-                let mut split = view.consequence_split();
-                // The GROW arms `downward_auth_sink` directly (GAP-A closed).
-                let _ = crate::context::governance_logic::enforce_triggered_consequences(
-                    &mut split,
-                    &crate::context::governance_logic::EnforceConsequencesCtx {
-                        context_id,
-                        member_did: &recv_member_did,
-                        now,
-                        triggered: &recv_triggered,
-                        rules: &consequence_rules,
-                        clock: &*deps.clock,
-                        event_log: &*deps.event_log,
-                        event_tx: deps.event_tx.as_ref(),
-                    },
-                    downward_auth_sink,
-                )
-                .await;
-            }
+            let (events, convergent_now) =
+                received_consequence_events(view, downward_auth_sink, evidence, now);
+            let triggered = evaluate_consequence_rules(
+                evidence.rules(),
+                &events,
+                sender_did,
+                now,
+                convergent_now,
+            );
+            let _ = enforce_after_receive(
+                view,
+                downward_auth_sink,
+                evidence,
+                &triggered,
+                context_id,
+                sender_did,
+                now,
+                &*deps.clock,
+                deps.event_tx.as_ref(),
+            );
             *view.checkpoint_events_since_mut() += 1;
 
             return Ok(true);
@@ -3925,8 +3706,8 @@ pub async fn deliver_message_and_drain_buffered(
         let _ = run_buffered_post_delivery(
             view,
             downward_auth_sink,
+            evidence,
             context_id,
-            context_id_bytes,
             &msg.sender_did,
             event_name,
             // Dormant: `event_name` here is always `None`
@@ -3936,10 +3717,8 @@ pub async fn deliver_message_and_drain_buffered(
             // `run_buffered_post_delivery`'s param doc.
             msg.inner.timestamp / 1000,
             &*deps.clock,
-            &*deps.event_log,
             deps.event_tx.as_ref(),
-        )
-        .await;
+        );
     }
 
     // §9.9.3: received application messages are NOT appended to the durable
@@ -3956,44 +3735,21 @@ pub async fn deliver_message_and_drain_buffered(
             .velocity_tracker_mut()
             .record_message(&DID(sender_did.to_owned()), now);
     }
-    let consequence_rules: Vec<ConsequenceRule> = view
-        .governance_class_c_mut()
-        .consequence_rules_mut()
-        .clone();
-    if !consequence_rules.is_empty() {
-        let (recv_events, convergent_now) =
-            crate::context::governance_logic::event_log_entries_for_consequences_after_side_effect(
-                view.receive_buffer_mut(),
-                context_id,
-                now,
-                &*deps.event_log,
-            );
-        let recv_triggered = evaluate_consequence_rules(
-            &consequence_rules,
-            &recv_events,
-            sender_did,
-            now,
-            convergent_now,
-        );
-        let recv_member_did = DID(sender_did.to_owned());
-        let mut split = view.consequence_split();
-        // The GROW arms `downward_auth_sink` directly (GAP-A closed).
-        let _ = crate::context::governance_logic::enforce_triggered_consequences(
-            &mut split,
-            &crate::context::governance_logic::EnforceConsequencesCtx {
-                context_id,
-                member_did: &recv_member_did,
-                now,
-                triggered: &recv_triggered,
-                rules: &consequence_rules,
-                clock: &*deps.clock,
-                event_log: &*deps.event_log,
-                event_tx: deps.event_tx.as_ref(),
-            },
-            downward_auth_sink,
-        )
-        .await;
-    }
+    let (events, convergent_now) =
+        received_consequence_events(view, downward_auth_sink, evidence, now);
+    let triggered =
+        evaluate_consequence_rules(evidence.rules(), &events, sender_did, now, convergent_now);
+    let _ = enforce_after_receive(
+        view,
+        downward_auth_sink,
+        evidence,
+        &triggered,
+        context_id,
+        sender_did,
+        now,
+        &*deps.clock,
+        deps.event_tx.as_ref(),
+    );
 
     *view.checkpoint_events_since_mut() += 1;
     crate::metrics::record_message_received();
@@ -4870,7 +4626,17 @@ mod pseudonym_routing_tests {
             _context_id: &[u8; 32],
         ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
         {
-            Ok(None)
+            Ok(Some(Vec::new()))
+        }
+
+        /// The fixture holds no entry, so its root is the empty log's root.
+        fn event_log_merkle_root(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok(scp_event_log::tree::root(&scp_event_log::EventLog::new(
+                String::new(),
+            )))
         }
 
         async fn init_event_log(
@@ -4919,9 +4685,6 @@ mod pseudonym_routing_tests {
         };
 
         let ctx = ctx_hex(0x11);
-        // `ctx` is a real 64-hex id; key it through the ADR-056 chokepoint for
-        // fidelity with production keying (decodes the digest, never re-hashes).
-        let ctx_bytes = crate::context::state::context_id_to_bytes(&ctx);
         let mut state: RegressionState = encrypted_state();
 
         // Install a MessageVelocity rule that triggers on the FIRST message from
@@ -4961,24 +4724,31 @@ mod pseudonym_routing_tests {
         // Post-delivery governance MUST run unconditionally, mirroring the
         // in-order path — this is exactly the call shape the four buffered-drain
         // sites now use.
-        let mut obligation = None;
+        let mut obligation = crate::context::log_unit_helpers::ConsequenceSink::new();
+        let evidence = crate::context::log_unit_helpers::test_support::pre_step_evidence(
+            &state, &ctx, &event_log,
+        );
         let _suspended = run_buffered_post_delivery(
             &mut ClassCMut::from_state(&mut state),
             &mut obligation,
+            &evidence,
             &ctx,
-            &ctx_bytes,
             ALICE,
             event_name,
             1_700_000_000,
             &clock,
-            &event_log,
             None,
-        )
-        .await;
+        );
         // No GROW occurs on this velocity-trigger path, so no obligation is armed.
+        let (token, leaves) = obligation.into_parts();
         assert!(
-            obligation.is_none(),
+            token.is_none(),
             "a non-GROW post-delivery must not arm a fail-closed obligation"
+        );
+        assert!(
+            leaves.is_empty(),
+            "a MessageVelocity-triggered consequence is non-convergent and MUST NOT \
+             queue a durable ConsequenceTriggered leaf (ADR-051 §6)"
         );
 
         // (a) Velocity was recorded for the sender.
@@ -5040,7 +4810,7 @@ mod pseudonym_routing_tests {
     // -----------------------------------------------------------------------
     // STRONGER regression: drive a buffered APPLICATION message END-TO-END
     // through a REAL buffered-drain call site so a re-introduced
-    // `if let Some(event_name) { run_buffered_post_delivery(...).await }` gate is
+    // `if let Some(event_name) { run_buffered_post_delivery(...) }` gate is
     // caught.
     //
     // The helper-contract test above calls `run_buffered_post_delivery`
@@ -5085,7 +4855,17 @@ mod pseudonym_routing_tests {
             _context_id: &[u8; 32],
         ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
         {
-            Ok(None)
+            Ok(Some(Vec::new()))
+        }
+
+        /// The fixture holds no entry, so its root is the empty log's root.
+        fn event_log_merkle_root(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok(scp_event_log::tree::root(&scp_event_log::EventLog::new(
+                String::new(),
+            )))
         }
 
         async fn init_event_log(
@@ -5193,6 +4973,7 @@ mod pseudonym_routing_tests {
 
     #[tokio::test]
     async fn buffered_drain_call_site_runs_governance_for_application_message() {
+        use crate::context::log_unit_helpers::test_support::pre_step_evidence;
         use crate::context::messaging_helpers::validate_and_drain_timeouts;
         use scp_protocol::context::roles::Capability;
         use scp_protocol::envelope::validation::{BufferedMessage, DEFAULT_GAP_TIMEOUT_MS};
@@ -5212,12 +4993,10 @@ mod pseudonym_routing_tests {
             .add_member(DID(ALICE.to_owned()), "member".to_owned(), Vec::new());
         state.members.insert(DID(ALICE.to_owned()));
         state.role_state.members.insert(ALICE.to_owned());
-        let mut caps = std::collections::HashSet::new();
-        caps.insert(Capability::MessagesWrite);
-        state
-            .role_state
-            .member_capabilities
-            .insert(ALICE.to_owned(), caps);
+        state.role_state.member_capabilities.insert(
+            ALICE.to_owned(),
+            std::iter::once(Capability::MessagesWrite).collect(),
+        );
 
         // A MessageVelocity rule that trips on the first message. Received
         // application messages project to `EventType::MessageSent` for
@@ -5268,24 +5047,29 @@ mod pseudonym_routing_tests {
         // skip governance for the `None`-typed application message.
         let incoming = drain_test_inner(&ctx, 1);
         let now_ms = 1_700_000_000 + DEFAULT_GAP_TIMEOUT_MS + 10;
-        let mut downward_auth_applied: Option<crate::context::actor::class_s::ClassSCommitToken> =
-            None;
+        let mut downward_auth_applied = crate::context::log_unit_helpers::ConsequenceSink::new();
+        let evidence = pre_step_evidence(&state, &ctx, deps.event_log.as_ref());
         validate_and_drain_timeouts(
             &mut ClassCMut::from_state(&mut state),
             &deps,
             &ctx,
             &incoming,
             now_ms,
+            &evidence,
             &mut downward_auth_applied,
         )
-        .await
         .expect("validate_and_drain_timeouts");
         // The `SuspendAccess` action is a downward-auth GROW, so the drain
         // populated the sink; discharge it (commit performs the fail-closed persist)
         // so the token's Drop guard is satisfied.
-        if let Some(token) = downward_auth_applied.take() {
+        let (token, leaves) = downward_auth_applied.into_parts();
+        if let Some(token) = token {
             let _ = token.commit(&state, &deps, &ctx).await;
         }
+        assert!(
+            leaves.is_empty(),
+            "a non-convergent consequence or a received message queues no durable leaf"
+        );
 
         // (a) Velocity recorded for the buffered sender via the drain path.
         let velocity = state.governance.velocity_tracker.snapshot_entries();
@@ -5363,9 +5147,6 @@ mod pseudonym_routing_tests {
         use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
         let ctx = ctx_hex(0x11);
-        // `ctx` is a real 64-hex id; key it through the ADR-056 chokepoint for
-        // fidelity with production keying (decodes the digest, never re-hashes).
-        let ctx_bytes = crate::context::state::context_id_to_bytes(&ctx);
         let mut state: PerContextState = encrypted_state();
 
         // The direct delivery path requires an Active context handle.
@@ -5409,26 +5190,34 @@ mod pseudonym_routing_tests {
         let plaintext = rmp_serde::to_vec_named(&announcement).expect("serialize announcement");
         let inner = drain_test_inner(&ctx, 1);
 
-        let mut downward_auth_applied: Option<crate::context::actor::class_s::ClassSCommitToken> =
-            None;
+        let mut downward_auth_applied = crate::context::log_unit_helpers::ConsequenceSink::new();
+        let evidence = crate::context::log_unit_helpers::test_support::pre_step_evidence(
+            &state,
+            &ctx,
+            deps.event_log.as_ref(),
+        );
         let consumed = deliver_message_and_drain_buffered(
             &mut ClassCMut::from_state(&mut state),
             &deps,
             &ctx,
-            &ctx_bytes,
             ALICE,
             &inner,
             &plaintext,
             false,
+            &evidence,
             &mut downward_auth_applied,
         )
-        .await
         .expect("deliver_message_and_drain_buffered");
         // No consequence rules are installed here, so the sink stays `None`; the
         // `take()` is a no-op that satisfies the token's Drop guard either way.
-        if let Some(token) = downward_auth_applied.take() {
+        let (token, leaves) = downward_auth_applied.into_parts();
+        if let Some(token) = token {
             let _ = token.commit(&state, &deps, &ctx).await;
         }
+        assert!(
+            leaves.is_empty(),
+            "a non-convergent consequence or a received message queues no durable leaf"
+        );
 
         // The announcement WAS recognized + processed (consumed as an internal
         // protocol message) and inserted into the in-memory peer registry.
@@ -5588,6 +5377,499 @@ mod pseudonym_routing_tests {
     }
 }
 
+/// The send and receive families of spec 17 §17.3 "Event log write
+/// failures": a consequence evaluated after the message left or arrived keeps
+/// its step and queues its leaves when the log rejects their write.
+#[cfg(test)]
+mod log_unit_family_tests {
+    use scp_did::DID;
+    use scp_protocol::context::ContextError;
+    use scp_protocol::context::roles::Capability;
+
+    use crate::context::actor::class_s::ClassSCell;
+    use crate::context::actor::deps::ActorDeps;
+    use crate::context::actor::state::PerContextState;
+    use crate::context::log_unit_helpers::test_support::{
+        SUSPENSION_LEAVES, deps_with, fail_log_entry_writes, faulty_merkle_log, log_len,
+        queued_unit_types, seed_warning_leaf, suspend_messages_write_rule,
+    };
+
+    const OWNER: &str = "did:dht:z6MkOwnerLogUnitFamily";
+    const MEMBER: &str = "did:dht:z6MkMemberLogUnitFamily";
+
+    /// An Active context with `MEMBER` a writable member, a seeded warning
+    /// against `MEMBER` in a log whose entry writes then fail, and a
+    /// `WarningCount` rule that the warning trips.
+    async fn tripped_context(ctx_byte: u8) -> (ClassSCell, ActorDeps, String, [u8; 32]) {
+        let ctx_id_bytes = [ctx_byte; 32];
+        let ctx = hex::encode(ctx_id_bytes);
+        let member = DID(MEMBER.to_owned());
+        let (log, faulty) = faulty_merkle_log();
+        seed_warning_leaf(&log, &ctx_id_bytes, &member).await;
+        fail_log_entry_writes(&faulty, &ctx_id_bytes);
+        let deps = deps_with(OWNER, None, Box::new(log)).await;
+
+        let mut state = PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            1_700_000_000,
+            DID(OWNER.to_owned()),
+        );
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .expect("transition to Active");
+        state
+            .membership
+            .add_member(member.clone(), "member".to_owned(), Vec::new());
+        state.members.insert(member);
+        state.role_state.members.insert(MEMBER.to_owned());
+        state.role_state.member_capabilities.insert(
+            MEMBER.to_owned(),
+            std::iter::once(Capability::MessagesWrite).collect(),
+        );
+        state
+            .governance
+            .consequence_rules
+            .push(suspend_messages_write_rule());
+        (ClassSCell::new(state), deps, ctx, ctx_id_bytes)
+    }
+
+    fn assert_step_kept_and_leaves_queued(
+        cell: &ClassSCell,
+        deps: &ActorDeps,
+        ctx_id_bytes: &[u8; 32],
+    ) {
+        assert!(
+            cell.role_state
+                .suspended_for(MEMBER)
+                .is_some_and(|caps| caps.contains(&Capability::MessagesWrite)),
+            "the consequence's suspension is kept"
+        );
+        assert_eq!(
+            queued_unit_types(&cell.class_s.pending_log_units),
+            vec![SUSPENSION_LEAVES.to_vec()],
+            "the consequence leaves stay queued as one unit"
+        );
+        assert_eq!(
+            log_len(deps, ctx_id_bytes),
+            1,
+            "only the seeded warning is logged"
+        );
+    }
+
+    /// Spec 17 §17.3 ("Event log write failures"): the send reads the
+    /// participation root beside the log before anything leaves, so a root
+    /// that cannot be read refuses the send: the reserved sequence is rolled
+    /// back, nothing reaches the transport or the queue, and no participation
+    /// record is cached.
+    #[tokio::test]
+    async fn send_refuses_when_the_participation_root_read_fails() {
+        let ctx_id_bytes = [0x62u8; 32];
+        let ctx = hex::encode(ctx_id_bytes);
+        let member = DID(MEMBER.to_owned());
+        let (deps, snapshots) =
+            crate::context::log_unit_helpers::test_support::deps_over_root_refusing_log(
+                OWNER, &ctx,
+            )
+            .await;
+        let mut state = PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            1_700_000_000,
+            DID(OWNER.to_owned()),
+        );
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .expect("transition to Active");
+        state
+            .membership
+            .add_member(member.clone(), "member".to_owned(), Vec::new());
+        state.members.insert(member.clone());
+        state.role_state.members.insert(MEMBER.to_owned());
+        state.role_state.member_capabilities.insert(
+            MEMBER.to_owned(),
+            std::iter::once(Capability::MessagesWrite).collect(),
+        );
+        // An announcement addresses the shared routing ID, so the send
+        // reaches its pre-send read without a peer pseudonym.
+        state.routing.set_local_pseudonym([0x63u8; 32]);
+        let handle = state.handle.clone();
+        let mut cell = ClassSCell::new(state);
+        let sequence_before = cell
+            .membership
+            .get(MEMBER)
+            .expect("the sender is a member")
+            .sequence_number;
+
+        let sent = crate::context::messaging_helpers::send_pseudonym_announcement(
+            &mut cell,
+            &deps,
+            &handle,
+            &member,
+            &crate::context::actor::signer::CommandSigner::local_ed25519(
+                ed25519_dalek::SigningKey::from_bytes(&[0x64u8; 32]),
+            ),
+        )
+        .await;
+
+        assert!(
+            matches!(sent, Err(ContextError::EventLogFailed(_))),
+            "the send fails with the root read error: got {sent:?}"
+        );
+        assert_eq!(
+            cell.membership
+                .get(MEMBER)
+                .expect("the sender is a member")
+                .sequence_number,
+            sequence_before,
+            "the reserved sequence is rolled back"
+        );
+        assert!(
+            cell.governance.participation_cache.is_empty(),
+            "no participation record is cached"
+        );
+        assert!(
+            cell.class_s.pending_log_units.is_empty(),
+            "no record is queued"
+        );
+        assert!(
+            snapshots.snapshot(&ctx).await.is_none(),
+            "nothing is persisted"
+        );
+    }
+
+    mod finalize_send {
+        use super::*;
+
+        /// The message left before `finalize_send` runs. A log that rejects
+        /// the consequence leaves keeps the sent sequence and the suspension,
+        /// queues the leaves, and the send succeeds.
+        #[tokio::test]
+        async fn append_failure_after_side_effect_keeps_step_and_queues_leaf() {
+            let (mut cell, deps, ctx, ctx_id_bytes) = tripped_context(0x61).await;
+            let member = DID(MEMBER.to_owned());
+            let reserved = cell
+                .class_c_view()
+                .membership_class_c_mut()
+                .next_sequence_number(MEMBER)
+                .expect("the sender is a member");
+            let log_entries = crate::context::governance_logic::LogAndQueue::read(
+                cell.class_s.pending_log_units.iter(),
+                &ctx,
+                deps.event_log.as_ref(),
+            )
+            .expect("the log reads before the send")
+            .into_entries();
+            let root =
+                crate::context::participation::ParticipationRoot::read(&ctx, &*deps.event_log)
+                    .expect("the root reads before the send");
+
+            let sent = crate::context::messaging_helpers::finalize_send(
+                &mut cell,
+                &deps,
+                &ctx,
+                &member,
+                reserved,
+                b"sent",
+                crate::context::supervisor::MessageSigner::Active(
+                    &crate::context::actor::signer::CommandSigner::local_ed25519(
+                        ed25519_dalek::SigningKey::from_bytes(&[0x61u8; 32]),
+                    ),
+                ),
+                &log_entries,
+                root,
+            )
+            .await;
+
+            assert!(
+                sent.is_ok(),
+                "the leaves are queued, so the send succeeds: {sent:?}"
+            );
+            assert_eq!(
+                cell.membership
+                    .get(MEMBER)
+                    .expect("the sender is a member")
+                    .sequence_number,
+                reserved,
+                "the sent message's sequence stays consumed"
+            );
+            assert_step_kept_and_leaves_queued(&cell, &deps, &ctx_id_bytes);
+        }
+    }
+
+    mod buffered_loops {
+        use super::*;
+        use scp_protocol::envelope::validation::{BufferedMessage, DEFAULT_GAP_TIMEOUT_MS};
+
+        pub(super) fn inner(
+            ctx: &str,
+            sequence: u64,
+        ) -> scp_protocol::envelope::inner::InnerEnvelope {
+            scp_protocol::envelope::inner::InnerEnvelope {
+                version: scp_protocol::envelope::inner::SCP_INNER_ENVELOPE_VERSION,
+                context_id: ctx.to_owned(),
+                sender_did: MEMBER.to_owned(),
+                epoch: 0,
+                generation: 0,
+                sequence,
+                timestamp: 1_700_000_000,
+                message_type: scp_protocol::envelope::inner::MessageType::Content,
+                payload_hash: [0u8; 32],
+                payload: Vec::new(),
+                provenance: None,
+                provenance_hash: [0u8; 32],
+                signing_key_id: scp_did::SigningKeyId::Active,
+                signature: [0u8; 64],
+                extensions: std::collections::HashMap::new(),
+            }
+        }
+
+        /// A buffered message drained past its gap timeout was delivered
+        /// before its consequences are evaluated. A log that rejects the
+        /// leaves keeps the delivery and the suspension and queues the
+        /// leaves; the receive is not refused.
+        #[tokio::test]
+        async fn append_failure_after_side_effect_keeps_step_and_queues_leaf() {
+            let (mut cell, deps, ctx, ctx_id_bytes) = tripped_context(0x62).await;
+            let overflow = cell
+                .class_c_view()
+                .reorder_buffer_mut()
+                .buffer(BufferedMessage {
+                    inner: inner(&ctx, 2),
+                    sender_did: MEMBER.to_owned(),
+                    plaintext: b"buffered application payload".to_vec(),
+                    received_at: 0,
+                });
+            assert!(overflow.is_none(), "one buffered message does not overflow");
+
+            let evidence = crate::context::log_unit_helpers::test_support::pre_step_evidence(
+                &cell,
+                &ctx,
+                deps.event_log.as_ref(),
+            );
+            let mut sink = crate::context::log_unit_helpers::ConsequenceSink::new();
+            let delivered = crate::context::messaging_helpers::validate_and_drain_timeouts(
+                &mut cell.class_c_view(),
+                &deps,
+                &ctx,
+                &inner(&ctx, 1),
+                1_700_000_000 + DEFAULT_GAP_TIMEOUT_MS + 10,
+                &evidence,
+                &mut sink,
+            );
+            assert!(delivered.is_ok(), "the receive is delivered: {delivered:?}");
+            let persisted = sink.discharge(&mut cell, &deps, &ctx).await;
+
+            assert!(
+                persisted.is_ok(),
+                "the leaves are queued, so the receive's persist succeeds: {persisted:?}"
+            );
+            assert_eq!(
+                cell.class_c_view().reorder_buffer_mut().total_buffered(),
+                0,
+                "the buffered message was delivered"
+            );
+            assert_step_kept_and_leaves_queued(&cell, &deps, &ctx_id_bytes);
+        }
+
+        /// A message that overflows the reorder buffer force-delivers the
+        /// buffered run, and each delivery is evaluated. A log that rejects
+        /// the leaves keeps the deliveries and the suspension and queues the
+        /// leaves.
+        #[tokio::test]
+        async fn overflow_drain_append_failure_keeps_step_and_queues_leaf() {
+            let (mut cell, deps, ctx, ctx_id_bytes) = tripped_context(0x63).await;
+            // Fill the per-sender buffer to its bound with sequences 2..=101.
+            for sequence in 2..=101 {
+                let overflow = cell
+                    .class_c_view()
+                    .reorder_buffer_mut()
+                    .buffer(BufferedMessage {
+                        inner: inner(&ctx, sequence),
+                        sender_did: MEMBER.to_owned(),
+                        plaintext: b"buffered application payload".to_vec(),
+                        received_at: 1_700_000_000,
+                    });
+                assert!(overflow.is_none(), "the buffer is not yet full");
+            }
+
+            let evidence = crate::context::log_unit_helpers::test_support::pre_step_evidence(
+                &cell,
+                &ctx,
+                deps.event_log.as_ref(),
+            );
+            let mut sink = crate::context::log_unit_helpers::ConsequenceSink::new();
+            crate::context::messaging_helpers::buffer_ahead_message(
+                &mut cell.class_c_view(),
+                &deps,
+                &ctx,
+                &inner(&ctx, 102),
+                MEMBER,
+                b"overflowing payload",
+                1_700_000_000,
+                &evidence,
+                &mut sink,
+            );
+            let persisted = sink.discharge(&mut cell, &deps, &ctx).await;
+
+            assert!(
+                persisted.is_ok(),
+                "the leaves are queued, so the receive's persist succeeds: {persisted:?}"
+            );
+            assert_eq!(
+                cell.class_c_view().reorder_buffer_mut().total_buffered(),
+                0,
+                "the overflow delivered the buffered run"
+            );
+            assert_step_kept_and_leaves_queued(&cell, &deps, &ctx_id_bytes);
+        }
+    }
+
+    mod receive {
+        use super::*;
+
+        use super::buffered_loops::inner;
+
+        /// An in-order received message is delivered before its consequences
+        /// are evaluated. A log that rejects the leaves keeps the delivery and
+        /// the suspension and queues the leaves; the receive is not refused.
+        #[tokio::test]
+        async fn in_order_append_failure_keeps_step_and_queues_leaf() {
+            let (mut cell, deps, ctx, ctx_id_bytes) = tripped_context(0x64).await;
+            let evidence = crate::context::log_unit_helpers::test_support::pre_step_evidence(
+                &cell,
+                &ctx,
+                deps.event_log.as_ref(),
+            );
+            let mut sink = crate::context::log_unit_helpers::ConsequenceSink::new();
+            let delivered = crate::context::messaging_helpers::deliver_message_and_drain_buffered(
+                &mut cell.class_c_view(),
+                &deps,
+                &ctx,
+                MEMBER,
+                &inner(&ctx, 1),
+                b"in-order application payload",
+                false,
+                &evidence,
+                &mut sink,
+            );
+            assert!(
+                matches!(delivered, Ok(false)),
+                "the message is delivered: {delivered:?}"
+            );
+            let persisted = sink.discharge(&mut cell, &deps, &ctx).await;
+            assert!(
+                persisted.is_ok(),
+                "the leaves are queued, so the receive's persist succeeds: {persisted:?}"
+            );
+            assert_step_kept_and_leaves_queued(&cell, &deps, &ctx_id_bytes);
+        }
+
+        /// The evaluation after the delivery runs over the log read before
+        /// it, so a log that becomes unreadable after the read neither skips
+        /// the evaluation nor faults the context (spec 17 §17.3 "Event log
+        /// write failures").
+        #[tokio::test]
+        async fn evaluation_after_the_step_uses_the_read_before_it() {
+            let (mut cell, deps, ctx, ctx_id_bytes) = tripped_context(0x65).await;
+            let evidence = crate::context::log_unit_helpers::test_support::pre_step_evidence(
+                &cell,
+                &ctx,
+                deps.event_log.as_ref(),
+            );
+            deps.event_log.release_event_log(&ctx_id_bytes);
+            assert!(
+                deps.event_log.event_log_entries(&ctx_id_bytes).is_err(),
+                "the released log is unreadable"
+            );
+
+            let mut sink = crate::context::log_unit_helpers::ConsequenceSink::new();
+            let delivered = crate::context::messaging_helpers::deliver_message_and_drain_buffered(
+                &mut cell.class_c_view(),
+                &deps,
+                &ctx,
+                MEMBER,
+                &inner(&ctx, 1),
+                b"in-order application payload",
+                false,
+                &evidence,
+                &mut sink,
+            );
+            assert!(matches!(delivered, Ok(false)), "{delivered:?}");
+            assert_eq!(
+                sink.staged_leaves()
+                    .iter()
+                    .map(crate::context::state::LeafSpec::event_type)
+                    .collect::<Vec<_>>(),
+                SUSPENSION_LEAVES.to_vec(),
+                "the evaluation ran and staged the consequence leaves"
+            );
+            let _ = sink.discharge(&mut cell, &deps, &ctx).await;
+            assert!(
+                cell.role_state
+                    .suspended_for(MEMBER)
+                    .is_some_and(|caps| caps.contains(&Capability::MessagesWrite)),
+                "the consequence's suspension is applied"
+            );
+            assert!(cell.class_s.log_fault.is_none(), "no log fault is set");
+        }
+
+        /// A receive whose log read fails is refused before the envelope is
+        /// opened, so no MLS key material is consumed and no delivery runs
+        /// without its evaluation. The control shows the same bytes reach
+        /// the envelope open when the log reads.
+        #[tokio::test]
+        async fn unreadable_log_refuses_the_receive_before_the_envelope_opens() {
+            let (mut cell, deps, ctx, ctx_id_bytes) = tripped_context(0x66).await;
+            // The node's own identity is a local member, so the receive gets
+            // past the local-member lookup to the log read.
+            deps.local_dids.store(std::sync::Arc::new(
+                std::iter::once(DID(OWNER.to_owned())).collect(),
+            ));
+            cell.class_c_view().membership_class_c_mut().add_member(
+                DID(OWNER.to_owned()),
+                "admin".to_owned(),
+                Vec::new(),
+            );
+            let blob = b"not an MLS message";
+
+            let mut sink = crate::context::log_unit_helpers::ConsequenceSink::new();
+            let mut commit_sink = None;
+            let control = crate::context::messaging_helpers::deliver_incoming(
+                &mut cell.class_c_view(),
+                &deps,
+                &ctx,
+                blob,
+                &mut sink,
+                &mut commit_sink,
+            )
+            .await;
+            assert!(
+                matches!(control, Err(ref e) if !matches!(e, ContextError::ContextNotRegistered(_))
+                    && !e.to_string().contains("no local member")),
+                "with a readable log the bytes reach the envelope open: {control:?}"
+            );
+
+            deps.event_log.release_event_log(&ctx_id_bytes);
+            let refused = crate::context::messaging_helpers::deliver_incoming(
+                &mut cell.class_c_view(),
+                &deps,
+                &ctx,
+                blob,
+                &mut sink,
+                &mut commit_sink,
+            )
+            .await;
+            assert!(
+                matches!(refused, Err(ContextError::ContextNotRegistered(_))),
+                "the failed read refuses the receive: {refused:?}"
+            );
+            assert!(sink.is_empty(), "nothing was evaluated or staged");
+            let _ = sink.discharge(&mut cell, &deps, &ctx).await;
+        }
+    }
+}
+
 /// Fixture and tests for the persist paths after the Supervisor has dropped
 /// (ADR-049 Decision 16): no floor export exists, so nothing is persisted and
 /// the caller gets [`ContextError::SupervisorShutDown`].
@@ -5651,7 +5933,17 @@ pub mod dropped_supervisor_tests {
             _context_id: &[u8; 32],
         ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
         {
-            Ok(None)
+            Ok(Some(Vec::new()))
+        }
+
+        /// The fixture holds no entry, so its root is the empty log's root.
+        fn event_log_merkle_root(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok(scp_event_log::tree::root(&scp_event_log::EventLog::new(
+                String::new(),
+            )))
         }
 
         async fn init_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {

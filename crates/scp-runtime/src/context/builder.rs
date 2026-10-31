@@ -173,21 +173,96 @@ pub enum EventLogRestore {
     Absent,
 }
 
-/// Where an event log append sits relative to the irreversible step of the
-/// operation that makes it (spec section 17.3, "Event log write failures").
+/// A context's event-log write gate, held from the moment the drain reads the
+/// log's length until [`ContextEventLogProvider::append_unit`] writes the unit
+/// (spec 17 §17.3 "Event log write failures").
+///
+/// The drain reserves a unit's `base_seq` at [`Self::log_len`] while it holds
+/// the guard, so no other gated write can take that slot before the unit is
+/// written.
+#[derive(Debug)]
+pub struct UnitWriteGuard {
+    context_id: [u8; 32],
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    log_len: u64,
+}
+
+impl UnitWriteGuard {
+    /// Builds a guard for `context_id` whose log held `log_len` entries when
+    /// `permit` was taken. `permit` is `None` for a provider that keeps no
+    /// write gate.
+    #[must_use]
+    pub const fn new(
+        context_id: [u8; 32],
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+        log_len: u64,
+    ) -> Self {
+        Self {
+            context_id,
+            permit,
+            log_len,
+        }
+    }
+
+    /// The context the guard gates.
+    #[must_use]
+    pub const fn context_id(&self) -> &[u8; 32] {
+        &self.context_id
+    }
+
+    /// The log's length when the guard was taken.
+    #[must_use]
+    pub const fn log_len(&self) -> u64 {
+        self.log_len
+    }
+
+    /// Gives up the write gate's permit, if the provider keeps one.
+    #[must_use]
+    pub fn into_permit(self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.permit
+    }
+}
+
+/// How [`ContextEventLogProvider::append_unit`] placed a unit (spec 17 §17.3
+/// "Event log write failures").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AppendMode {
-    /// The append comes before any side effect of its operation. It stores
-    /// the entry before memory takes it and returns an error when storing
-    /// fails, and the operation then fails with nothing done.
-    FailClosed,
-    /// The append comes after an irreversible step of its operation (a sent
-    /// message, an advanced MLS epoch, a committed governance decision). It
-    /// records the entry in memory first, stores it best-effort, and succeeds
-    /// when storing fails, because failing the operation cannot undo the
-    /// step. A failed store marks the stored log diverged, so the next write
-    /// replaces it.
-    AfterSideEffect,
+pub enum UnitAppended {
+    /// The log held `base_seq` entries; the unit was stored, then applied in
+    /// memory.
+    Appended,
+    /// The log already holds the unit at `base_seq`, leaf hash for leaf hash:
+    /// an earlier put reached storage and reported failure. Nothing was
+    /// written.
+    AlreadyPresent,
+}
+
+/// Why [`ContextEventLogProvider::append_unit`] did not place a unit (spec 17
+/// §17.3 "Event log write failures").
+#[derive(Debug, thiserror::Error)]
+pub enum UnitAppendError {
+    /// `base_seq` is greater than the log's length: the unit is not in the
+    /// log and no entry sits ahead of it, so the drain reserves it again at
+    /// the log's length.
+    #[error("event log unit past the end: base_seq {base_seq}, log length {log_len}")]
+    PastEnd {
+        /// The `base_seq` the unit was reserved at.
+        base_seq: u64,
+        /// The log's length.
+        log_len: u64,
+    },
+    /// The log holds other entries at `base_seq`, so placing the unit would
+    /// put it after an entry from a later step. The drain sets the log fault.
+    #[error("event log unit misaligned: base_seq {base_seq}, log length {log_len}")]
+    Misaligned {
+        /// The `base_seq` the unit was reserved at.
+        base_seq: u64,
+        /// The log's length.
+        log_len: u64,
+    },
+    /// The unit is malformed, the context has no log, or storing the unit
+    /// failed. The in-memory log is then unchanged.
+    #[error(transparent)]
+    Failed(#[from] ContextCreationError),
 }
 
 /// Provides event log operations needed during context creation.
@@ -243,9 +318,11 @@ pub trait ContextEventLogProvider: Send + Sync {
     /// deadline already held in context state — never a per-member local clock
     /// reading, which would diverge and break the equal-count/equal-root test.
     ///
-    /// The append fails closed ([`AppendMode::FailClosed`]): it stores the
-    /// entry before the in-memory log takes it, so the in-memory log is never
-    /// ahead of the stored log.
+    /// The append fails closed: it stores the entry before the in-memory log
+    /// takes it, so the in-memory log is never ahead of the stored log. A
+    /// leaf written after an irreversible step never comes here; it goes into
+    /// a pending log unit in the step's persist, and only the drain writes it
+    /// ([`Self::append_unit`]; spec 17 §17.3 "Event log write failures").
     ///
     /// # Errors
     ///
@@ -260,64 +337,6 @@ pub trait ContextEventLogProvider: Send + Sync {
         timestamp_secs: u64,
     ) -> Result<(), ContextCreationError>;
 
-    /// Appends a typed event after an irreversible step of its operation
-    /// ([`AppendMode::AfterSideEffect`]): the in-memory log takes the entry
-    /// first, storing it is best-effort, and a failed store still returns
-    /// `Ok` and marks the stored log diverged. Parameters as
-    /// [`Self::append_event`].
-    ///
-    /// The default delegates to [`Self::append_event`], which is correct for
-    /// a provider that keeps no separate stored log.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ContextCreationError`] if the context has no log or the event
-    /// is malformed. A storage failure is not an error here.
-    async fn append_event_after_side_effect(
-        &self,
-        context_id: &[u8; 32],
-        event_type: scp_event_log::EventType,
-        actor_did: &str,
-        payload: scp_event_log::EventPayload,
-        timestamp_secs: u64,
-    ) -> Result<(), ContextCreationError> {
-        self.append_event(context_id, event_type, actor_did, payload, timestamp_secs)
-            .await
-    }
-
-    /// Appends a typed event in the given [`AppendMode`]: dispatches to
-    /// [`Self::append_event`] or [`Self::append_event_after_side_effect`].
-    ///
-    /// # Errors
-    ///
-    /// As the method `mode` selects.
-    async fn append_event_in(
-        &self,
-        mode: AppendMode,
-        context_id: &[u8; 32],
-        event_type: scp_event_log::EventType,
-        actor_did: &str,
-        payload: scp_event_log::EventPayload,
-        timestamp_secs: u64,
-    ) -> Result<(), ContextCreationError> {
-        match mode {
-            AppendMode::FailClosed => {
-                self.append_event(context_id, event_type, actor_did, payload, timestamp_secs)
-                    .await
-            }
-            AppendMode::AfterSideEffect => {
-                self.append_event_after_side_effect(
-                    context_id,
-                    event_type,
-                    actor_did,
-                    payload,
-                    timestamp_secs,
-                )
-                .await
-            }
-        }
-    }
-
     /// Destroys the event log for the given context, in memory and in
     /// storage (creation rollback). The in-memory log and the write gate are
     /// removed even when deleting the stored log fails.
@@ -328,6 +347,143 @@ pub trait ContextEventLogProvider: Send + Sync {
     /// Creation rollback reports it as `RollbackFailed` (spec section 17.3,
     /// "Event log write failures").
     async fn destroy_event_log(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError>;
+
+    /// Takes the context's write gate and reads the log's length, for the
+    /// drain of queued log units (spec 17 §17.3 "Event log write failures").
+    ///
+    /// The default, for a provider that keeps no write gate, reads the length
+    /// from [`Self::event_log_entries`] and holds no permit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextCreationError::EventLogFailed`] when the context has
+    /// no log or the log cannot be read.
+    async fn lock_for_unit(
+        &self,
+        context_id: &[u8; 32],
+    ) -> Result<UnitWriteGuard, ContextCreationError> {
+        let len = match self.event_log_entries(context_id) {
+            Ok(Some(entries)) => entries.len(),
+            Ok(None) => {
+                return Err(ContextCreationError::EventLogFailed(format!(
+                    "no event log for context {}",
+                    hex::encode(context_id)
+                )));
+            }
+            Err(e) => return Err(ContextCreationError::EventLogFailed(e.to_string())),
+        };
+        let log_len = u64::try_from(len).map_err(|_| {
+            ContextCreationError::EventLogFailed("event log length exceeds u64".into())
+        })?;
+        Ok(UnitWriteGuard::new(*context_id, None, log_len))
+    }
+
+    /// Writes one queued log unit at `base_seq` under `guard`, chaining its
+    /// first entry to the entry at `base_seq − 1` (spec 17 §17.3 "Event log
+    /// write failures").
+    ///
+    /// Returns [`UnitAppended::Appended`] when the log held `base_seq`
+    /// entries and the unit was stored, and [`UnitAppended::AlreadyPresent`]
+    /// when the log already holds the unit at `base_seq`, leaf hash for leaf
+    /// hash. A unit is written whole or not at all: after an error the log
+    /// holds none of the unit's entries that it did not hold before.
+    ///
+    /// The default, for a provider that keeps no write gate, places the unit
+    /// from [`Self::event_log_entries`] and writes a one-entry unit through
+    /// [`Self::append_event`]. One `append_event` per entry cannot store a
+    /// unit of several entries whole: a failure at a later entry leaves the
+    /// earlier ones in the log, and the drain's next placement finds them
+    /// misaligned. So the default refuses such a unit with
+    /// [`UnitAppendError::Failed`], and the unit stays queued. A provider
+    /// that writes such units overrides this method with one atomic write, as
+    /// [`MerkleEventLogProvider`](crate::context::providers::event_log::MerkleEventLogProvider)
+    /// does.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UnitAppendError::PastEnd`] when `base_seq` is greater than
+    /// the log's length, [`UnitAppendError::Misaligned`] when the log holds
+    /// other entries at `base_seq`, and
+    /// [`UnitAppendError::Failed`] when the unit is malformed, the context has
+    /// no log, storing the unit fails, or (in the default) the unit holds
+    /// more than one entry.
+    async fn append_unit(
+        &self,
+        guard: UnitWriteGuard,
+        base_seq: u64,
+        leaves: &[crate::context::state::LeafSpec],
+    ) -> Result<UnitAppended, UnitAppendError> {
+        let context_id = *guard.context_id();
+        for leaf in leaves {
+            crate::context::providers::event_log::check_append_payload(
+                leaf.event_type(),
+                leaf.payload(),
+            )?;
+        }
+        let entries = match self.event_log_entries(&context_id) {
+            Ok(Some(entries)) => entries,
+            Ok(None) => {
+                return Err(UnitAppendError::Failed(
+                    ContextCreationError::EventLogFailed(format!(
+                        "no event log for context {}",
+                        hex::encode(context_id)
+                    )),
+                ));
+            }
+            Err(e) => {
+                return Err(UnitAppendError::Failed(
+                    ContextCreationError::EventLogFailed(e.to_string()),
+                ));
+            }
+        };
+        match crate::context::providers::event_log::place_unit(&entries, base_seq, leaves)? {
+            crate::context::providers::event_log::UnitPlacement::Append(_) => {
+                let [leaf] = leaves else {
+                    return Err(UnitAppendError::Failed(
+                        ContextCreationError::EventLogFailed(format!(
+                            "this event log provider cannot store a unit of {} entries \
+                             atomically; the unit stays queued",
+                            leaves.len()
+                        )),
+                    ));
+                };
+                self.append_event(
+                    &context_id,
+                    leaf.event_type(),
+                    leaf.actor_did(),
+                    leaf.payload().clone(),
+                    leaf.timestamp_secs(),
+                )
+                .await?;
+                Ok(UnitAppended::Appended)
+            }
+            crate::context::providers::event_log::UnitPlacement::AlreadyPresent => {
+                Ok(UnitAppended::AlreadyPresent)
+            }
+            crate::context::providers::event_log::UnitPlacement::PastEnd { log_len } => {
+                Err(UnitAppendError::PastEnd { base_seq, log_len })
+            }
+            crate::context::providers::event_log::UnitPlacement::Misaligned { log_len } => {
+                Err(UnitAppendError::Misaligned { base_seq, log_len })
+            }
+        }
+    }
+
+    /// Records whether the context has queued log units (spec 17 §17.3
+    /// "Event log write failures"). While it does, a provider that keeps a
+    /// write gate refuses every write to the context's log except the
+    /// drain's (a fail-closed append, an append after an irreversible step,
+    /// an import, a prune, and an init), checked under the gate, so no entry lands ahead
+    /// of a queued one and no replace re-chains the sequences a reserved
+    /// `base_seq` names. The actor calls this when it starts, and the drain
+    /// calls it before it takes the write gate and on every exit.
+    ///
+    /// The default does nothing: a provider without a write gate has no
+    /// writer outside the context's actor, and the actor drains the queue
+    /// before it handles each command.
+    fn set_units_pending(&self, context_id: &[u8; 32], pending: bool) {
+        let _ = (context_id, pending);
+    }
 
     /// Releases the context's in-memory log and write gate without touching
     /// storage, so the next restore loads the stored log (shutdown, and a
@@ -353,14 +509,12 @@ pub trait ContextEventLogProvider: Send + Sync {
     /// Returns [`ContextError::EventLogFailed`] if the append fails.
     async fn append_context_event(
         &self,
-        mode: AppendMode,
         context_id: &[u8; 32],
         event_type: scp_event_log::EventType,
         actor_did: &str,
         timestamp_secs: u64,
     ) -> Result<(), ContextError> {
-        self.append_event_in(
-            mode,
+        self.append_event(
             context_id,
             event_type,
             actor_did,
@@ -382,86 +536,15 @@ pub trait ContextEventLogProvider: Send + Sync {
     /// Returns [`ContextError::EventLogFailed`] if the append fails.
     async fn append_context_event_with_payload(
         &self,
-        mode: AppendMode,
         context_id: &[u8; 32],
         event_type: scp_event_log::EventType,
         actor_did: &str,
         payload: scp_event_log::EventPayload,
         timestamp_secs: u64,
     ) -> Result<(), ContextError> {
-        self.append_event_in(
-            mode,
-            context_id,
-            event_type,
-            actor_did,
-            payload,
-            timestamp_secs,
-        )
-        .await
-        .map_err(|e| ContextError::EventLogFailed(e.to_string()))
-    }
-
-    /// Appends an [`OutletInvokedEvent`] after enforcing the FULL §5.4.5:566
-    /// manifest-derived `chunks_billed` wire-invariant.
-    ///
-    /// Unlike the raw [`append_event`](Self::append_event) boundary — which
-    /// holds only the opaque event and can enforce nothing stronger than the
-    /// event-local `chunks_billed <= stream_chunk_count` backstop — this entry
-    /// point re-derives the manifest root + billable count from the
-    /// caller-supplied retained chunk sequence and rejects the event at
-    /// log-insert time if the recorded aggregates diverge. On success it
-    /// serializes the event and delegates to `append_event`, which re-runs the
-    /// durable event-local backstop. This is the verified-append boundary for
-    /// the cross-context receiver-side recording (SCP-OUT-036 AC7; §5.4.5:566) —
-    /// the path that retains the payload set to re-derive the manifest over its
-    /// independently-reassembled chunk sequence. The same-context streaming pump
-    /// does NOT route through here: it
-    /// does not retain the chunk sequence and persists via `append_event`,
-    /// enforcing same-context integrity inline
-    /// (`AuditAnomaly::ChunksBilledSelfMismatch`) plus the event-local backstop.
-    ///
-    /// [`OutletInvokedEvent`]:
-    ///     scp_protocol::context::outlets::lifecycle::OutletInvokedEvent
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ContextCreationError::EventLogFailed`] when the manifest
-    /// verification rejects the event (the wire-layer `ChunksBilledMismatch`),
-    /// when the event cannot be serialized, or when the underlying append
-    /// fails (e.g. no log initialized for the context).
-    async fn append_outlet_invoked_verified(
-        &self,
-        mode: AppendMode,
-        context_id: &[u8; 32],
-        event: &scp_protocol::context::outlets::lifecycle::OutletInvokedEvent,
-        chunks: &[scp_protocol::context::outlets::stream::OutletStreamChunk],
-        actor_did: &str,
-        timestamp_secs: u64,
-    ) -> Result<(), ContextCreationError> {
-        // (1) FULL §5.4.5:566 manifest-derived equality — the tighter check the
-        // opaque `append_event` boundary cannot make. Wire-reject on mismatch.
-        crate::context::outlets::stream::verify_outlet_invoked_event_manifest(event, chunks)
-            .map_err(|err| {
-                let log_err =
-                    crate::context::outlets::stream::chunks_billed_error_to_event_log_error(err);
-                ContextCreationError::EventLogFailed(log_err.to_string())
-            })?;
-        // (2) Serialize and append through the standard boundary, which
-        // re-runs the durable event-local `<=` backstop.
-        let data = serde_json::to_vec(event).map_err(|e| {
-            ContextCreationError::EventLogFailed(format!(
-                "failed to serialize OutletInvokedEvent: {e}"
-            ))
-        })?;
-        self.append_event_in(
-            mode,
-            context_id,
-            scp_event_log::EventType::OutletInvoked,
-            actor_did,
-            scp_event_log::EventPayload { data },
-            timestamp_secs,
-        )
-        .await
+        self.append_event(context_id, event_type, actor_did, payload, timestamp_secs)
+            .await
+            .map_err(|e| ContextError::EventLogFailed(e.to_string()))
     }
 
     /// Appends a `MemberJoined` / `MemberLeft` leaf carrying a subject-bearing
@@ -480,58 +563,22 @@ pub trait ContextEventLogProvider: Send + Sync {
     /// append fails.
     async fn append_membership_change_leaf(
         &self,
-        mode: AppendMode,
         context_id: &[u8; 32],
         event_type: scp_event_log::EventType,
         actor_did: &str,
         change: &scp_event_log::payload::MembershipChangePayload,
         timestamp_secs: u64,
     ) -> Result<(), ContextError> {
-        let payload = scp_event_log::payload::encode_payload(change)
-            .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
-        self.append_context_event_with_payload(
-            mode,
-            context_id,
+        let payload = crate::context::log_unit_helpers::plan_membership_change_leaf(
             event_type,
             actor_did,
-            payload,
+            change,
             timestamp_secs,
-        )
-        .await
-    }
-
-    /// Appends a `RoleAssigned` leaf carrying a subject-bearing
-    /// [`RoleAssignedPayload`](scp_event_log::payload::RoleAssignedPayload).
-    ///
-    /// `subject_did` is the *affected member* whose role changed — NOT the
-    /// governance actor (`actor_did`). `role` is the newly-assigned role. The
-    /// leaf is convergent (ADR-011 amendment); the participation record (§7.3.2)
-    /// attributes the role transition (`role_progression_count`) to
-    /// `subject_did`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ContextError::EventLogFailed`] if payload encoding or the
-    /// append fails.
-    async fn append_role_assigned_leaf(
-        &self,
-        mode: AppendMode,
-        context_id: &[u8; 32],
-        actor_did: &str,
-        subject_did: &str,
-        role: &str,
-        timestamp_secs: u64,
-    ) -> Result<(), ContextError> {
-        let payload =
-            scp_event_log::payload::encode_payload(&scp_event_log::payload::RoleAssignedPayload {
-                subject_did: subject_did.to_owned(),
-                role: role.to_owned(),
-            })
-            .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
+        )?
+        .into_payload();
         self.append_context_event_with_payload(
-            mode,
             context_id,
-            scp_event_log::EventType::RoleAssigned,
+            event_type,
             actor_did,
             payload,
             timestamp_secs,
@@ -1293,7 +1340,6 @@ pub(crate) async fn create_context(
     // failure, exactly like the `ContextCreated` append above.
     if let Err(e) = event_log_provider
         .append_membership_change_leaf(
-            crate::context::builder::AppendMode::FailClosed,
             &id_bytes,
             scp_event_log::EventType::MemberJoined,
             creator_did,
@@ -1525,7 +1571,17 @@ mod tests {
             _context_id: &[u8; 32],
         ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
         {
-            Ok(None)
+            Ok(Some(Vec::new()))
+        }
+
+        /// The fixture holds no entry, so its root is the empty log's root.
+        fn event_log_merkle_root(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok(scp_event_log::tree::root(&scp_event_log::EventLog::new(
+                String::new(),
+            )))
         }
 
         async fn init_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
@@ -2075,7 +2131,17 @@ mod tests {
             _context_id: &[u8; 32],
         ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
         {
-            Ok(None)
+            Ok(Some(Vec::new()))
+        }
+
+        /// The fixture holds no entry, so its root is the empty log's root.
+        fn event_log_merkle_root(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok(scp_event_log::tree::root(&scp_event_log::EventLog::new(
+                String::new(),
+            )))
         }
 
         async fn init_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {

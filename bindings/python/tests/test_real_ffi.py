@@ -1294,6 +1294,25 @@ class TestTrust:
         assert evaluation.behavioral_record.attestation_count == 0
         assert evaluation.behavioral_record.role_progression_count == 1
 
+    async def test_evaluate_trust_refuses_never_created_context_real_ffi(self, scp: SCP):
+        """A never-created context surfaces as an error, never a zeroed record.
+
+        A context with no log is an absent state, never an empty log (spec 17
+        §17.3): the core refuses with ``ContextNotRegistered``, which the bridge
+        reports as ``SCP-CTX-2000``. Only an empty log's ``SCP-CTX-2076`` folds
+        into a zeroed record (spec 07 §7.3.2).
+        """
+        from scp_sdk.trust import evaluate_trust, participation_record
+
+        member = await create_in_memory_identity(scp)
+        with pytest.raises(ContextError, match="context not registered") as direct:
+            await participation_record(scp, "ctx-never-created", member.did)
+        assert direct.value.code == "SCP-CTX-2000"
+
+        with pytest.raises(ContextError, match="context not registered") as evaluated:
+            await evaluate_trust(scp=scp, subject_did=member.did, context_id="ctx-never-created")
+        assert evaluated.value.code == "SCP-CTX-2000"
+
 
 # ---------------------------------------------------------------------------
 # Broadcast key distribution (spec §5.14.2)

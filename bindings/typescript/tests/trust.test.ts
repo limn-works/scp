@@ -20,7 +20,7 @@
 
 import { afterEach, describe, expect, it } from "bun:test";
 import type { Context } from "../src/context";
-import { IdentityError, UcanPermissionError, ValidationError } from "../src/errors";
+import { ContextError, IdentityError, UcanPermissionError, ValidationError } from "../src/errors";
 import { Identity } from "../src/identity";
 import type { SCP } from "../src/scp";
 import type {
@@ -572,6 +572,27 @@ describe("scp.evaluateTrust — Layer 1 AND-combination + Layer 2 behavioral", (
     await expect(scp.evaluateTrust(mockContext(scp, "ctx-1"), "did:dht:subject")).rejects.toThrow(
       /not initialized/i,
     );
+  });
+
+  it("propagates an unregistered context's refusal instead of folding it into a zeroed record", async () => {
+    const { scp, native } = mountMockScp();
+    cleanup = () => scp.shutdown(0);
+    // A context with no log is an absent state, never an empty log (spec 17
+    // §17.3): the bridge reports the core's ContextNotRegistered with a generic
+    // context code, and only SCP-CTX-2076 is folded (spec 07 §7.3.2).
+    native.__stub("participationRecord", () => {
+      throw new Error(
+        "[SCP-CTX-2000] participation_record failed: context not registered: ctx-unknown",
+      );
+    });
+
+    const error = await scp.evaluateTrust(mockContext(scp, "ctx-unknown"), "did:dht:subject").then(
+      () => undefined,
+      (err: unknown) => err,
+    );
+    expect(error).toBeInstanceOf(ContextError);
+    expect((error as ContextError).code).toBe("SCP-CTX-2000");
+    expect((error as ContextError).message).toMatch(/context not registered/);
   });
 });
 

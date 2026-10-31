@@ -242,44 +242,27 @@ pub fn evaluate_sybil_resistance(
 /// unified [`PerContextState`](crate::context::actor::state::PerContextState) (ADR-049 §Decision 1) — a cell-holder supplies
 /// the cache via `governance_class_c_mut().participation_cache_mut()` and the
 /// buffer via `receive_buffer_mut()`, so no whole `&mut GovernanceState` (and no
-/// `state_mut()`) is needed.
+/// `state_mut()`) is needed. `evidence` is the log and the queued units, and
+/// `root` the log's Merkle root, that the join read before its MLS add, so this
+/// reads nothing from the log after the step (spec 17 §17.3 "Event log write
+/// failures").
 pub fn post_join_bookkeeping(
     participation_cache: &mut std::collections::HashMap<
         String,
-        scp_protocol::trust::participation::ParticipationRecord,
+        super::participation::RootedParticipationRecord,
     >,
     receive_buffer: &scp_protocol::context::membership::ReceiveBuffer,
+    evidence: &super::governance_logic::PreStepEvidence,
+    root: super::participation::ParticipationRoot,
     context_id: &str,
     member_did: &DID,
     now: u64,
-    event_log: &dyn crate::context::builder::ContextEventLogProvider,
 ) {
-    let context_id_bytes = super::state::context_id_to_bytes(context_id);
-    let merkle_root = event_log
-        .event_log_merkle_root(&context_id_bytes)
-        .unwrap_or([0u8; 32]);
     // Participation-record path consumes only the merged event set;
     // the consequence window anchor is not used here.
-    let (join_events, _convergent_now) =
-        super::governance_logic::event_log_entries_for_consequences_after_side_effect(
-            receive_buffer,
-            context_id,
-            now,
-            event_log,
-        );
+    let (join_events, _convergent_now) = evidence.events(&[], receive_buffer, now);
     if !join_events.is_empty()
-        && let Ok(record) = scp_protocol::trust::participation::compute_participation_record(
-            &join_events,
-            member_did.as_ref(),
-            context_id,
-            merkle_root,
-            now,
-            // attestation_count is a credential-layer, verifier-relative fact
-            // (§7.3.2); this lifecycle path gates only on participation_count and
-            // has no attestation-cache access, so it passes an empty accessible-
-            // attestation set (count 0) by design — NOT a stub.
-            &[],
-        )
+        && let Ok(record) = root.record(&join_events, member_did.as_ref(), context_id, now)
     {
         participation_cache.insert(member_did.to_string(), record);
     }

@@ -268,7 +268,6 @@ pub fn filter_manager_entries<'a>(
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 

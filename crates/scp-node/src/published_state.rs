@@ -685,7 +685,6 @@ pub async fn apply_tier_change(
 /// Test-only: the plain (no `bridgeTarget`) relay entry for `url`, which every
 /// test fixture names by a canonical relay URL.
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 pub fn test_relay(url: &str) -> RelayService {
     RelayService::direct(
         scp_did::RelayEndpoint::new(url).expect("every test fixture names a canonical relay URL"),

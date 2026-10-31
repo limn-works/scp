@@ -289,18 +289,6 @@ impl ContextEventLogProvider for ArcEventLogProvider {
             .append_event(id, event_type, actor_did, payload, timestamp_secs)
             .await
     }
-    async fn append_event_after_side_effect(
-        &self,
-        id: &[u8; 32],
-        event_type: scp_event_log::EventType,
-        actor_did: &str,
-        payload: scp_event_log::EventPayload,
-        timestamp_secs: u64,
-    ) -> Result<(), ContextCreationError> {
-        self.0
-            .append_event_after_side_effect(id, event_type, actor_did, payload, timestamp_secs)
-            .await
-    }
     async fn destroy_event_log(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
         self.0.destroy_event_log(id).await
     }
@@ -344,6 +332,27 @@ impl ContextEventLogProvider for ArcEventLogProvider {
             policy,
         )
         .await
+    }
+    // The drain's write gate, unit write, and fence go to the shared provider,
+    // which writes a unit of any length atomically; the trait defaults would
+    // bypass its gate and refuse a unit of several entries.
+    async fn lock_for_unit(
+        &self,
+        id: &[u8; 32],
+    ) -> Result<scp_core::context::builder::UnitWriteGuard, ContextCreationError> {
+        self.0.lock_for_unit(id).await
+    }
+    async fn append_unit(
+        &self,
+        guard: scp_core::context::builder::UnitWriteGuard,
+        base_seq: u64,
+        leaves: &[scp_core::context::state::LeafSpec],
+    ) -> Result<scp_core::context::builder::UnitAppended, scp_core::context::builder::UnitAppendError>
+    {
+        self.0.append_unit(guard, base_seq, leaves).await
+    }
+    fn set_units_pending(&self, id: &[u8; 32], pending: bool) {
+        self.0.set_units_pending(id, pending);
     }
 }
 

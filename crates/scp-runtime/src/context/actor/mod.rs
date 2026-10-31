@@ -414,6 +414,14 @@ impl ContextActor {
         // mutation will set `dirty = true`, then the `select!` arm
         // computes the deadline as `last_persist_attempt_at + COALESCE_INTERVAL`
         // — which is in the future relative to actor-spawn `now()`.
+        //
+        // Drain the queued log units first (spec 17 §17.3 "Event log write
+        // failures"): an actor starts on spawn, respawn, and restore, and a
+        // restored queue is written before any command runs. The drain sets
+        // the provider fence from the restored queue unconditionally, so a
+        // fence a failed drain of an earlier actor left is cleared when the
+        // restored queue is empty.
+        self.drain_log_units().await;
         loop {
             // Reconcile the ACTOR-OWNED timer arms and the push-route watch
             // from owned state before every select (top of run() + after each
@@ -477,6 +485,11 @@ impl ContextActor {
                             // run-loop future under the `clippy::large_futures`
                             // threshold (the streaming-saga seal handlers added
                             // large stack frames held across `.await`).
+                            // Every command runs after a drain of the queued
+                            // log units (spec 17 §17.3), so a fail-closed
+                            // append, an import, an export, a prune, or a
+                            // checkpoint never lands ahead of a queued unit.
+                            self.drain_log_units().await;
                             let succeeded = Box::pin(self.dispatch(cmd)).await;
                             if is_flush {
                                 self.record_persist_attempt(succeeded);
@@ -635,6 +648,44 @@ impl ContextActor {
         }
     }
 
+    /// Drains the context's queued log units (spec 17 §17.3 "Event log write
+    /// failures"). The drain first tells the provider whether the queue holds
+    /// a unit, every time, so the provider fence follows the queue even when
+    /// there is nothing to drain. A failed drain leaves the units queued and
+    /// the fence set, so the command that follows cannot write ahead of them;
+    /// the drain logs the failure.
+    ///
+    /// A drain that empties the queue of a closed context deletes the
+    /// context's stored state, which close kept only for those units (spec 17
+    /// §17.3 "Event log write failures", "Restart").
+    async fn drain_log_units(&mut self) {
+        let had_units = !self.state.class_s.pending_log_units.is_empty();
+        let drained = crate::context::log_unit_helpers::drain_pending_log_units(
+            &mut self.state,
+            &self.deps,
+            &self.context_id,
+        )
+        .await;
+        let retired = match drained {
+            Ok(()) if had_units => {
+                crate::context::log_unit_helpers::retire_closed_snapshot(
+                    &self.state,
+                    &self.deps,
+                    &self.context_id,
+                )
+                .await
+            }
+            other => other,
+        };
+        if let Err(err) = retired {
+            tracing::debug!(
+                context_id = %self.context_id,
+                error = %err,
+                "log unit drain before the next command failed"
+            );
+        }
+    }
+
     /// Dispatch a single command to its matching handler: threads the
     /// actor-owned state/deps through `dispatch_state` into the
     /// per-domain actor-shape `dispatch` entry points. Returns whether the
@@ -644,8 +695,8 @@ impl ContextActor {
         // `dispatch_state` receives the `&mut ClassSCell` directly and threads
         // it into every domain handler. Every domain mutates through the cell's
         // combinators — the fail-closed `commit_class_s_*` / `ClassSCommitToken`
-        // for Class-S transitions, and the airtight `class_c_view()` /
-        // `commit_class_c_best_effort` for Class-C / structural state. There is
+        // for Class-S transitions, and the airtight `class_c_view()` for
+        // Class-C / structural state. There is
         // no `state_mut()` escape hatch (deleted), and the broadcast member-
         // removal in `unsubscribe_broadcast` routes through the restricted
         // `MembershipClassCMut::remove_subscriber` (a public-content subscriber
@@ -775,6 +826,9 @@ impl ContextActor {
             ContextCommand::Queries(sub) => handlers::queries::dispatch(cell, deps, sub).await,
             // Push domain (§10.7.1): read-only, answered from owned state.
             ContextCommand::Push(sub) => handlers::push::dispatch(cell, sub),
+            // Records sent by code outside the actor (spec 17 §17.3): queued in
+            // the restore persist, then drained.
+            ContextCommand::LogUnit(sub) => handlers::log_unit::dispatch(cell, deps, sub).await,
             // SagaPhase + LifecycleControl already migrated to the
             // state-owning signature.
             ContextCommand::SagaPhase(msg) => handlers::saga::dispatch(cell, deps, msg).await,
@@ -1020,11 +1074,13 @@ impl ContextActor {
         let handle = self.state.handle.clone();
 
         // Run the fail-closed expiry, carrying the completed-steps bitmask from
-        // any prior attempt so only the failed step re-runs. `handle_ttl_expiry`
-        // wraps ONLY the relay/event-log I/O in `timeout(HANDLER_TIMEOUT)`; the
-        // fail-closed terminal persist runs OUTSIDE that bound (SEC-1), so NO
-        // outer timeout here (an outer wrap would re-expose the persist to
-        // relay-stall cancellation — the exact bug this pass fixes).
+        // any prior attempt so only the failed step re-runs. The expiry bounds
+        // its own I/O: each event-log write of its drain runs under
+        // `LOG_UNIT_WRITE_TIMEOUT` (spec 17 §17.3 "Event log write failures",
+        // "Time bound"), and the relay delete runs under its own budget. The
+        // fail-closed terminal persist runs outside both bounds (SEC-1), so no
+        // outer timeout wraps the call: an outer timeout would cancel the
+        // persist when the relay or the log stalls.
         let outcome = crate::context::ttl_close_helpers::handle_ttl_expiry(
             &mut self.state,
             &self.deps,
@@ -1085,7 +1141,17 @@ impl ContextActor {
         // Any weaker condition would either lose an undestroyed key (incomplete
         // cleanup) or let a crash resurrect the context as `Active` against a
         // stale snapshot (undurable terminal state) — the SEC-1 window.
-        if terminal && outcome.result.is_complete() && outcome.persist_result.is_ok() {
+        //
+        // AND its queued log units are written. The stored snapshot keeps any
+        // unit still queued, and the drain-only pass of the next restore or
+        // respawn writes it (spec 17 §17.3 "Event log write failures",
+        // "Restart"), but the resident actor writes it sooner: the retry arm
+        // below re-runs the expiry, which drains again.
+        if terminal
+            && outcome.result.is_complete()
+            && outcome.persist_result.is_ok()
+            && self.state.class_s.pending_log_units.is_empty()
+        {
             // Clear the retry arm (a prior incomplete attempt may have armed it)
             // before reporting terminal so `run()` despawns cleanly. Reset the
             // retry counter — the expiry converged.
@@ -1109,14 +1175,19 @@ impl ContextActor {
             //
             // ACCEPTED crash-window residuals at this pending-retry point
             // (ADR-049 §9 TTL carve-out; NOT resurrection or an access-control
-            // bypass — the persisted snapshot is already TERMINAL, restore skips
-            // non-`Active` contexts, and B8 refuses re-create):
-            //  - L2 (black-hat P3-005): the retry state (that a `ContextExpired`
-            //    leaf append is still pending) lives only in this resident
-            //    actor's `ttl_expiry_completed` bitmask, not the persisted
-            //    snapshot. A crash DURING the pending retry drops the
-            //    not-yet-appended leaf — a missing PROVENANCE leaf only; the
-            //    context stays terminal for good.
+            // bypass — the persisted snapshot is already TERMINAL, restore
+            // starts no actor for a non-`Active` context, and B8 refuses
+            // re-create):
+            //  - L2 (black-hat P3-005): a `ContextExpired` record that the
+            //    terminal persist queued is in the stored snapshot, and the
+            //    drain-only pass of the next restore writes it (spec 17 §17.3
+            //    "Event log write failures", "Restart"). The residual is a
+            //    record the expiry never queued: when the log read before the
+            //    step failed, the record step stays undone in this resident
+            //    actor's `ttl_expiry_completed` bitmask, which no snapshot
+            //    stores. A crash during that retry leaves the log without the
+            //    record — a missing PROVENANCE leaf only; the context stays
+            //    terminal for good.
             //  - L4 (security): when key destruction itself is the still-failing
             //    step, a crash here can leave that context's key material
             //    ORPHANED in MLS storage. This is a STORAGE-HYGIENE residual —
@@ -1636,24 +1707,21 @@ mod tests {
         let deps = new_test_deps().await;
         let mut state = writable_encrypted_state(0x31, DIRECT_ALICE);
         let ctx = ctx_hex(0x31);
-        let ctx_bytes = [0x31u8; 32];
         let pseudonym = [0x42u8; 32];
         let inner = minimal_inner(&ctx, DIRECT_ALICE, 1);
 
-        let mut downward_auth_applied: Option<crate::context::actor::class_s::ClassSCommitToken> =
-            None;
+        let mut downward_auth_applied = crate::context::log_unit_helpers::ConsequenceSink::new();
         let consumed = crate::context::messaging_helpers::deliver_message_and_drain_buffered(
             &mut crate::context::actor::class_s::ClassCMut::from_state(&mut state),
             &deps,
             &ctx,
-            &ctx_bytes,
             DIRECT_ALICE,
             &inner,
             &announcement_bytes(DIRECT_ALICE, pseudonym),
             true,
+            &crate::context::governance_logic::PreStepEvidence::default(),
             &mut downward_auth_applied,
         )
-        .await
         .expect("a legitimate announcement is consumed, not an error");
         assert!(consumed, "an announcement is reported as consumed (true)");
         let reg = state.routing.peer_registry().expect("encrypted ⇒ registry");
@@ -1669,24 +1737,21 @@ mod tests {
         let deps = new_test_deps().await;
         let mut state = writable_encrypted_state(0x32, DIRECT_ALICE);
         let ctx = ctx_hex(0x32);
-        let ctx_bytes = [0x32u8; 32];
         // Authenticated sender is ALICE, but the announcement claims BOB.
         let inner = minimal_inner(&ctx, DIRECT_ALICE, 1);
 
-        let mut downward_auth_applied: Option<crate::context::actor::class_s::ClassSCommitToken> =
-            None;
+        let mut downward_auth_applied = crate::context::log_unit_helpers::ConsequenceSink::new();
         let result = crate::context::messaging_helpers::deliver_message_and_drain_buffered(
             &mut crate::context::actor::class_s::ClassCMut::from_state(&mut state),
             &deps,
             &ctx,
-            &ctx_bytes,
             DIRECT_ALICE,
             &inner,
             &announcement_bytes(DIRECT_BOB, [0x42u8; 32]),
             true,
+            &crate::context::governance_logic::PreStepEvidence::default(),
             &mut downward_auth_applied,
-        )
-        .await;
+        );
         assert!(
             matches!(result, Err(ContextError::PermissionDenied(_))),
             "the direct ingest site maps a rejection to PermissionDenied; got {result:?}"
@@ -1706,23 +1771,20 @@ mod tests {
         let deps = new_test_deps().await;
         let mut state = writable_encrypted_state(0x33, DIRECT_ALICE);
         let ctx = ctx_hex(0x33);
-        let ctx_bytes = [0x33u8; 32];
         let inner = minimal_inner(&ctx, DIRECT_ALICE, 1);
 
-        let mut downward_auth_applied: Option<crate::context::actor::class_s::ClassSCommitToken> =
-            None;
+        let mut downward_auth_applied = crate::context::log_unit_helpers::ConsequenceSink::new();
         let result = crate::context::messaging_helpers::deliver_message_and_drain_buffered(
             &mut crate::context::actor::class_s::ClassCMut::from_state(&mut state),
             &deps,
             &ctx,
-            &ctx_bytes,
             DIRECT_ALICE,
             &inner,
             &announcement_bytes(DIRECT_ALICE, [0u8; 32]), // zero sentinel = reserved
             true,
+            &crate::context::governance_logic::PreStepEvidence::default(),
             &mut downward_auth_applied,
-        )
-        .await;
+        );
         assert!(
             matches!(result, Err(ContextError::PermissionDenied(_))),
             "a reserved routing-ID value is rejected on the direct path; got {result:?}"
@@ -1734,25 +1796,22 @@ mod tests {
         let deps = new_test_deps().await;
         let mut state = writable_encrypted_state(0x34, DIRECT_ALICE);
         let ctx = ctx_hex(0x34);
-        let ctx_bytes = [0x34u8; 32];
 
         for (seq, rid) in [(1u64, [0x42u8; 32]), (2u64, [0x43u8; 32])] {
             let inner = minimal_inner(&ctx, DIRECT_ALICE, seq);
-            let mut downward_auth_applied: Option<
-                crate::context::actor::class_s::ClassSCommitToken,
-            > = None;
+            let mut downward_auth_applied =
+                crate::context::log_unit_helpers::ConsequenceSink::new();
             let consumed = crate::context::messaging_helpers::deliver_message_and_drain_buffered(
                 &mut crate::context::actor::class_s::ClassCMut::from_state(&mut state),
                 &deps,
                 &ctx,
-                &ctx_bytes,
                 DIRECT_ALICE,
                 &inner,
                 &announcement_bytes(DIRECT_ALICE, rid),
                 true,
+                &crate::context::governance_logic::PreStepEvidence::default(),
                 &mut downward_auth_applied,
             )
-            .await
             .expect("same-DID re-announce must succeed");
             assert!(consumed);
         }
@@ -1767,7 +1826,7 @@ mod tests {
 
     /// Ingests `member`'s v2 announcement at `pseudonym_epoch` through the
     /// real in-order ingest path.
-    async fn ingest_v2_announcement(
+    fn ingest_v2_announcement(
         state: &mut state::PerContextState,
         deps: &deps::ActorDeps,
         ctx_byte: u8,
@@ -1788,20 +1847,18 @@ mod tests {
         })
         .expect("serialize v2 announcement");
         let inner = minimal_inner(&ctx, member, sequence);
-        let mut downward_auth_applied: Option<crate::context::actor::class_s::ClassSCommitToken> =
-            None;
+        let mut downward_auth_applied = crate::context::log_unit_helpers::ConsequenceSink::new();
         crate::context::messaging_helpers::deliver_message_and_drain_buffered(
             &mut crate::context::actor::class_s::ClassCMut::from_state(state),
             deps,
             &ctx,
-            &[ctx_byte; 32],
             member,
             &inner,
             &plaintext,
             true,
+            &crate::context::governance_logic::PreStepEvidence::default(),
             &mut downward_auth_applied,
         )
-        .await
     }
 
     /// Spec 09 §9.10.4.1 "Record lifetime": once a member processes a Commit
@@ -1833,11 +1890,10 @@ mod tests {
 
         assert!(
             ingest_v2_announcement(&mut state, &deps, 0x35, DIRECT_BOB, 1, 1, [0x51; 32])
-                .await
                 .expect("the epoch-1 announcement is accepted")
         );
         let rejected =
-            ingest_v2_announcement(&mut state, &deps, 0x35, DIRECT_BOB, 2, 0, [0x50; 32]).await;
+            ingest_v2_announcement(&mut state, &deps, 0x35, DIRECT_BOB, 2, 0, [0x50; 32]);
         assert!(
             matches!(rejected, Err(ContextError::PermissionDenied(_))),
             "a lower epoch over a recorded epoch is rejected; got {rejected:?}"
@@ -1869,7 +1925,6 @@ mod tests {
         );
         assert!(
             ingest_v2_announcement(&mut state, &deps, 0x35, DIRECT_BOB, 3, 0, [0x52; 32])
-                .await
                 .expect("the rejoiner's epoch-0 announcement is accepted")
         );
         let record = state
@@ -2679,16 +2734,19 @@ mod tests {
         state
     }
 
-    /// SEC-1i (MUST FAIL pre-fix): with the event-log I/O stalling past
-    /// `HANDLER_TIMEOUT`, the terminal `Expired` state is persisted FAIL-CLOSED
-    /// BEFORE the actor could tear down, and the actor stays alive to retry the
-    /// unfinished cleanup. Pre-fix, the terminal persist was best-effort AFTER
-    /// the timed-out I/O (so a relay stall cancelled it, leaving only a
-    /// post-despawn coalesce drain to record `Expired` — a resurrection window)
-    /// AND the actor despawned unconditionally on `Expired` (mailbox closed).
+    /// SEC-1i (MUST FAIL pre-fix): with the event-log write stalling, the
+    /// terminal `Expired` state is persisted FAIL-CLOSED, with the
+    /// `ContextExpired` record queued in that persist, BEFORE any event-log or
+    /// relay I/O runs. Pre-fix, the terminal persist was best-effort AFTER the
+    /// timed-out I/O (so a relay stall cancelled it, leaving only a
+    /// post-despawn coalesce drain to record `Expired` — a resurrection window).
+    /// The keep-alive on an unwritten record is covered by
+    /// `incomplete_cleanup_keeps_actor_alive_and_retries`. The test then shows
+    /// that the stalled write cannot hold the actor: the drain gives the write
+    /// up at its time bound, and the actor exits on a Shutdown.
     #[cfg(feature = "testing")]
     #[tokio::test]
-    async fn ttl_expiry_persists_before_despawn_with_stalling_transport() {
+    async fn ttl_expiry_persists_its_record_before_a_stalled_log_write() {
         let recorder = RecordingPersistence::new();
         let deps = new_test_deps_with_providers(
             Box::new(recorder.clone()),
@@ -2700,7 +2758,6 @@ mod tests {
 
         let now = deps.clock.now_secs();
         let state = active_state_with_past_ttl(0x71, now);
-        let ctx = hex_encode_context_id(&[0x71u8; 32]);
 
         let (tx, rx) = mpsc::channel::<ContextCommand>(4);
         let actor = ContextActor::new(state, deps, rx, handle::ExitRecord::default());
@@ -2726,33 +2783,40 @@ mod tests {
             "the durable snapshot must be Expired BEFORE any teardown — anti-resurrection \
              keys off this (a stale Active snapshot would resurrect on respawn)"
         );
-
-        // Advance past the I/O transport budget so the stalled event-log append
-        // times out. Post-fix: cleanup is incomplete ⇒ the actor keeps itself
-        // alive and re-arms a retry (it does NOT despawn). Pre-fix: the actor
-        // despawned here (mailbox closed).
-        tokio::time::advance(
-            handlers::ttl_close::HANDLER_TIMEOUT + std::time::Duration::from_secs(1),
-        )
-        .await;
-
-        let state_after = handle
-            .send(|reply| {
-                ContextCommand::Queries(QueriesCommand::ReadContextState {
-                    context_id: ctx.clone(),
-                    reply,
-                })
+        let persisted_units: Vec<Vec<scp_event_log::EventType>> = snap
+            .pending_log_units
+            .iter()
+            .map(|unit| {
+                unit.leaves
+                    .iter()
+                    .map(crate::context::state::LeafSpec::event_type)
+                    .collect()
             })
-            .await
-            .expect("actor is still alive after an INCOMPLETE expiry (SEC-1 keep-alive)");
+            .collect();
         assert_eq!(
-            state_after,
-            scp_protocol::context::ContextState::Expired,
-            "the still-alive actor reports the terminal Expired state"
+            persisted_units,
+            vec![vec![scp_event_log::EventType::ContextExpired]],
+            "the ContextExpired record rides the fail-closed persist, ahead of the \
+             stalled write (spec 17 §17.3)"
         );
 
-        drop(handle);
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), actor_task).await;
+        // The drain's write stalls, and the drain gives it up after
+        // `LOG_UNIT_WRITE_TIMEOUT` with the record still queued (spec 17 §17.3
+        // "Event log write failures", "Time bound"). So the actor finishes the
+        // expiry turn and then handles a Shutdown; without the bound it waits
+        // on the stalled write forever and never reads the command. The
+        // virtual-time budget covers the expiry's drain and the drain before
+        // the Shutdown, each stopped at the bound.
+        let budget = crate::context::log_unit_helpers::LOG_UNIT_WRITE_TIMEOUT * 4;
+        tokio::time::timeout(budget, async {
+            handle
+                .send_shutdown()
+                .await
+                .expect("the actor answers the Shutdown");
+            actor_task.await.expect("the actor task joins");
+        })
+        .await
+        .expect("a stalled log write must not hold the actor past the drain's time bound");
     }
 
     /// M2 (bounded exponential TTL-expiry backoff): the retry delay grows

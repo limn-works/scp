@@ -94,6 +94,7 @@ use crate::context::actor::state::{
 };
 use crate::context::governance::timeout::DeadlockDetectionState;
 use crate::context::governance_helpers;
+use crate::context::log_unit_helpers::{drain_pending_log_units, plan_membership_change_leaf};
 use crate::context::state::{
     self, AccessControlState, CommitOperation, EpochState, GovernanceState, TtlState,
 };
@@ -197,6 +198,16 @@ pub fn export_context_blocks(
     // the crypto keys the snapshot exports), not a re-hash of the hex id.
     let ctx_id_bytes = state::context_id_to_bytes(context_id);
 
+    // An export carries the log as stored, and the public snapshot carries no
+    // queue, so it waits for the queued log units (spec 17 §17.3 "Event log
+    // write failures"); the actor drains them before every command.
+    if !state.class_s.pending_log_units.is_empty() {
+        return Err(ContextError::EventLogFailed(format!(
+            "context {context_id} has queued event log units; export waits for the drain"
+        )));
+    }
+    governance_helpers::check_log_fault(state)?;
+
     let snapshot = crate::context::messaging_helpers::build_snapshot_from_state(state);
 
     let event_log_data = deps.event_log.export_event_log_data(&ctx_id_bytes)?;
@@ -238,6 +249,39 @@ pub async fn leave_context(
     let context_id = handle.context_id().to_owned();
     let context_id_bytes = state::context_id_to_bytes(&context_id);
 
+    // The `MemberLeft` record is planned before the removal and queued in the
+    // removal's fail-closed persist, so the stored state that drops the member
+    // holds its record (spec 17 §17.3 "Event log write failures"); a planning
+    // failure refuses the leave before any step.
+    //
+    // Subject-bearing leaf (ADR-011 amendment): the payload carries the affected
+    // member (`member_did`, which on a self-leave already equals `actor_did`) and
+    // its role at departure, so the leaf shape is uniform with admin-driven
+    // removals and the participation record (§7.3.2) attributes the leave to this
+    // member with its role context.
+    //
+    // Committer-assigned: the leaving member's clock — the source of the
+    // `created_at` on its outgoing leave commit. This is the
+    // convergent-by-construction value WHEN cross-member leaf replication lands:
+    // the receive-side append path is currently dormant, so this leaf is
+    // committer-appended-only and is NOT yet replicated to other members.
+    // Cross-member convergence of membership leaves is the forward step under
+    // ADR-051 (§7.3.1, §9.9.3).
+    let left_role_name = cell
+        .membership
+        .get(member_did.as_ref())
+        .map(|info| info.role_name.clone())
+        .unwrap_or_default();
+    let left_leaf = plan_membership_change_leaf(
+        scp_event_log::EventType::MemberLeft,
+        member_did.as_ref(),
+        &scp_event_log::payload::MembershipChangePayload {
+            subject_did: member_did.as_ref().to_owned(),
+            role_name: left_role_name,
+        },
+        deps.clock.now_secs(),
+    )?;
+
     // ADR-049 §9 Class S: a member leaving removes their own membership (a
     // downward-authorization transition for that member) — STRUCTURAL fail-closed.
     // The removal body (MLS remove + membership/role/access/routing cleanup) runs
@@ -246,21 +290,22 @@ pub async fn leave_context(
     // `persist_state_fail_closed`). KEEP-direction: a removal that did not durably
     // land is NOT rolled back in memory — re-admitting a member the caller was told
     // had left is the unsafe direction; the persist error is surfaced instead so the
-    // leave is not acknowledged as durable. The closure body is synchronous; the
-    // `MemberLeft` Merkle-leaf append and the close-on-empty transition (both now or
-    // already async — under ADR-049 Decision 7 `EventLogPersistence` is async) run
-    // AFTER the persist, outside the sync `_keep` closure. `check_commit_fault` reads
+    // leave is not acknowledged as durable. The closure body is synchronous; it
+    // queues the `MemberLeft` record planned above in the same persist, and the
+    // drain and the close-on-empty transition run AFTER the persist, outside the
+    // sync `_keep` closure. `check_commit_fault` reads
     // through the whole `&mut PerContextState` the view hands back. The MLS-Commit
     // broadcast also runs after this persist (async — Decision 7); on failure its
     // `commit_fault`/`pending_commits` bookkeeping is applied FAIL-CLOSED via a
     // second `commit_class_s_keep` (`apply_broadcast_failure`), because `commit_fault`
     // is a safety gate that must survive a crash before the coalesced persist tick.
-    let (should_close, left_role_name, is_broadcast, mls_commit_bytes) = cell
+    let (should_close, is_broadcast, mls_commit_bytes) = cell
         .commit_class_s_keep(deps, &context_id, |mut view| {
             let state = view.rest_mut();
 
             // PR #1606 C6: refuse if a commit fault marker is set.
             governance_helpers::check_commit_fault(state)?;
+            governance_helpers::check_log_fault(state)?;
 
             // Authorization: self-removal always allowed; otherwise MemberRemove
             // required.
@@ -341,17 +386,6 @@ pub async fn leave_context(
                 }
             }
 
-            // Capture the leaving member's role name BEFORE the membership/role
-            // strip below — the role held at departure, carried into the
-            // subject-bearing MemberLeft leaf (ADR-011 amendment) so the
-            // participation record (§7.3.2) attributes the self-leave to this
-            // member with its role context.
-            let left_role_name = state
-                .membership
-                .get(member_did.as_ref())
-                .map(|info| info.role_name.clone())
-                .unwrap_or_default();
-
             // Clean teardown of every per-DID record (spec §5.6.1): membership,
             // role state, access key (§9.17.2, ADR-038), read exclusion and
             // pseudonym routing ID, inside this fail-closed persist (ADR-049 §9).
@@ -382,7 +416,8 @@ pub async fn leave_context(
 
             let should_close = state.membership.count() == 0;
 
-            Ok((should_close, left_role_name, is_broadcast, mls_commit_bytes))
+            view.enqueue_counted_log_unit(vec![left_leaf]);
+            Ok((should_close, is_broadcast, mls_commit_bytes))
         })
         .await?;
 
@@ -423,38 +458,11 @@ pub async fn leave_context(
         }
     }
 
-    // Append the `MemberLeft` Merkle leaf AFTER the Class-S removal persist.
-    // Under ADR-049 Decision 7 `EventLogPersistence` is async, so this append
-    // cannot run inside the synchronous `_keep` closure above — the membership
-    // removal is already fail-closed-persisted by the combinator; the Merkle
-    // leaf is a separate durable record.
-    //
-    // Subject-bearing leaf (ADR-011 amendment): the payload carries the affected
-    // member (`member_did`, which on a self-leave already equals `actor_did`) and
-    // its role at departure, so the leaf shape is uniform with admin-driven
-    // removals and the SDK reads `subject_did` consistently.
-    //
-    // Committer-assigned: the leaving member's clock — the source of the
-    // `created_at` on its outgoing leave commit. This is the
-    // convergent-by-construction value WHEN cross-member leaf replication lands:
-    // the receive-side append path is currently dormant, so this leaf is
-    // committer-appended-only and is NOT yet replicated to other members.
-    // Cross-member convergence of membership leaves is the forward step under
-    // ADR-051 (§7.3.1, §9.9.3).
-    deps.event_log
-        .append_membership_change_leaf(
-            crate::context::builder::AppendMode::AfterSideEffect,
-            &context_id_bytes,
-            scp_event_log::EventType::MemberLeft,
-            member_did.as_ref(),
-            &scp_event_log::payload::MembershipChangePayload {
-                subject_did: member_did.as_ref().to_owned(),
-                role_name: left_role_name.clone(),
-            },
-            deps.clock.now_secs(),
-        )
-        .await?;
-    *cell.class_c_view().checkpoint_events_since_mut() += 1;
+    // The step is durable with its records queued; write them now. A failed
+    // drain leaves them queued for the actor's next drain and logs its own
+    // error, so it does not fail the step that already landed (spec 17 §17.3
+    // "Event log write failures").
+    let _ = drain_pending_log_units(cell, deps, &context_id).await;
 
     // If member count reaches zero, transition to Closing. Runs AFTER the
     // fail-closed persist above, matching the prior ordering.
@@ -751,6 +759,42 @@ pub async fn close_context(
 // 5. close_context_with_key (per-context)
 // ---------------------------------------------------------------------------
 
+/// Queues the `ContextClosing` record in a keep commit right after the close
+/// transition, then drains it (spec 17 §17.3 "Event log write failures").
+///
+/// Returns whether the persist landed and every queued record is written,
+/// which the final close checkpoint requires. A failed persist keeps the
+/// record queued in memory (keep-direction); the close's teardown commit
+/// stores it and returns that persist's error.
+async fn queue_closing_record(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    context_id: &str,
+    closing_record: crate::context::state::LeafSpec,
+) -> bool {
+    let queued = cell
+        .commit_class_s_keep(deps, context_id, |mut view| {
+            view.enqueue_log_unit(vec![closing_record]);
+            Ok(())
+        })
+        .await;
+    if let Err(e) = &queued {
+        tracing::warn!(
+            context_id = %context_id,
+            error = %e,
+            "close: the persist that queues the ContextClosing record failed; \
+             the teardown persist stores it"
+        );
+        return false;
+    }
+    // The step is durable with its records queued; write them now. A failed
+    // drain leaves them queued for the actor's next drain and logs its own
+    // error, so it does not fail the step that already landed (spec 17 §17.3
+    // "Event log write failures").
+    let _ = drain_pending_log_units(cell, deps, context_id).await;
+    cell.class_s.pending_log_units.is_empty()
+}
+
 /// Builds and signs the final checkpoint a close records (§9.9.3). A refused
 /// or timed-out sign is logged and yields `None`: the close transition has
 /// already committed and must persist.
@@ -834,7 +878,7 @@ pub async fn close_context_with_key(
     let role_state = cell.role_state.clone();
 
     // Delegate to ttl::close_context for the lifecycle transition + role
-    // gate (async). The initiator assigns the `ContextClosing` leaf timestamp
+    // gate. The initiator assigns the `ContextClosing` leaf timestamp
     // from its own clock — the same value stamped on the outgoing close
     // commit. This is the convergent-by-construction value WHEN cross-member
     // leaf replication lands; the receive-side append path is currently
@@ -842,30 +886,37 @@ pub async fn close_context_with_key(
     // replicated to other members. Cross-member convergence is the forward
     // step under ADR-051 (§7.3.1, §9.9.3).
     //
-    // This `.await` runs BEFORE the Class-S persist below and does NOT mutate
+    // This call runs BEFORE the Class-S persist below and does NOT mutate
     // `PerContextState` (it drives the shared `handle` lifecycle FSM), so it
     // stays OUTSIDE the `_keep` combinator closure that wraps the subsequent
     // state mutations + fail-closed persist.
-    let result = ttl::close_context(
-        handle,
-        initiator_did,
-        &role_state,
-        deps.event_log.as_ref(),
-        deps.clock.now_secs(),
-    )
-    .await?;
+    let (result, closing_record) =
+        ttl::close_context(handle, initiator_did, &role_state, deps.clock.now_secs())?;
+
+    // The final checkpoint covers the whole log, so it waits for every queued
+    // record to be written.
+    let log_complete = queue_closing_record(cell, deps, &context_id, closing_record).await;
 
     // Final checkpoint before close (§9.9.3): capture the terminal event log
-    // state, including the `ContextClosing` leaf just appended, so equivocation
+    // state, including the `ContextClosing` record just drained, so equivocation
     // detection covers the full context lifetime. It is built and signed HERE,
     // before the synchronous Class-S combinator below, because signing awaits
     // custody (ADR-049 Decision 7a). The epoch is read before the broadcast
     // teardown, so a broadcast context's checkpoint carries no epoch
     // (§23.16.1). Best-effort: the close transition above has already
     // committed and must persist, so a refused or timed-out sign skips the
-    // checkpoint (logged) rather than aborting the close.
+    // checkpoint (logged) rather than aborting the close. A log still short of
+    // a queued record skips it the same way.
     let final_checkpoint = match signer {
         None => None,
+        Some(_) if !log_complete => {
+            tracing::warn!(
+                context_id = %context_id,
+                "final close checkpoint skipped: a queued event log record is not \
+                 yet written (§9.9.3)"
+            );
+            None
+        }
         Some(signer) => {
             let broadcast_context_is_none = cell.broadcast_context.is_none();
             let mls_epoch = cell.epoch.mls_epoch;
@@ -991,8 +1042,8 @@ pub async fn close_context_with_key(
 ///
 /// Validates the joiner's key package, performs the F4 escrow dance
 /// (economy + sybil + hard-rate-limit, then authorize, MLS add,
-/// sender-key distribute, membership mutate, capture), and appends a
-/// `MemberJoined` event.
+/// sender-key distribute, membership mutate, capture), and queues a
+/// `MemberJoined` record in the persist that records the join.
 ///
 /// Actor-owned state collapses the legacy three-phase lock dance. The
 /// actor's mailbox already serializes per-context commands, so each
@@ -1087,6 +1138,49 @@ pub async fn join_context(
         .params()
         .check_version_compatibility(scp_protocol::envelope::SCP_PROTOCOL_VERSION)?;
 
+    // The participation record's evidence and the log's Merkle root are read
+    // now, before any step, so a failed read refuses the join with nothing to
+    // roll back; nothing queues or drains between these reads and the Phase-4
+    // bookkeeping that uses them (spec 17 §17.3 "Event log write failures").
+    let evidence = crate::context::governance_logic::PreStepEvidence::read(
+        &cell.governance.consequence_rules,
+        &cell.class_s.pending_log_units,
+        &context_id,
+        deps.event_log.as_ref(),
+    )?;
+    let participation_root = crate::context::participation::ParticipationRoot::read(
+        &context_id,
+        deps.event_log.as_ref(),
+    )?;
+    // The `MemberJoined` record is planned before the step and queued in the
+    // Phase-3 commit that adds the member, so no stored state holds the added
+    // member without its record; [`JoinRollback`] withdraws the record in the
+    // commit that removes the member.
+    //
+    // Subject-bearing leaf (ADR-011 amendment): carry the joining member
+    // (`member_did`, which on a self-join already equals `actor_did`) and the
+    // default "member" role, so the leaf shape is uniform with admin-driven
+    // adds and the SDK reads `subject_did` consistently. The participation
+    // record (§7.3.2) attributes the join interval to this subject.
+    //
+    // Committer-assigned: the joining member's clock, read once as `now_secs`
+    // — the source of the `created_at` on its outgoing join commit.
+    // Convergent-by-construction WHEN cross-member leaf replication lands; the
+    // receive-side append path is currently dormant, so this leaf is
+    // committer-appended-only and is NOT yet replicated to other members.
+    // Cross-member convergence is the forward step under ADR-051 (§7.3.1,
+    // §9.9.3).
+    let now_secs = deps.clock.now_secs();
+    let joined_leaf = plan_membership_change_leaf(
+        scp_event_log::EventType::MemberJoined,
+        member_did.as_ref(),
+        &scp_event_log::payload::MembershipChangePayload {
+            subject_did: member_did.as_ref().to_owned(),
+            role_name: "member".to_owned(),
+        },
+        now_secs,
+    )?;
+
     // M13: Sybil resistance check BEFORE economy enforcement so that
     // a rejected sybil attacker doesn't consume budget. Fail-closed.
     // Read-only: routed through `&*cell` (the shared sybil-policy + governance
@@ -1102,7 +1196,6 @@ pub async fn join_context(
     // bucket). On any subsequent failure we refund the token. Class-C:
     // the hard-rate-limit consume + velocity record are routed through a
     // `class_c_view()` borrow that drops at the end of this block.
-    let now_secs = deps.clock.now_secs();
     let velocity_token = {
         let mut view = cell.class_c_view();
         let gov = view.governance_class_c_mut();
@@ -1239,21 +1332,56 @@ pub async fn join_context(
 
     // add_member + the joiner's sender-key distribution — one Class-S step
     // through the add-then-distribute helper the governance `AddMember` shares
-    // (spec 09 §9.16.9). On failure NO MLS rollback is needed (the add itself
-    // failed, so no member was added); a distribution that cannot be built
-    // keeps the add and is reported as not built.
+    // (spec 09 §9.16.9). A distribution that cannot be built keeps the add and
+    // is reported as not built.
     //
     // The same commit records the §9.10.4.1 membership trigger for the local
-    // member; the rollbacks below restore `rotation_before_add` with the MLS
-    // removal, so an add that does not commit triggers no rotation.
+    // member and queues the `MemberJoined` record (spec 17 §17.3 "Event log
+    // write failures"). A refused add applies nothing, so it needs no MLS
+    // rollback. An add whose persist failed stays applied in memory (keep
+    // direction) with its record queued, so it rolls back through
+    // [`JoinRollback`] like every later failure: the rollback restores
+    // `rotation_before_add` and withdraws the record with the MLS removal, so
+    // an add that does not commit triggers no rotation and leaves no record.
     let rotation_before_add = cell.class_s.pseudonym_rotation.clone();
+    let undo = JoinRollback {
+        local_did: &local_did,
+        member_did: &member_did,
+        context_id: &context_id,
+        context_id_bytes: &context_id_bytes,
+        rotation_before_add,
+        joined_leaf: &joined_leaf,
+    };
     let add_output = match cell
         .commit_class_s_keep(deps, &context_id, |mut v| {
-            add_member_and_queue_distribution(v.rest_mut(), deps, &member_did, kp_bytes)
+            let output =
+                add_member_and_queue_distribution(v.rest_mut(), deps, &member_did, kp_bytes)?;
+            v.enqueue_counted_log_unit(vec![joined_leaf.clone()]);
+            Ok(output)
         })
         .await
     {
         Ok(output) => output,
+        Err(e)
+            if cell
+                .class_s
+                .pending_log_units
+                .last_is_unwritten(std::slice::from_ref(&joined_leaf)) =>
+        {
+            return Err(undo
+                .run(
+                    cell,
+                    deps,
+                    JoinCharges {
+                        nonce_token: spending_nonce_token.take(),
+                        auth,
+                        ticket,
+                    },
+                    None,
+                    e,
+                )
+                .await);
+        }
         Err(e) => {
             // Keep-direction (ADR-049 §9): persist the burned nonce fail-closed
             // before the existing escrow-void + ticket rollback. Nonce-commit +
@@ -1291,177 +1419,123 @@ pub async fn join_context(
     )
     .await;
 
-    // Phase 4: Membership mutation. On failure: void escrow + rollback
-    // ticket + rollback MLS state. Routed through `cell.class_c_view()` — the
-    // membership / role / access / receive-buffer mutations are all Class-C.
+    // Phase 4: Membership mutation. Routed through `cell.class_c_view()` — the
+    // membership / role / access / receive-buffer mutations are all Class-C. A
+    // failure part-way may have cached a participation record and entered the
+    // member in the role state, so [`JoinRollback`] tears the member's state
+    // down with the MLS add.
+    let previous_participation = cell
+        .governance
+        .participation_cache
+        .get(member_did.as_ref())
+        .cloned();
     if let Err(e) = join_context_membership(
         &mut cell.class_c_view(),
         deps,
+        &evidence,
+        participation_root,
         &context_id,
         &member_did,
         add_output,
     ) {
-        // Roll back the MLS add on the actor's owned crypto (§9 Class-S).
-        let _ = cell
-            .commit_class_s_keep(deps, &context_id, |mut v| {
-                let s = v.rest_mut();
-                let _ = s.remove_member(&local_did, &member_did, deps.clock.as_ref());
-                // §9.10.4.1: the add did not commit, so neither does its
-                // membership trigger.
-                s.class_s.pseudonym_rotation = rotation_before_add;
-                s.remove_member_sender_key(&member_did)
-            })
-            .await;
-        // ADR-049 PR-6: prune the departed member's Class-M registry floors
-        // (member-granular; siblings + the local scalar retained).
-        deps.supervisor
-            .remove_member_floors(&context_id_bytes, &member_did);
-        // Keep-direction (ADR-049 §9): persist the burned nonce fail-closed
-        // before the existing escrow-void + ticket rollback.
-        let err = crate::context::messaging_helpers::commit_send_nonce_token_on_abort(
-            spending_nonce_token.take(),
-            &*cell,
-            deps,
-            &context_id,
-            e,
-        )
-        .await;
-        if let Some(a) = auth {
-            crate::context::economy_helpers::void_paid_action(deps, a, &context_id).await;
-        }
-        rollback_join_economy_ticket(cell, ticket);
-        return Err(err);
+        let membership = MembershipUndo {
+            previous_participation,
+            previous_pseudonym: None,
+            announced: false,
+        };
+        return Err(undo
+            .run(
+                cell,
+                deps,
+                JoinCharges {
+                    nonce_token: spending_nonce_token.take(),
+                    auth,
+                    ticket,
+                },
+                Some(membership),
+                e,
+            )
+            .await);
     }
 
     // Phase 4.5: Store local pseudonym after membership mutation succeeds.
     // §9.10.4: `set_local_pseudonym` is a no-op on a broadcast context (which
     // carries no pseudonym state), so this only updates encrypted contexts.
     // Routed through the Class-C routing view; the view drops immediately.
+    let previous_pseudonym = cell.routing.local_pseudonym();
     if let Some(pseudonym) = local_pseudonym {
         cell.class_c_view()
             .routing_mut()
             .set_local_pseudonym(pseudonym);
     }
 
-    // Phase 5: commit the economy ticket (in-memory budget debit) and append
-    // the join event, THEN durably persist, THEN settle the external escrow.
-    // Consume the ticket — commit returns the deducted cost and marks the
-    // ticket committed so the Drop guard stays quiet.
-    let deducted_cost = crate::context::economy_logic::commit_economy_ticket(ticket);
-
-    // Append MemberJoined event to event log.
+    // Phase 5: durably persist the join, THEN commit the economy ticket
+    // (in-memory budget debit), THEN settle the external escrow. The
+    // `MemberJoined` record already rides the Phase-3 add commit, so this
+    // persist queues nothing.
     //
-    // ADR-049 §9 (round-9 leak fix): the economy ticket was just committed
-    // (line above), so its `Drop` guard no longer rolls anything back — but the
-    // external escrow hold (`auth`, a `PaidActionAuthorization` that has NO
-    // `Drop` impl) is still HELD and uncaptured. The fail-closed persist + the
-    // success-path `capture_join_payment` both run AFTER this append. On this
-    // append's `Err`, the membership / MLS state already applied above is NOT
-    // reversed (it is Class-S security state that, like the consumed nonce, must
-    // persist — the joiner re-drives the idempotent join), but `auth` would
-    // otherwise drop silently WITHOUT voiding, leaking the hold and charging the
-    // joiner for an unacknowledged join. VOID the escrow here (gated on
-    // `auth.is_some()`) before returning — mirroring the money-ordering rule the
-    // persist-failure branch below already follows.
-    // Subject-bearing leaf (ADR-011 amendment): carry the joining member
-    // (`member_did`, which on a self-join already equals `actor_did`) and the
-    // default "member" role, so the leaf shape is uniform with admin-driven
-    // adds and the SDK reads `subject_did` consistently. The participation
-    // record (§7.3.2) attributes the join interval to this subject. A payload
-    // encoding failure is folded into the same `ContextError::EventLogFailed`
-    // the append would raise, so the fail-closed nonce/escrow handling below
-    // covers it identically.
-    //
-    // Committer-assigned: the joining member's clock (captured once above as
-    // `now_secs`) — the source of the `created_at` on its outgoing join commit.
-    // Convergent-by-construction WHEN cross-member leaf replication lands; the
-    // receive-side append path is currently dormant, so this leaf is
-    // committer-appended-only and is NOT yet replicated to other members.
-    // Cross-member convergence is the forward step under ADR-051 (§7.3.1,
-    // §9.9.3).
-    if let Err(e) = deps
-        .event_log
-        .append_membership_change_leaf(
-            crate::context::builder::AppendMode::AfterSideEffect,
-            &context_id_bytes,
-            scp_event_log::EventType::MemberJoined,
-            member_did.as_ref(),
-            &scp_event_log::payload::MembershipChangePayload {
-                subject_did: member_did.as_ref().to_owned(),
-                role_name: "member".to_owned(),
-            },
-            now_secs,
-        )
-        .await
-    {
-        // Keep-direction (ADR-049 §9): persist the burned nonce fail-closed
-        // before voiding the escrow hold (mirrors the money-ordering rule
-        // below). The membership / MLS state already applied is NOT reversed.
-        let err = crate::context::messaging_helpers::commit_send_nonce_token_on_abort(
-            spending_nonce_token.take(),
-            &*cell,
-            deps,
-            &context_id,
-            e,
-        )
-        .await;
-        if let Some(a) = auth {
-            crate::context::economy_helpers::void_paid_action(deps, a, &context_id).await;
-        }
-        return Err(err);
-    }
-    *cell.class_c_view().checkpoint_events_since_mut() += 1;
-
     // ADR-049 §9 Class S (BLACK-001): a PAID join consumed a spending-UCAN
     // nonce in Phase 1 (`enforce_join_economy` → `enforce_economy` →
     // `commit_spending_ucan_nonce`, mutating the actor-owned
     // `spending_nonce_tracker`) — the same Class-S monotonic state the
-    // message-send and outlet-invoke paths persist fail-closed. A best-effort
-    // persist here would let an actor crash in the ≤50ms coalesce window roll
-    // the nonce-consume back, freshening the spending UCAN's nonce after the
-    // joiner already saw the join succeed (replay / double-spend). Persist
-    // fail-closed when a spending nonce was committed (the same gating the
-    // send path uses: `deducted_cost.is_some() && spending_ucan.is_some()`):
-    // a persist failure returns an error so the join is NOT acknowledged. The
-    // membership / MLS state already applied above is NOT reversed — it is
-    // Class-S security state that, like the consumed nonce, must persist; the
-    // joiner re-drives the (now nonce-consumed, idempotent) join, and the
-    // surviving in-memory actor already holds the member. The consumed nonce
-    // stays CONSUMED (the fail-closed direction; un-consuming re-opens the
-    // replay window). A free / non-spending join keeps the best-effort persist
-    // — the common path is not regressed.
+    // message-send and outlet-invoke paths persist fail-closed. Its deferred
+    // token's owed persist is this persist (`discharge_with`). A free join
+    // persists through `commit_class_s_keep`, fail-closed too. On a persist
+    // failure the join is NOT acknowledged and rolls back through
+    // [`JoinRollback`] like every earlier failure: the member, its Phase-4
+    // state and its queued record leave memory together, and the ticket rolls
+    // back. The consumed nonce stays CONSUMED (the fail-closed direction;
+    // un-consuming re-opens the replay window), so the joiner's retry is
+    // idempotent.
     //
     // MONEY-ORDERING (round-7, mirrors the send path): the external escrow is
     // CAPTURED only AFTER the fail-closed persist succeeds. Capturing before
     // would charge the joiner (irreversible escrow settlement) and then hand
     // them an `Err` if the persist failed — a double-charge on retry. On
-    // persist failure we VOID the escrow hold instead (releasing the funds) so
-    // the charge is atomic with durability; the consumed nonce stays consumed,
-    // so the joiner's retry is idempotent and they are charged at most once.
-    // The deferred token is `Some` exactly on the paid (nonce-burning) branch —
-    // the same gating the legacy `deducted_cost.is_some() && spending_ucan.is_some()`
-    // expressed.
+    // persist failure the rollback VOIDS the escrow hold instead (releasing the
+    // funds) so the charge is atomic with durability. `auth`, a
+    // `PaidActionAuthorization`, has NO `Drop` impl, so the failure branch must
+    // void it or the hold leaks (round-9). The deferred token is `Some` exactly
+    // on the paid (nonce-burning) branch — the same gating the legacy
+    // `deducted_cost.is_some() && spending_ucan.is_some()` expressed.
     debug_assert_eq!(
         spending_nonce_token.is_some(),
-        deducted_cost.is_some() && spending_ucan.is_some(),
+        ticket.deducted_cost.is_some() && spending_ucan.is_some(),
         "spending-nonce token must be Some iff a paid join burned a nonce",
     );
-    if let Some(t) = spending_nonce_token.take() {
-        // Paid join: commit the deferred token (fail-closed persist, ADR-049 §9
-        // keep-direction). On failure release the escrow hold so the joiner is
-        // not charged for an unacknowledged join, then surface the error. The
-        // consumed nonce stays consumed. `t.commit` + `void_paid_action` take a
-        // shared `&PerContextState`, supplied via `&*cell`.
-        if let Err(e) = t.commit(&*cell, deps, &context_id).await {
-            if let Some(a) = auth {
-                crate::context::economy_helpers::void_paid_action(deps, a, &context_id).await;
-            }
-            return Err(e);
-        }
+    let persisted = if let Some(t) = spending_nonce_token.take() {
+        t.discharge_with(cell, deps, &context_id, |_view| Ok(()))
+            .await
     } else {
-        crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, &context_id)
-            .await;
+        cell.commit_class_s_keep(deps, &context_id, |_view| Ok(()))
+            .await
+    };
+    if let Err(e) = persisted {
+        let membership = MembershipUndo {
+            previous_participation,
+            previous_pseudonym: local_pseudonym.and(previous_pseudonym),
+            announced: true,
+        };
+        return Err(undo
+            .run(
+                cell,
+                deps,
+                JoinCharges {
+                    nonce_token: None,
+                    auth,
+                    ticket,
+                },
+                Some(membership),
+                e,
+            )
+            .await);
     }
+    let deducted_cost = crate::context::economy_logic::commit_economy_ticket(ticket);
+    // The step is durable with its records queued; write them now. A failed
+    // drain leaves them queued for the actor's next drain and logs its own
+    // error, so it does not fail the step that already landed (spec 17 §17.3
+    // "Event log write failures").
+    let _ = drain_pending_log_units(cell, deps, &context_id).await;
 
     // Durability has succeeded (or this is a free join): now settle the escrow.
     // `capture_join_payment` takes the cell so its escrow-capture `.await` runs
@@ -1469,6 +1543,179 @@ pub async fn join_context(
     capture_join_payment(cell, deps, auth, &member_did, &context_id, deducted_cost).await;
 
     Ok(())
+}
+
+/// What a [`join_context`] that fails after its Phase-3 MLS add takes back.
+///
+/// The Phase-3 add commit applies the MLS add and the §9.10.4.1 membership
+/// trigger and queues the `MemberJoined` record together, so the rollback
+/// removes all three in one commit: the stored state never holds the member
+/// without its record, or the record without the member (spec 17 §17.3 "Event
+/// log write failures").
+struct JoinRollback<'a> {
+    /// The local member, who removes the joiner from the MLS group.
+    local_did: &'a str,
+    /// The joiner.
+    member_did: &'a DID,
+    /// The context, hex-encoded.
+    context_id: &'a str,
+    /// The context's 32-byte id, which keys the registry floors.
+    context_id_bytes: &'a [u8; 32],
+    /// The §9.10.4.1 rotation state read before the add.
+    rotation_before_add: crate::context::actor::pseudonym_rotation::PseudonymRotationState,
+    /// The `MemberJoined` record the add commit queued.
+    joined_leaf: &'a crate::context::state::LeafSpec,
+}
+
+/// The join's Phase-1 and Phase-2 charges a [`JoinRollback`] settles.
+struct JoinCharges {
+    /// The deferred persist of a burned spending nonce, on a paid join that
+    /// has not persisted it yet.
+    nonce_token: Option<crate::context::actor::class_s::ClassSCommitToken>,
+    /// The escrow hold, voided by the rollback.
+    auth: Option<crate::context::economy_logic::PaidActionAuthorization>,
+    /// The Phase-1 economy ticket, rolled back.
+    ticket: crate::context::economy_logic::EconomyTicket,
+}
+
+/// The Phase-4 membership state a [`JoinRollback`] takes back as well, once
+/// [`join_context_membership`] has run.
+struct MembershipUndo {
+    /// The joiner's participation record cached before Phase 4, restored in
+    /// place of the one Phase 4 cached.
+    previous_participation: Option<crate::context::participation::RootedParticipationRecord>,
+    /// The local pseudonym before Phase 4.5 set a new one; `None` when Phase
+    /// 4.5 changed nothing. A pseudonymous (encrypted) context's routing
+    /// always holds a pseudonym, so "no pseudonym before the join" exists
+    /// only on a broadcast context, where Phase 4.5 sets nothing; the rollback
+    /// therefore never has a pseudonym to clear, only one to put back.
+    previous_pseudonym: Option<[u8; 32]>,
+    /// True once Phase 4 emitted `MemberJoined` to subscribers, so the
+    /// rollback emits `MemberLeft` for the same member.
+    announced: bool,
+}
+
+impl JoinRollback<'_> {
+    /// Removes the joiner from the MLS group, restores the rotation state,
+    /// withdraws the queued `MemberJoined` record, prunes the joiner's sender
+    /// key, and tears down any Phase-4 state, all in one fail-closed keep
+    /// commit; then prunes the registry floors, persists a burned spending
+    /// nonce, voids the escrow hold, and rolls the economy ticket back.
+    ///
+    /// Returns the error the join returns: `cause`, or the nonce persist's
+    /// error when that persist fails. A rollback commit whose persist fails is
+    /// logged and does not replace `cause`; its changes stay in memory (keep
+    /// direction), and the stored state keeps the member with its record
+    /// queued until the next persist replaces it.
+    async fn run(
+        self,
+        cell: &mut crate::context::actor::class_s::ClassSCell,
+        deps: &ActorDeps,
+        charges: JoinCharges,
+        membership: Option<MembershipUndo>,
+        cause: ContextError,
+    ) -> ContextError {
+        let JoinCharges {
+            nonce_token,
+            auth,
+            ticket,
+        } = charges;
+        let Self {
+            local_did,
+            member_did,
+            context_id,
+            context_id_bytes,
+            rotation_before_add,
+            joined_leaf,
+        } = self;
+        let committed = cell
+            .commit_class_s_keep(deps, context_id, |mut v| {
+                if !v.withdraw_counted_log_unit(std::slice::from_ref(joined_leaf)) {
+                    tracing::error!(
+                        context_id,
+                        member = %member_did,
+                        "join rollback found no queued MemberJoined record to withdraw"
+                    );
+                }
+                let s = v.rest_mut();
+                if let Err(e) = s.remove_member(local_did, member_did, deps.clock.as_ref()) {
+                    tracing::warn!(
+                        context_id,
+                        member = %member_did,
+                        error = %e,
+                        "join rollback could not remove the member from the MLS group"
+                    );
+                }
+                // §9.10.4.1: the add did not commit, so neither does its
+                // membership trigger.
+                s.class_s.pseudonym_rotation = rotation_before_add;
+                if let Some(undo) = membership {
+                    s.remove_member_state(context_id, member_did);
+                    match undo.previous_participation {
+                        Some(record) => {
+                            s.governance
+                                .participation_cache
+                                .insert(member_did.to_string(), record);
+                        }
+                        None => {
+                            s.governance.participation_cache.remove(member_did.as_ref());
+                        }
+                    }
+                    if let Some(pseudonym) = undo.previous_pseudonym {
+                        s.routing.set_local_pseudonym(pseudonym);
+                    }
+                    if undo.announced {
+                        state::emit_event_into(
+                            &mut s.receive_buffer,
+                            ContextEvent::MemberLeft {
+                                member_did: member_did.clone(),
+                            },
+                            context_id,
+                            deps.event_tx.as_ref(),
+                        );
+                    }
+                }
+                if let Err(e) = s.remove_member_sender_key(member_did) {
+                    tracing::warn!(
+                        context_id,
+                        member = %member_did,
+                        error = %e,
+                        "join rollback could not prune the member's sender key"
+                    );
+                }
+                Ok(())
+            })
+            .await;
+        if let Err(persist_err) = committed {
+            tracing::error!(
+                context_id,
+                member = %member_did,
+                error = %persist_err,
+                cause = %cause,
+                "join rollback did not persist; memory holds the rollback, and the \
+                 stored state keeps the member with its MemberJoined record queued"
+            );
+        }
+        // ADR-049 PR-6: prune the departed member's Class-M registry floors
+        // (member-granular; siblings + the local scalar retained).
+        deps.supervisor
+            .remove_member_floors(context_id_bytes, member_did);
+        // Keep-direction (ADR-049 §9): persist the burned nonce fail-closed
+        // before the escrow-void + ticket rollback.
+        let err = crate::context::messaging_helpers::commit_send_nonce_token_on_abort(
+            nonce_token,
+            &*cell,
+            deps,
+            context_id,
+            cause,
+        )
+        .await;
+        if let Some(a) = auth {
+            crate::context::economy_helpers::void_paid_action(deps, a, context_id).await;
+        }
+        rollback_join_economy_ticket(cell, ticket);
+        err
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1493,6 +1740,8 @@ pub async fn join_context(
 pub fn join_context_membership(
     view: &mut crate::context::actor::class_s::ClassCMut<'_>,
     deps: &ActorDeps,
+    evidence: &crate::context::governance_logic::PreStepEvidence,
+    participation_root: crate::context::participation::ParticipationRoot,
     context_id: &str,
     member_did: &DID,
     add_output: scp_protocol::context::builder::AddMemberOutput,
@@ -1504,14 +1753,18 @@ pub fn join_context_membership(
     // once (the `ConsequenceStateSplit` shape); the split drops before the
     // role / membership / access mutations below re-borrow the view.
     {
+        // `evidence` and `participation_root` are the log, the queued units,
+        // and the log's Merkle root that [`join_context`] read before the MLS
+        // add (spec 17 §17.3 "Event log write failures").
         let mut split = view.split_class_c();
         crate::context::lifecycle_logic::post_join_bookkeeping(
             split.governance.participation_cache_mut(),
             split.receive_buffer,
+            evidence,
+            participation_root,
             context_id,
             member_did,
             deps.clock.now_secs(),
-            deps.event_log.as_ref(),
         );
     }
 
@@ -1858,7 +2111,7 @@ pub(in crate::context) async fn create_context(
     // §6.2.4 cross-context outlet saga compares `target_context_id` against on
     // the wire, and the bytes the creation crypto (builder) keys under.
     let context_id_bytes = state::context_id_to_bytes(&context_id);
-    // ADR-049 PR-4 §5: create-seed the supervisor floor registry so a
+    // ADR-049 Decision 9 (Class M): create-seed the supervisor floor registry so a
     // default-empty entry exists from creation (it then grows via
     // mirror-forward). Insert-if-absent — never resets an advanced entry.
     deps.supervisor.seed_context_floors(&context_id_bytes)?;
@@ -1950,6 +2203,9 @@ pub(in crate::context) async fn create_context(
         // interface state, never authorization secrecy.
         xctx_ucan_proofs: scp_protocol::crypto::ucan::validate::InMemoryProofResolver::new(),
         class_s: crate::context::actor::state::ClassSState {
+            // Spec 17 §17.3: a new context has no queued log unit and no log fault.
+            pending_log_units: crate::context::actor::class_s::PendingLogUnits::default(),
+            log_fault: None,
             saga_pending: HashMap::new(),
             xctx_committed_outputs: HashMap::new(),
             xctx_committed_stream_outputs: HashMap::new(),
@@ -3297,6 +3553,17 @@ pub(in crate::context) async fn import_context(
         &export.event_log_data,
     )
     .await?;
+    // The imported log, as the provider verified and stored it, read before
+    // the spawn for the TTL arm in step 8. The imported actor starts with an
+    // empty queue, so the export's queued units are not evidence this node
+    // will ever hold, and the read counts none of them. An export with no log
+    // fails the import here, before any actor starts; an absent log is never
+    // read as an empty one (spec section 17.3, "Event log write failures").
+    let import_log = crate::context::governance_logic::LogAndQueue::read(
+        std::iter::empty(),
+        &context_id,
+        deps.event_log.as_ref(),
+    )?;
 
     // 4. Reconstruct the ContextHandle.
     let handle = ContextHandle::new(context_id.clone(), export.snapshot.context_params.clone());
@@ -3625,6 +3892,9 @@ pub(in crate::context) async fn import_context(
         // interface state, never authorization secrecy.
         xctx_ucan_proofs: scp_protocol::crypto::ucan::validate::InMemoryProofResolver::new(),
         class_s: crate::context::actor::state::ClassSState {
+            // Spec 17 §17.3: a new context has no queued log unit and no log fault.
+            pending_log_units: crate::context::actor::class_s::PendingLogUnits::default(),
+            log_fault: None,
             saga_pending: HashMap::new(),
             xctx_committed_outputs: HashMap::new(),
             xctx_committed_stream_outputs: HashMap::new(),
@@ -3735,10 +4005,8 @@ pub(in crate::context) async fn import_context(
     //
     // The base is `ttl_base_secs`: the committed `T0`, or the snapshot's
     // recorded creation timestamp on a keyless import (see its definition).
-    let import_log_entries: Vec<scp_event_log::Event> =
-        rmp_serde::from_slice(&export.event_log_data).unwrap_or_default();
     let ttl = crate::context::ttl_close_helpers::convergent_ttl_deadline(
-        &import_log_entries,
+        &import_log,
         ttl_base_secs,
         handle.params().ttl.map(|t| t.as_secs()),
     )
@@ -3963,6 +4231,11 @@ pub async fn restore_context(
         &ctx_snapshot.context_params.consequence_config,
     )?;
     validate_context_params_for_import(&ctx_snapshot.context_params)?;
+    // The queued log units enter the actor's queue only after each unit is
+    // checked as an enqueue would have checked it (spec 17 §17.3).
+    let pending_log_units = crate::context::actor::class_s::PendingLogUnits::validated(
+        std::mem::take(&mut ctx_snapshot.pending_log_units),
+    )?;
 
     // Ceiling-entry grammar enforcement on the RESTORED ceiling (spec §5.3.1.1).
     // This is the self-respawn / process-restart path reading a LOCAL snapshot.
@@ -4092,19 +4365,21 @@ pub async fn restore_context(
     // (H1).
     let restore_ttl_base_secs =
         restore_committed_t0.unwrap_or(ctx_snapshot.creation_timestamp_secs);
-    // An unreadable log fails the restore; it is never read as an empty one
-    // (spec section 17.3, "Event log write failures").
-    let restore_log_entries = deps
-        .event_log
-        .event_log_entries(&context_id_to_bytes(context_id))
-        .map_err(|e| {
-            ContextError::EventLogFailed(format!(
-                "reading the restored event log of context {context_id} failed: {e}"
-            ))
-        })?
-        .unwrap_or_default();
+    // The log plus the snapshot's queued units, so a `TtlExtended` entry still
+    // queued counts. An unreadable or absent log fails the restore; neither is
+    // read as an empty one (spec section 17.3, "Event log write failures").
+    let restore_log = crate::context::governance_logic::LogAndQueue::read(
+        pending_log_units.iter(),
+        context_id,
+        deps.event_log.as_ref(),
+    )
+    .map_err(|e| {
+        ContextError::EventLogFailed(format!(
+            "reading the restored event log of context {context_id} failed: {e}"
+        ))
+    })?;
     let restore_ttl_deadline = crate::context::ttl_close_helpers::convergent_ttl_deadline(
-        &restore_log_entries,
+        &restore_log,
         restore_ttl_base_secs,
         handle.params().ttl.map(|t| t.as_secs()),
     );
@@ -4354,6 +4629,11 @@ pub async fn restore_context(
         // interface is (re-)established.
         xctx_ucan_proofs: scp_protocol::crypto::ucan::validate::InMemoryProofResolver::new(),
         class_s: crate::context::actor::state::ClassSState {
+            // Spec 17 §17.3, ADR-049 §9 Class S: same-node restore REHYDRATES the
+            // queued log units and the log fault; the actor drains the queue when it
+            // starts.
+            pending_log_units,
+            log_fault: ctx_snapshot.log_fault,
             saga_pending: ctx_snapshot
                 .saga_pending
                 .into_iter()
@@ -4585,6 +4865,25 @@ pub async fn restore_all_contexts(
         };
 
         if ctx_snapshot.state != scp_protocol::context::ContextState::Active {
+            // A context that is not Active gets no actor. Its queued log units
+            // are written by the drain-only pass, which makes no transition
+            // (spec 17 §17.3 "Event log write failures", "Restart"). A failed
+            // pass leaves them stored for the next restore.
+            if !ctx_snapshot.pending_log_units.is_empty() || ctx_snapshot.log_fault.is_some() {
+                match supervisor.drain_dormant_context(ctx_id).await {
+                    Ok(drained) => tracing::info!(
+                        context_id = %ctx_id,
+                        ?drained,
+                        "drain-only pass wrote the dormant context's queued log units"
+                    ),
+                    Err(e) => tracing::error!(
+                        context_id = %ctx_id,
+                        error = %e,
+                        "drain-only pass over the dormant snapshot failed; its queued log units \
+                         stay stored"
+                    ),
+                }
+            }
             continue;
         }
 
@@ -5046,7 +5345,17 @@ mod restore_reconcile_tests {
             _context_id: &[u8; 32],
         ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
         {
-            Ok(None)
+            Ok(Some(Vec::new()))
+        }
+
+        /// The fixture holds no entry, so its root is the empty log's root.
+        fn event_log_merkle_root(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok(scp_event_log::tree::root(&scp_event_log::EventLog::new(
+                String::new(),
+            )))
         }
 
         async fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
@@ -5080,7 +5389,15 @@ mod restore_reconcile_tests {
             _context_id: &[u8; 32],
         ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
         {
-            Ok(None)
+            Ok(Some(Vec::new()))
+        }
+
+        /// The fixture holds no entry, so its root is the empty log's root.
+        fn event_log_merkle_root(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok(crate::context::participation::test_support::empty_tree_root())
         }
 
         async fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
@@ -6479,15 +6796,14 @@ mod restore_reconcile_tests {
             .expect("join_context_membership follows join_context");
         let body = &rest[..end_rel];
 
-        // ADR-049 §9: the paid path's fail-closed persist now rides the deferred
-        // `ClassSCommitToken`'s `commit` (which calls `persist_state_fail_closed`
-        // internally) rather than an inline `persist_state_fail_closed` call. The
-        // Phase-5 commit site is the `t.commit(&*cell, deps, &context_id)` below
-        // (the cell seam routes the shared persist through `&*cell`); the ordering
-        // invariant is asserted relative to it.
+        // ADR-049 §9: the paid path's fail-closed persist rides the deferred
+        // `ClassSCommitToken`'s `discharge_with` (which calls
+        // `persist_state_fail_closed` internally) rather than an inline
+        // `persist_state_fail_closed` call. The ordering invariant is asserted
+        // relative to that Phase-5 site.
         let persist_idx = body
-            .find("t.commit(&*cell, deps, &context_id)")
-            .expect("join_context must commit the deferred fail-closed token on the paid path");
+            .find("t.discharge_with(cell, deps, &context_id")
+            .expect("join_context must discharge the deferred fail-closed token on the paid path");
         let capture_idx = body
             .find("capture_join_payment(")
             .expect("join_context must capture the escrow");
@@ -6500,15 +6816,23 @@ mod restore_reconcile_tests {
         );
 
         // The persist-failure branch (between the fail-closed persist and the
-        // success-path capture) MUST void the escrow. `void_paid_action` also
-        // appears in the earlier MLS-rollback branches, so search the slice
-        // AFTER the persist call for the failure escape hatch specifically.
+        // success-path capture) MUST void the escrow. It rolls the join back
+        // through `JoinRollback::run`, which voids the hold it is handed.
         let post_persist = &body[persist_idx..capture_idx];
         assert!(
-            post_persist.contains("void_paid_action(deps, a, &context_id)"),
-            "the persist-failure branch must void the escrow (between the \
-             fail-closed persist and the success-path capture) so a durability \
-             failure releases the hold instead of charging the joiner"
+            post_persist.contains("undo\n            .run(") && post_persist.contains("auth,"),
+            "the persist-failure branch must hand the escrow hold to the join \
+             rollback (between the fail-closed persist and the success-path \
+             capture) so a durability failure releases the hold instead of \
+             charging the joiner"
+        );
+        let rollback = &SRC[SRC
+            .find("impl JoinRollback<'_> {")
+            .expect("JoinRollback exists")..];
+        let rollback = &rollback[..rollback.find("\n}\n").expect("the impl ends")];
+        assert!(
+            rollback.contains("void_paid_action(deps, a, context_id)"),
+            "the join rollback voids the escrow hold"
         );
     }
 
@@ -6587,7 +6911,6 @@ mod restore_reconcile_tests {
             &mut cell,
             &deps,
             &context_id,
-            &context_id_bytes,
             &sender,
             reserved,
             b"payload",
@@ -6596,8 +6919,9 @@ mod restore_reconcile_tests {
                     ed25519_dalek::SigningKey::from_bytes(&[0x5au8; 32]),
                 ),
             ),
-            None,  // no spending-nonce token (free send) — keeps best-effort persist
-            false, // is_broadcast
+            &[],
+            crate::context::participation::ParticipationRoot::read(&context_id, &*deps.event_log)
+                .expect("the root reads before the send"),
         )
         .await;
         let mut state = cell.into_inner();
@@ -6621,22 +6945,22 @@ mod restore_reconcile_tests {
         );
     }
 
-    /// ADR-049 §9 (round-9 leak fix) — STRUCTURAL. In `join_context`, the
-    /// `MemberJoined` `append_context_event` runs AFTER the economy ticket is
-    /// committed but while the external escrow hold (`auth`, a
-    /// `PaidActionAuthorization` with NO `Drop`) is still held and uncaptured.
-    /// On that append's `Err`, `auth` would otherwise drop WITHOUT voiding —
-    /// leaking the hold and charging the joiner for an unacknowledged join. The
-    /// runtime tail (post-commit, pre-capture) is reached only by the not-yet-
-    /// wired explicit paid-acceptance flow (the public entry rejects an
+    /// ADR-049 §9 (round-9 leak fix) — STRUCTURAL. In `join_context` the
+    /// `MemberJoined` record writes nothing to the log after the step: it is
+    /// queued once, in the Phase-3 commit that adds the member (spec 17 §17.3
+    /// "Event log write failures"), and the economy ticket is committed only
+    /// after the Phase-5 persist lands. That persist's failure branch must hand
+    /// the external escrow hold (`auth`, a `PaidActionAuthorization` with NO
+    /// `Drop`) to the join rollback before the success-path capture, or the
+    /// hold leaks and the joiner is charged for an unacknowledged join. The
+    /// runtime tail (post-commit, pre-capture) is reached only by the
+    /// not-yet-wired explicit paid-acceptance flow (the public entry rejects an
     /// auto-accept paid join at SCP-ECON-12030 first — see
-    /// `paid_join_blocked_at_auto_accept_guard_touches_no_escrow`), so this is a
-    /// STRUCTURAL assertion on the real `join_context` body, mirroring
-    /// `paid_join_captures_escrow_after_persist_not_before`: the `MemberJoined`
-    /// append's failure branch — which sits BETWEEN the ticket commit and the
-    /// fail-closed persist — MUST void the escrow.
+    /// `paid_join_blocked_at_auto_accept_guard_touches_no_escrow`), so this is
+    /// a STRUCTURAL assertion on the real `join_context` body, mirroring
+    /// `paid_join_captures_escrow_after_persist_not_before`.
     #[test]
-    fn join_context_voids_escrow_on_member_joined_append_failure() {
+    fn join_context_queues_member_joined_in_the_add_commit() {
         const SRC: &str = include_str!("lifecycle_helpers.rs");
 
         let start = SRC
@@ -6648,41 +6972,56 @@ mod restore_reconcile_tests {
             .expect("join_context_membership follows join_context");
         let body = &rest[..end_rel];
 
-        // The economy ticket is committed here; AFTER this point `auth` is the
-        // only un-Drop-guarded reservation still live.
+        assert!(
+            !body.contains(".append_membership_change_leaf("),
+            "join_context writes no record to the log after its step"
+        );
+        let add_idx = body
+            .find("add_member_and_queue_distribution(v.rest_mut(), deps, &member_did, kp_bytes)")
+            .expect("join_context must add the member and queue its distribution");
+        let deliver_idx = body
+            .find("drain_and_deliver_sender_keys(")
+            .expect("join_context must deliver the queued sender-key distribution");
+        let failure_idx = body
+            .find("if let Err(e) = persisted")
+            .expect("join_context must branch on the Phase-5 persist's failure");
         let commit_idx = body
             .find("commit_economy_ticket(ticket)")
-            .expect("join_context must commit the economy ticket before the append");
-        // The MemberJoined append is the next fallible step after the commit.
-        let append_idx = body
-            .find("EventType::MemberJoined")
-            .expect("join_context must append a MemberJoined event");
-        assert!(
-            commit_idx < append_idx,
-            "the MemberJoined append must follow the ticket commit"
+            .expect("join_context must commit the economy ticket");
+        let capture_idx = body
+            .find("capture_join_payment(")
+            .expect("join_context must capture the escrow");
+        let enqueues: Vec<usize> = body
+            .match_indices("enqueue_counted_log_unit(")
+            .map(|(idx, _)| idx)
+            .collect();
+        assert_eq!(
+            enqueues,
+            vec![
+                body.find("v.enqueue_counted_log_unit(vec![joined_leaf.clone()])")
+                    .expect("the add commit queues the MemberJoined record")
+                    + "v.".len()
+            ],
+            "the MemberJoined record is queued exactly once"
         );
-
-        // The fail-closed persist runs after the append; the append-failure
-        // branch sits strictly between commit and that persist. ADR-049 §9: the
-        // paid path's fail-closed persist now rides the deferred token's
-        // `t.commit(&*cell, deps, &context_id)` (Phase 5; cell seam).
-        let persist_idx = body
-            .find("t.commit(&*cell, deps, &context_id)")
-            .expect("join_context must commit the deferred fail-closed token on the paid path");
         assert!(
-            append_idx < persist_idx,
-            "the MemberJoined append must precede the fail-closed persist"
+            add_idx < enqueues[0] && enqueues[0] < deliver_idx,
+            "the record is queued in the Phase-3 add commit, before the delivery"
         );
-
-        // The slice from the append to the fail-closed persist contains the
-        // append's Err branch. It MUST void the escrow — otherwise `auth` drops
-        // silently (no Drop impl) and the hold leaks.
-        let append_to_persist = &body[append_idx..persist_idx];
         assert!(
-            append_to_persist.contains("void_paid_action(deps, a, &context_id)"),
-            "the MemberJoined append-failure branch (between the ticket commit and \
-             the fail-closed persist) must void the escrow so a failing append \
-             releases the hold instead of leaking it (ADR-049 §9 round-9)"
+            body.contains("withdraw_counted_log_unit(std::slice::from_ref(joined_leaf))"),
+            "the join rollback withdraws the queued record"
+        );
+        assert!(
+            failure_idx < commit_idx && commit_idx < capture_idx,
+            "the ticket is committed after the Phase-5 persist's failure branch \
+             and before the success-path capture"
+        );
+        assert!(
+            body[failure_idx..commit_idx].contains("auth,"),
+            "the Phase-5 persist-failure branch must hand the escrow hold to the \
+             join rollback so a failed persist releases the hold instead of \
+             leaking it (ADR-049 §9 round-9)"
         );
     }
 
@@ -6988,6 +7327,438 @@ mod restore_reconcile_tests {
         );
     }
 
+    /// A leave whose `MemberLeft` record the log refuses still lands: the
+    /// removal persists with the record queued in the same persist, the leave
+    /// returns `Ok`, and the log is unchanged (spec 17 §17.3 "Event log write
+    /// failures").
+    #[tokio::test]
+    async fn leave_append_failure_after_side_effect_keeps_step_and_queues_leaf() {
+        use crate::context::log_unit_helpers::test_support;
+        use scp_protocol::context::broadcast::{BroadcastAdmission, BroadcastContext};
+
+        let admin = DID("did:dht:z6MkLeaveQueuesAdmin".to_owned());
+        let context_id = hex::encode([0x4cu8; 32]);
+        let context_id_bytes = crate::context::state::context_id_to_bytes(&context_id);
+        let (deps, faulty, snapshots) =
+            test_support::deps_over_faulty_log(admin.as_ref(), &context_id).await;
+
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_broadcast(
+            context_id_bytes,
+            scp_clock::Clock::now_secs(&scp_clock::SystemClock),
+            admin.clone(),
+        );
+        let leaver = DID("did:dht:z6MkQueuedLeaver".to_owned());
+        state
+            .membership
+            .add_member(leaver.clone(), "member".to_owned(), Vec::new());
+        state.broadcast_context = Some(
+            BroadcastContext::new(
+                context_id.clone(),
+                &ContextMode::Broadcast,
+                BroadcastAdmission::Open,
+            )
+            .expect("broadcast context"),
+        );
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .unwrap();
+        let handle = ContextHandle::new(context_id.clone(), state.handle.params().clone());
+        handle
+            .transition_to(&crate::context::ContextState::Active)
+            .unwrap();
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
+        let credited_before = cell.checkpoint_events_since;
+
+        test_support::fail_log_entry_writes(&faulty, &context_id_bytes);
+        let log_before = test_support::log_len(&deps, &context_id_bytes);
+
+        let result =
+            lifecycle_helpers::leave_context(&mut cell, &deps, &handle, &leaver, &leaver).await;
+
+        assert!(
+            result.is_ok(),
+            "a refused MemberLeft write must not fail a leave whose removal \
+             persisted: got {result:?}"
+        );
+        assert!(
+            !cell.membership.contains(leaver.as_ref()),
+            "the removal stays applied"
+        );
+        let expected = vec![vec![scp_event_log::EventType::MemberLeft]];
+        assert_eq!(
+            test_support::queued_unit_types(&cell.class_s.pending_log_units),
+            expected,
+            "the MemberLeft record stays queued"
+        );
+        assert_eq!(
+            snapshots.persisted_unit_types(&context_id).await,
+            expected,
+            "the record rides the persist that recorded the removal"
+        );
+        assert_eq!(
+            cell.checkpoint_events_since,
+            credited_before + 1,
+            "the queued record is credited once"
+        );
+        assert_eq!(
+            test_support::log_len(&deps, &context_id_bytes),
+            log_before,
+            "the refused record never reached the log"
+        );
+    }
+
+    /// An encrypted, Active cell a free join can reach, with its handle. With
+    /// `seed_sender_key` false the cell has no sender key, so the join's
+    /// sender-key distribution fails after the MLS add and the join rolls back.
+    fn joinable_cell(
+        context_id: &str,
+        admin: &DID,
+        seed_sender_key: bool,
+    ) -> (crate::context::actor::class_s::ClassSCell, ContextHandle) {
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            crate::context::state::context_id_to_bytes(context_id),
+            scp_clock::Clock::now_secs(&scp_clock::SystemClock),
+            admin.clone(),
+        );
+        // The join assigns the built-in "member" role, which must be defined
+        // within the ceiling, as `create_context` installs it.
+        let ceiling = scp_protocol::context::roles::CapabilityCeiling::new([
+            scp_protocol::context::roles::Capability::MemberInvite,
+            scp_protocol::context::roles::Capability::MessagesWrite,
+            scp_protocol::context::roles::Capability::MessagesRead,
+        ]);
+        state
+            .role_state
+            .set_ceiling(ceiling.clone())
+            .expect("well-formed built-in ceiling");
+        for role in scp_protocol::context::roles::builtin_roles(&ceiling) {
+            state
+                .role_state
+                .role_definitions
+                .insert(role.name.clone(), role);
+        }
+        if seed_sender_key && let Some(crypto) = state.mode.crypto_mut() {
+            crypto.sender_key = Some(scp_protocol::crypto::sender_keys::generate_sender_key());
+        }
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .unwrap();
+        let handle = ContextHandle::new(context_id.to_owned(), state.handle.params().clone());
+        handle
+            .transition_to(&crate::context::ContextState::Active)
+            .unwrap();
+        (
+            crate::context::actor::class_s::ClassSCell::new(state),
+            handle,
+        )
+    }
+
+    /// A join whose `MemberJoined` record the log refuses still lands: the
+    /// Phase-5 persist records the member with the record queued, the join
+    /// returns `Ok`, and the log is unchanged (spec 17 §17.3 "Event log write
+    /// failures").
+    #[tokio::test]
+    async fn join_append_failure_after_side_effect_keeps_step_and_queues_leaf() {
+        use crate::context::log_unit_helpers::test_support;
+
+        let admin = DID("did:dht:z6MkJoinQueuesAdmin".to_owned());
+        let context_id = hex::encode([0x4au8; 32]);
+        let context_id_bytes = crate::context::state::context_id_to_bytes(&context_id);
+        let (deps, faulty, snapshots) =
+            test_support::deps_over_faulty_log(admin.as_ref(), &context_id).await;
+        let (mut cell, handle) = joinable_cell(&context_id, &admin, true);
+        let credited_before = cell.checkpoint_events_since;
+
+        test_support::fail_log_entry_writes(&faulty, &context_id_bytes);
+        let log_before = test_support::log_len(&deps, &context_id_bytes);
+
+        let joiner = DID("did:dht:z6MkQueuedJoiner".to_owned());
+        let result = lifecycle_helpers::join_context(
+            &mut cell,
+            &deps,
+            &handle,
+            scp_protocol::context::membership::KeyPackage::mock(joiner.clone()),
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "a refused MemberJoined write must not fail a join whose persist \
+             landed: got {result:?}"
+        );
+        assert!(
+            cell.membership.contains(joiner.as_ref()),
+            "the member stays joined"
+        );
+        let expected = vec![vec![scp_event_log::EventType::MemberJoined]];
+        assert_eq!(
+            test_support::queued_unit_types(&cell.class_s.pending_log_units),
+            expected,
+            "the MemberJoined record stays queued"
+        );
+        assert_eq!(
+            snapshots.persisted_unit_types(&context_id).await,
+            expected,
+            "the record rides the persist that recorded the join"
+        );
+        assert_eq!(
+            cell.checkpoint_events_since,
+            credited_before + 1,
+            "the queued record is credited once"
+        );
+        assert_eq!(
+            test_support::log_len(&deps, &context_id_bytes),
+            log_before,
+            "the refused record never reached the log"
+        );
+    }
+
+    /// Spec 17 §17.3 ("Event log write failures"): the join reads the
+    /// participation root beside its evidence, before the MLS add, so a root
+    /// that cannot be read refuses the join with no member added, nothing
+    /// queued or persisted, and no participation record cached.
+    #[tokio::test]
+    async fn join_refuses_when_the_participation_root_read_fails() {
+        use crate::context::log_unit_helpers::test_support;
+
+        let admin = DID("did:dht:z6MkJoinRootAdmin".to_owned());
+        let context_id = hex::encode([0x4cu8; 32]);
+        let (deps, snapshots) =
+            test_support::deps_over_root_refusing_log(admin.as_ref(), &context_id).await;
+        let (mut cell, handle) = joinable_cell(&context_id, &admin, true);
+
+        let joiner = DID("did:dht:z6MkRootRefusedJoiner".to_owned());
+        let result = lifecycle_helpers::join_context(
+            &mut cell,
+            &deps,
+            &handle,
+            scp_protocol::context::membership::KeyPackage::mock(joiner.clone()),
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(&result, Err(ContextError::EventLogFailed(_))),
+            "the join fails with the root read error: got {result:?}"
+        );
+        assert!(
+            !cell.membership.contains(joiner.as_ref()),
+            "the refused joiner is not a member"
+        );
+        assert!(
+            cell.governance.participation_cache.is_empty(),
+            "no participation record is cached"
+        );
+        assert!(
+            cell.class_s.pending_log_units.is_empty(),
+            "no record is queued"
+        );
+        assert!(
+            snapshots.snapshot(&context_id).await.is_none(),
+            "nothing is persisted"
+        );
+    }
+
+    /// A join that rolls back after its MLS add leaves no `MemberJoined`
+    /// record, in memory or in the stored state: the Phase-3 add commit queues
+    /// the record, and the rollback withdraws it with the member (spec 17
+    /// §17.3 "Event log write failures"). The add commit's own persist fails
+    /// here, so the add stays applied in memory with its record queued (keep
+    /// direction) and the join rolls back through `JoinRollback`. A failed
+    /// sender-key distribution no longer rolls a join back (spec 09 §9.16.9).
+    #[tokio::test]
+    async fn join_rolled_back_after_the_mls_add_queues_no_member_joined() {
+        use crate::context::log_unit_helpers::test_support;
+
+        let admin = DID("did:dht:z6MkJoinRollbackAdmin".to_owned());
+        let context_id = hex::encode([0x4bu8; 32]);
+        let (deps, _faulty, snapshots) =
+            test_support::deps_over_faulty_log(admin.as_ref(), &context_id).await;
+        let (mut cell, handle) = joinable_cell(&context_id, &admin, true);
+        // Every persist fails, starting with the Phase-3 add commit's.
+        snapshots.fail_persists_after(0);
+
+        let joiner = DID("did:dht:z6MkRolledBackJoiner".to_owned());
+        let result = lifecycle_helpers::join_context(
+            &mut cell,
+            &deps,
+            &handle,
+            scp_protocol::context::membership::KeyPackage::mock(joiner.clone()),
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(&result, Err(ContextError::PersistenceFailed(_))),
+            "the add commit's persist failure rolls the join back: got {result:?}"
+        );
+        assert!(
+            !cell.membership.contains(joiner.as_ref()),
+            "the rolled-back joiner is not a member"
+        );
+        assert!(
+            cell.class_s.pending_log_units.is_empty(),
+            "a rolled-back join queues no MemberJoined record"
+        );
+        assert!(
+            snapshots.persisted_unit_types(&context_id).await.is_empty(),
+            "the rollback's persist stores no MemberJoined record"
+        );
+    }
+
+    /// A join whose Phase-5 persist fails rolls back like every earlier
+    /// failure: the member, its Phase-4 state, and the `MemberJoined` record
+    /// the Phase-3 add commit queued all leave memory, the checkpoint count
+    /// returns to its value before the join, and the join returns the persist
+    /// error (spec 17 §17.3 "Event log write failures").
+    #[tokio::test]
+    async fn join_phase_five_persist_failure_rolls_the_member_and_record_back() {
+        use crate::context::log_unit_helpers::test_support;
+
+        let admin = DID("did:dht:z6MkJoinPhaseFiveAdmin".to_owned());
+        let probe_id = hex::encode([0x4du8; 32]);
+        let context_id = hex::encode([0x4eu8; 32]);
+        let (deps, _faulty, snapshots) =
+            test_support::deps_over_faulty_log(admin.as_ref(), &context_id).await;
+
+        // A join that lands counts the persists a join takes. The drain after
+        // Phase 5 persists the one queued unit twice, recording its base and
+        // then removing it, so Phase 5 is the third persist from the end.
+        deps.event_log
+            .init_event_log(&crate::context::state::context_id_to_bytes(&probe_id))
+            .await
+            .expect("init the probe's event log");
+        let (mut probe, probe_handle) = joinable_cell(&probe_id, &admin, true);
+        lifecycle_helpers::join_context(
+            &mut probe,
+            &deps,
+            &probe_handle,
+            scp_protocol::context::membership::KeyPackage::mock(DID(
+                "did:dht:z6MkPhaseFiveProbe".to_owned()
+            )),
+            None,
+            None,
+        )
+        .await
+        .expect("the probe join lands");
+        let persists_per_join = snapshots.persists_landed();
+        assert!(
+            persists_per_join >= 4,
+            "a join persists its add, its Phase-5 commit, and two drain steps"
+        );
+
+        let (mut cell, handle) = joinable_cell(&context_id, &admin, true);
+        let credited_before = cell.checkpoint_events_since;
+        let pseudonym_before = cell.routing.local_pseudonym();
+        let joins_pseudonym = [0x5au8; 32];
+        assert_ne!(
+            pseudonym_before,
+            Some(joins_pseudonym),
+            "the join's pseudonym differs from the one the context holds"
+        );
+        let before_phase_five = persists_per_join - 3;
+        snapshots.fail_persists_after(before_phase_five);
+        let joiner = DID("did:dht:z6MkPhaseFiveJoiner".to_owned());
+        let result = lifecycle_helpers::join_context(
+            &mut cell,
+            &deps,
+            &handle,
+            scp_protocol::context::membership::KeyPackage::mock(joiner.clone()),
+            None,
+            Some(joins_pseudonym),
+        )
+        .await;
+
+        assert!(
+            matches!(&result, Err(ContextError::PersistenceFailed(_))),
+            "the join returns the Phase-5 persist error: got {result:?}"
+        );
+        assert_eq!(
+            snapshots.persists_landed(),
+            persists_per_join + before_phase_five,
+            "every persist of this join before Phase 5 landed"
+        );
+        assert!(
+            !cell.membership.contains(joiner.as_ref()),
+            "the joiner leaves the MLS membership"
+        );
+        assert!(
+            !cell.role_state.members.contains(joiner.as_ref()),
+            "the joiner leaves the role state Phase 4 entered it in"
+        );
+        assert!(
+            !cell
+                .governance
+                .participation_cache
+                .contains_key(joiner.as_ref()),
+            "the participation record Phase 4 cached is withdrawn"
+        );
+        assert!(
+            cell.class_s.pending_log_units.is_empty(),
+            "the queued MemberJoined record is withdrawn"
+        );
+        assert_eq!(
+            cell.checkpoint_events_since, credited_before,
+            "the withdrawn record is no longer credited"
+        );
+        assert_eq!(
+            cell.routing.local_pseudonym(),
+            pseudonym_before,
+            "the pseudonym Phase 4.5 set is rolled back to the one held before the join"
+        );
+    }
+
+    /// A crash after the Phase-3 add commit lands leaves the stored state
+    /// holding the queued `MemberJoined` record: the record rides the commit
+    /// that adds the member, so no stored state holds the member without it
+    /// (spec 17 §17.3 "Event log write failures"). The test key package makes
+    /// the MLS add itself a no-op, so the record is what the stored add shows.
+    #[tokio::test]
+    async fn join_add_commit_stores_the_member_with_its_record() {
+        use crate::context::log_unit_helpers::test_support;
+
+        let admin = DID("did:dht:z6MkJoinAddCommitAdmin".to_owned());
+        let context_id = hex::encode([0x4fu8; 32]);
+        let (deps, _faulty, snapshots) =
+            test_support::deps_over_faulty_log(admin.as_ref(), &context_id).await;
+        let (mut cell, handle) = joinable_cell(&context_id, &admin, true);
+
+        // Only the add commit lands; every later persist, the rollback's
+        // included, fails, which is what a crash right after it stores.
+        snapshots.fail_persists_after(1);
+        let joiner = DID("did:dht:z6MkAddCommitJoiner".to_owned());
+        let result = lifecycle_helpers::join_context(
+            &mut cell,
+            &deps,
+            &handle,
+            scp_protocol::context::membership::KeyPackage::mock(joiner.clone()),
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(&result, Err(ContextError::PersistenceFailed(_))),
+            "the persist after the add fails the join: got {result:?}"
+        );
+        assert_eq!(snapshots.persists_landed(), 1, "only the add commit landed");
+        assert_eq!(
+            snapshots.persisted_unit_types(&context_id).await,
+            vec![vec![scp_event_log::EventType::MemberJoined]],
+            "the stored state holds the member's MemberJoined record"
+        );
+        assert!(
+            cell.class_s.pending_log_units.is_empty() && !cell.membership.contains(joiner.as_ref()),
+            "memory holds the rollback"
+        );
+    }
+
     /// `close_context` persists fail-closed: under a failing persistence backend
     /// it returns `PersistenceFailed`, and the close teardown STAYS applied in
     /// memory (keep-direction — a closed context must not silently re-open).
@@ -7049,6 +7820,80 @@ mod restore_reconcile_tests {
         assert!(
             cell.broadcast_context.is_none(),
             "keep-direction: the close teardown stays applied through persist failure"
+        );
+    }
+
+    /// A close whose `ContextClosing` record the log refuses still lands: the
+    /// record is queued in the persist that records the close, the close
+    /// returns `Ok`, and the log is unchanged (spec 17 §17.3 "Event log write
+    /// failures").
+    #[tokio::test]
+    async fn close_append_failure_after_transition_keeps_close_and_queues_leaf() {
+        use crate::context::log_unit_helpers::test_support;
+        use scp_protocol::context::roles::Capability;
+
+        let admin = DID("did:dht:z6MkCloseQueuesAdmin".to_owned());
+        let context_id = hex::encode([0x4du8; 32]);
+        let context_id_bytes = crate::context::state::context_id_to_bytes(&context_id);
+        let (deps, faulty, snapshots) =
+            test_support::deps_over_faulty_log(admin.as_ref(), &context_id).await;
+
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            context_id_bytes,
+            scp_clock::Clock::now_secs(&scp_clock::SystemClock),
+            admin.clone(),
+        );
+        state.role_state.members.insert(admin.as_ref().to_owned());
+        state.role_state.member_capabilities.insert(
+            admin.as_ref().to_owned(),
+            std::iter::once(Capability::ContextClose).collect(),
+        );
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .unwrap();
+        let handle = ContextHandle::new(context_id.clone(), state.handle.params().clone());
+        handle
+            .transition_to(&crate::context::ContextState::Active)
+            .unwrap();
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
+
+        test_support::fail_log_entry_writes(&faulty, &context_id_bytes);
+        let log_before = test_support::log_len(&deps, &context_id_bytes);
+
+        let result = lifecycle_helpers::close_context(&mut cell, &deps, &handle, &admin).await;
+
+        assert!(
+            result.is_ok(),
+            "a refused ContextClosing write must not fail a close whose transition \
+             persisted: got {result:?}"
+        );
+        assert_eq!(handle.state(), crate::context::ContextState::Closing);
+        let expected = vec![vec![scp_event_log::EventType::ContextClosing]];
+        assert_eq!(
+            test_support::queued_unit_types(&cell.class_s.pending_log_units),
+            expected,
+            "the ContextClosing record stays queued"
+        );
+        assert_eq!(
+            snapshots.persisted_unit_types(&context_id).await,
+            expected,
+            "the record rides the persist that recorded the close"
+        );
+        assert_eq!(
+            cell.class_s
+                .pending_log_units
+                .front()
+                .expect("one queued unit")
+                .leaves[0]
+                .actor_did(),
+            admin.as_ref(),
+            "the record names the initiator"
+        );
+        assert_eq!(
+            test_support::log_len(&deps, &context_id_bytes),
+            log_before,
+            "the refused write leaves the log unchanged"
         );
     }
 

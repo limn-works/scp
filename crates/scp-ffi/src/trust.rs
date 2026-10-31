@@ -1075,22 +1075,18 @@ fn participation_record_on_pool(
 
     let record = crate::runtime::supervisor(bi)?
         .participation_record(context_id, subject_did, &verified)
-        // Map the empty-log condition to its dedicated, stable code (CTX_2076) so
-        // SDKs can branch on "no recorded participation facts" without string-
-        // matching; genuine failures stay on the generic context code (CTX_2000),
-        // matching NAPI/UniFFI. `ScpPyError::context` would emit CTX_2001,
-        // diverging from the other bridges for the same condition.
+        // The shared classification names each code: an empty log's
+        // `NoParticipationFacts` keeps CTX_2076, the one code the SDKs fold into
+        // a zeroed record; an unregistered context or a context with no log has
+        // no dedicated code and reports CTX_2000, as NAPI and UniFFI do (spec 17
+        // §17.3).
         .map_err(|e| {
-            let code = match e {
-                scp_core::context::ContextError::NoParticipationFacts { .. } => {
-                    scp_ffi_common::error_codes::CTX_2076
-                }
-                _ => scp_ffi_common::error_codes::CTX_2000,
-            };
-            crate::error::ScpPyError::ContextError {
-                message: e.to_string(),
-                code: code.to_owned(),
-            }
+            crate::context::typed_supervisor_error("participation_record", &e).unwrap_or_else(
+                || crate::error::ScpPyError::ContextError {
+                    message: format!("participation_record failed: {e}"),
+                    code: scp_ffi_common::error_codes::CTX_2000.to_owned(),
+                },
+            )
         })?;
 
     let facts = scp_core::trust::ParticipationFacts::from(&record);

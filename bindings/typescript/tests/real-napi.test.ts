@@ -1228,51 +1228,68 @@ suite.describe("Real NAPI bridge E2E", ({ createNativeBridge, rawAddon }) => {
       }
     });
 
-    // `evaluateTrust` must remain usable on a context with NO convergent leaves
-    // (the EmptyEventLog case): the core returns `EmptyEventLog`, which the SDK
-    // folds into a zeroed behavioral record rather than throwing, so a
-    // Layer-1-only trust check never has to populate the log first. Drive the
-    // genuinely-empty case by keying the (handle-resolved) lookup at a context
-    // label the supervisor has never seen, so the core's event-log lookup is
-    // empty and the graceful fold is exercised end-to-end against the real
-    // bridge. `participationRecord` on the same empty context propagates instead.
-    test("evaluateTrust folds an empty event log into a zeroed behavioral record (real SCP method)", async () => {
+    // A context with no log is an absent state, never an empty log (spec 17
+    // §17.3): a never-created context has no event log, so the core refuses the
+    // participation record with `ContextNotRegistered`, which the bridge
+    // reports as a generic context code. Only an empty log's `SCP-CTX-2076` is
+    // folded into a zeroed record (spec 07 §7.3.2), so `evaluateTrust` on the
+    // same context propagates the refusal instead of reporting zero facts.
+    test("evaluateTrust refuses a never-created context instead of folding it into a zeroed record (real SCP method)", async () => {
       const member = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
-      // A handle whose resolved contextId is a never-created label → empty log.
-      const emptyHandle = { contextId: "ctx-never-created-empty-log" };
+      const unknownHandle = { contextId: "ctx-never-created" };
 
-      // Direct record request on the empty context → typed ContextError keyed
-      // on the dedicated, machine-detectable SCP-CTX-2076 code (the SDK branches
-      // on the code, not error prose).
       const directError = await scpInstance
-        .participationRecord(emptyHandle.contextId, member.did)
+        .participationRecord(unknownHandle.contextId, member.did)
         .then(
           () => undefined,
           (err: unknown) => err,
         );
       expect(directError).toBeInstanceOf(ContextError);
-      expect((directError as ContextError).code).toBe("SCP-CTX-2076");
+      expect((directError as ContextError).code).toBe("SCP-CTX-2000");
+      expect((directError as ContextError).message).toMatch(/context not registered/);
 
-      // evaluateTrust on the same empty context (no Layer-1 tokens, so only the
-      // Layer-2 empty-log fold is exercised) → graceful zeroed record.
+      const evaluateError = await scpInstance
+        .evaluateTrust(
+          Context._fromHandle(
+            scpInstance,
+            unknownHandle as unknown as BridgeContextHandle,
+            member.did,
+          ),
+          member.did,
+        )
+        .then(
+          () => undefined,
+          (err: unknown) => err,
+        );
+      expect(evaluateError).toBeInstanceOf(ContextError);
+      expect((evaluateError as ContextError).code).toBe("SCP-CTX-2000");
+      expect((evaluateError as ContextError).message).toMatch(/context not registered/);
+    });
+
+    // A subject with no activity in a context that has a real log is not the
+    // empty-log case: the core returns a record over the context's real log, with
+    // the subject's counts at zero and the log's real Merkle root, and
+    // `evaluateTrust` reports that record rather than the zeroed fold.
+    test("evaluateTrust reports zero facts over a real log for an inactive subject (real SCP method)", async () => {
+      const admin = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const outsider = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
+
       const result = await scpInstance.evaluateTrust(
-        Context._fromHandle(scpInstance, emptyHandle as unknown as BridgeContextHandle, member.did),
-        member.did,
+        Context._fromHandle(scpInstance, ctx, admin.did),
+        outsider.did,
       );
       const record = result.behavioralRecord;
-      expect(record.subjectDid).toBe(member.did);
+      expect(record.subjectDid).toBe(outsider.did);
       expect(record.participationDurationSecs).toBe(0);
       expect(record.governanceActionsAgainst).toBe(0);
       expect(record.governanceActionsBy).toBe(0);
-      expect(record.outletInvocationCount).toBe(0);
-      expect(record.outletInvocationCountAnchored).toBe(false);
       expect(record.contextCreationCount).toBe(0);
       expect(record.roleProgressionCount).toBe(0);
-      expect(record.attestationCount).toBe(0);
-      // attestationCount is credential-layer, never Merkle-anchored.
-      expect(record.attestationCountAnchored).toBe(false);
-      // Empty-log fold uses the all-zero root placeholder, not a real hash.
-      expect(record.eventLogRoot).toBe("");
+      // A real record: the log's 32-byte Merkle root and a real computation
+      // time, never the fold's empty root and zero timestamp.
+      expect(record.eventLogRoot).toMatch(/^[0-9a-f]{64}$/);
+      expect(record.computedAt).toBeGreaterThan(0);
     });
 
     // Finding O: audience-mismatch trust-inflation regression (TS sibling of

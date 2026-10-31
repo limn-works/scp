@@ -834,6 +834,34 @@ class TestParticipationRecordWrapper:
                     )
                 )
 
+    def test_evaluate_trust_propagates_unregistered_context(self) -> None:
+        """An unregistered context's refusal propagates, never a zeroed record.
+
+        A context with no log is an absent state, never an empty log (spec 17
+        §17.3). The bridge reports the core's ``ContextNotRegistered`` with a
+        generic context code, and only ``SCP-CTX-2076`` folds (spec 07 §7.3.2).
+        """
+        mock_scp = MagicMock()
+        mock_bridge = MagicMock()
+
+        class _NativeContextError(Exception):
+            pass
+
+        _NativeContextError.__name__ = "ContextError"  # mimic the PyO3 class name
+        mock_bridge.participation_record.side_effect = _NativeContextError(
+            "[SCP-CTX-2000] participation_record failed: context not registered: ctx-unknown"
+        )
+        with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
+            with pytest.raises(ContextError, match="context not registered") as excinfo:
+                asyncio.run(
+                    evaluate_trust(
+                        scp=mock_scp,
+                        subject_did="did:dht:zsubject",
+                        context_id="ctx-unknown",
+                    )
+                )
+        assert excinfo.value.code == "SCP-CTX-2000"
+
     async def test_participation_record_translates_native_error_with_code(self) -> None:
         """The public wrapper re-raises native bridge errors as coded SDK errors.
 

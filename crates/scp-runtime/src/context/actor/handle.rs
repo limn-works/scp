@@ -147,20 +147,107 @@ pub(in crate::context) enum DeliberateExit {
 /// [`ContextActorHandle`] clone for that actor. Empty while the actor runs,
 /// and empty forever after an exit that was not deliberate: a panic
 /// unwinds past every recording site.
+///
+/// It also carries the end of the actor's task. The spawn arms it with
+/// [`Self::arm`] before the task starts and moves the guard into the task,
+/// so the task's end, whether `run()` returned, unwound from a panic or was
+/// dropped unpolled, is observable after every handle clone is gone. A
+/// record no spawn armed (a test fixture with no task) never reports a
+/// running task.
 #[derive(Debug, Clone, Default)]
-pub(in crate::context) struct ExitRecord(std::sync::Arc<std::sync::OnceLock<DeliberateExit>>);
+pub(in crate::context) struct ExitRecord(std::sync::Arc<ExitCell>);
+
+/// The shared state behind an [`ExitRecord`].
+#[derive(Debug, Default)]
+pub(in crate::context) struct ExitCell {
+    deliberate: std::sync::OnceLock<DeliberateExit>,
+    armed: std::sync::atomic::AtomicBool,
+    ended: tokio_util::sync::CancellationToken,
+}
+
+/// Held by an actor's task for its whole life; dropping it marks the task
+/// ended on its [`ExitRecord`].
+#[must_use = "the task end is marked when this guard drops"]
+pub(in crate::context) struct ActorTaskGuard {
+    _ended_on_drop: tokio_util::sync::DropGuard,
+}
 
 impl ExitRecord {
     /// Records `exit`. The first record wins; an actor exits once.
     pub(in crate::context) fn record(&self, exit: DeliberateExit) {
-        if self.0.set(exit).is_err() {
+        if self.0.deliberate.set(exit).is_err() {
             tracing::error!(?exit, "an actor recorded a second deliberate exit");
         }
     }
 
     /// The deliberate exit the actor recorded, if any.
     pub(in crate::context) fn get(&self) -> Option<DeliberateExit> {
-        self.0.get().copied()
+        self.0.deliberate.get().copied()
+    }
+
+    /// Marks a task as running behind this record and returns the guard
+    /// whose drop marks that task ended. The spawn calls it before the task
+    /// starts, so no window exists in which the task runs unarmed.
+    pub(in crate::context) fn arm(&self) -> ActorTaskGuard {
+        self.0
+            .armed
+            .store(true, std::sync::atomic::Ordering::Release);
+        ActorTaskGuard {
+            _ended_on_drop: self.0.ended.clone().drop_guard(),
+        }
+    }
+
+    /// Whether a spawned task runs behind this record and has not ended.
+    pub(in crate::context) fn task_running(&self) -> bool {
+        self.0.armed.load(std::sync::atomic::Ordering::Acquire) && !self.0.ended.is_cancelled()
+    }
+
+    /// Resolves when the task behind this record has ended. Never resolves
+    /// for a record no spawn armed, so callers check [`Self::task_running`]
+    /// first.
+    async fn task_ended(&self) {
+        self.0.ended.cancelled().await;
+    }
+}
+
+/// An actor whose handle a despawn removed from the registry while its task
+/// still ran. It holds no strong sender, so it does not keep the actor
+/// alive: an actor whose every handle dropped still leaves its loop.
+#[derive(Clone)]
+pub(in crate::context) struct DepartingActor {
+    inbox: mpsc::WeakSender<ContextCommand>,
+    exit: ExitRecord,
+}
+
+impl DepartingActor {
+    /// Whether the actor's task has not ended yet.
+    pub(in crate::context) fn task_running(&self) -> bool {
+        self.exit.task_running()
+    }
+
+    /// Asks the actor to stop and waits, with no bound of its own, until its
+    /// task has ended, so no write the actor makes (its post-loop persist
+    /// included) can land after this resolves. The caller bounds the wait.
+    ///
+    /// A `Shutdown` that cannot be sent means either the inbox receiver has
+    /// dropped (the task is ending) or no strong sender is left (the actor
+    /// leaves its loop once its mailbox is empty); the task ends without it
+    /// in both cases.
+    pub(in crate::context) async fn stop_and_await_task_end(&self) {
+        if !self.task_running() {
+            return;
+        }
+        if let Some(inbox) = self.inbox.upgrade() {
+            let (reply, _ack) = oneshot::channel();
+            let shutdown =
+                ContextCommand::LifecycleControl(LifecycleControlCommand::Shutdown { reply });
+            // A send error means the receiver dropped, so the task is ending;
+            // the wait below observes that end.
+            if inbox.send(shutdown).await.is_err() {
+                tracing::debug!("a departing actor's inbox closed before its shutdown");
+            }
+        }
+        self.exit.task_ended().await;
     }
 }
 
@@ -211,6 +298,15 @@ impl ContextActorHandle {
     /// handle reads what that actor records.
     pub(in crate::context) fn exit_record(&self) -> ExitRecord {
         self.exit.clone()
+    }
+
+    /// The actor behind this handle while its task still runs, for a despawn
+    /// to track until that task has ended.
+    pub(in crate::context) fn departure(&self) -> Option<DepartingActor> {
+        self.exit.task_running().then(|| DepartingActor {
+            inbox: self.inbox.downgrade(),
+            exit: self.exit.clone(),
+        })
     }
 
     /// The exit the actor recorded when its `run()` loop ended on purpose,

@@ -5337,7 +5337,6 @@ fn sdk_shutdown(result: Result<ShutdownOutcome, ShutdownError>) -> Result<(), Sc
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod sdk_shutdown_tests {
     use super::*;
     use scp_ffi_common::bridge_instance::ShutdownFlush;
