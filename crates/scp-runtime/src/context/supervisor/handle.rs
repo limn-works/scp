@@ -1049,6 +1049,10 @@ impl SupervisorHandle {
     ///
     /// # Errors
     ///
+    /// - [`ContextError::ContextNotRegistered`] while a
+    ///   `Supervisor::discard_joined_context` of the id has not finished its
+    ///   teardown (`Supervisor::refuse_pending_discard`): a first-state write
+    ///   or its rollback would put back the snapshot the teardown deletes.
     /// - [`ContextError::ActorBusy`] while another operation's first state of
     ///   the id is unsettled; it is retryable.
     /// - [`ContextError::SupervisorShutDown`] when the Supervisor has dropped.
@@ -1056,11 +1060,9 @@ impl SupervisorHandle {
         &self,
         context_id: &str,
     ) -> Result<(), ContextError> {
-        if self
-            .upgrade()?
-            .pending_first_state
-            .insert(context_id.to_owned())
-        {
+        let supervisor = self.upgrade()?;
+        supervisor.refuse_pending_discard(context_id)?;
+        if supervisor.pending_first_state.insert(context_id.to_owned()) {
             return Ok(());
         }
         Err(ContextError::ActorBusy(format!(

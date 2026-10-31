@@ -3884,9 +3884,12 @@ async fn a_timed_out_discard_deletes_the_snapshot_after_the_stuck_last_write() {
         .discard_joined_context(&j.ctx_id)
         .await
         .expect_err("a second discard is refused while the first one waits for the exit");
+    // The exit-wait timeout is `ActorBusy`; only the pending-discard check
+    // answers `ContextNotRegistered`, so this match fails if the second
+    // discard got past that check and timed out on its own wait.
     assert!(
-        matches!(again, crate::context::ContextError::ActorBusy(_)),
-        "the second discard gets the typed pending error, got {again:?}"
+        matches!(again, crate::context::ContextError::ContextNotRegistered(_)),
+        "the second discard is refused by the pending-discard check, got {again:?}"
     );
     assert!(
         gated.has_snapshot(&j.ctx_id).await,
@@ -4099,9 +4102,12 @@ async fn a_timed_out_discard_with_no_registered_actor_deletes_the_snapshot_after
         .discard_joined_context(&j.ctx_id)
         .await
         .expect_err("a second discard is refused while the first one waits for the exit");
+    // The exit-wait timeout is `ActorBusy`; only the pending-discard check
+    // answers `ContextNotRegistered`, so this match fails if the second
+    // discard got past that check and timed out on its own wait.
     assert!(
-        matches!(again, crate::context::ContextError::ActorBusy(_)),
-        "the second discard gets the typed pending error, got {again:?}"
+        matches!(again, crate::context::ContextError::ContextNotRegistered(_)),
+        "the second discard is refused by the pending-discard check, got {again:?}"
     );
 
     gated.release();
@@ -4109,6 +4115,109 @@ async fn a_timed_out_discard_with_no_registered_actor_deletes_the_snapshot_after
     assert!(
         cached.is_closed(),
         "the snapshot is deleted only after the removed actor exited"
+    );
+}
+
+/// A restore of a joined context whose discard is waiting for the actor's
+/// exit is refused before it reads the snapshot, and registers no actor; the
+/// discard then deletes the snapshot. A restore that ignored the pending
+/// discard would register a second actor from the join's snapshot, the
+/// discard's teardown would keep that snapshot for the live actor, and the
+/// context would come back on restart with Precheck D refusing every re-join.
+#[tokio::test]
+async fn a_restore_during_a_discard_is_refused_and_the_snapshot_is_deleted() {
+    let gated = GatedPersistence::new();
+    let (result, j) = join_bob(0x7c, Some(Box::new(gated.clone()))).await;
+    let joined = result.expect("the happy-path join succeeds");
+    let held = j
+        .sup
+        .lookup(&j.ctx_id)
+        .expect("a live context actor is registered for the joiner");
+    gated.arm();
+
+    // The drain write after the discard's `Shutdown` waits at the gate, so
+    // the discard has removed the actor, released both locks and is waiting
+    // for the exit with the id marked pending.
+    let sup = Arc::clone(&j.sup);
+    let id = j.ctx_id.clone();
+    let discard = tokio::spawn(async move { sup.discard_joined_context(&id).await });
+    gated.entered.notified().await;
+
+    let loads_before = gated.loads.load(std::sync::atomic::Ordering::SeqCst);
+    let refused = j.sup.restore_context(&j.ctx_id, &joined).await;
+    assert!(
+        matches!(
+            refused,
+            Err(crate::context::ContextError::ContextNotRegistered(_))
+        ),
+        "a restore during the discard is refused with a typed error, got {refused:?}"
+    );
+    assert_eq!(
+        gated.loads.load(std::sync::atomic::Ordering::SeqCst),
+        loads_before,
+        "the refused restore reads no snapshot"
+    );
+    assert!(
+        j.sup.lookup(&j.ctx_id).is_none(),
+        "the refused restore registers no actor"
+    );
+
+    gated.release();
+    let removed = discard
+        .await
+        .expect("the discard task does not panic")
+        .expect("the discard stops the actor and deletes the snapshot");
+    assert!(removed, "the discard removed the live actor handle");
+    await_exit(&held).await;
+    assert!(
+        j.sup.lookup(&j.ctx_id).is_none(),
+        "no actor runs for the discarded context"
+    );
+    assert!(
+        !gated.has_snapshot(&j.ctx_id).await,
+        "no snapshot of the discarded context remains"
+    );
+}
+
+/// Dropping the discarding caller while it waits for the actor's exit does
+/// not stop the teardown: once the actor's last write lands and it exits, the
+/// snapshot is deleted. A teardown owned by the caller's future would die
+/// with it, and the snapshot it never deleted would bring the context back on
+/// restart.
+#[tokio::test]
+async fn a_dropped_discard_caller_still_deletes_the_snapshot_after_the_exit() {
+    let gated = GatedPersistence::new();
+    let (result, j) = join_bob(0x7d, Some(Box::new(gated.clone()))).await;
+    result.expect("the happy-path join succeeds");
+    let held = j
+        .sup
+        .lookup(&j.ctx_id)
+        .expect("a live context actor is registered for the joiner");
+    gated.arm();
+
+    {
+        let discard = j.sup.discard_joined_context(&j.ctx_id);
+        tokio::pin!(discard);
+        let finished = tokio::select! {
+            outcome = &mut discard => Some(outcome),
+            () = gated.entered.notified() => None,
+        };
+        assert!(
+            finished.is_none(),
+            "the discard is still waiting for the exit when its caller drops it, got {finished:?}"
+        );
+    }
+    assert!(
+        gated.has_snapshot(&j.ctx_id).await,
+        "the join's snapshot stays while the discarded actor can still write"
+    );
+
+    gated.release();
+    await_exit(&held).await;
+    gated.await_deleted(&j.ctx_id).await;
+    assert!(
+        j.sup.lookup(&j.ctx_id).is_none(),
+        "no actor runs for the discarded context"
     );
 }
 
