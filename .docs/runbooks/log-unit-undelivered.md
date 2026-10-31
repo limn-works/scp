@@ -16,26 +16,38 @@ holds no record of it.
 
 Three paths increment the counter. Each path writes its own error message:
 
-| Path | Error message | Missing record |
+| Path | Error log | Missing record |
 |------|---------------|----------------|
-| The cross-context bridge, after a cross-context stream ends (`send_cross_context_a_unit`, `context/outlets/invoke.rs`) | `cross-context bridge: A-side OutletInvoked record was not queued` | The `OutletInvoked` record in the receiving context A's log |
-| The streaming close sink (`ActorOutletInvokedEventSink`, `context/outlets/stream_settlement_adapter.rs`) | `streaming OutletInvokedEvent was not queued` | The stream's close record in the hosting context's log |
+| The cross-context bridge, after a cross-context stream ends (`send_cross_context_a_unit`, `context/outlets/invoke.rs`) | `log unit was not queued; the context's log lacks this record`, with `record` set to `cross-context bridge A-side OutletInvoked` | The `OutletInvoked` record in the receiving context A's log |
+| The streaming close sink (`ActorOutletInvokedEventSink`, `context/outlets/stream_settlement_adapter.rs`) | `log unit was not queued; the context's log lacks this record`, with `record` set to `streaming OutletInvokedEvent` | The stream's close record in the hosting context's log |
 | A streaming close hand-off that never ran because the Supervisor was gone or refused the task (`spawn_supervisor_op` in `context/outlets/stream_settlement_adapter.rs`, counted through `SinkHandoff::OutletInvokedEventAppend`) | `streaming sink: ... operation not run`, with `operation` set to `streaming OutletInvokedEvent append` | The stream's close record in the hosting context's log |
 
-A streaming saga's A-side record does not increment this counter. When that hand-off fails,
-the saga stays in `Committing`, and the saga recovery sweep re-sends the record on the next
-sweep and restart. `saga-needs-repair.md` covers a saga that does not resolve.
+A streaming saga's A-side record increments this counter only when A's context is deleted.
+While A's context exists, a failed hand-off leaves the saga in `Committing`, and the saga
+recovery sweep re-sends the record on the next sweep and restart. When A's context is deleted
+from persistence, the record has no log to land in: the sweep resolves the saga, increments
+the counter once, and logs `streaming saga recovery — the caller context is deleted`.
+`saga-needs-repair.md` covers a saga that does not resolve.
 
 ## Cause
 
-The error log's `error` field names one of three causes:
+A hand-off that never ran (the third path) sent nothing. The first two paths send the record
+to the actor once and do not retry, and the send ends in one of two ways:
 
-- **The Supervisor or the context's actor is gone.** A shutdown that started during the
-  stream, or a context that despawned before the stream ended, leaves no actor to queue the
-  record.
-- **The actor's mailbox stayed full** through every send attempt.
-- **The actor refused the queue persist.** The context state store failed, so the actor
-  could not store the unit and returned `PersistenceFailed`.
+- **The unit was not queued.** The counter counts only this outcome, and the error log's
+  `error` field begins `log unit not queued:` followed by the reason:
+  - **The Supervisor or the context's actor is gone.** A shutdown that started during the
+    stream, or a context that despawned before the stream ended, leaves no actor to queue
+    the record.
+  - **The actor's mailbox stayed full** for the whole send timeout, so the command never
+    reached the actor (`ActorBusy`).
+  - **The actor refused the unit.** Its leaf did not plan, or the context state store failed
+    and the actor could not store the unit (`PersistenceFailed`).
+- **The reply was lost.** The actor took the command, but its reply was dropped or did not
+  arrive within the reply bound, so the unit may have been queued. The runtime logs this at
+  warn level, with `log unit delivered, outcome unknown:` in the `error` field, and does not
+  increment the counter. Check whether the context's log holds the record before you treat
+  it as missing.
 
 ## Repair
 
