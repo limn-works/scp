@@ -17904,18 +17904,19 @@ impl Scp {
             })?;
             let record = supervisor
                 .participation_record(&context_id, &subject_did, &verified)
+                // The shared classification names each code: an empty log's
+                // `NoParticipationFacts` keeps CTX_2076, the one code the SDKs fold
+                // into a zeroed record; an unregistered context or a context with
+                // no log has no dedicated code and reports CTX_2000 (spec 17 §17.3).
                 .map_err(|e| {
-                    // Empty-log → dedicated CTX_2076 so SDKs branch on the code, not
-                    // the message; genuine failures stay on the generic CTX_2000.
-                    let code = match e {
-                        scp_core::context::ContextError::NoParticipationFacts { .. } => {
-                            codes::CTX_2076
+                    let msg = format!("participation_record failed: {e}");
+                    if scp_ffi_common::context_error_class::has_dedicated_code(&e) {
+                        ScpError::from_context_error(msg, &e)
+                    } else {
+                        ScpError::Context {
+                            msg,
+                            code: codes::CTX_2000.to_owned(),
                         }
-                        _ => codes::CTX_2000,
-                    };
-                    ScpError::Context {
-                        msg: e.to_string(),
-                        code: code.to_owned(),
                     }
                 })?;
 

@@ -165,6 +165,24 @@ class TrustAggregateFfiTest {
         )
 
     /**
+     * A context with no log is an absent state, never an empty log (spec 17
+     * §17.3): a never-created context surfaces as a generic context error, not
+     * the [NO_PARTICIPATION_FACTS_CODE] that [SCP.evaluateTrust] folds into a
+     * zeroed record (spec 07 §7.3.2).
+     */
+    @Test
+    fun `participationRecord - a never-created context is an error, never the empty-log code`() {
+        runBlocking {
+            val error =
+                assertFailsWith<ScpException.Context> {
+                    scp.participationRecord(contextId = "ctx-never-created", subjectDid = "did:dht:zSubject")
+                }
+            assertEquals("SCP-CTX-2000", error.code)
+            assertTrue(error.message.orEmpty().contains("context not registered"), error.message)
+        }
+    }
+
+    /**
      * An instance with no identity has no DID resolver, so the issuer's
      * `#active` key cannot be resolved: a coded SCP-VALID-7052 error, never a
      * verdict. The issuer DID in the message proves the typed envelope parsed

@@ -883,17 +883,16 @@ pub(crate) fn participation_record_on(
 
     let record = crate::runtime::supervisor(bi)?
         .participation_record(&context_id, &subject_did, &verified)
+        // The shared classification names each code: an empty log's
+        // `NoParticipationFacts` keeps CTX_2076, the one code the SDKs fold into
+        // a zeroed record; an unregistered context or a context with no log has
+        // no dedicated code and reports CTX_2000 (spec 17 §17.3).
         .map_err(|e| {
-            // Empty-log → dedicated CTX_2076 so SDKs branch on the code, not the
-            // message; genuine failures stay on the generic CTX_2000.
-            let code = match e {
-                scp_core::context::ContextError::NoParticipationFacts { .. } => codes::CTX_2076,
-                _ => codes::CTX_2000,
-            };
-            napi::Error::from(ScpNapiError::Context {
-                message: e.to_string(),
-                code: code.to_owned(),
-            })
+            napi::Error::from(crate::context::typed_supervisor_failure(
+                "participation_record",
+                codes::CTX_2000,
+                &e,
+            ))
         })?;
 
     let facts = scp_core::trust::ParticipationFacts::from(&record);
