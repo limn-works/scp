@@ -3710,6 +3710,8 @@ struct GatedPersistence {
     armed: Arc<std::sync::atomic::AtomicBool>,
     gate: Arc<tokio::sync::Semaphore>,
     entered: Arc<tokio::sync::Notify>,
+    /// How many `persist_context` calls reached the armed gate.
+    held: Arc<std::sync::atomic::AtomicUsize>,
     loads: Arc<std::sync::atomic::AtomicUsize>,
 }
 
@@ -3720,6 +3722,7 @@ impl GatedPersistence {
             armed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             gate: Arc::new(tokio::sync::Semaphore::new(0)),
             entered: Arc::new(tokio::sync::Notify::new()),
+            held: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             loads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
@@ -3768,6 +3771,7 @@ impl ContextPersistence for GatedPersistence {
         snapshot: &crate::context::state::ContextSnapshot,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if self.armed.load(std::sync::atomic::Ordering::SeqCst) {
+            self.held.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.entered.notify_one();
             self.gate.acquire().await?.forget();
         }
@@ -3884,9 +3888,10 @@ async fn a_timed_out_discard_deletes_the_snapshot_after_the_stuck_last_write() {
         .discard_joined_context(&j.ctx_id)
         .await
         .expect_err("a second discard is refused while the first one waits for the exit");
-    // The exit-wait timeout is `ActorBusy`; only the pending-discard check
-    // answers `ContextNotRegistered`, so this match fails if the second
-    // discard got past that check and timed out on its own wait.
+    // Only the pending-discard check answers `ContextNotRegistered`. Without
+    // it the second discard waits on the removed actor, which stays tracked
+    // as departing until its stuck write ends, and that wait times out with
+    // `ActorBusy`, so this match fails.
     assert!(
         matches!(again, crate::context::ContextError::ContextNotRegistered(_)),
         "the second discard is refused by the pending-discard check, got {again:?}"
@@ -4102,9 +4107,10 @@ async fn a_timed_out_discard_with_no_registered_actor_deletes_the_snapshot_after
         .discard_joined_context(&j.ctx_id)
         .await
         .expect_err("a second discard is refused while the first one waits for the exit");
-    // The exit-wait timeout is `ActorBusy`; only the pending-discard check
-    // answers `ContextNotRegistered`, so this match fails if the second
-    // discard got past that check and timed out on its own wait.
+    // Only the pending-discard check answers `ContextNotRegistered`. Without
+    // it the second discard waits on the removed actor, which stays tracked
+    // as departing until its stuck write ends, and that wait times out with
+    // `ActorBusy`, so this match fails.
     assert!(
         matches!(again, crate::context::ContextError::ContextNotRegistered(_)),
         "the second discard is refused by the pending-discard check, got {again:?}"
@@ -4218,6 +4224,227 @@ async fn a_dropped_discard_caller_still_deletes_the_snapshot_after_the_exit() {
     assert!(
         j.sup.lookup(&j.ctx_id).is_none(),
         "no actor runs for the discarded context"
+    );
+}
+
+/// Shutdown has begun, so the tracker takes no task and the discard runs its
+/// teardown inline in the caller's future. Dropping the caller there ends the
+/// teardown before its snapshot delete. The id must stay refused at the one
+/// check every registration and first-state write runs: a mark that cleared
+/// on drop would leave the snapshot nothing deleted open to a restore. (In
+/// this process the restore is also refused by shutdown itself, which is why
+/// the test asserts the pending-discard check directly.)
+#[tokio::test]
+async fn a_discard_cancelled_after_shutdown_began_keeps_the_id_refused() {
+    let gated = GatedPersistence::new();
+    let (result, j) = join_bob(0x7e, Some(Box::new(gated.clone()))).await;
+    let joined = result.expect("the happy-path join succeeds");
+    let held = j
+        .sup
+        .lookup(&j.ctx_id)
+        .expect("a live context actor is registered for the joiner");
+    gated.arm();
+    j.sup.close_spawn_gate();
+
+    {
+        let discard = j.sup.discard_joined_context(&j.ctx_id);
+        tokio::pin!(discard);
+        let finished = tokio::select! {
+            outcome = &mut discard => Some(outcome),
+            () = gated.entered.notified() => None,
+        };
+        assert!(
+            finished.is_none(),
+            "the discard is still waiting for the exit when its caller drops it, got {finished:?}"
+        );
+    }
+    gated.release();
+    await_exit(&held).await;
+
+    let refused = j.sup.refuse_pending_discard(&j.ctx_id);
+    assert!(
+        matches!(
+            refused,
+            Err(crate::context::ContextError::ContextNotRegistered(_))
+        ),
+        "a discard whose teardown was cancelled leaves the id refused, got {refused:?}"
+    );
+    let restore = j.sup.restore_context(&j.ctx_id, &joined).await;
+    assert!(restore.is_err(), "no restore of the id succeeds");
+    assert!(
+        j.sup.lookup(&j.ctx_id).is_none(),
+        "the refused restore registers no actor"
+    );
+    assert!(
+        gated.has_snapshot(&j.ctx_id).await,
+        "the cancelled teardown deleted nothing"
+    );
+}
+
+/// The discard tracks the registered actor it removes as departing, so a
+/// bootstrap of the id waits for that actor's task to end before it reads
+/// the snapshot, whatever becomes of the teardown and its pending mark. The
+/// mark refuses every bootstrap first, so the test clears it by hand to
+/// reach the wait: that is the state a teardown whose mark cleared early
+/// (as on a panic before this fix) left behind. Without the tracking the
+/// restore finds no departing actor and goes on while the removed actor
+/// still runs, so a second actor could register beside it.
+#[tokio::test]
+async fn a_restore_waits_for_the_actor_a_discard_removed() {
+    let gated = GatedPersistence::new();
+    let (result, j) = join_bob(0x7f, Some(Box::new(gated.clone()))).await;
+    let joined = result.expect("the happy-path join succeeds");
+    let held = j
+        .sup
+        .lookup(&j.ctx_id)
+        .expect("a live context actor is registered for the joiner");
+    gated.arm();
+
+    let sup = Arc::clone(&j.sup);
+    let id = j.ctx_id.clone();
+    let discard = tokio::spawn(async move { sup.discard_joined_context(&id).await });
+    gated.entered.notified().await;
+    assert!(
+        !held.is_closed(),
+        "the removed actor still runs: its last write waits at the gate"
+    );
+
+    j.sup.pending_discards.remove(&j.ctx_id);
+    let sup = Arc::clone(&j.sup);
+    let id = j.ctx_id.clone();
+    let restore = tokio::spawn(async move { sup.restore_context(&id, &joined).await });
+    for _ in 0..256 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !restore.is_finished(),
+        "the restore waits for the actor the discard removed"
+    );
+
+    gated.release();
+    let _outcome = restore.await.expect("the restore task does not panic");
+    assert!(
+        held.is_closed(),
+        "the restore went on only after the removed actor exited"
+    );
+    let _discarded = discard.await.expect("the discard task does not panic");
+}
+
+/// Builds a full export of `snapshot`, signed for its creator with a fixed
+/// key, and the key that verifies it.
+async fn signed_full_export(
+    snapshot: crate::context::state::ContextSnapshot,
+    ctx_bytes: &[u8; 32],
+) -> (
+    crate::context::export_import::ContextExport,
+    ed25519_dalek::VerifyingKey,
+) {
+    use crate::context::builder::ContextEventLogProvider;
+    let provider = crate::context::providers::event_log::MerkleEventLogProvider::new();
+    provider
+        .init_event_log(ctx_bytes)
+        .await
+        .expect("the event log initializes");
+    provider
+        .append_event(
+            ctx_bytes,
+            scp_event_log::EventType::ContextCreated,
+            "",
+            scp_event_log::EventPayload::default(),
+            1_700_000_000,
+        )
+        .await
+        .expect("the creation event appends");
+    let event_log_data = provider
+        .export_event_log_entries(ctx_bytes)
+        .expect("the event log exports");
+    let creator = DID(snapshot.role_state.creator_did.as_str().to_owned());
+    let signing_key = SigningKey::from_bytes(&[9u8; 32]);
+    let export = crate::context::export_import::create_export(
+        snapshot,
+        event_log_data,
+        creator,
+        crate::context::export_import::ExportScope::Full,
+        &scp_clock::SystemClock,
+        |hash: &[u8; 32]| Ok::<_, scp_crypto::CustodyFailure>(signing_key.sign(hash).to_bytes()),
+    )
+    .expect("build a valid signed full export");
+    (export, signing_key.verifying_key())
+}
+
+/// An import of a joined context whose discard has not finished is refused at
+/// its first-state claim, before it writes. The import holds
+/// `bootstrap_spawn_lock` from its departed-actor wait onward, so the
+/// discard's teardown cannot delete and clear its mark until the import ends;
+/// the claim is the check that stops it. The gate stays armed after the
+/// actor's last write is let through, so a persist from the import would
+/// stop at the gate, and the count of held writes shows it.
+#[tokio::test]
+async fn an_import_during_a_discard_is_refused_before_it_writes() {
+    let gated = GatedPersistence::new();
+    let (result, j) = join_bob(0x80, Some(Box::new(gated.clone()))).await;
+    result.expect("the happy-path join succeeds");
+    let held = j
+        .sup
+        .lookup(&j.ctx_id)
+        .expect("a live context actor is registered for the joiner");
+    let snapshot = gated
+        .inner
+        .load_context(&j.ctx_id)
+        .await
+        .expect("load never errors")
+        .expect("the join persisted its snapshot");
+    let (export, verifying_key) = signed_full_export(snapshot, &j.ctx_bytes).await;
+    gated.arm();
+
+    let sup = Arc::clone(&j.sup);
+    let id = j.ctx_id.clone();
+    let discard = tokio::spawn(async move { sup.discard_joined_context(&id).await });
+    gated.entered.notified().await;
+
+    let sup = Arc::clone(&j.sup);
+    let import =
+        tokio::spawn(async move { sup.import_context(export, &verifying_key, None).await });
+    for _ in 0..10_000 {
+        if j.sup.bootstrap_spawn_lock.try_lock().is_err() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        j.sup.bootstrap_spawn_lock.try_lock().is_err(),
+        "the import holds bootstrap_spawn_lock while it waits for the removed actor"
+    );
+
+    // Let the actor's last write through; the gate stays armed.
+    gated.gate.add_permits(1);
+    let refused = tokio::time::timeout(std::time::Duration::from_secs(20), import)
+        .await
+        .expect("the import returns without writing (a write would wait at the gate)")
+        .expect("the import task does not panic");
+    assert!(
+        matches!(
+            refused,
+            Err(crate::context::ContextError::ContextNotRegistered(_))
+        ),
+        "the import is refused by the pending discard, got {refused:?}"
+    );
+    assert_eq!(
+        gated.held.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "only the discarded actor's last write reached persistence; the import wrote nothing"
+    );
+
+    gated.release();
+    let removed = discard
+        .await
+        .expect("the discard task does not panic")
+        .expect("the discard deletes the snapshot once the import has ended");
+    assert!(removed, "the discard removed the live actor handle");
+    assert!(held.is_closed(), "the discarded actor exited");
+    assert!(
+        !gated.has_snapshot(&j.ctx_id).await,
+        "no snapshot of the discarded context remains"
     );
 }
 

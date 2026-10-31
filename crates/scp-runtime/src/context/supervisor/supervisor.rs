@@ -1294,18 +1294,40 @@ impl DiscardedActor {
     }
 }
 
-/// Clears a [`Supervisor::discard_joined_context`] pending mark on drop. The
-/// teardown future owns it, so the mark lasts until the teardown has run, and
-/// a teardown cancelled with its runtime never leaves the id refused forever.
+/// The [`Supervisor::discard_joined_context`] pending mark of one id. The
+/// teardown owns it and clears the mark only through [`Self::finish`], once
+/// the snapshot is deleted. Drop never clears it: a teardown that is
+/// cancelled (its caller dropped while it ran inline, or its runtime shut
+/// down) or that unwinds from a panic leaves the id refused until the process
+/// restarts, because the snapshot may still be in place and a registration
+/// meanwhile would bring back the discarded context (fail closed).
 struct PendingDiscardMark {
     supervisor: std::sync::Weak<Supervisor>,
-    context_id: String,
+    /// `Some` until [`Self::finish`] clears the mark.
+    context_id: Option<String>,
+}
+
+impl PendingDiscardMark {
+    /// Clears the pending mark. The teardown calls it after the snapshot
+    /// delete; it is the only code that removes an id from
+    /// `pending_discards`.
+    fn finish(mut self) {
+        if let Some(context_id) = self.context_id.take()
+            && let Some(supervisor) = self.supervisor.upgrade()
+        {
+            supervisor.pending_discards.remove(&context_id);
+        }
+    }
 }
 
 impl Drop for PendingDiscardMark {
     fn drop(&mut self) {
-        if let Some(supervisor) = self.supervisor.upgrade() {
-            supervisor.pending_discards.remove(&self.context_id);
+        if let Some(context_id) = &self.context_id {
+            tracing::error!(
+                context_id,
+                "discard of a joined context ended before its teardown finished; the id stays \
+                 refused until restart and its snapshot may remain"
+            );
         }
     }
 }
@@ -1344,9 +1366,10 @@ fn report_discard(report: &mut Option<DiscardReport>, outcome: Result<(), Contex
 /// with no bound. Once the actor has exited, the task finishes the teardown
 /// ([`Supervisor::finish_discard`]); while another departing actor of the id
 /// still runs, it waits for that actor too and tries again, reporting
-/// [`ContextError::ActorBusy`] if `report` is still waiting. It clears the
-/// pending mark, then reports the teardown's result, or logs it at error level
-/// when the caller already had its answer.
+/// [`ContextError::ActorBusy`] if `report` is still waiting. Once the snapshot
+/// is deleted it clears the pending mark ([`PendingDiscardMark::finish`]);
+/// after a failed delete the mark stays. It then reports the teardown's
+/// result, or logs it at error level when the caller already had its answer.
 ///
 /// Holds a `Weak<Supervisor>` (ADR-049 Decision 16) and the persistence
 /// strongly: once the Supervisor has dropped, its floor and tracker registries
@@ -1361,7 +1384,20 @@ async fn run_discard_teardown(
 ) {
     let mut report = Some(report);
     let waited = match &discarded {
-        DiscardedActor::Registered(handle) => handle.shutdown_and_await_exit().await,
+        // The inbox closes when `run()` returns, a moment before the task
+        // ends; the discard tracked the actor as departing, so the departed
+        // wait covers that moment and the finish step below finds no running
+        // actor and reports no `ActorBusy` for it.
+        DiscardedActor::Registered(handle) => match handle.shutdown_and_await_exit().await {
+            Ok(()) => match supervisor.upgrade() {
+                Some(live) => live
+                    .wait_for_departed_actors(&context_id, DepartedWait::Await)
+                    .await
+                    .map(|_ended| ()),
+                None => Ok(()),
+            },
+            Err(wait_error) => Err(wait_error),
+        },
         DiscardedActor::Departed(_) => match supervisor.upgrade() {
             Some(live) => live
                 .wait_for_departed_actors(&context_id, DepartedWait::Await)
@@ -1399,7 +1435,14 @@ async fn run_discard_teardown(
             Err(error) => break Err(error),
         }
     };
-    drop(mark);
+    // Only a deleted snapshot clears the mark. After a failed delete the
+    // snapshot is still in place, so the id stays refused until restart and
+    // the mark's drop logs it.
+    if finished.is_ok() {
+        mark.finish();
+    } else {
+        drop(mark);
+    }
     match report.take() {
         Some(sender) => {
             let _receiver_dropped = sender.send(finished);
@@ -2205,14 +2248,16 @@ pub struct Supervisor {
     helper_persistence: OnceLock<Arc<dyn ContextPersistence>>,
     /// Ids whose [`Self::discard_joined_context`] removed the actor and has
     /// not yet finished its teardown. Marked under `bootstrap_spawn_lock` and
-    /// `write_lock` together with the registry removal, cleared once the
-    /// teardown has run (or when the teardown task is cancelled with its
-    /// runtime). While an id is marked, `refuse_pending_discard` refuses a
+    /// `write_lock` together with the registry removal, and cleared only by
+    /// `PendingDiscardMark::finish` once the snapshot is deleted; a teardown
+    /// that ends early leaves the id marked until the process restarts.
+    /// While an id is marked, `refuse_pending_discard` refuses a
     /// second discard of it, every registration of an actor for it, and every
     /// first-state write of it, so nothing can write back the snapshot the
     /// discard is about to delete.
-    pending_discards: dashmap::DashSet<String>,
-    /// Actors a [`Self::despawn_actor`] removed from the registry while their
+    pub(in crate::context::supervisor) pending_discards: dashmap::DashSet<String>,
+    /// Actors a [`Self::despawn_actor`] or [`Self::discard_joined_context`]
+    /// removed from the registry while their
     /// task still ran, by context id. A removed actor keeps running until it
     /// leaves its loop and its post-loop persist has run, so a respawn,
     /// restore, import replace, create or dormant drain of the id waits for
@@ -7542,9 +7587,16 @@ impl Supervisor {
     /// with no time bound and then finishes the teardown. Once shutdown has
     /// begun the tracker takes no task, so this call runs the teardown inline
     /// and returns only after the actor has exited. Either way no write from
-    /// the actor lands after the delete. One gap remains: if the process dies
-    /// while a wedged actor is still running, the join's snapshot is still in
-    /// place and the next start restores the context.
+    /// the actor lands after the delete.
+    ///
+    /// Only a finished teardown clears the pending mark
+    /// ([`PendingDiscardMark::finish`]). A teardown that ends early (its
+    /// inline run cancelled with the caller, its task cancelled with the
+    /// runtime, a panic, or a failed delete) leaves the id refused until the
+    /// process restarts. The removed actor is tracked as departing, so a
+    /// bootstrap of the id also waits for it. One gap remains: if the process
+    /// dies before the delete, the join's snapshot is still in place and the
+    /// next start restores the context.
     ///
     /// Returns `Ok(true)` if a live actor handle was registered and removed,
     /// `Ok(false)` if no entry existed for `context_id`.
@@ -7562,8 +7614,9 @@ impl Supervisor {
     ///   and [`ContextError::ActorBusy`] while a create, import or join of the
     ///   id has not committed or rolled back its first state; neither removes
     ///   or deletes anything.
-    /// - [`ContextError::SupervisorShutDown`] when the teardown task ended
-    ///   without reporting, as when its runtime shut down.
+    /// - [`ContextError::ActorCrashed`] when the teardown task ended without
+    ///   reporting (it panicked, or its runtime shut down); the id stays
+    ///   refused until restart.
     pub async fn discard_joined_context(
         self: &Arc<Self>,
         context_id: &str,
@@ -7598,8 +7651,19 @@ impl Supervisor {
             // can have left its actor running, and that actor's post-loop
             // persist would re-create the snapshot step 3 deletes, so the
             // discard waits for it exactly as it waits for a registered one.
+            //
+            // A removed registered actor is tracked as departing here, under
+            // both locks, as `despawn_actor` tracks one: whatever happens to
+            // the teardown, every later bootstrap of the id waits for that
+            // actor's task to end (`await_departed_actors`) before it reads
+            // or writes.
             let discarded = match removed {
-                Some((_, handle)) => DiscardedActor::Registered(handle),
+                Some((_, handle)) => {
+                    if let Some(departing) = handle.departure() {
+                        self.track_departing_actor(context_id, departing);
+                    }
+                    DiscardedActor::Registered(handle)
+                }
                 None => DiscardedActor::Departed(
                     self.departing_actors
                         .get(context_id)
@@ -7612,7 +7676,7 @@ impl Supervisor {
                 discarded,
                 PendingDiscardMark {
                     supervisor: Arc::downgrade(self),
-                    context_id: context_id.to_owned(),
+                    context_id: Some(context_id.to_owned()),
                 },
             )
         };
@@ -7646,9 +7710,10 @@ impl Supervisor {
         outcome
             .await
             .unwrap_or_else(|_teardown_dropped| {
-                Err(ContextError::SupervisorShutDown(format!(
-                    "discard of joined context '{context_id}': the teardown task ended before \
-                     it reported"
+                // The teardown dropped its report unsent: it panicked or was
+                // cancelled with its runtime. Its pending mark stays.
+                Err(ContextError::ActorCrashed(format!(
+                    "{context_id} (discard teardown task ended without reporting)"
                 )))
             })
             .map(|()| registered)
@@ -13404,6 +13469,12 @@ impl Supervisor {
     /// - Whatever error [`Self::read_context_state_checked`] returns at
     ///   step 2 for a context it does not recreate: [`ContextError::ActorBusy`]
     ///   for a registered actor that did not answer.
+    /// - [`ContextError::ActorBusy`] when an actor a despawn or discard removed
+    ///   for the id did not exit within the reply bound.
+    /// - [`ContextError::ContextNotRegistered`] while a
+    ///   [`Self::discard_joined_context`] of the id has not finished its
+    ///   teardown: the recreate's first-state claim is refused
+    ///   ([`Self::refuse_pending_discard`]) and nothing is created or written.
     /// - [`ContextError::TransportFailed`] if context creation fails and no
     ///   concurrent creation resolved the id.
     pub(in crate::context) async fn standing_context(
@@ -25374,6 +25445,84 @@ mod tests {
 
         // Shut down the survivor to avoid a leaked task.
         let _ = h1.send_shutdown().await;
+    }
+
+    /// The registry insert refuses an id whose discard has not finished its
+    /// teardown, and registers nothing: an actor registered then would
+    /// persist the snapshot the teardown deletes. Every registration path
+    /// reaches this insert, so the direct call stands for all of them.
+    #[tokio::test]
+    async fn spawn_actor_with_state_refuses_an_id_with_a_pending_discard() {
+        let sup = supervisor_with_providers();
+        let ctx_id_bytes = [0xD7u8; 32];
+        let ctx_key = hex::encode(ctx_id_bytes);
+        sup.pending_discards.insert(ctx_key.clone());
+
+        let state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            1_700_000_000,
+            DID("did:example:admin".to_owned()),
+        );
+        let deps = test_actor_deps(&sup).await;
+        let refused = sup.spawn_actor_with_state(state, deps, None).await;
+        assert!(
+            matches!(refused, Err(ContextError::ContextNotRegistered(_))),
+            "the registry insert refuses an id with a pending discard"
+        );
+        assert!(
+            sup.lookup(&ctx_key).is_none(),
+            "the refused spawn registers no actor"
+        );
+    }
+
+    /// The discard's finish step deletes nothing while an actor removed for
+    /// the id still runs, since that actor's post-loop persist would write the
+    /// snapshot back. Production reaches it when the discard's unbounded exit
+    /// wait returns at the inbox close, a moment before the removed actor's
+    /// task ends; this test holds the removed actor running to reach it
+    /// deterministically.
+    #[tokio::test]
+    async fn finish_discard_waits_while_a_removed_actor_still_runs() {
+        let sup = supervisor_with_providers();
+        let ctx_id_bytes = [0xD8u8; 32];
+        let ctx_key = hex::encode(ctx_id_bytes);
+        let state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            1_700_000_000,
+            DID("did:example:admin".to_owned()),
+        );
+        let deps = test_actor_deps(&sup).await;
+        let held = sup
+            .spawn_actor_with_state(state, deps, None)
+            .await
+            .expect("the spawn registers an actor");
+        assert!(sup.despawn_actor(&ctx_key).await);
+        assert!(
+            !held.is_closed(),
+            "the held clone keeps the removed actor running"
+        );
+
+        let step = sup
+            .finish_discard(&ctx_key)
+            .await
+            .expect("the finish step does not fail");
+        assert!(
+            matches!(&step, DiscardTeardown::DepartingRunning(running) if running.len() == 1),
+            "the finish step deletes nothing while the removed actor runs"
+        );
+
+        held.stop_and_await_exit_unbounded().await;
+        sup.wait_for_departed_actors(&ctx_key, DepartedWait::Await)
+            .await
+            .expect("the removed actor's task ends");
+        let step = sup
+            .finish_discard(&ctx_key)
+            .await
+            .expect("the finish step does not fail");
+        assert!(
+            matches!(step, DiscardTeardown::Done),
+            "the finish step tears down once the removed actor has ended"
+        );
     }
 
     /// `shutdown_all_contexts` must DEREGISTER every actor, not just
