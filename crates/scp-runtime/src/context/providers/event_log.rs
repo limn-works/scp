@@ -72,11 +72,14 @@ use scp_protocol::context::builder::ContextCreationError;
 struct ContextLog {
     /// The RFC 6962 Merkle tree of events for this context.
     log: EventLog,
-    /// Set when a unit persist or a replace failed, so the stored log may
-    /// differ from `log`. While it is set, the next write replaces the whole
-    /// stored log with `log`, and only a replace that succeeds clears it
-    /// (spec section 17.3, "Merkle event log entries"). Read and written only
-    /// under the context's write gate.
+    /// Set when the stored log may differ from `log`. While it is set, the
+    /// next write replaces the whole stored log with `log`, and only a write
+    /// whose storage and memory both took it clears it (spec section 17.3,
+    /// "Merkle event log entries"). Every stored write sets it before it
+    /// starts (`mark_stored_write`), so a write that fails, or is cancelled
+    /// after storage took it and before memory did, leaves it set: storage
+    /// can never run ahead of memory unrecorded. Read and written only under
+    /// the context's write gate.
     storage_diverged: bool,
 }
 
@@ -908,6 +911,7 @@ impl MerkleEventLogProvider {
         let Some(ref persistence) = self.persistence else {
             return Ok(());
         };
+        self.mark_stored_write(context_id);
         let context_id_hex = hex::encode(context_id);
         persistence
             .persist_unit(&context_id_hex, base_seq, entries)
@@ -935,6 +939,7 @@ impl MerkleEventLogProvider {
         let Some(ref persistence) = self.persistence else {
             return Ok(());
         };
+        self.mark_stored_write(context_id);
         let context_id_hex = hex::encode(context_id);
         persistence
             .replace(&context_id_hex, entries)
@@ -966,6 +971,22 @@ impl MerkleEventLogProvider {
                     "deleting the stored event log of context {context_id_hex} failed: {e}"
                 ))
             })
+    }
+
+    /// Marks the context's stored log diverged as a stored write starts. The
+    /// write may land in storage and then be cancelled (a drain's time bound
+    /// drops the future) before memory takes it, and no settle runs then; the
+    /// mark, set first, records that storage may be ahead. The write's own
+    /// success path clears it once memory has taken the write. A context with
+    /// no log in memory has nothing to mark.
+    fn mark_stored_write(&self, context_id: &[u8; 32]) {
+        let mut logs = self
+            .logs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(log) = logs.get_mut(context_id) {
+            log.storage_diverged = true;
+        }
     }
 
     /// Settles a write after its persist returned, `stored` telling whether
@@ -3450,6 +3471,106 @@ mod tests {
             "both providers hold the unit exactly once, at the same sequences"
         );
         assert_reload_matches(&faulty, &provider, &ctx_id, "unit retry").await;
+    }
+
+    /// Persistence over the store bridge that, once `stall` is set, lets a
+    /// unit put land and then never returns, as a write that a time bound
+    /// cancels after storage took it.
+    struct LandThenStall {
+        inner: crate::store::context::ProtocolRepositoryEventLogBridge<std::sync::Arc<Faulty>>,
+        stall: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl EventLogPersistence for LandThenStall {
+        async fn persist_unit(
+            &self,
+            context_id: &str,
+            base_seq: u64,
+            entries: &[Event],
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.inner
+                .persist_unit(context_id, base_seq, entries)
+                .await?;
+            if self.stall.load(std::sync::atomic::Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
+            Ok(())
+        }
+
+        async fn replace(
+            &self,
+            context_id: &str,
+            entries: &[Event],
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.inner.replace(context_id, entries).await
+        }
+
+        async fn load_entries(
+            &self,
+            context_id: &str,
+        ) -> Result<Option<Vec<Event>>, Box<dyn std::error::Error + Send + Sync>> {
+            self.inner.load_entries(context_id).await
+        }
+
+        async fn delete_entries(
+            &self,
+            context_id: &str,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.inner.delete_entries(context_id).await
+        }
+    }
+
+    /// A unit write cancelled after storage took it and before memory did
+    /// leaves the stored log marked diverged, so the next write replaces
+    /// storage with memory instead of failing as misaligned against a stored
+    /// log one unit ahead (spec 17 §17.3 "Event log write failures").
+    #[tokio::test]
+    async fn a_unit_write_cancelled_after_storage_took_it_marks_the_stored_log_diverged() {
+        let ctx_id = [43u8; 32];
+        let faulty = fresh_faulty();
+        let persistence = std::sync::Arc::new(LandThenStall {
+            inner: crate::store::context::ProtocolRepositoryEventLogBridge::new(
+                std::sync::Arc::new(crate::store::ProtocolRepository::new_for_testing(
+                    std::sync::Arc::clone(&faulty),
+                )),
+            ),
+            stall: std::sync::atomic::AtomicBool::new(false),
+        });
+        let provider = MerkleEventLogProvider::with_persistence(
+            std::sync::Arc::clone(&persistence) as std::sync::Arc<dyn EventLogPersistence>,
+        );
+        provider.init_event_log(&ctx_id).await.unwrap();
+        append_n(&provider, &ctx_id, 0xA3, 2).await;
+
+        persistence
+            .stall
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let guard = provider.lock_for_unit(&ctx_id).await.unwrap();
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            provider.append_unit(guard, 2, &[unit_leaf(1)]),
+        )
+        .await;
+        assert!(cancelled.is_err(), "the stalled write is cancelled");
+        persistence
+            .stall
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            provider.entries(&ctx_id).unwrap().len(),
+            2,
+            "memory never took the cancelled unit"
+        );
+
+        // A different unit planned from memory at the same sequence lands.
+        let guard = provider.lock_for_unit(&ctx_id).await.unwrap();
+        assert_eq!(guard.log_len(), 2);
+        let next = provider.append_unit(guard, 2, &[unit_leaf(2)]).await;
+        assert!(
+            matches!(next, Ok(UnitAppended::Appended)),
+            "the next write replaces the stored log that ran ahead: {next:?}"
+        );
+        assert_reload_matches(&faulty, &provider, &ctx_id, "cancelled unit write").await;
     }
 
     /// A unit whose `base_seq` is past the log's end is refused as past the
