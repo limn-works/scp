@@ -895,8 +895,8 @@ impl SupervisorHandle {
         Ok(self.upgrade()?.despawn_actor(context_id).await)
     }
 
-    /// Despawn the actor an import is replacing, and mark the gap until the
-    /// replacement registers (ADR-049 §10). See
+    /// Despawn the actor an import is replacing, wait for its task to end,
+    /// and mark the gap until the replacement registers (ADR-049 §10). See
     /// [`Supervisor::despawn_for_replace`](crate::context::supervisor::Supervisor::despawn_for_replace).
     ///
     /// # Visibility
@@ -906,7 +906,7 @@ impl SupervisorHandle {
         &self,
         context_id: &str,
     ) -> Result<bool, ContextError> {
-        Ok(self.upgrade()?.despawn_for_replace(context_id).await)
+        self.upgrade()?.despawn_for_replace(context_id).await
     }
 
     /// Whether the context is poisoned (ADR-049 §10) — its actor exceeded

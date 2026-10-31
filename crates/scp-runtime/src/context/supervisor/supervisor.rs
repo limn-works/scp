@@ -1161,6 +1161,22 @@ impl CrashWindow {
 /// waits (ADR-049 Decision 16). It upgrades once the actor exits, for the one
 /// crash-handling operation; a failed upgrade means every owner dropped the
 /// Supervisor, so no respawn is possible and the watchdog ends.
+/// Whether [`Supervisor::await_departed_actors`] waits for a removed actor
+/// that still runs, or refuses at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DepartedWait {
+    /// Stop the removed actor and wait, bounded, for its task to end.
+    Await,
+    /// Refuse with a retryable error. An actor turn uses it: the removed
+    /// actor may be waiting on that turn, so waiting could only time out.
+    Refuse,
+}
+
+/// Proof that no actor a despawn removed for a context still runs. Only
+/// [`Supervisor::await_departed_actors`] makes one, and the dormant drain
+/// requires it, so no drain can run beside the context's last actor.
+struct DepartedActorsEnded(());
+
 fn spawn_actor_watchdog_task(
     permit: &SpawnPermit<'_>,
     supervisor: std::sync::Weak<Supervisor>,
@@ -1174,6 +1190,7 @@ fn spawn_actor_watchdog_task(
             log_watchdog_without_supervisor("context_actor", &ctx_id, &outcome);
             return;
         };
+        supervisor.prune_departed_actors(&ctx_id);
         supervisor.actor_watchdog(ctx_id, owning_did, outcome).await;
     });
 }
@@ -2080,6 +2097,14 @@ pub struct Supervisor {
     /// (`refuse_pending_discard`), so it cannot restore the context from the
     /// snapshot the discard is about to delete.
     pending_discards: dashmap::DashSet<String>,
+    /// Actors a [`Self::despawn_actor`] removed from the registry while their
+    /// task still ran, by context id. A removed actor keeps running until it
+    /// leaves its loop and its post-loop persist has run, so a respawn,
+    /// restore, import replace, create or dormant drain of the id waits for
+    /// every listed actor's task to end before it loads the snapshot or
+    /// writes the log ([`Self::await_departed_actors`]). The watchdog drops
+    /// an entry when its task ends, so the map holds only running actors.
+    departing_actors: DashMap<String, Vec<crate::context::actor::handle::DepartingActor>>,
     /// Context ids whose first-state writes a create, import, Welcome join,
     /// standing-context create or migration create has started and not yet
     /// committed or rolled back
@@ -2588,6 +2613,7 @@ impl Supervisor {
             write_lock,
             bootstrap_spawn_lock,
             pending_discards: dashmap::DashSet::new(),
+            departing_actors: DashMap::new(),
             pending_first_state: dashmap::DashSet::new(),
             first_state_settled: tokio::sync::Notify::new(),
             saga_journal,
@@ -4238,6 +4264,18 @@ impl Supervisor {
                     }
                     return Outcome::err_mutated(ContextError::CreationFailed(msg));
                 }
+                // An actor a despawn removed for this id may still be running;
+                // its post-loop persist would land over the created snapshot.
+                if let Err(e) = self
+                    .await_departed_actors(&context_id, DepartedWait::Await, &bootstrap_guard)
+                    .await
+                {
+                    let sketch = standing_outcome_error_sketch(&e);
+                    if let Err(_unsent) = reply.send(Err(e.into())) {
+                        tracing::debug!(context_id, "create_context caller dropped its reply");
+                    }
+                    return Outcome::err(sketch);
+                }
                 // (Re)creating this id is a fresh start: the fresh actor begins
                 // with a clean budget and does not inherit a previous
                 // instance's crash count or sticky poison (ADR-049 §10). A
@@ -4508,6 +4546,20 @@ impl Supervisor {
                     return Outcome::err_mutated(sketch);
                 }
                 let bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
+                // An actor a despawn removed for this id may still be running;
+                // its post-loop persist would land over the imported snapshot.
+                // (A registered actor is replaced inside the import, which
+                // waits for that one through `despawn_for_replace`.)
+                if let Err(e) = self
+                    .await_departed_actors(&context_id, DepartedWait::Await, &bootstrap_guard)
+                    .await
+                {
+                    let sketch = standing_outcome_error_sketch(&e);
+                    if let Err(_unsent) = reply.send(Err(e)) {
+                        tracing::debug!(context_id, "import_context caller dropped its reply");
+                    }
+                    return Outcome::err(sketch);
+                }
                 // Importing (re-establishing) this id is a fresh start: the
                 // imported actor begins with a clean budget, free of stale
                 // crash history and a stale poison (ADR-049 §10); a failed
@@ -4656,6 +4708,17 @@ impl Supervisor {
                 // A restore must not start an actor from a snapshot a failed
                 // create, import or join wrote and has not yet put back.
                 if let Err(e) = self.refuse_pending_first_state(&p.context_id, &bootstrap_guard) {
+                    let sketch = standing_outcome_error_sketch(&e);
+                    let _ = reply.send(Err(e));
+                    return Outcome::err(sketch);
+                }
+                // Nor while an actor a despawn removed for the id still runs:
+                // the restore would load a snapshot that actor may yet persist
+                // over, and drain units that actor may yet append.
+                if let Err(e) = self
+                    .await_departed_actors(&p.context_id, DepartedWait::Await, &bootstrap_guard)
+                    .await
+                {
                     let sketch = standing_outcome_error_sketch(&e);
                     let _ = reply.send(Err(e));
                     return Outcome::err(sketch);
@@ -5471,6 +5534,7 @@ impl Supervisor {
             self.respawn_from_snapshot_locked(
                 &notification.context_id,
                 &owning_did,
+                DepartedWait::Refuse,
                 &bootstrap_guard,
             )
             .await?;
@@ -5891,9 +5955,13 @@ impl Supervisor {
         // loop — no separate supervisor timer JoinSet exists.
         let inbox = rx;
         let exit = handle.exit_record();
+        // Armed before the task starts and dropped when the task ends, after
+        // `run()`'s post-loop persist, so a despawn can wait for that end.
+        let task_guard = exit.arm();
         let join = permit.spawn(async move {
             Box::pin(crate::context::actor::ContextActor::new(state, deps, inbox, exit).run())
                 .await;
+            drop(task_guard);
         });
 
         // Spawn the watchdog: it awaits the actor's completion and, on a
@@ -6274,7 +6342,7 @@ impl Supervisor {
         // `build_actor_deps`, nor `restore_context` re-acquires
         // `bootstrap_spawn_lock`, so this is re-entrancy- and deadlock-free.
         let bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
-        self.respawn_from_snapshot_locked(ctx_id, owning_did, &bootstrap_guard)
+        self.respawn_from_snapshot_locked(ctx_id, owning_did, DepartedWait::Await, &bootstrap_guard)
             .await
     }
 
@@ -6315,7 +6383,7 @@ impl Supervisor {
                 "{ctx_id} (the crashed actor no longer holds the id; not respawned)"
             )));
         }
-        self.respawn_from_snapshot_locked(ctx_id, owning_did, &bootstrap_guard)
+        self.respawn_from_snapshot_locked(ctx_id, owning_did, DepartedWait::Await, &bootstrap_guard)
             .await
     }
 
@@ -6394,6 +6462,9 @@ impl Supervisor {
         let bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
         self.refuse_pending_discard(ctx_id, &bootstrap_guard)?;
         self.refuse_pending_first_state(ctx_id, &bootstrap_guard)?;
+        let ended = self
+            .await_departed_actors(ctx_id, DepartedWait::Await, &bootstrap_guard)
+            .await?;
         let persistence = self.persistence_ref().ok_or_else(|| {
             ContextError::PersistenceFailed("no persistence provider configured".into())
         })?;
@@ -6409,8 +6480,13 @@ impl Supervisor {
             .ok_or_else(|| {
                 ContextError::ContextNotRegistered(format!("{ctx_id} has no stored snapshot"))
             })?;
-        self.drain_dormant_snapshot_locked(snapshot, &bootstrap_guard)
-            .await
+        let drained = self
+            .drain_dormant_snapshot_locked(snapshot, &ended, &bootstrap_guard)
+            .await;
+        // The lock is held through the drain, so no bootstrap of the id runs
+        // beside it.
+        drop(bootstrap_guard);
+        drained
     }
 
     /// Body of [`Self::drain_dormant_context`] for a caller that holds
@@ -6422,6 +6498,7 @@ impl Supervisor {
     async fn drain_dormant_snapshot_locked(
         &self,
         snapshot: Box<crate::context::state::ContextSnapshot>,
+        _departed_actors_ended: &DepartedActorsEnded,
         _bootstrap_guard: &tokio::sync::MutexGuard<'_, ()>,
     ) -> Result<crate::context::log_unit_helpers::DormantDrain, ContextError> {
         if self.lookup(&snapshot.context_id).is_some() {
@@ -6450,10 +6527,15 @@ impl Supervisor {
     /// holds `bootstrap_spawn_lock`; the guard parameter proves it.
     /// [`Self::clear_poison`] takes the lock itself so that it clears the
     /// poison flag and sets the respawn marker under the lock.
+    ///
+    /// `wait` says whether to wait for an actor a despawn removed for the id
+    /// ([`Self::await_departed_actors`]); an actor turn passes
+    /// [`DepartedWait::Refuse`].
     async fn respawn_from_snapshot_locked(
         self: &Arc<Self>,
         ctx_id: &str,
         owning_did: &DID,
+        wait: DepartedWait,
         bootstrap_guard: &tokio::sync::MutexGuard<'_, ()>,
     ) -> Result<(), ContextError> {
         // A context whose discard is in progress must not come back: its
@@ -6474,8 +6556,22 @@ impl Supervisor {
             .or_default()
             .mark_respawning();
 
-        // 1. Despawn the stale handle so the re-insert is not rejected.
+        // 1. Despawn the stale handle so the re-insert is not rejected, and
+        //    wait for every removed actor of the id to end its task: one still
+        //    running could append the units this respawn's drain appends, or
+        //    persist over the snapshot it loads. A refused wait loads nothing
+        //    and is not a crash.
         self.despawn_actor(ctx_id).await;
+        let ended = match self
+            .await_departed_actors(ctx_id, wait, bootstrap_guard)
+            .await
+        {
+            Ok(ended) => ended,
+            Err(e) => {
+                self.release_respawn_marker(ctx_id);
+                return Err(e);
+            }
+        };
 
         // 2. Load the snapshot. None ⇒ lost state (crashed pre-persist).
         let Some(persistence) = self.persistence_ref() else {
@@ -6551,7 +6647,7 @@ impl Supervisor {
             // next restore; the respawn's answer stays `ContextClosed`.
             if (!snapshot.pending_log_units.is_empty() || snapshot.log_fault.is_some())
                 && let Err(e) = self
-                    .drain_dormant_snapshot_locked(Box::new(snapshot), bootstrap_guard)
+                    .drain_dormant_snapshot_locked(Box::new(snapshot), &ended, bootstrap_guard)
                     .await
             {
                 tracing::error!(
@@ -6961,7 +7057,7 @@ impl Supervisor {
             entry.clear();
             entry.mark_respawning();
         }
-        self.respawn_from_snapshot_locked(ctx_id, owning_did, &bootstrap_guard)
+        self.respawn_from_snapshot_locked(ctx_id, owning_did, DepartedWait::Await, &bootstrap_guard)
             .await
     }
 
@@ -7037,11 +7133,101 @@ impl Supervisor {
     /// spurious `MemberLeft` event.
     pub async fn despawn_actor(&self, context_id: &str) -> bool {
         let _guard = self.write_lock.lock().await;
-        let removed = self.actors.remove(context_id).is_some();
-        if removed {
-            self.note_push_routes_changed();
+        let Some((_, handle)) = self.actors.remove(context_id) else {
+            return false;
+        };
+        self.note_push_routes_changed();
+        // The removed actor may still be mid-turn, and its post-loop persist
+        // runs after its loop ends. Track it until its task ends so the next
+        // bootstrap of this id waits for it (`await_departed_actors`).
+        if let Some(departing) = handle.departure() {
+            let mut entry = self
+                .departing_actors
+                .entry(context_id.to_owned())
+                .or_default();
+            entry.retain(crate::context::actor::handle::DepartingActor::task_running);
+            entry.push(departing);
         }
-        removed
+        true
+    }
+
+    /// Drops the tracked departing actors of `context_id` whose task has
+    /// ended, and the id's entry once none is left. The watchdog calls it
+    /// when the actor task it awaits ends.
+    fn prune_departed_actors(&self, context_id: &str) {
+        self.departing_actors
+            .remove_if_mut(context_id, |_, departing| {
+                departing.retain(crate::context::actor::handle::DepartingActor::task_running);
+                departing.is_empty()
+            });
+    }
+
+    /// Waits until no actor a despawn removed for `context_id` still runs,
+    /// so the caller's snapshot load, log write or new actor cannot interleave
+    /// with the removed actor's last turn or its post-loop persist. Each
+    /// running actor is sent `Shutdown` and awaited until its task has ended,
+    /// all within one
+    /// [`REPLY_TIMEOUT`](crate::context::actor::REPLY_TIMEOUT).
+    ///
+    /// [`DepartedWait::Refuse`] does not wait: an actor turn uses it, because
+    /// the departing actor may itself be waiting on that turn.
+    ///
+    /// The guard parameter proves the caller holds `bootstrap_spawn_lock`, so
+    /// no other bootstrap of the id registers an actor while this waits. The
+    /// wait holds no `write_lock`, which a departing actor's TTL self-despawn
+    /// takes.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::ActorBusy`] when a departing actor is still running
+    /// after the bound, or at once under [`DepartedWait::Refuse`]; it is
+    /// retryable, and the caller has loaded and written nothing.
+    async fn await_departed_actors(
+        &self,
+        context_id: &str,
+        wait: DepartedWait,
+        _bootstrap_guard: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> Result<DepartedActorsEnded, ContextError> {
+        self.wait_for_departed_actors(context_id, wait).await
+    }
+
+    /// Body of [`Self::await_departed_actors`], for
+    /// [`Self::despawn_for_replace`], whose caller holds
+    /// `bootstrap_spawn_lock` without a guard to show for it.
+    async fn wait_for_departed_actors(
+        &self,
+        context_id: &str,
+        wait: DepartedWait,
+    ) -> Result<DepartedActorsEnded, ContextError> {
+        self.prune_departed_actors(context_id);
+        let running: Vec<crate::context::actor::handle::DepartingActor> = self
+            .departing_actors
+            .get(context_id)
+            .map(|entry| entry.value().clone())
+            .unwrap_or_default();
+        if running.is_empty() {
+            return Ok(DepartedActorsEnded(()));
+        }
+        if wait == DepartedWait::Refuse {
+            return Err(ContextError::ActorBusy(format!(
+                "{context_id}: a removed actor for this context is still running; retry"
+            )));
+        }
+        let all_ended = async {
+            for departing in &running {
+                departing.stop_and_await_task_end().await;
+            }
+        };
+        let waited = tokio::time::timeout(crate::context::actor::REPLY_TIMEOUT, all_ended).await;
+        self.prune_departed_actors(context_id);
+        match waited {
+            Ok(()) => Ok(DepartedActorsEnded(())),
+            Err(_elapsed) => Err(ContextError::ActorBusy(format!(
+                "{context_id}: a removed actor for this context did not exit within {} seconds; \
+                 retry",
+                crate::context::actor::REPLY_TIMEOUT.as_secs()
+            ))),
+        }
     }
 
     /// Despawn the actor that `import_context` is replacing, and mark the
@@ -7059,14 +7245,32 @@ impl Supervisor {
     /// the two. The [`BootstrapCrashWindow`] the supervisor's
     /// `ImportContext` arm holds clears it on every exit, after the imported
     /// actor registers or the import fails.
-    pub(in crate::context) async fn despawn_for_replace(&self, context_id: &str) -> bool {
+    ///
+    /// It then waits for the replaced actor's task to end
+    /// ([`Self::await_departed_actors`]): that actor's post-loop persist runs
+    /// after its `PrepareForReplace` reply, and must not land over the
+    /// imported snapshot. Only `import_context`, which the `ImportContext`
+    /// arm runs while it holds `bootstrap_spawn_lock`, reaches this; that
+    /// lock is not threaded through the import, so this takes no guard.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::ActorBusy`] when the replaced actor has not exited
+    /// within [`REPLY_TIMEOUT`](crate::context::actor::REPLY_TIMEOUT).
+    pub(in crate::context) async fn despawn_for_replace(
+        &self,
+        context_id: &str,
+    ) -> Result<bool, ContextError> {
         // Drop the DashMap guard before the `.await` below (the workspace
         // denies `await_holding_lock`).
         self.crash_windows
             .entry(context_id.to_owned())
             .or_default()
             .mark_respawning();
-        self.despawn_actor(context_id).await
+        let removed = self.despawn_actor(context_id).await;
+        self.wait_for_departed_actors(context_id, DepartedWait::Await)
+            .await?;
+        Ok(removed)
     }
 
     /// Clear the respawn marker a bootstrap set ([`Self::begin_bootstrap_window`]
@@ -12978,6 +13182,11 @@ impl Supervisor {
         // custody call runs under either.
         self.load_wrapping_key(local_did).await?;
         let bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
+        // An actor a despawn removed for this id may still be running; the
+        // probe below must not read, and a recreate must not write over, the
+        // state that actor may yet persist.
+        self.await_departed_actors(&context_id, DepartedWait::Await, &bootstrap_guard)
+            .await?;
 
         // Step 1/2: existence + liveness probe. The decision to create turns
         // on absence, so this reads the checked form (ADR-049 §10). Only
@@ -16818,6 +17027,10 @@ impl Supervisor {
                  the single-use KeyPackage"
             )));
         }
+        // An actor a despawn removed for this id may still be running; its
+        // post-loop persist would land over the joined snapshot.
+        self.await_departed_actors(&context_id, DepartedWait::Await, &bootstrap_guard)
+            .await?;
 
         // Precheck B (BLACK-2J-04) — require a REAL §9.10.4 local pseudonym.
         // spawn-from-Welcome always stands up an ENCRYPTED context; the FFI
@@ -22480,6 +22693,222 @@ mod tests {
             "no governance-driven persist may accrue once the context is not Active \
              (the interval was nulled)"
         );
+    }
+
+    /// A snapshot store that parks the first persist recording a reserved
+    /// queued unit (the drain's reservation) until the test releases it.
+    #[derive(Clone)]
+    struct ReservationParkingSnapshots {
+        inner: crate::context::log_unit_helpers::test_support::SharedSnapshots,
+        armed: Arc<std::sync::atomic::AtomicBool>,
+        parked: Arc<std::sync::atomic::AtomicBool>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait::async_trait]
+    impl ContextPersistence for ReservationParkingSnapshots {
+        async fn persist_context(
+            &self,
+            id: &str,
+            snap: &crate::context::state::ContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            let reserves = snap
+                .pending_log_units
+                .front()
+                .is_some_and(|unit| unit.base_seq.is_some());
+            if reserves && self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                self.parked.store(true, std::sync::atomic::Ordering::SeqCst);
+                self.release
+                    .acquire()
+                    .await
+                    .expect("the release semaphore stays open")
+                    .forget();
+            }
+            self.inner.persist_context(id, snap).await
+        }
+        async fn load_context(
+            &self,
+            id: &str,
+        ) -> Result<
+            Option<crate::context::state::ContextSnapshot>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            self.inner.load_context(id).await
+        }
+        async fn delete_context(
+            &self,
+            id: &str,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.inner.delete_context(id).await
+        }
+        async fn list_persisted_contexts(
+            &self,
+        ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+            self.inner.list_persisted_contexts().await
+        }
+    }
+
+    /// A respawn never drains a dormant snapshot while the actor it despawned
+    /// still runs (spec 17 §17.3 "Event log write failures", "Restart";
+    /// ADR-049 §10). The old actor of a closed context is mid-drain of its
+    /// queued `ContextClosed` record, parked in the persist that reserves the
+    /// record's sequence, when a respawn despawns it. The respawn waits for
+    /// that actor's task to end before it loads the snapshot, so the record
+    /// lands once and the closed context's stored state stays deleted.
+    #[tokio::test]
+    async fn a_respawn_waits_for_the_despawned_actor_before_draining_its_snapshot() {
+        const T0: u64 = 1_700_000_000;
+        let ctx_id_bytes = [0x7Du8; 32];
+        let ctx_key = hex::encode(ctx_id_bytes);
+        let owner = DID("did:example:respawn-wait-owner".to_owned());
+
+        let faulty = Arc::new(
+            crate::context::supervisor::faulty_storage::FaultyStorage::new(Arc::new(
+                InMemoryStorage::new(),
+            )),
+        );
+        let snapshots = ReservationParkingSnapshots {
+            inner: crate::context::log_unit_helpers::test_support::SharedSnapshots::default(),
+            armed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            parked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+        };
+        let sup = supervisor_with_clock_persistence_and_event_log(
+            Arc::new(TestClock::new(T0)),
+            Box::new(snapshots.clone()),
+            Box::new(crate::context::log_unit_helpers::test_support::merkle_log_over(&faulty)),
+        );
+        let deps = sup
+            .build_actor_deps_loaded(&owner)
+            .await
+            .expect("the owner's deps build");
+        deps.event_log
+            .init_event_log(&ctx_id_bytes)
+            .await
+            .expect("the log initialises");
+
+        // A closed context whose `ContextClosed` record is queued, not yet
+        // reserved, stored as the close left it.
+        let state = closed_state_with_queued_close(ctx_id_bytes, T0, &owner);
+        snapshots
+            .inner
+            .persist_context(
+                &ctx_key,
+                &crate::context::manager_methods::snapshot_context(&state),
+            )
+            .await
+            .expect("the closed snapshot stores");
+
+        // The actor starts draining the record and parks in the persist that
+        // reserves its sequence.
+        snapshots
+            .armed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let handle = sup
+            .spawn_actor_with_state(state, deps, None)
+            .await
+            .expect("the actor spawns");
+        drop(handle);
+        for _ in 0..200 {
+            if snapshots.parked.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            snapshots.parked.load(std::sync::atomic::Ordering::SeqCst),
+            "the actor parks mid-drain"
+        );
+
+        // The respawn despawns the parked actor and runs as far as it can;
+        // then the actor's persist is released.
+        let respawn = tokio::spawn({
+            let sup = Arc::clone(&sup);
+            let ctx_key = ctx_key.clone();
+            let owner = owner.clone();
+            async move { sup.respawn_from_snapshot(&ctx_key, &owner).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        snapshots.release.add_permits(1);
+        let respawned = tokio::time::timeout(std::time::Duration::from_secs(10), respawn)
+            .await
+            .expect("the respawn finishes")
+            .expect("the respawn task does not panic");
+        assert!(
+            respawned.is_err(),
+            "a closed context is never respawned: {respawned:?}"
+        );
+        // Let a despawned actor that was not waited for finish its writes.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        assert_eq!(
+            stored_closed_records(&faulty, &ctx_id_bytes).await,
+            1,
+            "the queued ContextClosed record lands exactly once"
+        );
+        assert!(
+            snapshots.inner.snapshot(&ctx_key).await.is_none(),
+            "the closed context's stored state stays deleted, not resurrected"
+        );
+    }
+
+    /// A closed context's state whose `ContextClosed` record is queued and not
+    /// yet reserved, as the close leaves it.
+    fn closed_state_with_queued_close(
+        ctx_id_bytes: [u8; 32],
+        now_secs: u64,
+        owner: &DID,
+    ) -> crate::context::actor::state::PerContextState {
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            now_secs,
+            owner.clone(),
+        );
+        state.handle = crate::context::ContextHandle::new(
+            hex::encode(ctx_id_bytes),
+            scp_protocol::context::params::ContextParams::default(),
+        );
+        for next in [
+            crate::context::ContextState::Active,
+            crate::context::ContextState::Closing,
+            crate::context::ContextState::Closed,
+        ] {
+            state.handle.transition_to(&next).expect("the close path");
+        }
+        state.class_s.pending_log_units =
+            crate::context::actor::class_s::PendingLogUnits::validated(
+                std::iter::once(crate::context::state::PendingLogUnit {
+                    base_seq: None,
+                    leaves: vec![crate::context::state::LeafSpec::without_payload(
+                        scp_event_log::EventType::ContextClosed,
+                        scp_event_log::system_actors::SYSTEM_CLOSE_ACTOR.to_owned(),
+                        now_secs,
+                    )],
+                })
+                .collect(),
+            )
+            .expect("a valid unit");
+        state
+    }
+
+    /// The `ContextClosed` records in the context's log as storage holds it.
+    async fn stored_closed_records(
+        faulty: &Arc<crate::context::supervisor::faulty_storage::FaultyStorage>,
+        ctx_id_bytes: &[u8; 32],
+    ) -> usize {
+        use crate::context::builder::ContextEventLogProvider as _;
+        let stored_log = crate::context::log_unit_helpers::test_support::merkle_log_over(faulty);
+        stored_log
+            .restore_event_log(ctx_id_bytes)
+            .await
+            .expect("the stored log loads");
+        stored_log
+            .event_log_entries(ctx_id_bytes)
+            .expect("the log reads")
+            .expect("the log exists")
+            .iter()
+            .filter(|e| e.event_type == scp_event_log::EventType::ContextClosed)
+            .count()
     }
 
     /// D1 (create-window stuck-open): restoring an `Active` snapshot that
@@ -34862,8 +35291,8 @@ mod tests {
 
         let ctx_key = spawn_live_context(&sup, [0xC8u8; 32]).await;
         assert!(
-            sup.despawn_for_replace(&ctx_key).await,
-            "the live actor must be despawned"
+            matches!(sup.despawn_for_replace(&ctx_key).await, Ok(true)),
+            "the live actor must be despawned and its task ended"
         );
         assert!(sup.lookup(&ctx_key).is_none(), "no actor serves the gap");
         let in_gap = sup.read_context_state_checked(&ctx_key).await;
@@ -34883,7 +35312,10 @@ mod tests {
             .entry(with_history.clone())
             .or_default()
             .record(now_ms);
-        sup.despawn_for_replace(&with_history).await;
+        assert!(matches!(
+            sup.despawn_for_replace(&with_history).await,
+            Ok(true)
+        ));
         sup.end_bootstrap_window(&with_history);
         let window = sup
             .crash_windows
