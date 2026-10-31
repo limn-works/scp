@@ -6977,11 +6977,11 @@ mod restore_reconcile_tests {
             "join_context writes no record to the log after its step"
         );
         let add_idx = body
-            .find("state.add_member(&member_did, kp_bytes")
-            .expect("join_context must add the member");
-        let distribute_idx = body
-            .find("distribute_sender_key(&local_did, &member_did)")
-            .expect("join_context must distribute the sender key");
+            .find("add_member_and_queue_distribution(v.rest_mut(), deps, &member_did, kp_bytes)")
+            .expect("join_context must add the member and queue its distribution");
+        let deliver_idx = body
+            .find("drain_and_deliver_sender_keys(")
+            .expect("join_context must deliver the queued sender-key distribution");
         let failure_idx = body
             .find("if let Err(e) = persisted")
             .expect("join_context must branch on the Phase-5 persist's failure");
@@ -7005,8 +7005,8 @@ mod restore_reconcile_tests {
             "the MemberJoined record is queued exactly once"
         );
         assert!(
-            add_idx < enqueues[0] && enqueues[0] < distribute_idx,
-            "the record is queued in the Phase-3 add commit"
+            add_idx < enqueues[0] && enqueues[0] < deliver_idx,
+            "the record is queued in the Phase-3 add commit, before the delivery"
         );
         assert!(
             body.contains("withdraw_counted_log_unit(std::slice::from_ref(joined_leaf))"),
@@ -7566,8 +7566,11 @@ mod restore_reconcile_tests {
 
     /// A join that rolls back after its MLS add leaves no `MemberJoined`
     /// record, in memory or in the stored state: the Phase-3 add commit queues
-    /// the record, and the rollback withdraws it in the commit that removes the
-    /// member (spec 17 §17.3 "Event log write failures").
+    /// the record, and the rollback withdraws it with the member (spec 17
+    /// §17.3 "Event log write failures"). The add commit's own persist fails
+    /// here, so the add stays applied in memory with its record queued (keep
+    /// direction) and the join rolls back through `JoinRollback`. A failed
+    /// sender-key distribution no longer rolls a join back (spec 09 §9.16.9).
     #[tokio::test]
     async fn join_rolled_back_after_the_mls_add_queues_no_member_joined() {
         use crate::context::log_unit_helpers::test_support;
@@ -7576,8 +7579,9 @@ mod restore_reconcile_tests {
         let context_id = hex::encode([0x4bu8; 32]);
         let (deps, _faulty, snapshots) =
             test_support::deps_over_faulty_log(admin.as_ref(), &context_id).await;
-        // No sender key: the distribution after the MLS add fails.
-        let (mut cell, handle) = joinable_cell(&context_id, &admin, false);
+        let (mut cell, handle) = joinable_cell(&context_id, &admin, true);
+        // Every persist fails, starting with the Phase-3 add commit's.
+        snapshots.fail_persists_after(0);
 
         let joiner = DID("did:dht:z6MkRolledBackJoiner".to_owned());
         let result = lifecycle_helpers::join_context(
@@ -7591,8 +7595,8 @@ mod restore_reconcile_tests {
         .await;
 
         assert!(
-            matches!(&result, Err(ContextError::CryptoFailed(_))),
-            "the sender-key distribution failure rolls the join back: got {result:?}"
+            matches!(&result, Err(ContextError::PersistenceFailed(_))),
+            "the add commit's persist failure rolls the join back: got {result:?}"
         );
         assert!(
             !cell.membership.contains(joiner.as_ref()),

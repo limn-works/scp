@@ -8320,7 +8320,9 @@ impl Supervisor {
         // real minted id (the operator-repair handle), and the `Ok` path's
         // `SagaOutput.saga_id` is the SAME id.
         let saga_id = SagaId::new();
-        self.run_saga(saga_id.clone(), saga_input, Some(ctx), reservation)
+        // Boxed: the FSM's state machine is above the `large_futures` bound,
+        // so every caller would otherwise carry it inline.
+        Box::pin(self.run_saga(saga_id.clone(), saga_input, Some(ctx), reservation))
             .await
             .map_err(|run_err| Self::lift_run_saga_error(saga_id, run_err))
     }
@@ -23526,13 +23528,11 @@ mod tests {
             T0,
             admin.clone(),
         );
-        state.handle = crate::context::ContextHandle::new(
-            ctx_key.clone(),
-            scp_protocol::context::params::ContextParams {
-                ttl: Some(std::time::Duration::from_secs(TTL_SECS)),
-                ..Default::default()
-            },
-        );
+        // The constructor's params pass the restore's params validation; the
+        // test sets only the TTL.
+        let mut params = state.handle.params().clone();
+        params.ttl = Some(std::time::Duration::from_secs(TTL_SECS));
+        state.handle = crate::context::ContextHandle::new(ctx_key.clone(), params);
         // The governance extension armed the timer and queued its leaf in one
         // persist while the log refused the write.
         state.ttl.timer.deadline_unix_secs = Some(EXTENDED_DEADLINE);

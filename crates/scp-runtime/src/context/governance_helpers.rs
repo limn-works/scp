@@ -884,7 +884,6 @@ pub async fn execute_revoke(
         actor_did,
         timestamp_secs,
     } = meta;
-    let context_id_bytes = context_id_to_bytes(context_id);
 
     // SECURITY-FLAG (ADR-049 §9, FC→FC, no behaviour change): revocation
     // (capability / access / write) is a DOWNWARD-AUTHORIZATION Class-S
