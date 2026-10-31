@@ -233,6 +233,32 @@ where
     samples
 }
 
+/// Builds `n` independent instances at once, one task each, and returns them
+/// in index order. Setup is untimed and the instances share no state, so
+/// building them concurrently changes no measured region; it only shortens
+/// the run. Every instance is built before `run_measure` starts.
+async fn build_each<T, F, Fut>(n: usize, build: F) -> Vec<T>
+where
+    T: Send + 'static,
+    F: Fn(usize) -> Fut,
+    Fut: std::future::Future<Output = T> + Send + 'static,
+{
+    let mut set = tokio::task::JoinSet::new();
+    for i in 0..n {
+        let instance = build(i);
+        set.spawn(async move { (i, instance.await) });
+    }
+    let mut instances = Vec::with_capacity(n);
+    while let Some(joined) = set.join_next().await {
+        instances.push(joined.expect("perf setup task panicked"));
+    }
+    instances.sort_by_key(|(i, _)| *i);
+    instances
+        .into_iter()
+        .map(|(_, instance)| instance)
+        .collect()
+}
+
 /// p50 (median) of a sample set, in whatever unit the samples carry.
 fn p50(mut samples: Vec<f64>) -> f64 {
     assert!(!samples.is_empty(), "no samples collected");
@@ -346,16 +372,15 @@ async fn build_pair(
 }
 
 async fn setup_send(n: usize) -> Vec<Arc<SendInst>> {
-    let mut instances = Vec::with_capacity(n);
-    for i in 0..n {
+    build_each(n, |i| async move {
         let (network, alice, _bob, handle, _ctx) = build_pair("send", i).await;
-        instances.push(Arc::new(SendInst {
+        Arc::new(SendInst {
             _network: network,
             alice,
             handle,
-        }));
-    }
-    instances
+        })
+    })
+    .await
 }
 
 async fn op_send(inst: Arc<SendInst>, _round: usize) -> Duration {
@@ -377,59 +402,59 @@ struct DeliverInst {
 }
 
 async fn setup_deliver(n: usize) -> Vec<Arc<DeliverInst>> {
-    let mut instances = Vec::with_capacity(n);
-    for i in 0..n {
-        let (network, alice, bob, handle, ctx_id) = build_pair("deliver", i).await;
+    build_each(n, deliver_instance).await
+}
 
-        // Pre-generate one probe envelope + WARMUP+ROUNDS measured envelopes.
-        // Each Alice send yields exactly one captured ciphertext (single peer);
-        // delivering them in send order keeps the per-sender sequence monotonic.
-        let total = WARMUP + ROUNDS + 1;
-        let mut envelopes = Vec::with_capacity(total);
-        for _ in 0..total {
-            alice
-                .send_message(&handle, PAYLOAD)
-                .await
-                .expect("deliver setup: alice send");
-            let mut captured = alice.take_sent_ciphertexts();
-            assert_eq!(
-                captured.len(),
-                1,
-                "a single-peer encrypted send must capture exactly one ciphertext"
-            );
-            envelopes.push(captured.remove(0).1);
-        }
-        // Alice's sender key was pushed on the transport during `add_member` and
-        // ingested into Bob's actor through the real receive path during
-        // `join_from_welcome` (ADR-049 PR-7, SCP-CRYPTOMOVE-001) — no explicit
-        // pre-delivery pickup is needed. The untimed correctness probe below
-        // confirms the key resolves on the actor deliver path.
+async fn deliver_instance(i: usize) -> Arc<DeliverInst> {
+    let (network, alice, bob, handle, ctx_id) = build_pair("deliver", i).await;
 
-        // Correctness probe (untimed): the actor deliver path must return real
-        // application content for a genuine inbound message.
-        let probe = envelopes.remove(0);
-        let delivered = bob
-            .manager
-            .deliver_commit_blob(
-                &ctx_id,
-                probe,
-                scp_runtime::context::actor::commands::DeliveryMode::Live,
-            )
+    // Pre-generate one probe envelope + WARMUP+ROUNDS measured envelopes.
+    // Each Alice send yields exactly one captured ciphertext (single peer);
+    // delivering them in send order keeps the per-sender sequence monotonic.
+    let total = WARMUP + ROUNDS + 1;
+    let mut envelopes = Vec::with_capacity(total);
+    for _ in 0..total {
+        alice
+            .send_message(&handle, PAYLOAD)
             .await
-            .expect("probe deliver_commit_blob");
-        assert!(
-            matches!(delivered, Some((ref pt, _)) if pt.as_slice() == PAYLOAD),
-            "deliver_incoming must yield the real application payload; got {delivered:?}"
+            .expect("deliver setup: alice send");
+        let mut captured = alice.take_sent_ciphertexts();
+        assert_eq!(
+            captured.len(),
+            1,
+            "a single-peer encrypted send must capture exactly one ciphertext"
         );
-
-        instances.push(Arc::new(DeliverInst {
-            _network: network,
-            bob: Arc::clone(&bob.manager),
-            ctx_id,
-            envelopes,
-        }));
+        envelopes.push(captured.remove(0).1);
     }
-    instances
+    // Alice's sender key was pushed on the transport during `add_member` and
+    // ingested into Bob's actor through the real receive path during
+    // `join_from_welcome` (ADR-049 PR-7, SCP-CRYPTOMOVE-001) — no explicit
+    // pre-delivery pickup is needed. The untimed correctness probe below
+    // confirms the key resolves on the actor deliver path.
+
+    // Correctness probe (untimed): the actor deliver path must return real
+    // application content for a genuine inbound message.
+    let probe = envelopes.remove(0);
+    let delivered = bob
+        .manager
+        .deliver_commit_blob(
+            &ctx_id,
+            probe,
+            scp_runtime::context::actor::commands::DeliveryMode::Live,
+        )
+        .await
+        .expect("probe deliver_commit_blob");
+    assert!(
+        matches!(delivered, Some((ref pt, _)) if pt.as_slice() == PAYLOAD),
+        "deliver_incoming must yield the real application payload; got {delivered:?}"
+    );
+
+    Arc::new(DeliverInst {
+        _network: network,
+        bob: Arc::clone(&bob.manager),
+        ctx_id,
+        envelopes,
+    })
 }
 
 async fn op_deliver(inst: Arc<DeliverInst>, round: usize) -> Duration {

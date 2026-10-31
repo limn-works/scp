@@ -960,13 +960,26 @@ async fn republish(supervisor: &Supervisor, handle: &ContextHandle) -> Result<()
 
 /// §9.10.4.1 "Epoch schedule": with no policy, nothing is signalled across a
 /// thousand interval lengths.
+///
+/// The wall clock and tokio time step together, one interval at a time, so
+/// the arm sees every boundary `T0 + j × I` on the wall clock and every
+/// one-shot sleep due by it has elapsed. Between boundaries only the actor's
+/// 60 s governance interval would tick, and each tick costs a full snapshot
+/// persist; one `advance` past it fires it once (`MissedTickBehavior::Delay`),
+/// so the test pays for 1 000 ticks rather than 60 000.
 #[tokio::test(start_paused = true)]
 async fn nothing_is_signalled_without_a_policy_over_a_thousand_periods() {
     let mut n = node();
     let ctx = &cid("rotation-none");
     n.create(ctx, params(None)).await;
-    n.clock.set(T0 + 1_000 * INTERVAL);
-    let events = n.collect_for(Duration::from_secs(1_000 * INTERVAL)).await;
+    let mut events = Vec::new();
+    for j in 1..=1_000 {
+        n.clock.set(T0 + j * INTERVAL);
+        tokio::time::advance(Duration::from_secs(INTERVAL)).await;
+        // Long enough for the arm's turn and the 50 ms coalesced persist the
+        // governance tick schedules, short of the next 60 s tick.
+        events.extend(n.collect_for(Duration::from_secs(1)).await);
+    }
     assert!(
         !events.iter().any(is_rotation_signal),
         "rotation is opt-in: {events:?}"

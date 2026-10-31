@@ -1208,6 +1208,13 @@ async fn ledger_prunes_and_refuses_unknown() {
 /// T12 (RED-001): the bound counts open challenges only. 1024 open
 /// challenges refuse the next Create; once all 1024 are closed, Create
 /// succeeds.
+///
+/// One challenge is created and graded through the actor. The other 1023
+/// are copies of the entry the actor stored for it, at that moment, under
+/// their own challenge ids and subjects, written to the store the actor
+/// loads when it spawns. Each Create rewrites the whole index and scans every
+/// entry, so 1024 Creates cost O(n²), and each grading costs several
+/// signature operations; the bound depends on neither.
 #[tokio::test]
 async fn ledger_bound_counts_open_challenges_only() {
     let h = harness();
@@ -1215,34 +1222,84 @@ async fn ledger_bound_counts_open_challenges_only() {
         .map(|n| numbered_party(u16::try_from(n).unwrap()))
         .collect();
     let (last, open) = subjects.split_last().unwrap();
-    let mut issued = Vec::with_capacity(open.len());
-    for subject in open {
-        issued.push(
-            h.create_as(&h.handle, h.signer(), &subject.1, URI)
-                .await
-                .unwrap(),
-        );
-    }
+    let (graded_subject, copied) = open.split_first().unwrap();
+
+    let issued = h
+        .create_as(&h.handle, h.signer(), &graded_subject.1, URI)
+        .await
+        .unwrap();
+    let open_template = h.stored_entry(&issued.request.challenge_id);
+    assert_eq!(open_template.closed, None);
+    let handle = h.respawn_seeded(&h.handle, &open_template, copied).await;
     assert!(matches!(
-        trust_err(h.create_as(&h.handle, h.signer(), &last.1, URI).await),
+        trust_err(h.create_as(&handle, h.signer(), &last.1, URI).await),
         TrustError::ChallengeNotOpen {
             open: MAX_OPEN_CHALLENGES_PER_CHALLENGER,
             ..
         }
     ));
+
     h.clock.advance(1);
-    for (subject, challenge) in open.iter().zip(&issued) {
-        let auth = h.respond_as(subject, &challenge.request, 1, "ok");
-        let lease = h.lease(&auth).await;
-        let graded = h
-            .commit(&auth, lease.lease_id, &challenge.key)
-            .await
-            .unwrap();
-        assert!(graded.record.passed);
-    }
-    h.create_as(&h.handle, h.signer(), &last.1, URI)
+    let auth = h.respond_as(graded_subject, &issued.request, 1, "ok");
+    let lease = lease_on(&handle, &auth).await;
+    let graded = commit_on(&handle, &auth, lease.lease_id, &issued.key, h.signer())
         .await
         .unwrap();
+    assert!(graded.record.passed);
+    let closed_template = h.stored_entry(&issued.request.challenge_id);
+    assert_eq!(closed_template.closed, Some(ChallengeClosure::Passed));
+    let handle = h.respawn_seeded(&handle, &closed_template, copied).await;
+    h.create_as(&handle, h.signer(), &last.1, URI)
+        .await
+        .unwrap();
+}
+
+impl Harness {
+    /// The entry the store holds for `challenge_id`.
+    fn stored_entry(&self, challenge_id: &[u8; 32]) -> LedgerEntry {
+        let bytes = self
+            .storage
+            .kv
+            .get(&self.entry_key(challenge_id))
+            .map(|v| v.value().clone())
+            .expect("the entry is stored");
+        rmp_serde::from_slice(&bytes).unwrap()
+    }
+
+    /// Stops `handle`'s actor, stores one copy of `template` per subject in
+    /// `subjects`, each under its own challenge id, adds them to the index,
+    /// and spawns the replacement, which loads them.
+    async fn respawn_seeded(
+        &self,
+        handle: &ChallengerLedgerHandle,
+        template: &LedgerEntry,
+        subjects: &[(SigningKey, DID)],
+    ) -> ChallengerLedgerHandle {
+        handle.send_shutdown().await.unwrap();
+        let mut ids = self.index_ids();
+        for (n, (_, subject)) in subjects.iter().enumerate() {
+            let mut challenge_id = [0xc5_u8; 32];
+            challenge_id[..8].copy_from_slice(&u64::try_from(n).unwrap().to_be_bytes());
+            assert_ne!(challenge_id, template.request.challenge_id);
+            let mut entry = template.clone();
+            entry.request.challenge_id = challenge_id;
+            entry.request.subject = subject.clone();
+            entry.subject_key = *CanonicalIdentifier::parse(subject).unwrap().key();
+            let id = hex::encode(challenge_id);
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+            self.storage.kv.insert(
+                self.entry_key(&challenge_id),
+                rmp_serde::to_vec_named(&entry).unwrap(),
+            );
+        }
+        self.storage.kv.insert(
+            format!("scp-challenger-ids/{}", self.verifier.0),
+            rmp_serde::to_vec_named(&ids).unwrap(),
+        );
+        spawn(&self.verifier, &self.storage, &self.clock, handle.shared())
+    }
 }
 
 /// T6 (RULING 14): Create refuses while the latest challenge to the same
