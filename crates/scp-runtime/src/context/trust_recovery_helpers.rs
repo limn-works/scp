@@ -563,7 +563,6 @@ fn plan_recovery_epoch_leaf(
 
 /// The recovery family of spec 17 §17.3 "Event log write failures".
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod log_unit_family_tests {
     use scp_did::DID;
 

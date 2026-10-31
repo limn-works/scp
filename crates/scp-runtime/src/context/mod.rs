@@ -52,6 +52,7 @@ pub(crate) mod manager_methods;
 pub(crate) mod messaging_helpers;
 pub(crate) mod outlets_helpers;
 pub(crate) mod params_validation;
+pub mod participation;
 pub mod persistence;
 pub mod policy;
 pub mod providers;

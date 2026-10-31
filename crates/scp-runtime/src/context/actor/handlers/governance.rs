@@ -877,25 +877,14 @@ async fn handle_evaluate_periodic_consequences_actor(
         }
         // `split` / `view` drop here, releasing the `&mut cell` borrow.
     }
-    // The sweep keeps the memory-first rule for its leaves (spec 17 §17.3).
-    let (mut downward_auth_obligation, leaves) = sink.into_parts();
-    crate::context::governance_logic::append_consequence_leaves_after_side_effect(
-        deps.event_log.as_ref(),
-        &context_id,
-        leaves,
-    )
-    .await;
-
-    // Fail-closed persist of an applied downward-auth mutation (keep-direction):
-    // the mutation (suspension or `AssignRole` demotion) is already in memory;
-    // committing the obligation's token makes it durable before acking (`take()`
-    // discharges the Drop guard). On persist failure the mutation STAYS and the
-    // error is surfaced to the caller; the handler still reports `mutated` so the
-    // run loop also persists.
-    let reply_result = match downward_auth_obligation.take() {
-        Some(token) => token.commit(cell, deps, &context_id).await,
-        None => Ok(()),
-    };
+    // The sweep's consequence records are queued as one unit in the same
+    // fail-closed persist that makes an applied downward-auth mutation
+    // (suspension or `AssignRole` demotion) durable, then drained (spec 17
+    // §17.3 "Event log write failures"; ADR-049 §9 keep-direction). On persist
+    // failure the mutation and the unit STAY in memory and the error is
+    // surfaced to the caller; the handler still reports `mutated` so the run
+    // loop also persists.
+    let reply_result = sink.discharge(cell, deps, &context_id).await;
     let _ = reply.send(reply_result);
     Outcome::ok_mutated(())
 }
@@ -1431,6 +1420,12 @@ mod consequence_fail_closed_tests {
         let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
         let event_log: Box<dyn ContextEventLogProvider> = Box::new(MerkleEventLogProvider::new());
+        // The context holds an empty log: a context with no log refuses the
+        // sweep's read before it reaches the persist under test.
+        event_log
+            .init_event_log(&[CTX_BYTE; 32])
+            .await
+            .expect("init the empty log");
         let key_resolver: scp_protocol::context::governance::KeyResolver = Arc::new(|_, _| None);
         let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
             Arc::new(
@@ -1569,6 +1564,65 @@ mod consequence_fail_closed_tests {
         );
     }
 
+    /// The sweep writes nothing to the log: a convergent consequence queues
+    /// its records as one unit in the persist that makes the suspension
+    /// durable, and a log that refuses writes fails nothing (spec 17 §17.3
+    /// "Event log write failures").
+    #[tokio::test]
+    async fn periodic_sweep_queues_its_records_when_the_log_refuses_writes() {
+        use crate::context::log_unit_helpers::test_support::{
+            deps_with, fail_log_entry_writes, faulty_merkle_log, log_len, queued_unit_types,
+        };
+        let ctx = [CTX_BYTE; 32];
+        let (log, faulty) = faulty_merkle_log();
+        let deps = deps_with(ADMIN, None, Box::new(log)).await;
+        deps.event_log.init_event_log(&ctx).await.expect("init log");
+        // The `WarningCount` evidence: one governance record by ADMIN against
+        // SUBJECT.
+        deps.event_log
+            .append_event(
+                &ctx,
+                scp_event_log::EventType::GovernanceAction,
+                ADMIN,
+                scp_event_log::EventPayload {
+                    data: serde_json::to_vec(&serde_json::json!({ "target_did": SUBJECT }))
+                        .expect("encode the target payload"),
+                },
+                1_700_000_000,
+            )
+            .await
+            .expect("seed the warning record");
+        fail_log_entry_writes(&faulty, &ctx);
+        let mut state = seed_state();
+        state.governance.consequence_rules = vec![ConsequenceRule {
+            trigger: ConsequenceTrigger::WarningCount,
+            action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
+            threshold: 1,
+            window: Duration::from_hours(1),
+        }];
+        let mut cell = ClassSCell::new(state);
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ =
+            super::handle_evaluate_periodic_consequences_actor(&mut cell, &deps, reply_tx).await;
+
+        let reply = reply_rx.await.expect("handler replies");
+        assert!(reply.is_ok(), "the sweep fails nothing; got {reply:?}");
+        assert_eq!(
+            queued_unit_types(&cell.class_s.pending_log_units),
+            vec![vec![
+                scp_event_log::EventType::ConsequenceTriggered,
+                scp_event_log::EventType::ConsequenceEnforced,
+            ]],
+            "the consequence records wait in the queue as one unit"
+        );
+        assert_eq!(log_len(&deps, &ctx), 1, "the log holds only the seed");
+        assert!(
+            cell.role_state.suspended_for(SUBJECT).is_some(),
+            "the consequence is applied"
+        );
+    }
+
     /// SEND path: when a `send` trips a consequence that suspends the sender,
     /// the free (non-paid) send persists the suspension FAIL-CLOSED before
     /// acking — `finalize_send` surfaces the persist error and retains the
@@ -1588,17 +1642,22 @@ mod consequence_fail_closed_tests {
             .expect("transition to Active");
         let mut cell = ClassSCell::new(state);
         let ctx_str = hex::encode([CTX_BYTE; 32]);
-        // ADR-056: `ctx_str` is a real 64-hex id, so the code under test keys
-        // under its DECODED digest. Resolve the explicit arg the same way the
-        // internal keying does, not via the raw `SHA-256(ctx_str)` primitive.
-        let ctx_bytes = crate::context::state::context_id_to_bytes(&ctx_str);
+        deps.event_log
+            .init_event_log(&[CTX_BYTE; 32])
+            .await
+            .expect("init log");
+        // The root is read before the send, as `send_message` reads it.
+        let root = crate::context::participation::ParticipationRoot::read(
+            &ctx_str,
+            deps.event_log.as_ref(),
+        )
+        .expect("the root reads before the send");
 
         // Free (non-paid) send: no token, a local test signer, not broadcast.
         let result = crate::context::messaging_helpers::finalize_send(
             &mut cell,
             &deps,
             &ctx_str,
-            &ctx_bytes,
             &DID(SUBJECT.to_owned()),
             0,
             b"payload",
@@ -1608,6 +1667,7 @@ mod consequence_fail_closed_tests {
                 ),
             ),
             &[],
+            root,
         )
         .await;
 

@@ -71,17 +71,10 @@ async fn append_convergent_stream(log: &MerkleEventLogProvider, local_clock_offs
     // two members in the positive test can be given DIFFERENT skews and still
     // converge.
     let _ = local_clock_offset;
-    log.append_context_event(
-        scp_runtime::context::builder::AppendMode::FailClosed,
-        &CTX,
-        EventType::ContextCreated,
-        ALICE,
-        TS_CREATED,
-    )
-    .await
-    .unwrap();
+    log.append_context_event(&CTX, EventType::ContextCreated, ALICE, TS_CREATED)
+        .await
+        .unwrap();
     log.append_context_event_with_payload(
-        scp_runtime::context::builder::AppendMode::FailClosed,
         &CTX,
         EventType::MemberJoined,
         ALICE,
@@ -91,7 +84,6 @@ async fn append_convergent_stream(log: &MerkleEventLogProvider, local_clock_offs
     .await
     .unwrap();
     log.append_context_event_with_payload(
-        scp_runtime::context::builder::AppendMode::FailClosed,
         &CTX,
         EventType::MemberJoined,
         BOB,
@@ -101,7 +93,6 @@ async fn append_convergent_stream(log: &MerkleEventLogProvider, local_clock_offs
     .await
     .unwrap();
     log.append_context_event_with_payload(
-        scp_runtime::context::builder::AppendMode::FailClosed,
         &CTX,
         EventType::GovernanceAction,
         ALICE,
@@ -123,7 +114,6 @@ async fn append_stream_with_local_timestamps(
     local_clock_offset: u64,
 ) {
     log.append_context_event(
-        scp_runtime::context::builder::AppendMode::FailClosed,
         &CTX,
         EventType::ContextCreated,
         ALICE,
@@ -132,7 +122,6 @@ async fn append_stream_with_local_timestamps(
     .await
     .unwrap();
     log.append_context_event_with_payload(
-        scp_runtime::context::builder::AppendMode::FailClosed,
         &CTX,
         EventType::MemberJoined,
         ALICE,
@@ -142,7 +131,6 @@ async fn append_stream_with_local_timestamps(
     .await
     .unwrap();
     log.append_context_event_with_payload(
-        scp_runtime::context::builder::AppendMode::FailClosed,
         &CTX,
         EventType::MemberJoined,
         BOB,
@@ -152,7 +140,6 @@ async fn append_stream_with_local_timestamps(
     .await
     .unwrap();
     log.append_context_event_with_payload(
-        scp_runtime::context::builder::AppendMode::FailClosed,
         &CTX,
         EventType::GovernanceAction,
         ALICE,
@@ -219,13 +206,7 @@ async fn negative_control_per_author_appends_break_convergence() {
     append_convergent_stream(&log_a, 0).await;
     for _ in 0..3 {
         log_a
-            .append_context_event(
-                scp_runtime::context::builder::AppendMode::FailClosed,
-                &CTX,
-                EventType::MessageSent,
-                ALICE,
-                1_700_000_200,
-            )
+            .append_context_event(&CTX, EventType::MessageSent, ALICE, 1_700_000_200)
             .await
             .unwrap();
     }
@@ -235,13 +216,7 @@ async fn negative_control_per_author_appends_break_convergence() {
     append_convergent_stream(&log_b, 250).await;
     for _ in 0..5 {
         log_b
-            .append_context_event(
-                scp_runtime::context::builder::AppendMode::FailClosed,
-                &CTX,
-                EventType::MessageSent,
-                BOB,
-                1_700_000_200,
-            )
+            .append_context_event(&CTX, EventType::MessageSent, BOB, 1_700_000_200)
             .await
             .unwrap();
     }
@@ -301,13 +276,7 @@ async fn negative_control_per_payee_payment_appends_break_convergence() {
     append_convergent_stream(&log_a, 0).await;
     for _ in 0..2 {
         log_a
-            .append_context_event(
-                scp_runtime::context::builder::AppendMode::FailClosed,
-                &CTX,
-                EventType::PaymentReceived,
-                ALICE,
-                1_700_000_300,
-            )
+            .append_context_event(&CTX, EventType::PaymentReceived, ALICE, 1_700_000_300)
             .await
             .unwrap();
     }
@@ -317,13 +286,7 @@ async fn negative_control_per_payee_payment_appends_break_convergence() {
     append_convergent_stream(&log_b, 250).await;
     for _ in 0..4 {
         log_b
-            .append_context_event(
-                scp_runtime::context::builder::AppendMode::FailClosed,
-                &CTX,
-                EventType::PaymentReceived,
-                BOB,
-                1_700_000_300,
-            )
+            .append_context_event(&CTX, EventType::PaymentReceived, BOB, 1_700_000_300)
             .await
             .unwrap();
     }
@@ -392,23 +355,11 @@ async fn negative_control_per_committer_commit_broadcast_appends_break_convergen
     append_convergent_stream(&log_a, 0).await;
     // Committer-only divergence: re-introduce the durable broadcast records.
     log_a
-        .append_context_event(
-            scp_runtime::context::builder::AppendMode::FailClosed,
-            &CTX,
-            EventType::CommitBroadcasted,
-            ALICE,
-            1_700_000_400,
-        )
+        .append_context_event(&CTX, EventType::CommitBroadcasted, ALICE, 1_700_000_400)
         .await
         .unwrap();
     log_a
-        .append_context_event(
-            scp_runtime::context::builder::AppendMode::FailClosed,
-            &CTX,
-            EventType::CommitBroadcastFailed,
-            ALICE,
-            1_700_000_460,
-        )
+        .append_context_event(&CTX, EventType::CommitBroadcastFailed, ALICE, 1_700_000_460)
         .await
         .unwrap();
 

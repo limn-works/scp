@@ -79,41 +79,6 @@ fn consequence_leaf(
     )
 }
 
-/// Appends consequence leaves in memory first, for a caller that keeps the
-/// memory-first rule after its irreversible step (spec 17 §17.3 "Event log
-/// write failures": every append after a step that does not queue a pending
-/// log unit). A failed append is logged and never fails the caller.
-pub async fn append_consequence_leaves_after_side_effect(
-    event_log: &dyn crate::context::builder::ContextEventLogProvider,
-    context_id: &str,
-    leaves: Vec<LeafSpec>,
-) {
-    let context_id_bytes = context_id_to_bytes(context_id);
-    for leaf in leaves {
-        let event_type = leaf.event_type();
-        let actor_did = leaf.actor_did().to_owned();
-        let timestamp_secs = leaf.timestamp_secs();
-        if let Err(e) = event_log
-            .append_context_event_with_payload(
-                crate::context::builder::AppendMode::AfterSideEffect,
-                &context_id_bytes,
-                event_type,
-                &actor_did,
-                leaf.into_payload(),
-                timestamp_secs,
-            )
-            .await
-        {
-            tracing::warn!(
-                context_id,
-                event = ?event_type,
-                error = %e,
-                "failed to append consequence event to durable event log"
-            );
-        }
-    }
-}
-
 // `ConsequenceStateSplit` (the consequence-engine split) is DEFINED in
 // `super::actor::class_s` and RE-EXPORTED here (`use` above). It is its own
 // struct — NOT an alias of `ClassCSplit` (ADR-049 §9 / RED-CS3 / R1): its
@@ -755,17 +720,18 @@ fn emit_failure_escalation(
 /// has no convergent-trigger evidence, so `convergent_now` falls back to `now`
 /// (the window is then irrelevant: no convergent events can match it).
 ///
-/// A context with no log reads as an empty log. A log that cannot be read, or
-/// that is not loaded, is never read as an empty one (spec section 17.3,
-/// "Event log write failures"): a member whose read failed would otherwise
-/// decide a consequence differently from members whose reads succeeded.
+/// A context with no log, a log that cannot be read, and a log that is not
+/// loaded each refuse the read; none is read as an empty log (spec section
+/// 17.3, "Event log write failures"): a member whose read failed would
+/// otherwise decide a consequence differently from members whose reads
+/// succeeded.
 ///
 /// # Errors
 ///
 /// Returns the provider's read error ([`ContextError::EventLogFailed`] or
-/// [`ContextError::ContextNotRegistered`]). A caller whose operation has not
-/// yet taken its irreversible step fails with it; a caller whose operation
-/// already has uses [`event_log_entries_for_consequences_after_side_effect`].
+/// [`ContextError::ContextNotRegistered`]). The caller reads before its
+/// operation's irreversible step and fails with it; an evaluation that runs
+/// after the step uses the [`PreStepEvidence`] it read before the step.
 pub fn event_log_entries_for_consequences(
     receive_buffer: &ReceiveBuffer,
     queued: &PendingLogUnits,
@@ -773,36 +739,66 @@ pub fn event_log_entries_for_consequences(
     now: u64,
     event_log: &dyn crate::context::builder::ContextEventLogProvider,
 ) -> Result<(Vec<scp_event_log::Event>, u64), ContextError> {
-    let log_entries = read_consequence_log(queued, context_id, event_log)?;
-    Ok(merge_for_consequences(&log_entries, receive_buffer, now))
+    let log = LogAndQueue::read(queued.iter(), context_id, event_log)?;
+    Ok(merge_for_consequences(log.entries(), receive_buffer, now))
 }
 
-/// Source 1 of [`event_log_entries_for_consequences`]: the durable log
-/// followed by the entries of every queued log unit, which count as evidence
-/// (spec 17 §17.3 "Event log write failures").
-///
-/// ADR-056: the log is keyed by the canonical digest (matches the event log
-/// init in `builder::create_context` and `state.context_id`), not a re-hash
-/// of the hex id.
-///
-/// # Errors
-///
-/// Returns the provider's read error ([`ContextError::EventLogFailed`] or
-/// [`ContextError::ContextNotRegistered`]).
-pub fn read_consequence_log(
-    queued: &PendingLogUnits,
-    context_id: &str,
-    event_log: &dyn crate::context::builder::ContextEventLogProvider,
-) -> Result<Vec<scp_event_log::Event>, ContextError> {
-    let context_id_bytes = context_id_to_bytes(context_id);
-    let mut entries = event_log
-        .event_log_entries(&context_id_bytes)?
-        .unwrap_or_default();
-    push_unwritten_leaves(
-        &mut entries,
-        queued.iter().flat_map(|unit| unit.leaves.iter()),
-    );
-    Ok(entries)
+/// The durable log followed by the entries of every queued log unit, which
+/// count as written (spec 17 §17.3 "Event log write failures"). Every
+/// planning, consequence and TTL read takes this type, so none reads the log
+/// without the queue, and [`Self::read`] is its only production constructor,
+/// so none reads an absent log as an empty one.
+#[derive(Debug, Clone)]
+pub struct LogAndQueue(Vec<scp_event_log::Event>);
+
+impl LogAndQueue {
+    /// Reads the context's log and appends the entries of `queued`, oldest
+    /// unit first.
+    ///
+    /// ADR-056: the log is keyed by the canonical digest (matches the event
+    /// log init in `builder::create_context` and `state.context_id`), not a
+    /// re-hash of the hex id.
+    ///
+    /// # Errors
+    ///
+    /// - The provider's read error ([`ContextError::EventLogFailed`] or
+    ///   [`ContextError::ContextNotRegistered`]).
+    /// - [`ContextError::EventLogFailed`] when the context has no log: an
+    ///   absent log is an absent state, never an empty log.
+    pub fn read<'a>(
+        queued: impl IntoIterator<Item = &'a crate::context::state::PendingLogUnit>,
+        context_id: &str,
+        event_log: &dyn crate::context::builder::ContextEventLogProvider,
+    ) -> Result<Self, ContextError> {
+        let Some(mut entries) = event_log.event_log_entries(&context_id_to_bytes(context_id))?
+        else {
+            return Err(ContextError::EventLogFailed(format!(
+                "context {context_id} has no event log; an absent log is not read as an empty one"
+            )));
+        };
+        push_unwritten_leaves(
+            &mut entries,
+            queued.into_iter().flat_map(|unit| unit.leaves.iter()),
+        );
+        Ok(Self(entries))
+    }
+
+    /// The log's entries followed by the queued ones.
+    pub fn entries(&self) -> &[scp_event_log::Event] {
+        &self.0
+    }
+
+    /// [`Self::entries`], owned.
+    pub fn into_entries(self) -> Vec<scp_event_log::Event> {
+        self.0
+    }
+
+    /// A log and queue holding `entries`, for a test that builds the read
+    /// result directly.
+    #[cfg(test)]
+    pub(crate) const fn from_entries(entries: Vec<scp_event_log::Event>) -> Self {
+        Self(entries)
+    }
 }
 
 /// Appends entries that have no position in the log yet (queued or staged
@@ -837,7 +833,7 @@ pub struct PreStepEvidence {
     /// The context's consequence rules when the log was read.
     rules: Vec<ConsequenceRule>,
     /// The durable log followed by the queued units, from
-    /// [`read_consequence_log`]. Empty, and not read, when
+    /// [`LogAndQueue::read`]. Empty, and not read, when
     /// [`Self::read_for_rules`] found no rule.
     log: Vec<scp_event_log::Event>,
 }
@@ -857,7 +853,7 @@ impl PreStepEvidence {
     ) -> Result<Self, ContextError> {
         Ok(Self {
             rules: rules.to_vec(),
-            log: read_consequence_log(queued, context_id, event_log)?,
+            log: LogAndQueue::read(queued.iter(), context_id, event_log)?.into_entries(),
         })
     }
 
@@ -902,30 +898,6 @@ impl PreStepEvidence {
         push_unwritten_leaves(&mut entries, staged.iter());
         merge_for_consequences(&entries, receive_buffer, now)
     }
-}
-
-/// [`event_log_entries_for_consequences`] for a caller whose operation already
-/// took its irreversible step and keeps the memory-first rule (governance
-/// finalize and the post-join participation update; spec 17 §17.3 "Event log
-/// write failures"): a failed read is logged and the evaluation runs over the
-/// receive buffer alone.
-pub(in crate::context) fn event_log_entries_for_consequences_after_side_effect(
-    receive_buffer: &ReceiveBuffer,
-    queued: &PendingLogUnits,
-    context_id: &str,
-    now: u64,
-    event_log: &dyn crate::context::builder::ContextEventLogProvider,
-) -> (Vec<scp_event_log::Event>, u64) {
-    event_log_entries_for_consequences(receive_buffer, queued, context_id, now, event_log)
-        .unwrap_or_else(|e| {
-            tracing::warn!(
-                context_id,
-                error = %e,
-                "the event log could not be read after the operation's side effect; \
-                 consequences are evaluated over the receive buffer alone"
-            );
-            merge_for_consequences(&[], receive_buffer, now)
-        })
 }
 
 /// Merges Source 1 (`log_entries`) with Source 2 (the receive buffer) for
@@ -1085,10 +1057,23 @@ mod convergence_tests {
             // No persistence backend is wired in this convergence-discriminator
             // test, so defuse the obligation instead of driving a real persist.
             token.defuse_for_test();
-            // The memory-first adapter writes the durable leaves the engine
-            // produced; a non-convergent trigger produced none.
-            super::append_consequence_leaves_after_side_effect(&event_log, &context_id_str, leaves)
-                .await;
+            // The drain writes the durable leaves the engine produced as one
+            // unit; a non-convergent trigger produced none.
+            if !leaves.is_empty() {
+                // The log is fresh, so the unit starts at 0; `append_unit`
+                // refuses any other base as misaligned.
+                event_log
+                    .append_unit(
+                        event_log
+                            .lock_for_unit(&storage_key)
+                            .await
+                            .expect("lock the log for the unit"),
+                        0,
+                        &leaves,
+                    )
+                    .await
+                    .expect("append the consequence unit");
+            }
         }
 
         let root_after = event_log
@@ -1174,7 +1159,6 @@ mod convergence_tests {
         let log = MerkleEventLogProvider::new();
         log.init_event_log(&storage_key).await.expect("init log");
         log.append_context_event_with_payload(
-            crate::context::builder::AppendMode::AfterSideEffect,
             &storage_key,
             EventType::GovernanceAction,
             ADMIN,
@@ -1271,11 +1255,10 @@ mod convergence_tests {
         );
     }
 
-    /// An unreadable log is an error, never an empty log, and the
-    /// after-side-effect read logs it and evaluates over the receive buffer
-    /// alone (spec section 17.3, "Event log write failures").
+    /// An unreadable log is an error, never an empty log (spec section 17.3,
+    /// "Event log write failures").
     #[tokio::test]
-    async fn an_unreadable_log_is_an_error_except_after_the_side_effect() {
+    async fn an_unreadable_log_is_an_error() {
         let context_id_str = hex::encode(CTX_BYTES);
         let storage_key = crate::context::state::context_id_to_bytes(&context_id_str);
         let log = MerkleEventLogProvider::new();
@@ -1296,23 +1279,6 @@ mod convergence_tests {
                 Err(scp_protocol::context::ContextError::ContextNotRegistered(_))
             ),
             "an unreadable log is an error: {read:?}"
-        );
-        let (merged, convergent_now) = super::event_log_entries_for_consequences_after_side_effect(
-            &buffer,
-            &crate::context::actor::class_s::PendingLogUnits::default(),
-            &context_id_str,
-            1_700_000_100,
-            &log,
-        );
-        assert_eq!(
-            convergent_now, 1_700_000_100,
-            "no log evidence anchors the window"
-        );
-        assert!(
-            merged
-                .iter()
-                .any(|e| e.event_type == EventType::MessageSent),
-            "the receive buffer still feeds the evaluation"
         );
     }
 
@@ -1363,5 +1329,74 @@ mod convergence_tests {
              into the consequence event list (convergent events come only from \
              the durable log)"
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod log_and_queue_tests {
+    //! [`LogAndQueue::read`] (spec 17 §17.3 "Event log write failures"): a
+    //! context with no log refuses, and a queued unit's entries follow the
+    //! durable log's.
+
+    use super::LogAndQueue;
+    use crate::context::builder::ContextEventLogProvider;
+    use crate::context::providers::MerkleEventLogProvider;
+    use crate::context::state::{PendingLogUnit, context_id_to_bytes};
+    use scp_event_log::EventType;
+    use scp_protocol::context::ContextError;
+
+    const CONTEXT_ID: &str = "ctx-log-and-queue";
+
+    fn queued_extension() -> PendingLogUnit {
+        PendingLogUnit {
+            base_seq: None,
+            leaves: vec![
+                crate::context::log_unit_helpers::plan_ttl_extended_leaf(
+                    "did:example:log-and-queue",
+                    &scp_event_log::payload::TtlExtendedPayload {
+                        old_deadline_unix: 10,
+                        new_deadline_unix: 20,
+                        proposal_id: [0x4C; 32],
+                        consenting_members: vec!["did:example:log-and-queue".to_owned()],
+                    },
+                    5,
+                )
+                .expect("the TtlExtended leaf plans"),
+            ],
+        }
+    }
+
+    #[test]
+    fn a_context_with_no_log_refuses_even_with_queued_units() {
+        let provider = MerkleEventLogProvider::new();
+        let queued = [queued_extension()];
+        let err = LogAndQueue::read(queued.iter(), CONTEXT_ID, &provider)
+            .expect_err("an absent log must refuse");
+        assert!(
+            matches!(err, ContextError::EventLogFailed(_)),
+            "expected EventLogFailed, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_entries_follow_the_durable_log() {
+        let provider = MerkleEventLogProvider::new();
+        let id = context_id_to_bytes(CONTEXT_ID);
+        provider.init_event_log(&id).await.expect("init the log");
+        provider
+            .append_event(
+                &id,
+                EventType::ContextCreated,
+                "did:example:log-and-queue",
+                scp_event_log::EventPayload::default(),
+                1,
+            )
+            .await
+            .expect("append the genesis entry");
+        let queued = [queued_extension()];
+        let read = LogAndQueue::read(queued.iter(), CONTEXT_ID, &provider).expect("the log reads");
+        let types: Vec<EventType> = read.entries().iter().map(|e| e.event_type).collect();
+        assert_eq!(types, [EventType::ContextCreated, EventType::TtlExtended]);
     }
 }

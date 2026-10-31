@@ -220,6 +220,17 @@ const PSEUDONYM_ROTATION_SRC: &str =
 // the PUSH-013 push routing-ID query (§10.7.1).
 const HANDLERS_PUSH_SRC: &str =
     include_str!("../../../../crates/scp-runtime/src/context/actor/handlers/push.rs");
+const HANDLERS_LOG_UNIT_SRC: &str =
+    include_str!("../../../../crates/scp-runtime/src/context/actor/handlers/log_unit.rs");
+// Streaming settlement adapter source — owns `ActorOutletInvokedEventSink::record`,
+// the streaming close sink pinned by
+// `log_unit_writers_reach_the_pending_queue_through_the_actor_mailbox`.
+const OUTLETS_STREAM_SETTLEMENT_ADAPTER_SRC: &str =
+    include_str!("../../../../crates/scp-runtime/src/context/outlets/stream_settlement_adapter.rs");
+// Log-unit helpers source — owns the leaf planners, pinned by
+// `log_unit_writers_reach_the_pending_queue_through_the_actor_mailbox`.
+const LOG_UNIT_HELPERS_SRC: &str =
+    include_str!("../../../../crates/scp-runtime/src/context/log_unit_helpers.rs");
 // Push helpers source — owns `push_helpers::wake_target`, the push-wake pull
 // target (ADR-029 §2). Pinned by `push_wake_targets_reach_push_helpers`.
 const PUSH_HELPERS_SRC: &str =
@@ -1537,6 +1548,113 @@ fn push_routing_ids_reach_push_helpers_through_the_actor_mailbox() {
             "push_helpers::push_routes(state)"
         ),
         "handlers::push::dispatch must answer PushCommand::Routes from push_helpers::push_routes"
+    );
+}
+
+// Spec 17 §17.3 "Event log write failures": a writer outside a context's actor
+// (the streaming close sink, the cross-context bridge, the streaming saga's
+// seal task and both of its recovery paths) queues its leaves as a pending log
+// unit through `Supervisor::send_log_unit` → `dispatch_log_unit_command` →
+// actor mailbox → `handlers::log_unit::dispatch`, which enqueues them in a
+// persisted commit.
+#[test]
+fn log_unit_writers_reach_the_pending_queue_through_the_actor_mailbox() {
+    assert!(
+        fn_body_contains(
+            SUPERVISOR_SRC,
+            "send_log_unit",
+            "dispatch_log_unit_command("
+        ),
+        "Supervisor::send_log_unit must send through dispatch_log_unit_command"
+    );
+    assert!(
+        fn_body_contains(
+            SUPERVISOR_SRC,
+            "dispatch_log_unit_command",
+            "dispatch_via_mailbox(&actor, ContextCommand::LogUnit(cmd))"
+        ),
+        "dispatch_log_unit_command must send ContextCommand::LogUnit through the actor mailbox"
+    );
+    assert!(
+        fn_body_contains(
+            ACTOR_MOD_SRC,
+            "dispatch_state",
+            "handlers::log_unit::dispatch("
+        ),
+        "the actor's dispatch_state must route ContextCommand::LogUnit to handlers::log_unit::dispatch"
+    );
+    assert!(
+        fn_body_contains(
+            HANDLERS_LOG_UNIT_SRC,
+            "enqueue",
+            "enqueue_counted_log_unit("
+        ) && fn_body_contains(HANDLERS_LOG_UNIT_SRC, "dispatch", "enqueue(cell, deps"),
+        "handlers::log_unit::dispatch must enqueue the leaves as a pending log unit"
+    );
+    assert!(
+        fn_body_contains(HANDLERS_LOG_UNIT_SRC, "enqueue", "commit_class_s_restore("),
+        "handlers::log_unit::dispatch must enqueue inside a persisted Class-S commit"
+    );
+    assert!(
+        fn_body_contains(
+            SUPERVISOR_SRC,
+            "enqueue_streaming_outlet_invoked_unit",
+            "self.send_log_unit("
+        ),
+        "the streaming close record must be queued through send_log_unit"
+    );
+    assert!(
+        fn_body_contains(
+            OUTLETS_STREAM_SETTLEMENT_ADAPTER_SRC,
+            "record",
+            ".enqueue_streaming_outlet_invoked_unit("
+        ),
+        "ActorOutletInvokedEventSink::record must queue the streaming close record through \
+         enqueue_streaming_outlet_invoked_unit"
+    );
+    assert!(
+        fn_body_contains(
+            SUPERVISOR_SRC,
+            "enqueue_streaming_outlet_invoked_unit",
+            "plan_outlet_invoked_leaf("
+        ) && fn_body_contains(
+            LOG_UNIT_HELPERS_SRC,
+            "plan_outlet_invoked_verified_leaf",
+            "plan_outlet_invoked_leaf("
+        ),
+        "both OutletInvoked writers must encode through plan_outlet_invoked_leaf"
+    );
+    for writer in ["send_streaming_saga_a_unit", "send_cross_context_a_unit"] {
+        assert!(
+            fn_body_contains(OUTLETS_INVOKE_SRC, writer, ".send_log_unit("),
+            "{writer} must queue its leaf through send_log_unit"
+        );
+    }
+    assert!(
+        fn_body_contains(
+            OUTLETS_INVOKE_SRC,
+            "run_streaming_saga_seal_task",
+            "send_streaming_saga_a_unit("
+        ),
+        "run_streaming_saga_seal_task must queue the A-side leaf through send_streaming_saga_a_unit"
+    );
+    for caller in [
+        "recover_streaming_saga_truncated_close",
+        "recover_streaming_committing_entry",
+        "complete_unsettled_streaming_saga",
+    ] {
+        assert!(
+            fn_body_contains(SUPERVISOR_SRC, caller, "send_streaming_saga_a_unit("),
+            "{caller} must queue the A-side leaf through send_streaming_saga_a_unit"
+        );
+    }
+    assert!(
+        fn_body_contains(
+            OUTLETS_INVOKE_SRC,
+            "invoke_outlet_cross_context",
+            "send_cross_context_a_unit("
+        ),
+        "the cross-context bridge's close must queue A's record through send_cross_context_a_unit"
     );
 }
 
@@ -8204,14 +8322,14 @@ fn uniffi_saga_export_wires_binding_chokepoint_and_producer() {
 #[test]
 fn ac8_streaming_saga_seal_commits_once_no_per_chunk_2pc() {
     // Bound the seal-task function body: from its `fn` to the next item
-    // (`record_streaming_saga_a_event`, which immediately follows it).
+    // (`send_streaming_saga_a_unit`, which immediately follows it).
     let fn_start = OUTLETS_INVOKE_SRC
         .find("pub(crate) async fn run_streaming_saga_seal_task")
         .expect("run_streaming_saga_seal_task must exist in invoke.rs");
     let after_fn = &OUTLETS_INVOKE_SRC[fn_start..];
     let fn_len = after_fn
-        .find("async fn record_streaming_saga_a_event")
-        .expect("record_streaming_saga_a_event follows the seal task");
+        .find("async fn send_streaming_saga_a_unit")
+        .expect("send_streaming_saga_a_unit follows the seal task");
     // Strip `//` line comments (doc/rationale references to the message names are
     // not code) before matching — mirrors the gating gate's comment-stripping, so
     // the guard asserts on the actual dispatch code, not prose.
@@ -10095,17 +10213,11 @@ const NON_EVENT_LOG_APPENDS: &[(&str, &str)] = &[
     ),
     ("append_entry_by_text", "an OpenSSL X.509 name"),
     ("append_own_leaf_node", "the MLS provider's storage"),
-    ("append_mode", "a TTL leaf's append-mode accessor"),
 ];
 
-/// Free functions that write leaves to a context's event log.
-const EVENT_LOG_APPEND_FREE_FNS: &[&str] = &[
-    "append_consequence_leaves_after_side_effect",
-    // Wrappers that forward to the builder trait.
-    "record_streaming_saga_a_event",
-    "record_cross_context_a_event",
-    "emit_divergence_marker",
-];
+/// Free functions that write leaves to a context's event log. None exists
+/// today: every write goes through a `.append_*(` method call.
+const EVENT_LOG_APPEND_FREE_FNS: &[&str] = &[];
 
 /// The byte offset of each call in `code` that writes a leaf to a context's
 /// event log: every `.append_<name>(` method call whose name
@@ -10163,21 +10275,6 @@ const EVENT_LOG_APPEND_ALLOWLIST: &[(&str, &str, &str)] = &[
     ),
     (
         "scp-runtime/src/context/builder.rs",
-        "append_event_after_side_effect",
-        "the builder trait",
-    ),
-    (
-        "scp-runtime/src/context/builder.rs",
-        "append_event_in",
-        "the builder trait, forwards to `append_event`",
-    ),
-    (
-        "scp-runtime/src/context/builder.rs",
-        "append_event_in",
-        "the builder trait, forwards to `append_event_after_side_effect`",
-    ),
-    (
-        "scp-runtime/src/context/builder.rs",
         "append_unit",
         "the builder trait",
     ),
@@ -10193,17 +10290,7 @@ const EVENT_LOG_APPEND_ALLOWLIST: &[(&str, &str, &str)] = &[
     ),
     (
         "scp-runtime/src/context/builder.rs",
-        "append_outlet_invoked_verified",
-        "the builder trait",
-    ),
-    (
-        "scp-runtime/src/context/builder.rs",
         "append_membership_change_leaf",
-        "the builder trait",
-    ),
-    (
-        "scp-runtime/src/context/builder.rs",
-        "append_role_assigned_leaf",
         "the builder trait",
     ),
     // Fail-closed appends that run before their step.
@@ -10222,376 +10309,16 @@ const EVENT_LOG_APPEND_ALLOWLIST: &[(&str, &str, &str)] = &[
         "create_context",
         "a fail-closed append, the founder's `MemberJoined`",
     ),
+    (
+        "scp-runtime/src/context/ttl_close_helpers.rs",
+        "extend_ttl_deadline_and_record",
+        "fail-closed before the step (the bilateral reset)",
+    ),
     // A seam that only the `testing` feature compiles.
     (
         "scp-runtime/src/context/supervisor/supervisor.rs",
         "test_append_event_log",
         "a testing-feature seam",
-    ),
-    // KeyEpochAdvance leaves.
-    (
-        "scp-runtime/src/context/broadcast_helpers.rs",
-        "unsubscribe_broadcast",
-        "SCP-349",
-    ),
-    (
-        "scp-runtime/src/context/broadcast_helpers.rs",
-        "block_broadcast_subscriber",
-        "SCP-349",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_revoke",
-        "SCP-349",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_rotate_content_keys",
-        "SCP-349",
-    ),
-    // The streaming saga's A-side record.
-    (
-        "scp-runtime/src/context/outlets/invoke.rs",
-        "record_streaming_saga_a_event",
-        "spec 06 §6.2.4",
-    ),
-    (
-        "scp-runtime/src/context/actor/handlers/saga.rs",
-        "emit_divergence_marker",
-        "spec 17 §17.3",
-    ),
-    // Callers of the free wrappers on `EVENT_LOG_APPEND_FREE_FNS`.
-    (
-        "scp-runtime/src/context/actor/handlers/saga.rs",
-        "dispatch_commit_phase",
-        "through `emit_divergence_marker`, spec 17 §17.3",
-    ),
-    (
-        "scp-runtime/src/context/outlets/invoke.rs",
-        "run_cross_context_bridge",
-        "through `record_cross_context_a_event`, spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/outlets/invoke.rs",
-        "run_streaming_saga_seal_task",
-        "through `record_streaming_saga_a_event`, spec 06 §6.2.4",
-    ),
-    (
-        "scp-runtime/src/context/supervisor/supervisor.rs",
-        "complete_unsettled_streaming_saga",
-        "through `record_streaming_saga_a_event`, spec 06 §6.2.4",
-    ),
-    (
-        "scp-runtime/src/context/supervisor/supervisor.rs",
-        "recover_streaming_saga_truncated_close",
-        "through `record_streaming_saga_a_event`, spec 06 §6.2.4",
-    ),
-    // Leaves after a step, written memory-first; spec 17 §17.3 moves each
-    // into a pending log unit.
-    (
-        "scp-runtime/src/context/supervisor/supervisor.rs",
-        "append_streaming_outlet_invoked_event",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/outlets/stream_settlement_adapter.rs",
-        "record",
-        "forwards to `append_streaming_outlet_invoked_event`",
-    ),
-    (
-        "scp-runtime/src/context/actor/handlers/governance.rs",
-        "handle_evaluate_periodic_consequences_actor",
-        "spec 17 §17.3, memory-first after the step, through `append_consequence_leaves_after_side_effect`",
-    ),
-    (
-        "scp-runtime/src/context/broadcast_helpers.rs",
-        "subscribe_broadcast",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/broadcast_helpers.rs",
-        "unsubscribe_broadcast",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/lifecycle_helpers.rs",
-        "join_context",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/lifecycle_helpers.rs",
-        "leave_context",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_add_member",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_remove_member",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_change_role",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "finalize_governance_action",
-        "spec 17 §17.3, memory-first after the step, through `append_consequence_leaves_after_side_effect`",
-    ),
-    (
-        "scp-runtime/src/context/governance_logic.rs",
-        "append_consequence_leaves_after_side_effect",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/actor/handlers/saga.rs",
-        "commit_b_settle_finalize",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/actor/handlers/saga.rs",
-        "commit_b_stream_settle_finalize",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/actor/handlers/saga.rs",
-        "commit_a",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/outlets/invoke.rs",
-        "record_cross_context_a_event",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/broadcast_helpers.rs",
-        "block_broadcast_subscriber",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/broadcast_helpers.rs",
-        "unblock_broadcast_subscriber",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/ttl.rs",
-        "close_context",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/ttl.rs",
-        "finalize_close",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/ttl.rs",
-        "finish_ttl_expiry_io",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/ttl_close_helpers.rs",
-        "extend_ttl_deadline_and_record",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "tombstone_migrated_context",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "withdraw_governance_vote",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "apply_pending_ceiling_modification",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "apply_pending_economic_policy_change",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_suspend_member",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_revoke",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_restore_access",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_register_outlet",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_remove_outlet",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_modify_ceiling",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_close_context",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_extend_ttl",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_transfer_admin",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_create_child_context",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_modify_pruning_policy",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_add_signer",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_remove_signer",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_modify_threshold",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_establish_outlet_interface",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_reset_member",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_resolve_conflict",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_promote_context",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_rotate_content_keys",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_reconfigure_governance",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_reconfigure_governance",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_set_economic_policy",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_approve_spend",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_lock_economic_policy",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_modify_hard_rate_limit",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_modify_pseudonym_rotation_policy",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_propose_context_migration",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "execute_cancel_context_migration",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "propose_governance_action_inner",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "propose_governance_action_inner",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "propose_governance_action_inner",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "vote_on_proposal_inner",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "vote_on_proposal_inner",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "dispatch_governance_action",
-        "spec 17 §17.3, memory-first after the step",
-    ),
-    (
-        "scp-runtime/src/context/governance_helpers.rs",
-        "finalize_governance_action",
-        "spec 17 §17.3, memory-first after the step",
     ),
 ];
 
@@ -10642,17 +10369,14 @@ fn the_event_log_append_scan_reports_a_planted_call() {
         entry.1.push_str(&strip_non_code_keeping_cfg(extra));
         copy
     };
-    // A provider call, a builder wrapper, a supervisor wrapper, a method no
-    // list names yet, and the free consequence-leaf writer.
+    // A provider call, a builder wrapper, a supervisor wrapper, and a method
+    // no list names yet.
     for call in [
         "log.append_event(a, b)",
         "log.append_unit(a, b)",
         "log.append_membership_change_leaf(a, b)",
         "sup.append_streaming_outlet_invoked_event(a, b)",
         "log.append_some_new_leaf(a)",
-        "crate::context::governance_logic::append_consequence_leaves_after_side_effect(a, b)",
-        // A free wrapper that forwards to the builder trait.
-        "crate::context::outlets::invoke::record_streaming_saga_a_event(a, b)",
     ] {
         let planted = plant(&format!(
             "\nasync fn planted_after_send(log: &L) {{ let _ = {call}.await; }}\n"

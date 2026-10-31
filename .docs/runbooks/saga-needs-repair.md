@@ -76,9 +76,13 @@ The entry **stays** `NeedsRepair` across a restart only when replay cannot resol
 - a non-reconstructible / corrupt journal entry surfaced by the load-sweep skip.
 
 For these, use the durable divergence account: `recover_needs_repair_entry` rehydrates any
-`saga_repair_records` carried in the entry's evidence, and each reachable side has appended
-its own signed `CrossContextDivergenceMarker` to its own log (the
-`emit_divergence_marker` handler). Reconcile from those records — confirm which side
+`saga_repair_records` carried in the entry's evidence, and each reachable side has queued
+its own signed `CrossContextDivergenceMarker` for its own log (the
+`queue_divergence_marker` handler in `context/actor/handlers/saga.rs`). The marker is a
+pending log unit (spec 17 §17.3 "Event log write failures"), so the side's log holds it only
+after that context's actor drains its queue. A side whose log write keeps failing still holds
+the marker in its stored queue: check the side's log, and when the marker is missing, fix the
+log's storage and restart so the drain writes it. Reconcile from those records — confirm which side
 holds the committed effect and which the reservation — and settle the economy manually,
 then the entry can be marked resolved. A corrupt-entry skip is a **storage** problem: repair
 or restore the backing store before expecting recovery to progress.

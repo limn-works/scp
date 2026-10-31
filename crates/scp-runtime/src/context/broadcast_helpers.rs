@@ -9,7 +9,7 @@
 //! # Purpose
 //!
 //! This module hosts broadcast-domain helpers that operate on actor-owned
-//! [`PerContextState`] and
+//! [`PerContextState`](crate::context::actor::state::PerContextState) and
 //! capability-reduced [`ActorDeps`].
 //! The pre-migration `&Supervisor` lock-and-call bodies have been removed
 //! (Phase 2A finalization); this module is the sole home for these helpers.
@@ -38,8 +38,11 @@ use scp_protocol::crypto::ucan::validate::{
 use crate::context::actor::class_s::ClassSCell;
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::signer::CommandSigner;
-use crate::context::actor::state::PerContextState;
-use crate::context::state::{context_id_to_bytes, require_active, strip_event_payload};
+use crate::context::log_unit_helpers::{
+    PlannedKeyEpochAdvances, drain_pending_log_units, plan_leaf, plan_membership_change_leaf,
+    queue_log_unit,
+};
+use crate::context::state::{require_active, strip_event_payload};
 
 // ---------------------------------------------------------------------------
 // subscribe_broadcast
@@ -70,8 +73,6 @@ where
     P: ProofResolver + Send + Sync,
     S: BuildHasher + Send + Sync,
 {
-    let context_id_bytes = context_id_to_bytes(context_id);
-
     require_active(&cell.handle)?;
     cell.handle
         .params()
@@ -114,10 +115,28 @@ where
         ));
     }
 
-    // All in-state mutations below are Class-C (broadcast subscriber roster
-    // ADD, broadcast metadata, receive buffer, checkpoint counter) with the
-    // best-effort persist below — routed through the non-persisting Class-C
-    // view (ADR-049 §9). Member ADD is a structural Class-C op (the restricted
+    // Subject-bearing leaf (ADR-011 amendment): carry the subscriber
+    // (`subscriber_did`, which on a self-subscribe already equals `actor_did`)
+    // and the "subscriber" role, so the leaf shape is uniform with member
+    // joins and the SDK reads `subject_did` consistently. The participation
+    // record (§7.3.2) attributes the join interval to this subject.
+    //
+    // Committer-assigned: the subscriber's signed subscribe-request timestamp,
+    // copied by every member (§7.3.1, §9.9.3). Planned before the roster
+    // mutation so a leaf that breaks the payload rules refuses the subscribe
+    // before it lands (spec 17 §17.3 "Event log write failures").
+    let joined_leaf = plan_membership_change_leaf(
+        scp_event_log::EventType::MemberJoined,
+        subscriber_did.as_ref(),
+        &scp_event_log::payload::MembershipChangePayload {
+            subject_did: subscriber_did.as_ref().to_owned(),
+            role_name: "subscriber".to_owned(),
+        },
+        timestamp,
+    )?;
+
+    // The roster mutations below run through the non-persisting Class-C view
+    // (ADR-049 §9); the keep persist that queues the leaf makes them durable. Member ADD is a structural Class-C op (the restricted
     // `MembershipClassCMut` exposes it; member REMOVAL is the downward-auth
     // Class-S op it withholds — see `unsubscribe_broadcast`).
     let result = {
@@ -144,33 +163,16 @@ where
         deps.event_tx.as_ref(),
     );
 
-    // Broadcast roster state now rides the Class-S `ContextSnapshot`; the
-    // whole-snapshot best-effort persist below covers it. Subscribe/unsubscribe
-    // are roster ADD/REMOVE with no key secrecy, best-effort by design (§9 carve).
-    persist_state_best_effort(cell, deps, context_id).await;
-
-    // Subject-bearing leaf (ADR-011 amendment): carry the subscriber
-    // (`subscriber_did`, which on a self-subscribe already equals `actor_did`)
-    // and the "subscriber" role, so the leaf shape is uniform with member
-    // joins and the SDK reads `subject_did` consistently. The participation
-    // record (§7.3.2) attributes the join interval to this subject.
-    //
-    // Committer-assigned: the subscriber's signed subscribe-request timestamp,
-    // copied by every member (§7.3.1, §9.9.3).
-    deps.event_log
-        .append_membership_change_leaf(
-            crate::context::builder::AppendMode::AfterSideEffect,
-            &context_id_bytes,
-            scp_event_log::EventType::MemberJoined,
-            subscriber_did.as_ref(),
-            &scp_event_log::payload::MembershipChangePayload {
-                subject_did: subscriber_did.as_ref().to_owned(),
-                role_name: "subscriber".to_owned(),
-            },
-            timestamp,
-        )
-        .await?;
-    *cell.class_c_view().checkpoint_events_since_mut() += 1;
+    // The `MemberJoined` leaf goes into a pending log unit in the fail-closed
+    // keep persist that also carries the roster ADD (spec 17 §17.3 "Event log
+    // write failures"), so the stored state that holds the subscriber holds its
+    // leaf. A failed persist keeps both in memory and returns the error.
+    queue_log_unit(cell, deps, context_id, vec![joined_leaf]).await?;
+    // The step is durable with its records queued; write them now. A failed
+    // drain leaves them queued for the actor's next drain and logs its own
+    // error, so it does not fail the step that already landed (spec 17 §17.3
+    // "Event log write failures").
+    let _ = drain_pending_log_units(cell, deps, context_id).await;
 
     Ok(result)
 }
@@ -193,9 +195,37 @@ pub async fn unsubscribe_broadcast(
     subscriber_did: &DID,
     rotate_keys: bool,
 ) -> Result<UnsubscribeResult, ContextError> {
-    let context_id_bytes = context_id_to_bytes(context_id);
-
     require_active(&cell.handle)?;
+
+    // Subject-bearing leaf (ADR-011 amendment): carry the unsubscribing
+    // subscriber (`subscriber_did`, which already equals `actor_did` on this
+    // self-unsubscribe path) and the "subscriber" role, so the leaf shape is
+    // uniform with member leaves and the SDK reads `subject_did` consistently.
+    //
+    // Committer-assigned: the unsubscribing author's clock — the source of the
+    // `created_at` on its outgoing leave message, copied by every member
+    // (§7.3.1, §9.9.3). Planned before the roster mutation (spec 17 §17.3
+    // "Event log write failures").
+    let unsub_ts = deps.clock.now_secs();
+    let left_leaf = plan_membership_change_leaf(
+        scp_event_log::EventType::MemberLeft,
+        subscriber_did.as_ref(),
+        &scp_event_log::payload::MembershipChangePayload {
+            subject_did: subscriber_did.as_ref().to_owned(),
+            role_name: "subscriber".to_owned(),
+        },
+        unsub_ts,
+    )?;
+    // ADR-007 §5: a rotating unsubscribe advances every author's epoch by
+    // exactly 1, so each author's `KeyEpochAdvance` record is planned here,
+    // before the rotation, and a record that cannot be planned refuses the
+    // unsubscribe with nothing changed.
+    let planned_advances = match cell.broadcast_context.as_ref() {
+        Some(broadcast) if rotate_keys => {
+            PlannedKeyEpochAdvances::plan_all_authors(broadcast, unsub_ts)?
+        }
+        _ => PlannedKeyEpochAdvances::default(),
+    };
 
     let result = {
         let mut view = cell.class_c_view();
@@ -229,94 +259,33 @@ pub async fn unsubscribe_broadcast(
         deps.event_tx.as_ref(),
     );
 
-    // Broadcast roster state now rides the Class-S `ContextSnapshot`; the
-    // whole-snapshot best-effort persist below covers it. Subscribe/unsubscribe
-    // are roster ADD/REMOVE with no key secrecy, best-effort by design (§9 carve).
-    persist_state_best_effort(cell, deps, context_id).await;
-
-    // Subject-bearing leaf (ADR-011 amendment): carry the unsubscribing
-    // subscriber (`subscriber_did`, which already equals `actor_did` on this
-    // self-unsubscribe path) and the "subscriber" role, so the leaf shape is
-    // uniform with member leaves and the SDK reads `subject_did` consistently.
-    //
-    // Committer-assigned: the unsubscribing author's clock — the source of the
-    // `created_at` on its outgoing leave message, copied by every member
-    // (§7.3.1, §9.9.3).
-    let unsub_ts = deps.clock.now_secs();
-    deps.event_log
-        .append_membership_change_leaf(
-            crate::context::builder::AppendMode::AfterSideEffect,
-            &context_id_bytes,
-            scp_event_log::EventType::MemberLeft,
-            subscriber_did.as_ref(),
-            &scp_event_log::payload::MembershipChangePayload {
-                subject_did: subscriber_did.as_ref().to_owned(),
-                role_name: "subscriber".to_owned(),
-            },
-            unsub_ts,
-        )
-        .await?;
-    *cell.class_c_view().checkpoint_events_since_mut() += 1;
-
     // ADR-007 §5: when `rotate_keys` was requested, each author's sender-key
-    // epoch was advanced as a consequence of the unsubscription. Emit one
-    // `KeyEpochAdvance` leaf per rotated author so the event log reflects the
-    // new epoch state. Best-effort: a failure here does not roll back the
-    // unsubscription (§5.14.8: voluntary unsubscribe with forward-secrecy key
-    // rotation is authorization-UPWARD-safe and is intentionally coalesced).
-    // `unsubscribe` always increments by exactly 1, so `old_epoch =
-    // new_epoch.saturating_sub(1)` is exact.
+    // epoch advanced as a consequence of the unsubscription, so one
+    // `KeyEpochAdvance` leaf per rotated author follows `MemberLeft` in the same
+    // unit. `key_rotations` arrives in DID-lexicographic order by construction
+    // (the `authors` `BTreeMap` in `scp_protocol::context::broadcast`), so the
+    // leaf sequence is identical on every member and across replays.
     //
-    // `key_rotations` arrives in DID-lexicographic order by construction (the
-    // `authors` `BTreeMap` in `scp_protocol::context::broadcast`), so the leaf
-    // sequence is identical on every member and across replays.
-    //
-    // Each leaf that lands is a DURABLE leaf and MUST bump
-    // `checkpoint_events_since` — the counter tracks the true durable-leaf count
-    // (governance_logic.rs:156-158) and a missed bump drifts the §9.9.3
-    // checkpoint position. The bump is INLINE in the success arm, never
-    // coalesced, so a mid-sequence failure still credits the leaves that landed.
-    for rotation in &result.key_rotations {
-        let old_epoch = rotation.new_epoch.saturating_sub(1);
-        match scp_event_log::payload::encode_payload(
-            &scp_event_log::payload::KeyEpochAdvancePayload {
-                old_epoch,
-                new_epoch: rotation.new_epoch,
-            },
-        ) {
-            Ok(payload) => {
-                if let Err(e) = deps
-                    .event_log
-                    .append_context_event_with_payload(
-                        crate::context::builder::AppendMode::AfterSideEffect,
-                        &context_id_bytes,
-                        scp_event_log::EventType::KeyEpochAdvance,
-                        rotation.author_did.as_str(),
-                        payload,
-                        unsub_ts,
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        context_id = %context_id,
-                        author_did = %rotation.author_did,
-                        error = %e,
-                        "KeyEpochAdvance event-log append failed on unsubscribe (best-effort)"
-                    );
-                } else {
-                    *cell.class_c_view().checkpoint_events_since_mut() += 1;
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    context_id = %context_id,
-                    author_did = %rotation.author_did,
-                    error = %e,
-                    "KeyEpochAdvance payload encode failed on unsubscribe (best-effort)"
-                );
-            }
-        }
-    }
+    // The unit goes into the pending log queue in the fail-closed keep persist
+    // that also carries the roster REMOVE and the epoch advances (spec 17
+    // §17.3 "Event log write failures"); its leaves count toward the §9.9.3
+    // checkpoint triggers there.
+    let mut unit = vec![left_leaf];
+    unit.extend(
+        planned_advances.for_rotations(
+            result
+                .key_rotations
+                .iter()
+                .map(|rotation| (rotation.author_did.as_str(), rotation.new_epoch)),
+            context_id,
+        ),
+    );
+    queue_log_unit(cell, deps, context_id, unit).await?;
+    // The step is durable with its records queued; write them now. A failed
+    // drain leaves them queued for the actor's next drain and logs its own
+    // error, so it does not fail the step that already landed (spec 17 §17.3
+    // "Event log write failures").
+    let _ = drain_pending_log_units(cell, deps, context_id).await;
 
     Ok(result)
 }
@@ -668,9 +637,20 @@ pub async fn block_broadcast_subscriber(
     author_did: &DID,
     subscriber_did: &DID,
 ) -> Result<BlockResult, ContextError> {
-    let context_id_bytes = context_id_to_bytes(context_id);
-
     require_active(&cell.handle)?;
+
+    // Committer-assigned: the blocking author's clock — the source of the
+    // `created_at` on its outgoing block message, copied by every member
+    // (§7.3.1, §9.9.3). The `MemberBlocked` leaf is planned before the block so
+    // a leaf that breaks the payload rules refuses it before it lands (spec 17
+    // §17.3 "Event log write failures").
+    let block_ts = deps.clock.now_secs();
+    let blocked_leaf = plan_leaf(
+        scp_event_log::EventType::MemberBlocked,
+        author_did.as_ref().to_owned(),
+        scp_event_log::EventPayload::default(),
+        block_ts,
+    )?;
 
     // Fail-closed (ADR-049 §9, §5.14.8 block-before-serve). The block ADVANCES
     // the author key epoch and ADDS the subscriber to the author's block list — a
@@ -681,20 +661,46 @@ pub async fn block_broadcast_subscriber(
     // violation). Route the mutation through the fail-closed KEEP combinator: on a
     // persist failure the in-memory block is RETAINED (un-blocking is the unsafe
     // direction) and the error propagates so the caller never observes a
-    // non-durable block — BEFORE any MemberBlocked event-log append or ack. The
-    // broadcast state now rides the Class-S `ContextSnapshot`, so this persist is
-    // atomic with `read_exclusion_list` in one row.
+    // non-durable block. The broadcast state rides the Class-S
+    // `ContextSnapshot`, so this persist is atomic with `read_exclusion_list` in
+    // one row.
+    //
+    // The same persist queues the block's records as one pending log unit
+    // (spec 17 §17.3 "Event log write failures"): `MemberBlocked`, then the
+    // author's `KeyEpochAdvance` (ADR-007 §5: the block rotates the author's
+    // sender-key epoch by exactly 1), so the two leaves sit next to each other
+    // in the Merkle log. The block advances the author's epoch by exactly 1,
+    // so that record is planned from the current epoch before the block runs,
+    // and a record that cannot be planned refuses the block with nothing
+    // changed.
     let result = cell
         .commit_class_s_keep(deps, context_id, |mut view| {
             let bc =
                 view.rest_mut().broadcast_context.as_mut().ok_or_else(|| {
                     ContextError::MembershipFailed("not a broadcast context".into())
                 })?;
-            bc.block_subscriber(author_did, subscriber_did)
+            let planned_advance = PlannedKeyEpochAdvances::plan(
+                bc.get_author(author_did.as_ref())
+                    .map(|author| (author_did.as_ref(), author.epoch())),
+                block_ts,
+            )?;
+            let result = bc.block_subscriber(author_did, subscriber_did)?;
+            let mut unit = vec![blocked_leaf];
+            unit.extend(
+                planned_advance
+                    .for_rotations([(author_did.as_ref(), result.new_epoch)], context_id),
+            );
+            view.enqueue_counted_log_unit(unit);
+            Ok(result)
         })
         .await?;
+    // The step is durable with its records queued; write them now. A failed
+    // drain leaves them queued for the actor's next drain and logs its own
+    // error, so it does not fail the step that already landed (spec 17 §17.3
+    // "Event log write failures").
+    let _ = drain_pending_log_units(cell, deps, context_id).await;
 
-    // Durable — now emit the MemberBlocked receive-buffer event + Merkle leaf.
+    // Durable — now emit the MemberBlocked receive-buffer event.
     emit_event(
         cell.class_c_view().receive_buffer_mut(),
         ContextEvent::MemberBlocked {
@@ -704,75 +710,6 @@ pub async fn block_broadcast_subscriber(
         context_id,
         deps.event_tx.as_ref(),
     );
-
-    let block_ts = deps.clock.now_secs();
-    deps.event_log
-        .append_context_event(
-            crate::context::builder::AppendMode::AfterSideEffect,
-            &context_id_bytes,
-            scp_event_log::EventType::MemberBlocked,
-            author_did.as_ref(),
-            // Committer-assigned: the blocking author's clock — the source of the
-            // `created_at` on its outgoing block message, copied by every member
-            // (§7.3.1, §9.9.3).
-            block_ts,
-        )
-        .await?;
-    // Inline Class-C counter bump for the MemberBlocked leaf. This helper
-    // appends TWO durable leaves; each needs its own bump immediately after its
-    // append so a failure on the second still credits the first
-    // (governance_logic.rs:156-158, §9.9.3 checkpoint-position drift).
-    *cell.class_c_view().checkpoint_events_since_mut() += 1;
-
-    // ADR-007 §5: blocking a subscriber rotates the author's sender-key epoch.
-    // Append the KeyEpochAdvance leaf immediately after MemberBlocked so the
-    // two leaves sit next to each other in the Merkle log whenever both land.
-    // rotate_sender_key_for_block always increments by exactly 1, so
-    // old = new.saturating_sub(1) is exact.
-    //
-    // The block and the epoch advance are durable before this append runs
-    // (§5.14.8 of the contexts spec, Durability), and `MemberBlocked` is
-    // appended with `?` above because the block is the confidentiality
-    // effect. A failed `KeyEpochAdvance` append logs and leaves the block in
-    // force: returning `Err` here would report a block that landed as one
-    // that did not.
-    let old_epoch = result.new_epoch.saturating_sub(1);
-    match scp_event_log::payload::encode_payload(&scp_event_log::payload::KeyEpochAdvancePayload {
-        old_epoch,
-        new_epoch: result.new_epoch,
-    }) {
-        Ok(payload) => {
-            if let Err(e) = deps
-                .event_log
-                .append_context_event_with_payload(
-                    crate::context::builder::AppendMode::AfterSideEffect,
-                    &context_id_bytes,
-                    scp_event_log::EventType::KeyEpochAdvance,
-                    author_did.as_ref(),
-                    payload,
-                    block_ts,
-                )
-                .await
-            {
-                tracing::warn!(
-                    context_id = %context_id,
-                    error = %e,
-                    "KeyEpochAdvance event-log append failed (best-effort)"
-                );
-            } else {
-                // The KeyEpochAdvance leaf is durable — credit it. Best-effort
-                // leaves that failed are excluded: they were never durable.
-                *cell.class_c_view().checkpoint_events_since_mut() += 1;
-            }
-        }
-        Err(e) => {
-            tracing::warn!(
-                context_id = %context_id,
-                error = %e,
-                "KeyEpochAdvance payload encode failed (best-effort)"
-            );
-        }
-    }
 
     Ok(result)
 }
@@ -797,17 +734,25 @@ pub async fn unblock_broadcast_subscriber(
     author_did: &DID,
     subscriber_did: &DID,
 ) -> Result<(), ContextError> {
-    let context_id_bytes = context_id_to_bytes(context_id);
-
     require_active(&cell.handle)?;
 
-    // Class-C broadcast metadata + receive buffer + checkpoint counter
-    // (best-effort/coalesced persist) — non-persisting Class-C view (ADR-049 §9).
+    // Committer-assigned: the unblocking author's clock — the source of the
+    // `created_at` on its outgoing unblock message, copied by every member
+    // (§7.3.1, §9.9.3). Planned before the block-list REMOVE (spec 17 §17.3
+    // "Event log write failures").
+    let unblocked_leaf = plan_leaf(
+        scp_event_log::EventType::MemberUnblocked,
+        author_did.as_ref().to_owned(),
+        scp_event_log::EventPayload::default(),
+        deps.clock.now_secs(),
+    )?;
+
     // Unblock is an UPWARD authorization change (block-list REMOVE, re-grants
-    // access) and does NOT rotate keys (§9.16.8), so best-effort persistence is
-    // correct: a coalesce-window rollback re-instates the block (the safe
-    // direction), never a spurious grant. Deliberately NOT tightened to
-    // fail-closed — see the block-before-serve asymmetry (§5.14.8).
+    // access) and does NOT rotate keys (§9.16.8), so the mutation itself runs
+    // through the non-persisting Class-C view (ADR-049 §9): a rollback
+    // re-instates the block (the safe direction), never a spurious grant. The
+    // keep persist below that queues the `MemberUnblocked` leaf makes it
+    // durable, because the leaf needs a durable home.
     {
         let mut view = cell.class_c_view();
         let mut bc = view
@@ -827,23 +772,15 @@ pub async fn unblock_broadcast_subscriber(
         deps.event_tx.as_ref(),
     );
 
-    // Broadcast roster/block state rides the Class-S `ContextSnapshot`; the
-    // whole-snapshot best-effort persist covers the block-list REMOVE.
-    persist_state_best_effort(cell, deps, context_id).await;
-
-    deps.event_log
-        .append_context_event(
-            crate::context::builder::AppendMode::AfterSideEffect,
-            &context_id_bytes,
-            scp_event_log::EventType::MemberUnblocked,
-            author_did.as_ref(),
-            // Committer-assigned: the unblocking author's clock — the source of the
-            // `created_at` on its outgoing unblock message, copied by every member
-            // (§7.3.1, §9.9.3).
-            deps.clock.now_secs(),
-        )
-        .await?;
-    *cell.class_c_view().checkpoint_events_since_mut() += 1;
+    // The `MemberUnblocked` leaf goes into a pending log unit in the
+    // fail-closed keep persist that also carries the block-list REMOVE (spec 17
+    // §17.3 "Event log write failures").
+    queue_log_unit(cell, deps, context_id, vec![unblocked_leaf]).await?;
+    // The step is durable with its records queued; write them now. A failed
+    // drain leaves them queued for the actor's next drain and logs its own
+    // error, so it does not fail the step that already landed (spec 17 §17.3
+    // "Event log write failures").
+    let _ = drain_pending_log_units(cell, deps, context_id).await;
 
     Ok(())
 }
@@ -966,20 +903,6 @@ fn emit_event(
         let sanitized = strip_event_payload(&event);
         let _ = tx.send((context_id.to_owned(), sanitized));
     }
-}
-
-/// Best-effort persist of the current actor state. Mirrors
-/// the legacy context-snapshot persistence path, but reads fields from actor
-/// state rather than the old lock-shaped state.
-fn persist_state_best_effort<'d, 'c>(
-    state: &PerContextState,
-    deps: &'d ActorDeps,
-    context_id: &'c str,
-) -> impl std::future::Future<Output = ()> + Send + use<'d, 'c> {
-    // Single source of truth: the canonical best-effort persist builds the
-    // snapshot, exports the crypto state with the Supervisor's floors, and
-    // persists nothing when the Supervisor has dropped.
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id)
 }
 
 #[cfg(test)]

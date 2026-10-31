@@ -1095,7 +1095,7 @@ pub struct ContextSnapshot {
     /// Per-member participation record cache for proposer eligibility (#1530).
     #[serde(default)]
     pub participation_cache:
-        HashMap<String, scp_protocol::trust::participation::ParticipationRecord>,
+        HashMap<String, crate::context::participation::RootedParticipationRecord>,
     /// Sender velocity tracker window configuration for anti-spam and
     /// consequence evaluation (§19.7, #1537). Persisted so velocity state
     /// survives process restarts. Contains the `window_secs` configuration.
@@ -1648,7 +1648,7 @@ pub(crate) struct GovernanceState {
     /// hoisted free function lives outside the `manager` submodule tree
     /// and requires explicit `pub(crate)` to access it).
     pub(crate) participation_cache:
-        HashMap<String, scp_protocol::trust::participation::ParticipationRecord>,
+        HashMap<String, crate::context::participation::RootedParticipationRecord>,
     /// Cooldown tracking for consequence rules: maps `rule_index` to the Unix
     /// timestamp (seconds) until which the rule should not re-fire. Prevents
     /// repeated consequence dispatch within a rule's evaluation window.

@@ -44,14 +44,15 @@ use scp_protocol::context::membership::ContextEvent;
 
 use crate::context::actor::commands::{
     BroadcastCommand, ContextCommand, EconomyCommand, GovernanceCommand, LifecycleCommand,
-    MessagingCommand, OutletsCommand, PrepareAOutcome, PrepareBOutcome, PushCommand,
-    QueriesCommand, SagaReject, StandingCommand, TrustRecoveryCommand, TtlCloseCommand,
-    saga_reject,
+    LogUnitCommand, LogUnitRequest, MessagingCommand, OutletsCommand, PrepareAOutcome,
+    PrepareBOutcome, PushCommand, QueriesCommand, SagaReject, StandingCommand,
+    TrustRecoveryCommand, TtlCloseCommand, UnitDedup, saga_reject,
 };
 use crate::context::actor::handle::ContextActorHandle;
 use crate::context::actor::outcome::Outcome;
 use crate::context::actor::{BoundedReplyError, bounded_reply_await};
 use crate::context::builder::{ContextEventLogProvider, ContextTransportProvider};
+use crate::context::log_unit_helpers::LogUnitSendError;
 use crate::context::outlets::stream::{OriginAdmissionTracker, StreamAdmissionTracker};
 use crate::context::persistence::ContextPersistence;
 use crate::context::supervisor::key_package_actor::KeyPackageStoreHandle;
@@ -1160,6 +1161,22 @@ impl CrashWindow {
 /// waits (ADR-049 Decision 16). It upgrades once the actor exits, for the one
 /// crash-handling operation; a failed upgrade means every owner dropped the
 /// Supervisor, so no respawn is possible and the watchdog ends.
+/// Whether [`Supervisor::await_departed_actors`] waits for a removed actor
+/// that still runs, or refuses at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DepartedWait {
+    /// Stop the removed actor and wait, bounded, for its task to end.
+    Await,
+    /// Refuse with a retryable error. An actor turn uses it: the removed
+    /// actor may be waiting on that turn, so waiting could only time out.
+    Refuse,
+}
+
+/// Proof that no actor a despawn removed for a context still runs. Only
+/// [`Supervisor::await_departed_actors`] makes one, and the dormant drain
+/// requires it, so no drain can run beside the context's last actor.
+struct DepartedActorsEnded(());
+
 fn spawn_actor_watchdog_task(
     permit: &SpawnPermit<'_>,
     supervisor: std::sync::Weak<Supervisor>,
@@ -1173,6 +1190,7 @@ fn spawn_actor_watchdog_task(
             log_watchdog_without_supervisor("context_actor", &ctx_id, &outcome);
             return;
         };
+        supervisor.prune_departed_actors(&ctx_id);
         supervisor.actor_watchdog(ctx_id, owning_did, outcome).await;
     });
 }
@@ -1517,6 +1535,17 @@ impl SinkHandoff {
         match self {
             Self::StreamSettlement => "stream settlement",
             Self::OutletInvokedEventAppend => "streaming OutletInvokedEvent append",
+        }
+    }
+
+    /// Counts a hand-off that never ran. A dropped close-time
+    /// `OutletInvokedEvent` is a log unit no caller waits on, so it increments
+    /// `scp_log_unit_undelivered_total` (spec 17 §17.3). A dropped settlement
+    /// is logged by the caller and reconciled by the restore-time sweep.
+    pub(in crate::context) fn record_not_run(self) {
+        match self {
+            Self::StreamSettlement => {}
+            Self::OutletInvokedEventAppend => crate::metrics::record_log_unit_undelivered(),
         }
     }
 }
@@ -2068,6 +2097,14 @@ pub struct Supervisor {
     /// (`refuse_pending_discard`), so it cannot restore the context from the
     /// snapshot the discard is about to delete.
     pending_discards: dashmap::DashSet<String>,
+    /// Actors a [`Self::despawn_actor`] removed from the registry while their
+    /// task still ran, by context id. A removed actor keeps running until it
+    /// leaves its loop and its post-loop persist has run, so a respawn,
+    /// restore, import replace, create or dormant drain of the id waits for
+    /// every listed actor's task to end before it loads the snapshot or
+    /// writes the log ([`Self::await_departed_actors`]). The watchdog drops
+    /// an entry when its task ends, so the map holds only running actors.
+    departing_actors: DashMap<String, Vec<crate::context::actor::handle::DepartingActor>>,
     /// Context ids whose first-state writes a create, import, Welcome join,
     /// standing-context create or migration create has started and not yet
     /// committed or rolled back
@@ -2576,6 +2613,7 @@ impl Supervisor {
             write_lock,
             bootstrap_spawn_lock,
             pending_discards: dashmap::DashSet::new(),
+            departing_actors: DashMap::new(),
             pending_first_state: dashmap::DashSet::new(),
             first_state_settled: tokio::sync::Notify::new(),
             saga_journal,
@@ -3120,66 +3158,55 @@ impl Supervisor {
         self.helper_persistence.get()
     }
 
-    /// Durably appends the §5.4.5 streaming `OutletInvokedEvent` at stream close
-    /// through the [`ContextEventLogProvider::append_event_after_side_effect`]
-    /// boundary: the stream has already closed and settled, so a failed store
-    /// keeps the entry in memory and marks the stored log diverged (spec
-    /// section 17.3, "Event log write failures"). The boundary re-runs the
-    /// durable event-local
-    /// `chunks_billed <= stream_chunk_count` backstop
+    /// Queues the §5.4.5 streaming `OutletInvokedEvent` at stream close as a
+    /// pending log unit in the hosting context's actor (spec 17 §17.3 "Event log
+    /// write failures"): the stream has already closed and settled, so the
+    /// record joins the actor's pending-log-unit queue in a persisted commit and
+    /// drains to the event log from there. Planning the leaf re-runs the durable
+    /// event-local `chunks_billed <= stream_chunk_count` backstop
     /// ([`verify_outlet_invoked_event_local`](crate::context::outlets::stream::verify_outlet_invoked_event_local)).
     ///
     /// Same-context billing integrity is enforced INLINE in the dispatch pump
     /// before this call (`AuditAnomaly::ChunksBilledSelfMismatch`, escrow-ledger
     /// vs Merkle-fold) — the pump does not retain the emitted payload set, so the
-    /// full §5.4.5:566 manifest re-derivation
-    /// ([`append_outlet_invoked_verified`](crate::context::builder::ContextEventLogProvider::append_outlet_invoked_verified))
-    /// applies only on the Sequence path (cross-context reassembly / import,
-    /// slice 3), not here.
+    /// full §5.4.5:566 manifest re-derivation applies only on the Sequence path
+    /// (cross-context reassembly), not here.
     ///
     /// Called (fire-and-forget) by
     /// [`ActorOutletInvokedEventSink`](crate::context::outlets::stream_settlement_adapter::ActorOutletInvokedEventSink),
     /// which the streaming open orchestrator wires internally so the close event
     /// is persisted in production regardless of the FFI bridge.
     ///
+    /// Committer-assigned leaf timestamp: the same-context streaming close
+    /// event is authored once, by the operator's node (not a cross-member
+    /// convergent commit leaf), so the Supervisor clock dates it.
+    ///
     /// # Errors
     ///
-    /// Returns [`ContextError`] when no event-log provider is configured, or the
-    /// append serializes/persists/backstop-rejects the event.
-    pub(crate) async fn append_streaming_outlet_invoked_event(
+    /// - [`LogUnitSendError::NotQueued`] with [`ContextError::NotInitialized`]
+    ///   when the Supervisor has no clock, or with
+    ///   [`ContextError::EventLogFailed`] when the event does not serialize or
+    ///   breaks the payload backstop.
+    /// - The errors of [`Self::send_log_unit`] when the context's actor is
+    ///   absent, its mailbox stays full, its reply is lost, or the enqueue
+    ///   fails.
+    pub(crate) async fn enqueue_streaming_outlet_invoked_unit(
         &self,
-        context_id_bytes: [u8; 32],
+        context_id: &str,
         event: scp_protocol::context::outlets::lifecycle::OutletInvokedEvent,
         actor_did: String,
-    ) -> Result<(), ContextError> {
-        let event_log = self.event_log_ref().ok_or_else(|| {
-            ContextError::NotInitialized(
-                "Supervisor::append_streaming_outlet_invoked_event — event_log provider not configured"
-                    .to_owned(),
-            )
-        })?;
-        // Local committer-assigned leaf timestamp: the same-context streaming
-        // close event is authored once, by the operator's node (not a
-        // cross-member convergent commit leaf), so a wall-clock reading is
-        // correct here. A missing clock falls back to 0 rather than failing the
-        // append.
-        let timestamp_secs = self.clock_ref().map_or(0, |clock| {
-            use scp_clock::Clock as _;
-            clock.now_secs()
-        });
-        let data = serde_json::to_vec(&event).map_err(|e| {
-            ContextError::EventLogFailed(format!("failed to serialize OutletInvokedEvent: {e}"))
-        })?;
-        event_log
-            .append_event_after_side_effect(
-                &context_id_bytes,
-                scp_event_log::EventType::OutletInvoked,
-                &actor_did,
-                scp_event_log::EventPayload { data },
-                timestamp_secs,
-            )
-            .await
-            .map_err(|e| ContextError::EventLogFailed(e.to_string()))
+    ) -> Result<(), LogUnitSendError> {
+        let leaf = crate::context::log_unit_helpers::plan_outlet_invoked_leaf(
+            &event,
+            &actor_did,
+            self.now_secs()?,
+        )?;
+        self.send_log_unit(
+            context_id,
+            LogUnitRequest::Leaves(vec![leaf]),
+            UnitDedup::None,
+        )
+        .await
     }
 
     /// Cheap reference to the supervisor's wall-clock source. Returns
@@ -4237,6 +4264,18 @@ impl Supervisor {
                     }
                     return Outcome::err_mutated(ContextError::CreationFailed(msg));
                 }
+                // An actor a despawn removed for this id may still be running;
+                // its post-loop persist would land over the created snapshot.
+                if let Err(e) = self
+                    .await_departed_actors(&context_id, DepartedWait::Await, &bootstrap_guard)
+                    .await
+                {
+                    let sketch = standing_outcome_error_sketch(&e);
+                    if let Err(_unsent) = reply.send(Err(e.into())) {
+                        tracing::debug!(context_id, "create_context caller dropped its reply");
+                    }
+                    return Outcome::err(sketch);
+                }
                 // (Re)creating this id is a fresh start: the fresh actor begins
                 // with a clean budget and does not inherit a previous
                 // instance's crash count or sticky poison (ADR-049 §10). A
@@ -4507,6 +4546,20 @@ impl Supervisor {
                     return Outcome::err_mutated(sketch);
                 }
                 let bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
+                // An actor a despawn removed for this id may still be running;
+                // its post-loop persist would land over the imported snapshot.
+                // (A registered actor is replaced inside the import, which
+                // waits for that one through `despawn_for_replace`.)
+                if let Err(e) = self
+                    .await_departed_actors(&context_id, DepartedWait::Await, &bootstrap_guard)
+                    .await
+                {
+                    let sketch = standing_outcome_error_sketch(&e);
+                    if let Err(_unsent) = reply.send(Err(e)) {
+                        tracing::debug!(context_id, "import_context caller dropped its reply");
+                    }
+                    return Outcome::err(sketch);
+                }
                 // Importing (re-establishing) this id is a fresh start: the
                 // imported actor begins with a clean budget, free of stale
                 // crash history and a stale poison (ADR-049 §10); a failed
@@ -4655,6 +4708,17 @@ impl Supervisor {
                 // A restore must not start an actor from a snapshot a failed
                 // create, import or join wrote and has not yet put back.
                 if let Err(e) = self.refuse_pending_first_state(&p.context_id, &bootstrap_guard) {
+                    let sketch = standing_outcome_error_sketch(&e);
+                    let _ = reply.send(Err(e));
+                    return Outcome::err(sketch);
+                }
+                // Nor while an actor a despawn removed for the id still runs:
+                // the restore would load a snapshot that actor may yet persist
+                // over, and drain units that actor may yet append.
+                if let Err(e) = self
+                    .await_departed_actors(&p.context_id, DepartedWait::Await, &bootstrap_guard)
+                    .await
+                {
                     let sketch = standing_outcome_error_sketch(&e);
                     let _ = reply.send(Err(e));
                     return Outcome::err(sketch);
@@ -5470,6 +5534,7 @@ impl Supervisor {
             self.respawn_from_snapshot_locked(
                 &notification.context_id,
                 &owning_did,
+                DepartedWait::Refuse,
                 &bootstrap_guard,
             )
             .await?;
@@ -5890,9 +5955,13 @@ impl Supervisor {
         // loop — no separate supervisor timer JoinSet exists.
         let inbox = rx;
         let exit = handle.exit_record();
+        // Armed before the task starts and dropped when the task ends, after
+        // `run()`'s post-loop persist, so a despawn can wait for that end.
+        let task_guard = exit.arm();
         let join = permit.spawn(async move {
             Box::pin(crate::context::actor::ContextActor::new(state, deps, inbox, exit).run())
                 .await;
+            drop(task_guard);
         });
 
         // Spawn the watchdog: it awaits the actor's completion and, on a
@@ -6273,7 +6342,7 @@ impl Supervisor {
         // `build_actor_deps`, nor `restore_context` re-acquires
         // `bootstrap_spawn_lock`, so this is re-entrancy- and deadlock-free.
         let bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
-        self.respawn_from_snapshot_locked(ctx_id, owning_did, &bootstrap_guard)
+        self.respawn_from_snapshot_locked(ctx_id, owning_did, DepartedWait::Await, &bootstrap_guard)
             .await
     }
 
@@ -6314,7 +6383,7 @@ impl Supervisor {
                 "{ctx_id} (the crashed actor no longer holds the id; not respawned)"
             )));
         }
-        self.respawn_from_snapshot_locked(ctx_id, owning_did, &bootstrap_guard)
+        self.respawn_from_snapshot_locked(ctx_id, owning_did, DepartedWait::Await, &bootstrap_guard)
             .await
     }
 
@@ -6368,14 +6437,105 @@ impl Supervisor {
         Ok(())
     }
 
+    /// Runs the restore's drain-only pass over the stored snapshot of a
+    /// context that is not Active (spec 17 §17.3 "Event log write failures",
+    /// "Restart"): writes the snapshot's queued log units to the context's log
+    /// with no lifecycle transition and no actor. Takes `bootstrap_spawn_lock`
+    /// and loads the snapshot under it, so no restore or bootstrap of the id
+    /// runs alongside the pass.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::PersistenceFailed`] when no persistence provider is
+    ///   configured or the snapshot load fails.
+    /// - [`ContextError::ContextNotRegistered`] when no snapshot is stored or
+    ///   a discard of the id is in progress.
+    /// - [`ContextError::ActorBusy`] while a bootstrap's first state is
+    ///   unsettled, or an actor for the id is registered (that actor drains
+    ///   its own queue).
+    /// - The pass's error from
+    ///   [`drain_dormant_snapshot`](crate::context::log_unit_helpers::drain_dormant_snapshot).
+    pub(crate) async fn drain_dormant_context(
+        &self,
+        ctx_id: &str,
+    ) -> Result<crate::context::log_unit_helpers::DormantDrain, ContextError> {
+        let bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
+        self.refuse_pending_discard(ctx_id, &bootstrap_guard)?;
+        self.refuse_pending_first_state(ctx_id, &bootstrap_guard)?;
+        let ended = self
+            .await_departed_actors(ctx_id, DepartedWait::Await, &bootstrap_guard)
+            .await?;
+        let persistence = self.persistence_ref().ok_or_else(|| {
+            ContextError::PersistenceFailed("no persistence provider configured".into())
+        })?;
+        let snapshot = persistence
+            .load_context(ctx_id)
+            .await
+            .map_err(|e| {
+                ContextError::PersistenceFailed(format!(
+                    "loading the snapshot of dormant context {ctx_id} failed: {e}"
+                ))
+            })?
+            .map(Box::new)
+            .ok_or_else(|| {
+                ContextError::ContextNotRegistered(format!("{ctx_id} has no stored snapshot"))
+            })?;
+        let drained = self
+            .drain_dormant_snapshot_locked(snapshot, &ended, &bootstrap_guard)
+            .await;
+        // The lock is held through the drain, so no bootstrap of the id runs
+        // beside it.
+        drop(bootstrap_guard);
+        drained
+    }
+
+    /// Body of [`Self::drain_dormant_context`] for a caller that holds
+    /// `bootstrap_spawn_lock` and the loaded snapshot.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::drain_dormant_context`].
+    async fn drain_dormant_snapshot_locked(
+        &self,
+        snapshot: Box<crate::context::state::ContextSnapshot>,
+        _departed_actors_ended: &DepartedActorsEnded,
+        _bootstrap_guard: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> Result<crate::context::log_unit_helpers::DormantDrain, ContextError> {
+        if self.lookup(&snapshot.context_id).is_some() {
+            return Err(ContextError::ActorBusy(format!(
+                "{}: an actor is registered; it drains its own queue",
+                snapshot.context_id
+            )));
+        }
+        let event_log = self.event_log_ref().ok_or_else(|| {
+            ContextError::EventLogFailed("no event log provider configured".into())
+        })?;
+        let persistence = self.persistence_ref().ok_or_else(|| {
+            ContextError::PersistenceFailed("no persistence provider configured".into())
+        })?;
+        // Boxed: the pass's future holds the snapshot, and every respawn and
+        // restore future awaits this one.
+        Box::pin(crate::context::log_unit_helpers::drain_dormant_snapshot(
+            event_log.as_ref(),
+            persistence.as_ref(),
+            snapshot,
+        ))
+        .await
+    }
+
     /// Body of [`Self::respawn_from_snapshot`], run by a caller that already
     /// holds `bootstrap_spawn_lock`; the guard parameter proves it.
     /// [`Self::clear_poison`] takes the lock itself so that it clears the
     /// poison flag and sets the respawn marker under the lock.
+    ///
+    /// `wait` says whether to wait for an actor a despawn removed for the id
+    /// ([`Self::await_departed_actors`]); an actor turn passes
+    /// [`DepartedWait::Refuse`].
     async fn respawn_from_snapshot_locked(
         self: &Arc<Self>,
         ctx_id: &str,
         owning_did: &DID,
+        wait: DepartedWait,
         bootstrap_guard: &tokio::sync::MutexGuard<'_, ()>,
     ) -> Result<(), ContextError> {
         // A context whose discard is in progress must not come back: its
@@ -6396,8 +6556,22 @@ impl Supervisor {
             .or_default()
             .mark_respawning();
 
-        // 1. Despawn the stale handle so the re-insert is not rejected.
+        // 1. Despawn the stale handle so the re-insert is not rejected, and
+        //    wait for every removed actor of the id to end its task: one still
+        //    running could append the units this respawn's drain appends, or
+        //    persist over the snapshot it loads. A refused wait loads nothing
+        //    and is not a crash.
         self.despawn_actor(ctx_id).await;
+        let ended = match self
+            .await_departed_actors(ctx_id, wait, bootstrap_guard)
+            .await
+        {
+            Ok(ended) => ended,
+            Err(e) => {
+                self.release_respawn_marker(ctx_id);
+                return Err(e);
+            }
+        };
 
         // 2. Load the snapshot. None ⇒ lost state (crashed pre-persist).
         let Some(persistence) = self.persistence_ref() else {
@@ -6467,6 +6641,22 @@ impl Supervisor {
             // otherwise just clear the marker, preserving its real crash
             // history.
             self.release_respawn_marker(ctx_id);
+            // The dormant context's queued log units are written now, with no
+            // transition and no actor (spec 17 §17.3 "Event log write
+            // failures", "Restart"). A failed pass leaves them stored for the
+            // next restore; the respawn's answer stays `ContextClosed`.
+            if (!snapshot.pending_log_units.is_empty() || snapshot.log_fault.is_some())
+                && let Err(e) = self
+                    .drain_dormant_snapshot_locked(Box::new(snapshot), &ended, bootstrap_guard)
+                    .await
+            {
+                tracing::error!(
+                    context_id = %ctx_id,
+                    error = %e,
+                    "drain-only pass over the dormant snapshot failed; its queued log units \
+                     stay stored"
+                );
+            }
             return Err(ContextError::ContextClosed);
         }
 
@@ -6835,7 +7025,10 @@ impl Supervisor {
     /// join of the id has not committed or rolled back its first state it
     /// returns [`ContextError::ActorBusy`]; both leave the poison record
     /// untouched. The errors of loading the wrapping key of `owning_did`
-    /// return before the poison record is touched.
+    /// return before the poison record is touched. When an actor a despawn
+    /// removed for the id is still running after
+    /// [`REPLY_TIMEOUT`](crate::context::actor::REPLY_TIMEOUT), it returns
+    /// [`ContextError::ActorBusy`] and the poison record stands.
     pub async fn clear_poison(
         self: &Arc<Self>,
         ctx_id: &str,
@@ -6858,6 +7051,14 @@ impl Supervisor {
         // poison record as it found it.
         self.refuse_pending_discard(ctx_id, &bootstrap_guard)?;
         self.refuse_pending_first_state(ctx_id, &bootstrap_guard)?;
+        // Remove any registered handle and wait for every removed actor of the
+        // id to end its task BEFORE touching the window. A wait that times out
+        // returns `ActorBusy` with the poison record standing, so the context
+        // never reads as having neither poison nor an actor. The respawn below
+        // then finds no handle to remove and no running actor to wait for.
+        self.despawn_actor(ctx_id).await;
+        self.await_departed_actors(ctx_id, DepartedWait::Await, &bootstrap_guard)
+            .await?;
         // Clear the window so the single retry starts from a clean budget.
         // `entry().or_default()` then `clear()` resets both the deque and the
         // sticky flag, and the same guard sets the respawn marker, so no read
@@ -6867,7 +7068,7 @@ impl Supervisor {
             entry.clear();
             entry.mark_respawning();
         }
-        self.respawn_from_snapshot_locked(ctx_id, owning_did, &bootstrap_guard)
+        self.respawn_from_snapshot_locked(ctx_id, owning_did, DepartedWait::Await, &bootstrap_guard)
             .await
     }
 
@@ -6943,11 +7144,116 @@ impl Supervisor {
     /// spurious `MemberLeft` event.
     pub async fn despawn_actor(&self, context_id: &str) -> bool {
         let _guard = self.write_lock.lock().await;
-        let removed = self.actors.remove(context_id).is_some();
-        if removed {
-            self.note_push_routes_changed();
+        let Some((_, handle)) = self.actors.remove(context_id) else {
+            return false;
+        };
+        self.note_push_routes_changed();
+        // The removed actor may still be mid-turn, and its post-loop persist
+        // runs after its loop ends. Track it until its task ends so the next
+        // bootstrap of this id waits for it (`await_departed_actors`).
+        if let Some(departing) = handle.departure() {
+            self.track_departing_actor(context_id, departing);
         }
-        removed
+        true
+    }
+
+    /// Records `departing` for `context_id` until its task ends. The task can
+    /// end after
+    /// [`departure`](crate::context::actor::handle::ContextActorHandle::departure) read it as running and
+    /// before the push, in which case the watchdog's prune already ran and
+    /// found nothing; the prune after the push drops such a record, so no
+    /// record outlives its task.
+    fn track_departing_actor(
+        &self,
+        context_id: &str,
+        departing: crate::context::actor::handle::DepartingActor,
+    ) {
+        self.departing_actors
+            .entry(context_id.to_owned())
+            .or_default()
+            .push(departing);
+        // The entry guard above is dropped before the prune takes the same
+        // shard lock.
+        self.prune_departed_actors(context_id);
+    }
+
+    /// Drops the tracked departing actors of `context_id` whose task has
+    /// ended, and the id's entry once none is left. The watchdog calls it
+    /// when the actor task it awaits ends.
+    fn prune_departed_actors(&self, context_id: &str) {
+        self.departing_actors
+            .remove_if_mut(context_id, |_, departing| {
+                departing.retain(crate::context::actor::handle::DepartingActor::task_running);
+                departing.is_empty()
+            });
+    }
+
+    /// Waits until no actor a despawn removed for `context_id` still runs,
+    /// so the caller's snapshot load, log write or new actor cannot interleave
+    /// with the removed actor's last turn or its post-loop persist. Each
+    /// running actor is sent `Shutdown` and awaited until its task has ended,
+    /// all within one
+    /// [`REPLY_TIMEOUT`](crate::context::actor::REPLY_TIMEOUT).
+    ///
+    /// [`DepartedWait::Refuse`] does not wait: an actor turn uses it, because
+    /// the departing actor may itself be waiting on that turn.
+    ///
+    /// The guard parameter proves the caller holds `bootstrap_spawn_lock`, so
+    /// no other bootstrap of the id registers an actor while this waits. The
+    /// wait holds no `write_lock`, which a departing actor's TTL self-despawn
+    /// takes.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::ActorBusy`] when a departing actor is still running
+    /// after the bound, or at once under [`DepartedWait::Refuse`]; it is
+    /// retryable, and the caller has loaded and written nothing.
+    async fn await_departed_actors(
+        &self,
+        context_id: &str,
+        wait: DepartedWait,
+        _bootstrap_guard: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> Result<DepartedActorsEnded, ContextError> {
+        self.wait_for_departed_actors(context_id, wait).await
+    }
+
+    /// Body of [`Self::await_departed_actors`], for
+    /// [`Self::despawn_for_replace`], whose caller holds
+    /// `bootstrap_spawn_lock` without a guard to show for it.
+    async fn wait_for_departed_actors(
+        &self,
+        context_id: &str,
+        wait: DepartedWait,
+    ) -> Result<DepartedActorsEnded, ContextError> {
+        self.prune_departed_actors(context_id);
+        let running: Vec<crate::context::actor::handle::DepartingActor> = self
+            .departing_actors
+            .get(context_id)
+            .map(|entry| entry.value().clone())
+            .unwrap_or_default();
+        if running.is_empty() {
+            return Ok(DepartedActorsEnded(()));
+        }
+        if wait == DepartedWait::Refuse {
+            return Err(ContextError::ActorBusy(format!(
+                "{context_id}: a removed actor for this context is still running; retry"
+            )));
+        }
+        let all_ended = async {
+            for departing in &running {
+                departing.stop_and_await_task_end().await;
+            }
+        };
+        let waited = tokio::time::timeout(crate::context::actor::REPLY_TIMEOUT, all_ended).await;
+        self.prune_departed_actors(context_id);
+        match waited {
+            Ok(()) => Ok(DepartedActorsEnded(())),
+            Err(_elapsed) => Err(ContextError::ActorBusy(format!(
+                "{context_id}: a removed actor for this context did not exit within {} seconds; \
+                 retry",
+                crate::context::actor::REPLY_TIMEOUT.as_secs()
+            ))),
+        }
     }
 
     /// Despawn the actor that `import_context` is replacing, and mark the
@@ -6965,14 +7271,35 @@ impl Supervisor {
     /// the two. The [`BootstrapCrashWindow`] the supervisor's
     /// `ImportContext` arm holds clears it on every exit, after the imported
     /// actor registers or the import fails.
-    pub(in crate::context) async fn despawn_for_replace(&self, context_id: &str) -> bool {
+    ///
+    /// The `ImportContext` arm already waited for every actor an earlier
+    /// despawn removed, before the import sent `PrepareForReplace`, so the
+    /// wait here covers the replaced actor alone.
+    /// It then waits for the replaced actor's task to end
+    /// ([`Self::await_departed_actors`]): that actor's post-loop persist runs
+    /// after its `PrepareForReplace` reply, and must not land over the
+    /// imported snapshot. Only `import_context`, which the `ImportContext`
+    /// arm runs while it holds `bootstrap_spawn_lock`, reaches this; that
+    /// lock is not threaded through the import, so this takes no guard.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::ActorBusy`] when the replaced actor has not exited
+    /// within [`REPLY_TIMEOUT`](crate::context::actor::REPLY_TIMEOUT).
+    pub(in crate::context) async fn despawn_for_replace(
+        &self,
+        context_id: &str,
+    ) -> Result<bool, ContextError> {
         // Drop the DashMap guard before the `.await` below (the workspace
         // denies `await_holding_lock`).
         self.crash_windows
             .entry(context_id.to_owned())
             .or_default()
             .mark_respawning();
-        self.despawn_actor(context_id).await
+        let removed = self.despawn_actor(context_id).await;
+        self.wait_for_departed_actors(context_id, DepartedWait::Await)
+            .await?;
+        Ok(removed)
     }
 
     /// Clear the respawn marker a bootstrap set ([`Self::begin_bootstrap_window`]
@@ -8112,18 +8439,20 @@ impl Supervisor {
                 });
             }
 
-            // Resolve the RECEIVING context A's shared event-log provider up front
-            // (SCP-OUT-046 #135) — fail-closed WITHOUT reserving if it is missing,
-            // since the atomic dual-log's A-side leaf cannot be recorded without it
-            // (mirrors the best-effort bridge's early check).
-            let Some(a_event_log) = self.event_log_ref().cloned() else {
+            // The seal task queues the atomic dual-log's A-side leaf through the
+            // RECEIVING context A's actor (SCP-OUT-046; spec 17 §17.3) — fail
+            // closed WITHOUT reserving when no actor serves A (mirrors the
+            // best-effort bridge's early check).
+            if self.lookup(&caller_hex).is_none() {
                 return Err(SagaError::Aborted {
                     reason: SagaAbortReason::Rejected,
                     code: 13067,
-                    message: "streaming saga: receiving-context event-log provider not configured"
-                        .to_owned(),
+                    message: format!(
+                        "streaming saga: no actor serves the receiving context '{caller_hex}', so \
+                         its CrossContextOutletInvoked leaf cannot be queued"
+                    ),
                 });
-            };
+            }
 
             // Resolve the channel-authenticated caller's ROLE in the caller context
             // (spec §6.2.4) — authoritative only in the context gate 1 just proved,
@@ -8513,7 +8842,6 @@ impl Supervisor {
                     descriptor,
                     output_schema,
                     aggregate_schema,
-                    a_event_log,
                 ),
             ));
 
@@ -8610,7 +8938,7 @@ impl Supervisor {
         // terminal (the stream crashed without a clean `End`); the receipt attests
         // the manifest root of the durable prefix regardless of terminal status.
         let seal_saga_id = saga_id.clone();
-        let outcome = match actor
+        let outcome = actor
             .send(move |reply| {
                 ContextCommand::SagaPhase(SagaPhaseMessage::CommitBStreamSettle {
                     saga_id: seal_saga_id,
@@ -8625,57 +8953,78 @@ impl Supervisor {
                 })
             })
             .await
-        {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                return Err(SagaError::NeedsRepair {
-                    saga_id,
-                    message: format!(
-                        "streaming saga truncated-close recovery — CommitBStreamSettle failed: \
-                         {err}"
-                    ),
-                });
-            }
-        };
+            .map_err(|err| SagaError::NeedsRepair {
+                saga_id: saga_id.clone(),
+                message: format!(
+                    "streaming saga truncated-close recovery — CommitBStreamSettle failed: {err}"
+                ),
+            })?;
 
-        // Record the A-side `CrossContextOutletInvoked` leaf FIRST (borrows the
-        // whole `outcome` before the settlement move), using the SAME helper the
-        // seal task uses. Best-effort (the durable witness is authoritative).
-        if let Some(a_event_log) = self.event_log_ref().cloned() {
-            crate::context::outlets::invoke::record_streaming_saga_a_event(
-                &a_event_log,
-                &saga_id,
-                &outcome,
-            )
-            .await;
+        // Queue the A-side `CrossContextOutletInvoked` leaf FIRST (borrows the
+        // whole `outcome` before the settlement move), through the SAME helper
+        // the seal task uses (spec 17 §17.3). A failed send leaves the saga
+        // unresolved: the witness is now present, so the keyless sweep re-sends
+        // the leaf with `UnitDedup::OncePerSaga`.
+        if let Err(err) =
+            crate::context::outlets::invoke::send_streaming_saga_a_unit(self, &saga_id, &outcome)
+                .await
+        {
+            return Err(SagaError::NeedsRepair {
+                saga_id,
+                message: format!(
+                    "streaming saga truncated-close recovery — the A-side \
+                     CrossContextOutletInvoked leaf was not queued: {err}"
+                ),
+            });
         }
 
         // Apply the settlement off-mailbox against B's CURRENT generation (the
         // reserve-time generation was lost in the crash; B respawned with the hold
         // restored). `None` on a replay — the money already moved (witness settled)
         // so recovery never double-settles. `witness_saga_id: Some` ⇒ the on-actor
-        // settle flips `settled` atomically with the money move.
-        if let Some(settlement) = outcome.settlement
-            && let Err(err) = self
+        // settle flips `settled` atomically with the money move. A failed or
+        // deferred settle leaves the saga unresolved for the keyless sweep, which
+        // completes the money move from the durable witness.
+        if let Some(settlement) = outcome.settlement {
+            let unapplied = match self
                 .settle_outlet_stream_via_actor(
                     *settlement,
                     outcome.generation,
                     Some(saga_id.clone()),
                 )
                 .await
-        {
-            tracing::error!(
-                saga_id = %saga_id.0,
-                %err,
-                "streaming saga truncated-close recovery — settlement apply failed; the \
-                 durable reserve is reconciled by the restore-time sweep"
-            );
+            {
+                Ok(application) if application.applied => None,
+                Ok(_) => Some(
+                    "the settlement deferred (target replaced between the seal and the settle)"
+                        .to_owned(),
+                ),
+                Err(err) => Some(format!("settlement apply failed: {err}")),
+            };
+            if let Some(reason) = unapplied {
+                return Err(SagaError::NeedsRepair {
+                    saga_id,
+                    message: format!(
+                        "streaming saga truncated-close recovery — {reason}; left Committing \
+                         for the keyless sweep"
+                    ),
+                });
+            }
         }
 
-        let _ = self
+        if let Err(err) = self
             .saga_journal
             .mark_resolved(saga_id.clone(), SagaTerminalState::Committed, false)
-            .await;
+            .await
+        {
+            return Err(SagaError::NeedsRepair {
+                saga_id,
+                message: format!(
+                    "streaming saga truncated-close recovery — sealed and settled, but the \
+                     journal resolve to Committed failed: {err}"
+                ),
+            });
+        }
         tracing::info!(
             saga_id = %saga_id.0,
             billed_count = outcome.billed_count,
@@ -9553,10 +9902,10 @@ impl Supervisor {
     ///   in the seal→settle window, so the escrow refund + §7.3.8 counter release
     ///   never ran (the xctx path has NO `stream_reservations` reconcile net).
     ///   Settlement is pure budget/counter ops — it needs NO signing key — so
-    ///   recovery COMPLETES it here: reconstruct the A-side dual-log leaf
-    ///   (best-effort, #135) and apply the rebuilt `StreamSettlement` via
+    ///   recovery COMPLETES it here: apply the rebuilt `StreamSettlement` via
     ///   [`Self::settle_outlet_stream_via_actor`] against B's CURRENT generation
-    ///   (`witness_saga_id: Some` flips `settled` atomically with the money), then
+    ///   (`witness_saga_id: Some` flips `settled` atomically with the money),
+    ///   queue the A-side dual-log leaf with `UnitDedup::OncePerSaga`, then
     ///   resolve `Committed`. A deferral (B respawned again between the read and
     ///   the settle) leaves the journal `Committing` for the next sweep — the flag
     ///   makes the money move exactly once.
@@ -9570,11 +9919,109 @@ impl Supervisor {
     ///   driver is enumerated as an AC of SCP-OUT-047). An unreachable /
     ///   non-resident target is treated as unsealed (NeedsRepair).
     async fn recover_streaming_committing_entry(&self, entry: &JournalEntry, target_hex: &str) {
-        use crate::context::actor::commands::{SagaPhaseMessage, StreamWitnessRecoveryStatus};
+        use crate::context::actor::commands::StreamWitnessRecoveryStatus;
         let saga_id = &entry.saga_id;
-        // Read the durable witness. A send failure / non-resident target is
-        // treated as `Absent` (unsealed) → NeedsRepair.
-        let status = if let Some(actor) = self.lookup(target_hex) {
+        match self.read_stream_witness_status(saga_id, target_hex).await {
+            StreamWitnessRecoveryStatus::Absent => {
+                // Witness absent → NeedsRepair, escrow HELD for the key-bearing close.
+                // A failed journal append leaves the entry `Committing`, so the
+                // next sweep re-reads the witness and retries.
+                if let Err(err) = self
+                    .saga_journal
+                    .append(JournalEntry {
+                        saga_id: saga_id.clone(),
+                        state: SagaState::NeedsRepair,
+                        participants: entry.participants.clone(),
+                        evidence: Zeroizing::new(Vec::new()),
+                        timestamp_ms: current_timestamp_ms(),
+                        seq_per_saga: entry.seq_per_saga.saturating_add(1),
+                    })
+                    .await
+                {
+                    tracing::error!(
+                        saga_id = %saga_id,
+                        %err,
+                        "streaming saga recovery — the NeedsRepair journal append failed; left \
+                         Committing for the next sweep"
+                    );
+                }
+                crate::metrics::record_saga_repair_needed();
+                tracing::error!(
+                    saga_id = %saga_id,
+                    "streaming saga recovery — seal witness ABSENT; no autonomous signing key to \
+                     seal the truncated prefix — NeedsRepair, escrow HELD for the key-bearing close"
+                );
+            }
+            StreamWitnessRecoveryStatus::Settled { a_event } => {
+                // Money already moved on the first settle. The seal task resolves
+                // `Committed` only after BOTH the settle applied and the A-side
+                // leaf was queued, so a settled witness on a `Committing` entry
+                // can mean the A-side send failed: re-send it, then resolve. A
+                // failed send leaves the entry `Committing` for the next sweep,
+                // unless A's context is deleted (spec 17 §17.3).
+                let caller_deleted =
+                    match crate::context::outlets::invoke::send_streaming_saga_a_unit(
+                        self, saga_id, &a_event,
+                    )
+                    .await
+                    {
+                        Ok(()) => false,
+                        Err(err) => {
+                            if !self
+                                .streaming_a_record_caller_deleted(saga_id, &a_event, &err)
+                                .await
+                            {
+                                return;
+                            }
+                            true
+                        }
+                    };
+                if let Err(err) = self
+                    .saga_journal
+                    .mark_resolved(saga_id.clone(), SagaTerminalState::Committed, false)
+                    .await
+                {
+                    tracing::error!(
+                        saga_id = %saga_id,
+                        %err,
+                        "streaming saga recovery — witness settled and A-side leaf queued, but \
+                         the journal resolve to Committed failed; left Committing for the next \
+                         sweep"
+                    );
+                    return;
+                }
+                if caller_deleted {
+                    Self::report_streaming_a_record_lost(saga_id);
+                }
+                tracing::info!(
+                    saga_id = %saga_id,
+                    "streaming saga recovery — seal witness present + settled; resolved Committed \
+                     (idempotent, no re-invoke, no money move)"
+                );
+            }
+            StreamWitnessRecoveryStatus::Unsettled {
+                generation,
+                settlement,
+                a_event,
+            } => {
+                // Witness present but UNSETTLED — complete the money move keylessly.
+                self.complete_unsettled_streaming_saga(saga_id, generation, settlement, a_event)
+                    .await;
+            }
+        }
+    }
+
+    /// Reads the durable stream-settle witness for `saga_id` from the target
+    /// actor `target_hex`. A failed send or a non-resident target reads as
+    /// `Absent` (unsealed), which the caller turns into `NeedsRepair` with the
+    /// escrow held.
+    async fn read_stream_witness_status(
+        &self,
+        saga_id: &SagaId,
+        target_hex: &str,
+    ) -> crate::context::actor::commands::StreamWitnessRecoveryStatus {
+        use crate::context::actor::commands::{SagaPhaseMessage, StreamWitnessRecoveryStatus};
+        if let Some(actor) = self.lookup(target_hex) {
             let check_saga_id = saga_id.clone();
             match actor
                 .send(move |reply| {
@@ -9611,50 +10058,6 @@ impl Supervisor {
                  (NeedsRepair, escrow held until the context is restored)"
             );
             StreamWitnessRecoveryStatus::Absent
-        };
-
-        match status {
-            StreamWitnessRecoveryStatus::Absent => {
-                // Witness absent → NeedsRepair, escrow HELD for the key-bearing close.
-                let _ = self
-                    .saga_journal
-                    .append(JournalEntry {
-                        saga_id: saga_id.clone(),
-                        state: SagaState::NeedsRepair,
-                        participants: entry.participants.clone(),
-                        evidence: Zeroizing::new(Vec::new()),
-                        timestamp_ms: current_timestamp_ms(),
-                        seq_per_saga: entry.seq_per_saga.saturating_add(1),
-                    })
-                    .await;
-                crate::metrics::record_saga_repair_needed();
-                tracing::error!(
-                    saga_id = %saga_id,
-                    "streaming saga recovery — seal witness ABSENT; no autonomous signing key to \
-                     seal the truncated prefix — NeedsRepair, escrow HELD for the key-bearing close"
-                );
-            }
-            StreamWitnessRecoveryStatus::Settled => {
-                // Money already moved on the first settle — resolve Committed.
-                let _ = self
-                    .saga_journal
-                    .mark_resolved(saga_id.clone(), SagaTerminalState::Committed, false)
-                    .await;
-                tracing::info!(
-                    saga_id = %saga_id,
-                    "streaming saga recovery — seal witness present + settled; resolved Committed \
-                     (idempotent, no re-invoke, no money move)"
-                );
-            }
-            StreamWitnessRecoveryStatus::Unsettled {
-                generation,
-                settlement,
-                a_event,
-            } => {
-                // Witness present but UNSETTLED — complete the money move keylessly.
-                self.complete_unsettled_streaming_saga(saga_id, generation, settlement, a_event)
-                    .await;
-            }
         }
     }
 
@@ -9662,58 +10065,35 @@ impl Supervisor {
     /// crash-recovery sweep (SCP-OUT-046 CRITICAL): the seal-close landed durably
     /// but the money move (escrow refund + §7.3.8 counter release) never ran (a
     /// crash / eviction in the seal→settle window). Settlement is pure
-    /// budget/counter ops — NO signing key — so this reconstructs the best-effort
-    /// A-side dual-log leaf (#135; convergent, dedup-able) and applies the rebuilt
+    /// budget/counter ops — NO signing key — so this applies the rebuilt
     /// settlement against B's CURRENT generation (`witness_saga_id: Some` flips
-    /// `settled` atomically with the money), then resolves `Committed`. A deferral
-    /// (B respawned again between the witness read and the settle) leaves the
-    /// journal `Committing` for the next sweep — the `settled` flag makes the money
-    /// move exactly once.
+    /// `settled` atomically with the money), then queues the A-side dual-log leaf
+    /// through A's actor with `UnitDedup::OncePerSaga`, then resolves
+    /// `Committed`.
+    ///
+    /// The journal resolves only when the settle applied AND the A-side send
+    /// returned `Ok`, or the send did not queue the record and A's context is
+    /// deleted (counted once by [`Self::report_streaming_a_record_lost`]). A
+    /// deferral (B respawned again between the witness read and the settle), a
+    /// failed settle, or another failed A-side send leaves the journal
+    /// `Committing`: the next sweep reads a settled witness and re-sends the
+    /// A-side leaf (the `settled` flag makes the money move exactly once;
+    /// `OncePerSaga` makes the leaf land once). No caller waits on the sweep, so every failure
+    /// is logged at error level (spec 17 §17.3).
     async fn complete_unsettled_streaming_saga(
         &self,
         saga_id: &SagaId,
         generation: u64,
         settlement: Box<crate::context::outlets::invoke::StreamSettlement>,
-        a_event: Option<Box<crate::context::actor::commands::CommitBStreamSettleOutcome>>,
+        a_event: Box<crate::context::actor::commands::CommitBStreamSettleOutcome>,
     ) {
-        // First reconstruct the A-side dual-log leaf best-effort (#135) — the seal
-        // task records it BEFORE the money move, so a crash in that window can
-        // leave it absent. On the DEFER-then-recover path (the seal task recorded
-        // the A-leaf, then deferred the settle, and recovery now re-records it) this
-        // appends a byte-identical A-leaf TWICE. That double-append is BENIGN: the
-        // leaves are convergent (same nonce, chain-depth, timestamp, and sealed
-        // root), and the §9.9.3 per-sender `(count, root)` equivocation-dedup
-        // substrate collapses them — a repeated (count, root) from the same sender
-        // is de-duplicated, not treated as equivocation. So recovery may safely
-        // re-record without a conditional "did the seal task already append?" check.
-        if let (Some(a_event), Some(a_event_log)) =
-            (a_event.as_ref(), self.event_log_ref().cloned())
-        {
-            crate::context::outlets::invoke::record_streaming_saga_a_event(
-                &a_event_log,
-                saga_id,
-                a_event,
-            )
-            .await;
-        }
-
         // The `Unsettled` variant always carries a rebuilt settlement, so there is
         // no "unsettled but nothing to settle" state to defend against here.
         match self
             .settle_outlet_stream_via_actor(*settlement, generation, Some(saga_id.clone()))
             .await
         {
-            Ok(application) if application.applied => {
-                let _ = self
-                    .saga_journal
-                    .mark_resolved(saga_id.clone(), SagaTerminalState::Committed, false)
-                    .await;
-                tracing::info!(
-                    saga_id = %saga_id,
-                    "streaming saga recovery — witness present + unsettled; completed the \
-                     escrow refund + counter release keylessly and resolved Committed"
-                );
-            }
+            Ok(application) if application.applied => {}
             Ok(_) => {
                 // Deferred (B respawned again between the witness read and the
                 // settle) — leave Committing; the next sweep retries. The `settled`
@@ -9723,16 +10103,114 @@ impl Supervisor {
                     "streaming saga recovery — settlement deferred (target replaced between \
                      read and settle); left Committing for the next sweep"
                 );
+                return;
             }
             Err(err) => {
-                tracing::warn!(
+                tracing::error!(
                     saga_id = %saga_id,
                     %err,
                     "streaming saga recovery — settlement apply failed; left Committing for \
                      the next sweep"
                 );
+                return;
             }
         }
+
+        // The seal task sends the A-side leaf BEFORE the money move, so the leaf
+        // may already be queued or logged (a seal task whose settle deferred);
+        // A's per-saga dedup queues it once.
+        let caller_deleted = match crate::context::outlets::invoke::send_streaming_saga_a_unit(
+            self, saga_id, &a_event,
+        )
+        .await
+        {
+            Ok(()) => false,
+            Err(err) => {
+                if !self
+                    .streaming_a_record_caller_deleted(saga_id, &a_event, &err)
+                    .await
+                {
+                    return;
+                }
+                true
+            }
+        };
+
+        if let Err(err) = self
+            .saga_journal
+            .mark_resolved(saga_id.clone(), SagaTerminalState::Committed, false)
+            .await
+        {
+            tracing::error!(
+                saga_id = %saga_id,
+                %err,
+                "streaming saga recovery — settled and A-side leaf queued, but the journal \
+                 resolve to Committed failed; left Committing for the next sweep"
+            );
+            return;
+        }
+        if caller_deleted {
+            Self::report_streaming_a_record_lost(saga_id);
+        }
+        tracing::info!(
+            saga_id = %saga_id,
+            "streaming saga recovery — witness present + unsettled; completed the escrow \
+             refund + counter release keylessly and resolved Committed"
+        );
+    }
+
+    /// Classifies a failed A-side send of a sealed streaming saga during the
+    /// keyless sweep (spec 17 §17.3 "Event log write failures").
+    ///
+    /// Returns `true` when the send did not queue the record and A's context
+    /// is deleted from durable persistence
+    /// ([`Self::caller_context_deleted_from_persistence`]): the record has no
+    /// log to land in, so the caller resolves the saga and then calls
+    /// [`Self::report_streaming_a_record_lost`] once. Otherwise it logs the
+    /// failure and returns `false`, and the caller leaves the saga
+    /// `Committing`: a later sweep re-sends the record, and A's per-saga dedup
+    /// queues it once.
+    async fn streaming_a_record_caller_deleted(
+        &self,
+        saga_id: &SagaId,
+        a_event: &crate::context::actor::commands::CommitBStreamSettleOutcome,
+        err: &LogUnitSendError,
+    ) -> bool {
+        let deleted = match err {
+            LogUnitSendError::NotQueued(_) => {
+                match crate::context::outlets::invoke::plan_streaming_saga_a_leaf(saga_id, a_event)
+                {
+                    Ok((caller_hex, _)) => {
+                        self.caller_context_deleted_from_persistence(&caller_hex)
+                            .await
+                    }
+                    Err(_) => false,
+                }
+            }
+            LogUnitSendError::OutcomeUnknown(_) => false,
+        };
+        if !deleted {
+            tracing::error!(
+                saga_id = %saga_id,
+                %err,
+                "streaming saga recovery — the A-side CrossContextOutletInvoked leaf was not \
+                 queued; left Committing for the next sweep"
+            );
+        }
+        deleted
+    }
+
+    /// Logs and counts, once, the A-side record of a streaming saga the sweep
+    /// resolved after A's context was deleted (spec 17 §17.3 "Event log write
+    /// failures"). B's record and the money move stand; A's log, which no
+    /// longer exists, lacks the record.
+    fn report_streaming_a_record_lost(saga_id: &SagaId) {
+        crate::metrics::record_log_unit_undelivered();
+        tracing::error!(
+            saga_id = %saga_id,
+            "streaming saga recovery — the caller context is deleted, so its \
+             CrossContextOutletInvoked record has no log to land in; resolved Committed"
+        );
     }
 
     /// Reconstruct a cross-context outlet-invocation saga's prepared state from a
@@ -12760,6 +13238,11 @@ impl Supervisor {
         // custody call runs under either.
         self.load_wrapping_key(local_did).await?;
         let bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
+        // An actor a despawn removed for this id may still be running; the
+        // probe below must not read, and a recreate must not write over, the
+        // state that actor may yet persist.
+        self.await_departed_actors(&context_id, DepartedWait::Await, &bootstrap_guard)
+            .await?;
 
         // Step 1/2: existence + liveness probe. The decision to create turns
         // on absence, so this reads the checked form (ADR-049 §10). Only
@@ -14220,10 +14703,13 @@ impl Supervisor {
     /// # Errors
     ///
     /// Returns [`ContextError::NotInitialized`] if the event-log provider or
-    /// clock is not configured, [`ContextError`] if the provider fails, and
-    /// surfaces [`TrustError`](scp_protocol::trust::TrustError) (e.g.
-    /// `EmptyEventLog`) from the core computation as
-    /// [`ContextError::InvalidState`].
+    /// clock is not configured, [`ContextError::ContextNotRegistered`] when no
+    /// event log is loaded for the context and no actor serves it,
+    /// [`ContextError::EventLogFailed`] when an actor serves it but no log is
+    /// loaded, [`ContextError`] if the provider fails,
+    /// [`ContextError::NoParticipationFacts`] for an empty log, and surfaces
+    /// any other [`TrustError`](scp_protocol::trust::TrustError) from the core
+    /// computation as [`ContextError::InvalidState`].
     pub fn participation_record(
         &self,
         context_id: &str,
@@ -14247,9 +14733,26 @@ impl Supervisor {
         let context_id_bytes = crate::context::state::context_id_to_bytes(context_id);
         // FULL, unfiltered event set — `governance_actions_against` needs
         // events where the subject is the projected target, not the actor.
+        // The durable log only: the record binds the log's Merkle root, which
+        // covers no queued unit. A context with no log refuses; an absent log
+        // is never read as an empty one (spec 17 §17.3 "Event log write
+        // failures"). With no actor registered, the context is unknown here
+        // (never created, or dormant with its log unloaded), and the refusal
+        // says so; a registered context without a log is a fault.
         let events = event_log
             .event_log_entries(&context_id_bytes)?
-            .unwrap_or_default();
+            .ok_or_else(|| {
+                if self.lookup(context_id).is_none() {
+                    ContextError::ContextNotRegistered(format!(
+                        "Supervisor::participation_record — {context_id} (no actor serves it, \
+                         so no event log is loaded)"
+                    ))
+                } else {
+                    ContextError::EventLogFailed(format!(
+                        "Supervisor::participation_record — context {context_id} has no event log"
+                    ))
+                }
+            })?;
         // FAIL CLOSED on the Merkle root (white-hat P2). A log that HAS events
         // must carry a real root: substituting `[0u8; 32]` would emit a record
         // with real participation facts bound to a zero root, which a verifier
@@ -15326,15 +15829,20 @@ impl Supervisor {
 
         // §5.4.5 / SCP-OUT-035 — the durable close-event sink, wired INTERNALLY
         // here (not by the FFI caller, which passes `None`) so the "ONE event
-        // per stream at close" record is persisted in production and the full
-        // §5.4.5:566 wire-rejection fires at the real log-insert boundary. A
-        // caller-supplied `invoked_event_sink` (tests capturing the event) takes
-        // precedence; otherwise the durable production sink is used.
+        // per stream at close" record is persisted in production. The sink
+        // plans the leaf with only the event-local `chunks_billed <=
+        // stream_chunk_count` backstop: the pump keeps no chunks, so it enforces
+        // same-context billing integrity inline
+        // (`AuditAnomaly::ChunksBilledSelfMismatch`), and the full §5.4.5:566
+        // manifest re-derivation runs only on the cross-context receiver
+        // (`plan_outlet_invoked_verified_leaf`). A caller-supplied
+        // `invoked_event_sink` (tests capturing the event) takes precedence;
+        // otherwise the durable production sink is used.
         let durable_invoked_sink: Arc<dyn crate::context::outlets::invoke::OutletInvokedEventSink> =
             Arc::new(
                 crate::context::outlets::stream_settlement_adapter::ActorOutletInvokedEventSink::new(
                     Arc::downgrade(self),
-                    crate::context::state::context_id_to_bytes(context_id),
+                    context_id.to_owned(),
                     invoker_did.as_ref().to_owned(),
                 ),
             );
@@ -15629,8 +16137,9 @@ impl Supervisor {
     /// # Errors
     ///
     /// Returns [`OutletOpenError`](crate::context::outlets::invoke::OutletOpenError):
-    /// `SupervisorShutDown` once shutdown has begun, and `Invocation` when A's
-    /// event-log provider is not configured, when the outlet is a paid
+    /// `SupervisorShutDown` once shutdown has begun, and `Invocation` when no
+    /// actor serves A or the Supervisor has no clock (A's `OutletInvoked`
+    /// record could not be queued at close), when the outlet is a paid
     /// Action outlet (or `cost_per_chunk > 0`), when a §7.3.8 counter cap in
     /// `caveat_binding` is exhausted, or when the B-side open is rejected.
     #[allow(clippy::too_many_arguments)]
@@ -15654,22 +16163,8 @@ impl Supervisor {
     where
         E: crate::context::outlets::invoke::OutletExecutor + ?Sized + 'static,
     {
-        // Resolve A's SHARED event-log provider (the off-mailbox durable log —
-        // no per-context lock, ADR-049-safe). A missing provider fails the open
-        // closed: the bridge cannot record A's `OutletInvoked` without it.
-        let a_event_log = self.event_log_ref().cloned().ok_or_else(|| {
-            crate::context::outlets::invoke::OutletOpenError::from(
-                crate::context::outlets::invoke::InvocationError::ExecutionFailed {
-                    message:
-                        "cross-context bridge: receiving-context event-log provider not configured"
-                            .to_owned(),
-                },
-            )
-        })?;
-
         crate::context::outlets::invoke::invoke_outlet_cross_context(
             self,
-            a_event_log,
             receiving_context_id,
             operating_context_id,
             registry,
@@ -16607,6 +17102,10 @@ impl Supervisor {
                  the single-use KeyPackage"
             )));
         }
+        // An actor a despawn removed for this id may still be running; its
+        // post-loop persist would land over the joined snapshot.
+        self.await_departed_actors(&context_id, DepartedWait::Await, &bootstrap_guard)
+            .await?;
 
         // Precheck B (BLACK-2J-04) — require a REAL §9.10.4 local pseudonym.
         // spawn-from-Welcome always stands up an ENCRYPTED context; the FFI
@@ -16701,6 +17200,8 @@ impl Supervisor {
         // irreversible: if the elapse lands AFTER the consume the KeyPackage is
         // already spent (the same accepted cost as a crash), but the rollback still
         // leaves no half-keyed crypto or orphaned durable snapshot resident.
+        // Raised by step 3c before it initializes the joiner's event log.
+        let joiner_log_written = std::sync::atomic::AtomicBool::new(false);
         let spawn_outcome: Result<crate::context::ContextHandle, ContextError> =
             match tokio::time::timeout(
                 Self::LIFECYCLE_TIMEOUT,
@@ -16947,6 +17448,23 @@ impl Supervisor {
                         )));
                     }
 
+                    // 3c. Initialize the joiner's event log, as a create does (spec
+                    //     17 §17.3): the participation root every send, proposal,
+                    //     and outlet reserve reads, and every log unit the actor
+                    //     writes, live in this log. The flag goes up before the
+                    //     init, so a join that fails or times out from here on
+                    //     destroys whatever the init wrote.
+                    joiner_log_written.store(true, std::sync::atomic::Ordering::SeqCst);
+                    if let Err(e) = deps.event_log.init_event_log(&context_id_bytes).await {
+                        // Rollback path: no attestation is built here, so the
+                        // disposal outcome has no reader.
+                        let _ = state.dispose_secrets();
+                        return Err(ContextError::EventLogFailed(format!(
+                            "spawn-from-Welcome: initializing the event log of \
+                             '{context_id}' failed: {e}"
+                        )));
+                    }
+
                     // 4. Write the joiner's first `last_relay_contact` (ADR-029
                     //    Implementation), then persist the initial Class-S snapshot
                     //    FAIL-CLOSED, both BEFORE the spawn is acked: the member's history
@@ -17037,13 +17555,31 @@ impl Supervisor {
         drop(bootstrap_guard);
         // A failed or timed-out join puts back what step 4 wrote; a no-op after
         // the spawn committed or when step 4 never ran.
+        // The joiner's event log goes first, while `first_state` still claims
+        // the id, so no other operation over the id can initialize a log the
+        // destroy would remove.
         let spawn_outcome = match spawn_outcome {
-            Err(e) => match first_state.rollback(self.bootstrap_spawn_lock.lock()).await {
-                Ok(()) => Err(e),
-                Err(rollback) => Err(crate::context::lifecycle_helpers::fold_rollback_failure(
-                    &e, &rollback,
-                )),
-            },
+            Err(e) => {
+                let e = if joiner_log_written.load(std::sync::atomic::Ordering::SeqCst) {
+                    match deps.event_log.destroy_event_log(&context_id_bytes).await {
+                        Ok(()) => e,
+                        Err(destroy) => crate::context::lifecycle_helpers::fold_rollback_failure(
+                            &e,
+                            &ContextError::EventLogFailed(format!(
+                                "destroying the event log of '{context_id}' failed: {destroy}"
+                            )),
+                        ),
+                    }
+                } else {
+                    e
+                };
+                match first_state.rollback(self.bootstrap_spawn_lock.lock()).await {
+                    Ok(()) => Err(e),
+                    Err(rollback) => Err(crate::context::lifecycle_helpers::fold_rollback_failure(
+                        &e, &rollback,
+                    )),
+                }
+            }
             ok => ok,
         };
         // Propagate a step-internal error or the timeout error; on success bind the
@@ -18224,6 +18760,76 @@ impl Supervisor {
             )
         })?;
         Self::dispatch_via_mailbox(&actor, ContextCommand::Push(cmd)).await
+    }
+
+    /// Dispatch a [`LogUnitCommand`] to `ctx_id`'s actor mailbox, where
+    /// `handlers::log_unit::dispatch` queues its records (spec 17 §17.3 "Event
+    /// log write failures").
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ContextNotRegistered`], [`ContextError::ContextPoisoned`]
+    ///   or [`ContextError::ActorCrashed`] when no actor serves `ctx_id`.
+    /// - [`ContextError::ActorBusy`] from the mailbox send: the command was not
+    ///   delivered.
+    pub(in crate::context) async fn dispatch_log_unit_command(
+        &self,
+        ctx_id: &str,
+        cmd: LogUnitCommand,
+    ) -> Result<Outcome<()>, ContextError> {
+        let actor = self.lookup(ctx_id).ok_or_else(|| {
+            self.lookup_miss_error(
+                ctx_id,
+                format!(
+                    "dispatch_log_unit_command — no actor registered for context_id `{ctx_id}`"
+                ),
+            )
+        })?;
+        Self::dispatch_via_mailbox(&actor, ContextCommand::LogUnit(cmd)).await
+    }
+
+    /// Queues `request`'s records in `ctx_id`'s pending log units through its
+    /// actor, and returns once the actor replied (spec 17 §17.3 "Event log
+    /// write failures"). It sends once: the mailbox send already waits for
+    /// capacity up to its timeout, and a delivered command's reply alone says
+    /// whether the unit was queued.
+    ///
+    /// # Errors
+    ///
+    /// - [`LogUnitSendError::NotQueued`] with the lookup errors of
+    ///   [`Self::dispatch_log_unit_command`] when no actor serves `ctx_id`, with
+    ///   [`ContextError::ActorBusy`] when the mailbox stayed full, or with the
+    ///   handler's error when planning, the dedup read, or the persist failed;
+    ///   the queue is then unchanged.
+    /// - [`LogUnitSendError::OutcomeUnknown`] when the actor took the command
+    ///   but dropped the reply or did not reply within the reply bound, so the
+    ///   unit may have been queued.
+    pub(in crate::context) async fn send_log_unit(
+        &self,
+        ctx_id: &str,
+        request: LogUnitRequest,
+        dedup: UnitDedup,
+    ) -> Result<(), LogUnitSendError> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let cmd = LogUnitCommand::Enqueue {
+            request,
+            dedup,
+            reply,
+        };
+        self.dispatch_log_unit_command(ctx_id, cmd).await?;
+        match bounded_reply_await(rx).await {
+            Ok(reply) => Ok(reply?),
+            Err(BoundedReplyError::Dropped) => Err(LogUnitSendError::OutcomeUnknown(
+                ContextError::TransportFailed(format!(
+                    "send_log_unit — the actor of `{ctx_id}` dropped the reply"
+                )),
+            )),
+            Err(BoundedReplyError::Elapsed) => {
+                Err(LogUnitSendError::OutcomeUnknown(ContextError::ActorBusy(
+                    format!("send_log_unit — the actor of `{ctx_id}` did not reply in time"),
+                )))
+            }
+        }
     }
 
     /// Returns the routing IDs this device registers for push wakes, grouped by
@@ -21331,7 +21937,15 @@ mod tests {
             _context_id: &[u8; 32],
         ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
         {
-            Ok(None)
+            Ok(Some(Vec::new()))
+        }
+
+        /// The fixture holds no entry, so its root is the empty log's root.
+        fn event_log_merkle_root(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok(crate::context::participation::test_support::empty_tree_root())
         }
 
         async fn init_event_log(
@@ -22160,6 +22774,222 @@ mod tests {
         );
     }
 
+    /// A snapshot store that parks the first persist recording a reserved
+    /// queued unit (the drain's reservation) until the test releases it.
+    #[derive(Clone)]
+    struct ReservationParkingSnapshots {
+        inner: crate::context::log_unit_helpers::test_support::SharedSnapshots,
+        armed: Arc<std::sync::atomic::AtomicBool>,
+        parked: Arc<std::sync::atomic::AtomicBool>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait::async_trait]
+    impl ContextPersistence for ReservationParkingSnapshots {
+        async fn persist_context(
+            &self,
+            id: &str,
+            snap: &crate::context::state::ContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            let reserves = snap
+                .pending_log_units
+                .front()
+                .is_some_and(|unit| unit.base_seq.is_some());
+            if reserves && self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                self.parked.store(true, std::sync::atomic::Ordering::SeqCst);
+                self.release
+                    .acquire()
+                    .await
+                    .expect("the release semaphore stays open")
+                    .forget();
+            }
+            self.inner.persist_context(id, snap).await
+        }
+        async fn load_context(
+            &self,
+            id: &str,
+        ) -> Result<
+            Option<crate::context::state::ContextSnapshot>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            self.inner.load_context(id).await
+        }
+        async fn delete_context(
+            &self,
+            id: &str,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.inner.delete_context(id).await
+        }
+        async fn list_persisted_contexts(
+            &self,
+        ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+            self.inner.list_persisted_contexts().await
+        }
+    }
+
+    /// A respawn never drains a dormant snapshot while the actor it despawned
+    /// still runs (spec 17 §17.3 "Event log write failures", "Restart";
+    /// ADR-049 §10). The old actor of a closed context is mid-drain of its
+    /// queued `ContextClosed` record, parked in the persist that reserves the
+    /// record's sequence, when a respawn despawns it. The respawn waits for
+    /// that actor's task to end before it loads the snapshot, so the record
+    /// lands once and the closed context's stored state stays deleted.
+    #[tokio::test]
+    async fn a_respawn_waits_for_the_despawned_actor_before_draining_its_snapshot() {
+        const T0: u64 = 1_700_000_000;
+        let ctx_id_bytes = [0x7Du8; 32];
+        let ctx_key = hex::encode(ctx_id_bytes);
+        let owner = DID("did:example:respawn-wait-owner".to_owned());
+
+        let faulty = Arc::new(
+            crate::context::supervisor::faulty_storage::FaultyStorage::new(Arc::new(
+                InMemoryStorage::new(),
+            )),
+        );
+        let snapshots = ReservationParkingSnapshots {
+            inner: crate::context::log_unit_helpers::test_support::SharedSnapshots::default(),
+            armed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            parked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+        };
+        let sup = supervisor_with_clock_persistence_and_event_log(
+            Arc::new(TestClock::new(T0)),
+            Box::new(snapshots.clone()),
+            Box::new(crate::context::log_unit_helpers::test_support::merkle_log_over(&faulty)),
+        );
+        let deps = sup
+            .build_actor_deps_loaded(&owner)
+            .await
+            .expect("the owner's deps build");
+        deps.event_log
+            .init_event_log(&ctx_id_bytes)
+            .await
+            .expect("the log initialises");
+
+        // A closed context whose `ContextClosed` record is queued, not yet
+        // reserved, stored as the close left it.
+        let state = closed_state_with_queued_close(ctx_id_bytes, T0, &owner);
+        snapshots
+            .inner
+            .persist_context(
+                &ctx_key,
+                &crate::context::manager_methods::snapshot_context(&state),
+            )
+            .await
+            .expect("the closed snapshot stores");
+
+        // The actor starts draining the record and parks in the persist that
+        // reserves its sequence.
+        snapshots
+            .armed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let handle = sup
+            .spawn_actor_with_state(state, deps, None)
+            .await
+            .expect("the actor spawns");
+        drop(handle);
+        for _ in 0..200 {
+            if snapshots.parked.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            snapshots.parked.load(std::sync::atomic::Ordering::SeqCst),
+            "the actor parks mid-drain"
+        );
+
+        // The respawn despawns the parked actor and runs as far as it can;
+        // then the actor's persist is released.
+        let respawn = tokio::spawn({
+            let sup = Arc::clone(&sup);
+            let ctx_key = ctx_key.clone();
+            let owner = owner.clone();
+            async move { sup.respawn_from_snapshot(&ctx_key, &owner).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        snapshots.release.add_permits(1);
+        let respawned = tokio::time::timeout(std::time::Duration::from_secs(10), respawn)
+            .await
+            .expect("the respawn finishes")
+            .expect("the respawn task does not panic");
+        assert!(
+            respawned.is_err(),
+            "a closed context is never respawned: {respawned:?}"
+        );
+        // Let a despawned actor that was not waited for finish its writes.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        assert_eq!(
+            stored_closed_records(&faulty, &ctx_id_bytes).await,
+            1,
+            "the queued ContextClosed record lands exactly once"
+        );
+        assert!(
+            snapshots.inner.snapshot(&ctx_key).await.is_none(),
+            "the closed context's stored state stays deleted, not resurrected"
+        );
+    }
+
+    /// A closed context's state whose `ContextClosed` record is queued and not
+    /// yet reserved, as the close leaves it.
+    fn closed_state_with_queued_close(
+        ctx_id_bytes: [u8; 32],
+        now_secs: u64,
+        owner: &DID,
+    ) -> crate::context::actor::state::PerContextState {
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            now_secs,
+            owner.clone(),
+        );
+        state.handle = crate::context::ContextHandle::new(
+            hex::encode(ctx_id_bytes),
+            scp_protocol::context::params::ContextParams::default(),
+        );
+        for next in [
+            crate::context::ContextState::Active,
+            crate::context::ContextState::Closing,
+            crate::context::ContextState::Closed,
+        ] {
+            state.handle.transition_to(&next).expect("the close path");
+        }
+        state.class_s.pending_log_units =
+            crate::context::actor::class_s::PendingLogUnits::validated(
+                std::iter::once(crate::context::state::PendingLogUnit {
+                    base_seq: None,
+                    leaves: vec![crate::context::state::LeafSpec::without_payload(
+                        scp_event_log::EventType::ContextClosed,
+                        scp_event_log::system_actors::SYSTEM_CLOSE_ACTOR.to_owned(),
+                        now_secs,
+                    )],
+                })
+                .collect(),
+            )
+            .expect("a valid unit");
+        state
+    }
+
+    /// The `ContextClosed` records in the context's log as storage holds it.
+    async fn stored_closed_records(
+        faulty: &Arc<crate::context::supervisor::faulty_storage::FaultyStorage>,
+        ctx_id_bytes: &[u8; 32],
+    ) -> usize {
+        use crate::context::builder::ContextEventLogProvider as _;
+        let stored_log = crate::context::log_unit_helpers::test_support::merkle_log_over(faulty);
+        stored_log
+            .restore_event_log(ctx_id_bytes)
+            .await
+            .expect("the stored log loads");
+        stored_log
+            .event_log_entries(ctx_id_bytes)
+            .expect("the log reads")
+            .expect("the log exists")
+            .iter()
+            .filter(|e| e.event_type == scp_event_log::EventType::ContextClosed)
+            .count()
+    }
+
     /// D1 (create-window stuck-open): restoring an `Active` snapshot that
     /// carries a persisted convergent `ttl_deadline_secs` re-arms the
     /// actor-owned TTL arm to that ABSOLUTE deadline. The real
@@ -22669,6 +23499,105 @@ mod tests {
         assert_eq!(persisted.state, crate::context::ContextState::Expired);
     }
 
+    /// A `TtlExtended` entry that a refusing log left queued in the stored
+    /// snapshot counts at restore: the restore reads the log plus the queued
+    /// units, so it arms the extended deadline, not `creation + ttl` (spec 17
+    /// §17.3 "Event log write failures"). The log holds only `ContextCreated`.
+    #[tokio::test(start_paused = true)]
+    async fn restore_arms_the_deadline_of_a_queued_ttl_extension() {
+        const T0: u64 = 1_700_000_000;
+        const TTL_SECS: u64 = 20;
+        const EXTENDED_DEADLINE: u64 = T0 + 50;
+
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(T0));
+        let persistence = MapPersistence::default();
+        let sup = supervisor_with_clock_persistence_and_event_log(
+            clock_dyn,
+            Box::new(persistence.clone()),
+            Box::new(SeededEventLog::new(vec![seeded_context_created(0)])),
+        );
+
+        let ctx_id_bytes = [0x5Cu8; 32];
+        let ctx_key = hex::encode(ctx_id_bytes);
+        let admin = DID("did:example:restore-queued-extension-admin".to_owned());
+
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            T0,
+            admin.clone(),
+        );
+        state.handle = crate::context::ContextHandle::new(
+            ctx_key.clone(),
+            scp_protocol::context::params::ContextParams {
+                ttl: Some(std::time::Duration::from_secs(TTL_SECS)),
+                ..Default::default()
+            },
+        );
+        // The governance extension armed the timer and queued its leaf in one
+        // persist while the log refused the write.
+        state.ttl.timer.deadline_unix_secs = Some(EXTENDED_DEADLINE);
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .unwrap();
+        let mut snap = crate::context::manager_methods::snapshot_context(&state);
+        snap.pending_log_units
+            .push_back(crate::context::state::PendingLogUnit {
+                base_seq: None,
+                leaves: vec![
+                    crate::context::log_unit_helpers::plan_ttl_extended_leaf(
+                        admin.as_ref(),
+                        &scp_event_log::payload::TtlExtendedPayload {
+                            old_deadline_unix: T0 + TTL_SECS,
+                            new_deadline_unix: EXTENDED_DEADLINE,
+                            proposal_id: [0x5C; 32],
+                            consenting_members: vec![admin.as_ref().to_owned()],
+                        },
+                        T0 + 5,
+                    )
+                    .expect("the TtlExtended leaf plans"),
+                ],
+            });
+        persistence.persist_context(&ctx_key, &snap).await.unwrap();
+
+        sup.load_wrapping_key(&admin)
+            .await
+            .expect("an entry point loads the owner's wrapping key");
+        sup.respawn_from_snapshot(&ctx_key, &admin)
+            .await
+            .expect("respawn must restore the Active snapshot");
+
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        // Past `creation + ttl` (T0+20), before the queued extension's deadline
+        // (T0+50): a restore that read the log without the queue armed T0+20
+        // and the context has expired.
+        tokio::time::advance(std::time::Duration::from_secs(TTL_SECS + 5)).await;
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            sup.read_context_state(&ctx_key).await,
+            Some(crate::context::ContextState::Active),
+            "restore must arm the deadline of the queued TtlExtended entry"
+        );
+
+        tokio::time::advance(std::time::Duration::from_secs(30)).await;
+        let mut despawned = false;
+        for _ in 0..64 {
+            if sup.lookup(&ctx_key).is_none() {
+                despawned = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            despawned,
+            "the extended TTL arm fires once paused time passes the extended deadline"
+        );
+    }
+
     /// BUG-1 (stale TTL arm on Closed/Tombstoned, REGRESSION GATE): once a
     /// context leaves `Active`, a stale recorded deadline must NOT arm and fire
     /// — firing on a terminal context would despawn it, re-opening the close
@@ -22761,7 +23690,7 @@ mod tests {
             // The distinguishing signal (N3): the expiry pipeline never ran, so
             // no `ContextExpired` leaf was appended against the terminal context.
             // A regressed `is_active` reconcile gate would fire `on_ttl_tick` →
-            // `handle_ttl_expiry` → `finish_ttl_expiry_io` and record one here.
+            // `handle_ttl_expiry`, which queues and drains one, recorded here.
             assert_eq!(
                 expiry_counter
                     .context_expired_appends
@@ -23655,10 +24584,10 @@ mod tests {
         );
     }
 
-    /// M1 (retry stamps the convergent deadline, REGRESSION GATE): when the
-    /// FIRST TTL-expiry attempt's `ContextExpired` append fails and a RETRY
-    /// performs the actual append, the stamped leaf timestamp must be the
-    /// CONVERGENT deadline (`creation + ttl`), NOT the retry-time clock.
+    /// M1 (the convergent deadline survives a retry, REGRESSION GATE): when the
+    /// FIRST TTL-expiry attempt's `ContextExpired` write fails and a RETRY
+    /// drains the queued record, the written timestamp must be the CONVERGENT
+    /// deadline (`creation + ttl`), NOT the retry-time clock.
     ///
     /// Pre-fix this FAILED: `handle_ttl_expiry` read the leaf timestamp as
     /// `deadline_unix_secs.unwrap_or(now())` at the top; Phase 1 cleared
@@ -23757,15 +24686,23 @@ mod tests {
             "a registry floor entry exists before the terminal TTL expiry"
         );
 
-        // First attempt: append FAILS ⇒ incomplete. Phase 1 clears the recorded
-        // deadline.
+        // First attempt: the record write FAILS, so the record stays queued.
+        // Phase 1 clears the recorded deadline.
         let out1 =
             crate::context::ttl_close_helpers::handle_ttl_expiry(&mut cell, &deps, &handle, 0)
                 .await;
         assert!(
-            !out1.result.is_complete(),
-            "first attempt's append must fail (forcing a retry): {}",
+            out1.result.is_complete() && out1.persist_result.is_ok(),
+            "the first attempt completes with the ContextExpired record queued in \
+             its persist: {}",
             out1.result
+        );
+        assert_eq!(
+            crate::context::log_unit_helpers::test_support::queued_unit_types(
+                &cell.class_s.pending_log_units
+            ),
+            vec![vec![scp_event_log::EventType::ContextExpired]],
+            "the refused write leaves the record queued for the retry's drain"
         );
         assert!(
             !sup.floors.contains_key(&ctx_id_bytes),
@@ -23777,8 +24714,9 @@ mod tests {
             "Phase 1 clears the recorded convergent deadline"
         );
 
-        // Retry: the recorded deadline is gone, so the leaf timestamp must be
-        // RE-DERIVED as `creation + ttl` — NOT the skewed local clock.
+        // Retry: drains the queued record, whose timestamp was derived as
+        // `creation + ttl` — NOT the skewed local clock — although Phase 1
+        // cleared the recorded deadline.
         let out2 = crate::context::ttl_close_helpers::handle_ttl_expiry(
             &mut cell,
             &deps,
@@ -23788,7 +24726,7 @@ mod tests {
         .await;
         assert!(
             out2.result.is_complete(),
-            "retry re-appends the ContextExpired leaf ⇒ complete: {}",
+            "the retry drains the queued ContextExpired record: {}",
             out2.result
         );
 
@@ -23815,7 +24753,8 @@ mod tests {
     /// live deadline was pushed out by a `reset_ttl_timer` extension (now recorded
     /// as a `TtlExtended` leaf), a failed-then-retried `ContextExpired` append
     /// must stamp the EXTENDED deadline — re-derived from the log's `TtlExtended`
-    /// leaf, not the create base and not the skewed retry-time clock. This proves
+    /// leaf, not the create base and not the skewed retry-time clock, after the
+    /// retry drains the queued record. This proves
     /// the single-source terminal-leaf derivation reads reset extensions too (the
     /// whole point of making reset emit a leaf).
     #[tokio::test]
@@ -23837,31 +24776,10 @@ mod tests {
             fail_next: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             ..Default::default()
         };
-        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(NOW_SKEWED));
-
-        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
-            "did:dht:z6MktestM1Reset".to_owned(),
-            std::sync::Arc::new(scp_clock::SystemClock),
-        ));
-        let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
-            Box::new(crate::context::builder::NotConfiguredTransportProvider);
-        let key_resolver: KeyResolver = Arc::new(|_: &DID, _: scp_did::SigningKeyId| None);
-        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
-            Arc::new(
-                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
-                    InMemoryStorage::new(),
-                )),
-            );
-        let sup = Supervisor::with_providers(
-            crypto,
-            transport,
+        let sup = supervisor_with_clock_persistence_and_event_log(
+            Arc::new(TestClock::new(NOW_SKEWED)),
+            Box::new(MapPersistence::default()),
             Box::new(event_log.clone()),
-            key_resolver,
-            Some(Box::new(MapPersistence::default())),
-            None,
-            None,
-            Some(clock_dyn),
-            mls_storage,
         );
         let deps = test_actor_deps(&sup).await;
 
@@ -23894,9 +24812,17 @@ mod tests {
             crate::context::ttl_close_helpers::handle_ttl_expiry(&mut cell, &deps, &handle, 0)
                 .await;
         assert!(
-            !out1.result.is_complete(),
-            "first attempt's append must fail (forcing a retry): {}",
+            out1.result.is_complete() && out1.persist_result.is_ok(),
+            "the first attempt completes with the ContextExpired record queued in \
+             its persist: {}",
             out1.result
+        );
+        assert_eq!(
+            crate::context::log_unit_helpers::test_support::queued_unit_types(
+                &cell.class_s.pending_log_units
+            ),
+            vec![vec![scp_event_log::EventType::ContextExpired]],
+            "the refused write leaves the record queued for the retry's drain"
         );
 
         let out2 = crate::context::ttl_close_helpers::handle_ttl_expiry(
@@ -23908,7 +24834,7 @@ mod tests {
         .await;
         assert!(
             out2.result.is_complete(),
-            "retry re-appends the ContextExpired leaf ⇒ complete: {}",
+            "the retry drains the queued ContextExpired record: {}",
             out2.result
         );
 
@@ -24755,6 +25681,8 @@ mod tests {
         // A settle request for a context that has no actor registered.
         let ticket = crate::context::outlets_helpers::OutletEconomyTicket::new_for_test_no_escrow(
             invoker.clone(),
+            crate::context::participation::test_support::empty_log_root()
+                .expect("the empty log's root"),
         );
         let request = crate::context::outlets_helpers::OutletSettleRequest::Rollback {
             generation: 1,
@@ -26895,7 +27823,17 @@ mod tests {
             _context_id: &[u8; 32],
         ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
         {
-            Ok(None)
+            Ok(Some(Vec::new()))
+        }
+
+        /// The fixture holds no entry, so its root is the empty log's root.
+        fn event_log_merkle_root(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok(scp_event_log::tree::root(&scp_event_log::EventLog::new(
+                String::new(),
+            )))
         }
 
         async fn init_event_log(
@@ -26945,7 +27883,17 @@ mod tests {
             _context_id: &[u8; 32],
         ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
         {
-            Ok(None)
+            Ok(Some(Vec::new()))
+        }
+
+        /// The fixture holds no entry, so its root is the empty log's root.
+        fn event_log_merkle_root(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok(scp_event_log::tree::root(&scp_event_log::EventLog::new(
+                String::new(),
+            )))
         }
 
         async fn init_event_log(
@@ -27921,8 +28869,8 @@ mod tests {
 
     /// Event-log double that COUNTS `ContextExpired` append attempts (N3). A TTL
     /// arm that (wrongly) fired against a terminal context would drive
-    /// `handle_ttl_expiry`'s Phase-2 `finish_ttl_expiry_io`, which appends a
-    /// `ContextExpired` leaf — so a non-zero count is the distinguishing signal
+    /// `handle_ttl_expiry`, which queues and drains a `ContextExpired` record —
+    /// so a non-zero count is the distinguishing signal
     /// that the `is_active` reconcile gate regressed. Every other call is a
     /// success no-op.
     #[derive(Clone, Default)]
@@ -27936,7 +28884,17 @@ mod tests {
             _context_id: &[u8; 32],
         ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
         {
-            Ok(None)
+            Ok(Some(Vec::new()))
+        }
+
+        /// The fixture holds no entry, so its root is the empty log's root.
+        fn event_log_merkle_root(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok(scp_event_log::tree::root(&scp_event_log::EventLog::new(
+                String::new(),
+            )))
         }
 
         async fn init_event_log(
@@ -28584,6 +29542,98 @@ mod tests {
         assert!(
             matches!(respawn, Err(ContextError::ActorCrashed(_))),
             "the respawn with no snapshot fails, got {respawn:?}"
+        );
+    }
+
+    /// A despawned actor whose task is still running, with the guard whose
+    /// drop ends that task and the receiver that keeps its inbox open.
+    fn tracked_departing_actor() -> (
+        crate::context::actor::handle::DepartingActor,
+        crate::context::actor::handle::ActorTaskGuard,
+        tokio::sync::mpsc::Receiver<crate::context::actor::commands::ContextCommand>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let handle = crate::context::actor::handle::ContextActorHandle::from_sender(tx);
+        let task = handle.exit_record().arm();
+        let departing = handle
+            .departure()
+            .expect("an armed handle reports a running task");
+        (departing, task, rx)
+    }
+
+    /// A departing-actor record never outlives its task (ADR-049 §10). The
+    /// task can end after `despawn_actor` read it as running and before the
+    /// record is pushed; the watchdog's prune has then already run. Tracking
+    /// such a record leaves no entry for the id.
+    #[tokio::test]
+    async fn a_departing_record_whose_task_ended_before_the_push_is_pruned() {
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
+        let sup =
+            supervisor_with_clock_and_persistence(clock_dyn, Box::new(MapPersistence::default()));
+        let ctx_key = hex::encode([0xE1u8; 32]);
+        let (departing, task, _inbox) = tracked_departing_actor();
+        drop(task);
+        assert!(!departing.task_running(), "the task has ended");
+
+        sup.track_departing_actor(&ctx_key, departing);
+        assert!(
+            !sup.departing_actors.contains_key(&ctx_key),
+            "a record whose task already ended must not be kept"
+        );
+
+        let (running, _task, _inbox) = tracked_departing_actor();
+        sup.track_departing_actor(&ctx_key, running);
+        assert_eq!(
+            sup.departing_actors.get(&ctx_key).map(|e| e.len()),
+            Some(1),
+            "a record whose task still runs is kept"
+        );
+    }
+
+    /// A `clear_poison` whose wait for a removed actor times out leaves the
+    /// context Poisoned (ADR-049 §10): it returns `ActorBusy` before it
+    /// clears the window, so the context never reads as having neither
+    /// poison nor an actor. Once the removed actor ends, a retry clears the
+    /// poison and attempts the respawn.
+    #[tokio::test(start_paused = true)]
+    async fn clear_poison_whose_departed_wait_times_out_stays_poisoned() {
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
+        let sup =
+            supervisor_with_clock_and_persistence(clock_dyn, Box::new(MapPersistence::default()));
+        let ctx_key = hex::encode([0xE2u8; 32]);
+        let owning = DID(format!("did:scp:{ctx_key}"));
+        sup.crash_windows
+            .entry(ctx_key.clone())
+            .or_default()
+            .poisoned = true;
+        let (departing, task, _inbox) = tracked_departing_actor();
+        sup.track_departing_actor(&ctx_key, departing);
+
+        let cleared = sup.clear_poison(&ctx_key, &owning).await;
+        assert!(
+            matches!(cleared, Err(ContextError::ActorBusy(_))),
+            "a removed actor that outlives the bound makes clear_poison busy, got {cleared:?}"
+        );
+        assert!(
+            sup.is_context_poisoned(&ctx_key),
+            "the poison record must stand after a timed-out wait"
+        );
+        let read = sup.read_context_state_checked(&ctx_key).await;
+        assert!(
+            matches!(
+                read,
+                Ok(Some(scp_protocol::context::ContextState::Poisoned))
+            ),
+            "a timed-out clear_poison must read as Poisoned, got {read:?}"
+        );
+
+        // The removed actor ends: the retry clears the poison and reaches the
+        // respawn, which fails here only because no snapshot is stored.
+        drop(task);
+        let retried = sup.clear_poison(&ctx_key, &owning).await;
+        assert!(
+            matches!(retried, Err(ContextError::ActorCrashed(_))),
+            "the retry reaches the respawn, got {retried:?}"
         );
     }
 
@@ -34321,6 +35371,134 @@ mod tests {
         );
     }
 
+    /// A log-unit command that fills a one-slot mailbox.
+    fn ss_empty_log_unit(
+        reply: tokio::sync::oneshot::Sender<Result<(), ContextError>>,
+    ) -> ContextCommand {
+        ContextCommand::LogUnit(crate::context::actor::commands::LogUnitCommand::Enqueue {
+            request: crate::context::actor::commands::LogUnitRequest::Leaves(Vec::new()),
+            dedup: crate::context::actor::commands::UnitDedup::None,
+            reply,
+        })
+    }
+
+    /// Spec 17 §17.3: a full mailbox refuses the log unit. `send_log_unit`
+    /// returns `NotQueued(ActorBusy)` to its caller and delivers nothing.
+    #[tokio::test(start_paused = true)]
+    async fn send_log_unit_to_a_full_mailbox_fails_closed() {
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
+        let sup =
+            supervisor_with_clock_and_persistence(clock_dyn, Box::new(MapPersistence::default()));
+        let ctx_key = "ctx-full-mailbox";
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ContextCommand>(1);
+        let (prefill_reply, _prefill_rx) = tokio::sync::oneshot::channel();
+        tx.try_send(ss_empty_log_unit(prefill_reply))
+            .unwrap_or_else(|_| panic!("the empty mailbox takes the prefill"));
+        sup.actors
+            .insert(ctx_key.to_owned(), ContextActorHandle::from_sender(tx));
+
+        let sent = sup
+            .send_log_unit(
+                ctx_key,
+                crate::context::actor::commands::LogUnitRequest::Leaves(Vec::new()),
+                crate::context::actor::commands::UnitDedup::None,
+            )
+            .await;
+        assert!(
+            matches!(
+                sent,
+                Err(
+                    crate::context::log_unit_helpers::LogUnitSendError::NotQueued(
+                        ContextError::ActorBusy(_)
+                    )
+                )
+            ),
+            "a mailbox that stays full returns NotQueued(ActorBusy), got {sent:?}"
+        );
+        assert!(rx.try_recv().is_ok(), "the prefill is still queued");
+        assert!(
+            rx.try_recv().is_err(),
+            "the refused log unit was never delivered"
+        );
+    }
+
+    /// A log unit delivered to an actor that never replies returns
+    /// `OutcomeUnknown` after the reply bound, not `NotQueued`: the delivered
+    /// command may still run and queue the unit (spec 17 §17.3).
+    #[tokio::test(start_paused = true)]
+    async fn send_log_unit_with_a_lost_reply_reports_the_outcome_unknown() {
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
+        let sup =
+            supervisor_with_clock_and_persistence(clock_dyn, Box::new(MapPersistence::default()));
+        let ctx_key = "ctx-stalled-actor";
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ContextCommand>(4);
+        sup.actors
+            .insert(ctx_key.to_owned(), ContextActorHandle::from_sender(tx));
+
+        let sent = sup
+            .send_log_unit(
+                ctx_key,
+                crate::context::actor::commands::LogUnitRequest::Leaves(Vec::new()),
+                crate::context::actor::commands::UnitDedup::None,
+            )
+            .await;
+        assert!(
+            matches!(
+                sent,
+                Err(crate::context::log_unit_helpers::LogUnitSendError::OutcomeUnknown(_))
+            ),
+            "an actor that never replies returns OutcomeUnknown, got {sent:?}"
+        );
+        assert!(rx.try_recv().is_ok(), "the log unit was delivered once");
+        assert!(rx.try_recv().is_err(), "the log unit was sent once");
+    }
+
+    /// A log unit for a context no actor serves fails with the lookup-miss
+    /// error, never a silent success.
+    #[tokio::test]
+    async fn send_log_unit_to_an_absent_actor_fails_closed() {
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
+        let sup =
+            supervisor_with_clock_and_persistence(clock_dyn, Box::new(MapPersistence::default()));
+        let sent = sup
+            .send_log_unit(
+                "ctx-never-spawned",
+                crate::context::actor::commands::LogUnitRequest::Leaves(Vec::new()),
+                crate::context::actor::commands::UnitDedup::None,
+            )
+            .await;
+        assert!(
+            matches!(
+                sent,
+                Err(
+                    crate::context::log_unit_helpers::LogUnitSendError::NotQueued(
+                        ContextError::ContextNotRegistered(_)
+                    )
+                )
+            ),
+            "an absent actor fails closed, got {sent:?}"
+        );
+    }
+
+    /// A close-time `OutletInvokedEvent` hand-off that never ran is a record
+    /// no caller waits on, so it increments `scp_log_unit_undelivered_total`;
+    /// a settlement hand-off that never ran counts nothing here (spec 17
+    /// §17.3).
+    #[test]
+    fn a_dropped_outlet_invoked_hand_off_counts_one_undelivered_record() {
+        use super::SinkHandoff;
+        use crate::metrics::test_support::log_unit_undelivered_total;
+
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            SinkHandoff::StreamSettlement.record_not_run();
+            assert_eq!(log_unit_undelivered_total(&snapshotter), 0);
+            SinkHandoff::OutletInvokedEventAppend.record_not_run();
+            assert_eq!(log_unit_undelivered_total(&snapshotter), 1);
+        });
+    }
+
     /// A context in the respawn gap, and a context whose last respawn failed
     /// below the poison threshold, read as `ActorCrashed` from
     /// [`Supervisor::read_context_state_checked`], not as an absent context.
@@ -34597,8 +35775,8 @@ mod tests {
 
         let ctx_key = spawn_live_context(&sup, [0xC8u8; 32]).await;
         assert!(
-            sup.despawn_for_replace(&ctx_key).await,
-            "the live actor must be despawned"
+            matches!(sup.despawn_for_replace(&ctx_key).await, Ok(true)),
+            "the live actor must be despawned and its task ended"
         );
         assert!(sup.lookup(&ctx_key).is_none(), "no actor serves the gap");
         let in_gap = sup.read_context_state_checked(&ctx_key).await;
@@ -34618,7 +35796,10 @@ mod tests {
             .entry(with_history.clone())
             .or_default()
             .record(now_ms);
-        sup.despawn_for_replace(&with_history).await;
+        assert!(matches!(
+            sup.despawn_for_replace(&with_history).await,
+            Ok(true)
+        ));
         sup.end_bootstrap_window(&with_history);
         let window = sup
             .crash_windows
@@ -34737,6 +35918,74 @@ mod tests {
             matches!(after, Ok(None)),
             "with the gap ended, a despawned context must read as absent, got {after:?}"
         );
+    }
+
+    /// An import over a replaceable actor waits for every earlier-removed
+    /// actor of the id before it sends `PrepareForReplace` (ADR-049 §10). A
+    /// wait that times out fails the import while the prior actor is still
+    /// registered and not claimed terminal, so the context keeps a usable
+    /// actor; once the removed actor ends, the same import succeeds.
+    #[tokio::test(start_paused = true)]
+    async fn an_import_whose_departed_wait_times_out_leaves_the_prior_actor_usable() {
+        let sup = supervisor_with_providers_and_event_log(Box::new(
+            crate::context::providers::event_log::MerkleEventLogProvider::new(),
+        ));
+        let ctx_id_bytes = [0xE3u8; 32];
+        let deps = test_actor_deps(&sup).await;
+        let state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            1_700_000_000,
+            DID("did:example:replace-wait-admin".to_owned()),
+        );
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .expect("drive the prior context to Active");
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Closing)
+            .expect("drive the prior context to Closing, which an import may replace");
+        sup.spawn_actor_with_state(state, deps, None)
+            .await
+            .expect("spawn registers the prior context");
+        let ctx_key = hex::encode(ctx_id_bytes);
+        let (departing, task, _inbox) = tracked_departing_actor();
+        sup.track_departing_actor(&ctx_key, departing);
+
+        sup.key_package_store_for_loaded(&sup.node_identity().unwrap())
+            .await
+            .expect("kp store resolves with providers");
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+        let export = signed_import_export_with_member(
+            &ctx_key,
+            "did:key:replace-wait-creator",
+            "did:key:aaa-replace-wait-owning-member",
+            &signing_key,
+        )
+        .await;
+
+        let refused = sup
+            .import_context(export.clone(), &verifying_key, None)
+            .await;
+        assert!(
+            matches!(refused, Err(ContextError::ActorBusy(_))),
+            "a removed actor that outlives the bound makes the import busy, got {refused:?}"
+        );
+        assert!(
+            sup.lookup(&ctx_key).is_some(),
+            "the prior actor must still be registered"
+        );
+        let read = sup.read_context_state_checked(&ctx_key).await;
+        assert!(
+            matches!(read, Ok(Some(crate::context::ContextState::Closing))),
+            "the prior actor must still answer with its state, got {read:?}"
+        );
+
+        drop(task);
+        sup.import_context(export, &verifying_key, None)
+            .await
+            .expect("with the removed actor ended, the prior actor is replaceable");
     }
 
     /// The transient respawn marker must NOT leave a lingering crash-window
@@ -35813,12 +37062,13 @@ mod tests {
             &mut cell,
             &deps,
             &ctx_key,
-            &ctx_id_bytes,
             &sender,
             1,
             b"free",
             crate::context::supervisor::MessageSigner::Active(&signing_key),
             &[],
+            crate::context::participation::ParticipationRoot::read(&ctx_key, &*deps.event_log)
+                .expect("the root reads before the send"),
         )
         .await;
         assert!(
@@ -35865,12 +37115,13 @@ mod tests {
             &mut cell,
             &deps,
             &ctx_key,
-            &ctx_id_bytes,
             &sender,
             0,
             b"agent",
             MessageSigner::Agent(&agent),
             &[],
+            crate::context::participation::ParticipationRoot::read(&ctx_key, &*deps.event_log)
+                .expect("the root reads before the send"),
         )
         .await
         .unwrap();
@@ -35884,12 +37135,13 @@ mod tests {
             &mut cell,
             &deps,
             &ctx_key,
-            &ctx_id_bytes,
             &sender,
             1,
             b"active",
             MessageSigner::Active(&active),
             &[],
+            crate::context::participation::ParticipationRoot::read(&ctx_key, &*deps.event_log)
+                .expect("the root reads before the send"),
         )
         .await
         .unwrap();
@@ -35974,13 +37226,14 @@ mod tests {
         );
     }
 
-    /// Test 6 — the UNBLOCK path (upward authorization, block-list REMOVE) stays
-    /// BEST-EFFORT: with a persistence backend that always fails, unblock still
-    /// returns `Ok`. Proves the fail-closed tightening did not over-reach onto the
-    /// grant direction (no liveness regression).
+    /// Test 6 — the UNBLOCK path (upward authorization, block-list REMOVE)
+    /// persists fail-closed: its `MemberUnblocked` record is queued in the
+    /// persist that records the unblock, so a failed persist leaves the record
+    /// with no durable home and returns `Err(PersistenceFailed)`. The unblock
+    /// stays applied in memory (spec 17 §17.3 "Event log write failures").
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn broadcast_unblock_stays_best_effort_on_persist_failure() {
+    async fn broadcast_unblock_persist_failure_fails_closed_and_keeps_unblock() {
         let sup = supervisor_with_providers();
         let mut deps = test_actor_deps(&sup).await;
         deps.persistence = Arc::new(FailingPersistence);
@@ -36005,9 +37258,9 @@ mod tests {
         )
         .await;
         assert!(
-            res.is_ok(),
-            "unblock (upward authorization) must stay best-effort and return Ok on \
-             persist failure — no over-tightening: got {res:?}"
+            matches!(res, Err(ContextError::PersistenceFailed(_))),
+            "an unblock whose persist fails must return the durability error, \
+             since its queued record has no durable home: got {res:?}"
         );
         assert!(
             !cell
@@ -36401,17 +37654,17 @@ mod tests {
     }
 
     /// Test 5 — §5.14.8: a governance ban whose fail-closed persist FAILS returns
-    /// `Err(PersistenceFailed)` (NOT `Ok`) BEFORE any post-persist event-log
-    /// append or ack, and the ban is RETAINED in memory (keep-direction). Proves
-    /// the context-wide ban path shares the block path's fail-closed guarantee:
-    /// a crash in the coalesce window can never surface a ban the caller was told
+    /// `Err(PersistenceFailed)` (NOT `Ok`) and writes nothing to the event log,
+    /// and the ban is RETAINED in memory (keep-direction). Proves the
+    /// context-wide ban path shares the block path's fail-closed guarantee: a
+    /// crash in the coalesce window can never surface a ban the caller was told
     /// succeeded but that did not durably land.
     ///
-    /// The "BEFORE event-log" ordering is pinned with a [`RecordingEventLog`]:
-    /// the failing arm must record ZERO durable appends, and a control arm with
-    /// working persistence proves the SAME revoke path DOES append
-    /// `AccessRevoked` through this recorder — so the zero-append assertion is
-    /// non-vacuous (moving the append ahead of the persist fails the test).
+    /// The ban's `AccessRevoked` record rides the same persist as the ban
+    /// (spec 17 §17.3 "Event log write failures"): the failing arm keeps it
+    /// queued in memory beside the ban and the [`RecordingEventLog`] records
+    /// nothing, and a control arm with working persistence queues the same
+    /// record, so the record's presence in the failing arm is the ban's own.
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn broadcast_governance_ban_persist_is_fail_closed() {
@@ -36453,8 +37706,16 @@ mod tests {
             .clone();
         assert!(
             events.is_empty(),
-            "a failed ban persist must return BEFORE any durable event-log \
-             append: got {events:?}"
+            "the ban writes nothing to the event log: got {events:?}"
+        );
+        assert_eq!(
+            crate::context::log_unit_helpers::test_support::queued_unit_types(
+                &cell.class_s.pending_log_units
+            )
+            .first()
+            .and_then(|unit| unit.first()),
+            Some(&scp_event_log::EventType::AccessRevoked),
+            "keep-direction: the ban's record stays queued in memory beside the ban"
         );
         // Keep-direction: the ban is RETAINED in memory (un-banning would be the
         // unsafe re-grant direction). The banned DID stays excluded + blocked.
@@ -36471,9 +37732,8 @@ mod tests {
             "the ban all-author block must be RETAINED in memory (keep-direction)"
         );
 
-        // CONTROL (non-vacuity): the same revoke path with WORKING persistence
-        // appends `AccessRevoked` through this recorder — proving the recorder
-        // observes the exact append site the failing arm asserted silent.
+        // CONTROL: the same revoke path with WORKING persistence queues the
+        // same record and writes nothing to the recorder.
         let control_ctx_bytes = [0xB9u8; 32];
         let control_ctx_key = hex::encode(control_ctx_bytes);
         let control_deps = test_actor_deps(&sup).await;
@@ -36498,16 +37758,18 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        let control_appends = events
-            .iter()
-            .filter(|(id, event_type, ..)| {
-                *id == control_ctx_bytes && *event_type == scp_event_log::EventType::AccessRevoked
-            })
-            .count();
+        assert!(
+            events.is_empty(),
+            "the control ban writes nothing to the event log: got {events:?}"
+        );
         assert_eq!(
-            control_appends, 1,
-            "the successful control ban must append exactly one AccessRevoked \
-             (proves the recorder sees the revoke append site): got {events:?}"
+            crate::context::log_unit_helpers::test_support::queued_unit_types(
+                &control_cell.class_s.pending_log_units
+            )
+            .first()
+            .and_then(|unit| unit.first()),
+            Some(&scp_event_log::EventType::AccessRevoked),
+            "the control ban queues its AccessRevoked record"
         );
     }
 
@@ -36997,12 +38259,13 @@ mod tests {
             &mut cell,
             &deps,
             &ctx_key,
-            &ctx_id_bytes,
             &sender,
             reserved,
             b"sent",
             crate::context::supervisor::MessageSigner::Active(&signing_key),
             &[],
+            crate::context::participation::ParticipationRoot::read(&ctx_key, &*deps.event_log)
+                .expect("the root reads before the send"),
         )
         .await;
         let state = cell.into_inner();
@@ -37048,14 +38311,61 @@ mod tests {
     struct RecordingEventLog {
         events: Arc<std::sync::Mutex<Vec<RecordedEvent>>>,
     }
+    impl RecordingEventLog {
+        /// The recorded appends for `context_id` as a hash-chained Merkle log,
+        /// so the entries and the root this fixture answers describe one log.
+        fn recorded_log(
+            &self,
+            context_id: &[u8; 32],
+        ) -> Result<scp_event_log::EventLog, scp_protocol::context::ContextError> {
+            let to_failure = |e: scp_event_log::EventLogError| {
+                scp_protocol::context::ContextError::EventLogFailed(e.to_string())
+            };
+            let events = self
+                .events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let mut log = scp_event_log::EventLog::new(hex::encode(context_id));
+            let mut prev_hash = scp_event_log::tree::GENESIS_PREV_HASH;
+            for (sequence, (_, event_type, actor, data, timestamp)) in
+                (0u64..).zip(events.into_iter().filter(|(id, ..)| id == context_id))
+            {
+                let event = scp_event_log::Event {
+                    event_type,
+                    actor_did: DID(actor),
+                    timestamp,
+                    sequence,
+                    payload: scp_event_log::EventPayload { data },
+                    prev_hash,
+                    signature: Vec::new(),
+                };
+                prev_hash = scp_event_log::tree::leaf_hash(&event).map_err(to_failure)?;
+                scp_event_log::tree::append_unsigned_event(&mut log, &event).map_err(to_failure)?;
+            }
+            Ok(log)
+        }
+    }
     #[async_trait::async_trait]
     impl crate::context::builder::ContextEventLogProvider for RecordingEventLog {
+        /// The recorded appends for `context_id`, in order, so the drain of
+        /// queued log units places each unit at the log's length (spec 17
+        /// §17.3 "Event log write failures") and the recording shows what the
+        /// drain wrote.
         fn event_log_entries(
             &self,
-            _context_id: &[u8; 32],
+            context_id: &[u8; 32],
         ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
         {
-            Ok(None)
+            Ok(Some(self.recorded_log(context_id)?.events().to_vec()))
+        }
+
+        /// The root of the recorded appends for `context_id`.
+        fn event_log_merkle_root(
+            &self,
+            context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok(scp_event_log::tree::root(&self.recorded_log(context_id)?))
         }
 
         async fn init_event_log(
@@ -42410,6 +43720,8 @@ mod tests {
         // in `OutletEconomyTicket::drop` would fire.
         let ticket = crate::context::outlets_helpers::OutletEconomyTicket::new_for_test_no_escrow(
             DID("did:dht:z6MkHoldRepair".to_owned()),
+            crate::context::participation::test_support::empty_log_root()
+                .expect("the empty log's root"),
         );
         ticket.hold_external_for_repair();
         // Reaching here without a drop-guard panic proves the carrier was marked
@@ -42529,7 +43841,11 @@ mod tests {
             evaluated_cost: Amount(50),
         };
         let ticket = crate::context::outlets_helpers::OutletEconomyTicket::new_for_test_with_escrow(
-            invoker, escrow, policy,
+            invoker,
+            escrow,
+            policy,
+            crate::context::participation::test_support::empty_log_root()
+                .expect("the empty log's root"),
         );
         let reservation = crate::context::outlets_helpers::OutletEconomyReservation {
             handle,
@@ -42626,8 +43942,11 @@ mod tests {
             &scp_clock::SystemClock,
         )
         .unwrap();
-        let ticket =
-            crate::context::outlets_helpers::OutletEconomyTicket::new_for_test_no_escrow(invoker);
+        let ticket = crate::context::outlets_helpers::OutletEconomyTicket::new_for_test_no_escrow(
+            invoker,
+            crate::context::participation::test_support::empty_log_root()
+                .expect("the empty log's root"),
+        );
         let reservation = crate::context::outlets_helpers::OutletEconomyReservation {
             handle,
             role_state,
@@ -42847,6 +44166,42 @@ mod open_outlet_stream_tests {
             pricing_formula: None,
             payee: DID::from("did:key:stream-orch-payee"),
         }
+    }
+
+    /// Spawns an Active actor for the receiving context `a_ctx`, keyed by the
+    /// hex of its 32-byte id, with its event log initialised.
+    async fn spawn_receiving_actor(supervisor: &Arc<Supervisor>, a_ctx: &str) {
+        let a_bytes = crate::context::state::context_id_to_bytes(a_ctx);
+        supervisor
+            .event_log_ref()
+            .expect("event log provider")
+            .init_event_log(&a_bytes)
+            .await
+            .expect("init A event log");
+        let mut state = PerContextState::new_for_test_encrypted(a_bytes, NOW, invoker());
+        state.handle = crate::context::ContextHandle::new(
+            hex::encode(a_bytes),
+            scp_protocol::context::ContextParams::default(),
+        );
+        state
+            .handle
+            .transition_to(&ContextState::Active)
+            .expect("active");
+        state
+            .membership
+            .add_member(invoker(), "owner".to_owned(), Vec::new());
+        let deps = supervisor
+            .build_actor_deps_loaded(&invoker())
+            .await
+            .expect("build_actor_deps");
+        supervisor
+            .spawn_actor_with_state(state, deps, None)
+            .await
+            .expect("spawn the receiving actor");
+        assert!(
+            supervisor.lookup(&hex::encode(a_bytes)).is_some(),
+            "the receiving actor is resident under the hex of its id"
+        );
     }
 
     fn authorizing_role_state() -> ContextRoleState {
@@ -43169,8 +44524,9 @@ mod open_outlet_stream_tests {
     /// event is PERSISTED in production. `open_outlet_stream` wires the durable
     /// [`ActorOutletInvokedEventSink`](crate::context::outlets::stream_settlement_adapter::ActorOutletInvokedEventSink)
     /// INTERNALLY (the FFI bridges pass `None`), so a streaming close writes
-    /// EXACTLY ONE `OutletInvokedEvent` to the context event log — routed
-    /// through the verified `append_outlet_invoked_verified` boundary — carrying
+    /// EXACTLY ONE `OutletInvokedEvent` to the context event log — planned
+    /// through the verified `plan_outlet_invoked_verified_leaf` boundary and
+    /// written by the pending-unit drain — carrying
     /// the correct `chunks_billed`, `stream_manifest_hash`, and `cancel_ack_seq`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn open_outlet_stream_persists_one_invoked_event_035() {
@@ -44038,15 +45394,10 @@ mod open_outlet_stream_tests {
         register_outlet(&mut registry, &role_state, registration(), &invoker().0)
             .expect("register zero-cost outlet");
 
-        // Initialise the RECEIVING context A's event log so the bridge's A-side
-        // recording succeeds against the shared provider.
+        // Spawn the RECEIVING context A's actor: the bridge queues A's
+        // `OutletInvoked` record through it at close (spec 17 §17.3).
         let a_ctx = "ctx-a-036-accept";
-        supervisor
-            .event_log_ref()
-            .expect("event log provider")
-            .init_event_log(&crate::context::state::context_id_to_bytes(a_ctx))
-            .await
-            .expect("init A event log");
+        spawn_receiving_actor(&supervisor, a_ctx).await;
 
         let mut caveats = InvocationCaveats::empty();
         caveats.amount_max_cumulative = Some(Amount::new(1_000));
@@ -44102,6 +45453,30 @@ mod open_outlet_stream_tests {
         }
         assert_eq!(data, 2, "both Data chunks forwarded in plaintext");
         assert!(saw_end, "the stream closes with a plaintext terminal End");
+
+        // At close the bridge sends A's `OutletInvoked` record to A's actor,
+        // which queues and drains it into A's own log (spec 17 §17.3).
+        let a_bytes = crate::context::state::context_id_to_bytes(a_ctx);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let a_records = supervisor
+                .event_log_ref()
+                .expect("event log provider")
+                .event_log_entries(&a_bytes)
+                .expect("A's log reads")
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|e| e.event_type == scp_event_log::EventType::OutletInvoked)
+                .count();
+            if a_records == 1 {
+                break;
+            }
+            assert!(
+                a_records == 0 && tokio::time::Instant::now() < deadline,
+                "A's log carries exactly one OutletInvoked record, got {a_records}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     /// FIX 1 — durable §7.3.8 counter CAS across cross-context opens. A
@@ -44165,12 +45540,7 @@ mod open_outlet_stream_tests {
             .expect("register zero-cost outlet");
 
         let a_ctx = "ctx-a-036-maxcalls";
-        supervisor
-            .event_log_ref()
-            .expect("event log provider")
-            .init_event_log(&crate::context::state::context_id_to_bytes(a_ctx))
-            .await
-            .expect("init A event log");
+        spawn_receiving_actor(&supervisor, a_ctx).await;
 
         // One open per window: `rate_window { max: 1 }`.
         let mut caveats = InvocationCaveats::empty();
@@ -44343,12 +45713,35 @@ mod streaming_saga_tests {
     }
     #[async_trait::async_trait]
     impl ContextEventLogProvider for SsRecordingEventLog {
+        /// The recorded appends for `context_id`, in order, so the drain of
+        /// queued log units places each unit at the log's length (spec 17
+        /// §17.3 "Event log write failures") and the recording shows what the
+        /// drain wrote.
         fn event_log_entries(
             &self,
-            _context_id: &[u8; 32],
+            context_id: &[u8; 32],
         ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
         {
-            Ok(None)
+            Ok(Some(
+                (0u64..)
+                    .zip(
+                        self.snapshot()
+                            .into_iter()
+                            .filter(|(id, ..)| id == context_id),
+                    )
+                    .map(|(sequence, (_, event_type, actor, data, timestamp))| {
+                        scp_event_log::Event {
+                            event_type,
+                            actor_did: DID(actor),
+                            timestamp,
+                            sequence,
+                            payload: scp_event_log::EventPayload { data },
+                            prev_hash: [0u8; 32],
+                            signature: Vec::new(),
+                        }
+                    })
+                    .collect(),
+            ))
         }
 
         async fn init_event_log(
@@ -44501,6 +45894,21 @@ mod streaming_saga_tests {
         journal: Arc<dyn SagaJournal>,
         event_log: Box<dyn ContextEventLogProvider>,
     ) -> Arc<Supervisor> {
+        build_ss_supervisor_with_persistence(
+            captured,
+            journal,
+            event_log,
+            Box::new(crate::context::persistence::NoOpContextPersistence),
+        )
+    }
+
+    /// [`build_ss_supervisor`] over `persistence`.
+    fn build_ss_supervisor_with_persistence(
+        captured: &Arc<AtomicUsize>,
+        journal: Arc<dyn SagaJournal>,
+        event_log: Box<dyn ContextEventLogProvider>,
+        persistence: Box<dyn crate::context::persistence::ContextPersistence>,
+    ) -> Arc<Supervisor> {
         let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             ss_creator(),
             Arc::new(scp_clock::SystemClock),
@@ -44524,7 +45932,7 @@ mod streaming_saga_tests {
             transport,
             event_log,
             key_resolver,
-            Box::new(crate::context::persistence::NoOpContextPersistence),
+            persistence,
             Some(payment_adapter),
             None,
             Some(clock),
@@ -45832,6 +47240,110 @@ mod streaming_saga_tests {
         drop(recording);
     }
 
+    /// Spec 17 §17.3: a saga records its A-side `CrossContextOutletInvoked`
+    /// leaf once. The SDK can call truncated-close recovery for a saga whose
+    /// seal already completed (it reconnects before it reads the terminal
+    /// chunk), and can repeat the call. Each recovery re-sends the A unit with
+    /// `UnitDedup::OncePerSaga`, so the caller log keeps exactly one leaf.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn xctx_streaming_truncated_close_recovery_after_seal_queues_one_a_leaf() {
+        let captured = Arc::new(AtomicUsize::new(0));
+        let invoked = Arc::new(AtomicUsize::new(0));
+        let storage = Arc::new(InMemoryStorage::new());
+        let journal: Arc<dyn SagaJournal> =
+            Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
+        let recording = SsRecordingEventLog::default();
+        let supervisor =
+            build_ss_supervisor(&captured, Arc::clone(&journal), Box::new(recording.clone()));
+        spawn_ss_pair(&supervisor).await;
+
+        let registry = ss_registry();
+        let (params, binding) = ss_stream_params([0x4A; 16]);
+        let executor = Arc::new(FiniteChunkExecutor {
+            data_chunks: 3,
+            invoked: Arc::clone(&invoked),
+        });
+        let target_signing = SigningKey::from_bytes(&[7u8; 32]);
+        let caller_signing = SigningKey::from_bytes(&[8u8; 32]);
+        let outlet_id: OutletId = SS_OUTLET.to_owned();
+
+        let mut handle = supervisor
+            .start_cross_context_streaming_outlet_invocation_saga(
+                SS_CALLER,
+                SS_TARGET,
+                ss_invoker(),
+                SS_OUTLET.to_owned(),
+                None,
+                &registry,
+                &outlet_id,
+                serde_json::json!({ "a": 1, "b": 2 }),
+                1,
+                [0x4Au8; 16],
+                SS_NOW.saturating_mul(1000),
+                Some(5_000),
+                executor,
+                Some(binding),
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
+                },
+                params,
+            )
+            .await
+            .expect("the paid streaming saga starts");
+        let saga_id = handle.saga_id.clone();
+
+        // Drain to the terminal so the seal task completes and resolves.
+        while let Some(frame) = tokio::time::timeout(Duration::from_secs(5), handle.receiver.recv())
+            .await
+            .expect("forwarded frame within 5s")
+        {
+            if matches!(
+                frame.payload,
+                ChunkPayload::End { .. } | ChunkPayload::Error { .. }
+            ) {
+                break;
+            }
+        }
+        ss_await_resolved(&journal, &saga_id, Duration::from_secs(5)).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while ss_caller_a_leaves(&recording) == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the seal queues its A-side leaf"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Two truncated-close recoveries for the sealed saga. Their results are
+        // not the subject; a duplicate leaf is queued before any later step.
+        for _ in 0..2 {
+            let _recovered = supervisor
+                .recover_streaming_saga_truncated_close(
+                    saga_id.clone(),
+                    SS_TARGET,
+                    CommandSigner::local_ed25519(target_signing.clone()),
+                )
+                .await;
+        }
+
+        // A duplicate leaf lands asynchronously; give it time to appear.
+        let settle = tokio::time::Instant::now() + Duration::from_secs(1);
+        while ss_caller_a_leaves(&recording) == 1 && tokio::time::Instant::now() < settle {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            ss_caller_a_leaves(&recording),
+            1,
+            "a recovery after the seal must not queue a second A-side leaf"
+        );
+        assert_eq!(
+            invoked.load(Ordering::SeqCst),
+            1,
+            "recovery never re-invokes"
+        );
+    }
+
     /// SCP-OUT-046 CRITICAL — the settlement-atomicity gap AC7 misses: a crash /
     /// eviction AFTER the durable witness is inserted (seal-close landed) but
     /// BEFORE the off-mailbox money move runs. The witness signals "sealed", but
@@ -45846,6 +47358,112 @@ mod streaming_saga_tests {
     /// between the seal handler's reply and `settle_outlet_stream_via_actor`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn xctx_streaming_crash_after_witness_before_settle_recovers_exactly_once() {
+        let window = Box::pin(ss_drive_crash_window()).await;
+
+        // KEYLESS recovery: the sweep finds the Committing entry, sees the witness
+        // PRESENT but UNSETTLED, and COMPLETES the money move against B's current
+        // generation — no signing key needed.
+        window
+            .supervisor
+            .replay_unresolved_sagas(&super::RestoredContexts::new(Vec::new()))
+            .await
+            .expect("keyless recovery sweep runs");
+        recovered_assertions(&window).await;
+    }
+
+    /// The A-side `CrossContextOutletInvoked` leaves the recording log holds
+    /// for the caller context.
+    fn ss_caller_a_leaves(recording: &SsRecordingEventLog) -> usize {
+        recording
+            .snapshot()
+            .iter()
+            .filter(|(id, event_type, ..)| {
+                *id == SS_CALLER
+                    && *event_type == scp_event_log::EventType::CrossContextOutletInvoked
+            })
+            .count()
+    }
+
+    /// The state [`ss_drive_crash_window`] leaves: the witness inserted
+    /// unsettled, no money moved, and the journal `Committing`.
+    struct SsCrashWindow {
+        supervisor: Arc<Supervisor>,
+        journal: Arc<dyn SagaJournal>,
+        recording: SsRecordingEventLog,
+        captured: Arc<AtomicUsize>,
+        invoked: Arc<AtomicUsize>,
+        saga_id: SagaId,
+        target_hex: String,
+        actor: crate::context::actor::handle::ContextActorHandle,
+        k: usize,
+    }
+
+    /// Drives a paid streaming saga into the seal→settle crash window (see
+    /// `xctx_streaming_crash_after_witness_before_settle_recovers_exactly_once`).
+    async fn ss_drive_crash_window() -> SsCrashWindow {
+        Box::pin(ss_drive_crash_window_with(Box::new(
+            crate::context::persistence::NoOpContextPersistence,
+        )))
+        .await
+    }
+
+    /// A persistence that keeps every snapshot it is given, so the sweep's
+    /// deletion check reads a persisted context as present, and a test deletes
+    /// one by removing it.
+    #[derive(Clone, Default)]
+    struct SsPersistence {
+        contexts: Arc<dashmap::DashMap<String, crate::context::state::ContextSnapshot>>,
+    }
+
+    impl SsPersistence {
+        /// Stores the caller context's snapshot, as a durable caller has one.
+        fn persist_caller(&self) {
+            self.contexts.insert(
+                hex::encode(SS_CALLER),
+                crate::context::manager_methods::snapshot_context(&ss_caller_state_for(
+                    SS_CALLER, SS_TARGET,
+                )),
+            );
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::context::persistence::ContextPersistence for SsPersistence {
+        async fn persist_context(
+            &self,
+            id: &str,
+            snap: &crate::context::state::ContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.contexts.insert(id.to_owned(), snap.clone());
+            Ok(())
+        }
+        async fn load_context(
+            &self,
+            id: &str,
+        ) -> Result<
+            Option<crate::context::state::ContextSnapshot>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(self.contexts.get(id).map(|s| s.value().clone()))
+        }
+        async fn delete_context(
+            &self,
+            id: &str,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.contexts.remove(id);
+            Ok(())
+        }
+        async fn list_persisted_contexts(
+            &self,
+        ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self.contexts.iter().map(|e| e.key().clone()).collect())
+        }
+    }
+
+    /// [`ss_drive_crash_window`] over `persistence`.
+    async fn ss_drive_crash_window_with(
+        persistence: Box<dyn crate::context::persistence::ContextPersistence>,
+    ) -> SsCrashWindow {
         use crate::context::actor::commands::StreamSettleApplication;
 
         let captured = Arc::new(AtomicUsize::new(0));
@@ -45854,8 +47472,12 @@ mod streaming_saga_tests {
         let journal: Arc<dyn SagaJournal> =
             Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
         let recording = SsRecordingEventLog::default();
-        let supervisor =
-            build_ss_supervisor(&captured, Arc::clone(&journal), Box::new(recording.clone()));
+        let supervisor = build_ss_supervisor_with_persistence(
+            &captured,
+            Arc::clone(&journal),
+            Box::new(recording.clone()),
+            persistence,
+        );
         spawn_ss_pair(&supervisor).await;
 
         let registry = ss_registry();
@@ -45995,22 +47617,46 @@ mod streaming_saga_tests {
             0,
             "deferral captured nothing"
         );
+        SsCrashWindow {
+            supervisor,
+            journal,
+            recording,
+            captured,
+            invoked,
+            saga_id,
+            target_hex,
+            actor,
+            k,
+        }
+    }
 
-        // KEYLESS recovery: the sweep finds the Committing entry, sees the witness
-        // PRESENT but UNSETTLED, and COMPLETES the money move against B's current
-        // generation — no signing key needed.
-        supervisor
-            .replay_unresolved_sagas(&super::RestoredContexts::new(Vec::new()))
-            .await
-            .expect("keyless recovery sweep runs");
-
+    /// What a completed keyless recovery leaves: the saga resolved, the money
+    /// moved once, one A-side leaf, and a second sweep that changes nothing.
+    async fn recovered_assertions(window: &SsCrashWindow) {
+        let SsCrashWindow {
+            supervisor,
+            journal,
+            recording,
+            captured,
+            invoked,
+            saga_id,
+            target_hex,
+            actor,
+            k,
+        } = window;
+        let k = *k;
         assert_eq!(
-            ss_saga_state(&journal, &saga_id).await,
+            ss_saga_state(journal, saga_id).await,
             None,
             "recovery completed the settlement and resolved Committed"
         );
         assert_eq!(
-            ss_remaining_budget(&supervisor, &target_hex, &ss_invoker()).await,
+            ss_caller_a_leaves(recording),
+            1,
+            "the A-side CrossContextOutletInvoked leaf landed exactly once"
+        );
+        assert_eq!(
+            ss_remaining_budget(supervisor, target_hex, &ss_invoker()).await,
             Amount::new(SS_GRANTED - SS_COST * k as u64),
             "CRITICAL: recovery credited the reserved−billed refund (money moves exactly once)"
         );
@@ -46043,9 +47689,9 @@ mod streaming_saga_tests {
         assert!(
             matches!(
                 status,
-                crate::context::actor::commands::StreamWitnessRecoveryStatus::Settled
+                crate::context::actor::commands::StreamWitnessRecoveryStatus::Settled { .. }
             ),
-            "witness present + settled — a settled witness carries NO rebuilt settlement, \
+            "witness present + settled — a settled witness carries NO rebuilt settlement \
              so recovery moves no money"
         );
 
@@ -46055,7 +47701,7 @@ mod streaming_saga_tests {
             .await
             .expect("second recovery sweep runs");
         assert_eq!(
-            ss_remaining_budget(&supervisor, &target_hex, &ss_invoker()).await,
+            ss_remaining_budget(supervisor, target_hex, &ss_invoker()).await,
             Amount::new(SS_GRANTED - SS_COST * k as u64),
             "CRITICAL: a second recovery does NOT double-refund"
         );
@@ -46064,8 +47710,262 @@ mod streaming_saga_tests {
             1,
             "CRITICAL: a second recovery does NOT double-capture"
         );
+        assert_eq!(
+            ss_caller_a_leaves(recording),
+            1,
+            "a second recovery does NOT queue a second A-side leaf"
+        );
+    }
 
-        drop(recording);
+    /// Spec 17 §17.3 "Event log write failures": the keyless sweep sends the
+    /// A-side `CrossContextOutletInvoked` leaf to the caller context's actor.
+    /// When that actor is gone the send fails closed: the leaf is not written
+    /// around the actor, and the journal stays `Committing` so a later sweep
+    /// retries. After the caller respawns, the next sweep reads the now-settled
+    /// witness, queues the leaf once, and resolves; a further sweep adds
+    /// nothing, and the money moved exactly once throughout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn log_unit_command_to_a_gone_actor_fails_closed() {
+        let persistence = SsPersistence::default();
+        let window = Box::pin(ss_drive_crash_window_with(Box::new(persistence.clone()))).await;
+        let caller_hex = hex::encode(SS_CALLER);
+        persistence.persist_caller();
+        assert!(
+            window.supervisor.despawn_actor(&caller_hex).await,
+            "the caller actor was resident and is now gone"
+        );
+
+        window
+            .supervisor
+            .replay_unresolved_sagas(&super::RestoredContexts::new(Vec::new()))
+            .await
+            .expect("keyless recovery sweep runs");
+        assert_eq!(
+            ss_saga_state(&window.journal, &window.saga_id).await,
+            Some(SagaState::Committing),
+            "with the caller gone the A-side leaf cannot be queued, so the saga stays Committing"
+        );
+        assert_eq!(
+            ss_caller_a_leaves(&window.recording),
+            0,
+            "no A-side leaf is written around the caller's actor"
+        );
+        assert_eq!(
+            window.captured.load(Ordering::SeqCst),
+            1,
+            "the settlement still moved the money once"
+        );
+
+        spawn_ss_actor(
+            &window.supervisor,
+            "did:example:ss-caller-owner",
+            ss_caller_state_for(SS_CALLER, SS_TARGET),
+        )
+        .await;
+        window
+            .supervisor
+            .replay_unresolved_sagas(&super::RestoredContexts::new(Vec::new()))
+            .await
+            .expect("recovery sweep after the caller respawned runs");
+        recovered_assertions(&window).await;
+    }
+
+    /// Spec 17 §17.3: when A's context is deleted from durable persistence,
+    /// its `CrossContextOutletInvoked` record has no log to land in. The sweep
+    /// resolves the saga `Committed` (B's record and the money move stand) and
+    /// logs and counts the lost record once; a later sweep has nothing to retry
+    /// and counts nothing more.
+    #[test]
+    fn recovery_retires_the_saga_once_when_the_caller_context_is_deleted() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("a multi-thread runtime");
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(Box::pin(deleted_caller_retires_the_saga(&snapshotter)));
+        });
+    }
+
+    async fn deleted_caller_retires_the_saga(snapshotter: &metrics_util::debugging::Snapshotter) {
+        use crate::metrics::test_support::log_unit_undelivered_total;
+        let persistence = SsPersistence::default();
+        let window = Box::pin(ss_drive_crash_window_with(Box::new(persistence.clone()))).await;
+        let caller_hex = hex::encode(SS_CALLER);
+        persistence.persist_caller();
+        assert!(
+            window.supervisor.despawn_actor(&caller_hex).await,
+            "the caller actor was resident and is now gone"
+        );
+        assert!(
+            persistence.contexts.remove(&caller_hex).is_some(),
+            "the caller context was persisted, and is now deleted"
+        );
+
+        window
+            .supervisor
+            .replay_unresolved_sagas(&super::RestoredContexts::new(Vec::new()))
+            .await
+            .expect("keyless recovery sweep runs");
+        assert_eq!(
+            ss_saga_state(&window.journal, &window.saga_id).await,
+            None,
+            "a deleted caller retires the saga to Committed"
+        );
+        assert_eq!(
+            ss_caller_a_leaves(&window.recording),
+            0,
+            "no A-side leaf is written for a deleted caller"
+        );
+        assert_eq!(
+            window.captured.load(Ordering::SeqCst),
+            1,
+            "the settlement moved the money once"
+        );
+        assert_eq!(
+            log_unit_undelivered_total(snapshotter),
+            1,
+            "the lost A-side record is counted once"
+        );
+
+        window
+            .supervisor
+            .replay_unresolved_sagas(&super::RestoredContexts::new(Vec::new()))
+            .await
+            .expect("a later sweep runs");
+        assert_eq!(
+            log_unit_undelivered_total(snapshotter),
+            1,
+            "a later sweep counts nothing more"
+        );
+    }
+
+    /// Spec 17 §17.3: the seal task resolves the saga `Committed` only when the
+    /// settle applied AND A's `CrossContextOutletInvoked` record was queued.
+    /// With the caller's actor gone at close, the settle still moves the money
+    /// once, but the A record cannot be queued, so the saga stays `Committing`.
+    /// The next sweep after the caller respawns queues the record once and
+    /// resolves.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn seal_task_leaves_the_saga_committing_when_the_a_record_is_not_queued() {
+        let captured = Arc::new(AtomicUsize::new(0));
+        let invoked = Arc::new(AtomicUsize::new(0));
+        let storage = Arc::new(InMemoryStorage::new());
+        let journal: Arc<dyn SagaJournal> =
+            Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
+        let recording = SsRecordingEventLog::default();
+        let persistence = SsPersistence::default();
+        persistence.persist_caller();
+        let supervisor = build_ss_supervisor_with_persistence(
+            &captured,
+            Arc::clone(&journal),
+            Box::new(recording.clone()),
+            Box::new(persistence),
+        );
+        spawn_ss_pair(&supervisor).await;
+
+        let registry = ss_registry();
+        let (params, binding) = ss_stream_params([0x47; 16]);
+        let outlet_id: OutletId = SS_OUTLET.to_owned();
+        let mut handle = supervisor
+            .start_cross_context_streaming_outlet_invocation_saga(
+                SS_CALLER,
+                SS_TARGET,
+                ss_invoker(),
+                SS_OUTLET.to_owned(),
+                None,
+                &registry,
+                &outlet_id,
+                serde_json::json!({ "a": 1, "b": 2 }),
+                1,
+                [0x47u8; 16],
+                SS_NOW.saturating_mul(1000),
+                Some(5_000),
+                Arc::new(FiniteChunkExecutor {
+                    data_chunks: 3,
+                    invoked: Arc::clone(&invoked),
+                }),
+                Some(binding),
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(SigningKey::from_bytes(&[7u8; 32])),
+                    caller: CommandSigner::local_ed25519(SigningKey::from_bytes(&[8u8; 32])),
+                },
+                params,
+            )
+            .await
+            .expect("the paid streaming saga starts");
+        let saga_id = handle.saga_id.clone();
+
+        let caller_hex = hex::encode(SS_CALLER);
+        assert!(
+            supervisor.despawn_actor(&caller_hex).await,
+            "the caller actor was resident and is now gone"
+        );
+        while let Ok(Some(_frame)) =
+            tokio::time::timeout(Duration::from_secs(5), handle.receiver.recv()).await
+        {}
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while captured.load(Ordering::SeqCst) == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the seal task's settle captured the payment"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // The seal task resolves right after its settle when it resolves at all;
+        // a second of `Committing` shows it did not.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while tokio::time::Instant::now() < deadline {
+            assert_eq!(
+                ss_saga_state(&journal, &saga_id).await,
+                Some(SagaState::Committing),
+                "with A's record unqueued the seal task leaves the saga Committing"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            ss_caller_a_leaves(&recording),
+            0,
+            "no A-side leaf was written"
+        );
+
+        // A sweep while the caller is still gone reads the settled witness, cannot
+        // queue A's record either, and leaves the saga `Committing`.
+        supervisor
+            .replay_unresolved_sagas(&super::RestoredContexts::new(Vec::new()))
+            .await
+            .expect("recovery sweep with the caller gone runs");
+        assert_eq!(
+            ss_saga_state(&journal, &saga_id).await,
+            Some(SagaState::Committing),
+            "a settled witness with A's record unqueued stays Committing"
+        );
+        assert_eq!(ss_caller_a_leaves(&recording), 0, "still no A-side leaf");
+
+        spawn_ss_actor(
+            &supervisor,
+            "did:example:ss-caller-owner",
+            ss_caller_state_for(SS_CALLER, SS_TARGET),
+        )
+        .await;
+        supervisor
+            .replay_unresolved_sagas(&super::RestoredContexts::new(Vec::new()))
+            .await
+            .expect("recovery sweep after the caller respawned runs");
+        ss_await_resolved(&journal, &saga_id, Duration::from_secs(5)).await;
+        assert_eq!(
+            ss_caller_a_leaves(&recording),
+            1,
+            "the sweep queued A's record once"
+        );
+        assert_eq!(
+            captured.load(Ordering::SeqCst),
+            1,
+            "the money moved exactly once"
+        );
     }
 
     /// SCP-OUT-046 PASS-2 RESIDUAL CRITICAL — the settle handler must be
@@ -46289,9 +48189,9 @@ mod streaming_saga_tests {
         assert!(
             matches!(
                 status,
-                crate::context::actor::commands::StreamWitnessRecoveryStatus::Settled
+                crate::context::actor::commands::StreamWitnessRecoveryStatus::Settled { .. }
             ),
-            "witness present + settled — a settled witness carries NO rebuilt settlement, \
+            "witness present + settled — a settled witness carries NO rebuilt settlement \
              so no further money moves"
         );
 

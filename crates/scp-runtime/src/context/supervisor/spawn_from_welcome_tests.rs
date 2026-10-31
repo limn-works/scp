@@ -716,21 +716,19 @@ async fn spawn_from_welcome_yields_a_live_send_capable_actor() {
         "the joined MLS group is installed on the joiner actor"
     );
 
-    // Event-log provider WIRED (AC1) AND joiner-local log EMPTY: the spawned
-    // context resolves against the supervisor's shared event-log provider (an
-    // unwired supervisor answers `Err(NotInitialized)`, so `.expect` catches an
-    // unwired provider), and the joiner appends NO local join leaf — the log is
-    // absent/empty here and converges via cross-member event-log leaf
-    // replication. `event_log_entries` returns `None` for an untouched context,
-    // so `is_none_or(is_empty)` is the accurate "no local leaf" shape; a
-    // regression that starts emitting a spurious local join event fails it.
-    assert!(
+    // The joiner's log EXISTS and is EMPTY: the spawn initializes it, as a
+    // create does, because every send, proposal, and outlet reserve reads its
+    // participation root (spec 17 §17.3); a spawn that skipped the init answers
+    // `None` here. The joiner appends NO local join leaf — the log converges
+    // via cross-member event-log leaf replication — so a regression that
+    // starts emitting a spurious local join event fails the emptiness check.
+    assert_eq!(
         j.sup
             .event_log_entries(&j.ctx_bytes)
             .expect("event-log provider is wired")
-            .is_none_or(|v| v.is_empty()),
-        "joiner emits no local join leaf; the log converges via cross-member \
-         event-log leaf replication"
+            .map(|entries| entries.len()),
+        Some(0),
+        "the joiner's log exists and holds no local join leaf"
     );
 }
 
@@ -1421,6 +1419,14 @@ async fn persist_failure_leaves_no_half_keyed_actor() {
         j.sup.member_count(&j.ctx_id).await,
         None,
         "an unregistered context answers the unregistered default, not a live count"
+    );
+    // The event log step 3c initialized before the persist is destroyed.
+    assert!(
+        j.sup
+            .event_log_entries(&j.ctx_bytes)
+            .expect("event-log provider is wired")
+            .is_none(),
+        "a failed join leaves no event log for the context"
     );
 }
 
