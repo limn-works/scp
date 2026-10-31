@@ -3659,20 +3659,6 @@ pub enum SagaPhaseMessage {
         /// Oneshot reply: `true` iff Commit-A is durably recorded for this saga.
         reply: oneshot::Sender<Result<bool, ContextError>>,
     },
-    /// Retire the Commit-A witness — runs on the LOCAL caller-context actor
-    /// after the saga journal resolved the saga `Committed`. Removes this
-    /// `SagaId` from `xctx_committed_invocations` in a fail-closed Class-S
-    /// persist; an id not in the set is an `Ok` no-op. Once the journal holds
-    /// no unresolved entry for the saga, nothing re-drives its Commit-A or
-    /// re-sends its A-side record, so the witness has no reader left (spec
-    /// §17.16.4; spec 17 §17.3).
-    RetireCommitAWitness {
-        /// Durable saga identifier (the `xctx_committed_invocations` key).
-        saga_id: crate::context::supervisor::saga_journal::SagaId,
-        /// Oneshot reply: `Ok` once the witness is gone from the stored
-        /// snapshot; the persist error otherwise (the witness is kept).
-        reply: oneshot::Sender<Result<(), ContextError>>,
-    },
     /// Abort — runs on EITHER side's local actor. RAII-releases the staged
     /// reservations (escrow / outbound-RL on A — carried back via
     /// `reservation`; outlet-session on B — the staged `saga_pending` slot), clears

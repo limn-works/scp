@@ -5623,12 +5623,12 @@ pub(crate) async fn run_streaming_saga_seal_task(
                 }
             };
 
-            if let (true, Ok(caller_hex)) = (settlement_applied, &a_sent) {
+            if settlement_applied && a_sent.is_ok() {
                 // Resolve the journal to `Committed` so crash recovery does not
-                // redrive a completed saga, then retire A's witness. Non-secret
-                // (the streaming saga journals public metadata only).
+                // redrive a completed saga. Non-secret (the streaming saga journals
+                // public metadata only).
                 let resolved = match supervisor.upgrade() {
-                    Some(sup) => sup.resolve_saga_committed(&saga_id, caller_hex).await,
+                    Some(sup) => sup.resolve_saga_committed(&saga_id).await,
                     None => Err(scp_protocol::context::ContextError::SupervisorShutDown(
                         "streaming-saga seal task: supervisor dropped before the journal \
                          resolve"
@@ -5705,9 +5705,6 @@ pub(crate) async fn run_streaming_saga_seal_task(
 /// earlier one queued (a seal task whose settle deferred, then the sweep), and
 /// A's durable per-saga set, not a scan of its prunable log, lands it once.
 ///
-/// Returns A's actor key, the context whose Commit-A witness the caller
-/// retires once the journal resolves the saga.
-///
 /// # Errors
 ///
 /// - `LogUnitSendError::NotQueued` with
@@ -5719,7 +5716,7 @@ pub(crate) async fn send_streaming_saga_a_unit(
     supervisor: &crate::context::supervisor::Supervisor,
     saga_id: &crate::context::supervisor::saga_journal::SagaId,
     outcome: &crate::context::actor::commands::CommitBStreamSettleOutcome,
-) -> Result<String, crate::context::log_unit_helpers::LogUnitSendError> {
+) -> Result<(), crate::context::log_unit_helpers::LogUnitSendError> {
     let (caller_context_hex, leaf) = plan_streaming_saga_a_leaf(saga_id, outcome)?;
     supervisor
         .send_log_unit(
@@ -5727,8 +5724,7 @@ pub(crate) async fn send_streaming_saga_a_unit(
             crate::context::actor::commands::LogUnitRequest::Leaves(vec![leaf]),
             crate::context::actor::commands::UnitDedup::OncePerSaga(saga_id.clone()),
         )
-        .await?;
-    Ok(caller_context_hex)
+        .await
 }
 
 /// Plans the A-side `CrossContextOutletInvoked` leaf of a streaming-saga

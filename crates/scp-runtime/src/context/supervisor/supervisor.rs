@@ -8909,22 +8909,18 @@ impl Supervisor {
         // the seal task uses (spec 17 §17.3). A failed send leaves the saga
         // unresolved: the witness is now present, so the keyless sweep re-sends
         // the leaf with `UnitDedup::OncePerSaga`.
-        let caller_hex = match crate::context::outlets::invoke::send_streaming_saga_a_unit(
-            self, &saga_id, &outcome,
-        )
-        .await
+        if let Err(err) =
+            crate::context::outlets::invoke::send_streaming_saga_a_unit(self, &saga_id, &outcome)
+                .await
         {
-            Ok(caller_hex) => caller_hex,
-            Err(err) => {
-                return Err(SagaError::NeedsRepair {
-                    saga_id,
-                    message: format!(
-                        "streaming saga truncated-close recovery — the A-side \
-                         CrossContextOutletInvoked leaf was not queued: {err}"
-                    ),
-                });
-            }
-        };
+            return Err(SagaError::NeedsRepair {
+                saga_id,
+                message: format!(
+                    "streaming saga truncated-close recovery — the A-side \
+                     CrossContextOutletInvoked leaf was not queued: {err}"
+                ),
+            });
+        }
 
         // Apply the settlement off-mailbox against B's CURRENT generation (the
         // reserve-time generation was lost in the crash; B respawned with the hold
@@ -8961,7 +8957,8 @@ impl Supervisor {
         }
 
         if let Err(err) = self
-            .resolve_committed_and_retire_witness(&saga_id, false, Some(&caller_hex))
+            .saga_journal
+            .mark_resolved(saga_id.clone(), SagaTerminalState::Committed, false)
             .await
         {
             return Err(SagaError::NeedsRepair {
@@ -9761,24 +9758,14 @@ impl Supervisor {
                 // resolution marker as secure evidence — same as the live commit
                 // path). `secret_bearing=false`: the §6.2.4 saga resolution
                 // markers carry no bearer secret.
-                let caller_hex = Self::xctx_caller_hex_from_participants(entry);
-                if let Err(err) = self
-                    .resolve_committed_and_retire_witness(
-                        &entry.saga_id,
+                let _ = self
+                    .saga_journal
+                    .mark_resolved(
+                        entry.saga_id.clone(),
+                        SagaTerminalState::Committed,
                         /*secret_bearing=*/ false,
-                        caller_hex.as_deref(),
                     )
-                    .await
-                {
-                    tracing::error!(
-                        saga_id = %entry.saga_id,
-                        %err,
-                        "saga recovery — Commit-in-progress confirmed both sides committed, but \
-                         the journal resolve to Committed failed; left Committing for the next \
-                         start"
-                    );
-                    return;
-                }
+                    .await;
                 tracing::info!(
                     saga_id = %entry.saga_id,
                     "saga recovery — Commit-in-progress resolved to Committed (B re-emitted, A \
@@ -9916,26 +9903,26 @@ impl Supervisor {
                 // can mean the A-side send failed: re-send it, then resolve. A
                 // failed send leaves the entry `Committing` for the next sweep,
                 // unless A's context is deleted (spec 17 §17.3).
-                // `None` when A's context is deleted: no witness is left to retire.
-                let caller_hex = match crate::context::outlets::invoke::send_streaming_saga_a_unit(
-                    self, saga_id, &a_event,
-                )
-                .await
-                {
-                    Ok(caller_hex) => Some(caller_hex),
-                    Err(err) => {
-                        if !self
-                            .streaming_a_record_caller_deleted(saga_id, &a_event, &err)
-                            .await
-                        {
-                            return;
+                let caller_deleted =
+                    match crate::context::outlets::invoke::send_streaming_saga_a_unit(
+                        self, saga_id, &a_event,
+                    )
+                    .await
+                    {
+                        Ok(()) => false,
+                        Err(err) => {
+                            if !self
+                                .streaming_a_record_caller_deleted(saga_id, &a_event, &err)
+                                .await
+                            {
+                                return;
+                            }
+                            true
                         }
-                        None
-                    }
-                };
-                let caller_deleted = caller_hex.is_none();
+                    };
                 if let Err(err) = self
-                    .resolve_committed_and_retire_witness(saga_id, false, caller_hex.as_deref())
+                    .saga_journal
+                    .mark_resolved(saga_id.clone(), SagaTerminalState::Committed, false)
                     .await
                 {
                     tracing::error!(
@@ -10076,13 +10063,12 @@ impl Supervisor {
         // The seal task sends the A-side leaf BEFORE the money move, so the leaf
         // may already be queued or logged (a seal task whose settle deferred);
         // A's per-saga dedup queues it once.
-        // `None` when A's context is deleted: no witness is left to retire.
-        let caller_hex = match crate::context::outlets::invoke::send_streaming_saga_a_unit(
+        let caller_deleted = match crate::context::outlets::invoke::send_streaming_saga_a_unit(
             self, saga_id, &a_event,
         )
         .await
         {
-            Ok(caller_hex) => Some(caller_hex),
+            Ok(()) => false,
             Err(err) => {
                 if !self
                     .streaming_a_record_caller_deleted(saga_id, &a_event, &err)
@@ -10090,13 +10076,13 @@ impl Supervisor {
                 {
                     return;
                 }
-                None
+                true
             }
         };
-        let caller_deleted = caller_hex.is_none();
 
         if let Err(err) = self
-            .resolve_committed_and_retire_witness(saga_id, false, caller_hex.as_deref())
+            .saga_journal
+            .mark_resolved(saga_id.clone(), SagaTerminalState::Committed, false)
             .await
         {
             tracing::error!(
@@ -10538,9 +10524,13 @@ impl Supervisor {
         secret_bearing: bool,
         xctx: Option<&mut CrossContextSagaCtx<'_>>,
     ) -> Result<(), ContextError> {
-        let caller_hex = xctx.as_ref().map(|ctx| hex::encode(ctx.caller_context_id));
         if let Err(e) = self
-            .resolve_committed_and_retire_witness(saga_id, secret_bearing, caller_hex.as_deref())
+            .saga_journal
+            .mark_resolved(
+                saga_id.clone(),
+                SagaTerminalState::Committed,
+                secret_bearing,
+            )
             .await
         {
             if let Some(ctx) = xctx {
@@ -12272,9 +12262,7 @@ impl Supervisor {
     /// ([`run_streaming_saga_seal_task`](crate::context::outlets::invoke::run_streaming_saga_seal_task))
     /// once [`SagaPhaseMessage::CommitBStreamSettle`](crate::context::actor::commands::SagaPhaseMessage::CommitBStreamSettle)
     /// has durably sealed the stream, so the autonomous crash-recovery sweep does
-    /// not redrive a completed saga, then retires the Commit-A witness on A's
-    /// actor `caller_hex` ([`Self::resolve_committed_and_retire_witness`]).
-    /// `secret_bearing = false`: the streaming saga
+    /// not redrive a completed saga. `secret_bearing = false`: the streaming saga
     /// journals public metadata only (the manifest root + provenance, never chunk
     /// bytes or bearer material — [`saga_input_is_secret_bearing`] returns
     /// `false` for its input).
@@ -12288,85 +12276,15 @@ impl Supervisor {
     pub(in crate::context) async fn resolve_saga_committed(
         &self,
         saga_id: &SagaId,
-        caller_hex: &str,
     ) -> Result<(), ContextError> {
-        self.resolve_committed_and_retire_witness(saga_id, false, Some(caller_hex))
+        self.saga_journal
+            .mark_resolved(saga_id.clone(), SagaTerminalState::Committed, false)
             .await
             .map_err(|e| {
                 ContextError::InvalidState(format!(
                     "streaming-saga journal mark_resolved(Committed) failed: {e}"
                 ))
             })
-    }
-
-    /// Resolves `saga_id` to `Committed` in the journal, then retires the
-    /// Commit-A witness on the actor of `caller_hex`, the context whose
-    /// `xctx_committed_invocations` recorded the saga (spec §17.16.4; spec 17
-    /// §17.3). Every `Committed` resolve goes through here, so no committed
-    /// saga keeps its witness by a missed call site.
-    ///
-    /// The journal lives in supervisor storage and the witness in the
-    /// actor's snapshot, so the two cannot change in one commit. The journal
-    /// resolves first: an unresolved saga whose witness is gone would let a
-    /// crash-replayed Commit-A settle the escrow twice, while a resolved saga
-    /// is never re-driven (replay reads only unresolved entries), so its
-    /// witness has no reader left. `caller_hex` is `None` for a saga with no
-    /// caller context (a test input) or one whose caller context is deleted.
-    ///
-    /// The saga is committed once the journal resolves, so a retirement that
-    /// fails (the caller's actor is not resident, its mailbox or reply fails,
-    /// or its persist fails) is logged at error and not returned: returning it
-    /// would report the committed saga as failed. The witness then stays as
-    /// one entry for a saga nothing re-drives.
-    ///
-    /// # Errors
-    ///
-    /// The [`JournalError`](crate::context::supervisor::saga_journal::JournalError)
-    /// of a failed resolve; the witness is then kept.
-    async fn resolve_committed_and_retire_witness(
-        &self,
-        saga_id: &SagaId,
-        secret_bearing: bool,
-        caller_hex: Option<&str>,
-    ) -> Result<(), crate::context::supervisor::saga_journal::JournalError> {
-        self.saga_journal
-            .mark_resolved(
-                saga_id.clone(),
-                SagaTerminalState::Committed,
-                secret_bearing,
-            )
-            .await?;
-        let Some(caller_hex) = caller_hex else {
-            return Ok(());
-        };
-        let retired = match self.lookup(caller_hex) {
-            Some(caller) => {
-                let retire_id = saga_id.clone();
-                caller
-                    .send(move |reply| {
-                        ContextCommand::SagaPhase(
-                            crate::context::actor::commands::SagaPhaseMessage::RetireCommitAWitness {
-                                saga_id: retire_id,
-                                reply,
-                            },
-                        )
-                    })
-                    .await
-            }
-            None => Err(ContextError::ContextNotRegistered(format!(
-                "{caller_hex} has no resident actor"
-            ))),
-        };
-        if let Err(err) = retired {
-            tracing::error!(
-                saga_id = %saga_id.0,
-                context = %caller_hex,
-                %err,
-                "saga resolved Committed, but its Commit-A witness was not retired; the \
-                 caller's snapshot keeps one entry for a saga nothing re-drives"
-            );
-        }
-        Ok(())
     }
 
     // ---------------------------------------------------------------
@@ -38843,13 +38761,6 @@ mod tests {
             "pre-reopen: the single unresolved saga must be at Committing, got {:?}",
             pre_reopen[0]
         );
-        let saga_id = pre_reopen[0].saga_id.clone();
-        // The resolve failed, so the caller keeps its Commit-A witness: the
-        // replay below reads it to resolve the saga without settling twice.
-        assert!(
-            stored_commit_a_witnesses(&persistence).contains(&saga_id),
-            "a saga whose Committed resolve failed keeps its Commit-A witness"
-        );
 
         let supervisor2 = xctx_supervisor_with_journal(
             creator_did,
@@ -38874,11 +38785,6 @@ mod tests {
             "the Committing entry must self-heal to Committed and compact away on reopen, got \
              {unresolved:?}"
         );
-        // The replay retired the witness of the saga it resolved.
-        assert!(
-            !stored_commit_a_witnesses(&persistence).contains(&saga_id),
-            "the replay that resolves the saga Committed retires its Commit-A witness"
-        );
         // The replay re-drove the idempotent Commit (AlreadyCommitted) — the outlet
         // was NEVER re-invoked. NOTE: this post-reopen `calls == 1` check is a
         // STRUCTURAL guard, not a behavioral pin — the executor closure was dropped
@@ -38892,101 +38798,6 @@ mod tests {
             1,
             "the self-heal replay must re-drive the idempotent Commit (AlreadyCommitted), never \
              re-invoke the outlet"
-        );
-    }
-
-    /// The Commit-A witnesses in the caller context's stored snapshot.
-    fn stored_commit_a_witnesses(
-        persistence: &CapturingPersistence,
-    ) -> std::collections::HashSet<SagaId> {
-        persistence
-            .snapshots
-            .get(&hex::encode(XCTX_CALLER))
-            .expect("the caller context has a stored snapshot")
-            .xctx_committed_invocations
-            .clone()
-    }
-
-    /// A saga the journal resolves `Committed` retires its Commit-A witness
-    /// from the caller's stored snapshot and its live actor (spec §17.16.4;
-    /// spec 17 §17.3): nothing re-drives a resolved saga, so the witness set
-    /// holds only sagas the journal can still replay.
-    #[tokio::test]
-    async fn a_committed_saga_retires_its_commit_a_witness() {
-        let creator_did = "did:dht:z6MkXctxRetireCreator".to_owned();
-        let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
-        let journal: Arc<dyn SagaJournal> = Arc::new(ProtocolRepositorySagaJournal::new(Arc::new(
-            InMemoryStorage::new(),
-        )));
-        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
-            Arc::new(
-                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
-                    InMemoryStorage::new(),
-                )),
-            );
-        let persistence = CapturingPersistence::with_restore();
-        let supervisor = xctx_supervisor_with_journal(
-            creator_did.clone(),
-            creator_key,
-            Arc::clone(&journal),
-            mls_storage,
-            Box::new(persistence.clone()),
-            crate::crypto::wrapping::single_custody_source(Arc::new(
-                scp_platform::testing::InMemoryKeyCustody::new(),
-            )),
-        );
-        let caller_did = "did:dht:z6MkXctxRetireCaller";
-        Box::pin(spawn_xctx_pair(
-            &supervisor,
-            xctx_caller_state(caller_did, &creator_did),
-            xctx_target_state(caller_did, &creator_did),
-        ))
-        .await;
-
-        let now_ms = supervisor.clock_ref().expect("clock").now_millis();
-        let output = supervisor
-            .start_cross_context_outlet_invocation_saga(
-                xctx_request(caller_did, now_ms, [0x45u8; 16]),
-                SagaSigners {
-                    target: CommandSigner::local_ed25519(ed25519_dalek::SigningKey::from_bytes(
-                        &[7u8; 32],
-                    )),
-                    caller: CommandSigner::local_ed25519(ed25519_dalek::SigningKey::from_bytes(
-                        &[8u8; 32],
-                    )),
-                },
-                |input: serde_json::Value| async move {
-                    Ok(serde_json::json!({ "result": input["a"].as_i64().unwrap_or(0) }))
-                },
-            )
-            .await
-            .expect("the saga commits");
-
-        assert!(
-            journal.load_unresolved().await.unwrap().is_empty(),
-            "the saga resolved Committed"
-        );
-        assert!(
-            !stored_commit_a_witnesses(&persistence).contains(&output.saga_id),
-            "the resolved saga's Commit-A witness left the caller's stored snapshot"
-        );
-        let check_id = output.saga_id.clone();
-        let witnessed = supervisor
-            .lookup(&hex::encode(XCTX_CALLER))
-            .expect("the caller actor is resident")
-            .send(move |reply| {
-                ContextCommand::SagaPhase(
-                    crate::context::actor::commands::SagaPhaseMessage::CommitACheckWitness {
-                        saga_id: check_id,
-                        reply,
-                    },
-                )
-            })
-            .await
-            .expect("the witness check replies");
-        assert!(
-            !witnessed,
-            "the resolved saga's Commit-A witness left the live actor"
         );
     }
 
@@ -41123,50 +40934,15 @@ mod tests {
         );
     }
 
-    /// A supervisor whose journal faults the first `mark_resolved(Committed)`,
-    /// over a restore-enabled capturing persistence, with the journal and the
-    /// persistence returned for inspection.
-    fn xctx_supervisor_with_resolve_fault(
-        creator_did: String,
-        creator_key: ed25519_dalek::VerifyingKey,
-    ) -> (Arc<Supervisor>, Arc<dyn SagaJournal>, CapturingPersistence) {
-        let journal: Arc<dyn SagaJournal> = Arc::new(FailingSagaJournal::new(
-            Arc::new(InMemoryStorage::new()),
-            None,
-            /*fail_mark_resolved_committed=*/ true,
-        ));
-        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
-            Arc::new(
-                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
-                    InMemoryStorage::new(),
-                )),
-            );
-        let persistence = CapturingPersistence::with_restore();
-        let supervisor = xctx_supervisor_with_journal(
-            creator_did,
-            creator_key,
-            Arc::clone(&journal),
-            mls_storage,
-            Box::new(persistence.clone()),
-            crate::crypto::wrapping::single_custody_source(Arc::new(
-                scp_platform::testing::InMemoryKeyCustody::new(),
-            )),
-        );
-        (supervisor, journal, persistence)
-    }
-
     /// FIX 2 (§17.16.4): a Commit-in-progress recovery whose A-side
     /// `xctx_committed_invocations` witness IS present resolves to `Committed`,
-    /// NOT a spurious `NeedsRepair`. We run a real saga whose dual commit lands
-    /// (both witnesses land) but whose `mark_resolved(Committed)` faults once,
-    /// so the journal still holds it `Committing` and the caller keeps its
-    /// witness: the state a crash between the commit and the resolve leaves.
-    /// The recovery re-drive must return `Committed` (the A-side witness re-ack
-    /// succeeded), and the outlet never re-runs.
+    /// NOT a spurious `NeedsRepair`. We commit a real saga (both witnesses land),
+    /// then run the recovery re-drive and assert it returns `Committed` (the
+    /// A-side witness re-ack succeeded) — and the outlet never re-runs.
     ///
-    /// (The resolution is asserted on the re-drive's RETURN value — the input
-    /// `recover_committing_entry` consumes to choose `mark_resolved(Committed)`
-    /// vs the NeedsRepair append.)
+    /// (The journal is the no-op test journal here, so the resolution is
+    /// asserted on the re-drive's RETURN value — the input `recover_committing_entry`
+    /// consumes to choose `mark_resolved(Committed)` vs the NeedsRepair append.)
     #[tokio::test]
     async fn xctx_commit_in_progress_with_witness_resolves_committed() {
         use crate::context::supervisor::saga_journal::SagaId;
@@ -41175,8 +40951,7 @@ mod tests {
 
         let creator_did = "did:dht:z6MkXctxWitnessCreator".to_owned();
         let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
-        let (supervisor, journal, persistence) =
-            xctx_supervisor_with_resolve_fault(creator_did.clone(), creator_key);
+        let supervisor = xctx_supervisor(creator_did.clone(), creator_key);
         let caller_did = "did:dht:z6MkXctxWitnessCaller";
         let caller_state = xctx_caller_state(caller_did, &creator_did);
         let target_state = xctx_target_state(caller_did, &creator_did);
@@ -41195,7 +40970,7 @@ mod tests {
         };
         let now_ms = supervisor.clock_ref().expect("clock").now_millis();
         let nonce = [0x42u8; 16];
-        let result = supervisor
+        let out = supervisor
             .start_cross_context_outlet_invocation_saga(
                 CrossContextOutletInvocationRequest {
                     caller_context_id: XCTX_CALLER,
@@ -41214,31 +40989,20 @@ mod tests {
                 },
                 executor,
             )
-            .await;
-        assert!(
-            matches!(result, Err(SagaError::NeedsRepair { .. })),
-            "precondition: the faulted resolve leaves the saga unresolved, got {result:?}"
-        );
+            .await
+            .expect("saga commits");
         assert_eq!(calls.load(Ordering::SeqCst), 1, "outlet ran once");
 
-        // The saga is still Committing in the journal, and its A-side witness
-        // is present in the (still-live) caller actor, because the witness is
-        // retired only after the journal resolves the saga.
-        let unresolved = journal.load_unresolved().await.expect("load unresolved");
-        assert_eq!(
-            unresolved.len(),
-            1,
-            "one unresolved saga, got {unresolved:?}"
-        );
-        assert_eq!(
-            unresolved[0].state,
-            crate::context::supervisor::saga_journal::SagaState::Committing
-        );
-        let saga_id = unresolved[0].saga_id.clone();
-        assert!(
-            stored_commit_a_witnesses(&persistence).contains(&saga_id),
-            "precondition: the unresolved saga keeps its Commit-A witness"
-        );
+        // Recover the committed saga id from the receipt — its A-side witness is
+        // present in the (still-live) caller actor.
+        let receipt: scp_protocol::context::outlets::cross_context_saga::CrossContextOutletReceipt =
+            serde_json::from_slice(&out.receipt.expect("receipt")).expect("decode");
+        let saga_id_str = receipt
+            .outlet_invoked_event_id
+            .strip_prefix("OutletInvoked:")
+            .expect("event id carries saga id")
+            .to_owned();
+        let saga_id = SagaId(saga_id_str);
 
         let prepared = CrossContextOutletInvocationPrepared {
             caller_context_id: XCTX_CALLER,
@@ -46934,6 +46698,110 @@ mod streaming_saga_tests {
         );
 
         drop(recording);
+    }
+
+    /// Spec 17 §17.3: a saga records its A-side `CrossContextOutletInvoked`
+    /// leaf once. The SDK can call truncated-close recovery for a saga whose
+    /// seal already completed (it reconnects before it reads the terminal
+    /// chunk), and can repeat the call. Each recovery re-sends the A unit with
+    /// `UnitDedup::OncePerSaga`, so the caller log keeps exactly one leaf.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn xctx_streaming_truncated_close_recovery_after_seal_queues_one_a_leaf() {
+        let captured = Arc::new(AtomicUsize::new(0));
+        let invoked = Arc::new(AtomicUsize::new(0));
+        let storage = Arc::new(InMemoryStorage::new());
+        let journal: Arc<dyn SagaJournal> =
+            Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
+        let recording = SsRecordingEventLog::default();
+        let supervisor =
+            build_ss_supervisor(&captured, Arc::clone(&journal), Box::new(recording.clone()));
+        spawn_ss_pair(&supervisor).await;
+
+        let registry = ss_registry();
+        let (params, binding) = ss_stream_params([0x4A; 16]);
+        let executor = Arc::new(FiniteChunkExecutor {
+            data_chunks: 3,
+            invoked: Arc::clone(&invoked),
+        });
+        let target_signing = SigningKey::from_bytes(&[7u8; 32]);
+        let caller_signing = SigningKey::from_bytes(&[8u8; 32]);
+        let outlet_id: OutletId = SS_OUTLET.to_owned();
+
+        let mut handle = supervisor
+            .start_cross_context_streaming_outlet_invocation_saga(
+                SS_CALLER,
+                SS_TARGET,
+                ss_invoker(),
+                SS_OUTLET.to_owned(),
+                None,
+                &registry,
+                &outlet_id,
+                serde_json::json!({ "a": 1, "b": 2 }),
+                1,
+                [0x4Au8; 16],
+                SS_NOW.saturating_mul(1000),
+                Some(5_000),
+                executor,
+                Some(binding),
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
+                },
+                params,
+            )
+            .await
+            .expect("the paid streaming saga starts");
+        let saga_id = handle.saga_id.clone();
+
+        // Drain to the terminal so the seal task completes and resolves.
+        while let Some(frame) = tokio::time::timeout(Duration::from_secs(5), handle.receiver.recv())
+            .await
+            .expect("forwarded frame within 5s")
+        {
+            if matches!(
+                frame.payload,
+                ChunkPayload::End { .. } | ChunkPayload::Error { .. }
+            ) {
+                break;
+            }
+        }
+        ss_await_resolved(&journal, &saga_id, Duration::from_secs(5)).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while ss_caller_a_leaves(&recording) == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the seal queues its A-side leaf"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Two truncated-close recoveries for the sealed saga. Their results are
+        // not the subject; a duplicate leaf is queued before any later step.
+        for _ in 0..2 {
+            let _recovered = supervisor
+                .recover_streaming_saga_truncated_close(
+                    saga_id.clone(),
+                    SS_TARGET,
+                    CommandSigner::local_ed25519(target_signing.clone()),
+                )
+                .await;
+        }
+
+        // A duplicate leaf lands asynchronously; give it time to appear.
+        let settle = tokio::time::Instant::now() + Duration::from_secs(1);
+        while ss_caller_a_leaves(&recording) == 1 && tokio::time::Instant::now() < settle {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            ss_caller_a_leaves(&recording),
+            1,
+            "a recovery after the seal must not queue a second A-side leaf"
+        );
+        assert_eq!(
+            invoked.load(Ordering::SeqCst),
+            1,
+            "recovery never re-invokes"
+        );
     }
 
     /// SCP-OUT-046 CRITICAL — the settlement-atomicity gap AC7 misses: a crash /

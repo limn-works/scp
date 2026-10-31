@@ -321,9 +321,6 @@ async fn dispatch_stream_phase(
         SagaPhaseMessage::CommitACheckWitness { reply, .. } => {
             misrouted(reply, "CommitACheckWitness")
         }
-        SagaPhaseMessage::RetireCommitAWitness { reply, .. } => {
-            misrouted(reply, "RetireCommitAWitness")
-        }
         SagaPhaseMessage::CommitA { reply, .. } => misrouted(reply, "CommitA"),
         SagaPhaseMessage::Abort { reply, .. } => misrouted(reply, "Abort"),
         SagaPhaseMessage::EmitDivergenceMarker { reply, .. } => {
@@ -400,9 +397,6 @@ async fn dispatch_prepare_phase(
         SagaPhaseMessage::CommitACheckWitness { reply, .. } => {
             misrouted(reply, "CommitACheckWitness")
         }
-        SagaPhaseMessage::RetireCommitAWitness { reply, .. } => {
-            misrouted(reply, "RetireCommitAWitness")
-        }
         SagaPhaseMessage::CommitA { reply, .. } => misrouted(reply, "CommitA"),
         SagaPhaseMessage::Abort { reply, .. } => misrouted(reply, "Abort"),
         SagaPhaseMessage::EmitDivergenceMarker { reply, .. } => {
@@ -466,9 +460,6 @@ async fn dispatch_commit_phase(
         }
         SagaPhaseMessage::CommitACheckWitness { saga_id, reply } => {
             commit_a_check_witness(cell, &saga_id, reply)
-        }
-        SagaPhaseMessage::RetireCommitAWitness { saga_id, reply } => {
-            retire_commit_a_witness(cell, deps, &saga_id, reply).await
         }
         SagaPhaseMessage::Abort {
             saga_id,
@@ -3007,44 +2998,6 @@ fn commit_a_check_witness(
     let recorded = state.class_s.xctx_committed_invocations.contains(saga_id);
     let _ = reply.send(Ok(recorded));
     Outcome::ok(())
-}
-
-/// Retires the Commit-A witness of a saga the journal resolved `Committed`
-/// (spec §17.16.4; spec 17 §17.3). Removes `saga_id` from
-/// `xctx_committed_invocations` in a fail-closed Class-S persist and replies
-/// `Ok`; an id not in the set replies `Ok` and persists nothing. A failed
-/// persist rolls the removal back, keeps the witness, and replies the error.
-async fn retire_commit_a_witness(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
-    deps: &ActorDeps,
-    saga_id: &SagaId,
-    reply: tokio::sync::oneshot::Sender<Result<(), ContextError>>,
-) -> Outcome<()> {
-    if !cell.class_s.xctx_committed_invocations.contains(saga_id) {
-        let _ = reply.send(Ok(()));
-        return Outcome::ok(());
-    }
-    let context_id = cell.handle.context_id().to_owned();
-    let retired = saga_id.clone();
-    match cell
-        .commit_class_s_restore(deps, &context_id, move |mut view| {
-            view.class_s_mut()
-                .xctx_committed_invocations
-                .remove(&retired);
-            Ok(())
-        })
-        .await
-    {
-        Ok(()) => {
-            let _ = reply.send(Ok(()));
-            Outcome::ok_mutated(())
-        }
-        Err(err) => {
-            let sketch = outcome_error_sketch(&err);
-            let _ = reply.send(Err(err));
-            Outcome::err(sketch)
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

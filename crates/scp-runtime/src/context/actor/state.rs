@@ -965,17 +965,15 @@ pub struct ClassSState {
     /// double-settle the escrow on replay. Survives same-node restore; dropped
     /// on cross-node export/import (a foreign saga must never drive local replay).
     ///
-    /// **Retention bound.** One `SagaId` per committed saga whose journal
-    /// entry is still unresolved. The witness is read only while the journal
-    /// can still re-drive the saga (§17.16.4 replay reads only unresolved
-    /// entries), so the supervisor retires it right after the journal
-    /// resolves the saga `Committed`
-    /// (`Supervisor::resolve_committed_and_retire_witness`). The journal lives
-    /// in supervisor storage and this set in the actor's snapshot, so the two
-    /// cannot change in one commit; the journal resolves first, because an
-    /// unresolved saga without its witness would settle the escrow twice on
-    /// replay. A crash between the two writes, or a failed retirement (logged
-    /// at error), leaves one entry for a saga nothing re-drives.
+    /// **Retention bound.** Same discipline as
+    /// [`Self::xctx_committed_outputs`]: one `SagaId` per committed Commit-A,
+    /// retained for the context's lifetime and load-bearing only while a
+    /// crash-replayed Commit-A could still re-drive the saga (§17.16.4). Its
+    /// compaction is tied to saga-journal retention — pruned to the journal's
+    /// retention horizon once that horizon exists. Until then it grows with
+    /// committed-saga count; documented here so the growth is a tracked
+    /// retention decision rather than a silent memory-growth vector. No
+    /// speculative compaction is built here.
     pub(crate) xctx_committed_invocations: std::collections::HashSet<SagaId>,
 
     /// Caller-side (A-owned) durable reversal records for in-flight
