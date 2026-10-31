@@ -478,14 +478,24 @@ mod tests {
         adapter: Option<Arc<dyn PaymentAdapterDyn>>,
         persistence: Box<dyn crate::context::persistence::ContextPersistence>,
     ) -> Arc<Supervisor> {
+        build_supervisor_with_log(
+            adapter,
+            persistence,
+            Box::new(crate::context::providers::MerkleEventLogProvider::new()),
+        )
+    }
+
+    fn build_supervisor_with_log(
+        adapter: Option<Arc<dyn PaymentAdapterDyn>>,
+        persistence: Box<dyn crate::context::persistence::ContextPersistence>,
+        event_log: Box<dyn crate::context::builder::ContextEventLogProvider>,
+    ) -> Arc<Supervisor> {
         let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             INVOKER.to_owned(),
             Arc::new(scp_clock::SystemClock),
         ));
         let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
-        let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
-            Box::new(crate::context::providers::MerkleEventLogProvider::new());
         let key_resolver: scp_protocol::context::governance::KeyResolver = Arc::new(|_, _| None);
         let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
             Arc::new(
@@ -1396,6 +1406,112 @@ mod tests {
             3,
             "a close record whose Supervisor dropped is counted"
         );
+    }
+
+    /// Spec 17 §17.3: a close record the actor queued is not lost when the
+    /// log then refuses its write. The send reports the unit queued, so the
+    /// sink counts nothing; the record stays in the stored queue, and the
+    /// actor's next drain over a log that takes writes lands it once, ahead of
+    /// the next record.
+    #[test]
+    fn a_close_record_queued_before_the_log_refuses_it_is_kept_not_counted() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a current-thread runtime");
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(close_record_refused_after_queue(&snapshotter));
+        });
+    }
+
+    async fn close_record_refused_after_queue(snapshotter: &metrics_util::debugging::Snapshotter) {
+        use super::ActorOutletInvokedEventSink;
+        use crate::context::log_unit_helpers::test_support::{
+            SharedSnapshots, fail_log_entry_writes, faulty_merkle_log,
+        };
+        use crate::context::outlets::invoke::OutletInvokedEventSink;
+        use crate::metrics::test_support::log_unit_undelivered_total;
+
+        let ctx_id_bytes = [CTX_BYTE; 32];
+        let (log, faulty) = faulty_merkle_log();
+        let snapshots = SharedSnapshots::default();
+        let supervisor =
+            build_supervisor_with_log(None, Box::new(snapshots.clone()), Box::new(log));
+        let deps = deps_for(&supervisor).await;
+        deps.event_log
+            .init_event_log(&ctx_id_bytes)
+            .await
+            .expect("the log initialises");
+        let event_log = Arc::clone(&deps.event_log);
+        supervisor
+            .spawn_actor_with_state(member_state(0, 0), deps, None)
+            .await
+            .expect("register the actor");
+        let sink = ActorOutletInvokedEventSink::new(
+            Arc::downgrade(&supervisor),
+            ctx_key(),
+            INVOKER.to_owned(),
+        );
+
+        fail_log_entry_writes(&faulty, &ctx_id_bytes);
+        sink.record(close_event(3, 3));
+        let mut queued = Vec::new();
+        for _ in 0..200 {
+            queued = snapshots.persisted_unit_types(&ctx_key()).await;
+            if !queued.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            queued.len(),
+            1,
+            "the refused close record stays in the stored queue"
+        );
+        // Let the hand-off finish and report its outcome.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            log_unit_undelivered_total(snapshotter),
+            0,
+            "a queued record the log refused is not counted as undelivered"
+        );
+        assert_eq!(
+            log_len_of(event_log.as_ref(), &ctx_id_bytes),
+            0,
+            "the refused write left no entry"
+        );
+
+        faulty.clear_fail();
+        sink.record(close_event(3, 3));
+        for _ in 0..200 {
+            if log_len_of(event_log.as_ref(), &ctx_id_bytes) == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            log_len_of(event_log.as_ref(), &ctx_id_bytes),
+            2,
+            "the next drain lands the kept record once, then the next one"
+        );
+        assert!(
+            snapshots.persisted_unit_types(&ctx_key()).await.is_empty(),
+            "both records left the stored queue"
+        );
+        assert_eq!(log_unit_undelivered_total(snapshotter), 0);
+    }
+
+    /// The number of entries in the context's in-memory log.
+    fn log_len_of(
+        event_log: &dyn crate::context::builder::ContextEventLogProvider,
+        context_id_bytes: &[u8; 32],
+    ) -> usize {
+        event_log
+            .event_log_entries(context_id_bytes)
+            .expect("the log reads")
+            .map_or(0, |entries| entries.len())
     }
 
     /// A reservation persist against a dropped Supervisor returns the typed
