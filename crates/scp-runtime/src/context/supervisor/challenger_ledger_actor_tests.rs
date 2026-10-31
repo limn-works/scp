@@ -1206,15 +1206,21 @@ async fn ledger_prunes_and_refuses_unknown() {
 }
 
 /// T12 (RED-001): the bound counts open challenges only. 1024 open
-/// challenges refuse the next Create; once all 1024 are closed, Create
+/// challenges refuse the next Create; once one of them is closed, Create
 /// succeeds.
 ///
-/// One challenge is created and graded through the actor. The other 1023
-/// are copies of the entry the actor stored for it, at that moment, under
-/// their own challenge ids and subjects, written to the store the actor
-/// loads when it spawns. Each Create rewrites the whole index and scans every
-/// entry, so 1024 Creates cost O(n²), and each grading costs several
-/// signature operations; the bound depends on neither.
+/// One challenge is created through the actor. 1022 copies of the entry the
+/// actor stored for it, each under its own challenge id and subject, are
+/// written to the store, and a respawned actor loads all 1023. The 1024th
+/// open challenge is then created, and the first one graded closed, through
+/// that live actor, and every count after them is read without another
+/// respawn. So the refusal depends on Create inserting its entry into the
+/// actor's memory, and the final Create depends on Commit storing the closure
+/// there; a load from the store supplies neither.
+///
+/// Creating every challenge through the actor would cost O(n²), because each
+/// Create rewrites the whole index and scans every entry; the bound depends on
+/// neither.
 #[tokio::test]
 async fn ledger_bound_counts_open_challenges_only() {
     let h = harness();
@@ -1222,7 +1228,9 @@ async fn ledger_bound_counts_open_challenges_only() {
         .map(|n| numbered_party(u16::try_from(n).unwrap()))
         .collect();
     let (last, open) = subjects.split_last().unwrap();
+    let (boundary_subject, open) = open.split_last().unwrap();
     let (graded_subject, copied) = open.split_first().unwrap();
+    assert_eq!(copied.len() + 2, MAX_OPEN_CHALLENGES_PER_CHALLENGER);
 
     let issued = h
         .create_as(&h.handle, h.signer(), &graded_subject.1, URI)
@@ -1231,6 +1239,11 @@ async fn ledger_bound_counts_open_challenges_only() {
     let open_template = h.stored_entry(&issued.request.challenge_id);
     assert_eq!(open_template.closed, None);
     let handle = h.respawn_seeded(&h.handle, &open_template, copied).await;
+
+    // The 1024th open challenge, created by the live actor.
+    h.create_as(&handle, h.signer(), &boundary_subject.1, URI)
+        .await
+        .unwrap();
     assert!(matches!(
         trust_err(h.create_as(&handle, h.signer(), &last.1, URI).await),
         TrustError::ChallengeNotOpen {
@@ -1246,9 +1259,11 @@ async fn ledger_bound_counts_open_challenges_only() {
         .await
         .unwrap();
     assert!(graded.record.passed);
-    let closed_template = h.stored_entry(&issued.request.challenge_id);
-    assert_eq!(closed_template.closed, Some(ChallengeClosure::Passed));
-    let handle = h.respawn_seeded(&handle, &closed_template, copied).await;
+    assert_eq!(
+        h.stored_entry(&issued.request.challenge_id).closed,
+        Some(ChallengeClosure::Passed)
+    );
+    // 1024 entries, one of them closed: the same actor admits the Create.
     h.create_as(&handle, h.signer(), &last.1, URI)
         .await
         .unwrap();

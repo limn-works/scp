@@ -33,7 +33,7 @@ use scp_protocol::context::{ContextError, context_routing_id};
 use tokio::sync::broadcast;
 
 use crate::context::ContextHandle;
-use crate::context::actor::pseudonym_rotation::LocalRoutingIds;
+use crate::context::actor::pseudonym_rotation::{LocalRoutingIds, RotationWake};
 use crate::context::actor::signer::CommandSigner;
 use crate::context::builder::{ContextEventLogProvider, ContextTransportProvider};
 use crate::context::persistence::ContextPersistence;
@@ -958,27 +958,52 @@ async fn republish(supervisor: &Supervisor, handle: &ContextHandle) -> Result<()
 // Rotation arm: schedule, membership trigger, governance re-anchor
 // ---------------------------------------------------------------------------
 
-/// §9.10.4.1 "Epoch schedule": with no policy, nothing is signalled across a
-/// thousand interval lengths.
+/// §9.10.4.1 "Epoch schedule": with no policy, no rotation signal is emitted
+/// at or after any of the boundaries `T0 + j × I`, j = 1..=1 000.
 ///
-/// The wall clock and tokio time step together, one interval at a time, so
-/// the arm sees every boundary `T0 + j × I` on the wall clock and every
-/// one-shot sleep due by it has elapsed. Between boundaries only the actor's
-/// 60 s governance interval would tick, and each tick costs a full snapshot
-/// persist; one `advance` past it fires it once (`MissedTickBehavior::Delay`),
-/// so the test pays for 1 000 ticks rather than 60 000.
+/// The arm's timer does not visit those boundaries. At create,
+/// `PseudonymRotationState::wake` returns `Idle` for a policy of `None`, so
+/// `rotation_timer` stays `None`. The actor re-runs
+/// `reconcile_pseudonym_timers` after every dispatch and governance tick, but
+/// that re-reads `wake` only when the persisted rotation state or the policy
+/// changes, and a moving clock changes neither. No production path
+/// re-evaluates the arm because time passed, so the test checks two things at
+/// each boundary instead:
+///
+/// - the events the actor emits in the second after the wall clock reaches the
+///   boundary contain no rotation signal;
+/// - `wake`, the function the arm would run, returns `Idle` for the persisted
+///   rotation state and the context's policy at that wall-clock second. A
+///   schedule that made a no-policy context due at some boundary fails here
+///   even though the timer never fires.
+///
+/// The wall clock and tokio time step together, one interval at a time. The
+/// actor's 60 s governance interval ticks between boundaries, and each tick
+/// persists a full snapshot. One `advance` past it fires it once
+/// (`MissedTickBehavior::Delay`), so the test pays for 1 000 ticks, not 60 000.
 #[tokio::test(start_paused = true)]
 async fn nothing_is_signalled_without_a_policy_over_a_thousand_periods() {
     let mut n = node();
     let ctx = &cid("rotation-none");
-    n.create(ctx, params(None)).await;
+    let handle = n.create(ctx, params(None)).await;
+    let policy = handle.params().pseudonym_rotation;
+    assert!(policy.is_none(), "the context carries no rotation policy");
     let mut events = Vec::new();
     for j in 1..=1_000 {
-        n.clock.set(T0 + j * INTERVAL);
+        let boundary = T0 + j * INTERVAL;
+        n.clock.set(boundary);
         tokio::time::advance(Duration::from_secs(INTERVAL)).await;
         // Long enough for the arm's turn and the 50 ms coalesced persist the
         // governance tick schedules, short of the next 60 s tick.
         events.extend(n.collect_for(Duration::from_secs(1)).await);
+        assert_eq!(
+            n.store
+                .snapshot(ctx)
+                .pseudonym_rotation
+                .wake(policy.as_ref(), boundary),
+            RotationWake::Idle,
+            "boundary j = {j}: the arm has nothing to schedule without a policy"
+        );
     }
     assert!(
         !events.iter().any(is_rotation_signal),

@@ -130,6 +130,12 @@ const NOISE_FLOOR_MICROS: f64 = 150.0;
 /// Fixed application payload used by send / deliver / broadcast measurements.
 const PAYLOAD: &[u8] = b"scp-adr049-perf-baseline-payload";
 
+/// Untimed wait after a concurrent setup for the coalesced snapshot writes it
+/// scheduled (see [`build_each`]). Ten coalescing windows: one window until
+/// the last write is due, and the rest for up to 32 actors to build their
+/// snapshots on the runtime's worker threads.
+const PERSIST_SETTLE: Duration = Duration::from_millis(500);
+
 // ---------------------------------------------------------------------------
 // Deterministic key derivation — MUST mirror `FullStackNode::did_to_seed` so a
 // custody key we mint for a broadcast author verifies against the network's
@@ -236,7 +242,18 @@ where
 /// Builds `n` independent instances at once, one task each, and returns them
 /// in index order. Setup is untimed and the instances share no state, so
 /// building them concurrently changes no measured region; it only shortens
-/// the run. Every instance is built before `run_measure` starts.
+/// the run. Every instance is built, and the actors' background snapshot
+/// writes the setup scheduled have run, before `run_measure` starts.
+///
+/// Each setup mutation leaves its context actor dirty, and the actor builds a
+/// full snapshot (MLS state export included) one coalescing window
+/// (`COALESCE_INTERVAL`, 50 ms) after its last write. Built concurrently, up
+/// to 32 actors would do that during the first timed rounds. These
+/// supervisors have no persistence provider, so no completion signal reaches
+/// that write: `Supervisor::flush_all_contexts` returns at once without one,
+/// and `LifecycleCommand::FlushSnapshot` names no context, so
+/// `dispatch_lifecycle_command` cannot route it to an actor. The helper
+/// therefore sleeps [`PERSIST_SETTLE`] after the last instance is built.
 async fn build_each<T, F, Fut>(n: usize, build: F) -> Vec<T>
 where
     T: Send + 'static,
@@ -253,6 +270,7 @@ where
         instances.push(joined.expect("perf setup task panicked"));
     }
     instances.sort_by_key(|(i, _)| *i);
+    tokio::time::sleep(PERSIST_SETTLE).await;
     instances
         .into_iter()
         .map(|(_, instance)| instance)
