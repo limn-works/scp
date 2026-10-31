@@ -3955,6 +3955,163 @@ async fn a_discard_that_finds_a_full_mailbox_deletes_the_snapshot_after_the_last
     gated.await_deleted(&j.ctx_id).await;
 }
 
+/// A [`RecordingPersistence`] whose `persist_context`, once armed, first runs
+/// [`Supervisor::despawn_actor`] for the id, as a TTL exit's self-despawn
+/// does, so the persisting actor's turn needs the Supervisor's `write_lock`.
+#[derive(Clone, Default)]
+struct DespawningPersistence {
+    inner: RecordingPersistence,
+    supervisor: Arc<std::sync::OnceLock<std::sync::Weak<Supervisor>>>,
+    armed: Arc<std::sync::atomic::AtomicBool>,
+    despawns: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl ContextPersistence for DespawningPersistence {
+    async fn persist_context(
+        &self,
+        context_id: &str,
+        snapshot: &crate::context::state::ContextSnapshot,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self.armed.load(std::sync::atomic::Ordering::SeqCst)
+            && let Some(sup) = self.supervisor.get().and_then(std::sync::Weak::upgrade)
+        {
+            sup.despawn_actor(context_id).await;
+            self.despawns
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.inner.persist_context(context_id, snapshot).await
+    }
+    async fn load_context(
+        &self,
+        context_id: &str,
+    ) -> Result<
+        Option<crate::context::state::ContextSnapshot>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        self.inner.load_context(context_id).await
+    }
+    async fn delete_context(
+        &self,
+        context_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.delete_context(context_id).await
+    }
+    async fn list_persisted_contexts(
+        &self,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.list_persisted_contexts().await
+    }
+}
+
+/// A discard that finds no registered actor waits for the actor an earlier
+/// `despawn_actor` removed, and that actor's last turn takes `write_lock` (a
+/// TTL exit's self-despawn). The discard must hold no lock while it waits:
+/// holding `write_lock` would leave the actor stuck until the reply bound, and
+/// the discard would fail with the snapshot kept.
+#[tokio::test]
+async fn a_discard_with_no_registered_actor_waits_without_holding_the_write_lock() {
+    let persistence = DespawningPersistence::default();
+    let (result, j) = join_bob(0x7a, Some(Box::new(persistence.clone()))).await;
+    result.expect("the happy-path join succeeds");
+    persistence
+        .supervisor
+        .set(Arc::downgrade(&j.sup))
+        .expect("the supervisor is set once");
+    let cached = j
+        .sup
+        .lookup(&j.ctx_id)
+        .expect("a live context actor is registered for the joiner");
+    assert!(j.sup.despawn_actor(&j.ctx_id).await);
+    assert!(
+        !cached.is_closed(),
+        "the cached clone keeps the removed actor running"
+    );
+    persistence
+        .armed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let removed = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        j.sup.discard_joined_context(&j.ctx_id),
+    )
+    .await
+    .expect("the discard returns well within the reply bound")
+    .expect("the discard waits for the removed actor and tears the context down");
+    assert!(!removed, "no actor was registered for the id");
+    assert!(
+        persistence
+            .despawns
+            .load(std::sync::atomic::Ordering::SeqCst)
+            >= 1,
+        "the removed actor's last turn took write_lock"
+    );
+    assert!(
+        cached.is_closed(),
+        "the discard waited for the actor's exit"
+    );
+    drop(cached);
+    assert!(
+        persistence
+            .inner
+            .load_context(&j.ctx_id)
+            .await
+            .expect("load never errors")
+            .is_none(),
+        "the discard deleted the join's snapshot after the actor's last write"
+    );
+}
+
+/// A discard that finds no registered actor, whose removed actor does not
+/// exit within the reply bound because its last write is stuck, returns a
+/// typed error and keeps the snapshot while the actor can still write. It must
+/// still delete the snapshot once the actor exits, as a discard of a
+/// registered actor does; otherwise the context comes back on restart and
+/// Precheck D refuses every re-join. A second discard meanwhile is refused.
+#[tokio::test]
+async fn a_timed_out_discard_with_no_registered_actor_deletes_the_snapshot_after_the_exit() {
+    let gated = GatedPersistence::new();
+    let (result, j) = join_bob(0x7b, Some(Box::new(gated.clone()))).await;
+    result.expect("the happy-path join succeeds");
+    let cached = j
+        .sup
+        .lookup(&j.ctx_id)
+        .expect("a live context actor is registered for the joiner");
+    assert!(j.sup.despawn_actor(&j.ctx_id).await);
+    gated.arm();
+    tokio::time::pause();
+
+    let error = j
+        .sup
+        .discard_joined_context(&j.ctx_id)
+        .await
+        .expect_err("the exit wait times out while the last write is stuck");
+    assert!(
+        matches!(error, crate::context::ContextError::ActorBusy(_)),
+        "the caller gets the typed exit-wait error, got {error:?}"
+    );
+    assert!(
+        gated.has_snapshot(&j.ctx_id).await,
+        "the join's snapshot stays while the removed actor can still write"
+    );
+    let again = j
+        .sup
+        .discard_joined_context(&j.ctx_id)
+        .await
+        .expect_err("a second discard is refused while the first one waits for the exit");
+    assert!(
+        matches!(again, crate::context::ContextError::ActorBusy(_)),
+        "the second discard gets the typed pending error, got {again:?}"
+    );
+
+    gated.release();
+    gated.await_deleted(&j.ctx_id).await;
+    assert!(
+        cached.is_closed(),
+        "the snapshot is deleted only after the removed actor exited"
+    );
+}
+
 /// Panics `held`'s actor through the testing-only seam. The send errors once
 /// the actor has unwound, so its result carries nothing.
 #[cfg(feature = "testing")]

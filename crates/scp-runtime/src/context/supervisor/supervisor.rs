@@ -1267,6 +1267,33 @@ impl std::fmt::Display for JoinFailure {
     }
 }
 
+/// The actor a [`Supervisor::discard_joined_context`] waits for before it
+/// tears the context down.
+#[derive(Clone)]
+enum DiscardedActor {
+    /// The actor the discard removed from the registry.
+    Registered(ContextActorHandle),
+    /// No actor was registered: the actors an earlier despawn removed, read
+    /// under the discard's locks. Each may still run.
+    Departed(Vec<crate::context::actor::handle::DepartingActor>),
+}
+
+impl DiscardedActor {
+    /// Stops the actor (or every departed actor) and waits, with no time
+    /// bound, until its task has ended, so no write it makes lands after the
+    /// teardown's delete.
+    async fn stop_and_await_exit_unbounded(&self) {
+        match self {
+            Self::Registered(handle) => handle.stop_and_await_exit_unbounded().await,
+            Self::Departed(running) => {
+                for departing in running {
+                    departing.stop_and_await_task_end().await;
+                }
+            }
+        }
+    }
+}
+
 /// Clears a [`Supervisor::discard_joined_context`] pending mark on drop, so a
 /// discarding call that ends or is dropped before it hands the exit wait to a
 /// task never leaves the id refused forever.
@@ -7245,7 +7272,9 @@ impl Supervisor {
 
     /// Body of [`Self::await_departed_actors`], for
     /// [`Self::despawn_for_replace`], whose caller holds
-    /// `bootstrap_spawn_lock` without a guard to show for it.
+    /// `bootstrap_spawn_lock` without a guard to show for it, and for
+    /// [`Self::complete_discard`], which holds no lock and relies on the
+    /// discard's pending mark to keep every respawn of the id out.
     async fn wait_for_departed_actors(
         &self,
         context_id: &str,
@@ -7357,9 +7386,10 @@ impl Supervisor {
     /// ZEROIZE on drop when the actor task ends) AND deletes the persisted Class-S snapshot
     /// (`delete_context`).
     ///
-    /// With no actor registered for the id, the call still waits for any actor
-    /// an earlier [`Self::despawn_actor`] removed, before it deletes the
-    /// snapshot, so that actor's post-loop persist cannot re-create it.
+    /// With no actor registered for the id, the call waits in the same way,
+    /// through the same completion path, for every actor an earlier
+    /// [`Self::despawn_actor`] removed, so that actor's post-loop persist
+    /// cannot re-create the snapshot.
     ///
     /// The FFI bridges call this as the compensating teardown when a
     /// post-irreversible-commit join step fails (e.g. a concurrent close/leave
@@ -7412,9 +7442,7 @@ impl Supervisor {
     /// The actor's exit-wait error (the teardown then finishes in the tracked
     /// task), the error from finishing the teardown
     /// (`Self::finish_discard`), or [`ContextError::ActorBusy`] when an
-    /// earlier discard of the id has not finished its teardown, or when an
-    /// actor an earlier despawn removed has not exited within the reply
-    /// bound (the snapshot is then kept).
+    /// earlier discard of the id has not finished its teardown.
     pub async fn discard_joined_context(
         self: &Arc<Self>,
         context_id: &str,
@@ -7437,9 +7465,9 @@ impl Supervisor {
         //    crashed actor gone from the registry and stops
         //    (`respawn_crashed_actor`). A respawn that ran before them
         //    registered its actor first, and this removal takes that actor.
-        let (handle, mark) = {
-            let bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
-            let guard = self.write_lock.lock().await;
+        let (discarded, mark) = {
+            let _bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
+            let _write_guard = self.write_lock.lock().await;
             if self.pending_discards.contains(context_id) {
                 return Err(ContextError::ActorBusy(format!(
                     "discard of joined context '{context_id}': an earlier discard is still \
@@ -7450,44 +7478,75 @@ impl Supervisor {
             if removed.is_some() {
                 self.note_push_routes_changed();
             }
-            let Some((_, handle)) = removed else {
-                // No registered actor, but an earlier `despawn_actor` of the
-                // id can have left its actor running, and that actor's
-                // post-loop persist would re-create the snapshot deleted
-                // below. Wait for it under `bootstrap_spawn_lock` alone, as
-                // every bootstrap does: its TTL self-despawn takes
-                // `write_lock`. Then tear down under both locks, so no
-                // respawn of the id runs between the registry check and the
-                // snapshot delete.
-                drop(guard);
-                self.await_departed_actors(context_id, DepartedWait::Await, &bootstrap_guard)
-                    .await?;
-                let guard = self.write_lock.lock().await;
-                self.finish_discard_locked(context_id, &bootstrap_guard, &guard)
-                    .await?;
-                return Ok(false);
+            // With no registered actor, an earlier `despawn_actor` of the id
+            // can have left its actor running, and that actor's post-loop
+            // persist would re-create the snapshot step 3 deletes, so the
+            // discard waits for it exactly as it waits for a registered one.
+            let discarded = match removed {
+                Some((_, handle)) => DiscardedActor::Registered(handle),
+                None => DiscardedActor::Departed(
+                    self.departing_actors
+                        .get(context_id)
+                        .map(|entry| entry.value().clone())
+                        .unwrap_or_default(),
+                ),
             };
             self.pending_discards.insert(context_id.to_owned());
             (
-                handle,
+                discarded,
                 PendingDiscardMark {
                     supervisor: self,
                     context_id,
                 },
             )
         };
-        // 2. Stop the actor and wait for its run loop to return, so its
-        //    post-loop drain persist lands before step 3.
-        let Err(wait_error) = handle.shutdown_and_await_exit().await else {
+        let registered = matches!(discarded, DiscardedActor::Registered(_));
+        // 2–3. Both locks are released here, and the pending mark keeps every
+        //    respawn of the id out until the teardown finishes.
+        self.complete_discard(context_id, discarded, mark).await?;
+        Ok(registered)
+    }
+
+    /// Steps 2 and 3 of [`Self::discard_joined_context`], the one completion
+    /// path for a registered actor the discard removed and for actors an
+    /// earlier despawn removed. The caller holds no lock: the departing actor
+    /// can need `write_lock` before it exits (a TTL exit's self-despawn).
+    ///
+    /// Stops the actor and waits, bounded by
+    /// [`REPLY_TIMEOUT`](crate::context::actor::REPLY_TIMEOUT), for its task to
+    /// end, then finishes the teardown ([`Self::finish_discard`]) and clears
+    /// `mark`. When the wait times out, a task on the Supervisor's tracker
+    /// takes the mark, waits for the exit with no bound and then finishes the
+    /// teardown ([`finish_discard_after_exit`]). Once shutdown has begun the
+    /// tracker takes no task, so this finishes the teardown inline and returns
+    /// only after the actor has exited.
+    ///
+    /// # Errors
+    ///
+    /// The bounded wait's error, after the teardown moved to the tracked task
+    /// or finished inline, or the error from [`Self::finish_discard`].
+    async fn complete_discard(
+        self: &Arc<Self>,
+        context_id: &str,
+        discarded: DiscardedActor,
+        mark: PendingDiscardMark<'_>,
+    ) -> Result<(), ContextError> {
+        let waited = match &discarded {
+            DiscardedActor::Registered(handle) => handle.shutdown_and_await_exit().await,
+            DiscardedActor::Departed(_) => self
+                .wait_for_departed_actors(context_id, DepartedWait::Await)
+                .await
+                .map(|_ended| ()),
+        };
+        let Err(wait_error) = waited else {
             let finished = self.finish_discard(context_id).await;
             drop(mark);
-            finished?;
-            return Ok(true);
+            return finished;
         };
         let supervisor = Arc::downgrade(self);
         let persistence = self.persistence_ref().cloned();
         let id = context_id.to_owned();
-        let moved = handle.clone();
+        let moved = discarded.clone();
         let spawned = self.spawn_tracked("discard_joined_context exit wait", async move {
             moved.stop_and_await_exit_unbounded().await;
             finish_discard_after_exit(&supervisor, persistence.as_ref(), &id).await;
@@ -7497,7 +7556,7 @@ impl Supervisor {
             std::mem::forget(mark);
         } else {
             // Shutdown has begun and the tracker takes no task: finish inline.
-            handle.stop_and_await_exit_unbounded().await;
+            discarded.stop_and_await_exit_unbounded().await;
             let finished = self.finish_discard(context_id).await;
             drop(mark);
             finished?;
