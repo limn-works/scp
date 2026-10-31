@@ -7025,7 +7025,10 @@ impl Supervisor {
     /// join of the id has not committed or rolled back its first state it
     /// returns [`ContextError::ActorBusy`]; both leave the poison record
     /// untouched. The errors of loading the wrapping key of `owning_did`
-    /// return before the poison record is touched.
+    /// return before the poison record is touched. When an actor a despawn
+    /// removed for the id is still running after
+    /// [`REPLY_TIMEOUT`](crate::context::actor::REPLY_TIMEOUT), it returns
+    /// [`ContextError::ActorBusy`] and the poison record stands.
     pub async fn clear_poison(
         self: &Arc<Self>,
         ctx_id: &str,
@@ -7048,6 +7051,14 @@ impl Supervisor {
         // poison record as it found it.
         self.refuse_pending_discard(ctx_id, &bootstrap_guard)?;
         self.refuse_pending_first_state(ctx_id, &bootstrap_guard)?;
+        // Remove any registered handle and wait for every removed actor of the
+        // id to end its task BEFORE touching the window. A wait that times out
+        // returns `ActorBusy` with the poison record standing, so the context
+        // never reads as having neither poison nor an actor. The respawn below
+        // then finds no handle to remove and no running actor to wait for.
+        self.despawn_actor(ctx_id).await;
+        self.await_departed_actors(ctx_id, DepartedWait::Await, &bootstrap_guard)
+            .await?;
         // Clear the window so the single retry starts from a clean budget.
         // `entry().or_default()` then `clear()` resets both the deque and the
         // sticky flag, and the same guard sets the respawn marker, so no read
@@ -29472,6 +29483,53 @@ mod tests {
             sup.departing_actors.get(&ctx_key).map(|e| e.len()),
             Some(1),
             "a record whose task still runs is kept"
+        );
+    }
+
+    /// A `clear_poison` whose wait for a removed actor times out leaves the
+    /// context Poisoned (ADR-049 §10): it returns `ActorBusy` before it
+    /// clears the window, so the context never reads as having neither
+    /// poison nor an actor. Once the removed actor ends, a retry clears the
+    /// poison and attempts the respawn.
+    #[tokio::test(start_paused = true)]
+    async fn clear_poison_whose_departed_wait_times_out_stays_poisoned() {
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
+        let sup =
+            supervisor_with_clock_and_persistence(clock_dyn, Box::new(MapPersistence::default()));
+        let ctx_key = hex::encode([0xE2u8; 32]);
+        let owning = DID(format!("did:scp:{ctx_key}"));
+        sup.crash_windows
+            .entry(ctx_key.clone())
+            .or_default()
+            .poisoned = true;
+        let (departing, task, _inbox) = tracked_departing_actor();
+        sup.track_departing_actor(&ctx_key, departing);
+
+        let cleared = sup.clear_poison(&ctx_key, &owning).await;
+        assert!(
+            matches!(cleared, Err(ContextError::ActorBusy(_))),
+            "a removed actor that outlives the bound makes clear_poison busy, got {cleared:?}"
+        );
+        assert!(
+            sup.is_context_poisoned(&ctx_key),
+            "the poison record must stand after a timed-out wait"
+        );
+        let read = sup.read_context_state_checked(&ctx_key).await;
+        assert!(
+            matches!(
+                read,
+                Ok(Some(scp_protocol::context::ContextState::Poisoned))
+            ),
+            "a timed-out clear_poison must read as Poisoned, got {read:?}"
+        );
+
+        // The removed actor ends: the retry clears the poison and reaches the
+        // respawn, which fails here only because no snapshot is stored.
+        drop(task);
+        let retried = sup.clear_poison(&ctx_key, &owning).await;
+        assert!(
+            matches!(retried, Err(ContextError::ActorCrashed(_))),
+            "the retry reaches the respawn, got {retried:?}"
         );
     }
 
