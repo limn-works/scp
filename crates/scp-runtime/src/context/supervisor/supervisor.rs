@@ -7157,6 +7157,32 @@ impl Supervisor {
         true
     }
 
+    /// Test fixture: [`Self::despawn_actor`], then the wait every bootstrap
+    /// runs ([`Self::wait_for_departed_actors`]) until the removed actor's
+    /// task has ended. A test that edits the context's storage after a
+    /// despawn calls this. The removed actor keeps running while another
+    /// clone of its handle lives, such as the one the gauge refresh that
+    /// create starts holds while it waits for a reply. The next bootstrap's
+    /// wait then stops it, and the stop marks it dirty, so its final drain
+    /// writes its snapshot over the edit.
+    ///
+    /// Returns what [`Self::despawn_actor`] returns.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::ActorBusy`] when the removed actor has not exited
+    /// within [`REPLY_TIMEOUT`](crate::context::actor::REPLY_TIMEOUT).
+    #[cfg(test)]
+    pub(crate) async fn despawn_actor_and_await_exit(
+        &self,
+        context_id: &str,
+    ) -> Result<bool, ContextError> {
+        let removed = self.despawn_actor(context_id).await;
+        self.wait_for_departed_actors(context_id, DepartedWait::Await)
+            .await?;
+        Ok(removed)
+    }
+
     /// Records `departing` for `context_id` until its task ends. The task can
     /// end after
     /// [`departure`](crate::context::actor::handle::ContextActorHandle::departure) read it as running and
@@ -7331,6 +7357,10 @@ impl Supervisor {
     /// ZEROIZE on drop when the actor task ends) AND deletes the persisted Class-S snapshot
     /// (`delete_context`).
     ///
+    /// With no actor registered for the id, the call still waits for any actor
+    /// an earlier [`Self::despawn_actor`] removed, before it deletes the
+    /// snapshot, so that actor's post-loop persist cannot re-create it.
+    ///
     /// The FFI bridges call this as the compensating teardown when a
     /// post-irreversible-commit join step fails (e.g. a concurrent close/leave
     /// removed the bridge state before the authenticated ceiling could be
@@ -7382,7 +7412,9 @@ impl Supervisor {
     /// The actor's exit-wait error (the teardown then finishes in the tracked
     /// task), the error from finishing the teardown
     /// (`Self::finish_discard`), or [`ContextError::ActorBusy`] when an
-    /// earlier discard of the id has not finished its teardown.
+    /// earlier discard of the id has not finished its teardown, or when an
+    /// actor an earlier despawn removed has not exited within the reply
+    /// bound (the snapshot is then kept).
     pub async fn discard_joined_context(
         self: &Arc<Self>,
         context_id: &str,
@@ -7419,9 +7451,18 @@ impl Supervisor {
                 self.note_push_routes_changed();
             }
             let Some((_, handle)) = removed else {
-                // No actor to wait for: tear down under the locks already
-                // held, so no respawn of the id runs between the registry
-                // check and the snapshot delete.
+                // No registered actor, but an earlier `despawn_actor` of the
+                // id can have left its actor running, and that actor's
+                // post-loop persist would re-create the snapshot deleted
+                // below. Wait for it under `bootstrap_spawn_lock` alone, as
+                // every bootstrap does: its TTL self-despawn takes
+                // `write_lock`. Then tear down under both locks, so no
+                // respawn of the id runs between the registry check and the
+                // snapshot delete.
+                drop(guard);
+                self.await_departed_actors(context_id, DepartedWait::Await, &bootstrap_guard)
+                    .await?;
+                let guard = self.write_lock.lock().await;
                 self.finish_discard_locked(context_id, &bootstrap_guard, &guard)
                     .await?;
                 return Ok(false);
@@ -20689,7 +20730,7 @@ mod tests {
             "create persists the creator's relay set, each relay once"
         );
 
-        assert!(sup.despawn_actor(&ctx).await);
+        assert!(sup.despawn_actor_and_await_exit(&ctx).await.unwrap());
         contexts
             .get_mut(&ctx)
             .expect("context persisted")
@@ -20788,7 +20829,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(sup.despawn_actor(&ctx).await);
+        assert!(sup.despawn_actor_and_await_exit(&ctx).await.unwrap());
         contexts
             .get_mut(&ctx)
             .expect("context persisted")
@@ -20811,6 +20852,94 @@ mod tests {
         assert_eq!(
             restored_relay_set(0xC6, &[SPELLING_1, SPELLING_2]).await,
             Some(vec![SPELLING_2.to_owned()])
+        );
+    }
+
+    /// A discard that finds no registered actor still waits for the actor an
+    /// earlier `despawn_actor` removed before it deletes the snapshot. A
+    /// cached clone of the removed actor's handle keeps that actor running;
+    /// without the wait, the clone's later shutdown makes the actor's
+    /// post-loop persist re-create the deleted snapshot, and the discarded
+    /// context comes back on restart.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn discard_with_no_registered_actor_waits_for_the_despawned_actor() {
+        /// [`MapPersistence`] whose delete removes the snapshot.
+        struct DeletingMapPersistence(MapPersistence);
+        #[async_trait::async_trait]
+        impl ContextPersistence for DeletingMapPersistence {
+            async fn persist_context(
+                &self,
+                id: &str,
+                snap: &crate::context::state::ContextSnapshot,
+            ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                self.0.persist_context(id, snap).await
+            }
+            async fn load_context(
+                &self,
+                id: &str,
+            ) -> Result<
+                Option<crate::context::state::ContextSnapshot>,
+                Box<dyn std::error::Error + Send + Sync>,
+            > {
+                self.0.load_context(id).await
+            }
+            async fn delete_context(
+                &self,
+                id: &str,
+            ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                self.0.contexts.remove(id);
+                Ok(())
+            }
+            async fn list_persisted_contexts(
+                &self,
+            ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+                self.0.list_persisted_contexts().await
+            }
+        }
+        let persistence = MapPersistence::default();
+        let contexts = Arc::clone(&persistence.contexts);
+        let sup = supervisor_with_clock_and_persistence(
+            Arc::new(TestClock::new(1_700_000_000)),
+            Box::new(DeletingMapPersistence(persistence)),
+        );
+        let identity = sup.node_identity().unwrap();
+        let ctx = hex::encode([0xC8u8; 32]);
+        sup.create_context(
+            ctx.clone(),
+            scp_protocol::context::ContextParams {
+                ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
+                ..Default::default()
+            },
+            identity,
+            None,
+            vec!["wss://relay-z.example".to_owned()],
+        )
+        .await
+        .unwrap();
+        let cached = sup
+            .actors
+            .get(&ctx)
+            .map(|entry| entry.value().clone())
+            .expect("create registers the actor");
+        assert!(sup.despawn_actor(&ctx).await);
+        assert!(
+            !cached.is_closed(),
+            "the cached clone keeps the actor running"
+        );
+
+        assert!(
+            !sup.discard_joined_context(&ctx).await.unwrap(),
+            "no actor was registered for the id"
+        );
+        assert!(
+            cached.is_closed(),
+            "the discard waited for the actor to exit"
+        );
+        cached.shutdown_and_await_exit().await.unwrap();
+        assert!(
+            !contexts.contains_key(&ctx),
+            "no write of the removed actor lands after the discard's delete"
         );
     }
 
@@ -47796,7 +47925,11 @@ mod streaming_saga_tests {
         let caller_hex = hex::encode(SS_CALLER);
         persistence.persist_caller();
         assert!(
-            window.supervisor.despawn_actor(&caller_hex).await,
+            window
+                .supervisor
+                .despawn_actor_and_await_exit(&caller_hex)
+                .await
+                .unwrap(),
             "the caller actor was resident and is now gone"
         );
         assert!(

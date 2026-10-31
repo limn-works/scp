@@ -169,10 +169,19 @@ class TrustAggregateFfiTest {
      * §17.3): a never-created context surfaces as a generic context error, not
      * the [NO_PARTICIPATION_FACTS_CODE] that [SCP.evaluateTrust] folds into a
      * zeroed record (spec 07 §7.3.2).
+     *
+     * The instance's supervisor starts with its first context, so the test
+     * creates one first; without it the bridge refuses before the supervisor
+     * looks the context up.
      */
     @Test
     fun `participationRecord - a never-created context is an error, never the empty-log code`() {
         runBlocking {
+            val creator = scp.identityCreateInMemory()
+            scp.contextCreate(
+                creator,
+                paramsRequiring(listOf(CapabilityRequirement.SelfAttested(capability = schemaUri))),
+            )
             val error =
                 assertFailsWith<ScpException.Context> {
                     scp.participationRecord(contextId = "ctx-never-created", subjectDid = "did:dht:zSubject")

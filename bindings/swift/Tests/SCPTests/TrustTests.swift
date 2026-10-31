@@ -216,7 +216,14 @@ final class ParticipationRecordBridgeTests: XCTestCase {
     /// §17.3): a never-created context surfaces as a generic context error, not
     /// the `noParticipationFactsCode` that `evaluateTrust` folds into a zeroed
     /// record (spec 07 §7.3.2).
+    ///
+    /// The instance's supervisor starts with its first context, so the test
+    /// creates one first; without it the bridge refuses before the supervisor
+    /// looks the context up.
     func testNeverCreatedContextIsAnErrorNeverTheEmptyLogCode() async throws {
+        _ = try await contextRequiring(scp, [
+            .selfAttested(capability: "scp:capability:messages-write/v1")
+        ])
         do {
             _ = try await scp.participationRecord(
                 contextId: "ctx-never-created",
