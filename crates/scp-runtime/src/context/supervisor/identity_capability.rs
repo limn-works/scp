@@ -164,7 +164,6 @@ impl OwnedIdentityDid {
     /// reconstruct the proof — `OwnedIdentityDid` has no `From<&DID>` and
     /// no public constructor. Handlers may use this to build outgoing
     /// envelopes that need the owning identity's DID string.
-    #[allow(dead_code)] // consumed by SupervisorHandle per-identity methods landing in PR-3b
     #[must_use]
     pub(in crate::context) const fn as_did(&self) -> &DID {
         &self.did

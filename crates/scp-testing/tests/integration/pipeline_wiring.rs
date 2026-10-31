@@ -220,6 +220,17 @@ const PSEUDONYM_ROTATION_SRC: &str =
 // the PUSH-013 push routing-ID query (§10.7.1).
 const HANDLERS_PUSH_SRC: &str =
     include_str!("../../../../crates/scp-runtime/src/context/actor/handlers/push.rs");
+const HANDLERS_LOG_UNIT_SRC: &str =
+    include_str!("../../../../crates/scp-runtime/src/context/actor/handlers/log_unit.rs");
+// Streaming settlement adapter source — owns `ActorOutletInvokedEventSink::record`,
+// the streaming close sink pinned by
+// `log_unit_writers_reach_the_pending_queue_through_the_actor_mailbox`.
+const OUTLETS_STREAM_SETTLEMENT_ADAPTER_SRC: &str =
+    include_str!("../../../../crates/scp-runtime/src/context/outlets/stream_settlement_adapter.rs");
+// Log-unit helpers source — owns the leaf planners, pinned by
+// `log_unit_writers_reach_the_pending_queue_through_the_actor_mailbox`.
+const LOG_UNIT_HELPERS_SRC: &str =
+    include_str!("../../../../crates/scp-runtime/src/context/log_unit_helpers.rs");
 // Push helpers source — owns `push_helpers::wake_target`, the push-wake pull
 // target (ADR-029 §2). Pinned by `push_wake_targets_reach_push_helpers`.
 const PUSH_HELPERS_SRC: &str =
@@ -1537,6 +1548,113 @@ fn push_routing_ids_reach_push_helpers_through_the_actor_mailbox() {
             "push_helpers::push_routes(state)"
         ),
         "handlers::push::dispatch must answer PushCommand::Routes from push_helpers::push_routes"
+    );
+}
+
+// Spec 17 §17.3 "Event log write failures": a writer outside a context's actor
+// (the streaming close sink, the cross-context bridge, the streaming saga's
+// seal task and both of its recovery paths) queues its leaves as a pending log
+// unit through `Supervisor::send_log_unit` → `dispatch_log_unit_command` →
+// actor mailbox → `handlers::log_unit::dispatch`, which enqueues them in a
+// persisted commit.
+#[test]
+fn log_unit_writers_reach_the_pending_queue_through_the_actor_mailbox() {
+    assert!(
+        fn_body_contains(
+            SUPERVISOR_SRC,
+            "send_log_unit",
+            "dispatch_log_unit_command("
+        ),
+        "Supervisor::send_log_unit must send through dispatch_log_unit_command"
+    );
+    assert!(
+        fn_body_contains(
+            SUPERVISOR_SRC,
+            "dispatch_log_unit_command",
+            "dispatch_via_mailbox(&actor, ContextCommand::LogUnit(cmd))"
+        ),
+        "dispatch_log_unit_command must send ContextCommand::LogUnit through the actor mailbox"
+    );
+    assert!(
+        fn_body_contains(
+            ACTOR_MOD_SRC,
+            "dispatch_state",
+            "handlers::log_unit::dispatch("
+        ),
+        "the actor's dispatch_state must route ContextCommand::LogUnit to handlers::log_unit::dispatch"
+    );
+    assert!(
+        fn_body_contains(
+            HANDLERS_LOG_UNIT_SRC,
+            "enqueue",
+            "enqueue_counted_log_unit("
+        ) && fn_body_contains(HANDLERS_LOG_UNIT_SRC, "dispatch", "enqueue(cell, deps"),
+        "handlers::log_unit::dispatch must enqueue the leaves as a pending log unit"
+    );
+    assert!(
+        fn_body_contains(HANDLERS_LOG_UNIT_SRC, "enqueue", "commit_class_s_restore("),
+        "handlers::log_unit::dispatch must enqueue inside a persisted Class-S commit"
+    );
+    assert!(
+        fn_body_contains(
+            SUPERVISOR_SRC,
+            "enqueue_streaming_outlet_invoked_unit",
+            "self.send_log_unit("
+        ),
+        "the streaming close record must be queued through send_log_unit"
+    );
+    assert!(
+        fn_body_contains(
+            OUTLETS_STREAM_SETTLEMENT_ADAPTER_SRC,
+            "record",
+            ".enqueue_streaming_outlet_invoked_unit("
+        ),
+        "ActorOutletInvokedEventSink::record must queue the streaming close record through \
+         enqueue_streaming_outlet_invoked_unit"
+    );
+    assert!(
+        fn_body_contains(
+            SUPERVISOR_SRC,
+            "enqueue_streaming_outlet_invoked_unit",
+            "plan_outlet_invoked_leaf("
+        ) && fn_body_contains(
+            LOG_UNIT_HELPERS_SRC,
+            "plan_outlet_invoked_verified_leaf",
+            "plan_outlet_invoked_leaf("
+        ),
+        "both OutletInvoked writers must encode through plan_outlet_invoked_leaf"
+    );
+    for writer in ["send_streaming_saga_a_unit", "send_cross_context_a_unit"] {
+        assert!(
+            fn_body_contains(OUTLETS_INVOKE_SRC, writer, ".send_log_unit("),
+            "{writer} must queue its leaf through send_log_unit"
+        );
+    }
+    assert!(
+        fn_body_contains(
+            OUTLETS_INVOKE_SRC,
+            "run_streaming_saga_seal_task",
+            "send_streaming_saga_a_unit("
+        ),
+        "run_streaming_saga_seal_task must queue the A-side leaf through send_streaming_saga_a_unit"
+    );
+    for caller in [
+        "recover_streaming_saga_truncated_close",
+        "recover_streaming_committing_entry",
+        "complete_unsettled_streaming_saga",
+    ] {
+        assert!(
+            fn_body_contains(SUPERVISOR_SRC, caller, "send_streaming_saga_a_unit("),
+            "{caller} must queue the A-side leaf through send_streaming_saga_a_unit"
+        );
+    }
+    assert!(
+        fn_body_contains(
+            OUTLETS_INVOKE_SRC,
+            "invoke_outlet_cross_context",
+            "send_cross_context_a_unit("
+        ),
+        "the cross-context bridge's close must queue A's record through send_cross_context_a_unit"
     );
 }
 
@@ -8204,14 +8322,14 @@ fn uniffi_saga_export_wires_binding_chokepoint_and_producer() {
 #[test]
 fn ac8_streaming_saga_seal_commits_once_no_per_chunk_2pc() {
     // Bound the seal-task function body: from its `fn` to the next item
-    // (`record_streaming_saga_a_event`, which immediately follows it).
+    // (`send_streaming_saga_a_unit`, which immediately follows it).
     let fn_start = OUTLETS_INVOKE_SRC
         .find("pub(crate) async fn run_streaming_saga_seal_task")
         .expect("run_streaming_saga_seal_task must exist in invoke.rs");
     let after_fn = &OUTLETS_INVOKE_SRC[fn_start..];
     let fn_len = after_fn
-        .find("async fn record_streaming_saga_a_event")
-        .expect("record_streaming_saga_a_event follows the seal task");
+        .find("async fn send_streaming_saga_a_unit")
+        .expect("send_streaming_saga_a_unit follows the seal task");
     // Strip `//` line comments (doc/rationale references to the message names are
     // not code) before matching — mirrors the gating gate's comment-stripping, so
     // the guard asserts on the actual dispatch code, not prose.
@@ -10076,4 +10194,401 @@ fn reached_only_by_tests<'a>(name: &str, others: impl Iterator<Item = &'a String
         }
     }
     true
+}
+
+/// Methods named `append_*` that write no leaf to a context's event log, with
+/// the store each one writes. The scan counts every other `.append_*(` call.
+const NON_EVENT_LOG_APPENDS: &[(&str, &str)] = &[
+    ("append_journal", "the saga journal store"),
+    ("append_block_list_event", "the identity store's block list"),
+    (
+        "append_log_event",
+        "the in-browser client's in-memory context state (ADR-057), not the runtime provider",
+    ),
+    ("append_log", "the scp-platform syncable change log"),
+    ("append_entry", "the scp-platform key custody file"),
+    (
+        "append_entry_holding_the_write_locks",
+        "the scp-platform key custody file",
+    ),
+    ("append_entry_by_text", "an OpenSSL X.509 name"),
+    ("append_own_leaf_node", "the MLS provider's storage"),
+];
+
+/// Free functions that write leaves to a context's event log. None exists
+/// today: every write goes through a `.append_*(` method call.
+const EVENT_LOG_APPEND_FREE_FNS: &[&str] = &[];
+
+/// The byte offset of each call in `code` that writes a leaf to a context's
+/// event log: every `.append_<name>(` method call whose name
+/// [`NON_EVENT_LOG_APPENDS`] does not list, and every call of a free function
+/// on [`EVENT_LOG_APPEND_FREE_FNS`]. A wrapper that forwards to the provider is
+/// a writer too, so its callers count.
+fn event_log_append_calls(code: &str) -> Vec<usize> {
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    let mut calls = Vec::new();
+    for (at, _) in code.match_indices(".append_") {
+        let rest = &code[at + 1..];
+        let len = rest.find(|c: char| !ident(c)).unwrap_or(rest.len());
+        let name = &rest[..len];
+        let called = rest[len..].starts_with('(') || rest[len..].starts_with("::<");
+        if called && !NON_EVENT_LOG_APPENDS.iter().any(|(n, _)| *n == name) {
+            calls.push(at);
+        }
+    }
+    for free in EVENT_LOG_APPEND_FREE_FNS {
+        for (at, _) in code.match_indices(free) {
+            let before = code[..at].chars().next_back();
+            let after = &code[at + free.len()..];
+            let definition = code[..at].trim_end().ends_with("fn");
+            if before.is_none_or(|c| !(ident(c) || c == '.'))
+                && after.starts_with('(')
+                && !definition
+            {
+                calls.push(at);
+            }
+        }
+    }
+    calls
+}
+
+/// Each shipped function that may write a leaf to a context's event log, once
+/// per call it makes, with the reason it may.
+///
+/// Spec 17 §17.3 "Event log write failures": a leaf written after an
+/// irreversible step goes into a pending log unit in the step's commit, and
+/// only the drain writes it. Every other append is either the provider or
+/// builder layer the drain and the fail-closed appends go through, or a
+/// fail-closed append that runs before its step.
+const EVENT_LOG_APPEND_ALLOWLIST: &[(&str, &str, &str)] = &[
+    // The drain.
+    (
+        "scp-runtime/src/context/log_unit_helpers.rs",
+        "drain_queue",
+        "the pending-unit drain",
+    ),
+    // The provider and the builder trait.
+    (
+        "scp-runtime/src/store/event_log.rs",
+        "append_event_full",
+        "the event-log store",
+    ),
+    (
+        "scp-runtime/src/context/builder.rs",
+        "append_unit",
+        "the builder trait",
+    ),
+    (
+        "scp-runtime/src/context/builder.rs",
+        "append_context_event",
+        "the builder trait",
+    ),
+    (
+        "scp-runtime/src/context/builder.rs",
+        "append_context_event_with_payload",
+        "the builder trait",
+    ),
+    (
+        "scp-runtime/src/context/builder.rs",
+        "append_membership_change_leaf",
+        "the builder trait",
+    ),
+    // Fail-closed appends that run before their step.
+    (
+        "scp-runtime/src/context/builder.rs",
+        "create_context",
+        "a fail-closed append",
+    ),
+    (
+        "scp-runtime/src/context/builder.rs",
+        "create_context",
+        "a fail-closed append",
+    ),
+    (
+        "scp-runtime/src/context/builder.rs",
+        "create_context",
+        "a fail-closed append, the founder's `MemberJoined`",
+    ),
+    (
+        "scp-runtime/src/context/ttl_close_helpers.rs",
+        "extend_ttl_deadline_and_record",
+        "fail-closed before the step (the bilateral reset)",
+    ),
+    // A seam that only the `testing` feature compiles.
+    (
+        "scp-runtime/src/context/supervisor/supervisor.rs",
+        "test_append_event_log",
+        "a testing-feature seam",
+    ),
+];
+
+/// Spec 17 §17.3 "Event log write failures": no shipped function writes a
+/// leaf to a context's event log unless [`EVENT_LOG_APPEND_ALLOWLIST`] names
+/// it, once per call. A call outside the allowlist, a second call in a listed
+/// function, and an entry whose call is gone all fail.
+///
+/// The scan covers each shipped crate's `src` tree, minus test-gated `mod`
+/// blocks and the files test-gated `mod` declarations load, and minus the
+/// crates on [`TEST_ONLY_CRATES`].
+#[test]
+fn no_shipped_source_appends_outside_the_allowlist() {
+    let sources = shipped_crate_sources();
+    let scanned_runtime = sources
+        .iter()
+        .filter(|(rel, _)| rel.starts_with("scp-runtime/src/"))
+        .count();
+    assert!(
+        scanned_runtime > 100,
+        "the scan must read the scp-runtime sources, read {scanned_runtime}"
+    );
+    let mismatches = event_log_append_mismatches(&sources, EVENT_LOG_APPEND_ALLOWLIST);
+    assert!(
+        mismatches.is_empty(),
+        "shipped event-log appends differ from the allowlist; a leaf written after an \
+         irreversible step goes into a pending log unit instead (spec 17 §17.3): {mismatches:#?}"
+    );
+}
+
+/// The append scan's must-fail companion: a call planted in a temporary copy
+/// of the scanned sources fails the scan, in a new function and as a second
+/// call in a listed function; the same call in a test-gated module does not.
+#[test]
+fn the_event_log_append_scan_reports_a_planted_call() {
+    let sources = shipped_crate_sources();
+    assert!(
+        event_log_append_mismatches(&sources, EVENT_LOG_APPEND_ALLOWLIST).is_empty(),
+        "the unplanted copy passes"
+    );
+    let planted_in = "scp-runtime/src/context/messaging_helpers.rs";
+    let plant = |extra: &str| -> Vec<(String, String)> {
+        let mut copy = sources.clone();
+        let entry = copy
+            .iter_mut()
+            .find(|(rel, _)| rel == planted_in)
+            .expect("the scan reads the messaging helpers");
+        entry.1.push_str(&strip_non_code_keeping_cfg(extra));
+        copy
+    };
+    // A provider call, a builder wrapper, a supervisor wrapper, and a method
+    // no list names yet.
+    for call in [
+        "log.append_event(a, b)",
+        "log.append_unit(a, b)",
+        "log.append_membership_change_leaf(a, b)",
+        "sup.append_streaming_outlet_invoked_event(a, b)",
+        "log.append_some_new_leaf(a)",
+    ] {
+        let planted = plant(&format!(
+            "\nasync fn planted_after_send(log: &L) {{ let _ = {call}.await; }}\n"
+        ));
+        let found = event_log_append_mismatches(&planted, EVENT_LOG_APPEND_ALLOWLIST);
+        assert_eq!(
+            found,
+            vec![format!(
+                "{planted_in}::planted_after_send: 1 call(s), allowlisted 0"
+            )],
+            "a planted `{call}` call is reported"
+        );
+    }
+    for (name, _) in NON_EVENT_LOG_APPENDS {
+        let planted = plant(&format!(
+            "\nasync fn planted_other_store(s: &S) {{ let _ = s.{name}(a).await; }}\n"
+        ));
+        assert!(
+            event_log_append_mismatches(&planted, EVENT_LOG_APPEND_ALLOWLIST).is_empty(),
+            "`{name}` writes no event-log leaf"
+        );
+    }
+    let gated = plant(
+        "\n#[cfg(test)]\nmod planted_tests { async fn t(log: &L) { log.append_event(a).await; } }\n",
+    );
+    assert!(
+        event_log_append_mismatches(&gated, EVENT_LOG_APPEND_ALLOWLIST).is_empty(),
+        "a call in a test-gated module is not shipped"
+    );
+
+    let mut nested = sources.clone();
+    let drain = nested
+        .iter_mut()
+        .find(|(rel, _)| rel == "scp-runtime/src/context/log_unit_helpers.rs")
+        .expect("the scan reads the drain");
+    let at = drain
+        .1
+        .find("fn drain_queue")
+        .expect("the drain is defined");
+    let open = at + drain.1[at..].find('{').expect("the drain has a body") + 1;
+    drain.1.insert_str(open, " log.append_unit(a); ");
+    assert_eq!(
+        event_log_append_mismatches(&nested, EVENT_LOG_APPEND_ALLOWLIST),
+        vec![
+            "scp-runtime/src/context/log_unit_helpers.rs::drain_queue: 2 call(s), allowlisted 1"
+                .to_owned()
+        ],
+        "a second call in a listed function is reported"
+    );
+
+    let stale: Vec<(&str, &str, &str)> = EVENT_LOG_APPEND_ALLOWLIST
+        .iter()
+        .copied()
+        .chain([("scp-runtime/src/context/ttl.rs", "gone", "a removed site")])
+        .collect();
+    assert_eq!(
+        event_log_append_mismatches(&sources, &stale),
+        vec!["scp-runtime/src/context/ttl.rs::gone: 0 call(s), allowlisted 1".to_owned()],
+        "an entry whose call is gone is reported"
+    );
+}
+
+/// Each shipped source file as (path under `crates/`, its
+/// [`strip_non_code_keeping_cfg`] output), skipping the crates on
+/// [`TEST_ONLY_CRATES`] and the files a test-gated `mod name;` loads.
+fn shipped_crate_sources() -> Vec<(String, String)> {
+    let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("scp-testing sits under crates/");
+    let mut crate_dirs = Vec::new();
+    for krate in std::fs::read_dir(crates)
+        .expect("crates/ is readable")
+        .flatten()
+    {
+        let dir = krate.path();
+        if dir.join("Cargo.toml").is_file() {
+            crate_dirs.push(dir.clone());
+        }
+        if let Ok(nested) = std::fs::read_dir(&dir) {
+            for sub in nested.flatten() {
+                if sub.path().join("Cargo.toml").is_file() {
+                    crate_dirs.push(sub.path());
+                }
+            }
+        }
+    }
+    let mut files = Vec::new();
+    for dir in &crate_dirs {
+        let manifest =
+            std::fs::read_to_string(dir.join("Cargo.toml")).expect("a manifest is readable");
+        let name = manifest_package_name(&manifest).expect("a manifest names its package");
+        if !TEST_ONLY_CRATES.contains(&name.as_str()) {
+            collect_rust_files(&dir.join("src"), &mut files);
+        }
+    }
+    let read: Vec<(std::path::PathBuf, String, String)> = files
+        .into_iter()
+        .map(|file| {
+            let src = std::fs::read_to_string(&file).expect("a source file is readable");
+            let code = strip_non_code_keeping_cfg(&src);
+            (file, src, code)
+        })
+        .collect();
+    let test_files: std::collections::HashSet<std::path::PathBuf> = read
+        .iter()
+        .flat_map(|(file, src, code)| test_gated_mod_files(file, src, code))
+        .collect();
+    let mut out: Vec<(String, String)> = read
+        .into_iter()
+        .filter(|(file, _, _)| !test_files.contains(file))
+        .map(|(file, _, code)| {
+            let rel = file
+                .strip_prefix(crates)
+                .expect("a source file sits under crates/")
+                .to_string_lossy()
+                .replace('\\', "/");
+            (rel, code)
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Every (file, function) whose count of [`event_log_append_calls`] in
+/// shipped code differs from its count of `allowlist` entries, as
+/// `"file::fn: N call(s), allowlisted M"`, sorted. A call outside any
+/// function counts against the function name `<item>`.
+fn event_log_append_mismatches(
+    sources: &[(String, String)],
+    allowlist: &[(&str, &str, &str)],
+) -> Vec<String> {
+    let mut found: std::collections::BTreeMap<(String, String), usize> =
+        std::collections::BTreeMap::new();
+    for (rel, code) in sources {
+        let shipped = without_test_gated_mod_blocks(code);
+        let bodies = fn_bodies(&shipped);
+        for at in event_log_append_calls(&shipped) {
+            let owner = bodies
+                .iter()
+                .filter(|(open, end, _)| *open < at && at < *end)
+                .max_by_key(|(open, _, _)| *open)
+                .map_or("<item>", |(_, _, name)| *name);
+            *found.entry((rel.clone(), owner.to_owned())).or_default() += 1;
+        }
+    }
+    let mut allowed: std::collections::BTreeMap<(String, String), usize> =
+        std::collections::BTreeMap::new();
+    for (file, func, _) in allowlist {
+        *allowed
+            .entry(((*file).to_owned(), (*func).to_owned()))
+            .or_default() += 1;
+    }
+    let keys: std::collections::BTreeSet<&(String, String)> =
+        found.keys().chain(allowed.keys()).collect();
+    keys.into_iter()
+        .filter_map(|key| {
+            let calls = found.get(key).copied().unwrap_or(0);
+            let listed = allowed.get(key).copied().unwrap_or(0);
+            (calls != listed).then(|| {
+                format!(
+                    "{}::{}: {calls} call(s), allowlisted {listed}",
+                    key.0, key.1
+                )
+            })
+        })
+        .collect()
+}
+
+/// Each `fn name` with a body in `code`: (byte of its opening `{`, byte past
+/// its closing `}`, name). A declaration that ends in `;` has no body.
+fn fn_bodies(code: &str) -> Vec<(usize, usize, &str)> {
+    let mut bodies = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = code[from..].find("fn ") {
+        let at = from + rel;
+        from = at + 3;
+        let boundary = code[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+        if !boundary {
+            continue;
+        }
+        let rest = &code[at + 3..];
+        let len = rest
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        if len == 0 {
+            continue;
+        }
+        let name = &rest[..len];
+        let sig = at + 3 + len;
+        // A `;` inside the signature's brackets, as in `&[u8; 32]`, does not
+        // end the item.
+        let mut depth = 0usize;
+        let Some(stop) = code[sig..].find(|c: char| {
+            match c {
+                '(' | '[' => depth += 1,
+                ')' | ']' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+            depth == 0 && (c == '{' || c == ';')
+        }) else {
+            continue;
+        };
+        let open = sig + stop;
+        if !code[open..].starts_with('{') {
+            continue;
+        }
+        if let Some(body) = matching_brace_end(&code[open..]) {
+            bodies.push((open, open + body, name));
+        }
+    }
+    bodies
 }

@@ -1395,7 +1395,6 @@ impl UniffiBridgeInstance {
     /// Panics when the durable UCAN state cannot be rebuilt, which fails the
     /// calling test.
     #[cfg(test)]
-    #[allow(clippy::expect_used)]
     pub(crate) fn ensure_ucan_registered_for_test(&self, context_id: &str) {
         self.ensure_ucan_registered(context_id)
             .expect("rebuilding the durable UCAN state must succeed in a test");

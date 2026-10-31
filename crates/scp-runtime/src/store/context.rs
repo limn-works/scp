@@ -1377,6 +1377,8 @@ mod tests {
             revoked_spending_ucan_cids: std::collections::HashSet::new(),
             pending_commits: std::collections::VecDeque::new(),
             commit_fault: None,
+            pending_log_units: std::collections::VecDeque::new(),
+            log_fault: None,
             checkpoint_events_since: 0,
             checkpoint_last_time_secs: 0,
             generation: 0,

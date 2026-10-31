@@ -130,6 +130,9 @@ pub enum ContextCommand {
     /// Push: the routing IDs this device registers for push wakes (§10.7.1).
     /// Read-only, like `Queries`.
     Push(PushCommand),
+    /// Log units: queues event-log records sent by code that runs outside
+    /// this context's actor (spec 17 §17.3 "Event log write failures").
+    LogUnit(LogUnitCommand),
     /// Read-only queries. Handlers MUST NOT mutate state; the actor
     /// takes `&self.state` when dispatching this variant.
     Queries(QueriesCommand),
@@ -2282,6 +2285,59 @@ pub enum PushCommand {
     },
 }
 
+/// See [`ContextCommand::LogUnit`] (spec 17 §17.3 "Event log write
+/// failures").
+pub enum LogUnitCommand {
+    /// Queues `request`'s leaves as one pending log unit in the context's
+    /// fail-closed restore persist, then drains. Replies `Ok` once the unit is
+    /// durable in the queue, or once `dedup` dropped every leaf; replies the
+    /// error when planning, the dedup read, or the persist fails, and the queue
+    /// is then unchanged.
+    Enqueue {
+        /// The records to queue.
+        request: LogUnitRequest,
+        /// Whether to drop a leaf the log or the queue already holds.
+        dedup: UnitDedup,
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+}
+
+/// The records a [`LogUnitCommand::Enqueue`] queues.
+#[derive(Debug, Clone)]
+pub enum LogUnitRequest {
+    /// Leaves the sender planned, each checked against the append's payload
+    /// rules when it was built.
+    Leaves(Vec<crate::context::state::LeafSpec>),
+    /// An `OutletInvoked` record the actor plans through
+    /// [`plan_outlet_invoked_verified_leaf`](crate::context::log_unit_helpers::plan_outlet_invoked_verified_leaf),
+    /// which re-derives the §5.4.5 manifest over `reassembled` and refuses a
+    /// mismatch.
+    VerifiedOutletInvoked {
+        /// The event the sender built at stream close.
+        event: Box<scp_protocol::context::outlets::lifecycle::OutletInvokedEvent>,
+        /// The chunk sequence the receiver reassembled.
+        reassembled: Vec<scp_protocol::context::outlets::stream::OutletStreamChunk>,
+        /// The leaf's actor DID (the stream's invoker).
+        actor_did: String,
+        /// The leaf's timestamp in seconds since the Unix epoch.
+        timestamp_secs: u64,
+    },
+}
+
+/// Whether a [`LogUnitCommand::Enqueue`] drops a record already queued.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnitDedup {
+    /// Queue every leaf.
+    None,
+    /// Queue the leaves once for this saga. The context's durable
+    /// `xctx_committed_invocations` set decides: a saga id already in it drops
+    /// the leaves, and otherwise the persist that queues the leaves inserts
+    /// it. The set outlives the log's checkpoint prune, so a re-send after a
+    /// lost reply, a crash, or a prune lands the record once (spec 17 §17.3).
+    OncePerSaga(crate::context::supervisor::saga_journal::SagaId),
+}
+
 /// See [`ContextCommand::Outlets`]. Real variants cover every public
 /// method on `crate::context::outlets_helpers` EXCEPT
 /// [`Supervisor::invoke_outlet_with_economy`](crate::context::supervisor::Supervisor::invoke_outlet_with_economy)
@@ -3337,8 +3393,9 @@ pub struct StreamSettleApplication {
 /// resolve a `Committing` streaming saga.
 ///
 /// Modeled as an ENUM so illegal states are unrepresentable: only the
-/// [`Unsettled`](Self::Unsettled) case carries the money settlement + generation +
-/// A-leaf (they are meaningless when the witness is absent or already settled), so
+/// [`Unsettled`](Self::Unsettled) case carries the money settlement + generation
+/// (they are meaningless when the witness is absent or already settled), both
+/// witness-present cases carry the A-leaf inputs, so
 /// there is no "present-but-no-generation" or "settled-with-a-pending-settlement"
 /// combination to guard against, and no synthetic sentinel `generation: 0` on the
 /// absent path.
@@ -3351,9 +3408,16 @@ pub enum StreamWitnessRecoveryStatus {
     Absent,
     /// The witness is durably captured AND its `settled` flag is set — the money
     /// move (escrow refund + §7.3.8 counter release) already landed on the first
-    /// settle. Recovery resolves the journal `Committed` idempotently, moving no
-    /// money.
-    Settled,
+    /// settle. Recovery re-sends the A-side leaf, then resolves the journal
+    /// `Committed`, moving no money.
+    Settled {
+        /// The A-side dual-log leaf reconstruction inputs (JCS receipt bytes +
+        /// sealed root + counts + event id). The seal task queues the leaf
+        /// through A's actor before it resolves, and an unreachable A leaves
+        /// the journal `Committing`, so recovery re-sends it with
+        /// `UnitDedup::OncePerSaga` (spec 17 §17.3).
+        a_event: Box<CommitBStreamSettleOutcome>,
+    },
     /// The witness is durably captured but NOT settled — B sealed, then crashed /
     /// was evicted in the seal→settle window, so the money move never ran.
     /// Recovery completes it KEYLESSLY (money ops need no signing key).
@@ -3366,11 +3430,11 @@ pub enum StreamWitnessRecoveryStatus {
         /// rebuilt from the witness's durable fields — the money to move.
         settlement: Box<crate::context::outlets::invoke::StreamSettlement>,
         /// The A-side dual-log leaf reconstruction inputs (JCS receipt bytes +
-        /// sealed root + counts + event id) — `Some` iff the stored receipt parses.
-        /// Recovery records the `CrossContextOutletInvoked` leaf from this so the
-        /// dual-log is completed even if the seal task crashed before recording it
-        /// (SCP-OUT-046 #135; best-effort, convergent leaf).
-        a_event: Option<Box<CommitBStreamSettleOutcome>>,
+        /// sealed root + counts + event id). Recovery re-sends the
+        /// `CrossContextOutletInvoked` leaf from this with
+        /// `UnitDedup::OncePerSaga`, so the dual-log is completed even if the
+        /// seal task crashed before queueing it (SCP-OUT-046; spec 17 §17.3).
+        a_event: Box<CommitBStreamSettleOutcome>,
     },
 }
 

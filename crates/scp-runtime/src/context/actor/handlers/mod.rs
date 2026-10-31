@@ -40,6 +40,7 @@ pub mod economy;
 pub mod governance;
 pub mod lifecycle;
 pub mod lifecycle_control;
+pub mod log_unit;
 pub mod messaging;
 pub mod outlets;
 pub mod push;

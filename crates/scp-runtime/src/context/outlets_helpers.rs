@@ -152,6 +152,13 @@ pub struct OutletEconomyTicket {
     escrow: Option<PreparedAction>,
     policy_for_capture: Option<scp_protocol::economy::types::EconomicPolicy>,
     metrics_for_capture: ObservableMetrics,
+    /// The consequence rules and the log read before the outlet ran, for the
+    /// evaluation after it (spec 17 §17.3 "Event log write failures").
+    consequence_evidence: crate::context::governance_logic::PreStepEvidence,
+    /// The log's Merkle root read before the outlet ran, which the invoker's
+    /// participation record binds after it (spec 17 §17.3 "Event log write
+    /// failures").
+    participation_root: crate::context::participation::ParticipationRoot,
     needs_hard_rate_limit_refund: bool,
     consumed: bool,
 }
@@ -199,7 +206,10 @@ impl OutletEconomyTicket {
     /// the private ticket fields. No payment escrow ⇒
     /// `void_external_and_consume` is a pure consume.
     #[cfg(any(test, feature = "testing"))]
-    pub fn new_for_test_no_escrow(actor_did: DID) -> Self {
+    pub fn new_for_test_no_escrow(
+        actor_did: DID,
+        participation_root: crate::context::participation::ParticipationRoot,
+    ) -> Self {
         let tracker = scp_protocol::economy::antispam::SenderVelocityTracker::new(60);
         let velocity_token = tracker.record_message(&actor_did, 0);
         Self {
@@ -209,6 +219,8 @@ impl OutletEconomyTicket {
             escrow: None,
             policy_for_capture: None,
             metrics_for_capture: ObservableMetrics::default(),
+            consequence_evidence: crate::context::governance_logic::PreStepEvidence::default(),
+            participation_root,
             needs_hard_rate_limit_refund: true,
             consumed: false,
         }
@@ -225,6 +237,7 @@ impl OutletEconomyTicket {
         actor_did: DID,
         escrow: PreparedAction,
         policy: scp_protocol::economy::types::EconomicPolicy,
+        participation_root: crate::context::participation::ParticipationRoot,
     ) -> Self {
         let tracker = scp_protocol::economy::antispam::SenderVelocityTracker::new(60);
         let velocity_token = tracker.record_message(&actor_did, 0);
@@ -235,6 +248,8 @@ impl OutletEconomyTicket {
             escrow: Some(escrow),
             policy_for_capture: Some(policy),
             metrics_for_capture: ObservableMetrics::default(),
+            consequence_evidence: crate::context::governance_logic::PreStepEvidence::default(),
+            participation_root,
             needs_hard_rate_limit_refund: true,
             consumed: false,
         }
@@ -716,6 +731,8 @@ pub async fn reserve_outlet_economy(
     let metrics;
     let economic_policy;
     let action_cost;
+    let consequence_evidence;
+    let participation_root;
     {
         let mut view = cell.class_c_view();
 
@@ -768,17 +785,36 @@ pub async fn reserve_outlet_economy(
         economic_policy = gov.economic_policy_mut().clone();
 
         // Before the outlet runs or any budget is debited: an unreadable log
-        // fails the invocation, and the velocity tick and hard-rate token
-        // taken above are returned (spec section 17.3, "Event log write
-        // failures").
-        let read = crate::context::governance_logic::event_log_entries_for_consequences(
-            view.receive_buffer_mut(),
+        // or log root fails the invocation, and the velocity tick and
+        // hard-rate token taken above are returned (spec section 17.3, "Event
+        // log write failures").
+        // The same reads are the evidence and the participation root for the
+        // bookkeeping after the outlet runs, which reads nothing itself.
+        let rules = view
+            .governance_class_c_mut()
+            .consequence_rules_mut()
+            .clone();
+        let (receive_buffer, queued) = view.consequence_read_inputs();
+        let read = crate::context::governance_logic::PreStepEvidence::read(
+            &rules,
+            queued,
             context_id,
-            now_secs,
             event_log.as_ref(),
-        );
+        )
+        .and_then(|evidence| {
+            crate::context::participation::ParticipationRoot::read(context_id, event_log.as_ref())
+                .map(|root| (evidence, root))
+        })
+        .map(|(evidence, root)| {
+            let merged = evidence.events(&[], receive_buffer, now_secs);
+            (evidence, root, merged)
+        });
         let (events_snapshot, convergent_now) = match read {
-            Ok(read) => read,
+            Ok((evidence, root, merged)) => {
+                consequence_evidence = evidence;
+                participation_root = root;
+                merged
+            }
             Err(e) => {
                 let gov = view.governance_class_c_mut();
                 gov.velocity_tracker_mut()
@@ -790,7 +826,7 @@ pub async fn reserve_outlet_economy(
 
         let mut participation_cache: HashMap<
             String,
-            scp_protocol::trust::participation::ParticipationRecord,
+            crate::context::participation::RootedParticipationRecord,
         > = HashMap::new();
 
         action_cost = {
@@ -809,7 +845,10 @@ pub async fn reserve_outlet_economy(
                     now: now_secs,
                     events: &events_snapshot,
                     convergent_now,
-                    participation_cache: &mut participation_cache,
+                    participation: crate::context::outlets::invoke::OutletParticipation {
+                        root: participation_root,
+                        cache: &mut participation_cache,
+                    },
                     consequence_rules: borrows.consequence_rules,
                     payment_adapter: payment_adapter.clone(),
                     metrics: metrics.clone(),
@@ -1135,6 +1174,8 @@ pub async fn reserve_outlet_economy(
         escrow,
         policy_for_capture: economic_policy,
         metrics_for_capture: metrics,
+        consequence_evidence,
+        participation_root,
         needs_hard_rate_limit_refund: true,
         consumed: false,
     };
@@ -2317,13 +2358,15 @@ pub async fn authorize_and_capture_stream_billed(
 ///
 /// Returns the triggered consequences and the optional payment receipt.
 ///
-/// `downward_auth_sink` (ADR-049 §9, RED-CS3): a CALLER-OWNED
-/// `&mut Option<ClassSCommitToken>` that this function POPULATES with a
-/// fail-closed-persist obligation if consequence enforcement performed a
+/// `sink` (ADR-049 §9, RED-CS3; spec 17 §17.3 "Event log write failures"): a
+/// CALLER-OWNED [`ConsequenceSink`](crate::context::log_unit_helpers::ConsequenceSink)
+/// that this function fills with the fail-closed-persist obligation of a
 /// downward-authorization mutation (a `suspended_capabilities` GROW or an
-/// `AssignRole` `member_capabilities` replacement). The token is a caller-owned
-/// sink rather than part of the return value SO IT SURVIVES THE PAYMENT-CAPTURE
-/// ERROR PATH: the mutation is applied in memory BEFORE the fallible payment
+/// `AssignRole` `member_capabilities` replacement), the durable consequence
+/// leaves, and a failed log read. The outlet already ran, so a failed read
+/// skips the consequence evaluation and the caller's discharge sets the log
+/// fault. The sink is caller-owned rather than part of the return value SO IT
+/// SURVIVES THE PAYMENT-CAPTURE ERROR PATH: the mutation is applied in memory BEFORE the fallible payment
 /// capture, and on capture failure this function returns `Err` early — a
 /// returned token would be STRANDED/DROPPED by that `?` (tripping the token's Drop
 /// guard on a path that legitimately must still persist, or losing the obligation
@@ -2343,8 +2386,8 @@ pub async fn settle_outlet_economy_capture(
     deps: &ActorDeps,
     context_id: &str,
     invoker_did: &DID,
-    ticket: OutletEconomyTicket,
-    downward_auth_sink: &mut Option<crate::context::actor::class_s::ClassSCommitToken>,
+    mut ticket: OutletEconomyTicket,
+    sink: &mut crate::context::log_unit_helpers::ConsequenceSink,
 ) -> Result<
     (
         Vec<scp_protocol::trust::consequence::TriggeredConsequence>,
@@ -2352,31 +2395,35 @@ pub async fn settle_outlet_economy_capture(
     ),
     ContextError,
 > {
-    let event_log = &deps.event_log;
     let event_tx = deps.event_tx.clone();
     let clock = deps.clock.as_ref();
     let payment_adapter = deps.payment_adapter.clone();
 
     let now = clock.now_secs();
-    let (events_for_consequences, convergent_now) =
-        crate::context::governance_logic::event_log_entries_for_consequences_after_side_effect(
-            view.receive_buffer_mut(),
-            context_id,
-            now,
-            event_log.as_ref(),
-        );
+    // The evaluation runs over the log read before the outlet ran (carried by
+    // the ticket), plus the leaves staged since and the receive buffer, so it
+    // reads nothing after the step (spec 17 §17.3 "Event log write failures").
+    let evidence = std::mem::take(&mut ticket.consequence_evidence);
+    let (events_for_consequences, convergent_now) = {
+        let (receive_buffer, _) = view.consequence_read_inputs();
+        evidence.events(sink.staged_leaves(), receive_buffer, now)
+    };
+    // The rules are read now, as they stand at the capture: a rule change
+    // that landed while the outlet ran applies to this capture.
     let consequence_rules = view
         .governance_class_c_mut()
         .consequence_rules_mut()
         .clone();
-
     let consequences = post_outlet_invocation_bookkeeping(
         &events_for_consequences,
         invoker_did,
         context_id,
         now,
         convergent_now,
-        view.governance_class_c_mut().participation_cache_mut(),
+        crate::context::outlets::invoke::OutletParticipation {
+            root: ticket.participation_root,
+            cache: view.governance_class_c_mut().participation_cache_mut(),
+        },
         &consequence_rules,
     );
 
@@ -2391,10 +2438,10 @@ pub async fn settle_outlet_economy_capture(
     // coalesce-persists); only a downward-auth OUTCOME owes a fail-closed persist,
     // which the cell-holding caller performs when `downward_auth_applied` is set.
     let mut split = view.consequence_split();
-    // The GROW arms the caller-owned `downward_auth_sink` directly (GAP-A closed),
-    // so the mutation's fail-closed-persist obligation survives the payment-capture
-    // error path below (a returned token would be stranded/dropped by the early
-    // `return Err` — RED-CS3).
+    // The GROW arms the caller-owned `sink` directly (GAP-A closed), so the
+    // mutation's fail-closed-persist obligation and the durable leaves survive
+    // the payment-capture error path below (a returned token would be
+    // stranded/dropped by the early `return Err` — RED-CS3).
     let _ = crate::context::governance_logic::enforce_triggered_consequences(
         &mut split,
         &crate::context::governance_logic::EnforceConsequencesCtx {
@@ -2404,12 +2451,10 @@ pub async fn settle_outlet_economy_capture(
             triggered: &consequences,
             rules: &consequence_rules,
             clock,
-            event_log: event_log.as_ref(),
             event_tx: event_tx.as_ref(),
         },
-        downward_auth_sink,
-    )
-    .await;
+        sink,
+    );
 
     let payment_receipt = match (
         payment_adapter.as_ref(),
@@ -2788,32 +2833,30 @@ pub async fn settle_outlet_economy(
             // a path that must still persist or losing the obligation. The token
             // carrier (vs. a `bool`) makes a populated-but-undischarged obligation a
             // Drop-guard PANIC in debug/CI.
-            let mut downward_auth_obligation: Option<
-                crate::context::actor::class_s::ClassSCommitToken,
-            > = None;
+            let mut sink = crate::context::log_unit_helpers::ConsequenceSink::new();
             let capture_result = settle_outlet_economy_capture(
                 cell.class_c_view(),
                 deps,
                 context_id,
                 invoker_did,
                 ticket,
-                &mut downward_auth_obligation,
+                &mut sink,
             )
             .await;
             // Fail-closed persist (token `commit`) of an applied downward-auth
             // mutation (keep-direction), run on BOTH the Ok and Err arms: the
             // mutation is already in memory; commit it before acking so a
             // coalesce-window crash cannot silently re-grant the removed authority.
-            // `take()` discharges the Drop guard. The view above has been consumed,
+            // The same keep persist queues the consequence leaves as one pending
+            // log unit and sets the log fault for a failed read (spec 17 §17.3).
+            // The view above has been consumed,
             // so the `&mut cell` borrow is released here. ERROR PRECEDENCE: when the
             // capture itself failed, the commit still runs; if the commit ALSO
             // fails, the §9 durability failure (`PersistenceFailed`) is surfaced over
             // the original capture error (durability is the security obligation), and
             // the original capture cause is preserved in its message. When the
             // commit succeeds, the original capture error is surfaced unchanged.
-            if let Some(token) = downward_auth_obligation.take()
-                && let Err(persist_err) = token.commit(cell, deps, context_id).await
-            {
+            if let Err(persist_err) = sink.discharge(cell, deps, context_id).await {
                 return Err(match capture_result {
                     Ok(_) => persist_err,
                     Err(capture_err) => ContextError::PersistenceFailed(format!(
@@ -3233,8 +3276,11 @@ mod tests {
         assert!(try_consume_hard_rate_limit(cell.class_c_view(), &did, 10));
     }
 
-    fn ticket_with_budget(did: &DID) -> OutletEconomyTicket {
-        OutletEconomyTicket::new_for_test_no_escrow(did.clone())
+    fn ticket_with_budget(did: &DID) -> Result<OutletEconomyTicket, crate::context::ContextError> {
+        Ok(OutletEconomyTicket::new_for_test_no_escrow(
+            did.clone(),
+            crate::context::participation::test_support::empty_log_root()?,
+        ))
     }
 
     /// `OutletSettleRequest::generation()` reports the reservation's
@@ -3242,12 +3288,12 @@ mod tests {
     /// ticket back so the orchestrator can reverse it on an unreachable
     /// settle.
     #[test]
-    fn settle_request_exposes_generation_and_ticket() {
+    fn settle_request_exposes_generation_and_ticket() -> Result<(), crate::context::ContextError> {
         let did = test_did();
 
         let capture = OutletSettleRequest::Capture {
             generation: 42,
-            ticket: ticket_with_budget(&did),
+            ticket: ticket_with_budget(&did)?,
         };
         assert_eq!(capture.generation(), 42);
         // Consume the reclaimed ticket so its Drop balance guard does not
@@ -3256,10 +3302,11 @@ mod tests {
 
         let rollback = OutletSettleRequest::Rollback {
             generation: 7,
-            ticket: ticket_with_budget(&did),
+            ticket: ticket_with_budget(&did)?,
         };
         assert_eq!(rollback.generation(), 7);
         rollback.into_ticket().consume_abandoning_escrow();
+        Ok(())
     }
 
     /// The unreachable-actor reversal path
@@ -3269,11 +3316,13 @@ mod tests {
     /// payment adapter there is no external escrow to void, so this is a
     /// pure consume; reaching the end without a panic is the assertion.
     #[tokio::test]
-    async fn void_external_and_consume_consumes_ticket_without_panic() {
+    async fn void_external_and_consume_consumes_ticket_without_panic()
+    -> Result<(), crate::context::ContextError> {
         let did = test_did();
-        let ticket = ticket_with_budget(&did);
+        let ticket = ticket_with_budget(&did)?;
         ticket.void_external_and_consume(None).await;
         // No panic on Drop ⇒ the ticket was consumed.
+        Ok(())
     }
 
     /// ADR-049 §9 (RED-CS3): the outlet-settle CAPTURE-FAILURE path must NOT
@@ -3447,6 +3496,8 @@ mod tests {
                     evaluated_cost: Amount(50),
                 },
                 paid_policy(),
+                crate::context::participation::test_support::empty_log_root()
+                    .expect("the empty log's root"),
             )
         }
 
@@ -3571,6 +3622,98 @@ mod tests {
                 "the suspended capability is retained in memory (keep-direction) even \
                  though the payment capture failed"
             );
+        }
+    }
+
+    /// The outlet capture family of spec 17 §17.3 "Event log write failures".
+    mod outlet_capture {
+        use scp_did::DID;
+        use scp_protocol::context::params::Capability;
+
+        use crate::context::actor::class_s::ClassSCell;
+        use crate::context::actor::state::PerContextState;
+        use crate::context::log_unit_helpers::test_support::{
+            SUSPENSION_LEAVES, deps_with, fail_log_entry_writes, faulty_merkle_log, log_len,
+            queued_unit_types, seed_warning_leaf, suspend_messages_write_rule,
+        };
+
+        const OWNER: &str = "did:dht:z6MkOwnerOutletCapture";
+        const INVOKER: &str = "did:dht:z6MkInvokerOutletCapture";
+
+        /// The outlet already ran when the capture evaluates its consequences.
+        /// A log that rejects the leaf writes keeps the capture's step (the
+        /// suspension and the committed ticket) and queues the leaves as one
+        /// unit; the capture succeeds.
+        #[tokio::test]
+        async fn append_failure_after_side_effect_keeps_step_and_queues_leaf()
+        -> Result<(), crate::context::ContextError> {
+            let ctx_id_bytes = [0x7bu8; 32];
+            let ctx = hex::encode(ctx_id_bytes);
+            let invoker = DID(INVOKER.to_owned());
+            let (log, faulty) = faulty_merkle_log();
+            seed_warning_leaf(&log, &ctx_id_bytes, &invoker).await;
+            fail_log_entry_writes(&faulty, &ctx_id_bytes);
+            let deps = deps_with(OWNER, None, Box::new(log)).await;
+
+            let mut state = PerContextState::new_for_test_encrypted(
+                ctx_id_bytes,
+                1_700_000_000,
+                DID(OWNER.to_owned()),
+            );
+            state
+                .membership
+                .add_member(invoker.clone(), "member".to_owned(), Vec::new());
+            state
+                .governance
+                .consequence_rules
+                .push(suspend_messages_write_rule());
+            let mut cell = ClassSCell::new(state);
+
+            // The reserve reads the log before the outlet runs and carries the
+            // read on the ticket.
+            let mut ticket = super::super::OutletEconomyTicket::new_for_test_no_escrow(
+                invoker.clone(),
+                crate::context::participation::ParticipationRoot::read(
+                    &ctx,
+                    deps.event_log.as_ref(),
+                )?,
+            );
+            ticket.consequence_evidence =
+                crate::context::log_unit_helpers::test_support::pre_step_evidence(
+                    &cell,
+                    &ctx,
+                    deps.event_log.as_ref(),
+                );
+            let request = super::super::OutletSettleRequest::Capture {
+                generation: cell.generation,
+                ticket,
+            };
+            let settled =
+                super::super::settle_outlet_economy(&mut cell, &deps, &ctx, &invoker, request)
+                    .await;
+
+            assert!(
+                settled.is_ok(),
+                "the leaves are queued, so a log write failure does not fail the capture: \
+                 {settled:?}"
+            );
+            assert!(
+                cell.role_state
+                    .suspended_for(INVOKER)
+                    .is_some_and(|caps| caps.contains(&Capability::MessagesWrite)),
+                "the capture's suspension is kept"
+            );
+            assert_eq!(
+                queued_unit_types(&cell.class_s.pending_log_units),
+                vec![SUSPENSION_LEAVES.to_vec()],
+                "the consequence leaves stay queued as one unit"
+            );
+            assert_eq!(
+                log_len(&deps, &ctx_id_bytes),
+                1,
+                "only the seeded warning is logged"
+            );
+            Ok(())
         }
     }
 
@@ -4122,10 +4265,17 @@ mod tests {
                 mls_storage,
             );
             crate::context::supervisor::supervisor::leak_for_test(&supervisor);
-            supervisor
+            let deps = supervisor
                 .build_actor_deps_loaded(&DID(INVOKER.to_owned()))
                 .await
-                .expect("build_actor_deps")
+                .expect("build_actor_deps");
+            // The reserve reads the context's participation root, so the
+            // context has a log, as a created context does.
+            deps.event_log
+                .init_event_log(&crate::context::state::context_id_to_bytes(&ctx_key()))
+                .await
+                .expect("init log");
+            deps
         }
 
         fn active_state() -> PerContextState {
@@ -4269,6 +4419,63 @@ mod tests {
             assert!(
                 !super::super::try_consume_hard_rate_limit(cell.class_c_view(), &invoker, now),
                 "exactly the one token the reserve took comes back"
+            );
+        }
+
+        /// Spec section 17.3 ("Event log write failures"): the reserve reads
+        /// the participation root beside its evidence, before the outlet
+        /// runs, so a root that cannot be read fails the reserve with the
+        /// read error, hands back the velocity tick and the hard-rate token
+        /// it took, and caches no participation record.
+        #[tokio::test]
+        async fn reserve_refuses_when_the_participation_root_read_fails() {
+            let mut deps = build_deps(Box::new(OkPersistence)).await;
+            deps.event_log = Arc::new(
+                crate::context::participation::test_support::RootRefusingLog(
+                    crate::context::providers::MerkleEventLogProvider::new(),
+                ),
+            );
+            deps.event_log
+                .init_event_log(&crate::context::state::context_id_to_bytes(&ctx_key()))
+                .await
+                .expect("init log");
+            let mut cell = ClassSCell::new(active_state());
+            let invoker = DID(INVOKER.to_owned());
+            let now = 1_700_000_100;
+
+            // Leave exactly one hard-rate token: drain the bucket, then
+            // return one.
+            let mut drained = 0_u32;
+            while super::super::try_consume_hard_rate_limit(cell.class_c_view(), &invoker, now) {
+                drained += 1;
+                assert!(drained < 10_000, "the hard-rate bucket never empties");
+            }
+            super::super::refund_hard_rate_limit(cell.class_c_view(), &invoker);
+
+            let err = reserve_step(&mut cell, &deps, None, None, &serde_json::json!({}), now)
+                .await
+                .expect_err("an unreadable root fails the reserve");
+            assert!(
+                matches!(err, ContextError::EventLogFailed(_)),
+                "the reserve fails with the root read error; got {err:?}"
+            );
+
+            assert_eq!(
+                cell.governance.velocity_tracker.get_velocity(&invoker, now),
+                0,
+                "the velocity tick is rolled back"
+            );
+            assert!(
+                super::super::try_consume_hard_rate_limit(cell.class_c_view(), &invoker, now),
+                "the hard-rate token is refunded"
+            );
+            assert!(
+                !super::super::try_consume_hard_rate_limit(cell.class_c_view(), &invoker, now),
+                "exactly the one token the reserve took comes back"
+            );
+            assert!(
+                cell.governance.participation_cache.is_empty(),
+                "no participation record is cached"
             );
         }
 
@@ -4673,10 +4880,17 @@ mod tests {
                 mls_storage,
             );
             crate::context::supervisor::supervisor::leak_for_test(&supervisor);
-            supervisor
+            let deps = supervisor
                 .build_actor_deps_loaded(&DID(INVOKER.to_owned()))
                 .await
-                .expect("build_actor_deps")
+                .expect("build_actor_deps");
+            // The reserve reads the context's participation root, so the
+            // context has a log, as a created context does.
+            deps.event_log
+                .init_event_log(&crate::context::state::context_id_to_bytes(&ctx_key()))
+                .await
+                .expect("init log");
+            deps
         }
 
         /// `active_state()` plus a paid economic policy and a funded budget for

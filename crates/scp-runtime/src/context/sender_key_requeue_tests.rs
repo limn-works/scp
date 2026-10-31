@@ -882,7 +882,7 @@ async fn a_read_revoked_requester_gets_no_answer() {
         &deps,
         ctx,
         &denied,
-        &mut None,
+        &mut crate::context::log_unit_helpers::ConsequenceSink::new(),
         &mut None,
     )
     .await
@@ -906,7 +906,7 @@ async fn a_read_revoked_requester_gets_no_answer() {
         &deps,
         ctx,
         &answered,
-        &mut None,
+        &mut crate::context::log_unit_helpers::ConsequenceSink::new(),
         &mut None,
     )
     .await
@@ -943,7 +943,7 @@ async fn a_request_flood_keeps_one_answer_per_target_and_epoch() {
             &deps,
             ctx,
             &request,
-            &mut None,
+            &mut crate::context::log_unit_helpers::ConsequenceSink::new(),
             &mut None,
         )
         .await

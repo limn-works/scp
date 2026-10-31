@@ -306,6 +306,20 @@ impl From<OutletStreamOpenError> for OutletOpenError {
 // Economy context for outlet invocation
 // ---------------------------------------------------------------------------
 
+/// The participation cache an outlet invocation refreshes, and the log's
+/// Merkle root, read before the outlet ran, that the refreshed record binds
+/// (spec 17 §17.3 "Event log write failures").
+pub struct OutletParticipation<'a, S: BuildHasher = std::hash::RandomState> {
+    /// The log's Merkle root as read before the outlet ran.
+    pub root: crate::context::participation::ParticipationRoot,
+    /// The cache that receives the invoker's record.
+    pub cache: &'a mut std::collections::HashMap<
+        String,
+        crate::context::participation::RootedParticipationRecord,
+        S,
+    >,
+}
+
 /// Optional economy parameters for outlet invocation.
 ///
 /// When provided, `invoke_outlet` enforces budget checks before execution
@@ -334,12 +348,9 @@ pub struct OutletEconomyContext<'a, S: BuildHasher = std::hash::RandomState> {
     /// across skewed members (§9.9.3); derived from the same call to
     /// `event_log_entries_for_consequences` that produced `events`.
     pub convergent_now: u64,
-    /// Participation cache for proposer eligibility evaluation.
-    pub participation_cache: &'a mut std::collections::HashMap<
-        String,
-        scp_protocol::trust::participation::ParticipationRecord,
-        S,
-    >,
+    /// Participation cache for proposer eligibility evaluation, with the log
+    /// root its refreshed record binds.
+    pub participation: OutletParticipation<'a, S>,
     /// Consequence rules from the context's governance state.
     pub consequence_rules: &'a [scp_protocol::trust::consequence::ConsequenceRule],
     /// Optional payment adapter for the 9-step payment flow (spec §19.2.2, #1537).
@@ -804,7 +815,10 @@ fn economy_post_check<S: BuildHasher>(
         economy.context_id,
         economy.now,
         economy.convergent_now,
-        economy.participation_cache,
+        OutletParticipation {
+            root: economy.participation.root,
+            cache: &mut *economy.participation.cache,
+        },
         economy.consequence_rules,
     )
 }
@@ -1056,39 +1070,23 @@ where
 /// Post-invocation bookkeeping: participation record update and consequence evaluation.
 ///
 /// Called after a successful outlet invocation to update governance state.
-/// `compute_participation_record` refreshes the cache for proposer eligibility
-/// (#1530). `evaluate_consequence_rules` checks whether the outlet invocation
-/// triggered any consequence rules (#1531).
+/// The invoker's participation record, bound to the log's Merkle root that
+/// `participation.root` carries (read before the outlet ran), refreshes
+/// `participation.cache` for proposer eligibility.
+/// `evaluate_consequence_rules` checks whether the outlet invocation triggered
+/// any consequence rules.
+#[must_use]
 pub fn post_outlet_invocation_bookkeeping<S: std::hash::BuildHasher>(
     events: &[scp_event_log::Event],
     invoker_did: &DID,
     context_id: &str,
     now: u64,
     convergent_now: u64,
-    participation_cache: &mut std::collections::HashMap<
-        String,
-        scp_protocol::trust::participation::ParticipationRecord,
-        S,
-    >,
+    OutletParticipation { root, cache }: OutletParticipation<'_, S>,
     consequence_rules: &[scp_protocol::trust::consequence::ConsequenceRule],
 ) -> Vec<scp_protocol::trust::consequence::TriggeredConsequence> {
     // Update participation record after outlet execution (#1530).
-    if !events.is_empty()
-        && let Ok(record) = scp_protocol::trust::participation::compute_participation_record(
-            events,
-            invoker_did.as_ref(),
-            context_id,
-            [0u8; 32],
-            now,
-            // attestation_count is a credential-layer, verifier-relative fact
-            // (§7.3.2); this outlet-invoke path gates only on participation_count
-            // and has no attestation-cache access, so it passes an empty
-            // accessible-attestation set (count 0) by design — NOT a stub.
-            &[],
-        )
-    {
-        participation_cache.insert(invoker_did.to_string(), record);
-    }
+    root.refresh(cache, events, invoker_did.as_ref(), context_id, now);
 
     // Evaluate consequence rules after outlet execution (#1531).
     // The caller is responsible for enforcing triggered consequences via
@@ -4807,92 +4805,6 @@ async fn forward_bridge_terminal(
     Some(chunk)
 }
 
-/// Records the receiving context A's own `OutletInvoked` event at stream close
-/// (SCP-OUT-036 AC7; §5.4.5).
-///
-/// A re-derives the manifest root + billable count over its INDEPENDENTLY
-/// reassembled chunk sequence and records through the verified-append boundary
-/// [`ContextEventLogProvider::append_outlet_invoked_verified`](crate::context::builder::ContextEventLogProvider::append_outlet_invoked_verified),
-/// which WIRE-REJECTS any `chunks_billed` / manifest-root mismatch at
-/// log-insert time as `EventLogError::ChunksBilledMismatch` (§5.4.5:566
-/// "refused at log-insert time, not accepted-and-flagged"). On the happy path
-/// A's derived aggregates match those the operator's B-side pump committed —
-/// A recomputes over exactly the chunks B produced and signed — so the append
-/// succeeds and both logs carry the SAME 32-byte `stream_manifest_hash`
-/// (best-effort, non-atomic dual recording; the atomic guarantee is the
-/// streaming saga's, SCP-OUT-046).
-#[allow(clippy::too_many_arguments)]
-async fn record_cross_context_a_event(
-    a_event_log: &std::sync::Arc<dyn crate::context::builder::ContextEventLogProvider>,
-    receiving_context_id: &str,
-    invoker_did: &DID,
-    request_id: RequestId,
-    outlet_id: &OutletId,
-    input_hash: String,
-    execution_time_ms: u64,
-    terminal: &StreamTerminalSummary,
-    reassembled: &[OutletStreamChunk],
-    timestamp_secs: u64,
-) {
-    let manifest = match compute_chunk_manifest_root(reassembled) {
-        Ok(root) => root,
-        Err(err) => {
-            tracing::error!(
-                %err,
-                context_id = %receiving_context_id,
-                "cross-context bridge: A-side manifest-root computation failed — \
-                 skipping A's OutletInvoked recording"
-            );
-            return;
-        }
-    };
-    let stream_chunk_count = u32::try_from(reassembled.len()).unwrap_or(u32::MAX);
-    // The best-effort bridge processes no cross-context `OutletCancel`, so the
-    // §5.4.5 billing ceiling is `u64::MAX` and `chunks_billed` reduces to the
-    // count of `Data` leaves — identical to the frontier-derived value B's pump
-    // committed, so the verified append passes on the happy path.
-    let chunks_billed =
-        crate::context::outlets::stream::compute_chunks_billed_ref(reassembled, u64::MAX);
-    let event = build_streaming_outlet_event(
-        request_id,
-        outlet_id,
-        invoker_did,
-        input_hash,
-        execution_time_ms,
-        stream_chunk_count,
-        chunks_billed,
-        manifest,
-        terminal,
-        // The bridge maintains a single retained sequence (no separate running
-        // tally to diverge from), and processes no cancel-ack.
-        None,
-        None,
-    );
-    if let Err(err) = a_event_log
-        .append_outlet_invoked_verified(
-            crate::context::builder::AppendMode::AfterSideEffect,
-            &crate::context::state::context_id_to_bytes(receiving_context_id),
-            &event,
-            reassembled,
-            invoker_did.as_ref(),
-            timestamp_secs,
-        )
-        .await
-    {
-        // §5.4.5:566 wire-rejection (`ChunksBilledMismatch`) or a persistence
-        // fault. The best-effort bridge does not fail the already-drained
-        // stream on a receiver-side recording fault — it surfaces the refusal
-        // to the audit log (the atomic all-or-nothing dual-log guarantee is the
-        // streaming saga's, SCP-OUT-046).
-        tracing::error!(
-            %err,
-            context_id = %receiving_context_id,
-            "cross-context bridge: A-side OutletInvoked recording refused at the \
-             verified-append boundary (§5.4.5:566)"
-        );
-    }
-}
-
 /// Constructs the onward A-leg [`OutletStreamOpen`] the shared-member SDK seam
 /// uses to frame delivery of the re-encrypted stream to the RECEIVING context
 /// A's OTHER members (§5.4.5; §6.2.0).
@@ -4942,8 +4854,16 @@ pub(crate) const MAX_CROSS_CONTEXT_STREAM_CHUNKS: usize = 1 << 20;
 /// Consumes B's plaintext operator-signed chunks (`inner_rx`), verifies each
 /// against the PINNED descriptor, validates Data/End against the outlet's
 /// schemas, forwards each chunk UNMODIFIED (signature preserved) to A's invoker
-/// over a bounded outer channel, and at close records A's own `OutletInvoked`
-/// event over the independently reassembled sequence.
+/// over a bounded outer channel, and at close returns the request for A's own
+/// `OutletInvoked` record over the independently reassembled sequence, which
+/// the caller sends to A's actor ([`send_cross_context_a_unit`], spec 17
+/// §17.3).
+///
+/// # Errors
+///
+/// [`ContextError::EventLogFailed`](scp_protocol::context::ContextError::EventLogFailed)
+/// when A's manifest root cannot be computed over the reassembled chunks, or
+/// their count exceeds the `u32` `stream_chunk_count`.
 ///
 /// No bridge-level buffering: each chunk is forwarded as produced, subject to
 /// the outer channel's backpressure (bounded to 1 so chunk N is delivered
@@ -4989,7 +4909,6 @@ pub(crate) async fn run_cross_context_bridge(
     descriptor: CrossContextVerificationDescriptor,
     output_schema: serde_json::Value,
     aggregate_schema: Option<serde_json::Value>,
-    a_event_log: std::sync::Arc<dyn crate::context::builder::ContextEventLogProvider>,
     receiving_context_id: String,
     invoker_did: DID,
     request_id: RequestId,
@@ -4999,7 +4918,7 @@ pub(crate) async fn run_cross_context_bridge(
     timestamp_secs: u64,
     max_retained_chunks: usize,
     fault_probe: Option<BridgeFaultProbe>,
-) {
+) -> Result<crate::context::actor::commands::LogUnitRequest, scp_protocol::context::ContextError> {
     tracing::debug!(
         chain_depth = governing_chain_depth,
         request_id = %hex::encode(request_id),
@@ -5212,20 +5131,102 @@ pub(crate) async fn run_cross_context_bridge(
         }
     }
 
-    // (AC7) A-side recording through the verified-append boundary.
-    record_cross_context_a_event(
-        &a_event_log,
-        &receiving_context_id,
-        &invoker_did,
+    // (AC7) A's own `OutletInvoked` record. A re-derives the manifest root and
+    // billable count over its INDEPENDENTLY reassembled chunk sequence; the
+    // returned request makes A's actor re-check that manifest when it plans the
+    // leaf (`plan_outlet_invoked_verified_leaf`), which refuses a
+    // `chunks_billed` / manifest-root mismatch (§5.4.5:566 "refused at
+    // log-insert time, not accepted-and-flagged"). On the happy path A's
+    // aggregates match those B's pump committed, so both logs carry the SAME
+    // 32-byte `stream_manifest_hash` (best-effort, non-atomic dual recording;
+    // the atomic guarantee is the streaming saga's, SCP-OUT-046). The caller
+    // sends the request to A's actor (spec 17 §17.3).
+    let manifest = compute_chunk_manifest_root(&reassembled).map_err(|err| {
+        scp_protocol::context::ContextError::EventLogFailed(format!(
+            "cross-context bridge: A-side manifest-root computation failed for context \
+             {receiving_context_id}: {err}"
+        ))
+    })?;
+    let stream_chunk_count = u32::try_from(reassembled.len()).map_err(|_| {
+        scp_protocol::context::ContextError::EventLogFailed(format!(
+            "cross-context bridge: {} reassembled chunks exceed the u32 stream_chunk_count",
+            reassembled.len()
+        ))
+    })?;
+    // The best-effort bridge processes no cross-context `OutletCancel`, so the
+    // §5.4.5 billing ceiling is `u64::MAX` and `chunks_billed` reduces to the
+    // count of `Data` leaves — identical to the frontier-derived value B's pump
+    // committed, so the manifest check passes on the happy path.
+    let chunks_billed =
+        crate::context::outlets::stream::compute_chunks_billed_ref(&reassembled, u64::MAX);
+    let event = build_streaming_outlet_event(
         request_id,
         &outlet_id,
+        &invoker_did,
         input_hash,
         execution_time_ms,
+        stream_chunk_count,
+        chunks_billed,
+        manifest,
         &terminal,
-        &reassembled,
-        timestamp_secs,
+        // The bridge maintains a single retained sequence (no separate running
+        // tally to diverge from), and processes no cancel-ack.
+        None,
+        None,
+    );
+    Ok(
+        crate::context::actor::commands::LogUnitRequest::VerifiedOutletInvoked {
+            event: Box::new(event),
+            reassembled,
+            actor_did: invoker_did.0,
+            timestamp_secs,
+        },
     )
-    .await;
+}
+
+/// Sends the cross-context bridge's A-side `OutletInvoked` request to the
+/// receiving context A's actor, which queues it as a pending log unit (spec 17
+/// §17.3 "Event log write failures").
+///
+/// The bridge runs after the open returned A's receiver, so no caller waits on
+/// this record, and
+/// [`report_background_log_unit`](crate::context::log_unit_helpers::report_background_log_unit)
+/// reports the result: a planning failure, a dropped Supervisor, an absent A
+/// actor, a full mailbox, or a refused enqueue is logged at error level and
+/// counted by `scp_log_unit_undelivered_total`; a lost reply is logged at warn
+/// level. Returns whether the record is known to be queued.
+pub(crate) async fn send_cross_context_a_unit(
+    supervisor: &std::sync::Weak<crate::context::supervisor::Supervisor>,
+    receiving_context_id: &str,
+    request: Result<
+        crate::context::actor::commands::LogUnitRequest,
+        scp_protocol::context::ContextError,
+    >,
+) -> bool {
+    use crate::context::log_unit_helpers::LogUnitSendError;
+    let sent = match (request, supervisor.upgrade()) {
+        (Err(err), _) => Err(LogUnitSendError::NotQueued(err)),
+        (Ok(_), None) => Err(LogUnitSendError::NotQueued(
+            scp_protocol::context::ContextError::SupervisorShutDown(
+                "cross-context bridge: the Supervisor dropped before A's OutletInvoked record \
+                 was queued"
+                    .to_owned(),
+            ),
+        )),
+        (Ok(request), Some(sup)) => {
+            sup.send_log_unit(
+                receiving_context_id,
+                request,
+                crate::context::actor::commands::UnitDedup::None,
+            )
+            .await
+        }
+    };
+    crate::context::log_unit_helpers::report_background_log_unit(
+        receiving_context_id,
+        "cross-context bridge A-side OutletInvoked",
+        sent,
+    )
 }
 
 /// The transactional streaming-saga seal task (SCP-OUT-046 #134; the ADR-061
@@ -5279,11 +5280,6 @@ pub(crate) async fn run_streaming_saga_seal_task(
     descriptor: CrossContextVerificationDescriptor,
     output_schema: serde_json::Value,
     aggregate_schema: Option<serde_json::Value>,
-    // The RECEIVING context A's shared event-log provider (SCP-OUT-046 #135) —
-    // where the A-side `CrossContextOutletInvoked` dual-log leaf is recorded at
-    // seal-close, completing the atomic dual-log (B's `OutletInvoked` is
-    // recorded by the seal handler).
-    a_event_log: std::sync::Arc<dyn crate::context::builder::ContextEventLogProvider>,
 ) {
     use crate::context::actor::ContextCommand;
     use crate::context::actor::commands::SagaPhaseMessage;
@@ -5543,15 +5539,37 @@ pub(crate) async fn run_streaming_saga_seal_task(
                 manifest_root = %hex::encode(outcome.stream_manifest_hash),
                 "streaming-saga seal task: sealed — Committing→Committed"
             );
-            // #135 — record the receiving-context (A) `CrossContextOutletInvoked`
-            // dual-log leaf, completing the atomic dual-log (B's `OutletInvoked`
-            // was recorded by the seal handler). Recorded BEFORE the settlement
-            // move below so it borrows the whole `outcome`. Uses the SEALED root
-            // from `outcome` (never a re-derivation) + the convergent
-            // timestamp/nonce/context-ids from the signed receipt, so every
-            // honest member's leaf is byte-identical. No local payload buffer is
-            // read — B's durable frontier is the authoritative manifest.
-            record_streaming_saga_a_event(&a_event_log, &saga_id, &outcome).await;
+            // Queue the receiving-context (A) `CrossContextOutletInvoked`
+            // dual-log leaf through A's actor, completing the atomic dual-log
+            // (B's `OutletInvoked` was queued by the seal handler). Sent BEFORE
+            // the settlement move below so it borrows the whole `outcome`. Uses
+            // the SEALED root from `outcome` (never a re-derivation) + the
+            // convergent timestamp/nonce/context-ids from the signed receipt, so
+            // every honest member's leaf is byte-identical. No local payload
+            // buffer is read — B's durable frontier is the authoritative
+            // manifest. A failed send leaves the journal `Committing`, and the
+            // recovery sweep re-sends the leaf with `UnitDedup::OncePerSaga`
+            // (spec 17 §17.3).
+            let a_sent = match supervisor.upgrade() {
+                Some(sup) => send_streaming_saga_a_unit(&sup, &saga_id, &outcome).await,
+                None => Err(
+                    crate::context::log_unit_helpers::LogUnitSendError::NotQueued(
+                        scp_protocol::context::ContextError::SupervisorShutDown(
+                            "streaming-saga seal task: supervisor dropped before the A-side leaf \
+                         was queued"
+                                .to_owned(),
+                        ),
+                    ),
+                ),
+            };
+            if let Err(err) = &a_sent {
+                tracing::error!(
+                    saga_id = %saga_id.0,
+                    %err,
+                    "streaming-saga seal task: the A-side CrossContextOutletInvoked leaf was not \
+                     queued — journal left Committing; the crash-recovery sweep re-sends it"
+                );
+            }
 
             // Apply the ACTUAL budget movement (SCP-OUT-046 CRITICAL): the seal
             // handler durably inserted the `settled = false` witness and built the
@@ -5605,7 +5623,7 @@ pub(crate) async fn run_streaming_saga_seal_task(
                 }
             };
 
-            if settlement_applied {
+            if settlement_applied && a_sent.is_ok() {
                 // Resolve the journal to `Committed` so crash recovery does not
                 // redrive a completed saga. Non-secret (the streaming saga journals
                 // public metadata only).
@@ -5625,7 +5643,7 @@ pub(crate) async fn run_streaming_saga_seal_task(
                          crash recovery sweep will reconcile from the durable committed witness"
                     );
                 }
-            } else {
+            } else if !settlement_applied {
                 tracing::warn!(
                     saga_id = %saga_id.0,
                     "streaming-saga seal task: settlement DEFERRED (target evicted/replaced at \
@@ -5665,11 +5683,13 @@ pub(crate) async fn run_streaming_saga_seal_task(
     }
 }
 
-/// Record the receiving-context (A) `CrossContextOutletInvoked` dual-log leaf at
-/// a streaming-saga seal-close (SCP-OUT-046 #135; the streaming sibling of the
-/// unary saga's caller-side `cross_context_invoked_leaf`). Shared by the seal
-/// task AND the key-bearing crash-recovery truncated close (#136) so both record
-/// the identical A-side leaf.
+/// Queues the receiving-context (A) `CrossContextOutletInvoked` dual-log leaf of
+/// a streaming-saga seal-close through A's actor (SCP-OUT-046; the
+/// streaming sibling of the unary saga's caller-side
+/// `cross_context_invoked_leaf`; spec 17 §17.3 "Event log write failures").
+/// Shared by the seal task, the key-bearing crash-recovery truncated close,
+/// and the keyless recovery sweep, so all three queue the identical
+/// A-side leaf.
 ///
 /// The leaf is a commit-ordered CONVERGENT durable leaf (ADR-011 Amendment §6
 /// carve-out): every field is derived from the SIGNED streaming receipt
@@ -5681,28 +5701,53 @@ pub(crate) async fn run_streaming_saga_seal_task(
 /// records date the one provenance edge identically (§6.2.4 "Dual event-log
 /// recording"; §7.3.1 / §9.9.3).
 ///
-/// Best-effort append (mirrors `record_cross_context_a_event`): the atomic seal
-/// guarantee is the durable `xctx_committed_stream_outputs` witness + the journal,
-/// so a receiver-side recording fault surfaces to the audit log rather than
-/// un-committing the sealed saga. Never re-signs, never re-invokes.
-pub(crate) async fn record_streaming_saga_a_event(
-    a_event_log: &std::sync::Arc<dyn crate::context::builder::ContextEventLogProvider>,
+/// The send uses `UnitDedup::OncePerSaga`: a later sender may re-send a leaf an
+/// earlier one queued (a seal task whose settle deferred, then the sweep), and
+/// A's durable per-saga set, not a scan of its prunable log, lands it once.
+///
+/// # Errors
+///
+/// - `LogUnitSendError::NotQueued` with
+///   [`ContextError::EventLogFailed`](scp_protocol::context::ContextError::EventLogFailed)
+///   when the sealed receipt does not parse or the payload does not serialize.
+/// - The errors of `Supervisor::send_log_unit` when A's actor is absent, its
+///   mailbox stays full, its reply is lost, or the enqueue fails.
+pub(crate) async fn send_streaming_saga_a_unit(
+    supervisor: &crate::context::supervisor::Supervisor,
     saga_id: &crate::context::supervisor::saga_journal::SagaId,
     outcome: &crate::context::actor::commands::CommitBStreamSettleOutcome,
-) {
+) -> Result<(), crate::context::log_unit_helpers::LogUnitSendError> {
+    let (caller_context_hex, leaf) = plan_streaming_saga_a_leaf(saga_id, outcome)?;
+    supervisor
+        .send_log_unit(
+            &caller_context_hex,
+            crate::context::actor::commands::LogUnitRequest::Leaves(vec![leaf]),
+            crate::context::actor::commands::UnitDedup::OncePerSaga(saga_id.clone()),
+        )
+        .await
+}
+
+/// Plans the A-side `CrossContextOutletInvoked` leaf of a streaming-saga
+/// seal-close from the sealed `outcome`, and returns it with the actor key of
+/// the context it lands in (A, `receipt.caller_context_id`).
+///
+/// # Errors
+///
+/// [`ContextError::EventLogFailed`](scp_protocol::context::ContextError::EventLogFailed)
+/// when the sealed receipt does not parse, or the payload does not serialize or
+/// breaks the append's payload rules.
+pub(crate) fn plan_streaming_saga_a_leaf(
+    saga_id: &crate::context::supervisor::saga_journal::SagaId,
+    outcome: &crate::context::actor::commands::CommitBStreamSettleOutcome,
+) -> Result<(String, crate::context::state::LeafSpec), scp_protocol::context::ContextError> {
     let receipt: scp_protocol::context::outlets::cross_context_saga::CrossContextOutletStreamReceipt =
-        match serde_json::from_slice(&outcome.receipt) {
-            Ok(r) => r,
-            Err(err) => {
-                tracing::error!(
-                    saga_id = %saga_id.0,
-                    %err,
-                    "streaming-saga A-side record: sealed receipt could not be parsed for the \
-                     convergent timestamp/nonce — skipping CrossContextOutletInvoked"
-                );
-                return;
-            }
-        };
+        serde_json::from_slice(&outcome.receipt).map_err(|err| {
+            scp_protocol::context::ContextError::EventLogFailed(format!(
+                "streaming saga {}: the sealed receipt does not parse, so the A-side \
+                 CrossContextOutletInvoked leaf has no convergent timestamp or nonce: {err}",
+                saga_id.0
+            ))
+        })?;
     // The A-side leaf carries the SEALED manifest root (never the unary
     // `output_hash`) + the streaming counters, joined to B's `OutletInvoked` by
     // the shared `nonce`. The context id the leaf lands in is A
@@ -5718,38 +5763,20 @@ pub(crate) async fn record_streaming_saga_a_event(
         "stream_chunk_count": outcome.stream_chunk_count,
         "receipt_len": outcome.receipt.len(),
     });
-    let payload_bytes = match serde_json::to_vec(&payload) {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            tracing::error!(
-                saga_id = %saga_id.0,
-                %err,
-                "streaming-saga A-side record: CrossContextOutletInvoked payload serialization \
-                 failed — skipping"
-            );
-            return;
-        }
-    };
-    if let Err(err) = a_event_log
-        .append_context_event_with_payload(
-            crate::context::builder::AppendMode::AfterSideEffect,
-            &receipt.caller_context_id,
-            scp_event_log::EventType::CrossContextOutletInvoked,
-            &receipt.caller_did,
-            scp_event_log::EventPayload {
-                data: payload_bytes,
-            },
-            receipt.timestamp_ms / 1000,
-        )
-        .await
-    {
-        tracing::error!(
-            saga_id = %saga_id.0,
-            %err,
-            "streaming-saga A-side record: CrossContextOutletInvoked append failed — the sealed \
-             witness remains the authoritative dual-record source"
-        );
-    }
+    let data = serde_json::to_vec(&payload).map_err(|err| {
+        scp_protocol::context::ContextError::EventLogFailed(format!(
+            "streaming saga {}: the A-side CrossContextOutletInvoked payload does not \
+             serialize: {err}",
+            saga_id.0
+        ))
+    })?;
+    let leaf = crate::context::log_unit_helpers::plan_leaf(
+        scp_event_log::EventType::CrossContextOutletInvoked,
+        receipt.caller_did,
+        scp_event_log::EventPayload { data },
+        receipt.timestamp_ms / 1000,
+    )?;
+    Ok((hex::encode(receipt.caller_context_id), leaf))
 }
 
 /// Best-effort cross-context re-encrypting streaming bridge (SCP-OUT-036).
@@ -5812,6 +5839,10 @@ pub(crate) async fn record_streaming_saga_a_event(
 /// - [`CrossContextPaidActionUnsupported`](InvocationError::CrossContextPaidActionUnsupported)
 ///   — a paid Action outlet OR a positive billed `cost_per_chunk` (zero-escrow
 ///   rejection on the value actually billed).
+/// - [`ExecutionFailed`](InvocationError::ExecutionFailed) — no actor serves
+///   the receiving context A, or the Supervisor has no clock, so A's
+///   `OutletInvoked` record could not be queued at close (spec 17 §17.3). Both
+///   are checked before the B-side open reserves anything.
 /// - the mapped B-side open rejection
 ///   ([`From<OutletStreamOpenError>`](OutletStreamOpenError)),
 ///   including a §7.3.8 counter-CAS rejection when `caveat_binding`'s cap is
@@ -5819,7 +5850,6 @@ pub(crate) async fn record_streaming_saga_a_event(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn invoke_outlet_cross_context<E>(
     supervisor: &std::sync::Arc<crate::context::supervisor::Supervisor>,
-    a_event_log: std::sync::Arc<dyn crate::context::builder::ContextEventLogProvider>,
     receiving_context_id: &str,
     operating_context_id: &str,
     registry: &OutletRegistry,
@@ -5899,6 +5929,34 @@ where
         })
     })?;
 
+    // A's `OutletInvoked` record goes to A's actor at close (spec 17 §17.3).
+    // The close has no caller to report a failure to, so the two conditions
+    // this open can check fail it here, before the B-side open reserves
+    // anything: an actor serves A, and the Supervisor clock that dates the
+    // record reads. Committer-assigned leaf timestamp: A's close record is
+    // authored once by the bridge, not a cross-member convergent commit leaf,
+    // so the Supervisor clock is correct. The actor map is keyed by the hex of
+    // the context's 32-byte id, the same digest A's event log is keyed by.
+    let receiving_key = hex::encode(crate::context::state::context_id_to_bytes(
+        receiving_context_id,
+    ));
+    if supervisor.lookup(&receiving_key).is_none() {
+        return Err(OutletOpenError::from(InvocationError::ExecutionFailed {
+            message: format!(
+                "cross-context bridge: no actor serves the receiving context \
+                 {receiving_context_id}, so its OutletInvoked record cannot be queued"
+            ),
+        }));
+    }
+    let timestamp_secs = supervisor.now_secs().map_err(|err| {
+        OutletOpenError::from(InvocationError::ExecutionFailed {
+            message: format!(
+                "cross-context bridge: the Supervisor clock that dates the receiving \
+                 context's OutletInvoked record is unavailable: {err}"
+            ),
+        })
+    })?;
+
     // Open the B-side stream through the spawner taken above, so this open has
     // one shutdown refusal point. `open_outlet_stream_with_spawner` reserves escrow (zero for
     // Query / zero-cost), sources admission caps + timing policy from B's
@@ -5942,26 +6000,17 @@ where
     // `OutletStreamChunk`, forwarded verbatim (no bridge-local send-sequence).
     let (outer_tx, outer_rx) = mpsc::channel::<OutletStreamChunk>(1);
 
-    // Committer-assigned leaf timestamp for A's close event (a local wall-clock
-    // reading is correct — A's close event is authored once by the bridge, not
-    // a cross-member convergent commit leaf).
-    let timestamp_secs = supervisor.clock_ref().map_or(0, |clock| {
-        use scp_clock::Clock as _;
-        clock.now_secs()
-    });
-
     // Spawn the OFF-MAILBOX bridge task owning the inner receiver, the outer
-    // sender, the PINNED descriptor, the schemas, and A's event-log provider.
-    // The task holds no Supervisor reference, but it writes A's event log, so it
-    // spawns on the Supervisor's tracker and shutdown waits for that write
-    // before the owner closes storage (ADR-049 Decision 16, step 5).
+    // sender, the PINNED descriptor and the schemas. At close it sends A's
+    // `OutletInvoked` request to A's actor through a `Weak<Supervisor>`
+    // (ADR-049 Decision 16), so it spawns on the Supervisor's tracker and
+    // shutdown waits for that send.
     let bridge = run_cross_context_bridge(
         inner_rx,
         outer_tx,
         descriptor,
         output_schema,
         aggregate_schema,
-        a_event_log,
         receiving_context_id.to_owned(),
         invoker_did.clone(),
         request_id,
@@ -5972,7 +6021,11 @@ where
         MAX_CROSS_CONTEXT_STREAM_CHUNKS,
         None,
     );
-    spawner.spawn(bridge);
+    let weak_supervisor = std::sync::Arc::downgrade(supervisor);
+    spawner.spawn(async move {
+        let request = bridge.await;
+        send_cross_context_a_unit(&weak_supervisor, &receiving_key, request).await;
+    });
 
     Ok(outer_rx)
 }
@@ -6038,6 +6091,144 @@ mod tests {
             Capability::GovernanceVote,
             Capability::ContextClose,
         ])
+    }
+
+    /// A sealed streaming-saga outcome whose receipt names context A
+    /// (`caller`), for the A-side leaf planner.
+    fn sealed_stream_outcome(
+        caller: [u8; 32],
+    ) -> crate::context::actor::commands::CommitBStreamSettleOutcome {
+        use scp_protocol::context::outlets::cross_context_saga::CrossContextOutletStreamReceipt;
+        let receipt = CrossContextOutletStreamReceipt {
+            caller_context_id: caller,
+            target_context_id: [0x49; 32],
+            caller_did: "did:dht:z6MkCaller".to_owned(),
+            nonce: [7; 16],
+            outlet_registration_id: "outlet-x".to_owned(),
+            stream_manifest_hash: [0x5a; 32],
+            outlet_invoked_event_id: "evt-b".to_owned(),
+            chain_depth: 1,
+            timestamp_ms: 1_700_000_000_999,
+            signature: [0; 64],
+        };
+        crate::context::actor::commands::CommitBStreamSettleOutcome {
+            receipt: serde_json::to_vec(&receipt).expect("receipt json"),
+            stream_manifest_hash: [0x5a; 32],
+            billed: scp_protocol::economy::types::Amount(0),
+            refund: scp_protocol::economy::types::Amount(0),
+            billed_count: 3,
+            stream_chunk_count: 4,
+            outlet_invoked_event_id: "evt-b".to_owned(),
+            settlement: None,
+            generation: 1,
+        }
+    }
+
+    /// The streaming saga's A-side leaf lands in context A
+    /// (`receipt.caller_context_id`), is authored by the receipt's caller DID,
+    /// is dated by the receipt's convergent timestamp in whole seconds, and
+    /// carries the sealed root and counters (spec 06 §6.2.4 "Dual event-log
+    /// recording").
+    #[test]
+    fn streaming_saga_a_leaf_is_planned_from_the_sealed_receipt() {
+        let caller = [0x48u8; 32];
+        let saga_id = crate::context::supervisor::saga_journal::SagaId("saga-a".to_owned());
+        let (context, leaf) =
+            plan_streaming_saga_a_leaf(&saga_id, &sealed_stream_outcome(caller)).expect("plan");
+        assert_eq!(context, hex::encode(caller));
+        assert_eq!(
+            leaf.event_type(),
+            scp_event_log::EventType::CrossContextOutletInvoked
+        );
+        assert_eq!(leaf.actor_did(), "did:dht:z6MkCaller");
+        assert_eq!(leaf.timestamp_secs(), 1_700_000_000);
+        let payload: serde_json::Value =
+            serde_json::from_slice(&leaf.payload().data).expect("payload json");
+        assert_eq!(payload["saga_id"], "saga-a");
+        assert_eq!(payload["target_context_id"], hex::encode([0x49u8; 32]));
+        assert_eq!(payload["nonce"], hex::encode([7u8; 16]));
+        assert_eq!(payload["stream_manifest_hash"], hex::encode([0x5au8; 32]));
+        assert_eq!(payload["chunks_billed"], 3);
+        assert_eq!(payload["stream_chunk_count"], 4);
+    }
+
+    /// An unparseable sealed receipt gives the planner no convergent timestamp
+    /// or nonce, so it fails with `EventLogFailed` and plans no leaf.
+    #[test]
+    fn streaming_saga_a_leaf_refuses_an_unparseable_receipt() {
+        let mut outcome = sealed_stream_outcome([0x48; 32]);
+        outcome.receipt = b"not json".to_vec();
+        let saga_id = crate::context::supervisor::saga_journal::SagaId("saga-a".to_owned());
+        let err = plan_streaming_saga_a_leaf(&saga_id, &outcome).expect_err("unparseable receipt");
+        assert!(
+            matches!(err, scp_protocol::context::ContextError::EventLogFailed(_)),
+            "{err:?}"
+        );
+    }
+
+    /// The bridge's A-side record has no caller at close: a dropped
+    /// Supervisor, a context with no actor, or a planning failure takes the
+    /// undelivered branch, which reports `false` and increments
+    /// `scp_log_unit_undelivered_total` once per dropped record instead of
+    /// queuing (spec 17 §17.3).
+    #[test]
+    fn cross_context_a_unit_without_a_supervisor_is_undelivered() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a current-thread runtime");
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(cross_context_a_unit_undelivered_branches(&snapshotter));
+        });
+    }
+
+    async fn cross_context_a_unit_undelivered_branches(
+        snapshotter: &metrics_util::debugging::Snapshotter,
+    ) {
+        use crate::metrics::test_support::log_unit_undelivered_total;
+        let request = crate::context::actor::commands::LogUnitRequest::Leaves(Vec::new());
+        assert!(
+            !send_cross_context_a_unit(&std::sync::Weak::new(), "ctx", Ok(request.clone())).await
+        );
+        assert_eq!(
+            log_unit_undelivered_total(snapshotter),
+            1,
+            "a dropped Supervisor counts the record"
+        );
+        let supervisor = crate::context::test_supervisor(
+            std::sync::Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
+                "did:dht:z6MkBridgeA".to_owned(),
+                std::sync::Arc::new(scp_clock::SystemClock),
+            )),
+            Box::new(crate::context::builder::NotConfiguredTransportProvider),
+            Box::new(crate::context::providers::event_log::MerkleEventLogProvider::new()),
+            std::sync::Arc::new(|_, _| None),
+        );
+        assert!(
+            !send_cross_context_a_unit(
+                &std::sync::Arc::downgrade(&supervisor),
+                "ctx-no-actor",
+                Ok(request)
+            )
+            .await,
+            "a receiving context with no actor is undelivered"
+        );
+        assert_eq!(
+            log_unit_undelivered_total(snapshotter),
+            2,
+            "a receiving context with no actor counts the record"
+        );
+        let refused = Err(scp_protocol::context::ContextError::EventLogFailed(
+            "manifest".to_owned(),
+        ));
+        assert!(!send_cross_context_a_unit(&std::sync::Weak::new(), "ctx", refused).await);
+        assert_eq!(
+            log_unit_undelivered_total(snapshotter),
+            3,
+            "a record that did not plan counts"
+        );
     }
 
     /// Creates a `ContextRoleState` with a creator that has admin (all) capabilities.
@@ -7203,6 +7394,7 @@ mod tests {
     // budget_exceeded on outlet invocation returns BudgetExceeded
     #[tokio::test]
     async fn budget_exceeded_outlet_invoke() {
+        use crate::context::participation::test_support::empty_log_root;
         use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
         let policy = EconomicPolicy {
@@ -7252,10 +7444,7 @@ mod tests {
             sender_velocity: 0,
             storage_usage: 0,
         };
-        let mut participation: std::collections::HashMap<
-            String,
-            scp_protocol::trust::participation::ParticipationRecord,
-        > = std::collections::HashMap::new();
+        let mut participation = std::collections::HashMap::new();
         // Provide a spending UCAN so the AND-composition check passes;
         // the budget check (the actual test target) runs after.
         let spending_ucan = {
@@ -7299,7 +7488,11 @@ mod tests {
             now: 0,
             events: &[],
             convergent_now: 0,
-            participation_cache: &mut participation,
+            participation: super::OutletParticipation {
+                // The test's log holds no event, so its root is the empty log's.
+                root: empty_log_root().expect("the empty log's root"),
+                cache: &mut participation,
+            },
             consequence_rules: &[],
             payment_adapter: None,
             metrics,
@@ -8497,10 +8690,8 @@ mod tests {
         use ed25519_dalek::{Signer as _, SigningKey};
 
         use super::*;
-        use crate::context::builder::ContextEventLogProvider;
         use crate::context::outlets::signer::InProcessStreamSigner;
         use crate::context::providers::event_log::MerkleEventLogProvider;
-        use crate::context::state::context_id_to_bytes;
         use scp_protocol::context::outlets::stream::{
             OutletStreamOpen, compute_chunk_sig_preimage,
         };
@@ -8607,30 +8798,38 @@ mod tests {
             }
         }
 
-        /// Initializes a fresh receiving-context (A) event log.
-        async fn fresh_a_log() -> (Arc<MerkleEventLogProvider>, [u8; 32]) {
-            let provider = Arc::new(MerkleEventLogProvider::new());
-            let a_bytes = context_id_to_bytes(A_CTX);
-            provider.init_event_log(&a_bytes).await.expect("init A log");
-            (provider, a_bytes)
-        }
-
-        /// Reads back A's recorded `OutletInvokedEvent`, if any.
+        /// The bridge's A-side request as A's actor plans it
+        /// (`plan_outlet_invoked_verified_leaf`, the manifest re-check), decoded
+        /// back to the `OutletInvokedEvent` A's log would carry.
         fn read_a_invoked(
-            a_log: &MerkleEventLogProvider,
-            a_bytes: &[u8; 32],
+            request: &Result<
+                crate::context::actor::commands::LogUnitRequest,
+                scp_protocol::context::ContextError,
+            >,
         ) -> Option<OutletInvokedEvent> {
-            a_log.entries(a_bytes)?.into_iter().find_map(|entry| {
-                if entry.event_type == scp_event_log::EventType::OutletInvoked {
-                    serde_json::from_slice::<OutletInvokedEvent>(&entry.payload.data).ok()
-                } else {
-                    None
-                }
-            })
+            let crate::context::actor::commands::LogUnitRequest::VerifiedOutletInvoked {
+                event,
+                reassembled,
+                actor_did,
+                timestamp_secs,
+            } = request.as_ref().ok()?
+            else {
+                return None;
+            };
+            let leaf = crate::context::log_unit_helpers::plan_outlet_invoked_verified_leaf(
+                event,
+                reassembled,
+                actor_did,
+                *timestamp_secs,
+            )
+            .ok()?;
+            assert_eq!(leaf.event_type(), scp_event_log::EventType::OutletInvoked);
+            serde_json::from_slice::<OutletInvokedEvent>(&leaf.payload().data).ok()
         }
 
         /// Drives the bridge core to completion over a pre-built chunk
-        /// sequence, returning what A's invoker received plus A's log handle.
+        /// sequence, returning what A's invoker received plus the A-side
+        /// request the bridge hands to A's actor.
         async fn drive_bridge(
             chunks: Vec<OutletStreamChunk>,
             descriptor: CrossContextVerificationDescriptor,
@@ -8639,20 +8838,19 @@ mod tests {
             fault_probe: Option<BridgeFaultProbe>,
         ) -> (
             Vec<OutletStreamChunk>,
-            Arc<MerkleEventLogProvider>,
-            [u8; 32],
+            Result<
+                crate::context::actor::commands::LogUnitRequest,
+                scp_protocol::context::ContextError,
+            >,
         ) {
-            let (a_log, a_bytes) = fresh_a_log().await;
             let (inner_tx, inner_rx) = mpsc::channel::<OutletStreamChunk>(1);
             let (outer_tx, mut outer_rx) = mpsc::channel::<OutletStreamChunk>(1);
-            let a_dyn: Arc<dyn ContextEventLogProvider> = a_log.clone();
             let bridge = tokio::spawn(run_cross_context_bridge(
                 inner_rx,
                 outer_tx,
                 descriptor,
                 output_schema,
                 aggregate_schema,
-                a_dyn,
                 A_CTX.to_owned(),
                 DID::from(INVOKER),
                 RID,
@@ -8677,8 +8875,8 @@ mod tests {
                 received.push(chunk);
             }
             producer.await.expect("producer task");
-            bridge.await.expect("bridge task");
-            (received, a_log, a_bytes)
+            let a_request = bridge.await.expect("bridge task");
+            (received, a_request)
         }
 
         fn assert_terminal_error(chunk: &OutletStreamChunk, expected_code: &str) {
@@ -8714,7 +8912,6 @@ mod tests {
         #[allow(dead_code)]
         async fn ac2_return_type_is_plaintext_receiver(
             supervisor: &Arc<crate::context::supervisor::Supervisor>,
-            a_event_log: Arc<dyn crate::context::builder::ContextEventLogProvider>,
             registry: &OutletRegistry,
             outlet_id: &OutletId,
             invoker_did: &DID,
@@ -8724,7 +8921,6 @@ mod tests {
             let out: Result<mpsc::Receiver<OutletStreamChunk>, OutletOpenError> =
                 invoke_outlet_cross_context::<NoOpExecutor>(
                     supervisor,
-                    a_event_log,
                     "a",
                     "b",
                     registry,
@@ -8767,7 +8963,7 @@ mod tests {
                     end_payload(serde_json::json!({ "result": 1 })),
                 ),
             ];
-            let (received, _a_log, _a_bytes) = drive_bridge(
+            let (received, _a_request) = drive_bridge(
                 chunks,
                 pinned_descriptor(&op),
                 permissive_schema(),
@@ -8786,8 +8982,6 @@ mod tests {
         #[tokio::test]
         async fn ac3_bridge_forwards_without_buffering() {
             let op = operator_key();
-            let (a_log, _a_bytes) = fresh_a_log().await;
-            let a_dyn: Arc<dyn ContextEventLogProvider> = a_log.clone();
             let (inner_tx, inner_rx) = mpsc::channel::<OutletStreamChunk>(1);
             let (outer_tx, mut outer_rx) = mpsc::channel::<OutletStreamChunk>(1);
 
@@ -8797,7 +8991,6 @@ mod tests {
                 pinned_descriptor(&op),
                 permissive_schema(),
                 None,
-                a_dyn,
                 A_CTX.to_owned(),
                 DID::from(INVOKER),
                 RID,
@@ -8852,7 +9045,11 @@ mod tests {
                 received.push(chunk);
             }
             producer.await.expect("producer");
-            bridge.await.expect("bridge");
+            let a_request = bridge.await.expect("bridge");
+            assert!(
+                a_request.is_ok(),
+                "the bridge plans A's record after a faulted close: {a_request:?}"
+            );
             // The six Data chunks are forwarded in order; because the producer
             // drops its sender WITHOUT emitting a terminal, the bridge now
             // synthesizes a terminal transport-fault (§5.4.5 terminal guarantee)
@@ -8946,7 +9143,7 @@ mod tests {
                     },
                 ),
             ];
-            let (received, _a_log, _a_bytes) = drive_bridge(
+            let (received, _a_request) = drive_bridge(
                 chunks,
                 pinned_descriptor(&op),
                 strict_output_schema(),
@@ -8976,7 +9173,7 @@ mod tests {
                 0,
                 end_payload(serde_json::json!({ "summary": "done" })),
             )];
-            let (received, _a_log, _a_bytes) = drive_bridge(
+            let (received, _a_request) = drive_bridge(
                 chunks,
                 pinned_descriptor(&op),
                 strict_output_schema(),
@@ -9076,7 +9273,7 @@ mod tests {
                 // it) so the §5.4.5 crossing verification accepts B's chunks.
                 expected_request_id: b_chunks[0].request_id,
             };
-            let (received, a_log, a_bytes) = drive_bridge(
+            let (received, a_request) = drive_bridge(
                 b_chunks.clone(),
                 descriptor,
                 permissive_schema(),
@@ -9087,7 +9284,7 @@ mod tests {
             assert_eq!(received.len(), 10, "all 10 chunks forwarded to A");
 
             let a_event =
-                read_a_invoked(&a_log, &a_bytes).expect("A must record its OutletInvoked at close");
+                read_a_invoked(&a_request).expect("A must record its OutletInvoked at close");
             let a_hash = a_event.stream_manifest_hash;
 
             assert_eq!(
@@ -9112,7 +9309,6 @@ mod tests {
 
         #[tokio::test]
         async fn ac7_reject_chunks_billed_mismatch_refused_at_append() {
-            let (a_log, a_bytes) = fresh_a_log().await;
             let op = operator_key();
             let chunks = vec![
                 sign_chunk(
@@ -9157,17 +9353,10 @@ mod tests {
                 None,
                 None,
             );
-            let err = a_log
-                .append_outlet_invoked_verified(
-                    crate::context::builder::AppendMode::AfterSideEffect,
-                    &a_bytes,
-                    &bad_event,
-                    &chunks,
-                    INVOKER,
-                    0,
-                )
-                .await
-                .expect_err("mismatched chunks_billed must be refused at log-insert");
+            let err = crate::context::log_unit_helpers::plan_outlet_invoked_verified_leaf(
+                &bad_event, &chunks, INVOKER, 0,
+            )
+            .expect_err("mismatched chunks_billed must be refused at log-insert");
             assert!(
                 err.to_string().contains("ChunksBilled")
                     || err.to_string().contains("chunks_billed"),
@@ -9206,7 +9395,7 @@ mod tests {
             let probe: BridgeFaultProbe = Box::new(|chunk: &OutletStreamChunk| {
                 (chunk.sequence == 1).then(|| "injected re-encrypt fault".to_owned())
             });
-            let (received, _a_log, _a_bytes) = drive_bridge(
+            let (received, _a_request) = drive_bridge(
                 chunks,
                 pinned_descriptor(&op),
                 permissive_schema(),
@@ -9232,7 +9421,7 @@ mod tests {
                 0,
                 end_payload(serde_json::json!({ "summary": 123 })),
             )];
-            let (received, _a_log, _a_bytes) = drive_bridge(
+            let (received, _a_request) = drive_bridge(
                 chunks,
                 pinned_descriptor(&op),
                 strict_output_schema(),
@@ -9283,7 +9472,7 @@ mod tests {
 
             // End-to-end: the bridge rejects the forged chunk with an
             // Authorization-class terminal rather than forwarding it.
-            let (received, _a_log, _a_bytes) = drive_bridge(
+            let (received, _a_request) = drive_bridge(
                 vec![forged],
                 pinned_descriptor(&op),
                 permissive_schema(),
@@ -9369,11 +9558,9 @@ mod tests {
             if gate_closed {
                 supervisor.close_spawn_gate();
             }
-            let (a_log, _a_bytes) = fresh_a_log().await;
             let (params, incoming) = shutdown_gate_inputs();
             invoke_outlet_cross_context::<NoOpExecutor>(
                 &supervisor,
-                a_log,
                 A_CTX,
                 B_CTX,
                 &OutletRegistry::new(),
@@ -9549,7 +9736,7 @@ mod tests {
                     },
                 ),
             ];
-            let (received, _a_log, _a_bytes) = drive_bridge(
+            let (received, _a_request) = drive_bridge(
                 chunks,
                 pinned_descriptor(&op),
                 permissive_schema(),
@@ -9580,8 +9767,6 @@ mod tests {
             // ceiling without emitting a million chunks.
             const CAP: usize = 3;
             let op = operator_key();
-            let (a_log, _a_bytes) = fresh_a_log().await;
-            let a_dyn: Arc<dyn ContextEventLogProvider> = a_log.clone();
             let (inner_tx, inner_rx) = mpsc::channel::<OutletStreamChunk>(1);
             let (outer_tx, mut outer_rx) = mpsc::channel::<OutletStreamChunk>(1);
             let bridge = tokio::spawn(run_cross_context_bridge(
@@ -9590,7 +9775,6 @@ mod tests {
                 pinned_descriptor(&op),
                 permissive_schema(),
                 None,
-                a_dyn,
                 A_CTX.to_owned(),
                 DID::from(INVOKER),
                 RID,
@@ -9628,7 +9812,11 @@ mod tests {
                 received.push(chunk);
             }
             let _ = producer.await;
-            bridge.await.expect("bridge");
+            let a_request = bridge.await.expect("bridge");
+            assert!(
+                a_request.is_ok(),
+                "the bridge plans A's record after the cap breach: {a_request:?}"
+            );
 
             // The retained snapshot never grew unboundedly: the stream is
             // terminated with a transport-fault once the cap is reached.
@@ -9682,7 +9870,7 @@ mod tests {
             );
 
             // End-to-end: the bridge emits the AC11 Authorization-class terminal.
-            let (received, _a_log, _a_bytes) = drive_bridge(
+            let (received, _a_request) = drive_bridge(
                 vec![foreign],
                 pinned_descriptor(&op),
                 permissive_schema(),
@@ -9779,7 +9967,7 @@ mod tests {
                 end_payload(serde_json::json!({ "n": 9 })),
             ));
 
-            let (received, _a_log, _a_bytes) = drive_bridge(
+            let (received, _a_request) = drive_bridge(
                 chunks,
                 pinned_descriptor(&op),
                 permissive_schema(),
@@ -9831,7 +10019,6 @@ mod tests {
         /// (whose `Drop` asks its sink for the refund), and returns.
         #[tokio::test]
         async fn seal_task_with_dropped_supervisor_drops_the_ticket_and_returns() {
-            let (a_log, _) = fresh_a_log().await;
             let sink = Arc::new(RecordingRefundSink::default());
             let ticket = crate::context::outlets::dispatch::StreamEscrowTicket::new(
                 Arc::clone(&sink)
@@ -9856,7 +10043,6 @@ mod tests {
                     pinned_descriptor(&operator_key()),
                     permissive_schema(),
                     None,
-                    a_log as Arc<dyn ContextEventLogProvider>,
                 ),
             )
             .await

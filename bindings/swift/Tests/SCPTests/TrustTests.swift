@@ -193,3 +193,47 @@ final class TrustTests: XCTestCase {
         XCTAssertEqual(json, "[]")
     }
 }
+
+/// `SCP.participationRecord` against the linked bridge.
+final class ParticipationRecordBridgeTests: XCTestCase {
+    // Implicitly unwrapped because XCTest `setUp` initializes it before any
+    // test method runs — the XCTest lifecycle guarantees non-nil.
+    // swiftlint:disable:next implicitly_unwrapped_optional
+    var scp: SCP!
+
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        scp = try SCP(storage: .inMemory)
+    }
+
+    override func tearDown() async throws {
+        try await scp.shutdown(timeoutMillis: 1000)
+        scp = nil
+        try await super.tearDown()
+    }
+
+    /// A context with no log is an absent state, never an empty log (spec 17
+    /// §17.3): a never-created context surfaces as a generic context error, not
+    /// the `noParticipationFactsCode` that `evaluateTrust` folds into a zeroed
+    /// record (spec 07 §7.3.2).
+    ///
+    /// The instance's supervisor starts with its first context, so the test
+    /// creates one first; without it the bridge refuses before the supervisor
+    /// looks the context up.
+    func testNeverCreatedContextIsAnErrorNeverTheEmptyLogCode() async throws {
+        _ = try await contextRequiring(scp, [
+            .selfAttested(capability: "scp:capability:messages-write/v1")
+        ])
+        do {
+            _ = try await scp.participationRecord(
+                contextId: "ctx-never-created",
+                subjectDid: "did:dht:zSubject"
+            )
+            XCTFail("expected ScpError.Context for a never-created context")
+        } catch let ScpError.Context(msg, code) {
+            XCTAssertEqual(code, "SCP-CTX-2000")
+            XCTAssertNotEqual(code, noParticipationFactsCode)
+            XCTAssertTrue(msg.contains("context not registered"), msg)
+        }
+    }
+}

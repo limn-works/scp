@@ -84,7 +84,17 @@ impl ContextEventLogProvider for MockEventLog {
         &self,
         _context_id: &[u8; 32],
     ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError> {
-        Ok(None)
+        Ok(Some(Vec::new()))
+    }
+
+    /// The fixture holds no entry, so its root is the empty log's root.
+    fn event_log_merkle_root(
+        &self,
+        _context_id: &[u8; 32],
+    ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+        Ok(scp_event_log::tree::root(&scp_event_log::EventLog::new(
+            String::new(),
+        )))
     }
 
     async fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {

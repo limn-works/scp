@@ -49,6 +49,12 @@ disallowed-types = [
 ]
 
 # Clippy reads only the configuration file nearest the crate, so the workspace
+# `.clippy.toml` does not apply here. This entry repeats its admission of
+# `expect` in `#[cfg(test)]` items and `#[test]` functions, so no test module
+# carries its own `#[allow(clippy::expect_used)]`.
+allow-expect-in-tests = true
+
+# Clippy reads only the configuration file nearest the crate, so the workspace
 # `.clippy.toml` does not apply here; these entries repeat its ban.
 # `crypto::mls::production_backend::tests::signer_store_is_disallowed_and_refused`
 # carries a control `expect` for each signer-storage entry, and

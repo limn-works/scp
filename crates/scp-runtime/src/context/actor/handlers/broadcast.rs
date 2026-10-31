@@ -706,7 +706,17 @@ mod tests {
             _context_id: &[u8; 32],
         ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
         {
-            Ok(None)
+            Ok(Some(Vec::new()))
+        }
+
+        /// The fixture holds no entry, so its root is the empty log's root.
+        fn event_log_merkle_root(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok(scp_event_log::tree::root(&scp_event_log::EventLog::new(
+                String::new(),
+            )))
         }
 
         async fn init_event_log(
@@ -735,6 +745,59 @@ mod tests {
             _id: &[u8; 32],
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             Ok(())
+        }
+        /// The log's length is the count of recorded leaves, so the drain of a
+        /// queued unit writes through [`Self::append_event`] and a test counts
+        /// the leaves a drain wrote.
+        async fn lock_for_unit(
+            &self,
+            context_id: &[u8; 32],
+        ) -> Result<
+            crate::context::builder::UnitWriteGuard,
+            scp_protocol::context::builder::ContextCreationError,
+        > {
+            let len = u64::try_from(self.appended.load(Ordering::SeqCst)).map_err(|_| {
+                scp_protocol::context::builder::ContextCreationError::EventLogFailed(
+                    "leaf count exceeds u64".into(),
+                )
+            })?;
+            Ok(crate::context::builder::UnitWriteGuard::new(
+                *context_id,
+                None,
+                len,
+            ))
+        }
+        async fn append_unit(
+            &self,
+            guard: crate::context::builder::UnitWriteGuard,
+            base_seq: u64,
+            leaves: &[crate::context::state::LeafSpec],
+        ) -> Result<crate::context::builder::UnitAppended, crate::context::builder::UnitAppendError>
+        {
+            let log_len = guard.log_len();
+            if base_seq > log_len {
+                return Err(crate::context::builder::UnitAppendError::PastEnd {
+                    base_seq,
+                    log_len,
+                });
+            }
+            if base_seq < log_len {
+                return Err(crate::context::builder::UnitAppendError::Misaligned {
+                    base_seq,
+                    log_len,
+                });
+            }
+            for leaf in leaves {
+                self.append_event(
+                    guard.context_id(),
+                    leaf.event_type(),
+                    leaf.actor_did(),
+                    leaf.payload().clone(),
+                    leaf.timestamp_secs(),
+                )
+                .await?;
+            }
+            Ok(crate::context::builder::UnitAppended::Appended)
         }
     }
 
@@ -1155,6 +1218,67 @@ mod tests {
             appends.load(Ordering::SeqCst),
             appends_after_ban,
             "a rejected banned replay must append NO new MemberJoined leaf"
+        );
+    }
+
+    /// A rotating unsubscribe plans every author's `KeyEpochAdvance` record
+    /// before it rotates any key, so an author at the last epoch refuses the
+    /// unsubscribe with no author rotated (spec 17 §17.3 "Event log write
+    /// failures"; ADR-007 §5). Without the plan, the rotation advances the
+    /// authors before the last one and then fails, leaving those epochs
+    /// advanced with no record.
+    #[tokio::test]
+    async fn rotating_unsubscribe_with_an_author_at_the_last_epoch_rotates_no_author() {
+        const LAST_AUTHOR: &str = "did:example:zz-author-at-the-last-epoch";
+        let (deps, _appends) = build_deps().await;
+        let (mut state, ctx_hex) = build_broadcast_state_with_authors(
+            BroadcastAdmission::Gated,
+            &[CREATOR_DID, LAST_AUTHOR],
+        );
+        let mut snapshot = state
+            .broadcast_context
+            .as_ref()
+            .expect("a broadcast context")
+            .to_snapshot();
+        snapshot
+            .authors
+            .get_mut(LAST_AUTHOR)
+            .expect("the second author")
+            .epoch = u64::MAX;
+        state.broadcast_context = Some(BroadcastContext::from_snapshot(snapshot));
+        let mut cell = ClassSCell::new(state);
+        let grant = mint_read_ucan(&ctx_hex, CREATOR_DID, SUBSCRIBER_DID, &creator_key());
+        dispatch_subscribe(&mut cell, &deps, &ctx_hex, Some(grant))
+            .await
+            .expect("the subscribe lands");
+
+        let result = crate::context::broadcast_helpers::unsubscribe_broadcast(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &DID(SUBSCRIBER_DID.to_owned()),
+            true,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(ContextError::CryptoFailed(_))),
+            "the unsubscribe is refused: {result:?}"
+        );
+        let broadcast = cell
+            .broadcast_context
+            .as_ref()
+            .expect("a broadcast context");
+        assert_eq!(
+            broadcast
+                .get_author(CREATOR_DID)
+                .map(scp_protocol::context::AuthorState::epoch),
+            Some(0),
+            "the first author's key did not rotate"
+        );
+        assert!(
+            crate::context::broadcast_helpers::is_broadcast_subscriber(&mut cell, SUBSCRIBER_DID),
+            "the refused unsubscribe leaves the subscriber on the roster"
         );
     }
 
@@ -1587,6 +1711,10 @@ mod tests {
 
         // The un-banned DID can re-subscribe with a fresh grant, emitting a
         // MemberJoined leaf.
+        // The actor drains the queue before it handles each command.
+        crate::context::log_unit_helpers::drain_pending_log_units(&mut cell, &deps, &ctx_hex)
+            .await
+            .expect("the earlier records drain");
         let appends_before = appends.load(Ordering::SeqCst);
         let regrant = mint_read_ucan(&ctx_hex, CREATOR_DID, SUBSCRIBER_DID, &creator_key());
         dispatch_subscribe(&mut cell, &deps, &ctx_hex, Some(regrant))
@@ -1779,7 +1907,17 @@ mod tests {
             _context_id: &[u8; 32],
         ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
         {
-            Ok(None)
+            Ok(Some(Vec::new()))
+        }
+
+        /// The fixture holds no entry, so its root is the empty log's root.
+        fn event_log_merkle_root(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok(scp_event_log::tree::root(&scp_event_log::EventLog::new(
+                String::new(),
+            )))
         }
 
         async fn init_event_log(
@@ -1908,6 +2046,16 @@ mod tests {
 
     /// Zero the leaf counter so an assertion measures ONLY the operation under
     /// test, not the fixture's own setup leaves.
+    /// Every queued record as `(event type, payload bytes)`, oldest first.
+    fn queued_leaves(cell: &ClassSCell) -> Vec<(scp_event_log::EventType, Vec<u8>)> {
+        cell.class_s
+            .pending_log_units
+            .iter()
+            .flat_map(|unit| unit.leaves.iter())
+            .map(|leaf| (leaf.event_type(), leaf.payload().data.clone()))
+            .collect()
+    }
+
     fn reset_leaf_counter(cell: &mut ClassSCell) {
         *cell.class_c_view().checkpoint_events_since_mut() = 0;
     }
@@ -1984,21 +2132,248 @@ mod tests {
         );
     }
 
-    /// `execute_rotate_content_keys` must RETURN `Ok` when a `KeyEpochAdvance`
-    /// append fails, must keep appending the remaining leaves, and must credit
-    /// exactly the leaves that landed.
-    ///
-    /// The rotation and the `ContentKeysRotated` anchor leaf are already durable
-    /// when the loop runs, so an `Err` here would not undo them — it would tell
-    /// `execute_governance_action` to remove the proposal id from
-    /// `executed_proposals`, re-arming replay of an action that advances every
-    /// author's epoch again (see
-    /// `key_epoch_advance_failure_keeps_executed_proposal_marker`).
+    // ---- Spec 17 §17.3 "Event log write failures": a refused log write after
+    // a broadcast step keeps the step and leaves its leaves queued in the
+    // persist that recorded the step. Each test fails the log's entry writes
+    // from just before the operation under test, so the operation's own drain
+    // is refused and its unit stays queued.
+
+    /// An ACTIVE open broadcast cell with `authors`, deps over a Merkle log the
+    /// test can fail, and the snapshot store the deps write through.
+    async fn broadcast_over_faulty_log(
+        authors: &[&str],
+    ) -> (
+        ClassSCell,
+        String,
+        ActorDeps,
+        Arc<crate::context::supervisor::faulty_storage::FaultyStorage>,
+        crate::context::log_unit_helpers::test_support::SharedSnapshots,
+    ) {
+        let (cell, ctx_hex) = build_broadcast_cell_with_authors(BroadcastAdmission::Open, authors);
+        let (deps, faulty, snapshots) =
+            crate::context::log_unit_helpers::test_support::deps_over_faulty_log(
+                "did:example:broadcast-actor",
+                &ctx_hex,
+            )
+            .await;
+        (cell, ctx_hex, deps, faulty, snapshots)
+    }
+
+    /// Fails the log's entry writes from here on and returns the log's length
+    /// at that point.
+    fn fail_entry_writes(
+        deps: &ActorDeps,
+        faulty: &crate::context::supervisor::faulty_storage::FaultyStorage,
+        ctx_hex: &str,
+    ) -> usize {
+        let ctx_bytes = crate::context::state::context_id_to_bytes(ctx_hex);
+        crate::context::log_unit_helpers::test_support::fail_log_entry_writes(faulty, &ctx_bytes);
+        crate::context::log_unit_helpers::test_support::log_len(deps, &ctx_bytes)
+    }
+
+    /// Asserts the in-memory queue and the stored snapshot's queue both hold
+    /// exactly `expected`, and that the log still holds `log_before` entries.
+    async fn assert_queued_and_persisted(
+        queued: Vec<Vec<scp_event_log::EventType>>,
+        deps: &ActorDeps,
+        snapshots: &crate::context::log_unit_helpers::test_support::SharedSnapshots,
+        ctx_hex: &str,
+        expected: &[Vec<scp_event_log::EventType>],
+        log_before: usize,
+    ) {
+        use crate::context::log_unit_helpers::test_support::log_len;
+        assert_eq!(
+            queued, expected,
+            "the refused leaves stay queued as one unit"
+        );
+        assert_eq!(
+            snapshots.persisted_unit_types(ctx_hex).await,
+            expected,
+            "the unit is in the fail-closed persist that recorded the step"
+        );
+        assert_eq!(
+            log_len(deps, &crate::context::state::context_id_to_bytes(ctx_hex)),
+            log_before,
+            "the refused leaves never reached the log"
+        );
+    }
+
     #[tokio::test]
-    async fn rotate_content_keys_survives_key_epoch_advance_append_failure() {
+    async fn subscribe_append_failure_after_side_effect_keeps_step_and_queues_leaf() {
+        let (mut cell, ctx_hex, deps, faulty, snapshots) =
+            broadcast_over_faulty_log(&[CREATOR_DID]).await;
+        let log_before = fail_entry_writes(&deps, &faulty, &ctx_hex);
+
+        dispatch_subscribe(&mut cell, &deps, &ctx_hex, None)
+            .await
+            .expect("a refused log write after the roster ADD must not fail the subscribe");
+
+        assert!(
+            crate::context::broadcast_helpers::is_broadcast_subscriber(&mut cell, SUBSCRIBER_DID),
+            "the subscribe is kept, not compensated"
+        );
+        assert!(cell.membership.contains(&DID(SUBSCRIBER_DID.to_owned())));
+        assert_queued_and_persisted(
+            crate::context::log_unit_helpers::test_support::queued_unit_types(
+                &cell.class_s.pending_log_units,
+            ),
+            &deps,
+            &snapshots,
+            &ctx_hex,
+            &[vec![scp_event_log::EventType::MemberJoined]],
+            log_before,
+        )
+        .await;
+        assert_eq!(
+            cell.checkpoint_events_since, 1,
+            "the queued leaf is credited"
+        );
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_append_failure_after_side_effect_keeps_step_and_queues_leaf() {
+        let (mut cell, ctx_hex, deps, faulty, snapshots) =
+            broadcast_over_faulty_log(&AUTHORS_3).await;
+        dispatch_subscribe(&mut cell, &deps, &ctx_hex, None)
+            .await
+            .expect("open subscribe");
+        let log_before = fail_entry_writes(&deps, &faulty, &ctx_hex);
+        reset_leaf_counter(&mut cell);
+
+        crate::context::broadcast_helpers::unsubscribe_broadcast(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &DID(SUBSCRIBER_DID.to_owned()),
+            true,
+        )
+        .await
+        .expect("a refused log write after the roster REMOVE must not fail the unsubscribe");
+
+        assert!(
+            !crate::context::broadcast_helpers::is_broadcast_subscriber(&mut cell, SUBSCRIBER_DID),
+            "the unsubscribe is kept, not compensated"
+        );
+        let mut unit = vec![scp_event_log::EventType::MemberLeft];
+        unit.extend([scp_event_log::EventType::KeyEpochAdvance; AUTHORS_3.len()]);
+        assert_queued_and_persisted(
+            crate::context::log_unit_helpers::test_support::queued_unit_types(
+                &cell.class_s.pending_log_units,
+            ),
+            &deps,
+            &snapshots,
+            &ctx_hex,
+            &[unit],
+            log_before,
+        )
+        .await;
+        assert_eq!(
+            cell.checkpoint_events_since,
+            1 + AUTHORS_3.len() as u64,
+            "every queued leaf is credited"
+        );
+    }
+
+    #[tokio::test]
+    async fn block_append_failure_after_side_effect_keeps_step_and_queues_leaf() {
+        let (mut cell, ctx_hex, deps, faulty, snapshots) =
+            broadcast_over_faulty_log(&[CREATOR_DID]).await;
+        dispatch_subscribe(&mut cell, &deps, &ctx_hex, None)
+            .await
+            .expect("open subscribe");
+        let log_before = fail_entry_writes(&deps, &faulty, &ctx_hex);
+
+        crate::context::broadcast_helpers::block_broadcast_subscriber(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &DID(CREATOR_DID.to_owned()),
+            &DID(SUBSCRIBER_DID.to_owned()),
+        )
+        .await
+        .expect("a refused log write after the block must not fail the block");
+
+        assert!(
+            cell.broadcast_context
+                .as_ref()
+                .is_some_and(|bc| bc.is_blocked(CREATOR_DID, SUBSCRIBER_DID)),
+            "the block is kept, not compensated"
+        );
+        assert_queued_and_persisted(
+            crate::context::log_unit_helpers::test_support::queued_unit_types(
+                &cell.class_s.pending_log_units,
+            ),
+            &deps,
+            &snapshots,
+            &ctx_hex,
+            &[vec![
+                scp_event_log::EventType::MemberBlocked,
+                scp_event_log::EventType::KeyEpochAdvance,
+            ]],
+            log_before,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn unblock_append_failure_after_side_effect_keeps_step_and_queues_leaf() {
+        let (mut cell, ctx_hex, deps, faulty, snapshots) =
+            broadcast_over_faulty_log(&[CREATOR_DID]).await;
+        dispatch_subscribe(&mut cell, &deps, &ctx_hex, None)
+            .await
+            .expect("open subscribe");
+        crate::context::broadcast_helpers::block_broadcast_subscriber(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &DID(CREATOR_DID.to_owned()),
+            &DID(SUBSCRIBER_DID.to_owned()),
+        )
+        .await
+        .expect("block");
+        let log_before = fail_entry_writes(&deps, &faulty, &ctx_hex);
+
+        crate::context::broadcast_helpers::unblock_broadcast_subscriber(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &DID(CREATOR_DID.to_owned()),
+            &DID(SUBSCRIBER_DID.to_owned()),
+        )
+        .await
+        .expect("a refused log write after the unblock must not fail the unblock");
+
+        assert!(
+            cell.broadcast_context
+                .as_ref()
+                .is_some_and(|bc| !bc.is_blocked(CREATOR_DID, SUBSCRIBER_DID)),
+            "the unblock is kept, not compensated"
+        );
+        assert_queued_and_persisted(
+            crate::context::log_unit_helpers::test_support::queued_unit_types(
+                &cell.class_s.pending_log_units,
+            ),
+            &deps,
+            &snapshots,
+            &ctx_hex,
+            &[vec![scp_event_log::EventType::MemberUnblocked]],
+            log_before,
+        )
+        .await;
+    }
+
+    /// `execute_rotate_content_keys` writes nothing to the log after its step:
+    /// the `ContentKeysRotated` record and one `KeyEpochAdvance` per rotated
+    /// author are queued as one unit in the rotation's fail-closed persist
+    /// (spec 17 §17.3 "Event log write failures"), and every queued record is
+    /// credited. A log that refuses `KeyEpochAdvance` writes therefore cannot
+    /// fail the rotation: an `Err` here would tell `execute_governance_action`
+    /// to treat a durable rotation as failed.
+    #[tokio::test]
+    async fn rotate_content_keys_queues_every_key_epoch_advance_record() {
         let (mut deps, _appends) = build_deps().await;
-        // Anchor leaf + KEA #0 land; KEA #1 (of three) fails; KEA #2 must still
-        // be attempted and must land.
+        // A log that refuses the second KeyEpochAdvance write; the helper
+        // writes none, so the refusal never reaches it.
         let appends = inject_kea_failing_log(&mut deps, 1);
         let (mut cell, ctx_hex) =
             build_broadcast_cell_with_authors(BroadcastAdmission::Open, &AUTHORS_3);
@@ -2015,27 +2390,36 @@ mod tests {
 
         assert!(
             result.is_ok(),
-            "a KeyEpochAdvance append failure must NOT become the dispatch's \
-             error: `execute_governance_action` rolls back the executed-proposal \
-             replay marker on any dispatch error, and the rotation is already \
-             durable here; got {result:?}"
+            "a log that refuses KeyEpochAdvance writes must not fail a durable \
+             rotation; got {result:?}"
         );
         assert_eq!(
             appends.load(Ordering::SeqCst),
-            3,
-            "ContentKeysRotated + KEA #0 + KEA #2 became durable — the loop must \
-             continue past the failed KEA #1 rather than abort on it"
+            0,
+            "the helper writes no record to the log; its records are queued"
         );
         assert_eq!(
-            cell.checkpoint_events_since, 3,
-            "the inline per-leaf bump must credit exactly the three leaves that \
-             landed and must not credit the failed one"
+            crate::context::log_unit_helpers::test_support::queued_unit_types(
+                &cell.class_s.pending_log_units
+            ),
+            vec![vec![
+                scp_event_log::EventType::ContentKeysRotated,
+                scp_event_log::EventType::KeyEpochAdvance,
+                scp_event_log::EventType::KeyEpochAdvance,
+                scp_event_log::EventType::KeyEpochAdvance,
+            ]],
+            "the anchor record and one KeyEpochAdvance per author are one unit"
+        );
+        assert_eq!(
+            cell.checkpoint_events_since, 4,
+            "every queued record is credited"
         );
     }
 
-    /// `execute_revoke`'s governance-ban KeyEpochAdvance loop, same contract.
+    /// `execute_revoke`'s governance ban, same contract: the `AccessRevoked`
+    /// record and one `KeyEpochAdvance` per rotated author are one queued unit.
     #[tokio::test]
-    async fn revoke_survives_key_epoch_advance_append_failure() {
+    async fn revoke_queues_every_key_epoch_advance_record() {
         use scp_protocol::context::governance::AccessScope;
 
         let (mut deps, _appends) = build_deps().await;
@@ -2049,8 +2433,8 @@ mod tests {
             "member".to_owned(),
             vec![],
         );
-        // AccessRevoked + KEA #0 land; KEA #1 (of three) fails; KEA #2 must
-        // still be attempted and must land.
+        // A log that refuses the second KeyEpochAdvance write; the helper
+        // writes none, so the refusal never reaches it.
         let appends = inject_kea_failing_log(&mut deps, 1);
         reset_leaf_counter(&mut cell);
 
@@ -2066,21 +2450,29 @@ mod tests {
 
         assert!(
             result.is_ok(),
-            "a KeyEpochAdvance append failure must NOT become the dispatch's \
-             error: the ban and every author-key rotation are already durable \
-             here, and `execute_governance_action` rolls back the \
-             executed-proposal replay marker on any dispatch error; got {result:?}"
+            "a log that refuses KeyEpochAdvance writes must not fail a durable \
+             ban; got {result:?}"
         );
         assert_eq!(
             appends.load(Ordering::SeqCst),
-            3,
-            "AccessRevoked + KEA #0 + KEA #2 became durable — the loop must \
-             continue past the failed KEA #1 rather than abort on it"
+            0,
+            "the helper writes no record to the log; its records are queued"
         );
         assert_eq!(
-            cell.checkpoint_events_since, 3,
-            "the inline per-leaf bump must credit exactly the three leaves that \
-             landed and must not credit the failed one"
+            crate::context::log_unit_helpers::test_support::queued_unit_types(
+                &cell.class_s.pending_log_units
+            ),
+            vec![vec![
+                scp_event_log::EventType::AccessRevoked,
+                scp_event_log::EventType::KeyEpochAdvance,
+                scp_event_log::EventType::KeyEpochAdvance,
+                scp_event_log::EventType::KeyEpochAdvance,
+            ]],
+            "the anchor record and one KeyEpochAdvance per author are one unit"
+        );
+        assert_eq!(
+            cell.checkpoint_events_since, 4,
+            "every queued record is credited"
         );
     }
 
@@ -2181,22 +2573,17 @@ mod tests {
         );
     }
 
-    /// THE CLASS GATE. The anchor-leaf append that follows a helper's
-    /// fail-closed `commit_class_s_keep` fails, so the helper returns `Err`
-    /// after the ban and every author-key rotation are durable. The replay
-    /// marker must survive that error: `execute_governance_action` reads the
-    /// cell's `mutation_epoch` before and after dispatch, the keep-commit
-    /// advanced it, and so the error is classified as post-effect. A second
-    /// execute of the same proposal id must be refused as already executed and
-    /// must append nothing.
-    ///
-    /// Before the epoch rule, this exact sequence removed the marker and let a
-    /// retry run `governance_ban_subscriber` again, which advances every
-    /// author's epoch a second time (§9.9.3 divergence). The same shape sits at
-    /// the anchor leaf of every other `execute_*` helper in
-    /// `governance_helpers.rs`; the rule closes them all at the one caller.
+    /// A log that refuses the ban's `AccessRevoked` write cannot fail the ban:
+    /// `execute_revoke` queues the record with one `KeyEpochAdvance` per
+    /// rotated author in the ban's fail-closed persist and writes nothing
+    /// after its step (spec 17 §17.3 "Event log write failures"). The action
+    /// completes, the replay marker stays, the proposal leaves
+    /// `approved_proposals`, and a second execute of the same proposal id is
+    /// refused as already executed and queues nothing: a second run of
+    /// `governance_ban_subscriber` would advance every author's epoch again
+    /// (§9.9.3 divergence).
     #[tokio::test]
-    async fn anchor_leaf_failure_after_commit_keeps_marker_and_blocks_re_execution() {
+    async fn log_refusal_after_the_ban_queues_its_records_and_blocks_re_execution() {
         use scp_protocol::context::governance::{AccessScope, GovernanceAction};
 
         let (mut deps, _appends) = build_deps().await;
@@ -2220,8 +2607,7 @@ mod tests {
             "member".to_owned(),
             vec![],
         );
-        // The first `AccessRevoked` append fails — after `commit_class_s_keep`
-        // has persisted the ban and rotated every author.
+        // A log that refuses the `AccessRevoked` write.
         let appends = inject_failing_log(&mut deps, scp_event_log::EventType::AccessRevoked, 0);
 
         let first = crate::context::governance_helpers::execute_governance_action(
@@ -2236,15 +2622,15 @@ mod tests {
         .await;
 
         assert!(
-            matches!(first, Err(ContextError::EventLogFailed(_))),
-            "the anchor-leaf append failure must reach the caller unchanged; got {first:?}"
+            first.is_ok(),
+            "a log that refuses the record's write cannot fail the ban; got {first:?}"
         );
         assert!(
             cell.governance
                 .class_s
                 .executed_proposals
                 .contains_key(&proposal_id),
-            "a dispatch error raised AFTER the keep-commit must keep the replay marker"
+            "an executed proposal keeps its replay marker"
         );
         assert!(
             !cell
@@ -2255,15 +2641,20 @@ mod tests {
              blocks its re-execution, so an entry that stayed would make every \
              later conflicting proposal lose to a proposal that can never run"
         );
-        let landed_after_first = appends.load(Ordering::SeqCst);
-        assert_eq!(
-            landed_after_first, 0,
-            "`AccessRevoked` is the first append `execute_revoke` makes and it \
-             failed, so nothing else may land: a `GovernanceActionExecuted` leaf \
-             here would record as completed an action the helper reported as \
-             failed, so `execute_governance_action` must not run finalize on a \
-             post-effect dispatch error"
+        let queued_after_first = crate::context::log_unit_helpers::test_support::queued_unit_types(
+            &cell.class_s.pending_log_units,
         );
+        assert_eq!(
+            queued_after_first.first(),
+            Some(&vec![
+                scp_event_log::EventType::AccessRevoked,
+                scp_event_log::EventType::KeyEpochAdvance,
+                scp_event_log::EventType::KeyEpochAdvance,
+                scp_event_log::EventType::KeyEpochAdvance,
+            ]),
+            "the ban's records are queued as one unit"
+        );
+        let landed_after_first = appends.load(Ordering::SeqCst);
 
         let second = crate::context::governance_helpers::execute_governance_action(
             &mut cell,
@@ -2286,14 +2677,21 @@ mod tests {
         assert_eq!(
             appends.load(Ordering::SeqCst),
             landed_after_first,
-            "the refused replay must append no leaf: a second run would rotate \
-             every author again and write a second AccessRevoked leaf"
+            "the refused replay must write no record"
+        );
+        assert_eq!(
+            crate::context::log_unit_helpers::test_support::queued_unit_types(
+                &cell.class_s.pending_log_units
+            ),
+            queued_after_first,
+            "the refused replay must queue no record: a second run would rotate \
+             every author again and queue a second AccessRevoked record"
         );
     }
 
     /// A later proposal that conflicts with a consumed one (a same-DID
     /// `RevokeAccess`, per `actions_conflict`) must be admitted once the
-    /// consumed proposal's post-effect failure has removed it from
+    /// consumed proposal's execution has removed it from
     /// `approved_proposals`. Before the fix, `detect_and_handle_conflicts`
     /// found the consumed entry, saw the later proposal's higher sequence,
     /// returned `ConflictResolved` with the later proposal as loser, and never
@@ -2336,8 +2734,8 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(first, Err(ContextError::EventLogFailed(_))),
-            "the fixture's anchor-leaf failure must be post-effect; got {first:?}"
+            first.is_ok(),
+            "the fixture executes the proposal; got {first:?}"
         );
         assert!(
             cell.governance
@@ -2378,14 +2776,13 @@ mod tests {
         );
     }
 
-    /// A finalize error — the `GovernanceActionExecuted` append fails after the
-    /// dispatch applied its effect — keeps the replay marker, so the proposal is
-    /// consumed and must leave `approved_proposals` in the same fail-closed
-    /// persist. Before the fix `finalize_governance_action` owned the removal
-    /// and ran it after that append, so the append failure skipped it and the
-    /// entry outlived its marker.
+    /// A log that refuses the `GovernanceActionExecuted` record cannot fail
+    /// the action: finalize writes nothing and queues the record after the
+    /// dispatch's unit, in the persist that keeps the replay marker and removes
+    /// the consumed proposal from `approved_proposals` (spec 17 §17.3 "Event
+    /// log write failures").
     #[tokio::test]
-    async fn finalize_leaf_failure_removes_the_consumed_proposal_from_approved_proposals() {
+    async fn finalize_record_refusal_does_not_fail_the_action() {
         use scp_protocol::context::governance::{AccessScope, GovernanceAction};
 
         let (mut deps, _appends) = build_deps().await;
@@ -2427,27 +2824,38 @@ mod tests {
         .await;
 
         assert!(
-            matches!(result, Err(ContextError::EventLogFailed(_))),
-            "the executed-leaf append failure must reach the caller; got {result:?}"
+            result.is_ok(),
+            "a refused executed record does not fail the action; got {result:?}"
         );
-        assert!(
-            appends.load(Ordering::SeqCst) >= 1,
-            "the dispatch's own leaves landed before finalize failed"
+        assert_eq!(
+            crate::context::log_unit_helpers::test_support::queued_unit_types(
+                &cell.class_s.pending_log_units
+            ),
+            vec![
+                vec![
+                    scp_event_log::EventType::AccessRevoked,
+                    scp_event_log::EventType::KeyEpochAdvance,
+                    scp_event_log::EventType::KeyEpochAdvance,
+                    scp_event_log::EventType::KeyEpochAdvance,
+                ],
+                vec![scp_event_log::EventType::GovernanceActionExecuted],
+            ],
+            "the dispatch's unit, then the finalize unit"
         );
+        assert_eq!(appends.load(Ordering::SeqCst), 0, "nothing reached the log");
         assert!(
             cell.governance
                 .class_s
                 .executed_proposals
                 .contains_key(&proposal_id),
-            "a finalize error after a landed effect keeps the replay marker"
+            "the executed action keeps its replay marker"
         );
         assert!(
             !cell
                 .governance
                 .approved_proposals
                 .contains_key(&proposal_id),
-            "the consumed proposal must leave `approved_proposals` even though \
-             finalize failed before its own tail ran"
+            "the consumed proposal leaves `approved_proposals`"
         );
     }
 
@@ -3417,9 +3825,32 @@ mod tests {
         );
     }
 
+    /// The event types the log recorded, then those still queued, in order:
+    /// every record the operation produced, whether or not a drain has
+    /// written it yet.
+    fn logged_then_queued(
+        recorded: &RecordedLeaves,
+        cell: &ClassSCell,
+    ) -> Vec<scp_event_log::EventType> {
+        let mut types: Vec<scp_event_log::EventType> = recorded
+            .read()
+            .expect("recorded leaves lock")
+            .iter()
+            .map(|(event_type, _)| *event_type)
+            .collect();
+        types.extend(
+            crate::context::log_unit_helpers::test_support::queued_unit_types(
+                &cell.class_s.pending_log_units,
+            )
+            .into_iter()
+            .flatten(),
+        );
+        types
+    }
+
     /// A rejected TTL extension is the one dispatch that advances the cell's
     /// `mutation_epoch` without applying a governance effect: `execute_extend_ttl`
-    /// appends and credits a `TtlExtensionRejected` leaf, then returns
+    /// queues and credits a `TtlExtensionRejected` record, then returns
     /// `PermissionDenied` with the TTL unchanged. `execute_governance_action`
     /// keeps the replay marker (a retry would append a second rejection leaf on
     /// this member only, which §9.9.3 of the security-model spec reads as
@@ -3434,7 +3865,7 @@ mod tests {
     async fn unanimity_rejected_extend_ttl_keeps_marker_and_appends_no_executed_leaf() {
         use scp_protocol::context::governance::GovernanceAction;
 
-        let (deps, appends) = build_deps().await;
+        let (deps, appends, recorded) = build_deps_recording().await;
         let (mut state, ctx_hex) =
             build_broadcast_state_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
         let proposal_id = seed_approved_proposal(
@@ -3454,6 +3885,7 @@ mod tests {
             vec![],
         );
         appends.store(0, Ordering::SeqCst);
+        recorded.write().expect("recorded leaves lock").clear();
         reset_leaf_counter(&mut cell);
 
         let first = crate::context::governance_helpers::execute_governance_action(
@@ -3475,15 +3907,15 @@ mod tests {
             "the unanimity rejection must reach the caller unchanged; got {first:?}"
         );
         assert_eq!(
-            appends.load(Ordering::SeqCst),
-            1,
-            "exactly the `TtlExtensionRejected` leaf lands: a second leaf would be \
-             the `GovernanceActionExecuted` leaf finalize appends, which records \
-             an extension that did not happen"
+            logged_then_queued(&recorded, &cell),
+            vec![scp_event_log::EventType::TtlExtensionRejected],
+            "exactly the `TtlExtensionRejected` record is logged or queued: a \
+             second record would be the `GovernanceActionExecuted` record \
+             finalize produces, which records an extension that did not happen"
         );
         assert_eq!(
             cell.checkpoint_events_since, 1,
-            "the rejection leaf is credited once and the executed leaf never lands"
+            "the rejection record is credited once and no executed record exists"
         );
         assert!(
             cell.governance
@@ -3519,10 +3951,10 @@ mod tests {
             "the same proposal id must be refused as already executed; got {second:?}"
         );
         assert_eq!(
-            appends.load(Ordering::SeqCst),
-            1,
-            "the refused replay appends nothing: a second `TtlExtensionRejected` \
-             leaf on this member alone would diverge its Merkle root"
+            logged_then_queued(&recorded, &cell),
+            vec![scp_event_log::EventType::TtlExtensionRejected],
+            "the refused replay records nothing: a second `TtlExtensionRejected` \
+             record on this member alone would diverge its Merkle root"
         );
     }
 
@@ -3662,8 +4094,12 @@ mod tests {
             matches!(&result, Err(ContextError::PermissionDenied(msg)) if msg.contains("4 of 5")),
             "four of five members have not approved; got {result:?}"
         );
-        let leaves = recorded.read().expect("recorded leaves lock").clone();
-        assert_eq!(leaves.len(), 1, "exactly the rejection leaf lands");
+        assert!(
+            recorded.read().expect("recorded leaves lock").is_empty(),
+            "the helper writes no record to the log; its record is queued"
+        );
+        let leaves = queued_leaves(&cell);
+        assert_eq!(leaves.len(), 1, "exactly the rejection record is queued");
         let (event_type, bytes) = &leaves[0];
         assert_eq!(*event_type, scp_event_log::EventType::TtlExtensionRejected);
         let payload: scp_event_log::payload::TtlExtensionRejectedPayload =
@@ -3729,8 +4165,12 @@ mod tests {
         .await
         .expect("unanimous consent extends the TTL");
 
-        let leaves = recorded.read().expect("recorded leaves lock").clone();
-        assert_eq!(leaves.len(), 1, "exactly the TtlExtended leaf lands");
+        assert!(
+            recorded.read().expect("recorded leaves lock").is_empty(),
+            "the helper writes no record to the log; its record is queued"
+        );
+        let leaves = queued_leaves(&cell);
+        assert_eq!(leaves.len(), 1, "exactly the TtlExtended record is queued");
         let (event_type, bytes) = &leaves[0];
         assert_eq!(*event_type, scp_event_log::EventType::TtlExtended);
         let payload: scp_event_log::payload::TtlExtendedPayload =
@@ -3745,7 +4185,7 @@ mod tests {
         );
         assert_eq!(
             cell.checkpoint_events_since, 1,
-            "the landed leaf is credited once"
+            "the queued record is credited once"
         );
     }
 

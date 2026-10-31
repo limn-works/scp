@@ -295,6 +295,8 @@ pub fn snapshot_context(ctx: &PerContextState) -> ContextSnapshot {
         revoked_spending_ucan_cids: ctx.governance.revoked_spending_ucan_cids.clone(),
         pending_commits: ctx.pending_commits.clone(),
         commit_fault: ctx.commit_fault.clone(),
+        pending_log_units: ctx.class_s.pending_log_units.to_deque(),
+        log_fault: ctx.class_s.log_fault.clone(),
         checkpoint_events_since: ctx.checkpoint_events_since,
         checkpoint_last_time_secs: ctx.checkpoint_last_time_secs,
         generation: ctx.generation,
