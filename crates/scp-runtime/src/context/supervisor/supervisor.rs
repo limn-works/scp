@@ -7272,6 +7272,9 @@ impl Supervisor {
     /// `ImportContext` arm holds clears it on every exit, after the imported
     /// actor registers or the import fails.
     ///
+    /// The `ImportContext` arm already waited for every actor an earlier
+    /// despawn removed, before the import sent `PrepareForReplace`, so the
+    /// wait here covers the replaced actor alone.
     /// It then waits for the replaced actor's task to end
     /// ([`Self::await_departed_actors`]): that actor's post-loop persist runs
     /// after its `PrepareForReplace` reply, and must not land over the
@@ -35564,6 +35567,74 @@ mod tests {
             matches!(after, Ok(None)),
             "with the gap ended, a despawned context must read as absent, got {after:?}"
         );
+    }
+
+    /// An import over a replaceable actor waits for every earlier-removed
+    /// actor of the id before it sends `PrepareForReplace` (ADR-049 §10). A
+    /// wait that times out fails the import while the prior actor is still
+    /// registered and not claimed terminal, so the context keeps a usable
+    /// actor; once the removed actor ends, the same import succeeds.
+    #[tokio::test(start_paused = true)]
+    async fn an_import_whose_departed_wait_times_out_leaves_the_prior_actor_usable() {
+        let sup = supervisor_with_providers_and_event_log(Box::new(
+            crate::context::providers::event_log::MerkleEventLogProvider::new(),
+        ));
+        let ctx_id_bytes = [0xE3u8; 32];
+        let deps = test_actor_deps(&sup).await;
+        let state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            1_700_000_000,
+            DID("did:example:replace-wait-admin".to_owned()),
+        );
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .expect("drive the prior context to Active");
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Closing)
+            .expect("drive the prior context to Closing, which an import may replace");
+        sup.spawn_actor_with_state(state, deps, None)
+            .await
+            .expect("spawn registers the prior context");
+        let ctx_key = hex::encode(ctx_id_bytes);
+        let (departing, task, _inbox) = tracked_departing_actor();
+        sup.track_departing_actor(&ctx_key, departing);
+
+        sup.key_package_store_for_loaded(&sup.node_identity().unwrap())
+            .await
+            .expect("kp store resolves with providers");
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+        let export = signed_import_export_with_member(
+            &ctx_key,
+            "did:key:replace-wait-creator",
+            "did:key:aaa-replace-wait-owning-member",
+            &signing_key,
+        )
+        .await;
+
+        let refused = sup
+            .import_context(export.clone(), &verifying_key, None)
+            .await;
+        assert!(
+            matches!(refused, Err(ContextError::ActorBusy(_))),
+            "a removed actor that outlives the bound makes the import busy, got {refused:?}"
+        );
+        assert!(
+            sup.lookup(&ctx_key).is_some(),
+            "the prior actor must still be registered"
+        );
+        let read = sup.read_context_state_checked(&ctx_key).await;
+        assert!(
+            matches!(read, Ok(Some(crate::context::ContextState::Closing))),
+            "the prior actor must still answer with its state, got {read:?}"
+        );
+
+        drop(task);
+        sup.import_context(export, &verifying_key, None)
+            .await
+            .expect("with the removed actor ended, the prior actor is replaceable");
     }
 
     /// The transient respawn marker must NOT leave a lingering crash-window
