@@ -7141,14 +7141,29 @@ impl Supervisor {
         // runs after its loop ends. Track it until its task ends so the next
         // bootstrap of this id waits for it (`await_departed_actors`).
         if let Some(departing) = handle.departure() {
-            let mut entry = self
-                .departing_actors
-                .entry(context_id.to_owned())
-                .or_default();
-            entry.retain(crate::context::actor::handle::DepartingActor::task_running);
-            entry.push(departing);
+            self.track_departing_actor(context_id, departing);
         }
         true
+    }
+
+    /// Records `departing` for `context_id` until its task ends. The task can
+    /// end after
+    /// [`departure`](crate::context::actor::handle::ContextActorHandle::departure) read it as running and
+    /// before the push, in which case the watchdog's prune already ran and
+    /// found nothing; the prune after the push drops such a record, so no
+    /// record outlives its task.
+    fn track_departing_actor(
+        &self,
+        context_id: &str,
+        departing: crate::context::actor::handle::DepartingActor,
+    ) {
+        self.departing_actors
+            .entry(context_id.to_owned())
+            .or_default()
+            .push(departing);
+        // The entry guard above is dropped before the prune takes the same
+        // shard lock.
+        self.prune_departed_actors(context_id);
     }
 
     /// Drops the tracked departing actors of `context_id` whose task has
@@ -29412,6 +29427,51 @@ mod tests {
         assert!(
             matches!(respawn, Err(ContextError::ActorCrashed(_))),
             "the respawn with no snapshot fails, got {respawn:?}"
+        );
+    }
+
+    /// A despawned actor whose task is still running, with the guard whose
+    /// drop ends that task and the receiver that keeps its inbox open.
+    fn tracked_departing_actor() -> (
+        crate::context::actor::handle::DepartingActor,
+        crate::context::actor::handle::ActorTaskGuard,
+        tokio::sync::mpsc::Receiver<crate::context::actor::commands::ContextCommand>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let handle = crate::context::actor::handle::ContextActorHandle::from_sender(tx);
+        let task = handle.exit_record().arm();
+        let departing = handle
+            .departure()
+            .expect("an armed handle reports a running task");
+        (departing, task, rx)
+    }
+
+    /// A departing-actor record never outlives its task (ADR-049 §10). The
+    /// task can end after `despawn_actor` read it as running and before the
+    /// record is pushed; the watchdog's prune has then already run. Tracking
+    /// such a record leaves no entry for the id.
+    #[tokio::test]
+    async fn a_departing_record_whose_task_ended_before_the_push_is_pruned() {
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
+        let sup =
+            supervisor_with_clock_and_persistence(clock_dyn, Box::new(MapPersistence::default()));
+        let ctx_key = hex::encode([0xE1u8; 32]);
+        let (departing, task, _inbox) = tracked_departing_actor();
+        drop(task);
+        assert!(!departing.task_running(), "the task has ended");
+
+        sup.track_departing_actor(&ctx_key, departing);
+        assert!(
+            !sup.departing_actors.contains_key(&ctx_key),
+            "a record whose task already ended must not be kept"
+        );
+
+        let (running, _task, _inbox) = tracked_departing_actor();
+        sup.track_departing_actor(&ctx_key, running);
+        assert_eq!(
+            sup.departing_actors.get(&ctx_key).map(|e| e.len()),
+            Some(1),
+            "a record whose task still runs is kept"
         );
     }
 
