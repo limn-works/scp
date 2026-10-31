@@ -311,17 +311,22 @@ async fn participation_record_empty_log_errors() {
 }
 
 /// A context with no log is an absent state, never an empty log (spec 17
-/// §17.3 "Event log write failures"): the record refuses with
-/// `EventLogFailed`, not the empty log's `NoParticipationFacts`.
+/// §17.3 "Event log write failures"). For a context no actor serves, the
+/// record refuses with `ContextNotRegistered`, not the empty log's
+/// `NoParticipationFacts` (which the SDKs read as a zero record) and not a
+/// log fault.
 #[test]
-fn participation_record_absent_log_refuses() {
+fn participation_record_of_an_unregistered_context_is_not_registered() {
     let supervisor = supervisor_over(MerkleEventLogProvider::new());
     let err = supervisor
         .participation_record("ctx-never-created", SUBJECT, &[])
         .expect_err("an absent log must refuse");
     assert!(
-        matches!(err, scp_protocol::context::ContextError::EventLogFailed(_)),
-        "expected EventLogFailed, got: {err:?}"
+        matches!(
+            err,
+            scp_protocol::context::ContextError::ContextNotRegistered(_)
+        ),
+        "expected ContextNotRegistered, got: {err:?}"
     );
 }
 

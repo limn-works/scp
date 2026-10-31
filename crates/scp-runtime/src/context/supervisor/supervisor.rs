@@ -14640,10 +14640,13 @@ impl Supervisor {
     /// # Errors
     ///
     /// Returns [`ContextError::NotInitialized`] if the event-log provider or
-    /// clock is not configured, [`ContextError`] if the provider fails, and
-    /// surfaces [`TrustError`](scp_protocol::trust::TrustError) (e.g.
-    /// `EmptyEventLog`) from the core computation as
-    /// [`ContextError::InvalidState`].
+    /// clock is not configured, [`ContextError::ContextNotRegistered`] when no
+    /// event log is loaded for the context and no actor serves it,
+    /// [`ContextError::EventLogFailed`] when an actor serves it but no log is
+    /// loaded, [`ContextError`] if the provider fails,
+    /// [`ContextError::NoParticipationFacts`] for an empty log, and surfaces
+    /// any other [`TrustError`](scp_protocol::trust::TrustError) from the core
+    /// computation as [`ContextError::InvalidState`].
     pub fn participation_record(
         &self,
         context_id: &str,
@@ -14670,13 +14673,22 @@ impl Supervisor {
         // The durable log only: the record binds the log's Merkle root, which
         // covers no queued unit. A context with no log refuses; an absent log
         // is never read as an empty one (spec 17 §17.3 "Event log write
-        // failures").
+        // failures"). With no actor registered, the context is unknown here
+        // (never created, or dormant with its log unloaded), and the refusal
+        // says so; a registered context without a log is a fault.
         let events = event_log
             .event_log_entries(&context_id_bytes)?
             .ok_or_else(|| {
-                ContextError::EventLogFailed(format!(
-                    "Supervisor::participation_record — context {context_id} has no event log"
-                ))
+                if self.lookup(context_id).is_none() {
+                    ContextError::ContextNotRegistered(format!(
+                        "Supervisor::participation_record — {context_id} (no actor serves it, \
+                         so no event log is loaded)"
+                    ))
+                } else {
+                    ContextError::EventLogFailed(format!(
+                        "Supervisor::participation_record — context {context_id} has no event log"
+                    ))
+                }
             })?;
         // FAIL CLOSED on the Merkle root (white-hat P2). A log that HAS events
         // must carry a real root: substituting `[0u8; 32]` would emit a record
