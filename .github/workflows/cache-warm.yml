@@ -303,67 +303,6 @@ jobs:
           export LD_LIBRARY_PATH="$PY_LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           bash scripts/compile-examples.sh
 
-  transport-optional-node-relay:
-    name: Warm transport-optional-node-relay
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - uses: ./.github/actions/rust-toolchain
-      - id: cache
-        uses: ./.github/actions/rust-cache
-        with:
-          shared-key: transport-optional-node-relay
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - if: steps.cache.outputs.cache-hit != 'true'
-        uses: ./.github/actions/cargo-fetch
-      - if: steps.cache.outputs.cache-hit != 'true'
-        uses: taiki-e/install-action@nextest
-      # rust-test-optional-features's `node-relay` leg.
-      - name: Compile every scp-node and scp-relay feature set the node-relay leg tests
-        if: steps.cache.outputs.cache-hit != 'true'
-        run: |
-          cargo nextest run --no-run -p scp-node --features quic,testing --test quic_listener
-          cargo nextest run --no-run -p scp-node --features quic,testing --test quic_cross_transport
-          cargo nextest run --no-run -p scp-node --features http3,udp,testing --lib
-          cargo nextest run --no-run -p scp-node --features http3,testing --lib
-          cargo nextest run --no-run -p scp-node --features cloud-blobs,testing --test storage_backend_selection
-          cargo nextest run --no-run -p scp-relay --features cloud-blobs --test storage_backend
-
-  transport-optional-platform-testing:
-    name: Warm transport-optional-platform-testing
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - uses: ./.github/actions/rust-toolchain
-      - id: cache
-        uses: ./.github/actions/rust-cache
-        with:
-          shared-key: transport-optional-platform-testing
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - if: steps.cache.outputs.cache-hit != 'true'
-        uses: ./.github/actions/cargo-fetch
-      - if: steps.cache.outputs.cache-hit != 'true'
-        uses: taiki-e/install-action@nextest
-      # rust-test-optional-features's `platform-testing` leg.
-      - name: Compile every scp-platform and scp-testing feature set the platform-testing leg tests
-        if: steps.cache.outputs.cache-hit != 'true'
-        run: |
-          cargo nextest run --no-run -p scp-platform --features apple,sync,sqlite,filesystem,file,encrypting,testing --lib
-          cargo nextest run --no-run -p scp-testing --features sync,combined --test persistence_advanced
-          cargo nextest run --no-run -p scp-testing --features sqlite --test persistence
-          cargo nextest run --no-run -p scp-testing --features sqlite --test persistence_sdk
-          cargo nextest run --no-run -p scp-testing --features sqlite --test saga_bridge_journal_swap
-          cargo check -p scp-testing --lib
-          cargo check -p scp-testing --lib --features testing
-
   transport-optional-sqlite-without-memory-management:
     name: Warm transport-optional-sqlite-without-memory-management
     runs-on: ubuntu-latest
@@ -578,8 +517,8 @@ jobs:
           --init-script "$GITHUB_WORKSPACE/.github/gradle/warm-dependency-cache.gradle"
           warmDependencyCache installDist --no-daemon -Pscp.uniffi.prebuiltBindings=true
 
-  transport-optional-transport:
-    name: Warm transport-optional-transport
+  optional-features:
+    name: Warm optional-features
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -591,7 +530,7 @@ jobs:
       - id: cache
         uses: ./.github/actions/rust-cache
         with:
-          shared-key: transport-optional-transport
+          shared-key: optional-features
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - if: steps.cache.outputs.cache-hit != 'true'
         uses: ./.github/actions/cargo-fetch
@@ -612,6 +551,27 @@ jobs:
           cargo nextest run --no-run -p scp-transport --features push-store --lib
           cargo nextest run --no-run -p scp-transport --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --lib
           cargo nextest run --no-run -p scp-transport --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --test postgres_blob_fail_closed --test s3_blob_fail_closed
+      # rust-test-optional-features's `node-relay` leg.
+      - name: Compile every scp-node and scp-relay feature set the node-relay leg tests
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          cargo nextest run --no-run -p scp-node --features quic,testing --test quic_listener
+          cargo nextest run --no-run -p scp-node --features quic,testing --test quic_cross_transport
+          cargo nextest run --no-run -p scp-node --features http3,udp,testing --lib
+          cargo nextest run --no-run -p scp-node --features http3,testing --lib
+          cargo nextest run --no-run -p scp-node --features cloud-blobs,testing --test storage_backend_selection
+          cargo nextest run --no-run -p scp-relay --features cloud-blobs --test storage_backend
+      # rust-test-optional-features's `platform-testing` leg.
+      - name: Compile every scp-platform and scp-testing feature set the platform-testing leg tests
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          cargo nextest run --no-run -p scp-platform --features apple,sync,sqlite,filesystem,file,encrypting,testing --lib
+          cargo nextest run --no-run -p scp-testing --features sync,combined --test persistence_advanced
+          cargo nextest run --no-run -p scp-testing --features sqlite --test persistence
+          cargo nextest run --no-run -p scp-testing --features sqlite --test persistence_sdk
+          cargo nextest run --no-run -p scp-testing --features sqlite --test saga_bridge_journal_swap
+          cargo check -p scp-testing --lib
+          cargo check -p scp-testing --lib --features testing
 
   apple-transport-platform:
     name: Warm apple-transport-platform

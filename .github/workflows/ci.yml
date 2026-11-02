@@ -131,12 +131,16 @@ env:
 #                     opt-level 3). python-test, typescript-check, bridge-parity and
 #                     bridge-parity-kotlin download what the producers upload, so none
 #                     of them runs cargo and none of them reads a cargo cache.
-#   transport-optional-transport
-#                     `target/debug` under the `-p scp-transport` feature resolutions
-#                     rust-test-optional-features's four `transport-*` legs run. The
-#                     scp-transport selections drop `scp-runtime/testing`, which gave
-#                     337 packages a fingerprint the `workspace-debug` entry does not
-#                     hold.
+#   optional-features
+#                     `target/debug` under the feature resolutions
+#                     rust-test-optional-features's four `transport-*` legs and its
+#                     `node-relay` and `platform-testing` legs run: `-p scp-transport`,
+#                     `-p scp-node`, `-p scp-relay`, `-p scp-platform` and
+#                     `-p scp-testing` selections that drop `scp-runtime/testing`, which
+#                     gave 337 packages a fingerprint the `workspace-debug` entry does
+#                     not hold. Cargo keys each unit by its features, so one target
+#                     directory holds every leg's resolutions side by side, and the one
+#                     warm job that compiles them all writes every unit each leg reads.
 #   apple-transport-platform
 #                     `target/debug` on macOS under the feature resolutions of
 #                     rust-test-macos's `-p scp-transport` and `-p scp-platform`
@@ -167,12 +171,13 @@ env:
 #   clippy-examples   `target/debug` under check mode, one package's dev-target feature
 #                     set at a time — rust-clippy's `examples` leg, which runs
 #                     scripts/check-examples-compile.sh.
-#   transport-optional-node-relay, transport-optional-platform-testing,
 #   transport-optional-sqlite-without-memory-management
-#                     `target/debug` under the feature resolutions of
-#                     rust-test-optional-features's leg of that name, one group per leg
-#                     because each leg runs its own selections, so one entry for all
-#                     would hold only the units of whichever leg saved first.
+#                     `target/debug` under rust-test-optional-features's
+#                     `sqlite-without-memory-management` leg, which builds libsqlite3-sys
+#                     under its own LIBSQLITE3_FLAGS. The build script reruns on that
+#                     variable, and cargo keeps one output per unit, so in a shared
+#                     directory this leg and every other reader of libsqlite3-sys would
+#                     each rebuild it over the other's.
 #   python-wheel      python-wheel-build's wheel build; its comment says more.
 #   fuzz              `fuzz/target/debug` — fuzz-build, whose `cargo check` compiles a
 #                     separate workspace on the nightly `fuzz/rust-toolchain.toml`
@@ -2074,10 +2079,10 @@ jobs:
   # which then could not see a filter that lacks `--no-tests=fail`; that file
   # also requires the groups the steps name to equal the matrix list.
   #
-  # Each group writes its own rust-cache entry, `transport-optional-<group>`,
-  # because each group compiles feature resolutions of scp-transport, scp-node,
-  # scp-relay, scp-platform or scp-testing that the other two do not, and one
-  # shared entry would hold only the units of whichever leg saved first.
+  # Every leg but `sqlite-without-memory-management` restores the
+  # `optional-features` entry, which cache-warm.yml writes by compiling every
+  # leg's selections; the sqlite leg restores an entry of its own because its
+  # LIBSQLITE3_FLAGS rebuilds libsqlite3-sys in place.
   #
   # ── Why the transport group runs on four legs, or on one ────────────────────
   #
@@ -2089,8 +2094,8 @@ jobs:
   # (the eight optional-transport runs), `transport-push` (the two wake runs and
   # the three push-store runs) and `transport-blob` (the two blob-backend
   # runs). A push to `main` runs the one `transport` leg, which runs all four
-  # steps and alone writes `transport-optional-transport`, so that entry holds
-  # every feature resolution the four legs restore. Check `leg-commands` in
+  # steps. cache-warm.yml's `optional-features` job writes the entry the four
+  # legs restore. Check `leg-commands` in
   # scripts/tests/ci-gate/ci_gate_selftest.py fails when the commands one
   # event's legs run differ from the commands the one `transport` leg ran, or
   # when a command runs on two legs of one event.
@@ -2110,29 +2115,17 @@ jobs:
         with:
           python-version: "3.12"
       - uses: ./.github/actions/rust-toolchain
-      # One rust-cache step per entry, each key literal: the four `transport-*`
-      # legs share one entry, which a `${{ matrix.group }}` key cannot name.
-      - uses: ./.github/actions/rust-cache
-        if: matrix.group == 'node-relay'
-        with:
-          shared-key: transport-optional-node-relay
-          save-if: false
-      - uses: ./.github/actions/rust-cache
-        if: matrix.group == 'platform-testing'
-        with:
-          shared-key: transport-optional-platform-testing
-          save-if: false
+      # One rust-cache step per entry, each key literal: six legs share one
+      # entry, which a `${{ matrix.group }}` key cannot name.
       - uses: ./.github/actions/rust-cache
         if: matrix.group == 'sqlite-without-memory-management'
         with:
           shared-key: transport-optional-sqlite-without-memory-management
           save-if: false
-      # Only the push leg `transport` writes this entry; the four pull-request
-      # transport legs restore it.
       - uses: ./.github/actions/rust-cache
-        if: matrix.group == 'transport-local' || matrix.group == 'transport-network' || matrix.group == 'transport-push' || matrix.group == 'transport-blob'
+        if: matrix.group == 'transport-local' || matrix.group == 'transport-network' || matrix.group == 'transport-push' || matrix.group == 'transport-blob' || matrix.group == 'node-relay' || matrix.group == 'platform-testing'
         with:
-          shared-key: transport-optional-transport
+          shared-key: optional-features
           save-if: false
       - uses: ./.github/actions/cargo-fetch
       - uses: taiki-e/install-action@nextest
