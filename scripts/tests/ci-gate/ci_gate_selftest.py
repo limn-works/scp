@@ -943,9 +943,11 @@ PYTHON_ONLY_RUNS = DOCS_ONLY_RUNS | dict.fromkeys(CODE_JOBS, True) | dict.fromke
     ),
     True,
 )
-# One filter per job clause: no job ORs two of swift, typescript and
-# scaffold-typescript-web together, so dropping any one of those clauses from a
-# job's `if:` changes that job's answer in this scenario. typescript-wasm sits
+# One filter per job clause: apart from pyo3-module and python-test, no job ORs
+# two of swift, typescript and scaffold-typescript-web together, so dropping any
+# one of those clauses from such a job's `if:` changes that job's answer in this
+# scenario. python-test ORs swift and typescript because a test it runs reads both
+# SDKs' sources, and check_binding_test_reads reports a dropped clause there. typescript-wasm sits
 # in its own scenario because scaffold-typescript-web-check ORs it with
 # scaffold-typescript-web.
 SWIFT_TYPESCRIPT = DOCS_ONLY | dict.fromkeys(
@@ -958,6 +960,7 @@ SWIFT_TYPESCRIPT_RUNS = DOCS_ONLY_RUNS | dict.fromkeys(CODE_JOBS, True) | dict.f
         "napi-addon",
         "pyo3-module",
         "pyo3-module-macos",
+        "python-test",
         "scaffold-typescript-web-check",
         "swift-build-test",
         "swift-lint",
@@ -968,7 +971,7 @@ SWIFT_TYPESCRIPT_RUNS = DOCS_ONLY_RUNS | dict.fromkeys(CODE_JOBS, True) | dict.f
 )
 WASM_ONLY = DOCS_ONLY | {"typescript-wasm": "true", "code": "true"}
 WASM_ONLY_RUNS = DOCS_ONLY_RUNS | dict.fromkeys(CODE_JOBS, True) | dict.fromkeys(
-    ("scaffold-typescript-web-check", "typescript-wasm-check"), True
+    ("pyo3-module", "python-test", "scaffold-typescript-web-check", "typescript-wasm-check"), True
 )
 # A change confined to `fuzz/**`, such as a fuzz/Cargo.lock bump: of the `changes`
 # filters, only `fuzz` and `code` list `fuzz/**`. fuzz-build and rust-deny-fuzz run on
@@ -2086,17 +2089,9 @@ def write_inheritance_fixture(root: Path, publish_leaf: bool) -> Path:
     return consumer
 
 
-def glob_selects(pattern: str, path: str) -> bool:
-    """Report whether one dorny/paths-filter glob selects one file path.
-
-    dorny/paths-filter matches with picomatch (`dot: true`): a `**` segment
-    matches zero or more whole path segments, `*` and `?` match within one
-    segment, and every other character matches itself. pattern_covers stays
-    the conservative two-shape reader for the checks that rely on it; this
-    reader exists for a filter whose entry is a mid-path glob such as
-    `'crates/**/Cargo.toml'`, which pattern_covers would read as selecting
-    nothing.
-    """
+@functools.lru_cache(maxsize=None)
+def _glob_regex(pattern: str) -> re.Pattern:
+    """Compile one dorny/paths-filter glob as glob_selects reads it."""
     segments = pattern.split("/")
     parts = []
     for index, segment in enumerate(segments):
@@ -2109,7 +2104,21 @@ def glob_selects(pattern: str, path: str) -> bool:
             for c in segment
         )
         parts.append(piece if last else f"{piece}/")
-    return re.fullmatch("".join(parts), path) is not None
+    return re.compile("".join(parts))
+
+
+def glob_selects(pattern: str, path: str) -> bool:
+    """Report whether one dorny/paths-filter glob selects one file path.
+
+    dorny/paths-filter matches with picomatch (`dot: true`): a `**` segment
+    matches zero or more whole path segments, `*` and `?` match within one
+    segment, and every other character matches itself. pattern_covers stays
+    the conservative two-shape reader for the checks that rely on it; this
+    reader exists for a filter whose entry is a mid-path glob such as
+    `'crates/**/Cargo.toml'`, which pattern_covers would read as selecting
+    nothing.
+    """
+    return _glob_regex(pattern).fullmatch(path) is not None
 
 
 def tracked_crate_manifests() -> list[str]:
@@ -9379,6 +9388,728 @@ def check_every_path_routed(doc: dict) -> None:
     )
 
 
+# CRITERION for binding_test_scan: a test source under `bindings/` or `tests/` names a
+# path outside its own directory in exactly one form per language, and the scan reads
+# that form. A definition binds one name to the source's own location climbed a fixed
+# number of levels: Python `NAME = Path(__file__).resolve()` followed by `.parents[N]`
+# or `.parent` and `/` joins of literals; TypeScript
+# `const NAME = fileURLToPath(new URL("<literal>", import.meta.url))`, `import.meta.dir`
+# or `dirname(fileURLToPath(import.meta.url))`; Swift
+# `let NAME = URL(fileURLWithPath: #filePath)` followed by `.deletingLastPathComponent()`
+# calls; Kotlin `val NAME = File(System.getProperty("user.dir"))` followed by
+# `.parentFile` steps, where `user.dir` is the Gradle module directory, the nearest
+# directory above the source holding a `build.gradle.kts`. A definition that lands on
+# the repository root binds a name that is used only joined with string literals, or
+# with constants bound to literals in the same file, and each such join is a read; the
+# root may also be the base a path is made relative to, which reads nothing. A
+# definition that lands outside the source's package (`bindings/<name>`,
+# `tests/<name>`) reads the path it lands on and everything under it. A definition that
+# lands inside the package binds a name used any way, because whatever it names sits
+# under the package, unless a literal joined to it climbs out, which is reported. Every
+# other way to name a path above the source is reported: another `__file__`,
+# `import.meta`, `#filePath` or `user.dir`, a parent step outside a definition, the
+# working directory, `GITHUB_WORKSPACE`, `git rev-parse`, and a string literal whose `..`
+# segments reach a tracked path outside the package from the source's directory or from
+# the package directory a test runner starts in.
+#
+# Indicators, not the criterion: the scan reads code with comments and Python
+# docstrings removed and treats each string literal as one path. It does not follow a
+# path a test assembles from data at run time, such as a `..` held in a variable and
+# joined onto a name bound inside the package; the literal rule above catches the
+# common spelling of that, and a reviewer catches the rest.
+class ReadForm(NamedTuple):
+    """How one language names a path outside a test source's own directory."""
+
+    comment: str
+    definition: re.Pattern
+    # (match, source, tracked paths) -> the path the definition names, repository
+    # relative, "" for the root, None for a path above the root.
+    landing: Callable[[re.Match, str, set[str]], str | None]
+    join: str
+    const: str
+    relative: tuple[str, ...]
+    # Patterns matched against code with every string literal emptied.
+    escapes: tuple[str, ...]
+    ignore: tuple[str, ...] = ()
+    # Patterns matched against code with string literals intact, for a path a
+    # string names: an environment variable, a git command, a system property.
+    literal_escapes: tuple[str, ...] = (r"GITHUB_WORKSPACE", r"rev-parse")
+
+
+READ_STRING = re.compile(r'"((?:[^"\\\n]|\\.)*)"|\'((?:[^\'\\\n]|\\.)*)\'')
+READ_PARENT_SEGMENT = re.compile(r"(^|/)\.\.(/|$)")
+# The method names a chained Swift or Kotlin join spells between its literals.
+READ_JOIN_CALLS = frozenset({"appendingPathComponent", "resolve"})
+
+
+def _read_climb(path: str | None, levels: int) -> str | None:
+    for _ in range(levels):
+        if not path:
+            return None
+        path = posixpath.dirname(path)
+    return path
+
+
+def _read_join(base: str | None, segments: list[str]) -> str | None:
+    if base is None:
+        return None
+    target = posixpath.normpath(posixpath.join(base or ".", *segments))
+    if target == ".." or target.startswith("../"):
+        return None
+    return "" if target == "." else target
+
+
+def _read_package(source: str) -> str:
+    parts = source.split("/")
+    return "/".join(parts[:2]) if parts[0] in ("bindings", "tests") and len(parts) > 2 else parts[0]
+
+
+def _read_inside(path: str, package: str) -> bool:
+    return path == package or path.startswith(f"{package}/")
+
+
+def _read_literals(arguments: str, consts: dict[str, str]) -> list[str] | None:
+    """The segments of a join's arguments, or None when one is neither a literal nor a bound const."""
+    segments = []
+    for part in re.findall(r'"(?:[^"\\\n]|\\.)*"|\'(?:[^\'\\\n]|\\.)*\'|[A-Za-z_][\w.]*', arguments):
+        literal = READ_STRING.fullmatch(part)
+        if literal:
+            segments.append(literal.group(1) if literal.group(1) is not None else literal.group(2))
+        elif part in consts:
+            segments.append(consts[part])
+        elif part not in READ_JOIN_CALLS:
+            return None
+    return segments
+
+
+def _python_landing(match: re.Match, source: str, _paths: set[str]) -> str | None:
+    levels = int(match.group(2)) + 1 if match.group(2) else (1 if match.group(3) else 0)
+    return _read_join(_read_climb(source, levels), re.findall(r'"([^"\n]*)"', match.group(4) or ""))
+
+
+def _ts_landing(match: re.Match, source: str, _paths: set[str]) -> str | None:
+    return _read_join(posixpath.dirname(source), [match.group(2)] if match.group(2) is not None else [])
+
+
+def _swift_landing(match: re.Match, source: str, _paths: set[str]) -> str | None:
+    return _read_climb(source, match.group(2).count("deletingLastPathComponent"))
+
+
+def _kotlin_landing(match: re.Match, source: str, paths: set[str]) -> str | None:
+    module = posixpath.dirname(source)
+    while module and f"{module}/build.gradle.kts" not in paths:
+        module = posixpath.dirname(module)
+    return _read_climb(module, match.group(2).count("parentFile")) if module else None
+
+
+READ_C_COMMENTS = r"/\*.*?\*/|(?m:^[ \t]*//[^\n]*$)|(?m:[ \t]+//[^\"'\n]*$)"
+READ_FORMS: dict[str, ReadForm] = {
+    "py": ReadForm(
+        comment=r"\"\"\"[\s\S]*?\"\"\"|'''[\s\S]*?'''|(?m:^[ \t]*#[^\n]*$)|(?m:[ \t]+#[^\"'\n]*$)",
+        definition=re.compile(
+            r"^[ \t]*(\w+)(?:[ \t]*:[ \t]*[\w.]+)?[ \t]*=[ \t]*(?:pathlib\.)?Path\(__file__\)\.resolve\(\)"
+            r'(?:\.parents\[(\d+)\]|(\.parent))?((?:[ \t]*/[ \t]*"[^"\n]*")*)[ \t]*$',
+            re.M,
+        ),
+        landing=_python_landing,
+        join=r"\b{name}((?:\s*/\s*(?:\"[^\"\n]*\"|'[^'\n]*'|[A-Z][A-Z0-9_]*\b))+)",
+        const=r"^([A-Z][A-Z0-9_]*)[ \t]*(?::[ \t]*str[ \t]*)?=[ \t]*\"([^\"\n]*)\"[ \t]*$",
+        relative=(r"\.relative_to\(\s*{name}\s*\)",),
+        escapes=(
+            r"__file__",
+            r"\.parents?\b",
+            r"\bos\.path\.dirname\b",
+            r"\bos\.getcwd\b",
+            r"\bPath\.cwd\b",
+        ),
+    ),
+    "ts": ReadForm(
+        comment=READ_C_COMMENTS,
+        definition=re.compile(
+            r"^[ \t]*(?:export\s+)?const\s+(\w+)(?:\s*:\s*string)?\s*=\s*(?:"
+            r"fileURLToPath\(\s*new URL\(\s*\"([^\"\n]*)\"\s*,\s*import\.meta\.url\s*\)\s*\)"
+            r"|import\.meta\.dir|dirname\(\s*fileURLToPath\(\s*import\.meta\.url\s*\)\s*\))\s*;?[ \t]*$",
+            re.M,
+        ),
+        landing=_ts_landing,
+        join=r"\b(?:join|resolve)\(\s*{name}\s*,((?:\s*(?:\"[^\"\n]*\"|'[^'\n]*'|[A-Za-z_][\w.]*)\s*,?)+)\)",
+        const=r"^[ \t]*(?:export\s+)?const\s+([A-Z][A-Z0-9_]*)\s*=\s*\"([^\"\n]*)\"\s*;?[ \t]*$",
+        relative=(r"\brelative\(\s*{name}\s*,",),
+        escapes=(
+            r"import\.meta\.(?:url|dir|path|dirname|filename)",
+            r"__dirname",
+            r"__filename",
+            r"process\.cwd",
+            r"\bdirname\(",
+        ),
+    ),
+    "swift": ReadForm(
+        comment=READ_C_COMMENTS,
+        definition=re.compile(
+            r"^[ \t]*(?:(?:private|fileprivate|internal|static)\s+)*(?:let|var)\s+(\w+)(?:\s*:\s*URL)?\s*=\s*"
+            r"URL\(\s*fileURLWithPath:\s*#filePath\s*\)((?:\s*\.deletingLastPathComponent\(\))*)",
+            re.M,
+        ),
+        landing=_swift_landing,
+        join=r"\b{name}((?:\s*\.appendingPathComponent\(\s*(?:\"[^\"\n]*\"|[A-Za-z_]\w*)\s*\))+)",
+        const=r"^[ \t]*(?:(?:private|fileprivate|static)\s+)*let\s+([A-Za-z_]\w*)\s*=\s*\"([^\"\n]*)\"[ \t]*$",
+        relative=(),
+        escapes=(r"#filePath", r"#file\b", r"deletingLastPathComponent", r"currentDirectoryPath"),
+        # XCTest's `file: StaticString = #filePath` names this source in a failure
+        # report and reads nothing.
+        ignore=(r"file:\s*StaticString\s*=\s*#filePath",),
+    ),
+    "kt": ReadForm(
+        comment=READ_C_COMMENTS,
+        definition=re.compile(
+            r"^[ \t]*(?:(?:private|internal)\s+)*val\s+(\w+)(?:\s*:\s*File)?\s*=\s*"
+            r"File\(\s*System\.getProperty\(\s*\"user\.dir\"\s*\)\s*\)((?:\s*\.parentFile)*)[ \t]*$",
+            re.M,
+        ),
+        landing=_kotlin_landing,
+        join=r"\b{name}((?:\s*\.resolve\(\s*(?:\"[^\"\n$]*\"|[A-Z][A-Z0-9_]*)\s*\))+)",
+        const=(
+            r"^[ \t]*(?:(?:private|internal)\s+)*(?:const\s+)?val\s+([A-Z][A-Z0-9_]*)\s*(?::\s*String\s*)?="
+            r"\s*\"([^\"\n$]*)\"[ \t]*$"
+        ),
+        relative=(r"\.relativeTo\(\s*{name}\s*\)",),
+        escapes=(r"\bparentFile\b", r"\.parent\b", r"Paths\.get"),
+        literal_escapes=(r"GITHUB_WORKSPACE", r"rev-parse", r"\"user\.dir\""),
+    ),
+}
+READ_LANGUAGES = {".py": "py", ".ts": "ts", ".mjs": "ts", ".js": "ts", ".swift": "swift", ".kt": "kt"}
+READ_TEST_DIR = re.compile(r"(^|/)(tests?|Tests|androidTest)/")
+
+
+def binding_test_sources(paths: list[str]) -> list[str]:
+    """Every tracked test source under `bindings/` or `tests/` in a language READ_FORMS reads."""
+    return [
+        path
+        for path in paths
+        if path.startswith(("bindings/", "tests/"))
+        and READ_TEST_DIR.search(path)
+        and posixpath.splitext(path)[1] in READ_LANGUAGES
+        and "/node_modules/" not in path
+        and posixpath.basename(path) != "Package.swift"
+    ]
+
+
+def binding_test_scan(source: str, text: str, paths: set[str], dirs: set[str]) -> tuple[set[str], list[str]]:
+    """The tracked paths outside its package that `source` reads, and each form it uses that the scan cannot read."""
+    form = READ_FORMS[READ_LANGUAGES[posixpath.splitext(source)[1]]]
+    package = _read_package(source)
+    reads: set[str] = set()
+    found: list[str] = []
+    code = re.sub(form.comment, lambda m: "\n" * m.group(0).count("\n"), text, flags=re.S)
+    for pattern in form.ignore:
+        code = re.sub(pattern, "", code)
+    consts = {m.group(1): m.group(2) for m in re.finditer(form.const, code, re.M)}
+    body = form.definition.sub("", code)
+    for definition in form.definition.finditer(code):
+        name = re.escape(definition.group(1))
+        join = form.join.format(name=name)
+        landing = form.landing(definition, source, paths)
+        if landing is None:
+            found.append(f"{source}: {definition.group(1)} climbs above the repository")
+            continue
+        if landing and not _read_inside(landing, package):
+            # A name bound outside the package reads that path and everything under it.
+            reads.add(landing)
+            body = re.sub(join, "", body)
+            continue
+        for use in re.finditer(join, body):
+            segments = _read_literals(use.group(1), consts)
+            if segments is None:
+                if landing == "":
+                    found.append(f"{source}: root {definition.group(1)} joined with a non-literal")
+                continue
+            target = _read_join(landing, segments)
+            if target is None:
+                found.append(f"{source}: {definition.group(1)} joined with {segments} climbs above the repository")
+            elif landing == "" and not target:
+                found.append(f"{source}: root {definition.group(1)} joined with {segments} names the root itself")
+            elif landing == "" and not _read_inside(target, package):
+                reads.add(target)
+            elif landing != "" and not _read_inside(target, package):
+                found.append(f"{source}: {definition.group(1)} joined with {segments} reaches {target} outside {package}")
+        body = re.sub(join, "", body)
+        if landing == "":
+            rest = body
+            for pattern in form.relative:
+                rest = re.sub(pattern.format(name=name), "", rest)
+            if re.search(rf"\b{name}\b", rest):
+                found.append(f"{source}: root {definition.group(1)} used other than joined with a literal")
+    blank = READ_STRING.sub('""', body)
+    for pattern in form.escapes:
+        if re.search(pattern, blank):
+            found.append(f"{source}: names a path through {pattern}")
+    for pattern in form.literal_escapes:
+        if re.search(pattern, body):
+            found.append(f"{source}: names a path through {pattern}")
+    for match in READ_STRING.finditer(body):
+        literal = match.group(1) if match.group(1) is not None else match.group(2)
+        if not READ_PARENT_SEGMENT.search(literal):
+            continue
+        for base in (posixpath.dirname(source), package):
+            target = _read_join(base, [literal])
+            if target is None or _read_inside(target, package):
+                continue
+            if target in paths or target in dirs or target == "":
+                found.append(f"{source}: literal {literal!r} reaches {target or '.'} from {base}")
+                break
+    return reads, found
+
+
+# The ci.yml jobs that run the test sources under each directory, each with a string
+# its steps must hold for the claim to stand. A source maps to the longest prefix it
+# sits under. A source several jobs run is routed when the outputs of those jobs
+# together select each path it reads: the bridge-parity conftest reads
+# `bindings/typescript` only for the napi runner, which job bridge-parity runs.
+BINDING_TEST_JOBS: dict[str, tuple[tuple[str, str], ...]] = {
+    "bindings/python/tests/": (("python-test", 'pytest tests/ -v -m "not parity"'),),
+    "bindings/python/tests/bridge_parity/": (
+        ("python-test", 'pytest tests/ -v -m "not parity"'),
+        ("bridge-parity", "pytest tests/bridge_parity/"),
+        ("bridge-parity-kotlin", "pytest tests/bridge_parity/"),
+        ("bridge-parity-swift", "pytest tests/bridge_parity/"),
+    ),
+    "bindings/typescript/tests/": (("typescript-check", "bun test"),),
+    "bindings/typescript-wasm/tests/": (("typescript-wasm-check", "bun test"),),
+    "bindings/swift/Tests/": (("swift-build-test", "swift test"),),
+    "bindings/kotlin/scp-kt/src/test/": (("kotlin-test", ":scp-kt:test"),),
+    "bindings/kotlin/scp-kt-android/src/test/": (("kotlin-test", ":scp-kt-android:testDebugUnitTest"),),
+    "bindings/kotlin/scp-kt-android/src/androidTest/": (
+        ("kotlin-android-instrumented", ":scp-kt-android:connectedDebugAndroidTest"),
+    ),
+    # No ci.yml step runs `tests/integration/phase3_integration_test.py`; the comment
+    # above job python-test's pytest step says why. Its forms are still checked.
+    "tests/integration/": (),
+}
+
+
+def binding_test_jobs(source: str) -> tuple[tuple[str, str], ...] | None:
+    """The (job, evidence) pairs BINDING_TEST_JOBS names for a source, or None when no prefix holds it."""
+    prefix = max((p for p in BINDING_TEST_JOBS if source.startswith(p)), key=len, default=None)
+    return None if prefix is None else BINDING_TEST_JOBS[prefix]
+
+
+def job_selecting_outputs(doc: dict, job_id: str) -> list[str] | None:
+    """Each `changes` output that alone makes a job run on a merge_group event, or None for a job no output gates."""
+    condition = str(doc["jobs"][job_id].get("if") or "")
+    if not FILTER_REFERENCE.search(condition):
+        return None
+    outputs = sorted((doc["jobs"]["changes"].get("outputs") or {}))
+    return [
+        output
+        for output in outputs
+        if selects(condition, {key: "true" if key == output else "false" for key in outputs}, "merge_group")
+    ]
+
+
+def job_patterns(doc: dict, jobs: list[str], by_output: dict[str, set[str]] | None = None) -> set[str] | None:
+    """Every filter pattern that makes one of `jobs` run on a merge_group event, or None when one runs on every change.
+
+    output_patterns parses the filter YAML on each call; a caller reading many jobs
+    passes `by_output`, which this fills with each output's patterns once.
+    """
+    by_output = {} if by_output is None else by_output
+    patterns: set[str] = set()
+    for job_id in jobs:
+        selecting = job_selecting_outputs(doc, job_id)
+        if selecting is None:
+            return None
+        for output in selecting:
+            if output not in by_output:
+                found = output_patterns(doc, output)
+                if isinstance(found, str):
+                    raise AssertionError(found)
+                by_output[output] = found
+            patterns |= by_output[output]
+    return patterns
+
+
+def read_members(read: str, paths: list[str]) -> list[str]:
+    """The tracked files one read names: the file itself, every file under a directory, or every file a glob selects."""
+    if "*" in read:
+        return [path for path in paths if glob_selects(read, path)]
+    return [path for path in paths if path == read or path.startswith(f"{read}/")]
+
+
+def reads_unselected(doc: dict, paths: list[str], reads: dict[str, set[str]], jobs: dict[str, list[str]]) -> list[str]:
+    """Each `reader: path` whose path no output that runs the reader selects."""
+    gaps = []
+    by_output: dict[str, set[str]] = {}
+    known: dict[tuple[str, ...], set[str] | None] = {}
+    for reader, entries in sorted(reads.items()):
+        key = tuple(sorted(jobs[reader]))
+        if key not in known:
+            known[key] = job_patterns(doc, list(key), by_output)
+        patterns = known[key]
+        if patterns is None:
+            continue
+        for read in sorted(entries):
+            gaps += [f"{reader}: {path}" for path in read_members(read, paths) if not pattern_covers(patterns, path)]
+    return gaps
+
+
+def binding_test_reads(paths: list[str], texts: dict[str, str]) -> tuple[dict[str, set[str]], list[str]]:
+    """Each test source's reads and every form violation, over `texts` (source -> text)."""
+    tracked = set(paths)
+    dirs = _tracked_dirs(paths)
+    reads: dict[str, set[str]] = {}
+    violations: list[str] = []
+    for source, text in sorted(texts.items()):
+        found_reads, found = binding_test_scan(source, text, tracked, dirs)
+        reads[source] = found_reads
+        violations += found
+    return reads, violations
+
+
+def check_binding_test_reads(doc: dict, paths: list[str]) -> None:
+    sources = binding_test_sources(paths)
+    check("the binding test scan finds Python, TypeScript, Swift and Kotlin sources", all(
+        any(source.endswith(suffix) for source in sources) for suffix in (".py", ".ts", ".swift", ".kt")
+    ))
+    texts = {source: (REPO / source).read_text(encoding="utf-8") for source in sources}
+    reads, violations = binding_test_reads(paths, texts)
+    check(
+        "every binding test source names a path outside its directory only in its language's read form",
+        not violations,
+        f"{violations[:10]}",
+    )
+    for source, expected in (
+        ("bindings/typescript/tests/server.test.ts", ".docs/standards/sdk-common.md"),
+        ("bindings/python/tests/test_server.py", ".docs/standards/sdk-common.md"),
+        ("bindings/swift/Tests/SCPTests/NodeStartTests.swift", ".docs/standards/sdk-common.md"),
+        (
+            "bindings/kotlin/scp-kt/src/test/kotlin/works/limn/scp/OutletsStreamingTest.kt",
+            "tests/conformance/vectors/outlet_stream_vectors.json",
+        ),
+    ):
+        check(f"the binding test scan finds {source} reading {expected}", expected in reads.get(source, set()))
+    unmapped = [source for source in sources if binding_test_jobs(source) is None]
+    check("BINDING_TEST_JOBS names the jobs that run every binding test source", not unmapped, f"{unmapped[:10]}")
+    check(
+        "a test source under no BINDING_TEST_JOBS prefix is reported",
+        binding_test_jobs("bindings/newlang/tests/a.py") is None,
+    )
+    for prefix, pairs in BINDING_TEST_JOBS.items():
+        for job_id, evidence in pairs:
+            job = doc["jobs"].get(job_id)
+            runs = "\n".join(
+                "\n".join(logical_lines(str(step.get("run") or "")))
+                + "\n"
+                + str((step.get("with") or {}).get("script") or "")
+                for step in (job or {}).get("steps") or []
+            )
+            check(f"job {job_id} runs the tests under {prefix} ({evidence!r})", evidence in runs)
+    unrun = [
+        job_id
+        for job_id, job in doc["jobs"].items()
+        for step in job.get("steps") or []
+        if "tests/integration" in "\n".join(logical_lines(str(step.get("run") or "")))
+    ]
+    check("no ci.yml job runs the repository-root tests/integration/", not unrun, f"{unrun}")
+    jobs = {source: [job_id for job_id, _ in binding_test_jobs(source) or ()] for source in sources}
+    routed = {source: entries for source, entries in reads.items() if jobs.get(source)}
+    gaps = reads_unselected(doc, paths, routed, jobs)
+    check("ci.yml: the jobs that run each binding test source select every path it reads", not gaps, f"{gaps[:20]}")
+    check(
+        "a planted binding test read that no filter selects is reported",
+        reads_unselected(
+            doc,
+            [*paths, "new/x.bin"],
+            {"bindings/swift/Tests/SCPTests/A.swift": {"new/x.bin"}},
+            {"bindings/swift/Tests/SCPTests/A.swift": ["swift-build-test"]},
+        )
+        == ["bindings/swift/Tests/SCPTests/A.swift: new/x.bin"],
+    )
+    mutant = copy.deepcopy(doc)
+    step = next(
+        step
+        for step in mutant["jobs"]["changes"]["steps"]
+        if str(step.get("uses") or "").startswith("dorny/paths-filter")
+    )
+    filters = yaml.safe_load(step["with"]["filters"])
+    check("filter rust lists 'tests/conformance/**' for the mutant", "tests/conformance/**" in filters["rust"])
+    filters["rust"] = [entry for entry in filters["rust"] if entry != "tests/conformance/**"]
+    step["with"]["filters"] = yaml.safe_dump(filters)
+    narrowed = copy.deepcopy(doc)
+    narrowed["jobs"]["python-test"]["if"] = narrow_condition(
+        narrowed["jobs"]["python-test"]["if"], "outputs.swift ="
+    )
+    check(
+        "a python-test `if:` without its swift clause reports the SDK surface scan's Swift reads",
+        any(
+            gap.startswith("bindings/python/tests/test_outlets_streaming.py: bindings/swift/")
+            for gap in reads_unselected(narrowed, paths, routed, jobs)
+        ),
+    )
+    check(
+        "a `rust` filter that drops tests/conformance/** reports the Kotlin outlet vector read",
+        "bindings/kotlin/scp-kt/src/test/kotlin/works/limn/scp/OutletsStreamingTest.kt: "
+        "tests/conformance/vectors/outlet_stream_vectors.json"
+        in reads_unselected(mutant, paths, routed, jobs),
+    )
+    # Must fail: each planted source reaches outside its package in a form the scan
+    # does not read. Must pass: the admitted forms, with the reads they make.
+    tracked = set(paths)
+    dirs = _tracked_dirs(paths)
+    py = "bindings/python/tests/test_planted.py"
+    ts = "bindings/typescript/tests/planted.test.ts"
+    swift = "bindings/swift/Tests/SCPTests/PlantedTests.swift"
+    kt = "bindings/kotlin/scp-kt/src/test/kotlin/works/limn/scp/PlantedTest.kt"
+    py_root = "ROOT = Path(__file__).resolve().parents[3]\n"
+    ts_root = 'const ROOT = fileURLToPath(new URL("../../../", import.meta.url));\n'
+    swift_root = "let root = URL(fileURLWithPath: #filePath)" + ".deletingLastPathComponent()" * 5 + "\n"
+    kt_root = 'val root = File(System.getProperty("user.dir")).parentFile.parentFile.parentFile\n'
+    for source, label, text in (
+        (py, "a climbing literal", 'open("../../../AGENTS.md")'),
+        (py, "another __file__", "x = Path(__file__).parent.parent"),
+        (py, "a bare root use", py_root + "subprocess.run(cmd, cwd=ROOT)"),
+        (py, "a root joined with a variable", py_root + "ROOT / name"),
+        (py, "a parent step outside a definition", "p = here.parent"),
+        (py, "the working directory", "Path.cwd() / 'AGENTS.md'"),
+        (py, "GITHUB_WORKSPACE", 'Path(os.environ["GITHUB_WORKSPACE"]) / "AGENTS.md"'),
+        (py, "the repository top level", 'subprocess.run(["g" "it", "rev-parse", "--show-toplevel"])'),
+        (ts, "GITHUB_WORKSPACE", 'join(process.env["GITHUB_WORKSPACE"], "AGENTS.md")'),
+        (py, "a definition above the repository", "ROOT = Path(__file__).resolve().parents[9]\nROOT / 'x'"),
+        (ts, "a climbing literal", 'readFileSync("../../../AGENTS.md")'),
+        (ts, "another import.meta", 'join(import.meta.dir, "..", "..")'),
+        (ts, "a bare root use", ts_root + "spawnSync(cmd, { cwd: ROOT });"),
+        (ts, "a root joined with a variable", ts_root + "join(ROOT, name)"),
+        (ts, "__dirname", 'resolve(__dirname, "x")'),
+        (ts, "the working directory", 'join(process.cwd(), "AGENTS.md")'),
+        (swift, "a climbing literal", 'let x = "../../../../AGENTS.md"'),
+        (swift, "another #filePath", "load(URL(fileURLWithPath: #filePath))"),
+        (swift, "a bare root use", swift_root + "let y = root.path"),
+        (swift, "a root joined with a variable", swift_root + "root.appendingPathComponent(name)"),
+        (swift, "a parent step outside a definition", "let x = here.deletingLastPathComponent()"),
+        (swift, "the working directory", "FileManager.default.currentDirectoryPath"),
+        (kt, "a climbing literal", 'File("../../tests/conformance")'),
+        (kt, "another user.dir", 'File(System.getProperty("user.dir"), "x")'),
+        (kt, "a bare root use", kt_root + "ProcessBuilder(cmd).directory(root)"),
+        (kt, "a root joined with a variable", kt_root + "root.resolve(name)"),
+        (kt, "a parent step outside a definition", "val x = here.parentFile"),
+        (kt, "Paths.get", 'Paths.get("x")'),
+        (kt, "GITHUB_WORKSPACE", 'File(System.getenv("GITHUB_WORKSPACE"), "AGENTS.md")'),
+    ):
+        _, reported = binding_test_scan(source, text, tracked, dirs)
+        check(f"binding_test_scan reports {label} in {source.rsplit('.', 1)[1]}", bool(reported), f"{reported}")
+    for source, text, expected in (
+        (
+            py,
+            py_root
+            + 'DOC = "AGENTS.md"\nPKG = Path(__file__).resolve().parents[1]\n'
+            + '"""ROOT / "x" in a docstring"""\n'
+            + 'a = ROOT / ".docs" / "standards/sdk-common.md"\nb = ROOT / DOC\nc = p.relative_to(ROOT)\n'
+            + 'd = PKG / "scp_sdk"\n'
+            + 'f = subprocess.run(cmd, cwd=PKG)\n# Path(__file__).parent\n',
+            {".docs/standards/sdk-common.md", "AGENTS.md"},
+        ),
+        (
+            ts,
+            ts_root
+            + 'const PKG = fileURLToPath(new URL("../", import.meta.url));\n'
+            + 'join(ROOT, ".docs/standards", "sdk-common.md");\nrelative(ROOT, p);\n'
+            + 'spawnSync(cmd, { cwd: PKG });\n// import.meta.dir\nimport x from "../src/index";\n',
+            {".docs/standards/sdk-common.md"},
+        ),
+        (
+            swift,
+            swift_root
+            + 'root.appendingPathComponent(".docs/standards/sdk-common.md")\n'
+            + "func f(file: StaticString = #filePath) {}\n// #filePath\n",
+            {".docs/standards/sdk-common.md"},
+        ),
+        (
+            kt,
+            kt_root + 'root.resolve("tests/conformance")\nval module = File(System.getProperty("user.dir"))\n'
+            + "ProcessBuilder(cmd).directory(module)\n",
+            {"tests/conformance"},
+        ),
+    ):
+        found_reads, reported = binding_test_scan(source, text, tracked, dirs)
+        check(
+            f"binding_test_scan admits the {source.rsplit('.', 1)[1]} read form and reads {sorted(expected)}",
+            not reported and found_reads == expected,
+            f"reads {found_reads}, reported {reported}",
+        )
+
+
+# CRITERION for check_script_reads: every script a filter-gated job runs, named in a
+# `run:` of the job or in the code of a script the job runs, is selected by the outputs
+# that run the job, and so is every tracked path that script names. A script names a
+# path by a token of path shape in its code, resolved from the repository root, where
+# every such job starts; a token with a `*` names every tracked file it selects as a
+# dorny/paths-filter glob. A script that a job runs only on outputs other than `code`
+# walks no tree without a pathspec, because a walk reads every path under the
+# directory it starts in. A script a `code`-gated job runs can read any path but prose,
+# which `code` never selects, so for those scripts the token rule reports a prose read.
+#
+# Indicators, not the criterion: the scan reads code with comments and Python
+# docstrings removed, and does not follow a path a script assembles in a variable from
+# parts; for the Python scripts a narrowly gated job runs, binding_test_scan's Python
+# form reads the root joins as it does for tests.
+SCRIPT_NAME = re.compile(r"(?<![\w./$}-])(?:\./)?((?:scripts|bindings)/[\w./-]+\.(?:sh|py))")
+SCRIPT_PATH_TOKEN = re.compile(
+    r"(?<![\w$./{}-])((?:\.?[\w-]+/)+[\w.*-]*|[\w-]+\.(?:toml|lock|json|md|yml|yaml|txt))(?![\w/-])"
+)
+SCRIPT_TREE_WALK = re.compile(
+    r"\bgit(?:\s+-C\s+\S+)?\s+(?:ls-files|grep)\b(?![^\n]*\s--(?:\s|$))"
+    r"|\bfind\s+(?:-L\s+)?(?:\.|\"?\$\{?(?:REPO_ROOT|ROOT|repo_root)\}?\"?)(?:\s|$)"
+    r"|\bos\.walk\(\s*(?:REPO_ROOT|ROOT)\b|\b(?:REPO_ROOT|ROOT)\.rglob\("
+)
+# A script the token scan does not read, mapped to the reason its reads are routed.
+SCRIPT_READS_ROUTED_ELSEWHERE = {
+    "scripts/tests/ci-gate/ci_gate_selftest.py": (
+        "names paths as data for its checks; its `docs` group, which job ci-workflow-selftest-docs runs on "
+        "every event, holds each check that reads prose"
+    ),
+}
+# A (script, token) pair that names a path the script creates in a scratch repository.
+SCRIPT_FIXTURE_TOKENS = {
+    ("scripts/tests/toolchain-wiring/run-tests.sh", "README.md"): "the extra root file of a scratch repository",
+}
+
+
+def _script_code(script: str, text: str) -> str:
+    if script.endswith(".py"):
+        text = re.sub(r'"""[\s\S]*?"""|\'\'\'[\s\S]*?\'\'\'', lambda m: "\n" * m.group(0).count("\n"), text)
+    text = re.sub(r"(?m)^[ \t]*#[^\n]*$", "", text)
+    return re.sub(r"(?m)[ \t]+#[^\"'\n]*$", "", text)
+
+
+def gated_scripts(doc: dict, paths: set[str], texts: Callable[[str], str]) -> dict[str, set[str]]:
+    """Each tracked script a filter-gated job runs, mapped to the jobs that run it."""
+    runs: dict[str, set[str]] = {}
+    for job_id, job in doc["jobs"].items():
+        if not job_selecting_outputs(doc, job_id):
+            continue
+        for step in job.get("steps") or []:
+            for script in SCRIPT_NAME.findall("\n".join(logical_lines(str(step.get("run") or "")))):
+                if script in paths:
+                    runs.setdefault(script, set()).add(job_id)
+    pending = list(runs)
+    while pending:
+        script = pending.pop()
+        if script in SCRIPT_READS_ROUTED_ELSEWHERE:
+            continue
+        for named in SCRIPT_NAME.findall(_script_code(script, texts(script))):
+            if named in paths and not runs[script] <= runs.get(named, set()):
+                runs.setdefault(named, set()).update(runs[script])
+                pending.append(named)
+    return runs
+
+
+def script_reads(script: str, text: str, paths: set[str], dirs: set[str]) -> tuple[set[str], list[str]]:
+    """The tracked paths and globs a script names, and each tree walk it makes without a pathspec."""
+    code = _script_code(script, text)
+    reads = set()
+    for token in SCRIPT_PATH_TOKEN.findall(code):
+        token = token.rstrip("/")
+        if (script, token) in SCRIPT_FIXTURE_TOKENS:
+            continue
+        if "*" in token:
+            if any(glob_selects(token, path) for path in paths):
+                reads.add(token)
+        elif token in paths or token in dirs:
+            reads.add(token)
+    walks = [f"{script}: walks a tree without a pathspec: {m.group(0).strip()!r}" for m in SCRIPT_TREE_WALK.finditer(code)]
+    return reads, walks
+
+
+def check_script_reads(doc: dict, paths: list[str]) -> None:
+    tracked = set(paths)
+    dirs = _tracked_dirs(paths)
+
+    def text_of(script: str) -> str:
+        return (REPO / script).read_text(encoding="utf-8")
+
+    runs = gated_scripts(doc, tracked, text_of)
+    for script, job_id in (
+        ("scripts/check-examples-compile.sh", "rust-clippy"),
+        ("scripts/check-test-shard-features.py", "rust-test"),
+        ("scripts/check-python-falsy-optionals.py", "python-lint"),
+        ("scripts/generate-uniffi-kotlin.sh", "uniffi-cdylib-linux"),
+        ("scripts/check-wiping-allocator.sh", "wiping-allocator"),
+    ):
+        check(f"the script scan finds job {job_id} running {script}", job_id in runs.get(script, set()))
+    unselected = []
+    by_output: dict[str, set[str]] = {}
+    by_job = {job_id: job_patterns(doc, [job_id], by_output) for job_ids in runs.values() for job_id in job_ids}
+    for script, job_ids in sorted(runs.items()):
+        for job_id in sorted(job_ids):
+            patterns = by_job[job_id]
+            if patterns is not None and not pattern_covers(patterns, script):
+                unselected.append(f"{job_id}: {script}")
+    check("ci.yml: every job a filter gates is selected by a change to each script it runs", not unselected, f"{unselected}")
+    reads: dict[str, set[str]] = {}
+    jobs: dict[str, list[str]] = {}
+    violations: list[str] = []
+    for script, job_ids in sorted(runs.items()):
+        if script in SCRIPT_READS_ROUTED_ELSEWHERE:
+            continue
+        found_reads, walks = script_reads(script, text_of(script), tracked, dirs)
+        narrow = any("code" not in (job_selecting_outputs(doc, job_id) or ["code"]) for job_id in job_ids)
+        if narrow:
+            violations += walks
+            if script.endswith(".py"):
+                form_reads, found = binding_test_scan(script, text_of(script), tracked, dirs)
+                found_reads |= form_reads
+                violations += found
+        for job_id in sorted(job_ids):
+            reads[f"{job_id} {script}"] = found_reads
+            jobs[f"{job_id} {script}"] = [job_id]
+    check(
+        "every script a narrowly gated job runs walks no tree without a pathspec",
+        not violations,
+        f"{violations[:10]}",
+    )
+    gaps = reads_unselected(doc, paths, reads, jobs)
+    check("ci.yml: the outputs that run each gated script select every path it names", not gaps, f"{gaps[:20]}")
+    check(
+        "the script scan reads the SDK root check-python-falsy-optionals.py joins",
+        "bindings/python/scp_sdk" in reads.get("python-lint scripts/check-python-falsy-optionals.py", set()),
+    )
+    # Must fail: a prose read in a script a `code`-gated job runs, a script a job runs
+    # that its filter does not select, and tree walks in a narrowly gated script.
+    planted_reads, _ = script_reads("scripts/x.sh", 'cat .docs/standards/rust.md\ncat AGENTS.md', tracked, dirs)
+    check(
+        "a prose path named in a script a `code`-gated job runs is reported",
+        reads_unselected(doc, paths, {"s": planted_reads}, {"s": ["wiping-allocator"]})
+        == ["s: .docs/standards/rust.md", "s: AGENTS.md"],
+        f"{planted_reads}",
+    )
+    for label, text in (
+        ("git ls-files with no pathspec", "files=$(git ls-files)"),
+        ("git grep with no pathspec", "git grep -n foo"),
+        ("find from the root", 'find "$REPO_ROOT" -name x'),
+        ("an rglob of the root", "for p in ROOT.rglob('*'):"),
+    ):
+        _, walks = script_reads("scripts/x.sh" if "ROOT." not in text else "scripts/x.py", text, tracked, dirs)
+        check(f"script_reads reports {label}", bool(walks), f"{walks}")
+    _, walks = script_reads("scripts/x.sh", "git ls-files -- '*.rs'\nfind \"$pkgdir/examples\" -type f", tracked, dirs)
+    check("script_reads admits a walk with a pathspec or below the root", not walks, f"{walks}")
+    mutant = copy.deepcopy(doc)
+    step = next(
+        step
+        for step in mutant["jobs"]["changes"]["steps"]
+        if str(step.get("uses") or "").startswith("dorny/paths-filter")
+    )
+    filters = yaml.safe_load(step["with"]["filters"])
+    check(
+        "filter rust lists 'scripts/check-examples-compile.sh' for the mutant",
+        "scripts/check-examples-compile.sh" in filters["rust"],
+    )
+    filters["rust"] = [entry for entry in filters["rust"] if entry != "scripts/check-examples-compile.sh"]
+    step["with"]["filters"] = yaml.safe_dump(filters)
+    check(
+        "a `rust` filter that drops scripts/check-examples-compile.sh reports job rust-clippy",
+        not pattern_covers(job_patterns(mutant, ["rust-clippy"]) or set(), "scripts/check-examples-compile.sh"),
+    )
+
+
 def check_condition_grammar() -> None:
     """parse_condition reads the grammar ci.yml uses and refuses everything else."""
     outputs = {"rust": "true", "python": "false"}
@@ -10244,6 +10975,9 @@ def run_prose_route(inputs: Inputs) -> None:
     workflow = inputs.workflow
     print("prose-route — every tracked path is prose or reaches the `code` output")
     check_every_path_routed(workflow)
+    paths = tracked_paths()
+    check_binding_test_reads(workflow, paths)
+    check_script_reads(workflow, paths)
 
 
 def run_coverage(inputs: Inputs) -> None:

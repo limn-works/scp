@@ -47,9 +47,10 @@ import pytest
 # here, and no CI step runs the module. Its tests also patch
 # ``sys.modules["_scp_core"]``, a name no SDK code reads. The guard below is
 # inert until the suite is rewritten.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 _CONFTEST_SPEC = importlib.util.spec_from_file_location(
     "_scp_python_tests_conftest",
-    Path(__file__).resolve().parents[2] / "bindings" / "python" / "tests" / "conftest.py",
+    _REPO_ROOT / "bindings/python/tests/conftest.py",
 )
 assert _CONFTEST_SPEC is not None and _CONFTEST_SPEC.loader is not None
 _conftest = importlib.util.module_from_spec(_CONFTEST_SPEC)

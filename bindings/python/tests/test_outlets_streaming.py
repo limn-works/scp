@@ -582,7 +582,7 @@ class TestPublicSurfaceInvariant:
     def test_no_invoke_stream_token_in_bindings_sources(self) -> None:
         # Mirrors the SCP-OUT-006 grep AC:
         #   grep -rn 'invoke_stream\|invokeStream' bindings/ -> 0
-        bindings = Path(__file__).resolve().parents[2]
+        bindings = _REPO_ROOT / "bindings"
         assert bindings.name == "bindings"
         assert bindings.is_dir()
         # The AC scopes the ban to the PUBLIC surface. Exempt (per the AC):
@@ -624,13 +624,8 @@ class TestPublicSurfaceInvariant:
 # asserts the SDK reaches the vector's expected terminal.
 # ---------------------------------------------------------------------------
 
-_VECTORS_PATH = (
-    Path(__file__).resolve().parents[3]
-    / "tests"
-    / "conformance"
-    / "vectors"
-    / "outlet_stream_vectors.json"
-)
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_VECTORS_PATH = _REPO_ROOT / "tests/conformance/vectors/outlet_stream_vectors.json"
 
 
 def _load_vectors() -> dict[str, dict[str, Any]]:

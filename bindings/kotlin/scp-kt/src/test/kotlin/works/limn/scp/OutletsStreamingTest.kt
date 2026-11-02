@@ -257,16 +257,13 @@ private fun invoke(
 // tests/conformance/vectors/outlet_stream_vectors.json).
 // ---------------------------------------------------------------------------
 
-/** Walk up from the test JVM's working dir until the repo-root vectors file is found. */
-private fun locateVectorsFile(): File {
-    var dir: File? = File(System.getProperty("user.dir"))
-    while (dir != null) {
-        val candidate = File(dir, "tests/conformance/vectors/outlet_stream_vectors.json")
-        if (candidate.isFile) return candidate
-        dir = dir.parentFile
+/** The repository root: Gradle runs this module's tests in `bindings/kotlin/scp-kt`, three levels below it. */
+private val repositoryRoot = File(System.getProperty("user.dir")).parentFile.parentFile.parentFile
+
+private fun locateVectorsFile(): File =
+    repositoryRoot.resolve("tests/conformance/vectors/outlet_stream_vectors.json").also { file ->
+        check(file.isFile) { "outlet_stream_vectors.json is missing at ${file.path}" }
     }
-    error("could not locate outlet_stream_vectors.json from ${System.getProperty("user.dir")}")
-}
 
 private val VECTORS: Map<String, JsonObject> =
     run {

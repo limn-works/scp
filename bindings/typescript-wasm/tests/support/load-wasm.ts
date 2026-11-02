@@ -16,12 +16,11 @@
 
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { initScp } from "../../src/index";
 
-const here = dirname(fileURLToPath(import.meta.url));
-const packageRoot = join(here, "..", "..");
+const packageRoot = fileURLToPath(new URL("../../", import.meta.url));
 const testWasmPath = join(packageRoot, "tests", ".wasm-test", "scp_client_wasm_bg.wasm");
 
 /** Ensures the test wasm build exists (builds it with `--features testing` if not). */

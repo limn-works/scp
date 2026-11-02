@@ -55,7 +55,8 @@ SWIFT_RUNNER_DIR = HELPERS_DIR / "swift_bridge_runner"
 # bindings/python/tests/bridge_parity/conftest.py -> bridge_parity -> tests
 # -> python -> bindings -> repo root
 _REPO_ROOT = Path(__file__).resolve().parents[4]
-_TYPESCRIPT_DIR = _REPO_ROOT / "bindings" / "typescript"
+_TYPESCRIPT_DIR = _REPO_ROOT / "bindings/typescript"
+_WORKSPACE_MANIFEST = _REPO_ROOT / "Cargo.toml"
 
 
 def _cargo_target_dir() -> Path:
@@ -69,16 +70,24 @@ def _cargo_target_dir() -> Path:
 
     A set `CARGO_TARGET_DIR` is read directly instead. Cargo resolves a relative
     value of that variable against the directory it runs in, which for the
-    `cargo metadata` call below is the repository root. Job
-    `bridge-parity-kotlin` in `.github/workflows/ci.yml` sets it because that job
-    installs no Rust toolchain.
+    `cargo metadata` call below is this process's working directory, so a
+    relative value resolves against that directory here too. Job
+    `bridge-parity-kotlin` in `.github/workflows/ci.yml` sets it, to an absolute
+    path, because that job installs no Rust toolchain.
     """
     env_target_dir = os.environ.get("CARGO_TARGET_DIR", "")
     if env_target_dir:
-        return _REPO_ROOT / env_target_dir
+        return Path(env_target_dir).absolute()
     out = subprocess.run(
-        ["cargo", "metadata", "--format-version", "1", "--no-deps"],
-        cwd=_REPO_ROOT,
+        [
+            "cargo",
+            "metadata",
+            "--format-version",
+            "1",
+            "--no-deps",
+            "--manifest-path",
+            str(_WORKSPACE_MANIFEST),
+        ],
         check=True,
         capture_output=True,
         text=True,

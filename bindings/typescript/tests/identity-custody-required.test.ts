@@ -14,6 +14,7 @@
 import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { IdentityError, ValidationError } from "../src/errors";
 import type { CustodyType } from "../src/identity";
 import * as sdk from "../src/index";
@@ -25,6 +26,9 @@ import {
 } from "./harness-custody";
 import { mountMockScp } from "./mock-bridge";
 import { napiSuite } from "./napi-guard";
+
+/** `bindings/typescript`, which holds `package.json` and this `tests/` directory. */
+const PACKAGE_ROOT = fileURLToPath(new URL("../", import.meta.url));
 
 /** Every custody request value the union carries (spec §3.2.2). */
 const CUSTODY_VALUES: readonly CustodyType[] = ["encrypted_file", "os_keystore"];
@@ -195,9 +199,9 @@ describe("harness custody stays out of the package", () => {
   });
 
   it("the published files list ships no test file", () => {
-    const manifest = JSON.parse(
-      readFileSync(join(import.meta.dir, "..", "package.json"), "utf8"),
-    ) as { files: string[] };
+    const manifest = JSON.parse(readFileSync(join(PACKAGE_ROOT, "package.json"), "utf8")) as {
+      files: string[];
+    };
     expect(manifest.files.length).toBeGreaterThan(0);
     expect(manifest.files.some((f) => f.startsWith("tests"))).toBe(false);
   });

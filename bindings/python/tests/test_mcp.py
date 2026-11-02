@@ -30,6 +30,7 @@ Tests mock the ``_native`` bridge where needed; no Rust extension required.
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -45,6 +46,11 @@ from scp_sdk.mcp import (
     cli_main,
     validate_client_connect,
 )
+
+#: The repository root, three levels above this file.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+#: ``bindings/python``, which holds ``examples/`` and this ``tests/`` directory.
+_PYTHON_ROOT = Path(__file__).resolve().parents[1]
 
 # -----------------------------------------------------------------------
 # McpToolDefinition tests
@@ -595,10 +601,9 @@ class TestStdioAllowlistInstanceIsolation:
 def _sse_get_routes() -> set[str]:
     """Return the GET routes the SCP SSE server's router declares."""
     import re
-    from pathlib import Path
 
-    sse_rs = Path(__file__).resolve().parents[3] / "crates" / "scp-mcp" / "src" / "sse.rs"
-    return set(re.findall(r'\.route\("([^"]+)",\s*get\(', sse_rs.read_text()))
+    source = (_REPO_ROOT / "crates/scp-mcp/src/sse.rs").read_text()
+    return set(re.findall(r'\.route\("([^"]+)",\s*get\(', source))
 
 
 def _connect_sse_url_paths(source: str) -> list[str]:
@@ -622,11 +627,9 @@ def _connect_sse_url_paths(source: str) -> list[str]:
 
 class TestMcpExampleSsePath:
     def test_example_dials_a_get_route_the_sse_server_serves(self) -> None:
-        from pathlib import Path
-
         routes = _sse_get_routes()
         assert routes == {"/sse"}
-        example = Path(__file__).resolve().parents[1] / "examples" / "mcp_integration.py"
+        example = _PYTHON_ROOT / "examples/mcp_integration.py"
         paths = _connect_sse_url_paths(example.read_text())
         assert paths, "the example makes no mcp_client_connect_sse call with a literal URL"
         assert all(path in routes for path in paths), paths
