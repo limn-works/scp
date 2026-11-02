@@ -1,0 +1,48 @@
+name: Restore and save the cargo cache, keyed on every input that changes an artifact
+description: >-
+  Runs Swatinem/rust-cache with the digest manifest-digest.sh prints for each workspace's
+  root Cargo.toml in its `prefix-key`. rust-cache hashes member manifests, Cargo.lock,
+  `.cargo/config.toml`, `rust-toolchain(.toml)`, `rustc -vV` and the CARGO*/RUST*
+  environment, but never a virtual root manifest, which holds this repository's
+  `[profile.*]` tables, `[workspace.dependencies]` features and `[patch.crates-io]`.
+  manifest-digest.sh states what the digest drops and why. Every workflow step that
+  restores the cargo cache uses this action; job ci-workflow-selftest rejects a direct
+  Swatinem/rust-cache step.
+inputs:
+  shared-key:
+    description: The cache group; rust-cache's `shared-key`.
+    required: true
+  save-if:
+    description: Whether this step saves; rust-cache's `save-if`.
+    required: true
+  workspaces:
+    description: >-
+      rust-cache's `workspaces`: one `<root> -> <target>` per line. The digest covers the
+      Cargo.toml at each root.
+    required: false
+    default: ". -> target"
+runs:
+  using: composite
+  steps:
+    - name: Digest each workspace's root Cargo.toml
+      id: manifest
+      shell: bash
+      env:
+        CACHE_WORKSPACES: ${{ inputs.workspaces }}
+      run: |
+        set -euo pipefail
+        roots=()
+        while IFS= read -r line; do
+          root="${line%%->*}"
+          root="${root#"${root%%[![:space:]]*}"}"
+          root="${root%"${root##*[![:space:]]}"}"
+          [[ -n $root ]] && roots+=("$root")
+        done <<< "$CACHE_WORKSPACES"
+        digest="$(bash "$GITHUB_ACTION_PATH/manifest-digest.sh" "${roots[@]}")"
+        echo "digest=${digest:0:16}" >> "$GITHUB_OUTPUT"
+    - uses: Swatinem/rust-cache@v2
+      with:
+        prefix-key: v0-rust-${{ steps.manifest.outputs.digest }}
+        shared-key: ${{ inputs.shared-key }}
+        save-if: ${{ inputs.save-if }}
+        workspaces: ${{ inputs.workspaces }}

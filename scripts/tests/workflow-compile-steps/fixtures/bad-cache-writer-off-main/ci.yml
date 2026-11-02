@@ -4,7 +4,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         with:
           shared-key: workspace-debug
           save-if: true

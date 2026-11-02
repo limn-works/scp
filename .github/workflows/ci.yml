@@ -54,7 +54,7 @@ env:
 
 # ── Cargo cache groups ────────────────────────────────────────────────────────
 #
-# Every `Swatinem/rust-cache` step below names a `shared-key` and a `save-if`, and this
+# Every `./.github/actions/rust-cache` step below names a `shared-key` and a `save-if`, and this
 # comment says why both are required rather than left at their defaults.
 #
 # WHAT THE DEFAULTS DID. `add-job-id-key` defaults to true, so each step wrote its own
@@ -76,6 +76,20 @@ env:
 # Job rust-test-optional-features later split its one group into three, one per matrix
 # group, job rust-clippy split its one group into three, one per matrix leg, and job
 # rust-test-macos added one, so this workflow now writes thirteen groups per generation.
+#
+# WHAT THE KEY HOLDS. Every step restores through `./.github/actions/rust-cache`, never
+# Swatinem/rust-cache directly. rust-cache keys on `rustc -vV`, the CARGO*/RUST*
+# variables its step sees, `.cargo/config.toml` and `rust-toolchain.toml`, Cargo.lock and
+# each member Cargo.toml, but not on the virtual root Cargo.toml, which holds every
+# `[profile.*]` table. The wrapper adds a digest of that manifest to `prefix-key`. Before
+# it, `[profile.dev.package."*"] opt-level = 1` merged without changing any key: every job
+# restored the old entry with `full match: true`, recompiled 300 to 660 dependencies, and
+# skipped the save because the key still matched, so merge_group run 41477746543 took
+# 13.0 minutes against 6.8 in run 41465335098. A variable that changes artifacts
+# (RUSTFLAGS, RUSTDOCFLAGS, CARGO_INCREMENTAL, CARGO_PROFILE_*, CARGO_BUILD_*) is set
+# in the workflow-level or job-level `env:`, which the cache step sees, never in a
+# step's `env:` or through `$GITHUB_ENV`. Check `cache-key` in
+# scripts/tests/ci-gate/ci_gate_selftest.py holds both rules.
 #
 # THE GROUPS. Cargo hashes the compile mode into every artifact's metadata
 # suffix beside the profile and the feature set, so `cargo clippy` and `cargo doc`,
@@ -123,7 +137,7 @@ env:
 #                     replaced `workspace-release`, `apple-uniffi` and `apple-parity`,
 #                     which held `--release` output, when the producers moved to the
 #                     profile. Keeping the old names would have stalled each group:
-#                     rust-cache's key hashes no `[profile]` table, so the old entry
+#                     rust-cache's key then hashed no `[profile]` table, so the old entry
 #                     matched the new key in full, restored a `target/release` the
 #                     profile never reads, and a full match skips the save, so `main`
 #                     would never have written the `target/ci-bridge` entry. Measured
@@ -422,6 +436,9 @@ jobs:
               # offline for the rest of the job, so a change to it decides whether every
               # Rust lane resolves its dependencies at all.
               - '.github/actions/cargo-fetch/**'
+              # The step every Rust job restores its cargo cache through: it decides
+              # the key every Rust lane restores and saves under.
+              - '.github/actions/rust-cache/**'
             rust:
               - 'crates/**'
               - 'Cargo.toml'
@@ -635,9 +652,10 @@ jobs:
               - '.github/workflows/ci.yml'
               # fuzz-build installs its nightly through this action and downloads
               # fuzz/Cargo.lock's crates through the next one, and the `fuzz` output
-              # reads this filter alone.
+              # reads this filter alone. It restores its cache through the third.
               - '.github/actions/rust-toolchain/**'
               - '.github/actions/cargo-fetch/**'
+              - '.github/actions/rust-cache/**'
               # Every crate manifest, inside the closure above or not: a
               # manifest edit can add a dependency edge that pulls a crate into
               # this build, and `cargo check --locked` is the one check that
@@ -718,7 +736,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: taiki-e/install-action@nextest
       - uses: ./.github/actions/rust-toolchain
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         with:
           shared-key: workspace-debug
           save-if: false
@@ -787,7 +805,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/rust-toolchain
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         with:
           shared-key: workspace-debug
           save-if: false
@@ -818,7 +836,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/rust-toolchain
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         with:
           shared-key: workspace-debug
           save-if: false
@@ -1167,7 +1185,7 @@ jobs:
         run: bash scripts/tests/pre-commit-clippy-scope/run-tests.sh
       # The compile-steps check reads every workflow file with PyYAML, which
       # `actions/setup-python` does not ship, so the step before it installs the library.
-      # The check holds every `Swatinem/rust-cache` step to the group shape the header
+      # The check holds every `./.github/actions/rust-cache` step to the group shape the header
       # comment of this file describes — a `shared-key`, a `save-if`, one writer per group
       # and that writer on `main` — counted across every workflow, because the 10 GB cap
       # is per repository; and it holds every uniffi-bindgen step to reading the library
@@ -1265,7 +1283,7 @@ jobs:
       # scripts/check-workflow-compile-steps.py enforces: every rust-cache step
       # names a `shared-key` and a `save-if`, and each group has exactly one
       # writer, on `main`.
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         with:
           shared-key: workspace-debug
           save-if: false
@@ -1576,7 +1594,7 @@ jobs:
       # crates is compiled from — and not their compiled artifacts. It writes nothing:
       # a 1-minute job that saved its own entry would hold ~200 MB of the repository's
       # 10 GB cache budget against the entries the long jobs read.
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         with:
           shared-key: wasm32
           save-if: false
@@ -1604,7 +1622,7 @@ jobs:
       # scp-client-wasm under the dev profile and that job builds under release, so this
       # restore supplies the registry rather than compiled artifacts. It writes nothing,
       # for the reason spelled out on the same step in job wasm-protocol above.
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         with:
           shared-key: wasm32
           save-if: false
@@ -1716,7 +1734,7 @@ jobs:
       # run. This leg is the one that compiles the most of `target/debug` in check
       # mode under the workspace feature resolution, so it is the group's producer;
       # rust-doc reads the group for its `cargo doc`.
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         if: matrix.leg == 'workspace'
         with:
           shared-key: workspace-check
@@ -1724,7 +1742,7 @@ jobs:
       # Writes the `clippy-examples` group: scripts/check-examples-compile.sh lints
       # each example target alone, one package's dev-target feature set at a time,
       # a resolution the `workspace-check` entry does not hold.
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         if: matrix.leg == 'examples'
         with:
           shared-key: clippy-examples
@@ -1732,7 +1750,7 @@ jobs:
       # Writes the `clippy-packages` group: each `-p` command below resolves features
       # over one package's subgraph under the features it names. Only the push leg
       # `packages` writes it; the six pull-request legs restore it.
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         if: matrix.leg == 'packages' || matrix.leg == 'packages-network' || matrix.leg == 'packages-platform' || matrix.leg == 'packages-blob' || matrix.leg == 'packages-push' || matrix.leg == 'packages-cloud' || matrix.leg == 'packages-node-lib'
         with:
           shared-key: clippy-packages
@@ -1968,7 +1986,7 @@ jobs:
         with:
           python-version: "3.12"
       - uses: ./.github/actions/rust-toolchain
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         with:
           shared-key: workspace-debug
           save-if: ${{ github.ref == 'refs/heads/main' && matrix.leg == 'all' }}
@@ -2039,7 +2057,7 @@ jobs:
         with:
           python-version: "3.12"
       - uses: ./.github/actions/rust-toolchain
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         with:
           shared-key: workspace-debug
           save-if: false
@@ -2154,24 +2172,24 @@ jobs:
       # One rust-cache step per entry, each key literal: the matrix list is a
       # `fromJSON` expression, so scripts/check-workflow-compile-steps.py could
       # not expand a `${{ matrix.group }}` key into the entries it writes.
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         if: matrix.group == 'node-relay'
         with:
           shared-key: transport-optional-node-relay
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         if: matrix.group == 'platform-testing'
         with:
           shared-key: transport-optional-platform-testing
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         if: matrix.group == 'sqlite-without-memory-management'
         with:
           shared-key: transport-optional-sqlite-without-memory-management
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # Only the push leg `transport` writes this entry; the four pull-request
       # transport legs restore it.
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         if: matrix.group == 'transport' || matrix.group == 'transport-local' || matrix.group == 'transport-network' || matrix.group == 'transport-push' || matrix.group == 'transport-blob'
         with:
           shared-key: transport-optional-transport
@@ -2425,7 +2443,7 @@ jobs:
         with:
           python-version: "3.12"
       - uses: ./.github/actions/rust-toolchain
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         with:
           shared-key: apple-transport-platform
           save-if: ${{ github.ref == 'refs/heads/main' && matrix.leg == 'all' }}
@@ -2500,7 +2518,7 @@ jobs:
         with:
           python-version: "3.12"
       - uses: ./.github/actions/rust-toolchain
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         with:
           shared-key: workspace-debug
           save-if: false
@@ -2658,7 +2676,7 @@ jobs:
         with:
           python-version: "3.12"
       - uses: ./.github/actions/rust-toolchain
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         with:
           shared-key: workspace-debug
           save-if: false
@@ -2790,7 +2808,7 @@ jobs:
       - uses: ./.github/actions/rust-toolchain
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         with:
           shared-key: workspace-debug
           save-if: false
@@ -2938,7 +2956,7 @@ jobs:
       - uses: ./.github/actions/rust-toolchain
       # Restores the build-mode artifacts rust-test writes to the `workspace-debug`
       # group, and writes nothing.
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         with:
           shared-key: workspace-debug
           save-if: false
@@ -2977,7 +2995,7 @@ jobs:
       - uses: ./.github/actions/rust-toolchain
       # Restores the check-mode artifacts rust-clippy's `workspace` leg writes to the
       # `workspace-check` group, and writes nothing.
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         with:
           shared-key: workspace-check
           save-if: false
@@ -3448,7 +3466,7 @@ jobs:
           key: bridge-artifact-v1-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '**/Cargo.toml', '.cargo/**', 'crates/**', 'bindings/python/pyproject.toml') }}-${{ steps.artifact-inputs.outputs.digest }}
       - uses: ./.github/actions/rust-toolchain
         if: steps.artifact-cache.outputs.cache-hit != 'true'
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         with:
           shared-key: workspace-ci-bridge
@@ -3553,7 +3571,7 @@ jobs:
           key: bridge-artifact-v1-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '**/Cargo.toml', '.cargo/**', 'crates/**') }}-${{ steps.artifact-inputs.outputs.digest }}
       - uses: ./.github/actions/rust-toolchain
         if: steps.artifact-cache.outputs.cache-hit != 'true'
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         with:
           shared-key: workspace-ci-bridge
@@ -3653,7 +3671,7 @@ jobs:
           key: bridge-artifact-v1-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '**/Cargo.toml', '.cargo/**', 'crates/**', 'bindings/swift/build-xcframework.sh') }}-${{ steps.artifact-inputs.outputs.digest }}
       - uses: ./.github/actions/rust-toolchain
         if: steps.artifact-cache.outputs.cache-hit != 'true'
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         with:
           shared-key: apple-uniffi-ci-bridge
@@ -3790,7 +3808,7 @@ jobs:
           key: bridge-artifact-v1-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '**/Cargo.toml', '.cargo/**', 'crates/**', 'bindings/python/pyproject.toml') }}-${{ steps.artifact-inputs.outputs.digest }}
       - uses: ./.github/actions/rust-toolchain
         if: steps.artifact-cache.outputs.cache-hit != 'true'
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         with:
           shared-key: apple-parity-ci-bridge
@@ -3988,6 +4006,9 @@ jobs:
     name: Python / wheel (vendored OpenSSL)
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # Job-level, so the cache step's key holds it: RUSTFLAGS changes every artifact.
+    env:
+      RUSTFLAGS: "-D warnings"
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v5
@@ -3996,7 +4017,7 @@ jobs:
             3.10
             3.12
       - uses: ./.github/actions/rust-toolchain
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         with:
           shared-key: python-wheel
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -4007,8 +4028,6 @@ jobs:
       # features and the manifest from the `[tool.maturin]` table of
       # bindings/python/pyproject.toml and builds the dev profile.
       - name: Build a debug wheel for CPython 3.10 and 3.12
-        env:
-          RUSTFLAGS: "-D warnings"
         working-directory: bindings/python
         run: maturin build --out dist -i python3.10 python3.12 --locked
       - name: Install each wheel, import every scp_sdk module, and read the extension's NEEDED entries
@@ -4205,7 +4224,7 @@ jobs:
       - uses: ./.github/actions/rust-toolchain
         with:
           targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         with:
           shared-key: wasm32
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -4279,7 +4298,7 @@ jobs:
       - uses: ./.github/actions/rust-toolchain
         with:
           targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         with:
           shared-key: wasm32
           save-if: false
@@ -4625,7 +4644,7 @@ jobs:
         run: touch "$RUNNER_TEMP/uniffi-kotlin-build-start"
       - uses: ./.github/actions/rust-toolchain
         if: steps.artifact-cache.outputs.cache-hit != 'true'
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         with:
           shared-key: workspace-debug
@@ -4959,7 +4978,7 @@ jobs:
           targets: x86_64-linux-android
       # One writer for the group: the API 33 leg on main. Both legs compile the same
       # units, so the API 30 leg restores what the API 33 leg saved.
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         with:
           shared-key: android-x86_64-testing
           save-if: ${{ github.ref == 'refs/heads/main' && matrix.api-level == 33 }}
@@ -5124,7 +5143,7 @@ jobs:
       - uses: ./.github/actions/rust-toolchain
         with:
           toolchain-file: fuzz/rust-toolchain.toml
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         with:
           workspaces: "fuzz -> target"
           shared-key: fuzz
