@@ -96,6 +96,19 @@ jobs:
       - name: Fetch crates, then take cargo offline
         uses: ./.github/actions/cargo-fetch
 
+      # Every workspace cargo step below compiles scp-ffi, whose pyo3-ffi build script
+      # reads the interpreter PYO3_PYTHON names and fails when its version is newer than
+      # the newest one pyo3 supports. Without the pin it reads the runner image's
+      # default `python3`, which moves with the image.
+      - name: Setup Python 3.12
+        id: python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Point PyO3 at Python 3.12
+        run: echo "PYO3_PYTHON=${{ steps.python.outputs.python-path }}" >> "$GITHUB_ENV"
+
       - name: Run all workspace tests
         run: cargo test --workspace --release --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/saga-witness-test-mint
 

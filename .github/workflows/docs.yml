@@ -170,6 +170,16 @@ jobs:
       # Every crate Cargo.lock names, downloaded once with retries; `cargo doc` below
       # runs with CARGO_NET_OFFLINE=true. fetch.sh states why.
       - uses: ./.github/actions/cargo-fetch
+      # `cargo doc --workspace` compiles scp-ffi, whose pyo3-ffi build script reads the
+      # interpreter PYO3_PYTHON names and fails when its version is newer than the
+      # newest one pyo3 supports. Without the pin it reads the runner image's default
+      # `python3`, which moved to 3.14 past pyo3 0.24's 3.13 ceiling.
+      - uses: actions/setup-python@v5
+        id: python
+        with:
+          python-version: "3.12"
+      - name: Point PyO3 at Python 3.12
+        run: echo "PYO3_PYTHON=${{ steps.python.outputs.python-path }}" >> "$GITHUB_ENV"
       - name: Generate rustdoc
         # FFI bridge methods like `scpid_sign` and `identity_*_link_attestation`
         # on `impl Scp` are feature-gated by `testing` so that
