@@ -8,7 +8,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         with:
           shared-key: workspace-debug
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -16,7 +16,7 @@ jobs:
   clippy:
     runs-on: ubuntu-latest
     steps:
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         with:
           shared-key: workspace-check
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -24,11 +24,11 @@ jobs:
   doc:
     runs-on: ubuntu-latest
     steps:
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         with:
           shared-key: workspace-debug
           save-if: false
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         with:
           shared-key: workspace-check
           save-if: false
@@ -41,7 +41,7 @@ jobs:
       matrix:
         target: [a, b]
     steps:
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         with:
           workspaces: "fuzz -> target"
           shared-key: fuzz-run
@@ -49,7 +49,7 @@ jobs:
   fuzz-weekly:
     runs-on: ubuntu-latest
     steps:
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         with:
           workspaces: "fuzz -> target"
           shared-key: fuzz-run

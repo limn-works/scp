@@ -10,7 +10,7 @@ jobs:
         exclude:
           - group: node-relay
     steps:
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         with:
           shared-key: optional-${{ matrix.group }}
           save-if: ${{ github.ref == 'refs/heads/main' }}

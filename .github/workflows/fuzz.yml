@@ -215,7 +215,7 @@ jobs:
       # profile into `fuzz/target/debug`, a directory cargo shares nothing with.
       # `scripts/check-workflow-compile-steps.py` holds every rust-cache step to this
       # shape: a `shared-key`, a `save-if`, and one writer per group, on main.
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         with:
           workspaces: "fuzz -> target"
           shared-key: fuzz-run
@@ -347,7 +347,7 @@ jobs:
       # Reads group `fuzz-run`, which fuzz-nightly writes every night (see the group
       # comment on that job). Every leg here reads and none writes: the six targets
       # this job fuzzes are six of the thirteen fuzz-nightly builds with the same flags.
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         with:
           workspaces: "fuzz -> target"
           shared-key: fuzz-run

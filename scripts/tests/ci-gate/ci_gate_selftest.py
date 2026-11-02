@@ -224,6 +224,31 @@ nothing:
                compile-timings.yml times cargo builds, so the same rule holds
                there: without the key it would time builds that carry line
                tables.
+  cache-key    Every workflow step that restores the cargo cache uses
+               ./.github/actions/rust-cache, never Swatinem/rust-cache directly.
+               rust-cache keys on member manifests, Cargo.lock,
+               `.cargo/config.toml`, `rust-toolchain.toml`, `rustc -vV` and the
+               CARGO*/RUST* variables its step sees, but not on the virtual root
+               Cargo.toml, which holds every `[profile.*]` table. After
+               `[profile.dev.package."*"] opt-level = 1` merged, every job
+               restored the old entry with a full key match, recompiled 300 to 660
+               dependencies and saved nothing, and merge_group run 41477746543
+               took 13.0 minutes against 6.8 before. The check requires the
+               wrapper to put manifest-digest.sh's digest into `prefix-key`, runs
+               that script on edits to the root Cargo.toml (a profile, a
+               dependency's features, a patch rev and a member change the digest;
+               a version string, a comment and a lint level do not, so a version
+               bump keeps rust-cache's partial restore), requires every
+               artifact-changing variable (RUSTFLAGS, RUSTDOCFLAGS,
+               CARGO_INCREMENTAL, CARGO_PROFILE_*, CARGO_BUILD_* and the rest of
+               ARTIFACT_ENV) in a cache job to sit in the job's or workflow's
+               `env:`, never in a step's `env:` or a `$GITHUB_ENV` write, and
+               rejects a `.cargo/config` without `.toml`, which cargo reads and
+               rust-cache does not hash. Controls: a direct Swatinem step, the
+               wrapper without its prefix-key, digest step or workspaces, a digest
+               that skips `[profile.*]`, a root without Cargo.toml, a step-level
+               RUSTFLAGS, `$GITHUB_ENV` writes from a run and from a local action,
+               and a planted `.cargo/config`; a job-level RUSTFLAGS must pass.
   offline-cargo
                Every job in `.github/workflows/` that runs cargo, maturin or
                wasm-pack runs `./.github/actions/cargo-fetch` exactly once,
@@ -4968,6 +4993,363 @@ def check_profile_env_is_workflow_level(doc: dict, name: str) -> None:
     )
 
 
+# The local action every cargo-cache step uses, the upstream action only it may call, and
+# the script whose digest of each workspace's root Cargo.toml it puts into the cache key.
+# See the `cache-key` entry in this file's docstring.
+RUST_CACHE_ACTION = "./.github/actions/rust-cache"
+RUST_CACHE_UPSTREAM = "Swatinem/rust-cache@"
+RUST_CACHE_ACTION_FILE = REPO / ".github/actions/rust-cache/action.yml"
+MANIFEST_DIGEST_SCRIPT = REPO / ".github/actions/rust-cache/manifest-digest.sh"
+# A variable that changes what cargo compiles. rust-cache hashes the CARGO*/RUST*
+# variables its own step sees, so one of these set only in a later step's `env:`, or
+# written to `$GITHUB_ENV` by any step, changes the artifacts without changing the key.
+# CARGO_TARGET_DIR is absent: it moves artifacts, it does not change them.
+ARTIFACT_ENV = re.compile(
+    r"^(RUSTFLAGS|RUSTDOCFLAGS|CARGO_ENCODED_RUSTFLAGS|CARGO_ENCODED_RUSTDOCFLAGS"
+    r"|CARGO_INCREMENTAL|CARGO_PROFILE_\w+|CARGO_BUILD_\w+|CARGO_TARGET_\w+_RUSTFLAGS"
+    r"|CARGO_TARGET_\w+_LINKER|RUSTC|RUSTC_WRAPPER|RUSTC_WORKSPACE_WRAPPER)$"
+)
+ARTIFACT_ENV_WRITE = re.compile(
+    r"(?<![\w$])(RUSTFLAGS|RUSTDOCFLAGS|CARGO_\w+|RUSTC\w*)=[^\n]*>>\s*\"?\$\{?GITHUB_ENV"
+)
+
+
+def direct_rust_cache_gaps(documents: list[tuple[Path, dict]]) -> list[str]:
+    """Return each workflow step that calls Swatinem/rust-cache without the wrapper.
+
+    CRITERION: no step in any workflow `uses:` a ref starting with RUST_CACHE_UPSTREAM;
+    RUST_CACHE_ACTION is the only caller.
+    """
+    gaps = []
+    for path, doc in documents:
+        for job_id, job in sorted((doc.get("jobs") or {}).items()):
+            for index, step in enumerate(job.get("steps") or []):
+                if str(step.get("uses") or "").startswith(RUST_CACHE_UPSTREAM):
+                    label = step.get("name") or f"step {index}"
+                    gaps.append(f"{path.name} job {job_id}, {label}: uses {step['uses']}")
+    return gaps
+
+
+def wrapper_key_gaps(action: dict) -> list[str]:
+    """Return each way the wrapper action fails to key on the manifest digest.
+
+    CRITERION: a step with id `manifest` runs manifest-digest.sh, and a later step
+    uses RUST_CACHE_UPSTREAM with a `prefix-key` that reads
+    `steps.manifest.outputs.digest` and passes the wrapper's `workspaces` input on, so
+    the digest covers the roots the cache restores.
+    """
+    steps = (action.get("runs") or {}).get("steps") or []
+    digest_at = next(
+        (
+            index
+            for index, step in enumerate(steps)
+            if step.get("id") == "manifest"
+            and "manifest-digest.sh" in str(step.get("run") or "")
+            and "inputs.workspaces" in str((step.get("env") or {}).values())
+        ),
+        None,
+    )
+    gaps = []
+    if digest_at is None:
+        gaps.append("no step with id `manifest` runs manifest-digest.sh on the workspaces input")
+    caches = [
+        (index, step)
+        for index, step in enumerate(steps)
+        if str(step.get("uses") or "").startswith(RUST_CACHE_UPSTREAM)
+    ]
+    if len(caches) != 1:
+        gaps.append(f"{len(caches)} {RUST_CACHE_UPSTREAM} steps, expected 1")
+    for index, step in caches:
+        inputs = step.get("with") or {}
+        if "steps.manifest.outputs.digest" not in str(inputs.get("prefix-key", "")):
+            gaps.append("the rust-cache `prefix-key` does not read steps.manifest.outputs.digest")
+        if "inputs.workspaces" not in str(inputs.get("workspaces", "")):
+            gaps.append("the rust-cache step does not pass the workspaces input on")
+        if digest_at is not None and index < digest_at:
+            gaps.append("the rust-cache step runs before the digest step")
+    return gaps
+
+
+def manifest_digest(script: Path, root: Path) -> str:
+    result = subprocess.run(
+        ["bash", str(script), str(root)], capture_output=True, text=True, check=True
+    )
+    return result.stdout.strip()
+
+
+# Edits to the root Cargo.toml, each a regex substitution applied once. KEYED edits change
+# a compiled artifact, so the digest must change; UNKEYED edits change none or are keyed
+# by Cargo.lock, so the digest must not change and rust-cache keeps its partial restore.
+DIGEST_KEYED_EDITS = {
+    "a [profile.dev] opt-level": (r"(?m)^\[profile\.dev\]\n", "[profile.dev]\nopt-level = 2\n"),
+    'a [profile.dev.package."*"] value': (
+        r'(?m)^\[profile\.dev\.package\."\*"\]\n',
+        '[profile.dev.package."*"]\ncodegen-units = 7\n',
+    ),
+    "a [profile.release] value": (r"(?m)^\[profile\.release\]\n", "[profile.release]\nlto = false\n"),
+    "a workspace dependency's features": (
+        r'(?m)^(tokio = \{ version = "[^"]*", features = \[)"full"\]',
+        r'\1"full", "test-util"]',
+    ),
+    "a [patch.crates-io] rev": (r'(rev = ")[0-9a-f]{40}(")', r"\g<1>" + "0" * 40 + r"\2"),
+    "a workspace member": (r"(?m)^members = \[\n", 'members = [\n    "crates/planted",\n'),
+}
+DIGEST_UNKEYED_EDITS = {
+    "a workspace dependency's version string": (r'(?m)^(async-trait = )"[^"]*"', r'\1"0.1.99"'),
+    "a workspace dependency's inline version": (
+        r'(?m)^(tokio = \{ version = )"[^"]*"',
+        r'\1"1.99"',
+    ),
+    "a comment line": (r"(?m)^\[profile\.dev\]\n", "[profile.dev]\n# planted comment\n"),
+    "a [workspace.lints.clippy] level": (
+        r"(?m)^\[workspace\.lints\.clippy\]\n",
+        '[workspace.lints.clippy]\nplanted_lint = "allow"\n',
+    ),
+}
+
+
+def manifest_digest_gaps(script: Path, manifest_text: str) -> list[str]:
+    """Return each edit to `manifest_text` whose effect on the digest is wrong.
+
+    CRITERION: every DIGEST_KEYED_EDITS edit changes the digest `script` prints and
+    every DIGEST_UNKEYED_EDITS edit leaves it unchanged. An edit whose pattern matches
+    nothing is a gap too, because it would prove nothing.
+    """
+    gaps = []
+    with tempfile.TemporaryDirectory() as scratch:
+        root = Path(scratch)
+
+        def digest_of(text: str) -> str:
+            (root / "Cargo.toml").write_text(text)
+            return manifest_digest(script, root)
+
+        base = digest_of(manifest_text)
+        for keyed, edits in ((True, DIGEST_KEYED_EDITS), (False, DIGEST_UNKEYED_EDITS)):
+            for label, (pattern, replacement) in edits.items():
+                edited, count = re.subn(pattern, replacement, manifest_text, count=1)
+                if count != 1:
+                    gaps.append(f"{label}: the edit matches nothing in Cargo.toml")
+                    continue
+                changed = digest_of(edited) != base
+                if changed != keyed:
+                    gaps.append(
+                        f"{label} {'leaves' if keyed else 'changes'} the digest"
+                    )
+    return gaps
+
+
+def artifact_env_gaps(doc: dict, name: str, action_texts: dict[str, str]) -> list[str]:
+    """Return each artifact-changing variable a cargo-cache job sets outside the key.
+
+    CRITERION: in a job with a RUST_CACHE_ACTION step, no step's `env:` sets a key
+    ARTIFACT_ENV matches, and no step's `run:`, nor any local action in
+    `action_texts` that a step uses, writes such a variable to `$GITHUB_ENV`. The
+    workflow-level and job-level `env:` reach the cache step, so those stay allowed
+    (check profile-env further confines CARGO_PROFILE_* to the workflow level).
+    """
+    gaps = []
+    for job_id, job in sorted((doc.get("jobs") or {}).items()):
+        steps = job.get("steps") or []
+        if not any(str(step.get("uses") or "") == RUST_CACHE_ACTION for step in steps):
+            continue
+        for index, step in enumerate(steps):
+            label = step.get("name") or step.get("uses") or f"step {index}"
+            for key in sorted(step.get("env") or {}):
+                if ARTIFACT_ENV.match(str(key)):
+                    gaps.append(f"{name} job {job_id}, {label}: step env sets {key}")
+            texts = [str(step.get("run") or "")]
+            uses = str(step.get("uses") or "")
+            if uses in action_texts:
+                texts.append(action_texts[uses])
+            for text in texts:
+                for match in ARTIFACT_ENV_WRITE.finditer(text):
+                    if ARTIFACT_ENV.match(match.group(1)):
+                        gaps.append(
+                            f"{name} job {job_id}, {label}: writes {match.group(1)} "
+                            "to $GITHUB_ENV"
+                        )
+    return gaps
+
+
+def local_action_texts() -> dict[str, str]:
+    """Map each `./.github/actions/<name>` ref to the text of every file in it."""
+    texts = {}
+    for directory in sorted((REPO / ".github/actions").iterdir()):
+        if directory.is_dir():
+            texts[f"./.github/actions/{directory.name}"] = "\n".join(
+                path.read_text() for path in sorted(directory.iterdir()) if path.is_file()
+            )
+    return texts
+
+
+# Cargo reads `.cargo/config` as well as `.cargo/config.toml`; rust-cache hashes only
+# the second, so the first in any workspace root's ancestry would change artifacts
+# outside the key.
+def unkeyed_cargo_config_gaps(roots: list[Path]) -> list[str]:
+    """CRITERION: no directory from REPO down to each root holds `.cargo/config`."""
+    gaps = []
+    for root in roots:
+        for directory in (root, *root.parents):
+            legacy = directory / ".cargo/config"
+            if legacy.is_file():
+                gaps.append(f"{legacy} exists, and rust-cache hashes only .cargo/config.toml")
+            if directory == REPO or directory == directory.parent:
+                break
+    return sorted(set(gaps))
+
+
+def check_cache_key(documents: list[tuple[Path, dict]]) -> None:
+    gaps = direct_rust_cache_gaps(documents)
+    check(
+        f"no workflow step uses {RUST_CACHE_UPSTREAM} except through {RUST_CACHE_ACTION}",
+        not gaps,
+        f"{gaps}: that step's key omits the root Cargo.toml's [profile.*] tables",
+    )
+    planted = copy.deepcopy(documents)
+    path, doc = next(
+        (path, doc)
+        for path, doc in planted
+        if any(
+            str(step.get("uses") or "") == RUST_CACHE_ACTION
+            for job in (doc.get("jobs") or {}).values()
+            for step in job.get("steps") or []
+        )
+    )
+    step = next(
+        step
+        for job in doc["jobs"].values()
+        for step in job.get("steps") or []
+        if str(step.get("uses") or "") == RUST_CACHE_ACTION
+    )
+    step["uses"] = "Swatinem/rust-cache@v2"
+    check(
+        f"a direct Swatinem/rust-cache@v2 step in {path.name} is reported",
+        any(gap.startswith(f"{path.name} job ") for gap in direct_rust_cache_gaps(planted)),
+        f"{direct_rust_cache_gaps(planted)}",
+    )
+
+    action = yaml.safe_load(RUST_CACHE_ACTION_FILE.read_text())
+    gaps = wrapper_key_gaps(action)
+    check(
+        f"{RUST_CACHE_ACTION} puts the manifest digest into rust-cache's prefix-key",
+        not gaps,
+        "; ".join(gaps),
+    )
+    for label, mutate in (
+        ("without the prefix-key", lambda steps: steps[1]["with"].pop("prefix-key")),
+        ("with the digest step removed", lambda steps: steps.pop(0)),
+        ("passing no workspaces on", lambda steps: steps[1]["with"].pop("workspaces")),
+    ):
+        mutated = copy.deepcopy(action)
+        mutate(mutated["runs"]["steps"])
+        check(
+            f"the wrapper {label} is reported",
+            bool(wrapper_key_gaps(mutated)),
+            f"{label}: wrapper_key_gaps returned nothing",
+        )
+
+    manifest_text = (REPO / "Cargo.toml").read_text()
+    gaps = manifest_digest_gaps(MANIFEST_DIGEST_SCRIPT, manifest_text)
+    check(
+        "manifest-digest.sh changes on each artifact-changing edit to Cargo.toml and on "
+        "no other",
+        not gaps,
+        "; ".join(gaps),
+    )
+    # Control: a digest script that skips [profile.*] tables, the hole this check closes.
+    with tempfile.TemporaryDirectory() as scratch:
+        planted_script = Path(scratch) / "manifest-digest.sh"
+        text = MANIFEST_DIGEST_SCRIPT.read_text()
+        skip = "skip = header ~ /^(workspace\\.)?lints(\\.|$)/"
+        planted_script.write_text(
+            text.replace(skip, "skip = header ~ /^profile(\\.|$)/ || header ~ /^(workspace\\.)?lints(\\.|$)/")
+        )
+        check(
+            "the planting replaced the digest script's skip rule",
+            planted_script.read_text() != text,
+            "the skip rule text moved; update this control",
+        )
+        planted_gaps = manifest_digest_gaps(planted_script, manifest_text)
+        check(
+            "a digest that ignores [profile.*] tables is reported",
+            any("profile" in gap and "leaves the digest" in gap for gap in planted_gaps),
+            f"{planted_gaps}",
+        )
+    check(
+        "manifest-digest.sh exits non-zero for a root without Cargo.toml",
+        subprocess.run(
+            ["bash", str(MANIFEST_DIGEST_SCRIPT), str(REPO / ".github")],
+            capture_output=True,
+            check=False,
+        ).returncode
+        != 0,
+        "a missing manifest printed a digest that keys on nothing",
+    )
+
+    texts = local_action_texts()
+    for path, doc in documents:
+        gaps = artifact_env_gaps(doc, path.name, texts)
+        check(
+            f"{path.name}: every cargo-cache job sets artifact-changing variables only "
+            "where the cache step sees them",
+            not gaps,
+            f"{gaps}: move each to the job's or the workflow's `env:`",
+        )
+    workflow = next(doc for path, doc in documents if path.name == "ci.yml")
+    job_id = next(
+        job_id
+        for job_id, job in workflow["jobs"].items()
+        if any(str(step.get("uses") or "") == RUST_CACHE_ACTION for step in job.get("steps") or [])
+    )
+    mutated = copy.deepcopy(workflow)
+    mutated["jobs"][job_id]["steps"][-1].setdefault("env", {})["RUSTFLAGS"] = "-D warnings"
+    check(
+        f"a step-level RUSTFLAGS on {job_id} is reported",
+        any("step env sets RUSTFLAGS" in gap for gap in artifact_env_gaps(mutated, "ci.yml", texts)),
+        f"{artifact_env_gaps(mutated, 'ci.yml', texts)}",
+    )
+    mutated = copy.deepcopy(workflow)
+    mutated["jobs"][job_id]["steps"].append(
+        {"name": "planted", "run": "echo 'CARGO_PROFILE_DEV_OPT_LEVEL=0' >> \"$GITHUB_ENV\""}
+    )
+    check(
+        f"a $GITHUB_ENV write of CARGO_PROFILE_DEV_OPT_LEVEL on {job_id} is reported",
+        any(
+            "writes CARGO_PROFILE_DEV_OPT_LEVEL" in gap
+            for gap in artifact_env_gaps(mutated, "ci.yml", texts)
+        ),
+        f"{artifact_env_gaps(mutated, 'ci.yml', texts)}",
+    )
+    mutated = copy.deepcopy(workflow)
+    mutated["jobs"][job_id]["steps"].append({"uses": "./.github/actions/planted"})
+    planted_texts = {**texts, "./.github/actions/planted": 'echo "RUSTFLAGS=-Cplanted" >> "$GITHUB_ENV"'}
+    check(
+        f"a local action writing RUSTFLAGS to $GITHUB_ENV on {job_id} is reported",
+        any("writes RUSTFLAGS" in gap for gap in artifact_env_gaps(mutated, "ci.yml", planted_texts)),
+        f"{artifact_env_gaps(mutated, 'ci.yml', planted_texts)}",
+    )
+    mutated = copy.deepcopy(workflow)
+    mutated["jobs"][job_id].setdefault("env", {})["RUSTFLAGS"] = "-D warnings"
+    check(
+        f"a job-level RUSTFLAGS on {job_id}, which the cache step sees, is not reported",
+        not artifact_env_gaps(mutated, "ci.yml", texts),
+        f"{artifact_env_gaps(mutated, 'ci.yml', texts)}",
+    )
+
+    roots = [REPO, REPO / "fuzz"]
+    gaps = unkeyed_cargo_config_gaps(roots)
+    check("no workspace root's ancestry holds a .cargo/config without .toml", not gaps, f"{gaps}")
+    with tempfile.TemporaryDirectory() as scratch:
+        planted_root = Path(scratch)
+        (planted_root / ".cargo").mkdir()
+        (planted_root / ".cargo/config").write_text("[build]\nrustflags = ['-Cplanted']\n")
+        check(
+            "a planted .cargo/config is reported",
+            bool(unkeyed_cargo_config_gaps([planted_root])),
+            "unkeyed_cargo_config_gaps missed .cargo/config",
+        )
+
+
 # The step that fetches every crate a job compiles and takes cargo offline, and the
 # rule check_offline_cargo holds every workflow job to. See the `offline-cargo` entry
 # in this file's docstring.
@@ -4982,7 +5364,7 @@ CARGO_FETCH_ENV_WRITE = re.compile(
 TOOLCHAIN_OR_CACHE_ACTIONS = (
     "./.github/actions/rust-toolchain",
     "dtolnay/rust-toolchain@",
-    "Swatinem/rust-cache@",
+    RUST_CACHE_ACTION,
 )
 # An action that runs cargo inside its own step. CodeQL's Rust extractor runs
 # `cargo metadata` and the build scripts while it loads the workspace.
@@ -7056,7 +7438,7 @@ def cache_write(step: dict) -> str | None:
     def literal(name: str) -> str:
         return str(inputs.get(name, "")).strip().lower()
 
-    if action == "Swatinem/rust-cache":
+    if action == RUST_CACHE_ACTION:
         if literal("save-if") == "false":
             return None
         return f"rust-cache `{inputs.get('shared-key')}`"
@@ -7281,7 +7663,7 @@ def leg_step_identities(job: dict, axis: str, value: object) -> set[str] | None:
                 {name: text for name, text in item.items() if name != "save-if"}
                 if key == "with"
                 and isinstance(item, dict)
-                and str(step.get("uses", "")).startswith("Swatinem/rust-cache@")
+                and str(step.get("uses", "")) == RUST_CACHE_ACTION
                 else item
             )
             for key, item in step.items()
@@ -7566,7 +7948,7 @@ def push_writer_gaps(doc: dict) -> list[str]:
             key_text = f"{inputs.get('shared-key', '')} {inputs.get('key', '')}"
             named_axes = KEY_MATRIX_AXIS.findall(key_text)
             action = str(step.get("uses") or "").split("@", 1)[0]
-            if action == "Swatinem/rust-cache" or KEY_RUNNER.search(key_text):
+            if action == RUST_CACHE_ACTION or KEY_RUNNER.search(key_text):
                 named_axes += KEY_MATRIX_AXIS.findall(str(job.get("runs-on") or ""))
             key_axes = set()
             for name in named_axes:
@@ -8296,7 +8678,7 @@ def check_push_writer_mutants(doc: dict) -> None:
         )
         job["steps"] = [
             {"uses": "actions/cache@v4", "with": {"path": "deps", "key": key}}
-            if str(step.get("uses", "")).startswith("Swatinem/rust-cache")
+            if str(step.get("uses", "")) == RUST_CACHE_ACTION
             else step
             for step in job["steps"]
         ]
@@ -8335,7 +8717,7 @@ def check_push_writer_mutants(doc: dict) -> None:
 
     def test_cache(job: dict) -> dict:
         return step_where(
-            job, lambda step: str(step.get("uses", "")).startswith("Swatinem/rust-cache")
+            job, lambda step: str(step.get("uses", "")) == RUST_CACHE_ACTION
         )
 
     def pyo3_save(job: dict) -> dict:
@@ -11123,6 +11505,14 @@ def run_profile_env(inputs: Inputs) -> None:
     )
 
 
+def run_cache_key(inputs: Inputs) -> None:
+    print(
+        "cache-key — every cargo-cache key holds the root Cargo.toml and every "
+        "artifact-changing variable"
+    )
+    check_cache_key(inputs.documents)
+
+
 def run_offline_cargo(inputs: Inputs) -> None:
     print(
         "offline-cargo — every job that runs cargo fetches once, after its toolchain "
@@ -11850,6 +12240,7 @@ CHECKS: dict[str, Callable[[Inputs], None]] = {
     "downloaded-addon": run_downloaded_addon,
     "retention": run_retention,
     "profile-env": run_profile_env,
+    "cache-key": run_cache_key,
     "offline-cargo": run_offline_cargo,
     "pinned-python": run_pinned_python,
     "artifact-key": run_artifact_key,
@@ -11907,6 +12298,7 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "downloaded-addon",
         "retention",
         "profile-env",
+        "cache-key",
         "offline-cargo",
         "pinned-python",
         "artifact-key",

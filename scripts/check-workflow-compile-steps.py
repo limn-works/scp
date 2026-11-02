@@ -5,7 +5,7 @@ Both checks exist because the same defect landed twice in one week and a reader
 cannot see either defect in a workflow file without holding the whole file in mind:
 a step that looks correct on its own is wrong because of a step forty lines away.
 
-CHECK 1 — every `Swatinem/rust-cache` step names its group and says whether it writes.
+CHECK 1 — every `./.github/actions/rust-cache` step names its group and says whether it writes.
 
   The criterion: a step carries `with.shared-key` (a non-empty string), carries no
   `with.key`, and carries `with.save-if`; across every workflow file, each `shared-key`
@@ -68,7 +68,7 @@ from pathlib import Path
 
 import yaml
 
-RUST_CACHE_ACTION = "Swatinem/rust-cache"
+RUST_CACHE_ACTION = "./.github/actions/rust-cache"
 DEFAULT_BRANCH_REF = "refs/heads/main"
 
 # `cargo run`, an optional `+toolchain`, then flags up to `--bin uniffi-bindgen`, then the
