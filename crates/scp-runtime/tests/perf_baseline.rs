@@ -59,6 +59,14 @@
 //! Typical loop: run the default target to record a `before` baseline, apply the
 //! change under test, then run `SCP_PERF_GATE=1` on the same box to assert.
 //!
+//! The `default-filter` in `.config/nextest.toml` leaves this binary out of every
+//! `cargo nextest run`, so neither a local run of scp-runtime's tests nor CI runs it;
+//! CI compiles it. Run it on demand with
+//! `cargo nextest run -p scp-runtime --features testing --ignore-default-filter
+//! --test perf_baseline` (`--run-ignored all` does not lift a default filter), or
+//! with `cargo test -p scp-runtime --features testing --test perf_baseline`, which
+//! reads no nextest configuration.
+//!
 //! A `NOISE_FLOOR_MICROS` guard suppresses the relative check when BOTH the
 //! baseline and the measurement sit below the floor: at tens-of-microseconds a
 //! 15 % band is pure scheduler noise, so gating it would be a false-positive

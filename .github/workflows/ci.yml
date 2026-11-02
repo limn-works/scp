@@ -429,6 +429,9 @@ jobs:
               # The rust-test job runs scripts/check-test-shard-features.py over
               # its own shard commands, so a change to that script must trigger it.
               - 'scripts/check-test-shard-features.py'
+              # Nextest reads its `default-filter` out of this file, which decides
+              # which tests every `cargo nextest run` in rust-test runs.
+              - '.config/nextest.toml'
               # The `docker-image` job builds from these three and is guarded by this
               # filter, so a change to any of them has to reach it. The Dockerfile copies
               # the fetch step's script in and runs it before compiling offline.
@@ -628,6 +631,7 @@ jobs:
               - 'scaffolds/**'
               - 'templates/**'
               - 'ratchet/**'
+              - '.config/**'
               - 'docs/examples/**'
               # The examples-typecheck job type-checks the code blocks of the live
               # guides under this directory, so an edit to a guide there feeds a gate
