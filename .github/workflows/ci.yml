@@ -88,8 +88,9 @@ env:
 # 13.0 minutes against 6.8 in run 41465335098. A variable that changes artifacts
 # (RUSTFLAGS, RUSTDOCFLAGS, CARGO_INCREMENTAL, CARGO_PROFILE_*, CARGO_BUILD_*) is set
 # in the workflow-level or job-level `env:`, which the cache step sees, never in a
-# step's `env:` or through `$GITHUB_ENV`. Check `cache-key` in
-# scripts/tests/ci-gate/ci_gate_selftest.py holds both rules.
+# step's `env:` or through `$GITHUB_ENV`. No cargo command in a cache job passes
+# `--config` or `-Z`, which no key hashes. Check `cache-key` in
+# scripts/tests/ci-gate/ci_gate_selftest.py holds all three rules.
 #
 # THE GROUPS. Cargo hashes the compile mode into every artifact's metadata
 # suffix beside the profile and the feature set, so `cargo clippy` and `cargo doc`,

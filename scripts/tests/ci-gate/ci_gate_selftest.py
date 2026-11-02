@@ -242,13 +242,16 @@ nothing:
                artifact-changing variable (RUSTFLAGS, RUSTDOCFLAGS,
                CARGO_INCREMENTAL, CARGO_PROFILE_*, CARGO_BUILD_* and the rest of
                ARTIFACT_ENV) in a cache job to sit in the job's or workflow's
-               `env:`, never in a step's `env:` or a `$GITHUB_ENV` write, and
-               rejects a `.cargo/config` without `.toml`, which cargo reads and
-               rust-cache does not hash. Controls: a direct Swatinem step, the
-               wrapper without its prefix-key, digest step or workspaces, a digest
-               that skips `[profile.*]`, a root without Cargo.toml, a step-level
-               RUSTFLAGS, `$GITHUB_ENV` writes from a run and from a local action,
-               and a planted `.cargo/config`; a job-level RUSTFLAGS must pass.
+               `env:`, never in a step's `env:` or a `$GITHUB_ENV` write, rejects
+               a cargo `--config` or `-Z` argument in a cache job, which no key
+               hashes, and rejects a `.cargo/config` without `.toml`, which cargo
+               reads and rust-cache does not hash. Controls: a direct Swatinem
+               step, the wrapper without its prefix-key, digest step or
+               workspaces, a digest that skips `[profile.*]`, a root without
+               Cargo.toml, a step-level RUSTFLAGS, `$GITHUB_ENV` writes from a run
+               and from a local action, two `--config` forms, a `-Z` flag and a
+               planted `.cargo/config`; a job-level RUSTFLAGS and a `--config` on
+               a line that runs no cargo must pass.
   offline-cargo
                Every job in `.github/workflows/` that runs cargo, maturin or
                wasm-pack runs `./.github/actions/cargo-fetch` exactly once,
@@ -5012,6 +5015,10 @@ ARTIFACT_ENV = re.compile(
 ARTIFACT_ENV_WRITE = re.compile(
     r"(?<![\w$])(RUSTFLAGS|RUSTDOCFLAGS|CARGO_\w+|RUSTC\w*)=[^\n]*>>\s*\"?\$\{?GITHUB_ENV"
 )
+# A cargo command-line argument that changes what cargo compiles: `--config` overrides
+# any config key (a `[profile.dev.package."*"]` value no variable can reach), and `-Z`
+# turns on an unstable behavior. rust-cache hashes neither.
+ARTIFACT_ARG = re.compile(r"(?<![\w-])(--config(?=[\s=])|-Z\s*[\w-]+)")
 
 
 def direct_rust_cache_gaps(documents: list[tuple[Path, dict]]) -> list[str]:
@@ -5143,7 +5150,9 @@ def artifact_env_gaps(doc: dict, name: str, action_texts: dict[str, str]) -> lis
 
     CRITERION: in a job with a RUST_CACHE_ACTION step, no step's `env:` sets a key
     ARTIFACT_ENV matches, and no step's `run:`, nor any local action in
-    `action_texts` that a step uses, writes such a variable to `$GITHUB_ENV`. The
+    `action_texts` that a step uses, writes such a variable to `$GITHUB_ENV` or passes
+    an ARTIFACT_ARG on a line that runs cargo (a config override belongs in a
+    `CARGO_*` variable at the job or workflow level, which the key hashes). The
     workflow-level and job-level `env:` reach the cache step, so those stay allowed
     (check profile-env further confines CARGO_PROFILE_* to the workflow level).
     """
@@ -5168,6 +5177,13 @@ def artifact_env_gaps(doc: dict, name: str, action_texts: dict[str, str]) -> lis
                             f"{name} job {job_id}, {label}: writes {match.group(1)} "
                             "to $GITHUB_ENV"
                         )
+                for line in text.splitlines():
+                    if CARGO_COMMAND.search(line):
+                        for match in ARTIFACT_ARG.finditer(line):
+                            gaps.append(
+                                f"{name} job {job_id}, {label}: passes cargo "
+                                f"{match.group(1)}"
+                            )
     return gaps
 
 
@@ -5327,6 +5343,27 @@ def check_cache_key(documents: list[tuple[Path, dict]]) -> None:
         f"a local action writing RUSTFLAGS to $GITHUB_ENV on {job_id} is reported",
         any("writes RUSTFLAGS" in gap for gap in artifact_env_gaps(mutated, "ci.yml", planted_texts)),
         f"{artifact_env_gaps(mutated, 'ci.yml', planted_texts)}",
+    )
+    for planted_run, expected in (
+        ("cargo test --config 'profile.dev.package.\"*\".opt-level=0'", "passes cargo --config"),
+        ("cargo build --config=build.rustflags=['-Cplanted']", "passes cargo --config"),
+        ("cargo +nightly build -Zbuild-std", "passes cargo -Zbuild-std"),
+    ):
+        mutated = copy.deepcopy(workflow)
+        mutated["jobs"][job_id]["steps"].append({"name": "planted", "run": planted_run})
+        check(
+            f"`{planted_run}` on {job_id} is reported",
+            any(expected in gap for gap in artifact_env_gaps(mutated, "ci.yml", texts)),
+            f"{artifact_env_gaps(mutated, 'ci.yml', texts)}",
+        )
+    mutated = copy.deepcopy(workflow)
+    mutated["jobs"][job_id]["steps"].append(
+        {"name": "planted", "run": "bun run lint --config x\nls -Z"}
+    )
+    check(
+        f"--config and -Z on lines that run no cargo on {job_id} are not reported",
+        not artifact_env_gaps(mutated, "ci.yml", texts),
+        f"{artifact_env_gaps(mutated, 'ci.yml', texts)}",
     )
     mutated = copy.deepcopy(workflow)
     mutated["jobs"][job_id].setdefault("env", {})["RUSTFLAGS"] = "-D warnings"
