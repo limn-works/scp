@@ -127,8 +127,12 @@ pub const MAX_NONCE_CACHE_ENTRIES: usize = 10_000;
 
 /// Why a group state reset was triggered.
 ///
-/// Recorded in the event log's `MemberReset` event for auditability.
-/// See ADR-029 section 4.
+/// Carried in the member's signed [`ResetRequest`]. The event log records a
+/// reset in a `MemberReset` leaf whose payload is
+/// `scp_event_log::payload::MemberResetPayload`, which holds a requested
+/// reset's reason as text in its `reason` field
+/// (`07-trust-validation-and-capabilities.md` §7.3.1.1 step 1.6). See ADR-029
+/// section 4.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResetReason {
     /// Offline duration exceeded the 7-day threshold.
@@ -844,33 +848,6 @@ pub fn assess_bilateral_recovery(params: &BilateralRecoveryParams<'_>) -> Bilate
         online_member_queued_messages: params.online_member_queued_messages,
         assessment,
     }
-}
-
-// ---------------------------------------------------------------------------
-// MemberResetEvent
-// ---------------------------------------------------------------------------
-
-/// Event log entry for a member group state reset.
-///
-/// Distinct from `MemberLeft` + `MemberJoined` — this records that the member
-/// underwent a forced re-join, preserving the causal link between the old and
-/// new MLS leaf nodes.
-///
-/// See ADR-029 section 4, step 5.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MemberResetEvent {
-    /// The DID of the member who was reset.
-    pub member_did: DID,
-    /// The MLS epoch before reset (the member's stale epoch).
-    pub old_epoch: u64,
-    /// The MLS epoch after reset (the current group epoch post-Welcome).
-    pub new_epoch: u64,
-    /// Why the reset occurred.
-    pub reason: ResetReason,
-    /// The DID of the admin who processed the reset.
-    pub processed_by: DID,
-    /// Unix timestamp when the reset was processed.
-    pub timestamp: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -1823,27 +1800,6 @@ mod tests {
         let json = serde_json::to_string(&request).unwrap();
         let deserialized: ResetRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(request, deserialized);
-    }
-
-    // -----------------------------------------------------------------------
-    // MemberResetEvent tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn member_reset_event_serializable() {
-        let event = MemberResetEvent {
-            member_did: DID::from("did:dht:z6MkBob"),
-            old_epoch: 50,
-            new_epoch: 200,
-            reason: ResetReason::CatchUpFailed {
-                attempted_sources: vec!["relay".to_owned()],
-            },
-            processed_by: DID::from("did:dht:z6MkAlice"),
-            timestamp: BASE_TIMESTAMP,
-        };
-        let json = serde_json::to_string(&event).unwrap();
-        let deserialized: MemberResetEvent = serde_json::from_str(&json).unwrap();
-        assert_eq!(event, deserialized);
     }
 
     // -----------------------------------------------------------------------

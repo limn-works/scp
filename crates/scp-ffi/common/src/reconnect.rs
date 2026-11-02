@@ -1545,6 +1545,7 @@ pub const fn delivery_reached_verdict(error: &ContextError) -> bool {
         | ContextError::NothingToRestore(_)
         | ContextError::IntegrationFailed(_)
         | ContextError::GovernanceFailed(_)
+        | ContextError::ProposalIdMismatch { .. }
         | ContextError::CreationFailed(_)
         | ContextError::VersionIncompatible { .. }
         | ContextError::SnapshotFloorRegression { .. }

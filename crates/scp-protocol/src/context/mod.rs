@@ -485,6 +485,21 @@ pub enum ContextError {
     #[error("governance failed: {0}")]
     GovernanceFailed(String),
 
+    /// An approved proposal's action does not hash to its own identifier: the
+    /// `"SCP-PROPOSAL-V1:"` identifier recomputed from the context, the
+    /// proposer, the action's RFC 8785 bytes, and `created_at` differs from
+    /// the stored one. The action is not the one the proposer and the voters
+    /// signed, so it is neither executed nor recorded in a leaf, and the
+    /// proposal leaves the approved set
+    /// ([`GovernanceError::ProposalIdMismatch`](governance::GovernanceError::ProposalIdMismatch)).
+    #[error("proposal {id} does not hash to its identifier (recomputed {recomputed})")]
+    ProposalIdMismatch {
+        /// The stored proposal identifier, hex-encoded.
+        id: String,
+        /// The identifier recomputed from the action, hex-encoded.
+        recomputed: String,
+    },
+
     /// Context creation failed due to invalid parameters or internal error.
     #[error("creation failed: {0}")]
     CreationFailed(String),

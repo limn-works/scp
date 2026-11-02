@@ -28,9 +28,7 @@
 
 use std::sync::Arc;
 
-use scp_event_log::payload::{
-    GovernanceActionExecutedPayload, MembershipChangePayload, RoleAssignedPayload, encode_payload,
-};
+use scp_event_log::payload::{MembershipChangePayload, RoleAssignedPayload, encode_payload};
 use scp_event_log::{EventPayload, EventType};
 use scp_protocol::trust::attestation::{Attestation, RevocationStatus};
 use scp_protocol::trust::{AttestationType, ParticipationFacts};
@@ -75,11 +73,18 @@ fn role_payload(subject_did: &str) -> EventPayload {
     .expect("role payload encodes")
 }
 
+/// The `GovernanceActionExecuted` leaf payload of a real proposal to remove
+/// `target_did`.
 fn gov_payload(target_did: &str) -> EventPayload {
-    encode_payload(&GovernanceActionExecutedPayload {
-        target_did: target_did.to_owned(),
-        action_type: "RemoveMember".to_owned(),
-    })
+    encode_payload(
+        &scp_protocol::context::governance::executed_payload_fixture(
+            scp_protocol::context::governance::GovernanceAction::RemoveMember {
+                did: scp_did::DID::from(target_did),
+                reason: None,
+            },
+        )
+        .expect("a real proposal's payload"),
+    )
     .expect("governance payload encodes")
 }
 

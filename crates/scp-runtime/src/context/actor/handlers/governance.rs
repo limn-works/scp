@@ -228,6 +228,10 @@ fn outcome_error_sketch(err: &ContextError) -> ContextError {
         ContextError::MembershipFailed(msg) => ContextError::MembershipFailed(msg.clone()),
         ContextError::EventLogFailed(msg) => ContextError::EventLogFailed(msg.clone()),
         ContextError::GovernanceFailed(msg) => ContextError::GovernanceFailed(msg.clone()),
+        ContextError::ProposalIdMismatch { id, recomputed } => ContextError::ProposalIdMismatch {
+            id: id.clone(),
+            recomputed: recomputed.clone(),
+        },
         ContextError::InvalidState(msg) => ContextError::InvalidState(msg.clone()),
         ContextError::SupervisorShutDown(msg) => ContextError::SupervisorShutDown(msg.clone()),
         other => ContextError::CryptoFailed(format!("{other}")),

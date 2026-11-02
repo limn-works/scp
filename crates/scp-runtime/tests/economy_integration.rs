@@ -707,7 +707,17 @@ async fn invariant_4_receipt_local_buffer_and_convergent_log_merkle_proof() {
     let event1 = signed_event(
         EventType::GovernanceActionExecuted,
         1,
-        b"{\"action\":\"ChangeRole\"}".to_vec(),
+        scp_event_log::payload::encode_payload(
+            &scp_protocol::context::governance::executed_payload_fixture(
+                scp_protocol::context::governance::GovernanceAction::ChangeRole {
+                    did: scp_did::DID::from("did:dht:z6MkJoiner"),
+                    new_role: "moderator".to_owned(),
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap()
+        .data,
         leaf0_hash,
         &signing_key,
         &did,
