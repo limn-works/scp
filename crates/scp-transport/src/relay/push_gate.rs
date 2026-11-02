@@ -990,12 +990,13 @@ async fn check_webpush_addresses(
 /// `PushRole::Enabled`. Call it inside a tokio runtime.
 #[cfg(all(test, feature = "push-store"))]
 #[allow(clippy::unwrap_used)]
-pub(crate) fn kel_service_for_tests(dir: &std::path::Path) -> PushService {
+pub(crate) async fn kel_service_for_tests(dir: &std::path::Path) -> PushService {
     PushService::start(PushServiceConfig {
         store: PushRegistrationStore::open_sqlite(
             &dir.join("push.db"),
             crate::relay::push_store::PushStoreAtRest::Unkeyed,
         )
+        .await
         .unwrap(),
         verifier: Arc::new(scp_identity::push_verify::KelPushVerifier),
         senders: Arc::from(Vec::new()),
@@ -1102,6 +1103,7 @@ mod tests {
             &dir.path().join("push.sqlite"),
             crate::relay::push_store::PushStoreAtRest::Unkeyed,
         )
+        .await
         .unwrap();
         let refused = PushRole::start(PushProviders {
             store: store.clone(),
@@ -1157,6 +1159,7 @@ mod tests {
                     &dir.path().join("push.sqlite"),
                     crate::relay::push_store::PushStoreAtRest::Unkeyed,
                 )
+                .await
                 .unwrap(),
                 senders: PushSenders {
                     apns: None,
@@ -1183,12 +1186,17 @@ mod tests {
         use crate::relay::push_store::PushRegistrationStore;
 
         let dir = tempfile::tempdir().unwrap();
-        let result = PushRole::start(PushProviders {
-            store: PushRegistrationStore::open_sqlite(
+        let store = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(PushRegistrationStore::open_sqlite(
                 &dir.path().join("push.sqlite"),
                 crate::relay::push_store::PushStoreAtRest::Unkeyed,
-            )
-            .unwrap(),
+            ))
+            .unwrap();
+        let result = PushRole::start(PushProviders {
+            store,
             senders: PushSenders {
                 apns: Some(apns_sender()),
                 fcm: None,
@@ -1369,7 +1377,7 @@ mod tests {
     #[tokio::test]
     async fn enabled_rejects_a_retired_routing_id_with_4060() {
         let dir = tempfile::tempdir().unwrap();
-        let service = kel_service_for_tests(dir.path());
+        let service = kel_service_for_tests(dir.path()).await;
         let old = RelayUrl::new("wss://old.relay.example").unwrap();
         let live = LiveRelayUrl::new(old.clone());
         live.set(RelayUrl::new("wss://new.relay.example").unwrap());
@@ -1388,7 +1396,7 @@ mod tests {
     /// `dir`, and a `TestPushVerifier` holding `key`'s public key for
     /// `registrant`.
     #[cfg(feature = "push-store")]
-    fn test_service(
+    async fn test_service(
         dir: &std::path::Path,
         registrant: &str,
         key: &scp_crypto::p256::P256SecretKey,
@@ -1407,6 +1415,7 @@ mod tests {
                 &dir.join("push.db"),
                 crate::relay::push_store::PushStoreAtRest::Unkeyed,
             )
+            .await
             .unwrap(),
             verifier: Arc::new(scp_identity::push_verify::TestPushVerifier::new([(
                 scp_did::DID::from(registrant),
@@ -1478,7 +1487,7 @@ mod tests {
     #[cfg(feature = "push-store")]
     async fn present(held: &RelayUrl, blob: &[u8]) -> (PushPublishGate, Option<u64>) {
         let dir = tempfile::tempdir().unwrap();
-        let config = test_service(dir.path(), GATE_REGISTRANT, &gate_key());
+        let config = test_service(dir.path(), GATE_REGISTRANT, &gate_key()).await;
         let store = config.store.clone();
         let service = PushService::start(config).unwrap();
         let live = LiveRelayUrl::new(held.clone());
@@ -1645,7 +1654,7 @@ mod tests {
         };
         for deregister in [false, true] {
             let dir = tempfile::tempdir().unwrap();
-            let config = test_service(dir.path(), GATE_REGISTRANT, &gate_key());
+            let config = test_service(dir.path(), GATE_REGISTRANT, &gate_key()).await;
             let store = config.store.clone();
             let push = PushRole::Enabled(PushService::start(config).unwrap());
             let live = LiveRelayUrl::new(direct.clone());
@@ -1719,7 +1728,7 @@ mod tests {
         };
         for deregister in [false, true] {
             let dir = tempfile::tempdir().unwrap();
-            let config = test_service(dir.path(), GATE_REGISTRANT, &gate_key());
+            let config = test_service(dir.path(), GATE_REGISTRANT, &gate_key()).await;
             let store = config.store.clone();
             let service = PushService::start(config).unwrap();
             let live = LiveRelayUrl::new(RelayUrl::new("ws://198.51.100.7:32891/scp/v1").unwrap());
@@ -1812,7 +1821,8 @@ mod tests {
                 store: PushRegistrationStore::open_sqlite(
                     &dir.join("push.db"),
                     crate::relay::push_store::PushStoreAtRest::Unkeyed,
-                )?,
+                )
+                .await?,
                 verifier: Arc::new(scp_identity::push_verify::TestPushVerifier::new([(
                     scp_did::DID::from(GATE_REGISTRANT),
                     gate_key().public_key(),
@@ -1970,7 +1980,8 @@ mod tests {
                 store: PushRegistrationStore::open_sqlite(
                     &dir.path().join("push.db"),
                     crate::relay::push_store::PushStoreAtRest::Unkeyed,
-                )?,
+                )
+                .await?,
                 senders: PushSenders {
                     apns: Some(super::apns_sender()),
                     fcm: None,

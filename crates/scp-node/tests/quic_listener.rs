@@ -121,7 +121,7 @@ async fn quic_publish_then_query_roundtrips() {
 
 /// An enabled push slot over an unkeyed SQLite store in `dir` with one APNs
 /// sender. Building the sender makes no request.
-fn enabled_push(dir: &std::path::Path) -> scp_node::PushSlot {
+async fn enabled_push(dir: &std::path::Path) -> scp_node::PushSlot {
     use scp_transport::relay::push::{ApnsConfig, ApnsEnvironment, ApnsSender};
     use scp_transport::relay::push_gate::PushSenders;
     use scp_transport::relay::push_store::{PushRegistrationStore, PushStoreAtRest};
@@ -139,6 +139,7 @@ fn enabled_push(dir: &std::path::Path) -> scp_node::PushSlot {
             &dir.join("push.sqlite"),
             PushStoreAtRest::Unkeyed,
         )
+        .await
         .unwrap(),
         senders: PushSenders {
             apns: Some(apns),
@@ -184,7 +185,8 @@ async fn quic_push_reply(
 async fn quic_listener_serves_the_push_gate_of_an_enabled_node() {
     install_crypto_provider();
     let dir = tempfile::tempdir().unwrap();
-    let enabled = quic_push_reply(build_tls_node_with_push(enabled_push(dir.path())).await).await;
+    let enabled =
+        quic_push_reply(build_tls_node_with_push(enabled_push(dir.path()).await).await).await;
     assert_ne!(
         enabled,
         scp_relay_client::code::PUSH_NOT_SUPPORTED,

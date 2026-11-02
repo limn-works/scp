@@ -149,13 +149,15 @@ async fn host_site_serves_a_deployed_site_over_http_and_shuts_down() {
 
     // -- The shutdown drained the deployer's Supervisor and closed its MLS
     //    store, so the directory reopens on the first attempt (spec §17.6). --
-    assert_mls_store_reopens(&storage_dir);
+    assert_mls_store_reopens(&storage_dir).await;
 }
 
 /// Opens `{storage_dir}/mls` once and fails the test unless that first
 /// attempt succeeds: the advisory lock must already be released.
-fn assert_mls_store_reopens(storage_dir: &std::path::Path) {
-    let key = scp_node::self_host::resolve_storage_key(storage_dir).expect("storage key");
+async fn assert_mls_store_reopens(storage_dir: &std::path::Path) {
+    let key = scp_node::self_host::resolve_storage_key(storage_dir)
+        .await
+        .expect("storage key");
     scp_platform::sqlite::SqliteStorage::new(&storage_dir.join("mls"), key.as_ref())
         .expect("the MLS store must reopen on the first attempt after host_site_until returns");
 }
@@ -194,7 +196,7 @@ async fn host_site_failure_after_deploy_releases_the_mls_store() {
         "an asset path the content-path rules reject must fail the deploy step, got {result:?}"
     );
 
-    assert_mls_store_reopens(&storage_dir);
+    assert_mls_store_reopens(&storage_dir).await;
 }
 
 /// A public port already in use fails `host_site_until` with a serve error at

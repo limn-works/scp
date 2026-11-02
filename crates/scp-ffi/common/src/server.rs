@@ -378,26 +378,24 @@ pub async fn start_relay_in_memory() -> Result<RunningRelay, ServerError> {
 /// [`ServerError::Relay`] if the relay cannot bind.
 pub async fn start_relay_local(data_dir: &Path) -> Result<RunningRelay, ServerError> {
     validate_data_dir(data_dir)?;
-    let storage = on_blocking_pool({
+    on_blocking_pool({
         let data_dir = data_dir.to_path_buf();
-        move || {
-            create_private_dir(&data_dir)?;
-            Ok(BlobStorageBackend::redb(&data_dir.join("blobs.redb"))?)
-        }
+        move || create_private_dir(&data_dir)
     })
     .await?;
+    let storage = BlobStorageBackend::redb(&data_dir.join("blobs.redb")).await?;
     start_relay_with(storage).await
 }
 
 /// Runs `work` on tokio's blocking pool and waits for it without holding a
 /// worker thread.
 ///
-/// Every node and relay front door here creates directories, opens a blob
-/// database, or derives a key-file key before it starts. Each of those is
-/// synchronous file I/O or a memory-hard KDF, and an `async fn` that runs one
+/// Every node and relay front door here creates directories before it
+/// starts. That is synchronous file I/O, and an `async fn` that runs it
 /// inline stalls every other task scheduled on its worker thread for as long
-/// as the call takes. A task that panicked or was cancelled surfaces as
-/// [`ServerError::Io`].
+/// as the call takes. The blob database opens and the key-file open are
+/// `async` and run on the blocking pool themselves. A task that panicked or
+/// was cancelled surfaces as [`ServerError::Io`].
 async fn on_blocking_pool<T, F>(work: F) -> Result<T, ServerError>
 where
     T: Send + 'static,
@@ -734,19 +732,21 @@ where
     };
 
     validate_data_dir(data_dir)?;
-    // Creating the data directory and opening `blobs.redb` are synchronous
-    // file I/O, and redb's create fsyncs its file several times; run inline,
-    // they held this future's worker thread for 160 to 930 ms on macOS.
-    let blob_storage = on_blocking_pool({
+    // Creating the data directory and reading its metadata are synchronous
+    // file I/O, so they run on the blocking pool; the redb open, whose create
+    // fsyncs its file several times, runs there inside
+    // `BlobStorageBackend::redb`.
+    on_blocking_pool({
         let data_dir = data_dir.to_path_buf();
         move || {
             create_private_dir(&data_dir)?;
             warn_on_stale_plaintext_store(&data_dir);
             warn_on_permissive_data_dir(&data_dir);
-            Ok(BlobStorageBackend::redb(&data_dir.join("blobs.redb"))?)
+            Ok(())
         }
     })
     .await?;
+    let blob_storage = BlobStorageBackend::redb(&data_dir.join("blobs.redb")).await?;
 
     // Build the node via the ADR-052 flat-config front door (Phase B-P2). The
     // two identity arms differ only in their `IdentitySource`; the dropped
@@ -788,19 +788,11 @@ where
         // passphrase was validated at entry, before any file was created.
         let passphrase = passphrase.ok_or(ServerError::MissingPassphrase)?;
         let key_path = data_dir.join("identity.key");
-        // `FileKeyCustody::new` runs an Argon2id derivation (64 MiB, three
-        // passes) and can wait up to 10 s on a file another process is
-        // creating (spec §17.8), so it runs on the blocking pool rather than
-        // on this future's worker thread.
-        let key_custody = Arc::new(
-            on_blocking_pool(move || {
-                Ok(scp_platform::file::FileKeyCustody::new(
-                    &key_path,
-                    &passphrase,
-                )?)
-            })
-            .await?,
-        );
+        // The open runs an Argon2id derivation (64 MiB, three passes) and can
+        // wait up to 10 s on a file another process is creating (spec §17.8);
+        // `FileKeyCustody::open` runs it on the blocking pool.
+        let key_custody =
+            Arc::new(scp_platform::file::FileKeyCustody::open(&key_path, &passphrase).await?);
 
         // Build the node's DHT client for its DID method: the in-memory
         // §17.17.3 double, because this body compiles only under `testing`, so
@@ -1045,25 +1037,29 @@ fn validate_node_start(
     })
 }
 
-/// Creates a blob database's parent directory (mode `0o700` on Unix).
-fn create_blob_parent(path: &Path) -> Result<(), ServerError> {
+/// Creates a blob database's parent directory (mode `0o700` on Unix) on
+/// tokio's blocking pool.
+async fn create_blob_parent(path: &Path) -> Result<(), ServerError> {
     let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) else {
         return Ok(());
     };
-    create_private_dir(parent)
+    let parent = parent.to_path_buf();
+    on_blocking_pool(move || create_private_dir(&parent)).await
 }
 
 /// Opens the selected blob backend, creating its parent directory first.
-fn open_blob_backend(backend: &FfiBlobBackend) -> Result<BlobStorageBackend, ServerError> {
+/// The directory creation and the database open both run on tokio's
+/// blocking pool.
+async fn open_blob_backend(backend: &FfiBlobBackend) -> Result<BlobStorageBackend, ServerError> {
     Ok(match backend {
         FfiBlobBackend::InMemory {} => BlobStorageBackend::in_memory(),
         FfiBlobBackend::Redb { path } => {
-            create_blob_parent(path)?;
-            BlobStorageBackend::redb(path)?
+            create_blob_parent(path).await?;
+            BlobStorageBackend::redb(path).await?
         }
         FfiBlobBackend::Sqlite { path } => {
-            create_blob_parent(path)?;
-            BlobStorageBackend::sqlite(path)?
+            create_blob_parent(path).await?;
+            BlobStorageBackend::sqlite(path).await?
         }
     })
 }
@@ -1132,8 +1128,7 @@ pub async fn node_start(
     let validated = validate_node_start(cfg, &identity.identity.did)?;
     // Creating the blob directory and opening a redb or SQLite database are
     // synchronous file I/O with fsyncs, so they run off this worker thread.
-    let backend = validated.blob_storage.clone();
-    let blob_storage = on_blocking_pool(move || open_blob_backend(&backend)).await?;
+    let blob_storage = open_blob_backend(&validated.blob_storage).await?;
     let node = match storage {
         InstanceStorage::InMemoryEncrypted(storage) => {
             tracing::warn!(

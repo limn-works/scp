@@ -2323,7 +2323,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (handle, addr, storage) = start_test_listener_with_relay_config(RelayConfig {
             push: crate::relay::push_gate::PushRole::Enabled(
-                crate::relay::push_gate::kel_service_for_tests(dir.path()),
+                crate::relay::push_gate::kel_service_for_tests(dir.path()).await,
             ),
             ..RelayConfig::defaults(fixture.live.clone())
         })

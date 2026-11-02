@@ -171,6 +171,7 @@ async fn build_self_host_node() -> BuiltNode {
     // share this `Arc`, so publish -> commit_deploy closes the loop on disk.
     let blob_storage =
         scp_transport::native::storage::BlobStorageBackend::sqlite(&storage_dir.join("blobs"))
+            .await
             .expect("sqlite blob storage should open");
     // Retain a clone (the backend is `Arc`-backed and `Clone`) so the test can
     // read the relay's stored view directly (SHB-007 content-isolation proof).
@@ -889,7 +890,7 @@ async fn self_host_shares_single_root_storage_handle_and_serves() {
     //    the SAME root directory MUST be rejected by the advisory lock. This is
     //    precisely what the binary used to do at its second `open_sqlite_or_exit`
     //    call, and is the bug this fix removes. --
-    let second_open = scp_node::self_host::open_sqlite(&storage_dir, &storage_key);
+    let second_open = scp_node::self_host::open_sqlite(&storage_dir, &storage_key).await;
     let err = second_open
         .err()
         .expect("opening the root DB twice (while the first handle lives) must fail");
@@ -931,6 +932,7 @@ async fn self_host_shares_single_root_storage_handle_and_serves() {
 
     let blob_storage =
         scp_transport::native::storage::BlobStorageBackend::sqlite(&storage_dir.join("blobs"))
+            .await
             .expect("sqlite blob storage should open");
 
     // -- Step 2: build the node over the SHARED root handle (`Arc::clone`), exactly
@@ -1102,6 +1104,7 @@ async fn build_self_host_node_over_dir(dir: &std::path::Path) -> ApplicationNode
 
     let blob_storage =
         scp_transport::native::storage::BlobStorageBackend::sqlite(&dir.join("blobs"))
+            .await
             .expect("sqlite blob storage should open");
 
     // The production `--self-host` identity wiring: `IdentitySource::Persisted`
@@ -1279,6 +1282,7 @@ async fn skip_nat_probe_uses_loopback_relay_url_without_probing() {
 
     let blob_storage =
         scp_transport::native::storage::BlobStorageBackend::sqlite(&dir.join("blobs"))
+            .await
             .expect("sqlite blob storage should open");
 
     // A fixed HTTP bind port so we can assert the exact loopback relay URL.

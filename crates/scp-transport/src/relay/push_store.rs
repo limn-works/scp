@@ -367,8 +367,32 @@ impl PushRegistrationStore {
     ///
     /// The caller sees the failure; nothing falls back to another arm
     /// (SCP-CAPSEL-8001).
-    pub fn open_sqlite(path: &Path, at_rest: PushStoreAtRest<'_>) -> Result<Self, PushStoreError> {
-        Ok(Self::Sqlite(SqlitePushStore::open(path, at_rest)?))
+    ///
+    /// The open runs on tokio's blocking pool: it reads and writes the file,
+    /// and a keyed open derives the page key with 256,000 PBKDF2 iterations,
+    /// so run inline it would stall the calling tokio worker thread and every
+    /// task scheduled on it. A blocking-pool task that panics, or a runtime
+    /// that shuts down under it, is [`PushStoreError::Storage`].
+    pub async fn open_sqlite(
+        path: &Path,
+        at_rest: PushStoreAtRest<'_>,
+    ) -> Result<Self, PushStoreError> {
+        let path = path.to_owned();
+        let key = match at_rest {
+            PushStoreAtRest::Unkeyed => None,
+            PushStoreAtRest::Keyed(key) => Some(Zeroizing::new(*key)),
+        };
+        let store = tokio::task::spawn_blocking(move || {
+            let at_rest = key
+                .as_ref()
+                .map_or(PushStoreAtRest::Unkeyed, |key| PushStoreAtRest::Keyed(key));
+            SqlitePushStore::open(&path, at_rest)
+        })
+        .await
+        .map_err(|e| {
+            PushStoreError::Storage(format!("the task opening the push store failed: {e}"))
+        })??;
+        Ok(Self::Sqlite(store))
     }
 
     /// Creates the in-memory arm. Compiled only under the `testing` feature.
@@ -1745,8 +1769,9 @@ mod tests {
     /// A build without `testing` holds exactly one arm: this exhaustive match
     /// names only `Sqlite`, so it stops compiling if `InMemory` is present.
     #[cfg(not(feature = "testing"))]
-    #[test]
-    fn store_without_testing_has_only_the_sqlite_arm() -> Result<(), Box<dyn std::error::Error>> {
+    #[tokio::test]
+    async fn store_without_testing_has_only_the_sqlite_arm()
+    -> Result<(), Box<dyn std::error::Error>> {
         fn arm_name(store: &PushRegistrationStore) -> &'static str {
             match store {
                 PushRegistrationStore::Sqlite(_) => "sqlite",
@@ -1756,7 +1781,8 @@ mod tests {
         let store = PushRegistrationStore::open_sqlite(
             &dir.path().join("push.db"),
             PushStoreAtRest::Unkeyed,
-        )?;
+        )
+        .await?;
         assert_eq!(arm_name(&store), "sqlite");
         Ok(())
     }
@@ -1815,7 +1841,7 @@ mod tests {
 
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("push.db");
-        let store = PushRegistrationStore::open_sqlite(&path, PushStoreAtRest::Unkeyed)?;
+        let store = PushRegistrationStore::open_sqlite(&path, PushStoreAtRest::Unkeyed).await?;
         store.upsert(record_with(b"device-token")).await?;
         let files = store_files(&path);
         assert!(files.len() >= 2, "a WAL write leaves a sidecar: {files:?}");
@@ -1830,8 +1856,9 @@ mod tests {
     /// others is refused with `FileExposed`, and a path that is not a regular
     /// file with `NotAFile`. Nothing is opened in either case.
     #[cfg(unix)]
-    #[test]
-    fn exposed_or_irregular_store_files_are_refused() -> Result<(), Box<dyn std::error::Error>> {
+    #[tokio::test]
+    async fn exposed_or_irregular_store_files_are_refused() -> Result<(), Box<dyn std::error::Error>>
+    {
         use std::os::unix::fs::PermissionsExt as _;
 
         let dir = tempfile::tempdir()?;
@@ -1839,7 +1866,9 @@ mod tests {
         std::fs::write(&path, b"")?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
         assert_eq!(
-            PushRegistrationStore::open_sqlite(&path, PushStoreAtRest::Unkeyed).err(),
+            PushRegistrationStore::open_sqlite(&path, PushStoreAtRest::Unkeyed)
+                .await
+                .err(),
             Some(PushStoreError::FileExposed {
                 path: path.clone(),
                 mode: 0o644
@@ -1851,7 +1880,9 @@ mod tests {
         std::fs::write(&wal, b"")?;
         std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o640))?;
         assert_eq!(
-            PushRegistrationStore::open_sqlite(&path, PushStoreAtRest::Unkeyed).err(),
+            PushRegistrationStore::open_sqlite(&path, PushStoreAtRest::Unkeyed)
+                .await
+                .err(),
             Some(PushStoreError::FileExposed {
                 path: wal,
                 mode: 0o640
@@ -1861,7 +1892,9 @@ mod tests {
         let link = dir.path().join("link.db");
         std::os::unix::fs::symlink(&path, &link)?;
         assert_eq!(
-            PushRegistrationStore::open_sqlite(&link, PushStoreAtRest::Unkeyed).err(),
+            PushRegistrationStore::open_sqlite(&link, PushStoreAtRest::Unkeyed)
+                .await
+                .err(),
             Some(PushStoreError::NotAFile { path: link })
         );
         Ok(())
@@ -1877,10 +1910,12 @@ mod tests {
         let dir = tempfile::tempdir()?;
 
         let keyed = dir.path().join("keyed.db");
-        let store = PushRegistrationStore::open_sqlite(&keyed, PushStoreAtRest::Keyed(&key))?;
+        let store =
+            PushRegistrationStore::open_sqlite(&keyed, PushStoreAtRest::Keyed(&key)).await?;
         store.upsert(record_with(TOKEN)).await?;
         drop(store);
-        let reopened = PushRegistrationStore::open_sqlite(&keyed, PushStoreAtRest::Keyed(&key))?;
+        let reopened =
+            PushRegistrationStore::open_sqlite(&keyed, PushStoreAtRest::Keyed(&key)).await?;
         assert_eq!(
             reopened.get(&record_with(TOKEN).key()).await?,
             Some(record_with(TOKEN))
@@ -1892,7 +1927,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    PushRegistrationStore::open_sqlite(&keyed, other),
+                    PushRegistrationStore::open_sqlite(&keyed, other).await,
                     Err(PushStoreError::Storage(_))
                 ),
                 "{other:?} opened the keyed store"
@@ -1910,7 +1945,7 @@ mod tests {
         // The control: the same write to an unkeyed store leaves the token
         // readable in its files, so the search above can find it.
         let plain = dir.path().join("plain.db");
-        let store = PushRegistrationStore::open_sqlite(&plain, PushStoreAtRest::Unkeyed)?;
+        let store = PushRegistrationStore::open_sqlite(&plain, PushStoreAtRest::Unkeyed).await?;
         store.upsert(record_with(TOKEN)).await?;
         drop(store);
         let mut found = false;
@@ -1936,5 +1971,35 @@ mod tests {
         assert!(!shown.contains("secret-token-bytes"), "{shown}");
         assert!(!shown.contains(&format!("{:?}", record.token)), "{shown}");
         assert!(shown.contains("token_len: 18"), "{shown}");
+    }
+
+    /// `open_sqlite` runs its open, including a keyed open's 256,000-iteration
+    /// key derivation, on tokio's blocking pool. The runtime's only blocking
+    /// thread is held, so an open on the pool cannot finish within 300 ms;
+    /// run inline on the runtime thread, the open finishes and the assertion
+    /// fails.
+    #[test]
+    fn open_runs_on_the_blocking_pool() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("push.db");
+        let key = [0x42; 32];
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()?;
+        runtime.block_on(async {
+            let (release, held) = std::sync::mpsc::channel::<()>();
+            let holder = tokio::task::spawn_blocking(move || held.recv());
+            let open = PushRegistrationStore::open_sqlite(&path, PushStoreAtRest::Keyed(&key));
+            tokio::pin!(open);
+            let early = tokio::time::timeout(std::time::Duration::from_millis(300), &mut open)
+                .await
+                .is_ok();
+            release.send(())?;
+            holder.await??;
+            assert!(!early, "the push store opened on the runtime thread");
+            drop(open.await?);
+            Ok(())
+        })
     }
 }

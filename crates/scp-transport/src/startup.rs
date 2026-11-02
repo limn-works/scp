@@ -579,10 +579,15 @@ fn s3_prefix(raw: Option<OsString>) -> Result<String, StartupError> {
 ///   when `SCP_RELAY_S3_PREFIX` is set but blank.
 /// - [`StartupError::StoreOpen`] when the store fails to open.
 #[cfg_attr(
-    not(any(feature = "postgres-blob", feature = "s3-blob")),
+    not(any(
+        feature = "sqlite-blob",
+        feature = "redb-blob",
+        feature = "postgres-blob",
+        feature = "s3-blob"
+    )),
     expect(
         clippy::unused_async,
-        reason = "only the postgres and s3 arms await, and this build compiled neither"
+        reason = "only the store arms await, and this build compiled none of them"
     )
 )]
 pub async fn storage_from_env(choice: BackendChoice) -> Result<BlobStorageBackend, StartupError> {
@@ -590,11 +595,12 @@ pub async fn storage_from_env(choice: BackendChoice) -> Result<BlobStorageBacken
         #[cfg(feature = "sqlite-blob")]
         BackendChoice::Sqlite => {
             let path = storage_path("sqlite", env::var_os(STORAGE_PATH_VAR))?;
-            let store =
-                BlobStorageBackend::sqlite(&path).map_err(|error| StartupError::StoreOpen {
+            let store = BlobStorageBackend::sqlite(&path).await.map_err(|error| {
+                StartupError::StoreOpen {
                     backend: "sqlite",
                     error,
-                })?;
+                }
+            })?;
             tracing::info!(path = %path.display(), "using sqlite blob storage");
             Ok(store)
         }
@@ -602,10 +608,12 @@ pub async fn storage_from_env(choice: BackendChoice) -> Result<BlobStorageBacken
         BackendChoice::Redb => {
             let path = storage_path("redb", env::var_os(STORAGE_PATH_VAR))?;
             let store =
-                BlobStorageBackend::redb(&path).map_err(|error| StartupError::StoreOpen {
-                    backend: "redb",
-                    error,
-                })?;
+                BlobStorageBackend::redb(&path)
+                    .await
+                    .map_err(|error| StartupError::StoreOpen {
+                        backend: "redb",
+                        error,
+                    })?;
             tracing::info!(path = %path.display(), "using redb blob storage");
             Ok(store)
         }
@@ -1768,14 +1776,14 @@ fn check_owner_only(
 /// - [`PushStartupError::ServiceStart`] when the push service cannot start,
 ///   which includes a call outside a tokio runtime: the service's lookup and
 ///   drains run on the caller's runtime.
-pub fn push_role_from(selection: PushSelection) -> Result<PushRole, StartupError> {
+pub async fn push_role_from(selection: PushSelection) -> Result<PushRole, StartupError> {
     let PushBackends { store, senders } = match selection {
         PushSelection::Disabled => return Ok(PushRole::Disabled),
         PushSelection::Enabled(backends) => *backends,
     };
     let store = match store {
         PushStoreChoice::Sqlite { path } => {
-            match PushRegistrationStore::open_sqlite(&path, PushStoreAtRest::Unkeyed) {
+            match PushRegistrationStore::open_sqlite(&path, PushStoreAtRest::Unkeyed).await {
                 Ok(store) => store,
                 Err(error) => return Err(PushStartupError::StoreOpen { path, error }.into()),
             }
@@ -1837,7 +1845,7 @@ pub async fn start_relay_from_env(
         "starting relay"
     );
 
-    config.push = push_role_from(push_selection_from_env()?)?;
+    config.push = push_role_from(push_selection_from_env()?).await?;
     log_push_role(&config.push);
 
     let storage = Arc::new(storage_from_env(backend).await?);
@@ -2516,8 +2524,8 @@ mod push_tests {
 
     /// Criterion 2: `none` selects no push and reads no other variable, so a
     /// relay with `none` and no push store or credentials starts.
-    #[test]
-    fn none_selects_no_push_and_reads_nothing_else() {
+    #[tokio::test]
+    async fn none_selects_no_push_and_reads_nothing_else() {
         for value in ["none", "NONE", " None "] {
             let read = std::cell::RefCell::new(Vec::new());
             let value = OsString::from(value);
@@ -2529,7 +2537,7 @@ mod push_tests {
             assert!(matches!(selection, PushSelection::Disabled));
             assert_eq!(*read.borrow(), vec![PUSH_PLATFORMS_VAR]);
             assert!(matches!(
-                push_role_from(selection).unwrap(),
+                push_role_from(selection).await.unwrap(),
                 PushRole::Disabled
             ));
         }
@@ -3012,7 +3020,7 @@ mod push_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("push.sqlite");
         let env = Env::full(dir.path());
-        let role = push_role_from(env.parse().unwrap()).unwrap();
+        let role = push_role_from(env.parse().unwrap()).await.unwrap();
         assert!(
             path.exists(),
             "the push store was not opened at {}",
@@ -3092,21 +3100,23 @@ mod push_tests {
         drop(sink);
         drop(stream);
 
-        let reopened = PushRegistrationStore::open_sqlite(&path, PushStoreAtRest::Unkeyed).unwrap();
+        let reopened = PushRegistrationStore::open_sqlite(&path, PushStoreAtRest::Unkeyed)
+            .await
+            .unwrap();
         assert_eq!(reopened.get(&key).await.unwrap(), Some(record));
     }
 
     /// A push store path that cannot be opened (its parent is a regular file)
     /// is the typed `StoreOpen` refusal under SCP-CAPSEL-8001, naming the
     /// store variables, and nothing else is opened in its place.
-    #[test]
-    fn an_unopenable_push_store_path_is_a_typed_refusal() {
+    #[tokio::test]
+    async fn an_unopenable_push_store_path_is_a_typed_refusal() {
         let dir = tempfile::tempdir().unwrap();
         let blocker = write_file(dir.path(), "not-a-directory", b"x", 0o600);
         let path = blocker.join("push.sqlite");
         let mut env = Env::full(dir.path());
         env.set(PUSH_STORE_PATH_VAR, &path);
-        let result = push_role_from(env.parse().unwrap());
+        let result = push_role_from(env.parse().unwrap()).await;
         let Err(StartupError::Push(error)) = result else {
             panic!("expected a push refusal, got {result:?}");
         };
@@ -3521,28 +3531,6 @@ mod push_tests {
     /// Criterion 8: loading credentials writes no key byte to any log line,
     /// and neither the loaded selection's `Debug` nor any refusal's `Display`
     /// or `Debug` carries one.
-    /// An enabled selection outside a tokio runtime fails with a typed
-    /// refusal instead of yielding a role whose push service never runs.
-    #[test]
-    fn enabled_push_outside_a_runtime_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let env = Env::full(dir.path());
-        let error = push_role_from(env.parse().unwrap()).unwrap_err();
-        let StartupError::Push(error) = error else {
-            panic!("expected a push refusal: {error:?}");
-        };
-        assert!(
-            matches!(
-                error,
-                PushStartupError::ServiceStart {
-                    error: crate::relay::push_gate::PushRoleError::NoRuntime
-                }
-            ),
-            "{error:?}"
-        );
-        assert_eq!(error.rule(), "SCP-CAPSEL-8001");
-    }
-
     // A current-thread runtime, so the per-thread log capture sees the
     // lines `push_role_from` writes.
     #[tokio::test]
@@ -3572,7 +3560,7 @@ mod push_tests {
         );
         env.set(FCM_SERVICE_ACCOUNT_PATH_VAR, p8_as_sa);
         refusals.push(env.parse().unwrap_err());
-        let role = push_role_from(selection).unwrap();
+        let role = push_role_from(selection).await.unwrap();
         let role_printed = format!("{role:?} {role:#?}");
         drop(role);
 

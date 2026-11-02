@@ -5685,7 +5685,7 @@ async fn create_identity(
 ) -> napi::Result<crate::identity::NapiIdentity> {
     use crate::identity::NapiIdentityInner;
 
-    let key_custody = selection.open().map_err(NapiError::from)?;
+    let key_custody = selection.open().await.map_err(NapiError::from)?;
     let bi = &*bi_arc;
     let pre_rotation_custody = Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
     let dht = crate::identity::shared_did_method()?;

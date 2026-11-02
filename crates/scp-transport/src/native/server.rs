@@ -4600,6 +4600,7 @@ mod tests {
                 &dir.path().join("push.db"),
                 crate::relay::push_store::PushStoreAtRest::Unkeyed,
             )
+            .await
             .unwrap();
             let push = PushRole::Enabled(
                 PushService::start(PushServiceConfig {
@@ -4622,6 +4623,7 @@ mod tests {
                 &dir.path().join("push.db"),
                 crate::relay::push_store::PushStoreAtRest::Unkeyed,
             )
+            .await
             .unwrap();
             let push = PushRole::Enabled(
                 PushService::start(PushServiceConfig {
@@ -4677,6 +4679,7 @@ mod tests {
                 &dir.path().join("push.db"),
                 crate::relay::push_store::PushStoreAtRest::Unkeyed,
             )
+            .await
             .unwrap();
             let push = PushRole::Enabled(
                 PushService::start(PushServiceConfig {
@@ -4955,6 +4958,7 @@ mod tests {
                 &dir.path().join("push.db"),
                 crate::relay::push_store::PushStoreAtRest::Unkeyed,
             )
+            .await
             .unwrap();
             let service = PushService::start(PushServiceConfig {
                 store,

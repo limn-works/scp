@@ -414,8 +414,8 @@ fn s3_without_bucket_exits_with_error() {
 /// Verifies that blobs stored in an SQLite-backed `BlobStorageBackend`
 /// survive closing and reopening the database — the same persistence
 /// guarantee exercised when a relay restarts.
-#[test]
-fn sqlite_blob_persistence_across_reopens() {
+#[tokio::test]
+async fn sqlite_blob_persistence_across_reopens() {
     use scp_transport::native::storage::{BlobStorage, BlobStorageBackend};
 
     let tmp = tempfile::tempdir().expect("failed to create tempdir");
@@ -427,25 +427,24 @@ fn sqlite_blob_persistence_across_reopens() {
 
     // --- First open: store a blob ---
     {
-        let backend = BlobStorageBackend::sqlite(&db_path).expect("failed to open sqlite backend");
+        let backend = BlobStorageBackend::sqlite(&db_path)
+            .await
+            .expect("failed to open sqlite backend");
 
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let stored = backend
-                .store(routing_id, blob_id, None, 3600, blob_data.clone())
-                .await
-                .expect("failed to store blob");
+        let stored = backend
+            .store(routing_id, blob_id, None, 3600, blob_data.clone())
+            .await
+            .expect("failed to store blob");
 
-            assert_eq!(stored.blob, blob_data, "stored data should match");
+        assert_eq!(stored.blob, blob_data, "stored data should match");
 
-            // Verify immediate retrieval.
-            let retrieved = backend.get(&blob_id).await.expect("get failed");
-            assert!(
-                retrieved.is_some(),
-                "blob should be retrievable immediately"
-            );
-            assert_eq!(retrieved.unwrap().blob, blob_data);
-        });
+        // Verify immediate retrieval.
+        let retrieved = backend.get(&blob_id).await.expect("get failed");
+        assert!(
+            retrieved.is_some(),
+            "blob should be retrievable immediately"
+        );
+        assert_eq!(retrieved.unwrap().blob, blob_data);
     }
     // Backend dropped — database connection closed.
 
@@ -458,25 +457,23 @@ fn sqlite_blob_persistence_across_reopens() {
 
     // --- Second open: verify the blob persisted ---
     {
-        let backend =
-            BlobStorageBackend::sqlite(&db_path).expect("failed to reopen sqlite backend");
+        let backend = BlobStorageBackend::sqlite(&db_path)
+            .await
+            .expect("failed to reopen sqlite backend");
 
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let retrieved = backend
-                .get(&blob_id)
-                .await
-                .expect("get failed after reopen");
-            assert!(
-                retrieved.is_some(),
-                "blob should survive backend close and reopen"
-            );
-            assert_eq!(
-                retrieved.unwrap().blob,
-                blob_data,
-                "persisted blob data should match original"
-            );
-        });
+        let retrieved = backend
+            .get(&blob_id)
+            .await
+            .expect("get failed after reopen");
+        assert!(
+            retrieved.is_some(),
+            "blob should survive backend close and reopen"
+        );
+        assert_eq!(
+            retrieved.unwrap().blob,
+            blob_data,
+            "persisted blob data should match original"
+        );
     }
 }
 
@@ -642,8 +639,8 @@ fn apns_relay_command(dir: &std::path::Path, push_path: &std::path::Path) -> Com
 /// store at `SCP_RELAY_PUSH_STORE_PATH`, logs that push is enabled, and
 /// listens; the file it created opens as a push store after the relay stops.
 #[cfg(unix)]
-#[test]
-fn sqlite_push_store_starts_the_relay_with_push_enabled() {
+#[tokio::test]
+async fn sqlite_push_store_starts_the_relay_with_push_enabled() {
     const ENABLED: &str = "push: enabled with the sqlite push store";
     const LISTENING: &str = "relay listening";
     let tmp = tempfile::tempdir().expect("failed to create tempdir");
@@ -669,6 +666,7 @@ fn sqlite_push_store_starts_the_relay_with_push_enabled() {
         &push_path,
         scp_transport::relay::push_store::PushStoreAtRest::Unkeyed,
     )
+    .await
     .expect("the file the relay created opens as a push store");
 }
 

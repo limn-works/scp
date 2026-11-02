@@ -136,7 +136,8 @@ mod relays {
         let store = PushRegistrationStore::open_sqlite(
             &dir.path().join("push.db"),
             crate::relay::push_store::PushStoreAtRest::Unkeyed,
-        )?;
+        )
+        .await?;
         let push = PushRole::Enabled(PushService::start(PushServiceConfig {
             store: store.clone(),
             verifier,

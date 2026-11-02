@@ -1566,8 +1566,8 @@ where
 
     // -- Storage path + key (Result-returning; never exits) --
     let storage_dir = resolve_storage_path(storage_path.as_ref())?;
-    validate_storage_path(&storage_dir)?;
-    let storage_key = resolve_storage_key(&storage_dir)?;
+    validate_storage_path(&storage_dir).await?;
+    let storage_key = resolve_storage_key(&storage_dir).await?;
 
     tracing::info!(
         bind_addr = %http_addr,
@@ -1580,8 +1580,8 @@ where
     //    advisory lock on `{dir}/scp.db.lock`; it is shared via `Arc::clone`
     //    between the BEP44 sequence store and the node builder so there is
     //    exactly one lock holder. --
-    let node_storage_arc = Arc::new(open_sqlite(&storage_dir, &storage_key)?);
-    let custody_storage = open_sqlite(&storage_dir.join("custody"), &storage_key)?;
+    let node_storage_arc = Arc::new(open_sqlite(&storage_dir, &storage_key).await?);
+    let custody_storage = open_sqlite(&storage_dir.join("custody"), &storage_key).await?;
     let custody = Arc::new(
         SqliteKeyCustody::new(custody_storage)
             .await
@@ -1843,7 +1843,7 @@ where
     let context_id = self_host_context_id(&node_did);
 
     // -- Load the site assets once. The embedded default injects the node DID. --
-    let assets = match load_self_host_assets(site_dir.as_ref(), &node_did) {
+    let assets = match load_self_host_assets(site_dir.as_ref(), &node_did).await {
         Ok(a) => Arc::new(a),
         Err(e) => {
             release_self_host_mappings(upnp_mapper, natpmp_mapper, port).await;
@@ -2239,13 +2239,51 @@ fn default_storage_path(
     Ok(data_home.join("scp").join("node"))
 }
 
+/// Runs `work` on tokio's blocking pool and returns its result.
+///
+/// Every file and database operation on the self-host start path runs
+/// through this function: a directory creation, a key-file read or write, a
+/// `SQLCipher` open with its schema statements, or a site directory read.
+/// Run inline in an async function, that work stalls the tokio worker thread
+/// and every task scheduled on it, for a time that grows with the disk's
+/// latency and, for a site directory, with the site's size. Dropping the
+/// returned future leaves `work` running to completion, and its result is
+/// then dropped.
+///
+/// `lost` builds the error returned when the blocking task panicked or the
+/// runtime shut down under it.
+async fn on_blocking_pool<T, F>(
+    work: F,
+    lost: impl FnOnce(String) -> HostSiteError,
+) -> Result<T, HostSiteError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, HostSiteError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|e| lost(format!("the blocking task failed: {e}")))?
+}
+
 /// Validates that the storage directory can be created and is writable.
+///
+/// The check runs on tokio's blocking pool.
 ///
 /// # Errors
 ///
 /// Returns [`HostSiteError::StoragePath`] if the directory cannot be created or
 /// is not writable.
-pub fn validate_storage_path(dir: &Path) -> Result<(), HostSiteError> {
+pub async fn validate_storage_path(dir: &Path) -> Result<(), HostSiteError> {
+    let dir = dir.to_path_buf();
+    on_blocking_pool(
+        move || validate_storage_path_blocking(&dir),
+        HostSiteError::StoragePath,
+    )
+    .await
+}
+
+/// The body of [`validate_storage_path`], which blocks.
+fn validate_storage_path_blocking(dir: &Path) -> Result<(), HostSiteError> {
     std::fs::create_dir_all(dir).map_err(|e| {
         HostSiteError::StoragePath(format!(
             "cannot create storage directory '{}': {e}",
@@ -2269,13 +2307,24 @@ pub fn validate_storage_path(dir: &Path) -> Result<(), HostSiteError> {
 /// Reads from `SCP_STORAGE_KEY` (hex-encoded 32 bytes). If unset, generates a
 /// random key and writes it to `{storage_dir}/.key` (mode 0600 on Unix); on
 /// subsequent runs reads it back. All intermediate buffers are
-/// [`Zeroizing`](zeroize::Zeroizing).
+/// [`Zeroizing`](zeroize::Zeroizing). The key-file work runs on tokio's
+/// blocking pool.
 ///
 /// # Errors
 ///
 /// Returns [`HostSiteError::StorageKey`] if the env key is invalid, the key file
 /// has the wrong length, or the file cannot be read/created/written.
-pub fn resolve_storage_key(storage_dir: &Path) -> Result<Zeroizing<[u8; 32]>, HostSiteError> {
+pub async fn resolve_storage_key(storage_dir: &Path) -> Result<Zeroizing<[u8; 32]>, HostSiteError> {
+    let storage_dir = storage_dir.to_path_buf();
+    on_blocking_pool(
+        move || resolve_storage_key_blocking(&storage_dir),
+        HostSiteError::StorageKey,
+    )
+    .await
+}
+
+/// The body of [`resolve_storage_key`], which blocks on the key file.
+fn resolve_storage_key_blocking(storage_dir: &Path) -> Result<Zeroizing<[u8; 32]>, HostSiteError> {
     // Env var first.
     if let Ok(hex_key) = std::env::var("SCP_STORAGE_KEY") {
         let bytes = Zeroizing::new(hex::decode(&hex_key).map_err(|e| {
@@ -2359,14 +2408,29 @@ pub fn resolve_storage_key(storage_dir: &Path) -> Result<Zeroizing<[u8; 32]>, Ho
 /// Opens an encrypted `SQLite` database, returning a [`HostSiteError`] on
 /// failure (the Result-returning analogue of the binary's `open_sqlite_or_exit`).
 ///
+/// The open runs on tokio's blocking pool.
+///
 /// # Errors
 ///
 /// Returns [`HostSiteError::StorageOpen`] if the database cannot be opened.
-pub fn open_sqlite(dir: &Path, key: &Zeroizing<[u8; 32]>) -> Result<SqliteStorage, HostSiteError> {
-    SqliteStorage::new(dir, key.as_ref()).map_err(|error| HostSiteError::StorageOpen {
-        dir: dir.to_path_buf(),
-        error,
-    })
+pub async fn open_sqlite(
+    dir: &Path,
+    key: &Zeroizing<[u8; 32]>,
+) -> Result<SqliteStorage, HostSiteError> {
+    let dir = dir.to_path_buf();
+    let lost_dir = dir.clone();
+    let key = key.clone();
+    on_blocking_pool(
+        move || {
+            SqliteStorage::new(&dir, key.as_ref())
+                .map_err(|error| HostSiteError::StorageOpen { dir, error })
+        },
+        move |message| HostSiteError::StorageOpen {
+            dir: lost_dir,
+            error: PlatformError::StorageError(message),
+        },
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -2579,31 +2643,42 @@ pub fn self_host_context_id(node_did: &str) -> String {
 ///
 /// Returns an error message if the directory is empty, lacks an `index.html` at
 /// its root, or cannot be read.
-pub fn load_self_host_assets(
+pub async fn load_self_host_assets(
     site_dir: Option<&PathBuf>,
     node_did: &str,
 ) -> Result<Vec<Asset>, String> {
     match site_dir {
         None => Ok(embedded_assets(Some(node_did))),
+        // The read takes time in proportion to the site's size, so it runs on
+        // tokio's blocking pool.
         Some(dir) => {
-            let mut assets = Vec::new();
-            read_site_dir_recursive(dir, dir, &mut assets)?;
-            if assets.is_empty() {
-                return Err(format!(
-                    "site directory '{}' contains no files",
-                    dir.display()
-                ));
-            }
-            if !assets.iter().any(|a| a.path == "/index.html") {
-                return Err(format!(
-                    "site directory '{}' must contain an index.html at its root",
-                    dir.display()
-                ));
-            }
-            assets.sort_by(|a, b| a.path.cmp(&b.path));
-            Ok(assets)
+            let dir = dir.clone();
+            tokio::task::spawn_blocking(move || read_site_dir(&dir))
+                .await
+                .map_err(|e| format!("the task reading the site directory failed: {e}"))?
         }
     }
+}
+
+/// Reads every file under `dir` into an [`Asset`], sorted by path, and checks
+/// that the directory holds at least one file and an `index.html` at its root.
+fn read_site_dir(dir: &Path) -> Result<Vec<Asset>, String> {
+    let mut assets = Vec::new();
+    read_site_dir_recursive(dir, dir, &mut assets)?;
+    if assets.is_empty() {
+        return Err(format!(
+            "site directory '{}' contains no files",
+            dir.display()
+        ));
+    }
+    if !assets.iter().any(|a| a.path == "/index.html") {
+        return Err(format!(
+            "site directory '{}' must contain an index.html at its root",
+            dir.display()
+        ));
+    }
+    assets.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(assets)
 }
 
 /// Recursively reads every file under `dir`, mapping each to an [`Asset`] whose
@@ -2713,6 +2788,7 @@ async fn build_host_site_node<D: scp_identity::DidMethod + 'static>(
 > {
     let blob_db = storage_dir.join("blobs");
     let blob_storage = scp_transport::native::storage::BlobStorageBackend::sqlite(&blob_db)
+        .await
         .map_err(|e| {
             HostSiteError::BlobStorage(format!(
                 "failed to open persistent SQLite blob storage at '{}': {e}",
@@ -2799,7 +2875,7 @@ async fn build_host_site_deployer<S>(
 where
     S: scp_platform::EncryptedStorage + 'static,
 {
-    let mls_inner = Arc::new(open_sqlite(&storage_dir.join("mls"), storage_key)?);
+    let mls_inner = Arc::new(open_sqlite(&storage_dir.join("mls"), storage_key).await?);
     // The durable saga journal and the `mls_storage` view are bound into one
     // `DurableProviders` derived from the SAME `Arc<SqliteStorage>`, so
     // crash-recovery replay and the `OpenMLS` view read and write one
@@ -3201,11 +3277,86 @@ mod tests {
         );
     }
 
+    /// Runs `site` on a runtime whose one blocking-pool thread another task
+    /// holds, and returns whether `site` finished within 300 ms.
+    ///
+    /// A start-path helper that runs its file work on the blocking pool
+    /// queues behind the held thread and cannot finish; one that runs the
+    /// work inline on the runtime thread finishes at once. The held thread is
+    /// released before the runtime shuts down, and the site's result is
+    /// returned so the caller can check it succeeded.
+    fn finishes_while_the_blocking_pool_is_held<T, F>(site: F) -> (bool, T)
+    where
+        F: std::future::Future<Output = T>,
+    {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("build runtime");
+        runtime.block_on(async {
+            let (release, held) = std::sync::mpsc::channel::<()>();
+            let holder = tokio::task::spawn_blocking(move || held.recv());
+            tokio::pin!(site);
+            let early =
+                tokio::time::timeout(std::time::Duration::from_millis(300), &mut site).await;
+            release.send(()).expect("release the held blocking thread");
+            holder
+                .await
+                .expect("the holder task completes")
+                .expect("the holder receives the release");
+            match early {
+                Ok(out) => (true, out),
+                Err(_) => (false, site.await),
+            }
+        })
+    }
+
+    /// Each blocking step `host_site_until` and the `scp-node` binary run
+    /// before the node starts (the storage-path check, the storage-key file,
+    /// a `SQLCipher` open, and the site-directory read) runs on tokio's
+    /// blocking pool, so none of them holds the runtime's worker thread. Run
+    /// inline, each finishes while the pool's only thread is held, and the
+    /// assertion fails.
+    #[test]
+    fn start_path_file_work_runs_on_the_blocking_pool() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let storage = tmp.path().join("storage");
+        let site = tmp.path().join("site");
+        std::fs::create_dir_all(&site).expect("create site dir");
+        std::fs::write(site.join("index.html"), "<html></html>").expect("write index");
+
+        let (early, result) =
+            finishes_while_the_blocking_pool_is_held(validate_storage_path(&storage));
+        result.expect("validate the storage path");
+        assert!(!early, "validate_storage_path ran on the runtime thread");
+
+        let (early, key) = finishes_while_the_blocking_pool_is_held(resolve_storage_key(&storage));
+        let key = key.expect("resolve the storage key");
+        assert!(!early, "resolve_storage_key ran on the runtime thread");
+
+        let (early, store) =
+            finishes_while_the_blocking_pool_is_held(open_sqlite(&storage.join("mls"), &key));
+        drop(store.expect("open the SQLCipher store"));
+        assert!(!early, "open_sqlite ran on the runtime thread");
+
+        let site_dir = Some(site);
+        let (early, assets) = finishes_while_the_blocking_pool_is_held(load_self_host_assets(
+            site_dir.as_ref(),
+            "did:dht:test",
+        ));
+        assert_eq!(assets.expect("read the site").len(), 1);
+        assert!(
+            !early,
+            "load_self_host_assets read the site on the runtime thread"
+        );
+    }
+
     /// A setup drain that times out or fails reaches the caller as the typed
     /// `HostSiteError::Drain` and leaves the MLS store open with its lock; any
     /// other setup failure is `DeployerSetup` and closes the store.
-    #[test]
-    fn deployer_setup_failure_keeps_store_open_only_on_unfinished_drain() {
+    #[tokio::test]
+    async fn deployer_setup_failure_keeps_store_open_only_on_unfinished_drain() {
         let key = [7u8; 32];
         let tmp = tempfile::tempdir().expect("tempdir");
         let dir = tmp.path().join("mls");
@@ -3223,7 +3374,7 @@ mod tests {
             ),
             "a setup drain timeout must be HostSiteError::Drain, got {err:?}"
         );
-        let held = open_sqlite(&dir, &Zeroizing::new(key));
+        let held = open_sqlite(&dir, &Zeroizing::new(key)).await;
         assert!(
             matches!(
                 &held,
@@ -3246,7 +3397,7 @@ mod tests {
             matches!(err, HostSiteError::Drain(SelfHostError::DrainFailed { .. })),
             "a failed setup drain must be HostSiteError::Drain, got {err:?}"
         );
-        let held = open_sqlite(&dir, &Zeroizing::new(key));
+        let held = open_sqlite(&dir, &Zeroizing::new(key)).await;
         assert!(
             matches!(
                 &held,
@@ -3265,7 +3416,7 @@ mod tests {
             matches!(&err, HostSiteError::DeployerSetup(m) if m == "failed to commit deploy: y"),
             "a drained setup failure must be DeployerSetup, got {err:?}"
         );
-        let reopened = open_sqlite(&dir, &Zeroizing::new(key));
+        let reopened = open_sqlite(&dir, &Zeroizing::new(key)).await;
         assert!(
             reopened.is_ok(),
             "the store must release its lock after a drained setup failure: {:?}",

@@ -177,21 +177,37 @@ impl FileCustodyInputs {
     /// Creates the key directory, then opens (or creates) `keys.bin` in it
     /// under the resolved passphrase.
     ///
+    /// Both steps run on tokio's blocking pool: the open runs an Argon2id
+    /// derivation that takes seconds in an unoptimized build, and every
+    /// bridge calls this function from an async function. Dropping the
+    /// returned future leaves the open running to completion, which leaves
+    /// either a complete key file or none (see `FileKeyCustody::open`).
+    ///
     /// # Errors
     ///
     /// Returns [`FileCustodyError::DirectoryCreate`] when the directory cannot
     /// be created and [`FileCustodyError::Open`] when `scp-platform` rejects
-    /// the key file.
-    pub fn open(self) -> Result<FileKeyCustody, FileCustodyError> {
-        std::fs::create_dir_all(&self.key_dir).map_err(|e| FileCustodyError::DirectoryCreate {
-            path: self.key_dir.clone(),
-            message: e.to_string(),
-        })?;
+    /// the key file or the blocking task fails.
+    pub async fn open(self) -> Result<FileKeyCustody, FileCustodyError> {
         let key_path = self.key_path();
-        FileKeyCustody::new(&key_path, &self.passphrase).map_err(|e| FileCustodyError::Open {
-            path: key_path,
-            message: e.to_string(),
+        let failed_path = key_path.clone();
+        tokio::task::spawn_blocking(move || {
+            std::fs::create_dir_all(&self.key_dir).map_err(|e| {
+                FileCustodyError::DirectoryCreate {
+                    path: self.key_dir.clone(),
+                    message: e.to_string(),
+                }
+            })?;
+            FileKeyCustody::new(&key_path, &self.passphrase).map_err(|e| FileCustodyError::Open {
+                path: key_path,
+                message: e.to_string(),
+            })
         })
+        .await
+        .map_err(|e| FileCustodyError::Open {
+            path: failed_path,
+            message: format!("the task opening the key file failed: {e}"),
+        })?
     }
 }
 
@@ -256,8 +272,8 @@ mod tests {
 
     /// Resolution touches no file; opening creates the directory and the key
     /// file.
-    #[test]
-    fn resolution_creates_nothing_and_open_creates_the_key_file() {
+    #[tokio::test]
+    async fn resolution_creates_nothing_and_open_creates_the_key_file() {
         let base =
             std::env::temp_dir().join(format!("scp-test-custody-file-open-{}", std::process::id()));
         let home = base.join("home");
@@ -270,11 +286,57 @@ mod tests {
         );
 
         let key_path = inputs.key_path();
-        let opened = inputs.open();
+        let opened = inputs.open().await;
         let created = key_path.is_file();
         let _ = std::fs::remove_dir_all(&base);
         opened.expect("open creates the key file");
         assert!(created, "open must create {}", key_path.display());
+    }
+
+    /// `open` runs on the blocking pool, so an open waiting on a key file
+    /// another process reserved leaves the runtime thread free.
+    ///
+    /// A zero-byte `keys.bin` makes `FileKeyCustody::new` poll for up to 10 s
+    /// while the process that reserved it finishes writing. The test runs on a
+    /// `current_thread` runtime, starts an open over a zero-byte `keys.bin`,
+    /// sleeps 300 ms, and then deletes the file, which ends the poll with an
+    /// error. Run inline, the open parks the runtime's only thread for the
+    /// whole 10 s poll, so the sleep returns about 10 s late and the
+    /// elapsed-time assertion fails.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_open_waiting_on_a_reserved_key_file_leaves_the_runtime_thread_free() {
+        let base = std::env::temp_dir().join(format!(
+            "scp-test-custody-file-reserved-{}",
+            std::process::id()
+        ));
+        let home = base.join("home");
+        let inputs = resolve_file_custody_inputs_from(Some(passphrase()), Some(home.as_os_str()))
+            .expect("valid inputs");
+        let key_path = inputs.key_path();
+        std::fs::create_dir_all(home.join(".scp")).expect("create the key directory");
+        std::fs::write(&key_path, b"").expect("reserve keys.bin");
+
+        let opening = tokio::spawn(inputs.open());
+
+        let started = std::time::Instant::now();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "a 300 ms sleep took {elapsed:?}: the key-file open held the runtime thread"
+        );
+        assert!(
+            !opening.is_finished(),
+            "the open must still be waiting for the reserved file"
+        );
+
+        std::fs::remove_file(&key_path).expect("remove keys.bin");
+        let opened = opening.await.expect("the open task completes");
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(
+            matches!(opened, Err(FileCustodyError::Open { .. })),
+            "an open whose reserved file vanished must fail, got {opened:?}"
+        );
     }
 
     /// Every message names the variable or path its caller acts on.

@@ -500,6 +500,32 @@ pub enum BlobStorageBackend {
     Cached(Box<super::local_cache::LocalBlobCache<Self>>),
 }
 
+/// Runs a blob store's open on tokio's blocking pool and returns its result.
+///
+/// A file-backed open creates or recovers a database file, runs schema
+/// statements, and syncs, and a `SQLite` open waits up to its busy timeout
+/// (5 s) for a lock another connection holds. Run inline in an async
+/// function, that work stalls the tokio worker thread and every task
+/// scheduled on it. The file-backed constructors are async for that reason,
+/// so no async caller can run an open inline.
+///
+/// Dropping the returned future leaves the open running to completion; the
+/// opened store is then dropped, which closes it.
+///
+/// # Errors
+///
+/// Returns whatever `open` returns, and [`StorageError::Internal`] when the
+/// blocking task panicked or the runtime shut down under it.
+#[cfg(any(feature = "sqlite-blob", feature = "redb-blob", feature = "combined"))]
+async fn open_on_blocking_pool<F>(open: F) -> Result<BlobStorageBackend, StorageError>
+where
+    F: FnOnce() -> Result<BlobStorageBackend, StorageError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(open).await.map_err(|e| {
+        StorageError::Internal(format!("the task opening the blob store failed: {e}"))
+    })?
+}
+
 impl BlobStorageBackend {
     /// Creates a new in-memory backend with default capacity.
     #[must_use]
@@ -515,36 +541,56 @@ impl BlobStorageBackend {
 
     /// Opens an SQLite-backed blob storage at `path`.
     ///
+    /// The open runs on tokio's blocking pool, so it does not stall the
+    /// calling worker thread.
+    ///
     /// # Errors
     ///
     /// Returns [`StorageError`] if the database cannot be opened.
     #[cfg(feature = "sqlite-blob")]
-    pub fn sqlite(path: &std::path::Path) -> Result<Self, StorageError> {
-        Ok(Self::Sqlite(super::sqlite_blob::SqliteBlobStore::open(
-            path,
-        )?))
+    pub async fn sqlite(path: &std::path::Path) -> Result<Self, StorageError> {
+        let path = path.to_path_buf();
+        open_on_blocking_pool(move || {
+            Ok(Self::Sqlite(super::sqlite_blob::SqliteBlobStore::open(
+                &path,
+            )?))
+        })
+        .await
     }
 
     /// Opens a redb-backed blob storage at `path`.
+    ///
+    /// The open runs on tokio's blocking pool, so it does not stall the
+    /// calling worker thread.
     ///
     /// # Errors
     ///
     /// Returns [`StorageError`] if the database cannot be opened.
     #[cfg(feature = "redb-blob")]
-    pub fn redb(path: &std::path::Path) -> Result<Self, StorageError> {
-        Ok(Self::Redb(super::redb_blob::RedbBlobStore::open(path)?))
+    pub async fn redb(path: &std::path::Path) -> Result<Self, StorageError> {
+        let path = path.to_path_buf();
+        open_on_blocking_pool(move || Ok(Self::Redb(super::redb_blob::RedbBlobStore::open(&path)?)))
+            .await
     }
 
     /// Opens a combined SQLCipher-backed node storage at `dir/node.db`.
+    ///
+    /// The open runs on tokio's blocking pool, so it does not stall the
+    /// calling worker thread.
     ///
     /// # Errors
     ///
     /// Returns [`StorageError`] if the database cannot be opened.
     #[cfg(feature = "combined")]
-    pub fn combined(dir: &std::path::Path, key: &[u8]) -> Result<Self, StorageError> {
-        Ok(Self::Combined(super::combined::CombinedNodeStorage::open(
-            dir, key,
-        )?))
+    pub async fn combined(dir: &std::path::Path, key: &[u8]) -> Result<Self, StorageError> {
+        let dir = dir.to_path_buf();
+        let key = zeroize::Zeroizing::new(key.to_vec());
+        open_on_blocking_pool(move || {
+            Ok(Self::Combined(super::combined::CombinedNodeStorage::open(
+                &dir, &key,
+            )?))
+        })
+        .await
     }
 
     /// Wraps an existing backend in a size-limited local cache.

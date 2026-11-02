@@ -1668,7 +1668,9 @@ mod tests {
 
     /// A push role whose only sender is a `WebPush` sender, and that
     /// sender's published key. Call it inside a tokio runtime.
-    fn webpush_role(dir: &std::path::Path) -> (scp_transport::relay::push_gate::PushRole, String) {
+    async fn webpush_role(
+        dir: &std::path::Path,
+    ) -> (scp_transport::relay::push_gate::PushRole, String) {
         use scp_transport::relay::push::{VapidSubject, WebPushConfig, WebPushSender};
         use scp_transport::relay::push_endpoint::{Nat64Prefixes, OwnAddresses};
         use scp_transport::relay::push_gate::{PushProviders, PushRole, PushSenders};
@@ -1688,6 +1690,7 @@ mod tests {
                     &dir.join("push.sqlite"),
                     PushStoreAtRest::Unkeyed,
                 )
+                .await
                 .unwrap(),
                 senders: PushSenders {
                     apns: None,
@@ -1711,7 +1714,7 @@ mod tests {
         use http_body_util::BodyExt as _;
 
         let dir = tempfile::tempdir().unwrap();
-        let (role, k) = webpush_role(dir.path());
+        let (role, k) = webpush_role(dir.path()).await;
         let expected = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
             scp_crypto::p256::P256SecretKey::from_scalar_bytes(&[7; 32])
                 .unwrap()
@@ -1756,7 +1759,7 @@ mod tests {
         use scp_transport::http3::adapter::RequestHandler as _;
 
         let dir = tempfile::tempdir().unwrap();
-        let (role, k) = webpush_role(dir.path());
+        let (role, k) = webpush_role(dir.path()).await;
         let handler = Arc::new(super::H3RequestHandler {
             state: test_state_with_push(Some(allowed_only()), role),
             rt: tokio::runtime::Handle::current(),

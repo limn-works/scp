@@ -961,6 +961,7 @@ enum CreateCustody {}
 /// called.
 #[cfg(not(feature = "testing"))]
 fn open_custody_for_create(
+    _py: Python<'_>,
     selection: CustodySelection,
     bi: &PyBridgeInstance,
 ) -> Result<CreateCustody, ScpPyError> {
@@ -988,6 +989,7 @@ fn callback_custody(
 /// custody records over `bi`'s storage.
 #[cfg(feature = "testing")]
 fn open_custody_for_create(
+    py: Python<'_>,
     selection: CustodySelection,
     bi: &PyBridgeInstance,
 ) -> Result<CreateCustody, ScpPyError> {
@@ -1011,7 +1013,11 @@ fn open_custody_for_create(
             })
         }
         CustodySelection::EncryptedFile(inputs) => {
-            let file_kc = inputs.open().map_err(|e| file_custody_error(&e))?;
+            // The open runs its Argon2id derivation on tokio's blocking pool,
+            // and this thread releases the GIL while it waits, so other
+            // Python threads keep running for those seconds.
+            let file_kc = crate::actor_wait::block_on_released(py, inputs.open())?
+                .map_err(|e| file_custody_error(&e))?;
             Ok(CreateCustody {
                 custody: Arc::new(FfiKeyCustody::File(file_kc)),
                 request: CustodyRequest::EncryptedFile.as_str().to_owned(),
@@ -1570,8 +1576,11 @@ impl crate::scp::PyScp {
         // Resolve the custody (no file touched), then open it; a shipped build
         // refuses with SCP-IDENT-1100 at the open, before any key file exists
         // or any provider method runs.
-        let created =
-            open_custody_for_create(resolve_custody(custody, None, testing_seed_array)?, &bi_arc)?;
+        let created = open_custody_for_create(
+            py,
+            resolve_custody(custody, None, testing_seed_array)?,
+            &bi_arc,
+        )?;
         let rt = crate::runtime()?;
 
         // Ensure the production DID resolver is initialized on this bridge
@@ -1706,7 +1715,7 @@ impl crate::scp::PyScp {
         custody: &str,
     ) -> PyResult<PyIdentity> {
         let bi_arc = Arc::clone(&self.inner);
-        let created = open_custody_for_create(resolve_custody(custody, None, None)?, &bi_arc)?;
+        let created = open_custody_for_create(py, resolve_custody(custody, None, None)?, &bi_arc)?;
         let rt = crate::runtime()?;
 
         // Ensure the production DID resolver is initialized on this bridge
@@ -1856,6 +1865,7 @@ impl crate::scp::PyScp {
                 }
             })?;
         let created = open_custody_for_create(
+            py,
             resolve_custody(
                 scp_ffi_common::custody_request::CustodyRequest::OsKeystore.as_str(),
                 Some(provider_shim),
@@ -3708,7 +3718,8 @@ mod custody_request_tests {
         // `os_keystore` builds only over storage that persists (spec §17.3).
         let dir = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
         let bi = PyBridgeInstance::sqlite_for_test(dir.path()).map_err(|e| format!("{e:?}"))?;
-        open_custody_for_create(selection, &bi)
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| open_custody_for_create(py, selection, &bi))
             .map(label)
             .map_err(|e| format!("{e:?}"))
     }
@@ -3734,7 +3745,10 @@ mod custody_request_tests {
     -> Result<(), String> {
         let selection =
             resolve_custody("os_keystore", Some(provider()), None).map_err(|e| format!("{e:?}"))?;
-        let built = open_custody_for_create(selection, &PyBridgeInstance::new_py()).map(label);
+        let built = Python::with_gil(|py| {
+            open_custody_for_create(py, selection, &PyBridgeInstance::new_py())
+        })
+        .map(label);
         assert!(
             matches!(&built, Err(ScpPyError::ContextError { code, .. }) if code == codes::STORAGE_8000),
             "expected SCP-STORAGE-8000, got {built:?}"

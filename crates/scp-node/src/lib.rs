@@ -4184,7 +4184,7 @@ mod tests {
 
     /// A push slot whose only sender is a `WebPush` sender with an unresolved
     /// own-address set, over a SQLite store at `dir/push.sqlite`.
-    fn webpush_slot(dir: &std::path::Path) -> crate::config::PushSlot {
+    async fn webpush_slot(dir: &std::path::Path) -> crate::config::PushSlot {
         use scp_transport::relay::push::{VapidSubject, WebPushConfig, WebPushSender};
         use scp_transport::relay::push_endpoint::{Nat64Prefixes, OwnAddresses};
         use scp_transport::relay::push_gate::PushSenders;
@@ -4202,6 +4202,7 @@ mod tests {
                 &dir.join("push.sqlite"),
                 PushStoreAtRest::Unkeyed,
             )
+            .await
             .unwrap(),
             senders: PushSenders {
                 apns: None,
@@ -4242,7 +4243,7 @@ mod tests {
 
     /// A domain node config for [`WEBPUSH_DOMAIN`] with `tls` and a `WebPush`
     /// push slot over a store in `dir`.
-    fn webpush_domain_config(
+    async fn webpush_domain_config(
         dir: &std::path::Path,
         tls: Arc<dyn TlsProvider>,
     ) -> NodeConfig<InMemoryKeyCustody, TestDidDht, InMemoryStorage> {
@@ -4251,7 +4252,7 @@ mod tests {
                 domain: WEBPUSH_DOMAIN.to_owned(),
             },
             tls: TlsMode::Custom(tls),
-            push: webpush_slot(dir),
+            push: webpush_slot(dir).await,
             ..domain_config()
         }
     }
@@ -4277,7 +4278,8 @@ mod tests {
                     domain: WEBPUSH_DOMAIN.to_owned(),
                     answers: answers.clone(),
                 }),
-            ),
+            )
+            .await,
             OwnAddressLookup::fixed(&answers),
         )
         .await
@@ -4320,7 +4322,8 @@ mod tests {
                 Arc::new(SucceedingTlsProvider {
                     domain: WEBPUSH_DOMAIN.to_owned(),
                 }),
-            ),
+            )
+            .await,
             OwnAddressLookup::fixed(&answers),
         )
         .await;
@@ -4356,7 +4359,8 @@ mod tests {
                 Arc::new(SucceedingTlsProvider {
                     domain: WEBPUSH_DOMAIN.to_owned(),
                 }),
-            );
+            )
+            .await;
             config.identity = IdentitySource::Explicit(Box::new(ExplicitIdentity {
                 identity,
                 document,
@@ -4407,7 +4411,8 @@ mod tests {
                 Arc::new(SucceedingTlsProvider {
                     domain: WEBPUSH_DOMAIN.to_owned(),
                 }),
-            ),
+            )
+            .await,
             OwnAddressLookup::fixed(&answers),
         )
         .await
@@ -4451,7 +4456,8 @@ mod tests {
                 Arc::new(SucceedingTlsProvider {
                     domain: WEBPUSH_DOMAIN.to_owned(),
                 }),
-            ),
+            )
+            .await,
             OwnAddressLookup::fixed(&answers),
         )
         .await
@@ -4489,7 +4495,7 @@ mod tests {
         let local = Node::start_for_testing(NodeConfig {
             reach: Reach::Local,
             dht: DhtMode::Disabled,
-            push: webpush_slot(dir.path()),
+            push: webpush_slot(dir.path()).await,
             ..domain_config()
         })
         .await;
@@ -4520,7 +4526,8 @@ mod tests {
             ..domain_config()
         };
         let dir = tempfile::tempdir().unwrap();
-        let fell_through = Node::start_for_testing(failing_tls(webpush_slot(dir.path()))).await;
+        let fell_through =
+            Node::start_for_testing(failing_tls(webpush_slot(dir.path()).await)).await;
         assert!(
             matches!(fell_through, Err(NodeError::WebPushWithoutWellKnown)),
             "{:?}",

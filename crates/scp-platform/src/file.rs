@@ -1007,6 +1007,10 @@ impl FileKeyCustody {
     /// boundary to reject a wrong key or credential, so this check runs here
     /// instead of on a later `sign` call.
     ///
+    /// This function blocks for the derivation, and for up to 10 s on a path
+    /// another process reserved. An async caller uses [`Self::open`], which
+    /// runs it on tokio's blocking pool.
+    ///
     /// # Errors
     ///
     /// Returns [`PlatformError::CustodyError`] when the passphrase is empty,
@@ -1033,6 +1037,35 @@ impl FileKeyCustody {
         } else {
             Self::open_existing_when_written(path, passphrase)
         }
+    }
+
+    /// [`Self::new`] on tokio's blocking pool, for async callers.
+    ///
+    /// `new` runs an Argon2id derivation (64 MiB, three passes), which takes
+    /// hundreds of milliseconds in an optimized build and seconds in an
+    /// unoptimized one, and on a path another process reserved it polls for
+    /// up to 10 s. Called inline from an async function, either stalls the
+    /// tokio worker thread and every task scheduled on it; this function keeps
+    /// that worker free.
+    ///
+    /// Dropping the returned future leaves the open running to completion on
+    /// the blocking pool. A creation that completes leaves a complete key
+    /// file, and a creation that fails removes the file it reserved, so a
+    /// dropped open leaves no partly written file.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever [`Self::new`] returns, and
+    /// [`PlatformError::CustodyError`] when the blocking task panicked or the
+    /// runtime shut down under it.
+    pub async fn open(path: &Path, passphrase: &str) -> Result<Self, PlatformError> {
+        let path = path.to_path_buf();
+        let passphrase = Zeroizing::new(passphrase.to_owned());
+        tokio::task::spawn_blocking(move || Self::new(&path, &passphrase))
+            .await
+            .map_err(|e| {
+                PlatformError::CustodyError(format!("the task opening the key file failed: {e}"))
+            })?
     }
 
     /// Opens an existing key file, waiting briefly when another process
@@ -4514,6 +4547,45 @@ mod tests {
         let imported = import.await.unwrap().unwrap();
         custody.public_key(&generated).await.unwrap();
         custody.public_key(&imported).await.unwrap();
+    }
+
+    /// `open` runs on the blocking pool, so an open waiting on a path another
+    /// process reserved leaves the runtime thread free.
+    ///
+    /// A zero-byte file at the path makes `new` poll for up to 10 s while the
+    /// process that reserved it finishes writing. The test runs on a
+    /// `current_thread` runtime, starts an open over a zero-byte file, sleeps
+    /// 300 ms, and then deletes the file, which ends the poll with an error.
+    /// Run inline, the open parks the runtime's only thread for the whole
+    /// 10 s poll, so the sleep returns about 10 s late and the elapsed-time
+    /// assertion fails.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_open_waiting_on_a_reserved_path_leaves_the_runtime_thread_free() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("keys.scp");
+        std::fs::write(&path, b"").unwrap();
+
+        let reserved = path.clone();
+        let opening = tokio::spawn(async move { FileKeyCustody::open(&reserved, "pw").await });
+
+        let started = std::time::Instant::now();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "a 300 ms sleep took {elapsed:?}: the key-file open held the runtime thread"
+        );
+        assert!(
+            !opening.is_finished(),
+            "the open must still be waiting for the reserved file"
+        );
+
+        std::fs::remove_file(&path).unwrap();
+        let opened = opening.await.unwrap();
+        assert!(
+            matches!(opened, Err(PlatformError::CustodyError(_))),
+            "an open whose reserved file vanished must fail, got {opened:?}"
+        );
     }
 
     /// A caller that drops a write's future cannot separate the file write

@@ -13,7 +13,7 @@ let node = Node::start(NodeConfig {
     reach: Reach::Domain { domain: "example.com".into() },
     identity: IdentitySource::Generate { custody, did_method },
     storage: StorageSlot::Sqlite { path, passphrase }, // core slot; the FFI bridges mirror it as their `StorageConfig` enum
-    blob_storage: BlobStorageBackend::sqlite(&blob_db)?, // required relay blob backend (M4); durable for a public node
+    blob_storage: BlobStorageBackend::sqlite(&blob_db).await?, // required relay blob backend (M4); durable for a public node
     ..NodeConfig::defaults(/* required… */)
 }).await?;
 ```

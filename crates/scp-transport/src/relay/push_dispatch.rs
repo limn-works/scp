@@ -1538,14 +1538,15 @@ mod enabled {
 
         /// A configuration over a fresh SQLite store (the shipped arm) with
         /// `senders`.
-        fn config(
+        async fn config(
             senders: Vec<PushSender>,
         ) -> Result<(PushServiceConfig, TempDir), Box<dyn std::error::Error>> {
             let dir = tempfile::tempdir()?;
             let store = PushRegistrationStore::open_sqlite(
                 &dir.path().join("push.db"),
                 crate::relay::push_store::PushStoreAtRest::Unkeyed,
-            )?;
+            )
+            .await?;
             let config = PushServiceConfig {
                 store,
                 verifier: verifier()?,
@@ -1658,7 +1659,10 @@ mod enabled {
         /// error, instead of returning a service whose drains never run.
         #[test]
         fn start_outside_a_runtime_fails() -> TestResult {
-            let (config, _dir) = config(Vec::new())?;
+            let (config, _dir) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(config(Vec::new()))?;
             let refused = PushService::start(config).err();
             assert!(
                 refused
@@ -1673,7 +1677,7 @@ mod enabled {
         /// intake's receiver goes away.
         #[tokio::test]
         async fn dropping_the_service_stops_its_tasks() -> TestResult {
-            let (config, _dir) = config(vec![closed_apns()?])?;
+            let (config, _dir) = config(vec![closed_apns()?]).await?;
             let service = PushService::start(config)?;
             let probe = service.inner.intake.clone();
             let clone = service.clone();
@@ -1694,7 +1698,7 @@ mod enabled {
         /// clones of the service are still held, as a relay shutdown does.
         #[tokio::test]
         async fn stopping_the_service_stops_every_task_while_clones_live() -> TestResult {
-            let (config, _dir) = config(vec![closed_apns()?, closed_fcm()?])?;
+            let (config, _dir) = config(vec![closed_apns()?, closed_fcm()?]).await?;
             let service = PushService::start(config)?;
             let clone = service.clone();
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1716,7 +1720,7 @@ mod enabled {
         async fn production_limits() -> TestResult {
             assert_eq!(PUSH_QUEUE_CAPACITY, 10_000);
             const { assert!(MAX_WAKES_PER_PUBLISH * 10 <= PUSH_QUEUE_CAPACITY) };
-            let (config, _dir) = config(Vec::new())?;
+            let (config, _dir) = config(Vec::new()).await?;
             let service = PushService::start(config)?;
             assert_eq!(service.inner.intake.max_capacity(), PUSH_QUEUE_CAPACITY);
             Ok(())
@@ -1727,7 +1731,7 @@ mod enabled {
         /// the lookup task cannot run between them.
         #[tokio::test]
         async fn notify_holds_a_routing_id_once_on_the_intake() -> TestResult {
-            let (config, _dir) = config(Vec::new())?;
+            let (config, _dir) = config(Vec::new()).await?;
             let service = PushService::start_with_limits(config, 4, 4)?;
             let push = PushRole::Enabled(service.clone());
             notify(&push, &RID);
@@ -1743,7 +1747,7 @@ mod enabled {
         /// the caller's publish succeeds.
         #[tokio::test]
         async fn full_intake_drops_and_logs() -> TestResult {
-            let (config, _dir) = config(Vec::new())?;
+            let (config, _dir) = config(Vec::new()).await?;
             let service = PushService::start_with_limits(config, 1, 4)?;
             let push = PushRole::Enabled(service.clone());
             notify(&push, &RID);
@@ -1755,7 +1759,7 @@ mod enabled {
         /// A failed registration lookup queues nothing and is logged.
         #[tokio::test]
         async fn failed_lookup_is_logged() -> TestResult {
-            let (config, dir) = config(vec![closed_apns()?])?;
+            let (config, dir) = config(vec![closed_apns()?]).await?;
             let service = PushService::start(config)?;
             let push = PushRole::Enabled(service.clone());
             register(&push, REGISTRANT_A, PushPlatform::Apns, b"t1", &[RID]).await?;
@@ -1829,7 +1833,7 @@ mod enabled {
             ])
             .await;
             let sender = webpush_sender_for(&server, true, Arc::new(scp_clock::SystemClock))?;
-            let (config, _dir) = config(vec![PushSender::WebPush(sender)])?;
+            let (config, _dir) = config(vec![PushSender::WebPush(sender)]).await?;
             let push = PushRole::Enabled(PushService::start(config)?);
             let (_, hung) = subscribe(server.endpoint("hung.example.net", "/hung"))?;
             let (_, good) = subscribe(server.endpoint("push.example.net", "/ok"))?;
@@ -1866,7 +1870,7 @@ mod enabled {
 
         /// A push service whose one sender is a real `WebPush` sender reaching
         /// `server`, with `deadline` as its request deadline.
-        fn webpush_service(
+        async fn webpush_service(
             server: &TlsTestServer,
             deadline: Duration,
         ) -> Result<(PushRole, PushService, TempDir), Box<dyn std::error::Error>> {
@@ -1876,7 +1880,7 @@ mod enabled {
                 Arc::new(scp_clock::SystemClock),
                 deadline,
             )?;
-            let (config, dir) = config(vec![PushSender::WebPush(sender)])?;
+            let (config, dir) = config(vec![PushSender::WebPush(sender)]).await?;
             let service = PushService::start(config)?;
             Ok((PushRole::Enabled(service.clone()), service, dir))
         }
@@ -2012,7 +2016,8 @@ mod enabled {
             let server =
                 TlsTestServer::start_routed(vec![("/x", (0..3).map(|_| Reply::hang()).collect())])
                     .await;
-            let (push, service, _dir) = webpush_service(&server, Duration::from_millis(300))?;
+            let (push, service, _dir) =
+                webpush_service(&server, Duration::from_millis(300)).await?;
             let token = shared_webpush_token(&push, &server).await?;
             let store = &service.config().store;
             for (sent, count) in [(1, Some(1)), (2, Some(2))] {
@@ -2051,7 +2056,8 @@ mod enabled {
                 vec![Reply::hang(), Reply::empty(201), Reply::hang()],
             )])
             .await;
-            let (push, service, _dir) = webpush_service(&server, Duration::from_millis(300))?;
+            let (push, service, _dir) =
+                webpush_service(&server, Duration::from_millis(300)).await?;
             let token = shared_webpush_token(&push, &server).await?;
             let store = &service.config().store;
             notify(&push, &RID);
@@ -2100,7 +2106,8 @@ mod enabled {
                 ],
             )])
             .await;
-            let (push, service, _dir) = webpush_service(&server, Duration::from_millis(300))?;
+            let (push, service, _dir) =
+                webpush_service(&server, Duration::from_millis(300)).await?;
             let token = shared_webpush_token(&push, &server).await?;
             let store = &service.config().store;
             for (sent, count) in [(1, Some(1)), (2, Some(2))] {
@@ -2151,7 +2158,7 @@ mod enabled {
             ])
             .await;
             let sender = webpush_sender_for(&server, true, Arc::new(scp_clock::SystemClock))?;
-            let (config, _dir) = config(vec![PushSender::WebPush(sender)])?;
+            let (config, _dir) = config(vec![PushSender::WebPush(sender)]).await?;
             let push = PushRole::Enabled(PushService::start(config)?);
             let mut tokens = Vec::new();
             for n in 0..36 {
@@ -2202,7 +2209,7 @@ mod enabled {
             ])
             .await;
             let sender = webpush_sender_for(&server, true, Arc::new(scp_clock::SystemClock))?;
-            let (config, _dir) = config(vec![PushSender::WebPush(sender)])?;
+            let (config, _dir) = config(vec![PushSender::WebPush(sender)]).await?;
             let push = PushRole::Enabled(PushService::start(config)?);
             let mut tokens = Vec::new();
             for n in 0..36 {
@@ -2258,7 +2265,7 @@ mod enabled {
             ])
             .await;
             let sender = webpush_sender_for(&server, true, Arc::new(scp_clock::SystemClock))?;
-            let (config, _dir) = config(vec![PushSender::WebPush(sender)])?;
+            let (config, _dir) = config(vec![PushSender::WebPush(sender)]).await?;
             let service = PushService::start(config)?;
             let push = PushRole::Enabled(service.clone());
             let mut tokens = Vec::new();
@@ -2464,8 +2471,8 @@ mod enabled {
         /// Thirty-two jobs wait on a full endpoint lookup pool. One freed
         /// permit restarts the oldest of them, so one send signs and seals,
         /// not thirty-two; the next freed permit restarts the next.
-        #[test]
-        fn one_freed_lookup_permit_restarts_one_held_send() {
+        #[tokio::test]
+        async fn one_freed_lookup_permit_restarts_one_held_send() {
             const HELD: usize = 32;
             let no_backoff = |_: &str| None;
             let mut waiting = Waiting::default();
@@ -2498,8 +2505,8 @@ mod enabled {
         /// A freed lookup permit is not spent on a held job its origin's cap
         /// holds: that job moves to its origin's wait, and the permit starts
         /// the next held job, to another origin.
-        #[test]
-        fn a_freed_lookup_permit_passes_over_a_capped_job() {
+        #[tokio::test]
+        async fn a_freed_lookup_permit_passes_over_a_capped_job() {
             let capped = "https://capped.example.net";
             let other = "https://other.example.net";
             let no_backoff = |_: &str| None;
@@ -2620,7 +2627,7 @@ mod enabled {
         #[tokio::test(start_paused = true)]
         async fn a_full_lookup_pool_holds_a_wake_without_a_backoff() -> TestResult {
             let server = TlsTestServer::start_routed(vec![("/ok", vec![Reply::empty(201)])]).await;
-            let (push, service, _dir) = webpush_service(&server, Duration::from_secs(5))?;
+            let (push, service, _dir) = webpush_service(&server, Duration::from_secs(5)).await?;
             let (_, good) = subscribe(server.endpoint("push.example.net", "/ok"))?;
             let token = good.encode();
             register(&push, REGISTRANT_A, PushPlatform::WebPush, &token, &[RID]).await?;
@@ -2717,7 +2724,8 @@ mod enabled {
                     store: PushRegistrationStore::open_sqlite(
                         &dir.path().join("push.db"),
                         crate::relay::push_store::PushStoreAtRest::Unkeyed,
-                    )?,
+                    )
+                    .await?,
                     queued: Arc::clone(&queued),
                     logs: Arc::new(Logs::default()),
                     stop: stop.clone(),
@@ -2775,7 +2783,8 @@ mod enabled {
                     store: PushRegistrationStore::open_sqlite(
                         &dir.path().join("push.db"),
                         crate::relay::push_store::PushStoreAtRest::Unkeyed,
-                    )?,
+                    )
+                    .await?,
                     queued: Arc::clone(&queued),
                     logs: Arc::new(Logs::default()),
                     stop: stop.clone(),
@@ -2820,7 +2829,7 @@ mod enabled {
                 outcomes: &[PushSendOutcome],
             ) -> Result<(PushService, TempDir), Box<dyn std::error::Error>> {
                 let sender = RecordingSender::new(PushPlatform::Apns, outcomes.iter().copied());
-                let (config, dir) = config(vec![recording(&sender)])?;
+                let (config, dir) = config(vec![recording(&sender)]).await?;
                 let service = PushService::start(config)?;
                 let push = PushRole::Enabled(service.clone());
                 register(&push, REGISTRANT_A, PushPlatform::Apns, b"t1", &[RID]).await?;
@@ -2844,7 +2853,7 @@ mod enabled {
                 use PushSendOutcome::Delivered;
                 let apns = RecordingSender::new(PushPlatform::Apns, [Delivered, Delivered]);
                 let fcm = RecordingSender::new(PushPlatform::Fcm, [Delivered]);
-                let (config, _dir) = config(vec![recording(&apns), recording(&fcm)])?;
+                let (config, _dir) = config(vec![recording(&apns), recording(&fcm)]).await?;
                 let push = PushRole::Enabled(PushService::start(config)?);
                 register(&push, REGISTRANT_A, PushPlatform::Apns, b"t1", &[RID]).await?;
                 register(&push, REGISTRANT_B, PushPlatform::Apns, b"t1", &[RID]).await?;
@@ -2935,7 +2944,7 @@ mod enabled {
                     PushPlatform::Apns,
                     [InvalidToken, InvalidToken, Delivered, InvalidToken],
                 );
-                let (config, dir) = config(vec![recording(&sender)])?;
+                let (config, dir) = config(vec![recording(&sender)]).await?;
                 let service = PushService::start(config)?;
                 let push = PushRole::Enabled(service.clone());
                 let store = service.config().store.clone();
@@ -2981,7 +2990,7 @@ mod enabled {
                     PushPlatform::Apns,
                     [InvalidToken, InvalidToken, Delivered],
                 );
-                let (config, dir) = config(vec![recording(&sender)])?;
+                let (config, dir) = config(vec![recording(&sender)]).await?;
                 let store = config.store.clone();
                 let service = PushService::start(config.clone())?;
                 let push = PushRole::Enabled(service.clone());
@@ -3030,7 +3039,7 @@ mod enabled {
             async fn a_failed_clear_holds_wakes_until_it_lands() -> TestResult {
                 use PushSendOutcome::Delivered;
                 let sender = RecordingSender::new(PushPlatform::Apns, [Delivered]);
-                let (config, dir) = config(vec![recording(&sender)])?;
+                let (config, dir) = config(vec![recording(&sender)]).await?;
                 let registering = PushRole::Enabled(PushService::start(config.clone())?);
                 register(
                     &registering,
@@ -3064,7 +3073,7 @@ mod enabled {
             #[tokio::test]
             async fn job_without_a_sender_is_logged() -> TestResult {
                 let fcm = RecordingSender::new(PushPlatform::Fcm, []);
-                let (before, _dir) = config(vec![recording(&fcm)])?;
+                let (before, _dir) = config(vec![recording(&fcm)]).await?;
                 let registering = PushRole::Enabled(PushService::start(before.clone())?);
                 register(&registering, REGISTRANT_A, PushPlatform::Fcm, b"t1", &[RID]).await?;
                 drop(registering);
@@ -3096,7 +3105,7 @@ mod enabled {
                 use PushSendOutcome::Delivered;
                 let (apns, gate) = RecordingSender::gated(PushPlatform::Apns, [Delivered; 2]);
                 let fcm = RecordingSender::new(PushPlatform::Fcm, [Delivered; 2]);
-                let (config, _dir) = config(vec![recording(&apns), recording(&fcm)])?;
+                let (config, _dir) = config(vec![recording(&apns), recording(&fcm)]).await?;
                 let push = PushRole::Enabled(PushService::start(config)?);
                 register(&push, REGISTRANT_A, PushPlatform::Apns, b"apns", &[RID]).await?;
                 register(&push, REGISTRANT_A, PushPlatform::Fcm, b"fcm", &[RID]).await?;
@@ -3120,7 +3129,7 @@ mod enabled {
                 use PushSendOutcome::{Delivered, Transient};
                 let apns = RecordingSender::new(PushPlatform::Apns, [Transient, Delivered]);
                 let fcm = RecordingSender::new(PushPlatform::Fcm, [Delivered; 2]);
-                let (config, _dir) = config(vec![recording(&apns), recording(&fcm)])?;
+                let (config, _dir) = config(vec![recording(&apns), recording(&fcm)]).await?;
                 let push = PushRole::Enabled(PushService::start(config)?);
                 register(&push, REGISTRANT_A, PushPlatform::Apns, b"apns", &[RID]).await?;
                 register(&push, REGISTRANT_A, PushPlatform::Fcm, b"fcm", &[RID]).await?;
@@ -3164,7 +3173,7 @@ mod enabled {
                 const U: RoutingId = [0x55; 32];
                 let (webpush, gate) =
                     RecordingSender::gated(PushPlatform::WebPush, [InvalidToken; 8]);
-                let (config, _dir) = config(vec![recording(&webpush)])?;
+                let (config, _dir) = config(vec![recording(&webpush)]).await?;
                 let service = PushService::start(config)?;
                 let push = PushRole::Enabled(service.clone());
                 let (_, t) = subscribe("https://push.example.net/t".to_owned())?;
@@ -3217,7 +3226,7 @@ mod enabled {
                 const C: RoutingId = [0xC0; 32];
                 let (apns, gate): (RecordingSender, RecordingGate) =
                     RecordingSender::gated(PushPlatform::Apns, [PushSendOutcome::Delivered; 16]);
-                let (config, _dir) = config(vec![recording(&apns)])?;
+                let (config, _dir) = config(vec![recording(&apns)]).await?;
                 let service = PushService::start_with_limits(config, 4, 2)?;
                 let push = PushRole::Enabled(service.clone());
                 register(&push, REGISTRANT_A, PushPlatform::Apns, b"c0", &[C]).await?;
@@ -3259,7 +3268,7 @@ mod enabled {
                 const B: RoutingId = [0xB0; 32];
                 let (apns, gate) =
                     RecordingSender::gated(PushPlatform::Apns, [PushSendOutcome::Delivered; 4]);
-                let (config, _dir) = config(vec![recording(&apns)])?;
+                let (config, _dir) = config(vec![recording(&apns)]).await?;
                 let service = PushService::start_with_limits(config, 1, 8)?;
                 let push = PushRole::Enabled(service.clone());
                 register(&push, REGISTRANT_A, PushPlatform::Apns, b"t0", &[RID]).await?;
@@ -3386,7 +3395,8 @@ pub(crate) mod wake_harness {
             store: PushRegistrationStore::open_sqlite(
                 &dir.path().join("push.db"),
                 crate::relay::push_store::PushStoreAtRest::Unkeyed,
-            )?,
+            )
+            .await?,
             verifier: Arc::new(TestPushVerifier::new([(
                 DID::from(REGISTRANT),
                 signer.public_key(),

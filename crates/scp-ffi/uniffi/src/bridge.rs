@@ -7832,13 +7832,8 @@ async fn open_custody_for_create(
     let built = match decided {
         DecidedCustody::Built(built) => built,
         DecidedCustody::OpenFile(inputs) => {
-            let opened = tokio::task::spawn_blocking(move || inputs.open())
-                .await
-                .map_err(|e| ScpError::Identity {
-                    msg: format!("the task opening the encrypted key file failed: {e}"),
-                    code: codes::IDENT_1008.to_owned(),
-                })?
-                .map_err(|e| file_custody_error(&e))?;
+            // `FileCustodyInputs::open` runs on tokio's blocking pool.
+            let opened = inputs.open().await.map_err(|e| file_custody_error(&e))?;
             UniffiKeyCustody::File(opened)
         }
     };
@@ -19932,8 +19927,8 @@ mod tests {
     /// be created is `SCP-IDENT-1008`. The inputs go through
     /// `resolve_file_custody_inputs_from`, so the test sets no environment
     /// variable and runs on every build.
-    #[test]
-    fn file_custody_error_codes_every_encrypted_file_failure() {
+    #[tokio::test]
+    async fn file_custody_error_codes_every_encrypted_file_failure() {
         use scp_ffi_common::custody_file::resolve_file_custody_inputs_from;
         let passphrase = || Some(Zeroizing::new("uniffi-file-custody-passphrase".to_owned()));
         let base = tempfile::tempdir().expect("tempdir");
@@ -19979,6 +19974,7 @@ mod tests {
             resolve_file_custody_inputs_from(passphrase(), Some(home_is_a_file.as_os_str()))
                 .expect("an absolute HOME and a passphrase resolve")
                 .open()
+                .await
                 .expect_err("a HOME naming a file holds no key directory");
         match file_custody_error(&error) {
             ScpError::Identity { code, msg } => assert_eq!(code, codes::IDENT_1008, "{msg}"),
