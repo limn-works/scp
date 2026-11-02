@@ -94,7 +94,7 @@ impl PushReservation {
     ///
     /// # Errors
     ///
-    /// [`PushMessageError::InvalidRelayUrl`] when `url` has no §9.18.2
+    /// [`PushMessageError::InvalidNodeUrl`] when `url` has no §9.18.2
     /// canonical form.
     pub fn new(url: &str) -> Result<Self, PushMessageError> {
         Ok(Self::from(PushRelay::direct(url)?))
@@ -1293,7 +1293,7 @@ mod tests {
         );
         assert!(matches!(
             PushReservation::new("https://relay.example"),
-            Err(PushMessageError::InvalidRelayUrl(_))
+            Err(PushMessageError::InvalidNodeUrl(_))
         ));
     }
 

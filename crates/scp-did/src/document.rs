@@ -35,7 +35,7 @@
 //! See ADR-003 and ADR-039 in `.docs/adrs/phase-1.md`.
 
 use super::attestation::{IdentityLinkServiceEntry, ScpKeyCustodyAttestation};
-use crate::node_url::{BridgeEndpoint, NodeUrl, RelayEntryUrlError};
+use crate::node_url::{BridgeEndpoint, NodeEntryUrlError, NodeUrl};
 use serde::{Deserialize, Deserializer, Serialize};
 
 /// Synchronous, wasm-safe errors produced by the DID-document, verification-
@@ -70,12 +70,12 @@ pub enum DidError {
     /// A relay URL fails `18-addressability-and-deployment.md` §18.2.1: it
     /// has no `09-security-model.md` §9.18.2 canonical form, its canonical
     /// path does not end in `/scp/v1`, or it names a bridge relay over `ws`.
-    #[error("invalid relay URL {url:?}: {reason}")]
-    InvalidRelayUrl {
+    #[error("invalid node URL {url:?}: {reason}")]
+    InvalidNodeUrl {
         /// The rejected URL with any user information removed.
         url: String,
         /// Which rule the URL fails.
-        reason: RelayEntryUrlError,
+        reason: NodeEntryUrlError,
     },
 
     /// A relay entry's `bridgeTarget` equals `SHA-256(0x00)`, the bytes
@@ -1751,7 +1751,7 @@ fn parse_broadcast_context_endpoint(endpoint: &str) -> Option<(String, Vec<Strin
 )]
 mod tests {
     use super::*;
-    use crate::node_url::RelayUrlError;
+    use crate::node_url::NodeUrlError;
 
     #[test]
     fn document_has_correct_structure() {
@@ -1862,11 +1862,11 @@ mod tests {
         }
     }
 
-    /// The reason of a [`DidError::InvalidRelayUrl`], or `None` for any other
+    /// The reason of a [`DidError::InvalidNodeUrl`], or `None` for any other
     /// result.
-    fn url_reason<T>(result: &Result<T, DidError>) -> Option<RelayEntryUrlError> {
+    fn url_reason<T>(result: &Result<T, DidError>) -> Option<NodeEntryUrlError> {
         match result {
-            Err(DidError::InvalidRelayUrl { reason, .. }) => Some(*reason),
+            Err(DidError::InvalidNodeUrl { reason, .. }) => Some(*reason),
             _ => None,
         }
     }
@@ -1938,8 +1938,8 @@ mod tests {
         ] {
             assert_eq!(
                 url_reason(&NodeUrl::new(url)),
-                Some(RelayEntryUrlError::Canonical(
-                    RelayUrlError::UnsupportedScheme
+                Some(NodeEntryUrlError::Canonical(
+                    NodeUrlError::UnsupportedScheme
                 )),
                 "{url}"
             );
@@ -1967,7 +1967,7 @@ mod tests {
         ] {
             assert_eq!(
                 url_reason(&NodeUrl::new(url)),
-                Some(RelayEntryUrlError::PathNotScpV1),
+                Some(NodeEntryUrlError::PathNotScpV1),
                 "{url}"
             );
         }
@@ -1979,22 +1979,22 @@ mod tests {
     fn relay_endpoint_new_rejects_query_fragment_and_userinfo() {
         let query = format!("{BRIDGE_URL}?bridge_target={}", "ab".repeat(32));
         for (url, want) in [
-            (query.as_str(), RelayUrlError::QueryOrFragment),
+            (query.as_str(), NodeUrlError::QueryOrFragment),
             (
                 "wss://bridge.example.com/scp/v1#x",
-                RelayUrlError::QueryOrFragment,
+                NodeUrlError::QueryOrFragment,
             ),
-            ("wss://u@h/scp/v1", RelayUrlError::UserInfo),
+            ("wss://u@h/scp/v1", NodeUrlError::UserInfo),
         ] {
             assert_eq!(
                 url_reason(&NodeUrl::new(url)),
-                Some(RelayEntryUrlError::Canonical(want)),
+                Some(NodeEntryUrlError::Canonical(want)),
                 "{url}"
             );
         }
         // The error never repeats user information.
         let err = NodeUrl::new("wss://user:secret@h.example/scp/v1").unwrap_err();
-        let DidError::InvalidRelayUrl { url, .. } = &err else {
+        let DidError::InvalidNodeUrl { url, .. } = &err else {
             panic!("{err:?}");
         };
         assert_eq!(url, "wss://h.example/scp/v1");
@@ -2015,11 +2015,11 @@ mod tests {
     fn bridge_endpoint_rejects_plaintext_ws() {
         assert_eq!(
             url_reason(&BridgeEndpoint::new("ws://bridge.example.com/scp/v1")),
-            Some(RelayEntryUrlError::PlaintextBridge)
+            Some(NodeEntryUrlError::PlaintextBridge)
         );
         assert_eq!(
             url_reason(&BridgeEndpoint::new("ws://192.0.2.7:8080/scp/v1")),
-            Some(RelayEntryUrlError::PlaintextBridge)
+            Some(NodeEntryUrlError::PlaintextBridge)
         );
         assert_eq!(
             BridgeEndpoint::new(BRIDGE_URL).unwrap().as_str(),

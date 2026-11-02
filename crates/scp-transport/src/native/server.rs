@@ -767,8 +767,8 @@ pub enum RelayError {
     /// The URL a caller built for the relay has no §9.18.2 canonical form, so
     /// the relay could not derive its reserved push routing ID (§10.7.1
     /// step 2).
-    #[error("invalid relay URL: {0}")]
-    InvalidRelayUrl(#[from] scp_protocol::discovery::push::PushMessageError),
+    #[error("invalid node URL: {0}")]
+    InvalidNodeUrl(#[from] scp_protocol::discovery::push::PushMessageError),
 }
 
 /// Background task that periodically purges expired blobs and reclaims stale

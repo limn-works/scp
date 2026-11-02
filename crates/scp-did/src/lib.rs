@@ -46,9 +46,7 @@ pub use key_state::{
     CommitmentEntry, CustodyType, DiscriminatorKind, FixedCommitment, KeyAlgorithm, KeyCondition,
     KeyEntry, KeyRole, KeyState, StandingCommitment, UnknownDiscriminator,
 };
-pub use node_url::{
-    BridgeEndpoint, NodeUrl, RelayEntryUrlError, RelayUrlError, canonical_relay_url,
-};
+pub use node_url::{BridgeEndpoint, NodeEntryUrlError, NodeUrl, NodeUrlError, canonical_node_url};
 
 use serde::{Deserialize, Serialize};
 use std::fmt;

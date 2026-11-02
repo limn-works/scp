@@ -1152,9 +1152,9 @@ fn relay_set_writes_store_canonical_relay_urls() {
         fn_body_contains(
             LIFECYCLE_HELPERS_SRC,
             "normalize_relay_urls",
-            "canonical_relay_url("
+            "canonical_node_url("
         ),
-        "normalize_relay_urls must map each relay URL through canonical_relay_url"
+        "normalize_relay_urls must map each relay URL through canonical_node_url"
     );
     for entry in ["create_context", "import_context", "restore_context"] {
         assert!(
@@ -1515,7 +1515,7 @@ fn push_routing_ids_reach_push_helpers_through_the_actor_mailbox() {
         "Supervisor::push_routing_ids must enumerate known_context_ids, so a context whose actor is down fails the query"
     );
     assert!(
-        fn_body_contains(SUPERVISOR_SRC, "push_routing_ids", "canonical_relay_url("),
+        fn_body_contains(SUPERVISOR_SRC, "push_routing_ids", "canonical_node_url("),
         "Supervisor::push_routing_ids must group by the canonical relay URL"
     );
     assert!(

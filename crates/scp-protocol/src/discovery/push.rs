@@ -30,8 +30,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use scp_did::{
-    ABSENT_BRIDGE_TARGET, BridgeTarget, DID, NodeUrl, RelayService, RelayUrlError,
-    canonical_relay_url,
+    ABSENT_BRIDGE_TARGET, BridgeTarget, DID, NodeUrl, NodeUrlError, RelayService,
+    canonical_node_url,
 };
 
 use crate::crypto::canonical::{CanonicalError, CanonicalField, canonical_hash_bytes};
@@ -77,7 +77,7 @@ pub const PUSH_TIMESTAMP_SKEW_SECS: u64 = 300;
 /// A relay that offers push answers every variant that a received message
 /// causes with `4060` `PUSH_REGISTRATION_REJECTED` (ADR-004: "the message does
 /// not decode, or a registration's `routing_ids` list is empty").
-/// [`PushMessageError::InvalidRelayUrl`] names a relay URL the caller
+/// [`PushMessageError::InvalidNodeUrl`] names a relay URL the caller
 /// supplied, never a field of the message.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PushMessageError {
@@ -111,8 +111,8 @@ pub enum PushMessageError {
     #[error("push message token is empty")]
     EmptyToken,
     /// The relay URL has no §9.18.2 canonical form.
-    #[error("invalid relay URL: {0}")]
-    InvalidRelayUrl(#[from] RelayUrlError),
+    #[error("invalid node URL: {0}")]
+    InvalidNodeUrl(#[from] NodeUrlError),
     /// A length-prefixed field exceeded the 4-byte length prefix (§9.5.1).
     #[error("push preimage field too large: {0}")]
     FieldTooLarge(#[from] CanonicalError),
@@ -341,16 +341,16 @@ pub struct PushRelay {
 impl PushRelay {
     /// A relay reached at its `"scp-push-registration"` push routing ID,
     /// with no tier 3 target. `url` is canonicalized with
-    /// [`canonical_relay_url`], so every spelling of one relay URL yields one
+    /// [`canonical_node_url`], so every spelling of one relay URL yields one
     /// value.
     ///
     /// # Errors
     ///
-    /// [`PushMessageError::InvalidRelayUrl`] when `url` has no §9.18.2
+    /// [`PushMessageError::InvalidNodeUrl`] when `url` has no §9.18.2
     /// canonical form.
     pub fn direct(url: &str) -> Result<Self, PushMessageError> {
         Ok(Self {
-            canonical: canonical_relay_url(url)?,
+            canonical: canonical_node_url(url)?,
             bridge_target: None,
         })
     }
@@ -491,16 +491,16 @@ pub fn push_deregistration_signing_bytes(
 ///
 /// # Errors
 ///
-/// Returns [`PushMessageError::InvalidRelayUrl`] when `relay_url` has no
+/// Returns [`PushMessageError::InvalidNodeUrl`] when `relay_url` has no
 /// canonical form.
 pub fn push_registration_routing_id(relay_url: &str) -> Result<[u8; 32], PushMessageError> {
-    Ok(routing_id_of_canonical(&canonical_relay_url(relay_url)?))
+    Ok(routing_id_of_canonical(&canonical_node_url(relay_url)?))
 }
 
 /// [`push_registration_routing_id`] for a [`NodeUrl`], which already
 /// holds the §9.18.2 canonical form, so the derivation cannot fail.
 #[must_use]
-pub fn relay_endpoint_push_routing_id(endpoint: &NodeUrl) -> [u8; 32] {
+pub fn node_url_push_routing_id(endpoint: &NodeUrl) -> [u8; 32] {
     routing_id_of_canonical(endpoint.as_str())
 }
 
@@ -511,7 +511,7 @@ pub fn relay_endpoint_push_routing_id(endpoint: &NodeUrl) -> [u8; 32] {
 /// `endpoint` is the entry's URL, the bridge relay's own, which a
 /// [`NodeUrl`] already holds in canonical form, and `target` is the
 /// entry's `bridgeTarget`. The result never equals the bridge relay's own
-/// `"scp-push-registration"` ID ([`relay_endpoint_push_routing_id`]).
+/// `"scp-push-registration"` ID ([`node_url_push_routing_id`]).
 #[must_use]
 pub fn tier3_push_routing_id(endpoint: &NodeUrl, target: BridgeTarget) -> [u8; 32] {
     tier3_routing_id_of_canonical(endpoint.as_str(), target)
@@ -521,11 +521,11 @@ pub fn tier3_push_routing_id(endpoint: &NodeUrl, target: BridgeTarget) -> [u8; 3
 ///
 /// An entry that carries a `bridgeTarget` takes the tier 3 form
 /// ([`tier3_push_routing_id`]), and one that does not takes the
-/// `"scp-push-registration"` form ([`relay_endpoint_push_routing_id`]).
+/// `"scp-push-registration"` form ([`node_url_push_routing_id`]).
 #[must_use]
 pub fn relay_service_push_routing_id(relay: &RelayService) -> [u8; 32] {
     relay.bridge_target().map_or_else(
-        || relay_endpoint_push_routing_id(relay.endpoint()),
+        || node_url_push_routing_id(relay.endpoint()),
         |target| tier3_push_routing_id(relay.endpoint(), target),
     )
 }
@@ -1235,8 +1235,8 @@ mod tests {
     fn push_relay_direct_refuses_a_url_with_no_canonical_form() {
         assert_eq!(
             PushRelay::direct("https://r.example"),
-            Err(PushMessageError::InvalidRelayUrl(
-                RelayUrlError::UnsupportedScheme
+            Err(PushMessageError::InvalidNodeUrl(
+                NodeUrlError::UnsupportedScheme
             ))
         );
     }
@@ -1346,17 +1346,17 @@ mod tests {
         assert_eq!(a, want);
         assert_eq!(
             push_registration_routing_id("ftp://relay.example"),
-            Err(PushMessageError::InvalidRelayUrl(
-                RelayUrlError::UnsupportedScheme
+            Err(PushMessageError::InvalidNodeUrl(
+                NodeUrlError::UnsupportedScheme
             ))
         );
     }
 
     #[test]
-    fn relay_endpoint_push_routing_id_matches_the_string_derivation() {
+    fn node_url_push_routing_id_matches_the_string_derivation() {
         let endpoint = NodeUrl::new("WSS://Relay.Example:443/scp/v1/").unwrap();
         assert_eq!(
-            relay_endpoint_push_routing_id(&endpoint),
+            node_url_push_routing_id(&endpoint),
             push_registration_routing_id("wss://relay.example/scp/v1").unwrap()
         );
     }
@@ -1434,7 +1434,7 @@ mod tests {
         let printable = *b"abcdefghijklmnopqrstuvwxyz012345";
         let extended = format!("{BRIDGE_URL}{}", std::str::from_utf8(&printable).unwrap());
         // The extended string is a relay URL with a canonical form of its own.
-        assert_eq!(canonical_relay_url(&extended).unwrap(), extended);
+        assert_eq!(canonical_node_url(&extended).unwrap(), extended);
         let registration_id = push_registration_routing_id(&extended).unwrap();
         // Control: appending the target to the "scp-push-registration" form
         // would collide with that URL's own ID.
