@@ -55,7 +55,7 @@ pub enum FileCustodyError {
         /// What the filesystem reported.
         message: String,
     },
-    /// `FileKeyCustody::new` rejected the key file: a wrong passphrase, a
+    /// `FileKeyCustody::open` rejected the key file: a wrong passphrase, a
     /// version this build rejects, a failed integrity check, or an I/O error.
     Open {
         /// Key file this process tried to open.
@@ -177,21 +177,42 @@ impl FileCustodyInputs {
     /// Creates the key directory, then opens (or creates) `keys.bin` in it
     /// under the resolved passphrase.
     ///
+    /// Both steps run on `runtime`'s blocking pool: the open runs an Argon2id
+    /// derivation that takes seconds in an unoptimized build, and every
+    /// bridge calls this function from an async function. The custody this
+    /// returns keeps `runtime` for every later key operation, so a bridge
+    /// passes the handle of its process-wide runtime. Dropping the returned
+    /// future leaves the open running to completion, which leaves either a
+    /// complete key file or none (see `FileKeyCustody::open`).
+    ///
     /// # Errors
     ///
     /// Returns [`FileCustodyError::DirectoryCreate`] when the directory cannot
     /// be created and [`FileCustodyError::Open`] when `scp-platform` rejects
-    /// the key file.
-    pub fn open(self) -> Result<FileKeyCustody, FileCustodyError> {
-        std::fs::create_dir_all(&self.key_dir).map_err(|e| FileCustodyError::DirectoryCreate {
-            path: self.key_dir.clone(),
-            message: e.to_string(),
-        })?;
+    /// the key file or a blocking task fails.
+    pub async fn open(
+        self,
+        runtime: tokio::runtime::Handle,
+    ) -> Result<FileKeyCustody, FileCustodyError> {
         let key_path = self.key_path();
-        FileKeyCustody::new(&key_path, &self.passphrase).map_err(|e| FileCustodyError::Open {
-            path: key_path,
-            message: e.to_string(),
-        })
+        let key_dir = self.key_dir.clone();
+        runtime
+            .spawn_blocking(move || std::fs::create_dir_all(&key_dir))
+            .await
+            .map_err(|e| FileCustodyError::DirectoryCreate {
+                path: self.key_dir.clone(),
+                message: format!("the task creating the key directory failed: {e}"),
+            })?
+            .map_err(|e| FileCustodyError::DirectoryCreate {
+                path: self.key_dir.clone(),
+                message: e.to_string(),
+            })?;
+        FileKeyCustody::open(&key_path, &self.passphrase, runtime)
+            .await
+            .map_err(|e| FileCustodyError::Open {
+                path: key_path,
+                message: e.to_string(),
+            })
     }
 }
 
@@ -255,12 +276,22 @@ mod tests {
     }
 
     /// Resolution touches no file; opening creates the directory and the key
-    /// file.
+    /// file, and both run on the blocking pool.
+    ///
+    /// The open runs under
+    /// `scp_platform::testing::blocking_pool::drive_while_the_blocking_pool_is_held`,
+    /// whose observer checks the key directory while the pool's only thread is
+    /// held. Creating the directory inline, outside the blocking task, makes it
+    /// exist then and fails `!observed`; running the whole open inline makes it
+    /// finish while the pool is held and fails `!finished_while_held`.
     #[test]
-    fn resolution_creates_nothing_and_open_creates_the_key_file() {
-        let base =
-            std::env::temp_dir().join(format!("scp-test-custody-file-open-{}", std::process::id()));
-        let home = base.join("home");
+    fn resolution_creates_nothing_and_open_creates_the_key_file_on_the_blocking_pool() {
+        use scp_platform::testing::blocking_pool::{
+            blocking_pool_of_one, drive_while_the_blocking_pool_is_held,
+        };
+
+        let base = tempfile::tempdir().expect("create a temporary directory");
+        let home = base.path().join("home");
         let inputs = resolve_file_custody_inputs_from(Some(passphrase()), Some(home.as_os_str()))
             .expect("valid inputs");
         assert!(
@@ -269,12 +300,72 @@ mod tests {
             home.display()
         );
 
+        let key_dir = home.join(".scp");
         let key_path = inputs.key_path();
-        let opened = inputs.open();
-        let created = key_path.is_file();
-        let _ = std::fs::remove_dir_all(&base);
-        opened.expect("open creates the key file");
-        assert!(created, "open must create {}", key_path.display());
+        let runtime = blocking_pool_of_one().expect("build the probe runtime");
+        let outcome = runtime
+            .block_on(drive_while_the_blocking_pool_is_held(
+                inputs.open(runtime.handle().clone()),
+                || key_dir.exists(),
+            ))
+            .expect("run the probe");
+        assert!(
+            !outcome.finished_while_held,
+            "the open ran on the thread polling it"
+        );
+        assert!(
+            !outcome.observed,
+            "the key directory was created on the thread polling the open"
+        );
+        outcome.output.expect("open creates the key file");
+        assert!(
+            key_path.is_file(),
+            "open must create {}",
+            key_path.display()
+        );
+    }
+
+    /// An open waiting on a key file another process reserved runs on the
+    /// blocking pool.
+    ///
+    /// A zero-byte `keys.bin` makes the open poll for up to 10 s while the
+    /// process that reserved it finishes writing. With the pool's only thread
+    /// held the open cannot start; the observer then writes a one-byte header
+    /// of an unknown format version over the reservation, so the released open
+    /// reads it and fails at once. Run inline, the open finishes on its first
+    /// poll, after the whole 10 s wait, and fails `!finished_while_held`.
+    #[test]
+    fn an_open_waiting_on_a_reserved_key_file_runs_on_the_blocking_pool() {
+        use scp_platform::testing::blocking_pool::{
+            blocking_pool_of_one, drive_while_the_blocking_pool_is_held,
+        };
+
+        let base = tempfile::tempdir().expect("create a temporary directory");
+        let home = base.path().join("home");
+        let inputs = resolve_file_custody_inputs_from(Some(passphrase()), Some(home.as_os_str()))
+            .expect("valid inputs");
+        let key_path = inputs.key_path();
+        std::fs::create_dir_all(home.join(".scp")).expect("create the key directory");
+        std::fs::write(&key_path, b"").expect("reserve keys.bin");
+
+        let runtime = blocking_pool_of_one().expect("build the probe runtime");
+        let outcome = runtime
+            .block_on(drive_while_the_blocking_pool_is_held(
+                inputs.open(runtime.handle().clone()),
+                || std::fs::write(&key_path, [0xFF]).expect("write an unknown header"),
+            ))
+            .expect("run the probe");
+        assert!(
+            !outcome.finished_while_held,
+            "the open ran on the thread polling it"
+        );
+        match outcome.output {
+            Err(FileCustodyError::Open { message, .. }) => assert!(
+                message.contains("unsupported key file version"),
+                "the open must read the header written while the pool was held: {message}"
+            ),
+            other => panic!("expected an Open error naming the version, got {other:?}"),
+        }
     }
 
     /// Every message names the variable or path its caller acts on.

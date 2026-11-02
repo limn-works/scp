@@ -30,12 +30,13 @@ struct Arm {
     _dir: Option<TempDir>,
 }
 
-fn sqlite_arm() -> Result<Arm, Box<dyn std::error::Error>> {
+async fn sqlite_arm() -> Result<Arm, Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let store = PushRegistrationStore::open_sqlite(
         &dir.path().join("push.db"),
         scp_transport::relay::push_store::PushStoreAtRest::Unkeyed,
-    )?;
+    )
+    .await?;
     assert!(matches!(store, PushRegistrationStore::Sqlite(_)));
     Ok(Arm {
         store,
@@ -745,7 +746,7 @@ macro_rules! both_arms {
             $(
                 #[tokio::test]
                 async fn $name() -> Result<(), Box<dyn std::error::Error>> {
-                    let arm = super::sqlite_arm()?;
+                    let arm = super::sqlite_arm().await?;
                     super::$name(arm.store.clone()).await?;
                     Ok(())
                 }
@@ -795,7 +796,8 @@ async fn sqlite_arm_keeps_registrations_across_reopen() -> Result<(), Box<dyn st
         let store = PushRegistrationStore::open_sqlite(
             &path,
             scp_transport::relay::push_store::PushStoreAtRest::Unkeyed,
-        )?;
+        )
+        .await?;
         store.upsert(one.clone()).await?;
         store.upsert(two.clone()).await?;
         store
@@ -812,7 +814,8 @@ async fn sqlite_arm_keeps_registrations_across_reopen() -> Result<(), Box<dyn st
     let store = PushRegistrationStore::open_sqlite(
         &path,
         scp_transport::relay::push_store::PushStoreAtRest::Unkeyed,
-    )?;
+    )
+    .await?;
     assert!(matches!(store, PushRegistrationStore::Sqlite(_)));
     assert_eq!(store.get(&one.key()).await?, Some(one.clone()));
     assert_eq!(store.get(&two.key()).await?, Some(two.clone()));

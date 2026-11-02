@@ -24,12 +24,17 @@ use scp_platform::file::FileKeyCustody;
 /// `crates/scp-platform/tests/conformance_sqlite.rs`, because
 /// `key_custody_conformance!` binds its factory expression inside each test
 /// body and keeps no guard of its own.
-fn make_file_key_custody() -> FileKeyCustody {
+async fn make_file_key_custody() -> FileKeyCustody {
     let dir = tempfile::tempdir().expect("tempdir should succeed");
     let path = dir.path().join("keys.scp");
     let _ = Box::leak(Box::new(dir));
-    FileKeyCustody::new(&path, "conformance-passphrase")
-        .expect("FileKeyCustody::new should succeed")
+    FileKeyCustody::open(
+        &path,
+        "conformance-passphrase",
+        tokio::runtime::Handle::current(),
+    )
+    .await
+    .expect("FileKeyCustody::open should succeed")
 }
 
-scp_testing::key_custody_conformance!(make_file_key_custody());
+scp_testing::key_custody_conformance!(make_file_key_custody().await);

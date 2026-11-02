@@ -784,16 +784,19 @@ fn node_start_local_on(
     // instance was built without a storage selection, rather than letting a
     // node open a store of its own (SCP-CAPSEL-8000, spec §17.6).
     let storage = crate::runtime::get_storage(bi)?.clone();
+    // The node's key custody keeps this handle for every key operation, so
+    // its key-file work runs on the process-wide runtime's blocking pool.
+    let runtime = crate::runtime()?.handle().clone();
     let inner = crate::actor_wait::block_on_released(py, async {
         let data_dir = std::path::Path::new(&data_dir);
         match storage {
             crate::runtime::StorageProvider::InMemoryEncrypted(s) => {
-                server::start_node_local(data_dir, s, node_identity, zeroized_passphrase)
+                server::start_node_local(data_dir, s, node_identity, zeroized_passphrase, runtime)
                     .await
                     .map(RunningNode::InMemoryEncrypted)
             }
             crate::runtime::StorageProvider::Sqlite(s) => {
-                server::start_node_local(data_dir, s, node_identity, zeroized_passphrase)
+                server::start_node_local(data_dir, s, node_identity, zeroized_passphrase, runtime)
                     .await
                     .map(RunningNode::Sqlite)
             }

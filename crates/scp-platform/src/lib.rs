@@ -42,6 +42,10 @@ pub mod apple;
 // The Rust-side custody record that fixes a callback key's type and role
 // (spec §17.3 `custody/record/{namespace}/{key_id}`; SCP-345).
 pub mod custody_record;
+// The one atomic, durable writer of small secret files (key file, salt,
+// storage key): temp file at 0600, fsync, rename or link, directory fsync.
+#[cfg(any(feature = "file", feature = "sqlite"))]
+pub mod durable_file;
 pub mod encrypted;
 #[cfg(feature = "encrypting")]
 pub mod encrypting_adapter;

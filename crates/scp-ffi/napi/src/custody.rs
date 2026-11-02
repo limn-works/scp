@@ -1260,7 +1260,7 @@ impl CustodySelection {
     /// Returns `SCP-IDENT-1008` when `encrypted_file`'s key directory cannot
     /// be created or `FileKeyCustody` rejects the key file.
     #[cfg(feature = "testing")]
-    pub(crate) fn open(self) -> Result<std::sync::Arc<NapiKeyCustody>, ScpNapiError> {
+    pub(crate) async fn open(self) -> Result<std::sync::Arc<NapiKeyCustody>, ScpNapiError> {
         use scp_platform::testing::InMemoryKeyCustody;
 
         let custody = match self {
@@ -1273,9 +1273,15 @@ impl CustodySelection {
                 });
                 NapiKeyCustody::InMemory(Box::new(OpaqueInMemoryKeyCustody(in_memory)))
             }
-            Self::EncryptedFile(inputs) => {
-                NapiKeyCustody::File(inputs.open().map_err(|e| ScpNapiError::from(&e))?)
-            }
+            // `FileCustodyInputs::open` runs the directory creation and the
+            // Argon2id derivation on the process runtime's blocking pool, so
+            // this async caller's worker thread stays free while they run.
+            Self::EncryptedFile(inputs) => NapiKeyCustody::File(
+                inputs
+                    .open(crate::runtime().handle().clone())
+                    .await
+                    .map_err(|e| ScpNapiError::from(&e))?,
+            ),
             Self::OsKeystore(custody) => custody,
         };
         Ok(std::sync::Arc::new(custody))

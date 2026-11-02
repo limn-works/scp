@@ -23,12 +23,13 @@ use std::sync::Arc;
 
 use axum::response::IntoResponse;
 use axum::routing::get;
-use scp_clock::SystemClock;
-use scp_dht::PkarrDhtClient;
-use scp_identity::{DidDht, SequenceStore, dht::IdentityError};
-use scp_node::{ApplicationNodeBuilder, TlsProvider};
+use scp_identity::{DidCache, SequenceStore};
+use scp_node::self_host::{
+    build_production_did_method, open_sqlite, resolve_storage_key_file, validate_storage_path,
+    StorageSequenceStore,
+};
+use scp_node::{DhtMode, IdentitySource, Node, NodeConfig, Reach, TlsMode, TlsProvider};
 use scp_platform::sqlite::{SqliteKeyCustody, SqliteStorage};
-use scp_platform::traits::Storage;
 use scp_transport::native::storage::BlobStorageBackend;
 use tracing_subscriber::EnvFilter;
 use zeroize::Zeroizing;
@@ -59,144 +60,45 @@ fn init_tracing(config: &Config) {
 // Storage
 // ---------------------------------------------------------------------------
 
-/// Resolves or generates the SQLCipher encryption key.
+/// Resolves the SQLCipher encryption key.
 ///
-/// Reads from `config.storage_key_hex` (hex-encoded 32 bytes). If unset,
-/// generates a random key and persists it to `{storage_dir}/.key` (mode 0600
-/// on Unix) for subsequent restarts.
-fn resolve_storage_key(
+/// Reads `config.storage_key_hex` (hex-encoded 32 bytes) when set. Otherwise
+/// [`scp_node::self_host::resolve_storage_key_file`] reads `{storage_dir}/.key`,
+/// or generates a random key and publishes it there durably (mode 0600 on
+/// Unix) on the blocking pool, never replacing a key another process wrote
+/// first.
+async fn resolve_storage_key(
     config: &Config,
     storage_dir: &std::path::Path,
 ) -> Result<Zeroizing<[u8; 32]>, String> {
-    // Check explicit hex key first.
-    if let Some(ref hex_key) = config.storage_key_hex {
-        let bytes = Zeroizing::new(
-            hex::decode(hex_key)
-                .map_err(|e| format!("SCP_RELAY_STORAGE_KEY is not valid hex: {e}"))?,
-        );
-        if bytes.len() != 32 {
-            return Err(format!(
-                "SCP_RELAY_STORAGE_KEY must be 32 bytes (64 hex chars), got {} bytes",
-                bytes.len()
-            ));
-        }
-        let mut key = Zeroizing::new([0u8; 32]);
-        key.copy_from_slice(&bytes);
-        return Ok(key);
-    }
-
-    // Check for existing key file.
-    let key_file = storage_dir.join(".key");
-    if key_file.exists() {
-        let data = Zeroizing::new(
-            std::fs::read(&key_file)
-                .map_err(|e| format!("failed to read key file {}: {e}", key_file.display()))?,
-        );
-        if data.len() != 32 {
-            return Err(format!(
-                "key file {} has invalid length {} (expected 32)",
-                key_file.display(),
-                data.len()
-            ));
-        }
-        let mut key = Zeroizing::new([0u8; 32]);
-        key.copy_from_slice(&data);
-        return Ok(key);
-    }
-
-    // Generate a new key and persist it.
-    std::fs::create_dir_all(storage_dir)
-        .map_err(|e| format!("failed to create storage directory: {e}"))?;
-
-    let mut key = Zeroizing::new([0u8; 32]);
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut *key);
-
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&key_file)
-            .map_err(|e| format!("failed to create key file {}: {e}", key_file.display()))?;
-        file.write_all(&*key)
-            .map_err(|e| format!("failed to write key file {}: {e}", key_file.display()))?;
-    }
-
-    #[cfg(not(unix))]
-    {
-        std::fs::write(&key_file, &*key)
-            .map_err(|e| format!("failed to write key file {}: {e}", key_file.display()))?;
-    }
-
-    tracing::info!(
-        path = %key_file.display(),
-        "generated new storage encryption key"
+    let Some(ref hex_key) = config.storage_key_hex else {
+        return resolve_storage_key_file(storage_dir)
+            .await
+            .map_err(|e| e.to_string());
+    };
+    let bytes = Zeroizing::new(
+        hex::decode(hex_key).map_err(|e| format!("SCP_RELAY_STORAGE_KEY is not valid hex: {e}"))?,
     );
+    if bytes.len() != 32 {
+        return Err(format!(
+            "SCP_RELAY_STORAGE_KEY must be 32 bytes (64 hex chars), got {} bytes",
+            bytes.len()
+        ));
+    }
+    let mut key = Zeroizing::new([0u8; 32]);
+    key.copy_from_slice(&bytes);
     Ok(key)
 }
 
-/// Opens an encrypted SQLite database, exiting on failure.
-fn open_sqlite_or_exit(dir: &std::path::Path, key: &Zeroizing<[u8; 32]>) -> SqliteStorage {
-    match SqliteStorage::new(dir, key.as_ref()) {
+/// Opens an encrypted SQLite database on the blocking pool, exiting on
+/// failure.
+async fn open_sqlite_or_exit(dir: &std::path::Path, key: &Zeroizing<[u8; 32]>) -> SqliteStorage {
+    match open_sqlite(dir, key).await {
         Ok(s) => s,
         Err(e) => {
             tracing::error!(error = %e, path = %dir.display(), "failed to open SQLite storage");
             std::process::exit(1);
         }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Storage-backed BEP44 sequence store
-// ---------------------------------------------------------------------------
-
-/// Persists BEP44 sequence numbers to SQLite so DID document updates
-/// use monotonically increasing sequence numbers across restarts.
-struct StorageSequenceStore<S: Storage> {
-    storage: Arc<S>,
-}
-
-impl<S: Storage + 'static> SequenceStore for StorageSequenceStore<S> {
-    fn load(
-        &self,
-        did: &str,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<u64>, IdentityError>> + Send + '_>>
-    {
-        let key = format!("bep44/seq/{did}");
-        Box::pin(async move {
-            let data = self
-                .storage
-                .retrieve(&key)
-                .await
-                .map_err(IdentityError::Platform)?;
-            match data {
-                Some(bytes) if bytes.len() == 8 => {
-                    let mut buf = [0u8; 8];
-                    buf.copy_from_slice(&bytes);
-                    Ok(Some(u64::from_le_bytes(buf)))
-                }
-                Some(_) => Ok(None),
-                None => Ok(None),
-            }
-        })
-    }
-
-    fn store(
-        &self,
-        did: &str,
-        seq: u64,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), IdentityError>> + Send + '_>> {
-        let key = format!("bep44/seq/{did}");
-        let bytes = seq.to_le_bytes();
-        Box::pin(async move {
-            self.storage
-                .store(&key, &bytes)
-                .await
-                .map_err(IdentityError::Platform)
-        })
     }
 }
 
@@ -245,49 +147,6 @@ impl TlsProvider for ManualTlsProvider {
     }
 }
 
-/// TLS provider that generates a self-signed certificate (development only).
-struct SelfSignedTlsProvider {
-    domain: String,
-}
-
-impl TlsProvider for SelfSignedTlsProvider {
-    fn provision(
-        &self,
-    ) -> Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<scp_node::tls::CertificateData, scp_node::tls::TlsError>,
-                > + Send
-                + '_,
-        >,
-    > {
-        let domain = self.domain.clone();
-        Box::pin(async move { scp_node::tls::generate_self_signed(&domain) })
-    }
-}
-
-// ---------------------------------------------------------------------------
-// DHT client
-// ---------------------------------------------------------------------------
-
-/// Builds a production pkarr DHT client from config.
-fn build_dht_client(config: &Config) -> Arc<PkarrDhtClient> {
-    let mut builder = PkarrDhtClient::builder();
-
-    for gateway in &config.dht_gateways {
-        tracing::info!(gateway = %gateway, "adding DHT HTTP gateway");
-        builder = builder.gateway_url(gateway);
-    }
-
-    match builder.build() {
-        Ok(c) => Arc::new(c),
-        Err(e) => {
-            tracing::error!(error = %e, "failed to create DHT client");
-            std::process::exit(1);
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Health check
 // ---------------------------------------------------------------------------
@@ -312,12 +171,11 @@ async fn shutdown_signal() {
 
     #[cfg(unix)]
     {
-        let mut sigterm =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .unwrap_or_else(|_| {
-                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-                        .unwrap_or_else(|_| std::process::exit(1))
-                });
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .unwrap_or_else(|_| {
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                    .unwrap_or_else(|_| std::process::exit(1))
+            });
         tokio::select! {
             _ = ctrl_c => {}
             _ = sigterm.recv() => {}
@@ -346,6 +204,36 @@ async fn health_probe(addr: SocketAddr) {
 // Entry point
 // ---------------------------------------------------------------------------
 
+/// Selects the TLS mode for a domain relay: manual certificates, then a
+/// self-signed certificate, then ACME (the default).
+fn tls_mode(config: &Config) -> TlsMode {
+    if let (Some(cert_path), Some(key_path)) =
+        (config.tls_cert_path.clone(), config.tls_key_path.clone())
+    {
+        tracing::info!(
+            cert = %cert_path.display(),
+            key = %key_path.display(),
+            "using manual TLS certificates"
+        );
+        return TlsMode::Custom(Arc::new(ManualTlsProvider {
+            cert_path,
+            key_path,
+        }));
+    }
+    if config.tls_self_signed {
+        tracing::warn!(
+            "using self-signed TLS certificate (development only, not trusted by browsers)"
+        );
+        return TlsMode::SelfSigned;
+    }
+    if let Some(ref email) = config.acme_email {
+        tracing::info!(email = %email, "ACME email set for Let's Encrypt");
+    }
+    TlsMode::Acme {
+        email: config.acme_email.clone(),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // Handle --health before initializing tracing (keep probe quiet).
@@ -359,18 +247,18 @@ async fn main() {
     let config = Config::from_env();
     init_tracing(&config);
 
-    // Validate storage path.
-    if let Err(e) = std::fs::create_dir_all(&config.storage_path) {
+    // Create the storage directory and check that it is writable.
+    if let Err(e) = validate_storage_path(&config.storage_path).await {
         tracing::error!(
             error = %e,
             path = %config.storage_path.display(),
-            "cannot create storage directory"
+            "cannot use storage directory"
         );
         std::process::exit(1);
     }
 
     // Resolve encryption key and open storage.
-    let storage_key = match resolve_storage_key(&config, &config.storage_path) {
+    let storage_key = match resolve_storage_key(&config, &config.storage_path).await {
         Ok(k) => k,
         Err(e) => {
             tracing::error!(error = %e, "failed to resolve storage encryption key");
@@ -378,9 +266,9 @@ async fn main() {
         }
     };
 
-    let node_storage = open_sqlite_or_exit(&config.storage_path, &storage_key);
+    let node_storage = Arc::new(open_sqlite_or_exit(&config.storage_path, &storage_key).await);
     let custody_storage =
-        open_sqlite_or_exit(&config.storage_path.join("custody"), &storage_key);
+        open_sqlite_or_exit(&config.storage_path.join("custody"), &storage_key).await;
 
     let custody = match SqliteKeyCustody::new(custody_storage).await {
         Ok(c) => Arc::new(c),
@@ -390,102 +278,42 @@ async fn main() {
         }
     };
 
-    // Build DHT client and DID method.
-    let node_storage_arc = Arc::new(node_storage);
-    let dht_client = build_dht_client(&config);
-    let cache = Arc::new(scp_identity::DidCache::new());
-    let sequence_store: Arc<dyn SequenceStore> = Arc::new(StorageSequenceStore {
-        storage: Arc::clone(&node_storage_arc),
-    });
-
-    let sign_fn =
-        DidDht::<PkarrDhtClient, SystemClock>::make_sign_fn(Arc::clone(&custody));
-    let did_method = Arc::new(DidDht::with_client_signer_and_store(
-        dht_client,
-        cache,
-        sign_fn,
+    // Build the DID method: BEP44 sequence numbers persist in node storage,
+    // so DID document updates stay monotonic across restarts.
+    let sequence_store: Arc<dyn SequenceStore> =
+        Arc::new(StorageSequenceStore::new(Arc::clone(&node_storage)));
+    let did_method = match build_production_did_method(
+        Arc::clone(&custody),
+        Arc::new(DidCache::new()),
         sequence_store,
-    ));
+        &config.dht_gateways,
+    ) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to create DHT client");
+            std::process::exit(1);
+        }
+    };
 
     // Build the blob storage backend (SQLite by default).
     let blob_db_path = config.storage_path.join("blobs.db");
-    let blob_storage = BlobStorageBackend::sqlite(&blob_db_path).unwrap_or_else(|e| {
-        tracing::error!(error = %e, "failed to open blob storage");
-        std::process::exit(1);
-    });
+    let blob_storage = BlobStorageBackend::sqlite(&blob_db_path)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!(error = %e, "failed to open blob storage");
+            std::process::exit(1);
+        });
 
-    // Determine the domain. Without a domain, use no_domain (NAT-traversed) mode.
-    let domain = config.domain.clone();
-
-    // Re-open a fresh SQLite handle for the ApplicationNodeBuilder (the
-    // Arc<SqliteStorage> above is used for the sequence store; the builder
-    // needs its own handle for ProtocolRepository).
-    let builder_storage = open_sqlite_or_exit(&config.storage_path, &storage_key);
-
-    match domain {
-        Some(ref domain_str) => {
+    // Without a domain, the relay runs NAT-traversed.
+    let (reach, tls) = match config.domain.clone() {
+        Some(domain) => {
             tracing::info!(
-                domain = %domain_str,
+                domain = %domain,
                 bind_addr = %config.bind_addr,
                 storage = %config.storage_path.display(),
                 "starting personal relay (domain mode)"
             );
-
-            let mut builder = ApplicationNodeBuilder::new()
-                .storage(builder_storage)
-                .domain(domain_str)
-                .identity_with_storage(Arc::clone(&custody), Arc::clone(&did_method))
-                .blob_storage(blob_storage)
-                .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-                .http_bind_addr(config.bind_addr);
-
-            // TLS provider selection: manual certs > self-signed > ACME (default).
-            if let (Some(cert_path), Some(key_path)) =
-                (config.tls_cert_path.clone(), config.tls_key_path.clone())
-            {
-                tracing::info!(
-                    cert = %cert_path.display(),
-                    key = %key_path.display(),
-                    "using manual TLS certificates"
-                );
-                builder = builder.tls_provider(Arc::new(ManualTlsProvider {
-                    cert_path,
-                    key_path,
-                }));
-            } else if config.tls_self_signed {
-                tracing::warn!(
-                    "using self-signed TLS certificate (development only, not trusted by browsers)"
-                );
-                builder = builder.tls_provider(Arc::new(SelfSignedTlsProvider {
-                    domain: domain_str.clone(),
-                }));
-            } else if let Some(ref email) = config.acme_email {
-                tracing::info!(email = %email, "ACME email set for Let's Encrypt");
-                builder = builder.acme_email(email);
-            }
-
-            let node = match builder.build().await {
-                Ok(n) => n,
-                Err(e) => {
-                    tracing::error!(error = %e, "failed to build application node");
-                    std::process::exit(1);
-                }
-            };
-
-            // The builder bootstraps the BEP44 publish-sequence counter before
-            // its startup publish (see `initialize_sequence_for_mode` in
-            // scp-node), so no post-build sequence initialization is needed here.
-            tracing::info!(
-                did = %node.identity().did(),
-                relay_url = %node.relay_url(),
-                relay_internal_addr = %node.relay().bound_addr(),
-                "personal relay identity ready -- DID published to DHT"
-            );
-
-            if let Err(e) = node.serve(app_router(), shutdown_signal()).await {
-                tracing::error!(error = %e, "relay exited with error");
-                std::process::exit(1);
-            }
+            (Reach::Domain { domain }, tls_mode(&config))
         }
         None => {
             tracing::info!(
@@ -493,38 +321,47 @@ async fn main() {
                 storage = %config.storage_path.display(),
                 "starting personal relay (no-domain / NAT-traversed mode)"
             );
-
-            let builder = ApplicationNodeBuilder::new()
-                .storage(builder_storage)
-                .no_domain()
-                .identity_with_storage(Arc::clone(&custody), Arc::clone(&did_method))
-                .blob_storage(blob_storage)
-                .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-                .http_bind_addr(config.bind_addr);
-
-            let node = match builder.build().await {
-                Ok(n) => n,
-                Err(e) => {
-                    tracing::error!(error = %e, "failed to build application node");
-                    std::process::exit(1);
-                }
-            };
-
-            // The builder bootstraps the BEP44 publish-sequence counter before
-            // its startup publish (see `initialize_sequence_for_mode` in
-            // scp-node), so no post-build sequence initialization is needed here.
-            tracing::info!(
-                did = %node.identity().did(),
-                relay_url = %node.relay_url(),
-                relay_internal_addr = %node.relay().bound_addr(),
-                "personal relay identity ready -- DID published to DHT"
-            );
-
-            if let Err(e) = node.serve(app_router(), shutdown_signal()).await {
-                tracing::error!(error = %e, "relay exited with error");
-                std::process::exit(1);
-            }
+            (Reach::NatTraversal, TlsMode::SelfSigned)
         }
+    };
+
+    let node_config = NodeConfig {
+        tls,
+        dht: DhtMode::Production,
+        bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+        http_bind_addr: Some(config.bind_addr),
+        dht_gateways: config.dht_gateways.clone(),
+        ..NodeConfig::defaults(
+            reach,
+            IdentitySource::Persisted {
+                custody: Arc::clone(&custody),
+                did_method,
+            },
+            node_storage,
+            blob_storage,
+        )
+    };
+
+    let node = match Node::start(node_config).await {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to start application node");
+            std::process::exit(1);
+        }
+    };
+
+    // `Node::start` bootstraps the BEP44 publish-sequence counter before its
+    // startup publish, so no sequence initialization is needed here.
+    tracing::info!(
+        did = %node.identity().did(),
+        relay_url = %node.relay_url(),
+        relay_internal_addr = %node.relay().bound_addr(),
+        "personal relay identity ready -- DID published to DHT"
+    );
+
+    if let Err(e) = node.serve(app_router(), shutdown_signal()).await {
+        tracing::error!(error = %e, "relay exited with error");
+        std::process::exit(1);
     }
 
     tracing::info!("personal relay stopped");

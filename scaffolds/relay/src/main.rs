@@ -69,10 +69,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //     BlobStorageBackend::in_memory()
     //
     //   SQLite (persistent, single-file):
-    //     BlobStorageBackend::sqlite(&PathBuf::from("./scp-relay.db"))?
+    //     BlobStorageBackend::sqlite(&PathBuf::from("./scp-relay.db")).await?
     //
     //   redb (persistent, embedded):
-    //     BlobStorageBackend::redb(&PathBuf::from("./scp-relay.redb"))?
+    //     BlobStorageBackend::redb(&PathBuf::from("./scp-relay.redb")).await?
     //     (requires "redb-blob" feature on scp-transport)
     //
     //   PostgreSQL (requires "postgres-blob" feature):
@@ -80,7 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //
     //   S3-compatible (requires "s3-blob" feature):
     //     S3BlobStore::open("bucket", "blobs/").await?
-    let storage = BlobStorageBackend::sqlite(&PathBuf::from("./scp-relay.db"))?;
+    let storage = BlobStorageBackend::sqlite(&PathBuf::from("./scp-relay.db")).await?;
 
     // ── 4. Start the relay server ────────────────────────────────
     //

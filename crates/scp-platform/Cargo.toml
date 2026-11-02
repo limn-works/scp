@@ -50,7 +50,7 @@ apple = ["dep:rusqlite", "dep:scp-sqlite-pools", "dep:hex"]
 # `dep:libsqlite3-sys` names, on a non-Apple target only, the package rusqlite
 # already compiles, so that `vendored-openssl` below has an edge to set a
 # feature on; it adds no package to the build.
-sqlite = ["dep:rusqlite", "dep:scp-sqlite-pools", "dep:hex", "dep:argon2", "dep:rand", "dep:libsqlite3-sys"]
+sqlite = ["dep:rusqlite", "dep:scp-sqlite-pools", "dep:hex", "dep:argon2", "dep:rand", "dep:libsqlite3-sys", "dep:rustix"]
 # On a non-Apple target, compile OpenSSL from source into SQLCipher instead of
 # linking the build host's libcrypto (see the `rusqlite` comment in the workspace
 # Cargo.toml for what each host supplies). On an Apple target this feature
@@ -92,7 +92,7 @@ vendored-openssl = ["libsqlite3-sys?/bundled-sqlcipher-vendored-openssl"]
 # `FileKeyCustody` holds a cross-process exclusive advisory lock, taken through
 # std's `File::try_lock`, across a read-modify-write of the key file, which
 # §17.8 of the persistence spec requires under "One writer at a time".
-file = ["software_platform", "dep:aes-gcm", "dep:argon2"]
+file = ["software_platform", "dep:aes-gcm", "dep:argon2", "dep:rustix"]
 # Filesystem storage adapter (spec section 17.6).
 filesystem = []
 # EncryptingAdapter — wraps any Storage backend with AES-256-GCM per-value
@@ -160,6 +160,17 @@ hex = { workspace = true, optional = true }
 # so Cargo resolves it to the same package.
 [target.'cfg(not(target_vendor = "apple"))'.dependencies]
 libsqlite3-sys = { version = "0.30.1", optional = true }
+
+# `durable_file::create` publishes a secret with an exclusive rename,
+# `renameat2(RENAME_NOREPLACE)` on Linux and `renameatx_np(RENAME_EXCL)` on Apple
+# platforms, which never overwrites an existing file and needs no hard-link
+# support from the file system. rustix wraps both calls safely, so this crate keeps
+# `forbid(unsafe_code)`. Android publishes through a hard link only (see
+# `durable_file::PUBLISHERS`). On every Unix target, `durable_file` also names
+# the errno values that mean "the file system lacks this call" through
+# `rustix::io::Errno`, because their numbers differ between targets.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.4", default-features = false, features = ["std", "fs"], optional = true }
 
 [dev-dependencies]
 # Test-only: raw (un-normalised) RFC 6979 ECDSA, to pin a digest whose raw `s`

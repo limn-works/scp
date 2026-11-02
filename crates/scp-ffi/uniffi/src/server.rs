@@ -920,15 +920,27 @@ pub(crate) async fn node_start_local_on(
     let inner = match bi.protocol_repository() {
         crate::runtime::ProtocolRepoVariant::InMemory(repo) => {
             let storage = Arc::clone(repo.storage());
-            server::start_node_local(data_dir, storage, node_identity, zeroized_passphrase)
-                .await
-                .map(RunningNode::InMemoryEncrypted)
+            server::start_node_local(
+                data_dir,
+                storage,
+                node_identity,
+                zeroized_passphrase,
+                crate::runtime().handle().clone(),
+            )
+            .await
+            .map(RunningNode::InMemoryEncrypted)
         }
         crate::runtime::ProtocolRepoVariant::Sqlite(repo) => {
             let storage = Arc::clone(repo.storage());
-            server::start_node_local(data_dir, storage, node_identity, zeroized_passphrase)
-                .await
-                .map(RunningNode::Sqlite)
+            server::start_node_local(
+                data_dir,
+                storage,
+                node_identity,
+                zeroized_passphrase,
+                crate::runtime().handle().clone(),
+            )
+            .await
+            .map(RunningNode::Sqlite)
         }
     }?;
     // This node holds a clone of this instance's storage `Arc`, so register it

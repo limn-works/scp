@@ -2625,7 +2625,7 @@ mod tests {
             QuicListenerConfig {
                 bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
                 delivery_jitter_ms: 0,
-                push: PushRole::Enabled(push_gate::kel_service_for_tests(dir.path())),
+                push: PushRole::Enabled(push_gate::kel_service_for_tests(dir.path()).await),
                 ..QuicListenerConfig::defaults(fixture.live.clone())
             },
             Arc::clone(&storage),

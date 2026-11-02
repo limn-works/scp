@@ -404,148 +404,60 @@ pub(crate) fn load_or_init_salt(dir: &Path) -> Result<[u8; kdf::ARGON2_SALT_LEN]
         )));
     }
 
+    // A crashed write may have left a copy of the salt; the next open that can
+    // remove it does.
+    crate::durable_file::remove_stale_temporaries(&salt_path);
     if salt_path.exists() {
-        // Defense in depth: reject a symlinked salt sidecar. `symlink_metadata`
-        // does NOT follow the link, so a planted symlink is detected rather
-        // than silently followed to an attacker-chosen target.
-        let meta = std::fs::symlink_metadata(&salt_path).map_err(|e| {
-            PlatformError::StorageError(format!(
-                "failed to stat salt file at {}: {e}",
-                salt_path.display()
-            ))
-        })?;
-        if meta.file_type().is_symlink() {
-            return Err(PlatformError::StorageError(format!(
-                "salt file at {} is a symlink — refusing to follow (fail closed)",
-                salt_path.display()
-            )));
-        }
-
-        let bytes = std::fs::read(&salt_path).map_err(|e| {
-            PlatformError::StorageError(format!(
-                "failed to read salt file at {}: {e}",
-                salt_path.display()
-            ))
-        })?;
-        let salt: [u8; kdf::ARGON2_SALT_LEN] = bytes.as_slice().try_into().map_err(|_| {
-            PlatformError::StorageError(format!(
-                "salt file at {} has invalid length: expected {} bytes, got {}",
-                salt_path.display(),
-                kdf::ARGON2_SALT_LEN,
-                bytes.len()
-            ))
-        })?;
-        return Ok(salt);
+        return read_salt(&salt_path);
     }
 
     // First initialization: no salt yet. Generate 16 bytes from a CSPRNG and
-    // persist atomically.
+    // publish them atomically and durably without replacing a salt another
+    // opener published first; in that case read the winner's salt, so two
+    // concurrent first opens derive the same key.
     let mut salt = [0u8; kdf::ARGON2_SALT_LEN];
     rand::rngs::OsRng.fill_bytes(&mut salt);
-    atomic_write_salt(&salt_path, &salt)?;
-    Ok(salt)
+    match crate::durable_file::create(&salt_path, &salt)
+        .map_err(|e| PlatformError::StorageError(format!("salt file write: {e}")))?
+    {
+        crate::durable_file::Created::Written => Ok(salt),
+        crate::durable_file::Created::AlreadyPresent => read_salt(&salt_path),
+    }
 }
 
-/// Writes `data` to `path` atomically via a randomized `.tmp` sibling file.
-///
-/// 1. Generates a randomized, unpredictable temp name
-///    `scp.salt.{random_hex}.tmp` in the parent directory so concurrent
-///    first-inits cannot collide and the name cannot be pre-planted.
-/// 2. Opens the temp file with `create_new(true)` (`O_EXCL`): a pre-existing
-///    file or symlink at the temp path fails the open rather than being
-///    followed/overwritten. On `AlreadyExists` (astronomically unlikely with a
-///    16-byte random suffix), it errors fail-closed.
-/// 3. Writes `data` with `mode(0o600)` on Unix.
-/// 4. Calls `sync_all` to flush the file to durable storage.
-/// 5. Renames to `path` (atomic on POSIX).
-/// 6. On Unix, fsyncs the PARENT DIRECTORY so the rename is durable — a crash
-///    cannot leave the salt missing beside an already-fsynced `scp.db` (which
-///    would be an unrecoverable fail-closed brick). Best-effort on platforms
-///    without directory fsync.
-/// 7. Cleans up the tmp file on any failure after creation.
-///
-/// Mirrors the crash-safe write pattern used by `FileKeyCustody`.
-fn atomic_write_salt(path: &Path, data: &[u8]) -> Result<(), PlatformError> {
-    use std::io::Write;
-
-    let parent = path.parent().ok_or_else(|| {
+/// Reads the salt sidecar at `salt_path`, refusing a symlink and a file of the
+/// wrong length.
+fn read_salt(salt_path: &Path) -> Result<[u8; kdf::ARGON2_SALT_LEN], PlatformError> {
+    // Defense in depth: reject a symlinked salt sidecar. `symlink_metadata`
+    // does NOT follow the link, so a planted symlink is detected rather
+    // than silently followed to an attacker-chosen target.
+    let meta = std::fs::symlink_metadata(salt_path).map_err(|e| {
         PlatformError::StorageError(format!(
-            "salt path {} has no parent directory",
-            path.display()
+            "failed to stat salt file at {}: {e}",
+            salt_path.display()
         ))
     })?;
+    if meta.file_type().is_symlink() {
+        return Err(PlatformError::StorageError(format!(
+            "salt file at {} is a symlink — refusing to follow (fail closed)",
+            salt_path.display()
+        )));
+    }
 
-    // Randomized, unpredictable temp name in the same directory as the target
-    // so the final `rename` stays on one filesystem (atomic). 128 bits of
-    // CSPRNG entropy rendered as 32 hex chars — collision-free in practice and
-    // unguessable, so an attacker cannot pre-plant the temp path.
-    let mut rand_bytes = [0u8; 16];
-    rand::rngs::OsRng.fill_bytes(&mut rand_bytes);
-    let rand_suffix = u128::from_le_bytes(rand_bytes);
-    let tmp_path = parent.join(format!("scp.salt.{rand_suffix:032x}.tmp"));
-
-    #[cfg(unix)]
-    let open_result = {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp_path)
-    };
-    #[cfg(not(unix))]
-    let open_result = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp_path);
-
-    let mut file = open_result.map_err(|e| {
+    let bytes = std::fs::read(salt_path).map_err(|e| {
         PlatformError::StorageError(format!(
-            "failed to create temp salt file at {}: {e}",
-            tmp_path.display()
+            "failed to read salt file at {}: {e}",
+            salt_path.display()
         ))
     })?;
-    file.write_all(data).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp_path);
-        PlatformError::StorageError(format!("failed to write temp salt file: {e}"))
-    })?;
-    file.sync_all().map_err(|e| {
-        let _ = std::fs::remove_file(&tmp_path);
-        PlatformError::StorageError(format!("failed to sync temp salt file: {e}"))
-    })?;
-    drop(file);
-
-    std::fs::rename(&tmp_path, path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp_path);
-        PlatformError::StorageError(format!("failed to rename temp salt file: {e}"))
-    })?;
-
-    // Durably persist the directory entry created by the rename. Without this,
-    // a crash after `rename` returns could lose the salt while `scp.db` (whose
-    // own write fsynced) survives — an unrecoverable brick. Best-effort:
-    // platforms without directory fsync return an error we tolerate.
-    sync_parent_dir(parent);
-
-    Ok(())
-}
-
-/// Best-effort fsync of a directory so a preceding `rename` into it is durable.
-///
-/// On Unix, opens the directory and calls `sync_all`. Errors are tolerated
-/// (some filesystems/platforms do not support directory fsync); durability is a
-/// hardening property, not a correctness precondition for the in-memory result.
-/// No-op on non-Unix targets.
-fn sync_parent_dir(dir: &Path) {
-    #[cfg(unix)]
-    {
-        if let Ok(handle) = std::fs::File::open(dir) {
-            let _ = handle.sync_all();
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = dir;
-    }
+    bytes.as_slice().try_into().map_err(|_| {
+        PlatformError::StorageError(format!(
+            "salt file at {} has invalid length: expected {} bytes, got {}",
+            salt_path.display(),
+            kdf::ARGON2_SALT_LEN,
+            bytes.len()
+        ))
+    })
 }
 
 /// Computes the exclusive upper bound for a prefix range scan.
@@ -936,7 +848,7 @@ mod tests {
     }
 
     #[test]
-    fn atomic_write_salt_uses_randomized_temp_and_no_residue() {
+    fn salt_init_uses_randomized_temp_and_no_residue() {
         let dir = TempDir::new().unwrap();
         let salt_path = dir.path().join(SALT_FILE_NAME);
 
@@ -944,8 +856,7 @@ mod tests {
         // (`scp.salt.tmp`) must NOT interfere — the temp name is now randomized.
         std::fs::write(dir.path().join("scp.salt.tmp"), b"stale").unwrap();
 
-        let salt = [3u8; kdf::ARGON2_SALT_LEN];
-        atomic_write_salt(&salt_path, &salt).unwrap();
+        let salt = load_or_init_salt(dir.path()).unwrap();
 
         // The salt landed correctly.
         let on_disk = std::fs::read(&salt_path).unwrap();
@@ -960,12 +871,27 @@ mod tests {
             .filter(|n| n.starts_with("scp.salt.") && n.contains(".tmp"))
             .collect();
         // Only the stale pre-planted fixed-name temp remains; no randomized
-        // residue from atomic_write_salt.
+        // residue from the salt write.
         assert_eq!(
             tmp_residue,
             vec!["scp.salt.tmp".to_owned()],
             "randomized temp must be renamed away, leaving no residue"
         );
+    }
+
+    /// Loading an existing salt removes the copy a crashed write left beside
+    /// it. Without the sweep in `load_or_init_salt` the copy stays.
+    #[test]
+    fn loading_the_salt_removes_a_crashed_writes_copy() {
+        let dir = TempDir::new().unwrap();
+        let salt = load_or_init_salt(dir.path()).unwrap();
+        let copy = dir
+            .path()
+            .join(format!("{SALT_FILE_NAME}.{:032x}.tmp", 3_u128));
+        std::fs::write(&copy, [2u8; kdf::ARGON2_SALT_LEN]).unwrap();
+
+        assert_eq!(load_or_init_salt(dir.path()).unwrap(), salt);
+        assert!(!copy.exists(), "the load must remove the stale copy");
     }
 
     #[tokio::test]

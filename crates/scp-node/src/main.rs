@@ -336,8 +336,8 @@ fn resolve_storage_path_or_exit(cli_path: Option<&PathBuf>) -> PathBuf {
 }
 
 /// Binary wrapper over [`scp_node::self_host::resolve_storage_key`] that exits on error.
-fn resolve_storage_key_or_exit(storage_dir: &std::path::Path) -> Zeroizing<[u8; 32]> {
-    match scp_node::self_host::resolve_storage_key(storage_dir) {
+async fn resolve_storage_key_or_exit(storage_dir: &std::path::Path) -> Zeroizing<[u8; 32]> {
+    match scp_node::self_host::resolve_storage_key(storage_dir).await {
         Ok(k) => k,
         Err(e) => {
             tracing::error!(error = %e, "failed to resolve storage encryption key");
@@ -394,8 +394,8 @@ async fn run_relay_only() {
     // A relay-only node is a standalone relay, so its operator selects push
     // exactly as an scp-relay operator does (PUSH-012). Read before the blob
     // store opens, so a refusal leaves no blob store behind.
-    let push = or_exit(startup::push_selection_from_env());
-    config.push = or_exit(startup::push_role_from(push));
+    let push = or_exit(startup::push_selection_from_env().await);
+    config.push = or_exit(startup::push_role_from(push).await);
     startup::log_push_role(&config.push);
 
     let storage = Arc::new(or_exit(startup::storage_from_env(backend).await));
@@ -533,8 +533,8 @@ async fn run_full_node_ephemeral() {
 
 /// Opens an encrypted `SQLite` database via [`scp_node::self_host::open_sqlite`], exiting
 /// on failure.
-fn open_sqlite_or_exit(dir: &std::path::Path, key: &Zeroizing<[u8; 32]>) -> SqliteStorage {
-    match scp_node::self_host::open_sqlite(dir, key) {
+async fn open_sqlite_or_exit(dir: &std::path::Path, key: &Zeroizing<[u8; 32]>) -> SqliteStorage {
+    match scp_node::self_host::open_sqlite(dir, key).await {
         Ok(s) => s,
         Err(e) => {
             tracing::error!(error = %e, path = %dir.display(), "failed to open SQLite storage");
@@ -563,10 +563,10 @@ async fn init_persistent_storage(
     Arc<SqliteKeyCustody>,
 ) {
     let storage_dir = resolve_storage_path_or_exit(storage_path);
-    let storage_key = resolve_storage_key_or_exit(&storage_dir);
+    let storage_key = resolve_storage_key_or_exit(&storage_dir).await;
 
-    let node_storage = Arc::new(open_sqlite_or_exit(&storage_dir, &storage_key));
-    let custody_storage = open_sqlite_or_exit(&storage_dir.join("custody"), &storage_key);
+    let node_storage = Arc::new(open_sqlite_or_exit(&storage_dir, &storage_key).await);
+    let custody_storage = open_sqlite_or_exit(&storage_dir.join("custody"), &storage_key).await;
 
     let custody = match SqliteKeyCustody::new(custody_storage).await {
         Ok(c) => Arc::new(c),
@@ -581,8 +581,8 @@ async fn init_persistent_storage(
 
 /// Validates that the storage directory can be created and is writable via
 /// [`scp_node::self_host::validate_storage_path`], exiting with a clear message on failure.
-fn validate_storage_path_or_exit(dir: &std::path::Path) {
-    if let Err(e) = scp_node::self_host::validate_storage_path(dir) {
+async fn validate_storage_path_or_exit(dir: &std::path::Path) {
+    if let Err(e) = scp_node::self_host::validate_storage_path(dir).await {
         tracing::error!(error = %e, path = %dir.display(), "storage path is not usable");
         eprintln!(
             "ERROR: {e}\n\
@@ -608,7 +608,7 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
     // credential exits before the storage directory exists (PUSH-012, spec
     // §17.17.1 SCP-CAPSEL-8000). The store is the node's own, so a set store
     // variable exits here too (SCP-CAPSEL-8001).
-    let push_senders = or_exit(startup::push_senders_from_env());
+    let push_senders = or_exit(startup::push_senders_from_env().await);
     let domain = require_domain();
     let http_addr = node_http_addr();
 
@@ -621,7 +621,7 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
 
     // Validate the storage path upfront before attempting to open databases.
     let resolved_path = resolve_storage_path_or_exit(storage_path);
-    validate_storage_path_or_exit(&resolved_path);
+    validate_storage_path_or_exit(&resolved_path).await;
 
     // The single root `SqliteStorage` handle `init_persistent_storage` opens
     // (held alive via `node_storage_arc`) is the ONLY root handle and is
@@ -635,7 +635,7 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
     // Push registrations are relay data, kept beside the node's other stores
     // in its storage directory and keyed with the instance storage key, as
     // the node's other databases are (PUSH-012).
-    let push = or_exit(push_slot_from(push_senders, &storage_dir, &storage_key));
+    let push = or_exit(push_slot_from(push_senders, &storage_dir, &storage_key).await);
     drop(storage_key);
 
     tracing::info!(
@@ -734,7 +734,7 @@ const PUSH_STORE_FILE: &str = "push.sqlite";
 ///
 /// [`startup::PushStartupError::NodeStoreOpen`] when the store cannot be
 /// opened. Nothing falls back to another store (SCP-CAPSEL-8001).
-fn push_slot_from(
+async fn push_slot_from(
     senders: startup::PushSenderSelection,
     storage_dir: &std::path::Path,
     storage_key: &[u8; 32],
@@ -748,6 +748,7 @@ fn push_slot_from(
     };
     let path = storage_dir.join(PUSH_STORE_FILE);
     let store = match PushRegistrationStore::open_sqlite(&path, PushStoreAtRest::Keyed(storage_key))
+        .await
     {
         Ok(store) => store,
         Err(error) => {
@@ -1496,7 +1497,8 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let key = [0x5a; 32];
 
-        let disabled = push_slot_from(startup::PushSenderSelection::Disabled, dir.path(), &key);
+        let disabled =
+            push_slot_from(startup::PushSenderSelection::Disabled, dir.path(), &key).await;
         assert!(matches!(disabled, Ok(PushSlot::Disabled)), "{disabled:?}");
         assert!(!dir.path().join(PUSH_STORE_FILE).exists());
 
@@ -1510,7 +1512,8 @@ mod tests {
             })),
             dir.path(),
             &key,
-        );
+        )
+        .await;
         assert!(
             matches!(&enabled, Ok(PushSlot::Enabled(p))
                 if p.senders.apns.is_some() && p.senders.fcm.is_none()),
@@ -1522,12 +1525,12 @@ mod tests {
 
         // The store is keyed with the instance key: it opens with that key
         // and with no other, and not unkeyed.
-        PushRegistrationStore::open_sqlite(&path, PushStoreAtRest::Keyed(&key))?;
+        PushRegistrationStore::open_sqlite(&path, PushStoreAtRest::Keyed(&key)).await?;
         for other in [
             PushStoreAtRest::Unkeyed,
             PushStoreAtRest::Keyed(&[0xa5; 32]),
         ] {
-            let opened = PushRegistrationStore::open_sqlite(&path, other);
+            let opened = PushRegistrationStore::open_sqlite(&path, other).await;
             assert!(opened.is_err(), "{other:?} opened the keyed store");
         }
 
@@ -1542,7 +1545,8 @@ mod tests {
             })),
             &missing,
             &key,
-        );
+        )
+        .await;
         let Err(startup::StartupError::Push(error)) = &refused else {
             return Err(format!("expected a push refusal, got {refused:?}").into());
         };

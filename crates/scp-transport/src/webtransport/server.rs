@@ -532,7 +532,7 @@ mod tests {
         let mut config = WebTransportListenerConfig::defaults(fixture.live.clone());
         config.session_config.delivery_jitter_ms = 0;
         config.session_config.push = crate::relay::push_gate::PushRole::Enabled(
-            crate::relay::push_gate::kel_service_for_tests(dir.path()),
+            crate::relay::push_gate::kel_service_for_tests(dir.path()).await,
         );
         let listener = WebTransportListener::new(
             config,

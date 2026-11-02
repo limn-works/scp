@@ -364,6 +364,8 @@ Format: `{action}_{condition_or_expected_result}`.
 - Use `tokio::select!` for racing futures
 - Use `futures::StreamExt` for stream operations
 - Cancellation safety: all async functions must be cancellation-safe or documented as not
+- Blocking file work runs on the blocking pool. An async function that opens, reads, writes or syncs a file, or runs a key derivation, hands that work to `spawn_blocking` and awaits it, because inline it stalls every task scheduled on the same worker thread for as long as the call takes. A type whose construction blocks exposes the async open and keeps the synchronous body private, so no async caller can reach the blocking body (`FileKeyCustody::open`). A loader that reads files on behalf of an async caller is itself async and does the reads on the pool (`BlobStorageBackend::sqlite`, `startup::push_selection_from_env`). A type that keeps a runtime for later blocking work takes its `tokio::runtime::Handle` as a constructor argument instead of reading `Handle::current()` (ADR-052).
+- A future dropped while its blocking task runs leaves that task running. A blocking task that mints state only its caller would own, such as a key whose handle the caller returns, undoes that state when the caller is gone (`FileKeyCustody::generate`).
 
 ## Documentation
 

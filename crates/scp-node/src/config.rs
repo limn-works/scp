@@ -497,7 +497,7 @@ pub(crate) async fn resolve_own_addresses_for_start(
 ///         Reach::Domain { domain: "example.com".into() },
 ///         IdentitySource::Generate { custody, did_method },
 ///         storage,
-///         BlobStorageBackend::sqlite(&blob_db)?, // durable backend for a public node
+///         BlobStorageBackend::sqlite(&blob_db).await?, // durable backend for a public node
 ///     )
 /// }).await?;
 /// ```
@@ -2047,7 +2047,7 @@ mod tests {
     }
 
     /// An enabled push slot over a SQLite store at `dir/push.sqlite`.
-    fn enabled_push(
+    async fn enabled_push(
         dir: &std::path::Path,
         apns: Option<scp_transport::relay::push::ApnsSender>,
     ) -> PushSlot {
@@ -2055,6 +2055,7 @@ mod tests {
             &dir.join("push.sqlite"),
             scp_transport::relay::push_store::PushStoreAtRest::Unkeyed,
         )
+        .await
         .unwrap();
         PushSlot::Enabled(Box::new(NodePushProviders {
             store,
@@ -2117,7 +2118,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let node = Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
-            push: enabled_push(dir.path(), Some(apns_sender())),
+            push: enabled_push(dir.path(), Some(apns_sender())).await,
             ..NodeConfig::defaults(
                 Reach::Local,
                 generate_identity(),
@@ -2166,7 +2167,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let node = Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
-            push: enabled_push(dir.path(), Some(apns_sender())),
+            push: enabled_push(dir.path(), Some(apns_sender())).await,
             ..NodeConfig::defaults(
                 Reach::Domain {
                     domain: "config-push.example.com".to_owned(),
@@ -2199,7 +2200,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let node = Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
-            push: enabled_push(dir.path(), Some(apns_sender())),
+            push: enabled_push(dir.path(), Some(apns_sender())).await,
             ..NodeConfig::defaults(
                 Reach::Local,
                 generate_identity(),
@@ -2236,7 +2237,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let result = Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
-            push: enabled_push(dir.path(), None),
+            push: enabled_push(dir.path(), None).await,
             ..NodeConfig::defaults(
                 Reach::Local,
                 generate_identity(),

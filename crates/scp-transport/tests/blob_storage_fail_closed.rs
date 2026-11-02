@@ -40,11 +40,11 @@ fn path_under_a_regular_file(leaf: &str) -> (tempfile::TempDir, std::path::PathB
 /// `StorageError::Internal` — it never yields a usable backend. Selecting a
 /// durable blob backend that cannot be opened is a terminal error the caller
 /// observes (SCP-CAPSEL-8001), never a silent degrade to the in-memory arm.
-#[test]
-fn sqlite_blob_open_at_unusable_path_fails_closed_with_internal() {
+#[tokio::test]
+async fn sqlite_blob_open_at_unusable_path_fails_closed_with_internal() {
     let (_tmp, path) = path_under_a_regular_file("blobs.db");
 
-    let result = BlobStorageBackend::sqlite(&path);
+    let result = BlobStorageBackend::sqlite(&path).await;
 
     match result {
         Err(StorageError::Internal(message)) => {
@@ -66,13 +66,13 @@ fn sqlite_blob_open_at_unusable_path_fails_closed_with_internal() {
 /// `StorageError::Internal`. `SQLite` opens the file handle lazily, so this
 /// exercises the schema-application half of the open path: corruption is
 /// detected and reported, never absorbed.
-#[test]
-fn sqlite_blob_open_on_corrupt_file_fails_closed_with_internal() {
+#[tokio::test]
+async fn sqlite_blob_open_on_corrupt_file_fails_closed_with_internal() {
     let tmp = tempfile::tempdir().expect("create temp dir");
     let path = tmp.path().join("corrupt.db");
     std::fs::write(&path, vec![0x5Au8; 8192]).expect("write non-database bytes");
 
-    let result = BlobStorageBackend::sqlite(&path);
+    let result = BlobStorageBackend::sqlite(&path).await;
 
     match result {
         Err(StorageError::Internal(message)) => {
@@ -92,11 +92,11 @@ fn sqlite_blob_open_on_corrupt_file_fails_closed_with_internal() {
 /// `BlobStorageBackend::redb` at a path the operating system refuses returns
 /// `StorageError::Internal`, the same fail-closed contract the `SQLite` arm
 /// honours.
-#[test]
-fn redb_blob_open_at_unusable_path_fails_closed_with_internal() {
+#[tokio::test]
+async fn redb_blob_open_at_unusable_path_fails_closed_with_internal() {
     let (_tmp, path) = path_under_a_regular_file("blobs.redb");
 
-    let result = BlobStorageBackend::redb(&path);
+    let result = BlobStorageBackend::redb(&path).await;
 
     match result {
         Err(StorageError::Internal(message)) => {
@@ -115,13 +115,13 @@ fn redb_blob_open_at_unusable_path_fails_closed_with_internal() {
 
 /// A redb store pointed at a file that holds non-database bytes returns
 /// `StorageError::Internal`.
-#[test]
-fn redb_blob_open_on_corrupt_file_fails_closed_with_internal() {
+#[tokio::test]
+async fn redb_blob_open_on_corrupt_file_fails_closed_with_internal() {
     let tmp = tempfile::tempdir().expect("create temp dir");
     let path = tmp.path().join("corrupt.redb");
     std::fs::write(&path, vec![0x5Au8; 8192]).expect("write non-database bytes");
 
-    let result = BlobStorageBackend::redb(&path);
+    let result = BlobStorageBackend::redb(&path).await;
 
     match result {
         Err(StorageError::Internal(message)) => {
