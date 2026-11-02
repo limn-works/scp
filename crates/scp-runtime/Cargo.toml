@@ -119,28 +119,11 @@ scp-platform = { path = "../scp-platform", features = ["testing", "encrypting", 
 scp-event-log = { path = "../scp-event-log", features = ["testing"] }
 openmls_basic_credential = { workspace = true, features = ["test-utils"] }
 proptest = "1"
-scp-media = { path = "../scp-media" }
 static_assertions = { workspace = true }
 metrics-util = "0.19"
-# ADR-049 Decision 14 `perf_baseline` harness only. `scp-testing` re-exports the
-# `FullStackNetwork`/`FullStackNode` two-node MLS harness needed to drive the six
-# measured operations (notably `deliver_incoming`, which requires a genuine
-# second-member decryptable envelope). This is a DEV-only back-edge: dev-deps are
-# never part of the normal build graph, so it does NOT feed the
-# `scp-ffi → dep:scp-testing → scp-core{testing} → scp-runtime/testing` production
-# chain the feature-isolation comment above guards against.
-scp-testing = { path = "../scp-testing" }
 
 [[test]]
 name = "economy_integration"
-required-features = ["testing"]
-
-# ADR-049 Decision 14 benchmark. The `default-filter` in `.config/nextest.toml`
-# leaves it out of every `cargo nextest run`, so the default suite and CI never run
-# it; CI compiles it. Run it on demand with `cargo nextest run -p scp-runtime
-# --features testing --ignore-default-filter --test perf_baseline`.
-[[test]]
-name = "perf_baseline"
 required-features = ["testing"]
 
 [[test]]
@@ -153,10 +136,6 @@ required-features = ["testing"]
 
 [[test]]
 name = "phase2_integration"
-required-features = ["testing"]
-
-[[test]]
-name = "phase5_integration"
 required-features = ["testing"]
 
 [[test]]

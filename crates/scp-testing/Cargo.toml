@@ -119,6 +119,15 @@ scp-relay-client = { path = "../scp-relay-client" }
 # control surface is). scp-testing is a publish=false test crate, so a direct
 # dev-dep on the runtime is layering-clean.
 scp-runtime = { path = "../scp-runtime", features = ["testing"] }
+# `tests/phase5_integration.rs` drives the ADR-024 media session lifecycle and the
+# MLS group calls it keys from. That test and `tests/perf_baseline.rs` live in this
+# crate, not in scp-runtime, because both need a crate that depends on scp-runtime
+# (scp-media there, this crate's `fullstack` harness here): as scp-runtime
+# dev-dependencies, those crates made every scp-runtime test binary, its library
+# unit tests included, wait for scp-runtime, scp-core, scp-transport and scp-testing
+# to compile first.
+scp-media = { path = "../scp-media" }
+scp-mls = { path = "../scp-mls" }
 scp-protocol = { path = "../scp-protocol" }
 scp-clock = { path = "../scp-clock" }
 # The integration tests `tests/integration/identity.rs`, `discovery.rs`, `agent_binding.rs`
@@ -176,6 +185,14 @@ axum = { workspace = true, features = ["ws"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 hyper = "1"
+
+# ADR-049 Decision 14 benchmark. The `default-filter` in `.config/nextest.toml`
+# leaves it out of every `cargo nextest run`, so the default suite and CI never run
+# it; CI compiles it. Run it on demand with
+# `cargo nextest run -p scp-testing --ignore-default-filter --test perf_baseline`.
+[[test]]
+name = "perf_baseline"
+path = "tests/perf_baseline.rs"
 
 [[test]]
 name = "outlet_stream_conformance"

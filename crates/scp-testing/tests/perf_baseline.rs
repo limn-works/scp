@@ -4,7 +4,7 @@
 //! - `### 14. Performance regression as a rollback trigger`
 //! - `## Consequences` §Performance
 //!
-//! The ADR mandates a `cargo test -p scp-runtime --test perf_baseline` target
+//! The ADR mandates a `cargo test -p scp-testing --test perf_baseline` target
 //! that measures SIX operations at N = 1 / 4 / 16 (concurrency) and treats a
 //! **> 15 % regression on any (operation, N) pair** as rollback trigger #4.
 //! The six operations, and the two workload classes the ADR names:
@@ -25,7 +25,8 @@
 //! sender-key / access-key exchange across two `Supervisor`s) is exactly what
 //! `scp_testing::fullstack::FullStackNetwork` already drives. Per ADR guidance
 //! ("do not hand-roll protocol setup if a harness exists") this target reuses it
-//! via a **dev-only** dependency (see the note in `crates/scp-runtime/Cargo.toml`).
+//! from this crate, which depends on scp-runtime (see the note in
+//! `crates/scp-testing/Cargo.toml`).
 //! The harness is used only for untimed SETUP; every timed region calls the raw
 //! `Supervisor` operation directly, so the measurement is sensitive to a
 //! regression in the operation itself rather than diluted by harness overhead.
@@ -60,11 +61,11 @@
 //! change under test, then run `SCP_PERF_GATE=1` on the same box to assert.
 //!
 //! The `default-filter` in `.config/nextest.toml` leaves this binary out of every
-//! `cargo nextest run`, so neither a local run of scp-runtime's tests nor CI runs it;
+//! `cargo nextest run`, so neither a local run of scp-testing's tests nor CI runs it;
 //! CI compiles it. Run it on demand with
-//! `cargo nextest run -p scp-runtime --features testing --ignore-default-filter
-//! --test perf_baseline` (`--run-ignored all` does not lift a default filter), or
-//! with `cargo test -p scp-runtime --features testing --test perf_baseline`, which
+//! `cargo nextest run -p scp-testing --ignore-default-filter --test perf_baseline`
+//! (`--run-ignored all` does not lift a default filter), or with
+//! `cargo test -p scp-testing --test perf_baseline`, which
 //! reads no nextest configuration.
 //!
 //! A `NOISE_FLOOR_MICROS` guard suppresses the relative check when BOTH the
