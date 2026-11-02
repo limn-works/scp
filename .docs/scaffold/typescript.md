@@ -148,6 +148,20 @@ export default defineConfig({
 });
 ```
 
+## Node and identity types
+
+Every identity operation is a method on one `SCP` instance or on an `Identity` it returns, because the instance's Supervisor owns the identity store and the node network (`03-identity.md` §3.10.10). No free `Identity.create` exists.
+
+| Concept | TypeScript |
+|---------|------------|
+| Create an identity | `scp.identityCreate(config, signers)`, returning `Created` |
+| Canonical node URL, validated at construction | `NodeUrl` |
+| A context's node address, read-only: `url` and optional `bridge` | `NodeAddress` |
+| The accepted node list, read-only: `entries` and `nodeListSequence` | `AcceptedNodeList` |
+| Read the accepted node list, `null` where the instance holds none | `scp.identityNodeList()` |
+| Witness choice, name-bound | `{ kind: "CommunityDefault" }`, `{ kind: "Designated", witnesses }`, `{ kind: "NoWitness" }` |
+| One identity's handle, returned by `scp.identityCreate` (as `Created.identity`) and `scp.identityLoad` | `Identity` |
+
 ## Error Handling
 
 ```typescript

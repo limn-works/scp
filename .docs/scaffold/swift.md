@@ -150,20 +150,32 @@ public struct Identity: Sendable {
 
     private let handle: IdentityHandle
 
+    public func rotateActive(reason: RotationReason, signers: SignerPlan) async throws -> EventOutcome { ... }
+}
+
+extension SCP {
     /// `IdentityConfig` is the config object
     /// `.docs/standards/construction.md` states. Its `custody` slot carries the
     /// bridge's `KeyCustodyConfig` and carries no default, because that slot
-    /// decides where an identity's private key lives.
-    public static func create(config: IdentityConfig) async throws -> Identity {
-        let handle = try await ScpBindings.identityCreate(config: config)
-        return Identity(identifier: handle.identifier(), custodyType: handle.custodyType(), handle: handle)
-    }
+    /// decides where an identity's private key lives. The identity's records
+    /// live in this instance's store, so the config names no store
+    /// (`03-identity.md` §3.10.10). No free `Identity.create` exists.
+    public func identityCreate(config: IdentityConfig, signers: SignerPlan) async throws -> Created { ... }
 
-    public static func load(identifier: Data) async throws -> Identity { ... }
-
-    public func rotateKey() async throws -> Identity { ... }
+    public func identityLoad(identifier: Data) async throws -> Identity { ... }
 }
 ```
+
+### Node and identity types
+
+| Concept | Swift |
+|---------|-------|
+| Canonical node URL, validated at construction | `NodeUrl` |
+| A context's node address, read-only: `url` and optional `bridge` | `NodeAddress` |
+| The accepted node list, read-only: `entries` and `nodeListSequence` | `AcceptedNodeList` |
+| Read the accepted node list, `nil` where the instance holds none | `scp.identityNodeList()` |
+| Witness choice, name-bound | `WitnessChoice.CommunityDefault`, `.Designated(witnesses:)`, `.NoWitness` |
+| One identity's handle, returned by `scp.identityCreate` (as `Created.identity`) and `scp.identityLoad` | `Identity` |
 
 ### Error types
 
