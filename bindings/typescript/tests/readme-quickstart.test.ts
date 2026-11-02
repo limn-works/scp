@@ -21,11 +21,12 @@ import { describe, expect, it } from "bun:test";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { loadNativeAddon } from "../src/internal/native";
 import { napiSuite } from "./napi-guard";
 
-const PACKAGE_ROOT = join(import.meta.dir, "..");
+const PACKAGE_ROOT = fileURLToPath(new URL("../", import.meta.url));
 const README = join(PACKAGE_ROOT, "README.md");
 const QUICK_START = "Quick Start";
 const ERROR_HANDLING = "Error Handling";

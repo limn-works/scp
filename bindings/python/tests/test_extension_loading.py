@@ -36,6 +36,11 @@ from scp_sdk.errors import CODE_PREFIX_MAP, ScpError, ValidationError
 #: a file of exactly this shape.
 FOREIGN_TAGGED_EXTENSION = "_scp_core.cpython-000-scp-test.so"
 
+#: ``bindings/python``, which holds ``scp_sdk/`` and this ``tests/`` directory.
+_PYTHON_ROOT = Path(__file__).resolve().parents[1]
+#: The repository root, which holds the repository-root ``tests/`` directory.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
 #: Every SDK module whose bridge accessor must route through
 #: :func:`scp_sdk._extension.native_module`. Each one carried its own copy of the
 #: `import _scp_core` / `except ImportError` block, and each copy reported a load
@@ -424,7 +429,7 @@ def test_the_loader_is_the_only_sdk_module_that_imports_the_extension() -> None:
     ``__import__`` passes this assertion, because `_count_extension_imports`
     counts import statements only.
     """
-    package_directory = Path(_extension.__file__).parent
+    package_directory = _PYTHON_ROOT / "scp_sdk"
     counts = {
         path.relative_to(package_directory).as_posix(): _count_extension_imports(path.read_text())
         for path in package_directory.rglob("*.py")
@@ -465,17 +470,15 @@ def test_no_sdk_or_test_file_imports_the_extension_by_its_bare_name() -> None:
     reads both test directories as well. The repository-root ``tests/``
     directory holds ``tests/integration/phase3_integration_test.py``.
     """
-    python_root = Path(_extension.__file__).resolve().parent.parent
-    repo_root = python_root.parent.parent
-    directories = (python_root / "scp_sdk", python_root / "tests", repo_root / "tests")
+    directories = (_PYTHON_ROOT / "scp_sdk", _PYTHON_ROOT / "tests", _REPO_ROOT / "tests")
     offenders = {
-        path.relative_to(repo_root).as_posix(): count
+        path.relative_to(_REPO_ROOT).as_posix(): count
         for directory in directories
         for path in directory.rglob("*.py")
         if (count := _count_bare_name_imports(path.read_text()))
     }
     assert offenders == {}
-    assert (repo_root / "tests" / "integration" / "phase3_integration_test.py").is_file()
+    assert (_REPO_ROOT / "tests/integration/phase3_integration_test.py").is_file()
 
 
 @pytest.mark.parametrize(
@@ -623,7 +626,7 @@ def _import_package_over(extension_source: str) -> str:
     ) + textwrap.dedent(extension_source)
     completed = subprocess.run(
         [sys.executable, "-c", program],
-        cwd=Path(__file__).resolve().parents[1],
+        cwd=_PYTHON_ROOT,
         capture_output=True,
         text=True,
         check=True,

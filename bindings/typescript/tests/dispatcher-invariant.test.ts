@@ -24,17 +24,15 @@
 
 import { describe, expect, test } from "bun:test";
 import { readdirSync, readFileSync } from "node:fs";
-import { basename, dirname, join, resolve } from "node:path";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-const REPO_ROOT = resolve(__dirname, "../../..");
+const REPO_ROOT = fileURLToPath(new URL("../../../", import.meta.url));
 
-const NAPI_SRC_DIR = join(REPO_ROOT, "crates", "scp-ffi", "napi", "src");
-const SCP_RS = join(NAPI_SRC_DIR, "scp.rs");
-const DISPATCHER_TS = join(REPO_ROOT, "bindings", "typescript", "src", "internal", "native.ts");
+const NAPI_SRC_DIR = join(REPO_ROOT, "crates/scp-ffi/napi/src");
+const SCP_RS = join(REPO_ROOT, "crates/scp-ffi/napi/src/scp.rs");
+const DISPATCHER_TS = join(REPO_ROOT, "bindings/typescript/src/internal/native.ts");
 
 // ---------------------------------------------------------------------------
 // Naming conversion (Rust snake_case → napi-rs default camelCase)
@@ -492,7 +490,7 @@ describe("dispatcher invariant (ADR-048 §1 + §7)", () => {
 // `scp-class.test.ts` and the whole of `e2e-fullstack.test.ts` skipped that way
 // on every run of the `typescript-check` job until this invariant was enforced.
 
-const TESTS_DIR = join(REPO_ROOT, "bindings", "typescript", "tests");
+const TESTS_DIR = join(REPO_ROOT, "bindings/typescript/tests");
 const NAPI_PACKAGE_PREFIX = "@limn-works/scp-ts-napi";
 
 /** Removes block and line comments so prose naming a package is not a hit. */
@@ -506,7 +504,7 @@ describe("native addon loader invariant", () => {
       .filter((name) => name.endsWith(".ts"))
       // This file states the criterion, so it names the prefix in order to
       // search for it; every other file naming it resolves the addon itself.
-      .filter((name) => name !== basename(__filename))
+      .filter((name) => name !== "dispatcher-invariant.test.ts")
       .filter((name) =>
         stripComments(readFileSync(join(TESTS_DIR, name), "utf8")).includes(NAPI_PACKAGE_PREFIX),
       );

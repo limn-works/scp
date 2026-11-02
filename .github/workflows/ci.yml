@@ -506,6 +506,12 @@ jobs:
               # this lane builds.
               - 'crates/scp-alloc/**'
               - 'crates/scp-ffi/common/**'
+              # Job python-lint runs this script, and tests/test_falsy_optionals.py
+              # runs it too.
+              - 'scripts/check-python-falsy-optionals.py'
+              # tests/test_conftest_extension_guard.py and tests/test_extension_loading.py
+              # read the conftest loader in tests/integration/phase3_integration_test.py.
+              - 'tests/integration/**'
             typescript:
               - 'bindings/typescript/**'
               - 'crates/scp-ffi/napi/**'
@@ -3314,7 +3320,9 @@ jobs:
     if: >-
       needs.changes.outputs.python == 'true' ||
       needs.changes.outputs.typescript == 'true' ||
+      needs.changes.outputs.typescript-wasm == 'true' ||
       needs.changes.outputs.kotlin == 'true' ||
+      needs.changes.outputs.swift == 'true' ||
       needs.changes.outputs.rust == 'true'
     name: Bridge artifact / PyO3 module (linux)
     runs-on: ubuntu-latest
@@ -3797,9 +3805,16 @@ jobs:
     # Job pyo3-module builds the extension module this job imports. This job runs no
     # cargo command, so it installs no Rust toolchain and reads no cargo cache.
     needs: [changes, pyo3-module]
+    # The typescript, typescript-wasm, kotlin and swift outputs select this job
+    # because tests/test_outlets_streaming.py scans every SDK's public sources
+    # under bindings/ for a banned symbol, so a change to any of them can break it.
     if: >-
       github.event_name != 'push' &&
       (needs.changes.outputs.python == 'true' ||
+      needs.changes.outputs.typescript == 'true' ||
+      needs.changes.outputs.typescript-wasm == 'true' ||
+      needs.changes.outputs.kotlin == 'true' ||
+      needs.changes.outputs.swift == 'true' ||
       needs.changes.outputs.rust == 'true')
     name: Python / test
     runs-on: ubuntu-latest

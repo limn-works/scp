@@ -19,10 +19,13 @@ def test_set_target_dir_is_read_without_running_cargo(monkeypatch: pytest.Monkey
     assert conftest._cargo_target_dir() == conftest.Path("/ci/workspace/target")
 
 
-def test_relative_target_dir_resolves_against_repo_root(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_relative_target_dir_resolves_against_the_working_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: conftest.Path
+) -> None:
     monkeypatch.setattr(conftest.subprocess, "run", _forbid_cargo)
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("CARGO_TARGET_DIR", "target")
-    assert conftest._cargo_target_dir() == conftest._REPO_ROOT / "target"
+    assert conftest._cargo_target_dir() == tmp_path / "target"
 
 
 @pytest.mark.parametrize("value", [None, ""])
@@ -41,4 +44,14 @@ def test_unset_or_empty_target_dir_asks_cargo(
     else:
         monkeypatch.setenv("CARGO_TARGET_DIR", value)
     assert conftest._cargo_target_dir() == conftest.Path("/shared")
-    assert calls == [["cargo", "metadata", "--format-version", "1", "--no-deps"]]
+    assert calls == [
+        [
+            "cargo",
+            "metadata",
+            "--format-version",
+            "1",
+            "--no-deps",
+            "--manifest-path",
+            str(conftest._WORKSPACE_MANIFEST),
+        ]
+    ]

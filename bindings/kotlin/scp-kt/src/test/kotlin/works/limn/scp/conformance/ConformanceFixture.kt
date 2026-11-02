@@ -39,29 +39,20 @@ data class ConformanceFixture(
 object ConformanceFixtureLoader {
     private val json = Json { ignoreUnknownKeys = true }
 
-    private val searchPaths =
-        listOf(
-            "tests/conformance",
-            "../../tests/conformance",
-            "../../../../tests/conformance",
-            "../../../../../tests/conformance",
-        )
+    /** The repository root: Gradle runs this module's tests in `bindings/kotlin/scp-kt`, three levels below it. */
+    private val repositoryRoot = File(System.getProperty("user.dir")).parentFile.parentFile.parentFile
 
     fun loadFixtures(): List<ConformanceFixture> {
-        for (relativePath in searchPaths) {
-            val dir = File(relativePath)
-            if (!dir.exists() || !dir.isDirectory) continue
-
-            return dir.walkTopDown()
-                .filter { it.isFile && it.extension == "json" }
-                .mapNotNull { file ->
-                    runCatching {
-                        json.decodeFromString<ConformanceFixture>(file.readText())
-                    }.getOrNull()
-                }
-                .toList()
-        }
-        return emptyList()
+        val dir = repositoryRoot.resolve("tests/conformance")
+        if (!dir.isDirectory) return emptyList()
+        return dir.walkTopDown()
+            .filter { it.isFile && it.extension == "json" }
+            .mapNotNull { file ->
+                runCatching {
+                    json.decodeFromString<ConformanceFixture>(file.readText())
+                }.getOrNull()
+            }
+            .toList()
     }
 
     fun loadFixturesByCategory(category: String): List<ConformanceFixture> {

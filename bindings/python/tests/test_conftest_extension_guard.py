@@ -450,8 +450,10 @@ def _site_consults_loader(site: _SkipSite, source: str) -> bool:
     return isinstance(reason, ast.Name) and reason.id == name and _is_absence_variable(name, source)
 
 
-#: The repository root: ``bindings/python/tests/conftest.py`` sits three levels below it.
-_REPO_ROOT = Path(conftest.__file__).resolve().parents[3]
+#: The repository root: this file and ``conftest.py`` sit three levels below it.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+#: ``bindings/python/tests``, the directory that holds this file and ``conftest.py``.
+_TESTS_DIR = Path(__file__).resolve().parent
 
 #: Skip sites that ``_site_consults_loader`` rejects,
 #: keyed by ``(repository-relative file, enclosing function)``, with the exact
@@ -476,20 +478,20 @@ def _scanned_test_files() -> list[Path]:
     (recursively, so ``bridge_parity/`` is included) and the repository-root
     ``tests/`` directory, which holds
     ``tests/integration/phase3_integration_test.py``."""
-    roots = (Path(conftest.__file__).resolve().parent, _REPO_ROOT / "tests")
+    roots = (_TESTS_DIR, _REPO_ROOT / "tests")
     return sorted(path for root in roots for path in root.rglob("*.py"))
 
 
-def _non_loader_skip_sites(paths: list[Path], root: Path) -> dict[tuple[str, str], int]:
-    """Count, per ``(file relative to root, enclosing function)``, the skip sites
-    in ``paths`` that ``_site_consults_loader`` rejects."""
+def _non_loader_skip_sites(files: dict[str, Path]) -> dict[tuple[str, str], int]:
+    """Count, per ``(file name, enclosing function)``, the skip sites in the files
+    ``files`` maps each name to that ``_site_consults_loader`` rejects."""
     counts: dict[tuple[str, str], int] = {}
-    for path in paths:
+    for name, path in files.items():
         source = path.read_text()
         for site in _skip_sites(source):
             if _site_consults_loader(site, source):
                 continue
-            key = (path.relative_to(root).as_posix(), site.where)
+            key = (name, site.where)
             counts[key] = counts.get(key, 0) + 1
     return counts
 
@@ -503,7 +505,9 @@ def test_every_skip_site_takes_its_reason_from_the_absence_check() -> None:
     The only exceptions are the sites `_NON_LOADER_SKIP_SITES` names; each one is
     conditioned on SCP-VALID-7081 by other means or gates on something other than
     the Python extension."""
-    found = _non_loader_skip_sites(_scanned_test_files(), _REPO_ROOT)
+    found = _non_loader_skip_sites(
+        {path.relative_to(_REPO_ROOT).as_posix(): path for path in _scanned_test_files()}
+    )
     assert found == _NON_LOADER_SKIP_SITES, (
         "skip sites that do not consult skip_reason_if_extension_absent differ from "
         f"the reviewed table; found {found}, expected {_NON_LOADER_SKIP_SITES}"
@@ -526,7 +530,7 @@ def test_the_skip_scan_reports_a_planted_non_conforming_file(tmp_path: Path) -> 
         "def test_x():\n    pytest.skip('no native')\n\n"
         "@pytest.mark.skip\ndef test_y():\n    pass\n"
     )
-    found = _non_loader_skip_sites(sorted(tmp_path.glob("*.py")), tmp_path)
+    found = _non_loader_skip_sites({path.name: path for path in sorted(tmp_path.glob("*.py"))})
     # A decorator is attributed to the function it decorates.
     assert found == {("test_planted.py", "test_x"): 1, ("test_planted.py", "test_y"): 1}
 
@@ -541,7 +545,7 @@ def test_the_skip_scan_reads_the_repository_root_tests() -> None:
 
 def test_the_skip_scan_reads_the_bridge_parity_package() -> None:
     """The scan's file set includes the subpackage the bridge-parity jobs run."""
-    tests_dir = Path(conftest.__file__).resolve().parent
+    tests_dir = _TESTS_DIR
     scanned = {
         path.relative_to(tests_dir).parts[0]
         for path in _scanned_test_files()
@@ -554,7 +558,7 @@ def test_the_skip_scan_accepts_the_skipif_shape_that_consults_the_loader() -> No
     """The `skipif` guards in test_join_from_welcome.py and the Phase 3
     integration test pass the scan."""
     for path in (
-        Path(conftest.__file__).parent / "test_join_from_welcome.py",
+        _TESTS_DIR / "test_join_from_welcome.py",
         _REPO_ROOT / "tests/integration/phase3_integration_test.py",
     ):
         source = path.read_text()
