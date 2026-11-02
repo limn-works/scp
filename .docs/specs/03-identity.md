@@ -1571,7 +1571,7 @@ pub struct ResolutionOutcome {
 /// chain derived, and the instant of the resolution. Only the verdict
 /// classifier constructs it, on `Confirmed` or `Adopted`, so every
 /// verification decision that reads key state reads one a resolution accepted.
-pub struct ResolvedState { /* the replayed state, the identifier, the head's digest and sequence, and the resolution instant; private */ }
+pub struct ResolvedState { /* the validated chain, the replayed state, the identifier, the head's digest and sequence, and the resolution instant; private */ }
 
 impl ResolvedState {
     /// The identifier the resolved chain's inception recomputes to.
@@ -1581,6 +1581,16 @@ impl ResolvedState {
     /// The sequence of the resolved chain's head event.
     pub fn head_sequence(&self) -> u64;
     pub fn key_state(&self) -> &KeyState;
+    /// The key state at the resolved chain's event whose
+    /// `09-security-model.md` §9.5.1 preimage digest is `digest`: that
+    /// position's latest snapshot with the standing commitment at that
+    /// position, whatever events follow it (`09-security-model.md` §9.7.4.2
+    /// R8). A verifier reads a log-anchored signature's key here, at the
+    /// signed object's `key_state_head` (`09-security-model.md` §9.7.1, the
+    /// log-anchored row), so the key is read on the chain the resolution
+    /// adopted and never on a chain the signer hands in. `NotOnChain` where
+    /// no event of the resolved chain has that digest.
+    pub fn key_state_at(&self, digest: &[u8; 32]) -> Result<KeyState, NotOnChain>;
     pub fn standing_commitment(&self) -> &StandingCommitment;
     /// False once `MAX_ATTESTATION_KEY_RESOLUTION_STALENESS`
     /// (`09-security-model.md` §9.18.7) has passed since the resolution, and
