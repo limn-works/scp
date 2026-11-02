@@ -319,6 +319,90 @@ pub enum MlsError {
     /// provider, Welcome join) and when its scalar is read for a pseudonym.
     #[error("invalid MLS signer: {0}")]
     InvalidSigner(SignerDefect),
+
+    /// A governance leaf block failed to seal or open
+    /// (`07-trust-validation-and-capabilities.md` §7.3.1.1).
+    #[error("governance leaf block: {0}")]
+    GovernanceLeafBlock(#[from] GovernanceLeafBlockError),
+
+    /// A frame handed to the Commit receive path is not a Commit.
+    #[error("frame is not a Commit")]
+    NotACommit,
+
+    /// A staged Commit was merged into a group that is not the group, or not
+    /// in the epoch, it was staged for.
+    #[error("staged commit is for epoch {staged_epoch}, group is in epoch {group_epoch}")]
+    StagedCommitMismatch {
+        /// The sending epoch the Commit was staged in.
+        staged_epoch: u64,
+        /// The epoch the group is in now.
+        group_epoch: u64,
+    },
+
+    /// The group's join configuration differs from the configuration SCP
+    /// sets, so the committer will not rewrite it to pad a Commit.
+    #[error("group configuration differs from the SCP configuration")]
+    UnexpectedGroupConfiguration,
+
+    /// Setting or restoring the Commit padding size failed
+    /// (`09-security-model.md` §9.10.3).
+    #[error("commit padding: {0}")]
+    CommitPadding(String),
+}
+
+/// Why a governance leaf block failed to seal or open
+/// (`07-trust-validation-and-capabilities.md` §7.3.1.1 "Canonical encoding").
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum GovernanceLeafBlockError {
+    /// The body exceeds 32,764 bytes, so no block can carry it.
+    #[error("body is {len} bytes, at most 32764 fit one block")]
+    BodyTooLarge {
+        /// The body length.
+        len: usize,
+    },
+    /// The block is not 21 + `ciphertext_len` bytes.
+    #[error("block is {len} bytes, expected 32805")]
+    WrongLength {
+        /// The block length.
+        len: usize,
+    },
+    /// The block does not start with `b"SCPG"`.
+    #[error("block magic is not SCPG")]
+    WrongMagic,
+    /// The block's version is not one this crate accepts.
+    #[error("unknown block version {0}")]
+    UnknownVersion(u8),
+    /// `ciphertext_len` is not 32,784.
+    #[error("ciphertext_len is {0}, expected 32784")]
+    WrongCiphertextLen(u32),
+    /// The AES-128-GCM tag did not verify under the block's key and binding.
+    #[error("block AEAD tag does not verify")]
+    TagMismatch,
+    /// A padding byte after the body is not zero.
+    #[error("block padding is not all zero")]
+    NonZeroPadding,
+    /// The decrypted `body_len` exceeds 32,764.
+    #[error("body_len is {0}, at most 32764")]
+    BodyLenTooLarge(u32),
+    /// The context id that keys the block is empty.
+    #[error("context id is empty")]
+    EmptyContextId,
+    /// The group ID does not fit a 32-bit length.
+    #[error("group id is {len} bytes, too long for the block binding")]
+    GroupIdTooLong {
+        /// The group ID length.
+        len: usize,
+    },
+    /// The MLS exporter could not produce the block key.
+    #[error("block key export failed: {0}")]
+    KeyExport(String),
+    /// The AEAD failed to encrypt.
+    #[error("block seal failed: {0}")]
+    Seal(String),
+    /// The CSPRNG failed to produce a nonce.
+    #[error("block nonce generation failed: {0}")]
+    Random(String),
 }
 
 /// Why an MLS signer failed the P-256 check that every restore runs.

@@ -12467,7 +12467,7 @@
       "gate": "gate-gov-commit",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "in-progress",
       "files": [
         "crates/scp-mls/src/governance_leaf_block.rs",
         "crates/scp-mls/src/lib.rs",

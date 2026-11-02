@@ -539,7 +539,13 @@ mod tests {
                 &SystemClock,
             )
             .unwrap();
-            let add = add_member(alice, bundle.key_package().clone().into(), &SystemClock).unwrap();
+            let add = add_member(
+                alice,
+                bundle.key_package().clone().into(),
+                &crate::GovernanceLeafBlockInput::empty("test-context"),
+                &SystemClock,
+            )
+            .unwrap();
             let joined = join_group(&add.welcome, provider, signer, &SystemClock).unwrap();
             (add.commit, joined)
         };
@@ -599,9 +605,14 @@ mod tests {
     fn add_without_wrapping_key_is_rejected_by_adder_and_bystanders() {
         let mut f = fixture();
 
-        let err = add_member(&mut f.alice, keyless_kp("carol").into(), &SystemClock)
-            .err()
-            .expect("admission refuses the add");
+        let err = add_member(
+            &mut f.alice,
+            keyless_kp("carol").into(),
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
+            &SystemClock,
+        )
+        .err()
+        .expect("admission refuses the add");
         assert_eq!(
             rejection(&err),
             Some(LeafAdmissionRejection::MissingWrappingKey)
@@ -631,9 +642,14 @@ mod tests {
         let other = valid_uncompressed_point(0x77);
         assert_ne!(other, uncompressed_point_for(&did("bob")));
 
-        let err = add_member(&mut f.alice, kp("bob", &other).into(), &SystemClock)
-            .err()
-            .expect("admission refuses the add");
+        let err = add_member(
+            &mut f.alice,
+            kp("bob", &other).into(),
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
+            &SystemClock,
+        )
+        .err()
+        .expect("admission refuses the add");
         assert_eq!(
             rejection(&err),
             Some(LeafAdmissionRejection::WrappingKeyMismatch)
@@ -717,9 +733,14 @@ mod tests {
         decrypt_with_sender_did(&mut f.dave, &commit).unwrap();
         assert_eq!(f.dave.epoch().unwrap(), 3);
 
-        let err = add_member(&mut f.alice, kp("frank", &key).into(), &SystemClock)
-            .err()
-            .expect("admission refuses the add");
+        let err = add_member(
+            &mut f.alice,
+            kp("frank", &key).into(),
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
+            &SystemClock,
+        )
+        .err()
+        .expect("admission refuses the add");
         assert_eq!(rejection(&err), Some(LeafAdmissionRejection::TooManyLeaves));
 
         let commit = hostile_add(&mut f.alice, &[kp("frank", &key)]);
@@ -883,8 +904,13 @@ mod tests {
         let bob = leaf_of(&f.alice, "bob");
         propose_remove(&mut f, bob);
 
-        let add = add_member(&mut f.alice, kp("bob", &new_key).into(), &SystemClock)
-            .expect("the post-commit tree holds one Bob leaf, under the new key");
+        let add = add_member(
+            &mut f.alice,
+            kp("bob", &new_key).into(),
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
+            &SystemClock,
+        )
+        .expect("the post-commit tree holds one Bob leaf, under the new key");
         let new_key = scp_protocol::crypto::hpke::p256::P256Point::try_from(new_key).unwrap();
         let empty = std::collections::HashMap::new();
         assert_eq!(
@@ -919,8 +945,13 @@ mod tests {
 
         let frank = leaf_of(&f.alice, "frank");
         propose_remove(&mut f, frank);
-        let add = add_member(&mut f.alice, kp("frank", &key).into(), &SystemClock)
-            .expect("ten leaves after the commit");
+        let add = add_member(
+            &mut f.alice,
+            kp("frank", &key).into(),
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
+            &SystemClock,
+        )
+        .expect("ten leaves after the commit");
         let bytes = add.commit.tls_serialize_detached().unwrap();
         decrypt_with_sender_did(&mut f.dave, &bytes)
             .expect("the bystander counts the post-commit tree");
@@ -969,7 +1000,13 @@ mod tests {
 
         // Removing one of Bob's two leaves leaves him a member.
         let first = leaf_of(&f.alice, "bob");
-        let remove = crate::group::remove_member(&mut f.alice, first, &SystemClock).unwrap();
+        let remove = crate::group::remove_member(
+            &mut f.alice,
+            first,
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
+            &SystemClock,
+        )
+        .unwrap();
         let leaf_dids = received(&mut f.dave, &remove.commit_bytes);
         assert_eq!(count(&leaf_dids.before, "bob"), 2);
         assert_eq!(count(&leaf_dids.after, "bob"), 1);
@@ -981,7 +1018,13 @@ mod tests {
 
         // Removing Bob's last leaf is one RemoveMember.
         let last = leaf_of(&f.alice, "bob");
-        let remove = crate::group::remove_member(&mut f.alice, last, &SystemClock).unwrap();
+        let remove = crate::group::remove_member(
+            &mut f.alice,
+            last,
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
+            &SystemClock,
+        )
+        .unwrap();
         let change = classify_commit_membership(&received(&mut f.dave, &remove.commit_bytes));
         assert_eq!(change.removed_dids, vec![did("bob")]);
         assert!(change.added_dids.is_empty());
@@ -990,6 +1033,7 @@ mod tests {
         let add = add_member(
             &mut f.alice,
             kp("erin", &uncompressed_point_for(&did("erin"))).into(),
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
             &SystemClock,
         )
         .unwrap();
@@ -1022,10 +1066,14 @@ mod tests {
         cache_proposal(&mut f.dave, &proposal);
 
         // The committer's own admission refuses and clears the Commit.
-        let err =
-            crate::ratchet::propose_update_with_wrapping_key(&mut f.bob, &new_key, &SystemClock)
-                .err()
-                .expect("the committer refuses its own commit");
+        let err = crate::ratchet::propose_update_with_wrapping_key(
+            &mut f.bob,
+            &new_key,
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
+            &SystemClock,
+        )
+        .err()
+        .expect("the committer refuses its own commit");
         assert_eq!(
             rejection(&err),
             Some(LeafAdmissionRejection::WrappingKeyMismatch)

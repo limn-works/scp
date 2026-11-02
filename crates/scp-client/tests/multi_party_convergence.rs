@@ -623,7 +623,13 @@ fn remove_commit_is_rejected_fail_closed_without_skew() {
         .generate_key_package_for_join(CTX)
         .expect("Bob key package");
     let bob_kp_in = scp_mls::wire::parse_key_package_in(&bob_kp_bytes).expect("bob kp deserialize");
-    let add_bob = add_member(&mut alice_group, bob_kp_in, &SystemClock).expect("Alice adds Bob");
+    let add_bob = add_member(
+        &mut alice_group,
+        bob_kp_in,
+        &scp_mls::GovernanceLeafBlockInput::empty("test-context"),
+        &SystemClock,
+    )
+    .expect("Alice adds Bob");
     let bob_welcome = add_bob
         .welcome
         .tls_serialize_detached()
@@ -696,8 +702,13 @@ fn remove_commit_is_rejected_fail_closed_without_skew() {
         })
         .map(|m| m.index)
         .expect("Carol's leaf index");
-    let remove_carol =
-        remove_member(&mut alice_group, carol_leaf, &SystemClock).expect("Alice removes Carol");
+    let remove_carol = remove_member(
+        &mut alice_group,
+        carol_leaf,
+        &scp_mls::GovernanceLeafBlockInput::empty("test-context"),
+        &SystemClock,
+    )
+    .expect("Alice removes Carol");
     let remove_carol_commit = remove_carol
         .commit
         .tls_serialize_detached()

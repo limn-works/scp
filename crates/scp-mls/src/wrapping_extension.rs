@@ -335,7 +335,13 @@ mod tests {
         let mut alice_group =
             crate::group::create_group(&test_credential("alice"), &point(0xAA), &SystemClock)
                 .unwrap();
-        let add = crate::group::add_member(&mut alice_group, bob_kp_in, &SystemClock).unwrap();
+        let add = crate::group::add_member(
+            &mut alice_group,
+            bob_kp_in,
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
+            &SystemClock,
+        )
+        .unwrap();
         assert_eq!(add.admitted_did, bob_cred.did);
         assert_eq!(
             add.admitted_wrapping_key,
@@ -418,8 +424,13 @@ mod tests {
             crate::group::generate_key_package(&bob_cred, &bob_wrapping, &SystemClock).unwrap();
 
         let bob_kp_in: KeyPackageIn = bob_kp.key_package().clone().into();
-        let add_result =
-            crate::group::add_member(&mut alice_group, bob_kp_in, &SystemClock).unwrap();
+        let add_result = crate::group::add_member(
+            &mut alice_group,
+            bob_kp_in,
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
+            &SystemClock,
+        )
+        .unwrap();
 
         let bob_group =
             crate::group::join_group(&add_result.welcome, bob_provider, bob_signer, &SystemClock)
@@ -450,8 +461,13 @@ mod tests {
         let (bob_kp, bob_signer, bob_provider) =
             crate::group::generate_key_package(&bob_cred, &bob_wrapping, &SystemClock).unwrap();
         let bob_kp_in: KeyPackageIn = bob_kp.key_package().clone().into();
-        let add_result =
-            crate::group::add_member(&mut alice_group, bob_kp_in, &SystemClock).unwrap();
+        let add_result = crate::group::add_member(
+            &mut alice_group,
+            bob_kp_in,
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
+            &SystemClock,
+        )
+        .unwrap();
         let bob_group =
             crate::group::join_group(&add_result.welcome, bob_provider, bob_signer, &SystemClock)
                 .unwrap();
@@ -495,8 +511,13 @@ mod tests {
         let (bob_kp, bob_signer, bob_provider) =
             crate::group::generate_key_package(&bob_cred, &bob_wrapping, &SystemClock).unwrap();
         let bob_kp_in: KeyPackageIn = bob_kp.key_package().clone().into();
-        let add_result =
-            crate::group::add_member(&mut alice_group, bob_kp_in, &SystemClock).unwrap();
+        let add_result = crate::group::add_member(
+            &mut alice_group,
+            bob_kp_in,
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
+            &SystemClock,
+        )
+        .unwrap();
 
         let mut bob_group =
             crate::group::join_group(&add_result.welcome, bob_provider, bob_signer, &SystemClock)
@@ -506,6 +527,7 @@ mod tests {
         let commit = crate::ratchet::propose_update_with_wrapping_key(
             &mut alice_group,
             &wrapping_key,
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
             &SystemClock,
         )
         .unwrap()
@@ -541,15 +563,25 @@ mod tests {
         )
         .unwrap();
         let bob_kp_in: KeyPackageIn = bob_kp.key_package().clone().into();
-        let _add_result = crate::group::add_member(&mut group, bob_kp_in, &SystemClock).unwrap();
+        let _add_result = crate::group::add_member(
+            &mut group,
+            bob_kp_in,
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
+            &SystemClock,
+        )
+        .unwrap();
 
         // Simulate identity key rotation: generate a NEW wrapping key and
         // publish it via update.
         let new_key = point(0xFF);
-        let _commit =
-            crate::ratchet::propose_update_with_wrapping_key(&mut group, &new_key, &SystemClock)
-                .unwrap()
-                .commit;
+        let _commit = crate::ratchet::propose_update_with_wrapping_key(
+            &mut group,
+            &new_key,
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
+            &SystemClock,
+        )
+        .unwrap()
+        .commit;
 
         // After the update, the wrapping key should be the new value.
         let extracted = extract_own_wrapping_key(&group).unwrap();

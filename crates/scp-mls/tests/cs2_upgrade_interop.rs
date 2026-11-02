@@ -113,7 +113,11 @@ fn exchange(groups: &mut [&mut ScpMlsGroup], round: &str) -> TestResult {
 /// Each group in turn commits a self-Update, and every other group merges it.
 fn self_update_each(groups: &mut [&mut ScpMlsGroup]) -> TestResult {
     for committer in 0..groups.len() {
-        let update = propose_update(groups[committer], &SystemClock)?;
+        let update = propose_update(
+            groups[committer],
+            &scp_mls::GovernanceLeafBlockInput::empty("test-context"),
+            &SystemClock,
+        )?;
         for (receiver, group) in groups.iter_mut().enumerate() {
             if receiver != committer {
                 merge_commit(group, &update.commit_bytes)?;
@@ -174,7 +178,12 @@ fn cs2_state_and_messages_from_openmls_0_9_0_interoperate() -> TestResult {
 
     // Restored A adds a KeyPackage built by the current build.
     let (d_kp, d_signer, d_provider) = key_package(D)?;
-    let add_d = add_member(&mut a, d_kp, &SystemClock)?;
+    let add_d = add_member(
+        &mut a,
+        d_kp,
+        &scp_mls::GovernanceLeafBlockInput::empty("test-context"),
+        &SystemClock,
+    )?;
     let commit_d = serialize_mls_message(&add_d.commit)?;
     merge_commit(&mut b, &commit_d)?;
     merge_commit(&mut c, &commit_d)?;
@@ -199,12 +208,22 @@ fn capture_cs2_upgrade_fixtures() -> TestResult {
 
     let mut a = create_group(&credential(A)?, &uncompressed_point_for(A), &SystemClock)?;
     let (b_kp, b_signer, b_provider) = key_package(B)?;
-    let add_b = add_member(&mut a, b_kp, &SystemClock)?;
+    let add_b = add_member(
+        &mut a,
+        b_kp,
+        &scp_mls::GovernanceLeafBlockInput::empty("test-context"),
+        &SystemClock,
+    )?;
     let mut b = join_group(&add_b.welcome, b_provider, b_signer, &SystemClock)?;
 
     let (c_kp, c_signer, c_provider) = key_package(C)?;
     let c_pending = serialize_pending_join(&c_provider, &c_signer, C, C_CONTEXT)?;
-    let add_c = add_member(&mut a, c_kp, &SystemClock)?;
+    let add_c = add_member(
+        &mut a,
+        c_kp,
+        &scp_mls::GovernanceLeafBlockInput::empty("test-context"),
+        &SystemClock,
+    )?;
     let commit_c = serialize_mls_message(&add_c.commit)?;
     let welcome_c = serialize_mls_message(&add_c.welcome)?;
     merge_commit(&mut b, &commit_c)?;

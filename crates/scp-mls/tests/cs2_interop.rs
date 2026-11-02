@@ -87,11 +87,21 @@ fn three_members_interoperate_on_cs2() -> TestResult {
     let mut a = create_group(&credential(A)?, &uncompressed_point_for(A), &SystemClock)?;
 
     let (b_kp, b_signer, b_provider) = key_package(B)?;
-    let add_b = add_member(&mut a, b_kp, &SystemClock)?;
+    let add_b = add_member(
+        &mut a,
+        b_kp,
+        &scp_mls::GovernanceLeafBlockInput::empty("test-context"),
+        &SystemClock,
+    )?;
     let mut b = join_group(&add_b.welcome, b_provider, b_signer, &SystemClock)?;
 
     let (c_kp, c_signer, c_provider) = key_package(C)?;
-    let add_c = add_member(&mut a, c_kp, &SystemClock)?;
+    let add_c = add_member(
+        &mut a,
+        c_kp,
+        &scp_mls::GovernanceLeafBlockInput::empty("test-context"),
+        &SystemClock,
+    )?;
     merge_commit(&mut b, &serialize_mls_message(&add_c.commit)?)?;
     let mut c = join_group(&add_c.welcome, c_provider, c_signer, &SystemClock)?;
 
@@ -109,7 +119,12 @@ fn three_members_interoperate_on_cs2() -> TestResult {
     assert_eq!(decrypt(&mut c, &from_b)?, b"from B");
 
     let c_leaf = c.own_leaf_index()?;
-    let removal = remove_member(&mut a, c_leaf, &SystemClock)?;
+    let removal = remove_member(
+        &mut a,
+        c_leaf,
+        &scp_mls::GovernanceLeafBlockInput::empty("test-context"),
+        &SystemClock,
+    )?;
     let removal_bytes = serialize_mls_message(&removal.commit)?;
     merge_commit(&mut b, &removal_bytes)?;
     // C processes its own removal too, so the final assertion shows that C

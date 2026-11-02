@@ -391,7 +391,13 @@ mod tests {
         .unwrap();
 
         let kp_in: KeyPackageIn = entry.bundle.key_package().clone().into();
-        let add_result = crate::group::add_member(&mut alice_group, kp_in, &SystemClock).unwrap();
+        let add_result = crate::group::add_member(
+            &mut alice_group,
+            kp_in,
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
+            &SystemClock,
+        )
+        .unwrap();
 
         // Bob joins using the Welcome, with the provider and signer from the buffer entry.
         let bob_group = crate::group::join_group(

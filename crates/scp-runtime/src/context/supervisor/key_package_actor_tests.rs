@@ -245,7 +245,11 @@ async fn real_welcome_for(mls: &Arc<dyn MlsBackend>, kp_public_bytes: &[u8]) -> 
         .await
         .unwrap();
     let added = mls
-        .add_member_raw(&mut group, kp_public_bytes)
+        .add_member_raw(
+            &mut group,
+            kp_public_bytes,
+            &scp_mls::GovernanceLeafBlockInput::empty("test-context"),
+        )
         .await
         .unwrap();
     added.welcome
@@ -3010,7 +3014,11 @@ async fn fused_confirm_joins_welcome_with_expired_tree_leaf() {
         "Carol's leaf must be expired under the real clock"
     );
     let added = real_backend()
-        .add_member_raw(&mut group, &public_bytes)
+        .add_member_raw(
+            &mut group,
+            &public_bytes,
+            &scp_mls::GovernanceLeafBlockInput::empty("test-context"),
+        )
         .await
         .unwrap();
 
@@ -3042,7 +3050,11 @@ async fn fused_confirm_rejects_over_range_tree_leaf_as_crypto_failed() {
     let (mut group, over_long_not_after) =
         scp_mls::group::group_holding_carol_leaf_over_max_range().unwrap();
     let added = real_backend()
-        .add_member_raw(&mut group, &public_bytes)
+        .add_member_raw(
+            &mut group,
+            &public_bytes,
+            &scp_mls::GovernanceLeafBlockInput::empty("test-context"),
+        )
         .await
         .unwrap();
 
@@ -3355,15 +3367,19 @@ impl MlsBackend for FailingBackend {
         &self,
         group: &mut ScpMlsGroup,
         key_package_bytes: &[u8],
+        block: &scp_mls::GovernanceLeafBlockInput<'_>,
     ) -> Result<AddMemberRaw, MlsError> {
-        self.inner.add_member_raw(group, key_package_bytes).await
+        self.inner
+            .add_member_raw(group, key_package_bytes, block)
+            .await
     }
     async fn remove_member_raw(
         &self,
         group: &mut ScpMlsGroup,
         leaf_index: LeafNodeIndex,
+        block: &scp_mls::GovernanceLeafBlockInput<'_>,
     ) -> Result<RemoveMemberRaw, MlsError> {
-        self.inner.remove_member_raw(group, leaf_index).await
+        self.inner.remove_member_raw(group, leaf_index, block).await
     }
     async fn encrypt(
         &self,
@@ -3383,8 +3399,11 @@ impl MlsBackend for FailingBackend {
         &self,
         group: &mut ScpMlsGroup,
         wrapping_pubkey: &[u8; 65],
+        block: &scp_mls::GovernanceLeafBlockInput<'_>,
     ) -> Result<Vec<u8>, MlsError> {
-        self.inner.advance_epoch(group, wrapping_pubkey).await
+        self.inner
+            .advance_epoch(group, wrapping_pubkey, block)
+            .await
     }
     async fn validate_key_package(
         &self,

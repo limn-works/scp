@@ -385,7 +385,15 @@ mod tests {
         )
         .unwrap();
         let bob_kp = bob_kp_bundle.key_package().clone().into();
-        let _add_result = add_member(&mut group, bob_kp, &SystemClock).unwrap();
+        let _add_result = add_member(
+            &mut group,
+            bob_kp,
+            &scp_core::crypto::mls::governance_leaf_block::GovernanceLeafBlockInput::empty(
+                "test-context",
+            ),
+            &SystemClock,
+        )
+        .unwrap();
 
         let keys_after = export_media_keys(&group, b"ctx-1", TEST_KEY_LENGTH).unwrap();
         assert_eq!(keys_after.epoch, 1, "epoch must advance after member add");
@@ -415,7 +423,15 @@ mod tests {
         )
         .unwrap();
         let bob_kp = bob_kp_bundle.key_package().clone().into();
-        let _add_result = add_member(&mut group, bob_kp, &SystemClock).unwrap();
+        let _add_result = add_member(
+            &mut group,
+            bob_kp,
+            &scp_core::crypto::mls::governance_leaf_block::GovernanceLeafBlockInput::empty(
+                "test-context",
+            ),
+            &SystemClock,
+        )
+        .unwrap();
 
         let keys_epoch_1 = export_media_keys(&group, b"ctx-1", TEST_KEY_LENGTH).unwrap();
         assert_eq!(keys_epoch_1.epoch, 1);
@@ -424,8 +440,15 @@ mod tests {
         let alice_own = group.own_leaf_index().unwrap();
         let members = group.members().unwrap();
         let bob_member = members.iter().find(|m| m.index != alice_own).unwrap();
-        let _remove_result =
-            remove_member(&mut group, bob_member.index, &scp_clock::SystemClock).unwrap();
+        let _remove_result = remove_member(
+            &mut group,
+            bob_member.index,
+            &scp_core::crypto::mls::governance_leaf_block::GovernanceLeafBlockInput::empty(
+                "test-context",
+            ),
+            &scp_clock::SystemClock,
+        )
+        .unwrap();
 
         let keys_epoch_2 = export_media_keys(&group, b"ctx-1", TEST_KEY_LENGTH).unwrap();
         assert_eq!(
@@ -480,7 +503,15 @@ mod tests {
         )
         .unwrap();
         let bob_kp = bob_kp_bundle.key_package().clone().into();
-        let add_result = add_member(&mut alice_group, bob_kp, &SystemClock).unwrap();
+        let add_result = add_member(
+            &mut alice_group,
+            bob_kp,
+            &scp_core::crypto::mls::governance_leaf_block::GovernanceLeafBlockInput::empty(
+                "test-context",
+            ),
+            &SystemClock,
+        )
+        .unwrap();
 
         let bob_group =
             join_group(&add_result.welcome, bob_provider, bob_signer, &SystemClock).unwrap();

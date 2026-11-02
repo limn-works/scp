@@ -499,7 +499,13 @@ mod tests {
             &bundle.key_package().tls_serialize_detached().unwrap(),
         )
         .unwrap();
-        let add = add_member(&mut alice, kp_in, &SystemClock).unwrap();
+        let add = add_member(
+            &mut alice,
+            kp_in,
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
+            &SystemClock,
+        )
+        .unwrap();
         let bob = join_group(&add.welcome, bob_provider, bob_signer, &SystemClock).unwrap();
 
         // Snapshot Bob, then restore into a fresh group.
@@ -618,7 +624,13 @@ mod tests {
             &bundle.key_package().tls_serialize_detached().unwrap(),
         )
         .unwrap();
-        let add = add_member(&mut alice, kp_in, &SystemClock).unwrap();
+        let add = add_member(
+            &mut alice,
+            kp_in,
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
+            &SystemClock,
+        )
+        .unwrap();
         let bob = join_group(&add.welcome, bob_provider, bob_signer, &SystemClock).unwrap();
         let blob = bob.serialize_state().unwrap();
 
@@ -676,7 +688,13 @@ mod tests {
             &bundle.key_package().tls_serialize_detached().unwrap(),
         )
         .unwrap();
-        let add = add_member(&mut alice, kp_in, &SystemClock).unwrap();
+        let add = add_member(
+            &mut alice,
+            kp_in,
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
+            &SystemClock,
+        )
+        .unwrap();
 
         // The RESTORED pending pair must process the Welcome into a live group.
         let bob = join_group(

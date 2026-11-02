@@ -124,7 +124,11 @@ async fn drive_actor(
         .await
         .expect("generate_kp");
     let _added = backend
-        .add_member_raw(&mut grp, &kp.key_package_bytes)
+        .add_member_raw(
+            &mut grp,
+            &kp.key_package_bytes,
+            &scp_mls::GovernanceLeafBlockInput::empty("test-context"),
+        )
         .await
         .expect("add_member");
     // grp is now at epoch 1 with 2 members.

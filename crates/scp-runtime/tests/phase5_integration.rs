@@ -265,8 +265,13 @@ fn media_session_mls_key_derivation() {
     )
     .expect("bob key package");
     let bob_kp = bob_kp_bundle.key_package().clone().into();
-    let add_result =
-        add_member(&mut alice_group, bob_kp, &scp_clock::SystemClock).expect("add bob");
+    let add_result = add_member(
+        &mut alice_group,
+        bob_kp,
+        &scp_mls::GovernanceLeafBlockInput::empty("test-context"),
+        &scp_clock::SystemClock,
+    )
+    .expect("add bob");
 
     let bob_group = join_group(
         &add_result.welcome,
@@ -570,8 +575,13 @@ fn media_session_keys_derived_from_mls_group_state() {
     )
     .expect("bob kp");
     let bob_kp = bob_kp_bundle.key_package().clone().into();
-    let add_result =
-        add_member(&mut alice_group, bob_kp, &scp_clock::SystemClock).expect("add bob");
+    let add_result = add_member(
+        &mut alice_group,
+        bob_kp,
+        &scp_mls::GovernanceLeafBlockInput::empty("test-context"),
+        &scp_clock::SystemClock,
+    )
+    .expect("add bob");
     let bob_group = join_group(
         &add_result.welcome,
         bob_provider,

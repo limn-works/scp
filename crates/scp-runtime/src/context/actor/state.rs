@@ -2751,6 +2751,7 @@ impl PerContextState {
         wrapping_public_key: [u8; 65],
         clock: &dyn Clock,
     ) -> Result<AdvanceEpochOutput, ContextError> {
+        let context_id = hex::encode(self.context_id);
         let crypto = self.encrypted_crypto_mut()?;
         let mls_group = crypto.mls_group.as_mut().ok_or_else(|| {
             ContextError::CryptoFailed("no MLS group for this context".to_string())
@@ -2758,6 +2759,7 @@ impl PerContextState {
         let update = scp_mls::ratchet::propose_update_with_wrapping_key(
             mls_group,
             &wrapping_public_key,
+            &scp_mls::GovernanceLeafBlockInput::empty(&context_id),
             clock,
         )
         .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
@@ -2856,13 +2858,19 @@ impl PerContextState {
             )));
         }
 
+        let context_id = hex::encode(self.context_id);
         let crypto = self.encrypted_crypto_mut()?;
         let mls_group = crypto.mls_group.as_mut().ok_or_else(|| {
             ContextError::CryptoFailed("no MLS group for this context".to_string())
         })?;
 
-        let result = scp_mls::group::add_member(mls_group, kp_in, clock)
-            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+        let result = scp_mls::group::add_member(
+            mls_group,
+            kp_in,
+            &scp_mls::GovernanceLeafBlockInput::empty(&context_id),
+            clock,
+        )
+        .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
         // The merge was the last fallible step: `scp-mls` serialized the
         // Welcome and Commit before it, and the cache follows the tree.
@@ -2893,6 +2901,7 @@ impl PerContextState {
             return Ok(RemoveMemberOutput::default());
         }
 
+        let context_id = hex::encode(self.context_id);
         let crypto = self.encrypted_crypto_mut()?;
         let mls_group = crypto.mls_group.as_mut().ok_or_else(|| {
             ContextError::CryptoFailed("no MLS group for this context".to_string())
@@ -2911,8 +2920,13 @@ impl PerContextState {
             return Ok(RemoveMemberOutput::default());
         };
 
-        let result = scp_mls::group::remove_member(mls_group, leaf_index, clock)
-            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+        let result = scp_mls::group::remove_member(
+            mls_group,
+            leaf_index,
+            &scp_mls::GovernanceLeafBlockInput::empty(&context_id),
+            clock,
+        )
+        .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
         crypto.follow_tree(&result.members, &[]);
 
         Ok(RemoveMemberOutput {
@@ -2969,6 +2983,7 @@ impl PerContextState {
                 "key package credential names '{credential_did}', not the reset member '{member_did}'"
             )));
         }
+        let context_id = hex::encode(self.context_id);
 
         let crypto = self.encrypted_crypto_mut()?;
         let mls_group = crypto.mls_group.as_mut().ok_or_else(|| {
@@ -2977,8 +2992,14 @@ impl PerContextState {
         let leaf_index = peer_leaf_index(mls_group, member_did)?
             .ok_or_else(|| ContextError::MemberNotFound(member_did.to_owned()))?;
 
-        let result = scp_mls::group::reset_member(mls_group, leaf_index, kp_in, clock)
-            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+        let result = scp_mls::group::reset_member(
+            mls_group,
+            leaf_index,
+            kp_in,
+            &scp_mls::GovernanceLeafBlockInput::empty(&context_id),
+            clock,
+        )
+        .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
         // The merge was the last fallible step; the cache follows the tree.
         crypto.follow_tree(&result.members, &[result.admitted_did.as_str()]);
 
