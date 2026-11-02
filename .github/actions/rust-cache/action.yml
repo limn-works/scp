@@ -5,9 +5,10 @@ description: >-
   `.cargo/config.toml`, `rust-toolchain(.toml)`, `rustc -vV` and the CARGO*/RUST*
   environment, but never a virtual root manifest, which holds this repository's
   `[profile.*]` tables, `[workspace.dependencies]` features and `[patch.crates-io]`.
-  manifest-digest.sh states what the digest drops and why. The prefix also carries a
-  digest of .github/workflows/cache-warm.yml, whose commands decide what each shared
-  group's entry holds. Every workflow step that
+  manifest-digest.sh states what the digest drops and why. For a group that
+  .github/workflows/cache-warm.yml writes, the prefix also carries a digest of that
+  file, whose commands decide what the group's entry holds; every other group's key
+  ignores it. Every workflow step that
   restores the cargo cache uses this action; job ci-workflow-selftest rejects a direct
   Swatinem/rust-cache step.
 inputs:
@@ -37,6 +38,7 @@ runs:
       shell: bash
       env:
         CACHE_WORKSPACES: ${{ inputs.workspaces }}
+        CACHE_GROUP: ${{ inputs.shared-key }}
       run: |
         set -euo pipefail
         roots=()
@@ -48,10 +50,17 @@ runs:
         done <<< "$CACHE_WORKSPACES"
         digest="$(bash "$GITHUB_ACTION_PATH/manifest-digest.sh" "${roots[@]}")"
         # The commands .github/workflows/cache-warm.yml compiles decide what each
-        # group's entry holds, so a change to them must write a new entry in place of
-        # leaving the old one as an exact match that skips the save.
-        warm="$(shasum -a 256 "$GITHUB_WORKSPACE/.github/workflows/cache-warm.yml" | cut -c1-16)"
-        echo "digest=${digest:0:16}-${warm}" >> "$GITHUB_OUTPUT"
+        # group it writes holds, so a change to them must write a new entry in place
+        # of leaving the old one as an exact match that skips the save. The test reads
+        # the group name alone, so a reader and its writer always agree, and a group
+        # the file does not write keeps its key when the file changes.
+        warm_file="$GITHUB_WORKSPACE/.github/workflows/cache-warm.yml"
+        [[ -f $warm_file ]] || { echo "::error::$warm_file is not checked out, so this step cannot tell whether that workflow writes group $CACHE_GROUP"; exit 1; }
+        key="${digest:0:16}"
+        if grep -Eq "^[[:space:]]+shared-key:[[:space:]]+${CACHE_GROUP}[[:space:]]*$" "$warm_file"; then
+          key="${key}-$(shasum -a 256 "$warm_file" | cut -c1-16)"
+        fi
+        echo "digest=${key}" >> "$GITHUB_OUTPUT"
     - id: cache
       uses: Swatinem/rust-cache@v2
       with:

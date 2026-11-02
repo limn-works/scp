@@ -5081,6 +5081,64 @@ def wrapper_key_gaps(action: dict) -> list[str]:
     return gaps
 
 
+CACHE_WARM_WORKFLOW = REPO / ".github/workflows/cache-warm.yml"
+
+
+def wrapper_warm_key_gaps(script: str, groups: set[str], warm_text: str) -> list[str]:
+    """Return each group whose key reads cache-warm.yml when it should not, or the reverse.
+
+    CRITERION: the prefix the wrapper's `manifest` step prints for a group changes with
+    an edit to .github/workflows/cache-warm.yml exactly when that file writes the group,
+    so an edit to a warm job's commands writes a new entry for the groups it fills and
+    leaves every other group's entry an exact match. `script` is the step's `run:` text,
+    `groups` every `shared-key` a workflow names, and `warm_text` the file's content.
+    """
+    written = {
+        str((step.get("with") or {}).get("shared-key"))
+        for job in (yaml.safe_load(warm_text).get("jobs") or {}).values()
+        for step in job.get("steps") or []
+        if str(step.get("uses") or "") == RUST_CACHE_ACTION
+    }
+    gaps = []
+    with tempfile.TemporaryDirectory() as scratch:
+        root = Path(scratch)
+        (root / "Cargo.toml").write_text((REPO / "Cargo.toml").read_text())
+        workflows = root / ".github/workflows"
+        workflows.mkdir(parents=True)
+
+        def key(group: str, text: str) -> str:
+            (workflows / "cache-warm.yml").write_text(text)
+            output = root / "output"
+            output.write_text("")
+            env = dict(
+                os.environ,
+                GITHUB_WORKSPACE=str(root),
+                GITHUB_OUTPUT=str(output),
+                GITHUB_ACTION_PATH=str(MANIFEST_DIGEST_SCRIPT.parent),
+                CACHE_WORKSPACES=". -> target",
+                CACHE_GROUP=group,
+            )
+            result = subprocess.run(
+                ["bash", "-c", script], env=env, cwd=root, capture_output=True, text=True
+            )
+            if result.returncode != 0:
+                return f"exit {result.returncode}: {result.stdout.strip()} {result.stderr.strip()}"
+            return output.read_text().strip()
+
+        edited = warm_text + "\n# planted edit\n"
+        for group in sorted(groups):
+            before, after = key(group, warm_text), key(group, edited)
+            if before.startswith("exit ") or after.startswith("exit "):
+                gaps.append(f"group {group}: the digest step failed ({before} / {after})")
+            elif (before != after) != (group in written):
+                gaps.append(
+                    f"group {group}: an edit to cache-warm.yml "
+                    f"{'changes' if before != after else 'keeps'} its key, and cache-warm.yml "
+                    f"{'writes' if group in written else 'does not write'} it"
+                )
+    return gaps
+
+
 def manifest_digest(script: Path, root: Path) -> str:
     result = subprocess.run(
         ["bash", str(script), str(root)], capture_output=True, text=True, check=True
@@ -5304,6 +5362,66 @@ def check_cache_key(documents: list[tuple[Path, dict]]) -> None:
         ).returncode
         != 0,
         "a missing manifest printed a digest that keys on nothing",
+    )
+
+    manifest_step = next(
+        step for step in action["runs"]["steps"] if step.get("id") == "manifest"
+    )
+    groups = {
+        str((step.get("with") or {}).get("shared-key"))
+        for _path, doc in documents
+        for job in (doc.get("jobs") or {}).values()
+        for step in job.get("steps") or []
+        if str(step.get("uses") or "") == RUST_CACHE_ACTION
+    }
+    warm_text = CACHE_WARM_WORKFLOW.read_text()
+    gaps = wrapper_warm_key_gaps(manifest_step["run"], groups, warm_text)
+    check(
+        "an edit to cache-warm.yml changes the key of each group it writes and of no other",
+        not gaps,
+        "; ".join(gaps),
+    )
+    # Controls: a step that always hashes the file rekeys every group on each warm
+    # edit, and one that never hashes it leaves a warm group's stale entry an exact
+    # match that skips the save.
+    test = 'if grep -Eq "^[[:space:]]+shared-key:'
+    for label, replacement, reported in (
+        (
+            "hashing cache-warm.yml into every group",
+            'if true || grep -Eq "^[[:space:]]+shared-key:',
+            "changes its key, and cache-warm.yml does not write it",
+        ),
+        (
+            "hashing cache-warm.yml into no group",
+            'if false && grep -Eq "^[[:space:]]+shared-key:',
+            "keeps its key, and cache-warm.yml writes it",
+        ),
+    ):
+        planted = manifest_step["run"].replace(test, replacement)
+        check(f"the planting for a wrapper {label} replaced its test", planted != manifest_step["run"])
+        planted_gaps = wrapper_warm_key_gaps(planted, groups, warm_text)
+        check(
+            f"a wrapper {label} is reported",
+            any(reported in gap for gap in planted_gaps),
+            f"{planted_gaps}",
+        )
+    check(
+        "the digest step exits non-zero when cache-warm.yml is not checked out",
+        subprocess.run(
+            ["bash", "-c", manifest_step["run"]],
+            env=dict(
+                os.environ,
+                GITHUB_WORKSPACE=str(REPO / ".github"),
+                GITHUB_OUTPUT=os.devnull,
+                GITHUB_ACTION_PATH=str(MANIFEST_DIGEST_SCRIPT.parent),
+                CACHE_WORKSPACES=f"{REPO} -> target",
+                CACHE_GROUP="workspace-debug",
+            ),
+            capture_output=True,
+            check=False,
+        ).returncode
+        != 0,
+        "a missing cache-warm.yml printed a key that ignores it",
     )
 
     texts = local_action_texts()
