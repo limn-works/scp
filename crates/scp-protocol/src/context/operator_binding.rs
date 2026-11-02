@@ -85,19 +85,24 @@ pub(crate) fn compressed_point(bytes: &[u8; COMPRESSED_POINT_LEN]) -> Option<P25
 ///
 /// A reader that has not joined takes it from the genesis parameters its
 /// `InvitationBundle` signature covers (`05-contexts.md` §5.12.3.1), and a
-/// member from its committed `0xFF02` extension (§5.13.3 rule 11). Those two
-/// decoders are the callers of [`Self::from_invitation_or_extension`].
+/// member from its committed `0xFF02` extension (§5.13.3 rule 11). Both wire
+/// types live in this crate (`invitation_bundle.rs`,
+/// `group_context_extension.rs`) and neither carries `binding_hash` yet, so a
+/// production build has no constructor at all: the crate-private one arrives
+/// with that field, inside the decoder that reads it. No production caller
+/// can turn chosen bytes into a held hash, and
 /// [`ContextOperatorBinding::binding_hash`] returns a bare array, so a
-/// binding's own hash never stands in for the held one without that
-/// explicit call.
+/// binding's own hash never stands in for the held one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HeldBindingHash([u8; 32]);
 
 impl HeldBindingHash {
-    /// The `binding_hash` field read from the reader's invitation genesis
-    /// parameters or from its group state's `0xFF02` extension.
+    /// Any 32 bytes as the held hash, for tests and the §25 vector harness.
+    /// Compiled only under `cfg(test)` or the `testing` feature, which no
+    /// shipped build enables.
+    #[cfg(any(test, feature = "testing"))]
     #[must_use]
-    pub const fn from_invitation_or_extension(binding_hash: [u8; 32]) -> Self {
+    pub const fn testing_only_from_bytes(binding_hash: [u8; 32]) -> Self {
         Self(binding_hash)
     }
 
@@ -522,7 +527,7 @@ pub(crate) mod tests {
     /// `operator` instantiates at its current head with `key(2)`, built from
     /// those four fields and never from a binding value.
     pub fn held(operator: &Identity) -> TestResult<HeldBindingHash> {
-        Ok(HeldBindingHash::from_invitation_or_extension(
+        Ok(HeldBindingHash::testing_only_from_bytes(
             ContextOperatorBinding::signing_digest(
                 CONTEXT_ID,
                 &operator.identifier,
@@ -574,7 +579,7 @@ pub(crate) mod tests {
     ) -> TestResult<Result<(), ContextOperatorError>> {
         Ok(VerifiedContextOperatorBinding::verify(
             binding,
-            &HeldBindingHash::from_invitation_or_extension(held),
+            &HeldBindingHash::testing_only_from_bytes(held),
             &operator()?.chain()?,
         )
         .map(|_| ()))

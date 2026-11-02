@@ -2076,7 +2076,7 @@ fn vector_92_binding() -> ContextOperatorBinding {
 /// The `binding_hash` a reader holds from the invitation or the `0xFF02`
 /// extension: Vector 92's printed hash.
 fn vector_92_held() -> HeldBindingHash {
-    HeldBindingHash::from_invitation_or_extension(unhex32(VECTOR_92_BINDING_HASH))
+    HeldBindingHash::testing_only_from_bytes(unhex32(VECTOR_92_BINDING_HASH))
 }
 
 fn vector_92_verified() -> VerifiedContextOperatorBinding {
@@ -2143,7 +2143,7 @@ fn vector_92_context_operator_binding() {
     assert_eq!(
         VerifiedContextOperatorBinding::verify(
             binding.clone(),
-            &HeldBindingHash::from_invitation_or_extension(other_hash),
+            &HeldBindingHash::testing_only_from_bytes(other_hash),
             &vector_41_chain()
         ),
         Err(ContextOperatorError::BindingMismatch)
@@ -2152,7 +2152,7 @@ fn vector_92_context_operator_binding() {
     // Vector 41's log does not hold.
     let mut changed = binding.clone();
     changed.operator = Identifier::from_bytes([0x11; 32]);
-    let held = HeldBindingHash::from_invitation_or_extension(changed.binding_hash().unwrap());
+    let held = HeldBindingHash::testing_only_from_bytes(changed.binding_hash().unwrap());
     assert_eq!(
         VerifiedContextOperatorBinding::verify(changed, &held, &vector_41_chain()),
         Err(ContextOperatorError::OperatorKey(
@@ -2161,7 +2161,7 @@ fn vector_92_context_operator_binding() {
     );
     let mut changed = binding.clone();
     changed.key_state_head[31] ^= 1;
-    let held = HeldBindingHash::from_invitation_or_extension(changed.binding_hash().unwrap());
+    let held = HeldBindingHash::testing_only_from_bytes(changed.binding_hash().unwrap());
     assert_eq!(
         VerifiedContextOperatorBinding::verify(changed, &held, &vector_41_chain()),
         Err(ContextOperatorError::OperatorKey(
