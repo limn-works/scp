@@ -301,8 +301,9 @@ nothing:
                check reports a step gated that way on an axis the job's matrix
                does not define.
   leg-commands
-               Jobs rust-test-macos and rust-clippy split their commands
-               across legs, and rust-doc's two commands split across rust-doc
+               Jobs rust-test-macos, rust-clippy and
+               rust-test-optional-features split their commands across legs
+               (the last on its `group` axis), and rust-doc's two commands split across rust-doc
                and rust-doctest. A step moved to the wrong leg, a leg value
                dropped, or a command deleted while splitting runs that command
                on no leg, and every leg still passes. LEG_COMMANDS pins the
@@ -836,7 +837,6 @@ NOT_ON_PUSH_FILTER_JOBS = (
     "protocol-deps",
     "python-lint",
     "python-test",
-    "python-wheel-build",
     "rust-build-pyo3-production",
     "rust-build-uniffi-production",
     "rust-deny",
@@ -7549,9 +7549,26 @@ def push_writer_gaps(doc: dict) -> list[str]:
                 except AmbiguousMatrixKey as ambiguous:
                     gaps.append(f"{job_id} writes {cache_write(step)} where {ambiguous}")
             key_axes.discard(None)
+            def leg_runs_step(key: str, value: object) -> bool:
+                """Whether a leg holding `value` on axis `key` runs this step at all.
+
+                A leg whose value the step's `if:` excludes writes no entry under
+                that value, so it is not a value the key expands for this step.
+                """
+                try:
+                    return push_runs_step(
+                        {"if": step.get("if")}, {f"matrix.{key}": str(value)}
+                    )
+                except ValueError:
+                    return True
+
             for key in sorted(key_axes):
                 pushed_values = set(map(str, on_push[key]))
-                unwritten = [v for v in elsewhere[key] if str(v) not in pushed_values]
+                unwritten = [
+                    v
+                    for v in elsewhere[key]
+                    if str(v) not in pushed_values and leg_runs_step(key, v)
+                ]
                 if unwritten:
                     gaps.append(
                         f"{job_id} writes {cache_write(step)}, one entry per value of "
@@ -7713,6 +7730,49 @@ LEG_COMMANDS: tuple[tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]], ..
             ),
         ),
     ),
+    # Job rust-test-optional-features, whose `group` axis runs the transport
+    # group's commands on one leg on push and on four legs otherwise. The table
+    # pins every command of every group, as the one-leg job ran them.
+    (
+        ("rust-test-optional-features",),
+        ("push", "pull_request"),
+        (
+            'cargo test -p scp-transport --features combined,local-cache',
+            "cargo nextest run --no-tests=fail -p scp-transport --features quic,http3,udp,coap,nostr,webrtc,push-store -E 'not (binary(nostr_roundtrip) | binary(webrtc_roundtrip) | test(/^nostr::/) | test(/^webrtc::/) | test(=quic::listener::tests::enabled_quic_listener_rejects_a_tier3_publish_with_4060) | test(=udp::listener::tests::enabled_udp_listener_rejects_a_tier3_publish_with_4060) | test(=webtransport::server::tests::enabled_webtransport_listener_rejects_a_tier3_publish_with_4060))'",
+            'cargo nextest run --no-tests=fail -p scp-transport --features quic,http3,udp,coap,nostr,webrtc,push-store --test nostr_roundtrip',
+            'cargo nextest run --no-tests=fail -p scp-transport --features quic,http3,udp,coap,nostr,webrtc,push-store --test webrtc_roundtrip',
+            "cargo nextest run --no-tests=fail -p scp-transport --features quic,http3,udp,coap,nostr,webrtc,push-store --lib -E 'test(/^nostr::/)'",
+            "cargo nextest run --no-tests=fail -p scp-transport --features quic,http3,udp,coap,nostr,webrtc,push-store --lib -E 'test(/^webrtc::/)'",
+            "cargo nextest run --no-tests=fail -p scp-transport --features quic,http3,udp,coap,nostr,webrtc,push-store --lib -E 'test(=quic::listener::tests::enabled_quic_listener_rejects_a_tier3_publish_with_4060)'",
+            "cargo nextest run --no-tests=fail -p scp-transport --features quic,http3,udp,coap,nostr,webrtc,push-store --lib -E 'test(=udp::listener::tests::enabled_udp_listener_rejects_a_tier3_publish_with_4060)'",
+            "cargo nextest run --no-tests=fail -p scp-transport --features quic,http3,udp,coap,nostr,webrtc,push-store --lib -E 'test(=webtransport::server::tests::enabled_webtransport_listener_rejects_a_tier3_publish_with_4060)'",
+            "cargo nextest run --no-tests=fail -p scp-transport --features quic,http3,udp,push-store,testing --lib -E 'test(/^quic::listener::tests::wake::/)'",
+            "cargo nextest run --no-tests=fail -p scp-transport --features quic,http3,udp,push-store,testing --lib -E 'test(/^udp::listener::tests::wake::/)'",
+            'cargo nextest run --no-tests=fail -p scp-transport --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --lib startup::tests',
+            'cargo nextest run --no-tests=fail -p scp-transport --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --test postgres_blob_fail_closed --test s3_blob_fail_closed',
+            'cargo nextest run --no-tests=fail -p scp-transport --features push-store,testing --lib --tests',
+            'cargo nextest run --no-tests=fail -p scp-transport --features push-store --lib --tests',
+            'cargo nextest run --no-tests=fail -p scp-transport --features push-store --lib store_without_testing_has_only_the_sqlite_arm',
+            'cargo nextest run --no-tests=fail -p scp-node --features quic,testing --test quic_listener',
+            'cargo nextest run --no-tests=fail -p scp-node --features quic,testing --test quic_cross_transport',
+            "cargo nextest run --no-tests=fail -p scp-node --features http3,udp,testing --lib -E 'test(=well_known::tests::advertised_transports_includes_webtransport_with_feature)'",
+            "cargo nextest run --no-tests=fail -p scp-node --features http3,udp,testing --lib -E 'test(=well_known::tests::advertised_transports_includes_udp_dtls_with_feature)'",
+            "cargo nextest run --no-tests=fail -p scp-node --features http3,testing --lib -E 'test(=http::tests::http3_well_known_carries_the_key_and_cors_star)'",
+            'cargo nextest run --no-tests=fail -p scp-node --features cloud-blobs,testing --test storage_backend_selection',
+            'cargo nextest run --no-tests=fail -p scp-relay --features cloud-blobs --test storage_backend',
+            "cargo nextest run --no-tests=fail -p scp-platform --features apple,sync,sqlite,filesystem,file,encrypting,testing --lib -E 'test(/^apple::/)'",
+            "cargo nextest run --no-tests=fail -p scp-platform --features apple,sync,sqlite,filesystem,file,encrypting,testing --lib -E 'test(/^syncable::tests::storage_conformance::/)'",
+            "cargo nextest run --no-tests=fail -p scp-platform --features apple,sync,sqlite,filesystem,file,encrypting,testing --lib -E 'test(/^syncable::tests::/) - test(/^syncable::tests::storage_conformance::/)'",
+            "cargo nextest run --no-tests=fail -p scp-testing --features sync,combined --test persistence_advanced -E 'test(=syncable_storage_export_apply_roundtrip)'",
+            "cargo nextest run --no-tests=fail -p scp-testing --features sync,combined --test persistence_advanced -E 'test(=combined_node_storage_both_traits_roundtrip)'",
+            "cargo nextest run --no-tests=fail -p scp-testing --features sqlite --test persistence -E 'test(/^sqlite::/)'",
+            'cargo nextest run --no-tests=fail -p scp-testing --features sqlite --test persistence_sdk',
+            "cargo nextest run --no-tests=fail -p scp-testing --features sqlite --test saga_bridge_journal_swap -E 'test(=journal_swap_sqlite_durable_crash_recovery_round_trips_on_disk)'",
+            'cargo check -p scp-testing --lib',
+            'cargo check -p scp-testing --lib --features testing',
+            "cargo nextest run --no-tests=fail -p scp-sqlite-pools --lib --run-ignored only -E 'test(=tests::open_refuses_a_sqlite_built_without_memory_management)'",
+        ),
+    ),
     (
         ("rust-doc", "rust-doctest"),
         ("pull_request",),
@@ -7738,12 +7798,18 @@ def event_runs_job(job: dict, event: str) -> bool:
         return True
 
 
+# The matrix axes a split job in LEG_COMMANDS divides its commands over, in the
+# order leg_command_gaps looks for them.
+SPLIT_AXES = ("leg", "group")
+
+
 def leg_command_gaps(doc: dict) -> list[str]:
     """Return each way a split job's legs disagree with LEG_COMMANDS.
 
     CRITERION: for each group of jobs in LEG_COMMANDS and each event it names,
-    the legs that event runs (every value of the job's `leg` axis for that event,
-    or the one leg of a job with no such axis; a job whose `if:` rules the event
+    the legs that event runs (every value of the job's split axis, `leg` or else
+    `group`, for that event, or the one leg of a job with neither axis; a job
+    whose `if:` rules the event
     out runs none) run, by leg_commands, each pinned command exactly once, and no
     command the table does not pin. A leg whose steps leg_commands cannot read is
     reported. A job named in the table and absent from the workflow is reported.
@@ -7762,13 +7828,14 @@ def leg_command_gaps(doc: dict) -> list[str]:
                 if not event_runs_job(job, event):
                     continue
                 matrix = (job.get("strategy") or {}).get("matrix") or {}
-                lists = axis_event_values(matrix.get("leg")) if "leg" in matrix else None
-                if "leg" in matrix and lists is None:
-                    gaps.append(f"{job_id}: matrix axis leg {matrix['leg']!r} is unreadable")
+                axis = next((name for name in SPLIT_AXES if name in matrix), None)
+                lists = axis_event_values(matrix[axis]) if axis else None
+                if axis and lists is None:
+                    gaps.append(f"{job_id}: matrix axis {axis} {matrix[axis]!r} is unreadable")
                     continue
                 key = "push" if event == "push" else "other"
                 for value in lists[key] if lists else [None]:
-                    commands = leg_commands(job, "leg" if lists else None, value)
+                    commands = leg_commands(job, axis if lists else None, value)
                     if commands is None:
                         gaps.append(
                             f"{job_id} leg {value}: a step `if:` leaves open whether "
@@ -7853,15 +7920,20 @@ def check_leg_commands(doc: dict) -> None:
         )
 
     # Dropping one pull-request leg value leaves that leg's commands unrun.
-    for job_id, value in (("rust-test-macos", "platform"), ("rust-clippy", "packages-blob")):
+    for job_id, value in (
+        ("rust-test-macos", "platform"),
+        ("rust-clippy", "packages-blob"),
+        ("rust-test-optional-features", "transport-network"),
+    ):
         dropped = copy.deepcopy(doc)
         matrix = dropped["jobs"][job_id]["strategy"]["matrix"]
-        lists = axis_event_values(matrix["leg"])
-        check(f"{job_id}'s pull-request legs include {value}", bool(lists) and value in lists["other"], f"{matrix['leg']!r}")
+        axis = next((name for name in SPLIT_AXES if name in matrix), "leg")
+        lists = axis_event_values(matrix.get(axis))
+        check(f"{job_id}'s pull-request legs include {value}", bool(lists) and value in lists["other"], f"{matrix.get(axis)!r}")
         if not lists:
             continue
         other = [leg for leg in lists["other"] if leg != value]
-        matrix["leg"] = (
+        matrix[axis] = (
             f"${{{{ fromJSON(github.event_name == 'push' && "
             f"'{json.dumps(lists['push'])}' || '{json.dumps(other)}') }}}}"
         )
@@ -8047,6 +8119,7 @@ def check_push_runs_every_cache_writer(doc: dict) -> None:
         "napi-addon",
         "pyo3-module",
         "pyo3-module-macos",
+        "python-wheel-build",
         "rust-clippy",
         "rust-test",
         "rust-test-macos",
@@ -8110,9 +8183,8 @@ def check_push_writer_mutants(doc: dict) -> None:
         f"{gaps}",
     )
 
-    # rust-test-optional-features writes one rust-cache entry per `group` value
-    # through its key, and rust-clippy one entry per `leg` value through a writing
-    # step gated on that leg. A push matrix dropping a value leaves its entry
+    # rust-test-optional-features and rust-clippy each write one rust-cache entry
+    # per push value of their axis through a writing step gated on that value. A push matrix dropping a value leaves its entry
     # unwritten; a push matrix keeping every value leaves nothing to report.
     # A job whose `runs-on` reads an `os` axis writes one rust-cache entry per `os`
     # value, because rust-cache keys by platform. No job in ci.yml has such an axis
@@ -8132,7 +8204,7 @@ def check_push_writer_mutants(doc: dict) -> None:
             "rust-test-optional-features",
             "group",
             "node-relay",
-            "one entry per value of matrix `group`, and a push never runs ['node-relay']",
+            "only from matrix leg `group == node-relay`",
         ),
         (
             "rust-test",
