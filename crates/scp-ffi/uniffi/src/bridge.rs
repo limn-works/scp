@@ -26329,6 +26329,8 @@ mod tests {
                 &scp_event_log::payload::GovernanceActionExecutedPayload {
                     target_did: target_did.to_owned(),
                     action_type: "RemoveMember".to_owned(),
+                    proposal_id: [0x5a; 32],
+                    action_bytes: br#"{"RemoveMember":{}}"#.to_vec(),
                 },
             )
             .expect("governance payload encodes");

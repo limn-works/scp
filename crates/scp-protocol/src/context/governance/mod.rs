@@ -1345,6 +1345,66 @@ pub struct GovernanceProposal {
     pub created_at_epoch: Option<u64>,
 }
 
+impl GovernanceProposal {
+    /// The proposal's RFC 8785 action bytes: the bytes the proposer hashed
+    /// into [`proposal_id`](Self::proposal_id) (`09-security-model.md` §9.5.2).
+    ///
+    /// The bytes are the RFC 8785 serialization of [`action`](Self::action),
+    /// the encoding [`compute_proposal_id`] requires, and are returned only
+    /// after `proposal_id` recomputed from them, the context, the proposer, and
+    /// `created_at` equals the stored one. A proposal whose action does not
+    /// hash to its own identifier therefore yields no bytes, so no leaf records
+    /// an action other than the one the proposer and the voters signed
+    /// (ADR-031 acceptance criterion 7, as ADR-066 amends it).
+    ///
+    /// # Errors
+    ///
+    /// - [`GovernanceError::SerializationFailed`] when the action cannot be
+    ///   serialized.
+    /// - [`GovernanceError::ProposalIdMismatch`] when the recomputed
+    ///   identifier differs from `proposal_id`.
+    pub fn action_bytes(&self) -> Result<Vec<u8>, GovernanceError> {
+        let action_bytes =
+            crate::jcs::to_vec(&self.action).map_err(GovernanceError::SerializationFailed)?;
+        let recomputed = compute_proposal_id(
+            &self.context_id,
+            &self.proposer_did,
+            &action_bytes,
+            self.created_at,
+        );
+        if recomputed != self.proposal_id {
+            return Err(GovernanceError::ProposalIdMismatch {
+                id: hex::encode(self.proposal_id),
+                recomputed: hex::encode(recomputed),
+            });
+        }
+        Ok(action_bytes)
+    }
+
+    /// The payload of the `GovernanceActionExecuted` leaf that records this
+    /// proposal's execution: `[target_did, action_type, proposal_id,
+    /// action_bytes]` (`07-trust-validation-and-capabilities.md` §7.3.1.1
+    /// step 1.6), with `action_bytes` from [`action_bytes`](Self::action_bytes).
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`action_bytes`](Self::action_bytes).
+    pub fn executed_payload(
+        &self,
+    ) -> Result<scp_event_log::payload::GovernanceActionExecutedPayload, GovernanceError> {
+        Ok(scp_event_log::payload::GovernanceActionExecutedPayload {
+            target_did: self
+                .action
+                .target_did()
+                .map(|d| d.as_ref().to_owned())
+                .unwrap_or_default(),
+            action_type: self.action.variant_name().to_owned(),
+            proposal_id: self.proposal_id,
+            action_bytes: self.action_bytes()?,
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // GovernanceModelConfig
 // ---------------------------------------------------------------------------
@@ -1514,6 +1574,19 @@ pub enum GovernanceError {
     UnknownVoter {
         /// The unresolvable DID.
         did: String,
+    },
+
+    /// A proposal's action does not hash to its own identifier: the
+    /// identifier recomputed from the context, the proposer, the action's
+    /// RFC 8785 bytes, and `created_at` differs from the stored `proposal_id`
+    /// (`09-security-model.md` §9.5.2). Its action bytes are not the ones the
+    /// proposer and the voters signed, so no leaf may record them.
+    #[error("proposal id mismatch: stored {id}, recomputed {recomputed}")]
+    ProposalIdMismatch {
+        /// Hex-encoded stored proposal ID.
+        id: String,
+        /// Hex-encoded proposal ID recomputed from the proposal's fields.
+        recomputed: String,
     },
 }
 
@@ -4703,5 +4776,95 @@ mod tests {
             assert!(matches!(r, Err(GovernanceError::NotEligible(_))), "{r:?}");
             assert_eq!(e.get_proposal(&pid).unwrap().approvals.len(), 1);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // GovernanceProposal::action_bytes / executed_payload (spec 07 §7.3.1.1)
+    // -----------------------------------------------------------------------
+
+    fn proposed(action: GovernanceAction) -> GovernanceProposal {
+        let admin = alice();
+        let mut engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
+        let ctx = test_context(&admin);
+        engine
+            .propose(&admin, action, &ctx, &test_signing_key())
+            .expect("propose")
+            .0
+    }
+
+    #[test]
+    fn executed_payload_carries_the_proposal_id_preimage_action_bytes() {
+        let action = GovernanceAction::RemoveMember {
+            did: bob(),
+            reason: Some("spam".to_owned()),
+        };
+        let proposal = proposed(action.clone());
+        let payload = proposal.executed_payload().expect("payload");
+
+        let jcs = crate::jcs::to_vec(&action).expect("jcs");
+        assert_eq!(
+            payload.action_bytes, jcs,
+            "the RFC 8785 bytes of the action"
+        );
+        assert_eq!(payload.proposal_id, proposal.proposal_id);
+        // The bytes are the ones the proposal id commits to.
+        assert_eq!(
+            compute_proposal_id(
+                &proposal.context_id,
+                &proposal.proposer_did,
+                &payload.action_bytes,
+                proposal.created_at,
+            ),
+            payload.proposal_id
+        );
+        assert_eq!(payload.target_did, bob().as_ref());
+        assert_eq!(payload.action_type, "RemoveMember");
+        // The full action, reason included, decodes back from the leaf.
+        let decoded: GovernanceAction =
+            serde_json::from_slice(&payload.action_bytes).expect("action decodes");
+        assert_eq!(
+            crate::jcs::to_vec(&decoded).expect("jcs"),
+            jcs,
+            "the decoded action is the proposed one"
+        );
+    }
+
+    #[test]
+    fn executed_payload_of_untargeted_action_has_empty_target() {
+        let proposal = proposed(GovernanceAction::CloseContext {
+            reason: Some("done".to_owned()),
+        });
+        let payload = proposal.executed_payload().expect("payload");
+        assert_eq!(payload.target_did, "");
+        assert_eq!(payload.action_type, "CloseContext");
+        assert_eq!(
+            payload.action_bytes,
+            br#"{"CloseContext":{"reason":"done"}}"#.to_vec()
+        );
+    }
+
+    #[test]
+    fn executed_payload_refuses_an_action_that_does_not_hash_to_the_proposal_id() {
+        let mut proposal = proposed(GovernanceAction::RemoveMember {
+            did: bob(),
+            reason: None,
+        });
+        // The stored action no longer matches the one the id committed to.
+        proposal.action = GovernanceAction::RemoveMember {
+            did: carol(),
+            reason: None,
+        };
+        let stored = hex::encode(proposal.proposal_id);
+        match proposal.executed_payload() {
+            Err(GovernanceError::ProposalIdMismatch { id, recomputed }) => {
+                assert_eq!(id, stored);
+                assert_ne!(recomputed, stored);
+            }
+            other => panic!("expected ProposalIdMismatch, got {other:?}"),
+        }
+        assert!(matches!(
+            proposal.action_bytes(),
+            Err(GovernanceError::ProposalIdMismatch { .. })
+        ));
     }
 }

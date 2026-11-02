@@ -2378,6 +2378,144 @@ mod tests {
         );
     }
 
+    /// Spec 07 §7.3.1.1 step 1.6: an executed proposal's
+    /// `GovernanceActionExecuted` leaf carries `[target_did, action_type,
+    /// proposal_id, action_bytes]`, where `action_bytes` are the RFC 8785
+    /// bytes the proposal id commits to, so a replayer re-derives the whole
+    /// action, scope and reason included, from the leaf alone.
+    #[tokio::test]
+    async fn executed_leaf_carries_the_full_action_bytes_the_proposal_id_commits_to() {
+        use scp_protocol::context::governance::{AccessScope, GovernanceAction};
+
+        let (deps, _appends, recorded) = build_deps_recording().await;
+        let (mut state, ctx_hex) =
+            build_broadcast_state_with_authors(BroadcastAdmission::Open, &AUTHORS_3);
+        let action = GovernanceAction::RevokeAccess {
+            did: DID(SUBSCRIBER_DID.to_owned()),
+            access: AccessScope::Read,
+        };
+        let proposal_id = seed_approved_proposal(&mut state, &ctx_hex, action.clone());
+        let proposal = state
+            .governance
+            .engine
+            .get_proposal(&proposal_id)
+            .cloned()
+            .expect("the seeded proposal is engine-tracked");
+        let mut cell = ClassSCell::new(state);
+        dispatch_subscribe(&mut cell, &deps, &ctx_hex, None)
+            .await
+            .expect("open subscribe");
+        cell.class_c_view().membership_class_c_mut().add_member(
+            DID(SUBSCRIBER_DID.to_owned()),
+            "member".to_owned(),
+            vec![],
+        );
+        recorded.write().expect("recorded leaves lock").clear();
+
+        crate::context::governance_helpers::execute_governance_action(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &proposal_id,
+            Some(&DID(CREATOR_DID.to_owned())),
+            None,
+            None,
+        )
+        .await
+        .expect("the revoke executes");
+
+        let leaves = recorded.read().expect("recorded leaves lock").clone();
+        let executed: Vec<&Vec<u8>> = leaves
+            .iter()
+            .filter(|(t, _)| *t == scp_event_log::EventType::GovernanceActionExecuted)
+            .map(|(_, bytes)| bytes)
+            .collect();
+        assert_eq!(
+            executed.len(),
+            1,
+            "exactly one GovernanceActionExecuted leaf"
+        );
+        let payload: scp_event_log::payload::GovernanceActionExecutedPayload =
+            scp_event_log::payload::decode_payload(&scp_event_log::EventPayload {
+                data: executed[0].clone(),
+            })
+            .expect("the leaf decodes as GovernanceActionExecutedPayload");
+        assert_eq!(payload.target_did, SUBSCRIBER_DID);
+        assert_eq!(payload.action_type, "RevokeAccess");
+        assert_eq!(payload.proposal_id, proposal_id);
+        assert_eq!(
+            payload.action_bytes,
+            scp_protocol::jcs::to_vec(&action).expect("jcs"),
+            "the RFC 8785 bytes of the executed action"
+        );
+        assert_eq!(
+            scp_protocol::context::governance::compute_proposal_id(
+                &proposal.context_id,
+                &proposal.proposer_did,
+                &payload.action_bytes,
+                proposal.created_at,
+            ),
+            proposal_id,
+            "the leaf's action bytes are the proposal id's preimage"
+        );
+        let replayed: GovernanceAction =
+            serde_json::from_slice(&payload.action_bytes).expect("the action decodes");
+        assert_eq!(
+            scp_protocol::jcs::to_vec(&replayed).expect("jcs"),
+            payload.action_bytes,
+            "the leaf decodes to the executed action, scope included"
+        );
+        assert!(matches!(
+            replayed,
+            GovernanceAction::RevokeAccess {
+                access: AccessScope::Read,
+                ..
+            }
+        ));
+    }
+
+    /// A proposal whose action does not hash to its own id yields no leaf
+    /// payload: `ExecutedProposal::new`, which `execute_governance_action`
+    /// calls before the replay marker and the dispatch, returns a typed error, so no effect lands for
+    /// an action the leaf could not record.
+    #[test]
+    fn executed_proposal_refuses_a_proposal_whose_action_does_not_hash_to_its_id() {
+        use scp_protocol::context::governance::{AccessScope, GovernanceAction};
+
+        let (mut state, ctx_hex) =
+            build_broadcast_state_with_authors(BroadcastAdmission::Open, &AUTHORS_3);
+        let proposal_id = seed_approved_proposal(
+            &mut state,
+            &ctx_hex,
+            GovernanceAction::RevokeAccess {
+                did: DID(SUBSCRIBER_DID.to_owned()),
+                access: AccessScope::Read,
+            },
+        );
+        let mut proposal = state
+            .governance
+            .engine
+            .get_proposal(&proposal_id)
+            .cloned()
+            .expect("the seeded proposal is engine-tracked");
+        let executor = DID(CREATOR_DID.to_owned());
+        assert!(
+            crate::context::governance_helpers::ExecutedProposal::new(&proposal, &executor).is_ok(),
+            "control: the untampered proposal encodes"
+        );
+        proposal.action = GovernanceAction::RevokeAccess {
+            did: DID(SUBSCRIBER_DID.to_owned()),
+            access: AccessScope::Write,
+        };
+        let result =
+            crate::context::governance_helpers::ExecutedProposal::new(&proposal, &executor)
+                .map(|_| ());
+        assert!(
+            matches!(&result, Err(ContextError::GovernanceFailed(msg)) if msg.contains("proposal id mismatch")),
+            "a tampered action must be refused; got {result:?}"
+        );
+    }
+
     /// A finalize error — the `GovernanceActionExecuted` append fails after the
     /// dispatch applied its effect — keeps the replay marker, so the proposal is
     /// consumed and must leave `approved_proposals` in the same fail-closed

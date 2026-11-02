@@ -2736,6 +2736,19 @@ pub async fn execute_reset_member(
         return Err(ContextError::MemberNotFound(did.to_string()));
     }
 
+    // Spec 07 §7.3.1.1 step 1.6: a `ResetMember` for X derives
+    // `MemberReset [X, nil, nil, ""]`; the action's own reason travels in the
+    // `GovernanceActionExecuted` leaf's `action_bytes`. Encoded here, read-only,
+    // so an encoding failure refuses the reset before any MLS mutation.
+    let reset_payload =
+        scp_event_log::payload::encode_payload(&scp_event_log::payload::MemberResetPayload {
+            subject_did: did.as_ref().to_owned(),
+            last_known_epoch: None,
+            reset_counter: None,
+            reason: String::new(),
+        })
+        .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
+
     // Spec 07 §7.3.1.1 step 1.6: a `ResetMember` for X is ONE Commit holding
     // one Remove of X's leaf and one Add of a fresh leaf of X (ADR-066
     // decision 11: no action spans two Commits). A missing KeyPackage is
@@ -2804,11 +2817,12 @@ pub async fn execute_reset_member(
         .await;
 
     deps.event_log
-        .append_context_event(
+        .append_context_event_with_payload(
             crate::context::builder::AppendMode::AfterSideEffect,
             &context_id_bytes,
             scp_event_log::EventType::MemberReset,
             actor_did,
+            reset_payload,
             timestamp_secs,
         )
         .await?;
@@ -5905,6 +5919,59 @@ pub async fn dispatch_governance_action(
 }
 
 // ---------------------------------------------------------------------------
+// ExecutedProposal
+// ---------------------------------------------------------------------------
+
+/// A proposal being executed, the member that commits it, and the encoded
+/// `GovernanceActionExecuted` leaf payload that records it.
+///
+/// [`ExecutedProposal::new`] is the only constructor, and it builds the
+/// payload `[target_did, action_type, proposal_id, action_bytes]` only after
+/// the proposal's RFC 8785 action bytes hash to its `proposal_id` (spec 07
+/// §7.3.1.1 step 1.6; ADR-031 acceptance criterion 7, as ADR-066 amends it).
+/// `finalize_governance_action` takes this type, so the leaf it appends always
+/// carries checked action bytes.
+pub struct ExecutedProposal<'a> {
+    proposal: &'a GovernanceProposal,
+    // The committing member — the DID whose approval crossed quorum (or, for
+    // auto-execute, the proposer). Stamped as the `GovernanceActionExecuted`
+    // leaf `actor_did` and the event's `executor_did` per ADR-031 §8
+    // ("executor DID") / §7.3.1 ("committing member") / ADR-051 §6. This is
+    // DISTINCT from `proposal.proposer_did`, which remains the consequence
+    // SUBJECT in finalize (a different semantic — see the
+    // consequence-evaluation block).
+    executor_did: &'a DID,
+    payload: scp_event_log::EventPayload,
+}
+
+impl<'a> ExecutedProposal<'a> {
+    /// Checks `proposal`'s action bytes against its id and encodes the leaf
+    /// payload. Read-only, so the execute entry calls it before the replay
+    /// marker and the dispatch, and a refused proposal leaves no effect.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::GovernanceFailed`] when the action cannot be
+    ///   serialized or its bytes do not hash to the proposal's id.
+    /// - [`ContextError::EventLogFailed`] when the payload cannot be encoded.
+    pub fn new(
+        proposal: &'a GovernanceProposal,
+        executor_did: &'a DID,
+    ) -> Result<Self, ContextError> {
+        let payload = proposal
+            .executed_payload()
+            .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?;
+        let payload = scp_event_log::payload::encode_payload(&payload)
+            .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
+        Ok(Self {
+            proposal,
+            executor_did,
+            payload,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // finalize_governance_action (post-dispatch)
 // ---------------------------------------------------------------------------
 
@@ -5918,16 +5985,15 @@ pub async fn finalize_governance_action(
     state: &mut PerContextState,
     deps: &ActorDeps,
     context_id: &str,
-    proposal: &GovernanceProposal,
-    // The committing member — the DID whose approval crossed quorum (or, for
-    // auto-execute, the proposer). Stamped as the `GovernanceActionExecuted`
-    // leaf `actor_did` and the event's `executor_did` per ADR-031 §8
-    // ("executor DID") / §7.3.1 ("committing member") / ADR-051 §6. This is
-    // DISTINCT from `proposal.proposer_did`, which remains the consequence
-    // SUBJECT below (a different semantic — see the consequence-evaluation
-    // block).
-    executor_did: &DID,
+    // The proposal, its committing member, and its checked leaf payload, built
+    // by `ExecutedProposal::new` before dispatch.
+    executed: ExecutedProposal<'_>,
 ) -> Result<(), ContextError> {
+    let ExecutedProposal {
+        proposal,
+        executor_did,
+        payload: executed_payload,
+    } = executed;
     // For MLS-mutating actions (AddMember, RemoveMember, Revoke,
     // ResetMember), increment the epoch counter, place the old epoch into
     // the grace store (§23.11), record the coordination in the
@@ -5968,18 +6034,6 @@ pub async fn finalize_governance_action(
     };
 
     let context_id_bytes = context_id_to_bytes(context_id);
-    let action_variant = proposal.action.variant_name();
-    let executed_payload = scp_event_log::payload::encode_payload(
-        &scp_event_log::payload::GovernanceActionExecutedPayload {
-            target_did: proposal
-                .action
-                .target_did()
-                .map(|d| d.as_ref().to_owned())
-                .unwrap_or_default(),
-            action_type: action_variant.to_owned(),
-        },
-    )
-    .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
     deps.event_log
         .append_context_event_with_payload(
             crate::context::builder::AppendMode::AfterSideEffect,
@@ -6283,6 +6337,12 @@ pub async fn execute_governance_action(
         )));
     }
 
+    // The `GovernanceActionExecuted` leaf's payload, built before the replay
+    // marker and the dispatch: a proposal whose action bytes do not hash to its
+    // own id is refused here, read-only, so no effect lands for an action the
+    // leaf could not record (spec 07 §7.3.1.1 "The action, once").
+    let executed = ExecutedProposal::new(proposal, executor_did)?;
+
     // Atomically check replay AND mark as executed before dispatch (the
     // commit-fault gate already ran above). Actor-owned state — single linear
     // sequence.
@@ -6422,16 +6482,8 @@ pub async fn execute_governance_action(
     // `Err`, the same guard persists the kept marker and the proposal's removal
     // from `approved_proposals`, and finalize does not run (see the
     // replay-marker contract above).
-    discharge_and_order_governance_action(
-        token,
-        cell,
-        deps,
-        context_id,
-        proposal,
-        executor_did,
-        dispatch_outcome,
-    )
-    .await
+    discharge_and_order_governance_action(token, cell, deps, context_id, executed, dispatch_outcome)
+        .await
 }
 
 /// Runs the discharge tail of `execute_governance_action`.
@@ -6467,21 +6519,15 @@ async fn discharge_and_order_governance_action(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
-    proposal: &GovernanceProposal,
-    executor_did: &DID,
+    executed: ExecutedProposal<'_>,
     dispatch_outcome: Result<GovernanceActionResult, ContextError>,
 ) -> Result<GovernanceActionResult, ContextError> {
+    let proposal = executed.proposal;
     let mut discharge = token.begin_discharge(cell);
     let finalize_result = match &dispatch_outcome {
         Ok(_) => {
-            finalize_governance_action(
-                discharge.view().rest_mut(),
-                deps,
-                context_id,
-                proposal,
-                executor_did,
-            )
-            .await
+            finalize_governance_action(discharge.view().rest_mut(), deps, context_id, executed)
+                .await
         }
         Err(_) => Ok(()),
     };
