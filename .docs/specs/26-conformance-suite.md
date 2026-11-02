@@ -45,9 +45,9 @@ Each test specifies:
 | **Layer** | Identity |
 | **Tier** | Core |
 | **Spec Sections** | §3.1, §9.6.1, `03-identity.md` §3.10.4, `09-security-model.md` §9.7.4.2 R2, R8, R11 |
-| **Preconditions** | A key-event log published to two community relays under distinct operator keys. The resolver holds no baseline. |
-| **Steps** | 1. Query both relays at the identifier's routing id with `proof_nonce` set. 2. Decode each frame and verify every event. 3. Recompute the identifier under R2. 4. Apply the relay proof's five checks. 5. Derive the key state under R8. |
-| **Expected Outcome** | The recomputed identifier equals the one queried, so the binding verifies from the served bytes alone. Both relay proofs verify, R11's floor is met, and the resolver returns the derived key state rather than `Inconclusive{SingleSource}`. |
+| **Preconditions** | A key-event log published to two listed nodes of distinct operators (`09-security-model.md` §9.6.3). The resolver holds no baseline. |
+| **Steps** | 1. Query both nodes at the identifier's routing id with `proof_nonce` set. 2. Decode each frame and verify every event. 3. Recompute the identifier under R2. 4. Apply the node proof's five checks. 5. Derive the key state under R8. |
+| **Expected Outcome** | The recomputed identifier equals the one queried, so the binding verifies from the served bytes alone. Both node proofs verify, R11's floor is met, and the resolver returns the derived key state rather than `Inconclusive{SingleSource}`. |
 
 ### CONF-003: Key Rotation (Active Key Update)
 

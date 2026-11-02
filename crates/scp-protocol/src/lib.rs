@@ -10,6 +10,7 @@ pub mod economy;
 pub mod envelope;
 pub mod identity;
 pub mod jcs;
+pub mod node;
 pub mod provenance;
 pub mod serde_util;
 pub mod sync;

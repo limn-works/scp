@@ -29,7 +29,8 @@ use scp_crypto::p256::{
     P256Error, P256PublicKey, P256SecretKey, SeedLabel, sign_prehash_rfc6979, verify_prehash_strict,
 };
 use scp_did::{
-    ABSENT_BRIDGE_TARGET, BridgeEndpoint, BridgeTarget, DID, NodeUrl, RelayService, SigningKeyId,
+    ABSENT_BRIDGE_TARGET, BridgeEndpoint, BridgeTarget, DID, Identifier, NodeUrl, RelayService,
+    SigningKeyId,
 };
 use scp_protocol::context::governance::{
     GovernanceAction, VoteType, compute_proposal_id, vote_signing_digest,
@@ -46,6 +47,13 @@ use scp_protocol::envelope::inner::compute_canonical_hash;
 use scp_protocol::envelope::padding::{BUCKET_SIZES, pad_to_bucket, strip_padding};
 use scp_protocol::envelope::{InnerEnvelopeParams, MessageType};
 use scp_protocol::identity::attestation::IdentityLinkAttestation;
+use scp_protocol::node::{
+    NODE_BINDING_SEPARATOR, NODE_LIST_SEPARATOR, NODE_PROOF_SEPARATOR, NodeBinding,
+    NodeBindingError, NodeListEntry, NodeListEntryError, NodeListError, NodeListFrameError,
+    NodeListKeyClass, NodeListRecord, NodeProof, NodeProofError, VerifiedNodeBinding,
+    VerifiedNodeListEntry, VerifiedNodeListRecord, check_node_list_publish, decode_node_list_frame,
+    encode_node_list_frame, entries_canonical_json, node_url_hash, response_value_digest,
+};
 use scp_protocol::trust::capability_definition::CapabilityDefinition;
 use scp_protocol::trust::capability_registry::MinCases;
 use scp_protocol::trust::challenge::{
@@ -925,12 +933,12 @@ const PUSH_ROUTING_ID_B_HEX: &str =
     "b2f96d91d7b43038f18f9d1b686a5e033f8e07635e9baa819754d6a829942fcd";
 const PUSH_BRIDGE_URL: &str = "wss://bridge.example.com/scp/v1";
 const PUSH_BRIDGE_TARGET_HEX: &str =
-    "f8affd47ab024cae9489a63fa1c632914c16f7329441b8fca65b32c78d86a4eb";
-const PUSH_REGISTER_BRIDGE_HEX: &str = "5343502d505553482d52454749535445522d56313a000000387363703a68763661337066733471636962746868336b61656b7a68666f327878716c666e696537757073366876637371736d6b6970796c6101000000080123456789abcdef00000002f8f7da66a5b0f0d9466a2e1d8145fc72717465bb5e95638084d956dabd1ef6607c6b6cbf3a3930e627c126cfe0d79a6014853588f8aa56cfef59b6ef2725356e000000006553f1000000001f7773733a2f2f6272696467652e6578616d706c652e636f6d2f7363702f7631f8affd47ab024cae9489a63fa1c632914c16f7329441b8fca65b32c78d86a4eb";
-const PUSH_DEREGISTER_BRIDGE_HEX: &str = "5343502d505553482d444552454749535445522d56313a000000387363703a68763661337066733471636962746868336b61656b7a68666f327878716c666e696537757073366876637371736d6b6970796c6102000000080123456789abcdef000000006553f22c0000001f7773733a2f2f6272696467652e6578616d706c652e636f6d2f7363702f7631f8affd47ab024cae9489a63fa1c632914c16f7329441b8fca65b32c78d86a4eb";
-const PUSH_TIER3_PREIMAGE_HEX: &str = "7363702d707573682d6272696467653a7773733a2f2f6272696467652e6578616d706c652e636f6d2f7363702f7631f8affd47ab024cae9489a63fa1c632914c16f7329441b8fca65b32c78d86a4eb";
+    "4102ed70d1c4b106466149a7d129630c11a20554683ae012fdffa56341d1c323";
+const PUSH_REGISTER_BRIDGE_HEX: &str = "5343502d505553482d52454749535445522d56313a000000387363703a68763661337066733471636962746868336b61656b7a68666f327878716c666e696537757073366876637371736d6b6970796c6101000000080123456789abcdef00000002f8f7da66a5b0f0d9466a2e1d8145fc72717465bb5e95638084d956dabd1ef6607c6b6cbf3a3930e627c126cfe0d79a6014853588f8aa56cfef59b6ef2725356e000000006553f1000000001f7773733a2f2f6272696467652e6578616d706c652e636f6d2f7363702f76314102ed70d1c4b106466149a7d129630c11a20554683ae012fdffa56341d1c323";
+const PUSH_DEREGISTER_BRIDGE_HEX: &str = "5343502d505553482d444552454749535445522d56313a000000387363703a68763661337066733471636962746868336b61656b7a68666f327878716c666e696537757073366876637371736d6b6970796c6102000000080123456789abcdef000000006553f22c0000001f7773733a2f2f6272696467652e6578616d706c652e636f6d2f7363702f76314102ed70d1c4b106466149a7d129630c11a20554683ae012fdffa56341d1c323";
+const PUSH_TIER3_PREIMAGE_HEX: &str = "7363702d707573682d6272696467653a7773733a2f2f6272696467652e6578616d706c652e636f6d2f7363702f76314102ed70d1c4b106466149a7d129630c11a20554683ae012fdffa56341d1c323";
 const PUSH_TIER3_ROUTING_ID_HEX: &str =
-    "733a76fce10004826ffaecd3c85ba27169282665cd64a902000275a52ba640a1";
+    "b01dcde6d4e3d24f807acbc4ddadf3dd2bb8103f24f8f099ec08e4c476e7d9ec";
 const PUSH_BRIDGE_RELAY_ROUTING_ID_HEX: &str =
     "e47cce36c946ac50a2ee3dbc40f0416d7012bf82344c8f24a756c0f62242eea1";
 
@@ -1453,6 +1461,453 @@ fn vector_63_challenge_verification_passing_attempt() {
 }
 
 // ---------------------------------------------------------------------------
+// §25.27 Node vectors: Vector 90 (NodeId), 91 (NodeBinding), 44 (node proof),
+// 49 (node-list record and frame), and Vector 80's list record and node proof
+// ---------------------------------------------------------------------------
+
+/// §25.2's secret key at index `i` of [`REFERENCE_KEYS`].
+fn fixture_secret(i: usize) -> P256SecretKey {
+    P256SecretKey::from_seed(SeedLabel::TestVectorKey, &unhex32(REFERENCE_KEYS[i].0))
+}
+
+/// §25.2's public key at index `i` of [`REFERENCE_KEYS`].
+fn fixture_public(i: usize) -> P256PublicKey {
+    P256PublicKey::from_sec1(&unhex(REFERENCE_KEYS[i].2)).unwrap()
+}
+
+fn fixture_node_key(i: usize) -> [u8; 33] {
+    unhex(REFERENCE_KEYS[i].2).try_into().unwrap()
+}
+
+/// Vector 49's entry `index`: operator `#active` is §25.2's tertiary key and
+/// the node key is §25.2's key `index` (reference, then secondary).
+fn vector_49_entry(index: usize) -> NodeListEntry {
+    let (operator, head, url, url_hash, operator_sig, possession_sig, free) = if index == 0 {
+        (
+            "928c3419a430cdcbe4aa305a1e212ef62129ee259a5ebd36d62c8152123ef226",
+            "a358c071426ae76bd0434af1497dd52caa736d14c06dc91d8a562f71367f3a46",
+            "wss://node-a.example.com/scp/v1",
+            "0e9d09b337c5fc0be71b0688d6397b804369509fb9cd9b656276e5953fb7ad98",
+            "e49ae57145b6e63cf071328bc20bc149adab38046dfe0d8e15be04833f4f1ff83790fddd8bb44e3483f2354cb29690aa37a09b8a9bea17b6f95a792f0a38d81c",
+            "6cf2a11f081be3ba31e4d970eb1e841bde999be62d8b2a3eab984888ff8a787263a3c796e771a10ae4afa0e04f4b38fb4851917cfafe2f5ca31a8166c20d0d53",
+            true,
+        )
+    } else {
+        (
+            "260f934a7fecb9bd8d64563a017e7291b8d3cd8b8f24f297aed7685989d06acf",
+            "3abd3989c3912536e89c87b42385cb78cb0049e487a5bc6f1df5496840ed5396",
+            "wss://node-b.example.com/scp/v1",
+            "fa2f2df6d37f5691e35046764de6d6a65257da441fe53d427c18c6f4e166174d",
+            "62b0a0c0433a583f5e4121bbeb896e543fa45bcf4d9648037f374448401869a369a523bbcd3a01829882e07fcffe7cf800847cee824762166c7863b40d2c6135",
+            "73fb9e9ca723da73ec0bbe489d7755d1aab0138a6ccf5f7bf05fd91d077bb8226948c61c0a65742ad8b73be6797c4b85991d127e5ac5a601545caa43e5e9f737",
+            false,
+        )
+    };
+    NodeListEntry {
+        binding: NodeBinding {
+            operator: Identifier::from_bytes(unhex32(operator)),
+            node_key: fixture_node_key(index),
+            url_hash: unhex32(url_hash),
+            key_state_head: unhex32(head),
+            operator_sig: unhex(operator_sig).try_into().unwrap(),
+            possession_sig: unhex(possession_sig).try_into().unwrap(),
+        },
+        url: NodeUrl::new(url).unwrap(),
+        free,
+    }
+}
+
+/// Vector 49's entry `index` binding, verified under its operator's `#active`,
+/// §25.2's tertiary key.
+fn vector_49_bound(index: usize) -> VerifiedNodeBinding {
+    VerifiedNodeBinding::verify(vector_49_entry(index).binding, &fixture_public(2)).unwrap()
+}
+
+/// The verdict on a copy of `binding` under `operator_active`.
+fn check_binding(
+    binding: &NodeBinding,
+    operator_active: &P256PublicKey,
+) -> Result<(), NodeBindingError> {
+    VerifiedNodeBinding::verify(binding.clone(), operator_active).map(|_| ())
+}
+
+/// The verdict on a copy of `record` under `governor_active`, as attribution.
+fn check_record(
+    record: &NodeListRecord,
+    governor_active: &P256PublicKey,
+) -> Result<(), NodeListError> {
+    VerifiedNodeListRecord::verify(
+        record.clone(),
+        NodeListKeyClass::Attribution,
+        governor_active,
+    )
+    .map(|_| ())
+}
+
+const NODE_LIST_CONTEXT_ID: &str =
+    "97f678456b525ee215759c254e3ce5248249cf62dff666963caa5f25411354ce";
+const NODE_LIST_GOVERNOR: &str = "d5adb473c01283dc9a7e7e998c1d312b3a353acf4863c13fe77efe304ad38bb3";
+const NODE_LIST_SIGNING_HEAD: &str =
+    "fcd42118a68664c30ff6b44a74aa21fcee2e248e863b973dcad7c75dead5a763";
+
+fn vector_49_record(sequence: u64, signature: &str) -> NodeListRecord {
+    NodeListRecord {
+        context_id: NODE_LIST_CONTEXT_ID.to_owned(),
+        sequence,
+        governor: Identifier::from_bytes(unhex32(NODE_LIST_GOVERNOR)),
+        signing_key_state_head: unhex32(NODE_LIST_SIGNING_HEAD),
+        entries: vec![vector_49_entry(0), vector_49_entry(1)],
+        signature: unhex(signature).try_into().unwrap(),
+    }
+}
+
+#[test]
+fn vector_90_node_id() {
+    let binding = vector_49_entry(0).binding;
+    let node_id = binding.node_id().unwrap();
+    assert_eq!(
+        hex::encode(node_id.as_bytes()),
+        "e77d53354271e4c1c3c319cf7b5cfcc23be431c2ec795d5b6ecf549355f15610"
+    );
+    assert_spec_preimage(
+        "vector 90",
+        "5343502d4e4f44452d49442d56313a033b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f3027",
+        48,
+        node_id.as_bytes(),
+    );
+    let secondary = vector_49_entry(1).binding.node_id().unwrap();
+    assert_eq!(
+        hex::encode(secondary.as_bytes()),
+        "575d27a9d81af87b505b07f00c00031382c4ca1f3b9bf03e874f25179e21bcae"
+    );
+    assert_ne!(node_id, secondary);
+
+    // Negative: a binding whose node key carries the uncompressed prefix
+    // names no node, so no proof can be checked against it.
+    let mut off_prefix = vector_49_entry(0).binding;
+    off_prefix.node_key[0] = 0x04;
+    assert!(off_prefix.node_id().is_err());
+    assert!(matches!(
+        check_binding(&off_prefix, &fixture_public(2)),
+        Err(NodeBindingError::NodeKey(_))
+    ));
+}
+
+#[test]
+fn vector_91_node_binding() {
+    let binding = vector_49_entry(0).binding;
+    assert_eq!(
+        binding.operator.as_bytes(),
+        &unhex32("928c3419a430cdcbe4aa305a1e212ef62129ee259a5ebd36d62c8152123ef226")
+    );
+    assert_eq!(
+        binding.url_hash,
+        node_url_hash(&NodeUrl::new("wss://node-a.example.com/scp/v1").unwrap())
+    );
+    assert_eq!(
+        binding.url_hash,
+        unhex32("0e9d09b337c5fc0be71b0688d6397b804369509fb9cd9b656276e5953fb7ad98")
+    );
+    let digest = binding.digest();
+    assert_eq!(
+        hex::encode(digest),
+        "d68d4136c96b03ac41934a2d25b385cb065188e045aff1ea4c15379678f0bf38"
+    );
+    assert_spec_preimage(
+        "vector 91",
+        "5343502d4e4f44452d42494e442d56313a928c3419a430cdcbe4aa305a1e212ef62129ee259a5ebd36d62c8152123ef226033b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f30270e9d09b337c5fc0be71b0688d6397b804369509fb9cd9b656276e5953fb7ad98a358c071426ae76bd0434af1497dd52caa736d14c06dc91d8a562f71367f3a46",
+        146,
+        &digest,
+    );
+    assert_eq!(
+        hex::encode(sign_prehash_rfc6979(&fixture_secret(2), &digest).unwrap()),
+        "e49ae57145b6e63cf071328bc20bc149adab38046dfe0d8e15be04833f4f1ff83790fddd8bb44e3483f2354cb29690aa37a09b8a9bea17b6f95a792f0a38d81c"
+    );
+    assert_eq!(
+        hex::encode(sign_prehash_rfc6979(&fixture_secret(0), &digest).unwrap()),
+        "6cf2a11f081be3ba31e4d970eb1e841bde999be62d8b2a3eab984888ff8a787263a3c796e771a10ae4afa0e04f4b38fb4851917cfafe2f5ca31a8166c20d0d53"
+    );
+    let verified = VerifiedNodeBinding::verify(binding.clone(), &fixture_public(2)).unwrap();
+    assert_eq!(verified.binding(), &binding);
+    assert_eq!(*verified.node_key(), fixture_public(0));
+    assert_eq!(*verified.node_id(), binding.node_id().unwrap());
+
+    // Negative: another operator key, and each field changed.
+    assert!(matches!(
+        check_binding(&binding, &fixture_public(1)),
+        Err(NodeBindingError::OperatorSignature(_))
+    ));
+    let mut changed = binding.clone();
+    changed.url_hash[0] ^= 1;
+    assert!(matches!(
+        check_binding(&changed, &fixture_public(2)),
+        Err(NodeBindingError::OperatorSignature(_))
+    ));
+    let mut changed = binding.clone();
+    changed.key_state_head[31] ^= 1;
+    assert!(check_binding(&changed, &fixture_public(2)).is_err());
+    let mut changed = binding.clone();
+    changed.node_key = fixture_node_key(1);
+    assert!(check_binding(&changed, &fixture_public(2)).is_err());
+    let mut changed = binding.clone();
+    changed.possession_sig[0] ^= 1;
+    assert!(matches!(
+        check_binding(&changed, &fixture_public(2)),
+        Err(NodeBindingError::PossessionSignature(_))
+    ));
+
+    // Negative: the high-`s` form of each valid signature is refused.
+    let mut changed = binding.clone();
+    changed.operator_sig = high_s_form(&binding.operator_sig);
+    assert_eq!(
+        check_binding(&changed, &fixture_public(2)),
+        Err(NodeBindingError::OperatorSignature(P256Error::HighS))
+    );
+    let mut changed = binding.clone();
+    changed.possession_sig = high_s_form(&binding.possession_sig);
+    assert_eq!(
+        check_binding(&changed, &fixture_public(2)),
+        Err(NodeBindingError::PossessionSignature(P256Error::HighS))
+    );
+}
+
+fn vector_44_proof() -> NodeProof {
+    NodeProof {
+        node_id: vector_49_entry(0).binding.node_id().unwrap(),
+        nonce: unhex32("8c10b9bc0b5acdcfb85432747587fbbd8894bbad69f35de6dff46093513daac8"),
+        routing_id: unhex32("4102ed70d1c4b106466149a7d129630c11a20554683ae012fdffa56341d1c323"),
+        value_digest: response_value_digest(&[
+            b"scp-25-served-blob-a".as_slice(),
+            b"scp-25-served-blob-bb".as_slice(),
+        ])
+        .unwrap(),
+        observed_at: 1_700_000_000,
+        signature: unhex("e3181283bee0dfc05c16d114441e110743ebe830078d42380c68e520e86558557e2ddfbebb87ab89de8c16432122da3f5e8e230eecb8424359d35c816a8c03ab").try_into().unwrap(),
+    }
+}
+
+#[test]
+fn vector_44_node_proof() {
+    let proof = vector_44_proof();
+    assert_eq!(
+        hex::encode(proof.node_id.as_bytes()),
+        "e77d53354271e4c1c3c319cf7b5cfcc23be431c2ec795d5b6ecf549355f15610"
+    );
+    assert_eq!(
+        hex::encode(proof.value_digest),
+        "ebbf1905dedb60f162f2cc5190ae0a8cd0adc66bb34e0ea45469bc4957405115"
+    );
+    let digest = proof.digest();
+    assert_eq!(
+        hex::encode(digest),
+        "576f5707e3f53d47e9dbf92e376cf28032dfba602087803c93451326318d0952"
+    );
+    assert_spec_preimage(
+        "vector 44",
+        "5343502d4e4f44452d50524f4f462d56313ae77d53354271e4c1c3c319cf7b5cfcc23be431c2ec795d5b6ecf549355f156108c10b9bc0b5acdcfb85432747587fbbd8894bbad69f35de6dff46093513daac84102ed70d1c4b106466149a7d129630c11a20554683ae012fdffa56341d1c323ebbf1905dedb60f162f2cc5190ae0a8cd0adc66bb34e0ea45469bc4957405115000000006553f100",
+        154,
+        &digest,
+    );
+    assert_reference_signature(
+        "vector 44",
+        &digest,
+        "e3181283bee0dfc05c16d114441e110743ebe830078d42380c68e520e86558557e2ddfbebb87ab89de8c16432122da3f5e8e230eecb8424359d35c816a8c03ab",
+    );
+    let bytes = proof.to_bytes();
+    assert_eq!(bytes.len(), 200);
+    assert_eq!(NodeProof::from_bytes(&bytes).unwrap(), proof);
+    let node = vector_49_bound(0);
+    proof.verify_signature(&node).unwrap();
+
+    // Negative: the secondary key's binding names another node, the high-`s`
+    // form of the signature is refused, and any changed byte fails.
+    assert_eq!(
+        proof.verify_signature(&vector_49_bound(1)),
+        Err(NodeProofError::NodeIdMismatch)
+    );
+    let mut high = proof.clone();
+    high.signature = high_s_form(&proof.signature);
+    assert_eq!(
+        high.verify_signature(&node),
+        Err(NodeProofError::Signature(P256Error::HighS))
+    );
+    for i in 0..bytes.len() {
+        let mut changed = bytes;
+        changed[i] ^= 1;
+        let decoded = NodeProof::from_bytes(&changed).unwrap();
+        assert!(
+            decoded.verify_signature(&node).is_err(),
+            "byte {i} changed and the proof still verified"
+        );
+    }
+}
+
+#[test]
+fn vector_49_node_list_entries() {
+    let entries = [vector_49_entry(0), vector_49_entry(1)];
+    let entries_json = entries_canonical_json(&entries).unwrap();
+    assert_eq!(entries_json.len(), 1362);
+    assert_eq!(
+        hex::encode(sha256(&entries_json)),
+        "ecbad39bb7eed5b44dd1aaa228a1055ae09c2528cc490b3952e172600334e717"
+    );
+    for entry in &entries {
+        let verified = VerifiedNodeListEntry::verify(entry.clone(), &fixture_public(2)).unwrap();
+        assert_eq!(verified.url(), &entry.url);
+        assert_eq!(verified.free(), entry.free);
+    }
+    // Negative: an entry listed under another URL is void.
+    let mut moved = vector_49_entry(0);
+    moved.url = NodeUrl::new("wss://node-b.example.com/scp/v1").unwrap();
+    assert_eq!(
+        VerifiedNodeListEntry::verify(moved, &fixture_public(2)),
+        Err(NodeListEntryError::UrlHashMismatch)
+    );
+}
+
+#[test]
+fn vector_49_node_list_record() {
+    let record = vector_49_record(
+        1,
+        "9dedf72c8aaa38ce44039d8c5999c6c499652bfe8f265c84c615721a4ffeb6a00d7cd5473afc1ad30a00d45fcce9b1bea00f6088fc0342184e004a2095177591",
+    );
+    let digest = record.digest().unwrap();
+    assert_eq!(
+        hex::encode(digest),
+        "122077ea7a7501969555b1ff7f5dc819579451413ec3d7c70fdf83360defb05b"
+    );
+    assert_spec_preimage(
+        "vector 49",
+        "5343502d4e4f44452d4c4953542d56313a00000040393766363738343536623532356565323135373539633235346533636535323438323439636636326466663636363936336361613566323534313133353463650000000000000001d5adb473c01283dc9a7e7e998c1d312b3a353acf4863c13fe77efe304ad38bb3fcd42118a68664c30ff6b44a74aa21fcee2e248e863b973dcad7c75dead5a763ecbad39bb7eed5b44dd1aaa228a1055ae09c2528cc490b3952e172600334e717",
+        189,
+        &digest,
+    );
+    assert_eq!(
+        hex::encode(sign_prehash_rfc6979(&fixture_secret(1), &digest).unwrap()),
+        "9dedf72c8aaa38ce44039d8c5999c6c499652bfe8f265c84c615721a4ffeb6a00d7cd5473afc1ad30a00d45fcce9b1bea00f6088fc0342184e004a2095177591"
+    );
+    for class in [NodeListKeyClass::Standing, NodeListKeyClass::Attribution] {
+        let verified =
+            VerifiedNodeListRecord::verify(record.clone(), class, &fixture_public(1)).unwrap();
+        assert_eq!(verified.class(), class);
+        assert_eq!(verified.record(), &record);
+    }
+
+    let json = record.to_canonical_json().unwrap();
+    assert_eq!(json.len(), 1782);
+    assert_eq!(
+        hex::encode(sha256(&json)),
+        "774a88090c2ad8424a82a571b0584d32ed62dea6367062466e47329e82a74211"
+    );
+    assert_eq!(NodeListRecord::from_canonical_json(&json).unwrap(), record);
+
+    let routing_id = unhex32("e949d5a827c14f541cf388ce78193aeac04b893af96b472055ad595c14823fc6");
+    let frame = encode_node_list_frame(&record).unwrap();
+    assert_eq!(frame.len(), 1815);
+    assert_eq!(
+        hex::encode(sha256(&frame)),
+        "48c624ae14ac80251690464a576cc965f8493ab9a43dc1e9d828609fc84ecfb6"
+    );
+    assert_eq!(
+        check_node_list_publish(&routing_id, true, None, &frame).unwrap(),
+        record
+    );
+
+    // Negative: another signer, the high-`s` form of the signature, and each
+    // signed field changed.
+    assert!(matches!(
+        check_record(&record, &fixture_public(0)),
+        Err(NodeListError::Signature(_))
+    ));
+    let mut changed = record.clone();
+    changed.signature = high_s_form(&record.signature);
+    assert_eq!(
+        check_record(&changed, &fixture_public(1)),
+        Err(NodeListError::Signature(P256Error::HighS))
+    );
+    let mut changed = record.clone();
+    changed.sequence = 2;
+    assert!(check_record(&changed, &fixture_public(1)).is_err());
+    let mut changed = record.clone();
+    changed.context_id.push('0');
+    assert!(check_record(&changed, &fixture_public(1)).is_err());
+    let mut changed = record.clone();
+    changed.signing_key_state_head[0] ^= 1;
+    assert!(check_record(&changed, &fixture_public(1)).is_err());
+    let mut changed = record.clone();
+    changed.governor = Identifier::from_bytes([0x11; 32]);
+    assert!(check_record(&changed, &fixture_public(1)).is_err());
+    let mut changed = record;
+    changed.entries.swap(0, 1);
+    assert!(check_record(&changed, &fixture_public(1)).is_err());
+
+    // Negative: the frame's version byte, its governor, and a space.
+    let mut bad = frame.clone();
+    bad[0] = 5;
+    assert_eq!(
+        decode_node_list_frame(&bad),
+        Err(NodeListFrameError::WrongVersion(5))
+    );
+    let mut bad = frame.clone();
+    bad[1] ^= 1;
+    assert_eq!(
+        decode_node_list_frame(&bad),
+        Err(NodeListFrameError::GovernorMismatch)
+    );
+    let mut bad = frame[..33].to_vec();
+    bad.extend_from_slice(b" ");
+    bad.extend_from_slice(&json);
+    assert!(decode_node_list_frame(&bad).is_err());
+    assert_eq!(
+        check_node_list_publish(&routing_id, false, None, &frame),
+        Err(NodeListFrameError::RetainMissing)
+    );
+    assert_eq!(
+        check_node_list_publish(&unhex32(NODE_LIST_GOVERNOR), true, None, &frame),
+        Err(NodeListFrameError::RoutingIdMismatch)
+    );
+}
+
+#[test]
+fn vector_80_list_record_and_node_proof() {
+    let record = vector_49_record(
+        3,
+        "53e447ab82373c0df0deea27a29a40bbe4c5c5b1958d52eb8b7e3c6838f8ad984d0ec8165e28e18eedaade03e5febc825fb2becc00e9b357083f9eb2b610c6fa",
+    );
+    let digest = record.digest().unwrap();
+    assert_eq!(
+        hex::encode(digest),
+        "47f5a1005277b59e356463fd6417eb44f0d83c10d2bfe7f50b9d494f3ce06965"
+    );
+    check_record(&record, &fixture_public(1)).unwrap();
+    let json = record.to_canonical_json().unwrap();
+    assert_eq!(json.len(), 1782);
+    assert_eq!(
+        hex::encode(sha256(&json)),
+        "4b1f90d3a78a3cfabad1c60f3fcfdf4617bde409d423b0752f38bc1d81d2bd5a"
+    );
+
+    let proof_bytes = unhex(
+        "e77d53354271e4c1c3c319cf7b5cfcc23be431c2ec795d5b6ecf549355f156105a5054e04186dcdb137484414cc26f7a0b4100126689b5fee53f290d72b6eb9b4102ed70d1c4b106466149a7d129630c11a20554683ae012fdffa56341d1c3239762ccc1e7d800f5ede39f61fab3c5d53584c8ea17514964b36202ab5825330a000000006553f10019ccb6fb372c14165c1774324b3c9e96a0fff3ee18a60047b980404deaa949cf7f8615dfa625481895765838b261f38d8c39b8c7bc80f37fed3931a6ff2f80f8",
+    );
+    let proof = NodeProof::from_bytes(&proof_bytes).unwrap();
+    assert_eq!(proof.node_id, vector_49_entry(0).binding.node_id().unwrap());
+    assert_eq!(
+        hex::encode(proof.nonce),
+        "5a5054e04186dcdb137484414cc26f7a0b4100126689b5fee53f290d72b6eb9b"
+    );
+    assert_eq!(
+        hex::encode(proof.value_digest),
+        "9762ccc1e7d800f5ede39f61fab3c5d53584c8ea17514964b36202ab5825330a"
+    );
+    proof.verify_signature(&vector_49_bound(0)).unwrap();
+    assert_eq!(
+        proof.verify_signature(&vector_49_bound(1)),
+        Err(NodeProofError::NodeIdMismatch)
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Cross-vector consistency
 // ---------------------------------------------------------------------------
 
@@ -1498,6 +1953,10 @@ fn domain_separators_are_all_unique() {
         "SCP-KEYPACKAGE-ATTESTATION-V1:",
         "SCP-PUSH-REGISTER-V1:",
         "SCP-PUSH-DEREGISTER-V1:",
+        "SCP-NODE-ID-V1:",
+        NODE_BINDING_SEPARATOR,
+        NODE_LIST_SEPARATOR,
+        NODE_PROOF_SEPARATOR,
     ];
 
     // HKDF/HMAC labels, used as info strings, salts, or trailing labels. A

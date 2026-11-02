@@ -88,7 +88,7 @@ pub enum ResolutionVerdict {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InconclusiveCause {
     /// The verifier holds no event for the sequences `range` names.
-    /// `failed_sources` holds the relay URLs that failed to serve, and it is
+    /// `failed_sources` holds the node URLs that failed to serve, and it is
     /// empty where R9's fetch bound stopped the verifier itself.
     MissingEvents {
         /// The sequences the verifier holds no event for.
@@ -136,7 +136,7 @@ pub enum SourceExhaustion {
     Failed,
 }
 
-/// What the verifier made of a source's relay proof of control
+/// What the verifier made of a source's node proof of control
 /// (`09-security-model.md` §9.7.4.2 R11's first-contact floor).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OperatorProof {
@@ -156,7 +156,7 @@ pub enum OperatorProof {
 /// What one source served in one resolution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceRead {
-    /// The relay URL, which `MissingEvents.failed_sources` reports.
+    /// The node URL, which `MissingEvents.failed_sources` reports.
     pub name: String,
     /// Every unit the source served, in served order.
     pub units: Vec<Vec<u8>>,

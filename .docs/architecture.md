@@ -446,7 +446,7 @@ Responsibilities:
   • Identity inception — compose and publish the inception event, whose digest is the identifier (`09-security-model.md` §9.7.4.2 R2, R13)
   • Resolution with security verification (§9.6)
     - Replay the key-event log, recompute the identifier, derive the key state (`09-security-model.md` §9.7.4.2 R2, R8)
-    - Apply the relay proof of control's five checks and R11's first-contact floor
+    - Apply the node proof of control's five checks against listed nodes and R11's first-contact floor
   • Key rotation (triggers MLS Update in all active contexts — §9.7.4)
   • Key Continuity Verification — safety numbers (§9.11)
   • Compromise recovery flow orchestration (§9.12)

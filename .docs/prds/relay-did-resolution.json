@@ -894,7 +894,7 @@
         },
         {
           "file": ".docs/specs/25-test-vectors.md",
-          "section": "### Vector 49: the relay-list record"
+          "section": "### Vector 49: the node-list record"
         },
         {
           "file": ".docs/specs/05-contexts.md",

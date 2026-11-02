@@ -1146,8 +1146,8 @@ mod tests {
              1b69649c2295b1517883d47f3027000000010000000100000002033b1cac23f4\
              5cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f30270101000000\
              000000000001010223702a648232f2d00713de9289753c2fbd4c4efa7e1e3390\
-             5e3723a412b20aea020100000000000000000101000000019d94df95bc0a13f1\
-             963f484414c320354c73c75bb86e96559e97765f5bc2d31300000e1002000000\
+             5e3723a412b20aea02010000000000000000010100000001575d27a9d81af87b\
+             505b07f00c00031382c4ca1f3b9bf03e874f25179e21bcae00000e1002000000\
              0000000000000000000000000000000000000000000000000000000000000000\
              000100000001421be508c6ed135a9737895007e5ba16f9542e1b3440f6d00a51\
              5de80a3e43eb010100000001";
@@ -1227,11 +1227,11 @@ mod tests {
         let signature_41 = sign_prehash_rfc6979(&key, &v.digest_41).unwrap();
         assert_eq!(
             hex::encode(signature_41),
-            "274e7cf73b6807ec53619491a1cc094a5fa2a649b4a04a043965597c7faa5e96\
-             7e7b499be2e9750521b4bfec6fa65bfdd14c8e5c940bb60884d040da9d1e70a0"
+            "0f53fa982d5dedc4e0f7b0c0216098ee17e8fa0e0c42609a976c4b1d444a9ba1\
+             5f6fe6f9cbc80d4f37cf39e620b9ae7ff4e022e3810beab421655170ec4ddd07"
                 .replace(char::is_whitespace, ""),
             "Vector 41: preimage length {} (spec 364), byte 100 {:#04x} (spec 0x01), \
-             D {} (spec d8ba4ebad52657208736f4cac675352f5f9cc0aa837620f8d742dbf42aeedbd7)",
+             D {} (spec fcd42118a68664c30ff6b44a74aa21fcee2e248e863b973dcad7c75dead5a763)",
             v.preimage_41.len(),
             v.preimage_41[100],
             hex::encode(v.digest_41),
@@ -1241,14 +1241,14 @@ mod tests {
         let signature_42 = sign_prehash_rfc6979(&key, &v.digest_assertion).unwrap();
         assert_eq!(
             hex::encode(signature_42),
-            "6aee5c6f9b367f8a886fb996c2f08d77fefcddee6399f1b928cf1110cef786d0\
-             315de3e854e0669d355b4968b5c2bc8075a5630e3c980844049ebcbf9716c424"
+            "56594bcea202cce44d7a4587ad15f5e2629a42a11b2f68b99c7833c33ac5143a\
+             739f7439120872390466883124368fa5200b86df15e25155f9746492320f3225"
                 .replace(char::is_whitespace, ""),
-            "Vector 42: D {} (spec 9a41b0fdb978014730ab7d8d56b9a77745b4ff4824affc096bbd923d14a569a6), \
-             challenge {} (spec U0NQLUtFWS1FVkVOVC1WMTqaQbD9uXgBRzCrfY1Wuad3RbT_SCSv_AlrvZI9FKVppg), \
+            "Vector 42: D {} (spec 386f6c642383574c5a6cb2910158aa41619e2c91a0058b5125f9c70b7079dadc), \
+             challenge {} (spec U0NQLUtFWS1FVkVOVC1WMTo4b2xkI4NXTFpsspEBWKpBYZ4skaAFi1El-ccLcHna3A), \
              clientDataJSON length {} (spec 155), \
-             SHA-256(clientDataJSON) {} (spec 0b33b76a4ecb79e15753a17147ac39f6964ae20523e7e001c258e67d2562c236), \
-             signed digest {} (spec 1f63ea5226c20ce261b3243ad941ef8834b0678cf4681b2f914963b0bffe4d6b)",
+             SHA-256(clientDataJSON) {} (spec 035e3fb00ac00e96b7003f45c4acb263d0d751d76e1ee9a5d146f21168627420), \
+             signed digest {} (spec 201ce67c1b0826ae8a57b5649b8893bc1ff95e49ba532baba6e6ae9d106b5bce)",
             hex::encode(v.digest_42),
             v.challenge_b64url,
             v.client_data_json.len(),

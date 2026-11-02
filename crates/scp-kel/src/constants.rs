@@ -157,3 +157,12 @@ pub(crate) const CONFLICT_STATEMENTS_ROUTING_SEPARATOR: &[u8] = b"scp:wcf:";
 /// stored under (§9.7.4.2 R13; §9.18.2; `03-identity.md` §3.10.13). Its one
 /// public path is `routing_id`.
 pub(crate) const SERVICE_RECORD_ROUTING_SEPARATOR: &[u8] = b"scp:svc:";
+
+/// Prefixes a node-list context's identifier in the routing identifier its
+/// `NodeListRecord`s are stored under (§9.6.3 "The fetch"; §9.18.2). Its one
+/// public path is `node_list_routing_id`.
+pub(crate) const NODE_LIST_ROUTING_SEPARATOR: &[u8] = b"scp:nls:";
+
+/// Prefixes a node key in its `NodeId` (§9.7.4.2 definitions; §9.18.2). Its
+/// one public path is `derive_node_id`.
+pub(crate) const NODE_ID_SEPARATOR: &[u8] = b"SCP-NODE-ID-V1:";

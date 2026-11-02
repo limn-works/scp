@@ -26,6 +26,7 @@ mod custody_offer;
 pub mod document;
 mod identifier;
 mod key_state;
+mod node_id;
 mod node_url;
 
 pub use custody_offer::{
@@ -46,6 +47,7 @@ pub use key_state::{
     CommitmentEntry, CustodyType, DiscriminatorKind, FixedCommitment, KeyAlgorithm, KeyCondition,
     KeyEntry, KeyRole, KeyState, StandingCommitment, UnknownDiscriminator,
 };
+pub use node_id::NodeId;
 pub use node_url::{BridgeEndpoint, NodeEntryUrlError, NodeUrl, NodeUrlError, canonical_node_url};
 
 use serde::{Deserialize, Serialize};

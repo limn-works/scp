@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 
 use crate::constants::{
     CONFLICT_STATEMENTS_ROUTING_SEPARATOR, COSIGNED_HEADS_ROUTING_SEPARATOR,
-    KEY_EVENTS_ROUTING_SEPARATOR, SERVICE_RECORD_ROUTING_SEPARATOR,
+    KEY_EVENTS_ROUTING_SEPARATOR, NODE_LIST_ROUTING_SEPARATOR, SERVICE_RECORD_ROUTING_SEPARATOR,
 };
 
 /// The four retained object kinds an identity's routing identifiers address.
@@ -46,4 +46,36 @@ pub fn routing_id(kind: RoutingKind, identifier: &Identifier) -> [u8; 32] {
     hasher.update(kind.separator());
     hasher.update(identifier.as_bytes());
     hasher.finalize().into()
+}
+
+/// `SHA-256("scp:nls:" ‖ context_id)`, the routing identifier a node-list
+/// context's records are published at (§9.6.3 "The fetch"; §9.10.12).
+///
+/// `context_id` is the node-list context's identifier string, hashed as its
+/// UTF-8 bytes with no length prefix. A routing derivation hashes one
+/// variable-length input after a fixed separator, so the input's end is the
+/// preimage's end and no two inputs share a preimage. It is a separate
+/// function from [`routing_id`] because its input is a context identifier
+/// string, not an identity's 32-byte [`Identifier`].
+#[must_use]
+pub fn node_list_routing_id(context_id: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(NODE_LIST_ROUTING_SEPARATOR);
+    hasher.update(context_id.as_bytes());
+    hasher.finalize().into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn node_list_routing_id_hashes_the_separator_and_the_context_id() {
+        let mut hasher = Sha256::new();
+        hasher.update(b"scp:nls:");
+        hasher.update(b"ctx");
+        let expected: [u8; 32] = hasher.finalize().into();
+        assert_eq!(node_list_routing_id("ctx"), expected);
+        assert_ne!(node_list_routing_id("ctx"), node_list_routing_id("ctx2"));
+    }
 }

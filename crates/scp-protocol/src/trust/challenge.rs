@@ -3688,7 +3688,7 @@ mod tests {
     fn identifier_scoped_uri_fails_closed_at_create() {
         let fx = fixture();
         let other =
-            "scp:fqhx6rdyx2knwadygeppkg5dzsmtinrlb4ku3s7zywlvolsgz4za:capability:anything/v1";
+            "scp:2ww3i46ackb5zgt6p2myyhjrfm5dkowpjbr4cp7hp37daswtrozq:capability:anything/v1";
         assert!(matches!(
             ChallengePolicy::resolve(&fx.definitions, other, PolicyPick::default()),
             Err(TrustError::CapabilityDefinitionUnavailable { .. })

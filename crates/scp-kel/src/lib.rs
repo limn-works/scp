@@ -13,6 +13,7 @@ mod error;
 mod event;
 mod event_codec;
 mod key_event_signer;
+mod node_id;
 mod preimage;
 mod rank;
 pub mod recovery_store;
@@ -43,6 +44,7 @@ pub use key_event_signer::{
     CUSTODY_PROBE_CHALLENGE_LEN, CustodyProbe, KeyEventSignError, KeyEventSigner, MaybeSend,
     ProbeNonceError, ProbeSignature,
 };
+pub use node_id::{NodeKeyError, derive_node_id, parse_node_key};
 pub use preimage::{
     EncodedPreimage, decode_preimage, derive_identifier, encode_preimage, key_event_seal,
     prerotation_commitment,
@@ -57,7 +59,7 @@ pub use relation::{
     ChainRelation, EntryAdoption, EntryRelations, ExtendingAct, RelationError, ServedChainReading,
     WithheldEvent, classify_relation,
 };
-pub use routing::{RoutingKind, routing_id};
+pub use routing::{RoutingKind, node_list_routing_id, routing_id};
 pub use signature::{
     AssertionSignature, IndexedSignature, IndexedSignatureError, IndexedSignaturePart,
     IndexedSignatureReadError, key_event_challenge, verify_indexed,
