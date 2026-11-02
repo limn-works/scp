@@ -9,7 +9,7 @@ Use bun, never npm or npx. Follow `.docs/standards/typescript.md`. Biome handles
 
 ## Testing against the real addon
 
-`bun run check`, `bun run lint`, and a single-file `bun test` are not enough. The real-napi tests skip themselves when no built `.node` exists, and some failures appear only when every test file runs in one process. Before you push a bridge-facing change, build the addon (`cargo build -p scp-ffi-napi --release --features scp-ffi-napi/testing`, then copy the library to `node_modules/@limn-works/scp-ts-napi-<platform>/index.node` with a one-line `package.json`), and run the whole `bun test` suite. The release build takes minutes, so run it from the main session rather than a worktree subagent.
+`bun run check`, `bun run lint`, and a single-file `bun test` are not enough. The real-napi tests skip themselves when no built `.node` exists, and some failures appear only when every test file runs in one process. Before you push a bridge-facing change, build the addon (`cargo build -p scp-ffi-napi --profile ci-bridge --features scp-ffi-napi/testing`, then copy `target/ci-bridge/libscp_ffi_napi.dylib` (`.so` on Linux) to `node_modules/@limn-works/scp-ts-napi-<platform>/index.node` with a one-line `package.json`), and run the whole `bun test` suite. `ci-bridge` is the profile CI's napi-addon job builds the tests' addon with, and it compiles incrementally. On a 16-core Mac, a cold build took 730 s, and a rebuild after a one-line scp-runtime edit took 72-79 s, against 1,331 s and 745 s under `--release`. Start the cold build in the background.
 
 ## Code that also runs in a browser
 
