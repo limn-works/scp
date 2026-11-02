@@ -28,6 +28,17 @@
 # `scripts/check-toolchain-wiring.sh` must see the checkout as a developer's shell sees it,
 # with no override.
 #
+# WHY EVERY OTHER TOOLCHAIN IS REMOVED. `Swatinem/rust-cache` hashes the `rustc -vV` of every
+# installed toolchain into its environment hash, which is part of both the cache key and the
+# restore-key prefix. Each runner image preinstalls a stable toolchain, and the images
+# change it: macOS image 20261013 shipped 1.99.0 and image 20261021 shipped 1.99.1. So the
+# key of `apple-uniffi-ci-bridge` moved from `...-8222a566-...` to `...-2a259060-...`, and
+# the jobs on the newer image found `No cache found` and compiled every dependency (jobs
+# 124117779011 and 124625685010, 12 to 15 minutes against about 5 warm) until a push to
+# `main` ran on that image too. After the pin is installed, this step uninstalls every
+# toolchain it did not install in this job and makes the first one it installed the
+# default, so the key depends only on the toolchain files the checkout names.
+#
 # FAILURE IS TYPED, NEVER DEGRADED. Each case below exits non-zero with a `::error::` line
 # naming the case: an unreadable toolchain file or channel, a `RUSTUP_TOOLCHAIN` in the
 # environment (it outranks the override, so the job would compile on some other
@@ -149,6 +160,29 @@ if [[ $channel =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ && $resolved != "rustc $channel "*
 fi
 if [[ $resolved != "$expected" ]]; then
     error "rustc -V in $directory reports '$resolved', but toolchain $channel holds '$expected', so something outranks the override this step set."
+    exit 1
+fi
+
+# Every toolchain this step installed in this job, one channel per line, so a second call
+# (the fuzz jobs install the root pin, then the fuzz nightly) keeps the first one.
+record="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/rust-toolchain-action-installed"
+printf '%s\n' "$channel" >> "$record"
+
+if ! listed=$(rustup toolchain list); then
+    error "rustup toolchain list failed after $channel was installed, so this step cannot remove the toolchains the runner image preinstalled."
+    exit 1
+fi
+kept_pattern=$(awk 'NF {printf "%s^%s(-|$)", (n++ ? "|" : ""), $0}' "$record" | sed 's/\./\\./g')
+while read -r name _; do
+    [[ -z $name || $name =~ $kept_pattern ]] && continue
+    if ! rustup toolchain uninstall "$name"; then
+        error "rustup toolchain uninstall $name failed, so the rust-cache key of this job would hash that toolchain, which the runner image chose, and differ from the key a run on another image version writes."
+        exit 1
+    fi
+done <<< "$listed"
+first=$(head -n 1 "$record")
+if ! rustup default "$first"; then
+    error "rustup default $first failed after the runner image's other toolchains were removed, so a cargo command outside $directory would find no toolchain."
     exit 1
 fi
 
