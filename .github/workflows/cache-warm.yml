@@ -1,7 +1,8 @@
 name: Cache warm
 
-# Writes every cargo cache group that more than one job of ci.yml reads, on each push to
-# `main`. Each job here restores one group, and when the restore is not an exact match it
+# Writes every cargo cache group that more than one job of ci.yml reads, and every group
+# whose ci.yml reader restores it only when a bridge-artifact cache misses, on each push
+# to `main`. Each job here restores one group, and when the restore is not an exact match it
 # compiles every feature set, in every compile mode, that any job reading the group
 # compiles, so the entry it saves holds every dependency unit each reader needs. A
 # reader that restores an entry missing its units compiles them from source on every
@@ -14,9 +15,9 @@ name: Cache warm
 # so those run their tests too. Check `group coverage` in
 # scripts/check-workflow-compile-steps.py fails when a reader of a group compiles a
 # command no job writing that group compiles, so a reader's new feature set or mode
-# lands here in the same change. Editing this file changes every group's key, because
-# ./.github/actions/rust-cache digests it into `prefix-key`, so the next push to `main`
-# re-warms each group under the new commands.
+# lands here in the same change. Editing this file changes the key of every group it
+# writes, because ./.github/actions/rust-cache digests it into those groups'
+# `prefix-key`, so the next push to `main` re-warms each one under the new commands.
 #
 # These jobs are not in ci.yml so that a push to `main` runs ci.yml's legs exactly as a
 # merge-queue run does and is not held up by a job that compiles every reader's feature
@@ -327,3 +328,49 @@ jobs:
           cargo nextest run --no-run -p scp-transport --features quic,http3,udp,coap,nostr,webrtc --lib
           cargo nextest run --no-run -p scp-platform --features apple,sync,sqlite,filesystem,file,encrypting,testing --lib
           cargo nextest run --no-run -p scp-platform --features apple,sync,sqlite,filesystem,file,encrypting,testing
+
+  apple-uniffi-ci-bridge:
+    name: Warm apple-uniffi-ci-bridge
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/rust-toolchain
+      - id: cache
+        uses: ./.github/actions/rust-cache
+        with:
+          shared-key: apple-uniffi-ci-bridge
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - if: steps.cache.outputs.cache-hit != 'true'
+        uses: ./.github/actions/cargo-fetch
+      # xcframework.
+      - name: Build the XCFramework under the ci-bridge profile
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: bindings/swift/build-xcframework.sh --dev --profile ci-bridge
+
+  apple-parity-ci-bridge:
+    name: Warm apple-parity-ci-bridge
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: ./.github/actions/rust-toolchain
+      - id: cache
+        uses: ./.github/actions/rust-cache
+        with:
+          shared-key: apple-parity-ci-bridge
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - if: steps.cache.outputs.cache-hit != 'true'
+        uses: ./.github/actions/cargo-fetch
+      # pyo3-module-macos.
+      - name: Build the PyO3 module under the ci-bridge profile
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          python -m venv .venv
+          source .venv/bin/activate
+          pip install maturin
+          cd bindings/python
+          maturin develop --profile ci-bridge --features testing

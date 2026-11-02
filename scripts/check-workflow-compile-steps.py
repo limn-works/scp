@@ -60,7 +60,10 @@ restores compiles.
   same CARGO*/CC*/CFLAGS*/CXX*/CMAKE*/RUST* environment, the variables rust-cache hashes
   into the key. A leg writes when its rust-cache step's `save-if` and its job's and
   step's `if:` can hold on a run of `refs/heads/main` that a push or a schedule starts,
-  and the workflow file triggers on one of those events.
+  and the workflow file triggers on one of those events. A writer's rust-cache step
+  reads no earlier step's output in its `if:` or `save-if`: such an output (a
+  bridge-artifact cache hit, for one) can skip the save on every push, so an evicted or
+  rekeyed entry would stay unwritten while the check counted it written.
 
   Why: rust-cache saves only when the restored key was not an exact match, so a reader
   that compiles a feature set or a compile mode the writer did not compile rebuilds
@@ -1289,6 +1292,20 @@ def check_group_coverage(workflows_dir: Path, repo_root: Path) -> list[str]:
                             and may_run(block.get("save-if"), writer_context)
                             for writer_context in writer_contexts
                         )
+                        gate = " ".join(
+                            str(value)
+                            for value in (step.get("if"), block.get("save-if"))
+                            if value is not None
+                        )
+                        if writes and re.search(r"(?i)\bsteps\s*\.", gate):
+                            failures.append(
+                                f"{where}: the rust-cache step writing group "
+                                f"{substitute_matrix(key, leg).strip()!r} waits on an "
+                                f"earlier step's output (`{gate}`), which can skip the save "
+                                f"on every push to {DEFAULT_BRANCH_REF}, so an evicted or "
+                                f"rekeyed entry stays unwritten; write the group from a "
+                                f"step that every such push runs"
+                            )
                         env = {
                             name: substitute_matrix(str(value), leg)
                             for source in (workflow_env, job_env, step_env)

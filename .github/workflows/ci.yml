@@ -73,7 +73,7 @@ env:
 # compile the same crate graph into the same target directory read and write one entry.
 # `save-if` restricts writing to a push to `main`, whose entries every pull request and
 # every merge-queue run can read.
-# Seventeen groups exist per generation: nine written by this workflow, seven by
+# Seventeen groups exist per generation: seven written by this workflow, nine by
 # `.github/workflows/cache-warm.yml`, one by `.github/workflows/fuzz.yml`.
 #
 # WHAT THE KEY HOLDS. Every step restores through `./.github/actions/rust-cache`, never
@@ -146,6 +146,21 @@ env:
 #                     profile `wasm-pack build` uses and the dev profile `cargo check`
 #                     and `wasm-pack test` use — typescript-wasm-check,
 #                     scaffold-typescript-web-check, wasm-protocol and wasm-test.
+#   apple-uniffi-ci-bridge
+#                     `target/aarch64-apple-darwin/ci-bridge` — xcframework, which runs
+#                     `bindings/swift/build-xcframework.sh --dev --profile ci-bridge`
+#                     for both macOS jobs that read an XCFramework.
+#   apple-parity-ci-bridge
+#                     `target/ci-bridge` on macOS — pyo3-module-macos, which runs
+#                     `maturin develop --profile ci-bridge` for bridge-parity-swift.
+#
+# xcframework and pyo3-module-macos read one group each, but each restores it only when
+# its bridge-artifact cache misses. On `main` that artifact cache hits on every push that
+# leaves the bridge inputs alone, so a writer in either job would leave its group
+# unwritten after an eviction or a rekey until the bridge inputs next change, and every
+# pull request that does change them would build cold (pull request run 41512193208:
+# XCFramework 14.0 minutes against a missing entry). cache-warm.yml restores the group on
+# every push to `main`.
 #
 # Groups one job both writes and reads, each named by the job that writes it on a push
 # to `main`:
@@ -159,13 +174,6 @@ env:
 #                     rust-test-optional-features's leg of that name, one group per leg
 #                     because each leg runs its own selections, so one entry for all
 #                     would hold only the units of whichever leg saved first.
-#   apple-uniffi-ci-bridge
-#                     `target/aarch64-apple-darwin/ci-bridge` — xcframework, which runs
-#                     `bindings/swift/build-xcframework.sh --dev --profile ci-bridge`
-#                     for both macOS jobs that read an XCFramework.
-#   apple-parity-ci-bridge
-#                     `target/ci-bridge` on macOS — pyo3-module-macos, which runs
-#                     `maturin develop --profile ci-bridge` for bridge-parity-swift.
 #   python-wheel      python-wheel-build's wheel build; its comment says more.
 #   fuzz              `fuzz/target/debug` — fuzz-build, whose `cargo check` compiles a
 #                     separate workspace on the nightly `fuzz/rust-toolchain.toml`
@@ -186,7 +194,8 @@ env:
 #
 # `scripts/check-workflow-compile-steps.py`, run by job toolchain-wiring-cases, fails any
 # rust-cache step in any workflow that names no `shared-key` or no `save-if`; any group
-# with zero or with two writers or with a writer off `main`; and any reader whose
+# with zero or with two writers or with a writer off `main`; any writer whose rust-cache
+# step waits on an earlier step's output; and any reader whose
 # commands, OS, workspaces or CARGO*/RUST* environment a writer of a group it restores
 # does not match, so a reader's new feature set or compile mode lands in cache-warm.yml
 # in the same change.
@@ -3598,7 +3607,7 @@ jobs:
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         with:
           shared-key: apple-uniffi-ci-bridge
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: false
       - uses: ./.github/actions/cargo-fetch
         if: steps.artifact-cache.outputs.cache-hit != 'true'
       - name: Build XCFramework (dev mode — macOS arm64 only)
@@ -3735,7 +3744,7 @@ jobs:
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         with:
           shared-key: apple-parity-ci-bridge
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: false
       - uses: ./.github/actions/cargo-fetch
         if: steps.artifact-cache.outputs.cache-hit != 'true'
       - name: Build PyO3 native module

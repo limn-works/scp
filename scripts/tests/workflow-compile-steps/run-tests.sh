@@ -78,6 +78,7 @@ FIXTURES=(
     "bad-cache-reader-unset-variable"
     "bad-cache-reader-env-differs"
     "bad-cache-writer-never-triggered"
+    "bad-cache-writer-step-output-gated"
 )
 EXPECTED_EXITS=(
     "0"
@@ -91,6 +92,7 @@ EXPECTED_EXITS=(
     "1"
     "1"
     "0"
+    "1"
     "1"
     "1"
     "1"
@@ -126,6 +128,7 @@ EXPECTED_SUBSTRINGS=(
     "names shell variable(s) FEATURES that no assignment earlier in its script sets"
     "restore under different values of CARGO_PROFILE_DEV_DEBUG"
     "no leg writes it on a run of refs/heads/main that a push or a schedule starts"
+    "the rust-cache step writing group 'workspace-debug' waits on an earlier step's output"
 )
 
 passed=0
