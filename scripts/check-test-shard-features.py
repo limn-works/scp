@@ -32,7 +32,13 @@ fails when any of these holds:
   which of its tests exist and what code they run;
 - any package in a shard's resolved graph gets a feature the canonical resolution never
   gives it, or is a package the canonical resolution does not contain, because the shard
-  would then test code the canonical run never built.
+  would then test code the canonical run never built;
+- the `default-filter` of `.config/nextest.toml` leaves out a set of test binaries other
+  than UNRUN_BINARIES below. Nextest applies that filter to every shard command, so it
+  drops tests the way `-E` would. The filter may only be `not binary_id(<pkg>::<bin>)` or
+  `not (binary_id(...) | ...)`, each binary it names must be a test target of a workspace
+  member, and no profile other than `default` may set a `default-filter`. Leaving a
+  binary out of CI therefore takes an edit to this file, where the reason is written.
 
 A dependency a shard does not select may still resolve with fewer features than in the
 canonical resolution, when only another member's declaration requested them and no shard
@@ -62,6 +68,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import tomllib
 import yaml
 
 JOB = "rust-test"
@@ -69,6 +76,19 @@ AXIS = "leg"
 WORKFLOW = Path(".github/workflows/ci.yml")
 TARGET = "x86_64-unknown-linux-gnu"
 PUSH_LEG = "all"
+NEXTEST_CONFIG = Path(".config/nextest.toml")
+BINARY_ID = re.compile(r"binary_id\(([A-Za-z0-9_-]+)::([A-Za-z0-9_]+)\)")
+
+# Test binaries the default nextest filter leaves out, so that no shard and no other CI
+# job runs them. CI still compiles each one: the shards build every test binary of the
+# packages they select before nextest applies the filter, and job rust-clippy lints them
+# under `--all-targets`.
+#
+# scp-runtime::perf_baseline is the ADR-049 Decision 14 benchmark. Without
+# `SCP_PERF_GATE=1` it measures, writes a git-ignored JSON file and asserts nothing, so a
+# CI run spends tens of seconds and checks nothing. Decision 14 asks for a before-and-after
+# comparison on one machine, which an operator runs by hand.
+UNRUN_BINARIES = {("scp-runtime", "perf_baseline")}
 
 FeatureGraph = dict[str, set[frozenset[str]]]
 
@@ -168,6 +188,61 @@ def read_shards(document: dict) -> tuple[str, dict[str, tuple[list[str], list[st
     if not shards:
         raise CheckError(f"job {JOB} runs no shard command")
     return canonical, shards
+
+
+def default_filter_exclusions(config_text: str | None) -> set[tuple[str, str]]:
+    """Return the (package, binary) pairs the default nextest profile's filter leaves out."""
+    if config_text is None:
+        return set()
+    profiles = tomllib.loads(config_text).get("profile") or {}
+    for name, profile in profiles.items():
+        if name != "default" and "default-filter" in (profile or {}):
+            raise CheckError(
+                f"{NEXTEST_CONFIG} profile {name} sets a default-filter; only profile default may"
+            )
+    expression = str(
+        (profiles.get("default") or {}).get("default-filter") or ""
+    ).strip()
+    if not expression:
+        return set()
+    grouped = re.fullmatch(r"not\s*\((.*)\)", expression, re.DOTALL)
+    single = re.fullmatch(r"not\s+(binary_id\([^()]*\))", expression)
+    inner = grouped.group(1) if grouped else single.group(1) if single else None
+    matches = [BINARY_ID.fullmatch(term.strip()) for term in (inner or "").split("|")]
+    if inner is None or not all(matches):
+        raise CheckError(
+            f"{NEXTEST_CONFIG} default-filter `{expression}` is not `not binary_id(<package>::"
+            f"<binary>)` or `not (binary_id(...) | ...)`, so this check cannot tell which tests "
+            f"it drops from the shards"
+        )
+    return {(match.group(1), match.group(2)) for match in matches if match}
+
+
+def filter_failures(
+    exclusions: set[tuple[str, str]],
+    members: dict[str, list[str]],
+    declared: set[tuple[str, str]] = UNRUN_BINARIES,
+) -> list[str]:
+    """Report each binary the default filter drops that UNRUN_BINARIES does not declare,
+    each declared binary the filter runs, and each named binary that is no test target."""
+    failures: list[str] = []
+    for package, binary in sorted(exclusions - declared):
+        failures.append(
+            f"the default nextest filter leaves {package}::{binary} out of every shard, and "
+            f"UNRUN_BINARIES does not declare it"
+        )
+    for package, binary in sorted(declared - exclusions):
+        failures.append(
+            f"UNRUN_BINARIES declares {package}::{binary}, and the default nextest filter "
+            f"does not leave it out"
+        )
+    for package, binary in sorted(exclusions):
+        if f"test:{binary}" not in members.get(package, []):
+            failures.append(
+                f"the default nextest filter names {package}::{binary}, which is no test "
+                f"target of a workspace member"
+            )
+    return failures
 
 
 def coverage_failures(
@@ -339,7 +414,12 @@ def legs(workflow: Path) -> int:
 def check(workflow: Path) -> int:
     document = yaml.safe_load(workflow.read_text(encoding="utf-8"))
     canonical_features, shards = read_shards(document)
-    failures = coverage_failures(workspace_members(), shards)
+    members = workspace_members()
+    failures = coverage_failures(members, shards)
+    config_text = (
+        NEXTEST_CONFIG.read_text(encoding="utf-8") if NEXTEST_CONFIG.exists() else None
+    )
+    failures += filter_failures(default_filter_exclusions(config_text), members)
     canonical, error = resolve(["--workspace"], canonical_features.split(","))
     if canonical is None:
         print(f"check-test-shard-features: the canonical resolution failed:\n{error}")
@@ -365,7 +445,8 @@ def check(workflow: Path) -> int:
         return 1
     print(
         f"check-test-shard-features: {len(shards)} shards cover every workspace member once, "
-        f"and each selected package resolves to its canonical features"
+        f"each selected package resolves to its canonical features, and the default nextest "
+        f"filter leaves out exactly {', '.join(sorted(f'{p}::{b}' for p, b in UNRUN_BINARIES))}"
     )
     return 0
 
@@ -547,6 +628,62 @@ def self_test() -> int:
             "TEST_FEATURES" in str(error),
             error,
         )
+
+    expect(
+        "the default filter's exclusions are read",
+        default_filter_exclusions(
+            '[profile.default]\ndefault-filter = "not binary_id(c::slow)"\n'
+        )
+        == {("c", "slow")}
+        and default_filter_exclusions(None) == set()
+        and default_filter_exclusions(
+            "[profile.default]\n"
+            'default-filter = "not (binary_id(c::slow) | binary_id(a::big))"\n'
+        )
+        == {("c", "slow"), ("a", "big")},
+    )
+    for label, text, needle in (
+        (
+            "a test() default filter",
+            '[profile.default]\ndefault-filter = "not test(slow)"\n',
+            "is not",
+        ),
+        (
+            "a default filter on another profile",
+            '[profile.ci]\ndefault-filter = "all()"\n',
+            "profile ci",
+        ),
+    ):
+        try:
+            default_filter_exclusions(text)
+            expect(f"{label} is rejected", False, "accepted")
+        except CheckError as error:
+            expect(f"{label} is rejected", needle in str(error), error)
+    with_slow = {**members, "c": ["lib:c", "test:slow"]}
+    slow = {("c", "slow")}
+    expect(
+        "a declared exclusion passes",
+        not filter_failures(slow, with_slow, slow),
+        filter_failures(slow, with_slow, slow),
+    )
+    found = filter_failures(slow, with_slow, set())
+    expect(
+        "an undeclared exclusion is reported",
+        any("does not declare" in f for f in found),
+        found,
+    )
+    found = filter_failures(set(), with_slow, slow)
+    expect(
+        "a declared binary the filter runs is reported",
+        any("does not leave it out" in f for f in found),
+        found,
+    )
+    found = filter_failures({("c", "absent")}, with_slow, {("c", "absent")})
+    expect(
+        "an excluded binary that is no test target is reported",
+        any("no test target" in f for f in found),
+        found,
+    )
 
     a, b, dep = "a v0.1.0 (/w/a)", "b v0.1.0 (/w/b)", "dep v1.0.0"
     canon: FeatureGraph = {

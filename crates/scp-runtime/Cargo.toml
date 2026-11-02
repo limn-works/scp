@@ -135,6 +135,10 @@ scp-testing = { path = "../scp-testing" }
 name = "economy_integration"
 required-features = ["testing"]
 
+# ADR-049 Decision 14 benchmark. The `default-filter` in `.config/nextest.toml`
+# leaves it out of every `cargo nextest run`, so the default suite and CI never run
+# it; CI compiles it. Run it on demand with `cargo nextest run -p scp-runtime
+# --features testing --ignore-default-filter --test perf_baseline`.
 [[test]]
 name = "perf_baseline"
 required-features = ["testing"]
