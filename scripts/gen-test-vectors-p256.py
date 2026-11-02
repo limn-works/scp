@@ -2295,28 +2295,26 @@ NODE_LIST_ROUTING_PREFIX = b"scp:nls:"
 # the fixture is the lowercase hex of a stated label's digest.
 NODE_LIST_CONTEXT_ID = sha256(b"scp-25-node-list-context").hex()
 NODE_LIST_SEQUENCE = 1
-# Two listed nodes. Each operator is the digest of a stated ASCII label, and
-# both operators' `#active` is §25.2's tertiary key, which signs each
-# binding's operator_sig. The node keys are §25.2's reference and secondary
-# keys, which sign each binding's possession_sig. Each key_state_head is the
-# digest of a stated label, standing in for the operator's position.
+# Two listed nodes, both run by Vector 41's identity at its inception, so a
+# reader reads the operator's `#active` from Vector 41's log at
+# key_state_head (§9.6.3, §9.7.1 log-anchored class): §25.2's secondary key,
+# which signs each binding's operator_sig. The node keys are §25.2's
+# reference and tertiary keys, which sign each binding's possession_sig; no
+# node key is the operator's `#active`, so no entry's two signatures are the
+# same bytes.
 NODE_LIST_ENTRIES = [
-    (
-        sha256(b"scp-25-node-operator-a"),
-        REF_KEY_1,
-        "wss://node-a.example.com/scp/v1",
-        sha256(b"scp-25-node-operator-a-head"),
-        True,
-    ),
-    (
-        sha256(b"scp-25-node-operator-b"),
-        REF_KEY_2,
-        "wss://node-b.example.com/scp/v1",
-        sha256(b"scp-25-node-operator-b-head"),
-        False,
-    ),
+    (REF_KEY_1, "wss://node-a.example.com/scp/v1", True),
+    (REF_KEY_3, "wss://node-b.example.com/scp/v1", False),
 ]
-NODE_OPERATOR_ACTIVE = REF_KEY_3
+NODE_OPERATOR_ACTIVE = REF_KEY_2
+
+
+def node_operator() -> tuple[bytes, bytes]:
+    """The listed nodes' operator and its key_state_head: Vector 41's
+    identifier and inception digest."""
+    assert len(INCEPTION_IDENTIFIER) == 32 and len(INCEPTION_DIGEST) == 32, "Vector 41 runs first"
+    assert all(key is not NODE_OPERATOR_ACTIVE for key, _, _ in NODE_LIST_ENTRIES)
+    return INCEPTION_IDENTIFIER, INCEPTION_DIGEST
 
 
 
@@ -2358,13 +2356,14 @@ def node_binding(
 
 
 def node_list_entries() -> list[dict]:
+    operator, head = node_operator()
     return [
         {
             "binding": node_binding(operator, key, url, head, f"node_list.entry_{index}"),
             "free": free,
             "url": url,
         }
-        for index, (operator, key, url, head, free) in enumerate(NODE_LIST_ENTRIES)
+        for index, (key, url, free) in enumerate(NODE_LIST_ENTRIES)
     ]
 
 
@@ -2412,7 +2411,8 @@ def emit_node_id() -> None:
 
 def emit_node_binding() -> None:
     # Vector 91: the binding of the node list's entry 0.
-    operator, key, url, head, _ = NODE_LIST_ENTRIES[0]
+    operator, head = node_operator()
+    key, url, _ = NODE_LIST_ENTRIES[0]
     binding = node_binding(operator, key, url, head, "vector_91")
     url_hash = sha256(url.encode())
     preimage = node_binding_preimage(operator, key.compressed, url_hash, head)
@@ -3977,7 +3977,7 @@ def emit_key_positions_and_reseat() -> None:
         record_sequence, identifier, INCEPTION_DIGEST, "vector_80.list_record"
     )
     serving_node_id = node_id(REF_KEY_1.compressed)
-    assert NODE_LIST_ENTRIES[0][1] is REF_KEY_1
+    assert NODE_LIST_ENTRIES[0][0] is REF_KEY_1
     response = repeated_field([frame54])
     proof_nonce = fixture_digest("confirmation proof nonce")
     routing_id = sha256(b"scp:did:" + identifier)
@@ -4394,14 +4394,14 @@ CONTEXT_NODE_ADDRESS_SEPARATOR = "SCP-CONTEXT-NODE-ADDRESS-V1:"
 CONTEXT_CHAIN_SEPARATOR = "SCP-CONTEXT-CHAIN-V1:"
 CONTEXT_RECEIPT_SEPARATOR = "SCP-CONTEXT-RECEIPT-V1:"
 # The context id is a string; the fixture is the lowercase hex of a stated
-# label's digest. The operator and its key_state_head are digests of stated
-# labels. The operator's `#active` is §25.2's tertiary key, and context_key
-# is §25.2's secondary key, which signs every address, entry and receipt.
+# label's digest. The operator is Vector 41's identity and its key_state_head
+# is Vector 41's inception digest, so a reader verifies the binding under the
+# `#active` it reads from Vector 41's log at that position: §25.2's secondary
+# key. context_key is §25.2's tertiary key, which signs every address, entry
+# and receipt, and is not the operator's `#active`.
 CONTEXT_OPERATOR_CONTEXT_ID = sha256(b"scp-25-context-operator-context").hex()
-CONTEXT_OPERATOR = sha256(b"scp-25-context-operator")
-CONTEXT_OPERATOR_HEAD = sha256(b"scp-25-context-operator-head")
-CONTEXT_OPERATOR_ACTIVE = REF_KEY_3
-CONTEXT_KEY = REF_KEY_2
+CONTEXT_OPERATOR_ACTIVE = REF_KEY_2
+CONTEXT_KEY = REF_KEY_3
 CONTEXT_DIRECT_URL = "wss://context-node.example.com/scp/v1"
 CONTEXT_BRIDGE_URL = "wss://bridge.example.com/scp/v1"
 CONTEXT_SUBMISSION = b"scp-25-context-submission"
@@ -4428,13 +4428,16 @@ def node_address_bytes(url: str, bridge: tuple[bytes, bytes, bytes] | None) -> b
 def emit_context_operator() -> None:
     section("§25.36 Vectors 92-95 context operator binding, node address, chain entry, receipt")
 
-    # Vector 92: the binding.
+    # Vector 92: the binding, by Vector 41's identity at its inception.
+    operator, operator_head = INCEPTION_IDENTIFIER, INCEPTION_DIGEST
+    assert len(operator) == 32 and len(operator_head) == 32, "Vector 41 runs first"
+    assert CONTEXT_KEY.compressed != CONTEXT_OPERATOR_ACTIVE.compressed
     context_key = CONTEXT_KEY.compressed
     fields = (
         var_field(CONTEXT_OPERATOR_CONTEXT_ID)
-        + fixed_field(CONTEXT_OPERATOR)
+        + fixed_field(operator)
         + fixed_field(context_key)
-        + fixed_field(CONTEXT_OPERATOR_HEAD)
+        + fixed_field(operator_head)
     )
     preimage = canonical_preimage(CONTEXT_OPERATOR_SEPARATOR, fields)
     assert len(preimage) == 24 + 4 + 64 + 32 + 33 + 32, len(preimage)
@@ -4443,9 +4446,10 @@ def emit_context_operator() -> None:
     wire = fields + signature
     assert len(wire) == 165 + len(CONTEXT_OPERATOR_CONTEXT_ID), len(wire)
     emit("vector_92.context_id", CONTEXT_OPERATOR_CONTEXT_ID)
-    emit_hex("vector_92.operator", CONTEXT_OPERATOR)
+    emit_hex("vector_92.operator", operator)
+    emit_hex("vector_92.operator_active", CONTEXT_OPERATOR_ACTIVE.compressed)
     emit_hex("vector_92.context_key", context_key)
-    emit_hex("vector_92.key_state_head", CONTEXT_OPERATOR_HEAD)
+    emit_hex("vector_92.key_state_head", operator_head)
     emit("vector_92.preimage_len", len(preimage))
     emit_hex("vector_92.preimage", preimage)
     emit_hex("vector_92.binding_hash", binding_hash)
