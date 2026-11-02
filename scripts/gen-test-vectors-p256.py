@@ -1585,7 +1585,7 @@ def emit_keypackage_attestation() -> None:
 
 
 # ---------------------------------------------------------------------------
-# §25.26 Key-event indexed signatures, the cosigned head, and the relay proof
+# §25.26 Key-event indexed signatures, the cosigned head, and the node proof
 # (§9.7.4.2 definitions, §9.7.4.3, §9.18.2)
 # ---------------------------------------------------------------------------
 
@@ -2119,11 +2119,10 @@ def emit_context_export_preimage() -> None:
     emit_hex("vector_52.signature", sig)
 
 
-# --- §25.27 the cosigned head and the relay proof of control ---
+# --- §25.27 the cosigned head and the node proof of control ---
 
 WITNESS_ID = sha256(b"scp-25-witness-operator")
 COSIGN_OBSERVED_AT = 1_700_000_000
-RELAY_OPERATOR_ID = sha256(b"scp-25-relay-operator")
 RESOLVER_NONCE = sha256(b"scp-25-resolver-nonce")
 SERVED_BLOB_A = b"scp-25-served-blob-a"
 SERVED_BLOB_B = b"scp-25-served-blob-bb"
@@ -2134,8 +2133,8 @@ SERVED_VALUE_DIGEST = sha256(
 )
 
 
-def emit_witness_and_relay_objects() -> None:
-    section("§25.27 Witness objects, relay proof, relay-list record")
+def emit_witness_and_node_objects() -> None:
+    section("§25.27 Witness objects, node identifier, binding, proof, node-list record")
 
     subject = INCEPTION_IDENTIFIER
     designating_digest = INCEPTION_DIGEST
@@ -2198,18 +2197,20 @@ def emit_witness_and_relay_objects() -> None:
         seed=0x01,
     )
 
-    # Vector 44: the relay proof of control. It carries no key-state position:
-    # a non-transferable operator key has no position to name.
+    # Vector 44: the node proof of control (§9.7.4.2 definitions). It names
+    # the serving node by the NodeId of its node key, §25.2's reference key,
+    # and carries no key-state position: a node key never rotates.
     routing_id = sha256(b"scp:did:" + subject)
+    proof_node_id = node_id(REF_KEY_1.compressed)
     proof_fields = (
-        fixed_field(RELAY_OPERATOR_ID)
+        fixed_field(proof_node_id)
         + fixed_field(RESOLVER_NONCE)
         + fixed_field(routing_id)
         + fixed_field(SERVED_VALUE_DIGEST)
         + u64(COSIGN_OBSERVED_AT)
     )
     assert len(proof_fields) == 136, len(proof_fields)
-    emit_hex("vector_44.operator", RELAY_OPERATOR_ID)
+    emit_hex("vector_44.node_id", proof_node_id)
     emit_hex("vector_44.nonce", RESOLVER_NONCE)
     emit_hex("vector_44.routing_id", routing_id)
     emit_hex("vector_44.value_digest_input_blobs", SERVED_BLOB_A + SERVED_BLOB_B)
@@ -2218,7 +2219,7 @@ def emit_witness_and_relay_objects() -> None:
     emit("vector_44.field_bytes", len(proof_fields))
     sign_and_emit(
         "vector_44",
-        canonical_preimage("SCP-RELAY-PROOF-V1:", proof_fields),
+        canonical_preimage(NODE_PROOF_SEPARATOR, proof_fields),
         REF_KEY_1,
     )
     emit("vector_44.object_bytes", len(proof_fields) + 64)
@@ -2262,90 +2263,202 @@ def emit_witness_and_relay_objects() -> None:
     cosigned_head("vector_46b", 21, head_b, baseline, COSIGN_OBSERVED_AT + 1, seed=0x00)
     assert head_a != head_b, "vector_46: the two heads must differ"
 
-    emit_community_relay_list()
+    emit_node_id()
+    emit_node_binding()
+    emit_node_list()
 
 
-# --- §25.27 Vector 49: the relay-list record ---
+# --- §25.27 Vectors 90, 91 and 49: the node identifier, the node binding and
+# the node-list record (§9.6.3, §9.7.4.2 definitions, §9.18.2) ---
 
-# `18-addressability-and-deployment.md` §18.5.1: the SDK ships a pointer to a
-# relay-list context, and that context's `relay_list` outlet returns a record
-# whose `entries` member is one JSON array of entries, each an object with four
-# members — `operator`, `key`, `url` and `free`. The governor's `#active` key
-# signs the record over
-# SHA-256("SCP-RELAY-LIST-V1:" || context_id || sequence || governor || SHA-256(entries)).
-# The two entries below are a fixture: the operators are digests of stated ASCII
-# labels and the keys are §25.2's reference and secondary keys. The governor is
-# Vector 41's identity, whose `#active` key is §25.2's secondary key.
-RELAY_LIST_SEPARATOR = "SCP-RELAY-LIST-V1:"
-RELAY_LIST_CONTEXT_ID = sha256(b"scp-25-relay-list-context")
-RELAY_LIST_SEQUENCE = 1
-RELAY_LIST_ENTRIES = [
+NODE_ID_SEPARATOR = b"SCP-NODE-ID-V1:"
+NODE_BINDING_SEPARATOR = "SCP-NODE-BIND-V1:"
+NODE_LIST_SEPARATOR = "SCP-NODE-LIST-V1:"
+NODE_PROOF_SEPARATOR = "SCP-NODE-PROOF-V1:"
+NODE_LIST_ROUTING_PREFIX = b"scp:nls:"
+# The node-list context's identifier is a string (§9.6.4 NODE_LIST_POINTER);
+# the fixture is the lowercase hex of a stated label's digest.
+NODE_LIST_CONTEXT_ID = sha256(b"scp-25-node-list-context").hex()
+NODE_LIST_SEQUENCE = 1
+# Two listed nodes. Each operator is the digest of a stated ASCII label, and
+# both operators' `#active` is §25.2's tertiary key, which signs each
+# binding's operator_sig. The node keys are §25.2's reference and secondary
+# keys, which sign each binding's possession_sig. Each key_state_head is the
+# digest of a stated label, standing in for the operator's position.
+NODE_LIST_ENTRIES = [
     (
-        sha256(b"scp-25-relay-operator"),
-        REF_KEY_1.compressed,
-        "wss://relay.example.com/scp/v1",
+        sha256(b"scp-25-node-operator-a"),
+        REF_KEY_1,
+        "wss://node-a.example.com/scp/v1",
+        sha256(b"scp-25-node-operator-a-head"),
         True,
     ),
     (
-        sha256(b"scp-25-witness-operator"),
-        REF_KEY_2.compressed,
-        "wss://relay2.example.com/scp/v1",
+        sha256(b"scp-25-node-operator-b"),
+        REF_KEY_2,
+        "wss://node-b.example.com/scp/v1",
+        sha256(b"scp-25-node-operator-b-head"),
         False,
     ),
 ]
+NODE_OPERATOR_ACTIVE = REF_KEY_3
 
 
-def community_relay_list_bytes() -> bytes:
-    """The entries document's bytes: one JSON array, no insignificant whitespace.
+def node_id(node_key: bytes) -> bytes:
+    """§9.7.4.2 definitions: SHA-256("SCP-NODE-ID-V1:" || node_key) over a
+    33-byte compressed point on P-256; an id derivation, raw key, no prefix."""
+    assert len(node_key) == 33 and node_key[0] in (2, 3), node_key.hex()
+    assert on_curve(decode_point(node_key))
+    return sha256(NODE_ID_SEPARATOR + node_key)
 
-    Member order is the order §18.5.1 lists: `operator`, `key`, `url`, `free`.
-    A 32-byte identifier and a 33-byte SEC1 compressed point each print as
-    lowercase hexadecimal, which §18.5.1 fixes for both.
-    """
-    entries = ",".join(
-        '{{"operator":"{}","key":"{}","url":"{}","free":{}}}'.format(
-            operator.hex(), key.hex(), url, "true" if free else "false"
-        )
-        for operator, key, url, free in RELAY_LIST_ENTRIES
+
+def node_binding_preimage(
+    operator: bytes, node_key: bytes, url_hash: bytes, key_state_head: bytes
+) -> bytes:
+    """§9.6.3: P's preimage, four fixed-width fields after the separator."""
+    fields = (
+        fixed_field(operator)
+        + fixed_field(node_key)
+        + fixed_field(url_hash)
+        + fixed_field(key_state_head)
     )
-    return ("[" + entries + "]").encode()
+    assert len(fields) == 129, len(fields)
+    preimage = canonical_preimage(NODE_BINDING_SEPARATOR, fields)
+    assert len(preimage) == 146, len(preimage)
+    return preimage
 
 
-def emit_community_relay_list() -> None:
-    document = community_relay_list_bytes()
-    emit("vector_49.entry_count", len(RELAY_LIST_ENTRIES))
-    for index, (operator, key, url, free) in enumerate(RELAY_LIST_ENTRIES):
-        emit_hex(f"vector_49.entry_{index}.operator", operator)
-        emit_hex(f"vector_49.entry_{index}.key", key)
-        emit(f"vector_49.entry_{index}.url", url)
-        emit(f"vector_49.entry_{index}.free", "true" if free else "false")
-    assert len({key for _, key, *_ in RELAY_LIST_ENTRIES}) == len(RELAY_LIST_ENTRIES), (
-        "§18.5.1: two entries whose `key` bytes are equal are one operator"
+def node_binding(
+    operator: bytes, node_key: KeyPair, url: str, key_state_head: bytes, label: str
+) -> dict:
+    """§9.6.3: P signed by the operator's `#active` and by the node key.
+    Returns the binding's RFC 8785 member map, each byte field lowercase hex."""
+    url_hash = sha256(url.encode())
+    digest = sha256(
+        node_binding_preimage(operator, node_key.compressed, url_hash, key_state_head)
     )
-    emit("vector_49.document_len", len(document))
-    emit("vector_49.document", document.decode())
-    emit_hex("vector_49.document_bytes", document)
-    entries_digest = sha256(document)
-    emit_hex("vector_49.document_sha256", entries_digest)
+    return {
+        "key_state_head": key_state_head.hex(),
+        "node_key": node_key.compressed.hex(),
+        "operator": operator.hex(),
+        "operator_sig": sign_group(
+            NODE_OPERATOR_ACTIVE, digest, f"{label}.operator_sig"
+        ).hex(),
+        "possession_sig": sign_group(node_key, digest, f"{label}.possession_sig").hex(),
+        "url_hash": url_hash.hex(),
+    }
 
+
+def node_list_entries() -> list[dict]:
+    return [
+        {
+            "binding": node_binding(operator, key, url, head, f"node_list.entry_{index}"),
+            "free": free,
+            "url": url,
+        }
+        for index, (operator, key, url, head, free) in enumerate(NODE_LIST_ENTRIES)
+    ]
+
+
+def node_list_record(
+    sequence: int, governor: bytes, signing_key_state_head: bytes, label: str
+) -> tuple[bytes, bytes, bytes, bytes]:
+    """§9.6.3: the record's preimage, digest, signature by the governor's
+    `#active` (§25.2's secondary key, Vector 41's `#active`), and RFC 8785
+    JSON. `sequence` prints as a decimal string, because an I-JSON number
+    cannot carry every u64."""
+    entries = node_list_entries()
+    entries_json = jcs(entries)
+    preimage = canonical_preimage(
+        NODE_LIST_SEPARATOR,
+        var_field(NODE_LIST_CONTEXT_ID)
+        + u64(sequence)
+        + fixed_field(governor)
+        + fixed_field(signing_key_state_head)
+        + fixed_field(sha256(entries_json)),
+    )
+    digest = sha256(preimage)
+    signature = sign_group(REF_KEY_2, digest, label)
+    record = jcs(
+        {
+            "context_id": NODE_LIST_CONTEXT_ID,
+            "entries": entries,
+            "governor": governor.hex(),
+            "sequence": str(sequence),
+            "signature": signature.hex(),
+            "signing_key_state_head": signing_key_state_head.hex(),
+        }
+    )
+    return preimage, digest, signature, record
+
+
+def emit_node_id() -> None:
+    # Vector 90: the NodeId of §25.2's reference key, and of its secondary key.
+    key = REF_KEY_1.compressed
+    emit_hex("vector_90.node_key", key)
+    emit("vector_90.preimage_len", len(NODE_ID_SEPARATOR + key))
+    emit_hex("vector_90.preimage", NODE_ID_SEPARATOR + key)
+    emit_hex("vector_90.node_id", node_id(key))
+    emit_hex("vector_90.node_id_secondary", node_id(REF_KEY_2.compressed))
+
+
+def emit_node_binding() -> None:
+    # Vector 91: the binding of the node list's entry 0.
+    operator, key, url, head, _ = NODE_LIST_ENTRIES[0]
+    binding = node_binding(operator, key, url, head, "vector_91")
+    url_hash = sha256(url.encode())
+    preimage = node_binding_preimage(operator, key.compressed, url_hash, head)
+    emit_hex("vector_91.operator", operator)
+    emit_hex("vector_91.node_key", key.compressed)
+    emit("vector_91.url", url)
+    emit_hex("vector_91.url_hash", url_hash)
+    emit_hex("vector_91.key_state_head", head)
+    emit("vector_91.preimage_len", len(preimage))
+    emit_hex("vector_91.preimage", preimage)
+    emit_hex("vector_91.canonical_hash", sha256(preimage))
+    emit_hex("vector_91.operator_sig", bytes.fromhex(binding["operator_sig"]))
+    emit_hex("vector_91.possession_sig", bytes.fromhex(binding["possession_sig"]))
+
+
+def emit_node_list() -> None:
+    # Vector 49: the node-list record at sequence 1. The governor is Vector
+    # 41's identity, whose `#active` is §25.2's secondary key at its inception
+    # event, so signing_key_state_head is Vector 41's preimage digest.
     governor = INCEPTION_IDENTIFIER
     assert len(governor) == 32, "the governor is Vector 41's 32-byte identifier"
-    record_fields = (
-        fixed_field(RELAY_LIST_CONTEXT_ID)
-        + u64(RELAY_LIST_SEQUENCE)
-        + fixed_field(governor)
-        + fixed_field(entries_digest)
-    )
-    assert len(record_fields) == 104, len(record_fields)
-    emit_hex("vector_49.context_id", RELAY_LIST_CONTEXT_ID)
-    emit("vector_49.sequence", RELAY_LIST_SEQUENCE)
+    entries = node_list_entries()
+    keys = [entry["binding"]["node_key"] for entry in entries]
+    assert len(set(keys)) == len(keys), "§9.6.3: a key carried twice voids both entries"
+    entries_json = jcs(entries)
+    emit("vector_49.context_id", NODE_LIST_CONTEXT_ID)
+    emit("vector_49.sequence", NODE_LIST_SEQUENCE)
     emit_hex("vector_49.governor", governor)
-    emit("vector_49.field_bytes", len(record_fields))
-    sign_and_emit(
-        "vector_49",
-        canonical_preimage(RELAY_LIST_SEPARATOR, record_fields),
-        REF_KEY_2,
+    emit_hex("vector_49.signing_key_state_head", INCEPTION_DIGEST)
+    emit("vector_49.entry_count", len(entries))
+    for index, entry in enumerate(entries):
+        binding = entry["binding"]
+        emit_hex(f"vector_49.entry_{index}.operator", bytes.fromhex(binding["operator"]))
+        emit_hex(f"vector_49.entry_{index}.key_state_head", bytes.fromhex(binding["key_state_head"]))
+        emit_hex(f"vector_49.entry_{index}.url_hash", bytes.fromhex(binding["url_hash"]))
+        emit_hex(f"vector_49.entry_{index}.operator_sig", bytes.fromhex(binding["operator_sig"]))
+        emit_hex(f"vector_49.entry_{index}.possession_sig", bytes.fromhex(binding["possession_sig"]))
+    emit("vector_49.entries_len", len(entries_json))
+    emit_hex("vector_49.entries_sha256", sha256(entries_json))
+    preimage, digest, signature, record = node_list_record(
+        NODE_LIST_SEQUENCE, governor, INCEPTION_DIGEST, "vector_49"
     )
+    emit("vector_49.preimage_len", len(preimage))
+    emit_hex("vector_49.preimage", preimage)
+    emit_hex("vector_49.canonical_hash", digest)
+    emit_hex("vector_49.signature", signature)
+    emit("vector_49.record_len", len(record))
+    emit("vector_49.record", record.decode())
+    emit_hex("vector_49.record_sha256", sha256(record))
+    routing = sha256(NODE_LIST_ROUTING_PREFIX + NODE_LIST_CONTEXT_ID.encode())
+    emit_hex("vector_49.routing_id", routing)
+    frame = bytes([6]) + governor + record
+    emit("vector_49.frame_len", len(frame))
+    emit_hex("vector_49.frame_sha256", sha256(frame))
 
 
 # ---------------------------------------------------------------------------
@@ -3697,9 +3810,9 @@ def position_element(
     ]
 
 
-def key_positions_hash(relay_list_sequence: int, positions: list[list]) -> bytes:
+def key_positions_hash(node_list_sequence: int, positions: list[list]) -> bytes:
     ordered = sorted(positions, key=lambda element: element[0].encode())
-    return sha256(jcs([relay_list_sequence, ordered]))
+    return sha256(jcs([node_list_sequence, ordered]))
 
 
 def mp_opt_uint(value: int | None) -> bytes:
@@ -3849,48 +3962,33 @@ def emit_key_positions_and_reseat() -> None:
     emit_hex("vector_80.advance_frame_only_sha256", sha256(body_frame))
 
     # A KeyHistoryAdvance with an empty frame and a FallbackConfirmation. The
-    # record reuses Vector 49's context, governor and entries at sequence 3; the
-    # operator is Vector 49's entry 0, whose key is §25.2's reference key.
-    entries = community_relay_list_bytes()
+    # record is Vector 49's at sequence 3, and the serving node is Vector 49's
+    # entry 0, whose node key is §25.2's reference key.
     record_sequence = 3
-    record_fields = (
-        fixed_field(RELAY_LIST_CONTEXT_ID)
-        + u64(record_sequence)
-        + fixed_field(identifier)
-        + fixed_field(sha256(entries))
+    _, record_digest, record_signature, list_record = node_list_record(
+        record_sequence, identifier, INCEPTION_DIGEST, "vector_80.list_record"
     )
-    record_digest = sha256(canonical_preimage(RELAY_LIST_SEPARATOR, record_fields))
-    record_signature = sign_group(REF_KEY_2, record_digest, "vector_80.list_record")
-    list_record = jcs(
-        {
-            "context_id": RELAY_LIST_CONTEXT_ID.hex(),
-            "entries": entries.decode(),
-            "governor": identifier.hex(),
-            "sequence": record_sequence,
-            "signature": record_signature.hex(),
-        }
-    )
-    operator, operator_key, _, _ = RELAY_LIST_ENTRIES[0]
-    assert operator_key == REF_KEY_1.compressed
+    serving_node_id = node_id(REF_KEY_1.compressed)
+    assert NODE_LIST_ENTRIES[0][1] is REF_KEY_1
     response = repeated_field([frame54])
     proof_nonce = fixture_digest("confirmation proof nonce")
     routing_id = sha256(b"scp:did:" + identifier)
     proof_fields = (
-        fixed_field(operator)
+        fixed_field(serving_node_id)
         + fixed_field(proof_nonce)
         + fixed_field(routing_id)
         + fixed_field(sha256(response))
         + u64(COSIGN_OBSERVED_AT)
     )
-    proof_digest = sha256(canonical_preimage("SCP-RELAY-PROOF-V1:", proof_fields))
-    relay_proof = proof_fields + sign_group(REF_KEY_1, proof_digest, "vector_80.proof")
-    assert len(relay_proof) == 200
+    proof_digest = sha256(canonical_preimage(NODE_PROOF_SEPARATOR, proof_fields))
+    node_proof = proof_fields + sign_group(REF_KEY_1, proof_digest, "vector_80.proof")
+    assert len(node_proof) == 200
     confirmation = (
         var_field(list_record)
-        + fixed_field(operator)
+        + fixed_field(serving_node_id)
         + var_field(b"")
         + response
-        + fixed_field(relay_proof)
+        + fixed_field(node_proof)
     )
     body_confirmation = key_history_advance(b"", confirmation)
     emit("vector_80.list_record_sequence", record_sequence)
@@ -3900,13 +3998,13 @@ def emit_key_positions_and_reseat() -> None:
     emit_hex("vector_80.list_record_sha256", sha256(list_record))
     emit_hex("vector_80.proof_nonce", proof_nonce)
     emit_hex("vector_80.response_value_digest", sha256(response))
-    emit_hex("vector_80.relay_proof", relay_proof)
+    emit_hex("vector_80.node_proof", node_proof)
     emit("vector_80.confirmation_len", len(confirmation))
     emit_hex("vector_80.confirmation_sha256", sha256(confirmation))
     emit("vector_80.advance_confirmation_only_len", len(body_confirmation))
     emit_hex("vector_80.advance_confirmation_only_sha256", sha256(body_confirmation))
 
-    # key_positions_hash over four positions and relay_list_sequence 3. The
+    # key_positions_hash over four positions and node_list_sequence 3. The
     # Contested position held the recovery's triple from epoch 5, when it was
     # Linear; the contest recorded at epoch 12 left it unchanged.
     contested = position_element(
@@ -4308,7 +4406,7 @@ def main() -> int:
     emit_key_event_signatures()
     emit_custody_registry_key_state()
     emit_context_export_preimage()
-    emit_witness_and_relay_objects()
+    emit_witness_and_node_objects()
     emit_commitment_and_service_record()
     emit_reveal_ranking_and_text_form()
     emit_webpush()

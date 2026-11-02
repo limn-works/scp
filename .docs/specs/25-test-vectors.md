@@ -22,7 +22,7 @@ Three P-256 keypairs carry every signature in this section. Each derives from a 
 
 **Seed-to-scalar rule.** A seed becomes a private scalar by the extra-random-bits method of FIPS 186-5 Appendix A.2.1, which §9.10.4 states in full: expand the seed to 48 bytes with HKDF-Expand-SHA256 under a label, read those bytes as a big-endian integer, reduce modulo `n − 1`, and add one. P-256 carries no RFC 8032 seed expansion, so the curve ruling of 2026-09-10 required a defined step here. The label for these three fixtures is the ASCII string `"SCP-TEST-VECTOR-KEY-V1"`, which labels a test fixture and names no protocol object, so §9.18.2 registers no separator for it.
 
-Each key prints its seed, its private scalar, the 33-byte SEC1 compressed point §9.5 fixes for signature verification, and the 65-byte uncompressed point RFC 9420 §5.1.2 and RFC 9180 §7.1 fix. **These three are fixtures and their private scalars are published here**, so no key below ever signs for a real party: Vector 49's two relay-list entries carry the reference and secondary keys, which is what makes that vector a fixture rather than a record the relay-list context serves (`18-addressability-and-deployment.md` §18.5.1).
+Each key prints its seed, its private scalar, the 33-byte SEC1 compressed point §9.5 fixes for signature verification, and the 65-byte uncompressed point RFC 9420 §5.1.2 and RFC 9180 §7.1 fix. **These three are fixtures and their private scalars are published here**, so no key below ever signs for a real party: Vector 49's two node-list entries carry the reference and secondary keys as node keys and the tertiary key as their operators' `#active`, which is what makes that vector a fixture rather than a record a node-list context serves (`09-security-model.md` §9.6.3).
 
 ```
 Reference seed:
@@ -1469,14 +1469,14 @@ Key-event frame of the recovery, 756 bytes (3 × 64-byte signatures):
 **A `KeyHistoryAdvance` with a frame and an empty confirmation.** The body is BE32(388) || the rollover frame || BE32(0), 396 bytes, with SHA-256 `38ae68a426d2b13dcbf17bceec7cf86c9da2b3673b564ab66b5ccdedc9b3c61a`.
 
 **A `KeyHistoryAdvance` with an empty frame and a `FallbackConfirmation`.** The confirmation confirms the recovery tip d2. Its fixtures:
-- `list_record` is a relay-list record (`18-addressability-and-deployment.md` §18.5.1) at `sequence` 3, with Vector 49's `context_id` and entries document, and this vector's identity as `governor`. Its canonical hash is `afd998183f3a9392e6aeb277f2f6e737ed99a4a2bd7e75261fd505fd27d541c2`, and its signature under the §25.2 secondary key is `00145341685ce373b0871500edf2c94844cbee0261a671f10f7fbec57ac7513b50d4fb7c9d7f0d79fa3d4a224c375ed9e9ae27e9b540d7479e20d8d95d5c7636`. Its bytes are the RFC 8785 form of the outlet output object, 771 bytes, with SHA-256 `7575fffb69393356ca5228081cdceb2aa8f06efd180d3c390579a6ea739795c1`.
-- `operator` is Vector 49's entry 0, whose `key` is the §25.2 reference key, and `service_record` is empty.
+- `list_record` is a node-list record (§9.6.3) at `sequence` 3, with Vector 49's `context_id` and entries, this vector's identity as `governor`, and Vector 41's preimage digest as `signing_key_state_head`. Its canonical hash is `b5ec6306422336f9d1a8037e14608e5eed7dcc5fb83c05bf3a14a978e5b4664c`, and its signature under the §25.2 secondary key is `aca2e3c56b6b5fc46b8345b21d529b0706bf84f7d964f9ea1909946ecef07147386d154f38b5829d654d552ce3fbd079e5b85f0a6e8e4ab914707fa8c5a6f968`. Its bytes are the record's RFC 8785 form, 1782 bytes, with SHA-256 `3acb28cf0ecfe0f6721707e4425c72f900082a368f80c6661959e49ca1ebfe7b`.
+- The serving node is Vector 49's entry 0, whose node key is the §25.2 reference key, so the confirmation's second field is that key's `NodeId` (Vector 90), `e77d53354271e4c1c3c319cf7b5cfcc23be431c2ec795d5b6ecf549355f15610`, and `service_record` is empty.
 - `response` holds one blob, the recovery frame above. Under §9.5.1's repeated-field rule its `value_digest` is `23604fbe0d2514bfc1c07f2253e663d2748dc9a4b60e8c2b9c5a7d3a2a9af3c3`.
-- `relay_proof` has the proof `nonce` `5a5054e04186dcdb137484414cc26f7a0b4100126689b5fee53f290d72b6eb9b`, the routing ID SHA-256("scp:did:" || identifier), and `observed_at` from Vector 44, and is signed under the reference key: `c45b32c65d25b3d070929aa68fa4532f69fd5ab56fa15173be77d6c5c6d03c185a5054e04186dcdb137484414cc26f7a0b4100126689b5fee53f290d72b6eb9bf8affd47ab024cae9489a63fa1c632914c16f7329441b8fca65b32c78d86a4eb23604fbe0d2514bfc1c07f2253e663d2748dc9a4b60e8c2b9c5a7d3a2a9af3c3000000006553f1009a2fea47263cf961dfbec93425947ab5a15fb5e388a8dfa6fbdc276a992c6f7d5598234b14ec44351af629fc4e2132145195b22858bb04f447730efa46a3601f` (200 bytes).
+- `node_proof` names the serving node's `NodeId`, has the proof `nonce` `5a5054e04186dcdb137484414cc26f7a0b4100126689b5fee53f290d72b6eb9b`, the routing ID SHA-256("scp:did:" || identifier), and `observed_at` from Vector 44, and is signed under the reference key: `e77d53354271e4c1c3c319cf7b5cfcc23be431c2ec795d5b6ecf549355f156105a5054e04186dcdb137484414cc26f7a0b4100126689b5fee53f290d72b6eb9bf8affd47ab024cae9489a63fa1c632914c16f7329441b8fca65b32c78d86a4eb23604fbe0d2514bfc1c07f2253e663d2748dc9a4b60e8c2b9c5a7d3a2a9af3c3000000006553f100c2b04a8053917816044f5b2684163b345c33fc8f86d0895fde89b180264b5b00792c975cf8c7e2714e336d8ff1d5c55b6d975053fb994e02bb050d2a24962960` (200 bytes).
 
-The confirmation is 1775 bytes, with SHA-256 `8899ec1281dd387696cd6d0764c07530fe92730495d88cb7f7d2e942e23cb241`. The body is BE32(0) || BE32(1775) || the confirmation, 1783 bytes, with SHA-256 `a7c143f72aa7b9af6302d3fd17aeea08c87ca340401cd46acf6db477ddbff07a`.
+The confirmation is 2786 bytes, with SHA-256 `ce5459cf807d48c90963eb79396447748b61a5ee1015c4d73cab11f0d85b14fe`. The body is BE32(0) || BE32(2786) || the confirmation, 2794 bytes, with SHA-256 `e0356485e6993e5542bc71e03c71accd8b0e8dcf4bf571f366284cf8eede3dbf`.
 
-**`key_positions_hash` over four positions at `relay_list_sequence` 3.** The fixture positions:
+**`key_positions_hash` over four positions at `node_list_sequence` 3.** The fixture positions:
 - The Contested position of this vector's identity, with heads d1 and d2 in ascending digest order and `contested_since` 12. It recorded the recovery at epoch 5, while it was Linear, and the contest recorded at epoch 12 left `recovered_at` unchanged at [5, 1, d2].
 - A Linear held position whose chain holds a fixture `RootRecovery`, with `recovered_at` [9, 1, d].
 - An unheld position with two `presented` tips, `pending_since` 10, and `staged_by` carol.
@@ -1974,9 +1974,9 @@ signature (64 raw):   a77d28e5c20b588a75cc18f0891ec9ffea231e21ca23c9aa34bc23c603
 
 The signer is §25.2's secondary key, the `#active` key of Vector 41's identity.
 
-## 25.27 Witness-Layer and Relay-Proof Vectors (§9.7.4.2 definitions, §9.7.4.3, §9.18.2)
+## 25.27 Witness-Layer and Node Vectors (§9.6.3, §9.7.4.2 definitions, §9.7.4.3, §9.18.2)
 
-The witness objects below name Vector 41's identity as their subject and Vector 41's event as the event a witness seeded at. **No object below names a position in a signer's own key state**, because a community-relay-list operator's key is non-transferable and has no position to name: a verifier reads that key from the operator's list entry, which Vector 49 pins.
+The witness objects below name Vector 41's identity as their subject and Vector 41's event as the event a witness seeded at. **No witness object or node proof below names a position in a signer's own key state**: a witness signs under the key its designation names, and a node signs under its node key, which never rotates and has no position to name. A verifier reads a node key from the node's list entry, which Vector 49 pins. The node binding and the node-list record do name positions, the operator's and the governor's.
 
 ### Vector 43: a witness's first cosigned head after a seed
 
@@ -2008,12 +2008,12 @@ Signature, secondary key (249 bytes on the wire):
   516a9021c82a5c5c399216af0f065b541dd34d794ace9d7ef2709c3ad550da29
 ```
 
-### Vector 44: a relay proof of control over a served QUERY response
+### Vector 44: a node proof of control over a served QUERY response
 
-**The object carries no key-state position**, for the reason the cosigned head carries none. **`value_digest` is length-prefixed**: a 4-byte blob count, then each blob under §9.5.1's variable-length rule, so one digest names one split of the served bytes into blobs.
+The serving node is named by its `NodeId` (Vector 90), the `NodeId` of §25.2's reference key, and the reference key signs. **The object carries no key-state position**, because a node key never rotates and has no position to name. **`value_digest` is length-prefixed**: a 4-byte blob count, then each blob under §9.5.1's variable-length rule, so one digest names one split of the served bytes into blobs.
 
 ```
-operator:      c45b32c65d25b3d070929aa68fa4532f69fd5ab56fa15173be77d6c5c6d03c18
+node_id:       e77d53354271e4c1c3c319cf7b5cfcc23be431c2ec795d5b6ecf549355f15610   (Vector 90)
 nonce:         8c10b9bc0b5acdcfb85432747587fbbd8894bbad69f35de6dff46093513daac8
 routing_id:    f8affd47ab024cae9489a63fa1c632914c16f7329441b8fca65b32c78d86a4eb   (Vector 41's routing id)
 Served blobs, concatenated for display ("scp-25-served-blob-a", "scp-25-served-blob-bb"):
@@ -2023,18 +2023,20 @@ value_digest = SHA-256(BE32(2) || BE32(len(A)) || A || BE32(len(B)) || B):
   ebbf1905dedb60f162f2cc5190ae0a8cd0adc66bb34e0ea45469bc4957405115
 observed_at:   1700000000
 
-Preimage (155 bytes = 19-byte separator + 136 field bytes):
-  5343502d52454c41592d50524f4f462d56313ac45b32c65d25b3d070929aa68f
-  a4532f69fd5ab56fa15173be77d6c5c6d03c188c10b9bc0b5acdcfb854327475
-  87fbbd8894bbad69f35de6dff46093513daac8f8affd47ab024cae9489a63fa1
-  c632914c16f7329441b8fca65b32c78d86a4ebebbf1905dedb60f162f2cc5190
-  ae0a8cd0adc66bb34e0ea45469bc4957405115000000006553f100
+Preimage (154 bytes = 18-byte separator + 136 field bytes):
+  5343502d4e4f44452d50524f4f462d56313ae77d53354271e4c1c3c319cf7b5c
+  fcc23be431c2ec795d5b6ecf549355f156108c10b9bc0b5acdcfb85432747587
+  fbbd8894bbad69f35de6dff46093513daac8f8affd47ab024cae9489a63fa1c6
+  32914c16f7329441b8fca65b32c78d86a4ebebbf1905dedb60f162f2cc5190ae
+  0a8cd0adc66bb34e0ea45469bc4957405115000000006553f100
 Canonical hash:
-  da84527c98e7b933bf9dd90795924dcfdc6dc58a7a80f475cfdf766d46ca766d
+  80df288ea4fc43800ce1bcfc33db258c43a3af95f0046530981662eee8e43481
 Signature, reference key (200 bytes on the wire):
-  4dac593fea10e440cb649d0dccc0202aad333c627a485cb56161675ba826e798
-  685d6c9e920fa5d0932a94b3e6feb29fa5ccb788fcbd32c6daa14da5821ace1b
+  f94baff7e4b2e3e016191348cad794ad41c9f6424c6493f9703c8063ec672821
+  6e08bf1baa359563592f6d818eb1cf6457d48f0a64e7edb315fbde00b0419559
 ```
+
+A conforming implementation verifies this proof against the reference key's 33-byte form and refuses it against the secondary key, whose `NodeId` differs from `node_id`. It refuses the proof after any one byte of the 200 changes.
 
 ### Vector 45: the conflict statement a witness emits when its one check fails
 
@@ -2060,7 +2062,7 @@ Signature, secondary key (216 bytes on the wire):
 
 ### Vector 46: the two-heads fault proof
 
-Two cosigned heads of one witness, over one subject, carrying one shared `previous_cosigned_digest`, two different `event_digest` values, and `seed` clear on both. Both heads carry one seed, an equal `seed_event` and `seed_observed_at`, so the sixth condition holds too. **Those six conditions are the fault proof §9.7.4.3 defines**, and a relay keys its cosigned-head store on (subject, witness, `event_digest`) so that both survive at one address (`03-identity.md` §3.10.2). A conforming implementation assembles the pair, verifies both signatures against the P-256 key the witness operator's community-relay-list entry declares, and reports a valid fault proof. **Substituting Vector 43, whose `seed` carries `0x01`, for either head yields no proof**, which is how a declared re-seed stays outside the predicate.
+Two cosigned heads of one witness, over one subject, carrying one shared `previous_cosigned_digest`, two different `event_digest` values, and `seed` clear on both. Both heads carry one seed, an equal `seed_event` and `seed_observed_at`, so the sixth condition holds too. **Those six conditions are the fault proof §9.7.4.3 defines**, and a relay keys its cosigned-head store on (subject, witness, `event_digest`) so that both survive at one address (`03-identity.md` §3.10.2). A conforming implementation assembles the pair, verifies both signatures against the witness's P-256 key, §25.2's secondary key, and reports a valid fault proof. **Substituting Vector 43, whose `seed` carries `0x01`, for either head yields no proof**, which is how a declared re-seed stays outside the predicate.
 
 ```
 Shared previous_cosigned_digest:
@@ -2101,61 +2103,110 @@ Shared seed: seed_event, seed_observed_at 1700000000
   731ec51ab8c0dd7985b579d4cc8ec55cf5bb142fcabc78da89ccb2c4ff768454
 ```
 
-### Vector 49: the relay-list record
+### Vector 90: the node identifier
 
-`18-addressability-and-deployment.md` §18.5.1 fixes the record the relay-list context's `relay_list` outlet returns: an `entries` document holding one JSON array of entries, each an object carrying `operator`, `key`, `url` and `free` in that order, and the governor's signature over `SHA-256("SCP-RELAY-LIST-V1:" || context_id || sequence || governor || SHA-256(entries))`. **The two entries below are a fixture and are never the community relay list.** Each operator identifier is `SHA-256` over a stated ASCII label, and the two keys are §25.2's reference and secondary keys, whose private scalars §25.2 prints. The context id is `SHA-256` over a stated ASCII label, and the governor is Vector 41's identity, whose `#active` key is §25.2's secondary key. This vector pins the document's encoding — member order, lowercase hexadecimal, no insignificant whitespace — and the record's preimage and signature. An entry whose `key` appears anywhere in this corpus MUST NOT appear in the community relay list.
+`NodeId = SHA-256("SCP-NODE-ID-V1:" || node_key)` over the 33-byte compressed SEC1 key (§9.7.4.2 definitions). The separator is an identifier-derivation prefix, and the key follows it raw. A derivation refuses a key that is not 33 bytes, a key whose first byte is not `0x02` or `0x03` (the 65-byte uncompressed form among them), and 33 bytes that decode to no point on P-256, and it computes no digest over any of them.
 
 ```
-entry 0:  operator = SHA-256("scp-25-relay-operator")
-          c45b32c65d25b3d070929aa68fa4532f69fd5ab56fa15173be77d6c5c6d03c18
-          key      = §25.2's reference key, 33-byte SEC1 compressed
-          033b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f3027
-          url      = wss://relay.example.com/scp/v1
-          free     = true
-entry 1:  operator = SHA-256("scp-25-witness-operator")
-          9d94df95bc0a13f1963f484414c320354c73c75bb86e96559e97765f5bc2d313
-          key      = §25.2's secondary key, 33-byte SEC1 compressed
-          0223702a648232f2d00713de9289753c2fbd4c4efa7e1e33905e3723a412b20aea
-          url      = wss://relay2.example.com/scp/v1
-          free     = false
+node_key = §25.2's reference key, compressed:
+  033b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f3027
+Preimage (48 bytes = 15-byte separator + 33-byte key):
+  5343502d4e4f44452d49442d56313a033b1cac23f45cf1cdfdf0b32f8f777b99
+  166c1b69649c2295b1517883d47f3027
+NodeId:
+  e77d53354271e4c1c3c319cf7b5cfcc23be431c2ec795d5b6ecf549355f15610
+NodeId of §25.2's secondary key:
+  575d27a9d81af87b505b07f00c00031382c4ca1f3b9bf03e874f25179e21bcae
+```
 
-Document (415 bytes):
-[{"operator":"c45b32c65d25b3d070929aa68fa4532f69fd5ab56fa15173be77d6c5c6d03c18","key":"033b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f3027","url":"wss://relay.example.com/scp/v1","free":true},{"operator":"9d94df95bc0a13f1963f484414c320354c73c75bb86e96559e97765f5bc2d313","key":"0223702a648232f2d00713de9289753c2fbd4c4efa7e1e33905e3723a412b20aea","url":"wss://relay2.example.com/scp/v1","free":false}]
+### Vector 91: the node binding
 
-Document bytes:
-  5b7b226f70657261746f72223a22633435623332633635643235623364303730
-  3932396161363866613435333266363966643561623536666131353137336265
-  3737643663356336643033633138222c226b6579223a22303333623163616332
-  3366343563663163646664663062333266386637373762393931363663316236
-  39363439633232393562313531373838336434376633303237222c2275726c22
-  3a227773733a2f2f72656c61792e6578616d706c652e636f6d2f7363702f7631
-  222c2266726565223a747275657d2c7b226f70657261746f72223a2239643934
-  6466393562633061313366313936336634383434313463333230333534633733
-  63373562623836653936353539653937373635663562633264333133222c226b
-  6579223a22303232333730326136343832333266326430303731336465393238
-  3937353363326662643463346566613765316533333930356533373233613431
-  32623230616561222c2275726c223a227773733a2f2f72656c6179322e657861
-  6d706c652e636f6d2f7363702f7631222c2266726565223a66616c73657d5d
-SHA-256 over those bytes, the record's entries digest:
-  526839862b1ba39c6a9e163f8a56ef34162078ddffc8d0745dbf3b1a6de9c0b4
+The binding of Vector 49's entry 0 (§9.6.3). The operator is `SHA-256` over a stated ASCII label, and its `#active` is §25.2's tertiary key, which signs `operator_sig`. The node key is §25.2's reference key, which signs `possession_sig`. `key_state_head` is `SHA-256` over a stated ASCII label, standing in for the operator's position. Every field of `P` is fixed width, so none carries a length prefix.
 
-context_id = SHA-256("scp-25-relay-list-context"):
-  69fb718bd4cac0da5577db43fbabf3b13d21163ec05d2cbfd3da82e8e07f829b
-sequence:   1
+```
+operator = SHA-256("scp-25-node-operator-a"):
+  928c3419a430cdcbe4aa305a1e212ef62129ee259a5ebd36d62c8152123ef226
+node_key = §25.2's reference key:
+  033b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f3027
+url:            wss://node-a.example.com/scp/v1
+url_hash = SHA-256(url):
+  0e9d09b337c5fc0be71b0688d6397b804369509fb9cd9b656276e5953fb7ad98
+key_state_head = SHA-256("scp-25-node-operator-a-head"):
+  a358c071426ae76bd0434af1497dd52caa736d14c06dc91d8a562f71367f3a46
+
+P preimage (146 bytes = 17-byte separator + 129 field bytes):
+  5343502d4e4f44452d42494e442d56313a928c3419a430cdcbe4aa305a1e212e
+  f62129ee259a5ebd36d62c8152123ef226033b1cac23f45cf1cdfdf0b32f8f77
+  7b99166c1b69649c2295b1517883d47f30270e9d09b337c5fc0be71b0688d639
+  7b804369509fb9cd9b656276e5953fb7ad98a358c071426ae76bd0434af1497d
+  d52caa736d14c06dc91d8a562f71367f3a46
+P:
+  d68d4136c96b03ac41934a2d25b385cb065188e045aff1ea4c15379678f0bf38
+operator_sig, tertiary key (the operator's #active):
+  e49ae57145b6e63cf071328bc20bc149adab38046dfe0d8e15be04833f4f1ff8
+  3790fddd8bb44e3483f2354cb29690aa37a09b8a9bea17b6f95a792f0a38d81c
+possession_sig, reference key (the node key):
+  6cf2a11f081be3ba31e4d970eb1e841bde999be62d8b2a3eab984888ff8a7872
+  63a3c796e771a10ae4afa0e04f4b38fb4851917cfafe2f5ca31a8166c20d0d53
+```
+
+A conforming implementation accepts the binding with the tertiary key as the operator's `#active`, and refuses it after any one of the six fields changes, and refuses it with any other key as the operator's `#active`.
+
+### Vector 49: the node-list record
+
+The record of §9.6.3 at sequence 1, carrying two entries. **The two entries are a fixture and never the node list Limn curates.** Entry 0 is Vector 91's binding. Entry 1's operator is `SHA-256("scp-25-node-operator-b")`, its `#active` is again §25.2's tertiary key, its node key is §25.2's secondary key, and its `key_state_head` is `SHA-256("scp-25-node-operator-b-head")`. The context id is the lowercase hexadecimal of `SHA-256("scp-25-node-list-context")`, a 64-character string. The governor is Vector 41's identity, whose `#active` is §25.2's secondary key at Vector 41's inception event, so `signing_key_state_head` is Vector 41's preimage digest. A node key that appears anywhere in this corpus MUST NOT appear in a node list a governor serves.
+
+**The record's RFC 8785 form writes `sequence` as a decimal string**, because an I-JSON number cannot carry every `u64`, and the governor's signature as the member `signature`. Every byte field is lowercase hexadecimal.
+
+```
+entry 1:  operator       = 260f934a7fecb9bd8d64563a017e7291b8d3cd8b8f24f297aed7685989d06acf
+          node_key       = §25.2's secondary key
+          url            = wss://node-b.example.com/scp/v1
+          url_hash       = fa2f2df6d37f5691e35046764de6d6a65257da441fe53d427c18c6f4e166174d
+          key_state_head = 3abd3989c3912536e89c87b42385cb78cb0049e487a5bc6f1df5496840ed5396
+          free           = false
+          operator_sig, tertiary key:
+            62b0a0c0433a583f5e4121bbeb896e543fa45bcf4d9648037f374448401869a3
+            69a523bbcd3a01829882e07fcffe7cf800847cee824762166c7863b40d2c6135
+          possession_sig, secondary key:
+            73fb9e9ca723da73ec0bbe489d7755d1aab0138a6ccf5f7bf05fd91d077bb822
+            6948c61c0a65742ad8b73be6797c4b85991d127e5ac5a601545caa43e5e9f737
+
+Entry array, RFC 8785 (1362 bytes), SHA-256:
+  ecbad39bb7eed5b44dd1aaa228a1055ae09c2528cc490b3952e172600334e717
+
+context_id:              97f678456b525ee215759c254e3ce5248249cf62dff666963caa5f25411354ce
+sequence:                1
 governor = Vector 41's identifier:
   2c0f7f4478be94db0078311ef51ba3cc9934362b0f154dcbf9c597572e46cf32
+signing_key_state_head = Vector 41's preimage digest:
+  d8ba4ebad52657208736f4cac675352f5f9cc0aa837620f8d742dbf42aeedbd7
 
-Preimage (122 bytes = 18-byte separator + 104 field bytes):
-  5343502d52454c41592d4c4953542d56313a69fb718bd4cac0da5577db43fbab
-  f3b13d21163ec05d2cbfd3da82e8e07f829b00000000000000012c0f7f4478be
-  94db0078311ef51ba3cc9934362b0f154dcbf9c597572e46cf32526839862b1b
-  a39c6a9e163f8a56ef34162078ddffc8d0745dbf3b1a6de9c0b4
+Preimage (189 bytes = 17-byte separator + BE32 length + 64-byte context_id + 104 field bytes):
+  5343502d4e4f44452d4c4953542d56313a000000403937663637383435366235
+  3235656532313537353963323534653363653532343832343963663632646666
+  36363639363363616135663235343131333534636500000000000000012c0f7f
+  4478be94db0078311ef51ba3cc9934362b0f154dcbf9c597572e46cf32d8ba4e
+  bad52657208736f4cac675352f5f9cc0aa837620f8d742dbf42aeedbd7ecbad3
+  9bb7eed5b44dd1aaa228a1055ae09c2528cc490b3952e172600334e717
 Canonical hash:
-  802a7f4570a96bdd6134b5daf24f3dcb5b52b4e1c1e888a18029e0d7732640a8
+  de74507523ef05f5088528990a435d7f5df8895236f2ae0b9f080b036d6e7704
 Signature, secondary key (the governor's #active):
-  e5a28b5e36e1fec5b0c536e9a2b60d204c389f6f318a1996ea823ba8b6222a9f
-  0993f9168ef862e7589319bc3cb741c13eac08edf90cec70057cd5e12009bf9a
+  b6ae671033dbb533d6cc9deb1a072199d8de24b201c28840a786042481f5629d
+  6f2c8c9cb3771308ae07357a7fc730d8c785d079cab06485f02232b23ddf6f33
+
+Record, RFC 8785 (1782 bytes):
+{"context_id":"97f678456b525ee215759c254e3ce5248249cf62dff666963caa5f25411354ce","entries":[{"binding":{"key_state_head":"a358c071426ae76bd0434af1497dd52caa736d14c06dc91d8a562f71367f3a46","node_key":"033b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f3027","operator":"928c3419a430cdcbe4aa305a1e212ef62129ee259a5ebd36d62c8152123ef226","operator_sig":"e49ae57145b6e63cf071328bc20bc149adab38046dfe0d8e15be04833f4f1ff83790fddd8bb44e3483f2354cb29690aa37a09b8a9bea17b6f95a792f0a38d81c","possession_sig":"6cf2a11f081be3ba31e4d970eb1e841bde999be62d8b2a3eab984888ff8a787263a3c796e771a10ae4afa0e04f4b38fb4851917cfafe2f5ca31a8166c20d0d53","url_hash":"0e9d09b337c5fc0be71b0688d6397b804369509fb9cd9b656276e5953fb7ad98"},"free":true,"url":"wss://node-a.example.com/scp/v1"},{"binding":{"key_state_head":"3abd3989c3912536e89c87b42385cb78cb0049e487a5bc6f1df5496840ed5396","node_key":"0223702a648232f2d00713de9289753c2fbd4c4efa7e1e33905e3723a412b20aea","operator":"260f934a7fecb9bd8d64563a017e7291b8d3cd8b8f24f297aed7685989d06acf","operator_sig":"62b0a0c0433a583f5e4121bbeb896e543fa45bcf4d9648037f374448401869a369a523bbcd3a01829882e07fcffe7cf800847cee824762166c7863b40d2c6135","possession_sig":"73fb9e9ca723da73ec0bbe489d7755d1aab0138a6ccf5f7bf05fd91d077bb8226948c61c0a65742ad8b73be6797c4b85991d127e5ac5a601545caa43e5e9f737","url_hash":"fa2f2df6d37f5691e35046764de6d6a65257da441fe53d427c18c6f4e166174d"},"free":false,"url":"wss://node-b.example.com/scp/v1"}],"governor":"2c0f7f4478be94db0078311ef51ba3cc9934362b0f154dcbf9c597572e46cf32","sequence":"1","signature":"b6ae671033dbb533d6cc9deb1a072199d8de24b201c28840a786042481f5629d6f2c8c9cb3771308ae07357a7fc730d8c785d079cab06485f02232b23ddf6f33","signing_key_state_head":"d8ba4ebad52657208736f4cac675352f5f9cc0aa837620f8d742dbf42aeedbd7"}
+SHA-256 over the record:
+  1b9be719c4c4c45b66c32a05ce664d8c40202447ba74072fa4d1fbcbc47b3014
+
+Routing id = SHA-256("scp:nls:" || context_id):
+  e949d5a827c14f541cf388ce78193aeac04b893af96b472055ad595c14823fc6
+Frame = 0x06 || governor || record (1815 bytes), SHA-256:
+  818c859d9404320e609a4e1ef7a816e4c41c50f71782e16fcfdc403d73835a03
 ```
+
+A conforming implementation reproduces the record bytes from the fields, decodes them back to the same fields, verifies the signature with the secondary key, verifies each entry's binding with the tertiary key, and refuses the signature after any one of the five record fields changes. It refuses the frame after its first byte changes, after its `governor` changes, and after one space enters the record.
 
 ## 25.28 Pre-Rotation Commitment and Service Record Vectors (§9.7.4.2 definitions, `03-identity.md` §3.10.13)
 
