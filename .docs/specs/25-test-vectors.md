@@ -256,7 +256,7 @@ Domain: `"SCP-RESET-REQUEST-V1:"`
 
 ### Vector 8: Reset Request
 
-**V1 vector.** This vector shows the `"SCP-RESET-REQUEST-V1:"` preimage that the code still implements. `09-security-model.md` §9.5.2 retires that form for `"SCP-RESET-REQUEST-V2:"`, which adds `reset_counter` and `member_since`, and SCP-331 replaces this vector with the V2 form when it changes the code.
+**V1 vector.** This vector shows the `"SCP-RESET-REQUEST-V1:"` preimage that the code still implements. `09-security-model.md` §9.5.2 retires that form for `"SCP-RESET-REQUEST-V3:"`, which adds `reset_counter`, `member_since`, `key_package_hash` and `leaf_key_hash`, and SCP-331 replaces this vector with the V3 form when it changes the code.
 
 ```
 Input:
