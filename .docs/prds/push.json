@@ -295,7 +295,7 @@
         },
         {
           "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
-          "section": "## 10.4 Relay Architecture"
+          "section": "## 10.4 Node Architecture"
         }
       ],
       "details": {
@@ -1782,7 +1782,7 @@
         },
         {
           "file": ".docs/specs/09-security-model.md",
-          "section": "#### 9.18.11 Transport and Relay"
+          "section": "#### 9.18.11 Transport and Node"
         },
         {
           "file": ".docs/specs/25-test-vectors.md",
@@ -1857,7 +1857,7 @@
         },
         {
           "file": ".docs/specs/09-security-model.md",
-          "section": "#### 9.18.11 Transport and Relay"
+          "section": "#### 9.18.11 Transport and Node"
         },
         {
           "file": ".docs/specs/25-test-vectors.md",
@@ -1933,7 +1933,7 @@
         },
         {
           "file": ".docs/specs/09-security-model.md",
-          "section": "#### 9.18.11 Transport and Relay"
+          "section": "#### 9.18.11 Transport and Node"
         },
         {
           "file": ".docs/adrs/phase-6.md",
@@ -2158,7 +2158,7 @@
         },
         {
           "file": ".docs/specs/18-addressability-and-deployment.md",
-          "section": "### 18.2.1 SCPRelay"
+          "section": "### 18.2.1 SCPNode"
         },
         {
           "file": ".docs/specs/22-human-readable-addressing.md",
@@ -2232,11 +2232,11 @@
         },
         {
           "file": ".docs/specs/18-addressability-and-deployment.md",
-          "section": "### 18.2.1 SCPRelay"
+          "section": "### 18.2.1 SCPNode"
         },
         {
           "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
-          "section": "### 10.12.4 Tier 3: Relay Bridging"
+          "section": "### 10.12.4 Tier 3: Node Bridging"
         },
         {
           "file": ".docs/specs/09-security-model.md",
@@ -2295,7 +2295,7 @@
         },
         {
           "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
-          "section": "### 10.12.4 Tier 3: Relay Bridging"
+          "section": "### 10.12.4 Tier 3: Node Bridging"
         },
         {
           "file": ".docs/specs/09-security-model.md",
@@ -2373,7 +2373,7 @@
         },
         {
           "file": ".docs/specs/18-addressability-and-deployment.md",
-          "section": "### 18.2.1 SCPRelay"
+          "section": "### 18.2.1 SCPNode"
         },
         {
           "file": ".docs/specs/09-security-model.md",
@@ -2385,7 +2385,7 @@
         },
         {
           "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
-          "section": "### 10.12.4 Tier 3: Relay Bridging"
+          "section": "### 10.12.4 Tier 3: Node Bridging"
         },
         {
           "file": ".docs/specs/03-identity.md",

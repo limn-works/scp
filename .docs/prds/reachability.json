@@ -189,11 +189,11 @@
       "sources": [
         {
           "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
-          "section": "### 10.12.6 Transport Security for Self-Hosted Relays"
+          "section": "### 10.12.6 Transport Security for Self-Hosted Nodes"
         },
         {
           "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
-          "section": "### 10.12.7 Service-Record Relay URL Encoding"
+          "section": "### 10.12.7 Service-Record Node URL Encoding"
         }
       ],
       "details": {
@@ -290,7 +290,7 @@
       "sources": [
         {
           "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
-          "section": "### 10.12.4 Tier 3: Relay Bridging"
+          "section": "### 10.12.4 Tier 3: Node Bridging"
         }
       ],
       "details": {
@@ -368,7 +368,7 @@
       "sources": [
         {
           "file": ".docs/specs/03-identity.md",
-          "section": "### 3.10.2 Relay-Based Resolution"
+          "section": "### 3.10.2 Node-Based Resolution"
         }
       ],
       "details": {
@@ -417,7 +417,7 @@
         },
         {
           "file": ".docs/specs/03-identity.md",
-          "section": "### 3.10.2 Relay-Based Resolution"
+          "section": "### 3.10.2 Node-Based Resolution"
         }
       ],
       "details": {
@@ -466,7 +466,7 @@
         },
         {
           "file": ".docs/specs/03-identity.md",
-          "section": "### 3.10.2 Relay-Based Resolution"
+          "section": "### 3.10.2 Node-Based Resolution"
         }
       ],
       "details": {
@@ -787,7 +787,7 @@
       "sources": [
         {
           "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
-          "section": "### 10.12.4 Tier 3: Relay Bridging"
+          "section": "### 10.12.4 Tier 3: Node Bridging"
         }
       ],
       "details": {
@@ -887,15 +887,15 @@
       "sources": [
         {
           "file": ".docs/specs/18-addressability-and-deployment.md",
-          "section": "### 18.2.1 SCPRelay"
+          "section": "### 18.2.1 SCPNode"
         },
         {
           "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
-          "section": "### 10.12.4 Tier 3: Relay Bridging"
+          "section": "### 10.12.4 Tier 3: Node Bridging"
         },
         {
           "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
-          "section": "### 10.12.7 Service-Record Relay URL Encoding"
+          "section": "### 10.12.7 Service-Record Node URL Encoding"
         },
         {
           "file": ".docs/specs/03-identity.md",
@@ -946,7 +946,7 @@
       "sources": [
         {
           "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
-          "section": "### 10.12.4 Tier 3: Relay Bridging"
+          "section": "### 10.12.4 Tier 3: Node Bridging"
         },
         {
           "file": ".docs/adrs/phase-1.md",
@@ -995,7 +995,7 @@
       "sources": [
         {
           "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
-          "section": "### 10.12.4 Tier 3: Relay Bridging"
+          "section": "### 10.12.4 Tier 3: Node Bridging"
         },
         {
           "file": ".docs/adrs/phase-1.md",
@@ -1058,7 +1058,7 @@
         },
         {
           "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
-          "section": "## 10.4 Relay Architecture"
+          "section": "## 10.4 Node Architecture"
         },
         {
           "file": ".docs/specs/09-security-model.md",
@@ -1123,7 +1123,7 @@
     },
     {
       "id": "SCP-346",
-      "title": "Encode and verify the signed service record, and name the node device's wrapping-key entry in each tier 3 entry",
+      "title": "Encode and verify the signed service record, with `SCPNode` entries that carry a URL only",
       "gate": "gate-reachability-4",
       "priority": "P1",
       "severity": "major",
@@ -1133,25 +1133,29 @@
         "crates/scp-kel/src/lib.rs",
         "crates/scp-did/src/document.rs",
         "crates/scp-did/src/lib.rs",
-        "crates/scp-node/src/lib.rs",
-        "crates/scp-node/src/published_state.rs",
-        "scripts/gen-test-vectors-p256.py"
+        ".docs/specs/25-test-vectors.md",
+        "scripts/gen-test-vectors-p256.py",
+        "crates/scp-runtime/tests/test_vectors.rs"
       ],
-      "description": "Implements the signed service record's bytes (`03-identity.md` §3.10.13 **The record's bytes**) and the writer and reader sides of the `wrappingKey` property of a tier 3 `SCPRelay` entry (`18-addressability-and-deployment.md` §18.2.1 **`wrappingKey`**). No Rust code builds the §3.10.13 preimage today: `crates/scp-kel/src/routing.rs` derives only the record's `scp:svc:` address, so this story owns the whole encoder and its decoder, for every entry type, not only the `wrappingKey` field. Alec ruled on 2026-10-21 that the node's signed tier 3 relay entry names the node device's wrapping-key entry (`00-open-questions.md` **Which device's wrapping key a tier 3 client seals to**). The tier 3 push client of PUSH-035 seals to the key this field names (`10-infrastructure-and-self-hosting.md` §10.7.1 **Recipient key**). A reader accepts `wrappingKey` only when its 33 bytes equal the `key` of a wrapping-key entry the identity's resolved `KeyState` lists `Current`, and the device of that entry is the node's device; when the bytes match no `Current` wrapping-key entry, it treats the tier 3 entry as absent and never acts on the record's bytes alone (`03-identity.md` §3.10.13). The keri workstream owns the wrapping-key entry, and keri P7 (#2874) re-signs the service record after a wrapping-key rotation. Re-signing on rotation is keri P7's work, and this story does not implement it. SCP-328, the story that publishes a bridge's routing target as `bridgeTarget`, is done; this story adds the second field to the entry that SCP-328's `RelayService` bridge form builds. The value is the 33-byte `key` of the node's device's wrapping-key entry, a role keri P7 adds to the key state (`09-security-model.md` §9.7.4.2), which the issue in `blockedByIssues` tracks. File locations, function names and type names are indicators.",
+      "description": "Implements the signed service record's bytes (`03-identity.md` §3.10.13 **The record's bytes**). No Rust code builds the §3.10.13 preimage today: `crates/scp-kel/src/routing.rs` derives only the record's `scp:svc:` address, so this story owns the whole encoder and its decoder for every entry type. Each entry encodes as its three strings `id`, `type` and `serviceEndpoint`; an `IdentityPrivateState` entry then carries its 32-byte derivation id (§3.7), and every other type carries nothing after the three strings. An `SCPNode` entry names a node by URL alone and binds no node key; tier 3 bridge fields live in the context's `NodeAddress` (`09-security-model.md` §9.5.2), not in the service record (`18-addressability-and-deployment.md` §18.2.1). The `wrappingKey` writer and reader this story carried before 2026-11-02 are withdrawn, because the node backend design makes `SCPNode` a URL only. `25-test-vectors.md` Vector 48 on main still carries the relay-era layout (`SCPRelay` entries with `bridgeTarget` and `wrappingKey`), so this story re-pins it to the §3.10.13 layout. File locations, function names and type names are indicators.",
       "acceptanceCriteria": [
-        "JSON form (§18.2.1 **`wrappingKey`**): scp-did's `Service` carries `wrapping_key`, serialized as `wrappingKey`, 66 lowercase hex digits decoding to 33 bytes; a unit test round-trips a document holding a bridge entry with a `wrappingKey`, a bridge entry without one, and a plain entry, and only the first entry's JSON carries `wrappingKey`.",
-        "Reader rejections (§18.2.1 **`wrappingKey`**): `DidDocument::from_json` drops the entry, and keeps the record's other entries in their order, for each of these `wrappingKey` values, one test case each: 64 hex digits, 68 hex digits, 66 uppercase hex digits, a non-hex character, `null`, and 66 hex digits whose first byte is `0x04`; and for a valid `wrappingKey` on an `SCPRelay` entry with no `bridgeTarget` and on an entry whose `type` is not `SCPRelay`. A bridge entry with no `wrappingKey` is kept and `relay_services()` returns it.",
-        "Encoder (§3.10.13 **The record's bytes**): one function computes the service record's signature preimage `\"SCP-SERVICE-RECORD-V1:\" || identifier || sequence || entries` under the `09-security-model.md` §9.5.1 construction for every entry type: each entry's `id`, `type` and `serviceEndpoint` under the variable-length rule, and for an `SCPRelay` entry the 32 `bridgeTarget` bytes (`SHA-256(0x00)` when absent) followed by `wrappingKey` as `BE32(33) || key`, or `BE32(32) || SHA-256(0x00)` when absent. A known-answer test over `25-test-vectors.md` Vector 48 reproduces its `entries` field, its preimage and its canonical hash byte for byte (indicator: `service_record_preimage` in `crates/scp-kel/src/service_record.rs`).",
-        "Decoder (§3.10.13 **The record's bytes**): the decoder re-parses Vector 48's preimage into the four entries it encodes, and rejects the record, one test per case, for a `wrappingKey` value of 31 bytes, of 34 bytes, a 32-byte value other than `SHA-256(0x00)`, a 33-byte value whose first byte is `0x04`, and a 33-byte value on an `SCPRelay` entry whose `bridgeTarget` bytes are `SHA-256(0x00)`.",
-        "Acceptance against the key state (§3.10.13, §18.2.1 **`wrappingKey`**): the function that returns a tier 3 entry's wrapping key takes the identity's resolved `KeyState` and returns the key only when its 33 bytes equal the `key` of a wrapping-key entry that `KeyState` lists `Current`, and takes that entry's device as the node's device. It returns the tier 3 entry as absent, one test per case, when the key state lists the named key `Superseded`, lists it `Compromised{from: N}`, lists it only in an entry that is not a wrapping-key entry, does not list it, and holds no `Current` wrapping-key entry; no signature of the entry's own changes that result.",
-        "Writer (§18.2.1 **`wrappingKey`**): a node on tier 3 publishes each bridge entry with `wrappingKey` equal to the key its identity's key state lists `Current` as the wrapping-key entry of the device whose instance runs the node, and publishes no `wrappingKey` on a non-bridge entry; an in-process test resolves the published record and compares the field with the key state.",
-        "`python3.12 scripts/check-test-vectors-p256.py` passes, and a Rust test asserts Vector 48's canonical hash `6281d761d844bb8893bba4d55ee893902ff516414d9430043a59f0c750a70b18`."
+        "Withdrawn 2026-11-02: `18-addressability-and-deployment.md` §18.2.1 makes `SCPNode` a URL only, so no `wrappingKey` rides in the service record. (was: JSON form (§18.2.1 **`wrappingKey`**): scp-did's `Service` carries `wrapping_key`, serialized as `wrappingKey`, 66 lowercase hex digits decoding to 33 bytes; a unit test round-trips a document holding a bridge entry with a `wrappingKey`, a bridge entry without one, and a plain entry, and only the first entry's JSON carries `wrappingKey`.)",
+        "Withdrawn 2026-11-02: `18-addressability-and-deployment.md` §18.2.1 makes `SCPNode` a URL only, so no `wrappingKey` rides in the service record. (was: Reader rejections (§18.2.1 **`wrappingKey`**): `DidDocument::from_json` drops the entry, and keeps the record's other entries in their order, for each of these `wrappingKey` values, one test case each: 64 hex digits, 68 hex digits, 66 uppercase hex digits, a non-hex character, `null`, and 66 hex digits whose first byte is `0x04`; and for a valid `wrappingKey` on an `SCPRelay` entry with no `bridgeTarget` and on an entry whose `type` is not `SCPRelay`. A bridge entry with no `wrappingKey` is kept and `relay_services()` returns it.)",
+        "Withdrawn 2026-11-02: `18-addressability-and-deployment.md` §18.2.1 makes `SCPNode` a URL only, so no `wrappingKey` rides in the service record. (was: Acceptance against the key state (§3.10.13, §18.2.1 **`wrappingKey`**): the function that returns a tier 3 entry's wrapping key takes the identity's resolved `KeyState` and returns the key only when its 33 bytes equal the `key` of a wrapping-key entry that `KeyState` lists `Current`, and takes that entry's device as the node's device. It returns the tier 3 entry as absent, one test per case, when the key state lists the named key `Superseded`, lists it `Compromised{from: N}`, lists it only in an entry that is not a wrapping-key entry, does not list it, and holds no `Current` wrapping-key entry; no signature of the entry's own changes that result.)",
+        "Withdrawn 2026-11-02: `18-addressability-and-deployment.md` §18.2.1 makes `SCPNode` a URL only, so no `wrappingKey` rides in the service record. (was: Writer (§18.2.1 **`wrappingKey`**): a node on tier 3 publishes each bridge entry with `wrappingKey` equal to the key its identity's key state lists `Current` as the wrapping-key entry of the device whose instance runs the node, and publishes no `wrappingKey` on a non-bridge entry; an in-process test resolves the published record and compares the field with the key state.)",
+        "Encoder (`03-identity.md` §3.10.13 **The record's bytes**): one function computes the service record's signature preimage `\"SCP-SERVICE-RECORD-V1:\" || identifier || sequence || entries` under the `09-security-model.md` §9.5.1 construction for every entry type: each entry's `id`, `type` and `serviceEndpoint` under the variable-length rule, and for an `IdentityPrivateState` entry its 32-byte derivation id under the fixed-length rule directly after `serviceEndpoint`; an `SCPNode` entry and every other type carry nothing after the three strings (indicator: `service_record_preimage` in `crates/scp-kel/src/service_record.rs`)",
+        "Vector 48 (`25-test-vectors.md` §25.28) is re-pinned to that layout with at least one `SCPNode` entry and one `IdentityPrivateState` entry; `scripts/gen-test-vectors-p256.py` emits it, `python3.12 scripts/check-test-vectors-p256.py` passes, and a Rust known-answer test reproduces its `entries` field, its preimage and its canonical hash byte for byte",
+        "Decoder: the decoder re-parses Vector 48's preimage into the entries it encodes, reading the 32-byte derivation id only after it has read the type `IdentityPrivateState`, and rejects the whole record when an entry's bytes do not parse, one test per case: an `IdentityPrivateState` entry truncated inside its derivation id, trailing bytes after an `SCPNode` entry, and an entry count that exceeds the entries present",
+        "JSON form (`18-addressability-and-deployment.md` §18.2.1): a reader rejects an `SCPNode` entry whose `serviceEndpoint` has no canonical form under `09-security-model.md` §9.18.2 (a query, a fragment, or user information) or whose canonical path does not end in `/scp/v1`, routes to no such entry, and keeps the record's other entries in their order: one test per cause",
+        "No service-record type carries `wrappingKey` or `bridgeTarget`: `git grep -e wrappingKey -e wrapping_key -- crates/scp-did crates/scp-kel` prints nothing, and an entry whose JSON carries either field is read with the field ignored",
+        "No `unwrap()` or `expect()` in library code",
+        "CI-feature `cargo clippy` over the touched crates and their tests passes"
       ],
       "actionItems": [
-        "Add the §3.10.13 service-record preimage encoder and decoder for every entry type, with the Vector 48 known-answer test.",
-        "Add `wrapping_key` with a 66-digit lowercase hex serde helper to scp-did's `Service` and to `RelayService`'s bridge form, and drop every entry §18.2.1 rejects in the deserializer.",
-        "Accept a tier 3 entry's `wrappingKey` only when it equals the `key` of a wrapping-key entry the resolved `KeyState` lists `Current` in the resolved `KeyState`.",
-        "Make scp-node write the device's `Current` wrapping key on each tier 3 entry."
+        "Add the §3.10.13 service-record preimage encoder and decoder for every entry type.",
+        "Re-pin Vector 48 to the §3.10.13 layout and add the Rust known-answer test.",
+        "Reject an `SCPNode` entry without a canonical `/scp/v1` URL in the JSON reader.",
+        "Withdrawn 2026-11-02: `SCPNode` carries a URL only, so no tier 3 wrapping key rides in the service record. (was: Add `wrapping_key` with a 66-digit lowercase hex serde helper to scp-did's `Service` and to `RelayService`'s bridge form, and drop every entry §18.2.1 rejects in the deserializer.)"
       ],
       "blockedBy": [],
       "blockedByIssues": [
@@ -1160,23 +1164,24 @@
       "sources": [
         {
           "file": ".docs/specs/18-addressability-and-deployment.md",
-          "section": "### 18.2.1 SCPRelay"
+          "section": "### 18.2.1 SCPNode"
         },
         {
           "file": ".docs/specs/03-identity.md",
           "section": "### 3.10.13 The Service Record"
         },
         {
-          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
-          "section": "### 10.7.1 Push Registration Protocol"
+          "file": ".docs/specs/03-identity.md",
+          "section": "## 3.7 Identity Private State"
         },
         {
           "file": ".docs/specs/09-security-model.md",
-          "section": "### 9.7.4.2 Root-Authority Recovery and Fork Precedence"
+          "section": "### 9.5.2 Signed Structure Definitions"
         }
       ],
       "details": {
-        "crate": "scp-did"
+        "crate": "scp-did",
+        "withdrawn": "2026-11-02: the `wrappingKey` writer and reader criteria are withdrawn because `18-addressability-and-deployment.md` §18.2.1 makes `SCPNode` a URL only; tier 3 bridge fields live in `NodeAddress` (`09-security-model.md` §9.5.2), which SCP-365 builds."
       }
     }
   ]

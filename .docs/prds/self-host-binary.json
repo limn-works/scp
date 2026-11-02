@@ -382,7 +382,7 @@
         },
         {
           "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
-          "section": "### 10.12.6 Transport Security for Self-Hosted Relays"
+          "section": "### 10.12.6 Transport Security for Self-Hosted Nodes"
         },
         {
           "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
@@ -390,7 +390,7 @@
         },
         {
           "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
-          "section": "## 10.4 Relay Architecture"
+          "section": "## 10.4 Node Architecture"
         },
         {
           "file": ".docs/specs/19-economic-governance.md",

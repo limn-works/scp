@@ -448,7 +448,7 @@
       "sources": [
         {
           "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
-          "section": "### 10.14.3 Relay QUIC Support"
+          "section": "### 10.14.3 Node QUIC Support"
         },
         {
           "file": ".docs/adrs/phase-2.md",
@@ -495,7 +495,7 @@
       "sources": [
         {
           "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
-          "section": "### 10.15.1 Relay HTTP/3 Upgrade Path"
+          "section": "### 10.15.1 Node HTTP/3 Upgrade Path"
         },
         {
           "file": ".docs/adrs/phase-2.md",
@@ -1369,7 +1369,7 @@
         },
         {
           "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
-          "section": "### 10.14.3 Relay QUIC Support"
+          "section": "### 10.14.3 Node QUIC Support"
         },
         {
           "file": ".docs/adrs/phase-2.md",
@@ -1420,7 +1420,7 @@
         },
         {
           "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
-          "section": "### 10.14.3 Relay QUIC Support"
+          "section": "### 10.14.3 Node QUIC Support"
         },
         {
           "file": ".docs/adrs/phase-2.md",
