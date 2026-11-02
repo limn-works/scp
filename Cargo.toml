@@ -349,6 +349,23 @@ await_holding_lock = "deny"
 [profile.dev]
 debug = "line-tables-only"
 
+# Non-member dependencies compile at opt-level 1, and workspace members stay at
+# opt-level 0. Debug assertions and overflow checks keep the dev defaults for every
+# crate, because this table sets only `opt-level`. The slowest tests spend their time
+# in dependency crypto: Argon2id, SHA-2, BLAKE3, Ed25519, P-256. Measured on a 16-core
+# Mac, with load given for each run:
+#   - frontier oracle test (scp-protocol), run alone: 61.9-67.9 s CPU at opt-level 0
+#     (load 19-54), 15.5-16.0 s at opt-level 1 (load 16-23)
+#   - CI's three rust-test legs BR, RT and RS: run CPU 1,080 s at opt-level 0, 449 s at
+#     opt-level 1. Every test passes at both levels
+#   - scp-protocol lib-test rebuild after a one-line edit: 17.9-18.6 s CPU at opt-level 0,
+#     15.9-17.1 s at opt-level 1
+#   - cold dependency build: 3,618 s CPU at opt-level 0, 6,082 s at opt-level 1. This is
+#     paid again only when the dependency or feature set changes
+# Members stay at opt-level 0, so an edit recompiles at the debug-build speed.
+[profile.dev.package."*"]
+opt-level = 1
+
 # ── Release profile ─────────────────────────────────────────────────────────
 # `debug-assertions = false` is the cargo release default; this line changes no
 # behavior and keeps the setting explicit. The shipped browser wasm is a
