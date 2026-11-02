@@ -349,6 +349,18 @@ await_holding_lock = "deny"
 [profile.dev]
 debug = "line-tables-only"
 
+# Argon2id (`argon2`, with its `blake2` compression function) is the KDF behind
+# `FileKeyCustody` (64 MiB, three passes). At opt-level 0 one derivation takes
+# seconds, which dominates every test that opens a key file. Optimizing these
+# two crates alone makes the dev-profile KDF fast for tests; debug-assertions
+# and overflow-checks stay on, because a per-package override changes only the
+# optimization level.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
+
 # ── Release profile ─────────────────────────────────────────────────────────
 # `debug-assertions = false` is the cargo release default; this line changes no
 # behavior and keeps the setting explicit. The shipped browser wasm is a

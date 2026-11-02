@@ -378,21 +378,54 @@ pub async fn start_relay_in_memory() -> Result<RunningRelay, ServerError> {
 /// [`ServerError::Relay`] if the relay cannot bind.
 pub async fn start_relay_local(data_dir: &Path) -> Result<RunningRelay, ServerError> {
     validate_data_dir(data_dir)?;
+    let storage = on_blocking_pool({
+        let data_dir = data_dir.to_path_buf();
+        move || {
+            create_private_dir(&data_dir)?;
+            Ok(BlobStorageBackend::redb(&data_dir.join("blobs.redb"))?)
+        }
+    })
+    .await?;
+    start_relay_with(storage).await
+}
+
+/// Runs `work` on tokio's blocking pool and waits for it without holding a
+/// worker thread.
+///
+/// Every node and relay front door here creates directories, opens a blob
+/// database, or derives a key-file key before it starts. Each of those is
+/// synchronous file I/O or a memory-hard KDF, and an `async fn` that runs one
+/// inline stalls every other task scheduled on its worker thread for as long
+/// as the call takes. A task that panicked or was cancelled surfaces as
+/// [`ServerError::Io`].
+async fn on_blocking_pool<T, F>(work: F) -> Result<T, ServerError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, ServerError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(std::io::Error::from)?
+}
+
+/// Creates `dir` and its missing ancestors, at mode `0o700` on Unix.
+///
+/// That mode applies only to directories this call creates; an existing
+/// directory keeps its mode.
+fn create_private_dir(dir: &Path) -> Result<(), ServerError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
-            .create(data_dir)?;
+            .create(dir)?;
     }
     #[cfg(not(unix))]
     {
-        std::fs::create_dir_all(data_dir)?;
+        std::fs::create_dir_all(dir)?;
     }
-    let db_path = data_dir.join("blobs.redb");
-    let storage = BlobStorageBackend::redb(&db_path)?;
-    start_relay_with(storage).await
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -700,26 +733,20 @@ where
         ),
     };
 
-    // Validate and ensure data directory exists.
     validate_data_dir(data_dir)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(data_dir)?;
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::create_dir_all(data_dir)?;
-    }
-
-    warn_on_stale_plaintext_store(data_dir);
-    warn_on_permissive_data_dir(data_dir);
-
-    let blob_path = data_dir.join("blobs.redb");
-    let blob_storage = BlobStorageBackend::redb(&blob_path)?;
+    // Creating the data directory and opening `blobs.redb` are synchronous
+    // file I/O, and redb's create fsyncs its file several times; run inline,
+    // they held this future's worker thread for 160 to 930 ms on macOS.
+    let blob_storage = on_blocking_pool({
+        let data_dir = data_dir.to_path_buf();
+        move || {
+            create_private_dir(&data_dir)?;
+            warn_on_stale_plaintext_store(&data_dir);
+            warn_on_permissive_data_dir(&data_dir);
+            Ok(BlobStorageBackend::redb(&data_dir.join("blobs.redb"))?)
+        }
+    })
+    .await?;
 
     // Build the node via the ADR-052 flat-config front door (Phase B-P2). The
     // two identity arms differ only in their `IdentitySource`; the dropped
@@ -764,14 +791,15 @@ where
         // `FileKeyCustody::new` runs an Argon2id derivation (64 MiB, three
         // passes) and can wait up to 10 s on a file another process is
         // creating (spec §17.8), so it runs on the blocking pool rather than
-        // on this future's worker thread. A panicked or cancelled task
-        // surfaces as `ServerError::Io`.
+        // on this future's worker thread.
         let key_custody = Arc::new(
-            tokio::task::spawn_blocking(move || {
-                scp_platform::file::FileKeyCustody::new(&key_path, &passphrase)
+            on_blocking_pool(move || {
+                Ok(scp_platform::file::FileKeyCustody::new(
+                    &key_path,
+                    &passphrase,
+                )?)
             })
-            .await
-            .map_err(std::io::Error::from)??,
+            .await?,
         );
 
         // Build the node's DHT client for its DID method: the in-memory
@@ -1022,19 +1050,7 @@ fn create_blob_parent(path: &Path) -> Result<(), ServerError> {
     let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) else {
         return Ok(());
     };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(parent)?;
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::create_dir_all(parent)?;
-    }
-    Ok(())
+    create_private_dir(parent)
 }
 
 /// Opens the selected blob backend, creating its parent directory first.
@@ -1114,7 +1130,10 @@ pub async fn node_start(
     storage: InstanceStorage,
 ) -> Result<RunningNode, ServerError> {
     let validated = validate_node_start(cfg, &identity.identity.did)?;
-    let blob_storage = open_blob_backend(&validated.blob_storage)?;
+    // Creating the blob directory and opening a redb or SQLite database are
+    // synchronous file I/O with fsyncs, so they run off this worker thread.
+    let backend = validated.blob_storage.clone();
+    let blob_storage = on_blocking_pool(move || open_blob_backend(&backend)).await?;
     let node = match storage {
         InstanceStorage::InMemoryEncrypted(storage) => {
             tracing::warn!(
