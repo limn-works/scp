@@ -1,0 +1,61 @@
+# The Gradle warm job runs the Kotlin tests.
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+  merge_group:
+jobs:
+  check-draft:
+    if: github.event_name == 'push' || github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Not a draft PR, proceeding"
+  changes:
+    if: github.event_name == 'push' || github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dorny/paths-filter@v3
+  producer:
+    needs: changes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache/restore@v4
+        id: artifact
+        with:
+          key: artifact-${{ hashFiles('a/**') }}
+          path: target/debug/liba.so
+      - if: steps.artifact.outputs.cache-hit != 'true'
+        run: cargo build -p a 2>&1
+      - uses: actions/cache/save@v4
+        with:
+          key: artifact-${{ hashFiles('a/**') }}
+          path: target/debug/liba.so
+      - uses: actions/upload-artifact@v4
+        with:
+          name: liba
+          path: target/debug/liba.so
+  test:
+    needs: changes
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: liba
+      - uses: ./.github/actions/rust-cache
+        with:
+          shared-key: workspace-debug
+          save-if: false
+      - run: |
+          cargo nextest run -p a --features x -E 'test(=one)'
+          cargo test -p a --doc
+          cargo clippy -p a -- -D warnings
+  ci:
+    if: always() && github.event_name != 'push'
+    needs: [check-draft, changes, producer, test]
+    runs-on: ubuntu-latest
+    steps:
+      - run: python3 scripts/ci-aggregate-result.py

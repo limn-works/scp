@@ -1,0 +1,13 @@
+# Job test restores group nightly on merge-queue runs, and only a schedule writes it.
+name: CI
+on:
+  merge_group:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./.github/actions/rust-cache
+        with:
+          shared-key: nightly
+          save-if: false
+      - run: cargo nextest run -p a

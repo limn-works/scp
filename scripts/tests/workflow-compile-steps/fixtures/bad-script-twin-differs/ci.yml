@@ -1,0 +1,15 @@
+# scripts/compile-examples.sh checks where the gate lints, so the twin compiles units the
+# gate's reader never reads and misses the ones it does.
+name: Nightly
+on:
+  schedule:
+    - cron: "0 3 * * *"
+jobs:
+  warm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./.github/actions/rust-cache
+        with:
+          shared-key: clippy-examples
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: bash scripts/compile-examples.sh

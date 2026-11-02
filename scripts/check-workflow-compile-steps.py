@@ -1,5 +1,5 @@
 #!/usr/bin/env python3.12
-"""Three checks over every cargo step in every workflow under `.github/workflows/`.
+"""Four checks over the cargo steps and push runs of every workflow under `.github/workflows/`.
 
 The first two exist because the same defect landed twice in one week and a reader
 cannot see either defect in a workflow file without holding the whole file in mind:
@@ -63,7 +63,11 @@ restores compiles.
   and the workflow file triggers on one of those events. A writer's rust-cache step
   reads no earlier step's output in its `if:` or `save-if`: such an output (a
   bridge-artifact cache hit, for one) can skip the save on every push, so an evicted or
-  rekeyed entry would stay unwritten while the check counted it written.
+  rekeyed entry would stay unwritten while the check counted it written. A group with a
+  reader that runs on a pull request, a merge-queue run or a push has a writer that
+  writes on a push to `main`, not only on a schedule. A compile-only script a writer
+  runs in place of a gate script (SCRIPT_TWINS) holds the same compiling cargo
+  commands as that gate, and stands in for it in the comparison.
 
   Why: rust-cache saves only when the restored key was not an exact match, so a reader
   that compiles a feature set or a compile mode the writer did not compile rebuilds
@@ -88,6 +92,32 @@ restores compiles.
   Known gap: a script in a language other than shell (Python, TypeScript) builds its
   argv in code this check does not evaluate, so it is read as compiling nothing, and a
   reader that compiles through one is not compared.
+
+CHECK 4 — a push to `main` runs only cache writers, and they only set up and compile.
+
+  The criterion: in every workflow a push to `main` starts that also runs on merge-queue
+  runs or writes a cache on that push, every job the push can run writes a cache, or a
+  job that writes one needs it, or it is a companion PUSH_COMPANIONS names whose `if:`
+  equals its needed partner's; and no step of those jobs runs a test, a lint or a
+  gate.
+
+  Why: the merge-queue run already ran every test, lint and gate on the tree a push to
+  `main` lands, so the push run re-proves nothing and spends runner time to write the
+  caches every later run restores. A job that runs on that push only to assert holds
+  the push run's wall time (push run 41521637198), and a cache writer that runs a test
+  or a gate makes that gate's verdict on `main` depend on a job no ruleset reads.
+
+  Indicators, not the criterion — how the check reads a step: an action passes when it
+  is on PUSH_ACTIONS (checkout, tool setup, cache, upload, path filter, image build); a
+  shell command passes when its program is on PUSH_PLAIN_PROGRAMS, prints only its
+  version, is `cargo build|check|doc|fetch|metadata`, `cargo clippy` with nothing after
+  `--`, `cargo test` or `cargo nextest run` with `--no-run` (or `cargo test` ending
+  `-- --list`), `maturin build|develop`, `wasm-pack build` or `wasm-pack test` ending
+  `-- --list`, a package script whose own commands pass, Gradle tasks GRADLE_TASK
+  matches, or a script PUSH_SCRIPTS names. Anything else fails.
+
+  Known gap: an assertion written inline with programs PUSH_PLAIN_PROGRAMS allows (a
+  `test -f` that exits 1, a `jq -e`) passes, because those programs also serve setup.
 
 Exit 0 when every step passes, 1 otherwise. `--workflows-dir` points the checks at a
 directory other than the repository's, which the cases under
@@ -428,6 +458,9 @@ DROPPED_FLAGS = frozenset(
         "--no-capture",
         "--skip-auditwheel",
         "--strip",
+        # A test harness flag: after `--`, `cargo test --doc -- --list` and `wasm-pack test
+        # -- --list` print each test's name and run none, and the compile is unchanged.
+        "--list",
     }
 )
 DROPPED_VALUE_FLAGS = frozenset(
@@ -1177,14 +1210,17 @@ class Pair:
         workflow: str,
         job_id: str,
         leg: dict[str, object],
-        writes: bool,
+        write_events: set[str],
+        events: set[str],
         runner: str,
         workspaces: str,
         env: dict[str, str],
         extraction: Extraction,
     ) -> None:
         self.label = f"{workflow}: {leg_label(job_id, leg)}"
-        self.writes = writes
+        self.write_events = write_events
+        self.writes = bool(write_events)
+        self.events = events
         self.runner = runner
         self.workspaces = workspaces
         self.env = env
@@ -1212,15 +1248,120 @@ def main_events(document: dict) -> list[str]:
     if "push" in triggers:
         push = triggers["push"] if isinstance(triggers["push"], dict) else {}
         branches = push.get("branches")
-        if branches is None or DEFAULT_BRANCH_REF.rsplit("/", 1)[1] in branches:
+        # A `push` filter naming tags and no branch filter starts no branch push.
+        tags_only = (
+            branches is None
+            and "branches-ignore" not in push
+            and ("tags" in push or "tags-ignore" in push)
+        )
+        if not tags_only and (
+            branches is None or DEFAULT_BRANCH_REF.rsplit("/", 1)[1] in branches
+        ):
             events.append("push")
     if "schedule" in triggers:
         events.append("schedule")
     return events
 
 
-def check_group_coverage(workflows_dir: Path, repo_root: Path) -> list[str]:
+def trigger_events(document: dict) -> set[str]:
+    """Every event name a workflow's `on:` lists."""
+    triggers = document.get("on", document.get(True))
+    if isinstance(triggers, str):
+        return {triggers}
+    if isinstance(triggers, (list, dict)):
+        return {str(name) for name in triggers}
+    return set()
+
+
+# Events on which a reader runs against a tree someone is waiting on. A group such a reader
+# restores needs a writer on every push to `main`: a schedule writer leaves an evicted or
+# rekeyed entry missing until the schedule next fires.
+PUSH_WRITER_EVENTS = frozenset({"push", "pull_request", "merge_group"})
+
+# A shell script a step runs is read as one opaque `run-file <path>` signature. A gate
+# script whose compiles a writer must reproduce maps here to the compile-only script a
+# writer runs in its place; check_script_twins requires both scripts to hold the same
+# compiling cargo command templates, so the twin compiles what the gate compiles.
+SCRIPT_TWINS = {
+    "scripts/check-examples-compile.sh": "scripts/compile-examples.sh",
+}
+# Shell scripts a reader runs that compile nothing into the target directory its cache
+# group restores, each with the reason.
+SCRIPTS_COMPILING_ELSEWHERE = {
+    "scripts/tests/examples-compile/run-tests.sh": (
+        "each case runs cargo inside a workspace it creates under `mktemp -d`, whose own "
+        "`target/` no cache group holds"
+    ),
+}
+CARGO_TEMPLATE = re.compile(
+    r"\bcargo\s+(?:\+\S+\s+)?(?P<sub>[a-z][a-z-]*)(?P<rest>[^;|&<>\n]*)"
+)
+
+
+def cargo_templates(text: str) -> set[str]:
+    """The compiling cargo commands a shell script's text holds, up to `--`, as written."""
+    templates: set[str] = set()
+    for line in join_continuations(text).splitlines():
+        if line.lstrip().startswith("#"):
+            continue
+        for match in CARGO_TEMPLATE.finditer(line):
+            subcommand = match.group("sub")
+            words = match.group("rest").split(" -- ")[0].split()
+            if subcommand != "nextest" and subcommand not in CARGO_CLASS:
+                continue
+            if subcommand in ("package", "publish") and "--list" in words:
+                continue
+            templates.add(" ".join([CARGO_CLASS.get(subcommand, subcommand)] + words))
+    return templates
+
+
+def check_script_twins(repo_root: Path) -> list[str]:
     failures: list[str] = []
+    for gate, twin in sorted(SCRIPT_TWINS.items()):
+        texts = {}
+        for path in (gate, twin):
+            try:
+                texts[path] = (repo_root / path).read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                failures.append(f"script twin {path} does not exist or is not text")
+        if len(texts) != 2:
+            continue
+        gate_templates = cargo_templates(texts[gate])
+        twin_templates = cargo_templates(texts[twin])
+        if not gate_templates:
+            failures.append(
+                f"{gate} holds no compiling cargo command this check can read"
+            )
+        if gate_templates != twin_templates:
+            failures.append(
+                f"{twin} stands in for {gate} in every cache-group writer, and the two run "
+                f"different compiling cargo commands (only in {gate}: "
+                f"{sorted(gate_templates - twin_templates)}; only in {twin}: "
+                f"{sorted(twin_templates - gate_templates)}), so a writer running the twin "
+                f"does not compile what a reader running the gate compiles"
+            )
+    return failures
+
+
+def run_file_path(signature: str) -> str | None:
+    words = signature.split()
+    return words[1] if len(words) > 1 and words[0] == "run-file" else None
+
+
+def twin_signatures(signatures: set[str]) -> set[str]:
+    """Each signature, plus the gate signature that each twin script's signature covers."""
+    covered = set(signatures)
+    for signature in signatures:
+        path = run_file_path(signature)
+        for gate, twin in SCRIPT_TWINS.items():
+            if path == twin:
+                words = signature.split(" ")
+                covered.add(" ".join([words[0], gate] + words[2:]))
+    return covered
+
+
+def check_group_coverage(workflows_dir: Path, repo_root: Path) -> list[str]:
+    failures: list[str] = check_script_twins(repo_root)
     members: dict[str, list[Pair]] = defaultdict(list)
     restored_by: dict[str, set[str]] = defaultdict(set)
     for path in sorted(workflows_dir.glob("*.yml")) + sorted(
@@ -1236,6 +1377,7 @@ def check_group_coverage(workflows_dir: Path, repo_root: Path) -> list[str]:
         # A step saves only on a run of the default branch, and only push and schedule
         # start one without a person, so a workflow neither triggers writes nothing.
         writer_events = main_events(document)
+        events = trigger_events(document)
         for job_id, job in (document.get("jobs") or {}).items():
             if not isinstance(job, dict) or not isinstance(job.get("steps"), list):
                 continue
@@ -1258,19 +1400,22 @@ def check_group_coverage(workflows_dir: Path, repo_root: Path) -> list[str]:
             for leg in legs:
                 context = {f"matrix.{k}": v for k, v in leg.items()}
                 writer_contexts = [
-                    dict(
-                        context,
-                        **{
-                            "github.ref": DEFAULT_BRANCH_REF,
-                            "github.event_name": event,
-                        },
+                    (
+                        event,
+                        dict(
+                            context,
+                            **{
+                                "github.ref": DEFAULT_BRANCH_REF,
+                                "github.event_name": event,
+                            },
+                        ),
                     )
                     for event in writer_events
                 ]
                 where = f"{path.name}: {leg_label(job_id, leg)}"
                 extraction = Extraction()
                 reader = ScriptReader(repo_root, extraction, where)
-                restores: list[tuple[str, bool, str, dict[str, str]]] = []
+                restores: list[tuple[str, set[str], str, dict[str, str]]] = []
                 for step in steps:
                     if not may_run(step.get("if"), context):
                         continue
@@ -1286,12 +1431,18 @@ def check_group_coverage(workflows_dir: Path, repo_root: Path) -> list[str]:
                         key = block.get("shared-key")
                         if not isinstance(key, str) or not key.strip():
                             continue
-                        writes = not is_false(block.get("save-if")) and any(
-                            may_run(job.get("if"), writer_context)
-                            and may_run(step.get("if"), writer_context)
-                            and may_run(block.get("save-if"), writer_context)
-                            for writer_context in writer_contexts
+                        write_events = (
+                            set()
+                            if is_false(block.get("save-if"))
+                            else {
+                                event
+                                for event, writer_context in writer_contexts
+                                if may_run(job.get("if"), writer_context)
+                                and may_run(step.get("if"), writer_context)
+                                and may_run(block.get("save-if"), writer_context)
+                            }
                         )
+                        writes = bool(write_events)
                         gate = " ".join(
                             str(value)
                             for value in (step.get("if"), block.get("save-if"))
@@ -1315,7 +1466,7 @@ def check_group_coverage(workflows_dir: Path, repo_root: Path) -> list[str]:
                         restores.append(
                             (
                                 substitute_matrix(key, leg).strip(),
-                                writes,
+                                write_events,
                                 substitute_matrix(
                                     str(block.get("workspaces", ". -> target")), leg
                                 ).strip(),
@@ -1336,12 +1487,13 @@ def check_group_coverage(workflows_dir: Path, repo_root: Path) -> list[str]:
                         if is_compile_env(name)
                     }
                     reader.read(substitute_matrix(run, leg), cwd, compile_env)
-                for key, writes, workspaces, env in restores:
+                for key, write_events, workspaces, env in restores:
                     pair = Pair(
                         path.name,
                         job_id,
                         leg,
-                        writes,
+                        write_events,
+                        events,
                         runner_family(job.get("runs-on"), leg),
                         workspaces,
                         env,
@@ -1366,6 +1518,18 @@ def check_group_coverage(workflows_dir: Path, repo_root: Path) -> list[str]:
                 f"({', '.join(p.label for p in readers)}) restore nothing"
             )
             continue
+        waiting = [r for r in readers if r.events & PUSH_WRITER_EVENTS]
+        if waiting:
+            writers = [w for w in writers if "push" in w.write_events]
+            if not writers:
+                failures.append(
+                    f"cache group {group!r}: its readers "
+                    f"({', '.join(r.label for r in waiting)}) run on pull requests, "
+                    f"merge-queue runs or pushes, and no leg writes it on a push to "
+                    f"{DEFAULT_BRANCH_REF}, so an evicted or rekeyed entry stays missing "
+                    f"until a schedule next writes it"
+                )
+                continue
         for pair in writers + readers:
             for problem in pair.extraction.unreadable:
                 failures.append(f"cache group {group!r}: {problem}")
@@ -1406,9 +1570,19 @@ def check_group_coverage(workflows_dir: Path, repo_root: Path) -> list[str]:
             covered: set[str] = set()
             for restored in restored_by[reader.label]:
                 for writer in members[restored]:
-                    if writer.writes and same_key(reader, writer):
-                        covered |= writer.extraction.signatures
-            for signature in sorted(reader.extraction.signatures - covered):
+                    if not writer.writes or not same_key(reader, writer):
+                        continue
+                    if reader.events & PUSH_WRITER_EVENTS and (
+                        "push" not in writer.write_events
+                    ):
+                        continue
+                    covered |= twin_signatures(writer.extraction.signatures)
+            compared_signatures = {
+                s
+                for s in reader.extraction.signatures
+                if run_file_path(s) not in SCRIPTS_COMPILING_ELSEWHERE
+            }
+            for signature in sorted(compared_signatures - covered):
                 failures.append(
                     f"cache group {group!r}: {reader.label} compiles `{signature}`, and no "
                     f"writer of a group it restores compiles that feature set in that mode "
@@ -1420,6 +1594,401 @@ def check_group_coverage(workflows_dir: Path, repo_root: Path) -> list[str]:
         print(
             f"OK: {compared} cache-group reader(s), each compiling only what its group's "
             f"writer compiles"
+        )
+    return failures
+
+
+# CHECK 4 tables. Each names what a job that a push to `main` runs may do; anything else
+# fails the check, so a new tool or script lands here only with a reason.
+
+# Actions that set up a tool, fetch sources, restore or save a cache, upload a build output,
+# select jobs, or build an image.
+PUSH_ACTIONS = (
+    "actions/checkout@",
+    "actions/setup-python@",
+    "actions/setup-node@",
+    "actions/setup-java@",
+    "actions/cache@",
+    "actions/cache/restore@",
+    "actions/cache/save@",
+    "actions/upload-artifact@",
+    "android-actions/setup-android@",
+    "gradle/actions/setup-gradle@",
+    "oven-sh/setup-bun@",
+    "taiki-e/install-action@",
+    "dorny/paths-filter@",
+    "docker/setup-buildx-action@",
+    "docker/login-action@",
+    "docker/build-push-action@",
+    "./.github/actions/rust-toolchain",
+    "./.github/actions/rust-cache",
+    "./.github/actions/cargo-fetch",
+)
+# Programs a push step may run with any arguments: shell builtins, and utilities that
+# read, hash, print, copy or delete files or install packages. None of them runs a
+# repository test or check script.
+PUSH_PLAIN_PROGRAMS = frozenset(
+    {
+        "echo",
+        "printf",
+        "df",
+        "tail",
+        "head",
+        "tr",
+        "cut",
+        "sed",
+        "awk",
+        "cat",
+        "touch",
+        "mkdir",
+        "rm",
+        "cp",
+        "mv",
+        "ls",
+        "shasum",
+        "sha256sum",
+        "find",
+        "[",
+        "[[",
+        "test",
+        "exit",
+        "export",
+        "source",
+        ".",
+        "set",
+        "cd",
+        "true",
+        "false",
+        ":",
+        "continue",
+        "break",
+        "return",
+        "shift",
+        "local",
+        "pip",
+        "pip3",
+        "jq",
+        "sdkmanager",
+        "yes",
+        "dpkg-query",
+        "tsup",
+    }
+)
+# Programs a push step may run only to print their version, which some steps hash into a
+# bridge artifact's cache key.
+VERSION_ARGUMENTS = frozenset({"--version", "-version", "-V", "-VV"})
+# Repository scripts a push step may run, each a build or a generator that asserts nothing
+# about the tree beyond its own outputs existing.
+PUSH_SCRIPTS = {
+    "scripts/compile-examples.sh": "compiles every example target, asserting nothing",
+    "scripts/generate-uniffi-kotlin.sh": "builds the UniFFI library and generates Kotlin",
+    "bindings/swift/build-xcframework.sh": "builds the XCFramework and its Swift bindings",
+    "bindings/typescript-wasm/scripts/build-wasm.ts": "runs `wasm-pack build`",
+    "bindings/typescript-wasm/scripts/copy-wasm-asset.ts": "copies the built `.wasm`",
+}
+# Gradle tasks a push step may run: compiles, packaging, installs, and dependency
+# resolution. A verification task (test, check, lint, detekt, ktlint) matches none.
+GRADLE_TASK = re.compile(
+    r"(?:^|:)(?:compile\w*|assemble\w*|\w*[Cc]lasses|jar|installDist|warmDependencyCache)$"
+)
+PYTHON_PROGRAMS = frozenset({"python", "python3", "python3.12"})
+# A job a push runs that writes no cache and that no writer needs, mapped to the needed
+# job whose `if:` it must carry word for word. check-draft carries `changes`'s `if:` so
+# that `changes` starts with the run (ci_gate_selftest.py holds the two equal), so it
+# runs wherever `changes` runs; its one step prints a line.
+PUSH_COMPANIONS = {"check-draft": "changes"}
+REDIRECT = re.compile(r"^\d*(?:<<<|<<|<|>>|>|>&|<&|&>|&>>)$")
+
+
+def strip_redirects(words: list[str]) -> list[str]:
+    """A command's words without its redirections and their targets."""
+    kept: list[str] = []
+    index = 0
+    while index < len(words):
+        word = words[index]
+        following = words[index + 1] if index + 1 < len(words) else ""
+        if word.isdigit() and REDIRECT.match(following):
+            index += 1
+            continue
+        if REDIRECT.match(word):
+            index += 2
+            continue
+        kept.append(word)
+        index += 1
+    return kept
+
+
+def push_command_problem(
+    words: list[str], cwd: str, repo_root: Path, depth: int
+) -> str | None:
+    """Why one shell command may not run on a push, or None when it may."""
+    words = strip_redirects(words)
+    if not words:
+        return None
+    program = posixpath.basename(words[0])
+    args = words[1:]
+    if program in PUSH_PLAIN_PROGRAMS:
+        return None
+    if args and all(arg in VERSION_ARGUMENTS for arg in args):
+        return None
+    if program == "sudo" and args:
+        return push_command_problem(args, cwd, repo_root, depth)
+    if program == "command" and args and args[0] in ("-v", "-V"):
+        return None
+    if program == "git" and args and args[0] == "ls-files":
+        return None
+    if program == "xcrun" and "--show-sdk-version" in args:
+        return None
+    if program in PYTHON_PROGRAMS:
+        if args[:2] in (["-m", "venv"], ["-m", "pip"]) or args[:1] == ["-c"]:
+            return None
+        return f"`{' '.join(words)}` runs Python that is not a venv, pip or inline `-c`"
+    if program in ("cargo", "cross"):
+        rest = args[1:] if args and args[0].startswith("+") else args
+        subcommand = rest[0] if rest else ""
+        after = rest[rest.index("--") + 1 :] if "--" in rest else []
+        if subcommand in (
+            "build",
+            "b",
+            "check",
+            "c",
+            "doc",
+            "d",
+            "fetch",
+            "metadata",
+            "rustc",
+        ):
+            return None
+        if subcommand == "clippy" and not after:
+            return None
+        if subcommand in ("test", "t") and ("--no-run" in rest or after == ["--list"]):
+            return None
+        if subcommand == "nextest" and rest[1:2] == ["run"] and "--no-run" in rest:
+            return None
+        return (
+            f"`{' '.join(words)}` is a cargo command that runs tests or lints rather than "
+            f"only compiling (`cargo test` needs `--no-run` or `-- --list`, `cargo clippy` "
+            f"takes nothing after `--`)"
+        )
+    if program == "maturin" and args and args[0] in ("develop", "build"):
+        return None
+    if program == "wasm-pack" and args:
+        after = args[args.index("--") + 1 :] if "--" in args else []
+        if args[0] == "build" or (args[0] == "test" and after == ["--list"]):
+            return None
+        return (
+            f"`{' '.join(words)}` runs wasm tests (`wasm-pack test` needs `-- --list`)"
+        )
+    if program == "bun" and args[:1] == ["install"]:
+        return None
+    if program in PACKAGE_RUNNERS and len(args) >= 2 and args[0] == "run":
+        return push_package_script_problem(args[1], cwd, repo_root, depth)
+    if program in ("gradlew", "gradle"):
+        tasks = []
+        index = 0
+        while index < len(args):
+            arg = args[index]
+            index += 1
+            if arg in ("-p", "--project-dir", "--init-script", "-I"):
+                index += 1
+                continue
+            if arg.startswith("-"):
+                continue
+            tasks.append(arg)
+        bad = [task for task in tasks if not GRADLE_TASK.search(task)]
+        if not tasks or bad:
+            return (
+                f"`{' '.join(words)}` runs Gradle task(s) "
+                f"{', '.join(bad) or '(none named)'} that are not compile, assemble, "
+                f"install or dependency-resolution tasks"
+            )
+        return None
+    script = words[0]
+    if program in FILE_RUNNERS and args and not args[0].startswith("-"):
+        script = args[0]
+    located = normalize_path(cwd, script)
+    if located in PUSH_SCRIPTS:
+        return None
+    return (
+        f"`{' '.join(words)}` runs `{program}`, which this check does not know as a setup "
+        f"or compile command; a push to {DEFAULT_BRANCH_REF} runs only cache writers"
+    )
+
+
+def push_package_script_problem(
+    name: str, cwd: str, repo_root: Path, depth: int
+) -> str | None:
+    try:
+        scripts = (
+            json.loads(
+                (repo_root / cwd / "package.json").read_text(encoding="utf-8")
+            ).get("scripts")
+            or {}
+        )
+    except (OSError, json.JSONDecodeError):
+        return (
+            f"`run {name}` in {cwd} names a package script no package.json there holds"
+        )
+    text = scripts.get(name)
+    if not isinstance(text, str) or depth > 8:
+        return f"{cwd}/package.json defines no script {name!r} this check can read"
+    problems = push_script_problems(text, cwd, repo_root, depth + 1)
+    return "; ".join(problems) if problems else None
+
+
+def push_script_problems(
+    script: str, cwd: str, repo_root: Path, depth: int = 0
+) -> list[str]:
+    """Every command in a `run:` script that a push may not run."""
+    problems: list[str] = []
+    for line in join_continuations(strip_heredocs(script)).splitlines():
+        if not line.strip() or line.strip().startswith("#"):
+            continue
+        segments = split_segments(line)
+        if segments is None:
+            problems.append(f"cannot split the shell line {line.strip()!r}")
+            continue
+        for words in segments:
+            while words and (
+                words[0]
+                in ("if", "then", "else", "elif", "while", "until", "do", "!", "{", "}")
+                or ASSIGNMENT.match(words[0])
+            ):
+                words = words[1:]
+            if not words or words[0] in ("fi", "done", "esac", "(", ")"):
+                continue
+            if words[0] in ("for", "case") or set(words[0]) <= set("<>&0123456789"):
+                continue
+            if words[0] == "cd" and len(words) > 1 and "$" not in words[1]:
+                cwd = normalize_path(cwd, words[1])
+                continue
+            problem = push_command_problem(words, cwd, repo_root, depth)
+            if problem:
+                problems.append(problem)
+    return problems
+
+
+def step_writes_cache(step: dict, context: dict[str, object]) -> bool:
+    """Whether a step saves a cache entry on a run with this context."""
+    uses = str(step.get("uses", ""))
+    block = step.get("with") if isinstance(step.get("with"), dict) else {}
+
+    def holds(name: str) -> bool:
+        return evaluate(block.get(name, False), context) is True
+
+    if uses.startswith(RUST_CACHE_ACTION):
+        return not is_false(block.get("save-if")) and may_run(
+            block.get("save-if"), context
+        )
+    if uses.startswith(("actions/cache@", "actions/cache/save@")):
+        return True
+    if uses.startswith("gradle/actions/setup-gradle@"):
+        return not (holds("cache-disabled") or holds("cache-read-only"))
+    if uses.startswith("oven-sh/setup-bun@"):
+        return not holds("no-cache")
+    if uses.startswith("docker/build-push-action@"):
+        return bool(block.get("cache-to"))
+    if uses.startswith("actions/setup-"):
+        return bool(block.get("cache"))
+    return False
+
+
+def check_push_runs(workflows_dir: Path, repo_root: Path) -> list[str]:
+    failures: list[str] = []
+    checked = 0
+    for path in sorted(workflows_dir.glob("*.yml")) + sorted(
+        workflows_dir.glob("*.yaml")
+    ):
+        with path.open(encoding="utf-8") as handle:
+            document = yaml.safe_load(handle)
+        if not isinstance(document, dict) or "push" not in main_events(document):
+            continue
+        jobs = {
+            job_id: job
+            for job_id, job in (document.get("jobs") or {}).items()
+            if isinstance(job, dict)
+        }
+        context: dict[str, object] = {
+            "github.event_name": "push",
+            "github.ref": DEFAULT_BRANCH_REF,
+        }
+        push_jobs = {
+            job_id: job
+            for job_id, job in jobs.items()
+            if may_run(job.get("if"), context)
+        }
+        writers = set()
+        for job_id, job in push_jobs.items():
+            legs, _ = matrix_legs(job)
+            for leg in legs or [{}]:
+                leg_context = dict(
+                    context, **{f"matrix.{k}": v for k, v in leg.items()}
+                )
+                for step in job.get("steps") or []:
+                    if (
+                        isinstance(step, dict)
+                        and may_run(step.get("if"), leg_context)
+                        and step_writes_cache(step, leg_context)
+                    ):
+                        writers.add(job_id)
+        if "merge_group" not in trigger_events(document) and not writers:
+            continue
+        needed: set[str] = set()
+        pending = list(writers)
+        while pending:
+            needs = jobs.get(pending.pop(), {}).get("needs") or []
+            for name in [needs] if isinstance(needs, str) else needs:
+                if name not in needed:
+                    needed.add(name)
+                    pending.append(name)
+        for job_id, job in push_jobs.items():
+            checked += 1
+            where = f"{path.name}: job {job_id}"
+            companion = PUSH_COMPANIONS.get(job_id)
+            if companion is not None and (
+                companion not in needed | writers
+                or jobs.get(companion, {}).get("if") != job.get("if")
+            ):
+                failures.append(
+                    f"{where} runs on a push as the companion of job {companion}, so "
+                    f"its `if:` must equal that job's and a cache-writing job must need "
+                    f"{companion}"
+                )
+            elif companion is None and job_id not in writers and job_id not in needed:
+                failures.append(
+                    f"{where} can run on a push to {DEFAULT_BRANCH_REF}, writes no cache, "
+                    f"and no cache-writing job needs it; the merge-queue run already ran "
+                    f"it on the tree that push lands, so add "
+                    f"`github.event_name != 'push'` to its `if:`"
+                )
+            defaults = ((job.get("defaults") or {}).get("run") or {}).get(
+                "working-directory"
+            )
+            for step in job.get("steps") or []:
+                if not isinstance(step, dict) or not may_run(step.get("if"), context):
+                    continue
+                uses = step.get("uses")
+                if isinstance(uses, str):
+                    if not uses.startswith(PUSH_ACTIONS):
+                        failures.append(
+                            f"{where} uses {uses} on a push, an action this check does not "
+                            f"know as setup, cache, upload or build"
+                        )
+                    continue
+                run = step.get("run")
+                if not isinstance(run, str):
+                    continue
+                cwd = posixpath.normpath(
+                    str(step.get("working-directory") or defaults or ".")
+                )
+                for problem in push_script_problems(run, cwd, repo_root):
+                    failures.append(
+                        f"{where}, step {step.get('name', run.splitlines()[0])!r}: {problem}"
+                    )
+    if not failures:
+        print(
+            f"OK: {checked} job(s) a push to {DEFAULT_BRANCH_REF} can run, each writing a "
+            f"cache or needed by one that does, and each only setting up and compiling"
         )
     return failures
 
@@ -1445,6 +2014,7 @@ def main() -> int:
         return 1
     failures = check_workflows(args.workflows_dir)
     failures += check_group_coverage(args.workflows_dir, args.repo_root)
+    failures += check_push_runs(args.workflows_dir, args.repo_root)
     for failure in failures:
         print(f"FAIL: {failure}", file=sys.stderr)
     return 1 if failures else 0

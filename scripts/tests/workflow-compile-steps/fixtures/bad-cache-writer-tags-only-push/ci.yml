@@ -1,0 +1,24 @@
+# Job warm's workflow runs on a push of a release tag only, never on refs/heads/main.
+name: Release
+on:
+  push:
+    tags:
+      - "v*"
+  pull_request:
+jobs:
+  warm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./.github/actions/rust-cache
+        with:
+          shared-key: release
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo build -p a
+  reader:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./.github/actions/rust-cache
+        with:
+          shared-key: release
+          save-if: false
+      - run: cargo build -p a
