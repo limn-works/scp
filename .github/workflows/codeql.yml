@@ -55,6 +55,20 @@ jobs:
       - name: Fetch crates, then take cargo offline
         uses: ./.github/actions/cargo-fetch
 
+      # The Rust extractor runs scp-ffi's pyo3-ffi build script, which reads the
+      # interpreter PYO3_PYTHON names and fails when its version is newer than the newest
+      # one pyo3 supports. Without the pin it reads the runner image's default `python3`,
+      # which moves with the image. Every leg runs it for the reason the fetch steps above
+      # run on every leg.
+      - name: Setup Python 3.12
+        id: python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Point PyO3 at Python 3.12
+        run: echo "PYO3_PYTHON=${{ steps.python.outputs.python-path }}" >> "$GITHUB_ENV"
+
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
         with:
