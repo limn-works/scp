@@ -788,9 +788,8 @@ RUST_ONLY = {
 DOCS_ONLY = dict.fromkeys(RUST_ONLY, "false")
 
 # Jobs the `code` output selects: true for every change outside prose, so every
-# scenario below but docs-only runs them. wiping-allocator also runs on a push;
-# fix-round-check-selftest is in PULL_REQUEST_ONLY_FILTER_JOBS; the rest are in
-# NOT_ON_PUSH_FILTER_JOBS.
+# scenario below but docs-only runs them. fix-round-check-selftest is in
+# PULL_REQUEST_ONLY_FILTER_JOBS; the rest are in NOT_ON_PUSH_FILTER_JOBS.
 CODE_JOBS = (
     "ci-workflow-selftest",
     "examples-typecheck",
@@ -857,28 +856,39 @@ NOT_ON_PUSH_JOBS = (
 )
 
 # Jobs a `changes` filter output selects whose `if:` also reads
-# `github.event_name != 'push' && …`. The
-# filter jobs absent from this list write a cache on a push to `main` and run there
-# whenever their filters select them.
+# `github.event_name != 'push' && …`. The filter jobs absent from this list (the five
+# bridge producers and docker-image-cache) write a cache on a push to `main` and run
+# there whenever their filters select them; .github/workflows/cache-warm.yml writes
+# every cargo group and the Gradle home.
 NOT_ON_PUSH_FILTER_JOBS = (
     "bridge-parity",
+    "bridge-parity-kotlin",
     "bridge-parity-swift",
     "ci-workflow-selftest",
     "docker-image",
     "examples-typecheck",
     "fail-closed-pre-rotation",
+    "fuzz-build",
+    "kotlin-android-instrumented",
+    "kotlin-lint",
+    "kotlin-test",
     "personal-relay-template",
     "protocol-deps",
     "python-lint",
     "python-test",
+    "python-wheel-build",
     "rust-build-pyo3-production",
     "rust-build-uniffi-production",
+    "rust-clippy",
     "rust-deny",
     "rust-deny-fuzz",
     "rust-doc",
     "rust-doctest",
     "rust-fmt",
+    "rust-test",
+    "rust-test-macos",
     "rust-test-napi-production",
+    "rust-test-optional-features",
     "rust-test-prose",
     "scaffold-typescript-web-check",
     "shipped-feature-graph",
@@ -886,9 +896,11 @@ NOT_ON_PUSH_FILTER_JOBS = (
     "swift-lint",
     "toolchain-wiring-cases",
     "typescript-check",
+    "typescript-wasm-check",
     "vendored-openssl-scope",
     "wasm-protocol",
     "wasm-test",
+    "wiping-allocator",
 )
 
 
@@ -7954,7 +7966,25 @@ def push_only_legs_repeat_other_legs(
     return True
 
 
-def push_writer_gaps(doc: dict) -> list[str]:
+def warm_pushed_caches(warm: dict) -> set[str]:
+    """Name each SHARED_KEY_CACHES cache a job of the cache-warm workflow `warm` writes
+    on every push to `main`: the workflow triggers on a push to `main` and the job
+    carries no `if:`."""
+    events = warm.get("on", warm.get(True)) or {}
+    push = events.get("push", None) if isinstance(events, dict) else None
+    branches = (push or {}).get("branches") if isinstance(push, dict) else None
+    if not branches or "main" not in branches:
+        return set()
+    return {
+        name
+        for job_id, written in cache_writers(warm).items()
+        if warm["jobs"][job_id].get("if") is None
+        for name in written
+        if name in SHARED_KEY_CACHES
+    }
+
+
+def push_writer_gaps(doc: dict, warm: dict | None = None) -> list[str]:
     """Return every way a push to `main` would skip a cache write.
 
     CRITERION: a job holding a cache-writing step runs on a push to `main` wherever
@@ -7966,7 +7996,8 @@ def push_writer_gaps(doc: dict) -> list[str]:
     `runs-on` names) also runs on push, because each such value names its own entry;
     and push_runs_step finds that a push can meet each writing step's `if:` and
     `save-if` together. A cache SHARED_KEY_CACHES
-    names needs only that some push runs some job writing it.
+    names needs only that some push runs some job writing it, in ci.yml or in the
+    cache-warm workflow `warm` (the repository's when None).
 
     WHY: rust-cache and `actions/cache/save` write only on `refs/heads/main`, so a
     writer that a push skips leaves its entry to go stale until eviction, and every
@@ -7978,8 +8009,11 @@ def push_writer_gaps(doc: dict) -> list[str]:
     gaps: list[str] = []
     assignments = condition_assignments(doc)
     holders = cache_writers(doc)
+    if warm is None:
+        warm = yaml.safe_load(CACHE_WARM_WORKFLOW.read_text())
+    warmed = warm_pushed_caches(warm)
     for cache in sorted(SHARED_KEY_CACHES):
-        pushed = False
+        pushed = cache in warmed
         for job_id in sorted(job for job, written in holders.items() if cache in written):
             condition = doc["jobs"][job_id].get("if") or "true == 'true'"
             try:
@@ -8209,10 +8243,10 @@ RUST_TEST_SHARDS = (
     ),
 )
 LEG_COMMANDS: tuple[tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]], ...] = (
-    (("rust-test",), ("push", "pull_request"), RUST_TEST_SHARDS),
+    (("rust-test",), ("merge_group", "pull_request"), RUST_TEST_SHARDS),
     (
         ("rust-test-macos",),
-        ("push", "pull_request"),
+        ("merge_group", "pull_request"),
         (
             "cargo test -p scp-transport --features combined,local-cache",
             (
@@ -8248,7 +8282,7 @@ LEG_COMMANDS: tuple[tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]], ..
     ),
     (
         ("rust-clippy",),
-        ("push", "pull_request"),
+        ("merge_group", "pull_request"),
         (
             (
                 f"cargo clippy --workspace --all-targets --features {CLIPPY_WORKSPACE_FEATURES} "
@@ -8301,11 +8335,11 @@ LEG_COMMANDS: tuple[tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]], ..
         ),
     ),
     # Job rust-test-optional-features, whose `group` axis runs the transport
-    # group's commands on one leg on push and on four legs otherwise. The table
-    # pins every command of every group, as the one-leg job ran them.
+    # group's commands on four legs. The table pins every command of every group,
+    # as the one-leg job ran them.
     (
         ("rust-test-optional-features",),
-        ("push", "pull_request"),
+        ("merge_group", "pull_request"),
         (
             'cargo test -p scp-transport --features combined,local-cache',
             "cargo nextest run --no-tests=fail -p scp-transport --features quic,http3,udp,coap,nostr,webrtc,push-store -E 'not (binary(nostr_roundtrip) | binary(webrtc_roundtrip) | test(/^nostr::/) | test(/^webrtc::/) | test(=quic::listener::tests::enabled_quic_listener_rejects_a_tier3_publish_with_4060) | test(=udp::listener::tests::enabled_udp_listener_rejects_a_tier3_publish_with_4060) | test(=webtransport::server::tests::enabled_webtransport_listener_rejects_a_tier3_publish_with_4060))'",
@@ -8681,19 +8715,10 @@ def check_push_runs_every_cache_writer(doc: dict) -> None:
     # The detector has to find the writers this workflow holds today, or the gap
     # check below passes over an empty set.
     for job_id in (
-        "bridge-parity-kotlin",
         "docker-image-cache",
-        "fuzz-build",
-        "kotlin-android-instrumented",
-        "kotlin-lint",
-        "kotlin-test",
         "napi-addon",
         "pyo3-module",
         "pyo3-module-macos",
-        "python-wheel-build",
-        "rust-clippy",
-        "rust-test-optional-features",
-        "typescript-wasm-check",
         "uniffi-cdylib-linux",
         "xcframework",
     ):
@@ -8719,11 +8744,70 @@ def check_push_runs_every_cache_writer(doc: dict) -> None:
     )
 
 
-def check_push_writer_mutants(doc: dict) -> None:
+# The rust-cache groups each job wrote on a push to `main` before
+# .github/workflows/cache-warm.yml took every cargo group over, by the step `if:`
+# naming the leg that wrote it. rust-test and rust-test-macos wrote none.
+PUSH_WRITER_SHAPE: dict[str, tuple[str, ...]] = {
+    "rust-clippy": ("clippy-examples",),
+    "rust-test": (),
+    "rust-test-macos": (),
+    "rust-test-optional-features": (
+        "transport-optional-node-relay",
+        "transport-optional-platform-testing",
+        "transport-optional-sqlite-without-memory-management",
+    ),
+}
+PUSH_GUARD = "github.event_name != 'push' && "
+
+
+def push_writer_shape(source: dict) -> dict:
+    """Rebuild the jobs PUSH_WRITER_SHAPE names as they ran while they wrote on push.
+
+    ci.yml now writes no cargo group on a push, so a writer detector given only the
+    live jobs has no rust-cache writer to read. This copy drops each job's push
+    guard and lets each named group's rust-cache step save on `main`, giving the
+    controls in check_push_writer_mutants the leg-gated and step-gated writers they
+    mutate.
+    """
+    rebuilt = copy.deepcopy(source)
+    for job_id, groups in PUSH_WRITER_SHAPE.items():
+        job = rebuilt["jobs"][job_id]
+        condition = str(job.get("if") or "")
+        if not condition.startswith(PUSH_GUARD):
+            raise ValueError(f"{job_id}'s `if:` does not start with the push guard: {condition!r}")
+        rest = condition[len(PUSH_GUARD) :]
+        if rest.startswith("(") and rest.endswith(")"):
+            rest = rest[1:-1]
+        job["if"] = rest
+        for step in job["steps"]:
+            if (
+                isinstance(step, dict)
+                and str(step.get("uses", "")) == RUST_CACHE_ACTION
+                and (step.get("with") or {}).get("shared-key") in groups
+            ):
+                step["with"]["save-if"] = "${{ github.ref == 'refs/heads/main' }}"
+    return rebuilt
+
+
+def check_push_writer_mutants(live: dict) -> None:
     """Each way of skipping a writer on push, or leaking a push skip, is reported."""
 
-    # ci.yml runs one literal leg list on every event: rust-test and rust-test-macos
-    # write no cache, and rust-clippy has no push-only leg. The controls on push-only
+    doc = push_writer_shape(live)
+    for job_id, groups in PUSH_WRITER_SHAPE.items():
+        check(
+            f"the rebuilt {job_id} writes {list(groups) or 'nothing'} and runs on push",
+            sorted(
+                name.split("`")[1]
+                for name in cache_writers(doc, shared=False).get(job_id, [])
+                if name.startswith("rust-cache")
+            )
+            == sorted(groups)
+            and "github.event_name" not in str(doc["jobs"][job_id].get("if")),
+            f"{doc['jobs'][job_id].get('if')!r} {cache_writers(doc).get(job_id)}",
+        )
+
+    # ci.yml runs one literal leg list on every event that runs these jobs, and no
+    # push runs them. The controls on push-only
     # legs and on leg-gated writers run against a rebuilt copy of the shape those
     # jobs had while a push-only leg wrote their group: the push list swaps the
     # absorbed legs for one push leg, every step that names only absorbed legs also
@@ -8793,13 +8877,14 @@ def check_push_writer_mutants(doc: dict) -> None:
         and not any("cannot decide" in gap for gap in gaps),
         f"{gaps}",
     )
+    # SCENARIOS records the live push guard, so dropping it disagrees.
     check(
-        "a push guard on writer rust-clippy disagrees with SCENARIOS",
+        "dropping rust-clippy's push guard disagrees with SCENARIOS",
         any(
-            "rust-only, push: rust-clippy skips" in found
-            for found in scenario_disagreements(guarded)
+            "rust-only, push: rust-clippy runs" in found
+            for found in scenario_disagreements(doc)
         ),
-        f"{scenario_disagreements(guarded)}",
+        f"{scenario_disagreements(doc)}",
     )
 
     shard = copy.deepcopy(test_writer)
@@ -9311,7 +9396,7 @@ def check_push_writer_mutants(doc: dict) -> None:
         f"{skipped_writers(writing)}",
     )
 
-    bun = copy.deepcopy(doc)
+    bun = copy.deepcopy(live)
     bun["jobs"]["error-codes"].setdefault("steps", []).append(
         {"uses": "oven-sh/setup-bun@v2"}
     )
@@ -9330,7 +9415,12 @@ def check_push_writer_mutants(doc: dict) -> None:
                     job["if"] = f"github.event_name != 'push' && ({guard})"
                 elif guard is None:
                     job["if"] = "github.event_name != 'push'"
-    gaps = push_writer_gaps(bun)
+    check(
+        "cache-warm.yml writes the setup-bun executable cache on every push to `main`",
+        "the setup-bun executable cache"
+        in warm_pushed_caches(yaml.safe_load(CACHE_WARM_WORKFLOW.read_text())),
+    )
+    gaps = push_writer_gaps(bun, warm={"on": {"push": {"branches": ["main"]}}, "jobs": {}})
     check(
         "no push running any setup-bun writer is reported",
         any("setup-bun executable cache and no push" in gap for gap in gaps),

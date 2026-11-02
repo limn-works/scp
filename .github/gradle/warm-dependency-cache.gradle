@@ -1,0 +1,20 @@
+// Gradle init script that cache-warm.yml's `gradle` job passes with `--init-script`.
+// It adds a `warmDependencyCache` task to every project, which resolves every resolvable
+// configuration leniently, so the Gradle user home that setup-gradle saves holds every
+// dependency any Kotlin job of ci.yml downloads: compile and runtime classpaths, and the
+// ktlint and detekt tool classpaths that no compile task resolves. It asserts nothing.
+// A configuration Gradle cannot resolve on its own, such as an Android variant without
+// its consumer attributes, contributes what it can and is skipped.
+allprojects {
+    tasks.register("warmDependencyCache") {
+        doLast {
+            project.configurations.findAll { it.canBeResolved }.each { configuration ->
+                try {
+                    configuration.incoming.artifactView { lenient = true }.files.files
+                } catch (Exception skipped) {
+                    logger.lifecycle("warmDependencyCache: ${project.path}:${configuration.name} not resolved: ${skipped.message}")
+                }
+            }
+        }
+    }
+}

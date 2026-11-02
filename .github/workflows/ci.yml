@@ -73,7 +73,7 @@ env:
 # compile the same crate graph into the same target directory read and write one entry.
 # `save-if` restricts writing to a push to `main`, whose entries every pull request and
 # every merge-queue run can read.
-# Seventeen groups exist per generation: seven written by this workflow, nine by
+# Seventeen groups exist per generation: sixteen written by
 # `.github/workflows/cache-warm.yml`, one by `.github/workflows/fuzz.yml`.
 #
 # WHAT THE KEY HOLDS. Every step restores through `./.github/actions/rust-cache`, never
@@ -162,8 +162,7 @@ env:
 # XCFramework 14.0 minutes against a missing entry). cache-warm.yml restores the group on
 # every push to `main`.
 #
-# Groups one job both writes and reads, each named by the job that writes it on a push
-# to `main`:
+# Groups one job reads, each written by the job of the same name in cache-warm.yml:
 #
 #   clippy-examples   `target/debug` under check mode, one package's dev-target feature
 #                     set at a time — rust-clippy's `examples` leg, which runs
@@ -180,8 +179,8 @@ env:
 #                     names, under the dev profile.
 #   android-x86_64-testing
 #                     `target/x86_64-linux-android/debug` under `--features testing` —
-#                     kotlin-android-instrumented, whose API 33 leg on `main` writes and
-#                     whose API 30 leg restores.
+#                     kotlin-android-instrumented, whose API 30 and API 33 legs restore
+#                     it.
 #
 # A rename abandons the entry `main` holds under the old name, so a group keeps its name
 # unless that entry holds a directory its members no longer read.
@@ -203,13 +202,19 @@ env:
 # WHICH JOB IN A GROUP WRITES. Exactly one, and every other member carries
 # `save-if: false`. The first job to reach its post step wins the upload and every later
 # job with the same key is told the entry exists, so leaving `save-if` at its default
-# would let the shortest job in a group decide the entry's contents. A group several
-# jobs read is written in cache-warm.yml, not by one of its readers, so a push to `main`
-# runs this workflow's legs exactly as a merge-queue run does: before, a push ran
-# push-only legs (`all`, `packages`, `transport`) that compiled every leg's commands in
-# one job to write the entry, and those legs set the push run's wall time (run
-# 41491195844: rust-test `all` 17.4 minutes, rust-clippy `packages` 13.6, macOS `all`
-# 13.4). Each cache-warm.yml job compiles only when its restore is not an exact match.
+# would let the shortest job in a group decide the entry's contents. Every group is
+# written in cache-warm.yml, never by one of its readers, and each cache-warm.yml job
+# compiles only when its restore is not an exact match.
+#
+# WHAT A PUSH TO `main` RUNS. Only the jobs that write a cache, and the jobs they need:
+# `changes`, the five bridge producers (whose bridge-artifact entries each pull request
+# and merge-queue run restores) and docker-image-cache. Every test, lint and gate job
+# carries `github.event_name != 'push'`, because the merge-queue run already ran it on
+# the tree that push lands, and job `ci` skips on a push. Before, a push re-ran every
+# job that wrote a group, and those set the push run's wall time (push run
+# 41521637198). Check `push runs` in scripts/check-workflow-compile-steps.py fails when
+# a job a push can run writes no cache and no writer needs it, or runs a command that is
+# not setup, compile or upload.
 #
 # WHAT IS DELIBERATELY LEFT OFF. `cache-workspace-crates` stays false. A checkout writes
 # every source file with the checkout's own mtime, which is newer than any cached
@@ -844,7 +849,7 @@ jobs:
   # it restores no cache.
   wiping-allocator:
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    if: github.event_name != 'push' && needs.changes.outputs.code == 'true'
     name: Wiping allocator (§9.15)
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -1628,7 +1633,7 @@ jobs:
   # runs on two legs of one event.
   rust-clippy:
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: github.event_name != 'push' && needs.changes.outputs.rust == 'true'
     name: Rust / clippy (${{ matrix.leg }})
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -1683,7 +1688,7 @@ jobs:
         if: matrix.leg == 'examples'
         with:
           shared-key: clippy-examples
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: false
       # Writes the `clippy-packages` group: each `-p` command below resolves features
       # over one package's subgraph under the features it names. Only the push leg
       # `packages` writes it; the six pull-request legs restore it.
@@ -1880,7 +1885,7 @@ jobs:
   # writes it with each leg's dependency builds.
   rust-test:
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: github.event_name != 'push' && needs.changes.outputs.rust == 'true'
     name: Rust / test (${{ matrix.leg }})
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -2091,7 +2096,7 @@ jobs:
   # when a command runs on two legs of one event.
   rust-test-optional-features:
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: github.event_name != 'push' && needs.changes.outputs.rust == 'true'
     name: Rust / test (optional features, ${{ matrix.group }})
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -2111,17 +2116,17 @@ jobs:
         if: matrix.group == 'node-relay'
         with:
           shared-key: transport-optional-node-relay
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: false
       - uses: ./.github/actions/rust-cache
         if: matrix.group == 'platform-testing'
         with:
           shared-key: transport-optional-platform-testing
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: false
       - uses: ./.github/actions/rust-cache
         if: matrix.group == 'sqlite-without-memory-management'
         with:
           shared-key: transport-optional-sqlite-without-memory-management
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: false
       # Only the push leg `transport` writes this entry; the four pull-request
       # transport legs restore it.
       - uses: ./.github/actions/rust-cache
@@ -2267,8 +2272,8 @@ jobs:
       # allocates a bulk block. The default build defines it, so only a build
       # that undefines it shows the refusal comes from the real compile-option
       # query and not a constant. This group compiles the bundled SQLCipher
-      # with the option undefined, in a target directory of its own so no
-      # other build or cache sees that SQLite, and runs the crate's one ignored
+      # with the option undefined, under a cache group of its own so no other
+      # job restores that SQLite, and runs the crate's one ignored
       # test, which asserts that `open` and `open_in_memory` refuse with
       # `PageCacheBulkPossible`. Selecting only that test leaves out
       # page_cache_rollback.rs, which fails in this build by design.
@@ -2276,7 +2281,6 @@ jobs:
         if: matrix.group == 'sqlite-without-memory-management'
         env:
           LIBSQLITE3_FLAGS: -USQLITE_ENABLE_MEMORY_MANAGEMENT
-          CARGO_TARGET_DIR: ${{ runner.temp }}/target-without-memory-management
         run: cargo nextest run --no-tests=fail -p scp-sqlite-pools --lib --run-ignored only -E 'test(=tests::open_refuses_a_sqlite_built_without_memory_management)'
       - name: Run platform and scp-testing tests
         if: matrix.group == 'platform-testing'
@@ -2364,7 +2368,7 @@ jobs:
   # a command runs on two legs of one event.
   rust-test-macos:
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: github.event_name != 'push' && needs.changes.outputs.rust == 'true'
     name: Rust / test (macos-latest, ${{ matrix.leg }})
     runs-on: macos-latest
     timeout-minutes: 45
@@ -3960,8 +3964,9 @@ jobs:
   python-wheel-build:
     needs: changes
     if: >-
-      needs.changes.outputs.rust == 'true' ||
-      needs.changes.outputs.python == 'true'
+      github.event_name != 'push' &&
+      (needs.changes.outputs.rust == 'true' ||
+      needs.changes.outputs.python == 'true')
     name: Python / wheel (vendored OpenSSL)
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -3979,7 +3984,7 @@ jobs:
       - uses: ./.github/actions/rust-cache
         with:
           shared-key: python-wheel
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: false
       - uses: ./.github/actions/cargo-fetch
       - name: Install maturin
         run: python3.12 -m pip install 'maturin>=1.0,<2.0'
@@ -4159,7 +4164,7 @@ jobs:
   # ── TypeScript (wasm tier) ──────────────────────────────────────────
   typescript-wasm-check:
     needs: changes
-    if: needs.changes.outputs.typescript-wasm == 'true'
+    if: github.event_name != 'push' && needs.changes.outputs.typescript-wasm == 'true'
     name: TypeScript-wasm / build + check + lint + guards + test
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -4286,10 +4291,14 @@ jobs:
   # ── Kotlin ──────────────────────────────────────────────────────────
   kotlin-lint:
     needs: changes
-    if: needs.changes.outputs.kotlin == 'true'
+    if: github.event_name != 'push' && needs.changes.outputs.kotlin == 'true'
     name: Kotlin / lint + format
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # cache-warm.yml's `gradle` job writes the Gradle home this job restores; its
+    # comment says why every Kotlin job shares this key.
+    env:
+      GRADLE_BUILD_ACTION_CACHE_KEY_JOB: kotlin
     defaults:
       run:
         working-directory: bindings/kotlin
@@ -4352,6 +4361,8 @@ jobs:
           echo -e "\ne7ce8e93e13705710e8a1b7fdea3c49f149b1386" > "$ANDROID_HOME/licenses/mips-android-sysimage-license"
       - run: sdkmanager "platforms;android-35"
       - uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: true
       # `ktlintCheck`, not `runKtlintCheckOverMainSourceSet`: the `runKtlint*`
       # tasks only write the report and exit 0 whatever it lists; the
       # ktlint-gradle plugin fails the build in the `ktlint*SourceSetCheck`
@@ -4682,12 +4693,17 @@ jobs:
     # on every change it ran on when this job was also the producer.
     needs: [changes, uniffi-cdylib-linux]
     if: >-
-      needs.changes.outputs.python == 'true' ||
+      github.event_name != 'push' &&
+      (needs.changes.outputs.python == 'true' ||
       needs.changes.outputs.kotlin == 'true' ||
-      needs.changes.outputs.rust == 'true'
+      needs.changes.outputs.rust == 'true')
     name: Kotlin / test
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # cache-warm.yml's `gradle` job writes the Gradle home this job restores; its
+    # comment says why every Kotlin job shares this key.
+    env:
+      GRADLE_BUILD_ACTION_CACHE_KEY_JOB: kotlin
     steps:
       - name: Free disk space when the runner is short of it
         run: |
@@ -4773,6 +4789,8 @@ jobs:
       - uses: ./.github/actions/rust-toolchain
       - uses: ./.github/actions/cargo-fetch
       - uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: true
       - name: Run tests
         working-directory: bindings/kotlin
         env:
@@ -4859,10 +4877,14 @@ jobs:
   # artifact can carry the testing build.
   kotlin-android-instrumented:
     needs: [changes, uniffi-cdylib-linux]
-    if: needs.changes.outputs.kotlin == 'true'
+    if: github.event_name != 'push' && needs.changes.outputs.kotlin == 'true'
     name: Kotlin / instrumented (API ${{ matrix.api-level }})
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # cache-warm.yml's `gradle` job writes the Gradle home this job restores; its
+    # comment says why every Kotlin job shares this key.
+    env:
+      GRADLE_BUILD_ACTION_CACHE_KEY_JOB: kotlin
     strategy:
       fail-fast: false
       matrix:
@@ -4940,7 +4962,7 @@ jobs:
       - uses: ./.github/actions/rust-cache
         with:
           shared-key: android-x86_64-testing
-          save-if: ${{ github.ref == 'refs/heads/main' && matrix.api-level == 33 }}
+          save-if: false
       - uses: ./.github/actions/cargo-fetch
       - name: Build the UniFFI cdylib for the emulator
         run: |
@@ -4958,6 +4980,8 @@ jobs:
             exit 1
           fi
       - uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: true
       # The emulator cold-boots: `-no-snapshot` neither loads nor saves a snapshot, and
       # `force-avd-creation` builds a fresh AVD. The runner treats
       # `getprop sys.boot_completed` == 1 as ready and then sends
@@ -5087,7 +5111,7 @@ jobs:
   # crate uses libFuzzer internals.
   fuzz-build:
     needs: changes
-    if: needs.changes.outputs.fuzz == 'true'
+    if: github.event_name != 'push' && needs.changes.outputs.fuzz == 'true'
     name: Fuzz / build check
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -5106,7 +5130,7 @@ jobs:
         with:
           workspaces: "fuzz -> target"
           shared-key: fuzz
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: false
       - uses: ./.github/actions/cargo-fetch
         with:
           working-directory: fuzz
@@ -5313,12 +5337,17 @@ jobs:
     # that task would rebuild the crate whatever the download placed in `target/debug`.
     needs: [changes, pyo3-module, uniffi-cdylib-linux]
     if: >-
-      needs.changes.outputs.python == 'true' ||
+      github.event_name != 'push' &&
+      (needs.changes.outputs.python == 'true' ||
       needs.changes.outputs.kotlin == 'true' ||
-      needs.changes.outputs.rust == 'true'
+      needs.changes.outputs.rust == 'true')
     name: Cross-bridge runtime parity (UniFFI Kotlin)
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # cache-warm.yml's `gradle` job writes the Gradle home this job restores; its
+    # comment says why every Kotlin job shares this key.
+    env:
+      GRADLE_BUILD_ACTION_CACHE_KEY_JOB: kotlin
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v5
@@ -5329,6 +5358,8 @@ jobs:
           distribution: zulu
           java-version: "17"
       - uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: true
       - name: Download PyO3 native module
         uses: actions/download-artifact@v4
         with:
@@ -5594,7 +5625,7 @@ jobs:
   # scripts/tests/ci-gate/ci_gate_selftest.py reports a cache writer, or a job a
   # writer needs, that a push would skip.
   ci:
-    if: always()
+    if: always() && github.event_name != 'push'
     needs:
       - check-draft
       - changes

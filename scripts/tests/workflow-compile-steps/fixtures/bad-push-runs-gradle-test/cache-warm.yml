@@ -1,0 +1,33 @@
+name: Cache warm
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  workspace-debug:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - id: cache
+        uses: ./.github/actions/rust-cache
+        with:
+          shared-key: workspace-debug
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@nextest
+      - if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          cargo nextest run --no-run -p a --features x
+          cargo test -p a --doc -- --list
+          cargo clippy -p a
+          cargo build -p a
+  gradle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+      - working-directory: bindings/kotlin
+        run: ./gradlew --init-script ../../warm.gradle warmDependencyCache :a:testClasses :a:jar :a:test

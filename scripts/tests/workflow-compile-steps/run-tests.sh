@@ -33,11 +33,24 @@
 #     not, a reader that compiles in check mode against a build-mode writer, a reader
 #     whose command names a shell variable its script never sets, a reader whose
 #     CARGO_* environment differs from the writer's, and a group whose only writer sits
-#     in a workflow no push or schedule on main starts. It passes a reader whose
-#     commands the writers of the groups it restores compile, on the same OS family.
+#     in a workflow no push or schedule on main starts, including one a push starts
+#     only for tags. It fails a group whose reader runs on merge-queue runs and that only
+#     a schedule writes, and a compile-only twin script whose cargo commands differ
+#     from the gate script it stands in for. It passes a reader whose commands the
+#     writers of the groups it restores compile, on the same OS family, and a reader
+#     running `cargo test --doc` against a writer running it with `-- --list`.
+#   * Check 4 (push runs) fails a job a push runs that writes no cache and that no
+#     writer needs, a writer that runs tests (`cargo nextest run` without `--no-run`,
+#     `wasm-pack test` without `-- --list`, a Gradle `test` task), one that lints with
+#     `-- -D warnings`, one that runs a repository gate script, one that uses an action
+#     outside setup, cache, upload and build, and a companion job whose `if:` differs
+#     from the job it accompanies. It passes a push that runs only a producer, the job
+#     it needs, check-draft beside `changes`, and a cache-warm workflow that compiles
+#     every reader's command.
 #
 # Each case is a directory under ./fixtures/ that the check reads through
-# `--workflows-dir`. Exit 0 when every case matches its expectation, 1 otherwise.
+# `--workflows-dir`, and through `--repo-root` from the case's `repo/` directory when it
+# has one. Exit 0 when every case matches its expectation, 1 otherwise.
 
 set -euo pipefail
 
@@ -79,6 +92,18 @@ FIXTURES=(
     "bad-cache-reader-env-differs"
     "bad-cache-writer-never-triggered"
     "bad-cache-writer-step-output-gated"
+    "bad-cache-no-push-writer"
+    "bad-cache-writer-tags-only-push"
+    "bad-script-twin-differs"
+    "good-push-runs"
+    "bad-push-runs-gate-job"
+    "bad-push-runs-test"
+    "bad-push-runs-clippy-deny"
+    "bad-push-runs-wasm-test"
+    "bad-push-runs-gate-script"
+    "bad-push-runs-gradle-test"
+    "bad-push-runs-unknown-action"
+    "bad-push-runs-companion-if"
 )
 EXPECTED_EXITS=(
     "0"
@@ -96,6 +121,18 @@ EXPECTED_EXITS=(
     "1"
     "1"
     "1"
+    "1"
+    "1"
+    "1"
+    "1"
+    "1"
+    "1"
+    "1"
+    "1"
+    "1"
+    "1"
+    "1"
+    "0"
     "1"
     "1"
     "1"
@@ -129,6 +166,18 @@ EXPECTED_SUBSTRINGS=(
     "restore under different values of CARGO_PROFILE_DEV_DEBUG"
     "no leg writes it on a run of refs/heads/main that a push or a schedule starts"
     "the rust-cache step writing group 'workspace-debug' waits on an earlier step's output"
+    "no leg writes it on a push to refs/heads/main"
+    "cache group 'release': no leg writes it on a run of refs/heads/main"
+    "stands in for scripts/check-examples-compile.sh in every cache-group writer"
+    "OK: 5 job(s) a push to refs/heads/main can run"
+    "job lint can run on a push to refs/heads/main, writes no cache"
+    "\`cargo nextest run -p a --features x\` is a cargo command that runs tests or lints"
+    "\`cargo clippy -p a -- -D warnings\` is a cargo command that runs tests or lints"
+    "\`wasm-pack test --node crates/a\` runs wasm tests"
+    "\`bash scripts/check-examples-compile.sh\` runs \`bash\`, which this check does not know"
+    "runs Gradle task(s) :a:test that are not compile"
+    "uses actions/download-artifact@v4 on a push"
+    "job check-draft runs on a push as the companion of job changes"
 )
 
 passed=0
@@ -146,8 +195,12 @@ for i in "${!FIXTURES[@]}"; do
         continue
     fi
 
+    args=(--workflows-dir "$fixture_root")
+    if [[ -d "$fixture_root/repo" ]]; then
+        args+=(--repo-root "$fixture_root/repo")
+    fi
     set +e
-    output="$("$PYTHON" "$CHECK" --workflows-dir "$fixture_root" 2>&1)"
+    output="$("$PYTHON" "$CHECK" "${args[@]}" 2>&1)"
     actual_exit=$?
     set -e
 
