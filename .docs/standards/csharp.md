@@ -70,7 +70,8 @@ public class IdentityTests
     [Fact]
     public async Task CreateAsync_ReturnsIdentityWith32ByteIdentifier()
     {
-        var identity = await Identity.CreateAsync(custody: "in_memory");
+        await using var scp = await Scp.CreateAsync(EncryptedTestStorage());
+        var identity = (await scp.IdentityCreateAsync(TestIdentityConfig(), signers)).Identity;
         // 09-security-model.md §9.7.4.2 R13
         identity.Identifier.Should().HaveCount(32);
     }
