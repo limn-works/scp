@@ -107,6 +107,7 @@ context/{context_id}/event_meta/count
 context/{context_id}/event_meta/root
 context/{context_id}/event_tree/{level}/{index}
 context/{context_id}/merkle_event_log/head
+context/{context_id}/merkle_event_log/g{gen:020d}/prefix
 context/{context_id}/merkle_event_log/g{gen:020d}/{base_seq:020d}
 context/{context_id}/outlet/{outlet_id}
 context/{context_id}/outlet_session/{session_id}
@@ -192,17 +193,18 @@ The decoder refuses, and never substitutes a default for, a value with an unknow
 
 **Event data payloads.** The `event/{seq:020d}` key stores only the 32-byte SHA-256 leaf hash for Merkle tree verification. The `event_data/{seq:020d}` key stores the full MessagePack-serialized `Event` struct (event type, actor DID, timestamp, sequence, payload, prev_hash, signature). This dual-key design preserves the compact Merkle tree structure while enabling event replay and query without transport-layer round-trips. Events persisted before the `event_data/` key convention was introduced will have hash-only entries; `load_event_data` returns `None` for these (backward compatible).
 
-**Merkle event log entries.** The `MerkleEventLogProvider` stores each context's event log under `merkle_event_log/` in two kinds of key, and each value is a MessagePack `StoredValue`:
+**Merkle event log entries.** The `MerkleEventLogProvider` stores each context's event log under `merkle_event_log/` in three kinds of key, and each value is a MessagePack `StoredValue`:
 
-- `merkle_event_log/head` holds the current generation number `gen` and the log's length `len`, the total number of entries in the log.
+- `merkle_event_log/head` holds the current generation number `gen` and the log's length `len`, the number of leaves in the log, counting the leaves a prune removed.
+- `merkle_event_log/g{gen:020d}/prefix` holds the prefix record of a log that a prune shortened ("Pruning keeps the root" below). A log that no prune has shortened has no prefix record, and its prefix count p is 0.
 - `merkle_event_log/g{gen:020d}/{base_seq:020d}` holds one unit: a `Vec<EventLogEntry>` of one or more entries, whose first entry has sequence `base_seq`.
 
 Every write relies on one property that every `Storage` backend has: a put of a single key is atomic. No write relies on a multi-key batch. `FilesystemStorage` is atomic per key only, so a batch there would need an intent journal. `SyncableStorage::apply_changeset` replays a peer's keys one at a time, so a batch that was atomic on its source is not atomic on a replica.
 
 - **Append** puts one unit under the generation that `head` names, and then puts `head` with `len` raised by the unit's entry count. The unit's `base_seq` must equal `head`'s `len`; any other `base_seq` returns `StoreError::EventLogUnitMisaligned`. A crash between the two puts leaves a unit that starts at `len`, which load ignores, so a crash leaves either every entry of the unit or none of them. The next append puts its unit at the same `len`, so it overwrites that unit. When no `head` exists, an append is a replace with that one unit, and the unit's `base_seq` must be 0.
-- **Replace** (prune, import, and init over an existing log) deletes any keys left under generation `gen + 1` (generation 0 when no `head` exists), writes every unit of the new log under that generation, and then puts `head` naming that generation and the new log's length. The `head` put is the commit point: a failure before it leaves the old log in place, and a failure after it leaves the new log in place. Replace then deletes the old generation best-effort, because the next load deletes every generation below `head`'s.
+- **Replace** (prune, import, and init over an existing log) deletes any keys left under generation `gen + 1` (generation 0 when no `head` exists), writes the new log's prefix record, when the new log has one, and every unit of the new log under that generation, and then puts `head` naming that generation and the new log's length. The `head` put is the commit point: a failure before it leaves the old log in place, and a failure after it leaves the new log in place. Replace then deletes the old generation best-effort, because the next load deletes every generation below `head`'s.
 - **Destroy** deletes `head` first, which removes the log, and then deletes the generations best-effort.
-- **Load** reads `head`. When no `head` exists, the context has no log, and load returns none and deletes nothing. Otherwise load reads the units under generation `gen` in key order. A unit that starts at or beyond `len` is not part of the log: an append that crashed before its `head` put left it, or another writer's append is still in flight. Load ignores it and never deletes it. The next append at `len` overwrites it, and a replace's generation cleanup removes it. Each other unit's `base_seq` must equal the number of entries in the units before it, and a gap or an overlap returns the typed error `StoreError::EventLogUnitMisaligned`. The units' entries must total `len`, and any other total, such as a missing tail unit, returns the typed error `StoreError::EventLogLengthMismatch`. Load never returns a truncated log. An empty unit, or a unit key whose `base_seq` does not parse, returns a deserialization error. Load deletes, best-effort, every generation below `gen`. It leaves a generation above `gen` in place, because that generation can be a replace still in flight, from another process or on a replica that has not yet received its `head`.
+- **Load** reads `head`. When no `head` exists, the context has no log, and load returns none and deletes nothing. Otherwise load reads the prefix record, when generation `gen` holds one, and the units under generation `gen` in key order. A prefix record that fails a check of "Pruning keeps the root" below returns the typed error `StoreError::EventLogPrefixInvalid`. A unit that starts at or beyond `len` is not part of the log: an append that crashed before its `head` put left it, or another writer's append is still in flight. Load ignores it and never deletes it. The next append at `len` overwrites it, and a replace's generation cleanup removes it. Each other unit's `base_seq` must equal p plus the number of entries in the units before it, and a gap or an overlap returns the typed error `StoreError::EventLogUnitMisaligned`. The units' entries must total `len` − p, and any other total, such as a missing tail unit, returns the typed error `StoreError::EventLogLengthMismatch`. Load never returns a truncated log. An empty unit, or a key other than `prefix` whose `base_seq` does not parse, returns a deserialization error. Load deletes, best-effort, every generation below `gen`. It leaves a generation above `gen` in place, because that generation can be a replace still in flight, from another process or on a replica that has not yet received its `head`.
 
 The `MerkleEventLogProvider` serializes the writes to one context with a per-context write gate, so an append never lands in a generation that a concurrent replace is retiring. Every path that removes a context's log from the provider releases that context's gate, and so does a write that fails because the context has no log in memory.
 
@@ -220,7 +222,47 @@ Shutdown releases each context's in-memory log and write gate and touches no sto
 
 Restore loads the stored log and fails closed. It starts an empty log only when load returns none. A load error fails the restore with that error and leaves the stored log unchanged; restore never puts an empty log in memory over a stored `head`, because the next append would then overwrite stored units. A restore refuses before it loads the log when the context already has an actor. A restore that loaded the log and then fails before the context's actor spawns releases the in-memory log and the write gate the same way shutdown does.
 
-Prune re-chains the retained tail as a new log. The first retained entry gets sequence 0 and the `prev_hash` `GENESIS_PREV_HASH`, each later entry chains to the one before it, and every other field of each entry is kept. The pruned log therefore verifies from genesis like any other log, and its Merkle root differs from the root before the prune. See §9.9, #636, #710.
+**Pruning keeps the root.** A prune removes the first p leaves of a context's log, where p is at most the `event_count` of the latest checkpoint the member verified (ADR-030, "Pruning Strategies", pruning invariant 1). The prune keeps the RFC 6962 Merkle root over all `len` leaves unchanged. It keeps every later entry as it was, its `sequence` and `prev_hash` included, and writes a prefix record in place of the removed leaves; no prune renumbers or re-chains a retained entry. The pruned log's count, Merkle root, and last leaf hash therefore equal those of a member that never pruned. Rule 14 of `05-contexts.md` §5.13.3 requires that equality, because an importer and a restorer check the log they hold against the committed `log_head_hash`. The `09-security-model.md` §9.9.3 equivocation detector also requires it, because it compares the Merkle roots of two members at equal event counts.
+
+**Prefix record.** The value of `merkle_event_log/g{gen:020d}/prefix` is the `rmp_serde` encoding of `EventLogPrefix`, a positional array, as the units encode their entries:
+
+```rust
+pub struct EventLogPrefix {
+    /// p, the number of leaves the prunes removed; at least 1.
+    pub prefix_count: u64,
+    /// The leaf hash of leaf p − 1.
+    pub last_leaf_hash: [u8; 32],
+    /// The compact range of leaves 0 to p − 1, largest subtree first.
+    pub compact_range: Vec<[u8; 32]>,
+    /// The leaves below p that ADR-030 pruning invariants 3 and 6 keep,
+    /// in sequence order.
+    pub kept: Vec<KeptLeaf>,
+}
+
+pub struct KeptLeaf {
+    /// The removed entry, encoded as a unit encodes an entry.
+    pub entry: EventLogEntry,
+    /// Sibling hashes from the entry's leaf up to the root of the
+    /// compact-range subtree that covers it, lowest first.
+    pub path: Vec<[u8; 32]>,
+}
+```
+
+- **Compact range.** `compact_range` holds one subtree hash for each bit set in p, from the highest set bit to the lowest. The subtree for set bit j covers the 2^j leaves that start at the sum of the bits of p above j, and its hash is the RFC 6962 hash of those leaves (RFC 6962 §2.1). For p = 7 the three subtrees cover leaves 0 to 3, leaves 4 and 5, and leaf 6. Vector 89 in `25-test-vectors.md` §25.8 gives the compact range for p = 1, 2, 3, 7, and 8.
+- **Kept leaves.** `kept` holds every `Checkpoint` leaf below p, which ADR-030 pruning invariant 3 keeps, and the latest TTL leaf when it lies below p, which pruning invariant 6 keeps. A leaf that covers a subtree of 2^j leaves has a `path` of j hashes. At step t of the path, bit t of the leaf's offset inside its subtree sets the order: a clear bit hashes SHA-256(0x01 ‖ node ‖ sibling), and a set bit hashes SHA-256(0x01 ‖ sibling ‖ node). A prune that raises p computes each kept leaf's path inside the subtree of the new compact range that covers it, and drops a leaf that neither invariant keeps any more.
+- **Checks.** Load refuses with `StoreError::EventLogPrefixInvalid` a record whose `prefix_count` is 0 or exceeds `len`; whose `compact_range` holds a number of hashes other than the number of bits set in p; whose last compact-range hash differs from `last_leaf_hash` when p is odd; whose `kept` is out of sequence order, repeats a sequence, or holds a sequence of p or more; or whose kept leaf has a path of the wrong length, or a path that does not lead from the entry's leaf hash to its subtree's hash. Load also refuses, with the same error, a log whose entry at sequence p carries a `prev_hash` other than `last_leaf_hash`.
+
+**Root and append over a pruned log.** The log computes its root at a size m from p to `len` from the compact range and the retained entries. It starts with the compact-range subtrees and adds the leaf of each entry from sequence p to m − 1 as a one-leaf subtree. After each addition, while the last two subtrees cover equal numbers of leaves, it merges them into SHA-256(0x01 ‖ left ‖ right). The subtrees it then holds are the compact range of leaves 0 to m − 1. It folds them from the right: for subtrees s_0 to s_k, the root is s_k when k is 0, and otherwise SHA-256(0x01 ‖ s_0 ‖ the fold of s_1 to s_k). The fold equals the RFC 6962 root of the first m leaves. An append to a pruned log sets the new entry's `prev_hash` to the leaf hash of leaf `len` − 1 and computes the new root by the same rule. The root after the append therefore equals the root that the same append gives on a log that never pruned.
+
+**Proofs over a pruned log.** The log hashes a node of the RFC 6962 tree that covers leaves a to b − 1 in three cases. When the node is a compact-range subtree, the log reads the subtree's stored hash. When a is p or more, the log hashes the leaves of the retained entries. When a is the first leaf of a compact-range subtree and b is p or more, the log applies the root rule above to that subtree, the compact-range subtrees after it, and the leaves of the retained entries before b. These three cases hash every node of three kinds of proof:
+
+- the RFC 6962 §2.1.1 inclusion proof of a leaf at p or after, against any size up to `len` that includes the leaf;
+- the inclusion proof of a kept leaf against any size from p to `len`, whose first hashes are the kept leaf's `path` and whose later nodes fall in the three cases;
+- the RFC 6962 §2.1.2 consistency proof from a size m1 to a size m2, where p ≤ m1 ≤ m2 ≤ `len`.
+
+The log refuses every other request: the inclusion proof of a removed leaf that `kept` does not hold, a root at a size below p, and a consistency proof from a size below p. It returns a typed error that names p, and it never answers against a root other than the one requested. A member that never removed those leaves can serve such a proof (ADR-030 pruning invariant 4).
+
+**A rebuilt log is a pruned log.** A member that rebuilds its log from a checkpoint (ADR-030, "State Reconstruction from Checkpoints") stores a log whose prefix record holds the compact range of the checkpoint's first `event_count` leaves, and whose units hold the `Checkpoint` leaf and every leaf after it.
 
 **Nonce keys.** UCAN nonce replay prevention uses `context/{context_id}/nonce/{SHA256(nonce_string)}` — the nonce string is hashed to a fixed-length key. The value stores `(first_seen_timestamp, token_expiry_timestamp)` for pruning. The `exists()` method enables O(1) replay checks without deserializing.
 

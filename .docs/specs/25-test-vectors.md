@@ -446,6 +446,60 @@ Root: SHA-256(0x01 || interior_L || interior_R)
     = 0x5c8dc617d287a4297eb2bcb81b37644b5138e57ad461c657db152109e3fc9fca
 ```
 
+### Vector 89: Compact Range of a Pruned Prefix (§17.3)
+
+The prefix record of a log pruned to p leaves holds the compact range of leaves 0 to p − 1: one subtree hash for each bit set in p, largest subtree first (`17-persistence-and-storage.md` §17.3, "Prefix record"). The fold of the compact range from the right, `r = SHA-256(0x01 || c_i || r)`, equals the RFC 6962 root of the first p leaves. Appending leaf p adds a one-leaf subtree and merges the last two subtrees while they cover equal leaf counts, and the fold of the result equals the root of the first p + 1 leaves. The data leaves continue those of Vectors 18 and 19, `"A"` (0x41) to `"I"` (0x49), and each `[a, b)` below covers leaves a to b − 1. Every hash below was computed by the `scp-event-log` crate's RFC 6962 tree (`EventLog::push_leaf_raw` and `tree::root`), and the fold and append results were checked against the crate's root over the full prefix.
+
+```
+Leaf 5: SHA-256(0x00 || 0x45) = 0x6a8fd6b98e6e602358b45ef3d81dd9fab39900137bed7c806a2fd18fd1701ec9
+Leaf 6: SHA-256(0x00 || 0x46) = 0xc02b4bb4ab96197a9a5a4537d8b87f27c1c8f3f9572d215c505c5f3339ee4399
+Leaf 7: SHA-256(0x00 || 0x47) = 0x81904e68a8b9a2427e9e87e2c61b1098057608d18357d70d9281e8513941cf53
+Leaf 8: SHA-256(0x00 || 0x48) = 0x4d2ae2d6e0000b72a5739078e0e83bc029b6232edabff84d012acd1d4803db51
+Leaf 9: SHA-256(0x00 || 0x49) = 0x8b218b1d3c571d7f8f754bcac93c85e9abf4a384dadd24abce3cd2d3755ace66
+
+p = 1
+  compact_range:  [0, 1) = 0xc00b4d3c929cb5cc316691ed4636f634576f2c9b2954767234c5274e9dde185d
+  last_leaf_hash:          0xc00b4d3c929cb5cc316691ed4636f634576f2c9b2954767234c5274e9dde185d
+  root(1) = fold:          0xc00b4d3c929cb5cc316691ed4636f634576f2c9b2954767234c5274e9dde185d
+  append "B":     [0, 2) = 0xed692f01f7f6c46930d7ad8f9adad3f9f38b7379cf6a8d2f399a0ba1e914fe25
+  root(2):                 0xed692f01f7f6c46930d7ad8f9adad3f9f38b7379cf6a8d2f399a0ba1e914fe25
+
+p = 2
+  compact_range:  [0, 2) = 0xed692f01f7f6c46930d7ad8f9adad3f9f38b7379cf6a8d2f399a0ba1e914fe25
+  last_leaf_hash:          0x87afe6086fe4571e37657e76281301f189c75ebae1d2eaafb56d578067a1d95e
+  root(2) = fold:          0xed692f01f7f6c46930d7ad8f9adad3f9f38b7379cf6a8d2f399a0ba1e914fe25
+  append "C":     [0, 2) = 0xed692f01f7f6c46930d7ad8f9adad3f9f38b7379cf6a8d2f399a0ba1e914fe25
+                  [2, 3) = 0xb563a5e69628743929eddec0ccfeb0745c39577e12a72e84915edd6633cb97f2
+  root(3):                 0x961d2e2be20f538ffdf56962a86d1bd165498f222684ee4c5e02c1e9f852adc5
+
+p = 3
+  compact_range:  [0, 2) = 0xed692f01f7f6c46930d7ad8f9adad3f9f38b7379cf6a8d2f399a0ba1e914fe25
+                  [2, 3) = 0xb563a5e69628743929eddec0ccfeb0745c39577e12a72e84915edd6633cb97f2
+  last_leaf_hash:          0xb563a5e69628743929eddec0ccfeb0745c39577e12a72e84915edd6633cb97f2
+  root(3) = fold:          0x961d2e2be20f538ffdf56962a86d1bd165498f222684ee4c5e02c1e9f852adc5
+  append "D":     [0, 4) = 0x5c8dc617d287a4297eb2bcb81b37644b5138e57ad461c657db152109e3fc9fca
+  root(4):                 0x5c8dc617d287a4297eb2bcb81b37644b5138e57ad461c657db152109e3fc9fca
+
+p = 7
+  compact_range:  [0, 4) = 0x5c8dc617d287a4297eb2bcb81b37644b5138e57ad461c657db152109e3fc9fca
+                  [4, 6) = 0x0cf787b60da0e474cd87dcbb091f118e364a9a7ceb481845c6b414e98020afe9
+                  [6, 7) = 0x81904e68a8b9a2427e9e87e2c61b1098057608d18357d70d9281e8513941cf53
+  last_leaf_hash:          0x81904e68a8b9a2427e9e87e2c61b1098057608d18357d70d9281e8513941cf53
+  root(7) = fold:          0x316cc65a242cdebb8795b5d051b4912380e76ed2e4e64dae44a5fd04e7251951
+  append "H":     [0, 8) = 0xb13f019bd17bf7371b2ac2427a7c3780cab6c4281ff23af529f2ab2e6030cfae
+  root(8):                 0xb13f019bd17bf7371b2ac2427a7c3780cab6c4281ff23af529f2ab2e6030cfae
+
+p = 8
+  compact_range:  [0, 8) = 0xb13f019bd17bf7371b2ac2427a7c3780cab6c4281ff23af529f2ab2e6030cfae
+  last_leaf_hash:          0x4d2ae2d6e0000b72a5739078e0e83bc029b6232edabff84d012acd1d4803db51
+  root(8) = fold:          0xb13f019bd17bf7371b2ac2427a7c3780cab6c4281ff23af529f2ab2e6030cfae
+  append "I":     [0, 8) = 0xb13f019bd17bf7371b2ac2427a7c3780cab6c4281ff23af529f2ab2e6030cfae
+                  [8, 9) = 0x8b218b1d3c571d7f8f754bcac93c85e9abf4a384dadd24abce3cd2d3755ace66
+  root(9):                 0x9a439556481fe15c7885286c21302d6c512d7c997d000dc2fd6fe5114076133a
+```
+
+A pruned log that holds the p = 7 compact range and the entry for leaf `"H"` gives root(8), the root the unpruned eight-leaf log gives, and the entry for `"H"` carries `prev_hash` = the p = 7 `last_leaf_hash`.
+
 Note: The vectors above use abstract `data` leaves to pin the RFC 6962 tree construction itself (leaf/interior domain prefixes, unbalanced promotion). The typed-leaf and checkpoint vectors below pin the *typed* leaf preimage and the checkpoint root.
 
 ### Vector 32: Typed-Leaf KAT (closed `EventType` taxonomy)
