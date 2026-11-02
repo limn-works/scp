@@ -60,6 +60,7 @@ pub mod credential;
 pub mod encrypt;
 pub mod epoch_grace;
 pub mod error;
+pub mod governance_leaf_block;
 pub mod group;
 pub mod key_package;
 pub mod keypackage_attestation;
@@ -78,7 +79,15 @@ pub use convergent_timestamp::{
 };
 pub use credential::ScpCredential;
 pub use encrypt::{DecryptedContent, InboundChange};
-pub use error::{MlsError, SignerDefect};
+pub use error::{GovernanceLeafBlockError, MlsError, SignerDefect};
+pub use governance_leaf_block::{
+    BlockBinding, COMMIT_PADDING_MULTIPLE, GOVERNANCE_LEAF_BLOCK_LEN, GOVERNANCE_LEAF_BLOCK_MAGIC,
+    GOVERNANCE_LEAF_BLOCK_VERSION, GOVERNANCE_LEAF_CIPHERTEXT_LEN, GOVERNANCE_LEAF_EXPORTER_LABEL,
+    GOVERNANCE_LEAF_HEADER_LEN, GOVERNANCE_LEAF_KEY_LEN, GOVERNANCE_LEAF_NONCE_LEN,
+    GOVERNANCE_LEAF_PLAINTEXT_LEN, GOVERNANCE_LEAF_TAG_LEN, GovernanceLeafBlockInput,
+    MAX_GOVERNANCE_LEAF_BODY_LEN, StagedGovernanceCommit, decode_block, encode_block,
+    export_block_key, open_block, receive_commit, seal_block,
+};
 pub use keypackage_attestation::{
     AttestationTrigger, AttestationVerifyError, KeyPackageAttestation,
     MAX_ATTESTATION_KEY_RESOLUTION_STALENESS, MAX_KEYPACKAGE_ATTESTATION_LIFETIME,

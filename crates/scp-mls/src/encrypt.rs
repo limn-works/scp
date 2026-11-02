@@ -93,7 +93,7 @@ use crate::lifetime::validate_received_key_package_lifetime_range;
 /// future-path bullet under the residual bullet). Moving this call to it, with
 /// `LeafNodeLifetimePolicy::Skip`, together with the §9.7.1 and ADR-057
 /// corrections that change requires, is tracked as an open defect.
-fn process_inbound(
+pub(crate) fn process_inbound(
     g: &mut MlsGroup,
     provider: &crate::InMemoryMlsProvider,
     protocol_message: ProtocolMessage,
@@ -348,7 +348,7 @@ fn past_epoch_signature_key(
 /// the past message epoch cannot be read, or carries a signature key other
 /// than the current leaf's; or when the current leaf names another DID. Also
 /// the credential errors of [`credential_to_did`].
-fn sender_member(
+pub(crate) fn sender_member(
     group: &MlsGroup,
     provider: &crate::InMemoryMlsProvider,
     processed: &ProcessedMessage,
@@ -1008,7 +1008,13 @@ mod tests {
         .unwrap();
         let bob_kp: KeyPackageIn = bob_kp_bundle.key_package().clone().into();
 
-        let add_result = add_member(&mut alice_group, bob_kp, &SystemClock).unwrap();
+        let add_result = add_member(
+            &mut alice_group,
+            bob_kp,
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
+            &SystemClock,
+        )
+        .unwrap();
 
         // Bob joins using the Welcome message.
         let bob_group =
@@ -1413,7 +1419,13 @@ mod tests {
         .unwrap();
         let bob_kp: KeyPackageIn = bob_kp_bundle.key_package().clone().into();
 
-        let add_result = add_member(&mut alice_group, bob_kp, &SystemClock).unwrap();
+        let add_result = add_member(
+            &mut alice_group,
+            bob_kp,
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
+            &SystemClock,
+        )
+        .unwrap();
         let mut bob_group =
             join_group(&add_result.welcome, bob_provider, bob_signer, &SystemClock).unwrap();
 
@@ -1505,7 +1517,13 @@ mod tests {
         )
         .unwrap();
         let bob_kp: KeyPackageIn = bob_kp_bundle.key_package().clone().into();
-        let add_bob = add_member(&mut alice_group, bob_kp, &SystemClock).unwrap();
+        let add_bob = add_member(
+            &mut alice_group,
+            bob_kp,
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
+            &SystemClock,
+        )
+        .unwrap();
         let mut bob_group =
             join_group(&add_bob.welcome, bob_provider, bob_signer, &SystemClock).unwrap();
 
@@ -1590,6 +1608,7 @@ mod tests {
         let add_bob = add_member(
             &mut alice_group,
             bob_kp_bundle.key_package().clone().into(),
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
             &SystemClock,
         )
         .unwrap();
@@ -1632,9 +1651,13 @@ mod tests {
                 }
             })
             .unwrap();
-        let remove =
-            crate::group::remove_member(&mut alice_group, carol_member.index, &SystemClock)
-                .unwrap();
+        let remove = crate::group::remove_member(
+            &mut alice_group,
+            carol_member.index,
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
+            &SystemClock,
+        )
+        .unwrap();
         let remove_bytes = remove.commit.tls_serialize_detached().unwrap();
 
         // Bob is on epoch 2 (create + add-Bob + add-Carol = two epoch advances
@@ -1860,7 +1883,13 @@ mod tests {
         let bob_epoch_before = bob_group.epoch().unwrap();
 
         let (carol_kp, adder_clock) = carol_short_of_minimum_and_adder_clock();
-        let add_carol = add_member(&mut alice_group, carol_kp.into(), &adder_clock).unwrap();
+        let add_carol = add_member(
+            &mut alice_group,
+            carol_kp.into(),
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
+            &adder_clock,
+        )
+        .unwrap();
         let commit_bytes = add_carol.commit.tls_serialize_detached().unwrap();
 
         let content = decrypt_with_sender_did(&mut bob_group, &commit_bytes).unwrap();
@@ -2005,7 +2034,7 @@ mod tests {
     #[test]
     #[allow(clippy::unwrap_used)]
     fn membership_changes_missing_aad_commit_rejected_pre_merge() {
-        // A plain `add_member` Commit (no AAD) processed by an existing member is
+        // An add Commit with empty AAD processed by an existing member is
         // rejected pre-merge on the missing timestamp: the epoch is unchanged and
         // the group stays usable (fail-closed, not half-applied).
         let (mut alice_group, mut bob_group) = setup_alice_bob();
@@ -2022,8 +2051,12 @@ mod tests {
         )
         .unwrap();
         let carol_kp: KeyPackageIn = carol_kp_bundle.key_package().clone().into();
-        // Plain add_member — binds NO convergent-timestamp AAD.
-        let add_carol = add_member(&mut alice_group, carol_kp, &SystemClock).unwrap();
+        // Empty AAD: binds NO convergent-timestamp blob.
+        let add_carol =
+            crate::group::add_member_with_aad(&mut alice_group, carol_kp, &SystemClock, |_| {
+                Ok(Vec::new())
+            })
+            .unwrap();
         let commit_bytes = add_carol.commit.tls_serialize_detached().unwrap();
 
         let err = decrypt_with_membership_changes(&mut bob_group, &commit_bytes).unwrap_err();
@@ -2160,6 +2193,7 @@ mod tests {
         let add_bob = add_member(
             &mut alice_group,
             bob_kp_bundle.key_package().clone().into(),
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
             &SystemClock,
         )
         .unwrap();
@@ -2216,6 +2250,7 @@ mod tests {
             &mut alice_group,
             bob_index,
             fresh_kp_bundle.key_package().clone().into(),
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
             &SystemClock,
         )
         .unwrap();

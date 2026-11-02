@@ -21750,7 +21750,11 @@ mod tests {
             .await
             .expect("create group");
         let added = backend
-            .add_member_raw(&mut group, &generated.key_package_bytes)
+            .add_member_raw(
+                &mut group,
+                &generated.key_package_bytes,
+                &scp_mls::GovernanceLeafBlockInput::empty("test-context"),
+            )
             .await
             .expect("add member");
 

@@ -18,7 +18,8 @@ use scp_clock::Clock;
 use tls_codec::Serialize as TlsSerializeTrait;
 
 use crate::error::MlsError;
-use crate::group::ScpMlsGroup;
+use crate::governance_leaf_block::GovernanceLeafBlockInput;
+use crate::group::{ScpMlsGroup, build_own_commit, seal_commit_block};
 
 /// Issues an MLS Update proposal and immediately commits it.
 ///
@@ -32,6 +33,10 @@ use crate::group::ScpMlsGroup;
 /// # Arguments
 ///
 /// * `group` - The MLS group to update within. Must be active.
+/// * `block` - The governance leaf block the Commit carries
+///   (`07-trust-validation-and-capabilities.md` §7.3.1.1); an empty body
+///   sends the empty block. The Commit is padded to a multiple of
+///   [`crate::COMMIT_PADDING_MULTIPLE`] (§9.10.3 "Commits").
 /// * `clock` - The injected hardened [`Clock`] for the Commit's admission.
 ///
 /// # Returns
@@ -48,23 +53,27 @@ use crate::group::ScpMlsGroup;
 /// Returns any [`crate::admission`] error, with the Commit cleared and the
 /// epoch unchanged, if the Commit fails admission (including an Add openmls
 /// folded in from an earlier proposal).
+/// Returns [`MlsError::GovernanceLeafBlock`],
+/// [`MlsError::UnexpectedGroupConfiguration`] or [`MlsError::CommitPadding`]
+/// as [`crate::group::add_member`] does.
 /// Returns [`MlsError::MergePendingCommitFailed`] if merging the pending
 /// commit fails.
 ///
 /// See ADR-001 acceptance criterion 7.
 pub fn propose_update(
     group: &mut ScpMlsGroup,
+    block: &GovernanceLeafBlockInput<'_>,
     clock: &dyn Clock,
 ) -> Result<UpdateCommitResult, MlsError> {
-    let signer = group.signer.as_ref().ok_or(MlsError::GroupDestroyed)?;
+    let aad = seal_commit_block(group, block)?;
 
     // self_update() generates an Update proposal, builds a Commit that includes
     // it, and stages the commit. It returns a CommitMessageBundle containing the
     // Commit (and optionally a Welcome if there were pending Add proposals).
-    let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
-    let bundle = g
-        .self_update(&group.provider, signer, LeafNodeParameters::default())
-        .map_err(|e| MlsError::UpdateFailed(e.to_string()))?;
+    let bundle = build_own_commit(group, aad, |g, provider, signer| {
+        g.self_update(provider, signer, LeafNodeParameters::default())
+            .map_err(|e| MlsError::UpdateFailed(e.to_string()))
+    })?;
 
     // Extract the Commit message.
     let commit = bundle.into_commit();
@@ -97,6 +106,8 @@ pub fn propose_update(
 ///   `scp_wrapping_key` `LeafNode` extension. Must be the same key that was
 ///   originally published at context join time, unless this is an identity
 ///   key rotation.
+/// * `block` - The governance leaf block the Commit carries, as for
+///   [`propose_update`].
 /// * `clock` - The injected hardened [`Clock`] for the Commit's admission.
 ///
 /// # Errors
@@ -107,6 +118,9 @@ pub fn propose_update(
 /// Returns any [`crate::admission`] error, with the Commit cleared and the
 /// epoch unchanged, if the Commit fails admission (including an Add openmls
 /// folded in from an earlier proposal).
+/// Returns [`MlsError::GovernanceLeafBlock`],
+/// [`MlsError::UnexpectedGroupConfiguration`] or [`MlsError::CommitPadding`]
+/// as [`crate::group::add_member`] does.
 /// Returns [`MlsError::MergePendingCommitFailed`] if merging the pending
 /// commit fails.
 ///
@@ -114,17 +128,17 @@ pub fn propose_update(
 pub fn propose_update_with_wrapping_key(
     group: &mut ScpMlsGroup,
     wrapping_pubkey: &[u8; crate::wrapping_extension::P256_WRAPPING_KEY_SIZE],
+    block: &GovernanceLeafBlockInput<'_>,
     clock: &dyn Clock,
 ) -> Result<UpdateCommitResult, MlsError> {
-    let signer = group.signer.as_ref().ok_or(MlsError::GroupDestroyed)?;
-
     let leaf_params =
         crate::wrapping_extension::leaf_node_params_with_wrapping_key(wrapping_pubkey)?;
+    let aad = seal_commit_block(group, block)?;
 
-    let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
-    let bundle = g
-        .self_update(&group.provider, signer, leaf_params)
-        .map_err(|e| MlsError::UpdateFailed(e.to_string()))?;
+    let bundle = build_own_commit(group, aad, |g, provider, signer| {
+        g.self_update(provider, signer, leaf_params)
+            .map_err(|e| MlsError::UpdateFailed(e.to_string()))
+    })?;
 
     let commit = bundle.into_commit();
 
@@ -206,7 +220,13 @@ mod tests {
         .unwrap();
         let bob_kp: KeyPackageIn = bob_kp_bundle.key_package().clone().into();
 
-        let add_result = add_member(&mut alice_group, bob_kp, &SystemClock).unwrap();
+        let add_result = add_member(
+            &mut alice_group,
+            bob_kp,
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
+            &SystemClock,
+        )
+        .unwrap();
 
         let bob_group =
             join_group(&add_result.welcome, bob_provider, bob_signer, &SystemClock).unwrap();
@@ -220,9 +240,13 @@ mod tests {
         let (mut alice_group, _bob_group) = setup_alice_bob();
         let epoch_before = alice_group.epoch().unwrap();
 
-        let _commit = propose_update(&mut alice_group, &SystemClock)
-            .unwrap()
-            .commit;
+        let _commit = propose_update(
+            &mut alice_group,
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
+            &SystemClock,
+        )
+        .unwrap()
+        .commit;
 
         let epoch_after = alice_group.epoch().unwrap();
         assert_eq!(
@@ -237,9 +261,13 @@ mod tests {
     fn propose_update_returns_serializable_commit() {
         let (mut alice_group, _bob_group) = setup_alice_bob();
 
-        let commit = propose_update(&mut alice_group, &SystemClock)
-            .unwrap()
-            .commit;
+        let commit = propose_update(
+            &mut alice_group,
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
+            &SystemClock,
+        )
+        .unwrap()
+        .commit;
         let bytes = serialize_mls_message(&commit).unwrap();
 
         assert!(!bytes.is_empty(), "serialized commit should not be empty");
@@ -251,7 +279,11 @@ mod tests {
         let (mut alice_group, _bob_group) = setup_alice_bob();
         crate::group::destroy_group(&mut alice_group).unwrap();
 
-        let result = propose_update(&mut alice_group, &SystemClock);
+        let result = propose_update(
+            &mut alice_group,
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
+            &SystemClock,
+        );
         assert!(
             result.is_err(),
             "propose_update must fail on destroyed group"
@@ -287,9 +319,13 @@ mod tests {
         let ciphertext_bytes = serialize_ciphertext(&ciphertext_msg).unwrap();
 
         // Alice issues an update, advancing her group to epoch 2.
-        let commit = propose_update(&mut alice_group, &SystemClock)
-            .unwrap()
-            .commit;
+        let commit = propose_update(
+            &mut alice_group,
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
+            &SystemClock,
+        )
+        .unwrap()
+        .commit;
         let commit_bytes = serialize_mls_message(&commit).unwrap();
 
         // Alice processes Bob's old-epoch ciphertext AFTER advancing her own
@@ -369,9 +405,13 @@ mod tests {
         // Advance three times: epoch 1 → 2 → 3 → 4.
         // With max_past_epochs=2, at epoch 4 only epochs 2 and 3 are retained.
         for _ in 0..3 {
-            let commit = propose_update(&mut alice_group, &SystemClock)
-                .unwrap()
-                .commit;
+            let commit = propose_update(
+                &mut alice_group,
+                &crate::GovernanceLeafBlockInput::empty("test-context"),
+                &SystemClock,
+            )
+            .unwrap()
+            .commit;
             let commit_bytes = serialize_mls_message(&commit).unwrap();
             crate::encrypt::decrypt_with_sender_did(&mut bob_group, &commit_bytes).unwrap();
         }
@@ -406,9 +446,13 @@ mod tests {
         // Advance twice: epoch 1 → 2 → 3. At epoch 3, max_past_epochs=2
         // retains epochs 1 and 2.
         for _ in 0..2 {
-            let commit = propose_update(&mut alice_group, &SystemClock)
-                .unwrap()
-                .commit;
+            let commit = propose_update(
+                &mut alice_group,
+                &crate::GovernanceLeafBlockInput::empty("test-context"),
+                &SystemClock,
+            )
+            .unwrap()
+            .commit;
             let commit_bytes = serialize_mls_message(&commit).unwrap();
             crate::encrypt::decrypt_with_sender_did(&mut bob_group, &commit_bytes).unwrap();
         }

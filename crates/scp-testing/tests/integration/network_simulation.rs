@@ -182,7 +182,15 @@ async fn end_to_end_network_demo() {
         .tls_serialize_detached()
         .unwrap();
     let kp_in = scp_core::crypto::mls::wire::parse_key_package_in(kp_bytes.as_slice()).unwrap();
-    let add_result = add_member(&mut alice_group, kp_in, &scp_clock::SystemClock).unwrap();
+    let add_result = add_member(
+        &mut alice_group,
+        kp_in,
+        &scp_core::crypto::mls::governance_leaf_block::GovernanceLeafBlockInput::empty(
+            "test-context",
+        ),
+        &scp_clock::SystemClock,
+    )
+    .unwrap();
     let bob_group = join_group(
         &add_result.welcome,
         bob_provider,

@@ -47,6 +47,7 @@ use openmls::prelude::LeafNodeIndex;
 use super::storage_adapter::OpenMlsStorageAdapter;
 use scp_clock::Clock;
 use scp_did::DID;
+use scp_mls::GovernanceLeafBlockInput;
 use scp_mls::attested_key_package::KeyPackageDraft;
 use scp_mls::credential::ScpCredential;
 use scp_mls::encrypt::DecryptedContent;
@@ -213,6 +214,8 @@ pub trait MlsBackend: Send + Sync {
     /// and advances the group epoch.
     ///
     /// Returns the raw Commit / Welcome / `GroupInfo` bytes per RFC 9420.
+    /// The Commit carries `block`, sealed under the sending epoch's key for
+    /// its context id (spec 07 §7.3.1.1).
     ///
     /// # Errors
     ///
@@ -223,10 +226,11 @@ pub trait MlsBackend: Send + Sync {
         &self,
         group: &mut ScpMlsGroup,
         key_package_bytes: &[u8],
+        block: &GovernanceLeafBlockInput<'_>,
     ) -> Result<AddMemberRaw, MlsError>;
 
     /// Removes the member at `leaf_index` from `group` and advances the
-    /// group epoch.
+    /// group epoch. The Commit carries `block` (spec 07 §7.3.1.1).
     ///
     /// # Errors
     ///
@@ -235,6 +239,7 @@ pub trait MlsBackend: Send + Sync {
         &self,
         group: &mut ScpMlsGroup,
         leaf_index: LeafNodeIndex,
+        block: &GovernanceLeafBlockInput<'_>,
     ) -> Result<RemoveMemberRaw, MlsError>;
 
     /// Encrypts `plaintext` as an MLS application `PrivateMessage` for the
@@ -268,7 +273,7 @@ pub trait MlsBackend: Send + Sync {
     /// Advances the group epoch via a self-update Commit that republishes
     /// the caller's `LeafNode` with `wrapping_pubkey` (§9.16.1), the 65-byte
     /// DHKEM(P-256) point the extension carries. Returns the TLS-serialized
-    /// Commit bytes.
+    /// Commit bytes, which carry `block` (spec 07 §7.3.1.1).
     ///
     /// # Errors
     ///
@@ -278,6 +283,7 @@ pub trait MlsBackend: Send + Sync {
         &self,
         group: &mut ScpMlsGroup,
         wrapping_pubkey: &[u8; 65],
+        block: &GovernanceLeafBlockInput<'_>,
     ) -> Result<Vec<u8>, MlsError>;
 
     /// Validates a TLS-serialized `KeyPackage` for joinability. Does not

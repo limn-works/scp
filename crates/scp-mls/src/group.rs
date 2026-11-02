@@ -20,6 +20,9 @@ use crate::InMemoryMlsProvider;
 use crate::convergent_timestamp::encode_convergent_timestamp_aad;
 use crate::credential::ScpCredential;
 use crate::error::{MlsError, SignerDefect};
+use crate::governance_leaf_block::{
+    COMMIT_PADDING_MULTIPLE, GovernanceLeafBlockInput, seal_for_group,
+};
 use crate::lifetime::{
     key_package_lifetime, validate_key_package_lifetime_for_add, validate_own_join_leaf_lifetime,
     validate_tree_leaf_lifetime_ranges,
@@ -47,6 +50,98 @@ use tls_codec::Serialize as TlsSerializeTrait;
 /// No ciphersuite negotiation is supported. This eliminates downgrade attacks
 /// and simplifies the implementation. See ADR-001 for the rationale.
 pub const SCP_CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMP256_AES128GCM_SHA256_P256;
+
+/// Past epochs whose message secrets every SCP group keeps, for the 30-second
+/// sender-key grace window (§9.16.2, §9.7, ADR-001 criterion 6).
+const SCP_MAX_PAST_EPOCHS: usize = 2;
+
+/// The join configuration SCP gives every group it creates, joins, or loads,
+/// with `padding_size` set to `padding`.
+///
+/// openmls exposes no getter for every field of `MlsGroupJoinConfig`, and
+/// `MlsGroup::set_configuration` replaces the whole configuration, so the
+/// copy that changes only `padding_size` is built from these values, the
+/// ones the create and join paths set (`09-security-model.md` §9.10.3
+/// "Commits").
+pub(crate) fn scp_join_config(padding: usize) -> MlsGroupJoinConfig {
+    MlsGroupJoinConfig::builder()
+        .max_past_epochs(SCP_MAX_PAST_EPOCHS)
+        .use_ratchet_tree_extension(true)
+        .padding_size(padding)
+        .build()
+}
+
+/// Sets the group's MLS padding size to `padding`, changing no other setting.
+///
+/// Fails closed when the group's configuration is not SCP's configuration at
+/// its current padding, because the replacement would then change more than
+/// the padding.
+pub(crate) fn set_padding(
+    group: &mut MlsGroup,
+    provider: &InMemoryMlsProvider,
+    padding: usize,
+) -> Result<(), MlsError> {
+    let current = group.configuration();
+    if *current != scp_join_config(current.padding_size()) {
+        return Err(MlsError::UnexpectedGroupConfiguration);
+    }
+    group
+        .set_configuration(provider.storage(), &scp_join_config(padding))
+        .map_err(|e| MlsError::CommitPadding(format!("setting padding {padding}: {e}")))
+}
+
+/// Seals the governance leaf block this member puts on the Commit it is about
+/// to build, in the current (sending) epoch from its own leaf
+/// (`07-trust-validation-and-capabilities.md` §7.3.1.1). The block key is
+/// exported and dropped inside this call, before any Commit exists.
+pub(crate) fn seal_commit_block(
+    group: &ScpMlsGroup,
+    block: &GovernanceLeafBlockInput<'_>,
+) -> Result<Vec<u8>, MlsError> {
+    let g = group.group.as_ref().ok_or(MlsError::GroupDestroyed)?;
+    Ok(seal_for_group(g, &group.provider, block)?)
+}
+
+/// Builds one Commit of this member with `authenticated_data` set to `aad`,
+/// padded so its `PrivateMessage` `ciphertext` is a multiple of
+/// [`COMMIT_PADDING_MULTIPLE`] (`09-security-model.md` §9.10.3 "Commits").
+///
+/// The padding is 4,096 only while `build` runs and is 0 again before this
+/// returns, so no application message is padded. On a `build` error the
+/// ephemeral AAD is cleared (openmls clears it only on success). If the
+/// padding cannot be restored, a built Commit is cleared and the restore
+/// error is returned.
+pub(crate) fn build_own_commit<T>(
+    group: &mut ScpMlsGroup,
+    aad: Vec<u8>,
+    build: impl FnOnce(&mut MlsGroup, &InMemoryMlsProvider, &SignatureKeyPair) -> Result<T, MlsError>,
+) -> Result<T, MlsError> {
+    let signer = group.signer.as_ref().ok_or(MlsError::GroupDestroyed)?;
+    let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
+    set_padding(g, &group.provider, COMMIT_PADDING_MULTIPLE)?;
+    g.set_aad(aad);
+    let outcome = build(g, &group.provider, signer);
+    if outcome.is_err() {
+        g.set_aad(Vec::new());
+    }
+    match set_padding(g, &group.provider, 0) {
+        Ok(()) => outcome,
+        Err(restore) => match outcome {
+            Ok(_) => {
+                g.clear_pending_commit(group.provider.storage())
+                    .map_err(|e| {
+                        MlsError::CommitPadding(format!(
+                            "{restore}; clearing the built commit: {e}"
+                        ))
+                    })?;
+                Err(restore)
+            }
+            Err(build_error) => Err(MlsError::CommitPadding(format!(
+                "{restore}; after the commit failed: {build_error}"
+            ))),
+        },
+    }
+}
 
 /// Rejects a restored MLS group whose ciphersuite is not [`SCP_CIPHERSUITE`].
 ///
@@ -303,16 +398,22 @@ impl ScpMlsGroup {
     /// (ADR-057) and the Welcome join. The checks, in order: the group runs
     /// [`SCP_CIPHERSUITE`], the signer passes [`check_p256_signer`], and the
     /// signer's public key is the group's own leaf signature key (spec 09
-    /// §9.5). The signer stays beside the group and is never written to the
-    /// provider's key store (every openmls signing call takes it as an
-    /// argument). The resulting group is active (`destroyed = false`).
+    /// §9.5). The group's MLS padding is then set to 0, so a group persisted
+    /// while a Commit was padded sends unpadded application messages
+    /// (`09-security-model.md` §9.10.3 "Commits"). The signer stays beside the
+    /// group and is never written to the provider's key store (every openmls
+    /// signing call takes it as an argument). The resulting group is active
+    /// (`destroyed = false`).
     ///
     /// # Errors
     ///
-    /// [`MlsError::UnsupportedCiphersuite`] for another ciphersuite, or
-    /// [`MlsError::InvalidSigner`] with the [`SignerDefect`] that failed.
+    /// [`MlsError::UnsupportedCiphersuite`] for another ciphersuite,
+    /// [`MlsError::InvalidSigner`] with the [`SignerDefect`] that failed,
+    /// [`MlsError::UnexpectedGroupConfiguration`] when the group's
+    /// configuration is not SCP's, or [`MlsError::CommitPadding`] when the
+    /// padding cannot be written.
     pub fn from_parts(
-        group: MlsGroup,
+        mut group: MlsGroup,
         provider: InMemoryMlsProvider,
         signer: SignatureKeyPair,
     ) -> Result<Self, MlsError> {
@@ -324,6 +425,7 @@ impl ScpMlsGroup {
         if own_leaf.signature_key().as_slice() != signer.public() {
             return Err(MlsError::InvalidSigner(SignerDefect::LeafKeyMismatch));
         }
+        set_padding(&mut group, &provider, 0)?;
         Ok(Self::assemble(group, provider, signer))
     }
 
@@ -610,7 +712,7 @@ fn create_group_inner(
         .ciphersuite(SCP_CIPHERSUITE)
         .use_ratchet_tree_extension(true)
         .lifetime(key_package_lifetime(clock))
-        .max_past_epochs(2);
+        .max_past_epochs(SCP_MAX_PAST_EPOCHS);
 
     // Capabilities must be set before the leaf-node extensions: OpenMLS's
     // with_leaf_node_extensions validates each leaf extension type against the
@@ -702,6 +804,10 @@ pub struct AddMemberResult {
 /// * `group` - The MLS group to add the member to. Must be active.
 /// * `key_package` - The new member's pre-published `KeyPackage`, signed by
 ///   their P-256 key and containing their SCP credential.
+/// * `block` - The governance leaf block the Commit carries in its
+///   `authenticated_data` (`07-trust-validation-and-capabilities.md`
+///   §7.3.1.1); an empty body sends the empty block. The Commit is padded to
+///   a multiple of [`COMMIT_PADDING_MULTIPLE`] (§9.10.3 "Commits").
 /// * `clock` - The injected hardened [`Clock`]. After openmls validates the
 ///   key package (which runs its own un-injectable internal `Lifetime::validate`
 ///   against openmls's clock), the accepted `Lifetime` is *additionally*
@@ -732,6 +838,11 @@ pub struct AddMemberResult {
 /// a refusal leaves the epoch unchanged.
 /// Returns [`MlsError::CommitProcessingFailed`] if serializing the Commit,
 /// Welcome or `GroupInfo` fails; the epoch is unchanged.
+/// Returns [`MlsError::GovernanceLeafBlock`] if the block cannot be sealed
+/// (a body above 32,764 bytes, an empty context id); no Commit is built.
+/// Returns [`MlsError::UnexpectedGroupConfiguration`] or
+/// [`MlsError::CommitPadding`] if the Commit padding cannot be set or
+/// restored; the epoch is unchanged.
 /// Returns [`MlsError::MergePendingCommitFailed`] if committing fails. The
 /// merge is the last step that can fail.
 ///
@@ -739,7 +850,21 @@ pub struct AddMemberResult {
 pub fn add_member(
     group: &mut ScpMlsGroup,
     key_package: KeyPackageIn,
+    block: &GovernanceLeafBlockInput<'_>,
     clock: &dyn Clock,
+) -> Result<AddMemberResult, MlsError> {
+    add_member_with_aad(group, key_package, clock, |group| {
+        seal_commit_block(group, block)
+    })
+}
+
+/// [`add_member`] with the Commit's `authenticated_data` produced by `aad`,
+/// which runs after the key package's checks and before the Commit is built.
+pub(crate) fn add_member_with_aad(
+    group: &mut ScpMlsGroup,
+    key_package: KeyPackageIn,
+    clock: &dyn Clock,
+    aad: impl FnOnce(&ScpMlsGroup) -> Result<Vec<u8>, MlsError>,
 ) -> Result<AddMemberResult, MlsError> {
     // Validate the key package.
     let verified_key_package = key_package
@@ -757,19 +882,19 @@ pub fn add_member(
         crate::admission::LifetimeCheck::Adder(clock),
     )?;
 
-    let signer = group.signer.as_ref().ok_or(MlsError::GroupDestroyed)?;
-    let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
+    let aad = aad(group)?;
 
     // Add the member to the group. Returns (commit, welcome, group_info).
     // Both commit and welcome are MlsMessageOut. The Commit is pending, not
     // merged: it may also carry proposals openmls held from earlier messages.
-    let (commit, welcome, group_info) = g
-        .add_members(
-            &group.provider,
+    let (commit, welcome, group_info) = build_own_commit(group, aad, |g, provider, signer| {
+        g.add_members(
+            provider,
             signer,
             core::slice::from_ref(&verified_key_package),
         )
-        .map_err(|e| MlsError::AddMemberFailed(e.to_string()))?;
+        .map_err(|e| MlsError::AddMemberFailed(e.to_string()))
+    })?;
 
     // Both messages are serialized while the Commit is still pending, so
     // nothing after the merge can fail.
@@ -878,9 +1003,10 @@ pub(crate) fn serialize_out<M: TlsSerializeTrait>(
 /// **clears the AAD on error** so a failed add cannot leak the timestamp into a
 /// subsequent unrelated send/commit on the same group.
 ///
-/// The existing [`add_member`] is left untouched: the native runtime is a
-/// consumer of it and does not use the AAD-binding path (its convergent timestamp
-/// rides inside a signed SCP envelope).
+/// This path carries the timestamp blob, not a governance leaf block, in the
+/// Commit's `authenticated_data`; the Commit is padded like every other
+/// (§9.10.3 "Commits"). ADR-066 decision 9 retires the blob in favor of the
+/// block; the in-browser committer moves to [`add_member`] with that change.
 ///
 /// # Arguments
 ///
@@ -894,30 +1020,17 @@ pub(crate) fn serialize_out<M: TlsSerializeTrait>(
 ///
 /// # Errors
 ///
-/// Same as [`add_member`]. On any error the ephemeral AAD is cleared before the
-/// error is returned.
+/// Same as [`add_member`] less the block errors. On any error the ephemeral
+/// AAD is cleared before the error is returned.
 pub fn add_member_with_convergent_timestamp(
     group: &mut ScpMlsGroup,
     key_package: KeyPackageIn,
     clock: &dyn Clock,
     timestamp_secs: u64,
 ) -> Result<AddMemberResult, MlsError> {
-    let aad = encode_convergent_timestamp_aad(timestamp_secs);
-    {
-        let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
-        g.set_aad(aad.to_vec());
-    }
-    let result = add_member(group, key_package, clock);
-    if result.is_err() {
-        // openmls resets the ephemeral AAD only on a successful MlsMessageOut;
-        // on error it persists, so clear it to prevent leaking the timestamp
-        // into the next op. (If the group was destroyed, there is nothing to
-        // clear.)
-        if let Some(g) = group.group.as_mut() {
-            g.set_aad(Vec::new());
-        }
-    }
-    result
+    add_member_with_aad(group, key_package, clock, |_| {
+        Ok(encode_convergent_timestamp_aad(timestamp_secs).to_vec())
+    })
 }
 
 /// Extracts the SCP DID embedded in a fully-validated `KeyPackage`'s leaf
@@ -1037,21 +1150,25 @@ pub struct RemoveMemberResult {
 /// operation (e.g., invalid leaf index, removing self).
 /// Returns any [`crate::admission`] error, with the Commit cleared and the
 /// epoch unchanged, if the Commit fails admission.
+/// Returns [`MlsError::GovernanceLeafBlock`],
+/// [`MlsError::UnexpectedGroupConfiguration`] or [`MlsError::CommitPadding`]
+/// as [`add_member`] does.
 /// Returns [`MlsError::MergePendingCommitFailed`] if committing fails.
 ///
 /// See ADR-001 acceptance criterion 3.
 pub fn remove_member(
     group: &mut ScpMlsGroup,
     leaf_index: LeafNodeIndex,
+    block: &GovernanceLeafBlockInput<'_>,
     clock: &dyn Clock,
 ) -> Result<RemoveMemberResult, MlsError> {
-    let signer = group.signer.as_ref().ok_or(MlsError::GroupDestroyed)?;
-    let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
+    let aad = seal_commit_block(group, block)?;
 
     // Remove the member. Returns (commit, optional_welcome, group_info).
-    let (commit, _welcome, group_info) = g
-        .remove_members(&group.provider, signer, core::slice::from_ref(&leaf_index))
-        .map_err(|e| MlsError::RemoveMemberFailed(e.to_string()))?;
+    let (commit, _welcome, group_info) = build_own_commit(group, aad, |g, provider, signer| {
+        g.remove_members(provider, signer, core::slice::from_ref(&leaf_index))
+            .map_err(|e| MlsError::RemoveMemberFailed(e.to_string()))
+    })?;
 
     // Admit the pending commit on the tree after it, then merge it to advance
     // the group epoch locally.
@@ -1115,6 +1232,9 @@ pub struct ResetMemberResult {
 /// - [`MlsError::InvalidCredential`] if the key package names a DID other
 ///   than the removed leaf's;
 /// - [`MlsError::GroupDestroyed`] if the group has been destroyed;
+/// - [`MlsError::GovernanceLeafBlock`],
+///   [`MlsError::UnexpectedGroupConfiguration`] or [`MlsError::CommitPadding`]
+///   as [`add_member`] returns them;
 /// - any admission or serialization error of the staged Commit, after which
 ///   the pending Commit is cleared and the epoch is unchanged;
 /// - [`MlsError::MergePendingCommitFailed`] if committing fails.
@@ -1122,6 +1242,7 @@ pub fn reset_member(
     group: &mut ScpMlsGroup,
     leaf_index: LeafNodeIndex,
     key_package: KeyPackageIn,
+    block: &GovernanceLeafBlockInput<'_>,
     clock: &dyn Clock,
 ) -> Result<ResetMemberResult, MlsError> {
     let verified_key_package = key_package
@@ -1132,8 +1253,7 @@ pub fn reset_member(
         crate::admission::LifetimeCheck::Adder(clock),
     )?;
 
-    let signer = group.signer.as_ref().ok_or(MlsError::GroupDestroyed)?;
-    let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
+    let g = group.group.as_ref().ok_or(MlsError::GroupDestroyed)?;
 
     let removed = g
         .member_at(leaf_index)
@@ -1149,16 +1269,19 @@ pub fn reset_member(
         )));
     }
 
+    let aad = seal_commit_block(group, block)?;
+
     // One Commit holding the Remove and the Add. The Commit is pending, not
     // merged, and may also carry proposals openmls held from earlier messages.
-    let messages = g
-        .swap_members(
-            &group.provider,
+    let messages = build_own_commit(group, aad, |g, provider, signer| {
+        g.swap_members(
+            provider,
             signer,
             core::slice::from_ref(&leaf_index),
             core::slice::from_ref(&verified_key_package),
         )
-        .map_err(|e| MlsError::AddMemberFailed(e.to_string()))?;
+        .map_err(|e| MlsError::AddMemberFailed(e.to_string()))
+    })?;
 
     let (admission, (commit_bytes, welcome_bytes, group_info_bytes)) =
         admit_and_merge_own_commit(group, clock, || {
@@ -1538,10 +1661,7 @@ pub fn join_group_from_bytes(
     //   create_group, so mirroring it here keeps every member — creator or
     //   Welcome-joined — able to add further members (§9.16.1 in-tab
     //   distribution requires every member to be an eligible adder/bystander).
-    let join_config = MlsGroupJoinConfig::builder()
-        .max_past_epochs(2)
-        .use_ratchet_tree_extension(true)
-        .build();
+    let join_config = scp_join_config(0);
 
     // openmls's own tree-leaf `Lifetime` check reads openmls's clock (wasm:
     // `web_time`'s `Date.now()`) and rejects an expired leaf, which would let
@@ -2220,7 +2340,13 @@ mod tests {
         .unwrap();
 
         let bob_kp: KeyPackageIn = bob_kp_bundle.key_package().clone().into();
-        let result = add_member(&mut alice_group, bob_kp, &SystemClock).unwrap();
+        let result = add_member(
+            &mut alice_group,
+            bob_kp,
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
+            &SystemClock,
+        )
+        .unwrap();
 
         // Verify we got both messages.
         assert!(
@@ -2261,7 +2387,13 @@ mod tests {
         .unwrap();
 
         let bob_kp: KeyPackageIn = bob_kp_bundle.key_package().clone().into();
-        let result = add_member(&mut alice_group, bob_kp, &SystemClock).unwrap();
+        let result = add_member(
+            &mut alice_group,
+            bob_kp,
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
+            &SystemClock,
+        )
+        .unwrap();
 
         // Bob joins using the Welcome message.
         let bob_group =
@@ -2298,7 +2430,13 @@ mod tests {
         )
         .unwrap();
         let bob_kp: KeyPackageIn = bob_kp_bundle.key_package().clone().into();
-        let _add_result = add_member(&mut alice_group, bob_kp, &SystemClock).unwrap();
+        let _add_result = add_member(
+            &mut alice_group,
+            bob_kp,
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
+            &SystemClock,
+        )
+        .unwrap();
 
         // Epoch should be 1 after add.
         assert_eq!(alice_group.epoch().unwrap(), 1);
@@ -2309,8 +2447,13 @@ mod tests {
         let bob_member = members.iter().find(|m| m.index != alice_own_index).unwrap();
 
         // Remove Bob.
-        let remove_result =
-            remove_member(&mut alice_group, bob_member.index, &SystemClock).unwrap();
+        let remove_result = remove_member(
+            &mut alice_group,
+            bob_member.index,
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
+            &SystemClock,
+        )
+        .unwrap();
 
         // Verify epoch advanced to 2.
         assert_eq!(alice_group.epoch().unwrap(), 2);
@@ -2441,6 +2584,7 @@ mod tests {
         let add = add_member(
             &mut alice,
             bob_kp.key_package().clone().into(),
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
             &SystemClock,
         )
         .unwrap();
@@ -2521,7 +2665,12 @@ mod tests {
         .unwrap();
         let bob_kp: KeyPackageIn = bob_kp_bundle.key_package().clone().into();
 
-        let result = add_member(&mut group, bob_kp, &SystemClock);
+        let result = add_member(
+            &mut group,
+            bob_kp,
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
+            &SystemClock,
+        );
         assert!(result.is_err());
     }
 
@@ -2680,9 +2829,14 @@ mod tests {
         let hundred_days = 100 * 24 * 60 * 60;
         let future = scp_clock::TestClock::new(real_now + hundred_days);
         // `.err()` avoids requiring `AddMemberResult: Debug` for `unwrap_err`.
-        let err = add_member(&mut alice, bob_kp, &future)
-            .err()
-            .expect("add_member must reject an expired-lifetime KP");
+        let err = add_member(
+            &mut alice,
+            bob_kp,
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
+            &future,
+        )
+        .err()
+        .expect("add_member must reject an expired-lifetime KP");
         assert!(
             matches!(err, MlsError::KeyPackageLifetimeInvalid { .. }),
             "expected KeyPackageLifetimeInvalid, got {err:?}"
@@ -2701,7 +2855,13 @@ mod tests {
         )
         .unwrap();
         let carol_kp: KeyPackageIn = carol_bundle.key_package().clone().into();
-        add_member(&mut alice, carol_kp, &SystemClock).unwrap();
+        add_member(
+            &mut alice,
+            carol_kp,
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
+            &SystemClock,
+        )
+        .unwrap();
         assert_eq!(
             alice.epoch().unwrap(),
             epoch_before + 1,
@@ -2744,16 +2904,27 @@ mod tests {
         .unwrap();
         let epoch_before = alice.epoch().unwrap();
 
-        let err = add_member(&mut alice, bob_kp.clone(), &past_min)
-            .err()
-            .expect("one second short of the minimum must be refused");
+        let err = add_member(
+            &mut alice,
+            bob_kp.clone(),
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
+            &past_min,
+        )
+        .err()
+        .expect("one second short of the minimum must be refused");
         assert!(
             matches!(err, MlsError::KeyPackageLifetimeInvalid { now, .. } if now == past_min.now_secs()),
             "expected KeyPackageLifetimeInvalid at the refused clock, got {err:?}"
         );
         assert_eq!(alice.epoch().unwrap(), epoch_before);
 
-        add_member(&mut alice, bob_kp, &at_min).unwrap();
+        add_member(
+            &mut alice,
+            bob_kp,
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
+            &at_min,
+        )
+        .unwrap();
         assert_eq!(alice.epoch().unwrap(), epoch_before + 1);
     }
 
@@ -2839,9 +3010,14 @@ mod tests {
             &SystemClock,
         )
         .unwrap();
-        let err = add_member(&mut alice, kp_in, &SystemClock)
-            .err()
-            .expect("add_member must reject an over-long-range KP");
+        let err = add_member(
+            &mut alice,
+            kp_in,
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
+            &SystemClock,
+        )
+        .err()
+        .expect("add_member must reject an over-long-range KP");
         assert!(
             matches!(err, MlsError::KeyPackageLifetimeInvalid { .. }),
             "add_member must reject an over-long-range KP openmls would accept, got {err:?}"
@@ -2909,6 +3085,7 @@ mod tests {
         let add = add_member(
             &mut alice,
             bob_bundle.key_package().clone().into(),
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
             &SystemClock,
         )?;
 
@@ -3005,6 +3182,7 @@ mod tests {
         let add = add_member(
             &mut alice,
             bob_bundle.key_package().clone().into(),
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
             &SystemClock,
         )?;
 
@@ -3111,6 +3289,7 @@ mod tests {
         let add = add_member(
             &mut alice,
             bob_bundle.key_package().clone().into(),
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
             &SystemClock,
         )?;
         let bob = join_group(&add.welcome, bob_provider, bob_signer, &SystemClock)?;
@@ -3140,6 +3319,7 @@ mod tests {
         let add = add_member(
             &mut alice,
             bob_bundle.key_package().clone().into(),
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
             &SystemClock,
         )?;
         Ok(BobWelcome {

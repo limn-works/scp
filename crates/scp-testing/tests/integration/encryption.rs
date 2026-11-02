@@ -103,7 +103,15 @@ async fn mls_add_member() {
         .unwrap();
     let kp_in = scp_core::crypto::mls::wire::parse_key_package_in(kp_bytes.as_slice()).unwrap();
 
-    let result = add_member(&mut group, kp_in, &SystemClock).unwrap();
+    let result = add_member(
+        &mut group,
+        kp_in,
+        &scp_core::crypto::mls::governance_leaf_block::GovernanceLeafBlockInput::empty(
+            "test-context",
+        ),
+        &SystemClock,
+    )
+    .unwrap();
     assert!(group.epoch().unwrap() > initial_epoch);
     assert_eq!(group.members().unwrap().len(), 2);
 
@@ -146,7 +154,15 @@ async fn mls_join_group() {
         .unwrap();
     let kp_in = scp_core::crypto::mls::wire::parse_key_package_in(kp_bytes.as_slice()).unwrap();
 
-    let add_result = add_member(&mut group, kp_in, &SystemClock).unwrap();
+    let add_result = add_member(
+        &mut group,
+        kp_in,
+        &scp_core::crypto::mls::governance_leaf_block::GovernanceLeafBlockInput::empty(
+            "test-context",
+        ),
+        &SystemClock,
+    )
+    .unwrap();
 
     // Join the group from the new member's side using the Welcome.
     let joined_group = join_group(&add_result.welcome, provider, signer, &SystemClock).unwrap();
@@ -189,7 +205,15 @@ async fn mls_remove_member() {
         .unwrap();
     let kp_in = scp_core::crypto::mls::wire::parse_key_package_in(kp_bytes.as_slice()).unwrap();
 
-    add_member(&mut group, kp_in, &SystemClock).unwrap();
+    add_member(
+        &mut group,
+        kp_in,
+        &scp_core::crypto::mls::governance_leaf_block::GovernanceLeafBlockInput::empty(
+            "test-context",
+        ),
+        &SystemClock,
+    )
+    .unwrap();
     assert_eq!(group.members().unwrap().len(), 2);
 
     let epoch_after_add = group.epoch().unwrap();
@@ -203,7 +227,15 @@ async fn mls_remove_member() {
         .expect("should find non-self member");
     let other_index = other.index;
 
-    remove_member(&mut group, other_index, &scp_clock::SystemClock).unwrap();
+    remove_member(
+        &mut group,
+        other_index,
+        &scp_core::crypto::mls::governance_leaf_block::GovernanceLeafBlockInput::empty(
+            "test-context",
+        ),
+        &scp_clock::SystemClock,
+    )
+    .unwrap();
     assert!(group.epoch().unwrap() > epoch_after_add);
     assert_eq!(group.members().unwrap().len(), 1);
 }
@@ -263,7 +295,15 @@ async fn mls_forward_secrecy() {
     let bob_kp_bytes = bob_kpb.key_package().tls_serialize_detached().unwrap();
     let bob_kp_in =
         scp_core::crypto::mls::wire::parse_key_package_in(bob_kp_bytes.as_slice()).unwrap();
-    let add_result = add_member(&mut alice_group, bob_kp_in, &SystemClock).unwrap();
+    let add_result = add_member(
+        &mut alice_group,
+        bob_kp_in,
+        &scp_core::crypto::mls::governance_leaf_block::GovernanceLeafBlockInput::empty(
+            "test-context",
+        ),
+        &SystemClock,
+    )
+    .unwrap();
     let mut bob_group =
         join_group(&add_result.welcome, bob_provider, bob_signer, &SystemClock).unwrap();
     assert_eq!(alice_group.epoch().unwrap(), 1);
@@ -290,7 +330,15 @@ async fn mls_forward_secrecy() {
         .unwrap();
         let kp_bytes = temp_kpb.key_package().tls_serialize_detached().unwrap();
         let kp_in = scp_core::crypto::mls::wire::parse_key_package_in(kp_bytes.as_slice()).unwrap();
-        let result = add_member(&mut alice_group, kp_in, &SystemClock).unwrap();
+        let result = add_member(
+            &mut alice_group,
+            kp_in,
+            &scp_core::crypto::mls::governance_leaf_block::GovernanceLeafBlockInput::empty(
+                "test-context",
+            ),
+            &SystemClock,
+        )
+        .unwrap();
 
         // Bob processes Alice's Commit to advance his epoch too.
         let commit_bytes = serialize_mls_message(&result.commit).unwrap();
@@ -663,7 +711,15 @@ async fn double_encryption_roundtrip() {
 
     // Create a fresh group for the MLS layer test.
     let mut mls_sender_group = new_group(&creator_cred);
-    let add = add_member(&mut mls_sender_group, kp_in, &SystemClock).unwrap();
+    let add = add_member(
+        &mut mls_sender_group,
+        kp_in,
+        &scp_core::crypto::mls::governance_leaf_block::GovernanceLeafBlockInput::empty(
+            "test-context",
+        ),
+        &SystemClock,
+    )
+    .unwrap();
     let mut mls_receiver_group =
         join_group(&add.welcome, joiner_provider, joiner_signer, &SystemClock).unwrap();
 
@@ -785,7 +841,15 @@ async fn mls_application_message_roundtrip() {
     let kp_bytes = joiner_kpb.key_package().tls_serialize_detached().unwrap();
     let kp_in = scp_core::crypto::mls::wire::parse_key_package_in(kp_bytes.as_slice()).unwrap();
 
-    let add_result = add_member(&mut creator_group, kp_in, &SystemClock).unwrap();
+    let add_result = add_member(
+        &mut creator_group,
+        kp_in,
+        &scp_core::crypto::mls::governance_leaf_block::GovernanceLeafBlockInput::empty(
+            "test-context",
+        ),
+        &SystemClock,
+    )
+    .unwrap();
     let mut joiner_group = join_group(
         &add_result.welcome,
         joiner_provider,

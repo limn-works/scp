@@ -132,6 +132,7 @@ fn build_state() -> Option<FuzzState> {
     let add = add_member(
         &mut alice,
         bob_bundle.key_package().clone().into(),
+        &scp_mls::GovernanceLeafBlockInput::empty("fuzz-context"),
         &SystemClock,
     )
     .ok()?;

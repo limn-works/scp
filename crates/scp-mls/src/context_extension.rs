@@ -359,7 +359,12 @@ mod tests {
             crate::group::generate_key_package(&bob_cred, &bob_wrapping, &SystemClock).unwrap();
         let bob_kp_in: KeyPackageIn = bob_kp.key_package().clone().into();
 
-        match crate::group::add_member(&mut alice_group, bob_kp_in, &SystemClock) {
+        match crate::group::add_member(
+            &mut alice_group,
+            bob_kp_in,
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
+            &SystemClock,
+        ) {
             Err(MlsError::AddMemberFailed(_)) => {}
             Err(other) => panic!("expected AddMemberFailed, got {other:?}"),
             Ok(_) => {
@@ -446,8 +451,13 @@ mod tests {
             .unwrap();
 
         let bob_kp_in: KeyPackageIn = bob_kp.key_package().clone().into();
-        let add_result =
-            crate::group::add_member(&mut alice_group, bob_kp_in, &SystemClock).unwrap();
+        let add_result = crate::group::add_member(
+            &mut alice_group,
+            bob_kp_in,
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
+            &SystemClock,
+        )
+        .unwrap();
 
         let bob_group =
             crate::group::join_group(&add_result.welcome, bob_provider, bob_signer, &SystemClock)
@@ -506,7 +516,13 @@ mod tests {
             )
             .unwrap();
         let bob_kp_in: KeyPackageIn = bob_kp.key_package().clone().into();
-        let add_bob = crate::group::add_member(&mut alice_group, bob_kp_in, &SystemClock).unwrap();
+        let add_bob = crate::group::add_member(
+            &mut alice_group,
+            bob_kp_in,
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
+            &SystemClock,
+        )
+        .unwrap();
         let mut bob_group =
             crate::group::join_group(&add_bob.welcome, bob_provider, bob_signer, &SystemClock)
                 .unwrap();
@@ -522,8 +538,13 @@ mod tests {
             )
             .unwrap();
         let carol_kp_in: KeyPackageIn = carol_kp.key_package().clone().into();
-        let add_carol =
-            crate::group::add_member(&mut alice_group, carol_kp_in, &SystemClock).unwrap();
+        let add_carol = crate::group::add_member(
+            &mut alice_group,
+            carol_kp_in,
+            &crate::GovernanceLeafBlockInput::empty("test-context"),
+            &SystemClock,
+        )
+        .unwrap();
 
         // Bob processes the Carol-add commit to advance to epoch 2.
         let commit_bytes = crate::ratchet::serialize_mls_message(&add_carol.commit).unwrap();

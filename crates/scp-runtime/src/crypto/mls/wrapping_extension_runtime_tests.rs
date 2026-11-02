@@ -242,12 +242,18 @@ fn sender_keys_wrapping_stable_001() {
     let bob_kp_in: KeyPackageIn = bob_kp.key_package().clone().into();
 
     let mut group_mut = group;
-    let _add =
-        scp_mls::group::add_member(&mut group_mut, bob_kp_in, &scp_clock::SystemClock).unwrap();
+    let _add = scp_mls::group::add_member(
+        &mut group_mut,
+        bob_kp_in,
+        &scp_mls::GovernanceLeafBlockInput::empty("test-context"),
+        &scp_clock::SystemClock,
+    )
+    .unwrap();
 
     let _commit = scp_mls::ratchet::propose_update_with_wrapping_key(
         &mut group_mut,
         pub_key.as_bytes(),
+        &scp_mls::GovernanceLeafBlockInput::empty("test-context"),
         &scp_clock::SystemClock,
     )
     .unwrap();
@@ -264,6 +270,7 @@ fn sender_keys_wrapping_stable_001() {
     let _commit2 = scp_mls::ratchet::propose_update_with_wrapping_key(
         &mut group_mut,
         new_pub.as_bytes(),
+        &scp_mls::GovernanceLeafBlockInput::empty("test-context"),
         &scp_clock::SystemClock,
     )
     .unwrap();

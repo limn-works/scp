@@ -970,7 +970,13 @@ mod tests {
         .unwrap();
         let kp_bytes = bundle.key_package().tls_serialize_detached().unwrap();
         let kp_in = scp_mls::wire::parse_key_package_in(&kp_bytes).unwrap();
-        let result = add_member(&mut alice.mls_group, kp_in, &SystemClock).unwrap();
+        let result = add_member(
+            &mut alice.mls_group,
+            kp_in,
+            &scp_mls::GovernanceLeafBlockInput::empty("test-context"),
+            &SystemClock,
+        )
+        .unwrap();
 
         let bob_group = join_group(&result.welcome, provider, signer, &SystemClock).unwrap();
         let mut bob = ContextCryptoState::from_group(CTX, bob_group);
@@ -1031,7 +1037,13 @@ mod tests {
             &carol_bundle.key_package().tls_serialize_detached().unwrap(),
         )
         .unwrap();
-        let add_carol = add_member(&mut alice.mls_group, carol_kp_in, &SystemClock).unwrap();
+        let add_carol = add_member(
+            &mut alice.mls_group,
+            carol_kp_in,
+            &scp_mls::GovernanceLeafBlockInput::empty("test-context"),
+            &SystemClock,
+        )
+        .unwrap();
         let mut carol = ContextCryptoState::from_group(
             CTX,
             join_group(
@@ -1246,7 +1258,13 @@ mod tests {
         .unwrap();
         let kp_bytes = bundle.key_package().tls_serialize_detached().unwrap();
         let kp_in = scp_mls::wire::parse_key_package_in(&kp_bytes).unwrap();
-        let result = add_member(&mut alice.mls_group, kp_in, &SystemClock).unwrap();
+        let result = add_member(
+            &mut alice.mls_group,
+            kp_in,
+            &scp_mls::GovernanceLeafBlockInput::empty("test-context"),
+            &SystemClock,
+        )
+        .unwrap();
         let bob_group = join_group(&result.welcome, provider, signer, &SystemClock).unwrap();
         let mut bob = ContextCryptoState::from_group(CTX, bob_group);
 
@@ -1333,7 +1351,13 @@ mod tests {
             &bundle.key_package().tls_serialize_detached().unwrap(),
         )
         .unwrap();
-        let add = add_member(&mut alice.mls_group, kp_in, &SystemClock).unwrap();
+        let add = add_member(
+            &mut alice.mls_group,
+            kp_in,
+            &scp_mls::GovernanceLeafBlockInput::empty("test-context"),
+            &SystemClock,
+        )
+        .unwrap();
         let bob_group = join_group(&add.welcome, provider, signer, &SystemClock).unwrap();
         let mut bob =
             ContextCryptoState::from_group_with_wrapping(CTX, bob_group, bob_wpub, bob_wsec);
@@ -1664,7 +1688,13 @@ mod tests {
             &bundle.key_package().tls_serialize_detached().unwrap(),
         )
         .unwrap();
-        let add = add_member(&mut alice.mls_group, kp_in, &SystemClock).unwrap();
+        let add = add_member(
+            &mut alice.mls_group,
+            kp_in,
+            &scp_mls::GovernanceLeafBlockInput::empty("test-context"),
+            &SystemClock,
+        )
+        .unwrap();
         let welcome_in =
             scp_mls::wire::parse_mls_message_in(&add.welcome.tls_serialize_detached().unwrap())
                 .unwrap();

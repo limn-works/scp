@@ -40,12 +40,12 @@ use super::backend::{
 use super::storage_adapter::OpenMlsStorageAdapter;
 use scp_clock::Clock;
 use scp_did::DID;
-use scp_mls::InMemoryMlsProvider;
 use scp_mls::attested_key_package::{KeyPackageDraft, prepare_key_package};
 use scp_mls::credential::ScpCredential;
 use scp_mls::encrypt::{DecryptedContent, decrypt_with_sender_did};
 use scp_mls::error::MlsError;
 use scp_mls::group::{self, SCP_CIPHERSUITE, ScpMlsGroup};
+use scp_mls::{GovernanceLeafBlockInput, InMemoryMlsProvider};
 use scp_mls::{validate_key_package_lifetime, validate_key_package_lifetime_for_add};
 
 /// Durable-store key namespace for the consumed-init-key set (A2 crypto-layer
@@ -415,6 +415,7 @@ impl MlsBackend for ProductionMlsBackend {
         &self,
         group: &mut ScpMlsGroup,
         key_package_bytes: &[u8],
+        block: &GovernanceLeafBlockInput<'_>,
     ) -> Result<AddMemberRaw, MlsError> {
         // Deserialize the incoming KP bytes into `KeyPackageIn`. This mirrors
         // the existing `add_member` API which accepts a pre-deserialized KP;
@@ -423,7 +424,7 @@ impl MlsBackend for ProductionMlsBackend {
         let kp = scp_mls::wire::parse_key_package_in(&*key_package_bytes)
             .map_err(|e| MlsError::AddMemberFailed(format!("deserializing key package: {e}")))?;
 
-        let result = group::add_member(group, kp, self.clock.as_ref())?;
+        let result = group::add_member(group, kp, block, self.clock.as_ref())?;
 
         // `scp-mls` serialized every message before the merge, so nothing
         // after the epoch advanced can fail.
@@ -438,8 +439,9 @@ impl MlsBackend for ProductionMlsBackend {
         &self,
         group: &mut ScpMlsGroup,
         leaf_index: LeafNodeIndex,
+        block: &GovernanceLeafBlockInput<'_>,
     ) -> Result<RemoveMemberRaw, MlsError> {
-        let result = group::remove_member(group, leaf_index, self.clock.as_ref())?;
+        let result = group::remove_member(group, leaf_index, block, self.clock.as_ref())?;
         Ok(RemoveMemberRaw {
             commit: result.commit_bytes,
             group_info: result.group_info_bytes,
@@ -467,10 +469,12 @@ impl MlsBackend for ProductionMlsBackend {
         &self,
         group: &mut ScpMlsGroup,
         wrapping_pubkey: &[u8; 65],
+        block: &GovernanceLeafBlockInput<'_>,
     ) -> Result<Vec<u8>, MlsError> {
         Ok(scp_mls::ratchet::propose_update_with_wrapping_key(
             group,
             wrapping_pubkey,
+            block,
             self.clock.as_ref(),
         )?
         .commit_bytes)
@@ -1038,7 +1042,11 @@ mod tests {
             .await
             .unwrap();
         let added_a = backend
-            .add_member_raw(&mut grp_a, &kp_gen.key_package_bytes)
+            .add_member_raw(
+                &mut grp_a,
+                &kp_gen.key_package_bytes,
+                &scp_mls::GovernanceLeafBlockInput::empty("test-context"),
+            )
             .await
             .unwrap();
 
@@ -1051,7 +1059,11 @@ mod tests {
             .await
             .unwrap();
         let added_b = backend
-            .add_member_raw(&mut grp_b, &kp_gen.key_package_bytes)
+            .add_member_raw(
+                &mut grp_b,
+                &kp_gen.key_package_bytes,
+                &scp_mls::GovernanceLeafBlockInput::empty("test-context"),
+            )
             .await
             .unwrap();
 
@@ -1125,7 +1137,11 @@ mod tests {
             "Carol's leaf must be expired under the real clock"
         );
         let added = ProductionMlsBackend::new(Arc::new(SystemClock))
-            .add_member_raw(&mut alice, &bob_gen.key_package_bytes)
+            .add_member_raw(
+                &mut alice,
+                &bob_gen.key_package_bytes,
+                &scp_mls::GovernanceLeafBlockInput::empty("test-context"),
+            )
             .await
             .unwrap();
 
@@ -1185,7 +1201,11 @@ mod tests {
             .await
             .unwrap();
         let bob_add = adder
-            .add_member_raw(&mut alice, &bob_gen.key_package_bytes)
+            .add_member_raw(
+                &mut alice,
+                &bob_gen.key_package_bytes,
+                &scp_mls::GovernanceLeafBlockInput::empty("test-context"),
+            )
             .await
             .unwrap();
 
@@ -1270,7 +1290,11 @@ mod tests {
             .await
             .unwrap();
         let bob_add = adder
-            .add_member_raw(&mut alice, &bob_gen.key_package_bytes)
+            .add_member_raw(
+                &mut alice,
+                &bob_gen.key_package_bytes,
+                &scp_mls::GovernanceLeafBlockInput::empty("test-context"),
+            )
             .await
             .unwrap();
         let mut bob = bob_backend
@@ -1293,7 +1317,11 @@ mod tests {
             .await
             .unwrap();
         let carol_add = adder
-            .add_member_raw(&mut alice, &carol_gen.key_package_bytes)
+            .add_member_raw(
+                &mut alice,
+                &carol_gen.key_package_bytes,
+                &scp_mls::GovernanceLeafBlockInput::empty("test-context"),
+            )
             .await
             .unwrap();
 
@@ -1470,7 +1498,11 @@ mod tests {
             .await
             .unwrap();
         let bob_add = adder
-            .add_member_raw(&mut alice, &bob_gen.key_package_bytes)
+            .add_member_raw(
+                &mut alice,
+                &bob_gen.key_package_bytes,
+                &scp_mls::GovernanceLeafBlockInput::empty("test-context"),
+            )
             .await
             .unwrap();
         joiner
@@ -1573,7 +1605,11 @@ mod tests {
             .await
             .unwrap();
         let bob_add = adder
-            .add_member_raw(&mut alice, &bob_gen.key_package_bytes)
+            .add_member_raw(
+                &mut alice,
+                &bob_gen.key_package_bytes,
+                &scp_mls::GovernanceLeafBlockInput::empty("test-context"),
+            )
             .await
             .unwrap();
 
@@ -1640,7 +1676,11 @@ mod tests {
             .await
             .unwrap();
         let bob_add = adder
-            .add_member_raw(&mut alice, &bob_gen.key_package_bytes)
+            .add_member_raw(
+                &mut alice,
+                &bob_gen.key_package_bytes,
+                &scp_mls::GovernanceLeafBlockInput::empty("test-context"),
+            )
             .await
             .unwrap();
 
@@ -1697,7 +1737,11 @@ mod tests {
             group::group_holding_carol_leaf_over_max_range().unwrap();
         let adder = ProductionMlsBackend::new(Arc::new(SystemClock));
         let over_range_add = adder
-            .add_member_raw(&mut alice, &bob_gen.key_package_bytes)
+            .add_member_raw(
+                &mut alice,
+                &bob_gen.key_package_bytes,
+                &scp_mls::GovernanceLeafBlockInput::empty("test-context"),
+            )
             .await
             .unwrap();
 
@@ -1736,7 +1780,11 @@ mod tests {
             .await
             .unwrap();
         let clean_added = adder
-            .add_member_raw(&mut clean, &bob_gen.key_package_bytes)
+            .add_member_raw(
+                &mut clean,
+                &bob_gen.key_package_bytes,
+                &scp_mls::GovernanceLeafBlockInput::empty("test-context"),
+            )
             .await
             .unwrap();
         joiner
@@ -1821,7 +1869,11 @@ mod tests {
 
         // Alice adds Bob via backend primitive.
         let added = backend
-            .add_member_raw(&mut alice_grp, &bob_gen.key_package_bytes)
+            .add_member_raw(
+                &mut alice_grp,
+                &bob_gen.key_package_bytes,
+                &scp_mls::GovernanceLeafBlockInput::empty("test-context"),
+            )
             .await
             .unwrap();
         assert!(!added.commit.is_empty());
@@ -1867,7 +1919,11 @@ mod tests {
             .await
             .unwrap();
         let added = backend
-            .add_member_raw(&mut alice_grp, &bob_gen.key_package_bytes)
+            .add_member_raw(
+                &mut alice_grp,
+                &bob_gen.key_package_bytes,
+                &scp_mls::GovernanceLeafBlockInput::empty("test-context"),
+            )
             .await
             .unwrap();
         let mut bob_grp = backend
@@ -1916,7 +1972,11 @@ mod tests {
             .await
             .unwrap();
         let _added = backend
-            .add_member_raw(&mut alice_grp, &bob_gen.key_package_bytes)
+            .add_member_raw(
+                &mut alice_grp,
+                &bob_gen.key_package_bytes,
+                &scp_mls::GovernanceLeafBlockInput::empty("test-context"),
+            )
             .await
             .unwrap();
         assert_eq!(alice_grp.epoch().unwrap(), 1);
@@ -1926,7 +1986,11 @@ mod tests {
         let bob = members.iter().find(|m| m.index != own_index).unwrap();
 
         let removed = backend
-            .remove_member_raw(&mut alice_grp, bob.index)
+            .remove_member_raw(
+                &mut alice_grp,
+                bob.index,
+                &scp_mls::GovernanceLeafBlockInput::empty("test-context"),
+            )
             .await
             .unwrap();
 
@@ -1950,7 +2014,11 @@ mod tests {
         let wrap_pub = scp_crypto::p256::testing::valid_uncompressed_point(0x22);
 
         let commit_bytes = backend
-            .advance_epoch(&mut alice_grp, &wrap_pub)
+            .advance_epoch(
+                &mut alice_grp,
+                &wrap_pub,
+                &scp_mls::GovernanceLeafBlockInput::empty("test-context"),
+            )
             .await
             .unwrap();
         assert!(!commit_bytes.is_empty());
@@ -2098,7 +2166,11 @@ mod tests {
             .await
             .unwrap();
         let added = backend
-            .add_member_raw(&mut alice_grp, &bob_gen.key_package_bytes)
+            .add_member_raw(
+                &mut alice_grp,
+                &bob_gen.key_package_bytes,
+                &scp_mls::GovernanceLeafBlockInput::empty("test-context"),
+            )
             .await
             .unwrap();
         let mut bob_grp = backend
@@ -2112,7 +2184,11 @@ mod tests {
 
         // Alice advances epoch again; Bob processes the Commit.
         let adv_commit = backend
-            .advance_epoch(&mut alice_grp, &wrap_pub)
+            .advance_epoch(
+                &mut alice_grp,
+                &wrap_pub,
+                &scp_mls::GovernanceLeafBlockInput::empty("test-context"),
+            )
             .await
             .unwrap();
         assert_eq!(alice_grp.epoch().unwrap(), 2);
@@ -2152,7 +2228,11 @@ mod tests {
             .await
             .unwrap();
         let added = backend
-            .add_member_raw(&mut alice_grp, &bob_gen.key_package_bytes)
+            .add_member_raw(
+                &mut alice_grp,
+                &bob_gen.key_package_bytes,
+                &scp_mls::GovernanceLeafBlockInput::empty("test-context"),
+            )
             .await
             .unwrap();
         let mut bob_grp = backend
@@ -2245,7 +2325,11 @@ mod tests {
 
         // The Add SUCCEEDS: bob's leaf declares 0xFF02, satisfying valn0502.
         let added = backend
-            .add_member_raw(&mut alice_group, &bob_gen.key_package_bytes)
+            .add_member_raw(
+                &mut alice_group,
+                &bob_gen.key_package_bytes,
+                &scp_mls::GovernanceLeafBlockInput::empty("test-context"),
+            )
             .await
             .expect("production KP must satisfy valn0502 for a context group");
 
