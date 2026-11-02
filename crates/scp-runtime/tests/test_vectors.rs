@@ -36,6 +36,13 @@ use scp_protocol::context::governance::{
     GovernanceAction, VoteType, compute_proposal_id, vote_signing_digest,
 };
 use scp_protocol::context::outlets::interface::InterfaceOffer;
+use scp_protocol::context::{
+    CONTEXT_CHAIN_SEPARATOR, CONTEXT_NODE_ADDRESS_SEPARATOR, CONTEXT_OPERATOR_SEPARATOR,
+    CONTEXT_RECEIPT_SEPARATOR, ContextChainEntry, ContextNodeAddress, ContextOperatorBinding,
+    ContextOperatorError, ContextReceipt, NodeAddress, NodeAddressError, NodeBridge,
+    VerifiedContextChainEntry, VerifiedContextNodeAddress, VerifiedContextOperatorBinding,
+    VerifiedContextReceipt, submission_hash,
+};
 use scp_protocol::crypto::canonical::{CanonicalField, canonical_hash_bytes};
 use scp_protocol::crypto::sender_keys::key_protocol_verify::build_hpke_info;
 use scp_protocol::discovery::push::{
@@ -1957,6 +1964,10 @@ fn domain_separators_are_all_unique() {
         NODE_BINDING_SEPARATOR,
         NODE_LIST_SEPARATOR,
         NODE_PROOF_SEPARATOR,
+        CONTEXT_OPERATOR_SEPARATOR,
+        CONTEXT_NODE_ADDRESS_SEPARATOR,
+        CONTEXT_CHAIN_SEPARATOR,
+        CONTEXT_RECEIPT_SEPARATOR,
     ];
 
     // HKDF/HMAC labels, used as info strings, salts, or trailing labels. A
@@ -1996,4 +2007,420 @@ fn domain_separators_are_all_unique() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// §25.36 Context operator vectors: Vector 92 (ContextOperatorBinding), 93
+// (ContextNodeAddress), 94 (context chain entry) and 95 (context receipt)
+// ---------------------------------------------------------------------------
+
+const VECTOR_92_BINDING_HASH: &str =
+    "97cc6597a4654e17a07e1055b8c46372cabe5f947483030762f2227d2904d235";
+
+fn vector_92_binding() -> ContextOperatorBinding {
+    ContextOperatorBinding::from_bytes(&unhex(
+        "0000004036323532636634363739656562343365356434663234353637323565643533383565643935323530643434653734653663356164616561643439396431333433dbcd556971e435cdeff24dc1b3adc25f1cd8e351abe741b76ca5e40df3ed15270223702a648232f2d00713de9289753c2fbd4c4efa7e1e33905e3723a412b20aeac41c1bc7c9da5a260c56f31e9ded8035359e5f59cebb49addd18ea2f1d71520de4eb46fdb1f4c0e3f8bdd0efe757620c2bd2b5c4bbd08d05f54e313a3ff6a8a005c5d40cbdf1b79e6ac3e1164a4cc15540a78e7b90f8475022c91bf75f574aea",
+    ))
+    .unwrap()
+}
+
+fn vector_92_verified() -> VerifiedContextOperatorBinding {
+    VerifiedContextOperatorBinding::verify(
+        vector_92_binding(),
+        &unhex32(VECTOR_92_BINDING_HASH),
+        &fixture_public(2),
+    )
+    .unwrap()
+}
+
+fn check_context_binding(
+    binding: &ContextOperatorBinding,
+    operator_active: &P256PublicKey,
+) -> Result<(), ContextOperatorError> {
+    VerifiedContextOperatorBinding::verify(
+        binding.clone(),
+        &unhex32(VECTOR_92_BINDING_HASH),
+        operator_active,
+    )
+    .map(|_| ())
+}
+
+#[test]
+fn vector_92_context_operator_binding() {
+    let binding = vector_92_binding();
+    assert_eq!(
+        binding.context_id,
+        hex::encode(sha256(b"scp-25-context-operator-context"))
+    );
+    assert_eq!(
+        binding.operator.as_bytes(),
+        &unhex32("dbcd556971e435cdeff24dc1b3adc25f1cd8e351abe741b76ca5e40df3ed1527")
+    );
+    assert_eq!(
+        binding.operator.as_bytes(),
+        &sha256(b"scp-25-context-operator")
+    );
+    assert_eq!(binding.context_key.as_slice(), unhex(REFERENCE_KEYS[1].2));
+    assert_eq!(
+        binding.key_state_head,
+        sha256(b"scp-25-context-operator-head")
+    );
+    let hash = binding.binding_hash().unwrap();
+    assert_eq!(hex::encode(hash), VECTOR_92_BINDING_HASH);
+    assert_spec_preimage(
+        "vector 92",
+        "5343502d434f4e544558542d4f50455241544f522d56313a0000004036323532636634363739656562343365356434663234353637323565643533383565643935323530643434653734653663356164616561643439396431333433dbcd556971e435cdeff24dc1b3adc25f1cd8e351abe741b76ca5e40df3ed15270223702a648232f2d00713de9289753c2fbd4c4efa7e1e33905e3723a412b20aeac41c1bc7c9da5a260c56f31e9ded8035359e5f59cebb49addd18ea2f1d71520d",
+        189,
+        &hash,
+    );
+    assert_eq!(
+        sign_prehash_rfc6979(&fixture_secret(2), &hash).unwrap(),
+        binding.signature
+    );
+    assert_eq!(binding.to_bytes().unwrap().len(), 229);
+    let verified = vector_92_verified();
+    assert_eq!(verified.binding(), &binding);
+    assert_eq!(*verified.context_key(), fixture_public(1));
+
+    // Negative: another operator key, another held hash, each field changed.
+    assert_eq!(
+        check_context_binding(&binding, &fixture_public(1)),
+        Err(ContextOperatorError::Signature(
+            P256Error::VerificationFailed
+        ))
+    );
+    let mut other_hash = unhex32(VECTOR_92_BINDING_HASH);
+    other_hash[0] ^= 1;
+    assert_eq!(
+        VerifiedContextOperatorBinding::verify(binding.clone(), &other_hash, &fixture_public(2)),
+        Err(ContextOperatorError::BindingMismatch)
+    );
+    let mut changed = binding.clone();
+    changed.context_id.push('0');
+    assert_eq!(
+        check_context_binding(&changed, &fixture_public(2)),
+        Err(ContextOperatorError::BindingMismatch)
+    );
+    let mut changed = binding.clone();
+    changed.key_state_head[31] ^= 1;
+    assert_eq!(
+        check_context_binding(&changed, &fixture_public(2)),
+        Err(ContextOperatorError::BindingMismatch)
+    );
+    let mut changed = binding.clone();
+    changed.context_key = fixture_node_key(0);
+    assert_eq!(
+        check_context_binding(&changed, &fixture_public(2)),
+        Err(ContextOperatorError::BindingMismatch)
+    );
+    let mut changed = binding.clone();
+    changed.signature[0] ^= 1;
+    assert!(matches!(
+        check_context_binding(&changed, &fixture_public(2)),
+        Err(ContextOperatorError::Signature(_))
+    ));
+
+    // Negative: the high-`s` form of the valid signature is refused.
+    let mut changed = binding;
+    changed.signature = high_s_form(&changed.signature);
+    assert_eq!(
+        check_context_binding(&changed, &fixture_public(2)),
+        Err(ContextOperatorError::Signature(P256Error::HighS))
+    );
+}
+
+const VECTOR_93A_BYTES: &str = "97cc6597a4654e17a07e1055b8c46372cabe5f947483030762f2227d2904d2350000000000000001000000257773733a2f2f636f6e746578742d6e6f64652e6578616d706c652e636f6d2f7363702f7631000000206e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d6dcdeb8bbb5ef953d7d25452ed657f0c5c51904c1adf48aceb539f11434f919325b767a6b978a819200afef71c7daccba5860acbcbf07021c5b273b2f4de3960";
+const VECTOR_93B_BYTES: &str = "97cc6597a4654e17a07e1055b8c46372cabe5f947483030762f2227d2904d23500000000000000020000001f7773733a2f2f6272696467652e6578616d706c652e636f6d2f7363702f763100000061e77d53354271e4c1c3c319cf7b5cfcc23be431c2ec795d5b6ecf549355f156104102ed70d1c4b106466149a7d129630c11a20554683ae012fdffa56341d1c3230205de7df5512de2c640fb2dce84659ae7bbae26e7add7fb557d02b00a809ce0aef8e34719e8a710dd80c130b9cc32a76ce8cf578fcc7e9b7eabae23040a2825ef54e5fd00e92409bc93dbd9e0c4215d490f61b6c3a6c20901c073c5bb70ba52fb";
+
+/// Vector 93b's node: Vector 90's `NodeId`, Vector 48's bridge target and
+/// wrapping key.
+fn vector_93b_node() -> NodeAddress {
+    NodeAddress::bridged(
+        BridgeEndpoint::new("wss://bridge.example.com/scp/v1").unwrap(),
+        NodeBridge {
+            via: vector_49_entry(0).binding.node_id().unwrap(),
+            bridge_target: BridgeTarget::new(unhex32(
+                "4102ed70d1c4b106466149a7d129630c11a20554683ae012fdffa56341d1c323",
+            ))
+            .unwrap(),
+            wrapping_key: P256PublicKey::from_sec1(&unhex(
+                "0205de7df5512de2c640fb2dce84659ae7bbae26e7add7fb557d02b00a809ce0ae",
+            ))
+            .unwrap(),
+        },
+    )
+}
+
+#[test]
+fn vector_93_context_node_address() {
+    let binding = vector_92_verified();
+
+    // 93a: the production encoder builds the printed bytes from the inputs.
+    let direct =
+        NodeAddress::direct(NodeUrl::new("wss://context-node.example.com/scp/v1").unwrap());
+    let digest_a = ContextNodeAddress::signing_digest(binding.binding_hash(), 1, &direct).unwrap();
+    assert_eq!(
+        hex::encode(digest_a),
+        "7fc9592818c44a7e987dc4bf524811f0ed2b9b51ba7824e96afc2409f5bb8533"
+    );
+    assert_spec_preimage(
+        "vector 93a",
+        "5343502d434f4e544558542d4e4f44452d414444524553532d56313a97cc6597a4654e17a07e1055b8c46372cabe5f947483030762f2227d2904d2350000000000000001000000257773733a2f2f636f6e746578742d6e6f64652e6578616d706c652e636f6d2f7363702f7631000000206e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+        145,
+        &digest_a,
+    );
+    let address_a = ContextNodeAddress {
+        binding_hash: *binding.binding_hash(),
+        sequence: 1,
+        node: direct,
+        signature: sign_prehash_rfc6979(&fixture_secret(1), &digest_a).unwrap(),
+    };
+    assert_eq!(hex::encode(address_a.to_bytes().unwrap()), VECTOR_93A_BYTES);
+    assert_eq!(
+        ContextNodeAddress::from_bytes(&unhex(VECTOR_93A_BYTES)).unwrap(),
+        address_a
+    );
+
+    let bridged = vector_93b_node();
+    assert_eq!(
+        hex::encode(bridged.bridge().unwrap().via.as_bytes()),
+        "e77d53354271e4c1c3c319cf7b5cfcc23be431c2ec795d5b6ecf549355f15610"
+    );
+    let digest_b = ContextNodeAddress::signing_digest(binding.binding_hash(), 2, &bridged).unwrap();
+    assert_eq!(
+        hex::encode(digest_b),
+        "2e7b3d7939598ec900db0c283a2a45968386648b1b58752c334b62bdcf4ad451"
+    );
+    assert_spec_preimage(
+        "vector 93b",
+        "5343502d434f4e544558542d4e4f44452d414444524553532d56313a97cc6597a4654e17a07e1055b8c46372cabe5f947483030762f2227d2904d23500000000000000020000001f7773733a2f2f6272696467652e6578616d706c652e636f6d2f7363702f763100000061e77d53354271e4c1c3c319cf7b5cfcc23be431c2ec795d5b6ecf549355f156104102ed70d1c4b106466149a7d129630c11a20554683ae012fdffa56341d1c3230205de7df5512de2c640fb2dce84659ae7bbae26e7add7fb557d02b00a809ce0ae",
+        204,
+        &digest_b,
+    );
+    let address_b = ContextNodeAddress {
+        binding_hash: *binding.binding_hash(),
+        sequence: 2,
+        node: bridged,
+        signature: sign_prehash_rfc6979(&fixture_secret(1), &digest_b).unwrap(),
+    };
+    assert_eq!(hex::encode(address_b.to_bytes().unwrap()), VECTOR_93B_BYTES);
+
+    // Both verify, and the higher sequence wins in one direction only.
+    let verified_a = VerifiedContextNodeAddress::verify(
+        ContextNodeAddress::from_bytes(&unhex(VECTOR_93A_BYTES)).unwrap(),
+        &binding,
+    )
+    .unwrap();
+    let verified_b = VerifiedContextNodeAddress::verify(
+        ContextNodeAddress::from_bytes(&unhex(VECTOR_93B_BYTES)).unwrap(),
+        &binding,
+    )
+    .unwrap();
+    assert_eq!(
+        verified_b
+            .clone()
+            .supersede(&verified_a)
+            .unwrap()
+            .sequence(),
+        2
+    );
+    assert_eq!(
+        verified_a.clone().supersede(&verified_b),
+        Err(NodeAddressError::NotNewer {
+            held: 2,
+            offered: 1
+        })
+    );
+    assert_eq!(
+        verified_a.clone().supersede(&verified_a),
+        Err(NodeAddressError::NotNewer {
+            held: 1,
+            offered: 1
+        })
+    );
+
+    // Negative: under the operator's #active instead of context_key.
+    let mut wrong_key = address_a.clone();
+    wrong_key.signature = sign_prehash_rfc6979(&fixture_secret(2), &digest_a).unwrap();
+    assert_eq!(
+        VerifiedContextNodeAddress::verify(wrong_key, &binding),
+        Err(NodeAddressError::Signature(P256Error::VerificationFailed))
+    );
+    // Negative: the high-`s` form of each valid signature is refused.
+    for address in [address_a, address_b] {
+        let mut high = address;
+        high.signature = high_s_form(&high.signature);
+        assert_eq!(
+            VerifiedContextNodeAddress::verify(high, &binding),
+            Err(NodeAddressError::Signature(P256Error::HighS))
+        );
+    }
+}
+
+/// Vector 93: a change to any one byte of either printed address is refused,
+/// at decode or at verification.
+#[test]
+fn vector_93_refuses_any_changed_byte() {
+    let binding = vector_92_verified();
+    for printed in [VECTOR_93A_BYTES, VECTOR_93B_BYTES] {
+        let bytes = unhex(printed);
+        for i in 0..bytes.len() {
+            let mut flipped = bytes.clone();
+            flipped[i] ^= 1;
+            let refused = ContextNodeAddress::from_bytes(&flipped)
+                .and_then(|a| VerifiedContextNodeAddress::verify(a, &binding))
+                .is_err();
+            assert!(refused, "byte {i} of {printed}");
+        }
+    }
+}
+
+fn vector_94_entry() -> ContextChainEntry {
+    ContextChainEntry {
+        binding_hash: unhex32(VECTOR_92_BINDING_HASH),
+        position: 7,
+        item_hash: submission_hash(b"scp-25-context-submission"),
+        previous_hash: sha256(b"scp-25-context-chain-entry-6"),
+        signature: unhex(
+            "c01e2d5e8b904fa683afe9c762926a479632a2cc58249971d5cc5e9e234864b7411904daa0a5ee1c6d36ed6b697ba4811dc84b2fbcb6b11833cb1ca32ce65472",
+        )
+        .try_into()
+        .unwrap(),
+    }
+}
+
+fn vector_95_receipt() -> ContextReceipt {
+    ContextReceipt {
+        binding_hash: unhex32(VECTOR_92_BINDING_HASH),
+        position: 7,
+        submission_hash: submission_hash(b"scp-25-context-submission"),
+        signature: unhex(
+            "f8f0e30c7d15d0da45df4ef15004aafc2ebb856897dc4936bcc92dd9c9e61f4b4f1b796dc5355264c2b51a13fd99808c87146f385875b7e1bf32528dbf1ad575",
+        )
+        .try_into()
+        .unwrap(),
+    }
+}
+
+#[test]
+fn vector_94_context_chain_entry() {
+    let binding = vector_92_verified();
+    let entry = vector_94_entry();
+    assert_eq!(
+        entry.item_hash,
+        unhex32("15ced3699799818d385b605e1ef4d0db4b3d316b212b707bba4fddc642b1daf3")
+    );
+    assert_eq!(
+        entry.previous_hash,
+        unhex32("256e09d2a7df03b2dc686d806fe1c7933b4fd1b1c9aae033e764c35917e9b4fa")
+    );
+    let digest = entry.digest();
+    assert_eq!(
+        hex::encode(digest),
+        "19cb7638380565ba5f4aac658aa9cec42213e146b717a112dc6891cabf42d7d1"
+    );
+    assert_spec_preimage(
+        "vector 94",
+        "5343502d434f4e544558542d434841494e2d56313a97cc6597a4654e17a07e1055b8c46372cabe5f947483030762f2227d2904d235000000000000000715ced3699799818d385b605e1ef4d0db4b3d316b212b707bba4fddc642b1daf3256e09d2a7df03b2dc686d806fe1c7933b4fd1b1c9aae033e764c35917e9b4fa",
+        125,
+        &digest,
+    );
+    assert_eq!(
+        sign_prehash_rfc6979(&fixture_secret(1), &digest).unwrap(),
+        entry.signature
+    );
+    assert_eq!(
+        VerifiedContextChainEntry::verify(entry.clone(), &binding)
+            .unwrap()
+            .entry(),
+        &entry
+    );
+
+    // Negative: under the operator's #active, each field changed, high s.
+    let mut changed = entry.clone();
+    changed.signature = sign_prehash_rfc6979(&fixture_secret(2), &digest).unwrap();
+    assert_eq!(
+        VerifiedContextChainEntry::verify(changed, &binding),
+        Err(ContextOperatorError::Signature(
+            P256Error::VerificationFailed
+        ))
+    );
+    let mut changed = entry.clone();
+    changed.position = 6;
+    assert!(VerifiedContextChainEntry::verify(changed, &binding).is_err());
+    let mut changed = entry.clone();
+    changed.item_hash[0] ^= 1;
+    assert!(VerifiedContextChainEntry::verify(changed, &binding).is_err());
+    let mut changed = entry.clone();
+    changed.previous_hash[0] ^= 1;
+    assert!(VerifiedContextChainEntry::verify(changed, &binding).is_err());
+    let mut changed = entry.clone();
+    changed.binding_hash[0] ^= 1;
+    assert_eq!(
+        VerifiedContextChainEntry::verify(changed, &binding),
+        Err(ContextOperatorError::BindingMismatch)
+    );
+    let mut changed = entry;
+    changed.signature = high_s_form(&changed.signature);
+    assert_eq!(
+        VerifiedContextChainEntry::verify(changed, &binding),
+        Err(ContextOperatorError::Signature(P256Error::HighS))
+    );
+}
+
+#[test]
+fn vector_95_context_receipt() {
+    let binding = vector_92_verified();
+    let receipt = vector_95_receipt();
+    // One submission's receipt and chain entry carry one hash.
+    assert_eq!(receipt.submission_hash, vector_94_entry().item_hash);
+    let digest = receipt.digest();
+    assert_eq!(
+        hex::encode(digest),
+        "f7bed001b5e838dc4f0e013b0ab8c0ff352be4b6b213119c10f4679390872732"
+    );
+    assert_spec_preimage(
+        "vector 95",
+        "5343502d434f4e544558542d524543454950542d56313a97cc6597a4654e17a07e1055b8c46372cabe5f947483030762f2227d2904d235000000000000000715ced3699799818d385b605e1ef4d0db4b3d316b212b707bba4fddc642b1daf3",
+        95,
+        &digest,
+    );
+    assert_eq!(
+        sign_prehash_rfc6979(&fixture_secret(1), &digest).unwrap(),
+        receipt.signature
+    );
+    assert_eq!(
+        VerifiedContextReceipt::verify(receipt.clone(), &binding)
+            .unwrap()
+            .receipt(),
+        &receipt
+    );
+
+    // Negative: under the operator's #active, each field changed, high s.
+    let mut changed = receipt.clone();
+    changed.signature = sign_prehash_rfc6979(&fixture_secret(2), &digest).unwrap();
+    assert_eq!(
+        VerifiedContextReceipt::verify(changed, &binding),
+        Err(ContextOperatorError::Signature(
+            P256Error::VerificationFailed
+        ))
+    );
+    let mut changed = receipt.clone();
+    changed.position = 8;
+    assert!(VerifiedContextReceipt::verify(changed, &binding).is_err());
+    let mut changed = receipt.clone();
+    changed.submission_hash[0] ^= 1;
+    assert!(VerifiedContextReceipt::verify(changed, &binding).is_err());
+    let mut changed = receipt.clone();
+    changed.binding_hash[0] ^= 1;
+    assert_eq!(
+        VerifiedContextReceipt::verify(changed, &binding),
+        Err(ContextOperatorError::BindingMismatch)
+    );
+    let mut changed = receipt;
+    changed.signature = high_s_form(&changed.signature);
+    assert_eq!(
+        VerifiedContextReceipt::verify(changed, &binding),
+        Err(ContextOperatorError::Signature(P256Error::HighS))
+    );
 }
