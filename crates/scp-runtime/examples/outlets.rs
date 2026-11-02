@@ -4,7 +4,7 @@
 //! capabilities, and invoking the outlet with input validation.
 //!
 //! Usage:
-//!   `cargo run -p scp-runtime --features testing --example outlets`
+//!   `cargo run -p scp-runtime --example outlets`
 
 use scp_did::DID;
 use scp_protocol::context::outlets::lifecycle::OutletStatus;
