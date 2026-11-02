@@ -7169,7 +7169,8 @@ def check_artifact_input_digests_fail_closed(doc: dict) -> None:
     ImageVersion is unset, exits 0 and writes a digest when every command succeeds, and writes a
     different digest when the workflow-level env: block changes, at its top or below
     the column-0 comments that follow it, or when the job's own definition changes
-    below a comment indented as a job key.
+    below a comment indented as a job key, and writes the same digest when only a
+    whole-line comment or a blank line changes in either.
 
     WHY: a tool that fails puts nothing into the digest, so the key stops encoding
     that tool's version, and a later change to the tool restores an artifact the
@@ -7293,6 +7294,45 @@ def check_artifact_input_digests_fail_closed(doc: dict) -> None:
             and stop_jobs[0] == stop_jobs[1],
             "extraction that stops at a comment still saw a variable or job key "
             "written below one",
+        )
+        # Whole-line comments and blank lines change no build, so adding them to
+        # the env: range, to the job and to the comment block that heads the next
+        # job leaves the digest alone.
+        jobs_at = workflow.index("\njobs:\n")
+        next_job = workflow.index("\n  ", workflow.index(header) + len(header))
+        while not re.match(r"\n  [^ #]", workflow[next_job:]):
+            next_job = workflow.index("\n  ", next_job + 1)
+        commented = (
+            workflow[:jobs_at]
+            + "\n# probe comment\n\n"
+            + workflow[jobs_at:next_job]
+            + "\n    # probe comment\n\n  # probe comment heading the next job"
+            + workflow[next_job:]
+        ).replace(header, f"{header}    # probe comment\n", 1)
+        _, commented_output = run_artifact_inputs_step(
+            step, job_id, None, workflow=commented
+        )
+        check(
+            f"{job_id}: a comment or blank line in the env: block or the job leaves "
+            f"the digest unchanged",
+            commented != workflow and commented_output == output,
+            f"adding comments and blank lines moved the digest from {output!r} to "
+            f"{commented_output!r}",
+        )
+        # Control: the step without its comment-and-blank-line skip is reported.
+        hashes_comments = script.replace(
+            " found && /^[[:space:]]*(#|$)/ {next}", ""
+        )
+        _, plain_comments = run_artifact_inputs_step(
+            step, job_id, None, script=hashes_comments
+        )
+        _, commented_comments = run_artifact_inputs_step(
+            step, job_id, None, script=hashes_comments, workflow=commented
+        )
+        check(
+            f"{job_id}: a step that hashes comments is reported",
+            hashes_comments != script and plain_comments != commented_comments,
+            "a step that hashes comments still kept the digest across a comment edit",
         )
         # Control: the step with its workflow-env line removed is reported.
         without_env = "\n".join(
