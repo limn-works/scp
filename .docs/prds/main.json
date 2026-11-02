@@ -13561,15 +13561,23 @@
       "status": "pending",
       "files": [
         "crates/scp-mls/src/group.rs",
-        "crates/scp-mls/src/provider.rs"
+        "crates/scp-mls/src/provider.rs",
+        "crates/scp-mls/src/lifetime.rs",
+        "crates/scp-mls/src/encrypt.rs"
       ],
-      "description": "ADR-069 decision 4. A committer keeps its own Commit staged and unmerged after it submits it, until it reaches the chain position its receipt names, so the SDK must hold a staged Commit across other members' Commits and a restart without merging it, and discard it without any state change when another Commit for its epoch merges first. The choice of the Commit per epoch is SCP-351. SCP carries no openmls patch: the adder's lifetime checks bound openmls's receive-time lifetime check (ADR-069 decision 9), and this story changes nothing in that check.",
+      "description": "ADR-069 decision 4. A committer keeps its own Commit staged and unmerged after it submits it, until it reaches the chain position its receipt names, so the SDK must hold a staged Commit across other members' Commits and a restart without merging it, and discard it without any state change when another Commit for its epoch merges first. The choice of the Commit per epoch is SCP-351. This story also owns ADR-069 decision 9: every member, the committer included, checks each KeyPackage a Commit adds against the `append_time` of the Commit's chain entry, `not_before <= t < not_after` with the range within `MAX_KEYPACKAGE_ATTESTATION_LIFETIME`, as part of step 1 of `07-trust-validation-and-capabilities.md` §7.3.1.1 \"Receiver processing\", in place of the receive-side range-only check in `decrypt_with_sender_did` and `decrypt_with_membership_changes`. SCP carries no openmls patch, so the check runs on the staged Commit's Adds after `process_message` and before the merge. When `process_message` refuses with `LifetimeError`, the bound the error names is checked against t: a bound that fails at t is a verdict, and one that passes leaves the Commit neither merged nor skipped and hands the device to Welcome-based fast-forward or reset (`09-security-model.md` §9.7.1, \"openmls's own receive-side clock check\"). No API takes a time from its caller. The node side, which signs `append_time` into each chain entry, belongs with the rest of the node chain to plan decision D1, so this story's tests build the chain entries they read.",
       "acceptanceCriteria": [
         "A test stages a committer's Commit, restarts the process, and finds the Commit still staged and the group at its epoch; merging the staged Commit then moves the group to the next epoch",
-        "A test stages a committer's Commit naming N, then processes and merges another member's valid Commit naming N; the group reaches N + 1 through the other Commit, and the staged Commit is discarded without having changed the group's state"
+        "A test stages a committer's Commit naming N, then processes and merges another member's valid Commit naming N; the group reaches N + 1 through the other Commit, and the staged Commit is discarded without having changed the group's state",
+        "A chain entry whose `append_time` lies inside an added KeyPackage's `Lifetime` lets every member merge the Commit, and one whose `append_time` is at or past `not_after`, or before `not_before`, makes every member skip it, whatever each member's clock reads, one test per bound",
+        "A committer whose own Commit adds a KeyPackage that fails at its chain entry's `append_time` discards the staged Commit at its position and ends at the same epoch, event log, and governance state as a member that skipped it",
+        "A member whose openmls refuses a Commit with `LifetimeError::Expired` naming a `not_after` later than the chain entry's `append_time` neither merges nor skips the Commit, takes no later Commit for that epoch, and reports `EpochCatchUpFailure`; one naming a `not_after` at or before `append_time` skips the Commit",
+        "No public function of `scp-mls` or `scp-runtime` takes a time argument for the received-Add lifetime check"
       ],
       "actionItems": [
         "Keep a staged Commit unmerged across other Commits and a restart",
+        "Replace the receive-side range-only check with the check against the chain entry's `append_time`, run before the merge for received and own Commits",
+        "Keep the bound openmls's `LifetimeError` names on a refused Commit, and settle it against `append_time`",
         "Add the tests the criteria name"
       ],
       "blockedBy": [],
@@ -13577,6 +13585,14 @@
         {
           "file": ".docs/adrs/ADR-069-node-ordered-commits.md",
           "section": "## Decision"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.7.1 MLS-to-SCP Concept Mapping"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.9.3 Equivocation Detection — Context Chain Proofs"
         }
       ],
       "details": {}

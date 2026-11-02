@@ -83,7 +83,7 @@ Tried in order:
 
 1. The committer builds the Commit on its state at epoch e, keeps it staged and unmerged, and persists the staged Commit encrypted before it submits it.
 2. It submits the Commit to the context's node with the Commit's class, Remove, re-join or other (ADR-069 decision 2), and receives the node's signed receipt, which names the Commit's chain position and carries the `lost` flag. A Remove-class or re-join-class submission carries a `hold_commitment`, and when its receipt says lost, the committer submits the rebuilt action as the opening of that hold (ADR-069 decision 10, `07-trust-validation-and-capabilities.md` §7.3.1.1 "Commit order").
-3. It merges the staged Commit when, processing the chain in order, it reaches the position its receipt names while its group is still at epoch e.
+3. It merges the staged Commit when, processing the chain in order, it reaches the position its receipt names while its group is still at epoch e and every KeyPackage the Commit adds passes the check against that chain entry's `append_time` (ADR-069 decision 9). When a KeyPackage fails that check, it discards the staged Commit, as every other member skips it.
 4. When an earlier chain item has moved its group past epoch e, it discards the staged Commit, re-checks its action against the new state, and submits the action again or reports the proposal `Invalidated` (ADR-066 decision 5, `07-trust-validation-and-capabilities.md` §7.3.1.1 "Competing Commits").
 5. It never merges a Commit the chain does not hold. A committer that holds no receipt has merged nothing and submits the Commit again (`07-trust-validation-and-capabilities.md` §7.3.1.1 "Commit order").
 
@@ -94,7 +94,7 @@ The committer sends the Welcome of an Add only after the merge of step 3.
 ### 23.4.2 Epoch Catch-Up Limits
 
 - The SDK SHOULD process at most **100 sequential Commits** per catch-up attempt (RECOMMENDED implementation default, configurable via `SyncPolicy`). Beyond this limit, the SDK switches to Welcome-based fast-forward.
-- Each Commit is processed within a **5-second timeout**. A chain item that fails step 1 or step 2 at its position is skipped (§23.4.1) and is not a failure. A Commit the device cannot process for another reason (a timeout, a missing earlier position) is logged as `EpochCatchUpFailure`, and the SDK falls through to the next recovery source.
+- Each Commit is processed within a **5-second timeout**. A chain item that fails step 1 or step 2 at its position is skipped (§23.4.1) and is not a failure. A Commit the device cannot process for another reason (a timeout, a missing earlier position, or openmls's system-clock lifetime check refusing a Commit whose KeyPackages pass at the chain entry's `append_time`) is logged as `EpochCatchUpFailure`, and the SDK falls through to the next recovery source. The device neither merges nor skips that Commit and takes no later Commit for its epoch (ADR-069 decision 9). A peer request returns the same Commit, which openmls refuses again, so a device refused by openmls's clock recovers through Welcome-based fast-forward (§23.4.1 source 3) or a group state reset (§23.5).
 - The 100-Commit limit is a practical bound. In a context with 24-hour PCS Update intervals and 10 members, 100 Commits represents roughly 10 days of activity. Contexts with higher churn (frequent joins/leaves) may hit this limit sooner.
 
 ### 23.4.3 Catch-Up Status
