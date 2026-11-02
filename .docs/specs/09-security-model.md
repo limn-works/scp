@@ -834,6 +834,8 @@ The operator of the node that runs a context signs one `ContextOperatorBinding` 
 
 `binding_hash` is `SHA-256("SCP-CONTEXT-OPERATOR-V1:" || fields 1..4)`. The operator's `#active` key signs `binding_hash`, and the binding carries that signature beside the four fields.
 
+**The binding's bytes.** A binding travels as fields 1 to 4 in the encoding of the table, followed by the operator's 64-byte signature (§9.5), with no separator and nothing after the signature: `BE32(len(context_id)) ‖ context_id ‖ operator ‖ context_key ‖ key_state_head ‖ signature`, 165 bytes plus the length of `context_id`. A reader refuses bytes that end before the signature or continue after it, and a `context_id` that is not UTF-8. These bytes have one reading, so a reader that decodes them and encodes the result reproduces them byte for byte.
+
 - **Class.** The binding is log-anchored evidence (§9.7.1): it verifies when the operator's `#active` key was `Current` at `key_state_head`. A later rotation of the operator's `#active`, and the compromise recovery of §9.12, leave the binding valid, so an equivocation proof or a dropped-submission proof under `context_key` (§9.9.3) keeps verifying after every later rotation by the operator it accuses. A `Compromised{from: N}` marking on the operator's key takes §9.7.1's first-seen rule.
 - **Key check.** A verifier refuses a binding whose `context_key` does not decompress to a point on the P-256 curve.
 - **One binding for each instantiation.** `binding_hash` is a genesis parameter of the context, which the creator's `InvitationBundle` signature covers through `genesis_params_hash` (`05-contexts.md` §5.12.3.1). It is also a field of the context's `0xFF02` group-context extension, which no Commit changes (`05-contexts.md` §5.13.3 rule 11). A reader that has not joined checks a binding against the `binding_hash` of the invitation it holds, and a member checks a binding against the `binding_hash` of its extension. A binding that a thief signs, under the operator's current `#active` or a superseded one, has another `binding_hash`. No member's group state carries that hash, so no member accepts the thief's binding beside the true binding or in its place.
@@ -854,6 +856,12 @@ A `NodeAddress` encodes as two fields under §9.5.1:
 | 1 | `url` | 4-byte BE length + UTF-8 bytes of the canonical URL |
 | 2 | `bridge` | 4-byte BE length + body. When `bridge` is present, the body is the 97 bytes `via` (32) ‖ `bridge_target` (32) ‖ `wrapping_key` (33). When `bridge` is absent, the body is the 32 bytes `SHA-256(0x00)` (§9.5.1). |
 
+**A reader decodes a `NodeAddress` by these rules,** which give every valid address exactly one encoding:
+- `url` is UTF-8 and already in the canonical form of §9.18.2 **Canonical node URL**, with a path that ends in `/scp/v1` (`18-addressability-and-deployment.md` §18.2.1). A reader refuses a `url` that canonicalization would change, so two spellings of one URL never produce two encodings of one address.
+- The `bridge` length is 97 or 32. At 97 the body is a present `bridge`; at 32 the body MUST be `SHA-256(0x00)`, and a reader refuses any other 32 bytes. A reader refuses every other length.
+- In a present `bridge`, a reader refuses a `bridge_target` equal to `SHA-256(0x00)`, so the absent body and a present body never share a target, and refuses a `wrapping_key` that fails the point validation of §9.5.
+- A `NodeAddress` that carries a `bridge` has a `url` whose scheme is `wss`, because a peer reaches a node behind a bridge over the bridge node's TLS URL (`10-infrastructure-and-self-hosting.md` §10.12.6, §10.12.7). A reader refuses a `bridge` beside a `ws` URL.
+
 **A party checks `wrapping_key` at each use.** Before it seals to the key (`10-infrastructure-and-self-hosting.md` §10.7.1 **Tier 3 envelope**), the party reads the operator's key state, which it verifies by replaying the operator's key-event log (§9.7.4.2 R2, R3, R8). It seals only when that key state lists the 33 bytes `Current` as the wrapping-key entry of one of the operator's devices. When the check fails, the party refuses to seal with a typed error, so a `NodeAddress` whose `wrapping_key` fails the check gives that party no usable bridge. The address carries the key and no verdict on it, so a `wrapping_key` that the operator rotated out fails the check at its next use, before the node signs a new address.
 
 **ContextNodeAddress** — domain: `"SCP-CONTEXT-NODE-ADDRESS-V1:"`
@@ -865,6 +873,8 @@ A `NodeAddress` encodes as two fields under §9.5.1:
 | 3 | `node` | the `NodeAddress` encoding above, its two fields in order |
 
 The node signs `SHA-256("SCP-CONTEXT-NODE-ADDRESS-V1:" || fields 1..3)` under `context_key`.
+
+**The address's bytes.** An address travels as fields 1 to 3 in the encoding of the table, followed by the 64-byte signature under `context_key`, with nothing after the signature. A reader decodes `node` by the rules of **NodeAddress** above, and refuses bytes that end before the signature or continue after it, and a `sequence` of 0.
 - **Verification.** Every member and every joiner verifies the signature under the `context_key` of the binding whose hash the address carries. It refuses an address whose `binding_hash` differs from the `binding_hash` its group state or its invitation holds.
 - **Sequence.** The node signs `sequence` 1 at instantiation, and signs each later address with a `sequence` one higher than the last address it signed. **The highest sequence wins:** a party that holds an address of sequence n refuses an address of sequence n or below, and adopts a verified address of a higher sequence.
 - **Delivery.** A member receives the current address from the context's node, which serves the address with each chain entry it returns, or from another member inside the group. Either source suffices, because the signature under `context_key` authenticates the address whichever party delivered it.
