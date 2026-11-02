@@ -3116,8 +3116,8 @@ jobs:
       contents: read
       packages: read
     steps:
-      # Each of the two builder stages measures about 6 GB — 2 GB of it the pin's
-      # cross-compilation targets, which the two share — before the buildx cache blobs. `rust-clippy` here and all three jobs in
+      # The builder stage measures about 6 GB — 2 GB of it the pin's cross-compilation
+      # targets — before the buildx cache blobs. `rust-clippy` here and all three jobs in
       # `fuzz.yml` already reclaim this space.
       - name: Free disk space when the runner is short of it
         run: |
@@ -3199,8 +3199,8 @@ jobs:
         with:
           context: .
           push: false
-          # `mode=max` keeps the chef, deps, cook-node and builder stages, which hold the
-          # toolchain, cargo-chef, and each binary's cooked dependencies; the final stage alone holds none of
+          # `mode=max` keeps the chef and builder stages, which hold the toolchain,
+          # cargo-chef, and the cooked dependencies; the final stage alone holds none of
           # them. `image-manifest=true` stores the cache as an OCI image manifest.
           # A missing or unreadable cache only makes buildkit warn and build every layer.
           cache-from: type=registry,ref=ghcr.io/${{ github.repository }}/buildcache:docker-image

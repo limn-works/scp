@@ -84,8 +84,8 @@ FROM chef AS planner
 COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
 
-# Stage 3: Deps — the workspace skeleton and every crate the lockfile names, offline
-FROM chef AS deps
+# Stage 3: Builder — cook deps then build
+FROM chef AS builder
 # The CI fetch step's own script, so a container build downloads its crates the way every
 # CI job does: one `cargo fetch --locked` that retries far longer than cargo's default,
 # then cargo offline for every later command. Without it, `cargo chef cook` downloads on
@@ -101,11 +101,9 @@ COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json --no-build
 RUN GITHUB_ENV="$(mktemp)" GITHUB_OUTPUT="$(mktemp)" bash /usr/local/bin/cargo-fetch.sh /app
 ENV CARGO_NET_OFFLINE=true
-
-# Stages 4, 5a and 5b: scp-node's dependencies cooked once, then one builder per binary.
-# Cooking the whole workspace pulls in `scp-ffi`, whose `pyo3-build-config` build script
-# fails with "no Python 3.x interpreter found", and this image ships neither Python
-# bindings nor a Python.
+# Cook only the two binaries' dependencies. Cooking the whole workspace pulls in
+# `scp-ffi`, whose `pyo3-build-config` build script fails with "no Python 3.x
+# interpreter found" — and this image ships neither Python bindings nor a Python.
 #
 # ONE PACKAGE PER CARGO INVOCATION, in the cooks and in the builds. Cargo unifies the
 # features of every package one invocation selects, so `-p scp-relay -p scp-node`
@@ -117,32 +115,23 @@ ENV CARGO_NET_OFFLINE=true
 # its build does, so the build reuses it. `scripts/check-shipped-build-invocations.py`
 # fails on a joint invocation here.
 #
-# WHY THIS SHAPE. The runtime stage copies from both builder stages, and neither depends
-# on the other, so BuildKit runs them at the same time. Both start from `cook-node`, whose
-# target/ already holds every dependency compiled the way scp-node needs it. Of the 336
-# dependencies scp-relay resolves for x86_64-unknown-linux-gnu, 321 resolve with the same
-# features under scp-node and none is absent from its graph. So `build-relay` cooks only
-# the 15 that differ and the crates that depend on them. Measured on CI with no cook layer cached, one after the other in
-# one stage, the cooks took 211 s and the builds 399 s, against 414 s for both in the joint
-# invocation. Two stages that each cooked from nothing and ran at the same time were
-# slower: the two cooks fought for the runner's 4 cores and took 297 s and 315 s, and the
-# scp-node build took 421 s. Each build compiles the workspace crates about one at a time,
-# and the scp-node crate alone took 156 of its 246 s, so the relay's small cook and its
-# build fit into the cores that build leaves idle. Each builder stage keeps its own copy of
-# target/, so neither waits on the other's build lock.
-FROM deps AS cook-node
-RUN cargo chef cook --release --offline --recipe-path recipe.json -p scp-node
-
-FROM cook-node AS build-node
-COPY . .
-RUN cargo build --release --offline -p scp-node
-
-FROM cook-node AS build-relay
+# WHY ONE STAGE, ONE BINARY AFTER THE OTHER. Measured on CI, with no cook layer cached,
+# this order took 211 s of cook and 399 s of build, against 414 s for both binaries in
+# the joint invocation, because the crates both use with different features compile
+# twice. Running the two at once on the runner's 4 cores bought nothing back, because
+# rustc spreads each crate's code generation over every core and leaves none idle. Two
+# builder stages that each cooked from nothing and ran at the same time took 815 s for
+# the whole job (cooks of 297 s and 315 s, a scp-node build of 421 s). Cooking scp-node's
+# dependencies once and then running both builds at the same time took 674 s (a scp-node
+# build of 456 s, up from 246 s). Only more cores can cut this time, by building each
+# binary on its own runner.
 RUN cargo chef cook --release --offline --recipe-path recipe.json -p scp-relay
+RUN cargo chef cook --release --offline --recipe-path recipe.json -p scp-node
 COPY . .
 RUN cargo build --release --offline -p scp-relay
+RUN cargo build --release --offline -p scp-node
 
-# Stage 6: Runtime — minimal Debian with both binaries
+# Stage 4: Runtime — minimal Debian with both binaries
 #
 # Both binaries link `libcrypto.so.3` dynamically, because `libsqlite3-sys` builds
 # SQLCipher against OpenSSL. `libssl3` is named explicitly rather than left to arrive as
@@ -151,7 +140,7 @@ FROM mirror.gcr.io/library/debian:bookworm-slim AS runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates libssl3 \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=build-relay /app/target/release/scp-relay /usr/local/bin/scp-relay
-COPY --from=build-node /app/target/release/scp-node /usr/local/bin/scp-node
+COPY --from=builder /app/target/release/scp-relay /usr/local/bin/scp-relay
+COPY --from=builder /app/target/release/scp-node /usr/local/bin/scp-node
 EXPOSE 9000
 ENTRYPOINT ["/usr/local/bin/scp-relay"]
