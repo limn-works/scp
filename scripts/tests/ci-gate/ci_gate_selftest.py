@@ -8394,6 +8394,8 @@ LEG_COMMANDS: tuple[tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]], ..
             "cargo nextest run --no-tests=fail -p scp-transport --features quic,http3,udp,push-store,testing --lib -E 'test(/^udp::listener::tests::wake::/)'",
             'cargo nextest run --no-tests=fail -p scp-transport --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --lib startup::tests',
             'cargo nextest run --no-tests=fail -p scp-transport --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --test postgres_blob_fail_closed --test s3_blob_fail_closed',
+            "cargo nextest run --no-tests=fail -p scp-transport --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --lib -E 'test(/^native::postgres_blob::tests::/)'",
+            "cargo nextest run --no-tests=fail -p scp-transport --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --lib -E 'test(/^native::s3_blob::tests::/)'",
             'cargo nextest run --no-tests=fail -p scp-transport --features push-store,testing --lib --tests',
             'cargo nextest run --no-tests=fail -p scp-transport --features push-store --lib --tests',
             'cargo nextest run --no-tests=fail -p scp-transport --features push-store --lib store_without_testing_has_only_the_sqlite_arm',
