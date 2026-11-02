@@ -103,6 +103,14 @@ arc-swap = { workspace = true }
 futures = { workspace = true }
 
 [dev-dependencies]
+# This crate, naming itself, to turn its `testing` feature on for its own dev targets
+# and for no other build. All four examples and most integration tests here declare
+# `required-features = ["testing"]`, so without this edge `cargo test -p scp-runtime`
+# skips those tests and `cargo clippy -p scp-runtime --example identity` refuses to build,
+# which `scripts/check-examples-compile.sh` runs. A build that takes this crate as a
+# normal dependency never builds these dev-dependencies and never gets the feature,
+# and publication strips this path-only edge.
+scp-runtime = { path = ".", features = ["testing"] }
 # The shared valid-P-256-point test fixture (`scp_crypto::p256::testing`).
 scp-crypto = { path = "../scp-crypto", features = ["testing"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
@@ -195,10 +203,10 @@ name = "identity"
 # The example names `InMemoryDhtClient`, `InMemoryKeyCustody`, and
 # `InMemoryPreRotationCustody`, which a consumer reaches only through this crate's
 # `testing` feature. Inside this workspace the declaration never refuses a build:
-# the `scp-testing` dev-dependency turns on `scp-runtime/testing`, and cargo unifies
-# that into every dev target, so `cargo run -p scp-runtime --example identity`
+# this crate's dev-dependency on itself turns on `scp-runtime/testing`, and cargo
+# unifies that into every dev target, so `cargo run -p scp-runtime --example identity`
 # compiles and runs. Only a build of the published crate, which strips path-only
-# dev-dependencies such as `scp-testing`, reports the missing feature instead of
+# dev-dependencies such as that one, reports the missing feature instead of
 # unresolved imports.
 # `check-examples-compile.sh` names each target, so the declaration removes no
 # target from that gate.
