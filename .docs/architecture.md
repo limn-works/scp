@@ -262,7 +262,7 @@ scp/
 │   │   └── sync/              # Offline/sync strategy (§23)
 │   │
 │   ├── scp-runtime/           # Async orchestration (Supervisor + per-context actors, MLS, providers; ADR-049)
-│   │   ├── context/           # Supervisor, ContextActor, saga coordinator, persistence bridges
+│   │   ├── context/           # Supervisor, ContextActor, IdentityRegistry + IdentityActor, saga coordinator, persistence bridges
 │   │   ├── crypto/            # MLS wrapper (OpenMLS), UCAN minting, key protocol
 │   │   ├── identity/          # SCPID, custody migration, recovery
 │   │   ├── store/             # ProtocolRepository — typed domain storage (§17.4)
@@ -272,6 +272,7 @@ scp/
 │   ├── scp-core/              # Facade re-exporting scp-protocol + scp-runtime
 │   │
 │   ├── scp-identity/          # Native identity subsystem — key-event log, publication, lifecycle;
+│   │                          #   NodeNetwork, the one implementor of the sealed IdentityBackend;
 │   │                          #   IdentityBackend::resolve returns a ResolutionOutcome (03-identity.md §3.10.10)
 │   │
 │   ├── scp-dht/               # Retired DHT transport leaf — no resolution path reads it
@@ -696,8 +697,8 @@ Layer 1 ─ scp-protocol              Pure sync protocol types (no tokio, wasm32
            │  scp-runtime             Async orchestration (Supervisor + per-context actors, MLS, providers; ADR-049).
            │  scp-core                Facade re-exporting scp-protocol + scp-runtime.
            │  scp-identity            Native identity subsystem — key-event log composition,
-           │                          resolution and publication over the SCP relay network;
-           │                          imports the identity model from scp-did.
+           │                          resolution and publication over the SCP node network
+           │                          (NodeNetwork); imports the identity model from scp-did.
            │  scp-dht                  Retired DHT transport leaf; no resolution path reads it.
            │  scp-event-log           Merkle event log.
            │  scp-mls                 Synchronous MLS state machine (wasm-safe; ADR-057).
@@ -734,7 +735,7 @@ Every subsystem in the table below is injected through a trait. Callers never co
 | Device attestation | `DeviceAttestation` | `scp-platform/src/traits.rs` | Full | Nothing — App Attest, Play Integrity, synthetic for testing. |
 | Push notifications | `Push` | `scp-platform/src/traits.rs` | Full | Nothing — APNs, FCM, synthetic. |
 | Transport | `TransportAdapter` | `scp-transport/src/traits.rs` | Full | Nothing — native relay, Nostr, Matrix, Hyperswarm, libp2p, WebSocket, WebRTC, custom. |
-| Identity backend | `IdentityBackend` | `scp-identity/src/lib.rs` | Full | Nothing — the seam ADR-063 names, behind which the key-event-log implementation sits. |
+| Identity backend | `IdentityBackend` | `scp-identity/src/lib.rs` | None — sealed | Not replaceable by a caller: `NodeNetwork` is its one implementor, and each instance's Supervisor builds it (`03-identity.md` §3.10.10). The seam ADR-063 names stays inside `scp-identity`. |
 | MLS primitives | `MlsBackend` | `scp-runtime/src/crypto/mls/` | Partial | MLS is protocol-fundamental; the OpenMLS implementation is swappable but any replacement must implement RFC 9420 with the SCP ciphersuite. |
 | OpenMLS storage | `OpenMlsStorageAdapter` | `scp-runtime/src/crypto/mls/storage_adapter.rs` | None — internal to the OpenMLS `MlsBackend` | Not intended for replacement; swapping this only makes sense if the OpenMLS-based `MlsBackend` itself is replaced. |
 | Context transport | `ContextTransportProvider` | `scp-runtime/src/context/builder.rs` | Full | Nothing — wraps transport for context-scoped operations. |
@@ -777,7 +778,14 @@ Each replaceable trait imposes invariants that every implementation must uphold.
 - `delete` is best-effort — untrusted transports may ignore it.
 - Adapters map transport-specific semantics (WebSocket, Nostr relay, libp2p, etc.) onto this uniform interface.
 
-**`IdentityBackend`** (scp-identity) — `Send + Sync`, async. `03-identity.md` §3.10.10 declares the trait's methods with their return types and their error type, and this entry lists none of its own. ADR-063 names the seam.
+**`IdentityBackend`** (scp-identity) — `Send + Sync`, async, sealed. `03-identity.md` §3.10.10 declares the trait's methods with their return types and their error type, and this entry lists none of its own. ADR-063 names the seam.
+
+**Identity ownership and crate edges.** Each SCP instance owns its identities. `CoreFields::new` takes the instance's encrypted storage and node client and builds the Supervisor before it returns. The Supervisor holds the instance's `IdentityRegistry`, its one `Arc<NodeNetwork>` and its one `RecordLock` (`03-identity.md` §3.10.10). Every identity operation is a `dispatch_identity_*` method, which the registry serves or which the identity's `IdentityActor` in `scp-runtime/src/context/supervisor/` serves (ADR-049, the actor-per-context concurrency model, Decision 17). The crate edges:
+- `NodeNetwork` and the sealed `IdentityBackend` live in `scp-identity`, which depends on `scp-kel`, `scp-platform` and the node client crate.
+- `scp-runtime` depends on `scp-identity`, an edge that already exists.
+- The `NodeId` newtype lives in `scp-did`, which depends on no SCP crate, and `NodeId`'s derivation lives in `scp-kel`.
+- `scp-protocol` gains only pure types: `NodeAddress`, the node record structs and their preimage builders. It gains no async dependency, so `scripts/check-protocol-deps.sh` holds.
+- The node's public-record store is built in `scp-node`, which already depends on `scp-identity`, so the store adds no crate edge.
 
 **`MlsBackend`** (scp-runtime/crypto/mls) — `Send + Sync`, async methods (via `#[async_trait]`). Replaces the deleted `ContextCryptoProvider` (ADR-049).
 - Stateless MLS primitives: `create_group`, `add_member_raw`, `remove_member_raw`, `encrypt`, `decrypt`, `advance_epoch`, `validate_key_package`, `generate_key_package`, `join_from_welcome`. `decrypt` merges a received Commit.
@@ -909,11 +917,15 @@ The Python SDK is the most critical binding. The agent ecosystem is Python. If t
 ```python
 import scp
 
-# Create or load identity
-identity = await scp.Identity.create(custody="platform")
+# One SCP instance; its storage argument is encrypted (ADR-052, acceptance criterion 9)
+instance = scp.SCP(storage=storage)
+
+# Create an identity: IdentityConfig carries custody, next_set_custody, profile and witnesses
+created = await instance.identity_create(config, signers)
+identity = created.identity
 
 # Create a context
-ctx = await scp.Context.create(
+ctx = await instance.create_context(
     creator=identity,
     ceiling=["messaging", "outlet_invocation"],
     outlets=[scp.Outlet("assistant", schema={"query": "string"})],
@@ -932,7 +944,8 @@ result = await ctx.invoke("assistant", {"query": "help me"})
 import scp
 from scp.mcp import serve_mcp
 
-identity = await scp.Identity.load()
+instance = scp.SCP(storage=storage)
+identity = await instance.identity_load(identifier)
 
 # Start an MCP server that exposes all SCP contexts as tools
 server = await serve_mcp(identity, host="localhost", port=8080)
@@ -966,7 +979,7 @@ agent.invoke({"input": "Schedule a meeting with Bob"})
 ```
 Python (scp_sdk/)              PyO3 (crates/scp-ffi/pyo3/)  Rust (scp-core/)
 
-scp.Identity.create()    →    py_identity_create()     →    Identity::create()
+scp.identity_create()    →    PyScp::identity_create() →    Supervisor::dispatch_identity_create()
 scp.Context.create()     →    py_context_create()      →    Supervisor::create_context()
 ctx.send()               →    py_context_send()        →    Context::send()
 ctx.invoke()             →    outlet_invoke()          →    Context::invoke_outlet()
@@ -980,8 +993,9 @@ PyO3 handles the Rust↔Python boundary: async (tokio↔asyncio), error conversi
 import { SCP } from '@limn-works/scp-ts';
 
 // Node.js / Deno
-const identity = await SCP.Identity.create({ custody: 'platform' });
-const ctx = await SCP.Context.create({
+const scp = new SCP(storage); // encrypted instance storage
+const { identity } = await scp.identityCreate(config, signers);
+const ctx = await scp.createContext({
   creator: identity,
   ceiling: ['messaging'],
 });
@@ -1001,9 +1015,10 @@ TypeScript uses napi-rs for in-process use on Node.js/Bun (Rust → native addon
 ```swift
 import SCP
 
-let identity = try await SCP.Identity.create(custody: .secureEnclave)
+let scp = try await SCP.create(storage: storage) // encrypted instance storage
+let identity = try await scp.identityCreate(config: config, signers: signers).identity
 
-let quest = try await SCP.Context.create(
+let quest = try await scp.createContext(
     creator: identity,
     ceiling: [.messaging, .outletInvocation, .media],
     outlets: [guideAssistant, stepTracker],
@@ -1326,7 +1341,7 @@ This is a hard requirement, not an aspiration. Every protocol mechanism must be 
 | Third binding | Swift (UniFFI) | iOS/macOS apps. |
 | Core language | Rust | Crypto libraries, performance, cross-platform via FFI. |
 | Identity substrate | Inception-derived identifier over a key-event log (ADR-063) | Self-certifying, decentralized, rotation without rename, no server dependency. Modelled on KERI. |
-| Identity seam | `IdentityBackend` | A `did:scp` facade stays optional and unbuilt behind it, foreclosed by nothing (ADR-063). |
+| Identity seam | `IdentityBackend`, sealed, implemented by `NodeNetwork` | A `did:scp` facade stays optional and unbuilt behind it, foreclosed by nothing (ADR-063). Each instance's Supervisor owns the one `NodeNetwork` (`03-identity.md` §3.10.10). |
 | Group encryption | MLS (OpenMLS) | O(log n) removal, forward secrecy, clean key destruction. |
 | Transport | SCP native relay (canonical) + adapters | No dependency on any single transport. SCP native relay is simplest reference. Adapters: Nostr, Matrix, Holepunch/Hyperswarm, libp2p, WebSocket, WebRTC, QUIC, BLE, Tor, I2P, SSB, MQTT, NATS, ZeroMQ, Yggdrasil, cjdns. |
 | Capability tokens | UCAN (native impl) | Per-agent, per-context, per-capability, revocable. Native implementation using the `p256` crate + serde_json. |

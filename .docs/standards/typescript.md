@@ -108,18 +108,21 @@ import { type CustodyType, SCP, ValidationError } from "../src/index.js";
 // In-memory custody is a testing-addon affordance outside `CustodyType`
 // (03-identity.md §3.2.2); tests reach it only through this helper.
 import { createInMemoryIdentity } from "./harness-custody";
+import { encryptedTestStorage, signers, testIdentityConfig } from "./harness-instance";
 
 describe("Identity", () => {
   it("creates an identity with a 32-byte identifier", async () => {
-    const scp = new SCP({ storage: { type: "in_memory" } });
+    // The instance storage is encrypted (ADR-052 acceptance criterion 9).
+    const scp = new SCP(encryptedTestStorage());
     const identity = await createInMemoryIdentity(scp);
     // 09-security-model.md §9.7.4.2 R13
     expect(identity.identifier).toHaveLength(32);
   });
 
   it("rejects a custody request outside the vocabulary", async () => {
-    const scp = new SCP({ storage: { type: "in_memory" } });
-    await expect(scp.identityCreate("invalid" as CustodyType))
+    const scp = new SCP(encryptedTestStorage());
+    const config = { ...testIdentityConfig(), custody: "invalid" as CustodyType };
+    await expect(scp.identityCreate(config, signers))
       .rejects.toThrow(ValidationError);
   });
 });

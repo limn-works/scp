@@ -113,28 +113,40 @@ testpaths = ["tests"]
 
 ### Bridge function naming
 
-Bridge functions in Rust use `py_` prefix:
+Free bridge functions in Rust use the `py_` prefix. An operation that touches instance state is a method on the `SCP` pyclass instead (ADR-048, SCP as a first-class multi-instance SDK object, §1), and every identity operation is one, because the instance's Supervisor owns the identity store and the node network (`03-identity.md` §3.10.10):
 
 ```rust
-#[pyfunction]
-fn py_identity_create<'py>(py: Python<'py>, config: IdentityConfig) -> PyResult<Bound<'py, PyAny>> { ... }
+#[pymethods]
+impl PyScp {
+    // check_ready, then Supervisor::dispatch_identity_create
+    fn identity_create<'py>(&self, py: Python<'py>, config: IdentityConfig, signers: SignerPlan) -> PyResult<Bound<'py, PyAny>> { ... }
+}
 ```
 
-Python wrappers call these without the prefix. **`Identity.create` takes the config object `.docs/standards/construction.md` states, and `custody` carries the bridge's `KeyCustodyConfig` and carries no default**, because that slot decides where an identity's private key lives:
+**`scp.identity_create` takes the config object `.docs/standards/construction.md` states, and `custody` carries the bridge's `KeyCustodyConfig` and carries no default**, because that slot decides where an identity's private key lives. No free `Identity.create` exists:
 
 ```python
-from scp_sdk._scp_core import py_identity_create
+class SCP:
+    async def identity_create(self, config: IdentityConfig, signers: SignerPlan) -> Created:
+        raw = await self._core.identity_create(config, signers)
+        return Created._from_raw(raw)  # Created.identity is an Identity wrapping the bridge's handle id
 
-class Identity:
-    @classmethod
-    async def create(cls, config: IdentityConfig) -> Identity:
-        raw = await py_identity_create(config)
-        return cls(raw)
-
-# IdentityConfig(custody=KeyCustodyConfig.ENCRYPTED_FILE,  # required; no default (03-identity.md §3.2.2)
-#                next_set_custody=...,                 # required; the bridge's NextSetCustodyConfig
-#                ...)                                  # every other field as .docs/standards/construction.md states; no ephemeral identity
+# IdentityConfig(custody=KeyCustodyConfig.ENCRYPTED_FILE,       # required; no default (03-identity.md §3.2.2)
+#                next_set_custody=...,                      # required; the bridge's NextSetCustodyConfig
+#                profile=...,                               # required; the CustodyProfile
+#                witnesses=WitnessChoice.CommunityDefault)  # required; no default; no store field, no ephemeral identity
 ```
+
+### Node and identity types
+
+| Concept | Python |
+|---------|--------|
+| Canonical node URL, validated at construction | `NodeUrl` |
+| A context's node address, read-only: `url` and optional `bridge` | `NodeAddress` |
+| The accepted node list, read-only: `entries` and `node_list_sequence` | `AcceptedNodeList` |
+| Read the accepted node list, `None` where the instance holds none | `scp.identity_node_list()` |
+| Witness choice, name-bound | `WitnessChoice.CommunityDefault`, `WitnessChoice.Designated(witnesses=[...])`, `WitnessChoice.NoWitness` |
+| One identity's handle, returned by `scp.identity_create` (as `Created.identity`) and `scp.identity_load` | `Identity` |
 
 ### Opaque types
 

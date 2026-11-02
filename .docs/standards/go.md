@@ -76,10 +76,11 @@ defer ctx.Close()
 ### Standard go test
 
 ```go
-func TestNewIdentity(t *testing.T) {
-    identity, err := NewIdentity("in_memory")
+func TestIdentityCreate(t *testing.T) {
+    scp := newTestSCP(t) // an SCP instance over an encrypted test store
+    identity, err := scp.IdentityCreate(testIdentityConfig())
     if err != nil {
-        t.Fatalf("NewIdentity failed: %v", err)
+        t.Fatalf("IdentityCreate failed: %v", err)
     }
     // 09-security-model.md §9.7.4.2 R13
     if len(identity.Identifier()) != 32 {

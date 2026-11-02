@@ -11,7 +11,7 @@ bindings/go/
   go.mod                        # Module: github.com/limn/scp-go
   go.sum
   scp.go                        # Package root, re-exports
-  identity.go                   # Identity type, NewIdentity(), Resolve()
+  identity.go                   # Identity type; SCP.IdentityCreate(), SCP.IdentityResolve()
   context.go                    # Context type, NewContext(), Join(), Leave(), Close()
   tools.go                      # ToolDefinition, Invoke(), Verify()
   trust.go                      # EvaluateTrust(), TrustEvaluation
@@ -56,10 +56,12 @@ Rust → cbindgen → C header → cgo → Go
 ```rust
 // crates/scp-ffi/cbindgen/src/lib.rs
 
-/// Create a new SCP identity.
+/// Create a new SCP identity within one SCP instance, whose Supervisor
+/// owns the identity store and the node network (03-identity.md §3.10.10).
 /// Returns an opaque handle. Caller must free with scp_identity_free().
 #[no_mangle]
 pub extern "C" fn scp_identity_create(
+    instance: *const ScpInstance,
     config: *const ScpIdentityConfig,
     out_handle: *mut *mut ScpIdentity,
     out_error: *mut *mut ScpError,
@@ -162,15 +164,16 @@ func Shutdown() {
 // IdentityConfig is the config object
 // `.docs/standards/construction.md` states. Its Custody slot carries the
 // bridge's KeyCustodyConfig and carries no default, because that slot decides
-// where an identity's private key lives.
-func IdentityCreate(config IdentityConfig) (*IdentityHandle, error) {
+// where an identity's private key lives. The identity's records live in
+// this instance's store, so no free IdentityCreate exists.
+func (s *SCP) IdentityCreate(config IdentityConfig) (*IdentityHandle, error) {
     cConfig := config.toC()
     defer cConfig.free()
 
     var handle *C.ScpIdentity
     var errPtr *C.ScpError
 
-    rc := C.scp_identity_create(cConfig, &handle, &errPtr)
+    rc := C.scp_identity_create(s.ptr, cConfig, &handle, &errPtr)
     if rc != 0 {
         return nil, extractError(errPtr)
     }

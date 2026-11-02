@@ -51,15 +51,18 @@ UniFFI generates Kotlin bindings from a single UDL (Universal Definition Languag
 Located at `crates/scp-ffi/uniffi/src/scp.udl`:
 
 ```
-namespace scp {
+interface Scp {
   [Throws=ScpError]
-  Identity identity_create(IdentityConfig config);
+  Created identity_create(IdentityConfig config, SignerPlan signers);
 
   [Throws=ScpError]
   Identity identity_load(bytes identifier);
 
   [Throws=ScpError]
   ResolutionOutcome identity_resolve(bytes identifier);
+
+  [Throws=ScpError]
+  AcceptedNodeList? identity_node_list();
 };
 
 interface Identity {
@@ -67,7 +70,7 @@ interface Identity {
   CustodyType custody_type();
 
   [Throws=ScpError]
-  Identity rotate_key();
+  EventOutcome rotate_active(RotationReason reason, SignerPlan signers);
 };
 
 interface Context {
@@ -197,31 +200,39 @@ class ValidationException(message: String, code: String) : ScpException(message,
 ## Identity Class
 
 ```kotlin
-class Identity private constructor(private val handle: IdentityHandle) {
+class Identity internal constructor(private val handle: IdentityHandle) {
     val identifier: ByteArray get() = handle.identifier()
     val custodyType: CustodyType get() = handle.custodyType()
 
-    companion object {
-        // IdentityConfig is the config object
-        // `.docs/standards/construction.md` states. Its `custody` slot carries
-        // the bridge's KeyCustodyConfig and carries no default, because that
-        // slot decides where an identity's private key lives.
-        suspend fun create(config: IdentityConfig): Identity =
-            withContext(Dispatchers.IO) {
-                Identity(NativeLib.identityCreate(config))
-            }
+    suspend fun rotateActive(reason: RotationReason, signers: SignerPlan): EventOutcome =
+        withContext(Dispatchers.IO) { handle.rotateActive(reason, signers) }
+}
 
-        suspend fun load(identifier: ByteArray): Identity =
-            withContext(Dispatchers.IO) {
-                Identity(NativeLib.identityLoad(identifier))
-            }
-    }
+class SCP internal constructor(private val core: Scp) {
+    // IdentityConfig is the config object
+    // `.docs/standards/construction.md` states. Its `custody` slot carries
+    // the bridge's KeyCustodyConfig and carries no default, because that
+    // slot decides where an identity's private key lives. The identity's
+    // records live in this instance's store, so the config names no store
+    // (03-identity.md §3.10.10). No free Identity.create exists.
+    suspend fun identityCreate(config: IdentityConfig, signers: SignerPlan): Created =
+        withContext(Dispatchers.IO) { Created.fromCore(core.identityCreate(config, signers)) }
 
-    suspend fun rotateKey(): Identity = withContext(Dispatchers.IO) {
-        Identity(handle.rotateKey())
-    }
+    suspend fun identityLoad(identifier: ByteArray): Identity =
+        withContext(Dispatchers.IO) { Identity(core.identityLoad(identifier)) }
 }
 ```
+
+### Node and identity types
+
+| Concept | Kotlin |
+|---------|--------|
+| Canonical node URL, validated at construction | `NodeUrl` |
+| A context's node address, read-only: `url` and optional `bridge` | `NodeAddress` |
+| The accepted node list, read-only: `entries` and `nodeListSequence` | `AcceptedNodeList` |
+| Read the accepted node list, `null` where the instance holds none | `scp.identityNodeList()` |
+| Witness choice, name-bound | `WitnessChoice.CommunityDefault`, `WitnessChoice.Designated(witnesses)`, `WitnessChoice.NoWitness` |
+| One identity's handle, returned by `scp.identityCreate` (as `Created.identity`) and `scp.identityLoad` | `Identity` |
 
 ## Resource Management
 

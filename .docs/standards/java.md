@@ -34,11 +34,14 @@ Java conventions, toolchain, and CI for the SCP Java SDK. References `sdk-common
 **PATTERN:** `AutoCloseable` + `try-with-resources` for all native handles. Use `java.lang.ref.Cleaner` as a safety net for leaked handles (the cleanable captures only the `Pointer`, never `this`). See `.docs/scaffold/java.md` for the Cleaner-based handle wrapper.
 
 ```java
-try (var identity = Identity.create("in_memory").join();
-     var ctx = Context.create(identity, params).join()) {
+// storage is encrypted (ADR-052 acceptance criterion 9); config names custody,
+// next-set custody, profile and witnesses, and no store (.docs/standards/construction.md)
+try (var scp = SCP.create(storage).join();
+     var identity = scp.identityCreate(config, signers).join().identity();
+     var ctx = scp.createContext(identity, params).join()) {
     ctx.send(payload).join();
 }
-// Both identity and ctx are closed automatically
+// scp, identity and ctx are closed automatically
 ```
 
 ### Naming
@@ -57,7 +60,8 @@ try (var identity = Identity.create("in_memory").join();
 class IdentityTest {
     @Test
     void createReturnsIdentityWith32ByteIdentifier() throws Exception {
-        try (var identity = Identity.create("in_memory").join()) {
+        try (var scp = SCP.create(encryptedTestStorage()).join();
+             var identity = scp.identityCreate(testIdentityConfig(), signers).join().identity()) {
             // 09-security-model.md §9.7.4.2 R13
             assertThat(identity.identifier()).hasSize(32);
         }
