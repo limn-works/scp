@@ -3741,9 +3741,9 @@ def emit_participation_seed() -> None:
 
 
 # ---------------------------------------------------------------------------
-# §25.23 Vectors 80-82: key positions, the re-seat request and answer, and the
-# answer's seal (`09-security-model.md` §9.7.1, §9.10.12, §9.18;
-# `05-contexts.md` §5.13.3 "Key positions", §5.12.3.4, §5.12.3.5;
+# §25.23 Vectors 80 and 82: key positions and the re-seat request
+# (`09-security-model.md` §9.7.1, §9.10.12, §9.18;
+# `05-contexts.md` §5.13.3 "Key positions", §5.12.3.5;
 # `07-trust-validation-and-capabilities.md` §7.3.1.1 step 1.6).
 #
 # The two branch events of the Contested position are §25.29's Vector 53
@@ -3754,7 +3754,6 @@ def emit_participation_seed() -> None:
 KEY_EVENT_FRAME_VERSION = 0x02
 RESEAT_CONTEXT_ID = "context-alpha"
 RESEAT_REQUEST_DOMAIN = "SCP-RESEAT-REQUEST-V1:"
-RESEAT_GROUPINFO_DOMAIN = "SCP-RESEAT-GROUPINFO-V1:"
 KEY_POSITION_NAMES = ("contested", "linear", "unheld", "displaced")
 
 
@@ -3885,43 +3884,8 @@ def mp_header(item: bytes) -> bytes:
     raise AssertionError(f"no header rule for 0x{first:02x}")
 
 
-def hpke_seal_base(
-    recipient: KeyPair, ephemeral: KeyPair, info: bytes, aad: bytes, plaintext: bytes
-) -> dict[str, bytes]:
-    """RFC 9180 single-shot Seal in mode base under DHKEM(P-256, HKDF-SHA256),
-    HKDF-SHA256 and AES-128-GCM, the suite §5.12.3.1 seals an `InvitationBundle`
-    under (§9.5). The ephemeral key is a fixture, so the bytes are reproducible."""
-    enc = ephemeral.uncompressed
-    dh = ecdh_p256(ephemeral.d, recipient.point)
-    assert dh == ecdh_p256(recipient.d, ephemeral.point)
-    eae_prk = hpke_labeled_extract(HPKE_SUITE_KEM, b"", b"eae_prk", dh)
-    shared_secret = hpke_labeled_expand(
-        HPKE_SUITE_KEM, eae_prk, b"shared_secret", enc + recipient.uncompressed, 32
-    )
-    psk_id_hash = hpke_labeled_extract(HPKE_SUITE, b"", b"psk_id_hash", b"")
-    info_hash = hpke_labeled_extract(HPKE_SUITE, b"", b"info_hash", info)
-    context = b"\x00" + psk_id_hash + info_hash
-    secret = hpke_labeled_extract(HPKE_SUITE, shared_secret, b"secret", b"")
-    key = hpke_labeled_expand(HPKE_SUITE, secret, b"key", context, 16)
-    base_nonce = hpke_labeled_expand(HPKE_SUITE, secret, b"base_nonce", context, 12)
-    return {
-        "enc": enc,
-        "shared_secret": shared_secret,
-        "key": key,
-        "base_nonce": base_nonce,
-        "ciphertext": aes128_gcm_encrypt(key, base_nonce, plaintext, aad),
-    }
-
-
-def reseat_seal_label(label: str, context_id: str, request_digest: bytes) -> bytes:
-    """`09-security-model.md` §9.18's HPKE rows for the re-seat seals:
-    label || BE32(len(context_id)) || context_id || request_digest."""
-    assert len(request_digest) == 32
-    return label.encode() + var_field(context_id) + request_digest
-
-
 def emit_key_positions_and_reseat() -> None:
-    section("§25.23 Vectors 80-82 key positions, re-seat request and answer, seals")
+    section("§25.23 Vectors 80 and 82 key positions and the re-seat request")
     identifier = INCEPTION_IDENTIFIER
     identifier_text = scp_text_form(identifier)
     fork_point = INCEPTION_DIGEST
@@ -4129,87 +4093,6 @@ def emit_key_positions_and_reseat() -> None:
     emit_hex(
         "vector_82.aad", b"scp-reseat-request-aad-v1" + var_field(RESEAT_CONTEXT_ID)
     )
-
-    # --- Vector 81: the re-seat answer, published by carol for epoch 7. ---
-    group_info = fixture_bytes("re-seat group info", 300)
-    wrap_key = fixture_digest("re-seat wrap key")[:16]
-    key_material = jcs(
-        {
-            "context_metadata_key": fixture_digest("re-seat metadata key").hex(),
-            "sender_key_seed": None,
-        }
-    )
-    context_params = jcs(
-        {"governance": "SingleAdmin", "mode": "Encrypted", "ttl": None}
-    )
-    reordered_params = b'{"mode":"Encrypted","governance":"SingleAdmin","ttl":null}'
-    assert json.loads(reordered_params) == json.loads(context_params)
-    assert reordered_params != context_params
-    publisher = ID_CAROL
-    assert len(RESEAT_GROUPINFO_DOMAIN) == 24
-    answer_preimage = canonical_preimage(
-        RESEAT_GROUPINFO_DOMAIN,
-        var_field(RESEAT_CONTEXT_ID),
-        u64(7),
-        fixed_field(request_digest),
-        var_field(identifier_text),
-        fixed_field(sha256(group_info)),
-        fixed_field(sha256(wrap_key)),
-        fixed_field(sha256(key_material)),
-        fixed_field(sha256(context_params)),
-        var_field(publisher),
-    )
-    answer_digest = sha256(answer_preimage)
-    answer_signature = sign_group(REF_KEY_1, answer_digest, "vector_81")
-    answer_items = [
-        mp_str(RESEAT_CONTEXT_ID),
-        mp_uint(7),
-        mp_bin(request_digest),
-        mp_bin(group_info),
-        mp_bin(wrap_key),
-        mp_bin(key_material),
-        mp_bin(context_params),
-        mp_str(publisher),
-        mp_bin(answer_signature),
-    ]
-    answer = mp_array(answer_items)
-    emit_hex("vector_81.group_info", group_info)
-    emit_hex("vector_81.wrap_key", wrap_key)
-    emit("vector_81.key_material", key_material.decode())
-    emit("vector_81.context_params", context_params.decode())
-    emit("vector_81.context_params_rejected", reordered_params.decode())
-    emit("vector_81.publisher_did", publisher)
-    emit("vector_81.preimage_len", len(answer_preimage))
-    emit_hex("vector_81.preimage", answer_preimage)
-    emit_hex("vector_81.canonical_hash", answer_digest)
-    emit_hex("vector_81.signature", answer_signature)
-    emit(
-        "vector_81.item_headers",
-        " ".join(hexs(mp_header(item)) for item in answer_items),
-    )
-    emit("vector_81.answer_len", len(answer))
-    emit_hex("vector_81.answer_sha256", sha256(answer))
-
-    # --- The answer's seal, binding request_digest in info and aad.
-    # The recipient key is Vector 37's wrapping key; the ephemeral key is
-    # §25.2's tertiary key.
-    recipient = keypair_from_seed(
-        WRAPPING_KEY_SEED, TEST_VECTOR_KEY_LABEL, "wrapping key"
-    )
-    info = reseat_seal_label(
-        "scp-reseat-groupinfo-v1", RESEAT_CONTEXT_ID, request_digest
-    )
-    aad = reseat_seal_label(
-        "scp-reseat-groupinfo-aad-v1", RESEAT_CONTEXT_ID, request_digest
-    )
-    sealed = hpke_seal_base(recipient, REF_KEY_3, info, aad, answer)
-    emit_hex("vector_81.seal_groupinfo.info", info)
-    emit_hex("vector_81.seal_groupinfo.aad", aad)
-    emit_hex("vector_81.seal_groupinfo.shared_secret", sealed["shared_secret"])
-    emit_hex("vector_81.seal_groupinfo.key", sealed["key"])
-    emit_hex("vector_81.seal_groupinfo.base_nonce", sealed["base_nonce"])
-    emit("vector_81.seal_groupinfo.ciphertext_len", len(sealed["ciphertext"]))
-    emit_hex("vector_81.seal_groupinfo.ciphertext_sha256", sha256(sealed["ciphertext"]))
 
 
 # --- §25.34 Vector 83: the custody-reachability probe ---

@@ -1509,43 +1509,9 @@ key_positions_hash with the resolved position in place of the contested one:
   0xfea7bb39f87590a3bad2a6711c540ad4b62ee24971dc268d31b3aa31872790fb
 ```
 
-### Vector 81: the `ReseatGroupInfo` answer and its seal (§5.12.3.4, §9.7.1, §9.18)
+### Vector 81: withdrawn
 
-Fixture: carol (`publisher_did`, §25.1) answers Vector 82's request for epoch 7 of `context-alpha`, with recipient Vector 80's identity. `group_info` is 300 fixed bytes and `wrap_key` 16 fixed bytes, each the leading bytes of SHA-256("SCP test vector " || label || " " || counter) blocks. `key_material` and `context_params` are bins holding these RFC 8785 forms:
-
-```
-key_material:   {"context_metadata_key":"b4b7bf6e0f36c5639bb30720427c522a9f5f26db0eef479a7d868223f070cc60","sender_key_seed":null}
-context_params: {"governance":"SingleAdmin","mode":"Encrypted","ttl":null}
-group_info:     0xd383e910f15bf87e232c2489e07705faf4489ebbdd127aaf5d35ae7e9872dd32f9669081e74663937c45146b08280fb60f4ba3b5fbc899c0f8f43ab1a1779fe426e176ac2774d89a3aeca507bd2720c29b4a9b5262a9f4093ebc2e6af3370fd2482dac42c141679e34289c5a3489895eff76e4a2c685482d513e0351242ba880109c1934a20f0fb3cc92cbaa96c66c4cdb47b234a0bd0178fcf1b657c6d3c26f92d519d252862a3d253aad3b9a507a1c67df5683f16171ea87c1959b580bc4d99bf695da08d4ed17f29410f7676438a5e2146b0c0ffb906b14ff9ec5be32290e60b582773ac4d892696431673ae04a2b647e1df586fcca257eba7bf8468426af70030a30ab676c133b9a7552bb3492caa93b06e7b32f48190a3ab5d3fdc91afbf9e50968f51b9eb4855cf129
-wrap_key:       0x67d8345a7b14a7621dfe1f4f47b462cc
-
-Signature preimage, 329 bytes:
-  "SCP-RESEAT-GROUPINFO-V1:" || BE32(13) || "context-alpha" || BE64(7) || request_digest
-  || BE32(56) || recipient || SHA-256(group_info) || SHA-256(wrap_key)
-  || SHA-256(key_material) || SHA-256(context_params) || BE32(56) || publisher_did
-  0x5343502d5245534541542d47524f5550494e464f2d56313a0000000d636f6e746578742d616c7068610000000000000007db620ebad828cc2cad51ab5168053bb1a66dcf83cd7bd5f55521708d23d59183000000387363703a3277773369343661636b62357a67743670326d7979686a72666d35646b6f77706a627234637037687033376461737774726f7a7180e13f471e14b27be01ec88f74e5420ac33f23980d22e2538cf2480a001c46ca7dde0f76af497a1c01df97c005ef887fe9e15c6074f021c1156fe1576fb65f51c9646c5ac83f54e73c0925fc633f039a614e960780e015ed684b2f0f4e0b44c2300c02ffdc6d8a419d258aa9bbb6d991e1b5e52b4f97fa8dd571323d2dbf6c47000000387363703a6d75336c656572706f70776c71693464613567363577677076356370346c6d7678667065626f746d6e7975677665647333377161
-canonical hash: 0x36c304491318635fd6cef85e6d5b194f9178d2f8a7d09debf2dabb95b3e1ac5e
-signature (reference key, RFC 6979): 0xf2a33f4cbfb8bebbd2a3eb3b7bddd7d90630985e025e21f9ba8450d0c67ca7d25097c0011a330f88a84f31e03be992678f0c19edf407432ee3ac1ac41dba4d01
-
-Answer: a nine-item MessagePack array (0x99), 671 bytes, with SHA-256
-  0x1d58becfe2cc3b24d9e6d47f65df4355d5c216dca94b09360b69823515400750
-item headers in order: ad 07 c420 c5012c c410 c472 c43a d938 c440
-```
-
-A `context_params` bin whose JSON reorders a member, `{"mode":"Encrypted","governance":"SingleAdmin","ttl":null}`, is not the RFC 8785 form, and a receiver rejects the answer that carries it.
-
-**The seal.** The answer is sealed in RFC 9180 base mode under the suite of §5.12.3.1, to Vector 37's `wrapping_key`, with the §25.2 tertiary key as the fixed ephemeral key. `info` and `aad` are the label, BE32(13) || "context-alpha", and Vector 82's `request_digest`. The shared secret is `e3aca73e38b32533c7038dc86fedc10238bd9adbe67be8f21606d4427043bd3c`.
-
-| Seal | `info` label / `aad` label | key | base_nonce | ciphertext length, SHA-256 |
-|---|---|---|---|---|
-| `ReseatGroupInfo` | `scp-reseat-groupinfo-v1` / `scp-reseat-groupinfo-aad-v1` | `e0a54b675ca9b35d64cda901af309572` | `33d84d011ca57c55997b7e8d` | 687, `352cf0f6ecc8044a9cbc79ac85a0505409622cfa55eb40d082a1c96a0a7343ac` |
-
-```
-groupinfo info: 0x7363702d7265736561742d67726f7570696e666f2d76310000000d636f6e746578742d616c706861db620ebad828cc2cad51ab5168053bb1a66dcf83cd7bd5f55521708d23d59183
-groupinfo aad:  0x7363702d7265736561742d67726f7570696e666f2d6161642d76310000000d636f6e746578742d616c706861db620ebad828cc2cad51ab5168053bb1a66dcf83cd7bd5f55521708d23d59183
-```
-
-An opener that builds `info` or `aad` from an epoch in place of `request_digest` fails to open the seal.
+Withdrawn 2026-11-02. Vector 81 fixed the bytes of the `ReseatGroupInfo` answer and its seal. ADR-069 decision 8 replaces the external re-seat that the answer served with a re-seat request that members execute (`05-contexts.md` §5.12.3.4, §5.12.3.5), so no answer and no seal remain to test. The number is not reused.
 
 ### Vector 82: the `ReseatRequest` (§5.12.3.5)
 
