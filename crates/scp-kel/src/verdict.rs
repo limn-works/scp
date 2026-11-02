@@ -222,14 +222,15 @@ pub enum ClassifyError {
 
 /// The key state a resolution accepted.
 ///
-/// It holds the state replaying the validated chain derived, and the
-/// instant of the resolution. Only [`classify`]
+/// It holds the validated chain the resolution adopted, the state replaying
+/// it derived, and the instant of the resolution. Only [`classify`]
 /// constructs it, on `Confirmed` or `Adopted`, so every verification
 /// decision that reads key state reads one a resolution accepted
 /// (`03-identity.md` §3.10.10).
 ///
 /// ```compile_fail,E0451
 /// let _ = scp_kel::ResolvedState {
+///     chain: todo!(),
 ///     replayed: todo!(),
 ///     identifier: todo!(),
 ///     head_digest: [0; 32],
@@ -247,6 +248,10 @@ pub enum ClassifyError {
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedState {
+    /// The adopted chain, which [`ResolvedState::key_state_at`] reads a
+    /// past position of. It holds the log's public events and no secret,
+    /// and R9 bounds it as it bounds every retained chain.
+    chain: ValidatedChain,
     replayed: ReplayedState,
     identifier: Identifier,
     head_digest: [u8; 32],
@@ -258,6 +263,7 @@ impl ResolvedState {
     /// The state `chain` replays to, resolved at `resolved_at`.
     fn of(chain: &ValidatedChain, resolved_at: SystemTime) -> Self {
         Self {
+            chain: chain.clone(),
             replayed: replay(chain),
             identifier: chain.identifier(),
             head_digest: chain.head_digest(),
@@ -288,6 +294,22 @@ impl ResolvedState {
     #[must_use]
     pub const fn key_state(&self) -> &KeyState {
         self.replayed.key_state()
+    }
+
+    /// The key state at the resolved chain's event whose preimage digest
+    /// (`09-security-model.md` §9.5.1) is `digest`: that position's latest
+    /// snapshot with the standing commitment at that position, whatever
+    /// events follow it (§9.7.4.2 R8). A verifier reads a log-anchored
+    /// signature's key here, at the signed object's `key_state_head`
+    /// (`09-security-model.md` §9.7.1, the log-anchored row;
+    /// `03-identity.md` §3.10.10), so the key is read on the chain the
+    /// resolution adopted.
+    ///
+    /// # Errors
+    ///
+    /// [`NotOnChain`](crate::NotOnChain) where no event of the resolved chain has that digest.
+    pub fn key_state_at(&self, digest: &[u8; 32]) -> Result<KeyState, crate::NotOnChain> {
+        crate::key_state_at(&self.chain, digest).map(|state| state.key_state().clone())
     }
 
     /// The commitment the latest reveal-authorized event fixed, or the

@@ -242,14 +242,14 @@ const ALLOWLIST: &[Allowed] = &[
     allow(
         "crates/scp-kel/src/verdict.rs",
         "struct ResolvedState",
-        "27f11d950be95e2e0a0356fdb1133bdb04926d5dc7fcede76eb82543e0fb76f1",
+        "0a86eb46b61714dd0571062b6a5ab3dd62efdee6c6a9a6960b931e2c43bc5199",
         "holds the replayed state of the chain resolution accepted, in a private field",
     ),
     allow(
         "crates/scp-kel/src/verdict.rs",
         "impl ResolvedState",
-        "7e28a093730f2175ac738acf5d34376aeee5a997b57d10d215eb9bcbea330938",
-        "`key_state` returns the state of the chain resolution accepted; takes none in",
+        "ed0e611fc5f96f1a91f9743fc06a74d62c87d473baad9e40bc30b89880e2f5a7",
+        "`key_state` and `key_state_at` return states of the chain resolution accepted; takes none in",
     ),
     allow(
         "crates/scp-protocol/src/crypto/key_continuity.rs",

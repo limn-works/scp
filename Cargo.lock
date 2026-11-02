@@ -5538,6 +5538,7 @@ dependencies = [
  "scp-did",
  "scp-event-log",
  "scp-identity",
+ "scp-kel",
  "scp-mls",
  "scp-platform",
  "scp-protocol",

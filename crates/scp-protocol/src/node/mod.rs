@@ -8,11 +8,11 @@
 //!   response.
 //!
 //! These are pure types and codecs. Each verification returns a `Verified*`
-//! type whose only constructor is that verification, and takes the key the
-//! caller resolved, because the classes §9.7.1 assigns (log-anchored for a
-//! binding and a record's attribution, current-key for a record's standing,
-//! bound-node-key for a proof) read key state and list state this crate does
-//! not hold.
+//! type whose only constructor is that verification. A binding and a record
+//! take the signer's validated key-event log and read the key the §9.7.1
+//! class names from it: log-anchored for a binding and a record's
+//! attribution, current-key for a record's standing. A proof takes the
+//! verified binding of its node, the bound-node-key class.
 
 pub mod binding;
 pub mod list;

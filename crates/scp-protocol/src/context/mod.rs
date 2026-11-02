@@ -17,6 +17,8 @@ pub mod membership;
 pub mod memory_scope;
 pub mod metadata;
 pub mod nesting;
+pub mod node_address;
+pub mod operator_binding;
 pub mod outlets;
 pub mod params;
 pub mod policy;
@@ -57,6 +59,16 @@ pub use metadata::{
     Ed25519Signature, MetadataRecord, MetadataSnapshot, OperationalMetadata, StructuralMetadata,
 };
 pub use nesting::{compute_ceiling_intersection, validate_child_ttl, validate_nesting_depth};
+pub use node_address::{
+    CONTEXT_NODE_ADDRESS_SEPARATOR, ContextNodeAddress, NODE_BRIDGE_LEN, NodeAddress,
+    NodeAddressError, NodeBridge, VerifiedContextNodeAddress,
+};
+pub use operator_binding::{
+    CONTEXT_CHAIN_SEPARATOR, CONTEXT_OPERATOR_SEPARATOR, CONTEXT_RECEIPT_SEPARATOR,
+    ContextChainEntry, ContextOperatorBinding, ContextOperatorError, ContextReceipt,
+    FIRST_POSITION, FIRST_PREVIOUS_HASH, HeldBindingHash, VerifiedContextChainEntry,
+    VerifiedContextOperatorBinding, VerifiedContextReceipt, submission_hash,
+};
 pub use params::{
     Capability, CeilingPolicy, ContextMode, ContextParams, FieldVisibility, GovernanceModel,
     MemoryScope, MetadataVisibilityPolicy, MigrationSource, OutletRegistration,

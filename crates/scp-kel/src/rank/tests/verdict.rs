@@ -14,7 +14,8 @@ use super::super::{
 use scp_did::Identifier;
 
 use super::chain_support::{
-    Ring, group, identifier_of, sign_inception, signed_of, v41_v50, v41_v54, v41_v55, vector,
+    Ring, current, digest_of, group, identifier_of, key_state_on, point, sign_inception, sign_on,
+    signed_of, v41, v41_changed, v41_v50, v41_v54, v41_v55, vector,
 };
 use super::fixtures::{
     self, TestResult, V41_IDENTIFIER, V41_PREIMAGE, V50_DIGEST, V54_DIGEST, V55_DIGEST,
@@ -25,6 +26,7 @@ use crate::{
     ResolutionVerdict, ResolvedState, SequenceRange, SourceExhaustion, SourceRead, classify,
     replay,
 };
+use scp_did::{KeyCondition, KeyEntry, KeyRole};
 
 /// The resolution instant every test reads.
 fn now() -> Result<SystemTime, Error> {
@@ -399,6 +401,65 @@ fn resolved_state_accessors_on_vector_41_50() -> TestResult {
     assert_eq!(state.head_sequence(), 1);
     assert_eq!(state.key_state(), replayed.key_state());
     assert_eq!(state.standing_commitment(), replayed.standing_commitment());
+    Ok(())
+}
+
+/// `03-identity.md` §3.10.10 and `09-security-model.md` §9.7.1's
+/// log-anchored row: after a `KeyState` on Vector 41 rotates `#active`,
+/// `key_state_at` at Vector 41's digest reads the earlier `#active`, at the
+/// head's digest the later one, and refuses a digest that names no event of
+/// the adopted chain.
+///
+/// Mutant (run, then restored): `key_state_at` returning the head's state.
+#[test]
+fn resolved_state_reads_the_earlier_active_after_a_rotation() -> TestResult {
+    let base = v41()?;
+    let earlier = fixtures::array::<33>(fixtures::V41_ACTIVE)?;
+    let later = point("scp-365-rotated-active");
+    let mut rotated = v41_changed()?;
+    rotated.keys = vec![
+        current(
+            fixtures::array::<33>(fixtures::V41_ROOT)?,
+            KeyRole::RootMember,
+        ),
+        current(later, KeyRole::Active),
+        KeyEntry {
+            condition: KeyCondition::Superseded,
+            ..current(earlier, KeyRole::Active)
+        },
+    ];
+    let unit = sign_on(&Ring::new()?, &base, &key_state_on(&base, rotated))?;
+    let head = digest_of(signed_of(&unit)?);
+    let mut units = base.units.clone();
+    units.push(unit);
+    let read = |name: &str, n| SourceRead {
+        name: name.to_owned(),
+        units: units.clone(),
+        exhaustion: SourceExhaustion::Exhausted,
+        proof: operator(n),
+    };
+    let result = run(None, &[read("a", 1), read("b", 2)])?;
+    let state = key_state(&result)?;
+    assert_eq!(state.head_digest(), head);
+    let current_active = |keys: &[KeyEntry]| -> Vec<[u8; 33]> {
+        keys.iter()
+            .filter(|e| e.role == KeyRole::Active && e.condition == KeyCondition::Current)
+            .map(|e| e.key)
+            .collect()
+    };
+    assert_eq!(
+        current_active(&state.key_state_at(&base.head)?.keys),
+        vec![earlier]
+    );
+    assert_eq!(
+        current_active(&state.key_state_at(&head)?.keys),
+        vec![later]
+    );
+    assert_eq!(current_active(&state.key_state().keys), vec![later]);
+    assert_eq!(
+        state.key_state_at(&[0x22; 32]),
+        Err(crate::NotOnChain { digest: [0x22; 32] })
+    );
     Ok(())
 }
 

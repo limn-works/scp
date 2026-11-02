@@ -23,17 +23,19 @@
 //! [`VerifiedNodeListRecord`] records which: [`NodeListKeyClass::Standing`]
 //! under the key the governor's current key state lists `Current` in
 //! `#active`, and [`NodeListKeyClass::Attribution`] under the `#active` that
-//! was `Current` at `signing_key_state_head`.
+//! was `Current` at `signing_key_state_head`. Both read the key from the
+//! governor's validated key-event log, never from a key the caller names.
 
-use scp_crypto::p256::{P256Error, P256PublicKey, SIGNATURE_LEN, verify_prehash_strict};
+use scp_crypto::p256::{P256Error, SIGNATURE_LEN, verify_prehash_strict};
 use scp_did::{DidError, Identifier, NodeEntryUrlError, NodeId, NodeUrl};
-use scp_kel::{NodeKeyError, node_list_routing_id};
+use scp_kel::{NodeKeyError, ResolvedState, node_list_routing_id};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::binding::{
     NODE_KEY_LEN, NodeBinding, NodeBindingError, VerifiedNodeBinding, node_url_hash,
 };
+use crate::crypto::anchored_key::{AnchoredKeyError, active_at, current_active};
 use crate::crypto::canonical::{CanonicalError, CanonicalField, canonical_hash};
 use crate::envelope::did_record::MAX_BLOB_SIZE;
 
@@ -102,8 +104,10 @@ pub struct VerifiedNodeListEntry {
 impl VerifiedNodeListEntry {
     /// Checks that `binding.url_hash` is the SHA-256 of `url`, so a binding
     /// signed for one URL cannot be listed under another, then verifies the
-    /// binding under `operator_active`, the operator's `#active` at
-    /// `binding.key_state_head` (see [`VerifiedNodeBinding::verify`]).
+    /// binding under the operator's `#active` at `binding.key_state_head` on
+    /// `operator`, the key state the verifier's resolution of `binding.operator`
+    /// accepted (see
+    /// [`VerifiedNodeBinding::verify`]).
     ///
     /// # Errors
     ///
@@ -111,13 +115,13 @@ impl VerifiedNodeListEntry {
     /// [`NodeListEntryError::Binding`].
     pub fn verify(
         entry: NodeListEntry,
-        operator_active: &P256PublicKey,
+        operator: &ResolvedState,
     ) -> Result<Self, NodeListEntryError> {
         if node_url_hash(&entry.url) != entry.binding.url_hash {
             return Err(NodeListEntryError::UrlHashMismatch);
         }
         Ok(Self {
-            binding: VerifiedNodeBinding::verify(entry.binding, operator_active)?,
+            binding: VerifiedNodeBinding::verify(entry.binding, operator)?,
             url: entry.url,
             free: entry.free,
         })
@@ -210,6 +214,10 @@ pub enum NodeListError {
     /// The governor signature does not verify.
     #[error("node-list record signature: {0}")]
     Signature(P256Error),
+    /// The governor key the class names could not be read from the
+    /// key-event log handed in.
+    #[error("node-list record governor key: {0}")]
+    GovernorKey(AnchoredKeyError),
 }
 
 // The JSON shape. Member order here is irrelevant: `crate::jcs` sorts members
@@ -442,20 +450,31 @@ pub struct VerifiedNodeListRecord {
 }
 
 impl VerifiedNodeListRecord {
-    /// Verifies `record`'s signature strictly under `governor_active`, the
-    /// key `class` names. The caller resolves that key, because both classes
-    /// read the governor's key state, which this type does not hold.
+    /// Verifies `record`'s signature strictly under the governor key `class`
+    /// names, read from `governor`, the key state the verifier's resolution of
+    /// `record.governor` accepted: the `#active` at the chain's head for
+    /// [`NodeListKeyClass::Standing`], and the `#active` at
+    /// `signing_key_state_head` for [`NodeListKeyClass::Attribution`].
     ///
     /// # Errors
     ///
+    /// [`NodeListError::GovernorKey`] when `governor` is another identity's
+    /// or its chain does not hold `signing_key_state_head`,
     /// [`NodeListError::Signature`] when the signature fails, or a digest
     /// error.
     pub fn verify(
         record: NodeListRecord,
         class: NodeListKeyClass,
-        governor_active: &P256PublicKey,
+        governor: &ResolvedState,
     ) -> Result<Self, NodeListError> {
-        verify_prehash_strict(governor_active, &record.digest()?, &record.signature)
+        let governor_active = match class {
+            NodeListKeyClass::Standing => current_active(governor, &record.governor),
+            NodeListKeyClass::Attribution => {
+                active_at(governor, &record.governor, &record.signing_key_state_head)
+            }
+        }
+        .map_err(NodeListError::GovernorKey)?;
+        verify_prehash_strict(&governor_active, &record.digest()?, &record.signature)
             .map_err(NodeListError::Signature)?;
         Ok(Self { record, class })
     }
@@ -589,54 +608,70 @@ pub fn check_node_list_publish(
 mod tests {
     use scp_crypto::p256::{P256SecretKey, sign_prehash_rfc6979};
 
-    use super::super::binding::tests::{key, signed_binding};
+    use super::super::binding::tests::{
+        Identity, TestResult, incept, key, operator, signed_binding,
+    };
     use super::*;
 
-    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+    /// The governor identity of these tests: root `key(0x39)`, `#active`
+    /// `key(9)`.
+    fn governor() -> TestResult<Identity> {
+        incept(0x39, 9, 0x3b)
+    }
 
+    /// An entry whose binding [`operator`] signs with its `#active`.
     fn entry(node_seed: u8, url: &str, free: bool) -> TestResult<NodeListEntry> {
         let url = NodeUrl::new(url)?;
         Ok(NodeListEntry {
-            binding: signed_binding(&key(1), &key(node_seed), &url)?,
+            binding: signed_binding(&operator()?, &key(1), &key(node_seed), &url)?,
             url,
             free,
         })
     }
 
-    fn signed_record(governor_key: &P256SecretKey) -> TestResult<NodeListRecord> {
+    /// A record of `governor` at its current head, signed by `signer`.
+    fn record_of(governor: &Identity, signer: &P256SecretKey) -> TestResult<NodeListRecord> {
         let entries = vec![
             entry(2, "wss://a.example.com/scp/v1", true)?,
             entry(3, "wss://b.example.com/scp/v1", false)?,
         ];
-        let governor = Identifier::from_bytes([0x33; 32]);
-        let head = [0x44; 32];
-        let digest = NodeListRecord::signing_digest("node-list", 1, &governor, &head, &entries)?;
+        let digest = NodeListRecord::signing_digest(
+            "node-list",
+            1,
+            &governor.identifier,
+            &governor.head,
+            &entries,
+        )?;
         Ok(NodeListRecord {
             context_id: "node-list".to_owned(),
             sequence: 1,
-            governor,
-            signing_key_state_head: head,
+            governor: governor.identifier,
+            signing_key_state_head: governor.head,
             entries,
-            signature: sign_prehash_rfc6979(governor_key, &digest)?,
+            signature: sign_prehash_rfc6979(signer, &digest)?,
         })
+    }
+
+    /// A record of [`governor`] signed by `signer`.
+    fn signed_record(signer: &P256SecretKey) -> TestResult<NodeListRecord> {
+        record_of(&governor()?, signer)
     }
 
     #[test]
     fn a_record_round_trips_through_canonical_json_and_verifies() -> TestResult {
-        let governor = key(9);
-        let record = signed_record(&governor)?;
+        let record = signed_record(&key(9))?;
         let json = record.to_canonical_json()?;
         let back = NodeListRecord::from_canonical_json(&json)?;
         assert_eq!(back, record);
         let verified = VerifiedNodeListRecord::verify(
             back.clone(),
             NodeListKeyClass::Standing,
-            &governor.public_key(),
+            &governor()?.resolved()?,
         )?;
         assert_eq!(verified.class(), NodeListKeyClass::Standing);
         assert_eq!(verified.record(), &back);
         for entry in &back.entries {
-            let checked = VerifiedNodeListEntry::verify(entry.clone(), &key(1).public_key())?;
+            let checked = VerifiedNodeListEntry::verify(entry.clone(), &operator()?.resolved()?)?;
             assert_eq!(checked.binding().binding(), &entry.binding);
             assert_eq!(checked.url(), &entry.url);
         }
@@ -655,8 +690,8 @@ mod tests {
         preimage.extend_from_slice(&9u32.to_be_bytes());
         preimage.extend_from_slice(b"node-list");
         preimage.extend_from_slice(&1u64.to_be_bytes());
-        preimage.extend_from_slice(&[0x33; 32]);
-        preimage.extend_from_slice(&[0x44; 32]);
+        preimage.extend_from_slice(governor()?.identifier.as_bytes());
+        preimage.extend_from_slice(&governor()?.head);
         preimage.extend_from_slice(&entries_digest);
         let expected: [u8; 32] = Sha256::digest(&preimage).into();
         assert_eq!(record.digest()?, expected);
@@ -664,18 +699,17 @@ mod tests {
     }
 
     /// A change to each of the five signed fields, and to the signature,
-    /// makes the governor signature refused.
+    /// makes the record refused: `governor` and `signing_key_state_head` at
+    /// the key read, the rest at the signature.
     #[test]
     fn a_change_in_each_record_field_is_refused() -> TestResult {
-        let governor = key(9);
-        let active = governor.public_key();
-        let good = signed_record(&governor)?;
-        let refused = |r: &NodeListRecord| {
-            matches!(
-                VerifiedNodeListRecord::verify(r.clone(), NodeListKeyClass::Attribution, &active),
-                Err(NodeListError::Signature(_))
-            )
+        let resolved = governor()?.resolved()?;
+        let good = signed_record(&key(9))?;
+        let verdict = |r: &NodeListRecord| {
+            VerifiedNodeListRecord::verify(r.clone(), NodeListKeyClass::Attribution, &resolved)
+                .map(|_| ())
         };
+        let refused = |r: &NodeListRecord| matches!(verdict(r), Err(NodeListError::Signature(_)));
 
         let mut r = good.clone();
         r.context_id.push('x');
@@ -689,11 +723,21 @@ mod tests {
         let mut g = *r.governor.as_bytes();
         g[0] ^= 1;
         r.governor = Identifier::from_bytes(g);
-        assert!(refused(&r), "governor");
+        assert_eq!(
+            verdict(&r),
+            Err(NodeListError::GovernorKey(
+                AnchoredKeyError::IdentityMismatch
+            )),
+            "governor"
+        );
 
         let mut r = good.clone();
         r.signing_key_state_head[0] ^= 1;
-        assert!(refused(&r), "signing_key_state_head");
+        assert_eq!(
+            verdict(&r),
+            Err(NodeListError::GovernorKey(AnchoredKeyError::HeadNotOnChain)),
+            "signing_key_state_head"
+        );
 
         let mut r = good.clone();
         r.entries[1].free = true;
@@ -714,7 +758,7 @@ mod tests {
         let mut e = entry(2, "wss://a.example.com/scp/v1", true)?;
         e.url = NodeUrl::new("wss://c.example.com/scp/v1")?;
         assert_eq!(
-            VerifiedNodeListEntry::verify(e, &key(1).public_key()),
+            VerifiedNodeListEntry::verify(e, &operator()?.resolved()?),
             Err(NodeListEntryError::UrlHashMismatch)
         );
         Ok(())
@@ -730,7 +774,9 @@ mod tests {
             NodeListRecord::from_canonical_json(spaced.as_bytes()),
             Err(NodeListError::NotCanonical)
         );
-        let upper = text.replacen(r#""governor":"33"#, r#""governor":"3A"#, 1);
+        let governor_hex = hex::encode(governor()?.identifier.as_bytes());
+        let upper = text.replacen(&governor_hex, &governor_hex.to_uppercase(), 1);
+        assert_ne!(upper, text);
         assert!(NodeListRecord::from_canonical_json(upper.as_bytes()).is_err());
         let padded = text.replacen(r#""sequence":"1""#, r#""sequence":"01""#, 1);
         assert_eq!(
@@ -757,8 +803,7 @@ mod tests {
 
     #[test]
     fn a_sequence_above_two_to_the_53_round_trips() -> TestResult {
-        let governor = key(9);
-        let mut record = signed_record(&governor)?;
+        let mut record = signed_record(&key(9))?;
         record.sequence = u64::MAX;
         let json = record.to_canonical_json()?;
         assert_eq!(NodeListRecord::from_canonical_json(&json)?, record);
@@ -767,13 +812,58 @@ mod tests {
 
     #[test]
     fn an_entry_with_a_bad_binding_is_void() -> TestResult {
-        let e = entry(2, "wss://a.example.com/scp/v1", true)?;
+        let op = operator()?;
+        let url = NodeUrl::new("wss://a.example.com/scp/v1")?;
+        let e = NodeListEntry {
+            binding: signed_binding(&op, &key(4), &key(2), &url)?,
+            url,
+            free: true,
+        };
         assert!(matches!(
-            VerifiedNodeListEntry::verify(e, &key(4).public_key()),
+            VerifiedNodeListEntry::verify(e, &op.resolved()?),
             Err(NodeListEntryError::Binding(
                 NodeBindingError::OperatorSignature(_)
             ))
         ));
+        Ok(())
+    }
+
+    /// The governor rotates `#active` after signing. Attribution reads the
+    /// key at `signing_key_state_head` and Standing the key at the chain's
+    /// head, so the old record attributes and gives no standing, and a record
+    /// the new key signs at the old head gives standing and does not
+    /// attribute.
+    #[test]
+    fn each_class_reads_its_own_governor_key() -> TestResult {
+        let old = governor()?;
+        let by_old_key = record_of(&old, &key(9))?;
+        let by_new_key = record_of(&old, &key(10))?;
+        let resolved = old.rotate(10)?.resolved()?;
+        let verdict = |r: &NodeListRecord, class| {
+            VerifiedNodeListRecord::verify(r.clone(), class, &resolved).map(|v| v.class())
+        };
+        let failed = Err(NodeListError::Signature(P256Error::VerificationFailed));
+        assert_eq!(
+            verdict(&by_old_key, NodeListKeyClass::Attribution),
+            Ok(NodeListKeyClass::Attribution)
+        );
+        assert_eq!(verdict(&by_old_key, NodeListKeyClass::Standing), failed);
+        assert_eq!(verdict(&by_new_key, NodeListKeyClass::Attribution), failed);
+        assert_eq!(
+            verdict(&by_new_key, NodeListKeyClass::Standing),
+            Ok(NodeListKeyClass::Standing)
+        );
+        assert_eq!(
+            VerifiedNodeListRecord::verify(
+                by_old_key,
+                NodeListKeyClass::Standing,
+                &operator()?.resolved()?
+            )
+            .map(|_| ()),
+            Err(NodeListError::GovernorKey(
+                AnchoredKeyError::IdentityMismatch
+            ))
+        );
         Ok(())
     }
 

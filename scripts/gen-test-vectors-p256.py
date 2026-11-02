@@ -2295,28 +2295,26 @@ NODE_LIST_ROUTING_PREFIX = b"scp:nls:"
 # the fixture is the lowercase hex of a stated label's digest.
 NODE_LIST_CONTEXT_ID = sha256(b"scp-25-node-list-context").hex()
 NODE_LIST_SEQUENCE = 1
-# Two listed nodes. Each operator is the digest of a stated ASCII label, and
-# both operators' `#active` is §25.2's tertiary key, which signs each
-# binding's operator_sig. The node keys are §25.2's reference and secondary
-# keys, which sign each binding's possession_sig. Each key_state_head is the
-# digest of a stated label, standing in for the operator's position.
+# Two listed nodes, both run by Vector 41's identity at its inception, so a
+# reader reads the operator's `#active` from Vector 41's log at
+# key_state_head (§9.6.3, §9.7.1 log-anchored class): §25.2's secondary key,
+# which signs each binding's operator_sig. The node keys are §25.2's
+# reference and tertiary keys, which sign each binding's possession_sig; no
+# node key is the operator's `#active`, so no entry's two signatures are the
+# same bytes.
 NODE_LIST_ENTRIES = [
-    (
-        sha256(b"scp-25-node-operator-a"),
-        REF_KEY_1,
-        "wss://node-a.example.com/scp/v1",
-        sha256(b"scp-25-node-operator-a-head"),
-        True,
-    ),
-    (
-        sha256(b"scp-25-node-operator-b"),
-        REF_KEY_2,
-        "wss://node-b.example.com/scp/v1",
-        sha256(b"scp-25-node-operator-b-head"),
-        False,
-    ),
+    (REF_KEY_1, "wss://node-a.example.com/scp/v1", True),
+    (REF_KEY_3, "wss://node-b.example.com/scp/v1", False),
 ]
-NODE_OPERATOR_ACTIVE = REF_KEY_3
+NODE_OPERATOR_ACTIVE = REF_KEY_2
+
+
+def node_operator() -> tuple[bytes, bytes]:
+    """The listed nodes' operator and its key_state_head: Vector 41's
+    identifier and inception digest."""
+    assert len(INCEPTION_IDENTIFIER) == 32 and len(INCEPTION_DIGEST) == 32, "Vector 41 runs first"
+    assert all(key is not NODE_OPERATOR_ACTIVE for key, _, _ in NODE_LIST_ENTRIES)
+    return INCEPTION_IDENTIFIER, INCEPTION_DIGEST
 
 
 
@@ -2358,13 +2356,14 @@ def node_binding(
 
 
 def node_list_entries() -> list[dict]:
+    operator, head = node_operator()
     return [
         {
             "binding": node_binding(operator, key, url, head, f"node_list.entry_{index}"),
             "free": free,
             "url": url,
         }
-        for index, (operator, key, url, head, free) in enumerate(NODE_LIST_ENTRIES)
+        for index, (key, url, free) in enumerate(NODE_LIST_ENTRIES)
     ]
 
 
@@ -2412,7 +2411,8 @@ def emit_node_id() -> None:
 
 def emit_node_binding() -> None:
     # Vector 91: the binding of the node list's entry 0.
-    operator, key, url, head, _ = NODE_LIST_ENTRIES[0]
+    operator, head = node_operator()
+    key, url, _ = NODE_LIST_ENTRIES[0]
     binding = node_binding(operator, key, url, head, "vector_91")
     url_hash = sha256(url.encode())
     preimage = node_binding_preimage(operator, key.compressed, url_hash, head)
@@ -3977,7 +3977,7 @@ def emit_key_positions_and_reseat() -> None:
         record_sequence, identifier, INCEPTION_DIGEST, "vector_80.list_record"
     )
     serving_node_id = node_id(REF_KEY_1.compressed)
-    assert NODE_LIST_ENTRIES[0][1] is REF_KEY_1
+    assert NODE_LIST_ENTRIES[0][0] is REF_KEY_1
     response = repeated_field([frame54])
     proof_nonce = fixture_digest("confirmation proof nonce")
     routing_id = sha256(b"scp:did:" + identifier)
@@ -4386,6 +4386,138 @@ def emit_device_attestation() -> None:
     emit("vector_88.root_der_length", len(root_der))
     emit_hex("vector_88.root_sha256", sha256(root_der))
 
+# --- §25.36 Vectors 92-95: the context operator binding, the context node
+# address, a chain entry and a receipt (`09-security-model.md` §9.5.2) ---
+
+CONTEXT_OPERATOR_SEPARATOR = "SCP-CONTEXT-OPERATOR-V1:"
+CONTEXT_NODE_ADDRESS_SEPARATOR = "SCP-CONTEXT-NODE-ADDRESS-V1:"
+CONTEXT_CHAIN_SEPARATOR = "SCP-CONTEXT-CHAIN-V1:"
+CONTEXT_RECEIPT_SEPARATOR = "SCP-CONTEXT-RECEIPT-V1:"
+# The context id is a string; the fixture is the lowercase hex of a stated
+# label's digest. The operator is Vector 41's identity and its key_state_head
+# is Vector 41's inception digest, so a reader verifies the binding under the
+# `#active` it reads from Vector 41's log at that position: §25.2's secondary
+# key. context_key is §25.2's tertiary key, which signs every address, entry
+# and receipt, and is not the operator's `#active`.
+CONTEXT_OPERATOR_CONTEXT_ID = sha256(b"scp-25-context-operator-context").hex()
+CONTEXT_OPERATOR_ACTIVE = REF_KEY_2
+CONTEXT_KEY = REF_KEY_3
+CONTEXT_DIRECT_URL = "wss://context-node.example.com/scp/v1"
+CONTEXT_BRIDGE_URL = "wss://bridge.example.com/scp/v1"
+CONTEXT_SUBMISSION = b"scp-25-context-submission"
+CONTEXT_POSITION = 7
+CONTEXT_PREVIOUS_HASH = sha256(b"scp-25-context-chain-entry-6")
+
+
+def node_address_bytes(url: str, bridge: tuple[bytes, bytes, bytes] | None) -> bytes:
+    """§9.5.2 NodeAddress: var(url) || var(body), where body is via ||
+    bridge_target || wrapping_key (97 bytes) or SHA-256(0x00) when absent."""
+    if bridge is None:
+        body = ABSENT_SENTINEL
+    else:
+        via, target, wrapping_key = bridge
+        assert len(via) == 32 and len(target) == 32 and len(wrapping_key) == 33
+        assert target != ABSENT_SENTINEL, "a present bridge_target is not the sentinel"
+        assert wrapping_key[0] in (2, 3), "wrapping_key is compressed"
+        assert url.startswith("wss://"), "a bridge needs a wss url"
+        body = via + target + wrapping_key
+        assert len(body) == 97, len(body)
+    return var_field(url) + var_field(body)
+
+
+def emit_context_operator() -> None:
+    section("§25.36 Vectors 92-95 context operator binding, node address, chain entry, receipt")
+
+    # Vector 92: the binding, by Vector 41's identity at its inception.
+    operator, operator_head = INCEPTION_IDENTIFIER, INCEPTION_DIGEST
+    assert len(operator) == 32 and len(operator_head) == 32, "Vector 41 runs first"
+    assert CONTEXT_KEY.compressed != CONTEXT_OPERATOR_ACTIVE.compressed
+    context_key = CONTEXT_KEY.compressed
+    fields = (
+        var_field(CONTEXT_OPERATOR_CONTEXT_ID)
+        + fixed_field(operator)
+        + fixed_field(context_key)
+        + fixed_field(operator_head)
+    )
+    preimage = canonical_preimage(CONTEXT_OPERATOR_SEPARATOR, fields)
+    assert len(preimage) == 24 + 4 + 64 + 32 + 33 + 32, len(preimage)
+    binding_hash = sha256(preimage)
+    signature = sign_group(CONTEXT_OPERATOR_ACTIVE, binding_hash, "vector_92")
+    wire = fields + signature
+    assert len(wire) == 165 + len(CONTEXT_OPERATOR_CONTEXT_ID), len(wire)
+    emit("vector_92.context_id", CONTEXT_OPERATOR_CONTEXT_ID)
+    emit_hex("vector_92.operator", operator)
+    emit_hex("vector_92.operator_active", CONTEXT_OPERATOR_ACTIVE.compressed)
+    emit_hex("vector_92.context_key", context_key)
+    emit_hex("vector_92.key_state_head", operator_head)
+    emit("vector_92.preimage_len", len(preimage))
+    emit_hex("vector_92.preimage", preimage)
+    emit_hex("vector_92.binding_hash", binding_hash)
+    emit_hex("vector_92.signature", signature)
+    emit("vector_92.bytes_len", len(wire))
+    emit_hex("vector_92.bytes", wire)
+
+    # Vector 93: a direct address at sequence 1 and a bridged one at 2.
+    bridge = (
+        node_id(REF_KEY_1.compressed),
+        service_record_bridge_target(INCEPTION_IDENTIFIER),
+        SERVICE_RECORD_WRAPPING_KEY.compressed,
+    )
+    for label, sequence, url, bridge_value in (
+        ("vector_93a", 1, CONTEXT_DIRECT_URL, None),
+        ("vector_93b", 2, CONTEXT_BRIDGE_URL, bridge),
+    ):
+        node = node_address_bytes(url, bridge_value)
+        preimage = canonical_preimage(
+            CONTEXT_NODE_ADDRESS_SEPARATOR,
+            fixed_field(binding_hash) + u64(sequence) + node,
+        )
+        digest = sha256(preimage)
+        signature = sign_group(CONTEXT_KEY, digest, label)
+        wire = binding_hash + u64(sequence) + node + signature
+        emit(f"{label}.sequence", sequence)
+        emit(f"{label}.url", url)
+        if bridge_value is not None:
+            emit_hex(f"{label}.via", bridge_value[0])
+            emit_hex(f"{label}.bridge_target", bridge_value[1])
+            emit_hex(f"{label}.wrapping_key", bridge_value[2])
+        emit(f"{label}.node_len", len(node))
+        emit_hex(f"{label}.node", node)
+        emit(f"{label}.preimage_len", len(preimage))
+        emit_hex(f"{label}.preimage", preimage)
+        emit_hex(f"{label}.digest", digest)
+        emit_hex(f"{label}.signature", signature)
+        emit(f"{label}.bytes_len", len(wire))
+        emit_hex(f"{label}.bytes", wire)
+
+    # Vectors 94 and 95: one submission's chain entry and receipt. They hash
+    # the same bytes, so item_hash equals submission_hash.
+    submission_hash = sha256(CONTEXT_SUBMISSION)
+    entry_preimage = canonical_preimage(
+        CONTEXT_CHAIN_SEPARATOR,
+        fixed_field(binding_hash)
+        + u64(CONTEXT_POSITION)
+        + fixed_field(submission_hash)
+        + fixed_field(CONTEXT_PREVIOUS_HASH),
+    )
+    assert len(entry_preimage) == 21 + 32 + 8 + 32 + 32, len(entry_preimage)
+    entry_digest = sha256(entry_preimage)
+    emit("vector_94.position", CONTEXT_POSITION)
+    emit_hex("vector_94.item_hash", submission_hash)
+    emit_hex("vector_94.previous_hash", CONTEXT_PREVIOUS_HASH)
+    emit_hex("vector_94.preimage", entry_preimage)
+    emit_hex("vector_94.digest", entry_digest)
+    emit_hex("vector_94.signature", sign_group(CONTEXT_KEY, entry_digest, "vector_94"))
+    receipt_preimage = canonical_preimage(
+        CONTEXT_RECEIPT_SEPARATOR,
+        fixed_field(binding_hash) + u64(CONTEXT_POSITION) + fixed_field(submission_hash),
+    )
+    assert len(receipt_preimage) == 23 + 32 + 8 + 32, len(receipt_preimage)
+    receipt_digest = sha256(receipt_preimage)
+    emit_hex("vector_95.preimage", receipt_preimage)
+    emit_hex("vector_95.digest", receipt_digest)
+    emit_hex("vector_95.signature", sign_group(CONTEXT_KEY, receipt_digest, "vector_95"))
+
 
 def main() -> int:
     self_test()
@@ -4424,6 +4556,7 @@ def main() -> int:
     emit_key_positions_and_reseat()
     emit_custody_probe()
     emit_device_attestation()
+    emit_context_operator()
     print("\n".join(_LINES))
     return 0
 
