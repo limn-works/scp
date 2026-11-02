@@ -332,6 +332,11 @@ def resolve(
         "tree",
         "-q",
         "--offline",
+        # CI sets CARGO_TERM_COLOR=always, under which cargo tree wraps the `(*)`
+        # marker in escape codes; the marker then reads as part of the feature list,
+        # every deduplicated node becomes a childless new node, and closures shrink.
+        "--color",
+        "never",
         "-e",
         "normal,build",
         "--target",
@@ -350,9 +355,15 @@ def resolve(
     roots: list[tuple] = []
     stack: list[tuple] = []
     for line in proc.stdout.splitlines():
-        m = TREE_LINE.match(line)
-        if not m:
+        if not line.strip():
             continue
+        m = TREE_LINE.match(line)
+        if not m or "\x1b" in line:
+            # A line this reader cannot parse would silently drop edges and shrink
+            # every closure, so it fails the run instead of being skipped.
+            raise RuntimeError(
+                f"`{' '.join(cmd)}` printed a line this check cannot parse: {line!r}"
+            )
         depth = int(m.group(1))
         node = (
             m.group(2).strip(),
