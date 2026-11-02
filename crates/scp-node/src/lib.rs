@@ -4121,7 +4121,8 @@ mod tests {
     /// The config opts into `DhtMode::Production` (M2 accepts `Disabled` for
     /// every `Reach`, `Reach::Domain` included), so `Node::start` publishes the
     /// identity document to the in-memory `TestDidDht`, which receives it in
-    /// process and never reaches live Mainline.
+    /// process and never reaches live Mainline. Its NAT strategy is a
+    /// `MockNatStrategy`, so a TLS-failure fall-through never probes STUN.
     fn domain_config() -> NodeConfig<InMemoryKeyCustody, TestDidDht, InMemoryStorage> {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let did_method = Arc::new(make_test_dht(&custody));
@@ -4130,6 +4131,14 @@ mod tests {
             dht: DhtMode::Production,
             tls: TlsMode::Custom(Arc::new(SucceedingTlsProvider {
                 domain: "test.example.com".to_owned(),
+            })),
+            // A test that overrides `tls` with a failing provider falls
+            // through to NAT traversal (spec 10 §10.12.8 step 4); the mock
+            // keeps that probe off the network.
+            nat: NatSlot::Custom(Arc::new(MockNatStrategy {
+                tier: ReachabilityTier::Stun {
+                    external_addr: SocketAddr::from(([198, 51, 100, 7], 32891)),
+                },
             })),
             ..NodeConfig::defaults(
                 Reach::Domain {
