@@ -3479,7 +3479,7 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
     own_lookup: scp_transport::relay::push_endpoint::OwnAddressLookup,
 ) -> Result<ApplicationNode<S>, NodeError> {
     // Node::start already rejected a domain whose relay URL has no §9.18.2
-    // canonical form (config.rs builds the relay's `ReservedPushUrl` from the same
+    // canonical form (config.rs builds the relay's `PushReservation` from the same
     // string first), so this conversion succeeds on that path; it stays a
     // typed error, never an unwrap, for any other caller.
     let relay = scp_did::RelayService::direct(
@@ -3985,7 +3985,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use scp_transport::relay::push_gate::{LiveRelayUrl, ReservedPushUrl};
+    use scp_transport::relay::push_gate::{LiveRelayUrl, PushReservation};
 
     use scp_clock::SystemClock;
     use scp_dht::InMemoryDhtClient;
@@ -6930,7 +6930,7 @@ mod tests {
             None,
             NodePublisher::from_dyn(
                 Arc::clone(&publisher) as Arc<dyn DidPublisher>,
-                LiveRelayUrl::new(ReservedPushUrl::new("ws://198.51.100.7:32891/scp/v1").unwrap()),
+                LiveRelayUrl::new(PushReservation::new("ws://198.51.100.7:32891/scp/v1").unwrap()),
             ),
             node_bridge_target(&identity.did).unwrap(),
             identity,
@@ -7026,7 +7026,7 @@ mod tests {
             Some(detector as Arc<dyn NetworkChangeDetector>),
             NodePublisher::from_dyn(
                 Arc::clone(&publisher) as Arc<dyn DidPublisher>,
-                LiveRelayUrl::new(ReservedPushUrl::new("ws://198.51.100.7:32891/scp/v1").unwrap()),
+                LiveRelayUrl::new(PushReservation::new("ws://198.51.100.7:32891/scp/v1").unwrap()),
             ),
             node_bridge_target(&identity.did).unwrap(),
             identity,
@@ -7122,7 +7122,7 @@ mod tests {
             None,
             NodePublisher::from_dyn(
                 Arc::clone(&publisher) as Arc<dyn DidPublisher>,
-                LiveRelayUrl::new(ReservedPushUrl::new("ws://198.51.100.7:32891/scp/v1").unwrap()),
+                LiveRelayUrl::new(PushReservation::new("ws://198.51.100.7:32891/scp/v1").unwrap()),
             ),
             node_bridge_target(&identity.did).unwrap(),
             identity,
@@ -7228,7 +7228,7 @@ mod tests {
             None,
             NodePublisher::from_dyn(
                 Arc::clone(&publisher) as Arc<dyn DidPublisher>,
-                LiveRelayUrl::new(ReservedPushUrl::new("ws://198.51.100.7:32891/scp/v1").unwrap()),
+                LiveRelayUrl::new(PushReservation::new("ws://198.51.100.7:32891/scp/v1").unwrap()),
             ),
             node_bridge_target(&identity.did).unwrap(),
             identity,
@@ -7365,7 +7365,7 @@ mod tests {
             None,
             NodePublisher::from_dyn(
                 publisher as Arc<dyn DidPublisher>,
-                LiveRelayUrl::new(ReservedPushUrl::new("ws://198.51.100.7:32891/scp/v1").unwrap()),
+                LiveRelayUrl::new(PushReservation::new("ws://198.51.100.7:32891/scp/v1").unwrap()),
             ),
             node_bridge_target("did:dht:slowdrop").unwrap(),
             ScpIdentity {
@@ -7985,7 +7985,7 @@ mod tests {
         use futures::{SinkExt as _, StreamExt as _};
         use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest as _};
 
-        let routing_id = scp_transport::relay::push_gate::ReservedPushUrl::new(url)
+        let routing_id = scp_transport::relay::push_gate::PushReservation::new(url)
             .expect("the advertised relay URL has a canonical form")
             .push_routing_id();
         let mut request = format!("ws://{}/scp/v1", node.relay().bound_addr())
@@ -8190,7 +8190,7 @@ mod tests {
     /// The `"scp-push-registration"` ID of `url`, which a node relay holding
     /// a tier 3 entry for `url` does not reserve.
     fn registration_id(url: &str) -> [u8; 32] {
-        ReservedPushUrl::new(url)
+        PushReservation::new(url)
             .expect("canonical URL")
             .push_routing_id()
     }
@@ -8204,7 +8204,7 @@ mod tests {
         entry: &scp_did::RelayService,
         when: &str,
     ) {
-        let tier3 = ReservedPushUrl::from(entry).push_routing_id();
+        let tier3 = PushReservation::from(entry).push_routing_id();
         let bridge_own = registration_id(entry.url());
         assert_ne!(tier3, bridge_own, "{when}: the tier 3 ID is its own");
         assert_push_not_supported(&publish_at(node, tier3).await, when);
@@ -8254,7 +8254,7 @@ mod tests {
         assert_tier3_id_intercepted(&node, &entry, "at startup").await;
         assert_eq!(
             node.state.relay_config.relay_url.current(),
-            scp_transport::relay::push_gate::ReservedRelayUrls::from(ReservedPushUrl::from(&entry))
+            scp_transport::relay::push_gate::PushReservations::from(PushReservation::from(&entry))
         );
         node.shutdown();
     }
@@ -8300,14 +8300,14 @@ mod tests {
             .await
             .expect("the explicit no-domain node starts");
         let relay = node.state.relay_config.relay_url.clone();
-        let second_id = ReservedPushUrl::from(&second).push_routing_id();
-        let foreign_id = ReservedPushUrl::from(&foreign).push_routing_id();
+        let second_id = PushReservation::from(&second).push_routing_id();
+        let foreign_id = PushReservation::from(&foreign).push_routing_id();
 
         assert_eq!(
             relay.current(),
-            scp_transport::relay::push_gate::ReservedRelayUrls::new(
-                ReservedPushUrl::new(TIER_CHANGE_OLD_URL).unwrap(),
-                [ReservedPushUrl::from(&second)],
+            scp_transport::relay::push_gate::PushReservations::new(
+                PushReservation::new(TIER_CHANGE_OLD_URL).unwrap(),
+                [PushReservation::from(&second)],
             ),
             "at startup: the own direct entry and the document's tier 3 entry"
         );
@@ -8333,16 +8333,16 @@ mod tests {
         let own = node_tier3_entry(&node, SLOT_BRIDGE_URL);
         assert_eq!(
             relay.current(),
-            scp_transport::relay::push_gate::ReservedRelayUrls::new(
-                ReservedPushUrl::from(&own),
-                [ReservedPushUrl::from(&second)],
+            scp_transport::relay::push_gate::PushReservations::new(
+                PushReservation::from(&own),
+                [PushReservation::from(&second)],
             ),
             "after the tier change: both tier 3 entries"
         );
         for (label, id) in [
             (
                 "own tier 3 entry",
-                ReservedPushUrl::from(&own).push_routing_id(),
+                PushReservation::from(&own).push_routing_id(),
             ),
             ("second tier 3 entry", second_id),
         ] {
@@ -8390,13 +8390,13 @@ mod tests {
         );
         assert_eq!(
             node.state.relay_config.relay_url.current(),
-            scp_transport::relay::push_gate::ReservedRelayUrls::new(
-                ReservedPushUrl::new(&domain_relay_url("test.example.com")).unwrap(),
-                [ReservedPushUrl::from(&tier3)],
+            scp_transport::relay::push_gate::PushReservations::new(
+                PushReservation::new(&domain_relay_url("test.example.com")).unwrap(),
+                [PushReservation::from(&tier3)],
             ),
             "the domain entry and the document's tier 3 entry with this node's target"
         );
-        let tier3_id = ReservedPushUrl::from(&tier3).push_routing_id();
+        let tier3_id = PushReservation::from(&tier3).push_routing_id();
         assert_push_not_supported(&publish_at(&node, tier3_id).await, "tier 3 entry");
         assert_eq!(
             query_blob_count(&node, tier3_id).await,
@@ -8405,7 +8405,7 @@ mod tests {
         );
         assert!(
             matches!(
-                publish_at(&node, ReservedPushUrl::from(&foreign).push_routing_id()).await,
+                publish_at(&node, PushReservation::from(&foreign).push_routing_id()).await,
                 scp_relay_client::RelayMessage::Ok {
                     blob_id: Some(_),
                     ..
@@ -8490,15 +8490,15 @@ mod tests {
         .await;
         assert_eq!(
             node.state.relay_config.relay_url.current(),
-            scp_transport::relay::push_gate::ReservedRelayUrls::from(
-                ReservedPushUrl::new(TIER_CHANGE_NEW_URL).unwrap()
+            scp_transport::relay::push_gate::PushReservations::from(
+                PushReservation::new(TIER_CHANGE_NEW_URL).unwrap()
             )
         );
         assert_push_not_supported(
             &publish_at(&node, registration_id(TIER_CHANGE_NEW_URL)).await,
             "the direct entry after the change back",
         );
-        let tier3 = ReservedPushUrl::from(&entry).push_routing_id();
+        let tier3 = PushReservation::from(&entry).push_routing_id();
         assert_push_not_supported(
             &publish_at(&node, tier3).await,
             "the released tier 3 ID after the change back",
@@ -8553,9 +8553,9 @@ mod tests {
         .expect("the scripted publish succeeds");
         assert_eq!(
             relay.current(),
-            scp_transport::relay::push_gate::ReservedRelayUrls::from(ReservedPushUrl::from(&a))
+            scp_transport::relay::push_gate::PushReservations::from(PushReservation::from(&a))
         );
-        let released = ReservedPushUrl::from(&b).push_routing_id();
+        let released = PushReservation::from(&b).push_routing_id();
         assert_push_not_supported(&publish_at(&node, released).await, "released entry B");
         assert_eq!(query_blob_count(&node, released).await, 0);
         node.shutdown();
@@ -8652,7 +8652,7 @@ mod tests {
         observed: Option<LiveRelayUrl>,
         fail_initialize: bool,
         relay_at_initialize:
-            std::sync::Mutex<Vec<scp_transport::relay::push_gate::ReservedRelayUrls>>,
+            std::sync::Mutex<Vec<scp_transport::relay::push_gate::PushReservations>>,
     }
 
     impl ScriptedPublisher {
@@ -8839,7 +8839,7 @@ mod tests {
             slot_test_target(),
             &NodePublisher::from_dyn(
                 Arc::clone(&publisher) as Arc<dyn DidPublisher>,
-                LiveRelayUrl::new(ReservedPushUrl::new(TIER_CHANGE_OLD_URL).unwrap()),
+                LiveRelayUrl::new(PushReservation::new(TIER_CHANGE_OLD_URL).unwrap()),
             ),
             &slot_test_identity(),
             crate::published_state::TierChangeReport {
@@ -8884,7 +8884,7 @@ mod tests {
             slot_test_target(),
             &NodePublisher::from_dyn(
                 Arc::new(ScriptedPublisher::new(false)) as Arc<dyn DidPublisher>,
-                LiveRelayUrl::new(ReservedPushUrl::new(TIER_CHANGE_OLD_URL).unwrap()),
+                LiveRelayUrl::new(PushReservation::new(TIER_CHANGE_OLD_URL).unwrap()),
             ),
             &slot_test_identity(),
             crate::published_state::TierChangeReport {
@@ -8921,7 +8921,7 @@ mod tests {
             relay: crate::published_state::test_relay(TIER_CHANGE_OLD_URL),
             record: None,
         });
-        let old = ReservedPushUrl::new(TIER_CHANGE_OLD_URL).expect("canonical test URL");
+        let old = PushReservation::new(TIER_CHANGE_OLD_URL).expect("canonical test URL");
         let relay = LiveRelayUrl::new(old.clone());
         let publisher = Arc::new(ScriptedPublisher::new(false));
         let bridge = slot_bridge_entry();
@@ -8953,13 +8953,11 @@ mod tests {
         );
         assert_eq!(
             relay.current(),
-            scp_transport::relay::push_gate::ReservedRelayUrls::from(ReservedPushUrl::from(
-                &bridge
-            )),
+            scp_transport::relay::push_gate::PushReservations::from(PushReservation::from(&bridge)),
             "the relay reserves the entry's tier 3 ID"
         );
         assert_ne!(
-            ReservedPushUrl::from(&bridge).push_routing_id(),
+            PushReservation::from(&bridge).push_routing_id(),
             registration_id(SLOT_BRIDGE_URL),
             "never the bridge relay's own ID"
         );
@@ -8984,12 +8982,12 @@ mod tests {
     async fn reserve_push_routing_id_reserves_the_tier3_id_of_every_entry() {
         use crate::published_state::PublishedEntries;
         use scp_transport::relay::push_gate::{
-            PushPublishGate, PushRole, ReservedRelayUrls, gate_publish,
+            PushPublishGate, PushReservations, PushRole, gate_publish,
         };
         async fn gate(relay: &LiveRelayUrl, id: [u8; 32]) -> PushPublishGate {
             gate_publish(relay, &PushRole::Disabled, &id, &[1], 0).await
         }
-        let old = ReservedPushUrl::new(TIER_CHANGE_OLD_URL).unwrap();
+        let old = PushReservation::new(TIER_CHANGE_OLD_URL).unwrap();
         let relay = LiveRelayUrl::new(old.clone());
         let scripted = Arc::new(ScriptedPublisher::new(false));
         let publisher = NodePublisher::from_dyn(
@@ -9029,14 +9027,14 @@ mod tests {
         let current = relay.current();
         assert_eq!(
             current,
-            ReservedRelayUrls::new(ReservedPushUrl::from(&a), [ReservedPushUrl::from(&b)]),
+            PushReservations::new(PushReservation::from(&a), [PushReservation::from(&b)]),
             "the own entry and the document's entry with this node's target, \
              never the direct entry or another target's entry"
         );
         for (held, entry) in current.as_slice().iter().zip([&a, &b]) {
             assert_eq!(
                 held.canonical(),
-                ReservedPushUrl::new(entry.url()).unwrap().canonical()
+                PushReservation::new(entry.url()).unwrap().canonical()
             );
             assert_eq!(held.bridge_target(), Some(target));
             assert_ne!(held.push_routing_id(), registration_id(entry.url()));
@@ -9065,10 +9063,10 @@ mod tests {
         seed(PublishedEntries::new(&a, &only_own, target)).await;
         assert_eq!(
             relay.current(),
-            ReservedRelayUrls::from(ReservedPushUrl::from(&a))
+            PushReservations::from(PushReservation::from(&a))
         );
         assert!(matches!(
-            gate(&relay, ReservedPushUrl::from(&b).push_routing_id()).await,
+            gate(&relay, PushReservation::from(&b).push_routing_id()).await,
             PushPublishGate::Rejected { code: 4063, .. }
         ));
 
@@ -9076,7 +9074,7 @@ mod tests {
         seed(PublishedEntries::new(&direct, &only_own, target)).await;
         assert_eq!(
             relay.current(),
-            ReservedRelayUrls::from(ReservedPushUrl::new(TIER_CHANGE_NEW_URL).unwrap())
+            PushReservations::from(PushReservation::new(TIER_CHANGE_NEW_URL).unwrap())
         );
     }
 
@@ -9088,11 +9086,11 @@ mod tests {
     async fn startup_and_tier_change_reserve_on_the_one_publisher_handle() {
         use crate::published_state::PublishedEntries;
         use scp_transport::relay::push_gate::{
-            PushPublishGate, PushRole, ReservedRelayUrls, gate_publish,
+            PushPublishGate, PushReservations, PushRole, gate_publish,
         };
         // The handle starts at an URL the node never advertises, so a
         // reservation that missed it would leave this value in place.
-        let unrelated = ReservedPushUrl::new("ws://203.0.113.9:4000/scp/v1").unwrap();
+        let unrelated = PushReservation::new("ws://203.0.113.9:4000/scp/v1").unwrap();
         let relay = LiveRelayUrl::new(unrelated);
         let publisher = NodePublisher::from_dyn(
             Arc::new(ScriptedPublisher::new(false)) as Arc<dyn DidPublisher>,
@@ -9110,7 +9108,7 @@ mod tests {
         .expect("the scripted publish succeeds");
         assert_eq!(
             relay.current(),
-            ReservedRelayUrls::from(ReservedPushUrl::from(&old)),
+            PushReservations::from(PushReservation::from(&old)),
             "the startup publish reserves on the publisher's handle"
         );
 
@@ -9129,14 +9127,14 @@ mod tests {
         .await;
         assert_eq!(
             relay.current(),
-            ReservedRelayUrls::from(ReservedPushUrl::from(&bridge)),
+            PushReservations::from(PushReservation::from(&bridge)),
             "the tier change reserves on the same handle"
         );
         assert!(matches!(
             gate_publish(
                 &relay,
                 &PushRole::Disabled,
-                &ReservedPushUrl::from(&old).push_routing_id(),
+                &PushReservation::from(&old).push_routing_id(),
                 &[1],
                 0,
             )
@@ -9151,8 +9149,8 @@ mod tests {
     #[tokio::test]
     async fn startup_publish_reserves_before_it_initializes_the_sequence() {
         use crate::published_state::PublishedEntries;
-        use scp_transport::relay::push_gate::ReservedRelayUrls;
-        let unrelated = ReservedPushUrl::new("ws://203.0.113.9:4000/scp/v1").unwrap();
+        use scp_transport::relay::push_gate::PushReservations;
+        let unrelated = PushReservation::new("ws://203.0.113.9:4000/scp/v1").unwrap();
         let relay = LiveRelayUrl::new(unrelated.clone());
         let scripted = Arc::new(ScriptedPublisher::observing(relay.clone(), false));
         let publisher = NodePublisher::from_dyn(
@@ -9177,7 +9175,7 @@ mod tests {
             .clone();
         assert_eq!(
             at_initialize,
-            vec![ReservedRelayUrls::from(ReservedPushUrl::from(&old))],
+            vec![PushReservations::from(PushReservation::from(&old))],
             "the sequence bootstrap runs once, after the reservation moved the handle \
              off {unrelated:?}"
         );
@@ -9194,7 +9192,7 @@ mod tests {
     async fn failed_sequence_bootstrap_stops_the_startup_publish() {
         use crate::published_state::PublishedEntries;
         let relay =
-            LiveRelayUrl::new(ReservedPushUrl::new("ws://203.0.113.9:4000/scp/v1").unwrap());
+            LiveRelayUrl::new(PushReservation::new("ws://203.0.113.9:4000/scp/v1").unwrap());
         let scripted = Arc::new(ScriptedPublisher::observing(relay.clone(), true));
         let publisher =
             NodePublisher::from_dyn(Arc::clone(&scripted) as Arc<dyn DidPublisher>, relay);
@@ -9238,8 +9236,8 @@ mod tests {
             relay: slot_bridge_entry(),
             record: None,
         });
-        let relay = LiveRelayUrl::new(ReservedPushUrl::from(&slot_bridge_entry()));
-        let tier3 = ReservedPushUrl::from(&slot_bridge_entry()).push_routing_id();
+        let relay = LiveRelayUrl::new(PushReservation::from(&slot_bridge_entry()));
+        let tier3 = PushReservation::from(&slot_bridge_entry()).push_routing_id();
         let stun = crate::published_state::test_relay(TIER_CHANGE_NEW_URL);
 
         apply_tier_change(
@@ -9272,8 +9270,8 @@ mod tests {
         assert_eq!(raw[0].bridge_target, None, "the bridgeTarget is cleared");
         assert_eq!(
             relay.current(),
-            scp_transport::relay::push_gate::ReservedRelayUrls::from(
-                ReservedPushUrl::new(TIER_CHANGE_NEW_URL).unwrap()
+            scp_transport::relay::push_gate::PushReservations::from(
+                PushReservation::new(TIER_CHANGE_NEW_URL).unwrap()
             ),
             "a direct tier's URL is this node's, so the relay reserves it"
         );
@@ -9311,7 +9309,7 @@ mod tests {
             None,
             NodePublisher::from_dyn(
                 Arc::clone(&publisher) as Arc<dyn DidPublisher>,
-                LiveRelayUrl::new(ReservedPushUrl::new(TIER_CHANGE_OLD_URL).unwrap()),
+                LiveRelayUrl::new(PushReservation::new(TIER_CHANGE_OLD_URL).unwrap()),
             ),
             node_bridge_target(&slot_test_identity().did).unwrap(),
             slot_test_identity(),
@@ -9394,7 +9392,7 @@ mod tests {
             slot_test_target(),
             &NodePublisher::from_dyn(
                 Arc::new(ScriptedPublisher::new(true)) as Arc<dyn DidPublisher>,
-                LiveRelayUrl::new(ReservedPushUrl::new(TIER_CHANGE_OLD_URL).unwrap()),
+                LiveRelayUrl::new(PushReservation::new(TIER_CHANGE_OLD_URL).unwrap()),
             ),
             &slot_test_identity(),
             crate::published_state::TierChangeReport {
@@ -9438,7 +9436,7 @@ mod tests {
             slot_test_target(),
             &NodePublisher::from_dyn(
                 Arc::new(ScriptedPublisher::new(false)) as Arc<dyn DidPublisher>,
-                LiveRelayUrl::new(ReservedPushUrl::new(TIER_CHANGE_OLD_URL).unwrap()),
+                LiveRelayUrl::new(PushReservation::new(TIER_CHANGE_OLD_URL).unwrap()),
             ),
             &slot_test_identity(),
             crate::published_state::TierChangeReport {

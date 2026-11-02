@@ -635,7 +635,7 @@ mod tests {
             blob_storage: Arc::new(BlobStorageBackend::in_memory()),
             relay_config: scp_transport::native::server::RelayConfig::defaults(
                 scp_transport::relay::push_gate::LiveRelayUrl::new(
-                    scp_transport::relay::push_gate::ReservedPushUrl::new(
+                    scp_transport::relay::push_gate::PushReservation::new(
                         "ws://127.0.0.1:9000/scp/v1",
                     )
                     .unwrap(),

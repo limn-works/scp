@@ -28,7 +28,7 @@ async fn start_ephemeral_relay() -> (ShutdownHandle, std::net::SocketAddr) {
         bind_addr: ([127, 0, 0, 1], 0).into(),
         delivery_jitter_ms: 0, // Disable jitter for deterministic tests.
         ..RelayConfig::defaults(scp_transport::relay::push_gate::LiveRelayUrl::new(
-            scp_transport::relay::push_gate::ReservedPushUrl::new("ws://127.0.0.1:9000/scp/v1")
+            scp_transport::relay::push_gate::PushReservation::new("ws://127.0.0.1:9000/scp/v1")
                 .unwrap(),
         ))
     };
@@ -181,7 +181,7 @@ async fn delete_removes_blob() {
 #[tokio::test]
 async fn relay_config_defaults() {
     let config = RelayConfig::defaults(scp_transport::relay::push_gate::LiveRelayUrl::new(
-        scp_transport::relay::push_gate::ReservedPushUrl::new("ws://127.0.0.1:9000/scp/v1")
+        scp_transport::relay::push_gate::PushReservation::new("ws://127.0.0.1:9000/scp/v1")
             .unwrap(),
     ));
 

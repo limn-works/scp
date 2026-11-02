@@ -53,7 +53,7 @@ async fn start_relay() -> (ShutdownHandle, SocketAddr) {
         bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
         delivery_jitter_ms: 0,
         ..RelayConfig::defaults(scp_transport::relay::push_gate::LiveRelayUrl::new(
-            scp_transport::relay::push_gate::ReservedPushUrl::new("ws://127.0.0.1:9000/scp/v1")
+            scp_transport::relay::push_gate::PushReservation::new("ws://127.0.0.1:9000/scp/v1")
                 .unwrap(),
         ))
     };

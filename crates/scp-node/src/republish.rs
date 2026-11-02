@@ -1136,7 +1136,7 @@ mod tests {
     #[cfg(feature = "testing")]
     fn publish_seam(did_method: &Arc<SigningDidDht>) -> NodePublisher {
         let relay = scp_transport::relay::push_gate::LiveRelayUrl::new(
-            scp_transport::relay::push_gate::ReservedPushUrl::new("ws://198.51.100.7:32891/scp/v1")
+            scp_transport::relay::push_gate::PushReservation::new("ws://198.51.100.7:32891/scp/v1")
                 .expect("canonical test URL"),
         );
         NodePublisher::new(

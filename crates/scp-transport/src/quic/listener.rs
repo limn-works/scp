@@ -2350,9 +2350,9 @@ mod tests {
     /// either.
     #[tokio::test]
     async fn quic_listener_reads_the_shared_relay_url() {
-        use crate::relay::push_gate::ReservedPushUrl;
-        let old = ReservedPushUrl::new("ws://198.51.100.7:32891/scp/v1").unwrap();
-        let new = ReservedPushUrl::new("ws://203.0.113.42:8443/scp/v1").unwrap();
+        use crate::relay::push_gate::PushReservation;
+        let old = PushReservation::new("ws://198.51.100.7:32891/scp/v1").unwrap();
+        let new = PushReservation::new("ws://203.0.113.42:8443/scp/v1").unwrap();
         let live = LiveRelayUrl::new(old.clone());
         let (server_config, certs) = test_server_config();
         let storage = Arc::new(InMemoryBlobStorage::new());
@@ -2476,7 +2476,7 @@ mod tests {
     async fn quic_listener_reads_no_blob_at_a_current_or_released_reserved_id() {
         let fixture = crate::relay::push_gate::tier3_fixture().unwrap();
         let direct =
-            crate::relay::push_gate::ReservedPushUrl::new("wss://relay.quic.test").unwrap();
+            crate::relay::push_gate::PushReservation::new("wss://relay.quic.test").unwrap();
         let live = LiveRelayUrl::new(direct.clone());
         let (server_config, certs) = test_server_config();
         let listener = QuicListener::new(

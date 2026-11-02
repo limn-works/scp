@@ -34,7 +34,7 @@ use scp_transport::native::storage::BlobStorageBackend;
 use scp_transport::relay::push::WebPushSender;
 use scp_transport::relay::push_endpoint::{OwnAddressLookup, OwnAddressTracker};
 use scp_transport::relay::push_gate::{
-    LiveRelayUrl, PushProviders, PushRole, PushSenders, ReservedPushUrl,
+    LiveRelayUrl, PushProviders, PushReservation, PushRole, PushSenders,
 };
 use scp_transport::relay::push_store::PushRegistrationStore;
 
@@ -1203,7 +1203,7 @@ where
     let bind_addr = bind_addr.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 0)));
     // The relay knows the URL the node publishes, so it reserves the matching
     // push routing ID and answers a PUBLISH there itself (§10.7.1).
-    let relay_url = ReservedPushUrl::new(&domain_relay_url(&domain))
+    let relay_url = PushReservation::new(&domain_relay_url(&domain))
         .map_err(|e| NodeError::InvalidConfig(format!("relay URL for domain {domain}: {e}")))?;
     let relay_config = RelayConfig {
         bind_addr,
@@ -1379,7 +1379,7 @@ where
             .local_addr()
             .map_err(|e| RelayError::BindFailed(e.to_string()))?,
     );
-    let relay_url = ReservedPushUrl::new(&seed_url)
+    let relay_url = PushReservation::new(&seed_url)
         .map_err(|e| NodeError::InvalidConfig(format!("relay URL {seed_url}: {e}")))?;
     let relay_config = RelayConfig {
         bind_addr,
@@ -1763,8 +1763,8 @@ mod tests {
         // (§10.7.1 step 2), so a PUBLISH there is answered, never stored.
         assert_eq!(
             node.state.relay_config.relay_url.current(),
-            scp_transport::relay::push_gate::ReservedRelayUrls::from(
-                ReservedPushUrl::new(&node.relay_url()).unwrap()
+            scp_transport::relay::push_gate::PushReservations::from(
+                PushReservation::new(&node.relay_url()).unwrap()
             ),
             "the domain node's relay must reserve the push routing ID of its published URL"
         );
@@ -2070,7 +2070,7 @@ mod tests {
         use scp_relay_client::{ClientMessage, RelayMessage};
         use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest as _};
 
-        let routing_id = ReservedPushUrl::new(&node.relay_url())
+        let routing_id = PushReservation::new(&node.relay_url())
             .unwrap()
             .push_routing_id();
         let mut request = format!("ws://{}/scp/v1", node.relay().bound_addr())

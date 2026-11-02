@@ -144,10 +144,10 @@ struct DtlsSession {
 /// use scp_transport::native::storage::InMemoryBlobStorage;
 /// use scp_transport::relay::rate_limit::{self, PublishRateLimiter};
 /// use scp_transport::native::did_slot::DidSlotRegistry;
-/// use scp_transport::relay::push_gate::{LiveRelayUrl, ReservedPushUrl};
+/// use scp_transport::relay::push_gate::{LiveRelayUrl, PushReservation};
 ///
 /// let config = UdpDtlsListenerConfig::default();
-/// let relay_url = LiveRelayUrl::new(ReservedPushUrl::new("wss://relay.example")?);
+/// let relay_url = LiveRelayUrl::new(PushReservation::new("wss://relay.example")?);
 /// let relay_config = RelayConfig::defaults(relay_url);
 /// let storage = Arc::new(InMemoryBlobStorage::new());
 /// let rate_limiter = PublishRateLimiter::new(100);
@@ -2149,9 +2149,9 @@ mod tests {
     /// either.
     #[tokio::test]
     async fn udp_listener_reads_the_shared_relay_url() {
-        use crate::relay::push_gate::{LiveRelayUrl, ReservedPushUrl};
-        let old = ReservedPushUrl::new("ws://198.51.100.7:32891/scp/v1").unwrap();
-        let new = ReservedPushUrl::new("ws://203.0.113.42:8443/scp/v1").unwrap();
+        use crate::relay::push_gate::{LiveRelayUrl, PushReservation};
+        let old = PushReservation::new("ws://198.51.100.7:32891/scp/v1").unwrap();
+        let new = PushReservation::new("ws://203.0.113.42:8443/scp/v1").unwrap();
         let live = LiveRelayUrl::new(old.clone());
         let (handle, addr, storage) =
             start_test_listener_with_relay_config(RelayConfig::defaults(live.clone())).await;
@@ -2212,7 +2212,7 @@ mod tests {
     #[tokio::test]
     async fn udp_listener_reads_no_blob_at_a_current_or_released_reserved_id() {
         let fixture = crate::relay::push_gate::tier3_fixture().unwrap();
-        let direct = crate::relay::push_gate::ReservedPushUrl::new("wss://relay.udp.test").unwrap();
+        let direct = crate::relay::push_gate::PushReservation::new("wss://relay.udp.test").unwrap();
         let live = crate::relay::push_gate::LiveRelayUrl::new(direct.clone());
         let (handle, addr, _storage) =
             start_test_listener_with_relay_config(RelayConfig::defaults(live.clone())).await;
