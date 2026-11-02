@@ -17,6 +17,15 @@ cargo nextest run --workspace
 # or
 cargo test --workspace
 
+# One named test: cargo test with the full path and --exact. Name the target
+# (--lib, or --test <file>), because without one cargo runs every test binary
+# in the package and compiles its doc tests. On a 16-core Mac at load 26, with the binary already
+# built, a single scp-protocol test took 0.67-3.05 s this way, against
+# 3.34-12.38 s under `cargo nextest run -E 'test(=...)'`, which adds its own
+# startup and a listing pass on top of cargo's freshness check (0.74 s). Both use
+# the same build, so switching between them recompiles nothing.
+cargo test -p scp-protocol --features testing --lib -- context::broadcast::tests::add_author_rejects_duplicate --exact
+
 # Doc tests. The two cloud-blobs features compile the PostgreSQL blob backend,
 # whose doctest no default feature compiles.
 cargo test --workspace --doc --features scp-node/cloud-blobs,scp-relay/cloud-blobs
