@@ -773,6 +773,14 @@
         {
           "file": ".docs/specs/09-security-model.md",
           "section": "### 9.7.4.3 Witness and Watcher Layer (Layer B)"
+        },
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-052: Unified Construction Pattern"
+        },
+        {
+          "file": ".docs/standards/construction.md",
+          "section": "### Identity — `IdentityConfig`"
         }
       ],
       "details": {
@@ -11468,6 +11476,10 @@
         {
           "file": ".docs/specs/09-security-model.md",
           "section": "### 9.3.1 Reading a device attestation"
+        },
+        {
+          "file": ".docs/adrs/ADR-049-actor-per-context.md",
+          "section": "### 17. Per-identity `IdentityActor`, `SupervisorHandle::live()`, and the instance-built Supervisor (2026-11-02)"
         }
       ],
       "details": {}
@@ -14161,7 +14173,7 @@
         "crates/scp-runtime/src/context/supervisor/identity_actor/cadence.rs",
         "crates/scp-runtime/src/context/supervisor/identity_actor.rs"
       ],
-      "description": "The self-observation cadence of `09-security-model.md` §9.7.4.2 R10 runs as one task per loaded identity under that identity's actor, which the instance-owned Supervisor spawns (SCP-371, `03-identity.md` §3.10.10). The cadence criteria SCP-007 carried move here, reworded for nodes. Node backend execution plan code PR C14.",
+      "description": "The self-observation cadence of `09-security-model.md` §9.7.4.2 R10 runs as one task per loaded identity under that identity's actor, which the instance-owned Supervisor spawns (SCP-371, ADR-049 decision 17, ADR-048 §6, `03-identity.md` §3.10.10). The cadence criteria SCP-007 carried move here, reworded for nodes. Node backend execution plan code PR C14.",
       "acceptanceCriteria": [
         "The cadence starts when an identity's actor spawns, through `dispatch_identity_create` or `dispatch_identity_load`, and stops when the actor stops; exactly one cadence task runs per loaded identity: a test loads one identity, counts the cadence tasks the actor spawned, and sees one (`09-security-model.md` §9.7.4.2 R10)",
         "The task captures a `SupervisorHandle` and exits when a dispatch returns `ContextError::SupervisorShutDown`; it stops on suspend and restarts on resume: a test per transition",
@@ -14201,6 +14213,14 @@
         {
           "file": ".docs/adrs/ADR-049-actor-per-context.md",
           "section": "### 2. Supervisor is a plain struct, not an actor"
+        },
+        {
+          "file": ".docs/adrs/ADR-049-actor-per-context.md",
+          "section": "### 17. Per-identity `IdentityActor`, `SupervisorHandle::live()`, and the instance-built Supervisor (2026-11-02)"
+        },
+        {
+          "file": ".docs/adrs/ADR-048-scp-multi-instance.md",
+          "section": "### 6. Long-lived background tasks capture `Weak<BridgeInstance>`, not `Arc`"
         }
       ],
       "details": {}
@@ -14224,7 +14244,7 @@
         "crates/scp-runtime/src/context/error.rs",
         "crates/scp-testing/tests/integration/pipeline_wiring.rs"
       ],
-      "description": "Each SCP instance builds its Supervisor when it is constructed, and the Supervisor owns an `IdentityRegistry` and one `NodeNetwork` (ADR-049 as amended for per-identity actors, `03-identity.md` §3.10.10). Each loaded identity runs in its own `IdentityActor`, reached through an `IdentityHandle {identifier, supervisor}`, and every `dispatch_identity_*` calls `SupervisorHandle::live()` first. `IdentityConfig` carries no persistence field: the identity lives in the instance's encrypted store. This story builds the owner and the create and load paths; SCP-313 wires the rest of the dispatch table. Node backend execution plan code PR C12, which carries SCP-372 in the same PR.",
+      "description": "Each SCP instance builds its Supervisor when it is constructed, and the Supervisor owns an `IdentityRegistry` and one `NodeNetwork` (ADR-049 decision 17, ADR-048 §5, ADR-052, `03-identity.md` §3.10.10). Each loaded identity runs in its own `IdentityActor`, reached through an `IdentityHandle {identifier, supervisor}`, and every `dispatch_identity_*` calls `SupervisorHandle::live()` first. `IdentityConfig` carries no persistence field: the identity lives in the instance's encrypted store. This story builds the owner and the create and load paths; SCP-313 wires the rest of the dispatch table. Node backend execution plan code PR C12, which carries SCP-372 in the same PR.",
       "acceptanceCriteria": [
         "`CoreFields::new<S: EncryptedStorage + Clone + 'static>(storage, client)` builds the Supervisor before it returns, and the `OnceLock` Supervisor slot and `with_supervisor` have zero occurrences under `crates/`",
         "The Supervisor holds `IdentityRegistry` and one `Arc<NodeNetwork>`, and at build loads every persisted identity from the instance store and spawns its `IdentityActor` through `SpawnPermit::spawn_through`: a test persists two identities, rebuilds the instance, and sees two actors",
@@ -14259,6 +14279,22 @@
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
           "section": "## 17.3 Key Convention"
+        },
+        {
+          "file": ".docs/adrs/ADR-049-actor-per-context.md",
+          "section": "### 17. Per-identity `IdentityActor`, `SupervisorHandle::live()`, and the instance-built Supervisor (2026-11-02)"
+        },
+        {
+          "file": ".docs/adrs/ADR-048-scp-multi-instance.md",
+          "section": "### 5. `shutdown(timeout: Duration)` replaces terminal infallible shutdown"
+        },
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-052: Unified Construction Pattern"
+        },
+        {
+          "file": ".docs/standards/construction.md",
+          "section": "### Identity — `IdentityConfig`"
         }
       ],
       "details": {}
@@ -14285,7 +14321,7 @@
         "scripts/bridge-aliases.json",
         "scripts/ffi-export-allowlist.json"
       ],
-      "description": "Each bridge exports one `identity_create` and one `identity_load`, each calling `check_ready` and then the Supervisor dispatch SCP-371 adds, and the older create and load variants fold into them (`03-identity.md` §3.10.10). Every SDK's `SCP` constructor takes the instance's encrypted storage as a required argument. Deleting the Supervisor slot in SCP-371 breaks every bridge's current create, so node backend execution plan code PR C12 carries both stories.",
+      "description": "Each bridge exports one `identity_create` and one `identity_load`, each calling `check_ready` and then the Supervisor dispatch SCP-371 adds, and the older create and load variants fold into them (`03-identity.md` §3.10.10). Every SDK's `SCP` constructor takes the instance's encrypted storage as a required argument (ADR-048 §1, ADR-052 as amended for `CoreFields::new`). Deleting the Supervisor slot in SCP-371 breaks every bridge's current create, so node backend execution plan code PR C12 carries both stories.",
       "acceptanceCriteria": [
         "PyO3, napi-rs and UniFFI each export `identity_create`, which calls `check_ready` and then `dispatch_identity_create`, and `identity_load`, which calls `check_ready` and then `dispatch_identity_load`: `ffi_conformance.rs` asserts each export on each bridge, and `check_ready_coverage.rs` asserts the `check_ready` call once per bridge",
         "`identity_create_with_custody`, `identity_create_with_agent_key`, every `identity_load*` variant and `identity_migrate` have zero occurrences in `crates/scp-ffi`, and their `bridge-aliases.json` and `ffi-export-allowlist.json` entries are deleted with them",
@@ -14311,6 +14347,22 @@
         {
           "file": ".docs/scaffold/shared.md",
           "section": "## Cross-Language Naming"
+        },
+        {
+          "file": ".docs/adrs/ADR-048-scp-multi-instance.md",
+          "section": "### 1. `SCP` is the first-class SDK-level opaque object in all four language SDKs"
+        },
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-052: Unified Construction Pattern"
+        },
+        {
+          "file": ".docs/standards/construction.md",
+          "section": "### Identity — `IdentityConfig`"
+        },
+        {
+          "file": ".docs/standards/construction.md",
+          "section": "## The EncryptedStorage compile-time split (the one M5 exception)"
         }
       ],
       "details": {}
@@ -14529,14 +14581,8 @@
       "priority": "P0",
       "severity": "critical",
       "status": "pending",
-      "files": [
-        "crates/scp-runtime/src/context/lifecycle_helpers.rs",
-        "crates/scp-platform/src/traits.rs",
-        "crates/scp-mls/src/context_extension.rs",
-        "crates/scp-protocol/src/context/params.rs",
-        "crates/scp-protocol/src/context/group_context_extension.rs"
-      ],
-      "description": "When a node instantiates a context, its operator's device mints `context_key` in custody, signs the `ContextOperatorBinding`, and the creator writes `binding_hash` into the genesis parameters and the `0xFF02` group-context extension, which no later Commit may change (`09-security-model.md` §9.5.2, `05-contexts.md` §5.13.3). The node then signs chain entries and receipts under `context_key` and publishes its `ContextNodeAddress`. The context-creation path this story extends is built by the context-operation plan's D1 execution, which has no story yet; this story waits on that code, and its file list names the paths that exist on main today as indicators. Node backend execution plan code PR C19, parked until D1 execution merges.",
+      "files": [],
+      "description": "When a node instantiates a context, its operator's device mints `context_key` in custody, signs the `ContextOperatorBinding`, and the creator writes `binding_hash` into the genesis parameters and the `0xFF02` group-context extension, which no later Commit may change (`09-security-model.md` §9.5.2, `05-contexts.md` §5.13.3). The node then signs chain entries and receipts under `context_key` and publishes its `ContextNodeAddress`. The context-creation path this story extends is built by the context-operation plan's D1 execution, which has no story yet; this story waits on that code. Its file list is empty until D1 lands, and is set then from the context-creation path D1 builds. Node backend execution plan code PR C19, parked until D1 execution merges.",
       "acceptanceCriteria": [
         "The operator device mints `context_key` through `KeyCustody::generate_keypair(KeyType::P256Signing)`, signs through `sign`, and calls `destroy_key` when the context closes or is re-founded: a test per in-tree `KeyCustody` backend shows the key minted, used and destroyed",
         "Context creation signs the `ContextOperatorBinding` and writes its `binding_hash` into `context_params` and the `0xFF02` extension: a test reads both back and compares them (`05-contexts.md` §5.13.3)",
@@ -14568,7 +14614,9 @@
           "section": "## 5.12 Context Templates and Lightweight Creation"
         }
       ],
-      "details": {}
+      "details": {
+        "blockedOnWork": "Context-operation plan D1 execution (one node runs a context and orders its Commits) has no story or issue. This story cannot start until D1's code merges; its code files are set when D1 lands."
+      }
     },
     {
       "id": "SCP-375",
