@@ -579,7 +579,11 @@ WORKSPACE_SCOPED_JOBS = {
     ("ci.yml", "rust-test"),
     ("docs.yml", "rust-docs"),
 }
-RUSTDOC_JOBS = {("ci.yml", "rust-doc"), ("docs.yml", "rust-docs")}
+RUSTDOC_JOBS = {
+    ("cache-warm.yml", "workspace-check"),
+    ("ci.yml", "rust-doc"),
+    ("docs.yml", "rust-docs"),
+}
 
 # CRITERION for check_documented_rustdoc_reproduces_the_required_job: a `cargo
 # doc` line inside a shell-labelled fenced block of a tracked Markdown file is a
@@ -8560,6 +8564,7 @@ def check_push_runs_every_cache_writer(doc: dict) -> None:
         "bridge-parity-kotlin",
         "docker-image-cache",
         "fuzz-build",
+        "kotlin-android-instrumented",
         "kotlin-lint",
         "kotlin-test",
         "napi-addon",
@@ -8567,8 +8572,6 @@ def check_push_runs_every_cache_writer(doc: dict) -> None:
         "pyo3-module-macos",
         "python-wheel-build",
         "rust-clippy",
-        "rust-test",
-        "rust-test-macos",
         "rust-test-optional-features",
         "typescript-wasm-check",
         "uniffi-cdylib-linux",
@@ -8598,6 +8601,68 @@ def check_push_runs_every_cache_writer(doc: dict) -> None:
 
 def check_push_writer_mutants(doc: dict) -> None:
     """Each way of skipping a writer on push, or leaking a push skip, is reported."""
+
+    # ci.yml runs one literal leg list on every event: rust-test and rust-test-macos
+    # write no cache, and rust-clippy has no push-only leg. The controls on push-only
+    # legs and on leg-gated writers run against a rebuilt copy of the shape those
+    # jobs had while a push-only leg wrote their group: the push list swaps the
+    # absorbed legs for one push leg, every step that names only absorbed legs also
+    # runs on the push leg, and the rust-cache step those legs run saves only from
+    # the push leg on `main`.
+    def with_push_leg(
+        source: dict, job_id: str, push_leg: str, absorbed: tuple[str, ...] | None = None
+    ) -> dict:
+        rebuilt = copy.deepcopy(source)
+        job = rebuilt["jobs"][job_id]
+        legs = job["strategy"]["matrix"]["leg"]
+        taken = set(legs if absorbed is None else absorbed)
+        pushed = [leg for leg in legs if leg not in taken] + [push_leg]
+        job["strategy"]["matrix"]["leg"] = (
+            f"${{{{ fromJSON(github.event_name == 'push' && '{json.dumps(pushed)}' "
+            f"|| '{json.dumps(legs)}') }}}}"
+        )
+        for step in job["steps"]:
+            if not isinstance(step, dict):
+                continue
+            terms = axis_terms(step.get("if"))
+            named = terms is not None and terms[0] == "leg" and set(terms[1]) <= taken
+            if named:
+                step["if"] = f"matrix.leg == '{push_leg}' || {step['if']}"
+            every_leg = step.get("if") is None and taken == set(legs)
+            if str(step.get("uses", "")) == RUST_CACHE_ACTION and (named or every_leg):
+                step.setdefault("with", {})["save-if"] = (
+                    f"${{{{ github.ref == 'refs/heads/main' && matrix.leg == '{push_leg}' }}}}"
+                )
+        return rebuilt
+
+    test_writer = with_push_leg(doc, "rust-test", "all")
+    macos_writer = with_push_leg(doc, "rust-test-macos", "all")
+    clippy_writer = with_push_leg(
+        doc,
+        "rust-clippy",
+        "packages",
+        tuple(
+            leg
+            for leg in doc["jobs"]["rust-clippy"]["strategy"]["matrix"]["leg"]
+            if leg.startswith("packages-")
+        ),
+    )
+    for job_id, rebuilt in (
+        ("rust-test", test_writer),
+        ("rust-test-macos", macos_writer),
+        ("rust-clippy", clippy_writer),
+    ):
+        check(
+            f"the rebuilt push-leg {job_id} is read as a cache writer",
+            job_id in cache_writers(rebuilt),
+            f"{sorted(cache_writers(rebuilt))}",
+        )
+        check(
+            f"the rebuilt push-leg {job_id} is read without a gap",
+            not push_writer_gaps(rebuilt),
+            f"{push_writer_gaps(rebuilt)}",
+        )
+
     guarded = copy.deepcopy(doc)
     clippy = guarded["jobs"]["rust-clippy"]
     clippy["if"] = f"github.event_name != 'push' && ({clippy['if']})"
@@ -8617,7 +8682,7 @@ def check_push_writer_mutants(doc: dict) -> None:
         f"{scenario_disagreements(guarded)}",
     )
 
-    shard = copy.deepcopy(doc)
+    shard = copy.deepcopy(test_writer)
     shard["jobs"]["rust-test"]["strategy"]["matrix"]["leg"] = (
         "${{ fromJSON(github.event_name == 'push' && '[\"bridges\"]' "
         "|| '[\"bridges\", \"runtime\", \"testing\", \"rest\"]') }}"
@@ -8667,7 +8732,8 @@ def check_push_writer_mutants(doc: dict) -> None:
         ("rust-clippy", "leg", "examples", "only from matrix leg `leg == examples`"),
         ("rust-test-macos", "leg", "all", "only from matrix leg `leg == all`"),
     ):
-        base = with_os_axis(doc, job_id) if axis == "os" else doc
+        writer = {"rust-test": test_writer, "rust-test-macos": macos_writer}.get(job_id, doc)
+        base = with_os_axis(writer, job_id) if axis == "os" else writer
         live_axis = base["jobs"][job_id]["strategy"]["matrix"][axis]
         # A literal axis runs one list on every event; an axis that is already a
         # PUSH_MATRIX expression keeps its pull-request list and loses the value
@@ -8749,8 +8815,12 @@ def check_push_writer_mutants(doc: dict) -> None:
             step for step in job["steps"] if isinstance(step, dict) and predicate(step)
         )
 
-    def clippy_workspace(job: dict) -> dict:
-        return step_where(job, lambda step: step.get("if") == "matrix.leg == 'workspace'")
+    def clippy_examples(job: dict) -> dict:
+        return step_where(
+            job,
+            lambda step: step.get("if") == "matrix.leg == 'examples'"
+            and str(step.get("uses", "")) == RUST_CACHE_ACTION,
+        )
 
     def test_cache(job: dict) -> dict:
         return step_where(
@@ -8763,33 +8833,37 @@ def check_push_writer_mutants(doc: dict) -> None:
         )
 
     no_push = "github.event_name != 'push'"
-    for label, job_id, locate, field, text, reported in (
+    for label, base, job_id, locate, field, text, reported in (
         (
             "a push exclusion spelled in another case on rust-clippy's rust-cache `if:`",
+            doc,
             "rust-clippy",
-            clippy_workspace,
+            clippy_examples,
             "if",
-            "matrix.leg == 'workspace' && GitHub.Event_Name != 'Push'",
+            "matrix.leg == 'examples' && GitHub.Event_Name != 'Push'",
             "no push to `main` meets",
         ),
         (
             "a rust-clippy rust-cache `if:` naming a pull-request-only leg in another case",
+            clippy_writer,
             "rust-clippy",
-            clippy_workspace,
+            clippy_examples,
             "if",
             "MATRIX.LEG == 'packages-network'",
             "only from matrix leg",
         ),
         (
-            "a push exclusion on rust-clippy's workspace rust-cache `if:`",
+            "a push exclusion on rust-clippy's examples rust-cache `if:`",
+            doc,
             "rust-clippy",
-            clippy_workspace,
+            clippy_examples,
             "if",
-            f"matrix.leg == 'workspace' && {no_push}",
+            f"matrix.leg == 'examples' && {no_push}",
             "no push to `main` meets",
         ),
         (
             "a merge_group-only rust-test rust-cache `save-if`",
+            test_writer,
             "rust-test",
             test_cache,
             "save-if",
@@ -8798,6 +8872,7 @@ def check_push_writer_mutants(doc: dict) -> None:
         ),
         (
             "a push exclusion on pyo3-module's cache save `if:`",
+            doc,
             "pyo3-module",
             pyo3_save,
             "if",
@@ -8806,30 +8881,34 @@ def check_push_writer_mutants(doc: dict) -> None:
         ),
         (
             "a writing step condition that contradicts itself on one operand pair",
+            doc,
             "rust-clippy",
-            clippy_workspace,
+            clippy_examples,
             "if",
-            "matrix.leg == 'workspace' && matrix.leg != 'workspace'",
+            "matrix.leg == 'examples' && matrix.leg != 'examples'",
             "no push to `main` meets",
         ),
         (
             "a writing step `if:` outside the grammar",
+            doc,
             "rust-clippy",
-            clippy_workspace,
+            clippy_examples,
             "if",
-            "matrix.leg == 'workspace' && !cancelled()",
+            "matrix.leg == 'examples' && !cancelled()",
             "this check cannot read",
         ),
         (
             "a writing step `if:` that admits push alongside other events",
+            doc,
             "rust-clippy",
-            clippy_workspace,
+            clippy_examples,
             "if",
-            f"matrix.leg == 'workspace' && ({no_push} || github.ref == 'refs/heads/main')",
+            f"matrix.leg == 'examples' && ({no_push} || github.ref == 'refs/heads/main')",
             None,
         ),
         (
             "a rust-cache `save-if` naming a leg and the main ref",
+            test_writer,
             "rust-test",
             test_cache,
             "save-if",
@@ -8837,7 +8916,7 @@ def check_push_writer_mutants(doc: dict) -> None:
             None,
         ),
     ):
-        changed = copy.deepcopy(doc)
+        changed = copy.deepcopy(base)
         step = locate(changed["jobs"][job_id])
         if field == "if":
             step["if"] = text
@@ -8877,7 +8956,7 @@ def check_push_writer_mutants(doc: dict) -> None:
             "rust-test's matrix `leg` runs ['all', 'extra'] on push",
         ),
     ):
-        changed = copy.deepcopy(doc)
+        changed = copy.deepcopy(test_writer)
         strategy = changed["jobs"]["rust-test"]["strategy"]
         if key is None:
             strategy["matrix"] = value
@@ -8886,7 +8965,7 @@ def check_push_writer_mutants(doc: dict) -> None:
         gaps = push_writer_gaps(changed)
         check(f"{label} is reported", any(reported in gap for gap in gaps), f"{gaps}")
 
-    # rust-test-macos's push-only `all` leg is allowed because every step it runs
+    # The rebuilt rust-test-macos's push-only `all` leg is allowed because every step it runs
     # is one a pull-request leg runs. A push-only leg that runs a step no
     # pull-request leg runs, whatever its `run:` line starts with or when it is a
     # `uses:` or `env:` difference, or that runs no command, is reported.
@@ -9018,7 +9097,7 @@ def check_push_writer_mutants(doc: dict) -> None:
             ],
         ),
     ):
-        changed = copy.deepcopy(doc)
+        changed = copy.deepcopy(macos_writer)
         mutate(changed["jobs"]["rust-test-macos"])
         gaps = push_writer_gaps(changed)
         check(
@@ -9033,8 +9112,9 @@ def check_push_writer_mutants(doc: dict) -> None:
     # hands each leg its own value, which a step every leg runs reads with text
     # that is the same on every leg: a job `env:` a step's shell reads, or a
     # `defaults:` working directory a step's relative path resolves under. Both
-    # jobs with a push-only leg report it; the same keys holding no matrix value
-    # report nothing.
+    # rebuilt jobs with a push-only leg report it; the same keys holding no matrix
+    # value report nothing.
+    leg_writers = {"rust-test-macos": macos_writer, "rust-clippy": clippy_writer}
     for job_id in ("rust-test-macos", "rust-clippy"):
         for label, key, item, run, reported in (
             (
@@ -9059,7 +9139,7 @@ def check_push_writer_mutants(doc: dict) -> None:
                 False,
             ),
         ):
-            changed = copy.deepcopy(doc)
+            changed = copy.deepcopy(leg_writers[job_id])
             job = changed["jobs"][job_id]
             job[key] = item
             job["steps"].append({"run": run})
@@ -9090,7 +9170,7 @@ def check_push_writer_mutants(doc: dict) -> None:
         f"{push_writer_gaps(doc)}",
     )
     for job_id in ("rust-test-macos", "rust-clippy"):
-        unrelated = copy.deepcopy(doc)
+        unrelated = copy.deepcopy(leg_writers[job_id])
         unrelated["jobs"][job_id]["steps"].append(
             {"run": "cargo test -p scp-transport ${{ github.sha }}"}
         )

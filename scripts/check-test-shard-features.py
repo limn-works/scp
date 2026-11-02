@@ -83,7 +83,6 @@ READER_JOB = "rust-test-prose"
 AXIS = "leg"
 WORKFLOW = Path(".github/workflows/ci.yml")
 TARGET = "x86_64-unknown-linux-gnu"
-PUSH_LEG = "all"
 NEXTEST_CONFIG = Path(".config/nextest.toml")
 BINARY_ID = re.compile(r"binary_id\(([A-Za-z0-9_-]+)::([A-Za-z0-9_]+)\)")
 
@@ -122,15 +121,15 @@ def logical_lines(script: str) -> list[str]:
 
 
 def shard_of_condition(condition: object) -> str | None:
-    """Return the shard a step `if:` of the form `matrix.leg == 'all' || matrix.leg == 'X'` names."""
+    """Return the shard a step `if:` of the form `matrix.leg == 'X'` names."""
     text = str(condition or "").strip()
     wrapped = re.fullmatch(r"\$\{\{(.*)\}\}", text, re.DOTALL)
     text = (wrapped.group(1) if wrapped else text).strip()
     values = re.findall(rf"matrix\.{AXIS}\s*==\s*'([^']*)'", text)
     rest = re.sub(rf"matrix\.{AXIS}\s*==\s*'[^']*'", "", text).replace("||", "").strip()
-    if rest or len(values) != 2 or PUSH_LEG not in values:
+    if rest or len(values) != 1:
         return None
-    return next(value for value in values if value != PUSH_LEG)
+    return values[0]
 
 
 def parse_command(line: str) -> tuple[list[str], list[str]]:
@@ -257,7 +256,7 @@ def read_shards(document: dict) -> tuple[str, dict[str, tuple[list[str], list[st
         if shard is None:
             raise CheckError(
                 f"step {step.get('name')!r} runs `{commands[0]}` under `if: {step.get('if')}`, "
-                f"which is not `matrix.{AXIS} == '{PUSH_LEG}' || matrix.{AXIS} == '<shard>'`"
+                f"which is not `matrix.{AXIS} == '<shard>'`"
             )
         if len(commands) != 1:
             raise CheckError(
@@ -604,11 +603,11 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: Run shard one
-        if: matrix.leg == 'all' || matrix.leg == 'one'
+        if: matrix.leg == 'one'
         run: |
           cargo nextest run --no-tests=fail -p a -p b --features a/x,b/y
       - name: Run shard two
-        if: matrix.leg == 'all' || matrix.leg == 'two'
+        if: matrix.leg == 'two'
         run: cargo nextest run --no-tests=fail -p c
 """
 
@@ -700,14 +699,14 @@ def self_test() -> int:
             expect(f"{label} is rejected", needle in str(error), error)
 
     mutant = yaml.safe_load(SELF_TEST_WORKFLOW)
-    mutant["jobs"]["rust-test"]["steps"][2]["if"] = "matrix.leg == 'two'"
+    mutant["jobs"]["rust-test"]["steps"][2]["if"] = (
+        "matrix.leg == 'one' || matrix.leg == 'two'"
+    )
     try:
         read_shards(mutant)
-        expect("a shard step the push leg skips is rejected", False, "accepted")
+        expect("a shard step two legs run is rejected", False, "accepted")
     except CheckError as error:
-        expect(
-            "a shard step the push leg skips is rejected", "is not" in str(error), error
-        )
+        expect("a shard step two legs run is rejected", "is not" in str(error), error)
 
     mutant = yaml.safe_load(SELF_TEST_WORKFLOW)
     del mutant["jobs"]["rust-test"]["env"]

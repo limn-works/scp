@@ -29,6 +29,12 @@
 #     --target` reading `target/<triple>/ci-bridge`, with a bare `cargo run` reading
 #     `target/debug`, with `--profile test` reading `target/debug` and `--profile bench`
 #     reading `target/release`, and it joins backslash-continued lines before reading a command.
+#   * Check 3 (group coverage) fails a reader that compiles a feature the writer does
+#     not, a reader that compiles in check mode against a build-mode writer, a reader
+#     whose command names a shell variable its script never sets, a reader whose
+#     CARGO_* environment differs from the writer's, and a group whose only writer sits
+#     in a workflow no push or schedule on main starts. It passes a reader whose
+#     commands the writers of the groups it restores compile, on the same OS family.
 #
 # Each case is a directory under ./fixtures/ that the check reads through
 # `--workflows-dir`. Exit 0 when every case matches its expectation, 1 otherwise.
@@ -67,6 +73,11 @@ FIXTURES=(
     "bad-cache-matrix-key-exclude"
     "bad-bindgen-custom-profile-release-path"
     "bad-bindgen-test-profile-own-name"
+    "bad-cache-reader-extra-feature"
+    "bad-cache-reader-check-mode"
+    "bad-cache-reader-unset-variable"
+    "bad-cache-reader-env-differs"
+    "bad-cache-writer-never-triggered"
 )
 EXPECTED_EXITS=(
     "0"
@@ -80,6 +91,11 @@ EXPECTED_EXITS=(
     "1"
     "1"
     "0"
+    "1"
+    "1"
+    "1"
+    "1"
+    "1"
     "1"
     "1"
     "1"
@@ -105,6 +121,11 @@ EXPECTED_SUBSTRINGS=(
     "of a \`strategy.matrix\` carrying exclude, so this check"
     "writes target/aarch64-apple-darwin/ci-bridge/ and the \`--library\` it reads is target/aarch64-apple-darwin/release/libscp_ffi_uniffi.dylib"
     "writes target/debug/ and the \`--library\` it reads is target/test/libscp_ffi_uniffi.so"
+    "reader compiles \`cargo test --features=a/x,a/y -p=a [in .]\`, and no writer"
+    "reader compiles \`cargo clippy --features=a/x -p=a [in .]\`, and no writer"
+    "names shell variable(s) FEATURES that no assignment earlier in its script sets"
+    "restore under different values of CARGO_PROFILE_DEV_DEBUG"
+    "no leg writes it on a run of refs/heads/main that a push or a schedule starts"
 )
 
 passed=0
@@ -154,6 +175,15 @@ if [[ "$good_output" == *"OK: 6 uniffi-bindgen step(s)"* ]]; then
     passed=$((passed + 1))
 else
     echo "FAIL [good-groups-and-bindgen counts six bindgen steps]: $good_output" >&2
+    failed=$((failed + 1))
+fi
+# Check 3 compares four readers there: job doc in both groups and the two fuzz legs
+# that do not write. Zero would mean it read no command.
+if [[ "$good_output" == *"OK: 4 cache-group reader(s)"* ]]; then
+    echo "PASS [good-groups-and-bindgen compares four readers]"
+    passed=$((passed + 1))
+else
+    echo "FAIL [good-groups-and-bindgen compares four readers]: $good_output" >&2
     failed=$((failed + 1))
 fi
 
