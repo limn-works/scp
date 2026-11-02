@@ -1236,7 +1236,7 @@
       "sources": [
         {
           "file": ".docs/specs/18-addressability-and-deployment.md",
-          "section": "### 18.5.1 The Community Relay List and Bootstrap Priority Order"
+          "section": "### 18.5.1 The Node List and the Bootstrap Pointer"
         },
         {
           "file": ".docs/specs/18-addressability-and-deployment.md",
