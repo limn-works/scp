@@ -54,27 +54,22 @@ pub fn parse_node_key(node_key: &[u8]) -> Result<P256PublicKey, NodeKeyError> {
     })
 }
 
-/// `NodeId::derive`, which `scp-did` cannot hold because it carries no P-256
-/// or SHA-256 dependency. Bring the trait into scope and call
-/// `NodeId::derive(node_key)`.
-pub trait NodeIdDerive: Sized {
-    /// `SHA-256("SCP-NODE-ID-V1:" ‖ node_key)` over a checked node key.
-    ///
-    /// # Errors
-    ///
-    /// [`NodeKeyError`] when `node_key` is not a 33-byte compressed SEC1
-    /// point on P-256; no digest is computed over such bytes.
-    fn derive(node_key: &[u8]) -> Result<Self, NodeKeyError>;
-}
-
-impl NodeIdDerive for NodeId {
-    fn derive(node_key: &[u8]) -> Result<Self, NodeKeyError> {
-        parse_node_key(node_key)?;
-        let mut hasher = Sha256::new();
-        hasher.update(NODE_ID_SEPARATOR);
-        hasher.update(node_key);
-        Ok(Self::from_bytes(hasher.finalize().into()))
-    }
+/// `SHA-256("SCP-NODE-ID-V1:" ‖ node_key)` over a checked node key.
+///
+/// The peer of [`derive_identifier`](crate::derive_identifier). It lives here
+/// because `scp-did`, which holds [`NodeId`], carries no P-256 or SHA-256
+/// dependency.
+///
+/// # Errors
+///
+/// [`NodeKeyError`] when `node_key` is not a 33-byte compressed SEC1 point
+/// on P-256; no digest is computed over such bytes.
+pub fn derive_node_id(node_key: &[u8]) -> Result<NodeId, NodeKeyError> {
+    parse_node_key(node_key)?;
+    let mut hasher = Sha256::new();
+    hasher.update(NODE_ID_SEPARATOR);
+    hasher.update(node_key);
+    Ok(NodeId::from_bytes(hasher.finalize().into()))
 }
 
 #[cfg(test)]
@@ -96,22 +91,22 @@ mod tests {
     fn derive_refuses_a_key_of_the_wrong_length() {
         let key = reference_key();
         assert_eq!(
-            NodeId::derive(&key[..32]),
+            derive_node_id(&key[..32]),
             Err(NodeKeyError::WrongLength(32))
         );
         let mut long = key;
         long.push(0);
-        assert_eq!(NodeId::derive(&long), Err(NodeKeyError::WrongLength(34)));
-        assert_eq!(NodeId::derive(&[]), Err(NodeKeyError::WrongLength(0)));
+        assert_eq!(derive_node_id(&long), Err(NodeKeyError::WrongLength(34)));
+        assert_eq!(derive_node_id(&[]), Err(NodeKeyError::WrongLength(0)));
     }
 
     #[test]
     fn derive_refuses_an_uncompressed_prefix() {
         let mut key = reference_key();
         key[0] = 0x04;
-        assert_eq!(NodeId::derive(&key), Err(NodeKeyError::NotCompressed(0x04)));
+        assert_eq!(derive_node_id(&key), Err(NodeKeyError::NotCompressed(0x04)));
         key[0] = 0x00;
-        assert_eq!(NodeId::derive(&key), Err(NodeKeyError::NotCompressed(0x00)));
+        assert_eq!(derive_node_id(&key), Err(NodeKeyError::NotCompressed(0x00)));
     }
 
     #[test]
@@ -120,11 +115,11 @@ mod tests {
         let mut key = [0u8; 33];
         key[0] = 0x02;
         key[32] = 0x01;
-        assert_eq!(NodeId::derive(&key), Err(NodeKeyError::NotOnCurve));
+        assert_eq!(derive_node_id(&key), Err(NodeKeyError::NotOnCurve));
         // x ≥ p is not a field element.
         let mut key = [0xffu8; 33];
         key[0] = 0x03;
-        assert_eq!(NodeId::derive(&key), Err(NodeKeyError::NotOnCurve));
+        assert_eq!(derive_node_id(&key), Err(NodeKeyError::NotOnCurve));
     }
 
     #[test]
@@ -134,14 +129,14 @@ mod tests {
         hasher.update(b"SCP-NODE-ID-V1:");
         hasher.update(&key);
         let expected: [u8; 32] = hasher.finalize().into();
-        assert_eq!(NodeId::derive(&key)?.as_bytes(), &expected);
+        assert_eq!(derive_node_id(&key)?.as_bytes(), &expected);
         Ok(())
     }
 
     /// §25.27 Vector 90: the `NodeId` of §25.2's reference key.
     #[test]
     fn derive_matches_vector_90() -> Result<(), NodeKeyError> {
-        let node_id = NodeId::derive(&REFERENCE_KEY)?;
+        let node_id = derive_node_id(&REFERENCE_KEY)?;
         assert_eq!(
             hex::encode(node_id.as_bytes()),
             "e77d53354271e4c1c3c319cf7b5cfcc23be431c2ec795d5b6ecf549355f15610"

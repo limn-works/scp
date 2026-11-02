@@ -1607,10 +1607,22 @@ KEL_SEAL_SEPARATOR = b"SCP-KEL-SEAL-V1:"
 KEL_ID_SEPARATOR = b"SCP-KEL-ID-V1:"
 ZERO32 = bytes(32)
 
+NODE_ID_SEPARATOR = b"SCP-NODE-ID-V1:"
+
+def node_id(node_key: bytes) -> bytes:
+    """§9.7.4.2 definitions: SHA-256("SCP-NODE-ID-V1:" || node_key) over a
+    33-byte compressed point on P-256; an id derivation, raw key, no prefix."""
+    assert len(node_key) == 33 and node_key[0] in (2, 3), node_key.hex()
+    assert on_curve(decode_point(node_key))
+    return sha256(NODE_ID_SEPARATOR + node_key)
+
+
 # The vector identity: a 1-of-1 root (§25.2's reference key), one #active key
 # (§25.2's secondary key), a 1-of-1 next set, one witness, and a one-hour
-# witnessing interval.
-VECTOR_WITNESS_OPERATOR = sha256(b"scp-25-witness-operator")
+# witnessing interval. A witness is a listed node named by its NodeId
+# (§9.7.4.3): this one is Vector 49's second node, whose node key is §25.2's
+# secondary key.
+VECTOR_WITNESS = node_id(REF_KEY_2.compressed)
 VECTOR_WITNESSING_INTERVAL = 3600
 VECTOR_PREROTATION_POINT = REF_KEY_3.compressed
 
@@ -1642,7 +1654,7 @@ def vector_key_state(witnessing_interval: int = VECTOR_WITNESSING_INTERVAL) -> b
         + key_state_entry(REF_KEY_1.compressed, ROLE_ROOT, CONDITION_CURRENT)
         + key_state_entry(REF_KEY_2.compressed, ROLE_ACTIVE, CONDITION_CURRENT)
         + u32(1)  # witness-set count
-        + fixed_field(VECTOR_WITNESS_OPERATOR)
+        + fixed_field(VECTOR_WITNESS)
         + u32(witnessing_interval)
         + u8(ROLE_ACTIVE)  # service-key role discriminator
         + fixed_field(ZERO32)  # delegator: non-delegated
@@ -1776,7 +1788,7 @@ def emit_key_event_signatures() -> None:
         "vector_41.prerotation_commitment",
         sha256(PREROTATION_SEPARATOR + VECTOR_PREROTATION_POINT),
     )
-    emit_hex("vector_41.witness_operator", VECTOR_WITNESS_OPERATOR)
+    emit_hex("vector_41.witness", VECTOR_WITNESS)
     emit("vector_41.witnessing_interval", VECTOR_WITNESSING_INTERVAL)
     emit("vector_41.key_state_bytes", len(vector_key_state()))
     emit("vector_41.preimage_len", len(preimage_41))
@@ -1920,7 +1932,9 @@ CUSTODY_PREROTATION_KEY = keypair_from_seed(
     TEST_VECTOR_KEY_LABEL,
     "custody-registry pre-rotation",
 )
-CUSTODY_WITNESS_OPERATOR = sha256(b"scp-25-custody-witness-operator")
+# The custody identity's one witness is Vector 49's first node, whose node
+# key is §25.2's reference key (§9.7.4.3: a witness is named by its NodeId).
+CUSTODY_WITNESS = node_id(REF_KEY_1.compressed)
 CUSTODY_INTERVAL_INCEPTION = 3600
 CUSTODY_INTERVAL_KEY_STATE = 7200
 
@@ -1951,7 +1965,7 @@ def custody_key_state(witnessing_interval: int) -> bytes:
         + u32(9)  # key count
         + entries
         + u32(1)  # witness-set count
-        + fixed_field(CUSTODY_WITNESS_OPERATOR)
+        + fixed_field(CUSTODY_WITNESS)
         + u32(witnessing_interval)
         + u8(ROLE_ACTIVE)  # service-key role discriminator
         + fixed_field(ZERO32)  # delegator: non-delegated
@@ -2022,7 +2036,7 @@ def emit_custody_registry_key_state() -> None:
         emit(f"vector_51.custody.{name}", f"0x{value:02x}")
         emit_hex(f"vector_51.key.{name}", key.compressed)
     emit_hex("vector_51.prerotation_key_compressed", CUSTODY_PREROTATION_KEY.compressed)
-    emit_hex("vector_51.witness_operator", CUSTODY_WITNESS_OPERATOR)
+    emit_hex("vector_51.witness", CUSTODY_WITNESS)
     emit("vector_51.inception_commitment_custody", f"0x{CUSTODY_PASSKEY:02x}")
     emit("vector_51.inception_commitment_key_algorithm", f"0x{KEY_ALGORITHM_ECDSA_P256_SHA256:02x}")
     emit("vector_51.inception_preimage_len", len(inception))
@@ -2121,7 +2135,9 @@ def emit_context_export_preimage() -> None:
 
 # --- §25.27 the cosigned head and the node proof of control ---
 
-WITNESS_ID = sha256(b"scp-25-witness-operator")
+# The witness of Vectors 43, 45 and 46 is Vector 41's designated witness; its
+# node key, §25.2's secondary key, signs each object (§9.7.4.3).
+WITNESS_ID = VECTOR_WITNESS
 COSIGN_OBSERVED_AT = 1_700_000_000
 RESOLVER_NONCE = sha256(b"scp-25-resolver-nonce")
 SERVED_BLOB_A = b"scp-25-served-blob-a"
@@ -2271,7 +2287,6 @@ def emit_witness_and_node_objects() -> None:
 # --- §25.27 Vectors 90, 91 and 49: the node identifier, the node binding and
 # the node-list record (§9.6.3, §9.7.4.2 definitions, §9.18.2) ---
 
-NODE_ID_SEPARATOR = b"SCP-NODE-ID-V1:"
 NODE_BINDING_SEPARATOR = "SCP-NODE-BIND-V1:"
 NODE_LIST_SEPARATOR = "SCP-NODE-LIST-V1:"
 NODE_PROOF_SEPARATOR = "SCP-NODE-PROOF-V1:"
@@ -2303,13 +2318,6 @@ NODE_LIST_ENTRIES = [
 ]
 NODE_OPERATOR_ACTIVE = REF_KEY_3
 
-
-def node_id(node_key: bytes) -> bytes:
-    """§9.7.4.2 definitions: SHA-256("SCP-NODE-ID-V1:" || node_key) over a
-    33-byte compressed point on P-256; an id derivation, raw key, no prefix."""
-    assert len(node_key) == 33 and node_key[0] in (2, 3), node_key.hex()
-    assert on_curve(decode_point(node_key))
-    return sha256(NODE_ID_SEPARATOR + node_key)
 
 
 def node_binding_preimage(
@@ -2749,7 +2757,7 @@ def compromised_key_state() -> bytes:
         + key_state_entry(COMPROMISE_ACTIVE_KEY.compressed, ROLE_ACTIVE, CONDITION_CURRENT)
         + compromised
         + u32(1)
-        + fixed_field(VECTOR_WITNESS_OPERATOR)
+        + fixed_field(VECTOR_WITNESS)
         + u32(VECTOR_WITNESSING_INTERVAL)
         + u8(ROLE_ACTIVE)
         + fixed_field(ZERO32)
@@ -2786,7 +2794,7 @@ def recovery_key_state(root: KeyPair, active: KeyPair) -> bytes:
         + key_state_entry(REF_KEY_1.compressed, ROLE_ROOT, CONDITION_SUPERSEDED)
         + key_state_entry(REF_KEY_2.compressed, ROLE_ACTIVE, CONDITION_SUPERSEDED)
         + u32(1)
-        + fixed_field(VECTOR_WITNESS_OPERATOR)
+        + fixed_field(VECTOR_WITNESS)
         + u32(VECTOR_WITNESSING_INTERVAL)
         + u8(ROLE_ACTIVE)
         + fixed_field(ZERO32)

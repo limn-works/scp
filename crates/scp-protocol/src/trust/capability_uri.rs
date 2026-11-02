@@ -23,7 +23,7 @@
 //!
 //! // Identifier-scoped capability
 //! let uri: CapabilityUri =
-//!     "scp:fqhx6rdyx2knwadygeppkg5dzsmtinrlb4ku3s7zywlvolsgz4za:capability:domain-expertise/v2"
+//!     "scp:2ww3i46ackb5zgt6p2myyhjrfm5dkowpjbr4cp7hp37daswtrozq:capability:domain-expertise/v2"
 //!         .parse()
 //!         .unwrap();
 //! assert!(uri.is_identifier_scoped());
@@ -449,7 +449,7 @@ mod tests {
     use super::*;
 
     /// Spec 25 Vector 57's identifier in the `03-identity.md` §3.1 text form.
-    const DEFINER: &str = "scp:fqhx6rdyx2knwadygeppkg5dzsmtinrlb4ku3s7zywlvolsgz4za";
+    const DEFINER: &str = "scp:2ww3i46ackb5zgt6p2myyhjrfm5dkowpjbr4cp7hp37daswtrozq";
     /// Spec 25 Vector 61's definer, whose last character is `q`.
     const DEFINER_ENDING_Q: &str = "scp:tfgiiao36zlseo2tzfoi32knfx6topped3qloxcsube5gdvfrqgq";
 

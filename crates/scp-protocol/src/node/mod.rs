@@ -7,7 +7,8 @@
 //! - [`proof`]: the node proof of control a node signs over a QUERY
 //!   response.
 //!
-//! These are pure types and codecs. Every verification takes the key the
+//! These are pure types and codecs. Each verification returns a `Verified*`
+//! type whose only constructor is that verification, and takes the key the
 //! caller resolved, because the classes §9.7.1 assigns (log-anchored for a
 //! binding and a record's attribution, current-key for a record's standing,
 //! bound-node-key for a proof) read key state and list state this crate does
@@ -18,11 +19,13 @@ pub mod list;
 pub mod proof;
 
 pub use binding::{
-    NODE_BINDING_SEPARATOR, NODE_KEY_LEN, NodeBinding, NodeBindingError, node_url_hash,
+    NODE_BINDING_SEPARATOR, NODE_KEY_LEN, NodeBinding, NodeBindingError, VerifiedNodeBinding,
+    node_url_hash,
 };
 pub use list::{
     MAX_NODE_LIST_VALUE_LEN, NODE_LIST_FRAME_PREFIX_LEN, NODE_LIST_FRAME_VERSION,
-    NODE_LIST_SEPARATOR, NodeListEntry, NodeListError, NodeListFrameError, NodeListRecord,
+    NODE_LIST_SEPARATOR, NodeListEntry, NodeListEntryError, NodeListError, NodeListFrameError,
+    NodeListKeyClass, NodeListRecord, VerifiedNodeListEntry, VerifiedNodeListRecord,
     check_node_list_publish, decode_node_list_frame, encode_node_list_frame,
     entries_canonical_json,
 };

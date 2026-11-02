@@ -44,7 +44,7 @@ pub use key_event_signer::{
     CUSTODY_PROBE_CHALLENGE_LEN, CustodyProbe, KeyEventSignError, KeyEventSigner, MaybeSend,
     ProbeNonceError, ProbeSignature,
 };
-pub use node_id::{NodeIdDerive, NodeKeyError, parse_node_key};
+pub use node_id::{NodeKeyError, derive_node_id, parse_node_key};
 pub use preimage::{
     EncodedPreimage, decode_preimage, derive_identifier, encode_preimage, key_event_seal,
     prerotation_commitment,

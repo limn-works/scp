@@ -40,7 +40,7 @@
 //!
 //! // Identifier-scoped URIs are always accepted
 //! let uri = validate_capability_uri(
-//!     "scp:fqhx6rdyx2knwadygeppkg5dzsmtinrlb4ku3s7zywlvolsgz4za:capability:custom/v1",
+//!     "scp:2ww3i46ackb5zgt6p2myyhjrfm5dkowpjbr4cp7hp37daswtrozq:capability:custom/v1",
 //! )
 //! .unwrap();
 //! assert!(matches!(uri, CapabilityUri::IdentifierScoped { .. }));
@@ -580,7 +580,7 @@ pub fn is_known_system_capability(uri: &str) -> bool {
 ///
 /// // Identifier-scoped — always accepted
 /// assert!(validate_capability_uri(
-///     "scp:fqhx6rdyx2knwadygeppkg5dzsmtinrlb4ku3s7zywlvolsgz4za:capability:anything/v1"
+///     "scp:2ww3i46ackb5zgt6p2myyhjrfm5dkowpjbr4cp7hp37daswtrozq:capability:anything/v1"
 /// )
 /// .is_ok());
 ///
@@ -842,7 +842,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Spec 25 Vector 57's identifier in the `03-identity.md` §3.1 text form.
-    const DEFINER: &str = "scp:fqhx6rdyx2knwadygeppkg5dzsmtinrlb4ku3s7zywlvolsgz4za";
+    const DEFINER: &str = "scp:2ww3i46ackb5zgt6p2myyhjrfm5dkowpjbr4cp7hp37daswtrozq";
 
     #[test]
     fn validate_accepts_any_identifier_scoped_capability() {

@@ -47,10 +47,10 @@ use sha2::{Digest, Sha256};
 use wasm_bindgen_test::wasm_bindgen_test;
 
 /// Vector 57's text form of Vector 41's identifier.
-const V57_TEXT: &str = "scp:fqhx6rdyx2knwadygeppkg5dzsmtinrlb4ku3s7zywlvolsgz4za";
+const V57_TEXT: &str = "scp:2ww3i46ackb5zgt6p2myyhjrfm5dkowpjbr4cp7hp37daswtrozq";
 /// Vector 57's two rejected variants.
-const V57_UPPERCASE: &str = "scp:FQHX6RDYX2KNWADYGEPPKG5DZSMTINRLB4KU3S7ZYWLVOLSGZ4ZA";
-const V57_PADDED: &str = "scp:fqhx6rdyx2knwadygeppkg5dzsmtinrlb4ku3s7zywlvolsgz4za====";
+const V57_UPPERCASE: &str = "scp:2WW3I46ACKB5ZGT6P2MYYHJRFM5DKOWPJBR4CP7HP37DASWTROZQ";
+const V57_PADDED: &str = "scp:2ww3i46ackb5zgt6p2myyhjrfm5dkowpjbr4cp7hp37daswtrozq====";
 
 /// The identifier text error a non-canonical form returns.
 const fn non_canonical(reason: NonCanonicalReason) -> Result<Identifier, IdentifierError> {

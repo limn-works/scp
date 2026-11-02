@@ -245,10 +245,10 @@ mod tests {
     }
 
     /// Spec 25 Vector 57's identifier in the `03-identity.md` §3.1 text form.
-    const DEFINER: &str = "scp:fqhx6rdyx2knwadygeppkg5dzsmtinrlb4ku3s7zywlvolsgz4za";
+    const DEFINER: &str = "scp:2ww3i46ackb5zgt6p2myyhjrfm5dkowpjbr4cp7hp37daswtrozq";
     /// An identifier-scoped capability URI under [`DEFINER`].
     const SCOPED: &str =
-        "scp:fqhx6rdyx2knwadygeppkg5dzsmtinrlb4ku3s7zywlvolsgz4za:capability:custom/v1";
+        "scp:2ww3i46ackb5zgt6p2myyhjrfm5dkowpjbr4cp7hp37daswtrozq:capability:custom/v1";
 
     // -----------------------------------------------------------------
     // AC 2: parse_capability_endpoint with Protocol URIs

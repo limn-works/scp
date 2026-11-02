@@ -291,7 +291,7 @@ mod tests {
     const V83A_SIGNATURE: &str = "6f4a8e41a55455a45ea941e003199263aeb225e799c5453d56870e2561c94ec6\
                                   082078272e8a524df06c647899a9fe4ad4cf7e809a501fe38fd9e6e6a90629ac";
     /// Vector 41's event digest `D`.
-    const V41_DIGEST: &str = "d8ba4ebad52657208736f4cac675352f5f9cc0aa837620f8d742dbf42aeedbd7";
+    const V41_DIGEST: &str = "fcd42118a68664c30ff6b44a74aa21fcee2e248e863b973dcad7c75dead5a763";
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 

@@ -1366,7 +1366,7 @@ async fn capability_uri_construction() {
 
     // Identifier-scoped capability (spec 25 Vector 57's identifier)
     let scoped_str =
-        "scp:fqhx6rdyx2knwadygeppkg5dzsmtinrlb4ku3s7zywlvolsgz4za:capability:domain-expertise/v2";
+        "scp:2ww3i46ackb5zgt6p2myyhjrfm5dkowpjbr4cp7hp37daswtrozq:capability:domain-expertise/v2";
     let scoped: CapabilityUri = scoped_str.parse().unwrap();
     assert!(scoped.is_identifier_scoped());
     assert_eq!(scoped.name(), "domain-expertise");
@@ -1410,7 +1410,7 @@ async fn capability_matching() {
     let v2: CapabilityUri = "scp:capability:test/v2".parse().unwrap();
     let system: CapabilityUri = "scp:system:test".parse().unwrap();
     let scoped: CapabilityUri =
-        "scp:fqhx6rdyx2knwadygeppkg5dzsmtinrlb4ku3s7zywlvolsgz4za:capability:test/v1"
+        "scp:2ww3i46ackb5zgt6p2myyhjrfm5dkowpjbr4cp7hp37daswtrozq:capability:test/v1"
             .parse()
             .unwrap();
 

@@ -1364,7 +1364,7 @@ mod tests {
     const BRIDGE_URL: &str = "wss://bridge.example.com/scp/v1";
     /// Entry 3's `bridgeTarget` in Vector 48 of `25-test-vectors.md` §25.28.
     const BRIDGE_TARGET_HEX: &str =
-        "f8affd47ab024cae9489a63fa1c632914c16f7329441b8fca65b32c78d86a4eb";
+        "4102ed70d1c4b106466149a7d129630c11a20554683ae012fdffa56341d1c323";
 
     fn target(bytes: [u8; 32]) -> BridgeTarget {
         BridgeTarget::new(bytes).unwrap()
@@ -1393,7 +1393,7 @@ mod tests {
         let bridge = bridge_entry(BRIDGE_URL, vector_target());
         assert_eq!(
             hex::encode(relay_service_push_routing_id(&bridge)),
-            "733a76fce10004826ffaecd3c85ba27169282665cd64a902000275a52ba640a1"
+            "b01dcde6d4e3d24f807acbc4ddadf3dd2bb8103f24f8f099ec08e4c476e7d9ec"
         );
         assert_eq!(
             relay_service_push_routing_id(&bridge),

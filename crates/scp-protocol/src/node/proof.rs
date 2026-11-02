@@ -15,9 +15,9 @@
 
 use scp_crypto::p256::{P256Error, SIGNATURE_LEN, verify_prehash_strict};
 use scp_did::NodeId;
-use scp_kel::{NodeIdDerive, NodeKeyError, parse_node_key};
 use sha2::{Digest, Sha256};
 
+use super::binding::VerifiedNodeBinding;
 use crate::crypto::canonical::{CanonicalError, CanonicalField, canonical_hash};
 
 /// The §9.18.2 separator of the node-proof preimage.
@@ -53,10 +53,7 @@ pub enum NodeProofError {
     /// The bytes are not exactly [`NODE_PROOF_LEN`] long.
     #[error("node proof is {0} bytes, expected 200")]
     WrongLength(usize),
-    /// The key the caller supplied is not a node key.
-    #[error("node proof key: {0}")]
-    NodeKey(#[from] NodeKeyError),
-    /// The proof names a `NodeId` other than the supplied key's.
+    /// The proof names a `NodeId` other than the binding's.
     #[error("node proof names another node")]
     NodeIdMismatch,
     /// The signature does not verify under the supplied key.
@@ -167,11 +164,12 @@ impl NodeProof {
         })
     }
 
-    /// Checks that `node_key` is a node key whose `NodeId` is the proof's
-    /// `node_id`, and that the signature verifies strictly under it.
+    /// Checks that `binding`'s `NodeId` is the proof's `node_id`, and that the
+    /// signature verifies strictly under `binding`'s node key.
     ///
-    /// `node_key` is the `node_key` of the `NodeBinding` whose `NodeId` the
-    /// proof names (§9.7.1 bound-node-key class). The resolver's other checks
+    /// `binding` is the verified `NodeBinding` whose `NodeId` the proof names
+    /// (§9.7.1 bound-node-key class); the caller holds it attributed by a
+    /// verified node-list record (§9.6.3). The resolver's other checks
     /// (standing, the echoed nonce, the queried routing id, the value digest
     /// over the bytes received, and `observed_at` within the clock-skew
     /// tolerance) read state this type does not hold, so the caller makes
@@ -179,32 +177,35 @@ impl NodeProof {
     ///
     /// # Errors
     ///
-    /// [`NodeProofError::NodeKey`], [`NodeProofError::NodeIdMismatch`] or
-    /// [`NodeProofError::Signature`].
-    pub fn verify_signature(&self, node_key: &[u8]) -> Result<(), NodeProofError> {
-        let key = parse_node_key(node_key)?;
-        if NodeId::derive(node_key)? != self.node_id {
+    /// [`NodeProofError::NodeIdMismatch`] or [`NodeProofError::Signature`].
+    pub fn verify_signature(&self, binding: &VerifiedNodeBinding) -> Result<(), NodeProofError> {
+        if *binding.node_id() != self.node_id {
             return Err(NodeProofError::NodeIdMismatch);
         }
-        verify_prehash_strict(&key, &self.digest(), &self.signature)
+        verify_prehash_strict(binding.node_key(), &self.digest(), &self.signature)
             .map_err(NodeProofError::Signature)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use scp_crypto::p256::{P256SecretKey, SeedLabel, sign_prehash_rfc6979};
+    use scp_crypto::p256::{P256SecretKey, sign_prehash_rfc6979};
+    use scp_kel::derive_node_id;
 
+    use super::super::binding::tests::{TestResult, key, signed_binding, url};
     use super::*;
 
-    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
-
-    fn key(seed: u8) -> P256SecretKey {
-        P256SecretKey::from_seed(SeedLabel::TestVectorKey, &[seed; 32])
+    /// The verified binding of `node` under operator key 9.
+    fn bound(node: &P256SecretKey) -> TestResult<VerifiedNodeBinding> {
+        let operator = key(9);
+        Ok(VerifiedNodeBinding::verify(
+            signed_binding(&operator, node, &url()?)?,
+            &operator.public_key(),
+        )?)
     }
 
     fn signed_proof(node: &P256SecretKey) -> TestResult<NodeProof> {
-        let node_id = NodeId::derive(&node.public_key().to_compressed())?;
+        let node_id = derive_node_id(&node.public_key().to_compressed())?;
         let value_digest = response_value_digest(&[b"a".as_slice(), b"bb"])?;
         let digest = NodeProof::signing_digest(&node_id, &[1; 32], &[2; 32], &value_digest, 7);
         Ok(NodeProof {
@@ -234,10 +235,7 @@ mod tests {
         let proof = signed_proof(&node)?;
         let back = NodeProof::from_bytes(&proof.to_bytes())?;
         assert_eq!(back, proof);
-        assert_eq!(
-            back.verify_signature(&node.public_key().to_compressed()),
-            Ok(())
-        );
+        assert_eq!(back.verify_signature(&bound(&node)?), Ok(()));
         Ok(())
     }
 
@@ -261,13 +259,13 @@ mod tests {
     #[test]
     fn a_flip_in_any_byte_is_refused() -> TestResult {
         let node = key(1);
-        let node_key = node.public_key().to_compressed();
+        let binding = bound(&node)?;
         let bytes = signed_proof(&node)?.to_bytes();
         for i in 0..NODE_PROOF_LEN {
             let mut flipped = bytes;
             flipped[i] ^= 1;
             let proof = NodeProof::from_bytes(&flipped)?;
-            assert!(proof.verify_signature(&node_key).is_err(), "byte {i}");
+            assert!(proof.verify_signature(&binding).is_err(), "byte {i}");
         }
         Ok(())
     }
@@ -276,7 +274,7 @@ mod tests {
     fn a_proof_checked_under_another_node_key_is_refused() -> TestResult {
         let proof = signed_proof(&key(1))?;
         assert_eq!(
-            proof.verify_signature(&key(2).public_key().to_compressed()),
+            proof.verify_signature(&bound(&key(2))?),
             Err(NodeProofError::NodeIdMismatch)
         );
         Ok(())

@@ -521,9 +521,9 @@ fn assertion_form_rejects_a_create_type() -> TestResult {
 #[test]
 fn assertion_form_rejects_a_challenge_for_anything_else() -> TestResult {
     // Unpadded base64url of "SCP-KEL-EVENT-V1:" || Vector 42's D.
-    let wrong_prefix = "U0NQLUtFTC1FVkVOVC1WMTqaQbD9uXgBRzCrfY1Wuad3RbT_SCSv_AlrvZI9FKVppg";
+    let wrong_prefix = "U0NQLUtFTC1FVkVOVC1WMTo4b2xkI4NXTFpsspEBWKpBYZ4skaAFi1El-ccLcHna3A";
     // Unpadded base64url of "SCP-KEY-EVENT-V1:" || Vector 41's D.
-    let other_event = "U0NQLUtFWS1FVkVOVC1WMTrYuk661SZXIIc29MrGdTUvX5zAqoN2IPjXQtv0Ku7b1w";
+    let other_event = "U0NQLUtFWS1FVkVOVC1WMTr81CEYpoZkww_2tEp0qiH87i4kjoY7lz3K18dd6tWnYw";
     for challenge in [wrong_prefix, other_event] {
         let signature = resigned(
             authenticator_data(0x05)?,
@@ -538,15 +538,15 @@ fn assertion_form_rejects_a_challenge_for_anything_else() -> TestResult {
 }
 
 /// A challenge carrying `=` padding, or a character outside the base64url
-/// alphabet, is rejected. Replacing `_` with `/` gives the standard
+/// alphabet, is rejected. Replacing `-` with `+` gives the standard
 /// alphabet's encoding of the same bytes, which a lenient decoder accepts.
 #[test]
 fn assertion_form_rejects_padding_and_characters_outside_base64url() -> TestResult {
     let padded = format!("{V42_CHALLENGE}=");
-    let slash = V42_CHALLENGE.replacen('_', "/", 1);
-    let plus = format!("+{}", V42_CHALLENGE.get(1..).ok_or("short")?);
-    assert_ne!(slash, V42_CHALLENGE);
-    for challenge in [padded, slash, plus] {
+    let standard = V42_CHALLENGE.replacen('-', "+", 1);
+    let slash = format!("/{}", V42_CHALLENGE.get(1..).ok_or("short")?);
+    assert_ne!(standard, V42_CHALLENGE);
+    for challenge in [padded, standard, slash] {
         let signature = resigned(
             authenticator_data(0x05)?,
             client_data("webauthn.get", &challenge),
@@ -566,8 +566,8 @@ fn assertion_form_rejects_padding_and_characters_outside_base64url() -> TestResu
 #[test]
 fn assertion_form_rejects_a_non_canonical_challenge() -> TestResult {
     let mut challenge = V42_CHALLENGE.to_owned();
-    assert_eq!(challenge.pop(), Some('g'));
-    challenge.push('h');
+    assert_eq!(challenge.pop(), Some('A'));
+    challenge.push('B');
     let signature = resigned(
         authenticator_data(0x05)?,
         client_data("webauthn.get", &challenge),
@@ -585,7 +585,7 @@ fn assertion_form_rejects_a_non_canonical_challenge() -> TestResult {
 #[test]
 fn assertion_form_compares_the_decoded_challenge() -> TestResult {
     let escaped_challenge = format!(
-        r"\u0055{}\u0067",
+        r"\u0055{}\u0041",
         V42_CHALLENGE
             .get(1..V42_CHALLENGE.len() - 1)
             .ok_or("short")?

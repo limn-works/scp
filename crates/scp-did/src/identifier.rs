@@ -203,13 +203,13 @@ mod tests {
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     /// Spec 25 Vector 57's identifier, which is Vector 41's.
-    const VECTOR_57_HEX: &str = "2c0f7f4478be94db0078311ef51ba3cc9934362b0f154dcbf9c597572e46cf32";
+    const VECTOR_57_HEX: &str = "d5adb473c01283dc9a7e7e998c1d312b3a353acf4863c13fe77efe304ad38bb3";
     /// Spec 25 Vector 57's accepted text form.
-    const VECTOR_57: &str = "scp:fqhx6rdyx2knwadygeppkg5dzsmtinrlb4ku3s7zywlvolsgz4za";
+    const VECTOR_57: &str = "scp:2ww3i46ackb5zgt6p2myyhjrfm5dkowpjbr4cp7hp37daswtrozq";
     /// Spec 25 Vector 57's rejected uppercase form.
-    const VECTOR_57_UPPER: &str = "scp:FQHX6RDYX2KNWADYGEPPKG5DZSMTINRLB4KU3S7ZYWLVOLSGZ4ZA";
+    const VECTOR_57_UPPER: &str = "scp:2WW3I46ACKB5ZGT6P2MYYHJRFM5DKOWPJBR4CP7HP37DASWTROZQ";
     /// Spec 25 Vector 57's rejected padded form.
-    const VECTOR_57_PADDED: &str = "scp:fqhx6rdyx2knwadygeppkg5dzsmtinrlb4ku3s7zywlvolsgz4za====";
+    const VECTOR_57_PADDED: &str = "scp:2ww3i46ackb5zgt6p2myyhjrfm5dkowpjbr4cp7hp37daswtrozq====";
     /// The §25.1 fixture identifiers `proposer`, `new member` and `definer`.
     const PROPOSER: &str = "scp:flrkfgy6ehrwj35ay57p36ldffarlcmh2mj7smr7rauyvpreyqfa";
     const NEW_MEMBER: &str = "scp:ykcz3x3dycntc6lkxzbe3nixvd7w5c37riaowlh26lczdnc5vmja";

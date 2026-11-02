@@ -15,19 +15,25 @@
 //! the rest are fixed width. A party stores and forwards the record as its
 //! RFC 8785 canonical JSON, in which every byte field is lowercase hex.
 //!
-//! **`sequence` is a decimal string in the JSON.** §9.6.3 types it `u64`, and
-//! `crate::jcs` refuses a JSON number above 2^53 (I-JSON), so a numeric
-//! encoding could not carry every `u64`. The workspace rule for such a field
-//! is a string encoding, as `economy::types::Amount` takes. The signature
-//! member is `signature`. §9.6.3 fixes neither choice.
+//! §9.6.3 "The record's JSON" fixes the members: the five fields and
+//! `signature`, `sequence` as the decimal string of a `u64`, and every byte
+//! field as lowercase hex.
+//!
+//! The record verifies under one of two classes (§9.6.3, §9.7.1), and
+//! [`VerifiedNodeListRecord`] records which: [`NodeListKeyClass::Standing`]
+//! under the key the governor's current key state lists `Current` in
+//! `#active`, and [`NodeListKeyClass::Attribution`] under the `#active` that
+//! was `Current` at `signing_key_state_head`.
 
 use scp_crypto::p256::{P256Error, P256PublicKey, SIGNATURE_LEN, verify_prehash_strict};
-use scp_did::{Identifier, NodeId, NodeUrl};
+use scp_did::{DidError, Identifier, NodeEntryUrlError, NodeId, NodeUrl};
 use scp_kel::{NodeKeyError, node_list_routing_id};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::binding::{NODE_KEY_LEN, NodeBinding, NodeBindingError, node_url_hash};
+use super::binding::{
+    NODE_KEY_LEN, NodeBinding, NodeBindingError, VerifiedNodeBinding, node_url_hash,
+};
 use crate::crypto::canonical::{CanonicalError, CanonicalField, canonical_hash};
 use crate::envelope::did_record::MAX_BLOB_SIZE;
 
@@ -68,20 +74,71 @@ impl NodeListEntry {
     pub fn node_id(&self) -> Result<NodeId, NodeKeyError> {
         self.binding.node_id()
     }
+}
 
-    /// Verifies the binding under `operator_active` and checks that
-    /// `binding.url_hash` is the SHA-256 of `url`, so a binding signed for one
-    /// URL cannot be listed under another. A party treats an entry that fails
-    /// as void (§9.6.3 acceptance step 3).
+/// Why an entry is void (§9.6.3 acceptance step 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum NodeListEntryError {
+    /// The binding fails one of its two checks.
+    #[error("node-list entry binding: {0}")]
+    Binding(#[from] NodeBindingError),
+    /// `binding.url_hash` is not the SHA-256 of the entry's `url`.
+    #[error("node-list entry url_hash does not match the entry's URL")]
+    UrlHashMismatch,
+}
+
+/// A [`NodeListEntry`] that passed the three checks of §9.6.3 acceptance step
+/// 3: the binding's two signatures and `url_hash` over the entry's `url`.
+///
+/// [`Self::verify`] is the only constructor, and the type has no
+/// `Deserialize`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedNodeListEntry {
+    binding: VerifiedNodeBinding,
+    url: NodeUrl,
+    free: bool,
+}
+
+impl VerifiedNodeListEntry {
+    /// Checks that `binding.url_hash` is the SHA-256 of `url`, so a binding
+    /// signed for one URL cannot be listed under another, then verifies the
+    /// binding under `operator_active`, the operator's `#active` at
+    /// `binding.key_state_head` (see [`VerifiedNodeBinding::verify`]).
     ///
     /// # Errors
     ///
-    /// [`NodeBindingError::UrlHashMismatch`] or the binding's own error.
-    pub fn verify(&self, operator_active: &P256PublicKey) -> Result<(), NodeBindingError> {
-        if node_url_hash(&self.url) != self.binding.url_hash {
-            return Err(NodeBindingError::UrlHashMismatch);
+    /// [`NodeListEntryError::UrlHashMismatch`] or
+    /// [`NodeListEntryError::Binding`].
+    pub fn verify(
+        entry: NodeListEntry,
+        operator_active: &P256PublicKey,
+    ) -> Result<Self, NodeListEntryError> {
+        if node_url_hash(&entry.url) != entry.binding.url_hash {
+            return Err(NodeListEntryError::UrlHashMismatch);
         }
-        self.binding.verify(operator_active)
+        Ok(Self {
+            binding: VerifiedNodeBinding::verify(entry.binding, operator_active)?,
+            url: entry.url,
+            free: entry.free,
+        })
+    }
+
+    /// The verified binding.
+    #[must_use]
+    pub const fn binding(&self) -> &VerifiedNodeBinding {
+        &self.binding
+    }
+
+    /// The node's canonical URL, which `binding.url_hash` commits to.
+    #[must_use]
+    pub const fn url(&self) -> &NodeUrl {
+        &self.url
+    }
+
+    /// True where the node charges nothing for basic protocol operation.
+    #[must_use]
+    pub const fn free(&self) -> bool {
+        self.free
     }
 }
 
@@ -104,11 +161,25 @@ pub struct NodeListRecord {
 }
 
 /// Why a record, or its canonical JSON, is refused.
+///
+/// No variant carries text from the input, so an error never echoes the
+/// bytes a peer sent.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum NodeListError {
-    /// The bytes are not the JSON of a `NodeListRecord`.
-    #[error("node-list record JSON: {0}")]
-    Json(String),
+    /// The bytes are not the JSON of a `NodeListRecord`: `serde_json`'s
+    /// category of the failure and the 1-based line and column it found.
+    #[error("node-list record JSON {category:?} error at line {line} column {column}")]
+    Json {
+        /// What kind of failure `serde_json` met.
+        category: serde_json::error::Category,
+        /// The line of the failure.
+        line: usize,
+        /// The column of the failure.
+        column: usize,
+    },
+    /// The record did not encode as RFC 8785 JSON.
+    #[error("node-list record does not encode as RFC 8785 JSON")]
+    Encode,
     /// The bytes parse, but they are not the record's RFC 8785 canonical
     /// form: whitespace, member order, uppercase hex, a leading zero, or a
     /// non-canonical URL.
@@ -126,9 +197,10 @@ pub enum NodeListError {
     /// `context_id` is empty.
     #[error("node-list record context_id is empty")]
     EmptyContextId,
-    /// An entry's `url` has no canonical form ending in `/scp/v1`.
-    #[error("node-list entry URL: {0}")]
-    BadUrl(String),
+    /// An entry's `url` has no canonical form ending in `/scp/v1`; the
+    /// reason, where the URL check named one.
+    #[error("node-list entry URL is not a node URL: {0:?}")]
+    BadUrl(Option<NodeEntryUrlError>),
     /// The canonical JSON is longer than a frame's `value` can carry.
     #[error("node-list record JSON is {0} bytes, more than a frame carries")]
     TooLarge(usize),
@@ -205,7 +277,10 @@ fn entry_from_wire(wire: WireEntry) -> Result<NodeListEntry, NodeListError> {
             operator_sig: from_hex("operator_sig", &b.operator_sig)?,
             possession_sig: from_hex("possession_sig", &b.possession_sig)?,
         },
-        url: NodeUrl::new(&wire.url).map_err(|e| NodeListError::BadUrl(e.to_string()))?,
+        url: NodeUrl::new(&wire.url).map_err(|e| match e {
+            DidError::InvalidNodeUrl { reason, .. } => NodeListError::BadUrl(Some(reason)),
+            _ => NodeListError::BadUrl(None),
+        })?,
         free: wire.free,
     })
 }
@@ -215,10 +290,10 @@ fn entry_from_wire(wire: WireEntry) -> Result<NodeListEntry, NodeListError> {
 ///
 /// # Errors
 ///
-/// [`NodeListError::Json`] when serialization fails.
+/// [`NodeListError::Encode`] when serialization fails.
 pub fn entries_canonical_json(entries: &[NodeListEntry]) -> Result<Vec<u8>, NodeListError> {
     let wire: Vec<WireEntry> = entries.iter().map(wire_entry).collect();
-    crate::jcs::to_vec(&wire).map_err(NodeListError::Json)
+    crate::jcs::to_vec(&wire).map_err(|_| NodeListError::Encode)
 }
 
 impl NodeListRecord {
@@ -226,7 +301,7 @@ impl NodeListRecord {
     ///
     /// # Errors
     ///
-    /// [`NodeListError::Json`] when the entries do not serialize, or
+    /// [`NodeListError::Encode`] when the entries do not serialize, or
     /// [`NodeListError::Preimage`] when `context_id` exceeds a BE32 length.
     pub fn signing_digest(
         context_id: &str,
@@ -263,32 +338,24 @@ impl NodeListRecord {
         )
     }
 
-    /// Verifies the governor signature strictly under `governor_active`.
-    ///
-    /// `governor_active` is the key the caller found for the governor: for
-    /// standing, the key the governor's current key state lists `Current` in
-    /// `#active`; for attribution, the `#active` at `signing_key_state_head`
-    /// (§9.6.3, two classes). The caller resolves it, because both classes
-    /// read key state this type does not hold. The record's entries are
-    /// verified one by one with [`NodeListEntry::verify`].
-    ///
-    /// # Errors
-    ///
-    /// [`NodeListError::Signature`] when the signature fails, or a digest
-    /// error.
-    pub fn verify(&self, governor_active: &P256PublicKey) -> Result<(), NodeListError> {
-        verify_prehash_strict(governor_active, &self.digest()?, &self.signature)
-            .map_err(NodeListError::Signature)
-    }
-
     /// The record's RFC 8785 canonical JSON, the form a party stores and
     /// forwards and `FallbackConfirmation.list_record` carries (§9.7.1).
     ///
+    /// Both directions refuse the same records: [`Self::from_canonical_json`]
+    /// reaches these checks through this function.
+    ///
     /// # Errors
     ///
-    /// [`NodeListError::Json`] when serialization fails, or
+    /// [`NodeListError::EmptyContextId`], [`NodeListError::ZeroSequence`],
+    /// [`NodeListError::Encode`] when serialization fails, or
     /// [`NodeListError::TooLarge`] when the JSON exceeds a frame's `value`.
     pub fn to_canonical_json(&self) -> Result<Vec<u8>, NodeListError> {
+        if self.context_id.is_empty() {
+            return Err(NodeListError::EmptyContextId);
+        }
+        if self.sequence == 0 {
+            return Err(NodeListError::ZeroSequence);
+        }
         let wire = WireRecord {
             context_id: self.context_id.clone(),
             sequence: self.sequence.to_string(),
@@ -297,7 +364,7 @@ impl NodeListRecord {
             entries: self.entries.iter().map(wire_entry).collect(),
             signature: hex::encode(self.signature),
         };
-        let bytes = crate::jcs::to_vec(&wire).map_err(NodeListError::Json)?;
+        let bytes = crate::jcs::to_vec(&wire).map_err(|_| NodeListError::Encode)?;
         if bytes.len() > MAX_NODE_LIST_VALUE_LEN {
             return Err(NodeListError::TooLarge(bytes.len()));
         }
@@ -306,8 +373,8 @@ impl NodeListRecord {
 
     /// Reads a record from its canonical JSON and refuses any other spelling
     /// of it: the bytes must equal the canonical JSON of the record they
-    /// parse to. This checks the form only; [`Self::verify`] checks the
-    /// signature.
+    /// parse to. This checks the form only; [`VerifiedNodeListRecord::verify`]
+    /// checks the signature.
     ///
     /// # Errors
     ///
@@ -317,18 +384,15 @@ impl NodeListRecord {
         if bytes.len() > MAX_NODE_LIST_VALUE_LEN {
             return Err(NodeListError::TooLarge(bytes.len()));
         }
-        let wire: WireRecord =
-            serde_json::from_slice(bytes).map_err(|e| NodeListError::Json(e.to_string()))?;
-        if wire.context_id.is_empty() {
-            return Err(NodeListError::EmptyContextId);
-        }
+        let wire: WireRecord = serde_json::from_slice(bytes).map_err(|e| NodeListError::Json {
+            category: e.classify(),
+            line: e.line(),
+            column: e.column(),
+        })?;
         let sequence: u64 = wire
             .sequence
             .parse()
             .map_err(|_| NodeListError::BadSequence)?;
-        if sequence == 0 {
-            return Err(NodeListError::ZeroSequence);
-        }
         let record = Self {
             context_id: wire.context_id,
             sequence,
@@ -348,6 +412,70 @@ impl NodeListRecord {
             return Err(NodeListError::NotCanonical);
         }
         Ok(record)
+    }
+}
+
+/// The key class a record's signature verifies under (§9.6.3, §9.7.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NodeListKeyClass {
+    /// Current-key: the key the governor's current key state lists
+    /// `Current` in `#active`. Only a record verified under this class gives
+    /// its entries standing.
+    Standing,
+    /// Log-anchored: the governor's `#active` that was `Current` at
+    /// `signing_key_state_head`, with §9.7.1's first-seen rule deciding where
+    /// the governor later marks that key `Compromised`. A record verified
+    /// under this class attributes its bindings and gives no standing.
+    Attribution,
+}
+
+/// A [`NodeListRecord`] whose governor signature verified, with the class it
+/// verified under.
+///
+/// [`Self::verify`] is the only constructor, and the type has no
+/// `Deserialize`. The entries are not verified here: each entry's operator
+/// key is resolved separately, through [`VerifiedNodeListEntry::verify`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedNodeListRecord {
+    record: NodeListRecord,
+    class: NodeListKeyClass,
+}
+
+impl VerifiedNodeListRecord {
+    /// Verifies `record`'s signature strictly under `governor_active`, the
+    /// key `class` names. The caller resolves that key, because both classes
+    /// read the governor's key state, which this type does not hold.
+    ///
+    /// # Errors
+    ///
+    /// [`NodeListError::Signature`] when the signature fails, or a digest
+    /// error.
+    pub fn verify(
+        record: NodeListRecord,
+        class: NodeListKeyClass,
+        governor_active: &P256PublicKey,
+    ) -> Result<Self, NodeListError> {
+        verify_prehash_strict(governor_active, &record.digest()?, &record.signature)
+            .map_err(NodeListError::Signature)?;
+        Ok(Self { record, class })
+    }
+
+    /// Borrows the record this value verified.
+    #[must_use]
+    pub const fn record(&self) -> &NodeListRecord {
+        &self.record
+    }
+
+    /// The class the signature verified under.
+    #[must_use]
+    pub const fn class(&self) -> NodeListKeyClass {
+        self.class
+    }
+
+    /// Returns the record this value verified, dropping the verified marker.
+    #[must_use]
+    pub fn into_record(self) -> NodeListRecord {
+        self.record
     }
 }
 
@@ -432,7 +560,8 @@ pub fn decode_node_list_frame(bytes: &[u8]) -> Result<NodeListRecord, NodeListFr
 /// The node's remaining admission step, the governor signature under the
 /// `#active` at `signing_key_state_head` in the governor key state the node
 /// holds, reads key state this function does not hold; the caller runs
-/// [`NodeListRecord::verify`] on the returned record.
+/// [`VerifiedNodeListRecord::verify`] under [`NodeListKeyClass::Attribution`]
+/// on the returned record.
 ///
 /// # Errors
 ///
@@ -499,9 +628,17 @@ mod tests {
         let json = record.to_canonical_json()?;
         let back = NodeListRecord::from_canonical_json(&json)?;
         assert_eq!(back, record);
-        assert_eq!(back.verify(&governor.public_key()), Ok(()));
+        let verified = VerifiedNodeListRecord::verify(
+            back.clone(),
+            NodeListKeyClass::Standing,
+            &governor.public_key(),
+        )?;
+        assert_eq!(verified.class(), NodeListKeyClass::Standing);
+        assert_eq!(verified.record(), &back);
         for entry in &back.entries {
-            assert_eq!(entry.verify(&key(1).public_key()), Ok(()));
+            let checked = VerifiedNodeListEntry::verify(entry.clone(), &key(1).public_key())?;
+            assert_eq!(checked.binding().binding(), &entry.binding);
+            assert_eq!(checked.url(), &entry.url);
         }
         let text = std::str::from_utf8(&json)?;
         assert!(text.starts_with(r#"{"context_id":"node-list","entries":[{"binding":{"#));
@@ -533,8 +670,12 @@ mod tests {
         let governor = key(9);
         let active = governor.public_key();
         let good = signed_record(&governor)?;
-        let refused =
-            |r: &NodeListRecord| matches!(r.verify(&active), Err(NodeListError::Signature(_)));
+        let refused = |r: &NodeListRecord| {
+            matches!(
+                VerifiedNodeListRecord::verify(r.clone(), NodeListKeyClass::Attribution, &active),
+                Err(NodeListError::Signature(_))
+            )
+        };
 
         let mut r = good.clone();
         r.context_id.push('x');
@@ -573,8 +714,8 @@ mod tests {
         let mut e = entry(2, "wss://a.example.com/scp/v1", true)?;
         e.url = NodeUrl::new("wss://c.example.com/scp/v1")?;
         assert_eq!(
-            e.verify(&key(1).public_key()),
-            Err(NodeBindingError::UrlHashMismatch)
+            VerifiedNodeListEntry::verify(e, &key(1).public_key()),
+            Err(NodeListEntryError::UrlHashMismatch)
         );
         Ok(())
     }
@@ -599,7 +740,7 @@ mod tests {
         let numeric = text.replacen(r#""sequence":"1""#, r#""sequence":1"#, 1);
         assert!(matches!(
             NodeListRecord::from_canonical_json(numeric.as_bytes()),
-            Err(NodeListError::Json(_))
+            Err(NodeListError::Json { .. })
         ));
         let zero = text.replacen(r#""sequence":"1""#, r#""sequence":"0""#, 1);
         assert_eq!(
@@ -609,7 +750,7 @@ mod tests {
         let extra = text.replacen('{', r#"{"a":1,"#, 1);
         assert!(matches!(
             NodeListRecord::from_canonical_json(extra.as_bytes()),
-            Err(NodeListError::Json(_))
+            Err(NodeListError::Json { .. })
         ));
         Ok(())
     }
@@ -621,6 +762,79 @@ mod tests {
         record.sequence = u64::MAX;
         let json = record.to_canonical_json()?;
         assert_eq!(NodeListRecord::from_canonical_json(&json)?, record);
+        Ok(())
+    }
+
+    #[test]
+    fn an_entry_with_a_bad_binding_is_void() -> TestResult {
+        let e = entry(2, "wss://a.example.com/scp/v1", true)?;
+        assert!(matches!(
+            VerifiedNodeListEntry::verify(e, &key(4).public_key()),
+            Err(NodeListEntryError::Binding(
+                NodeBindingError::OperatorSignature(_)
+            ))
+        ));
+        Ok(())
+    }
+
+    /// An empty `context_id` or a zero `sequence` is refused in both
+    /// directions, by the one check `to_canonical_json` runs.
+    #[test]
+    fn an_empty_context_id_and_a_zero_sequence_are_refused_both_ways() -> TestResult {
+        let good = signed_record(&key(9))?;
+        let text = String::from_utf8(good.to_canonical_json()?)?;
+
+        let mut r = good.clone();
+        r.context_id.clear();
+        assert_eq!(r.to_canonical_json(), Err(NodeListError::EmptyContextId));
+        let empty = text.replacen(r#""context_id":"node-list""#, r#""context_id":"""#, 1);
+        assert_ne!(empty, text);
+        assert_eq!(
+            NodeListRecord::from_canonical_json(empty.as_bytes()),
+            Err(NodeListError::EmptyContextId)
+        );
+
+        let mut r = good;
+        r.sequence = 0;
+        assert_eq!(r.to_canonical_json(), Err(NodeListError::ZeroSequence));
+        Ok(())
+    }
+
+    /// A JSON error carries the failure's category and position and never the
+    /// text it read.
+    #[test]
+    fn a_json_error_does_not_echo_the_input() -> TestResult {
+        let text = String::from_utf8(signed_record(&key(9))?.to_canonical_json()?)?;
+        let marker = "attacker-chosen-text";
+        let hostile = text.replacen('{', &format!(r#"{{"{marker}":1,"#), 1);
+        let Err(error) = NodeListRecord::from_canonical_json(hostile.as_bytes()) else {
+            return Err("an unknown member was accepted".into());
+        };
+        assert!(matches!(
+            error,
+            NodeListError::Json {
+                category: serde_json::error::Category::Data,
+                line: 1,
+                ..
+            }
+        ));
+        assert!(!error.to_string().contains(marker), "{error}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_record_too_large_for_a_frame_does_not_encode() -> TestResult {
+        let mut record = signed_record(&key(9))?;
+        let one = record.entries[0].clone();
+        record.entries = vec![one; 400];
+        assert!(matches!(
+            record.to_canonical_json(),
+            Err(NodeListError::TooLarge(len)) if len > MAX_NODE_LIST_VALUE_LEN
+        ));
+        assert!(matches!(
+            encode_node_list_frame(&record),
+            Err(NodeListFrameError::Record(NodeListError::TooLarge(_)))
+        ));
         Ok(())
     }
 
@@ -681,6 +895,19 @@ mod tests {
         );
     }
 
+    /// A `value` of exactly `Max blob size − 33` bytes passes the length rule
+    /// and is then read as record JSON.
+    #[test]
+    fn frame_rule_value_of_exactly_the_maximum_reaches_the_json_rule() {
+        let mut bytes = vec![b' '; NODE_LIST_FRAME_PREFIX_LEN + MAX_NODE_LIST_VALUE_LEN];
+        bytes[0] = NODE_LIST_FRAME_VERSION;
+        bytes[1..33].fill(0x33);
+        assert!(matches!(
+            decode_node_list_frame(&bytes),
+            Err(NodeListFrameError::Record(NodeListError::Json { .. }))
+        ));
+    }
+
     #[test]
     fn frame_rule_value_is_not_canonical_record_json() -> TestResult {
         let (_, bytes) = frame()?;
@@ -693,7 +920,7 @@ mod tests {
         );
         assert!(matches!(
             decode_node_list_frame(&bytes[..33]),
-            Err(NodeListFrameError::Record(NodeListError::Json(_)))
+            Err(NodeListFrameError::Record(NodeListError::Json { .. }))
         ));
         Ok(())
     }

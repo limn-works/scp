@@ -1039,7 +1039,7 @@ pub(crate) fn tier3_fixture() -> Result<Tier3Fixture, Box<dyn std::error::Error>
     const BRIDGE_URL: &str = "wss://bridge.example.com/scp/v1";
     let mut target = [0u8; 32];
     hex::decode_to_slice(
-        "f8affd47ab024cae9489a63fa1c632914c16f7329441b8fca65b32c78d86a4eb",
+        "4102ed70d1c4b106466149a7d129630c11a20554683ae012fdffa56341d1c323",
         &mut target,
     )?;
     let target = scp_did::BridgeTarget::new(target)?;
@@ -1053,7 +1053,7 @@ pub(crate) fn tier3_fixture() -> Result<Tier3Fixture, Box<dyn std::error::Error>
     let entry_b = entry("wss://bridge-two.example.net/scp/v1")?;
     let bridge_own_id = PushReservation::new(BRIDGE_URL)?.push_routing_id();
     if hex::encode(entry_a.push_routing_id())
-        != "733a76fce10004826ffaecd3c85ba27169282665cd64a902000275a52ba640a1"
+        != "b01dcde6d4e3d24f807acbc4ddadf3dd2bb8103f24f8f099ec08e4c476e7d9ec"
         || hex::encode(bridge_own_id)
             != "e47cce36c946ac50a2ee3dbc40f0416d7012bf82344c8f24a756c0f62242eea1"
     {

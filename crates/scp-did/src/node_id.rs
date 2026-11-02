@@ -3,8 +3,8 @@
 //!
 //! A node is named by `NodeId = SHA-256("SCP-NODE-ID-V1:" ‖ node_key)` over
 //! its 33-byte compressed SEC1 P-256 key. This crate holds only the 32-byte
-//! newtype, because it carries no P-256 or SHA-256 dependency; `scp-kel`'s
-//! `NodeIdDerive::derive` checks the key and computes the digest.
+//! newtype, because it carries no P-256 or SHA-256 dependency;
+//! `scp_kel::derive_node_id` checks the key and computes the digest.
 //!
 //! A `NodeId` and an [`Identifier`](crate::Identifier) are both 32 bytes, and
 //! §9.7.4.2 forbids accepting one where the other is expected. They are two

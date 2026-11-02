@@ -164,5 +164,5 @@ pub(crate) const SERVICE_RECORD_ROUTING_SEPARATOR: &[u8] = b"scp:svc:";
 pub(crate) const NODE_LIST_ROUTING_SEPARATOR: &[u8] = b"scp:nls:";
 
 /// Prefixes a node key in its `NodeId` (§9.7.4.2 definitions; §9.18.2). Its
-/// one public path is `NodeIdDerive::derive`.
+/// one public path is `derive_node_id`.
 pub(crate) const NODE_ID_SEPARATOR: &[u8] = b"SCP-NODE-ID-V1:";
