@@ -7652,9 +7652,8 @@ def check_push_writer_mutants(doc: dict) -> None:
         f"{gaps}",
     )
 
-    # rust-test-optional-features writes one rust-cache entry per `group` value
-    # through its key, and rust-clippy one entry per `leg` value through a writing
-    # step gated on that leg. A push matrix dropping a value leaves its entry
+    # rust-test-optional-features and rust-clippy each write one rust-cache entry
+    # per push value of their axis through a writing step gated on that value. A push matrix dropping a value leaves its entry
     # unwritten; a push matrix keeping every value leaves nothing to report.
     # A job whose `runs-on` reads an `os` axis writes one rust-cache entry per `os`
     # value, because rust-cache keys by platform. No job in ci.yml has such an axis
@@ -7674,7 +7673,7 @@ def check_push_writer_mutants(doc: dict) -> None:
             "rust-test-optional-features",
             "group",
             "node-relay",
-            "one entry per value of matrix `group`, and a push never runs ['node-relay']",
+            "only from matrix leg `group == node-relay`",
         ),
         (
             "rust-test",

@@ -153,8 +153,8 @@ env:
 #   transport-optional-platform-testing
 #                     `target/debug` again, but under feature resolutions no
 #                     other job produces — rust-test-optional-features, one group
-#                     per value of its matrix `group` axis, named by
-#                     `shared-key: transport-optional-${{ matrix.group }}`. Its
+#                     per push value of its matrix `group` axis, each named by a
+#                     literal `shared-key: transport-optional-<group>`. Its
 #                     `-p scp-transport`, `-p scp-testing`, `-p scp-node`,
 #                     `-p scp-relay` and `-p scp-platform` selections resolve
 #                     features over one package's subgraph, not the workspace.
@@ -2070,10 +2070,23 @@ jobs:
         with:
           python-version: "3.12"
       - uses: ./.github/actions/rust-toolchain
+      # One rust-cache step per entry, each key literal: the matrix list is a
+      # `fromJSON` expression, so scripts/check-workflow-compile-steps.py could
+      # not expand a `${{ matrix.group }}` key into the entries it writes.
       - uses: Swatinem/rust-cache@v2
-        if: matrix.group == 'node-relay' || matrix.group == 'platform-testing' || matrix.group == 'sqlite-without-memory-management'
+        if: matrix.group == 'node-relay'
         with:
-          shared-key: transport-optional-${{ matrix.group }}
+          shared-key: transport-optional-node-relay
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: Swatinem/rust-cache@v2
+        if: matrix.group == 'platform-testing'
+        with:
+          shared-key: transport-optional-platform-testing
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: Swatinem/rust-cache@v2
+        if: matrix.group == 'sqlite-without-memory-management'
+        with:
+          shared-key: transport-optional-sqlite-without-memory-management
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # Only the push leg `transport` writes this entry; the four pull-request
       # transport legs restore it.

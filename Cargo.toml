@@ -349,21 +349,6 @@ await_holding_lock = "deny"
 [profile.dev]
 debug = "line-tables-only"
 
-# ── Passphrase KDF at full optimization in dev and test builds ─────────────
-# scp-platform derives its file-custody key with Argon2id (persistence spec
-# §17.6) at the production cost parameters. At opt-level 0 one derivation runs
-# for seconds, so its passphrase tests ran 34 to 47 s each in CI (2026-11-01)
-# and three of them took 121 s together on an M-series Mac. Optimizing the two
-# crates that do the hashing, `argon2` and its `blake2` core, changes only the
-# code generation of a third-party KDF: the source, the parameters and every
-# workspace member's `debug-assertions` and `overflow-checks` stay as `dev` sets
-# them, and `test` inherits `dev`.
-[profile.dev.package.argon2]
-opt-level = 3
-
-[profile.dev.package.blake2]
-opt-level = 3
-
 # ── Release profile ─────────────────────────────────────────────────────────
 # `debug-assertions = false` is the cargo release default; this line changes no
 # behavior and keeps the setting explicit. The shipped browser wasm is a
