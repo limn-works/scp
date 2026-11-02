@@ -2265,34 +2265,36 @@ pub struct RecoveryCompletion {
     pub removal: RemovalOutcome,
 }
 
-impl<S: EncryptedStorage> Identity<S> {
-    /// The ceremony's four entry points over this identity's own persistence,
-    /// custody and backend slots.
-    pub fn recovery(&self) -> Recovery<S>;
+impl IdentityHandle {
+    /// The ceremony's four entry points for this identity.
+    pub fn recovery(&self) -> Recovery<'_>;
 }
 
-/// Built by `Identity::recovery` and by nothing else, so the slots it reads
-/// are the identity's own.
-pub struct Recovery<S> {
-    persistence: S,
-    custody: KeyCustodySlot,
-    backend: IdentityBackendSlot,
-}
+/// Built by `IdentityHandle::recovery` and by nothing else, so the identity
+/// it acts on is the handle's own. It holds no store, no custody and no
+/// backend: each entry point calls the `dispatch_identity_recovery_*` method
+/// `03-identity.md` §3.10.10 names, and the identity's actor reaches the
+/// instance store, the custody and the instance's one `NodeNetwork`.
+pub struct Recovery<'a> { handle: &'a IdentityHandle }
 
-impl<S: EncryptedStorage> Recovery<S> {
+impl Recovery<'_> {
     /// Asynchronous, because its first step runs a self-observation pass.
+    /// Calls `dispatch_identity_recovery_begin`.
     pub fn begin(&self, kind: RecoveryKind, signers: SignerPlan)
-        -> impl Future<Output = Result<EventOutcome, IdentityError>> + Send;
+        -> impl Future<Output = Result<EventOutcome, ContextError>> + Send;
 
-    pub fn load_pending_recovery(&self, identifier: &Identifier)
-        -> Result<Option<RecoveryHandle>, IdentityError>;
+    /// Calls `dispatch_identity_recovery_load_pending`.
+    pub fn load_pending_recovery(&self)
+        -> impl Future<Output = Result<Option<RecoveryHandle>, ContextError>> + Send;
 
-    /// Asynchronous, because it drives a publish cycle.
+    /// Asynchronous, because it drives a publish cycle. Calls
+    /// `dispatch_identity_recovery_resume`.
     pub fn resume_recovery(&self, handle: RecoveryHandle)
-        -> impl Future<Output = Result<RecoveryCompletion, IdentityError>> + Send;
+        -> impl Future<Output = Result<RecoveryCompletion, ContextError>> + Send;
 
-    pub fn abort_recovery(&self, identifier: &Identifier, composing_device: ComposingDevice)
-        -> Result<RemovalOutcome, IdentityError>;
+    /// Calls `dispatch_identity_recovery_abort`.
+    pub fn abort_recovery(&self, composing_device: ComposingDevice)
+        -> impl Future<Output = Result<RemovalOutcome, ContextError>> + Send;
 }
 ```
 
@@ -3760,7 +3762,11 @@ This section consolidates all HKDF labels, HPKE info prefixes, HMAC domain strin
 | Label | Type | Used For | Spec Reference |
 |-------|------|----------|----------------|
 | `"scp-private-state-salt-v1"` | HKDF salt domain | Private state routing ID derivation — actual salt is `SHA-256("scp-private-state-salt-v1")` | §3.7 |
-| `"scp-private-state-v1"` | HKDF info prefix | Private state routing ID derivation — full info is `"scp-private-state-v1" \|\| did_string` | §3.7 |
+| `"scp-private-state-v1"` | HKDF info prefix | Per-node private state routing ID derivation — full info is `"scp-private-state-v1" \|\| identifier_bytes \|\| node_id`, where `node_id` is the target's 32-byte derivation id | §3.7 |
+| `"scp-private-state-enc-salt-v1"` | HKDF salt domain | Private state encryption key `enc_key` — actual salt is `SHA-256("scp-private-state-enc-salt-v1")` | §3.7 |
+| `"scp-private-state-enc-v1"` | HKDF info prefix | Private state encryption key `enc_key` — full info is `"scp-private-state-enc-v1" \|\| identifier_bytes`, with no node id | §3.7 |
+| `"scp-private-state-write-salt-v1"` | HKDF salt domain | Per-node private state write key `write_key` — actual salt is `SHA-256("scp-private-state-write-salt-v1")` | §3.7 |
+| `"scp-private-state-write-v1"` | HKDF info prefix | Per-node private state write key `write_key` — full info is `"scp-private-state-write-v1" \|\| identifier_bytes \|\| node_id` | §3.7 |
 | `"SCP-PARTICIPATION-SIGNER-V1"` | HKDF salt domain | Participation signing key derivation — actual salt is `SHA-256("SCP-PARTICIPATION-SIGNER-V1")`; `prk = HKDF-Extract(salt, participation_signing_seed)` | §7.3.2.1 |
 | `"scp-participation-signer:"` | HKDF info prefix | Participation signing key derivation — full info is `"scp-participation-signer:" \|\| context_id` (UTF-8, no length prefix); `okm = HKDF-Expand(prk, info, 48)`, then `d = (int(okm) mod (n - 1)) + 1` | §7.3.2.1 |
 | `"scp-pseudonym-secret-v1"` | HKDF salt (the label bytes themselves, not their hash) | `pseudonym_secret` derivation — `HKDF-SHA256(ikm = p256_private_scalar, salt = "scp-pseudonym-secret-v1", info = "", len = 32)`; native software custody passes the Ed25519 identity seed as `ikm` until the identity key moves to P-256 (§9.10.4.A interim) | §9.10.4.A |
