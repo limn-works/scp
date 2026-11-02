@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use scp_did::{
-    ABSENT_BRIDGE_TARGET, BridgeTarget, DID, RelayEndpoint, RelayService, RelayUrlError,
+    ABSENT_BRIDGE_TARGET, BridgeTarget, DID, NodeUrl, RelayService, RelayUrlError,
     canonical_relay_url,
 };
 
@@ -497,10 +497,10 @@ pub fn push_registration_routing_id(relay_url: &str) -> Result<[u8; 32], PushMes
     Ok(routing_id_of_canonical(&canonical_relay_url(relay_url)?))
 }
 
-/// [`push_registration_routing_id`] for a [`RelayEndpoint`], which already
+/// [`push_registration_routing_id`] for a [`NodeUrl`], which already
 /// holds the §9.18.2 canonical form, so the derivation cannot fail.
 #[must_use]
-pub fn relay_endpoint_push_routing_id(endpoint: &RelayEndpoint) -> [u8; 32] {
+pub fn relay_endpoint_push_routing_id(endpoint: &NodeUrl) -> [u8; 32] {
     routing_id_of_canonical(endpoint.as_str())
 }
 
@@ -509,11 +509,11 @@ pub fn relay_endpoint_push_routing_id(endpoint: &RelayEndpoint) -> [u8; 32] {
 /// (§9.18.2 **Tier 3 push routing ID**).
 ///
 /// `endpoint` is the entry's URL, the bridge relay's own, which a
-/// [`RelayEndpoint`] already holds in canonical form, and `target` is the
+/// [`NodeUrl`] already holds in canonical form, and `target` is the
 /// entry's `bridgeTarget`. The result never equals the bridge relay's own
 /// `"scp-push-registration"` ID ([`relay_endpoint_push_routing_id`]).
 #[must_use]
-pub fn tier3_push_routing_id(endpoint: &RelayEndpoint, target: BridgeTarget) -> [u8; 32] {
+pub fn tier3_push_routing_id(endpoint: &NodeUrl, target: BridgeTarget) -> [u8; 32] {
     tier3_routing_id_of_canonical(endpoint.as_str(), target)
 }
 
@@ -1354,7 +1354,7 @@ mod tests {
 
     #[test]
     fn relay_endpoint_push_routing_id_matches_the_string_derivation() {
-        let endpoint = RelayEndpoint::new("WSS://Relay.Example:443/scp/v1/").unwrap();
+        let endpoint = NodeUrl::new("WSS://Relay.Example:443/scp/v1/").unwrap();
         assert_eq!(
             relay_endpoint_push_routing_id(&endpoint),
             push_registration_routing_id("wss://relay.example/scp/v1").unwrap()
@@ -1379,7 +1379,7 @@ mod tests {
     }
 
     fn direct_entry(url: &str) -> RelayService {
-        RelayService::direct(RelayEndpoint::new(url).unwrap())
+        RelayService::direct(NodeUrl::new(url).unwrap())
     }
 
     /// The [`PushRelay`] of the tier 3 entry at `url` with target `t`.
@@ -1421,7 +1421,7 @@ mod tests {
         assert_eq!(preimage.len(), 79);
         let want: [u8; 32] = Sha256::digest(&preimage).into();
         assert_eq!(
-            tier3_push_routing_id(&RelayEndpoint::new(BRIDGE_URL).unwrap(), vector_target()),
+            tier3_push_routing_id(&NodeUrl::new(BRIDGE_URL).unwrap(), vector_target()),
             want
         );
     }

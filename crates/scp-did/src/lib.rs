@@ -26,7 +26,7 @@ mod custody_offer;
 pub mod document;
 mod identifier;
 mod key_state;
-mod relay_url;
+mod node_url;
 
 pub use custody_offer::{
     CustodyCoResidence, CustodyColumn, CustodyCopyHolder, CustodyDisclosure,
@@ -46,8 +46,8 @@ pub use key_state::{
     CommitmentEntry, CustodyType, DiscriminatorKind, FixedCommitment, KeyAlgorithm, KeyCondition,
     KeyEntry, KeyRole, KeyState, StandingCommitment, UnknownDiscriminator,
 };
-pub use relay_url::{
-    BridgeEndpoint, RelayEndpoint, RelayEntryUrlError, RelayUrlError, canonical_relay_url,
+pub use node_url::{
+    BridgeEndpoint, NodeUrl, RelayEntryUrlError, RelayUrlError, canonical_relay_url,
 };
 
 use serde::{Deserialize, Serialize};

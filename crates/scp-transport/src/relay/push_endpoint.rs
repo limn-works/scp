@@ -1492,8 +1492,8 @@ mod tests {
 
     fn relay_url(
         url: &str,
-    ) -> Result<crate::relay::push_gate::RelayUrl, Box<dyn std::error::Error>> {
-        Ok(crate::relay::push_gate::RelayUrl::new(url)?)
+    ) -> Result<crate::relay::push_gate::ReservedPushUrl, Box<dyn std::error::Error>> {
+        Ok(crate::relay::push_gate::ReservedPushUrl::new(url)?)
     }
 
     /// Lets the refresh task run until `done` holds, moving the paused clock

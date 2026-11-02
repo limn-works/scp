@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use scp_transport::native::server::{RelayConfig, RelayServer};
 use scp_transport::native::storage::BlobStorageBackend;
-use scp_transport::relay::push_gate::{LiveRelayUrl, RelayUrl};
+use scp_transport::relay::push_gate::{LiveRelayUrl, ReservedPushUrl};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -46,7 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `ws://127.0.0.1:9000/scp/v1` for a local relay.
     let relay_url_text = std::env::var("SCP_RELAY_URL")
         .map_err(|e| format!("SCP_RELAY_URL must be set to the relay's public URL: {e}"))?;
-    let relay_url = LiveRelayUrl::new(RelayUrl::new(&relay_url_text)?);
+    let relay_url = LiveRelayUrl::new(ReservedPushUrl::new(&relay_url_text)?);
 
     let config = RelayConfig {
         bind_addr,

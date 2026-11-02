@@ -14,11 +14,11 @@
 //! ```rust,no_run
 //! use scp_transport::native::server::{Relay, RelayConfig};
 //! use scp_transport::native::storage::BlobStorageBackend;
-//! use scp_transport::relay::push_gate::{LiveRelayUrl, RelayUrl};
+//! use scp_transport::relay::push_gate::{LiveRelayUrl, ReservedPushUrl};
 //!
 //! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 //! // The relay's public URL fixes its reserved push routing ID (§10.7.1).
-//! let relay_url = LiveRelayUrl::new(RelayUrl::new("wss://relay.example/scp/v1")?);
+//! let relay_url = LiveRelayUrl::new(ReservedPushUrl::new("wss://relay.example/scp/v1")?);
 //! let (shutdown, addr) =
 //!     Relay::start(RelayConfig::defaults(relay_url), BlobStorageBackend::in_memory()).await?;
 //! // ... serve; later:
@@ -136,13 +136,13 @@ pub enum DidRecordValidation {
 ///
 /// ```
 /// use scp_transport::native::server::RelayConfig;
-/// use scp_transport::relay::push_gate::{LiveRelayUrl, RelayUrl, ReservedRelayUrls};
+/// use scp_transport::relay::push_gate::{LiveRelayUrl, ReservedPushUrl, ReservedRelayUrls};
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-/// let url = LiveRelayUrl::new(RelayUrl::new("wss://relay.example")?);
+/// let url = LiveRelayUrl::new(ReservedPushUrl::new("wss://relay.example")?);
 /// let config = RelayConfig { delivery_jitter_ms: 0, ..RelayConfig::defaults(url) };
 /// assert_eq!(
 ///     config.relay_url.current(),
-///     ReservedRelayUrls::from(RelayUrl::new("wss://relay.example")?)
+///     ReservedRelayUrls::from(ReservedPushUrl::new("wss://relay.example")?)
 /// );
 /// # Ok(())
 /// # }
@@ -1949,7 +1949,7 @@ mod tests {
 
     use super::*;
     use crate::native::storage::BlobStorageBackend;
-    use crate::relay::push_gate::RelayUrl;
+    use crate::relay::push_gate::ReservedPushUrl;
     use futures::{SinkExt, StreamExt};
     use sha2::{Digest, Sha256};
     use tokio_tungstenite::connect_async;
@@ -4197,7 +4197,9 @@ mod tests {
 
     /// The reserved push routing ID of [`PUSH_RELAY_URL`].
     fn push_rid() -> [u8; 32] {
-        RelayUrl::new(PUSH_RELAY_URL).unwrap().push_routing_id()
+        ReservedPushUrl::new(PUSH_RELAY_URL)
+            .unwrap()
+            .push_routing_id()
     }
 
     /// Starts a relay with `push` and the relay URL [`PUSH_RELAY_URL`].
@@ -4206,7 +4208,9 @@ mod tests {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             delivery_jitter_ms: 0,
             push,
-            ..RelayConfig::defaults(LiveRelayUrl::new(RelayUrl::new(PUSH_RELAY_URL).unwrap()))
+            ..RelayConfig::defaults(LiveRelayUrl::new(
+                ReservedPushUrl::new(PUSH_RELAY_URL).unwrap(),
+            ))
         };
         let server = RelayServer::new(config, Arc::new(BlobStorageBackend::in_memory()));
         let (_handle, addr) = server.start().await.unwrap();
@@ -4321,8 +4325,8 @@ mod tests {
     /// reserved routing ID, and the previous one stays intercepted.
     #[tokio::test]
     async fn websocket_listener_reads_the_shared_relay_url() {
-        let old = RelayUrl::new("ws://198.51.100.7:32891/scp/v1").unwrap();
-        let new = RelayUrl::new("ws://203.0.113.42:8443/scp/v1").unwrap();
+        let old = ReservedPushUrl::new("ws://198.51.100.7:32891/scp/v1").unwrap();
+        let new = ReservedPushUrl::new("ws://203.0.113.42:8443/scp/v1").unwrap();
         let live = LiveRelayUrl::new(old.clone());
         let config = RelayConfig {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -4397,7 +4401,7 @@ mod tests {
     #[tokio::test]
     async fn websocket_listener_reads_no_blob_at_a_current_or_released_reserved_id() {
         let fixture = push_gate::tier3_fixture().unwrap();
-        let direct = RelayUrl::new(PUSH_RELAY_URL).unwrap();
+        let direct = ReservedPushUrl::new(PUSH_RELAY_URL).unwrap();
         let live = LiveRelayUrl::new(direct.clone());
         let config = RelayConfig {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -4634,7 +4638,9 @@ mod tests {
             let config = RelayConfig {
                 bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
                 push: push.clone(),
-                ..RelayConfig::defaults(LiveRelayUrl::new(RelayUrl::new(PUSH_RELAY_URL).unwrap()))
+                ..RelayConfig::defaults(LiveRelayUrl::new(
+                    ReservedPushUrl::new(PUSH_RELAY_URL).unwrap(),
+                ))
             };
             let server = RelayServer::new(config, Arc::new(BlobStorageBackend::in_memory()));
             let (handle, _addr) = server.start().await.unwrap();
@@ -4686,7 +4692,7 @@ mod tests {
                 })
                 .unwrap(),
             );
-            let live = LiveRelayUrl::new(RelayUrl::new(PUSH_RELAY_URL).unwrap());
+            let live = LiveRelayUrl::new(ReservedPushUrl::new(PUSH_RELAY_URL).unwrap());
             let storage = Arc::new(BlobStorageBackend::in_memory());
             let config = RelayConfig {
                 bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),

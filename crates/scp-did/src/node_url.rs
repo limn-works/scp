@@ -6,8 +6,9 @@
 //! (§10.7.1) end in this form, and `18-addressability-and-deployment.md`
 //! §18.2.1 requires every `SCPRelay` entry's `serviceEndpoint` to have it, so
 //! the function lives beside the DID document that carries those entries.
-//! [`RelayEndpoint`] and [`BridgeEndpoint`] hold a URL that passed §18.2.1's
-//! URL rules, so a relay entry built from one cannot fail them.
+//! [`NodeUrl`], the node URL of `03-identity.md` §3.10.10, and
+//! [`BridgeEndpoint`] hold a URL that passed §18.2.1's URL rules, so an entry
+//! built from one cannot fail them.
 
 use crate::document::DidError;
 
@@ -60,17 +61,17 @@ pub enum RelayEntryUrlError {
 /// The path every `SCPRelay` URL's canonical form ends in (§18.2.1, ADR-004).
 pub const SCP_RELAY_PATH: &str = "/scp/v1";
 
-/// A relay URL an `SCPRelay` entry may carry: it has a §9.18.2 canonical form,
-/// and that form's path ends in `/scp/v1` (§18.2.1).
+/// A node's canonical URL (`03-identity.md` §3.10.10 `NodeUrl`): it has a
+/// §9.18.2 canonical form, and that form's path ends in `/scp/v1` (§18.2.1).
 ///
-/// [`RelayEndpoint::new`] is the only constructor, and the value holds the
-/// canonical form, so every spelling of one relay yields one endpoint.
+/// [`NodeUrl::new`] is the only constructor, and the value holds the
+/// canonical form, so every spelling of one node's URL yields one value.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct RelayEndpoint {
+pub struct NodeUrl {
     canonical: String,
 }
 
-impl RelayEndpoint {
+impl NodeUrl {
     /// Canonicalizes `url` and checks its path.
     ///
     /// # Errors
@@ -105,27 +106,27 @@ impl RelayEndpoint {
     }
 }
 
-/// A tier 3 bridge relay's URL: a [`RelayEndpoint`] whose scheme is `wss`
+/// A tier 3 bridge relay's URL: a [`NodeUrl`] whose scheme is `wss`
 /// (`10-infrastructure-and-self-hosting.md` §10.12.7).
 ///
 /// [`BridgeEndpoint::new`] is the only public constructor.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct BridgeEndpoint(RelayEndpoint);
+pub struct BridgeEndpoint(NodeUrl);
 
 impl BridgeEndpoint {
-    /// Validates `url` as a [`RelayEndpoint`] and requires `wss`.
+    /// Validates `url` as a [`NodeUrl`] and requires `wss`.
     ///
     /// # Errors
     ///
-    /// Every error of [`RelayEndpoint::new`], and
+    /// Every error of [`NodeUrl::new`], and
     /// [`DidError::InvalidRelayUrl`] with reason
     /// [`RelayEntryUrlError::PlaintextBridge`] when the scheme is `ws`.
     pub fn new(url: &str) -> Result<Self, DidError> {
-        Self::from_endpoint(RelayEndpoint::new(url)?)
+        Self::from_endpoint(NodeUrl::new(url)?)
     }
 
     /// Requires `endpoint`'s scheme to be `wss`.
-    pub(crate) fn from_endpoint(endpoint: RelayEndpoint) -> Result<Self, DidError> {
+    pub(crate) fn from_endpoint(endpoint: NodeUrl) -> Result<Self, DidError> {
         if endpoint.is_tls() {
             Ok(Self(endpoint))
         } else {
@@ -138,13 +139,13 @@ impl BridgeEndpoint {
 
     /// The bridge relay's endpoint.
     #[must_use]
-    pub const fn endpoint(&self) -> &RelayEndpoint {
+    pub const fn endpoint(&self) -> &NodeUrl {
         &self.0
     }
 
     /// Consumes the value and returns the bridge relay's endpoint.
     #[must_use]
-    pub fn into_endpoint(self) -> RelayEndpoint {
+    pub fn into_endpoint(self) -> NodeUrl {
         self.0
     }
 
@@ -281,6 +282,21 @@ fn split_host_port(authority: &str) -> Result<(&str, Option<&str>), RelayUrlErro
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// `18-addressability-and-deployment.md` §18.2.1: a node URL's canonical
+    /// path ends in `/scp/v1`, and construction refuses any other path.
+    #[test]
+    fn node_url_new_accepts_scp_v1_and_refuses_another_path() {
+        let url = NodeUrl::new("WSS://Node.Example:443/scp/v1/").unwrap();
+        assert_eq!(url.as_str(), "wss://node.example/scp/v1");
+        assert_eq!(
+            NodeUrl::new("wss://node.example/scp/v2"),
+            Err(DidError::InvalidRelayUrl {
+                url: "wss://node.example/scp/v2".to_owned(),
+                reason: RelayEntryUrlError::PathNotScpV1,
+            })
+        );
+    }
 
     #[test]
     fn canonical_relay_url_applies_section_9_18_2() {

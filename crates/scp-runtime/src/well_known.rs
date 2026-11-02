@@ -20,7 +20,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use scp_did::RelayEndpoint;
+use scp_did::NodeUrl;
 use scp_identity::DidMethod;
 use scp_protocol::economy::types::{Amount, CurrencyCode, PaymentAdapterRef};
 
@@ -309,7 +309,7 @@ impl WellKnownScp {
         // entry. Two spellings of one relay share a canonical form, so the
         // claimed URL is canonicalized before the comparison.
         let claimed =
-            RelayEndpoint::new(&self.relay).map_err(WellKnownValidationError::InvalidRelayUrl)?;
+            NodeUrl::new(&self.relay).map_err(WellKnownValidationError::InvalidRelayUrl)?;
         if !relay_urls.iter().any(|url| url == claimed.as_str()) {
             return Err(WellKnownValidationError::RelayMismatch {
                 relay_url: self.relay.clone(),

@@ -34,7 +34,7 @@ use scp_transport::native::adapter::NativeRelayAdapter;
 use scp_transport::native::server::{RelayConfig, RelayServer};
 use scp_transport::native::storage::BlobStorageBackend;
 use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
-use scp_transport::relay::push_gate::{LiveRelayUrl, RelayUrl};
+use scp_transport::relay::push_gate::{LiveRelayUrl, ReservedPushUrl};
 
 /// How long the client may take to observe the dead socket before the test
 /// fails. Loopback teardown is observed in milliseconds; the bound only stops
@@ -68,7 +68,7 @@ impl DedicatedRelay {
                     .expect("relay listener address")
                     .port();
                 let relay_url = LiveRelayUrl::new(
-                    RelayUrl::new(&format!("ws://127.0.0.1:{port}/scp/v1"))
+                    ReservedPushUrl::new(&format!("ws://127.0.0.1:{port}/scp/v1"))
                         .expect("canonical relay URL"),
                 );
                 let config = RelayConfig {

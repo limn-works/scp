@@ -28,7 +28,7 @@ use crate::native::server::{RelayConfig, RelayError};
 use crate::native::storage::{BlobStorageBackend, StorageError};
 
 use crate::relay::push_gate::{
-    LiveRelayUrl, PushProviders, PushRole, PushRoleError, PushSenders, RelayUrl,
+    LiveRelayUrl, PushProviders, PushRole, PushRoleError, PushSenders, ReservedPushUrl,
 };
 use crate::relay::push_store::{PushRegistrationStore, PushStoreAtRest, PushStoreError};
 use crate::shutdown::ShutdownSignalError;
@@ -231,19 +231,22 @@ pub fn relay_config_from_env() -> Result<RelayConfig, StartupError> {
 /// The variable that holds the relay's public URL.
 const RELAY_URL_VAR: &str = "SCP_RELAY_URL";
 
-/// Parses `raw`, the value of variable `name`, as a [`RelayUrl`].
+/// Parses `raw`, the value of variable `name`, as a [`ReservedPushUrl`].
 ///
 /// # Errors
 ///
 /// - [`StartupError::RequiredVarUnset`] when `raw` is unset or blank.
 /// - [`StartupError::InvalidValue`] when `raw` is not UTF-8 or has no
 ///   §9.18.2 canonical form.
-fn parse_relay_url(name: &'static str, raw: Option<OsString>) -> Result<RelayUrl, StartupError> {
+fn parse_relay_url(
+    name: &'static str,
+    raw: Option<OsString>,
+) -> Result<ReservedPushUrl, StartupError> {
     let raw = match raw {
         Some(raw) if !raw.to_string_lossy().trim().is_empty() => raw,
         _ => return Err(StartupError::RequiredVarUnset { var: name }),
     };
-    RelayUrl::new(&utf8(name, raw)?).map_err(|e| StartupError::InvalidValue {
+    ReservedPushUrl::new(&utf8(name, raw)?).map_err(|e| StartupError::InvalidValue {
         var: name,
         reason: e.to_string(),
     })
@@ -1858,7 +1861,7 @@ mod tests {
         log_format_is_json, parse_or, parse_relay_url, rejection_message, relay_subscriber,
         valid_backends,
     };
-    use crate::relay::push_gate::RelayUrl;
+    use crate::relay::push_gate::ReservedPushUrl;
 
     /// `SCP_RELAY_URL` set to a relay URL yields that URL's reserved push
     /// routing ID; unset or blank is `RequiredVarUnset`; a value with no
@@ -1870,13 +1873,13 @@ mod tests {
             parse_relay_url("V", Some(OsString::from(url)))
                 .ok()
                 .as_ref()
-                .map(RelayUrl::push_routing_id),
-            RelayUrl::new(url)
+                .map(ReservedPushUrl::push_routing_id),
+            ReservedPushUrl::new(url)
                 .ok()
                 .as_ref()
-                .map(RelayUrl::push_routing_id),
+                .map(ReservedPushUrl::push_routing_id),
         );
-        assert!(RelayUrl::new(url).is_ok());
+        assert!(ReservedPushUrl::new(url).is_ok());
         for unset in [None, Some(""), Some("  ")] {
             assert!(
                 matches!(
@@ -3004,7 +3007,7 @@ mod push_tests {
 
         use crate::native::server::{RelayConfig, RelayServer};
         use crate::native::storage::BlobStorageBackend;
-        use crate::relay::push_gate::{LiveRelayUrl, RelayUrl};
+        use crate::relay::push_gate::{LiveRelayUrl, ReservedPushUrl};
         use crate::relay::push_store::{
             PushRegistrationKey, PushRegistrationRecord, PushRegistrationStore, PushStoreAtRest,
         };
@@ -3035,7 +3038,7 @@ mod push_tests {
         assert_eq!(platforms, vec![PushPlatform::Apns, PushPlatform::Fcm]);
         let relays_store = service.store.clone();
 
-        let relay_url = RelayUrl::new("wss://relay.example/scp/v1").unwrap();
+        let relay_url = ReservedPushUrl::new("wss://relay.example/scp/v1").unwrap();
         let config = RelayConfig {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             push: role,

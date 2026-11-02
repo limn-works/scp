@@ -959,7 +959,7 @@ mod tests {
     /// A relay URL handle whose reserved push routing ID no test routing ID
     /// equals, so `gate_query` reaches storage.
     fn unreserved() -> LiveRelayUrl {
-        let url = crate::relay::push_gate::RelayUrl::new("wss://did-slot-test.example.com")
+        let url = crate::relay::push_gate::ReservedPushUrl::new("wss://did-slot-test.example.com")
             .expect("canonical test URL");
         LiveRelayUrl::new(url)
     }
@@ -970,9 +970,9 @@ mod tests {
     async fn gate_query_returns_nothing_at_a_current_or_released_reserved_id() {
         let storage = BlobStorageBackend::in_memory();
         let reg = DidSlotRegistry::new();
-        let reserved = crate::relay::push_gate::RelayUrl::new("wss://reserved.example.com")
+        let reserved = crate::relay::push_gate::ReservedPushUrl::new("wss://reserved.example.com")
             .expect("canonical test URL");
-        let other = crate::relay::push_gate::RelayUrl::new("wss://other.example.com")
+        let other = crate::relay::push_gate::ReservedPushUrl::new("wss://other.example.com")
             .expect("canonical test URL");
         let rid = reserved.push_routing_id();
         store_opaque(&storage, rid, b"stored-before-reservation").await;
