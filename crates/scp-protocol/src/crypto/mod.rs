@@ -4,6 +4,7 @@
 //! remain in scp-runtime.
 
 pub mod access_keys;
+pub mod anchored_key;
 pub mod canonical;
 pub mod envelope_seal;
 pub mod hpke;

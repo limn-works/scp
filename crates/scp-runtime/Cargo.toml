@@ -105,6 +105,10 @@ futures = { workspace = true }
 [dev-dependencies]
 # The shared valid-P-256-point test fixture (`scp_crypto::p256::testing`).
 scp-crypto = { path = "../scp-crypto", features = ["testing"] }
+# The §25 vector tests read Vector 41's log through `validate_entry`, the
+# validated chain the node binding, node-list record and context operator
+# binding verifiers take (09-security-model.md §9.7.1 log-anchored class).
+scp-kel = { path = "../scp-kel", version = "=0.1.0-beta.2" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 # The discovery test modules construct `InMemoryDhtClient` (now gated behind
 # `scp-dht/testing`); activate it for this crate's own test build (ADR-062

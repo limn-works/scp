@@ -66,8 +66,8 @@ pub use node_address::{
 pub use operator_binding::{
     CONTEXT_CHAIN_SEPARATOR, CONTEXT_OPERATOR_SEPARATOR, CONTEXT_RECEIPT_SEPARATOR,
     ContextChainEntry, ContextOperatorBinding, ContextOperatorError, ContextReceipt,
-    FIRST_PREVIOUS_HASH, VerifiedContextChainEntry, VerifiedContextOperatorBinding,
-    VerifiedContextReceipt, submission_hash,
+    FIRST_POSITION, FIRST_PREVIOUS_HASH, HeldBindingHash, VerifiedContextChainEntry,
+    VerifiedContextOperatorBinding, VerifiedContextReceipt, submission_hash,
 };
 pub use params::{
     Capability, CeilingPolicy, ContextMode, ContextParams, FieldVisibility, GovernanceModel,

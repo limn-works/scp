@@ -192,15 +192,15 @@ mod tests {
     use scp_crypto::p256::{P256SecretKey, sign_prehash_rfc6979};
     use scp_kel::derive_node_id;
 
-    use super::super::binding::tests::{TestResult, key, signed_binding, url};
+    use super::super::binding::tests::{TestResult, key, operator, signed_binding, url};
     use super::*;
 
-    /// The verified binding of `node` under operator key 9.
+    /// The verified binding of `node` under the test operator.
     fn bound(node: &P256SecretKey) -> TestResult<VerifiedNodeBinding> {
-        let operator = key(9);
+        let operator = operator()?;
         Ok(VerifiedNodeBinding::verify(
-            signed_binding(&operator, node, &url()?)?,
-            &operator.public_key(),
+            signed_binding(&operator, &key(1), node, &url()?)?,
+            &operator.chain()?,
         )?)
     }
 

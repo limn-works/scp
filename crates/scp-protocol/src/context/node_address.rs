@@ -24,6 +24,8 @@
 //! one encoding: a canonical URL, a 97-byte or sentinel body, a target other
 //! than the sentinel, a wrapping key on P-256, and `wss` beside a bridge.
 
+use std::num::NonZeroU64;
+
 use scp_crypto::p256::{P256Error, P256PublicKey, SIGNATURE_LEN, verify_prehash_strict};
 use scp_did::{BridgeEndpoint, BridgeTarget, DidError, NodeEntryUrlError, NodeId, NodeUrl};
 
@@ -296,8 +298,9 @@ impl NodeAddress {
 pub struct ContextNodeAddress {
     /// The `binding_hash` of the context's `ContextOperatorBinding`.
     pub binding_hash: [u8; 32],
-    /// 1 at instantiation, one higher on each later address.
-    pub sequence: u64,
+    /// 1 at instantiation, one higher on each later address. The type holds
+    /// no 0, so the encoder never emits a sequence the decoder refuses.
+    pub sequence: NonZeroU64,
     /// Where members reach the node.
     pub node: NodeAddress,
     /// The `context_key` signature over the preimage.
@@ -313,7 +316,7 @@ impl ContextNodeAddress {
     /// length.
     pub fn signing_digest(
         binding_hash: &[u8; 32],
-        sequence: u64,
+        sequence: NonZeroU64,
         node: &NodeAddress,
     ) -> Result<[u8; 32], NodeAddressError> {
         let node = node.to_bytes()?;
@@ -321,7 +324,7 @@ impl ContextNodeAddress {
             CONTEXT_NODE_ADDRESS_SEPARATOR,
             &[
                 CanonicalField::Fixed32(binding_hash),
-                CanonicalField::U64(sequence),
+                CanonicalField::U64(sequence.get()),
                 CanonicalField::RawBytes(&node),
             ],
         )?)
@@ -346,7 +349,7 @@ impl ContextNodeAddress {
         let node = self.node.to_bytes()?;
         let mut out = Vec::with_capacity(32 + 8 + node.len() + SIGNATURE_LEN);
         out.extend_from_slice(&self.binding_hash);
-        out.extend_from_slice(&self.sequence.to_be_bytes());
+        out.extend_from_slice(&self.sequence.get().to_be_bytes());
         out.extend_from_slice(&node);
         out.extend_from_slice(&self.signature);
         Ok(out)
@@ -362,10 +365,10 @@ impl ContextNodeAddress {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, NodeAddressError> {
         let mut reader = Reader::new(bytes);
         let binding_hash = reader.array().ok_or(NodeAddressError::Truncated)?;
-        let sequence = u64::from_be_bytes(reader.array().ok_or(NodeAddressError::Truncated)?);
-        if sequence == 0 {
-            return Err(NodeAddressError::ZeroSequence);
-        }
+        let sequence = NonZeroU64::new(u64::from_be_bytes(
+            reader.array().ok_or(NodeAddressError::Truncated)?,
+        ))
+        .ok_or(NodeAddressError::ZeroSequence)?;
         let node = NodeAddress::read(&mut reader)?;
         let signature = reader.array().ok_or(NodeAddressError::Truncated)?;
         match reader.remaining() {
@@ -380,10 +383,11 @@ impl ContextNodeAddress {
     }
 }
 
-/// A [`ContextNodeAddress`] whose signature verified under the `context_key`
-/// of the binding it names.
+/// A [`ContextNodeAddress`] the reader adopted: its signature verified under
+/// the `context_key` of the binding it names, and its sequence is above the
+/// one the reader held.
 ///
-/// [`Self::verify`] is the only constructor, and the type has no
+/// [`Self::adopt`] is the only constructor, and the type has no
 /// `Deserialize`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedContextNodeAddress {
@@ -391,26 +395,49 @@ pub struct VerifiedContextNodeAddress {
 }
 
 impl VerifiedContextNodeAddress {
-    /// The §9.5.2 verification: `sequence` is at least 1, `binding_hash` is
-    /// the binding's, and the signature verifies strictly (low-`s`, no second
-    /// hash) under the binding's `context_key`.
+    /// The §9.5.2 verification and sequence rule in one step.
     ///
     /// `binding` is the binding the reader accepted against the
     /// `binding_hash` its group state or its invitation holds, so an address
-    /// that names any other binding is refused.
+    /// that names any other binding is refused. `held` is the address the
+    /// reader holds for that binding, or `None` before its first; the reader
+    /// adopts `address` only when its sequence is above `held`'s (§9.5.2 "The
+    /// highest sequence wins"). Keeping `held` across restarts is the
+    /// caller's.
     ///
     /// # Errors
     ///
-    /// [`NodeAddressError::ZeroSequence`],
-    /// [`NodeAddressError::BindingMismatch`],
-    /// [`NodeAddressError::Encoding`] or [`NodeAddressError::Signature`].
-    pub fn verify(
+    /// [`NodeAddressError::BindingMismatch`] when `address` or `held` names
+    /// another binding than `binding`, [`NodeAddressError::Encoding`],
+    /// [`NodeAddressError::Signature`] (including a high-`s` signature) or
+    /// [`NodeAddressError::NotNewer`].
+    pub fn adopt(
+        address: ContextNodeAddress,
+        binding: &VerifiedContextOperatorBinding,
+        held: Option<&Self>,
+    ) -> Result<Self, NodeAddressError> {
+        let offered = Self::verify(address, binding)?;
+        let Some(held) = held else {
+            return Ok(offered);
+        };
+        if held.address.binding_hash != *binding.binding_hash() {
+            return Err(NodeAddressError::BindingMismatch);
+        }
+        if offered.address.sequence <= held.address.sequence {
+            return Err(NodeAddressError::NotNewer {
+                held: held.address.sequence.get(),
+                offered: offered.address.sequence.get(),
+            });
+        }
+        Ok(offered)
+    }
+
+    /// `binding_hash` is the binding's, and the signature verifies strictly
+    /// (low-`s`, no second hash) under the binding's `context_key`.
+    fn verify(
         address: ContextNodeAddress,
         binding: &VerifiedContextOperatorBinding,
     ) -> Result<Self, NodeAddressError> {
-        if address.sequence == 0 {
-            return Err(NodeAddressError::ZeroSequence);
-        }
         if address.binding_hash != *binding.binding_hash() {
             return Err(NodeAddressError::BindingMismatch);
         }
@@ -421,27 +448,6 @@ impl VerifiedContextNodeAddress {
         )
         .map_err(NodeAddressError::Signature)?;
         Ok(Self { address })
-    }
-
-    /// The §9.5.2 sequence rule: a reader that holds `held` adopts `self`
-    /// only when `self`'s sequence is higher, and refuses an address of the
-    /// held sequence or below.
-    ///
-    /// # Errors
-    ///
-    /// [`NodeAddressError::BindingMismatch`] when the two name different
-    /// bindings, or [`NodeAddressError::NotNewer`].
-    pub fn supersede(self, held: &Self) -> Result<Self, NodeAddressError> {
-        if self.address.binding_hash != held.address.binding_hash {
-            return Err(NodeAddressError::BindingMismatch);
-        }
-        if self.address.sequence <= held.address.sequence {
-            return Err(NodeAddressError::NotNewer {
-                held: held.address.sequence,
-                offered: self.address.sequence,
-            });
-        }
-        Ok(self)
     }
 
     /// The address this value verified.
@@ -458,7 +464,7 @@ impl VerifiedContextNodeAddress {
 
     /// The address's sequence.
     #[must_use]
-    pub const fn sequence(&self) -> u64 {
+    pub const fn sequence(&self) -> NonZeroU64 {
         self.address.sequence
     }
 }
@@ -468,7 +474,9 @@ mod tests {
     use scp_crypto::p256::sign_prehash_rfc6979;
     use sha2::{Digest, Sha256};
 
-    use super::super::operator_binding::tests::{TestResult, key, verified_binding};
+    use super::super::operator_binding::tests::{
+        TestResult, binding_by, held as held_hash, incept, key, verified_binding,
+    };
     use super::*;
 
     fn direct() -> TestResult<NodeAddress> {
@@ -494,6 +502,7 @@ mod tests {
         node: NodeAddress,
         context_key_seed: u8,
     ) -> TestResult<ContextNodeAddress> {
+        let sequence = NonZeroU64::new(sequence).ok_or("sequence 0")?;
         let digest = ContextNodeAddress::signing_digest(binding.binding_hash(), sequence, &node)?;
         Ok(ContextNodeAddress {
             binding_hash: *binding.binding_hash(),
@@ -501,6 +510,14 @@ mod tests {
             node,
             signature: sign_prehash_rfc6979(&key(context_key_seed), &digest)?,
         })
+    }
+
+    /// The verdict on a first address, with no held one.
+    fn first(
+        address: ContextNodeAddress,
+        binding: &VerifiedContextOperatorBinding,
+    ) -> Result<VerifiedContextNodeAddress, NodeAddressError> {
+        VerifiedContextNodeAddress::adopt(address, binding, None)
     }
 
     #[test]
@@ -605,6 +622,24 @@ mod tests {
         Ok(())
     }
 
+    /// The signed address's own decoder refuses one byte after the
+    /// signature, and a cut inside it.
+    #[test]
+    fn a_context_node_address_refuses_a_trailing_byte() -> TestResult {
+        let bytes = signed(&verified_binding()?, 1, direct()?, 2)?.to_bytes()?;
+        let mut long = bytes.clone();
+        long.push(0);
+        assert_eq!(
+            ContextNodeAddress::from_bytes(&long),
+            Err(NodeAddressError::TrailingBytes(1))
+        );
+        assert_eq!(
+            ContextNodeAddress::from_bytes(&bytes[..bytes.len() - 1]),
+            Err(NodeAddressError::Truncated)
+        );
+        Ok(())
+    }
+
     #[test]
     fn a_signed_address_round_trips_and_verifies() -> TestResult {
         let binding = verified_binding()?;
@@ -613,7 +648,7 @@ mod tests {
             let bytes = address.to_bytes()?;
             let back = ContextNodeAddress::from_bytes(&bytes)?;
             assert_eq!(back, address);
-            let verified = VerifiedContextNodeAddress::verify(back, &binding)?;
+            let verified = first(back, &binding)?;
             assert_eq!(verified.address(), &address);
         }
         Ok(())
@@ -644,7 +679,7 @@ mod tests {
             let mut flipped = bytes.clone();
             flipped[i] ^= 1;
             let refused = ContextNodeAddress::from_bytes(&flipped)
-                .and_then(|a| VerifiedContextNodeAddress::verify(a, &binding))
+                .and_then(|a| first(a, &binding))
                 .is_err();
             assert!(refused, "byte {i}");
         }
@@ -656,28 +691,26 @@ mod tests {
         let binding = verified_binding()?;
         let address = signed(&binding, 1, direct()?, 3)?;
         assert!(matches!(
-            VerifiedContextNodeAddress::verify(address, &binding),
+            first(address, &binding),
             Err(NodeAddressError::Signature(P256Error::VerificationFailed))
         ));
         let mut address = signed(&binding, 1, direct()?, 2)?;
         address.binding_hash[0] ^= 1;
         assert_eq!(
-            VerifiedContextNodeAddress::verify(address, &binding),
+            first(address, &binding),
             Err(NodeAddressError::BindingMismatch)
         );
         Ok(())
     }
 
+    /// The wire value 0 is refused at decode; the type cannot hold it, so no
+    /// value reaches verification with it.
     #[test]
-    fn sequence_zero_is_refused_at_decode_and_at_verification() -> TestResult {
-        let binding = verified_binding()?;
-        let address = signed(&binding, 0, direct()?, 2)?;
+    fn sequence_zero_is_refused_at_decode() -> TestResult {
+        let mut bytes = signed(&verified_binding()?, 1, direct()?, 2)?.to_bytes()?;
+        bytes[32..40].fill(0);
         assert_eq!(
-            ContextNodeAddress::from_bytes(&address.to_bytes()?),
-            Err(NodeAddressError::ZeroSequence)
-        );
-        assert_eq!(
-            VerifiedContextNodeAddress::verify(address, &binding),
+            ContextNodeAddress::from_bytes(&bytes),
             Err(NodeAddressError::ZeroSequence)
         );
         Ok(())
@@ -688,15 +721,10 @@ mod tests {
     #[test]
     fn the_highest_sequence_wins() -> TestResult {
         let binding = verified_binding()?;
-        let at = |sequence: u64| -> TestResult<VerifiedContextNodeAddress> {
-            Ok(VerifiedContextNodeAddress::verify(
-                signed(&binding, sequence, direct()?, 2)?,
-                &binding,
-            )?)
-        };
-        let held = at(5)?;
+        let address = |sequence: u64| signed(&binding, sequence, direct()?, 2);
+        let held = first(address(5)?, &binding)?;
         assert_eq!(
-            at(5)?.supersede(&held),
+            VerifiedContextNodeAddress::adopt(address(5)?, &binding, Some(&held)),
             Err(NodeAddressError::NotNewer {
                 held: 5,
                 offered: 5
@@ -704,15 +732,44 @@ mod tests {
         );
         for lower in 1..5 {
             assert_eq!(
-                at(lower)?.supersede(&held),
+                VerifiedContextNodeAddress::adopt(address(lower)?, &binding, Some(&held)),
                 Err(NodeAddressError::NotNewer {
                     held: 5,
                     offered: lower
                 })
             );
         }
-        let adopted = at(6)?.supersede(&held)?;
-        assert_eq!(adopted.sequence(), 6);
+        let adopted = VerifiedContextNodeAddress::adopt(address(6)?, &binding, Some(&held))?;
+        assert_eq!(adopted.sequence().get(), 6);
+        Ok(())
+    }
+
+    /// An address at sequence 6 under another binding, offered to a reader
+    /// that holds sequence 5 under the first, is refused even though it
+    /// verifies under its own binding, which shares the `context_key`.
+    #[test]
+    fn an_address_under_another_binding_never_supersedes_the_held_one() -> TestResult {
+        let binding = verified_binding()?;
+        let held = first(signed(&binding, 5, direct()?, 2)?, &binding)?;
+
+        let other_operator = incept(0x41, 1, 0x43)?;
+        let other = VerifiedContextOperatorBinding::verify(
+            binding_by(&other_operator, &key(1))?,
+            &held_hash(&other_operator)?,
+            &other_operator.chain()?,
+        )?;
+        assert_ne!(other.binding_hash(), binding.binding_hash());
+        assert_eq!(other.context_key(), binding.context_key());
+        let offered = signed(&other, 6, direct()?, 2)?;
+        assert!(first(offered.clone(), &other).is_ok());
+        assert_eq!(
+            VerifiedContextNodeAddress::adopt(offered.clone(), &other, Some(&held)),
+            Err(NodeAddressError::BindingMismatch)
+        );
+        assert_eq!(
+            VerifiedContextNodeAddress::adopt(offered, &binding, Some(&held)),
+            Err(NodeAddressError::BindingMismatch)
+        );
         Ok(())
     }
 }

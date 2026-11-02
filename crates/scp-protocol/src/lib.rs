@@ -17,6 +17,9 @@ pub mod sync;
 pub mod trust;
 pub mod uri;
 
+#[cfg(test)]
+pub(crate) mod test_kel;
+
 // Outlet surface re-exports (SCP-OUT-002, AC-5). `OutletId` is exported from
 // [`context::roles`]; the remaining types come from [`context::outlets`] and
 // its submodules. See §5.4.1, §5.4.5, and ADR-049.
