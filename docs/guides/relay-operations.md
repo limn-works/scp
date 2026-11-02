@@ -27,18 +27,17 @@ Both binaries are configured via environment variables and CLI flags. Both share
 
 ## 1. Building
 
-Both binaries are workspace members in the SCP repository. Build with:
+Both binaries are workspace members in the SCP repository. Build each in its own cargo invocation:
 
 ```bash
-# Build both binaries
-cargo build --release -p scp-relay -p scp-node
-
-# Build just the standalone relay
+# The standalone relay
 cargo build --release -p scp-relay
 
-# Build just the full node
+# The full node
 cargo build --release -p scp-node
 ```
+
+Do not build both in one invocation (`cargo build -p scp-relay -p scp-node`). Cargo unifies the features of every package one invocation selects, so that build compiles `scp-relay` with the features `scp-node` asks for, among them `scp-transport/webpush`, which a standalone relay must not carry.
 
 The resulting binaries are at:
 - `target/release/scp-relay`
@@ -582,7 +581,7 @@ The node re-evaluates its tier every 30 minutes and on network change events. Wh
 
 ### Binary upgrade
 
-1. Build the new version: `cargo build --release -p scp-relay -p scp-node`
+1. Build the new version, one binary per invocation: `cargo build --release -p scp-relay`, then `cargo build --release -p scp-node`
 2. Gracefully stop the running relay: `kill -TERM $(pidof scp-relay)`
 3. Replace the binary.
 4. Start the new version.

@@ -780,6 +780,16 @@ jobs:
           python-version: "3.12"
       - name: G1 — shipped-feature-graph ⊆ permitted-production allowlist (ZERO-nullifier mandate)
         run: bash scripts/check-shipped-feature-graph.sh
+      # G1 resolves each shipped package alone. These two steps make that the graph
+      # the shipped builds produce: every compiling cargo invocation in G1's
+      # SHIPPING_FILES (the Dockerfile job docker-image builds, build-matrix.yml,
+      # release.yml) selects at most one shipped package and resolves it exactly as
+      # cargo resolves it alone. The planted cases run first; among them the joint
+      # `-p scp-relay -p scp-node` build the Dockerfile once ran, which must fail.
+      - name: Shipped build invocations — planted cases
+        run: python3.12 scripts/check-shipped-build-invocations.py --self-test
+      - name: Shipped build invocations resolve each shipped package alone
+        run: python3.12 scripts/check-shipped-build-invocations.py
 
   # ── Vendored-OpenSSL scope ──
   # scripts/check-vendored-openssl-scope.sh: `openssl-src` reaches the PyPI

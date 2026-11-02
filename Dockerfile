@@ -104,9 +104,21 @@ ENV CARGO_NET_OFFLINE=true
 # Cook only the two binaries' dependencies. Cooking the whole workspace pulls in
 # `scp-ffi`, whose `pyo3-build-config` build script fails with "no Python 3.x
 # interpreter found" — and this image ships neither Python bindings nor a Python.
-RUN cargo chef cook --release --offline --recipe-path recipe.json -p scp-relay -p scp-node
+#
+# ONE PACKAGE PER CARGO INVOCATION, in the cooks and in the builds. Cargo unifies the
+# features of every package one invocation selects, so `-p scp-relay -p scp-node`
+# compiled scp-relay with the features scp-node asks for (among them
+# `scp-transport/webpush`, which a relay that publishes no VAPID key must not carry,
+# and `scp-platform/{encrypting,sqlite,in-memory-storage}`). Built alone, each binary
+# carries exactly what its own manifest states, the graph
+# `scripts/check-shipped-feature-graph.sh` gates. Each cook resolves the same graph
+# its build does, so the build reuses it. `scripts/check-shipped-build-invocations.py`
+# fails on a joint invocation here.
+RUN cargo chef cook --release --offline --recipe-path recipe.json -p scp-relay
+RUN cargo chef cook --release --offline --recipe-path recipe.json -p scp-node
 COPY . .
-RUN cargo build --release --offline -p scp-relay -p scp-node
+RUN cargo build --release --offline -p scp-relay
+RUN cargo build --release --offline -p scp-node
 
 # Stage 4: Runtime — minimal Debian with both binaries
 #
