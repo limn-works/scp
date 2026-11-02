@@ -8752,8 +8752,7 @@ PUSH_WRITER_SHAPE: dict[str, tuple[str, ...]] = {
     "rust-test": (),
     "rust-test-macos": (),
     "rust-test-optional-features": (
-        "transport-optional-node-relay",
-        "transport-optional-platform-testing",
+        "optional-features",
         "transport-optional-sqlite-without-memory-management",
     ),
 }
@@ -8919,8 +8918,8 @@ def check_push_writer_mutants(live: dict) -> None:
         (
             "rust-test-optional-features",
             "group",
-            "node-relay",
-            "only from matrix leg `group == node-relay`",
+            "sqlite-without-memory-management",
+            "only from matrix leg `group == sqlite-without-memory-management`",
         ),
         (
             "rust-test",
