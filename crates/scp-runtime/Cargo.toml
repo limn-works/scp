@@ -103,27 +103,19 @@ arc-swap = { workspace = true }
 futures = { workspace = true }
 
 [dev-dependencies]
-# This crate, naming itself, to turn its `testing` feature on for its own dev targets
-# and for no other build. All four examples and most integration tests here declare
-# `required-features = ["testing"]`, so without this edge `cargo test -p scp-runtime`
-# skips those tests and `cargo clippy -p scp-runtime --example identity` refuses to build,
-# which `scripts/check-examples-compile.sh` runs. A build that takes this crate as a
-# normal dependency never builds these dev-dependencies and never gets the feature,
-# and publication strips this path-only edge.
-scp-runtime = { path = ".", features = ["testing"] }
 # The shared valid-P-256-point test fixture (`scp_crypto::p256::testing`).
 scp-crypto = { path = "../scp-crypto", features = ["testing"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 # The discovery test modules construct `InMemoryDhtClient` (now gated behind
 # `scp-dht/testing`); activate it for this crate's own test build (ADR-062
 # §Decision 1). `scp-dht/testing` never appears in a non-testing feature list.
-scp-dht = { path = "../scp-dht", features = ["testing"] }
+scp-dht = { path = "../scp-dht", version = "=0.1.0-beta.2", features = ["testing"] }
 scp-mls = { path = "../scp-mls", features = ["testing"] }
 scp-protocol = { path = "../scp-protocol", features = ["testing"] }
 # `filesystem` backs ADR-052 §AC-9 `EncryptedStorage` seal doctests on
 # `ProtocolRepository::new`: `FilesystemStorage` is a plaintext backend that a
 # `compile_fail,E0277` assertion proves cannot reach a production constructor.
-scp-platform = { path = "../scp-platform", features = ["testing", "encrypting", "filesystem"] }
+scp-platform = { path = "../scp-platform", version = "=0.1.0-beta.2", features = ["testing", "encrypting", "filesystem"] }
 scp-event-log = { path = "../scp-event-log", features = ["testing"] }
 openmls_basic_credential = { workspace = true, features = ["test-utils"] }
 proptest = "1"
@@ -198,31 +190,29 @@ required-features = ["testing"]
 name = "context_config_create"
 required-features = ["testing"]
 
+# The examples declare no `required-features`, and this crate carries no dev-dependency
+# edge back to itself. Such an edge turns `scp-runtime/testing` on for the dev targets,
+# but cargo then builds this crate's lib before its lib test, and its lib check before
+# its lib check-test, which runs the two largest units in the workspace in series on
+# every edit. These examples need no feature of this crate. They get `InMemoryDhtClient`,
+# `InMemoryKeyCustody` and `InMemoryPreRotationCustody` from the `testing` features of
+# the `scp-dht` and `scp-platform` dev-dependencies, and they store through the
+# production `ProtocolRepository::new` over an `EncryptingAdapter`. So
+# `cargo run -p scp-runtime --example identity` and `scripts/check-examples-compile.sh`
+# build them with no features. Those two dev-dependencies carry a `version` key because
+# cargo drops a dev-dependency without one from a published manifest, which would leave
+# the examples' imports unresolved there.
 [[example]]
 name = "identity"
-# The example names `InMemoryDhtClient`, `InMemoryKeyCustody`, and
-# `InMemoryPreRotationCustody`, which a consumer reaches only through this crate's
-# `testing` feature. Inside this workspace the declaration never refuses a build:
-# this crate's dev-dependency on itself turns on `scp-runtime/testing`, and cargo
-# unifies that into every dev target, so `cargo run -p scp-runtime --example identity`
-# compiles and runs. Only a build of the published crate, which strips path-only
-# dev-dependencies such as that one, reports the missing feature instead of
-# unresolved imports.
-# `check-examples-compile.sh` names each target, so the declaration removes no
-# target from that gate.
-required-features = ["testing"]
 
 [[example]]
 name = "context"
-required-features = ["testing"]
 
 [[example]]
 name = "outlets"
-required-features = ["testing"]
 
 [[example]]
 name = "messaging"
-required-features = ["testing"]
 
 [lints]
 workspace = true

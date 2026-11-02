@@ -539,8 +539,8 @@ bash scripts/check-protocol-deps.sh
 python3.12 scripts/check-block-in-place.py
 python3.12 scripts/check-block-in-place.py --self-test
 bash scripts/check-deleted-primitives.sh
-cargo test -p scp-runtime --test persistence_ordering
-cargo test -p scp-runtime --test cancel_safety
+cargo test -p scp-runtime --features testing --test persistence_ordering
+cargo test -p scp-runtime --features testing --test cancel_safety
 cargo test -p scp-runtime --test shuttle_actor --features shuttle
 ```
 

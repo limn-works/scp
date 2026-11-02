@@ -21,14 +21,15 @@
 #![forbid(unsafe_code)]
 
 // scp-runtime test targets require the `testing` feature: numerous `#[cfg(test)]`
-// modules call `#[cfg(feature = "testing")]`-gated helpers. `testing` is normally
-// enabled transitively via the `scp-testing` dev-dependency; this tripwire turns a
-// severed back-edge into a clear message instead of a cryptic E0599 (or silent vanish).
+// modules call `#[cfg(feature = "testing")]`-gated helpers. No dev-dependency edge
+// turns it on, because any edge back to this crate makes its lib test wait for its lib
+// (see the note above the `[[example]]` entries in Cargo.toml), so every test command
+// names the feature. This tripwire turns a missing `--features` into a clear message
+// instead of a cryptic E0599.
 #[cfg(all(test, not(feature = "testing")))]
 compile_error!(
-    "scp-runtime test targets require the `testing` feature \
-     (enabled transitively via the scp-testing dev-dependency, or pass \
-     `--features scp-runtime/testing` explicitly)."
+    "scp-runtime test targets require the `testing` feature: pass \
+     `--features testing` (or `--features scp-runtime/testing` in a multi-package command)."
 );
 
 pub mod context;
