@@ -9269,9 +9269,21 @@ mod syn_scan {
     }
 }
 
+/// The repository root. A path outside this crate is formed only as
+/// `workspace_root().join` of a literal, the form
+/// scripts/tests/ci-gate/ci_gate_selftest.py reads to route a change to it to
+/// this test.
+fn workspace_root() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("scp-testing sits at crates/scp-testing")
+        .to_path_buf()
+}
+
 /// The directory that holds the workspace's crates.
 fn crates_dir() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..")
+    workspace_root().join("crates")
 }
 
 /// Every caller of `store_last_relay_contact` in `facts`, a spawned task
@@ -9647,11 +9659,8 @@ fn shutdown_releases_the_event_log_and_never_destroys_it() {
 /// bridges and the relay ship as libraries and binaries of their own.
 #[test]
 fn no_shipped_source_builds_an_event_log_without_a_store() {
-    let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("scp-testing sits under crates/");
     let mut crate_dirs = Vec::new();
-    for krate in std::fs::read_dir(crates)
+    for krate in std::fs::read_dir(crates_dir())
         .expect("crates/ is readable")
         .flatten()
     {
