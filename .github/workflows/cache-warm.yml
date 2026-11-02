@@ -575,7 +575,7 @@ jobs:
       - name: Build the Kotlin parity runner
         run: >-
           bindings/kotlin/gradlew -p bindings/python/tests/bridge_parity/helpers/kotlin_bridge_runner
-          --init-script .github/gradle/warm-dependency-cache.gradle
+          --init-script "$GITHUB_WORKSPACE/.github/gradle/warm-dependency-cache.gradle"
           warmDependencyCache installDist --no-daemon -Pscp.uniffi.prebuiltBindings=true
 
   transport-optional-transport:
