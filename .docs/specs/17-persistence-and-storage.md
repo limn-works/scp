@@ -23,7 +23,7 @@ The `Storage` trait (defined in `scp-platform`) is deliberately thin — six asy
 ```
 Relay Server (blob routing, TTL enforcement, subscription registry)
         |
-BlobStorage trait (store/get/query/delete/purge_expired with routing_id + TTL)
+BlobStorage trait (store/get/query/delete/purge_expired with routing_id + TTL or retain)
         |
 Backend adapter (SQLite, redb, PostgreSQL, S3-compatible, in-memory)
 ```
@@ -788,13 +788,13 @@ CREATE TABLE blobs (
     blob_id BLOB PRIMARY KEY,
     routing_id BLOB NOT NULL,
     recipient_hint BLOB,
-    blob_ttl INTEGER NOT NULL,
+    blob_ttl INTEGER,          -- NULL: a retained record (09-security-model.md §9.10.12)
     stored_at INTEGER NOT NULL,
-    expires_at INTEGER NOT NULL,
+    expires_at INTEGER,        -- NULL: never expires
     blob BLOB NOT NULL
 ) WITHOUT ROWID;
 
-CREATE INDEX idx_routing ON blobs (routing_id, stored_at);
+CREATE INDEX idx_routing ON blobs (routing_id, stored_at, blob_id);
 CREATE INDEX idx_expiry ON blobs (expires_at);
 ```
 
@@ -818,7 +818,7 @@ The `BlobStorage` trait provides streaming variants of `store` and `get` for bac
 
 **Trait methods (with defaults):**
 
-- `store_streaming(routing_id, blob_id, recipient_hint, blob_ttl, content_length: Option<u64>, body: BlobBodyStream) -> Result<BlobMetadata, StorageError>` — Default: collects stream to `Vec<u8>`, delegates to `store()`, drops the blob body from the result.
+- `store_streaming(routing_id, blob_id, recipient_hint, lifetime, content_length: Option<u64>, body: BlobBodyStream) -> Result<BlobMetadata, StorageError>` — Default: collects stream to `Vec<u8>`, delegates to `store()`, drops the blob body from the result.
 - `get_streaming(blob_id) -> Result<Option<(BlobMetadata, BlobBodyStream)>, StorageError>` — Default: calls `get()`, splits `StoredBlob` into metadata + single-chunk stream.
 
 **Content length:** `store_streaming` accepts an optional content length hint. Backends MAY use this for pre-allocation or capacity checks. Backends MUST NOT trust it for security decisions — the actual streamed length governs.
