@@ -18,6 +18,9 @@
 # channel, a `RUSTUP_TOOLCHAIN` in the environment, and a `RUSTUP_AUTO_INSTALL` other
 # than 0 (every other case runs with it set to 0 and passes), and refuses, after installing, an
 # override rustup rejected and a `rustc -V` that does not report the installed toolchain.
+# After installing, it uninstalls every toolchain it did not install in this job (a
+# second call shares the job's RUNNER_TEMP record), makes the first one the default, and
+# fails the step when rustup refuses an uninstall.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -80,6 +83,16 @@ ERR
         printf '%s\n' "${STUB_TOOLCHAIN_RUSTC:-rustc 1.98.0 (88d9e12ae 2026-08-18)}"
         exit 0
         ;;
+    "toolchain list")
+        printf '%b' "${STUB_TOOLCHAINS:-stable-x86_64-unknown-linux-gnu (default)\n1.98.0-x86_64-unknown-linux-gnu (override)\n}"
+        exit 0
+        ;;
+    "toolchain uninstall")
+        exit "${STUB_UNINSTALL_STATUS:-0}"
+        ;;
+    "default "*)
+        exit 0
+        ;;
 esac
 echo "stub rustup: unexpected call: $*" >&2
 exit 99
@@ -112,7 +125,7 @@ run_install() {
     if [[ $toolchain_body != "<absent>" ]]; then
         printf '%s\n' "$toolchain_body" > "$CHECKOUT/rust-toolchain.toml"
     fi
-    OUT=$(cd "$CHECKOUT" && env -u RUSTUP_TOOLCHAIN RUSTUP_AUTO_INSTALL=0 PATH="$STUB_BIN:$PATH" STUB_STATE="$STATE" "$@" \
+    OUT=$(cd "$CHECKOUT" && env -u RUSTUP_TOOLCHAIN RUSTUP_AUTO_INSTALL=0 PATH="$STUB_BIN:$PATH" STUB_STATE="$STATE" RUNNER_TEMP="$STATE" "$@" \
         bash "$INSTALL" rust-toolchain.toml "$components" "$targets" 2>&1)
     RC=$?
 }
@@ -218,6 +231,38 @@ report "a dated nightly passes when rustc -V matches that toolchain's own rustc"
 run_install "$NIGHTLY" "" "" "STUB_RESOLVED_RUSTC=rustc 1.98.0 (88d9e12ae 2026-08-18)" "STUB_TOOLCHAIN_RUSTC=rustc 1.100.0-nightly (abc 2026-09-27)"
 [[ $RC -ne 0 ]]
 report "a dated nightly fails when rustc -V answers with another toolchain" $? "rc=$RC out: $OUT"
+
+# ── 8: the runner image's other toolchains are removed ─────────────────────────────
+uninstalled() { command grep '^toolchain uninstall ' "$STATE/calls" | cut -d' ' -f3 | tr '\n' ' '; }
+run_install "$PIN" "" ""
+[[ $RC -eq 0 && $(uninstalled) == "stable-x86_64-unknown-linux-gnu " ]]
+report "the image's stable toolchain is uninstalled and the pin is kept" $? "rc=$RC uninstalled: '$(uninstalled)' out: $OUT"
+[[ $(command grep '^default ' "$STATE/calls") == "default 1.98.0" ]]
+report "the pin becomes the default toolchain" $? "calls: $(tr '\n' ';' < "$STATE/calls")"
+
+run_install "$PIN" "" "" "STUB_TOOLCHAINS=1.98.0-x86_64-unknown-linux-gnu (default)\n"
+[[ $RC -eq 0 && -z $(uninstalled) ]]
+report "a runner holding only the pin uninstalls nothing" $? "rc=$RC uninstalled: '$(uninstalled)'"
+
+run_install "$PIN" "" "" "STUB_TOOLCHAINS=stable-x86_64-unknown-linux-gnu (default)\n1.98.0-x86_64-unknown-linux-gnu\n1.98.0.1-x86_64-unknown-linux-gnu\n1.98.1-x86_64-unknown-linux-gnu\n1.99.1-x86_64-unknown-linux-gnu\n"
+[[ $RC -eq 0 && $(uninstalled) == "stable-x86_64-unknown-linux-gnu 1.98.0.1-x86_64-unknown-linux-gnu 1.98.1-x86_64-unknown-linux-gnu 1.99.1-x86_64-unknown-linux-gnu " ]]
+report "a toolchain whose name only starts with the pin's is uninstalled" $? "rc=$RC uninstalled: '$(uninstalled)'"
+
+# The fuzz jobs call the action twice in one job: the root pin, then the fuzz nightly.
+SHARED_TEMP="$TMP_PARENT/shared-runner-temp"
+mkdir -p "$SHARED_TEMP"
+run_install "$PIN" "" "" RUNNER_TEMP="$SHARED_TEMP"
+run_install "$NIGHTLY" "" "" RUNNER_TEMP="$SHARED_TEMP" \
+    "STUB_RESOLVED_RUSTC=rustc 1.100.0-nightly (abc 2026-09-27)" "STUB_TOOLCHAIN_RUSTC=rustc 1.100.0-nightly (abc 2026-09-27)" \
+    "STUB_TOOLCHAINS=1.98.0-x86_64-unknown-linux-gnu (default)\nnightly-2026-09-28-x86_64-unknown-linux-gnu (override)\n"
+[[ $RC -eq 0 && -z $(uninstalled) ]]
+report "a second call in the same job keeps the toolchain the first call installed" $? "rc=$RC uninstalled: '$(uninstalled)' out: $OUT"
+[[ $(command grep '^default ' "$STATE/calls") == "default 1.98.0" ]]
+report "the first toolchain installed in the job stays the default" $? "calls: $(tr '\n' ';' < "$STATE/calls")"
+
+run_install "$PIN" "" "" STUB_UNINSTALL_STATUS=1
+[[ $RC -ne 0 && $OUT == *"::error"*"rustup toolchain uninstall stable-x86_64-unknown-linux-gnu failed"* ]]
+report "an uninstall rustup refuses fails the step" $? "rc=$RC out: $OUT"
 
 echo ""
 echo "rust-toolchain-action cases: $passed passed, $failed failed"
