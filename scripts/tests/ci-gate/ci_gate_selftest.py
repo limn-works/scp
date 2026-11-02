@@ -751,6 +751,7 @@ RUST_ONLY = {
     "swift": "false",
     "fuzz": "false",
     "code": "true",
+    "rust-prose": "false",
 }
 DOCS_ONLY = dict.fromkeys(RUST_ONLY, "false")
 
@@ -845,6 +846,7 @@ NOT_ON_PUSH_FILTER_JOBS = (
     "rust-doctest",
     "rust-fmt",
     "rust-test-napi-production",
+    "rust-test-prose",
     "scaffold-typescript-web-check",
     "shipped-feature-graph",
     "swift-build-test",
@@ -897,6 +899,9 @@ RUST_ONLY_RUNS = {
     "rust-doctest": True,
     "rust-fmt": True,
     "rust-test": True,
+    # rust-test runs its targets on every change `rust` selects; it runs on
+    # `rust-prose` alone, which a Rust-only change leaves false.
+    "rust-test-prose": False,
     "rust-test-optional-features": True,
     "rust-test-macos": True,
     "rust-test-napi-production": True,
@@ -981,6 +986,10 @@ FUZZ_ONLY = DOCS_ONLY | {"fuzz": "true", "code": "true"}
 FUZZ_ONLY_RUNS = DOCS_ONLY_RUNS | dict.fromkeys(CODE_JOBS, True) | dict.fromkeys(
     ("fuzz-build", "rust-deny-fuzz"), True
 )
+# A change confined to prose that only Rust test code reads, such as an ADR edit:
+# no filter but `rust-prose` lists it, and it is prose, so `code` is false too.
+RUST_PROSE_ONLY = DOCS_ONLY | {"rust-prose": "true"}
+RUST_PROSE_ONLY_RUNS = DOCS_ONLY_RUNS | {"rust-test-prose": True}
 
 SCENARIOS = {
     "rust-only, pull_request": Scenario(
@@ -1043,6 +1052,14 @@ SCENARIOS = {
         filters=FUZZ_ONLY,
         event=event,
         runs=on_event(FUZZ_ONLY_RUNS, event),
+    )
+    for event in ("pull_request", "merge_group", "push")
+} | {
+    f"rust-prose-only, {event}": Scenario(
+        name=f"rust-prose-only, {event}",
+        filters=RUST_PROSE_ONLY,
+        event=event,
+        runs=on_event(RUST_PROSE_ONLY_RUNS, event),
     )
     for event in ("pull_request", "merge_group", "push")
 }
@@ -9109,9 +9126,16 @@ def _tracked_dirs(paths: list[str]) -> set[str]:
     return dirs
 
 
-def rust_test_reads(sources: dict[str, str], paths: list[str] | None = None) -> set[str]:
-    """Each path outside `crates/` that a `crates/` source can read, a tracked directory ending in `/`."""
-    dirs = _tracked_dirs(paths) if paths is not None else set()
+def rust_test_reads(
+    sources: dict[str, str], paths: list[str] | None = None, dirs: set[str] | None = None
+) -> set[str]:
+    """Each path outside `crates/` that a `crates/` source can read, a tracked directory ending in `/`.
+
+    `dirs`, when given, is `_tracked_dirs(paths)`, which a caller scanning one source at a
+    time computes once.
+    """
+    if dirs is None:
+        dirs = _tracked_dirs(paths) if paths is not None else set()
     reads = set()
     for source, raw in sources.items():
         text = _rust_code(raw)
@@ -9206,13 +9230,214 @@ def crate_sources(paths: list[str]) -> dict[str, str]:
 
 
 def rust_test_inputs_unselected(doc: dict, paths: list[str], reads: set[str]) -> list[str]:
-    """Return each tracked rust-test input the `rust` output does not select and no step mirrors."""
+    """Return each tracked rust-test input neither `rust` nor `rust-prose` selects and no step mirrors.
+
+    A read only `rust-prose` selects is routed to job rust-test-prose, and
+    check_rust_prose_readers requires that job to run every test target that reads it.
+    """
     patterns = output_patterns(doc, "rust")
     if isinstance(patterns, str):
         return [patterns]
+    prose = output_patterns(doc, RUST_PROSE_OUTPUT)
+    if isinstance(prose, str):
+        return [prose]
     under = tuple(entry for entry in reads if entry.endswith("/"))
     inputs = [path for path in paths if path in reads or path.startswith(under)]
-    return [path for path in inputs if path not in RUST_TEST_MIRRORED and not pattern_covers(patterns, path)]
+    return [
+        path
+        for path in inputs
+        if path not in RUST_TEST_MIRRORED and not pattern_covers(patterns, path) and not pattern_covers(prose, path)
+    ]
+
+
+# CRITERION for check_rust_prose_readers: a pull request that edits only files the
+# `rust-prose` output selects and `rust` does not runs job rust-test-prose and none of
+# the `rust` lanes, so every test that reads such a file must be one rust-test-prose
+# runs, and the file must change no shipped code. A `crates/` source that reads one
+# (rust_test_reads, per source) is therefore either a test target's root, named by a
+# `[[test]]` path or auto-discovered as `tests/<name>.rs` or `tests/<name>/main.rs`,
+# or a library source under `src/` whose every such read sits inside a
+# `#[cfg(test)] mod` block that opens and closes at column 0, which rustfmt guarantees
+# for a top-level module. Any other reader, a submodule of a test target among them,
+# is reported. The (package, target) pairs these sources compile into must equal the
+# pairs rust-test-prose's commands select, so the job runs no target that reads none
+# of them. Non-Rust readers need no rule here: check_binding_test_reads and
+# check_script_reads require each reading job's outputs to select what it reads, and
+# no output but `rust-prose` selects these files.
+RUST_PROSE_OUTPUT = "rust-prose"
+RUST_PROSE_JOB = "rust-test-prose"
+RUST_CFG_TEST_MOD = re.compile(r"(?m)^#\[cfg\(test\)\]\n(?:#\[[^\n]*\]\n)*(?:pub(?:\([^)]*\))? )?mod \w+ \{\n")
+
+
+def _rust_read_sites(text: str) -> list[tuple[int, str]]:
+    """(offset, path) of each include literal and workspace_root join in `text`, as rust_test_reads resolves them."""
+    sites = []
+    for match in RUST_INCLUDE_LITERAL.finditer(text):
+        sites.append((match.start(), re.sub(r"\\\n\s*", "", match.group(1))))
+    consts = dict(RUST_STR_CONST.findall(text))
+    for match in RUST_WORKSPACE_JOIN.finditer(text):
+        literal = match.group(1) if match.group(1) is not None else consts.get(match.group(2))
+        if literal is not None:
+            sites.append((match.start(), f"//{literal}"))
+    return sites
+
+
+def rust_prose_reader_targets(
+    sources: dict[str, str], paths: list[str], routed: set[str]
+) -> tuple[set[tuple[str, str]], list[str]]:
+    """Return the (package, target) pairs whose sources read a `routed` path, and each reader that is not test code."""
+    tracked = set(paths)
+    dirs = _tracked_dirs(paths)
+    manifests = sorted(
+        (posixpath.dirname(p) for p in paths if p.startswith("crates/") and p.endswith("/Cargo.toml")),
+        key=len,
+        reverse=True,
+    )
+
+    def hits(read: str) -> bool:
+        return read in routed or (read.endswith("/") and any(p.startswith(read) for p in routed))
+
+    def resolved(source: str, literal: str) -> str:
+        if literal.startswith("//"):
+            path = posixpath.normpath(literal[2:])
+        else:
+            path = posixpath.normpath(posixpath.join(posixpath.dirname(source), literal))
+        return f"{path}/" if path in dirs else path
+
+    targets: set[tuple[str, str]] = set()
+    found: list[str] = []
+    for source, raw in sorted(sources.items()):
+        if not any(hits(read) for read in rust_test_reads({source: raw}, dirs=dirs)):
+            continue
+        crate = next((m for m in manifests if source.startswith(f"{m}/")), None)
+        if crate is None:
+            found.append(f"{source}: no Cargo.toml above it under crates/")
+            continue
+        manifest = tomllib.loads((REPO / crate / "Cargo.toml").read_text(encoding="utf-8")) if (
+            f"{crate}/Cargo.toml" in tracked and (REPO / crate / "Cargo.toml").exists()
+        ) else {}
+        package = str((manifest.get("package") or {}).get("name") or posixpath.basename(crate))
+        rel = source[len(crate) + 1 :]
+        named = {str(t.get("path")): str(t.get("name")) for t in manifest.get("test") or []}
+        auto = (manifest.get("package") or {}).get("autotests", True)
+        stem = re.fullmatch(r"tests/([\w-]+)\.rs|tests/([\w-]+)/main\.rs", rel)
+        if rel in named:
+            targets.add((package, f"test:{named[rel]}"))
+        elif stem and auto:
+            targets.add((package, f"test:{stem.group(1) or stem.group(2)}"))
+        elif rel.startswith("src/") and not rel.startswith("src/bin/") and rel != "src/main.rs":
+            text = _rust_code(raw)
+            blocks = []
+            for match in RUST_CFG_TEST_MOD.finditer(text):
+                end = text.find("\n}\n", match.end() - 1)
+                blocks.append((match.start(), len(text) if end < 0 else end))
+            outside = [
+                path
+                for offset, literal in _rust_read_sites(text)
+                if hits(path := resolved(source, literal))
+                and not any(start <= offset < end for start, end in blocks)
+            ]
+            if outside:
+                found.append(f"{source}: reads {outside} outside a #[cfg(test)] module, so the file ships")
+            else:
+                targets.add((package, "lib"))
+        else:
+            found.append(f"{source}: reads routed prose and is neither a test target's root nor library test code")
+    return targets, found
+
+
+def rust_prose_job_targets(doc: dict) -> set[tuple[str, str]]:
+    """The (package, target) pairs the `cargo nextest run` commands of job rust-test-prose select."""
+    selected: set[tuple[str, str]] = set()
+    for step in (doc["jobs"].get(RUST_PROSE_JOB) or {}).get("steps") or []:
+        for line in str(step.get("run") or "").splitlines():
+            tokens = shlex.split(line.strip())
+            if tokens[:3] != ["cargo", "nextest", "run"]:
+                continue
+            packages = [tokens[i + 1] for i, t in enumerate(tokens[:-1]) if t == "-p"]
+            chosen = ["lib" for t in tokens if t == "--lib"] + [
+                f"test:{tokens[i + 1]}" for i, t in enumerate(tokens[:-1]) if t == "--test"
+            ]
+            selected |= {(package, target) for package in packages for target in chosen}
+    return selected
+
+
+def rust_prose_routed(doc: dict, paths: list[str]) -> set[str] | str:
+    """Each tracked path the `rust-prose` output selects and `rust` does not."""
+    rust = output_patterns(doc, "rust")
+    prose = output_patterns(doc, RUST_PROSE_OUTPUT)
+    for patterns in (rust, prose):
+        if isinstance(patterns, str):
+            return patterns
+    return {path for path in paths if pattern_covers(prose, path) and not pattern_covers(rust, path)}
+
+
+def check_rust_prose_readers(doc: dict, paths: list[str], sources: dict[str, str]) -> None:
+    routed = rust_prose_routed(doc, paths)
+    check("ci.yml: `changes` publishes the `rust-prose` output", not isinstance(routed, str), f"{routed}")
+    if isinstance(routed, str):
+        return
+    check(
+        "the `rust-prose` output selects only prose",
+        routed and all(is_prose(path) for path in routed),
+        f"{sorted(p for p in routed if not is_prose(p))[:10]}",
+    )
+    derived, found = rust_prose_reader_targets(sources, paths, routed)
+    check("every Rust reader of `rust-prose` files is test code", not found, f"{found[:10]}")
+    job = rust_prose_job_targets(doc)
+    check(
+        "job rust-test-prose runs exactly the test targets that read `rust-prose` files",
+        bool(derived) and derived == job,
+        f"derived {sorted(derived)}, job {sorted(job)}",
+    )
+    for expected in (
+        ("scp-testing", "test:ffi_conformance"),
+        ("scp-testing", "test:trust"),
+        ("scp-protocol", "lib"),
+        ("scp-event-log", "lib"),
+    ):
+        check(f"the reader scan derives {expected[0]} {expected[1]}", expected in derived)
+    # Must fail: a library source that reads routed prose outside a test module, a
+    # test-target submodule that reads it, and a new test root whose target the job
+    # does not run. Must pass: the read inside a #[cfg(test)] module.
+    adr = next(path for path in sorted(routed) if path.startswith(".docs/adrs/"))
+    climb = "../../../" + adr
+    planted = {
+        "crates/scp-kel/src/planted.rs": f'const S: &str = include_str!("{climb}");\n',
+        "crates/scp-kel/tests/kel/planted.rs": f'const S: &str = include_str!("../{climb}");\n',
+    }
+    _, reported = rust_prose_reader_targets(planted, paths, routed)
+    check(
+        "a library read outside #[cfg(test)] and a test-target submodule read are each reported",
+        len(reported) == 2 and "outside a #[cfg(test)]" in reported[0] and "neither" in reported[1],
+        f"{reported}",
+    )
+    inside = {
+        "crates/scp-kel/src/planted.rs": (
+            f'pub fn f() {{}}\n\n#[cfg(test)]\nmod tests {{\n    const S: &str = include_str!("{climb}");\n}}\n'
+        ),
+    }
+    targets, reported = rust_prose_reader_targets(inside, paths, routed)
+    check(
+        "a read inside a #[cfg(test)] module derives the crate's lib target",
+        not reported and targets == {("scp-kel", "lib")},
+        f"{targets} {reported}",
+    )
+    root = {"crates/scp-kel/tests/planted_root.rs": f'const S: &str = include_str!("{climb}");\n'}
+    targets, _ = rust_prose_reader_targets(root, paths, routed)
+    check(
+        "a new test root that reads routed prose derives a target the job does not run",
+        targets == {("scp-kel", "test:planted_root")} and not targets <= job,
+        f"{targets}",
+    )
+    mutant = copy.deepcopy(doc)
+    for step in mutant["jobs"][RUST_PROSE_JOB]["steps"]:
+        if "--test trust" in str(step.get("run") or ""):
+            step["run"] = str(step["run"]).replace(" --test trust", "")
+    check(
+        "a rust-test-prose job that drops `--test trust` no longer matches the derived targets",
+        rust_prose_job_targets(mutant) == job - {("scp-testing", "test:trust")},
+    )
 
 
 def tracked_paths() -> list[str]:
@@ -9371,8 +9596,12 @@ def check_every_path_routed(doc: dict) -> None:
     )
     filters = yaml.safe_load(step["with"]["filters"])
     dropped = (".docs/adrs/**", "bindings/python/scp_sdk/**")
-    check(f"filter rust lists {dropped} for the mutant", all(entry in filters["rust"] for entry in dropped))
-    filters["rust"] = [entry for entry in filters["rust"] if entry not in dropped]
+    check(
+        f"filters rust-prose and rust list {dropped} for the mutant",
+        dropped[0] in filters[RUST_PROSE_OUTPUT] and dropped[1] in filters["rust"],
+    )
+    filters[RUST_PROSE_OUTPUT] = [entry for entry in filters[RUST_PROSE_OUTPUT] if entry != dropped[0]]
+    filters["rust"] = [entry for entry in filters["rust"] if entry != dropped[1]]
     step["with"]["filters"] = yaml.safe_dump(filters)
     unselected = rust_test_inputs_unselected(mutant, paths, reads)
     under = tuple(entry for entry in reads if entry.endswith("/"))
@@ -9382,10 +9611,11 @@ def check_every_path_routed(doc: dict) -> None:
         if p.startswith(".docs/adrs/") or ((p in reads or p.startswith(under)) and p.startswith("bindings/python/"))
     ]
     check(
-        f"a `rust` filter that drops {dropped} reports every ADR file and every Python SDK file rust-test reads",
+        f"filters that drop {dropped} report every ADR file and every Python SDK file rust-test reads",
         bool(unselected) and unselected == expected,
         f"{unselected[:5]}",
     )
+    check_rust_prose_readers(doc, paths, sources)
 
 
 # CRITERION for binding_test_scan: a test source under `bindings/` or `tests/` names a

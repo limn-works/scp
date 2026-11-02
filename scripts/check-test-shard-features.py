@@ -46,6 +46,13 @@ command can name them (cargo accepts `--features dep/feature` only for a depende
 selected package). The check prints each such difference and does not fail on it: the
 package's own tests run in the shard that selects it, with its canonical features.
 
+Job rust-test-prose runs a few test targets of packages the shards select, for pull
+requests that edit only prose those targets read. Each of its commands takes the shard
+form plus target selectors (`--lib`, `--test <name>`), and the check fails when one takes
+any other argument, names a `--test` target with more than one `-p`, names a target the
+package lacks, or resolves a selected package to features other than the canonical
+resolution's, so each target compiles the code its shard compiles.
+
 `--legs` prints one line per shard, `<shard>` then a tab then the shard command's `-p` and
 `--features` arguments, read out of the workflow without invoking cargo.
 `.github/workflows/compile-timings.yml` builds each line's arguments under `--timings`, so
@@ -72,6 +79,7 @@ import tomllib
 import yaml
 
 JOB = "rust-test"
+READER_JOB = "rust-test-prose"
 AXIS = "leg"
 WORKFLOW = Path(".github/workflows/ci.yml")
 TARGET = "x86_64-unknown-linux-gnu"
@@ -127,12 +135,21 @@ def shard_of_condition(condition: object) -> str | None:
 
 def parse_command(line: str) -> tuple[list[str], list[str]]:
     """Return (packages, features) of one shard command, or raise CheckError."""
+    packages, features, _ = parse_targeted(line, targets_allowed=False)
+    return packages, features
+
+
+def parse_targeted(
+    line: str, targets_allowed: bool = True
+) -> tuple[list[str], list[str], list[str]]:
+    """Return (packages, features, targets) of one command; targets are `lib` or `test:<name>`."""
     tokens = shlex.split(line)
     prefix = ["cargo", "nextest", "run", "--no-tests=fail"]
     if tokens[: len(prefix)] != prefix:
         raise CheckError(f"`{line}` does not start with `{' '.join(prefix)}`")
     packages: list[str] = []
     features: list[str] | None = None
+    targets: list[str] = []
     rest = tokens[len(prefix) :]
     index = 0
     while index < len(rest):
@@ -143,6 +160,17 @@ def parse_command(line: str) -> tuple[list[str], list[str]]:
         elif token == "--features" and index + 1 < len(rest) and features is None:
             features = [item for item in rest[index + 1].split(",") if item]
             index += 2
+        elif targets_allowed and token == "--lib" and "lib" not in targets:
+            targets.append("lib")
+            index += 1
+        elif targets_allowed and token == "--test" and index + 1 < len(rest):
+            targets.append(f"test:{rest[index + 1]}")
+            index += 2
+        elif targets_allowed:
+            raise CheckError(
+                f"`{line}` passes `{token}`; a {READER_JOB} command takes only `-p <package>`, "
+                f"one `--features <list>`, `--lib` and `--test <name>`"
+            )
         else:
             raise CheckError(
                 f"`{line}` passes `{token}`; a shard command takes only `-p <package>` and one "
@@ -150,7 +178,60 @@ def parse_command(line: str) -> tuple[list[str], list[str]]:
             )
     if not packages:
         raise CheckError(f"`{line}` selects no package with `-p`")
-    return packages, features or []
+    if targets_allowed and not targets:
+        raise CheckError(f"`{line}` selects no target with `--lib` or `--test`")
+    if any(t.startswith("test:") for t in targets) and len(packages) != 1:
+        raise CheckError(
+            f"`{line}` names a `--test` target with {len(packages)} packages; cargo runs it "
+            f"from whichever package has it, so a `--test` command selects one package"
+        )
+    return packages, features or [], targets
+
+
+def read_reader_commands(
+    document: dict,
+) -> list[tuple[list[str], list[str], list[str]]]:
+    """Return (packages, features, targets) of each test command job rust-test-prose runs."""
+    job = (document.get("jobs") or {}).get(READER_JOB)
+    if not isinstance(job, dict):
+        return []
+    commands = []
+    for step in job.get("steps") or []:
+        if not isinstance(step, dict) or "run" not in step:
+            continue
+        for line in logical_lines(str(step["run"])):
+            if line.startswith(("cargo nextest", "cargo test")):
+                commands.append(parse_targeted(line))
+    if not commands:
+        raise CheckError(f"job {READER_JOB} runs no test command")
+    return commands
+
+
+def target_failures(
+    members: dict[str, list[str]],
+    commands: list[tuple[list[str], list[str], list[str]]],
+) -> list[str]:
+    """Each rust-test-prose target its selected packages do not define."""
+    failures = []
+    for packages, _, targets in commands:
+        for package in packages:
+            if package not in members:
+                failures.append(
+                    f"{READER_JOB} names {package}, which is not a workspace member"
+                )
+                continue
+            for target in targets:
+                kinds = {t.split(":", 1)[0] for t in members[package]}
+                present = (
+                    bool(kinds & {"lib", "rlib", "cdylib", "staticlib", "proc-macro"})
+                    if target == "lib"
+                    else target in members[package]
+                )
+                if not present:
+                    failures.append(
+                        f"{READER_JOB}: package {package} has no target {target}"
+                    )
+    return failures
 
 
 def read_shards(document: dict) -> tuple[str, dict[str, tuple[list[str], list[str]]]]:
@@ -420,10 +501,20 @@ def check(workflow: Path) -> int:
         NEXTEST_CONFIG.read_text(encoding="utf-8") if NEXTEST_CONFIG.exists() else None
     )
     failures += filter_failures(default_filter_exclusions(config_text), members)
+    readers = read_reader_commands(document)
+    failures += target_failures(members, readers)
     canonical, error = resolve(["--workspace"], canonical_features.split(","))
     if canonical is None:
         print(f"check-test-shard-features: the canonical resolution failed:\n{error}")
         return 1
+    for packages, features, _ in readers:
+        graph, error = resolve(selection_args(packages), features)
+        label = f"{READER_JOB} -p {' -p '.join(packages)}"
+        if graph is None:
+            failures.append(f"{label}: cargo tree rejected the command:\n{error}")
+            continue
+        found, _ = feature_failures(canonical, graph, packages)
+        failures += [f"{label}: {failure}" for failure in found]
     for shard, (packages, features) in shards.items():
         graph, error = resolve(selection_args(packages), features)
         if graph is None:
@@ -445,7 +536,8 @@ def check(workflow: Path) -> int:
         return 1
     print(
         f"check-test-shard-features: {len(shards)} shards cover every workspace member once, "
-        f"each selected package resolves to its canonical features, and the default nextest "
+        f"each selected package of every shard and of {len(readers)} {READER_JOB} command(s) "
+        f"resolves to its canonical features, and the default nextest "
         f"filter leaves out exactly {', '.join(sorted(f'{p}::{b}' for p, b in UNRUN_BINARIES))}"
     )
     return 0
@@ -757,6 +849,69 @@ def self_test() -> int:
         "terminal escapes" in colored,
         colored,
     )
+    reader = yaml.safe_load(
+        SELF_TEST_WORKFLOW
+        + f"""
+  {READER_JOB}:
+    steps:
+      - run: |
+          cargo nextest run --no-tests=fail -p b --features a/x --test it
+          cargo nextest run --no-tests=fail -p a -p c --lib
+"""
+    )
+    readers = read_reader_commands(reader)
+    expect(
+        f"reads each {READER_JOB} command with its targets",
+        readers == [(["b"], ["a/x"], ["test:it"]), (["a", "c"], [], ["lib"])],
+        readers,
+    )
+    expect(
+        f"{READER_JOB} targets every package defines pass",
+        not target_failures(members, readers),
+    )
+    found = target_failures(members, [(["c"], [], ["test:it"]), (["d"], [], ["lib"])])
+    expect(
+        f"a {READER_JOB} target the package lacks, and a non-member, are reported",
+        any("c has no target test:it" in f for f in found)
+        and any("names d" in f for f in found),
+        found,
+    )
+    expect(
+        f"a workflow without {READER_JOB} has no reader commands",
+        read_reader_commands(base) == [],
+    )
+    for label, run, needle in (
+        (
+            "a filter expression",
+            "cargo nextest run --no-tests=fail -p b --test it -E 'test(x)'",
+            "`-E`",
+        ),
+        (
+            "no target selector",
+            "cargo nextest run --no-tests=fail -p b",
+            "selects no target",
+        ),
+        (
+            "a --test target with two packages",
+            "cargo nextest run --no-tests=fail -p a -p b --test it",
+            "one package",
+        ),
+        (
+            "a --workspace selection",
+            "cargo nextest run --no-tests=fail --workspace --lib",
+            "--workspace",
+        ),
+    ):
+        try:
+            parse_targeted(run)
+            refused = "accepted"
+        except CheckError as error:
+            refused = str(error)
+        expect(
+            f"a {READER_JOB} command with {label} is refused",
+            needle in refused,
+            refused,
+        )
     if failures:
         print(f"check-test-shard-features self-test: {failures} case(s) failed")
         return 1
