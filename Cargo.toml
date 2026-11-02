@@ -360,7 +360,9 @@ debug-assertions = false
 
 # ── CI test-bridge profile ──────────────────────────────────────────────────
 # Used by the four bridge-artifact producer jobs in `.github/workflows/ci.yml`
-# (pyo3-module, pyo3-module-macos, napi-addon, xcframework) and by nothing else.
+# (pyo3-module, pyo3-module-macos, napi-addon, xcframework), and by local test
+# builds of the bridges (`bindings/typescript/AGENTS.md`, `.docs/standards/python.md`),
+# so a local run tests the artifact CI tests.
 # Opt-levels for those test bridges:
 #   - the three bridge crates scp-ffi, scp-ffi-napi and scp-ffi-uniffi: 0
 #     (Alec's ruling of 2026-10-09);
@@ -382,9 +384,17 @@ debug-assertions = false
 # opt-level 3 here where `--release` compiles them at 0. Cargo writes this
 # profile's output to `target/ci-bridge/` (`target/<triple>/ci-bridge/` under
 # `--target`).
+#
+# `incremental = true`: `[profile.release]`, which this inherits, compiles
+# non-incrementally, so after a one-literal scp-runtime edit a local
+# `cargo build -p scp-ffi-napi --profile ci-bridge --features scp-ffi-napi/testing`
+# recompiled scp-runtime whole: 269 s wall, against 72-79 s with this key, both
+# measured on a 16-core Mac at load 17-28. CI sets `CARGO_INCREMENTAL=0` in the
+# environment, which overrides this key, so CI's bridge builds are unchanged.
 [profile.ci-bridge]
 inherits = "release"
 opt-level = 1
+incremental = true
 
 [profile.ci-bridge.package."*"]
 opt-level = 3

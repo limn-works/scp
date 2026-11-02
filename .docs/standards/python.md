@@ -202,8 +202,9 @@ ruff check bindings/python/
 # Type check
 mypy bindings/python/scp_sdk/ --strict
 
-# Build extension (dev mode), from the directory whose pyproject.toml holds [tool.maturin]
-(cd bindings/python && maturin develop --release)
+# Build extension (dev mode), from the directory whose pyproject.toml holds [tool.maturin].
+# `ci-bridge` is the profile CI's pyo3-module job tests with; it compiles incrementally.
+(cd bindings/python && maturin develop --profile ci-bridge --features testing)
 
 # Run tests
 pytest bindings/python/tests/ -v
