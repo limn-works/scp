@@ -12,6 +12,11 @@
 //! 2. If still over the limit, the oldest blobs (by `stored_at` timestamp)
 //!    are deleted until the count is at or below the limit.
 //!
+//! A retained record ([`BlobLifetime::Retained`], `09-security-model.md`
+//! §9.10.12) is never tracked and never evicted: only the node's
+//! public-record selection may drop it, so it does not count against
+//! `max_cache_size`.
+//!
 //! See SCP-PERSIST-065.
 
 use scp_clock::Clock;
@@ -19,7 +24,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use super::storage::{BlobStorage, StorageError, StoredBlob};
+use super::storage::{BlobLifetime, BlobStorage, QueryCursor, StorageError, StoredBlob};
 
 /// Clock function type for timestamp injection (testing).
 ///
@@ -154,9 +159,10 @@ impl<S: BlobStorage> LocalBlobCache<S> {
         entries.sort_by_key(|e| e.stored_at);
 
         while entries.len() > self.max_cache_size {
-            let oldest = entries.remove(0);
-            // Best-effort delete — if it fails, we still remove from tracking.
-            let _ = self.inner.delete(&oldest.blob_id).await;
+            // An entry leaves tracking only once its blob is gone; a failed
+            // delete stays tracked and fails the store.
+            self.inner.delete(&entries[0].blob_id).await?;
+            entries.remove(0);
         }
 
         Ok(())
@@ -171,23 +177,25 @@ impl<S: BlobStorage> BlobStorage for LocalBlobCache<S> {
         routing_id: [u8; 32],
         blob_id: [u8; 32],
         recipient_hint: Option<[u8; 32]>,
-        blob_ttl: u32,
+        lifetime: BlobLifetime,
         blob: Vec<u8>,
     ) -> Result<StoredBlob, StorageError> {
         let stored = self
             .inner
-            .store(routing_id, blob_id, recipient_hint, blob_ttl, blob)
+            .store(routing_id, blob_id, recipient_hint, lifetime, blob)
             .await?;
 
-        // Update tracking.
+        // Update tracking: only a TTL blob is evictable.
         {
             let mut entries = self.entries.lock().await;
             // Remove any existing entry with the same blob_id (overwrite case).
             entries.retain(|e| e.blob_id != blob_id);
-            entries.push(CacheEntry {
-                blob_id,
-                stored_at: stored.stored_at,
-            });
+            if matches!(lifetime, BlobLifetime::Ttl(_)) {
+                entries.push(CacheEntry {
+                    blob_id,
+                    stored_at: stored.stored_at,
+                });
+            }
         }
 
         // Evict if over the limit.
@@ -203,10 +211,10 @@ impl<S: BlobStorage> BlobStorage for LocalBlobCache<S> {
     async fn query(
         &self,
         routing_id: &[u8; 32],
-        since: Option<u64>,
+        cursor: QueryCursor,
         limit: u32,
     ) -> Result<Vec<StoredBlob>, StorageError> {
-        self.inner.query(routing_id, since, limit).await
+        self.inner.query(routing_id, cursor, limit).await
     }
 
     async fn delete(&self, blob_id: &[u8; 32]) -> Result<bool, StorageError> {
@@ -275,14 +283,20 @@ mod tests {
         let blob_id = make_blob_id(&blob_data);
 
         let stored = cache
-            .store(routing_id, blob_id, None, 3600, blob_data.clone())
+            .store(
+                routing_id,
+                blob_id,
+                None,
+                crate::native::storage::BlobLifetime::Ttl(3600),
+                blob_data.clone(),
+            )
             .await
             .unwrap();
 
         assert_eq!(stored.blob_id, blob_id);
         assert_eq!(stored.routing_id, routing_id);
         assert_eq!(stored.blob, blob_data);
-        assert_eq!(stored.blob_ttl, 3600);
+        assert_eq!(stored.lifetime, BlobLifetime::Ttl(3600));
         assert!(stored.stored_at > 0);
 
         let retrieved = cache.get(&blob_id).await.unwrap().unwrap();
@@ -308,7 +322,13 @@ mod tests {
         let blob_id = make_blob_id(&blob_data);
 
         cache
-            .store(routing_id, blob_id, None, 3600, blob_data)
+            .store(
+                routing_id,
+                blob_id,
+                None,
+                crate::native::storage::BlobLifetime::Ttl(3600),
+                blob_data,
+            )
             .await
             .unwrap();
 
@@ -338,12 +358,21 @@ mod tests {
             let data = vec![i; 10];
             let blob_id = make_blob_id(&data);
             cache
-                .store(routing_id, blob_id, None, 3600, data)
+                .store(
+                    routing_id,
+                    blob_id,
+                    None,
+                    crate::native::storage::BlobLifetime::Ttl(3600),
+                    data,
+                )
                 .await
                 .unwrap();
         }
 
-        let results = cache.query(&routing_id, None, 100).await.unwrap();
+        let results = cache
+            .query(&routing_id, crate::native::storage::QueryCursor::All, 100)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 5);
     }
 
@@ -357,12 +386,21 @@ mod tests {
             let data = vec![i; 10];
             let blob_id = make_blob_id(&data);
             cache
-                .store(routing_id, blob_id, None, 3600, data)
+                .store(
+                    routing_id,
+                    blob_id,
+                    None,
+                    crate::native::storage::BlobLifetime::Ttl(3600),
+                    data,
+                )
                 .await
                 .unwrap();
         }
 
-        let results = cache.query(&routing_id, None, 3).await.unwrap();
+        let results = cache
+            .query(&routing_id, crate::native::storage::QueryCursor::All, 3)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 3);
     }
 
@@ -376,12 +414,21 @@ mod tests {
             let data = vec![i; 10];
             let blob_id = make_blob_id(&data);
             cache
-                .store(routing_id, blob_id, None, 3600, data)
+                .store(
+                    routing_id,
+                    blob_id,
+                    None,
+                    crate::native::storage::BlobLifetime::Ttl(3600),
+                    data,
+                )
                 .await
                 .unwrap();
         }
 
-        let results = cache.query(&routing_id, None, 100).await.unwrap();
+        let results = cache
+            .query(&routing_id, crate::native::storage::QueryCursor::All, 100)
+            .await
+            .unwrap();
         for window in results.windows(2) {
             assert!(window[0].stored_at <= window[1].stored_at);
         }
@@ -397,11 +444,20 @@ mod tests {
         let data = vec![1, 2, 3];
         let blob_id = make_blob_id(&data);
         cache
-            .store(routing_id_a, blob_id, None, 3600, data)
+            .store(
+                routing_id_a,
+                blob_id,
+                None,
+                crate::native::storage::BlobLifetime::Ttl(3600),
+                data,
+            )
             .await
             .unwrap();
 
-        let results = cache.query(&routing_id_b, None, 100).await.unwrap();
+        let results = cache
+            .query(&routing_id_b, crate::native::storage::QueryCursor::All, 100)
+            .await
+            .unwrap();
         assert!(results.is_empty());
     }
 
@@ -415,7 +471,13 @@ mod tests {
         let blob_id = make_blob_id(&data);
 
         let stored = cache
-            .store(routing_id, blob_id, Some(hint), 3600, data)
+            .store(
+                routing_id,
+                blob_id,
+                Some(hint),
+                crate::native::storage::BlobLifetime::Ttl(3600),
+                data,
+            )
             .await
             .unwrap();
 
@@ -434,13 +496,22 @@ mod tests {
         let blob_id = make_blob_id(&data);
 
         cache
-            .store(routing_id, blob_id, None, 3600, data)
+            .store(
+                routing_id,
+                blob_id,
+                None,
+                crate::native::storage::BlobLifetime::Ttl(3600),
+                data,
+            )
             .await
             .unwrap();
 
         cache.delete(&blob_id).await.unwrap();
 
-        let results = cache.query(&routing_id, None, 100).await.unwrap();
+        let results = cache
+            .query(&routing_id, crate::native::storage::QueryCursor::All, 100)
+            .await
+            .unwrap();
         assert!(results.is_empty());
     }
 
@@ -453,21 +524,39 @@ mod tests {
         let data1 = vec![1u8; 10];
         let blob_id1 = make_blob_id(&data1);
         cache
-            .store(routing_id, blob_id1, None, 3600, data1)
+            .store(
+                routing_id,
+                blob_id1,
+                None,
+                crate::native::storage::BlobLifetime::Ttl(3600),
+                data1,
+            )
             .await
             .unwrap();
 
         let data2 = vec![2u8; 10];
         let blob_id2 = make_blob_id(&data2);
         cache
-            .store(routing_id, blob_id2, None, 3600, data2)
+            .store(
+                routing_id,
+                blob_id2,
+                None,
+                crate::native::storage::BlobLifetime::Ttl(3600),
+                data2,
+            )
             .await
             .unwrap();
 
         // Overwrite blob_id1 — should succeed even though at capacity.
         let updated_data = vec![1u8; 20];
         let result = cache
-            .store(routing_id, blob_id1, None, 7200, updated_data)
+            .store(
+                routing_id,
+                blob_id1,
+                None,
+                crate::native::storage::BlobLifetime::Ttl(7200),
+                updated_data,
+            )
             .await;
         assert!(result.is_ok());
     }
@@ -488,7 +577,13 @@ mod tests {
             let blob_id = make_blob_id(&data);
             blob_ids.push(blob_id);
             cache
-                .store(routing_id, blob_id, None, 3600, data)
+                .store(
+                    routing_id,
+                    blob_id,
+                    None,
+                    crate::native::storage::BlobLifetime::Ttl(3600),
+                    data,
+                )
                 .await
                 .unwrap();
         }
@@ -520,7 +615,13 @@ mod tests {
             let blob_id = make_blob_id(&data);
             blob_ids.push(blob_id);
             cache
-                .store(routing_id, blob_id, None, 3600, data)
+                .store(
+                    routing_id,
+                    blob_id,
+                    None,
+                    crate::native::storage::BlobLifetime::Ttl(3600),
+                    data,
+                )
                 .await
                 .unwrap();
         }
@@ -535,7 +636,13 @@ mod tests {
         let new_data = vec![99u8; 10];
         let new_blob_id = make_blob_id(&new_data);
         cache
-            .store(routing_id, new_blob_id, None, 3600, new_data)
+            .store(
+                routing_id,
+                new_blob_id,
+                None,
+                crate::native::storage::BlobLifetime::Ttl(3600),
+                new_data,
+            )
             .await
             .unwrap();
 
@@ -569,7 +676,13 @@ mod tests {
             let blob_id = make_blob_id(&data);
             blob_ids.push(blob_id);
             cache
-                .store(routing_id, blob_id, None, 1, data)
+                .store(
+                    routing_id,
+                    blob_id,
+                    None,
+                    crate::native::storage::BlobLifetime::Ttl(1),
+                    data,
+                )
                 .await
                 .unwrap();
         }
@@ -601,7 +714,13 @@ mod tests {
         let new_data = vec![99u8; 10];
         let new_blob_id = make_blob_id(&new_data);
         cache
-            .store(routing_id, new_blob_id, None, 3600, new_data)
+            .store(
+                routing_id,
+                new_blob_id,
+                None,
+                crate::native::storage::BlobLifetime::Ttl(3600),
+                new_data,
+            )
             .await
             .unwrap();
 
@@ -633,7 +752,13 @@ mod tests {
             let blob_id = make_blob_id(&data);
             blob_ids.push(blob_id);
             cache
-                .store(routing_id, blob_id, None, 3600, data)
+                .store(
+                    routing_id,
+                    blob_id,
+                    None,
+                    crate::native::storage::BlobLifetime::Ttl(3600),
+                    data,
+                )
                 .await
                 .unwrap();
         }
@@ -662,7 +787,13 @@ mod tests {
         let data = vec![1u8; 10];
         let blob_id = make_blob_id(&data);
         cache
-            .store(routing_id, blob_id, None, 1, data)
+            .store(
+                routing_id,
+                blob_id,
+                None,
+                crate::native::storage::BlobLifetime::Ttl(1),
+                data,
+            )
             .await
             .unwrap();
 
@@ -690,7 +821,13 @@ mod tests {
         let data = vec![7, 7, 7];
         let blob_id = make_blob_id(&data);
         cache
-            .store([0xAB; 32], blob_id, None, 3600, data)
+            .store(
+                [0xAB; 32],
+                blob_id,
+                None,
+                crate::native::storage::BlobLifetime::Ttl(3600),
+                data,
+            )
             .await
             .unwrap();
 

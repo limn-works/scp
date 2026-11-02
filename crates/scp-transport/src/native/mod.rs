@@ -36,11 +36,11 @@ pub mod cert_pin;
 pub(crate) mod client;
 #[cfg(feature = "combined")]
 pub mod combined;
-pub mod did_slot;
 #[cfg(feature = "local-cache")]
 pub mod local_cache;
 #[cfg(feature = "postgres-blob")]
 pub mod postgres_blob;
+pub mod public_records;
 pub mod push_publisher;
 #[cfg(feature = "redb-blob")]
 pub mod redb_blob;
@@ -50,6 +50,8 @@ pub mod relay_querier;
 #[cfg(feature = "s3-blob")]
 pub mod s3_blob;
 pub mod server;
+#[cfg(any(feature = "sqlite-blob", feature = "combined"))]
+mod sql_blob;
 #[cfg(feature = "sqlite-blob")]
 pub mod sqlite_blob;
 pub mod storage;

@@ -11,12 +11,13 @@ use scp_clock::Clock;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use scp_platform::{PlatformError, Storage};
 use zeroize::Zeroize;
 
-use super::storage::{BlobStorage, StorageError, StoredBlob};
+use super::sql_blob;
+use super::storage::{BlobLifetime, BlobStorage, QueryCursor, StorageError, StoredBlob};
 
 // ---------------------------------------------------------------------------
 // Clock function for testability
@@ -37,18 +38,6 @@ pub fn system_clock() -> ClockFn {
 // ---------------------------------------------------------------------------
 // Prefix successor computation (for B-tree range scans)
 // ---------------------------------------------------------------------------
-
-/// Converts a `Vec<u8>` to a `[u8; 32]` array, returning a `rusqlite::Error`
-/// if the length doesn't match.
-fn vec_to_array(v: Vec<u8>, field: &str) -> Result<[u8; 32], rusqlite::Error> {
-    v.try_into().map_err(|v: Vec<u8>| {
-        rusqlite::Error::InvalidColumnType(
-            0,
-            format!("{field} has wrong length: expected 32, got {}", v.len()),
-            rusqlite::types::Type::Blob,
-        )
-    })
-}
 
 /// Computes the lexicographic successor of `prefix` for B-tree range scans.
 ///
@@ -197,21 +186,8 @@ impl CombinedNodeStorage {
         .map_err(|e| StorageError::Internal(format!("failed to create kv table: {e}")))?;
 
         // Create the blobs table (BlobStorage trait) per spec section 17.7.
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS blobs (
-                blob_id BLOB PRIMARY KEY,
-                routing_id BLOB NOT NULL,
-                recipient_hint BLOB,
-                blob_ttl INTEGER NOT NULL,
-                stored_at INTEGER NOT NULL,
-                expires_at INTEGER NOT NULL,
-                blob BLOB NOT NULL
-            ) WITHOUT ROWID;
-
-            CREATE INDEX IF NOT EXISTS idx_routing ON blobs (routing_id, stored_at);
-            CREATE INDEX IF NOT EXISTS idx_expiry ON blobs (expires_at);",
-        )
-        .map_err(|e| StorageError::Internal(format!("failed to create blobs table: {e}")))?;
+        conn.execute_batch(sql_blob::SCHEMA)
+            .map_err(|e| StorageError::Internal(format!("failed to create blobs table: {e}")))?;
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -422,170 +398,48 @@ impl BlobStorage for CombinedNodeStorage {
         routing_id: [u8; 32],
         blob_id: [u8; 32],
         recipient_hint: Option<[u8; 32]>,
-        blob_ttl: u32,
+        lifetime: BlobLifetime,
         blob: Vec<u8>,
     ) -> Result<StoredBlob, StorageError> {
-        let stored_at = (self.clock)();
-        let expires_at = stored_at.saturating_add(u64::from(blob_ttl));
-
-        let hint_bytes: Option<Vec<u8>> = recipient_hint.map(|h| h.to_vec());
-
-        let conn = self.lock_conn()?;
-        conn.execute(
-            "INSERT OR REPLACE INTO blobs
-                (blob_id, routing_id, recipient_hint, blob_ttl, stored_at, expires_at, blob)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params![
-                blob_id.as_slice(),
-                routing_id.as_slice(),
-                hint_bytes,
-                blob_ttl,
-                stored_at,
-                expires_at,
-                blob,
-            ],
-        )
-        .map_err(|e| StorageError::Internal(format!("insert blob failed: {e}")))?;
-
-        Ok(StoredBlob {
+        let stored = StoredBlob {
             routing_id,
             blob_id,
             recipient_hint,
-            blob_ttl,
-            stored_at,
+            lifetime,
+            stored_at: (self.clock)(),
             blob,
-        })
+        };
+        sql_blob::store(&*self.lock_conn()?, stored)
     }
 
     async fn get(&self, blob_id: &[u8; 32]) -> Result<Option<StoredBlob>, StorageError> {
         let now = (self.clock)();
-        let conn = self.lock_conn()?;
-        let mut stmt = conn
-            .prepare_cached(
-                "SELECT routing_id, recipient_hint, blob_ttl, stored_at, blob
-                 FROM blobs WHERE blob_id = ?1 AND expires_at > ?2",
-            )
-            .map_err(|e| StorageError::Internal(format!("prepare failed: {e}")))?;
-
-        let result = stmt
-            .query_row(rusqlite::params![blob_id.as_slice(), now], |row| {
-                let routing_id_vec: Vec<u8> = row.get(0)?;
-                let hint_vec: Option<Vec<u8>> = row.get(1)?;
-                let blob_ttl: u32 = row.get(2)?;
-                let stored_at: u64 = row.get(3)?;
-                let blob: Vec<u8> = row.get(4)?;
-
-                let routing_id: [u8; 32] = vec_to_array(routing_id_vec, "routing_id")?;
-                let recipient_hint = hint_vec
-                    .map(|h| vec_to_array(h, "recipient_hint"))
-                    .transpose()?;
-
-                Ok(StoredBlob {
-                    routing_id,
-                    blob_id: *blob_id,
-                    recipient_hint,
-                    blob_ttl,
-                    stored_at,
-                    blob,
-                })
-            })
-            .optional()
-            .map_err(|e| StorageError::Internal(format!("query failed: {e}")))?;
-
-        Ok(result)
+        sql_blob::get(&*self.lock_conn()?, blob_id, now)
     }
 
     async fn query(
         &self,
         routing_id: &[u8; 32],
-        since: Option<u64>,
+        cursor: QueryCursor,
         limit: u32,
     ) -> Result<Vec<StoredBlob>, StorageError> {
         let now = (self.clock)();
-        let conn = self.lock_conn()?;
-
-        let since_ts = since.unwrap_or(0);
-
-        let mut stmt = conn
-            .prepare_cached(
-                "SELECT blob_id, recipient_hint, blob_ttl, stored_at, blob
-                 FROM blobs
-                 WHERE routing_id = ?1 AND expires_at > ?2 AND stored_at > ?3
-                 ORDER BY stored_at ASC
-                 LIMIT ?4",
-            )
-            .map_err(|e| StorageError::Internal(format!("prepare failed: {e}")))?;
-
-        let rows = stmt
-            .query_map(
-                rusqlite::params![routing_id.as_slice(), now, since_ts, limit],
-                |row| {
-                    let blob_id_vec: Vec<u8> = row.get(0)?;
-                    let hint_vec: Option<Vec<u8>> = row.get(1)?;
-                    let blob_ttl: u32 = row.get(2)?;
-                    let stored_at: u64 = row.get(3)?;
-                    let blob: Vec<u8> = row.get(4)?;
-
-                    let blob_id: [u8; 32] = vec_to_array(blob_id_vec, "blob_id")?;
-                    let recipient_hint = hint_vec
-                        .map(|h| vec_to_array(h, "recipient_hint"))
-                        .transpose()?;
-
-                    Ok(StoredBlob {
-                        routing_id: *routing_id,
-                        blob_id,
-                        recipient_hint,
-                        blob_ttl,
-                        stored_at,
-                        blob,
-                    })
-                },
-            )
-            .map_err(|e| StorageError::Internal(format!("query failed: {e}")))?;
-
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row.map_err(|e| StorageError::Internal(format!("row error: {e}")))?);
-        }
-
-        Ok(results)
+        sql_blob::query(&*self.lock_conn()?, routing_id, cursor, limit, now)
     }
 
     async fn delete(&self, blob_id: &[u8; 32]) -> Result<bool, StorageError> {
-        let conn = self.lock_conn()?;
-        let deleted = conn
-            .execute(
-                "DELETE FROM blobs WHERE blob_id = ?1",
-                rusqlite::params![blob_id.as_slice()],
-            )
-            .map_err(|e| StorageError::Internal(format!("delete blob failed: {e}")))?;
-        Ok(deleted > 0)
+        sql_blob::delete(&*self.lock_conn()?, blob_id)
     }
 
     async fn purge_expired(&self) -> Result<usize, StorageError> {
         let now = (self.clock)();
-        let conn = self.lock_conn()?;
-        let purged = conn
-            .execute(
-                "DELETE FROM blobs WHERE expires_at <= ?1",
-                rusqlite::params![now],
-            )
-            .map_err(|e| StorageError::Internal(format!("purge failed: {e}")))?;
-        Ok(purged)
+        sql_blob::purge_expired(&*self.lock_conn()?, now)
     }
 
     async fn count(&self) -> Result<usize, StorageError> {
-        let conn = self.lock_conn()?;
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))
-            .map_err(|e| StorageError::Internal(format!("count failed: {e}")))?;
-        usize::try_from(count)
-            .map_err(|e| StorageError::Internal(format!("blob count {count} out of range: {e}")))
+        sql_blob::count(&*self.lock_conn()?)
     }
 }
-
-// We need the optional() extension.
-use rusqlite::OptionalExtension;
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -826,15 +680,21 @@ mod tests {
         let blob_data = vec![1, 2, 3, 4];
         let blob_id = make_blob_id(&blob_data);
 
-        let stored =
-            BlobStorage::store(&storage, routing_id, blob_id, None, 3600, blob_data.clone())
-                .await
-                .unwrap();
+        let stored = BlobStorage::store(
+            &storage,
+            routing_id,
+            blob_id,
+            None,
+            BlobLifetime::Ttl(3600),
+            blob_data.clone(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(stored.blob_id, blob_id);
         assert_eq!(stored.routing_id, routing_id);
         assert_eq!(stored.blob, blob_data);
-        assert_eq!(stored.blob_ttl, 3600);
+        assert_eq!(stored.lifetime, BlobLifetime::Ttl(3600));
         assert_eq!(stored.stored_at, 1_000_000);
 
         let retrieved = storage.get(&blob_id).await.unwrap().unwrap();
@@ -861,9 +721,16 @@ mod tests {
         let blob_data = vec![5, 6, 7];
         let blob_id = make_blob_id(&blob_data);
 
-        BlobStorage::store(&storage, routing_id, blob_id, None, 3600, blob_data)
-            .await
-            .unwrap();
+        BlobStorage::store(
+            &storage,
+            routing_id,
+            blob_id,
+            None,
+            BlobLifetime::Ttl(3600),
+            blob_data,
+        )
+        .await
+        .unwrap();
 
         let deleted = BlobStorage::delete(&storage, &blob_id).await.unwrap();
         assert!(deleted);
@@ -894,12 +761,22 @@ mod tests {
             time.store(1_000_000 + u64::from(i), Ordering::Relaxed);
             let data = vec![i; 10];
             let blob_id = make_blob_id(&data);
-            BlobStorage::store(&storage, routing_id, blob_id, None, 3600, data)
-                .await
-                .unwrap();
+            BlobStorage::store(
+                &storage,
+                routing_id,
+                blob_id,
+                None,
+                BlobLifetime::Ttl(3600),
+                data,
+            )
+            .await
+            .unwrap();
         }
 
-        let results = storage.query(&routing_id, None, 100).await.unwrap();
+        let results = storage
+            .query(&routing_id, crate::native::storage::QueryCursor::All, 100)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 5);
     }
 
@@ -914,12 +791,22 @@ mod tests {
             time.store(1_000_000 + u64::from(i), Ordering::Relaxed);
             let data = vec![i; 10];
             let blob_id = make_blob_id(&data);
-            BlobStorage::store(&storage, routing_id, blob_id, None, 3600, data)
-                .await
-                .unwrap();
+            BlobStorage::store(
+                &storage,
+                routing_id,
+                blob_id,
+                None,
+                BlobLifetime::Ttl(3600),
+                data,
+            )
+            .await
+            .unwrap();
         }
 
-        let results = storage.query(&routing_id, None, 3).await.unwrap();
+        let results = storage
+            .query(&routing_id, crate::native::storage::QueryCursor::All, 3)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 3);
     }
 
@@ -934,12 +821,22 @@ mod tests {
             time.store(1_000_000 + u64::from(i), Ordering::Relaxed);
             let data = vec![i; 10];
             let blob_id = make_blob_id(&data);
-            BlobStorage::store(&storage, routing_id, blob_id, None, 3600, data)
-                .await
-                .unwrap();
+            BlobStorage::store(
+                &storage,
+                routing_id,
+                blob_id,
+                None,
+                BlobLifetime::Ttl(3600),
+                data,
+            )
+            .await
+            .unwrap();
         }
 
-        let results = storage.query(&routing_id, None, 100).await.unwrap();
+        let results = storage
+            .query(&routing_id, crate::native::storage::QueryCursor::All, 100)
+            .await
+            .unwrap();
         for window in results.windows(2) {
             assert!(window[0].stored_at <= window[1].stored_at);
         }
@@ -955,11 +852,21 @@ mod tests {
 
         let data = vec![1, 2, 3];
         let blob_id = make_blob_id(&data);
-        BlobStorage::store(&storage, routing_id_a, blob_id, None, 3600, data)
+        BlobStorage::store(
+            &storage,
+            routing_id_a,
+            blob_id,
+            None,
+            BlobLifetime::Ttl(3600),
+            data,
+        )
+        .await
+        .unwrap();
+
+        let results = storage
+            .query(&routing_id_b, crate::native::storage::QueryCursor::All, 100)
             .await
             .unwrap();
-
-        let results = storage.query(&routing_id_b, None, 100).await.unwrap();
         assert!(results.is_empty());
     }
 
@@ -973,9 +880,16 @@ mod tests {
         let data = vec![1, 2, 3];
         let blob_id = make_blob_id(&data);
 
-        let stored = BlobStorage::store(&storage, routing_id, blob_id, Some(hint), 3600, data)
-            .await
-            .unwrap();
+        let stored = BlobStorage::store(
+            &storage,
+            routing_id,
+            blob_id,
+            Some(hint),
+            BlobLifetime::Ttl(3600),
+            data,
+        )
+        .await
+        .unwrap();
         assert_eq!(stored.recipient_hint, Some(hint));
 
         let retrieved = storage.get(&blob_id).await.unwrap().unwrap();
@@ -992,9 +906,16 @@ mod tests {
         let blob_id = make_blob_id(&data);
 
         // Store with TTL of 100 seconds.
-        BlobStorage::store(&storage, routing_id, blob_id, None, 100, data)
-            .await
-            .unwrap();
+        BlobStorage::store(
+            &storage,
+            routing_id,
+            blob_id,
+            None,
+            BlobLifetime::Ttl(100),
+            data,
+        )
+        .await
+        .unwrap();
 
         // Advance clock past expiry.
         time.store(1_000_101, Ordering::Relaxed);
@@ -1015,9 +936,16 @@ mod tests {
         let data = vec![4, 5, 6];
         let blob_id = make_blob_id(&data);
 
-        BlobStorage::store(&storage, routing_id, blob_id, None, 3600, data)
-            .await
-            .unwrap();
+        BlobStorage::store(
+            &storage,
+            routing_id,
+            blob_id,
+            None,
+            BlobLifetime::Ttl(3600),
+            data,
+        )
+        .await
+        .unwrap();
 
         let purged = storage.purge_expired().await.unwrap();
         assert_eq!(purged, 0);
@@ -1035,9 +963,16 @@ mod tests {
         let data = vec![7, 8, 9];
         let blob_id = make_blob_id(&data);
 
-        BlobStorage::store(&storage, routing_id, blob_id, None, 100, data)
-            .await
-            .unwrap();
+        BlobStorage::store(
+            &storage,
+            routing_id,
+            blob_id,
+            None,
+            BlobLifetime::Ttl(100),
+            data,
+        )
+        .await
+        .unwrap();
 
         // Advance clock past expiry.
         time.store(1_000_101, Ordering::Relaxed);
@@ -1065,9 +1000,16 @@ mod tests {
         let routing_id = [0xDD; 32];
         let blob_data = vec![42; 100];
         let blob_id = make_blob_id(&blob_data);
-        BlobStorage::store(&storage, routing_id, blob_id, None, 3600, blob_data.clone())
-            .await
-            .unwrap();
+        BlobStorage::store(
+            &storage,
+            routing_id,
+            blob_id,
+            None,
+            BlobLifetime::Ttl(3600),
+            blob_data.clone(),
+        )
+        .await
+        .unwrap();
 
         // Both should be retrievable independently.
         assert_eq!(
@@ -1094,9 +1036,16 @@ mod tests {
             let routing_id = [0xEE; 32];
             let blob_data = vec![99; 50];
             let blob_id = make_blob_id(&blob_data);
-            BlobStorage::store(&storage, routing_id, blob_id, None, 86400, blob_data)
-                .await
-                .unwrap();
+            BlobStorage::store(
+                &storage,
+                routing_id,
+                blob_id,
+                None,
+                BlobLifetime::Ttl(86400),
+                blob_data,
+            )
+            .await
+            .unwrap();
         }
 
         // Re-open from same directory — data should survive.

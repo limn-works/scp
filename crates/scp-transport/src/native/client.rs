@@ -841,6 +841,7 @@ impl NativeRelayClient {
                 ref_id: None,
                 routing_id: *routing_id,
                 since,
+                after_blob: None,
                 limit: None,
             };
             let _response = self.send_request(msg).await?;
@@ -902,7 +903,8 @@ impl NativeRelayClient {
             ref_id: None,
             routing_id: *routing_id,
             recipient_hint: None,
-            blob_ttl,
+            blob_ttl: Some(blob_ttl),
+            retain: None,
             blob,
         };
 
@@ -1053,6 +1055,7 @@ impl NativeRelayClient {
             ref_id: None,
             routing_id: *routing_id,
             since,
+            after_blob: None,
             limit,
         };
         assign_ref_id(&mut msg, &ref_id);
@@ -1290,7 +1293,8 @@ impl NativeRelayClient {
             ref_id: None,
             routing_id,
             recipient_hint: None,
-            blob_ttl: 60,
+            blob_ttl: Some(60),
+            retain: None,
             blob: payload,
         };
 
@@ -1335,7 +1339,8 @@ mod tests {
             ref_id: None,
             routing_id: [0xAA; 32],
             recipient_hint: None,
-            blob_ttl: 3600,
+            blob_ttl: Some(3600),
+            retain: None,
             blob: vec![0x01],
         };
         assign_ref_id(&mut msg, "test-1");
@@ -1518,7 +1523,7 @@ mod tests {
             routing_id,
             blob_id,
             recipient_hint: None,
-            blob_ttl: 3600,
+            blob_ttl: Some(3600),
             stored_at: 1_700_000_000,
             blob: blob_data.clone(),
         };
@@ -1565,7 +1570,7 @@ mod tests {
             routing_id,
             blob_id: correct_blob_id,
             recipient_hint: None,
-            blob_ttl: 3600,
+            blob_ttl: Some(3600),
             stored_at: 1_700_000_000,
             blob: blob_data,
         };
@@ -1598,7 +1603,7 @@ mod tests {
             routing_id,
             blob_id: original_blob_id, // Hash of original, not tampered.
             recipient_hint: None,
-            blob_ttl: 3600,
+            blob_ttl: Some(3600),
             stored_at: 1_700_000_000,
             blob: tampered_blob,
         };
@@ -1627,7 +1632,7 @@ mod tests {
             routing_id,
             blob_id: correct_blob_id,
             recipient_hint: None,
-            blob_ttl: 3600,
+            blob_ttl: Some(3600),
             stored_at: 1_700_000_000,
             blob: empty_blob,
         };
@@ -1667,7 +1672,7 @@ mod tests {
             routing_id: routing_id_b,
             blob_id,
             recipient_hint: None,
-            blob_ttl: 3600,
+            blob_ttl: Some(3600),
             stored_at: 1_700_000_000,
             blob: blob_payload.clone(),
         };
@@ -1695,7 +1700,7 @@ mod tests {
             routing_id: routing_id_a,
             blob_id,
             recipient_hint: None,
-            blob_ttl: 3600,
+            blob_ttl: Some(3600),
             stored_at: 1_700_000_000,
             blob: blob_payload,
         };
@@ -1740,7 +1745,7 @@ mod tests {
             routing_id,
             blob_id,
             recipient_hint: None,
-            blob_ttl: 3600,
+            blob_ttl: Some(3600),
             stored_at: 1_700_000_000,
             blob: blob_payload.clone(),
         };
@@ -1780,7 +1785,7 @@ mod tests {
             routing_id,
             blob_id,
             recipient_hint: None,
-            blob_ttl: 3600,
+            blob_ttl: Some(3600),
             stored_at: 1_700_000_000,
             blob: blob_payload,
         };
@@ -1856,7 +1861,8 @@ mod tests {
             ref_id: None,
             routing_id: [0xAA; 32],
             recipient_hint: None,
-            blob_ttl: 3600,
+            blob_ttl: Some(3600),
+            retain: None,
             blob: vec![0x01],
         };
 
@@ -1889,7 +1895,8 @@ mod tests {
                 ref_id: None,
                 routing_id: [i; 32],
                 recipient_hint: None,
-                blob_ttl: 3600,
+                blob_ttl: Some(3600),
+                retain: None,
                 blob: vec![i],
             };
 
@@ -1940,7 +1947,8 @@ mod tests {
             ref_id: None,
             routing_id: [0xAA; 32],
             recipient_hint: None,
-            blob_ttl: 3600,
+            blob_ttl: Some(3600),
+            retain: None,
             blob: vec![0xDE, 0xAD],
         };
 
@@ -2088,20 +2096,13 @@ mod tests {
     /// normal resolution yielded zero candidates.
     #[tokio::test]
     async fn query_raw_e2e_returns_all_frames_and_completes_promptly() {
-        use crate::native::server::{DidRecordValidation, Relay, RelayConfig};
+        use crate::native::server::{Relay, RelayConfig};
         use crate::native::storage::BlobStorageBackend;
         use std::net::SocketAddr;
 
-        // This test exercises the CLIENT's multi-candidate collection over
-        // NON-validating storage (the frames use dummy key/signature bytes —
-        // exactly what a validating relay would reject). A validating relay
-        // collapses a DID routing_id to a single slot (SCP-RELAYRES-003), which
-        // is a separate, relay-side property; here we want the relay to keep and
-        // return every published blob so the client's sift path is exercised.
         let config = RelayConfig {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             delivery_jitter_ms: 0,
-            did_record_validation: DidRecordValidation::Disabled,
             ..RelayConfig::defaults(crate::relay::push_gate::test_relay_url())
         };
         let (_shutdown, addr) = Relay::start(config, BlobStorageBackend::in_memory())
@@ -2146,14 +2147,13 @@ mod tests {
     /// and returns every well-framed blob beside it.
     #[tokio::test]
     async fn query_drops_a_malformed_blob_and_returns_the_framed_one() {
-        use crate::native::server::{DidRecordValidation, Relay, RelayConfig};
+        use crate::native::server::{Relay, RelayConfig};
         use crate::native::storage::BlobStorageBackend;
         use std::net::SocketAddr;
 
         let config = RelayConfig {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             delivery_jitter_ms: 0,
-            did_record_validation: DidRecordValidation::Disabled,
             ..RelayConfig::defaults(crate::relay::push_gate::test_relay_url())
         };
         let (_shutdown, addr) = Relay::start(config, BlobStorageBackend::in_memory())
@@ -2196,16 +2196,13 @@ mod tests {
     /// empty. This behavioral test fails if the flag is silently flipped.
     #[tokio::test]
     async fn query_raw_twice_same_did_returns_record_both_times() {
-        use crate::native::server::{DidRecordValidation, Relay, RelayConfig};
+        use crate::native::server::{Relay, RelayConfig};
         use crate::native::storage::BlobStorageBackend;
         use std::net::SocketAddr;
 
-        // Client-side dedup-bypass behavior over NON-validating storage (the
-        // dummy-signature frame is not relay-valid). See the sibling test above.
         let config = RelayConfig {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             delivery_jitter_ms: 0,
-            did_record_validation: DidRecordValidation::Disabled,
             ..RelayConfig::defaults(crate::relay::push_gate::test_relay_url())
         };
         let (_shutdown, addr) = Relay::start(config, BlobStorageBackend::in_memory())
@@ -2287,7 +2284,7 @@ mod tests {
                             routing_id: *routing_id,
                             blob_id,
                             recipient_hint: None,
-                            blob_ttl: 3600,
+                            blob_ttl: Some(3600),
                             stored_at: 1_700_000_000,
                             blob,
                         }
@@ -2332,7 +2329,7 @@ mod tests {
                     routing_id: *routing_id,
                     blob_id,
                     recipient_hint: None,
-                    blob_ttl: 3600,
+                    blob_ttl: Some(3600),
                     stored_at: 1_700_000_000,
                     blob,
                 }]

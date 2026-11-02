@@ -257,17 +257,6 @@ pub struct NodeState {
     #[cfg(feature = "quic")]
     pub(crate) publish_rate_limiter: PublishRateLimiter,
 
-    /// Shared DID-record slot index from the relay server.
-    ///
-    /// Cloned from the WebSocket relay so the QUIC listener enforces DID-record
-    /// slot-exclusivity over the SAME claimed-slot index as WebSocket (§3.10.2,
-    /// ADR-004, SCP-RELAYRES-003). Without sharing this, a QUIC PUBLISH would
-    /// bypass the registry and co-locate junk with the genuine slot in the shared
-    /// blob store. Only present when the `quic` feature is enabled, since it is
-    /// consumed exclusively by the QUIC listener.
-    #[cfg(feature = "quic")]
-    pub(crate) did_slot_registry: scp_transport::native::did_slot::DidSlotRegistry,
-
     /// Pre-built QUIC server config for the relay-side QUIC listener.
     ///
     /// `Some` only in domain mode with a provisioned TLS certificate: the same
@@ -1518,8 +1507,6 @@ mod tests {
             #[cfg(feature = "quic")]
             publish_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter::new(100),
             #[cfg(feature = "quic")]
-            did_slot_registry: scp_transport::native::did_slot::DidSlotRegistry::new(),
-            #[cfg(feature = "quic")]
             quic_server_config: None,
             #[cfg(feature = "quic")]
             quic_listening: std::sync::atomic::AtomicBool::new(false),
@@ -1882,8 +1869,6 @@ mod vhost_tests {
             default_site_routing_id: std::sync::RwLock::new(None),
             #[cfg(feature = "quic")]
             publish_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter::new(100),
-            #[cfg(feature = "quic")]
-            did_slot_registry: scp_transport::native::did_slot::DidSlotRegistry::new(),
             #[cfg(feature = "quic")]
             quic_server_config: None,
             #[cfg(feature = "quic")]
@@ -2344,11 +2329,10 @@ fn spawn_quic_listener(
         rate_limit_publishes_per_second: rc.rate_limit_publishes_per_second,
         rate_limit_subscribes_per_minute: rc.rate_limit_subscribes_per_minute,
         delivery_jitter_ms: rc.delivery_jitter_ms,
-        // Match the co-deployed WebSocket relay's DID-record validation mode so
-        // slot-exclusivity is consistent across both transports on the shared
-        // store (§3.10.2). The listener also shares the relay's slot registry
-        // below — the two together honor one set of claimed slots.
-        did_record_validation: rc.did_record_validation,
+        // The co-deployed WebSocket relay's public-record store, so a retained
+        // record reaches storage through one admission and one selection on
+        // either transport (§9.10.12).
+        public_records: rc.public_records.clone(),
         // A clone of the WebSocket relay's live URL handle and the same push
         // role, so a push message is intercepted on QUIC too and a tier change
         // moves both transports' reserved push routing ID at once (§10.7.1).
@@ -2362,7 +2346,6 @@ fn spawn_quic_listener(
         state.subscription_registry.clone(),
         state.publish_rate_limiter.clone(),
         state.connection_tracker.clone(),
-        state.did_slot_registry.clone(),
     );
 
     let (quic_handle, local_addr) = listener.start(server_config)?;

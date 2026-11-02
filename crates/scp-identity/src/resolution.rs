@@ -69,15 +69,12 @@ pub fn did_routing_id(did: &str) -> [u8; 32] {
 /// Every production site that must turn a raw identity key into the DID
 /// `routing_id` it binds to calls **this** function; none re-inlines the
 /// `did_from_ed25519_public_key ∘ did_routing_id` composition. Today those
-/// sites are the relay WRITE path (`TransportRelayPublisher`), the relay
-/// ADMISSION check (`classify_did_record_frame` /
-/// `DidSlotRegistry::classify_stored_frame`, via [`did_record_routing_id`]),
-/// and `BRIDGE_REGISTER` authentication (`verify_bridge_registration`).
+/// sites are the relay WRITE path (`TransportRelayPublisher`) and
+/// `BRIDGE_REGISTER` authentication (`verify_bridge_registration`).
 ///
 /// They MUST agree byte-for-byte forever: were the write address and the
-/// admission binding to drift, every self-DID republish would be rejected as a
-/// binding mismatch by every validating relay — a silent, total availability
-/// failure for DID resolution. One function makes that agreement structural
+/// registration binding to drift, a bridge would register at a routing id
+/// no DID record is published to. One function makes that agreement structural
 /// rather than a convention independent copies could quietly violate. Tests
 /// deliberately keep their own independent recomposition as an oracle so a bug
 /// here cannot make both sides of an assertion vacuously agree; production code

@@ -891,7 +891,8 @@ impl TransportAdapter for WebTransportAdapter {
                         ref_id: Some(ref_id.clone()),
                         routing_id,
                         recipient_hint,
-                        blob_ttl: envelope.blob_ttl,
+                        blob_ttl: Some(envelope.blob_ttl),
+                        retain: None,
                         blob,
                     };
 
@@ -1299,6 +1300,7 @@ impl TransportAdapter for WebTransportAdapter {
                         ref_id: Some(ref_id.clone()),
                         routing_id: routing_id_bytes,
                         since,
+                        after_blob: None,
                         limit: None,
                     };
 
@@ -1687,7 +1689,7 @@ mod tests {
             routing_id: routing_a,
             blob_id: *crate::traits::BlobId::from_sha256(&blob_bytes).as_bytes(),
             recipient_hint: None,
-            blob_ttl: 3600,
+            blob_ttl: Some(3600),
             stored_at: 1_700_000_000,
             blob: blob_bytes,
         };

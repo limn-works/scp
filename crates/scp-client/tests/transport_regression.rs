@@ -69,7 +69,7 @@ fn self_echoed_announcement_is_benign_drop_and_not_self_recorded() {
         routing_id: context_routing_id(CTX),
         blob_id: [0u8; 32],
         recipient_hint: None,
-        blob_ttl: DEFAULT_APP_DATA_BLOB_TTL_SECS,
+        blob_ttl: Some(DEFAULT_APP_DATA_BLOB_TTL_SECS),
         stored_at: 0,
         blob: alice_ann.blob.clone(),
     }
@@ -447,7 +447,7 @@ fn undecryptable_announcement_on_known_routing_is_benign_drop() {
         routing_id: context_routing_id(CTX),
         blob_id: [0u8; 32],
         recipient_hint: None,
-        blob_ttl: DEFAULT_APP_DATA_BLOB_TTL_SECS,
+        blob_ttl: Some(DEFAULT_APP_DATA_BLOB_TTL_SECS),
         stored_at: 0,
         blob: carol_ann.blob,
     }
@@ -530,7 +530,7 @@ fn misrouted_app_frame_on_announcement_channel_is_dropped_not_received() {
         routing_id: context_routing_id(CTX),
         blob_id: [0u8; 32],
         recipient_hint: None,
-        blob_ttl: DEFAULT_APP_DATA_BLOB_TTL_SECS,
+        blob_ttl: Some(DEFAULT_APP_DATA_BLOB_TTL_SECS),
         stored_at: 0,
         blob: app_pub.blob,
     }
@@ -666,7 +666,7 @@ fn app_data_is_never_published_to_the_shared_channel() {
             context_routing_id(CTX),
             "app data must NEVER be published to the shared announcement channel"
         );
-        assert_eq!(p.blob_ttl, DEFAULT_APP_DATA_BLOB_TTL_SECS);
+        assert_eq!(p.blob_ttl, Some(DEFAULT_APP_DATA_BLOB_TTL_SECS));
         assert_eq!(
             p.envelope_routing_id(),
             vec![0u8; 32],
@@ -690,7 +690,7 @@ fn handle_relay_frame_drops_unknown_routing_and_surfaces_relay_err() {
         routing_id: [0x99u8; 32],
         blob_id: [0u8; 32],
         recipient_hint: None,
-        blob_ttl: DEFAULT_APP_DATA_BLOB_TTL_SECS,
+        blob_ttl: Some(DEFAULT_APP_DATA_BLOB_TTL_SECS),
         stored_at: 0,
         blob: OuterEnvelope::from_bytes(
             &scp_protocol::envelope::outer::create_outer_envelope(

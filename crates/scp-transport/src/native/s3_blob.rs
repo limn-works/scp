@@ -65,8 +65,58 @@ use aws_smithy_http_client::tls;
 use aws_smithy_http_client::tls::rustls_provider::CryptoMode;
 
 use super::storage::{
-    BlobBodyStream, BlobMetadata, BlobStorage, ClockFn, StorageError, StoredBlob, system_clock,
+    BlobBodyStream, BlobLifetime, BlobMetadata, BlobStorage, ClockFn, QueryCursor, StorageError,
+    StoredBlob, sort_query_order, system_clock,
 };
+
+/// The metadata value that marks a retained record, under [`RETAIN_KEY`].
+const RETAIN_VALUE: &str = "true";
+/// The metadata key a retained record carries in place of `blob_ttl`.
+const RETAIN_KEY: &str = "retain";
+
+/// Writes a blob's lifetime into its object metadata: `blob_ttl` and
+/// `expires_at` for a TTL blob, `retain` for a retained record.
+fn insert_lifetime_metadata(
+    metadata: &mut HashMap<String, String>,
+    lifetime: BlobLifetime,
+    stored_at: u64,
+) {
+    match lifetime {
+        BlobLifetime::Ttl(ttl) => {
+            metadata.insert("blob_ttl".to_owned(), ttl.to_string());
+            metadata.insert(
+                "expires_at".to_owned(),
+                stored_at.saturating_add(u64::from(ttl)).to_string(),
+            );
+        }
+        BlobLifetime::Retained => {
+            metadata.insert(RETAIN_KEY.to_owned(), RETAIN_VALUE.to_owned());
+        }
+    }
+}
+
+/// Reads a blob's lifetime back from its object metadata.
+///
+/// An object must carry exactly one of `blob_ttl` and `retain=true`; an
+/// object with neither, both, or another `retain` value is refused, so a
+/// damaged object never reads as a record TTL purge must keep.
+fn lifetime_from_metadata(
+    metadata: &HashMap<String, String>,
+) -> Result<BlobLifetime, StorageError> {
+    match (metadata.get("blob_ttl"), metadata.get(RETAIN_KEY)) {
+        (Some(ttl), None) => Ok(BlobLifetime::Ttl(S3BlobStore::parse_u32(ttl)?)),
+        (None, Some(retain)) if retain == RETAIN_VALUE => Ok(BlobLifetime::Retained),
+        (None, Some(_)) => Err(StorageError::Internal(
+            "invalid retain value in metadata".to_owned(),
+        )),
+        (Some(_), Some(_)) => Err(StorageError::Internal(
+            "metadata carries both blob_ttl and retain".to_owned(),
+        )),
+        (None, None) => Err(StorageError::Internal(
+            "metadata carries neither blob_ttl nor retain".to_owned(),
+        )),
+    }
+}
 
 /// Resolves the AWS SDK configuration over an HTTPS client that uses the ring rustls backend.
 ///
@@ -326,7 +376,7 @@ impl S3BlobStore {
             routing_id: meta.routing_id,
             blob_id: meta.blob_id,
             recipient_hint: meta.recipient_hint,
-            blob_ttl: meta.blob_ttl,
+            lifetime: meta.lifetime,
             stored_at: meta.stored_at,
             blob: body,
         })
@@ -339,7 +389,7 @@ impl S3BlobStore {
     ) -> Result<BlobMetadata, StorageError> {
         let routing_id = Self::parse_hex_32(Self::require_metadata(metadata, "routing_id")?)?;
         let blob_id = Self::parse_hex_32(Self::require_metadata(metadata, "blob_id")?)?;
-        let blob_ttl = Self::parse_u32(Self::require_metadata(metadata, "blob_ttl")?)?;
+        let lifetime = lifetime_from_metadata(metadata)?;
         let stored_at = Self::parse_u64(Self::require_metadata(metadata, "stored_at")?)?;
 
         let recipient_hint = metadata
@@ -351,7 +401,7 @@ impl S3BlobStore {
             routing_id,
             blob_id,
             recipient_hint,
-            blob_ttl,
+            lifetime,
             stored_at,
             content_length,
         })
@@ -410,19 +460,17 @@ impl BlobStorage for S3BlobStore {
         routing_id: [u8; 32],
         blob_id: [u8; 32],
         recipient_hint: Option<[u8; 32]>,
-        blob_ttl: u32,
+        lifetime: BlobLifetime,
         blob: Vec<u8>,
     ) -> Result<StoredBlob, StorageError> {
         let stored_at = self.now();
-        let expires_at = stored_at.saturating_add(u64::from(blob_ttl));
 
         // Build metadata map for S3 object user metadata.
         let mut metadata = HashMap::new();
         metadata.insert("routing_id".to_owned(), hex::encode(routing_id));
         metadata.insert("blob_id".to_owned(), hex::encode(blob_id));
-        metadata.insert("blob_ttl".to_owned(), blob_ttl.to_string());
         metadata.insert("stored_at".to_owned(), stored_at.to_string());
-        metadata.insert("expires_at".to_owned(), expires_at.to_string());
+        insert_lifetime_metadata(&mut metadata, lifetime, stored_at);
         if let Some(hint) = &recipient_hint {
             metadata.insert("recipient_hint".to_owned(), hex::encode(hint));
         }
@@ -459,27 +507,31 @@ impl BlobStorage for S3BlobStore {
                 ))
             })?;
 
-        // 3. Put expiry index entry (empty body, metadata with routing_id).
-        let expiry_key = self.expiry_key(expires_at, &blob_id);
-        let mut expiry_metadata = HashMap::new();
-        expiry_metadata.insert("routing_id".to_owned(), hex::encode(routing_id));
-        self.client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(&expiry_key)
-            .body(ByteStream::from(Vec::<u8>::new()))
-            .set_metadata(Some(expiry_metadata))
-            .send()
-            .await
-            .map_err(|e| {
-                StorageError::Internal(format!("S3 put expiry index failed for {expiry_key}: {e}"))
-            })?;
+        // 3. Put expiry index entry for a TTL blob (empty body, metadata with routing_id).
+        if let Some(expires_at) = lifetime.expires_at(stored_at) {
+            let expiry_key = self.expiry_key(expires_at, &blob_id);
+            let mut expiry_metadata = HashMap::new();
+            expiry_metadata.insert("routing_id".to_owned(), hex::encode(routing_id));
+            self.client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(&expiry_key)
+                .body(ByteStream::from(Vec::<u8>::new()))
+                .set_metadata(Some(expiry_metadata))
+                .send()
+                .await
+                .map_err(|e| {
+                    StorageError::Internal(format!(
+                        "S3 put expiry index failed for {expiry_key}: {e}"
+                    ))
+                })?;
+        }
 
         Ok(StoredBlob {
             routing_id,
             blob_id,
             recipient_hint,
-            blob_ttl,
+            lifetime,
             stored_at,
             blob,
         })
@@ -521,10 +573,10 @@ impl BlobStorage for S3BlobStore {
         let stored_blob = Self::stored_blob_from_response(&metadata, body)?;
 
         // Check expiry: if the blob has expired, return None.
-        let expires_at = stored_blob
-            .stored_at
-            .saturating_add(u64::from(stored_blob.blob_ttl));
-        if expires_at <= self.now() {
+        if stored_blob
+            .lifetime
+            .expired(stored_blob.stored_at, self.now())
+        {
             return Ok(None);
         }
 
@@ -534,7 +586,7 @@ impl BlobStorage for S3BlobStore {
     async fn query(
         &self,
         routing_id: &[u8; 32],
-        since: Option<u64>,
+        cursor: QueryCursor,
         limit: u32,
     ) -> Result<Vec<StoredBlob>, StorageError> {
         let prefix = format!("{}/routing/{}/", self.prefix, hex::encode(routing_id));
@@ -621,24 +673,16 @@ impl BlobStorage for S3BlobStore {
 
             let stored_blob = Self::stored_blob_from_response(&metadata, body)?;
 
-            // Skip expired blobs.
-            let expires_at = stored_blob
-                .stored_at
-                .saturating_add(u64::from(stored_blob.blob_ttl));
-            if expires_at <= now {
-                continue;
-            }
-
-            // Apply since filter.
-            if since.is_some_and(|since_ts| stored_blob.stored_at <= since_ts) {
+            if stored_blob.lifetime.expired(stored_blob.stored_at, now)
+                || !cursor.admits(stored_blob.stored_at, &stored_blob.blob_id)
+            {
                 continue;
             }
 
             results.push(stored_blob);
         }
 
-        // Sort oldest-first (ascending stored_at).
-        results.sort_by_key(|b| b.stored_at);
+        sort_query_order(&mut results);
 
         // Apply limit.
         // u32 fits in usize on all supported platforms (32-bit+).
@@ -656,16 +700,20 @@ impl BlobStorage for S3BlobStore {
         };
 
         let routing_id = Self::parse_hex_32(Self::require_metadata(&metadata, "routing_id")?)?;
-        let expires_at = Self::parse_u64(Self::require_metadata(&metadata, "expires_at")?)?;
+        let lifetime = lifetime_from_metadata(&metadata)?;
+        let stored_at = Self::parse_u64(Self::require_metadata(&metadata, "stored_at")?)?;
 
-        // Delete all three objects: blob, routing index, expiry index.
+        // Delete the blob, its routing index entry, and a TTL blob's expiry
+        // index entry (a retained blob has none).
         let blob_key = self.blob_key(blob_id);
         let routing_key = self.routing_key(&routing_id, blob_id);
-        let expiry_key = self.expiry_key(expires_at, blob_id);
 
         self.delete_object(&blob_key).await?;
         self.delete_object(&routing_key).await?;
-        self.delete_object(&expiry_key).await?;
+        if let Some(expires_at) = lifetime.expires_at(stored_at) {
+            self.delete_object(&self.expiry_key(expires_at, blob_id))
+                .await?;
+        }
 
         Ok(true)
     }
@@ -819,7 +867,7 @@ impl BlobStorage for S3BlobStore {
         routing_id: [u8; 32],
         blob_id: [u8; 32],
         recipient_hint: Option<[u8; 32]>,
-        blob_ttl: u32,
+        lifetime: BlobLifetime,
         content_length: Option<u64>,
         body: BlobBodyStream,
     ) -> Result<BlobMetadata, StorageError> {
@@ -859,15 +907,13 @@ impl BlobStorage for S3BlobStore {
         }
 
         let stored_at = self.now();
-        let expires_at = stored_at.saturating_add(u64::from(blob_ttl));
 
         // Build metadata map for S3 object user metadata.
         let mut metadata = HashMap::new();
         metadata.insert("routing_id".to_owned(), hex::encode(routing_id));
         metadata.insert("blob_id".to_owned(), hex::encode(blob_id));
-        metadata.insert("blob_ttl".to_owned(), blob_ttl.to_string());
         metadata.insert("stored_at".to_owned(), stored_at.to_string());
-        metadata.insert("expires_at".to_owned(), expires_at.to_string());
+        insert_lifetime_metadata(&mut metadata, lifetime, stored_at);
         if let Some(hint) = &recipient_hint {
             metadata.insert("recipient_hint".to_owned(), hex::encode(hint));
         }
@@ -912,27 +958,31 @@ impl BlobStorage for S3BlobStore {
                 ))
             })?;
 
-        // Put expiry index entry (empty body, metadata with routing_id).
-        let expiry_key = self.expiry_key(expires_at, &blob_id);
-        let mut expiry_metadata = HashMap::new();
-        expiry_metadata.insert("routing_id".to_owned(), hex::encode(routing_id));
-        self.client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(&expiry_key)
-            .body(ByteStream::from(Vec::<u8>::new()))
-            .set_metadata(Some(expiry_metadata))
-            .send()
-            .await
-            .map_err(|e| {
-                StorageError::Internal(format!("S3 put expiry index failed for {expiry_key}: {e}"))
-            })?;
+        // Put expiry index entry for a TTL blob (empty body, metadata with routing_id).
+        if let Some(expires_at) = lifetime.expires_at(stored_at) {
+            let expiry_key = self.expiry_key(expires_at, &blob_id);
+            let mut expiry_metadata = HashMap::new();
+            expiry_metadata.insert("routing_id".to_owned(), hex::encode(routing_id));
+            self.client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(&expiry_key)
+                .body(ByteStream::from(Vec::<u8>::new()))
+                .set_metadata(Some(expiry_metadata))
+                .send()
+                .await
+                .map_err(|e| {
+                    StorageError::Internal(format!(
+                        "S3 put expiry index failed for {expiry_key}: {e}"
+                    ))
+                })?;
+        }
 
         Ok(BlobMetadata {
             routing_id,
             blob_id,
             recipient_hint,
-            blob_ttl,
+            lifetime,
             stored_at,
             content_length,
         })
@@ -972,8 +1022,7 @@ impl BlobStorage for S3BlobStore {
         let meta = Self::metadata_from_response(&metadata, s3_content_length)?;
 
         // Check expiry.
-        let expires_at = meta.stored_at.saturating_add(u64::from(meta.blob_ttl));
-        if expires_at <= self.now() {
+        if meta.lifetime.expired(meta.stored_at, self.now()) {
             return Ok(None);
         }
 
@@ -1017,6 +1066,40 @@ mod tests {
     use sha2::{Digest, Sha256};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn lifetime_round_trip(lifetime: BlobLifetime) -> HashMap<String, String> {
+        let mut metadata = HashMap::new();
+        insert_lifetime_metadata(&mut metadata, lifetime, 1_000);
+        assert_eq!(lifetime_from_metadata(&metadata).unwrap(), lifetime);
+        metadata
+    }
+
+    #[test]
+    fn ttl_lifetime_writes_ttl_and_expiry_metadata() {
+        let metadata = lifetime_round_trip(BlobLifetime::Ttl(60));
+        assert_eq!(metadata.get("blob_ttl").map(String::as_str), Some("60"));
+        assert_eq!(metadata.get("expires_at").map(String::as_str), Some("1060"));
+        assert!(!metadata.contains_key(RETAIN_KEY));
+    }
+
+    #[test]
+    fn retained_lifetime_writes_retain_and_no_expiry() {
+        let metadata = lifetime_round_trip(BlobLifetime::Retained);
+        assert_eq!(metadata.get(RETAIN_KEY).map(String::as_str), Some("true"));
+        assert!(!metadata.contains_key("blob_ttl"));
+        assert!(!metadata.contains_key("expires_at"));
+    }
+
+    #[test]
+    fn lifetime_metadata_refuses_neither_both_or_a_bad_retain() {
+        let mut metadata = HashMap::new();
+        assert!(lifetime_from_metadata(&metadata).is_err());
+        metadata.insert(RETAIN_KEY.to_owned(), "yes".to_owned());
+        assert!(lifetime_from_metadata(&metadata).is_err());
+        metadata.insert(RETAIN_KEY.to_owned(), RETAIN_VALUE.to_owned());
+        metadata.insert("blob_ttl".to_owned(), "60".to_owned());
+        assert!(lifetime_from_metadata(&metadata).is_err());
+    }
 
     /// Returns the test endpoint URL from env, defaulting to localhost `MinIO`.
     fn test_endpoint() -> String {
@@ -1069,19 +1152,76 @@ mod tests {
         let blob_id = make_blob_id(&blob_data);
 
         let stored = store
-            .store(routing_id, blob_id, None, 3600, blob_data.clone())
+            .store(
+                routing_id,
+                blob_id,
+                None,
+                crate::native::storage::BlobLifetime::Ttl(3600),
+                blob_data.clone(),
+            )
             .await
             .unwrap();
 
         assert_eq!(stored.blob_id, blob_id);
         assert_eq!(stored.routing_id, routing_id);
         assert_eq!(stored.blob, blob_data);
-        assert_eq!(stored.blob_ttl, 3600);
+        assert_eq!(stored.lifetime, BlobLifetime::Ttl(3600));
         assert_eq!(stored.stored_at, 1_000_000);
 
         let retrieved = store.get(&blob_id).await.unwrap().unwrap();
         assert_eq!(retrieved.blob, blob_data);
         assert_eq!(retrieved.blob_id, blob_id);
+    }
+
+    /// `09-security-model.md` §9.10.12: a retained record carries no TTL, so
+    /// no purge removes it while a TTL blob beside it expires.
+    #[tokio::test]
+    #[ignore = "requires S3-compatible endpoint"]
+    async fn retained_record_survives_every_purge() {
+        let (clock, time) = test_clock(1_000_000);
+        let storage = test_store(clock).await;
+        let routing_id = [0xAD; 32];
+        let retained = vec![0x52; 16];
+        let retained_id = make_blob_id(&retained);
+        storage
+            .store(
+                routing_id,
+                retained_id,
+                None,
+                crate::native::storage::BlobLifetime::Retained,
+                retained.clone(),
+            )
+            .await
+            .unwrap();
+        let ttl_data = vec![0x54; 16];
+        let ttl_id = make_blob_id(&ttl_data);
+        storage
+            .store(
+                routing_id,
+                ttl_id,
+                None,
+                crate::native::storage::BlobLifetime::Ttl(10),
+                ttl_data,
+            )
+            .await
+            .unwrap();
+
+        // Past the longest TTL a blob may carry, twice.
+        for _ in 0..2 {
+            time.fetch_add(
+                u64::from(scp_relay_client::MAX_BLOB_TTL) + 1,
+                Ordering::SeqCst,
+            );
+            storage.purge_expired().await.unwrap();
+        }
+
+        let held = storage.get(&retained_id).await.unwrap().unwrap();
+        assert_eq!(held.blob, retained);
+        assert_eq!(
+            held.lifetime,
+            crate::native::storage::BlobLifetime::Retained
+        );
+        assert!(storage.get(&ttl_id).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1106,7 +1246,13 @@ mod tests {
         let blob_id = make_blob_id(&blob_data);
 
         store
-            .store(routing_id, blob_id, None, 3600, blob_data)
+            .store(
+                routing_id,
+                blob_id,
+                None,
+                crate::native::storage::BlobLifetime::Ttl(3600),
+                blob_data,
+            )
             .await
             .unwrap();
 
@@ -1140,12 +1286,21 @@ mod tests {
             let data = vec![i; 10];
             let blob_id = make_blob_id(&data);
             store
-                .store(routing_id, blob_id, None, 3600, data)
+                .store(
+                    routing_id,
+                    blob_id,
+                    None,
+                    crate::native::storage::BlobLifetime::Ttl(3600),
+                    data,
+                )
                 .await
                 .unwrap();
         }
 
-        let results = store.query(&routing_id, None, 100).await.unwrap();
+        let results = store
+            .query(&routing_id, crate::native::storage::QueryCursor::All, 100)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 5);
     }
 
@@ -1161,12 +1316,21 @@ mod tests {
             let data = vec![i; 10];
             let blob_id = make_blob_id(&data);
             store
-                .store(routing_id, blob_id, None, 3600, data)
+                .store(
+                    routing_id,
+                    blob_id,
+                    None,
+                    crate::native::storage::BlobLifetime::Ttl(3600),
+                    data,
+                )
                 .await
                 .unwrap();
         }
 
-        let results = store.query(&routing_id, None, 3).await.unwrap();
+        let results = store
+            .query(&routing_id, crate::native::storage::QueryCursor::All, 3)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 3);
     }
 
@@ -1182,12 +1346,21 @@ mod tests {
             let data = vec![i; 10];
             let blob_id = make_blob_id(&data);
             store
-                .store(routing_id, blob_id, None, 3600, data)
+                .store(
+                    routing_id,
+                    blob_id,
+                    None,
+                    crate::native::storage::BlobLifetime::Ttl(3600),
+                    data,
+                )
                 .await
                 .unwrap();
         }
 
-        let results = store.query(&routing_id, None, 100).await.unwrap();
+        let results = store
+            .query(&routing_id, crate::native::storage::QueryCursor::All, 100)
+            .await
+            .unwrap();
         for window in results.windows(2) {
             assert!(window[0].stored_at <= window[1].stored_at);
         }
@@ -1204,11 +1377,20 @@ mod tests {
         let data = vec![1, 2, 3];
         let blob_id = make_blob_id(&data);
         store
-            .store(routing_id_a, blob_id, None, 3600, data)
+            .store(
+                routing_id_a,
+                blob_id,
+                None,
+                crate::native::storage::BlobLifetime::Ttl(3600),
+                data,
+            )
             .await
             .unwrap();
 
-        let results = store.query(&routing_id_b, None, 100).await.unwrap();
+        let results = store
+            .query(&routing_id_b, crate::native::storage::QueryCursor::All, 100)
+            .await
+            .unwrap();
         assert!(results.is_empty());
     }
 
@@ -1223,7 +1405,13 @@ mod tests {
         let blob_id = make_blob_id(&data);
 
         let stored = store
-            .store(routing_id, blob_id, Some(hint), 3600, data)
+            .store(
+                routing_id,
+                blob_id,
+                Some(hint),
+                crate::native::storage::BlobLifetime::Ttl(3600),
+                data,
+            )
             .await
             .unwrap();
 
@@ -1244,7 +1432,13 @@ mod tests {
 
         // Store with TTL of 100 seconds.
         store
-            .store(routing_id, blob_id, None, 100, data)
+            .store(
+                routing_id,
+                blob_id,
+                None,
+                crate::native::storage::BlobLifetime::Ttl(100),
+                data,
+            )
             .await
             .unwrap();
 
@@ -1268,7 +1462,13 @@ mod tests {
         let blob_id = make_blob_id(&data);
 
         store
-            .store(routing_id, blob_id, None, 3600, data)
+            .store(
+                routing_id,
+                blob_id,
+                None,
+                crate::native::storage::BlobLifetime::Ttl(3600),
+                data,
+            )
             .await
             .unwrap();
 
@@ -1289,14 +1489,23 @@ mod tests {
         let blob_id = make_blob_id(&data);
 
         store
-            .store(routing_id, blob_id, None, 3600, data)
+            .store(
+                routing_id,
+                blob_id,
+                None,
+                crate::native::storage::BlobLifetime::Ttl(3600),
+                data,
+            )
             .await
             .unwrap();
 
         store.delete(&blob_id).await.unwrap();
 
         // After deletion, query should return empty.
-        let results = store.query(&routing_id, None, 100).await.unwrap();
+        let results = store
+            .query(&routing_id, crate::native::storage::QueryCursor::All, 100)
+            .await
+            .unwrap();
         assert!(results.is_empty());
     }
 
@@ -1313,14 +1522,24 @@ mod tests {
             let data = vec![i; 10];
             let blob_id = make_blob_id(&data);
             store
-                .store(routing_id, blob_id, None, 36_000, data)
+                .store(
+                    routing_id,
+                    blob_id,
+                    None,
+                    crate::native::storage::BlobLifetime::Ttl(36_000),
+                    data,
+                )
                 .await
                 .unwrap();
         }
 
         // Query with since = 1_000_000 should skip the first blob.
         let results = store
-            .query(&routing_id, Some(1_000_000), 100)
+            .query(
+                &routing_id,
+                crate::native::storage::QueryCursor::Since(1_000_000),
+                100,
+            )
             .await
             .unwrap();
         assert_eq!(results.len(), 2);
@@ -1337,7 +1556,13 @@ mod tests {
         let expected_id = make_blob_id(&blob_data);
 
         let stored = store
-            .store(routing_id, expected_id, None, 3600, blob_data)
+            .store(
+                routing_id,
+                expected_id,
+                None,
+                crate::native::storage::BlobLifetime::Ttl(3600),
+                blob_data,
+            )
             .await
             .unwrap();
 
@@ -1357,7 +1582,13 @@ mod tests {
             let data = vec![i; 10];
             let blob_id = make_blob_id(&data);
             store
-                .store(routing_id, blob_id, None, 10, data)
+                .store(
+                    routing_id,
+                    blob_id,
+                    None,
+                    crate::native::storage::BlobLifetime::Ttl(10),
+                    data,
+                )
                 .await
                 .unwrap();
         }
@@ -1375,7 +1606,13 @@ mod tests {
             let data = vec![i; 10];
             let blob_id = make_blob_id(&data);
             store
-                .store(routing_id, blob_id, None, 3600, data)
+                .store(
+                    routing_id,
+                    blob_id,
+                    None,
+                    crate::native::storage::BlobLifetime::Ttl(3600),
+                    data,
+                )
                 .await
                 .unwrap();
         }
@@ -1404,7 +1641,13 @@ mod tests {
         let short_data = vec![1, 2, 3];
         let short_id = make_blob_id(&short_data);
         store
-            .store(routing_id, short_id, None, 10, short_data)
+            .store(
+                routing_id,
+                short_id,
+                None,
+                crate::native::storage::BlobLifetime::Ttl(10),
+                short_data,
+            )
             .await
             .unwrap();
 
@@ -1413,7 +1656,13 @@ mod tests {
         let long_data = vec![4, 5, 6];
         let long_id = make_blob_id(&long_data);
         store
-            .store(routing_id, long_id, None, 3600, long_data.clone())
+            .store(
+                routing_id,
+                long_id,
+                None,
+                crate::native::storage::BlobLifetime::Ttl(3600),
+                long_data.clone(),
+            )
             .await
             .unwrap();
 
@@ -1443,7 +1692,13 @@ mod tests {
 
         // Store with TTL of 100 seconds.
         store
-            .store(routing_id, blob_id, None, 100, data)
+            .store(
+                routing_id,
+                blob_id,
+                None,
+                crate::native::storage::BlobLifetime::Ttl(100),
+                data,
+            )
             .await
             .unwrap();
 

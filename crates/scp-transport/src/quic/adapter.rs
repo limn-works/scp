@@ -344,7 +344,8 @@ impl TransportAdapter for QuicAdapter {
                 ref_id: None,
                 routing_id,
                 recipient_hint,
-                blob_ttl,
+                blob_ttl: Some(blob_ttl),
+                retain: None,
                 blob,
             };
 
@@ -553,6 +554,7 @@ impl TransportAdapter for QuicAdapter {
                 ref_id: None,
                 routing_id: routing_id_bytes,
                 since,
+                after_blob: None,
                 limit: None,
             };
 
@@ -1334,7 +1336,7 @@ mod tests {
             routing_id: mismatched,
             blob_id: [0xCCu8; 32],
             recipient_hint: None,
-            blob_ttl: 3600,
+            blob_ttl: Some(3600),
             stored_at: 1_700_000_000,
             blob,
         };

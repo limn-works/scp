@@ -71,7 +71,7 @@ struct StoredBlob {
     routing_id: [u8; 32],
     blob_id: [u8; 32],
     recipient_hint: Option<[u8; 32]>,
-    blob_ttl: u32,
+    blob_ttl: Option<u32>,
     stored_at: u64,
     blob: Vec<u8>,
 }
@@ -83,8 +83,8 @@ pub struct PublishRecord {
     pub conn: ConnId,
     /// The cleartext relay `routing_id` the frame was published to.
     pub routing_id: [u8; 32],
-    /// The relay-storage TTL (seconds) the publish requested.
-    pub blob_ttl: u32,
+    /// The relay-storage TTL (seconds) the publish requested; `None` for a `retain` PUBLISH.
+    pub blob_ttl: Option<u32>,
     /// The wire `OuterEnvelope` bytes (the `blob` field of the `PUBLISH`).
     pub blob: Vec<u8>,
 }
@@ -260,7 +260,8 @@ impl Relay {
                 ref_id: None,
                 routing_id,
                 recipient_hint: None,
-                blob_ttl: DEFAULT_APP_DATA_BLOB_TTL_SECS,
+                blob_ttl: Some(DEFAULT_APP_DATA_BLOB_TTL_SECS),
+                retain: None,
                 blob,
             },
         );
@@ -274,7 +275,7 @@ impl Relay {
             routing_id,
             blob_id: [0u8; 32],
             recipient_hint: None,
-            blob_ttl: DEFAULT_APP_DATA_BLOB_TTL_SECS,
+            blob_ttl: Some(DEFAULT_APP_DATA_BLOB_TTL_SECS),
             stored_at: 0,
             blob,
         }

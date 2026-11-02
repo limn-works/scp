@@ -25,7 +25,6 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::native::did_slot::DidSlotRegistry;
 use crate::native::storage::BlobStorage;
 use crate::relay::push_gate::LiveRelayUrl;
 use crate::relay::rate_limit::{ConnectionTracker, PublishRateLimiter};
@@ -133,7 +132,6 @@ pub struct WebTransportListener<S: BlobStorage> {
     subscriptions: SubscriptionRegistry,
     connection_tracker: ConnectionTracker,
     publish_rate_limiter: PublishRateLimiter,
-    did_slots: DidSlotRegistry,
 }
 
 impl<S: BlobStorage + 'static> WebTransportListener<S> {
@@ -141,13 +139,12 @@ impl<S: BlobStorage + 'static> WebTransportListener<S> {
     /// and shared state.
     ///
     /// The `storage`, `subscriptions`, `publish_rate_limiter`,
-    /// `connection_tracker`, and `did_slots` are shared with the WebSocket relay
-    /// server, QUIC listener, and UDP/DTLS listener, enabling cross-transport
-    /// message delivery, unified rate limiting, and one shared DID-record slot
-    /// index so slot-exclusivity holds across every transport on the shared blob
-    /// store (ADR-037 AC3, §3.10.2). Obtain the shared registry via
-    /// [`RelayServer::did_slot_registry`](crate::native::server::RelayServer::did_slot_registry)
-    /// and set `config.session_config.did_record_validation` to the relay's mode.
+    /// and `connection_tracker` are shared with the WebSocket relay server,
+    /// QUIC listener, and UDP/DTLS listener, enabling cross-transport message
+    /// delivery and unified rate limiting (ADR-037 AC3). Set
+    /// `config.session_config.public_records` to the relay's value, so a
+    /// retained record reaches the shared store only through one admission
+    /// (§9.10.12).
     /// Set `config.session_config.relay_url` to a clone of the relay's handle
     /// and `config.session_config.push` to the relay's value too, so push
     /// messages are intercepted and follow a URL change (§10.7.1).
@@ -158,7 +155,6 @@ impl<S: BlobStorage + 'static> WebTransportListener<S> {
         subscriptions: SubscriptionRegistry,
         publish_rate_limiter: PublishRateLimiter,
         connection_tracker: ConnectionTracker,
-        did_slots: DidSlotRegistry,
     ) -> Self {
         Self {
             config,
@@ -166,7 +162,6 @@ impl<S: BlobStorage + 'static> WebTransportListener<S> {
             subscriptions,
             connection_tracker,
             publish_rate_limiter,
-            did_slots,
         }
     }
 
@@ -202,7 +197,6 @@ impl<S: BlobStorage + 'static> WebTransportListener<S> {
             shutdown_token,
             self.publish_rate_limiter.clone(),
             remote_ip,
-            self.did_slots.clone(),
         )
     }
 
@@ -262,7 +256,6 @@ mod tests {
             subscriptions,
             rate_limiter,
             conn_tracker,
-            DidSlotRegistry::new(),
         )
     }
 
@@ -323,7 +316,6 @@ mod tests {
             crate::relay::subscription::new_registry(),
             PublishRateLimiter::new(100),
             crate::relay::rate_limit::new_connection_tracker(),
-            DidSlotRegistry::new(),
         );
         let mut session =
             listener.create_session(IpAddr::V4(Ipv4Addr::LOCALHOST), CancellationToken::new());
@@ -336,7 +328,8 @@ mod tests {
                     ref_id: Some("push".to_owned()),
                     routing_id: rid,
                     recipient_hint: None,
-                    blob_ttl: 60,
+                    blob_ttl: Some(60),
+                    retain: None,
                     blob: vec![0x42; 64],
                 })
                 .await
@@ -348,7 +341,13 @@ mod tests {
                 ),
                 "{reply:?}"
             );
-            assert!(storage.query(&rid, None, 100).await.unwrap().is_empty());
+            assert!(
+                storage
+                    .query(&rid, crate::native::storage::QueryCursor::All, 100)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
         }
     }
 
@@ -373,7 +372,6 @@ mod tests {
             crate::relay::subscription::new_registry(),
             PublishRateLimiter::new(100),
             crate::relay::rate_limit::new_connection_tracker(),
-            DidSlotRegistry::new(),
         );
         let rid = fixture.entry_a.push_routing_id();
         let blobs = |messages: &[RelayMessage]| {
@@ -391,6 +389,7 @@ mod tests {
                     ref_id: Some("q".to_owned()),
                     routing_id: rid,
                     since: None,
+                    after_blob: None,
                     limit: None,
                 })
                 .await
@@ -422,7 +421,8 @@ mod tests {
                 ref_id: Some("p".to_owned()),
                 routing_id: rid,
                 recipient_hint: None,
-                blob_ttl: 60,
+                blob_ttl: Some(60),
+                retain: None,
                 blob: vec![0x42; 64],
             })
             .await
@@ -464,7 +464,6 @@ mod tests {
             crate::relay::subscription::new_registry(),
             PublishRateLimiter::new(100),
             crate::relay::rate_limit::new_connection_tracker(),
-            DidSlotRegistry::new(),
         );
         let mut session =
             listener.create_session(IpAddr::V4(Ipv4Addr::LOCALHOST), CancellationToken::new());
@@ -473,7 +472,8 @@ mod tests {
             ref_id: Some("push".to_owned()),
             routing_id: rid,
             recipient_hint: None,
-            blob_ttl: 60,
+            blob_ttl: Some(60),
+            retain: None,
             blob: vec![0x42; 64],
         };
 
@@ -489,7 +489,13 @@ mod tests {
                 ),
                 "{reply:?}"
             );
-            assert!(storage.query(&rid, None, 100).await.unwrap().is_empty());
+            assert!(
+                storage
+                    .query(&rid, crate::native::storage::QueryCursor::All, 100)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
         }
         let reply = session
             .dispatch_message_multi(&publish(fixture.bridge_own_id))
@@ -507,7 +513,11 @@ mod tests {
         );
         assert_eq!(
             storage
-                .query(&fixture.bridge_own_id, None, 100)
+                .query(
+                    &fixture.bridge_own_id,
+                    crate::native::storage::QueryCursor::All,
+                    100
+                )
                 .await
                 .unwrap()
                 .len(),
@@ -540,7 +550,6 @@ mod tests {
             crate::relay::subscription::new_registry(),
             PublishRateLimiter::new(100),
             crate::relay::rate_limit::new_connection_tracker(),
-            DidSlotRegistry::new(),
         );
         let mut session =
             listener.create_session(IpAddr::V4(Ipv4Addr::LOCALHOST), CancellationToken::new());
@@ -553,7 +562,8 @@ mod tests {
                 ref_id: Some("push".to_owned()),
                 routing_id: rid,
                 recipient_hint: None,
-                blob_ttl: 60,
+                blob_ttl: Some(60),
+                retain: None,
                 blob: vec![0x42; 64],
             };
             let reply = session.dispatch_message_multi(&publish).await.unwrap();
@@ -564,7 +574,13 @@ mod tests {
                 ),
                 "{reply:?}"
             );
-            assert!(storage.query(&rid, None, 100).await.unwrap().is_empty());
+            assert!(
+                storage
+                    .query(&rid, crate::native::storage::QueryCursor::All, 100)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
         }
     }
 }

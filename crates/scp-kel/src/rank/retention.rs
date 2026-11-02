@@ -451,8 +451,7 @@ impl RetentionSet {
     /// Admits `candidate`, a valid chain of the basis's identifier, under
     /// R9's identity, retention bound and eviction rule. The holder of the
     /// accepted chain admits here every chain it holds other than the
-    /// accepted one; S5 (SCP-007 part) is the caller that wires that holder
-    /// into a validating store.
+    /// accepted one.
     ///
     /// Identity, R9: "An arrival every event of which the party already
     /// holds changes nothing." A candidate the basis or a retained suffix

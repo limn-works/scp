@@ -444,18 +444,10 @@ impl Tournament {
     }
 }
 
-// `AcceptedChainHolder` holds its divergent suffixes in a `RetentionSet`
-// under R9's bounds; S5 (SCP-007 part) is the caller that wires it into a
-// validating store, so it stays crate-private until then.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "AcceptedChainHolder's one caller is the validating store S5 (SCP-007 part) wires"
-    )
-)]
 mod holder;
 mod retention;
+
+pub use holder::{AcceptedChainHolder, HoldError, HoldOutcome};
 
 pub use retention::{
     Admission, AdoptedBasis, BasisKind, PersistedBasis, PersistedRetention, PersistedSuffix,

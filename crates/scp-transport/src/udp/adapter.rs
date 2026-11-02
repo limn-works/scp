@@ -251,7 +251,8 @@ impl TransportAdapter for UdpDtlsAdapter {
                 ref_id: None,
                 routing_id,
                 recipient_hint,
-                blob_ttl,
+                blob_ttl: Some(blob_ttl),
+                retain: None,
                 blob,
             };
 
@@ -321,6 +322,7 @@ impl TransportAdapter for UdpDtlsAdapter {
                 ref_id: None,
                 routing_id: routing_id_bytes,
                 since,
+                after_blob: None,
                 limit: None,
             };
 

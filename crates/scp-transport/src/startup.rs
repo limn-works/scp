@@ -3126,7 +3126,8 @@ mod push_tests {
             ref_id: Some("push".to_owned()),
             routing_id: relay_url.push_routing_id(),
             recipient_hint: None,
-            blob_ttl: 3600,
+            blob_ttl: Some(3600),
+            retain: None,
             blob: vec![0xC1],
         };
         sink.send(Message::Binary(publish.to_bytes().unwrap()))

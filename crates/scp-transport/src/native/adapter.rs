@@ -550,7 +550,8 @@ impl TransportAdapter for NativeRelayAdapter {
                 ref_id: None,
                 routing_id,
                 recipient_hint,
-                blob_ttl,
+                blob_ttl: Some(blob_ttl),
+                retain: None,
                 blob,
             };
 
@@ -795,7 +796,7 @@ mod tests {
             routing_id,
             blob_id,
             recipient_hint: None,
-            blob_ttl: 3600,
+            blob_ttl: Some(3600),
             stored_at: 1_700_000_000,
             blob: blob_data,
         };
@@ -875,7 +876,7 @@ mod tests {
             routing_id: [0xAA; 32],
             blob_id: [0xBB; 32],
             recipient_hint: None,
-            blob_ttl: 3600,
+            blob_ttl: Some(3600),
             stored_at: 1_700_000_000,
             blob: vec![0xFF, 0xFE, 0xFD], // Invalid envelope data.
         };

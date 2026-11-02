@@ -29,7 +29,10 @@ use scp_identity::{DidMethod, dht::ScpIdentity};
 use scp_platform::EncryptedStorage;
 use scp_platform::traits::{KeyCustody, Storage};
 use scp_transport::nat::NetworkChangeDetector;
+use scp_transport::native::public_records::PublicRecords;
 use scp_transport::native::server::{RelayConfig, RelayError, RelayServer};
+
+use crate::public_records::{NodePublicRecords, PublicRecordTerms};
 use scp_transport::native::storage::BlobStorageBackend;
 use scp_transport::relay::push::WebPushSender;
 use scp_transport::relay::push_endpoint::{OwnAddressLookup, OwnAddressTracker};
@@ -631,6 +634,11 @@ pub struct NodeConfig<K: KeyCustody, D: DidMethod, S: Storage> {
     /// [`PushSlot::Disabled`]. Push registrations are relay data, as blobs
     /// are, so the caller provides their store beside [`Self::blob_storage`].
     pub push: PushSlot,
+    /// The operator's terms for the public-record store every transport
+    /// admits retained records through (`09-security-model.md` §9.10.12,
+    /// §9.18.B). Defaults to [`PublicRecordTerms::UNCONFIGURED`]: no quota
+    /// bound, and no node-list context, so no conflict statement is admitted.
+    pub public_records: PublicRecordTerms,
 }
 
 impl<K: KeyCustody, D: DidMethod, S: Storage> NodeConfig<K, D, S> {
@@ -683,6 +691,7 @@ impl<K: KeyCustody, D: DidMethod, S: Storage> NodeConfig<K, D, S> {
             network_detector: None,
             blob_storage,
             push: PushSlot::Disabled,
+            public_records: PublicRecordTerms::UNCONFIGURED,
         }
     }
 }
@@ -752,6 +761,8 @@ struct ConfigTail {
     push: PendingPush,
     /// How the domain build resolves the relay's own hosts.
     own_lookup: OwnAddressLookup,
+    /// The store every transport admits retained records through.
+    public_records: PublicRecords,
 }
 
 /// Validates the config, returning a loud error for contradictory combinations
@@ -879,6 +890,7 @@ fn split_config<K: KeyCustody, D: DidMethod, S: Storage>(
         network_detector,
         blob_storage,
         push,
+        public_records,
     } = config;
     let push = start_push_slot(push, &reach)?;
 
@@ -899,6 +911,7 @@ fn split_config<K: KeyCustody, D: DidMethod, S: Storage>(
         blob_storage,
         push,
         own_lookup: OwnAddressLookup::system(),
+        public_records: PublicRecords::Store(Arc::new(NodePublicRecords::new(public_records))),
     };
 
     Ok((storage, identity, tail))
@@ -1058,6 +1071,7 @@ where
         blob_storage,
         push,
         own_lookup,
+        public_records,
     } = tail;
 
     // The Reach selects the build path. `Domain` reproduces the former
@@ -1086,6 +1100,7 @@ where
                 blob_storage,
                 push,
                 own_lookup,
+                public_records,
             )
             .await
         }
@@ -1119,6 +1134,7 @@ where
                 network_detector,
                 blob_storage,
                 push,
+                public_records,
                 skip_nat_probe,
             )
             .await
@@ -1155,6 +1171,7 @@ async fn build_node_domain<D, S>(
     blob_storage: BlobStorageBackend,
     push: PendingPush,
     own_lookup: OwnAddressLookup,
+    public_records: PublicRecords,
 ) -> Result<ApplicationNode<S>, NodeError>
 where
     D: DidMethod + 'static,
@@ -1209,6 +1226,7 @@ where
         bind_addr,
         bridge_secret: Some(*bridge_secret),
         push,
+        public_records,
         ..RelayConfig::defaults(LiveRelayUrl::new(relay_url))
     };
 
@@ -1222,11 +1240,6 @@ where
     // budgets are enforced uniformly across WebSocket and QUIC (ADR-037 AC3).
     #[cfg(feature = "quic")]
     let publish_rate_limiter = relay_server.publish_rate_limiter();
-    // Shared DID-record slot index — the QUIC listener reuses it so
-    // slot-exclusivity holds across WebSocket and QUIC over the shared store
-    // (§3.10.2, SCP-RELAYRES-003).
-    #[cfg(feature = "quic")]
-    let did_slot_registry = relay_server.did_slot_registry();
     let (shutdown_handle, bound_addr) = relay_server.start().await?;
     // Every `?` from here until the node is built shuts the relay down.
     let relay_guard = crate::RelayShutdownGuard::new(shutdown_handle);
@@ -1272,8 +1285,6 @@ where
                 subscription_registry.clone(),
                 #[cfg(feature = "quic")]
                 publish_rate_limiter.clone(),
-                #[cfg(feature = "quic")]
-                did_slot_registry.clone(),
                 acme_challenges,
                 #[cfg(feature = "http3")]
                 http3,
@@ -1315,8 +1326,6 @@ where
                 subscription_registry,
                 #[cfg(feature = "quic")]
                 publish_rate_limiter,
-                #[cfg(feature = "quic")]
-                did_slot_registry,
                 // The domain reach's TLS-failure fall-through always probes NAT
                 // (it is the §10.12.8 zero-config path), so it never skips the
                 // probe — matching the legacy `self.skip_nat_probe` which was
@@ -1348,6 +1357,7 @@ async fn build_node_no_domain<D, S>(
     network_detector: Option<Arc<dyn NetworkChangeDetector>>,
     blob_storage: BlobStorageBackend,
     push: PendingPush,
+    public_records: PublicRecords,
     skip_nat_probe: bool,
 ) -> Result<ApplicationNode<S>, NodeError>
 where
@@ -1385,6 +1395,7 @@ where
         bind_addr,
         bridge_secret: Some(*bridge_secret),
         push,
+        public_records,
         ..RelayConfig::defaults(LiveRelayUrl::new(relay_url))
     };
 
@@ -1398,10 +1409,6 @@ where
     // not served without TLS, but kept on NodeState for a uniform struct).
     #[cfg(feature = "quic")]
     let publish_rate_limiter = relay_server.publish_rate_limiter();
-    // Shared DID-record slot index (same rationale as publish_rate_limiter:
-    // unused in no-domain mode, kept for a uniform NodeState).
-    #[cfg(feature = "quic")]
-    let did_slot_registry = relay_server.did_slot_registry();
     let (shutdown_handle, bound_addr) = relay_server.start_with_listener(listener).await?;
     // Every `?` from here until the node is built shuts the relay down.
     let relay_guard = crate::RelayShutdownGuard::new(shutdown_handle);
@@ -1434,8 +1441,6 @@ where
         subscription_registry,
         #[cfg(feature = "quic")]
         publish_rate_limiter,
-        #[cfg(feature = "quic")]
-        did_slot_registry,
         skip_nat_probe,
     )
     .await
@@ -2089,7 +2094,8 @@ mod tests {
             ref_id: Some("push".to_owned()),
             routing_id,
             recipient_hint: None,
-            blob_ttl: 3600,
+            blob_ttl: Some(3600),
+            retain: None,
             blob: vec![0xC1],
         };
         sink.send(Message::Binary(publish.to_bytes().unwrap()))

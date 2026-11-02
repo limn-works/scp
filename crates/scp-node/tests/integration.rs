@@ -245,7 +245,8 @@ async fn scenario2_client_discovers_relay_via_well_known_and_subscribes() {
         ref_id: Some("pub-1".to_string()),
         routing_id,
         recipient_hint: None,
-        blob_ttl: 60,
+        blob_ttl: Some(60),
+        retain: None,
         blob: blob_content.clone(),
     };
     let publish_bytes = publish_msg.to_bytes().unwrap();

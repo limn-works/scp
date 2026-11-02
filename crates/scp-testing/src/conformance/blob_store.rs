@@ -97,14 +97,24 @@ macro_rules! blob_store_conformance {
                 let hint = [0xBB; 32];
 
                 let stored = store
-                    .store(routing_id, blob_id, Some(hint), 3600, blob_data.clone())
+                    .store(
+                        routing_id,
+                        blob_id,
+                        Some(hint),
+                        scp_transport::native::storage::BlobLifetime::Ttl(3600),
+                        blob_data.clone(),
+                    )
                     .await
                     .expect("store should succeed");
 
                 assert_eq!(stored.blob_id, blob_id, "blob_id mismatch");
                 assert_eq!(stored.routing_id, routing_id, "routing_id mismatch");
                 assert_eq!(stored.blob, blob_data, "blob content mismatch");
-                assert_eq!(stored.blob_ttl, 3600, "blob_ttl mismatch");
+                assert_eq!(
+                    stored.lifetime,
+                    scp_transport::native::storage::BlobLifetime::Ttl(3600),
+                    "blob_ttl mismatch"
+                );
                 assert_eq!(stored.recipient_hint, Some(hint), "recipient_hint mismatch");
                 assert!(stored.stored_at > 0, "stored_at should be positive");
 
@@ -125,7 +135,11 @@ macro_rules! blob_store_conformance {
                     Some(hint),
                     "retrieved recipient_hint mismatch"
                 );
-                assert_eq!(retrieved.blob_ttl, 3600, "retrieved blob_ttl mismatch");
+                assert_eq!(
+                    retrieved.lifetime,
+                    scp_transport::native::storage::BlobLifetime::Ttl(3600),
+                    "retrieved blob_ttl mismatch"
+                );
                 assert_eq!(
                     retrieved.stored_at, stored.stored_at,
                     "stored_at should match"
@@ -149,7 +163,13 @@ macro_rules! blob_store_conformance {
 
                 // Store with TTL of 60 seconds.
                 store
-                    .store(routing_id, blob_id, None, 60, blob_data)
+                    .store(
+                        routing_id,
+                        blob_id,
+                        None,
+                        scp_transport::native::storage::BlobLifetime::Ttl(60),
+                        blob_data,
+                    )
                     .await
                     .expect("store should succeed");
 
@@ -176,7 +196,13 @@ macro_rules! blob_store_conformance {
                     let data = vec![i; 10];
                     let blob_id = sha256_blob_id(&data);
                     store
-                        .store(routing_id, blob_id, None, 3600, data)
+                        .store(
+                            routing_id,
+                            blob_id,
+                            None,
+                            scp_transport::native::storage::BlobLifetime::Ttl(3600),
+                            data,
+                        )
                         .await
                         .expect("store should succeed");
 
@@ -187,7 +213,11 @@ macro_rules! blob_store_conformance {
                 }
 
                 let results = store
-                    .query(&routing_id, None, 100)
+                    .query(
+                        &routing_id,
+                        scp_transport::native::storage::QueryCursor::All,
+                        100,
+                    )
                     .await
                     .expect("query should succeed");
 
@@ -215,7 +245,13 @@ macro_rules! blob_store_conformance {
                     let data = vec![i + 100; 10];
                     let blob_id = sha256_blob_id(&data);
                     let stored = store
-                        .store(routing_id, blob_id, None, 3600, data)
+                        .store(
+                            routing_id,
+                            blob_id,
+                            None,
+                            scp_transport::native::storage::BlobLifetime::Ttl(3600),
+                            data,
+                        )
                         .await
                         .expect("store should succeed");
                     timestamps.push(stored.stored_at);
@@ -227,7 +263,11 @@ macro_rules! blob_store_conformance {
                 // Query with since = first blob's stored_at. Should exclude
                 // the first blob (since filter is exclusive: stored_at > since).
                 let results = store
-                    .query(&routing_id, Some(timestamps[0]), 100)
+                    .query(
+                        &routing_id,
+                        scp_transport::native::storage::QueryCursor::Since(timestamps[0]),
+                        100,
+                    )
                     .await
                     .expect("query should succeed");
 
@@ -250,7 +290,13 @@ macro_rules! blob_store_conformance {
                     let data = vec![i + 200; 10];
                     let blob_id = sha256_blob_id(&data);
                     store
-                        .store(routing_id, blob_id, None, 3600, data)
+                        .store(
+                            routing_id,
+                            blob_id,
+                            None,
+                            scp_transport::native::storage::BlobLifetime::Ttl(3600),
+                            data,
+                        )
                         .await
                         .expect("store should succeed");
 
@@ -259,7 +305,11 @@ macro_rules! blob_store_conformance {
                 }
 
                 let results = store
-                    .query(&routing_id, None, 2)
+                    .query(
+                        &routing_id,
+                        scp_transport::native::storage::QueryCursor::All,
+                        2,
+                    )
                     .await
                     .expect("query should succeed");
 
@@ -274,7 +324,13 @@ macro_rules! blob_store_conformance {
                 let blob_id = sha256_blob_id(&blob_data);
 
                 store
-                    .store(routing_id, blob_id, None, 3600, blob_data)
+                    .store(
+                        routing_id,
+                        blob_id,
+                        None,
+                        scp_transport::native::storage::BlobLifetime::Ttl(3600),
+                        blob_data,
+                    )
                     .await
                     .expect("store should succeed");
 
@@ -295,7 +351,11 @@ macro_rules! blob_store_conformance {
 
                 // Query should also not return the deleted blob.
                 let query_results = store
-                    .query(&routing_id, None, 100)
+                    .query(
+                        &routing_id,
+                        scp_transport::native::storage::QueryCursor::All,
+                        100,
+                    )
                     .await
                     .expect("query should succeed");
                 assert!(
@@ -312,7 +372,13 @@ macro_rules! blob_store_conformance {
                 let expected_id = sha256_blob_id(&blob_data);
 
                 let stored = store
-                    .store(routing_id, expected_id, None, 3600, blob_data)
+                    .store(
+                        routing_id,
+                        expected_id,
+                        None,
+                        scp_transport::native::storage::BlobLifetime::Ttl(3600),
+                        blob_data,
+                    )
                     .await
                     .expect("store should succeed");
 
@@ -332,7 +398,13 @@ macro_rules! blob_store_conformance {
                     let data = vec![i; 10];
                     let blob_id = sha256_blob_id(&data);
                     store
-                        .store(routing_id, blob_id, None, 10, data)
+                        .store(
+                            routing_id,
+                            blob_id,
+                            None,
+                            scp_transport::native::storage::BlobLifetime::Ttl(10),
+                            data,
+                        )
                         .await
                         .expect("store should succeed");
                 }
@@ -351,7 +423,13 @@ macro_rules! blob_store_conformance {
                     let data = vec![i; 10];
                     let blob_id = sha256_blob_id(&data);
                     store
-                        .store(routing_id, blob_id, None, 3600, data)
+                        .store(
+                            routing_id,
+                            blob_id,
+                            None,
+                            scp_transport::native::storage::BlobLifetime::Ttl(3600),
+                            data,
+                        )
                         .await
                         .expect("concurrent store should succeed");
                 }
@@ -393,7 +471,13 @@ macro_rules! blob_store_conformance {
                 let short_data = vec![1, 2, 3];
                 let short_id = sha256_blob_id(&short_data);
                 store
-                    .store(routing_id, short_id, None, 10, short_data)
+                    .store(
+                        routing_id,
+                        short_id,
+                        None,
+                        scp_transport::native::storage::BlobLifetime::Ttl(10),
+                        short_data,
+                    )
                     .await
                     .expect("store should succeed");
 
@@ -401,7 +485,13 @@ macro_rules! blob_store_conformance {
                 let long_data = vec![4, 5, 6];
                 let long_id = sha256_blob_id(&long_data);
                 store
-                    .store(routing_id, long_id, None, 3600, long_data.clone())
+                    .store(
+                        routing_id,
+                        long_id,
+                        None,
+                        scp_transport::native::storage::BlobLifetime::Ttl(3600),
+                        long_data.clone(),
+                    )
                     .await
                     .expect("store should succeed");
 
@@ -431,7 +521,11 @@ macro_rules! blob_store_conformance {
                 let unknown_routing_id = [0xFF; 32];
 
                 let results = store
-                    .query(&unknown_routing_id, None, 100)
+                    .query(
+                        &unknown_routing_id,
+                        scp_transport::native::storage::QueryCursor::All,
+                        100,
+                    )
                     .await
                     .expect("query should succeed");
 
@@ -454,13 +548,24 @@ macro_rules! blob_store_conformance {
                     Box::pin(stream::once(async { Ok(Bytes::from(vec![1, 2, 3, 4, 5])) }));
 
                 let meta = store
-                    .store_streaming(routing_id, blob_id, Some([0xBB; 32]), 3600, Some(5), body)
+                    .store_streaming(
+                        routing_id,
+                        blob_id,
+                        Some([0xBB; 32]),
+                        scp_transport::native::storage::BlobLifetime::Ttl(3600),
+                        Some(5),
+                        body,
+                    )
                     .await
                     .expect("store_streaming should succeed");
 
                 assert_eq!(meta.blob_id, blob_id, "blob_id mismatch");
                 assert_eq!(meta.routing_id, routing_id, "routing_id mismatch");
-                assert_eq!(meta.blob_ttl, 3600, "blob_ttl mismatch");
+                assert_eq!(
+                    meta.lifetime,
+                    scp_transport::native::storage::BlobLifetime::Ttl(3600),
+                    "blob_ttl mismatch"
+                );
                 assert_eq!(
                     meta.recipient_hint,
                     Some([0xBB; 32]),
@@ -487,7 +592,13 @@ macro_rules! blob_store_conformance {
 
                 // Store via regular store.
                 store
-                    .store(routing_id, blob_id, None, 3600, blob_data.clone())
+                    .store(
+                        routing_id,
+                        blob_id,
+                        None,
+                        scp_transport::native::storage::BlobLifetime::Ttl(3600),
+                        blob_data.clone(),
+                    )
                     .await
                     .expect("store should succeed");
 
@@ -500,7 +611,11 @@ macro_rules! blob_store_conformance {
 
                 assert_eq!(meta.blob_id, blob_id, "blob_id mismatch");
                 assert_eq!(meta.routing_id, routing_id, "routing_id mismatch");
-                assert_eq!(meta.blob_ttl, 3600, "blob_ttl mismatch");
+                assert_eq!(
+                    meta.lifetime,
+                    scp_transport::native::storage::BlobLifetime::Ttl(3600),
+                    "blob_ttl mismatch"
+                );
                 assert_eq!(meta.content_length, Some(5), "content_length mismatch");
 
                 // Collect the body stream.
@@ -521,7 +636,14 @@ macro_rules! blob_store_conformance {
                     Ok(Bytes::from(vec![99, 88, 77, 66, 55]))
                 }));
                 store
-                    .store_streaming(routing_id, blob_id, None, 3600, Some(5), body)
+                    .store_streaming(
+                        routing_id,
+                        blob_id,
+                        None,
+                        scp_transport::native::storage::BlobLifetime::Ttl(3600),
+                        Some(5),
+                        body,
+                    )
                     .await
                     .expect("store_streaming should succeed");
 
@@ -550,7 +672,14 @@ macro_rules! blob_store_conformance {
                 let body: BlobBodyStream = Box::pin(stream::empty());
 
                 let meta = store
-                    .store_streaming(routing_id, blob_id, None, 3600, Some(0), body)
+                    .store_streaming(
+                        routing_id,
+                        blob_id,
+                        None,
+                        scp_transport::native::storage::BlobLifetime::Ttl(3600),
+                        Some(0),
+                        body,
+                    )
                     .await
                     .expect("store_streaming with empty body should succeed");
 
@@ -580,7 +709,14 @@ macro_rules! blob_store_conformance {
                     Box::pin(stream::once(async { Ok(Bytes::from(vec![1, 2, 3])) }));
 
                 let meta = store
-                    .store_streaming(routing_id, blob_id, None, 3600, Some(100), body)
+                    .store_streaming(
+                        routing_id,
+                        blob_id,
+                        None,
+                        scp_transport::native::storage::BlobLifetime::Ttl(3600),
+                        Some(100),
+                        body,
+                    )
                     .await
                     .expect("store_streaming should accept mismatched content_length hint");
 
@@ -618,13 +754,24 @@ macro_rules! blob_store_conformance {
                 let body: BlobBodyStream =
                     Box::pin(stream::once(async { Ok(Bytes::from(vec![11, 22, 33])) }));
                 store
-                    .store_streaming(routing_id, blob_id, None, 3600, Some(3), body)
+                    .store_streaming(
+                        routing_id,
+                        blob_id,
+                        None,
+                        scp_transport::native::storage::BlobLifetime::Ttl(3600),
+                        Some(3),
+                        body,
+                    )
                     .await
                     .expect("store_streaming should succeed");
 
                 // Query via regular query — should find the blob.
                 let results = store
-                    .query(&routing_id, None, 100)
+                    .query(
+                        &routing_id,
+                        scp_transport::native::storage::QueryCursor::All,
+                        100,
+                    )
                     .await
                     .expect("query should succeed");
 
@@ -645,7 +792,13 @@ macro_rules! blob_store_conformance {
 
                 // Store with short TTL.
                 store
-                    .store(routing_id, blob_id, None, 60, blob_data)
+                    .store(
+                        routing_id,
+                        blob_id,
+                        None,
+                        scp_transport::native::storage::BlobLifetime::Ttl(60),
+                        blob_data,
+                    )
                     .await
                     .expect("store should succeed");
 
@@ -662,6 +815,234 @@ macro_rules! blob_store_conformance {
                 assert!(
                     result.is_none(),
                     "expired blob should return None from get_streaming"
+                );
+            }
+
+            /// Stores `data` at `routing_id` with the clock at `at`.
+            async fn store_at<B: BlobStorage>(
+                store: &B,
+                clock: &AtomicU64,
+                at: u64,
+                routing_id: [u8; 32],
+                data: Vec<u8>,
+            ) -> [u8; 32] {
+                clock.store(at, Ordering::Relaxed);
+                let blob_id = sha256_blob_id(&data);
+                store
+                    .store(
+                        routing_id,
+                        blob_id,
+                        None,
+                        scp_transport::native::storage::BlobLifetime::Ttl(3600),
+                        data,
+                    )
+                    .await
+                    .expect("store should succeed");
+                blob_id
+            }
+
+            /// The `blob_id`s a query answers, in the order it answers them.
+            async fn queried<B: BlobStorage>(
+                store: &B,
+                routing_id: &[u8; 32],
+                cursor: scp_transport::native::storage::QueryCursor,
+            ) -> Vec<[u8; 32]> {
+                store
+                    .query(routing_id, cursor, 100)
+                    .await
+                    .expect("query should succeed")
+                    .into_iter()
+                    .map(|blob| blob.blob_id)
+                    .collect()
+            }
+
+            /// `09-security-model.md` §9.10.12: a retained record carries no
+            /// TTL, so no purge removes it while a TTL blob beside it expires.
+            #[tokio::test]
+            async fn retained_record_survives_every_purge() {
+                let (store, clock) = $factory;
+                let routing_id = [0xAD; 32];
+                let retained = vec![0x52; 16];
+                let retained_id = sha256_blob_id(&retained);
+                let stored = store
+                    .store(
+                        routing_id,
+                        retained_id,
+                        None,
+                        scp_transport::native::storage::BlobLifetime::Retained,
+                        retained.clone(),
+                    )
+                    .await
+                    .expect("retained store should succeed");
+                assert_eq!(
+                    stored.lifetime,
+                    scp_transport::native::storage::BlobLifetime::Retained
+                );
+                let ttl_data = vec![0x54; 16];
+                let ttl_id = sha256_blob_id(&ttl_data);
+                store
+                    .store(
+                        routing_id,
+                        ttl_id,
+                        None,
+                        scp_transport::native::storage::BlobLifetime::Ttl(10),
+                        ttl_data,
+                    )
+                    .await
+                    .expect("ttl store should succeed");
+
+                // Past the longest TTL a blob may carry, twice.
+                for _ in 0..2 {
+                    let current = clock.load(Ordering::Relaxed);
+                    clock.store(
+                        current + u64::from(scp_relay_client::MAX_BLOB_TTL) + 1,
+                        Ordering::Relaxed,
+                    );
+                    store.purge_expired().await.expect("purge should succeed");
+                }
+
+                let held = store
+                    .get(&retained_id)
+                    .await
+                    .expect("get should succeed")
+                    .expect("the retained record survives every purge");
+                assert_eq!(held.blob, retained);
+                assert_eq!(
+                    held.lifetime,
+                    scp_transport::native::storage::BlobLifetime::Retained
+                );
+                assert!(
+                    store
+                        .get(&ttl_id)
+                        .await
+                        .expect("get should succeed")
+                        .is_none()
+                );
+                assert_eq!(
+                    queried(
+                        &store,
+                        &routing_id,
+                        scp_transport::native::storage::QueryCursor::All
+                    )
+                    .await,
+                    vec![retained_id],
+                );
+            }
+
+            /// One blob a second before `at`, three at `at`, one a second
+            /// after: the `blob_id`s in ascending (`stored_at`, `blob_id`)
+            /// order.
+            async fn cursor_fixture<B: BlobStorage>(
+                store: &B,
+                clock: &AtomicU64,
+                routing_id: [u8; 32],
+            ) -> (u64, Vec<[u8; 32]>) {
+                let at = clock.load(Ordering::Relaxed) + 100;
+                let before = store_at(store, clock, at - 1, routing_id, vec![0xB0]).await;
+                let mut tied = vec![
+                    store_at(store, clock, at, routing_id, vec![0xC1]).await,
+                    store_at(store, clock, at, routing_id, vec![0xC2]).await,
+                    store_at(store, clock, at, routing_id, vec![0xC3]).await,
+                ];
+                tied.sort_unstable();
+                let after = store_at(store, clock, at + 1, routing_id, vec![0xD0]).await;
+                let mut order = vec![before];
+                order.extend(tied);
+                order.push(after);
+                (at, order)
+            }
+
+            /// `after_blob` at the lowest tied `blob_id`: the two higher tied
+            /// blobs and the later one, never the cursor's own blob.
+            #[tokio::test]
+            async fn after_cursor_skips_the_tied_blob_it_names() {
+                let (store, clock) = $factory;
+                let routing_id = [0xC0; 32];
+                let (at, order) = cursor_fixture(&store, &clock, routing_id).await;
+                let cursor = scp_transport::native::storage::QueryCursor::After {
+                    since: at,
+                    blob_id: order[1],
+                };
+                assert_eq!(
+                    queried(&store, &routing_id, cursor).await,
+                    order[2..].to_vec()
+                );
+            }
+
+            /// `after_blob` at the highest tied `blob_id`: only the later blob.
+            #[tokio::test]
+            async fn after_cursor_at_the_last_tied_blob_returns_only_later_seconds() {
+                let (store, clock) = $factory;
+                let routing_id = [0xC1; 32];
+                let (at, order) = cursor_fixture(&store, &clock, routing_id).await;
+                let cursor = scp_transport::native::storage::QueryCursor::After {
+                    since: at,
+                    blob_id: order[3],
+                };
+                assert_eq!(queried(&store, &routing_id, cursor).await, vec![order[4]]);
+            }
+
+            /// `after_blob` below every tied `blob_id`: every tied blob and the
+            /// later one, and never the blob of the earlier second.
+            #[tokio::test]
+            async fn after_cursor_below_every_tied_blob_returns_the_whole_second() {
+                let (store, clock) = $factory;
+                let routing_id = [0xC2; 32];
+                let (at, order) = cursor_fixture(&store, &clock, routing_id).await;
+                let cursor = scp_transport::native::storage::QueryCursor::After {
+                    since: at,
+                    blob_id: [0x00; 32],
+                };
+                assert_eq!(
+                    queried(&store, &routing_id, cursor).await,
+                    order[1..].to_vec()
+                );
+            }
+
+            /// `after_blob` above every tied `blob_id`: only the later blob.
+            #[tokio::test]
+            async fn after_cursor_above_every_tied_blob_returns_only_later_seconds() {
+                let (store, clock) = $factory;
+                let routing_id = [0xC3; 32];
+                let (at, order) = cursor_fixture(&store, &clock, routing_id).await;
+                let cursor = scp_transport::native::storage::QueryCursor::After {
+                    since: at,
+                    blob_id: [0xFF; 32],
+                };
+                assert_eq!(queried(&store, &routing_id, cursor).await, vec![order[4]]);
+            }
+
+            /// Blobs stored with descending clocks come back in ascending
+            /// (`stored_at`, `blob_id`) order, from `All` and from `Since`.
+            #[tokio::test]
+            async fn query_serves_blobs_stored_out_of_order_ascending() {
+                let (store, clock) = $factory;
+                let routing_id = [0xC4; 32];
+                let base = clock.load(Ordering::Relaxed) + 1_000;
+                let mut stored = Vec::new();
+                for (offset, byte) in [(30u64, 0x01u8), (20, 0x02), (20, 0x03), (10, 0x04)] {
+                    let id = store_at(&store, &clock, base + offset, routing_id, vec![byte]).await;
+                    stored.push((base + offset, id));
+                }
+                stored.sort_unstable();
+                let expected: Vec<[u8; 32]> = stored.iter().map(|(_, id)| *id).collect();
+                assert_eq!(
+                    queried(
+                        &store,
+                        &routing_id,
+                        scp_transport::native::storage::QueryCursor::All
+                    )
+                    .await,
+                    expected,
+                );
+                assert_eq!(
+                    queried(
+                        &store,
+                        &routing_id,
+                        scp_transport::native::storage::QueryCursor::Since(base + 10)
+                    )
+                    .await,
+                    expected[1..].to_vec(),
                 );
             }
         }

@@ -31,7 +31,9 @@ use std::sync::Arc;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 
-use super::storage::{BlobStorage, ClockFn, StorageError, StoredBlob, system_clock};
+use super::storage::{
+    BlobLifetime, BlobStorage, ClockFn, QueryCursor, StorageError, StoredBlob, system_clock,
+};
 
 // ---------------------------------------------------------------------------
 // Schema
@@ -42,13 +44,13 @@ CREATE TABLE IF NOT EXISTS blobs (
     blob_id BYTEA PRIMARY KEY,
     routing_id BYTEA NOT NULL,
     recipient_hint BYTEA,
-    blob_ttl INTEGER NOT NULL,
+    blob_ttl INTEGER,
     stored_at BIGINT NOT NULL,
-    expires_at BIGINT NOT NULL,
+    expires_at BIGINT,
     blob BYTEA NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_routing ON blobs (routing_id, stored_at);
+CREATE INDEX IF NOT EXISTS idx_routing ON blobs (routing_id, stored_at, blob_id);
 CREATE INDEX IF NOT EXISTS idx_expiry ON blobs (expires_at);
 ";
 
@@ -140,11 +142,10 @@ impl BlobStorage for PostgresBlobStore {
         routing_id: [u8; 32],
         blob_id: [u8; 32],
         recipient_hint: Option<[u8; 32]>,
-        blob_ttl: u32,
+        lifetime: BlobLifetime,
         blob: Vec<u8>,
     ) -> Result<StoredBlob, StorageError> {
         let stored_at = self.now();
-        let expires_at = stored_at.saturating_add(u64::from(blob_ttl));
 
         let hint_slice: Option<&[u8]> = recipient_hint.as_ref().map(AsRef::as_ref);
 
@@ -162,9 +163,9 @@ impl BlobStorage for PostgresBlobStore {
         .bind(blob_id.as_slice())
         .bind(routing_id.as_slice())
         .bind(hint_slice)
-        .bind(u32_to_i32(blob_ttl))
+        .bind(lifetime.ttl().map(u32_to_i32))
         .bind(u64_to_i64(stored_at))
-        .bind(u64_to_i64(expires_at))
+        .bind(lifetime.expires_at(stored_at).map(u64_to_i64))
         .bind(&blob)
         .execute(&self.pool)
         .await
@@ -174,7 +175,7 @@ impl BlobStorage for PostgresBlobStore {
             routing_id,
             blob_id,
             recipient_hint,
-            blob_ttl,
+            lifetime,
             stored_at,
             blob,
         })
@@ -185,7 +186,7 @@ impl BlobStorage for PostgresBlobStore {
 
         let row = sqlx::query(
             "SELECT routing_id, recipient_hint, blob_ttl, stored_at, blob \
-             FROM blobs WHERE blob_id = $1 AND expires_at > $2",
+             FROM blobs WHERE blob_id = $1 AND (expires_at IS NULL OR expires_at > $2)",
         )
         .bind(blob_id.as_slice())
         .bind(u64_to_i64(now))
@@ -198,7 +199,7 @@ impl BlobStorage for PostgresBlobStore {
             Some(row) => {
                 let routing_id = bytes_to_array32(row.get::<Vec<u8>, _>("routing_id"))?;
                 let recipient_hint = optional_bytes_to_array32(row.get("recipient_hint"))?;
-                let blob_ttl = i32_to_u32(row.get::<i32, _>("blob_ttl"));
+                let lifetime = read_lifetime(&row);
                 let stored_at = i64_to_u64(row.get::<i64, _>("stored_at"));
                 let blob: Vec<u8> = row.get("blob");
 
@@ -206,7 +207,7 @@ impl BlobStorage for PostgresBlobStore {
                     routing_id,
                     blob_id: *blob_id,
                     recipient_hint,
-                    blob_ttl,
+                    lifetime,
                     stored_at,
                     blob,
                 }))
@@ -217,22 +218,26 @@ impl BlobStorage for PostgresBlobStore {
     async fn query(
         &self,
         routing_id: &[u8; 32],
-        since: Option<u64>,
+        cursor: QueryCursor,
         limit: u32,
     ) -> Result<Vec<StoredBlob>, StorageError> {
         let now = self.now();
-        let since_ts = u64_to_i64(since.unwrap_or(0));
 
+        // $3 is the `stored_at` floor and $4 the cursor's `blob_id`, or NULL
+        // for a cursor without one; a row at the floor passes only above it.
         let rows = sqlx::query(
             "SELECT blob_id, recipient_hint, blob_ttl, stored_at, blob \
              FROM blobs \
-             WHERE routing_id = $1 AND expires_at > $2 AND stored_at > $3 \
-             ORDER BY stored_at ASC \
-             LIMIT $4",
+             WHERE routing_id = $1 AND (expires_at IS NULL OR expires_at > $2) \
+               AND stored_at >= $3 \
+               AND ($4::BYTEA IS NULL OR stored_at > $3 OR blob_id > $4) \
+             ORDER BY stored_at ASC, blob_id ASC \
+             LIMIT $5",
         )
         .bind(routing_id.as_slice())
         .bind(u64_to_i64(now))
-        .bind(since_ts)
+        .bind(u64_to_i64(cursor.floor()))
+        .bind(cursor.after_blob().map(|id| id.to_vec()))
         .bind(i64::from(limit))
         .fetch_all(&self.pool)
         .await
@@ -242,7 +247,7 @@ impl BlobStorage for PostgresBlobStore {
         for row in rows {
             let blob_id = bytes_to_array32(row.get::<Vec<u8>, _>("blob_id"))?;
             let recipient_hint = optional_bytes_to_array32(row.get("recipient_hint"))?;
-            let blob_ttl = i32_to_u32(row.get::<i32, _>("blob_ttl"));
+            let lifetime = read_lifetime(&row);
             let stored_at = i64_to_u64(row.get::<i64, _>("stored_at"));
             let blob: Vec<u8> = row.get("blob");
 
@@ -250,7 +255,7 @@ impl BlobStorage for PostgresBlobStore {
                 routing_id: *routing_id,
                 blob_id,
                 recipient_hint,
-                blob_ttl,
+                lifetime,
                 stored_at,
                 blob,
             });
@@ -272,11 +277,12 @@ impl BlobStorage for PostgresBlobStore {
     async fn purge_expired(&self) -> Result<usize, StorageError> {
         let now = self.now();
 
-        let result = sqlx::query("DELETE FROM blobs WHERE expires_at <= $1")
-            .bind(u64_to_i64(now))
-            .execute(&self.pool)
-            .await
-            .map_err(|e| StorageError::Internal(format!("postgres purge: {e}")))?;
+        let result =
+            sqlx::query("DELETE FROM blobs WHERE expires_at IS NOT NULL AND expires_at <= $1")
+                .bind(u64_to_i64(now))
+                .execute(&self.pool)
+                .await
+                .map_err(|e| StorageError::Internal(format!("postgres purge: {e}")))?;
 
         #[allow(clippy::cast_possible_truncation)]
         Ok(result.rows_affected() as usize)
@@ -339,6 +345,11 @@ const fn i32_to_u32(v: i32) -> u32 {
 }
 
 /// Converts a `Vec<u8>` from a `BYTEA` column to a `[u8; 32]`.
+/// Reads the `blob_ttl` column: a value is a TTL, NULL a retained record.
+fn read_lifetime(row: &sqlx::postgres::PgRow) -> BlobLifetime {
+    BlobLifetime::from_ttl(row.get::<Option<i32>, _>("blob_ttl").map(i32_to_u32))
+}
+
 fn bytes_to_array32(bytes: Vec<u8>) -> Result<[u8; 32], StorageError> {
     bytes
         .try_into()
@@ -425,14 +436,20 @@ mod tests {
         let blob_id = make_blob_id(&blob_data);
 
         let stored = storage
-            .store(routing_id, blob_id, None, 3600, blob_data.clone())
+            .store(
+                routing_id,
+                blob_id,
+                None,
+                crate::native::storage::BlobLifetime::Ttl(3600),
+                blob_data.clone(),
+            )
             .await
             .unwrap();
 
         assert_eq!(stored.blob_id, blob_id);
         assert_eq!(stored.routing_id, routing_id);
         assert_eq!(stored.blob, blob_data);
-        assert_eq!(stored.blob_ttl, 3600);
+        assert_eq!(stored.lifetime, BlobLifetime::Ttl(3600));
         assert!(stored.stored_at > 0);
 
         let retrieved = storage.get(&blob_id).await.unwrap().unwrap();
@@ -458,7 +475,13 @@ mod tests {
         let blob_id = make_blob_id(&blob_data);
 
         storage
-            .store(routing_id, blob_id, None, 3600, blob_data)
+            .store(
+                routing_id,
+                blob_id,
+                None,
+                crate::native::storage::BlobLifetime::Ttl(3600),
+                blob_data,
+            )
             .await
             .unwrap();
 
@@ -488,12 +511,21 @@ mod tests {
             let data = vec![i; 10];
             let blob_id = make_blob_id(&data);
             storage
-                .store(routing_id, blob_id, None, 3600, data)
+                .store(
+                    routing_id,
+                    blob_id,
+                    None,
+                    crate::native::storage::BlobLifetime::Ttl(3600),
+                    data,
+                )
                 .await
                 .unwrap();
         }
 
-        let results = storage.query(&routing_id, None, 100).await.unwrap();
+        let results = storage
+            .query(&routing_id, crate::native::storage::QueryCursor::All, 100)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 5);
     }
 
@@ -507,12 +539,21 @@ mod tests {
             let data = vec![i; 10];
             let blob_id = make_blob_id(&data);
             storage
-                .store(routing_id, blob_id, None, 3600, data)
+                .store(
+                    routing_id,
+                    blob_id,
+                    None,
+                    crate::native::storage::BlobLifetime::Ttl(3600),
+                    data,
+                )
                 .await
                 .unwrap();
         }
 
-        let results = storage.query(&routing_id, None, 3).await.unwrap();
+        let results = storage
+            .query(&routing_id, crate::native::storage::QueryCursor::All, 3)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 3);
     }
 
@@ -529,12 +570,21 @@ mod tests {
             let data = vec![i; 10];
             let blob_id = make_blob_id(&data);
             storage
-                .store(routing_id, blob_id, None, 3600, data)
+                .store(
+                    routing_id,
+                    blob_id,
+                    None,
+                    crate::native::storage::BlobLifetime::Ttl(3600),
+                    data,
+                )
                 .await
                 .unwrap();
         }
 
-        let results = storage.query(&routing_id, None, 100).await.unwrap();
+        let results = storage
+            .query(&routing_id, crate::native::storage::QueryCursor::All, 100)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 3);
         for window in results.windows(2) {
             assert!(window[0].stored_at <= window[1].stored_at);
@@ -551,11 +601,20 @@ mod tests {
         let data = vec![1, 2, 3];
         let blob_id = make_blob_id(&data);
         storage
-            .store(routing_id_a, blob_id, None, 3600, data)
+            .store(
+                routing_id_a,
+                blob_id,
+                None,
+                crate::native::storage::BlobLifetime::Ttl(3600),
+                data,
+            )
             .await
             .unwrap();
 
-        let results = storage.query(&routing_id_b, None, 100).await.unwrap();
+        let results = storage
+            .query(&routing_id_b, crate::native::storage::QueryCursor::All, 100)
+            .await
+            .unwrap();
         assert!(results.is_empty());
     }
 
@@ -569,7 +628,13 @@ mod tests {
         let blob_id = make_blob_id(&data);
 
         let stored = storage
-            .store(routing_id, blob_id, Some(hint), 3600, data)
+            .store(
+                routing_id,
+                blob_id,
+                Some(hint),
+                crate::native::storage::BlobLifetime::Ttl(3600),
+                data,
+            )
             .await
             .unwrap();
 
@@ -577,6 +642,57 @@ mod tests {
 
         let retrieved = storage.get(&blob_id).await.unwrap().unwrap();
         assert_eq!(retrieved.recipient_hint, Some(hint));
+    }
+
+    /// `09-security-model.md` §9.10.12: a retained record carries no TTL, so
+    /// no purge removes it while a TTL blob beside it expires.
+    #[tokio::test]
+    #[ignore = "requires running PostgreSQL"]
+    async fn retained_record_survives_every_purge() {
+        let (clock, time) = test_clock(1_000_000);
+        let storage = fresh_store_with_clock(clock).await;
+        let routing_id = [0xAD; 32];
+        let retained = vec![0x52; 16];
+        let retained_id = make_blob_id(&retained);
+        storage
+            .store(
+                routing_id,
+                retained_id,
+                None,
+                crate::native::storage::BlobLifetime::Retained,
+                retained.clone(),
+            )
+            .await
+            .unwrap();
+        let ttl_data = vec![0x54; 16];
+        let ttl_id = make_blob_id(&ttl_data);
+        storage
+            .store(
+                routing_id,
+                ttl_id,
+                None,
+                crate::native::storage::BlobLifetime::Ttl(10),
+                ttl_data,
+            )
+            .await
+            .unwrap();
+
+        // Past the longest TTL a blob may carry, twice.
+        for _ in 0..2 {
+            time.fetch_add(
+                u64::from(scp_relay_client::MAX_BLOB_TTL) + 1,
+                Ordering::SeqCst,
+            );
+            storage.purge_expired().await.unwrap();
+        }
+
+        let held = storage.get(&retained_id).await.unwrap().unwrap();
+        assert_eq!(held.blob, retained);
+        assert_eq!(
+            held.lifetime,
+            crate::native::storage::BlobLifetime::Retained
+        );
+        assert!(storage.get(&ttl_id).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -590,7 +706,13 @@ mod tests {
 
         // Store with TTL of 60 seconds. expires_at = 1_000_060.
         storage
-            .store(routing_id, blob_id, None, 60, data)
+            .store(
+                routing_id,
+                blob_id,
+                None,
+                crate::native::storage::BlobLifetime::Ttl(60),
+                data,
+            )
             .await
             .unwrap();
 
@@ -613,7 +735,13 @@ mod tests {
         let blob_id = make_blob_id(&data);
 
         storage
-            .store(routing_id, blob_id, None, 3600, data)
+            .store(
+                routing_id,
+                blob_id,
+                None,
+                crate::native::storage::BlobLifetime::Ttl(3600),
+                data,
+            )
             .await
             .unwrap();
 
@@ -633,13 +761,22 @@ mod tests {
         let blob_id = make_blob_id(&data);
 
         storage
-            .store(routing_id, blob_id, None, 3600, data)
+            .store(
+                routing_id,
+                blob_id,
+                None,
+                crate::native::storage::BlobLifetime::Ttl(3600),
+                data,
+            )
             .await
             .unwrap();
 
         storage.delete(&blob_id).await.unwrap();
 
-        let results = storage.query(&routing_id, None, 100).await.unwrap();
+        let results = storage
+            .query(&routing_id, crate::native::storage::QueryCursor::All, 100)
+            .await
+            .unwrap();
         assert!(results.is_empty());
     }
 
@@ -656,7 +793,13 @@ mod tests {
             let data = vec![i; 10];
             let blob_id = make_blob_id(&data);
             storage
-                .store(routing_id, blob_id, None, 86400, data)
+                .store(
+                    routing_id,
+                    blob_id,
+                    None,
+                    crate::native::storage::BlobLifetime::Ttl(86400),
+                    data,
+                )
                 .await
                 .unwrap();
         }
@@ -664,7 +807,11 @@ mod tests {
         // Query with since=1_000_050 should exclude the first blob (stored_at=1_000_000)
         // and include the second (stored_at=1_000_100) and third (stored_at=1_000_200).
         let results = storage
-            .query(&routing_id, Some(1_000_050), 100)
+            .query(
+                &routing_id,
+                crate::native::storage::QueryCursor::Since(1_000_050),
+                100,
+            )
             .await
             .unwrap();
         assert_eq!(results.len(), 2);
@@ -682,7 +829,13 @@ mod tests {
 
         // Store with TTL of 60 seconds.
         storage
-            .store(routing_id, blob_id, None, 60, data)
+            .store(
+                routing_id,
+                blob_id,
+                None,
+                crate::native::storage::BlobLifetime::Ttl(60),
+                data,
+            )
             .await
             .unwrap();
 
@@ -707,7 +860,13 @@ mod tests {
         let expected_id = make_blob_id(&blob_data);
 
         let stored = storage
-            .store(routing_id, expected_id, None, 3600, blob_data)
+            .store(
+                routing_id,
+                expected_id,
+                None,
+                crate::native::storage::BlobLifetime::Ttl(3600),
+                blob_data,
+            )
             .await
             .unwrap();
 
@@ -726,7 +885,13 @@ mod tests {
             let data = vec![i; 10];
             let blob_id = make_blob_id(&data);
             storage
-                .store(routing_id, blob_id, None, 10, data)
+                .store(
+                    routing_id,
+                    blob_id,
+                    None,
+                    crate::native::storage::BlobLifetime::Ttl(10),
+                    data,
+                )
                 .await
                 .unwrap();
         }
@@ -743,7 +908,13 @@ mod tests {
             let data = vec![i; 10];
             let blob_id = make_blob_id(&data);
             storage
-                .store(routing_id, blob_id, None, 3600, data)
+                .store(
+                    routing_id,
+                    blob_id,
+                    None,
+                    crate::native::storage::BlobLifetime::Ttl(3600),
+                    data,
+                )
                 .await
                 .unwrap();
         }
@@ -772,7 +943,13 @@ mod tests {
         let short_data = vec![1, 2, 3];
         let short_id = make_blob_id(&short_data);
         storage
-            .store(routing_id, short_id, None, 10, short_data)
+            .store(
+                routing_id,
+                short_id,
+                None,
+                crate::native::storage::BlobLifetime::Ttl(10),
+                short_data,
+            )
             .await
             .unwrap();
 
@@ -780,7 +957,13 @@ mod tests {
         let long_data = vec![4, 5, 6];
         let long_id = make_blob_id(&long_data);
         storage
-            .store(routing_id, long_id, None, 3600, long_data.clone())
+            .store(
+                routing_id,
+                long_id,
+                None,
+                crate::native::storage::BlobLifetime::Ttl(3600),
+                long_data.clone(),
+            )
             .await
             .unwrap();
 
@@ -808,19 +991,31 @@ mod tests {
         let blob_id = make_blob_id(&data);
 
         storage
-            .store(routing_id, blob_id, None, 3600, data)
+            .store(
+                routing_id,
+                blob_id,
+                None,
+                crate::native::storage::BlobLifetime::Ttl(3600),
+                data,
+            )
             .await
             .unwrap();
 
         // Overwrite with different TTL.
         let updated_data = vec![1u8; 20];
         let result = storage
-            .store(routing_id, blob_id, None, 7200, updated_data.clone())
+            .store(
+                routing_id,
+                blob_id,
+                None,
+                crate::native::storage::BlobLifetime::Ttl(7200),
+                updated_data.clone(),
+            )
             .await;
         assert!(result.is_ok());
 
         let retrieved = storage.get(&blob_id).await.unwrap().unwrap();
         assert_eq!(retrieved.blob, updated_data);
-        assert_eq!(retrieved.blob_ttl, 7200);
+        assert_eq!(retrieved.lifetime, BlobLifetime::Ttl(7200));
     }
 }

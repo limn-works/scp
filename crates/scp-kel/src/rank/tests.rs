@@ -2,10 +2,9 @@
 //! (`09-security-model.md` §9.7.4.2 R6, R7, R9) over chains that fork from
 //! Vector 41, each suffix signed here.
 //!
-//! These tests sit in the crate because `AcceptedChainHolder` stays
-//! crate-private until S5 (SCP-007 part) wires it into a validating store,
-//! and because the retention tests drive `RetentionSet` and the holder with
-//! bounds small enough to reach. They compile the integration tests' spec 25 fixtures by path.
+//! These tests sit in the crate because the retention tests drive
+//! `RetentionSet` and the holder with bounds small enough to reach, which
+//! only the crate can construct. They compile the integration tests' spec 25 fixtures by path.
 //!
 //! Every expected rank and resolution is the test's own model of R6, read
 //! from the kinds of the events a test built: a suffix ranks by its first

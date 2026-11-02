@@ -1519,7 +1519,11 @@ async fn assert_relay_view_is_ciphertext(built: &BuiltNode, routing_id: &[u8; 32
     use scp_transport::native::storage::BlobStorage;
     let blobs = built
         .blob_storage
-        .query(routing_id, None, 1024)
+        .query(
+            routing_id,
+            scp_transport::native::storage::QueryCursor::All,
+            1024,
+        )
         .await
         .expect("relay blob query should succeed");
     assert!(

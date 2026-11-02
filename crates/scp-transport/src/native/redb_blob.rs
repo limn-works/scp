@@ -19,7 +19,10 @@ use redb::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use super::storage::{BlobStorage, ClockFn, StorageError, StoredBlob, system_clock};
+use super::storage::{
+    BlobLifetime, BlobStorage, ClockFn, QueryCursor, StorageError, StoredBlob, sort_query_order,
+    system_clock,
+};
 
 /// Table: `blob_id` (32 bytes) -> `MessagePack`-serialized [`SerializedBlob`].
 const BLOBS_TABLE: TableDefinition<&[u8; 32], &[u8]> = TableDefinition::new("blobs");
@@ -31,15 +34,16 @@ const ROUTING_TABLE: MultimapTableDefinition<&[u8; 32], &[u8; 32]> =
 /// Internal serializable representation of a stored blob.
 ///
 /// Stored as `MessagePack` in the blobs table. Fields mirror [`StoredBlob`]
-/// plus `expires_at` for TTL enforcement.
+/// plus `expires_at` for TTL enforcement. A retained record has no
+/// `blob_ttl` and no `expires_at`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SerializedBlob {
     routing_id: [u8; 32],
     blob_id: [u8; 32],
     recipient_hint: Option<[u8; 32]>,
-    blob_ttl: u32,
+    blob_ttl: Option<u32>,
     stored_at: u64,
-    expires_at: u64,
+    expires_at: Option<u64>,
     #[serde(with = "serde_bytes")]
     blob: Vec<u8>,
 }
@@ -55,10 +59,15 @@ impl SerializedBlob {
             routing_id: self.routing_id,
             blob_id: self.blob_id,
             recipient_hint: self.recipient_hint,
-            blob_ttl: self.blob_ttl,
+            lifetime: BlobLifetime::from_ttl(self.blob_ttl),
             stored_at: self.stored_at,
             blob: self.blob.clone(),
         }
+    }
+
+    /// Whether the blob has expired at `now`; a retained blob never does.
+    fn expired(&self, now: u64) -> bool {
+        self.expires_at.is_some_and(|expires_at| expires_at <= now)
     }
 }
 
@@ -163,19 +172,18 @@ impl BlobStorage for RedbBlobStore {
         routing_id: [u8; 32],
         blob_id: [u8; 32],
         recipient_hint: Option<[u8; 32]>,
-        blob_ttl: u32,
+        lifetime: BlobLifetime,
         blob: Vec<u8>,
     ) -> Result<StoredBlob, StorageError> {
         let stored_at = (self.clock)();
-        let expires_at = stored_at.saturating_add(u64::from(blob_ttl));
 
         let entry = SerializedBlob {
             routing_id,
             blob_id,
             recipient_hint,
-            blob_ttl,
+            blob_ttl: lifetime.ttl(),
             stored_at,
-            expires_at,
+            expires_at: lifetime.expires_at(stored_at),
             blob: blob.clone(),
         };
 
@@ -209,7 +217,7 @@ impl BlobStorage for RedbBlobStore {
             routing_id,
             blob_id,
             recipient_hint,
-            blob_ttl,
+            lifetime,
             stored_at,
             blob,
         })
@@ -235,7 +243,7 @@ impl BlobStorage for RedbBlobStore {
         let entry: SerializedBlob = rmp_serde::from_slice(value.value())
             .map_err(|e| StorageError::Internal(format!("msgpack decode: {e}")))?;
 
-        if entry.expires_at <= now {
+        if entry.expired(now) {
             return Ok(None);
         }
 
@@ -245,7 +253,7 @@ impl BlobStorage for RedbBlobStore {
     async fn query(
         &self,
         routing_id: &[u8; 32],
-        since: Option<u64>,
+        cursor: QueryCursor,
         limit: u32,
     ) -> Result<Vec<StoredBlob>, StorageError> {
         let now = (self.clock)();
@@ -279,15 +287,7 @@ impl BlobStorage for RedbBlobStore {
                 let entry: SerializedBlob = rmp_serde::from_slice(value.value())
                     .map_err(|e| StorageError::Internal(format!("msgpack decode: {e}")))?;
 
-                // Skip expired blobs.
-                if entry.expires_at <= now {
-                    continue;
-                }
-
-                // Apply since filter.
-                if let Some(since_ts) = since
-                    && entry.stored_at <= since_ts
-                {
+                if entry.expired(now) || !cursor.admits(entry.stored_at, &entry.blob_id) {
                     continue;
                 }
 
@@ -295,8 +295,7 @@ impl BlobStorage for RedbBlobStore {
             }
         }
 
-        // Sort by stored_at ascending (oldest first).
-        candidates.sort_by_key(|b| b.stored_at);
+        sort_query_order(&mut candidates);
 
         // Apply limit.
         candidates.truncate(limit as usize);
@@ -378,7 +377,7 @@ impl BlobStorage for RedbBlobStore {
                 let entry: SerializedBlob = rmp_serde::from_slice(value.value())
                     .map_err(|e| StorageError::Internal(format!("msgpack decode: {e}")))?;
 
-                if entry.expires_at <= now {
+                if entry.expired(now) {
                     expired_entries.push((*key.value(), entry.routing_id));
                 }
             }

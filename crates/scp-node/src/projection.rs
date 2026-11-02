@@ -42,7 +42,7 @@ use scp_core::context::params::{ProjectionPolicy, ProjectionRule};
 use scp_core::crypto::sender_keys::{BroadcastEnvelope, BroadcastKey, open_broadcast_trusted};
 use scp_core::crypto::ucan::CapabilityUri;
 use scp_core::crypto::ucan::validate::{DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, parse_ucan};
-use scp_transport::native::storage::BlobStorage;
+use scp_transport::native::storage::{BlobStorage, QueryCursor};
 
 use crate::error::ApiError;
 use crate::http::NodeState;
@@ -1620,7 +1620,8 @@ pub async fn feed_handler(
         .min(MAX_FEED_LIMIT);
 
     // Query blobs.
-    let blobs = match state.blob_storage.query(&routing_id, since_ts, limit).await {
+    let cursor = since_ts.map_or(QueryCursor::All, QueryCursor::Since);
+    let blobs = match state.blob_storage.query(&routing_id, cursor, limit).await {
         Ok(blobs) => blobs,
         Err(e) => {
             tracing::error!(
@@ -2486,6 +2487,10 @@ async fn projection_rate_limit_middleware(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 pub(crate) mod test_helpers {
     use super::*;
+
+    /// The TTL every test blob is stored under.
+    pub const HOUR: scp_transport::native::storage::BlobLifetime =
+        scp_transport::native::storage::BlobLifetime::Ttl(3600);
     use ed25519_dalek::Signer;
     use scp_core::context::broadcast_content::{BroadcastContent, serialize_broadcast_content};
     use scp_core::crypto::sender_keys::{
@@ -2550,7 +2555,7 @@ pub(crate) mod test_helpers {
             r
         };
         storage
-            .store(routing_id, blob_id, None, 3600, blob_bytes)
+            .store(routing_id, blob_id, None, HOUR, blob_bytes)
             .await
             .unwrap();
         blob_id
@@ -2592,6 +2597,7 @@ pub(crate) mod test_helpers {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+    use super::test_helpers::HOUR;
     use super::*;
     use scp_core::crypto::sender_keys::{generate_broadcast_key, rotate_broadcast_key};
 
@@ -2695,7 +2701,7 @@ mod tests {
             routing_id: [0xAA; 32],
             blob_id,
             recipient_hint: None,
-            blob_ttl: 3600,
+            lifetime: HOUR,
             stored_at: 1_736_937_000,
             blob: blob_bytes,
         };
@@ -2720,7 +2726,7 @@ mod tests {
             routing_id: [0xAA; 32],
             blob_id: [0xBB; 32],
             recipient_hint: None,
-            blob_ttl: 3600,
+            lifetime: HOUR,
             stored_at: 100,
             blob: vec![0xFF, 0xFE], // invalid MessagePack
         };
@@ -2742,7 +2748,7 @@ mod tests {
             routing_id: [0xAA; 32],
             blob_id: [0xCC; 32],
             recipient_hint: None,
-            blob_ttl: 3600,
+            lifetime: HOUR,
             stored_at: 100,
             blob: blob_bytes,
         };
@@ -2839,8 +2845,6 @@ mod tests {
             #[cfg(feature = "quic")]
             publish_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter::new(100),
             #[cfg(feature = "quic")]
-            did_slot_registry: scp_transport::native::did_slot::DidSlotRegistry::new(),
-            #[cfg(feature = "quic")]
             quic_server_config: None,
             #[cfg(feature = "quic")]
             quic_listening: std::sync::atomic::AtomicBool::new(false),
@@ -2905,7 +2909,7 @@ mod tests {
         };
 
         storage
-            .store(routing_id, blob_id, None, 3600, blob_bytes)
+            .store(routing_id, blob_id, None, HOUR, blob_bytes)
             .await
             .unwrap();
 
@@ -2980,7 +2984,7 @@ mod tests {
                 r
             };
             storage
-                .store(routing_id, blob_id, None, 3600, blob_bytes)
+                .store(routing_id, blob_id, None, HOUR, blob_bytes)
                 .await
                 .unwrap();
         }
@@ -3144,7 +3148,7 @@ mod tests {
         };
 
         storage
-            .store(routing_id, blob_id, None, 3600, blob_bytes)
+            .store(routing_id, blob_id, None, HOUR, blob_bytes)
             .await
             .unwrap();
 
@@ -3212,7 +3216,7 @@ mod tests {
         };
 
         storage
-            .store(routing_id, blob_id, None, 3600, blob_bytes)
+            .store(routing_id, blob_id, None, HOUR, blob_bytes)
             .await
             .unwrap();
 
@@ -3260,7 +3264,7 @@ mod tests {
         };
 
         storage
-            .store(routing_id, blob_id, None, 3600, blob_bytes)
+            .store(routing_id, blob_id, None, HOUR, blob_bytes)
             .await
             .unwrap();
 
@@ -3511,7 +3515,7 @@ mod tests {
             r
         };
         storage
-            .store(routing_id_a, blob_id, None, 3600, blob_bytes)
+            .store(routing_id_a, blob_id, None, HOUR, blob_bytes)
             .await
             .unwrap();
 
@@ -3592,7 +3596,7 @@ mod tests {
                 r
             };
             storage
-                .store(routing_id, blob_id, None, 3600, blob_bytes)
+                .store(routing_id, blob_id, None, HOUR, blob_bytes)
                 .await
                 .unwrap();
             blob_ids.push(blob_id);
@@ -3688,7 +3692,7 @@ mod tests {
             r
         };
         storage
-            .store(routing_id, blob_id_0, None, 3600, blob_bytes_0)
+            .store(routing_id, blob_id_0, None, HOUR, blob_bytes_0)
             .await
             .unwrap();
 
@@ -3703,7 +3707,7 @@ mod tests {
             r
         };
         storage
-            .store(routing_id, blob_id_1, None, 3600, blob_bytes_1)
+            .store(routing_id, blob_id_1, None, HOUR, blob_bytes_1)
             .await
             .unwrap();
 
@@ -3780,7 +3784,7 @@ mod tests {
             r
         };
         storage
-            .store(routing_id, blob_id, None, 3600, blob_bytes)
+            .store(routing_id, blob_id, None, HOUR, blob_bytes)
             .await
             .unwrap();
 
@@ -3796,7 +3800,7 @@ mod tests {
             r
         };
         storage
-            .store(routing_id, valid_blob_id, None, 3600, valid_blob_bytes)
+            .store(routing_id, valid_blob_id, None, HOUR, valid_blob_bytes)
             .await
             .unwrap();
 
@@ -3874,7 +3878,7 @@ mod tests {
             r
         };
         storage
-            .store(routing_id, blob_id, None, 3600, blob_bytes)
+            .store(routing_id, blob_id, None, HOUR, blob_bytes)
             .await
             .unwrap();
 
@@ -3936,7 +3940,7 @@ mod tests {
             r
         };
         storage
-            .store(routing_id, blob_id, None, 3600, blob_bytes)
+            .store(routing_id, blob_id, None, HOUR, blob_bytes)
             .await
             .unwrap();
 
@@ -3993,7 +3997,7 @@ mod tests {
             r
         };
         storage
-            .store(routing_id_a, blob_id, None, 3600, blob_bytes)
+            .store(routing_id_a, blob_id, None, HOUR, blob_bytes)
             .await
             .unwrap();
 
@@ -4113,7 +4117,7 @@ mod tests {
             r
         };
         storage
-            .store(routing_id, blob_id, None, 3600, blob_bytes)
+            .store(routing_id, blob_id, None, HOUR, blob_bytes)
             .await
             .unwrap();
 
@@ -4245,7 +4249,7 @@ mod tests {
             r
         };
         storage
-            .store(routing_id, blob_id, None, 3600, blob_bytes)
+            .store(routing_id, blob_id, None, HOUR, blob_bytes)
             .await
             .unwrap();
 
@@ -4304,7 +4308,7 @@ mod tests {
             r
         };
         storage
-            .store(routing_id, blob_id, None, 3600, blob_bytes)
+            .store(routing_id, blob_id, None, HOUR, blob_bytes)
             .await
             .unwrap();
 
@@ -4532,7 +4536,7 @@ mod tests {
             r
         };
         storage
-            .store(routing_id, alice_blob_id, None, 3600, alice_bytes)
+            .store(routing_id, alice_blob_id, None, HOUR, alice_bytes)
             .await
             .unwrap();
 
@@ -4547,7 +4551,7 @@ mod tests {
             r
         };
         storage
-            .store(routing_id, bob_blob_id, None, 3600, bob_bytes)
+            .store(routing_id, bob_blob_id, None, HOUR, bob_bytes)
             .await
             .unwrap();
 
@@ -4748,7 +4752,7 @@ mod tests {
             r
         };
         storage
-            .store(routing_id, alice_blob_id, None, 3600, alice_blob_bytes)
+            .store(routing_id, alice_blob_id, None, HOUR, alice_blob_bytes)
             .await
             .unwrap();
 
@@ -4763,7 +4767,7 @@ mod tests {
             r
         };
         storage
-            .store(routing_id, bob_blob_id, None, 3600, bob_blob_bytes)
+            .store(routing_id, bob_blob_id, None, HOUR, bob_blob_bytes)
             .await
             .unwrap();
 
@@ -5252,7 +5256,7 @@ mod tests {
             r
         };
         storage
-            .store(routing_id, blob_id, None, 3600, blob_bytes)
+            .store(routing_id, blob_id, None, HOUR, blob_bytes)
             .await
             .unwrap();
 
@@ -5310,7 +5314,7 @@ mod tests {
             r
         };
         storage
-            .store(routing_id, blob_id, None, 3600, blob_bytes)
+            .store(routing_id, blob_id, None, HOUR, blob_bytes)
             .await
             .unwrap();
 
@@ -5437,7 +5441,7 @@ mod tests {
             r
         };
         storage
-            .store(routing_id, blob_id, None, 3600, blob_bytes)
+            .store(routing_id, blob_id, None, HOUR, blob_bytes)
             .await
             .unwrap();
 
@@ -5634,7 +5638,7 @@ mod tests {
             r
         };
         storage
-            .store(routing_id, blob_id, None, 3600, blob_bytes)
+            .store(routing_id, blob_id, None, HOUR, blob_bytes)
             .await
             .unwrap();
 
@@ -7315,7 +7319,7 @@ mod tests {
             r
         };
         storage
-            .store(routing_id, blob_id, None, 3600, blob_bytes)
+            .store(routing_id, blob_id, None, HOUR, blob_bytes)
             .await
             .unwrap();
 

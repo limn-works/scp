@@ -172,8 +172,17 @@ pub enum ClientMessage {
         recipient_hint: Option<[u8; 32]>,
 
         /// How long (seconds) the relay should store this blob.
-        /// Valid range: 1--604800 (7 days).
-        blob_ttl: u32,
+        /// Valid range: 1--604800 (7 days). Required on every PUBLISH but a
+        /// `retain` one, and absent on that one (ADR-004 constraints).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        blob_ttl: Option<u32>,
+
+        /// `Some(true)` on a PUBLISH of one of the five retained kinds,
+        /// `scp:did:`, `scp:svc:`, `scp:wit:`, `scp:wcf:` and `scp:nls:`,
+        /// which the node stores with no TTL; absent on every other kind
+        /// (`09-security-model.md` §9.10.12). `Some(false)` is refused.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retain: Option<bool>,
 
         /// The opaque blob content. 1--262144 bytes (256 KB).
         /// Bounded to 512 KiB on deserialization to prevent OOM (#347).
@@ -230,6 +239,17 @@ pub enum ClientMessage {
         /// Optional unix timestamp; return only blobs newer than this.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         since: Option<u64>,
+
+        /// The page-walk cursor: with it, the node returns only the blobs
+        /// whose pair (`stored_at`, `blob_id`) sorts strictly after the pair
+        /// (`since`, `after_blob`). It requires `since` (ADR-004 operation 4;
+        /// `09-security-model.md` §9.7.4.2 R9).
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "byte_array_32_opt"
+        )]
+        after_blob: Option<[u8; 32]>,
 
         /// Maximum number of blobs to return. Default 100, max 1000.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -394,11 +414,12 @@ impl ClientMessage {
             Self::Publish {
                 ref_id,
                 blob_ttl,
+                retain,
                 blob,
                 ..
             } => {
                 validate_ref_id(ref_id)?;
-                validate_blob_ttl(*blob_ttl)?;
+                validate_lifetime(*blob_ttl, *retain)?;
                 validate_blob(blob)?;
             }
             Self::Subscribe { ref_id, .. }
@@ -407,8 +428,19 @@ impl ClientMessage {
             | Self::BridgeRegister { ref_id, .. } => {
                 validate_ref_id(ref_id)?;
             }
-            Self::Query { ref_id, limit, .. } => {
+            Self::Query {
+                ref_id,
+                limit,
+                since,
+                after_blob,
+                ..
+            } => {
                 validate_ref_id(ref_id)?;
+                if after_blob.is_some() && since.is_none() {
+                    return Err(RelayProtocolError::ValidationFailed(
+                        "after_blob requires since".into(),
+                    ));
+                }
                 if let Some(l) = limit
                     && (*l == 0 || *l > MAX_QUERY_LIMIT)
                 {
@@ -520,8 +552,10 @@ pub enum RelayMessage {
         )]
         recipient_hint: Option<[u8; 32]>,
 
-        /// TTL at time of storage (seconds).
-        blob_ttl: u32,
+        /// TTL at time of storage (seconds); absent on a retained record,
+        /// which carries none (ADR-004, `09-security-model.md` §9.10.12).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        blob_ttl: Option<u32>,
 
         /// Unix timestamp when the relay stored the blob.
         stored_at: u64,
@@ -630,6 +664,29 @@ fn validate_ref_id(ref_id: &Option<String>) -> Result<(), RelayProtocolError> {
     Ok(())
 }
 
+/// Validates a PUBLISH's lifetime fields: `retain` is absent or `true`, a
+/// `retain` PUBLISH carries no `blob_ttl` (`4003`), and every other PUBLISH
+/// carries one in range (`4002` when absent) (ADR-004 constraints,
+/// `09-security-model.md` §9.10.12).
+fn validate_lifetime(
+    blob_ttl: Option<u32>,
+    retain: Option<bool>,
+) -> Result<(), RelayProtocolError> {
+    match (retain, blob_ttl) {
+        (Some(false), _) => Err(RelayProtocolError::ValidationFailed(
+            "retain is present only as true".into(),
+        )),
+        (Some(true), Some(_)) => Err(RelayProtocolError::ValidationFailed(
+            "a retain PUBLISH carries no blob_ttl".into(),
+        )),
+        (Some(true), None) => Ok(()),
+        (None, None) => Err(RelayProtocolError::ValidationFailed(
+            "blob_ttl is required on a PUBLISH without retain".into(),
+        )),
+        (None, Some(ttl)) => validate_blob_ttl(ttl),
+    }
+}
+
 /// Validates a `blob_ttl` value against the allowed range.
 fn validate_blob_ttl(ttl: u32) -> Result<(), RelayProtocolError> {
     if !(MIN_BLOB_TTL..=MAX_BLOB_TTL).contains(&ttl) {
@@ -671,7 +728,8 @@ mod tests {
             ref_id: None,
             routing_id: [0xAA; 32],
             recipient_hint: None,
-            blob_ttl: ttl,
+            blob_ttl: Some(ttl),
+            retain: None,
             blob: vec![0x01],
         };
         let decoded = ClientMessage::from_bytes(&msg.to_bytes().unwrap()).unwrap();
@@ -688,7 +746,8 @@ mod tests {
             ref_id: Some("req-1".to_string()),
             routing_id: [0xAA; 32],
             recipient_hint: Some([0xBB; 32]),
-            blob_ttl: 3600,
+            blob_ttl: Some(3600),
+            retain: None,
             blob: vec![0x01, 0x02, 0x03],
         };
 
@@ -703,7 +762,8 @@ mod tests {
             ref_id: None,
             routing_id: [0xCC; 32],
             recipient_hint: None,
-            blob_ttl: 1,
+            blob_ttl: Some(1),
+            retain: None,
             blob: vec![0xFF],
         };
 
@@ -756,6 +816,7 @@ mod tests {
             ref_id: Some("q-1".to_string()),
             routing_id: [0x44; 32],
             since: Some(1_000_000),
+            after_blob: None,
             limit: Some(500),
         };
 
@@ -770,6 +831,7 @@ mod tests {
             ref_id: None,
             routing_id: [0x55; 32],
             since: None,
+            after_blob: None,
             limit: None,
         };
 
@@ -927,7 +989,7 @@ mod tests {
             routing_id: [0x11; 32],
             blob_id: [0x22; 32],
             recipient_hint: Some([0x33; 32]),
-            blob_ttl: 7200,
+            blob_ttl: Some(7200),
             stored_at: 1_700_000_000,
             blob: vec![0xDE, 0xAD, 0xBE, 0xEF],
         };
@@ -943,7 +1005,7 @@ mod tests {
             routing_id: [0x44; 32],
             blob_id: [0x55; 32],
             recipient_hint: None,
-            blob_ttl: 60,
+            blob_ttl: Some(60),
             stored_at: 1_700_000_001,
             blob: vec![0x01],
         };
@@ -1076,7 +1138,8 @@ mod tests {
             ref_id: Some("ok".to_string()),
             routing_id: [0x00; 32],
             recipient_hint: None,
-            blob_ttl: 3600,
+            blob_ttl: Some(3600),
+            retain: None,
             blob: vec![0x01],
         };
         assert!(msg.validate().is_ok());
@@ -1088,7 +1151,8 @@ mod tests {
             ref_id: None,
             routing_id: [0x00; 32],
             recipient_hint: None,
-            blob_ttl: 60,
+            blob_ttl: Some(60),
+            retain: None,
             blob: vec![0x00; MAX_BLOB_SIZE + 1],
         };
         let err = msg.validate().unwrap_err();
@@ -1101,7 +1165,8 @@ mod tests {
             ref_id: None,
             routing_id: [0x00; 32],
             recipient_hint: None,
-            blob_ttl: 60,
+            blob_ttl: Some(60),
+            retain: None,
             blob: vec![],
         };
         let err = msg.validate().unwrap_err();
@@ -1114,7 +1179,8 @@ mod tests {
             ref_id: None,
             routing_id: [0x00; 32],
             recipient_hint: None,
-            blob_ttl: 0,
+            blob_ttl: Some(0),
+            retain: None,
             blob: vec![0x01],
         };
         let err = msg.validate().unwrap_err();
@@ -1127,7 +1193,8 @@ mod tests {
             ref_id: None,
             routing_id: [0x00; 32],
             recipient_hint: None,
-            blob_ttl: MAX_BLOB_TTL + 1,
+            blob_ttl: Some(MAX_BLOB_TTL + 1),
+            retain: None,
             blob: vec![0x01],
         };
         let err = msg.validate().unwrap_err();
@@ -1141,7 +1208,8 @@ mod tests {
             ref_id: None,
             routing_id: [0x00; 32],
             recipient_hint: None,
-            blob_ttl: MIN_BLOB_TTL,
+            blob_ttl: Some(MIN_BLOB_TTL),
+            retain: None,
             blob: vec![0x01],
         };
         assert!(msg.validate().is_ok());
@@ -1151,7 +1219,8 @@ mod tests {
             ref_id: None,
             routing_id: [0x00; 32],
             recipient_hint: None,
-            blob_ttl: MAX_BLOB_TTL,
+            blob_ttl: Some(MAX_BLOB_TTL),
+            retain: None,
             blob: vec![0x01],
         };
         assert!(msg.validate().is_ok());
@@ -1163,7 +1232,8 @@ mod tests {
             ref_id: Some("x".repeat(MAX_REF_ID_LEN + 1)),
             routing_id: [0x00; 32],
             recipient_hint: None,
-            blob_ttl: 60,
+            blob_ttl: Some(60),
+            retain: None,
             blob: vec![0x01],
         };
         let err = msg.validate().unwrap_err();
@@ -1176,7 +1246,8 @@ mod tests {
             ref_id: Some("x".repeat(MAX_REF_ID_LEN)),
             routing_id: [0x00; 32],
             recipient_hint: None,
-            blob_ttl: 60,
+            blob_ttl: Some(60),
+            retain: None,
             blob: vec![0x01],
         };
         assert!(msg.validate().is_ok());
@@ -1188,6 +1259,7 @@ mod tests {
             ref_id: None,
             routing_id: [0x00; 32],
             since: None,
+            after_blob: None,
             limit: Some(MAX_QUERY_LIMIT + 1),
         };
         let err = msg.validate().unwrap_err();
@@ -1200,6 +1272,7 @@ mod tests {
             ref_id: None,
             routing_id: [0x00; 32],
             since: None,
+            after_blob: None,
             limit: Some(0),
         };
         let err = msg.validate().unwrap_err();
@@ -1212,6 +1285,7 @@ mod tests {
             ref_id: None,
             routing_id: [0x00; 32],
             since: None,
+            after_blob: None,
             limit: Some(MAX_QUERY_LIMIT),
         };
         assert!(msg.validate().is_ok());
@@ -1223,6 +1297,7 @@ mod tests {
             ref_id: None,
             routing_id: [0x00; 32],
             since: None,
+            after_blob: None,
             limit: None,
         };
         assert!(msg.validate().is_ok());
@@ -1349,7 +1424,8 @@ mod tests {
                     ref_id: None,
                     routing_id: [0; 32],
                     recipient_hint: None,
-                    blob_ttl: 1,
+                    blob_ttl: Some(1),
+                    retain: None,
                     blob: vec![0x01],
                 },
                 "PUBLISH",
@@ -1374,6 +1450,7 @@ mod tests {
                     ref_id: None,
                     routing_id: [0; 32],
                     since: None,
+                    after_blob: None,
                     limit: None,
                 },
                 "QUERY",
@@ -1440,7 +1517,7 @@ mod tests {
                     routing_id: [0; 32],
                     blob_id: [0; 32],
                     recipient_hint: None,
-                    blob_ttl: 1,
+                    blob_ttl: Some(1),
                     stored_at: 0,
                     blob: vec![0x01],
                 },
@@ -1496,7 +1573,8 @@ mod tests {
             ref_id: None,
             routing_id: [0x00; 32],
             recipient_hint: None,
-            blob_ttl: 60,
+            blob_ttl: Some(60),
+            retain: None,
             blob: vec![0xAB; MAX_BLOB_SIZE],
         };
 
@@ -1587,7 +1665,8 @@ mod tests {
             ref_id: Some("test-ref".to_string()),
             routing_id: [0xAA; 32],
             recipient_hint: None,
-            blob_ttl: 60,
+            blob_ttl: Some(60),
+            retain: None,
             blob: vec![0x01],
         };
         let bytes = msg.to_bytes().unwrap();
@@ -1687,7 +1766,8 @@ mod tests {
                 ref_id: Some("r".into()),
                 routing_id: [0; 32],
                 recipient_hint: None,
-                blob_ttl: 1,
+                blob_ttl: Some(1),
+                retain: None,
                 blob: vec![0x01],
             },
             ClientMessage::Subscribe {
@@ -1703,6 +1783,7 @@ mod tests {
                 ref_id: Some("r".into()),
                 routing_id: [0; 32],
                 since: None,
+                after_blob: None,
                 limit: None,
             },
             ClientMessage::Delete {

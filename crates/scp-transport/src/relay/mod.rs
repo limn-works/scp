@@ -17,11 +17,6 @@
 //! - [`bridge`] -- BRIDGE relay operation for symmetric NAT fallback
 //!   (spec section 10.12.4). Transparent proxy for self-hosted relays
 //!   behind symmetric NAT.
-//! - [`did_record_validation`] -- pure, cheapest-first validation of a
-//!   `DidRecordV1` frame against its DID-domain `routing_id` (decode →
-//!   `DID→routing_id` binding → BEP44 signature). The OPTIONAL validating
-//!   SCP-native-relay path (§3.10.2). Stateful single-slot / slot-exclusivity
-//!   bookkeeping lives in `native::did_slot`.
 //! - [`push`] -- the relay push sender seam ([`push::PushSender`],
 //!   [`push::PushSendOutcome`]) that sends the §10.7.1 step 5 wake signal,
 //!   with the APNs sender in [`push_apns`] (PUSH-010) and the FCM HTTP v1
@@ -50,7 +45,6 @@
 pub mod bridge;
 pub mod config;
 pub mod connection;
-pub mod did_record_validation;
 #[cfg(test)]
 pub(crate) mod log_capture;
 pub mod push;

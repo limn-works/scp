@@ -1779,7 +1779,8 @@ mod tests {
             ref_id: None,
             routing_id,
             recipient_hint: None,
-            blob_ttl: 3600,
+            blob_ttl: Some(3600),
+            retain: None,
             blob: vec![1],
         };
         ws.send(Message::Binary(publish.to_bytes().unwrap()))

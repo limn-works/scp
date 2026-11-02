@@ -1133,7 +1133,8 @@ impl ScpClient {
                 ref_id: None,
                 routing_id,
                 recipient_hint: None,
-                blob_ttl: ttl.secs(),
+                blob_ttl: Some(ttl.secs()),
+                retain: None,
                 blob: blob.clone(),
             }
             .to_bytes()

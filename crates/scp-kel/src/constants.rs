@@ -47,6 +47,17 @@ const _: () = assert!(
 /// position (§9.7.1 check 2). `ResolvedState::is_fresh` reads it, and scp-mls re-exports it.
 pub const MAX_ATTESTATION_KEY_RESOLUTION_STALENESS: u64 = 300;
 
+/// The most events one key-event record frame carries (§9.18.17).
+///
+/// §9.10.12's frame decoder rejects a frame whose `event_count` exceeds it, and a
+/// validating node answers that frame with ADR-004's `4040` before it
+/// verifies any signature.
+pub const MAX_EVENTS_PER_FRAME: u32 = 16;
+
+/// The most entries one service record carries (§9.18.17; `03-identity.md`
+/// §3.10.13).
+pub const MAX_SERVICE_RECORD_ENTRIES: u32 = 64;
+
 /// The most witnesses a key-state snapshot may name (§9.18.17).
 pub const MAX_WITNESS_SET_SIZE: u32 = 32;
 

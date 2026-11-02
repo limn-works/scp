@@ -221,7 +221,7 @@ async fn blob_storage_roundtrip() {
             routing_id,
             *blob_id.as_bytes(),
             None,
-            3600,
+            scp_transport::native::storage::BlobLifetime::Ttl(3600),
             blob_data.clone(),
         )
         .await
@@ -230,14 +230,24 @@ async fn blob_storage_roundtrip() {
     assert_eq!(stored.routing_id, routing_id);
     assert_eq!(stored.blob_id, *blob_id.as_bytes());
     assert_eq!(stored.blob, blob_data);
-    assert_eq!(stored.blob_ttl, 3600);
+    assert_eq!(
+        stored.lifetime,
+        scp_transport::native::storage::BlobLifetime::Ttl(3600)
+    );
 
     // Get
     let retrieved = storage.get(blob_id.as_bytes()).await.unwrap().unwrap();
     assert_eq!(retrieved.blob, blob_data);
 
     // Query
-    let results = storage.query(&routing_id, None, 100).await.unwrap();
+    let results = storage
+        .query(
+            &routing_id,
+            scp_transport::native::storage::QueryCursor::All,
+            100,
+        )
+        .await
+        .unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].blob, blob_data);
 
@@ -249,7 +259,14 @@ async fn blob_storage_roundtrip() {
     let gone = storage.get(blob_id.as_bytes()).await.unwrap();
     assert!(gone.is_none());
 
-    let empty = storage.query(&routing_id, None, 100).await.unwrap();
+    let empty = storage
+        .query(
+            &routing_id,
+            scp_transport::native::storage::QueryCursor::All,
+            100,
+        )
+        .await
+        .unwrap();
     assert!(empty.is_empty());
 }
 
@@ -271,7 +288,13 @@ async fn blob_expiry() {
 
     // Store with TTL of 10 seconds.
     storage
-        .store(routing_id, *blob_id.as_bytes(), None, 10, blob_data)
+        .store(
+            routing_id,
+            *blob_id.as_bytes(),
+            None,
+            scp_transport::native::storage::BlobLifetime::Ttl(10),
+            blob_data,
+        )
         .await
         .unwrap();
 

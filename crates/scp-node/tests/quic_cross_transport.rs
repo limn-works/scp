@@ -220,7 +220,8 @@ async fn ws_publish(ws: &mut WsStream, routing_id: [u8; 32], blob: Vec<u8>) {
         ref_id: Some("ws-pub".to_owned()),
         routing_id,
         recipient_hint: None,
-        blob_ttl: 3600,
+        blob_ttl: Some(3600),
+        retain: None,
         blob,
     };
     ws_send(ws, &publish).await;
@@ -316,7 +317,8 @@ async fn websocket_subscriber_receives_quic_publish() {
         ref_id: Some("quic-pub".to_owned()),
         routing_id,
         recipient_hint: None,
-        blob_ttl: 3600,
+        blob_ttl: Some(3600),
+        retain: None,
         blob: payload.clone(),
     };
     let pub_responses = quic_send_and_recv(&quic_conn, &publish).await;
