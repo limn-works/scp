@@ -196,7 +196,7 @@ The SDK ships with a mapping of default `BootstrapContextEntry` values (§22.11.
    the GroupContext authenticates the context_id.
    Call handle_lookup("alice")
 7. Get result: Identity { did: "<scp-identifier:alice>" }
-8. Resolve the identifier by replaying its key-event log over the relay
+8. Resolve the identifier by replaying its key-event log over the node
    network (self-certifying, `09-security-model.md` §9.7.4.2 R2)
 9. Return AddressResolution::Identity {
      did: "<scp-identifier:alice>",
@@ -455,7 +455,7 @@ The context's governance determines what verification is required before a mappi
 
 ## 22.6 Domain Handles (Web Compatibility Extension)
 
-Domain handles are an optional web on-ramp for human-readable addressing — the same role `.well-known/scp` plays for relay discovery (§18.3). They are NOT self-certifying, NOT required, and NOT a protocol pillar. They exist for organizations and individuals who already have domains and want familiar addressing for web audiences.
+Domain handles are an optional web on-ramp for human-readable addressing — the same role `.well-known/scp` plays for node discovery (§18.3). They are NOT self-certifying, NOT required, and NOT a protocol pillar. They exist for organizations and individuals who already have domains and want familiar addressing for web audiences.
 
 **Format:** `<name>@<domain>`
 
@@ -474,7 +474,7 @@ The `.well-known/scp` document format (§18.3.1) is extended with an optional `h
 {
   "version": 1,
   "did": "<the operator's identifier, in the text form 03 §3.1 fixes>",
-  "relay": "wss://relay.example.com/scp/v1",
+  "node": "wss://node.example.com/scp/v1",
   "handles": {
     "alice": {
       "type": "identity",
@@ -483,11 +483,11 @@ The `.well-known/scp` document format (§18.3.1) is extended with an optional `h
     "recipes": {
       "type": "context",
       "context_id": "a1b2c3d4e5f6...",
-      "relay": "wss://relay.example.com/scp/v1"
+      "node": "wss://node.example.com/scp/v1"
     }
   },
   "contexts": [ ... ],
-  "relay_config": { ... }
+  "node_config": { ... }
 }
 ```
 
@@ -504,7 +504,7 @@ The `.well-known/scp` document format (§18.3.1) is extended with an optional `h
 | `type` | string | Yes | `"identity"` or `"context"`. |
 | `did` | identifier | Conditional | The identifier. Required for `identity` type. |
 | `context_id` | string | Conditional | Hex-encoded context ID. Required for `context` type. |
-| `relay` | string | No | Override relay URL for context types. Defaults to document-level `relay`. |
+| `node` | string | No | Override node URL for context types. Defaults to document-level `node`. |
 
 **Constraints:**
 
@@ -522,7 +522,7 @@ The `.well-known/scp` document format (§18.3.1) is extended with an optional `h
    b. Look up "alice" in the "handles" map
    c. If found: resolve the identifier by replaying its key-event log
       (self-certifying, 09-security-model.md 9.6.1)
-      Verify: the service record's SCPRelay entries are consistent
+      Verify: the service record's SCPNode entries are consistent
       Return AddressResolution with trust_level: DomainVerified
 4. If domain resolution fails (no .well-known/scp, or handle not in map):
    a. Extract domain name as potential platform identifier
@@ -1125,18 +1125,18 @@ Admin removal via governance produces standard governance events (§5.9), not `S
 | `registrant` | `Identifier` | Yes | The registering identity's identifier (`03-identity.md` §3.1), which SCP-308, the key-event data model story of architecture slice S1, implements as the type `Identifier`. |
 | `platform` | `PushPlatform` | Yes | Target push platform. |
 | `token` | `Vec<u8>` (serde_bytes) | Yes | Platform-specific device token. A `WebPush` token follows the WebPush token encoding below. |
-| `routing_ids` | `Vec<[u8; 32]>` | Yes | The relay routing IDs to receive wake signals for, each a 32-byte routing ID: each context's `context_routing_id` and the device's own `pseudonym_routing_id` (`09-security-model.md` §9.10.4). The message carries no context ID. An empty list is invalid, and the relay rejects it with `4060` PUSH_REGISTRATION_REJECTED. |
+| `routing_ids` | `Vec<[u8; 32]>` | Yes | The routing IDs to receive wake signals for, each a 32-byte routing ID: each context's `context_routing_id` and the device's own `pseudonym_routing_id` (`09-security-model.md` §9.10.4). The message carries no context ID. An empty list is invalid, and the relay rejects it with `4060` PUSH_REGISTRATION_REJECTED. |
 | `timestamp` | `u64` | Yes | Unix timestamp (seconds). |
 | `signature` | `Vec<u8>` (64 bytes) | Yes | P-256 signature — see construction below. |
 
-**Signature construction.** The signature covers the §9.5.1 canonical hash of `"SCP-PUSH-REGISTER-V1:" || BE32(56) || registrant_text || platform_tag (1 byte) || BE32(len(token)) || token || BE32(count(routing_ids)) || routing_ids_encoded || timestamp (8-byte BE u64) || BE32(len(relay_url)) || relay_url || bridge_target`. `registrant_text` is the 56-byte `scp:` text form of the identifier that `03-identity.md` §3.1 fixes. `BE32(count(routing_ids))` is the number of entries in `routing_ids`, which is the 4-byte big-endian element count §9.5.1 requires before every repeated field. `routing_ids_encoded` is each 32-byte routing ID in list order, with no length prefix, because each element is fixed-length. `relay_url` is the UTF-8 canonical URL (`09-security-model.md` §9.18.2) of the relay the message is published to; no field of the message carries it. The relay verifies against its own canonical URL, the one from which it derived the reserved push routing ID the PUBLISH arrived at, so a message signed for a different relay URL fails verification and the relay rejects it with `4060` PUSH_REGISTRATION_REJECTED. `bridge_target` is the 32-byte `bridgeTarget` of the tier 3 relay entry the message is published to, or `SHA-256(0x00)` when the relay is not a tier 3 entry (`09-security-model.md` §9.18.2 **Tier 3 push routing ID**); no field of the message carries it either, and the relay verifies against the target from which it derived the routing ID the PUBLISH arrived at. The `PushRegistration` table of `09-security-model.md` §9.5.2 lists the same fields in the same order. Re-registration, and what a relay keeps when a registration matches a stored one, follow `10-infrastructure-and-self-hosting.md` §10.7.1.
+**Signature construction.** The signature covers the §9.5.1 canonical hash of `"SCP-PUSH-REGISTER-V1:" || BE32(56) || registrant_text || platform_tag (1 byte) || BE32(len(token)) || token || BE32(count(routing_ids)) || routing_ids_encoded || timestamp (8-byte BE u64) || BE32(len(node_url)) || node_url || bridge_target`. `registrant_text` is the 56-byte `scp:` text form of the identifier that `03-identity.md` §3.1 fixes. `BE32(count(routing_ids))` is the number of entries in `routing_ids`, which is the 4-byte big-endian element count §9.5.1 requires before every repeated field. `routing_ids_encoded` is each 32-byte routing ID in list order, with no length prefix, because each element is fixed-length. `node_url` is the `url` (`09-security-model.md` §9.18.2) of the `NodeAddress` the message is published to, which the current `ContextNodeAddress` of the contexts the message lists names (`09-security-model.md` §9.5.2); no field of the message carries it. The node verifies against the URL from which it derived the reserved push routing ID the PUBLISH arrived at, so a message signed for a different node URL fails verification and the node rejects it with `4060` PUSH_REGISTRATION_REJECTED. `bridge_target` is the 32-byte `bridge_target` of that `NodeAddress`'s `bridge`, or `SHA-256(0x00)` when the address carries no `bridge` (`09-security-model.md` §9.18.2 **Tier 3 push routing ID**); no field of the message carries it either, and the node verifies against the target from which it derived the routing ID the PUBLISH arrived at. The `PushRegistration` table of `09-security-model.md` §9.5.2 lists the same fields in the same order. Re-registration, and what a node keeps when a registration matches a stored one, follow `10-infrastructure-and-self-hosting.md` §10.7.1.
 
 **WebPush token encoding.** When `platform` is `WebPush`, `token` holds the browser's `PushSubscription` in one canonical encoding, `BE32(len(endpoint)) || endpoint || p256dh || auth`:
 - `endpoint` is the subscription's push resource URL (RFC 8030 §5), the string `PushSubscription.endpoint` returns, as UTF-8 bytes behind the 4-byte big-endian length prefix of `09-security-model.md` §9.5.1. Its scheme is `https`, its bytes are printable ASCII (`0x21`–`0x7E`), it carries no userinfo and no fragment, and it is 1 to 2,048 bytes long, the WebPush endpoint cap of `09-security-model.md` §9.18.13. The endpoint equals its own serialization under the WHATWG URL Standard: running the URL parser on the endpoint and the URL serializer on the result yields the endpoint's bytes unchanged. A browser's `PushSubscription.endpoint` already returns that serialization, and the rule gives one push resource one spelling, so one subscription makes one token.
 - `p256dh` is the subscription's P-256 ECDH public key (RFC 8291 §2.1, §3.1), the value `PushSubscription.getKey("p256dh")` returns, as the 65-byte SEC1 uncompressed point `0x04 || X || Y`, with no length prefix.
 - `auth` is the subscription's 16-byte authentication secret (RFC 8291 §3.2), the value `PushSubscription.getKey("auth")` returns, with no length prefix.
 
-A WebPush token is therefore `4 + len(endpoint) + 81` bytes, at most 2,133. The relay rejects a WebPush `PushRegistration` with `4060` PUSH_REGISTRATION_REJECTED when its `token` fails any of these checks: the length prefix exceeds 2,048 or the bytes that follow it; bytes remain after `auth`; the endpoint breaks a rule above or the endpoint refusal rule of ADR-004; `p256dh` does not begin with `0x04` or is not a point on P-256 (RFC 8291 §7); or the token is shorter than the encoding. One subscription has one encoding, so it makes one registration key (`10-infrastructure-and-self-hosting.md` §10.7.1 step 4), and a `PushDeregistration` for it carries the same token bytes its registration carried. Vector 59 of `25-test-vectors.md` §25.30 pins one token.
+A WebPush token is therefore `4 + len(endpoint) + 81` bytes, at most 2,133. The node rejects a WebPush `PushRegistration` with `4060` PUSH_REGISTRATION_REJECTED when its `token` fails any of these checks: the length prefix exceeds 2,048 or the bytes that follow it; bytes remain after `auth`; the endpoint breaks a rule above or the endpoint refusal rule of ADR-004; `p256dh` does not begin with `0x04` or is not a point on P-256 (RFC 8291 §7); or the token is shorter than the encoding. One subscription has one encoding, so it makes one registration key (`10-infrastructure-and-self-hosting.md` §10.7.1 step 4), and a `PushDeregistration` for it carries the same token bytes its registration carried. Vector 59 of `25-test-vectors.md` §25.30 pins one token.
 
 **`PushDeregistration`** — Removes push notification registration.
 
@@ -1148,7 +1148,7 @@ A WebPush token is therefore `4 + len(endpoint) + 81` bytes, at most 2,133. The 
 | `timestamp` | `u64` | Yes | Unix timestamp (seconds). |
 | `signature` | `Vec<u8>` (64 bytes) | Yes | P-256 signature — see construction below. |
 
-**Signature construction.** The signature covers the §9.5.1 canonical hash of `"SCP-PUSH-DEREGISTER-V1:" || BE32(56) || registrant_text || platform_tag (1 byte) || BE32(len(token)) || token || timestamp (8-byte BE u64) || BE32(len(relay_url)) || relay_url || bridge_target`, where `relay_url` and `bridge_target` are the values that `PushRegistration` defines and the relay verifies against its own canonical URL and target in the same way, rejecting a deregistration signed for a different relay URL or target with `4060`. The `PushDeregistration` table of `09-security-model.md` §9.5.2 lists the same fields in the same order. The two domain separators differ, so a registration signature never verifies as a deregistration signature, and a deregistration signature never verifies as a registration signature.
+**Signature construction.** The signature covers the §9.5.1 canonical hash of `"SCP-PUSH-DEREGISTER-V1:" || BE32(56) || registrant_text || platform_tag (1 byte) || BE32(len(token)) || token || timestamp (8-byte BE u64) || BE32(len(node_url)) || node_url || bridge_target`, where `node_url` and `bridge_target` are the values that `PushRegistration` defines and the node verifies against its URL and target in the same way, rejecting a deregistration signed for a different node URL or target with `4060`. The `PushDeregistration` table of `09-security-model.md` §9.5.2 lists the same fields in the same order. The two domain separators differ, so a registration signature never verifies as a deregistration signature, and a deregistration signature never verifies as a registration signature.
 
 ### 22.11.5 Petname Events (Identity Private State)
 
@@ -1262,7 +1262,7 @@ The entry types `18-addressability-and-deployment.md` §18.2.2 enumerates; the t
 |--------------|-----------|----------------|
 | `SCPCapabilities` | Self-asserted agent capability URIs | §6.2.2A [no such section] |
 | `SCPBroadcastContext` | Broadcast context advertisement | §5.14 |
-| `SCPRelay` | Relay endpoint URL | §18.3 |
+| `SCPNode` | URL of one node that holds the identity's public records | §18.2.1 |
 
 ## 22.12 Phase Integration
 
