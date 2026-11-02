@@ -18,13 +18,16 @@ This template builds a single-binary relay that:
 - Port 443 reachable from the internet (for ACME challenges and client connections)
 - Port 80 temporarily reachable during initial certificate provisioning (ACME HTTP-01)
 
-**This template does not currently compile against the workspace.** `src/main.rs:25`
-imports `scp_node::ApplicationNodeBuilder`, which the ADR-052 node-construction refactor
-deleted in favour of `Node::start(NodeConfig { .. })`, so `cargo build` stops at that import
-with `error[E0432]`. Issue #2384, the non-workspace crates that no longer compile, tracks the
-port. Every recipe below — the quick start, the systemd unit, and the Docker block — is
-correct once that lands, and the Docker recipe compiles on the version
-`rust-toolchain.toml` names, because it copies that file into the image.
+The template commits no `Cargo.lock`. Copy the repository root's `Cargo.lock` into this
+directory before the first build, so the template compiles against the dependency versions
+the workspace pins, as CI does:
+
+```bash
+cp ../../Cargo.lock .
+```
+
+The Docker recipe below compiles on the version `rust-toolchain.toml` names, because it
+copies that file into the image.
 
 ## Quick start
 
@@ -33,7 +36,8 @@ correct once that lands, and the Docker recipe compiles on the version
 git clone https://github.com/limn-works/scp.git
 cd scp/templates/personal-relay
 
-# Build in release mode
+# Pin the workspace's dependency versions, then build in release mode
+cp ../../Cargo.lock .
 cargo build --release
 
 # Run with a domain (automatic Let's Encrypt TLS)
@@ -204,7 +208,8 @@ COPY . .
 RUN pin="$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n 1)"; \
     got="$(rustc --version | cut -d' ' -f2)"; \
     [ -n "$pin" ] && [ "$got" = "$pin" ] || { echo "image resolved rustc '$got'; rust-toolchain.toml names '$pin'" >&2; exit 1; }
-RUN cargo build --release --manifest-path templates/personal-relay/Cargo.toml
+RUN cp Cargo.lock templates/personal-relay/Cargo.lock \
+    && cargo build --release --manifest-path templates/personal-relay/Cargo.toml
 
 FROM debian:bookworm-slim
 # `libssl3` because the binary links `libcrypto.so.3` that SQLCipher pulls in.

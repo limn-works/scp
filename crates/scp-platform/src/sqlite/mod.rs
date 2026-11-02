@@ -404,6 +404,10 @@ pub(crate) fn load_or_init_salt(dir: &Path) -> Result<[u8; kdf::ARGON2_SALT_LEN]
         )));
     }
 
+    // A crashed write may have left a copy of the salt; no copy outlives the
+    // next open.
+    crate::durable_file::remove_stale_temporaries(&salt_path)
+        .map_err(|e| PlatformError::StorageError(format!("salt sidecar: {e}")))?;
     if salt_path.exists() {
         return read_salt(&salt_path);
     }
@@ -874,6 +878,21 @@ mod tests {
             vec!["scp.salt.tmp".to_owned()],
             "randomized temp must be renamed away, leaving no residue"
         );
+    }
+
+    /// Loading an existing salt removes the copy a crashed write left beside
+    /// it. Without the sweep in `load_or_init_salt` the copy stays.
+    #[test]
+    fn loading_the_salt_removes_a_crashed_writes_copy() {
+        let dir = TempDir::new().unwrap();
+        let salt = load_or_init_salt(dir.path()).unwrap();
+        let copy = dir
+            .path()
+            .join(format!("{SALT_FILE_NAME}.{:032x}.tmp", 3_u128));
+        std::fs::write(&copy, [2u8; kdf::ARGON2_SALT_LEN]).unwrap();
+
+        assert_eq!(load_or_init_salt(dir.path()).unwrap(), salt);
+        assert!(!copy.exists(), "the load must remove the stale copy");
     }
 
     #[tokio::test]

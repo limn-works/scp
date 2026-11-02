@@ -436,6 +436,9 @@ jobs:
               # Nextest reads its `default-filter` out of this file, which decides
               # which tests every `cargo nextest run` in rust-test runs.
               - '.config/nextest.toml'
+              # Job `personal-relay-template` compiles this crate, which declares its
+              # own `[workspace]`, so no other cargo command in this file reaches it.
+              - 'templates/personal-relay/**'
               # The `docker-image` job builds from these three and is guarded by this
               # filter, so a change to any of them has to reach it. The Dockerfile copies
               # the fetch step's script in and runs it before compiling offline.
@@ -3057,6 +3060,30 @@ jobs:
         run: cargo deny --manifest-path ./fuzz/Cargo.toml fetch db
       - run: cargo deny --log-level warn --manifest-path ./fuzz/Cargo.toml --all-features --offline check advisories bans sources
 
+  # ── Personal relay template ─────────────────────────────────────────
+  # `templates/personal-relay` declares its own `[workspace]` and commits no
+  # Cargo.lock, so no other cargo command in this file compiles it, and it stopped
+  # compiling once when the node construction API it called was deleted. This job
+  # seeds its lockfile from the root `Cargo.lock`, which the fetch step downloads
+  # and then takes cargo offline: cargo drops the packages the template does not
+  # use and, offline, cannot resolve any version the root lockfile does not pin.
+  personal-relay-template:
+    needs: changes
+    if: github.event_name != 'push' && needs.changes.outputs.rust == 'true'
+    name: Rust / personal-relay template
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/rust-toolchain
+      - uses: ./.github/actions/cargo-fetch
+      - name: Seed the template's lockfile from the root lockfile
+        run: cp Cargo.lock templates/personal-relay/Cargo.lock
+      - name: Check the template compiles without warnings
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo check --manifest-path templates/personal-relay/Cargo.toml
+
   # ── Container image ─────────────────────────────────────────────────
   # Builds the `Dockerfile` that ships `scp-relay` and `scp-node`, and that
   # `templates/personal-relay/README.md` tells a self-hosting operator to run. Nothing
@@ -5591,6 +5618,7 @@ jobs:
       - toolchain-wiring
       - toolchain-wiring-cases
       - fix-round-check-selftest
+      - personal-relay-template
       - docker-image
       - docker-image-cache
       - no-mutable-globals-rust

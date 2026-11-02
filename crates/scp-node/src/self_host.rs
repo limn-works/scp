@@ -2310,13 +2310,7 @@ fn validate_storage_path_blocking(dir: &Path) -> Result<(), HostSiteError> {
 /// [`Zeroizing`](zeroize::Zeroizing). The key-file work runs on tokio's
 /// blocking pool.
 ///
-/// A generated key reaches `.key` through
-/// [`scp_platform::durable_file::create`]: a synced temporary file linked to
-/// the final name, then a directory sync. So the key is durable before any
-/// database is written under it, and a crash leaves either no `.key` or the
-/// whole key, never an empty or partial file that would strand the databases.
-/// When another process published `.key` first, its key is read back and
-/// returned.
+/// Without the env var, the key comes from [`resolve_storage_key_file`].
 ///
 /// # Errors
 ///
@@ -2341,6 +2335,30 @@ async fn resolve_storage_key_from(
     .await
 }
 
+/// Reads the `SQLCipher` key stored in `{storage_dir}/.key`, or generates a
+/// random one and stores it there (mode 0600 on Unix). The work runs on
+/// tokio's blocking pool.
+///
+/// A generated key reaches `.key` through
+/// [`scp_platform::durable_file::create`], which publishes a synced temporary
+/// file under the final name without replacing a file already there, then
+/// syncs the directory. So the key is durable before any database is written
+/// under it, and a crash leaves either no `.key` or the whole key, never an
+/// empty or partial file that would strand the databases. When another
+/// process published `.key` first, its key is read back and returned. Every
+/// call first removes any temporary copy of the key that a crashed write left
+/// in `storage_dir`.
+///
+/// # Errors
+///
+/// Returns [`HostSiteError::StorageKey`] if the key file has the wrong length
+/// or cannot be read, created or written.
+pub async fn resolve_storage_key_file(
+    storage_dir: &Path,
+) -> Result<Zeroizing<[u8; 32]>, HostSiteError> {
+    resolve_storage_key_from(storage_dir, None).await
+}
+
 /// The body of [`resolve_storage_key`], which blocks on the key file.
 fn resolve_storage_key_blocking(
     storage_dir: &Path,
@@ -2362,8 +2380,10 @@ fn resolve_storage_key_blocking(
         return Ok(key);
     }
 
-    // Existing key file.
+    // Existing key file, after removing any copy of a key a crashed write left.
     let key_file = storage_dir.join(".key");
+    scp_platform::durable_file::remove_stale_temporaries(&key_file)
+        .map_err(|e| HostSiteError::StorageKey(format!("key file: {e}")))?;
     if key_file.exists() {
         return read_storage_key_file(&key_file);
     }
@@ -3369,6 +3389,26 @@ mod tests {
             .await
             .expect("read the storage key back");
         assert_eq!(&again[..], &key[..], "a second start reads the same key");
+    }
+
+    /// Reading an existing storage key removes the complete copy of a key that
+    /// a write which crashed before its publish left beside `.key`. Without
+    /// the sweep in `resolve_storage_key_blocking` the copy stays.
+    #[tokio::test]
+    async fn reading_the_storage_key_removes_a_crashed_writes_copy() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let storage = tmp.path().join("storage");
+        let key = resolve_storage_key_file(&storage)
+            .await
+            .expect("generate the storage key");
+        let copy = storage.join(format!(".key.{:032x}.tmp", 9_u128));
+        std::fs::write(&copy, [1u8; 32]).expect("plant a crashed write's copy");
+
+        let again = resolve_storage_key_file(&storage)
+            .await
+            .expect("read the storage key back");
+        assert_eq!(&again[..], &key[..]);
+        assert!(!copy.exists(), "the read must remove the stale copy");
     }
 
     /// A setup drain that times out or fails reaches the caller as the typed

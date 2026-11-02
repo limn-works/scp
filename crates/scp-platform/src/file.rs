@@ -112,6 +112,20 @@
 //! `append_entry`, which takes them both again; it takes them itself and
 //! appends through `append_entry_holding_the_write_locks`.
 //!
+//! A mint (generate or import) that writes an entry keeps that lock until the
+//! handle reaches its caller or the entry is removed again, because a caller
+//! that is cancelled while the write runs never receives the handle and the
+//! entry is removed. Until then no other custody object can read the entry: a
+//! second object importing the same seed would otherwise deduplicate to it and
+//! hand its own caller a handle that the removal empties. When that removal
+//! fails, a generated key, whose handle exists nowhere else, is removed by the
+//! next operation on the same object; an imported key stays, because another
+//! object may adopt it once the lock drops, and its importer, who still holds
+//! the seed, gets its handle back by importing the seed again.
+//!
+//! Every write goes through [`crate::durable_file`], and opening the file
+//! removes any temporary copy of it that a crashed write left behind.
+//!
 //! # Passphrase commitment and file HMAC
 //!
 //! One Argon2id derivation over a caller's passphrase and a stored salt
@@ -159,7 +173,7 @@
 //!
 //! See GitHub issue #391 and ADR-006.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use aes_gcm::aead::Aead;
@@ -592,12 +606,17 @@ struct MappedEntry {
 /// Maps handle IDs to their entries.
 struct HandleMap {
     entries: HashMap<u64, MappedEntry>,
+    /// Generated keys whose handle never reached a caller and whose removal
+    /// failed. Every later operation on this object retries each removal
+    /// before its own work (see [`KeyFile::retry_unremoved`]).
+    unremoved: BTreeSet<u64>,
 }
 
 impl HandleMap {
     fn new() -> Self {
         Self {
             entries: HashMap::new(),
+            unremoved: BTreeSet::new(),
         }
     }
 }
@@ -887,12 +906,29 @@ struct KeyFile {
     file_write_lock: StdMutex<()>,
 }
 
-/// What a mint's blocking work produced: the handle it recorded, and whether
-/// it wrote a new entry for that handle.
+/// What a mint's blocking work produced: the handle it recorded and, when it
+/// wrote a new entry for that handle, the key-file lock it wrote under.
 struct Minted {
     handle: KeyHandle,
-    /// `false` when the key file already held the key, so nothing was written.
-    written: bool,
+    /// The new entry's write: absent when the key file already held the key,
+    /// so nothing was written.
+    write: Option<MintWrite>,
+}
+
+/// The write a mint made: the key-file lock it still holds, and whether
+/// another caller can reach the new entry.
+struct MintWrite {
+    /// The advisory lock taken before the write. It stays held until the
+    /// handle reaches the caller or the entry is removed again, so no other
+    /// custody object over this file reads the entry in between: an import
+    /// there would deduplicate to it and hand its caller a handle that the
+    /// removal then empties.
+    _lock: KeyFileWriteLock,
+    /// Whether another caller can obtain a handle to this entry once the lock
+    /// drops: an imported seed can be imported again, and that import
+    /// deduplicates to this entry. A generated key's handle exists nowhere
+    /// else.
+    reachable_by_reimport: bool,
 }
 
 /// A minted handle on its way from the blocking task to the caller of
@@ -931,11 +967,14 @@ impl Drop for UndeliveredKey {
 
 /// The removal of a freshly written entry, run when this value is dropped
 /// while `armed`. It owns the handle-map lock, so no other operation on this
-/// custody object sees the entry between the write and its removal.
+/// custody object sees the entry between the write and its removal, and the
+/// key-file lock of that write, so no other custody object over the same file
+/// does either.
 struct PendingUndo {
     file: Arc<KeyFile>,
     map: tokio::sync::OwnedMutexGuard<HandleMap>,
     key_id: u64,
+    write: MintWrite,
     armed: bool,
 }
 
@@ -944,13 +983,40 @@ impl Drop for PendingUndo {
         if !self.armed {
             return;
         }
-        if let Err(error) = self.file.remove_entry_locked(&mut self.map, self.key_id) {
-            // The entry stays in the file and in the handle map, where a later
-            // `destroy_key` on this id can still remove it.
+        let removed = self
+            .file
+            .file_write_lock
+            .lock()
+            .map_err(|_| PlatformError::CustodyError("file write lock poisoned".into()))
+            .and_then(|_lock| {
+                self.file
+                    .remove_entry_holding_the_write_locks(&mut self.map, self.key_id)
+            });
+        let Err(error) = removed else {
+            return;
+        };
+        if self.write.reachable_by_reimport {
+            // The entry stays. Once the key-file lock drops, another custody
+            // object can import the same seed and hand its caller this entry,
+            // so a later removal could destroy a key that caller owns. The
+            // caller of this import still holds the seed: importing it again
+            // returns this entry's handle, which `destroy_key` removes.
             tracing::warn!(
                 key_id = self.key_id,
                 %error,
-                "FileKeyCustody could not remove a key whose handle never reached its caller"
+                "FileKeyCustody could not remove an imported key whose handle never reached \
+                 its caller; importing the same seed again returns its handle"
+            );
+        } else {
+            // No caller can ever name a generated key whose handle never left
+            // this object, so retrying later destroys nothing anyone owns.
+            // Every later operation on this object retries the removal.
+            self.map.unremoved.insert(self.key_id);
+            tracing::warn!(
+                key_id = self.key_id,
+                %error,
+                "FileKeyCustody could not remove a generated key whose handle never reached \
+                 its caller; the next operation on this custody object retries the removal"
             );
         }
     }
@@ -1040,6 +1106,10 @@ impl FileKeyCustody {
                 "key file passphrase must not be empty".to_owned(),
             ));
         }
+        // A writer that crashed mid-write left a complete, wrapped copy of the
+        // key file beside it; no copy outlives the next open.
+        crate::durable_file::remove_stale_temporaries(path)
+            .map_err(|e| PlatformError::CustodyError(format!("key file: {e}")))?;
         // `create_file_exclusive` creates a file with `O_EXCL` and reports
         // `false` when it loses that race, so two processes calling this
         // constructor at once never both create a file and never overwrite each
@@ -1180,7 +1250,10 @@ impl FileKeyCustody {
         let mut map = Arc::clone(&self.handle_map).lock_owned().await;
         let file = Arc::clone(&self.file);
         self.runtime
-            .spawn_blocking(move || work(&file, &mut map))
+            .spawn_blocking(move || {
+                file.retry_unremoved(&mut map);
+                work(&file, &mut map)
+            })
             .await
             .map_err(|e| {
                 PlatformError::CustodyError(format!("key file task did not finish: {e}"))
@@ -1206,17 +1279,32 @@ impl FileKeyCustody {
     where
         F: FnOnce(&KeyFile, &mut HandleMap) -> Result<Minted, PlatformError> + Send + 'static,
     {
+        Ok(self.mint_undelivered(work).await?.deliver())
+    }
+
+    /// The body of [`Self::mint_with_key_file`]: runs `work` and returns its
+    /// handle undelivered, still holding the handle-map lock and, when `work`
+    /// wrote an entry, the key-file lock of that write.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::mint_with_key_file`].
+    async fn mint_undelivered<F>(&self, work: F) -> Result<UndeliveredKey, PlatformError>
+    where
+        F: FnOnce(&KeyFile, &mut HandleMap) -> Result<Minted, PlatformError> + Send + 'static,
+    {
         let mut map = Arc::clone(&self.handle_map).lock_owned().await;
         let file = Arc::clone(&self.file);
         let runtime = self.runtime.clone();
-        let undelivered = self
-            .runtime
+        self.runtime
             .spawn_blocking(move || {
+                file.retry_unremoved(&mut map);
                 let minted = work(&file, &mut map)?;
-                let undo = minted.written.then(|| PendingUndo {
+                let undo = minted.write.map(|write| PendingUndo {
                     file,
                     map,
                     key_id: minted.handle.id(),
+                    write,
                     armed: true,
                 });
                 Ok::<_, PlatformError>(UndeliveredKey {
@@ -1228,8 +1316,7 @@ impl FileKeyCustody {
             .await
             .map_err(|e| {
                 PlatformError::CustodyError(format!("key file task did not finish: {e}"))
-            })??;
-        Ok(undelivered.deliver())
+            })?
     }
 
     /// Opens an existing key file at `path` and loads entry metadata.
@@ -1476,7 +1563,10 @@ impl KeyFile {
     }
 
     /// Appends an encrypted key entry to the file and updates the entry count,
-    /// for a caller that holds neither write lock.
+    /// for a caller that holds neither write lock, and returns the new entry's
+    /// identifier with the advisory lock still held, so a mint keeps the
+    /// entry out of every other custody object's reach until its handle is
+    /// delivered or the entry removed.
     ///
     /// Takes both locks and hands the read-modify-write to
     /// [`Self::append_entry_holding_the_write_locks`], so the cross-process
@@ -1497,13 +1587,14 @@ impl KeyFile {
         key_type: StoredKeyType,
         role: KeyRole,
         private_key: &[u8; KEY_LEN],
-    ) -> Result<EntryId, PlatformError> {
+    ) -> Result<(EntryId, KeyFileWriteLock), PlatformError> {
         let _lock = self
             .file_write_lock
             .lock()
             .map_err(|_| PlatformError::CustodyError("file write lock poisoned".into()))?;
-        let _file_lock = lock_key_file_for_write(&self.path)?;
-        self.append_entry_holding_the_write_locks(key_type, role, private_key)
+        let file_lock = lock_key_file_for_write(&self.path)?;
+        let entry_id = self.append_entry_holding_the_write_locks(key_type, role, private_key)?;
+        Ok((entry_id, file_lock))
     }
 
     /// Appends an encrypted key entry to the file and updates the entry count,
@@ -1582,6 +1673,67 @@ impl KeyFile {
     /// type or role, or when the rewrite fails. Every error leaves the file and
     /// `map` as they were.
     fn remove_entry_locked(&self, map: &mut HandleMap, key_id: u64) -> Result<(), PlatformError> {
+        if !map.entries.contains_key(&key_id) {
+            return Err(PlatformError::KeyNotFound);
+        }
+        let _lock = self
+            .file_write_lock
+            .lock()
+            .map_err(|_| PlatformError::CustodyError("file write lock poisoned".into()))?;
+        // Hold the cross-process advisory lock from this read through the
+        // write below, so a second custody object over the same path cannot
+        // append between them and lose its own entry to this rewrite
+        // (§17.8 of `.docs/specs/17-persistence-and-storage.md`, "One
+        // writer at a time").
+        let _file_lock = lock_key_file_for_write(&self.path)?;
+        self.remove_entry_holding_the_write_locks(map, key_id)
+    }
+
+    /// Retries the removal of every generated key in `map.unremoved`, under a
+    /// `handle_map` lock the caller holds, before that caller's own work.
+    ///
+    /// Best effort and never waiting: when another writer holds the key-file
+    /// lock, or a removal fails again, the id stays for the next operation, and
+    /// the caller's work runs either way. An id whose entry this file no longer
+    /// holds leaves the set and `map`.
+    fn retry_unremoved(&self, map: &mut HandleMap) {
+        if map.unremoved.is_empty() {
+            return;
+        }
+        let Ok(_lock) = self.file_write_lock.lock() else {
+            return;
+        };
+        let Ok(_file_lock) = lock_key_file_for_write_within(&self.path, std::time::Duration::ZERO)
+        else {
+            return;
+        };
+        for key_id in std::mem::take(&mut map.unremoved) {
+            match self.remove_entry_holding_the_write_locks(map, key_id) {
+                Ok(()) | Err(PlatformError::KeyNotFound) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        key_id,
+                        %error,
+                        "FileKeyCustody could not yet remove a generated key whose handle \
+                         never reached its caller; the next operation retries"
+                    );
+                    map.unremoved.insert(key_id);
+                }
+            }
+        }
+    }
+
+    /// The body of [`Self::remove_entry_locked`], for a caller that already
+    /// holds `handle_map`, `file_write_lock` and the key-file lock.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::remove_entry_locked`].
+    fn remove_entry_holding_the_write_locks(
+        &self,
+        map: &mut HandleMap,
+        key_id: u64,
+    ) -> Result<(), PlatformError> {
         // Look up — do NOT mutate the map yet. Map mutation is
         // deferred until after the file rewrite succeeds, so a
         // failed `read_file` or `atomic_write` cannot orphan
@@ -1599,17 +1751,6 @@ impl KeyFile {
         // Rewrite the key file without the destroyed entry.
         // This ensures key material is removed from disk, not just from
         // the in-memory handle map.
-        let _lock = self
-            .file_write_lock
-            .lock()
-            .map_err(|_| PlatformError::CustodyError("file write lock poisoned".into()))?;
-        // Hold the cross-process advisory lock from this read through the
-        // write below, so a second custody object over the same path cannot
-        // append between them and lose its own entry to this rewrite
-        // (§17.8 of `.docs/specs/17-persistence-and-storage.md`, "One
-        // writer at a time").
-        let _file_lock = lock_key_file_for_write(&self.path)?;
-
         let data = self.read_file()?;
 
         // Find the entry this handle names. An identifier names one entry
@@ -1808,34 +1949,8 @@ impl FileKeyCustody {
         // `append_entry` takes only `file_write_lock`, never `handle_map`, so
         // there is no lock-ordering inversion. Mirrors the pattern in
         // `import_ed25519_signing_key`.
-        self.mint_with_key_file(move |file, map| {
-            let key_bytes = match key_type {
-                KeyType::Ed25519 => {
-                    let mut key_bytes = Zeroizing::new([0u8; KEY_LEN]);
-                    rand::rngs::OsRng.fill_bytes(key_bytes.as_mut());
-                    key_bytes
-                }
-                KeyType::P256Signing | KeyType::HpkeP256 | KeyType::P256KeyEvent => {
-                    crate::traits::generate_p256_os_rng()?.to_scalar_bytes()
-                }
-            };
-            let stored_type = StoredKeyType::from_key_type(key_type);
-            let entry_id = file.append_entry(stored_type, role, &key_bytes)?;
-            let handle = KeyHandle::new(handle_id_for(&entry_id));
-            map.entries.insert(
-                handle.id(),
-                MappedEntry {
-                    key_type: stored_type,
-                    role,
-                    entry_id,
-                },
-            );
-            Ok(Minted {
-                handle,
-                written: true,
-            })
-        })
-        .await
+        self.mint_with_key_file(move |file, map| file.generate_locked(map, key_type, role))
+            .await
     }
 }
 
@@ -2063,138 +2178,203 @@ impl KeyCustody for FileKeyCustody {
     ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send {
         let seed = Zeroizing::new(**seed);
         async move {
-            self.mint_with_key_file(move |file, map| {
-                // Dedup by content: if the seed's verifying key already
-                // matches an existing Ed25519 entry, return that handle
-                // instead of appending a duplicate. Without this guard a
-                // retry of import (e.g. on transient failure higher up the
-                // stack) would create a parallel encrypted entry holding the
-                // same private key — wasting space and producing a phantom
-                // handle on reopen that the registry can no longer reach.
-                let signing_key = SigningKey::from_bytes(&seed);
-                let target_pub = signing_key.verifying_key().to_bytes();
-
-                // Hold `handle_map.lock()` across the entire scan-and-insert
-                // path so that two concurrent imports of the same seed
-                // cannot both observe a non-matching snapshot and both
-                // append. We do NOT call `self.load_key` from here (that
-                // method re-acquires `handle_map` and would deadlock).
-                // Instead, read the file once and decrypt candidate Ed25519
-                // entries directly via `decrypt_entry`.
-                //
-                // The scan walks the file's entries rather than this object's
-                // handle map, because a second custody object over the same path
-                // writes entries this object minted no handle for. A scan over the
-                // map would miss those entries and append a second copy of a key
-                // the file already holds.
-                //
-                // Both write locks are taken here, before that read, and held
-                // through the append below, because this scan and that append are
-                // one read-modify-write of the key file: §17.8 of
-                // `.docs/specs/17-persistence-and-storage.md` requires an
-                // exclusive advisory lock across it, and states that an in-process
-                // mutex does not satisfy that requirement. `handle_map` excludes
-                // only two tasks that share this object, so without the advisory
-                // lock two custody objects over one path — the arrangement the
-                // Python bridge produces, since each identity it creates constructs
-                // a fresh object over `$HOME/.scp/keys.bin` — each scan a file that holds
-                // no matching entry, each append, and the file ends up holding two
-                // entries wrapping one private key. `destroy_key` then removes the
-                // one entry its handle names and leaves the other on disk.
-                //
-                // Lock order matches `destroy_key`: `handle_map`, then
-                // `file_write_lock`, then the advisory lock. Nothing below awaits,
-                // so no lock here is held across a suspension point.
-                let _lock = file
-                    .file_write_lock
-                    .lock()
-                    .map_err(|_| PlatformError::CustodyError("file write lock poisoned".into()))?;
-                let _file_lock = lock_key_file_for_write(&file.path)?;
-
-                let data = file.read_file()?;
-                let entry_count = data.len().saturating_sub(HEADER_SIZE) / ENTRY_SIZE;
-                // Only identity entries count: the imported key is the migrated
-                // identity's new `#0`, and an operational entry never derives.
-                for index in 0..entry_count {
-                    let entry_offset = HEADER_SIZE + index * ENTRY_SIZE;
-                    if StoredKeyType::from_byte(data[entry_offset])? != StoredKeyType::Ed25519
-                        || read_entry_role(&data, index)? != KeyRole::Identity
-                    {
-                        continue;
-                    }
-                    let entry_id = read_entry_id(&data, index);
-                    // Surface decrypt failure rather than silently skipping
-                    // the entry. A failed decrypt at this point indicates
-                    // file corruption (mismatched MAC, truncated ciphertext,
-                    // or wrong passphrase-derived key) — not a "this entry
-                    // doesn't match"; treating it as the latter would
-                    // permit a corrupted file to silently re-grow with
-                    // duplicate entries on every retry.
-                    let existing_bytes = file
-                        .decrypt_entry(&data, &entry_id, StoredKeyType::Ed25519, KeyRole::Identity)
-                        .map_err(|e| {
-                            PlatformError::CustodyError(format!(
-                                "import dedup scan: failed to decrypt entry {index} — file may be \
-                             corrupted: {e}"
-                            ))
-                        })?;
-                    let existing = SigningKey::from_bytes(&existing_bytes);
-                    if existing.verifying_key().to_bytes() != target_pub {
-                        continue;
-                    }
-
-                    // Return that entry's handle. This object holds no map entry
-                    // for it when another custody object over this path wrote the
-                    // entry, so this branch records one instead of appending a
-                    // second copy of the same key.
-                    let handle = KeyHandle::new(handle_id_for(&entry_id));
-                    map.entries.insert(
-                        handle.id(),
-                        MappedEntry {
-                            key_type: StoredKeyType::Ed25519,
-                            role: KeyRole::Identity,
-                            entry_id,
-                        },
-                    );
-                    // The file already held this key, so this call wrote
-                    // nothing and a dropped caller leaves nothing to undo.
-                    return Ok(Minted {
-                        handle,
-                        written: false,
-                    });
-                }
-                drop(data);
-
-                // Persist the seed bytes via the same encrypted append-only
-                // log used by `generate_keypair`. After this call the bytes
-                // are encrypted-at-rest under the same passphrase-derived key.
-                // Both write locks are already held above and neither is
-                // reentrant, so this call takes the variant that writes under
-                // locks its caller holds.
-                let key_bytes = Zeroizing::new(*seed);
-                let entry_id = file.append_entry_holding_the_write_locks(
-                    StoredKeyType::Ed25519,
-                    KeyRole::Identity,
-                    &key_bytes,
-                )?;
-
-                let handle = KeyHandle::new(handle_id_for(&entry_id));
-                map.entries.insert(
-                    handle.id(),
-                    MappedEntry {
-                        key_type: StoredKeyType::Ed25519,
-                        role: KeyRole::Identity,
-                        entry_id,
-                    },
-                );
-
-                Ok(Minted {
-                    handle,
-                    written: true,
-                })
-            })
-            .await
+            self.mint_with_key_file(move |file, map| file.import_ed25519_locked(map, &seed))
+                .await
         }
+    }
+}
+
+impl KeyFile {
+    /// Mints a key of `key_type` in `role`, appends it, and records its
+    /// handle in `map`, under a `handle_map` lock the caller holds. The
+    /// returned write keeps the key-file lock (see [`MintWrite`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlatformError::CustodyError`] when key generation or the
+    /// append fails.
+    fn generate_locked(
+        &self,
+        map: &mut HandleMap,
+        key_type: KeyType,
+        role: KeyRole,
+    ) -> Result<Minted, PlatformError> {
+        let key_bytes = match key_type {
+            KeyType::Ed25519 => {
+                let mut key_bytes = Zeroizing::new([0u8; KEY_LEN]);
+                rand::rngs::OsRng.fill_bytes(key_bytes.as_mut());
+                key_bytes
+            }
+            KeyType::P256Signing | KeyType::HpkeP256 | KeyType::P256KeyEvent => {
+                crate::traits::generate_p256_os_rng()?.to_scalar_bytes()
+            }
+        };
+        let stored_type = StoredKeyType::from_key_type(key_type);
+        let (entry_id, lock) = self.append_entry(stored_type, role, &key_bytes)?;
+        let handle = KeyHandle::new(handle_id_for(&entry_id));
+        map.entries.insert(
+            handle.id(),
+            MappedEntry {
+                key_type: stored_type,
+                role,
+                entry_id,
+            },
+        );
+        Ok(Minted {
+            handle,
+            write: Some(MintWrite {
+                _lock: lock,
+                reachable_by_reimport: false,
+            }),
+        })
+    }
+
+    /// Stores `seed` as an identity Ed25519 entry unless this file already
+    /// holds it, and records its handle in `map`, under a `handle_map` lock
+    /// the caller holds. A new entry's write keeps the key-file lock (see
+    /// [`MintWrite`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlatformError::CustodyError`] when a lock cannot be taken,
+    /// the file fails verification, an existing entry fails to decrypt, or
+    /// the append fails.
+    fn import_ed25519_locked(
+        &self,
+        map: &mut HandleMap,
+        seed: &Zeroizing<[u8; 32]>,
+    ) -> Result<Minted, PlatformError> {
+        // Dedup by content: if the seed's verifying key already
+        // matches an existing Ed25519 entry, return that handle
+        // instead of appending a duplicate. Without this guard a
+        // retry of import (e.g. on transient failure higher up the
+        // stack) would create a parallel encrypted entry holding the
+        // same private key — wasting space and producing a phantom
+        // handle on reopen that the registry can no longer reach.
+        let signing_key = SigningKey::from_bytes(seed);
+        let target_pub = signing_key.verifying_key().to_bytes();
+
+        // Hold `handle_map.lock()` across the entire scan-and-insert
+        // path so that two concurrent imports of the same seed
+        // cannot both observe a non-matching snapshot and both
+        // append. We do NOT call `self.load_key` from here (that
+        // method re-acquires `handle_map` and would deadlock).
+        // Instead, read the file once and decrypt candidate Ed25519
+        // entries directly via `decrypt_entry`.
+        //
+        // The scan walks the file's entries rather than this object's
+        // handle map, because a second custody object over the same path
+        // writes entries this object minted no handle for. A scan over the
+        // map would miss those entries and append a second copy of a key
+        // the file already holds.
+        //
+        // Both write locks are taken here, before that read, and held
+        // through the append below, because this scan and that append are
+        // one read-modify-write of the key file: §17.8 of
+        // `.docs/specs/17-persistence-and-storage.md` requires an
+        // exclusive advisory lock across it, and states that an in-process
+        // mutex does not satisfy that requirement. `handle_map` excludes
+        // only two tasks that share this object, so without the advisory
+        // lock two custody objects over one path — the arrangement the
+        // Python bridge produces, since each identity it creates constructs
+        // a fresh object over `$HOME/.scp/keys.bin` — each scan a file that holds
+        // no matching entry, each append, and the file ends up holding two
+        // entries wrapping one private key. `destroy_key` then removes the
+        // one entry its handle names and leaves the other on disk.
+        //
+        // Lock order matches `destroy_key`: `handle_map`, then
+        // `file_write_lock`, then the advisory lock. Nothing below awaits,
+        // so no lock here is held across a suspension point.
+        let _lock = self
+            .file_write_lock
+            .lock()
+            .map_err(|_| PlatformError::CustodyError("self write lock poisoned".into()))?;
+        let file_lock = lock_key_file_for_write(&self.path)?;
+
+        let data = self.read_file()?;
+        let entry_count = data.len().saturating_sub(HEADER_SIZE) / ENTRY_SIZE;
+        // Only identity entries count: the imported key is the migrated
+        // identity's new `#0`, and an operational entry never derives.
+        for index in 0..entry_count {
+            let entry_offset = HEADER_SIZE + index * ENTRY_SIZE;
+            if StoredKeyType::from_byte(data[entry_offset])? != StoredKeyType::Ed25519
+                || read_entry_role(&data, index)? != KeyRole::Identity
+            {
+                continue;
+            }
+            let entry_id = read_entry_id(&data, index);
+            // Surface decrypt failure rather than silently skipping
+            // the entry. A failed decrypt at this point indicates
+            // file corruption (mismatched MAC, truncated ciphertext,
+            // or wrong passphrase-derived key) — not a "this entry
+            // doesn't match"; treating it as the latter would
+            // permit a corrupted file to silently re-grow with
+            // duplicate entries on every retry.
+            let existing_bytes = self
+                .decrypt_entry(&data, &entry_id, StoredKeyType::Ed25519, KeyRole::Identity)
+                .map_err(|e| {
+                    PlatformError::CustodyError(format!(
+                        "import dedup scan: failed to decrypt entry {index} — self may be \
+                     corrupted: {e}"
+                    ))
+                })?;
+            let existing = SigningKey::from_bytes(&existing_bytes);
+            if existing.verifying_key().to_bytes() != target_pub {
+                continue;
+            }
+
+            // Return that entry's handle. This object holds no map entry
+            // for it when another custody object over this path wrote the
+            // entry, so this branch records one instead of appending a
+            // second copy of the same key.
+            let handle = KeyHandle::new(handle_id_for(&entry_id));
+            map.entries.insert(
+                handle.id(),
+                MappedEntry {
+                    key_type: StoredKeyType::Ed25519,
+                    role: KeyRole::Identity,
+                    entry_id,
+                },
+            );
+            // The file already held this key, so this call wrote
+            // nothing and a dropped caller leaves nothing to undo.
+            return Ok(Minted {
+                handle,
+                write: None,
+            });
+        }
+        drop(data);
+
+        // Persist the seed bytes via the same encrypted append-only
+        // log used by `generate_keypair`. After this call the bytes
+        // are encrypted-at-rest under the same passphrase-derived key.
+        // Both write locks are already held above and neither is
+        // reentrant, so this call takes the variant that writes under
+        // locks its caller holds.
+        let key_bytes = Zeroizing::new(**seed);
+        let entry_id = self.append_entry_holding_the_write_locks(
+            StoredKeyType::Ed25519,
+            KeyRole::Identity,
+            &key_bytes,
+        )?;
+
+        let handle = KeyHandle::new(handle_id_for(&entry_id));
+        map.entries.insert(
+            handle.id(),
+            MappedEntry {
+                key_type: StoredKeyType::Ed25519,
+                role: KeyRole::Identity,
+                entry_id,
+            },
+        );
+
+        Ok(Minted {
+            handle,
+            write: Some(MintWrite {
+                _lock: file_lock,
+                reachable_by_reimport: true,
+            }),
+        })
     }
 }
 
@@ -4894,6 +5074,167 @@ mod tests {
             .expect("the key the first import stored must survive a dropped duplicate import");
     }
 
+    /// An import whose handle never reached its caller keeps the key-file
+    /// lock until its entry is removed again, so a second custody object over
+    /// the same file cannot deduplicate to that entry in between and hand its
+    /// own caller a handle that the removal then empties.
+    ///
+    /// Releasing the key-file lock when the import's blocking work returns
+    /// lets the zero-wait lock below succeed, and fails this test.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_undone_import_keeps_a_key_another_object_handed_out() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("keys.scp");
+        let runtime = tokio::runtime::Handle::current();
+        let first = FileKeyCustody::open(&path, "pw", runtime.clone())
+            .await
+            .unwrap();
+        let second = Arc::new(FileKeyCustody::open(&path, "pw", runtime).await.unwrap());
+        let seed = Zeroizing::new([5u8; KEY_LEN]);
+
+        let undone_seed = seed.clone();
+        let undelivered = first
+            .mint_undelivered(move |file, map| file.import_ed25519_locked(map, &undone_seed))
+            .await
+            .unwrap();
+        assert!(
+            lock_key_file_for_write_within(&path, std::time::Duration::ZERO).is_err(),
+            "an undelivered import must hold the key-file lock until its entry is removed"
+        );
+
+        let importer = {
+            let second = Arc::clone(&second);
+            let seed = seed.clone();
+            tokio::spawn(async move { second.import_ed25519_signing_key(&seed).await })
+        };
+        drop(undelivered);
+        let handle = importer.await.unwrap().unwrap();
+
+        second
+            .sign(&handle, b"still stored")
+            .await
+            .expect("the second object's handle must still name a stored key");
+        assert!(handles_of(&first).await.is_empty());
+        let reopened = FileKeyCustody::open(&path, "pw", tokio::runtime::Handle::current())
+            .await
+            .unwrap();
+        assert_eq!(handles_of(&reopened).await, vec![handle]);
+    }
+
+    /// Stands a directory at `path` in place of the key file, so every read of
+    /// that file fails, and returns where the file was moved.
+    fn hide_key_file(path: &Path) -> PathBuf {
+        let aside = path.with_extension("aside");
+        std::fs::rename(path, &aside).unwrap();
+        std::fs::create_dir(path).unwrap();
+        aside
+    }
+
+    /// Undoes [`hide_key_file`].
+    fn restore_key_file(path: &Path, aside: &Path) {
+        std::fs::remove_dir(path).unwrap();
+        std::fs::rename(aside, path).unwrap();
+    }
+
+    /// A generated key whose removal failed is removed by the next operation
+    /// on the same custody object, so the file keeps no key whose handle
+    /// reached nobody.
+    ///
+    /// The removal fails because a directory stands at the key file's path
+    /// while it runs. Without the retry the orphan stays in the handle map and
+    /// in the file, and both final assertions fail.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_removal_of_an_undelivered_generated_key_is_retried() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("keys.scp");
+        let custody = FileKeyCustody::open(&path, "pw", tokio::runtime::Handle::current())
+            .await
+            .unwrap();
+        let kept = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+
+        let undelivered = custody
+            .mint_undelivered(|file, map| {
+                file.generate_locked(map, KeyType::Ed25519, KeyRole::Operational)
+            })
+            .await
+            .unwrap();
+        let orphan = KeyHandle::new(undelivered.handle.id());
+        let aside = hide_key_file(&path);
+        drop(undelivered);
+        assert!(
+            handles_of(&custody).await.contains(&orphan),
+            "the removal must have failed while the key file was hidden"
+        );
+        restore_key_file(&path, &aside);
+
+        custody.public_key(&kept).await.unwrap();
+        assert_eq!(handles_of(&custody).await, vec![kept]);
+        let reopened = FileKeyCustody::open(&path, "pw", tokio::runtime::Handle::current())
+            .await
+            .unwrap();
+        assert_eq!(handles_of(&reopened).await, vec![kept]);
+    }
+
+    /// An imported key whose removal failed is never removed later: once the
+    /// key-file lock drops, another object may hand out that entry. Its
+    /// importer still holds the seed, and importing it again returns the
+    /// entry's handle, which `destroy_key` removes.
+    ///
+    /// Retrying the removal of an imported key, as a generated one is retried,
+    /// removes the entry at the `public_key` call and fails the re-import
+    /// assertion.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_removal_of_an_undelivered_import_is_left_to_its_seed() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("keys.scp");
+        let custody = FileKeyCustody::open(&path, "pw", tokio::runtime::Handle::current())
+            .await
+            .unwrap();
+        let kept = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let seed = Zeroizing::new([6u8; KEY_LEN]);
+
+        let undone_seed = seed.clone();
+        let undelivered = custody
+            .mint_undelivered(move |file, map| file.import_ed25519_locked(map, &undone_seed))
+            .await
+            .unwrap();
+        let imported = KeyHandle::new(undelivered.handle.id());
+        let aside = hide_key_file(&path);
+        drop(undelivered);
+        assert!(handles_of(&custody).await.contains(&imported));
+        restore_key_file(&path, &aside);
+
+        custody.public_key(&kept).await.unwrap();
+        let reimported = custody.import_ed25519_signing_key(&seed).await.unwrap();
+        assert_eq!(
+            reimported, imported,
+            "importing the seed again must return the entry the failed removal left"
+        );
+        custody.destroy_key(&reimported).await.unwrap();
+        assert_eq!(handles_of(&custody).await, vec![kept]);
+    }
+
+    /// Opening a key file removes the complete copy of it that a writer which
+    /// crashed mid-write left beside it. Without the sweep in `open_blocking`
+    /// the copy stays.
+    #[tokio::test]
+    async fn an_open_removes_a_crashed_writes_copy_of_the_key_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("keys.scp");
+        let custody = FileKeyCustody::open(&path, "pw", tokio::runtime::Handle::current())
+            .await
+            .unwrap();
+        custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        drop(custody);
+        let copy = dir.path().join(format!("keys.scp.{:032x}.tmp", 7_u128));
+        std::fs::copy(&path, &copy).unwrap();
+
+        FileKeyCustody::open(&path, "pw", tokio::runtime::Handle::current())
+            .await
+            .unwrap();
+        assert!(!copy.exists(), "the open must remove the stale copy");
+    }
+
     /// The P-256 group order `n`, big-endian: the smallest invalid scalar.
     const P256_ORDER: [u8; 32] = [
         0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
@@ -5194,7 +5535,8 @@ mod tests {
                 let id = custody
                     .file
                     .append_entry(stored_type, KeyRole::Operational, &scalar)
-                    .unwrap();
+                    .unwrap()
+                    .0;
                 drop(custody);
 
                 let custody =
