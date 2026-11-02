@@ -2,6 +2,8 @@
 
 **Status:** Accepted (model decided; implementation is a separate, forward program — see *Implementation and sequencing*).
 
+**Amended by ADR-069 (2026-11-02):** §3 "No trusted sequencer" no longer holds for Commits. The node that runs a context orders its Commits as the context's MLS Delivery Service, and every member merges the first valid Commit for each epoch in the node's chain, so the commit-ordered stream this record's Context relies on has a sequencer: the context's node. Every member still verifies every Commit, and the node holds no MLS group secret. Decision D6 of the context-operation plan (Alec, 2026-10-25) also moves application messages to the node's order in place of this record's causal DAG; this record's DAG text is unchanged until that work lands (ADR-069, Consequences).
+
 **Date:** 2026-06-19
 
 **Phase:** Phase 6 / event-log convergence

@@ -51,6 +51,8 @@ The only mitigation the current design offers is an always-on device of the same
 
 **D4 — No primary-device formalization.** Do not formalize an always-on/primary device (or any delegate) as the answer to absence — that would enshrine the assumption D1 exists to eliminate. Multi-device remains what §10.8.1 makes it: a capability. The attenuated keep-alive delegate idea is dead: heartbeats need not be delegated (no idle obligation exists — see the sweep), Updates cannot be soundly delegated (holding the leaf key = full impersonation; pre-signed Updates defeat PCS's purpose), and KeyPackage availability is solved key-lessly by D1 (a last-resort KP is public material — anyone can *serve* it; no delegate needed to *mint* it).
 
+**Note on D4 (2026-11-02).** Alec's rulings of 2026-10-25 (`~/.claude/plans/context-operation-plan.md`, rulings 2 and 3) and ADR-069 make the context's node the always-on party that orders a context's Commits. The node is an infrastructure host, not a member device: "the node isn't participating in that context as a first-class entity; it's the place where the context runs." D4 therefore no longer governs ordering. It still governs what it names for members: no member device is formalized as primary, and no delegate holds a member's leaf key.
+
 ## Execution notes
 
 - Deliverables: spec amendments (§9.6.2, §23, §9.9.2-adjacent for D2, §5 context-parameter for D3) + one ADR recording D1–D4 with the rejected alternatives (always-on-device reliance, delegated keep-alive, unconditional absence-decay). Then implementation slices (KP pool + relay serve-order + reconnection rotation; the D2 classification; the D3 parameter through governance).
