@@ -822,6 +822,43 @@ mod tests {
         Ok(())
     }
 
+    /// `signed_record` with `context_id` padded so its canonical JSON is
+    /// exactly `len` bytes. The signature is not recomputed; encoding does not
+    /// check it.
+    fn record_of_json_len(len: usize) -> TestResult<NodeListRecord> {
+        let mut record = signed_record(&key(9))?;
+        let base = record.to_canonical_json()?.len();
+        record.context_id.push_str(&"a".repeat(len - base));
+        Ok(record)
+    }
+
+    /// A record whose canonical JSON is exactly `Max blob size − 33` bytes
+    /// encodes, decodes back, and fits a frame.
+    #[test]
+    fn a_record_of_exactly_the_maximum_encodes() -> TestResult {
+        let record = record_of_json_len(MAX_NODE_LIST_VALUE_LEN)?;
+        let json = record.to_canonical_json()?;
+        assert_eq!(json.len(), MAX_NODE_LIST_VALUE_LEN);
+        assert_eq!(NodeListRecord::from_canonical_json(&json)?, record);
+        let frame = encode_node_list_frame(&record)?;
+        assert_eq!(
+            frame.len(),
+            NODE_LIST_FRAME_PREFIX_LEN + MAX_NODE_LIST_VALUE_LEN
+        );
+        Ok(())
+    }
+
+    /// One byte past the maximum is refused on encode.
+    #[test]
+    fn a_record_one_byte_over_the_maximum_does_not_encode() -> TestResult {
+        let record = record_of_json_len(MAX_NODE_LIST_VALUE_LEN + 1)?;
+        assert_eq!(
+            record.to_canonical_json(),
+            Err(NodeListError::TooLarge(MAX_NODE_LIST_VALUE_LEN + 1))
+        );
+        Ok(())
+    }
+
     #[test]
     fn a_record_too_large_for_a_frame_does_not_encode() -> TestResult {
         let mut record = signed_record(&key(9))?;
