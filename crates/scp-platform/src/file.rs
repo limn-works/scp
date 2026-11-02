@@ -1107,9 +1107,8 @@ impl FileKeyCustody {
             ));
         }
         // A writer that crashed mid-write left a complete, wrapped copy of the
-        // key file beside it; no copy outlives the next open.
-        crate::durable_file::remove_stale_temporaries(path)
-            .map_err(|e| PlatformError::CustodyError(format!("key file: {e}")))?;
+        // key file beside it; the next open that can remove it does.
+        crate::durable_file::remove_stale_temporaries(path);
         // `create_file_exclusive` creates a file with `O_EXCL` and reports
         // `false` when it loses that race, so two processes calling this
         // constructor at once never both create a file and never overwrite each
@@ -3328,6 +3327,37 @@ mod tests {
             vec!["keys.scp.tmp".to_owned()],
             "randomized temp must be renamed away, leaving no residue"
         );
+    }
+
+    /// A leftover temporary of the key file that this user cannot open, and
+    /// so the sweep cannot remove, does not fail the open of the key file or
+    /// a write to it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unremovable_temporary_does_not_block_the_open()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = TempDir::new()?;
+        let path = dir.path().join("keys.scp");
+        let custody = FileKeyCustody::open(&path, "pw", tokio::runtime::Handle::current()).await?;
+        let first = custody.generate_keypair(KeyType::Ed25519).await?;
+        drop(custody);
+
+        let stale = dir
+            .path()
+            .join(format!("keys.scp.{:032x}.tmp", 0x5eed_u128));
+        std::fs::write(&stale, b"a crashed write's copy")?;
+        std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o000))?;
+        assert!(
+            std::fs::File::open(&stale).is_err(),
+            "this test needs an unprivileged user, for whom a mode-000 file is unreadable"
+        );
+
+        let custody = FileKeyCustody::open(&path, "pw", tokio::runtime::Handle::current()).await?;
+        custody.public_key(&first).await?;
+        custody.generate_keypair(KeyType::Ed25519).await?;
+        assert!(stale.exists(), "the sweep could not remove it");
+        Ok(())
     }
 
     #[tokio::test]

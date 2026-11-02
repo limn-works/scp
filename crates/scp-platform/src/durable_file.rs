@@ -14,11 +14,17 @@
 //! does: when another writer published first it reports
 //! [`Created::AlreadyPresent`] and leaves the winner's file in place, so two
 //! processes generating the same secret at once agree on one. `create`
-//! publishes with an exclusive rename (`renameat2(RENAME_NOREPLACE)` on Linux
-//! and Android, `renameatx_np(RENAME_EXCL)` on Apple platforms) and falls back
-//! to a hard link, which also refuses an existing name. A file system that
-//! supports neither gets [`DurableWriteErrorKind::ExclusivePublishUnsupported`]
-//! and no file: `create` never falls back to a write that could overwrite.
+//! publishes with an exclusive rename (`renameat2(RENAME_NOREPLACE)` on Linux,
+//! `renameatx_np(RENAME_EXCL)` on Apple platforms) and falls back to a hard
+//! link, which also refuses an existing name. Android and every other target
+//! publish through the hard link alone: Android 8 to 10 (API 26 to 29) has no
+//! `renameat2` in bionic, and its app seccomp filter may kill the process on a
+//! raw `renameat2` system call instead of returning `ENOSYS`. When every
+//! publish fails with an error [`unsupported`] classifies as "the file system
+//! or platform lacks this call", `create` returns
+//! [`DurableWriteErrorKind::ExclusivePublishUnsupported`] and no file; any
+//! other failure returns [`DurableWriteErrorKind::Io`]. `create` never falls
+//! back to a write that could overwrite.
 //!
 //! # No temporary copy outlives its write
 //!
@@ -30,7 +36,10 @@
 //! and never the temporary of a writer that is still running. `create` and
 //! `replace` call it before they write, and every reader of a secret this
 //! module wrote calls it before it reads, so a crash leaves a copy only until
-//! the next open of that secret.
+//! the next open of that secret that can remove it. A temporary the sweep
+//! cannot remove (no permission, a lock call the file system refuses) is
+//! logged as a warning naming its path and left in place; it never fails the
+//! open or write of the secret itself.
 //!
 //! Every secret-file writer in this workspace calls this module, so the
 //! guarantee lives in one place.
@@ -115,7 +124,7 @@ pub enum Created {
 /// Returns [`DurableWriteError`] naming the step that failed. A failure
 /// leaves `path` as it was and removes the temporary file.
 pub fn replace(path: &Path, data: &[u8]) -> Result<(), DurableWriteError> {
-    remove_stale_temporaries(path)?;
+    remove_stale_temporaries(path);
     let (parent, temp) = write_temp(path, data)?;
     std::fs::rename(&temp.path, path).map_err(|source| {
         let _ = std::fs::remove_file(&temp.path);
@@ -151,7 +160,7 @@ fn create_with(
     data: &[u8],
     publishers: &[Publisher],
 ) -> Result<Created, DurableWriteError> {
-    remove_stale_temporaries(path)?;
+    remove_stale_temporaries(path);
     let (parent, temp) = write_temp(path, data)?;
     let published = publish_new(&temp.path, path, publishers);
     // An exclusive rename consumed the temporary name, and a link, a refusal
@@ -172,13 +181,19 @@ type Publisher = fn(&Path, &Path) -> std::io::Result<()>;
 /// Every exclusive publish this platform offers, in the order [`create`]
 /// tries them. The hard link is last, the fallback for a file system without
 /// an exclusive rename.
-#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+///
+/// Android is left out of the exclusive rename on purpose: bionic exposes
+/// `renameat2` only from API 30, so rustix issues it as a raw system call, and
+/// the app seccomp filter of Android 8 to 10 may answer that call with
+/// `SIGSYS`, which kills the process before any fallback runs. Android app
+/// data sits on ext4 or f2fs, both of which support hard links.
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
 const PUBLISHERS: &[Publisher] = &[rename_exclusive, link];
-#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
 const PUBLISHERS: &[Publisher] = &[link];
 
 /// Renames `from` to `to` unless `to` exists.
-#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
 fn rename_exclusive(from: &Path, to: &Path) -> std::io::Result<()> {
     rustix::fs::renameat_with(
         rustix::fs::CWD,
@@ -195,17 +210,48 @@ fn link(from: &Path, to: &Path) -> std::io::Result<()> {
     std::fs::hard_link(from, to)
 }
 
-/// Whether a publish failed because the file system lacks that call rather
-/// than because of this write: `EINVAL` from a `renameat2` flag the file
-/// system does not implement, `ENOTSUP` or `ENOSYS`, and `EPERM` from a hard
-/// link on a file system without links (FAT, exFAT, some network mounts).
+/// Whether a publish failed because the file system or platform lacks that
+/// call rather than because of this write.
+///
+/// It reads the raw OS error code, not [`std::io::ErrorKind`]: std maps
+/// macOS `ENOTSUP` (45), which exFAT returns for both `renameatx_np` and
+/// `link`, to an uncategorized kind, so a kind match misses it.
 fn unsupported(error: &std::io::Error) -> bool {
-    matches!(
-        error.kind(),
-        std::io::ErrorKind::Unsupported
-            | std::io::ErrorKind::InvalidInput
-            | std::io::ErrorKind::PermissionDenied
-    )
+    error.raw_os_error().is_some_and(unsupported_os_error)
+}
+
+/// Whether the raw `errno` `code` says the file system or platform lacks a
+/// call: `ENOTSUP` and `EOPNOTSUPP` (one value on Linux, 45 and 102 on Apple
+/// platforms; exFAT on macOS returns 45 from both publishes), `ENOSYS` (a
+/// kernel without the call), `EINVAL` (a `renameat2` flag the file system does
+/// not implement), and `EPERM` (Linux `link` on FAT or exFAT, or a container
+/// seccomp profile that denies the call).
+#[cfg(unix)]
+fn unsupported_os_error(code: i32) -> bool {
+    use rustix::io::Errno;
+    [
+        Errno::NOTSUP,
+        Errno::OPNOTSUPP,
+        Errno::NOSYS,
+        Errno::INVAL,
+        Errno::PERM,
+    ]
+    .contains(&Errno::from_raw_os_error(code))
+}
+
+/// Whether the Win32 error `code` says the file system lacks a call:
+/// `ERROR_INVALID_FUNCTION` (1, `CreateHardLinkW` on FAT or exFAT),
+/// `ERROR_NOT_SUPPORTED` (50), `ERROR_INVALID_PARAMETER` (87) and
+/// `ERROR_CALL_NOT_IMPLEMENTED` (120).
+#[cfg(windows)]
+fn unsupported_os_error(code: i32) -> bool {
+    matches!(code, 1 | 50 | 87 | 120)
+}
+
+/// No other target reports OS error codes for these calls.
+#[cfg(not(any(unix, windows)))]
+fn unsupported_os_error(_code: i32) -> bool {
+    false
 }
 
 /// Gives `tmp` the name `path` through the first of `publishers` the file
@@ -371,12 +417,14 @@ fn still_named(_file: &File, tmp: &Path) -> bool {
 /// after a temporary was published but before it was removed leaves a copy
 /// that no later write of an existing secret would reach.
 ///
-/// # Errors
-///
-/// Returns [`DurableWriteError`] when the directory cannot be listed, or when
-/// a stale temporary cannot be opened, locked or removed, because a secret
-/// copy would then outlive its write.
-pub fn remove_stale_temporaries(path: &Path) -> Result<(), DurableWriteError> {
+/// This call never fails its caller. A directory it cannot list, or a
+/// temporary it cannot inspect, open, lock or remove (one another user owns,
+/// a lock call the file system refuses), is logged with `tracing::warn!`
+/// naming the path and the error, and left in place: the copy it holds is no
+/// more exposed than before, and refusing the open or write of the secret
+/// itself would stop the service until someone deletes the file by hand.
+/// Errors on the secret's own path come from the read or write that follows.
+pub fn remove_stale_temporaries(path: &Path) {
     let (parent, file_name) = split(path);
     let entries = match std::fs::read_dir(parent) {
         Ok(entries) => entries,
@@ -388,56 +436,60 @@ pub fn remove_stale_temporaries(path: &Path) -> Result<(), DurableWriteError> {
                 std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
             ) =>
         {
-            return Ok(());
+            return;
         }
-        Err(source) => {
-            return Err(DurableWriteError::io(
-                "list temporary files in",
-                parent,
-                source,
-            ));
+        Err(error) => {
+            warn_unremoved("list temporary files in", parent, &error);
+            return;
         }
     };
     let mut removed = false;
     for entry in entries {
-        let entry = entry
-            .map_err(|source| DurableWriteError::io("list temporary files in", parent, source))?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                warn_unremoved("list temporary files in", parent, &error);
+                continue;
+            }
+        };
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
             continue;
         };
         if is_temporary_of(name, &file_name) {
-            removed |= remove_if_stale(&parent.join(name))?;
+            let candidate = parent.join(name);
+            match remove_if_stale(&candidate) {
+                Ok(gone) => removed |= gone,
+                Err((step, error)) => warn_unremoved(step, &candidate, &error),
+            }
         }
     }
     if removed {
         sync_dir(parent);
     }
-    Ok(())
+}
+
+/// Logs a temporary file, or a directory of them, that a sweep left in place.
+fn warn_unremoved(step: &'static str, path: &Path, error: &std::io::Error) {
+    tracing::warn!(
+        path = %path.display(),
+        %error,
+        "failed to {step} a stale temporary secret file; it stays until a sweep can remove it"
+    );
 }
 
 /// Removes `candidate` unless a running writer holds its lock. Returns
-/// whether it removed a name.
-fn remove_if_stale(candidate: &Path) -> Result<bool, DurableWriteError> {
+/// whether it removed a name, or the step that failed and its error.
+fn remove_if_stale(candidate: &Path) -> Result<bool, (&'static str, std::io::Error)> {
     let remove = |path: &Path| match std::fs::remove_file(path) {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(source) => Err(DurableWriteError::io(
-            "remove a stale temporary file",
-            path,
-            source,
-        )),
+        Err(error) => Err(("remove", error)),
     };
     let metadata = match std::fs::symlink_metadata(candidate) {
         Ok(metadata) => metadata,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(source) => {
-            return Err(DurableWriteError::io(
-                "inspect a temporary file",
-                candidate,
-                source,
-            ));
-        }
+        Err(error) => return Err(("inspect", error)),
     };
     if metadata.is_dir() {
         return Ok(false);
@@ -448,24 +500,12 @@ fn remove_if_stale(candidate: &Path) -> Result<bool, DurableWriteError> {
     let file = match File::open(candidate) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(source) => {
-            return Err(DurableWriteError::io(
-                "open a stale temporary file",
-                candidate,
-                source,
-            ));
-        }
+        Err(error) => return Err(("open", error)),
     };
     let lock = match ExclusiveFileLock::try_acquire(file, candidate) {
         Ok(lock) => lock,
         Err((_, TryLockError::WouldBlock)) => return Ok(false),
-        Err((_, TryLockError::Error(source))) => {
-            return Err(DurableWriteError::io(
-                "lock a temporary file",
-                candidate,
-                source,
-            ));
-        }
+        Err((_, TryLockError::Error(error))) => return Err(("lock", error)),
     };
     let removed = remove(candidate);
     drop(lock);
@@ -587,14 +627,111 @@ mod tests {
 
     /// A publish that reports the file system lacks it.
     fn refused(_: &Path, _: &Path) -> std::io::Result<()> {
-        Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        Err(std::io::Error::from_raw_os_error(ENOTSUP))
+    }
+
+    /// The raw `ENOTSUP` of this target: what macOS exFAT returns from both
+    /// `renameatx_np(RENAME_EXCL)` and `link`, and what Linux returns for an
+    /// operation a file system does not implement.
+    #[cfg(target_vendor = "apple")]
+    const ENOTSUP: i32 = 45;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const ENOTSUP: i32 = 95;
+    #[cfg(windows)]
+    const ENOTSUP: i32 = 50;
+    #[cfg(not(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        windows
+    )))]
+    const ENOTSUP: i32 = 0;
+
+    /// The classifier reads raw OS error codes: each code a file system or
+    /// kernel returns for a call it lacks counts as unsupported, and codes for
+    /// a failure of this write (`EACCES`, `EEXIST`, `ENOENT`, `EXDEV`, `EIO`)
+    /// do not. macOS `ENOTSUP` (45) is the case an `ErrorKind` match misses.
+    #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+    #[test]
+    fn unsupported_classifies_raw_errnos() {
+        // ENOTSUP, EOPNOTSUPP, ENOSYS, EINVAL, EPERM.
+        #[cfg(target_vendor = "apple")]
+        let lacking = [45, 102, 78, 22, 1];
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let lacking = [95, 38, 22, 1];
+        for code in lacking {
+            assert!(
+                unsupported(&std::io::Error::from_raw_os_error(code)),
+                "errno {code} means the file system lacks the call"
+            );
+        }
+        // EACCES, EEXIST, ENOENT, EXDEV, EIO: the same values on both.
+        for code in [13, 17, 2, 18, 5] {
+            assert!(
+                !unsupported(&std::io::Error::from_raw_os_error(code)),
+                "errno {code} is a failure of this write"
+            );
+        }
+    }
+
+    /// The exclusive rename failing with `ENOTSUP` falls through to the hard
+    /// link, which publishes; when the link fails the same way too, `create`
+    /// returns `ExclusivePublishUnsupported` and writes nothing.
+    #[test]
+    fn create_falls_through_enotsup_to_the_link_then_fails_typed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join(".key");
+        assert_eq!(
+            create_with(&path, &[8; 32], &[refused, link])?,
+            Created::Written
+        );
+        assert_eq!(std::fs::read(&path)?, vec![8; 32]);
+        assert_eq!(names(dir.path())?, vec![".key".to_owned()]);
+
+        let other = dir.path().join("salt");
+        let Err(error) = create_with(&other, &[9; 16], &[refused, refused]) else {
+            return Err("a create whose publishes both lack support must fail".into());
+        };
+        assert_eq!(
+            error.kind,
+            DurableWriteErrorKind::ExclusivePublishUnsupported
+        );
+        assert_eq!(error.source.raw_os_error(), Some(ENOTSUP));
+        assert_eq!(names(dir.path())?, vec![".key".to_owned()]);
+        Ok(())
+    }
+
+    /// A leftover temporary the sweep cannot open, and so cannot lock or
+    /// remove, is left in place and does not fail the sweep, a `create` or a
+    /// `replace` of the secret beside it.
+    #[cfg(unix)]
+    #[test]
+    fn an_unremovable_temporary_does_not_block_the_secret() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir()?;
+        let key = dir.path().join(".key");
+        let stale = stale_temporary(dir.path(), ".key", &[9; 32])?;
+        std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o000))?;
+        assert!(
+            File::open(&stale).is_err(),
+            "this test needs an unprivileged user, for whom a mode-000 file is unreadable"
+        );
+
+        remove_stale_temporaries(&key);
+        assert_eq!(create(&key, &[1; 32])?, Created::Written);
+        replace(&key, &[2; 32])?;
+        assert_eq!(std::fs::read(&key)?, vec![2; 32]);
+        assert!(stale.exists(), "the sweep could not remove it");
+        Ok(())
     }
 
     /// On a file system with no hard links, `create` still publishes: every
     /// publish this platform offers ahead of the hard link (`PUBLISHERS` keeps
     /// the link last) runs, and the link refuses. Publishing through
     /// `hard_link` alone fails here.
-    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
     #[test]
     fn create_publishes_without_hard_links() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
@@ -697,7 +834,7 @@ mod tests {
         let key = dir.path().join(".key");
         std::fs::write(&key, [1; 32])?;
         let stale = stale_temporary(dir.path(), ".key", &[1; 32])?;
-        remove_stale_temporaries(&key)?;
+        remove_stale_temporaries(&key);
         assert!(!stale.exists());
         assert_eq!(names(dir.path())?, vec![".key".to_owned()]);
         Ok(())
@@ -712,13 +849,13 @@ mod tests {
         let live = stale_temporary(dir.path(), ".key", &[1; 32])?;
         let held = ExclusiveFileLock::try_acquire(File::open(&live)?, &live)
             .map_err(|(_, e)| format!("lock: {e}"))?;
-        remove_stale_temporaries(&key)?;
+        remove_stale_temporaries(&key);
         assert!(
             live.exists(),
             "a locked temporary belongs to a running write"
         );
         drop(held);
-        remove_stale_temporaries(&key)?;
+        remove_stale_temporaries(&key);
         assert!(!live.exists());
         Ok(())
     }

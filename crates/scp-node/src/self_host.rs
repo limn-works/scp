@@ -2382,8 +2382,7 @@ fn resolve_storage_key_blocking(
 
     // Existing key file, after removing any copy of a key a crashed write left.
     let key_file = storage_dir.join(".key");
-    scp_platform::durable_file::remove_stale_temporaries(&key_file)
-        .map_err(|e| HostSiteError::StorageKey(format!("key file: {e}")))?;
+    scp_platform::durable_file::remove_stale_temporaries(&key_file);
     if key_file.exists() {
         return read_storage_key_file(&key_file);
     }

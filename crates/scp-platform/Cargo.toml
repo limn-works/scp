@@ -162,11 +162,14 @@ hex = { workspace = true, optional = true }
 libsqlite3-sys = { version = "0.30.1", optional = true }
 
 # `durable_file::create` publishes a secret with an exclusive rename,
-# `renameat2(RENAME_NOREPLACE)` on Linux and Android and `renameatx_np(RENAME_EXCL)`
-# on Apple platforms, which never overwrites an existing file and needs no hard-link
+# `renameat2(RENAME_NOREPLACE)` on Linux and `renameatx_np(RENAME_EXCL)` on Apple
+# platforms, which never overwrites an existing file and needs no hard-link
 # support from the file system. rustix wraps both calls safely, so this crate keeps
-# `forbid(unsafe_code)`.
-[target.'cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))'.dependencies]
+# `forbid(unsafe_code)`. Android publishes through a hard link only (see
+# `durable_file::PUBLISHERS`). On every Unix target, `durable_file` also names
+# the errno values that mean "the file system lacks this call" through
+# `rustix::io::Errno`, because their numbers differ between targets.
+[target.'cfg(unix)'.dependencies]
 rustix = { version = "1.1.4", default-features = false, features = ["std", "fs"], optional = true }
 
 [dev-dependencies]

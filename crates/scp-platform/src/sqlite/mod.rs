@@ -404,10 +404,9 @@ pub(crate) fn load_or_init_salt(dir: &Path) -> Result<[u8; kdf::ARGON2_SALT_LEN]
         )));
     }
 
-    // A crashed write may have left a copy of the salt; no copy outlives the
-    // next open.
-    crate::durable_file::remove_stale_temporaries(&salt_path)
-        .map_err(|e| PlatformError::StorageError(format!("salt sidecar: {e}")))?;
+    // A crashed write may have left a copy of the salt; the next open that can
+    // remove it does.
+    crate::durable_file::remove_stale_temporaries(&salt_path);
     if salt_path.exists() {
         return read_salt(&salt_path);
     }
