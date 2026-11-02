@@ -899,6 +899,68 @@ def emit_merkle() -> None:
     emit_hex("vector_19.interior_R", interior_hash(abcd[2], abcd[3]))
     emit_hex("vector_19.root", merkle_root(abcd))
 
+    emit_compact_range()
+
+
+# ---------------------------------------------------------------------------
+# §25.8 Vector 89 — compact range of a pruned prefix (§17.3)
+#
+# The compact range of leaves 0..p-1 holds one subtree per set bit of p,
+# largest first. Its right fold equals the RFC 6962 root of the first p
+# leaves; appending a leaf pushes a one-leaf subtree and merges the last two
+# while they cover equal leaf counts.
+# ---------------------------------------------------------------------------
+
+
+def compact_range(leaves: list[bytes]) -> list[tuple[int, int, bytes]]:
+    nodes: list[tuple[int, int, bytes]] = []
+    start = 0
+    for bit in reversed(range(len(leaves).bit_length())):
+        size = 1 << bit
+        if len(leaves) & size:
+            nodes.append((start, size, merkle_root(leaves[start : start + size])))
+            start += size
+    return nodes
+
+
+def compact_fold(nodes: list[tuple[int, int, bytes]]) -> bytes:
+    root = nodes[-1][2]
+    for node in reversed(nodes[:-1]):
+        root = interior_hash(node[2], root)
+    return root
+
+
+def compact_append(
+    nodes: list[tuple[int, int, bytes]], leaf: bytes, index: int
+) -> list[tuple[int, int, bytes]]:
+    out = list(nodes) + [(index, 1, leaf)]
+    while len(out) >= 2 and out[-1][1] == out[-2][1]:
+        right = out.pop()
+        left = out.pop()
+        out.append((left[0], left[1] * 2, interior_hash(left[2], right[2])))
+    return out
+
+
+def emit_compact_range() -> None:
+    leaves = [leaf_hash(bytes([c])) for c in b"ABCDEFGHI"]
+    for i in range(4, 9):
+        emit_hex(f"vector_89.leaf_{i + 1}", leaves[i])
+    for p in (1, 2, 3, 7, 8):
+        nodes = compact_range(leaves[:p])
+        assert len(nodes) == p.bit_count()
+        fold = compact_fold(nodes)
+        assert fold == merkle_root(leaves[:p]), f"fold != root at p={p}"
+        after = compact_append(nodes, leaves[p], p)
+        root_next = compact_fold(after)
+        assert root_next == merkle_root(leaves[: p + 1]), f"append != root at p={p}"
+        for start, size, digest in nodes:
+            emit_hex(f"vector_89.p{p}.compact_range[{start},{start + size})", digest)
+        emit_hex(f"vector_89.p{p}.last_leaf_hash", leaves[p - 1])
+        emit_hex(f"vector_89.p{p}.root_{p}", fold)
+        for start, size, digest in after:
+            emit_hex(f"vector_89.p{p}.after_append[{start},{start + size})", digest)
+        emit_hex(f"vector_89.p{p}.root_{p + 1}", root_next)
+
 
 # ---------------------------------------------------------------------------
 # §25.8 Vector 32/33 — typed event-log leaves
