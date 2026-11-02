@@ -530,7 +530,7 @@ async fn push_routing_ids_follow_a_rotation() {
         )
         .await
         .expect("create_context");
-    let relay = scp_did::canonical_relay_url(RELAY).expect("canonical");
+    let relay = scp_did::canonical_node_url(RELAY).expect("canonical");
     let routes = |ids: [u8; 32]| {
         std::collections::BTreeMap::from([(
             relay.clone(),
@@ -634,7 +634,7 @@ async fn a_rotation_after_start_reregisters_once_with_the_new_routing_id() {
         .await
         .expect("a registration after the rotation")
         .expect("publisher alive");
-    assert_eq!(url, scp_did::canonical_relay_url(RELAY).expect("canonical"));
+    assert_eq!(url, scp_did::canonical_node_url(RELAY).expect("canonical"));
     let after = PushRegistration::from_msgpack(&blob).expect("a registration");
     assert!(after.routing_ids.contains(&RID_1), "the new routing ID");
     assert!(!after.routing_ids.contains(&V1_RID), "not the old one");

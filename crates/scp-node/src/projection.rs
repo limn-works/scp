@@ -2813,8 +2813,10 @@ mod tests {
             blob_storage: Arc::new(BlobStorageBackend::from(storage)),
             relay_config: scp_transport::native::server::RelayConfig::defaults(
                 scp_transport::relay::push_gate::LiveRelayUrl::new(
-                    scp_transport::relay::push_gate::RelayUrl::new("ws://127.0.0.1:9000/scp/v1")
-                        .unwrap(),
+                    scp_transport::relay::push_gate::PushReservation::new(
+                        "ws://127.0.0.1:9000/scp/v1",
+                    )
+                    .unwrap(),
                 ),
             ),
             start_time: Instant::now(),

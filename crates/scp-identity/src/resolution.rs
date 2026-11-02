@@ -410,7 +410,7 @@ mod tests {
 
         let mut doc = scp_did::DidDocument::new(&did, &public_key, &[2u8; 32], &[3u8; 32]);
         let plain = scp_did::RelayService::direct(
-            scp_did::RelayEndpoint::new("wss://plain.example.com/scp/v1").unwrap(),
+            scp_did::NodeUrl::new("wss://plain.example.com/scp/v1").unwrap(),
         );
         doc.add_relay_service(&plain);
         doc.service.push(scp_did::Service {

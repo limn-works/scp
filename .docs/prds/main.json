@@ -13713,7 +13713,7 @@
     },
     {
       "id": "SCP-377",
-      "title": "Rename `RelayUrl` to `NodeUrl` across the workspace and the bindings",
+      "title": "Rename `RelayEndpoint` to `NodeUrl` and `RelayUrl` to `PushReservation` across the workspace",
       "gate": "gate-kel",
       "priority": "P0",
       "severity": "major",
@@ -13722,20 +13722,21 @@
         "crates/scp-did/src/relay_url.rs",
         "crates/scp-did/src/node_url.rs",
         "crates/scp-did/src/lib.rs",
+        "crates/scp-transport/src/relay/push_gate.rs",
         "crates/",
         "bindings/"
       ],
-      "description": "Spec 03 §3.10.10 and spec 18 §18.2.1 name the validated node URL type `NodeUrl`, and no new identifier names a relay. The newtype in `crates/scp-did/src/relay_url.rs` moves to `crates/scp-did/src/node_url.rs` under the name `NodeUrl`, and every one of the 55 files under `crates/` and `bindings/` that names `RelayUrl` follows. The rename is mechanical and goes through sed, so it changes no validation rule. Node backend execution plan code PR C1; no other coder holds any of these files while it runs.",
+      "description": "`03-identity.md` §3.10.10 names the validated node URL type `NodeUrl`, a §9.18.2 canonical URL, and `18-addressability-and-deployment.md` §18.2.1 states its URL rules: the canonical form exists and its path ends in `/scp/v1`; and no new identifier names a relay. `RelayEndpoint` in `crates/scp-did/src/relay_url.rs` is that type, so it moves to `crates/scp-did/src/node_url.rs` under the name `NodeUrl`. The type named `RelayUrl` is a different one: `crates/scp-transport/src/relay/push_gate.rs` defines it as the push routing ID a node reserves (`10-infrastructure-and-self-hosting.md` §10.7.1) together with the canonical URL and tier 3 target it is derived from, and it checks no `/scp/v1` path, so it becomes `PushReservation` and not `NodeUrl`, which keeps one `NodeUrl` in the workspace. The set type `ReservedRelayUrls` becomes `PushReservations`. Both renames are mechanical and go through sed across the 28 files under `crates/` that name `RelayUrl` and the 13 that name `RelayEndpoint`; no file under `bindings/` names either. They change no validation rule. Node backend execution plan code PR C1; no other coder holds any of these files while it runs.",
       "acceptanceCriteria": [
-        "`git grep -w RelayUrl -- crates bindings` prints nothing, and `crates/scp-did/src/relay_url.rs` does not exist",
-        "`NodeUrl` validates at construction exactly as `RelayUrl` did: the existing construction tests pass unchanged except for the type name, and a test constructs one valid URL and is refused one URL whose canonical path does not end in `/scp/v1` (`18-addressability-and-deployment.md` §18.2.1)",
+        "`git grep -w -e RelayUrl -e RelayEndpoint -e ReservedRelayUrls -e canonical_relay_url -e RelayUrlError -e RelayEntryUrlError -e SCP_RELAY_PATH -e InvalidRelayUrl -- crates bindings` prints nothing, and `crates/scp-did/src/relay_url.rs` does not exist",
+        "`NodeUrl` validates at construction exactly as `RelayEndpoint` did: the existing construction tests pass unchanged except for the type name, and a test constructs one valid URL and is refused one URL whose canonical path does not end in `/scp/v1` (`18-addressability-and-deployment.md` §18.2.1)",
         "`cargo test --workspace` with the CI feature list passes",
         "No `unwrap()` or `expect()` in library code",
         "CI-feature `cargo clippy` over the touched crates and their tests passes"
       ],
       "actionItems": [
-        "Move `crates/scp-did/src/relay_url.rs` to `node_url.rs`, rename the type and its re-export in `crates/scp-did/src/lib.rs`.",
-        "Rename every use under `crates/` and `bindings/` with sed, then run `cargo fmt --all`."
+        "Move `crates/scp-did/src/relay_url.rs` to `node_url.rs`, and rename `RelayEndpoint` to `NodeUrl` there and in its re-export in `crates/scp-did/src/lib.rs`.",
+        "Rename `canonical_relay_url`, `RelayUrlError`, `RelayEntryUrlError`, `SCP_RELAY_PATH` and `InvalidRelayUrl` to `canonical_node_url`, `NodeUrlError`, `NodeEntryUrlError`, `SCP_NODE_PATH` and `InvalidNodeUrl`, after the **Canonical node URL** paragraph of `09-security-model.md` §9.18.2, keeping every error code and wire string. Rename `RelayUrl` to `PushReservation` in `crates/scp-transport/src/relay/push_gate.rs`, rename every use of both types under `crates/` and in `scaffolds/relay` with sed, then run `cargo fmt --all`."
       ],
       "blockedBy": [],
       "sources": [

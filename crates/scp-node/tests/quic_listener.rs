@@ -153,7 +153,7 @@ fn enabled_push(dir: &std::path::Path) -> scp_node::PushSlot {
 async fn quic_push_reply(
     node: scp_node::ApplicationNode<scp_platform::in_memory::InMemoryStorage>,
 ) -> u16 {
-    let routing_id = scp_transport::relay::push_gate::RelayUrl::new(&node.relay_url())
+    let routing_id = scp_transport::relay::push_gate::PushReservation::new(&node.relay_url())
         .unwrap()
         .push_routing_id();
     let mut serving = serve_in_background(node).await;

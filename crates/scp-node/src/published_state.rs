@@ -406,7 +406,7 @@ use reservation::ReservedDocument;
 /// either.
 mod reservation {
     use scp_did::{BridgeTarget, DidDocument, RelayService};
-    use scp_transport::relay::push_gate::{RelayUrl, ReservedRelayUrls};
+    use scp_transport::relay::push_gate::{PushReservation, PushReservations};
 
     /// Proof that a [`DidPublisher::publish`](super::DidPublisher::publish)
     /// call publishes a document whose entries the relay reserves. See the
@@ -453,10 +453,10 @@ mod reservation {
 
         /// The reserved relay URL of every entry, the node's own first, each
         /// with its entry's `bridgeTarget`.
-        fn relay_urls(&self) -> ReservedRelayUrls {
-            ReservedRelayUrls::new(
-                RelayUrl::from(&self.own),
-                self.bridged.iter().map(RelayUrl::from),
+        fn relay_urls(&self) -> PushReservations {
+            PushReservations::new(
+                PushReservation::from(&self.own),
+                self.bridged.iter().map(PushReservation::from),
             )
         }
     }
@@ -688,6 +688,6 @@ pub async fn apply_tier_change(
 #[allow(clippy::expect_used)]
 pub fn test_relay(url: &str) -> RelayService {
     RelayService::direct(
-        scp_did::RelayEndpoint::new(url).expect("every test fixture names a canonical relay URL"),
+        scp_did::NodeUrl::new(url).expect("every test fixture names a canonical relay URL"),
     )
 }

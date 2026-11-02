@@ -41,7 +41,7 @@ use std::time::Duration;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use url::{Host, Url};
 
-use super::push_gate::{LiveRelayUrl, ReservedRelayUrls};
+use super::push_gate::{LiveRelayUrl, PushReservations};
 
 /// The longest a registration-time or send-time DNS lookup may take
 /// (indicator: 5 s, the connect deadline of every push sender).
@@ -1426,7 +1426,7 @@ enum NextTurn {
 
 /// One resolution of every reserved URL's host.
 async fn resolve_own(
-    urls: &ReservedRelayUrls,
+    urls: &PushReservations,
     lookup: &Lookup,
     permits: &LookupPermits,
 ) -> Result<Vec<IpAddr>, OwnAddressError> {
@@ -1492,8 +1492,8 @@ mod tests {
 
     fn relay_url(
         url: &str,
-    ) -> Result<crate::relay::push_gate::RelayUrl, Box<dyn std::error::Error>> {
-        Ok(crate::relay::push_gate::RelayUrl::new(url)?)
+    ) -> Result<crate::relay::push_gate::PushReservation, Box<dyn std::error::Error>> {
+        Ok(crate::relay::push_gate::PushReservation::new(url)?)
     }
 
     /// Lets the refresh task run until `done` holds, moving the paused clock
@@ -1594,7 +1594,7 @@ mod tests {
         );
         assert_eq!(own.known().map(|s| s.len()), Some(2));
 
-        urls.set(crate::relay::push_gate::ReservedRelayUrls::new(
+        urls.set(crate::relay::push_gate::PushReservations::new(
             relay_url("wss://a.example/scp/v1")?,
             [relay_url("wss://b.example/scp/v1")?],
         ));
