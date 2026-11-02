@@ -7832,8 +7832,12 @@ async fn open_custody_for_create(
     let built = match decided {
         DecidedCustody::Built(built) => built,
         DecidedCustody::OpenFile(inputs) => {
-            // `FileCustodyInputs::open` runs on tokio's blocking pool.
-            let opened = inputs.open().await.map_err(|e| file_custody_error(&e))?;
+            // `FileCustodyInputs::open` runs on the process runtime's
+            // blocking pool.
+            let opened = inputs
+                .open(crate::runtime().handle().clone())
+                .await
+                .map_err(|e| file_custody_error(&e))?;
             UniffiKeyCustody::File(opened)
         }
     };
@@ -19973,7 +19977,7 @@ mod tests {
         let error =
             resolve_file_custody_inputs_from(passphrase(), Some(home_is_a_file.as_os_str()))
                 .expect("an absolute HOME and a passphrase resolve")
-                .open()
+                .open(tokio::runtime::Handle::current())
                 .await
                 .expect_err("a HOME naming a file holds no key directory");
         match file_custody_error(&error) {

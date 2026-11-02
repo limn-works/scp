@@ -42,6 +42,7 @@
 //! ```
 
 mod attestation;
+pub mod blocking_pool;
 mod key_custody;
 // `lib.rs` already gates this module behind `testing`; the module and its
 // re-export repeat the gate because `test_double_gating` parses each file

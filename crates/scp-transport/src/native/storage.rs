@@ -1070,4 +1070,77 @@ mod tests {
         let result = storage.store(routing_id, blob_id3, None, 3600, data3).await;
         assert!(result.is_ok());
     }
+
+    /// Runs one file-backed constructor under the shared blocking-pool probe
+    /// and asserts that its open waited for the pool and that `created` did
+    /// not exist while the pool's only thread was held.
+    ///
+    /// A constructor that opens inline (its `open_on_blocking_pool` wrapper
+    /// removed) finishes on its first poll and has created `created` by then,
+    /// so each arm fails both assertions under that revert.
+    #[cfg(any(feature = "sqlite-blob", feature = "redb-blob", feature = "combined"))]
+    fn assert_opens_on_the_blocking_pool<F>(label: &str, open: F, created: &std::path::Path)
+    where
+        F: std::future::Future<Output = Result<BlobStorageBackend, StorageError>>,
+    {
+        use scp_platform::testing::blocking_pool::{
+            blocking_pool_of_one, drive_while_the_blocking_pool_is_held,
+        };
+
+        let runtime = blocking_pool_of_one().expect("build the probe runtime");
+        let outcome = runtime
+            .block_on(drive_while_the_blocking_pool_is_held(open, || {
+                created.exists()
+            }))
+            .expect("run the probe");
+        assert!(
+            !outcome.finished_while_held,
+            "{label}: the open ran on the thread polling it"
+        );
+        assert!(
+            !outcome.observed,
+            "{label}: {} was created on the thread polling the open",
+            created.display()
+        );
+        outcome
+            .output
+            .unwrap_or_else(|e| panic!("{label}: the open fails once the pool is free: {e}"));
+        assert!(
+            created.exists(),
+            "{label}: the open creates {}",
+            created.display()
+        );
+    }
+
+    /// `BlobStorageBackend::sqlite` opens on the blocking pool.
+    #[cfg(feature = "sqlite-blob")]
+    #[test]
+    fn sqlite_blob_store_opens_on_the_blocking_pool() {
+        let dir = tempfile::tempdir().expect("create a temporary directory");
+        let path = dir.path().join("blobs.db");
+        assert_opens_on_the_blocking_pool("sqlite", BlobStorageBackend::sqlite(&path), &path);
+    }
+
+    /// `BlobStorageBackend::redb` opens on the blocking pool.
+    #[cfg(feature = "redb-blob")]
+    #[test]
+    fn redb_blob_store_opens_on_the_blocking_pool() {
+        let dir = tempfile::tempdir().expect("create a temporary directory");
+        let path = dir.path().join("blobs.redb");
+        assert_opens_on_the_blocking_pool("redb", BlobStorageBackend::redb(&path), &path);
+    }
+
+    /// `BlobStorageBackend::combined` creates its directory and opens on the
+    /// blocking pool.
+    #[cfg(feature = "combined")]
+    #[test]
+    fn combined_node_store_opens_on_the_blocking_pool() {
+        let dir = tempfile::tempdir().expect("create a temporary directory");
+        let node_dir = dir.path().join("node");
+        assert_opens_on_the_blocking_pool(
+            "combined",
+            BlobStorageBackend::combined(&node_dir, &[0x5A; 32]),
+            &node_dir,
+        );
+    }
 }

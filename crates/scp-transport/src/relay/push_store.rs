@@ -1974,32 +1974,34 @@ mod tests {
     }
 
     /// `open_sqlite` runs its open, including a keyed open's 256,000-iteration
-    /// key derivation, on tokio's blocking pool. The runtime's only blocking
-    /// thread is held, so an open on the pool cannot finish within 300 ms;
-    /// run inline on the runtime thread, the open finishes and the assertion
-    /// fails.
+    /// key derivation, on tokio's blocking pool. Under the shared probe
+    /// (`scp_platform::testing::blocking_pool`), the runtime's only blocking
+    /// thread is held, so an open on the pool cannot finish; run inline on the
+    /// runtime thread, the open finishes on its first poll and has created
+    /// the database file, so both assertions fail.
     #[test]
     fn open_runs_on_the_blocking_pool() -> Result<(), Box<dyn std::error::Error>> {
+        use scp_platform::testing::blocking_pool::{
+            blocking_pool_of_one, drive_while_the_blocking_pool_is_held,
+        };
+
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("push.db");
         let key = [0x42; 32];
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .max_blocking_threads(1)
-            .build()?;
-        runtime.block_on(async {
-            let (release, held) = std::sync::mpsc::channel::<()>();
-            let holder = tokio::task::spawn_blocking(move || held.recv());
-            let open = PushRegistrationStore::open_sqlite(&path, PushStoreAtRest::Keyed(&key));
-            tokio::pin!(open);
-            let early = tokio::time::timeout(std::time::Duration::from_millis(300), &mut open)
-                .await
-                .is_ok();
-            release.send(())?;
-            holder.await??;
-            assert!(!early, "the push store opened on the runtime thread");
-            drop(open.await?);
-            Ok(())
-        })
+        let runtime = blocking_pool_of_one()?;
+        let outcome = runtime.block_on(drive_while_the_blocking_pool_is_held(
+            PushRegistrationStore::open_sqlite(&path, PushStoreAtRest::Keyed(&key)),
+            || path.exists(),
+        ))?;
+        assert!(
+            !outcome.finished_while_held,
+            "the push store opened on the runtime thread"
+        );
+        assert!(
+            !outcome.observed,
+            "the push store file was created on the runtime thread"
+        );
+        drop(outcome.output?);
+        Ok(())
     }
 }

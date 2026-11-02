@@ -606,100 +606,12 @@ impl HandleMap {
 // Atomic write helper
 // ---------------------------------------------------------------------------
 
-/// Writes `data` to `path` atomically via a randomized `.tmp` sibling file.
-///
-/// 1. Generates a randomized, unpredictable temp name `{file}.{random_hex}.tmp`
-///    in the parent directory so concurrent writes cannot collide and the name
-///    cannot be pre-planted by an attacker.
-/// 2. Opens the temp file with `create_new(true)` (`O_EXCL`): a pre-existing file
-///    or symlink at the temp path fails the open rather than being
-///    followed/overwritten. On `AlreadyExists` it errors fail-closed.
-/// 3. Writes `data` with `mode(0o600)` on Unix.
-/// 4. Calls `sync_all` to flush the file to durable storage.
-/// 5. Renames to `path` (atomic on POSIX).
-/// 6. On Unix, fsyncs the PARENT DIRECTORY so the rename is durable across a
-///    crash. Best-effort on platforms without directory fsync.
-/// 7. Cleans up the tmp file on any failure after creation.
+/// Writes `data` to `path` atomically and durably through
+/// [`crate::durable_file::replace`]: a randomized `0o600` temp sibling,
+/// fsync, rename, parent-directory fsync.
 fn atomic_write(path: &Path, data: &[u8]) -> Result<(), PlatformError> {
-    let parent = path.parent().ok_or_else(|| {
-        PlatformError::CustodyError(format!(
-            "key path {} has no parent directory",
-            path.display()
-        ))
-    })?;
-
-    // Randomized, unpredictable temp name in the same directory as the target
-    // so the final `rename` stays on one filesystem (atomic). 128 bits of
-    // CSPRNG entropy rendered as 32 hex chars — collision-free in practice and
-    // unguessable, so an attacker cannot pre-plant the temp path.
-    let mut rand_bytes = [0u8; 16];
-    rand::rngs::OsRng.fill_bytes(&mut rand_bytes);
-    let rand_suffix = u128::from_le_bytes(rand_bytes);
-    let file_name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("keys.scp");
-    let tmp_path = parent.join(format!("{file_name}.{rand_suffix:032x}.tmp"));
-
-    // Write to temp file with restrictive permissions on Unix.
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp_path)
-            .map_err(|e| {
-                PlatformError::CustodyError(format!(
-                    "failed to create temp key file at {}: {e}",
-                    tmp_path.display()
-                ))
-            })?;
-        file.write_all(data).map_err(|e| {
-            let _ = std::fs::remove_file(&tmp_path);
-            PlatformError::CustodyError(format!("failed to write temp key file: {e}"))
-        })?;
-        file.sync_all().map_err(|e| {
-            let _ = std::fs::remove_file(&tmp_path);
-            PlatformError::CustodyError(format!("failed to sync temp key file: {e}"))
-        })?;
-    }
-    #[cfg(not(unix))]
-    {
-        use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp_path)
-            .map_err(|e| {
-                PlatformError::CustodyError(format!(
-                    "failed to create temp key file at {}: {e}",
-                    tmp_path.display()
-                ))
-            })?;
-        file.write_all(data).map_err(|e| {
-            let _ = std::fs::remove_file(&tmp_path);
-            PlatformError::CustodyError(format!("failed to write temp key file: {e}"))
-        })?;
-        file.sync_all().map_err(|e| {
-            let _ = std::fs::remove_file(&tmp_path);
-            PlatformError::CustodyError(format!("failed to sync temp key file: {e}"))
-        })?;
-    }
-
-    // Atomic rename: if this fails, the original file is untouched.
-    std::fs::rename(&tmp_path, path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp_path);
-        PlatformError::CustodyError(format!("failed to rename temp key file: {e}"))
-    })?;
-
-    // Durably persist the directory entry created by the rename. Best-effort:
-    // platforms without directory fsync tolerate the error.
-    sync_parent_dir(parent);
-
-    Ok(())
+    crate::durable_file::replace(path, data)
+        .map_err(|e| PlatformError::CustodyError(format!("key file write: {e}")))
 }
 
 /// Three values a passphrase and salt produce, each under its own label.
@@ -907,24 +819,6 @@ fn verify_file(data: &[u8], mac_key: &Zeroizing<[u8; DIGEST_LEN]>) -> Result<usi
     Ok(entry_count)
 }
 
-/// Best-effort fsync of a directory so a preceding `rename` into it is durable.
-///
-/// On Unix, opens the directory and calls `sync_all`. Errors are tolerated
-/// (some filesystems/platforms do not support directory fsync). No-op on
-/// non-Unix targets.
-fn sync_parent_dir(dir: &Path) {
-    #[cfg(unix)]
-    {
-        if let Ok(handle) = std::fs::File::open(dir) {
-            let _ = handle.sync_all();
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = dir;
-    }
-}
-
 // ---------------------------------------------------------------------------
 // FileKeyCustody
 // ---------------------------------------------------------------------------
@@ -945,10 +839,21 @@ fn sync_parent_dir(dir: &Path) {
 /// Every key operation reads the key file, and every write fsyncs it twice and
 /// can wait up to [`KEY_FILE_LOCK_WAIT`] on another process's advisory lock.
 /// Each `KeyCustody` method therefore runs its file work on tokio's blocking
-/// pool, never on the worker thread that polls it, and so needs a tokio
-/// runtime. The task holds this object's handle-map lock for its whole run, so
-/// a caller that drops the future cannot separate a file write from the
-/// handle-map change that records it.
+/// pool, never on the worker thread that polls it. The runtime whose pool
+/// runs that work is the one [`Self::open`] receives, never an ambient one, so
+/// a caller that polls these futures from another executor or a short-lived
+/// runtime still reaches a live pool.
+///
+/// # Cancellation
+///
+/// A blocking task holds this object's handle-map lock for its whole run, so a
+/// caller that drops a future cannot separate a file write from the handle-map
+/// change that records it. A dropped `generate_keypair`,
+/// `generate_key_event_keypair`, `generate_identity_keypair` or
+/// `import_ed25519_signing_key` writes no key that outlives it: when the
+/// minted handle cannot reach the caller, the entry that call wrote is removed
+/// from the file and from the handle map before the lock is released. A
+/// dropped `destroy_key` runs to completion, so the key it names is gone.
 ///
 /// See GitHub issue #391 and ADR-006.
 pub struct FileKeyCustody {
@@ -958,6 +863,9 @@ pub struct FileKeyCustody {
     /// Maps handle IDs to key type and entry identifier. Behind an `Arc` so a
     /// blocking-pool task owns its guard.
     handle_map: Arc<Mutex<HandleMap>>,
+    /// The runtime whose blocking pool runs every file operation, passed in by
+    /// whoever opened this object.
+    runtime: tokio::runtime::Handle,
 }
 
 /// One key file on disk and the keys that read and seal it.
@@ -979,6 +887,75 @@ struct KeyFile {
     file_write_lock: StdMutex<()>,
 }
 
+/// What a mint's blocking work produced: the handle it recorded, and whether
+/// it wrote a new entry for that handle.
+struct Minted {
+    handle: KeyHandle,
+    /// `false` when the key file already held the key, so nothing was written.
+    written: bool,
+}
+
+/// A minted handle on its way from the blocking task to the caller of
+/// [`FileKeyCustody::mint_with_key_file`].
+///
+/// [`Self::deliver`] hands the handle over. Dropping this value undelivered,
+/// which happens when that caller's future was dropped first, undoes the
+/// mint's write on the blocking pool of `runtime`, never inline: the drop can
+/// run on an async worker thread.
+struct UndeliveredKey {
+    handle: KeyHandle,
+    /// The write to undo, absent when the mint wrote nothing.
+    undo: Option<PendingUndo>,
+    runtime: tokio::runtime::Handle,
+}
+
+impl UndeliveredKey {
+    /// Disarms the undo, releases the handle-map lock, and returns the handle.
+    fn deliver(mut self) -> KeyHandle {
+        if let Some(mut undo) = self.undo.take() {
+            undo.armed = false;
+        }
+        self.handle
+    }
+}
+
+impl Drop for UndeliveredKey {
+    fn drop(&mut self) {
+        if let Some(undo) = self.undo.take() {
+            // A shut-down runtime drops this closure without running it, and
+            // dropping `undo` runs the undo inline, so it runs either way.
+            drop(self.runtime.spawn_blocking(move || drop(undo)));
+        }
+    }
+}
+
+/// The removal of a freshly written entry, run when this value is dropped
+/// while `armed`. It owns the handle-map lock, so no other operation on this
+/// custody object sees the entry between the write and its removal.
+struct PendingUndo {
+    file: Arc<KeyFile>,
+    map: tokio::sync::OwnedMutexGuard<HandleMap>,
+    key_id: u64,
+    armed: bool,
+}
+
+impl Drop for PendingUndo {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Err(error) = self.file.remove_entry_locked(&mut self.map, self.key_id) {
+            // The entry stays in the file and in the handle map, where a later
+            // `destroy_key` on this id can still remove it.
+            tracing::warn!(
+                key_id = self.key_id,
+                %error,
+                "FileKeyCustody could not remove a key whose handle never reached its caller"
+            );
+        }
+    }
+}
+
 /// Prints the key file's path and nothing else.
 ///
 /// A derived `Debug` would print `derived_key` and `mac_key`, which is why
@@ -996,7 +973,9 @@ impl std::fmt::Debug for FileKeyCustody {
 }
 
 impl FileKeyCustody {
-    /// Opens an existing key file or creates a new one at `path`.
+    /// Opens an existing key file or creates a new one at `path`, running the
+    /// work on `runtime`'s blocking pool, and returns custody whose every
+    /// operation also runs there.
     ///
     /// A passphrase derives an AES-256-GCM encryption key via Argon2id. On an
     /// existing file, this constructor re-opens a header verifier that
@@ -1007,18 +986,52 @@ impl FileKeyCustody {
     /// boundary to reject a wrong key or credential, so this check runs here
     /// instead of on a later `sign` call.
     ///
-    /// This function blocks for the derivation, and for up to 10 s on a path
-    /// another process reserved. An async caller uses [`Self::open`], which
-    /// runs it on tokio's blocking pool.
+    /// The open runs an Argon2id derivation (64 MiB, three passes), which takes
+    /// hundreds of milliseconds in an optimized build and seconds in an
+    /// unoptimized one, and on a path another process reserved it polls for up
+    /// to 10 s. It runs on `runtime`'s blocking pool, so the worker thread that
+    /// polls this future stays free. No synchronous constructor is public, so
+    /// no async caller can run that work inline.
+    ///
+    /// `runtime` is an explicit input (`.docs/standards/construction.md`, ADR-052
+    /// injection through initializers): custody keeps it for every later key
+    /// operation, so it must outlive this object. A bridge passes the handle of
+    /// its process-wide runtime.
+    ///
+    /// Dropping the returned future leaves the open running to completion on
+    /// the blocking pool. A creation that completes leaves a complete key
+    /// file, and a creation that fails removes the file it reserved, so a
+    /// dropped open leaves no partly written file.
     ///
     /// # Errors
     ///
     /// Returns [`PlatformError::CustodyError`] when the passphrase is empty,
     /// when a caller's passphrase does not match whichever passphrase created
-    /// an existing file, when a file
-    /// exists but carries an invalid format or an unsupported version, or when
-    /// an I/O operation fails.
-    pub fn new(path: &Path, passphrase: &str) -> Result<Self, PlatformError> {
+    /// an existing file, when a file exists but carries an invalid format or an
+    /// unsupported version, when an I/O operation fails, and when the blocking
+    /// task panicked or the runtime shut down under it.
+    pub async fn open(
+        path: &Path,
+        passphrase: &str,
+        runtime: tokio::runtime::Handle,
+    ) -> Result<Self, PlatformError> {
+        let path = path.to_path_buf();
+        let passphrase = Zeroizing::new(passphrase.to_owned());
+        let pool = runtime.clone();
+        pool.spawn_blocking(move || Self::open_blocking(&path, &passphrase, runtime))
+            .await
+            .map_err(|e| {
+                PlatformError::CustodyError(format!("the task opening the key file failed: {e}"))
+            })?
+    }
+
+    /// The synchronous body of [`Self::open`]. Private, so only a blocking-pool
+    /// task (or a synchronous test) runs it.
+    fn open_blocking(
+        path: &Path,
+        passphrase: &str,
+        runtime: tokio::runtime::Handle,
+    ) -> Result<Self, PlatformError> {
         // Argon2id over an empty passphrase derives a key anyone who reads the
         // file can re-derive from the salt in its header, so every opener is
         // refused here before a file is reserved or read.
@@ -1033,39 +1046,10 @@ impl FileKeyCustody {
         // other's keys. A `path.exists()` test ahead of that creation would
         // leave exactly this window open.
         if create_file_exclusive(path)? {
-            Self::finish_new(path, passphrase)
+            Self::finish_new(path, passphrase, runtime)
         } else {
-            Self::open_existing_when_written(path, passphrase)
+            Self::open_existing_when_written(path, passphrase, runtime)
         }
-    }
-
-    /// [`Self::new`] on tokio's blocking pool, for async callers.
-    ///
-    /// `new` runs an Argon2id derivation (64 MiB, three passes), which takes
-    /// hundreds of milliseconds in an optimized build and seconds in an
-    /// unoptimized one, and on a path another process reserved it polls for
-    /// up to 10 s. Called inline from an async function, either stalls the
-    /// tokio worker thread and every task scheduled on it; this function keeps
-    /// that worker free.
-    ///
-    /// Dropping the returned future leaves the open running to completion on
-    /// the blocking pool. A creation that completes leaves a complete key
-    /// file, and a creation that fails removes the file it reserved, so a
-    /// dropped open leaves no partly written file.
-    ///
-    /// # Errors
-    ///
-    /// Returns whatever [`Self::new`] returns, and
-    /// [`PlatformError::CustodyError`] when the blocking task panicked or the
-    /// runtime shut down under it.
-    pub async fn open(path: &Path, passphrase: &str) -> Result<Self, PlatformError> {
-        let path = path.to_path_buf();
-        let passphrase = Zeroizing::new(passphrase.to_owned());
-        tokio::task::spawn_blocking(move || Self::new(&path, &passphrase))
-            .await
-            .map_err(|e| {
-                PlatformError::CustodyError(format!("the task opening the key file failed: {e}"))
-            })?
     }
 
     /// Opens an existing key file, waiting briefly when another process
@@ -1075,7 +1059,11 @@ impl FileKeyCustody {
     /// derivation, which takes hundreds of milliseconds. A second constructor
     /// arriving inside that window reads zero bytes, so it polls rather than
     /// reporting an empty file that a moment later holds a header.
-    fn open_existing_when_written(path: &Path, passphrase: &str) -> Result<Self, PlatformError> {
+    fn open_existing_when_written(
+        path: &Path,
+        passphrase: &str,
+        runtime: tokio::runtime::Handle,
+    ) -> Result<Self, PlatformError> {
         // Forty attempts at 250 ms bound this wait at 10 s, the same bound
         // `KEY_FILE_LOCK_WAIT` sets. One Argon2id derivation at this crate's
         // parameters (64 MiB, 3 passes) takes hundreds of milliseconds in an
@@ -1087,7 +1075,9 @@ impl FileKeyCustody {
 
         for attempt in 0..ATTEMPTS {
             match std::fs::metadata(path) {
-                Ok(metadata) if metadata.len() > 0 => return Self::open_existing(path, passphrase),
+                Ok(metadata) if metadata.len() > 0 => {
+                    return Self::open_existing(path, passphrase, runtime);
+                }
                 Ok(_) => {}
                 Err(e) => {
                     return Err(PlatformError::CustodyError(format!(
@@ -1110,7 +1100,11 @@ impl FileKeyCustody {
 
     /// Derives key material, writes an initial header, and returns custody over
     /// a file `create_file_exclusive` just created.
-    fn finish_new(path: &Path, passphrase: &str) -> Result<Self, PlatformError> {
+    fn finish_new(
+        path: &Path,
+        passphrase: &str,
+        runtime: tokio::runtime::Handle,
+    ) -> Result<Self, PlatformError> {
         // Every failure from here on removes whichever empty file a caller just
         // reserved, so a failed creation leaves nothing behind for a later
         // `new` to read as a zero-byte key file.
@@ -1118,7 +1112,7 @@ impl FileKeyCustody {
             let _ = std::fs::remove_file(path);
         })?;
 
-        Ok(Self::from_parts(path, material, HandleMap::new()))
+        Ok(Self::from_parts(path, material, HandleMap::new(), runtime))
     }
 
     /// Derives key material and writes an initial header into a file
@@ -1149,7 +1143,12 @@ impl FileKeyCustody {
 
     /// Assembles a custody object over `path` from the material its
     /// passphrase derived and the handles its entries name.
-    fn from_parts(path: &Path, material: DerivedMaterial, handle_map: HandleMap) -> Self {
+    fn from_parts(
+        path: &Path,
+        material: DerivedMaterial,
+        handle_map: HandleMap,
+        runtime: tokio::runtime::Handle,
+    ) -> Self {
         Self {
             file: Arc::new(KeyFile {
                 path: path.to_path_buf(),
@@ -1158,6 +1157,7 @@ impl FileKeyCustody {
                 file_write_lock: StdMutex::new(()),
             }),
             handle_map: Arc::new(Mutex::new(handle_map)),
+            runtime,
         }
     }
 
@@ -1179,15 +1179,65 @@ impl FileKeyCustody {
     {
         let mut map = Arc::clone(&self.handle_map).lock_owned().await;
         let file = Arc::clone(&self.file);
-        tokio::task::spawn_blocking(move || work(&file, &mut map))
+        self.runtime
+            .spawn_blocking(move || work(&file, &mut map))
             .await
             .map_err(|e| {
                 PlatformError::CustodyError(format!("key file task did not finish: {e}"))
             })?
     }
 
+    /// Runs `work`, which mints a key and records its handle in the handle map,
+    /// on the blocking pool, and returns that handle only if it reaches the
+    /// caller.
+    ///
+    /// A key whose handle no caller holds is a private key no record names and
+    /// no flow destroys. So when this future is dropped before it returns, an
+    /// entry `work` wrote is removed again: the blocking task hands back an
+    /// [`UndeliveredKey`] that owns the handle-map lock, this future disarms it
+    /// in the same poll that receives it, and an armed one undoes the write
+    /// when it is dropped, before that lock is released.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever `work` returns, and [`PlatformError::CustodyError`]
+    /// when the blocking task panicked or the runtime shut down under it.
+    async fn mint_with_key_file<F>(&self, work: F) -> Result<KeyHandle, PlatformError>
+    where
+        F: FnOnce(&KeyFile, &mut HandleMap) -> Result<Minted, PlatformError> + Send + 'static,
+    {
+        let mut map = Arc::clone(&self.handle_map).lock_owned().await;
+        let file = Arc::clone(&self.file);
+        let runtime = self.runtime.clone();
+        let undelivered = self
+            .runtime
+            .spawn_blocking(move || {
+                let minted = work(&file, &mut map)?;
+                let undo = minted.written.then(|| PendingUndo {
+                    file,
+                    map,
+                    key_id: minted.handle.id(),
+                    armed: true,
+                });
+                Ok::<_, PlatformError>(UndeliveredKey {
+                    handle: minted.handle,
+                    undo,
+                    runtime,
+                })
+            })
+            .await
+            .map_err(|e| {
+                PlatformError::CustodyError(format!("key file task did not finish: {e}"))
+            })??;
+        Ok(undelivered.deliver())
+    }
+
     /// Opens an existing key file at `path` and loads entry metadata.
-    fn open_existing(path: &Path, passphrase: &str) -> Result<Self, PlatformError> {
+    fn open_existing(
+        path: &Path,
+        passphrase: &str,
+        runtime: tokio::runtime::Handle,
+    ) -> Result<Self, PlatformError> {
         let data = std::fs::read(path)
             .map_err(|e| PlatformError::CustodyError(format!("failed to read key file: {e}")))?;
 
@@ -1246,7 +1296,7 @@ impl FileKeyCustody {
             }
         }
 
-        Ok(Self::from_parts(path, material, handle_map))
+        Ok(Self::from_parts(path, material, handle_map, runtime))
     }
 }
 
@@ -1520,6 +1570,148 @@ impl KeyFile {
         Ok(entry_id)
     }
 
+    /// Removes the entry `key_id` names from the key file and then from `map`,
+    /// under a `handle_map` lock the caller holds. `destroy_key` runs this, and
+    /// so does the undo of a minted key whose handle never reached its caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlatformError::KeyNotFound`] when `map` holds no `key_id`, and
+    /// [`PlatformError::CustodyError`] when a write lock cannot be taken, when
+    /// the file holds no entry with that identifier or holds one of another
+    /// type or role, or when the rewrite fails. Every error leaves the file and
+    /// `map` as they were.
+    fn remove_entry_locked(&self, map: &mut HandleMap, key_id: u64) -> Result<(), PlatformError> {
+        // Look up — do NOT mutate the map yet. Map mutation is
+        // deferred until after the file rewrite succeeds, so a
+        // failed `read_file` or `atomic_write` cannot orphan
+        // encrypted material on disk (the in-memory map would
+        // otherwise have lost the only handle pointing at it).
+        let Some(&MappedEntry {
+            key_type: handle_key_type,
+            role: handle_role,
+            entry_id,
+        }) = map.entries.get(&key_id)
+        else {
+            return Err(PlatformError::KeyNotFound);
+        };
+
+        // Rewrite the key file without the destroyed entry.
+        // This ensures key material is removed from disk, not just from
+        // the in-memory handle map.
+        let _lock = self
+            .file_write_lock
+            .lock()
+            .map_err(|_| PlatformError::CustodyError("file write lock poisoned".into()))?;
+        // Hold the cross-process advisory lock from this read through the
+        // write below, so a second custody object over the same path cannot
+        // append between them and lose its own entry to this rewrite
+        // (§17.8 of `.docs/specs/17-persistence-and-storage.md`, "One
+        // writer at a time").
+        let _file_lock = lock_key_file_for_write(&self.path)?;
+
+        let data = self.read_file()?;
+
+        // Find the entry this handle names. An identifier names one entry
+        // for that entry's whole life, so this lookup reaches the key its
+        // caller designated and reaches no other key. A file that carries
+        // no entry under this identifier is one that another custody
+        // object already rewrote, or a copy an operator restored from
+        // before this key existed; this call then writes nothing and
+        // leaves the handle map alone, so its caller reads an error rather
+        // than a report that custody destroyed a key this file never held.
+        let Some(removed_index) = find_entry_index(&data, &entry_id) else {
+            tracing::warn!(
+                key_id,
+                "FileKeyCustody::destroy_key found no entry carrying the identifier this \
+             handle names — writing nothing"
+            );
+            return Err(PlatformError::CustodyError(format!(
+                "destroy_key: this key file holds no entry with the identifier handle \
+             {key_id} names — another custody object over this file destroyed that key, \
+             or this file was replaced by a copy written before that key existed"
+            )));
+        };
+
+        // The type and role this file records against the type and role
+        // this handle names. A
+        // mismatch means these bytes are not the entry this handle was
+        // minted against, and destroying a key is irreversible, so this
+        // call writes nothing.
+        let entry_offset = HEADER_SIZE + removed_index * ENTRY_SIZE;
+        let stored_key_type = StoredKeyType::from_byte(data[entry_offset])?;
+        if stored_key_type != handle_key_type {
+            return Err(PlatformError::CustodyError(format!(
+                "destroy_key: key entry {removed_index} holds a {:?} key, and handle \
+             {key_id} names a {:?} key — refusing to destroy a key this handle does not \
+             name",
+                stored_key_type.to_key_type(),
+                handle_key_type.to_key_type()
+            )));
+        }
+        let stored_role = read_entry_role(&data, removed_index)?;
+        if stored_role != handle_role {
+            return Err(PlatformError::CustodyError(format!(
+                "destroy_key: key entry {removed_index} holds a {stored_role:?} key, and \
+             handle {key_id} names a {handle_role:?} key — refusing to destroy a key this \
+             handle does not name"
+            )));
+        }
+
+        // Reconstruct the file: copy header, skip the destroyed entry,
+        // decrement the entry count.
+        let current_count = u32::from_le_bytes(
+            data[ENTRY_COUNT_OFFSET..HEADER_SIZE]
+                .try_into()
+                .map_err(|_| PlatformError::CustodyError("invalid entry count".into()))?,
+        );
+
+        // `find_entry_index` derived `removed_index` from this file's own
+        // length, and `verify_file` matched that length against this count
+        // before `read_file` returned these bytes, so this file holds at
+        // least one entry and this subtraction stays inside `u32`.
+        let new_count = current_count - 1;
+        let mut new_data = Vec::with_capacity(HEADER_SIZE + (new_count as usize) * ENTRY_SIZE);
+
+        // Copy header (version + salt + commitment + an HMAC field, which
+        // `seal_file_mac` overwrites below).
+        new_data.extend_from_slice(&data[..ENTRY_COUNT_OFFSET]);
+        // Write updated entry count.
+        new_data.extend_from_slice(&new_count.to_le_bytes());
+
+        // Copy every entry except the removed one, byte for byte.
+        // `FileKeyCustody::encrypt_key` binds an entry's identifier rather
+        // than its position (§17.8 of
+        // `.docs/specs/17-persistence-and-storage.md`, "Per-entry
+        // binding"), so an entry that moves down one position still
+        // decrypts, and this loop needs no key material to move it.
+        for i in 0..current_count as usize {
+            if i == removed_index {
+                continue;
+            }
+            let copy_offset = HEADER_SIZE + i * ENTRY_SIZE;
+            new_data.extend_from_slice(&data[copy_offset..copy_offset + ENTRY_SIZE]);
+        }
+
+        // Re-authenticate this whole file: this rewrite dropped an entry
+        // and changed an entry count, so a stored HMAC no longer covers
+        // what sits on disk.
+        seal_file_mac(&self.mac_key, &mut new_data)?;
+
+        // Commit to disk BEFORE mutating the in-memory map. If
+        // `atomic_write` fails, the map still references the
+        // (unmodified) on-disk entry — no orphaned ciphertext.
+        atomic_write(&self.path, &new_data)?;
+
+        // Now that disk state is updated, drop the destroyed entry from
+        // the in-memory map. Every other handle keeps naming its own
+        // entry, because an entry's identifier does not change when that
+        // entry moves down a position.
+        map.entries.remove(&key_id);
+
+        Ok(())
+    }
+
     /// The Ed25519 seed of a pseudonym-derivation source, after the role and
     /// (until SCP-315) curve check, read under a `handle_map` lock the caller
     /// holds.
@@ -1616,7 +1808,7 @@ impl FileKeyCustody {
         // `append_entry` takes only `file_write_lock`, never `handle_map`, so
         // there is no lock-ordering inversion. Mirrors the pattern in
         // `import_ed25519_signing_key`.
-        self.with_key_file(move |file, map| {
+        self.mint_with_key_file(move |file, map| {
             let key_bytes = match key_type {
                 KeyType::Ed25519 => {
                     let mut key_bytes = Zeroizing::new([0u8; KEY_LEN]);
@@ -1638,7 +1830,10 @@ impl FileKeyCustody {
                     entry_id,
                 },
             );
-            Ok(handle)
+            Ok(Minted {
+                handle,
+                written: true,
+            })
         })
         .await
     }
@@ -1788,138 +1983,8 @@ impl KeyCustody for FileKeyCustody {
     ) -> impl Future<Output = Result<(), PlatformError>> + Send {
         let key_id = key.id();
         async move {
-            self.with_key_file(move |file, map| {
-                // Look up — do NOT mutate the map yet. Map mutation is
-                // deferred until after the file rewrite succeeds, so a
-                // failed `read_file` or `atomic_write` cannot orphan
-                // encrypted material on disk (the in-memory map would
-                // otherwise have lost the only handle pointing at it).
-                let Some(&MappedEntry {
-                    key_type: handle_key_type,
-                    role: handle_role,
-                    entry_id,
-                }) = map.entries.get(&key_id)
-                else {
-                    return Err(PlatformError::KeyNotFound);
-                };
-
-                // Rewrite the key file without the destroyed entry.
-                // This ensures key material is removed from disk, not just from
-                // the in-memory handle map.
-                let _lock = file
-                    .file_write_lock
-                    .lock()
-                    .map_err(|_| PlatformError::CustodyError("file write lock poisoned".into()))?;
-                // Hold the cross-process advisory lock from this read through the
-                // write below, so a second custody object over the same path cannot
-                // append between them and lose its own entry to this rewrite
-                // (§17.8 of `.docs/specs/17-persistence-and-storage.md`, "One
-                // writer at a time").
-                let _file_lock = lock_key_file_for_write(&file.path)?;
-
-                let data = file.read_file()?;
-
-                // Find the entry this handle names. An identifier names one entry
-                // for that entry's whole life, so this lookup reaches the key its
-                // caller designated and reaches no other key. A file that carries
-                // no entry under this identifier is one that another custody
-                // object already rewrote, or a copy an operator restored from
-                // before this key existed; this call then writes nothing and
-                // leaves the handle map alone, so its caller reads an error rather
-                // than a report that custody destroyed a key this file never held.
-                let Some(removed_index) = find_entry_index(&data, &entry_id) else {
-                    tracing::warn!(
-                        key_id,
-                        "FileKeyCustody::destroy_key found no entry carrying the identifier this \
-                     handle names — writing nothing"
-                    );
-                    return Err(PlatformError::CustodyError(format!(
-                        "destroy_key: this key file holds no entry with the identifier handle \
-                     {key_id} names — another custody object over this file destroyed that key, \
-                     or this file was replaced by a copy written before that key existed"
-                    )));
-                };
-
-                // The type and role this file records against the type and role
-                // this handle names. A
-                // mismatch means these bytes are not the entry this handle was
-                // minted against, and destroying a key is irreversible, so this
-                // call writes nothing.
-                let entry_offset = HEADER_SIZE + removed_index * ENTRY_SIZE;
-                let stored_key_type = StoredKeyType::from_byte(data[entry_offset])?;
-                if stored_key_type != handle_key_type {
-                    return Err(PlatformError::CustodyError(format!(
-                        "destroy_key: key entry {removed_index} holds a {:?} key, and handle \
-                     {key_id} names a {:?} key — refusing to destroy a key this handle does not \
-                     name",
-                        stored_key_type.to_key_type(),
-                        handle_key_type.to_key_type()
-                    )));
-                }
-                let stored_role = read_entry_role(&data, removed_index)?;
-                if stored_role != handle_role {
-                    return Err(PlatformError::CustodyError(format!(
-                        "destroy_key: key entry {removed_index} holds a {stored_role:?} key, and \
-                     handle {key_id} names a {handle_role:?} key — refusing to destroy a key this \
-                     handle does not name"
-                    )));
-                }
-
-                // Reconstruct the file: copy header, skip the destroyed entry,
-                // decrement the entry count.
-                let current_count = u32::from_le_bytes(
-                    data[ENTRY_COUNT_OFFSET..HEADER_SIZE]
-                        .try_into()
-                        .map_err(|_| PlatformError::CustodyError("invalid entry count".into()))?,
-                );
-
-                // `find_entry_index` derived `removed_index` from this file's own
-                // length, and `verify_file` matched that length against this count
-                // before `read_file` returned these bytes, so this file holds at
-                // least one entry and this subtraction stays inside `u32`.
-                let new_count = current_count - 1;
-                let mut new_data =
-                    Vec::with_capacity(HEADER_SIZE + (new_count as usize) * ENTRY_SIZE);
-
-                // Copy header (version + salt + commitment + an HMAC field, which
-                // `seal_file_mac` overwrites below).
-                new_data.extend_from_slice(&data[..ENTRY_COUNT_OFFSET]);
-                // Write updated entry count.
-                new_data.extend_from_slice(&new_count.to_le_bytes());
-
-                // Copy every entry except the removed one, byte for byte.
-                // `FileKeyCustody::encrypt_key` binds an entry's identifier rather
-                // than its position (§17.8 of
-                // `.docs/specs/17-persistence-and-storage.md`, "Per-entry
-                // binding"), so an entry that moves down one position still
-                // decrypts, and this loop needs no key material to move it.
-                for i in 0..current_count as usize {
-                    if i == removed_index {
-                        continue;
-                    }
-                    let copy_offset = HEADER_SIZE + i * ENTRY_SIZE;
-                    new_data.extend_from_slice(&data[copy_offset..copy_offset + ENTRY_SIZE]);
-                }
-
-                // Re-authenticate this whole file: this rewrite dropped an entry
-                // and changed an entry count, so a stored HMAC no longer covers
-                // what sits on disk.
-                seal_file_mac(&file.mac_key, &mut new_data)?;
-
-                // Commit to disk BEFORE mutating the in-memory map. If
-                // `atomic_write` fails, the map still references the
-                // (unmodified) on-disk entry — no orphaned ciphertext.
-                atomic_write(&file.path, &new_data)?;
-
-                // Now that disk state is updated, drop the destroyed entry from
-                // the in-memory map. Every other handle keeps naming its own
-                // entry, because an entry's identifier does not change when that
-                // entry moves down a position.
-                map.entries.remove(&key_id);
-
-                Ok(())
-            })
-            .await
+            self.with_key_file(move |file, map| file.remove_entry_locked(map, key_id))
+                .await
         }
     }
 
@@ -1998,7 +2063,7 @@ impl KeyCustody for FileKeyCustody {
     ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send {
         let seed = Zeroizing::new(**seed);
         async move {
-            self.with_key_file(move |file, map| {
+            self.mint_with_key_file(move |file, map| {
                 // Dedup by content: if the seed's verifying key already
                 // matches an existing Ed25519 entry, return that handle
                 // instead of appending a duplicate. Without this guard a
@@ -2091,7 +2156,12 @@ impl KeyCustody for FileKeyCustody {
                             entry_id,
                         },
                     );
-                    return Ok(handle);
+                    // The file already held this key, so this call wrote
+                    // nothing and a dropped caller leaves nothing to undo.
+                    return Ok(Minted {
+                        handle,
+                        written: false,
+                    });
                 }
                 drop(data);
 
@@ -2118,7 +2188,10 @@ impl KeyCustody for FileKeyCustody {
                     },
                 );
 
-                Ok(handle)
+                Ok(Minted {
+                    handle,
+                    written: true,
+                })
             })
             .await
         }
@@ -2153,7 +2226,7 @@ mod tests {
     /// Helper: create a `FileKeyCustody` in a temporary directory.
     fn make_custody(dir: &TempDir, passphrase: &str) -> FileKeyCustody {
         let path = dir.path().join("keys.scp");
-        FileKeyCustody::new(&path, passphrase).unwrap()
+        FileKeyCustody::open_blocking(&path, passphrase, tokio::runtime::Handle::current()).unwrap()
     }
 
     /// Dropping the key-file lock unlocks it before closing the lock file, so a
@@ -2231,14 +2304,18 @@ mod tests {
         let passphrase = "correct-horse-battery-staple";
 
         // Create and generate a key.
-        let custody = FileKeyCustody::new(&path, passphrase).unwrap();
+        let custody = FileKeyCustody::open(&path, passphrase, tokio::runtime::Handle::current())
+            .await
+            .unwrap();
         let handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
         let pubkey = custody.public_key(&handle).await.unwrap();
         let sig = custody.sign(&handle, b"test data").await.unwrap();
         drop(custody);
 
         // Reopen with the same passphrase.
-        let custody2 = FileKeyCustody::new(&path, passphrase).unwrap();
+        let custody2 = FileKeyCustody::open(&path, passphrase, tokio::runtime::Handle::current())
+            .await
+            .unwrap();
         // A handle id comes from its entry's identifier, so the handle the
         // first object returned names the same key after a reopen.
         let handle2 = handle;
@@ -2267,7 +2344,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("keys.scp");
 
-        match FileKeyCustody::new(&path, "") {
+        match FileKeyCustody::open(&path, "", tokio::runtime::Handle::current()).await {
             Err(PlatformError::CustodyError(msg)) => assert!(
                 msg.contains("must not be empty"),
                 "error must name the empty passphrase: {msg}"
@@ -2289,11 +2366,13 @@ mod tests {
         let path = dir.path().join("keys.scp");
 
         // Create and generate a key.
-        let custody = FileKeyCustody::new(&path, "correct").unwrap();
+        let custody = FileKeyCustody::open(&path, "correct", tokio::runtime::Handle::current())
+            .await
+            .unwrap();
         custody.generate_keypair(KeyType::Ed25519).await.unwrap();
         drop(custody);
 
-        let result = FileKeyCustody::new(&path, "wrong");
+        let result = FileKeyCustody::open(&path, "wrong", tokio::runtime::Handle::current()).await;
         assert!(
             result.is_err(),
             "construction must reject a wrong passphrase"
@@ -2320,7 +2399,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("keys.scp");
 
-        let custody = FileKeyCustody::new(&path, "passphrase").unwrap();
+        let custody = FileKeyCustody::open(&path, "passphrase", tokio::runtime::Handle::current())
+            .await
+            .unwrap();
         let first = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
         custody.generate_keypair(KeyType::Ed25519).await.unwrap();
 
@@ -2354,7 +2435,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("keys.scp");
 
-        let custody = FileKeyCustody::new(&path, "passphrase").unwrap();
+        let custody = FileKeyCustody::open(&path, "passphrase", tokio::runtime::Handle::current())
+            .await
+            .unwrap();
         custody.generate_keypair(KeyType::Ed25519).await.unwrap();
 
         // Flip one ciphertext bit while custody stays open.
@@ -2368,7 +2451,9 @@ mod tests {
             "a write path must reject a modified file rather than re-seal it"
         );
         assert!(
-            FileKeyCustody::new(&path, "passphrase").is_err(),
+            FileKeyCustody::open(&path, "passphrase", tokio::runtime::Handle::current())
+                .await
+                .is_err(),
             "a later construction must still report that modified file"
         );
     }
@@ -2380,7 +2465,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("keys.scp");
 
-        let custody = FileKeyCustody::new(&path, "passphrase").unwrap();
+        let custody = FileKeyCustody::open(&path, "passphrase", tokio::runtime::Handle::current())
+            .await
+            .unwrap();
         let handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
 
         std::fs::write(&path, [FORMAT_VERSION; 20]).unwrap();
@@ -2403,13 +2490,25 @@ mod tests {
         let attacker_path = dir.path().join("attacker.scp");
 
         // Victim file: one key under its own passphrase.
-        let victim = FileKeyCustody::new(&victim_path, "victim-passphrase").unwrap();
+        let victim = FileKeyCustody::open(
+            &victim_path,
+            "victim-passphrase",
+            tokio::runtime::Handle::current(),
+        )
+        .await
+        .unwrap();
         victim.generate_keypair(KeyType::Ed25519).await.unwrap();
         drop(victim);
 
         // Attacker file: one key under a passphrase an attacker knows, so its
         // header carries a commitment that same passphrase opens.
-        let attacker = FileKeyCustody::new(&attacker_path, "attacker-passphrase").unwrap();
+        let attacker = FileKeyCustody::open(
+            &attacker_path,
+            "attacker-passphrase",
+            tokio::runtime::Handle::current(),
+        )
+        .await
+        .unwrap();
         attacker.generate_keypair(KeyType::Ed25519).await.unwrap();
         drop(attacker);
 
@@ -2420,9 +2519,14 @@ mod tests {
         spliced.extend_from_slice(&victim_bytes[HEADER_SIZE..]);
         std::fs::write(&victim_path, &spliced).unwrap();
 
-        match FileKeyCustody::new(&victim_path, "attacker-passphrase")
-            .err()
-            .unwrap()
+        match FileKeyCustody::open(
+            &victim_path,
+            "attacker-passphrase",
+            tokio::runtime::Handle::current(),
+        )
+        .await
+        .err()
+        .unwrap()
         {
             PlatformError::CustodyError(msg) => {
                 assert!(
@@ -2443,7 +2547,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("keys.scp");
 
-        let custody = FileKeyCustody::new(&path, "passphrase").unwrap();
+        let custody = FileKeyCustody::open(&path, "passphrase", tokio::runtime::Handle::current())
+            .await
+            .unwrap();
         custody.generate_keypair(KeyType::Ed25519).await.unwrap();
         drop(custody);
 
@@ -2452,7 +2558,11 @@ mod tests {
         bytes.truncate(HEADER_SIZE);
         std::fs::write(&path, &bytes).unwrap();
 
-        match FileKeyCustody::new(&path, "passphrase").err().unwrap() {
+        match FileKeyCustody::open(&path, "passphrase", tokio::runtime::Handle::current())
+            .await
+            .err()
+            .unwrap()
+        {
             PlatformError::CustodyError(msg) => {
                 assert!(
                     msg.contains("integrity check"),
@@ -2471,7 +2581,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("keys.scp");
 
-        let custody = FileKeyCustody::new(&path, "passphrase").unwrap();
+        let custody = FileKeyCustody::open(&path, "passphrase", tokio::runtime::Handle::current())
+            .await
+            .unwrap();
         custody.generate_keypair(KeyType::Ed25519).await.unwrap();
         drop(custody);
 
@@ -2480,7 +2592,11 @@ mod tests {
         bytes[last] ^= 0x01;
         std::fs::write(&path, &bytes).unwrap();
 
-        match FileKeyCustody::new(&path, "passphrase").err().unwrap() {
+        match FileKeyCustody::open(&path, "passphrase", tokio::runtime::Handle::current())
+            .await
+            .err()
+            .unwrap()
+        {
             PlatformError::CustodyError(msg) => {
                 assert!(
                     msg.contains("integrity check"),
@@ -2504,7 +2620,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("keys.scp");
 
-        let custody = FileKeyCustody::new(&path, "pw").unwrap();
+        let custody = FileKeyCustody::open(&path, "pw", tokio::runtime::Handle::current())
+            .await
+            .unwrap();
         let mut handles = Vec::new();
         let mut publics = Vec::new();
         for _ in 0..3 {
@@ -2515,7 +2633,9 @@ mod tests {
         custody.destroy_key(&handles[0]).await.unwrap();
         drop(custody);
 
-        let reopened = FileKeyCustody::new(&path, "pw").unwrap();
+        let reopened = FileKeyCustody::open(&path, "pw", tokio::runtime::Handle::current())
+            .await
+            .unwrap();
         for i in 1..3 {
             assert_eq!(
                 reopened.public_key(&handles[i]).await.unwrap().as_bytes(),
@@ -2552,7 +2672,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("keys.scp");
 
-        let custody = FileKeyCustody::new(&path, "pw").unwrap();
+        let custody = FileKeyCustody::open(&path, "pw", tokio::runtime::Handle::current())
+            .await
+            .unwrap();
         custody.generate_keypair(KeyType::Ed25519).await.unwrap();
         custody.generate_keypair(KeyType::Ed25519).await.unwrap();
         let mut data = custody.file.read_file().unwrap();
@@ -2564,7 +2686,11 @@ mod tests {
         atomic_write(&path, &data).unwrap();
         drop(custody);
 
-        match FileKeyCustody::new(&path, "pw").err().unwrap() {
+        match FileKeyCustody::open(&path, "pw", tokio::runtime::Handle::current())
+            .await
+            .err()
+            .unwrap()
+        {
             PlatformError::CustodyError(msg) => assert!(
                 msg.contains("two entries with handle id"),
                 "the error must name the shared handle id: {msg}"
@@ -2613,15 +2739,21 @@ mod tests {
         let path = dir.path().join("empty-keys.scp");
 
         // Create a file and store nothing in it.
-        let custody = FileKeyCustody::new(&path, "correct").unwrap();
+        let custody = FileKeyCustody::open(&path, "correct", tokio::runtime::Handle::current())
+            .await
+            .unwrap();
         drop(custody);
 
         assert!(
-            FileKeyCustody::new(&path, "wrong").is_err(),
+            FileKeyCustody::open(&path, "wrong", tokio::runtime::Handle::current())
+                .await
+                .is_err(),
             "construction must reject a wrong passphrase on a zero-entry file"
         );
         assert!(
-            FileKeyCustody::new(&path, "correct").is_ok(),
+            FileKeyCustody::open(&path, "correct", tokio::runtime::Handle::current())
+                .await
+                .is_ok(),
             "construction must accept an original passphrase on a zero-entry file"
         );
     }
@@ -2634,14 +2766,20 @@ mod tests {
     /// `FileKeyCustody::new` at a path whose parent component is a regular
     /// file returns `PlatformError::CustodyError` naming the failed create. A
     /// custody object returned here would hold keys no restart can recover.
-    #[test]
-    fn new_at_an_uncreatable_path_fails_closed_with_custody_error() {
+    #[tokio::test]
+    async fn new_at_an_uncreatable_path_fails_closed_with_custody_error() {
         let dir = TempDir::new().unwrap();
         let blocker = dir.path().join("this-is-a-file");
         std::fs::write(&blocker, b"not a directory").unwrap();
         let path = blocker.join("keys.scp");
 
-        match FileKeyCustody::new(&path, "correct-horse-battery-staple") {
+        match FileKeyCustody::open(
+            &path,
+            "correct-horse-battery-staple",
+            tokio::runtime::Handle::current(),
+        )
+        .await
+        {
             Err(PlatformError::CustodyError(msg)) => assert!(
                 msg.contains(&path.display().to_string()),
                 "the error must name the key file it could not create: {msg}"
@@ -2661,15 +2799,21 @@ mod tests {
     /// A file that carries this format's version byte but ends before a full
     /// header is refused at construction by its length, before any key
     /// derivation reads a salt or commitment past its end.
-    #[test]
-    fn new_on_a_file_shorter_than_its_header_fails_closed_with_custody_error() {
+    #[tokio::test]
+    async fn new_on_a_file_shorter_than_its_header_fails_closed_with_custody_error() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("keys.scp");
         let mut data = vec![FORMAT_VERSION];
         data.extend_from_slice(&[0x11u8; SALT_LEN]);
         std::fs::write(&path, &data).unwrap();
 
-        match FileKeyCustody::new(&path, "correct-horse-battery-staple") {
+        match FileKeyCustody::open(
+            &path,
+            "correct-horse-battery-staple",
+            tokio::runtime::Handle::current(),
+        )
+        .await
+        {
             Err(PlatformError::CustodyError(msg)) => assert!(
                 msg.contains("too short for header"),
                 "the error must name the short header: {msg}"
@@ -2690,7 +2834,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("keys.scp");
 
-        let custody = FileKeyCustody::new(&path, "passphrase").unwrap();
+        let custody = FileKeyCustody::open(&path, "passphrase", tokio::runtime::Handle::current())
+            .await
+            .unwrap();
         custody.generate_keypair(KeyType::Ed25519).await.unwrap();
         drop(custody);
 
@@ -2698,7 +2844,7 @@ mod tests {
         bytes.truncate(HEADER_SIZE);
         std::fs::write(&path, &bytes).unwrap();
 
-        match FileKeyCustody::new(&path, "passphrase") {
+        match FileKeyCustody::open(&path, "passphrase", tokio::runtime::Handle::current()).await {
             Err(PlatformError::CustodyError(msg)) => assert!(
                 msg.contains("does not match its entry count"),
                 "the error must name the missing entries: {msg}"
@@ -2715,7 +2861,9 @@ mod tests {
     async fn key_file_does_not_contain_raw_private_key() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("keys.scp");
-        let custody = FileKeyCustody::new(&path, "passphrase").unwrap();
+        let custody = FileKeyCustody::open(&path, "passphrase", tokio::runtime::Handle::current())
+            .await
+            .unwrap();
 
         let handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
 
@@ -2961,7 +3109,9 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("keys.scp");
-        let _custody = FileKeyCustody::new(&path, "test-perms").unwrap();
+        let _custody = FileKeyCustody::open(&path, "test-perms", tokio::runtime::Handle::current())
+            .await
+            .unwrap();
         let metadata = std::fs::metadata(&path).unwrap();
         let mode = metadata.permissions().mode() & 0o777;
         assert_eq!(
@@ -2979,7 +3129,9 @@ mod tests {
         let path = dir.path().join("keys.scp");
         std::fs::write(dir.path().join("keys.scp.tmp"), b"stale").unwrap();
 
-        let custody = FileKeyCustody::new(&path, "pw").unwrap();
+        let custody = FileKeyCustody::open(&path, "pw", tokio::runtime::Handle::current())
+            .await
+            .unwrap();
         let handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
         let pubkey = custody.public_key(&handle).await.unwrap();
         assert_eq!(pubkey.as_bytes().len(), 32);
@@ -3004,7 +3156,9 @@ mod tests {
         let path = dir.path().join("keys.scp");
         let passphrase = "multi-key";
 
-        let custody = FileKeyCustody::new(&path, passphrase).unwrap();
+        let custody = FileKeyCustody::open(&path, passphrase, tokio::runtime::Handle::current())
+            .await
+            .unwrap();
 
         let h1 = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
         let h2 = custody.generate_keypair(KeyType::HpkeP256).await.unwrap();
@@ -3017,7 +3171,9 @@ mod tests {
         drop(custody);
 
         // Reopen and verify all keys.
-        let custody2 = FileKeyCustody::new(&path, passphrase).unwrap();
+        let custody2 = FileKeyCustody::open(&path, passphrase, tokio::runtime::Handle::current())
+            .await
+            .unwrap();
         let (rh1, rh2, rh3) = (h1, h2, h3);
 
         assert_eq!(
@@ -3050,7 +3206,9 @@ mod tests {
         let passphrase = "rollback-passphrase";
 
         // One key, then a snapshot of the file holding exactly that one key.
-        let custody = FileKeyCustody::new(&path, passphrase).unwrap();
+        let custody = FileKeyCustody::open(&path, passphrase, tokio::runtime::Handle::current())
+            .await
+            .unwrap();
         let first = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
         let one_entry_snapshot = std::fs::read(&path).unwrap();
 
@@ -3284,8 +3442,14 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("keys.scp");
 
-        let importer = Arc::new(FileKeyCustody::new(&path, "pw").unwrap());
-        let other_writer = FileKeyCustody::new(&path, "pw").unwrap();
+        let importer = Arc::new(
+            FileKeyCustody::open(&path, "pw", tokio::runtime::Handle::current())
+                .await
+                .unwrap(),
+        );
+        let other_writer = FileKeyCustody::open(&path, "pw", tokio::runtime::Handle::current())
+            .await
+            .unwrap();
 
         let seed = Zeroizing::new([7u8; KEY_LEN]);
         let expected_public = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
@@ -3436,11 +3600,19 @@ mod tests {
 
         // Construct the file once, so no constructor races another constructor
         // and every object below opens the same existing header.
-        drop(FileKeyCustody::new(&path, "pw").unwrap());
+        drop(
+            FileKeyCustody::open(&path, "pw", tokio::runtime::Handle::current())
+                .await
+                .unwrap(),
+        );
 
         let mut tasks = Vec::with_capacity(WRITERS);
         for _ in 0..WRITERS {
-            let custody = Arc::new(FileKeyCustody::new(&path, "pw").unwrap());
+            let custody = Arc::new(
+                FileKeyCustody::open(&path, "pw", tokio::runtime::Handle::current())
+                    .await
+                    .unwrap(),
+            );
             tasks.push(tokio::spawn(async move {
                 let handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
                 let public = custody.public_key(&handle).await.unwrap();
@@ -3476,7 +3648,9 @@ mod tests {
 
         // Reopening reads all eight entries back, which proves each entry
         // decrypts under its own identifier.
-        let reopened = FileKeyCustody::new(&path, "pw").unwrap();
+        let reopened = FileKeyCustody::open(&path, "pw", tokio::runtime::Handle::current())
+            .await
+            .unwrap();
         let mut reread = Vec::with_capacity(WRITERS);
         for handle in handles_of(&reopened).await {
             let public = reopened.public_key(&handle).await.unwrap();
@@ -3496,11 +3670,15 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("keys.scp");
 
-        let first = FileKeyCustody::new(&path, "pw").unwrap();
+        let first = FileKeyCustody::open(&path, "pw", tokio::runtime::Handle::current())
+            .await
+            .unwrap();
         let first_handle = first.generate_keypair(KeyType::Ed25519).await.unwrap();
         let first_public = first.public_key(&first_handle).await.unwrap();
 
-        let second = FileKeyCustody::new(&path, "pw").unwrap();
+        let second = FileKeyCustody::open(&path, "pw", tokio::runtime::Handle::current())
+            .await
+            .unwrap();
         let second_handle = second.generate_keypair(KeyType::Ed25519).await.unwrap();
         let second_public = second.public_key(&second_handle).await.unwrap();
 
@@ -3570,12 +3748,13 @@ mod tests {
             let path = Arc::clone(&path);
             let barrier = Arc::clone(&barrier);
             threads.push(std::thread::spawn(move || {
-                barrier.wait();
-                let custody = FileKeyCustody::new(&path, "pw").unwrap();
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .unwrap();
+                barrier.wait();
+                let custody =
+                    FileKeyCustody::open_blocking(&path, "pw", runtime.handle().clone()).unwrap();
                 runtime.block_on(async {
                     let handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
                     custody
@@ -3592,11 +3771,12 @@ mod tests {
             threads.into_iter().map(|t| t.join().unwrap()).collect();
         public_keys.sort_unstable();
 
-        let reopened = FileKeyCustody::new(&path, "pw").unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
+        let reopened =
+            FileKeyCustody::open_blocking(&path, "pw", runtime.handle().clone()).unwrap();
         let mut reread: Vec<Vec<u8>> = runtime.block_on(async {
             let mut keys = Vec::with_capacity(CONSTRUCTORS);
             for handle in handles_of(&reopened).await {
@@ -3667,17 +3847,18 @@ mod tests {
         };
         let key_path = PathBuf::from(key_path);
 
-        let custody = FileKeyCustody::new(&key_path, "pw").unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let custody =
+            FileKeyCustody::open_blocking(&key_path, "pw", runtime.handle().clone()).unwrap();
         std::fs::write(cross_process_ready_path(&key_path), b"").unwrap();
         wait_for_file(
             &cross_process_go_path(&key_path),
             std::time::Duration::from_secs(60),
         );
 
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
         runtime.block_on(async {
             for _ in 0..CROSS_PROCESS_APPENDS {
                 custody.generate_keypair(KeyType::Ed25519).await.unwrap();
@@ -3699,7 +3880,9 @@ mod tests {
     async fn two_processes_appending_to_one_key_file_lose_no_entry() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("keys.scp");
-        let custody = FileKeyCustody::new(&path, "pw").unwrap();
+        let custody = FileKeyCustody::open(&path, "pw", tokio::runtime::Handle::current())
+            .await
+            .unwrap();
 
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
@@ -3761,7 +3944,9 @@ mod tests {
             "every key both processes generated must reach disk"
         );
 
-        let reopened = FileKeyCustody::new(&path, "pw").unwrap();
+        let reopened = FileKeyCustody::open(&path, "pw", tokio::runtime::Handle::current())
+            .await
+            .unwrap();
         let mut public_keys = Vec::with_capacity(2 * CROSS_PROCESS_APPENDS);
         for handle in handles_of(&reopened).await {
             let public = reopened.public_key(&handle).await.unwrap();
@@ -3797,13 +3982,17 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("keys.scp");
 
-        let a = FileKeyCustody::new(&path, "pw").unwrap();
+        let a = FileKeyCustody::open(&path, "pw", tokio::runtime::Handle::current())
+            .await
+            .unwrap();
         let ed = a.generate_keypair(KeyType::Ed25519).await.unwrap();
         a.generate_keypair(KeyType::HpkeP256).await.unwrap();
 
         // `b` loads the same two entries, and derives the same handle ids from
         // their identifiers, so `ed` names entry 0 in `b` too.
-        let b = FileKeyCustody::new(&path, "pw").unwrap();
+        let b = FileKeyCustody::open(&path, "pw", tokio::runtime::Handle::current())
+            .await
+            .unwrap();
         b.destroy_key(&ed).await.unwrap();
 
         let sign_error = a
@@ -3840,7 +4029,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("keys.scp");
 
-        let custody = FileKeyCustody::new(&path, "pw").unwrap();
+        let custody = FileKeyCustody::open(&path, "pw", tokio::runtime::Handle::current())
+            .await
+            .unwrap();
         let ed = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
 
         let mut data = custody.file.read_file().unwrap();
@@ -3881,7 +4072,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("keys.scp");
 
-        let custody = FileKeyCustody::new(&path, "pw").unwrap();
+        let custody = FileKeyCustody::open(&path, "pw", tokio::runtime::Handle::current())
+            .await
+            .unwrap();
         let handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
 
         let mut data = custody.file.read_file().unwrap();
@@ -3890,7 +4083,8 @@ mod tests {
         atomic_write(&path, &data).unwrap();
         drop(custody);
 
-        let reopened = FileKeyCustody::new(&path, "pw")
+        let reopened = FileKeyCustody::open(&path, "pw", tokio::runtime::Handle::current())
+            .await
             .expect("a re-sealed file passes its HMAC check, so the reopen succeeds");
 
         // A valid P-256 peer point, so an unmutated build could not fail on
@@ -3928,7 +4122,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("keys.scp");
 
-        let custody = FileKeyCustody::new(&path, "pw").unwrap();
+        let custody = FileKeyCustody::open(&path, "pw", tokio::runtime::Handle::current())
+            .await
+            .unwrap();
         let handle = custody.generate_key_event_keypair().await.unwrap();
 
         let mut data = custody.file.read_file().unwrap();
@@ -3938,7 +4134,8 @@ mod tests {
         atomic_write(&path, &data).unwrap();
         drop(custody);
 
-        let reopened = FileKeyCustody::new(&path, "pw")
+        let reopened = FileKeyCustody::open(&path, "pw", tokio::runtime::Handle::current())
+            .await
             .expect("a re-sealed file passes its HMAC check, so the reopen succeeds");
         let error = reopened
             .sign(&handle, &[0u8; 32])
@@ -3968,7 +4165,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("keys.scp");
 
-        let custody = FileKeyCustody::new(&path, "pw").unwrap();
+        let custody = FileKeyCustody::open(&path, "pw", tokio::runtime::Handle::current())
+            .await
+            .unwrap();
         let first = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
         let second = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
         let first_public = custody.public_key(&first).await.unwrap();
@@ -4025,7 +4224,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("keys.scp");
 
-        let custody = FileKeyCustody::new(&path, "pw").unwrap();
+        let custody = FileKeyCustody::open(&path, "pw", tokio::runtime::Handle::current())
+            .await
+            .unwrap();
         let first = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
         let second = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
         let first_public = custody.public_key(&first).await.unwrap();
@@ -4066,7 +4267,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("keys.scp");
 
-        let custody = FileKeyCustody::new(&path, "pw").unwrap();
+        let custody = FileKeyCustody::open(&path, "pw", tokio::runtime::Handle::current())
+            .await
+            .unwrap();
         let first = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
         let victim = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
         let third = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
@@ -4142,7 +4345,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("keys.scp");
 
-        let a = FileKeyCustody::new(&path, "pw").unwrap();
+        let a = FileKeyCustody::open(&path, "pw", tokio::runtime::Handle::current())
+            .await
+            .unwrap();
         let mut a_handles = Vec::new();
         let mut publics = Vec::new();
         for _ in 0..4 {
@@ -4153,7 +4358,9 @@ mod tests {
 
         // `b` loads the same four entries and derives the same four handle ids
         // from their identifiers.
-        let b = FileKeyCustody::new(&path, "pw").unwrap();
+        let b = FileKeyCustody::open(&path, "pw", tokio::runtime::Handle::current())
+            .await
+            .unwrap();
         let before = std::fs::read(&path).unwrap();
 
         a.destroy_key(&a_handles[1]).await.unwrap();
@@ -4229,14 +4436,18 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("keys.scp");
 
-        let a = FileKeyCustody::new(&path, "pw").unwrap();
+        let a = FileKeyCustody::open(&path, "pw", tokio::runtime::Handle::current())
+            .await
+            .unwrap();
         let a_first = a.generate_keypair(KeyType::Ed25519).await.unwrap();
         let a_second = a.generate_keypair(KeyType::Ed25519).await.unwrap();
         let a_second_public = a.public_key(&a_second).await.unwrap();
 
         // `b` loads both entries under the same handle ids, destroys the first,
         // and writes a third key into the position that rewrite freed.
-        let b = FileKeyCustody::new(&path, "pw").unwrap();
+        let b = FileKeyCustody::open(&path, "pw", tokio::runtime::Handle::current())
+            .await
+            .unwrap();
         b.destroy_key(&a_first).await.unwrap();
         let b_fresh = b.generate_keypair(KeyType::Ed25519).await.unwrap();
         let b_fresh_public = b.public_key(&b_fresh).await.unwrap();
@@ -4442,7 +4653,11 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("keys.scp");
-        let custody = Arc::new(FileKeyCustody::new(&path, "pw").unwrap());
+        let custody = Arc::new(
+            FileKeyCustody::open(&path, "pw", tokio::runtime::Handle::current())
+                .await
+                .unwrap(),
+        );
 
         let held = lock_key_file_for_write(&path).unwrap();
 
@@ -4476,7 +4691,11 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("keys.scp");
-        let custody = Arc::new(FileKeyCustody::new(&path, "pw").unwrap());
+        let custody = Arc::new(
+            FileKeyCustody::open(&path, "pw", tokio::runtime::Handle::current())
+                .await
+                .unwrap(),
+        );
         let victim = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
 
         let held = lock_key_file_for_write(&path).unwrap();
@@ -4496,142 +4715,183 @@ mod tests {
             .expect("destroy_key must succeed once the lock is free");
     }
 
-    /// Each key-file write runs on the blocking pool, so a write waiting for
-    /// the key-file lock leaves the runtime's thread free for other tasks.
+    /// Every key operation runs its file work on the blocking pool of the
+    /// runtime custody was opened with, so none of it runs on the thread that
+    /// polls the operation's future.
     ///
-    /// The test runs on a `current_thread` runtime, takes the lock directly,
-    /// starts a write, and sleeps 300 ms on the runtime's one thread. Running
-    /// the write inline parks that thread in the lock wait until
-    /// `KEY_FILE_LOCK_WAIT` (10 s) runs out, so the sleep returns about 10 s
-    /// late and the elapsed-time assertion fails.
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_write_waiting_for_the_key_file_lock_leaves_the_runtime_thread_free() {
-        use std::sync::Arc;
+    /// Each operation runs under
+    /// [`crate::testing::blocking_pool::drive_while_the_blocking_pool_is_held`]:
+    /// with the pool's only thread held, an operation that hands its work to
+    /// the pool cannot finish, and one that runs it inline finishes on its
+    /// first poll. Reverting `with_key_file` or `mint_with_key_file` to run
+    /// `work` inline, or any one operation to lock the handle map and read the
+    /// file itself, fails that operation's assertion. Each operation must also
+    /// succeed once the pool is released, which shows it reached the file.
+    #[test]
+    fn every_key_operation_runs_on_the_blocking_pool() {
+        use crate::testing::blocking_pool::{
+            blocking_pool_of_one, drive_while_the_blocking_pool_is_held,
+        };
 
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("keys.scp");
-        let custody = Arc::new(FileKeyCustody::new(&path, "pw").unwrap());
-        let victim = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
-        let seed = Zeroizing::new([7u8; KEY_LEN]);
+        let runtime = blocking_pool_of_one().unwrap();
+        runtime.block_on(async {
+            let custody = FileKeyCustody::open(&path, "pw", tokio::runtime::Handle::current())
+                .await
+                .unwrap();
+            let identity = custody.generate_identity_keypair().await.unwrap();
+            let victim = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+            let seed = Zeroizing::new([7u8; KEY_LEN]);
 
-        let held = lock_key_file_for_write(&path).unwrap();
+            macro_rules! assert_on_pool {
+                ($name:literal, $call:expr) => {{
+                    let outcome = drive_while_the_blocking_pool_is_held($call, || ())
+                        .await
+                        .unwrap();
+                    assert!(
+                        !outcome.finished_while_held,
+                        "{} ran its key-file work on the thread polling it",
+                        $name
+                    );
+                    outcome.output.expect($name)
+                }};
+            }
 
-        let generating = Arc::clone(&custody);
-        let generate =
-            tokio::spawn(async move { generating.generate_keypair(KeyType::P256Signing).await });
-        let destroying = Arc::clone(&custody);
-        let destroy = tokio::spawn(async move { destroying.destroy_key(&victim).await });
-        let importing = Arc::clone(&custody);
-        let import = tokio::spawn(async move { importing.import_ed25519_signing_key(&seed).await });
-
-        let started = std::time::Instant::now();
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed < std::time::Duration::from_secs(3),
-            "a 300 ms sleep took {elapsed:?}: a key-file write held the runtime thread"
-        );
-        assert!(
-            !generate.is_finished(),
-            "generate must wait for the held lock"
-        );
-        assert!(
-            !destroy.is_finished(),
-            "destroy_key must wait for the held lock"
-        );
-        assert!(!import.is_finished(), "import must wait for the held lock");
-
-        drop(held);
-        let generated = generate.await.unwrap().unwrap();
-        destroy.await.unwrap().unwrap();
-        let imported = import.await.unwrap().unwrap();
-        custody.public_key(&generated).await.unwrap();
-        custody.public_key(&imported).await.unwrap();
+            let generated = assert_on_pool!(
+                "generate_keypair",
+                custody.generate_keypair(KeyType::Ed25519)
+            );
+            assert_on_pool!(
+                "import_ed25519_signing_key",
+                custody.import_ed25519_signing_key(&seed)
+            );
+            assert_on_pool!("public_key", custody.public_key(&generated));
+            assert_on_pool!("sign", custody.sign(&generated, b"message"));
+            assert_on_pool!(
+                "derive_pseudonym",
+                custody.derive_pseudonym(&identity, b"ctx")
+            );
+            assert_on_pool!("destroy_key", custody.destroy_key(&victim));
+        });
     }
 
-    /// `open` runs on the blocking pool, so an open waiting on a path another
-    /// process reserved leaves the runtime thread free.
+    /// An open runs on the blocking pool, so an open waiting on a path
+    /// another process reserved leaves the polling thread free.
     ///
-    /// A zero-byte file at the path makes `new` poll for up to 10 s while the
-    /// process that reserved it finishes writing. The test runs on a
-    /// `current_thread` runtime, starts an open over a zero-byte file, sleeps
-    /// 300 ms, and then deletes the file, which ends the poll with an error.
-    /// Run inline, the open parks the runtime's only thread for the whole
-    /// 10 s poll, so the sleep returns about 10 s late and the elapsed-time
-    /// assertion fails.
-    #[tokio::test(flavor = "current_thread")]
-    async fn an_open_waiting_on_a_reserved_path_leaves_the_runtime_thread_free() {
+    /// A zero-byte file at the path makes the open poll for up to 10 s while
+    /// the process that reserved it finishes writing. With the pool's only
+    /// thread held, the open cannot start; the observer then writes a header
+    /// of an unknown format version over the reservation, so the open, once
+    /// released, reads that header and fails at once. Reverting `open` to call
+    /// `open_blocking` inline makes it finish on its first poll, after the full
+    /// 10 s wait, with the "is empty" error, and fails `finished_while_held`.
+    #[test]
+    fn an_open_waiting_on_a_reserved_path_runs_on_the_blocking_pool() {
+        use crate::testing::blocking_pool::{
+            blocking_pool_of_one, drive_while_the_blocking_pool_is_held,
+        };
+
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("keys.scp");
         std::fs::write(&path, b"").unwrap();
 
-        let reserved = path.clone();
-        let opening = tokio::spawn(async move { FileKeyCustody::open(&reserved, "pw").await });
-
-        let started = std::time::Instant::now();
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        let elapsed = started.elapsed();
+        let runtime = blocking_pool_of_one().unwrap();
+        let outcome = runtime
+            .block_on(drive_while_the_blocking_pool_is_held(
+                FileKeyCustody::open(&path, "pw", runtime.handle().clone()),
+                || std::fs::write(&path, [FORMAT_VERSION.wrapping_add(1)]).unwrap(),
+            ))
+            .unwrap();
         assert!(
-            elapsed < std::time::Duration::from_secs(3),
-            "a 300 ms sleep took {elapsed:?}: the key-file open held the runtime thread"
+            !outcome.finished_while_held,
+            "the open ran on the thread polling it"
         );
-        assert!(
-            !opening.is_finished(),
-            "the open must still be waiting for the reserved file"
-        );
+        match outcome.output {
+            Err(PlatformError::CustodyError(msg)) => assert!(
+                msg.contains("unsupported key file version"),
+                "the open must read the header written while the pool was held: {msg}"
+            ),
+            other => panic!("expected the version refusal, got {other:?}"),
+        }
+    }
 
-        std::fs::remove_file(&path).unwrap();
-        let opened = opening.await.unwrap();
+    /// Starts `call`, polls it exactly once so it takes the handle-map lock
+    /// and hands its work to the blocking pool, and drops it.
+    async fn start_and_drop<F: Future>(call: F) {
+        let mut call = std::pin::pin!(call);
+        // `timeout` polls its future before it checks its deadline, so a zero
+        // timeout polls `call` exactly once.
         assert!(
-            matches!(opened, Err(PlatformError::CustodyError(_))),
-            "an open whose reserved file vanished must fail, got {opened:?}"
+            tokio::time::timeout(std::time::Duration::ZERO, &mut call)
+                .await
+                .is_err(),
+            "the call must still be waiting for the key-file lock this test holds"
         );
     }
 
-    /// A caller that drops a write's future cannot separate the file write
-    /// from the handle-map entry that records it: the blocking task owns the
-    /// handle-map lock and runs to completion.
+    /// A caller that drops a `generate_keypair` future leaves no key behind:
+    /// the entry the blocking task wrote is removed from the file and from the
+    /// handle map, because its handle never reached anyone who could use or
+    /// destroy it.
     ///
-    /// The test aborts a `generate_keypair` waiting for the key-file lock,
-    /// releases the lock, and checks that the key reached both the file (a
-    /// reopen finds it) and this object's handle map (`public_key` on the
-    /// reopened handle succeeds here too).
+    /// The test holds the key-file lock so the write cannot finish, polls a
+    /// generate once (the blocking task is then queued with the handle-map
+    /// lock), drops it, and releases the lock. The task writes its entry and
+    /// the undo removes it under the same handle-map lock, so a later
+    /// `handle_map.lock()` returns only after both. Deleting the undo from
+    /// `UndeliveredKey`'s `Drop` leaves one entry in both places and fails
+    /// both assertions.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn an_aborted_write_lands_in_both_the_file_and_the_handle_map() {
-        use std::sync::Arc;
-
+    async fn a_dropped_generate_leaves_no_key_in_the_file_or_the_handle_map() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("keys.scp");
-        let custody = Arc::new(FileKeyCustody::new(&path, "pw").unwrap());
-
-        let held = lock_key_file_for_write(&path).unwrap();
-        let generating = Arc::clone(&custody);
-        let task = tokio::spawn(async move { generating.generate_keypair(KeyType::Ed25519).await });
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        task.abort();
-        assert!(task.await.unwrap_err().is_cancelled());
-        drop(held);
-
-        // The next operation queues behind the aborted write's handle-map
-        // lock, so it observes the write's result.
-        let map_len = custody
-            .with_key_file(|_, map| Ok(map.entries.len()))
+        let custody = FileKeyCustody::open(&path, "pw", tokio::runtime::Handle::current())
             .await
             .unwrap();
-        assert_eq!(map_len, 1, "the aborted write must record its handle");
 
-        let reopened = FileKeyCustody::new(&path, "pw").unwrap();
-        let ids: Vec<u64> = reopened
-            .handle_map
-            .lock()
+        let held = lock_key_file_for_write(&path).unwrap();
+        start_and_drop(custody.generate_keypair(KeyType::Ed25519)).await;
+        drop(held);
+
+        assert!(
+            handles_of(&custody).await.is_empty(),
+            "a dropped generate must leave no handle"
+        );
+        let reopened = FileKeyCustody::open(&path, "pw", tokio::runtime::Handle::current())
             .await
-            .entries
-            .keys()
-            .copied()
-            .collect();
-        assert_eq!(ids.len(), 1, "the aborted write must reach the file");
-        let handle = KeyHandle::new(ids[0]);
-        custody.public_key(&handle).await.unwrap();
+            .unwrap();
+        assert!(
+            handles_of(&reopened).await.is_empty(),
+            "a dropped generate must leave no entry in the file"
+        );
+    }
+
+    /// A dropped import of a key the file already holds removes nothing: that
+    /// import wrote nothing, and the entry belongs to the earlier import whose
+    /// caller holds its handle.
+    ///
+    /// Marking a deduplicated import as `written` makes the undo destroy that
+    /// earlier entry, which fails the `public_key` read below.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_import_of_a_held_key_keeps_the_key() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("keys.scp");
+        let custody = FileKeyCustody::open(&path, "pw", tokio::runtime::Handle::current())
+            .await
+            .unwrap();
+        let seed = Zeroizing::new([9u8; KEY_LEN]);
+        let imported = custody.import_ed25519_signing_key(&seed).await.unwrap();
+
+        let held = lock_key_file_for_write(&path).unwrap();
+        start_and_drop(custody.import_ed25519_signing_key(&seed)).await;
+        drop(held);
+
+        assert_eq!(handles_of(&custody).await, vec![imported]);
+        custody
+            .public_key(&imported)
+            .await
+            .expect("the key the first import stored must survive a dropped duplicate import");
     }
 
     /// The P-256 group order `n`, big-endian: the smallest invalid scalar.
@@ -4645,7 +4905,9 @@ mod tests {
     async fn p256_keys_round_trip_with_type_bytes_3_and_4() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("keys.scp");
-        let custody = FileKeyCustody::new(&path, "pass").unwrap();
+        let custody = FileKeyCustody::open(&path, "pass", tokio::runtime::Handle::current())
+            .await
+            .unwrap();
         let sign_handle = custody
             .generate_keypair(KeyType::P256Signing)
             .await
@@ -4662,7 +4924,9 @@ mod tests {
         assert_eq!(data[HEADER_SIZE + ENTRY_SIZE], KEY_TYPE_P256_HPKE);
         assert_eq!((KEY_TYPE_P256_SIGNING, KEY_TYPE_P256_HPKE), (0x03, 0x04));
 
-        let custody = FileKeyCustody::new(&path, "pass").unwrap();
+        let custody = FileKeyCustody::open(&path, "pass", tokio::runtime::Handle::current())
+            .await
+            .unwrap();
         assert_eq!(custody.public_key(&sign_handle).await.unwrap(), sign_pub);
         assert_eq!(custody.public_key(&hpke_handle).await.unwrap(), hpke_pub);
 
@@ -4722,14 +4986,16 @@ mod tests {
         for version in [0x00u8, 0x01, 0x03, 0xFF] {
             let dir = TempDir::new().unwrap();
             let path = dir.path().join("keys.scp");
-            let custody = FileKeyCustody::new(&path, "pass").unwrap();
+            let custody = FileKeyCustody::open(&path, "pass", tokio::runtime::Handle::current())
+                .await
+                .unwrap();
             custody.generate_keypair(KeyType::Ed25519).await.unwrap();
             drop(custody);
             tamper_and_reseal(&path, "pass", |data| {
                 assert_eq!(data[0], FORMAT_VERSION);
                 data[0] = version;
             });
-            match FileKeyCustody::new(&path, "pass") {
+            match FileKeyCustody::open(&path, "pass", tokio::runtime::Handle::current()).await {
                 Err(PlatformError::CustodyError(m)) => {
                     assert!(m.contains("unsupported key file version"), "{m}");
                 }
@@ -4764,7 +5030,9 @@ mod tests {
     async fn identity_role_persists_and_is_authenticated() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("keys.scp");
-        let custody = FileKeyCustody::new(&path, "pass").unwrap();
+        let custody = FileKeyCustody::open(&path, "pass", tokio::runtime::Handle::current())
+            .await
+            .unwrap();
         let identity = custody.generate_identity_keypair().await.unwrap();
         let operational = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
         let imported = custody
@@ -4774,7 +5042,9 @@ mod tests {
         let first = custody.derive_pseudonym(&identity, b"ctx").await.unwrap();
         drop(custody);
 
-        let custody = FileKeyCustody::new(&path, "pass").unwrap();
+        let custody = FileKeyCustody::open(&path, "pass", tokio::runtime::Handle::current())
+            .await
+            .unwrap();
         let again = custody.derive_pseudonym(&identity, b"ctx").await.unwrap();
         assert_eq!(first, again);
         custody
@@ -4811,7 +5081,9 @@ mod tests {
         }
         drop(custody);
 
-        let custody = FileKeyCustody::new(&path, "pass").unwrap();
+        let custody = FileKeyCustody::open(&path, "pass", tokio::runtime::Handle::current())
+            .await
+            .unwrap();
         assert!(matches!(
             custody.derive_pseudonym(&operational, b"ctx").await,
             Err(PlatformError::CustodyError(_))
@@ -4831,7 +5103,9 @@ mod tests {
     async fn destroy_key_refuses_an_entry_whose_role_changed_under_the_handle() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("keys.scp");
-        let custody = FileKeyCustody::new(&path, "pass").unwrap();
+        let custody = FileKeyCustody::open(&path, "pass", tokio::runtime::Handle::current())
+            .await
+            .unwrap();
         let operational = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
         tamper_and_reseal(&path, "pass", |data| {
             let role = HEADER_SIZE + ENTRY_ROLE_IN_ENTRY;
@@ -4851,7 +5125,7 @@ mod tests {
 
     /// Asserts that opening the key file at `path` fails with `CustodyError`.
     fn assert_open_fails(path: &Path) {
-        match FileKeyCustody::new(path, "pass") {
+        match FileKeyCustody::open_blocking(path, "pass", tokio::runtime::Handle::current()) {
             Err(PlatformError::CustodyError(_)) => {}
             Err(other) => panic!("expected CustodyError, got {other:?}"),
             Ok(_) => panic!("a tampered key file must not open"),
@@ -4864,7 +5138,9 @@ mod tests {
     async fn replayed_destroyed_last_entry_fails_the_file_mac() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("keys.scp");
-        let custody = FileKeyCustody::new(&path, "pass").unwrap();
+        let custody = FileKeyCustody::open(&path, "pass", tokio::runtime::Handle::current())
+            .await
+            .unwrap();
         custody.generate_keypair(KeyType::Ed25519).await.unwrap();
         let last = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
         let before = std::fs::read(&path).unwrap();
@@ -4889,7 +5165,9 @@ mod tests {
     async fn trailing_bytes_fail_the_exact_length_check() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("keys.scp");
-        let custody = FileKeyCustody::new(&path, "pass").unwrap();
+        let custody = FileKeyCustody::open(&path, "pass", tokio::runtime::Handle::current())
+            .await
+            .unwrap();
         let a = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
         let mut data = std::fs::read(&path).unwrap();
         data.push(0);
@@ -4909,14 +5187,20 @@ mod tests {
             for scalar in [[0u8; 32], P256_ORDER, [0xFFu8; 32]] {
                 let dir = TempDir::new().unwrap();
                 let path = dir.path().join("keys.scp");
-                let custody = FileKeyCustody::new(&path, "pass").unwrap();
+                let custody =
+                    FileKeyCustody::open(&path, "pass", tokio::runtime::Handle::current())
+                        .await
+                        .unwrap();
                 let id = custody
                     .file
                     .append_entry(stored_type, KeyRole::Operational, &scalar)
                     .unwrap();
                 drop(custody);
 
-                let custody = FileKeyCustody::new(&path, "pass").unwrap();
+                let custody =
+                    FileKeyCustody::open(&path, "pass", tokio::runtime::Handle::current())
+                        .await
+                        .unwrap();
                 let handle = KeyHandle::new(handle_id_for(&id));
                 assert!(matches!(
                     custody.public_key(&handle).await,

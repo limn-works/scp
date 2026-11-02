@@ -686,7 +686,10 @@ const fn warn_on_permissive_data_dir(_data_dir: &Path) {}
 /// When `identity` is `None`, a node creates or reloads a persistent identity
 /// via [`FileKeyCustody`] backed by
 /// `<data_dir>/identity.key`. A `passphrase` argument is required in this
-/// mode, and no environment variable substitutes for it.
+/// mode, and no environment variable substitutes for it. `runtime` is the
+/// runtime whose blocking pool runs that custody's key-file work for the
+/// node's whole life (`FileKeyCustody::open`); a bridge passes the handle of
+/// its process-wide runtime.
 ///
 /// On first run, a new DID is generated and written to `storage`. On a later
 /// run against that same `storage` handle, a node reloads that same DID. A
@@ -712,6 +715,7 @@ pub async fn start_node_local<S>(
     storage: S,
     identity: Option<NodeIdentity>,
     passphrase: Option<zeroize::Zeroizing<String>>,
+    runtime: tokio::runtime::Handle,
 ) -> Result<scp_node::ApplicationNode<S>, ServerError>
 where
     S: EncryptedStorage + 'static,
@@ -791,8 +795,9 @@ where
         // The open runs an Argon2id derivation (64 MiB, three passes) and can
         // wait up to 10 s on a file another process is creating (spec §17.8);
         // `FileKeyCustody::open` runs it on the blocking pool.
-        let key_custody =
-            Arc::new(scp_platform::file::FileKeyCustody::open(&key_path, &passphrase).await?);
+        let key_custody = Arc::new(
+            scp_platform::file::FileKeyCustody::open(&key_path, &passphrase, runtime).await?,
+        );
 
         // Build the node's DHT client for its DID method: the in-memory
         // §17.17.3 double, because this body compiles only under `testing`, so
@@ -1860,6 +1865,7 @@ mod tests {
             instance_in_memory_storage(),
             None,
             Some(test_passphrase()),
+            tokio::runtime::Handle::current(),
         )
         .await
         .unwrap();
@@ -1903,9 +1909,15 @@ mod tests {
         let storage = instance_in_memory_storage();
 
         // A caller keeps its own clone — exactly what a bridge instance does.
-        let node = start_node_local(&tmp, Arc::clone(&storage), None, Some(test_passphrase()))
-            .await
-            .unwrap();
+        let node = start_node_local(
+            &tmp,
+            Arc::clone(&storage),
+            None,
+            Some(test_passphrase()),
+            tokio::runtime::Handle::current(),
+        )
+        .await
+        .unwrap();
 
         let keys = storage.list_keys("").await.unwrap();
         assert!(
@@ -1942,6 +1954,7 @@ mod tests {
             instance_in_memory_storage(),
             None,
             Some(test_passphrase()),
+            tokio::runtime::Handle::current(),
         )
         .await
         .expect("a stale plaintext store must not block startup");
@@ -1975,9 +1988,15 @@ mod tests {
         // First run — writes an identity into a caller's SQLCipher database.
         {
             let storage = instance_sqlite_storage(&db_dir);
-            let node = start_node_local(&tmp, Arc::clone(&storage), None, Some(test_passphrase()))
-                .await
-                .unwrap();
+            let node = start_node_local(
+                &tmp,
+                Arc::clone(&storage),
+                None,
+                Some(test_passphrase()),
+                tokio::runtime::Handle::current(),
+            )
+            .await
+            .unwrap();
             assert!(tmp.join("blobs.redb").exists());
             assert!(tmp.join("identity.key").exists());
             first_did = node.identity().did().to_owned();
@@ -1995,9 +2014,15 @@ mod tests {
         // Second run — reopens that same database and reloads that same DID.
         {
             let storage = instance_sqlite_storage(&db_dir);
-            let node = start_node_local(&tmp, Arc::clone(&storage), None, Some(test_passphrase()))
-                .await
-                .unwrap();
+            let node = start_node_local(
+                &tmp,
+                Arc::clone(&storage),
+                None,
+                Some(test_passphrase()),
+                tokio::runtime::Handle::current(),
+            )
+            .await
+            .unwrap();
             assert_eq!(
                 node.identity().did(),
                 first_did,
@@ -2101,9 +2126,15 @@ mod tests {
         let storage = instance_sqlite_storage(&db_dir);
         let instance = Arc::new(StorageOwningInstance::new(Arc::clone(&storage)));
 
-        let node = start_node_local(&tmp, Arc::clone(&storage), None, Some(test_passphrase()))
-            .await
-            .unwrap();
+        let node = start_node_local(
+            &tmp,
+            Arc::clone(&storage),
+            None,
+            Some(test_passphrase()),
+            tokio::runtime::Handle::current(),
+        )
+        .await
+        .unwrap();
         let node = register_node(instance.core(), RunningNode::Sqlite(node));
         instance.observe(&node);
         assert!(
@@ -2144,9 +2175,15 @@ mod tests {
         let storage = instance_sqlite_storage(&db_dir);
         let instance = Arc::new(StorageOwningInstance::new(Arc::clone(&storage)));
 
-        let node = start_node_local(&tmp, Arc::clone(&storage), None, Some(test_passphrase()))
-            .await
-            .unwrap();
+        let node = start_node_local(
+            &tmp,
+            Arc::clone(&storage),
+            None,
+            Some(test_passphrase()),
+            tokio::runtime::Handle::current(),
+        )
+        .await
+        .unwrap();
         let node = register_node(instance.core(), RunningNode::Sqlite(node));
         instance.observe(&node);
 
@@ -2265,6 +2302,7 @@ mod tests {
             instance_in_memory_storage(),
             None,
             Some(test_passphrase()),
+            tokio::runtime::Handle::current(),
         )
         .await
         .unwrap();
@@ -2289,9 +2327,15 @@ mod tests {
         let db_dir = tmp.join("db");
         std::fs::create_dir_all(&db_dir).unwrap();
         let storage = instance_sqlite_storage(&db_dir);
-        let node = start_node_local(&tmp, Arc::clone(&storage), None, Some(test_passphrase()))
-            .await
-            .unwrap();
+        let node = start_node_local(
+            &tmp,
+            Arc::clone(&storage),
+            None,
+            Some(test_passphrase()),
+            tokio::runtime::Handle::current(),
+        )
+        .await
+        .unwrap();
         let running = RunningNode::Sqlite(node);
         assert_running_node_backends_are_encrypted(&running);
         assert!(
@@ -2477,9 +2521,15 @@ mod tests {
 
         let tmp = temp_dir_for("node-local-id");
         // No passphrase needed when passing a pre-existing identity.
-        let node = start_node_local(&tmp, instance_in_memory_storage(), Some(test_id), None)
-            .await
-            .unwrap();
+        let node = start_node_local(
+            &tmp,
+            instance_in_memory_storage(),
+            Some(test_id),
+            None,
+            tokio::runtime::Handle::current(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             node.identity().did(),
@@ -2517,7 +2567,14 @@ mod tests {
     #[tokio::test]
     async fn node_local_without_identity_requires_passphrase() {
         let tmp = temp_dir_for("node-no-pass");
-        let result = start_node_local(&tmp, instance_in_memory_storage(), None, None).await;
+        let result = start_node_local(
+            &tmp,
+            instance_in_memory_storage(),
+            None,
+            None,
+            tokio::runtime::Handle::current(),
+        )
+        .await;
 
         let err = result.err().expect("should fail without passphrase");
         assert!(
@@ -2545,6 +2602,7 @@ mod tests {
             instance_in_memory_storage(),
             None,
             Some(zeroize::Zeroizing::new(String::new())),
+            tokio::runtime::Handle::current(),
         )
         .await;
         let created = tmp.exists();
@@ -2562,7 +2620,7 @@ mod tests {
         );
     }
 
-    /// `FileKeyCustody::new` runs its Argon2id derivation on the blocking
+    /// `FileKeyCustody::open` runs its Argon2id derivation on the blocking
     /// pool. With one worker thread, a derivation run inline would stall a
     /// sibling task for the whole derivation; the sibling's longest stall must
     /// stay under half of one derivation measured on this machine and build.
@@ -2574,7 +2632,12 @@ mod tests {
         let probe = temp_dir_for("custody-cost");
         std::fs::create_dir_all(&probe).expect("probe dir");
         let started = Instant::now();
-        let probe_custody = FileKeyCustody::new(&probe.join("identity.key"), "probe-passphrase");
+        let probe_custody = FileKeyCustody::open(
+            &probe.join("identity.key"),
+            "probe-passphrase",
+            tokio::runtime::Handle::current(),
+        )
+        .await;
         let derivation = started.elapsed();
         drop(probe_custody.expect("probe custody opens"));
         let _ = std::fs::remove_dir_all(&probe);
@@ -2601,6 +2664,7 @@ mod tests {
                 instance_in_memory_storage(),
                 None,
                 Some(zeroize::Zeroizing::new("blocking-pool-pass".to_owned())),
+                tokio::runtime::Handle::current(),
             )
             .await
         })
@@ -2615,8 +2679,91 @@ mod tests {
         assert!(
             longest < derivation / 2,
             "a sibling task stalled {longest:?}, against {derivation:?} for one derivation; \
-             FileKeyCustody::new ran on the worker thread"
+             FileKeyCustody::open ran on the worker thread"
         );
+    }
+
+    /// `start_relay_local` creates its data directory on the blocking pool.
+    ///
+    /// The start runs under
+    /// `scp_platform::testing::blocking_pool::drive_while_the_blocking_pool_is_held`,
+    /// whose observer checks the data directory while the pool's only thread
+    /// is held. Creating the directory inline (`create_private_dir` called
+    /// without `on_blocking_pool`, or `on_blocking_pool` running its work
+    /// directly) makes it exist then and fails `!observed`. A not-finished
+    /// check alone cannot catch that revert, because the redb open that
+    /// follows still waits for the pool.
+    #[test]
+    fn relay_local_creates_its_data_directory_on_the_blocking_pool() {
+        use scp_platform::testing::blocking_pool::{
+            blocking_pool_of_one, drive_while_the_blocking_pool_is_held,
+        };
+
+        let base = tempfile::tempdir().expect("create a temporary directory");
+        let data_dir = base.path().join("relay-data");
+        let runtime = blocking_pool_of_one().expect("build the probe runtime");
+        let outcome = runtime
+            .block_on(drive_while_the_blocking_pool_is_held(
+                start_relay_local(&data_dir),
+                || data_dir.exists(),
+            ))
+            .expect("run the probe");
+        assert!(
+            !outcome.finished_while_held,
+            "the relay started while the blocking pool was held"
+        );
+        assert!(
+            !outcome.observed,
+            "{} was created on the thread polling the start",
+            data_dir.display()
+        );
+        let relay = outcome
+            .output
+            .expect("the relay starts once the pool is free");
+        assert!(data_dir.join("blobs.redb").is_file());
+        relay.shutdown();
+    }
+
+    /// `node_start` creates a redb blob file's missing parent directory on
+    /// the blocking pool. The observer checks that parent while the pool's
+    /// only thread is held; `create_blob_parent` run inline makes it exist
+    /// then and fails `!observed`.
+    #[test]
+    fn node_start_creates_the_blob_parent_on_the_blocking_pool() {
+        use scp_platform::testing::blocking_pool::{
+            blocking_pool_of_one, drive_while_the_blocking_pool_is_held,
+        };
+
+        let base = tempfile::tempdir().expect("create a temporary directory");
+        let blob_parent = base.path().join("missing").join("blobs");
+        let blob_path = blob_parent.join("blobs.redb");
+        let runtime = blocking_pool_of_one().expect("build the probe runtime");
+        let identity = runtime.block_on(create_test_identity());
+        let config = local_start_config(&identity.identity.did, &blob_path);
+        let outcome = runtime
+            .block_on(drive_while_the_blocking_pool_is_held(
+                node_start(
+                    config,
+                    identity,
+                    InstanceStorage::InMemoryEncrypted(instance_in_memory_storage()),
+                ),
+                || blob_parent.exists(),
+            ))
+            .expect("run the probe");
+        assert!(
+            !outcome.finished_while_held,
+            "the node started while the blocking pool was held"
+        );
+        assert!(
+            !outcome.observed,
+            "{} was created on the thread polling the start",
+            blob_parent.display()
+        );
+        let node = outcome
+            .output
+            .expect("the node starts once the pool is free");
+        assert!(blob_path.is_file(), "the redb blob file is created");
+        node.shutdown();
     }
 
     // -----------------------------------------------------------------------

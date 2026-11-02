@@ -394,7 +394,7 @@ async fn run_relay_only() {
     // A relay-only node is a standalone relay, so its operator selects push
     // exactly as an scp-relay operator does (PUSH-012). Read before the blob
     // store opens, so a refusal leaves no blob store behind.
-    let push = or_exit(startup::push_selection_from_env());
+    let push = or_exit(startup::push_selection_from_env().await);
     config.push = or_exit(startup::push_role_from(push).await);
     startup::log_push_role(&config.push);
 
@@ -608,7 +608,7 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
     // credential exits before the storage directory exists (PUSH-012, spec
     // §17.17.1 SCP-CAPSEL-8000). The store is the node's own, so a set store
     // variable exits here too (SCP-CAPSEL-8001).
-    let push_senders = or_exit(startup::push_senders_from_env());
+    let push_senders = or_exit(startup::push_senders_from_env().await);
     let domain = require_domain();
     let http_addr = node_http_addr();
 

@@ -1274,11 +1274,14 @@ impl CustodySelection {
                 NapiKeyCustody::InMemory(Box::new(OpaqueInMemoryKeyCustody(in_memory)))
             }
             // `FileCustodyInputs::open` runs the directory creation and the
-            // Argon2id derivation on tokio's blocking pool, so this async
-            // caller's worker thread stays free while they run.
-            Self::EncryptedFile(inputs) => {
-                NapiKeyCustody::File(inputs.open().await.map_err(|e| ScpNapiError::from(&e))?)
-            }
+            // Argon2id derivation on the process runtime's blocking pool, so
+            // this async caller's worker thread stays free while they run.
+            Self::EncryptedFile(inputs) => NapiKeyCustody::File(
+                inputs
+                    .open(crate::runtime().handle().clone())
+                    .await
+                    .map_err(|e| ScpNapiError::from(&e))?,
+            ),
             Self::OsKeystore(custody) => custody,
         };
         Ok(std::sync::Arc::new(custody))

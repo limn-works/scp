@@ -1013,10 +1013,17 @@ fn open_custody_for_create(
             })
         }
         CustodySelection::EncryptedFile(inputs) => {
-            // The open runs its Argon2id derivation on tokio's blocking pool,
-            // and this thread releases the GIL while it waits, so other
-            // Python threads keep running for those seconds.
-            let file_kc = crate::actor_wait::block_on_released(py, inputs.open())?
+            // The open runs its Argon2id derivation on the process runtime's
+            // blocking pool, and this thread releases the GIL while it waits,
+            // so other Python threads keep running for those seconds. Every
+            // failure of this arm is `SCP-IDENT-1008`, including a missing
+            // runtime and a wait that could not run.
+            let runtime = crate::runtime()
+                .map_err(|e| file_custody_runtime_error(&e.to_string()))?
+                .handle()
+                .clone();
+            let file_kc = crate::actor_wait::block_on_released(py, inputs.open(runtime))
+                .map_err(|e| file_custody_runtime_error(&e.to_string()))?
                 .map_err(|e| file_custody_error(&e))?;
             Ok(CreateCustody {
                 custody: Arc::new(FfiKeyCustody::File(file_kc)),
@@ -1303,6 +1310,16 @@ fn file_custody_error(error: &scp_ffi_common::custody_file::FileCustodyError) ->
             scp_ffi_common::error_codes::IDENT_1008,
         ),
     }
+}
+
+/// `SCP-IDENT-1008` for an `encrypted_file` open that could not run: the
+/// process runtime is missing, or the wait on the open failed.
+#[cfg(feature = "testing")]
+fn file_custody_runtime_error(detail: &str) -> ScpPyError {
+    ScpPyError::identity_with_code(
+        format!("the encrypted key file open could not run: {detail}"),
+        scp_ffi_common::error_codes::IDENT_1008,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -3734,6 +3751,43 @@ mod custody_request_tests {
     #[cfg(not(feature = "testing"))]
     fn label(created: CreateCustody) -> String {
         match created {}
+    }
+
+    /// An `encrypted_file` selection opens through the process runtime and
+    /// creates `keys.bin` under the selected home. Before the open took the
+    /// runtime handle, this path awaited the open inside `block_on_released`
+    /// with no test; reverting the open to a no-op leaves no key file and
+    /// fails here.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn open_custody_for_create_opens_an_encrypted_file_selection() -> Result<(), String> {
+        pyo3::prepare_freethreaded_python();
+        crate::init_runtime().map_err(|e| format!("init the runtime: {e}"))?;
+        let base = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
+        let home = base.path().join("home");
+        let inputs = scp_ffi_common::custody_file::resolve_file_custody_inputs_from(
+            Some(zeroize::Zeroizing::new(
+                "encrypted-file-open-pass".to_owned(),
+            )),
+            Some(home.as_os_str()),
+        )
+        .map_err(|e| format!("{e:?}"))?;
+        let key_path = inputs.key_path();
+        let created = Python::with_gil(|py| {
+            open_custody_for_create(
+                py,
+                CustodySelection::EncryptedFile(inputs),
+                &PyBridgeInstance::new_py(),
+            )
+        })
+        .map_err(|e| format!("{e:?}"))?;
+        assert_eq!(created.request, "encrypted_file");
+        assert!(
+            key_path.is_file(),
+            "the open must create {}",
+            key_path.display()
+        );
+        Ok(())
     }
 
     /// Decision D2 (SCP-345): `os_keystore` on a bridge with no storage is

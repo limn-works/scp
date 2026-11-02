@@ -2330,7 +2330,10 @@ class SleepyAgreeCustody(P256Custody):
     async fn ffi_custody_file_generates_and_signs() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("test_keys.bin");
-        let file_kc = FileKeyCustody::new(&path, "test-passphrase").expect("FileKeyCustody::new");
+        let file_kc =
+            FileKeyCustody::open(&path, "test-passphrase", tokio::runtime::Handle::current())
+                .await
+                .expect("FileKeyCustody::open");
         let custody = FfiKeyCustody::File(file_kc);
         let handle = custody
             .generate_keypair(KeyType::Ed25519)
@@ -2344,7 +2347,10 @@ class SleepyAgreeCustody(P256Custody):
     async fn ffi_custody_file_custody_type_is_software() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("test_keys_type.bin");
-        let file_kc = FileKeyCustody::new(&path, "test-passphrase").expect("FileKeyCustody::new");
+        let file_kc =
+            FileKeyCustody::open(&path, "test-passphrase", tokio::runtime::Handle::current())
+                .await
+                .expect("FileKeyCustody::open");
         let custody = FfiKeyCustody::File(file_kc);
         let handle = custody
             .generate_keypair(KeyType::Ed25519)
@@ -2368,7 +2374,9 @@ class SleepyAgreeCustody(P256Custody):
     async fn ffi_custody_file_dh_agree_succeeds() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("test_keys_dh.bin");
-        let file_kc = FileKeyCustody::new(&path, "passphrase").expect("FileKeyCustody::new");
+        let file_kc = FileKeyCustody::open(&path, "passphrase", tokio::runtime::Handle::current())
+            .await
+            .expect("FileKeyCustody::open");
         let custody = FfiKeyCustody::File(file_kc);
 
         let handle_a = custody
@@ -2393,7 +2401,9 @@ class SleepyAgreeCustody(P256Custody):
     async fn ffi_custody_file_destroy_key_prevents_sign() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("test_keys_destroy.bin");
-        let file_kc = FileKeyCustody::new(&path, "passphrase").expect("FileKeyCustody::new");
+        let file_kc = FileKeyCustody::open(&path, "passphrase", tokio::runtime::Handle::current())
+            .await
+            .expect("FileKeyCustody::open");
         let custody = FfiKeyCustody::File(file_kc);
 
         let handle = custody

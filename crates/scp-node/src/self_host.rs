@@ -2310,24 +2310,45 @@ fn validate_storage_path_blocking(dir: &Path) -> Result<(), HostSiteError> {
 /// [`Zeroizing`](zeroize::Zeroizing). The key-file work runs on tokio's
 /// blocking pool.
 ///
+/// A generated key reaches `.key` through
+/// [`scp_platform::durable_file::create`]: a synced temporary file linked to
+/// the final name, then a directory sync. So the key is durable before any
+/// database is written under it, and a crash leaves either no `.key` or the
+/// whole key, never an empty or partial file that would strand the databases.
+/// When another process published `.key` first, its key is read back and
+/// returned.
+///
 /// # Errors
 ///
 /// Returns [`HostSiteError::StorageKey`] if the env key is invalid, the key file
 /// has the wrong length, or the file cannot be read/created/written.
 pub async fn resolve_storage_key(storage_dir: &Path) -> Result<Zeroizing<[u8; 32]>, HostSiteError> {
+    let env_key = std::env::var("SCP_STORAGE_KEY").ok().map(Zeroizing::new);
+    resolve_storage_key_from(storage_dir, env_key).await
+}
+
+/// [`resolve_storage_key`] with the `SCP_STORAGE_KEY` value passed in, so a
+/// test does not read the ambient environment.
+async fn resolve_storage_key_from(
+    storage_dir: &Path,
+    env_key: Option<Zeroizing<String>>,
+) -> Result<Zeroizing<[u8; 32]>, HostSiteError> {
     let storage_dir = storage_dir.to_path_buf();
     on_blocking_pool(
-        move || resolve_storage_key_blocking(&storage_dir),
+        move || resolve_storage_key_blocking(&storage_dir, env_key.as_deref().map(String::as_str)),
         HostSiteError::StorageKey,
     )
     .await
 }
 
 /// The body of [`resolve_storage_key`], which blocks on the key file.
-fn resolve_storage_key_blocking(storage_dir: &Path) -> Result<Zeroizing<[u8; 32]>, HostSiteError> {
+fn resolve_storage_key_blocking(
+    storage_dir: &Path,
+    env_key: Option<&str>,
+) -> Result<Zeroizing<[u8; 32]>, HostSiteError> {
     // Env var first.
-    if let Ok(hex_key) = std::env::var("SCP_STORAGE_KEY") {
-        let bytes = Zeroizing::new(hex::decode(&hex_key).map_err(|e| {
+    if let Some(hex_key) = env_key {
+        let bytes = Zeroizing::new(hex::decode(hex_key).map_err(|e| {
             HostSiteError::StorageKey(format!("SCP_STORAGE_KEY is not valid hex: {e}"))
         })?);
         if bytes.len() != 32 {
@@ -2344,64 +2365,40 @@ fn resolve_storage_key_blocking(storage_dir: &Path) -> Result<Zeroizing<[u8; 32]
     // Existing key file.
     let key_file = storage_dir.join(".key");
     if key_file.exists() {
-        let data = Zeroizing::new(std::fs::read(&key_file).map_err(|e| {
-            HostSiteError::StorageKey(format!(
-                "failed to read key file {}: {e}",
-                key_file.display()
-            ))
-        })?);
-        if data.len() != 32 {
-            return Err(HostSiteError::StorageKey(format!(
-                "key file {} has invalid length {} (expected 32)",
-                key_file.display(),
-                data.len()
-            )));
-        }
-        let mut key = Zeroizing::new([0u8; 32]);
-        key.copy_from_slice(&data);
-        return Ok(key);
+        return read_storage_key_file(&key_file);
     }
 
-    // Generate a new key and persist it.
+    // Generate a new key and publish it durably before any store uses it.
     std::fs::create_dir_all(storage_dir).map_err(|e| {
         HostSiteError::StorageKey(format!("failed to create storage directory: {e}"))
     })?;
     let mut key = Zeroizing::new([0u8; 32]);
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut *key);
-
-    // On Unix, create the key file with mode 0600 atomically (no TOCTOU window).
-    #[cfg(unix)]
+    match scp_platform::durable_file::create(&key_file, &*key)
+        .map_err(|e| HostSiteError::StorageKey(format!("key file: {e}")))?
     {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&key_file)
-            .map_err(|e| {
-                HostSiteError::StorageKey(format!(
-                    "failed to create key file {}: {e}",
-                    key_file.display()
-                ))
-            })?;
-        file.write_all(&*key).map_err(|e| {
-            HostSiteError::StorageKey(format!(
-                "failed to write key file {}: {e}",
-                key_file.display()
-            ))
-        })?;
+        scp_platform::durable_file::Created::Written => Ok(key),
+        scp_platform::durable_file::Created::AlreadyPresent => read_storage_key_file(&key_file),
     }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(&key_file, &*key).map_err(|e| {
-            HostSiteError::StorageKey(format!(
-                "failed to write key file {}: {e}",
-                key_file.display()
-            ))
-        })?;
-    }
+}
 
+/// Reads a 32-byte storage key from `key_file`.
+fn read_storage_key_file(key_file: &Path) -> Result<Zeroizing<[u8; 32]>, HostSiteError> {
+    let data = Zeroizing::new(std::fs::read(key_file).map_err(|e| {
+        HostSiteError::StorageKey(format!(
+            "failed to read key file {}: {e}",
+            key_file.display()
+        ))
+    })?);
+    if data.len() != 32 {
+        return Err(HostSiteError::StorageKey(format!(
+            "key file {} has invalid length {} (expected 32)",
+            key_file.display(),
+            data.len()
+        )));
+    }
+    let mut key = Zeroizing::new([0u8; 32]);
+    key.copy_from_slice(&data);
     Ok(key)
 }
 
@@ -3277,39 +3274,15 @@ mod tests {
         );
     }
 
-    /// Runs `site` on a runtime whose one blocking-pool thread another task
-    /// holds, and returns whether `site` finished within 300 ms.
-    ///
-    /// A start-path helper that runs its file work on the blocking pool
-    /// queues behind the held thread and cannot finish; one that runs the
-    /// work inline on the runtime thread finishes at once. The held thread is
-    /// released before the runtime shuts down, and the site's result is
-    /// returned so the caller can check it succeeded.
+    /// Whether `site` finished while the blocking pool's only thread was held,
+    /// and its result, from the shared probe in
+    /// `scp_platform::testing::blocking_pool`.
     fn finishes_while_the_blocking_pool_is_held<T, F>(site: F) -> (bool, T)
     where
         F: std::future::Future<Output = T>,
     {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .max_blocking_threads(1)
-            .build()
-            .expect("build runtime");
-        runtime.block_on(async {
-            let (release, held) = std::sync::mpsc::channel::<()>();
-            let holder = tokio::task::spawn_blocking(move || held.recv());
-            tokio::pin!(site);
-            let early =
-                tokio::time::timeout(std::time::Duration::from_millis(300), &mut site).await;
-            release.send(()).expect("release the held blocking thread");
-            holder
-                .await
-                .expect("the holder task completes")
-                .expect("the holder receives the release");
-            match early {
-                Ok(out) => (true, out),
-                Err(_) => (false, site.await),
-            }
-        })
+        scp_platform::testing::blocking_pool::finishes_while_the_blocking_pool_is_held(site)
+            .expect("run the blocking-pool probe")
     }
 
     /// Each blocking step `host_site_until` and the `scp-node` binary run
@@ -3331,7 +3304,10 @@ mod tests {
         result.expect("validate the storage path");
         assert!(!early, "validate_storage_path ran on the runtime thread");
 
-        let (early, key) = finishes_while_the_blocking_pool_is_held(resolve_storage_key(&storage));
+        // The ambient `SCP_STORAGE_KEY` is not read, so a value in the
+        // developer's shell cannot fail this step for the wrong reason.
+        let (early, key) =
+            finishes_while_the_blocking_pool_is_held(resolve_storage_key_from(&storage, None));
         let key = key.expect("resolve the storage key");
         assert!(!early, "resolve_storage_key ran on the runtime thread");
 
@@ -3350,6 +3326,49 @@ mod tests {
             !early,
             "load_self_host_assets read the site on the runtime thread"
         );
+    }
+
+    /// A generated storage key is published whole under `.key` and leaves no
+    /// temporary file behind, and a second resolution reads the same key
+    /// back. A writer that left its temporary file, or published fewer than
+    /// 32 bytes, fails here. The ordering this test cannot observe (the key
+    /// synced to disk before any store is written under it) is carried by
+    /// `scp_platform::durable_file::create`, whose own tests cover it.
+    #[tokio::test]
+    async fn a_generated_storage_key_is_published_whole_with_no_temporary() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let storage = tmp.path().join("storage");
+
+        let key = resolve_storage_key_from(&storage, None)
+            .await
+            .expect("generate the storage key");
+        let on_disk = std::fs::read(storage.join(".key")).expect("read .key");
+        assert_eq!(on_disk.as_slice(), &key[..], ".key holds the returned key");
+        let names: Vec<String> = std::fs::read_dir(&storage)
+            .expect("list the storage directory")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(names, vec![".key".to_owned()], "no temporary file remains");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(storage.join(".key"))
+                .expect("stat .key")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, ".key is owner-only");
+        }
+
+        let again = resolve_storage_key_from(&storage, None)
+            .await
+            .expect("read the storage key back");
+        assert_eq!(&again[..], &key[..], "a second start reads the same key");
     }
 
     /// A setup drain that times out or fails reaches the caller as the typed

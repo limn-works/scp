@@ -972,6 +972,14 @@ pub enum PushStartupError {
         /// Why the file is refused.
         reason: &'static str,
     },
+    /// The blocking task that reads the push variables and credential files
+    /// panicked, or the runtime shut down under it. Nothing starts without
+    /// the selection it was reading (SCP-CAPSEL-8001).
+    #[error("the task reading the push configuration failed: {reason} (SCP-CAPSEL-8001)")]
+    LoadTask {
+        /// The task's failure.
+        reason: String,
+    },
     /// A sender refused a configured value (spec §10.7.1 step 5).
     #[error("the {platform} push sender refused its configuration: {error}")]
     Sender {
@@ -1119,6 +1127,7 @@ impl PushStartupError {
             | Self::CredentialUnreadable { .. }
             | Self::CredentialPermissions { .. }
             | Self::CredentialFile { .. }
+            | Self::LoadTask { .. }
             | Self::Sender { .. }
             | Self::StoreOpen { .. }
             | Self::ServiceStart { .. }
@@ -1189,13 +1198,44 @@ pub enum PushSelection {
 /// others. Key bytes are read into zeroizing buffers. This function opens no
 /// store and makes no network request, so a refusal leaves nothing behind.
 ///
+/// The environment and every credential file are read on tokio's blocking
+/// pool, so the reads never stall the caller's worker thread.
+///
 /// # Errors
 ///
 /// [`StartupError::Push`] carrying the [`PushStartupError`] variant for the
-/// first missing or invalid value, and [`StartupError::InvalidValue`] for a
-/// value that is not UTF-8.
-pub fn push_selection_from_env() -> Result<PushSelection, StartupError> {
-    push_selection_from(&|var| env::var_os(var))
+/// first missing or invalid value, [`StartupError::InvalidValue`] for a
+/// value that is not UTF-8, and [`PushStartupError::LoadTask`] when the
+/// blocking task did not finish.
+pub async fn push_selection_from_env() -> Result<PushSelection, StartupError> {
+    push_selection_on_blocking_pool(env::var_os).await
+}
+
+/// Runs [`push_selection_from`] over `lookup` on tokio's blocking pool.
+async fn push_selection_on_blocking_pool(
+    lookup: impl Fn(&'static str) -> Option<OsString> + Send + 'static,
+) -> Result<PushSelection, StartupError> {
+    load_push_on_blocking_pool(move || push_selection_from(&lookup)).await
+}
+
+/// Runs `load`, which reads push variables and credential files, on tokio's
+/// blocking pool. A credential read is synchronous file I/O, so no async
+/// caller reaches it except through this function.
+///
+/// # Errors
+///
+/// Returns whatever `load` returns, and [`PushStartupError::LoadTask`] when
+/// the blocking task panicked or the runtime shut down under it.
+async fn load_push_on_blocking_pool<T, F>(load: F) -> Result<T, StartupError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, StartupError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(load)
+        .await
+        .map_err(|e| PushStartupError::LoadTask {
+            reason: e.to_string(),
+        })?
 }
 
 /// The two platforms `scp-relay` and `scp-node --relay-only` can serve. It
@@ -1374,11 +1414,23 @@ pub struct NodePushSenders {
 /// - [`PushStartupError::VapidKeyIsApnsKey`] when the VAPID key is the APNs
 ///   key.
 /// - As [`push_selection_from_env`], less the store variants:
-///   [`StartupError::Push`] for the first missing or invalid value, and
-///   [`StartupError::InvalidValue`] for a value that is not UTF-8.
+///   [`StartupError::Push`] for the first missing or invalid value,
+///   [`StartupError::InvalidValue`] for a value that is not UTF-8, and
+///   [`PushStartupError::LoadTask`] when the blocking task did not finish.
+///
+/// Like [`push_selection_from_env`], it reads the environment and every
+/// credential file on tokio's blocking pool.
 #[cfg(any(test, feature = "webpush"))]
-pub fn push_senders_from_env() -> Result<PushSenderSelection, StartupError> {
-    push_senders_from(&|var| env::var_os(var))
+pub async fn push_senders_from_env() -> Result<PushSenderSelection, StartupError> {
+    push_senders_on_blocking_pool(env::var_os).await
+}
+
+/// Runs [`push_senders_from`] over `lookup` on tokio's blocking pool.
+#[cfg(any(test, feature = "webpush"))]
+async fn push_senders_on_blocking_pool(
+    lookup: impl Fn(&'static str) -> Option<OsString> + Send + 'static,
+) -> Result<PushSenderSelection, StartupError> {
+    load_push_on_blocking_pool(move || push_senders_from(&lookup)).await
 }
 
 /// Reads the platform list and senders through `lookup`.
@@ -1777,13 +1829,21 @@ fn check_owner_only(
 ///   schema cannot be applied. Nothing falls back to another store
 ///   (SCP-CAPSEL-8001).
 /// - [`PushStartupError::ServiceStart`] when the push service cannot start,
-///   which includes a call outside a tokio runtime: the service's lookup and
-///   drains run on the caller's runtime.
+///   which includes a call outside a tokio runtime: the store opens on the
+///   runtime's blocking pool and the service's lookup and drains run on the
+///   caller's runtime, so an enabled selection polled outside one is refused
+///   with [`PushRoleError::NoRuntime`] before the store opens.
 pub async fn push_role_from(selection: PushSelection) -> Result<PushRole, StartupError> {
     let PushBackends { store, senders } = match selection {
         PushSelection::Disabled => return Ok(PushRole::Disabled),
         PushSelection::Enabled(backends) => *backends,
     };
+    if tokio::runtime::Handle::try_current().is_err() {
+        return Err(PushStartupError::ServiceStart {
+            error: PushRoleError::NoRuntime,
+        }
+        .into());
+    }
     let store = match store {
         PushStoreChoice::Sqlite { path } => {
             match PushRegistrationStore::open_sqlite(&path, PushStoreAtRest::Unkeyed).await {
@@ -1848,7 +1908,7 @@ pub async fn start_relay_from_env(
         "starting relay"
     );
 
-    config.push = push_role_from(push_selection_from_env()?).await?;
+    config.push = push_role_from(push_selection_from_env().await?).await?;
     log_push_role(&config.push);
 
     let storage = Arc::new(storage_from_env(backend).await?);
@@ -2313,7 +2373,8 @@ mod push_tests {
         PushPlatforms, PushSelection, PushSenderSelection, PushStartupError, PushStoreChoice,
         RELAY_PUSH_PLATFORM_VALUES, StartupError, WEBPUSH_NAT64_PREFIXES_VAR,
         WEBPUSH_VAPID_KEY_PATH_VAR, WEBPUSH_VAPID_SUBJECT_VAR, parse_node_push_platforms,
-        parse_push_platforms, push_role_from, push_selection_from, push_senders_from,
+        parse_push_platforms, push_role_from, push_selection_from, push_selection_on_blocking_pool,
+        push_senders_from, push_senders_on_blocking_pool,
     };
     use crate::relay::log_capture::LogCapture;
     use crate::relay::push_gate::PushRole;
@@ -3534,6 +3595,106 @@ mod push_tests {
     /// Criterion 8: loading credentials writes no key byte to any log line,
     /// and neither the loaded selection's `Debug` nor any refusal's `Display`
     /// or `Debug` carries one.
+    /// An enabled selection polled outside a tokio runtime fails with a typed
+    /// refusal instead of panicking in the store open or yielding a role
+    /// whose push service never runs. Removing the `try_current` check makes
+    /// the store open's `spawn_blocking` panic here.
+    #[test]
+    fn enabled_push_outside_a_runtime_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::full(dir.path());
+        let error = futures::executor::block_on(push_role_from(env.parse().unwrap())).unwrap_err();
+        let StartupError::Push(error) = error else {
+            panic!("expected a push refusal: {error:?}");
+        };
+        assert!(
+            matches!(
+                error,
+                PushStartupError::ServiceStart {
+                    error: crate::relay::push_gate::PushRoleError::NoRuntime
+                }
+            ),
+            "{error:?}"
+        );
+        assert_eq!(error.rule(), "SCP-CAPSEL-8001");
+        assert!(
+            !dir.path().join("push.sqlite").exists(),
+            "a refused start must not create the push store"
+        );
+    }
+
+    /// The relay and full-node push loaders read their credential files on
+    /// the blocking pool.
+    ///
+    /// Each load runs under `scp_platform::testing::blocking_pool`'s probe.
+    /// While the pool's only thread is held, the observer widens the APNs
+    /// key file to mode 0644, so a load that reads the file afterwards, on
+    /// the pool, refuses it with `CredentialPermissions`. A load that reads
+    /// the file inline finishes on its first poll, before the observer runs,
+    /// and fails `!finished_while_held`.
+    #[test]
+    fn push_loaders_read_credentials_on_the_blocking_pool() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        use scp_platform::testing::blocking_pool::{
+            blocking_pool_of_one, drive_while_the_blocking_pool_is_held,
+        };
+
+        fn assert_refused_after_the_hold<T: std::fmt::Debug>(
+            label: &str,
+            finished_while_held: bool,
+            output: &Result<T, StartupError>,
+        ) {
+            assert!(
+                !finished_while_held,
+                "{label}: the credentials were read on the thread polling the load"
+            );
+            assert!(
+                matches!(
+                    output,
+                    Err(StartupError::Push(
+                        PushStartupError::CredentialPermissions {
+                            var: APNS_KEY_PATH_VAR,
+                            ..
+                        }
+                    ))
+                ),
+                "{label}: the load must read the key file after the hold: {output:?}"
+            );
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut env = Env::full(dir.path());
+        let key_path = PathBuf::from(env.vars[APNS_KEY_PATH_VAR].clone());
+        let widen = || {
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        };
+        let restore = || {
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        };
+
+        let runtime = blocking_pool_of_one().unwrap();
+        let vars = env.vars.clone();
+        let relay = runtime
+            .block_on(drive_while_the_blocking_pool_is_held(
+                push_selection_on_blocking_pool(move |var| vars.get(var).cloned()),
+                widen,
+            ))
+            .unwrap();
+        assert_refused_after_the_hold("relay", relay.finished_while_held, &relay.output);
+
+        restore();
+        env.node_webpush();
+        let vars = env.vars.clone();
+        let node = runtime
+            .block_on(drive_while_the_blocking_pool_is_held(
+                push_senders_on_blocking_pool(move |var| vars.get(var).cloned()),
+                widen,
+            ))
+            .unwrap();
+        assert_refused_after_the_hold("full node", node.finished_while_held, &node.output);
+    }
+
     // A current-thread runtime, so the per-thread log capture sees the
     // lines `push_role_from` writes.
     #[tokio::test]
