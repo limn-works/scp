@@ -42,13 +42,15 @@
 //!
 //! # Testing
 //!
-//! Tests require a running S3-compatible endpoint (e.g., MinIO):
+//! The unit tests need a running S3-compatible endpoint, named by
+//! `S3_TEST_ENDPOINT` and `S3_TEST_BUCKET`, and credentials the AWS SDK's
+//! environment chain reads (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+//! `AWS_REGION`). CI's `transport-blob` leg starts one and sets them
+//! (`.github/workflows/ci.yml`, "Run the blob-backend tests"):
 //!
 //! ```bash
-//! cargo test -p scp-transport --features s3-blob -- --ignored
+//! cargo test -p scp-transport --features s3-blob --lib s3_blob
 //! ```
-//!
-//! Set `S3_TEST_ENDPOINT` and `S3_TEST_BUCKET` environment variables.
 //!
 //! The construction failure path needs no endpoint:
 //! `crates/scp-transport/tests/s3_blob_fail_closed.rs` opens the store against
@@ -1053,7 +1055,7 @@ mod tests {
     //! These tests require a running S3-compatible endpoint. Run with:
     //!
     //! ```bash
-    //! cargo test -p scp-transport --features s3-blob -- --ignored
+    //! cargo test -p scp-transport --features s3-blob --lib s3_blob
     //! ```
     //!
     //! Environment variables:
@@ -1142,7 +1144,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires S3-compatible endpoint"]
     async fn store_and_get_returns_blob() {
         let (clock, _time) = test_clock(1_000_000);
         let store = test_store(clock).await;
@@ -1176,7 +1177,6 @@ mod tests {
     /// `09-security-model.md` §9.10.12: a retained record carries no TTL, so
     /// no purge removes it while a TTL blob beside it expires.
     #[tokio::test]
-    #[ignore = "requires S3-compatible endpoint"]
     async fn retained_record_survives_every_purge() {
         let (clock, time) = test_clock(1_000_000);
         let storage = test_store(clock).await;
@@ -1225,7 +1225,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires S3-compatible endpoint"]
     async fn get_nonexistent_returns_none() {
         let (clock, _time) = test_clock(1_000_000);
         let store = test_store(clock).await;
@@ -1236,7 +1235,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires S3-compatible endpoint"]
     async fn delete_removes_blob() {
         let (clock, _time) = test_clock(1_000_000);
         let store = test_store(clock).await;
@@ -1264,7 +1262,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires S3-compatible endpoint"]
     async fn delete_nonexistent_returns_false() {
         let (clock, _time) = test_clock(1_000_000);
         let store = test_store(clock).await;
@@ -1275,7 +1272,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires S3-compatible endpoint"]
     async fn query_returns_blobs_for_routing_id() {
         let (clock, time) = test_clock(1_000_000);
         let store = test_store(clock).await;
@@ -1305,7 +1301,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires S3-compatible endpoint"]
     async fn query_respects_limit() {
         let (clock, time) = test_clock(1_000_000);
         let store = test_store(clock).await;
@@ -1335,7 +1330,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires S3-compatible endpoint"]
     async fn query_returns_oldest_first() {
         let (clock, time) = test_clock(1_000_000);
         let store = test_store(clock).await;
@@ -1367,7 +1361,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires S3-compatible endpoint"]
     async fn query_different_routing_id_returns_empty() {
         let (clock, _time) = test_clock(1_000_000);
         let store = test_store(clock).await;
@@ -1395,7 +1388,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires S3-compatible endpoint"]
     async fn store_with_recipient_hint_preserves_it() {
         let (clock, _time) = test_clock(1_000_000);
         let store = test_store(clock).await;
@@ -1422,7 +1414,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires S3-compatible endpoint"]
     async fn purge_expired_removes_old_blobs() {
         let (clock, time) = test_clock(1_000_000);
         let store = test_store(clock).await;
@@ -1453,7 +1444,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires S3-compatible endpoint"]
     async fn purge_expired_does_not_remove_active_blobs() {
         let (clock, _time) = test_clock(1_000_000);
         let store = test_store(clock).await;
@@ -1480,7 +1470,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires S3-compatible endpoint"]
     async fn delete_cleans_up_routing_index() {
         let (clock, _time) = test_clock(1_000_000);
         let store = test_store(clock).await;
@@ -1510,7 +1499,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires S3-compatible endpoint"]
     async fn query_with_since_filter() {
         let (clock, time) = test_clock(1_000_000);
         let store = test_store(clock).await;
@@ -1547,7 +1535,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires S3-compatible endpoint"]
     async fn store_returns_correct_blob_id() {
         let (clock, _time) = test_clock(1_000_000);
         let store = test_store(clock).await;
@@ -1570,7 +1557,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires S3-compatible endpoint"]
     async fn concurrent_store_purge() {
         let (clock, time) = test_clock(1_000_000);
         let store = test_store(clock).await;
@@ -1631,7 +1617,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires S3-compatible endpoint"]
     async fn purge_expired_only_removes_expired() {
         let (clock, time) = test_clock(1_000_000);
         let store = test_store(clock).await;
@@ -1682,7 +1667,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires S3-compatible endpoint"]
     async fn get_expired_blob_returns_none() {
         let (clock, time) = test_clock(1_000_000);
         let store = test_store(clock).await;

@@ -116,8 +116,11 @@ impl PostgresBlobStore {
             .await
             .map_err(|e| StorageError::Internal(format!("postgres connect: {e}")))?;
 
-        // Create schema (idempotent).
-        sqlx::query(SCHEMA_SQL)
+        // Create schema (idempotent). `SCHEMA_SQL` holds three statements;
+        // `raw_sql` sends them over the simple-query protocol, because the
+        // extended protocol `query` uses prepares one statement and PostgreSQL
+        // refuses a multi-statement string there.
+        sqlx::raw_sql(SCHEMA_SQL)
             .execute(&pool)
             .await
             .map_err(|e| StorageError::Internal(format!("postgres schema: {e}")))?;
@@ -365,14 +368,14 @@ fn optional_bytes_to_array32(bytes: Option<Vec<u8>>) -> Result<Option<[u8; 32]>,
 // Tests
 // ---------------------------------------------------------------------------
 
-// Run with: cargo test -p scp-transport --features postgres-blob -- --ignored
-// Requires: DATABASE_URL=postgres://localhost/scp_test_blobs
+// The tests need a running `PostgreSQL` server, named by `DATABASE_URL`, on
+// which the URL's role may run `CREATE DATABASE`. Each test creates its own
+// database there, so tests running in parallel never share a `blobs` table.
+// CI's `transport-blob` leg starts a `PostgreSQL` container and sets
+// `DATABASE_URL` (`.github/workflows/ci.yml`, "Run the blob-backend tests").
 //
-// Setup:
-//   createdb scp_test_blobs
-//
-// The tests are #[ignore]d by default because they require a running `PostgreSQL`
-// instance. CI runs them in a job that provisions a `PostgreSQL` service container.
+// Run with: DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
+//   cargo test -p scp-transport --features postgres-blob --lib postgres_blob
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -388,11 +391,26 @@ mod tests {
         out
     }
 
-    /// Returns the `DATABASE_URL` from the environment, defaulting to a local test
-    /// database.
-    fn test_database_url() -> String {
-        std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://localhost/scp_test_blobs".to_string())
+    /// Creates a database no other test uses on the server `DATABASE_URL`
+    /// names, and returns its URL. A test without `DATABASE_URL` fails here
+    /// rather than passing without a server.
+    async fn isolated_database_url() -> String {
+        let server = std::env::var("DATABASE_URL")
+            .expect("DATABASE_URL names the PostgreSQL server these tests run against");
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&server)
+            .await
+            .expect("connect to the DATABASE_URL server");
+        let name = format!("scp_test_{:016x}", rand::random::<u64>());
+        sqlx::query(&format!("CREATE DATABASE {name}"))
+            .execute(&admin)
+            .await
+            .expect("create the test database");
+        admin.close().await;
+        let mut url = url::Url::parse(&server).expect("DATABASE_URL is a URL");
+        url.set_path(&name);
+        url.to_string()
     }
 
     /// Creates a controllable clock starting at `start`.
@@ -403,32 +421,21 @@ mod tests {
         (clock, time)
     }
 
-    /// Opens a store and clears the blobs table for a clean test.
+    /// Opens a store on a database of its own.
     async fn fresh_store() -> PostgresBlobStore {
-        let url = test_database_url();
-        let store = PostgresBlobStore::open(&url).await.unwrap();
-        sqlx::query("DELETE FROM blobs")
-            .execute(&store.pool)
+        PostgresBlobStore::open(&isolated_database_url().await)
             .await
-            .unwrap();
-        store
+            .unwrap()
     }
 
-    /// Opens a store with an injectable clock and clears the blobs table.
+    /// Opens a store with an injectable clock on a database of its own.
     async fn fresh_store_with_clock(clock: ClockFn) -> PostgresBlobStore {
-        let url = test_database_url();
-        let store = PostgresBlobStore::open_with_clock(&url, clock)
+        PostgresBlobStore::open_with_clock(&isolated_database_url().await, clock)
             .await
-            .unwrap();
-        sqlx::query("DELETE FROM blobs")
-            .execute(&store.pool)
-            .await
-            .unwrap();
-        store
+            .unwrap()
     }
 
     #[tokio::test]
-    #[ignore = "requires running PostgreSQL"]
     async fn store_and_get_returns_blob() {
         let storage = fresh_store().await;
         let routing_id = [0xAA; 32];
@@ -458,7 +465,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires running PostgreSQL"]
     async fn get_nonexistent_returns_none() {
         let storage = fresh_store().await;
         let blob_id = [0xFF; 32];
@@ -467,7 +473,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires running PostgreSQL"]
     async fn delete_removes_blob() {
         let storage = fresh_store().await;
         let routing_id = [0xAA; 32];
@@ -493,7 +498,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires running PostgreSQL"]
     async fn delete_nonexistent_returns_false() {
         let storage = fresh_store().await;
         let blob_id = [0xFF; 32];
@@ -502,7 +506,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires running PostgreSQL"]
     async fn query_returns_blobs_for_routing_id() {
         let storage = fresh_store().await;
         let routing_id = [0xAA; 32];
@@ -530,7 +533,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires running PostgreSQL"]
     async fn query_respects_limit() {
         let storage = fresh_store().await;
         let routing_id = [0xBB; 32];
@@ -558,7 +560,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires running PostgreSQL"]
     async fn query_returns_oldest_first() {
         let (clock, time) = test_clock(1_000_000);
         let storage = fresh_store_with_clock(clock).await;
@@ -592,7 +593,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires running PostgreSQL"]
     async fn query_different_routing_id_returns_empty() {
         let storage = fresh_store().await;
         let routing_id_a = [0xAA; 32];
@@ -619,7 +619,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires running PostgreSQL"]
     async fn store_with_recipient_hint_preserves_it() {
         let storage = fresh_store().await;
         let routing_id = [0xAA; 32];
@@ -647,7 +646,6 @@ mod tests {
     /// `09-security-model.md` §9.10.12: a retained record carries no TTL, so
     /// no purge removes it while a TTL blob beside it expires.
     #[tokio::test]
-    #[ignore = "requires running PostgreSQL"]
     async fn retained_record_survives_every_purge() {
         let (clock, time) = test_clock(1_000_000);
         let storage = fresh_store_with_clock(clock).await;
@@ -696,7 +694,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires running PostgreSQL"]
     async fn purge_expired_removes_old_blobs() {
         let (clock, time) = test_clock(1_000_000);
         let storage = fresh_store_with_clock(clock).await;
@@ -727,7 +724,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires running PostgreSQL"]
     async fn purge_expired_does_not_remove_active_blobs() {
         let storage = fresh_store().await;
         let routing_id = [0xAA; 32];
@@ -753,7 +749,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires running PostgreSQL"]
     async fn delete_cleans_up_and_query_returns_empty() {
         let storage = fresh_store().await;
         let routing_id = [0xDD; 32];
@@ -781,7 +776,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires running PostgreSQL"]
     async fn query_with_since_filter() {
         let (clock, time) = test_clock(1_000_000);
         let storage = fresh_store_with_clock(clock).await;
@@ -819,7 +813,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires running PostgreSQL"]
     async fn get_expired_returns_none() {
         let (clock, time) = test_clock(1_000_000);
         let storage = fresh_store_with_clock(clock).await;
@@ -852,7 +845,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires running PostgreSQL"]
     async fn store_returns_correct_blob_id() {
         let storage = fresh_store().await;
         let routing_id = [0xAA; 32];
@@ -874,7 +866,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires running PostgreSQL"]
     async fn concurrent_store_purge() {
         let (clock, time) = test_clock(1_000_000);
         let storage = fresh_store_with_clock(clock).await;
@@ -933,7 +924,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires running PostgreSQL"]
     async fn purge_expired_only_removes_expired() {
         let (clock, time) = test_clock(1_000_000);
         let storage = fresh_store_with_clock(clock).await;
@@ -983,7 +973,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires running PostgreSQL"]
     async fn store_overwrites_existing_blob() {
         let storage = fresh_store().await;
         let routing_id = [0xAA; 32];
