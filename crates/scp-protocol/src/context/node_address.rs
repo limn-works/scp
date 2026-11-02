@@ -756,7 +756,7 @@ mod tests {
         let other = VerifiedContextOperatorBinding::verify(
             binding_by(&other_operator, &key(1))?,
             &held_hash(&other_operator)?,
-            &other_operator.chain()?,
+            &other_operator.resolved()?,
         )?;
         assert_ne!(other.binding_hash(), binding.binding_hash());
         assert_eq!(other.context_key(), binding.context_key());

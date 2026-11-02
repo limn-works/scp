@@ -35,7 +35,7 @@ use scp_crypto::p256::{
     COMPRESSED_POINT_LEN, P256Error, P256PublicKey, SIGNATURE_LEN, verify_prehash_strict,
 };
 use scp_did::Identifier;
-use scp_kel::ValidatedChain;
+use scp_kel::ResolvedState;
 use sha2::{Digest, Sha256};
 
 use super::node_address::Reader;
@@ -283,8 +283,9 @@ impl VerifiedContextOperatorBinding {
     ///
     /// `held` is the `binding_hash` of the invitation a joiner holds, or of
     /// the `0xFF02` extension a member's group state holds. `operator` is the
-    /// chain the verifier adopted for `binding.operator`; the signing key is
-    /// the `#active` that was `Current` at `binding.key_state_head` on it, the
+    /// key state the verifier's resolution of `binding.operator` accepted;
+    /// the signing key is the `#active` that was `Current` at
+    /// `binding.key_state_head` on its chain, the
     /// §9.7.1 log-anchored class. §9.7.1's first-seen rule for a later
     /// `Compromised` marking stays the caller's.
     ///
@@ -293,13 +294,13 @@ impl VerifiedContextOperatorBinding {
     /// [`ContextOperatorError::BindingMismatch`],
     /// [`ContextOperatorError::ContextKey`],
     /// [`ContextOperatorError::OperatorKey`] when `operator` is another
-    /// identity's or does not hold `key_state_head`,
+    /// identity's or its chain does not hold `key_state_head`,
     /// [`ContextOperatorError::Signature`] (including a high-`s` signature)
     /// or [`ContextOperatorError::Encoding`].
     pub fn verify(
         binding: ContextOperatorBinding,
         held: &HeldBindingHash,
-        operator: &ValidatedChain,
+        operator: &ResolvedState,
     ) -> Result<Self, ContextOperatorError> {
         let binding_hash = binding.binding_hash()?;
         if binding_hash != held.0 {
@@ -568,7 +569,7 @@ pub(crate) mod tests {
         Ok(VerifiedContextOperatorBinding::verify(
             binding_by(&op, &key(1))?,
             &held(&op)?,
-            &op.chain()?,
+            &op.resolved()?,
         )?)
     }
 
@@ -580,7 +581,7 @@ pub(crate) mod tests {
         Ok(VerifiedContextOperatorBinding::verify(
             binding,
             &HeldBindingHash::testing_only_from_bytes(held),
-            &operator()?.chain()?,
+            &operator()?.resolved()?,
         )
         .map(|_| ()))
     }
@@ -710,7 +711,7 @@ pub(crate) mod tests {
         let hash = held(&op)?;
         let by_first = binding_by(&op, &key(1))?;
         let by_head = binding_by(&op, &key(4))?;
-        let rotated = op.rotate(4)?.chain()?;
+        let rotated = op.rotate(4)?.resolved()?;
         assert!(VerifiedContextOperatorBinding::verify(by_first.clone(), &hash, &rotated).is_ok());
         assert_eq!(
             VerifiedContextOperatorBinding::verify(by_head, &hash, &rotated).map(|_| ()),
@@ -722,7 +723,7 @@ pub(crate) mod tests {
             VerifiedContextOperatorBinding::verify(
                 by_first,
                 &hash,
-                &incept(0x41, 1, 0x43)?.chain()?
+                &incept(0x41, 1, 0x43)?.resolved()?
             )
             .map(|_| ()),
             Err(ContextOperatorError::OperatorKey(

@@ -15,7 +15,7 @@
 
 use scp_crypto::p256::{P256Error, P256PublicKey, SIGNATURE_LEN, verify_prehash_strict};
 use scp_did::{Identifier, NodeId, NodeUrl};
-use scp_kel::{NodeKeyError, ValidatedChain, derive_node_id, parse_node_key};
+use scp_kel::{NodeKeyError, ResolvedState, derive_node_id, parse_node_key};
 use sha2::{Digest, Sha256};
 
 use crate::crypto::anchored_key::{AnchoredKeyError, active_at};
@@ -131,8 +131,8 @@ impl VerifiedNodeBinding {
     /// `#active` at `key_state_head`, and `possession_sig` under `node_key`,
     /// both over `P` and both strict (low-`s`, no second hash).
     ///
-    /// `operator` is the chain the verifier adopted for `binding.operator`.
-    /// The operator's key is read from it at `binding.key_state_head`, the
+    /// `operator` is the key state the verifier's resolution of
+    /// `binding.operator` accepted. The operator's key is read from it at `binding.key_state_head`, the
     /// log-anchored class of §9.7.1, so a key from another identity or
     /// another position never verifies the binding. §9.7.1's first-seen rule
     /// for a later `Compromised` marking stays the caller's.
@@ -143,7 +143,7 @@ impl VerifiedNodeBinding {
     /// node key, operator key, operator signature, possession signature.
     pub fn verify(
         binding: NodeBinding,
-        operator: &ValidatedChain,
+        operator: &ResolvedState,
     ) -> Result<Self, NodeBindingError> {
         let node_key = parse_node_key(&binding.node_key)?;
         let operator_active = active_at(operator, &binding.operator, &binding.key_state_head)
@@ -230,7 +230,7 @@ pub(crate) mod tests {
     }
 
     /// The verdict on a copy of `binding`, without the verified value.
-    fn check(binding: &NodeBinding, operator: &ValidatedChain) -> Result<(), NodeBindingError> {
+    fn check(binding: &NodeBinding, operator: &ResolvedState) -> Result<(), NodeBindingError> {
         VerifiedNodeBinding::verify(binding.clone(), operator).map(|_| ())
     }
 
@@ -238,7 +238,7 @@ pub(crate) mod tests {
     fn a_signed_binding_verifies() -> TestResult {
         let op = operator()?;
         let binding = signed_binding(&op, &key(1), &key(2), &url()?)?;
-        let verified = VerifiedNodeBinding::verify(binding, &op.chain()?)?;
+        let verified = VerifiedNodeBinding::verify(binding, &op.resolved()?)?;
         assert_eq!(verified.node_key(), &key(2).public_key());
         Ok(())
     }
@@ -251,18 +251,18 @@ pub(crate) mod tests {
         let op = operator()?;
         let old = signed_binding(&op, &key(1), &key(2), &url()?)?;
         let rotated = op.rotate(4)?;
-        let chain = rotated.chain()?;
-        assert!(VerifiedNodeBinding::verify(old.clone(), &chain).is_ok());
+        let resolved = rotated.resolved()?;
+        assert!(VerifiedNodeBinding::verify(old.clone(), &resolved).is_ok());
         let mut by_head_key = old;
         by_head_key.operator_sig = sign_prehash_rfc6979(&key(4), &by_head_key.digest())?;
         assert_eq!(
-            check(&by_head_key, &chain),
+            check(&by_head_key, &resolved),
             Err(NodeBindingError::OperatorSignature(
                 P256Error::VerificationFailed
             ))
         );
         let current = signed_binding(&rotated, &key(4), &key(2), &url()?)?;
-        assert!(VerifiedNodeBinding::verify(current, &chain).is_ok());
+        assert!(VerifiedNodeBinding::verify(current, &resolved).is_ok());
         Ok(())
     }
 
@@ -272,7 +272,7 @@ pub(crate) mod tests {
     fn another_identity_or_an_unknown_head_is_refused() -> TestResult {
         let op = operator()?;
         let binding = signed_binding(&op, &key(1), &key(2), &url()?)?;
-        let other = incept(0x41, 1, 0x43)?.chain()?;
+        let other = incept(0x41, 1, 0x43)?.resolved()?;
         assert_eq!(
             check(&binding, &other),
             Err(NodeBindingError::OperatorKey(
@@ -282,7 +282,7 @@ pub(crate) mod tests {
         let mut b = binding;
         b.key_state_head[0] ^= 1;
         assert_eq!(
-            check(&b, &op.chain()?),
+            check(&b, &op.resolved()?),
             Err(NodeBindingError::OperatorKey(
                 AnchoredKeyError::HeadNotOnChain
             ))
@@ -312,33 +312,33 @@ pub(crate) mod tests {
     #[test]
     fn a_flip_in_each_field_is_refused() -> TestResult {
         let op = operator()?;
-        let chain = op.chain()?;
+        let resolved = op.resolved()?;
         let good = signed_binding(&op, &key(1), &key(2), &url()?)?;
 
         // The flip lands in x, so the key is off the curve or another point;
         // either way the binding is refused.
         let mut b = good.clone();
         b.node_key[32] ^= 1;
-        assert!(check(&b, &chain).is_err());
+        assert!(check(&b, &resolved).is_err());
 
         let mut b = good.clone();
         b.url_hash[0] ^= 1;
         assert!(matches!(
-            check(&b, &chain),
+            check(&b, &resolved),
             Err(NodeBindingError::OperatorSignature(_))
         ));
 
         let mut b = good.clone();
         b.operator_sig[5] ^= 1;
         assert!(matches!(
-            check(&b, &chain),
+            check(&b, &resolved),
             Err(NodeBindingError::OperatorSignature(_))
         ));
 
         let mut b = good;
         b.possession_sig[5] ^= 1;
         assert!(matches!(
-            check(&b, &chain),
+            check(&b, &resolved),
             Err(NodeBindingError::PossessionSignature(_))
         ));
         Ok(())
@@ -349,7 +349,7 @@ pub(crate) mod tests {
         let op = operator()?;
         let binding = signed_binding(&op, &key(3), &key(2), &url()?)?;
         assert_eq!(
-            check(&binding, &op.chain()?),
+            check(&binding, &op.resolved()?),
             Err(NodeBindingError::OperatorSignature(
                 P256Error::VerificationFailed
             ))
@@ -365,7 +365,7 @@ pub(crate) mod tests {
         let mut binding = signed_binding(&op, &key(1), &key(2), &url()?)?;
         binding.possession_sig = binding.operator_sig;
         assert!(matches!(
-            check(&binding, &op.chain()?),
+            check(&binding, &op.resolved()?),
             Err(NodeBindingError::PossessionSignature(_))
         ));
         Ok(())

@@ -200,7 +200,7 @@ mod tests {
         let operator = operator()?;
         Ok(VerifiedNodeBinding::verify(
             signed_binding(&operator, &key(1), node, &url()?)?,
-            &operator.chain()?,
+            &operator.resolved()?,
         )?)
     }
 

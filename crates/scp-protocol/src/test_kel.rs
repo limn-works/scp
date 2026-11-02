@@ -1,16 +1,19 @@
 //! Key-event logs for the crate's tests: an identity whose one root key
 //! signs each event, with spec 25's seed-to-scalar rule for every key, and
-//! the chain `validate_entry` accepts over its log.
+//! the key state the verdict classifier accepts over its log.
 
 use scp_crypto::p256::{P256SecretKey, SeedLabel, sign_prehash_rfc6979};
 use scp_did::{
     CommitmentEntry, CustodyType, FixedCommitment, Identifier, KeyAlgorithm, KeyCondition,
     KeyEntry, KeyRole,
 };
+use std::time::SystemTime;
+
 use scp_kel::{
     Continuation, EncodedPreimage, EntryVerdict, EventPreimage, InceptionFields, KeyStateFields,
-    KeyStateSnapshot, ReplayedState, SignatureForm, SignerGroup, ValidatedChain, encode_preimage,
-    prerotation_commitment, replay, validate_entry,
+    KeyStateSnapshot, OperatorProof, ReplayedState, ResolutionInput, ResolutionVerdict,
+    ResolvedState, SignatureForm, SignerGroup, SourceExhaustion, SourceRead, ValidatedChain,
+    classify, encode_preimage, prerotation_commitment, replay, validate_entry,
 };
 use sha2::{Digest, Sha256};
 
@@ -144,7 +147,7 @@ impl Identity {
     }
 
     /// The one chain of the unforked log `validate_entry` accepts.
-    pub fn chain(&self) -> TestResult<ValidatedChain> {
+    fn chain(&self) -> TestResult<ValidatedChain> {
         let units: Vec<&[u8]> = self.units.iter().map(Vec::as_slice).collect();
         let validation = validate_entry(&self.identifier, &units);
         if !validation.discarded.is_empty() {
@@ -157,6 +160,34 @@ impl Identity {
                 .ok_or_else(|| format!("expected one chain, got {chains:?}").into()),
             other => Err(format!("expected a valid chain, got {other:?}").into()),
         }
+    }
+
+    /// The key state a first-contact resolution of the log accepts, through
+    /// the verdict classifier, the one constructor of a `ResolvedState`
+    /// (`03-identity.md` §3.10.10): two sources, read to the end under two
+    /// distinct proven operator keys, serve the log (§9.7.4.2 R11's floor).
+    pub fn resolved(&self) -> TestResult<ResolvedState> {
+        let source = |name: &str, operator: u8| SourceRead {
+            name: name.to_owned(),
+            units: self.units.clone(),
+            exhaustion: SourceExhaustion::Exhausted,
+            proof: OperatorProof::Verified {
+                operator_key: [operator; 33],
+            },
+        };
+        let classification = classify(ResolutionInput {
+            identifier: self.identifier,
+            held: None,
+            reads: &[source("relay-a", 0x02), source("relay-b", 0x03)],
+            now: SystemTime::now(),
+        })?;
+        match classification.verdict {
+            ResolutionVerdict::Adopted { .. } | ResolutionVerdict::Confirmed => {}
+            other => return Err(format!("expected Adopted, got {other:?}").into()),
+        }
+        classification
+            .key_state
+            .ok_or_else(|| "an Adopted verdict carries a key state".into())
     }
 
     /// The replay of [`Self::chain`] at its head.

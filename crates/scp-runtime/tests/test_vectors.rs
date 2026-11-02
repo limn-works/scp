@@ -24,6 +24,7 @@
 )]
 
 use std::num::NonZeroU64;
+use std::time::SystemTime;
 
 use sha2::{Digest, Sha256};
 
@@ -34,7 +35,10 @@ use scp_did::{
     ABSENT_BRIDGE_TARGET, BridgeEndpoint, BridgeTarget, DID, Identifier, NodeUrl, RelayService,
     SigningKeyId,
 };
-use scp_kel::{EntryVerdict, ValidatedChain, validate_entry};
+use scp_kel::{
+    OperatorProof, ResolutionInput, ResolutionVerdict, ResolvedState, SourceExhaustion, SourceRead,
+    classify,
+};
 use scp_protocol::context::governance::{
     GovernanceAction, VoteType, compute_proposal_id, vote_signing_digest,
 };
@@ -1533,11 +1537,13 @@ fn vector_49_entry(index: usize) -> NodeListEntry {
 const VECTOR_41_PREIMAGE: &str = "5343502d4b454c2d4556454e542d56313a0100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000010000000001010000000000000001033b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f3027000000010000000100000002033b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f30270101000000000000000001010223702a648232f2d00713de9289753c2fbd4c4efa7e1e33905e3723a412b20aea02010000000000000000010100000001575d27a9d81af87b505b07f00c00031382c4ca1f3b9bf03e874f25179e21bcae00000e10020000000000000000000000000000000000000000000000000000000000000000000000000100000001421be508c6ed135a9737895007e5ba16f9542e1b3440f6d00a515de80a3e43eb010100000001";
 const VECTOR_41_SIGNATURE: &str = "0f53fa982d5dedc4e0f7b0c0216098ee17e8fa0e0c42609a976c4b1d444a9ba15f6fe6f9cbc80d4f37cf39e620b9ae7ff4e022e3810beab421655170ec4ddd07";
 
-/// Vector 41's log, its one inception as the unit
-/// `BE32(len) ‖ signed preimage ‖ signature`, through `validate_entry`. A
-/// reader reads Vector 49's operators' and governor's and Vector 92's
+/// The key state the verdict classifier accepts over Vector 41's log, its
+/// one inception as the unit `BE32(len) ‖ signed preimage ‖ signature`,
+/// served to the end by two sources under two distinct proven operator keys
+/// (`09-security-model.md` §9.7.4.2 R11's floor; `03-identity.md` §3.10.10).
+/// A reader reads Vector 49's operators' and governor's and Vector 92's
 /// operator's `#active` from it.
-fn vector_41_chain() -> ValidatedChain {
+fn vector_41_resolved() -> ResolvedState {
     let preimage = unhex(VECTOR_41_PREIMAGE);
     let mut unit = u32::try_from(preimage.len())
         .unwrap()
@@ -1545,23 +1551,37 @@ fn vector_41_chain() -> ValidatedChain {
         .to_vec();
     unit.extend_from_slice(&preimage);
     unit.extend_from_slice(&unhex(VECTOR_41_SIGNATURE));
-    let identifier = Identifier::from_bytes(unhex32(NODE_LIST_GOVERNOR));
-    let validation = validate_entry(&identifier, &[unit.as_slice()]);
-    assert!(validation.discarded.is_empty());
-    match validation.verdict {
-        EntryVerdict::Valid { chains } => chains.single().cloned().unwrap(),
-        other => panic!("Vector 41's log: {other:?}"),
-    }
+    let source = |name: &str, operator: u8| SourceRead {
+        name: name.to_owned(),
+        units: vec![unit.clone()],
+        exhaustion: SourceExhaustion::Exhausted,
+        proof: OperatorProof::Verified {
+            operator_key: [operator; 33],
+        },
+    };
+    let classification = classify(ResolutionInput {
+        identifier: Identifier::from_bytes(unhex32(NODE_LIST_GOVERNOR)),
+        held: None,
+        reads: &[source("relay-a", 0x02), source("relay-b", 0x03)],
+        now: SystemTime::now(),
+    })
+    .unwrap();
+    assert!(
+        matches!(classification.verdict, ResolutionVerdict::Adopted { .. }),
+        "Vector 41's log: {:?}",
+        classification.verdict
+    );
+    classification.key_state.unwrap()
 }
 
 /// Vector 49's entry `index` binding, verified against Vector 41's log.
 fn vector_49_bound(index: usize) -> VerifiedNodeBinding {
-    VerifiedNodeBinding::verify(vector_49_entry(index).binding, &vector_41_chain()).unwrap()
+    VerifiedNodeBinding::verify(vector_49_entry(index).binding, &vector_41_resolved()).unwrap()
 }
 
 /// The verdict on a copy of `binding` against Vector 41's log.
 fn check_binding(binding: &NodeBinding) -> Result<(), NodeBindingError> {
-    VerifiedNodeBinding::verify(binding.clone(), &vector_41_chain()).map(|_| ())
+    VerifiedNodeBinding::verify(binding.clone(), &vector_41_resolved()).map(|_| ())
 }
 
 /// The verdict on a copy of `record` against Vector 41's log, as attribution.
@@ -1569,7 +1589,7 @@ fn check_record(record: &NodeListRecord) -> Result<(), NodeListError> {
     VerifiedNodeListRecord::verify(
         record.clone(),
         NodeListKeyClass::Attribution,
-        &vector_41_chain(),
+        &vector_41_resolved(),
     )
     .map(|_| ())
 }
@@ -1659,7 +1679,7 @@ fn vector_91_node_binding() {
         hex::encode(sign_prehash_rfc6979(&fixture_secret(0), &digest).unwrap()),
         "52d92cfbef55246e511e354cadb35f71ec8105cfc909ce9b2b1e23e061535d8e794028c9eb1a344f2521f2dfa6caea45e77ebacbf0ece4e561d2f524dafba02d"
     );
-    let verified = VerifiedNodeBinding::verify(binding.clone(), &vector_41_chain()).unwrap();
+    let verified = VerifiedNodeBinding::verify(binding.clone(), &vector_41_resolved()).unwrap();
     assert_eq!(verified.binding(), &binding);
     assert_eq!(*verified.node_key(), fixture_public(0));
     assert_eq!(*verified.node_id(), binding.node_id().unwrap());
@@ -1806,7 +1826,7 @@ fn vector_49_node_list_entries() {
         "4f09885c65c8abab8b548f6ed1849c889a0b06f353d39531fe68f27c5c54d1cc"
     );
     for entry in &entries {
-        let verified = VerifiedNodeListEntry::verify(entry.clone(), &vector_41_chain()).unwrap();
+        let verified = VerifiedNodeListEntry::verify(entry.clone(), &vector_41_resolved()).unwrap();
         assert_eq!(verified.url(), &entry.url);
         assert_eq!(verified.free(), entry.free);
     }
@@ -1814,7 +1834,7 @@ fn vector_49_node_list_entries() {
     let mut moved = vector_49_entry(0);
     moved.url = NodeUrl::new("wss://node-b.example.com/scp/v1").unwrap();
     assert_eq!(
-        VerifiedNodeListEntry::verify(moved, &vector_41_chain()),
+        VerifiedNodeListEntry::verify(moved, &vector_41_resolved()),
         Err(NodeListEntryError::UrlHashMismatch)
     );
 }
@@ -1842,7 +1862,7 @@ fn vector_49_node_list_record() {
     );
     for class in [NodeListKeyClass::Standing, NodeListKeyClass::Attribution] {
         let verified =
-            VerifiedNodeListRecord::verify(record.clone(), class, &vector_41_chain()).unwrap();
+            VerifiedNodeListRecord::verify(record.clone(), class, &vector_41_resolved()).unwrap();
         assert_eq!(verified.class(), class);
         assert_eq!(verified.record(), &record);
     }
@@ -2083,7 +2103,7 @@ fn vector_92_verified() -> VerifiedContextOperatorBinding {
     VerifiedContextOperatorBinding::verify(
         vector_92_binding(),
         &vector_92_held(),
-        &vector_41_chain(),
+        &vector_41_resolved(),
     )
     .unwrap()
 }
@@ -2091,8 +2111,12 @@ fn vector_92_verified() -> VerifiedContextOperatorBinding {
 /// The verdict on a copy of `binding` against Vector 92's held hash and
 /// Vector 41's log.
 fn check_context_binding(binding: &ContextOperatorBinding) -> Result<(), ContextOperatorError> {
-    VerifiedContextOperatorBinding::verify(binding.clone(), &vector_92_held(), &vector_41_chain())
-        .map(|_| ())
+    VerifiedContextOperatorBinding::verify(
+        binding.clone(),
+        &vector_92_held(),
+        &vector_41_resolved(),
+    )
+    .map(|_| ())
 }
 
 #[test]
@@ -2104,7 +2128,7 @@ fn vector_92_context_operator_binding() {
     );
     // The operator is Vector 41's identity at its inception digest, whose
     // `#active` is §25.2's secondary key; the context key is the tertiary.
-    assert_eq!(binding.operator, vector_41_chain().identifier());
+    assert_eq!(binding.operator, *vector_41_resolved().identifier());
     assert_eq!(binding.operator.as_bytes(), &unhex32(NODE_LIST_GOVERNOR));
     assert_eq!(binding.key_state_head, unhex32(NODE_LIST_SIGNING_HEAD));
     assert_eq!(binding.context_key.as_slice(), unhex(REFERENCE_KEYS[2].2));
@@ -2144,7 +2168,7 @@ fn vector_92_context_operator_binding() {
         VerifiedContextOperatorBinding::verify(
             binding.clone(),
             &HeldBindingHash::testing_only_from_bytes(other_hash),
-            &vector_41_chain()
+            &vector_41_resolved()
         ),
         Err(ContextOperatorError::BindingMismatch)
     );
@@ -2154,7 +2178,7 @@ fn vector_92_context_operator_binding() {
     changed.operator = Identifier::from_bytes([0x11; 32]);
     let held = HeldBindingHash::testing_only_from_bytes(changed.binding_hash().unwrap());
     assert_eq!(
-        VerifiedContextOperatorBinding::verify(changed, &held, &vector_41_chain()),
+        VerifiedContextOperatorBinding::verify(changed, &held, &vector_41_resolved()),
         Err(ContextOperatorError::OperatorKey(
             AnchoredKeyError::IdentityMismatch
         ))
@@ -2163,7 +2187,7 @@ fn vector_92_context_operator_binding() {
     changed.key_state_head[31] ^= 1;
     let held = HeldBindingHash::testing_only_from_bytes(changed.binding_hash().unwrap());
     assert_eq!(
-        VerifiedContextOperatorBinding::verify(changed, &held, &vector_41_chain()),
+        VerifiedContextOperatorBinding::verify(changed, &held, &vector_41_resolved()),
         Err(ContextOperatorError::OperatorKey(
             AnchoredKeyError::HeadNotOnChain
         ))
