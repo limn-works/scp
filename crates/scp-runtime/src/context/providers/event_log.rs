@@ -1852,7 +1852,15 @@ mod tests {
                 &ctx_id,
                 EventType::GovernanceActionExecuted,
                 "did:key:admin",
-                payload_bytes(b"some-payload"),
+                scp_event_log::payload::encode_payload(
+                    &scp_protocol::context::governance::executed_payload_fixture(
+                        scp_protocol::context::governance::GovernanceAction::CloseContext {
+                            reason: None,
+                        },
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
                 1_700_000_000,
             )
             .await

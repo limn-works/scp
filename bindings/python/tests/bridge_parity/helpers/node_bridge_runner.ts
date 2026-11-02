@@ -177,15 +177,13 @@ async function loadNapiAddon(): Promise<typeof napiAddon> {
     throw new Error(`parity runner: no NAPI addon for platform ${key}`);
   }
   const { createRequire } = await import("node:module");
+  const { fileURLToPath } = await import("node:url");
   // Resolve via a file inside bindings/typescript so Node's module
   // resolution walks the TS workspace's node_modules tree (where CI
-  // wires `@limn-works/scp-ts-napi-linux-x64-gnu`). `import.meta.url`
-  // points into bindings/python/tests/bridge_parity/helpers/, which
-  // sits in a different subtree and cannot see the NAPI addon package.
-  const typescriptAnchor = new URL(
-    "../../../../../bindings/typescript/package.json",
-    import.meta.url,
-  ).href;
+  // wires `@limn-works/scp-ts-napi-linux-x64-gnu`). This file sits in
+  // bindings/python/tests/bridge_parity/helpers/, a different subtree
+  // that cannot see the NAPI addon package.
+  const typescriptAnchor = fileURLToPath(new URL("../../../../../bindings/typescript/package.json", import.meta.url));
   const req = createRequire(typescriptAnchor);
   napiAddon = req(packageName);
   if (typeof napiAddon.SCP !== "function") {

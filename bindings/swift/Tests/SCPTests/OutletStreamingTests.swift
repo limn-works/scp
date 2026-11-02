@@ -481,8 +481,7 @@ extension OutletStreamingTests {
         // Scans Sources/SCP excluding the generated Internal/ bridge; comment
         // lines that merely name the banned token are exempt (a doc-comment is
         // not a symbol).
-        let thisFile = URL(fileURLWithPath: #filePath)
-        let swiftRoot = thisFile
+        let swiftRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent() // SCPTests
             .deletingLastPathComponent() // Tests
             .deletingLastPathComponent() // swift
@@ -733,16 +732,18 @@ private extension OutletStreamingTests {
         let expectedErrorCode: String?
     }
 
-    /// The repo-root vectors file, resolved by walking up from this test file
-    /// (`.../bindings/swift/Tests/SCPTests/…` → repo root).
+    /// The repository root, five levels above this file
+    /// (`bindings/swift/Tests/SCPTests/…`).
+    static let repoRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent() // SCPTests
+        .deletingLastPathComponent() // Tests
+        .deletingLastPathComponent() // swift
+        .deletingLastPathComponent() // bindings
+        .deletingLastPathComponent() // repository root
+
+    /// The repo-root vectors file.
     var vectorsFileURL: URL {
-        URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent() // SCPTests
-            .deletingLastPathComponent() // Tests
-            .deletingLastPathComponent() // swift
-            .deletingLastPathComponent() // bindings
-            .deletingLastPathComponent() // repo root
-            .appendingPathComponent("tests/conformance/vectors/outlet_stream_vectors.json")
+        Self.repoRoot.appendingPathComponent("tests/conformance/vectors/outlet_stream_vectors.json")
     }
 
     /// Loads the 7 vectors, serializing each chunk into the mock's wire bytes

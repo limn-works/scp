@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use scp_transport::native::server::{RelayConfig, RelayServer};
 use scp_transport::native::storage::BlobStorageBackend;
-use scp_transport::relay::push_gate::{LiveRelayUrl, RelayUrl};
+use scp_transport::relay::push_gate::{LiveRelayUrl, PushReservation};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -46,7 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `ws://127.0.0.1:9000/scp/v1` for a local relay.
     let relay_url_text = std::env::var("SCP_RELAY_URL")
         .map_err(|e| format!("SCP_RELAY_URL must be set to the relay's public URL: {e}"))?;
-    let relay_url = LiveRelayUrl::new(RelayUrl::new(&relay_url_text)?);
+    let relay_url = LiveRelayUrl::new(PushReservation::new(&relay_url_text)?);
 
     let config = RelayConfig {
         bind_addr,
@@ -69,10 +69,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //     BlobStorageBackend::in_memory()
     //
     //   SQLite (persistent, single-file):
-    //     BlobStorageBackend::sqlite(&PathBuf::from("./scp-relay.db"))?
+    //     BlobStorageBackend::sqlite(&PathBuf::from("./scp-relay.db")).await?
     //
     //   redb (persistent, embedded):
-    //     BlobStorageBackend::redb(&PathBuf::from("./scp-relay.redb"))?
+    //     BlobStorageBackend::redb(&PathBuf::from("./scp-relay.redb")).await?
     //     (requires "redb-blob" feature on scp-transport)
     //
     //   PostgreSQL (requires "postgres-blob" feature):
@@ -80,7 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //
     //   S3-compatible (requires "s3-blob" feature):
     //     S3BlobStore::open("bucket", "blobs/").await?
-    let storage = BlobStorageBackend::sqlite(&PathBuf::from("./scp-relay.db"))?;
+    let storage = BlobStorageBackend::sqlite(&PathBuf::from("./scp-relay.db")).await?;
 
     // ── 4. Start the relay server ────────────────────────────────
     //

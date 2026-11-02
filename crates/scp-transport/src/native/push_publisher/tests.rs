@@ -101,7 +101,7 @@ mod relays {
     use crate::relay::connection::{RelayUrlSource, SourcedRelayUrl};
     use crate::relay::push::{ApnsConfig, ApnsEnvironment, ApnsSender, PushSender};
     use crate::relay::push_dispatch::PushService;
-    use crate::relay::push_gate::{LiveRelayUrl, PushRole, PushServiceConfig, RelayUrl};
+    use crate::relay::push_gate::{LiveRelayUrl, PushReservation, PushRole, PushServiceConfig};
     use crate::relay::push_store::{PushRegistrationKey, PushRegistrationStore};
 
     const REGISTRANT: &str = "did:dht:z6MkPushPublisherTest";
@@ -147,7 +147,7 @@ mod relays {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             delivery_jitter_ms: 0,
             push,
-            ..RelayConfig::defaults(LiveRelayUrl::new(RelayUrl::new(url)?))
+            ..RelayConfig::defaults(LiveRelayUrl::new(PushReservation::new(url)?))
         };
         let (_handle, addr) = RelayServer::new(config, Arc::new(BlobStorageBackend::in_memory()))
             .start()

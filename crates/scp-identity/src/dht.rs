@@ -216,12 +216,12 @@ pub enum IdentityError {
     /// A relay URL fails `18-addressability-and-deployment.md` §18.2.1: it
     /// has no `09-security-model.md` §9.18.2 canonical form, its canonical
     /// path does not end in `/scp/v1`, or it names a bridge relay over `ws`.
-    #[error("invalid relay URL {url:?}: {reason}")]
-    InvalidRelayUrl {
+    #[error("invalid node URL {url:?}: {reason}")]
+    InvalidNodeUrl {
         /// The rejected URL with any user information removed.
         url: String,
         /// Which rule the URL fails.
-        reason: scp_did::RelayEntryUrlError,
+        reason: scp_did::NodeEntryUrlError,
     },
 
     /// A relay entry's `bridgeTarget` equals `SHA-256(0x00)`, which §18.2.1
@@ -418,7 +418,7 @@ impl IdentityError {
 ///
 /// The mapping is variant-for-variant onto the pre-existing `IdentityError`
 /// variants, so `?`-propagation from a `scp-did` method yields the *identical*
-/// observable error (`IdentityError::InvalidRelayUrl { .. }`, etc.) it did before
+/// observable error (`IdentityError::InvalidNodeUrl { .. }`, etc.) it did before
 /// the move — the split is behavior-preserving for every existing consumer,
 /// not just compile-preserving. `scp-identity`'s own code constructs these
 /// same variants directly for its DHT/config paths. Each `DidError` variant
@@ -433,8 +433,8 @@ impl From<scp_did::DidError> for IdentityError {
             scp_did::DidError::DocumentDeserializationError(msg) => {
                 Self::DocumentDeserializationError(msg)
             }
-            scp_did::DidError::InvalidRelayUrl { url, reason } => {
-                Self::InvalidRelayUrl { url, reason }
+            scp_did::DidError::InvalidNodeUrl { url, reason } => {
+                Self::InvalidNodeUrl { url, reason }
             }
             scp_did::DidError::AbsentSentinelBridgeTarget => Self::AbsentSentinelBridgeTarget,
             scp_did::DidError::AgentKeyAlreadyExists => Self::AgentKeyAlreadyExists,
@@ -5950,7 +5950,7 @@ mod tests {
     /// Plain relay entries for `urls`, each without a `bridgeTarget`.
     fn relays(urls: &[&str]) -> Vec<RelayService> {
         urls.iter()
-            .map(|url| RelayService::direct(scp_did::RelayEndpoint::new(url).unwrap()))
+            .map(|url| RelayService::direct(scp_did::NodeUrl::new(url).unwrap()))
             .collect()
     }
 
@@ -5968,9 +5968,7 @@ mod tests {
             dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
 
         let published = vec![
-            RelayService::direct(
-                scp_did::RelayEndpoint::new("wss://plain.example.com/scp/v1").unwrap(),
-            ),
+            RelayService::direct(scp_did::NodeUrl::new("wss://plain.example.com/scp/v1").unwrap()),
             RelayService::bridge(
                 scp_did::BridgeEndpoint::new("wss://bridge.example.com/scp/v1").unwrap(),
                 scp_did::BridgeTarget::new([0x42; 32]).unwrap(),
@@ -5998,9 +5996,8 @@ mod tests {
         let (identity, mut document, _pre_rotation_handle) =
             dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
 
-        let plain = RelayService::direct(
-            scp_did::RelayEndpoint::new("wss://plain.example.com/scp/v1").unwrap(),
-        );
+        let plain =
+            RelayService::direct(scp_did::NodeUrl::new("wss://plain.example.com/scp/v1").unwrap());
         document.add_relay_service(&plain);
         document.service.push(scp_did::Service {
             id: format!("{}#scp-relay-2", identity.did),

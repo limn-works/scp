@@ -29,8 +29,7 @@ use scp_crypto::p256::{
     P256Error, P256PublicKey, P256SecretKey, SeedLabel, sign_prehash_rfc6979, verify_prehash_strict,
 };
 use scp_did::{
-    ABSENT_BRIDGE_TARGET, BridgeEndpoint, BridgeTarget, DID, RelayEndpoint, RelayService,
-    SigningKeyId,
+    ABSENT_BRIDGE_TARGET, BridgeEndpoint, BridgeTarget, DID, NodeUrl, RelayService, SigningKeyId,
 };
 use scp_protocol::context::governance::{
     GovernanceAction, VoteType, compute_proposal_id, vote_signing_digest,
@@ -1149,12 +1148,12 @@ fn tier3_push_routing_id_matches_golden_vector() {
     );
     assert_eq!(
         hex::encode(tier3_push_routing_id(
-            &RelayEndpoint::new(PUSH_BRIDGE_URL).unwrap(),
+            &NodeUrl::new(PUSH_BRIDGE_URL).unwrap(),
             push_bridge_target()
         )),
         PUSH_TIER3_ROUTING_ID_HEX
     );
-    let direct = RelayService::direct(RelayEndpoint::new(PUSH_BRIDGE_URL).unwrap());
+    let direct = RelayService::direct(NodeUrl::new(PUSH_BRIDGE_URL).unwrap());
     assert_eq!(
         hex::encode(relay_service_push_routing_id(&direct)),
         PUSH_BRIDGE_RELAY_ROUTING_ID_HEX

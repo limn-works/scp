@@ -308,7 +308,24 @@
         "SCP-316",
         "SCP-317",
         "SCP-318",
-        "SCP-345"
+        "SCP-345",
+        "SCP-364",
+        "SCP-365",
+        "SCP-366",
+        "SCP-367",
+        "SCP-368",
+        "SCP-369",
+        "SCP-370",
+        "SCP-371",
+        "SCP-372",
+        "SCP-373",
+        "SCP-374",
+        "SCP-375",
+        "SCP-376",
+        "SCP-377",
+        "SCP-378",
+        "SCP-379",
+        "SCP-380"
       ]
     },
     {
@@ -678,18 +695,18 @@
         "crates/scp-identity/src/kel/*.rs",
         "crates/scp-identity/src/lib.rs"
       ],
-      "description": "Implement identity creation in the scp-identity crate, over the wasm-safe identity data model in scp-did. The module handles creation, verification, and key-state management. An identity's first key event is its inception event, and the identifier is SHA-256(\"SCP-KEL-ID-V1:\" || inception_signed_preimage) — 32 raw digest bytes that encode no key, which is what makes the identifier self-certifying (security spec §9.7.4.2 R13). The module abstracts the identity backend behind the `IdentityBackend` seam `03-identity.md` §3.10.10 states, which carries six methods; that section names them and this story states no list of its own, because a second list drifts from the declaration it copies. The shipped crate carries `generate_ephemeral_ed25519_seed`, which names the superseded curve; the code workstream that moves the key material to P-256 renames it, and this story names it as it ships today rather than inventing a name no author chose (ADR-054). Creation takes two custody providers: key_custody holds the root members and the operational keys, and a `NextSetCustody` (SCP-345) holds each next-set key, because §9.7.4.1 item 3 forbids the operational provider from holding the recovery key. Where no substrate satisfies §9.7.4.1 item 3a's independent-residence requirement, every creation path fails closed with IdentityError::NoIndependentSubstrate (SCP-IDENT-1100, `03-identity.md` §3.10.10). `create` writes the inception's `KeptComposition` into the device record before it returns (`09-security-model.md` §9.7.4.2 R10, `17-persistence-and-storage.md` §17.3), and `abandon_pending` destroys the keys that composition minted. Publication and resolution are SCP-007; rotation is SCP-008. Criteria labelled W wait on the publish-backend question in `00-open-questions.md` §Identity and Custody (the entry that opens \"Which error identity creation returns when an independent substrate exists and no publish backend does\"), which asks which error a caller gets when a §9.7.4.1 item 3a substrate exists and no publish backend does. AC numbers are kept stable, so no AC8 entry exists: it is W1.",
+      "description": "Implement identity creation in the scp-identity crate, over the wasm-safe identity data model in scp-did. The module handles creation, verification, and key-state management. An identity's first key event is its inception event, and the identifier is SHA-256(\"SCP-KEL-ID-V1:\" || inception_signed_preimage) — 32 raw digest bytes that encode no key, which is what makes the identifier self-certifying (security spec §9.7.4.2 R13). The module publishes through the sealed `IdentityBackend` that `NodeNetwork` implements (`03-identity.md` §3.10.10), and the instance's Supervisor reaches it through `dispatch_identity_create` (SCP-371). The read-side criterion this story carried as W2 moved to SCP-378, the node resolution story. The shipped crate carries `generate_ephemeral_ed25519_seed`, which names the superseded curve; the code workstream that moves the key material to P-256 renames it, and this story names it as it ships today rather than inventing a name no author chose (ADR-054). Creation takes two custody providers: key_custody holds the root members and the operational keys, and a `NextSetCustody` (SCP-345) holds each next-set key, because §9.7.4.1 item 3 forbids the operational provider from holding the recovery key. Where no substrate satisfies §9.7.4.1 item 3a's independent-residence requirement, every creation path fails closed with IdentityError::NoIndependentSubstrate (SCP-IDENT-1100, `03-identity.md` §3.10.10). `create` writes the inception's `KeptComposition` into the device record before it returns (`09-security-model.md` §9.7.4.2 R10, `17-persistence-and-storage.md` §17.3), and `abandon_pending` destroys the keys that composition minted. Publication and resolution are SCP-007; rotation is SCP-008. Criteria labelled W wait on the publish-backend question in `00-open-questions.md` §Identity and Custody (the entry that opens \"Which error identity creation returns when an independent substrate exists and no publish backend does\"), which asks which error a caller gets when a §9.7.4.1 item 3a substrate exists and no publish backend does. AC numbers are kept stable, so no AC8 entry exists: it is W1.",
       "acceptanceCriteria": [
-        "AC1: `Identity::create(config, signers)` returns `Result<Created<S>, CreateError>` under the collection flow `03-identity.md` §3.10.10 states, and generates the root member (#0) and the Active Signing Key (#active) as ECDSA P-256 keypairs, with each root member minted by `generate_key_event_keypair` as `KeyType::P256KeyEvent`, in the custody the config names (`03-identity.md` §3.10.10, §9.5, §9.7.4.2 definitions). Publishing in the same call is W1",
+        "AC1: `scp.identity_create(config, signers)` reaches `dispatch_identity_create`, and the registry's create helper in `crates/scp-runtime/src/context/supervisor/identity_helpers.rs` calls `scp-identity`'s create function, which returns `Result<Created, CreateError>` under the collection flow `03-identity.md` §3.10.10 states and generates the root member (#0) and the Active Signing Key (#active) as ECDSA P-256 keypairs, with each root member minted by `generate_key_event_keypair` as `KeyType::P256KeyEvent`, in the custody the config names; `pipeline_wiring.rs` asserts the step (`03-identity.md` §3.10.10, §9.5, §9.7.4.2 definitions)",
         "AC2: The identity-creation path generates each next-set key inside `NextSetCustody::generate`, reads its 33-byte SEC1 public key through `reveal_public_key`, and moves no next-set private key byte across any trait; key_custody never holds it — §9.7.4.1 item 3 (storage isolation)",
         "AC3: The identity-creation path computes the pre-rotation commitment as SHA-256(\"SCP-PREROTATION-COMMITMENT-V1:\" || pre_rotation_public_key) over the 33-byte SEC1 compressed point (§9.7.4.2 definitions)",
         "AC4: The identity-creation path derives the identifier as SHA-256(\"SCP-KEL-ID-V1:\" || inception_signed_preimage), with the preimage's identifier and predecessor-digest fields all-zero, and stores those 32 raw digest bytes on the ScpIdentity (§9.7.4.2 R13)",
         "AC5: The identity-creation path builds the key state the inception event carries: the standing root with its threshold and each member's custody type, the Active Signing Key in the #active role, the standing commitment list with its next threshold, the witness set with its interval, the service-key designation, and the all-zero delegator (§9.7.4.2 definitions)",
-        "AC6: The returned `Identity<S>` carries the identifier, the operational key handles (never raw private keys), and the pre-rotation commitment; a `compile_fail` doctest shows that no accessor returns secret bytes (`03-identity.md` §3.10.10). The `PublishOutcome` half is W1",
+        "AC6: `Created {identity, outcome, witness_warning}` carries an `IdentityHandle` for the new identity, whose actor the registry spawned, and the identity's key handles (never raw private keys) and pre-rotation commitment; `outcome` is the `PublishOutcome` of the inception's publication, naming every entry of the publication set once and carrying `fallback_reached`; a `compile_fail` doctest shows that no accessor returns secret bytes (`03-identity.md` §3.10.10)",
         "AC7: verify_did(identifier, inception_event) -> bool recomputes SHA-256(\"SCP-KEL-ID-V1:\" || inception_signed_preimage) and compares it to the identifier (§9.7.4.2 R2 — local, no network call)",
         "AC9: ScpIdentity declares exactly four public fields: identity_key (KeyHandle), active_signing_key (KeyHandle), pre_rotation_commitment (FixedCommitment, the standing commitment the inception event fixes: its commitment list and next threshold, `09-security-model.md` §9.7.4.2 definitions), identifier (Identifier); a test destructures ScpIdentity exhaustively",
         "AC10: Every identity-creation entry point — Identity::create, the scp-node identity resolvers, and the identity_create paths of the PyO3, napi-rs, and UniFFI bridges — returns IdentityError::NoIndependentSubstrate where no substrate satisfying §9.7.4.1 item 3a is available, and the three bridges surface it as error code SCP-IDENT-1100; a test drives each entry point with no such substrate and asserts that code (`03-identity.md` §3.10.10)",
-        "AC11: An identity publishes no W3C DID Core document: key material and each key's condition live in the key-event log, and every transport and service field is a service-record entry. AC9's exhaustive destructure shows ScpIdentity carries no document field, and `IdentityBackend::publish(&self, identifier: &Identifier, chain: &[Vec<u8>])` (`03-identity.md` §3.10.10, W1) takes key-event units and no document type",
+        "AC11: An identity publishes no W3C DID Core document: key material and each key's condition live in the key-event log, and every transport and service field is a service-record entry. AC9's exhaustive destructure shows ScpIdentity carries no document field, and `IdentityBackend::publish(&self, identifier: &Identifier, chain: &[Vec<u8>])` (`03-identity.md` §3.10.10, AC8) takes key-event units and no document type",
         "AC12: The identity API maps `IdentifierError::NonCanonicalIdentifier` to `IdentityError::NonCanonicalIdentifier`, SCP-IDENT-1106 (`03-identity.md` §3.1, §3.10.10)",
         "AC13: All public items have /// doc comments",
         "AC14: Unit tests for create, verify_did, and key-state construction",
@@ -700,14 +717,15 @@
         "AC19: `Identity::abandon_pending(config, pending)` on an inception composition destroys the next-set member, #0 and #active, then writes the device record without the `KeptComposition`; where the device holds a `PendingSignatureRecord` for the inception, it removes both entries and destroys no key (`17-persistence-and-storage.md` §17.3): a test; a second call with the same `PendingEvent` returns `IdentityError::NoPendingSignature` (SCP-IDENT-1120): a test (`03-identity.md` §3.10.10, `09-security-model.md` §9.7.4.2 R10)",
         "AC20: A `create` future dropped before it returns leaves zero live keys and no `KeptComposition`: one test drops it after the next-set `generate` returns, and one drops it after `create`'s task has sent its `CreateResult` and before `create` takes the `PendingEvent` out of it, where the dropped `CreateResult` spawns `abandon_pending` and every key is destroyed",
         "AC21: Once the creation record rewrite that names a key has completed, no failure, failed cleanup, panic, runtime shutdown or crash of `create` leaves that key unlisted by `Identity::unfinished`; a crash after a custody generates a key and before the rewrite that names it leaves that one key named by no record, which `17-persistence-and-storage.md` §17.3 states. `create` names each minted key in the creation record `identity/creation/{creation_id}` before it generates the next, a failed cleanup returns `CreateError` with the original error and `CleanupFailure::Incomplete` naming every live key, a runtime-cancelled `create` returns `CleanupFailure::NotAttempted` naming every key minted and the records that name them, and `abandon_unfinished` destroys every key a listed creation names. A test injects a failure and a failing destroy at each step, then lists, abandons, and asserts zero live keys and no record; a test shuts the runtime down mid-create and asserts `NotAttempted` names every minted key (`17-persistence-and-storage.md` §17.3, `03-identity.md` §3.10.10)",
-        "AC22: `IdentityConfig.witnesses` is a required `WitnessChoice`; `default_witness_set` keeps entries under distinct operator keys, drops an operator two entries declare under different keys, and caps at `MAX_WITNESS_SET_SIZE`: tests for each; `create` with `NoWitness`, an empty default, an unlisted designated operator, or a designated operator listed only under another key or under two keys returns a `WitnessWarning` whose `consequence` is the `09-security-model.md` §9.7.4.3 wording, a designated set naming two operators under one key is refused, and the inception carries the installed set: a test per case (`03-identity.md` §3.10.10)",
-        "W1 (waiting on the publish-backend question, `00-open-questions.md` §Identity and Custody): under `SignerPlan::ThisSdk`, `create` publishes the inception event in the same call (the publish half of AC1); the `PublishOutcome` the flow returns names every entry of the publication set (the publish half of AC6); and the identity backend seam is `IdentityBackend`, carrying the six methods `03-identity.md` §3.10.10 names and no others — `resolve`, `publish`, `read_service_record`, `publish_service_record`, `read_policy` and `fallback_set` (formerly AC8)",
-        "W2 (waiting on W1's `IdentityBackend`): `read_service_record` returns `ServiceRecordVerdict::Rejected { cause: IdentifierMismatch }` for a signature-valid record whose `identifier` is not the identifier read (`03-identity.md` §3.10.10, §3.10.13); a test serves another identity's record at the read identity's `scp:svc:` address and shows the rejection"
+        "AC22: `IdentityConfig.witnesses` is a required `WitnessChoice` (`CommunityDefault`, `Designated { witnesses: Vec<NodeId> }` or `NoWitness`); under `CommunityDefault` the witness set is the `Vec<NodeId>` that `default_witness_set(&AcceptedNodeList)` returns; `create` with `NoWitness` or an empty default returns a `WitnessWarning::NoWitness`, and with a designated `NodeId` the accepted list does not carry returns `WitnessWarning::UnlistedNodes`; a designated set naming one `NodeId` twice is refused with `IllegalKeyEvent { stage: Content }`; the inception carries the installed set: a test per case (`03-identity.md` §3.10.10, `09-security-model.md` §9.7.4.3)",
+        "AC8: Under `SignerPlan::ThisSdk`, `create` publishes the inception in the same call through the sealed `IdentityBackend` that `NodeNetwork` implements, and the trait carries the ten methods `03-identity.md` §3.10.10 names and no others: `resolve`, `publish`, `read_service_record`, `publish_service_record`, `read_policy`, `node_list`, `observe`, `publish_private`, `read_private` and `publish_key_packages`; a test against `AdversarialNode` reads the inception back from every publication-set entry that answered `OK`",
+        "AC23: With no accepted node list, or with no publication-set entry that passes both the read probe and the publish probe of `09-security-model.md` §9.7.4.2 R10, `create` returns `IdentityError::NoFallbackSourceReachable` (SCP-IDENT-1102) under every `WitnessChoice` and generates no key: one `AdversarialNode` test per probe failure (QUERY unanswered, `node_proof` invalid, PUBLISH refused), one with no list, and each asserts zero keys in every custody",
+        "AC24: `IdentityConfig` has the fields `custody`, `next_set_custody`, `profile` and `witnesses`, no `persistence` field and no type parameter: a test destructures it exhaustively, and `git grep -w persistence -- crates/scp-identity/src/kel` prints nothing"
       ],
       "actionItems": [
         "Define ScpIdentity, IdentityError, IdentityConfig and Identity in crates/scp-identity/src/kel/, re-exported from the crate root in crates/scp-identity/src/lib.rs",
         "Define ScpIdentity with identity_key, active_signing_key, pre_rotation_commitment, and identifier fields",
-        "Define `Identity::create` returning `Created<S>`, `Identity::abandon_pending`, `Identity::unfinished`, `Identity::abandon_unfinished` and `default_witness_set`, in crates/scp-identity/src/kel/; the `IdentityBackend` trait with the six methods `03-identity.md` §3.10.10 names waits on the publish-backend question (W1)",
+        "Define `Identity::create` returning `Created<S>`, `Identity::abandon_pending`, `Identity::unfinished`, `Identity::abandon_unfinished` and `default_witness_set`, in crates/scp-identity/src/kel/; publish the inception through the sealed `IdentityBackend` (AC8)",
         "Implement verify_did in crates/scp-identity/src/kel/ — recompute the identifier from the inception preimage and compare",
         "Build the key-state snapshot in crates/scp-identity/src/kel/ — standing root, operational roles, standing commitment, witness set, designation, delegator",
         "Run the §9.7.4.1 item 5 step (d) probe against the next-set custody before minting any operational key",
@@ -718,12 +736,14 @@
         "Write unit tests for the identity-creation path covering the two keypairs, the cold-stored pre-rotation key, the identifier derivation, and the key-state snapshot",
         "Write unit tests for verify_did with valid and invalid inception events",
         "Write unit tests for key-state serialization and deserialization",
-        "Write unit tests asserting that creation fails closed with NoIndependentSubstrate where no substrate satisfies §9.7.4.1 item 3a"
+        "Write unit tests asserting that creation fails closed with NoIndependentSubstrate where no substrate satisfies §9.7.4.1 item 3a",
+        "Refuse with SCP-IDENT-1102 before any key when no list is held or no publication-set entry passes both R10 probes (AC23), and delete `IdentityConfig.persistence` and the `ThisSdk` stub (AC24)."
       ],
       "blockedBy": [
         "SCP-001",
         "SCP-345",
-        "SCP-311"
+        "SCP-311",
+        "SCP-007"
       ],
       "sources": [
         {
@@ -749,6 +769,18 @@
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
           "section": "## 17.3 Key Convention"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.7.4.3 Witness and Watcher Layer (Layer B)"
+        },
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-052: Unified Construction Pattern"
+        },
+        {
+          "file": ".docs/standards/construction.md",
+          "section": "### Identity — `IdentityConfig`"
         }
       ],
       "details": {
@@ -758,76 +790,48 @@
     },
     {
       "id": "SCP-007",
-      "title": "Implement key-event log publish, resolve, cache, and republishing",
+      "title": "Publish an identity's key-event log and service record to nodes",
       "gate": "gate-1",
       "priority": "P0",
       "severity": "critical",
       "status": "pending",
       "files": [
-        "crates/scp-core/src/identity/dht.rs",
-        "crates/scp-core/src/identity/cache.rs",
-        "crates/scp-testing/tests/integration/conformance.rs"
+        "crates/scp-identity/src/network/publish.rs",
+        "crates/scp-identity/src/network/mod.rs",
+        "crates/scp-identity/tests/network_publish.rs"
       ],
-      "description": "Implement publishing an identity's key-event log to SCP relays and resolving it back, with caching, staleness detection, and automatic republishing. A publisher splits the chain into frame-sized segments and publishes them to the identity's own relays and to the fallback set (§3.10.5). A validating relay honors the PUBLISH's `retain` flag and gives the record no TTL; §9.7.4.2 R9 states that a relay may stop holding what it once held on terms its operator declares, and §9.7.4.2 R10 states the cadence that re-publishes where an entry no longer holds the record. The cycle keeps alive the copies a transport that cannot validate stores as opaque blobs under the shared TTL (§9.10.12). This story owns the self-observation cadence of §9.7.4.2 R10 and the `observe_self` operation `03-identity.md` §3.10.10 declares on the identity handle; SCP-008 composes the events that cadence re-publishes, and SCP-305 carries the recovery entry points.",
+      "description": "Implement publishing an identity's key-event log and service record to SCP nodes through `NodeNetwork` (`03-identity.md` §3.10.5, §3.10.10). A publisher splits the chain into frame-sized segments and publishes them to every entry of the publication set: the identity's own `SCPNode` entries and the fallback set. A conforming node honors the PUBLISH's `retain` flag and gives the record no TTL (`09-security-model.md` §9.10.12). Confirmed publication is durable self-retention plus acceptance by any publication-set entry; every cycle still sends to every fallback-set entry, and `PublishOutcome.fallback_reached` reports whether one accepted (`09-security-model.md` §9.7.4.2 R10). The self-observation cadence criteria this story carried moved to SCP-370, and the resolution, cache and observation criteria moved to SCP-378. SCP-008 composes the events the cadence re-publishes, and SCP-305 carries the recovery entry points. Node backend execution plan code PR C9.",
       "acceptanceCriteria": [
-        "IdentityBackend::publish splits the chain into frame-sized segments of at most `MAX_EVENTS_PER_FRAME` events and publishes them to both relay sets in sequence order (§3.10.5, `09-security-model.md` §9.18.17)",
+        "`IdentityBackend::publish` splits the chain into frame-sized segments of at most `MAX_EVENTS_PER_FRAME` events and publishes them to every entry of the publication set in sequence order (`03-identity.md` §3.10.5, `09-security-model.md` §9.18.17)",
         "The root signs every establishment event and an operational key signs none (§9.7.4.2)",
         "An event's sequence is its predecessor's plus one, and the inception event's is zero (§9.7.4.2)",
-        "Idempotent: a frame whose event digests all match the chain's leaves what the relay holds unchanged, which is a relay's own write rule and which ADR-065, the relay ADR, pending, states; the tag `archive/kel-combined-pre-split` preserves the combined text",
-        "A PUBLISH at the `scp:did:` kind sets `retain: true` and a validating relay gives the record no TTL (§9.10.12)",
+        "Idempotent: a frame whose event digests all match the chain's leaves what the node holds unchanged, under the node's write rule of `09-security-model.md` §9.10.12 and ADR-065 decision 2: a test publishes the same frame twice to an `AdversarialNode` and sees one stored copy",
+        "A PUBLISH at the `scp:did:` kind sets `retain: true`, and a conforming node gives the record no TTL (`09-security-model.md` §9.10.12)",
         "Failure handling: exponential backoff on publish failure: 30s, 1m, 2m, 4m, 8m, 16m, capped at 30m",
-        "Each retry re-reads the fallback set from the community relay list the SDK last accepted from the relay-list context (§18.5.1)",
+        "Each retry re-reads the fallback set from the node list the SDK last accepted (`09-security-model.md` §9.6.3, `18-addressability-and-deployment.md` §18.5.1)",
         "After 6 consecutive failures, emit a publish-degraded warning to the application layer",
-        "The self-observation cadence starts when an identity is loaded (Identity::load or Identity::create) and stops when that identity is unloaded or the SDK shuts down, and the SDK runs exactly one cadence loop per loaded identity: a test loads one identity, counts the cadence tasks the identity module spawned for it, and asserts one (`09-security-model.md` §9.7.4.2 R10)",
-        "Each cadence pass fetches from every entry of the publication set `03-identity.md` §3.10.5 names, on every launch and at least once per witnessing interval, and `Identity::observe_self` returns a `SelfObservation` whose `entries` carry one `EntryObservation` per entry of that set, each entry exactly once (`03-identity.md` §3.10.10)",
-        "An entry that answers nothing yields `EntryReach::Unreachable`: a test serves no answer from one entry and asserts that observation, an alert, and no PUBLISH to that entry (`09-security-model.md` §9.7.4.2 R10)",
-        "An entry the page walk did not read to exhaustion yields `EntryReach::Unexhausted`: a test stops the walk at the fetch bound and asserts that observation, an alert naming the entry, and no PUBLISH to it (`09-security-model.md` §9.7.4.2 R10)",
-        "An empty entry yields one `ChainObservation` whose `relation` is `Absent`, whose `alerted` is false, and whose `republished` is present, after the SDK re-published its chain from the inception event and its service record; an entry whose frames chain to nothing yields the same observation with `alerted` true: a test serves each case and asserts both (`09-security-model.md` §9.7.4.2 R10)",
-        "Two chains at one entry yield two observations: a test serves the controller's own head and a second chain forking from it at one entry, and asserts `EntryReach::Answered` carries two `ChainObservation` values, the first `Identical` and the second `Diverged` with `alerted` true (`09-security-model.md` §9.7.4.2 R10)",
-        "The superseded arm re-publishes and the identical arm does not: a test serves from one entry a head the controller's own log supersedes and from a second entry the controller's own head, and asserts one re-PUBLISH to the first entry, starting at the first event that entry does not hold, and none to the second (`09-security-model.md` §9.7.4.2 R10)",
         "An entry whose declared `max_blob_size` admits no segment of the chain receives no PUBLISH and appears in `PublishOutcome::per_entry` as `EntryResult::NotSent { reason: SegmentTooLarge }`: a test declares a ceiling below one frame's fixed prefix plus one event and asserts both (`03-identity.md` §3.10.5)",
-        "The cadence is a background tokio task the identity module owns, and no second republication task exists (`09-security-model.md` §9.7.4.2 R10)",
-        "On SDK initialization the self-observation cadence runs one pass immediately for every persisted active identity, over every entry of that identity's publication set, and publishes under the relations R10 names and under no unconditional startup republish (`09-security-model.md` §9.7.4.2 R10)",
-        "resolve(identifier) returns a ResolutionOutcome from the SCP relay network, the one resolution layer (§3.10.4)",
-        "resolve recomputes the identifier from the inception event and discards a differing response (§9.7.4.2 R2)",
-        "resolve verifies every later event under the standing root, discards a defective event past the inception, and returns `Invalid` only for a defective inception (§9.7.4.2 R3, R14)",
-        "resolve derives the key state from the latest state-carrying event at or before the adopted head (§9.7.4.2 R8)",
-        "Content signed under a key the resolved log's replay marks `Superseded` or `Retired` is judged by the class the classification table of `09-security-model.md` §9.7.1 assigns its separator: an attestation-class signature fails, a content-class signature verifies only for content that reached the party under an epoch before that context's boundary for the key, and a log-anchored signature verifies only where the key was `Current` at the position its `key_state_head` names: a test per class, each signed under the `Superseded` key of a chain whose `KeyState` installs a new `#active` key (`09-security-model.md` §9.7.1, §9.7.4.2 R8)",
-        "The log-anchored arm of `09-security-model.md` §9.7.1 reads the key that held the named role, and its condition, from `scp_kel::key_state_at` at the digest the artifact's `key_state_head` names on the adopted chain, and rejects an artifact whose `key_state_head` is no event of that chain (`NotOnChain`): a test signs a log-anchored artifact under the old `#active` key anchored at the event before a rotation and asserts it verifies, anchors the same signature at the rotation and asserts it fails, and anchors it at a digest off the chain and asserts it fails (`09-security-model.md` §9.7.1, §9.7.4.2 R8)",
-        "resolve caches results: 24-hour refresh for active contacts, 7-day for inactive (§9.10.7)",
-        "`ResolutionOutcome` carries no staleness field (`03-identity.md` §3.10.10): where every relay fails and a cached key state under seven days old exists, resolve returns `Confirmed` carrying the cached head, with an empty `relays_reached`, an empty `proven`, and the `head_provenance` an earlier resolution recorded; a test asserts all four (`03-identity.md` §3.10.4)",
-        "Stale results trigger an SDK warning log",
-        "Unit tests for publish and resolve against an in-memory relay mock",
-        "Unit tests for cache TTL behavior (24h active, 7d inactive)",
-        "Unit tests for staleness detection",
         "`publish` sends each entry only the events that entry does not hold, starting at the first event it lacks: a test publishes a two-event extension to an entry holding the rest of the chain and asserts that the frame opens at the first new event (`03-identity.md` §3.10.5)",
-        "resolve returns key state only as a `ResolvedState`, self-observation holds the controller's own key state only as `scp_kel::ReplayedState`, and the retained log is persisted as raw units and re-validated with `validate_entry` on load, never deserialized into a `ValidatedChain`: a test reloads a retained log carrying one illegal own event and asserts it is discarded on load (`09-security-model.md` §9.7.4.2 R3, R10)",
-        "A fixture puts an own `KeyState` carrying A26 into the retained log through the test-only signer, and a relay prepends a separator-flipped junk unit at the same position; `observe_self` returns one `DiscardedOwnEvent{class: Change, stage: Content}` naming the own event's digest, makes no republish call for it, and alerts; a foreign threshold-signed A26 at that position, absent from the retained log, yields an alert and no `DiscardedOwnEvent` (`09-security-model.md` §9.7.4.2 R10)",
-        "resolve skips an illegal event a non-conforming relay served: an in-memory relay mock that stores every frame opaquely serves [Vector 41, C16-on-V41, the legal `KeyState` at sequence 1], and resolve returns the key state of [Vector 41, the legal `KeyState`]; serving [Vector 41, C16-on-V41] alone returns Vector 41's key state; neither returns `Invalid` (`09-security-model.md` §9.7.4.2 R3, R14)",
-        "A mock relay answers `4044` KEY_EVENT_ILLEGAL to a legal frame: the SDK records the entry as non-conforming, produces no `DiscardedOwnEvent` and no compromise alert, and sends that frame to that entry in no later cycle: a test across two cycles (`09-security-model.md` §9.7.4.2 R10, ADR-004)",
+        "A node that answers `4044` KEY_EVENT_ILLEGAL to a legal frame is recorded as non-conforming, the publisher produces no `DiscardedOwnEvent` and no compromise alert, and sends that frame to that node in no later cycle: a test against an `AdversarialNode` across two cycles (`09-security-model.md` §9.7.4.2 R10, `10-infrastructure-and-self-hosting.md` §10.4.1)",
         "A frame holding an own event the retained log's check discards, answered `4044`, yields one `DiscardedOwnEvent` and no re-send: a test (`09-security-model.md` §9.7.4.2 R10)",
-        "resolve over an entry serving [Vector 41, A@1, B@1], two legal `KeyState`s signed by Vector 41's root, returns `Contested`: a test (`09-security-model.md` §9.7.4.2 R6, R7)",
-        "A device adopts a served chain R6 ranks above the chain carrying its own event and never re-publishes the dropped event: a test holds an own `KeyState` E at n + 1, serves a chain whose event at n + 1 R6 ranks above E, and asserts that the self-observation pass adopts the served chain, moves the marker under R10's marker clause, yields one `DiscardedOwnEvent` naming E, and makes no publish call carrying E in that cycle or the next (`09-security-model.md` §9.7.4.2 R10)",
-        "resolve persists the contested verdict, the retained suffixes and the accepted-head baseline before it returns any verdict; an injected persist failure returns `IdentityError::PersistFailed` (SCP-IDENT-1104) and no verdict; a test retains a suffix, adopts a chain forking below that suffix's fork, restarts the resolver, and asserts the contested verdict, every retained suffix with the order the resolver first observed each, and the baseline are restored from the held copies' bytes (`09-security-model.md` §9.7.4.2 R14)",
-        "No unwrap() or expect() in library code"
+        "Confirmed publication is durable self-retention plus an `OK` from at least one publication-set entry; every cycle sends to every fallback-set entry, and `PublishOutcome.fallback_reached` is false when no fallback-set entry accepted, which the SDK reports as degraded and which gates no key destruction: a test where only the identity's own node accepts, and one where only a fallback node accepts (`03-identity.md` §3.10.5, §3.10.6, `09-security-model.md` §9.7.4.2 R10)",
+        "`publish_service_record` publishes the signed service record at the identity's `scp:svc:` routing id with `retain: true` to every publication-set entry and returns a `PublishOutcome`: a test reads it back from an `AdversarialNode` (`03-identity.md` §3.10.13)",
+        "Publish tests run against `AdversarialNode` (SCP-367) and no in-memory or always-accept publisher exists on any build",
+        "No `unwrap()` or `expect()` in library code",
+        "CI-feature `cargo clippy` over the touched crates and their tests passes"
       ],
       "actionItems": [
-        "Implement IdentityBackend::publish in dht.rs — split the chain into frame-sized segments, publish to both relay sets in sequence order with `retain: true`",
-        "Implement the self-observation cadence as the one background tokio task that fetches from every entry of the publication set and produces what `Identity::observe_self` returns: one `EntryObservation` per entry, and one `ChainObservation` per chain an answered entry served",
+        "Implement `IdentityBackend::publish` in `crates/scp-identity/src/network/publish.rs`: split the chain into frame-sized segments and publish to every publication-set entry in sequence order with `retain: true`",
+        "Implement `publish_service_record` over the same path",
         "Implement exponential backoff for publish failures (30s, 1m, 2m, 4m, 8m, 16m, cap 30m)",
         "Implement the publish-degraded warning after six consecutive failures",
-        "Run one cadence pass on identity load",
-        "Implement resolve in dht.rs over multi-relay QUERY",
-        "Implement identifier recomputation (R2), event verification under the standing root (R3), and key-state derivation (R8)",
-        "Implement resolution cache in cache.rs with TTL-based expiry (24h active, 7d inactive)",
-        "Implement head-sequence comparison for cache freshness",
-        "Write tests for cache TTL and staleness detection",
-        "Write tests for the cadence lifecycle (start on load, stop on unload, one loop), for each `EntryReach`, and for each relation the acceptance criteria name"
+        "Compute confirmed publication and `fallback_reached`",
+        "Write the tests against `AdversarialNode`"
       ],
       "blockedBy": [
-        "SCP-006",
         "SCP-309",
-        "SCP-310"
+        "SCP-310",
+        "SCP-378"
       ],
       "sources": [
         {
@@ -843,18 +847,17 @@
           "section": "### 3.10.10 IdentityBackend, the Resolution Trait"
         },
         {
-          "file": ".docs/specs/03-identity.md",
-          "section": "### 3.10.4 Resolution Protocol"
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.10.12 Node Record Frames"
         },
         {
-          "file": ".docs/specs/09-security-model.md",
-          "section": "### 9.7.1 MLS-to-SCP Concept Mapping"
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.4.1 Node Wire Protocol"
         }
       ],
       "details": {
-        "republishStrategy": "A validating relay stores a `retain` PUBLISH and gives it no TTL, which §9.10.12 states, so no republication cycle makes the record permanent there; §9.7.4.2 R9 states that a relay may stop holding what it once held on terms its operator declares, and §9.7.4.2 R10 states which of the five relations an entry's head can hold to the controller's own retained log carry a publication and what each one publishes. A transport that cannot validate stores the frame as an opaque blob under the shared blob TTL, and the cycle keeps that copy alive.",
-        "cacheStrategy": "Resolution cache — TTL-based, 24h active / 7d inactive, head-sequence comparison for staleness (§9.10.7)",
-        "stalenessIndicator": "`ResolutionOutcome` carries no staleness field. The cached return `03-identity.md` §3.10.4 states comes back `Confirmed` with an empty `relays_reached`. UCAN validation and MLS credential verification SHOULD resolve fresh first, and §9.7.1 check 2 bounds how stale a key state may be when it satisfies an attestation's current-key check."
+        "republishStrategy": "A conforming node stores a `retain` PUBLISH and gives it no TTL, which `09-security-model.md` §9.10.12 states, so no republication cycle makes the record permanent there; §9.7.4.2 R9 states that a node may stop holding what it once held on terms its operator declares, and §9.7.4.2 R10 states which of the five relations an entry's head can hold to the controller's own retained log carry a publication and what each one publishes. The cadence that runs R10 is SCP-370's.",
+        "moved": "Criteria 9-15, 17 and 18 (the self-observation cadence) moved to SCP-370; criteria 19-30, 32-34 and 37-39 (resolution, cache and observation) moved to SCP-378, with the resolve half of criterion 28; the publish half of criterion 28 is the `AdversarialNode` criterion here."
       },
       "result": "Implemented identity publish/resolve, DhtClient trait abstraction, InMemoryDhtClient for testing, DidCache with TTL-based staleness detection (24h active/7d inactive), RepublishManager with exponential backoff. 40 new tests.",
       "republishStrategy": "A validating relay stores a `retain` PUBLISH and gives it no TTL, which §9.10.12 states, so no republication cycle makes the record permanent there; §9.7.4.2 R10 states the self-observation cadence that re-publishes where an entry no longer holds the record. The retry schedule this story's acceptance criteria name is the implementation's own and states no protocol rule, because a story is downstream of a spec."
@@ -7758,7 +7761,7 @@
         },
         {
           "file": ".docs/specs/18-addressability-and-deployment.md",
-          "section": "### 18.2.3 Multiple Relay Entries"
+          "section": "### 18.2.3 Multiple Node Entries"
         }
       ],
       "details": {
@@ -7807,11 +7810,11 @@
         },
         {
           "file": ".docs/specs/18-addressability-and-deployment.md",
-          "section": "## 18.5 Relay Bootstrap"
+          "section": "## 18.5 Node Bootstrap"
         },
         {
           "file": ".docs/specs/09-security-model.md",
-          "section": "### 9.6.3 Relay List Authentication"
+          "section": "### 9.6.3 Node List Authentication"
         }
       ],
       "details": {
@@ -7958,7 +7961,7 @@
       "sources": [
         {
           "file": ".docs/specs/18-addressability-and-deployment.md",
-          "section": "## 18.5 Relay Bootstrap"
+          "section": "## 18.5 Node Bootstrap"
         },
         {
           "file": ".docs/adrs/phase-2.md",
@@ -8943,7 +8946,7 @@
         },
         {
           "file": ".docs/specs/18-addressability-and-deployment.md",
-          "section": "### 18.3.3 Relay Operator Configuration Subset"
+          "section": "### 18.3.3 Node Operator Configuration Subset"
         },
         {
           "file": ".docs/adrs/phase-3.md",
@@ -10936,7 +10939,7 @@
         "crates/scp-protocol/src/trust/mod.rs",
         "crates/scp-runtime/src/context/supervisor/challenger_ledger_actor.rs",
         "crates/scp-runtime/src/context/supervisor/challenger_ledger_actor_tests.rs",
-        "crates/scp-runtime/tests/phase5_integration.rs",
+        "crates/scp-testing/tests/phase5_integration.rs",
         "fuzz/Cargo.lock"
       ],
       "description": "The first architecture slice of the key-event-log identity substrate. ADR-063 moves every SCP key to ECDSA over NIST P-256 with SHA-256, and `09-security-model.md` §9.5 states the encoding and verification rules. This story adds P-256 to the wasm-safe `scp-crypto` crate and to `KeyCustody`, moves MLS to RFC 9420 ciphersuite 2 and HPKE to DHKEM(P-256), and adds the JOSE ES256 codec. SCP-315 wires that codec to UCAN. The key-event preimage types are SCP-308.",
@@ -11196,7 +11199,7 @@
         },
         {
           "file": ".docs/specs/09-security-model.md",
-          "section": "### 9.10.12 Relay Key-Event Record Frame"
+          "section": "### 9.10.12 Node Record Frames"
         },
         {
           "file": ".docs/specs/09-security-model.md",
@@ -11425,27 +11428,37 @@
       "severity": "critical",
       "status": "pending",
       "files": [
-        "crates/scp-runtime/src/supervisor/identity.rs",
-        "crates/scp-runtime/tests/pipeline_wiring.rs"
+        "crates/scp-runtime/src/context/supervisor/supervisor.rs",
+        "crates/scp-runtime/src/context/supervisor/identity_actor.rs",
+        "crates/scp-runtime/src/context/supervisor/identity_actor/handlers.rs",
+        "crates/scp-runtime/src/context/supervisor/identity_helpers.rs",
+        "crates/scp-testing/tests/integration/pipeline_wiring.rs",
+        ".docs/standards/sdk-capability-matrix.json",
+        "scripts/call-invariants-baseline.json"
       ],
-      "description": "Architecture slice S10. Identity is not per-context, so the Supervisor reaches an injected `IdentityService` through direct dispatch methods rather than through a context actor's mailbox. A change to the local `#active` key fans out as an MLS Update to every context actor, and the self-observation cadence runs as a Supervisor task on the injected clock. This satisfies the integration checklist's first and fourth checks for every operation `03-identity.md` §3.10.10 and `09-security-model.md` §9.7.4.2 R10 declare.",
+      "description": "Architecture slice S10. Each identity operation runs `dispatch_identity_*` on the instance's Supervisor, then the identity's actor mailbox in `crates/scp-runtime/src/context/supervisor/identity_actor.rs`, then its handler in `identity_actor/handlers.rs`, then the helper in `identity_helpers.rs`, which is generic over `B: IdentityBackend`; a dispatch with no subject actor goes to the `IdentityRegistry` (`03-identity.md` §3.10.10). SCP-371 owns create and load. A change to the local `#active` key fans out as an MLS Update to every context actor, and the self-observation cadence SCP-370 builds runs as a task of the identity actor. This satisfies the integration checklist's first and fourth checks for every operation `03-identity.md` §3.10.10 lists. Node backend execution plan code PR C16.",
       "acceptanceCriteria": [
-        "The Supervisor exposes `dispatch_identity_create`, `dispatch_identity_abandon_pending`, `dispatch_identity_unfinished`, `dispatch_identity_abandon_unfinished`, `dispatch_identity_resolve`, `dispatch_identity_publish`, `dispatch_identity_read_service_record`, `dispatch_identity_publish_service_record`, `dispatch_identity_observe_self`, `dispatch_recovery_load_pending`, `dispatch_recovery_resume` and `dispatch_recovery_abort`, each reaching the `IdentityService` method of the same operation: `pipeline_wiring.rs` carries one assertion per method",
+        "The Supervisor exposes `dispatch_identity_cosign`, `dispatch_identity_attach`, `dispatch_identity_rotate_active`, `dispatch_identity_set_witnesses`, `dispatch_identity_abandon_pending`, `dispatch_identity_unfinished`, `dispatch_identity_abandon_unfinished`, `dispatch_identity_observe_self`, `dispatch_identity_witness_status`, `dispatch_identity_recovery_begin`, `dispatch_identity_recovery_resume`, `dispatch_identity_recovery_load_pending`, `dispatch_identity_recovery_abort`, `dispatch_identity_publish_service_record`, `dispatch_identity_private_append`, `dispatch_identity_private_sync`, `dispatch_identity_resolve`, `dispatch_identity_node_list`, `dispatch_identity_fallback_set`, `dispatch_identity_read_policy` and `dispatch_scpid_verify`, each calling `SupervisorHandle::live()` first and reaching, through the target `03-identity.md` §3.10.10's dispatch table names (the identity's actor or the registry), the helper in `identity_helpers.rs`; each returns `ContextError::Identity(IdentityError)` on an identity failure; `pipeline_wiring.rs` carries one assertion per method",
         "A change to the local `#active` key sends an MLS Update to every context actor: a pipeline assertion covers the fan-out (`09-security-model.md` §9.7.4.2 R8)",
-        "The self-observation cadence runs once at launch and then at least once per witnessing interval on the injected clock: a test advances a paused clock and asserts the pass count, and a pipeline assertion covers the tick (`09-security-model.md` §9.7.4.2 R10)",
-        "`IdentityBackedDidResolver` is absent from `crates/scp-ffi`: `grep -rn 'IdentityBackedDidResolver' crates/scp-ffi` prints nothing",
-        "No unwrap() or expect() in library code",
-        "Join admission reads the joiner's service record through `read_service_record` and runs the `09-security-model.md` §9.3.1 device-attestation reader (SCP-316) on it for the context being joined, and adds the reader's signal to the joiner's assessment; a test shows a context whose `require_device_attestation` is true admits a joiner whose entry reads `Verified` and refuses one whose entry reads `Absent`"
+        "The self-observation cadence SCP-370 builds runs once at actor spawn and then at least once per witnessing interval on the injected clock: `pipeline_wiring.rs` asserts that the tick reaches `dispatch_identity_observe_self` (`09-security-model.md` §9.7.4.2 R10)",
+        "Verifiers resolve identities through the registry's `dispatch_identity_resolve`, and `git grep -e DispatchDidResolver -e BridgeDidResolver -e IdentityBackedDidResolver -e ensure_did_resolver_initialized_on -- crates bindings` prints nothing; the call invariant on `ensure_did_resolver_initialized_on` in `sdk-capability-matrix.json` and its `call-invariants-baseline.json` entry are deleted with the function",
+        "No `unwrap()` or `expect()` in library code",
+        "Join admission reads the joiner's service record through `read_service_record` and runs the `09-security-model.md` §9.3.1 device-attestation reader (SCP-316) on it for the context being joined, and adds the reader's signal to the joiner's assessment; a test shows a context whose `require_device_attestation` is true admits a joiner whose entry reads `Verified` and refuses one whose entry reads `Absent`",
+        "CI-feature `cargo clippy` over the touched crates and their tests passes"
       ],
       "actionItems": [
-        "Add the dispatch methods over an injected `IdentityService`.",
-        "Add the key-change fan-out and the cadence task.",
-        "Add one pipeline assertion per dispatch method, plus the tick and the fan-out."
+        "Add the dispatch methods, actor handlers and helpers for every operation in the list.",
+        "Add the key-change fan-out.",
+        "Add one pipeline assertion per dispatch method, plus the tick and the fan-out.",
+        "Delete the three string resolvers, `ensure_did_resolver_initialized_on`, their tests, and the call invariant with its baseline entry."
       ],
       "blockedBy": [
         "SCP-305",
         "SCP-312",
-        "SCP-316"
+        "SCP-316",
+        "SCP-371",
+        "SCP-373",
+        "SCP-380"
       ],
       "sources": [
         {
@@ -11463,6 +11476,10 @@
         {
           "file": ".docs/specs/09-security-model.md",
           "section": "### 9.3.1 Reading a device attestation"
+        },
+        {
+          "file": ".docs/adrs/ADR-049-actor-per-context.md",
+          "section": "### 17. Per-identity `IdentityActor`, `SupervisorHandle::live()`, and the instance-built Supervisor (2026-11-02)"
         }
       ],
       "details": {}
@@ -11478,29 +11495,32 @@
         "crates/scp-ffi/src/identity.rs",
         "crates/scp-ffi/uniffi/src/identity.rs",
         "crates/scp-ffi/napi/src/identity.rs",
-        "bindings/python/scp_sdk/identity.py",
-        "bindings/typescript/src/identity.ts",
-        "bindings/swift/Sources/SCP/Identity.swift",
-        "bindings/kotlin/src/main/kotlin/works/limn/scp/Identity.kt"
+        "crates/scp-testing/tests/integration/ffi_conformance.rs",
+        "crates/scp-ffi/uniffi/tests/check_ready_coverage.rs",
+        "scripts/bridge-aliases.json",
+        "scripts/ffi-export-allowlist.json",
+        ".docs/standards/sdk-capability-matrix.json"
       ],
-      "description": "Architecture slice S11. PyO3, UniFFI and napi export identical identity and recovery functions, and each SDK wraps them under the names the shared scaffold's naming table gives, including `identity.recovery()` and `observe_self`. Every name-bound enumeration keeps the spec's PascalCase in every language. This satisfies the integration checklist's second, third and fifth checks.",
+      "description": "Architecture slice S11. PyO3, UniFFI and napi export identical identity and recovery functions, each calling `check_ready` before its Supervisor dispatch (`03-identity.md` §3.10.10). Every name-bound enumeration keeps the spec's PascalCase in every language. `identity_create` and `identity_load` belong to SCP-372, and the SDK wrappers, the conformance fixture and the capability-matrix rows moved to SCP-379. This satisfies the integration checklist's second check. Node backend execution plan code PR C17.",
       "acceptanceCriteria": [
-        "PyO3, UniFFI and napi each export `identity_create`, `identity_resolve`, `identity_publish`, `identity_read_service_record`, `identity_publish_service_record`, `identity_read_policy`, `identity_fallback_set`, `identity_observe_self`, `identity_rotate_active`, `identity_set_witnesses`, `identity_cosign`, `identity_attach`, `identity_abandon_pending`, `identity_unfinished`, `identity_abandon_unfinished` and the `recovery_*` functions, `recovery_begin` included, where `identity_cosign` takes a `PendingEvent` including `chain` and no bridge exports a key-event signer over raw bytes: `ffi_conformance.rs` asserts each export on each bridge",
-        "Each SDK wraps each export under the name the shared scaffold's naming table gives: a test per SDK calls each wrapper",
-        "`EntryReach`, `ChainRelation`, `ExtendingAct`, `EntryResult`, `NotSentReason`, `RecoveryPhase`, `RecoveryKind`, `ComposingDevice`, `SignatureGroup`, `SignerPlan`, `EventOutcome`, `RotationReason`, `ResolutionVerdict`, `CheckStep`, `OwnDiscardClass`, `StandingCommitment` and `KeyStateView`, with `RecoveryPhase` including `Discarded` and `Lost`, carry their spec variant names verbatim in every SDK: a conformance test compares the variant names across the five languages (`03-identity.md` §3.10.10)",
-        "One conformance fixture of identity operations replays in Rust, Python, TypeScript, Swift and Kotlin with identical results",
-        "The SDK capability matrix lists every operation above for every SDK",
+        "PyO3, UniFFI and napi each export `identity_cosign`, `identity_attach`, `identity_rotate_active`, `identity_set_witnesses`, `identity_abandon_pending`, `identity_unfinished`, `identity_abandon_unfinished`, `identity_observe_self`, `identity_witness_status`, `identity_publish_service_record`, `identity_private_append`, `identity_private_sync`, `identity_resolve`, `identity_node_list`, `identity_fallback_set`, `identity_read_policy`, the `recovery_*` functions (`recovery_begin`, `recovery_resume`, `recovery_load_pending` and `recovery_abort`) and `scpid_verify`, each calling `check_ready` and then the Supervisor dispatch of the same operation, where `identity_cosign` takes a `PendingEvent` including `chain` and no bridge exports a key-event signer over raw bytes: `ffi_conformance.rs` asserts each export on each bridge, and `check_ready_coverage.rs` carries one assertion per bridge that every `identity_*` export and `scpid_verify` calls `check_ready`",
+        "Withdrawn 2026-11-02: moved to SCP-379, the SDK wrapper story. (was: Each SDK wraps each export under the name the shared scaffold's naming table gives: a test per SDK calls each wrapper)",
+        "`EntryReach`, `ChainRelation`, `ExtendingAct`, `EntryResult`, `NotSentReason`, `RecoveryPhase`, `RecoveryKind`, `ComposingDevice`, `SignatureGroup`, `SignerPlan`, `EventOutcome`, `RotationReason`, `ResolutionVerdict`, `CheckStep`, `OwnDiscardClass`, `StandingCommitment`, `KeyStateView`, `WitnessChoice` and `WitnessAnswerKind`, with `RecoveryPhase` including `Discarded` and `Lost`, carry their spec variant names verbatim in every SDK, and `NodeUrl` crosses every bridge as a string validated at the bridge by `NodeUrl`'s constructor: a conformance test compares the variant names across the five languages (`03-identity.md` §3.10.10)",
+        "Withdrawn 2026-11-02: moved to SCP-379, the SDK wrapper story. (was: One conformance fixture of identity operations replays in Rust, Python, TypeScript, Swift and Kotlin with identical results)",
+        "Withdrawn 2026-11-02: moved to SCP-379, the SDK wrapper story. (was: The SDK capability matrix lists every operation above for every SDK)",
         "UniFFI's `recovery_*` path takes a host's `SyncedStoreProvider` and `CredentialBlobProvider` and builds the store set's members from them: `PlatformAccountSlot::Present` over a `SyncedStoreMember` only on a host whose row of the `09-security-model.md` §9.7.4.2 R10 platform-account host table is Present, the row's absence reason otherwise, and the `largeBlob` member as a `CredentialBlobMember` where the host reaches the credential's `largeBlob` store, each member holding no credential, so that it reads and writes only the credential the store set passes from its own lease on each call; `pipeline_wiring.rs` asserts that path (`09-security-model.md` §9.7.4.2 R10)",
-        "The agent-key exports, `identity_migrate`, the DID-document classes and the FFI DHT client are absent from all three bridges: a grep per name prints nothing",
+        "The agent-key exports, `identity_migrate`, the DID-document classes and the FFI DHT client are absent from all three bridges, with their `ffi_conformance.rs` cases, `bridge-aliases.json` and `ffi-export-allowlist.json` entries and the `dht_backend` matrix row: a grep per name prints nothing",
         "In each bridge, a test passes `identity_cosign` a `PendingEvent` whose preimage carries A26 (two `Current` `#active` keys) and asserts code SCP-IDENT-1117 and zero calls on the custody provider's sign callback (`09-security-model.md` §9.7.4.2 R10)",
         "Each bridge returns `ResolutionOutcome.key_state` as a `KeyStateView` built from the `ResolvedState` through `From<&ResolvedState>`, and no bridge export or SDK function takes a `KeyStateView` parameter: a test per bridge resolves [Vector 41, Vector 50] and asserts every field (`03-identity.md` §3.10.10)",
         "Each bridge maps SCP-IDENT-1116 through SCP-IDENT-1122 to the host error type and exposes `SelfObservation.discarded_own` with `DiscardedOwnEvent` and `OwnDiscardClass`: a test per bridge per code, and one per bridge for the observation (`03-identity.md` §3.10.10)",
-        "The change that creates `KeyStateView` in `crates/scp-ffi/common` adds to `crates/scp-testing/tests/integration/key_state_params.rs` the allowlist entries `(path, item, digest, reason)` for the defining struct and inherent impls of `KeyStateView`, and the gate asserts each entry matches at least once (SCP-310's `key_state_params.rs` criterion, `03-identity.md` §3.10.10)"
+        "The change that creates `KeyStateView` in `crates/scp-ffi/common` adds to `crates/scp-testing/tests/integration/key_state_params.rs` the allowlist entries `(path, item, digest, reason)` for the defining struct and inherent impls of `KeyStateView`, and the gate asserts each entry matches at least once (SCP-310's `key_state_params.rs` criterion, `03-identity.md` §3.10.10)",
+        "No `unwrap()` or `expect()` in library code",
+        "CI-feature `cargo clippy` over the touched crates and their tests passes"
       ],
       "actionItems": [
-        "Add the bridge exports and the SDK wrappers.",
-        "Update the capability matrix, `ffi_conformance.rs` and `bridge-aliases.json` with the new operations.",
-        "Add the cross-language conformance fixture."
+        "Add the bridge exports, each calling `check_ready` before its dispatch.",
+        "Update `ffi_conformance.rs`, `check_ready_coverage.rs` and `bridge-aliases.json` with the new operations.",
+        "Delete the DHT exports with their conformance cases, aliases, allowlist entries and the `dht_backend` matrix row."
       ],
       "blockedBy": [
         "SCP-313",
@@ -11562,24 +11582,24 @@
         "`grep -rn -i 'ed25519' crates/scp-platform/src` prints nothing",
         "A UCAN carries an ES256 signature: a round-trip test signs a UCAN with a P-256 key and verifies it (`09-security-model.md` §9.5)",
         "`PushRegistration::registrant` and `PushDeregistration::registrant` hold the `Identifier` SCP-308 defines, encoded as the 56-byte `scp:` text form, and the push store and the push golden vectors carry that form; the `SCP-PUSH-REGISTER-V1:` and `SCP-PUSH-DEREGISTER-V1:` separators are unchanged (`22-human-readable-addressing.md` §22.11.4, `09-security-model.md` §9.5.2)",
-        "`KelPushVerifier::verify(&self, message: PushMessage<'_>, relay: &PushRelay)` replaces the refuse-all stub PUSH-005 left: it resolves the registrant through SCP-007's `resolve` and verifies the message's signature, over the SHA-256 of `PushMessage::signing_bytes(relay)`, against the `#active` key `Current` in the `ResolvedState` the `ResolutionOutcome` carries. `relay` is the relay's own entry from which it derived the push routing ID the PUBLISH arrived at, a `PushRelay` built by `PushRelay::direct(url)` from its canonical URL or by `From<&RelayService>` for a tier 3 entry, and never a value the message carries (`10-infrastructure-and-self-hosting.md` §10.7.1 step 3). A test accepts a registration and a deregistration signed by the `#active` key of a valid chain, and returns the registrant. A test accepts one signed by the `#active` key of a chain whose later event was discarded (a served chain [Vector 41, C16-on-V41], verified under Vector 41's `#active`). It refuses, each with the named `PushVerifyError` variant: a signature by a key the resolved state holds `Superseded`, `Retired` or `Compromised` → `NotCurrentActive`; a resolution whose verdict is `Invalid` (a defective inception) → `IdentifierUnresolvable`; a resolution that carries no key state on any other verdict (`Inconclusive` of any cause, including every source answering empty, and `Contested`, `Discarded`), or a `ResolvedState` that is no longer fresh → `KeyStateUnavailable`, which the push gate answers with its retryable code `5004`; a signature that does not verify under the `#active` key → `SignatureInvalid`; a registration signed for relay A and verified with relay B's `PushRelay` → `SignatureInvalid`; a message that does not decode → `Malformed`; and a verifier constructed with no resolver → `VerifierUnavailable`. One test per case (`22-human-readable-addressing.md` §22.11.4, `09-security-model.md` §9.5.2, §9.7.4.2 R8, R14)",
+        "`KelPushVerifier::verify(&self, message: PushMessage<'_>, node: &NodeAddress)` replaces the refuse-all stub PUSH-005 left: it resolves the registrant through SCP-378's `resolve` and verifies the message's signature, over the SHA-256 of `PushMessage::signing_bytes(node)`, against the `#active` key `Current` in the `ResolvedState` the `ResolutionOutcome` carries. `node` is the `NodeAddress` of the context's current `ContextNodeAddress`, verified under the context's `ContextOperatorBinding`, from which the node derived the push routing ID the PUBLISH arrived at, and never a value the message carries (`10-infrastructure-and-self-hosting.md` §10.7.1 step 3, `09-security-model.md` §9.5.2). A test accepts a registration and a deregistration signed by the `#active` key of a valid chain, and returns the registrant. A test accepts one signed by the `#active` key of a chain whose later event was discarded (a served chain [Vector 41, C16-on-V41], verified under Vector 41's `#active`). It refuses, each with the named `PushVerifyError` variant: a signature by a key the resolved state holds `Superseded`, `Retired` or `Compromised` → `NotCurrentActive`; a resolution whose verdict is `Invalid` (a defective inception) → `IdentifierUnresolvable`; a resolution that carries no key state on any other verdict (`Inconclusive` of any cause, including every source answering empty, and `Contested`, `Discarded`), or a `ResolvedState` that is no longer fresh → `KeyStateUnavailable`, which the push gate answers with its retryable code `5004`; a signature that does not verify under the `#active` key → `SignatureInvalid`; a registration signed for node A and verified with node B's `NodeAddress` → `SignatureInvalid`; a message that does not decode → `Malformed`; and a verifier constructed with no resolver → `VerifierUnavailable`. One test per case (`22-human-readable-addressing.md` §22.11.4, `09-security-model.md` §9.5.2, §9.7.4.2 R8, R14)",
         "`PreRotationCustody`, `store_committed_pre_rotation_key`, `destroy_after_migration` and `PreRotationKeyHandle` are absent: `git grep -n` for each name under `crates/` prints nothing",
         "Body (`09-security-model.md` §9.5.2, ADR-066 decision 40): `KeyPackageAttestation` carries `active_key: [u8; 33]` and `active_key_algorithm` at preimage positions 7 and 8, under `\"SCP-KEYPACKAGE-ATTESTATION-V1:\"`. Tests: a round trip; rejection of algorithm `0x02`, of a body truncated inside `active_key`, and of trailing bytes; a one-byte flip of `active_key` fails verification; `spec_vector37_matches` (411/445, `25-test-vectors.md` Vector 37). Mutant: the decoder accepts any algorithm",
         "Minters and capabilities (`05-contexts.md` §5.13.3, `09-security-model.md` §9.7.1 checks 4a and 4b): at each minter (`create_group`, KeyPackage store and replenish, the Update leaf, and the PyO3, napi and UniFFI self-join), a test asserts `active_key == custody.public_key(handle)` for the handle that signed, that `capabilities.proposals` lists `0xF000`, and that `capabilities.extensions` lists `0xFF01` and `0xFF02`. `create_group_inner` (`crates/scp-mls/src/group.rs`) lists `0xFF01` and `0xFF02` as extension types and `0xF000` as a proposal type in `RequiredCapabilities`, and the module comment in `crates/scp-mls/src/context_extension.rs` that calls a `0xFF02` entry redundant is rewritten to cite RFC 9420 §7.3 and §11.1, quoted from the RFC text. A Commit receiver rejects an Add whose KeyPackage lacks `0xF000` (check 4b) and one whose leaf lacks `0xFF02`; an Update whose new leaf drops `0xFF02` from its capabilities is rejected; a GroupContextExtensions proposal that changes `RequiredCapabilities`, or that adds a second context extension type of a known rule set, is rejected; a Welcome whose GroupContext carries two context extension types of known rule sets is refused. Mutants: write a fixed key; omit `0xF000`; omit `0xFF02` from `RequiredCapabilities`",
         "`KeyHistoryAdvance` (`09-security-model.md` §9.7.1 'Key positions are group state', §9.7.4.2 R6): each test runs at two receivers, and both reach the same verdict. An Inception where no position exists is accepted, and one where a position exists is rejected; an Extend of the head is accepted; a frame that attaches to no held chain is rejected; an event with a bad signature, or with a copy-level defect, is rejected (no skip inside a proposal); X's position is Linear at 9, a frame holding X's honest event 10 is an Extend, the position becomes Linear at 10, and no frame can make that event contest X; a frame whose first event equals the held event at its sequence is rejected; ranking trace: X's chain at 5 commits C5, branch T is a rank-3 event at 6, branch H is an interaction event at 6 then a C5-revealing rotation at 7 with a root signature, presenting H against held T records H Linear, presenting T against held H is rejected as beaten, and both receivers reach the result R6 gives, never a tie; a rank-3 tie records Contested with `contested_since` equal to the sending epoch; a third branch on a Contested position that R6 ranks above both heads makes the position Linear; a ninth tied head is rejected, and a dominating branch at eight heads is accepted; two advances for one identifier in one Commit apply in proposal order, and one `KeyPositionRecorded` leaf records the result; `MAX_KEY_ADVANCES_PER_COMMIT` + 1 advances are rejected, and so are bodies totalling `MAX_KEY_ADVANCE_BYTES_PER_COMMIT` + 1 bytes; an advance for an identity with no leaf is rejected from a committer without `member:invite`, and accepted from one with it; a 2,000-event history is staged over successive Commits, and the Add follows. Unadopted tie: member M holds X's rank-3 tie and has adopted neither suffix, M commits the divergence, and both receivers record X Contested. Two-head leaf: the two-head `KeyPositionRecorded` leaf matches `25-test-vectors.md` Vector 80 byte for byte, and a Commit whose leaf lists the same heads in descending order is rejected. Held set: a `MemberLeft` for X makes X's position unheld at that Commit, both receivers delete X's bytes and keep X's head digests; a staged position stays held until `pending_since` + `MAX_STAGED_EPOCHS`, and then both receivers delete its bytes at the same Commit; a fourteenth position pending with one `staged_by` is rejected. Re-presentation: on an unheld Contested position with two heads, a re-presentation from inception over three Commits re-attaches at the Commit whose `presented` chains hold both heads; a frame with `s` = 0 on a held position is rejected. Leaf-key rule and current: on a fixture position, a leaf whose attested key is `Current` at the head in `#active` is current, one whose key is `Superseded` is stale, and with the position Contested, or with `presented` non-empty, no leaf is current. Cut off by a recovery: X holds leaves L1 under key K (installed at `seq` 4) and L2 under K′ (installed at `seq` 9); X's `RootRecovery` at `seq` 11 re-lists K `Current`; a member other than X commits the recovery with no confirmation; both receivers make L1 and L2 stale; an UpdatePath or Update that replaces either by a leaf attested under K or K′ is rejected; an Add, a reset re-add, an own-device Add and an external re-seat of a leaf under K after the recovery are each rejected; L2's device then commits a key-position Commit carrying X's advance through K″ (installed at `seq` 12), a confirmation at `seq` 12, and L2's replacement attested under K″, both receivers accept it, and the new leaf is current. Recovery rule: with `confirmed` at 11, a leaf whose key was installed at `seq` 12 is current at both receivers, and with `confirmed` absent, or below 11, it is not. Per leaf: two leaves of X under different keys, one `Current` and one `Superseded` at the head, get different verdicts at both receivers, and placing one leaf changes no other leaf's verdict. Winning branch: a winning branch with no `RootRecovery` that still lists the attested key `Current` keeps the leaf current, and a leaf whose key was installed only on the losing branch is stale. Displaced: X's position is Linear with head H6 at `seq` 6 and L1's key K is `Current` there; a Divergence at `seq` 4, whose branch rotates K away, wins under R6 and removes H6; both receivers set `displaced_at` and `displaced_top` to 3, and L1 is displaced; while the range is recorded, a Remove of L1 is rejected, whether a `member:remove` holder or an own-device Commit sends it; a confirmation above `seq` 3 clears both fields, L1 is then stale, and its Remove is accepted after `LEAF_REPLACEMENT_GRACE`; a leaf whose key the winning branch still lists `Current` stays current. The range survives a second displacement: the winning branch is then forked at `seq` 8 and the new branch outranks it; both receivers record `displaced_at` 3 and `displaced_top` 7; L1 is still displaced and its Remove is rejected; a leaf whose key was installed at `seq` 5 on the first winner's branch, and which the second ranking took away, is displaced too; a confirmation at `seq` 5 leaves the range in place, and one at `seq` 9 clears it; an Add of X while the range is recorded is rejected. No capability: a structural test pins that the advance verifier and the standing function take no resolver, `IdentityBackend`, clock or relay parameter. Mutants: rank by the first event after the shared prefix; rank by head sequence; accept a frame whose first event equals the held one; sort `heads` by `seq`; read the key's first `Current` event in place of its installing event; accept `confirmed` below the recovery; accept a cut-off leaf's replacement by a leaf that is not current; compute standing per identity rather than per leaf; keep bytes for an unheld position; rank `presented` tips before they re-attach; skip the per-stager cap; overwrite `displaced_at` with a later fork point; clear the range on a confirmation below `displaced_top`; leave a displaced leaf ungated",
         "Leaf entry against the position (`09-security-model.md` §9.7.1 'Verification (MUST)'): (a) a leaf whose `active_key` is `Current` at the position is accepted; (b) one that is `Superseded` at the position is rejected; (c) an Update whose `active_key` is current only after the same Commit's Extend is accepted, and is rejected without that Extend; (d) a contested identity's key-keeping Update is accepted, its key-changing Update is rejected, and its Add is rejected; (e) a replacement that reuses `signature_key` is rejected, by UpdatePath and by Update proposal (check 4a), a leaf replaced in epoch e and a re-added leaf that reuses an old `signature_key` while e is retained resolve to the right `(epoch, leaf_index)` entries, and every Update site in `crates/scp-mls/src/ratchet.rs` generates a new signer, a test that fails on the current `propose_update`; (f) the seven binding refusals (signature by another key, mismatched `signature_key`, `encryption_key`, `0xFF01`, `did`, `signing_key_id`, `expires_at <= issued_at`), each at a Commit receiver for an Add and for an Update; (g) an Add of an identity whose head chain carries an abandoning `CommitmentRollover` is rejected, and that identity's leaves are stale from the recording Commit; (h) re-attach: after X leaves, an Add of X whose re-presented chain holds X's recorded head re-attaches and is accepted without a confirmation; (i) re-seat below the head: X's recorded head is on a branch that X's later chain diverges below, an Add of X whose `presented` tip is that later chain's tip is rejected while the position has no `confirmed`, and it is accepted when a `member:invite` holder's earlier advance recorded a `FallbackConfirmation` of that tip; after the Add both receivers hold `heads` equal to the confirmed tip, `presented` empty, `pending_since` and `staged_by` cleared, and the new leaf current; the same Add from a committer without `member:invite` is rejected; (j) every leaf-placing path (Add, reset re-add, own-device Add, UpdatePath, Update, external re-seat) runs the same current check, and a test per path places a leaf that fails each condition of 'Current' in turn and is rejected at both receivers. A structural test pins that the leaf-entry function takes no resolver and no clock. Mutants: replace the position read with `Ok`; key the map by `signature_key`; accept a below-head re-seat with no `confirmed`; leave the old heads after the re-seat; let a confirmation advance on an unheld position pass without `member:invite`; skip the current check on one path",
         "No split (`09-security-model.md` §9.7.1 'The attested key is group state'): members A, B, C and D; B and D privately adopt X's rotation, and A and C do not; X's old-key Update is accepted by all four; B commits the Extend; X's old leaf becomes stale at all four in the same epoch, and a later old-key Update is rejected by all four. A test gives one member a resolver that returns a newer head, and asserts that its Commit verdicts equal the others' on 100 random Commits. Mutant: let the leaf check consult the member's resolver",
-        "Tree installer (`09-security-model.md` §9.7.1 'Verification (MUST): a member that installs a tree it did not build'): every test runs with the chains served by fixture relays. Joins that must succeed: a valid tree whose chains the joiner fetches by recorded digest, including pending positions of identities that hold no leaf, and unheld positions that need no bytes; a relay that serves events beyond a recorded `seq`, where the joiner installs the recorded position only and commits nothing from those events; a relay that serves a forged event under a recorded digest, where the joiner ignores it, fetches from a second relay, and joins; a real Contested position, whose branch frames arrive with the group state and verify, then a later advance that resolves it, after which the losing branch's frames are gone from every member's state; a Contested position whose branches no relay serves, where the joiner verifies them from the group-state frames, installs, holds that identity's leaves unverified, and reaches every existing member's position; a stale leaf held as stale, a contested leaf as unverified, a leaf cut off by a recovery as stale, and a leaf current under the recovery rule as current, matching the existing members. Joins that must be refused, each with the typed error naming the identifier: a GroupInfo whose `key_positions_hash` mismatches; a held Linear chain that no relay serves by the Welcome's TTL end, refused at the TTL end and not before; a forged genesis Linear position, whose head digest names no fetchable chain (an attacker-created context with an invented key for X); a Contested position with a fabricated branch, whose events carry no valid signature under the identity's keys at the fork point, recorded by a sole creator at epoch 1 with Y joining later; a Contested position whose group-state frames are missing; a Contested position whose two branches name different fork points; a Contested position whose branch ends at no recorded head; a Contested position whose fetched heads do not tie under R6, or whose `contested_since` is absent. Recording: an advance that makes a position Contested with a fabricated branch is rejected at two receivers, including when the committer is the only other identity's creator; one carrying a real branch by value is accepted; a branch longer than one Commit's advance bytes is recorded across two Commits, and both receivers hold the same frames. Restore: a member restoring state that lacks one held chain fetches it and restores, and one that holds every chain fetches nothing. Refusal paths: the first-time joiner's refusal sends exactly one self-Remove proposal; the re-add and fast-forward joiners, the re-seating member and the importer install nothing. Mutants: skip the hash check; keep an event beyond a recorded `seq`; accept a fetched event whose digest does not match; fetch a Contested branch from relays; require bytes for an unheld position; refuse on the first relay that fails; accept a Contested position whose branch frames are not verified",
+        "Tree installer (`09-security-model.md` §9.7.1 'Verification (MUST): a member that installs a tree it did not build'): every test runs with the chains served by fixture nodes. Joins that must succeed: a valid tree whose chains the joiner fetches by recorded digest, including pending positions of identities that hold no leaf, and unheld positions that need no bytes; a node that serves events beyond a recorded `seq`, where the joiner installs the recorded position only and commits nothing from those events; a node that serves a forged event under a recorded digest, where the joiner ignores it, fetches from a second node, and joins; a real Contested position, whose branch frames arrive with the group state and verify, then a later advance that resolves it, after which the losing branch's frames are gone from every member's state; a Contested position whose branches no node serves, where the joiner verifies them from the group-state frames, installs, holds that identity's leaves unverified, and reaches every existing member's position; a stale leaf held as stale, a contested leaf as unverified, a leaf cut off by a recovery as stale, and a leaf current under the recovery rule as current, matching the existing members. Joins that must be refused, each with the typed error naming the identifier: a GroupInfo whose `key_positions_hash` mismatches; a held Linear chain that no node serves by the Welcome's TTL end, refused at the TTL end and not before; a forged genesis Linear position, whose head digest names no fetchable chain (an attacker-created context with an invented key for X); a Contested position with a fabricated branch, whose events carry no valid signature under the identity's keys at the fork point, recorded by a sole creator at epoch 1 with Y joining later; a Contested position whose group-state frames are missing; a Contested position whose two branches name different fork points; a Contested position whose branch ends at no recorded head; a Contested position whose fetched heads do not tie under R6, or whose `contested_since` is absent. Recording: an advance that makes a position Contested with a fabricated branch is rejected at two receivers, including when the committer is the only other identity's creator; one carrying a real branch by value is accepted; a branch longer than one Commit's advance bytes is recorded across two Commits, and both receivers hold the same frames. Restore: a member restoring state that lacks one held chain fetches it and restores, and one that holds every chain fetches nothing. Refusal paths: the first-time joiner's refusal sends exactly one self-Remove proposal; the re-add and fast-forward joiners, the re-seating member and the importer install nothing. Mutants: skip the hash check; keep an event beyond a recorded `seq`; accept a fetched event whose digest does not match; fetch a Contested branch from nodes; require bytes for an unheld position; refuse on the first node that fails; accept a Contested position whose branch frames are not verified",
         "In-group signatures (`09-security-model.md` §9.7.1 'The attested key is group state', §9.7.4.2 R8 tree-key arm): (a) for each separator the R8 class table assigns to the tree-key arm, three tests: a payload signed under K′ before X's rotation Commit is rejected; one signed under K after that Commit is rejected; one from X's old leaf decrypted under the epoch before the Commit is accepted when the receiver processes it before merging the Commit, and rejected when the receiver processes it after. (b) A structural test pins that no tree-key verifier takes a resolver or `IdentityBackend`. (c) Sender binding: Y's MLS message carrying a payload whose signer is X is rejected for every direct separator, and a forwarded UCAN and a forwarded receipt take their class arm. (d) The leaf map: a late message; after a restart, a map exists exactly for the epochs whose secrets openmls's `MessageSecretsStore` kept, and a message under an evicted epoch fails to decrypt before any map lookup; the map and the secrets are written in one transaction, so an injected failure between them leaves neither; with a crash injected after F's merge transaction commits, the restarted member holds every closing mark F caused, and with one injected before, it holds F unmerged and no mark; a message decrypted before F and verified after F's merge is rejected, because the held message reads the live entry by `(epoch, leaf_index)`; pruning with the epoch's secrets; a lookup with no entry rejects; a closed entry rejects. (e) A stale leaf's direct sends are rejected from the recording Commit, and accepted before it. Mutants: skip closing; write the marks outside F's transaction; store a copy of the entry with a held message; persist the map past its epoch's secrets",
         "Contested content (`09-security-model.md` §9.7.1): two members, A and B; A holds X's tie privately, without having adopted it, before any Commit records it; both accept X's in-group envelope; A commits the divergence as a learner at its slot; after that Commit, both report `Invalid{NoPreforkBasis}` for X's envelopes under later epochs, and both accept the envelope they accepted earlier from the epoch before; a joiner installed after the Commit reads the same anchor from `contested_since`. Mutants: anchor on the member's own observation; restore the adoption gate on sending",
         "Stale leaf and step 1a (`09-security-model.md` §9.12 '1a. Removal of a stale leaf'): (a) after the Extend, the stale leaf's governance-leaf signatures fail, and its only accepted Commit is its replacement with a current leaf; (b) a key-keeping Update of a stale leaf is rejected; (c) X has two devices whose leaves are attested under X's shared `#active`, D1's rotation Commit replaces D1's leaf, D2's leaf goes stale, D2's leaf gets a Remove proposal when its grace ends, and D1's leaf gets none; (d) a member without `member:remove` proposes and never commits the Remove; (e) after that Remove, D1 re-adds D2's new leaf by an own-device Commit, both receivers derive nothing, and X keeps its role; (f) with per-device keys simulated by a fixture leaf-key rule that names a per-device role, revoking D2's key makes only D2's leaf stale, and D1 removes it by an own-device Commit at once. Mutant: count a key-keeping replacement as replacing",
-        "Sender hold (`09-security-model.md` §9.7.1 'A rotated device commits at once'): after a local rotation, the device's first in-group act in each context is its own key-position Commit carrying its advance and its leaf's replacement; it sends no `#active`-signed message before that Commit merges, and afterwards it sends the queue under K′. With every relay unreachable, the device does not publish, adopts nothing, and commits nothing, and the hold persists; once publication succeeds, it commits. A receiver with no relay access accepts that Commit, which shows that no verdict reads publication. The queue persists across a restart; overflow raises `QueueOverflow`; a device behind the context's epoch sends no `CommitRangeRequest`",
+        "Sender hold (`09-security-model.md` §9.7.1 'A rotated device commits at once'): after a local rotation, the device's first in-group act in each context is its own key-position Commit carrying its advance and its leaf's replacement; it sends no `#active`-signed message before that Commit merges, and afterwards it sends the queue under K′. With every node unreachable, the device does not publish, adopts nothing, and commits nothing, and the hold persists; once publication succeeds, it commits. A receiver with no node access accepts that Commit, which shows that no verdict reads publication. The queue persists across a restart; overflow raises `QueueOverflow`; a device behind the context's epoch sends no `CommitRangeRequest`",
         "Learner commits (`09-security-model.md` §9.7.1, learner slots and `KEY_ADVANCE_WINDOW`): idle context: after an Add of X whose position predates X's rotation, no other Commit follows, and the lowest-slotted online member that resolves the rotation commits it within `KEY_ADVANCE_WINDOW` plus one Commit, with no capability. Anchor and window: each learner's slot is `t₀ + ⌊r × 295 / n⌋` modulo the window, from the merge of its current epoch's Commit; a test with n = 96 and r = 95 commits within 295 s, and a test with n = 10,000 commits within 295 s. Three learners, in-order delivery: exactly one key-position Commit lands, and the other two re-test at their slots and send nothing. Collision: two learners whose slots coincide each submit a key-position Commit naming E; both receivers merge the one earlier in the chain and skip the other (ADR-069 decision 3); when both advances carry the same event, the skipped learner re-tests against the recorded position and sends nothing; when they carry different events, the skipped learner commits its event at its next slot, and both receivers then record the same position. Re-test: a learner whose head another Commit already recorded, or which a recorded head beats under R6, sends nothing; a learner whose head ties a recorded head under R6 commits it, and both receivers record the position Contested. Joiner: a joiner that holds a newer event commits it as its first act, with no slot. Authorization: a key-position Commit (advances plus the rule-11 GroupContextExtensions proposal) is authorized in `SingleAdmin` from a non-admin when every advanced identity holds a leaf. No precondition on recoveries: a learner commits a `RootRecovery` frame with no fallback-set lookup. After a recovery: a member that merges a Commit recording X's `RootRecovery` with no confirmation at or above it obtains a `FallbackConfirmation` and commits it at its slot; once X's post-recovery key is also recorded, the re-seat trigger holds while every leaf X holds was cut off by that recovery. After a displacement: a member that merges a Commit setting or widening the range, with no `confirmed` above `displaced_top`, obtains a `FallbackConfirmation` and commits it at its slot. A request naming a later head: a member that receives a valid `ReseatRequest` whose head is beyond X's recorded head commits X's advance at its slot, both receivers accept it, and the request then draws no answer at the next epoch. Mutants: drop the slot (every learner commits at once); anchor to the learner's own learning time; scale the wait by rank without dividing by n; wait for another member's Commit; drop the post-Add resolution; learner re-test requires rank above",
         "Wiring and ship order (AGENTS.md integration checklist): `pipeline_wiring.rs` asserts the advance verify step on the Commit dispatch path; the leaf-entry position check; the installer on the join dispatch path and the `import_context` dispatch path; the tree-key verify step for the inner envelope, consistency checkpoint, commit-range request and response, EpochAdvance and block notification; the key-position Commit class check on the Commit dispatch path; the leaf-map closing step on merge; the installer fetching held chains by recorded digest on the Welcome, reset re-add, fast-forward, import, re-seat and restore paths, reading no chain bytes from any message a member sends; the learner slot driver; the merge step deleting bytes for positions that stop being held; the `FallbackConfirmation` verifier on every advance that carries one; the merge step evaluating the re-seat trigger; the receive path running the re-seat unwrap only when sender-data decryption fails and the trigger holds; every external Commit reaching the external re-seat verifier, with no `PublicMessage` reaching openmls from any other path; the receive path for `ReseatRequest` reaching the learner and the `ReseatGroupInfo` answerer; the `ReseatRequest` answerer answering only from its tip and recording the identities it answered at that tip's epoch; the own-device Commit path reachable from the SDK's device add and device revoke operations; the SDK's recovery flow replacing a leaf it still controls by a key-position Commit, and otherwise sending a `ReseatRequest`, installing from the `ReseatGroupInfo`, publishing the wrapped external Commit, and, when that re-seat is not canonical, sending a new request and re-seating at the tip it is answered from; the authority check reading each proposal's sender leaf standing on every Commit path. Until criteria 3, 4 and 6 land, every tree-key verifier returns `NoActiveKey` (`// Stub — see SCP-315`), and a test covers each verifier. The typed install refusal maps to one error code in every binding. `key_positions` round-trips through the checkpoint snapshot and through restore",
         "Commit classes and size (`07-trust-validation-and-capabilities.md` §7.3.1.1 step 1.6, `09-security-model.md` §9.10.3): classes: for each class of step 1.6 other than key-position (an empty block, a recording or executing Commit 'With a proposal', 'With a checkpoint', 'With a revocation', 'With an outlet change', 'With own-device changes' and 'Without a proposal'), a Commit that also carries a `KeyHistoryAdvance` is rejected at two receivers; a key-position Commit that carries an Add, a Remove, a block `proposal` or any leaf other than `KeyPositionRecorded` is rejected. Worst case: the worst-case key-position Commit has 13 advances totalling `MAX_KEY_ADVANCE_BYTES_PER_COMMIT`, including one maximal confirmation-only advance, and thirteen 8-head leaves of 1,179 bytes, a leaves array of 15,369 bytes; its UpdatePath is for a 96-leaf tree, the TTL-context member cap (`05-contexts.md` 'Member cap'), laid out with the blank nodes that maximize the UpdatePath's ciphertexts; the test measures the published relay blob, not the Commit, asserts it is at most 262,144 bytes, and prints the margin. Packer: with a relay advertising `max_blob_size` 131,072, the packer emits fewer advances and the published blob is at most 131,072 bytes; for a tree large enough that the full cap no longer fits 262,144, the packer stops early and the next Commit carries the rest; with no advertised `max_blob_size`, the packer uses 262,144. External re-seat: an external re-seat with a 96-leaf tree's UpdatePath fits one 262,144-byte blob after the wrap, and the wrap's lengths equal a Commit `PrivateMessage`'s for the same padded size. Mutants: allow advances beside a checkpoint; pack to `MAX_KEY_ADVANCE_BYTES_PER_COMMIT` ignoring the blob size",
         "Rule-set binding (`13-versioning-and-protocol-evolution.md` §13.7.4, `05-contexts.md` §5.13.3): a Welcome whose GroupContext carries a context extension type the build does not implement (a test-only type ID) is refused with a typed error before any install; an Add of a KeyPackage whose leaf lacks the group's context extension type is rejected by openmls at every receiver; a structural test pins that no Commit, proposal or leaf verdict function takes a protocol-version parameter. Mutant: select rules from the `InnerEnvelope` `version` field",
         "Fetch and export (`09-security-model.md` §9.7.1 installer, `05-contexts.md` §5.12.3.1): Add: an `InvitationBundle` round-trips with no key-history bytes beside it, the joiner installs by fetching, and its signature verifies under the `active_key` of `creator_did`'s delivered leaf, which the installer found current. Reset re-add and fast-forward: X installs by fetching each held chain by recorded digest, with no member sending any chain. Export: it carries no chain bytes; an importer fetches each held chain by recorded digest and stops at the recorded `seq`; an importer that cannot fetch a held Linear chain rejects the import with the installer's typed error; an importer with neither the creator's chain nor a network path to it rejects the import. Held set: after X leaves, a new joiner fetches no bytes for X. Mutants: omit unheld positions from the hash; fetch past a recorded `seq`; read chain bytes from any message a member sends",
-        "Fallback-set confirmation (`09-security-model.md` §9.7.1, `FallbackConfirmation`): accepted: an advance carrying a fixture `FallbackConfirmation` (`25-test-vectors.md` Vector 80) is accepted at two receivers, and both record `confirmed` and `relay_list_sequence`. Rejected, one test each: a record whose governor is not the pinned identifier; a record signature that fails under the governor's recorded `#active`; a governor position that is not held; a record `sequence` below `relay_list_sequence`; an operator named by the carried service record while another entry remains; a proof over a different `routing_id`; a `value_digest` that does not match `response`; a proof signature that fails under the entry's `key`; a response whose last event is not a tip. Removal: with X's leaf stale after a recovery, a `member:remove` holder's Remove is rejected at both receivers until a confirmation on the head chain at or above the `RootRecovery` is recorded, and accepted after; the same holds for an abandonment. Re-admission: an Add of an identity whose head chain holds a `RootRecovery` is rejected unless the added leaf is current under the recovery rule, and an external re-seat while the position records no confirmation at or above the recovery is rejected. Governor staging: a non-admin member stages the governor's chain with no capability, and it does not count toward `MAX_PENDING_POSITIONS`. A structural test pins that the confirmation verifier takes no resolver, relay client or clock. Mutants: skip the exclusion; skip the sequence floor; read `observed_at`; accept a removal with a confirmation below the recovery",
+        "Fallback-set confirmation (`09-security-model.md` §9.7.1, `FallbackConfirmation`): accepted: an advance carrying a fixture `FallbackConfirmation` (`25-test-vectors.md` Vector 80) is accepted at two receivers, and both record `confirmed` and `node_list_sequence`. Rejected, one test each: a record whose governor is not the pinned identifier; a record signature that fails under the governor's recorded `#active`; a governor position that is not held; a record `sequence` below `node_list_sequence`; an operator named by the carried service record while another entry remains; a proof over a different `routing_id`; a `value_digest` that does not match `response`; a proof signature that fails under the entry's `key`; a response whose last event is not a tip. Removal: with X's leaf stale after a recovery, a `member:remove` holder's Remove is rejected at both receivers until a confirmation on the head chain at or above the `RootRecovery` is recorded, and accepted after; the same holds for an abandonment. Re-admission: an Add of an identity whose head chain holds a `RootRecovery` is rejected unless the added leaf is current under the recovery rule, and an external re-seat while the position records no confirmation at or above the recovery is rejected. Governor staging: a non-admin member stages the governor's chain with no capability, and it does not count toward `MAX_PENDING_POSITIONS`. A structural test pins that the confirmation verifier takes no resolver, node client or clock. Mutants: skip the exclusion; skip the sequence floor; read `observed_at`; accept a removal with a confirmation below the recovery",
         "External re-seat (`09-security-model.md` §9.7.1 'The external re-seat' and 'The re-seat trigger', `05-contexts.md` §5.12.3.4 and §5.12.3.5, ADR-069 decision 8): every test runs at two receivers, and both reach the same verdict. Sole admin: in a `SingleAdmin` context, admin X recovers its root, installs a fresh `#active`, and controls no device that holds a leaf, and learners record the recovery, the fresh `#active` and a confirmation; X sends a `ReseatRequest` to one member, which answers from its tip `S_E` with one `ReseatGroupInfo` whose `epoch` is E; X installs, fetching chains by recorded digest, and publishes the wrapped external Commit; both receivers accept it, and the new leaf is current from its merge; X's new leaf commits an own-device Commit that removes its cut-off leaves, both receivers derive no `MemberLeft` and keep X as admin, and X then adds a member. Not the admin: the same flow for a member Y without `member:invite` succeeds, and Y keeps its role. A later joiner: a member that joins after the re-seat computes X's new leaf as current, and the cut-off leaves, before their removal, as stale. One re-seat per recovery: after X's re-seat for R merges, a Remove of X's new leaf proposed by that leaf while a cut-off leaf remains, the same Remove by a `member:remove` holder, and a second external re-seat by X for R are each rejected at both receivers. A rotation opens nothing: X, with no `RootRecovery` on its chain, rotates `#active`, a learner records the advance so every leaf of X is stale, X's external re-seat is rejected, and X's own device's Update with a current leaf is accepted. A device X still controls: X's laptop holds a leaf cut off by X's recovery and commits a key-position Commit carrying X's advance through a key installed above the recovery, a confirmation, and its own replacement attested under that key; both receivers accept it, the trigger no longer holds for X, and an external re-seat by X is then rejected; a second cut-off device of X then commits only its UpdatePath with a current leaf, and both receivers accept it. Rejected, one test each: a re-seat while the position records no confirmation at or above the recovery; a re-seat while the position records no key installed at or above the recovery; a re-seat while `displaced_at` is recorded; a leaf whose key the recovery re-listed; a leaf attested under a pre-recovery `#active` by a thief holding X's old KeyPackage keys; an external Commit that carries a Remove (resync), a PreSharedKey, an Add, or non-empty `authenticated_data`; a joiner whose identifier holds no leaf in E's tree; a member that holds a current leaf; an external Commit sent as an unwrapped `PublicMessage`; a wrapped blob under another epoch's `K_w`. The KeyPackage in the wrap: a wrap with no KeyPackage, a wrap whose KeyPackage fails a §9.7.1 check, and a wrap whose KeyPackage's `signature_key` or `wrapping_key` differs from the new leaf's are each rejected at both receivers. Node view: the wrapped blob's clear header, `authenticated_data` length, `encrypted_sender_data` length and ciphertext length equal those of a real Commit `PrivateMessage` at E with the same padded size. No other source: a structural test pins that the external re-seat verifier takes no resolver, `IdentityBackend`, relay client or clock. Mutants: accept a Remove proposal in the external Commit; skip trigger item 1's cut-off check, or item 3, 4 or 5; skip the installing-event check; drop the one-re-seat rule; let a `PublicMessage` reach openmls outside the unwrap; answer when the trigger does not hold; answer a request signed below the anchor; leave `request_digest` out of the answer's preimage; derive `MemberLeft` for a Remove after which X still holds a leaf",
         "External re-seat, the answer (`05-contexts.md` §5.12.3.4 and §5.12.3.5, `09-security-model.md` §9.7.1): every case runs at two receivers, and both reach the same verdict. At the tip: a current member whose tip is `S_E` answers a valid request with exactly one `ReseatGroupInfo` whose `epoch` is E and whose `request_digest` matches the request. Never from an earlier state: a member whose tip is `S_{E+1}` answers for E+1 and never for E. Not current: a member that is not current sends no answer. No epoch in the request: the request is a MessagePack array of nine items whose bytes and digest match `25-test-vectors.md` Vector 82, and a ten-item array with `epoch` appended fails to decode at the receiving member. Replay: the same request, replayed at the same tip and at a later tip within its TTL, gets no second answer. Once per identity per tip epoch: a second request from X with a new nonce at the same tip gets no answer, and at the next tip it gets one. Open requests only: X ignores an answer to a request it has closed, and rejects an answer whose `request_digest` names no request it sent, including a valid answer to an earlier request re-sealed to X. Several answers: X asks three members and answers for E, E+2 and E+1 arrive; when X's builds for E and E+2 complete at the same moment, X submits the build for E+2 only; when the build for E completes first, X submits it at once, does not wait for the build for E+2, and ignores every answer that arrives after its submission. No answer is sent when the trigger does not hold, when the request is signed under a key installed below the anchor, when the request names an anchor other than the recorded R, or when the carried KeyPackage fails a §9.7.1 check or its leaf would not be current. No Welcome's GroupInfo carries `external_pub`, checked on an Add and on a reset re-add. Nested encoding: a request whose `signature` is a 65-byte bin is rejected, an answer whose `context_params` bin is not in RFC 8785 form is rejected, and both bodies match Vectors 82 and 81 byte for byte; the `ReseatGroupInfo` seal binds `request_digest` in `info` and `aad` and matches its Vector 81 seal byte for byte",
         "External re-seat, chain order (`09-security-model.md` §9.7.1 'Retry', `07-trust-validation-and-capabilities.md` §7.3.1.1 'Commit order', ADR-069 decisions 2, 3 and 8): the tests run on SCP-351's chain processing, and every test runs at two receivers that reach the same verdict. Re-seat first: the chain holds X's re-seat naming E before another member's Commit naming E; both receivers merge X's re-seat and skip the other Commit, and the other member re-checks its action and submits it again, and it merges at a later epoch. Re-seat second: the chain holds another member's Commit naming E before X's re-seat naming E; both receivers skip X's re-seat, and X sends a new request and re-seats at the epoch it is answered from. Two identities: the chain holds X's and Y's re-seats naming E, X's first; both receivers merge X's and skip Y's, and Y sends a new request and re-seats at the epoch it is answered from. Two devices of X: two devices of X submit re-seats naming E for R with different KeyPackages; both receivers merge the one earlier in the chain and skip the other, the other device's re-seat for R is rejected at E+1 (trigger item 1), and that device returns by an own-device Commit. Re-join class: X submits its re-seat with the re-join class, and a re-seat submitted with the class other or Remove is skipped at both receivers, after which a later valid Commit naming E merges. A stale answer: X's re-seat built from an answer for an epoch the group has passed is skipped at both receivers, and X sends a new request. A contest leaves `recovered_at` unchanged: a contest-recording advance leaves `recovered_at` and the `key_positions_hash` input unchanged at both receivers; the resolving advance that leaves the position Linear, with a different latest `RootRecovery` on its sole head, sets `recovered_at` to that event's [epoch, seq, digest]; a resolving advance whose sole head chain holds no `RootRecovery` sets `recovered_at` to null. Mutants: merge a later valid Commit naming E over an earlier one; accept a re-seat submitted with the class other; a contest that changes `recovered_at`",
@@ -11646,6 +11666,10 @@
         {
           "file": ".docs/specs/07-trust-validation-and-capabilities.md",
           "section": "##### Commit order"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.5.2 Signed Structure Definitions"
         }
       ],
       "details": {}
@@ -12980,11 +13004,11 @@
       "description": "§7.3.1 of the trust spec says events are signed by the acting agent, and §23.13 ¶1 of the sync spec verifies each event under the `actor_did` and `signing_key_id` fields of `Event`. Today the runtime provider appends every leaf with `signature: Vec::new()` through `append_unsigned_event`, and `Event` has no `signing_key_id` field, so step 1.6 of §7.3.1.1 (each leaf's own signature) cannot pass. This story adds `signing_key_id` and `key_state_head` to `Event` (ADR-011 as ADR-066 decision 23 amends it), the first naming the actor's identity-key role such as `#active` (the record field that hashes an MLS leaf key is `leaf_key_hash`, a different value), signs each commit-ordered leaf the runtime appends under the actor's identity key through the existing `EventLogSigner` seam, and adds the verify function that §23.13 ¶1 and §7.3.1.1 step 1.6 call, which takes the public key from its caller. It also gives every payload that steps 1.3 and 1.6 read the fields they read: `GovernanceActionExecutedPayload` becomes `[target_did, action_type, proposal_id, action_bytes]`, with `proposal_id: [u8; 32]` and `action_bytes: Vec<u8>` encoded as MessagePack binaries (`serde_bytes`), `action_bytes` holding the proposal's exact RFC 8785 bytes verbatim; a new `MemberResetPayload` is `[subject_did, last_known_epoch, reset_counter, reason]`, the two integers optional and nil for a reset a `ResetMember` action derives, and `reason` a non-optional `String`, empty for such a reset (§7.3.1.1 step 1.6); `MembershipChangePayload` and `TtlExtendedPayload` keep their fields. `action_bytes` is the action's one copy in an executing Commit (ADR-031 acceptance criterion 7 as ADR-066 amends it; §7.3.1.1, 'The action, once'). The `.docs/lessons/unsigned-event-mcp-bridge.md` lesson is updated to match. The committer's use of it is SCP-329; the receiver's is SCP-330.",
       "acceptanceCriteria": [
         "`Event` has `signing_key_id` and `key_state_head` fields, and the signature covers every field but `signature`; a test changes each field in turn and the verify function rejects the event",
-        "Every leaf the runtime provider appends carries a 64-byte signature that verifies under the actor's identity key, asserted by a test that appends one leaf of each commit-ordered event type the runtime emits",
+        "Every leaf the runtime provider appends carries a 64-byte signature made through `EventLogSigner` with the identity key of the actor's identity, which the instance's `IdentityRegistry` holds, and the signature verifies under that key, asserted by a test that appends one leaf of each commit-ordered event type the runtime emits",
         "`signature: Vec::new()` and `append_unsigned_event` have zero occurrences on any production path in `crates/scp-runtime`",
         "A leaf whose `signing_key_id` names a key other than the one supplied fails verification with `InvalidSignature`",
         "`GovernanceActionExecutedPayload` encodes as the four-item array `[target_did, action_type, proposal_id, action_bytes]` with `proposal_id` and `action_bytes` as MessagePack `bin`; a test round-trips a payload whose `action_bytes` is an 8,192-byte RFC 8785 action, asserts the decoded bytes equal the input byte for byte with no re-encoding, and asserts the encoded payload is 8,318 bytes for a 56-byte `target_did` and the 29-byte `action_type` `ModifyPseudonymRotationPolicy`; `MemberResetPayload` round-trips with all four fields and with both integers nil and an empty `reason`, and `reason` is a `String`, not an `Option`, so a nil `reason` fails to decode",
-        "The signature is over the `09-security-model.md` §9.5.2 Event preimage under `\"SCP-EVENT-V2:\"`, which ends with `signing_key_id` and `key_state_head` (ADR-011 as ADR-066 decision 23 amends it): a test vector fixes that hash for a fixed event and head; the encoded `Event` is a 9-element array whose last element is a 32-byte MessagePack `bin`; the runtime provider writes the actor's own key-state head when it signs; a leaf whose `key_state_head` names a position at which the signing key was not `Current` in the role `signing_key_id` names fails verification; a leaf whose actor has since rotated that key to `Superseded` or `Retired` still verifies; `\"SCP-EVENT-V1:\"` has zero occurrences in `crates/`, `scripts/gen-test-vectors-p256.py`, and `.docs/specs/25-test-vectors.md`; and Vectors 32 and 33 print the V2 layout, so `scripts/check-test-vectors-p256.py` passes",
+        "The signature is over the `09-security-model.md` §9.5.2 Event preimage under `\"SCP-EVENT-V2:\"`, which ends with `signing_key_id` and `key_state_head` (ADR-011 as ADR-066 decision 23 amends it): a test vector fixes that hash for a fixed event and head; the encoded `Event` is a 9-element array whose last element is a 32-byte MessagePack `bin`; the runtime provider writes the key-state head that `IdentityRegistry` holds for the actor's identity when it signs; a leaf whose `key_state_head` names a position at which the signing key was not `Current` in the role `signing_key_id` names fails verification; a leaf whose actor has since rotated that key to `Superseded` or `Retired` still verifies; `\"SCP-EVENT-V1:\"` has zero occurrences in `crates/`, `scripts/gen-test-vectors-p256.py`, and `.docs/specs/25-test-vectors.md`; and Vectors 32 and 33 print the V2 layout, so `scripts/check-test-vectors-p256.py` passes",
         "`cargo test -p scp-event-log --features testing` passes",
         "CI-feature `cargo clippy` over the touched crates and their tests pass"
       ],
@@ -12995,7 +13019,9 @@
         "Update the lesson",
         "Add the tests the criteria name"
       ],
-      "blockedBy": [],
+      "blockedBy": [
+        "SCP-371"
+      ],
       "sources": [
         {
           "file": ".docs/specs/07-trust-validation-and-capabilities.md",
@@ -13657,9 +13683,9 @@
         "crates/scp-transport/src/native/adapter.rs",
         "crates/scp-client/src/client.rs"
       ],
-      "description": "Spec 09 §9.10.2 'What a reconnecting device recovers' and spec 23 §23.3 state that a reconnecting device reads only one answer per routing ID and relay: a `QUERY` without a limit answers 100 blobs, a subscribe backfill answers 1,000, and nothing asks for the rest; the in-browser client subscribes without `since` and gets no backfill. With a 7-day blob TTL, a device offline for days can find more stored blobs than one answer holds. This story generalizes the (`stored_at`, `blob_id`) cursor of SCP-RELAYRES-009, which pages one routing ID's public records, to every catch-up path, so a reconnecting device reads every blob a relay still stores for its routing IDs.",
+      "description": "Spec 09 §9.10.2 'What a reconnecting device recovers' and spec 23 §23.3 state that a reconnecting device reads only one answer per routing ID and relay: a `QUERY` without a limit answers 100 blobs, a subscribe backfill answers 1,000, and nothing asks for the rest; the in-browser client subscribes without `since` and gets no backfill. With a 7-day blob TTL, a device offline for days can find more stored blobs than one answer holds. This story generalizes the (`stored_at`, `blob_id`) cursor that SCP-366 (the node public-record store) serves and SCP-368 (`NodeNetwork` and the node client) sends, which pages one routing ID's public records, to every catch-up path, so a reconnecting device reads every blob a relay still stores for its routing IDs.",
       "acceptanceCriteria": [
-        "Native reconnect catch-up of a routing ID holding 2,500 stored blobs delivers all 2,500, each once, by repeated `QUERY` calls that advance the (`stored_at`, `blob_id`) cursor of SCP-RELAYRES-009",
+        "Native reconnect catch-up of a routing ID holding 2,500 stored blobs delivers all 2,500, each once, by repeated `QUERY` calls that advance the (`stored_at`, `blob_id`) cursor that SCP-366 (the node public-record store) serves and SCP-368 (`NodeNetwork` and the node client) sends",
         "250 blobs that share one `stored_at` are all delivered at a page limit of 100",
         "Catch-up stops when a page returns fewer blobs than its limit, and a relay error mid-way returns a typed error that names the routing ID",
         "The in-browser client, after a reconnect with a persisted last `stored_at`, receives every blob stored on its routing IDs since then, 2,500 blobs included",
@@ -13671,7 +13697,7 @@
         "Add one test per criterion"
       ],
       "blockedBy": [
-        "SCP-RELAYRES-009"
+        "SCP-368"
       ],
       "sources": [
         {
@@ -13681,6 +13707,963 @@
         {
           "file": ".docs/specs/23-sync-and-offline-strategy.md",
           "section": "## 23.3 Reconnection Protocol"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-377",
+      "title": "Rename `RelayEndpoint` to `NodeUrl` and `RelayUrl` to `PushReservation` across the workspace",
+      "gate": "gate-kel",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-did/src/relay_url.rs",
+        "crates/scp-did/src/node_url.rs",
+        "crates/scp-did/src/lib.rs",
+        "crates/scp-transport/src/relay/push_gate.rs",
+        "crates/",
+        "bindings/"
+      ],
+      "description": "`03-identity.md` §3.10.10 names the validated node URL type `NodeUrl`, a §9.18.2 canonical URL, and `18-addressability-and-deployment.md` §18.2.1 states its URL rules: the canonical form exists and its path ends in `/scp/v1`; and no new identifier names a relay. `RelayEndpoint` in `crates/scp-did/src/relay_url.rs` is that type, so it moves to `crates/scp-did/src/node_url.rs` under the name `NodeUrl`. The type named `RelayUrl` is a different one: `crates/scp-transport/src/relay/push_gate.rs` defines it as the push routing ID a node reserves (`10-infrastructure-and-self-hosting.md` §10.7.1) together with the canonical URL and tier 3 target it is derived from, and it checks no `/scp/v1` path, so it becomes `PushReservation` and not `NodeUrl`, which keeps one `NodeUrl` in the workspace. The set type `ReservedRelayUrls` becomes `PushReservations`. Both renames are mechanical and go through sed across the 28 files under `crates/` that name `RelayUrl` and the 13 that name `RelayEndpoint`; no file under `bindings/` names either. They change no validation rule. Node backend execution plan code PR C1; no other coder holds any of these files while it runs.",
+      "acceptanceCriteria": [
+        "`git grep -w -e RelayUrl -e RelayEndpoint -e ReservedRelayUrls -e canonical_relay_url -e RelayUrlError -e RelayEntryUrlError -e SCP_RELAY_PATH -e InvalidRelayUrl -- crates bindings` prints nothing, and `crates/scp-did/src/relay_url.rs` does not exist",
+        "`NodeUrl` validates at construction exactly as `RelayEndpoint` did: the existing construction tests pass unchanged except for the type name, and a test constructs one valid URL and is refused one URL whose canonical path does not end in `/scp/v1` (`18-addressability-and-deployment.md` §18.2.1)",
+        "`cargo test --workspace` with the CI feature list passes",
+        "No `unwrap()` or `expect()` in library code",
+        "CI-feature `cargo clippy` over the touched crates and their tests passes"
+      ],
+      "actionItems": [
+        "Move `crates/scp-did/src/relay_url.rs` to `node_url.rs`, and rename `RelayEndpoint` to `NodeUrl` there and in its re-export in `crates/scp-did/src/lib.rs`.",
+        "Rename `canonical_relay_url`, `RelayUrlError`, `RelayEntryUrlError`, `SCP_RELAY_PATH` and `InvalidRelayUrl` to `canonical_node_url`, `NodeUrlError`, `NodeEntryUrlError`, `SCP_NODE_PATH` and `InvalidNodeUrl`, after the **Canonical node URL** paragraph of `09-security-model.md` §9.18.2, keeping every error code and wire string. Rename `RelayUrl` to `PushReservation` in `crates/scp-transport/src/relay/push_gate.rs`, rename every use of both types under `crates/` and in `scaffolds/relay` with sed, then run `cargo fmt --all`."
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.2.1 SCPNode"
+        },
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.10 IdentityBackend, the Resolution Trait"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-364",
+      "title": "Node identifier, node binding, node-list record and node-proof wire types",
+      "gate": "gate-kel",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-did/src/node_id.rs",
+        "crates/scp-did/src/lib.rs",
+        "crates/scp-kel/src/node_id.rs",
+        "crates/scp-kel/src/lib.rs",
+        "crates/scp-protocol/src/node/mod.rs",
+        "crates/scp-protocol/src/node/binding.rs",
+        "crates/scp-protocol/src/node/list.rs",
+        "crates/scp-protocol/src/node/proof.rs",
+        "crates/scp-protocol/src/lib.rs",
+        "crates/scp-kel/src/routing.rs",
+        ".docs/specs/25-test-vectors.md",
+        "scripts/gen-test-vectors-p256.py",
+        "crates/scp-runtime/tests/test_vectors.rs"
+      ],
+      "description": "A node is named by a `NodeId`, the digest of its node key, and an operator attributes a node key to itself through a `NodeBinding` that both the operator's identity key and the node key sign (`09-security-model.md` §9.6.3). A governor publishes the node list as a `NodeListRecord` of `NodeListEntry {binding, url, free}` values, fetched at the `scp:nls:` routing id in the `0x06` frame (`09-security-model.md` §9.10.12). A node answers a QUERY carrying `proof_nonce` with a node proof under the `SCP-NODE-PROOF-V1:` separator, which replaces the relay-era proof and list separators (`09-security-model.md` §9.18.2). This story adds the pure types, their codecs and their vectors, and no network code. Node backend execution plan code PR C2.",
+      "acceptanceCriteria": [
+        "`NodeId` is a 32-byte newtype in `scp-did`. `NodeId::derive` in `scp-kel` computes `SHA-256(\"SCP-NODE-ID-V1:\" || node_key)` and refuses a key that is not a 33-byte compressed SEC1 point on P-256: a test per refusal (wrong length, `0x04` prefix, off-curve point) and one known-answer test (`09-security-model.md` §9.6.3, §9.18.2)",
+        "`NodeBinding {operator, node_key, url_hash, key_state_head, operator_sig, possession_sig}` verifies `operator_sig` under the operator's `#active` key at `key_state_head` and `possession_sig` under `node_key`, both over `P = SHA-256(\"SCP-NODE-BIND-V1:\" || operator || node_key || url_hash || key_state_head)`; a test flips each of the six fields in turn and sees the binding refused (`09-security-model.md` §9.6.3)",
+        "`NodeListRecord {context_id, sequence, governor, signing_key_state_head, entries}` and `NodeListEntry {binding, url, free}` encode, and the governor signature covers `SHA-256(\"SCP-NODE-LIST-V1:\" || BE32(len(context_id)) || context_id || BE64(sequence) || governor || signing_key_state_head || SHA-256(entries))`; a round-trip test and a test that flips each record field and sees the signature refused (`09-security-model.md` §9.6.3)",
+        "The `scp:nls:` routing derivation exists in `crates/scp-kel/src/routing.rs`, and the `0x06` node-list frame codec round-trips and refuses each rule `09-security-model.md` §9.10.12 states for that frame, including a frame without `retain`: one test per rule",
+        "The node-proof preimage uses `SCP-NODE-PROOF-V1:`, and `git grep -e SCP-RELAY-PROOF-V1: -e SCP-RELAY-LIST-V1: -- crates scripts` prints nothing (`09-security-model.md` §9.18.2)",
+        "`FallbackConfirmation` carries `node_proof` and `node_list_sequence`, and no field named `relay_proof` or `relay_list_sequence` remains (`09-security-model.md` §9.7.1)",
+        "Vectors 44, 49 and 80 and the node-proof vectors of `25-test-vectors.md` are re-pinned to the node layouts, new vectors pin one `NodeId` and one `NodeBinding`, `scripts/gen-test-vectors-p256.py` emits them, `python3.12 scripts/check-test-vectors-p256.py` passes, and `test_vectors.rs` asserts each hash",
+        "No `unwrap()` or `expect()` in library code",
+        "CI-feature `cargo clippy` over the touched crates and their tests passes"
+      ],
+      "actionItems": [
+        "Add `NodeId` to `scp-did` and `NodeId::derive` to `scp-kel`.",
+        "Add `NodeBinding`, `NodeListRecord`, `NodeListEntry` and the node-proof preimage under `crates/scp-protocol/src/node/`.",
+        "Add the `scp:nls:` routing derivation and the `0x06` frame codec.",
+        "Re-pin Vectors 44, 49 and 80 and the node-proof vectors; add the `NodeId` and `NodeBinding` vectors."
+      ],
+      "blockedBy": [
+        "SCP-377"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.6.3 Node List Authentication"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.10.12 Node Record Frames"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "#### 9.18.2 Domain Separators"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.7.4.2 Root-Authority Recovery and Fork Precedence"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-365",
+      "title": "Context operator binding, context node address, and the chain-entry and receipt preimages",
+      "gate": "gate-kel",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-protocol/src/context/operator_binding.rs",
+        "crates/scp-protocol/src/context/node_address.rs",
+        "crates/scp-protocol/src/context/mod.rs",
+        ".docs/specs/25-test-vectors.md",
+        "scripts/gen-test-vectors-p256.py",
+        "crates/scp-runtime/tests/test_vectors.rs"
+      ],
+      "description": "The operator of a context's node signs a `ContextOperatorBinding {context_id, operator, context_key, key_state_head}` under its `#active` key in the log-anchored class, and the binding's `binding_hash` is a genesis parameter of the context (`09-security-model.md` §9.5.2, `05-contexts.md` §5.13.3). The node announces where it is reached in a `ContextNodeAddress {binding_hash, sequence, node}` signed under `context_key`, where `node` is a `NodeAddress {url, bridge}`. Chain entries and receipts carry `binding_hash`. This story adds the pure types, their verify functions and their vectors; SCP-376 issues them. Node backend execution plan code PR C3.",
+      "acceptanceCriteria": [
+        "`ContextOperatorBinding` computes `binding_hash = SHA-256(\"SCP-CONTEXT-OPERATOR-V1:\" || context_id || operator || context_key || key_state_head)` under the `09-security-model.md` §9.5.1 rules, and its verify function checks the operator signature under the operator's `#active` key at `key_state_head` and refuses a `context_key` that is not a point on P-256: a test per field flip and one for an off-curve key (`09-security-model.md` §9.5.2)",
+        "`ContextNodeAddress {binding_hash, sequence, node}` verifies under `context_key`; `sequence` starts at 1; a reader holding sequence n refuses n and every lower sequence and adopts n + 1: tests for each (`09-security-model.md` §9.5.2)",
+        "`NodeAddress {url, bridge: Option<{via: NodeId, bridge_target, wrapping_key}>}` round-trips with and without `bridge`, and its preimage carries `bridge` as BE32 length plus 97 bytes, or `SHA-256(0x00)` when absent: a test per form (`09-security-model.md` §9.5.2)",
+        "The chain-entry preimage under `SCP-CONTEXT-CHAIN-V1:` covers `binding_hash`, `position`, `item_hash` and `previous_hash`, and the receipt preimage under `SCP-CONTEXT-RECEIPT-V1:` covers `binding_hash`, `position` and `submission_hash`; a test shows `item_hash` and `submission_hash` hash identical bytes for one submission (`09-security-model.md` §9.5.2)",
+        "Vectors in `25-test-vectors.md` pin the binding, the context node address, the chain entry and the receipt; `python3.12 scripts/check-test-vectors-p256.py` passes and `test_vectors.rs` asserts each hash",
+        "The new modules hold pure types only, so `scripts/check-protocol-deps.sh` passes",
+        "No `unwrap()` or `expect()` in library code",
+        "CI-feature `cargo clippy` over the touched crates and their tests passes"
+      ],
+      "actionItems": [
+        "Add `ContextOperatorBinding`, `ContextNodeAddress` and `NodeAddress` with their verify functions.",
+        "Add `binding_hash` to the chain-entry and receipt preimages.",
+        "Pin the four vectors."
+      ],
+      "blockedBy": [
+        "SCP-364"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.5.2 Signed Structure Definitions"
+        },
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.13.3 Creation"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "#### 9.18.2 Domain Separators"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-366",
+      "title": "Node public-record store: admission, selection, retention and quota classes per kind",
+      "gate": "gate-kel",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-node/src/public_records/mod.rs",
+        "crates/scp-node/src/public_records/admission.rs",
+        "crates/scp-node/src/public_records/selection.rs",
+        "crates/scp-node/src/public_records/quota.rs",
+        "crates/scp-node/src/lib.rs",
+        "crates/scp-transport/src/native/server.rs",
+        "crates/scp-transport/src/native/storage.rs",
+        "crates/scp-transport/src/native/combined.rs",
+        "crates/scp-transport/src/native/local_cache.rs",
+        "crates/scp-transport/src/native/postgres_blob.rs",
+        "crates/scp-transport/src/native/redb_blob.rs",
+        "crates/scp-transport/src/native/s3_blob.rs",
+        "crates/scp-transport/src/native/sqlite_blob.rs"
+      ],
+      "description": "Every conforming node validates the public records it stores, as defense in depth and never as a trust dependency (ADR-065 decisions 1 and 2, `09-security-model.md` §9.10.12). A node admits and selects each retained kind by the per-kind table of §9.10.12, keeps a retained record with no TTL, and charges four quota classes keyed on routing id: retained public records, KeyPackage sets, identity private state, and TTL-bearing blobs (ADR-065 decision 3, `09-security-model.md` §9.18.B). The non-validating storage class goes. A QUERY pages by the (`stored_at`, `blob_id`) cursor, the criteria SCP-RELAYRES-009 carried before its withdrawal. `scp:wit:` admission is SCP-369's, private state SCP-373's, and KeyPackage sets SCP-374's. Node backend execution plan code PR C4.",
+      "acceptanceCriteria": [
+        "One `scp-node` integration test per kind (`scp:did:`, `scp:svc:`, `scp:wcf:`, `scp:nls:`) shows admission and selection as the `09-security-model.md` §9.10.12 per-kind table states: a record the table admits is stored and served, and a record it refuses is answered with the code the table names",
+        "Codes 4040 and 4044 keep their meaning and their numbers: a test per code",
+        "`retain` is required on `scp:did:`, `scp:svc:`, `scp:wit:`, `scp:wcf:` and `scp:nls:`, and the node refuses a retained kind without `retain`, `retain` on any other kind, and `retain` together with `blob_ttl`: one test per refusal (`09-security-model.md` §9.10.12)",
+        "`BlobStorage::store` takes `retain`, and every backend (`combined.rs`, `local_cache.rs`, `postgres_blob.rs`, `redb_blob.rs`, `s3_blob.rs`, `sqlite_blob.rs`) keeps a retained record past every TTL purge: one test per backend",
+        "The four quota classes exist, each keyed on routing id with no stored value; a write past a class's limit is refused and leaves the other three classes' counts unchanged: a test per class (`09-security-model.md` §9.18.B)",
+        "A QUERY carrying `after_blob` returns only the blobs whose (`stored_at`, `blob_id`) pair sorts strictly after (`since`, `after_blob`); a QUERY carrying `after_blob` without `since` receives `ERR` `4002`; a query and a backfill are served in ascending (`stored_at`, `blob_id`) order: a test per boundary, one for the refusal, and one that stores blobs out of order (`10-infrastructure-and-self-hosting.md` §10.4.1)",
+        "The non-validating storage class and its tests are deleted: `git grep` for its type name over `crates/` prints nothing",
+        "No `unwrap()` or `expect()` in library code",
+        "CI-feature `cargo clippy` over the touched crates and their tests passes"
+      ],
+      "actionItems": [
+        "Add `crates/scp-node/src/public_records/` with admission, selection and quota per kind.",
+        "Add `retain` to `BlobStorage::store` and honor it in every backend's purge.",
+        "Serve QUERY by the (`stored_at`, `blob_id`) cursor.",
+        "Delete the non-validating storage class and its tests."
+      ],
+      "blockedBy": [
+        "SCP-364"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.10.12 Node Record Frames"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.18.B Configurable Parameters"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "## 10.4 Node Architecture"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.4.1 Node Wire Protocol"
+        },
+        {
+          "file": ".docs/adrs/phase-1.md",
+          "section": "## ADR-004: SCP Native Relay Protocol"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-367",
+      "title": "`AdversarialNode` test fixture over a real node public-record store",
+      "gate": "gate-kel",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-testing/src/nodes.rs",
+        "crates/scp-testing/src/lib.rs",
+        "crates/scp-testing/Cargo.toml"
+      ],
+      "description": "No in-memory network and no always-accept publisher exists on any build. Identity tests run against `scp-testing::nodes::AdversarialNode`, a real `scp-node` public-record store (SCP-366) bound on loopback and wrapped in a policy that misbehaves the way a hostile or faulty node can. The fixture is compiled only under the `testing` feature, which no shipped artifact enables. Node backend execution plan code PR C5.",
+      "acceptanceCriteria": [
+        "`scp_testing::nodes::AdversarialNode` exists only under `#[cfg(feature = \"testing\")]` and runs the SCP-366 store on a loopback port",
+        "One test per policy shows the misbehavior on the wire: truncate a page, pad a page, serve a same-second burst, serve one proven source, skew the clock, serve a fork, and refuse under a quota class",
+        "`scripts/check-shipped-feature-graph.sh` passes, so no shipped artifact reaches the fixture",
+        "No `unwrap()` or `expect()` in library code",
+        "CI-feature `cargo clippy` over the touched crates and their tests passes"
+      ],
+      "actionItems": [
+        "Add `AdversarialNode` and its policies.",
+        "Add one test per policy."
+      ],
+      "blockedBy": [
+        "SCP-366"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.10.12 Node Record Frames"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.7.4.2 Root-Authority Recovery and Fork Precedence"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-368",
+      "title": "`NodeNetwork`, the sealed `IdentityBackend`, node-list acceptance and the node client",
+      "gate": "gate-kel",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-identity/src/network/mod.rs",
+        "crates/scp-identity/src/network/list.rs",
+        "crates/scp-identity/src/network/policy.rs",
+        "crates/scp-identity/src/backend.rs",
+        "crates/scp-identity/src/lib.rs",
+        "crates/scp-transport/src/native/node_client.rs",
+        "crates/scp-relay-client/src/protocol.rs",
+        "crates/scp-identity/src/relay_querier.rs",
+        "crates/scp-transport/src/native/relay_querier.rs",
+        "crates/scp-transport/src/native/relay_publisher.rs",
+        "crates/scp-transport/src/config.rs"
+      ],
+      "description": "`IdentityBackend` is sealed, and `NodeNetwork` is its one implementation (`03-identity.md` §3.10.10). The network starts from `NODE_LIST_POINTER {governor, context_id, bootstrap, min_list_sequence}` (`09-security-model.md` §9.6.4), fetches the governor's node list, and accepts it in the four steps of §9.6.3: governor, record, entries and adoption. `NodeClient` speaks the frames spec 10 §10.4.1 lists. The relay-era resolution types this replaces, which the withdrawn SCP-RELAYRES stories shipped, are deleted with their tests. Renaming the `scp-relay-client` crate and its wire types belongs to the relay crate deletion (context-operation plan D8); this story extends the wire types in place. Node backend execution plan code PR C6.",
+      "acceptanceCriteria": [
+        "`IdentityBackend: sealed::Sealed`, and `NodeNetwork` is the only type that implements it: a `compile_fail` doctest implements it outside the crate",
+        "`NodeNetwork::new(storage, client)` is `pub` and takes no URL and no list; `NodeNetwork::with_pointer` exists only under `#[cfg(any(test, feature = \"testing\"))]` (`03-identity.md` §3.10.10)",
+        "`NODE_LIST_POINTER` carries `governor`, `context_id`, `bootstrap: [NodeUrl]` and `min_list_sequence` (`09-security-model.md` §9.6.4)",
+        "One test per acceptance step of `09-security-model.md` §9.6.3, each against `AdversarialNode`: a record whose `context_id` or `governor` mismatches is refused; a record below the persisted sequence floor is refused; a record below the pointer's `min_list_sequence` is refused; each entry's operator is resolved under R2 and R3 alone with no floor, and an entry whose binding fails verification is void while the rest of the list is adopted; adoption persists the record and each operator's head as floors, and a restart reads them back",
+        "Attribution evidence is stored as the triple (binding, list record, entry index), and standing holds only while a non-void entry carries the binding: a test removes the entry in a later list and sees standing end while the triple stays (`09-security-model.md` §9.6.3)",
+        "Two entries carrying one node key void both, and the first binding stays that key's attribution: a test (`09-security-model.md` §9.6.3)",
+        "`NodeClient` sends PUBLISH (`retain`, `delete_token_hash`, `write_key`), QUERY (`since`, `after_blob`, `limit`, `proof_nonce`), SUBSCRIBE, UNSUBSCRIBE, DELETE (`delete_token` or `write_key`), ACK, PING and the bridge frames, and reads OK, ERR (with `last_cosigned_head`), BLOB, the `query_complete` EVENT (`count`, `node_proof`), the `backfill_complete` EVENT and PONG; `crates/scp-relay-client/src/protocol.rs` gains every field it lacks, and one round-trip test per message checks its fields against `10-infrastructure-and-self-hosting.md` §10.4.1",
+        "`node_list()`, the pure `fallback_set(&AcceptedNodeList, Option<&ServiceRecord>)` and `read_policy(&NodeUrl)` exist on the trait, each with a test (`03-identity.md` §3.10.10)",
+        "`git grep -e TransportRelayQuerier -e RealMultiRelayQuerier -e TransportRelayPublisher -e DefaultRelayResolver -e FALLBACK_RELAYS -e SCP-RELAYRES -- crates bindings` prints nothing, and the tests of those types are deleted with them",
+        "No `unwrap()` or `expect()` in library code",
+        "CI-feature `cargo clippy` over the touched crates and their tests passes"
+      ],
+      "actionItems": [
+        "Seal `IdentityBackend` in `crates/scp-identity/src/backend.rs` and add `NodeNetwork` under `crates/scp-identity/src/network/`.",
+        "Add `NODE_LIST_POINTER` and the four-step list acceptance.",
+        "Add `NodeClient` and extend the wire types with the missing fields.",
+        "Delete the RELAYRES types, `FALLBACK_RELAYS`, their tests and the code comments that cite SCP-RELAYRES."
+      ],
+      "blockedBy": [
+        "SCP-367"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.10 IdentityBackend, the Resolution Trait"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.6.3 Node List Authentication"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.6.4 First-Contact Trust Bootstrapping"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.4.1 Node Wire Protocol"
+        },
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.5.1 The Node List and the Bootstrap Pointer"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-369",
+      "title": "A witness is a listed node: `NodeId` witness sets, the default set and `scp:wit:` admission",
+      "gate": "gate-kel",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-did/src/key_state.rs",
+        "crates/scp-identity/src/kel/witness.rs",
+        "crates/scp-identity/src/kel/config.rs",
+        "crates/scp-node/src/public_records/witness.rs",
+        "crates/scp-identity/src/network/witness.rs"
+      ],
+      "description": "A witness is a node the accepted node list carries, named by its `NodeId`, and it cosigns a head under its node key (`09-security-model.md` §9.7.4.3). The default witness set walks the governor's list order. A node admits a witness head at `scp:wit:` only from a node key the list attributes, and standing gates only the opening of a new (subject, witness) slot; conflicting heads and conflict statements are always admitted. Node backend execution plan code PR C7.",
+      "acceptanceCriteria": [
+        "`KeyState.witnesses` is `Vec<NodeId>` and `WitnessChoice::Designated { witnesses: Vec<NodeId> }`; a designated set naming one `NodeId` twice, or more than `MAX_WITNESS_SET_SIZE`, is refused with `IllegalKeyEvent { stage: Content }`: a test per case (`03-identity.md` §3.10.10)",
+        "`default_witness_set(&AcceptedNodeList) -> Vec<NodeId>` walks the governor's list order, skips void entries, takes the first entry per `binding.operator`, and stops at `MAX_WITNESS_SET_SIZE`: a test per rule (`09-security-model.md` §9.7.4.3)",
+        "A witness node cosigns under its node key, and a cosigned head verifies under the node key the list attributes to that `NodeId`: a test, and one that refuses a head signed by another key",
+        "`scp:wit:` admission requires a node key the accepted list attributes and requires standing only to open a new (subject, witness) slot; a conflicting head and a `scp:wcf:` conflict statement are admitted without standing: a test per case (`09-security-model.md` §9.7.4.3)",
+        "`SelfObservation` reports `WitnessWithoutStanding { node_id }` for a designated witness whose node key has no standing in the accepted list: a test",
+        "Codes 4050, 4051, 4052 and 4053 keep their meaning and their numbers: a test per code at the node",
+        "A fault proof against a stolen node key ends that `NodeId`'s standing and leaves the operator's other `NodeId`s standing: a test",
+        "No `unwrap()` or `expect()` in library code",
+        "CI-feature `cargo clippy` over the touched crates and their tests passes"
+      ],
+      "actionItems": [
+        "Re-key witness sets on `NodeId`.",
+        "Move `default_witness_set` to list order.",
+        "Add `scp:wit:` admission in `scp-node`.",
+        "Delete the `ListedOperator` witness keying and its tests."
+      ],
+      "blockedBy": [
+        "SCP-368"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.7.4.3 Witness and Watcher Layer (Layer B)"
+        },
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.10 IdentityBackend, the Resolution Trait"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.6.3 Node List Authentication"
+        },
+        {
+          "file": ".docs/adrs/ADR-063-inception-derived-identity-key-event-log.md",
+          "section": "### Freshness and the witness layer"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-378",
+      "title": "Resolve an identity over nodes",
+      "gate": "gate-kel",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-identity/src/network/resolve.rs",
+        "crates/scp-identity/src/resolution.rs",
+        "crates/scp-identity/src/cache.rs",
+        "crates/scp-identity/src/dht.rs",
+        "crates/scp-identity/src/resolver.rs"
+      ],
+      "description": "`IdentityBackend::resolve` queries the publication set, walks each node's pages to exhaustion, verifies each node proof, and returns a `ResolutionOutcome` whose `ResolutionSources` separates the nodes reached, the operators declared by the list, and the operators proven (`03-identity.md` §3.10.4, §3.10.10). The resolution criteria SCP-007 carried move here, reworded for nodes, together with SCP-006's W2 and the page-walk criteria SCP-RELAYRES-009 carried before its withdrawal. The DHT resolution path in `scp-identity` is deleted with its tests. Node backend execution plan code PR C8.",
+      "acceptanceCriteria": [
+        "`resolve(identifier)` returns a `ResolutionOutcome` from the node network, the one resolution layer (`03-identity.md` §3.10.4)",
+        "`resolve` recomputes the identifier from the inception event and discards a differing response (`09-security-model.md` §9.7.4.2 R2)",
+        "`resolve` verifies every later event under the standing root, discards a defective event past the inception, and returns `Invalid` only for a defective inception (`09-security-model.md` §9.7.4.2 R3, R14)",
+        "`resolve` derives the key state from the latest state-carrying event at or before the adopted head (`09-security-model.md` §9.7.4.2 R8)",
+        "Content signed under a key the resolved log's replay marks `Superseded` or `Retired` is judged by the class the classification table of `09-security-model.md` §9.7.1 assigns its separator: an attestation-class signature fails, a content-class signature verifies only for content that reached the party under an epoch before that context's boundary for the key, and a log-anchored signature verifies only where the key was `Current` at the position its `key_state_head` names: a test per class, each signed under the `Superseded` key of a chain whose `KeyState` installs a new `#active` key (`09-security-model.md` §9.7.1, §9.7.4.2 R8)",
+        "The log-anchored arm reads the key that held the named role, and its condition, from `scp_kel::key_state_at` at the digest the artifact's `key_state_head` names on the adopted chain, and rejects an artifact whose `key_state_head` is no event of that chain (`NotOnChain`): a test anchors a signature at the event before a rotation and sees it verify, anchors it at the rotation and sees it fail, and anchors it off the chain and sees it fail (`09-security-model.md` §9.7.1, §9.7.4.2 R8)",
+        "`resolve` caches results with a 24-hour refresh for active contacts and a 7-day refresh for inactive ones: a test per interval (`09-security-model.md` §9.10.7)",
+        "`ResolutionOutcome` carries no staleness field: where every node fails and a cached key state under seven days old exists, `resolve` returns `Confirmed` carrying the cached head, with an empty `nodes_reached`, an empty `proven`, and the `head_provenance` an earlier resolution recorded; a test asserts all four (`03-identity.md` §3.10.4)",
+        "A stale result writes an SDK warning log: a test captures it",
+        "`ResolutionSources` fills `nodes_reached`, `unexhausted`, `declared` and `proven` as `03-identity.md` §3.10.10 defines them; R11's first-contact floor counts distinct `binding.operator` values among proven sources the walk read to exhaustion, and never counts an unexhausted source or the identity's own unlisted node; below two operators `resolve` returns `Inconclusive { SingleSource }`; `head_provenance` is `WitnessRead`, `TwoOperatorRead` or `SingleNode` per `09-security-model.md` §9.7.4.2: a test per case against `AdversarialNode`",
+        "With 250 blobs stored at one `stored_at` and `limit` 100, the page walk issues QUERYs until a page returns no blob and reads each of the 250 exactly once; the walk verifies the `node_proof` the `query_complete` EVENT carries on the page that returned no blob, and treats a source whose proof fails as unexhausted: tests against `AdversarialNode` (`09-security-model.md` §9.7.4.2 R9, `10-infrastructure-and-self-hosting.md` §10.4.1)",
+        "`resolve` returns key state only as a `ResolvedState`, self-observation holds the controller's own key state only as `scp_kel::ReplayedState`, and the retained log is persisted as raw units and re-validated with `validate_entry` on load, never deserialized into a `ValidatedChain`: a test reloads a retained log carrying one illegal own event and sees it discarded on load (`09-security-model.md` §9.7.4.2 R3, R10)",
+        "`IdentityBackend::observe` over a retained log holding an own `KeyState` carrying A26, placed through the test-only signer, while an `AdversarialNode` serves a separator-flipped junk unit at the same position, returns one `DiscardedOwnEvent { class: Change, stage: Content }` naming the own event's digest, and the pass makes no republish call for it and alerts; a foreign threshold-signed A26 at that position, absent from the retained log, yields an alert and no `DiscardedOwnEvent` (`09-security-model.md` §9.7.4.2 R10)",
+        "`resolve` skips an illegal event a node served: an `AdversarialNode` that stores every frame without the §9.10.12 admission check serves [Vector 41, C16-on-V41, the legal `KeyState` at sequence 1], and `resolve` returns the key state of [Vector 41, the legal `KeyState`]; serving [Vector 41, C16-on-V41] alone returns Vector 41's key state; neither returns `Invalid` (`09-security-model.md` §9.7.4.2 R3, R14)",
+        "`resolve` over a node serving [Vector 41, A@1, B@1], two legal `KeyState`s signed by Vector 41's root, returns `Contested`: a test (`09-security-model.md` §9.7.4.2 R6, R7)",
+        "`observe` adopts a served chain R6 ranks above the chain carrying the device's own event and the pass never re-publishes the dropped event: a test holds an own `KeyState` E at n + 1, has an `AdversarialNode` serve a chain whose event at n + 1 R6 ranks above E, and sees the pass adopt the served chain, move the marker under R10's marker clause, yield one `DiscardedOwnEvent` naming E, and make no publish call carrying E in that cycle or the next (`09-security-model.md` §9.7.4.2 R10)",
+        "`resolve` persists the contested verdict, the retained suffixes and the accepted-head baseline before it returns any verdict; an injected persist failure returns `IdentityError::PersistFailed` (SCP-IDENT-1104) and no verdict; a test retains a suffix, adopts a chain forking below that suffix's fork, restarts the resolver, and sees the contested verdict, every retained suffix in the order the resolver first observed each, and the baseline restored from the held copies' bytes (`09-security-model.md` §9.7.4.2 R14)",
+        "`read_service_record` returns `ServiceRecordVerdict::Rejected { cause: IdentifierMismatch }` for a signature-valid record whose `identifier` is not the identifier read: a test has an `AdversarialNode` serve another identity's record at the read identity's `scp:svc:` address (`03-identity.md` §3.10.10, §3.10.13)",
+        "`crates/scp-identity/src/dht.rs` and the DHT path of `resolver.rs` are deleted with their tests: `git grep -i mainline -- crates/scp-identity` prints nothing",
+        "No `unwrap()` or `expect()` in library code",
+        "CI-feature `cargo clippy` over the touched crates and their tests passes"
+      ],
+      "actionItems": [
+        "Add `resolve` and `read_service_record` to `NodeNetwork` in `crates/scp-identity/src/network/resolve.rs`.",
+        "Fill `ResolutionSources` and `head_provenance` from node proofs and the accepted list.",
+        "Move the cache to `crates/scp-identity/src/cache.rs`.",
+        "Delete the DHT resolution path and its tests."
+      ],
+      "blockedBy": [
+        "SCP-369"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.4 Resolution Protocol"
+        },
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.10 IdentityBackend, the Resolution Trait"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.7.4.2 Root-Authority Recovery and Fork Precedence"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.4.1 Node Wire Protocol"
+        },
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.13 The Service Record"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-370",
+      "title": "Self-observation cadence as a task of the identity actor",
+      "gate": "gate-kel",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-runtime/src/context/supervisor/identity_actor/cadence.rs",
+        "crates/scp-runtime/src/context/supervisor/identity_actor.rs"
+      ],
+      "description": "The self-observation cadence of `09-security-model.md` §9.7.4.2 R10 runs as one task per loaded identity under that identity's actor, which the instance-owned Supervisor spawns (SCP-371, ADR-049 decision 17, ADR-048 §6, `03-identity.md` §3.10.10). The cadence criteria SCP-007 carried move here, reworded for nodes. Node backend execution plan code PR C14.",
+      "acceptanceCriteria": [
+        "The cadence starts when an identity's actor spawns, through `dispatch_identity_create` or `dispatch_identity_load`, and stops when the actor stops; exactly one cadence task runs per loaded identity: a test loads one identity, counts the cadence tasks the actor spawned, and sees one (`09-security-model.md` §9.7.4.2 R10)",
+        "The task captures a `SupervisorHandle` and exits when a dispatch returns `ContextError::SupervisorShutDown`; it stops on suspend and restarts on resume: a test per transition",
+        "Each pass fetches from every entry of the publication set on every launch and at least once per witnessing interval on the injected clock, and `dispatch_identity_observe_self` returns a `SelfObservation` whose `entries` carry one `EntryObservation` per entry, each exactly once: a test advances a paused clock and counts passes (`03-identity.md` §3.10.10)",
+        "A node that answers nothing yields `EntryReach::Unreachable`, an alert, and no PUBLISH to that node: a test against `AdversarialNode` (`09-security-model.md` §9.7.4.2 R10)",
+        "A node the page walk did not read to exhaustion yields `EntryReach::Unexhausted`, an alert naming the node, and no PUBLISH to it: a test stops the walk at the fetch bound (`09-security-model.md` §9.7.4.2 R10)",
+        "An empty node yields one `ChainObservation` whose `relation` is `Absent`, whose `alerted` is false and whose `republished` is present, after the pass re-published the chain from the inception event and the service record; a node whose frames chain to nothing yields the same observation with `alerted` true: a test per case (`09-security-model.md` §9.7.4.2 R10)",
+        "Two chains at one node yield two observations: an `AdversarialNode` serves the controller's own head and a fork from it, and `EntryReach::Answered` carries two `ChainObservation` values, the first `Identical` and the second `Diverged` with `alerted` true (`09-security-model.md` §9.7.4.2 R10)",
+        "The superseded arm re-publishes and the identical arm does not: one node serves a head the controller's own log supersedes and a second serves the controller's own head, and the pass sends one PUBLISH to the first, starting at the first event it lacks, and none to the second (`09-security-model.md` §9.7.4.2 R10)",
+        "No second republication task exists: `git grep` finds one spawn site for the cadence in `crates/scp-runtime` and none in `crates/scp-identity` (`09-security-model.md` §9.7.4.2 R10)",
+        "At instance start the cadence runs one pass immediately for every persisted identity the registry loads, over every entry of its publication set, and publishes under the relations R10 names and under no unconditional startup republish: a test (`09-security-model.md` §9.7.4.2 R10)",
+        "The pass reports `WitnessWithoutStanding { node_id }` for each designated witness whose node key has no standing in the accepted list: a test (`09-security-model.md` §9.7.4.3)",
+        "`pipeline_wiring.rs` asserts that the cadence tick reaches `dispatch_identity_observe_self`",
+        "No `unwrap()` or `expect()` in library code",
+        "CI-feature `cargo clippy` over the touched crates and their tests passes"
+      ],
+      "actionItems": [
+        "Add `identity_actor/cadence.rs` and spawn it from the actor.",
+        "Run one pass at actor spawn and one per witnessing interval on the injected clock."
+      ],
+      "blockedBy": [
+        "SCP-371"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.7.4.2 Root-Authority Recovery and Fork Precedence"
+        },
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.10 IdentityBackend, the Resolution Trait"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.7.4.3 Witness and Watcher Layer (Layer B)"
+        },
+        {
+          "file": ".docs/adrs/ADR-049-actor-per-context.md",
+          "section": "### 2. Supervisor is a plain struct, not an actor"
+        },
+        {
+          "file": ".docs/adrs/ADR-049-actor-per-context.md",
+          "section": "### 17. Per-identity `IdentityActor`, `SupervisorHandle::live()`, and the instance-built Supervisor (2026-11-02)"
+        },
+        {
+          "file": ".docs/adrs/ADR-048-scp-multi-instance.md",
+          "section": "### 6. Long-lived background tasks capture `Weak<BridgeInstance>`, not `Arc`"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-371",
+      "title": "Instance-owned Supervisor, identity registry and identity actors",
+      "gate": "gate-kel",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-ffi/common/src/bridge_instance.rs",
+        "crates/scp-runtime/src/context/supervisor/supervisor.rs",
+        "crates/scp-runtime/src/context/supervisor/handle.rs",
+        "crates/scp-runtime/src/context/supervisor/mod.rs",
+        "crates/scp-runtime/src/context/supervisor/identity_actor.rs",
+        "crates/scp-runtime/src/context/supervisor/identity_actor/handlers.rs",
+        "crates/scp-runtime/src/context/supervisor/identity_helpers.rs",
+        "crates/scp-core/src/lib.rs",
+        "crates/scp-runtime/src/context/error.rs",
+        "crates/scp-testing/tests/integration/pipeline_wiring.rs"
+      ],
+      "description": "Each SCP instance builds its Supervisor when it is constructed, and the Supervisor owns an `IdentityRegistry` and one `NodeNetwork` (ADR-049 decision 17, ADR-048 §5, ADR-052, `03-identity.md` §3.10.10). Each loaded identity runs in its own `IdentityActor`, reached through an `IdentityHandle {identifier, supervisor}`, and every `dispatch_identity_*` calls `SupervisorHandle::live()` first. `IdentityConfig` carries no persistence field: the identity lives in the instance's encrypted store. This story builds the owner and the create and load paths; SCP-313 wires the rest of the dispatch table. Node backend execution plan code PR C12, which carries SCP-372 in the same PR.",
+      "acceptanceCriteria": [
+        "`CoreFields::new<S: EncryptedStorage + Clone + 'static>(storage, client)` builds the Supervisor before it returns, and the `OnceLock` Supervisor slot and `with_supervisor` have zero occurrences under `crates/`",
+        "The Supervisor holds `IdentityRegistry` and one `Arc<NodeNetwork>`, and at build loads every persisted identity from the instance store and spawns its `IdentityActor` through `SpawnPermit::spawn_through`: a test persists two identities, rebuilds the instance, and sees two actors",
+        "`IdentityHandle {identifier, supervisor}` lives in `identity_actor.rs` and its constructor is `pub(in crate::context)`, called only by the registry: a `compile_fail` doctest constructs one outside the module",
+        "`SupervisorHandle::live()` refuses a dropped Supervisor and one whose shutdown began, and every `dispatch_identity_*` calls it first: a test per refusal, and a test that a dispatch after shutdown returns `ContextError::SupervisorShutDown`",
+        "`ContextError::Identity(IdentityError)` carries the identity error code unchanged across the dispatch: a test per code the create path returns",
+        "Shutdown drains every identity actor before the store closes: a test holds an in-flight dispatch across shutdown and sees it complete or return `SupervisorShutDown`, never a store error",
+        "`dispatch_identity_create` reaches the create helper in `identity_helpers.rs`, and `dispatch_identity_load` returns the registry's `IdentityHandle` or `IdentityError::IdentityUnknown` (SCP-IDENT-1127) for an identifier the store does not hold; `pipeline_wiring.rs` asserts both steps (`03-identity.md` §3.10.10)",
+        "`IdentityConfig` has the fields `custody`, `next_set_custody`, `profile` and `witnesses`, no `persistence` field and no type parameter: a test destructures it exhaustively",
+        "The per-identity MLS binding (`NodeMlsFactory`) is created at actor spawn and not at instance construction: a test",
+        "No `unwrap()` or `expect()` in library code",
+        "CI-feature `cargo clippy` over the touched crates and their tests passes"
+      ],
+      "actionItems": [
+        "Build the Supervisor in `CoreFields::new` and delete the `OnceLock` slot and `with_supervisor`.",
+        "Add `IdentityRegistry`, `IdentityActor`, `IdentityHandle` and `SupervisorHandle::live()`.",
+        "Route create and load through the registry; delete `IdentityConfig.persistence`.",
+        "Assert both steps in `pipeline_wiring.rs`."
+      ],
+      "blockedBy": [
+        "SCP-006"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.10 IdentityBackend, the Resolution Trait"
+        },
+        {
+          "file": ".docs/adrs/ADR-049-actor-per-context.md",
+          "section": "### 2. Supervisor is a plain struct, not an actor"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.3 Key Convention"
+        },
+        {
+          "file": ".docs/adrs/ADR-049-actor-per-context.md",
+          "section": "### 17. Per-identity `IdentityActor`, `SupervisorHandle::live()`, and the instance-built Supervisor (2026-11-02)"
+        },
+        {
+          "file": ".docs/adrs/ADR-048-scp-multi-instance.md",
+          "section": "### 5. `shutdown(timeout: Duration)` replaces terminal infallible shutdown"
+        },
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-052: Unified Construction Pattern"
+        },
+        {
+          "file": ".docs/standards/construction.md",
+          "section": "### Identity — `IdentityConfig`"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-372",
+      "title": "`identity_create` and `identity_load` on every bridge, and SDK constructors that require encrypted storage",
+      "gate": "gate-kel",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-ffi/src/identity.rs",
+        "crates/scp-ffi/napi/src/identity.rs",
+        "crates/scp-ffi/napi/src/scp.rs",
+        "crates/scp-ffi/uniffi/src/bridge.rs",
+        "bindings/python/scp_sdk/scp.py",
+        "bindings/typescript/src/scp.ts",
+        "bindings/swift/Sources/SCP/Scp.swift",
+        "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/SCP.kt",
+        ".docs/standards/sdk-capability-matrix.json",
+        "crates/scp-testing/tests/integration/ffi_conformance.rs",
+        "crates/scp-ffi/uniffi/tests/check_ready_coverage.rs",
+        "scripts/bridge-aliases.json",
+        "scripts/ffi-export-allowlist.json"
+      ],
+      "description": "Each bridge exports one `identity_create` and one `identity_load`, each calling `check_ready` and then the Supervisor dispatch SCP-371 adds, and the older create and load variants fold into them (`03-identity.md` §3.10.10). Every SDK's `SCP` constructor takes the instance's encrypted storage as a required argument (ADR-048 §1, ADR-052 as amended for `CoreFields::new`). Deleting the Supervisor slot in SCP-371 breaks every bridge's current create, so node backend execution plan code PR C12 carries both stories.",
+      "acceptanceCriteria": [
+        "PyO3, napi-rs and UniFFI each export `identity_create`, which calls `check_ready` and then `dispatch_identity_create`, and `identity_load`, which calls `check_ready` and then `dispatch_identity_load`: `ffi_conformance.rs` asserts each export on each bridge, and `check_ready_coverage.rs` asserts the `check_ready` call once per bridge",
+        "`identity_create_with_custody`, `identity_create_with_agent_key`, every `identity_load*` variant and `identity_migrate` have zero occurrences in `crates/scp-ffi`, and their `bridge-aliases.json` and `ffi-export-allowlist.json` entries are deleted with them",
+        "Each SDK exposes `load` beside create, and `sdk-capability-matrix.json` carries one `identity_load` row per binding",
+        "Every SDK constructor requires encrypted storage: `SCP(storage)` in Python and TypeScript, `SCP.create(storage:)` in Swift and `SCP.create(storage)` in Kotlin; a test per SDK constructs one, and the matrix's `SCP(storage)` row states the required arguments",
+        "The SDK test suites pass: `python3.12 -m pytest tests/ -v`, `bun test`, the Swift tests and `./gradlew test -Pscp.uniffi.cargoFeatures=testing`",
+        "No `unwrap()` or `expect()` in library code",
+        "CI-feature `cargo clippy` over the touched crates and their tests passes"
+      ],
+      "actionItems": [
+        "Add `identity_create` and `identity_load` to each bridge and fold the older variants into them.",
+        "Change each SDK constructor to require encrypted storage and add `load`.",
+        "Update the conformance tests, the matrix, the aliases and the allowlist."
+      ],
+      "blockedBy": [
+        "SCP-371"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.10 IdentityBackend, the Resolution Trait"
+        },
+        {
+          "file": ".docs/scaffold/shared.md",
+          "section": "## Cross-Language Naming"
+        },
+        {
+          "file": ".docs/adrs/ADR-048-scp-multi-instance.md",
+          "section": "### 1. `SCP` is the first-class SDK-level opaque object in all four language SDKs"
+        },
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-052: Unified Construction Pattern"
+        },
+        {
+          "file": ".docs/standards/construction.md",
+          "section": "### Identity — `IdentityConfig`"
+        },
+        {
+          "file": ".docs/standards/construction.md",
+          "section": "## The EncryptedStorage compile-time split (the one M5 exception)"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-373",
+      "title": "Identity private state on nodes: per-node derivations and the write proof",
+      "gate": "gate-kel",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-protocol/src/identity/private_state.rs",
+        "crates/scp-identity/src/network/private.rs",
+        "crates/scp-node/src/public_records/private.rs",
+        ".docs/specs/25-test-vectors.md",
+        "scripts/gen-test-vectors-p256.py",
+        "crates/scp-runtime/tests/test_vectors.rs"
+      ],
+      "description": "An identity's private state is stored as encrypted blobs on its private-state nodes, one copy per node, at a routing id each node cannot compute for any other node (`03-identity.md` §3.7). Each target's 32-byte derivation id feeds three per-node derivations: the routing id, the write key and, independent of the node, the encryption key. The first write to a routing id stores `SHA-256(write_key)` at the node, and every later append or delete presents `write_key` (`10-infrastructure-and-self-hosting.md` §10.4, ADR-065 decision 4). Node backend execution plan code PR C11.",
+      "acceptanceCriteria": [
+        "`derive_private_state_routing_id(psk, identifier, node_id)` replaces the `(identity_key_material, did_string)` form, and `derive_private_state_write_key` and `derive_private_state_enc_key` exist with the salts and info strings `03-identity.md` §3.7 states: a known-answer test per derivation",
+        "AES-256-GCM seals and opens under `enc_key` and never under the PSK, with the AAD `identifier_bytes || \"scp-private-state-v1\" || sequence_number`: a test, and one that opens under the PSK and fails",
+        "A node admits a first write at a private-state routing id and stores `SHA-256(write_key)`; it refuses a later append or delete whose `write_key` does not hash to the stored value with `4043`: a node test per case (`10-infrastructure-and-self-hosting.md` §10.4)",
+        "PUBLISH and DELETE carry `write_key` as `10-infrastructure-and-self-hosting.md` §10.4.1 lists, and `NodeClient` sends it: a round-trip test",
+        "Target choice follows `03-identity.md` §3.7, and the service record carries one `IdentityPrivateState` entry per target with that target's 32-byte derivation id after its URL; a test moves a target's entry in the node list and sees the routing id and write key unchanged, and a test for a node the list does not name derives its id as `SHA-256(\"SCP-NODE-URL-ID-V1:\" || canonical URL)`",
+        "After a PSK rotation each device keeps the derived old (`routing_id`, `write_key`) pair per target until the delete at that routing id succeeds, and holds no old PSK: a test with one target offline at rotation and online later (`03-identity.md` §3.7)",
+        "`25-test-vectors.md` pins the three derivations, `python3.12 scripts/check-test-vectors-p256.py` passes, and `test_vectors.rs` asserts each",
+        "The old `derive_private_state_routing_id` form and its tests are deleted",
+        "No `unwrap()` or `expect()` in library code",
+        "CI-feature `cargo clippy` over the touched crates and their tests passes"
+      ],
+      "actionItems": [
+        "Rewrite the private-state derivations in `crates/scp-protocol/src/identity/private_state.rs`.",
+        "Add `publish_private` and `read_private` to `NodeNetwork` and the write-proof admission to `scp-node`.",
+        "Pin the vectors."
+      ],
+      "blockedBy": [
+        "SCP-368"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "## 3.7 Identity Private State"
+        },
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.13 The Service Record"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "## 10.4 Node Architecture"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.4.1 Node Wire Protocol"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.18.B Configurable Parameters"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-374",
+      "title": "KeyPackage set as a public record on nodes",
+      "gate": "gate-kel",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-protocol/src/key_package_set.rs",
+        "crates/scp-node/src/public_records/key_packages.rs",
+        "crates/scp-identity/src/network/key_packages.rs",
+        "crates/scp-runtime/src/context/supervisor/key_package_actor.rs",
+        ".docs/specs/25-test-vectors.md",
+        "crates/scp-testing/tests/integration/pipeline_wiring.rs"
+      ],
+      "description": "Each device of an identity publishes its KeyPackages as one `KeyPackageSet {subject, device, sequence, packages}`, signed in the attestation class over `SCP-KEY-PACKAGE-SET-V1:` with no `key_state_head`, in the `0x07` frame (`09-security-model.md` §9.7.4, §9.10.12, `10-infrastructure-and-self-hosting.md` §10.7.1). A node holds one set per (subject, device), bounded by the subject's `Current` wrapping-key entries, and admits a set only at a sequence above the one it holds. Node backend execution plan code PR C13.",
+      "acceptanceCriteria": [
+        "`KeyPackageSet` signs `SCP-KEY-PACKAGE-SET-V1:` under the attestation class and carries no `key_state_head`; a vector in `25-test-vectors.md` pins its preimage and `test_vectors.rs` asserts it (`09-security-model.md` §9.7.4, §9.18.2)",
+        "The `0x07` frame codec round-trips and refuses each rule `09-security-model.md` §9.10.12 states for that frame: one test per rule",
+        "A node holds one set per (subject, device); a set at or below the held sequence is refused; the number of device slots is bounded by the subject's `Current` wrapping-key entries; a set holding more than `MAX_PUBLISHED_KEY_PACKAGES` (64) packages is refused: a node test per rule",
+        "Admission reads each retained chain the set names, and each package passes the admission of `10-infrastructure-and-self-hosting.md` §10.7.1, with a failing package refused with `4042`: a test per refusal",
+        "Consumption of a package republishes the set at `sequence + 1`, and the device's buffer counts a package as published once a node answers `OK`: a test",
+        "`pipeline_wiring.rs` asserts that the replenish path in `key_package_actor.rs` reaches `IdentityBackend::publish_key_packages`",
+        "No `unwrap()` or `expect()` in library code",
+        "CI-feature `cargo clippy` over the touched crates and their tests passes"
+      ],
+      "actionItems": [
+        "Add `KeyPackageSet` and the `0x07` frame codec.",
+        "Add set admission in `scp-node` and `publish_key_packages` in `NodeNetwork`.",
+        "Route the replenish path through `publish_key_packages`."
+      ],
+      "blockedBy": [
+        "SCP-371"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.7.4 Key Lifecycle"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.10.12 Node Record Frames"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.7.1 Push Registration Protocol"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "#### 9.18.2 Domain Separators"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-380",
+      "title": "Witness answers, the witness refusal codes and `witness_status`",
+      "gate": "gate-kel",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-identity/src/kel/error.rs",
+        "crates/scp-identity/src/network/witness.rs",
+        "crates/scp-runtime/src/context/supervisor/identity_actor.rs",
+        "crates/scp-runtime/src/context/supervisor/identity_actor/cadence.rs",
+        "crates/scp-runtime/src/context/supervisor/identity_actor/handlers.rs",
+        "crates/scp-runtime/src/context/supervisor/identity_helpers.rs"
+      ],
+      "description": "A witness answers a submitted head with `OK` or with one of four refusals, `4050` through `4053`, which the SDK maps to SCP-IDENT-1123 through SCP-IDENT-1126 (`09-security-model.md` §9.7.4.3). The identity actor keeps each designated witness's latest answer, and `witness_status` reports them, with `all_at_capacity` set when every designated witness refused for capacity (`03-identity.md` §3.10.10). Node backend execution plan code PR C21, which runs after C14 and before C16.",
+      "acceptanceCriteria": [
+        "`IdentityError` carries SCP-IDENT-1123 `WitnessStale` (with `last_cosigned_head`), 1124 for capacity, 1125 for a node that is not a designated witness, and 1126 for clock skew, with the meanings `09-security-model.md` §9.7.4.3 states, and `code()` returns each: a test per code",
+        "The publish path turns each designated witness's `OK` or `ERR` `4050`–`4053` into one `WitnessAnswer { node_id, answer }` whose `WitnessAnswerKind` is `Cosigned { head_digest, sequence }`, `Refused(IdentityError)` or `Unreached`, keeping `last_cosigned_head` on 1123: one `AdversarialNode` test per answer",
+        "The cadence records the latest answer per `NodeId` in the identity actor: a test runs two passes with different answers and sees the second kept",
+        "`witness_status()` returns one answer per designated `NodeId` and sets `all_at_capacity` exactly when every designated witness's latest answer is 1124: a test with all at capacity and one with a mixed set (`09-security-model.md` §9.7.4.3)",
+        "The `witness_status` handler exists in `identity_actor/handlers.rs`; SCP-313 adds its `pipeline_wiring.rs` assertion, SCP-314 its exports, and SCP-379 its SDK methods and matrix row",
+        "No `unwrap()` or `expect()` in library code",
+        "CI-feature `cargo clippy` over the touched crates and their tests passes"
+      ],
+      "actionItems": [
+        "Add SCP-IDENT-1123 through 1126.",
+        "Build `WitnessAnswer` values on the publish path and record them in the actor.",
+        "Add the `witness_status` handler."
+      ],
+      "blockedBy": [
+        "SCP-369",
+        "SCP-370"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.7.4.3 Witness and Watcher Layer (Layer B)"
+        },
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.10 IdentityBackend, the Resolution Trait"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.10.12 Node Record Frames"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-379",
+      "title": "SDK wrappers and capability-matrix rows for the identity operations",
+      "gate": "gate-kel",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "bindings/python/scp_sdk/identity.py",
+        "bindings/typescript/src/identity.ts",
+        "bindings/swift/Sources/SCP/Identity.swift",
+        "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Identity.kt",
+        ".docs/standards/sdk-capability-matrix.json"
+      ],
+      "description": "Each export SCP-314 adds gets a method on `SCP` or on `Identity` in every SDK, under the name the shared scaffold's naming table gives, and one capability-matrix row (`03-identity.md` §3.10.10). These criteria moved here from SCP-314. Node backend execution plan code PR C18.",
+      "acceptanceCriteria": [
+        "Each SCP-314 export, `recovery_load_pending`, `recovery_abort` and `witness_status` included, has a method on `SCP` or `Identity` in Python, TypeScript, Swift and Kotlin under the name the shared scaffold's naming table gives: a test per SDK calls each method",
+        "`sdk-capability-matrix.json` carries one row per operation for every SDK, and `python3.12 scripts/check-sdk-coverage.py` passes",
+        "One conformance fixture of identity operations replays in Rust, Python, TypeScript, Swift and Kotlin with identical results",
+        "The SDK methods of exports SCP-314 deletes have zero occurrences under `bindings/`",
+        "No `unwrap()` or `expect()` in library code",
+        "CI-feature `cargo clippy` over the touched crates and their tests passes"
+      ],
+      "actionItems": [
+        "Add the SDK methods.",
+        "Add the matrix rows.",
+        "Add the cross-language conformance fixture."
+      ],
+      "blockedBy": [
+        "SCP-314"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.10 IdentityBackend, the Resolution Trait"
+        },
+        {
+          "file": ".docs/scaffold/shared.md",
+          "section": "## Cross-Language Naming"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-376",
+      "title": "Issue the context operator binding at context creation and commit it in the group",
+      "gate": "gate-kel",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [],
+      "description": "When a node instantiates a context, its operator's device mints `context_key` in custody, signs the `ContextOperatorBinding`, and the creator writes `binding_hash` into the genesis parameters and the `0xFF02` group-context extension, which no later Commit may change (`09-security-model.md` §9.5.2, `05-contexts.md` §5.13.3). The node then signs chain entries and receipts under `context_key` and publishes its `ContextNodeAddress`. The context-creation path this story extends is built by the context-operation plan's D1 execution, which has no story yet; this story waits on that code. Its file list is empty until D1 lands, and is set then from the context-creation path D1 builds. Node backend execution plan code PR C19, parked until D1 execution merges.",
+      "acceptanceCriteria": [
+        "The operator device mints `context_key` through `KeyCustody::generate_keypair(KeyType::P256Signing)`, signs through `sign`, and calls `destroy_key` when the context closes or is re-founded: a test per in-tree `KeyCustody` backend shows the key minted, used and destroyed",
+        "Context creation signs the `ContextOperatorBinding` and writes its `binding_hash` into `context_params` and the `0xFF02` extension: a test reads both back and compares them (`05-contexts.md` §5.13.3)",
+        "A Commit that changes `binding_hash` in the `0xFF02` extension is refused at two receivers under rule 11 of `05-contexts.md` §5.13.3: a test",
+        "The node signs every chain entry and receipt under `context_key`, and a test verifies each under the binding's `context_key`",
+        "The operator publishes `ContextNodeAddress` at sequence 1 and at a higher sequence on each address change: a test",
+        "No `unwrap()` or `expect()` in library code",
+        "CI-feature `cargo clippy` over the touched crates and their tests passes"
+      ],
+      "actionItems": [
+        "Mint and destroy `context_key` through `KeyCustody`.",
+        "Sign the binding at creation and commit `binding_hash`.",
+        "Sign chain entries and receipts under `context_key` and publish `ContextNodeAddress`."
+      ],
+      "blockedBy": [
+        "SCP-365"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.5.2 Signed Structure Definitions"
+        },
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.13.3 Creation"
+        },
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "## 5.12 Context Templates and Lightweight Creation"
+        }
+      ],
+      "details": {
+        "blockedOnWork": "Context-operation plan D1 execution (one node runs a context and orders its Commits) has no story or issue. This story cannot start until D1's code merges; its code files are set when D1 lands."
+      }
+    },
+    {
+      "id": "SCP-375",
+      "title": "Push registration targets read from the context node address",
+      "gate": "gate-kel",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-protocol/src/discovery/push.rs",
+        "crates/scp-transport/src/relay/push_gate.rs",
+        "crates/scp-node/src/published_state.rs",
+        "crates/scp-node/src/lib.rs",
+        "crates/scp-testing/tests/integration/pipeline_wiring.rs",
+        ".docs/specs/25-test-vectors.md"
+      ],
+      "description": "A push registration names the node it registers at by the URL and bridge target of the context's current `ContextNodeAddress`, and the node rebuilds the preimage from its own canonical URL and bridge registration (`09-security-model.md` §9.5.2, `10-infrastructure-and-self-hosting.md` §10.7.1, `22-human-readable-addressing.md` §22.11.4). The PUSH stories that consume this stay with their own workstream. Node backend execution plan code PR C20.",
+      "acceptanceCriteria": [
+        "`PushRegistration` field 6 is `node_url` and field 7 is `bridge_target`, and `PushDeregistration` fields 5 and 6 are the same two, each read from the current `ContextNodeAddress`: a vector per preimage and a test per message (`09-security-model.md` §9.5.2)",
+        "A client sends one registration per `NodeAddress`: a test with a direct and a bridged address",
+        "The node rebuilds the preimage from its own canonical URL and bridge registration and refuses a registration signed for another node: a test (`10-infrastructure-and-self-hosting.md` §10.7.1)",
+        "`ReservedDocument` and `LiveRelayUrl` have zero occurrences under `crates/`, and the `pipeline_wiring.rs` assertions on them are deleted with them",
+        "The node's own service record carries `SCPNode` entries only: a test resolves it",
+        "No `unwrap()` or `expect()` in library code",
+        "CI-feature `cargo clippy` over the touched crates and their tests passes"
+      ],
+      "actionItems": [
+        "Redefine the push preimages over `node_url` and `bridge_target`.",
+        "Rebuild the preimage at the node from its own address.",
+        "Delete `ReservedDocument`, `LiveRelayUrl` and the NAT-tier URL-handle task."
+      ],
+      "blockedBy": [
+        "SCP-376"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.5.2 Signed Structure Definitions"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.7.1 Push Registration Protocol"
+        },
+        {
+          "file": ".docs/specs/22-human-readable-addressing.md",
+          "section": "### 22.11.4 Push Notifications"
         }
       ],
       "details": {}

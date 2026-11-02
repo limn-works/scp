@@ -309,10 +309,10 @@ mod tests {
     #[tokio::test]
     async fn webtransport_listener_reads_the_shared_relay_url() {
         use super::super::session::DispatchResult;
-        use crate::relay::push_gate::RelayUrl;
+        use crate::relay::push_gate::PushReservation;
         use scp_relay_client::{ClientMessage, RelayMessage};
-        let old = RelayUrl::new("ws://198.51.100.7:32891/scp/v1").unwrap();
-        let new = RelayUrl::new("ws://203.0.113.42:8443/scp/v1").unwrap();
+        let old = PushReservation::new("ws://198.51.100.7:32891/scp/v1").unwrap();
+        let new = PushReservation::new("ws://203.0.113.42:8443/scp/v1").unwrap();
         let live = LiveRelayUrl::new(old.clone());
         let storage = Arc::new(InMemoryBlobStorage::new());
         let mut config = WebTransportListenerConfig::defaults(live.clone());
@@ -360,10 +360,10 @@ mod tests {
     #[tokio::test]
     async fn webtransport_listener_reads_no_blob_at_a_current_or_released_reserved_id() {
         use super::super::session::DispatchResult;
-        use crate::relay::push_gate::RelayUrl;
+        use crate::relay::push_gate::PushReservation;
         use scp_relay_client::{ClientMessage, RelayMessage};
         let fixture = crate::relay::push_gate::tier3_fixture().unwrap();
-        let direct = RelayUrl::new("wss://relay.webtransport.test").unwrap();
+        let direct = PushReservation::new("wss://relay.webtransport.test").unwrap();
         let live = LiveRelayUrl::new(direct.clone());
         let mut config = WebTransportListenerConfig::defaults(live.clone());
         config.session_config.delivery_jitter_ms = 0;

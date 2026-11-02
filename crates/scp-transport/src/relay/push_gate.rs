@@ -69,11 +69,11 @@ use super::push_store::{PushRegistrationKey, PushRegistrationRecord, PushRegistr
 #[cfg(feature = "push-store")]
 pub const PUSH_VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The relay's own [`PushRelay`] (its URL in §9.18.2 canonical form and the
-/// tier 3 `bridge_target` it is reached with) and the reserved push routing
-/// ID derived from both (§10.7.1 step 2).
+/// One push routing ID the node reserves (§10.7.1 step 2), with the
+/// [`PushRelay`] it was derived from: the node's URL in §9.18.2 canonical form
+/// and the tier 3 `bridge_target` it is reached with.
 ///
-/// [`RelayUrl::new`] builds the relay with [`PushRelay::direct`], which holds
+/// [`PushReservation::new`] builds the relay with [`PushRelay::direct`], which holds
 /// no target, so the ID is the `"scp-push-registration"` form. The conversion
 /// from an `SCPRelay` entry goes through `PushRelay::from`, which keeps the
 /// entry's target, so the ID is the tier 3 form when a target is present.
@@ -82,19 +82,19 @@ pub const PUSH_VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
 /// the Tier 3 envelope opener. At a direct entry's ID the relay hands the
 /// verifier that entry's [`PushRelay`] (§10.7.1 step 3).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RelayUrl {
+pub struct PushReservation {
     relay: PushRelay,
     push_routing_id: [u8; 32],
 }
 
-impl RelayUrl {
+impl PushReservation {
     /// Canonicalizes `url` and derives the relay's reserved push routing ID,
     /// the `"scp-push-registration"` form, for a relay reached with no tier 3
     /// target.
     ///
     /// # Errors
     ///
-    /// [`PushMessageError::InvalidRelayUrl`] when `url` has no §9.18.2
+    /// [`PushMessageError::InvalidNodeUrl`] when `url` has no §9.18.2
     /// canonical form.
     pub fn new(url: &str) -> Result<Self, PushMessageError> {
         Ok(Self::from(PushRelay::direct(url)?))
@@ -129,7 +129,7 @@ impl RelayUrl {
     }
 }
 
-impl From<PushRelay> for RelayUrl {
+impl From<PushRelay> for PushReservation {
     /// Holds `relay` and derives its reserved push routing ID once.
     fn from(relay: PushRelay) -> Self {
         let push_routing_id = relay.push_routing_id();
@@ -140,7 +140,7 @@ impl From<PushRelay> for RelayUrl {
     }
 }
 
-impl From<&scp_did::RelayService> for RelayUrl {
+impl From<&scp_did::RelayService> for PushReservation {
     /// The relay URL of an `SCPRelay` entry, with the entry's `bridgeTarget`.
     /// The entry holds its §9.18.2 canonical URL by construction, so the
     /// conversion cannot fail.
@@ -149,7 +149,8 @@ impl From<&scp_did::RelayService> for RelayUrl {
     }
 }
 
-/// The relay URLs whose push routing IDs a relay currently reserves.
+/// The push routing IDs a node currently reserves, one [`PushReservation`]
+/// each.
 ///
 /// The set holds one URL per entry the node publishes (§10.7.1 "Tier 3
 /// relays": a node MAY publish one tier 3 entry per bridge relay, and its
@@ -158,14 +159,14 @@ impl From<&scp_did::RelayService> for RelayUrl {
 /// URL whose routing ID an earlier URL already holds is dropped. Two sets are
 /// equal when they hold the same URLs, whatever their order.
 #[derive(Debug, Clone)]
-pub struct ReservedRelayUrls(Vec<RelayUrl>);
+pub struct PushReservations(Vec<PushReservation>);
 
-impl ReservedRelayUrls {
+impl PushReservations {
     /// The set of `first` and `rest`, keeping the first URL for each push
     /// routing ID. Taking `first` apart from `rest` makes an empty set
     /// unrepresentable, so building a set cannot fail.
     #[must_use]
-    pub fn new(first: RelayUrl, rest: impl IntoIterator<Item = RelayUrl>) -> Self {
+    pub fn new(first: PushReservation, rest: impl IntoIterator<Item = PushReservation>) -> Self {
         let mut held = vec![first];
         for url in rest {
             if !held
@@ -180,13 +181,13 @@ impl ReservedRelayUrls {
 
     /// The URLs, in the order they were given, one per push routing ID.
     #[must_use]
-    pub fn as_slice(&self) -> &[RelayUrl] {
+    pub fn as_slice(&self) -> &[PushReservation] {
         &self.0
     }
 
     /// The URL whose reserved push routing ID is `routing_id`, if any.
     #[must_use]
-    pub fn get(&self, routing_id: &[u8; 32]) -> Option<&RelayUrl> {
+    pub fn get(&self, routing_id: &[u8; 32]) -> Option<&PushReservation> {
         self.0.iter().find(|u| u.push_routing_id == *routing_id)
     }
 
@@ -197,14 +198,14 @@ impl ReservedRelayUrls {
     }
 }
 
-impl From<RelayUrl> for ReservedRelayUrls {
+impl From<PushReservation> for PushReservations {
     /// The set holding `url` alone.
-    fn from(url: RelayUrl) -> Self {
+    fn from(url: PushReservation) -> Self {
         Self(vec![url])
     }
 }
 
-impl PartialEq for ReservedRelayUrls {
+impl PartialEq for PushReservations {
     /// Set equality: both hold the same URLs. Each set holds a routing ID
     /// once, so equal lengths and inclusion one way decide it.
     fn eq(&self, other: &Self) -> bool {
@@ -212,7 +213,7 @@ impl PartialEq for ReservedRelayUrls {
     }
 }
 
-impl Eq for ReservedRelayUrls {}
+impl Eq for PushReservations {}
 
 /// Whether a relay offers push (§10.7.1).
 ///
@@ -482,7 +483,7 @@ pub const MAX_RETIRED_PUSH_ROUTING_IDS: usize = 64;
 
 #[derive(Debug)]
 struct UrlState {
-    current: ReservedRelayUrls,
+    current: PushReservations,
     /// Routing IDs of released URLs, oldest first, never a current one.
     retired: VecDeque<[u8; 32]>,
 }
@@ -490,13 +491,13 @@ struct UrlState {
 /// The relay's current reserved entries, shared by every transport listener
 /// and updated in place when they change (§10.7.1 step 2, "Tier 3 relays").
 ///
-/// The handle holds a [`ReservedRelayUrls`]: one [`RelayUrl`] for a relay
+/// The handle holds a [`PushReservations`]: one [`PushReservation`] for a relay
 /// reached at its own URL, and one per tier 3 entry for a node that publishes
 /// several. Every listener of one relay (WebSocket, QUIC, UDP/DTLS,
 /// WebTransport) holds a clone of the same handle and reads it on each
 /// PUBLISH, so a [`set`](Self::set) moves every listener's reserved push
 /// routing IDs, and the entry each rebuilds the signature preimage with
-/// (§10.7.1 step 3), at once. The handle is built from a [`RelayUrl`], so a
+/// (§10.7.1 step 3), at once. The handle is built from a [`PushReservation`], so a
 /// relay always reserves at least one URL and no listener runs push
 /// interception without one.
 ///
@@ -518,7 +519,7 @@ pub(crate) struct RelayUrlChanges(watch::Receiver<UrlState>);
 
 impl RelayUrlChanges {
     /// The current set, which [`changed`](Self::changed) then counts as seen.
-    pub(crate) fn current(&mut self) -> ReservedRelayUrls {
+    pub(crate) fn current(&mut self) -> PushReservations {
         self.0.borrow_and_update().current.clone()
     }
 
@@ -546,7 +547,7 @@ enum Reservation {
     /// with that entry's URL, from which the relay rebuilds the message's
     /// preimage (§10.7.1 step 3). Only this variant reaches [`handle`].
     #[cfg(feature = "push-store")]
-    Direct(RelayUrl),
+    Direct(PushReservation),
     /// The tier 3 push routing ID of a current entry that carries a
     /// `bridgeTarget`. §10.7.1 "Tier 3 relays" has the relay open the
     /// PUBLISH payload as a Tier 3 envelope before any other rule, so this
@@ -566,16 +567,16 @@ enum Reservation {
 impl LiveRelayUrl {
     /// A handle whose current set holds `url` alone, with no released URLs.
     #[must_use]
-    pub fn new(url: RelayUrl) -> Self {
+    pub fn new(url: PushReservation) -> Self {
         Self(Arc::new(watch::Sender::new(UrlState {
-            current: ReservedRelayUrls::from(url),
+            current: PushReservations::from(url),
             retired: VecDeque::new(),
         })))
     }
 
     /// The current reserved URLs.
     #[must_use]
-    pub fn current(&self) -> ReservedRelayUrls {
+    pub fn current(&self) -> PushReservations {
         self.0.borrow().current.clone()
     }
 
@@ -606,7 +607,7 @@ impl LiveRelayUrl {
     /// The routing ID of each current URL absent from `urls` joins the retired
     /// list, and each routing ID in `urls` leaves it, so a URL that comes back
     /// is current again. Setting the current set changes nothing.
-    pub fn set(&self, urls: impl Into<ReservedRelayUrls>) {
+    pub fn set(&self, urls: impl Into<PushReservations>) {
         let urls = urls.into();
         self.0.send_if_modified(|state| {
             if state.current == urls {
@@ -823,7 +824,7 @@ impl Decoded {
 #[cfg(feature = "push-store")]
 async fn handle(
     service: &PushServiceConfig,
-    relay_url: &RelayUrl,
+    relay_url: &PushReservation,
     blob: &[u8],
     now: u64,
 ) -> Result<(), PushPublishGate> {
@@ -1009,7 +1010,7 @@ pub(crate) async fn kel_service_for_tests(dir: &std::path::Path) -> PushService 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 pub(crate) fn test_relay_url() -> LiveRelayUrl {
-    LiveRelayUrl::new(RelayUrl::new("ws://127.0.0.1:9000/scp/v1").unwrap())
+    LiveRelayUrl::new(PushReservation::new("ws://127.0.0.1:9000/scp/v1").unwrap())
 }
 
 /// Two tier 3 bridge entries a node relay reserves, for the listener tests of
@@ -1020,9 +1021,9 @@ pub(crate) struct Tier3Fixture {
     pub live: LiveRelayUrl,
     /// The `09-security-model.md` §9.18.2 test vector: bridge URL
     /// `wss://bridge.example.com/scp/v1`, target `f8affd47…a4eb`.
-    pub entry_a: RelayUrl,
+    pub entry_a: PushReservation,
     /// A second bridge relay's entry for the same target.
-    pub entry_b: RelayUrl,
+    pub entry_b: PushReservation,
     /// The bridge relay's own `"scp-push-registration"` ID, which belongs to
     /// the bridge relay; a node relay stores a PUBLISH there as a blob.
     pub bridge_own_id: [u8; 32],
@@ -1043,15 +1044,15 @@ pub(crate) fn tier3_fixture() -> Result<Tier3Fixture, Box<dyn std::error::Error>
         &mut target,
     )?;
     let target = scp_did::BridgeTarget::new(target)?;
-    let entry = |url: &str| -> Result<RelayUrl, Box<dyn std::error::Error>> {
-        Ok(RelayUrl::from(&scp_did::RelayService::bridge(
+    let entry = |url: &str| -> Result<PushReservation, Box<dyn std::error::Error>> {
+        Ok(PushReservation::from(&scp_did::RelayService::bridge(
             scp_did::BridgeEndpoint::new(url)?,
             target,
         )))
     };
     let entry_a = entry(BRIDGE_URL)?;
     let entry_b = entry("wss://bridge-two.example.net/scp/v1")?;
-    let bridge_own_id = RelayUrl::new(BRIDGE_URL)?.push_routing_id();
+    let bridge_own_id = PushReservation::new(BRIDGE_URL)?.push_routing_id();
     if hex::encode(entry_a.push_routing_id())
         != "733a76fce10004826ffaecd3c85ba27169282665cd64a902000275a52ba640a1"
         || hex::encode(bridge_own_id)
@@ -1059,8 +1060,8 @@ pub(crate) fn tier3_fixture() -> Result<Tier3Fixture, Box<dyn std::error::Error>
     {
         return Err("tier 3 fixture diverges from 25-test-vectors.md §25.28 Vector 70".into());
     }
-    let live = LiveRelayUrl::new(RelayUrl::new("ws://198.51.100.7:32891/scp/v1")?);
-    live.set(ReservedRelayUrls::new(entry_a.clone(), [entry_b.clone()]));
+    let live = LiveRelayUrl::new(PushReservation::new("ws://198.51.100.7:32891/scp/v1")?);
+    live.set(PushReservations::new(entry_a.clone(), [entry_b.clone()]));
     Ok(Tier3Fixture {
         live,
         entry_a,
@@ -1211,11 +1212,11 @@ mod tests {
     #[test]
     fn relay_url_from_relay_service_matches_relay_url_new() {
         let service = scp_did::RelayService::direct(
-            scp_did::RelayEndpoint::new("WSS://Relay.Example:443/scp/v1").unwrap(),
+            scp_did::NodeUrl::new("WSS://Relay.Example:443/scp/v1").unwrap(),
         );
         assert_eq!(
-            RelayUrl::from(&service),
-            RelayUrl::new("wss://relay.example/scp/v1").unwrap()
+            PushReservation::from(&service),
+            PushReservation::new("wss://relay.example/scp/v1").unwrap()
         );
     }
 
@@ -1229,12 +1230,12 @@ mod tests {
     }
 
     /// A bridge entry keeps its canonical URL and its target, and reserves
-    /// the tier 3 ID; a direct entry and `RelayUrl::new` hold no target and
+    /// the tier 3 ID; a direct entry and `PushReservation::new` hold no target and
     /// reserve the `"scp-push-registration"` ID (§9.18.2).
     #[test]
     fn relay_url_from_a_bridge_entry_keeps_the_target_and_the_tier3_id() {
         let entry = bridge_entry([0xA1; 32]);
-        let url = RelayUrl::from(&entry);
+        let url = PushReservation::from(&entry);
         assert_eq!(url.canonical(), BRIDGE_URL);
         assert_eq!(
             url.bridge_target(),
@@ -1252,11 +1253,11 @@ mod tests {
             push_registration_routing_id(BRIDGE_URL).unwrap()
         );
 
-        let direct = RelayUrl::from(&scp_did::RelayService::direct(
-            scp_did::RelayEndpoint::new(BRIDGE_URL).unwrap(),
+        let direct = PushReservation::from(&scp_did::RelayService::direct(
+            scp_did::NodeUrl::new(BRIDGE_URL).unwrap(),
         ));
         assert_eq!(direct.bridge_target(), None);
-        assert_eq!(direct, RelayUrl::new(BRIDGE_URL).unwrap());
+        assert_eq!(direct, PushReservation::new(BRIDGE_URL).unwrap());
         assert_eq!(
             direct.push_routing_id(),
             push_registration_routing_id(BRIDGE_URL).unwrap()
@@ -1273,11 +1274,11 @@ mod tests {
     /// one after the other moves the reservation and retires the first ID.
     #[test]
     fn set_keeps_the_target_when_only_the_target_changes() {
-        let a = RelayUrl::from(&bridge_entry([0xA1; 32]));
-        let b = RelayUrl::from(&bridge_entry([0xB2; 32]));
+        let a = PushReservation::from(&bridge_entry([0xA1; 32]));
+        let b = PushReservation::from(&bridge_entry([0xB2; 32]));
         let live = LiveRelayUrl::new(a.clone());
         live.set(b.clone());
-        assert_eq!(live.current(), ReservedRelayUrls::from(b.clone()));
+        assert_eq!(live.current(), PushReservations::from(b.clone()));
         assert_eq!(
             live.current().as_slice()[0].bridge_target(),
             b.bridge_target()
@@ -1290,8 +1291,8 @@ mod tests {
 
     #[test]
     fn relay_url_canonicalizes_and_derives_the_reserved_routing_id() {
-        let a = RelayUrl::new("WSS://Relay.Example:443/").unwrap();
-        let b = RelayUrl::new("wss://relay.example").unwrap();
+        let a = PushReservation::new("WSS://Relay.Example:443/").unwrap();
+        let b = PushReservation::new("wss://relay.example").unwrap();
         assert_eq!(a, b);
         assert_eq!(a.canonical(), "wss://relay.example");
         assert_eq!(
@@ -1299,14 +1300,14 @@ mod tests {
             push_registration_routing_id("wss://relay.example").unwrap()
         );
         assert!(matches!(
-            RelayUrl::new("https://relay.example"),
-            Err(PushMessageError::InvalidRelayUrl(_))
+            PushReservation::new("https://relay.example"),
+            Err(PushMessageError::InvalidNodeUrl(_))
         ));
     }
 
     #[tokio::test]
     async fn other_routing_ids_pass_through() {
-        let url = LiveRelayUrl::new(RelayUrl::new("wss://relay.example").unwrap());
+        let url = LiveRelayUrl::new(PushReservation::new("wss://relay.example").unwrap());
         assert_eq!(
             gate_publish(&url, &PushRole::Disabled, &[0xAA; 32], b"x", 0).await,
             PushPublishGate::NotPush
@@ -1315,7 +1316,7 @@ mod tests {
 
     #[tokio::test]
     async fn disabled_rejects_the_reserved_routing_id_with_4063() {
-        let url = RelayUrl::new("wss://relay.example").unwrap();
+        let url = PushReservation::new("wss://relay.example").unwrap();
         let live = LiveRelayUrl::new(url.clone());
         let gate = gate_publish(
             &live,
@@ -1331,19 +1332,19 @@ mod tests {
 
     #[tokio::test]
     async fn set_moves_the_reserved_routing_id_and_keeps_refusing_the_old_one() {
-        let old = RelayUrl::new("ws://198.51.100.7:32891/scp/v1").unwrap();
-        let new = RelayUrl::new("ws://203.0.113.42:8443/scp/v1").unwrap();
+        let old = PushReservation::new("ws://198.51.100.7:32891/scp/v1").unwrap();
+        let new = PushReservation::new("ws://203.0.113.42:8443/scp/v1").unwrap();
         let live = LiveRelayUrl::new(old.clone());
         let reader = live.clone();
         live.set(new.clone());
-        assert_eq!(reader.current(), ReservedRelayUrls::from(new.clone()));
+        assert_eq!(reader.current(), PushReservations::from(new.clone()));
         for id in [new.push_routing_id(), old.push_routing_id()] {
             let gate = gate_publish(&reader, &PushRole::Disabled, &id, b"x", 0).await;
             assert!(matches!(gate, PushPublishGate::Rejected { code: 4063, .. }));
         }
         // The old URL coming back makes it current and retires the new one.
         live.set(old.clone());
-        assert_eq!(reader.current(), ReservedRelayUrls::from(old.clone()));
+        assert_eq!(reader.current(), PushReservations::from(old.clone()));
         assert!(!matches!(
             reader.reservation(&old.push_routing_id()),
             Reservation::Retired | Reservation::Other
@@ -1356,8 +1357,9 @@ mod tests {
 
     #[test]
     fn retired_routing_ids_are_bounded() {
-        let url =
-            |n: usize| RelayUrl::new(&format!("ws://198.51.100.7:{}/scp/v1", 1000 + n)).unwrap();
+        let url = |n: usize| {
+            PushReservation::new(&format!("ws://198.51.100.7:{}/scp/v1", 1000 + n)).unwrap()
+        };
         let live = LiveRelayUrl::new(url(0));
         for n in 1..=MAX_RETIRED_PUSH_ROUTING_IDS + 1 {
             live.set(url(n));
@@ -1378,9 +1380,9 @@ mod tests {
     async fn enabled_rejects_a_retired_routing_id_with_4060() {
         let dir = tempfile::tempdir().unwrap();
         let service = kel_service_for_tests(dir.path()).await;
-        let old = RelayUrl::new("wss://old.relay.example").unwrap();
+        let old = PushReservation::new("wss://old.relay.example").unwrap();
         let live = LiveRelayUrl::new(old.clone());
-        live.set(RelayUrl::new("wss://new.relay.example").unwrap());
+        live.set(PushReservation::new("wss://new.relay.example").unwrap());
         let gate = gate_publish(
             &live,
             &PushRole::Enabled(service),
@@ -1485,7 +1487,7 @@ mod tests {
     /// not [`gate_publish`], because the gate rejects every message at a tier
     /// 3 ID until it can open the Tier 3 envelope (PUSH-033).
     #[cfg(feature = "push-store")]
-    async fn present(held: &RelayUrl, blob: &[u8]) -> (PushPublishGate, Option<u64>) {
+    async fn present(held: &PushReservation, blob: &[u8]) -> (PushPublishGate, Option<u64>) {
         let dir = tempfile::tempdir().unwrap();
         let config = test_service(dir.path(), GATE_REGISTRANT, &gate_key()).await;
         let store = config.store.clone();
@@ -1519,9 +1521,9 @@ mod tests {
     #[cfg(feature = "push-store")]
     #[tokio::test]
     async fn enabled_rejects_a_message_signed_for_another_bridge_target_with_4060() {
-        let held_a = RelayUrl::from(&bridge_entry([0xA1; 32]));
-        let held_b = RelayUrl::from(&bridge_entry([0xB2; 32]));
-        let held_none = RelayUrl::new(BRIDGE_URL).unwrap();
+        let held_a = PushReservation::from(&bridge_entry([0xA1; 32]));
+        let held_b = PushReservation::from(&bridge_entry([0xB2; 32]));
+        let held_none = PushReservation::new(BRIDGE_URL).unwrap();
         for deregister in [false, true] {
             let for_a = signed_for(deregister, held_a.push_relay());
             let sentinel = signed_for(deregister, held_none.push_relay());
@@ -1548,10 +1550,10 @@ mod tests {
     /// Two bridge entries with different URLs and the same target, as a node
     /// publishing one tier 3 entry per bridge relay holds them (§10.7.1
     /// "Tier 3 relays").
-    fn two_bridge_entries() -> (RelayUrl, RelayUrl) {
+    fn two_bridge_entries() -> (PushReservation, PushReservation) {
         let target = BridgeTarget::new([0xA1; 32]).unwrap();
         let entry = |url: &str| {
-            RelayUrl::from(&scp_did::RelayService::bridge(
+            PushReservation::from(&scp_did::RelayService::bridge(
                 scp_did::BridgeEndpoint::new(url).unwrap(),
                 target,
             ))
@@ -1566,16 +1568,16 @@ mod tests {
     /// compares as a set. It has no empty value, because `new` takes a first
     /// URL.
     #[test]
-    fn reserved_relay_urls_drop_duplicate_ids() {
+    fn push_reservations_drop_duplicate_ids() {
         let (a, b) = two_bridge_entries();
-        let set = ReservedRelayUrls::new(a.clone(), [b.clone(), a.clone(), b.clone()]);
+        let set = PushReservations::new(a.clone(), [b.clone(), a.clone(), b.clone()]);
         assert_eq!(set.as_slice(), &[a.clone(), b.clone()]);
-        assert_eq!(set, ReservedRelayUrls::new(b.clone(), [a.clone()]));
-        assert_ne!(set, ReservedRelayUrls::from(a.clone()));
+        assert_eq!(set, PushReservations::new(b.clone(), [a.clone()]));
+        assert_ne!(set, PushReservations::from(a.clone()));
         assert_eq!(set.get(&b.push_routing_id()), Some(&b));
         assert_eq!(
-            ReservedRelayUrls::new(a.clone(), std::iter::empty()),
-            ReservedRelayUrls::from(a)
+            PushReservations::new(a.clone(), std::iter::empty()),
+            PushReservations::from(a)
         );
     }
 
@@ -1584,10 +1586,10 @@ mod tests {
     /// into the retired list, and setting both again makes it current.
     #[test]
     fn set_of_two_entries_reserves_both_and_a_single_entry_releases_the_other() {
-        let old = RelayUrl::new("ws://198.51.100.7:32891/scp/v1").unwrap();
+        let old = PushReservation::new("ws://198.51.100.7:32891/scp/v1").unwrap();
         let (a, b) = two_bridge_entries();
         let live = LiveRelayUrl::new(old.clone());
-        live.set(ReservedRelayUrls::new(a.clone(), [b.clone()]));
+        live.set(PushReservations::new(a.clone(), [b.clone()]));
         for entry in [&a, &b] {
             assert!(
                 !matches!(
@@ -1604,7 +1606,7 @@ mod tests {
         ));
 
         live.set(a.clone());
-        assert_eq!(live.current(), ReservedRelayUrls::from(a.clone()));
+        assert_eq!(live.current(), PushReservations::from(a.clone()));
         assert!(matches!(
             live.reservation(&b.push_routing_id()),
             Reservation::Retired
@@ -1614,7 +1616,7 @@ mod tests {
             VecDeque::from([old.push_routing_id(), b.push_routing_id()])
         );
 
-        live.set(ReservedRelayUrls::new(a, [b]));
+        live.set(PushReservations::new(a, [b]));
         assert_eq!(
             live.0.borrow().retired,
             VecDeque::from([old.push_routing_id()]),
@@ -1625,11 +1627,12 @@ mod tests {
     /// The retired list keeps its bound when each set releases several IDs.
     #[test]
     fn retired_routing_ids_stay_bounded_when_sets_release_several_ids() {
-        let url =
-            |n: usize| RelayUrl::new(&format!("ws://198.51.100.7:{}/scp/v1", 1000 + n)).unwrap();
+        let url = |n: usize| {
+            PushReservation::new(&format!("ws://198.51.100.7:{}/scp/v1", 1000 + n)).unwrap()
+        };
         let live = LiveRelayUrl::new(url(0));
         for n in 1..=MAX_RETIRED_PUSH_ROUTING_IDS {
-            live.set(ReservedRelayUrls::new(url(2 * n), [url(2 * n + 1)]));
+            live.set(PushReservations::new(url(2 * n), [url(2 * n + 1)]));
         }
         assert_eq!(live.0.borrow().retired.len(), MAX_RETIRED_PUSH_ROUTING_IDS);
     }
@@ -1646,7 +1649,7 @@ mod tests {
     #[tokio::test]
     async fn enabled_rejects_an_unsealed_message_at_each_reserved_tier3_id_with_4060() {
         let (a, b) = two_bridge_entries();
-        let direct = RelayUrl::new("ws://198.51.100.7:32891/scp/v1").unwrap();
+        let direct = PushReservation::new("ws://198.51.100.7:32891/scp/v1").unwrap();
         let key = PushRegistrationKey {
             registrant: GATE_REGISTRANT.to_owned(),
             platform: PushPlatform::Apns,
@@ -1672,7 +1675,7 @@ mod tests {
             assert_eq!(stored, Some(GATE_NOW));
 
             // The runtime change a tier change makes.
-            live.set(ReservedRelayUrls::new(a.clone(), [b.clone()]));
+            live.set(PushReservations::new(a.clone(), [b.clone()]));
             for (label, signed, at, timestamp) in [
                 ("A-signed at A", &a, &a, GATE_NOW + 1),
                 ("B-signed at B", &b, &b, GATE_NOW + 2),
@@ -1731,8 +1734,9 @@ mod tests {
             let config = test_service(dir.path(), GATE_REGISTRANT, &gate_key()).await;
             let store = config.store.clone();
             let service = PushService::start(config).unwrap();
-            let live = LiveRelayUrl::new(RelayUrl::new("ws://198.51.100.7:32891/scp/v1").unwrap());
-            live.set(ReservedRelayUrls::new(a.clone(), [b.clone()]));
+            let live =
+                LiveRelayUrl::new(PushReservation::new("ws://198.51.100.7:32891/scp/v1").unwrap());
+            live.set(PushReservations::new(a.clone(), [b.clone()]));
 
             // Each step: (label, signed for, presented at, timestamp, accepted).
             let steps = [
@@ -1803,7 +1807,9 @@ mod tests {
         use super::super::super::push_store::{PushRegistrationKey, PushRegistrationStore};
         use super::super::super::push_test_server::TlsTestServer;
         use super::super::super::push_webpush::tests::{TestResult, sender_for, subscribe};
-        use super::super::{LiveRelayUrl, PushPublishGate, PushServiceConfig, RelayUrl, handle};
+        use super::super::{
+            LiveRelayUrl, PushPublishGate, PushReservation, PushServiceConfig, handle,
+        };
         use super::{GATE_NOW, GATE_REGISTRANT, gate_key};
 
         const RELAY: &str = "wss://relay.example/scp/v1";
@@ -1840,7 +1846,7 @@ mod tests {
             timestamp: u64,
             forged: bool,
         ) -> TestResult<Vec<u8>> {
-            let relay = RelayUrl::new(RELAY)?;
+            let relay = PushReservation::new(RELAY)?;
             let key = if forged {
                 scp_crypto::p256::P256SecretKey::from_scalar_bytes(&[9; 32])?
             } else {
@@ -1882,7 +1888,7 @@ mod tests {
             blob: &[u8],
             token: &[u8],
         ) -> TestResult<(PushPublishGate, Option<u64>)> {
-            let held = RelayUrl::new(RELAY)?;
+            let held = PushReservation::new(RELAY)?;
             let live = LiveRelayUrl::new(held.clone());
             let entry = live
                 .current()

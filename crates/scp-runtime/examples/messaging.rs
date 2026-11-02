@@ -4,11 +4,12 @@
 //! and exchanging messages between them. Shows how events are
 //! generated for membership changes and message delivery.
 //!
-//! Uses mock providers — see `scp-testing` for full-stack examples
-//! with real MLS encryption.
+//! Uses a mock transport and event log. Bob's `KeyPackage` is a real MLS
+//! one, minted through `Supervisor::mint_attested_key_package`; see
+//! `scp-testing` for full-stack runs over a relay.
 //!
 //! Usage:
-//!   `cargo run -p scp-runtime --features testing --example messaging`
+//!   `cargo run -p scp-runtime --example messaging`
 
 use std::sync::Arc;
 
@@ -24,7 +25,13 @@ mod support;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Build a Supervisor with mock providers.
-    let key_resolver: KeyResolver = Arc::new(|_did: &DID, _kid: scp_did::SigningKeyId| None);
+    // Each participant's `#active` key is the one `support::command_signer_for`
+    // signs with, so the supervisor can check the attestation on Bob's
+    // KeyPackage against the key his DID names.
+    let key_resolver: KeyResolver = Arc::new(|did: &DID, kid: scp_did::SigningKeyId| {
+        matches!(kid, scp_did::SigningKeyId::Active)
+            .then(|| support::signing_key_for(did).verifying_key())
+    });
     let (durable, persistence) = support::example_storage_providers();
     let manager = Supervisor::with_providers_and_journal(
         support::example_crypto("did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK"),
@@ -72,10 +79,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     println!("Alice created context: {}", handle.context_id());
 
-    // 4. Bob joins the context with a mock key package.
+    // 4. Bob joins the context with a real MLS KeyPackage, minted the way every
+    // bridge mints one: it carries Bob's wrapping key and an attestation signed
+    // through his `#active` key.
+    let bob_signer = support::command_signer_for(&bob).await?;
     let bob_key_package = KeyPackage {
         owner_did: bob.clone(),
-        mls_key_package_bytes: None, // mock — no real MLS in this example
+        mls_key_package_bytes: Some(manager.mint_attested_key_package(&bob, &bob_signer).await?),
     };
     manager
         .join_context(&handle, bob_key_package, None, None)
@@ -102,7 +112,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nAlice: Hello Bob!");
 
     // 6. Bob sends a reply.
-    let bob_signer = support::command_signer_for(&bob).await?;
     manager
         .send_message(
             &handle,

@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use scp_core::push::{PushPublishError, PushRelayPublisher};
-use scp_did::{RelayUrlError, canonical_relay_url};
+use scp_did::{NodeUrlError, canonical_node_url};
 use scp_relay_client::{MIN_BLOB_TTL, sanitize_relay_text};
 
 use crate::error::TransportError;
@@ -63,14 +63,14 @@ impl TransportPushPublisher {
     ///
     /// # Errors
     ///
-    /// [`RelayUrlError`] when `relay_url` is not a valid relay URL; nothing
+    /// [`NodeUrlError`] when `relay_url` is not a valid relay URL; nothing
     /// is bound.
     pub fn bind(
         &self,
         relay_url: &str,
         adapter: Arc<dyn TransportAdapter>,
-    ) -> Result<(), RelayUrlError> {
-        self.relays.bind(canonical_relay_url(relay_url)?, adapter);
+    ) -> Result<(), NodeUrlError> {
+        self.relays.bind(canonical_node_url(relay_url)?, adapter);
         Ok(())
     }
 
@@ -79,9 +79,9 @@ impl TransportPushPublisher {
     ///
     /// # Errors
     ///
-    /// [`RelayUrlError`] when `relay_url` is not a valid relay URL.
-    pub fn unbind(&self, relay_url: &str) -> Result<(), RelayUrlError> {
-        self.relays.unbind(&canonical_relay_url(relay_url)?);
+    /// [`NodeUrlError`] when `relay_url` is not a valid relay URL.
+    pub fn unbind(&self, relay_url: &str) -> Result<(), NodeUrlError> {
+        self.relays.unbind(&canonical_node_url(relay_url)?);
         Ok(())
     }
 }
@@ -95,8 +95,8 @@ impl PushRelayPublisher for TransportPushPublisher {
     ) -> BoxFuture<'a, Result<(), PushPublishError>> {
         Box::pin(async move {
             let canonical =
-                canonical_relay_url(relay_url).map_err(|err| PushPublishError::Unreachable {
-                    reason: format!("invalid relay URL: {err}"),
+                canonical_node_url(relay_url).map_err(|err| PushPublishError::Unreachable {
+                    reason: format!("invalid node URL: {err}"),
                 })?;
             let adapter =
                 self.relays

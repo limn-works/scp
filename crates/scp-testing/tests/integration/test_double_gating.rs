@@ -236,12 +236,21 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// The repository root. A path outside this crate is formed only as
+/// `workspace_root().join` of a literal, the form
+/// scripts/tests/ci-gate/ci_gate_selftest.py reads to route a change to it to
+/// this test.
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("scp-testing sits at crates/scp-testing")
+        .to_path_buf()
+}
+
 #[test]
 fn named_test_doubles_compile_only_under_test_or_testing() {
-    let crates_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("scp-testing sits under crates/")
-        .to_path_buf();
+    let crates_dir = workspace_root().join("crates");
     let mut files = Vec::new();
     rust_files(&crates_dir, &mut files);
 
@@ -332,7 +341,7 @@ fn checker_rejects_each_weakened_gate() {
 /// there is rejected, and an ungated `use` in `src/` is rejected.
 #[test]
 fn integration_test_exemption_accepts_only_use_items() {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let crate_dir = workspace_root().join("crates/scp-testing");
     let in_tests = crate_dir.join("tests/integration/fixture.rs");
     let in_src = crate_dir.join("src/fixture.rs");
 
@@ -361,14 +370,14 @@ fn integration_test_exemption_accepts_only_use_items() {
 /// `tests.rs` module file, does not count.
 #[test]
 fn integration_test_exemption_covers_only_the_crate_tests_dir() {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let crate_dir = workspace_root().join("crates/scp-testing");
     assert!(in_integration_test_target(
         &crate_dir.join("tests/integration/attacks.rs")
     ));
     assert!(in_integration_test_target(
         &crate_dir.join("tests/integration/test_double_gating.rs")
     ));
-    let runtime_dir = crate_dir.parent().unwrap().join("scp-runtime");
+    let runtime_dir = workspace_root().join("crates/scp-runtime");
     assert!(in_integration_test_target(
         &runtime_dir.join("tests/ucan_validate_integration.rs")
     ));
@@ -381,7 +390,7 @@ fn integration_test_exemption_covers_only_the_crate_tests_dir() {
     assert!(!in_integration_test_target(
         &runtime_dir.join("src/tests.rs")
     ));
-    let protocol_dir = crate_dir.parent().unwrap().join("scp-protocol");
+    let protocol_dir = workspace_root().join("crates/scp-protocol");
     assert!(!in_integration_test_target(
         &protocol_dir.join("src/crypto/ucan/validate.rs")
     ));

@@ -37,7 +37,7 @@ cd bindings/python
 PYTHONPATH=. python3.12 -m pytest tests/ -v
 ```
 
-Requires `maturin develop --release` first to build the native extension.
+Requires `maturin develop --profile ci-bridge --features testing` first to build the native extension, with the same profile and features as CI's pyo3-module job.
 
 ### TypeScript
 

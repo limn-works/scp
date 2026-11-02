@@ -20,7 +20,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use scp_did::RelayEndpoint;
+use scp_did::NodeUrl;
 use scp_identity::DidMethod;
 use scp_protocol::economy::types::{Amount, CurrencyCode, PaymentAdapterRef};
 
@@ -239,7 +239,7 @@ pub enum WellKnownValidationError {
     /// canonical form to compare with the document's entries. The error's URL
     /// has its user information removed.
     #[error("relay URL in .well-known/scp is invalid: {0}")]
-    InvalidRelayUrl(#[source] scp_did::DidError),
+    InvalidNodeUrl(#[source] scp_did::DidError),
 
     /// The operator DID in `.well-known/scp` does not match the resolved
     /// DID document's subject.
@@ -276,7 +276,7 @@ impl WellKnownScp {
     ///   be resolved.
     /// - [`WellKnownValidationError::OperatorDidMismatch`] if the resolved
     ///   document subject does not match the claimed operator DID.
-    /// - [`WellKnownValidationError::InvalidRelayUrl`] if the relay URL has no
+    /// - [`WellKnownValidationError::InvalidNodeUrl`] if the relay URL has no
     ///   §9.18.2 canonical form or its canonical path does not end in
     ///   `/scp/v1` (§18.2.1).
     /// - [`WellKnownValidationError::RelayMismatch`] if the relay URL's
@@ -309,7 +309,7 @@ impl WellKnownScp {
         // entry. Two spellings of one relay share a canonical form, so the
         // claimed URL is canonicalized before the comparison.
         let claimed =
-            RelayEndpoint::new(&self.relay).map_err(WellKnownValidationError::InvalidRelayUrl)?;
+            NodeUrl::new(&self.relay).map_err(WellKnownValidationError::InvalidNodeUrl)?;
         if !relay_urls.iter().any(|url| url == claimed.as_str()) {
             return Err(WellKnownValidationError::RelayMismatch {
                 relay_url: self.relay.clone(),
@@ -360,7 +360,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use scp_did::{DidDocument, DidError, RelayEntryUrlError, RelayUrlError, Service};
+    use scp_did::{DidDocument, DidError, NodeEntryUrlError, NodeUrlError, Service};
     use scp_identity::{
         DidMethod,
         dht::{IdentityError, ScpIdentity},
@@ -1130,11 +1130,11 @@ mod tests {
         for (relay, expected) in [
             (
                 "wss://user:pw@relay.example.com/scp/v1?x=1",
-                RelayEntryUrlError::Canonical(RelayUrlError::QueryOrFragment),
+                NodeEntryUrlError::Canonical(NodeUrlError::QueryOrFragment),
             ),
             (
                 "wss://relay.example.com/other",
-                RelayEntryUrlError::PathNotScpV1,
+                NodeEntryUrlError::PathNotScpV1,
             ),
         ] {
             let err = well_known_with_relay(did, relay)
@@ -1142,14 +1142,14 @@ mod tests {
                 .await
                 .expect_err("no canonical SCPRelay form");
             match err {
-                WellKnownValidationError::InvalidRelayUrl(DidError::InvalidRelayUrl {
+                WellKnownValidationError::InvalidNodeUrl(DidError::InvalidNodeUrl {
                     url,
                     reason,
                 }) => {
                     assert_eq!(reason, expected, "{relay}");
                     assert!(!url.contains("pw@"), "user information echoed: {url}");
                 }
-                other => panic!("expected InvalidRelayUrl for {relay}, got: {other:?}"),
+                other => panic!("expected InvalidNodeUrl for {relay}, got: {other:?}"),
             }
         }
     }

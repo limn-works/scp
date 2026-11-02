@@ -1342,6 +1342,7 @@ pub const PARTICIPATION_STATEMENTS_SERVICE_TYPE: &str = "ScpParticipationStateme
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::context::governance::{GovernanceAction, executed_payload_fixture};
     use scp_event_log::EventPayload;
 
     /// Creates a test event with the given parameters. The signature and
@@ -1458,7 +1459,7 @@ mod tests {
                 "did:key:alice",
                 1000,
                 0,
-                make_gov_payload("did:key:bob", "RemoveMember"),
+                make_gov_payload(remove_member("did:key:bob")),
             ),
             // Untargeted action (empty target_did) — still counts as an action
             // BY the subject, but projects no target.
@@ -1467,7 +1468,7 @@ mod tests {
                 "did:key:alice",
                 1001,
                 1,
-                make_gov_payload("", "ModifyPolicy"),
+                make_gov_payload(GovernanceAction::CloseContext { reason: None }),
             ),
         ];
 
@@ -1534,14 +1535,14 @@ mod tests {
                 "did:key:admin",
                 1000,
                 0,
-                make_gov_payload("did:key:alice", "RemoveMember"),
+                make_gov_payload(remove_member("did:key:alice")),
             ),
             make_event(
                 EventType::GovernanceActionExecuted,
                 "did:key:admin",
                 1001,
                 1,
-                make_gov_payload("did:key:bob", "RemoveMember"),
+                make_gov_payload(remove_member("did:key:bob")),
             ),
         ];
 
@@ -1558,18 +1559,34 @@ mod tests {
         assert_eq!(record.governance_actions_against[0].event_sequence, 0);
     }
 
-    /// Helper: create a canonical `GovernanceActionExecutedPayload` (positional
-    /// `MessagePack`, ADR-011 amendment) carrying both `target_did` and
-    /// `action_type`.
-    fn make_gov_payload(target_did: &str, action_type: &str) -> Vec<u8> {
-        scp_event_log::payload::encode_payload(
-            &scp_event_log::payload::GovernanceActionExecutedPayload {
-                target_did: target_did.to_owned(),
-                action_type: action_type.to_owned(),
-            },
-        )
-        .unwrap()
-        .data
+    /// Helper: the encoded `GovernanceActionExecuted` leaf payload a committer
+    /// writes for a real proposal of `action`, so its `target_did`,
+    /// `action_type`, `proposal_id`, and `action_bytes` agree.
+    fn make_gov_payload(action: GovernanceAction) -> Vec<u8> {
+        scp_event_log::payload::encode_payload(&executed_payload_fixture(action).unwrap())
+            .unwrap()
+            .data
+    }
+
+    fn remove_member(did: &str) -> GovernanceAction {
+        GovernanceAction::RemoveMember {
+            did: DID::from(did),
+            reason: None,
+        }
+    }
+
+    fn restore_access(did: &str) -> GovernanceAction {
+        GovernanceAction::RestoreAccess {
+            did: DID::from(did),
+            capabilities: Vec::new(),
+        }
+    }
+
+    fn suspend_capability(did: &str) -> GovernanceAction {
+        GovernanceAction::SuspendCapability {
+            did: DID::from(did),
+            capabilities: Vec::new(),
+        }
     }
 
     /// Helper: create a canonical `RoleAssignedPayload` carrying the affected
@@ -1608,7 +1625,7 @@ mod tests {
                     "did:key:admin",
                     1000 + i,
                     i,
-                    make_gov_payload(victim, "RestoreAccess"),
+                    make_gov_payload(restore_access(victim)),
                 )
             })
             .collect();
@@ -1633,7 +1650,7 @@ mod tests {
             "did:key:admin",
             1000,
             0,
-            make_gov_payload(victim, "SuspendCapability"),
+            make_gov_payload(suspend_capability(victim)),
         )];
 
         let record =
@@ -1657,42 +1674,42 @@ mod tests {
                 "did:key:admin",
                 1000,
                 0,
-                make_gov_payload(victim, "RestoreAccess"),
+                make_gov_payload(restore_access(victim)),
             ),
             make_event(
                 EventType::GovernanceActionExecuted,
                 "did:key:admin",
                 1001,
                 1,
-                make_gov_payload(victim, "RestoreAccess"),
+                make_gov_payload(restore_access(victim)),
             ),
             make_event(
                 EventType::GovernanceActionExecuted,
                 "did:key:admin",
                 1002,
                 2,
-                make_gov_payload(victim, "RestoreAccess"),
+                make_gov_payload(restore_access(victim)),
             ),
             make_event(
                 EventType::GovernanceActionExecuted,
                 "did:key:admin",
                 1003,
                 3,
-                make_gov_payload(victim, "SuspendCapability"),
+                make_gov_payload(suspend_capability(victim)),
             ),
             make_event(
                 EventType::GovernanceActionExecuted,
                 "did:key:admin",
                 1004,
                 4,
-                make_gov_payload(victim, "SuspendCapability"),
+                make_gov_payload(suspend_capability(victim)),
             ),
             make_event(
                 EventType::GovernanceActionExecuted,
                 "did:key:admin",
                 1005,
                 5,
-                make_gov_payload(victim, "RemoveMember"),
+                make_gov_payload(remove_member(victim)),
             ),
         ];
 
@@ -1708,15 +1725,20 @@ mod tests {
 
     #[test]
     fn approve_spend_does_not_count_against_beneficiary() {
-        // ApproveSpend is beneficial. Even when its target_did is the victim,
-        // it must not count against them.
+        // ApproveSpend names a `spender`, which is neither `did` nor
+        // `new_admin`, so its leaf's target_did is empty (spec 07 §7.3.1.1
+        // step 1.6) and it never counts against the spender.
         let victim = "did:key:victim";
         let events = vec![make_event(
             EventType::GovernanceActionExecuted,
             "did:key:admin",
             1000,
             0,
-            make_gov_payload(victim, "ApproveSpend"),
+            make_gov_payload(GovernanceAction::ApproveSpend {
+                spender: DID::from(victim),
+                amount: crate::economy::types::Amount::new(100),
+                purpose: "supplies".to_owned(),
+            }),
         )];
 
         let record =
@@ -1741,7 +1763,19 @@ mod tests {
             "did:key:admin",
             1000,
             0,
-            make_gov_payload(victim, ""),
+            {
+                // A real proposal's leaf with its `action_type` blanked: no
+                // honest committer writes it, which is the case under test.
+                let mut payload = executed_payload_fixture(GovernanceAction::RemoveMember {
+                    did: DID::from(victim),
+                    reason: None,
+                })
+                .unwrap();
+                payload.action_type = String::new();
+                scp_event_log::payload::encode_payload(&payload)
+                    .unwrap()
+                    .data
+            },
         )];
 
         let record =
@@ -2034,7 +2068,7 @@ mod tests {
                 "did:key:alice",
                 1008,
                 8,
-                make_gov_payload("did:key:bob", "RemoveMember"),
+                make_gov_payload(remove_member("did:key:bob")),
             ),
         ];
         let attestations = vec![make_attestation(
@@ -3076,7 +3110,7 @@ mod tests {
                 actor_did,
                 1005,
                 5,
-                make_gov_payload("did:key:target", "RemoveMember"),
+                make_gov_payload(remove_member("did:key:target")),
             ),
             // Adverse governance action AGAINST the member (by an admin).
             make_event(
@@ -3084,7 +3118,7 @@ mod tests {
                 "did:key:admin",
                 1006,
                 6,
-                make_gov_payload(actor_did, "RemoveMember"),
+                make_gov_payload(remove_member(actor_did)),
             ),
             // Role assignment whose subject is the member.
             make_event(
@@ -3389,7 +3423,7 @@ mod tests {
     /// the subject.
     #[test]
     fn test_participation_actions_against_populated() {
-        let payload = make_gov_payload("did:key:alice", "RemoveMember");
+        let payload = make_gov_payload(remove_member("did:key:alice"));
 
         let events = vec![
             make_event(
@@ -3412,7 +3446,7 @@ mod tests {
                 "did:key:admin",
                 1002,
                 2,
-                make_gov_payload("did:key:bob", "RemoveMember"),
+                make_gov_payload(remove_member("did:key:bob")),
             ),
         ];
 
@@ -3532,7 +3566,7 @@ mod tests {
                 admin,
                 1150,
                 2,
-                make_gov_payload(member, "RemoveMember"),
+                make_gov_payload(remove_member(member)),
             ),
             // Governance action executed BY the member (by).
             make_event(
@@ -3540,7 +3574,7 @@ mod tests {
                 member,
                 1200,
                 3,
-                make_gov_payload(admin, "RemoveMember"),
+                make_gov_payload(remove_member(admin)),
             ),
             // Child context created by the member.
             make_event(EventType::ChildContextCreated, member, 1250, 4, vec![]),

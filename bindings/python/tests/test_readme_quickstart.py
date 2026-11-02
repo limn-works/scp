@@ -29,7 +29,7 @@ try:
 except Exception as _exc:
     pytest.skip(skip_reason_if_extension_absent(_exc), allow_module_level=True)
 
-_PACKAGE_ROOT = Path(__file__).resolve().parent.parent
+_PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 _README = _PACKAGE_ROOT / "README.md"
 _QUICK_START = "Quick Start"
 _ERROR_HANDLING = "Error Handling"

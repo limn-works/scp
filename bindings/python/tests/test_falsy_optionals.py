@@ -27,7 +27,7 @@ from unittest.mock import MagicMock
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-LINT_SCRIPT = REPO_ROOT / "scripts" / "check-python-falsy-optionals.py"
+LINT_SCRIPT = REPO_ROOT / "scripts/check-python-falsy-optionals.py"
 
 
 def _run_lint_against_tmp_sdk(
@@ -63,7 +63,6 @@ class TestLintGuardOnRepo:
             [sys.executable, str(LINT_SCRIPT)],
             capture_output=True,
             text=True,
-            cwd=REPO_ROOT,
         )
         assert result.returncode == 0, (
             f"Lint guard failed on current tree:\nstdout: {result.stdout}\nstderr: {result.stderr}"

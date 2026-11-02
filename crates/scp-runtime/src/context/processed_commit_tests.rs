@@ -163,6 +163,45 @@ impl ContextEventLogProvider for OkEventLog {
     }
 }
 
+/// Every appended leaf as `(event type, payload bytes)`. `std::sync::RwLock`
+/// is the one shared lock the runtime's clippy `disallowed-types` list admits.
+type Leaves = Arc<std::sync::RwLock<Vec<(scp_event_log::EventType, Vec<u8>)>>>;
+
+/// An event log that records every appended leaf, so a test can decode the
+/// payload a production emit site wrote.
+struct RecordingEventLog(Leaves);
+
+#[async_trait::async_trait]
+impl ContextEventLogProvider for RecordingEventLog {
+    fn event_log_entries(
+        &self,
+        _context_id: &[u8; 32],
+    ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError> {
+        Ok(None)
+    }
+
+    async fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        Ok(())
+    }
+    async fn append_event(
+        &self,
+        _id: &[u8; 32],
+        event: scp_event_log::EventType,
+        _actor: &str,
+        payload: scp_event_log::EventPayload,
+        _timestamp_secs: u64,
+    ) -> Result<(), ContextCreationError> {
+        self.0
+            .write()
+            .expect("recorded leaves lock")
+            .push((event, payload.data));
+        Ok(())
+    }
+    async fn destroy_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        Ok(())
+    }
+}
+
 /// One member: its cell, production deps, snapshot store and sent payloads.
 struct Member {
     cell: ClassSCell,
@@ -581,6 +620,44 @@ async fn a_reset_is_one_commit_and_one_epoch() {
     assert!(
         alice.store.snapshot(ctx).is_some(),
         "the reset persisted once its Commit merged"
+    );
+}
+
+/// Spec 07 §7.3.1.1 step 1.6: a `ResetMember` for Carol derives exactly one
+/// `MemberReset` leaf, `[Carol, nil, nil, ""]`; an admin-initiated reset has
+/// no requested epoch, no counter, and no requester's reason (the action's own
+/// reason travels in the `GovernanceActionExecuted` leaf's `action_bytes`).
+#[tokio::test]
+async fn a_reset_appends_one_member_reset_leaf_naming_the_reset_member() {
+    let ctx = "reset-appends-member-reset-leaf";
+    let (mut alice, _bob) = trio(ctx).await;
+    let leaves: Leaves = Arc::new(std::sync::RwLock::new(Vec::new()));
+    alice.deps.event_log = Arc::new(RecordingEventLog(Arc::clone(&leaves)));
+
+    reset_carol(&mut alice, ctx, Some(&key_package(CAROL)))
+        .await
+        .expect("the reset commits");
+
+    let leaves = leaves.read().expect("recorded leaves lock").clone();
+    let resets: Vec<&Vec<u8>> = leaves
+        .iter()
+        .filter(|(t, _)| *t == scp_event_log::EventType::MemberReset)
+        .map(|(_, bytes)| bytes)
+        .collect();
+    assert_eq!(resets.len(), 1, "exactly one MemberReset leaf");
+    let payload: scp_event_log::payload::MemberResetPayload =
+        scp_event_log::payload::decode_payload(&scp_event_log::EventPayload {
+            data: resets[0].clone(),
+        })
+        .expect("the leaf decodes as MemberResetPayload");
+    assert_eq!(
+        payload,
+        scp_event_log::payload::MemberResetPayload {
+            subject_did: CAROL.to_owned(),
+            last_known_epoch: None,
+            reset_counter: None,
+            reason: String::new(),
+        }
     );
 }
 

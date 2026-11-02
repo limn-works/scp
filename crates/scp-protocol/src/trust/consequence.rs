@@ -1097,7 +1097,7 @@ fn payload_target_did(data: &[u8]) -> Option<String> {
 /// [`scp_event_log::payload::encode_payload`] for the typed payload structs
 /// whose first field is `target_did`. It reads only the first element, so it
 /// works uniformly across structs of differing arity (1-field
-/// `AccessRevokedPayload`, 2-field `GovernanceActionExecutedPayload`).
+/// `AccessRevokedPayload`, 4-field `GovernanceActionExecutedPayload`).
 fn rmp_array_first_string(data: &[u8]) -> Option<String> {
     let mut cursor = data;
     let value = rmpv::decode::read_value(&mut cursor).ok()?;
@@ -1425,10 +1425,13 @@ mod tests {
             })
             .unwrap();
         let executed = scp_event_log::payload::encode_payload(
-            &scp_event_log::payload::GovernanceActionExecutedPayload {
-                target_did: "did:key:alice".to_owned(),
-                action_type: "RemoveMember".to_owned(),
-            },
+            &crate::context::governance::executed_payload_fixture(
+                crate::context::governance::GovernanceAction::RemoveMember {
+                    did: DID::from("did:key:alice"),
+                    reason: None,
+                },
+            )
+            .unwrap(),
         )
         .unwrap();
 

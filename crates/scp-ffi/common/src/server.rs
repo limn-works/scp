@@ -44,7 +44,7 @@ use crate::node_start_config::{
 };
 use scp_transport::native::server::{RelayConfig, RelayError, RelayServer, ShutdownHandle};
 use scp_transport::native::storage::{BlobStorageBackend, StorageError};
-use scp_transport::relay::push_gate::{LiveRelayUrl, RelayUrl};
+use scp_transport::relay::push_gate::{LiveRelayUrl, PushReservation};
 use zeroize::Zeroizing;
 
 // ---------------------------------------------------------------------------
@@ -341,7 +341,7 @@ async fn start_relay_with(storage: BlobStorageBackend) -> Result<RunningRelay, S
     let config = RelayConfig {
         delivery_jitter_ms: 0,
         ..RelayConfig::defaults(LiveRelayUrl::new(
-            RelayUrl::new(&relay_url).map_err(RelayError::from)?,
+            PushReservation::new(&relay_url).map_err(RelayError::from)?,
         ))
     };
     let server = RelayServer::new(config, Arc::new(storage));
@@ -1764,7 +1764,7 @@ mod tests {
         use tokio_tungstenite::tungstenite::Message;
 
         let relay = start_relay_in_memory().await.unwrap();
-        let routing_id = scp_transport::relay::push_gate::RelayUrl::new(relay.relay_url())
+        let routing_id = scp_transport::relay::push_gate::PushReservation::new(relay.relay_url())
             .unwrap()
             .push_routing_id();
         let (mut ws, _) = tokio_tungstenite::connect_async(relay.relay_url())

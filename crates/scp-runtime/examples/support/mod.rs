@@ -64,17 +64,26 @@ pub fn example_crypto(did: &str) -> std::sync::Arc<NodeMlsFactory> {
 /// `InMemoryStorage` is a durability-only backend (spec §17.17
 /// `SCP-CAPSEL-8010`): it loses state when the process exits but stores every
 /// write while it runs. Examples select it explicitly; production selects a
-/// durable `Storage` (`SQLCipher`).
+/// durable `Storage` (`SQLCipher`). An
+/// [`EncryptingAdapter`](scp_platform::encrypting_adapter::EncryptingAdapter)
+/// under a fresh random key wraps it, so the context persistence goes through
+/// the production [`ProtocolRepository::new`](scp_runtime::store::ProtocolRepository::new)
+/// and its `EncryptedStorage` bound, the same constructor a host calls.
 pub fn example_storage_providers() -> (
     DurableProviders,
     Box<dyn scp_runtime::context::persistence::ContextPersistence>,
 ) {
-    let storage = std::sync::Arc::new(scp_platform::in_memory::InMemoryStorage::new());
+    use rand::RngCore as _;
+    let mut key = zeroize::Zeroizing::new([0u8; 32]);
+    rand::rngs::OsRng.fill_bytes(key.as_mut());
+    let storage = std::sync::Arc::new(scp_platform::encrypting_adapter::EncryptingAdapter::new(
+        scp_platform::in_memory::InMemoryStorage::new(),
+        key,
+    ));
     let durable = DurableProviders::from_handle(std::sync::Arc::clone(&storage));
-    let persistence =
-        scp_runtime::store::context::ProtocolRepositoryContextBridge::new(std::sync::Arc::new(
-            scp_runtime::store::ProtocolRepository::new_for_testing(storage),
-        ));
+    let persistence = scp_runtime::store::context::ProtocolRepositoryContextBridge::new(
+        std::sync::Arc::new(scp_runtime::store::ProtocolRepository::new(storage)),
+    );
     (durable, Box::new(persistence))
 }
 

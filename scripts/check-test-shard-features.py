@@ -84,11 +84,11 @@ BINARY_ID = re.compile(r"binary_id\(([A-Za-z0-9_-]+)::([A-Za-z0-9_]+)\)")
 # packages they select before nextest applies the filter, and job rust-clippy lints them
 # under `--all-targets`.
 #
-# scp-runtime::perf_baseline is the ADR-049 Decision 14 benchmark. Without
+# scp-testing::perf_baseline is the ADR-049 Decision 14 benchmark. Without
 # `SCP_PERF_GATE=1` it measures, writes a git-ignored JSON file and asserts nothing, so a
 # CI run spends tens of seconds and checks nothing. Decision 14 asks for a before-and-after
 # comparison on one machine, which an operator runs by hand.
-UNRUN_BINARIES = {("scp-runtime", "perf_baseline")}
+UNRUN_BINARIES = {("scp-testing", "perf_baseline")}
 
 FeatureGraph = dict[str, set[frozenset[str]]]
 

@@ -409,7 +409,7 @@ async fn main() {
 
     // Build the blob storage backend (SQLite by default).
     let blob_db_path = config.storage_path.join("blobs.db");
-    let blob_storage = BlobStorageBackend::sqlite(&blob_db_path).unwrap_or_else(|e| {
+    let blob_storage = BlobStorageBackend::sqlite(&blob_db_path).await.unwrap_or_else(|e| {
         tracing::error!(error = %e, "failed to open blob storage");
         std::process::exit(1);
     });

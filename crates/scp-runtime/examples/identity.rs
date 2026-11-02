@@ -5,17 +5,18 @@
 //! to the (in-memory) DHT.
 //!
 //! Usage, from a checkout of the repository:
-//!   `cargo run -p scp-runtime --features testing --example identity`
+//!   `cargo run -p scp-runtime --example identity`
 //!
 //! This example names three test-harness types: `InMemoryDhtClient`,
 //! `InMemoryKeyCustody`, and `InMemoryPreRotationCustody`. `scp-dht` compiles
 //! the first only under `scp-dht/testing`, and `scp-platform` compiles the other
-//! two only under `scp-platform/testing`. `scp-runtime/testing` activates both
-//! of those features, and `scp-dht` and `scp-platform` are normal dependencies
-//! that survive publication, so a consumer of the published crate compiles this
-//! file under `--features testing` (ADR-062, capability injection,
-//! §Decision 1). Every one of those types stays out of a shipped artifact,
-//! because no shipped artifact enables `scp-runtime/testing`, which
+//! two only under `scp-platform/testing`. This crate's `scp-dht` and
+//! `scp-platform` dev-dependencies turn both features on for its examples
+//! (ADR-062, capability injection, §Decision 1). They carry a `version` key,
+//! because cargo drops a dev-dependency without one from a published manifest.
+//! Every one of those types stays out of a shipped artifact: dev-dependencies
+//! never enter one, and no shipped artifact enables
+//! `scp-runtime/testing`, `scp-dht/testing` or `scp-platform/testing`, which
 //! `scripts/check-shipped-feature-graph.sh`, the shipped-feature-graph
 //! prove-absence gate, asserts on every run.
 

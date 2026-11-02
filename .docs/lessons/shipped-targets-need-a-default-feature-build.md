@@ -168,8 +168,26 @@ A later round restored the declaration on different ground. The revert measured 
 build inside the workspace, where the dev-dependency back-edge turns `testing` on. A
 consumer of the published crate has none of its path-only dev-dependencies, `scp-testing`
 among them, so on default features the file fails with unresolved imports, and the declaration makes cargo name the missing
-feature instead. All four of `scp-runtime`'s examples now carry it, and the gate still
-compiles each of them.
+feature instead. All four of `scp-runtime`'s examples carried it, and the gate still
+compiled each of them.
+
+The declaration came off again once the back-edge itself had to go. Any dev-dependency
+edge that reaches `scp-runtime`, even one naming the crate itself, makes cargo build
+the crate's lib before its lib test and its lib check before its lib check-test, which
+puts the workspace's two largest units in series on every edit. Without an edge, nothing
+turns `scp-runtime/testing` on for a bare `cargo clippy -p scp-runtime --example NAME`,
+so the declaration would refuse the gate's build. The examples now need no feature of
+`scp-runtime`. They store through the production `ProtocolRepository::new` over an
+`EncryptingAdapter`, and the `scp-dht` and `scp-platform` dev-dependencies give them the
+in-memory test types. Those two dev-dependencies carry a `version` key, because cargo
+drops a dev-dependency without one from a published manifest. The `messaging` example
+had joined Bob with a `KeyPackage` carrying no MLS bytes, which only `scp-runtime/testing`
+admits. It now mints a real one through `Supervisor::mint_attested_key_package`.
+
+A compile-only gate misses an example that compiles but fails when run. `messaging`
+stops at its first send with `PseudonymRegistryEmpty`, with or without `testing`,
+because no transport in one process delivers Bob's routing announcement. Running it was
+the only way to see that.
 
 ## An example a consumer cannot compile names a missing feature edge, not a file to stop publishing
 

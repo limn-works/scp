@@ -7,7 +7,7 @@
 //! with real MLS encryption.
 //!
 //! Usage:
-//!   `cargo run -p scp-runtime --features testing --example context`
+//!   `cargo run -p scp-runtime --example context`
 
 use std::sync::Arc;
 

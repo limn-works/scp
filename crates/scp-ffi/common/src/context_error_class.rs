@@ -83,6 +83,7 @@ pub fn classify_context_error(e: &ContextError) -> ContextErrorClass<'_> {
         ContextError::SupervisorShutDown(_) => K::Context(codes::CTX_2138),
         ContextError::SenderKeyDistributionPending { .. } => K::Context(codes::CTX_2140),
         ContextError::SenderKeyRotationPending { .. } => K::Context(codes::CTX_2141),
+        ContextError::ProposalIdMismatch { .. } => K::Context(codes::CTX_2142),
         ContextError::PermissionDenied(msg) => K::PermissionDenied(msg),
         ContextError::Outlet(surface) => K::Outlet(&surface.code),
         // The reserve-gate carrier renders no lifecycle state (it runs before
@@ -198,6 +199,21 @@ mod tests {
         assert!(matches!(
             classify_context_error(&refused),
             ContextErrorClass::Context(code) if code == codes::CTX_2141
+        ));
+        assert!(has_dedicated_code(&refused));
+    }
+
+    /// An approved proposal whose action does not hash to its identifier is
+    /// refused with its own code, never a call's fallback.
+    #[test]
+    fn a_proposal_id_mismatch_carries_ctx_2142() {
+        let refused = ContextError::ProposalIdMismatch {
+            id: "aa".to_owned(),
+            recomputed: "bb".to_owned(),
+        };
+        assert!(matches!(
+            classify_context_error(&refused),
+            ContextErrorClass::Context(code) if code == codes::CTX_2142
         ));
         assert!(has_dedicated_code(&refused));
     }

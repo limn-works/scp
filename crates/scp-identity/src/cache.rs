@@ -515,7 +515,7 @@ mod tests {
             "wss://relay2.example.com/scp/v1",
         ] {
             doc.add_relay_service(&scp_did::RelayService::direct(
-                scp_did::RelayEndpoint::new(url).unwrap(),
+                scp_did::NodeUrl::new(url).unwrap(),
             ));
         }
 

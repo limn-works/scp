@@ -32,6 +32,7 @@
 //! part of the wire contract: **never reorder fields** in these structs without
 //! treating it as a breaking protocol change.
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::{EventLogError, EventPayload, EventType};
@@ -57,15 +58,36 @@ pub fn encode_payload<T: Serialize>(value: &T) -> Result<EventPayload, EventLogE
 /// The inverse of [`encode_payload`]. Used by verifiers and the receive path to
 /// recover the typed parameters from a logged event.
 ///
+/// The bytes are accepted only when they are exactly the bytes
+/// [`encode_payload`] produces for the decoded value. `rmp_serde` also decodes
+/// non-canonical forms into the same value: a map keyed by field name in place
+/// of the positional array, an array of integers in place of a `serde_bytes`
+/// binary, a binary in place of a string, a wider integer encoding, and
+/// trailing bytes after the value. Each of those would let two different byte
+/// strings, and so two different leaf hashes, record one payload, so each is
+/// refused (`07-trust-validation-and-capabilities.md` §7.3.1.1 step 1.6: "Each
+/// received leaf's bytes are exactly `rmp_serde` of the `Event` they decode
+/// to").
+///
 /// # Errors
 ///
 /// Returns [`EventLogError::SerializationFailed`] if the bytes do not decode to
-/// `T` under positional `MessagePack`.
-pub fn decode_payload<T: for<'de> Deserialize<'de>>(
+/// `T` under positional `MessagePack`, or decode to a value whose encoding is
+/// not the input bytes.
+pub fn decode_payload<T: Serialize + DeserializeOwned>(
     payload: &EventPayload,
 ) -> Result<T, EventLogError> {
-    rmp_serde::from_slice(&payload.data)
-        .map_err(|e| EventLogError::SerializationFailed(e.to_string()))
+    let value: T = rmp_serde::from_slice(&payload.data)
+        .map_err(|e| EventLogError::SerializationFailed(e.to_string()))?;
+    let canonical =
+        rmp_serde::to_vec(&value).map_err(|e| EventLogError::SerializationFailed(e.to_string()))?;
+    if canonical != payload.data {
+        return Err(EventLogError::SerializationFailed(
+            "payload bytes are not the canonical positional encoding of the decoded value"
+                .to_owned(),
+        ));
+    }
+    Ok(value)
 }
 
 // ---------------------------------------------------------------------------
@@ -194,19 +216,69 @@ pub struct AccessRevokedPayload {
 }
 
 /// Payload for
-/// [`EventType::GovernanceActionExecuted`](crate::EventType::GovernanceActionExecuted)
-/// (ADR-031 §8; PRD SCP-269/SCP-270).
+/// [`EventType::GovernanceActionExecuted`](crate::EventType::GovernanceActionExecuted).
+///
+/// Sources: ADR-031 §8 and acceptance criterion 7, as ADR-066 amends them;
+/// `07-trust-validation-and-capabilities.md` §7.3.1.1 step 1.6, "The action,
+/// once".
+///
+/// Encodes as the four-item array `[target_did, action_type, proposal_id,
+/// action_bytes]`, with `proposal_id` and `action_bytes` as `MessagePack`
+/// binaries (`serde_bytes`), never arrays of integers.
 ///
 /// `target_did` is the member the action targeted (empty when the action has
 /// no target, e.g. a context-wide policy change). `action_type` is the
 /// `GovernanceAction` variant name. The consequence engine reads `target_did`
 /// for the `WarningCount` trigger and `action_type` for participation records.
+/// `action_bytes` is the action's one copy in the executing Commit: the exact
+/// RFC 8785 bytes the proposer hashed into `proposal_id`, which every member
+/// that applies the leaf decodes the action from, and from which every
+/// receiver recomputes `proposal_id` (§7.3.1.1 step 1.3). A member never
+/// re-encodes them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GovernanceActionExecutedPayload {
     /// The DID the executed action targeted (empty if the action is untargeted).
     pub target_did: String,
     /// The `GovernanceAction` variant name (e.g. `"RemoveMember"`).
     pub action_type: String,
+    /// The executed proposal's identifier, as the proposal stores it: the
+    /// `"SCP-PROPOSAL-V1:"` hash over the context, the proposer,
+    /// `action_bytes`, and the proposal's `created_at`.
+    #[serde(with = "serde_bytes")]
+    pub proposal_id: [u8; 32],
+    /// The proposal's RFC 8785 action bytes, verbatim.
+    #[serde(with = "serde_bytes")]
+    pub action_bytes: Vec<u8>,
+}
+
+/// Payload for [`EventType::MemberReset`](crate::EventType::MemberReset).
+///
+/// Sources: ADR-029 §4 group state reset, `23-sync-and-offline-strategy.md` §23.4.1
+/// Welcome-based fast-forward, and the `ResetMember` governance action;
+/// `07-trust-validation-and-capabilities.md` §7.3.1.1 step 1.6.
+///
+/// Encodes as the four-item array `[subject_did, last_known_epoch,
+/// reset_counter, reason]`. A reset a member requested carries the
+/// `last_known_epoch`, `reset_counter`, and `reason` of that member's signed
+/// reset-request record (§7.3.1.1 step 1.7), so every value in the leaf is one
+/// the member signed. A reset a `ResetMember` action derives carries nil for
+/// both integers and an empty `reason`; the action's own reason is in the
+/// `GovernanceActionExecuted` leaf's `action_bytes`. `reason` is a `String`,
+/// never optional, so a nil `reason` fails to decode.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberResetPayload {
+    /// The DID of the member that was reset (the affected member, not the
+    /// committer, which is the leaf's `actor_did`).
+    pub subject_did: String,
+    /// The last epoch the member reported in its reset request; `None` for a
+    /// reset a `ResetMember` action derives.
+    pub last_known_epoch: Option<u64>,
+    /// The member's reset-request counter; `None` for a reset a `ResetMember`
+    /// action derives.
+    pub reset_counter: Option<u64>,
+    /// The request's reason text; empty for a reset a `ResetMember` action
+    /// derives.
+    pub reason: String,
 }
 
 /// Payload for
@@ -405,10 +477,11 @@ pub struct EventPayloadProjection {
     /// `None` so consumers do not key participation facts on an empty subject.
     pub target_did: Option<String>,
     /// The subject DID for role/membership events that carry one
-    /// (`RoleAssigned`, `MemberJoined`, `MemberLeft`) — the *affected member*,
-    /// not the governance actor; `None` otherwise. An empty `subject_did` in the
-    /// underlying payload (e.g. a historical empty-payload leaf) projects to
-    /// `None` so consumers do not key participation facts on an empty subject.
+    /// (`RoleAssigned`, `MemberJoined`, `MemberLeft`, `MemberReset`) — the
+    /// *affected member*, not the governance actor; `None` otherwise. An empty
+    /// `subject_did` in the underlying payload (e.g. a historical empty-payload
+    /// leaf) projects to `None` so consumers do not key participation facts on
+    /// an empty subject.
     ///
     /// This is a separate field from [`target_did`](Self::target_did) by design:
     /// governance/access events project the targeted member into `target_did`,
@@ -457,6 +530,12 @@ pub fn project_payload(event_type: &EventType, payload: &EventPayload) -> EventP
         },
         EventType::MemberJoined | EventType::MemberLeft => EventPayloadProjection {
             subject_did: decode_payload::<MembershipChangePayload>(payload)
+                .ok()
+                .and_then(|p| non_empty(p.subject_did)),
+            ..EventPayloadProjection::default()
+        },
+        EventType::MemberReset => EventPayloadProjection {
+            subject_did: decode_payload::<MemberResetPayload>(payload)
                 .ok()
                 .and_then(|p| non_empty(p.subject_did)),
             ..EventPayloadProjection::default()
@@ -613,30 +692,421 @@ mod tests {
         assert_eq!(p, decoded);
     }
 
+    /// A 56-byte identifier in text form (`03-identity.md` §3.1), the length
+    /// the §7.3.1.1 leaf bound assumes for `target_did` and `subject_did`.
+    const DID_56: &str = "did:dht:z6MkAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+    /// RFC 8785 bytes of `GovernanceAction::RemoveMember { did, reason: None }`:
+    /// keys sorted, `reason` written as `null`. scp-protocol depends on this
+    /// crate, so the bytes are spelled out here; scp-protocol's
+    /// `executed_payload_fixture` produces the same form from a real proposal.
+    fn remove_member_bytes(did: &str) -> Vec<u8> {
+        format!(r#"{{"RemoveMember":{{"did":"{did}","reason":null}}}}"#).into_bytes()
+    }
+
+    /// RFC 8785 bytes of `GovernanceAction::CloseContext { reason: None }`.
+    const CLOSE_CONTEXT_BYTES: &[u8] = br#"{"CloseContext":{"reason":null}}"#;
+
+    /// A canonical `GovernanceActionExecuted` payload whose fields agree.
+    fn executed_remove_member() -> GovernanceActionExecutedPayload {
+        GovernanceActionExecutedPayload {
+            target_did: "did:key:bob".to_owned(),
+            action_type: "RemoveMember".to_owned(),
+            proposal_id: [9u8; 32],
+            action_bytes: remove_member_bytes("did:key:bob"),
+        }
+    }
+
+    /// A canonical `MemberReset` payload with every field set.
+    fn requested_reset() -> MemberResetPayload {
+        MemberResetPayload {
+            subject_did: "did:key:bob".to_owned(),
+            last_known_epoch: Some(41),
+            reset_counter: Some(7),
+            reason: "offline".to_owned(),
+        }
+    }
+
+    /// A positional array of the given raw `MessagePack` items.
+    fn array_of<T: AsRef<[u8]>>(items: &[T]) -> Vec<u8> {
+        let mut out = vec![0x90 | u8::try_from(items.len()).unwrap()];
+        for item in items {
+            out.extend_from_slice(item.as_ref());
+        }
+        out
+    }
+
+    fn mp_str(s: &str) -> Vec<u8> {
+        rmp_serde::to_vec(s).unwrap()
+    }
+
+    fn mp_bin(b: &[u8]) -> Vec<u8> {
+        rmp_serde::to_vec(&serde_bytes::Bytes::new(b)).unwrap()
+    }
+
+    fn mp_int_array(b: &[u8]) -> Vec<u8> {
+        rmp_serde::to_vec(&b.to_vec()).unwrap()
+    }
+
+    fn mp_opt_u64(v: Option<u64>) -> Vec<u8> {
+        rmp_serde::to_vec(&v).unwrap()
+    }
+
+    fn executed_items(p: &GovernanceActionExecutedPayload) -> [Vec<u8>; 4] {
+        [
+            mp_str(&p.target_did),
+            mp_str(&p.action_type),
+            mp_bin(&p.proposal_id),
+            mp_bin(&p.action_bytes),
+        ]
+    }
+
+    fn reset_items(p: &MemberResetPayload) -> [Vec<u8>; 4] {
+        [
+            mp_str(&p.subject_did),
+            mp_opt_u64(p.last_known_epoch),
+            mp_opt_u64(p.reset_counter),
+            mp_str(&p.reason),
+        ]
+    }
+
+    /// The positive control for every rejection table below: the items
+    /// assembled by hand are the canonical encoding and decode.
     #[test]
-    fn governance_action_executed_round_trip() {
+    fn hand_assembled_canonical_payloads_decode() {
+        let executed = executed_remove_member();
+        let bytes = array_of(&executed_items(&executed));
+        assert_eq!(bytes, encode_payload(&executed).unwrap().data);
+        assert_eq!(
+            decode_payload::<GovernanceActionExecutedPayload>(&EventPayload { data: bytes })
+                .unwrap(),
+            executed
+        );
+        let reset = requested_reset();
+        let bytes = array_of(&reset_items(&reset));
+        assert_eq!(bytes, encode_payload(&reset).unwrap().data);
+        assert_eq!(
+            decode_payload::<MemberResetPayload>(&EventPayload { data: bytes }).unwrap(),
+            reset
+        );
+    }
+
+    fn assert_rejected<T: Serialize + DeserializeOwned + std::fmt::Debug>(
+        case: &str,
+        bytes: Vec<u8>,
+    ) {
+        let result = decode_payload::<T>(&EventPayload { data: bytes });
+        assert!(
+            matches!(result, Err(EventLogError::SerializationFailed(_))),
+            "{case}: expected SerializationFailed, got {result:?}"
+        );
+    }
+
+    /// Every non-canonical or wrong-typed form of a `GovernanceActionExecuted`
+    /// payload is refused, so one payload has exactly one byte string.
+    #[test]
+    fn governance_action_executed_rejects_wrong_types_and_forms() {
+        let p = executed_remove_member();
+        let [target, action_type, proposal_id, action_bytes] = executed_items(&p);
+        let named_map = rmp_serde::to_vec_named(&p).unwrap();
+        assert_eq!(named_map[0] & 0xf0, 0x80, "the map form is a fixmap");
+        let mut trailing = encode_payload(&p).unwrap().data;
+        trailing.push(0xc0);
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            (
+                "proposal_id as an array of integers",
+                array_of(&[
+                    target.as_slice(),
+                    action_type.as_slice(),
+                    mp_int_array(&p.proposal_id).as_slice(),
+                    action_bytes.as_slice(),
+                ]),
+            ),
+            (
+                "action_bytes as an array of integers",
+                array_of(&[
+                    target.as_slice(),
+                    action_type.as_slice(),
+                    proposal_id.as_slice(),
+                    mp_int_array(&p.action_bytes).as_slice(),
+                ]),
+            ),
+            (
+                "action_bytes as a string",
+                array_of(&[
+                    target.as_slice(),
+                    action_type.as_slice(),
+                    proposal_id.as_slice(),
+                    mp_str(std::str::from_utf8(&p.action_bytes).unwrap()).as_slice(),
+                ]),
+            ),
+            (
+                "target_did as a binary",
+                array_of(&[
+                    mp_bin(p.target_did.as_bytes()).as_slice(),
+                    action_type.as_slice(),
+                    proposal_id.as_slice(),
+                    action_bytes.as_slice(),
+                ]),
+            ),
+            ("the field-name map form", named_map),
+            ("a trailing byte after the array", trailing),
+        ];
+        for (case, bytes) in cases {
+            assert_rejected::<GovernanceActionExecutedPayload>(case, bytes);
+        }
+    }
+
+    /// Every non-canonical or wrong-typed form of a `MemberReset` payload is
+    /// refused.
+    #[test]
+    fn member_reset_rejects_wrong_types_and_forms() {
+        let p = requested_reset();
+        let [subject, epoch, counter, reason] = reset_items(&p);
+        let named_map = rmp_serde::to_vec_named(&p).unwrap();
+        assert_eq!(named_map[0] & 0xf0, 0x80, "the map form is a fixmap");
+        // 41 as a uint16 (0xcd 0x00 0x29) in place of the positive fixint.
+        let wide_epoch = vec![0xcd, 0x00, 0x29];
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            (
+                "reason as a binary",
+                array_of(&[
+                    subject.as_slice(),
+                    epoch.as_slice(),
+                    counter.as_slice(),
+                    mp_bin(p.reason.as_bytes()).as_slice(),
+                ]),
+            ),
+            (
+                "subject_did as a binary",
+                array_of(&[
+                    mp_bin(p.subject_did.as_bytes()).as_slice(),
+                    epoch.as_slice(),
+                    counter.as_slice(),
+                    reason.as_slice(),
+                ]),
+            ),
+            (
+                "last_known_epoch in a wider integer encoding",
+                array_of(&[
+                    subject.as_slice(),
+                    wide_epoch.as_slice(),
+                    counter.as_slice(),
+                    reason.as_slice(),
+                ]),
+            ),
+            ("the field-name map form", named_map),
+        ];
+        for (case, bytes) in cases {
+            assert_rejected::<MemberResetPayload>(case, bytes);
+        }
+    }
+
+    /// A payload array of any length but four is refused for both structs; the
+    /// four-item array is the positive control.
+    #[test]
+    fn four_item_payloads_reject_arrays_of_two_three_and_five_items() {
+        let executed = executed_remove_member();
+        let items = executed_items(&executed);
+        let reset = requested_reset();
+        let reset_fields = reset_items(&reset);
+        for len in [2, 3, 5] {
+            let mut ex: Vec<Vec<u8>> = items.iter().take(len).cloned().collect();
+            let mut rs: Vec<Vec<u8>> = reset_fields.iter().take(len).cloned().collect();
+            if len == 5 {
+                ex.push(mp_str("extra"));
+                rs.push(mp_str("extra"));
+            }
+            assert_rejected::<GovernanceActionExecutedPayload>(
+                &format!("{len}-item GovernanceActionExecuted array"),
+                array_of(&ex),
+            );
+            assert_rejected::<MemberResetPayload>(
+                &format!("{len}-item MemberReset array"),
+                array_of(&rs),
+            );
+        }
+        assert!(
+            decode_payload::<GovernanceActionExecutedPayload>(&EventPayload {
+                data: array_of(&items)
+            })
+            .is_ok()
+        );
+        assert!(
+            decode_payload::<MemberResetPayload>(&EventPayload {
+                data: array_of(&reset_fields)
+            })
+            .is_ok()
+        );
+    }
+
+    /// RFC 8785 bytes of a `CloseContext` action whose reason pads the whole
+    /// encoding to exactly `len` bytes. The object has one key at each level
+    /// and an ASCII string value, so its compact JSON is its RFC 8785 form.
+    fn canonical_action_of_len(len: usize) -> Vec<u8> {
+        let prefix = br#"{"CloseContext":{"reason":""#;
+        let suffix = br#""}}"#;
+        let pad = len - prefix.len() - suffix.len();
+        let mut bytes = Vec::with_capacity(len);
+        bytes.extend_from_slice(prefix);
+        bytes.extend(std::iter::repeat_n(b'a', pad));
+        bytes.extend_from_slice(suffix);
+        bytes
+    }
+
+    #[test]
+    fn governance_action_executed_encodes_four_items_with_bin_fields() {
+        let action_bytes = remove_member_bytes("did:key:bob");
         let p = GovernanceActionExecutedPayload {
             target_did: "did:key:bob".to_owned(),
             action_type: "RemoveMember".to_owned(),
+            proposal_id: [9u8; 32],
+            action_bytes: action_bytes.clone(),
         };
         let encoded = encode_payload(&p).unwrap();
-        assert_positional_array(&encoded.data, 2);
+        assert_positional_array(&encoded.data, 4);
+
+        // [fixarray 4][fixstr 11 "did:key:bob"][fixstr 12 "RemoveMember"]
+        // [bin8 32 proposal_id][bin8 N action_bytes] — both byte fields are
+        // MessagePack `bin` (0xc4), never an array of integers.
+        let mut expected = vec![0x94, 0xa0 | 0x0b];
+        expected.extend_from_slice(b"did:key:bob");
+        expected.push(0xa0 | 0x0c);
+        expected.extend_from_slice(b"RemoveMember");
+        expected.extend_from_slice(&[0xc4, 32]);
+        expected.extend_from_slice(&[9u8; 32]);
+        expected.extend_from_slice(&[0xc4, u8::try_from(action_bytes.len()).unwrap()]);
+        expected.extend_from_slice(&action_bytes);
+        assert_eq!(encoded.data, expected);
+
         let decoded: GovernanceActionExecutedPayload = decode_payload(&encoded).unwrap();
         assert_eq!(p, decoded);
     }
 
     #[test]
-    fn governance_action_executed_empty_target_round_trip() {
-        // Untargeted actions (e.g. context-wide policy changes) carry an empty
-        // target_did but must still round-trip and stay a 2-element fixarray.
+    fn governance_action_executed_8192_byte_action_round_trips_verbatim_in_8318_bytes() {
+        let action_bytes = canonical_action_of_len(8_192);
+        assert_eq!(action_bytes.len(), 8_192);
+        // The bytes are RFC 8785: re-serializing the parsed value (serde_json
+        // sorts object keys and writes compact output) reproduces them.
+        let parsed: serde_json::Value = serde_json::from_slice(&action_bytes).unwrap();
+        assert_eq!(serde_json::to_vec(&parsed).unwrap(), action_bytes);
+        assert_eq!(DID_56.len(), 56);
+        // The longest variant name with the longest action and a 56-byte
+        // identifier: the leaf bound's worst case, which story SCP-336
+        // acceptance criterion 5 fixes. No single action reaches all three
+        // maxima (`ModifyPseudonymRotationPolicy` has no field to pad), so
+        // this size case alone pairs a name with another variant's bytes.
+        let action_type = "ModifyPseudonymRotationPolicy";
+        assert_eq!(action_type.len(), 29);
+
         let p = GovernanceActionExecutedPayload {
-            target_did: String::new(),
-            action_type: "ModifyPolicy".to_owned(),
+            target_did: DID_56.to_owned(),
+            action_type: action_type.to_owned(),
+            proposal_id: [0xab; 32],
+            action_bytes: action_bytes.clone(),
         };
         let encoded = encode_payload(&p).unwrap();
-        assert_positional_array(&encoded.data, 2);
+        // 1 (fixarray) + 58 (str8 56) + 30 (fixstr 29) + 34 (bin8 32)
+        // + 8,195 (bin16 8,192) = 8,318 (§7.3.1.1, the leaf bound).
+        assert_eq!(encoded.data.len(), 8_318);
+        // The action is the encoding's tail, verbatim after its bin16 header.
+        let tail_start = encoded.data.len() - 8_192;
+        assert_eq!(
+            &encoded.data[tail_start - 3..tail_start],
+            &[0xc5, 0x20, 0x00]
+        );
+        assert_eq!(&encoded.data[tail_start..], action_bytes.as_slice());
+
+        let decoded: GovernanceActionExecutedPayload = decode_payload(&encoded).unwrap();
+        assert_eq!(
+            decoded.action_bytes, action_bytes,
+            "byte for byte, no re-encoding"
+        );
+        assert_eq!(decoded, p);
+    }
+
+    #[test]
+    fn governance_action_executed_empty_target_round_trip() {
+        // Untargeted actions (e.g. context-wide policy changes) carry an empty
+        // target_did but must still round-trip as a four-element fixarray.
+        let p = GovernanceActionExecutedPayload {
+            target_did: String::new(),
+            action_type: "LockEconomicPolicy".to_owned(),
+            proposal_id: [1u8; 32],
+            action_bytes: br#""LockEconomicPolicy""#.to_vec(),
+        };
+        let encoded = encode_payload(&p).unwrap();
+        assert_positional_array(&encoded.data, 4);
         let decoded: GovernanceActionExecutedPayload = decode_payload(&encoded).unwrap();
         assert_eq!(p, decoded);
+    }
+
+    #[test]
+    fn governance_action_executed_rejects_proposal_id_of_wrong_length() {
+        // [fixarray 4]["" ]["X"][bin8 31 …][bin8 0] — a 31-byte proposal_id is
+        // not a ProposalId.
+        let mut bytes = vec![0x94, 0xa0, 0xa1, b'X', 0xc4, 31];
+        bytes.extend_from_slice(&[0u8; 31]);
+        bytes.extend_from_slice(&[0xc4, 0]);
+        let result =
+            decode_payload::<GovernanceActionExecutedPayload>(&EventPayload { data: bytes });
+        assert!(matches!(result, Err(EventLogError::SerializationFailed(_))));
+    }
+
+    #[test]
+    fn member_reset_requested_round_trips_all_four_fields() {
+        let p = MemberResetPayload {
+            subject_did: DID_56.to_owned(),
+            last_known_epoch: Some(41),
+            reset_counter: Some(7),
+            reason: "extended offline (9 days)".to_owned(),
+        };
+        let encoded = encode_payload(&p).unwrap();
+        assert_positional_array(&encoded.data, 4);
+        let decoded: MemberResetPayload = decode_payload(&encoded).unwrap();
+        assert_eq!(p, decoded);
+    }
+
+    #[test]
+    fn member_reset_of_reset_member_action_encodes_nil_integers_and_empty_reason() {
+        let p = MemberResetPayload {
+            subject_did: "did:key:bob".to_owned(),
+            last_known_epoch: None,
+            reset_counter: None,
+            reason: String::new(),
+        };
+        let encoded = encode_payload(&p).unwrap();
+        // [fixarray 4][fixstr 11 "did:key:bob"][nil][nil][fixstr 0]
+        let mut expected = vec![0x94, 0xa0 | 0x0b];
+        expected.extend_from_slice(b"did:key:bob");
+        expected.extend_from_slice(&[0xc0, 0xc0, 0xa0]);
+        assert_eq!(encoded.data, expected);
+        let decoded: MemberResetPayload = decode_payload(&encoded).unwrap();
+        assert_eq!(p, decoded);
+    }
+
+    #[test]
+    fn member_reset_rejects_nil_reason() {
+        // [fixarray 4][fixstr 1 "x"][nil][nil][nil] — `reason` is a String, so
+        // nil is not a value of it.
+        let bytes = vec![0x94, 0xa1, b'x', 0xc0, 0xc0, 0xc0];
+        let result = decode_payload::<MemberResetPayload>(&EventPayload { data: bytes });
+        assert!(matches!(result, Err(EventLogError::SerializationFailed(_))));
+    }
+
+    #[test]
+    fn project_member_reset_round_trips_subject_did() {
+        let p = MemberResetPayload {
+            subject_did: "did:key:erin".to_owned(),
+            last_known_epoch: None,
+            reset_counter: None,
+            reason: String::new(),
+        };
+        let encoded = encode_payload(&p).unwrap();
+        let projection = project_payload(&EventType::MemberReset, &encoded);
+        assert_eq!(projection.subject_did.as_deref(), Some("did:key:erin"));
+        assert_eq!(projection.target_did, None);
     }
 
     #[test]
@@ -715,10 +1185,7 @@ mod tests {
 
     #[test]
     fn project_governance_action_executed_round_trips_target_did() {
-        let p = GovernanceActionExecutedPayload {
-            target_did: "did:key:bob".to_owned(),
-            action_type: "RemoveMember".to_owned(),
-        };
+        let p = executed_remove_member();
         let encoded = encode_payload(&p).unwrap();
         let projection = project_payload(&EventType::GovernanceActionExecuted, &encoded);
         assert_eq!(projection.target_did.as_deref(), Some("did:key:bob"));
@@ -741,7 +1208,9 @@ mod tests {
         // subject.
         let p = GovernanceActionExecutedPayload {
             target_did: String::new(),
-            action_type: "ModifyPolicy".to_owned(),
+            action_type: "CloseContext".to_owned(),
+            proposal_id: [9u8; 32],
+            action_bytes: CLOSE_CONTEXT_BYTES.to_vec(),
         };
         let encoded = encode_payload(&p).unwrap();
         let projection = project_payload(&EventType::GovernanceActionExecuted, &encoded);
@@ -755,6 +1224,8 @@ mod tests {
         let p = GovernanceActionExecutedPayload {
             target_did: "did:key:carol".to_owned(),
             action_type: "RemoveMember".to_owned(),
+            proposal_id: [9u8; 32],
+            action_bytes: remove_member_bytes("did:key:carol"),
         };
         let encoded = encode_payload(&p).unwrap();
         let projection = project_payload(&EventType::ContextCreated, &encoded);

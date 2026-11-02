@@ -26,8 +26,12 @@ use std::path::{Path, PathBuf};
 /// The first and last number of the capability-challenge band.
 const CHALLENGE_BAND: (u32, u32) = (7140, 7159);
 
-fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..")
+fn workspace_root() -> Result<PathBuf, String> {
+    Ok(Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(3)
+        .ok_or("scp-ffi-common sits at crates/scp-ffi/common")?
+        .to_path_buf())
 }
 
 /// Every `SCP-<PREFIX>-<digits>` token in `text` with four or more digits, in
@@ -58,7 +62,7 @@ fn code_tokens(text: &str) -> Vec<String> {
 /// The literal of every `pub const NAME: &str = "SCP-...";` in the native
 /// registry, with how many constants carry it.
 fn native_codes() -> Result<BTreeMap<String, usize>, String> {
-    let text = read(&repo_root().join("crates/scp-ffi/common/src/error_codes.rs"))?;
+    let text = read(&workspace_root()?.join("crates/scp-ffi/common/src/error_codes.rs"))?;
     let mut codes = BTreeMap::new();
     for line in text.lines() {
         let line = line.trim();
@@ -79,7 +83,7 @@ struct Row {
 }
 
 fn registry_rows() -> Result<Vec<Row>, String> {
-    let text = read(&repo_root().join(".docs/standards/sdk-common.md"))?;
+    let text = read(&workspace_root()?.join(".docs/standards/sdk-common.md"))?;
     let rows: Vec<Row> = text
         .lines()
         .filter(|l| l.starts_with("| `SCP-"))
@@ -98,18 +102,32 @@ fn registry_rows() -> Result<Vec<Row>, String> {
 }
 
 /// The SDK source trees, keyed by the name a registry owner cell gives the SDK.
-const SDK_TREES: [(&str, &[&str]); 4] = [
-    ("Swift", &["bindings/swift/Sources"]),
-    (
-        "Kotlin",
-        &[
-            "bindings/kotlin/scp-kt/src/main",
-            "bindings/kotlin/scp-kt-android/src/main",
-        ],
-    ),
-    ("Python", &["bindings/python/scp_sdk"]),
-    ("TypeScript", &["bindings/typescript/src"]),
-];
+/// Each tree is a `workspace_root().join` of a literal, the one form in which
+/// scripts/tests/ci-gate/ci_gate_selftest.py reads a test's input outside its
+/// crate and routes a change to that input to this test.
+fn sdk_trees() -> Result<[(&'static str, Vec<PathBuf>); 4], String> {
+    Ok([
+        (
+            "Swift",
+            vec![workspace_root()?.join("bindings/swift/Sources")],
+        ),
+        (
+            "Kotlin",
+            vec![
+                workspace_root()?.join("bindings/kotlin/scp-kt/src/main"),
+                workspace_root()?.join("bindings/kotlin/scp-kt-android/src/main"),
+            ],
+        ),
+        (
+            "Python",
+            vec![workspace_root()?.join("bindings/python/scp_sdk")],
+        ),
+        (
+            "TypeScript",
+            vec![workspace_root()?.join("bindings/typescript/src")],
+        ),
+    ])
+}
 
 /// The SDK a row gives sole ownership to, when its owner cell names exactly one
 /// SDK and not the native registry.
@@ -157,10 +175,10 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
 /// Every code token in each SDK's source tree.
 fn sdk_codes() -> Result<BTreeMap<&'static str, BTreeSet<String>>, String> {
     let mut by_sdk = BTreeMap::new();
-    for (sdk, dirs) in SDK_TREES {
+    for (sdk, dirs) in sdk_trees()? {
         let mut files = Vec::new();
-        for dir in dirs {
-            collect_files(&repo_root().join(dir), &mut files)?;
+        for dir in &dirs {
+            collect_files(dir, &mut files)?;
         }
         let mut codes = BTreeSet::new();
         for file in &files {

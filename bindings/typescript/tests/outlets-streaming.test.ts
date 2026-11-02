@@ -19,6 +19,7 @@
 import { describe, expect, it } from "bun:test";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { Context } from "../src/context";
 import {
   ContextError,
@@ -39,6 +40,11 @@ import {
   Outlets,
 } from "../src/outlets";
 import { __constructScpWithNativeForTests } from "../src/scp";
+
+/** The repository root, three levels above this file. */
+const REPO_ROOT = fileURLToPath(new URL("../../../", import.meta.url));
+/** `bindings/typescript`, which holds `src/` and this `tests/` directory. */
+const PACKAGE_ROOT = fileURLToPath(new URL("../", import.meta.url));
 
 // ---------------------------------------------------------------------------
 // Wire-shape chunk builders (match §5.4.5 OutletStreamChunk serialization).
@@ -594,16 +600,7 @@ interface Vector {
   readonly expected_error_code: string | null;
 }
 
-const VECTORS_PATH = join(
-  import.meta.dir,
-  "..",
-  "..",
-  "..",
-  "tests",
-  "conformance",
-  "vectors",
-  "outlet_stream_vectors.json",
-);
+const VECTORS_PATH = join(REPO_ROOT, "tests/conformance/vectors/outlet_stream_vectors.json");
 
 function loadVectors(): Map<string, Vector> {
   const data = JSON.parse(readFileSync(VECTORS_PATH, "utf8")) as { vectors: Vector[] };
@@ -767,7 +764,7 @@ describe("public-surface invariant", () => {
   });
 
   it("no `invokeStream` token appears in the TS SDK source (outside comments)", () => {
-    expect(offendingStreamVerbLines(join(import.meta.dir, "..", "src"))).toEqual([]);
+    expect(offendingStreamVerbLines(join(PACKAGE_ROOT, "src"))).toEqual([]);
   });
 });
 

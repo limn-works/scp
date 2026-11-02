@@ -8,7 +8,7 @@
 //! 25 event unit. Every expected identifier, key and digest is a §25
 //! constant or a SHA-256 this file computes, never a value scp-kel returns.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use scp_did::KeyCondition;
 use scp_kel::constants::MAX_EVENT_BYTES;
@@ -73,6 +73,17 @@ const V55_ROOT: &str = "026bf1355bb40ab86b1f3d2e776e08da67e754a5dfeeb706b67d7483
 const V55_ACTIVE: &str = "03b7fe460356f0d94ff2bb085ed16157ae327b7769f2823ca829077110f05fb4a5";
 const V55_NEXT_COMMITMENT: &str =
     "cb05862aec3a89bd73c5e2d10a61d6483d945c72036bdf62dd880a9ff7d4d6f0";
+
+/// The repository root, two levels above this crate's manifest. A path outside
+/// this crate is formed only as `workspace_root().join` of a literal, the form
+/// scripts/tests/ci-gate/ci_gate_selftest.py reads to route a change to it here.
+fn workspace_root() -> Result<PathBuf, Error> {
+    Ok(Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .ok_or("scp-kel sits at crates/scp-kel")?
+        .to_path_buf())
+}
 
 fn max_event_bytes() -> Result<usize, Error> {
     Ok(usize::try_from(MAX_EVENT_BYTES)?)
@@ -435,8 +446,7 @@ const SEEDS: [&str; 9] = [
 /// re-encode and walk invariants run on each seed.
 #[test]
 fn every_seed_corpus_unit_decodes_its_body() -> TestResult {
-    let corpus =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/corpus/fuzz_kel_decode_event");
+    let corpus = workspace_root()?.join("fuzz/corpus/fuzz_kel_decode_event");
     for name in SEEDS {
         let value = std::fs::read(corpus.join(name))?;
         let mut offset = 0;

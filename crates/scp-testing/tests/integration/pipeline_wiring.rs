@@ -1152,9 +1152,9 @@ fn relay_set_writes_store_canonical_relay_urls() {
         fn_body_contains(
             LIFECYCLE_HELPERS_SRC,
             "normalize_relay_urls",
-            "canonical_relay_url("
+            "canonical_node_url("
         ),
-        "normalize_relay_urls must map each relay URL through canonical_relay_url"
+        "normalize_relay_urls must map each relay URL through canonical_node_url"
     );
     for entry in ["create_context", "import_context", "restore_context"] {
         assert!(
@@ -1515,7 +1515,7 @@ fn push_routing_ids_reach_push_helpers_through_the_actor_mailbox() {
         "Supervisor::push_routing_ids must enumerate known_context_ids, so a context whose actor is down fails the query"
     );
     assert!(
-        fn_body_contains(SUPERVISOR_SRC, "push_routing_ids", "canonical_relay_url("),
+        fn_body_contains(SUPERVISOR_SRC, "push_routing_ids", "canonical_node_url("),
         "Supervisor::push_routing_ids must group by the canonical relay URL"
     );
     assert!(
@@ -9269,9 +9269,21 @@ mod syn_scan {
     }
 }
 
+/// The repository root. A path outside this crate is formed only as
+/// `workspace_root().join` of a literal, the form
+/// scripts/tests/ci-gate/ci_gate_selftest.py reads to route a change to it to
+/// this test.
+fn workspace_root() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("scp-testing sits at crates/scp-testing")
+        .to_path_buf()
+}
+
 /// The directory that holds the workspace's crates.
 fn crates_dir() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..")
+    workspace_root().join("crates")
 }
 
 /// Every caller of `store_last_relay_contact` in `facts`, a spawned task
@@ -9647,11 +9659,8 @@ fn shutdown_releases_the_event_log_and_never_destroys_it() {
 /// bridges and the relay ship as libraries and binaries of their own.
 #[test]
 fn no_shipped_source_builds_an_event_log_without_a_store() {
-    let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("scp-testing sits under crates/");
     let mut crate_dirs = Vec::new();
-    for krate in std::fs::read_dir(crates)
+    for krate in std::fs::read_dir(crates_dir())
         .expect("crates/ is readable")
         .flatten()
     {
@@ -10076,4 +10085,74 @@ fn reached_only_by_tests<'a>(name: &str, others: impl Iterator<Item = &'a String
         }
     }
     true
+}
+
+/// Spec 07 §7.3.1.1 "The action, once"; ADR-031 acceptance criterion 7, as
+/// ADR-066 amends it: `execute_governance_action` checks the proposal's action
+/// bytes against its id (`ExecutedProposal::new`) before it records the replay
+/// marker (`begin_class_s`) and before it dispatches, so a proposal whose
+/// action does not hash to its id leaves no effect. `dispatch_governance_action`
+/// takes the checked `ExecutedProposal`, never a bare proposal.
+#[test]
+fn execute_governance_action_checks_the_action_before_marker_and_dispatch() {
+    let body: String = extract_fn_body(MANAGER_SRC, "execute_governance_action")
+        .expect("execute_governance_action not found")
+        .split_whitespace()
+        .collect();
+    let checked = body
+        .find("ExecutedProposal::new(")
+        .expect("execute_governance_action must build an ExecutedProposal");
+    let marker = body
+        .find("begin_class_s(")
+        .expect("execute_governance_action must record its replay marker");
+    let dispatch = body
+        .find("dispatch_governance_action(")
+        .expect("execute_governance_action must dispatch");
+    assert!(
+        checked < marker,
+        "ExecutedProposal::new must come before the replay marker"
+    );
+    assert!(
+        checked < dispatch,
+        "ExecutedProposal::new must come before the dispatch"
+    );
+    let signature: String = extract_fn_signature(MANAGER_SRC, "dispatch_governance_action")
+        .expect("dispatch_governance_action not found")
+        .split_whitespace()
+        .collect();
+    assert!(
+        signature.contains("executed:&ExecutedProposal<'_>")
+            && !signature.contains(":&GovernanceProposal"),
+        "dispatch_governance_action must take the checked ExecutedProposal, \
+         never a bare proposal"
+    );
+}
+
+/// Spec 07 §7.3.1.1 step 1.6: a `ResetMember` for X derives the `MemberReset`
+/// leaf `[X, nil, nil, ""]`, so `execute_reset_member` appends it with an
+/// encoded `MemberResetPayload` and never through the payload-less
+/// `append_context_event`.
+#[test]
+fn execute_reset_member_appends_a_member_reset_payload() {
+    let body: String = extract_fn_body(MANAGER_SRC, "execute_reset_member")
+        .expect("execute_reset_member not found")
+        .split_whitespace()
+        .collect();
+    let append = body
+        .find("append_context_event_with_payload(")
+        .expect("execute_reset_member must append its leaf with a payload");
+    let call = &body[append..];
+    let call = &call[..call.find(".await").expect("the append is awaited")];
+    assert!(
+        call.contains("EventType::MemberReset"),
+        "the payload-carrying append must record the MemberReset leaf"
+    );
+    assert!(
+        body[..append].contains("MemberResetPayload{"),
+        "the appended payload must be an encoded MemberResetPayload"
+    );
+    assert!(
+        !body.contains(".append_context_event("),
+        "execute_reset_member must never append MemberReset without its payload"
+    );
 }

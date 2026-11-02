@@ -378,7 +378,7 @@ Pre-merge baseline + post-merge measurement on six operations at N=1/4/16:
 - `broadcast_publish`
 - `broadcast_subscribe`
 
-A regression of >15% on any (operation, N) pair triggers §Rollback strategy trigger #4. The baseline + post-merge measurement is implemented in `cargo test -p scp-runtime --test perf_baseline`, landing in commit 13 of the ADR-049 ladder (Phase 4 of the post-review-round-1 plan).
+A regression of >15% on any (operation, N) pair triggers §Rollback strategy trigger #4. The baseline + post-merge measurement is implemented in `cargo test -p scp-testing --test perf_baseline`, landing in commit 13 of the ADR-049 ladder (Phase 4 of the post-review-round-1 plan).
 
 Mandatory coverage: BOTH workload classes (crypto-dominated AND protocol-overhead-dominated) AND BOTH read fast path AND write slow path. The handshake path is crypto-dominated; the broadcast publish/subscribe path is overhead-dominated; that pair stresses both classes.
 
@@ -519,7 +519,7 @@ Proposed on the grounds that the rest of the supervisor's mutable state lives be
 
 **Dependencies.** Adds `shuttle` (model checker, dev-only) to the dev-dependencies. (An earlier draft also added `tree-sitter-rust` for the source-text scanner; that scanner was dropped — see "Why no scanner" in §5 — so no AST-check dependency is introduced.)
 
-**Performance.** Baseline measurement is mandatory per Decision 14 — pre-merge baseline + post-merge measurement on six operations (`handshake`, `send_message`, `deliver_incoming`, `governance_propose`, `broadcast_publish`, `broadcast_subscribe`) at N=1/4/16. A regression of >15% on any (operation, N) pair triggers §Rollback strategy trigger #4. The baseline harness lands as `cargo test -p scp-runtime --test perf_baseline` in commit 13.
+**Performance.** Baseline measurement is mandatory per Decision 14 — pre-merge baseline + post-merge measurement on six operations (`handshake`, `send_message`, `deliver_incoming`, `governance_propose`, `broadcast_publish`, `broadcast_subscribe`) at N=1/4/16. A regression of >15% on any (operation, N) pair triggers §Rollback strategy trigger #4. The baseline harness lands as `cargo test -p scp-testing --test perf_baseline` in commit 13.
 
 Expected overhead sources: `Box<dyn Future>` allocation per `async_trait` call, mailbox send+recv+oneshot reply per command, journal write per saga phase transition, `spawn_blocking` hop per SQLite op. The lock-free read invariant (Decision 12) keeps the hot read paths off the `RwLock::read` cost cliff documented in OpenSSL #30659 (~67 cycles per uncontended acquire vs ~17 for `__atomic_load_n`).
 
@@ -539,8 +539,8 @@ bash scripts/check-protocol-deps.sh
 python3.12 scripts/check-block-in-place.py
 python3.12 scripts/check-block-in-place.py --self-test
 bash scripts/check-deleted-primitives.sh
-cargo test -p scp-runtime --test persistence_ordering
-cargo test -p scp-runtime --test cancel_safety
+cargo test -p scp-runtime --features testing --test persistence_ordering
+cargo test -p scp-runtime --features testing --test cancel_safety
 cargo test -p scp-runtime --test shuttle_actor --features shuttle
 ```
 

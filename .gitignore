@@ -55,4 +55,4 @@ bindings/python/tests/bridge_parity/helpers/swift_bridge_runner/.build/
 # ADR-049 Decision 14 perf_baseline harness — per-environment runtime artifact
 # recorded by the default `--test perf_baseline` run; never committed (one box's
 # numbers must not become a cross-machine gate reference).
-crates/scp-runtime/tests/perf_baseline.json
+crates/scp-testing/tests/perf_baseline.json

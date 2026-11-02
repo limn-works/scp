@@ -22,9 +22,13 @@
         .deletingLastPathComponent() // Tests
         .deletingLastPathComponent() // bindings/swift
 
-    private let repoRoot = packageRoot
+    /// The repository root, five levels above this file.
+    private let repoRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent() // SCPTests
+        .deletingLastPathComponent() // Tests
+        .deletingLastPathComponent() // bindings/swift
         .deletingLastPathComponent() // bindings
-        .deletingLastPathComponent()
+        .deletingLastPathComponent() // repository root
 
     private struct FixtureError: Error, CustomStringConvertible {
         let description: String

@@ -934,10 +934,13 @@ fn event_log_query_projects_governance_target_did_from_storage() {
             timestamp: 1_700_000_000,
             sequence: 0,
             payload: scp_event_log::payload::encode_payload(
-                &scp_event_log::payload::GovernanceActionExecutedPayload {
-                    target_did: target_did.to_owned(),
-                    action_type: "RemoveMember".to_owned(),
-                },
+                &scp_core::context::governance::executed_payload_fixture(
+                    scp_core::context::governance::GovernanceAction::RemoveMember {
+                        did: scp_did::DID(target_did.to_owned()),
+                        reason: None,
+                    },
+                )
+                .unwrap(),
             )
             .unwrap(),
             prev_hash: [0u8; 32],

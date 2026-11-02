@@ -1769,7 +1769,7 @@ mod tests {
     /// routing ID with 4063 and stores nothing there.
     #[tokio::test]
     async fn webtransport_rejects_the_reserved_push_routing_id_with_4063_and_stores_nothing() {
-        let url = crate::relay::push_gate::RelayUrl::new("wss://relay.push.test").unwrap();
+        let url = crate::relay::push_gate::PushReservation::new("wss://relay.push.test").unwrap();
         let storage = Arc::new(InMemoryBlobStorage::new());
         let mut handler = WebTransportSessionHandler::new(
             SessionId(1),
