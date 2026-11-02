@@ -23,9 +23,7 @@
 use sha2::{Digest, Sha256};
 
 use scp_event_log::checkpoint::ConsistencyCheckpoint;
-use scp_event_log::payload::{
-    GovernanceActionExecutedPayload, MembershipChangePayload, RoleAssignedPayload, encode_payload,
-};
+use scp_event_log::payload::{MembershipChangePayload, RoleAssignedPayload, encode_payload};
 use scp_event_log::pruning::{PruningConfig, prune_before_checkpoint};
 use scp_event_log::test_helpers::{TestSigner, did_from_pubkey, sign_event, test_keypair};
 use scp_event_log::tree::{self, GENESIS_PREV_HASH};
@@ -53,14 +51,18 @@ fn role_payload(subject_did: &str, role: &str) -> Vec<u8> {
     .data
 }
 
-/// Encodes a canonical `GovernanceActionExecutedPayload` (target-bearing leaf).
-fn gov_payload(target_did: &str, action_type: &str) -> Vec<u8> {
-    encode_payload(&GovernanceActionExecutedPayload {
-        target_did: target_did.to_owned(),
-        action_type: action_type.to_owned(),
-        proposal_id: [0x5a; 32],
-        action_bytes: br#"{"RemoveMember":{}}"#.to_vec(),
-    })
+/// Encodes the `GovernanceActionExecuted` leaf payload of a real proposal to
+/// remove `target_did`.
+fn gov_payload(target_did: &str) -> Vec<u8> {
+    encode_payload(
+        &scp_protocol::context::governance::executed_payload_fixture(
+            scp_protocol::context::governance::GovernanceAction::RemoveMember {
+                did: scp_did::DID::from(target_did),
+                reason: None,
+            },
+        )
+        .expect("a real proposal's payload"),
+    )
     .expect("governance payload encodes")
     .data
 }
@@ -353,7 +355,7 @@ async fn participation_validation_works_with_checkpointed_log() {
         &did_alice,
         1_000_009,
         9,
-        gov_payload(&did_bob, "RemoveMember"),
+        gov_payload(&did_bob),
         &sk_alice,
         prev_hash,
     );

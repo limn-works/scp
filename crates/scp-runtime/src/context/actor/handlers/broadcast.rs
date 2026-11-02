@@ -2511,9 +2511,326 @@ mod tests {
             crate::context::governance_helpers::ExecutedProposal::new(&proposal, &executor)
                 .map(|_| ());
         assert!(
-            matches!(&result, Err(ContextError::GovernanceFailed(msg)) if msg.contains("proposal id mismatch")),
-            "a tampered action must be refused; got {result:?}"
+            matches!(
+                &result,
+                Err(ContextError::ProposalIdMismatch { id, recomputed })
+                    if *id == hex::encode(proposal_id) && recomputed != id
+            ),
+            "a tampered action must be refused with ProposalIdMismatch; got {result:?}"
         );
+    }
+
+    /// A governance engine that hands out `tampered` in place of the tracked
+    /// proposal with the same id and delegates everything else to `inner`. It
+    /// models a proposal whose stored action no longer hashes to its id, which
+    /// no honest engine produces, so the execute entry's own check is the only
+    /// thing between that action and its executor.
+    struct TamperingEngine {
+        inner: Box<dyn scp_protocol::context::governance::GovernanceEngine>,
+        tampered: scp_protocol::context::governance::GovernanceProposal,
+    }
+
+    impl scp_protocol::context::governance::GovernanceEngine for TamperingEngine {
+        fn precheck_propose(
+            &self,
+            proposer: &DID,
+            action: &scp_protocol::context::governance::GovernanceAction,
+            context: &scp_protocol::context::governance::GovernanceContext,
+        ) -> Result<
+            scp_protocol::context::governance::ProposeIntent,
+            scp_protocol::context::governance::GovernanceError,
+        > {
+            self.inner.precheck_propose(proposer, action, context)
+        }
+
+        fn propose_signed(
+            &mut self,
+            proposer: &DID,
+            action: scp_protocol::context::governance::GovernanceAction,
+            context: &scp_protocol::context::governance::GovernanceContext,
+            proposer_vote: Option<scp_protocol::context::governance::SignedVote>,
+        ) -> Result<
+            (
+                scp_protocol::context::governance::GovernanceProposal,
+                Vec<scp_protocol::context::governance::GovernanceEvent>,
+            ),
+            scp_protocol::context::governance::GovernanceError,
+        > {
+            self.inner
+                .propose_signed(proposer, action, context, proposer_vote)
+        }
+
+        fn check_proposer(
+            &self,
+            proposer: &DID,
+        ) -> Result<(), scp_protocol::context::governance::GovernanceError> {
+            self.inner.check_proposer(proposer)
+        }
+
+        fn precheck_vote(
+            &mut self,
+            proposal_id: &scp_protocol::context::governance::ProposalId,
+            voter: &DID,
+            vote: &scp_protocol::context::governance::VoteType,
+            context: &scp_protocol::context::governance::GovernanceContext,
+        ) -> Result<
+            scp_protocol::context::governance::VoteIntent,
+            scp_protocol::context::governance::GovernanceError,
+        > {
+            self.inner.precheck_vote(proposal_id, voter, vote, context)
+        }
+
+        fn approve_signed(
+            &mut self,
+            proposal_id: &scp_protocol::context::governance::ProposalId,
+            voter: &DID,
+            context: &scp_protocol::context::governance::GovernanceContext,
+            vote: scp_protocol::context::governance::SignedVote,
+        ) -> Result<
+            (
+                scp_protocol::context::governance::ProposalStatus,
+                Vec<scp_protocol::context::governance::GovernanceEvent>,
+            ),
+            scp_protocol::context::governance::GovernanceError,
+        > {
+            self.inner.approve_signed(proposal_id, voter, context, vote)
+        }
+
+        fn reject_signed(
+            &mut self,
+            proposal_id: &scp_protocol::context::governance::ProposalId,
+            voter: &DID,
+            context: &scp_protocol::context::governance::GovernanceContext,
+            vote: scp_protocol::context::governance::SignedVote,
+        ) -> Result<
+            (
+                scp_protocol::context::governance::ProposalStatus,
+                Vec<scp_protocol::context::governance::GovernanceEvent>,
+            ),
+            scp_protocol::context::governance::GovernanceError,
+        > {
+            self.inner.reject_signed(proposal_id, voter, context, vote)
+        }
+
+        fn boxed_clone(&self) -> Box<dyn scp_protocol::context::governance::GovernanceEngine> {
+            Box::new(Self {
+                inner: self.inner.boxed_clone(),
+                tampered: self.tampered.clone(),
+            })
+        }
+
+        fn model_config(&self) -> scp_protocol::context::governance::GovernanceModelConfig {
+            self.inner.model_config()
+        }
+
+        fn eligible_voters(
+            &self,
+            context: &scp_protocol::context::governance::GovernanceContext,
+        ) -> Vec<DID> {
+            self.inner.eligible_voters(context)
+        }
+
+        fn get_proposal(
+            &self,
+            proposal_id: &scp_protocol::context::governance::ProposalId,
+        ) -> Option<&scp_protocol::context::governance::GovernanceProposal> {
+            if *proposal_id == self.tampered.proposal_id {
+                Some(&self.tampered)
+            } else {
+                self.inner.get_proposal(proposal_id)
+            }
+        }
+
+        fn list_proposals(&self) -> Vec<scp_protocol::context::governance::GovernanceProposal> {
+            self.inner.list_proposals()
+        }
+
+        fn pending_proposal_ids(&self) -> Vec<scp_protocol::context::governance::ProposalId> {
+            self.inner.pending_proposal_ids()
+        }
+
+        fn invalidate_proposal(
+            &mut self,
+            proposal_id: &scp_protocol::context::governance::ProposalId,
+            reason: String,
+        ) -> Result<
+            Vec<scp_protocol::context::governance::GovernanceEvent>,
+            scp_protocol::context::governance::GovernanceError,
+        > {
+            self.inner.invalidate_proposal(proposal_id, reason)
+        }
+
+        fn checkpoint_cosignature_requirements(&self) -> (Vec<DID>, usize) {
+            self.inner.checkpoint_cosignature_requirements()
+        }
+
+        fn validate_checkpoint_cosignatures(
+            &self,
+            cosignatures: &[scp_protocol::context::governance::CosignedCheckpoint],
+            checkpoint_hash: &[u8; 32],
+        ) -> Result<
+            scp_protocol::context::governance::CheckpointAttestationStatus,
+            scp_protocol::context::governance::GovernanceError,
+        > {
+            self.inner
+                .validate_checkpoint_cosignatures(cosignatures, checkpoint_hash)
+        }
+    }
+
+    /// The broadcast context of [`assert_tampered_action_refused_at_entry`]:
+    /// an approved `RevokeAccess` of the subscriber (with a conflict-tracking
+    /// entry when `tracked`) whose engine-stored action reads `Write` in place
+    /// of the `Read` its id was computed over, the subscriber subscribed and a
+    /// member, and no leaf recorded yet.
+    async fn tampered_revoke_cell(
+        tracked: bool,
+    ) -> (
+        ActorDeps,
+        RecordedLeaves,
+        ClassSCell,
+        String,
+        scp_protocol::context::governance::ProposalId,
+    ) {
+        use scp_protocol::context::governance::{AccessScope, GovernanceAction};
+
+        let (deps, _appends, recorded) = build_deps_recording().await;
+
+        let (mut state, ctx_hex) =
+            build_broadcast_state_with_authors(BroadcastAdmission::Open, &AUTHORS_3);
+        let proposal_id = seed_approved_proposal(
+            &mut state,
+            &ctx_hex,
+            GovernanceAction::RevokeAccess {
+                did: DID(SUBSCRIBER_DID.to_owned()),
+                access: AccessScope::Read,
+            },
+        );
+        if tracked {
+            seed_conflict_tracking_entry(&mut state, &proposal_id);
+        }
+        let mut tampered = state
+            .governance
+            .engine
+            .get_proposal(&proposal_id)
+            .cloned()
+            .expect("the seeded proposal is engine-tracked");
+        tampered.action = GovernanceAction::RevokeAccess {
+            did: DID(SUBSCRIBER_DID.to_owned()),
+            access: AccessScope::Write,
+        };
+        state.governance.engine = Box::new(TamperingEngine {
+            inner: state.governance.engine.boxed_clone(),
+            tampered,
+        });
+        let mut cell = ClassSCell::new(state);
+        dispatch_subscribe(&mut cell, &deps, &ctx_hex, None)
+            .await
+            .expect("open subscribe");
+        cell.class_c_view().membership_class_c_mut().add_member(
+            DID(SUBSCRIBER_DID.to_owned()),
+            "member".to_owned(),
+            vec![],
+        );
+        recorded.write().expect("recorded leaves lock").clear();
+        (deps, recorded, cell, ctx_hex, proposal_id)
+    }
+
+    /// Runs `execute_governance_action` on an approved `RevokeAccess` of the
+    /// subscriber whose stored action was changed from `Read` to `Write` after
+    /// the proposal id was computed, and asserts the refusal leaves no effect:
+    /// the typed `ProposalIdMismatch`, no replay marker, no leaf, the
+    /// subscriber still a member and not banned, and the proposal out of
+    /// `approved_proposals`. With `tracked` the proposal has a conflict-tracking
+    /// entry, whose fail-closed removal is the one commit the refusal makes, so
+    /// `mutation_epoch` advances by exactly one; without it the epoch is
+    /// unchanged. `executed_leaf_carries_the_full_action_bytes_the_proposal_id_commits_to`
+    /// is the positive control: the same proposal untampered executes and
+    /// writes its leaf.
+    async fn assert_tampered_action_refused_at_entry(tracked: bool) {
+        let (deps, recorded, mut cell, ctx_hex, proposal_id) =
+            Box::pin(tampered_revoke_cell(tracked)).await;
+        let epoch_before = cell.mutation_epoch();
+
+        let result = Box::pin(
+            crate::context::governance_helpers::execute_governance_action(
+                &mut cell,
+                &deps,
+                &ctx_hex,
+                &proposal_id,
+                Some(&DID(CREATOR_DID.to_owned())),
+                None,
+                None,
+            ),
+        )
+        .await
+        .map(|_| ());
+
+        assert!(
+            matches!(
+                &result,
+                Err(ContextError::ProposalIdMismatch { id, recomputed })
+                    if *id == hex::encode(proposal_id) && recomputed != id
+            ),
+            "a tampered action must be refused with ProposalIdMismatch; got {result:?}"
+        );
+        assert!(
+            !cell
+                .governance
+                .class_s
+                .executed_proposals
+                .contains_key(&proposal_id),
+            "a refused proposal records no replay marker"
+        );
+        assert!(
+            recorded.read().expect("recorded leaves lock").is_empty(),
+            "a refused proposal appends no leaf"
+        );
+        assert!(
+            !cell
+                .broadcast_context
+                .as_ref()
+                .is_some_and(|bc| bc.is_banned(SUBSCRIBER_DID)),
+            "the tampered revoke must not ban the subscriber"
+        );
+        assert!(
+            cell.membership
+                .member_dids()
+                .any(|member| member.as_ref() == SUBSCRIBER_DID),
+            "the subscriber stays a member"
+        );
+        assert!(
+            !cell
+                .governance
+                .approved_proposals
+                .contains_key(&proposal_id),
+            "a refused proposal leaves the conflict-tracking set"
+        );
+        let expected_epoch = if tracked {
+            epoch_before.wrapping_add(1)
+        } else {
+            epoch_before
+        };
+        assert_eq!(
+            cell.mutation_epoch(),
+            expected_epoch,
+            "only the conflict-tracking removal, when there is an entry, commits"
+        );
+    }
+
+    /// Spec 07 §7.3.1.1 "The action, once"; ADR-031 acceptance criterion 7,
+    /// as ADR-066 amends it: a proposal with no conflict-tracking entry is
+    /// refused at the execute entry with no state change at all.
+    #[tokio::test]
+    async fn execute_refuses_a_tampered_action_with_no_effect() {
+        assert_tampered_action_refused_at_entry(false).await;
+    }
+
+    /// The same refusal removes the proposal's conflict-tracking entry,
+    /// fail-closed, so no later conflicting proposal loses to one that can
+    /// never run.
+    #[tokio::test]
+    async fn execute_refusal_of_a_tampered_action_removes_its_conflict_tracking_entry() {
+        assert_tampered_action_refused_at_entry(true).await;
     }
 
     /// A finalize error — the `GovernanceActionExecuted` append fails after the

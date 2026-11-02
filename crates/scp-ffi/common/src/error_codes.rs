@@ -673,6 +673,16 @@ pub const CTX_2140: &str = "SCP-CTX-2140";
 ///
 /// Maps from `ContextError::SenderKeyRotationPending`.
 pub const CTX_2141: &str = "SCP-CTX-2141";
+/// Proposal identifier mismatch.
+///
+/// An approved proposal was refused at execution because its action does not
+/// hash to its stored identifier: the action is not the one the proposer and
+/// the voters signed. The action is neither executed nor recorded in a
+/// `GovernanceActionExecuted` leaf, and the proposal leaves the approved set
+/// (ADR-031 acceptance criterion 7, as ADR-066 amends it).
+///
+/// Maps from `ContextError::ProposalIdMismatch`.
+pub const CTX_2142: &str = "SCP-CTX-2142";
 /// Media context error.
 pub const CTX_2500: &str = "SCP-CTX-2500";
 /// Media context key export error.

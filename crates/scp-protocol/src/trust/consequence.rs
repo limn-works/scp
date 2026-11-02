@@ -1425,12 +1425,13 @@ mod tests {
             })
             .unwrap();
         let executed = scp_event_log::payload::encode_payload(
-            &scp_event_log::payload::GovernanceActionExecutedPayload {
-                target_did: "did:key:alice".to_owned(),
-                action_type: "RemoveMember".to_owned(),
-                proposal_id: [0x5a; 32],
-                action_bytes: br#"{"RemoveMember":{}}"#.to_vec(),
-            },
+            &crate::context::governance::executed_payload_fixture(
+                crate::context::governance::GovernanceAction::RemoveMember {
+                    did: DID::from("did:key:alice"),
+                    reason: None,
+                },
+            )
+            .unwrap(),
         )
         .unwrap();
 

@@ -26326,12 +26326,13 @@ mod tests {
         bi.ensure_ucan_registered_for_test(&handle.context_id);
         let append = bi.with_ucan_state(&handle.context_id, |ucan_state| {
             let payload = scp_event_log::payload::encode_payload(
-                &scp_event_log::payload::GovernanceActionExecutedPayload {
-                    target_did: target_did.to_owned(),
-                    action_type: "RemoveMember".to_owned(),
-                    proposal_id: [0x5a; 32],
-                    action_bytes: br#"{"RemoveMember":{}}"#.to_vec(),
-                },
+                &scp_core::context::governance::executed_payload_fixture(
+                    scp_core::context::governance::GovernanceAction::RemoveMember {
+                        did: scp_did::DID(target_did.to_owned()),
+                        reason: None,
+                    },
+                )
+                .expect("a real proposal's payload"),
             )
             .expect("governance payload encodes");
             let event = scp_event_log::Event {

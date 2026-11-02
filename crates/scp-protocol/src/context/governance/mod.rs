@@ -1084,12 +1084,19 @@ impl GovernanceAction {
         })
     }
 
-    /// Returns the target DID for actions that operate on a specific member.
+    /// The member the action targets: the identifier in the action's `did`
+    /// field, or its `new_admin` field for `TransferAdmin`, and `None` for an
+    /// action with neither (`07-trust-validation-and-capabilities.md`
+    /// §7.3.1.1 step 1.6). `ApproveSpend` names a `spender`, which is neither
+    /// field, so it targets no member.
     ///
-    /// This is used to populate structured event payloads so that consequence
-    /// triggers (e.g., `WarningCount`) and participation records can identify
-    /// who was targeted by a governance action without relying on opaque
-    /// byte-level payload conventions.
+    /// This one rule fills the `GovernanceActionExecuted` leaf's `target_did`
+    /// (as the empty string for `None`), the `ContextEvent`'s `target_did`, and
+    /// the member the consequence triggers (e.g. `WarningCount`) and the
+    /// participation record attribute the action to, so the committer, every
+    /// receiver deriving the leaf, and every reader of it agree. The match
+    /// names every variant, so a new variant does not compile until it takes a
+    /// side.
     #[must_use]
     pub const fn target_did(&self) -> Option<&DID> {
         match self {
@@ -1104,8 +1111,8 @@ impl GovernanceAction {
             | Self::AddSigner { did }
             | Self::RemoveSigner { did } => Some(did),
             Self::TransferAdmin { new_admin } => Some(new_admin),
-            Self::ApproveSpend { spender, .. } => Some(spender),
-            Self::RegisterOutlet { .. }
+            Self::ApproveSpend { .. }
+            | Self::RegisterOutlet { .. }
             | Self::RemoveOutlet { .. }
             | Self::ModifyCeiling { .. }
             | Self::CloseContext { .. }
@@ -1347,15 +1354,19 @@ pub struct GovernanceProposal {
 
 impl GovernanceProposal {
     /// The proposal's RFC 8785 action bytes: the bytes the proposer hashed
-    /// into [`proposal_id`](Self::proposal_id) (`09-security-model.md` §9.5.2).
+    /// into [`proposal_id`](Self::proposal_id).
     ///
     /// The bytes are the RFC 8785 serialization of [`action`](Self::action),
     /// the encoding [`compute_proposal_id`] requires, and are returned only
-    /// after `proposal_id` recomputed from them, the context, the proposer, and
-    /// `created_at` equals the stored one. A proposal whose action does not
-    /// hash to its own identifier therefore yields no bytes, so no leaf records
-    /// an action other than the one the proposer and the voters signed
-    /// (ADR-031 acceptance criterion 7, as ADR-066 amends it).
+    /// after the identifier [`compute_proposal_id`] recomputes from them equals
+    /// the stored one. That identifier is the `"SCP-PROPOSAL-V1:"` construction
+    /// over the context, the proposer, the action bytes, and `created_at`, not
+    /// the `"SCP-PROPOSAL-V2:"` construction over `anchor_seq` that
+    /// `09-security-model.md` §9.5.2 defines; SCP-331 moves the whole
+    /// identifier to V2. A proposal whose action does not hash to its own
+    /// identifier yields no bytes, so no leaf records an action other than the
+    /// one the proposer and the voters signed (ADR-031 acceptance criterion 7,
+    /// as ADR-066 amends it).
     ///
     /// # Errors
     ///
@@ -1366,6 +1377,8 @@ impl GovernanceProposal {
     pub fn action_bytes(&self) -> Result<Vec<u8>, GovernanceError> {
         let action_bytes =
             crate::jcs::to_vec(&self.action).map_err(GovernanceError::SerializationFailed)?;
+        // Stub — see SCP-331: the V1 identifier over `created_at`, not the
+        // §9.5.2 V2 identifier over `anchor_seq`.
         let recomputed = compute_proposal_id(
             &self.context_id,
             &self.proposer_did,
@@ -1403,6 +1416,46 @@ impl GovernanceProposal {
             action_bytes: self.action_bytes()?,
         })
     }
+}
+
+/// The admin that proposes every [`executed_payload_fixture`] proposal.
+#[cfg(any(test, feature = "testing"))]
+pub const EXECUTED_PAYLOAD_FIXTURE_ADMIN: &str = "did:key:executed-payload-fixture-admin";
+
+/// The `GovernanceActionExecuted` leaf payload a committer writes for `action`.
+///
+/// The admin [`EXECUTED_PAYLOAD_FIXTURE_ADMIN`] proposes it through
+/// a [`SingleAdminEngine`], which approves it at once, and the payload is that
+/// proposal's [`GovernanceProposal::executed_payload`]. A test that needs a
+/// leaf payload builds it here, so its `target_did`, `action_type`,
+/// `proposal_id`, and `action_bytes` are the ones a real proposal of `action`
+/// carries and agree with each other.
+///
+/// # Errors
+///
+/// The errors of [`GovernanceEngineRawKey::propose`] and
+/// [`GovernanceProposal::executed_payload`].
+#[cfg(any(test, feature = "testing"))]
+pub fn executed_payload_fixture(
+    action: GovernanceAction,
+) -> Result<scp_event_log::payload::GovernanceActionExecutedPayload, GovernanceError> {
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x5e; 32]);
+    let verifying_key = signing_key.verifying_key();
+    let admin = DID::from(EXECUTED_PAYLOAD_FIXTURE_ADMIN);
+    let resolver: KeyResolver = Arc::new(move |did: &DID, kid: SigningKeyId| {
+        (did.as_ref() == EXECUTED_PAYLOAD_FIXTURE_ADMIN && kid == SigningKeyId::Active)
+            .then_some(verifying_key)
+    });
+    let mut engine = SingleAdminEngine::new(admin.clone(), resolver);
+    let context = GovernanceContext {
+        context_id: "ctx-executed-payload-fixture".to_owned(),
+        members: vec![(admin.clone(), "admin".to_owned())],
+        admin_dids: vec![admin.clone()],
+        current_epoch: Some(0),
+        now: 1_700_000_000,
+    };
+    let (proposal, _events) = engine.propose(&admin, action, &context, &signing_key)?;
+    proposal.executed_payload()
 }
 
 // ---------------------------------------------------------------------------
@@ -1577,10 +1630,11 @@ pub enum GovernanceError {
     },
 
     /// A proposal's action does not hash to its own identifier: the
-    /// identifier recomputed from the context, the proposer, the action's
-    /// RFC 8785 bytes, and `created_at` differs from the stored `proposal_id`
-    /// (`09-security-model.md` §9.5.2). Its action bytes are not the ones the
-    /// proposer and the voters signed, so no leaf may record them.
+    /// `"SCP-PROPOSAL-V1:"` identifier [`compute_proposal_id`] recomputes from
+    /// the context, the proposer, the action's RFC 8785 bytes, and
+    /// `created_at` differs from the stored `proposal_id`. Its action bytes are
+    /// not the ones the proposer and the voters signed, so no leaf may record
+    /// them.
     #[error("proposal id mismatch: stored {id}, recomputed {recomputed}")]
     ProposalIdMismatch {
         /// Hex-encoded stored proposal ID.
@@ -4792,20 +4846,29 @@ mod tests {
             .0
     }
 
+    /// `RevokeAccess` declares `did` before `access`, so serde's field order
+    /// differs from RFC 8785's sorted key order, and only an RFC 8785 encoder
+    /// produces the literal below.
     #[test]
     fn executed_payload_carries_the_proposal_id_preimage_action_bytes() {
-        let action = GovernanceAction::RemoveMember {
+        let action = GovernanceAction::RevokeAccess {
             did: bob(),
-            reason: Some("spam".to_owned()),
+            access: AccessScope::Read,
         };
         let proposal = proposed(action.clone());
         let payload = proposal.executed_payload().expect("payload");
 
-        let jcs = crate::jcs::to_vec(&action).expect("jcs");
         assert_eq!(
-            payload.action_bytes, jcs,
-            "the RFC 8785 bytes of the action"
+            payload.action_bytes,
+            br#"{"RevokeAccess":{"access":"Read","did":"did:dht:z6MkBob"}}"#.to_vec(),
+            "the RFC 8785 bytes of the action, keys sorted"
         );
+        assert_ne!(
+            serde_json::to_vec(&action).expect("json"),
+            payload.action_bytes,
+            "control: serde's declaration-order JSON differs from RFC 8785"
+        );
+        let jcs = crate::jcs::to_vec(&action).expect("jcs");
         assert_eq!(payload.proposal_id, proposal.proposal_id);
         // The bytes are the ones the proposal id commits to.
         assert_eq!(
@@ -4818,14 +4881,72 @@ mod tests {
             payload.proposal_id
         );
         assert_eq!(payload.target_did, bob().as_ref());
-        assert_eq!(payload.action_type, "RemoveMember");
-        // The full action, reason included, decodes back from the leaf.
+        assert_eq!(payload.action_type, "RevokeAccess");
+        // The full action decodes back from the leaf.
         let decoded: GovernanceAction =
             serde_json::from_slice(&payload.action_bytes).expect("action decodes");
         assert_eq!(
             crate::jcs::to_vec(&decoded).expect("jcs"),
             jcs,
             "the decoded action is the proposed one"
+        );
+    }
+
+    /// `07-trust-validation-and-capabilities.md` §7.3.1.1 step 1.6:
+    /// `target_did` is the `did` field, or `new_admin` for `TransferAdmin`,
+    /// and the empty string otherwise. `ApproveSpend` names a `spender`, so
+    /// its target is empty; `TransferAdmin` is the control that a non-`did`
+    /// field still fills the target when the spec names it.
+    #[test]
+    fn executed_payload_of_approve_spend_has_empty_target() {
+        let payload = proposed(GovernanceAction::ApproveSpend {
+            spender: carol(),
+            amount: Amount::new(1000),
+            purpose: "supplies".to_owned(),
+        })
+        .executed_payload()
+        .expect("payload");
+        assert_eq!(payload.target_did, "");
+        assert_eq!(payload.action_type, "ApproveSpend");
+        assert_eq!(
+            GovernanceAction::ApproveSpend {
+                spender: carol(),
+                amount: Amount::new(1),
+                purpose: String::new(),
+            }
+            .target_did(),
+            None
+        );
+
+        let control = proposed(GovernanceAction::TransferAdmin { new_admin: carol() })
+            .executed_payload()
+            .expect("payload");
+        assert_eq!(control.target_did, carol().as_ref());
+    }
+
+    /// The shared fixture builds a payload whose fields agree: the bytes are
+    /// the action's RFC 8785 serialization and hash to the identifier.
+    #[test]
+    fn executed_payload_fixture_is_a_real_proposal_payload() {
+        let action = GovernanceAction::RevokeAccess {
+            did: bob(),
+            access: AccessScope::Write,
+        };
+        let payload = executed_payload_fixture(action.clone()).expect("fixture");
+        assert_eq!(
+            payload.action_bytes,
+            crate::jcs::to_vec(&action).expect("jcs")
+        );
+        assert_eq!(payload.action_type, "RevokeAccess");
+        assert_eq!(payload.target_did, bob().as_ref());
+        assert_eq!(
+            compute_proposal_id(
+                "ctx-executed-payload-fixture",
+                &DID::from(EXECUTED_PAYLOAD_FIXTURE_ADMIN),
+                &payload.action_bytes,
+                1_700_000_000,
+            ),
+            payload.proposal_id
         );
     }
 
