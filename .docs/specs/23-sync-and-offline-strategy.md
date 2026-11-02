@@ -82,7 +82,7 @@ Tried in order:
 **Submitting its own Commit (ADR-069 decision 4).**
 
 1. The committer builds the Commit on its state at epoch e, keeps it staged and unmerged, and persists the staged Commit encrypted before it submits it.
-2. It submits the Commit to the context's node with the Commit's class, Remove, re-join or other (ADR-069 decision 2), and receives the node's signed receipt, which names the Commit's chain position.
+2. It submits the Commit to the context's node with the Commit's class, Remove, re-join or other (ADR-069 decision 2), and receives the node's signed receipt, which names the Commit's chain position and carries the `lost` flag. A Remove-class or re-join-class submission carries a `hold_commitment`, and when its receipt says lost, the committer submits the rebuilt action as the opening of that hold (ADR-069 decision 10, `07-trust-validation-and-capabilities.md` §7.3.1.1 "Commit order").
 3. It merges the staged Commit when, processing the chain in order, it reaches the position its receipt names while its group is still at epoch e.
 4. When an earlier chain item has moved its group past epoch e, it discards the staged Commit, re-checks its action against the new state, and submits the action again or reports the proposal `Invalidated` (ADR-066 decision 5, `07-trust-validation-and-capabilities.md` §7.3.1.1 "Competing Commits").
 5. It never merges a Commit the chain does not hold. A committer that holds no receipt has merged nothing and submits the Commit again (`07-trust-validation-and-capabilities.md` §7.3.1.1 "Commit order").

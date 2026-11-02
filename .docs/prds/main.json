@@ -13563,7 +13563,7 @@
         "crates/scp-mls/src/group.rs",
         "crates/scp-mls/src/provider.rs"
       ],
-      "description": "ADR-069 decision 4. A committer keeps its own Commit staged and unmerged after it submits it, until it reaches the chain position its receipt names, so the SDK must hold a staged Commit across other members' Commits and a restart without merging it, and discard it without any state change when another Commit for its epoch merges first. The choice of the Commit per epoch is SCP-351. How verdicts avoid openmls's receive-time lifetime check (ADR-069 decision 9) is an open question in `00-open-questions.md` and is not this story.",
+      "description": "ADR-069 decision 4. A committer keeps its own Commit staged and unmerged after it submits it, until it reaches the chain position its receipt names, so the SDK must hold a staged Commit across other members' Commits and a restart without merging it, and discard it without any state change when another Commit for its epoch merges first. The choice of the Commit per epoch is SCP-351. SCP carries no openmls patch: the adder's lifetime checks bound openmls's receive-time lifetime check (ADR-069 decision 9), and this story changes nothing in that check.",
       "acceptanceCriteria": [
         "A test stages a committer's Commit, restarts the process, and finds the Commit still staged and the group at its epoch; merging the staged Commit then moves the group to the next epoch",
         "A test stages a committer's Commit naming N, then processes and merges another member's valid Commit naming N; the group reaches N + 1 through the other Commit, and the staged Commit is discarded without having changed the group's state"
@@ -13594,7 +13594,7 @@
         "crates/scp-runtime/src/context/governance_helpers.rs",
         "crates/scp-runtime/src/context/actor/state.rs"
       ],
-      "description": "ADR-069 decisions 2, 3 and 4, and `07-trust-validation-and-capabilities.md` §7.3.1.1 'Commit order'. `admit_and_merge_own_commit` (`crates/scp-mls/src/group.rs`) merges the committer's own Commit before anyone orders it, so two members that commit at one epoch N each merge their own Commit and each rejects the other's as `WrongEpoch`, and the group splits. The context's node appends every submission it accepts to one chain and returns a receipt naming the submission's position. Every member processes the chain in position order, and at epoch N merges the first chain item that is a Commit naming N and passes steps 1 and 2 of §7.3.1.1 'Receiver processing' in its own state at N; it skips every other Commit, and a skipped Commit changes no state. A committer keeps its own Commit staged and unmerged after it submits it, merges it when it reaches the position its receipt names with its group still at the Commit's epoch, and otherwise discards it and hands the action back to the executor's re-check, which submits it again or reports the proposal `Invalidated` (ADR-066 decision 5; the re-check is SCP-329's). Each chain item carries its class (Remove, re-join, other) outside the MLS message, and a Commit whose class differs from the class its content gives is invalid at its position (ADR-069 decision 2): Remove when its derived leaves include a `MemberLeft` leaf, re-join when it is an external re-seat or its derived leaves include a `MemberReset` leaf and no `MemberLeft` leaf, other otherwise. Staging without merging and the clock-free verdict are SCP-357's. The node side of decision 1, the chain, its signed entries and receipts, and the submission transport belong to the execution of plan decision D1, which has no story yet, so this story's tests drive the chain processing with chains they build, and blockedBy names no story for the node side.",
+      "description": "ADR-069 decisions 2, 3 and 4, and `07-trust-validation-and-capabilities.md` §7.3.1.1 'Commit order'. `admit_and_merge_own_commit` (`crates/scp-mls/src/group.rs`) merges the committer's own Commit before anyone orders it, so two members that commit at one epoch N each merge their own Commit and each rejects the other's as `WrongEpoch`, and the group splits. The context's node appends every submission it accepts to one chain and returns a receipt naming the submission's position. Every member processes the chain in position order, and at epoch N merges the first chain item that is a Commit naming N and passes steps 1 and 2 of §7.3.1.1 'Receiver processing' in its own state at N; it skips every other Commit, and a skipped Commit changes no state. A committer keeps its own Commit staged and unmerged after it submits it, merges it when it reaches the position its receipt names with its group still at the Commit's epoch, and otherwise discards it and hands the action back to the executor's re-check, which submits it again or reports the proposal `Invalidated` (ADR-066 decision 5; the re-check is SCP-329's). Each chain item carries its class (Remove, re-join, other) outside the MLS message, and a Commit whose class differs from the class its content gives is invalid at its position (ADR-069 decision 2): Remove when its derived leaves include a `MemberLeft` leaf, re-join when it is an external re-seat or its derived leaves include a `MemberReset` leaf and no `MemberLeft` leaf, other otherwise. A Remove-class or re-join-class submission carries a `hold_commitment`, the SHA-256 of a 32-byte random `hold_secret` the committer keeps; when the node's receipt says the submission is lost, the committer rebuilds the action at the epoch the chain reaches and submits it with that secret as `hold_opening` and a new `hold_commitment`, so the node appends it before every lower-class submission (ADR-069 decision 10). Staging without merging and the clock-free verdict are SCP-357's. The node side of decision 1, the chain, its signed entries and receipts, and the submission transport belong to the execution of plan decision D1, which has no story yet, so this story's tests drive the chain processing with chains they build, and blockedBy names no story for the node side.",
       "acceptanceCriteria": [
         "After a member creates and submits a Commit naming epoch N, its group is still at epoch N and holds the Commit staged; `admit_and_merge_own_commit` no longer merges at creation",
         "A chain holding two valid Commits naming N, at positions p < q, ends with every member, both committers included, at epoch N + 1 through the Commit at p, with equal `log_head_hash` and `governance_state_hash`",
@@ -13604,13 +13604,15 @@
         "A committer whose group an earlier chain item moved past its staged Commit's epoch discards the staged Commit without merging it; a non-conflicting action is submitted again and merges at a later epoch, and a conflicting one is reported `Invalidated`, one test each",
         "A committer whose submission the chain never holds stays at epoch N with its Commit staged and unmerged, and never merges it",
         "Class check, one test each, every receiver skipping the Commit and leaving its state unchanged: a Commit deriving a `MemberLeft` leaf with class other; an external re-seat with class other; a Commit deriving no `MemberLeft` leaf with class Remove; a Commit deriving a `MemberReset` leaf and a `MemberLeft` leaf with class re-join; in each case a later valid Commit naming the same epoch merges",
-        "Two devices of one identity that process the same chain end at the same epoch, event log, and governance state"
+        "Two devices of one identity that process the same chain end at the same epoch, event log, and governance state",
+        "A Remove-class submission and a re-join-class submission each carry a `hold_commitment` equal to the SHA-256 of a 32-byte secret the committer persisted; when the receipt's `lost` flag is set, the rebuilt submission carries that secret as `hold_opening` and a new `hold_commitment`, and an other-class submission carries neither field, one test each"
       ],
       "actionItems": [
         "Stop `admit_and_merge_own_commit` from merging at creation, and keep the staged Commit with the receipt position",
         "Process the chain in position order and merge the first valid Commit per epoch",
         "Merge or discard the committer's staged Commit at its receipt position, and hand a discarded action to the re-check",
         "Check each Commit's class against the class its content gives",
+        "Add `hold_commitment` to Remove-class and re-join-class submissions, and open the hold with the rebuilt submission when the receipt says lost",
         "Add the tests the criteria name"
       ],
       "blockedBy": [],
@@ -13626,6 +13628,10 @@
         {
           "file": ".docs/specs/07-trust-validation-and-capabilities.md",
           "section": "#### 7.3.1.1 Governance Leaves Carried in the Commit"
+        },
+        {
+          "file": ".docs/adrs/ADR-069-node-ordered-commits.md",
+          "section": "### Options considered for the hold rule (decision 10, 2026-11-02)"
         }
       ],
       "details": {}
