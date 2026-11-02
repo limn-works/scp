@@ -261,7 +261,7 @@ Each test specifies:
 | **Tier** | Core |
 | **Spec Sections** | §23.5 |
 | **Preconditions** | Member was offline for > 7 days. Epoch drift > 1000. |
-| **Steps** | 1. Member submits a reset request to the context's node, sealed to the request key (`05-contexts.md` §5.9.1.1), whose record is signed over the `"SCP-RESET-REQUEST-V3:"` preimage of `09-security-model.md` §9.5.2 and names its KeyPackage and stale leaf. 2. Any member's Commit whose prefix of the request queue reaches the request executes it. 3. That committer sends the MLS Welcome. 4. Member processes Welcome within 60s timeout (§9.18.9). 5. Member joins as fresh member. |
+| **Steps** | 1. Member submits a reset request to the context's node, sealed under a window epoch request key or, without one, the intake key (`05-contexts.md` §5.9.1.1), whose record is signed over the `"SCP-RESET-REQUEST-V3:"` preimage of `09-security-model.md` §9.5.2 and names its KeyPackage and stale leaf. 2. Any member's Commit whose executed run of the request queue holds the request executes it. 3. That committer sends the MLS Welcome. 4. Member processes Welcome within 60s timeout (§9.18.9). 5. Member joins as fresh member. |
 | **Expected Outcome** | Member is re-admitted to the MLS group. Fresh epoch state. Historical messages not accessible (re-join, not restore). |
 
 ### CONF-022: Equivocation Detection
