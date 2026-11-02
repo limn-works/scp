@@ -16,6 +16,13 @@ A key's custody type names the substrate that holds its private half, and `09-se
 
 The identifier does not depend on custody, because it is the inception event's digest and encodes no key (`09-security-model.md` §9.7.4.2 R13). A controller therefore moves its operational signing capability from one substrate to another under the key custody migration protocol (§3.2.1), and every relying party keeps resolving the same identifier.
 
+**A context key is held through the existing `KeyCustody` API, with no new method.** The node that runs a context signs its chain entries, its receipts and its node addresses under that context's `context_key`, the P-256 key the operator's `ContextOperatorBinding` binds (`09-security-model.md` §9.5.2). The key custody of the operator's device whose SCP instance runs the node holds `context_key` through three methods of `KeyCustody` (`crates/scp-platform/src/traits.rs`):
+- `generate_keypair(KeyType::P256Signing)` mints `context_key` when the node instantiates the context. The public half is the 33-byte compressed SEC1 point the binding carries.
+- `sign` signs the 32-byte `SHA-256` digests of the `SCP-CONTEXT-CHAIN-V1:`, `SCP-CONTEXT-RECEIPT-V1:` and `SCP-CONTEXT-NODE-ADDRESS-V1:` preimages, as prehash signing, and returns the 64-byte low-`s` `r ‖ s`. The node's signer builds each digest from the preimage's fields and signs no digest a caller hands it (`09-security-model.md` §9.5.2 **Custody**).
+- `destroy_key` destroys `context_key` when the context closes and when the context is re-founded on another node, after the node has durably stored the last chain entry it signed under that key.
+
+Every `KeyCustody` backend MUST support `KeyType::P256Signing` in those three methods, and a software backend holds the private scalar in `Zeroizing` memory. `KeyType::P256KeyEvent` cannot hold `context_key`, because `sign` refuses that type: it signs only key-event digests and custody probes through the key-event signer (`09-security-model.md` §9.7.4.2 R10).
+
 ### 3.2.1 Key Custody Migration Protocol
 
 Custody migration moves the operational signing capability from one custody provider to another — a passkey to a FIDO2 token, a secure element to a self-managed key — and the identifier does not change, because the identifier is the inception event's digest and encodes no key (`09-security-model.md` §9.7.4.2 R13). An operational-key custody migration leaves the root set unchanged; case 2 below is the one case in which the root itself changes.
@@ -566,11 +573,6 @@ All identity private state event types, organized by category:
 | `EnrollDevice` | `device_id: String, device_hpke_pubkey: [u8; 65], device_name: String, enrolled_at: u64` | Yes | New device enrollment |
 | `UnenrollDevice` | `device_id: String, timestamp: u64` | Yes | Device removal |
 
-**KeyPackage events (`10-infrastructure-and-self-hosting.md` §10.7.1 **Retired init keys**):**
-
-| Event type | Fields | Commutative | Notes |
-|-----------|--------|-------------|-------|
-| `RetireInitKey` | `init_key: [u8; 65], expires_at: u64, timestamp: u64` | Yes | A device consumed or deleted the KeyPackage carrying `init_key`; the identity's node refuses that `init_key` until `expires_at` |
 
 **Recovery contact events:**
 
