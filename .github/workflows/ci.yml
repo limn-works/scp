@@ -47,6 +47,10 @@ env:
   # installed" in place of a one-attempt download of every target and component
   # `rust-toolchain.toml` lists. See "The Rust toolchain each job compiles on" below.
   RUSTUP_AUTO_INSTALL: "0"
+  # pyo3's build script runs this interpreter, which each job compiling pyo3 installs
+  # with `actions/setup-python` 3.12, in place of the runner image's default `python3`.
+  # Check `pinned-python` in scripts/tests/ci-gate/ci_gate_selftest.py requires both.
+  PYO3_PYTHON: python3.12
 
 # ── Cargo cache groups ────────────────────────────────────────────────────────
 #

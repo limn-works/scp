@@ -262,6 +262,30 @@ nothing:
                LIMIT: a job that runs cargo only inside a script, with no
                toolchain step, is not detected; in ci.yml
                `RUSTUP_AUTO_INSTALL: "0"` fails such a job before cargo starts.
+  pinned-python
+               pyo3's build script runs the interpreter PYO3_PYTHON names, or
+               the runner image's default `python3`, and fails when that
+               interpreter is newer than the newest version the locked pyo3
+               supports. When ubuntu-latest moved its default to 3.14, job
+               rust-docs in docs.yml, which ran `cargo doc --workspace` with no
+               pinned Python, failed on every pull request. Every step that
+               compiles pyo3 must come after an unconditional
+               `actions/setup-python` step pinned to 3.12 and run with
+               PYO3_PYTHON naming that interpreter: the step's `python-path`
+               output, or `python3.12` off Windows. A step compiles pyo3 when
+               its `run:` text runs cargo with a compiling subcommand that
+               selects a package depending on pyo3 (read from every member's
+               Cargo.toml): `-p` naming one or a word only the runner knows,
+               `--workspace` excluding none, or no package flag in a directory
+               whose nearest manifest builds one, which at the root means a
+               default member; or `maturin build|develop` without `-i`; or
+               maturin-action without `-i`; or CodeQL on a job analysing rust,
+               whose extractor runs build scripts. Controls remove the pin, the
+               PYO3_PYTHON write, and the workflow-level key, pin 3.14, guard
+               the pin with `if:`, move the write after the build, name
+               `python3.12` on a Windows leg, and add unpinned fixture jobs.
+               LIMIT: cargo run inside a repository script a step starts is
+               not read.
   matrix-axis
                Job rust-test-optional-features runs its commands on three
                legs, one per value of a matrix `group` axis, and jobs
@@ -5504,6 +5528,513 @@ def check_offline_cargo(documents: list[tuple[Path, dict]]) -> None:
              "ci.yml", "fixture/Missing.Dockerfile`, which does not exist")
 
 
+# PyO3's build script runs the interpreter PYO3_PYTHON names, or the first `python3` on
+# PATH when PYO3_PYTHON is unset, and fails the build when that interpreter is newer than
+# the newest version the locked pyo3 supports. A runner image moves its default Python
+# on its own schedule, so a job that compiles pyo3 pins the interpreter itself. See the
+# `pinned-python` entry in this file's docstring.
+PINNED_PYTHON_VERSION = "3.12"
+SETUP_PYTHON_ACTION = "actions/setup-python@"
+PYO3_CRATES = {"pyo3", "pyo3-ffi", "pyo3-build-config"}
+PYTHON_PATH_OUTPUT = re.compile(r"^\$\{\{\s*steps\.([A-Za-z0-9_-]+)\.outputs\.python-path\s*\}\}$")
+PYO3_ENV_WRITE = re.compile(
+    r"""PYO3_PYTHON=(?P<value>\$\{\{[^}]*\}\}|[^\s"'>]+)["']?\s*>>\s*["']?\$\{?GITHUB_ENV\}?"""
+)
+# INDICATORS, not the criterion: the cargo subcommands that compile the packages they
+# select and so run their build scripts. `cargo tree`, `metadata`, `fetch`, `deny` and
+# `fmt` read manifests or sources and run no build script.
+CARGO_COMPILING = {
+    "build", "b", "check", "c", "clippy", "doc", "d", "test", "t", "bench", "run", "r",
+    "rustc", "rustdoc", "fix", "nextest", "llvm-cov", "llvm-lines", "miri", "mutants",
+    "hack", "publish",
+}
+MATURIN_COMPILING = {"build", "develop", "publish"}
+CODEQL_ACTIONS = ("github/codeql-action/init@", "github/codeql-action/analyze@",
+                  "github/codeql-action/autobuild@")
+MATURIN_ACTION = "PyO3/maturin-action@"
+
+
+def is_dynamic(text: str) -> bool:
+    """True for a word whose value only the runner knows: a variable or an expression."""
+    return "$" in text or "EXPRESSION" in text or any(c in text for c in "*?[")
+
+
+@functools.cache
+def cargo_workspace() -> tuple[dict[str, str], frozenset[str], frozenset[str]]:
+    """Return (member directory -> package name, default-member names, pyo3 packages).
+
+    A package is a pyo3 package when any dependency table of its manifest, target
+    tables included, names a crate in PYO3_CRATES or another pyo3 package.
+    """
+    root = tomllib.loads((REPO / "Cargo.toml").read_text())["workspace"]
+    members: dict[str, str] = {}
+    depends: dict[str, set[str]] = {}
+    for member in root["members"]:
+        manifest = tomllib.loads((REPO / member / "Cargo.toml").read_text())
+        name = manifest["package"]["name"]
+        members[posixpath.normpath(member)] = name
+        depends[name] = manifest_dependencies(manifest)
+    pyo3: set[str] = set()
+    while True:
+        grown = {name for name, deps in depends.items() if deps & (PYO3_CRATES | pyo3)}
+        if grown <= pyo3:
+            break
+        pyo3 |= grown
+    defaults = root.get("default-members", root["members"])
+    return (
+        members,
+        frozenset(members[posixpath.normpath(path)] for path in defaults),
+        frozenset(pyo3),
+    )
+
+
+def manifest_dependencies(manifest: dict) -> set[str]:
+    """Return every package name a manifest's dependency tables name, renames resolved."""
+    tables = [manifest]
+    tables += [t for t in (manifest.get("target") or {}).values() if isinstance(t, dict)]
+    found: set[str] = set()
+    for table in tables:
+        for key in ("dependencies", "dev-dependencies", "build-dependencies"):
+            for name, spec in (table.get(key) or {}).items():
+                found.add(spec.get("package", name) if isinstance(spec, dict) else name)
+    return found
+
+
+def directory_compiles_pyo3(directory: str | None) -> bool:
+    """True when cargo run with no package flag in `directory` compiles pyo3.
+
+    `directory` is relative to the repository root, or None when unknown. Cargo reads
+    the nearest Cargo.toml at or above it: the root manifest builds the default members,
+    a member manifest builds that member, and any other manifest builds what it names.
+    """
+    if directory is None:
+        return True
+    members, defaults, pyo3 = cargo_workspace()
+    directory = posixpath.normpath(directory)
+    if directory.startswith(("/", "..")):
+        return False
+    while True:
+        if directory in (".", ""):
+            return bool(defaults & pyo3)
+        if directory in members:
+            return members[directory] in pyo3
+        manifest = REPO / directory / "Cargo.toml"
+        if manifest.is_file():
+            deps = manifest_dependencies(tomllib.loads(manifest.read_text()))
+            return bool(deps & (PYO3_CRATES | pyo3))
+        directory = posixpath.dirname(directory)
+
+
+def manifest_directory(cwd: str | None, manifest: str) -> str | None:
+    if cwd is None or is_dynamic(manifest):
+        return None
+    return posixpath.dirname(posixpath.normpath(posixpath.join(cwd, manifest)))
+
+
+def cargo_compiles_pyo3(tokens: list[str], cwd: str | None) -> bool:
+    """True when one cargo command line, the tokens after `cargo`, compiles pyo3.
+
+    A subcommand outside CARGO_COMPILING compiles nothing. Otherwise the command
+    compiles pyo3 when it selects a pyo3 package with `-p`/`--package`, or a package
+    word it cannot read; when it passes `--workspace` or `--all` and excludes none of
+    the pyo3 packages; or, with neither, when the manifest it reads (`--manifest-path`,
+    else the nearest one at or above the working directory) builds one.
+    """
+    if tokens and tokens[0].startswith("+"):
+        tokens = tokens[1:]
+    if not tokens:
+        return False
+    subcommand = tokens[0]
+    if not is_dynamic(subcommand) and subcommand not in CARGO_COMPILING:
+        return False
+    workspace, packages, excluded, manifest = False, [], set(), None
+    index = 1
+    while index < len(tokens) and tokens[index] != "--":
+        token = tokens[index]
+        value = tokens[index + 1] if index + 1 < len(tokens) else ""
+        if token in ("--workspace", "--all"):
+            workspace = True
+        elif token in ("-p", "--package"):
+            packages.append(value)
+            index += 1
+        elif token.startswith("--package="):
+            packages.append(token.partition("=")[2])
+        elif token.startswith("-p") and len(token) > 2 and not token.startswith("--"):
+            packages.append(token[2:])
+        elif token == "--exclude":
+            excluded.add(value)
+            index += 1
+        elif token.startswith("--exclude="):
+            excluded.add(token.partition("=")[2])
+        elif token == "--manifest-path":
+            manifest = value
+            index += 1
+        elif token.startswith("--manifest-path="):
+            manifest = token.partition("=")[2]
+        index += 1
+    _, _, pyo3 = cargo_workspace()
+    if packages:
+        return any(is_dynamic(p) or p.partition("@")[0] in pyo3 for p in packages)
+    if workspace:
+        return bool(pyo3 - {e for e in excluded if not is_dynamic(e)})
+    directory = cwd if manifest is None else manifest_directory(cwd, manifest)
+    return directory_compiles_pyo3(directory)
+
+
+def names_interpreters(tokens: list[str]) -> bool:
+    """True when maturin arguments name the interpreters to build for with `-i`."""
+    return any(
+        token in ("-i", "--interpreter") or token.startswith("--interpreter=")
+        for token in tokens
+    )
+
+
+def maturin_compiles_pyo3(tokens: list[str], cwd: str | None) -> bool:
+    """True when `maturin <tokens>` compiles pyo3 for an interpreter it does not name.
+
+    maturin builds the crate its manifest names. With `-i`/`--interpreter` it builds
+    for each interpreter named and hands pyo3 that one, so no ambient Python is read.
+
+    The manifest is `-m`/`--manifest-path`, else `[tool.maturin] manifest-path` of the
+    working directory's pyproject.toml, else the working directory's Cargo.toml.
+    """
+    if not tokens or (not is_dynamic(tokens[0]) and tokens[0] not in MATURIN_COMPILING):
+        return False
+    if names_interpreters(tokens):
+        return False
+    for index, token in enumerate(tokens):
+        if token in ("-m", "--manifest-path") and index + 1 < len(tokens):
+            return directory_compiles_pyo3(manifest_directory(cwd, tokens[index + 1]))
+        if token.startswith("--manifest-path="):
+            return directory_compiles_pyo3(
+                manifest_directory(cwd, token.partition("=")[2])
+            )
+    if cwd is None:
+        return True
+    pyproject = REPO / cwd / "pyproject.toml"
+    if pyproject.is_file():
+        tool = tomllib.loads(pyproject.read_text()).get("tool", {}).get("maturin", {})
+        if "manifest-path" in tool:
+            return directory_compiles_pyo3(manifest_directory(cwd, tool["manifest-path"]))
+    return directory_compiles_pyo3(cwd)
+
+
+def start_directory(job: dict, step: dict) -> str | None:
+    """The directory, relative to the repository root, a step's `run:` starts in."""
+    directory = step.get("working-directory") or (
+        ((job.get("defaults") or {}).get("run") or {}).get("working-directory")
+    )
+    if directory is None:
+        return "."
+    directory = str(directory)
+    if directory.startswith("${{") and "github.workspace" in directory:
+        directory = "." + directory.split("}}", 1)[1]
+    if "${{" in directory or "$" in directory:
+        return None
+    return posixpath.normpath(directory)
+
+
+def script_compiles_pyo3(script: str, cwd: str | None) -> bool:
+    """True when a `run:` script compiles pyo3 through cargo or maturin.
+
+    Reads each simple command in order and follows `cd` and `pushd`.
+    """
+    for line in logical_lines(script):
+        commands = command_words(line)
+        if commands is None:
+            commands = [
+                (match.group(1), line[match.end() :].split())
+                for match in CARGO_COMMAND.finditer(line)
+            ]
+        for word, tokens in commands:
+            base = posixpath.basename(word)
+            if base in ("cd", "pushd"):
+                target = tokens[0] if tokens else "."
+                if target.startswith(("$GITHUB_WORKSPACE", "${GITHUB_WORKSPACE}")):
+                    cwd = "."
+                elif is_dynamic(target) or cwd is None:
+                    cwd = None
+                else:
+                    cwd = posixpath.normpath(posixpath.join(cwd, target))
+            elif (base == "cargo" and cargo_compiles_pyo3(tokens, cwd)) or (
+                base == "maturin" and maturin_compiles_pyo3(tokens, cwd)
+            ):
+                return True
+    return False
+
+
+def job_matrix_values(job: dict) -> set[str]:
+    matrix = (job.get("strategy") or {}).get("matrix") or {}
+    values: set[str] = set()
+
+    def walk(node: object) -> None:
+        if isinstance(node, dict):
+            for item in node.values():
+                walk(item)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+        elif node is not None:
+            values.add(str(node))
+
+    walk(matrix)
+    return values
+
+
+def step_compiles_pyo3(job: dict, step: dict) -> bool:
+    """True when one step runs pyo3's build script.
+
+    CRITERION: the step's `run:` text runs a cargo or maturin command that compiles a
+    package depending on pyo3 (cargo_compiles_pyo3, maturin_compiles_pyo3); or it is a CodeQL step for a job whose analysed
+    languages include rust, whose extractor runs the workspace's build scripts; or it
+    runs maturin-action with a command other than `sdist` and no `-i`.
+    """
+    uses = step_uses(step)
+    inputs = step.get("with") or {}
+    if uses.startswith(CODEQL_ACTIONS):
+        languages = str(inputs.get("languages") or "")
+        if "${{" in languages:
+            return "rust" in job_matrix_values(job)
+        return "rust" in re.split(r"[\s,]+", languages)
+    if uses.startswith(MATURIN_ACTION):
+        args = split_command(str(inputs.get("args") or ""))
+        return str(inputs.get("command") or "build") != "sdist" and not names_interpreters(args)
+    script = str(step.get("run") or "")
+    return bool(script) and script_compiles_pyo3(script, start_directory(job, step))
+
+
+def pinned_setup_steps(steps: list[dict], before: int) -> dict[str, int]:
+    """Return {id or '': index} of each unconditional setup-python 3.12 step before `before`."""
+    found: dict[str, int] = {}
+    for index, step in enumerate(steps[:before]):
+        if not step_uses(step).startswith(SETUP_PYTHON_ACTION) or step.get("if"):
+            continue
+        version = str((step.get("with") or {}).get("python-version") or "").strip()
+        if version == PINNED_PYTHON_VERSION:
+            found[str(step.get("id") or "")] = index
+    return found
+
+
+def job_runs_on_windows(job: dict) -> bool:
+    return "windows" in str(job.get("runs-on") or "") or any(
+        "windows" in value for value in job_matrix_values(job)
+    )
+
+
+def pyo3_python_gaps(label: str, doc: dict, job: dict, steps: list[dict], index: int) -> list[str]:
+    """Return why PYO3_PYTHON, as step `index` sees it, does not name the pinned interpreter.
+
+    PYO3_PYTHON reaches a step from its own `env:`, its job's, the workflow's, or the
+    latest earlier unconditional step that writes it to `$GITHUB_ENV`. Each of those
+    that sets it must name the interpreter, so the verdict does not depend on which one
+    GitHub gives precedence, and at least one must set it. A value names the interpreter
+    when it is the `python-path` output of an unconditional setup-python
+    PINNED_PYTHON_VERSION step before the step that reads or writes it, or, except on a
+    Windows runner, where setup-python installs no `python3.12` command, the literal
+    `python3.12`.
+    """
+    pinned = pinned_setup_steps(steps, index)
+    windows = job_runs_on_windows(job)
+    sources: list[tuple[str, str, int]] = []
+    for where, env in (("step", steps[index].get("env")), ("job", job.get("env")),
+                       ("workflow", doc.get("env"))):
+        if isinstance(env, dict) and "PYO3_PYTHON" in env:
+            sources.append((f"{where} env", str(env["PYO3_PYTHON"]), index))
+    for earlier in range(index - 1, -1, -1):
+        if steps[earlier].get("if"):
+            continue
+        match = PYO3_ENV_WRITE.search(str(steps[earlier].get("run") or ""))
+        if match:
+            sources.append((f"$GITHUB_ENV write of step {earlier}", match.group("value"), earlier))
+            break
+    if not sources:
+        return [f"{label}: compiles pyo3 with PYO3_PYTHON unset"]
+    gaps = []
+    for where, value, limit in sources:
+        output = PYTHON_PATH_OUTPUT.match(value.strip())
+        if output and output.group(1) in pinned and pinned[output.group(1)] < limit:
+            continue
+        if not output and value.strip() == f"python{PINNED_PYTHON_VERSION}" and not windows:
+            continue
+        gaps.append(
+            f"{label}: PYO3_PYTHON from the {where} is `{value}`, which names no "
+            f"unconditional setup-python {PINNED_PYTHON_VERSION} interpreter before it"
+            + (" (a Windows runner has no python3.12 command)" if windows else "")
+        )
+    return gaps
+
+
+def pinned_python_gaps(name: str, doc: dict) -> list[str]:
+    """Return each step that compiles pyo3 without the pinned interpreter.
+
+    CRITERION: in every job, every step that compiles pyo3
+    (step_compiles_pyo3) comes after an unconditional `actions/setup-python` step whose
+    `python-version` is exactly PINNED_PYTHON_VERSION, and runs with PYO3_PYTHON naming
+    that interpreter (pyo3_python_gaps).
+    """
+    gaps: list[str] = []
+    for job_id, job in sorted((doc.get("jobs") or {}).items()):
+        if "uses" in job:
+            continue
+        steps = job.get("steps") or []
+        for index, step in enumerate(steps):
+            if not step_compiles_pyo3(job, step):
+                continue
+            label = f"{name}:{job_id}, {step.get('name') or f'step {index}'}"
+            if not pinned_setup_steps(steps, index):
+                gaps.append(
+                    f"{label}: compiles pyo3 with no unconditional setup-python "
+                    f"{PINNED_PYTHON_VERSION} step before it"
+                )
+            gaps += pyo3_python_gaps(label, doc, job, steps, index)
+    return gaps
+
+
+def check_pinned_python(documents: list[tuple[Path, dict]]) -> None:
+    by_name = {path.name: doc for path, doc in documents}
+    for name, doc in sorted(by_name.items()):
+        gaps = pinned_python_gaps(name, doc)
+        check(
+            f"{name}: every step compiling pyo3 runs on a pinned Python "
+            f"{PINNED_PYTHON_VERSION} that PYO3_PYTHON names",
+            not gaps,
+            f"{gaps}: pyo3's build script reads the runner image's default Python, "
+            f"and fails once the image moves it past the newest version pyo3 supports",
+        )
+    _, _, pyo3 = cargo_workspace()
+    check(
+        "the pinned-python reader finds scp-ffi among the packages depending on pyo3",
+        "scp-ffi" in pyo3,
+        f"read {sorted(pyo3)}",
+    )
+
+    # Reader controls: commands that do and do not compile pyo3.
+    for line, cwd, expected in (
+        ("cargo build --workspace", ".", True),
+        ("cargo +1.98.0 clippy --all-targets", ".", True),
+        ("cargo test -p scp-ffi --features testing", ".", True),
+        ("cargo nextest run --package=scp-ffi", ".", True),
+        ('cargo build -p "$pkg"', ".", True),
+        ("cargo build --manifest-path crates/scp-ffi/Cargo.toml", ".", True),
+        ("cargo doc", "crates/scp-ffi/src", True),
+        ("cd bindings/python && maturin develop --features testing", ".", True),
+        ("cargo build -p scp-ffi-napi --release", ".", False),
+        ("cargo build --workspace --exclude scp-ffi", ".", False),
+        ("cargo tree --workspace -e features", ".", False),
+        ("cargo check --locked", "fuzz", False),
+        ("cargo build --release", "crates/scp-crypto", False),
+        ("maturin build --out dist -i python3.10 python3.12", "bindings/python", False),
+        ("maturin sdist", "bindings/python", False),
+    ):
+        got = script_compiles_pyo3(line, cwd)
+        check(
+            f"the pinned-python reader reads `{line}` in {cwd} as "
+            f"{'compiling' if expected else 'not compiling'} pyo3",
+            got == expected,
+            f"read {got}",
+        )
+
+    # Controls: each fixture below breaks the rule one way and must be reported.
+    def reported(label: str, name: str, doc: dict, needle: str) -> None:
+        gaps = pinned_python_gaps(name, doc)
+        check(
+            f"pinned-python control: {label} is reported",
+            any(needle in gap for gap in gaps),
+            f"no gap containing {needle!r} among {gaps}",
+        )
+
+    def not_reported(label: str, name: str, doc: dict) -> None:
+        gaps = pinned_python_gaps(name, doc)
+        check(f"pinned-python control: {label} is not reported", not gaps, f"{gaps}")
+
+    def rust_docs(doc: dict) -> tuple[list[dict], int, int]:
+        steps = doc["jobs"]["rust-docs"]["steps"]
+        setup = next(i for i, s in enumerate(steps) if step_uses(s).startswith(SETUP_PYTHON_ACTION))
+        writer = next(i for i, s in enumerate(steps) if PYO3_ENV_WRITE.search(str(s.get("run") or "")))
+        return steps, setup, writer
+
+    docs = by_name["docs.yml"]
+    mutated = copy.deepcopy(docs)
+    steps, setup, _ = rust_docs(mutated)
+    del steps[setup]
+    reported("docs.yml rust-docs with its setup-python step removed", "docs.yml", mutated,
+             "no unconditional setup-python 3.12 step before it")
+
+    mutated = copy.deepcopy(docs)
+    steps, _, writer = rust_docs(mutated)
+    del steps[writer]
+    reported("docs.yml rust-docs with its PYO3_PYTHON write removed", "docs.yml", mutated,
+             "compiles pyo3 with PYO3_PYTHON unset")
+
+    mutated = copy.deepcopy(docs)
+    steps, setup, _ = rust_docs(mutated)
+    steps[setup]["with"]["python-version"] = "3.14"
+    reported("docs.yml rust-docs pinned to 3.14", "docs.yml", mutated,
+             "no unconditional setup-python 3.12 step before it")
+
+    mutated = copy.deepcopy(docs)
+    steps, setup, _ = rust_docs(mutated)
+    steps[setup]["if"] = "github.event_name == 'push'"
+    reported("docs.yml rust-docs with a conditional setup-python step", "docs.yml", mutated,
+             "no unconditional setup-python 3.12 step before it")
+
+    mutated = copy.deepcopy(docs)
+    steps, _, writer = rust_docs(mutated)
+    steps.append(steps.pop(writer))
+    reported("docs.yml rust-docs writing PYO3_PYTHON after cargo doc", "docs.yml", mutated,
+             "compiles pyo3 with PYO3_PYTHON unset")
+
+    ci = by_name["ci.yml"]
+    mutated = copy.deepcopy(ci)
+    mutated["env"].pop("PYO3_PYTHON", None)
+    reported("ci.yml without its workflow-level PYO3_PYTHON", "ci.yml", mutated,
+             "ci.yml:rust-clippy, Run clippy over the workspace: compiles pyo3 with "
+             "PYO3_PYTHON unset")
+
+    mutated = copy.deepcopy(ci)
+    mutated["env"]["PYO3_PYTHON"] = "python3"
+    reported("ci.yml with PYO3_PYTHON naming the image's python3", "ci.yml", mutated,
+             "PYO3_PYTHON from the workflow env is `python3`")
+
+    mutated = copy.deepcopy(by_name["build-matrix.yml"])
+    mutated["jobs"]["rust"]["env"] = {"PYO3_PYTHON": "python3.12"}
+    reported("build-matrix.yml rust, which has a Windows leg, naming python3.12",
+             "build-matrix.yml", mutated, "a Windows runner has no python3.12 command")
+
+    mutated = copy.deepcopy(by_name["codeql.yml"])
+    mutated["jobs"]["analyze"]["steps"] = [
+        step for step in mutated["jobs"]["analyze"]["steps"]
+        if not step_uses(step).startswith(SETUP_PYTHON_ACTION)
+        and not PYO3_ENV_WRITE.search(str(step.get("run") or ""))
+    ]
+    reported("codeql.yml analyze, whose Rust leg runs build scripts, with no pin",
+             "codeql.yml", mutated, "codeql.yml:analyze")
+
+    fixture = {"runs-on": "ubuntu-latest", "steps": [{"uses": "actions/checkout@v5"}]}
+    for label, step, expected in (
+        ("a workspace build", {"run": "cargo build --workspace"}, True),
+        ("a default-member clippy run", {"run": "cargo clippy --all-targets"}, True),
+        ("a test of scp-ffi", {"run": "cargo test -p scp-ffi"}, True),
+        ("a maturin develop", {"working-directory": "bindings/python",
+                               "run": "maturin develop"}, True),
+        ("a build of scp-ffi-napi alone", {"run": "cargo build -p scp-ffi-napi"}, False),
+        ("a fuzz-workspace check", {"working-directory": "fuzz", "run": "cargo check"}, False),
+    ):
+        mutated = {"jobs": {"fixture": copy.deepcopy(fixture)}}
+        mutated["jobs"]["fixture"]["steps"].append(step)
+        if expected:
+            reported(f"an unpinned job running {label}", "fixture.yml", mutated,
+                     "fixture.yml:fixture")
+        else:
+            not_reported(f"an unpinned job running {label}", "fixture.yml", mutated)
+    mutated = {"env": {"PYO3_PYTHON": "python3.12"}, "jobs": {"fixture": copy.deepcopy(fixture)}}
+    mutated["jobs"]["fixture"]["steps"] += [
+        {"uses": "actions/setup-python@v5", "with": {"python-version": "3.12"}},
+        {"run": "cargo build --workspace"},
+    ]
+    not_reported("a pinned job running a workspace build", "fixture.yml", mutated)
+
+
 def package_write_holders(doc: dict) -> list[str]:
     """Return `workflow` and every job id whose own `permissions:` grants package write.
 
@@ -9391,6 +9922,14 @@ def run_offline_cargo(inputs: Inputs) -> None:
     check_offline_cargo(inputs.documents)
 
 
+def run_pinned_python(inputs: Inputs) -> None:
+    print(
+        "pinned-python — every job that compiles pyo3 runs on a pinned Python 3.12 "
+        "that PYO3_PYTHON names"
+    )
+    check_pinned_python(inputs.documents)
+
+
 def run_artifact_key(inputs: Inputs) -> None:
     workflow = inputs.workflow
     print(
@@ -10100,6 +10639,7 @@ CHECKS: dict[str, Callable[[Inputs], None]] = {
     "retention": run_retention,
     "profile-env": run_profile_env,
     "offline-cargo": run_offline_cargo,
+    "pinned-python": run_pinned_python,
     "artifact-key": run_artifact_key,
     "artifact-digest": run_artifact_digest,
     "producer-outputs": run_producer_outputs,
@@ -10156,6 +10696,7 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "retention",
         "profile-env",
         "offline-cargo",
+        "pinned-python",
         "artifact-key",
         "artifact-digest",
         "producer-outputs",
