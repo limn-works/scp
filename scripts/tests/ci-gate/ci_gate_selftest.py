@@ -7614,12 +7614,13 @@ RUST_TEST_SHARDS = (
         "scp-platform/filesystem,scp-testing/testing"
     ),
     (
-        f"{NEXTEST} -p scp-runtime -p scp-core --features scp-core/testing,scp-runtime/testing,"
+        f"{NEXTEST} -p scp-runtime -p scp-core --features scp-core/testing,"
+        "scp-core/allow_unencrypted_storage,scp-runtime/testing,"
         "scp-runtime/saga-witness-test-mint,scp-core/outlet-capability-test-grant,"
         "serde_json/raw_value,serde_json/unbounded_depth,tracing/log,"
         "scp-runtime/outlet-capability-test-grant,scp-dht/production-dht,"
         "scp-identity/production-dht,scp-platform/file,scp-platform/sqlite,tokio-util/codec,"
-        "tokio-util/io,scp-testing/testing"
+        "tokio-util/io"
     ),
     (
         f"{NEXTEST} -p scp-testing -p scp-platform --features openmls_basic_credential/test-utils,"

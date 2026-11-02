@@ -103,6 +103,14 @@ arc-swap = { workspace = true }
 futures = { workspace = true }
 
 [dev-dependencies]
+# This crate, naming itself, to turn its `testing` feature on for its own dev targets
+# and for no other build. All four examples and most integration tests here declare
+# `required-features = ["testing"]`, so without this edge `cargo test -p scp-runtime`
+# skips those tests and `cargo clippy -p scp-runtime --example identity` refuses to build,
+# which `scripts/check-examples-compile.sh` runs. A build that takes this crate as a
+# normal dependency never builds these dev-dependencies and never gets the feature,
+# and publication strips this path-only edge.
+scp-runtime = { path = ".", features = ["testing"] }
 # The shared valid-P-256-point test fixture (`scp_crypto::p256::testing`).
 scp-crypto = { path = "../scp-crypto", features = ["testing"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
@@ -119,28 +127,11 @@ scp-platform = { path = "../scp-platform", features = ["testing", "encrypting", 
 scp-event-log = { path = "../scp-event-log", features = ["testing"] }
 openmls_basic_credential = { workspace = true, features = ["test-utils"] }
 proptest = "1"
-scp-media = { path = "../scp-media" }
 static_assertions = { workspace = true }
 metrics-util = "0.19"
-# ADR-049 Decision 14 `perf_baseline` harness only. `scp-testing` re-exports the
-# `FullStackNetwork`/`FullStackNode` two-node MLS harness needed to drive the six
-# measured operations (notably `deliver_incoming`, which requires a genuine
-# second-member decryptable envelope). This is a DEV-only back-edge: dev-deps are
-# never part of the normal build graph, so it does NOT feed the
-# `scp-ffi → dep:scp-testing → scp-core{testing} → scp-runtime/testing` production
-# chain the feature-isolation comment above guards against.
-scp-testing = { path = "../scp-testing" }
 
 [[test]]
 name = "economy_integration"
-required-features = ["testing"]
-
-# ADR-049 Decision 14 benchmark. The `default-filter` in `.config/nextest.toml`
-# leaves it out of every `cargo nextest run`, so the default suite and CI never run
-# it; CI compiles it. Run it on demand with `cargo nextest run -p scp-runtime
-# --features testing --ignore-default-filter --test perf_baseline`.
-[[test]]
-name = "perf_baseline"
 required-features = ["testing"]
 
 [[test]]
@@ -153,10 +144,6 @@ required-features = ["testing"]
 
 [[test]]
 name = "phase2_integration"
-required-features = ["testing"]
-
-[[test]]
-name = "phase5_integration"
 required-features = ["testing"]
 
 [[test]]
@@ -216,10 +203,10 @@ name = "identity"
 # The example names `InMemoryDhtClient`, `InMemoryKeyCustody`, and
 # `InMemoryPreRotationCustody`, which a consumer reaches only through this crate's
 # `testing` feature. Inside this workspace the declaration never refuses a build:
-# the `scp-testing` dev-dependency turns on `scp-runtime/testing`, and cargo unifies
-# that into every dev target, so `cargo run -p scp-runtime --example identity`
+# this crate's dev-dependency on itself turns on `scp-runtime/testing`, and cargo
+# unifies that into every dev target, so `cargo run -p scp-runtime --example identity`
 # compiles and runs. Only a build of the published crate, which strips path-only
-# dev-dependencies such as `scp-testing`, reports the missing feature instead of
+# dev-dependencies such as that one, reports the missing feature instead of
 # unresolved imports.
 # `check-examples-compile.sh` names each target, so the declaration removes no
 # target from that gate.

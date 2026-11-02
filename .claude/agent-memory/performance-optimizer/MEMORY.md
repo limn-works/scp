@@ -1,0 +1,1 @@
+- [Local build loop costs](project_local_build_loop_costs.md) — what dominates the scp-runtime edit/build/lint loop, why linker levers cannot pay, dev-dep and self-dep traps, shared-scratchpad collisions
