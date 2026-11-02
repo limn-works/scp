@@ -1,0 +1,29 @@
+name: Plant
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  writer:
+    runs-on: ubuntu-latest
+    steps:
+      - id: artifact-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: out
+          key: artifact
+      - uses: ./.github/actions/rust-cache
+        if: steps.artifact-cache.outputs.cache-hit != 'true'
+        with:
+          shared-key: workspace-debug
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - if: steps.artifact-cache.outputs.cache-hit != 'true'
+        run: cargo nextest run -p a --features a/x
+  reader:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./.github/actions/rust-cache
+        with:
+          shared-key: workspace-debug
+          save-if: false
+      - run: cargo nextest run -p a --features a/x

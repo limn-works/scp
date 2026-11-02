@@ -13,7 +13,7 @@ jobs:
           shared-key: optional-${{ matrix.group }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
   reader:
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     steps:
       - uses: ./.github/actions/rust-cache
         with:

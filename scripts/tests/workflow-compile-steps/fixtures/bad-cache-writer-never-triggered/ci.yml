@@ -1,0 +1,19 @@
+name: Plant
+on: pull_request
+jobs:
+  writer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./.github/actions/rust-cache
+        with:
+          shared-key: workspace-debug
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo nextest run -p a --features a/x
+  reader:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./.github/actions/rust-cache
+        with:
+          shared-key: workspace-debug
+          save-if: false
+      - run: cargo nextest run -p a --features a/x

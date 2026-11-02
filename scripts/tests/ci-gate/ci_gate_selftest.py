@@ -579,7 +579,11 @@ WORKSPACE_SCOPED_JOBS = {
     ("ci.yml", "rust-test"),
     ("docs.yml", "rust-docs"),
 }
-RUSTDOC_JOBS = {("ci.yml", "rust-doc"), ("docs.yml", "rust-docs")}
+RUSTDOC_JOBS = {
+    ("cache-warm.yml", "workspace-check"),
+    ("ci.yml", "rust-doc"),
+    ("docs.yml", "rust-docs"),
+}
 
 # CRITERION for check_documented_rustdoc_reproduces_the_required_job: a `cargo
 # doc` line inside a shell-labelled fenced block of a tracked Markdown file is a
@@ -5077,6 +5081,64 @@ def wrapper_key_gaps(action: dict) -> list[str]:
     return gaps
 
 
+CACHE_WARM_WORKFLOW = REPO / ".github/workflows/cache-warm.yml"
+
+
+def wrapper_warm_key_gaps(script: str, groups: set[str], warm_text: str) -> list[str]:
+    """Return each group whose key reads cache-warm.yml when it should not, or the reverse.
+
+    CRITERION: the prefix the wrapper's `manifest` step prints for a group changes with
+    an edit to .github/workflows/cache-warm.yml exactly when that file writes the group,
+    so an edit to a warm job's commands writes a new entry for the groups it fills and
+    leaves every other group's entry an exact match. `script` is the step's `run:` text,
+    `groups` every `shared-key` a workflow names, and `warm_text` the file's content.
+    """
+    written = {
+        str((step.get("with") or {}).get("shared-key"))
+        for job in (yaml.safe_load(warm_text).get("jobs") or {}).values()
+        for step in job.get("steps") or []
+        if str(step.get("uses") or "") == RUST_CACHE_ACTION
+    }
+    gaps = []
+    with tempfile.TemporaryDirectory() as scratch:
+        root = Path(scratch)
+        (root / "Cargo.toml").write_text((REPO / "Cargo.toml").read_text())
+        workflows = root / ".github/workflows"
+        workflows.mkdir(parents=True)
+
+        def key(group: str, text: str) -> str:
+            (workflows / "cache-warm.yml").write_text(text)
+            output = root / "output"
+            output.write_text("")
+            env = dict(
+                os.environ,
+                GITHUB_WORKSPACE=str(root),
+                GITHUB_OUTPUT=str(output),
+                GITHUB_ACTION_PATH=str(MANIFEST_DIGEST_SCRIPT.parent),
+                CACHE_WORKSPACES=". -> target",
+                CACHE_GROUP=group,
+            )
+            result = subprocess.run(
+                ["bash", "-c", script], env=env, cwd=root, capture_output=True, text=True
+            )
+            if result.returncode != 0:
+                return f"exit {result.returncode}: {result.stdout.strip()} {result.stderr.strip()}"
+            return output.read_text().strip()
+
+        edited = warm_text + "\n# planted edit\n"
+        for group in sorted(groups):
+            before, after = key(group, warm_text), key(group, edited)
+            if before.startswith("exit ") or after.startswith("exit "):
+                gaps.append(f"group {group}: the digest step failed ({before} / {after})")
+            elif (before != after) != (group in written):
+                gaps.append(
+                    f"group {group}: an edit to cache-warm.yml "
+                    f"{'changes' if before != after else 'keeps'} its key, and cache-warm.yml "
+                    f"{'writes' if group in written else 'does not write'} it"
+                )
+    return gaps
+
+
 def manifest_digest(script: Path, root: Path) -> str:
     result = subprocess.run(
         ["bash", str(script), str(root)], capture_output=True, text=True, check=True
@@ -5300,6 +5362,66 @@ def check_cache_key(documents: list[tuple[Path, dict]]) -> None:
         ).returncode
         != 0,
         "a missing manifest printed a digest that keys on nothing",
+    )
+
+    manifest_step = next(
+        step for step in action["runs"]["steps"] if step.get("id") == "manifest"
+    )
+    groups = {
+        str((step.get("with") or {}).get("shared-key"))
+        for _path, doc in documents
+        for job in (doc.get("jobs") or {}).values()
+        for step in job.get("steps") or []
+        if str(step.get("uses") or "") == RUST_CACHE_ACTION
+    }
+    warm_text = CACHE_WARM_WORKFLOW.read_text()
+    gaps = wrapper_warm_key_gaps(manifest_step["run"], groups, warm_text)
+    check(
+        "an edit to cache-warm.yml changes the key of each group it writes and of no other",
+        not gaps,
+        "; ".join(gaps),
+    )
+    # Controls: a step that always hashes the file rekeys every group on each warm
+    # edit, and one that never hashes it leaves a warm group's stale entry an exact
+    # match that skips the save.
+    test = 'if grep -Eq "^[[:space:]]+shared-key:'
+    for label, replacement, reported in (
+        (
+            "hashing cache-warm.yml into every group",
+            'if true || grep -Eq "^[[:space:]]+shared-key:',
+            "changes its key, and cache-warm.yml does not write it",
+        ),
+        (
+            "hashing cache-warm.yml into no group",
+            'if false && grep -Eq "^[[:space:]]+shared-key:',
+            "keeps its key, and cache-warm.yml writes it",
+        ),
+    ):
+        planted = manifest_step["run"].replace(test, replacement)
+        check(f"the planting for a wrapper {label} replaced its test", planted != manifest_step["run"])
+        planted_gaps = wrapper_warm_key_gaps(planted, groups, warm_text)
+        check(
+            f"a wrapper {label} is reported",
+            any(reported in gap for gap in planted_gaps),
+            f"{planted_gaps}",
+        )
+    check(
+        "the digest step exits non-zero when cache-warm.yml is not checked out",
+        subprocess.run(
+            ["bash", "-c", manifest_step["run"]],
+            env=dict(
+                os.environ,
+                GITHUB_WORKSPACE=str(REPO / ".github"),
+                GITHUB_OUTPUT=os.devnull,
+                GITHUB_ACTION_PATH=str(MANIFEST_DIGEST_SCRIPT.parent),
+                CACHE_WORKSPACES=f"{REPO} -> target",
+                CACHE_GROUP="workspace-debug",
+            ),
+            capture_output=True,
+            check=False,
+        ).returncode
+        != 0,
+        "a missing cache-warm.yml printed a key that ignores it",
     )
 
     texts = local_action_texts()
@@ -8560,6 +8682,7 @@ def check_push_runs_every_cache_writer(doc: dict) -> None:
         "bridge-parity-kotlin",
         "docker-image-cache",
         "fuzz-build",
+        "kotlin-android-instrumented",
         "kotlin-lint",
         "kotlin-test",
         "napi-addon",
@@ -8567,8 +8690,6 @@ def check_push_runs_every_cache_writer(doc: dict) -> None:
         "pyo3-module-macos",
         "python-wheel-build",
         "rust-clippy",
-        "rust-test",
-        "rust-test-macos",
         "rust-test-optional-features",
         "typescript-wasm-check",
         "uniffi-cdylib-linux",
@@ -8598,6 +8719,68 @@ def check_push_runs_every_cache_writer(doc: dict) -> None:
 
 def check_push_writer_mutants(doc: dict) -> None:
     """Each way of skipping a writer on push, or leaking a push skip, is reported."""
+
+    # ci.yml runs one literal leg list on every event: rust-test and rust-test-macos
+    # write no cache, and rust-clippy has no push-only leg. The controls on push-only
+    # legs and on leg-gated writers run against a rebuilt copy of the shape those
+    # jobs had while a push-only leg wrote their group: the push list swaps the
+    # absorbed legs for one push leg, every step that names only absorbed legs also
+    # runs on the push leg, and the rust-cache step those legs run saves only from
+    # the push leg on `main`.
+    def with_push_leg(
+        source: dict, job_id: str, push_leg: str, absorbed: tuple[str, ...] | None = None
+    ) -> dict:
+        rebuilt = copy.deepcopy(source)
+        job = rebuilt["jobs"][job_id]
+        legs = job["strategy"]["matrix"]["leg"]
+        taken = set(legs if absorbed is None else absorbed)
+        pushed = [leg for leg in legs if leg not in taken] + [push_leg]
+        job["strategy"]["matrix"]["leg"] = (
+            f"${{{{ fromJSON(github.event_name == 'push' && '{json.dumps(pushed)}' "
+            f"|| '{json.dumps(legs)}') }}}}"
+        )
+        for step in job["steps"]:
+            if not isinstance(step, dict):
+                continue
+            terms = axis_terms(step.get("if"))
+            named = terms is not None and terms[0] == "leg" and set(terms[1]) <= taken
+            if named:
+                step["if"] = f"matrix.leg == '{push_leg}' || {step['if']}"
+            every_leg = step.get("if") is None and taken == set(legs)
+            if str(step.get("uses", "")) == RUST_CACHE_ACTION and (named or every_leg):
+                step.setdefault("with", {})["save-if"] = (
+                    f"${{{{ github.ref == 'refs/heads/main' && matrix.leg == '{push_leg}' }}}}"
+                )
+        return rebuilt
+
+    test_writer = with_push_leg(doc, "rust-test", "all")
+    macos_writer = with_push_leg(doc, "rust-test-macos", "all")
+    clippy_writer = with_push_leg(
+        doc,
+        "rust-clippy",
+        "packages",
+        tuple(
+            leg
+            for leg in doc["jobs"]["rust-clippy"]["strategy"]["matrix"]["leg"]
+            if leg.startswith("packages-")
+        ),
+    )
+    for job_id, rebuilt in (
+        ("rust-test", test_writer),
+        ("rust-test-macos", macos_writer),
+        ("rust-clippy", clippy_writer),
+    ):
+        check(
+            f"the rebuilt push-leg {job_id} is read as a cache writer",
+            job_id in cache_writers(rebuilt),
+            f"{sorted(cache_writers(rebuilt))}",
+        )
+        check(
+            f"the rebuilt push-leg {job_id} is read without a gap",
+            not push_writer_gaps(rebuilt),
+            f"{push_writer_gaps(rebuilt)}",
+        )
+
     guarded = copy.deepcopy(doc)
     clippy = guarded["jobs"]["rust-clippy"]
     clippy["if"] = f"github.event_name != 'push' && ({clippy['if']})"
@@ -8617,7 +8800,7 @@ def check_push_writer_mutants(doc: dict) -> None:
         f"{scenario_disagreements(guarded)}",
     )
 
-    shard = copy.deepcopy(doc)
+    shard = copy.deepcopy(test_writer)
     shard["jobs"]["rust-test"]["strategy"]["matrix"]["leg"] = (
         "${{ fromJSON(github.event_name == 'push' && '[\"bridges\"]' "
         "|| '[\"bridges\", \"runtime\", \"testing\", \"rest\"]') }}"
@@ -8667,7 +8850,8 @@ def check_push_writer_mutants(doc: dict) -> None:
         ("rust-clippy", "leg", "examples", "only from matrix leg `leg == examples`"),
         ("rust-test-macos", "leg", "all", "only from matrix leg `leg == all`"),
     ):
-        base = with_os_axis(doc, job_id) if axis == "os" else doc
+        writer = {"rust-test": test_writer, "rust-test-macos": macos_writer}.get(job_id, doc)
+        base = with_os_axis(writer, job_id) if axis == "os" else writer
         live_axis = base["jobs"][job_id]["strategy"]["matrix"][axis]
         # A literal axis runs one list on every event; an axis that is already a
         # PUSH_MATRIX expression keeps its pull-request list and loses the value
@@ -8749,8 +8933,12 @@ def check_push_writer_mutants(doc: dict) -> None:
             step for step in job["steps"] if isinstance(step, dict) and predicate(step)
         )
 
-    def clippy_workspace(job: dict) -> dict:
-        return step_where(job, lambda step: step.get("if") == "matrix.leg == 'workspace'")
+    def clippy_examples(job: dict) -> dict:
+        return step_where(
+            job,
+            lambda step: step.get("if") == "matrix.leg == 'examples'"
+            and str(step.get("uses", "")) == RUST_CACHE_ACTION,
+        )
 
     def test_cache(job: dict) -> dict:
         return step_where(
@@ -8763,33 +8951,37 @@ def check_push_writer_mutants(doc: dict) -> None:
         )
 
     no_push = "github.event_name != 'push'"
-    for label, job_id, locate, field, text, reported in (
+    for label, base, job_id, locate, field, text, reported in (
         (
             "a push exclusion spelled in another case on rust-clippy's rust-cache `if:`",
+            doc,
             "rust-clippy",
-            clippy_workspace,
+            clippy_examples,
             "if",
-            "matrix.leg == 'workspace' && GitHub.Event_Name != 'Push'",
+            "matrix.leg == 'examples' && GitHub.Event_Name != 'Push'",
             "no push to `main` meets",
         ),
         (
             "a rust-clippy rust-cache `if:` naming a pull-request-only leg in another case",
+            clippy_writer,
             "rust-clippy",
-            clippy_workspace,
+            clippy_examples,
             "if",
             "MATRIX.LEG == 'packages-network'",
             "only from matrix leg",
         ),
         (
-            "a push exclusion on rust-clippy's workspace rust-cache `if:`",
+            "a push exclusion on rust-clippy's examples rust-cache `if:`",
+            doc,
             "rust-clippy",
-            clippy_workspace,
+            clippy_examples,
             "if",
-            f"matrix.leg == 'workspace' && {no_push}",
+            f"matrix.leg == 'examples' && {no_push}",
             "no push to `main` meets",
         ),
         (
             "a merge_group-only rust-test rust-cache `save-if`",
+            test_writer,
             "rust-test",
             test_cache,
             "save-if",
@@ -8798,6 +8990,7 @@ def check_push_writer_mutants(doc: dict) -> None:
         ),
         (
             "a push exclusion on pyo3-module's cache save `if:`",
+            doc,
             "pyo3-module",
             pyo3_save,
             "if",
@@ -8806,30 +8999,34 @@ def check_push_writer_mutants(doc: dict) -> None:
         ),
         (
             "a writing step condition that contradicts itself on one operand pair",
+            doc,
             "rust-clippy",
-            clippy_workspace,
+            clippy_examples,
             "if",
-            "matrix.leg == 'workspace' && matrix.leg != 'workspace'",
+            "matrix.leg == 'examples' && matrix.leg != 'examples'",
             "no push to `main` meets",
         ),
         (
             "a writing step `if:` outside the grammar",
+            doc,
             "rust-clippy",
-            clippy_workspace,
+            clippy_examples,
             "if",
-            "matrix.leg == 'workspace' && !cancelled()",
+            "matrix.leg == 'examples' && !cancelled()",
             "this check cannot read",
         ),
         (
             "a writing step `if:` that admits push alongside other events",
+            doc,
             "rust-clippy",
-            clippy_workspace,
+            clippy_examples,
             "if",
-            f"matrix.leg == 'workspace' && ({no_push} || github.ref == 'refs/heads/main')",
+            f"matrix.leg == 'examples' && ({no_push} || github.ref == 'refs/heads/main')",
             None,
         ),
         (
             "a rust-cache `save-if` naming a leg and the main ref",
+            test_writer,
             "rust-test",
             test_cache,
             "save-if",
@@ -8837,7 +9034,7 @@ def check_push_writer_mutants(doc: dict) -> None:
             None,
         ),
     ):
-        changed = copy.deepcopy(doc)
+        changed = copy.deepcopy(base)
         step = locate(changed["jobs"][job_id])
         if field == "if":
             step["if"] = text
@@ -8877,7 +9074,7 @@ def check_push_writer_mutants(doc: dict) -> None:
             "rust-test's matrix `leg` runs ['all', 'extra'] on push",
         ),
     ):
-        changed = copy.deepcopy(doc)
+        changed = copy.deepcopy(test_writer)
         strategy = changed["jobs"]["rust-test"]["strategy"]
         if key is None:
             strategy["matrix"] = value
@@ -8886,7 +9083,7 @@ def check_push_writer_mutants(doc: dict) -> None:
         gaps = push_writer_gaps(changed)
         check(f"{label} is reported", any(reported in gap for gap in gaps), f"{gaps}")
 
-    # rust-test-macos's push-only `all` leg is allowed because every step it runs
+    # The rebuilt rust-test-macos's push-only `all` leg is allowed because every step it runs
     # is one a pull-request leg runs. A push-only leg that runs a step no
     # pull-request leg runs, whatever its `run:` line starts with or when it is a
     # `uses:` or `env:` difference, or that runs no command, is reported.
@@ -9018,7 +9215,7 @@ def check_push_writer_mutants(doc: dict) -> None:
             ],
         ),
     ):
-        changed = copy.deepcopy(doc)
+        changed = copy.deepcopy(macos_writer)
         mutate(changed["jobs"]["rust-test-macos"])
         gaps = push_writer_gaps(changed)
         check(
@@ -9033,8 +9230,9 @@ def check_push_writer_mutants(doc: dict) -> None:
     # hands each leg its own value, which a step every leg runs reads with text
     # that is the same on every leg: a job `env:` a step's shell reads, or a
     # `defaults:` working directory a step's relative path resolves under. Both
-    # jobs with a push-only leg report it; the same keys holding no matrix value
-    # report nothing.
+    # rebuilt jobs with a push-only leg report it; the same keys holding no matrix
+    # value report nothing.
+    leg_writers = {"rust-test-macos": macos_writer, "rust-clippy": clippy_writer}
     for job_id in ("rust-test-macos", "rust-clippy"):
         for label, key, item, run, reported in (
             (
@@ -9059,7 +9257,7 @@ def check_push_writer_mutants(doc: dict) -> None:
                 False,
             ),
         ):
-            changed = copy.deepcopy(doc)
+            changed = copy.deepcopy(leg_writers[job_id])
             job = changed["jobs"][job_id]
             job[key] = item
             job["steps"].append({"run": run})
@@ -9090,7 +9288,7 @@ def check_push_writer_mutants(doc: dict) -> None:
         f"{push_writer_gaps(doc)}",
     )
     for job_id in ("rust-test-macos", "rust-clippy"):
-        unrelated = copy.deepcopy(doc)
+        unrelated = copy.deepcopy(leg_writers[job_id])
         unrelated["jobs"][job_id]["steps"].append(
             {"run": "cargo test -p scp-transport ${{ github.sha }}"}
         )
