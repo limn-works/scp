@@ -30,17 +30,20 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-fn repo_root() -> Result<PathBuf, String> {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+/// The repository root, two levels above this crate's manifest. A path outside
+/// this crate is formed only as `workspace_root().join` of a literal or of a
+/// `const` bound to one, the form scripts/tests/ci-gate/ci_gate_selftest.py
+/// reads to route a change to it to this test.
+fn workspace_root() -> Result<PathBuf, String> {
+    Ok(Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
         .nth(2)
-        .map(Path::to_path_buf)
-        .ok_or_else(|| "scp-testing sits less than two levels below a root".to_owned())
+        .ok_or("scp-testing sits at crates/scp-testing")?
+        .to_path_buf())
 }
 
-fn read(relative: &str) -> Result<String, String> {
-    let path = repo_root()?.join(relative);
-    std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))
+fn read(path: &Path) -> Result<String, String> {
+    std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))
 }
 
 /// Returns the error message of `result`, or an error naming `what` when it
@@ -366,12 +369,32 @@ type Sdk<'a> = (&'a str, String, &'a Shape, fn(&NameEnum) -> &'static str);
 
 #[test]
 fn every_sdk_names_exactly_the_rust_governance_names() -> Result<(), String> {
-    let rust_src = read(RUST_FILE)?;
+    let rust_src = read(&workspace_root()?.join(RUST_FILE))?;
     let sdks: [Sdk<'_>; 4] = [
-        ("Python", read(PYTHON_FILE)?, &PYTHON, |e| e.python_class),
-        ("Swift", read(SWIFT_FILE)?, &SWIFT, |e| e.swift_enum),
-        ("Kotlin", read(KOTLIN_FILE)?, &KOTLIN, |e| e.kotlin_enum),
-        ("TypeScript", read(TS_FILE)?, &TS, |e| e.ts_const),
+        (
+            "Python",
+            read(&workspace_root()?.join(PYTHON_FILE))?,
+            &PYTHON,
+            |e| e.python_class,
+        ),
+        (
+            "Swift",
+            read(&workspace_root()?.join(SWIFT_FILE))?,
+            &SWIFT,
+            |e| e.swift_enum,
+        ),
+        (
+            "Kotlin",
+            read(&workspace_root()?.join(KOTLIN_FILE))?,
+            &KOTLIN,
+            |e| e.kotlin_enum,
+        ),
+        (
+            "TypeScript",
+            read(&workspace_root()?.join(TS_FILE))?,
+            &TS,
+            |e| e.ts_const,
+        ),
     ];
     for e in &ENUMS {
         let rust = as_set(&rust_names(&rust_src, e.rust_fn)?, e.rust_fn);
@@ -393,14 +416,32 @@ fn every_sdk_names_exactly_the_rust_governance_names() -> Result<(), String> {
 
 #[test]
 fn every_sdk_member_role_names_exactly_the_reserved_role_names() -> Result<(), String> {
-    let rust = rust_const_names(&read(ROLES_FILE)?, "RESERVED_ROLE_NAMES")?;
+    let rust = rust_const_names(
+        &read(&workspace_root()?.join(ROLES_FILE))?,
+        "RESERVED_ROLE_NAMES",
+    )?;
     let rust = as_set(&rust, "RESERVED_ROLE_NAMES");
     // Each SDK spells a built-in role in its own case; its parser matches the
     // lowercase form, which is the form `RESERVED_ROLE_NAMES` holds.
     let sdks: [(&str, String, &Shape, &str); 3] = [
-        ("Python", read(PYTHON_ROLE_FILE)?, &PYTHON, "MemberRole"),
-        ("Swift", read(SWIFT_FILE)?, &SWIFT_ROLE, "MemberRole"),
-        ("TypeScript", read(TS_FILE)?, &TS, "BUILT_IN_ROLES"),
+        (
+            "Python",
+            read(&workspace_root()?.join(PYTHON_ROLE_FILE))?,
+            &PYTHON,
+            "MemberRole",
+        ),
+        (
+            "Swift",
+            read(&workspace_root()?.join(SWIFT_FILE))?,
+            &SWIFT_ROLE,
+            "MemberRole",
+        ),
+        (
+            "TypeScript",
+            read(&workspace_root()?.join(TS_FILE))?,
+            &TS,
+            "BUILT_IN_ROLES",
+        ),
     ];
     for (sdk, src, shape, decl) in &sdks {
         let label = format!("{sdk} `{decl}`");
@@ -423,7 +464,10 @@ fn every_sdk_member_role_names_exactly_the_reserved_role_names() -> Result<(), S
 #[test]
 fn rust_extraction_reads_the_reserved_role_names() -> Result<(), String> {
     // A positive control for the const extraction.
-    let names = rust_const_names(&read(ROLES_FILE)?, "RESERVED_ROLE_NAMES")?;
+    let names = rust_const_names(
+        &read(&workspace_root()?.join(ROLES_FILE))?,
+        "RESERVED_ROLE_NAMES",
+    )?;
     assert_eq!(
         names,
         [
@@ -454,7 +498,10 @@ fn rust_extraction_reads_the_reserved_role_names() -> Result<(), String> {
 #[test]
 fn rust_extraction_reads_the_shipped_names() -> Result<(), String> {
     // The shipped function list; a positive control for the syn extraction.
-    let names = rust_names(&read(RUST_FILE)?, "proposal_status_name")?;
+    let names = rust_names(
+        &read(&workspace_root()?.join(RUST_FILE))?,
+        "proposal_status_name",
+    )?;
     assert_eq!(
         names,
         [

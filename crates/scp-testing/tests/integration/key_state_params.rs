@@ -752,12 +752,25 @@ fn parse(rel: &str, src: &str) -> (String, syn::File) {
     (rel.to_owned(), file)
 }
 
+/// The repository root. A path outside this crate is formed only as
+/// `workspace_root().join` of a literal, the form
+/// scripts/tests/ci-gate/ci_gate_selftest.py reads to route a change to it to
+/// this test.
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
         .nth(2)
         .expect("scp-testing sits at crates/scp-testing")
         .to_path_buf()
+}
+
+/// The file at workspace-relative `rel`, which names a path under `crates/`:
+/// this gate reads Rust sources and nothing outside the workspace's crates.
+fn crate_path(rel: &str) -> PathBuf {
+    let under = rel
+        .strip_prefix("crates/")
+        .unwrap_or_else(|| panic!("{rel} lies outside crates/, which this gate does not read"));
+    workspace_root().join("crates").join(under)
 }
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -774,9 +787,12 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// Every `src` directory under `crates/*/` and `crates/scp-ffi/*/`.
-fn source_roots(root: &Path) -> Vec<PathBuf> {
+fn source_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
-    for parent in [root.join("crates"), root.join("crates/scp-ffi")] {
+    for parent in [
+        workspace_root().join("crates"),
+        workspace_root().join("crates/scp-ffi"),
+    ] {
         let entries = std::fs::read_dir(&parent)
             .unwrap_or_else(|e| panic!("{} is not readable: {e}", parent.display()));
         for entry in entries {
@@ -790,8 +806,8 @@ fn source_roots(root: &Path) -> Vec<PathBuf> {
     roots
 }
 
-fn read_parse(root: &Path, rel: &str) -> (String, syn::File) {
-    let src = std::fs::read_to_string(root.join(rel))
+fn read_parse(rel: &str) -> (String, syn::File) {
+    let src = std::fs::read_to_string(crate_path(rel))
         .unwrap_or_else(|e| panic!("{rel} is not readable: {e}"));
     let file = syn::parse_file(&src).unwrap_or_else(|e| panic!("{rel} does not parse: {e}"));
     (rel.to_owned(), file)
@@ -801,27 +817,26 @@ fn read_parse(root: &Path, rel: &str) -> (String, syn::File) {
 /// declaration reaches outside them (through `#[path]`, or as a child of such
 /// a file), read until no declaration reaches an unread file on disk.
 fn workspace_files() -> Vec<(String, syn::File)> {
-    let root = workspace_root();
     let mut paths = Vec::new();
-    for src in source_roots(&root) {
+    for src in source_roots() {
         rust_files(&src, &mut paths);
     }
     let mut files: Vec<_> = paths
         .iter()
         .map(|p| {
             let rel = p
-                .strip_prefix(&root)
+                .strip_prefix(workspace_root())
                 .expect("source sits under the workspace root")
                 .to_string_lossy()
                 .replace('\\', "/");
-            read_parse(&root, &rel)
+            read_parse(&rel)
         })
         .collect();
     loop {
         let mut reached: Vec<String> = loads(&files)
             .into_iter()
             .filter(|l| l.target.is_none())
-            .filter_map(|l| l.candidates.into_iter().find(|c| root.join(c).is_file()))
+            .filter_map(|l| l.candidates.into_iter().find(|c| crate_path(c).is_file()))
             .collect();
         reached.sort();
         reached.dedup();
@@ -829,7 +844,7 @@ fn workspace_files() -> Vec<(String, syn::File)> {
             files.sort_by(|a, b| a.0.cmp(&b.0));
             return files;
         }
-        files.extend(reached.iter().map(|r| read_parse(&root, r)));
+        files.extend(reached.iter().map(|r| read_parse(r)));
     }
 }
 
@@ -1126,7 +1141,7 @@ fn assert_fixtures() {
 }
 
 fn real(rel: &str) -> (String, syn::File) {
-    read_parse(&workspace_root(), rel)
+    read_parse(rel)
 }
 
 fn entry(path: &str, item: &str) -> usize {

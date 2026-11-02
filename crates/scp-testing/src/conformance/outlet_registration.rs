@@ -62,7 +62,7 @@
     clippy::missing_panics_doc
 )]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ed25519_dalek::{Signer, SigningKey};
 use scp_core::context::outlets::registry::{
@@ -133,18 +133,22 @@ pub struct OutletRegistrationVectorFile {
     pub v1_rejection_corpus: Vec<V1RejectionEntry>,
 }
 
+/// The repository root, two levels above this crate's manifest. A path outside
+/// this crate is formed only as `workspace_root().join` of a literal, the form
+/// scripts/tests/ci-gate/ci_gate_selftest.py reads to route a change to it to
+/// the tests that read it.
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("scp-testing sits at crates/scp-testing")
+        .to_path_buf()
+}
+
 /// Workspace-root path to the canonical V2 vectors JSON.
 #[must_use]
 pub fn vectors_path() -> PathBuf {
-    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    // crates/scp-testing → workspace root: pop twice.
-    p.pop();
-    p.pop();
-    p.push("tests");
-    p.push("conformance");
-    p.push("vectors");
-    p.push("outlet_registration_v2.json");
-    p
+    workspace_root().join("tests/conformance/vectors/outlet_registration_v2.json")
 }
 
 /// Returns the reference signing key (RFC 8032 §7.1 Test Vector 1).

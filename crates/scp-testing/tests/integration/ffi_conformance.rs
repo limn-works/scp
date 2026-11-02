@@ -991,10 +991,9 @@ fn cited_tokens(text: &str, prefix: &str) -> Vec<String> {
 /// anywhere in the corpus. This turns the exemption gate from "cites something
 /// ADR-/SCP-shaped" into "cites a REAL artifact": a fabricated `ADR-999` /
 /// `SCP-9999` no longer satisfies the gate.
-fn prefixed_tokens_under(rel_dir: &str, prefix: &str) -> BTreeSet<String> {
-    let dir = workspace_root().join(rel_dir);
+fn prefixed_tokens_under(dir: &Path, prefix: &str) -> BTreeSet<String> {
     let entries =
-        std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()));
+        std::fs::read_dir(dir).unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()));
     let mut set = BTreeSet::new();
     for entry in entries {
         let path = entry.expect("doc dir entry").path();
@@ -1015,13 +1014,13 @@ fn prefixed_tokens_under(rel_dir: &str, prefix: &str) -> BTreeSet<String> {
 /// `ADR-NNN` tokens that exist under `.docs/adrs/`.
 fn adrs_in_repo() -> &'static BTreeSet<String> {
     static CELL: OnceLock<BTreeSet<String>> = OnceLock::new();
-    CELL.get_or_init(|| prefixed_tokens_under(".docs/adrs", "ADR-"))
+    CELL.get_or_init(|| prefixed_tokens_under(&workspace_root().join(".docs/adrs"), "ADR-"))
 }
 
 /// `SCP-NNN` PRD-story tokens that exist under `.docs/prds/`.
 fn scp_stories_in_repo() -> &'static BTreeSet<String> {
     static CELL: OnceLock<BTreeSet<String>> = OnceLock::new();
-    CELL.get_or_init(|| prefixed_tokens_under(".docs/prds", "SCP-"))
+    CELL.get_or_init(|| prefixed_tokens_under(&workspace_root().join(".docs/prds"), "SCP-"))
 }
 
 /// Every per-bridge exemption MUST justify itself by citing a durable
@@ -2181,14 +2180,15 @@ fn collect_rs_files(root: &Path, out: &mut Vec<PathBuf>) {
 
 /// Returns the workspace root computed from `CARGO_MANIFEST_DIR`.
 /// `scp-testing`'s manifest lives at `<workspace>/crates/scp-testing`, so the
-/// workspace root is two parents up. This is the same convention used by the
-/// other crate-root path computations in the SCP codebase.
+/// workspace root is two levels up. A path outside this crate is formed only as
+/// `workspace_root().join` of a literal, the form
+/// scripts/tests/ci-gate/ci_gate_selftest.py reads to route a change to it to
+/// this test.
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
+        .ancestors()
+        .nth(2)
+        .expect("scp-testing sits at crates/scp-testing")
         .to_path_buf()
 }
 
@@ -2199,11 +2199,10 @@ fn workspace_root() -> PathBuf {
 /// (trait impls for cross-bridge composability) where the §1 rule does not
 /// straightforwardly apply.
 fn ffi_bridge_roots() -> Vec<PathBuf> {
-    let root = workspace_root();
     vec![
-        root.join("crates/scp-ffi/src"),
-        root.join("crates/scp-ffi/napi/src"),
-        root.join("crates/scp-ffi/uniffi/src"),
+        workspace_root().join("crates/scp-ffi/src"),
+        workspace_root().join("crates/scp-ffi/napi/src"),
+        workspace_root().join("crates/scp-ffi/uniffi/src"),
     ]
 }
 
@@ -2375,7 +2374,6 @@ struct PureHelperViolation {
 /// non-receiver signature parts, or generics. These are pure helpers
 /// wrongly bound to an instance — ADR-048 §1 mandates they be free fns.
 fn scan_pure_helpers() -> Vec<PureHelperViolation> {
-    let workspace = workspace_root();
     let allowlist = load_pure_helpers_allowlist();
     let mut violations = Vec::new();
 
@@ -2395,7 +2393,7 @@ fn scan_pure_helpers() -> Vec<PureHelperViolation> {
                 ),
             };
             let rel = file_path
-                .strip_prefix(&workspace)
+                .strip_prefix(workspace_root())
                 .unwrap_or(&file_path)
                 .to_string_lossy()
                 .replace('\\', "/");
@@ -2801,11 +2799,10 @@ fn ffi_export_allowlist() -> &'static FfiExportAllowlistFile {
 /// and the closure that selects that bridge's Rust names from an alias op.
 /// Order mirrors `ffi_bridge_roots()`.
 fn bridge_export_targets() -> Vec<(&'static str, PathBuf)> {
-    let root = workspace_root();
     vec![
-        ("pyo3", root.join("crates/scp-ffi/src")),
-        ("uniffi", root.join("crates/scp-ffi/uniffi/src")),
-        ("napi", root.join("crates/scp-ffi/napi/src")),
+        ("pyo3", workspace_root().join("crates/scp-ffi/src")),
+        ("uniffi", workspace_root().join("crates/scp-ffi/uniffi/src")),
+        ("napi", workspace_root().join("crates/scp-ffi/napi/src")),
     ]
 }
 
@@ -2882,7 +2879,6 @@ fn pending_keys_for(bridge: &str) -> BTreeSet<String> {
 /// that happens to share the name but lives in a different file. Keyed on the
 /// full path, an entry exempts ONLY the specific fn it was written for.
 fn exported_qualified_under(root: &Path) -> BTreeSet<String> {
-    let ws = workspace_root();
     let mut files = Vec::new();
     collect_rs_files(root, &mut files);
     let mut out = BTreeSet::new();
@@ -2891,7 +2887,7 @@ fn exported_qualified_under(root: &Path) -> BTreeSet<String> {
             continue;
         };
         let rel = path
-            .strip_prefix(&ws)
+            .strip_prefix(workspace_root())
             .unwrap_or(&path)
             .to_string_lossy()
             .replace('\\', "/");

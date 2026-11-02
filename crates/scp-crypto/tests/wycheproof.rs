@@ -9,7 +9,7 @@
 //! its declared `numberOfTests`, so a skipped case is a failure too.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use scp_crypto::p256::{
     P256Error, P256PublicKey, P256SecretKey, der_to_raw, ecdh_p256, verify_prehash_lenient,
@@ -37,9 +37,9 @@ const DER_FILE: (&str, &str) = (
 /// Reads a vendored file, checks its pinned SHA-256, and returns the parsed
 /// JSON and its declared test count.
 fn load((name, sha256): (&str, &str)) -> (Value, usize) {
-    let path: PathBuf = [env!("CARGO_MANIFEST_DIR"), "tests", "wycheproof", name]
-        .iter()
-        .collect();
+    let path: PathBuf = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/wycheproof")
+        .join(name);
     let bytes = std::fs::read(&path).unwrap();
     assert_eq!(
         hex::encode(Sha256::digest(&bytes)),

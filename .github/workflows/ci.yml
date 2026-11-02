@@ -482,8 +482,16 @@ jobs:
               - '.docs/specs/25-test-vectors.md'
               - 'bindings/python/scp_sdk/**'
               - 'bindings/typescript/src/**'
-              - 'bindings/swift/Sources/SCP/**'
-              - 'bindings/kotlin/scp-kt/src/main/kotlin/**'
+              # `crates/scp-ffi/common/tests/code_allocation.rs` walks the Swift and
+              # Kotlin SDK source trees and reads the error-code table of
+              # `.docs/standards/sdk-common.md`.
+              - 'bindings/swift/Sources/**'
+              - 'bindings/kotlin/scp-kt/src/main/**'
+              - 'bindings/kotlin/scp-kt-android/src/main/**'
+              - '.docs/standards/sdk-common.md'
+              # `crates/scp-kel/tests/kel/event_codec.rs` decodes every seed of the
+              # fuzz_kel_decode_event corpus.
+              - 'fuzz/corpus/fuzz_kel_decode_event/**'
               # `scripts/check-toolchain-wiring.sh` enumerates every root-level file in
               # the git tree, and every cargo configuration file the tree holds at any
               # depth, and fails when one is listed neither here nor in the `toolchain`

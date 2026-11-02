@@ -9041,31 +9041,150 @@ def output_patterns(doc: dict, output: str) -> set[str] | str:
     return set().union(*(filters[key] for key in keys))
 
 
-# rust_test_reads lists the files outside `crates/` that a workspace source, and so
-# rust-test, can read, by scanning every tracked
-# `crates/**/*.rs` file: the literal of
-# each `include_str!` or `include_bytes!`, resolved against that file's directory, and
-# the literal of each `workspace_root().join(...)`. It also walks the directories
-# below, which ffi_conformance.rs passes to `prefixed_tokens_under` and no literal path
-# names. An entry ends in `/` and stands for every tracked path under it.
-RUST_TEST_RUNTIME_DIRS = (".docs/adrs/", ".docs/prds/")
+# CRITERION for rust_test_reads: a path outside `crates/` is a rust-test input when a
+# `crates/**/*.rs` source names it, or names a directory above it, in one of the forms
+# rust_read_form_violations admits as the only ways a Rust source reaches outside its
+# crate: the literal of an `include_str!`, `include_bytes!` or `#[path = ...]`, resolved
+# against the source's directory, and the argument of a `workspace_root().join(...)`,
+# a string literal or a `const` bound to one in the same file, resolved against the
+# repository root. Because rust_read_form_violations rejects every other way to name a
+# path outside the crate, the scan's result is the set of paths outside `crates/` that
+# any Rust test can read. An entry that names a tracked directory ends in `/` and stands
+# for every tracked path under it. Reads inside `crates/` are dropped: the `rust` output
+# selects all of `crates/**`.
+#
+# The one input this form does not follow is a path a test computes from data and
+# joins onto a literal-rooted directory, such as key_state_params.rs joining a module's
+# `#[path]` target onto `crates/`; the read sits under that directory, which the scan
+# reports, unless the data itself climbs out of it with `..`.
 # A rust-test input that no filter routes to rust-test, mapped to the name of the
 # always-on step in job `toolchain-wiring` that asserts what rust-test asserts of it.
 RUST_TEST_MIRRORED = {"AGENTS.md": "AGENTS.md keeps its enforcement sections"}
-RUST_INCLUDE_LITERAL = re.compile(r'include_(?:str|bytes)!\(\s*"((?:[^"\\]|\\.)*)"\s*\)', re.DOTALL)
-RUST_WORKSPACE_JOIN_LITERAL = re.compile(r'workspace_root\(\)\s*\.join\(\s*"([^"]+)"\s*\)')
+RUST_INCLUDE_LITERAL = re.compile(
+    r'(?:include_(?:str|bytes)!\(\s*|#\[path\s*=\s*)"((?:[^"\\]|\\.)*)"', re.DOTALL
+)
+RUST_WORKSPACE_JOIN = re.compile(r'workspace_root\(\)\??\s*\.join\(\s*(?:"([^"]*)"|([A-Z][A-Z0-9_]*))\s*\)')
+RUST_STR_CONST = re.compile(r'const ([A-Z][A-Z0-9_]*): &(?:\'static )?str = "([^"]*)";')
+# The one admitted definition of `workspace_root`, `N` levels above the manifest
+# of the crate that holds the source, which rust_read_form_violations checks. A
+# crate whose tests deny `expect` returns the root in a `Result` instead.
+RUST_WORKSPACE_ROOT_FN = re.compile(
+    r"fn workspace_root\(\) -> (?:(?:std::path::)?PathBuf|Result<(?:std::path::)?PathBuf, \w+>) \{\s*(?:Ok\()?"
+    r'(?:std::path::)?Path::new\(env!\("CARGO_MANIFEST_DIR"\)\)\s*\.ancestors\(\)\s*\.nth\((\d+)\)\s*'
+    r'(?:\.expect\(\s*"[^"]*"\s*\)|\.ok_or\(\s*"[^"]*"\s*\)\?)\s*\.to_path_buf\(\)\s*\)?\s*\}'
+)
+# A path inside the crate: the manifest directory joined with, or concatenated to, a
+# literal. A literal that climbs with `..` is reported.
+RUST_MANIFEST_JOIN = re.compile(
+    r'(?:std::path::)?(?:Path::new|PathBuf::from)\(env!\("CARGO_MANIFEST_DIR"\)\)\s*\.join\(\s*"([^"]*)"\s*\)'
+    r'|concat!\(\s*env!\("CARGO_MANIFEST_DIR"\),\s*"(/[^"]*)"\s*\)'
+)
+RUST_STRING_LITERAL = re.compile(r'"((?:[^"\\]|\\.)*)"')
+RUST_PARENT_SEGMENT = re.compile(r"(^|/)\.\.(/|$)")
+# Locating the repository by any of these is not an admitted form.
+RUST_OTHER_ROOTS = ("CARGO_WORKSPACE_DIR", "GITHUB_WORKSPACE", "file!()")
 
 
-def rust_test_reads(sources: dict[str, str]) -> set[str]:
-    """Each path outside `crates/` that a `crates/` source names in an include or a workspace_root join."""
+def _rust_code(text: str) -> str:
+    """The source without its whole-line comments, which name paths in prose."""
+    return re.sub(r"(?m)^\s*//.*$", "", text)
+
+
+def _tracked_dirs(paths: list[str]) -> set[str]:
+    dirs = set()
+    for path in paths:
+        parent = posixpath.dirname(path)
+        while parent:
+            dirs.add(parent)
+            parent = posixpath.dirname(parent)
+    return dirs
+
+
+def rust_test_reads(sources: dict[str, str], paths: list[str] | None = None) -> set[str]:
+    """Each path outside `crates/` that a `crates/` source can read, a tracked directory ending in `/`."""
+    dirs = _tracked_dirs(paths) if paths is not None else set()
     reads = set()
-    for source, text in sources.items():
+    for source, raw in sources.items():
+        text = _rust_code(raw)
         for match in RUST_INCLUDE_LITERAL.finditer(text):
             # A backslash before a newline continues a Rust string literal past it.
             literal = re.sub(r"\\\n\s*", "", match.group(1))
             reads.add(posixpath.normpath(posixpath.join(posixpath.dirname(source), literal)))
-        reads.update(posixpath.normpath(m.group(1)) for m in RUST_WORKSPACE_JOIN_LITERAL.finditer(text))
-    return {path for path in reads if not path.startswith("crates/")}
+        consts = dict(RUST_STR_CONST.findall(text))
+        for match in RUST_WORKSPACE_JOIN.finditer(text):
+            literal = match.group(1) if match.group(1) is not None else consts.get(match.group(2))
+            if literal is not None:
+                reads.add(posixpath.normpath(literal))
+    return {
+        f"{path}/" if path in dirs else path
+        for path in reads
+        if not f"{path}/".startswith("crates/")
+    }
+
+
+def rust_read_form_violations(sources: dict[str, str], paths: list[str]) -> list[str]:
+    """Each place a `crates/` source reaches outside its crate in a form rust_test_reads does not read.
+
+    Admitted: an include or `#[path]` literal; the one `workspace_root` definition, at
+    the depth of the source's crate; `workspace_root()` followed by `.join` of a
+    literal or of a `const` bound to one, or passed to `strip_prefix`; and the manifest
+    directory joined with or concatenated to a literal that does not climb with `..`.
+    Reported: any other `CARGO_MANIFEST_DIR`, any other `workspace_root()` or
+    `workspace_root` definition, a repository root found another way, and a string
+    literal that climbs with `..` to a tracked path outside `crates/` from the crate's
+    directory, where a test runs, or from the source's own directory.
+    """
+    tracked = set(paths)
+    dirs = _tracked_dirs(paths)
+    manifests = sorted(
+        (posixpath.dirname(p) for p in paths if p.startswith("crates/") and p.endswith("/Cargo.toml")),
+        key=len,
+        reverse=True,
+    )
+    found = []
+    for source, raw in sorted(sources.items()):
+        crate = next((m for m in manifests if source.startswith(f"{m}/")), None)
+        if crate is None:
+            found.append(f"{source}: no Cargo.toml above it under crates/")
+            continue
+        text = _rust_code(raw)
+        depth = crate.count("/") + 1
+        for match in RUST_WORKSPACE_ROOT_FN.finditer(text):
+            if int(match.group(1)) != depth:
+                found.append(f"{source}: workspace_root climbs {match.group(1)} levels from a crate {depth} deep")
+        rest = RUST_WORKSPACE_ROOT_FN.sub("", text)
+        for match in RUST_MANIFEST_JOIN.finditer(rest):
+            literal = match.group(1) if match.group(1) is not None else match.group(2)
+            if RUST_PARENT_SEGMENT.search(literal):
+                found.append(f"{source}: CARGO_MANIFEST_DIR joined with {literal!r}")
+        rest = RUST_MANIFEST_JOIN.sub("", rest)
+        if "CARGO_MANIFEST_DIR" in rest:
+            found.append(f"{source}: CARGO_MANIFEST_DIR outside workspace_root and a literal join")
+        if "fn workspace_root" in rest:
+            found.append(f"{source}: a workspace_root other than the one admitted definition")
+        consts = dict(RUST_STR_CONST.findall(text))
+        for match in RUST_WORKSPACE_JOIN.finditer(rest):
+            if match.group(2) is not None and match.group(2) not in consts:
+                found.append(f"{source}: workspace_root().join({match.group(2)}), no const bound to a literal")
+        loose = re.sub(r"strip_prefix\(\s*&?workspace_root\(\)\??\s*\)", "", RUST_WORKSPACE_JOIN.sub("", rest))
+        if "workspace_root()" in loose:
+            found.append(f"{source}: workspace_root() not followed by .join of a literal")
+        for name in RUST_OTHER_ROOTS:
+            if name in text:
+                found.append(f"{source}: locates the repository through {name}")
+        literals = RUST_INCLUDE_LITERAL.sub("", text)
+        for match in RUST_STRING_LITERAL.finditer(literals):
+            literal = match.group(1)
+            if not RUST_PARENT_SEGMENT.search(literal):
+                continue
+            for base in (crate, posixpath.dirname(source)):
+                target = posixpath.normpath(posixpath.join(base, literal))
+                if target.startswith("..") or f"{target}/".startswith("crates/"):
+                    continue
+                if target in tracked or target in dirs or target == ".":
+                    found.append(f"{source}: literal {literal!r} reaches {target} from {base}")
+                    break
+    return found
 
 
 def crate_sources(paths: list[str]) -> dict[str, str]:
@@ -9082,9 +9201,8 @@ def rust_test_inputs_unselected(doc: dict, paths: list[str], reads: set[str]) ->
     patterns = output_patterns(doc, "rust")
     if isinstance(patterns, str):
         return [patterns]
-    inputs = [
-        path for path in paths if path in reads or any(path.startswith(entry) for entry in RUST_TEST_RUNTIME_DIRS)
-    ]
+    under = tuple(entry for entry in reads if entry.endswith("/"))
+    inputs = [path for path in paths if path in reads or path.startswith(under)]
     return [path for path in inputs if path not in RUST_TEST_MIRRORED and not pattern_covers(patterns, path)]
 
 
@@ -9140,34 +9258,86 @@ def check_every_path_routed(doc: dict) -> None:
         ".docs/migration/phase-4.md" in unrouted_paths(mutant, paths),
     )
     sources = crate_sources(paths)
-    reads = rust_test_reads(sources)
+    reads = rust_test_reads(sources, paths)
     # Controls for the scan: a read on one line, a read whose literal continues past a
-    # backslash-newline, a workspace_root join, and a read of a prose file are each found.
+    # backslash-newline, a workspace_root join of a literal and of a const, a read of a
+    # prose file, and a directory each test walks are each found.
     for known in (
         "bindings/python/scp_sdk/identity.py",
         "scripts/tests/bridge-symmetry/fixtures/bad-alias-in-test-module-only/crates/scp-ffi/napi/src/widgets.rs",
         "scripts/pure-helpers-allowlist.txt",
+        "bindings/python/scp_sdk/governance.py",
         "AGENTS.md",
+        ".docs/standards/sdk-common.md",
+        ".docs/adrs/",
+        ".docs/prds/",
+        "bindings/kotlin/scp-kt-android/src/main/",
+        "fuzz/corpus/fuzz_kel_decode_event/",
     ):
         check(f"the include and workspace_root scan finds rust-test input {known}", known in reads)
-    missing = sorted(reads - set(paths))
+    missing = sorted(
+        entry for entry in reads if entry not in set(paths) and not any(p.startswith(entry) for p in paths)
+    )
     check("every path the scan resolves is tracked", not missing, f"{missing[:10]}")
     planted = {
         "crates/a/tests/t.rs": 'include_bytes!(\n    "../../../new/\\\n     x.bin"\n); include_str!("../src/y.rs");',
-        "crates/b/src/lib.rs": 'workspace_root().join("new/z.txt")',
+        "crates/b/src/lib.rs": 'workspace_root().join("new/z.txt")\nconst F: &str = "new/c.txt";\nworkspace_root().join(F)',
+        "crates/b/src/m.rs": '#[path = "../../../new/m.rs"]\nmod m;\n// workspace_root().join("new/comment.txt")',
     }
     check(
-        "the scan resolves planted reads and drops a read inside crates/",
-        rust_test_reads(planted) == {"new/x.bin", "new/z.txt"},
+        "the scan resolves planted reads and drops a read inside crates/ and one in a comment",
+        rust_test_reads(planted) == {"new/x.bin", "new/z.txt", "new/c.txt", "new/m.rs"},
         f"{rust_test_reads(planted)}",
     )
-    conformance = sources.get("crates/scp-testing/tests/integration/ffi_conformance.rs", "")
-    for entry in RUST_TEST_RUNTIME_DIRS:
-        check(f"the checkout tracks rust-test input {entry}", any(p.startswith(entry) for p in paths))
-        check(
-            f"ffi_conformance.rs walks {entry} through prefixed_tokens_under",
-            f'prefixed_tokens_under("{entry.rstrip("/")}"' in conformance,
-        )
+    violations = rust_read_form_violations(sources, paths)
+    check(
+        "every crates/ source reaches outside its crate only in a form rust_test_reads reads",
+        not violations,
+        f"{violations[:10]}",
+    )
+    canonical = (
+        "fn workspace_root() -> PathBuf {\n    Path::new(env!(\"CARGO_MANIFEST_DIR\"))\n        .ancestors()\n"
+        '        .nth(2)\n        .expect("x")\n        .to_path_buf()\n}\n'
+    )
+    # Must fail: each source below reaches outside its crate in a form the scan does
+    # not read. Must pass: the admitted forms, in the last source.
+    for label, text in (
+        ("a manifest join that climbs", 'Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.docs/x.md")'),
+        ("a manifest parent", 'PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent()'),
+        ("a manifest popped", 'let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));\np.pop();'),
+        ("a workspace_root bound to a name", canonical + "let root = workspace_root();\nroot.join(x)"),
+        ("a workspace_root joined with a variable", canonical + "workspace_root().join(name)"),
+        ("a workspace_root joined with an unbound const", canonical + "workspace_root().join(NAME)"),
+        ("a workspace_root one level short", canonical.replace(".nth(2)", ".nth(1)")),
+        ("a workspace_root of another shape", 'fn workspace_root() -> PathBuf { PathBuf::from("/") }'),
+        ("a cwd-relative literal that climbs to prose", 'std::fs::read("../../AGENTS.md")'),
+        ("a source-relative literal that climbs to the root", 'let r = Path::new("../../..");'),
+        ("GITHUB_WORKSPACE", 'std::env::var("GITHUB_WORKSPACE")'),
+    ):
+        reported = rust_read_form_violations({"crates/scp-kel/tests/planted.rs": text}, paths)
+        check(f"rust_read_form_violations reports {label}", bool(reported), f"{reported}")
+    admitted = (
+        canonical
+        + 'const F: &str = "AGENTS.md";\nworkspace_root().join(F);\nworkspace_root().join(".docs/adrs");\n'
+        + "p.strip_prefix(&workspace_root());\n"
+        + 'Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/x");\n'
+        + 'include_str!("../../../AGENTS.md");\n'
+        + 'let traversal = "../../etc/passwd";\nlet sibling = "../scp-did/src";\n'
+        + '// Path::new(env!("CARGO_MANIFEST_DIR")).parent()\n'
+    )
+    fallible = (
+        "fn workspace_root() -> Result<PathBuf, Error> {\n    Ok(Path::new(env!(\"CARGO_MANIFEST_DIR\"))\n"
+        '        .ancestors()\n        .nth(2)\n        .ok_or("x")?\n        .to_path_buf())\n}\n'
+        'workspace_root()?.join("fuzz/corpus/fuzz_kel_decode_event");\n'
+    )
+    reported = rust_read_form_violations(
+        {"crates/scp-kel/tests/planted.rs": admitted, "crates/scp-kel/tests/fallible.rs": fallible}, paths
+    )
+    check("rust_read_form_violations admits the forms rust_test_reads reads", not reported, f"{reported}")
+    check(
+        "rust_test_reads follows a fallible workspace_root join",
+        rust_test_reads({"crates/scp-kel/tests/fallible.rs": fallible}) == {"fuzz/corpus/fuzz_kel_decode_event"},
+    )
     wiring_runs = {
         str(step.get("name")): str(step.get("run") or "") for step in doc["jobs"]["toolchain-wiring"].get("steps") or []
     }
@@ -9196,7 +9366,12 @@ def check_every_path_routed(doc: dict) -> None:
     filters["rust"] = [entry for entry in filters["rust"] if entry not in dropped]
     step["with"]["filters"] = yaml.safe_dump(filters)
     unselected = rust_test_inputs_unselected(mutant, paths, reads)
-    expected = [p for p in paths if p.startswith(".docs/adrs/") or (p in reads and p.startswith("bindings/python/"))]
+    under = tuple(entry for entry in reads if entry.endswith("/"))
+    expected = [
+        p
+        for p in paths
+        if p.startswith(".docs/adrs/") or ((p in reads or p.startswith(under)) and p.startswith("bindings/python/"))
+    ]
     check(
         f"a `rust` filter that drops {dropped} reports every ADR file and every Python SDK file rust-test reads",
         bool(unselected) and unselected == expected,
