@@ -39,8 +39,10 @@ directory holding only the pinned, checked pip and certifi wheels.
 maturin goes where PyO3/maturin-action looks before it downloads: installMaturin
 (src/index.ts:568-576) calls `tc.find('maturin', <version>, 'x64')` and uses a hit, so
 the binary is unpacked to $RUNNER_TOOL_CACHE/maturin/<version>/x64 with the
-`x64.complete` marker tc.find requires, and every maturin-action step passes the same
-version as `maturin-version`.
+`x64.complete` marker tc.find requires (maturin-action passes `x64` on every CPU), and
+every maturin-action step passes the same version as `maturin-version`. Job
+python-wheels-linux in build-matrix.yml runs no maturin-action; it mounts the binary from
+that directory into its manylinux container.
 """
 
 from __future__ import annotations
@@ -102,6 +104,14 @@ PINS: dict[tuple[str, str, str], Archive] = {
         MATURIN_URL + "maturin-x86_64-unknown-linux-musl.tar.gz",
         10440643,
         "804add817bf3b8a3760324ace2e2c39c345f7a99b3ace1296aeed1abc3a1d8c4",
+        ("maturin",),
+    ),
+    # build-matrix.yml job python-wheels-linux mounts this static binary into the
+    # manylinux image of an arm64 runner.
+    ("maturin", "Linux", "ARM64"): Archive(
+        MATURIN_URL + "maturin-aarch64-unknown-linux-musl.tar.gz",
+        9863420,
+        "7b7321340805f90d65f138ba8831c789b706086153f1cfb97d915c5ac6ad6c4d",
         ("maturin",),
     ),
     ("maturin", "macOS", "ARM64"): Archive(

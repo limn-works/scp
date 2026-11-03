@@ -407,8 +407,10 @@ nothing:
                android-emulator-runner, setup-bun, setup-nasm), uses
                setup-python, setup-node or setup-java outside
                .github/actions/toolcache-setup's guard.py steps, uses
-               maturin-action without the maturin pinned-tool installs or in
-               a manylinux container outside MATURIN_CONTAINER_BUILDS,
+               maturin-action without the maturin pinned-tool installs,
+               builds with maturin-action without `container: off`, runs or
+               pulls a container image (docker run, pull or create, a `docker://`
+               step, a job container or a service) not named by digest,
                installs a package with sdkmanager, or fetches with curl or
                wget and runs no digest command; .github/actions/android-sdk
                and .github/actions/pinned-tool are the checked paths. Every
@@ -11563,9 +11565,16 @@ VERIFIED_DOWNLOAD_LIB = REPO / ".github/actions/lib"
 #   PyO3/maturin-action          downloads maturin unchecked unless the tool cache holds
 #                                `maturin-version` (src/index.ts:550-583 at v1), so a
 #                                step must name the version pinned-tool installs, after
-#                                a pinned-tool maturin step. In a manylinux container it
+#                                a pinned-tool maturin step. On a Linux runner a build or
+#                                publish runs in Docker unless `container` is `off`
+#                                (src/index.ts:1264-1295), and the script it runs there
 #                                downloads maturin, rustup and uv unchecked whatever the
-#                                cache holds (src/index.ts:711-725).
+#                                cache holds (src/index.ts:711-725), so every build or
+#                                publish step must pass `container: off`.
+#   container images             `docker run`, `pull` and `create`, a `docker://` step, a
+#                                job `container:` and a `services:` entry each pull an
+#                                image; Docker checks what it pulls only against a digest
+#                                the reference names, so each must name `@sha256:`.
 #   sdkmanager with a package    sdkmanager unpacks what it downloaded: jobs
 #                                118835960956 (NDK) and 125594057792 (emulator) died
 #                                on corrupt archives.
@@ -11589,12 +11598,14 @@ TOOLCACHE_ACTIONS = (
     "actions/setup-java@",
 )
 MATURIN_ACTION = "PyO3/maturin-action@"
-# Jobs whose maturin-action step builds in a manylinux container, where maturin-action's
-# own script downloads maturin (src/index.ts:722, `curl -L ${url} | tar -xz`), rustup
-# (src/index.ts:711) and uv (src/index.ts:725) with no check. Checking them means running
-# the manylinux build without maturin-action. Listed so the gap stays visible; a job
-# missing from this set fails the check.
-MATURIN_CONTAINER_BUILDS = {"build-matrix.yml:python-wheels"}
+# maturin-action commands that may start Docker (src/index.ts:1266).
+MATURIN_DOCKER_COMMANDS = {"build", "publish"}
+# `docker <...>` subcommands that pull the image they name when it is absent.
+DOCKER_PULLING_COMMANDS = (["run"], ["pull"], ["create"], ["container", "run"],
+                           ["container", "create"], ["image", "pull"])
+PINNED_IMAGE = re.compile(r"@sha256:[0-9a-f]{64}$")
+SHELL_VARIABLE = re.compile(r"^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$")
+MATRIX_EXPRESSION = re.compile(r"^\$\{\{\s*matrix\.([\w-]+)\s*\}\}$")
 GRADLE_WRAPPER_VALIDATORS = (
     "gradle/actions/setup-gradle@",
     "gradle/actions/wrapper-validation@",
@@ -11637,7 +11648,9 @@ def script_commands(script: str) -> list[tuple[str, list[str]]]:
         if words is None:
             words = [
                 (word, line.split())
-                for word in sorted(FETCH_COMMANDS | DIGEST_COMMANDS | {"sdkmanager"})
+                for word in sorted(
+                    FETCH_COMMANDS | DIGEST_COMMANDS | {"sdkmanager", "docker"}
+                )
                 if re.search(rf"(?<![\w/.-]){word}\b", line)
             ]
         for word, rest in words:
@@ -11694,19 +11707,88 @@ def maturin_gaps(where: str, label: str, step: dict, earlier: list) -> list[str]
             f"{label} runs with no earlier {PINNED_TOOL_ACTION} step installing maturin, "
             "so maturin-action downloads maturin unchecked"
         )
-    if (
-        str(inputs.get("manylinux", "off")) not in ("", "off")
-        and where not in MATURIN_CONTAINER_BUILDS
-    ):
+    command = str(inputs.get("command") or "build")
+    if command in MATURIN_DOCKER_COMMANDS and str(inputs.get("container")) != "off":
         gaps.append(
-            f"{label} builds in a manylinux container, where maturin-action downloads "
-            "maturin, rustup and uv unchecked"
+            f"{label} runs `maturin {command}` without `container: off`, so on a Linux "
+            "runner maturin-action builds in Docker, where it downloads maturin, rustup "
+            "and uv unchecked"
         )
     return gaps
 
 
-def unverified_download_gaps(where: str, steps: object) -> list[str]:
-    """Return each step under `where` that fetches an archive and checks nothing."""
+def matrix_values(job: dict | None, key: str) -> list[str]:
+    """Every value a job's matrix gives `key`, from its axis and its `include` entries."""
+    matrix = ((job or {}).get("strategy") or {}).get("matrix") or {}
+    if not isinstance(matrix, dict):
+        return []
+    values = [str(v) for v in matrix.get(key) or []] if isinstance(matrix.get(key), list) else []
+    for entry in matrix.get("include") or []:
+        if isinstance(entry, dict) and key in entry:
+            values.append(str(entry[key]))
+    return values
+
+
+def image_values(reference: str, step: dict | None, job: dict | None) -> list[str]:
+    """What an image reference can expand to.
+
+    A `$NAME` or `${NAME}` reads the step's, then the job's, `env:`; a
+    `${{ matrix.KEY }}` reads every matrix value of KEY. Anything else is literal, so
+    a reference this cannot resolve is read as unpinned.
+    """
+    reference = reference.strip().strip("\"'")
+    variable = SHELL_VARIABLE.match(reference)
+    if variable:
+        env = {**((job or {}).get("env") or {}), **((step or {}).get("env") or {})}
+        if variable.group(1) not in env:
+            return [reference]
+        reference = str(env[variable.group(1)]).strip()
+    matrix = MATRIX_EXPRESSION.match(reference)
+    if matrix:
+        return matrix_values(job, matrix.group(1)) or [reference]
+    return [reference]
+
+
+def image_pinned(reference: str, step: dict | None, job: dict | None) -> bool:
+    return all(PINNED_IMAGE.search(v) for v in image_values(reference, step, job))
+
+
+def docker_pull_gaps(label: str, arguments: list[str], step: dict, job: dict | None) -> list[str]:
+    """A docker command that can pull must name some argument that resolves to a digest."""
+    if not any(arguments[: len(prefix)] == prefix for prefix in DOCKER_PULLING_COMMANDS):
+        return []
+    if any(image_pinned(argument, step, job) for argument in arguments):
+        return []
+    return [
+        (
+            f"{label} runs `docker {' '.join(arguments[:2])}` on an image not named by "
+            "digest (`@sha256:`), so Docker checks nothing it pulls"
+        )
+    ]
+
+
+def job_image_gaps(where: str, job: dict) -> list[str]:
+    """A job's `container:` and `services:` images must each be named by digest."""
+    images = []
+    container = job.get("container")
+    if container:
+        images.append(("container", container))
+    for name, service in sorted((job.get("services") or {}).items()):
+        images.append((f"service {name}", service))
+    gaps = []
+    for what, entry in images:
+        image = str(entry.get("image") if isinstance(entry, dict) else entry)
+        if not image_pinned(image, None, job):
+            gaps.append(f"{where} {what} image {image!r} is not named by digest")
+    return gaps
+
+
+def unverified_download_gaps(where: str, steps: object, job: dict | None = None) -> list[str]:
+    """Return each step under `where` that fetches an archive and checks nothing.
+
+    `job` is the workflow job the steps belong to, None for a local action; image
+    references resolve against its `env:` and matrix.
+    """
     gaps = []
     steps = steps if isinstance(steps, list) else []
     for index, step in enumerate(steps):
@@ -11731,7 +11813,12 @@ def unverified_download_gaps(where: str, steps: object) -> list[str]:
             )
         if uses.startswith(MATURIN_ACTION):
             gaps += maturin_gaps(where, label, step, steps[:index])
+        if uses.startswith("docker://") and not image_pinned(uses[9:], step, job):
+            gaps.append(f"{label} uses {uses}, an image not named by digest")
         commands = script_commands(str(step.get("run") or ""))
+        for word, rest in commands:
+            if word == "docker":
+                gaps += docker_pull_gaps(label, rest, step, job)
         if any(
             word == "sdkmanager" and sdkmanager_installs(rest)
             for word, rest in commands
@@ -11750,16 +11837,18 @@ def unverified_download_gaps(where: str, steps: object) -> list[str]:
     return gaps
 
 
-def download_step_lists(documents: list[tuple[Path, dict]]) -> list[tuple[str, object]]:
-    """Every workflow job's steps and every local composite action's steps."""
+def download_step_lists(
+    documents: list[tuple[Path, dict]],
+) -> list[tuple[str, object, dict | None]]:
+    """Every workflow job's steps, with the job, and every local composite action's steps."""
     found = []
     for path, doc in documents:
         for job_id, job in sorted((doc.get("jobs") or {}).items()):
-            found.append((f"{path.name}:{job_id}", job.get("steps")))
+            found.append((f"{path.name}:{job_id}", job.get("steps"), job))
     for action in sorted((REPO / ".github/actions").glob("*/action.y*ml")):
         doc = yaml.safe_load(action.read_text()) or {}
         found.append(
-            (str(action.relative_to(REPO)), (doc.get("runs") or {}).get("steps"))
+            (str(action.relative_to(REPO)), (doc.get("runs") or {}).get("steps"), None)
         )
     return found
 
@@ -12093,8 +12182,9 @@ def check_toolcache_guard() -> None:
 def check_verified_downloads(documents: list[tuple[Path, dict]]) -> None:
     gaps = [
         gap
-        for where, steps in download_step_lists(documents)
-        for gap in unverified_download_gaps(where, steps)
+        for where, steps, job in download_step_lists(documents)
+        for gap in unverified_download_gaps(where, steps, job)
+        + (job_image_gaps(where, job) if job else [])
     ]
     check(
         "no workflow or local action step unpacks an archive it downloaded unchecked",
@@ -12112,7 +12202,14 @@ def check_verified_downloads(documents: list[tuple[Path, dict]]) -> None:
     pinned_maturin = {"uses": PINNED_TOOL_ACTION, "with": {"tool": "maturin"}}
     maturin = {
         "uses": "PyO3/maturin-action@v1",
-        "with": {"maturin-version": pinned_maturin_version()},
+        "with": {"maturin-version": pinned_maturin_version(), "container": "off"},
+    }
+    digest = "@sha256:" + "0" * 64
+    image_job = {
+        "strategy": {"matrix": {"include": [
+            {"image": "quay.io/pypa/manylinux_2_28_x86_64" + digest},
+            {"image": "quay.io/pypa/manylinux_2_28_aarch64:latest"},
+        ]}},
     }
     planted = {
         "setup-android": [{"uses": "android-actions/setup-android@v3"}],
@@ -12131,8 +12228,32 @@ def check_verified_downloads(documents: list[tuple[Path, dict]]) -> None:
         ],
         "maturin-action in a manylinux container": [
             pinned_maturin,
-            {**maturin, "with": {**maturin["with"], "manylinux": "2_28"}},
+            {
+                **maturin,
+                "with": {"maturin-version": pinned_maturin_version(), "manylinux": "2_28"},
+            },
         ],
+        "maturin-action build without container off": [
+            pinned_maturin,
+            {**maturin, "with": {"maturin-version": pinned_maturin_version()}},
+        ],
+        "maturin-action publish in a named container": [
+            pinned_maturin,
+            {
+                **maturin,
+                "with": {
+                    **maturin["with"],
+                    "command": "publish",
+                    "container": "quay.io/pypa/manylinux_2_28_x86_64",
+                },
+            },
+        ],
+        "docker run by tag": [
+            {"run": "docker run --rm quay.io/pypa/manylinux_2_28_x86_64:latest true"}
+        ],
+        "docker pull of an unset variable": [{"run": 'docker pull "$IMAGE"'}],
+        "docker image pull by tag": [{"run": "docker image pull alpine:3"}],
+        "a docker:// step by tag": [{"uses": "docker://alpine:3"}],
         "sdkmanager": [{"run": 'sdkmanager "ndk;27.2.12479018"'}],
         "sdkmanager --install": [
             {"run": "yes | sdkmanager --install emulator --channel=0"}
@@ -12180,6 +12301,18 @@ def check_verified_downloads(documents: list[tuple[Path, dict]]) -> None:
             pinned_maturin,
             maturin,
         ],
+        "maturin-action sdist, which never starts Docker": [
+            pinned_maturin,
+            {
+                **maturin,
+                "with": {"maturin-version": pinned_maturin_version(), "command": "sdist"},
+            },
+        ],
+        "docker run of an image named by digest": [
+            {"run": f"docker run --rm -v a:/b quay.io/pypa/manylinux_2_28_x86_64{digest} true"}
+        ],
+        "docker inspect, which pulls nothing": [{"run": "docker inspect alpine:3"}],
+        "a docker:// step named by digest": [{"uses": f"docker://alpine{digest}"}],
     }
     for name, steps in controls.items():
         check(
@@ -12187,6 +12320,44 @@ def check_verified_downloads(documents: list[tuple[Path, dict]]) -> None:
             not unverified_download_gaps("control", steps),
             f"{unverified_download_gaps('control', steps)}",
         )
+    pinned_pull = {"env": {"IMAGE": "${{ matrix.image }}"}, "run": 'docker pull "$IMAGE"'}
+    check(
+        "verified-download reports docker pull of a matrix image when one matrix value "
+        "has no digest",
+        bool(unverified_download_gaps("planted", [pinned_pull], image_job)),
+        f"{pinned_pull} with {image_job} went unreported",
+    )
+    every_pinned = copy.deepcopy(image_job)
+    every_pinned["strategy"]["matrix"]["include"][1]["image"] = "alpine" + digest
+    check(
+        "verified-download does not report docker pull of a matrix image whose every "
+        "value has a digest",
+        not unverified_download_gaps("control", [pinned_pull], every_pinned),
+        f"{unverified_download_gaps('control', [pinned_pull], every_pinned)}",
+    )
+    for name, job in {
+        "a job container by tag": {"container": "node:22"},
+        "a job container mapping by tag": {"container": {"image": "node:22"}},
+        "a service by tag": {"services": {"db": {"image": "postgres:17"}}},
+        "a matrix container with one unpinned value": {
+            **image_job,
+            "container": "${{ matrix.image }}",
+        },
+    }.items():
+        check(
+            f"verified-download reports {name}",
+            bool(job_image_gaps("planted", job)),
+            f"{job} went unreported",
+        )
+    pinned_job = {
+        "container": {"image": "node" + digest},
+        "services": {"db": {"image": "postgres" + digest}},
+    }
+    check(
+        "verified-download does not report job and service images named by digest",
+        not job_image_gaps("control", pinned_job),
+        f"{job_image_gaps('control', pinned_job)}",
+    )
     check(
         "verified-download does not report setup-python between guard.py's steps in "
         "toolcache-setup",
