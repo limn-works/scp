@@ -50,11 +50,11 @@ pub use kind::{
     classify_node_record,
 };
 pub use list::{
-    MAX_NODE_LIST_VALUE_LEN, NODE_LIST_FRAME_PREFIX_LEN, NODE_LIST_FRAME_VERSION,
-    NODE_LIST_SEPARATOR, NodeListEntry, NodeListEntryError, NodeListError, NodeListFrameError,
-    NodeListKeyClass, NodeListRecord, VerifiedNodeListEntry, VerifiedNodeListRecord,
-    check_node_list_publish, decode_node_list_frame, encode_node_list_frame,
-    entries_canonical_json,
+    AdmittedNodeListEntry, AdmittedNodeListRecord, MAX_NODE_LIST_VALUE_LEN,
+    NODE_LIST_FRAME_PREFIX_LEN, NODE_LIST_FRAME_VERSION, NODE_LIST_SEPARATOR, NodeListEntry,
+    NodeListEntryError, NodeListError, NodeListFrameError, NodeListKeyClass, NodeListRecord,
+    VerifiedNodeListEntry, VerifiedNodeListRecord, check_node_list_publish, decode_node_list_frame,
+    encode_node_list_frame, entries_canonical_json,
 };
 pub use proof::{
     NODE_PROOF_FIELDS_LEN, NODE_PROOF_LEN, NODE_PROOF_SEPARATOR, NodeProof, NodeProofError,

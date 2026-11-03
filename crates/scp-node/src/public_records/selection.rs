@@ -11,14 +11,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use scp_crypto::p256::P256PublicKey;
 use scp_did::{Identifier, KeyCondition, NodeId};
-use scp_kel::{
-    AcceptedChainHolder, EntryVerdict, EventKind, RetainedChain, RoutingKind, ValidatedChain,
-    key_state_at, replay, routing_id, validate_entry,
-};
+use scp_kel::{EventKind, FrameRefusal, RetainedChain, RetainedLog, RoutingKind, routing_id};
 use scp_protocol::crypto::anchored_key::AnchoredKeyError;
 use scp_protocol::node::{
-    ConflictStatement, NodeListError, NodeListKeyClass, NodeListRecord, ServiceRecordFrame,
-    VerifiedNodeListEntry, VerifiedNodeListRecord, decode_conflict_frame, decode_key_event_frame,
+    AdmittedNodeListEntry, AdmittedNodeListRecord, ConflictStatement, NodeListError,
+    NodeListRecord, ServiceRecordFrame, decode_conflict_frame, decode_key_event_frame,
     decode_node_list_frame, decode_service_record_frame,
 };
 use scp_relay_client::code;
@@ -128,93 +125,64 @@ pub(super) async fn count_ttl(
 // scp:did:
 // ---------------------------------------------------------------------------
 
-/// The chains of one identifier the node holds, replayed from its stored
-/// key-event frames (§9.7.4.2 R9).
+/// One identifier's key-event log as the node holds it: the chains it
+/// retains under §9.7.4.2 R9, built by admitting its stored frames in the
+/// order the node admitted them, and each stored frame's event digests.
 pub(super) struct HeldLog {
-    /// The holder after every stored frame, in the order the node stored them.
-    pub(super) holder: AcceptedChainHolder,
+    /// The log after every stored frame.
+    pub(super) log: RetainedLog,
     /// Each stored frame's `blob_id` and the event digests it carries.
     pub(super) frames: Vec<([u8; 32], Vec<[u8; 32]>)>,
-    /// Every event unit the stored frames carry, in stored order.
-    pub(super) units: Vec<Vec<u8>>,
 }
 
 impl HeldLog {
-    /// Every event digest a stored frame carries.
-    pub(super) fn digests(&self) -> BTreeSet<[u8; 32]> {
-        self.frames
-            .iter()
-            .flat_map(|(_, digests)| digests.iter().copied())
-            .collect()
-    }
-
-    /// Every chain the holder holds, accepted and retained suffixes.
-    pub(super) fn chains(&self) -> Vec<ValidatedChain> {
-        self.holder.held().cloned().collect()
-    }
-
-    /// Every chain the holder retains under R9, as the store-held key state
-    /// admission and selection verify signatures under (`03-identity.md`
+    /// Every chain the log retains under R9, accepted and suffix, as the
+    /// store-held key state admission and selection read (`03-identity.md`
     /// §3.10.10, §9.10.12).
     pub(super) fn retained(&self) -> Vec<RetainedChain> {
-        self.holder.retained()
+        self.log.retained()
     }
 }
 
-/// Holds every valid chain `units` carry under `identifier`.
-///
-/// # Errors
-///
-/// `5000` where `units` carry no valid chain, which units this node admitted
-/// always do, or where the holder reaches an error, which valid chains of one
-/// identifier never do.
-pub(super) fn hold_units(
-    holder: &mut AcceptedChainHolder,
-    identifier: &Identifier,
-    units: &[&[u8]],
-) -> Result<(), PublicRecordRefusal> {
-    let EntryVerdict::Valid { chains } = validate_entry(identifier, units).verdict else {
-        return Err(PublicRecordRefusal::new(
-            code::INTERNAL_ERROR,
-            "the stored key-event log carries no valid chain",
-        ));
+/// The node's refusal of a key-event frame the log refuses (§9.10.12, the
+/// `scp:did:` row): `4040` for frame admission and a frame the retention
+/// bounds keep none of, `4044` for an event R3's check order refuses,
+/// `5000` where the R9 holder reaches an error.
+pub(super) fn frame_refusal(refusal: &FrameRefusal) -> PublicRecordRefusal {
+    let code = match refusal {
+        FrameRefusal::Empty
+        | FrameRefusal::Undecodable
+        | FrameRefusal::FirstHeld
+        | FrameRefusal::Unanchored => code::DID_RECORD_REJECTED,
+        FrameRefusal::InceptionInvalid(_) | FrameRefusal::Illegal { .. } => code::KEY_EVENT_ILLEGAL,
+        FrameRefusal::Hold(_) => code::INTERNAL_ERROR,
     };
-    for chain in chains.iter() {
-        // The outcome is not read: every selection recomputes from `held()`.
-        holder.hold(chain.clone()).map(drop).map_err(|e| {
-            PublicRecordRefusal::new(
-                code::INTERNAL_ERROR,
-                format!("holding a validated chain: {e}"),
-            )
-        })?;
-    }
-    Ok(())
+    PublicRecordRefusal::new(code, refusal.to_string())
 }
 
-/// Replays the key-event frames stored for `identifier` into a holder, one
-/// frame at a time, so the holder's "held earliest" moment of each chain is
-/// the order the node admitted it in (§9.7.4.2 R9).
+/// Replays the key-event frames stored for `identifier` into a
+/// [`RetainedLog`], one frame at a time, so the log's "held earliest" moment
+/// of each chain is the order the node admitted it in (§9.7.4.2 R9).
 ///
 /// Stored order is (`stored_at`, `blob_id`), and `stored_at` has one-second
 /// resolution, so two frames admitted in one second can come back with an
 /// extension ahead of the frame holding its predecessor. Admission held each
-/// frame's predecessor (or the frame is an inception), so the replay takes the
-/// earliest stored frame whose first event is an inception or extends an event
-/// already replayed: that order is the admission order up to same-second ties.
+/// frame's predecessor (or the frame is an inception), so the replay admits
+/// the earliest stored frame the log anchors: that order is the admission
+/// order up to same-second ties.
 ///
 /// # Errors
 ///
 /// `5000` on a storage failure, a stored frame that does not decode, or a
-/// stored frame no replay order reaches.
+/// stored frame no replay order admits.
 pub(super) async fn held_log(
     storage: &dyn BlobStorage,
     identifier: &Identifier,
 ) -> Result<HeldLog, PublicRecordRefusal> {
     let stored = load_retained(storage, &routing_id(RoutingKind::KeyEvents, identifier)).await?;
-    let mut log = HeldLog {
-        holder: AcceptedChainHolder::new(),
+    let mut held = HeldLog {
+        log: RetainedLog::new(*identifier),
         frames: Vec::with_capacity(stored.len()),
-        units: Vec::new(),
     };
     let mut pending = stored
         .iter()
@@ -224,11 +192,14 @@ pub(super) async fn held_log(
                 .map_err(|e| corrupt("key-event", &e))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let mut replayed = BTreeSet::new();
     while !pending.is_empty() {
         let next = pending.iter().position(|(_, frame)| {
             frame.first().is_some_and(|first| {
-                first.kind() == EventKind::Inception || replayed.contains(first.predecessor())
+                first.kind() == EventKind::Inception
+                    || first
+                        .sequence()
+                        .checked_sub(1)
+                        .is_some_and(|position| held.log.holds(position, first.predecessor()))
             })
         });
         let Some(next) = next else {
@@ -238,30 +209,39 @@ pub(super) async fn held_log(
             ));
         };
         let (blob_id, frame) = pending.remove(next);
-        let digests: Vec<[u8; 32]> = frame
+        let units: Vec<&[u8]> = frame
             .events()
             .iter()
-            .map(scp_protocol::node::FrameEvent::digest)
+            .map(scp_protocol::node::FrameEvent::unit)
             .collect();
-        replayed.extend(digests.iter().copied());
-        log.frames.push((blob_id, digests));
-        log.units
-            .extend(frame.events().iter().map(|event| event.unit().to_vec()));
-        let units: Vec<&[u8]> = log.units.iter().map(Vec::as_slice).collect();
-        hold_units(&mut log.holder, identifier, &units)?;
+        // The outcome is not read: the selection reads what the log retains.
+        held.log.admit(&units).map(drop).map_err(|e| {
+            PublicRecordRefusal::new(
+                code::INTERNAL_ERROR,
+                format!("a stored key-event frame no longer admits: {e}"),
+            )
+        })?;
+        held.frames.push((
+            blob_id,
+            frame
+                .events()
+                .iter()
+                .map(scp_protocol::node::FrameEvent::digest)
+                .collect(),
+        ));
     }
-    Ok(log)
+    Ok(held)
 }
 
 /// The key-event frames the did selection keeps: every frame carrying at
-/// least one event of a chain the holder holds, accepted or suffix.
+/// least one event of a chain the log retains, accepted or suffix.
 pub(super) fn select_key_events(
-    holder: &AcceptedChainHolder,
+    retained: &[RetainedChain],
     frames: &[([u8; 32], Vec<[u8; 32]>)],
 ) -> BTreeSet<[u8; 32]> {
-    let kept: BTreeSet<[u8; 32]> = holder
-        .held()
-        .flat_map(ValidatedChain::event_digests)
+    let kept: BTreeSet<[u8; 32]> = retained
+        .iter()
+        .flat_map(RetainedChain::event_digests)
         .collect();
     frames
         .iter()
@@ -277,14 +257,13 @@ pub(super) fn select_key_events(
 /// The service keys the held chains designate: on each chain, the key its
 /// head key state lists `Current` in the service-record role (§9.10.12,
 /// `03-identity.md` §3.10.13 "Who signs it").
-pub(super) fn designated_service_keys(chains: &[ValidatedChain]) -> BTreeSet<[u8; 33]> {
+pub(super) fn designated_service_keys(chains: &[RetainedChain]) -> BTreeSet<[u8; 33]> {
     chains
         .iter()
         .flat_map(|chain| {
-            let state = replay(chain);
-            let role = state.key_state().service_key_role;
+            let state = chain.key_state();
+            let role = state.service_key_role;
             state
-                .key_state()
                 .keys
                 .iter()
                 .filter(|entry| entry.role == role && entry.condition == KeyCondition::Current)
@@ -388,9 +367,9 @@ pub(super) fn verify_node_list(
     let head = &record.signing_key_state_head;
     let mut refusal: Option<NodeListError> = None;
     for chain in governor {
-        match VerifiedNodeListRecord::verify(record.clone(), NodeListKeyClass::Attribution, chain) {
-            Ok(verified) => {
-                let key = verified.signing_key().to_compressed();
+        match AdmittedNodeListRecord::admit(record.clone(), chain) {
+            Ok(admitted) => {
+                let key = admitted.signing_key().to_compressed();
                 let compromised = governor
                     .iter()
                     .filter(|held| held.key_state_at(head).is_ok())
@@ -514,16 +493,16 @@ pub(super) async fn bound_witnesses(
             let log = held_log(storage, &operator).await?;
             e.insert(log.retained());
         }
-        let verified = chains.get(&operator).and_then(|chains| {
+        let admitted = chains.get(&operator).and_then(|chains| {
             chains
                 .iter()
-                .find_map(|chain| VerifiedNodeListEntry::verify(entry.clone(), chain).ok())
+                .find_map(|chain| AdmittedNodeListEntry::admit(entry, chain).ok())
         });
-        if let Some(verified) = verified {
+        if let Some(admitted) = admitted {
             bound.insert(
-                *verified.binding().node_id(),
+                *admitted.node_id(),
                 BoundWitness {
-                    node_key: *verified.binding().node_key(),
+                    node_key: *admitted.node_key(),
                     operator,
                 },
             );
@@ -544,7 +523,7 @@ pub(super) async fn bound_witnesses(
 pub(super) fn statement_admissible(
     statement: &ConflictStatement,
     subject: &Identifier,
-    subject_chains: &[ValidatedChain],
+    subject_chains: &[RetainedChain],
     bound: &HashMap<NodeId, BoundWitness>,
 ) -> bool {
     if statement.subject != *subject {
@@ -557,11 +536,10 @@ pub(super) fn statement_admissible(
         return false;
     }
     let at = |digest: &[u8; 32], sequence: u64| {
-        subject_chains.iter().find_map(|chain| {
-            key_state_at(chain, digest)
-                .ok()
-                .filter(|state| state.head_sequence() == sequence)
-        })
+        subject_chains
+            .iter()
+            .filter(|chain| chain.holds(sequence, digest))
+            .find_map(|chain| chain.key_state_at(digest).ok())
     };
     let (Some(held), Some(offered)) = (
         at(&statement.held_digest, statement.held_sequence),
@@ -571,7 +549,7 @@ pub(super) fn statement_admissible(
     };
     [held, offered]
         .iter()
-        .any(|state| state.key_state().witnesses.contains(&witness.operator))
+        .any(|state| state.witnesses.contains(&witness.operator))
 }
 
 /// The conflict frames the wcf selection keeps: per (witness, offered head),
@@ -582,7 +560,7 @@ pub(super) fn statement_admissible(
 pub(super) fn select_conflicts(
     frames: &[ConflictFrame],
     subject: &Identifier,
-    subject_chains: &[ValidatedChain],
+    subject_chains: &[RetainedChain],
     bound: &HashMap<NodeId, BoundWitness>,
 ) -> BTreeSet<[u8; 32]> {
     let mut best: BTreeMap<(NodeId, [u8; 32]), (u64, [u8; 32])> = BTreeMap::new();

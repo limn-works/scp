@@ -15,10 +15,10 @@
 
 use scp_crypto::p256::{P256Error, P256PublicKey, SIGNATURE_LEN, verify_prehash_strict};
 use scp_did::{Identifier, NodeId, NodeUrl};
-use scp_kel::{KeyStateSource, NodeKeyError, derive_node_id, parse_node_key};
+use scp_kel::{NodeKeyError, ResolvedState, derive_node_id, parse_node_key};
 use sha2::{Digest, Sha256};
 
-use crate::crypto::anchored_key::{AnchoredKeyError, active_at};
+use crate::crypto::anchored_key::{AnchoredKeyError, KeyStateSource, active_at};
 
 /// The §9.18.2 separator of the binding preimage.
 pub const NODE_BINDING_SEPARATOR: &str = "SCP-NODE-BIND-V1:";
@@ -111,6 +111,27 @@ impl NodeBinding {
     }
 }
 
+/// The two checks of §9.6.3 over `binding`, the operator's key read from
+/// `operator`, in the order node key, operator key, operator signature,
+/// possession signature; the decoded node key and its `NodeId`. A party's
+/// [`VerifiedNodeBinding::verify`] and a store's
+/// [`AdmittedNodeListEntry::admit`](super::AdmittedNodeListEntry::admit) run
+/// it over their own source.
+pub(crate) fn check_binding(
+    binding: &NodeBinding,
+    operator: &impl KeyStateSource,
+) -> Result<(P256PublicKey, NodeId), NodeBindingError> {
+    let node_key = parse_node_key(&binding.node_key)?;
+    let operator_active = active_at(operator, &binding.operator, &binding.key_state_head)
+        .map_err(NodeBindingError::OperatorKey)?;
+    let digest = binding.digest();
+    verify_prehash_strict(&operator_active, &digest, &binding.operator_sig)
+        .map_err(NodeBindingError::OperatorSignature)?;
+    verify_prehash_strict(&node_key, &digest, &binding.possession_sig)
+        .map_err(NodeBindingError::PossessionSignature)?;
+    Ok((node_key, derive_node_id(&binding.node_key)?))
+}
+
 /// A [`NodeBinding`] whose two signatures verified (§9.6.3 "The binding").
 ///
 /// [`Self::verify`] is the only constructor, so a function that takes this
@@ -131,11 +152,31 @@ impl VerifiedNodeBinding {
     /// `#active` at `key_state_head`, and `possession_sig` under `node_key`,
     /// both over `P` and both strict (low-`s`, no second hash).
     ///
-    /// `operator` is the key state of `binding.operator`: the
-    /// [`ResolvedState`](scp_kel::ResolvedState) a party's resolution
-    /// accepted, or the [`RetainedChain`](scp_kel::RetainedChain) a
-    /// validating store holds (`03-identity.md` §3.10.10). The operator's key
-    /// is read from it at `binding.key_state_head`, the
+    /// `operator` is the [`ResolvedState`] a party's resolution of
+    /// `binding.operator` accepted (`03-identity.md` §3.10.10); a validating
+    /// store's [`RetainedChain`](scp_kel::RetainedChain) is refused:
+    ///
+    /// ```compile_fail,E0308
+    /// fn verify(
+    ///     binding: scp_protocol::node::NodeBinding,
+    ///     held: &scp_kel::RetainedChain,
+    /// ) -> bool {
+    ///     scp_protocol::node::VerifiedNodeBinding::verify(binding, held).is_ok()
+    /// }
+    /// ```
+    ///
+    /// The positive control:
+    ///
+    /// ```
+    /// fn verify(
+    ///     binding: scp_protocol::node::NodeBinding,
+    ///     resolved: &scp_kel::ResolvedState,
+    /// ) -> bool {
+    ///     scp_protocol::node::VerifiedNodeBinding::verify(binding, resolved).is_ok()
+    /// }
+    /// ```
+    ///
+    /// The operator's key is read from it at `binding.key_state_head`, the
     /// log-anchored class of §9.7.1, so a key from another identity or
     /// another position never verifies the binding. §9.7.1's first-seen rule
     /// for a later `Compromised` marking stays the caller's.
@@ -146,17 +187,9 @@ impl VerifiedNodeBinding {
     /// node key, operator key, operator signature, possession signature.
     pub fn verify(
         binding: NodeBinding,
-        operator: &impl KeyStateSource,
+        operator: &ResolvedState,
     ) -> Result<Self, NodeBindingError> {
-        let node_key = parse_node_key(&binding.node_key)?;
-        let operator_active = active_at(operator, &binding.operator, &binding.key_state_head)
-            .map_err(NodeBindingError::OperatorKey)?;
-        let digest = binding.digest();
-        verify_prehash_strict(&operator_active, &digest, &binding.operator_sig)
-            .map_err(NodeBindingError::OperatorSignature)?;
-        verify_prehash_strict(&node_key, &digest, &binding.possession_sig)
-            .map_err(NodeBindingError::PossessionSignature)?;
-        let node_id = derive_node_id(&binding.node_key)?;
+        let (node_key, node_id) = check_binding(&binding, operator)?;
         Ok(Self {
             binding,
             node_key,

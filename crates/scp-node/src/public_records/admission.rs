@@ -11,9 +11,7 @@
 use std::collections::BTreeSet;
 
 use scp_did::Identifier;
-use scp_kel::{
-    EntryVerdict, EventKind, RoutingKind, node_list_routing_id, routing_id, validate_entry,
-};
+use scp_kel::{HoldOutcome, RoutingKind, node_list_routing_id, routing_id};
 use scp_protocol::node::{
     check_node_list_publish, decode_conflict_frame, decode_key_event_frame, decode_node_list_frame,
     decode_service_record_frame,
@@ -25,7 +23,7 @@ use scp_transport::native::storage::{BlobStorage, StoredBlob};
 use super::NodeListSource;
 use super::selection::{
     HeldNodeList, bound_witnesses, decode_conflicts, decode_service_records,
-    designated_service_keys, held_log, held_node_lists, hold_units, load_retained,
+    designated_service_keys, frame_refusal, held_log, held_node_lists, load_retained,
     select_conflicts, select_key_events, select_node_lists, select_service_records,
     statement_admissible, verify_node_list,
 };
@@ -44,11 +42,6 @@ fn rejected(msg: impl Into<String>) -> PublicRecordRefusal {
     PublicRecordRefusal::new(code::DID_RECORD_REJECTED, msg)
 }
 
-/// `4044` with `msg`.
-fn illegal(msg: impl Into<String>) -> PublicRecordRefusal {
-    PublicRecordRefusal::new(code::KEY_EVENT_ILLEGAL, msg)
-}
-
 /// `scp:did:` admission: §9.7.4.2 R10's frame admission (`4040`), then R3's
 /// check order on every event of the frame against the chains the node
 /// holds (`4044`), then R9's accepted-chain rule and suffix retention.
@@ -65,56 +58,19 @@ pub(super) async fn admit_key_events(
     let frame = decode_key_event_frame(&publish.blob)
         .map_err(|e| rejected(format!("the key-event frame does not decode: {e}")))?;
     let identifier = frame.identifier();
-    let mut log = held_log(storage, &identifier).await?;
-    let held_digests = log.digests();
-    let Some(first) = frame.first() else {
-        return Err(rejected("the key-event frame carries no event"));
-    };
-    if held_digests.contains(&first.digest()) {
-        return Err(rejected("the frame's first event is one this node holds"));
-    }
-    let admitted = if first.kind() == EventKind::Inception {
-        first.recomputed_identifier() == identifier
-    } else {
-        held_digests.contains(first.predecessor())
-    };
-    if !admitted {
-        return Err(rejected(
-            "the frame's first event is neither the inception of this identifier nor an \
-             event whose predecessor this node holds",
-        ));
-    }
-    let held_count = log.units.len();
-    let units: Vec<&[u8]> = log
-        .units
+    let mut held = held_log(storage, &identifier).await?;
+    let units: Vec<&[u8]> = frame
+        .events()
         .iter()
-        .map(Vec::as_slice)
-        .chain(
-            frame
-                .events()
-                .iter()
-                .map(scp_protocol::node::FrameEvent::unit),
-        )
+        .map(scp_protocol::node::FrameEvent::unit)
         .collect();
-    let validation = validate_entry(&identifier, &units);
-    if let Some(discarded) = validation
-        .discarded
-        .iter()
-        .find(|discarded| discarded.served_index() >= held_count)
-    {
-        return Err(illegal(format!(
-            "event {} of the frame fails R3: {}",
-            discarded.served_index() - held_count,
-            discarded.defect(),
-        )));
-    }
-    if !matches!(validation.verdict, EntryVerdict::Valid { .. }) {
-        return Err(illegal(
-            "the frame leaves the identifier with no valid chain",
+    let outcome = held.log.admit(&units).map_err(|e| frame_refusal(&e))?;
+    if matches!(outcome, HoldOutcome::Refused { .. }) {
+        return Err(rejected(
+            "the retention bounds keep no chain the frame extends",
         ));
     }
-    hold_units(&mut log.holder, &identifier, &units)?;
-    log.frames.push((
+    held.frames.push((
         publish.blob_id,
         frame
             .events()
@@ -122,9 +78,9 @@ pub(super) async fn admit_key_events(
             .map(scp_protocol::node::FrameEvent::digest)
             .collect(),
     ));
-    let kept = select_key_events(&log.holder, &log.frames);
-    let held = load_retained(storage, &publish.routing_id).await?;
-    Ok((identifier, Selection { held, kept }))
+    let kept = select_key_events(&held.retained(), &held.frames);
+    let stored = load_retained(storage, &publish.routing_id).await?;
+    Ok((identifier, Selection { held: stored, kept }))
 }
 
 /// `scp:svc:` admission: the record verifies under the service key a chain
@@ -142,7 +98,7 @@ pub(super) async fn admit_service_record(
 ) -> Result<Selection, PublicRecordRefusal> {
     let record = decode_service_record_frame(&publish.blob)
         .map_err(|e| rejected(format!("the service record does not decode: {e}")))?;
-    let chains = held_log(storage, &record.identifier()).await?.chains();
+    let chains = held_log(storage, &record.identifier()).await?.retained();
     if chains.is_empty() {
         return Err(rejected("this node holds no key-event log of the identity"));
     }
@@ -170,7 +126,7 @@ pub(super) async fn reselect_service_records(
     identifier: &Identifier,
 ) -> Result<([u8; 32], Selection), PublicRecordRefusal> {
     let routing = routing_id(RoutingKind::ServiceRecord, identifier);
-    let chains = held_log(storage, identifier).await?.chains();
+    let chains = held_log(storage, identifier).await?.retained();
     let held = load_retained(storage, &routing).await?;
     let kept = select_service_records(
         &decode_service_records(&held)?,
@@ -294,7 +250,7 @@ pub(super) async fn admit_conflicts(
     let (subject, statements) = decode_conflict_frame(&publish.blob)
         .map_err(|e| rejected(format!("the conflict frame does not decode: {e}")))?;
     let bound = bound_witnesses(storage, &configured_node_lists(storage, source).await?).await?;
-    let chains = held_log(storage, &subject).await?.chains();
+    let chains = held_log(storage, &subject).await?.retained();
     if let Some(index) = statements
         .iter()
         .position(|statement| !statement_admissible(statement, &subject, &chains, &bound))
@@ -334,7 +290,7 @@ pub(super) async fn reselect_conflicts(
         ));
     }
     let bound = bound_witnesses(storage, &configured_node_lists(storage, source).await?).await?;
-    let chains = held_log(storage, subject).await?.chains();
+    let chains = held_log(storage, subject).await?.retained();
     let kept = select_conflicts(&decode_conflicts(&held)?, subject, &chains, &bound);
     Ok((routing, Selection { held, kept }))
 }

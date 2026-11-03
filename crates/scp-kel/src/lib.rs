@@ -60,7 +60,7 @@ pub use relation::{
     ChainRelation, EntryAdoption, EntryRelations, ExtendingAct, RelationError, ServedChainReading,
     WithheldEvent, classify_relation,
 };
-pub use retained::{KeyStateSource, RetainedChain};
+pub use retained::{FrameRefusal, RetainedChain, RetainedLog};
 pub use routing::{RoutingKind, node_list_routing_id, routing_id};
 pub use signature::{
     AssertionSignature, IndexedSignature, IndexedSignatureError, IndexedSignaturePart,

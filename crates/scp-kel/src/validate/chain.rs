@@ -248,6 +248,20 @@ impl ValidatedChain {
             .map(|event| event.digest)
     }
 
+    /// The preimage digest of the chain's event at `position`, or `None`
+    /// past the head. Positions run from zero without a gap, so it reads one
+    /// event and walks none.
+    pub(crate) fn digest_at(&self, position: u64) -> Option<[u8; 32]> {
+        position
+            .checked_sub(1)
+            .map_or(Some(self.state.inception.digest), |later| {
+                usize::try_from(later)
+                    .ok()
+                    .and_then(|index| self.state.later.get(index))
+                    .map(|event| event.digest)
+            })
+    }
+
     pub(super) fn head(&self) -> &ChainEvent {
         self.state.later.last().unwrap_or(&self.state.inception)
     }
