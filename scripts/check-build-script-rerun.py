@@ -7,7 +7,7 @@ than the last run. Editing a README, an AGENTS.md or a test file then reruns the
 which rebuilds the package's library and every workspace package that depends on it.
 
 Usage:
-    check-build-script-rerun.py <cargo arguments>    e.g. build -p scp-ffi --features server
+    check-build-script-rerun.py <cargo arguments>    (from the repository root), e.g. build -p scp-ffi
     check-build-script-rerun.py --self-test
 
 The check runs `cargo <arguments>` once so every unit is fresh, writes a new file into
@@ -34,7 +34,7 @@ from urllib.parse import unquote, urlparse
 PROBE = "build-script-rerun-probe.txt"
 
 
-def cargo_json(args: list[str], cwd: Path, env: dict[str, str]) -> list[dict]:
+def cargo_json(args: list[str], cwd: Path | None, env: dict[str, str]) -> list[dict]:
     proc = subprocess.run(
         ["cargo", *args, "--message-format=json-render-diagnostics"],
         cwd=cwd,
@@ -45,7 +45,7 @@ def cargo_json(args: list[str], cwd: Path, env: dict[str, str]) -> list[dict]:
     )
     if proc.returncode != 0:
         sys.stderr.write(proc.stderr[-4000:])
-        raise SystemExit(f"`cargo {' '.join(args)}` failed in {cwd}")
+        raise SystemExit(f"`cargo {' '.join(args)}` failed in {cwd or Path.cwd()}")
     return [
         json.loads(line) for line in proc.stdout.splitlines() if line.startswith("{")
     ]
@@ -58,7 +58,7 @@ def package_dir(package_id: str) -> Path | None:
     return Path(unquote(urlparse(package_id.removeprefix("path+").split("#")[0]).path))
 
 
-def rebuilt_units(args: list[str], cwd: Path, env: dict[str, str]) -> list[str]:
+def rebuilt_units(args: list[str], cwd: Path | None, env: dict[str, str]) -> list[str]:
     """Run the check; return each workspace unit cargo compiled again after the probe."""
     first = cargo_json(args, cwd, env)
     dirs = sorted(
@@ -91,8 +91,8 @@ def rebuilt_units(args: list[str], cwd: Path, env: dict[str, str]) -> list[str]:
 
 
 def check(args: list[str]) -> int:
-    root = Path(__file__).resolve().parents[1]
-    rebuilt = rebuilt_units(args, root, dict(os.environ))
+    # Run from the repository root, as every CI job does, so cargo finds the workspace.
+    rebuilt = rebuilt_units(args, None, dict(os.environ))
     if rebuilt:
         print(
             "A new file that no unit reads made cargo compile these workspace units again, "
