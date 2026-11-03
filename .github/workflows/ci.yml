@@ -3921,7 +3921,8 @@ jobs:
           tool: python
           version: "3.12"
       # ruff.in says why ruff is pinned.
-      - run: pip install --require-hashes -r .github/requirements/ruff.txt
+      - working-directory: ${{ github.workspace }}
+        run: pip install --require-hashes -r .github/requirements/ruff.txt
       - run: ruff format --check .
       - run: ruff check .
       # H14 / M16: enforce `is not None` over falsy checks on Optional

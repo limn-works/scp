@@ -13,6 +13,10 @@ on:
 permissions:
   contents: read
 
+# The rust-toolchain action refuses to run without it, as ci.yml sets it.
+env:
+  RUSTUP_AUTO_INSTALL: "0"
+
 jobs:
   build-matrix:
     uses: ./.github/workflows/build-matrix.yml

@@ -11661,6 +11661,7 @@ FETCH_WORDS = re.compile(
     re.IGNORECASE,
 )
 PIP_INSTALL = re.compile(r"(?<![\w.-])pip(?:3(?:\.\d+)?)?\s+(install|download|wheel)\b", re.I)
+PIP_REQUIREMENT = re.compile(r"(?<!\S)(?:-r|--requirement)(?:\s+|=)(\S+)")
 CARGO_INSTALL = re.compile(r"(?<![\w./-])cargo\s+(?:\+\S+\s+)?install\b")
 BUN_INSTALL = re.compile(r"(?<![\w./-])bun\s+(?:install|i)\b")
 DOCKER_WORD = re.compile(r"(?<![\w./-])docker(?![\w-])", re.IGNORECASE)
@@ -11863,12 +11864,26 @@ def run_gaps(label: str, step: dict, job: dict | None) -> list[str]:
             f"{label} runs {', '.join(words)}, which fetches outside the pinned paths; "
             f"download through {PINNED_TOOL_ACTION} (verified_download.py) instead"
         )
+    default = ((job or {}).get("defaults") or {}).get("run") or {}
+    cwd = str(step.get("working-directory") or default.get("working-directory") or ".")
+    cwd = re.sub(r"^\$\{\{\s*github\.workspace\s*\}\}", ".", cwd)
     for line in text.splitlines():
         if PIP_INSTALL.search(line) and "--require-hashes" not in line:
             gaps.append(
                 f"{label} runs pip without --require-hashes: {line.strip()!r}; install a "
                 "hashed file under .github/requirements/"
             )
+        # A hashed install fails at run time when its file is missing from the directory
+        # the step runs in, so each requirements path must name a tracked file from there.
+        if PIP_INSTALL.search(line):
+            for req in PIP_REQUIREMENT.findall(line):
+                req = req.strip("\"'")
+                resolved = posixpath.normpath(posixpath.join(cwd, req))
+                if "$" in req or "$" in cwd or not (REPO / resolved).is_file():
+                    gaps.append(
+                        f"{label} installs requirements {req!r} from working directory "
+                        f"{cwd!r}, which names no file in the repository"
+                    )
         if CARGO_INSTALL.search(line) and not (
             re.search(r"(?<!\S)--locked(?!\S)", line) and re.search(r"(?<!\S)--path[ =]", line)
         ):
@@ -12637,6 +12652,16 @@ def check_verified_downloads(documents: list[tuple[Path, dict]]) -> None:
             {"run": "cargo +nightly install cargo-fuzz"}
         ],
         "uv pip": [{"run": "uv pip install maturin"}],
+        "hashed pip of a file missing from the step's directory": [
+            {"working-directory": "bindings/python",
+             "run": "pip install --require-hashes -r .github/requirements/ruff.txt"}
+        ],
+        "hashed pip of a file that does not exist": [
+            {"run": "pip install --require-hashes --requirement=.github/requirements/absent.txt"}
+        ],
+        "hashed pip of a computed path": [
+            {"run": 'pip install --require-hashes -r "$REQS"'}
+        ],
         "git clone": [{"run": "git clone https://example.invalid/a.git"}],
         "taiki-e without fallback none": [{"uses": taiki, "with": {"tool": "cargo-nextest"}}],
         "taiki-e with the checksum off": [
@@ -12684,6 +12709,19 @@ def check_verified_downloads(documents: list[tuple[Path, dict]]) -> None:
             bool(unverified_download_gaps("planted", steps)),
             f"{steps} went unreported",
         )
+    hashed = {"run": "pip install --require-hashes -r .github/requirements/ruff.txt"}
+    in_bindings = {"defaults": {"run": {"working-directory": "bindings/python"}}}
+    check(
+        "verified-download reports a hashed pip whose file is missing from the job's "
+        "default working directory",
+        bool(run_gaps("planted", hashed, in_bindings)),
+        f"{hashed} under {in_bindings} went unreported",
+    )
+    check(
+        "verified-download accepts the same hashed pip from the repository root",
+        not run_gaps("control", hashed, {}),
+        f"returned {run_gaps('control', hashed, {})}",
+    )
     guarded = [
         {"run": '"$py" -I "$GITHUB_ACTION_PATH/guard.py" before "$T" "$V"'},
         {"uses": f"actions/setup-python@{sha}"},
