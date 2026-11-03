@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Experiment driver (branch ci/workspace-crate-cache-exp only): reader compile commands and edit scenarios.
-set -uo pipefail
+set -u
 PY_LIBDIR="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
 export LD_LIBRARY_PATH="$PY_LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 TF=scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/testing,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/testing,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/testing,scp-ffi-uniffi/outlet-capability-test-grant
@@ -29,6 +29,7 @@ leaf_file() {
 # run_reader <reader> <label>: runs every command, prints elapsed and the units cargo rebuilt.
 run_reader() {
   local r=$1 label=$2 start end rc=0 log
+  set +e +o pipefail
   log=$(mktemp)
   start=$(date +%s.%N)
   while IFS= read -r c; do
@@ -41,10 +42,11 @@ run_reader() {
   local n_ws n_dep
   n_ws=$(command grep -E '^\s*(Compiling|Checking) scp-' "$log" | sort -u | wc -l)
   n_dep=$(command grep -E '^\s*(Compiling|Checking) ' "$log" | command grep -v ' scp-' | sort -u | wc -l)
-  printf 'RESULT reader=%s label=%s seconds=%.1f ws_units=%s dep_units=%s rc=%s\n' "$r" "$label" "$(echo "$end - $start" | bc)" "$n_ws" "$n_dep" "$rc" | tee -a "$GITHUB_STEP_SUMMARY"
+  printf 'RESULT reader=%s label=%s seconds=%.1f ws_units=%s dep_units=%s rc=%s\n' "$r" "$label" "$(awk -v a="$start" -v b="$end" 'BEGIN{print b-a}')" "$n_ws" "$n_dep" "$rc" | tee -a "$GITHUB_STEP_SUMMARY"
   command grep -E '^\s*(Compiling|Checking) ' "$log" | sed 's/^ */  /' | sort | uniq -c | head -80
   command grep -E '^(error|warning)' "$log" | head -20
   tail -3 "$log"
   rm -f "$log" "$log.1"
+  return 0
 }
 edit() { echo "// workspace-cache experiment $1" >>"$2"; }
