@@ -32,7 +32,7 @@ env:
 
 jobs:
   writer:
-    if: inputs.mode != 'exactness'
+    if: inputs.mode == 'measure'
     name: writer ${{ matrix.group }}
     runs-on: ubuntu-latest
     timeout-minutes: 120
@@ -86,7 +86,7 @@ jobs:
           retention-days: 1
 
   base:
-    if: inputs.mode != 'exactness'
+    if: inputs.mode == 'measure'
     name: base ${{ matrix.reader }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -204,7 +204,7 @@ jobs:
           run_reader "$r" root
 
   sccache:
-    if: inputs.mode != 'exactness'
+    if: inputs.mode == 'measure'
     name: sccache ${{ matrix.reader }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
