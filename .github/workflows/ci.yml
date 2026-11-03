@@ -412,6 +412,9 @@ jobs:
               # The rust-test job runs scripts/check-test-shard-features.py over
               # its own shard commands, so a change to that script must trigger it.
               - 'scripts/check-test-shard-features.py'
+              # The pyo3, napi and uniffi production jobs run this script on their
+              # builds, so a change to it must trigger them.
+              - 'scripts/check-build-script-rerun.py'
               # Nextest reads its `default-filter` out of this file, which decides
               # which tests every `cargo nextest run` in rust-test runs.
               - '.config/nextest.toml'
@@ -2553,6 +2556,8 @@ jobs:
           cd bindings/typescript
           SCP_EXPECT_SHIPPED_ADDON=1 bun test tests/shipped-addon.test.ts \
             --test-name-pattern 'identityCreateWithCustody refuses with SCP-IDENT-1100 before any provider call'
+      - name: No build script reruns when an unrelated file of its package changes
+        run: python3 scripts/check-build-script-rerun.py build -p scp-ffi-napi --features server --lib
 
   # Builds the pyo3 bridge (`scp-ffi`) in its PRODUCTION configuration: default
   # features (`server` on) but WITHOUT `testing`. `build-matrix.yml` builds the
@@ -2620,6 +2625,13 @@ jobs:
           export LD_LIBRARY_PATH="$PY_LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           # Default features = production: `server` on, no `testing`.
           cargo build -p scp-ffi --features server
+      - name: No build script reruns when an unrelated file of its package changes
+        run: |
+          # A build script that prints no rerun-if line is rerun, and its crate and
+          # every dependent recompiled, whenever any file of its package changes.
+          # The self-test proves the check catches such a script.
+          python3 scripts/check-build-script-rerun.py --self-test
+          python3 scripts/check-build-script-rerun.py build -p scp-ffi --features server
       - name: Shipped pyo3 fail-closed assertions
         run: |
           # Assigned before an export so a failing python3 stops this step
@@ -2749,6 +2761,8 @@ jobs:
         run: |
           # Default features = production: `server` on, no `testing`.
           cargo build -p scp-ffi-uniffi --features server
+      - name: No build script reruns when an unrelated file of its package changes
+        run: python3 scripts/check-build-script-rerun.py build -p scp-ffi-uniffi --features server
       - name: Lint and test every uniffi target in production config
         run: |
           # Every other clippy and test lane enables `scp-ffi-uniffi/testing`, so a

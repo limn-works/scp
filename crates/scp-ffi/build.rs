@@ -7,6 +7,14 @@
 /// `cargo:rustc-link-search=native=...` so the test binaries can find
 /// `libpython3.XX.dylib` automatically.
 fn main() {
+    // A build script that prints no rerun-if line is rerun whenever any file of the
+    // package is newer than its last run, and that rerun recompiles this crate: a
+    // README edit rebuilt `_scp_core`. The script reads only itself and the
+    // `python3.12` on `PATH`; `PATH` is left untracked, as before, because shells
+    // that differ in `PATH` would otherwise rebuild this crate on every switch.
+    // `scripts/check-build-script-rerun.py` fails CI if the rerun comes back.
+    println!("cargo:rerun-if-changed=build.rs");
+
     // Only needed on macOS — Linux uses rpath or ld.so.conf.
     if std::env::consts::OS != "macos" {
         return;
