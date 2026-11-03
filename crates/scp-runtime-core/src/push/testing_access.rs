@@ -44,16 +44,16 @@ impl<C: KeyCustody, S: Storage> PushRegistrar<C, S> {
         &self.token
     }
 
-    /// Test access to [`Self::handle_command`] (ADR-070 §6.2).
+    /// Test access to `Self::handle_command` (ADR-070 §6.2).
     pub async fn handle_command_for_test(&mut self, a0: RegistrarCommand, a1: &Supervisor) -> bool {
         self.handle_command(a0, a1).await
     }
 
-    /// Test access to [`Self::reconcile`] (ADR-070 §6.2).
+    /// Test access to `Self::reconcile` (ADR-070 §6.2).
     ///
     /// # Errors
     ///
-    /// The errors of [`Self::reconcile`].
+    /// The errors of `Self::reconcile`.
     pub async fn reconcile_for_test(
         &mut self,
         a0: &Supervisor,

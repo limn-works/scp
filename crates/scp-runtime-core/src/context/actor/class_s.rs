@@ -535,9 +535,9 @@ impl<'a> SharedClassS<'a> {
 /// (there is no whole-state [`Deref`]); reads don't mutate, so a shared `&` to
 /// Class-S cannot violate the invariant.
 ///
-/// # The Class-S reach is the read-only [`SharedClassS`] wrapper (BLACK-CS-01)
+/// # The Class-S reach is the read-only `SharedClassS` wrapper (BLACK-CS-01)
 ///
-/// `ClassCMut.class_s` is a [`SharedClassS`] — a wrapper holding a PRIVATE
+/// `ClassCMut.class_s` is a `SharedClassS` — a wrapper holding a PRIVATE
 /// `&ClassSState`, with NO `&mut` accessor and NO [`DerefMut`](std::ops::DerefMut). So the only Class-S
 /// reach on this best-effort view is the shared read [`Self::class_s`]
 /// (`self.class_s.get()`); there is no `&mut` to the actor's `ClassSState`
@@ -895,7 +895,7 @@ pub struct EconomyPreCheckBorrows<'a> {
 ///
 /// # `governance.class_s` is unreachable from this view (structural)
 ///
-/// [`GovernanceClassCMut::new`] destructures the `&mut GovernanceState` and leaves
+/// `GovernanceClassCMut::new` destructures the `&mut GovernanceState` and leaves
 /// `class_s` (the [`GovernanceClassS`] Class-S sub-struct) and
 /// `revoked_spending_ucan_cids` in the `..` rest — so this view holds NO reference
 /// (mut or shared) to either. A "convenience" accessor returning a
@@ -903,7 +903,7 @@ pub struct EconomyPreCheckBorrows<'a> {
 /// on the view (illustrative, NOT a decoupled `compile_fail` mirror that could
 /// drift): the load-bearing guarantee is this struct's field list itself. The
 /// regression to guard against — binding `class_s` by name in `new` so a `&mut`
-/// survives — is caught by the SAFETY-INVARIANT contract on [`Self::new`]'s
+/// survives — is caught by the SAFETY-INVARIANT contract on `Self::new`'s
 /// destructure (the `..` rest) plus the type having no `class_s` field; it does
 /// NOT rely on an example. (Per
 /// `.docs/lessons/ast-gate-checks-definition-not-name-resolution.md`, prefer
@@ -1315,7 +1315,7 @@ impl<'a> GovernanceClassCMut<'a> {
 ///
 /// `ceiling` is bound a SHARED `&` (read-only — there is no `ceiling_mut`).
 /// `suspended_capabilities` is held `&mut` BUT exposed ONLY through the
-/// SHRINK-only [`Self::prune_suspensions_to_role_grants`] + a shared READ
+/// SHRINK-only `Self::prune_suspensions_to_role_grants` + a shared READ
 /// ([`Self::suspended_capabilities`]) — there is deliberately NO GROW ACCESSOR
 /// (`suspend_capabilities` / `suspend_all`) on this view. So a caller holding THIS
 /// view (a `RoleStateClassCMut`) cannot perform a downward-auth GROW — the GROW
@@ -2138,7 +2138,7 @@ pub struct ConsequenceStateSplit<'a> {
 impl<'a> ConsequenceStateSplit<'a> {
     /// Build a [`ConsequenceStateSplit`] DIRECTLY from a `&mut PerContextState`,
     /// with NO owning [`ClassSCell`] / [`ClassCMut`] in scope (the cell-free
-    /// governance-helper consequence sites). Mirrors [`ClassCSplit::from_state`]'s
+    /// governance-helper consequence sites). Mirrors `ClassCSplit::from_state`'s
     /// disjoint destructure, but wraps `role_state` in the GROW-capable
     /// [`ConsequenceRoleStateMut`]. The Class-S sub-structs `class_s` (actor) and
     /// `governance.class_s` are never bound `&mut` (left to the `..` rest / the
@@ -2265,7 +2265,7 @@ impl<'a> ClassCMut<'a> {
     /// owning [`ClassSCell`] in scope.
     ///
     /// This is the cell-free bridge — the [`ClassCMut`] counterpart of
-    /// [`ClassCSplit::from_state`] — for the receive-cascade sites that hold a
+    /// `ClassCSplit::from_state` — for the receive-cascade sites that hold a
     /// bare `&mut PerContextState` (the `deliver_message_and_drain_buffered` unit
     /// tests exercise `deliver_incoming` with a bare `&mut PerContextState`, with
     /// no cell to call [`ClassSCell::class_c_view`] through). A cell holder
@@ -2274,7 +2274,7 @@ impl<'a> ClassCMut<'a> {
     ///
     /// # Airtight BY CONSTRUCTION — identical to [`ClassSCell::class_c_view`]
     ///
-    /// This delegates to [`Self::new`], which performs the SINGLE disjoint
+    /// This delegates to `Self::new`, which performs the SINGLE disjoint
     /// destructure that is the airtightness guarantee: the whole
     /// `&mut PerContextState` is consumed and only field-granular references
     /// survive. It holds NO whole `&mut PerContextState`, NO whole
@@ -2597,7 +2597,7 @@ impl<'a> ClassCMut<'a> {
     /// [`ClassCSplit`], for the
     /// [`crate::context::actor::class_s::ConsequenceStateSplit`] pattern. The
     /// view ALREADY holds five distinct field references (destructured apart in
-    /// [`Self::new`]), so all five borrows are live simultaneously. None is
+    /// `Self::new`), so all five borrows are live simultaneously. None is
     /// Class-S: governance is the field-granular [`GovernanceClassCMut`] (which
     /// cannot reach `governance.class_s`), and `class_s` itself is not handed out
     /// here (the split is for the structural consequence path).
@@ -2875,7 +2875,7 @@ impl ClassSCell {
     /// in-memory state must match what a respawn would load. The rollback is the
     /// combinator's own snapshot/restore of the Class-S sub-structs (via
     /// [`ClassSState::snapshot`]/[`ClassSState::restore`] +
-    /// [`GovernanceClassS::snapshot`]/[`GovernanceClassS::restore`]) — there is no
+    /// `GovernanceClassS::snapshot`/`GovernanceClassS::restore`) — there is no
     /// caller-supplied rollback closure to get wrong.
     ///
     /// # Snapshot SCOPE contract — Class-S sub-structs ONLY

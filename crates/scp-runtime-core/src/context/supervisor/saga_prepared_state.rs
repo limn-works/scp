@@ -230,7 +230,7 @@ pub(in crate::context) struct CrossContextOutletInvocationPreparedWire {
 #[allow(dead_code)] // evidence path consumed by the saga dispatch wiring PR
 impl CrossContextOutletInvocationPrepared {
     /// Encode the public prepared state to its journal `evidence` bytes —
-    /// `MessagePack` of the [`CrossContextOutletInvocationPreparedWire`]
+    /// `MessagePack` of the `CrossContextOutletInvocationPreparedWire`
     /// mirror (§6.2.4 "Public-metadata journaling"). Classified **public**;
     /// the supervisor wraps these bytes in the standard `Zeroizing` envelope
     /// for uniformity only.

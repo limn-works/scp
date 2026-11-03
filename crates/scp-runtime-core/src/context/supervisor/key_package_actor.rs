@@ -957,7 +957,7 @@ pub struct KeyPackageStoreActor {
 impl KeyPackageStoreActor {
     /// Spawns a new actor task onto a task tracker of its own and returns
     /// its handle and `JoinHandle`. Test-only: production spawns through
-    /// [`Self::spawn_through`] and the Supervisor's task tracker (ADR-049
+    /// `Self::spawn_through` and the Supervisor's task tracker (ADR-049
     /// Decision 16).
     #[cfg(any(test, feature = "testing"))]
     #[must_use]

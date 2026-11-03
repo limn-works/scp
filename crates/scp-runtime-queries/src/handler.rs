@@ -5,10 +5,10 @@
 )]
 //! Query handlers — pure-read surface over per-context state.
 //!
-//! See [`QueriesCommand`](scp_runtime_core::context::actor::commands::QueriesCommand)
+//! See [`QueriesCommand`]
 //! for the full variant set. Every handler takes a borrowed actor-owned
 //! [`PerContextState`](scp_runtime_core::context::actor::state::PerContextState)
-//! plus the capability-reduced [`ActorDeps`](scp_runtime_core::context::actor::deps::ActorDeps),
+//! plus the capability-reduced [`ActorDeps`],
 //! and returns `Outcome { mutated: false }` by construction — the
 //! dispatch function uses [`Outcome::ok(())`](scp_runtime_core::context::actor::outcome::Outcome::ok)
 //! on every arm.

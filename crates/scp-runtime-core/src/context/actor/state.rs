@@ -345,7 +345,7 @@ pub struct PendingBroadcastKeyRotation {
 ///
 /// The two flags are PRIVATE and there is no public/`pub(crate)` constructor:
 /// the only code that can mint a `DisposalOutcome` is this module
-/// (`crate::context::actor::state`), via the private [`Self::observed`]
+/// (`crate::context::actor::state`), via the private `Self::observed`
 /// constructor called EXCLUSIVELY from [`ContextCryptoState::dispose_secrets`]
 /// (which derives the flags from the PRE-disposal presence of the material) and
 /// the [`PerContextState::dispose_secrets`] Broadcast N/A arm (which mints
@@ -357,7 +357,7 @@ pub struct PendingBroadcastKeyRotation {
 /// originated in an actual observed disposal.
 ///
 /// The type and its read accessors are `pub` because the domain crates read
-/// them (ADR-070 §2.5); the flags and [`Self::observed`] stay private, so the
+/// them (ADR-070 §2.5); the flags and `Self::observed` stay private, so the
 /// guarantee holds across crates. The finalize seam returns a
 /// `KeyDestructionAttestation`, not this outcome, so it is not part of the SDK
 /// surface.
@@ -1026,7 +1026,7 @@ pub struct ClassSState {
     /// **Replay-bound invariant (defense-in-depth).** The cache is bounded by
     /// `NONCE_DEDUP_CAPACITY` (10,000) with oldest-first eviction; the replay
     /// guarantee holds only while the *TTL*
-    /// ([`SAGA_NONCE_DEDUP_TTL_SECS`](SAGA_NONCE_DEDUP_TTL_SECS),
+    /// ([`SAGA_NONCE_DEDUP_TTL_SECS`],
     /// 600 s — 2× the freshness skew tolerance), not eviction, is what drops an
     /// entry. That requires the maximum number of distinct nonces a caller can
     /// land within the TTL window to stay safely below the capacity. The
@@ -2777,7 +2777,7 @@ impl PerContextState {
     /// actor-owned group directly.
     ///
     /// With `Some(bytes)` performs the real MLS add via
-    /// [`Self::add_member_from_bytes`]. With `None` (no `KeyPackage`) the
+    /// `Self::add_member_from_bytes`. With `None` (no `KeyPackage`) the
     /// `testing`/`cfg(test)` build returns an empty output (mock-equivalent, so
     /// integration tests that don't produce real MLS key packages still exercise
     /// the non-crypto pipeline — byte-for-byte with the provider) and production

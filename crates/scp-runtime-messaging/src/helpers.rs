@@ -110,11 +110,11 @@ pub type ContextEventSender = tokio::sync::broadcast::Sender<(String, ContextEve
 
 /// Enforces economic policy for message sends (#1537, #1593).
 ///
-/// Actor-shape variant: takes the [`ClassSCell`](ClassSCell)
+/// Actor-shape variant: takes the [`ClassSCell`]
 /// and routes the spending-nonce consume through
 /// [`begin_class_s_conditional`](ClassSCell::begin_class_s_conditional)
 /// so the consume is DEFERRED-persisted (ADR-049 §9, keep-direction). The
-/// returned [`ClassSCommitToken`](ClassSCommitToken)
+/// returned [`ClassSCommitToken`]
 /// is `Some` ONLY on the PAID branch (a non-zero cost was charged AND a spending
 /// UCAN was presented — i.e. `enforce_economy` actually burned a nonce); the
 /// free / best-effort branch returns `None` so the caller's existing best-effort
@@ -2053,7 +2053,7 @@ fn record_send_participation(
 ///
 /// `finalize_send` OWNS the per-sender sequence rollback on ALL of its error
 /// exits — the TTL early-return below and the final persist failure (in
-/// [`persist_finalized_send`]). (The former FIRST `MessageSent` durable-append
+/// `persist_finalized_send`). (The former FIRST `MessageSent` durable-append
 /// rollback site is gone: per ADR-051 §6 / the phase-2.md ADR-011 amendment
 /// exclusion taxonomy §2, `MessageSent` is a per-author, non-convergent event
 /// excluded from the canonical Merkle log — there is no durable append to fail,

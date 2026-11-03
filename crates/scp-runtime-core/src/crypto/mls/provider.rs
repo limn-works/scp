@@ -928,7 +928,7 @@ impl NodeMlsFactory {
     /// 1. the response names `mls_sender`, the sender the MLS layer
     ///    authenticated ([`check_response_sender`]);
     /// 2. its public `epoch` lies in the window above `sender_epoch_floor`
-    ///    ([`admit_sender_epoch`] with
+    ///    (`admit_sender_epoch` with
     ///    [`MAX_EPOCH_ADVANCE`](scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE));
     /// 3. `enc` is the point validated at decode (spec 09 §9.16.2 Open step 1);
     /// 4. the wrapping key agrees in custody (Open step 2);
@@ -941,7 +941,6 @@ impl NodeMlsFactory {
     /// (gate-before-install), which re-checks the window under the entry guard.
     ///
     /// [`check_response_sender`]: scp_runtime_types::crypto::sender_keys::key_protocol::check_response_sender
-    /// [`admit_sender_epoch`]: crate::context::supervisor::admit_sender_epoch
     ///
     /// # Errors
     ///

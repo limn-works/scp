@@ -172,7 +172,7 @@ pub struct VerifiedRestoredCrypto {
 impl VerifiedRestoredCrypto {
     /// Consumes `restored` and verifies its group's committed
     /// `scp_context_params` (`0xFF02`) extension through the shared binding
-    /// check [`verify_scp_context_binding`](verify_scp_context_binding)
+    /// check [`verify_scp_context_binding`]
     /// (spec 05 §5.13.3 rules 1-9), with `snapshot_creation_timestamp_secs`
     /// as the recorded creation timestamp the committed `T0` must equal.
     ///
@@ -234,7 +234,7 @@ impl VerifiedRestoredCrypto {
     }
 
     /// Merges the verified floors into the Supervisor-owned registry through
-    /// [`restore_crypto_state_with_floor_guard`](restore_crypto_state_with_floor_guard)
+    /// [`restore_crypto_state_with_floor_guard`]
     /// and returns the owned crypto, now floor-guarded, for the hydrate and
     /// seed steps.
     ///
@@ -295,13 +295,13 @@ impl FloorGuardedCrypto {
 /// import, `PrepareForReplace`, respawn, and restore.
 ///
 /// Merges the floors of a
-/// [`VerifiedRestoredCrypto`](crate::context::restored_crypto::VerifiedRestoredCrypto)
+/// [`VerifiedRestoredCrypto`]
 /// INTO the authoritative Supervisor-owned Class-M registry (ADR-049 PR-6).
 /// EVERY crypto-restore site — the actor-side `PrepareForReplace` handler,
 /// `import_context`, and `restore_context` — routes through here so the replay
 /// (floor-regression) guard cannot be bypassed.
 ///
-/// The input is [`VerifiedFloors`](crate::context::restored_crypto::VerifiedFloors),
+/// The input is [`VerifiedFloors`],
 /// which only a `VerifiedRestoredCrypto` yields, so floors from a group whose
 /// `0xFF02` binding (spec 05 §5.13.3) was not verified cannot reach the
 /// registry.

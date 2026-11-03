@@ -273,7 +273,7 @@ impl OutletEconomyTicket {
 #[must_use = "a OutletEconomyReservation must be settled (capture) or rolled back — dropping leaks the held ticket"]
 pub struct OutletEconomyReservation {
     /// Context handle snapshot — the executor reads lifecycle state and
-    /// the supervisor passes it to [`invoke_outlet_execute_and_validate`].
+    /// the supervisor passes it to `invoke_outlet_execute_and_validate`.
     pub handle: ContextHandle,
     /// Role-state snapshot for the capability re-check inside the
     /// off-lock executor path.
@@ -373,7 +373,7 @@ pub const SCP_OUTLET_6089_MARKER: &str = "SCP-OUTLET-6089";
 /// captured verbatim; the receipt reflects exactly what the invoker consumed.
 /// Shared by the on-actor
 /// `scp_runtime_outlets::helpers::settle_outlet_stream` and the supervisor-side no-actor fallback
-/// [`Supervisor::settle_outlet_stream_via_actor`](crate::context::supervisor::Supervisor::settle_outlet_stream_via_actor).
+/// `Supervisor::settle_outlet_stream_via_actor`.
 ///
 /// # Idempotency (both legs)
 ///
@@ -509,7 +509,7 @@ pub async fn rollback_outlet_economy(
 /// [`OutletsCommand::ReserveOutletEconomy`](crate::context::actor::commands::OutletsCommand::ReserveOutletEconomy)
 /// to the context actor (economy reserve on owned state), run the
 /// non-`Send` executor supervisor-side via
-/// [`invoke_outlet_execute_and_validate`], then dispatch the Phase-3
+/// `invoke_outlet_execute_and_validate`, then dispatch the Phase-3
 /// [`OutletsCommand::SettleOutletEconomy`](crate::context::actor::commands::OutletsCommand::SettleOutletEconomy)
 /// (capture on success / rollback on failure). The economy bookkeeping
 /// never crosses the mailbox as anything but a `Send`

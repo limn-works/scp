@@ -604,7 +604,7 @@ pub struct StaleRun {
     pub first_millis: u64,
 }
 
-/// Whether [`PushRegistrar::forget_stale_refusals`] also drops the refusals
+/// Whether `PushRegistrar::forget_stale_refusals` also drops the refusals
 /// recorded as [`RefusalCause::StaleBeyondSkew`] and every `4062` run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StaleBound {

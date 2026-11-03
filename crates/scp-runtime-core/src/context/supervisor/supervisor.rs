@@ -569,7 +569,7 @@ pub enum SagaAbortReason {
     Rejected,
 }
 
-/// Private error of the shared [`Supervisor::run_saga`] FSM driver. Carries the
+/// Private error of the shared `Supervisor::run_saga` FSM driver. Carries the
 /// FSM's internal [`ContextError`] (the type the saga FSM and the saga
 /// integration tests depend on) PLUS whether the saga reached `NeedsRepair`, so
 /// the boundary methods can lift it: `start_saga` discards the flag and
@@ -645,8 +645,8 @@ pub enum CommitInProgressResolution {
 /// input to the coordinator's terminal-marker decision (spec §6.2.4
 /// "Reservation release on every terminal path"): a terminal-`Aborted` journal
 /// asserts "fully compensated" and MUST NOT be written while a caller refund is
-/// still outstanding. Produced by [`Supervisor::abort_xctx_participants`] (the
-/// live abort path) and by [`Supervisor::redrive_xctx_prepare_in_progress`] (the
+/// still outstanding. Produced by `Supervisor::abort_xctx_participants` (the
+/// live abort path) and by `Supervisor::redrive_xctx_prepare_in_progress` (the
 /// §17.16.4 crash-recovery `PreparingB` re-drive).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallerAbortReversal {
@@ -684,7 +684,7 @@ type DivergenceMarkerPlan = (
     u64,
 );
 
-/// Per-saga phase-data context threaded through [`Supervisor::run_saga_fsm`]
+/// Per-saga phase-data context threaded through `Supervisor::run_saga_fsm`
 /// for a `CrossContextOutletInvocation` saga (spec §6.2.4).
 ///
 /// The generic FSM (journal, retry, NeedsRepair, abort, gating) stays
@@ -700,7 +700,7 @@ type DivergenceMarkerPlan = (
 ///   Prepare-A and held across the saga (RAII-released on any abort, settled
 ///   at Commit-A),
 /// - `prepared_b` — B's recorded provenance from Prepare-B (B's clock / nonce /
-///   re-derived chain depth). Read by [`Supervisor::xctx_prepared_evidence_bytes`] at
+///   re-derived chain depth). Read by `Supervisor::xctx_prepared_evidence_bytes` at
 ///   Committing-evidence time: once recorded, B's values OVERRIDE the
 ///   caller-asserted nonce / depth / timestamp in the journaled prepared
 ///   evidence (the §17.16.4 replay/crash-recovery surface), so a recovered saga
@@ -760,7 +760,7 @@ pub struct CrossContextSagaCtx<'a> {
     /// Prepare-A's held reservation (settled at Commit-A, released on abort).
     pub prepared_a: Option<crate::context::actor::commands::PreparedAFields>,
     /// Prepare-B's recorded provenance (B's clock / nonce / re-derived depth).
-    /// Read by [`Supervisor::xctx_prepared_evidence_bytes`]: once `Some`, these values
+    /// Read by `Supervisor::xctx_prepared_evidence_bytes`: once `Some`, these values
     /// override the caller-asserted nonce / depth / timestamp in the journaled
     /// prepared evidence (the §17.16.4 replay surface).
     pub prepared_b: Option<crate::context::actor::commands::PreparedBFields>,
@@ -776,7 +776,7 @@ pub struct CrossContextSagaCtx<'a> {
     /// side committed and a `NeedsRepair` cannot have diverged the logs.
     pub committed_b_outlet_invoked_event_id: Option<String>,
     /// Set by the FSM when the saga reaches `NeedsRepair` (commit-retry
-    /// exhaustion). It tells the [`Supervisor::run_saga`] tail to LEAVE any held
+    /// exhaustion). It tells the `Supervisor::run_saga` tail to LEAVE any held
     /// Prepare-A escrow reservation RESERVED rather than voiding it (spec
     /// §6.2.4 "`NeedsRepair` reservation semantics": the escrow is NOT
     /// auto-voided — only the concurrency slot is released — because the
@@ -841,7 +841,7 @@ fn encode_repair_records_evidence(
 }
 
 /// Decode the `MessagePack` repair-record set from a durable `NeedsRepair`
-/// journal entry's `evidence` (the inverse of [`encode_repair_records_evidence`]).
+/// journal entry's `evidence` (the inverse of `encode_repair_records_evidence`).
 ///
 /// # Errors
 ///
@@ -961,7 +961,7 @@ pub const CRASH_POISON_THRESHOLD: usize = 3;
 pub const CRASH_DEQUE_CAP: usize = CRASH_POISON_THRESHOLD;
 
 /// The `crash_windows` key prefix of a per-identity KeyPackage actor's window
-/// ([`Supervisor::kp_crash_key`]); no context ID starts with it.
+/// (`Supervisor::kp_crash_key`); no context ID starts with it.
 pub const KP_CRASH_KEY_PREFIX: &str = "kp::";
 
 /// Per-context crash-count window (ADR-049 §10 — actor respawn budget).
@@ -1015,7 +1015,7 @@ pub struct CrashWindow {
     respawning: bool,
 }
 
-/// The bootstrap scope [`Supervisor::begin_bootstrap_window`] returns. When
+/// The bootstrap scope `Supervisor::begin_bootstrap_window` returns. When
 /// it drops, an id an actor now serves keeps a fresh budget, and an id no
 /// actor serves gets its prior [`CrashWindow`] back.
 pub struct BootstrapCrashWindow<'a> {
@@ -1081,7 +1081,7 @@ impl CrashWindow {
 
     /// Whether the most recent respawn failed without poisoning the context
     /// — the "silently dead" case (ADR-049 §10). Used by
-    /// [`Supervisor::lookup_miss_error`] to surface
+    /// `Supervisor::lookup_miss_error` to surface
     /// [`ContextError::ActorCrashed`] rather than `ContextNotRegistered`.
     #[must_use]
     pub const fn last_respawn_failed(&self) -> bool {
@@ -1115,7 +1115,7 @@ impl CrashWindow {
     }
 
     /// Whether the context is mid-respawn (despawned, not yet re-registered).
-    /// Used by [`Supervisor::lookup_miss_error`] to surface a retryable
+    /// Used by `Supervisor::lookup_miss_error` to surface a retryable
     /// `ActorCrashed` rather than a misleading `ContextNotRegistered` during
     /// the transient respawn gap (ADR-049 §10).
     #[must_use]
@@ -1426,7 +1426,7 @@ impl SubtaskSpawner {
 /// Spawns onto the Supervisor's task tracker for one operation that began
 /// before shutdown, such as a streaming open that starts its pump and its
 /// seal task (ADR-049 Decision 16, item 2). Issued by
-/// [`Supervisor::tracked_spawner`]. It holds a tracker token, so the tracker
+/// `Supervisor::tracked_spawner`. It holds a tracker token, so the tracker
 /// is not empty while the spawner lives: the drain waits for the operation
 /// that holds it and for every task spawned through it.
 #[derive(Clone)]
@@ -1437,7 +1437,7 @@ pub struct TrackedSpawner {
 
 impl TrackedSpawner {
     /// Spawns `future` onto the Supervisor's task tracker, marked as a
-    /// tracked task (see [`tracked_task_marker`]).
+    /// tracked task (see `tracked_task_marker`).
     pub fn spawn<F>(&self, future: F) -> tokio::task::JoinHandle<F::Output>
     where
         F: std::future::Future + Send + 'static,
@@ -1530,7 +1530,7 @@ pub enum DrainWithDeadline<T> {
 }
 
 /// The kind of work a tracked task hands to a task of its own through
-/// [`Supervisor::spawn_tracked_on`]. The variants are the two kinds ADR-049
+/// `Supervisor::spawn_tracked_on`. The variants are the two kinds ADR-049
 /// Decision 16 item 2 admits after the closed flag is set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SinkHandoff {
@@ -3441,7 +3441,7 @@ impl Supervisor {
     /// shutdown.
     ///
     /// `_write` is the held [`Self::write_lock`] guard. The only insert,
-    /// [`Self::insert_wrapping_key`], checks the gate under that same lock, so
+    /// `Self::insert_wrapping_key`, checks the gate under that same lock, so
     /// an insert either precedes this clear or sees the closed gate and is
     /// refused: no load in flight at shutdown re-inserts a key afterwards.
     pub fn clear_wrapping_keys(&self, _write: &tokio::sync::MutexGuard<'_, ()>) {
@@ -3889,7 +3889,7 @@ impl Supervisor {
             })
     }
 
-    /// [`Self::build_actor_deps`] after [`Self::load_wrapping_key`], for tests
+    /// `Self::build_actor_deps` after `Self::load_wrapping_key`, for tests
     /// that build deps without going through an entry point.
     ///
     /// # Errors
@@ -3905,7 +3905,7 @@ impl Supervisor {
         self.build_actor_deps(owning_did).await
     }
 
-    /// [`Self::key_package_store_for`] after [`Self::load_wrapping_key`], for
+    /// `Self::key_package_store_for` after `Self::load_wrapping_key`, for
     /// tests that resolve the store without going through an entry point.
     ///
     /// # Errors
@@ -7284,11 +7284,11 @@ impl Supervisor {
     ///
     /// It deliberately does NOT remove a POISONED entry: the poison record is
     /// the durable "dormant, needs operator recovery" signal that
-    /// [`Self::lookup_miss_error`] / [`Self::is_context_poisoned`] /
+    /// `Self::lookup_miss_error` / `Self::is_context_poisoned` /
     /// [`Self::read_context_state`] all read after the actor is despawned.
     /// Only [`CrashWindow::clear`] (operator `clear_poison`), a (re)create,
     /// import, standing recreate, or Welcome join of the id whose bootstrap
-    /// registers an actor ([`Self::begin_bootstrap_window`]), or a process
+    /// registers an actor (`Self::begin_bootstrap_window`), or a process
     /// restart removes a poison. A bootstrap that registers no actor puts
     /// the poisoned window back.
     ///
@@ -12467,7 +12467,7 @@ impl Supervisor {
     }
 
     /// Sets the closed flag (ADR-049 Decision 16, step 2). Blocks only until
-    /// every live [`SpawnPermit`] drops, and a permit is never held across an
+    /// every live `SpawnPermit` drops, and a permit is never held across an
     /// `.await`, so the wait is bounded by one synchronous spawn. Then cancels
     /// the shutdown token every streaming pump selects on.
     pub fn close_spawn_gate(&self) {
@@ -19130,7 +19130,7 @@ fn current_timestamp_ms() -> u64 {
 }
 
 /// Maps a bounded hard-rate-limit reply into an allow (`true`) / deny
-/// (`false`) decision for [`Supervisor::try_consume_hard_rate_limit`].
+/// (`false`) decision for `Supervisor::try_consume_hard_rate_limit`.
 ///
 /// SECURITY (fail-closed): the `Elapsed` arm — an ALIVE-but-wedged actor
 /// whose per-context bucket exists but is momentarily unreachable — MUST deny

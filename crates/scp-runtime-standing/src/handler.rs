@@ -4,7 +4,7 @@
     clippy::too_long_first_doc_paragraph
 )]
 //! Standing-pair handlers — see
-//! [`StandingCommand`](scp_runtime_core::context::actor::commands::StandingCommand)
+//! [`StandingCommand`]
 //! and spec §5.12.6 (contact graph) / §5.15.8 (standing-pair creation).
 //!
 //! # Phase 2A.2 — actor-shape dispatch

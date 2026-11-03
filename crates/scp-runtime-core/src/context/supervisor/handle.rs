@@ -158,7 +158,7 @@ impl SupervisorHandle {
     // key insert is deferred to PR-7's key-move, which co-serializes it for free.
 
     /// Advance a per-sender epoch floor in the authoritative registry, FAIL-CLOSED.
-    /// See [`Supervisor::check_and_advance_sender_epoch`].
+    /// See `Supervisor::check_and_advance_sender_epoch`.
     ///
     /// # Errors
     ///
@@ -180,7 +180,7 @@ impl SupervisorHandle {
     }
 
     /// Read a per-sender epoch floor from the authoritative registry without
-    /// advancing it (absent reads as `0`). See [`Supervisor::sender_epoch_floor`].
+    /// advancing it (absent reads as `0`). See `Supervisor::sender_epoch_floor`.
     ///
     /// # Errors
     ///
@@ -190,7 +190,7 @@ impl SupervisorHandle {
     }
 
     /// Advance a per-sender receive-sequence floor in the authoritative registry,
-    /// FAIL-CLOSED. See [`Supervisor::check_and_advance_recv_sequence`].
+    /// FAIL-CLOSED. See `Supervisor::check_and_advance_recv_sequence`.
     ///
     /// # Errors
     ///
@@ -212,7 +212,7 @@ impl SupervisorHandle {
     }
 
     /// Read the registry's per-sender epoch floors for `ctx`. See
-    /// [`Supervisor::export_sender_key_epochs`].
+    /// `Supervisor::export_sender_key_epochs`.
     ///
     /// ADR-049 PR-6: with [`Self::export_recv_sequence_floors`], the
     /// authoritative durable-blob export source.
@@ -230,7 +230,7 @@ impl SupervisorHandle {
     }
 
     /// Read the registry's receive-sequence floors for `ctx`. See
-    /// [`Supervisor::export_recv_sequence_floors`].
+    /// `Supervisor::export_recv_sequence_floors`.
     ///
     /// # Errors
     ///
@@ -245,7 +245,7 @@ impl SupervisorHandle {
 
     /// Atomically merge BOTH the per-sender epoch floors AND the receive-sequence
     /// floors into the registry under one guard (the restore/import sink). See
-    /// [`Supervisor::validate_and_merge_all_floors`].
+    /// `Supervisor::validate_and_merge_all_floors`.
     ///
     /// # Errors
     ///
@@ -268,7 +268,7 @@ impl SupervisorHandle {
     }
 
     /// Create-seed the floor registry for `ctx` (insert-if-absent). See
-    /// [`Supervisor::seed_context_floors`].
+    /// `Supervisor::seed_context_floors`.
     ///
     /// # Errors
     ///
@@ -296,7 +296,7 @@ impl SupervisorHandle {
     }
 
     /// Member-granular floor prune of `did` from `ctx`'s registry entry. See
-    /// [`Supervisor::remove_member_floors`] — the member-granular twin of
+    /// `Supervisor::remove_member_floors` — the member-granular twin of
     /// `remove_context_floors` (keeps siblings + the local scalar; drops only the
     /// departed member's floors under one guard). ADR-049 PR-6: called from every
     /// member-removal seam.
@@ -752,7 +752,7 @@ impl SupervisorHandle {
     /// register the resulting handle in the supervisor's actor registry.
     ///
     /// Capability-reduced wrapper around
-    /// [`Supervisor::spawn_actor_with_state`](crate::context::supervisor::Supervisor::spawn_actor_with_state).
+    /// `Supervisor::spawn_actor_with_state`.
     /// Phase 2A finalization keystone: lifecycle bootstrap entry points
     /// in `scp_runtime_lifecycle::helpers` (`create_context`,
     /// `restore_context`, `import_context`) call this after building the
@@ -903,7 +903,7 @@ impl SupervisorHandle {
 
     /// Despawn the actor an import is replacing, and mark the gap until the
     /// replacement registers (ADR-049 §10). See
-    /// [`Supervisor::despawn_for_replace`](crate::context::supervisor::Supervisor::despawn_for_replace).
+    /// `Supervisor::despawn_for_replace`.
     ///
     /// # Visibility
     ///
@@ -990,7 +990,7 @@ impl SupervisorHandle {
     /// An actor turn never waits for this lock: its holders wait on actor
     /// mailboxes (a create's post-spawn wiring, a discard's teardown), so a
     /// turn that waited could deadlock with them. Work that must wait for
-    /// the lock goes through [`Self::spawn_under_bootstrap_spawn_lock`].
+    /// the lock goes through `Self::spawn_under_bootstrap_spawn_lock`.
     ///
     /// # Errors
     ///
@@ -1199,7 +1199,7 @@ impl SupervisorHandle {
 
     /// Fix-D — dispatch the restore-time streaming crash-recovery sweep to a
     /// freshly-respawned actor, delegating to
-    /// [`Supervisor::reconcile_stream_reservations_via_actor`](crate::context::supervisor::Supervisor::reconcile_stream_reservations_via_actor).
+    /// `Supervisor::reconcile_stream_reservations_via_actor`.
     ///
     /// # Errors
     ///

@@ -12,9 +12,9 @@
 //! [`crate::handler`] calls to implement
 //! [`TtlCloseCommand`](scp_runtime_core::context::actor::commands::TtlCloseCommand).
 //! Helpers operate on actor-owned
-//! [`PerContextState`](scp_runtime_core::context::actor::state::PerContextState)
+//! [`PerContextState`]
 //! and capability-reduced
-//! [`ActorDeps`](scp_runtime_core::context::actor::deps::ActorDeps). The pre-migration
+//! [`ActorDeps`]. The pre-migration
 //! `&Supervisor` lock-and-call bodies have been removed (Phase 2A
 //! finalization); this module is the sole home for these helpers.
 //!
@@ -403,7 +403,7 @@ pub async fn propose_ttl_extension(
 /// # Single-source invariant — the reset emits a leaf (§5.10.1 step 5)
 ///
 /// This is the post-consent ACTIVATION of the
-/// [`propose_ttl_extension`] flow. Every deadline mutation MUST emit a
+/// `propose_ttl_extension` flow. Every deadline mutation MUST emit a
 /// convergent `TtlExtended` leaf so the event log stays the single
 /// authoritative source that [`convergent_ttl_deadline`] reads — the same
 /// invariant `execute_extend_ttl` (the governance extension path) upholds.

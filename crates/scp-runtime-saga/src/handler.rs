@@ -4,7 +4,7 @@
     clippy::too_long_first_doc_paragraph
 )]
 //! Saga-phase handlers — see
-//! [`SagaPhaseMessage`](scp_runtime_core::context::actor::commands::SagaPhaseMessage)
+//! [`SagaPhaseMessage`]
 //! and spec §6.2.4 (cross-context outlet-invocation saga).
 //!
 //! # What runs here
@@ -1050,7 +1050,7 @@ fn consume_inbound_interface_rate_limit(
 
 /// Owned inputs for [`prepare_b`], grouped to keep the handler signature within
 /// the clippy argument budget. Mirrors the
-/// [`SagaPhaseMessage::PrepareB`](scp_runtime_core::context::actor::commands::SagaPhaseMessage::PrepareB)
+/// [`SagaPhaseMessage::PrepareB`]
 /// payload (minus the reply channel).
 struct PrepareBRequest {
     saga_id: scp_runtime_types::context::supervisor::saga_journal::SagaId,

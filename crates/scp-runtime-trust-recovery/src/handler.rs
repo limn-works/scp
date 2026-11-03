@@ -4,7 +4,7 @@
     clippy::too_long_first_doc_paragraph
 )]
 //! Trust-recovery handlers — see
-//! [`TrustRecoveryCommand`](scp_runtime_core::context::actor::commands::TrustRecoveryCommand)
+//! [`TrustRecoveryCommand`]
 //! and spec §9.12 / §23.17.
 //!
 //! # Phase 2A.1 — actor-shape dispatch

@@ -4,7 +4,7 @@
     clippy::too_long_first_doc_paragraph
 )]
 //! Outlets handlers — see
-//! [`OutletsCommand`](scp_runtime_core::context::actor::commands::OutletsCommand)
+//! [`OutletsCommand`]
 //! and spec §19 (economic governance) / §19.7 (anti-spam cost
 //! escalation); hard rate limits §6.2.0.2.
 //!

@@ -105,11 +105,11 @@ impl Supervisor {
         &self.wrapping_keys
     }
 
-    /// Test access to [`Self::abort_saga`] (ADR-070 §6.2).
+    /// Test access to `Self::abort_saga` (ADR-070 §6.2).
     ///
     /// # Errors
     ///
-    /// The errors of [`Self::abort_saga`].
+    /// The errors of `Self::abort_saga`.
     pub async fn abort_saga_for_test(
         &self,
         a0: &SagaId,
@@ -121,7 +121,7 @@ impl Supervisor {
         self.abort_saga(a0, a1, a2, a3, a4).await
     }
 
-    /// Test access to [`Self::abort_xctx_participants`] (ADR-070 §6.2).
+    /// Test access to `Self::abort_xctx_participants` (ADR-070 §6.2).
     pub async fn abort_xctx_participants_for_test(
         &self,
         a0: &SagaId,
@@ -130,11 +130,11 @@ impl Supervisor {
         self.abort_xctx_participants(a0, a1).await
     }
 
-    /// Test access to [`Self::append_journal`] (ADR-070 §6.2).
+    /// Test access to `Self::append_journal` (ADR-070 §6.2).
     ///
     /// # Errors
     ///
-    /// The errors of [`Self::append_journal`].
+    /// The errors of `Self::append_journal`.
     pub async fn append_journal_for_test(
         &self,
         a0: &SagaId,
@@ -146,16 +146,16 @@ impl Supervisor {
         self.append_journal(a0, a1, a2, a3, a4).await
     }
 
-    /// Test access to [`Self::begin_bootstrap_window`] (ADR-070 §6.2).
+    /// Test access to `Self::begin_bootstrap_window` (ADR-070 §6.2).
     pub fn begin_bootstrap_window_for_test(&self, a0: &str) -> BootstrapCrashWindow<'_> {
         self.begin_bootstrap_window(a0)
     }
 
-    /// Test access to [`Self::build_actor_deps`] (ADR-070 §6.2).
+    /// Test access to `Self::build_actor_deps` (ADR-070 §6.2).
     ///
     /// # Errors
     ///
-    /// The errors of [`Self::build_actor_deps`].
+    /// The errors of `Self::build_actor_deps`.
     pub async fn build_actor_deps_for_test(
         self: &Arc<Self>,
         a0: &DID,
@@ -163,16 +163,16 @@ impl Supervisor {
         self.build_actor_deps(a0).await
     }
 
-    /// Test access to [`Self::caller_context_deleted_from_persistence`] (ADR-070 §6.2).
+    /// Test access to `Self::caller_context_deleted_from_persistence` (ADR-070 §6.2).
     pub async fn caller_context_deleted_from_persistence_for_test(&self, a0: &str) -> bool {
         self.caller_context_deleted_from_persistence(a0).await
     }
 
-    /// Test access to [`Self::check_and_advance_recv_sequence`] (ADR-070 §6.2).
+    /// Test access to `Self::check_and_advance_recv_sequence` (ADR-070 §6.2).
     ///
     /// # Errors
     ///
-    /// The errors of [`Self::check_and_advance_recv_sequence`].
+    /// The errors of `Self::check_and_advance_recv_sequence`.
     pub fn check_and_advance_recv_sequence_for_test(
         &self,
         a0: &[u8; 32],
@@ -183,11 +183,11 @@ impl Supervisor {
         self.check_and_advance_recv_sequence(a0, a1, a2, a3)
     }
 
-    /// Test access to [`Self::check_and_advance_sender_epoch`] (ADR-070 §6.2).
+    /// Test access to `Self::check_and_advance_sender_epoch` (ADR-070 §6.2).
     ///
     /// # Errors
     ///
-    /// The errors of [`Self::check_and_advance_sender_epoch`].
+    /// The errors of `Self::check_and_advance_sender_epoch`.
     pub fn check_and_advance_sender_epoch_for_test(
         &self,
         a0: &[u8; 32],
@@ -198,25 +198,25 @@ impl Supervisor {
         self.check_and_advance_sender_epoch(a0, a1, a2, a3)
     }
 
-    /// Test access to [`Self::clear_kp_poison`] (ADR-070 §6.2).
+    /// Test access to `Self::clear_kp_poison` (ADR-070 §6.2).
     ///
     /// # Errors
     ///
-    /// The errors of [`Self::clear_kp_poison`].
+    /// The errors of `Self::clear_kp_poison`.
     pub async fn clear_kp_poison_for_test(self: &Arc<Self>, a0: &DID) -> Result<(), ContextError> {
         self.clear_kp_poison(a0).await
     }
 
-    /// Test access to [`Self::clock_ref`] (ADR-070 §6.2).
+    /// Test access to `Self::clock_ref` (ADR-070 §6.2).
     pub fn clock_ref_for_test(&self) -> Option<&Arc<dyn Clock>> {
         self.clock_ref()
     }
 
-    /// Test access to [`Self::commit_a_settle`] (ADR-070 §6.2).
+    /// Test access to `Self::commit_a_settle` (ADR-070 §6.2).
     ///
     /// # Errors
     ///
-    /// The errors of [`Self::commit_a_settle`].
+    /// The errors of `Self::commit_a_settle`.
     pub async fn commit_a_settle_for_test(
         &self,
         a0: &SagaId,
@@ -227,28 +227,28 @@ impl Supervisor {
         self.commit_a_settle(a0, a1, a2, a3).await
     }
 
-    /// Test access to [`Self::crash_now_ms`] (ADR-070 §6.2).
+    /// Test access to `Self::crash_now_ms` (ADR-070 §6.2).
     pub fn crash_now_ms_for_test(&self, a0: &'static str, a1: &str) -> u64 {
         self.crash_now_ms(a0, a1)
     }
 
-    /// Test access to [`Self::crypto_ref`] (ADR-070 §6.2).
+    /// Test access to `Self::crypto_ref` (ADR-070 §6.2).
     pub fn crypto_ref_for_test(
         &self,
     ) -> Option<&Arc<crate::crypto::mls::provider::NodeMlsFactory>> {
         self.crypto_ref()
     }
 
-    /// Test access to [`Self::despawn_for_replace`] (ADR-070 §6.2).
+    /// Test access to `Self::despawn_for_replace` (ADR-070 §6.2).
     pub async fn despawn_for_replace_for_test(&self, a0: &str) -> bool {
         self.despawn_for_replace(a0).await
     }
 
-    /// Test access to [`Self::dispatch_recovery_send_notification_in_turn`] (ADR-070 §6.2).
+    /// Test access to `Self::dispatch_recovery_send_notification_in_turn` (ADR-070 §6.2).
     ///
     /// # Errors
     ///
-    /// The errors of [`Self::dispatch_recovery_send_notification_in_turn`].
+    /// The errors of `Self::dispatch_recovery_send_notification_in_turn`.
     pub async fn dispatch_recovery_send_notification_in_turn_for_test(
         self: &Arc<Self>,
         a0: Box<crate::context::actor::commands::RecoverySendNotificationPayload>,
@@ -258,11 +258,11 @@ impl Supervisor {
             .await
     }
 
-    /// Test access to [`Self::dispatch_xctx_prepare_a`] (ADR-070 §6.2).
+    /// Test access to `Self::dispatch_xctx_prepare_a` (ADR-070 §6.2).
     ///
     /// # Errors
     ///
-    /// The errors of [`Self::dispatch_xctx_prepare_a`].
+    /// The errors of `Self::dispatch_xctx_prepare_a`.
     pub async fn dispatch_xctx_prepare_a_for_test(
         &self,
         a0: &SagaId,
@@ -271,7 +271,7 @@ impl Supervisor {
         self.dispatch_xctx_prepare_a(a0, a1).await
     }
 
-    /// Test access to [`Self::divergence_marker_plan`] (ADR-070 §6.2).
+    /// Test access to `Self::divergence_marker_plan` (ADR-070 §6.2).
     #[must_use]
     pub fn divergence_marker_plan_for_test(
         a0: &CrossContextSagaCtx<'_>,
@@ -279,7 +279,7 @@ impl Supervisor {
         Self::divergence_marker_plan(a0)
     }
 
-    /// Test access to [`Self::drain_terminal_reservation`] (ADR-070 §6.2).
+    /// Test access to `Self::drain_terminal_reservation` (ADR-070 §6.2).
     pub async fn drain_terminal_reservation_for_test(
         &self,
         a0: &SagaId,
@@ -289,22 +289,22 @@ impl Supervisor {
         self.drain_terminal_reservation(a0, a1, a2).await;
     }
 
-    /// Test access to [`Self::emit_divergence_markers`] (ADR-070 §6.2).
+    /// Test access to `Self::emit_divergence_markers` (ADR-070 §6.2).
     pub async fn emit_divergence_markers_for_test(&self, a0: &SagaId, a1: DivergenceMarkerPlan) {
         self.emit_divergence_markers(a0, a1).await;
     }
 
-    /// Test access to [`Self::end_bootstrap_window`] (ADR-070 §6.2).
+    /// Test access to `Self::end_bootstrap_window` (ADR-070 §6.2).
     pub fn end_bootstrap_window_for_test(&self, a0: &str) {
         self.end_bootstrap_window(a0);
     }
 
-    /// Test access to [`Self::event_log_ref`] (ADR-070 §6.2).
+    /// Test access to `Self::event_log_ref` (ADR-070 §6.2).
     pub fn event_log_ref_for_test(&self) -> Option<&Arc<dyn ContextEventLogProvider>> {
         self.event_log_ref()
     }
 
-    /// Test access to [`Self::export_recv_sequence_floors`] (ADR-070 §6.2).
+    /// Test access to `Self::export_recv_sequence_floors` (ADR-070 §6.2).
     pub fn export_recv_sequence_floors_for_test(
         &self,
         a0: &[u8; 32],
@@ -312,12 +312,12 @@ impl Supervisor {
         self.export_recv_sequence_floors(a0)
     }
 
-    /// Test access to [`Self::export_sender_key_epochs`] (ADR-070 §6.2).
+    /// Test access to `Self::export_sender_key_epochs` (ADR-070 §6.2).
     pub fn export_sender_key_epochs_for_test(&self, a0: &[u8; 32]) -> Vec<(String, u64)> {
         self.export_sender_key_epochs(a0)
     }
 
-    /// Test access to [`Self::extract_abort_reservation`] (ADR-070 §6.2).
+    /// Test access to `Self::extract_abort_reservation` (ADR-070 §6.2).
     #[must_use]
     pub fn extract_abort_reservation_for_test(
         a0: Box<ContextCommand>,
@@ -325,7 +325,7 @@ impl Supervisor {
         Self::extract_abort_reservation(a0)
     }
 
-    /// Test access to [`Self::extract_commit_a_reservation`] (ADR-070 §6.2).
+    /// Test access to `Self::extract_commit_a_reservation` (ADR-070 §6.2).
     #[must_use]
     pub fn extract_commit_a_reservation_for_test(
         a0: Box<ContextCommand>,
@@ -333,16 +333,16 @@ impl Supervisor {
         Self::extract_commit_a_reservation(a0)
     }
 
-    /// Test access to [`Self::is_context_poisoned`] (ADR-070 §6.2).
+    /// Test access to `Self::is_context_poisoned` (ADR-070 §6.2).
     pub fn is_context_poisoned_for_test(&self, a0: &str) -> bool {
         self.is_context_poisoned(a0)
     }
 
-    /// Test access to [`Self::key_package_store_for`] (ADR-070 §6.2).
+    /// Test access to `Self::key_package_store_for` (ADR-070 §6.2).
     ///
     /// # Errors
     ///
-    /// The errors of [`Self::key_package_store_for`].
+    /// The errors of `Self::key_package_store_for`.
     pub async fn key_package_store_for_for_test(
         self: &Arc<Self>,
         a0: &DID,
@@ -351,28 +351,28 @@ impl Supervisor {
         self.key_package_store_for(a0).await
     }
 
-    /// Test access to [`Self::known_context_ids`] (ADR-070 §6.2).
+    /// Test access to `Self::known_context_ids` (ADR-070 §6.2).
     pub fn known_context_ids_for_test(&self) -> Vec<String> {
         self.known_context_ids()
     }
 
-    /// Test access to [`Self::kp_crash_key`] (ADR-070 §6.2).
+    /// Test access to `Self::kp_crash_key` (ADR-070 §6.2).
     #[must_use]
     pub fn kp_crash_key_for_test(a0: &DID) -> String {
         Self::kp_crash_key(a0)
     }
 
-    /// Test access to [`Self::lift_run_saga_error`] (ADR-070 §6.2).
+    /// Test access to `Self::lift_run_saga_error` (ADR-070 §6.2).
     #[must_use]
     pub fn lift_run_saga_error_for_test(a0: SagaId, a1: RunSagaError) -> SagaError {
         Self::lift_run_saga_error(a0, a1)
     }
 
-    /// Test access to [`Self::load_wrapping_key`] (ADR-070 §6.2).
+    /// Test access to `Self::load_wrapping_key` (ADR-070 §6.2).
     ///
     /// # Errors
     ///
-    /// The errors of [`Self::load_wrapping_key`].
+    /// The errors of `Self::load_wrapping_key`.
     pub async fn load_wrapping_key_for_test(
         &self,
         a0: &DID,
@@ -380,12 +380,12 @@ impl Supervisor {
         self.load_wrapping_key(a0).await
     }
 
-    /// Test access to [`Self::lookup_miss_error`] (ADR-070 §6.2).
+    /// Test access to `Self::lookup_miss_error` (ADR-070 §6.2).
     pub fn lookup_miss_error_for_test(&self, a0: &str, a1: String) -> ContextError {
         self.lookup_miss_error(a0, a1)
     }
 
-    /// Test access to [`Self::mls_storage_ref`] (ADR-070 §6.2).
+    /// Test access to `Self::mls_storage_ref` (ADR-070 §6.2).
     pub fn mls_storage_ref_for_test(
         &self,
     ) -> Option<&Arc<dyn scp_runtime_types::crypto::mls::storage_adapter::OpenMlsStorageAdapter>>
@@ -393,7 +393,7 @@ impl Supervisor {
         self.mls_storage_ref()
     }
 
-    /// Test access to [`Self::outlet_stream_admission_for`] (ADR-070 §6.2).
+    /// Test access to `Self::outlet_stream_admission_for` (ADR-070 §6.2).
     pub fn outlet_stream_admission_for_for_test(
         &self,
         a0: &str,
@@ -401,18 +401,18 @@ impl Supervisor {
         self.outlet_stream_admission_for(a0)
     }
 
-    /// Test access to [`Self::payment_adapter_ref`] (ADR-070 §6.2).
+    /// Test access to `Self::payment_adapter_ref` (ADR-070 §6.2).
     pub fn payment_adapter_ref_for_test(&self) -> Option<&Arc<dyn PaymentAdapterDyn>> {
         self.payment_adapter_ref()
     }
 
-    /// Test access to [`Self::reconstruct_xctx_prepared`] (ADR-070 §6.2).
+    /// Test access to `Self::reconstruct_xctx_prepared` (ADR-070 §6.2).
     #[must_use]
     pub fn reconstruct_xctx_prepared_for_test(a0: &JournalEntry) -> Option<XctxPrepared> {
         Self::reconstruct_xctx_prepared(a0)
     }
 
-    /// Test access to [`Self::record_supervisor_repair`] (ADR-070 §6.2).
+    /// Test access to `Self::record_supervisor_repair` (ADR-070 §6.2).
     pub async fn record_supervisor_repair_for_test(
         &self,
         a0: &SagaId,
@@ -424,12 +424,12 @@ impl Supervisor {
         self.record_supervisor_repair(a0, a1, a2, a3, a4).await;
     }
 
-    /// Test access to [`Self::recover_saga_entry`] (ADR-070 §6.2).
+    /// Test access to `Self::recover_saga_entry` (ADR-070 §6.2).
     pub async fn recover_saga_entry_for_test(&self, a0: JournalEntry) {
         self.recover_saga_entry(a0).await;
     }
 
-    /// Test access to [`Self::recovery_send_notification_direct`] (ADR-070 §6.2).
+    /// Test access to `Self::recovery_send_notification_direct` (ADR-070 §6.2).
     pub fn recovery_send_notification_direct_for_test<'a>(
         self: &'a Arc<Self>,
         a0: &str,
@@ -442,7 +442,7 @@ impl Supervisor {
         self.recovery_send_notification_direct(a0, a1, a2, a3, a4)
     }
 
-    /// Test access to [`Self::redrive_caller_local_reversal`] (ADR-070 §6.2).
+    /// Test access to `Self::redrive_caller_local_reversal` (ADR-070 §6.2).
     pub async fn redrive_caller_local_reversal_for_test(
         &self,
         a0: &SagaId,
@@ -451,7 +451,7 @@ impl Supervisor {
         self.redrive_caller_local_reversal(a0, a1).await
     }
 
-    /// Test access to [`Self::redrive_xctx_commit_in_progress`] (ADR-070 §6.2).
+    /// Test access to `Self::redrive_xctx_commit_in_progress` (ADR-070 §6.2).
     pub async fn redrive_xctx_commit_in_progress_for_test(
         &self,
         a0: &SagaId,
@@ -460,7 +460,7 @@ impl Supervisor {
         self.redrive_xctx_commit_in_progress(a0, a1).await
     }
 
-    /// Test access to [`Self::redrive_xctx_prepare_in_progress`] (ADR-070 §6.2).
+    /// Test access to `Self::redrive_xctx_prepare_in_progress` (ADR-070 §6.2).
     pub async fn redrive_xctx_prepare_in_progress_for_test(
         &self,
         a0: &SagaId,
@@ -469,16 +469,16 @@ impl Supervisor {
         self.redrive_xctx_prepare_in_progress(a0, a1).await
     }
 
-    /// Test access to [`Self::refuse_if_shut_down`] (ADR-070 §6.2).
+    /// Test access to `Self::refuse_if_shut_down` (ADR-070 §6.2).
     ///
     /// # Errors
     ///
-    /// The errors of [`Self::refuse_if_shut_down`].
+    /// The errors of `Self::refuse_if_shut_down`.
     pub fn refuse_if_shut_down_for_test(&self, a0: &str) -> Result<(), ContextError> {
         self.refuse_if_shut_down(a0)
     }
 
-    /// Test access to [`Self::release_stream_escrow`] (ADR-070 §6.2).
+    /// Test access to `Self::release_stream_escrow` (ADR-070 §6.2).
     pub async fn release_stream_escrow_for_test(
         self: &Arc<Self>,
         a0: &TrackedSpawner,
@@ -489,11 +489,11 @@ impl Supervisor {
         self.release_stream_escrow(a0, a1, a2, a3).await;
     }
 
-    /// Test access to [`Self::reserve_outlet_stream_economy_via_actor`] (ADR-070 §6.2).
+    /// Test access to `Self::reserve_outlet_stream_economy_via_actor` (ADR-070 §6.2).
     ///
     /// # Errors
     ///
-    /// The errors of [`Self::reserve_outlet_stream_economy_via_actor`].
+    /// The errors of `Self::reserve_outlet_stream_economy_via_actor`.
     pub async fn reserve_outlet_stream_economy_via_actor_for_test(
         &self,
         a0: &str,
@@ -507,11 +507,11 @@ impl Supervisor {
             .await
     }
 
-    /// Test access to [`Self::respawn_from_snapshot`] (ADR-070 §6.2).
+    /// Test access to `Self::respawn_from_snapshot` (ADR-070 §6.2).
     ///
     /// # Errors
     ///
-    /// The errors of [`Self::respawn_from_snapshot`].
+    /// The errors of `Self::respawn_from_snapshot`.
     pub async fn respawn_from_snapshot_for_test(
         self: &Arc<Self>,
         a0: &str,
@@ -520,22 +520,22 @@ impl Supervisor {
         self.respawn_from_snapshot(a0, a1).await
     }
 
-    /// Test access to [`Self::restore_all_contexts`] (ADR-070 §6.2).
+    /// Test access to `Self::restore_all_contexts` (ADR-070 §6.2).
     ///
     /// # Errors
     ///
-    /// The errors of [`Self::restore_all_contexts`].
+    /// The errors of `Self::restore_all_contexts`.
     pub async fn restore_all_contexts_for_test(
         self: &Arc<Self>,
     ) -> Result<RestoredContexts, ContextError> {
         self.restore_all_contexts().await
     }
 
-    /// Test access to [`Self::reverse_stream_escrow_via_actor`] (ADR-070 §6.2).
+    /// Test access to `Self::reverse_stream_escrow_via_actor` (ADR-070 §6.2).
     ///
     /// # Errors
     ///
-    /// The errors of [`Self::reverse_stream_escrow_via_actor`].
+    /// The errors of `Self::reverse_stream_escrow_via_actor`.
     pub async fn reverse_stream_escrow_via_actor_for_test(
         &self,
         a0: &str,
@@ -545,16 +545,16 @@ impl Supervisor {
         self.reverse_stream_escrow_via_actor(a0, a1, a2).await
     }
 
-    /// Test access to [`Self::sender_epoch_floor`] (ADR-070 §6.2).
+    /// Test access to `Self::sender_epoch_floor` (ADR-070 §6.2).
     pub fn sender_epoch_floor_for_test(&self, a0: &[u8; 32], a1: &str) -> u64 {
         self.sender_epoch_floor(a0, a1)
     }
 
-    /// Test access to [`Self::settle_outlet_economy_via_actor`] (ADR-070 §6.2).
+    /// Test access to `Self::settle_outlet_economy_via_actor` (ADR-070 §6.2).
     ///
     /// # Errors
     ///
-    /// The errors of [`Self::settle_outlet_economy_via_actor`].
+    /// The errors of `Self::settle_outlet_economy_via_actor`.
     pub async fn settle_outlet_economy_via_actor_for_test(
         &self,
         a0: &str,
@@ -564,11 +564,11 @@ impl Supervisor {
         self.settle_outlet_economy_via_actor(a0, a1, a2).await
     }
 
-    /// Test access to [`Self::settle_outlet_stream_via_actor`] (ADR-070 §6.2).
+    /// Test access to `Self::settle_outlet_stream_via_actor` (ADR-070 §6.2).
     ///
     /// # Errors
     ///
-    /// The errors of [`Self::settle_outlet_stream_via_actor`].
+    /// The errors of `Self::settle_outlet_stream_via_actor`.
     pub async fn settle_outlet_stream_via_actor_for_test(
         &self,
         a0: crate::context::outlets::invoke::StreamSettlement,
@@ -578,11 +578,11 @@ impl Supervisor {
         self.settle_outlet_stream_via_actor(a0, a1, a2).await
     }
 
-    /// Test access to [`Self::spawn_actor_with_state`] (ADR-070 §6.2).
+    /// Test access to `Self::spawn_actor_with_state` (ADR-070 §6.2).
     ///
     /// # Errors
     ///
-    /// The errors of [`Self::spawn_actor_with_state`].
+    /// The errors of `Self::spawn_actor_with_state`.
     pub async fn spawn_actor_with_state_for_test(
         self: &Arc<Self>,
         a0: crate::context::actor::state::PerContextState,
@@ -592,11 +592,11 @@ impl Supervisor {
         self.spawn_actor_with_state(a0, a1, a2).await
     }
 
-    /// Test access to [`Self::spawn_tracked`] (ADR-070 §6.2).
+    /// Test access to `Self::spawn_tracked` (ADR-070 §6.2).
     ///
     /// # Errors
     ///
-    /// The errors of [`Self::spawn_tracked`].
+    /// The errors of `Self::spawn_tracked`.
     pub fn spawn_tracked_for_test<F>(
         &self,
         a0: &str,
@@ -609,11 +609,11 @@ impl Supervisor {
         self.spawn_tracked(a0, a1)
     }
 
-    /// Test access to [`Self::spawn_tracked_on`] (ADR-070 §6.2).
+    /// Test access to `Self::spawn_tracked_on` (ADR-070 §6.2).
     ///
     /// # Errors
     ///
-    /// The errors of [`Self::spawn_tracked_on`].
+    /// The errors of `Self::spawn_tracked_on`.
     pub fn spawn_tracked_on_for_test<F>(
         &self,
         a0: SinkHandoff,
@@ -627,11 +627,11 @@ impl Supervisor {
         self.spawn_tracked_on(a0, a1, a2)
     }
 
-    /// Test access to [`Self::standing_context`] (ADR-070 §6.2).
+    /// Test access to `Self::standing_context` (ADR-070 §6.2).
     ///
     /// # Errors
     ///
-    /// The errors of [`Self::standing_context`].
+    /// The errors of `Self::standing_context`.
     pub async fn standing_context_for_test(
         self: &Arc<Self>,
         a0: &DID,
@@ -641,20 +641,20 @@ impl Supervisor {
         self.standing_context(a0, a1, a2).await
     }
 
-    /// Test access to [`Self::tracked_spawner`] (ADR-070 §6.2).
+    /// Test access to `Self::tracked_spawner` (ADR-070 §6.2).
     ///
     /// # Errors
     ///
-    /// The errors of [`Self::tracked_spawner`].
+    /// The errors of `Self::tracked_spawner`.
     pub fn tracked_spawner_for_test(&self, a0: &str) -> Result<TrackedSpawner, ContextError> {
         self.tracked_spawner(a0)
     }
 
-    /// Test access to [`Self::verify_commit_b_receipt`] (ADR-070 §6.2).
+    /// Test access to `Self::verify_commit_b_receipt` (ADR-070 §6.2).
     ///
     /// # Errors
     ///
-    /// The errors of [`Self::verify_commit_b_receipt`].
+    /// The errors of `Self::verify_commit_b_receipt`.
     pub fn verify_commit_b_receipt_for_test(
         a0: &SagaId,
         a1: &CrossContextSagaCtx<'_>,
@@ -663,11 +663,11 @@ impl Supervisor {
         Self::verify_commit_b_receipt(a0, a1, a2)
     }
 
-    /// Test access to [`Self::wrapping_key`] (ADR-070 §6.2).
+    /// Test access to `Self::wrapping_key` (ADR-070 §6.2).
     ///
     /// # Errors
     ///
-    /// The errors of [`Self::wrapping_key`].
+    /// The errors of `Self::wrapping_key`.
     pub fn wrapping_key_for_test(
         &self,
         a0: &DID,
@@ -675,7 +675,7 @@ impl Supervisor {
         self.wrapping_key(a0)
     }
 
-    /// Test access to [`Self::xctx_prepared_evidence_bytes`] (ADR-070 §6.2).
+    /// Test access to `Self::xctx_prepared_evidence_bytes` (ADR-070 §6.2).
     #[must_use]
     pub fn xctx_prepared_evidence_bytes_for_test(
         a0: &SagaInput,
@@ -686,21 +686,21 @@ impl Supervisor {
 }
 
 impl Supervisor {
-    /// Test access to [`Self::remove_member_floors`] (ADR-070 §6.2).
+    /// Test access to `Self::remove_member_floors` (ADR-070 §6.2).
     pub fn remove_member_floors_for_test(&self, a0: &[u8; 32], a1: &str) {
         self.remove_member_floors(a0, a1);
     }
 
-    /// Test access to [`Self::seed_context_floors`] (ADR-070 §6.2).
+    /// Test access to `Self::seed_context_floors` (ADR-070 §6.2).
     pub fn seed_context_floors_for_test(&self, a0: &[u8; 32]) {
         self.seed_context_floors(a0);
     }
 
-    /// Test access to [`Self::validate_and_merge_all_floors`] (ADR-070 §6.2).
+    /// Test access to `Self::validate_and_merge_all_floors` (ADR-070 §6.2).
     ///
     /// # Errors
     ///
-    /// The errors of [`Self::validate_and_merge_all_floors`].
+    /// The errors of `Self::validate_and_merge_all_floors`.
     pub fn validate_and_merge_all_floors_for_test(
         &self,
         a0: &[u8; 32],
@@ -712,11 +712,11 @@ impl Supervisor {
         self.validate_and_merge_all_floors(a0, a1, a2, a3, a4)
     }
 
-    /// Test access to [`Self::validate_and_merge_epoch_floors`] (ADR-070 §6.2).
+    /// Test access to `Self::validate_and_merge_epoch_floors` (ADR-070 §6.2).
     ///
     /// # Errors
     ///
-    /// The errors of [`Self::validate_and_merge_epoch_floors`].
+    /// The errors of `Self::validate_and_merge_epoch_floors`.
     pub fn validate_and_merge_epoch_floors_for_test(
         &self,
         a0: &[u8; 32],
@@ -727,11 +727,11 @@ impl Supervisor {
         self.validate_and_merge_epoch_floors(a0, a1, a2, a3)
     }
 
-    /// Test access to [`Self::validate_and_merge_recv_sequence_floors`] (ADR-070 §6.2).
+    /// Test access to `Self::validate_and_merge_recv_sequence_floors` (ADR-070 §6.2).
     ///
     /// # Errors
     ///
-    /// The errors of [`Self::validate_and_merge_recv_sequence_floors`].
+    /// The errors of `Self::validate_and_merge_recv_sequence_floors`.
     pub fn validate_and_merge_recv_sequence_floors_for_test(
         &self,
         a0: &[u8; 32],

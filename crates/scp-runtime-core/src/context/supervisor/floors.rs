@@ -45,7 +45,7 @@ use super::supervisor::Supervisor;
 /// Per-context Class-M floor bundle held by the supervisor registry.
 ///
 /// Bundled (rather than two separate maps) because the receive-side overshoot
-/// ceiling in [`Supervisor::check_and_advance_recv_sequence`] reads the sender
+/// ceiling in `Supervisor::check_and_advance_recv_sequence` reads the sender
 /// epoch floor from the SAME entry — one `DashMap` entry guard covers both,
 /// keeping every gate a single acquire (ADR-049 Decision 13).
 ///
